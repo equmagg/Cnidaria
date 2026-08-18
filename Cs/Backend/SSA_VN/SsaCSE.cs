@@ -717,6 +717,7 @@ namespace Cnidaria.Cs
             private static bool IsCallBoundary(GenTree node)
             {
                 return node.Kind is
+                    GenTreeKind.Intrinsic or
                     GenTreeKind.Call or
                     GenTreeKind.IndirectCall or
                     GenTreeKind.VirtualCall or

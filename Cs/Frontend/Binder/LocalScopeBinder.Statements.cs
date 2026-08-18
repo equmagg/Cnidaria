@@ -62,6 +62,149 @@ namespace Cnidaria.Cs
             var expressionBody = scope.BindStatement(node.Statement, context, diagnostics);
             return new BoundUsingStatement(node, ImmutableArray<BoundLocalDeclarationStatement>.Empty, expression, expressionBody);
         }
+        private BoundStatement BindLockStatement(
+            LockStatementSyntax node,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var expression = BindExpression(node.Expression, context, diagnostics);
+            bool hasErrors = expression.HasErrors;
+
+            if (!expression.HasErrors &&
+                expression.Type is not ErrorTypeSymbol &&
+                !IsValidLockTargetType(expression.Type))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_LOCK001",
+                    DiagnosticSeverity.Error,
+                    $"'{expression.Type.Name}' is not a reference type as required by the lock statement.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Expression.Span)));
+                hasErrors = true;
+            }
+
+            if (IsSystemThreadingLockType(expression.Type))
+            {
+                if (!ValidateSystemThreadingLockType((NamedTypeSymbol)expression.Type, node.Expression, context, diagnostics))
+                    hasErrors = true;
+
+                if (context.ContainingSymbol is MethodSymbol { IsAsync: true })
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_LOCK004",
+                        DiagnosticSeverity.Error,
+                        "A lock statement on a value of type 'System.Threading.Lock' cannot be used in an async method or async lambda expression.",
+                        new Location(context.SemanticModel.SyntaxTree, node.Expression.Span)));
+                    hasErrors = true;
+                }
+            }
+
+            if (IsInvalidEmbeddedStatement(node.Statement))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_STMT001",
+                    DiagnosticSeverity.Error,
+                    "Embedded statement cannot be a declaration or labeled statement.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Statement.Span)));
+                hasErrors = true;
+            }
+
+            var scope = new LocalScopeBinder(parent: this, flags: Flags, containing: _containing);
+            var body = scope.BindStatement(node.Statement, context, diagnostics);
+            return new BoundLockStatement(node, expression, body, hasErrors);
+        }
+
+        private static bool IsValidLockTargetType(TypeSymbol type)
+        {
+            if (type is NullTypeSymbol)
+                return true;
+
+            if (type.IsReferenceType)
+                return true;
+
+            if (type is TypeParameterSymbol typeParameter)
+                return !typeParameter.IsValueType;
+
+            return false;
+        }
+
+        private static bool IsInvalidEmbeddedStatement(StatementSyntax statement)
+            => statement is LocalDeclarationStatementSyntax or LabeledStatementSyntax or LocalFunctionStatementSyntax;
+
+        private static bool IsSystemThreadingLockType(TypeSymbol type)
+        {
+            if (type is not NamedTypeSymbol named)
+                return false;
+
+            var definition = named.OriginalDefinition;
+            return definition.Arity == 0 &&
+                   StringComparer.Ordinal.Equals(definition.Name, "Lock") &&
+                   IsNamespaceFullName(definition.ContainingSymbol, "System.Threading");
+        }
+
+        private static bool ValidateSystemThreadingLockType(
+            NamedTypeSymbol lockType,
+            SyntaxNode diagnosticNode,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var enterScope = FindUniquePublicParameterlessInstanceMethod(lockType, "EnterScope");
+            if (enterScope is null ||
+                enterScope.ReturnType is not NamedTypeSymbol scopeType ||
+                scopeType.Arity != 0 ||
+                !StringComparer.Ordinal.Equals(scopeType.Name, "Scope") ||
+                scopeType.TypeKind != TypeKind.Struct ||
+                !scopeType.IsRefLikeType ||
+                scopeType.DeclaredAccessibility != Accessibility.Public ||
+                !ReferenceEquals(scopeType.ContainingSymbol, lockType.OriginalDefinition))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_LOCK002",
+                    DiagnosticSeverity.Error,
+                    "Missing compiler required member 'System.Threading.Lock.EnterScope'.",
+                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                return false;
+            }
+
+            var dispose = FindUniquePublicParameterlessInstanceMethod(scopeType, "Dispose");
+            if (dispose is null || dispose.ReturnType.SpecialType != SpecialType.System_Void)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_LOCK003",
+                    DiagnosticSeverity.Error,
+                    "Missing compiler required member 'System.Threading.Lock.Scope.Dispose'.",
+                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                return false;
+            }
+
+            return true;
+        }
+
+        private static MethodSymbol? FindUniquePublicParameterlessInstanceMethod(NamedTypeSymbol type, string name)
+        {
+            MethodSymbol? result = null;
+            var members = type.GetMembers();
+            for (int i = 0; i < members.Length; i++)
+            {
+                if (members[i] is not MethodSymbol method ||
+                    !StringComparer.Ordinal.Equals(method.Name, name) ||
+                    method.IsStatic ||
+                    method.IsConstructor ||
+                    method.DeclaredAccessibility != Accessibility.Public ||
+                    method.Parameters.Length != 0 ||
+                    method.TypeParameters.Length != 0)
+                {
+                    continue;
+                }
+
+                if (result is not null)
+                    return null;
+
+                result = method;
+            }
+
+            return result;
+        }
+
         private ImmutableArray<BoundLocalDeclarationStatement> BindUsingResourceDeclaration(
             UsingStatementSyntax ownerSyntax,
             VariableDeclarationSyntax declaration,
@@ -370,6 +513,7 @@ namespace Cnidaria.Cs
                 return null;
 
             var name = decl.Identifier.ValueText ?? string.Empty;
+            ReportFieldKeywordDeclaration(decl.Identifier, context, diagnostics);
             if (name.Length == 0)
                 return null;
 
@@ -522,6 +666,65 @@ namespace Cnidaria.Cs
 
             return new BoundIfStatement(node, condition, thenStmt, elseStmt);
         }
+        private bool TryBindSwitchTypePatternAsConstant(
+            TypePatternSyntax pattern,
+            TypeSymbol governingType,
+            SyntaxNode diagnosticNode,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            out ExpressionSyntax expressionSyntax,
+            out BoundExpression value)
+        {
+            var probeDiagnostics = new DiagnosticBag();
+            var probeContext = WithRecorder(context, NullBindingRecorder.Instance);
+            var probeType = BindType(pattern.Type, probeContext, probeDiagnostics);
+            if (probeType is not ErrorTypeSymbol || !TryConvertPatternTypeToExpression(pattern.Type, out expressionSyntax))
+            {
+                expressionSyntax = null!;
+                value = null!;
+                return false;
+            }
+
+            value = BindExpression(expressionSyntax, context, diagnostics);
+            value = ApplyConversion(
+                expressionSyntax,
+                value,
+                governingType,
+                diagnosticNode,
+                context,
+                diagnostics,
+                requireImplicit: true);
+            return true;
+        }
+
+        private static bool TryConvertPatternTypeToExpression(TypeSyntax type, out ExpressionSyntax expression)
+        {
+            switch (type)
+            {
+                case SimpleNameSyntax simpleName:
+                    expression = simpleName;
+                    return true;
+
+                case QualifiedNameSyntax qualifiedName:
+                    if (!TryConvertPatternTypeToExpression(qualifiedName.Left, out var left))
+                    {
+                        expression = null!;
+                        return false;
+                    }
+
+                    expression = new MemberAccessExpressionSyntax(
+                        SyntaxKind.SimpleMemberAccessExpression,
+                        left,
+                        qualifiedName.DotToken,
+                        qualifiedName.Right);
+                    return true;
+
+                default:
+                    expression = null!;
+                    return false;
+            }
+        }
+
         // Case labels lower to boolean tests against one stabilized governing value
         private BoundExpression BindSwitchLabelCondition(
             SyntaxNode diagnosticNode,
@@ -570,6 +773,38 @@ namespace Cnidaria.Cs
                 BoundExpression match;
                 switch (cps.Pattern)
                 {
+                    case TypePatternSyntax typePattern:
+                        {
+                            if (TryBindSwitchTypePatternAsConstant(
+                                typePattern,
+                                governingType,
+                                diagnosticNode,
+                                ctx,
+                                diagnostics,
+                                out var constantSyntax,
+                                out var value))
+                            {
+                                if (value.HasErrors)
+                                    return new BoundBadExpression(label);
+                                if (!value.ConstantValueOpt.HasValue)
+                                {
+                                    diagnostics.Add(new Diagnostic("CN_SWITCH000", DiagnosticSeverity.Error,
+                                        "A switch case label must be a constant expression.",
+                                        new Location(ctx.SemanticModel.SyntaxTree, typePattern.Span)));
+                                    match = MakeBoolLiteral(label, ctx, value: false);
+                                    break;
+                                }
+                                if (cps.WhenClause is null)
+                                    gotoCaseKey = new SwitchCaseKey(value.ConstantValueOpt.Value);
+                                var eqTok = MakeToken(SyntaxKind.EqualsEqualsToken, cps.CaseKeyword.Span);
+                                var eqSyntax = new BinaryExpressionSyntax(SyntaxKind.EqualsExpression, tmpExprSyntax, eqTok, constantSyntax);
+                                match = BindEqualityBinary(eqSyntax, tmpExpr, value, ctx, diagnostics);
+                                break;
+                            }
+
+                            match = BindIsPatternCore(label, tmpExpr, cps.Pattern, ctx, diagnostics);
+                            break;
+                        }
                     case ConstantPatternSyntax cp:
                         {
                             var value = BindExpression(cp.Expression, ctx, diagnostics);
@@ -590,6 +825,12 @@ namespace Cnidaria.Cs
                             match = BindEqualityBinary(eqSyntax, tmpExpr, value, ctx, diagnostics);
                             break;
                         }
+                    case RelationalPatternSyntax relationalPattern:
+                        match = BindIsPatternCore(label, tmpExpr, relationalPattern, ctx, diagnostics);
+                        break;
+                    case BinaryPatternSyntax binaryPattern when binaryPattern.Kind is SyntaxKind.AndPattern or SyntaxKind.OrPattern:
+                        match = BindIsPatternCore(label, tmpExpr, binaryPattern, ctx, diagnostics);
+                        break;
                     case DiscardPatternSyntax:
                         match = MakeBoolLiteral(label, ctx, value: true);
                         isFallbackLabel = cps.WhenClause is null;
@@ -628,6 +869,37 @@ namespace Cnidaria.Cs
             BoundExpression match;
             switch (arm.Pattern)
             {
+                case TypePatternSyntax typePattern:
+                    {
+                        if (TryBindSwitchTypePatternAsConstant(
+                            typePattern,
+                            governingType,
+                            arm,
+                            ctx,
+                            diagnostics,
+                            out var constantSyntax,
+                            out var value))
+                        {
+                            if (value.HasErrors)
+                                return new BoundBadExpression(arm);
+                            if (!value.ConstantValueOpt.HasValue)
+                            {
+                                diagnostics.Add(new Diagnostic("CN_SWITCHEXPR000", DiagnosticSeverity.Error,
+                                    "A switch expression arm pattern must be a constant expression.",
+                                    new Location(ctx.SemanticModel.SyntaxTree, typePattern.Span)));
+                                match = MakeBoolLiteral(arm, ctx, value: false);
+                                break;
+                            }
+
+                            var eqTok = MakeToken(SyntaxKind.EqualsEqualsToken, arm.EqualsGreaterThanToken.Span);
+                            var eqSyntax = new BinaryExpressionSyntax(SyntaxKind.EqualsExpression, tmpExprSyntax, eqTok, constantSyntax);
+                            match = BindEqualityBinary(eqSyntax, tmpExpr, value, ctx, diagnostics);
+                            break;
+                        }
+
+                        match = BindIsPatternCore(arm, tmpExpr, arm.Pattern, ctx, diagnostics);
+                        break;
+                    }
                 case ConstantPatternSyntax cp:
                     {
                         var value = BindExpression(cp.Expression, ctx, diagnostics);
@@ -647,6 +919,12 @@ namespace Cnidaria.Cs
                         match = BindEqualityBinary(eqSyntax, tmpExpr, value, ctx, diagnostics);
                         break;
                     }
+                case RelationalPatternSyntax relationalPattern:
+                    match = BindIsPatternCore(arm, tmpExpr, relationalPattern, ctx, diagnostics);
+                    break;
+                case BinaryPatternSyntax binaryPattern when binaryPattern.Kind is SyntaxKind.AndPattern or SyntaxKind.OrPattern:
+                    match = BindIsPatternCore(arm, tmpExpr, binaryPattern, ctx, diagnostics);
+                    break;
                 case DiscardPatternSyntax:
                     match = MakeBoolLiteral(arm, ctx, value: true);
                     break;
@@ -757,6 +1035,13 @@ namespace Cnidaria.Cs
             if (fallbackSection >= 0) stmts.Add(new BoundGotoStatement(node, sectionLabels[fallbackSection]));
             else stmts.Add(new BoundGotoStatement(node, breakLabel));
             var switchGotoScope = new SwitchGotoScope(governing.Type, gotoCaseLabels, gotoDefaultLabel);
+            var switchBinder = new LocalScopeBinder(parent: this, flags: Flags, containing: _containing);
+            for (int i = 0; i < sectionCount; i++)
+            {
+                var sectionStatements = node.Sections[i].Statements.ToArray();
+                switchBinder.PredeclareLocalFunctionsInStatementList(ImmutableArray.CreateRange(sectionStatements), ctx, diagnostics);
+            }
+
             _flow.PushBreak(breakLabel);
             _flow.PushSwitchGotoScope(switchGotoScope);
             try
@@ -768,9 +1053,8 @@ namespace Cnidaria.Cs
                     _flow.RegisterLabelDefinition(sectionLabels[i]);
                     stmts.Add(new BoundLabelStatement(sec, sectionLabels[i]));
 
-                    var sectionBinder = new LocalScopeBinder(parent: this, flags: Flags, containing: _containing);
+                    var sectionBinder = new LocalScopeBinder(parent: switchBinder, flags: Flags, containing: _containing);
                     var secStatements = sec.Statements.ToArray();
-                    sectionBinder.PredeclareLocalFunctionsInStatementList(ImmutableArray.CreateRange(secStatements), ctx, diagnostics);
 
                     var boundSecStmts = ImmutableArray.CreateBuilder<BoundStatement>(secStatements.Length);
                     for (int s = 0; s < secStatements.Length; s++)

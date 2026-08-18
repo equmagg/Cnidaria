@@ -128,6 +128,7 @@ namespace Cnidaria.Cs
                 BoundExpressionStatement s => RewriteExpressionStatement(s),
                 BoundLocalDeclarationStatement s => RewriteLocalDeclarationStatement(s),
                 BoundUsingStatement s => RewriteUsingStatement(s),
+                BoundLockStatement s => RewriteLockStatement(s),
                 BoundEmptyStatement s => s,
                 BoundTryStatement s => RewriteTryStatement(s),
                 BoundThrowStatement s => RewriteThrowStatement(s),
@@ -471,6 +472,16 @@ namespace Cnidaria.Cs
 
             return node;
         }
+        protected virtual BoundStatement RewriteLockStatement(BoundLockStatement node)
+        {
+            var expression = RewriteExpression(node.Expression);
+            var body = RewriteStatement(node.Body);
+
+            if (!ReferenceEquals(expression, node.Expression) || !ReferenceEquals(body, node.Body))
+                return new BoundLockStatement((LockStatementSyntax)node.Syntax, expression, body, node.HasErrors);
+
+            return node;
+        }
         protected virtual BoundStatement RewriteReturnStatement(BoundReturnStatement node)
         {
             var expr = node.Expression is null ? null : RewriteExpression(node.Expression);
@@ -675,10 +686,12 @@ namespace Cnidaria.Cs
             if (changed)
             {
                 return new BoundSpanCollectionExpression(
-                    (CollectionExpressionSyntax)node.Syntax,
+                    node.Syntax,
                     (NamedTypeSymbol)node.Type,
                     node.ElementType,
-                    elements);
+                    elements,
+                    node.IsUtf8Encoded,
+                    node.NeedsUtf8NullTerminator);
             }
 
             return node;

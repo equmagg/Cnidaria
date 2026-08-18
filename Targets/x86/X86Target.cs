@@ -491,6 +491,8 @@ namespace Cnidaria.X86
         Vpsrld,
         Vpsrlq,
         Vpsrad,
+        Cmpxchg,
+        Xadd,
     }
 
     public enum X86Register : byte
@@ -1078,6 +1080,8 @@ namespace Cnidaria.X86
                 X86InstrKind.Sub => "sub",
                 X86InstrKind.Xor => "xor",
                 X86InstrKind.Cmp => "cmp",
+                X86InstrKind.Cmpxchg => "cmpxchg",
+                X86InstrKind.Xadd => "xadd",
                 X86InstrKind.Test => "test",
                 X86InstrKind.Inc => "inc",
                 X86InstrKind.Dec => "dec",
@@ -1239,6 +1243,8 @@ namespace Cnidaria.X86
             Add(map, X86InstrKind.Sub, X86InstructionFormat.Binary);
             Add(map, X86InstrKind.Xor, X86InstructionFormat.Binary);
             Add(map, X86InstrKind.Cmp, X86InstructionFormat.Binary);
+            Add(map, X86InstrKind.Cmpxchg, X86InstructionFormat.Binary);
+            Add(map, X86InstrKind.Xadd, X86InstructionFormat.Binary);
             Add(map, X86InstrKind.Test, X86InstructionFormat.Binary);
             Add(map, X86InstrKind.Inc, X86InstructionFormat.Unary);
             Add(map, X86InstrKind.Dec, X86InstructionFormat.Unary);

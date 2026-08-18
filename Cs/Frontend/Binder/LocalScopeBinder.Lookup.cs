@@ -266,7 +266,7 @@ namespace Cnidaria.Cs
             if (field is not null)
             {
                 bool isRefField = field.Type is ByRefTypeSymbol;
-                TypeSymbol fieldValueType = isRefField ? ((ByRefTypeSymbol)field.Type).ElementType : field.Type;
+                TypeSymbol fieldValueType = GetFieldValueType(field);
 
                 bool canWriteField = !field.IsConst && (isRefField || !field.IsReadOnly);
                 var cv = field.IsConst ? field.ConstantValueOpt : Optional<object>.None;
@@ -680,6 +680,8 @@ namespace Cnidaria.Cs
                 ? new LocalScopeBinder(parent: this, flags: Flags | BinderFlags.UnsafeRegion, containing: _containing)
                 : this;
             var sigContext = new BindingContext(context.Compilation, context.SemanticModel, sym, context.Recorder);
+            GenericConstraintBinder.BindOwnerTypeConstraints(
+                tree, lf.ConstraintClauses, sym.TypeParameters, sym, sigBinder, sigContext, diagnostics);
             var returnType = sigBinder.BindType(lf.ReturnType, sigContext, diagnostics);
 
             var pars = lf.ParameterList.Parameters;
@@ -690,6 +692,7 @@ namespace Cnidaria.Cs
             {
                 var p = pars[i];
                 var pn = p.Identifier.ValueText ?? "";
+                ReportFieldKeywordDeclaration(p.Identifier, sigContext, diagnostics);
                 if (!seen.Add(pn))
                 {
                     diagnostics.Add(new Diagnostic("CN_LFUNC005", DiagnosticSeverity.Error,
@@ -726,7 +729,11 @@ namespace Cnidaria.Cs
                 pb.Add(parameter);
             }
 
-            sym.SetSignature(returnType, pb.ToImmutable());
+            sym.SetSignature(
+                returnType,
+                pb.ToImmutable(),
+                lf.ReturnType is RefTypeSyntax refReturn &&
+                refReturn.ReadOnlyKeyword.Kind == SyntaxKind.ReadOnlyKeyword);
             return sym;
         }
         private void BindLocalFunctionParameterDefault(
@@ -757,6 +764,12 @@ namespace Cnidaria.Cs
                     DiagnosticSeverity.Error,
                     "'params' parameters cannot have a default value.",
                     new Location(sigContext.SemanticModel.SyntaxTree, def.Span)));
+                return;
+            }
+
+            if (def.Value.Kind == SyntaxKind.DefaultLiteralExpression)
+            {
+                parameter.SetDefaultValue(new Optional<object>(null!));
                 return;
             }
 

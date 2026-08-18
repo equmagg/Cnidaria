@@ -171,6 +171,144 @@ namespace Cnidaria.Cs
                 _ => ""
             };
         }
+        private BoundExpression BindFieldExpression(
+            FieldExpressionSyntax node,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var property = GetAssociatedSourceProperty(context.ContainingSymbol);
+            if (property is null)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FIELD003",
+                    DiagnosticSeverity.Error,
+                    "The 'field' keyword is only valid within a property accessor or expression body.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                return new BoundBadExpression(node);
+            }
+
+            if (property.Type is ByRefTypeSymbol)
+                return new BoundBadExpression(node);
+
+            if (WouldFieldBindToDifferentSymbol(node, context))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_FIELD9258",
+                    DiagnosticSeverity.Warning,
+                    "In this language version, the 'field' keyword binds to a synthesized backing field for the property. To avoid generating a synthesized backing field, and to refer to the existing member, use 'this.field' or '@field' instead.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+            }
+
+            var backingField = property.BackingFieldOpt ?? property.EnsureBackingField(IsBackingFieldReadOnly(property));
+            BoundExpression? receiver = null;
+
+            if (!backingField.IsStatic)
+            {
+                if (context.ContainingSymbol is MethodSymbol { IsStatic: true })
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_MEMACC011",
+                        DiagnosticSeverity.Error,
+                        $"An object reference is required for the backing field of property '{property.Name}'.",
+                        new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                    return new BoundBadExpression(node);
+                }
+
+                if (property.ContainingSymbol is not NamedTypeSymbol containingType)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_FIELD004",
+                        DiagnosticSeverity.Error,
+                        "Cannot resolve the containing type for the synthesized backing field.",
+                        new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                    return new BoundBadExpression(node);
+                }
+
+                receiver = new BoundThisExpression(node, containingType);
+            }
+
+            return new BoundMemberAccessExpression(
+                node,
+                receiver,
+                backingField,
+                backingField.Type,
+                isLValue: !backingField.IsReadOnly,
+                constantValueOpt: Optional<object>.None);
+        }
+
+        private bool WouldFieldBindToDifferentSymbol(FieldExpressionSyntax node, BindingContext context)
+        {
+            var identifier = new IdentifierNameSyntax(node.Token);
+            return BindIdentifier(identifier, context, new DiagnosticBag()) is not BoundBadExpression;
+        }
+
+        private static SourcePropertySymbol? GetAssociatedSourceProperty(Symbol? symbol)
+        {
+            for (var current = symbol; current is not null; current = current.ContainingSymbol)
+            {
+                if (current is SourceMethodSymbol method && method.AssociatedProperty is SourcePropertySymbol property)
+                    return property;
+            }
+
+            return null;
+        }
+
+        private void ReportFieldKeywordDeclaration(
+            SyntaxToken identifier,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (identifier.Kind != SyntaxKind.IdentifierToken || identifier.ContextualKind != SyntaxKind.FieldKeyword)
+                return;
+
+            if (GetAssociatedSourceProperty(context.ContainingSymbol) is null)
+                return;
+
+            diagnostics.Add(new Diagnostic(
+                "CN_FIELD9272",
+                DiagnosticSeverity.Error,
+                "'field' is a keyword within a property accessor. Rename the variable or use the identifier '@field' instead.",
+                new Location(context.SemanticModel.SyntaxTree, identifier.Span)));
+        }
+
+        private void ReportFieldKeywordDeclaration(
+            VariableDesignationSyntax designation,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            switch (designation)
+            {
+                case SingleVariableDesignationSyntax single:
+                    ReportFieldKeywordDeclaration(single.Identifier, context, diagnostics);
+                    break;
+                case ParenthesizedVariableDesignationSyntax parenthesized:
+                    for (int i = 0; i < parenthesized.Variables.Count; i++)
+                        ReportFieldKeywordDeclaration(parenthesized.Variables[i], context, diagnostics);
+                    break;
+            }
+        }
+
+        private static bool IsBackingFieldReadOnly(SourcePropertySymbol property)
+        {
+            if (property.ContainingSymbol is not NamedTypeSymbol containingType || !containingType.IsValueType)
+                return false;
+
+            if (containingType.IsReadOnlyStruct)
+                return true;
+
+            var refs = property.DeclaringSyntaxReferences;
+            for (int i = 0; i < refs.Length; i++)
+            {
+                if (refs[i].Node is PropertyDeclarationSyntax declaration &&
+                    HasModifier(declaration.Modifiers, SyntaxKind.ReadOnlyKeyword))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         private BoundExpression BindIdentifier(IdentifierNameSyntax id, BindingContext context, DiagnosticBag diagnostics)
         {
             var name = id.Identifier.ValueText ?? "";
@@ -411,7 +549,7 @@ namespace Cnidaria.Cs
             return constructed.Count == 0 ? ImmutableArray<MethodSymbol>.Empty : constructed.ToImmutable();
         }
 
-        private static bool TryBindUnqualifiedMember(
+        private bool TryBindUnqualifiedMember(
             IdentifierNameSyntax id,
             string name,
             BindValueKind valueKind,
@@ -511,7 +649,7 @@ namespace Cnidaria.Cs
                 BoundExpression? receiver = field.IsStatic ? null : new BoundThisExpression(id, containingType);
 
                 bool isRefField = field.Type is ByRefTypeSymbol;
-                TypeSymbol fieldValueType = isRefField ? ((ByRefTypeSymbol)field.Type).ElementType : field.Type;
+                TypeSymbol fieldValueType = GetFieldValueType(field);
                 if (valueKind == BindValueKind.LValue &&
                     !field.IsStatic &&
                     IsReadOnlyStructThisReceiver(receiver, context) &&
@@ -608,7 +746,7 @@ namespace Cnidaria.Cs
             if (operand.HasErrors)
                 return operand;
 
-            if (!operand.IsLValue)
+            if (!operand.IsLValue && !(operand is BoundConditionalExpression ce && ce.Type is ByRefTypeSymbol))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_REF000",
@@ -630,13 +768,23 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(node);
             }
 
-            if (operand is BoundMemberAccessExpression { Member: PropertySymbol } ||
-                operand is BoundIndexerAccessExpression)
+            if (IsNonRefReturningPropertyTarget(operand))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_REF002",
                     DiagnosticSeverity.Error,
                     "A property cannot be used as a ref value here.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Expression.Span)));
+
+                return new BoundBadExpression(node);
+            }
+
+            if (IsReadOnlyRefReturnTarget(operand))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_REF004",
+                    DiagnosticSeverity.Error,
+                    "Cannot use a 'ref readonly' return value as a writable ref.",
                     new Location(context.SemanticModel.SyntaxTree, node.Expression.Span)));
 
                 return new BoundBadExpression(node);
@@ -834,26 +982,6 @@ namespace Cnidaria.Cs
             };
         }
 
-        private static bool IsRefReadonlyMethodReturn(MethodSymbol method)
-        {
-            var references = method.DeclaringSyntaxReferences;
-            for (int i = 0; i < references.Length; i++)
-            {
-                TypeSyntax? returnType = references[i].Node switch
-                {
-                    MethodDeclarationSyntax declaration => declaration.ReturnType,
-                    LocalFunctionStatementSyntax localFunction => localFunction.ReturnType,
-                    _ => null
-                };
-
-                if (returnType is RefTypeSyntax refType &&
-                    refType.ReadOnlyKeyword.Kind == SyntaxKind.ReadOnlyKeyword)
-                    return true;
-            }
-
-            return false;
-        }
-
         private static bool FunctionPointerSignatureMatches(MethodSymbol method, FunctionPointerTypeSymbol type)
         {
             if (type.CallingConvention != FunctionPointerCallingConvention.Managed ||
@@ -864,7 +992,7 @@ namespace Cnidaria.Cs
             var methodReturnRefKind = GetFunctionPointerRefKind(
                 method.ReturnType,
                 ParameterRefKind.None,
-                IsRefReadonlyMethodReturn(method));
+                method.ReturnsByRefReadonly);
             if (methodReturnRefKind != type.ReturnRefKind)
                 return false;
 
@@ -1472,8 +1600,9 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(invocation);
             }
 
-            var receiverType = GetReceiverTypeForMemberLookup(receiver.Type, context);
-            if (receiverType is null)
+            var receiverTypeParameter = receiver.Type as TypeParameterSymbol;
+            var receiverType = GetReceiverTypeForMemberLookup(receiver.Type);
+            if (receiverType is null && receiverTypeParameter is null)
             {
                 diagnostics.Add(new Diagnostic("CN_CALL021", DiagnosticSeverity.Error,
                     "Receiver is not a type or a value with members.",
@@ -1481,8 +1610,11 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(invocation);
             }
 
-            var candidates = LookupMethods(receiverType, name)
-                .Where(m => !m.IsStatic && AccessibilityHelper.IsAccessible(m, context))
+            var candidates = receiverTypeParameter is not null
+                ? LookupInstanceMethods(receiverTypeParameter, name, context)
+                : LookupMethods(receiverType!, name).Where(m => !m.IsStatic).ToImmutableArray();
+            candidates = candidates
+                .Where(m => AccessibilityHelper.IsAccessible(m, context))
                 .ToImmutableArray();
 
             if (!candidates.IsDefaultOrEmpty)
@@ -1576,7 +1708,7 @@ namespace Cnidaria.Cs
                 return BindDelegateInvocation(invocation, memberValue, argSyntaxes, args, context, diagnostics);
 
             diagnostics.Add(new Diagnostic("CN_CALL022", DiagnosticSeverity.Error,
-                $"No method '{name}' found on type '{receiverType.Name}'.",
+                $"No method '{name}' found on type '{receiverTypeParameter?.Name ?? receiverType!.Name}'.",
                 new Location(context.SemanticModel.SyntaxTree, nameSyntax.Span)));
             return new BoundBadExpression(invocation);
         }

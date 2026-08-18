@@ -1550,7 +1550,7 @@ namespace Cnidaria.Cs
                     return condition;
                 }
             }
-            private static bool TryGetAutoPropertyBackingField(PropertySymbol prop, out FieldSymbol backingField)
+            private static bool TryGetPropertyBackingField(PropertySymbol prop, out FieldSymbol backingField)
             {
                 if (prop is SourcePropertySymbol sp && sp.BackingFieldOpt is FieldSymbol bf)
                 {
@@ -1560,6 +1560,47 @@ namespace Cnidaria.Cs
 
                 backingField = null!;
                 return false;
+            }
+            private static bool TryGetAutoPropertyBackingField(PropertySymbol prop, out FieldSymbol backingField)
+            {
+                if (prop is SourcePropertySymbol sp &&
+                    sp.BackingFieldOpt is FieldSymbol bf &&
+                    HasOnlySemicolonAccessors(sp))
+                {
+                    backingField = bf;
+                    return true;
+                }
+
+                backingField = null!;
+                return false;
+            }
+            private static bool HasOnlySemicolonAccessors(SourcePropertySymbol property)
+            {
+                var refs = property.DeclaringSyntaxReferences;
+                bool found = false;
+
+                for (int i = 0; i < refs.Length; i++)
+                {
+                    if (refs[i].Node is not PropertyDeclarationSyntax declaration)
+                        continue;
+
+                    found = true;
+                    if (declaration.ExpressionBody is not null ||
+                        declaration.AccessorList is null ||
+                        declaration.AccessorList.Accessors.Count == 0)
+                    {
+                        return false;
+                    }
+
+                    var accessors = declaration.AccessorList.Accessors;
+                    for (int a = 0; a < accessors.Count; a++)
+                    {
+                        if (accessors[a].Body is not null || accessors[a].ExpressionBody is not null)
+                            return false;
+                    }
+                }
+
+                return found;
             }
             private static bool TryGetBoolConstant(BoundExpression expr, out bool value)
             {
@@ -1816,6 +1857,148 @@ namespace Cnidaria.Cs
                 return tail;
             }
 
+            protected override BoundStatement RewriteLockStatement(BoundLockStatement node)
+            {
+                var body = RewriteStatement(node.Body);
+                var expression = RewriteExpression(node.Expression);
+
+                if (IsSystemThreadingLockType(expression.Type))
+                    return LowerSystemThreadingLock(node.Syntax, expression, body);
+
+                return LowerMonitorLock(node.Syntax, expression, body);
+            }
+
+            private BoundStatement LowerSystemThreadingLock(
+                SyntaxNode syntax,
+                BoundExpression expression,
+                BoundStatement body)
+            {
+                var lockType = (NamedTypeSymbol)expression.Type;
+                var enterScope = FindParameterlessInstanceMethod(lockType, "EnterScope", null)
+                    ?? throw new InvalidOperationException("System.Threading.Lock.EnterScope was not found during lowering.");
+                if (enterScope.ReturnType is not NamedTypeSymbol scopeType)
+                    throw new InvalidOperationException("System.Threading.Lock.EnterScope must return System.Threading.Lock.Scope.");
+
+                var lockTemp = CreateTempLocal(lockType);
+                var lockDeclaration = new BoundLocalDeclarationStatement(syntax, lockTemp, expression);
+                var lockExpression = new BoundLocalExpression(syntax, lockTemp);
+                var enterCall = RewriteExpression(new BoundCallExpression(
+                    syntax,
+                    lockExpression,
+                    enterScope,
+                    ImmutableArray<BoundExpression>.Empty));
+                var scopeTemp = CreateTempLocal(scopeType);
+                var scopeDeclaration = new BoundLocalDeclarationStatement(syntax, scopeTemp, enterCall);
+                var protectedBody = LowerUsingLocal(syntax, scopeDeclaration, body);
+
+                return new BoundBlockStatement(
+                    syntax,
+                    ImmutableArray.Create<BoundStatement>(lockDeclaration, protectedBody));
+            }
+
+            private BoundStatement LowerMonitorLock(
+                SyntaxNode syntax,
+                BoundExpression expression,
+                BoundStatement body)
+            {
+                var objectType = _compilation.GetSpecialType(SpecialType.System_Object);
+                BoundExpression objectExpression = expression;
+                if (!ReferenceEquals(expression.Type, objectType))
+                {
+                    var conversion = LocalScopeBinder.ClassifyConversion(expression, objectType);
+                    if (!conversion.Exists || !conversion.IsImplicit)
+                        throw new InvalidOperationException($"Lock expression type '{expression.Type.Name}' is not convertible to System.Object.");
+                    objectExpression = RewriteExpression(new BoundConversionExpression(
+                        syntax,
+                        objectType,
+                        expression,
+                        conversion,
+                        isChecked: false));
+                }
+
+                var temp = CreateTempLocal(objectType);
+                var declaration = new BoundLocalDeclarationStatement(syntax, temp, objectExpression);
+                var enter = FindMonitorMethod("Enter", objectType);
+                var exit = FindMonitorMethod("Exit", objectType);
+                var enterExpression = RewriteExpression(new BoundCallExpression(
+                    syntax,
+                    receiverOpt: null,
+                    enter,
+                    ImmutableArray.Create<BoundExpression>(new BoundLocalExpression(syntax, temp))));
+                var exitExpression = RewriteExpression(new BoundCallExpression(
+                    syntax,
+                    receiverOpt: null,
+                    exit,
+                    ImmutableArray.Create<BoundExpression>(new BoundLocalExpression(syntax, temp))));
+
+                var tryBlock = body is BoundBlockStatement block
+                    ? block
+                    : new BoundBlockStatement(
+                        body.Syntax,
+                        IsNoOpStatement(body)
+                            ? ImmutableArray<BoundStatement>.Empty
+                            : ImmutableArray.Create(body));
+                var finallyBlock = new BoundBlockStatement(
+                    syntax,
+                    ImmutableArray.Create<BoundStatement>(new BoundExpressionStatement(syntax, exitExpression)));
+                var tryStatement = new BoundTryStatement(
+                    CreateSyntheticTryStatementSyntax(),
+                    tryBlock,
+                    ImmutableArray<BoundCatchBlock>.Empty,
+                    finallyBlock);
+
+                return new BoundBlockStatement(
+                    syntax,
+                    ImmutableArray.Create<BoundStatement>(
+                        declaration,
+                        new BoundExpressionStatement(syntax, enterExpression),
+                        tryStatement));
+            }
+
+            private MethodSymbol FindMonitorMethod(string name, TypeSymbol objectType)
+            {
+                var monitorType = GetWellKnownType(
+                    _compilation,
+                    new[] { "System", "Threading" },
+                    "Monitor",
+                    0) ?? throw new InvalidOperationException("System.Threading.Monitor was not found during lock lowering.");
+                var members = monitorType.GetMembers();
+                for (int i = 0; i < members.Length; i++)
+                {
+                    if (members[i] is MethodSymbol method &&
+                        method.IsStatic &&
+                        StringComparer.Ordinal.Equals(method.Name, name) &&
+                        method.TypeParameters.Length == 0 &&
+                        method.Parameters.Length == 1 &&
+                        ReferenceEquals(method.Parameters[0].Type, objectType) &&
+                        method.ReturnType.SpecialType == SpecialType.System_Void)
+                    {
+                        return method;
+                    }
+                }
+
+                throw new InvalidOperationException($"System.Threading.Monitor.{name}(object) was not found during lock lowering.");
+            }
+
+            private static bool IsSystemThreadingLockType(TypeSymbol type)
+            {
+                if (type is not NamedTypeSymbol named)
+                    return false;
+
+                var definition = named.OriginalDefinition;
+                if (definition.Arity != 0 || !StringComparer.Ordinal.Equals(definition.Name, "Lock"))
+                    return false;
+                if (definition.ContainingSymbol is not NamespaceSymbol threading ||
+                    !StringComparer.Ordinal.Equals(threading.Name, "Threading"))
+                {
+                    return false;
+                }
+                return threading.ContainingSymbol is NamespaceSymbol system &&
+                       StringComparer.Ordinal.Equals(system.Name, "System") &&
+                       system.ContainingSymbol is NamespaceSymbol root &&
+                       root.IsGlobalNamespace;
+            }
+
             protected override BoundStatement RewriteUsingStatement(BoundUsingStatement node)
             {
                 BoundStatement body = RewriteStatement(node.Body);
@@ -1979,6 +2162,15 @@ namespace Cnidaria.Cs
                     return LowerSpanCollectionToHeapArray(node);
 
                 var elements = RewriteExpressions(node.Elements, out _);
+                var staticElements = elements;
+                if (node.NeedsUtf8NullTerminator)
+                {
+                    var builder = ImmutableArray.CreateBuilder<BoundExpression>(elements.Length + 1);
+                    builder.AddRange(elements);
+                    builder.Add(new BoundLiteralExpression(node.Syntax, node.ElementType, (byte)0));
+                    staticElements = builder.ToImmutable();
+                }
+
                 var int32 = _compilation.GetSpecialType(SpecialType.System_Int32);
                 var pointerType = _compilation.CreatePointerType(node.ElementType);
 
@@ -1986,7 +2178,7 @@ namespace Cnidaria.Cs
                     node.Syntax,
                     pointerType,
                     node.ElementType,
-                    elements);
+                    staticElements);
 
                 if (!ReferenceEquals(pointerArgument.Type, ctor.Parameters[0].Type))
                 {
@@ -3588,6 +3780,10 @@ namespace Cnidaria.Cs
                             CollectCandidateLocals(forEachStatement.Body, result);
                             return;
 
+                        case BoundLockStatement lockStatement:
+                            CollectCandidateLocals(lockStatement.Body, result);
+                            return;
+
                         case BoundTryStatement tryStatement:
                             CollectCandidateLocals(tryStatement.TryBlock, result);
                             for (int i = 0; i < tryStatement.CatchBlocks.Length; i++)
@@ -3692,6 +3888,10 @@ namespace Cnidaria.Cs
                         case BoundForEachStatement forEachStatement:
                             return ExpressionEscapes(forEachStatement.Collection, local) ||
                                    EscapesFromStatement(forEachStatement.Body, local);
+
+                        case BoundLockStatement lockStatement:
+                            return ExpressionEscapes(lockStatement.Expression, local) ||
+                                   EscapesFromStatement(lockStatement.Body, local);
 
                         case BoundTryStatement tryStatement:
                             if (EscapesFromStatement(tryStatement.TryBlock, local))
@@ -3994,6 +4194,10 @@ namespace Cnidaria.Cs
                         case BoundForEachStatement forEachStatement:
                             return ContainsLocal(forEachStatement.Collection, local) ||
                                    ContainsLocalInStatement(forEachStatement.Body, local);
+                        case BoundLockStatement lockStatement:
+                            return ContainsLocal(lockStatement.Expression, local) ||
+                                   ContainsLocalInStatement(lockStatement.Body, local);
+
                         case BoundTryStatement tryStatement:
                             if (ContainsLocalInStatement(tryStatement.TryBlock, local))
                                 return true;
@@ -4445,7 +4649,7 @@ namespace Cnidaria.Cs
 
                 if (node.Left is BoundMemberAccessExpression { Member: PropertySymbol prop } left)
                 {
-                    // Access the backing field directly
+                    // Access the backing field directly for a semicolon-only property
                     if (TryGetAutoPropertyBackingField(prop, out _))
                     {
                         var rewrittenLeft = RewriteExpression(node.Left);
@@ -4453,9 +4657,24 @@ namespace Cnidaria.Cs
                         return new BoundAssignmentExpression(node.Syntax, rewrittenLeft, rewrittenRight);
                     }
 
-                    // Preserve the property setter call
+                    // Preserve a full or mixed property's setter call
                     if (prop.SetMethod is MethodSymbol setMethod)
                         return LowerPropertyAssignment(node, left, setMethod);
+
+                    // Constructor assignment to a get-only field-backed property writes the backing field
+                    if (TryGetPropertyBackingField(prop, out var backingField))
+                    {
+                        var receiver = left.ReceiverOpt is null ? null : RewriteExpression(left.ReceiverOpt);
+                        var fieldLeft = new BoundMemberAccessExpression(
+                            (ExpressionSyntax)left.Syntax,
+                            receiver,
+                            backingField,
+                            backingField.Type,
+                            isLValue: true,
+                            constantValueOpt: Optional<object>.None);
+                        var rewrittenRight = RewriteExpression(node.Right);
+                        return new BoundAssignmentExpression(node.Syntax, fieldLeft, rewrittenRight);
+                    }
                 }
 
                 return base.RewriteAssignmentExpression(node);

@@ -1455,6 +1455,7 @@ namespace Cnidaria.Cs
 
         private static bool IsCallLike(GenTreeKind kind)
             => kind is
+                GenTreeKind.Intrinsic or
                 GenTreeKind.Call or
                 GenTreeKind.IndirectCall or
                 GenTreeKind.VirtualCall or

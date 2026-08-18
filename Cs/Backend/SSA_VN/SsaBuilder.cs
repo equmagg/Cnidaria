@@ -978,6 +978,7 @@ namespace Cnidaria.Cs
                     break;
 
                 case GenTreeKind.ClassInit:
+                case GenTreeKind.Intrinsic:
                 case GenTreeKind.Call:
                 case GenTreeKind.IndirectCall:
                 case GenTreeKind.VirtualCall:
@@ -1020,7 +1021,7 @@ namespace Cnidaria.Cs
                 if (SsaSlotHelpers.TryGetAddressExposedSlot(node, out _))
                     return true;
 
-                if (node.Kind == GenTreeKind.PointerToByRef)
+                if (node.Kind == GenTreeKind.Unary && node.SourceOp == BytecodeOp.PtrToByRef)
                     return true;
 
                 if (node.Kind == GenTreeKind.FieldAddr && node.Operands.Length != 0)

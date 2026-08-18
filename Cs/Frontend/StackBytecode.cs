@@ -156,6 +156,10 @@ namespace Cnidaria.Cs
         Calli,  // operand0: function pointer type token, operand1: argCount
         FnPtrToPtr,
         PtrToFnPtr,
+        TypeIsPrimitive,
+        TypeIsEnum,
+        TypeEquals,
+        ObjectTypeEquals,
     }
     /// <summary>Identifies the destination representation of a numeric conversion</summary>
     internal enum NumericConvKind : byte
@@ -769,9 +773,9 @@ namespace Cnidaria.Cs
 
             private static bool IsBool(TypeSymbol type) => type.SpecialType == SpecialType.System_Boolean;
 
-            private int GetElementSizeOrThrow(TypeSymbol type)
+            private bool TryGetElementSize(TypeSymbol type, out int size)
             {
-                return type.SpecialType switch
+                size = type.SpecialType switch
                 {
                     SpecialType.System_Boolean => 1,
                     SpecialType.System_Void => 1,
@@ -787,10 +791,53 @@ namespace Cnidaria.Cs
                     SpecialType.System_UInt64 => 8,
                     SpecialType.System_Double => 8,
                     SpecialType.System_Decimal => 16,
-                    _ => (type.IsReferenceType || type is PointerTypeSymbol || type is FunctionPointerTypeSymbol || type is ByRefTypeSymbol)
-                        ? _target.PointerSize
-                        : throw new NotSupportedException($"No known size for '{type.Name}'.")
+                    SpecialType.System_IntPtr => _target.PointerSize,
+                    SpecialType.System_UIntPtr => _target.PointerSize,
+                    _ => 0
                 };
+
+                if (size != 0)
+                    return true;
+
+                if (type.IsReferenceType || type is PointerTypeSymbol || type is FunctionPointerTypeSymbol || type is ByRefTypeSymbol)
+                {
+                    size = _target.PointerSize;
+                    return true;
+                }
+
+                return false;
+            }
+            private int GetElementSizeOrThrow(TypeSymbol type)
+            {
+                if (TryGetElementSize(type, out int size))
+                    return size;
+
+                throw new NotSupportedException($"No known size for '{type.Name}'.");
+            }
+            private void EmitRuntimeElementSize(TypeSymbol elementType, TypeSymbol scaleType)
+            {
+                _il.Emit(BytecodeOp.Sizeof, operand0: _tokens.GetTypeToken(elementType), pop: 0, push: 1);
+
+                if (scaleType.SpecialType == SpecialType.System_IntPtr)
+                {
+                    _il.Emit(BytecodeOp.Conv, operand0: (int)NumericConvKind.NativeInt, pop: 1, push: 1);
+                }
+                else if (scaleType.SpecialType == SpecialType.System_UIntPtr)
+                {
+                    _il.Emit(BytecodeOp.Conv, operand0: (int)NumericConvKind.NativeUInt, pop: 1, push: 1);
+                }
+            }
+            private void EmitPointerElementAddress(TypeSymbol elementType, TypeSymbol indexType)
+            {
+                if (TryGetElementSize(elementType, out int size))
+                {
+                    _il.Emit(BytecodeOp.PtrElemAddr, operand0: size, pop: 2, push: 1);
+                    return;
+                }
+
+                EmitRuntimeElementSize(elementType, indexType);
+                _il.Emit(BytecodeOp.Mul, pop: 2, push: 1);
+                _il.Emit(BytecodeOp.PtrElemAddr, operand0: 1, pop: 2, push: 1);
             }
             private static bool IsAddressableValueTypeReceiver(BoundExpression receiver)
             {
@@ -1424,40 +1471,67 @@ namespace Cnidaria.Cs
                     _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
 
             }
-            private bool TryEmitTypeOfIsValueType(BoundCallExpression call, EmitMode mode)
+            private bool TryEmitTypeOfPredicate(BoundCallExpression call, EmitMode mode)
             {
                 if (call.ReceiverOpt is not BoundTypeOfExpression typeOf || call.Arguments.Length != 0)
                     return false;
 
-                if (!IsSystemTypeIsValueTypeGetter(call.Method))
+                if (!TryGetSystemTypePredicateOpcode(call.Method, out BytecodeOp op))
                     return false;
 
                 if (mode == EmitMode.Discard)
                     return true;
 
-                EmitTypeIsValueType(typeOf.OperandType);
+                EmitTypePredicate(op, typeOf.OperandType);
                 return true;
             }
-            private static bool IsSystemTypeIsValueTypeGetter(MethodSymbol method)
+            private static bool TryGetSystemTypePredicateOpcode(MethodSymbol method, out BytecodeOp op)
             {
+                op = default;
                 if (method.IsStatic ||
                     method.Parameters.Length != 0 ||
                     method.ReturnType.SpecialType != SpecialType.System_Boolean ||
-                    !string.Equals(method.Name, "get_IsValueType", StringComparison.Ordinal))
+                    method.ContainingSymbol is not NamedTypeSymbol containingType ||
+                    !string.Equals(containingType.Name, "Type", StringComparison.Ordinal) ||
+                    !IsInNamespace(containingType, "System"))
                     return false;
 
-                return method.ContainingSymbol is NamedTypeSymbol containingType &&
-                    string.Equals(containingType.Name, "Type", StringComparison.Ordinal) &&
-                    IsInNamespace(containingType, "System");
-            }
-            private void EmitTypeIsValueType(TypeSymbol operandType)
-            {
-                if (TryGetCompileTimeTypeIsValueType(operandType, out bool isValueType))
+                op = method.Name switch
                 {
-                    _il.Emit(BytecodeOp.Ldc_I4, operand0: isValueType ? 1 : 0, pop: 0, push: 1);
+                    "get_IsValueType" => BytecodeOp.TypeIsValueType,
+                    "get_IsPrimitive" => BytecodeOp.TypeIsPrimitive,
+                    "get_IsEnum" => BytecodeOp.TypeIsEnum,
+                    _ => default,
+                };
+                return op is BytecodeOp.TypeIsValueType or BytecodeOp.TypeIsPrimitive or BytecodeOp.TypeIsEnum;
+            }
+            private void EmitTypePredicate(BytecodeOp op, TypeSymbol operandType)
+            {
+                if (TryGetCompileTimeTypePredicate(op, operandType, out bool value))
+                {
+                    _il.Emit(BytecodeOp.Ldc_I4, operand0: value ? 1 : 0, pop: 0, push: 1);
                     return;
                 }
-                _il.Emit(BytecodeOp.TypeIsValueType, operand0: _tokens.GetTypeToken(operandType), pop: 0, push: 1);
+                _il.Emit(op, operand0: _tokens.GetTypeToken(operandType), pop: 0, push: 1);
+            }
+            private static bool TryGetCompileTimeTypePredicate(BytecodeOp op, TypeSymbol type, out bool value)
+            {
+                if (op == BytecodeOp.TypeIsValueType)
+                    return TryGetCompileTimeTypeIsValueType(type, out value);
+
+                if (type is TypeParameterSymbol)
+                {
+                    value = false;
+                    return false;
+                }
+
+                value = op switch
+                {
+                    BytecodeOp.TypeIsPrimitive => IsPrimitiveType(type),
+                    BytecodeOp.TypeIsEnum => type is NamedTypeSymbol { TypeKind: TypeKind.Enum },
+                    _ => throw new InvalidOperationException($"Unexpected type predicate opcode '{op}'."),
+                };
+                return true;
             }
             private static bool TryGetCompileTimeTypeIsValueType(TypeSymbol type, out bool isValueType)
             {
@@ -1473,6 +1547,273 @@ namespace Cnidaria.Cs
                 }
                 isValueType = type.IsValueType;
                 return true;
+            }
+            private static bool IsPrimitiveType(TypeSymbol type)
+            {
+                return type.SpecialType is
+                    SpecialType.System_Boolean or
+                    SpecialType.System_Char or
+                    SpecialType.System_Int8 or
+                    SpecialType.System_UInt8 or
+                    SpecialType.System_Int16 or
+                    SpecialType.System_UInt16 or
+                    SpecialType.System_Int32 or
+                    SpecialType.System_UInt32 or
+                    SpecialType.System_Int64 or
+                    SpecialType.System_UInt64 or
+                    SpecialType.System_Single or
+                    SpecialType.System_Double or
+                    SpecialType.System_IntPtr or
+                    SpecialType.System_UIntPtr;
+            }
+            private static bool ContainsTypeParameter(TypeSymbol type)
+            {
+                switch (type)
+                {
+                    case TypeParameterSymbol:
+                        return true;
+                    case ArrayTypeSymbol array:
+                        return ContainsTypeParameter(array.ElementType);
+                    case PointerTypeSymbol pointer:
+                        return ContainsTypeParameter(pointer.PointedAtType);
+                    case ByRefTypeSymbol byRef:
+                        return ContainsTypeParameter(byRef.ElementType);
+                    case FunctionPointerTypeSymbol functionPointer:
+                        if (ContainsTypeParameter(functionPointer.ReturnType))
+                            return true;
+                        for (int i = 0; i < functionPointer.Parameters.Length; i++)
+                            if (ContainsTypeParameter(functionPointer.Parameters[i].Type))
+                                return true;
+                        return false;
+                    case TupleTypeSymbol tuple:
+                        for (int i = 0; i < tuple.ElementTypes.Length; i++)
+                            if (ContainsTypeParameter(tuple.ElementTypes[i]))
+                                return true;
+                        return false;
+                    case NamedTypeSymbol named:
+                        if (named.ContainingSymbol is NamedTypeSymbol containingType &&
+                            ContainsTypeParameter(containingType))
+                            return true;
+                        var arguments = named.TypeArguments;
+                        for (int i = 0; i < arguments.Length; i++)
+                            if (ContainsTypeParameter(arguments[i]))
+                                return true;
+                        return false;
+                    default:
+                        return false;
+                }
+            }
+            private bool TryEmitTypeEquality(BoundBinaryExpression bin, EmitMode mode)
+            {
+                if (bin.OperatorKind is not (BoundBinaryOperatorKind.Equals or BoundBinaryOperatorKind.NotEquals))
+                    return false;
+
+                bool negate = bin.OperatorKind == BoundBinaryOperatorKind.NotEquals;
+
+                if (bin.Left is BoundTypeOfExpression leftTypeOf && bin.Right is BoundTypeOfExpression rightTypeOf)
+                {
+                    if (mode == EmitMode.Discard)
+                        return true;
+
+                    EmitTypeEquality(leftTypeOf.OperandType, rightTypeOf.OperandType);
+                    if (negate)
+                        EmitBooleanNot();
+                    return true;
+                }
+
+                if (TryGetObjectGetTypeCall(bin.Left, out BoundCallExpression leftGetType) &&
+                    bin.Right is BoundTypeOfExpression rightType)
+                {
+                    EmitObjectGetTypeEquality(leftGetType, rightType.OperandType, negate, mode);
+                    return true;
+                }
+
+                if (bin.Left is BoundTypeOfExpression leftType &&
+                    TryGetObjectGetTypeCall(bin.Right, out BoundCallExpression rightGetType))
+                {
+                    EmitObjectGetTypeEquality(rightGetType, leftType.OperandType, negate, mode);
+                    return true;
+                }
+
+                return false;
+            }
+            private void EmitTypeEquality(TypeSymbol left, TypeSymbol right)
+            {
+                if (AreSameRuntimeTypeIdentity(left, right))
+                {
+                    _il.Emit(BytecodeOp.Ldc_I4, operand0: 1, pop: 0, push: 1);
+                    return;
+                }
+
+                if (!ContainsTypeParameter(left) && !ContainsTypeParameter(right) &&
+                    left is not TupleTypeSymbol && right is not TupleTypeSymbol)
+                {
+                    _il.Emit(BytecodeOp.Ldc_I4, operand0: 0, pop: 0, push: 1);
+                    return;
+                }
+
+                _il.Emit(
+                    BytecodeOp.TypeEquals,
+                    operand0: _tokens.GetTypeToken(left),
+                    operand1: _tokens.GetTypeToken(right),
+                    pop: 0,
+                    push: 1);
+            }
+            private static bool AreSameRuntimeTypeIdentity(TypeSymbol left, TypeSymbol right)
+            {
+                if (ReferenceEquals(left, right))
+                    return true;
+                if (left.SpecialType != SpecialType.None || right.SpecialType != SpecialType.None)
+                    return left.SpecialType == right.SpecialType;
+                if (left.Kind != right.Kind)
+                    return false;
+
+                switch (left, right)
+                {
+                    case (ArrayTypeSymbol a, ArrayTypeSymbol b):
+                        return a.Rank == b.Rank &&
+                            a.IsSZArray == b.IsSZArray &&
+                            AreSameRuntimeTypeIdentity(a.ElementType, b.ElementType);
+
+                    case (PointerTypeSymbol a, PointerTypeSymbol b):
+                        return AreSameRuntimeTypeIdentity(a.PointedAtType, b.PointedAtType);
+
+                    case (ByRefTypeSymbol a, ByRefTypeSymbol b):
+                        return AreSameRuntimeTypeIdentity(a.ElementType, b.ElementType);
+
+                    case (FunctionPointerTypeSymbol a, FunctionPointerTypeSymbol b):
+                        if (a.CallingConvention != b.CallingConvention ||
+                            (a.ReturnRefKind == FunctionPointerRefKind.None) != (b.ReturnRefKind == FunctionPointerRefKind.None) ||
+                            a.Parameters.Length != b.Parameters.Length ||
+                            !AreSameRuntimeTypeIdentity(a.ReturnType, b.ReturnType))
+                            return false;
+                        for (int i = 0; i < a.Parameters.Length; i++)
+                        {
+                            if ((a.Parameters[i].RefKind == FunctionPointerRefKind.None) != (b.Parameters[i].RefKind == FunctionPointerRefKind.None) ||
+                                !AreSameRuntimeTypeIdentity(a.Parameters[i].Type, b.Parameters[i].Type))
+                                return false;
+                        }
+                        return true;
+
+                    case (TupleTypeSymbol a, TupleTypeSymbol b):
+                        if (a.ElementTypes.Length != b.ElementTypes.Length)
+                            return false;
+                        for (int i = 0; i < a.ElementTypes.Length; i++)
+                            if (!AreSameRuntimeTypeIdentity(a.ElementTypes[i], b.ElementTypes[i]))
+                                return false;
+                        return true;
+
+                    case (NamedTypeSymbol a, NamedTypeSymbol b):
+                        if (!ReferenceEquals(a.OriginalDefinition, b.OriginalDefinition))
+                            return false;
+
+                        NamedTypeSymbol? aContaining = a.ContainingSymbol as NamedTypeSymbol;
+                        NamedTypeSymbol? bContaining = b.ContainingSymbol as NamedTypeSymbol;
+                        if (aContaining is not null || bContaining is not null)
+                        {
+                            if (aContaining is null || bContaining is null ||
+                                !AreSameRuntimeTypeIdentity(aContaining, bContaining))
+                                return false;
+                        }
+
+                        var aArguments = a.TypeArguments;
+                        var bArguments = b.TypeArguments;
+                        if (aArguments.Length != bArguments.Length)
+                            return false;
+                        for (int i = 0; i < aArguments.Length; i++)
+                            if (!AreSameRuntimeTypeIdentity(aArguments[i], bArguments[i]))
+                                return false;
+                        return true;
+
+                    case (TypeParameterSymbol a, TypeParameterSymbol b):
+                        return a.Ordinal == b.Ordinal && ReferenceEquals(a.ContainingSymbol, b.ContainingSymbol);
+
+                    default:
+                        return false;
+                }
+            }
+            private void EmitObjectGetTypeEquality(BoundCallExpression getTypeCall, TypeSymbol targetType, bool negate, EmitMode mode)
+            {
+                TypeSymbol receiverType = GetObjectGetTypeReceiverType(getTypeCall);
+                if (receiverType.IsValueType && !IsSystemNullableValueType(receiverType))
+                {
+                    if (getTypeCall.ReceiverOpt is not null)
+                        EmitExpression(getTypeCall.ReceiverOpt, EmitMode.Discard);
+
+                    if (mode == EmitMode.Discard)
+                        return;
+
+                    EmitTypeEquality(receiverType, targetType);
+                    if (negate)
+                        EmitBooleanNot();
+                    return;
+                }
+
+                EmitObjectGetTypeReceiver(getTypeCall);
+                _il.Emit(
+                    BytecodeOp.ObjectTypeEquals,
+                    operand0: _tokens.GetTypeToken(receiverType),
+                    operand1: _tokens.GetTypeToken(targetType),
+                    pop: 1,
+                    push: 1);
+
+                if (negate)
+                    EmitBooleanNot();
+
+                if (mode == EmitMode.Discard)
+                    _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+            }
+            private static bool TryGetObjectGetTypeCall(BoundExpression expression, out BoundCallExpression call)
+            {
+                call = null!;
+                if (expression is not BoundCallExpression candidate ||
+                    candidate.Arguments.Length != 0 ||
+                    !IsSystemObjectGetType(candidate.Method))
+                    return false;
+
+                call = candidate;
+                return true;
+            }
+            private static bool IsSystemObjectGetType(MethodSymbol method)
+            {
+                MethodSymbol definition = method.OriginalDefinition;
+                if (definition.IsStatic ||
+                    definition.Parameters.Length != 0 ||
+                    !string.Equals(definition.Name, "GetType", StringComparison.Ordinal) ||
+                    definition.ContainingSymbol is not NamedTypeSymbol containingType ||
+                    !string.Equals(containingType.Name, "Object", StringComparison.Ordinal) ||
+                    !IsInNamespace(containingType, "System"))
+                    return false;
+
+                return definition.ReturnType is NamedTypeSymbol returnType &&
+                    string.Equals(returnType.Name, "Type", StringComparison.Ordinal) &&
+                    IsInNamespace(returnType, "System");
+            }
+            private TypeSymbol GetObjectGetTypeReceiverType(BoundCallExpression call)
+            {
+                if (call.ReceiverOpt is not null)
+                    return call.ReceiverOpt.Type;
+
+                return _method.ContainingSymbol as NamedTypeSymbol
+                    ?? throw new InvalidOperationException("Cannot resolve implicit GetType receiver type.");
+            }
+            private void EmitObjectGetTypeReceiver(BoundCallExpression call)
+            {
+                if (call.ReceiverOpt is not null)
+                {
+                    EmitExpression(call.ReceiverOpt, EmitMode.Value);
+                    return;
+                }
+
+                if (_method.IsStatic)
+                    throw new InvalidOperationException("GetType call without receiver in a static method.");
+
+                _il.Emit(BytecodeOp.Ldthis, pop: 0, push: 1);
+            }
+            private void EmitBooleanNot()
+            {
+                _il.Emit(BytecodeOp.Ldc_I4, operand0: 0, pop: 0, push: 1);
+                _il.Emit(BytecodeOp.Ceq, pop: 2, push: 1);
             }
             private void EmitLocal(BoundLocalExpression loc, EmitMode mode)
             {
@@ -1580,6 +1921,9 @@ namespace Cnidaria.Cs
                     return;
                 }
 
+                if (TryEmitTypeEquality(bin, mode))
+                    return;
+
                 EmitExpression(bin.Left, EmitMode.Value);
                 EmitExpression(bin.Right, EmitMode.Value);
 
@@ -1607,11 +1951,17 @@ namespace Cnidaria.Cs
                     if (!ReferenceEquals(lpt, rpt))
                         throw new NotSupportedException("Pointer subtraction requires both operands to have the same pointer type.");
 
-                    _il.Emit(
-                        BytecodeOp.PtrDiff,
-                        operand0: GetElementSizeOrThrow(lpt.PointedAtType),
-                        pop: 2,
-                        push: 1);
+                    if (TryGetElementSize(lpt.PointedAtType, out int elementSize))
+                    {
+                        _il.Emit(BytecodeOp.PtrDiff, operand0: elementSize, pop: 2, push: 1);
+                    }
+                    else
+                    {
+                        _il.Emit(BytecodeOp.PtrDiff, operand0: 1, pop: 2, push: 1);
+                        _il.Emit(BytecodeOp.Sizeof, operand0: _tokens.GetTypeToken(lpt.PointedAtType), pop: 0, push: 1);
+                        _il.Emit(BytecodeOp.Conv, operand0: (int)NumericConvKind.NativeInt, pop: 1, push: 1);
+                        _il.Emit(BytecodeOp.Div, pop: 2, push: 1);
+                    }
                     return;
                 }
 
@@ -1632,11 +1982,7 @@ namespace Cnidaria.Cs
                     if (op == BoundBinaryOperatorKind.Subtract)
                         _il.Emit(BytecodeOp.Neg, pop: 1, push: 1); // [ptr, -index]
 
-                    _il.Emit(
-                        BytecodeOp.PtrElemAddr,
-                        operand0: GetElementSizeOrThrow(ptrType.PointedAtType),
-                        pop: 2,
-                        push: 1);
+                    EmitPointerElementAddress(ptrType.PointedAtType, bin.Right.Type);
 
                     return;
                 }
@@ -2238,7 +2584,7 @@ namespace Cnidaria.Cs
                 if (TryEmitIntrinsic(call, mode))
                     return;
 
-                if (TryEmitTypeOfIsValueType(call, mode))
+                if (TryEmitTypeOfPredicate(call, mode))
                     return;
 
                 if (TryEmitDelegateCombineRemoveCall(call, mode))
@@ -2491,12 +2837,14 @@ namespace Cnidaria.Cs
                         return true;
                     }
 
-                    // Unsafe.ReadUnaligned<T>(scoped ref readonly byte source)
+                    // Unsafe.ReadUnaligned<T>(void*) / Unsafe.ReadUnaligned<T>(scoped ref readonly byte source)
                     if (def.Name == "ReadUnaligned" && ps.Length == 1 &&
-                        ps[0].Type is ByRefTypeSymbol br0 &&
-                        br0.ElementType.SpecialType == SpecialType.System_UInt8)
+                        ((ps[0].Type is ByRefTypeSymbol readRef &&
+                         readRef.ElementType.SpecialType == SpecialType.System_UInt8) ||
+                        (ps[0].Type is PointerTypeSymbol readPtr &&
+                         readPtr.PointedAtType.SpecialType == SpecialType.System_Void)))
                     {
-                        EmitExpression(call.Arguments[0], EmitMode.Value); // byref
+                        EmitExpression(call.Arguments[0], EmitMode.Value);
 
                         int tTok = _tokens.GetTypeToken(call.Type); // !!T
                         _il.Emit(BytecodeOp.Ldobj, operand0: tTok, pop: 1, push: 1);
@@ -2505,6 +2853,7 @@ namespace Cnidaria.Cs
                             _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
                         return true;
                     }
+
                     // Unsafe.WriteUnaligned<T>(ref byte destination, T value)
                     if (def.Name == "WriteUnaligned" && ps.Length == 2 &&
                         ps[0].Type is ByRefTypeSymbol brDst &&
@@ -2523,7 +2872,94 @@ namespace Cnidaria.Cs
                         return true;
                     }
 
-                    // Unsafe.Add<T>(ref T, int) / Unsafe.Add<T>(ref T, IntPtr) / Unsafe.Add<T>(void*, int)
+                    // Unsafe.CopyBlockUnaligned(void*, void*, uint) / Unsafe.CopyBlockUnaligned(ref byte, ref readonly byte, uint)
+                    if (def.Name == "CopyBlockUnaligned" && ps.Length == 3 &&
+                        ps[2].Type.SpecialType == SpecialType.System_UInt32 &&
+                        IsVoid(def.ReturnType))
+                    {
+                        bool pointerOverload =
+                            ps[0].Type is PointerTypeSymbol destinationPointer &&
+                            destinationPointer.PointedAtType.SpecialType == SpecialType.System_Void &&
+                            ps[1].Type is PointerTypeSymbol sourcePointer &&
+                            sourcePointer.PointedAtType.SpecialType == SpecialType.System_Void;
+
+                        TypeSymbol? byteType = null;
+                        bool byRefOverload =
+                            ps[0].Type is ByRefTypeSymbol destinationRef &&
+                            destinationRef.ElementType.SpecialType == SpecialType.System_UInt8 &&
+                            ps[1].Type is ByRefTypeSymbol sourceRef &&
+                            sourceRef.ElementType.SpecialType == SpecialType.System_UInt8;
+
+                        if (byRefOverload)
+                        {
+                            byteType = ((ByRefTypeSymbol)ps[0].Type).ElementType;
+                        }
+                        else if (pointerOverload)
+                        {
+                            var members = containingType.GetMembers();
+                            for (int i = 0; i < members.Length; i++)
+                            {
+                                if (members[i] is MethodSymbol candidate &&
+                                    candidate.Name == "CopyBlockUnaligned" &&
+                                    candidate.Parameters.Length == 3 &&
+                                    candidate.Parameters[0].Type is ByRefTypeSymbol candidateDestination &&
+                                    candidateDestination.ElementType.SpecialType == SpecialType.System_UInt8)
+                                {
+                                    byteType = candidateDestination.ElementType;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if ((pointerOverload || byRefOverload) && byteType is not null)
+                        {
+                            int destinationLocal = AllocateSpillLocal(call.Arguments[0].Type);
+                            int sourceLocal = AllocateSpillLocal(call.Arguments[1].Type);
+                            int countLocal = AllocateSpillLocal(call.Arguments[2].Type);
+                            int indexLocal = AllocateSpillLocal(call.Arguments[2].Type);
+
+                            EmitExpression(call.Arguments[0], EmitMode.Value);
+                            _il.Emit(BytecodeOp.Stloc, operand0: destinationLocal, pop: 1, push: 0);
+                            EmitExpression(call.Arguments[1], EmitMode.Value);
+                            _il.Emit(BytecodeOp.Stloc, operand0: sourceLocal, pop: 1, push: 0);
+                            EmitExpression(call.Arguments[2], EmitMode.Value);
+                            _il.Emit(BytecodeOp.Stloc, operand0: countLocal, pop: 1, push: 0);
+                            _il.Emit(BytecodeOp.Ldc_I4, operand0: 0, pop: 0, push: 1);
+                            _il.Emit(BytecodeOp.Stloc, operand0: indexLocal, pop: 1, push: 0);
+
+                            var loop = _il.DefineLabel();
+                            var done = _il.DefineLabel();
+                            _il.MarkLabel(loop);
+
+                            _il.Emit(BytecodeOp.Ldloc, operand0: indexLocal, pop: 0, push: 1);
+                            _il.Emit(BytecodeOp.Ldloc, operand0: countLocal, pop: 0, push: 1);
+                            _il.Emit(BytecodeOp.Clt_Un, pop: 2, push: 1);
+                            _il.EmitBranch(BytecodeOp.Brfalse, done, pop: 1);
+
+                            _il.Emit(BytecodeOp.Ldloc, operand0: destinationLocal, pop: 0, push: 1);
+                            _il.Emit(BytecodeOp.Ldloc, operand0: indexLocal, pop: 0, push: 1);
+                            EmitIntrinsicConv(NumericConvKind.NativeUInt);
+                            _il.Emit(BytecodeOp.PtrElemAddr, operand0: 1, pop: 2, push: 1);
+
+                            _il.Emit(BytecodeOp.Ldloc, operand0: sourceLocal, pop: 0, push: 1);
+                            _il.Emit(BytecodeOp.Ldloc, operand0: indexLocal, pop: 0, push: 1);
+                            EmitIntrinsicConv(NumericConvKind.NativeUInt);
+                            _il.Emit(BytecodeOp.PtrElemAddr, operand0: 1, pop: 2, push: 1);
+                            _il.Emit(BytecodeOp.Ldobj, operand0: _tokens.GetTypeToken(byteType), pop: 1, push: 1);
+                            _il.Emit(BytecodeOp.Stobj, operand0: _tokens.GetTypeToken(byteType), pop: 2, push: 0);
+
+                            _il.Emit(BytecodeOp.Ldloc, operand0: indexLocal, pop: 0, push: 1);
+                            _il.Emit(BytecodeOp.Ldc_I4, operand0: 1, pop: 0, push: 1);
+                            _il.Emit(BytecodeOp.Add, pop: 2, push: 1);
+                            _il.Emit(BytecodeOp.Stloc, operand0: indexLocal, pop: 1, push: 0);
+                            _il.EmitBranch(BytecodeOp.Br, loop, pop: 0);
+
+                            _il.MarkLabel(done);
+                            return true;
+                        }
+                    }
+
+                    // Unsafe.Add<T>(ref T, int) / Unsafe.Add<T>(ref T, IntPtr) / Unsafe.Add<T>(ref T, UIntPtr) / Unsafe.Add<T>(void*, int)
                     if (def.Name == "Add" && ps.Length == 2)
                     {
                         var p0 = ps[0].Type;
@@ -2533,7 +2969,9 @@ namespace Cnidaria.Cs
                         bool isVoidPtrSource = p0 is PointerTypeSymbol ptr0 && ptr0.PointedAtType.SpecialType == SpecialType.System_Void;
 
                         if ((isRefSource || isVoidPtrSource) &&
-                            (p1.SpecialType == SpecialType.System_Int32 || p1.SpecialType == SpecialType.System_IntPtr))
+                            (p1.SpecialType == SpecialType.System_Int32 ||
+                             p1.SpecialType == SpecialType.System_IntPtr ||
+                             p1.SpecialType == SpecialType.System_UIntPtr))
                         {
                             TypeSymbol elemType = p0 switch
                             {
@@ -2549,7 +2987,7 @@ namespace Cnidaria.Cs
                                 EmitIntrinsicConv(NumericConvKind.NativeInt);
 
                             _il.Emit(BytecodeOp.Sizeof, operand0: _tokens.GetTypeToken(elemType), pop: 0, push: 1);
-                            EmitIntrinsicConv(NumericConvKind.NativeInt);
+                            EmitIntrinsicConv(p1.SpecialType == SpecialType.System_UIntPtr ? NumericConvKind.NativeUInt : NumericConvKind.NativeInt);
                             _il.Emit(BytecodeOp.Mul, pop: 2, push: 1); // scaled byte offset
                             _il.Emit(BytecodeOp.PtrElemAddr, operand0: 1, pop: 2, push: 1);
 
@@ -2592,6 +3030,21 @@ namespace Cnidaria.Cs
                                 _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
                             return true;
                         }
+                    }
+                    // Unsafe.NullRef<T>()
+                    if (def.Name == "NullRef" && ps.Length == 0)
+                    {
+                        var tas = call.Method.TypeArguments;
+                        if (tas.Length != 1)
+                            return false;
+
+                        _il.Emit(BytecodeOp.Ldnull, pop: 0, push: 1);
+                        _il.Emit(BytecodeOp.PtrToByRef, pop: 1, push: 1);
+
+                        if (mode == EmitMode.Discard)
+                            _il.Emit(BytecodeOp.Pop, pop: 1, push: 0);
+
+                        return true;
                     }
                     // Unsafe.IsNullRef<T>(ref readonly T)
                     if (def.Name == "IsNullRef" && ps.Length == 1 &&
@@ -3054,8 +3507,7 @@ namespace Cnidaria.Cs
                 EmitExpression(pea.Expression, EmitMode.Value);
                 EmitExpression(pea.Index, EmitMode.Value);
 
-                int size = GetElementSizeOrThrow(pea.Type);
-                _il.Emit(BytecodeOp.PtrElemAddr, operand0: size, pop: 2, push: 1);
+                EmitPointerElementAddress(pea.Type, pea.Index.Type);
 
                 if (mode == EmitMode.Discard)
                 {
@@ -3243,6 +3695,10 @@ namespace Cnidaria.Cs
                         EmitCall(call, EmitMode.Value);
                         return;
 
+                    case BoundConditionalExpression conditional when conditional.Type is ByRefTypeSymbol:
+                        EmitConditionalExpression(conditional, EmitMode.Value);
+                        return;
+
                     case BoundFunctionPointerInvocationExpression functionPointerInvocation
                         when functionPointerInvocation.FunctionPointerType.ReturnRefKind != FunctionPointerRefKind.None:
                         EmitFunctionPointerInvocation(functionPointerInvocation, EmitMode.Value);
@@ -3361,7 +3817,7 @@ namespace Cnidaria.Cs
                     case BoundPointerElementAccessExpression pea:
                         EmitExpression(pea.Expression, EmitMode.Value);
                         EmitExpression(pea.Index, EmitMode.Value);
-                        _il.Emit(BytecodeOp.PtrElemAddr, operand0: GetElementSizeOrThrow(pea.Type), pop: 2, push: 1);
+                        EmitPointerElementAddress(pea.Type, pea.Index.Type);
                         return;
 
                     default:

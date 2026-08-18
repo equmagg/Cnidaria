@@ -109,21 +109,25 @@ namespace Cnidaria.Cs
             public readonly SlidingTokenWindow.TokenWindowMark TokenMark;
             public readonly ParseContextStack.ContextMark CtxMark;
             public readonly int DiagnosticCount;
+            public readonly int FieldExpressionCount;
 
             public ResetPoint(
                 SlidingTokenWindow.TokenWindowMark tokenMark,
                 ParseContextStack.ContextMark ctxMark,
-                int diagnosticCount)
+                int diagnosticCount,
+                int fieldExpressionCount)
             {
                 TokenMark = tokenMark;
                 CtxMark = ctxMark;
                 DiagnosticCount = diagnosticCount;
+                FieldExpressionCount = fieldExpressionCount;
             }
         }
 
         private readonly SlidingTokenWindow _tokens;
         private readonly List<SyntaxDiagnostic> _diagnostics = new();
         private readonly ParseContextStack _ctx = new();
+        private int _fieldExpressionCount;
         public IReadOnlyList<SyntaxDiagnostic> Diagnostics => _diagnostics;
         public IReadOnlyList<SyntaxDiagnostic> LexerDiagnostics => _tokens.LexerDiagnostics;
 
@@ -142,7 +146,7 @@ namespace Cnidaria.Cs
 
         // Speculation, token matching and recovery
         private ResetPoint GetResetPoint()
-            => new ResetPoint(_tokens.MarkState(), _ctx.Mark(), _diagnostics.Count);
+            => new ResetPoint(_tokens.MarkState(), _ctx.Mark(), _diagnostics.Count, _fieldExpressionCount);
 
         // Probe always restores tokens, contexts and diagnostics
         private bool Probe(Func<bool> scan, ParseContext tempContext = ParseContext.None, bool requireProgress = true)
@@ -206,6 +210,7 @@ namespace Cnidaria.Cs
         {
             _tokens.Reset(rp.TokenMark);
             _ctx.Reset(rp.CtxMark);
+            _fieldExpressionCount = rp.FieldExpressionCount;
             RollbackDiagnostics(rp.DiagnosticCount);
         }
         private SyntaxToken MatchToken(SyntaxKind kind)
@@ -1235,6 +1240,14 @@ namespace Cnidaria.Cs
             var attrs = ParseAttributeLists();
             var modifiers = ParseModifiers(ModifierContext.Member);
 
+            if (_tokens.CurrentKind == SyntaxKind.RefKeyword && IsNestedRefStructDeclarationStart())
+            {
+                var modifierTokens = new List<SyntaxToken>(modifiers.ToArray());
+                while (!IsCurrentTypeDeclarationKeyword())
+                    modifierTokens.Add(_tokens.EatToken());
+                modifiers = new SyntaxTokenList(modifierTokens.ToArray());
+            }
+
             // delegate
             if (_tokens.CurrentKind == SyntaxKind.DelegateKeyword)
                 return ParseDelegateDeclarationAfterModifiers(attrs, modifiers);
@@ -1373,6 +1386,7 @@ namespace Cnidaria.Cs
             ExplicitInterfaceSpecifierSyntax? explicitInterfaceSpecifier,
             SyntaxToken id)
         {
+            var fieldExpressionCount = _fieldExpressionCount;
             if (_tokens.CurrentKind == SyntaxKind.EqualsGreaterThanToken)
             {
                 ArrowExpressionClauseSyntax exprBody;
@@ -1389,7 +1403,8 @@ namespace Cnidaria.Cs
                     accessorList: null,
                     expressionBody: exprBody,
                     initializer: null,
-                    semicolonToken: semi);
+                    semicolonToken: semi,
+                    usesFieldKeyword: _fieldExpressionCount != fieldExpressionCount);
             }
             var accessorList = ParseAccessorList(allowFieldExpression: true);
 
@@ -1411,7 +1426,8 @@ namespace Cnidaria.Cs
                 accessorList,
                 expressionBody: null,
                 initializer: init,
-                semicolonToken: semi2);
+                semicolonToken: semi2,
+                usesFieldKeyword: _fieldExpressionCount != fieldExpressionCount);
         }
         private AccessorListSyntax ParseAccessorList(bool allowFieldExpression = false)
         {
@@ -4880,6 +4896,7 @@ namespace Cnidaria.Cs
                         t.ContextualKind == SyntaxKind.FieldKeyword &&
                         _tokens.Peek(1).Kind != SyntaxKind.ColonColonToken)
                     {
+                        _fieldExpressionCount++;
                         return new FieldExpressionSyntax(
                             ConvertTokenKind(_tokens.EatToken(), SyntaxKind.FieldKeyword));
                     }
@@ -5130,7 +5147,7 @@ namespace Cnidaria.Cs
 
             if (argList == null && init == null)
                 _diagnostics.Add(new SyntaxDiagnostic(_tokens.Current.Span.Start,
-                    "Object creation requires argument list '()' or initializer '{...}' (recovery continues)."));
+                    "Object creation requires argument list '()' or initializer '{...}'."));
 
             return new ObjectCreationExpressionSyntax(newKeyword, type, argList, init);
         }
@@ -5143,7 +5160,7 @@ namespace Cnidaria.Cs
             if (ranks.Count == 0)
             {
                 _diagnostics.Add(new SyntaxDiagnostic(_tokens.Current.Span.Start,
-                    "Array creation requires at least one rank specifier '[...]' (recovery continues)."));
+                    "Array creation requires at least one rank specifier '[...]'."));
                 ranks.Add(CreateMissingArrayRankSpecifier(_tokens.Current.Span.Start));
             }
 
@@ -5155,7 +5172,7 @@ namespace Cnidaria.Cs
 
             if (init == null && AllRankSpecifiersOmitted(ranks))
                 _diagnostics.Add(new SyntaxDiagnostic(_tokens.Current.Span.Start,
-                    "Array creation with omitted sizes requires an initializer '{...}' (recovery continues)."));
+                    "Array creation with omitted sizes requires an initializer '{...}'."));
 
             return new ArrayCreationExpressionSyntax(newKeyword, arrayType, init);
         }
@@ -5178,7 +5195,7 @@ namespace Cnidaria.Cs
             else
             {
                 _diagnostics.Add(new SyntaxDiagnostic(_tokens.Current.Span.Start,
-                    "Implicit array creation requires an initializer '{...}' (recovery continues)."));
+                    "Implicit array creation requires an initializer '{...}'."));
                 init = CreateMissingInitializerExpression(SyntaxKind.ArrayInitializerExpression, _tokens.Current.Span.Start);
             }
 
@@ -5203,7 +5220,7 @@ namespace Cnidaria.Cs
             else
             {
                 _diagnostics.Add(new SyntaxDiagnostic(_tokens.Current.Span.Start,
-                    "stackalloc requires an array rank specifier '[...]' (recovery continues)."));
+                    "stackalloc requires an array rank specifier '[...]'."));
                 ranks.Add(CreateMissingArrayRankSpecifier(_tokens.Current.Span.Start));
             }
 
@@ -5233,7 +5250,7 @@ namespace Cnidaria.Cs
             else
             {
                 _diagnostics.Add(new SyntaxDiagnostic(_tokens.Current.Span.Start,
-                    "Implicit stackalloc array creation requires an initializer '{...}' (recovery continues)."));
+                    "Implicit stackalloc array creation requires an initializer '{...}'."));
                 init = CreateMissingInitializerExpression(SyntaxKind.ArrayInitializerExpression, _tokens.Current.Span.Start);
             }
 
@@ -5262,10 +5279,41 @@ namespace Cnidaria.Cs
                     continue;
                 }
 
+                if (_tokens.CurrentKind == SyntaxKind.OpenBracketToken &&
+                    IsOmittedArrayRankBeforeTypeSuffix())
+                {
+                    var rank = ParseArrayRankSpecifier();
+                    t = new ArrayTypeSyntax(t, new SyntaxList<ArrayRankSpecifierSyntax>(new[] { rank }));
+                    continue;
+                }
+
                 break;
             }
 
             return t;
+        }
+
+        private bool IsOmittedArrayRankBeforeTypeSuffix()
+        {
+            return Probe(() =>
+            {
+                while (_tokens.CurrentKind == SyntaxKind.OpenBracketToken)
+                {
+                    _tokens.EatToken();
+                    while (_tokens.CurrentKind == SyntaxKind.CommaToken)
+                        _tokens.EatToken();
+
+                    if (_tokens.CurrentKind != SyntaxKind.CloseBracketToken)
+                        return false;
+
+                    _tokens.EatToken();
+
+                    if (_tokens.CurrentKind is SyntaxKind.QuestionToken or SyntaxKind.AsteriskToken)
+                        return true;
+                }
+
+                return false;
+            }, ParseContext.Type);
         }
         private ArrayRankSpecifierSyntax ParseArrayRankSpecifierWithSizes()
         {
@@ -5839,7 +5887,7 @@ namespace Cnidaria.Cs
                 Reset(resetPoint);
             }
 
-            var expr2 = ParseExpression();
+            var expr2 = ParseBinaryExpression();
             return new ConstantPatternSyntax(expr2);
         }
         private ListPatternSyntax ParseListPattern()
@@ -6803,6 +6851,24 @@ namespace Cnidaria.Cs
             SyntaxKind.VoidKeyword => true,
             _ => false
         };
+        private bool IsNestedRefStructDeclarationStart()
+        {
+            if (_tokens.CurrentKind != SyntaxKind.RefKeyword)
+                return false;
+
+            int offset = 1;
+            while (true)
+            {
+                var token = _tokens.Peek(offset);
+                if (token.Kind == SyntaxKind.StructKeyword)
+                    return true;
+
+                if (!IsModifierToken(token, ModifierContext.Type) || token.Kind == SyntaxKind.RefKeyword)
+                    return false;
+
+                offset++;
+            }
+        }
         private static bool IsModifierToken(SyntaxToken t, ModifierContext ctx)
         {
             // Contextual modifiers

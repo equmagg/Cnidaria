@@ -1216,6 +1216,7 @@ namespace Cnidaria.Cs
                     case GenTreeKind.EndFinally:
                         _asm.Emit(InstrDesc.Op0(Op.EndFinally));
                         return;
+                    case GenTreeKind.Intrinsic:
                     case GenTreeKind.Call:
                     case GenTreeKind.IndirectCall:
                     case GenTreeKind.VirtualCall:
@@ -1299,9 +1300,6 @@ namespace Cnidaria.Cs
                         return;
                     case GenTreeKind.PointerElementAddr:
                         EmitPointerElementAddress(instruction, source);
-                        return;
-                    case GenTreeKind.PointerToByRef:
-                        _asm.Emit(new InstrDesc(Op.PtrToByRef, RegisterVmIsa.EncodeRegister(RequireResultRegister(instruction)), RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 0))));
                         return;
                     case GenTreeKind.PointerDiff:
                         _asm.Emit(new InstrDesc(Op.PtrDiff, RegisterVmIsa.EncodeRegister(RequireResultRegister(instruction)),
@@ -1720,6 +1718,9 @@ namespace Cnidaria.Cs
                     case BytecodeOp.FnPtrToPtr:
                     case BytecodeOp.PtrToFnPtr:
                         _asm.MovPtr(rd, rs);
+                        return;
+                    case BytecodeOp.PtrToByRef:
+                        _asm.Emit(new InstrDesc(Op.PtrToByRef, RegisterVmIsa.EncodeRegister(rd), RegisterVmIsa.EncodeRegister(rs)));
                         return;
                     default:
                         throw Unsupported(instruction, "unsupported unary opcode " + source.SourceOp);
@@ -2594,6 +2595,12 @@ namespace Cnidaria.Cs
                 if (parameters.Length == 1)
                 {
                     RuntimeType p0 = parameters[0];
+                    if (IsReadOnlyCharSpanType(p0))
+                    {
+                        EmitReadOnlyCharSpanLength(instruction, p0, length);
+                        return;
+                    }
+
                     if (IsCharArrayType(p0))
                     {
                         var value = RequireCallUse(instruction, 0, "string(char[]) value");
@@ -2672,6 +2679,61 @@ namespace Cnidaria.Cs
             private static bool IsCharPointerType(RuntimeType type)
                 => type.Kind == RuntimeTypeKind.Pointer && type.ElementType is not null && IsCharType(type.ElementType);
 
+            private static bool IsReadOnlyCharSpanType(RuntimeType type)
+            {
+                if (!StringComparer.Ordinal.Equals(type.Namespace, "System") ||
+                    !type.Name.StartsWith("ReadOnlySpan", StringComparison.Ordinal))
+                {
+                    return false;
+                }
+
+                var arguments = type.GenericTypeArguments;
+                return arguments.Length == 1 && IsCharType(arguments[0]);
+            }
+
+            private void EmitReadOnlyCharSpanLength(GenTree instruction, RuntimeType spanType, MachineRegister length)
+            {
+                RuntimeField? lengthField = null;
+                for (int i = 0; i < spanType.InstanceFields.Length; i++)
+                {
+                    if (StringComparer.Ordinal.Equals(spanType.InstanceFields[i].Name, "_length"))
+                    {
+                        lengthField = spanType.InstanceFields[i];
+                        break;
+                    }
+                }
+
+                if (lengthField is null)
+                    throw Unsupported(instruction, "ReadOnlySpan<char> has no _length field");
+
+                var abi = MachineAbi.ClassifyStorageValue(spanType, StackKindOf(spanType));
+                if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
+                {
+                    var segments = MachineAbi.GetRegisterSegments(abi);
+                    for (int i = 0; i < segments.Length; i++)
+                    {
+                        if (segments[i].Offset != lengthField.Offset)
+                            continue;
+
+                        var source = RequireCallUse(instruction, i, "string(ReadOnlySpan<char>) length");
+                        EmitLoadOperand(length, source, lengthField.FieldType, GenStackKind.I4);
+                        return;
+                    }
+                }
+
+                var value = RequireCallUse(instruction, 0, "string(ReadOnlySpan<char>) value");
+                if (!value.IsFrameSlot)
+                    throw Unsupported(instruction, "ReadOnlySpan<char> aggregate has no addressable home");
+
+                EmitAddressOf(MachineRegisters.ParallelCopyScratch0, value);
+                _asm.Emit(InstrDesc.Mem(
+                    Op.LdI4,
+                    length,
+                    MachineRegisters.ParallelCopyScratch0,
+                    lengthField.Offset,
+                    aux: Aux.Memory(0, 2, MemoryBase.Register, MemoryFlags.NoNullCheck)));
+            }
+
             private void EmitCallLike(GenTree instruction, GenTree source)
             {
                 if (instruction.TreeKind == GenTreeKind.IndirectCall)
@@ -2711,6 +2773,32 @@ namespace Cnidaria.Cs
                 {
                     throw Unsupported(instruction, $"call-like instruction must have zero or one result, actual count: {instruction.Results.Length}");
                 }
+                if (instruction.TreeKind == GenTreeKind.Intrinsic)
+                {
+                    if (!RuntimeIntrinsics.TryResolve(method, _method.Target, out RuntimeIntrinsicInfo intrinsic) || intrinsic.Id != source.IntrinsicId)
+                        throw Unsupported(instruction, $"unrecognized runtime intrinsic {source.IntrinsicId}");
+
+                    switch (intrinsic.Id)
+                    {
+                        case RuntimeIntrinsicId.InterlockedCompareExchange:
+                            {
+                                Op intrinsicOp = intrinsic.CompareExchange.IsReference ? Op.CallInternalRef : Op.CallInternalI;
+                                CallFlags intrinsicFlags = BuildCallFlags(method, intrinsicOp) & ~CallFlags.GcSafePoint;
+                                _asm.Emit(InstrDesc.Call(intrinsicOp, method.MethodId, intrinsicFlags));
+                                return;
+                            }
+                        case RuntimeIntrinsicId.InterlockedExchangeAdd:
+                            {
+                                Op intrinsicOp = Op.CallInternalI;
+                                CallFlags intrinsicFlags = BuildCallFlags(method, intrinsicOp) & ~CallFlags.GcSafePoint;
+                                _asm.Emit(InstrDesc.Call(intrinsicOp, method.MethodId, intrinsicFlags));
+                                return;
+                            }
+                        default:
+                            throw Unsupported(instruction, $"unsupported runtime intrinsic {intrinsic.Id}");
+                    }
+                }
+
                 Op op = SelectCallOp(instruction.TreeKind, method, method.ReturnType, resultClass);
                 CallFlags callFlags = BuildCallFlags(method, op);
                 if ((callFlags & CallFlags.HiddenReturnBuffer) != 0 && !hasHiddenReturnBufferOperand)
@@ -5002,12 +5090,15 @@ namespace Cnidaria.Cs
             {
                 if (instruction.TreeKind == GenTreeKind.GcPoll)
                     return true;
+                if (instruction.TreeKind == GenTreeKind.Intrinsic && RuntimeIntrinsics.IsNoGcSafePoint(instruction.IntrinsicId))
+                    return false;
                 if (!GenTreeLirKinds.IsRealTree(instruction))
                     return false;
                 var source = instruction;
                 if ((source.Flags & (GenTreeFlags.ContainsCall | GenTreeFlags.Allocation)) != 0)
                     return true;
                 return instruction.TreeKind is
+                    GenTreeKind.Intrinsic or
                     GenTreeKind.Call or
                     GenTreeKind.IndirectCall or
                     GenTreeKind.VirtualCall or

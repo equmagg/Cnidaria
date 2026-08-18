@@ -88,6 +88,114 @@ namespace System.Runtime.InteropServices
             value = Unsafe.ReadUnaligned<T>(ref GetReference<byte>(source));
             return true;
         }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe Span<byte> AsBytes<T>(Span<T> span)
+            where T : struct
+        {
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                throw new NotSupportedException();
+
+            return new Span<byte>(
+                ref Unsafe.As<T, byte>(ref GetReference(span)),
+                checked(span.Length * sizeof(T)));
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe ReadOnlySpan<byte> AsBytes<T>(ReadOnlySpan<T> span)
+            where T : struct
+        {
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                throw new NotSupportedException();
+
+            return new ReadOnlySpan<byte>(
+                ref Unsafe.As<T, byte>(ref GetReference(span)),
+                checked(span.Length * sizeof(T)));
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe Span<TTo> Cast<TFrom, TTo>(Span<TFrom> span)
+            where TFrom : struct
+            where TTo : struct
+        {
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<TFrom>())
+                throw new InvalidCastException();
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<TTo>())
+                throw new InvalidCastException();
+
+            // Use unsigned integers - unsigned division by constant (especially by power of 2)
+            // and checked casts are faster and smaller.
+            uint fromSize = (uint)sizeof(TFrom);
+            uint toSize = (uint)sizeof(TTo);
+            uint fromLength = (uint)span.Length;
+            int toLength;
+            if (fromSize == toSize)
+            {
+                // Special case for same size types - `(ulong)fromLength * (ulong)fromSize / (ulong)toSize`
+                // should be optimized to just `length` but the JIT doesn't do that today.
+                toLength = (int)fromLength;
+            }
+            else if (fromSize == 1)
+            {
+                // Special case for byte sized TFrom - `(ulong)fromLength * (ulong)fromSize / (ulong)toSize`
+                // becomes `(ulong)fromLength / (ulong)toSize` but the JIT can't narrow it down to `int`
+                // and can't eliminate the checked cast. This also avoids a 32 bit specific issue,
+                // the JIT can't eliminate long multiply by 1.
+                toLength = (int)(fromLength / toSize);
+            }
+            else
+            {
+                // Ensure that casts are done in such a way that the JIT is able to "see"
+                // the uint->ulong casts and the multiply together so that on 32 bit targets
+                // 32x32to64 multiplication is used.
+                ulong toLengthUInt64 = (ulong)fromLength * (ulong)fromSize / (ulong)toSize;
+                toLength = checked((int)toLengthUInt64);
+            }
+
+            return new Span<TTo>(
+                ref Unsafe.As<TFrom, TTo>(ref span._reference),
+                toLength);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe ReadOnlySpan<TTo> Cast<TFrom, TTo>(ReadOnlySpan<TFrom> span)
+            where TFrom : struct
+            where TTo : struct
+        {
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<TFrom>())
+                throw new InvalidCastException();
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<TTo>())
+                throw new InvalidCastException();
+
+            // Use unsigned integers - unsigned division by constant (especially by power of 2)
+            // and checked casts are faster and smaller.
+            uint fromSize = (uint)sizeof(TFrom);
+            uint toSize = (uint)sizeof(TTo);
+            uint fromLength = (uint)span.Length;
+            int toLength;
+            if (fromSize == toSize)
+            {
+                // Special case for same size types - `(ulong)fromLength * (ulong)fromSize / (ulong)toSize`
+                // should be optimized to just `length` but the JIT doesn't do that today.
+                toLength = (int)fromLength;
+            }
+            else if (fromSize == 1)
+            {
+                // Special case for byte sized TFrom - `(ulong)fromLength * (ulong)fromSize / (ulong)toSize`
+                // becomes `(ulong)fromLength / (ulong)toSize` but the JIT can't narrow it down to `int`
+                // and can't eliminate the checked cast. This also avoids a 32 bit specific issue,
+                // the JIT can't eliminate long multiply by 1.
+                toLength = (int)(fromLength / toSize);
+            }
+            else
+            {
+                // Ensure that casts are done in such a way that the JIT is able to "see"
+                // the uint->ulong casts and the multiply together so that on 32 bit targets
+                // 32x32to64 multiplication is used.
+                ulong toLengthUInt64 = (ulong)fromLength * (ulong)fromSize / (ulong)toSize;
+                toLength = checked((int)toLengthUInt64);
+            }
+
+            return new ReadOnlySpan<TTo>(
+                ref Unsafe.As<TFrom, TTo>(ref GetReference(span)),
+                toLength);
+        }
     }
     public static class CollectionsMarshal
     {

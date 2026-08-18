@@ -17,12 +17,33 @@ namespace Cnidaria.Cs
             if (node.Kind == SyntaxKind.SimpleAssignmentExpression && IsDeconstructionTargetSyntax(node.Left))
                 return BindDeconstructionAssignment(node, context, diagnostics);
 
+            if (node.Kind == SyntaxKind.SimpleAssignmentExpression &&
+                node.Left is IdentifierNameSyntax discardIdentifier &&
+                string.Equals(discardIdentifier.Identifier.ValueText, "_", StringComparison.Ordinal) &&
+                IsDiscardAssignmentTarget(discardIdentifier, context))
+            {
+                return BindExpression(node.Right, context, diagnostics);
+            }
+
             var lv = BindLValue(node.Left, context, diagnostics, requireReadable: node.Kind != SyntaxKind.SimpleAssignmentExpression);
             var leftTarget = lv.Target;
 
             var right = BindExpression(node.Right, context, diagnostics);
 
             return BindAssignmentToLValue(node, lv, right, context, diagnostics);
+        }
+        private bool IsDiscardAssignmentTarget(IdentifierNameSyntax identifier, BindingContext context)
+        {
+            if (TryGetLocalFromEnclosingScopes("_", out _) || TryGetParameterFromEnclosingScopes("_", out _))
+                return false;
+
+            var probeContext = WithRecorder(context, NullBindingRecorder.Instance);
+            var probeDiagnostics = new DiagnosticBag();
+            if (TryBindUnqualifiedMember(identifier, "_", BindValueKind.LValue, probeContext, probeDiagnostics, out _))
+                return false;
+
+            probeDiagnostics = new DiagnosticBag();
+            return !TryBindImportedStaticMember(identifier, "_", BindValueKind.LValue, probeContext, probeDiagnostics, out _);
         }
         private BoundExpression BindAssignmentToLValue(
             AssignmentExpressionSyntax node,
@@ -53,12 +74,23 @@ namespace Cnidaria.Cs
                     new Location(context.SemanticModel.SyntaxTree, node.Left.Span)));
                 hasErrors = true;
             }
-            if (!leftTarget.HasErrors && IsReadOnlyByRefParameterTarget(leftTarget))
+            if (!leftTarget.HasErrors &&
+                IsReadOnlyByRefParameterTarget(leftTarget) &&
+                right is not BoundRefExpression)
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_ASG_READONLYREF001",
                     DiagnosticSeverity.Error,
                     "Cannot assign to a readonly by-ref parameter.",
+                    new Location(context.SemanticModel.SyntaxTree, node.Left.Span)));
+                hasErrors = true;
+            }
+            if (!leftTarget.HasErrors && IsReadOnlyRefReturnTarget(leftTarget))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_REFRET_READONLY001",
+                    DiagnosticSeverity.Error,
+                    "Cannot assign through a 'ref readonly' return value.",
                     new Location(context.SemanticModel.SyntaxTree, node.Left.Span)));
                 hasErrors = true;
             }
@@ -90,6 +122,14 @@ namespace Cnidaria.Cs
                         else if (leftTarget is BoundLocalExpression refLocalExpr && refLocalExpr.Local.IsByRef)
                         {
                             assignmentTargetType = context.Compilation.CreateByRefType(refLocalExpr.Local.Type);
+                        }
+                        else if (leftTarget is BoundParameterExpression refParameterExpr &&
+                                 refParameterExpr.Parameter.RefKind != ParameterRefKind.None)
+                        {
+                            var elementType = refParameterExpr.Parameter.Type is ByRefTypeSymbol parameterByRefType
+                                ? parameterByRefType.ElementType
+                                : refParameterExpr.Parameter.Type;
+                            assignmentTargetType = context.Compilation.CreateByRefType(elementType);
                         }
                     }
                     else
@@ -933,6 +973,7 @@ namespace Cnidaria.Cs
             ImmutableArray<BoundStatement>.Builder sideEffects)
         {
             var name = single.Identifier.ValueText ?? string.Empty;
+            ReportFieldKeywordDeclaration(single.Identifier, context, diagnostics);
             if (name.Length == 0)
                 return;
 
@@ -1909,7 +1950,7 @@ namespace Cnidaria.Cs
             if (expr is BoundOutDiscardExpression)
                 return expr;
 
-            if (expr.IsLValue)
+            if (expr.IsLValue || (expr is BoundConditionalExpression ce && ce.Type is ByRefTypeSymbol))
                 return expr;
 
 
@@ -2006,6 +2047,7 @@ namespace Cnidaria.Cs
             }
 
             var name = sv.Identifier.ValueText ?? "";
+            ReportFieldKeywordDeclaration(sv.Identifier, context, diagnostics);
 
             if (IsNameDeclaredInEnclosingScopes(name))
             {
@@ -2091,8 +2133,31 @@ namespace Cnidaria.Cs
         private static bool IsReadOnlyLocalTarget(BoundExpression expr)
             => expr is BoundLocalExpression l && l.Local.IsReadOnly;
 
+        private static bool IsReadOnlyRefReturnTarget(BoundExpression expr)
+            => expr switch
+            {
+                BoundCallExpression call => call.Method.ReturnsByRefReadonly,
+                BoundMemberAccessExpression { Member: PropertySymbol property }
+                    => property.GetMethod?.ReturnsByRefReadonly == true,
+                BoundIndexerAccessExpression indexer
+                    => indexer.Indexer.GetMethod?.ReturnsByRefReadonly == true,
+                _ => false
+            };
+
+        private static bool IsNonRefReturningPropertyTarget(BoundExpression expr)
+            => expr switch
+            {
+                BoundMemberAccessExpression { Member: PropertySymbol property }
+                    => property.GetMethod?.ReturnType is not ByRefTypeSymbol,
+                BoundIndexerAccessExpression indexer
+                    => indexer.Indexer.GetMethod?.ReturnType is not ByRefTypeSymbol,
+                _ => false
+            };
+
         private static bool IsReadOnlyTarget(BoundExpression expr)
-            => IsReadOnlyLocalTarget(expr) || IsReadOnlyByRefParameterTarget(expr);
+            => IsReadOnlyLocalTarget(expr) ||
+               IsReadOnlyByRefParameterTarget(expr) ||
+               IsReadOnlyRefReturnTarget(expr);
         private static bool IsInsideIntrinsicMethod(BindingContext context)
         {
             if (context.ContainingSymbol is not MethodSymbol method)

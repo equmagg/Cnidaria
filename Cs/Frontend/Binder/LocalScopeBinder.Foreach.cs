@@ -167,6 +167,8 @@ namespace Cnidaria.Cs
                     new Location(context.SemanticModel.SyntaxTree, node.Type.Span)));
             }
 
+            scope.ReportFieldKeywordDeclaration(node.Identifier, context, diagnostics);
+
             var iterationLocal = new LocalSymbol(
                 name: name,
                 containing: _containing,

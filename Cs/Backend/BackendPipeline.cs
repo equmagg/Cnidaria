@@ -721,6 +721,10 @@ namespace Cnidaria.Cs
 
             switch (node.Kind)
             {
+                case GenTreeKind.Intrinsic:
+                    flags |= GenTreeIntrinsicSemantics.Flags(node.IntrinsicId);
+                    break;
+
                 case GenTreeKind.ClassInit:
                 case GenTreeKind.Call:
                 case GenTreeKind.IndirectCall:

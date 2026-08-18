@@ -294,6 +294,10 @@ namespace Cnidaria.Cs
                 if (target == AttributeApplicationTarget.Unknown)
                     continue;
 
+                var targetOwner = GetTargetOwner(ownerSymbol, target);
+                if (targetOwner is null)
+                    continue;
+
                 for (int ai = 0; ai < list.Attributes.Count; ai++)
                 {
                     var attrSyntax = list.Attributes[ai];
@@ -302,9 +306,9 @@ namespace Cnidaria.Cs
                         typeBinder, localBinder, ctx, diagnostics,
                         out var data))
                     {
-                        AddAttribute(ownerSymbol, data!);
+                        AddAttribute(targetOwner, data!);
 
-                        applications.Add(new BoundAttributeApplication(tree, attrSyntax, ownerSymbol, data!));
+                        applications.Add(new BoundAttributeApplication(tree, attrSyntax, targetOwner, data!));
                     }
                 }
             }
@@ -683,6 +687,11 @@ namespace Cnidaria.Cs
                         return target == AttributeApplicationTarget.Constructor;
                     return target == AttributeApplicationTarget.Method || target == AttributeApplicationTarget.ReturnValue;
 
+                case SourcePropertySymbol property:
+                    return target == AttributeApplicationTarget.Property ||
+                           target == AttributeApplicationTarget.ReturnValue ||
+                           (target == AttributeApplicationTarget.Field && property.BackingFieldOpt is not null);
+
                 case PropertySymbol:
                     return target == AttributeApplicationTarget.Property || target == AttributeApplicationTarget.ReturnValue;
 
@@ -698,6 +707,17 @@ namespace Cnidaria.Cs
                 default:
                     return false;
             }
+        }
+        private static Symbol? GetTargetOwner(Symbol owner, AttributeApplicationTarget target)
+        {
+            if (target == AttributeApplicationTarget.Field &&
+                owner is SourcePropertySymbol property &&
+                property.BackingFieldOpt is FieldSymbol backingField)
+            {
+                return backingField;
+            }
+
+            return owner;
         }
         private static AttributeApplicationTarget GetDefaultTarget(Symbol owner)
         {
@@ -816,7 +836,7 @@ namespace Cnidaria.Cs
             {
                 if (!TryCreateTypedConstant(
                     tree,
-                    argSpanNode: ctorArgs[i].Syntax,
+                    argSpanNode: attrSyntax,
                     convertedExpression: convertedCtorArgs[i],
                     declaredType: ctor!.Parameters[i].Type,
                     diagnostics,
@@ -885,98 +905,27 @@ namespace Cnidaria.Cs
 
             MethodSymbol? best = null;
             int bestScore = int.MaxValue;
+            bool bestExpanded = false;
             bool ambiguous = false;
             int[]? bestParamMap = null;
+            int[]? bestParamsElementArgIndices = null;
 
             for (int ci = 0; ci < candidates.Length; ci++)
             {
                 var m = candidates[ci];
-                if (m.Parameters.Length != ctorArgs.Length)
-                    continue;
 
-                var paramMap = new int[ctorArgs.Length];
-                for (int i = 0; i < paramMap.Length; i++) paramMap[i] = -1;
+                if (TryScoreRegular(m, out int regularScore, out var regularMap))
+                    Consider(m, regularScore, expanded: false, regularMap, null);
 
-                var assigned = new bool[m.Parameters.Length];
-                int nextPositional = 0;
-                bool bad = false;
-
-                for (int ai = 0; ai < ctorArgs.Length; ai++)
+                var ps = m.Parameters;
+                if (ps.Length > 0 &&
+                    ps[^1].IsParams &&
+                    ps[^1].Type is ArrayTypeSymbol paramsArray &&
+                    paramsArray.Rank == 1 &&
+                    paramsArray.IsSZArray &&
+                    TryScoreExpanded(m, paramsArray.ElementType, out int expandedScore, out var expandedMap, out var paramsElements))
                 {
-                    int paramIndex = -1;
-
-                    if (!string.IsNullOrEmpty(ctorArgs[ai].Name))
-                    {
-                        for (int pi = 0; pi < m.Parameters.Length; pi++)
-                        {
-                            if (StringComparer.Ordinal.Equals(m.Parameters[pi].Name, ctorArgs[ai].Name))
-                            {
-                                paramIndex = pi;
-                                break;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        while (nextPositional < assigned.Length && assigned[nextPositional])
-                            nextPositional++;
-
-                        if (nextPositional < assigned.Length)
-                            paramIndex = nextPositional++;
-                    }
-
-                    if (paramIndex < 0 || paramIndex >= assigned.Length || assigned[paramIndex])
-                    {
-                        bad = true;
-                        break;
-                    }
-
-                    assigned[paramIndex] = true;
-                    paramMap[ai] = paramIndex;
-                }
-
-                if (bad)
-                    continue;
-
-                int score = 0;
-                for (int ai = 0; ai < ctorArgs.Length; ai++)
-                {
-                    var expr = ctorArgs[ai].Expression;
-                    var ptype = m.Parameters[paramMap[ai]].Type;
-
-                    var conv = LocalScopeBinder.ClassifyConversion(expr, ptype);
-                    if (!conv.Exists || !conv.IsImplicit)
-                    {
-                        bad = true;
-                        break;
-                    }
-
-                    score += conv.Kind switch
-                    {
-                        ConversionKind.Identity => 0,
-                        ConversionKind.ImplicitNumeric => 1,
-                        ConversionKind.ImplicitConstant => 1,
-                        ConversionKind.ImplicitReference => 1,
-                        ConversionKind.ImplicitTuple => 1,
-                        ConversionKind.NullLiteral => 1,
-                        ConversionKind.Boxing => 2,
-                        _ => 10
-                    };
-                }
-
-                if (bad)
-                    continue;
-
-                if (score < bestScore)
-                {
-                    best = m;
-                    bestScore = score;
-                    ambiguous = false;
-                    bestParamMap = paramMap;
-                }
-                else if (score == bestScore)
-                {
-                    ambiguous = true;
+                    Consider(m, expandedScore + 5, expanded: true, expandedMap, paramsElements);
                 }
             }
 
@@ -1001,22 +950,264 @@ namespace Cnidaria.Cs
             }
 
             var converted = new BoundExpression[best.Parameters.Length];
-            for (int ai = 0; ai < ctorArgs.Length; ai++)
+            var assigned = new bool[best.Parameters.Length];
+
+            if (!bestExpanded)
             {
-                int pi = bestParamMap![ai];
-                converted[pi] = exprBinder.ApplyConversion(
-                    exprSyntax: ctorArgs[ai].Syntax.Expression,
-                    expr: ctorArgs[ai].Expression,
-                    targetType: best.Parameters[pi].Type,
-                    diagnosticNode: ctorArgs[ai].Syntax,
-                    context: ctx,
-                    diagnostics: diagnostics,
-                    requireImplicit: true);
+                for (int ai = 0; ai < ctorArgs.Length; ai++)
+                {
+                    int pi = bestParamMap![ai];
+                    assigned[pi] = true;
+                    converted[pi] = exprBinder.ApplyConversion(
+                        exprSyntax: ctorArgs[ai].Syntax.Expression,
+                        expr: ctorArgs[ai].Expression,
+                        targetType: best.Parameters[pi].Type,
+                        diagnosticNode: ctorArgs[ai].Syntax,
+                        context: ctx,
+                        diagnostics: diagnostics,
+                        requireImplicit: true);
+                }
+            }
+            else
+            {
+                int paramsIndex = best.Parameters.Length - 1;
+                for (int ai = 0; ai < ctorArgs.Length; ai++)
+                {
+                    int pi = bestParamMap![ai];
+                    if (pi == paramsIndex)
+                        continue;
+
+                    assigned[pi] = true;
+                    converted[pi] = exprBinder.ApplyConversion(
+                        exprSyntax: ctorArgs[ai].Syntax.Expression,
+                        expr: ctorArgs[ai].Expression,
+                        targetType: best.Parameters[pi].Type,
+                        diagnosticNode: ctorArgs[ai].Syntax,
+                        context: ctx,
+                        diagnostics: diagnostics,
+                        requireImplicit: true);
+                }
+
+                var paramsArray = (ArrayTypeSymbol)best.Parameters[paramsIndex].Type;
+                var elementType = paramsArray.ElementType;
+                var paramsElements = bestParamsElementArgIndices ?? Array.Empty<int>();
+                var elementBuilder = ImmutableArray.CreateBuilder<BoundExpression>(paramsElements.Length);
+                for (int i = 0; i < paramsElements.Length; i++)
+                {
+                    int ai = paramsElements[i];
+                    elementBuilder.Add(exprBinder.ApplyConversion(
+                        exprSyntax: ctorArgs[ai].Syntax.Expression,
+                        expr: ctorArgs[ai].Expression,
+                        targetType: elementType,
+                        diagnosticNode: ctorArgs[ai].Syntax,
+                        context: ctx,
+                        diagnostics: diagnostics,
+                        requireImplicit: true));
+                }
+
+                var int32Type = ctx.Compilation.GetSpecialType(SpecialType.System_Int32);
+                var count = new BoundLiteralExpression(attrSyntax, int32Type, paramsElements.Length);
+                var initializer = new BoundArrayInitializerExpression(attrSyntax, elementType, elementBuilder.ToImmutable());
+                converted[paramsIndex] = new BoundArrayCreationExpression(attrSyntax, paramsArray, elementType, count, initializer);
+                assigned[paramsIndex] = true;
+            }
+
+            for (int pi = 0; pi < best.Parameters.Length; pi++)
+            {
+                if (assigned[pi])
+                    continue;
+
+                var p = best.Parameters[pi];
+                if (p.IsParams && p.Type is ArrayTypeSymbol paramsArray)
+                {
+                    var int32Type = ctx.Compilation.GetSpecialType(SpecialType.System_Int32);
+                    var zero = new BoundLiteralExpression(attrSyntax, int32Type, 0);
+                    var initializer = new BoundArrayInitializerExpression(attrSyntax, paramsArray.ElementType, ImmutableArray<BoundExpression>.Empty);
+                    converted[pi] = new BoundArrayCreationExpression(attrSyntax, paramsArray, paramsArray.ElementType, zero, initializer);
+                    continue;
+                }
+
+                if (p.HasExplicitDefault && p.DefaultValueOpt.HasValue)
+                {
+                    converted[pi] = new BoundLiteralExpression(attrSyntax, p.Type, p.DefaultValueOpt.Value);
+                    continue;
+                }
+
+                diagnostics.Add(new Diagnostic(
+                    "CN_ATTR005",
+                    DiagnosticSeverity.Error,
+                    "No attribute constructor overload matches the supplied arguments.",
+                    new Location(tree, attrSyntax.Span)));
+                return false;
             }
 
             chosen = best;
             convertedArgsInParameterOrder = ImmutableArray.Create(converted);
             return true;
+
+            void Consider(MethodSymbol method, int score, bool expanded, int[] map, int[]? paramsElements)
+            {
+                if (score < bestScore)
+                {
+                    best = method;
+                    bestScore = score;
+                    bestExpanded = expanded;
+                    bestParamMap = map;
+                    bestParamsElementArgIndices = paramsElements;
+                    ambiguous = false;
+                }
+                else if (score == bestScore)
+                {
+                    ambiguous = true;
+                }
+            }
+
+            bool TryScoreRegular(MethodSymbol method, out int score, out int[] map)
+            {
+                score = 0;
+                map = new int[ctorArgs.Length];
+                Array.Fill(map, -1);
+
+                var ps = method.Parameters;
+                if (!TryBuildRegularMap(ps, map, out var assignedParameters))
+                    return false;
+
+                for (int pi = 0; pi < ps.Length; pi++)
+                {
+                    if (!assignedParameters[pi] && !ps[pi].HasExplicitDefault && !ps[pi].IsParams)
+                        return false;
+                }
+
+                for (int ai = 0; ai < ctorArgs.Length; ai++)
+                {
+                    var conv = LocalScopeBinder.ClassifyConversion(ctorArgs[ai].Expression, ps[map[ai]].Type);
+                    if (!conv.Exists || !conv.IsImplicit)
+                        return false;
+                    score += ConversionScore(conv.Kind);
+                }
+
+                return true;
+            }
+
+            bool TryScoreExpanded(MethodSymbol method, TypeSymbol paramsElementType, out int score, out int[] map, out int[] paramsElements)
+            {
+                score = 0;
+                map = new int[ctorArgs.Length];
+                Array.Fill(map, -1);
+                var elems = new List<int>();
+
+                var ps = method.Parameters;
+                int paramsIndex = ps.Length - 1;
+                int fixedCount = paramsIndex;
+                var assignedFixed = new bool[fixedCount];
+                int nextPositional = 0;
+
+                for (int ai = 0; ai < ctorArgs.Length; ai++)
+                {
+                    int pi;
+                    var name = ctorArgs[ai].Name;
+                    if (!string.IsNullOrEmpty(name))
+                    {
+                        pi = IndexOfParameter(ps, name!);
+                        if (pi < 0 || pi == paramsIndex || pi >= fixedCount || assignedFixed[pi])
+                            return FailExpanded(out paramsElements);
+                        assignedFixed[pi] = true;
+                    }
+                    else
+                    {
+                        while (nextPositional < fixedCount && assignedFixed[nextPositional])
+                            nextPositional++;
+
+                        if (nextPositional < fixedCount)
+                        {
+                            pi = nextPositional++;
+                            assignedFixed[pi] = true;
+                        }
+                        else
+                        {
+                            pi = paramsIndex;
+                            elems.Add(ai);
+                        }
+                    }
+
+                    map[ai] = pi;
+                }
+
+                for (int pi = 0; pi < fixedCount; pi++)
+                {
+                    if (!assignedFixed[pi] && !ps[pi].HasExplicitDefault)
+                        return FailExpanded(out paramsElements);
+                }
+
+                for (int ai = 0; ai < ctorArgs.Length; ai++)
+                {
+                    int pi = map[ai];
+                    var targetType = pi == paramsIndex ? paramsElementType : ps[pi].Type;
+                    var conv = LocalScopeBinder.ClassifyConversion(ctorArgs[ai].Expression, targetType);
+                    if (!conv.Exists || !conv.IsImplicit)
+                        return FailExpanded(out paramsElements);
+                    score += ConversionScore(conv.Kind);
+                }
+
+                paramsElements = elems.ToArray();
+                return true;
+            }
+
+            bool TryBuildRegularMap(ImmutableArray<ParameterSymbol> ps, int[] map, out bool[] assigned)
+            {
+                assigned = new bool[ps.Length];
+                int nextPositional = 0;
+
+                for (int ai = 0; ai < ctorArgs.Length; ai++)
+                {
+                    int pi;
+                    var name = ctorArgs[ai].Name;
+                    if (!string.IsNullOrEmpty(name))
+                    {
+                        pi = IndexOfParameter(ps, name!);
+                    }
+                    else
+                    {
+                        while (nextPositional < ps.Length && assigned[nextPositional])
+                            nextPositional++;
+                        pi = nextPositional < ps.Length ? nextPositional++ : -1;
+                    }
+
+                    if (pi < 0 || pi >= ps.Length || assigned[pi])
+                        return false;
+
+                    assigned[pi] = true;
+                    map[ai] = pi;
+                }
+
+                return true;
+            }
+
+            static int IndexOfParameter(ImmutableArray<ParameterSymbol> ps, string name)
+            {
+                for (int i = 0; i < ps.Length; i++)
+                    if (StringComparer.Ordinal.Equals(ps[i].Name, name))
+                        return i;
+                return -1;
+            }
+
+            static int ConversionScore(ConversionKind kind) => kind switch
+            {
+                ConversionKind.Identity => 0,
+                ConversionKind.ImplicitNumeric => 1,
+                ConversionKind.ImplicitConstant => 1,
+                ConversionKind.ImplicitReference => 1,
+                ConversionKind.ImplicitTuple => 1,
+                ConversionKind.NullLiteral => 1,
+                ConversionKind.Boxing => 2,
+                _ => 10
+            };
+
+            static bool FailExpanded(out int[] elements)
+            {
+                elements = Array.Empty<int>();
+                return false;
+            }
         }
         /// <summary>Binds a writable attribute field or property assignment</summary>
         private static bool TryBindNamedAttributeAssignment(
@@ -1125,10 +1316,54 @@ namespace Cnidaria.Cs
 
             if (declaredType is ArrayTypeSymbol arr)
             {
+                if (convertedExpression.ConstantValueOpt.HasValue && convertedExpression.ConstantValueOpt.Value is null)
+                {
+                    constant = new TypedConstant(declaredType, null);
+                    return true;
+                }
+
+                if (convertedExpression is BoundArrayCreationExpression arrayCreation)
+                {
+                    var elements = arrayCreation.InitializerOpt?.Elements ?? ImmutableArray<BoundExpression>.Empty;
+                    if (arrayCreation.InitializerOpt is null)
+                    {
+                        if (arrayCreation.DimensionSizes.Length != 1 ||
+                            !arrayCreation.DimensionSizes[0].ConstantValueOpt.HasValue ||
+                            Convert.ToInt32(arrayCreation.DimensionSizes[0].ConstantValueOpt.Value) != 0)
+                        {
+                            diagnostics.Add(new Diagnostic(
+                                "CN_ATTR009",
+                                DiagnosticSeverity.Error,
+                                "Attribute array arguments require a constant initializer.",
+                                new Location(tree, argSpanNode.Span)));
+                            return false;
+                        }
+                    }
+
+                    var typedElements = ImmutableArray.CreateBuilder<TypedConstant>(elements.Length);
+                    for (int i = 0; i < elements.Length; i++)
+                    {
+                        if (!TryCreateTypedConstant(
+                            tree,
+                            elements[i].Syntax,
+                            elements[i],
+                            arr.ElementType,
+                            diagnostics,
+                            out var elementConstant))
+                        {
+                            return false;
+                        }
+                        typedElements.Add(elementConstant);
+                    }
+
+                    constant = new TypedConstant(declaredType, typedElements.ToImmutable());
+                    return true;
+                }
+
                 diagnostics.Add(new Diagnostic(
                     "CN_ATTR009",
                     DiagnosticSeverity.Error,
-                    "Array-valued attribute arguments are not implemented.",
+                    "Attribute array argument must be a constant array creation.",
                     new Location(tree, argSpanNode.Span)));
                 return false;
             }
@@ -1260,6 +1495,9 @@ namespace Cnidaria.Cs
                 case SourceFieldSymbol f:
                     f.AddAttribute(data);
                     break;
+                case SynthesizedBackingFieldSymbol f:
+                    f.AddAttribute(data);
+                    break;
                 case ParameterSymbol p:
                     p.AddAttribute(data);
                     break;
@@ -1351,7 +1589,7 @@ namespace Cnidaria.Cs
                     location));
             }
 
-            if (method.IsExtern && !compilation.Target.IsRiscV && !compilation.Target.IsX86)
+            if (method.IsExtern && !MethodAttributeFacts.HasInternalCall(method) && !compilation.Target.IsRiscV && !compilation.Target.IsX86)
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_EXTERN005",
@@ -1360,7 +1598,7 @@ namespace Cnidaria.Cs
                     location));
             }
 
-            if (method.IsExtern)
+            if (method.IsExtern && !MethodAttributeFacts.HasInternalCall(method))
             {
                 if (IsGenericExternContext(method))
                 {

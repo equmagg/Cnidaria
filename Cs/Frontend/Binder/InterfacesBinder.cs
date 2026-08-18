@@ -325,7 +325,8 @@ namespace Cnidaria.Cs
             if (!StringComparer.Ordinal.Equals(a.Name, b.Name))
                 return false;
 
-            if (!LocalScopeBinder.AreSameType(a.ReturnType, b.ReturnType))
+            if (!LocalScopeBinder.AreSameType(a.ReturnType, b.ReturnType) ||
+                a.ReturnsByRefReadonly != b.ReturnsByRefReadonly)
                 return false;
 
             return SameExplicitMethodSignature(a, b);
@@ -357,6 +358,10 @@ namespace Cnidaria.Cs
             if (a.HasGet != b.HasGet || a.HasSet != b.HasSet)
                 return false;
 
+            if (a.HasGet &&
+                a.GetMethod?.ReturnsByRefReadonly != b.GetMethod?.ReturnsByRefReadonly)
+                return false;
+
             return SameExplicitPropertySignature(a, b);
         }
         private static MethodSymbol? FindImplicitMethodImplementation(NamedTypeSymbol type, MethodSymbol ifaceMethod)
@@ -384,7 +389,8 @@ namespace Cnidaria.Cs
                     if (!SameExplicitMethodSignature(candidate, ifaceMethod))
                         continue;
 
-                    if (!LocalScopeBinder.AreSameType(candidate.ReturnType, ifaceMethod.ReturnType))
+                    if (!LocalScopeBinder.AreSameType(candidate.ReturnType, ifaceMethod.ReturnType) ||
+                        candidate.ReturnsByRefReadonly != ifaceMethod.ReturnsByRefReadonly)
                         continue;
 
                     return candidate;
@@ -591,7 +597,8 @@ namespace Cnidaria.Cs
                     if (!SameExplicitMethodSignature(method, candidate))
                         continue;
 
-                    if (!LocalScopeBinder.AreSameType(method.ReturnType, candidate.ReturnType))
+                    if (!LocalScopeBinder.AreSameType(method.ReturnType, candidate.ReturnType) ||
+                        method.ReturnsByRefReadonly != candidate.ReturnsByRefReadonly)
                         continue;
 
                     if (match is null)

@@ -601,13 +601,23 @@ namespace Cnidaria.Cs
                     }
                     if (node.TreeKind is GenTreeKind.IndirectCall or GenTreeKind.VirtualCall or GenTreeKind.DelegateInvoke)
                         return true;
-                    if (node.TreeKind == GenTreeKind.Call &&
-                        (node.Method?.HasInternalCall != true ||
-                        (node.Method is not null &&
-                         ((Target.IsRiscV && RiscVRuntime.IsGcSafePointInternalCall(node.Method)) ||
-                          (Target.IsX86 && X86Runtime.IsGcSafePointInternalCall(node.Method))))))
+                    if (node.TreeKind == GenTreeKind.Intrinsic)
                     {
-                        return true;
+                        if (!RuntimeIntrinsics.IsNoGcSafePoint(node.IntrinsicId))
+                            return true;
+                        continue;
+                    }
+                    if (node.TreeKind == GenTreeKind.Call)
+                    {
+                        RuntimeMethod? method = node.Method;
+                        if (method is null)
+                            return true;
+                        if (method.HasInternalCall != true ||
+                             (Target.IsRiscV && RiscVRuntime.IsGcSafePointInternalCall(method)) ||
+                             (Target.IsX86 && X86Runtime.IsGcSafePointInternalCall(method)))
+                        {
+                            return true;
+                        }
                     }
                 }
                 return false;

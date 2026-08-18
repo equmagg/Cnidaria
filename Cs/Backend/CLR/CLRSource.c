@@ -15,7 +15,7 @@ typedef signed int isize;
 #define MINIMUM_MANAGED_OBJECT_SIZE __SIZEOF_POINTER__ * 2
 #define MINIMUM_GC_OBJECT_SIZE SYNC_BLOCK_SIZE + MINIMUM_MANAGED_OBJECT_SIZE
 #define STRING_LENGTH_OFFSET __SIZEOF_POINTER__
-#define STRING_CHARS_OFFSET __SIZEOF_POINTER__ + 4
+#define STRING_FIRST_CHAR_OFFSET __SIZEOF_POINTER__ + 4
 #define ARRAY_LENGTH_OFFSET __SIZEOF_POINTER__
 #define ARRAY_DATA_OFFSET __SIZEOF_POINTER__ * 2
 
@@ -25,18 +25,24 @@ typedef signed int isize;
 #define RH_SYS_MUNMAP 215ul
 #define RH_SYS_MMAP 222ul
 #define RH_SYS_MPROTECT 226ul
+#define RH_SYS_GETTID 178ul
+#define RH_SYS_GETCPU 168ul
 #elif defined(__linux__) && defined(__x86_64__)
 #define RH_SYS_WRITE 1ul
 #define RH_SYS_EXIT 60ul
 #define RH_SYS_MUNMAP 11ul
 #define RH_SYS_MMAP 9ul
 #define RH_SYS_MPROTECT 10ul
+#define RH_SYS_GETTID 186ul
+#define RH_SYS_GETCPU 309ul
 #elif defined(__linux__) && defined(__i386__)
 #define RH_SYS_WRITE 4ul
 #define RH_SYS_EXIT 1ul
 #define RH_SYS_MUNMAP 91ul
 #define RH_SYS_MMAP 90ul
 #define RH_SYS_MPROTECT 125ul
+#define RH_SYS_GETTID 224ul
+#define RH_SYS_GETCPU 318ul
 #elif defined(_WIN32)
 #define RH_WIN_MEM_COMMIT 0x00001000u
 #define RH_WIN_MEM_RESERVE 0x00002000u
@@ -1494,7 +1500,7 @@ static const RhTypeInfo* rh_require_method_table(const RhMethodTable* type, int 
         if (component_size != 2ul ||
             rh_method_table_kind(type) != 0ul ||
             rh_element_type(type) != RH_EETYPE_ELEMENT_TYPE_CLASS ||
-            type->base_size < SYNC_BLOCK_SIZE + STRING_CHARS_OFFSET + 2ul ||
+            type->base_size < SYNC_BLOCK_SIZE + STRING_FIRST_CHAR_OFFSET + 2ul ||
             info->component_gc_field_count != 0ul)
         {
             RhpFallbackFailFast(code);
@@ -1811,6 +1817,325 @@ void RhpFreeHGlobal(void* pointer)
         RhpFallbackFailFast(153);
 }
 
+void RhpMemset(void* destination, int value, usize length)
+{
+#if defined(__x86_64__)
+    usize destination_arg = (usize)destination;
+    usize length_arg = length;
+    usize value_arg = (usize)(u8)value;
+    __asm__ volatile(
+        ".byte 0xf3, 0xaa"
+        : [destination] "+{rdi}"(destination_arg), [length] "+{rcx}"(length_arg)
+        : [value] "{rax}"(value_arg)
+        : "memory");
+    return;
+#elif defined(__i386__)
+    usize destination_arg = (usize)destination;
+    usize length_arg = length;
+    usize value_arg = (usize)(u8)value;
+    __asm__ volatile(
+        ".byte 0xf3, 0xaa"
+        : [destination] "+{edi}"(destination_arg), [length] "+{ecx}"(length_arg)
+        : [value] "{eax}"(value_arg)
+        : "memory");
+    return;
+#else
+    u8* bytes = (u8*)destination;
+    u8 fill = (u8)value;
+#if defined(__riscv_vector)
+    while (length != 0ul)
+    {
+        usize vector_length;
+        __asm__ volatile(
+            "vsetvli %[vector_length], %[length], e8, m1, ta, ma"
+            : [vector_length] "=r"(vector_length)
+            : [length] "r"(length));
+        __asm__ volatile(
+            "vxor.vv v0, v0, v0\n"
+            "vadd.vx v0, v0, %[value]\n"
+            "vse8.v v0, 0(%[destination])"
+            :
+        : [destination] "r"(bytes), [value] "r"((usize)fill)
+            : "v0", "memory");
+        bytes = bytes + vector_length;
+        length = length - vector_length;
+    }
+#else
+    usize word = (usize)fill;
+    word = word | (word << 8);
+    word = word | (word << 16);
+#if __SIZEOF_POINTER__ == 8
+    word = word | (word << 32);
+#endif
+
+    while (length != 0ul && (((usize)bytes) & (__SIZEOF_POINTER__ - 1ul)) != 0ul)
+    {
+        *bytes = fill;
+        bytes = bytes + 1ul;
+        length = length - 1ul;
+    }
+
+    usize* words = (usize*)bytes;
+    while (length >= (__SIZEOF_POINTER__ * 4ul))
+    {
+        words[0] = word;
+        words[1] = word;
+        words[2] = word;
+        words[3] = word;
+        words = words + 4ul;
+        length = length - (__SIZEOF_POINTER__ * 4ul);
+    }
+
+    while (length >= __SIZEOF_POINTER__)
+    {
+        *words = word;
+        words = words + 1ul;
+        length = length - __SIZEOF_POINTER__;
+    }
+
+    bytes = (u8*)words;
+    while (length != 0ul)
+    {
+        *bytes = fill;
+        bytes = bytes + 1ul;
+        length = length - 1ul;
+    }
+#endif
+#endif
+}
+
+int RhpGetCurrentProcessorNumber(void)
+{
+#if defined(__linux__)
+    u32 cpu = 0u;
+    isize result = rh_syscall3(RH_SYS_GETCPU, (usize) & cpu, 0ul, 0ul);
+    if (result != 0l)
+        return 0;
+    return (int)cpu;
+#elif defined(_WIN32) && defined(__x86_64__)
+    usize result;
+    __asm__ volatile(
+        "sub rsp, 32\n"
+        "call qword ptr[rip + __imp_GetCurrentProcessorNumber]\n"
+        "add rsp, 32"
+        : "={rax}"(result)
+        :
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+    return (int)(u32)result;
+#elif defined(_WIN32) && defined(__i386__)
+    usize result;
+    __asm__ volatile(
+        "call dword ptr[__imp_GetCurrentProcessorNumber]"
+        : "={eax}"(result)
+        :
+        : "ecx", "edx", "memory");
+    return (int)(u32)result;
+#else
+    return 0;
+#endif
+}
+
+static usize rh_current_thread_id(void)
+{
+#if defined(__linux__)
+    return (usize)rh_syscall1(RH_SYS_GETTID, 0ul);
+#elif defined(_WIN32) && defined(__x86_64__)
+    usize result;
+    __asm__ volatile(
+        "sub rsp, 32\n"
+        "call qword ptr[rip + __imp_GetCurrentThreadId]\n"
+        "add rsp, 32"
+        : "={rax}"(result)
+        :
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+    return result;
+#elif defined(_WIN32) && defined(__i386__)
+    usize result;
+    __asm__ volatile(
+        "call dword ptr[__imp_GetCurrentThreadId]"
+        : "={eax}"(result)
+        :
+        : "ecx", "edx", "memory");
+    return result;
+#endif
+}
+
+static usize rh_atomic_compare_exchange(volatile usize* address, usize comparand, usize value)
+{
+#if defined(__riscv_zacas)
+    usize original = comparand;
+#if __SIZEOF_POINTER__ == 8
+    __asm__ volatile(
+        "amocas.d.aqrl %[original], %[value], (%[address])"
+        : [original] "+&r"(original)
+        : [address] "r"(address), [value] "r"(value)
+        : "memory");
+#else
+    __asm__ volatile(
+        "amocas.w.aqrl %[original], %[value], (%[address])"
+        : [original] "+&r"(original)
+        : [address] "r"(address), [value] "r"(value)
+        : "memory");
+#endif
+    return original;
+#elif defined(__riscv_zalrsc)
+    usize original;
+    usize status;
+#if __SIZEOF_POINTER__ == 8
+    __asm__ volatile(
+        ".Lrh_cas_retry_%=:\n"
+        "lr.d.aq %[original], (%[address])\n"
+        "bne %[original], %[comparand], .Lrh_cas_done_%=\n"
+        "sc.d.rl %[status], %[value], (%[address])\n"
+        "bne %[status], zero, .Lrh_cas_retry_%=\n"
+        ".Lrh_cas_done_%=:"
+        : [original] "=&r"(original), [status] "=&r"(status)
+        : [address] "r"(address), [comparand] "r"(comparand), [value] "r"(value)
+        : "memory");
+#else
+    __asm__ volatile(
+        ".Lrh_cas_retry_%=:\n"
+        "lr.w.aq %[original], (%[address])\n"
+        "bne %[original], %[comparand], .Lrh_cas_done_%=\n"
+        "sc.w.rl %[status], %[value], (%[address])\n"
+        "bne %[status], zero, .Lrh_cas_retry_%=\n"
+        ".Lrh_cas_done_%=:"
+        : [original] "=&r"(original), [status] "=&r"(status)
+        : [address] "r"(address), [comparand] "r"(comparand), [value] "r"(value)
+        : "memory");
+#endif
+    return original;
+#elif defined(__riscv)
+    (void)address;
+    (void)comparand;
+    (void)value;
+    RhpFallbackFailFast(154);
+    return 0ul;
+#elif defined(__x86_64__)
+    usize original = comparand;
+    __asm__ volatile(
+        ".byte 0xf0\n"
+        "cmpxchg qword ptr[%[address]], %[value]"
+        : [original] "+&{rax}"(original)
+        : [address] "r"(address), [value] "r"(value)
+        : "cc", "memory");
+    return original;
+#elif defined(__i386__)
+    usize original = comparand;
+    __asm__ volatile(
+        ".byte 0xf0\n"
+        "cmpxchg dword ptr[%[address]], %[value]"
+        : [original] "+&{eax}"(original)
+        : [address] "r"(address), [value] "r"(value)
+        : "cc", "memory");
+    return original;
+#endif
+}
+
+static void rh_cpu_relax(void)
+{
+#if defined(__x86_64__) || defined(__i386__) || defined(__riscv)
+    __asm__ volatile("nop" : : : "memory");
+#endif
+}
+
+typedef struct RhMonitor
+{
+    volatile usize gate;
+    volatile usize owner;
+    usize recursion;
+} RhMonitor;
+
+static RhMonitor* rh_monitor_for_object(void* object)
+{
+    volatile usize* slot = (volatile usize*)((u8*)object - SYNC_BLOCK_SIZE);
+    usize current = *slot;
+    RhMonitor* candidate;
+    usize observed;
+
+    if (current != 0ul)
+        return (RhMonitor*)current;
+
+    candidate = (RhMonitor*)RhpAllocHGlobal(sizeof(RhMonitor));
+    candidate->gate = 0ul;
+    candidate->owner = 0ul;
+    candidate->recursion = 0ul;
+    observed = rh_atomic_compare_exchange(slot, 0ul, (usize)candidate);
+    if (observed == 0ul)
+        return candidate;
+
+    RhpFreeHGlobal(candidate);
+    return (RhMonitor*)observed;
+}
+
+void RhpMonitorEnter(void* object)
+{
+    RhMonitor* monitor;
+    usize thread_id;
+
+    if (object == (void*)0)
+        RhpFallbackFailFast(154);
+
+    monitor = rh_monitor_for_object(object);
+    thread_id = rh_current_thread_id();
+    if (thread_id == 0ul)
+        RhpFallbackFailFast(154);
+
+    if (monitor->owner == thread_id)
+    {
+        if (monitor->recursion == (usize)-1)
+            RhpFallbackFailFast(154);
+        monitor->recursion = monitor->recursion + 1ul;
+        return;
+    }
+
+    while (rh_atomic_compare_exchange(&monitor->gate, 0ul, 1ul) != 0ul)
+        rh_cpu_relax();
+
+    monitor->owner = thread_id;
+    monitor->recursion = 1ul;
+}
+
+void RhpMonitorExit(void* object)
+{
+    volatile usize* slot;
+    RhMonitor* monitor;
+    usize thread_id;
+
+    if (object == (void*)0)
+        RhpFallbackFailFast(154);
+
+    slot = (volatile usize*)((u8*)object - SYNC_BLOCK_SIZE);
+    monitor = (RhMonitor*)(*slot);
+    if (monitor == (RhMonitor*)0)
+        RhpFallbackFailFast(154);
+
+    thread_id = rh_current_thread_id();
+    if (thread_id == 0ul || monitor->owner != thread_id || monitor->recursion == 0ul)
+        RhpFallbackFailFast(154);
+
+    if (monitor->recursion > 1ul)
+    {
+        monitor->recursion = monitor->recursion - 1ul;
+        return;
+    }
+
+    monitor->recursion = 0ul;
+    monitor->owner = 0ul;
+    if (rh_atomic_compare_exchange(&monitor->gate, 1ul, 0ul) != 1ul)
+        RhpFallbackFailFast(154);
+}
+
+static void rh_monitor_destroy_for_object(void* object)
+{
+    volatile usize* slot = (volatile usize*)((u8*)object - SYNC_BLOCK_SIZE);
+    RhMonitor* monitor = (RhMonitor*)(*slot);
+    if (monitor == (RhMonitor*)0)
+        return;
+    *slot = 0ul;
+    RhpFreeHGlobal(monitor);
+}
+
 static int rh_ensure_committed(u8* required)
 {
     usize required_offset;
@@ -1888,7 +2213,7 @@ void RhpInitialize(
         (MANAGED_OBJECT_HEADER_SIZE & (__SIZEOF_POINTER__ - 1ul)) != 0ul ||
         MINIMUM_GC_OBJECT_SIZE < SYNC_BLOCK_SIZE + MANAGED_OBJECT_HEADER_SIZE ||
         STRING_LENGTH_OFFSET != MANAGED_OBJECT_HEADER_SIZE ||
-        STRING_CHARS_OFFSET != STRING_LENGTH_OFFSET + 4ul ||
+        STRING_FIRST_CHAR_OFFSET != STRING_LENGTH_OFFSET + 4ul ||
         ARRAY_LENGTH_OFFSET != MANAGED_OBJECT_HEADER_SIZE ||
         ARRAY_DATA_OFFSET < ARRAY_LENGTH_OFFSET + 4ul ||
         (ARRAY_DATA_OFFSET & (__SIZEOF_POINTER__ - 1ul)) != 0ul ||
@@ -2263,6 +2588,7 @@ static void rh_sweep(void)
         {
             if ((block->flags & RH_BLOCK_MARK) == 0ul)
             {
+                rh_monitor_destroy_for_object(rh_object_from_block(block));
                 block->kind = RH_BLOCK_FREE;
                 block->mark_next = (RhBlock*)0;
                 block->flags = 0ul;
@@ -2427,7 +2753,7 @@ static void* rh_try_allocate(usize gc_size)
     return rh_try_bump_allocate(total);
 }
 
-static void* rh_allocate_object(const RhMethodTable* type, usize gc_size)
+static void* rh_allocate_object_with_zeroing(const RhMethodTable* type, usize gc_size, int zeroing_optional)
 {
     void* storage;
     void* object;
@@ -2445,7 +2771,18 @@ static void* rh_allocate_object(const RhMethodTable* type, usize gc_size)
             RhpFallbackFailFast(141);
     }
 
-    rh_zero(storage, gc_size);
+    if (zeroing_optional != 0 && (type->flags & RH_EETYPE_HAS_POINTERS) == 0u)
+    {
+        usize prefix_size = (usize)type->base_size;
+        if (prefix_size > gc_size)
+            RhpFallbackFailFast(140);
+        rh_zero(storage, prefix_size);
+    }
+    else
+    {
+        rh_zero(storage, gc_size);
+    }
+
     object = (void*)((u8*)storage + SYNC_BLOCK_SIZE);
     ((RhObject*)object)->type = type;
     if (rh_allocation_debt > maximum - gc_size)
@@ -2455,6 +2792,11 @@ static void* rh_allocate_object(const RhMethodTable* type, usize gc_size)
     if (rh_allocation_debt >= RH_GC_POLL_DEBT_LIMIT)
         RhpGcPollRequested = 1u;
     return object;
+}
+
+static void* rh_allocate_object(const RhMethodTable* type, usize gc_size)
+{
+    return rh_allocate_object_with_zeroing(type, gc_size, 0);
 }
 
 void* RhpNewFast(const RhMethodTable* type)
@@ -2487,6 +2829,23 @@ void* RhpNewArray(const RhMethodTable* type, int length)
         *(int*)((u8*)object + STRING_LENGTH_OFFSET) = length;
     else
         *(int*)((u8*)object + ARRAY_LENGTH_OFFSET) = length;
+    return object;
+}
+
+void* RhpNewArrayUninitialized(const RhMethodTable* type, int length)
+{
+    const RhTypeInfo* info;
+    usize gc_size;
+    void* object;
+    info = rh_require_method_table(type, 140);
+    if (info->runtime_kind != RH_TYPE_SZARRAY)
+        RhpFallbackFailFast(140);
+    gc_size = rh_variable_gc_size(type, length);
+    if (gc_size == 0ul || rh_total_block_size(gc_size) == 0ul)
+        RhpFallbackFailFast(140);
+
+    object = rh_allocate_object_with_zeroing(type, gc_size, 1);
+    *(int*)((u8*)object + ARRAY_LENGTH_OFFSET) = length;
     return object;
 }
 
@@ -2768,7 +3127,7 @@ void* RhpNewStringFromChar(
     int length)
 {
     void* object = RhpNewArray(type, length);
-    u16* destination = (u16*)((u8*)object + STRING_CHARS_OFFSET);
+    u16* destination = (u16*)((u8*)object + STRING_FIRST_CHAR_OFFSET);
     int i = 0;
     while (i < length)
     {
@@ -2793,7 +3152,7 @@ void* RhpNewStringFromUtf16(
         length = length + 1;
     }
     object = RhpNewArray(type, length);
-    rh_copy_utf16((u16*)((u8*)object + STRING_CHARS_OFFSET), source, length);
+    rh_copy_utf16((u16*)((u8*)object + STRING_FIRST_CHAR_OFFSET), source, length);
     return object;
 }
 
@@ -2980,7 +3339,7 @@ void* RhpNewStringFromCharArray(
     length = rh_array_length(array);
     source = (const u16*)((const u8*)array + ARRAY_DATA_OFFSET);
     object = RhpNewArray(type, length);
-    rh_copy_utf16((u16*)((u8*)object + STRING_CHARS_OFFSET), source, length);
+    rh_copy_utf16((u16*)((u8*)object + STRING_FIRST_CHAR_OFFSET), source, length);
     return object;
 }
 
@@ -3001,7 +3360,21 @@ void* RhpNewStringFromCharArrayRange(
         RhpFallbackFailFast(147);
     source = (const u16*)((const u8*)array + ARRAY_DATA_OFFSET) + start_index;
     object = RhpNewArray(type, length);
-    rh_copy_utf16((u16*)((u8*)object + STRING_CHARS_OFFSET), source, length);
+    rh_copy_utf16((u16*)((u8*)object + STRING_FIRST_CHAR_OFFSET), source, length);
+    return object;
+}
+
+void* RhpNewStringFromReadOnlySpan(
+    const RhMethodTable* type,
+    const u16* source,
+    int length)
+{
+    void* object;
+    if (length < 0 || (source == (const u16*)0 && length != 0))
+        RhpFallbackFailFast(147);
+    object = RhpNewArray(type, length);
+    if (length != 0)
+        rh_copy_utf16((u16*)((u8*)object + STRING_FIRST_CHAR_OFFSET), source, length);
     return object;
 }
 
@@ -3025,18 +3398,6 @@ static const RhMethodTable* rh_require_string(const void* value)
         RhpFallbackFailFast(147);
     }
     return type;
-}
-
-int RhpStringGetLength(const void* value)
-{
-    rh_require_string(value);
-    return *(const int*)((const u8*)value + STRING_LENGTH_OFFSET);
-}
-
-u16* RhpStringGetData(void* value)
-{
-    rh_require_string(value);
-    return (u16*)((u8*)value + STRING_CHARS_OFFSET);
 }
 
 void RhpConsoleWriteUtf16(const u16* text, int length)
@@ -3102,6 +3463,6 @@ void RhpConsoleWriteString(const void* value)
     object = (const u8*)value;
     rh_require_string(value);
     length = *(const int*)(object + STRING_LENGTH_OFFSET);
-    chars = (const u16*)(object + STRING_CHARS_OFFSET);
+    chars = (const u16*)(object + STRING_FIRST_CHAR_OFFSET);
     RhpConsoleWriteUtf16(chars, length);
 }

@@ -1,3 +1,4 @@
+using Cnidaria.C;
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
@@ -56,6 +57,7 @@ namespace Cnidaria.Cs
         FunctionPointer,
 
         Call,
+        Intrinsic,
         IndirectCall,
         VirtualCall,
         NewObject,
@@ -88,7 +90,6 @@ namespace Cnidaria.Cs
         StaticData,
         StackAlloc,
         PointerElementAddr,
-        PointerToByRef,
         PointerDiff,
 
         CastClass,
@@ -154,6 +155,29 @@ namespace Cnidaria.Cs
         MakeCse = 1u << 22,
         ExplicitInit = 1u << 23,
         AssertionProperties = NullCheckEliminated | BoundsCheckEliminated | DivModNoByZero | DivModNoOverflow,
+    }
+    internal static class GenTreeIntrinsicSemantics
+    {
+        public static GenTreeFlags Flags(RuntimeIntrinsicId intrinsicId)
+        {
+            RuntimeIntrinsicFlags intrinsicFlags = RuntimeIntrinsics.GetFlags(intrinsicId);
+            GenTreeFlags flags = GenTreeFlags.None;
+            if ((intrinsicFlags & RuntimeIntrinsicFlags.SideEffect) != 0)
+                flags |= GenTreeFlags.SideEffect;
+            if ((intrinsicFlags & RuntimeIntrinsicFlags.CanThrow) != 0)
+                flags |= GenTreeFlags.CanThrow;
+            if ((intrinsicFlags & RuntimeIntrinsicFlags.MemoryRead) != 0)
+                flags |= GenTreeFlags.MemoryRead;
+            if ((intrinsicFlags & RuntimeIntrinsicFlags.MemoryWrite) != 0)
+                flags |= GenTreeFlags.MemoryWrite;
+            if ((intrinsicFlags & RuntimeIntrinsicFlags.GlobalRef) != 0)
+                flags |= GenTreeFlags.GlobalRef;
+            if ((intrinsicFlags & RuntimeIntrinsicFlags.Indirect) != 0)
+                flags |= GenTreeFlags.Indirect;
+            if ((intrinsicFlags & RuntimeIntrinsicFlags.Ordered) != 0)
+                flags |= GenTreeFlags.Ordered;
+            return flags;
+        }
     }
     internal enum GenTreeBlockJumpKind : byte
     {
@@ -1004,6 +1028,7 @@ namespace Cnidaria.Cs
         public RuntimeType? RuntimeType { get; }
         public RuntimeField? Field { get; }
         public RuntimeMethod? Method { get; }
+        public RuntimeIntrinsicId IntrinsicId { get; }
         public NumericConvKind ConvKind { get; }
         public NumericConvFlags ConvFlags { get; }
         public int TargetPc { get; }
@@ -1028,7 +1053,8 @@ namespace Cnidaria.Cs
             NumericConvFlags convFlags = default,
             int targetPc = -1,
             int targetBlockId = -1,
-            int boundsCheckIndexOverride = -1)
+            int boundsCheckIndexOverride = -1,
+            RuntimeIntrinsicId intrinsicId = RuntimeIntrinsicId.None)
         {
             if (boundsCheckIndexOverride < -1)
                 throw new ArgumentOutOfRangeException(nameof(boundsCheckIndexOverride));
@@ -1052,6 +1078,7 @@ namespace Cnidaria.Cs
             RuntimeType = runtimeType;
             Field = field;
             Method = method;
+            IntrinsicId = intrinsicId != RuntimeIntrinsicId.None ? intrinsicId : RuntimeIntrinsics.GetIntrinsicId(method);
             ConvKind = convKind;
             ConvFlags = convFlags;
             TargetPc = targetPc;

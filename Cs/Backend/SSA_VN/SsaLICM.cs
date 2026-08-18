@@ -604,7 +604,8 @@ namespace Cnidaria.Cs
                 if (node.Kind is GenTreeKind.StoreLocal or GenTreeKind.StoreArg or GenTreeKind.StoreTemp)
                     return node.LocalDescriptor is null || node.LocalDescriptor.HasMemoryAlias;
 
-                if (node.Kind is GenTreeKind.Call or
+                if (node.Kind is GenTreeKind.Intrinsic or
+                    GenTreeKind.Call or
                     GenTreeKind.IndirectCall or
                     GenTreeKind.VirtualCall or
                     GenTreeKind.NewObject or

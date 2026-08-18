@@ -153,7 +153,7 @@ namespace Cnidaria.RiscV
                     ValidateUnsignedImmediate(instruction.Immediate, 12, nameof(instruction.Immediate));
                     return EncodeI(metadata.Opcode, instruction.Rd, metadata.Funct3, (RVRegister)zimm, instruction.Immediate);
                 case RVInstructionFormat.Amo:
-                    return EncodeAmo(instruction, metadata);
+                    return EncodeAmo(instruction, metadata, target);
                 case RVInstructionFormat.VectorConfig:
                     return EncodeVectorConfig(instruction, metadata);
                 case RVInstructionFormat.VectorLoad:
@@ -365,7 +365,7 @@ namespace Cnidaria.RiscV
                 _ => throw new NotSupportedException("Unsupported RISC-V hypervisor load opcode: " + opcode),
             };
 
-        private static uint EncodeAmo(RVInstruction instruction, RVInstructionMetadata metadata)
+        private static uint EncodeAmo(RVInstruction instruction, RVInstructionMetadata metadata, RVTarget target)
         {
             ValidateIntegerRegister(instruction.Rd, nameof(instruction.Rd));
             ValidateIntegerRegister(instruction.Rs1, nameof(instruction.Rs1));
@@ -377,6 +377,14 @@ namespace Cnidaria.RiscV
             else
             {
                 ValidateIntegerRegister(instruction.Rs2, nameof(instruction.Rs2));
+            }
+
+            if ((instruction.Opcode == RVInstrKind.AmocasD && target.Is32Bit) || instruction.Opcode == RVInstrKind.AmocasQ)
+            {
+                int rd = RVRegisters.IntegerIndex(instruction.Rd);
+                int rs2Index = RVRegisters.IntegerIndex(instruction.Rs2);
+                if ((rd & 1) != 0 || (rs2Index & 1) != 0)
+                    throw new InvalidOperationException(instruction.Opcode + " requires even rd and rs2 register pairs");
             }
 
             uint aq = instruction.AtomicAcquire ? 1U : 0U;
@@ -1459,35 +1467,42 @@ namespace Cnidaria.RiscV
             byte funct5 = (byte)((word >> 27) & 0x1F);
             bool acquire = ((word >> 26) & 1) != 0;
             bool release = ((word >> 25) & 1) != 0;
-            bool is64 = funct3 == 3;
             var opcode = (funct5, funct3) switch
             {
-                (0x02, 2) when rs2 == RVRegister.X0 => RVInstrKind.LrW,
-                (0x03, 2) => RVInstrKind.ScW,
-                (0x01, 2) => RVInstrKind.AmoSwapW,
-                (0x00, 2) => RVInstrKind.AmoAddW,
-                (0x04, 2) => RVInstrKind.AmoXorW,
-                (0x0C, 2) => RVInstrKind.AmoAndW,
-                (0x08, 2) => RVInstrKind.AmoOrW,
-                (0x10, 2) => RVInstrKind.AmoMinW,
-                (0x14, 2) => RVInstrKind.AmoMaxW,
-                (0x18, 2) => RVInstrKind.AmoMinuW,
-                (0x1C, 2) => RVInstrKind.AmoMaxuW,
-                (0x02, 3) when target.Is64Bit && rs2 == RVRegister.X0 => RVInstrKind.LrD,
-                (0x03, 3) when target.Is64Bit => RVInstrKind.ScD,
-                (0x01, 3) when target.Is64Bit => RVInstrKind.AmoSwapD,
-                (0x00, 3) when target.Is64Bit => RVInstrKind.AmoAddD,
-                (0x04, 3) when target.Is64Bit => RVInstrKind.AmoXorD,
-                (0x0C, 3) when target.Is64Bit => RVInstrKind.AmoAndD,
-                (0x08, 3) when target.Is64Bit => RVInstrKind.AmoOrD,
-                (0x10, 3) when target.Is64Bit => RVInstrKind.AmoMinD,
-                (0x14, 3) when target.Is64Bit => RVInstrKind.AmoMaxD,
-                (0x18, 3) when target.Is64Bit => RVInstrKind.AmoMinuD,
-                (0x1C, 3) when target.Is64Bit => RVInstrKind.AmoMaxuD,
+                (0x02, 2) when target.HasZalrsc && rs2 == RVRegister.X0 => RVInstrKind.LrW,
+                (0x03, 2) when target.HasZalrsc => RVInstrKind.ScW,
+                (0x01, 2) when target.HasZaamo => RVInstrKind.AmoSwapW,
+                (0x00, 2) when target.HasZaamo => RVInstrKind.AmoAddW,
+                (0x04, 2) when target.HasZaamo => RVInstrKind.AmoXorW,
+                (0x0C, 2) when target.HasZaamo => RVInstrKind.AmoAndW,
+                (0x08, 2) when target.HasZaamo => RVInstrKind.AmoOrW,
+                (0x10, 2) when target.HasZaamo => RVInstrKind.AmoMinW,
+                (0x14, 2) when target.HasZaamo => RVInstrKind.AmoMaxW,
+                (0x18, 2) when target.HasZaamo => RVInstrKind.AmoMinuW,
+                (0x1C, 2) when target.HasZaamo => RVInstrKind.AmoMaxuW,
+                (0x05, 2) when target.HasZacas => RVInstrKind.AmocasW,
+                (0x05, 3) when target.HasZacas => RVInstrKind.AmocasD,
+                (0x05, 4) when target.Is64Bit && target.HasZacas => RVInstrKind.AmocasQ,
+                (0x02, 3) when target.Is64Bit && target.HasZalrsc && rs2 == RVRegister.X0 => RVInstrKind.LrD,
+                (0x03, 3) when target.Is64Bit && target.HasZalrsc => RVInstrKind.ScD,
+                (0x01, 3) when target.Is64Bit && target.HasZaamo => RVInstrKind.AmoSwapD,
+                (0x00, 3) when target.Is64Bit && target.HasZaamo => RVInstrKind.AmoAddD,
+                (0x04, 3) when target.Is64Bit && target.HasZaamo => RVInstrKind.AmoXorD,
+                (0x0C, 3) when target.Is64Bit && target.HasZaamo => RVInstrKind.AmoAndD,
+                (0x08, 3) when target.Is64Bit && target.HasZaamo => RVInstrKind.AmoOrD,
+                (0x10, 3) when target.Is64Bit && target.HasZaamo => RVInstrKind.AmoMinD,
+                (0x14, 3) when target.Is64Bit && target.HasZaamo => RVInstrKind.AmoMaxD,
+                (0x18, 3) when target.Is64Bit && target.HasZaamo => RVInstrKind.AmoMinuD,
+                (0x1C, 3) when target.Is64Bit && target.HasZaamo => RVInstrKind.AmoMaxuD,
                 _ => RVInstrKind.Invalid,
             };
-            if (opcode == RVInstrKind.Invalid || (is64 && !target.Is64Bit))
+            if (opcode == RVInstrKind.Invalid)
                 throw new InvalidDataException("Invalid RISC-V atomic instruction");
+            if ((opcode == RVInstrKind.AmocasD && target.Is32Bit) || opcode == RVInstrKind.AmocasQ)
+            {
+                if ((RVRegisters.IntegerIndex(rd) & 1) != 0 || (RVRegisters.IntegerIndex(rs2) & 1) != 0)
+                    throw new InvalidDataException("Invalid RISC-V AMOCAS register pair");
+            }
             return RVInstruction.Amo(opcode, rd, rs1, rs2, acquire, release);
         }
 

@@ -681,6 +681,7 @@ namespace Cnidaria.Cs
         NotNullConstraint = 1 << 1,
         StructConstraint = 1 << 2,
         AllowsRefStruct = 1 << 3,
+        ClassConstraint = 1 << 4,
     }
 
     /// <summary>Represents a type parameter declared by a type or method</summary>
@@ -692,8 +693,106 @@ namespace Cnidaria.Cs
         public override ImmutableArray<Location> Locations { get; }
         public int Ordinal { get; }
         public GenericConstraintsFlags GenericConstraint { get; private set; }
+        private ImmutableArray<TypeSymbol> _constraintTypes;
         private List<AttributeData>? _attributes;
-        public override bool IsValueType => (GenericConstraint & GenericConstraintsFlags.StructConstraint) != 0;
+        public ImmutableArray<TypeSymbol> ConstraintTypes
+            => _constraintTypes.IsDefault ? ImmutableArray<TypeSymbol>.Empty : _constraintTypes;
+        public override bool IsReferenceType
+        {
+            get
+            {
+                if ((GenericConstraint & GenericConstraintsFlags.ClassConstraint) != 0)
+                    return true;
+
+                return IsReferenceTypeFromConstraintTypes(this, new HashSet<TypeParameterSymbol>());
+            }
+        }
+
+        private static bool IsReferenceTypeFromConstraintTypes(
+            TypeParameterSymbol typeParameter,
+            HashSet<TypeParameterSymbol> visited)
+        {
+            if (!visited.Add(typeParameter))
+                return false;
+
+            var constraints = typeParameter.ConstraintTypes;
+            for (int i = 0; i < constraints.Length; i++)
+            {
+                var constraint = constraints[i];
+                if (constraint is TypeParameterSymbol constrainedTypeParameter)
+                {
+                    if (IsReferenceTypeFromConstraintTypes(constrainedTypeParameter, visited))
+                    {
+                        visited.Remove(typeParameter);
+                        return true;
+                    }
+                    continue;
+                }
+
+                if (!constraint.IsReferenceType || constraint.Kind == SymbolKind.Error)
+                    continue;
+
+                if (constraint is NamedTypeSymbol { TypeKind: TypeKind.Interface })
+                    continue;
+
+                if (constraint.SpecialType is
+                    SpecialType.System_Object or
+                    SpecialType.System_ValueType or
+                    SpecialType.System_Enum)
+                {
+                    continue;
+                }
+
+                visited.Remove(typeParameter);
+                return true;
+            }
+
+            visited.Remove(typeParameter);
+            return false;
+        }
+
+        public override bool IsValueType
+        {
+            get
+            {
+                if ((GenericConstraint & GenericConstraintsFlags.StructConstraint) != 0)
+                    return true;
+
+                return IsValueTypeFromConstraintTypes(this, new HashSet<TypeParameterSymbol>());
+            }
+        }
+
+        private static bool IsValueTypeFromConstraintTypes(
+            TypeParameterSymbol typeParameter,
+            HashSet<TypeParameterSymbol> visited)
+        {
+            if (!visited.Add(typeParameter))
+                return false;
+
+            var constraints = typeParameter.ConstraintTypes;
+            for (int i = 0; i < constraints.Length; i++)
+            {
+                if (constraints[i] is TypeParameterSymbol constrainedTypeParameter)
+                {
+                    if ((constrainedTypeParameter.GenericConstraint & GenericConstraintsFlags.StructConstraint) != 0 ||
+                        IsValueTypeFromConstraintTypes(constrainedTypeParameter, visited))
+                    {
+                        visited.Remove(typeParameter);
+                        return true;
+                    }
+                    continue;
+                }
+
+                if (constraints[i].IsValueType)
+                {
+                    visited.Remove(typeParameter);
+                    return true;
+                }
+            }
+
+            visited.Remove(typeParameter);
+            return false;
+        }
         public TypeParameterSymbol(string name, Symbol? containing, int ordinal, ImmutableArray<Location> locations)
         {
             Name = name;
@@ -713,6 +812,17 @@ namespace Cnidaria.Cs
                 return false;
             GenericConstraint |= constraint;
             return true;
+        }
+        internal void AddConstraintType(TypeSymbol type)
+        {
+            var current = ConstraintTypes;
+            for (int i = 0; i < current.Length; i++)
+            {
+                if (ReferenceEquals(current[i], type))
+                    return;
+            }
+
+            _constraintTypes = current.Add(type);
         }
     }
     /// <summary>Represents an array type with a fixed rank and element type</summary>
@@ -1017,6 +1127,7 @@ namespace Cnidaria.Cs
     {
         public sealed override SymbolKind Kind => SymbolKind.Method;
         public abstract TypeSymbol ReturnType { get; }
+        public virtual bool ReturnsByRefReadonly => false;
         public abstract ImmutableArray<ParameterSymbol> Parameters { get; }
         public abstract ImmutableArray<TypeParameterSymbol> TypeParameters { get; }
         public abstract bool IsStatic { get; }
@@ -1087,6 +1198,7 @@ namespace Cnidaria.Cs
     internal sealed class SynthesizedBackingFieldSymbol : FieldSymbol
     {
         private TypeSymbol _type;
+        private readonly List<AttributeData> _attributes = new();
 
         public override string Name { get; }
         public override Symbol? ContainingSymbol { get; }
@@ -1113,6 +1225,8 @@ namespace Cnidaria.Cs
         }
 
         internal void SetType(TypeSymbol type) => _type = type;
+        public override ImmutableArray<AttributeData> GetAttributes() => _attributes.ToImmutableArray();
+        internal void AddAttribute(AttributeData attribute) => _attributes.Add(attribute);
     }
     /// <summary>Specifies parameter passing by value or by reference</summary>
     public enum ParameterRefKind : byte
@@ -1433,9 +1547,35 @@ namespace Cnidaria.Cs
             _locations.Add(location);
             _declRefs.Add(declarationRef);
         }
-        internal void SetBackingField(FieldSymbol field)
+        internal FieldSymbol EnsureBackingField(bool isReadOnly)
         {
-            BackingFieldOpt ??= field;
+            if (BackingFieldOpt is FieldSymbol existing)
+                return existing;
+
+            if (ContainingSymbol is not NamedTypeSymbol ownerType)
+                throw new InvalidOperationException("A source property backing field requires a named containing type.");
+
+            var backing = new SynthesizedBackingFieldSymbol(
+                name: $"<{Name}>k__BackingField",
+                containing: ownerType,
+                placeholderType: Type,
+                isStatic: IsStatic,
+                isReadOnly: isReadOnly);
+
+            switch (ownerType)
+            {
+                case SourceNamedTypeSymbol sourceType:
+                    sourceType.AddMember(backing);
+                    break;
+                case SpecialNamedTypeSymbol specialType:
+                    specialType.AddMember(backing);
+                    break;
+                default:
+                    throw new InvalidOperationException("Unsupported containing type for a synthesized backing field.");
+            }
+
+            BackingFieldOpt = backing;
+            return backing;
         }
         public override ImmutableArray<AttributeData> GetAttributes() => _attributes.ToImmutableArray();
 
@@ -1619,9 +1759,11 @@ namespace Cnidaria.Cs
         public LocalFunctionStatementSyntax Declaration { get; }
 
         private TypeSymbol _returnType;
+        private bool _returnsByRefReadonly;
         private ImmutableArray<ParameterSymbol> _parameters;
         private ImmutableArray<TypeParameterSymbol> _typeParameters;
         public override TypeSymbol ReturnType => _returnType;
+        public override bool ReturnsByRefReadonly => _returnsByRefReadonly;
         public override ImmutableArray<ParameterSymbol> Parameters => _parameters;
         public override ImmutableArray<TypeParameterSymbol> TypeParameters
             => _typeParameters.IsDefault ? ImmutableArray<TypeParameterSymbol>.Empty : _typeParameters;
@@ -1659,9 +1801,10 @@ namespace Cnidaria.Cs
             _parameters = ImmutableArray<ParameterSymbol>.Empty;
         }
 
-        internal void SetSignature(TypeSymbol returnType, ImmutableArray<ParameterSymbol> parameters)
+        internal void SetSignature(TypeSymbol returnType, ImmutableArray<ParameterSymbol> parameters, bool returnsByRefReadonly = false)
         {
             _returnType = returnType;
+            _returnsByRefReadonly = returnsByRefReadonly;
             _parameters = parameters.IsDefault ? ImmutableArray<ParameterSymbol>.Empty : parameters;
         }
         internal void SetTypeParameters(ImmutableArray<TypeParameterSymbol> typeParameters)
@@ -1680,7 +1823,9 @@ namespace Cnidaria.Cs
         public override Symbol? ContainingSymbol { get; }
         public override ImmutableArray<Location> Locations { get; }
         private TypeSymbol _returnType;
+        private bool _returnsByRefReadonly;
         public override TypeSymbol ReturnType => _returnType;
+        public override bool ReturnsByRefReadonly => _returnsByRefReadonly;
         private ImmutableArray<ParameterSymbol> _parameters;
         public override ImmutableArray<ParameterSymbol> Parameters => _parameters;
         private ImmutableArray<TypeParameterSymbol> _typeParameters;
@@ -1710,6 +1855,7 @@ namespace Cnidaria.Cs
         private readonly bool _isExtensionMethod;
         public override bool IsExtensionMethod => _isExtensionMethod;
         internal bool IsUnsafe { get; }
+        internal SourcePropertySymbol? AssociatedProperty { get; private set; }
         public SourceMethodSymbol(
             string name,
             Symbol containing,
@@ -1751,12 +1897,18 @@ namespace Cnidaria.Cs
                 ?? throw new ArgumentNullException(nameof(method));
         }
         internal void SetOverriddenMethod(MethodSymbol overridden) => _overridden = overridden;
+        internal void SetAssociatedProperty(SourcePropertySymbol property)
+            => AssociatedProperty ??= property ?? throw new ArgumentNullException(nameof(property));
         internal void SetTypeParameters(ImmutableArray<TypeParameterSymbol> typeParameters)
         {
             if (!_typeParameters.IsDefault) throw new InvalidOperationException("TypeParameters already set.");
             _typeParameters = typeParameters;
         }
-        internal void SetReturnType(TypeSymbol type) => _returnType = type;
+        internal void SetReturnType(TypeSymbol type, bool returnsByRefReadonly = false)
+        {
+            _returnType = type;
+            _returnsByRefReadonly = returnsByRefReadonly;
+        }
         public void SetParameters(ImmutableArray<ParameterSymbol> parameters)
         {
             if (!_parameters.IsDefault) throw new InvalidOperationException("Parameters already set.");
@@ -2148,6 +2300,7 @@ namespace Cnidaria.Cs
         public override bool IsSealed => _original.IsSealed;
         public override ImmutableArray<TypeParameterSymbol> TypeParameters => _original.TypeParameters;
         public override TypeSymbol ReturnType => _returnType;
+        public override bool ReturnsByRefReadonly => _original.ReturnsByRefReadonly;
         public override ImmutableArray<ParameterSymbol> Parameters => _parameters;
         public override MethodSymbol OriginalDefinition => _original.OriginalDefinition;
         public override MethodSymbol? ExplicitInterfaceImplementation
@@ -2248,6 +2401,7 @@ namespace Cnidaria.Cs
         public override ImmutableArray<TypeParameterSymbol> TypeParameters => _definition.TypeParameters;
 
         public override TypeSymbol ReturnType => _returnType;
+        public override bool ReturnsByRefReadonly => _definition.ReturnsByRefReadonly;
         public override ImmutableArray<ParameterSymbol> Parameters => _parameters;
         public override ImmutableArray<AttributeData> GetAttributes() => _definition.GetAttributes();
         public ConstructedMethodSymbol(MethodSymbol definition, ImmutableArray<TypeSymbol> typeArguments, TypeManager types)
@@ -2508,6 +2662,7 @@ namespace Cnidaria.Cs
         public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
         public override MethodSymbol? ExplicitInterfaceImplementation => _explicitInterfaceImplementation;
         public override TypeSymbol ReturnType { get; }
+        public override bool ReturnsByRefReadonly { get; }
         public override ImmutableArray<ParameterSymbol> Parameters { get; }
         public override ImmutableArray<TypeParameterSymbol> TypeParameters
          => _typeParameters.IsDefault ? ImmutableArray<TypeParameterSymbol>.Empty : _typeParameters;
@@ -2535,11 +2690,13 @@ namespace Cnidaria.Cs
             bool isOverride,
             bool isSealed,
             bool isExtensionMethod,
-            bool isExtern = false)
+            bool isExtern = false,
+            bool returnsByRefReadonly = false)
         {
             Name = name;
             ContainingSymbol = containing;
             ReturnType = returnType;
+            ReturnsByRefReadonly = returnsByRefReadonly;
             IsStatic = isStatic;
             IsConstructor = isConstructor;
             IsExtern = isExtern;

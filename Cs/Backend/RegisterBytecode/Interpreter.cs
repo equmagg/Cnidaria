@@ -60,7 +60,7 @@ namespace Cnidaria.Cs
         private const int ArrayLengthOffset = ObjectHeaderSize;
         private const int ArrayDataOffset = ObjectHeaderSize + 8;
         private const int StringLengthOffset = ObjectHeaderSize;
-        private const int StringCharsOffset = ObjectHeaderSize + 4;
+        private const int StringFirstCharOffset = ObjectHeaderSize + 4;
         private const int MaxCallFramesHard = 4096;
 
         private const int ShadowFrameSize = 64;
@@ -1422,7 +1422,8 @@ namespace Cnidaria.Cs
         {
             int runtimeMethodId = checked((int)ins.Imm);
             RuntimeMethod target = _rts.GetMethodById(runtimeMethodId);
-            if (!target.HasInternalCall)
+            bool runtimeIntrinsic = RuntimeIntrinsics.TryResolve(target, _rts.Target, out _);
+            if (!target.HasInternalCall && !runtimeIntrinsic)
                 throw new InvalidOperationException($"CallInternal target method M{runtimeMethodId} is not marked InternalCall.");
 
             CallFlags previousActiveCallFlags = _activeCallFlags;
@@ -2319,7 +2320,7 @@ namespace Cnidaria.Cs
             if (len < 0) throw new InvalidOperationException("Corrupted string length.");
 
             char[] chars = new char[len];
-            int charsAbs = strAbs + StringCharsOffset;
+            int charsAbs = strAbs + StringFirstCharOffset;
             CheckIndirectAccess(charsAbs, checked(len * 2), false);
             for (int i = 0; i < len; i++)
             {
@@ -2744,35 +2745,191 @@ namespace Cnidaria.Cs
             return true;
         }
 
+        private bool IntrinsicInterlockedCompareExchange(RuntimeMethod rm, InterlockedCompareExchangeIntrinsic intrinsic)
+        {
+            long location = ReadAbiScalarArgument(rm, 0);
+            if (location == 0)
+                throw new NullReferenceException();
+
+            int address = checked((int)location);
+            ulong mask = intrinsic.Size switch
+            {
+                1 => 0xFFUL,
+                2 => 0xFFFFUL,
+                4 => 0xFFFFFFFFUL,
+                8 => ulong.MaxValue,
+                _ => throw new InvalidOperationException($"Unsupported Interlocked.CompareExchange size: {intrinsic.Size}.")
+            };
+            ulong value = unchecked((ulong)ReadAbiScalarArgument(rm, 1)) & mask;
+            ulong comparand = unchecked((ulong)ReadAbiScalarArgument(rm, 2)) & mask;
+            ulong original = intrinsic.Size switch
+            {
+                1 => ReadU8(address),
+                2 => ReadU16(address),
+                4 => unchecked((uint)ReadI32(address)),
+                8 => unchecked((ulong)ReadI64(address)),
+                _ => throw new InvalidOperationException()
+            };
+
+            if (original == comparand)
+            {
+                switch (intrinsic.Size)
+                {
+                    case 1:
+                        WriteU8(address, unchecked((byte)value));
+                        break;
+                    case 2:
+                        WriteU16(address, unchecked((ushort)value));
+                        break;
+                    case 4:
+                        WriteI32(address, unchecked((int)value));
+                        break;
+                    case 8:
+                        WriteI64(address, unchecked((long)value));
+                        break;
+                }
+            }
+
+            long result = intrinsic.Size switch
+            {
+                1 when intrinsic.IsSigned => unchecked((sbyte)original),
+                2 when intrinsic.IsSigned => unchecked((short)original),
+                4 when intrinsic.IsSigned => unchecked((int)original),
+                1 => unchecked((byte)original),
+                2 => unchecked((ushort)original),
+                4 => unchecked((uint)original),
+                8 => unchecked((long)original),
+                _ => throw new InvalidOperationException()
+            };
+            SetGpr(MachineRegisters.ReturnValue0, result);
+            return true;
+        }
+
+        private bool IntrinsicInterlockedExchangeAdd(RuntimeMethod rm, InterlockedExchangeAddIntrinsic intrinsic)
+        {
+            long location = ReadAbiScalarArgument(rm, 0);
+            if (location == 0)
+                throw new NullReferenceException();
+
+            int address = checked((int)location);
+            long value = ReadAbiScalarArgument(rm, 1);
+            long original;
+            switch (intrinsic.Size)
+            {
+                case 4:
+                    {
+                        int oldValue = ReadI32(address);
+                        WriteI32(address, unchecked(oldValue + (int)value));
+                        original = oldValue;
+                        break;
+                    }
+                case 8:
+                    {
+                        long oldValue = ReadI64(address);
+                        WriteI64(address, unchecked(oldValue + value));
+                        original = oldValue;
+                        break;
+                    }
+                default:
+                    throw new InvalidOperationException($"Unsupported Interlocked.ExchangeAdd size: {intrinsic.Size}.");
+            }
+
+            SetGpr(MachineRegisters.ReturnValue0, original);
+            return true;
+        }
+
         private bool TryInvokeIntrinsic(RuntimeMethod rm, CancellationToken ct)
         {
+            if (RuntimeIntrinsics.TryResolve(rm, _rts.Target, out RuntimeIntrinsicInfo runtimeIntrinsic))
+            {
+                switch (runtimeIntrinsic.Id)
+                {
+                    case RuntimeIntrinsicId.InterlockedCompareExchange:
+                        return IntrinsicInterlockedCompareExchange(rm, runtimeIntrinsic.CompareExchange);
+                    case RuntimeIntrinsicId.InterlockedExchangeAdd:
+                        return IntrinsicInterlockedExchangeAdd(rm, runtimeIntrinsic.ExchangeAdd);
+                    default:
+                        return false;
+                }
+            }
+
+            if (rm.DeclaringType.Namespace == "System" &&
+                rm.DeclaringType.Name == "SpanHelpers" &&
+                rm.Name == "memset" &&
+                !rm.HasThis &&
+                rm.IsStatic &&
+                rm.HasInternalCall &&
+                rm.ParameterTypes.Length == 3 &&
+                rm.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Void)
+            {
+                long destination = ReadAbiScalarArgument(rm, 0);
+                int value = unchecked((int)ReadAbiScalarArgument(rm, 1));
+                long rawLength = ReadAbiScalarArgument(rm, 2);
+                ulong length = _rts.Target.PointerSize == 8
+                    ? unchecked((ulong)rawLength)
+                    : unchecked((uint)rawLength);
+                int size = checked((int)length);
+                if (size != 0)
+                {
+                    int abs = checked((int)destination);
+                    CheckIndirectAccess(abs, size, writable: true);
+                    _mem.AsSpan(abs, size).Fill(unchecked((byte)value));
+                }
+                return true;
+            }
+
+            if (rm.DeclaringType.Namespace == "System.Threading" &&
+                rm.DeclaringType.Name == "Thread" &&
+                rm.Name == "GetCurrentProcessorNumber" &&
+                !rm.HasThis &&
+                rm.IsStatic &&
+                rm.HasInternalCall &&
+                rm.ParameterTypes.Length == 0 &&
+                rm.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Int32)
+            {
+                //SetReturnI4(Thread.GetCurrentProcessorId());
+                SetReturnI4(1);
+                return true;
+            }
+
+            if (rm.DeclaringType.Namespace == "System.Threading" &&
+                rm.DeclaringType.Name == "ObjectHeader" &&
+                !rm.HasThis &&
+                rm.IsStatic &&
+                rm.ParameterTypes.Length == 1 &&
+                rm.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Void &&
+                (rm.Name == "AcquireThinLock" || rm.Name == "Release"))
+            {
+                return true;
+            }
+
             if (rm.DeclaringType.Namespace == "System" && rm.DeclaringType.Name == "Console" && rm.Name == "_Write")
                 return IntrinsicConsoleWrite(rm, ct);
 
-            if (IsSystemStringType(rm.DeclaringType))
+            if (IsSystemStringType(rm.DeclaringType) &&
+                rm.HasInternalCall &&
+                !rm.HasThis &&
+                rm.Name == "FastAllocateString" &&
+                rm.ParameterTypes.Length == 1)
             {
-                if (rm.HasThis && rm.Name == "get_Length" && rm.ParameterTypes.Length == 0)
-                {
-                    long s = ReadThisArgumentReference(rm);
-                    RuntimeType type = ValidateStringRef(s);
-                    int strAbs = checked((int)s);
-                    SetReturnI4(ReadI32(strAbs + StringLengthOffset));
-                    return true;
-                }
-                if (rm.HasThis && (rm.Name == "GetPinnableReference" || rm.Name == "GetRawStringData") && rm.ParameterTypes.Length == 0)
-                {
-                    long s = ReadThisArgumentReference(rm);
-                    RuntimeType type = ValidateStringRef(s);
-                    int strAbs = checked((int)s);
-                    SetReturnRef(strAbs + StringCharsOffset);
-                    return true;
-                }
-                if (!rm.HasThis && rm.Name == "FastAllocateString" && rm.ParameterTypes.Length == 1)
-                {
-                    int len = (int)ReadAbiScalarArgument(rm, 0);
-                    SetReturnRef(AllocStringUninitialized(len));
-                    return true;
-                }
+                int len = (int)ReadAbiScalarArgument(rm, 0);
+                SetReturnRef(AllocStringUninitialized(len));
+                return true;
+            }
+
+            if (rm.DeclaringType.Namespace == "System" &&
+                rm.DeclaringType.Name == "RuntimeImports" &&
+                rm.HasInternalCall &&
+                !rm.HasThis &&
+                rm.IsStatic &&
+                rm.Name == "RhAllocateNewArray" &&
+                rm.ParameterTypes.Length == 2 &&
+                rm.ReturnType.Kind == RuntimeTypeKind.Array &&
+                rm.ReturnType.IsSzArray)
+            {
+                int length = (int)ReadAbiScalarArgument(rm, 0);
+                SetReturnRef(AllocArray(rm.ReturnType, length));
+                return true;
             }
 
             if (rm.DeclaringType.Namespace == "System" && rm.DeclaringType.Name == "Array")
@@ -2871,7 +3028,7 @@ namespace Cnidaria.Cs
                     RuntimeType type = ValidateStringRef(s);
                     int strAbs = checked((int)s);
                     int len = ReadI32(strAbs + StringLengthOffset);
-                    int chars = strAbs + StringCharsOffset;
+                    int chars = strAbs + StringFirstCharOffset;
                     CheckIndirectAccess(chars, checked(len * 2), false);
                     for (int i = 0; i < len; i++)
                     {
@@ -4062,19 +4219,19 @@ namespace Cnidaria.Cs
             if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
             RuntimeType stringType = ResolveRequiredType("std", "System", "String");
             int byteLen = checked(length * 2);
-            int size = AlignUp(StringCharsOffset + byteLen, 2);
+            int size = AlignUp(checked(StringFirstCharOffset + byteLen + 2), 2);
             int obj = AllocHeapBytes(size, 8);
             WriteI32(obj, stringType.TypeId);
             WriteI32(obj + 4, GcFlagAllocated);
             WriteI32(obj + StringLengthOffset, length);
-            if (byteLen != 0) _mem.AsSpan(obj + StringCharsOffset, byteLen).Clear();
+            _mem.AsSpan(obj + StringFirstCharOffset, byteLen + 2).Clear();
             return obj;
         }
 
         private int AllocStringFromManaged(string value)
         {
             int obj = AllocStringUninitialized(value.Length);
-            int chars = obj + StringCharsOffset;
+            int chars = obj + StringFirstCharOffset;
             for (int i = 0; i < value.Length; i++)
                 WriteU16(chars + i * 2, value[i]);
             return obj;
@@ -6444,7 +6601,7 @@ namespace Cnidaria.Cs
             int len = ReadI32(obj + StringLengthOffset);
             if (len < 0) throw new InvalidOperationException("Corrupted string length.");
             char[] chars = new char[len];
-            int p = obj + StringCharsOffset;
+            int p = obj + StringFirstCharOffset;
             for (int i = 0; i < len; i++)
                 chars[i] = (char)ReadU16(p + i * 2);
             return new string(chars);

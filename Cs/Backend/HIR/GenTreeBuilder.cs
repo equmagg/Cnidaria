@@ -646,10 +646,30 @@ namespace Cnidaria.Cs
                         }
 
                     case BytecodeOp.TypeIsValueType:
+                    case BytecodeOp.TypeIsPrimitive:
+                    case BytecodeOp.TypeIsEnum:
                         {
                             var t = ResolveType(ins.Operand0);
                             Push(stack, Node(GenTreeKind.ConstI4, pc, ins.Op, stackKind: GenStackKind.I4,
-                                int32: RuntimeTypeIsValueType(t, pc, ins.Op) ? 1 : 0));
+                                int32: RuntimeTypePredicate(ins.Op, t, pc) ? 1 : 0));
+                            break;
+                        }
+
+                    case BytecodeOp.TypeEquals:
+                        {
+                            var left = ResolveType(ins.Operand0);
+                            var right = ResolveType(ins.Operand1);
+                            Push(stack, Node(GenTreeKind.ConstI4, pc, ins.Op, stackKind: GenStackKind.I4,
+                                int32: RuntimeTypesEqual(left, right, pc, ins.Op) ? 1 : 0));
+                            break;
+                        }
+
+                    case BytecodeOp.ObjectTypeEquals:
+                        {
+                            var receiver = Pop(stack, pc, ins.Op);
+                            var receiverType = ResolveType(ins.Operand0);
+                            var targetType = ResolveType(ins.Operand1);
+                            ImportObjectTypeEquals(stack, statements, receiver, receiverType, targetType, pc, ins.Op);
                             break;
                         }
 
@@ -1440,7 +1460,7 @@ namespace Cnidaria.Cs
             if (value.StackKind == GenStackKind.Void)
                 return false;
 
-            if (value.Kind is GenTreeKind.Call or GenTreeKind.IndirectCall or GenTreeKind.VirtualCall or GenTreeKind.DelegateInvoke)
+            if (value.Kind is GenTreeKind.Intrinsic or GenTreeKind.Call or GenTreeKind.IndirectCall or GenTreeKind.VirtualCall or GenTreeKind.DelegateInvoke)
                 return false;
 
             const GenTreeFlags materializeFlags =
@@ -1457,6 +1477,7 @@ namespace Cnidaria.Cs
                 return true;
 
             return value.Kind is
+                GenTreeKind.Intrinsic or
                 GenTreeKind.Call or
                 GenTreeKind.IndirectCall or
                 GenTreeKind.VirtualCall or
@@ -2529,7 +2550,7 @@ namespace Cnidaria.Cs
                 BytecodeOp.Not => GenTreeKind.Unary,
                 BytecodeOp.FnPtrToPtr => GenTreeKind.Unary,
                 BytecodeOp.PtrToFnPtr => GenTreeKind.Unary,
-                BytecodeOp.PtrToByRef => GenTreeKind.PointerToByRef,
+                BytecodeOp.PtrToByRef => GenTreeKind.Unary,
                 BytecodeOp.CastClass => GenTreeKind.CastClass,
                 BytecodeOp.Isinst => GenTreeKind.IsInst,
                 BytecodeOp.Box => GenTreeKind.Box,
@@ -3175,6 +3196,7 @@ namespace Cnidaria.Cs
                 case GenTreeKind.Field:
                 case GenTreeKind.StaticField:
                 case GenTreeKind.ArrayElement:
+                case GenTreeKind.Intrinsic:
                 case GenTreeKind.Call:
                 case GenTreeKind.VirtualCall:
                 case GenTreeKind.DelegateInvoke:
@@ -3255,9 +3277,9 @@ namespace Cnidaria.Cs
                             runtimeType: targetMethod.DeclaringType);
                         RuntimeType payloadByRefType = _rts.GetByRefType(targetMethod.DeclaringType);
                         rewrittenReceiver = Node(
-                            GenTreeKind.PointerToByRef,
+                            GenTreeKind.Unary,
                             pc,
-                            sourceOp,
+                            BytecodeOp.PtrToByRef,
                             type: payloadByRefType,
                             stackKind: GenStackKind.ByRef,
                             operands: One(payloadPointer),
@@ -3398,7 +3420,12 @@ namespace Cnidaria.Cs
             if (requiresCallvirtNullCheck)
                 args = MaterializeCallVirtOperandsAndAppendNullCheck(statements, pc, ins.Op, args);
 
-            if (!isVirtual && TryInlineCall(method, args, statements, successorPcs, stack, pc, ins.Op, out var inlineResult, out bool terminatedBlock))
+            RuntimeIntrinsicInfo runtimeIntrinsic = default;
+            bool hasRuntimeIntrinsic = !isVirtual && RuntimeIntrinsics.TryResolve(method, _rts.Target, out runtimeIntrinsic);
+            bool isRuntimeIntrinsic = hasRuntimeIntrinsic && runtimeIntrinsic.IsSpecialImport;
+            bool suppressIntrinsicInline = hasRuntimeIntrinsic && runtimeIntrinsic.IsNoInline;
+
+            if (!isVirtual && !isRuntimeIntrinsic && !suppressIntrinsicInline && TryInlineCall(method, args, statements, successorPcs, stack, pc, ins.Op, out var inlineResult, out bool terminatedBlock))
             {
                 if (terminatedBlock)
                     return true;
@@ -3407,11 +3434,16 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            if (!isVirtual)
+            if (!isVirtual && !isRuntimeIntrinsic)
                 AddDirectDependency(method);
 
             bool returnsVoid = IsVoid(method.ReturnType);
-            var call = Node(isVirtual ? GenTreeKind.VirtualCall : GenTreeKind.Call,
+            GenTreeKind callKind = isVirtual
+                ? GenTreeKind.VirtualCall
+                : isRuntimeIntrinsic
+                    ? GenTreeKind.Intrinsic
+                    : GenTreeKind.Call;
+            var call = Node(callKind,
                 pc,
                 ins.Op,
                 type: returnsVoid ? null : method.ReturnType,
@@ -3419,7 +3451,8 @@ namespace Cnidaria.Cs
                 operands: args,
                 int32: total,
                 int64: ins.Operand0,
-                method: method);
+                method: method,
+                intrinsicId: runtimeIntrinsic.Id);
 
             if (returnsVoid)
                 AppendImporterStatement(statements, stack, Node(GenTreeKind.Eval, pc, ins.Op, operands: One(call)));
@@ -3713,10 +3746,30 @@ namespace Cnidaria.Cs
                             }
 
                         case BytecodeOp.TypeIsValueType:
+                        case BytecodeOp.TypeIsPrimitive:
+                        case BytecodeOp.TypeIsEnum:
                             {
                                 var t = ResolveTypeIn(bodyModule, callee, ins.Operand0);
                                 Push(inlineStack, Node(GenTreeKind.ConstI4, callPc, ins.Op, stackKind: GenStackKind.I4,
-                                    int32: RuntimeTypeIsValueType(t, callPc, ins.Op) ? 1 : 0));
+                                    int32: RuntimeTypePredicate(ins.Op, t, callPc) ? 1 : 0));
+                                break;
+                            }
+
+                        case BytecodeOp.TypeEquals:
+                            {
+                                var left = ResolveTypeIn(bodyModule, callee, ins.Operand0);
+                                var right = ResolveTypeIn(bodyModule, callee, ins.Operand1);
+                                Push(inlineStack, Node(GenTreeKind.ConstI4, callPc, ins.Op, stackKind: GenStackKind.I4,
+                                    int32: RuntimeTypesEqual(left, right, callPc, ins.Op) ? 1 : 0));
+                                break;
+                            }
+
+                        case BytecodeOp.ObjectTypeEquals:
+                            {
+                                var receiver = Pop(inlineStack, callPc, ins.Op);
+                                var receiverType = ResolveTypeIn(bodyModule, callee, ins.Operand0);
+                                var targetType = ResolveTypeIn(bodyModule, callee, ins.Operand1);
+                                ImportObjectTypeEquals(inlineStack, statements, receiver, receiverType, targetType, callPc, ins.Op);
                                 break;
                             }
 
@@ -4243,10 +4296,30 @@ namespace Cnidaria.Cs
                     }
 
                 case BytecodeOp.TypeIsValueType:
+                case BytecodeOp.TypeIsPrimitive:
+                case BytecodeOp.TypeIsEnum:
                     {
                         var t = ResolveTypeIn(bodyModule, callee, ins.Operand0);
                         Push(stack, Node(GenTreeKind.ConstI4, callPc, ins.Op, stackKind: GenStackKind.I4,
-                            int32: RuntimeTypeIsValueType(t, callPc, ins.Op) ? 1 : 0));
+                            int32: RuntimeTypePredicate(ins.Op, t, callPc) ? 1 : 0));
+                        break;
+                    }
+
+                case BytecodeOp.TypeEquals:
+                    {
+                        var left = ResolveTypeIn(bodyModule, callee, ins.Operand0);
+                        var right = ResolveTypeIn(bodyModule, callee, ins.Operand1);
+                        Push(stack, Node(GenTreeKind.ConstI4, callPc, ins.Op, stackKind: GenStackKind.I4,
+                            int32: RuntimeTypesEqual(left, right, callPc, ins.Op) ? 1 : 0));
+                        break;
+                    }
+
+                case BytecodeOp.ObjectTypeEquals:
+                    {
+                        var receiver = Pop(stack, callPc, ins.Op);
+                        var receiverType = ResolveTypeIn(bodyModule, callee, ins.Operand0);
+                        var targetType = ResolveTypeIn(bodyModule, callee, ins.Operand1);
+                        ImportObjectTypeEquals(stack, statements, receiver, receiverType, targetType, callPc, ins.Op);
                         break;
                     }
 
@@ -4802,6 +4875,7 @@ namespace Cnidaria.Cs
             return op is BytecodeOp.Ldarg or BytecodeOp.Ldarga or BytecodeOp.Ldthis or BytecodeOp.Ldloc or
                          BytecodeOp.Ldc_I8 or BytecodeOp.Ldc_R4 or BytecodeOp.Ldc_R8 or BytecodeOp.Ldnull or
                          BytecodeOp.Ldstr or BytecodeOp.DefaultValue or BytecodeOp.Sizeof or BytecodeOp.TypeIsValueType or
+                         BytecodeOp.TypeIsPrimitive or BytecodeOp.TypeIsEnum or BytecodeOp.TypeEquals or BytecodeOp.ObjectTypeEquals or
                          BytecodeOp.Starg or BytecodeOp.Stloc or BytecodeOp.Ldfld or BytecodeOp.Ldflda or
                          BytecodeOp.Ldsfld or BytecodeOp.Ldsflda or BytecodeOp.Ldobj or BytecodeOp.Stobj or
                          BytecodeOp.Ldelem or BytecodeOp.Ldelema or BytecodeOp.Stelem or BytecodeOp.Pop or
@@ -5006,6 +5080,10 @@ namespace Cnidaria.Cs
                 BytecodeOp.DefaultValue or
                 BytecodeOp.Sizeof or
                 BytecodeOp.TypeIsValueType or
+                BytecodeOp.TypeIsPrimitive or
+                BytecodeOp.TypeIsEnum or
+                BytecodeOp.TypeEquals or
+                BytecodeOp.ObjectTypeEquals or
                 BytecodeOp.Ldloc or
                 BytecodeOp.Stloc or
                 BytecodeOp.Ldloca or
@@ -5143,7 +5221,7 @@ namespace Cnidaria.Cs
             {
                 BytecodeOp.Neg => GenTreeKind.Unary,
                 BytecodeOp.Not => GenTreeKind.Unary,
-                BytecodeOp.PtrToByRef => GenTreeKind.PointerToByRef,
+                BytecodeOp.PtrToByRef => GenTreeKind.Unary,
                 BytecodeOp.CastClass => GenTreeKind.CastClass,
                 BytecodeOp.Isinst => GenTreeKind.IsInst,
                 BytecodeOp.Box => GenTreeKind.Box,
@@ -5295,18 +5373,28 @@ namespace Cnidaria.Cs
             if (requiresCallvirtNullCheck)
                 args = MaterializeCallVirtOperandsAndAppendNullCheck(statements, callPc, ins.Op, args);
 
-            if (!isVirtual && TryInlineCall(method, args, statements, callPc, ins.Op, out var inlineResult, inlineDepth + 1))
+            RuntimeIntrinsicInfo runtimeIntrinsic = default;
+            bool hasRuntimeIntrinsic = !isVirtual && RuntimeIntrinsics.TryResolve(method, _rts.Target, out runtimeIntrinsic);
+            bool isRuntimeIntrinsic = hasRuntimeIntrinsic && runtimeIntrinsic.IsSpecialImport;
+            bool suppressIntrinsicInline = hasRuntimeIntrinsic && runtimeIntrinsic.IsNoInline;
+
+            if (!isVirtual && !isRuntimeIntrinsic && !suppressIntrinsicInline && TryInlineCall(method, args, statements, callPc, ins.Op, out var inlineResult, inlineDepth + 1))
             {
                 if (inlineResult is not null)
                     Push(stack, inlineResult);
                 return;
             }
 
-            if (!isVirtual)
+            if (!isVirtual && !isRuntimeIntrinsic)
                 AddDirectDependency(method);
 
             bool returnsVoid = IsVoid(method.ReturnType);
-            var call = Node(isVirtual ? GenTreeKind.VirtualCall : GenTreeKind.Call,
+            GenTreeKind callKind = isVirtual
+                ? GenTreeKind.VirtualCall
+                : isRuntimeIntrinsic
+                    ? GenTreeKind.Intrinsic
+                    : GenTreeKind.Call;
+            var call = Node(callKind,
                 callPc,
                 ins.Op,
                 type: returnsVoid ? null : method.ReturnType,
@@ -5314,7 +5402,8 @@ namespace Cnidaria.Cs
                 operands: args,
                 int32: total,
                 int64: ins.Operand0,
-                method: method);
+                method: method,
+                intrinsicId: runtimeIntrinsic.Id);
 
             if (returnsVoid)
                 AppendImporterStatement(statements, stack, Node(GenTreeKind.Eval, callPc, ins.Op, operands: One(call)));
@@ -5610,12 +5699,168 @@ namespace Cnidaria.Cs
             return _localTypes[index];
         }
 
-        private bool RuntimeTypeIsValueType(RuntimeType type, int pc, BytecodeOp op)
+        private bool RuntimeTypePredicate(BytecodeOp op, RuntimeType type, int pc)
         {
             if (type.Kind == RuntimeTypeKind.TypeParam)
-                throw Fail(pc, op, "TypeIsValueType requires a closed generic context.");
+                throw Fail(pc, op, $"{op} requires a closed generic context.");
 
-            return type.IsValueType;
+            if (op == BytecodeOp.TypeIsPrimitive)
+            {
+                _rts.EnsureRuntimeTypeReady(type);
+                return IsPrimitiveRuntimeType(type);
+            }
+
+            return op switch
+            {
+                BytecodeOp.TypeIsValueType => type.IsValueType,
+                BytecodeOp.TypeIsEnum => type.Kind == RuntimeTypeKind.Enum,
+                _ => throw Fail(pc, op, "Invalid runtime type predicate opcode."),
+            };
+        }
+
+        private bool RuntimeTypesEqual(RuntimeType left, RuntimeType right, int pc, BytecodeOp op)
+        {
+            if (left.Kind == RuntimeTypeKind.TypeParam || right.Kind == RuntimeTypeKind.TypeParam)
+                throw Fail(pc, op, "Type equality requires a closed generic context.");
+
+            return left.TypeId == right.TypeId;
+        }
+
+        private static bool IsPrimitiveRuntimeType(RuntimeType type)
+        {
+            return type.PrimitiveKind is
+                RuntimePrimitiveKind.Boolean or
+                RuntimePrimitiveKind.Char or
+                RuntimePrimitiveKind.Int8 or
+                RuntimePrimitiveKind.UInt8 or
+                RuntimePrimitiveKind.Int16 or
+                RuntimePrimitiveKind.UInt16 or
+                RuntimePrimitiveKind.Int32 or
+                RuntimePrimitiveKind.UInt32 or
+                RuntimePrimitiveKind.Int64 or
+                RuntimePrimitiveKind.UInt64 or
+                RuntimePrimitiveKind.NativeInt or
+                RuntimePrimitiveKind.NativeUInt or
+                RuntimePrimitiveKind.Single or
+                RuntimePrimitiveKind.Double;
+        }
+
+        private void ImportObjectTypeEquals(
+            List<StackValue> stack,
+            List<GenTree> statements,
+            StackValue receiver,
+            RuntimeType receiverType,
+            RuntimeType targetType,
+            int pc,
+            BytecodeOp op)
+        {
+            if (receiverType.Kind == RuntimeTypeKind.TypeParam || targetType.Kind == RuntimeTypeKind.TypeParam)
+                throw Fail(pc, op, "GetType equality requires a closed generic context.");
+
+            GenTree runtimeReceiver = receiver.Node;
+            if (receiverType.IsValueType)
+            {
+                if (!IsSystemNullableRuntimeType(receiverType))
+                {
+                    AppendImporterStatement(statements, stack, CreateDiscardStatement(receiver.Node, pc, op));
+                    Push(stack, Node(
+                        GenTreeKind.ConstI4,
+                        pc,
+                        op,
+                        stackKind: GenStackKind.I4,
+                        int32: receiverType.TypeId == targetType.TypeId ? 1 : 0));
+                    return;
+                }
+
+                MarkInstantiatedType(receiverType);
+                runtimeReceiver = Node(
+                    GenTreeKind.Box,
+                    pc,
+                    BytecodeOp.Box,
+                    type: _rts.SystemObject,
+                    stackKind: GenStackKind.Ref,
+                    operands: One(receiver.Node),
+                    int32: receiverType.TypeId,
+                    runtimeType: receiverType);
+            }
+
+            GenTemp receiverTemp = CreateImporterSpillTemp(runtimeReceiver.Type, runtimeReceiver.StackKind);
+            AppendImporterStatement(statements, stack, Node(
+                GenTreeKind.StoreTemp,
+                pc,
+                op,
+                operands: One(runtimeReceiver),
+                int32: receiverTemp.Index));
+            AppendImporterStatement(statements, stack, Node(
+                GenTreeKind.NullCheck,
+                pc,
+                op,
+                operands: One(TempLoad(pc, op, receiverTemp).Node)));
+
+            GenTree actualTypeId = LoadRuntimeObjectTypeId(TempLoad(pc, op, receiverTemp).Node, pc);
+            GenTree targetTypeId = Node(
+                GenTreeKind.ConstI4,
+                pc,
+                BytecodeOp.Ldc_I4,
+                stackKind: GenStackKind.I4,
+                int32: targetType.TypeId);
+            PushImportedValue(stack, statements, Node(
+                GenTreeKind.Binary,
+                pc,
+                BytecodeOp.Ceq,
+                stackKind: GenStackKind.I4,
+                operands: Two(actualTypeId, targetTypeId)));
+        }
+
+        private static bool IsSystemNullableRuntimeType(RuntimeType type)
+        {
+            if (!type.IsValueType || type.GenericTypeArguments.Length != 1)
+                return false;
+
+            RuntimeType definition = type.GenericTypeDefinition ?? type;
+            return definition.Namespace == "System" &&
+                definition.Name.StartsWith("Nullable", StringComparison.Ordinal);
+        }
+
+        private GenTree LoadRuntimeObjectTypeId(GenTree receiver, int pc)
+        {
+            GenTree objectAddress = Node(
+                GenTreeKind.PointerElementAddr,
+                pc,
+                BytecodeOp.PtrElemAddr,
+                stackKind: GenStackKind.Ptr,
+                operands: Two(receiver, ConstI4(pc, BytecodeOp.Ldc_I4, 0)),
+                int32: 1);
+
+            if (_rts.Target.IsRegisterBytecode)
+            {
+                return Node(
+                    GenTreeKind.LoadIndirect,
+                    pc,
+                    BytecodeOp.Ldobj,
+                    stackKind: GenStackKind.I4,
+                    operands: One(objectAddress));
+            }
+
+            GenTree methodTable = Node(
+                GenTreeKind.LoadIndirect,
+                pc,
+                BytecodeOp.Ldobj,
+                stackKind: GenStackKind.Ptr,
+                operands: One(objectAddress));
+            GenTree typeIdAddress = Node(
+                GenTreeKind.PointerElementAddr,
+                pc,
+                BytecodeOp.PtrElemAddr,
+                stackKind: GenStackKind.Ptr,
+                operands: Two(methodTable, ConstI4(pc, BytecodeOp.Ldc_I4, 12 + _rts.Target.PointerSize)),
+                int32: 1);
+            return Node(
+                GenTreeKind.LoadIndirect,
+                pc,
+                BytecodeOp.Ldobj,
+                stackKind: GenStackKind.I4,
+                operands: One(typeIdAddress));
         }
 
         private RuntimeType CheckedArgType(int index, int pc)
@@ -5642,7 +5887,8 @@ namespace Cnidaria.Cs
             NumericConvFlags convFlags = default,
             int targetPc = -1,
             int targetBlockId = -1,
-            int boundsCheckIndexOverride = -1)
+            int boundsCheckIndexOverride = -1,
+            RuntimeIntrinsicId intrinsicId = RuntimeIntrinsicId.None)
         {
             var actualOperands = operands.IsDefault ? ImmutableArray<GenTree>.Empty : operands;
             if (kind == GenTreeKind.Eval &&
@@ -5670,7 +5916,7 @@ namespace Cnidaria.Cs
                 method = null;
             }
 
-            var flags = ComputeFlags(kind, sourceOp, type, stackKind, actualOperands, convFlags);
+            var flags = ComputeFlags(kind, sourceOp, type, stackKind, actualOperands, convFlags, intrinsicId);
 
             return new GenTree(
                 ++_nextNodeId,
@@ -5691,7 +5937,8 @@ namespace Cnidaria.Cs
                 convFlags,
                 targetPc,
                 targetBlockId,
-                boundsCheckIndexOverride);
+                boundsCheckIndexOverride,
+                intrinsicId);
         }
 
         private static GenTree MarkExplicitInit(GenTree store)
@@ -5700,7 +5947,7 @@ namespace Cnidaria.Cs
             return store;
         }
 
-        private GenTreeFlags ComputeFlags(GenTreeKind kind, BytecodeOp sourceOp, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands, NumericConvFlags convFlags)
+        private GenTreeFlags ComputeFlags(GenTreeKind kind, BytecodeOp sourceOp, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands, NumericConvFlags convFlags, RuntimeIntrinsicId intrinsicId)
         {
             GenTreeFlags flags = GenTreeFlags.None;
             for (int i = 0; i < operands.Length; i++)
@@ -5797,6 +6044,10 @@ namespace Cnidaria.Cs
                 case GenTreeKind.Binary:
                     if (GenTreeArithmeticSemantics.BinaryOperationCanThrow(sourceOp, type, stackKind, operands, _rts.Target))
                         flags |= GenTreeFlags.CanThrow;
+                    break;
+
+                case GenTreeKind.Intrinsic:
+                    flags |= GenTreeIntrinsicSemantics.Flags(intrinsicId);
                     break;
 
                 case GenTreeKind.ClassInit:

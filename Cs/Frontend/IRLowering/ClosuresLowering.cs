@@ -22,6 +22,7 @@ namespace Cnidaria.Cs
             public override Symbol? ContainingSymbol { get; }
             public override ImmutableArray<Location> Locations { get; }
             public override TypeSymbol ReturnType { get; }
+            public override bool ReturnsByRefReadonly => _original.ReturnsByRefReadonly;
             private ImmutableArray<ParameterSymbol> _parameters;
             public override ImmutableArray<ParameterSymbol> Parameters => _parameters.IsDefault ? ImmutableArray<ParameterSymbol>.Empty : _parameters;
             public override ImmutableArray<TypeParameterSymbol> TypeParameters => ImmutableArray<TypeParameterSymbol>.Empty;
@@ -779,7 +780,7 @@ namespace Cnidaria.Cs
                 hiddenParameters.Add(hiddenParameter);
             }
 
-            lowered.SetSignature(original.ReturnType, allParameters.ToImmutable());
+            lowered.SetSignature(original.ReturnType, allParameters.ToImmutable(), original.ReturnsByRefReadonly);
 
             return new CaptureInfo(
                 original,

@@ -29,7 +29,8 @@ namespace Cnidaria.X86
         private const int ImportDirectoryIndex = 1;
         private static readonly ImmutableArray<WindowsImportDll> Kernel32Imports = ImmutableArray.Create(
             new WindowsImportDll("KERNEL32.dll", ImmutableArray.Create(
-                "GetStdHandle", "WriteFile", "ExitProcess", "GetProcessHeap", "HeapAlloc", "HeapReAlloc", "HeapFree", "VirtualAlloc", "VirtualFree")));
+                "GetStdHandle", "WriteFile", "ExitProcess", "GetCurrentThreadId", "GetCurrentProcessorNumber", "GetProcessHeap", 
+                "HeapAlloc", "HeapReAlloc", "HeapFree", "VirtualAlloc", "VirtualFree")));
 
         public static ulong DefaultImageBase(X86Target target)
             => target is not null && target.Is64Bit ? 0x0000000140000000UL : 0x00400000UL;
@@ -68,10 +69,12 @@ namespace Cnidaria.X86
 
             var sizeOfImage = AlignUp(sections.Max(static s => s.Rva + Math.Max(1, s.VirtualSize)), SectionAlignment);
             var sizeOfCode = sections.Where(static s => s.Kind == X86ObjectSectionKind.Text).Sum(static s => s.RawSize);
-            var sizeOfInitializedData = sections.Where(static s => s.Kind != X86ObjectSectionKind.Text && s.Kind != X86ObjectSectionKind.Bss).Sum(static s => s.RawSize);
-            var sizeOfUninitializedData = sections.Where(static s => s.Kind == X86ObjectSectionKind.Bss).Sum(static s => AlignUp(s.VirtualSize, SectionAlignment));
+            var sizeOfInitializedData = sections
+                .Where(static s => s.Kind != X86ObjectSectionKind.Text && s.Kind != X86ObjectSectionKind.Bss).Sum(static s => s.RawSize);
+            var sizeOfUninitializedData = sections
+                .Where(static s => s.Kind == X86ObjectSectionKind.Bss).Sum(static s => AlignUp(s.VirtualSize, SectionAlignment));
             var image = new byte[sections.Max(static s => s.RawPointer + s.RawSize)];
-            WriteHeaders(image, obj.Target, imageBase, sections, headersSize, sizeOfImage, checked((uint)(entryAddress - imageBase)), 
+            WriteHeaders(image, obj.Target, imageBase, sections, headersSize, sizeOfImage, checked((uint)(entryAddress - imageBase)),
                 sizeOfCode, sizeOfInitializedData, sizeOfUninitializedData, idata.Rva, importTable.Bytes.Length);
 
             foreach (var section in sections)
@@ -89,10 +92,11 @@ namespace Cnidaria.X86
             var sections = new List<PeSectionLayout>();
             var referencedDataSections = new HashSet<string>(
                 obj.Symbols
-                    .Where(static s => s.Binding != X86ObjectSymbolBinding.External && s.Kind != X86ObjectSymbolKind.Section && !string.IsNullOrEmpty(s.SectionName))
+                    .Where(static s => s.Binding != X86ObjectSymbolBinding.External 
+                    && s.Kind != X86ObjectSymbolKind.Section && !string.IsNullOrEmpty(s.SectionName))
                     .Select(static s => s.SectionName),
                 StringComparer.Ordinal);
-            sections.Add(new PeSectionLayout(".text", X86ObjectSectionKind.Text, Math.Max(1, obj.Target.Is64Bit ? 16 : 4), 
+            sections.Add(new PeSectionLayout(".text", X86ObjectSectionKind.Text, Math.Max(1, obj.Target.Is64Bit ? 16 : 4),
                 new byte[ComputeTextSize(obj.Text, obj.Target)], 0, SectionCode | SectionRead | SectionExecute));
 
             foreach (var section in obj.DataSections)
@@ -111,7 +115,8 @@ namespace Cnidaria.X86
                 sections.Add(new PeSectionLayout(section.Name, section.Kind, section.Alignment, raw, size, characteristics));
             }
 
-            sections.Add(new PeSectionLayout(".idata", X86ObjectSectionKind.Rodata, 4, new byte[importSize], importSize, SectionInitializedData | SectionRead | SectionWrite));
+            sections.Add(new PeSectionLayout(
+                ".idata", X86ObjectSectionKind.Rodata, 4, new byte[importSize], importSize, SectionInitializedData | SectionRead | SectionWrite));
             return sections;
         }
 
@@ -265,7 +270,7 @@ namespace Cnidaria.X86
             WriteUInt16(image, coff + 0, target.Is64Bit ? MachineAmd64 : MachineI386);
             WriteUInt16(image, coff + 2, (ushort)sections.Count);
             WriteUInt16(image, coff + 16, (ushort)(target.Is64Bit ? 240 : 224));
-            WriteUInt16(image, coff + 18, (ushort)(CharacteristicsRelocationsStripped 
+            WriteUInt16(image, coff + 18, (ushort)(CharacteristicsRelocationsStripped
                 | CharacteristicsExecutableImage | CharacteristicsLargeAddressAware | (target.Is32Bit ? CharacteristicsMachine32Bit : 0)));
 
             var opt = coff + 20;

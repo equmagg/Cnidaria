@@ -1,5 +1,42 @@
 namespace System.Numerics
 {
+    public interface INumberBase<TSelf>
+        where TSelf : INumberBase<TSelf>
+    {
+        /// <summary>Gets the value <c>1</c> for the type.</summary>
+        static abstract TSelf One { get; }
+
+        /// <summary>Gets the radix, or base, for the type.</summary>
+        static abstract int Radix { get; }
+
+        /// <summary>Gets the value <c>0</c> for the type.</summary>
+        static abstract TSelf Zero { get; }
+
+        static abstract bool TryConvertFromTruncating<TOther>(TOther value, out TSelf result)
+            where TOther : INumberBase<TOther>;
+
+        static abstract bool TryConvertToTruncating<TOther>(TSelf value, out TOther result)
+            where TOther : INumberBase<TOther>;
+
+        /// <summary>Creates an instance of the current type from a value, truncating any values that fall outside the representable range of the current type.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static virtual TSelf CreateTruncating<TOther>(TOther value)
+            where TOther : INumberBase<TOther>
+        {
+            TSelf? result;
+
+            if (typeof(TOther) == typeof(TSelf))
+            {
+                result = (TSelf)(object)value;
+            }
+            else if (!TSelf.TryConvertFromTruncating(value, out result) && !TOther.TryConvertToTruncating<TSelf>(value, out result))
+            {
+                throw new NotSupportedException();
+            }
+
+            return result;
+        }
+    }
     public static class BitOperations
     {
         private static ReadOnlySpan<byte> TrailingZeroCountDeBruijn => // 32

@@ -17,8 +17,11 @@ namespace Cnidaria.Cs
         public const string CurrentFramePointerSymbol = "RhpCurrentFramePointer";
         public const string NewFastSymbol = "RhpNewFast";
         public const string NewArraySymbol = "RhpNewArray";
+        public const string NewUninitializedArraySymbol = "RhpNewArrayUninitialized";
         public const string AllocHGlobalSymbol = "RhpAllocHGlobal";
         public const string FreeHGlobalSymbol = "RhpFreeHGlobal";
+        public const string MonitorEnterSymbol = "RhpMonitorEnter";
+        public const string MonitorExitSymbol = "RhpMonitorExit";
         public const string DelegateCombineSymbol = "RhpDelegateCombine";
         public const string DelegateRemoveSymbol = "RhpDelegateRemove";
         public const string ArrayGetLengthSymbol = "RhpArrayGetLength";
@@ -30,6 +33,7 @@ namespace Cnidaria.Cs
         public const string NewStringFromUtf16Symbol = "RhpNewStringFromUtf16";
         public const string NewStringFromCharArraySymbol = "RhpNewStringFromCharArray";
         public const string NewStringFromCharArrayRangeSymbol = "RhpNewStringFromCharArrayRange";
+        public const string NewStringFromReadOnlySpanSymbol = "RhpNewStringFromReadOnlySpan";
         public const string ThrowSymbol = "RhpThrowEx";
         public const string RethrowSymbol = "RhpRethrow";
         public const string LeaveSymbol = "RhpLeave";
@@ -40,11 +44,11 @@ namespace Cnidaria.Cs
         public const string EhRegisterContextsSymbol = "RhpEhRegisterContexts";
         public const string CurrentExceptionSymbol = "RhpCurrentException";
         public const string FailFastSymbol = "RhpFallbackFailFast";
-        private const string StringGetLengthSymbol = "RhpStringGetLength";
-        private const string StringGetDataSymbol = "RhpStringGetData";
         private const string ConsoleWriteUtf16Symbol = "RhpConsoleWriteUtf16";
         private const string ConsoleWriteUtf16ZSymbol = "RhpConsoleWriteUtf16Z";
         private const string ConsoleWriteStringSymbol = "RhpConsoleWriteString";
+        private const string MemsetSymbol = "RhpMemset";
+        private const string GetCurrentProcessorNumberSymbol = "RhpGetCurrentProcessorNumber";
 
         private static readonly ConcurrentDictionary<string, Lazy<RiscVProgram>> RuntimeObjects =
             new ConcurrentDictionary<string, Lazy<RiscVProgram>>(StringComparer.Ordinal);
@@ -107,24 +111,6 @@ namespace Cnidaria.Cs
                 }
             }
 
-            if (IsSystemType(method.DeclaringType, "String"))
-            {
-                if (method.HasThis &&
-                    StringComparer.Ordinal.Equals(method.Name, "get_Length") &&
-                    method.ParameterTypes.Length == 0)
-                {
-                    return StringGetLengthSymbol;
-                }
-
-                if (method.HasThis &&
-                    (StringComparer.Ordinal.Equals(method.Name, "GetPinnableReference") ||
-                     StringComparer.Ordinal.Equals(method.Name, "GetRawStringData")) &&
-                    method.ParameterTypes.Length == 0)
-                {
-                    return StringGetDataSymbol;
-                }
-            }
-
             if (IsSystemType(method.DeclaringType, "Console") &&
                 StringComparer.Ordinal.Equals(method.Name, "_Write") &&
                 method.IsStatic &&
@@ -138,6 +124,45 @@ namespace Cnidaria.Cs
                     return ConsoleWriteStringSymbol;
                 if (IsReadOnlyCharSpan(parameter))
                     return ConsoleWriteUtf16Symbol;
+            }
+
+            if (StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System") &&
+                StringComparer.Ordinal.Equals(method.DeclaringType.Name, "SpanHelpers") &&
+                StringComparer.Ordinal.Equals(method.Name, "memset") &&
+                method.IsStatic &&
+                !method.HasThis &&
+                method.ParameterTypes.Length == 3 &&
+                method.ParameterTypes[0].Kind == RuntimeTypeKind.Pointer &&
+                IsSystemType(method.ParameterTypes[1], "Int32") &&
+                IsSystemType(method.ParameterTypes[2], "UIntPtr") &&
+                IsVoid(method.ReturnType))
+            {
+                return MemsetSymbol;
+            }
+
+            if (StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Threading") &&
+                StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Thread") &&
+                StringComparer.Ordinal.Equals(method.Name, "GetCurrentProcessorNumber") &&
+                method.IsStatic &&
+                !method.HasThis &&
+                method.ParameterTypes.Length == 0 &&
+                IsSystemType(method.ReturnType, "Int32"))
+            {
+                return GetCurrentProcessorNumberSymbol;
+            }
+
+            if (StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Threading") &&
+                StringComparer.Ordinal.Equals(method.DeclaringType.Name, "ObjectHeader") &&
+                method.IsStatic &&
+                !method.HasThis &&
+                method.ParameterTypes.Length == 1 &&
+                IsSystemType(method.ParameterTypes[0], "Object") &&
+                IsVoid(method.ReturnType))
+            {
+                if (StringComparer.Ordinal.Equals(method.Name, "AcquireThinLock"))
+                    return MonitorEnterSymbol;
+                if (StringComparer.Ordinal.Equals(method.Name, "Release"))
+                    return MonitorExitSymbol;
             }
 
             if (StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Runtime.InteropServices") &&
@@ -159,6 +184,9 @@ namespace Cnidaria.Cs
                     return FreeHGlobalSymbol;
                 }
             }
+
+            if (IsAllocateNewArrayInternalCall(method))
+                return NewUninitializedArraySymbol;
 
             throw new MissingMethodException(
                 $"InternalCall implementation is missing: {method.DeclaringType.Namespace}.{method.DeclaringType.Name}.{method.Name}");
@@ -188,10 +216,31 @@ namespace Cnidaria.Cs
             return true;
         }
 
+        public static bool IsAllocateNewArrayInternalCall(RuntimeMethod method)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+
+            return method.HasInternalCall &&
+                   method.IsStatic &&
+                   !method.HasThis &&
+                   StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System") &&
+                   StringComparer.Ordinal.Equals(method.DeclaringType.Name, "RuntimeImports") &&
+                   StringComparer.Ordinal.Equals(method.Name, "RhAllocateNewArray") &&
+                   method.ParameterTypes.Length == 2 &&
+                   IsSystemType(method.ParameterTypes[0], "Int32") &&
+                   IsSystemType(method.ParameterTypes[1], "UInt32") &&
+                   method.ReturnType.Kind == RuntimeTypeKind.Array &&
+                   method.ReturnType.IsSzArray;
+        }
+
         public static bool IsGcSafePointInternalCall(RuntimeMethod method)
         {
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
+
+            if (IsAllocateNewArrayInternalCall(method))
+                return true;
 
             return method.HasInternalCall &&
                    method.IsStatic &&

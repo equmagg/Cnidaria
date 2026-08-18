@@ -2063,6 +2063,7 @@ namespace Cnidaria.Cs
                     ushort flags = 0;
                     flags |= (ushort)MapFieldAccessibility(f.DeclaredAccessibility);
                     if (f.IsStatic || f.IsConst) flags |= 0x0010; // const must also be static
+                    if (f.IsReadOnly) flags |= 0x0020;            // FieldAttributes.InitOnly
                     if (f.IsConst) flags |= 0x0040;               // FieldAttributes.Literal
 
                     Image.Fields.Add(new FieldRow(flags: flags, name: fNameIdx, signature: sigIdx));
@@ -2591,7 +2592,7 @@ namespace Cnidaria.Cs
                 w.CompressedUInt((uint)mtps.Length); // generic arity
             w.CompressedUInt((uint)method.Parameters.Length);
 
-            WriteTypeSig(w, method.ReturnType);
+            WriteMethodReturnType(w, method);
 
             var ps = method.Parameters;
             for (int i = 0; i < ps.Length; i++)
@@ -2599,6 +2600,23 @@ namespace Cnidaria.Cs
 
             return Image.Blob.Add(w.ToArray());
         }
+        private void WriteMethodReturnType(SigWriter writer, MethodSymbol method)
+        {
+            if (method.ReturnsByRefReadonly && method.ReturnType is ByRefTypeSymbol byRef)
+            {
+                writer.Byte((byte)SigElementType.BYREF);
+                WriteCustomModifier(
+                    writer,
+                    true,
+                    "System.Runtime.InteropServices",
+                    "InAttribute");
+                WriteTypeSig(writer, byRef.ElementType);
+                return;
+            }
+
+            WriteTypeSig(writer, method.ReturnType);
+        }
+
         private void WriteTypeSig(SigWriter w, TypeSymbol type)
         {
             switch (type)
@@ -2711,21 +2729,21 @@ namespace Cnidaria.Cs
                 switch (refKind)
                 {
                     case FunctionPointerRefKind.Out:
-                        WriteFunctionPointerCustomModifier(
+                        WriteCustomModifier(
                             writer,
                             true,
                             "System.Runtime.InteropServices",
                             "OutAttribute");
                         break;
                     case FunctionPointerRefKind.In:
-                        WriteFunctionPointerCustomModifier(
+                        WriteCustomModifier(
                             writer,
                             true,
                             "System.Runtime.InteropServices",
                             "InAttribute");
                         break;
                     case FunctionPointerRefKind.RefReadOnly:
-                        WriteFunctionPointerCustomModifier(
+                        WriteCustomModifier(
                             writer,
                             false,
                             "System.Runtime.CompilerServices",
@@ -2736,7 +2754,7 @@ namespace Cnidaria.Cs
             WriteTypeSig(writer, type);
         }
 
-        private void WriteFunctionPointerCustomModifier(
+        private void WriteCustomModifier(
             SigWriter writer,
             bool required,
             string @namespace,
@@ -2890,6 +2908,12 @@ namespace Cnidaria.Cs
                 case double x: w.WriteByte(12); w.WriteDouble(x); return;
                 case string x: w.WriteByte(13); w.WriteInt32(Image.Strings.Add(x)); return;
                 case TypeSymbol t: w.WriteByte(14); w.WriteInt32(GetTypeToken(t)); return;
+                case ImmutableArray<TypedConstant> values:
+                    w.WriteByte(15);
+                    w.WriteInt32(values.Length);
+                    for (int i = 0; i < values.Length; i++)
+                        WriteTypedConstant(w, values[i]);
+                    return;
                 default:
                     throw new NotSupportedException($"Unsupported attribute constant value: {v.GetType().FullName}");
             }

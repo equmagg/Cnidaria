@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Text;
 
 namespace Cnidaria.Cs
 {
@@ -162,6 +163,9 @@ namespace Cnidaria.Cs
 
                 case SyntaxKind.PostDecrementExpression:
                     return BindPostfixIncrementOrDecrement(node, isIncrement: false, resultUsed: true, context, diagnostics);
+
+                case SyntaxKind.SuppressNullableWarningExpression:
+                    return BindExpression(node.Operand, context, diagnostics);
 
                 default:
                     diagnostics.Add(new Diagnostic("CN_UNARY001", DiagnosticSeverity.Error,
@@ -357,7 +361,7 @@ namespace Cnidaria.Cs
             return new BoundBinaryExpression(operatorSyntax, op, promoted, leftConv, rightConv, constValue, isChecked);
         }
         private bool TryBindPointerArithmeticBinary(
-            SyntaxNode diagnosticNode,
+            ExpressionSyntax diagnosticNode,
             ExpressionSyntax leftSyntax,
             BoundExpression left,
             ExpressionSyntax rightSyntax,
@@ -381,7 +385,7 @@ namespace Cnidaria.Cs
                 diagnostics.Add(new Diagnostic("CN_PTRARITH000", DiagnosticSeverity.Error,
                     $"Pointer arithmetic supports only '+' and '-', got '{op}'.",
                     new Location(ctx.SemanticModel.SyntaxTree, diagnosticNode.Span)));
-                result = new BoundBadExpression((ExpressionSyntax)diagnosticNode);
+                result = new BoundBadExpression(diagnosticNode);
                 return true;
             }
 
@@ -390,7 +394,7 @@ namespace Cnidaria.Cs
                 diagnostics.Add(new Diagnostic("CN_PTRARITH001", DiagnosticSeverity.Error,
                     "Pointer arithmetic currently requires the pointer operand on the left.",
                     new Location(ctx.SemanticModel.SyntaxTree, diagnosticNode.Span)));
-                result = new BoundBadExpression((ExpressionSyntax)diagnosticNode);
+                result = new BoundBadExpression(diagnosticNode);
                 return true;
             }
 
@@ -401,7 +405,7 @@ namespace Cnidaria.Cs
                     diagnostics.Add(new Diagnostic("CN_PTRARITH002", DiagnosticSeverity.Error,
                         "Pointer-pointer arithmetic supports only subtraction.",
                         new Location(ctx.SemanticModel.SyntaxTree, diagnosticNode.Span)));
-                    result = new BoundBadExpression((ExpressionSyntax)diagnosticNode);
+                    result = new BoundBadExpression(diagnosticNode);
                     return true;
                 }
                 if (!ReferenceEquals(left.Type, right.Type))
@@ -410,7 +414,7 @@ namespace Cnidaria.Cs
                         $"Pointer subtraction requires both operands to have the same pointer type, " +
                         $"got '{left.Type.Name}' and '{right.Type.Name}'.",
                         new Location(ctx.SemanticModel.SyntaxTree, diagnosticNode.Span)));
-                    result = new BoundBadExpression((ExpressionSyntax)diagnosticNode);
+                    result = new BoundBadExpression(diagnosticNode);
                     return true;
                 }
                 var diffType = ctx.Compilation.GetSpecialType(SpecialType.System_IntPtr);
@@ -429,7 +433,7 @@ namespace Cnidaria.Cs
                 diagnostics.Add(new Diagnostic("CN_PTRARITH003", DiagnosticSeverity.Error,
                     $"Pointer arithmetic requires an integral offset, got '{right.Type.Name}'.",
                     new Location(ctx.SemanticModel.SyntaxTree, diagnosticNode.Span)));
-                result = new BoundBadExpression((ExpressionSyntax)diagnosticNode);
+                result = new BoundBadExpression(diagnosticNode);
                 return true;
             }
 
@@ -442,7 +446,7 @@ namespace Cnidaria.Cs
 
             if (rightConv.HasErrors)
             {
-                result = new BoundBadExpression((ExpressionSyntax)diagnosticNode);
+                result = new BoundBadExpression(diagnosticNode);
                 return true;
             }
 
@@ -797,6 +801,22 @@ namespace Cnidaria.Cs
                 SyntaxKind.ModuloExpression => BoundBinaryOperatorKind.Modulo,
                 _ => throw new InvalidOperationException()
             };
+            if (op == BoundBinaryOperatorKind.Add &&
+                left is BoundSpanCollectionExpression leftUtf8 && leftUtf8.IsUtf8Encoded &&
+                right is BoundSpanCollectionExpression rightUtf8 && rightUtf8.IsUtf8Encoded)
+            {
+                var elements = ImmutableArray.CreateBuilder<BoundExpression>(leftUtf8.Elements.Length + rightUtf8.Elements.Length);
+                elements.AddRange(leftUtf8.Elements);
+                elements.AddRange(rightUtf8.Elements);
+                return new BoundSpanCollectionExpression(
+                    bin,
+                    (NamedTypeSymbol)leftUtf8.Type,
+                    leftUtf8.ElementType,
+                    elements.ToImmutable(),
+                    isUtf8Encoded: true,
+                    needsUtf8NullTerminator: true);
+            }
+
             if (TryBindUserDefinedBinaryOperator(
                 operatorSyntax: bin,
                 leftSyntax: bin.Left,
@@ -955,13 +975,11 @@ namespace Cnidaria.Cs
             var left = BindExpression(bin.Left, ctx, diagnostics);
             left = ApplyConversion(bin.Left, left, boolType, bin, ctx, diagnostics, requireImplicit: true);
             var rightBinder = op == BoundBinaryOperatorKind.LogicalAnd
-                ? CreateFlowScopeBinderForTrue(left) : this;
+                ? CreateFlowScopeBinderForTrue(left)
+                : CreateFlowScopeBinderForFalse(left);
 
             var right = rightBinder.BindExpression(bin.Right, ctx, diagnostics);
             right = rightBinder.ApplyConversion(bin.Right, right, boolType, bin, ctx, diagnostics, requireImplicit: true);
-
-            if (left.HasErrors || right.HasErrors)
-                return new BoundBadExpression(bin);
 
             return new BoundBinaryExpression(bin, op, boolType, left, right, Optional<object>.None);
         }
@@ -1993,6 +2011,12 @@ namespace Cnidaria.Cs
                     builder.Add(isPattern.DeclaredLocalOpt);
                     return;
 
+                case BoundBinaryExpression bin
+                    when bin.OperatorKind == BoundBinaryOperatorKind.LogicalOr:
+                    CollectPatternLocalsWhenFalse(bin.Left, builder);
+                    CollectPatternLocalsWhenFalse(bin.Right, builder);
+                    return;
+
                 case BoundCheckedExpression chk:
                     CollectPatternLocalsWhenFalse(chk.Expression, builder);
                     return;
@@ -2065,6 +2089,9 @@ namespace Cnidaria.Cs
 
                 case BoundUncheckedStatement unchk:
                     return StatementDefinitelyDoesNotComplete(unchk.Statement);
+
+                case BoundLockStatement lockStatement:
+                    return StatementDefinitelyDoesNotComplete(lockStatement.Body);
 
                 default:
                     return false;
@@ -2423,6 +2450,54 @@ namespace Cnidaria.Cs
 
             return Optional<object>.None;
         }
+        private BoundExpression BindUtf8StringLiteral(
+            LiteralExpressionSyntax lit,
+            string value,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var byteType = context.Compilation.GetSpecialType(SpecialType.System_UInt8);
+            var readOnlySpanDefinition = LookupTypeByMetadataName(context.Compilation, "System", "ReadOnlySpan", 1);
+            if (readOnlySpanDefinition is null)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_UTF8LIT001",
+                    DiagnosticSeverity.Error,
+                    "Required type 'System.ReadOnlySpan<T>' was not found.",
+                    new Location(context.SemanticModel.SyntaxTree, lit.Span)));
+                return new BoundBadExpression(lit);
+            }
+
+            byte[] bytes;
+            try
+            {
+                bytes = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true).GetBytes(value);
+            }
+            catch (EncoderFallbackException)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_UTF8LIT002",
+                    DiagnosticSeverity.Error,
+                    "UTF-8 string literal contains an invalid Unicode scalar value.",
+                    new Location(context.SemanticModel.SyntaxTree, lit.Span)));
+                return new BoundBadExpression(lit);
+            }
+
+            var spanType = context.Compilation.ConstructNamedType(
+                readOnlySpanDefinition,
+                ImmutableArray.Create<TypeSymbol>(byteType));
+            var elements = ImmutableArray.CreateBuilder<BoundExpression>(bytes.Length);
+            for (int i = 0; i < bytes.Length; i++)
+                elements.Add(new BoundLiteralExpression(lit, byteType, bytes[i]));
+
+            return new BoundSpanCollectionExpression(
+                lit,
+                spanType,
+                byteType,
+                elements.ToImmutable(),
+                isUtf8Encoded: true,
+                needsUtf8NullTerminator: true);
+        }
         private BoundExpression BindLiteral(LiteralExpressionSyntax lit, BindingContext context, DiagnosticBag diagnostics)
         {
             var token = lit.LiteralToken;
@@ -2484,6 +2559,11 @@ namespace Cnidaria.Cs
             {
                 var t = context.Compilation.GetSpecialType(SpecialType.System_Decimal);
                 return new BoundLiteralExpression(lit, t, value);
+            }
+
+            if (lit.Kind == SyntaxKind.Utf8StringLiteralExpression && value is string utf8Text)
+            {
+                return BindUtf8StringLiteral(lit, utf8Text, context, diagnostics);
             }
 
             if (value is string)

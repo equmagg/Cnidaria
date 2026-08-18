@@ -858,7 +858,7 @@ namespace Cnidaria.Cs
         public int MinimumManagedObjectSize => PointerSize * 2;
         public int MinimumGcObjectSize => SyncBlockSize + MinimumManagedObjectSize;
         public int StringLengthOffset => ManagedObjectHeaderSize;
-        public int StringCharsOffset => StringLengthOffset + 4;
+        public int StringFirstCharOffset => StringLengthOffset + 4;
         public int ArrayLengthOffset => ManagedObjectHeaderSize;
         public int ArrayDataOffset => ArrayLengthOffset + (ManagedObjectHeaderSize == PointerSize ? (Is64Bit ? 8 : 4) : 8);
         public bool Is32Bit => PointerSize == 4;

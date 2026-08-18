@@ -14,12 +14,35 @@ namespace System.Collections
         }
     }
 
+    public interface IDictionaryEnumerator : IEnumerator
+    {
+        object Key
+        {
+            get;
+        }
+
+        object? Value
+        {
+            get;
+        }
+
+    }
+
     public interface ICollection : IEnumerable
     {
         int Count { get; }
         bool IsSynchronized { get; }
         object SyncRoot { get; }
         void CopyTo(Array array, int index);
+    }
+
+    public interface IComparer
+    {
+        // Compares two objects. An implementation of this method must return a
+        // value less than zero if x is less than y, zero if x is equal to y, or a
+        // value greater than zero if x is greater than y.
+        //
+        int Compare(object? x, object? y);
     }
 
     public interface IList : ICollection
@@ -50,11 +73,52 @@ namespace System.Collections
         void Remove(object value);
         void RemoveAt(int index);
     }
+    public interface IAlternateEqualityComparer<in TAlternate, T>
+        where TAlternate : allows ref struct
+        where T : allows ref struct
+    {
+        bool Equals(TAlternate alternate, T other);
+
+        int GetHashCode(TAlternate alternate);
+
+        T Create(TAlternate alternate);
+    }
     public interface IEqualityComparer
     {
         bool Equals(object? x, object? y);
         int GetHashCode(object obj);
     }
+
+    public struct DictionaryEntry
+    {
+        private object _key; // Do not rename
+        private object? _value; // Do not rename
+
+        public DictionaryEntry(object key, object? value)
+        {
+            _key = key;
+            _value = value;
+        }
+
+        public object Key
+        {
+            get => _key;
+            set => _key = value;
+        }
+
+        public object? Value
+        {
+            get => _value;
+            set => _value = value;
+        }
+
+        public void Deconstruct(out object key, out object? value)
+        {
+            key = Key;
+            value = Value;
+        }
+    }
+
     internal static class HashHelpers
     {
         public const uint HashCollisionThreshold = 100;
@@ -138,6 +202,20 @@ namespace System.Collections
 }
 namespace System.Collections.Generic
 {
+    public class KeyNotFoundException : SystemException
+    {
+        public KeyNotFoundException()
+            : base(string.Empty)
+        { }
+
+        public KeyNotFoundException(string? message)
+            : base(message ?? string.Empty)
+        { }
+
+        public KeyNotFoundException(string? message, Exception? innerException)
+            : base(message ?? string.Empty, innerException)
+        { }
+    }
     public interface IEnumerable<out T> : System.Collections.IEnumerable
         where T : allows ref struct
     {
@@ -726,6 +804,26 @@ namespace System.Collections.Generic
         bool Equals(T? x, T? y);
         int GetHashCode(T obj);
     }
+    internal interface IInternalStringEqualityComparer : IEqualityComparer<string?>
+    {
+        IEqualityComparer<string?> GetUnderlyingEqualityComparer();
+
+        /// <summary>
+        /// Unwraps the internal equality comparer, if proxied.
+        /// Otherwise returns the equality comparer itself or its default equivalent.
+        /// </summary>
+        internal static IEqualityComparer<string?> GetUnderlyingEqualityComparer(IEqualityComparer<string?> outerComparer)
+        {
+            if (outerComparer is IInternalStringEqualityComparer internalComparer)
+            {
+                return internalComparer.GetUnderlyingEqualityComparer();
+            }
+            else
+            {
+                return outerComparer;
+            }
+        }
+    }
     public abstract class EqualityComparer<T> : IEqualityComparer, IEqualityComparer<T>
     {
         public static EqualityComparer<T> Default { get; } = null;
@@ -757,6 +855,213 @@ namespace System.Collections.Generic
             if ((x is T) && (y is T)) return Equals((T)x, (T)y);
             throw new ArgumentException();
             return false;
+        }
+    }
+    internal abstract class RandomizedStringEqualityComparer : EqualityComparer<string?>, IInternalStringEqualityComparer
+    {
+        private readonly MarvinSeed _seed;
+        private readonly IEqualityComparer<string?> _underlyingComparer;
+
+        private unsafe RandomizedStringEqualityComparer(IEqualityComparer<string?> underlyingComparer)
+        {
+            _underlyingComparer = underlyingComparer;
+
+            fixed (MarvinSeed* seed = &_seed)
+            {
+                //Interop.GetRandomBytes((byte*)seed, sizeof(MarvinSeed));
+            }
+        }
+
+        internal static RandomizedStringEqualityComparer Create(IEqualityComparer<string?> underlyingComparer, bool ignoreCase)
+        {
+            if (!ignoreCase)
+            {
+                return new OrdinalComparer(underlyingComparer);
+            }
+            else
+            {
+                return new OrdinalIgnoreCaseComparer(underlyingComparer);
+            }
+        }
+
+        public IEqualityComparer<string?> GetUnderlyingEqualityComparer() => _underlyingComparer;
+
+        private struct MarvinSeed
+        {
+            internal uint p0;
+            internal uint p1;
+        }
+
+        private sealed class OrdinalComparer : RandomizedStringEqualityComparer, IAlternateEqualityComparer<ReadOnlySpan<char>, string?>
+        {
+            internal OrdinalComparer(IEqualityComparer<string?> wrappedComparer)
+                    : base(wrappedComparer)
+            {
+            }
+
+            string IAlternateEqualityComparer<ReadOnlySpan<char>, string?>.Create(ReadOnlySpan<char> span) =>
+                span.ToString();
+
+            public override bool Equals(string? x, string? y) => string.Equals(x, y);
+
+            bool IAlternateEqualityComparer<ReadOnlySpan<char>, string?>.Equals(ReadOnlySpan<char> alternate, string? other)
+            {
+                // See explanation in System.OrdinalComparer.Equals.
+                if (alternate.IsEmpty && other is null)
+                {
+                    return false;
+                }
+
+                return alternate.SequenceEqual(other);
+            }
+
+            public override int GetHashCode(string? obj)
+            {
+                if (obj is null)
+                {
+                    return 0;
+                }
+
+                // The Ordinal version of Marvin32 operates over bytes.
+                // The multiplication from # chars -> # bytes will never integer overflow.
+                return Marvin.ComputeHash32(
+                    ref obj.GetRawStringDataAsUInt8(),
+                    (uint)obj.Length * 2,
+                    _seed.p0, _seed.p1);
+            }
+
+            int IAlternateEqualityComparer<ReadOnlySpan<char>, string?>.GetHashCode(ReadOnlySpan<char> alternate) =>
+                Marvin.ComputeHash32(
+                    ref Unsafe.As<char, byte>(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(alternate)),
+                    (uint)alternate.Length * 2,
+                    _seed.p0, _seed.p1);
+        }
+        private sealed class OrdinalIgnoreCaseComparer : RandomizedStringEqualityComparer, IAlternateEqualityComparer<ReadOnlySpan<char>, string?>
+        {
+            internal OrdinalIgnoreCaseComparer(IEqualityComparer<string?> wrappedComparer)
+                : base(wrappedComparer)
+            {
+            }
+
+            string IAlternateEqualityComparer<ReadOnlySpan<char>, string?>.Create(ReadOnlySpan<char> span) =>
+                span.ToString();
+
+            public override int GetHashCode(string? obj)
+            {
+                if (obj is null)
+                {
+                    return 0;
+                }
+
+                // The OrdinalIgnoreCase version of Marvin32 operates over chars,
+                // so pass in the char count directly.
+                return Marvin.ComputeHash32OrdinalIgnoreCase(
+                    ref obj.GetRawStringData(),
+                    obj.Length,
+                    _seed.p0, _seed.p1);
+            }
+
+            int IAlternateEqualityComparer<ReadOnlySpan<char>, string?>.GetHashCode(ReadOnlySpan<char> alternate) =>
+                Marvin.ComputeHash32OrdinalIgnoreCase(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetReference(alternate),
+                    alternate.Length,
+                    _seed.p0, _seed.p1);
+        }
+    }
+    
+    public class NonRandomizedStringEqualityComparer : EqualityComparer<string?>, IInternalStringEqualityComparer
+    {
+        // Dictionary<...>.Comparer and similar methods need to return the original IEqualityComparer
+        // that was passed in to the ctor. The caller chooses one of these singletons so that the
+        // GetUnderlyingEqualityComparer method can return the correct value.
+
+        private static readonly NonRandomizedStringEqualityComparer WrappedAroundDefaultComparer = new OrdinalComparer(EqualityComparer<string?>.Default);
+        private static readonly NonRandomizedStringEqualityComparer WrappedAroundStringComparerOrdinal = new OrdinalComparer(StringComparer.Ordinal);
+        private static readonly NonRandomizedStringEqualityComparer WrappedAroundStringComparerOrdinalIgnoreCase = new OrdinalIgnoreCaseComparer(StringComparer.OrdinalIgnoreCase);
+
+        private readonly IEqualityComparer<string?> _underlyingComparer;
+
+        private NonRandomizedStringEqualityComparer(IEqualityComparer<string?> underlyingComparer)
+        {
+            _underlyingComparer = underlyingComparer;
+        }
+
+        public virtual bool Equals(string? x, string? y)
+        {
+            // This instance may have been deserialized into a class that doesn't guarantee
+            // these parameters are non-null. Can't short-circuit the null checks.
+
+            return string.Equals(x, y);
+        }
+
+        internal virtual RandomizedStringEqualityComparer GetRandomizedEqualityComparer()
+        {
+            return RandomizedStringEqualityComparer.Create(_underlyingComparer, ignoreCase: false);
+        }
+
+        // Gets the comparer that should be returned back to the caller when querying the
+        // ICollection.Comparer property. Also used for serialization purposes.
+        public virtual IEqualityComparer<string?> GetUnderlyingEqualityComparer() => _underlyingComparer;
+
+        private sealed class OrdinalComparer : NonRandomizedStringEqualityComparer, IAlternateEqualityComparer<ReadOnlySpan<char>, string?>
+        {
+            internal OrdinalComparer(IEqualityComparer<string?> wrappedComparer) : base(wrappedComparer)
+            {
+            }
+
+            public override bool Equals(string? x, string? y) => string.Equals(x, y);
+
+            public override int GetHashCode(string? obj)
+            {
+                return obj.GetNonRandomizedHashCode();
+            }
+
+            int IAlternateEqualityComparer<ReadOnlySpan<char>, string?>.GetHashCode(ReadOnlySpan<char> span) =>
+                string.GetNonRandomizedHashCode(span);
+
+            string IAlternateEqualityComparer<ReadOnlySpan<char>, string?>.Create(ReadOnlySpan<char> span) =>
+                span.ToString();
+        }
+
+        private sealed class OrdinalIgnoreCaseComparer : NonRandomizedStringEqualityComparer, IAlternateEqualityComparer<ReadOnlySpan<char>, string?>
+        {
+            internal OrdinalIgnoreCaseComparer(IEqualityComparer<string?> wrappedComparer) : base(wrappedComparer)
+            {
+            }
+
+            public override bool Equals(string? x, string? y) => string.Equals(x, y, StringComparison.OrdinalIgnoreCase);
+
+            string IAlternateEqualityComparer<ReadOnlySpan<char>, string?>.Create(ReadOnlySpan<char> span) =>
+                span.ToString();
+
+            internal override RandomizedStringEqualityComparer GetRandomizedEqualityComparer()
+            {
+                return RandomizedStringEqualityComparer.Create(_underlyingComparer, ignoreCase: true);
+            }
+        }
+
+        public static IEqualityComparer<string>? GetStringComparer(object comparer)
+        {
+            // Special-case EqualityComparer<string>.Default, StringComparer.Ordinal, and StringComparer.OrdinalIgnoreCase.
+            // We use a non-randomized comparer for improved perf, falling back to a randomized comparer if the
+            // hash buckets become unbalanced.
+
+            if (ReferenceEquals(comparer, EqualityComparer<string>.Default))
+            {
+                return WrappedAroundDefaultComparer;
+            }
+
+            if (ReferenceEquals(comparer, StringComparer.Ordinal))
+            {
+                return WrappedAroundStringComparerOrdinal;
+            }
+
+            if (ReferenceEquals(comparer, StringComparer.OrdinalIgnoreCase))
+            {
+                return WrappedAroundStringComparerOrdinalIgnoreCase;
+            }
+
+            return null;
         }
     }
     internal sealed class DelegateEqualityComparer<T> : EqualityComparer<T>
@@ -877,6 +1182,26 @@ namespace System.Collections.Generic
             value = Value;
         }
     }
+    /// <summary>
+    /// Used internally to control behavior of insertion into a <see cref="Dictionary{TKey, TValue}"/> or <see cref="HashSet{T}"/>.
+    /// </summary>
+    internal enum InsertionBehavior : byte
+    {
+        /// <summary>
+        /// The default insertion behavior.
+        /// </summary>
+        None = 0,
+
+        /// <summary>
+        /// Specifies that an existing entry with the same key should be overwritten if encountered.
+        /// </summary>
+        OverwriteExisting = 1,
+
+        /// <summary>
+        /// Specifies that if an existing entry with the same key is encountered, an exception should be thrown.
+        /// </summary>
+        ThrowOnExisting = 2
+    }
     public class Dictionary<TKey, TValue>
     {
         // constants for serialization
@@ -887,7 +1212,9 @@ namespace System.Collections.Generic
 
         private int[]? _buckets;
         private Entry[]? _entries;
+#if TARGET_64BIT
         private ulong _fastModMultiplier;
+#endif
         private int _count;
         private int _freeList;
         private int _freeCount;
@@ -918,13 +1245,321 @@ namespace System.Collections.Generic
             {
                 _comparer = comparer ?? EqualityComparer<TKey>.Default;
 
-
+                if (typeof(TKey) == typeof(string) &&
+                    NonRandomizedStringEqualityComparer.GetStringComparer(_comparer!) is IEqualityComparer<string> stringComparer)
+                {
+                    _comparer = (IEqualityComparer<TKey>)stringComparer;
+                }
             }
             else if (comparer is not null && // first check for null to avoid forcing default comparer instantiation unnecessarily
                      comparer != EqualityComparer<TKey>.Default)
             {
                 _comparer = comparer;
             }
+        }
+
+        public Dictionary(IDictionary<TKey, TValue> dictionary) : this(dictionary, null) { }
+
+        public Dictionary(IDictionary<TKey, TValue> dictionary, IEqualityComparer<TKey>? comparer) :
+            this(dictionary?.Count ?? 0, comparer)
+        {
+            if (dictionary == null)
+            {
+                throw new ArgumentNullException();
+            }
+
+            AddRange(dictionary);
+        }
+
+        public Dictionary(IEnumerable<KeyValuePair<TKey, TValue>> collection) : this(collection, null) { }
+
+        public Dictionary(IEnumerable<KeyValuePair<TKey, TValue>> collection, IEqualityComparer<TKey>? comparer) :
+            this((collection as ICollection<KeyValuePair<TKey, TValue>>)?.Count ?? 0, comparer)
+        {
+            if (collection == null)
+            {
+                throw new ArgumentNullException();
+            }
+
+            AddRange(collection);
+        }
+
+        private void AddRange(IEnumerable<KeyValuePair<TKey, TValue>> enumerable)
+        {
+            if (enumerable.GetType() == typeof(Dictionary<TKey, TValue>))
+            {
+                Dictionary<TKey, TValue> source = (Dictionary<TKey, TValue>)enumerable;
+
+                if (source.Count == 0)
+                {
+                    // Nothing to copy, all done
+                    return;
+                }
+
+                Entry[] oldEntries = source._entries;
+                if (source._comparer == _comparer)
+                {
+                    // If comparers are the same, we can copy _entries without rehashing.
+                    CopyEntries(oldEntries, source._count);
+                    return;
+                }
+
+                // Comparers differ need to rehash all the entries via Add
+                int count = source._count;
+                for (int i = 0; i < count; i++)
+                {
+                    // Only copy if an entry
+                    if (oldEntries[i].next >= -1)
+                    {
+                        Add(oldEntries[i].key, oldEntries[i].value);
+                    }
+                }
+                return;
+            }
+
+            ReadOnlySpan<KeyValuePair<TKey, TValue>> span;
+            if (enumerable is KeyValuePair<TKey, TValue>[] array)
+            {
+                span = array;
+            }
+            else if (enumerable.GetType() == typeof(List<KeyValuePair<TKey, TValue>>))
+            {
+                span = System.Runtime.InteropServices.CollectionsMarshal.AsSpan((List<KeyValuePair<TKey, TValue>>)enumerable);
+            }
+            else
+            {
+                // Fallback path for all other enumerables
+                foreach (KeyValuePair<TKey, TValue> pair in enumerable)
+                {
+                    Add(pair.Key, pair.Value);
+                }
+                return;
+            }
+
+            // We got a span. Add the elements to the dictionary.
+            foreach (KeyValuePair<TKey, TValue> pair in span)
+            {
+                Add(pair.Key, pair.Value);
+            }
+        }
+
+        public IEqualityComparer<TKey> Comparer
+        {
+            get
+            {
+                return _comparer ?? EqualityComparer<TKey>.Default;
+            }
+        }
+
+        public int Count => _count - _freeCount;
+        /// <summary>
+        /// Gets the total numbers of elements the internal data structure can hold without resizing.
+        /// </summary>
+        public int Capacity => _entries?.Length ?? 0;
+        public KeyCollection Keys => _keys ??= new KeyCollection(this);
+
+        //ICollection<TKey> IDictionary<TKey, TValue>.Keys => Keys;
+
+        //IEnumerable<TKey> IReadOnlyDictionary<TKey, TValue>.Keys => Keys;
+
+        public ValueCollection Values => _values ??= new ValueCollection(this);
+        public TValue this[TKey key]
+        {
+            get
+            {
+                ref TValue value = ref FindValue(key);
+                if (!Unsafe.IsNullRef(ref value))
+                {
+                    return value;
+                }
+
+                throw new KeyNotFoundException();
+                return default;
+            }
+            set
+            {
+                bool modified = TryInsert(key, value, InsertionBehavior.OverwriteExisting);
+            }
+        }
+
+        public void Add(TKey key, TValue value)
+        {
+            bool modified = TryInsert(key, value, InsertionBehavior.ThrowOnExisting);
+        }
+
+        public void Clear()
+        {
+            int count = _count;
+            if (count > 0)
+            {
+
+                Array.Clear(_buckets);
+
+                _count = 0;
+                _freeList = -1;
+                _freeCount = 0;
+                Array.Clear(_entries, 0, count);
+            }
+        }
+
+        public bool ContainsKey(TKey key) =>
+            !System.Runtime.CompilerServices.Unsafe.IsNullRef(ref FindValue(key));
+
+        public bool ContainsValue(TValue value)
+        {
+            Entry[]? entries = _entries;
+            if (value == null)
+            {
+                for (int i = 0; i < _count; i++)
+                {
+                    if (entries![i].next >= -1 && entries[i].value == null)
+                    {
+                        return true;
+                    }
+                }
+            }
+            else if (typeof(TValue).IsValueType)
+            {
+                for (int i = 0; i < _count; i++)
+                {
+                    if (entries![i].next >= -1 && EqualityComparer<TValue>.Default.Equals(entries[i].value, value))
+                    {
+                        return true;
+                    }
+                }
+            }
+            else
+            {
+                EqualityComparer<TValue> defaultComparer = EqualityComparer<TValue>.Default;
+                for (int i = 0; i < _count; i++)
+                {
+                    if (entries![i].next >= -1 && defaultComparer.Equals(entries[i].value, value))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private void CopyTo(KeyValuePair<TKey, TValue>[] array, int index)
+        {
+            if (array == null)
+            {
+                throw new ArgumentNullException();
+            }
+
+            if ((uint)index > (uint)array.Length)
+            {
+                throw new IndexOutOfRangeException();
+            }
+
+            if (array.Length - index < Count)
+            {
+                throw new ArgumentException();
+            }
+
+            int count = _count;
+            Entry[]? entries = _entries;
+            for (int i = 0; i < count; i++)
+            {
+                if (entries![i].next >= -1)
+                {
+                    array[index++] = new KeyValuePair<TKey, TValue>(entries[i].key, entries[i].value);
+                }
+            }
+        }
+
+        public Enumerator GetEnumerator() => new Enumerator(this, Enumerator.KeyValuePair);
+
+        internal ref TValue FindValue(TKey key)
+        {
+            if (key == null)
+            {
+                throw new ArgumentNullException();
+            }
+
+            ref Entry entry = ref Unsafe.NullRef<Entry>();
+            if (_buckets != null)
+            {
+                IEqualityComparer<TKey>? comparer = _comparer;
+                if (typeof(TKey).IsValueType && // comparer can only be null for value types
+                    comparer == null)
+                {
+                    uint hashCode = (uint)EqualityComparer<TKey>.Default.GetHashCode(key);
+                    int i = GetBucket(hashCode);
+                    Entry[]? entries = _entries;
+                    uint collisionCount = 0;
+
+                    // ValueType: Devirtualize with EqualityComparer<TKey>.Default intrinsic
+                    i--; // Value in _buckets is 1-based; subtract 1 from i. We do it here so it fuses with the following conditional.
+                    do
+                    {
+                        // Test in if to drop range check for following array access
+                        if ((uint)i >= (uint)entries.Length)
+                        {
+                            goto ReturnNotFound;
+                        }
+
+                        entry = ref entries[i];
+                        if (entry.hashCode == hashCode && EqualityComparer<TKey>.Default.Equals(entry.key, key))
+                        {
+                            goto ReturnFound;
+                        }
+
+                        i = entry.next;
+
+                        collisionCount++;
+                    } while (collisionCount <= (uint)entries.Length);
+
+                    // The chain of entries forms a loop; which means a concurrent update has happened.
+                    // Break out of the loop and throw, rather than looping forever.
+                    goto ConcurrentOperation;
+                }
+                else
+                {
+                    uint hashCode = (uint)comparer.GetHashCode(key);
+                    int i = GetBucket(hashCode);
+                    Entry[]? entries = _entries;
+                    uint collisionCount = 0;
+                    i--; // Value in _buckets is 1-based; subtract 1 from i. We do it here so it fuses with the following conditional.
+                    do
+                    {
+                        // Test in if to drop range check for following array access
+                        if ((uint)i >= (uint)entries.Length)
+                        {
+                            goto ReturnNotFound;
+                        }
+
+                        entry = ref entries[i];
+                        if (entry.hashCode == hashCode && comparer.Equals(entry.key, key))
+                        {
+                            goto ReturnFound;
+                        }
+
+                        i = entry.next;
+
+                        collisionCount++;
+                    } while (collisionCount <= (uint)entries.Length);
+
+                    // The chain of entries forms a loop; which means a concurrent update has happened.
+                    // Break out of the loop and throw, rather than looping forever.
+                    goto ConcurrentOperation;
+                }
+            }
+
+            goto ReturnNotFound;
+
+        ConcurrentOperation:
+            throw new InvalidOperationException();
+        ReturnFound:
+            ref TValue value = ref entry.value;
+        Return:
+            return ref value;
+        ReturnNotFound:
+            value = ref Unsafe.NullRef<TValue>();
+            goto Return;
         }
 
         private int Initialize(int capacity)
@@ -944,23 +1579,201 @@ namespace System.Collections.Generic
             return size;
         }
 
-        public int Count => _count - _freeCount;
+        private bool TryInsert(TKey key, TValue value, InsertionBehavior behavior)
+        {
+            if (key == null)
+            {
+                throw new ArgumentNullException();
+            }
 
-        /// <summary>
-        /// Gets the total numbers of elements the internal data structure can hold without resizing.
-        /// </summary>
-        public int Capacity => _entries?.Length ?? 0;
-        public KeyCollection Keys => _keys ??= new KeyCollection(this);
+            if (_buckets == null)
+            {
+                Initialize(0);
+            }
 
-        //ICollection<TKey> IDictionary<TKey, TValue>.Keys => Keys;
+            Entry[]? entries = _entries;
+            IEqualityComparer<TKey>? comparer = _comparer;
+            uint hashCode = (uint)((typeof(TKey).IsValueType && comparer == null) ? key.GetHashCode() : comparer!.GetHashCode(key));
 
-        //IEnumerable<TKey> IReadOnlyDictionary<TKey, TValue>.Keys => Keys;
+            uint collisionCount = 0;
+            ref int bucket = ref GetBucket(hashCode);
+            int i = bucket - 1; // Value in _buckets is 1-based
 
-        public ValueCollection Values => _values ??= new ValueCollection(this);
+            if (typeof(TKey).IsValueType && // comparer can only be null for value types
+                comparer == null)
+            {
+                while ((uint)i < (uint)entries.Length)
+                {
+                    if (entries[i].hashCode == hashCode && EqualityComparer<TKey>.Default.Equals(entries[i].key, key))
+                    {
+                        if (behavior == InsertionBehavior.OverwriteExisting)
+                        {
+                            entries[i].value = value;
+                            return true;
+                        }
 
-        //ICollection<TValue> IDictionary<TKey, TValue>.Values => Values;
+                        if (behavior == InsertionBehavior.ThrowOnExisting)
+                        {
+                            throw new ArgumentException();
+                        }
 
-        //IEnumerable<TValue> IReadOnlyDictionary<TKey, TValue>.Values => Values;
+                        return false;
+                    }
+
+                    i = entries[i].next;
+
+                    collisionCount++;
+                    if (collisionCount > (uint)entries.Length)
+                    {
+                        // The chain of entries forms a loop; which means a concurrent update has happened.
+                        // Break out of the loop and throw, rather than looping forever.
+                        throw new InvalidOperationException();
+                    }
+                }
+            }
+            else
+            {
+                while ((uint)i < (uint)entries.Length)
+                {
+                    if (entries[i].hashCode == hashCode && comparer.Equals(entries[i].key, key))
+                    {
+                        if (behavior == InsertionBehavior.OverwriteExisting)
+                        {
+                            entries[i].value = value;
+                            return true;
+                        }
+
+                        if (behavior == InsertionBehavior.ThrowOnExisting)
+                        {
+                            throw new ArgumentException();
+                        }
+
+                        return false;
+                    }
+
+                    i = entries[i].next;
+
+                    collisionCount++;
+                    if (collisionCount > (uint)entries.Length)
+                    {
+                        // The chain of entries forms a loop; which means a concurrent update has happened.
+                        // Break out of the loop and throw, rather than looping forever.
+                        throw new InvalidOperationException();
+                    }
+                }
+            }
+
+            int index;
+            if (_freeCount > 0)
+            {
+                index = _freeList;
+                _freeList = StartOfFreeList - entries[_freeList].next;
+                _freeCount--;
+            }
+            else
+            {
+                int count = _count;
+                if (count == entries.Length)
+                {
+                    Resize();
+                    bucket = ref GetBucket(hashCode);
+                }
+                index = count;
+                _count = count + 1;
+                entries = _entries;
+            }
+
+            ref Entry entry = ref entries![index];
+            entry.hashCode = hashCode;
+            entry.next = bucket - 1; // Value in _buckets is 1-based
+            entry.key = key;
+            entry.value = value;
+            bucket = index + 1; // Value in _buckets is 1-based
+            _version++;
+
+            // Value types never rehash
+            if (!typeof(TKey).IsValueType && collisionCount > HashHelpers.HashCollisionThreshold && comparer is NonRandomizedStringEqualityComparer)
+            {
+                // If we hit the collision threshold we'll need to switch to the comparer which is using randomized string hashing
+                // i.e. EqualityComparer<string>.Default.
+                Resize(entries.Length, true);
+            }
+
+            return true;
+        }
+
+        private void CopyEntries(Entry[] entries, int count)
+        {
+            Entry[] newEntries = _entries;
+            int newCount = 0;
+            for (int i = 0; i < count; i++)
+            {
+                uint hashCode = entries[i].hashCode;
+                if (entries[i].next >= -1)
+                {
+                    ref Entry entry = ref newEntries[newCount];
+                    entry = entries[i];
+                    ref int bucket = ref GetBucket(hashCode);
+                    entry.next = bucket - 1; // Value in _buckets is 1-based
+                    bucket = newCount + 1;
+                    newCount++;
+                }
+            }
+
+            _count = newCount;
+            _freeCount = 0;
+        }
+
+        private void Resize() => Resize(HashHelpers.ExpandPrime(_count), false);
+
+        private void Resize(int newSize, bool forceNewHashCodes)
+        {
+            Entry[] entries = new Entry[newSize];
+
+            int count = _count;
+            Array.Copy(_entries, entries, count);
+
+            if (!typeof(TKey).IsValueType && forceNewHashCodes)
+            {
+                IEqualityComparer<TKey> comparer = _comparer = (IEqualityComparer<TKey>)((NonRandomizedStringEqualityComparer)_comparer).GetRandomizedEqualityComparer();
+
+                for (int i = 0; i < count; i++)
+                {
+                    if (entries[i].next >= -1)
+                    {
+                        entries[i].hashCode = (uint)comparer.GetHashCode(entries[i].key);
+                    }
+                }
+            }
+
+            // Assign member variables after both arrays allocated to guard against corruption from OOM if second fails
+            _buckets = new int[newSize];
+#if TARGET_64BIT
+            _fastModMultiplier = HashHelpers.GetFastModMultiplier((uint)newSize);
+#endif
+            for (int i = 0; i < count; i++)
+            {
+                if (entries[i].next >= -1)
+                {
+                    ref int bucket = ref GetBucket(entries[i].hashCode);
+                    entries[i].next = bucket - 1; // Value in _buckets is 1-based
+                    bucket = i + 1;
+                }
+            }
+
+            _entries = entries;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private ref int GetBucket(uint hashCode)
+        {
+            int[] buckets = _buckets!;
+#if TARGET_64BIT
+            return ref buckets[HashHelpers.FastMod(hashCode, (uint)buckets.Length, _fastModMultiplier)];
+#else
+            return ref buckets[(uint)hashCode % buckets.Length];
+#endif
+        }
 
         private struct Entry
         {
@@ -973,6 +1786,123 @@ namespace System.Collections.Generic
             public int next;
             public TKey key;     // Key of entry
             public TValue value; // Value of entry
+        }
+        public struct Enumerator : IEnumerator<KeyValuePair<TKey, TValue>>, IDictionaryEnumerator
+        {
+            private readonly Dictionary<TKey, TValue> _dictionary;
+            private readonly int _version;
+            private int _index;
+            private KeyValuePair<TKey, TValue> _current;
+            private readonly int _getEnumeratorRetType;  // What should Enumerator.Current return?
+
+            internal const int DictEntry = 1;
+            internal const int KeyValuePair = 2;
+
+            internal Enumerator(Dictionary<TKey, TValue> dictionary, int getEnumeratorRetType)
+            {
+                _dictionary = dictionary;
+                _version = dictionary._version;
+                _index = 0;
+                _getEnumeratorRetType = getEnumeratorRetType;
+                _current = default;
+            }
+
+            public bool MoveNext()
+            {
+                if (_version != _dictionary._version)
+                {
+                    throw new InvalidOperationException();
+                }
+
+                // Use unsigned comparison since we set index to dictionary.count+1 when the enumeration ends.
+                // dictionary.count+1 could be negative if dictionary.count is int.MaxValue
+                while ((uint)_index < (uint)_dictionary._count)
+                {
+                    ref Entry entry = ref _dictionary._entries![_index++];
+
+                    if (entry.next >= -1)
+                    {
+                        _current = new KeyValuePair<TKey, TValue>(entry.key, entry.value);
+                        return true;
+                    }
+                }
+
+                _index = _dictionary._count + 1;
+                _current = default;
+                return false;
+            }
+
+            public KeyValuePair<TKey, TValue> Current => _current;
+
+            public void Dispose() { }
+
+            object? IEnumerator.Current
+            {
+                get
+                {
+                    if (_index == 0 || (_index == _dictionary._count + 1))
+                    {
+                        throw new InvalidOperationException();
+                    }
+
+                    if (_getEnumeratorRetType == DictEntry)
+                    {
+                        return new DictionaryEntry(_current.Key, _current.Value);
+                    }
+
+                    return new KeyValuePair<TKey, TValue>(_current.Key, _current.Value);
+                }
+            }
+
+            void IEnumerator.Reset()
+            {
+                if (_version != _dictionary._version)
+                {
+                    throw new InvalidOperationException();
+                }
+
+                _index = 0;
+                _current = default;
+            }
+
+            DictionaryEntry IDictionaryEnumerator.Entry
+            {
+                get
+                {
+                    if (_index == 0 || (_index == _dictionary._count + 1))
+                    {
+                        throw new InvalidOperationException();
+                    }
+
+                    return new DictionaryEntry(_current.Key, _current.Value);
+                }
+            }
+
+            object IDictionaryEnumerator.Key
+            {
+                get
+                {
+                    if (_index == 0 || (_index == _dictionary._count + 1))
+                    {
+                        throw new InvalidOperationException();
+                    }
+
+                    return _current.Key;
+                }
+            }
+
+            object? IDictionaryEnumerator.Value
+            {
+                get
+                {
+                    if (_index == 0 || (_index == _dictionary._count + 1))
+                    {
+                        throw new InvalidOperationException();
+                    }
+
+                    return _current.Value;
+                }
+            }
         }
         public sealed class KeyCollection
         {

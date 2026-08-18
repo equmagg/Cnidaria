@@ -455,17 +455,23 @@ namespace Cnidaria.Cs
         public override BoundNodeKind Kind => BoundNodeKind.SpanCollection;
         public TypeSymbol ElementType { get; }
         public ImmutableArray<BoundExpression> Elements { get; }
+        public bool IsUtf8Encoded { get; }
+        public bool NeedsUtf8NullTerminator { get; }
 
         public BoundSpanCollectionExpression(
-            CollectionExpressionSyntax syntax,
+            SyntaxNode syntax,
             NamedTypeSymbol spanType,
             TypeSymbol elementType,
-            ImmutableArray<BoundExpression> elements)
+            ImmutableArray<BoundExpression> elements,
+            bool isUtf8Encoded = false,
+            bool needsUtf8NullTerminator = false)
             : base(syntax)
         {
             Type = spanType;
             ElementType = elementType;
             Elements = elements.IsDefault ? ImmutableArray<BoundExpression>.Empty : elements;
+            IsUtf8Encoded = isUtf8Encoded;
+            NeedsUtf8NullTerminator = needsUtf8NullTerminator;
             ConstantValueOpt = Optional<object>.None;
 
             for (int i = 0; i < Elements.Length; i++)
@@ -1221,6 +1227,25 @@ namespace Cnidaria.Cs
                 if (Declarations[i].HasErrors)
                     HasErrors = true;
             }
+        }
+    }
+    /// <summary>Represents a lock statement</summary>
+    internal sealed class BoundLockStatement : BoundStatement
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.LockStatement;
+        public BoundExpression Expression { get; }
+        public BoundStatement Body { get; }
+
+        public BoundLockStatement(
+            LockStatementSyntax syntax,
+            BoundExpression expression,
+            BoundStatement body,
+            bool hasErrors = false)
+            : base(syntax)
+        {
+            Expression = expression;
+            Body = body;
+            HasErrors = hasErrors || expression.HasErrors || body.HasErrors;
         }
     }
     /// <summary>Represents a statement with no runtime effect</summary>

@@ -370,6 +370,7 @@ namespace Cnidaria.Cs
             public override Symbol? ContainingSymbol { get; }
             public override ImmutableArray<Location> Locations { get; }
             public override TypeSymbol ReturnType { get; }
+            public override bool ReturnsByRefReadonly { get; }
             private ImmutableArray<ParameterSymbol> _parameters;
             public override ImmutableArray<ParameterSymbol> Parameters => _parameters.IsDefault ? ImmutableArray<ParameterSymbol>.Empty : _parameters;
             public override ImmutableArray<TypeParameterSymbol> TypeParameters => ImmutableArray<TypeParameterSymbol>.Empty;
@@ -386,11 +387,13 @@ namespace Cnidaria.Cs
                 ImmutableArray<ParameterSymbol> parameters,
                 ImmutableArray<Location> locations,
                 bool isStatic,
-                bool isAsync)
+                bool isAsync,
+                bool returnsByRefReadonly = false)
             {
                 Name = name;
                 ContainingSymbol = containing;
                 ReturnType = returnType;
+                ReturnsByRefReadonly = returnsByRefReadonly;
                 _parameters = parameters.IsDefault ? ImmutableArray<ParameterSymbol>.Empty : parameters;
                 Locations = locations.IsDefault ? ImmutableArray<Location>.Empty : locations;
                 IsStatic = isStatic;
@@ -606,6 +609,10 @@ namespace Cnidaria.Cs
                     result = BindUsingStatement(us, context, diagnostics);
                     break;
 
+                case LockStatementSyntax ls:
+                    result = BindLockStatement(ls, context, diagnostics);
+                    break;
+
                 case ReturnStatementSyntax rs:
                     result = BindReturn(rs, context, diagnostics);
                     break;
@@ -699,6 +706,9 @@ namespace Cnidaria.Cs
                     break;
                 case IdentifierNameSyntax id:
                     result = BindIdentifier(id, context, diagnostics);
+                    break;
+                case FieldExpressionSyntax field:
+                    result = BindFieldExpression(field, context, diagnostics);
                     break;
                 case GenericNameSyntax g:
                     result = BindGenericMethodGroup(g, context, diagnostics);

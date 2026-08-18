@@ -1218,17 +1218,88 @@ namespace Cnidaria.RiscV
                     case 0x2F: // AMO
                         {
                             uint funct3 = instruction & Funct3Mask;
-                            int size = funct3 == 0x2000U ? 4 : funct3 == 0x3000U ? 8 : 0;
+                            int size = funct3 == 0x2000U ? 4 : funct3 == 0x3000U ? 8 : funct3 == 0x4000U ? 16 : 0;
                             if (size == 0)
                             {
                                 trapped = true;
                                 break;
                             }
                             ulong address = _x[(int)((instruction >> 15) & 31)];
+                            uint op = instruction & 0xF8000000U;
                             if ((address & (ulong)(size - 1)) != 0)
                             {
-                                trapCause = (ulong)RVTrapCause.LoadAddressMisaligned;
+                                trapCause = op == 0x10000000U
+                                    ? (ulong)RVTrapCause.LoadAddressMisaligned
+                                    : (ulong)RVTrapCause.StoreAddressMisaligned;
                                 trapValue = address;
+                                trapped = true;
+                                break;
+                            }
+
+                            int rs2 = (int)((instruction >> 20) & 31);
+
+                            if (op == 0x28000000U)
+                            {
+                                if (size == 16)
+                                {
+                                    if ((rd & 1) != 0 || (rs2 & 1) != 0)
+                                    {
+                                        trapped = true;
+                                        break;
+                                    }
+                                    if (!TryTranslate(address, RVMemoryAccess.Store, out _, out trapCause, out trapValue) ||
+                                        !TryTranslate(address + 8, RVMemoryAccess.Store, out _, out trapCause, out trapValue) ||
+                                        !TryReadMemory(address, 8, RVMemoryAccess.Load, out ulong oldLo, out trapCause, out trapValue) ||
+                                        !TryReadMemory(address + 8, 8, RVMemoryAccess.Load, out ulong oldHi, out trapCause, out trapValue))
+                                    {
+                                        trapped = true;
+                                        break;
+                                    }
+
+                                    ulong expectedLo = rd == 0 ? 0UL : _x[rd];
+                                    ulong expectedHi = rd == 0 ? 0UL : _x[rd + 1];
+                                    ulong desiredLo = rs2 == 0 ? 0UL : _x[rs2];
+                                    ulong desiredHi = rs2 == 0 ? 0UL : _x[rs2 + 1];
+                                    if (oldLo == expectedLo && oldHi == expectedHi)
+                                    {
+                                        if (!TryWriteMemory(address, 8, desiredLo, out trapCause, out trapValue) ||
+                                            !TryWriteMemory(address + 8, 8, desiredHi, out trapCause, out trapValue))
+                                        {
+                                            trapped = true;
+                                            break;
+                                        }
+                                    }
+
+                                    if (rd != 0)
+                                    {
+                                        _x[rd] = oldLo;
+                                        _x[rd + 1] = oldHi;
+                                    }
+                                    break;
+                                }
+
+                                if (!TryTranslate(address, RVMemoryAccess.Store, out _, out trapCause, out trapValue) ||
+                                    !TryReadMemory(address, size, RVMemoryAccess.Load, out ulong casOld, out trapCause, out trapValue))
+                                {
+                                    trapped = true;
+                                    break;
+                                }
+
+                                ulong expected = size == 4 ? (uint)_x[rd] : _x[rd];
+                                ulong desired = size == 4 ? (uint)_x[rs2] : _x[rs2];
+                                ulong observed = size == 4 ? (uint)casOld : casOld;
+                                if (observed == expected && !TryWriteMemory(address, size, desired, out trapCause, out trapValue))
+                                {
+                                    trapped = true;
+                                    break;
+                                }
+                                if (rd != 0)
+                                    _x[rd] = size == 4 ? SignExtend32((uint)casOld) : casOld;
+                                break;
+                            }
+
+                            if (size == 16)
+                            {
                                 trapped = true;
                                 break;
                             }
@@ -1238,7 +1309,6 @@ namespace Cnidaria.RiscV
                                 break;
                             }
 
-                            uint op = instruction & 0xF8000000U;
                             if (op == 0x10000000U)
                             {
                                 if (rd != 0)
@@ -1248,7 +1318,6 @@ namespace Cnidaria.RiscV
                                 break;
                             }
 
-                            int rs2 = (int)((instruction >> 20) & 31);
                             ulong result;
                             if (op == 0x18000000U)
                             {
@@ -3093,7 +3162,7 @@ namespace Cnidaria.RiscV
                 {
                     result = System.Numerics.BitOperations.RotateRight(source, immediate & 63); return true;
                 }
-                if(funct6 == 0x48000000U)
+                if (funct6 == 0x48000000U)
                 {
                     result = (source >> immediate & 63) & 1UL; return true;
                 }
@@ -3178,7 +3247,7 @@ namespace Cnidaria.RiscV
             result = 0;
             return false;
         }
-        
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static ulong OrCombineBytes(ulong value)
         {

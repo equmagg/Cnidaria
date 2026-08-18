@@ -68,6 +68,8 @@ namespace Cnidaria.Cs
                         new Location(context.SemanticModel.SyntaxTree, v.Span)));
                 }
 
+                scope.ReportFieldKeywordDeclaration(v.Identifier, context, diagnostics);
+
                 if (v.Initializer is null)
                 {
                     diagnostics.Add(new Diagnostic(
@@ -404,8 +406,22 @@ namespace Cnidaria.Cs
         private BoundExpression BindIsPatternExpression(IsPatternExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
             var operand = BindExpression(node.Expression, context, diagnostics);
-            if (operand.HasErrors)
-                return new BoundBadExpression(node);
+
+            if (node.Pattern is TypePatternSyntax typePattern)
+            {
+                var patternType = BindType(typePattern.Type, context, diagnostics);
+                return BindIsTypePattern(
+                    node,
+                    operand,
+                    patternType,
+                    declaredLocalOpt: null,
+                    isDiscard: false,
+                    patternTypeSyntax: typePattern.Type,
+                    diagnosticNode: typePattern,
+                    requirePatternCompatibility: false,
+                    context,
+                    diagnostics);
+            }    
 
             if (PatternInputMayBeTestedMoreThanOnce(node.Pattern) &&
                 operand.Type is not NullTypeSymbol &&
@@ -483,7 +499,9 @@ namespace Cnidaria.Cs
                             patternType,
                             declaredLocalOpt: null,
                             isDiscard: false,
+                            patternTypeSyntax: typePattern.Type,
                             diagnosticNode: typePattern,
+                            requirePatternCompatibility: true,
                             context,
                             diagnostics);
                     }
@@ -511,7 +529,9 @@ namespace Cnidaria.Cs
                             patternType,
                             local,
                             isDiscard,
+                            declPattern.Type,
                             declPattern,
+                            requirePatternCompatibility: true,
                             context,
                             diagnostics);
                     }
@@ -521,6 +541,14 @@ namespace Cnidaria.Cs
                         wholeSyntax,
                         operand,
                         constantPattern,
+                        context,
+                        diagnostics);
+
+                case RelationalPatternSyntax relationalPattern:
+                    return BindRelationalPattern(
+                        wholeSyntax,
+                        operand,
+                        relationalPattern,
                         context,
                         diagnostics);
 
@@ -600,6 +628,43 @@ namespace Cnidaria.Cs
                     new Location(context.SemanticModel.SyntaxTree, pattern.Span)));
                     return new BoundBadExpression(wholeSyntax);
             }
+        }
+        private BoundExpression BindRelationalPattern(
+            SyntaxNode wholeSyntax,
+            BoundExpression operand,
+            RelationalPatternSyntax pattern,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var constant = BindExpression(pattern.Expression, context, diagnostics);
+            if (constant.HasErrors)
+                return new BoundBadExpression(wholeSyntax);
+
+            if (!constant.ConstantValueOpt.HasValue)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PAT_REL001",
+                    DiagnosticSeverity.Error,
+                    "Relational pattern expression must be a compile-time constant.",
+                    new Location(context.SemanticModel.SyntaxTree, pattern.Expression.Span)));
+                return new BoundBadExpression(wholeSyntax);
+            }
+
+            var kind = pattern.OperatorToken.Kind switch
+            {
+                SyntaxKind.LessThanToken => SyntaxKind.LessThanExpression,
+                SyntaxKind.LessThanEqualsToken => SyntaxKind.LessThanOrEqualExpression,
+                SyntaxKind.GreaterThanToken => SyntaxKind.GreaterThanExpression,
+                SyntaxKind.GreaterThanEqualsToken => SyntaxKind.GreaterThanOrEqualExpression,
+                _ => SyntaxKind.None
+            };
+
+            if (kind == SyntaxKind.None)
+                return new BoundBadExpression(wholeSyntax);
+
+            var leftSyntax = operand.Syntax as ExpressionSyntax ?? pattern.Expression;
+            var binary = new BinaryExpressionSyntax(kind, leftSyntax, pattern.OperatorToken, pattern.Expression);
+            return BindRelationalBinary(binary, operand, constant, context, diagnostics);
         }
         private BoundExpression BindConstantPatternInIs(
             SyntaxNode wholeSyntax,
@@ -805,6 +870,7 @@ namespace Cnidaria.Cs
 
                 case SingleVariableDesignationSyntax single:
                     {
+                        ReportFieldKeywordDeclaration(single.Identifier, context, diagnostics);
                         var name = single.Identifier.ValueText ?? string.Empty;
                         if (name.Length == 0)
                         {
@@ -853,7 +919,9 @@ namespace Cnidaria.Cs
             TypeSymbol patternType,
             LocalSymbol? declaredLocalOpt,
             bool isDiscard,
+            TypeSyntax patternTypeSyntax,
             SyntaxNode diagnosticNode,
+            bool requirePatternCompatibility,
             BindingContext context,
             DiagnosticBag diagnostics)
         {
@@ -870,38 +938,47 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(wholeSyntax);
             }
 
-            if (patternType is PointerTypeSymbol or FunctionPointerTypeSymbol)
+            if (patternTypeSyntax is NullableTypeSyntax || TryGetSystemNullableInfo(patternType, out _, out _))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PAT_IS013",
+                    DiagnosticSeverity.Error,
+                    "Pattern type cannot be nullable.",
+                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                return new BoundBadExpression(wholeSyntax);
+            }
+
+            if (operand.HasErrors)
+            {
+                return new BoundIsPatternExpression(
+                    syntax: wholeSyntax,
+                    operand: operand,
+                    boolType: context.Compilation.GetSpecialType(SpecialType.System_Boolean),
+                    patternKind: BoundIsPatternKind.Type,
+                    patternTypeOpt: patternType,
+                    declaredLocalOpt: declaredLocalOpt,
+                    isDiscard: isDiscard);
+            }
+
+            if (operand.Type is PointerTypeSymbol or FunctionPointerTypeSymbol or ByRefTypeSymbol ||
+                patternType is PointerTypeSymbol or FunctionPointerTypeSymbol or ByRefTypeSymbol)
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_PAT_IS008",
                     DiagnosticSeverity.Error,
-                    "Pattern type cannot be a pointer or function pointer type.",
+                    "Pattern matching cannot be applied to pointer, function pointer, or by-reference types.",
                     new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
                 return new BoundBadExpression(wholeSyntax);
             }
 
-            if (patternType.IsRefLikeType)
-            {
-                diagnostics.Add(new Diagnostic(
-                    "CN_PAT_IS009",
-                    DiagnosticSeverity.Error,
-                    "Pattern matching against ref-like types is not supported.",
-                    new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
-                return new BoundBadExpression(wholeSyntax);
-            }
-
-            if (!(ClassifyConversion(operand, patternType, context).Kind is ConversionKind.Identity
-                or ConversionKind.ImplicitReference
-                or ConversionKind.ExplicitReference
-                or ConversionKind.Boxing
-                or ConversionKind.Unboxing
-                or ConversionKind.NullLiteral))
+            if (requirePatternCompatibility && !IsTypePatternCompatible(operand, patternType))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_PAT_IS010",
-                    DiagnosticSeverity.Warning,
-                    $"Expression of type '{operand.Type.Name}' is never of type '{patternType.Name}'.",
+                    DiagnosticSeverity.Error,
+                    $"An expression of type '{operand.Type.Name}' cannot be handled by a pattern of type '{patternType.Name}'.",
                     new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                return new BoundBadExpression(wholeSyntax);
             }
 
             var boolType = context.Compilation.GetSpecialType(SpecialType.System_Boolean);
@@ -914,6 +991,101 @@ namespace Cnidaria.Cs
                 declaredLocalOpt: declaredLocalOpt,
                 isDiscard: isDiscard);
 
+        }
+
+        private static bool IsTypePatternCompatible(BoundExpression operand, TypeSymbol patternType)
+        {
+            var inputType = operand.Type;
+
+            if (AreSameType(inputType, patternType))
+                return true;
+
+            if (MayBeRefLikePatternType(inputType) || MayBeRefLikePatternType(patternType))
+                return false;
+
+            if (ContainsTypeParameter(inputType) || ContainsTypeParameter(patternType))
+                return true;
+
+            var conversion = ClassifyConversion(operand, patternType);
+            if (IsPatternCompatibilityConversion(conversion.Kind))
+                return true;
+
+            if (TryGetSystemNullableInfo(inputType, out _, out var underlyingInput))
+            {
+                var underlyingOperand = new BoundTypeOnlyExpression((ExpressionSyntax)operand.Syntax, underlyingInput);
+                return IsPatternCompatibilityConversion(ClassifyConversion(underlyingOperand, patternType).Kind);
+            }
+
+            return false;
+        }
+
+        private static bool IsPatternCompatibilityConversion(ConversionKind kind)
+            => kind is ConversionKind.Identity
+                or ConversionKind.ImplicitReference
+                or ConversionKind.ExplicitReference
+                or ConversionKind.Boxing
+                or ConversionKind.Unboxing
+                or ConversionKind.NullLiteral
+                or ConversionKind.ImplicitNullable
+                or ConversionKind.ExplicitNullable;
+
+        private static bool MayBeRefLikePatternType(TypeSymbol type)
+            => type.IsRefLikeType ||
+               type is TypeParameterSymbol tp &&
+               (tp.GenericConstraint & GenericConstraintsFlags.AllowsRefStruct) != 0;
+
+        private static bool ContainsTypeParameter(TypeSymbol type)
+        {
+            switch (type)
+            {
+                case TypeParameterSymbol:
+                    return true;
+
+                case ArrayTypeSymbol array:
+                    return ContainsTypeParameter(array.ElementType);
+
+                case PointerTypeSymbol pointer:
+                    return ContainsTypeParameter(pointer.PointedAtType);
+
+                case ByRefTypeSymbol byRef:
+                    return ContainsTypeParameter(byRef.ElementType);
+
+                case FunctionPointerTypeSymbol functionPointer:
+                    if (ContainsTypeParameter(functionPointer.ReturnType))
+                        return true;
+                    for (int i = 0; i < functionPointer.Parameters.Length; i++)
+                    {
+                        if (ContainsTypeParameter(functionPointer.Parameters[i].Type))
+                            return true;
+                    }
+                    return false;
+
+                case TupleTypeSymbol tuple:
+                    for (int i = 0; i < tuple.ElementTypes.Length; i++)
+                    {
+                        if (ContainsTypeParameter(tuple.ElementTypes[i]))
+                            return true;
+                    }
+                    return false;
+
+                case NamedTypeSymbol named:
+                    if (named.ContainingSymbol is NamedTypeSymbol containingType &&
+                        ContainsTypeParameter(containingType))
+                    {
+                        return true;
+                    }
+
+                    var typeArguments = named.TypeArguments;
+                    for (int i = 0; i < typeArguments.Length; i++)
+                    {
+                        if (ContainsTypeParameter(typeArguments[i]))
+                            return true;
+                    }
+                    return false;
+
+                default:
+                    return false;
+            }
         }
     }
 }

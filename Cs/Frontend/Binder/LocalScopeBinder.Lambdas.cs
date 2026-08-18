@@ -228,7 +228,11 @@ namespace Cnidaria.Cs
                     if (boundReturnType.Kind != SymbolKind.Error)
                     {
                         lambdaReturnType = boundReturnType;
-                        if (!AreSameType(boundReturnType, invoke.ReturnType))
+                        bool explicitReturnsByRefReadonly =
+                            explicitReturnType is RefTypeSyntax explicitRefReturn &&
+                            explicitRefReturn.ReadOnlyKeyword.Kind == SyntaxKind.ReadOnlyKeyword;
+                        if (!AreSameType(boundReturnType, invoke.ReturnType) ||
+                            explicitReturnsByRefReadonly != invoke.ReturnsByRefReadonly)
                         {
                             diagnostics.Add(new Diagnostic(
                                 "CN_LAMBDA008",
@@ -247,7 +251,8 @@ namespace Cnidaria.Cs
                 parameters: ImmutableArray<ParameterSymbol>.Empty,
                 locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, syntax.Span)),
                 isStatic: true,
-                isAsync: isAsync);
+                isAsync: isAsync,
+                returnsByRefReadonly: invoke.ReturnsByRefReadonly);
 
             if (syntax is LambdaExpressionSyntax lambdaSyntax)
             {
@@ -282,6 +287,8 @@ namespace Cnidaria.Cs
 
                 if (sourceParameter is not null)
                 {
+                    ReportFieldKeywordDeclaration(sourceParameter.Identifier, context, diagnostics);
+
                     if (!seenNames.Add(parameterName))
                     {
                         diagnostics.Add(new Diagnostic(
@@ -551,7 +558,8 @@ namespace Cnidaria.Cs
                 return false;
 
             if (method.ReturnType is ByRefTypeSymbol || invoke.ReturnType is ByRefTypeSymbol)
-                return AreSameType(method.ReturnType, invoke.ReturnType);
+                return AreSameType(method.ReturnType, invoke.ReturnType) &&
+                       method.ReturnsByRefReadonly == invoke.ReturnsByRefReadonly;
 
             var methodReturn = new BoundTypeOnlyExpression(syntax, method.ReturnType);
             var conversion = ClassifyConversion(methodReturn, invoke.ReturnType, context);
@@ -591,7 +599,8 @@ namespace Cnidaria.Cs
                 parameters: ImmutableArray<ParameterSymbol>.Empty,
                 locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, syntax.Span)),
                 isStatic: true,
-                isAsync: false);
+                isAsync: false,
+                returnsByRefReadonly: invoke.ReturnsByRefReadonly);
 
             var parameterBuilder = ImmutableArray.CreateBuilder<ParameterSymbol>(invoke.Parameters.Length);
             for (int i = 0; i < invoke.Parameters.Length; i++)

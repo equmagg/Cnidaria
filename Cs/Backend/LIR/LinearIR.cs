@@ -562,6 +562,9 @@ namespace Cnidaria.Cs
 
         public static bool IsAbiCall(GenTree source)
         {
+            if (source.Kind == GenTreeKind.Intrinsic)
+                return (RuntimeIntrinsics.GetFlags(source.IntrinsicId) & RuntimeIntrinsicFlags.UsesCallAbi) != 0;
+
             return source.Kind is
                 GenTreeKind.ClassInit or
                 GenTreeKind.Call or
@@ -639,10 +642,14 @@ namespace Cnidaria.Cs
             return false;
         }
 
-        public static bool IsGcSafePoint(GenTree source, int blockId = -1)
+        public bool IsGcSafePoint(GenTree source, int blockId = -1)
         {
             if (IsAbiCall(source))
+            {
+                if (source.Kind == GenTreeKind.Intrinsic && RuntimeIntrinsics.IsNoGcSafePoint(source.IntrinsicId))
+                    return false;
                 return true;
+            }
 
             if (source.Kind is
                 GenTreeKind.NewArray or

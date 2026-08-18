@@ -825,17 +825,20 @@ namespace Cnidaria.Cs
             bool srcIface = IsInterfaceType(source);
             bool dstIface = IsInterfaceType(destination);
 
+            if (srcIface && dstIface)
+                return true;
+
             if (!srcIface && dstIface)
             {
                 if (ImplementsInterface(source, destination))
                     return true;
 
-                return false;
+                return source is NamedTypeSymbol sourceType && !sourceType.IsSealed;
             }
             if (srcIface && !dstIface)
             {
-                if (destination is NamedTypeSymbol ntDest && ImplementsInterface(ntDest, source))
-                    return true;
+                if (destination is NamedTypeSymbol ntDest)
+                    return !ntDest.IsSealed || ImplementsInterface(ntDest, source);
 
                 return false;
             }

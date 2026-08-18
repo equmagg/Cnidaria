@@ -183,6 +183,9 @@ namespace Cnidaria.Cs
                 case BoundUsingStatement usingStatement:
                     return AnalyzeUsingCompletion(usingStatement);
 
+                case BoundLockStatement lockStatement:
+                    return AnalyzeCompletion(lockStatement.Body);
+
                 case BoundFixedStatement fixedStatement:
                     return AnalyzeCompletion(fixedStatement.Body);
 
@@ -496,6 +499,9 @@ namespace Cnidaria.Cs
 
                 case BoundUsingStatement usingStatement:
                     return ContainsYieldStatement(usingStatement.Body);
+
+                case BoundLockStatement lockStatement:
+                    return ContainsYieldStatement(lockStatement.Body);
 
                 case BoundFixedStatement fixedStatement:
                     return ContainsYieldStatement(fixedStatement.Body);

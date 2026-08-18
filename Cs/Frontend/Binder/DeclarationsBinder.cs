@@ -1629,6 +1629,9 @@ namespace Cnidaria.Cs
                 location: new Location(tree, syntax.Span),
                 declarationRef: new SyntaxReference(tree, syntax));
 
+            getMethod?.SetAssociatedProperty(prop);
+            setMethod?.SetAssociatedProperty(prop);
+
             // Property parameters
             var propParams = ImmutableArray.CreateBuilder<ParameterSymbol>(syntax.ParameterList.Parameters.Count);
             for (int i = 0; i < syntax.ParameterList.Parameters.Count; i++)
@@ -1829,6 +1832,9 @@ namespace Cnidaria.Cs
                 setMethod: setMethod,
                 location: new Location(tree, syntax.Span),
                 declarationRef: new SyntaxReference(tree, syntax));
+
+            getMethod?.SetAssociatedProperty(prop);
+            setMethod?.SetAssociatedProperty(prop);
 
             AddMemberToType(container, prop);
             RecordDeclared(tree, syntax, prop);

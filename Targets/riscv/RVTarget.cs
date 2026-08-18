@@ -279,6 +279,9 @@ namespace Cnidaria.RiscV
         H = 1UL << 8,
         Zicsr = 1UL << 16,
         Zifencei = 1UL << 17,
+        Zacas = 1UL << 18,
+        Zaamo = 1UL << 19,
+        Zalrsc = 1UL << 20,
         Privileged = 1UL << 32,
     }
 
@@ -482,6 +485,9 @@ namespace Cnidaria.RiscV
         AmoMaxD,
         AmoMinuD,
         AmoMaxuD,
+        AmocasW,
+        AmocasD,
+        AmocasQ,
         Fence,
         FenceI,
         Ecall,
@@ -947,6 +953,10 @@ namespace Cnidaria.RiscV
                 flags |= RVIsaFlags.M;
             if ((features & TargetArchitectureFeatures.RiscVA) != 0)
                 flags |= RVIsaFlags.A;
+            if ((features & TargetArchitectureFeatures.RiscVZaamo) != 0)
+                flags |= RVIsaFlags.Zaamo;
+            if ((features & TargetArchitectureFeatures.RiscVZalrsc) != 0)
+                flags |= RVIsaFlags.Zalrsc;
             if ((features & TargetArchitectureFeatures.RiscVF) != 0)
                 flags |= RVIsaFlags.F;
             if ((features & TargetArchitectureFeatures.RiscVD) != 0)
@@ -959,6 +969,8 @@ namespace Cnidaria.RiscV
                 flags |= RVIsaFlags.B;
             if ((features & TargetArchitectureFeatures.RiscVH) != 0)
                 flags |= RVIsaFlags.H;
+            if ((features & TargetArchitectureFeatures.RiscVZacas) != 0)
+                flags |= RVIsaFlags.Zacas;
             if ((features & TargetArchitectureFeatures.RiscVPrivileged) != 0)
                 flags |= RVIsaFlags.Privileged;
 
@@ -981,6 +993,10 @@ namespace Cnidaria.RiscV
                 flags |= RVIsaFlags.M;
             if ((features & TargetArchitectureFeatures.RiscVA) != 0)
                 flags |= RVIsaFlags.A;
+            if ((features & TargetArchitectureFeatures.RiscVZaamo) != 0)
+                flags |= RVIsaFlags.Zaamo;
+            if ((features & TargetArchitectureFeatures.RiscVZalrsc) != 0)
+                flags |= RVIsaFlags.Zalrsc;
             if ((features & TargetArchitectureFeatures.RiscVF) != 0)
                 flags |= RVIsaFlags.F;
             if ((features & TargetArchitectureFeatures.RiscVD) != 0)
@@ -993,6 +1009,8 @@ namespace Cnidaria.RiscV
                 flags |= RVIsaFlags.B;
             if ((features & TargetArchitectureFeatures.RiscVH) != 0)
                 flags |= RVIsaFlags.H;
+            if ((features & TargetArchitectureFeatures.RiscVZacas) != 0)
+                flags |= RVIsaFlags.Zacas;
             if ((features & TargetArchitectureFeatures.RiscVPrivileged) != 0)
                 flags |= RVIsaFlags.Privileged;
 
@@ -1020,6 +1038,9 @@ namespace Cnidaria.RiscV
         public bool HasH => Has(RVIsaFlags.H);
         public bool HasZicsr => Has(RVIsaFlags.Zicsr);
         public bool HasZifencei => Has(RVIsaFlags.Zifencei);
+        public bool HasZacas => Has(RVIsaFlags.Zacas);
+        public bool HasZaamo => Has(RVIsaFlags.Zaamo);
+        public bool HasZalrsc => Has(RVIsaFlags.Zalrsc);
         public bool HasPrivileged => Has(RVIsaFlags.Privileged);
 
         public RVTarget(int xlen, RVAbiKind abi, RVIsaFlags isa, TargetEndianness endianness = TargetEndianness.Little, OperatingSystemKind operatingSystem = OperatingSystemKind.None)
@@ -1032,6 +1053,11 @@ namespace Cnidaria.RiscV
                 throw new ArgumentException("LP64 ABI requires RV64", nameof(abi));
             if (xlen == 64 && abi is RVAbiKind.Ilp32 or RVAbiKind.Ilp32F or RVAbiKind.Ilp32D)
                 throw new ArgumentException("ILP32 ABI requires RV32", nameof(abi));
+
+            if ((isa & RVIsaFlags.A) != 0)
+                isa |= RVIsaFlags.Zaamo | RVIsaFlags.Zalrsc;
+            if ((isa & RVIsaFlags.Zacas) != 0)
+                isa |= RVIsaFlags.Zaamo;
 
             XLen = xlen;
             Abi = abi;
@@ -1065,6 +1091,12 @@ namespace Cnidaria.RiscV
                 suffix += "b";
             if (HasH)
                 suffix += "h";
+            if (HasZaamo && !HasA && !HasZacas)
+                suffix += "_zaamo";
+            if (HasZalrsc && !HasA)
+                suffix += "_zalrsc";
+            if (HasZacas)
+                suffix += "_zacas";
             return suffix;
         }
     }
@@ -1801,6 +1833,9 @@ namespace Cnidaria.RiscV
             RVInstrKind.AmoMaxD => "amomax.d",
             RVInstrKind.AmoMinuD => "amominu.d",
             RVInstrKind.AmoMaxuD => "amomaxu.d",
+            RVInstrKind.AmocasW => "amocas.w",
+            RVInstrKind.AmocasD => "amocas.d",
+            RVInstrKind.AmocasQ => "amocas.q",
             RVInstrKind.Fence => "fence",
             RVInstrKind.FenceI => "fence.i",
             RVInstrKind.Ecall => "ecall",
@@ -2218,8 +2253,8 @@ namespace Cnidaria.RiscV
             Add(map, RVInstrKind.Divuw, RVInstructionFormat.R, RVIsaFlags.M, true, 0x3B, 5, 0x01);
             Add(map, RVInstrKind.Remw, RVInstructionFormat.R, RVIsaFlags.M, true, 0x3B, 6, 0x01);
             Add(map, RVInstrKind.Remuw, RVInstructionFormat.R, RVIsaFlags.M, true, 0x3B, 7, 0x01);
-            AddAmo(map, RVInstrKind.LrW, false, 2, 0x02);
-            AddAmo(map, RVInstrKind.ScW, false, 2, 0x03);
+            AddAmo(map, RVInstrKind.LrW, false, 2, 0x02, RVIsaFlags.Zalrsc);
+            AddAmo(map, RVInstrKind.ScW, false, 2, 0x03, RVIsaFlags.Zalrsc);
             AddAmo(map, RVInstrKind.AmoSwapW, false, 2, 0x01);
             AddAmo(map, RVInstrKind.AmoAddW, false, 2, 0x00);
             AddAmo(map, RVInstrKind.AmoXorW, false, 2, 0x04);
@@ -2229,8 +2264,8 @@ namespace Cnidaria.RiscV
             AddAmo(map, RVInstrKind.AmoMaxW, false, 2, 0x14);
             AddAmo(map, RVInstrKind.AmoMinuW, false, 2, 0x18);
             AddAmo(map, RVInstrKind.AmoMaxuW, false, 2, 0x1C);
-            AddAmo(map, RVInstrKind.LrD, true, 3, 0x02);
-            AddAmo(map, RVInstrKind.ScD, true, 3, 0x03);
+            AddAmo(map, RVInstrKind.LrD, true, 3, 0x02, RVIsaFlags.Zalrsc);
+            AddAmo(map, RVInstrKind.ScD, true, 3, 0x03, RVIsaFlags.Zalrsc);
             AddAmo(map, RVInstrKind.AmoSwapD, true, 3, 0x01);
             AddAmo(map, RVInstrKind.AmoAddD, true, 3, 0x00);
             AddAmo(map, RVInstrKind.AmoXorD, true, 3, 0x04);
@@ -2240,6 +2275,9 @@ namespace Cnidaria.RiscV
             AddAmo(map, RVInstrKind.AmoMaxD, true, 3, 0x14);
             AddAmo(map, RVInstrKind.AmoMinuD, true, 3, 0x18);
             AddAmo(map, RVInstrKind.AmoMaxuD, true, 3, 0x1C);
+            AddAmo(map, RVInstrKind.AmocasW, false, 2, 0x05, RVIsaFlags.Zacas | RVIsaFlags.Zaamo);
+            AddAmo(map, RVInstrKind.AmocasD, false, 3, 0x05, RVIsaFlags.Zacas | RVIsaFlags.Zaamo);
+            AddAmo(map, RVInstrKind.AmocasQ, true, 4, 0x05, RVIsaFlags.Zacas | RVIsaFlags.Zaamo);
             Add(map, RVInstrKind.Fence, RVInstructionFormat.Fence, RVIsaFlags.I, false, 0x0F, 0, 0);
             Add(map, RVInstrKind.FenceI, RVInstructionFormat.System, RVIsaFlags.Zifencei, false, 0x0F, 1, 0);
             Add(map, RVInstrKind.Ecall, RVInstructionFormat.System, RVIsaFlags.I, false, 0x73, 0, 0);
@@ -2499,8 +2537,8 @@ namespace Cnidaria.RiscV
         private static void AddFloatR(Dictionary<RVInstrKind, RVInstructionMetadata> map, RVInstrKind opcode, RVIsaFlags requiredIsa, byte funct7)
             => Add(map, opcode, RVInstructionFormat.FloatRRR, requiredIsa, false, 0x53, 0, funct7);
 
-        private static void AddAmo(Dictionary<RVInstrKind, RVInstructionMetadata> map, RVInstrKind opcode, bool requires64Bit, byte funct3, byte funct5)
-            => Add(map, opcode, RVInstructionFormat.Amo, RVIsaFlags.A, requires64Bit, 0x2F, funct3, funct5);
+        private static void AddAmo(Dictionary<RVInstrKind, RVInstructionMetadata> map, RVInstrKind opcode, bool requires64Bit, byte funct3, byte funct5, RVIsaFlags requiredIsa = RVIsaFlags.Zaamo)
+            => Add(map, opcode, RVInstructionFormat.Amo, requiredIsa, requires64Bit, 0x2F, funct3, funct5);
 
         private static void AddCompressed(
             Dictionary<RVInstrKind, RVInstructionMetadata> map, RVInstrKind opcode, bool requires64Bit = false, RVIsaFlags requiredIsa = RVIsaFlags.C)

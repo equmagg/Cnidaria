@@ -286,10 +286,11 @@ namespace Cnidaria.Cs
                     AppendOperandList(sb, tree);
                     sb.Append(')');
                     return;
+                case GenTreeKind.Intrinsic:
                 case GenTreeKind.Call:
                 case GenTreeKind.VirtualCall:
                 case GenTreeKind.DelegateInvoke:
-                    sb.Append(tree.Kind == GenTreeKind.VirtualCall ? "callvirt " : tree.Kind == GenTreeKind.DelegateInvoke ? "delegate_invoke " : "call ")
+                    sb.Append(tree.Kind == GenTreeKind.Intrinsic ? "intrinsic " : tree.Kind == GenTreeKind.VirtualCall ? "callvirt " : tree.Kind == GenTreeKind.DelegateInvoke ? "delegate_invoke " : "call ")
                       .Append(MethodName(tree.Source.Method)).Append('(');
                     AppendOperandList(sb, tree);
                     sb.Append(')');

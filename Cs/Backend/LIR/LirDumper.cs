@@ -224,6 +224,11 @@ namespace Cnidaria.Cs
                     sb.Append("calli ");
                     AppendUses(sb, node);
                     return;
+                case GenTreeKind.Intrinsic:
+                    sb.Append("intrinsic ");
+                    sb.Append(source.IntrinsicId).Append(' ');
+                    AppendUses(sb, node);
+                    return;
                 case GenTreeKind.Call:
                     sb.Append("call ");
                     sb.Append(MethodName(source.Method)).Append(' ');
@@ -336,10 +341,6 @@ namespace Cnidaria.Cs
                     return;
                 case GenTreeKind.PointerElementAddr:
                     sb.Append("ptr_elem_addr elemSize=").Append(source.Int32).Append(' ');
-                    AppendUses(sb, node);
-                    return;
-                case GenTreeKind.PointerToByRef:
-                    sb.Append("ptr_to_byref ");
                     AppendUses(sb, node);
                     return;
                 case GenTreeKind.PointerDiff:

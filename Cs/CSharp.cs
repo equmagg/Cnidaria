@@ -1354,10 +1354,12 @@ namespace Cnidaria.Cs
         {
             StringBuilder sb = new();
             sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.cs"));
+            sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Runtime.cs"));
             sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Runtime.InteropServices.cs"));
             sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Runtime.CompilerServices.cs"));
             sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Collections.cs"));
             sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Buffers.cs"));
+            sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Threading.cs"));
             sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Globalization.cs"));
             sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Text.cs"));
             sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Numerics.cs"));

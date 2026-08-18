@@ -18,7 +18,14 @@ namespace Cnidaria.Cs
             var name = lf.Identifier.ValueText ?? "";
 
             if (!_localFunctions.TryGetValue(name, out var sym))
-                sym = DeclareLocalFunction(lf, context, diagnostics);
+            {
+                if (!TryGetLocalFunctionFromEnclosingScopes(name, out sym) ||
+                    sym is null ||
+                    !ReferenceEquals(sym.Declaration, lf))
+                {
+                    sym = DeclareLocalFunction(lf, context, diagnostics);
+                }
+            }
 
             var bodyFlags = Flags;
             if (HasModifier(lf.Modifiers, SyntaxKind.UnsafeKeyword))
@@ -187,6 +194,7 @@ namespace Cnidaria.Cs
             DiagnosticBag diagnostics)
         {
             var name = v.Identifier.ValueText ?? "";
+            ReportFieldKeywordDeclaration(v.Identifier, context, diagnostics);
 
             if (IsNameDeclaredInEnclosingScopes(name))
             {
@@ -221,9 +229,12 @@ namespace Cnidaria.Cs
 
                     if (rhs is not BoundRefExpression br || br.Type is not ByRefTypeSymbol brType)
                     {
-                        diagnostics.Add(new Diagnostic("CN_REFLOC003", DiagnosticSeverity.Error,
-                            "A ref local initializer must be a ref expression.",
-                            new Location(context.SemanticModel.SyntaxTree, v.Initializer.Value.Span)));
+                        if (!rhs.HasErrors)
+                        {
+                            diagnostics.Add(new Diagnostic("CN_REFLOC003", DiagnosticSeverity.Error,
+                                "A ref local initializer must be a ref expression.",
+                                new Location(context.SemanticModel.SyntaxTree, v.Initializer.Value.Span)));
+                        }
 
                         localType = explicitType ?? new ErrorTypeSymbol("ref", containing: null, ImmutableArray<Location>.Empty);
                         init = rhs;
@@ -428,6 +439,17 @@ namespace Cnidaria.Cs
                 return result;
             }
         }
+        private static bool IsValidArrayIndexType(TypeSymbol type)
+        {
+            return type.SpecialType is
+                SpecialType.System_Int32 or
+                SpecialType.System_UInt32 or
+                SpecialType.System_Int64 or
+                SpecialType.System_UInt64 or
+                SpecialType.System_IntPtr or
+                SpecialType.System_UIntPtr;
+        }
+
         private BoundExpression BindElementAccess(
             ElementAccessExpressionSyntax node,
             BindValueKind bindValueKind,
@@ -491,14 +513,17 @@ namespace Cnidaria.Cs
                     {
                         var arg = node.ArgumentList.Arguments[i];
                         var indexExpr = BindExpression(arg.Expression, context, diagnostics);
-                        indexExpr = ApplyConversion(
-                            exprSyntax: arg.Expression,
-                            expr: indexExpr,
-                            targetType: intType,
-                            diagnosticNode: node,
-                            context: context,
-                            diagnostics: diagnostics,
-                            requireImplicit: true);
+                        if (!IsValidArrayIndexType(indexExpr.Type))
+                        {
+                            indexExpr = ApplyConversion(
+                                exprSyntax: arg.Expression,
+                                expr: indexExpr,
+                                targetType: intType,
+                                diagnosticNode: node,
+                                context: context,
+                                diagnostics: diagnostics,
+                                requireImplicit: true);
+                        }
                         indices.Add(indexExpr);
                     }
 
@@ -639,15 +664,18 @@ namespace Cnidaria.Cs
                 }
 
                 var indexExpr = BindExpression(node.ArgumentList.Arguments[0].Expression, context, diagnostics);
-                var intType = context.Compilation.GetSpecialType(SpecialType.System_Int32);
-                indexExpr = ApplyConversion(
-                    exprSyntax: node.ArgumentList.Arguments[0].Expression,
-                    expr: indexExpr,
-                    targetType: intType,
-                    diagnosticNode: node,
-                    context: context,
-                    diagnostics: diagnostics,
-                    requireImplicit: true);
+                if (!IsValidArrayIndexType(indexExpr.Type))
+                {
+                    var intType = context.Compilation.GetSpecialType(SpecialType.System_Int32);
+                    indexExpr = ApplyConversion(
+                        exprSyntax: node.ArgumentList.Arguments[0].Expression,
+                        expr: indexExpr,
+                        targetType: intType,
+                        diagnosticNode: node,
+                        context: context,
+                        diagnostics: diagnostics,
+                        requireImplicit: true);
+                }
 
                 return new BoundPointerElementAccessExpression(node, pt.PointedAtType, expr, indexExpr);
             }
@@ -1722,6 +1750,54 @@ namespace Cnidaria.Cs
             DiagnosticBag diagnostics,
             bool requireImplicit = true)
         {
+            if (exprSyntax is ConditionalExpressionSyntax conditionalSyntax)
+            {
+                var boolType = context.Compilation.GetSpecialType(SpecialType.System_Boolean);
+                var condition = BindExpression(conditionalSyntax.Condition, context, diagnostics);
+                condition = ApplyConversion(
+                    conditionalSyntax.Condition,
+                    condition,
+                    boolType,
+                    conditionalSyntax,
+                    context,
+                    diagnostics,
+                    requireImplicit: true);
+
+                var whenTrueBinder = CreateFlowScopeBinderForTrue(condition);
+                var whenTrue = whenTrueBinder.BindExpressionWithTargetType(
+                    conditionalSyntax.WhenTrue,
+                    targetType,
+                    diagnosticNode,
+                    context,
+                    diagnostics,
+                    requireImplicit);
+                var whenFalse = BindExpressionWithTargetType(
+                    conditionalSyntax.WhenFalse,
+                    targetType,
+                    diagnosticNode,
+                    context,
+                    diagnostics,
+                    requireImplicit);
+
+                if (condition.HasErrors || whenTrue.HasErrors || whenFalse.HasErrors)
+                {
+                    var bad = new BoundBadExpression(exprSyntax);
+                    bad.SetType(targetType);
+                    context.Recorder.RecordBound(exprSyntax, bad);
+                    return bad;
+                }
+
+                var result = new BoundConditionalExpression(
+                    conditionalSyntax,
+                    targetType,
+                    condition,
+                    whenTrue,
+                    whenFalse,
+                    FoldConditionalConstant(condition, whenTrue, whenFalse));
+                context.Recorder.RecordBound(exprSyntax, result);
+                return result;
+            }
+
             if (exprSyntax is InitializerExpressionSyntax initSyntax &&
                 initSyntax.Kind == SyntaxKind.ArrayInitializerExpression &&
                 targetType is ArrayTypeSymbol arrayType)
@@ -2190,7 +2266,6 @@ namespace Cnidaria.Cs
                     rs.Expression,
                     expr,
                     byRefReturnType,
-                    rs,
                     context,
                     diagnostics);
 
@@ -2467,7 +2542,6 @@ namespace Cnidaria.Cs
             ExpressionSyntax syntax,
             BoundExpression expr,
             ByRefTypeSymbol targetType,
-            SyntaxNode diagnosticNode,
             BindingContext context,
             DiagnosticBag diagnostics)
         {
@@ -2479,10 +2553,10 @@ namespace Cnidaria.Cs
                     "A ref return expression must be a ref expression.",
                     new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
 
-                return new BoundBadExpression((ExpressionSyntax)diagnosticNode);
+                return new BoundBadExpression(syntax);
             }
 
-            if (!ReferenceEquals(sourceByRef.ElementType, targetType.ElementType))
+            if (!AreSameType(sourceByRef.ElementType, targetType.ElementType))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_REFRET001",
@@ -2490,7 +2564,7 @@ namespace Cnidaria.Cs
                     $"Ref type mismatch: expected ref '{targetType.ElementType.Name}', got ref '{sourceByRef.ElementType.Name}'.",
                     new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
 
-                return new BoundBadExpression((ExpressionSyntax)diagnosticNode);
+                return new BoundBadExpression(syntax);
             }
 
             return br;

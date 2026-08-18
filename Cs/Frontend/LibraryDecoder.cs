@@ -387,7 +387,8 @@ namespace Cnidaria.Cs
             bool isSealed,
             bool isExtensionMethod,
             ImmutableArray<TypeParameterSymbol> typeParameters,
-            bool isExtern = false)
+            bool isExtern = false,
+            bool returnsByRefReadonly = false)
         {
             var m = new ExternalMethodSymbol(
                 name: name,
@@ -402,7 +403,8 @@ namespace Cnidaria.Cs
                 isOverride: isOverride,
                 isSealed: isSealed,
                 isExtensionMethod: isExtensionMethod,
-                isExtern: isExtern);
+                isExtern: isExtern,
+                returnsByRefReadonly: returnsByRefReadonly);
 
             if (!typeParameters.IsDefaultOrEmpty && m is ExternalMethodSymbol em)
                 em.SetTypeParameters(typeParameters);
@@ -1176,6 +1178,15 @@ namespace Cnidaria.Cs
             var type = ResolveTypeToken(core, typeByRid, r.ReadInt32());
             byte kind = r.ReadByte();
 
+            if (kind == 15)
+            {
+                int length = r.ReadInt32();
+                var elements = ImmutableArray.CreateBuilder<TypedConstant>(length);
+                for (int i = 0; i < length; i++)
+                    elements.Add(ReadTypedConstant(core, typeByRid, ref r));
+                return new TypedConstant(type, elements.ToImmutable());
+            }
+
             object? value = kind switch
             {
                 0 => null,
@@ -1288,7 +1299,13 @@ namespace Cnidaria.Cs
                         }
                         mtps = b.ToImmutable();
                     }
-                    var retType = ReadType(core, typeByRid, ref reader, declaringType, mtps);
+                    var retType = ReadMethodReturnType(
+                        core,
+                        typeByRid,
+                        ref reader,
+                        declaringType,
+                        mtps,
+                        out bool returnsByRefReadonly);
 
                     var ps = ImmutableArray.CreateBuilder<(string name, TypeSymbol type)>((int)paramCount);
                     int totalParams = _md.GetRowCount(MetadataTableKind.Param);
@@ -1337,7 +1354,8 @@ namespace Cnidaria.Cs
                         isExtensionMethod: isExtensionMethod,
                         typeParameters: mtps,
                         isExtern: (mdRow.ImplFlags & MetadataFlagBits.Extern) != 0 ||
-                                  (mdRow.Flags & (ushort)System.Reflection.MethodAttributes.PinvokeImpl) != 0);
+                                  (mdRow.Flags & (ushort)System.Reflection.MethodAttributes.PinvokeImpl) != 0,
+                        returnsByRefReadonly: returnsByRefReadonly);
 
                     ApplyParamRefKinds(ms, mdRow.ParamList, (int)paramCount);
                     ApplyParamDefaultValues(ms, mdRow.ParamList, (int)paramCount, constByParent);
@@ -1802,6 +1820,36 @@ namespace Cnidaria.Cs
                 _ => new ErrorTypeSymbol($"sig:{et}", containing: null, locations: ImmutableArray<Location>.Empty)
             };
         }
+        private TypeSymbol ReadMethodReturnType(
+            CoreLibraryBuilder core,
+            NamedTypeSymbol[] typeByRid,
+            ref SigReader reader,
+            NamedTypeSymbol? declaringType,
+            ImmutableArray<TypeParameterSymbol> methodTypeParameters,
+            out bool returnsByRefReadonly)
+        {
+            returnsByRefReadonly = false;
+            if (reader.PeekByte() != (byte)SigElementType.BYREF)
+                return ReadType(core, typeByRid, ref reader, declaringType, methodTypeParameters);
+
+            _ = reader.ReadByte();
+            while (reader.PeekByte() == (byte)SigElementType.CMOD_REQD ||
+                   reader.PeekByte() == (byte)SigElementType.CMOD_OPT)
+            {
+                var modifierKind = (SigElementType)reader.ReadByte();
+                uint modifierType = reader.ReadCompressedUInt();
+                if (modifierKind == SigElementType.CMOD_REQD &&
+                    GetModifierTypeName(modifierType, typeByRid) ==
+                    ("System.Runtime.InteropServices", "InAttribute"))
+                {
+                    returnsByRefReadonly = true;
+                }
+            }
+
+            var elementType = ReadType(core, typeByRid, ref reader, declaringType, methodTypeParameters);
+            return core.CreateByRefType(elementType);
+        }
+
         private TypeSymbol ReadFunctionPointerType(
             CoreLibraryBuilder core,
             NamedTypeSymbol[] typeByRid,

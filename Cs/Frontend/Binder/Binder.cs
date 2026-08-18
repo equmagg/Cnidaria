@@ -704,10 +704,10 @@ namespace Cnidaria.Cs
             }
             else
             {
-                var layer0 = new List<Symbol>(8);
+                var layer0 = BuildLexicalRootScopes(context);
                 var layer1 = new List<Symbol>(8);
                 var layer2 = new List<Symbol>(1);
-                BuildRootLayers(context, imports, layer0, layer1, layer2);
+                BuildImportAndGlobalRootLayers(imports, layer1, layer2);
 
                 var first = parts[0];
                 var hasTypeArgs = first.TypeArgListOpt != null;
@@ -715,7 +715,12 @@ namespace Cnidaria.Cs
                     ? BindTypeArguments(first.TypeArgListOpt!.Arguments, context, diagnostics)
                     : default;
 
-                var next = CollectNextWithAttributeSuffix(layer0, first, hasTypeArgs, boundTypeArgs);
+                var next = new List<Symbol>();
+                for (int rootIndex = 0; rootIndex < layer0.Count && next.Count == 0; rootIndex++)
+                {
+                    var root = new List<Symbol>(1) { layer0[rootIndex] };
+                    next = CollectNextWithAttributeSuffix(root, first, hasTypeArgs, boundTypeArgs);
+                }
                 if (next.Count == 0)
                     next = CollectNextWithAttributeSuffix(layer1, first, hasTypeArgs, boundTypeArgs);
                 if (next.Count == 0)
@@ -815,6 +820,13 @@ namespace Cnidaria.Cs
             List<Symbol> current = new(capacity: 8);
             int startIndex = 0;
 
+            if (parts.Count == 1 && parts[0].Arity == 0 && parts[0].TypeArgListOpt is null)
+            {
+                var typeParameter = LookupTypeParameter(parts[0].Name, context);
+                if (typeParameter is not null)
+                    return typeParameter;
+            }
+
             if (imports.TryGetAlias(parts[0].Name, out var alias))
             {
                 current.Add(alias!.Target);
@@ -822,17 +834,22 @@ namespace Cnidaria.Cs
             }
             else
             {
-                var layer0 = new List<Symbol>(8);
+                var layer0 = BuildLexicalRootScopes(context);
                 var layer1 = new List<Symbol>(8);
                 var layer2 = new List<Symbol>(1);
-                BuildRootLayers(context, imports, layer0, layer1, layer2);
+                BuildImportAndGlobalRootLayers(imports, layer1, layer2);
 
                 var first = parts[0];
                 var hasTypeArgs = first.TypeArgListOpt != null;
                 var boundTypeArgs = hasTypeArgs
                     ? BindTypeArguments(first.TypeArgListOpt!.Arguments, context, diagnostics)
                     : default;
-                var next = CollectNextChecked(layer0, first, hasTypeArgs, boundTypeArgs);
+                var next = new List<Symbol>();
+                for (int rootIndex = 0; rootIndex < layer0.Count && next.Count == 0; rootIndex++)
+                {
+                    var root = new List<Symbol>(1) { layer0[rootIndex] };
+                    next = CollectNextChecked(root, first, hasTypeArgs, boundTypeArgs);
+                }
                 if (next.Count == 0)
                     next = CollectNextChecked(layer1, first, hasTypeArgs, boundTypeArgs);
                 if (next.Count == 0)
@@ -963,52 +980,28 @@ namespace Cnidaria.Cs
                     return;
             list.Add(sym);
         }
-        // Lookup proceeds from lexical containers through imports to the global namespace
-        private void BuildRootLayers(BindingContext context, Imports imports, List<Symbol> layer0, List<Symbol> layer1, List<Symbol> layer2)
+        private List<Symbol> BuildLexicalRootScopes(BindingContext context)
         {
-            // Lexically enclosing types and namespaces
+            var scopes = new List<Symbol>(8);
             for (Symbol? s = context.ContainingSymbol; s != null; s = s.ContainingSymbol)
             {
                 if (s is NamedTypeSymbol nt)
-                    AddUnique(layer0, nt);
+                    AddUnique(scopes, nt);
             }
 
-            if (!TryAddMergedEnclosingNamespaces(context.ContainingSymbol, layer0))
-            {
-                var ns = GetEnclosingNamespace(context.ContainingSymbol);
-                for (NamespaceSymbol? n = ns; n != null; n = n.ContainingSymbol as NamespaceSymbol)
-                    AddUnique(layer0, n);
-            }
-
-            // Imported namespace and type containers
-            for (int i = 0; i < imports.Containers.Length; i++)
-                AddUnique(layer1, imports.Containers[i]);
-
-            // Statically imported types
-            for (int i = 0; i < imports.StaticTypes.Length; i++)
-                AddUnique(layer1, imports.StaticTypes[i]);
-
-            // Global namespace fallback
-            AddUnique(layer2, _compilation.GlobalNamespace);
-        }
-        private bool TryAddMergedEnclosingNamespaces(Symbol? containing, List<Symbol> layer0)
-        {
             var parts = new List<string>();
-            for (var n = GetEnclosingNamespace(containing); n != null && !n.IsGlobalNamespace; n = n.ContainingSymbol as NamespaceSymbol)
+            for (var n = GetEnclosingNamespace(context.ContainingSymbol); n != null && !n.IsGlobalNamespace; n = n.ContainingSymbol as NamespaceSymbol)
                 parts.Add(n.Name);
 
-            // Reconstruct the same path starting from merged global namespace
             NamespaceSymbol cur = _compilation.GlobalNamespace;
-            var chainOuterToInner = new List<NamespaceSymbol>(parts.Count);
-
+            var merged = new List<NamespaceSymbol>(parts.Count);
+            bool resolvedMergedPath = true;
             for (int i = parts.Count - 1; i >= 0; i--)
             {
-                var part = parts[i];
                 NamespaceSymbol? next = null;
-
                 foreach (var child in cur.GetNamespaceMembers())
                 {
-                    if (StringComparer.Ordinal.Equals(child.Name, part))
+                    if (StringComparer.Ordinal.Equals(child.Name, parts[i]))
                     {
                         next = child;
                         break;
@@ -1016,17 +1009,38 @@ namespace Cnidaria.Cs
                 }
 
                 if (next is null)
-                    return false;
+                {
+                    resolvedMergedPath = false;
+                    break;
+                }
 
-                chainOuterToInner.Add(next);
+                merged.Add(next);
                 cur = next;
             }
 
-            for (int i = chainOuterToInner.Count - 1; i >= 0; i--)
-                AddUnique(layer0, chainOuterToInner[i]);
+            if (resolvedMergedPath)
+            {
+                for (int i = merged.Count - 1; i >= 0; i--)
+                    AddUnique(scopes, merged[i]);
+            }
+            else
+            {
+                for (var n = GetEnclosingNamespace(context.ContainingSymbol); n != null && !n.IsGlobalNamespace; n = n.ContainingSymbol as NamespaceSymbol)
+                    AddUnique(scopes, n);
+            }
 
-            AddUnique(layer0, _compilation.GlobalNamespace);
-            return true;
+            return scopes;
+        }
+
+        private void BuildImportAndGlobalRootLayers(Imports imports, List<Symbol> importsLayer, List<Symbol> globalLayer)
+        {
+            for (int i = 0; i < imports.Containers.Length; i++)
+                AddUnique(importsLayer, imports.Containers[i]);
+
+            for (int i = 0; i < imports.StaticTypes.Length; i++)
+                AddUnique(importsLayer, imports.StaticTypes[i]);
+
+            AddUnique(globalLayer, _compilation.GlobalNamespace);
         }
         // Advance one qualified name part through namespaces and nested types
         private List<Symbol> CollectNext(

@@ -299,8 +299,8 @@ namespace Cnidaria.Cs
         private int ArrayLengthOffset => ObjectHeaderSize;    // +8
         private int ArrayDataOffset => ObjectHeaderSize + 8;  // +16 aligned
 
-        private int StringLengthOffset => ObjectHeaderSize;   // +8
-        private int StringCharsOffset => ObjectHeaderSize + 4;// +12
+        private int StringLengthOffset => _rts.Target.StringLengthOffset;
+        private int StringFirstCharOffset => _rts.Target.StringFirstCharOffset;
 
         private readonly int _heapBase;
         private readonly int _heapEnd;
@@ -520,6 +520,22 @@ namespace Cnidaria.Cs
 
                         case BytecodeOp.TypeIsValueType:
                             ExecTypeIsValueType(mod, ins.Operand0);
+                            break;
+
+                        case BytecodeOp.TypeIsPrimitive:
+                            ExecTypeIsPrimitive(mod, ins.Operand0);
+                            break;
+
+                        case BytecodeOp.TypeIsEnum:
+                            ExecTypeIsEnum(mod, ins.Operand0);
+                            break;
+
+                        case BytecodeOp.TypeEquals:
+                            ExecTypeEquals(mod, ins.Operand0, ins.Operand1);
+                            break;
+
+                        case BytecodeOp.ObjectTypeEquals:
+                            ExecObjectTypeEquals(mod, ins.Operand0, ins.Operand1);
                             break;
 
                         case BytecodeOp.Pop:
@@ -1694,6 +1710,19 @@ namespace Cnidaria.Cs
         }
         private bool IsSystemStringType(RuntimeType t)
             => t.Namespace == "System" && t.Name == "String";
+        private static bool IsReadOnlyCharSpanType(RuntimeType type)
+        {
+            if (!StringComparer.Ordinal.Equals(type.Namespace, "System") ||
+                !type.Name.StartsWith("ReadOnlySpan", StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            var arguments = type.GenericTypeArguments;
+            return arguments.Length == 1 &&
+                   StringComparer.Ordinal.Equals(arguments[0].Namespace, "System") &&
+                   StringComparer.Ordinal.Equals(arguments[0].Name, "Char");
+        }
         private bool IsSystemBooleanType(RuntimeType t)
             => t.Namespace == "System" && t.Name == "Boolean";
         private int GetStringLengthFromObject(int strObjAbs)
@@ -1704,7 +1733,7 @@ namespace Cnidaria.Cs
             return len;
         }
 
-        private int GetStringCharsAbs(int strObjAbs) => checked(strObjAbs + StringCharsOffset);
+        private int GetStringFirstCharAbs(int strObjAbs) => checked(strObjAbs + StringFirstCharOffset);
 
         private int GetArrayLengthFromObject(int arrObjAbs)
         {
@@ -2194,7 +2223,7 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException("Negative string length.");
 
             var stringType = _rts.SystemString;
-            int totalSize = AlignUp(checked(StringCharsOffset + (length * 2) + 2), 8);
+            int totalSize = AlignUp(checked(StringFirstCharOffset + (length * 2) + 2), 8);
 
             int abs = AllocHeapBytes(totalSize, align: 8);
             Array.Clear(_mem, abs, totalSize);
@@ -2204,7 +2233,7 @@ namespace Cnidaria.Cs
             WriteI32(abs + StringLengthOffset, length);
 
             // null terminator
-            BinaryPrimitives.WriteUInt16LittleEndian(_mem.AsSpan(abs + StringCharsOffset + length * 2, 2), 0);
+            BinaryPrimitives.WriteUInt16LittleEndian(_mem.AsSpan(abs + StringFirstCharOffset + length * 2, 2), 0);
 
             _heapObjects.Add(abs);
             return abs;
@@ -2227,7 +2256,7 @@ namespace Cnidaria.Cs
             {
                 int len = GetStringLengthFromObject(objAbs);
                 int bytes = checked(len * 2); // UTF-16 char
-                return AlignUp(checked(StringCharsOffset + bytes + 2), 8); // + null terminator
+                return AlignUp(checked(StringFirstCharOffset + bytes + 2), 8); // + null terminator
             }
 
             if (t.IsValueType)
@@ -2241,7 +2270,7 @@ namespace Cnidaria.Cs
             if (s is null) throw new ArgumentNullException(nameof(s));
 
             int abs = AllocStringUninitialized(s.Length);
-            int charsAbs = GetStringCharsAbs(abs);
+            int charsAbs = GetStringFirstCharAbs(abs);
 
             for (int i = 0; i < s.Length; i++)
             {
@@ -2721,6 +2750,86 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException($"Unbound generic type parameter in typeof(T).IsValueType: {t.Name}");
             PushSlot(new Slot(SlotKind.I4, t.IsValueType ? 1 : 0));
         }
+        private void ExecTypeIsPrimitive(RuntimeModule mod, int typeToken)
+        {
+            var rm = _curLayout?.Method ?? throw new InvalidOperationException("No current method layout.");
+            var t = _rts.ResolveTypeInMethodContext(mod, typeToken, rm);
+            if (t.Kind == RuntimeTypeKind.TypeParam)
+                throw new InvalidOperationException($"Unbound generic type parameter in typeof(T).IsPrimitive: {t.Name}");
+            _rts.EnsureRuntimeTypeReady(t);
+            PushSlot(new Slot(SlotKind.I4, IsPrimitiveRuntimeType(t) ? 1 : 0));
+        }
+        private void ExecTypeIsEnum(RuntimeModule mod, int typeToken)
+        {
+            var rm = _curLayout?.Method ?? throw new InvalidOperationException("No current method layout.");
+            var t = _rts.ResolveTypeInMethodContext(mod, typeToken, rm);
+            if (t.Kind == RuntimeTypeKind.TypeParam)
+                throw new InvalidOperationException($"Unbound generic type parameter in typeof(T).IsEnum: {t.Name}");
+            PushSlot(new Slot(SlotKind.I4, t.Kind == RuntimeTypeKind.Enum ? 1 : 0));
+        }
+        private void ExecTypeEquals(RuntimeModule mod, int leftTypeToken, int rightTypeToken)
+        {
+            var rm = _curLayout?.Method ?? throw new InvalidOperationException("No current method layout.");
+            var left = _rts.ResolveTypeInMethodContext(mod, leftTypeToken, rm);
+            var right = _rts.ResolveTypeInMethodContext(mod, rightTypeToken, rm);
+            if (left.Kind == RuntimeTypeKind.TypeParam || right.Kind == RuntimeTypeKind.TypeParam)
+                throw new InvalidOperationException("Unbound generic type parameter in type equality check.");
+            PushSlot(new Slot(SlotKind.I4, left.TypeId == right.TypeId ? 1 : 0));
+        }
+        private void ExecObjectTypeEquals(RuntimeModule mod, int receiverTypeToken, int targetTypeToken)
+        {
+            var rm = _curLayout?.Method ?? throw new InvalidOperationException("No current method layout.");
+            var receiverType = _rts.ResolveTypeInMethodContext(mod, receiverTypeToken, rm);
+            var targetType = _rts.ResolveTypeInMethodContext(mod, targetTypeToken, rm);
+            if (receiverType.Kind == RuntimeTypeKind.TypeParam || targetType.Kind == RuntimeTypeKind.TypeParam)
+                throw new InvalidOperationException("Unbound generic type parameter in GetType equality check.");
+
+            Slot receiver = PopSlot();
+            RuntimeType actualType;
+            if (receiverType.IsValueType &&
+                TryGetNullableInfo(receiverType, out var nullableUnderlying, out var hasValueField, out _))
+            {
+                if (receiver.Kind != SlotKind.Value)
+                    throw new InvalidOperationException($"Nullable GetType expects struct value slot, got {receiver.Kind}.");
+
+                var slotType = GetValueSlotType(receiver);
+                if (slotType.TypeId != receiverType.TypeId)
+                    throw new InvalidOperationException(
+                        $"Nullable GetType type mismatch: slot={slotType.Name}, token={receiverType.Name}.");
+
+                int srcAbs = checked((int)receiver.Payload);
+                var hasValueSlot = LoadValueAsSlot(srcAbs, hasValueField.Offset, hasValueField.FieldType);
+                if (hasValueSlot.Kind != SlotKind.I4 || hasValueSlot.AsI4Checked() == 0)
+                    throw new NullReferenceException();
+
+                actualType = nullableUnderlying;
+            }
+            else
+            {
+                actualType = receiverType.IsValueType
+                    ? receiverType
+                    : GetObjectTypeFromRef(receiver);
+            }
+            PushSlot(new Slot(SlotKind.I4, actualType.TypeId == targetType.TypeId ? 1 : 0));
+        }
+        private static bool IsPrimitiveRuntimeType(RuntimeType type)
+        {
+            return type.PrimitiveKind is
+                RuntimePrimitiveKind.Boolean or
+                RuntimePrimitiveKind.Char or
+                RuntimePrimitiveKind.Int8 or
+                RuntimePrimitiveKind.UInt8 or
+                RuntimePrimitiveKind.Int16 or
+                RuntimePrimitiveKind.UInt16 or
+                RuntimePrimitiveKind.Int32 or
+                RuntimePrimitiveKind.UInt32 or
+                RuntimePrimitiveKind.Int64 or
+                RuntimePrimitiveKind.UInt64 or
+                RuntimePrimitiveKind.NativeInt or
+                RuntimePrimitiveKind.NativeUInt or
+                RuntimePrimitiveKind.Single or
+                RuntimePrimitiveKind.Double;
+        }
         private void ExecDefaultValue(RuntimeModule mod, int typeToken)
         {
             var t = ResolveTypeTokenInCurrentMethod(mod, typeToken);
@@ -3133,6 +3242,7 @@ namespace Cnidaria.Cs
 
             PushSlot(new Slot(SlotKind.ByRef, p.Payload, p.Aux));
         }
+
         private void ExecLdArrayDataRef()
         {
             var arr = PopSlot();
@@ -3383,6 +3493,29 @@ namespace Cnidaria.Cs
                 {
                     length = args[2].AsI4Checked();
                     if (length < 0) throw new InvalidOperationException("Negative string length.");
+                }
+                else if (args.Length == 1 && IsReadOnlyCharSpanType(ctor.ParameterTypes[0]))
+                {
+                    if (args[0].Kind != SlotKind.Value)
+                        throw new NotSupportedException("System.String(ReadOnlySpan<char>) expects a value type slot.");
+
+                    var spanType = GetValueSlotType(args[0]);
+                    int spanAbs = checked((int)args[0].Payload);
+                    RuntimeField? lengthField = null;
+                    for (int i = 0; i < spanType.InstanceFields.Length; i++)
+                    {
+                        if (StringComparer.Ordinal.Equals(spanType.InstanceFields[i].Name, "_length"))
+                        {
+                            lengthField = spanType.InstanceFields[i];
+                            break;
+                        }
+                    }
+                    if (lengthField is null)
+                        throw new NotSupportedException("System.String(ReadOnlySpan<char>) cannot locate the span length field.");
+
+                    length = LoadValueAsSlot(spanAbs, lengthField.Offset, lengthField.FieldType).AsI4Checked();
+                    if (length < 0)
+                        throw new InvalidOperationException("Negative string length.");
                 }
                 else if (args.Length == 1 && ctor.ParameterTypes[0].Kind == RuntimeTypeKind.Pointer &&
                          ctor.ParameterTypes[0].ElementType is { Namespace: "System", Name: "Char" })
@@ -5588,6 +5721,10 @@ namespace Cnidaria.Cs
 
         private Slot DoConv(Slot v, NumericConvKind kind, NumericConvFlags flags)
         {
+            // Unsafe.AsPointer<T> lowers ref readonly T -> void* as conv.u
+            if (v.Kind == SlotKind.ByRef && kind == NumericConvKind.NativeUInt)
+                return new Slot(SlotKind.Ptr, v.Payload, v.Aux);
+
             bool @checked = (flags & NumericConvFlags.Checked) != 0;
             bool srcUnsigned = (flags & NumericConvFlags.SourceUnsigned) != 0;
 
@@ -6316,7 +6453,7 @@ namespace Cnidaria.Cs
             ValidateStringRef(s, out int strObjAbs);
 
             int len = GetStringLengthFromObject(strObjAbs);
-            int charsAbs = GetStringCharsAbs(strObjAbs);
+            int charsAbs = GetStringFirstCharAbs(strObjAbs);
 
             var chars = new char[len];
             for (int i = 0; i < len; i++)
@@ -6456,8 +6593,136 @@ namespace Cnidaria.Cs
                 throw;
             }
         }
+
+        private static ulong InterlockedSlotBits(Slot value, int size)
+        {
+            ulong bits = value.Kind switch
+            {
+                SlotKind.I4 => unchecked((uint)value.Payload),
+                SlotKind.I8 => unchecked((ulong)value.Payload),
+                SlotKind.Ref or SlotKind.Ptr or SlotKind.ByRef or SlotKind.FunctionPointer => unchecked((ulong)value.Payload),
+                SlotKind.Null => 0UL,
+                _ => throw new InvalidOperationException($"Unsupported Interlocked.CompareExchange value slot: {value.Kind}.")
+            };
+
+            return size switch
+            {
+                1 => bits & 0xFFUL,
+                2 => bits & 0xFFFFUL,
+                4 => bits & 0xFFFFFFFFUL,
+                8 => bits,
+                _ => throw new InvalidOperationException($"Unsupported Interlocked.CompareExchange size: {size}.")
+            };
+        }
         private bool TryInvokeIntrinsic(RuntimeMethod rm, int totalArgs, CancellationToken ct)
         {
+            if (RuntimeIntrinsics.TryResolve(rm, _rts.Target, out RuntimeIntrinsicInfo runtimeIntrinsic))
+            {
+                switch (runtimeIntrinsic.Id)
+                {
+                    case RuntimeIntrinsicId.InterlockedCompareExchange:
+                        {
+                            InterlockedCompareExchangeIntrinsic compareExchange = runtimeIntrinsic.CompareExchange;
+                            if (totalArgs != 3)
+                                throw new InvalidOperationException("Interlocked.CompareExchange requires exactly three arguments.");
+
+                            Slot comparand = PopSlot();
+                            Slot value = PopSlot();
+                            Slot location = PopSlot();
+                            if (location.Kind == SlotKind.Null || location.Payload == 0)
+                                throw new NullReferenceException();
+                            if (location.Kind != SlotKind.ByRef)
+                                throw new InvalidOperationException($"Interlocked.CompareExchange location must be byref, got {location.Kind}.");
+
+                            int address = checked((int)location.Payload);
+                            Slot original = LoadValueAsSlot(address, 0, compareExchange.ValueType);
+                            if (InterlockedSlotBits(original, compareExchange.Size) == InterlockedSlotBits(comparand, compareExchange.Size))
+                                StoreSlotAsValue(address, 0, compareExchange.ValueType, value);
+                            PushSlot(original);
+                            return true;
+                        }
+                    case RuntimeIntrinsicId.InterlockedExchangeAdd:
+                        {
+                            InterlockedExchangeAddIntrinsic exchangeAdd = runtimeIntrinsic.ExchangeAdd;
+                            if (totalArgs != 2)
+                                throw new InvalidOperationException("Interlocked.ExchangeAdd requires exactly two arguments.");
+
+                            Slot value = PopSlot();
+                            Slot location = PopSlot();
+                            if (location.Kind == SlotKind.Null || location.Payload == 0)
+                                throw new NullReferenceException();
+                            if (location.Kind != SlotKind.ByRef)
+                                throw new InvalidOperationException($"Interlocked.ExchangeAdd location must be byref, got {location.Kind}.");
+
+                            int address = checked((int)location.Payload);
+                            Slot original = LoadValueAsSlot(address, 0, exchangeAdd.ValueType);
+                            Slot updated = exchangeAdd.Size switch
+                            {
+                                4 => new Slot(SlotKind.I4, unchecked(original.AsI4Checked() + value.AsI4Checked())),
+                                8 => new Slot(SlotKind.I8, unchecked(original.AsI8Checked() + value.AsI8Checked())),
+                                _ => throw new InvalidOperationException($"Unsupported Interlocked.ExchangeAdd size: {exchangeAdd.Size}.")
+                            };
+                            StoreSlotAsValue(address, 0, exchangeAdd.ValueType, updated);
+                            PushSlot(original);
+                            return true;
+                        }
+                    default:
+                        return false;
+                }
+            }
+            if (rm.DeclaringType.Namespace == "System" &&
+                rm.DeclaringType.Name == "SpanHelpers" &&
+                rm.Name == "memset" &&
+                !rm.HasThis &&
+                rm.IsStatic &&
+                rm.HasInternalCall &&
+                rm.ParameterTypes.Length == 3 &&
+                totalArgs == 3 &&
+                IsVoidReturn(rm.ReturnType))
+            {
+                Slot lengthSlot = PopSlot();
+                int value = PopSlot().AsI4Checked();
+                Slot destination = PopSlot();
+                ulong length = _rts.Target.PointerSize == 8
+                    ? unchecked((ulong)lengthSlot.AsI8Checked())
+                    : unchecked((uint)lengthSlot.AsI4Checked());
+                int size = checked((int)length);
+                if (size != 0)
+                {
+                    int abs = GetAddressAbsOrThrow(destination);
+                    CheckIndirectAccess(abs, size, writable: true);
+                    _mem.AsSpan(abs, size).Fill(unchecked((byte)value));
+                }
+                return true;
+            }
+
+            if (rm.DeclaringType.Namespace == "System.Threading" &&
+                rm.DeclaringType.Name == "Thread" &&
+                rm.Name == "GetCurrentProcessorNumber" &&
+                !rm.HasThis &&
+                rm.IsStatic &&
+                rm.HasInternalCall &&
+                rm.ParameterTypes.Length == 0 &&
+                totalArgs == 0 &&
+                rm.ReturnType.Namespace == "System" &&
+                rm.ReturnType.Name == "Int32")
+            {
+                PushSlot(new Slot(SlotKind.I4, 1));
+                return true;
+            }
+
+            if (rm.DeclaringType.Namespace == "System.Threading" &&
+                rm.DeclaringType.Name == "ObjectHeader" &&
+                !rm.HasThis &&
+                rm.IsStatic &&
+                rm.ParameterTypes.Length == 1 &&
+                totalArgs == 1 &&
+                IsVoidReturn(rm.ReturnType) &&
+                (rm.Name == "AcquireThinLock" || rm.Name == "Release"))
+            {
+                PopSlot();
+                return true;
+            }
             if (rm.DeclaringType.Namespace == "System" && rm.DeclaringType.Name == "Array")
             {
                 // instance int get_Length()
@@ -6768,53 +7033,8 @@ namespace Cnidaria.Cs
                     return true;
                 }
             }
-            if (IsSystemStringType(rm.DeclaringType))
+            if (IsSystemStringType(rm.DeclaringType) && rm.HasInternalCall)
             {
-                // instance int get_Length()
-                if (rm.HasThis &&
-                    rm.Name == "get_Length" &&
-                    rm.ParameterTypes.Length == 0 &&
-                    totalArgs == 1 &&
-                    rm.ReturnType.Namespace == "System" && rm.ReturnType.Name == "Int32")
-                {
-                    var s = PopSlot();
-                    ValidateStringRef(s, out int strObjAbs);
-                    int len = GetStringLengthFromObject(strObjAbs);
-                    PushSlot(new Slot(SlotKind.I4, len));
-                    return true;
-                }
-
-                // instance ref char GetPinnableReference()
-                if (rm.HasThis &&
-                    rm.Name == "GetPinnableReference" &&
-                    rm.ParameterTypes.Length == 0 &&
-                    totalArgs == 1 &&
-                    rm.ReturnType.Kind == RuntimeTypeKind.ByRef &&
-                    rm.ReturnType.ElementType is { Namespace: "System", Name: "Char" })
-                {
-                    var s = PopSlot();
-                    ValidateStringRef(s, out int strObjAbs);
-                    int charsAbs = GetStringCharsAbs(strObjAbs);
-                    PushSlot(new Slot(SlotKind.ByRef, charsAbs));
-                    return true;
-                }
-
-                // internal instance ref char GetRawStringData()
-                if (rm.HasThis &&
-                    rm.Name == "GetRawStringData" &&
-                    rm.ParameterTypes.Length == 0 &&
-                    totalArgs == 1 &&
-                    rm.ReturnType.Kind == RuntimeTypeKind.ByRef &&
-                    rm.ReturnType.ElementType is { Namespace: "System", Name: "Char" })
-                {
-                    var s = PopSlot();
-                    ValidateStringRef(s, out int strObjAbs);
-                    int charsAbs = GetStringCharsAbs(strObjAbs);
-                    PushSlot(new Slot(SlotKind.ByRef, charsAbs));
-                    return true;
-                }
-
-                // internal static string FastAllocateString(int length)
                 if (!rm.HasThis &&
                     rm.Name == "FastAllocateString" &&
                     rm.ParameterTypes.Length == 1 &&
@@ -6850,7 +7070,7 @@ namespace Cnidaria.Cs
                         ValidateStringRef(s, out int strObjAbs);
 
                         int len = GetStringLengthFromObject(strObjAbs);
-                        int charsAbs = GetStringCharsAbs(strObjAbs);
+                        int charsAbs = GetStringFirstCharAbs(strObjAbs);
                         CheckHeapAccess(charsAbs, checked(len * 2), writable: false);
 
                         for (int i = 0; i < len; i++)
@@ -6882,8 +7102,10 @@ namespace Cnidaria.Cs
                         if ((i & 0xFF) == 0) ct.ThrowIfCancellationRequested();
 
                         int pos = abs + (i * 2);
-                        if (pos < _stackBase || pos + 2 > _sp)
-                            throw new InvalidOperationException("Unterminated or out of range char* for Console.Write(char*).");
+                        if (pos >= _heapBase)
+                            CheckHeapAccess(pos, 2, writable: false);
+                        else
+                            CheckActiveStackAccess(pos, 2, writable: false);
 
                         ushort ch = BinaryPrimitives.ReadUInt16LittleEndian(_mem.AsSpan(pos, 2));
                         if (ch == 0)

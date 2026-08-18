@@ -980,6 +980,8 @@ namespace Cnidaria.Cs
                 {
                     if (X86Runtime.TryEvaluateIsReferenceOrContainsReferences(method, out _))
                         throw new InvalidOperationException("Compile-time InternalCall has no external symbol.");
+                    if (X86Runtime.IsAllocateNewArrayInternalCall(method))
+                        return ResolveExternalFunction(X86Runtime.NewUninitializedArraySymbol);
                     if (X86Runtime.IsGcSafePointInternalCall(method))
                         return ResolveExternalFunction(X86Runtime.NewArraySymbol);
 
@@ -1713,7 +1715,7 @@ namespace Cnidaria.Cs
                             : 0;
                     uint flags = ComputeMethodTableFlags(descriptor, componentSize);
                     int baseSize = isString
-                        ? checked(_target.SyncBlockSize + _target.StringCharsOffset + 2)
+                        ? checked(_target.SyncBlockSize + _target.StringFirstCharOffset + 2)
                         : isArray
                             ? checked(
                                 _target.SyncBlockSize +
@@ -1802,7 +1804,7 @@ namespace Cnidaria.Cs
                     _rodata.Align(_target.PointerSize);
                     _rodata.EmitPointer(0);
                     int offset = _rodata.ByteLength;
-                    int objectSize = checked(_target.PointerSize + 4 + chars.Length + 2);
+                    int objectSize = checked(_target.StringFirstCharOffset + chars.Length + 2);
                     AddDataSymbol(literal.Label, offset, objectSize);
                     _rodata.EmitPointerRelocation(literal.TypeDescriptorLabel);
                     _rodata.EmitInt32(literal.Text.Length);
@@ -2468,11 +2470,19 @@ namespace Cnidaria.Cs
                             return true;
                         if (node.TreeKind is GenTreeKind.DelegateInvoke or GenTreeKind.IndirectCall or GenTreeKind.VirtualCall)
                             return true;
-                        if (node.TreeKind == GenTreeKind.Call &&
-                            (node.Method?.HasInternalCall != true ||
-                             (node.Method is not null && X86Runtime.IsGcSafePointInternalCall(node.Method))))
+                        if (node.TreeKind == GenTreeKind.Intrinsic)
                         {
-                            return true;
+                            if (!RuntimeIntrinsics.IsNoGcSafePoint(node.IntrinsicId))
+                                return true;
+                            continue;
+                        }
+                        if (node.TreeKind == GenTreeKind.Call)
+                        {
+                            RuntimeMethod? method = node.Method;
+                            if (method is null)
+                                return true;
+                            if (method.HasInternalCall != true || X86Runtime.IsGcSafePointInternalCall(method))
+                                return true;
                         }
                     }
                     return false;
@@ -3474,7 +3484,6 @@ namespace Cnidaria.Cs
                             EmitBinary(node);
                             return;
                         case GenTreeKind.Conv:
-                        case GenTreeKind.PointerToByRef:
                             EmitSimpleConversion(node);
                             return;
                         case GenTreeKind.PointerElementAddr:
@@ -3493,6 +3502,9 @@ namespace Cnidaria.Cs
                         case GenTreeKind.BranchTrue:
                         case GenTreeKind.BranchFalse:
                             EmitConditionalBranch(node);
+                            return;
+                        case GenTreeKind.Intrinsic:
+                            EmitIntrinsic(node);
                             return;
                         case GenTreeKind.Call:
                             EmitCall(node);
@@ -4912,6 +4924,25 @@ namespace Cnidaria.Cs
                         Reg(source, size)));
                 }
 
+                private void EmitIntrinsic(GenTree node)
+                {
+                    RuntimeMethod method = node.Method ?? throw Unsupported(node, "intrinsic has no runtime method");
+                    if (!RuntimeIntrinsics.TryResolve(method, Target, out RuntimeIntrinsicInfo intrinsic) || intrinsic.Id != node.IntrinsicId)
+                        throw Unsupported(node, $"unrecognized runtime intrinsic {node.IntrinsicId}");
+
+                    switch (intrinsic.Id)
+                    {
+                        case RuntimeIntrinsicId.InterlockedCompareExchange:
+                            EmitInterlockedCompareExchange(node, intrinsic.CompareExchange);
+                            return;
+                        case RuntimeIntrinsicId.InterlockedExchangeAdd:
+                            EmitInterlockedExchangeAdd(node, intrinsic.ExchangeAdd);
+                            return;
+                        default:
+                            throw Unsupported(node, $"unsupported runtime intrinsic {intrinsic.Id}");
+                    }
+                }
+
                 private void EmitCall(GenTree node)
                 {
                     RuntimeMethod method = node.Method ?? throw Unsupported(node, "call has no runtime method");
@@ -4920,6 +4951,11 @@ namespace Cnidaria.Cs
                         if (X86Runtime.TryEvaluateIsReferenceOrContainsReferences(method, out bool result))
                         {
                             EmitIntegerConstant(MachineRegister.X0, result ? 1 : 0, 4);
+                            return;
+                        }
+                        if (X86Runtime.IsAllocateNewArrayInternalCall(method))
+                        {
+                            EmitAllocateNewArray(node, method);
                             return;
                         }
                         if (X86Runtime.IsGcSafePointInternalCall(method))
@@ -4937,6 +4973,127 @@ namespace Cnidaria.Cs
                     MarkEhCallSite(node, "call");
                     _owner.EmitCall(_owner.ResolveMethodLabel(method));
                     _owner.DefineLabel(safePoint.ReturnLabel);
+                }
+
+                private void EmitInterlockedCompareExchange(GenTree node, InterlockedCompareExchangeIntrinsic intrinsic)
+                {
+                    if (Target.PointerSize == 4 && intrinsic.Size == 8)
+                    {
+                        EmitI386InterlockedCompareExchange64(node);
+                        return;
+                    }
+
+                    if (node.Uses.Length != 3)
+                        throw Unsupported(node, $"Interlocked.CompareExchange requires three ABI operands, actual count: {node.Uses.Length}");
+                    if (!node.Uses[0].IsRegister || !node.Uses[1].IsRegister)
+                        throw Unsupported(node, "Interlocked.CompareExchange location and value must be in ABI registers");
+
+                    X86Register location = ToX86Register(node.Uses[0].Register, Target);
+                    X86Register value = ToX86Register(node.Uses[1].Register, Target);
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        EmitNullCheck(node, location, "interlocked_compare_exchange");
+                    RegisterOperand comparand = node.Uses[2];
+                    X86Operand comparandOperand;
+                    if (comparand.IsRegister)
+                    {
+                        comparandOperand = Reg(ToX86Register(comparand.Register, Target), intrinsic.Size);
+                    }
+                    else if (comparand.IsFrameSlot)
+                    {
+                        comparandOperand = FrameMemory(comparand, intrinsic.Size);
+                    }
+                    else
+                    {
+                        throw Unsupported(node, "Interlocked.CompareExchange comparand has an unsupported ABI location");
+                    }
+
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Mov,
+                        Reg(X86Register.Rax, intrinsic.Size),
+                        comparandOperand));
+                    _owner.Emit(X86Instruction.Raw(new byte[] { 0xF0 }));
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Cmpxchg,
+                        Mem(location, 0, intrinsic.Size),
+                        Reg(value, intrinsic.Size)));
+
+                    if (intrinsic.Size is 1 or 2)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            intrinsic.IsSigned ? X86InstrKind.Movsx : X86InstrKind.Movzx,
+                            Reg(X86Register.Rax, 4),
+                            Reg(X86Register.Rax, intrinsic.Size)));
+                    }
+                }
+
+                private void EmitInterlockedExchangeAdd(GenTree node, InterlockedExchangeAddIntrinsic intrinsic)
+                {
+                    if (intrinsic.Size == 8 && Target.PointerSize == 4)
+                        throw Unsupported(node, "64-bit Interlocked.ExchangeAdd is not supported on i386");
+                    if (node.Uses.Length != 2 || !node.Uses[0].IsRegister || !node.Uses[1].IsRegister)
+                        throw Unsupported(node, "Interlocked.ExchangeAdd requires two scalar ABI register operands");
+
+                    X86Register location = ToX86Register(node.Uses[0].Register, Target);
+                    X86Register value = ToX86Register(node.Uses[1].Register, Target);
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        EmitNullCheck(node, location, "interlocked_exchange_add");
+
+                    _owner.Emit(X86Instruction.Raw(new byte[] { 0xF0 }));
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Xadd,
+                        Mem(location, 0, intrinsic.Size),
+                        Reg(value, intrinsic.Size)));
+
+                    if (value != X86Register.Rax)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Reg(X86Register.Rax, intrinsic.Size),
+                            Reg(value, intrinsic.Size)));
+                    }
+                }
+
+                private void EmitI386InterlockedCompareExchange64(GenTree node)
+                {
+                    if (node.Uses.Length != 3 || !node.Uses[0].IsRegister || !node.Uses[1].IsFrameSlot || !node.Uses[2].IsFrameSlot)
+                        throw Unsupported(node, $"64-bit Interlocked.CompareExchange on i386 requires one register and two stack ABI operands, actual count: {node.Uses.Length}");
+
+                    X86Register location = ToX86Register(node.Uses[0].Register, Target);
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        EmitNullCheck(node, location, "interlocked_compare_exchange");
+
+                    X86Operand valueLow = InterlockedAbiOperand(node.Uses[1], 0, 4);
+                    X86Operand valueHigh = InterlockedAbiOperand(node.Uses[1], 4, 4);
+                    X86Operand comparandLow = InterlockedAbiOperand(node.Uses[2], 0, 4);
+                    X86Operand comparandHigh = InterlockedAbiOperand(node.Uses[2], 4, 4);
+
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 4), comparandLow));
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rdx, 4), comparandHigh));
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, comparandLow, Reg(X86Register.Rbx, 4)));
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, comparandHigh, Reg(X86Register.Rsi, 4)));
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Mov,
+                        Reg(X86Register.Rsi, 4),
+                        Reg(location, 4)));
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rbx, 4), valueLow));
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rcx, 4), valueHigh));
+                    _owner.Emit(X86Instruction.Raw(new byte[] { 0xF0, 0x0F, 0xC7, 0x0E }));
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rsi, 4), comparandHigh));
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rbx, 4), comparandLow));
+                }
+
+                private X86Operand InterlockedAbiOperand(RegisterOperand operand, int operandOffset, int size)
+                {
+                    if (operand.IsRegister)
+                    {
+                        if (operandOffset != 0)
+                            throw new InvalidOperationException("Register Interlocked.CompareExchange ABI operands cannot be sliced.");
+                        return Reg(ToX86Register(operand.Register, Target), size);
+                    }
+                    if (!operand.IsFrameSlot)
+                        throw new InvalidOperationException("Interlocked.CompareExchange ABI operand is neither a register nor a frame slot.");
+
+                    return Mem(FrameBase(operand), checked(EffectiveFrameOffset(operand) + operandOffset), size);
                 }
 
                 private void EmitIndirectCall(GenTree node)
@@ -5091,6 +5248,30 @@ namespace Cnidaria.Cs
                     }
 
                     throw Unsupported(node, "VirtualCall node has no receiver ABI operand");
+                }
+
+                private void EmitAllocateNewArray(GenTree node, RuntimeMethod method)
+                {
+                    RuntimeType arrayType = method.ReturnType;
+                    if (arrayType.Kind != RuntimeTypeKind.Array || !arrayType.IsSzArray)
+                        throw Unsupported(node, "RhAllocateNewArray return type is not an SZ array");
+
+                    SafePointDraft safePoint = PrepareSafePoint(node);
+                    PublishGcTransition(safePoint);
+                    X86Register typeArgument = RuntimeArgumentRegister(0);
+                    X86Register lengthArgument = RuntimeArgumentRegister(1);
+                    if (lengthArgument != typeArgument)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Reg(lengthArgument, 4),
+                            Reg(typeArgument, 4)));
+                    }
+                    _owner.EmitLea(typeArgument, _owner.GetTypeDescriptorLabel(arrayType));
+                    MarkEhCallSite(node, "allocate_uninitialized_array");
+                    _owner.EmitCall(_owner.ResolveExternalFunction(X86Runtime.NewUninitializedArraySymbol));
+                    _owner.DefineLabel(safePoint.ReturnLabel);
+                    MoveAllocationResult(node);
                 }
 
                 private void EmitFastAllocateString(GenTree node, RuntimeMethod method)
@@ -6022,6 +6203,10 @@ namespace Cnidaria.Cs
                     {
                         runtimeSymbol = X86Runtime.NewStringFromCharArrayRangeSymbol;
                     }
+                    else if (parameters.Length == 1 && IsReadOnlyCharSpanType(parameters[0]))
+                    {
+                        runtimeSymbol = X86Runtime.NewStringFromReadOnlySpanSymbol;
+                    }
                     else
                     {
                         throw Unsupported(node, "Unsupported System.String constructor shape");
@@ -6061,6 +6246,18 @@ namespace Cnidaria.Cs
                     => type.Kind == RuntimeTypeKind.Pointer &&
                        type.ElementType is not null &&
                        IsCharType(type.ElementType);
+
+                private static bool IsReadOnlyCharSpanType(RuntimeType type)
+                {
+                    if (!StringComparer.Ordinal.Equals(type.Namespace, "System") ||
+                        !type.Name.StartsWith("ReadOnlySpan", StringComparison.Ordinal))
+                    {
+                        return false;
+                    }
+
+                    var arguments = type.GenericTypeArguments;
+                    return arguments.Length == 1 && IsCharType(arguments[0]);
+                }
 
                 private void EmitUnary(GenTree node)
                 {
@@ -6103,6 +6300,7 @@ namespace Cnidaria.Cs
                             return;
                         case BytecodeOp.FnPtrToPtr:
                         case BytecodeOp.PtrToFnPtr:
+                        case BytecodeOp.PtrToByRef:
                             return;
                         default:
                             throw Unsupported(node, $"unsupported unary opcode {node.SourceOp}");
@@ -6539,11 +6737,6 @@ namespace Cnidaria.Cs
 
                     MachineRegister destination = node.Results[0].Register;
                     MachineRegister source = node.Uses[0].Register;
-                    if (node.TreeKind == GenTreeKind.PointerToByRef)
-                    {
-                        EmitRegisterMove(destination, source, Target.PointerSize);
-                        return;
-                    }
 
                     RuntimeType? sourceType = OperandType(node, 0);
                     GenStackKind sourceKind = OperandStackKind(node, 0);

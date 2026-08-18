@@ -287,6 +287,7 @@ namespace Cnidaria.Cs
         {
             if (node.Kind is GenTreeKind.GcPoll or
                 GenTreeKind.ClassInit or
+                GenTreeKind.Intrinsic or
                 GenTreeKind.Call or
                 GenTreeKind.IndirectCall or
                 GenTreeKind.VirtualCall or

@@ -298,7 +298,8 @@ namespace Cnidaria.Cs
         }
         private static bool SignatureEquals(MethodSymbol a, MethodSymbol b)
         {
-            if (!LocalScopeBinder.AreSameType(a.ReturnType, b.ReturnType))
+            if (!LocalScopeBinder.AreSameType(a.ReturnType, b.ReturnType) ||
+                a.ReturnsByRefReadonly != b.ReturnsByRefReadonly)
                 return false;
 
             var ap = a.Parameters;

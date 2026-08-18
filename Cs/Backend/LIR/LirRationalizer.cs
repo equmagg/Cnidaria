@@ -918,7 +918,7 @@ namespace Cnidaria.Cs
                 if (!ProducesValue(tree))
                     return false;
 
-                if (tree.Kind is GenTreeKind.Call or GenTreeKind.IndirectCall or GenTreeKind.VirtualCall or GenTreeKind.DelegateInvoke)
+                if (tree.Kind is GenTreeKind.Intrinsic or GenTreeKind.Call or GenTreeKind.IndirectCall or GenTreeKind.VirtualCall or GenTreeKind.DelegateInvoke)
                 {
                     RuntimeType? returnType;
                     GenStackKind returnKind;
@@ -952,6 +952,7 @@ namespace Cnidaria.Cs
                     return true;
 
                 return tree.Kind is
+                    GenTreeKind.Intrinsic or
                     GenTreeKind.Call or
                     GenTreeKind.IndirectCall or
                     GenTreeKind.VirtualCall or

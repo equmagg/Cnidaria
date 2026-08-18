@@ -4270,6 +4270,7 @@ namespace Cnidaria.Cs
         public ArrowExpressionClauseSyntax? ExpressionBody { get; }
         public EqualsValueClauseSyntax? Initializer { get; }
         public SyntaxToken SemicolonToken { get; }
+        internal bool UsesFieldKeyword { get; }
 
         public PropertyDeclarationSyntax(
             SyntaxList<AttributeListSyntax> attributeLists,
@@ -4280,7 +4281,8 @@ namespace Cnidaria.Cs
             AccessorListSyntax? accessorList,
             ArrowExpressionClauseSyntax? expressionBody,
             EqualsValueClauseSyntax? initializer,
-            SyntaxToken semicolonToken)
+            SyntaxToken semicolonToken,
+            bool usesFieldKeyword = false)
             : base(
                 SyntaxKind.PropertyDeclaration,
                 attributeLists,
@@ -4300,6 +4302,7 @@ namespace Cnidaria.Cs
             ExpressionBody = expressionBody;
             Initializer = initializer;
             SemicolonToken = semicolonToken;
+            UsesFieldKeyword = usesFieldKeyword;
         }
     }
     ///<summary>Represents an event declaration with explicit accessors</summary>

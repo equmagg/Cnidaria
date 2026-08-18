@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.CompilerServices;
 
 namespace System
@@ -6,8 +7,35 @@ namespace System
     {
         internal const bool IsDebug = false;
         internal const bool IsRelease = !IsDebug;
+        public static bool Is64BitProcess => IntPtr.Size == 8;
         internal const string NewLineConst = "\n";
         public static string NewLine => NewLineConst;
+        private static volatile OperatingSystem? s_osVersion;
+        public static OperatingSystem OSVersion
+        {
+            get
+            {
+                OperatingSystem? osVersion = s_osVersion;
+                if (osVersion == null)
+                {
+                    System.Threading.Interlocked.CompareExchange(ref s_osVersion, GetOSVersion(), null);
+                    osVersion = s_osVersion;
+                }
+                return osVersion;
+            }
+        }
+
+        private static OperatingSystem GetOSVersion()
+        {
+            throw new NotSupportedException();
+        }
+
+        public static int ProcessorCount { get; } = 1;
+        /// <summary>Gets the number of milliseconds elapsed since the system started.</summary>
+        /// <value>A 32-bit signed integer containing the amount of time in milliseconds that has passed since the last time the computer was started.</value>
+        public static int TickCount => (int)TickCount64;
+        /// <summary>Gets the number of milliseconds elapsed since the system started.</summary>
+        public static long TickCount64 => throw new NotSupportedException();
     }
 
     public struct Void { }
@@ -37,6 +65,16 @@ namespace System
             return objA == objB;
         }
         public virtual int GetHashCode() { return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(this); }
+        // Returns a Type object which represent this object instance.
+        [Intrinsic]
+        public unsafe Type GetType()
+        {
+            //MethodTable* pMT = RuntimeHelpers.GetMethodTable(this);
+            //RuntimeType type = RuntimeTypeHandle.GetRuntimeType(pMT);
+            //GC.KeepAlive(this);
+            //return type;
+            return null!;
+        }
     }
 
     public class ValueType { }
@@ -280,16 +318,23 @@ namespace System
     }
     public sealed class String
     {
+        private readonly int _stringLength;  // do not rename
+        private char _firstChar;  // do not rename
+
+        /// <summary>Maximum length allowed for a string.</summary>
+        /// <remarks>Keep in sync with AllocateString in gchelpers.cpp.</remarks>
+        internal const int MaxLength = 0x3FFFFFDF;
         public const string Empty = "";
         public int Length
         {
-            [MethodImpl(MethodImplOptions.InternalCall)]
-            get { return 0; }
+            [Intrinsic]
+            get { return _stringLength; }
         }
-        [MethodImpl(MethodImplOptions.InternalCall)]
-        internal ref char GetRawStringData() { throw new NullReferenceException(); }
-        [MethodImpl(MethodImplOptions.InternalCall)]
-        public ref char GetPinnableReference() { throw new NullReferenceException(); }
+        [NonVersionable]
+        public ref readonly char GetPinnableReference() { return ref _firstChar; }
+        internal ref char GetRawStringData() { return ref _firstChar; }
+        internal ref byte GetRawStringDataAsUInt8() { return ref System.Runtime.CompilerServices.Unsafe.As<char, byte>(ref _firstChar); }
+        internal ref ushort GetRawStringDataAsUInt16() { return ref System.Runtime.CompilerServices.Unsafe.As<char, ushort>(ref _firstChar); }
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static string FastAllocateString(int length) { return null; }
         internal String() { }
@@ -320,6 +365,12 @@ namespace System
             for (int i = 0; i < length; i++)
                 System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) = value[startIndex + i];
         }
+        public String(ReadOnlySpan<char> value)
+        {
+            ref char dst = ref GetRawStringData();
+            for (int i = 0; i < value.Length; i++)
+                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) = value[i];
+        }
         public unsafe String(char* value)
         {
             if (value == null) throw new ArgumentNullException("value");
@@ -331,30 +382,71 @@ namespace System
 
         public char this[int index]
         {
+            [Intrinsic]
             get
             {
-                if ((uint)index >= (uint)Length)
+                if ((uint)index >= (uint)_stringLength)
                     throw new IndexOutOfRangeException();
-                ref char r0 = ref GetPinnableReference();
-                return System.Runtime.CompilerServices.Unsafe.Add<char>(ref r0, index);
+                return System.Runtime.CompilerServices.Unsafe.Add<char>(ref _firstChar, index);
             }
         }
 
-        public override string ToString() => this;
-        public override bool Equals(object obj)
+        /// <summary>Copies the contents of this string into the destination span.</summary>
+        /// <param name="destination">The span into which to copy this string's contents.</param>
+        /// <exception cref="ArgumentException">The destination span is shorter than the source string.</exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void CopyTo(Span<char> destination)
         {
-            var s = obj as string;
-            if (s == null) return false;
-            return Equals(s);
+            if ((uint)Length <= (uint)destination.Length)
+            {
+                Buffer.Memmove(ref destination._reference, ref _firstChar, (uint)Length);
+            }
+            else
+            {
+                throw new ArgumentException();
+            }
         }
-        public bool Equals(string other)
+
+        /// <summary>Copies the contents of this string into the destination span.</summary>
+        /// <param name="destination">The span into which to copy this string's contents.</param>
+        /// <returns>true if the data was copied; false if the destination was too short to fit the contents of the string.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool TryCopyTo(Span<char> destination)
         {
-            if ((object)other == null) return false;
-            if ((object)this == (object)other) return true;
+            bool retVal = false;
+            if ((uint)Length <= (uint)destination.Length)
+            {
+                Buffer.Memmove(ref destination._reference, ref _firstChar, (uint)Length);
+                retVal = true;
+            }
+            return retVal;
+        }
+
+        public override string ToString() => this;
+        // Determines whether two strings match.
+        public override bool Equals([NotNullWhen(true)] object? obj)
+        {
+            if (ReferenceEquals(this, obj))
+                return true;
+
+            if (obj is not string str)
+                return false;
+
+            if (this.Length != str.Length)
+                return false;
+
+            return EqualsHelper(this, str);
+        }
+        public bool Equals([NotNullWhen(true)] string? value)
+        {
+            if (ReferenceEquals(this, value))
+                return true;
+            if (value == null)
+                return false;
             int n = Length;
-            if (n != other.Length) return false;
-            ref char a = ref GetPinnableReference();
-            ref char b = ref other.GetPinnableReference();
+            if (n != value.Length) return false;
+            ref char a = ref GetRawStringData();
+            ref char b = ref value.GetRawStringData();
             for (int i = 0; i < n; i++)
             {
                 if (System.Runtime.CompilerServices.Unsafe.Add<char>(ref a, i) !=
@@ -363,16 +455,149 @@ namespace System
             }
             return true;
         }
-        public override int GetHashCode()
+        public bool Equals([NotNullWhen(true)] string? value, StringComparison comparisonType)
         {
-            uint hash = 2166136261u;
-            ref char p = ref GetPinnableReference();
-            for (int i = 0; i < Length; i++)
+            if (ReferenceEquals(this, value))
             {
-                hash ^= (uint)System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i);
-                hash *= 16777619u;
+                CheckStringComparison(comparisonType);
+                return true;
             }
-            return unchecked((int)hash);
+
+            if (value is null)
+            {
+                CheckStringComparison(comparisonType);
+                return false;
+            }
+
+            switch (comparisonType)
+            {
+                case StringComparison.CurrentCulture:
+                case StringComparison.CurrentCultureIgnoreCase:
+                    return System.Globalization.CultureInfo.CurrentCulture.CompareInfo.Compare(this, value, GetCaseCompareOfComparisonCulture(comparisonType)) == 0;
+
+                case StringComparison.InvariantCulture:
+                case StringComparison.InvariantCultureIgnoreCase:
+                    return System.Globalization.CompareInfo.Invariant.Compare(this, value, GetCaseCompareOfComparisonCulture(comparisonType)) == 0;
+
+                case StringComparison.Ordinal:
+                    if (this.Length != value.Length)
+                        return false;
+                    return EqualsHelper(this, value);
+
+                case StringComparison.OrdinalIgnoreCase:
+                    if (this.Length != value.Length)
+                        return false;
+
+                    return EqualsOrdinalIgnoreCaseNoLengthCheck(this, value);
+
+                default:
+                    throw new ArgumentException();
+            }
+        }
+        public static bool Equals(string? a, string? b)
+        {
+            if (ReferenceEquals(a, b))
+            {
+                return true;
+            }
+
+            if (a is null || b is null || a.Length != b.Length)
+            {
+                return false;
+            }
+
+            return EqualsHelper(a, b);
+        }
+        public static bool Equals(string? a, string? b, StringComparison comparisonType)
+        {
+            if (ReferenceEquals(a, b))
+            {
+                CheckStringComparison(comparisonType);
+                return true;
+            }
+
+            if (a is null || b is null)
+            {
+                CheckStringComparison(comparisonType);
+                return false;
+            }
+
+            switch (comparisonType)
+            {
+                case StringComparison.CurrentCulture:
+                case StringComparison.CurrentCultureIgnoreCase:
+                    return CultureInfo.CurrentCulture.CompareInfo.Compare(a, b, GetCaseCompareOfComparisonCulture(comparisonType)) == 0;
+
+                case StringComparison.InvariantCulture:
+                case StringComparison.InvariantCultureIgnoreCase:
+                    return CompareInfo.Invariant.Compare(a, b, GetCaseCompareOfComparisonCulture(comparisonType)) == 0;
+
+                case StringComparison.Ordinal:
+                    if (a.Length != b.Length)
+                        return false;
+                    return EqualsHelper(a, b);
+
+                case StringComparison.OrdinalIgnoreCase:
+                    if (a.Length != b.Length)
+                        return false;
+
+                    return EqualsOrdinalIgnoreCaseNoLengthCheck(a, b);
+
+                default:
+                    throw new ArgumentException();
+            }
+        }
+        private static bool EqualsOrdinalIgnoreCaseNoLengthCheck(string strA, string strB)
+        {
+            return System.Globalization.Ordinal.EqualsIgnoreCase(ref strA.GetRawStringData(), ref strB.GetRawStringData(), strB.Length);
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool EqualsHelper(string strA, string strB)
+        {
+            return SpanHelpers.SequenceEqual(
+                ref strA.GetRawStringDataAsUInt8(),
+                ref strB.GetRawStringDataAsUInt8(),
+                ((uint)strA.Length) * sizeof(char));
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int CompareOrdinalHelper(string strA, int indexA, int countA, string strB, int indexB, int countB)
+        {
+            return SpanHelpers.SequenceCompareTo(
+                ref Unsafe.Add(ref strA.GetRawStringData(), (nint)(uint)indexA /* force zero-extension */), countA,
+                ref Unsafe.Add(ref strB.GetRawStringData(), (nint)(uint)indexB /* force zero-extension */), countB);
+        }
+        internal static void CheckStringComparison(StringComparison comparisonType)
+        {
+            // Single comparison to check if comparisonType is within [CurrentCulture .. OrdinalIgnoreCase]
+            if ((uint)comparisonType > (uint)StringComparison.OrdinalIgnoreCase)
+            {
+                throw new ArgumentException();
+            }
+        }
+        internal static System.Globalization.CompareOptions GetCaseCompareOfComparisonCulture(StringComparison comparisonType)
+        {
+            // Culture enums can be & with CompareOptions.IgnoreCase 0x01 to extract if IgnoreCase or CompareOptions.None 0x00
+            //
+            // CompareOptions.None                          0x00
+            // CompareOptions.IgnoreCase                    0x01
+            //
+            // StringComparison.CurrentCulture:             0x00
+            // StringComparison.InvariantCulture:           0x02
+            // StringComparison.Ordinal                     0x04
+            //
+            // StringComparison.CurrentCultureIgnoreCase:   0x01
+            // StringComparison.InvariantCultureIgnoreCase: 0x03
+            // StringComparison.OrdinalIgnoreCase           0x05
+
+            return (System.Globalization.CompareOptions)((int)comparisonType & (int)System.Globalization.CompareOptions.IgnoreCase);
+        }
+        private static System.Globalization.CompareOptions GetCompareOptionsFromOrdinalStringComparison(StringComparison comparisonType)
+        {
+            // StringComparison.Ordinal (0x04) --> CompareOptions.Ordinal (0x4000_0000)
+            // StringComparison.OrdinalIgnoreCase (0x05) -> CompareOptions.OrdinalIgnoreCase (0x1000_0000)
+
+            int ct = (int)comparisonType;
+            return (System.Globalization.CompareOptions)((ct & -ct) << 28); // neg and shl
         }
         public static bool operator ==(string left, string right)
         {
@@ -381,6 +606,134 @@ namespace System
             return left.Equals(right);
         }
         public static bool operator !=(string left, string right) => !(left == right);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public override int GetHashCode()
+        {
+            ulong seed = Marvin.DefaultSeed;
+
+            // Multiplication below will not overflow since going from positive Int32 to UInt32.
+            return Marvin.ComputeHash32(ref Unsafe.As<char, byte>(ref _firstChar), (uint)_stringLength * 2 /* in bytes, not chars */, (uint)seed, (uint)(seed >> 32));
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal int GetHashCodeOrdinalIgnoreCase()
+        {
+            ulong seed = Marvin.DefaultSeed;
+            return Marvin.ComputeHash32OrdinalIgnoreCase(ref _firstChar, _stringLength /* in chars, not bytes */, (uint)seed, (uint)(seed >> 32));
+        }
+        // A span-based equivalent of String.GetHashCode(). Computes an ordinal hash code.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int GetHashCode(ReadOnlySpan<char> value)
+        {
+            ulong seed = Marvin.DefaultSeed;
+
+            // Multiplication below will not overflow since going from positive Int32 to UInt32.
+            return Marvin.ComputeHash32(ref Unsafe.As<char, byte>(
+                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(value)), (uint)value.Length * 2 /* in bytes, not chars */, (uint)seed, (uint)(seed >> 32));
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static int GetHashCodeOrdinalIgnoreCase(ReadOnlySpan<char> value)
+        {
+            ulong seed = Marvin.DefaultSeed;
+            return Marvin.ComputeHash32OrdinalIgnoreCase(
+                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(value), value.Length /* in chars, not bytes */, (uint)seed, (uint)(seed >> 32));
+        }
+        // Important GetNonRandomizedHashCode{OrdinalIgnoreCase} notes:
+        //
+        // Use if and only if 'Denial of Service' attacks are not a concern (i.e. never used for free-form user input),
+        // or are otherwise mitigated.
+        //
+        // The string-based implementation relies on System.String being null terminated. All reads are performed
+        // two characters at a time, so for odd-length strings, the final read will include the null terminator.
+        // This implementation must not be used as-is with spans, or otherwise arbitrary char refs/pointers, as
+        // they're not guaranteed to be null-terminated.
+        //
+        // For spans, we must produce the exact same value as is used for strings: consumers like Dictionary<>
+        // rely on str.GetNonRandomizedHashCode() == GetNonRandomizedHashCode(str.AsSpan()). As such, we must
+        // restructure the comparison so that for odd-length spans, we simulate the null terminator and include
+        // it in the hash computation exactly as does str.GetNonRandomizedHashCode().
+        internal unsafe int GetNonRandomizedHashCode()
+        {
+            fixed (char* src = &_firstChar)
+            {
+                uint hash1 = (5381 << 16) + 5381;
+                uint hash2 = hash1;
+
+                uint* ptr = (uint*)src;
+                int length = Length;
+
+                while (length > 2)
+                {
+                    length -= 4;
+                    hash1 = (System.Numerics.BitOperations.RotateLeft(hash1, 5) + hash1) ^ ptr[0];
+                    hash2 = (System.Numerics.BitOperations.RotateLeft(hash2, 5) + hash2) ^ ptr[1];
+                    ptr += 2;
+                }
+
+                if (length > 0)
+                {
+                    hash2 = (System.Numerics.BitOperations.RotateLeft(hash2, 5) + hash2) ^ ptr[0];
+                }
+
+                return (int)(hash1 + (hash2 * 1566083941));
+            }
+        }
+
+        internal static unsafe int GetNonRandomizedHashCode(ReadOnlySpan<char> span)
+        {
+            uint hash1 = (5381 << 16) + 5381;
+            uint hash2 = hash1;
+
+            int length = span.Length;
+            fixed (char* src = &System.Runtime.InteropServices.MemoryMarshal.GetReference(span))
+            {
+                uint* ptr = (uint*)src;
+
+            LengthSwitch:
+                switch (length)
+                {
+                    default:
+                        do
+                        {
+                            length -= 4;
+                            hash1 = System.Numerics.BitOperations.RotateLeft(hash1, 5) + hash1 ^ Unsafe.ReadUnaligned<uint>(ptr);
+                            hash2 = System.Numerics.BitOperations.RotateLeft(hash2, 5) + hash2 ^ Unsafe.ReadUnaligned<uint>(ptr + 1);
+                            ptr += 2;
+                        }
+                        while (length >= 4);
+                        goto LengthSwitch;
+
+                    case 3:
+                        hash1 = BitOperations.RotateLeft(hash1, 5) + hash1 ^ Unsafe.ReadUnaligned<uint>(ptr);
+                        uint p1 = *(char*)(ptr + 1);
+                        if (!BitConverter.IsLittleEndian)
+                        {
+                            p1 <<= 16;
+                        }
+
+                        hash2 = BitOperations.RotateLeft(hash2, 5) + hash2 ^ p1;
+                        break;
+
+                    case 2:
+                        hash2 = BitOperations.RotateLeft(hash2, 5) + hash2 ^ Unsafe.ReadUnaligned<uint>(ptr);
+                        break;
+
+                    case 1:
+                        uint p0 = *(char*)ptr;
+                        if (!BitConverter.IsLittleEndian)
+                        {
+                            p0 <<= 16;
+                        }
+
+                        hash2 = BitOperations.RotateLeft(hash2, 5) + hash2 ^ p0;
+                        break;
+
+                    case 0:
+                        break;
+                }
+            }
+
+            return (int)(hash1 + (hash2 * 1_566_083_941));
+        }
         public static bool IsNullOrEmpty(string value) => (object)value == null || value.Length == 0;
         public static bool IsNullOrWhiteSpace(string value)
         {
@@ -388,7 +741,7 @@ namespace System
             int n = value.Length;
             if (n == 0) return true;
 
-            ref char p = ref value.GetPinnableReference();
+            ref char p = ref value.GetRawStringData();
             for (int i = 0; i < n; i++)
             {
                 if (!Char.IsWhiteSpace(System.Runtime.CompilerServices.Unsafe.Add<char>(ref p, i)))
@@ -398,7 +751,7 @@ namespace System
         }
         public ReadOnlySpan<char> AsSpan()
         {
-            ref char r = ref GetPinnableReference();
+            ref char r = ref GetRawStringData();
             return new ReadOnlySpan<char>(ref r, Length);
         }
         public ReadOnlySpan<char> AsSpan(int start)
@@ -407,7 +760,7 @@ namespace System
             if ((uint)start > (uint)len)
                 throw new ArgumentOutOfRangeException("start");
 
-            ref char r = ref GetPinnableReference();
+            ref char r = ref GetRawStringData();
             return new ReadOnlySpan<char>(
                 ref System.Runtime.CompilerServices.Unsafe.Add<char>(ref r, start),
                 len - start);
@@ -420,14 +773,35 @@ namespace System
             if ((uint)length > (uint)(len - start))
                 throw new ArgumentOutOfRangeException("length");
 
-            ref char r = ref GetPinnableReference();
+            ref char r = ref GetRawStringData();
             return new ReadOnlySpan<char>(
                 ref System.Runtime.CompilerServices.Unsafe.Add<char>(ref r, start),
                 length);
         }
+
+        /// <summary>Creates a new string by using the specified provider to control the formatting of the specified interpolated string.</summary>
+        /// <param name="provider">An object that supplies culture-specific formatting information.</param>
+        /// <param name="handler">The interpolated string.</param>
+        /// <returns>The string that results for formatting the interpolated string using the specified format provider.</returns>
+        public static string Create(
+            IFormatProvider? provider,
+            [InterpolatedStringHandlerArgument(nameof(provider))] ref DefaultInterpolatedStringHandler handler) =>
+            handler.ToStringAndClear();
+
+        /// <summary>Creates a new string by using the specified provider to control the formatting of the specified interpolated string.</summary>
+        /// <param name="provider">An object that supplies culture-specific formatting information.</param>
+        /// <param name="initialBuffer">The initial buffer that may be used as temporary space as part of the formatting operation. The contents of this buffer may be overwritten.</param>
+        /// <param name="handler">The interpolated string.</param>
+        /// <returns>The string that results for formatting the interpolated string using the specified format provider.</returns>
+        public static string Create(
+            IFormatProvider? provider,
+            Span<char> initialBuffer,
+            [InterpolatedStringHandlerArgument(nameof(provider), nameof(initialBuffer))] ref DefaultInterpolatedStringHandler handler) =>
+            handler.ToStringAndClear();
+
         public static implicit operator ReadOnlySpan<char>(String? value)
         {
-            ref char r = ref value.GetPinnableReference();
+            ref char r = ref value.GetRawStringData();
             return new ReadOnlySpan<char>(ref r, value.Length);
         }
         public string Substring(int startIndex) => Substring(startIndex, Length - startIndex);
@@ -442,7 +816,7 @@ namespace System
 
             string dstStr = FastAllocateString(length);
             ref char dst = ref dstStr.GetRawStringData();
-            ref char src = ref GetPinnableReference();
+            ref char src = ref GetRawStringData();
 
             for (int i = 0; i < length; i++)
                 System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) =
@@ -465,7 +839,7 @@ namespace System
             if (count < 0 || startIndex > len - count) throw new ArgumentOutOfRangeException("count");
 
             int end = startIndex + count;
-            ref char src = ref GetPinnableReference();
+            ref char src = ref GetRawStringData();
 
             for (int i = startIndex; i < end; i++)
             {
@@ -498,8 +872,8 @@ namespace System
             if (m == 1) return IndexOf(value[0], startIndex, count);
             if (m > count) return -1;
 
-            ref char a = ref GetPinnableReference();
-            ref char b = ref value.GetPinnableReference();
+            ref char a = ref GetRawStringData();
+            ref char b = ref value.GetRawStringData();
 
             int last = startIndex + count - m;
             char b0 = System.Runtime.CompilerServices.Unsafe.Add<char>(ref b, 0);
@@ -529,7 +903,7 @@ namespace System
             int n = Length;
             if (n == 0) return -1;
 
-            ref char src = ref GetPinnableReference();
+            ref char src = ref GetRawStringData();
             for (int i = n - 1; i >= 0; i--)
                 if (System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i) == value)
                     return i;
@@ -550,7 +924,7 @@ namespace System
 
             int startSearchAt = startIndex + 1 - count;
 
-            ref char src = ref GetPinnableReference();
+            ref char src = ref GetRawStringData();
             for (int i = startIndex; i >= startSearchAt; i--)
                 if (System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i) == value)
                     return i;
@@ -599,8 +973,8 @@ namespace System
 
             if (valueLen > count) return -1;
 
-            ref char a = ref GetPinnableReference();
-            ref char b = ref value.GetPinnableReference();
+            ref char a = ref GetRawStringData();
+            ref char b = ref value.GetRawStringData();
 
             int last = startIndex - valueLen + 1;
             for (int i = last; i >= searchStart; i--)
@@ -628,8 +1002,8 @@ namespace System
             int n = value.Length;
             if (n > Length) return false;
 
-            ref char a = ref GetPinnableReference();
-            ref char b = ref value.GetPinnableReference();
+            ref char a = ref GetRawStringData();
+            ref char b = ref value.GetRawStringData();
             for (int i = 0; i < n; i++)
                 if (System.Runtime.CompilerServices.Unsafe.Add<char>(ref a, i) !=
                     System.Runtime.CompilerServices.Unsafe.Add<char>(ref b, i))
@@ -643,8 +1017,8 @@ namespace System
             int len = Length;
             if (n > len) return false;
 
-            ref char a = ref GetPinnableReference();
-            ref char b = ref value.GetPinnableReference();
+            ref char a = ref GetRawStringData();
+            ref char b = ref value.GetRawStringData();
             int start = len - n;
             for (int i = 0; i < n; i++)
                 if (System.Runtime.CompilerServices.Unsafe.Add<char>(ref a, start + i) !=
@@ -658,7 +1032,7 @@ namespace System
             if (n == 0) return this;
 
             // Find first occurrence
-            ref char src = ref GetPinnableReference();
+            ref char src = ref GetRawStringData();
             int first = -1;
             for (int i = 0; i < n; i++)
             {
@@ -713,8 +1087,8 @@ namespace System
             string dstStr = FastAllocateString((int)resultLen);
             ref char dst = ref dstStr.GetRawStringData();
 
-            ref char src = ref GetPinnableReference();
-            ref char ov = ref oldValue.GetPinnableReference();
+            ref char src = ref GetRawStringData();
+            ref char ov = ref oldValue.GetRawStringData();
 
             int srcPos = 0;
             int dstPos = 0;
@@ -753,7 +1127,7 @@ namespace System
         {
             int n = Length;
             var a = new char[n];
-            ref char src = ref GetPinnableReference();
+            ref char src = ref GetRawStringData();
             for (int i = 0; i < n; i++)
                 a[i] = System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i);
             return a;
@@ -771,7 +1145,7 @@ namespace System
             int len = srcStr.Length;
             if (len == 0) return;
 
-            ref char src = ref srcStr.GetPinnableReference();
+            ref char src = ref srcStr.GetRawStringData();
             for (int i = 0; i < len; i++)
                 System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, dstIndex + i) =
                     System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i);
@@ -827,7 +1201,7 @@ namespace System
                 int len = s.Length;
                 if (len != 0)
                 {
-                    ref char src = ref s.GetPinnableReference();
+                    ref char src = ref s.GetRawStringData();
                     for (int k = 0; k < len; k++)
                         System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos + k) =
                             System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, k);
@@ -853,7 +1227,7 @@ namespace System
             int pos = 0;
             if (la != 0)
             {
-                ref char src = ref a.GetPinnableReference();
+                ref char src = ref a.GetRawStringData();
                 for (int i = 0; i < la; i++)
                     System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) =
                         System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i);
@@ -861,7 +1235,7 @@ namespace System
             }
             if (lb != 0)
             {
-                ref char src = ref b.GetPinnableReference();
+                ref char src = ref b.GetRawStringData();
                 for (int i = 0; i < lb; i++)
                     System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, pos + i) =
                         System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i);
@@ -1161,7 +1535,7 @@ namespace System
             if (len == 0)
                 return Array.Empty<int>();
 
-            ref char src = ref source.GetPinnableReference();
+            ref char src = ref source.GetRawStringData();
 
             // count separators
             for (int i = 0; i < len; i++)
@@ -1494,7 +1868,7 @@ namespace System
             for (int i = 0; i < padCount; i++)
                 System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) = paddingChar;
 
-            ref char src = ref GetPinnableReference();
+            ref char src = ref GetRawStringData();
             for (int i = 0; i < oldLength; i++)
                 System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, padCount + i) =
                     System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i);
@@ -1514,7 +1888,7 @@ namespace System
             string result = FastAllocateString(totalWidth);
             ref char dst = ref result.GetRawStringData();
 
-            ref char src = ref GetPinnableReference();
+            ref char src = ref GetRawStringData();
             for (int i = 0; i < oldLength; i++)
                 System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) =
                     System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i);
@@ -1541,6 +1915,158 @@ namespace System
         public string ToUpperInvariant()
         {
             return System.Globalization.TextInfo.Invariant.ToUpper(this);
+        }
+
+
+
+        private static unsafe int CompareOrdinalHelper(string strA, string strB)
+        {
+            int length = Math.Min(strA.Length, strB.Length);
+
+            fixed (char* ap = &strA._firstChar) fixed (char* bp = &strB._firstChar)
+            {
+                char* a = ap;
+                char* b = bp;
+
+                if (*(a + 1) != *(b + 1)) goto DiffOffset1;
+
+                length -= 2; a += 2; b += 2;
+
+                // unroll the loop
+#if TARGET_64BIT
+                while (length >= 12)
+                {
+                    if (*(long*)a != *(long*)b) goto DiffOffset0;
+                    if (*(long*)(a + 4) != *(long*)(b + 4)) goto DiffOffset4;
+                    if (*(long*)(a + 8) != *(long*)(b + 8)) goto DiffOffset8;
+                    length -= 12; a += 12; b += 12;
+                }
+#else // TARGET_64BIT
+                while (length >= 10)
+                {
+                    if (*(int*)a != *(int*)b) goto DiffOffset0;
+                    if (*(int*)(a + 2) != *(int*)(b + 2)) goto DiffOffset2;
+                    if (*(int*)(a + 4) != *(int*)(b + 4)) goto DiffOffset4;
+                    if (*(int*)(a + 6) != *(int*)(b + 6)) goto DiffOffset6;
+                    if (*(int*)(a + 8) != *(int*)(b + 8)) goto DiffOffset8;
+                    length -= 10; a += 10; b += 10;
+                }
+#endif // TARGET_64BIT
+
+                // Fallback loop:
+                // go back to slower code path and do comparison on 4 bytes at a time.
+                // This depends on the fact that the String objects are
+                // always zero terminated and that the terminating zero is not included
+                // in the length. For odd string sizes, the last compare will include
+                // the zero terminator.
+                while (length > 0)
+                {
+                    if (*(int*)a != *(int*)b) goto DiffNextInt;
+                    length -= 2;
+                    a += 2;
+                    b += 2;
+                }
+
+                // At this point, we have compared all the characters in at least one string.
+                // The longer string will be larger.
+                return strA.Length - strB.Length;
+
+#if TARGET_64BIT
+            DiffOffset8: a += 4; b += 4;
+            DiffOffset4: a += 4; b += 4;
+#else // TARGET_64BIT
+                // Use jumps instead of falling through, since
+                // otherwise going to DiffOffset8 will involve
+                // 8 add instructions before getting to DiffNextInt
+            DiffOffset8: a += 8; b += 8; goto DiffOffset0;
+            DiffOffset6: a += 6; b += 6; goto DiffOffset0;
+            DiffOffset4: a += 2; b += 2;
+            DiffOffset2: a += 2; b += 2;
+#endif // TARGET_64BIT
+
+            DiffOffset0:
+                // If we reached here, we already see a difference in the unrolled loop above
+#if TARGET_64BIT
+                if (*(int*)a == *(int*)b)
+                {
+                    a += 2; b += 2;
+                }
+#endif // TARGET_64BIT
+
+            DiffNextInt:
+                if (*a != *b) return *a - *b;
+
+            DiffOffset1:
+                return *(a + 1) - *(b + 1);
+            }
+        }
+
+        public static int CompareOrdinal(string? strA, string? strB)
+        {
+            if (object.ReferenceEquals(strA, strB))
+            {
+                return 0;
+            }
+
+            // They can't both be null at this point.
+            if (strA == null)
+            {
+                return -1;
+            }
+            if (strB == null)
+            {
+                return 1;
+            }
+
+            // Most common case, first character is different.
+            // This will return false for empty strings.
+            if (strA._firstChar != strB._firstChar)
+            {
+                return strA._firstChar - strB._firstChar;
+            }
+
+            return CompareOrdinalHelper(strA, strB);
+        }
+
+        public static int CompareOrdinal(string? strA, int indexA, string? strB, int indexB, int length)
+        {
+            if (strA == null || strB == null)
+            {
+                if (object.ReferenceEquals(strA, strB))
+                {
+                    // They're both null
+                    return 0;
+                }
+
+                return strA == null ? -1 : 1;
+            }
+
+            if (length < 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(length));
+            }
+
+            if (indexA < 0 || indexB < 0)
+            {
+                string paramName = indexA < 0 ? nameof(indexA) : nameof(indexB);
+                throw new ArgumentOutOfRangeException(paramName);
+            }
+
+            int lengthA = Math.Min(length, strA.Length - indexA);
+            int lengthB = Math.Min(length, strB.Length - indexB);
+
+            if (lengthA < 0 || lengthB < 0)
+            {
+                string paramName = lengthA < 0 ? nameof(indexA) : nameof(indexB);
+                throw new ArgumentOutOfRangeException(paramName);
+            }
+
+            if (length == 0 || (object.ReferenceEquals(strA, strB) && indexA == indexB))
+            {
+                return 0;
+            }
+
+            return CompareOrdinalHelper(strA, indexA, lengthA, strB, indexB, lengthB);
         }
     }
 
@@ -1645,6 +2171,44 @@ namespace System
         private static bool IsWhiteSpaceLatin1(char c) => (Latin1CharInfo[c] & IsWhiteSpaceFlag) != 0;
         private static System.Globalization.UnicodeCategory GetLatin1UnicodeCategory(char c)
             => (System.Globalization.UnicodeCategory)(Latin1CharInfo[c] & UnicodeCategoryMask);
+
+        public static bool IsHighSurrogate(char c)
+        {
+            return IsBetween(c, System.Globalization.CharUnicodeInfo.HIGH_SURROGATE_START, System.Globalization.CharUnicodeInfo.HIGH_SURROGATE_END);
+        }
+
+        public static bool IsHighSurrogate(string s, int index)
+        {
+            if (s == null)
+            {
+                throw new ArgumentNullException();
+            }
+            if ((uint)index >= (uint)s.Length)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+
+            return IsHighSurrogate(s[index]);
+        }
+        public static bool IsLowSurrogate(char c)
+        {
+            return IsBetween(c, System.Globalization.CharUnicodeInfo.LOW_SURROGATE_START, System.Globalization.CharUnicodeInfo.LOW_SURROGATE_END);
+        }
+
+        public static bool IsLowSurrogate(string s, int index)
+        {
+            if (s == null)
+            {
+                throw new ArgumentNullException();
+            }
+            if ((uint)index >= (uint)s.Length)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+
+            return IsLowSurrogate(s[index]);
+        }
+
     }
 
     public readonly struct SByte
@@ -1872,10 +2436,61 @@ namespace System
         }
     }
     public readonly struct Int32
+        : IComparable
     {
-        private readonly int m_value;
+        private readonly int m_value; // Do not rename
+
         public const int MaxValue = 0x7fffffff;
         public const int MinValue = unchecked((int)0x80000000);
+
+        /// <summary>Represents the additive identity (0).</summary>
+        private const int AdditiveIdentity = 0;
+
+        /// <summary>Represents the multiplicative identity (1).</summary>
+        private const int MultiplicativeIdentity = 1;
+
+        /// <summary>Represents the number one (1).</summary>
+        private const int One = 1;
+
+        /// <summary>Represents the number zero (0).</summary>
+        private const int Zero = 0;
+
+        /// <summary>Represents the number negative one (-1).</summary>
+        private const int NegativeOne = -1;
+
+        /// <summary>Produces the full product of two 32-bit numbers.</summary>
+        /// <param name="left">The first number to multiply.</param>
+        /// <param name="right">The second number to multiply.</param>
+        /// <returns>The number containing the product of the specified numbers.</returns>
+        public static long BigMul(int left, int right) => Math.BigMul(left, right);
+
+        public int CompareTo(object? value)
+        {
+            if (value == null)
+            {
+                return 1;
+            }
+
+            // NOTE: Cannot use return (_value - value) as this causes a wrap
+            // around in cases where _value - value > MaxValue.
+            if (value is int i)
+            {
+                if (m_value < i) return -1;
+                if (m_value > i) return 1;
+                return 0;
+            }
+
+            throw new ArgumentException();
+        }
+
+        public int CompareTo(int value)
+        {
+            // NOTE: Cannot use return (_value - value) as this causes a wrap
+            // around in cases where _value - value > MaxValue.
+            if (m_value < value) return -1;
+            if (m_value > value) return 1;
+            return 0;
+        }
 
         public bool Equals(int obj)
         {
@@ -1999,6 +2614,85 @@ namespace System
         public string ToString(string format)
         {
             return System.Number.FormatUInt32(m_value, format, null);
+        }
+
+        public bool TryFormat(Span<char> destination, out int charsWritten, ReadOnlySpan<char> format = default, IFormatProvider? provider = null)
+        {
+            return Number.TryFormatUInt32(m_value, format, provider, destination, out charsWritten);
+        }
+
+        public bool TryFormat(Span<byte> utf8Destination, out int bytesWritten, ReadOnlySpan<char> format = default, IFormatProvider? provider = null)
+        {
+            return Number.TryFormatUInt32(m_value, format, provider, utf8Destination, out bytesWritten);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static uint CreateTruncating<TOther>(TOther value)
+            where TOther : System.Numerics.INumberBase<TOther>
+        {
+            uint result;
+
+            if (typeof(TOther) == typeof(uint))
+            {
+                result = (uint)(object)value;
+            }
+            else if (!TryConvertFromTruncating(value, out result) && !TOther.TryConvertToTruncating(value, out result))
+            {
+                throw new NotSupportedException();
+            }
+
+            return result;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool TryConvertFromTruncating<TOther>(TOther value, out uint result)
+            where TOther : System.Numerics.INumberBase<TOther>
+        {
+            if (typeof(TOther) == typeof(byte))
+            {
+                byte actualValue = (byte)(object)value;
+                result = actualValue;
+                return true;
+            }
+            else if (typeof(TOther) == typeof(char))
+            {
+                char actualValue = (char)(object)value;
+                result = actualValue;
+                return true;
+            }
+            else if (typeof(TOther) == typeof(decimal))
+            {
+                throw new NotSupportedException();
+            }
+            else if (typeof(TOther) == typeof(ushort))
+            {
+                ushort actualValue = (ushort)(object)value;
+                result = actualValue;
+                return true;
+            }
+            else if (typeof(TOther) == typeof(ulong))
+            {
+                ulong actualValue = (ulong)(object)value;
+                result = (uint)actualValue;
+                return true;
+            }
+            else if (typeof(TOther) == typeof(UInt128))
+            {
+                UInt128 actualValue = (UInt128)(object)value;
+                result = (uint)actualValue;
+                return true;
+            }
+            else if (typeof(TOther) == typeof(nuint))
+            {
+                nuint actualValue = (nuint)(object)value;
+                result = (uint)actualValue;
+                return true;
+            }
+            else
+            {
+                result = default;
+                return false;
+            }
         }
     }
     public readonly struct Int64
@@ -2801,63 +3495,98 @@ namespace System
             return zeroCount;
         }
     }
-    public sealed class NumberFormatInfo
-    {
-        internal string _positiveSign = "+";
-        internal string _negativeSign = "-";
-        internal string _numberDecimalSeparator = ".";
-        internal string _numberGroupSeparator = ",";
-        internal string _currencyGroupSeparator = ",";
-        internal string _currencyDecimalSeparator = ".";
-        internal string _currencySymbol = "\x00a4";
-        internal string _nanSymbol = "NaN";
-        internal string _positiveInfinitySymbol = "Infinity";
-        internal string _negativeInfinitySymbol = "-Infinity";
-        internal string _percentDecimalSeparator = ".";
-        internal string _percentGroupSeparator = ",";
-        internal string _percentSymbol = "%";
-        internal string _perMilleSymbol = "\u2030";
-
-        internal byte[]? _positiveSignUtf8;
-        internal byte[]? _negativeSignUtf8;
-        internal byte[]? _currencySymbolUtf8;
-        internal byte[]? _numberDecimalSeparatorUtf8;
-        internal byte[]? _currencyDecimalSeparatorUtf8;
-        internal byte[]? _currencyGroupSeparatorUtf8;
-        internal byte[]? _numberGroupSeparatorUtf8;
-        internal byte[]? _percentSymbolUtf8;
-        internal byte[]? _percentDecimalSeparatorUtf8;
-        internal byte[]? _percentGroupSeparatorUtf8;
-        internal byte[]? _perMilleSymbolUtf8;
-        internal byte[]? _nanSymbolUtf8;
-        internal byte[]? _positiveInfinitySymbolUtf8;
-        internal byte[]? _negativeInfinitySymbolUtf8;
-
-        internal int _numberDecimalDigits = 2;
-        internal int _currencyDecimalDigits = 2;
-        internal int _currencyPositivePattern;
-        internal int _currencyNegativePattern;
-        internal int _numberNegativePattern = 1;
-        internal int _percentPositivePattern;
-        internal int _percentNegativePattern;
-        internal int _percentDecimalDigits = 2;
-
-        internal int _digitSubstitution = (int)DigitShapes.None;
-
-        internal bool _isReadOnly;
-
-        private bool _hasInvariantNumberSigns = true;
-
-        private bool _allowHyphenDuringParsing;
-
-        public NumberFormatInfo()
-        {
-
-        }
-    }
     internal static unsafe class Number
     {
+        // We need 1 additional byte, per length, for the terminating null
+        internal const int DecimalNumberBufferLength = 29 + 1 + 1;  // 29 for the longest input + 1 for rounding
+        internal const int DoubleNumberBufferLength = 767 + 1 + 1;  // 767 for the longest input + 1 for rounding: 4.9406564584124654E-324
+        internal const int Int32NumberBufferLength = 10 + 1;    // 10 for the longest input: 2,147,483,647
+        internal const int Int64NumberBufferLength = 19 + 1;    // 19 for the longest input: 9,223,372,036,854,775,807
+        internal const int Int128NumberBufferLength = 39 + 1;    // 39 for the longest input: 170,141,183,460,469,231,731,687,303,715,884,105,727
+        internal const int SingleNumberBufferLength = 112 + 1 + 1;  // 112 for the longest input + 1 for rounding: 1.40129846E-45
+        internal const int HalfNumberBufferLength = 21 + 1 + 1; // 21 for the longest input + 1 for rounding: 0.000122010707855224609375
+        internal const int UInt32NumberBufferLength = 10 + 1;   // 10 for the longest input: 4,294,967,295
+        internal const int UInt64NumberBufferLength = 20 + 1;   // 20 for the longest input: 18,446,744,073,709,551,615
+        internal const int UInt128NumberBufferLength = 39 + 1; // 39 for the longest input: 340,282,366,920,938,463,463,374,607,431,768,211,455
+        internal const int Decimal32NumberBufferLength = 7 + 1 + 1; // 7 for the longest input + 1 for rounding
+        internal const int Decimal64NumberBufferLength = 16 + 1 + 1; // 16 for the longest input + 1 for rounding
+        internal const int Decimal128NumberBufferLength = 34 + 1 + 1; // 34 for the longest input + 1 for rounding
+
+        internal unsafe ref struct NumberBuffer
+        {
+            public int DigitsCount;
+            public int Scale;
+            public bool IsNegative;
+            public bool HasNonZeroTail;
+            public NumberBufferKind Kind;
+            public Span<byte> Digits;
+            /// <safety>Converts the ref to Digits into a pointer value via Unsafe.AsPointer and returns it without dereferencing; 
+            /// the result is not GC-tracked, so any use must be in an unsafe context that establishes Digits still refers to unmovable memory.</safety>
+            public readonly byte* DigitsPtr => 
+                (byte*)Unsafe.AsPointer(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(Digits)); // safe since constructor expects Digits to refer to unmovable memory
+
+            public NumberBuffer(NumberBufferKind kind, byte* digits, int digitsLength) : this(kind, new Span<byte>(digits, digitsLength))
+            {
+
+            }
+
+            public NumberBuffer(NumberBufferKind kind, Span<byte> digits)
+            {
+                DigitsCount = 0;
+                Scale = 0;
+                IsNegative = false;
+                HasNonZeroTail = false;
+                Kind = kind;
+                Digits = digits;
+                Digits[0] = (byte)'\0';
+            }
+        }
+        internal enum NumberBufferKind : byte
+        {
+            Unknown = 0,
+            Integer = 1,
+            Decimal = 2,
+            FloatingPoint = 3,
+
+            /// <summary>
+            /// An IEEE 754 decimal interchange format. Unlike <see cref="NumberBufferKind.FloatingPoint"/> the buffer
+            /// holds the exact coefficient rather than a pre-rounded shortest representation, so formatting must round
+            /// it; unlike <see cref="NumberBufferKind.Decimal"/> that rounding is ties-to-even and a signed zero must
+            /// survive it.
+            /// </summary>
+            DecimalIeee754 = 4,
+        }
+
         internal const int DecimalPrecision = 29;
+        private const int SmallNumberCacheLength = 300;
+
+        private static ReadOnlySpan<byte> TwoDigitsCharsAsBytes =>
+            System.Runtime.InteropServices.MemoryMarshal.AsBytes<char>("00010203040506070809" +
+                                        "10111213141516171819" +
+                                        "20212223242526272829" +
+                                        "30313233343536373839" +
+                                        "40414243444546474849" +
+                                        "50515253545556575859" +
+                                        "60616263646566676869" +
+                                        "70717273747576777879" +
+                                        "80818283848586878889" +
+                                        "90919293949596979899");
+        private static ReadOnlySpan<byte> TwoDigitsBytes =>
+                                        "00010203040506070809"u8 +
+                                        "10111213141516171819"u8 +
+                                        "20212223242526272829"u8 +
+                                        "30313233343536373839"u8 +
+                                        "40414243444546474849"u8 +
+                                        "50515253545556575859"u8 +
+                                        "60616263646566676869"u8 +
+                                        "70717273747576777879"u8 +
+                                        "80818283848586878889"u8 +
+                                        "90919293949596979899"u8;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static ref byte GetTwoDigitsBytesRef(bool useChars) =>
+            ref System.Runtime.InteropServices.MemoryMarshal.GetReference(useChars ? TwoDigitsCharsAsBytes : TwoDigitsBytes);
+
 
         internal enum ParseStatus : byte
         {
@@ -2950,6 +3679,69 @@ namespace System
                 System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) = p[i];
 
             return s;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)] // expose to caller's likely-const format to trim away slow path
+        public static bool TryFormatUInt32<TChar>(
+            uint value, ReadOnlySpan<char> format, IFormatProvider? provider, Span<TChar> destination, out int charsWritten) 
+            where TChar : unmanaged, IUtfChar<TChar>
+        {
+            // Fast path for default format
+            if (format.Length == 0)
+            {
+                return TryUInt32ToDecStr(value, destination, out charsWritten);
+            }
+
+            //return TryFormatUInt32Slow(value, format, provider, destination, out charsWritten);
+            throw new NotSupportedException();
+        }
+        internal static unsafe bool TryUInt32ToDecStr<TChar>(uint value, Span<TChar> destination, out int charsWritten) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            int bufferLength = FormattingHelpers.CountDigits(value);
+            if (bufferLength <= destination.Length)
+            {
+                charsWritten = bufferLength;
+                fixed (TChar* buffer = &System.Runtime.InteropServices.MemoryMarshal.GetReference(destination))
+                {
+                    TChar* p = UInt32ToDecChars(buffer + bufferLength, value);
+                }
+                return true;
+            }
+
+            charsWritten = 0;
+            return false;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static unsafe TChar* UInt32ToDecChars<TChar>(TChar* bufferEnd, uint value) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            if (value >= 10)
+            {
+                // Handle all values >= 100 two-digits at a time so as to avoid expensive integer division operations.
+                while (value >= 100)
+                {
+                    bufferEnd -= 2;
+                    (value, uint remainder) = Math.DivRem(value, 100);
+                    WriteTwoDigits(remainder, bufferEnd);
+                }
+
+                // If there are two digits remaining, store them.
+                if (value >= 10)
+                {
+                    bufferEnd -= 2;
+                    WriteTwoDigits(value, bufferEnd);
+                    return bufferEnd;
+                }
+            }
+            // Otherwise, store the single digit remaining.
+            *(--bufferEnd) = TChar.CastFrom(value + '0');
+            return bufferEnd;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static unsafe void WriteTwoDigits<TChar>(uint value, TChar* ptr) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            Unsafe.CopyBlockUnaligned(
+                ref *(byte*)ptr,
+                ref Unsafe.Add(ref GetTwoDigitsBytesRef(typeof(TChar) == typeof(char)), (uint)sizeof(TChar) * 2 * value),
+                (uint)sizeof(TChar) * 2);
         }
         public static string FormatUInt32(uint value, string? format, IFormatProvider? provider)
         {
@@ -3129,13 +3921,13 @@ namespace System
 
             return length;
         }
-        internal static unsafe string FormatFloat(float value, string? format, NumberFormatInfo? info)
+        internal static unsafe string FormatFloat(float value, string? format, System.Globalization.NumberFormatInfo? info)
         {
             char* buffer = stackalloc char[FloatFormatBufferCharCount];
             int length = FormatFloatToBuffer(value, format, info, buffer, FloatFormatBufferCharCount);
             return StringFromCharBuffer(buffer, length);
         }
-        internal static unsafe int FormatFloatToBuffer(float value, string? format, NumberFormatInfo? info, char* destination, int destinationLength)
+        internal static unsafe int FormatFloatToBuffer(float value, string? format, System.Globalization.NumberFormatInfo? info, char* destination, int destinationLength)
         {
             uint bits = BitConverter.SingleToUInt32Bits(value);
             bool negative = (bits & 0x8000_0000U) != 0;
@@ -3220,13 +4012,13 @@ namespace System
             public int Length;
             public int Capacity;
         }
-        internal static unsafe string FormatDouble(double value, string? format, NumberFormatInfo? info)
+        internal static unsafe string FormatDouble(double value, string? format, System.Globalization.NumberFormatInfo? info)
         {
             char* buffer = stackalloc char[DoubleFormatBufferCharCount];
             int length = FormatDoubleToBuffer(value, format, info, buffer, DoubleFormatBufferCharCount);
             return StringFromCharBuffer(buffer, length);
         }
-        internal static unsafe int FormatDoubleToBuffer(double value, string? format, NumberFormatInfo? info, char* destination, int destinationLength)
+        internal static unsafe int FormatDoubleToBuffer(double value, string? format, System.Globalization.NumberFormatInfo? info, char* destination, int destinationLength)
         {
             const ulong SignMask = 0x8000_0000_0000_0000UL;
             const ulong MantissaMask = 0x000F_FFFF_FFFF_FFFFUL;
@@ -4876,11 +5668,31 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
                 this = default;
                 return;
             }
-            //if (!typeof(T).IsValueType && array.GetType() != typeof(T[]))
-            //    ThrowHelper.ThrowArrayTypeMismatchException();
+            if (!typeof(T).IsValueType && array.GetType() != typeof(T[]))
+                throw new ArrayTypeMismatchException();
 
             _reference = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference<T>(array);
             _length = array.Length;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Span(T[]? array, int start, int length)
+        {
+            if (array == null)
+            {
+                if (start != 0 || length != 0)
+                    throw new ArgumentOutOfRangeException();
+                this = default;
+                return; // returns default
+            }
+#if TARGET_64BIT
+            if ((ulong)(uint)start + (ulong)(uint)length > (ulong)(uint)array.Length)
+                throw new ArgumentOutOfRangeException();
+#else
+            if ((uint)start > (uint)array.Length || (uint)length > (uint)(array.Length - start))
+                throw new ArgumentOutOfRangeException();
+#endif
+            _reference = ref Unsafe.Add(ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(array), (nint)(uint)start /* force zero-extension */);
+            _length = length;
         }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public Span(ref T reference)
@@ -4907,6 +5719,71 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
                 return ref System.Runtime.CompilerServices.Unsafe.Add<T>(ref _reference, (nint)(uint)index /* force zero-extension */);
             }
         }
+
+        /// <summary>
+        /// Clears the contents of this span.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public unsafe void Clear()
+        {
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                SpanHelpers.ClearWithReferences(ref Unsafe.As<T, IntPtr>(ref _reference), (uint)_length * (nuint)(sizeof(T) / sizeof(nuint)));
+            }
+            else
+            {
+                SpanHelpers.ClearWithoutReferences(ref Unsafe.As<T, byte>(ref _reference), (uint)_length * (nuint)sizeof(T));
+            }
+        }
+
+        /// <summary>
+        /// Fills the contents of this span with the given value.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Fill(T value)
+        {
+            SpanHelpers.Fill(ref _reference, (uint)_length, value);
+        }
+
+        /// <summary>
+        /// Copies the contents of this span into destination span. If the source
+        /// and destinations overlap, this method behaves as if the original values in
+        /// a temporary location before the destination is overwritten.
+        /// </summary>
+        /// <exception cref="ArgumentException">
+        /// Thrown when the destination Span is shorter than the source Span.
+        /// </exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void CopyTo(Span<T> destination)
+        {
+            if ((uint)_length <= (uint)destination.Length)
+            {
+                Buffer.Memmove(ref destination._reference, ref _reference, (uint)_length);
+            }
+            else
+            {
+                throw new ArgumentException();
+            }
+        }
+
+        /// <summary>
+        /// Copies the contents of this span into destination span. If the source
+        /// and destinations overlap, this method behaves as if the original values in
+        /// a temporary location before the destination is overwritten.
+        /// </summary>
+        /// <returns>If the destination span is shorter than the source span, this method
+        /// return false and no data is written to the destination.</returns>
+        public bool TryCopyTo(Span<T> destination)
+        {
+            bool retVal = false;
+            if ((uint)_length <= (uint)destination.Length)
+            {
+                Buffer.Memmove(ref destination._reference, ref _reference, (uint)_length);
+                retVal = true;
+            }
+            return retVal;
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static implicit operator Span<T>(T[] array) => new Span<T>(array);
         public static bool operator ==(Span<T> left, Span<T> right) =>
@@ -4940,6 +5817,8 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 #endif
             return new Span<T>(ref System.Runtime.CompilerServices.Unsafe.Add<T>(ref _reference, (nint)(uint)start /* force zero-extension */), length);
         }
+
+
     }
     public readonly ref struct ReadOnlySpan<T>
     {
@@ -4982,11 +5861,68 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
                 return ref System.Runtime.CompilerServices.Unsafe.Add<T>(ref _reference, (nint)(uint)index /* force zero-extension */);
             }
         }
+
+        /// <summary>
+        /// Copies the contents of this read-only span into destination span. If the source
+        /// and destinations overlap, this method behaves as if the original values in
+        /// a temporary location before the destination is overwritten.
+        /// </summary>
+        /// <param name="destination">The span to copy items into.</param>
+        /// <exception cref="ArgumentException">
+        /// Thrown when the destination Span is shorter than the source Span.
+        /// </exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void CopyTo(Span<T> destination)
+        {
+            if ((uint)_length <= (uint)destination.Length)
+            {
+                Buffer.Memmove(ref destination._reference, ref _reference, (uint)_length);
+            }
+            else
+            {
+                throw new ArgumentException();
+            }
+        }
+
+        /// <summary>
+        /// Copies the contents of this read-only span into destination span. If the source
+        /// and destinations overlap, this method behaves as if the original values in
+        /// a temporary location before the destination is overwritten.
+        /// </summary>
+        /// <returns>If the destination span is shorter than the source span, this method
+        /// return false and no data is written to the destination.</returns>
+        /// <param name="destination">The span to copy items into.</param>
+        public bool TryCopyTo(Span<T> destination)
+        {
+            bool retVal = false;
+            if ((uint)_length <= (uint)destination.Length)
+            {
+                Buffer.Memmove(ref destination._reference, ref _reference, (uint)_length);
+                retVal = true;
+            }
+            return retVal;
+        }
+
+        /// <summary>
+        /// Returns false if left and right point at the same memory and have the same length.  Note that
+        /// this does *not* check to see if the *contents* are equal.
+        /// </summary>
+        public static bool operator !=(ReadOnlySpan<T> left, ReadOnlySpan<T> right) => !(left == right);
+
+        public static bool operator ==(ReadOnlySpan<T> left, ReadOnlySpan<T> right) =>
+            left._length == right._length &&
+            Unsafe.AreSame(ref left._reference, ref right._reference);
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static implicit operator ReadOnlySpan<T>(T[] array) => new ReadOnlySpan<T>(array);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static implicit operator ReadOnlySpan<T>(Span<T> span) => new ReadOnlySpan<T>(ref span._reference, span.Length);
+
+        /// <summary>
+        /// Returns a 0-length read-only span whose base is the null pointer.
+        /// </summary>
+        public static ReadOnlySpan<T> Empty => default;
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ReadOnlySpan<T> Slice(int start)
@@ -5043,6 +5979,612 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
             _length = length;
         }
     }
+
+    internal static class SpanHelpers
+    {
+#if TARGET_ARM64 || TARGET_LOONGARCH64
+        private const ulong MemmoveNativeThreshold = ulong.MaxValue;
+#elif TARGET_ARM
+        private const nuint MemmoveNativeThreshold = 512;
+#else
+        private const nuint MemmoveNativeThreshold = 2048;
+#endif
+        private const nuint ZeroMemoryNativeThreshold = 1024;
+
+#if HAS_CUSTOM_BLOCKS
+        [StructLayout(LayoutKind.Sequential, Size = 16)]
+        private struct Block16 {}
+
+        [StructLayout(LayoutKind.Sequential, Size = 64)]
+        private struct Block64 {}
+#endif // HAS_CUSTOM_BLOCKS
+
+        public static unsafe void ClearWithReferences(ref IntPtr ip, nuint pointerSizeLength)
+        {
+            // First write backward 8 natural words at a time.
+            // Writing backward allows us to get away with only simple modifications to the
+            // mov instruction's base and index registers between loop iterations.
+
+            for (; pointerSizeLength >= 8; pointerSizeLength -= 8)
+            {
+                Unsafe.Add(ref Unsafe.Add(ref ip, (nint)pointerSizeLength), -1) = default;
+                Unsafe.Add(ref Unsafe.Add(ref ip, (nint)pointerSizeLength), -2) = default;
+                Unsafe.Add(ref Unsafe.Add(ref ip, (nint)pointerSizeLength), -3) = default;
+                Unsafe.Add(ref Unsafe.Add(ref ip, (nint)pointerSizeLength), -4) = default;
+                Unsafe.Add(ref Unsafe.Add(ref ip, (nint)pointerSizeLength), -5) = default;
+                Unsafe.Add(ref Unsafe.Add(ref ip, (nint)pointerSizeLength), -6) = default;
+                Unsafe.Add(ref Unsafe.Add(ref ip, (nint)pointerSizeLength), -7) = default;
+                Unsafe.Add(ref Unsafe.Add(ref ip, (nint)pointerSizeLength), -8) = default;
+            }
+
+            // The logic below works by trying to minimize the number of branches taken for any
+            // given range of lengths. For example, the lengths [ 4 .. 7 ] are handled by a single
+            // branch, [ 2 .. 3 ] are handled by a single branch, and [ 1 ] is handled by a single
+            // branch.
+            //
+            // We can write both forward and backward as a perf improvement. For example,
+            // the lengths [ 4 .. 7 ] can be handled by zeroing out the first four natural
+            // words and the last 3 natural words. In the best case (length = 7), there are
+            // no overlapping writes. In the worst case (length = 4), there are three
+            // overlapping writes near the middle of the buffer. In perf testing, the
+            // penalty for performing duplicate writes is less expensive than the penalty
+            // for complex branching.
+
+            if (pointerSizeLength >= 4)
+            {
+                goto Write4To7;
+            }
+            else if (pointerSizeLength >= 2)
+            {
+                goto Write2To3;
+            }
+            else if (pointerSizeLength > 0)
+            {
+                goto Write1;
+            }
+            else
+            {
+                return; // nothing to write
+            }
+
+        Write4To7:
+            // Write first four and last three.
+            Unsafe.Add(ref ip, 2) = default;
+            Unsafe.Add(ref ip, 3) = default;
+            Unsafe.Add(ref Unsafe.Add(ref ip, (nint)pointerSizeLength), -3) = default;
+            Unsafe.Add(ref Unsafe.Add(ref ip, (nint)pointerSizeLength), -2) = default;
+
+        Write2To3:
+            // Write first two and last one.
+            Unsafe.Add(ref ip, 1) = default;
+            Unsafe.Add(ref Unsafe.Add(ref ip, (nint)pointerSizeLength), -1) = default;
+
+        Write1:
+            // Write only element.
+            ip = default;
+        }
+
+        public static void ClearWithoutReferences(ref byte dest, nuint len)
+        {
+            if (len == 0)
+                return;
+
+            ref byte destEnd = ref Unsafe.Add(ref dest, len);
+
+            if (len <= 16)
+                goto MZER02;
+            if (len > 64)
+                goto MZER05;
+
+        MZER00:
+            // Clear bytes which are multiples of 16 and leave the remainder for MZER01 to handle.
+#if HAS_CUSTOM_BLOCKS
+            Unsafe.WriteUnaligned<Block16>(ref dest, default);
+#elif TARGET_64BIT
+            Unsafe.WriteUnaligned<long>(ref dest, 0);
+            Unsafe.WriteUnaligned<long>(ref Unsafe.Add(ref dest, 8), 0);
+#else
+            Unsafe.WriteUnaligned<int>(ref dest, 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 4), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 8), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 12), 0);
+#endif
+            if (len <= 32)
+                goto MZER01;
+#if HAS_CUSTOM_BLOCKS
+            Unsafe.WriteUnaligned<Block16>(ref Unsafe.Add(ref dest, 16), default);
+#elif TARGET_64BIT
+            Unsafe.WriteUnaligned<long>(ref Unsafe.Add(ref dest, 16), 0);
+            Unsafe.WriteUnaligned<long>(ref Unsafe.Add(ref dest, 24), 0);
+#else
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 16), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 20), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 24), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 28), 0);
+#endif
+            if (len <= 48)
+                goto MZER01;
+#if HAS_CUSTOM_BLOCKS
+            Unsafe.WriteUnaligned<Block16>(ref Unsafe.Add(ref dest, 32), default);
+#elif TARGET_64BIT
+            Unsafe.WriteUnaligned<long>(ref Unsafe.Add(ref dest, 32), 0);
+            Unsafe.WriteUnaligned<long>(ref Unsafe.Add(ref dest, 40), 0);
+#else
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 32), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 36), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 40), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 44), 0);
+#endif
+
+        MZER01:
+            // Unconditionally clear the last 16 bytes using destEnd and return.
+#if HAS_CUSTOM_BLOCKS
+            Unsafe.WriteUnaligned<Block16>(ref Unsafe.Add(ref destEnd, -16), default);
+#elif TARGET_64BIT
+            Unsafe.WriteUnaligned<long>(ref Unsafe.Add(ref destEnd, -16), 0);
+            Unsafe.WriteUnaligned<long>(ref Unsafe.Add(ref destEnd, -8), 0);
+#else
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref destEnd, -16), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref destEnd, -12), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref destEnd, -8), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref destEnd, -4), 0);
+#endif
+            return;
+
+        MZER02:
+            // Clear the first 8 bytes and then unconditionally clear the last 8 bytes and return.
+            if ((len & 24) == 0)
+                goto MZER03;
+#if TARGET_64BIT
+            Unsafe.WriteUnaligned<long>(ref dest, 0);
+            Unsafe.WriteUnaligned<long>(ref Unsafe.Add(ref destEnd, -8), 0);
+#else
+            Unsafe.WriteUnaligned<int>(ref dest, 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 4), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref destEnd, -8), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref destEnd, -4), 0);
+#endif
+            return;
+
+        MZER03:
+            // Clear the first 4 bytes and then unconditionally clear the last 4 bytes and return.
+            if ((len & 4) == 0)
+                goto MZER04;
+            Unsafe.WriteUnaligned<int>(ref dest, 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref destEnd, -4), 0);
+            return;
+
+        MZER04:
+            // Clear the first byte. For pending bytes, do an unconditionally clear of the last 2 bytes and return.
+            if (len == 0)
+                return;
+            dest = 0;
+            if ((len & 2) == 0)
+                return;
+            Unsafe.WriteUnaligned<short>(ref Unsafe.Add(ref destEnd, -2), 0);
+            return;
+
+        MZER05:
+            // PInvoke to the native version when the clear length exceeds the threshold.
+            if (len > ZeroMemoryNativeThreshold)
+            {
+                goto PInvoke;
+            }
+
+#if HAS_CUSTOM_BLOCKS
+            if (len >= 256)
+            {
+                // Try to opportunistically align the destination below. The input isn't pinned, so the GC
+                // is free to move the references. We're therefore assuming that reads may still be unaligned.
+                nuint misalignedElements = 64 - Unsafe.OpportunisticMisalignment(ref dest, 64);
+                Unsafe.WriteUnaligned<Block64>(ref dest, default);
+                dest = ref Unsafe.Add(ref dest, misalignedElements);
+                len -= misalignedElements;
+            }
+#endif
+            // Clear 64-bytes at a time until the remainder is less than 64.
+            // If remainder is greater than 16 bytes, then jump to MZER00. Otherwise, unconditionally clear the last 16 bytes and return.
+            nuint n = len >> 6;
+
+        MZER06:
+#if HAS_CUSTOM_BLOCKS
+            Unsafe.WriteUnaligned<Block64>(ref dest, default);
+#elif TARGET_64BIT
+            Unsafe.WriteUnaligned<long>(ref dest, 0);
+            Unsafe.WriteUnaligned<long>(ref Unsafe.Add(ref dest, 8), 0);
+            Unsafe.WriteUnaligned<long>(ref Unsafe.Add(ref dest, 16), 0);
+            Unsafe.WriteUnaligned<long>(ref Unsafe.Add(ref dest, 24), 0);
+            Unsafe.WriteUnaligned<long>(ref Unsafe.Add(ref dest, 32), 0);
+            Unsafe.WriteUnaligned<long>(ref Unsafe.Add(ref dest, 40), 0);
+            Unsafe.WriteUnaligned<long>(ref Unsafe.Add(ref dest, 48), 0);
+            Unsafe.WriteUnaligned<long>(ref Unsafe.Add(ref dest, 56), 0);
+#else
+            Unsafe.WriteUnaligned<int>(ref dest, 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 4), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 8), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 12), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 16), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 20), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 24), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 28), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 32), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 36), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 40), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 44), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 48), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 52), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 56), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref dest, 60), 0);
+#endif
+            dest = ref Unsafe.Add(ref dest, 64);
+            n--;
+            if (n != 0)
+                goto MZER06;
+
+            len %= 64;
+            if (len > 16)
+                goto MZER00;
+#if HAS_CUSTOM_BLOCKS
+            Unsafe.WriteUnaligned<Block16>(ref Unsafe.Add(ref destEnd, -16), default);
+#elif TARGET_64BIT
+            Unsafe.WriteUnaligned<long>(ref Unsafe.Add(ref destEnd, -16), 0);
+            Unsafe.WriteUnaligned<long>(ref Unsafe.Add(ref destEnd, -8), 0);
+#else
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref destEnd, -16), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref destEnd, -12), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref destEnd, -8), 0);
+            Unsafe.WriteUnaligned<int>(ref Unsafe.Add(ref destEnd, -4), 0);
+#endif
+            return;
+
+        PInvoke:
+            // Implicit nullchecks
+            _ = Unsafe.ReadUnaligned<byte>(ref dest);
+            ZeroMemoryNative(ref dest, len);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static unsafe void ZeroMemoryNative(ref byte b, nuint byteLength)
+        {
+            fixed (byte* ptr = &b)
+            {
+                byte* adjustedPtr = ptr;
+#if TARGET_X86 || TARGET_AMD64
+                if (byteLength > 0x100)
+                {
+                    // memset ends up calling rep stosb if the hardware claims to support it efficiently. rep stosb is up to 2x slower
+                    // on misaligned blocks. Workaround this issue by aligning the blocks passed to memset upfront.
+                    Unsafe.WriteUnaligned<Block16>(ptr, default);
+                    Unsafe.WriteUnaligned<Block16>(ptr + byteLength - 16, default);
+
+                    byte* alignedEnd = (byte*)((nuint)(ptr + byteLength - 1) & ~(nuint)(16 - 1));
+
+                    adjustedPtr = (byte*)(((nuint)ptr + 16) & ~(nuint)(16 - 1));
+                    byteLength = (nuint)(alignedEnd - adjustedPtr);
+                }
+#endif
+                memset(adjustedPtr, 0, byteLength);
+            }
+        }
+
+        public static unsafe void Fill<T>(ref T refData, nuint numElements, T value)
+        {
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                goto CannotVectorize;
+            }
+
+
+        CannotVectorize:
+
+            // If we reached this point, we cannot vectorize this T, or there are too few
+            // elements for us to vectorize. Fall back to an unrolled loop.
+
+            nuint i = 0;
+
+            // Write 8 elements at a time
+
+            if (numElements >= 8)
+            {
+                nuint stopLoopAtOffset = numElements & ~(nuint)7;
+                do
+                {
+                    Unsafe.Add(ref refData, (nint)i + 0) = value;
+                    Unsafe.Add(ref refData, (nint)i + 1) = value;
+                    Unsafe.Add(ref refData, (nint)i + 2) = value;
+                    Unsafe.Add(ref refData, (nint)i + 3) = value;
+                    Unsafe.Add(ref refData, (nint)i + 4) = value;
+                    Unsafe.Add(ref refData, (nint)i + 5) = value;
+                    Unsafe.Add(ref refData, (nint)i + 6) = value;
+                    Unsafe.Add(ref refData, (nint)i + 7) = value;
+                } while ((i += 8) < stopLoopAtOffset);
+            }
+
+            // Write next 4 elements if needed
+
+            if ((numElements & 4) != 0)
+            {
+                Unsafe.Add(ref refData, (nint)i + 0) = value;
+                Unsafe.Add(ref refData, (nint)i + 1) = value;
+                Unsafe.Add(ref refData, (nint)i + 2) = value;
+                Unsafe.Add(ref refData, (nint)i + 3) = value;
+                i += 4;
+            }
+
+            // Write next 2 elements if needed
+
+            if ((numElements & 2) != 0)
+            {
+                Unsafe.Add(ref refData, (nint)i + 0) = value;
+                Unsafe.Add(ref refData, (nint)i + 1) = value;
+                i += 2;
+            }
+
+            // Write final element if needed
+
+            if ((numElements & 1) != 0)
+            {
+                Unsafe.Add(ref refData, (nint)i) = value;
+            }
+        }
+
+        public static bool SequenceEqual<T>(ref T first, ref T second, int length) where T : IEquatable<T>?
+        {
+            if (Unsafe.AreSame(ref first, ref second))
+            {
+                return true;
+            }
+
+            nint index = 0; // Use nint for arithmetic to avoid unnecessary 64->32->64 truncations
+            T lookUp0;
+            T lookUp1;
+            while (length >= 8)
+            {
+                length -= 8;
+
+                lookUp0 = Unsafe.Add(ref first, index);
+                lookUp1 = Unsafe.Add(ref second, index);
+                if (!(lookUp0?.Equals(lookUp1) ?? (object?)lookUp1 is null))
+                {
+                    return false;
+                }
+
+                lookUp0 = Unsafe.Add(ref first, index + 1);
+                lookUp1 = Unsafe.Add(ref second, index + 1);
+                if (!(lookUp0?.Equals(lookUp1) ?? (object?)lookUp1 is null))
+                {
+                    return false;
+                }
+
+                lookUp0 = Unsafe.Add(ref first, index + 2);
+                lookUp1 = Unsafe.Add(ref second, index + 2);
+                if (!(lookUp0?.Equals(lookUp1) ?? (object?)lookUp1 is null))
+                {
+                    return false;
+                }
+
+                lookUp0 = Unsafe.Add(ref first, index + 3);
+                lookUp1 = Unsafe.Add(ref second, index + 3);
+                if (!(lookUp0?.Equals(lookUp1) ?? (object?)lookUp1 is null))
+                {
+                    return false;
+                }
+
+                lookUp0 = Unsafe.Add(ref first, index + 4);
+                lookUp1 = Unsafe.Add(ref second, index + 4);
+                if (!(lookUp0?.Equals(lookUp1) ?? (object?)lookUp1 is null))
+                {
+                    return false;
+                }
+
+                lookUp0 = Unsafe.Add(ref first, index + 5);
+                lookUp1 = Unsafe.Add(ref second, index + 5);
+                if (!(lookUp0?.Equals(lookUp1) ?? (object?)lookUp1 is null))
+                {
+                    return false;
+                }
+
+                lookUp0 = Unsafe.Add(ref first, index + 6);
+                lookUp1 = Unsafe.Add(ref second, index + 6);
+                if (!(lookUp0?.Equals(lookUp1) ?? (object?)lookUp1 is null))
+                {
+                    return false;
+                }
+
+                lookUp0 = Unsafe.Add(ref first, index + 7);
+                lookUp1 = Unsafe.Add(ref second, index + 7);
+                if (!(lookUp0?.Equals(lookUp1) ?? (object?)lookUp1 is null))
+                {
+                    return false;
+                }
+
+                index += 8;
+            }
+
+            if (length >= 4)
+            {
+                length -= 4;
+
+                lookUp0 = Unsafe.Add(ref first, index);
+                lookUp1 = Unsafe.Add(ref second, index);
+                if (!(lookUp0?.Equals(lookUp1) ?? (object?)lookUp1 is null))
+                {
+                    return false;
+                }
+
+                lookUp0 = Unsafe.Add(ref first, index + 1);
+                lookUp1 = Unsafe.Add(ref second, index + 1);
+                if (!(lookUp0?.Equals(lookUp1) ?? (object?)lookUp1 is null))
+                {
+                    return false;
+                }
+
+                lookUp0 = Unsafe.Add(ref first, index + 2);
+                lookUp1 = Unsafe.Add(ref second, index + 2);
+                if (!(lookUp0?.Equals(lookUp1) ?? (object?)lookUp1 is null))
+                {
+                    return false;
+                }
+
+                lookUp0 = Unsafe.Add(ref first, index + 3);
+                lookUp1 = Unsafe.Add(ref second, index + 3);
+                if (!(lookUp0?.Equals(lookUp1) ?? (object?)lookUp1 is null))
+                {
+                    return false;
+                }
+
+                index += 4;
+            }
+
+            while (length > 0)
+            {
+                lookUp0 = Unsafe.Add(ref first, index);
+                lookUp1 = Unsafe.Add(ref second, index);
+                if (!(lookUp0?.Equals(lookUp1) ?? (object?)lookUp1 is null))
+                {
+                    return false;
+                }
+
+                index += 1;
+                length--;
+            }
+
+            return true;
+        }
+
+        public static unsafe bool SequenceEqual(ref byte first, ref byte second, nuint length)
+        {
+            bool result;
+            // Use nint for arithmetic to avoid unnecessary 64->32->64 truncations
+            if (length >= (nuint)sizeof(nuint))
+            {
+                // Conditional jmp forward to favor shorter lengths. (See comment at "Equal:" label)
+                // The longer lengths can make back the time due to branch misprediction
+                // better than shorter lengths.
+                goto Longer;
+            }
+
+#if TARGET_64BIT
+            // On 32-bit, this will always be true since sizeof(nuint) == 4
+            if (length < sizeof(uint))
+#endif
+            {
+                uint differentBits = 0;
+                nuint offset = (length & 2);
+                if (offset != 0)
+                {
+                    differentBits = LoadUShort(ref first);
+                    differentBits -= LoadUShort(ref second);
+                }
+                if ((length & 1) != 0)
+                {
+                    differentBits |= (uint)Unsafe.AddByteOffset(ref first, offset) - (uint)Unsafe.AddByteOffset(ref second, offset);
+                }
+                result = (differentBits == 0);
+                goto Result;
+            }
+#if TARGET_64BIT
+            else
+            {
+                nuint offset = length - sizeof(uint);
+                uint differentBits = LoadUInt(ref first) - LoadUInt(ref second);
+                differentBits |= LoadUInt(ref first, offset) - LoadUInt(ref second, offset);
+                result = (differentBits == 0);
+                goto Result;
+            }
+#endif
+        Longer:
+            // Only check that the ref is the same if buffers are large,
+            // and hence its worth avoiding doing unnecessary comparisons
+            if (!Unsafe.AreSame(ref first, ref second))
+            {
+                goto Vector;
+            }
+
+            // This becomes a conditional jmp forward to not favor it.
+            goto Equal;
+
+        Result:
+            return result;
+            // When the sequence is equal; which is the longest execution, we want it to determine that
+            // as fast as possible so we do not want the early outs to be "predicted not taken" branches.
+        Equal:
+            return true;
+
+        Vector:
+
+            {
+                {
+                    nuint offset = 0;
+                    nuint lengthToExamine = length - (nuint)sizeof(nuint);
+                    // Unsigned, so it shouldn't have overflowed larger than length (rather than negative)
+
+                    if (lengthToExamine > 0)
+                    {
+                        do
+                        {
+                            // Compare unsigned so not do a sign extend mov on 64 bit
+                            if (LoadNUInt(ref first, offset) != LoadNUInt(ref second, offset))
+                            {
+                                goto NotEqual;
+                            }
+                            offset += (nuint)sizeof(nuint);
+                        } while (lengthToExamine > offset);
+                    }
+
+                    // Do final compare as sizeof(nuint) from end rather than start
+                    result = (LoadNUInt(ref first, lengthToExamine) == LoadNUInt(ref second, lengthToExamine));
+                    goto Result;
+                }
+            }
+
+        NotEqual:
+            return false;
+        }
+
+        public static int SequenceCompareTo<T>(ref T first, int firstLength, ref T second, int secondLength)
+            where T : IComparable<T>?
+        {
+            int minLength = firstLength;
+            if (minLength > secondLength)
+                minLength = secondLength;
+            for (int i = 0; i < minLength; i++)
+            {
+                T lookUp = Unsafe.Add(ref second, i);
+                int result = (Unsafe.Add(ref first, i)?.CompareTo(lookUp) ?? (((object?)lookUp is null) ? 0 : -1));
+                if (result != 0)
+                {
+                    return result;
+                }
+            }
+
+            return firstLength.CompareTo(secondLength);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static ushort LoadUShort(ref byte start)
+            => Unsafe.ReadUnaligned<ushort>(ref start);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static uint LoadUInt(ref byte start)
+            => Unsafe.ReadUnaligned<uint>(ref start);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static uint LoadUInt(ref byte start, nuint offset)
+            => Unsafe.ReadUnaligned<uint>(ref Unsafe.AddByteOffset(ref start, offset));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static nuint LoadNUInt(ref byte start)
+            => Unsafe.ReadUnaligned<nuint>(ref start);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static nuint LoadNUInt(ref byte start, nuint offset)
+            => Unsafe.ReadUnaligned<nuint>(ref Unsafe.AddByteOffset(ref start, offset));
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern unsafe void memset(void* dest, int value, nuint len);
+    }
+
     public static class MemoryExtensions
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -5078,6 +6620,137 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
                 }
                 return span.Slice(start, end - start + 1);
             }
+        }
+
+        /// <summary>
+        /// Creates a new span over the target array.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Span<T> AsSpan<T>(this T[]? array)
+        {
+            return new Span<T>(array);
+        }
+
+        /// <summary>
+        /// Creates a new Span over the portion of the target array beginning
+        /// at 'start' index and ending at 'end' index (exclusive).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Span<T> AsSpan<T>(this T[]? array, int start, int length)
+        {
+            return new Span<T>(array, start, length);
+        }
+
+
+        /// <summary>
+        /// Determines whether two sequences overlap in memory.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [OverloadResolutionPriority(-1)]
+        public static bool Overlaps<T>(this Span<T> span, ReadOnlySpan<T> other) =>
+            Overlaps((ReadOnlySpan<T>)span, other);
+
+        /// <summary>
+        /// Determines whether two sequences overlap in memory and outputs the element offset.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [OverloadResolutionPriority(-1)]
+        public static bool Overlaps<T>(this Span<T> span, ReadOnlySpan<T> other, out int elementOffset) =>
+            Overlaps((ReadOnlySpan<T>)span, other, out elementOffset);
+
+        /// <summary>
+        /// Determines whether two sequences overlap in memory.
+        /// </summary>
+        public static unsafe bool Overlaps<T>(this ReadOnlySpan<T> span, ReadOnlySpan<T> other)
+        {
+            if (span.IsEmpty || other.IsEmpty)
+            {
+                return false;
+            }
+
+            nint byteOffset = Unsafe.ByteOffset(
+                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(span),
+                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(other));
+
+            return (nuint)byteOffset < (nuint)((nint)span.Length * sizeof(T)) ||
+                    (nuint)byteOffset > (nuint)(-((nint)other.Length * sizeof(T)));
+        }
+
+        /// <summary>
+        /// Determines whether two sequences overlap in memory and outputs the element offset.
+        /// </summary>
+        public static unsafe bool Overlaps<T>(this ReadOnlySpan<T> span, ReadOnlySpan<T> other, out int elementOffset)
+        {
+            if (span.IsEmpty || other.IsEmpty)
+            {
+                elementOffset = 0;
+                return false;
+            }
+
+            nint byteOffset = Unsafe.ByteOffset(
+                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(span),
+                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(other));
+
+            if ((nuint)byteOffset < (nuint)((nint)span.Length * sizeof(T)) ||
+                (nuint)byteOffset > (nuint)(-((nint)other.Length * sizeof(T))))
+            {
+                if (byteOffset % sizeof(T) != 0)
+                    throw new ArgumentException();
+
+                elementOffset = (int)(byteOffset / sizeof(T));
+                return true;
+            }
+            else
+            {
+                elementOffset = 0;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Determines whether two sequences are equal by comparing the elements using IEquatable{T}.Equals(T).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe bool SequenceEqual<T>(this ReadOnlySpan<T> span, ReadOnlySpan<T> other) where T : IEquatable<T>?
+        {
+            int length = span.Length;
+            int otherLength = other.Length;
+
+            //if (RuntimeHelpers.IsBitwiseEquatable<T>())
+            {
+
+            }
+
+            return length == otherLength && SpanHelpers.SequenceEqual(
+                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(span), 
+                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(other), length);
+        }
+        /// <summary>
+        /// Determines the relative order of the sequences being compared by comparing the elements using IComparable{T}.CompareTo(T).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int SequenceCompareTo<T>(this ReadOnlySpan<T> span, ReadOnlySpan<T> other) where T : IComparable<T>?
+        {
+            // Can't use IsBitwiseEquatable<T>() below because that only tells us about
+            // equality checks, not about CompareTo checks.
+
+            if (typeof(T) == typeof(byte))
+                return SpanHelpers.SequenceCompareTo(
+                    ref Unsafe.As<T, byte>(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(span)),
+                    span.Length,
+                    ref Unsafe.As<T, byte>(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(other)),
+                    other.Length);
+
+            if (typeof(T) == typeof(char))
+                return SpanHelpers.SequenceCompareTo(
+                    ref Unsafe.As<T, char>(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(span)),
+                    span.Length,
+                    ref Unsafe.As<T, char>(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(other)),
+                    other.Length);
+
+            return SpanHelpers.SequenceCompareTo(
+                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(span), span.Length, 
+                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(other), other.Length);
         }
     }
 
@@ -6752,6 +8425,314 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 
         public static bool operator >=(TimeSpan t1, TimeSpan t2) => t1._ticks >= t2._ticks;
     }
+
+    internal static class Marvin
+    {
+        /// <summary>
+        /// Compute a Marvin hash and collapse it into a 32-bit hash.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int ComputeHash32(ReadOnlySpan<byte> data, ulong seed)
+            => ComputeHash32(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(data), (uint)data.Length, (uint)seed, (uint)(seed >> 32));
+
+        /// <summary>
+        /// Compute a Marvin hash and collapse it into a 32-bit hash.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static int ComputeHash32(ref byte data, uint count, uint p0, uint p1)
+        {
+            // Control flow of this method generally flows top-to-bottom, trying to
+            // minimize the number of branches taken for large (>= 8 bytes, 4 chars) inputs.
+            // If small inputs (< 8 bytes, 4 chars) are given, this jumps to a "small inputs"
+            // handler at the end of the method.
+
+            if (count < 8)
+            {
+                // We can't run the main loop, but we might still have 4 or more bytes available to us.
+                // If so, jump to the 4 .. 7 bytes logic immediately after the main loop.
+
+                if (count >= 4)
+                {
+                    goto Between4And7BytesRemain;
+                }
+                else
+                {
+                    goto InputTooSmallToEnterMainLoop;
+                }
+            }
+
+            // Main loop - read 8 bytes at a time.
+            // The block function is unrolled 2x in this loop.
+
+            uint loopCount = count / 8;
+
+            do
+            {
+                p0 += Unsafe.ReadUnaligned<uint>(ref data);
+                uint nextUInt32 = Unsafe.ReadUnaligned<uint>(ref Unsafe.AddByteOffset(ref data, 4));
+
+                // One block round for each of the 32-bit integers we just read, 2x rounds total.
+
+                Block(ref p0, ref p1);
+                p0 += nextUInt32;
+                Block(ref p0, ref p1);
+
+                // Bump the data reference pointer and decrement the loop count.
+
+                data = ref Unsafe.AddByteOffset(ref data, 8);
+            } while (--loopCount > 0);
+
+            // n.b. We've not been updating the original 'count' parameter, so its actual value is
+            // still the original data length. However, we can still rely on its least significant
+            // 3 bits to tell us how much data remains (0 .. 7 bytes) after the loop above is
+            // completed.
+
+            if ((count & 0b_0100) == 0)
+            {
+                goto DoFinalPartialRead;
+            }
+
+        Between4And7BytesRemain:
+
+            // If after finishing the main loop we still have 4 or more leftover bytes, or if we had
+            // 4 .. 7 bytes to begin with and couldn't enter the loop in the first place, we need to
+            // consume 4 bytes immediately and send them through one round of the block function.
+
+            p0 += Unsafe.ReadUnaligned<uint>(ref data);
+            Block(ref p0, ref p1);
+
+        DoFinalPartialRead:
+
+            // Finally, we have 0 .. 3 bytes leftover. Since we know the original data length was at
+            // least 4 bytes (smaller lengths are handled at the end of this routine), we can safely
+            // read the 4 bytes at the end of the buffer without reading past the beginning of the
+            // original buffer. This necessarily means the data we're about to read will overlap with
+            // some data we've already processed, but we can handle that below.
+
+            uint partialResult = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref Unsafe.AddByteOffset(ref data, (nuint)count & 7), -4));
+
+            // The 'partialResult' local above contains any data we have yet to read, plus some number
+            // of bytes which we've already read from the buffer. An example of this is given below
+            // for little-endian architectures. In this table, AA BB CC are the bytes which we still
+            // need to consume, and ## are bytes which we want to throw away since we've already
+            // consumed them as part of a previous read.
+            //
+            //                                                    (partialResult contains)   (we want it to contain)
+            // count mod 4 = 0 -> [ ## ## ## ## |             ] -> 0x####_####             -> 0x0000_0080
+            // count mod 4 = 1 -> [ ## ## ## ## | AA          ] -> 0xAA##_####             -> 0x0000_80AA
+            // count mod 4 = 2 -> [ ## ## ## ## | AA BB       ] -> 0xBBAA_####             -> 0x0080_BBAA
+            // count mod 4 = 3 -> [ ## ## ## ## | AA BB CC    ] -> 0xCCBB_AA##             -> 0x80CC_BBAA
+
+            count = ~count << 3;
+
+            if (BitConverter.IsLittleEndian)
+            {
+                partialResult >>= 8; // make some room for the 0x80 byte
+                partialResult |= 0x8000_0000u; // put the 0x80 byte at the beginning
+                partialResult >>= (int)count & 0x1F; // shift out all previously consumed bytes
+            }
+            else
+            {
+                partialResult <<= 8; // make some room for the 0x80 byte
+                partialResult |= 0x80u; // put the 0x80 byte at the end
+                partialResult <<= (int)count & 0x1F; // shift out all previously consumed bytes
+            }
+
+        DoFinalRoundsAndReturn:
+
+            // Now that we've computed the final partial result, merge it in and run two rounds of
+            // the block function to finish out the Marvin algorithm.
+
+            p0 += partialResult;
+            Block(ref p0, ref p1);
+            Block(ref p0, ref p1);
+
+            return (int)(p1 ^ p0);
+
+        InputTooSmallToEnterMainLoop:
+
+            // We had only 0 .. 3 bytes to begin with, so we can't perform any 32-bit reads.
+            // This means that we're going to be building up the final result right away and
+            // will only ever run two rounds total of the block function. Let's initialize
+            // the partial result to "no data".
+
+            if (BitConverter.IsLittleEndian)
+            {
+                partialResult = 0x80u;
+            }
+            else
+            {
+                partialResult = 0x80000000u;
+            }
+
+            if ((count & 0b_0001) != 0)
+            {
+                // If the buffer is 1 or 3 bytes in length, let's read a single byte now
+                // and merge it into our partial result. This will result in partialResult
+                // having one of the two values below, where AA BB CC are the buffer bytes.
+                //
+                //                  (little-endian / big-endian)
+                // [ AA          ]  -> 0x0000_80AA / 0xAA80_0000
+                // [ AA BB CC    ]  -> 0x0000_80CC / 0xCC80_0000
+
+                partialResult = Unsafe.AddByteOffset(ref data, (nuint)count & 2);
+
+                if (BitConverter.IsLittleEndian)
+                {
+                    partialResult |= 0x8000;
+                }
+                else
+                {
+                    partialResult <<= 24;
+                    partialResult |= 0x800000u;
+                }
+            }
+
+            if ((count & 0b_0010) != 0)
+            {
+                // If the buffer is 2 or 3 bytes in length, let's read a single ushort now
+                // and merge it into the partial result. This will result in partialResult
+                // having one of the two values below, where AA BB CC are the buffer bytes.
+                //
+                //                  (little-endian / big-endian)
+                // [ AA BB       ]  -> 0x0080_BBAA / 0xAABB_8000
+                // [ AA BB CC    ]  -> 0x80CC_BBAA / 0xAABB_CC80 (carried over from above)
+
+                if (BitConverter.IsLittleEndian)
+                {
+                    partialResult <<= 16;
+                    partialResult |= (uint)Unsafe.ReadUnaligned<ushort>(ref data);
+                }
+                else
+                {
+                    partialResult |= (uint)Unsafe.ReadUnaligned<ushort>(ref data);
+                    partialResult = System.Numerics.BitOperations.RotateLeft(partialResult, 16);
+                }
+            }
+
+            // Everything is consumed! Go perform the final rounds and return.
+
+            goto DoFinalRoundsAndReturn;
+        }
+
+        /// <summary>
+        /// Compute a Marvin OrdinalIgnoreCase hash and collapse it into a 32-bit hash.
+        /// n.b. <paramref name="count"/> is specified as char count, not byte count.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static int ComputeHash32OrdinalIgnoreCase(ref char data, int count, uint p0, uint p1)
+        {
+            uint ucount = (uint)count; // in chars
+            nuint byteOffset = 0; // in bytes
+            uint tempValue;
+
+            // We operate on 32-bit integers (two chars) at a time.
+
+            while (ucount >= 2)
+            {
+                tempValue = Unsafe.ReadUnaligned<uint>(ref Unsafe.As<char, byte>(ref Unsafe.AddByteOffset(ref data, byteOffset)));
+                if (!System.Text.Unicode.Utf16Utility.AllCharsInUInt32AreAscii(tempValue))
+                {
+                    goto NotAscii;
+                }
+                p0 += System.Text.Unicode.Utf16Utility.ConvertAllAsciiCharsInUInt32ToUppercase(tempValue);
+                Block(ref p0, ref p1);
+
+                byteOffset += 4;
+                ucount -= 2;
+            }
+
+            // We have either one char (16 bits) or zero chars left over.
+
+            if (ucount > 0)
+            {
+                tempValue = Unsafe.AddByteOffset(ref data, byteOffset);
+                if (tempValue > 0x7Fu)
+                {
+                    goto NotAscii;
+                }
+
+                if (BitConverter.IsLittleEndian)
+                {
+                    // addition is written with -0x80u to allow fall-through to next statement rather than jmp past it
+                    p0 += System.Text.Unicode.Utf16Utility.ConvertAllAsciiCharsInUInt32ToUppercase(tempValue) + (0x800000u - 0x80u);
+                }
+                else
+                {
+                    // as above, addition is modified to allow fall-through to next statement rather than jmp past it
+                    p0 += (System.Text.Unicode.Utf16Utility.ConvertAllAsciiCharsInUInt32ToUppercase(tempValue) << 16) + 0x8000u - 0x80000000u;
+                }
+            }
+            if (BitConverter.IsLittleEndian)
+            {
+                p0 += 0x80u;
+            }
+            else
+            {
+                p0 += 0x80000000u;
+            }
+
+            Block(ref p0, ref p1);
+            Block(ref p0, ref p1);
+
+            return (int)(p1 ^ p0);
+
+        NotAscii:
+            return ComputeHash32OrdinalIgnoreCaseSlow(ref Unsafe.AddByteOffset(ref data, byteOffset), (int)ucount, p0, p1);
+        }
+
+        private static unsafe int ComputeHash32OrdinalIgnoreCaseSlow(ref char data, int count, uint p0, uint p1)
+        {
+            char[]? borrowedArr = null;
+            Span<char> scratch = (uint)count <= 64 ? stackalloc char[64] : (borrowedArr = System.Buffers.ArrayPool<char>.Shared.Rent(count));
+
+            int charsWritten = Globalization.Ordinal.ToUpperOrdinal(new ReadOnlySpan<char>(ref data, count), scratch);
+
+            // Slice the array to the size returned by ToUpperInvariant.
+            // Multiplication below will not overflow since going from positive Int32 to UInt32.
+            int hash = ComputeHash32(ref Unsafe.As<char, byte>(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(scratch)), (uint)charsWritten * 2, p0, p1);
+
+            // Return the borrowed array if necessary.
+            if (borrowedArr != null)
+            {
+                System.Buffers.ArrayPool<char>.Shared.Return(borrowedArr);
+            }
+
+            return hash;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void Block(ref uint rp0, ref uint rp1)
+        {
+            uint p0 = rp0;
+            uint p1 = rp1;
+
+            p1 ^= p0;
+            p0 = System.Numerics.BitOperations.RotateLeft(p0, 20);
+
+            p0 += p1;
+            p1 = System.Numerics.BitOperations.RotateLeft(p1, 9);
+
+            p1 ^= p0;
+            p0 = System.Numerics.BitOperations.RotateLeft(p0, 27);
+
+            p0 += p1;
+            p1 = System.Numerics.BitOperations.RotateLeft(p1, 19);
+
+            rp0 = p0;
+            rp1 = p1;
+        }
+
+        public static ulong DefaultSeed { get; } = GenerateSeed();
+
+        private static unsafe ulong GenerateSeed()
+        {
+            ulong seed = 0;
+
+            return seed;
+        }
+    }
+
     public static class Convert
     {
         public static bool ToBoolean(bool value)
@@ -7401,7 +9382,262 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 
         private static void ThrowUInt64OverflowException() { throw new OverflowException(); }
     }
+    public abstract class StringComparer : IComparer
+    {
+        public static StringComparer InvariantCulture => CultureAwareComparer.InvariantCaseSensitiveInstance;
+
+        public static StringComparer InvariantCultureIgnoreCase => CultureAwareComparer.InvariantIgnoreCaseInstance;
+
+        public static StringComparer CurrentCulture =>
+            new CultureAwareComparer(System.Globalization.CultureInfo.CurrentCulture, System.Globalization.CompareOptions.None);
+
+        public static StringComparer CurrentCultureIgnoreCase =>
+            new CultureAwareComparer(System.Globalization.CultureInfo.CurrentCulture, System.Globalization.CompareOptions.IgnoreCase);
+
+        public static StringComparer Ordinal => OrdinalCaseSensitiveComparer.Instance;
+
+        public static StringComparer OrdinalIgnoreCase => OrdinalIgnoreCaseComparer.Instance;
+
+        // Convert a StringComparison to a StringComparer
+        public static StringComparer FromComparison(StringComparison comparisonType)
+        {
+            return comparisonType switch
+            {
+                StringComparison.CurrentCulture => CurrentCulture,
+                StringComparison.CurrentCultureIgnoreCase => CurrentCultureIgnoreCase,
+                StringComparison.InvariantCulture => InvariantCulture,
+                StringComparison.InvariantCultureIgnoreCase => InvariantCultureIgnoreCase,
+                StringComparison.Ordinal => Ordinal,
+                StringComparison.OrdinalIgnoreCase => OrdinalIgnoreCase,
+                _ => throw new ArgumentException(),
+            };
+        }
+
+        private protected virtual bool IsWellKnownOrdinalComparerCore(out bool ignoreCase)
+        {
+            // unless specialized comparer overrides this, we're not a well-known ordinal comparer
+            ignoreCase = default;
+            return false;
+        }
+        private protected virtual bool IsWellKnownCultureAwareComparerCore(
+            [NotNullWhen(true)] out System.Globalization.CompareInfo? compareInfo, out System.Globalization.CompareOptions compareOptions)
+        {
+            // unless specialized comparer overrides this, we're not a well-known culture-aware comparer
+            compareInfo = default;
+            compareOptions = default;
+            return false;
+        }
+
+        public int GetHashCode(object obj)
+        {
+            if (obj is null) throw new ArgumentNullException();
+
+            if (obj is string s)
+            {
+                return GetHashCode(s);
+            }
+            return obj.GetHashCode();
+        }
+        public abstract int Compare(string? x, string? y);
+        public abstract bool Equals(string? x, string? y);
+        public abstract int GetHashCode(string obj);
+    }
+    public class OrdinalComparer : StringComparer, IAlternateEqualityComparer<ReadOnlySpan<char>, string?>
+    {
+        private readonly bool _ignoreCase; // Do not rename
+
+        internal OrdinalComparer(bool ignoreCase)
+        {
+            _ignoreCase = ignoreCase;
+        }
+
+        // Equals method for the comparer itself.
+        public override bool Equals([NotNullWhen(true)] object? obj)
+        {
+            if (obj is not OrdinalComparer comparer)
+            {
+                return false;
+            }
+            return this._ignoreCase == comparer._ignoreCase;
+        }
+
+        public override int GetHashCode()
+        {
+            int hashCode = nameof(OrdinalComparer).GetHashCode();
+            return _ignoreCase ? (~hashCode) : hashCode;
+        }
+
+        public override int GetHashCode(string obj)
+        {
+            if (obj == null)
+            {
+                throw new ArgumentNullException();
+            }
+
+            if (_ignoreCase)
+            {
+                return obj.GetHashCodeOrdinalIgnoreCase();
+            }
+
+            return obj.GetHashCode();
+        }
+    }
+    internal sealed class OrdinalCaseSensitiveComparer : OrdinalComparer, IAlternateEqualityComparer<ReadOnlySpan<char>, string?>
+    {
+        internal static readonly OrdinalCaseSensitiveComparer Instance = new OrdinalCaseSensitiveComparer();
+
+        private OrdinalCaseSensitiveComparer() : base(false)
+        {
+        }
+
+        public override int Compare(string? x, string? y) => string.CompareOrdinal(x, y);
+
+        public override bool Equals(string? x, string? y) => string.Equals(x, y);
+
+        public override int GetHashCode(string obj)
+        {
+            if (obj == null)
+            {
+                throw new ArgumentNullException(nameof(obj));
+            }
+            return obj.GetHashCode();
+        }
+    }
+    internal sealed class OrdinalIgnoreCaseComparer : OrdinalComparer, IAlternateEqualityComparer<ReadOnlySpan<char>, string?>
+    {
+        internal static readonly OrdinalIgnoreCaseComparer Instance = new OrdinalIgnoreCaseComparer();
+
+        private OrdinalIgnoreCaseComparer() : base(true)
+        {
+        }
+
+        public override int Compare(string? x, string? y)
+        {
+            if (ReferenceEquals(x, y))
+            {
+                return 0;
+            }
+
+            if (x == null)
+            {
+                return -1;
+            }
+
+            if (y == null)
+            {
+                return 1;
+            }
+
+            return Globalization.Ordinal.CompareStringIgnoreCase(ref x.GetRawStringData(), x.Length, ref y.GetRawStringData(), y.Length);
+        }
+
+        public override bool Equals(string? x, string? y)
+        {
+            if (ReferenceEquals(x, y))
+            {
+                return true;
+            }
+
+            if (x is null || y is null)
+            {
+                return false;
+            }
+
+            if (x.Length != y.Length)
+            {
+                return false;
+            }
+
+            return Globalization.Ordinal.EqualsIgnoreCase(ref x.GetRawStringData(), ref y.GetRawStringData(), x.Length);
+        }
+
+        public override int GetHashCode(string obj)
+        {
+            if (obj == null)
+            {
+                throw new ArgumentNullException();
+            }
+            return obj.GetHashCodeOrdinalIgnoreCase();
+        }
+    }
+    public sealed class CultureAwareComparer : StringComparer
+    {
+        internal static readonly CultureAwareComparer InvariantCaseSensitiveInstance =
+            new CultureAwareComparer(System.Globalization.CompareInfo.Invariant, System.Globalization.CompareOptions.None);
+        internal static readonly CultureAwareComparer InvariantIgnoreCaseInstance =
+            new CultureAwareComparer(System.Globalization.CompareInfo.Invariant, System.Globalization.CompareOptions.IgnoreCase);
+
+        private const System.Globalization.CompareOptions ValidCompareMaskOffFlags =
+            ~(System.Globalization.CompareOptions.IgnoreCase | System.Globalization.CompareOptions.IgnoreSymbols |
+            System.Globalization.CompareOptions.IgnoreNonSpace | System.Globalization.CompareOptions.IgnoreKanaType |
+              System.Globalization.CompareOptions.IgnoreWidth | System.Globalization.CompareOptions.NumericOrdering | System.Globalization.CompareOptions.StringSort);
+
+        private readonly System.Globalization.CompareInfo _compareInfo; // Do not rename
+        private readonly System.Globalization.CompareOptions _options;
+
+        internal CultureAwareComparer(System.Globalization.CultureInfo culture, System.Globalization.CompareOptions options) : this(culture.CompareInfo, options) { }
+
+        internal CultureAwareComparer(System.Globalization.CompareInfo compareInfo, System.Globalization.CompareOptions options)
+        {
+            _compareInfo = compareInfo;
+
+            if ((options & ValidCompareMaskOffFlags) != 0)
+            {
+                throw new ArgumentException();
+            }
+            _options = options;
+        }
+    }
     // interfaces
+    public interface IBitwiseOperators<TSelf, TOther, TResult>
+        where TSelf : IBitwiseOperators<TSelf, TOther, TResult>?
+    {
+
+    }
+    public interface INumber<TSelf>
+        : System.Numerics.INumberBase<TSelf>
+        where TSelf : INumber<TSelf>?
+    {
+
+    }
+    public interface IBinaryNumber<TSelf>
+        : IBitwiseOperators<TSelf, TSelf, TSelf>,
+          INumber<TSelf>
+        where TSelf : IBinaryNumber<TSelf>?
+    {
+
+    }
+    public interface IShiftOperators<TSelf, TOther, TResult>
+        where TSelf : IShiftOperators<TSelf, TOther, TResult>?
+    {
+
+    }
+    public interface IBinaryInteger<TSelf>
+        : IBinaryNumber<TSelf>,
+          IShiftOperators<TSelf, int, TSelf>
+        where TSelf : IBinaryInteger<TSelf>?
+    {
+
+    }
+    internal interface IUtfChar<TSelf> :
+        IBinaryInteger<TSelf>
+        where TSelf : unmanaged, IUtfChar<TSelf>
+    {
+        /// <summary>Casts the specified value to this type.</summary>
+        public static abstract TSelf CastFrom(byte value);
+
+        /// <summary>Casts the specified value to this type.</summary>
+        public static abstract TSelf CastFrom(char value);
+
+        /// <summary>Casts the specified value to this type.</summary>
+        public static abstract TSelf CastFrom(int value);
+
+        /// <summary>Casts the specified value to this type.</summary>
+        public static abstract TSelf CastFrom(uint value);
+
+        /// <summary>Casts the specified value to this type.</summary>
+        public static abstract TSelf CastFrom(ulong value);
+    }
     public interface ITuple
     {
         int Length { get; }
@@ -7411,6 +9647,14 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
     public interface IDisposable
     {
         void Dispose();
+    }
+    public interface IComparable
+    {
+        int CompareTo(object? obj);
+    }
+    public interface IComparable<in T> where T : allows ref struct
+    {
+        int CompareTo(T? other);
     }
     public interface IConvertible
     {
@@ -7433,9 +9677,23 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         string ToString(IFormatProvider? provider);
         object ToType(Type conversionType, IFormatProvider? provider);
     }
+    public interface IFormattable
+    {
+        string ToString(string? format, IFormatProvider? formatProvider);
+    }
+    /// <summary>
+    /// Provides a mechanism for retrieving an object to control formatting.
+    /// </summary>
     public interface IFormatProvider
     {
         object? GetFormat(Type? formatType);
+    }
+    /// <summary>
+    /// Defines a method that supports custom formatting of the value of an object.
+    /// </summary>
+    public interface ICustomFormatter
+    {
+        string Format(string? format, object? arg, IFormatProvider? formatProvider);
     }
     public interface IEquatable<T> where T : allows ref struct // invariant due to questionable semantics around equality and inheritance
     {
@@ -9556,6 +11814,344 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         where T16 : allows ref struct;
 
 
+    public static class GC
+    {
+        private enum StartNoGCRegionStatus
+        {
+            Succeeded,
+            NotEnoughMemory,
+            AmountTooLarge,
+            AlreadyInProgress
+        }
+
+        private enum EndNoGCRegionStatus
+        {
+            Succeeded,
+            NotInProgress,
+            GCInduced,
+            AllocationExceeded
+        }
+
+
+        /// <summary>
+        /// Allocate an array while skipping zero-initialization if possible.
+        /// </summary>
+        /// <typeparam name="T">Specifies the type of the array element.</typeparam>
+        /// <param name="length">Specifies the length of the array.</param>
+        /// <param name="pinned">Specifies whether the allocated array must be pinned.</param>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)] // forced to ensure no perf drop for small memory buffers (hot path)
+        public static unsafe T[] AllocateUninitializedArray<T>(int length, bool pinned = false)
+        {
+            if (!pinned)
+            {
+                if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                {
+                    return new T[length];
+                }
+            }
+
+            return AllocateNewUninitializedArray(length, pinned);
+
+            static T[] AllocateNewUninitializedArray(int length, bool pinned)
+            {
+                Internal.Runtime.GC_ALLOC_FLAGS flags = Internal.Runtime.GC_ALLOC_FLAGS.GC_ALLOC_ZEROING_OPTIONAL;
+                if (pinned)
+                    flags |= Internal.Runtime.GC_ALLOC_FLAGS.GC_ALLOC_PINNED_OBJECT_HEAP;
+                if (length < 0)
+                    throw new OverflowException();
+
+                T[]? array = System.Runtime.RuntimeImports.RhAllocateNewArray<T>(length, (uint)flags);
+                if (array == null)
+                    throw new OutOfMemoryException();
+
+                return array;
+            }
+        }
+    }
+
+
+    public enum PlatformID
+    {
+        Win32S = 0,
+        Win32Windows = 1,
+        Win32NT = 2,
+        WinCE = 3,
+        Unix = 4,
+        Xbox = 5,
+        MacOSX = 6,
+        Other = 7
+    }
+
+    public sealed class Version
+    {
+        private readonly int _Major; // Do not rename
+        private readonly int _Minor; // Do not rename
+        private readonly int _Build; // Do not rename
+        private readonly int _Revision; // Do not rename
+
+        public Version(int major, int minor, int build, int revision)
+        {
+            if (major < 0 || minor < 0 || build < 0 || revision < 0) throw new ArgumentOutOfRangeException();
+            _Major = major;
+            _Minor = minor;
+            _Build = build;
+            _Revision = revision;
+        }
+
+        public Version(int major, int minor, int build)
+        {
+            if (major < 0 || minor < 0 || build < 0) throw new ArgumentOutOfRangeException();
+            _Major = major;
+            _Minor = minor;
+            _Build = build;
+            _Revision = -1;
+        }
+
+        public Version(int major, int minor)
+        {
+            if (major < 0 || minor < 0) throw new ArgumentOutOfRangeException();
+            _Major = major;
+            _Minor = minor;
+            _Build = -1;
+            _Revision = -1;
+        }
+
+        public Version()
+        {
+            //_Major = 0;
+            //_Minor = 0;
+            _Build = -1;
+            _Revision = -1;
+        }
+
+        private Version(Version version)
+        {
+            _Major = version._Major;
+            _Minor = version._Minor;
+            _Build = version._Build;
+            _Revision = version._Revision;
+        }
+
+        public int Major => _Major;
+
+        public int Minor => _Minor;
+
+        public int Build => _Build;
+
+        public int Revision => _Revision;
+
+        public short MajorRevision => (short)(_Revision >> 16);
+
+        public short MinorRevision => (short)(_Revision & 0xFFFF);
+
+        public int CompareTo(object? version)
+        {
+            if (version == null)
+            {
+                return 1;
+            }
+
+            if (version is Version v)
+            {
+                return CompareTo(v);
+            }
+
+            throw new ArgumentException();
+        }
+
+        public int CompareTo(Version? value)
+        {
+            return
+                ReferenceEquals(value, this) ? 0 :
+                value is null ? 1 :
+                _Major != value._Major ? (_Major > value._Major ? 1 : -1) :
+                _Minor != value._Minor ? (_Minor > value._Minor ? 1 : -1) :
+                _Build != value._Build ? (_Build > value._Build ? 1 : -1) :
+                _Revision != value._Revision ? (_Revision > value._Revision ? 1 : -1) :
+                0;
+        }
+
+        public override bool Equals([NotNullWhen(true)] object? obj)
+        {
+            return Equals(obj as Version);
+        }
+
+        public bool Equals([NotNullWhen(true)] Version? obj)
+        {
+            return ReferenceEquals(obj, this) ||
+                (obj is not null &&
+                _Major == obj._Major &&
+                _Minor == obj._Minor &&
+                _Build == obj._Build &&
+                _Revision == obj._Revision);
+        }
+
+        public override int GetHashCode()
+        {
+            // Let's assume that most version numbers will be pretty small and just
+            // OR some lower order bits together.
+
+            int accumulator = 0;
+
+            accumulator |= (_Major & 0x0000000F) << 28;
+            accumulator |= (_Minor & 0x000000FF) << 20;
+            accumulator |= (_Build & 0x000000FF) << 12;
+            accumulator |= (_Revision & 0x00000FFF);
+
+            return accumulator;
+        }
+
+        public bool TryFormat(Span<char> destination, int fieldCount, out int charsWritten) =>
+            TryFormatCore(destination, fieldCount, out charsWritten);
+
+        private bool TryFormatCore<TChar>(Span<TChar> destination, int fieldCount, out int charsWritten) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            switch ((uint)fieldCount)
+            {
+                case > 4:
+                    ThrowArgumentException("4");
+                    break;
+
+                case >= 3 when _Build == -1:
+                    ThrowArgumentException("2");
+                    break;
+
+                case 4 when _Revision == -1:
+                    ThrowArgumentException("3");
+                    break;
+
+                    static void ThrowArgumentException(string failureUpperBound) =>
+                        throw new ArgumentException(failureUpperBound, nameof(fieldCount));
+            }
+
+            int totalCharsWritten = 0;
+
+            for (int i = 0; i < fieldCount; i++)
+            {
+                if (i != 0)
+                {
+                    if (destination.IsEmpty)
+                    {
+                        charsWritten = 0;
+                        return false;
+                    }
+
+                    destination[0] = TChar.CastFrom('.');
+                    destination = destination.Slice(1);
+                    totalCharsWritten++;
+                }
+                int value = i switch
+                {
+                    0 => _Major,
+                    1 => _Minor,
+                    2 => _Build,
+                    _ => _Revision
+                };
+                int valueCharsWritten;
+                bool formatted = typeof(TChar) == typeof(char) ?
+                    ((uint)value).TryFormat(Unsafe.BitCast<Span<TChar>, Span<char>>(destination), out valueCharsWritten) :
+                    ((uint)value).TryFormat(Unsafe.BitCast<Span<TChar>, Span<byte>>(destination), out valueCharsWritten, 
+                        default, System.Globalization.CultureInfo.InvariantCulture);
+
+                totalCharsWritten += valueCharsWritten;
+                destination = destination.Slice(valueCharsWritten);
+            }
+
+            charsWritten = totalCharsWritten;
+            return true;
+        }
+
+        public override string ToString() =>
+            ToString(DefaultFormatFieldCount);
+
+        public unsafe string ToString(int fieldCount)
+        {
+            Span<char> dest = stackalloc char[(4 * Number.Int32NumberBufferLength) + 3]; // at most 4 Int32s and 3 periods
+            bool success = TryFormat(dest, fieldCount, out int charsWritten);
+            return dest.Slice(0, charsWritten).ToString();
+        }
+
+        private int DefaultFormatFieldCount =>
+            _Build == -1 ? 2 :
+            _Revision == -1 ? 3 :
+            4;
+    }
+
+    public sealed class OperatingSystem
+    {
+        private readonly Version _version;
+        private readonly string? _servicePack;
+        private readonly PlatformID _platform;
+        private string? _versionString;
+
+        public PlatformID Platform => _platform;
+
+        public string ServicePack => _servicePack ?? string.Empty;
+
+        public Version Version => _version;
+
+        public unsafe string VersionString
+        {
+            get
+            {
+                if (_versionString == null)
+                {
+                    string os;
+                    switch (_platform)
+                    {
+                        case PlatformID.Win32S: os = "Microsoft Win32S "; break;
+                        case PlatformID.Win32Windows:
+                            os = (_version.Major > 4 || (_version.Major == 4 && _version.Minor > 0))
+                                ? "Microsoft Windows 98 " : "Microsoft Windows 95 "; break;
+                        case PlatformID.Win32NT: os = "Microsoft Windows NT "; break;
+                        case PlatformID.WinCE: os = "Microsoft Windows CE "; break;
+                        case PlatformID.Unix: os = "Unix "; break;
+                        case PlatformID.Xbox: os = "Xbox "; break;
+                        case PlatformID.MacOSX: os = "Mac OS X "; break;
+                        case PlatformID.Other: os = "Other "; break;
+                        default:
+                            os = "<unknown> "; break;
+                    }
+
+                    Span<char> stackBuffer = stackalloc char[128];
+                    _versionString = string.IsNullOrEmpty(_servicePack) ?
+                        string.Create(null, stackBuffer, $"{os}{_version}") :
+                        string.Create(null, stackBuffer, $"{os}{_version.ToString(3)} {_servicePack}");
+                }
+
+                return _versionString;
+            }
+        }
+
+
+        private static bool IsOSVersionAtLeast(int major, int minor, int build, int revision)
+        {
+            Version current = Environment.OSVersion.Version;
+
+            if (current.Major != major)
+            {
+                return current.Major > major;
+            }
+            if (current.Minor != minor)
+            {
+                return current.Minor > minor;
+            }
+            // Unspecified build component is to be treated as zero
+            int currentBuild = current.Build < 0 ? 0 : current.Build;
+            build = build < 0 ? 0 : build;
+            if (currentBuild != build)
+            {
+                return currentBuild > build;
+            }
+
+            // Unspecified revision component is to be treated as zero
+            int currentRevision = current.Revision < 0 ? 0 : current.Revision;
+            revision = revision < 0 ? 0 : revision;
+
+            return currentRevision >= revision;
+        }
+    }
+
     public enum TypeCode
     {
         Empty = 0,          // Null reference
@@ -9588,6 +12184,13 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 
         public abstract Type UnderlyingSystemType { get; }
 
+        public virtual bool IsEnum { [Intrinsic] get => throw new NotImplementedException(); }
+        public bool IsPrimitive
+        {
+            [Intrinsic]
+            get => IsPrimitiveImpl();
+        }
+        protected abstract bool IsPrimitiveImpl();
         public bool IsValueType
         {
             [Intrinsic]
@@ -9990,6 +12593,32 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 
         public bool Inherited { get; set; }
     }
+    /// <summary>
+    /// Indicates that the value of a static field is unique for each thread.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Field, Inherited = false)]
+    public class ThreadStaticAttribute : Attribute
+    {
+        public ThreadStaticAttribute()
+        {
+        }
+    }
+    [AttributeUsage(AttributeTargets.Method | AttributeTargets.Constructor | AttributeTargets.Property, AllowMultiple = false, Inherited = false)]
+    public sealed class OverloadResolutionPriorityAttribute : Attribute
+    {
+        /// <summary>
+        /// Initializes a new instance of the <see cref="OverloadResolutionPriorityAttribute"/> class.
+        /// </summary>
+        public OverloadResolutionPriorityAttribute(int priority)
+        {
+            Priority = priority;
+        }
+
+        /// <summary>
+        /// The priority of the member.
+        /// </summary>
+        public int Priority { get; }
+    }
     [AttributeUsage(AttributeTargets.Parameter, Inherited = false)]
     public sealed class AllowNullAttribute : Attribute
     {
@@ -10072,8 +12701,8 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         private static ReadOnlySpan<char> _falseWithNewLineString => ['F', 'a', 'l', 's', 'e', '\n', '\0'];
         private static ReadOnlySpan<char> _intMinValueString => ['-', '2', '1', '4', '7', '4', '8', '3', '6', '4', '8', '\0'];
         private static ReadOnlySpan<char> _intMinValueWithNewLineString => ['-', '2', '1', '4', '7', '4', '8', '3', '6', '4', '8', '\n', '\0'];
-        private static ReadOnlySpan<char> _longMinValueString => 
-            ['-','9','2','2','3','3','7','2','0','3', '6','8','5','4','7','7','5','8','0','8','\0'];
+        private static ReadOnlySpan<char> _longMinValueString =>
+            ['-', '9', '2', '2', '3', '3', '7', '2', '0', '3', '6', '8', '5', '4', '7', '7', '5', '8', '0', '8', '\0'];
         public static void Write(sbyte value) { Write((int)value); }
         public static void Write(byte value) { Write((int)value); }
         public static void Write(short value) { Write((int)value); }
@@ -10164,10 +12793,7 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         public static unsafe void Write(char value) { uint terminated = value; _Write((char*)&terminated); }
         public static unsafe void Write(bool value)
         {
-            if (value)
-                _Write((char*)Unsafe.AsPointer(in _trueString._reference));
-            else
-                _Write((char*)Unsafe.AsPointer(in _falseString._reference));
+            _Write((char*)Unsafe.AsPointer(in (value ? ref _trueString._reference : ref _falseString._reference)));
         }
         public static unsafe void Write(char* value) { _Write(value); }
         public static void Write(ReadOnlySpan<char> value) { _Write(value); }
@@ -10212,10 +12838,7 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         public unsafe static void WriteLine(char value) { ulong s = (ulong)value | ((ulong)'\n' << 16); _Write((char*)&s); }
         public unsafe static void WriteLine(bool value)
         {
-            if (value)
-                _Write((char*)Unsafe.AsPointer(in _trueWithNewLineString._reference));
-            else
-                _Write((char*)Unsafe.AsPointer(in _falseWithNewLineString._reference));
+            _Write((char*)Unsafe.AsPointer(in (value ? ref _trueWithNewLineString._reference : ref _falseWithNewLineString._reference)));
         }
         public unsafe static void WriteLine(float value) { Write(value); uint nl = '\n'; _Write((char*)&nl); }
         public unsafe static void WriteLine(double value) { Write(value); uint nl = '\n'; _Write((char*)&nl); }

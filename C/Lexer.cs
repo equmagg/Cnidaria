@@ -336,7 +336,20 @@ namespace Cnidaria.C
                 if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVM) != 0)
                     macros["__riscv_mul"] = "1";
                 if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVA) != 0)
+                {
                     macros["__riscv_atomic"] = "1";
+                    macros["__riscv_zaamo"] = "1000000";
+                    macros["__riscv_zalrsc"] = "1000000";
+                }
+                if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVZaamo) != 0)
+                    macros["__riscv_zaamo"] = "1000000";
+                if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVZalrsc) != 0)
+                    macros["__riscv_zalrsc"] = "1000000";
+                if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVZacas) != 0)
+                {
+                    macros["__riscv_zaamo"] = "1000000";
+                    macros["__riscv_zacas"] = "1000000";
+                }
                 if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVF) != 0)
                     macros["__riscv_flen"] = "32";
                 if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVD) != 0)

@@ -189,6 +189,17 @@ namespace Cnidaria.Cs
                         $"the 'unmanaged' constraint on '{tp.Name}' in '{ownerDisplayName}'.",
                         location: new Location(context.SemanticModel.SyntaxTree, getArgSpan(i))));
                 }
+                if ((constraints & GenericConstraintsFlags.ClassConstraint) != 0
+                    && !arg.IsReferenceType)
+                {
+                    ok = false;
+                    diagnostics.Add(new Diagnostic(
+                        id: "CN_GENCONSTR_CLASS",
+                        severity: DiagnosticSeverity.Error,
+                        message: $"The type '{arg.Name}' must be a reference type to satisfy " +
+                        $"the 'class' constraint on '{tp.Name}' in '{ownerDisplayName}'.",
+                        location: new Location(context.SemanticModel.SyntaxTree, getArgSpan(i))));
+                }
                 // Requires a non-nullable value type
                 if ((constraints & GenericConstraintsFlags.UnmanagedConstraint) == 0
                     && (constraints & GenericConstraintsFlags.StructConstraint) != 0
@@ -293,6 +304,58 @@ namespace Cnidaria.Cs
                 }
             }
         }
+        internal static void BindOwnerTypeConstraints(
+            SyntaxTree tree,
+            SyntaxList<TypeParameterConstraintClauseSyntax> clauses,
+            ImmutableArray<TypeParameterSymbol> typeParameters,
+            Symbol owner,
+            Binder typeBinder,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (clauses.Count == 0 || typeParameters.IsDefaultOrEmpty)
+                return;
+
+            for (int c = 0; c < clauses.Count; c++)
+            {
+                var clause = clauses[c];
+                var tpName = clause.Name.ValueText ?? string.Empty;
+                TypeParameterSymbol? tp = null;
+                for (int i = 0; i < typeParameters.Length; i++)
+                {
+                    if (StringComparer.Ordinal.Equals(typeParameters[i].Name, tpName))
+                    {
+                        tp = typeParameters[i];
+                        break;
+                    }
+                }
+
+                if (tp is null)
+                    continue;
+
+                var constraints = clause.Constraints;
+                for (int i = 0; i < constraints.Count; i++)
+                {
+                    if (constraints[i] is not TypeConstraintSyntax typeConstraint)
+                        continue;
+
+                    if (typeConstraint.Type is IdentifierNameSyntax id)
+                    {
+                        var text = id.Identifier.ValueText ?? string.Empty;
+                        if (string.Equals(text, "unmanaged", StringComparison.Ordinal) ||
+                            string.Equals(text, "notnull", StringComparison.Ordinal))
+                        {
+                            continue;
+                        }
+                    }
+
+                    var type = typeBinder.BindType(typeConstraint.Type, context, diagnostics);
+                    if (type is not ErrorTypeSymbol)
+                        tp.AddConstraintType(type);
+                }
+            }
+        }
+
         /// <summary>Binds and validates constraint clauses for one generic owner</summary>
         internal static void BindOwnerConstraintClauses(
             SyntaxTree tree,
@@ -352,6 +415,16 @@ namespace Cnidaria.Cs
                                     id: "CN_GENCONSTR_DUP001",
                                     severity: DiagnosticSeverity.Error,
                                     message: $"Duplicate 'struct' constraint for type parameter '{tp.Name}'.",
+                                    location: new Location(tree, s.Span)));
+                            }
+                            break;
+                        case ClassOrStructConstraintSyntax s when s.Kind == SyntaxKind.ClassConstraint:
+                            if (!tp.TrySetConstraint(GenericConstraintsFlags.ClassConstraint))
+                            {
+                                diagnostics.Add(new Diagnostic(
+                                    id: "CN_GENCONSTR_DUP005",
+                                    severity: DiagnosticSeverity.Error,
+                                    message: $"Duplicate 'class' constraint for type parameter '{tp.Name}'.",
                                     location: new Location(tree, s.Span)));
                             }
                             break;

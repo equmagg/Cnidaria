@@ -2522,6 +2522,7 @@ namespace Cnidaria.Cs
                     case GenTreeKind.DelegateCombine:
                     case GenTreeKind.DelegateRemove:
                         return NewObject(node, operands, ref heap, blockId);
+                    case GenTreeKind.Intrinsic:
                     case GenTreeKind.Call:
                     case GenTreeKind.IndirectCall:
                     case GenTreeKind.VirtualCall:
@@ -2547,8 +2548,6 @@ namespace Cnidaria.Cs
                         return StackAlloc(node, operands);
                     case GenTreeKind.PointerElementAddr:
                         return Func(node, ValueNumberFunction.PointerElementAddr, operands, _store.VNForInt32(node.Int32));
-                    case GenTreeKind.PointerToByRef:
-                        return Func(node, ValueNumberFunction.PointerToByRef, operands);
                     case GenTreeKind.PointerDiff:
                         return Func(node, ValueNumberFunction.PointerDiff, operands, _store.VNForInt32(node.Int32));
                     case GenTreeKind.ExceptionObject:
@@ -2641,6 +2640,7 @@ namespace Cnidaria.Cs
                 {
                     BytecodeOp.Neg => ValueNumberFunction.Neg,
                     BytecodeOp.Not => ValueNumberFunction.Not,
+                    BytecodeOp.PtrToByRef => ValueNumberFunction.PointerToByRef,
                     _ => ValueNumberFunction.None,
                 };
                 if (func == ValueNumberFunction.None)
@@ -3111,7 +3111,7 @@ namespace Cnidaria.Cs
                 if (node.Kind is GenTreeKind.Arg or GenTreeKind.Local or GenTreeKind.Temp)
                     return node.LocalDescriptor is { IsLocalStorageByRefAlias: true };
 
-                if (node.Kind is GenTreeKind.FieldAddr or GenTreeKind.PointerToByRef or GenTreeKind.PointerElementAddr)
+                if ((node.Kind is GenTreeKind.FieldAddr or GenTreeKind.PointerElementAddr) || (node.Kind == GenTreeKind.Unary && node.SourceOp == BytecodeOp.PtrToByRef))
                 {
                     for (int i = 0; i < node.Operands.Length; i++)
                     {
@@ -3466,6 +3466,7 @@ namespace Cnidaria.Cs
                         result = AddHelperOpaqueException(result, node);
                         break;
 
+                    case GenTreeKind.Intrinsic:
                     case GenTreeKind.Call:
                         result = AddHelperOpaqueException(result, node);
                         break;

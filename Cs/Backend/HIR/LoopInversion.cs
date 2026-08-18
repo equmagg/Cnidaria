@@ -723,7 +723,7 @@ namespace Cnidaria.Cs
         {
             int cost = node.Kind switch
             {
-                GenTreeKind.Call or GenTreeKind.IndirectCall or GenTreeKind.VirtualCall => 8,
+                GenTreeKind.Intrinsic or GenTreeKind.Call or GenTreeKind.IndirectCall or GenTreeKind.VirtualCall => 8,
                 GenTreeKind.NewObject or GenTreeKind.NewArray or GenTreeKind.NewDelegate => 8,
                 GenTreeKind.ClassInit => 8,
                 GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or GenTreeKind.StoreArrayElement => 5,

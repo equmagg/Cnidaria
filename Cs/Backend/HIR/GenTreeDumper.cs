@@ -105,10 +105,11 @@ namespace Cnidaria.Cs
                     AppendOperands(sb, node);
                     sb.Append(')');
                     return;
+                case GenTreeKind.Intrinsic:
                 case GenTreeKind.Call:
                 case GenTreeKind.VirtualCall:
                 case GenTreeKind.DelegateInvoke:
-                    sb.Append(node.Kind == GenTreeKind.VirtualCall ? "callvirt " : node.Kind == GenTreeKind.DelegateInvoke ? "delegate_invoke " : "call ");
+                    sb.Append(node.Kind == GenTreeKind.Intrinsic ? "intrinsic " : node.Kind == GenTreeKind.VirtualCall ? "callvirt " : node.Kind == GenTreeKind.DelegateInvoke ? "delegate_invoke " : "call ");
                     sb.Append(MethodName(node.Method)).Append('(');
                     AppendOperands(sb, node);
                     sb.Append(')');
@@ -218,11 +219,6 @@ namespace Cnidaria.Cs
                     return;
                 case GenTreeKind.PointerElementAddr:
                     sb.Append("ptrElemAddr(size=").Append(node.Int32).Append(", ");
-                    AppendOperands(sb, node);
-                    sb.Append(')');
-                    return;
-                case GenTreeKind.PointerToByRef:
-                    sb.Append("ptrToByRef(");
                     AppendOperands(sb, node);
                     sb.Append(')');
                     return;

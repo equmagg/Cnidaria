@@ -56,6 +56,8 @@ namespace Cnidaria.Cs
                     parent: null, flags: BinderFlags.None, compilation: compilation, importScopeMap: importScopeMap);
                 var unsafeTypeBinder = new TypeBinder(
                     parent: null, flags: BinderFlags.UnsafeRegion, compilation: compilation, importScopeMap: importScopeMap);
+                BindTypeConstraintTypesForTree(
+                    tree, declMap, stubModel, safeTypeBinder, unsafeTypeBinder, diagnostics);
                 BindEnumUnderlyingTypesForTree(
                     compilation, tree, declMap, stubModel, safeTypeBinder, diagnostics);
                 foreach (var kv in declMap)
@@ -70,7 +72,7 @@ namespace Cnidaria.Cs
 
                         var typeBinder = HasModifier(md.Modifiers, SyntaxKind.UnsafeKeyword) ? unsafeTypeBinder : safeTypeBinder;
                         var rt = typeBinder.BindType(md.ReturnType, ctx, diagnostics);
-                        sm.SetReturnType(rt);
+                        sm.SetReturnType(rt, IsRefReadonlyReturnType(md.ReturnType));
 
                         var pars = md.ParameterList.Parameters;
                         for (int i = 0; i < pars.Count && i < sm.Parameters.Length; i++)
@@ -106,7 +108,7 @@ namespace Cnidaria.Cs
 
                         var typeBinder = HasModifier(od.Modifiers, SyntaxKind.UnsafeKeyword) ? unsafeTypeBinder : safeTypeBinder;
                         var rt = typeBinder.BindType(od.ReturnType, ctx, diagnostics);
-                        opMethod.SetReturnType(rt);
+                        opMethod.SetReturnType(rt, IsRefReadonlyReturnType(od.ReturnType));
 
                         var pars = od.ParameterList.Parameters;
                         for (int i = 0; i < pars.Count && i < opMethod.Parameters.Length; i++)
@@ -122,7 +124,7 @@ namespace Cnidaria.Cs
 
                         var typeBinder = HasModifier(cod.Modifiers, SyntaxKind.UnsafeKeyword) ? unsafeTypeBinder : safeTypeBinder;
                         var rt = typeBinder.BindType(cod.Type, ctx, diagnostics);
-                        convMethod.SetReturnType(rt);
+                        convMethod.SetReturnType(rt, IsRefReadonlyReturnType(cod.Type));
 
                         var pars = cod.ParameterList.Parameters;
                         for (int i = 0; i < pars.Count && i < convMethod.Parameters.Length; i++)
@@ -173,43 +175,34 @@ namespace Cnidaria.Cs
 
                         if (prop.GetMethod is SourceMethodSymbol get)
                         {
-                            get.SetReturnType(pt);
+                            get.SetReturnType(pt, IsRefReadonlyReturnType(pd.Type));
                         }
                         if (prop.SetMethod is SourceMethodSymbol set && set.Parameters.Length == 1)
                         {
                             set.Parameters[0].Type = pt;
                         }
-                        if (IsAutoProperty(pd) &&
-                            prop.BackingFieldOpt is null &&
-                            prop.ContainingSymbol is NamedTypeSymbol ownerType)
+                        if (RequiresBackingField(pd, prop) && prop.BackingFieldOpt is null)
                         {
-                            string backingName = $"<{prop.Name}>k__BackingField";
-                            var backing = new SynthesizedBackingFieldSymbol(
-                                name: backingName,
-                                containing: ownerType,
-                                placeholderType: pt,
-                                isStatic: prop.IsStatic,
-                                isReadOnly: false);
-                            bool added = ownerType switch
+                            if (prop.Type is ByRefTypeSymbol)
                             {
-                                SourceNamedTypeSymbol srcType => AddToSource(srcType, backing),
-                                SpecialNamedTypeSymbol specialType => AddToSpecial(specialType, backing),
-                                _ => false
-                            };
-
-                            if (added)
-                                prop.SetBackingField(backing);
-
-                            static bool AddToSource(SourceNamedTypeSymbol t, Symbol m)
-                            {
-                                t.AddMember(m);
-                                return true;
+                                diagnostics.Add(new Diagnostic(
+                                    "CN_FIELD001",
+                                    DiagnosticSeverity.Error,
+                                    "Auto-implemented properties cannot return by reference.",
+                                    new Location(tree, pd.Span)));
                             }
-
-                            static bool AddToSpecial(SpecialNamedTypeSymbol t, Symbol m)
+                            else
                             {
-                                t.AddMember(m);
-                                return true;
+                                prop.EnsureBackingField(IsBackingFieldReadOnly(pd, prop));
+
+                                if (!prop.IsStatic && prop.ContainingSymbol is NamedTypeSymbol { TypeKind: TypeKind.Interface })
+                                {
+                                    diagnostics.Add(new Diagnostic(
+                                        "CN_FIELD002",
+                                        DiagnosticSeverity.Error,
+                                        "Interfaces cannot contain instance fields.",
+                                        new Location(tree, pd.Span)));
+                                }
                             }
                         }
                     }
@@ -245,7 +238,7 @@ namespace Cnidaria.Cs
                         }
 
                         if (prop2.GetMethod is SourceMethodSymbol getMethod)
-                            getMethod.SetReturnType(pt);
+                            getMethod.SetReturnType(pt, IsRefReadonlyReturnType(idx.Type));
 
                         if (prop2.SetMethod is SourceMethodSymbol setMethod && setMethod.Parameters.Length > 0)
                             setMethod.Parameters[setMethod.Parameters.Length - 1].Type = pt;
@@ -289,7 +282,7 @@ namespace Cnidaria.Cs
 
             var ctx = new BindingContext(compilation, stubModel, invoke, NullRecorder.Instance);
             var returnType = typeBinder.BindType(syntax.ReturnType, ctx, diagnostics);
-            invoke.SetReturnType(returnType);
+            invoke.SetReturnType(returnType, IsRefReadonlyReturnType(syntax.ReturnType));
 
             var pars = syntax.ParameterList.Parameters;
             for (int i = 0; i < pars.Count && i < invoke.Parameters.Length; i++)
@@ -305,6 +298,11 @@ namespace Cnidaria.Cs
                 }
             }
         }
+
+
+        private static bool IsRefReadonlyReturnType(TypeSyntax type)
+            => type is RefTypeSyntax refType &&
+               refType.ReadOnlyKeyword.Kind == SyntaxKind.ReadOnlyKeyword;
 
         private static SourceMethodSymbol? FindSourceMethod(NamedTypeSymbol type, string name)
         {
@@ -521,6 +519,12 @@ namespace Cnidaria.Cs
                 containing: pending.ContainingMethod,
                 inheritFlowFromParent: false);
 
+            if (def.Value.Kind == SyntaxKind.DefaultLiteralExpression)
+            {
+                constantValueOpt = new Optional<object>(null!);
+                return true;
+            }
+
             var init = exprBinder.BindExpression(def.Value, ctx, diagnostics);
             init = exprBinder.ApplyConversion(
                 exprSyntax: def.Value,
@@ -615,6 +619,66 @@ namespace Cnidaria.Cs
             return ctx.Compilation.CreateByRefType(baseType);
         }
         // Enum underlying types must be known before member constants are converted
+        private static void BindTypeConstraintTypesForTree(
+            SyntaxTree tree,
+            ImmutableDictionary<SyntaxNode, Symbol> declMap,
+            SemanticModelStub stubModel,
+            TypeBinder safeTypeBinder,
+            TypeBinder unsafeTypeBinder,
+            DiagnosticBag diagnostics)
+        {
+            foreach (var kv in declMap)
+            {
+                SyntaxList<TypeParameterConstraintClauseSyntax> clauses;
+                SyntaxTokenList modifiers;
+                ImmutableArray<TypeParameterSymbol> typeParameters;
+                Symbol owner;
+
+                switch (kv.Key)
+                {
+                    case ClassDeclarationSyntax syntax when kv.Value is NamedTypeSymbol symbol:
+                        clauses = syntax.ConstraintClauses;
+                        modifiers = syntax.Modifiers;
+                        typeParameters = symbol.TypeParameters;
+                        owner = symbol;
+                        break;
+                    case StructDeclarationSyntax syntax when kv.Value is NamedTypeSymbol symbol:
+                        clauses = syntax.ConstraintClauses;
+                        modifiers = syntax.Modifiers;
+                        typeParameters = symbol.TypeParameters;
+                        owner = symbol;
+                        break;
+                    case InterfaceDeclarationSyntax syntax when kv.Value is NamedTypeSymbol symbol:
+                        clauses = syntax.ConstraintClauses;
+                        modifiers = syntax.Modifiers;
+                        typeParameters = symbol.TypeParameters;
+                        owner = symbol;
+                        break;
+                    case DelegateDeclarationSyntax syntax when kv.Value is NamedTypeSymbol symbol:
+                        clauses = syntax.ConstraintClauses;
+                        modifiers = syntax.Modifiers;
+                        typeParameters = symbol.TypeParameters;
+                        owner = symbol;
+                        break;
+                    case MethodDeclarationSyntax syntax when kv.Value is MethodSymbol symbol:
+                        clauses = syntax.ConstraintClauses;
+                        modifiers = syntax.Modifiers;
+                        typeParameters = symbol.TypeParameters;
+                        owner = symbol;
+                        break;
+                    default:
+                        continue;
+                }
+
+                if (clauses.Count == 0 || typeParameters.IsDefaultOrEmpty)
+                    continue;
+
+                var binder = HasModifier(modifiers, SyntaxKind.UnsafeKeyword) ? unsafeTypeBinder : safeTypeBinder;
+                var context = new BindingContext(stubModel.Compilation, stubModel, owner, NullRecorder.Instance);
+                GenericConstraintBinder.BindOwnerTypeConstraints(
+                    tree, clauses, typeParameters, owner, binder, context, diagnostics);
+            }
+        }
         private static void BindEnumUnderlyingTypesForTree(
             Compilation compilation,
             SyntaxTree tree,
@@ -679,14 +743,21 @@ namespace Cnidaria.Cs
             TypeBinder safeTypeBinder,
             DiagnosticBag diagnostics)
         {
+            var enumDeclarations = new List<KeyValuePair<SyntaxNode, Symbol>>();
             foreach (var kv in declMap)
             {
-                if (kv.Key is not EnumDeclarationSyntax eds)
-                    continue;
+                if (kv.Key is EnumDeclarationSyntax &&
+                    kv.Value is SourceNamedTypeSymbol { TypeKind: TypeKind.Enum })
+                {
+                    enumDeclarations.Add(kv);
+                }
+            }
+            enumDeclarations.Sort((left, right) => left.Key.Span.Start.CompareTo(right.Key.Span.Start));
 
-                if (kv.Value is not SourceNamedTypeSymbol enumType || enumType.TypeKind != TypeKind.Enum)
-                    continue;
-
+            foreach (var kv in enumDeclarations)
+            {
+                var eds = (EnumDeclarationSyntax)kv.Key;
+                var enumType = (SourceNamedTypeSymbol)kv.Value;
                 var underlyingType = enumType.EnumUnderlyingType ?? compilation.GetSpecialType(SpecialType.System_Int32);
                 object? previousValue = null;
                 bool hasPrevious = false;
@@ -702,7 +773,10 @@ namespace Cnidaria.Cs
                     if (em.EqualsValue is not null)
                     {
                         var ctx = new BindingContext(compilation, stubModel, field, NullRecorder.Instance);
-                        var exprBinder = new LocalScopeBinder(parent: safeTypeBinder, flags: BinderFlags.None, containing: field);
+                        var exprBinder = new LocalScopeBinder(
+                            parent: safeTypeBinder,
+                            flags: BinderFlags.EnumMemberInitializer,
+                            containing: field);
                         var init = exprBinder.BindExpression(em.EqualsValue.Value, ctx, diagnostics);
 
                         if (!ReferenceEquals(init.Type, enumType))
@@ -719,11 +793,14 @@ namespace Cnidaria.Cs
 
                         if (!init.ConstantValueOpt.HasValue)
                         {
-                            diagnostics.Add(new Diagnostic(
-                                "CN_ENUM003",
-                                DiagnosticSeverity.Error,
-                                $"Enum member '{field.Name}' must have a constant value.",
-                                new Location(tree, em.Span)));
+                            if (!init.HasErrors)
+                            {
+                                diagnostics.Add(new Diagnostic(
+                                    "CN_ENUM003",
+                                    DiagnosticSeverity.Error,
+                                    $"Enum member '{field.Name}' must have a constant value.",
+                                    new Location(tree, em.Span)));
+                            }
 
                             value = GetDefaultEnumConstantValue(underlyingType);
                         }
@@ -755,33 +832,70 @@ namespace Cnidaria.Cs
                 }
             }
         }
+        private static bool RequiresBackingField(PropertyDeclarationSyntax pd, SourcePropertySymbol property)
+        {
+            if (pd.UsesFieldKeyword)
+                return true;
+
+            if (!HasAutoAccessor(pd))
+                return false;
+
+            if (property.ContainingSymbol is NamedTypeSymbol { TypeKind: TypeKind.Interface } &&
+                !property.IsStatic &&
+                IsAutoProperty(pd))
+            {
+                return false;
+            }
+
+            return true;
+        }
+        private static bool IsBackingFieldReadOnly(PropertyDeclarationSyntax pd, SourcePropertySymbol property)
+        {
+            if (property.ContainingSymbol is NamedTypeSymbol containingType &&
+                containingType.IsValueType &&
+                (containingType.IsReadOnlyStruct || HasModifier(pd.Modifiers, SyntaxKind.ReadOnlyKeyword)))
+            {
+                return true;
+            }
+
+            return !property.HasSet && IsAutoProperty(pd);
+        }
         private static bool IsAutoProperty(PropertyDeclarationSyntax pd)
         {
-            if (pd is null)
+            if (pd.ExpressionBody is not null || pd.AccessorList is null || pd.AccessorList.Accessors.Count == 0)
                 return false;
 
-            if (pd.ExpressionBody is not null)
+            var accessors = pd.AccessorList.Accessors;
+            for (int i = 0; i < accessors.Count; i++)
+            {
+                var accessor = accessors[i];
+                if (accessor.Kind is not (SyntaxKind.GetAccessorDeclaration or SyntaxKind.SetAccessorDeclaration or SyntaxKind.InitAccessorDeclaration) ||
+                    accessor.Body is not null ||
+                    accessor.ExpressionBody is not null)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+        private static bool HasAutoAccessor(PropertyDeclarationSyntax pd)
+        {
+            if (pd is null || pd.ExpressionBody is not null || pd.AccessorList is null)
                 return false;
 
-            if (pd.AccessorList is null)
-                return false;
-
-            bool hasAccessor = false;
             var accessors = pd.AccessorList.Accessors;
             for (int i = 0; i < accessors.Count; i++)
             {
                 var a = accessors[i];
-
-                if (a.Kind is not SyntaxKind.GetAccessorDeclaration and not SyntaxKind.SetAccessorDeclaration)
-                    return false;
-
-                hasAccessor = true;
-
-                if (a.Body is not null || a.ExpressionBody is not null)
-                    return false;
+                if (a.Kind is SyntaxKind.GetAccessorDeclaration or SyntaxKind.SetAccessorDeclaration or SyntaxKind.InitAccessorDeclaration)
+                {
+                    if (a.Body is null && a.ExpressionBody is null)
+                        return true;
+                }
             }
 
-            return hasAccessor;
+            return false;
         }
         private static bool IsValidEnumUnderlyingType(TypeSymbol t)
         {

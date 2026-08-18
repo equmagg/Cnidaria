@@ -2357,21 +2357,43 @@ namespace Cnidaria.Cs
                 string executeLabel = CreateLocalLabel(thunk.Label + "_execute");
                 string doneLabel = CreateLocalLabel(thunk.Label + "_done");
                 string failedLabel = CreateLocalLabel(thunk.Label + "_failed");
-                bool hasAtomics = (_target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVA) != 0;
+                bool hasZacas = _machineTarget.HasZacas;
+                bool hasZalrsc = _machineTarget.HasZalrsc;
+                bool hasAtomics = hasZacas || hasZalrsc;
 
                 EmitMaterializeAddress(thunk.StateLabel, RVRegister.X28);
                 if (hasAtomics)
                 {
                     DefineLabel(retryLabel);
-                    Emit(RVInstruction.Amo(RVInstrKind.LrW, RVRegister.X31, RVRegister.X28, RVRegister.X0, acquire: true));
-                    Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, doneLabel));
-                    EmitLoadImmediate(RVRegister.X30, 2);
-                    Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X31, RVRegister.X30, runningLabel));
-                    EmitLoadImmediate(RVRegister.X30, 1);
-                    Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X31, RVRegister.X30, failedLabel));
-                    EmitLoadImmediate(RVRegister.X29, 2);
-                    Emit(RVInstruction.Amo(RVInstrKind.ScW, RVRegister.X30, RVRegister.X28, RVRegister.X29, release: true));
-                    Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X30, RVRegister.X0, retryLabel));
+                    if (hasZacas)
+                    {
+                        EmitLoadImmediate(RVRegister.X31, 1);
+                        EmitLoadImmediate(RVRegister.X29, 2);
+                        Emit(RVInstruction.Amo(
+                            RVInstrKind.AmocasW,
+                            RVRegister.X31,
+                            RVRegister.X28,
+                            RVRegister.X29,
+                            acquire: true,
+                            release: true));
+                        Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, doneLabel));
+                        EmitLoadImmediate(RVRegister.X30, 2);
+                        Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X31, RVRegister.X30, runningLabel));
+                        EmitLoadImmediate(RVRegister.X30, 1);
+                        Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X31, RVRegister.X30, failedLabel));
+                    }
+                    else
+                    {
+                        Emit(RVInstruction.Amo(RVInstrKind.LrW, RVRegister.X31, RVRegister.X28, RVRegister.X0, acquire: true));
+                        Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, doneLabel));
+                        EmitLoadImmediate(RVRegister.X30, 2);
+                        Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X31, RVRegister.X30, runningLabel));
+                        EmitLoadImmediate(RVRegister.X30, 1);
+                        Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X31, RVRegister.X30, failedLabel));
+                        EmitLoadImmediate(RVRegister.X29, 2);
+                        Emit(RVInstruction.Amo(RVInstrKind.ScW, RVRegister.X30, RVRegister.X28, RVRegister.X29, release: true));
+                        Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X30, RVRegister.X0, retryLabel));
+                    }
                     Emit(RVInstruction.J(RVInstrKind.Jal, RVRegister.X0, executeLabel));
 
                     DefineLabel(runningLabel);
@@ -2446,7 +2468,18 @@ namespace Cnidaria.Cs
                     _target.PointerSize));
                 if (hasAtomics)
                 {
-                    Emit(RVInstruction.Amo(RVInstrKind.AmoSwapW, RVRegister.X0, RVRegister.X28, RVRegister.X0, release: true));
+                    if (_machineTarget.HasZaamo)
+                    {
+                        Emit(RVInstruction.Amo(RVInstrKind.AmoSwapW, RVRegister.X0, RVRegister.X28, RVRegister.X0, release: true));
+                    }
+                    else
+                    {
+                        string publishRetryLabel = CreateLocalLabel(thunk.Label + "_publish_retry");
+                        DefineLabel(publishRetryLabel);
+                        Emit(RVInstruction.Amo(RVInstrKind.LrW, RVRegister.X31, RVRegister.X28, RVRegister.X0));
+                        Emit(RVInstruction.Amo(RVInstrKind.ScW, RVRegister.X30, RVRegister.X28, RVRegister.X0, release: true));
+                        Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X30, RVRegister.X0, publishRetryLabel));
+                    }
                     EmitMaterializeAddress(thunk.StateLabel, RVRegister.X28);
                     EmitFutexWakeAll(RVRegister.X28);
                 }
@@ -2496,9 +2529,10 @@ namespace Cnidaria.Cs
             public string GetTypeInitializationStateLabel(RuntimeType type)
             {
                 if (_target.OperatingSystem == OperatingSystemKind.Linux &&
-                    (_target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVA) == 0)
+                    !_machineTarget.HasZacas &&
+                    !_machineTarget.HasZalrsc)
                 {
-                    throw new NotSupportedException("Thread-safe static initialization on Linux RISC-V requires the A extension.");
+                    throw new NotSupportedException("Thread-safe static initialization on Linux RISC-V requires Zacas or Zalrsc.");
                 }
 
                 StaticStorageDraft storage = GetOrCreateStaticStorage(type);
@@ -2846,7 +2880,7 @@ namespace Cnidaria.Cs
                             : 0;
                     uint flags = ComputeMethodTableFlags(descriptor, componentSize);
                     int baseSize = isString
-                        ? checked(_target.SyncBlockSize + _target.StringCharsOffset + 2)
+                        ? checked(_target.SyncBlockSize + _target.StringFirstCharOffset + 2)
                         : isArray
                             ? checked(
                                 _target.SyncBlockSize +
@@ -2917,7 +2951,7 @@ namespace Cnidaria.Cs
                 {
                     StringLiteralDraft literal = _stringLiterals[i];
                     byte[] chars = Encoding.Unicode.GetBytes(literal.Text);
-                    int objectSize = checked(pointerSize + 4 + chars.Length + 2);
+                    int objectSize = checked(_target.StringFirstCharOffset + chars.Length + 2);
                     _rodata.Align(pointerSize);
                     EmitNative(0);
                     int offset = _rodata.ByteLength;
@@ -3277,12 +3311,23 @@ namespace Cnidaria.Cs
                         }
                         if (node.TreeKind == GenTreeKind.DelegateInvoke ||
                             node.TreeKind == GenTreeKind.IndirectCall ||
-                            node.TreeKind == GenTreeKind.VirtualCall ||
-                            (node.TreeKind == GenTreeKind.Call &&
-                             (node.Method?.HasInternalCall != true ||
-                              (node.Method is not null && RiscVRuntime.IsGcSafePointInternalCall(node.Method)))))
+                            node.TreeKind == GenTreeKind.VirtualCall)
                         {
                             return true;
+                        }
+                        if (node.TreeKind == GenTreeKind.Intrinsic)
+                        {
+                            if (!RuntimeIntrinsics.IsNoGcSafePoint(node.IntrinsicId))
+                                return true;
+                            continue;
+                        }
+                        if (node.TreeKind == GenTreeKind.Call)
+                        {
+                            RuntimeMethod? method = node.Method;
+                            if (method is null)
+                                return true;
+                            if (method.HasInternalCall != true || RiscVRuntime.IsGcSafePointInternalCall(method))
+                                return true;
                         }
                     }
                     return false;
@@ -3905,6 +3950,9 @@ namespace Cnidaria.Cs
                         case GenTreeKind.Return:
                             EmitReturn(node);
                             return;
+                        case GenTreeKind.Intrinsic:
+                            EmitIntrinsic(node);
+                            return;
                         case GenTreeKind.Call:
                             EmitCall(node);
                             return;
@@ -3930,9 +3978,6 @@ namespace Cnidaria.Cs
                             return;
                         case GenTreeKind.PointerElementAddr:
                             EmitPointerElementAddress(node);
-                            return;
-                        case GenTreeKind.PointerToByRef:
-                            EmitPointerToByRef(node);
                             return;
                         case GenTreeKind.PointerDiff:
                             EmitPointerDifference(node);
@@ -4963,6 +5008,7 @@ namespace Cnidaria.Cs
                             return;
                         case BytecodeOp.FnPtrToPtr:
                         case BytecodeOp.PtrToFnPtr:
+                        case BytecodeOp.PtrToByRef:
                             _owner.EmitMove(ToIntegerRegister(destination), ToIntegerRegister(source));
                             return;
                         default:
@@ -6304,6 +6350,25 @@ namespace Cnidaria.Cs
                     _owner.DefineLabel(safePoint.ReturnLabel);
                 }
 
+                private void EmitIntrinsic(GenTree node)
+                {
+                    RuntimeMethod method = node.Method ?? throw Unsupported(node, "intrinsic has no runtime method");
+                    if (!RuntimeIntrinsics.TryResolve(method, Target, out RuntimeIntrinsicInfo intrinsic) || intrinsic.Id != node.IntrinsicId)
+                        throw Unsupported(node, $"unrecognized runtime intrinsic {node.IntrinsicId}");
+
+                    switch (intrinsic.Id)
+                    {
+                        case RuntimeIntrinsicId.InterlockedCompareExchange:
+                            EmitInterlockedCompareExchange(node, intrinsic.CompareExchange);
+                            return;
+                        case RuntimeIntrinsicId.InterlockedExchangeAdd:
+                            EmitInterlockedExchangeAdd(node, intrinsic.ExchangeAdd);
+                            return;
+                        default:
+                            throw Unsupported(node, $"unsupported runtime intrinsic {intrinsic.Id}");
+                    }
+                }
+
                 private void EmitCall(GenTree node)
                 {
                     RuntimeMethod method = node.Method ?? throw Unsupported(node, "Call node has no runtime method");
@@ -6312,6 +6377,11 @@ namespace Cnidaria.Cs
                         if (RiscVRuntime.TryEvaluateIsReferenceOrContainsReferences(method, out bool containsReferences))
                         {
                             _owner.EmitLoadImmediate(RVRegister.X10, containsReferences ? 1 : 0);
+                            return;
+                        }
+                        if (RiscVRuntime.IsAllocateNewArrayInternalCall(method))
+                        {
+                            EmitAllocateNewArray(node, method);
                             return;
                         }
                         if (RiscVRuntime.IsGcSafePointInternalCall(method))
@@ -6344,6 +6414,319 @@ namespace Cnidaria.Cs
                     _owner.DefineLabel(safePoint.ReturnLabel);
                 }
 
+                private void EmitInterlockedExchangeAdd(GenTree node, InterlockedExchangeAddIntrinsic intrinsic)
+                {
+                    if (!MachineTarget.HasZaamo && !MachineTarget.HasZalrsc)
+                        throw Unsupported(node, "Interlocked.ExchangeAdd requires the RISC-V Zaamo or Zalrsc extension");
+                    if (intrinsic.Size == 8 && !MachineTarget.Is64Bit)
+                        throw Unsupported(node, "64-bit Interlocked.ExchangeAdd is not supported on RV32");
+                    if (node.Uses.Length != 2 || !node.Uses[0].IsRegister || !node.Uses[1].IsRegister)
+                        throw Unsupported(node, "Interlocked.ExchangeAdd requires two scalar ABI register operands");
+
+                    RVRegister location = ToIntegerRegister(node.Uses[0].Register);
+                    RVRegister value = ToIntegerRegister(node.Uses[1].Register);
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        EmitNullCheck(node, location, "interlocked_exchange_add");
+
+                    _owner.EmitMove(RVRegister.X28, location);
+                    _owner.Emit(new RVInstruction(RVInstrKind.Fence, immediate: 0x33));
+
+                    if (MachineTarget.HasZaamo)
+                    {
+                        _owner.Emit(RVInstruction.Amo(
+                            intrinsic.Size == 8 ? RVInstrKind.AmoAddD : RVInstrKind.AmoAddW,
+                            RVRegister.X10,
+                            RVRegister.X28,
+                            value,
+                            acquire: true,
+                            release: true));
+                    }
+                    else
+                    {
+                        string retry = _owner.CreateLocalLabel($"{_methodLabel}_exchange_add_retry_{node.LinearId}");
+                        RVRegister addend = value;
+                        if (addend == RVRegister.X10)
+                        {
+                            _owner.EmitMove(RVRegister.X30, addend);
+                            addend = RVRegister.X30;
+                        }
+
+                        _owner.DefineLabel(retry);
+                        _owner.Emit(RVInstruction.Amo(
+                            intrinsic.Size == 8 ? RVInstrKind.LrD : RVInstrKind.LrW,
+                            RVRegister.X10,
+                            RVRegister.X28,
+                            RVRegister.X0,
+                            acquire: true));
+                        _owner.Emit(RVInstruction.R(
+                            intrinsic.Size == 4 && MachineTarget.Is64Bit ? RVInstrKind.Addw : RVInstrKind.Add,
+                            RVRegister.X29,
+                            RVRegister.X10,
+                            addend));
+                        _owner.Emit(RVInstruction.Amo(
+                            intrinsic.Size == 8 ? RVInstrKind.ScD : RVInstrKind.ScW,
+                            RVRegister.X31,
+                            RVRegister.X28,
+                            RVRegister.X29,
+                            release: true));
+                        _owner.Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, retry));
+                    }
+
+                    _owner.Emit(new RVInstruction(RVInstrKind.Fence, immediate: 0x33));
+                }
+
+                private void EmitInterlockedCompareExchange(GenTree node, InterlockedCompareExchangeIntrinsic intrinsic)
+                {
+                    if (!MachineTarget.HasZacas && !MachineTarget.HasZalrsc)
+                        throw Unsupported(node, "Interlocked.CompareExchange requires the RISC-V Zacas or Zalrsc extension");
+
+                    if (intrinsic.Size == 8 && MachineTarget.Is32Bit)
+                    {
+                        EmitInterlockedCompareExchangeRv32D(node);
+                        return;
+                    }
+
+                    if (node.Uses.Length != 3 || !node.Uses[0].IsRegister || !node.Uses[1].IsRegister || !node.Uses[2].IsRegister)
+                        throw Unsupported(node, "Interlocked.CompareExchange requires three scalar ABI register operands");
+
+                    RVRegister location = ToIntegerRegister(node.Uses[0].Register);
+                    RVRegister value = ToIntegerRegister(node.Uses[1].Register);
+                    RVRegister comparand = ToIntegerRegister(node.Uses[2].Register);
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        EmitNullCheck(node, location, "interlocked_compare_exchange");
+
+                    _owner.EmitMove(RVRegister.X28, location);
+                    _owner.Emit(new RVInstruction(RVInstrKind.Fence, immediate: 0x33));
+
+                    if (MachineTarget.HasZacas)
+                        EmitInterlockedCompareExchangeZacas(node, intrinsic, value, comparand);
+                    else
+                        EmitInterlockedCompareExchangeLrSc(node, intrinsic, value, comparand);
+
+                    _owner.Emit(new RVInstruction(RVInstrKind.Fence, immediate: 0x33));
+                }
+
+                private void EmitInterlockedCompareExchangeRv32D(GenTree node)
+                {
+                    if (!MachineTarget.HasZacas)
+                        throw Unsupported(node, "64-bit Interlocked.CompareExchange on RV32 requires Zacas");
+                    if (node.Uses.Length != 5)
+                        throw Unsupported(node, "64-bit Interlocked.CompareExchange on RV32 requires five ABI register operands");
+                    for (int i = 0; i < node.Uses.Length; i++)
+                    {
+                        if (!node.Uses[i].IsRegister)
+                            throw Unsupported(node, "64-bit Interlocked.CompareExchange on RV32 requires register ABI operands");
+                    }
+
+                    RVRegister location = ToIntegerRegister(node.Uses[0].Register);
+                    RVRegister valueLo = ToIntegerRegister(node.Uses[1].Register);
+                    RVRegister valueHi = ToIntegerRegister(node.Uses[2].Register);
+                    RVRegister comparandLo = ToIntegerRegister(node.Uses[3].Register);
+                    RVRegister comparandHi = ToIntegerRegister(node.Uses[4].Register);
+
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        EmitNullCheck(node, location, "interlocked_compare_exchange");
+
+                    _owner.EmitMove(RVRegister.X28, location);
+                    _owner.EmitMove(RVRegister.X30, valueLo);
+                    _owner.EmitMove(RVRegister.X31, valueHi);
+                    _owner.EmitMove(RVRegister.X10, comparandLo);
+                    _owner.EmitMove(RVRegister.X11, comparandHi);
+                    _owner.Emit(new RVInstruction(RVInstrKind.Fence, immediate: 0x33));
+                    _owner.Emit(RVInstruction.Amo(
+                        RVInstrKind.AmocasD,
+                        RVRegister.X10,
+                        RVRegister.X28,
+                        RVRegister.X30,
+                        acquire: true,
+                        release: true));
+                    _owner.Emit(new RVInstruction(RVInstrKind.Fence, immediate: 0x33));
+                }
+
+                private void EmitInterlockedCompareExchangeZacas(
+                    GenTree node,
+                    InterlockedCompareExchangeIntrinsic intrinsic,
+                    RVRegister value,
+                    RVRegister comparand)
+                {
+                    if (intrinsic.Size == 8)
+                    {
+                        RVRegister casValue = value;
+                        if (casValue == RVRegister.X10)
+                        {
+                            _owner.EmitMove(RVRegister.X30, casValue);
+                            casValue = RVRegister.X30;
+                        }
+                        _owner.EmitMove(RVRegister.X10, comparand);
+                        _owner.Emit(RVInstruction.Amo(
+                            RVInstrKind.AmocasD,
+                            RVRegister.X10,
+                            RVRegister.X28,
+                            casValue,
+                            acquire: true,
+                            release: true));
+                        return;
+                    }
+
+                    if (intrinsic.Size == 4)
+                    {
+                        RVRegister casValue = value;
+                        if (casValue == RVRegister.X10)
+                        {
+                            _owner.EmitMove(RVRegister.X30, casValue);
+                            casValue = RVRegister.X30;
+                        }
+
+                        if (MachineTarget.Is64Bit)
+                            _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, RVRegister.X10, comparand, 0));
+                        else
+                            _owner.EmitMove(RVRegister.X10, comparand);
+
+                        _owner.Emit(RVInstruction.Amo(
+                            RVInstrKind.AmocasW,
+                            RVRegister.X10,
+                            RVRegister.X28,
+                            casValue,
+                            acquire: true,
+                            release: true));
+
+                        if (MachineTarget.Is64Bit && !intrinsic.IsSigned && !intrinsic.IsReference)
+                            EmitZeroExtend32(RVRegister.X10, RVRegister.X10);
+                        return;
+                    }
+
+                    if (intrinsic.Size is not (1 or 2))
+                        throw Unsupported(node, $"Unsupported Interlocked.CompareExchange size {intrinsic.Size}");
+
+                    EmitInterlockedCompareExchangeSubwordZacas(node, intrinsic, value, comparand);
+                }
+
+                private void EmitInterlockedCompareExchangeSubwordZacas(
+                    GenTree node,
+                    InterlockedCompareExchangeIntrinsic intrinsic,
+                    RVRegister value,
+                    RVRegister comparand)
+                {
+                    int bitCount = intrinsic.Size * 8;
+                    long fieldMask = intrinsic.Size == 1 ? 0xFFL : 0xFFFFL;
+                    string retry = _owner.CreateLocalLabel($"{_methodLabel}_cmpxchg_zacas_retry_{node.LinearId}");
+                    string done = _owner.CreateLocalLabel($"{_methodLabel}_cmpxchg_zacas_done_{node.LinearId}");
+
+                    _owner.Emit(RVInstruction.I(RVInstrKind.Andi, RVRegister.X29, RVRegister.X28, 3));
+                    _owner.Emit(RVInstruction.I(RVInstrKind.Slli, RVRegister.X29, RVRegister.X29, 3));
+                    _owner.Emit(RVInstruction.I(RVInstrKind.Andi, RVRegister.X28, RVRegister.X28, -4));
+                    _owner.EmitLoadImmediate(RVRegister.X30, fieldMask);
+                    _owner.Emit(RVInstruction.R(RVInstrKind.And, RVRegister.X13, value, RVRegister.X30));
+                    _owner.Emit(RVInstruction.R(RVInstrKind.Sll, RVRegister.X13, RVRegister.X13, RVRegister.X29));
+                    _owner.Emit(RVInstruction.R(RVInstrKind.And, RVRegister.X14, comparand, RVRegister.X30));
+                    _owner.Emit(RVInstruction.R(RVInstrKind.Sll, RVRegister.X14, RVRegister.X14, RVRegister.X29));
+                    _owner.Emit(RVInstruction.R(RVInstrKind.Sll, RVRegister.X30, RVRegister.X30, RVRegister.X29));
+                    _owner.Emit(RVInstruction.I(RVInstrKind.Xori, RVRegister.X15, RVRegister.X30, -1));
+                    _owner.Emit(RVInstruction.I(RVInstrKind.Lw, RVRegister.X16, RVRegister.X28, 0));
+
+                    _owner.DefineLabel(retry);
+                    _owner.Emit(RVInstruction.R(RVInstrKind.And, RVRegister.X10, RVRegister.X16, RVRegister.X30));
+                    _owner.Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X10, RVRegister.X14, done));
+                    _owner.Emit(RVInstruction.R(RVInstrKind.And, RVRegister.X17, RVRegister.X16, RVRegister.X15));
+                    _owner.Emit(RVInstruction.R(RVInstrKind.Or, RVRegister.X17, RVRegister.X17, RVRegister.X13));
+                    _owner.EmitMove(RVRegister.X31, RVRegister.X16);
+                    _owner.Emit(RVInstruction.Amo(
+                        RVInstrKind.AmocasW,
+                        RVRegister.X16,
+                        RVRegister.X28,
+                        RVRegister.X17,
+                        acquire: true,
+                        release: true));
+                    _owner.Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X16, RVRegister.X31, retry));
+                    _owner.DefineLabel(done);
+                    _owner.Emit(RVInstruction.R(RVInstrKind.Srl, RVRegister.X10, RVRegister.X10, RVRegister.X29));
+
+                    if (intrinsic.IsSigned)
+                    {
+                        int shift = MachineTarget.XLen - bitCount;
+                        _owner.Emit(RVInstruction.I(RVInstrKind.Slli, RVRegister.X10, RVRegister.X10, shift));
+                        _owner.Emit(RVInstruction.I(RVInstrKind.Srai, RVRegister.X10, RVRegister.X10, shift));
+                    }
+                }
+
+                private void EmitInterlockedCompareExchangeLrSc(
+                    GenTree node,
+                    InterlockedCompareExchangeIntrinsic intrinsic,
+                    RVRegister value,
+                    RVRegister comparand)
+                {
+                    string retry = _owner.CreateLocalLabel($"{_methodLabel}_cmpxchg_retry_{node.LinearId}");
+                    string done = _owner.CreateLocalLabel($"{_methodLabel}_cmpxchg_done_{node.LinearId}");
+
+                    if (intrinsic.Size == 8)
+                    {
+                        if (!MachineTarget.Is64Bit)
+                            throw Unsupported(node, "64-bit Interlocked.CompareExchange is not supported on RV32");
+
+                        _owner.DefineLabel(retry);
+                        _owner.Emit(RVInstruction.Amo(RVInstrKind.LrD, RVRegister.X10, RVRegister.X28, RVRegister.X0, acquire: true));
+                        _owner.Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X10, comparand, done));
+                        _owner.Emit(RVInstruction.Amo(RVInstrKind.ScD, RVRegister.X31, RVRegister.X28, value, release: true));
+                        _owner.Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, retry));
+                        _owner.DefineLabel(done);
+                        return;
+                    }
+
+                    if (intrinsic.Size == 4)
+                    {
+                        RVRegister normalizedComparand = comparand;
+                        if (MachineTarget.Is64Bit)
+                        {
+                            _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, RVRegister.X29, comparand, 0));
+                            normalizedComparand = RVRegister.X29;
+                        }
+
+                        _owner.DefineLabel(retry);
+                        _owner.Emit(RVInstruction.Amo(RVInstrKind.LrW, RVRegister.X10, RVRegister.X28, RVRegister.X0, acquire: true));
+                        _owner.Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X10, normalizedComparand, done));
+                        _owner.Emit(RVInstruction.Amo(RVInstrKind.ScW, RVRegister.X31, RVRegister.X28, value, release: true));
+                        _owner.Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, retry));
+                        _owner.DefineLabel(done);
+                        if (MachineTarget.Is64Bit && !intrinsic.IsSigned && !intrinsic.IsReference)
+                            EmitZeroExtend32(RVRegister.X10, RVRegister.X10);
+                        return;
+                    }
+
+                    if (intrinsic.Size is not (1 or 2))
+                        throw Unsupported(node, $"Unsupported Interlocked.CompareExchange size {intrinsic.Size}");
+
+                    int bitCount = intrinsic.Size * 8;
+                    long fieldMask = intrinsic.Size == 1 ? 0xFFL : 0xFFFFL;
+                    _owner.Emit(RVInstruction.I(RVInstrKind.Andi, RVRegister.X29, RVRegister.X28, 3));
+                    _owner.Emit(RVInstruction.I(RVInstrKind.Slli, RVRegister.X29, RVRegister.X29, 3));
+                    _owner.Emit(RVInstruction.I(RVInstrKind.Andi, RVRegister.X28, RVRegister.X28, -4));
+                    _owner.EmitLoadImmediate(RVRegister.X30, fieldMask);
+                    _owner.Emit(RVInstruction.R(RVInstrKind.And, RVRegister.X13, value, RVRegister.X30));
+                    _owner.Emit(RVInstruction.R(RVInstrKind.Sll, RVRegister.X13, RVRegister.X13, RVRegister.X29));
+                    _owner.Emit(RVInstruction.R(RVInstrKind.And, RVRegister.X14, comparand, RVRegister.X30));
+                    _owner.Emit(RVInstruction.R(RVInstrKind.Sll, RVRegister.X14, RVRegister.X14, RVRegister.X29));
+                    _owner.Emit(RVInstruction.R(RVInstrKind.Sll, RVRegister.X30, RVRegister.X30, RVRegister.X29));
+                    _owner.Emit(RVInstruction.I(RVInstrKind.Xori, RVRegister.X15, RVRegister.X30, -1));
+
+                    _owner.DefineLabel(retry);
+                    _owner.Emit(RVInstruction.Amo(RVInstrKind.LrW, RVRegister.X16, RVRegister.X28, RVRegister.X0, acquire: true));
+                    _owner.Emit(RVInstruction.R(RVInstrKind.And, RVRegister.X10, RVRegister.X16, RVRegister.X30));
+                    _owner.Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X10, RVRegister.X14, done));
+                    _owner.Emit(RVInstruction.R(RVInstrKind.And, RVRegister.X17, RVRegister.X16, RVRegister.X15));
+                    _owner.Emit(RVInstruction.R(RVInstrKind.Or, RVRegister.X17, RVRegister.X17, RVRegister.X13));
+                    _owner.Emit(RVInstruction.Amo(RVInstrKind.ScW, RVRegister.X31, RVRegister.X28, RVRegister.X17, release: true));
+                    _owner.Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, retry));
+                    _owner.DefineLabel(done);
+                    _owner.Emit(RVInstruction.R(RVInstrKind.Srl, RVRegister.X10, RVRegister.X10, RVRegister.X29));
+
+                    if (intrinsic.IsSigned)
+                    {
+                        int shift = MachineTarget.XLen - bitCount;
+                        _owner.Emit(RVInstruction.I(RVInstrKind.Slli, RVRegister.X10, RVRegister.X10, shift));
+                        _owner.Emit(RVInstruction.I(RVInstrKind.Srai, RVRegister.X10, RVRegister.X10, shift));
+                    }
+                }
+
                 private void EmitClassInit(GenTree node)
                 {
                     RuntimeType type = node.RuntimeType ?? throw Unsupported(node, "ClassInit node has no runtime type");
@@ -6363,6 +6746,21 @@ namespace Cnidaria.Cs
                     _owner.DefineLabel(initializedLabel);
                     _owner.Emit(new RVInstruction(RVInstrKind.Fence, immediate: 0x23));
                     _owner.DefineLabel(doneLabel);
+                }
+
+                private void EmitAllocateNewArray(GenTree node, RuntimeMethod method)
+                {
+                    RuntimeType arrayType = method.ReturnType;
+                    if (arrayType.Kind != RuntimeTypeKind.Array || !arrayType.IsSzArray)
+                        throw Unsupported(node, "RhAllocateNewArray return type is not an SZ array");
+
+                    SafePointDraft safePoint = PrepareSafePoint(node);
+                    PublishGcTransition(safePoint);
+                    _owner.EmitMove(RVRegister.X11, RVRegister.X10);
+                    _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(arrayType), RVRegister.X10);
+                    MarkEhCallSite(node, "allocate_uninitialized_array");
+                    _owner.EmitPcrelTransfer(_owner.ResolveExternalSymbol(RiscVRuntime.NewUninitializedArraySymbol), link: true);
+                    _owner.DefineLabel(safePoint.ReturnLabel);
                 }
 
                 private void EmitFastAllocateString(GenTree node, RuntimeMethod method)
@@ -7418,6 +7816,10 @@ namespace Cnidaria.Cs
                     {
                         runtimeSymbol = RiscVRuntime.NewStringFromCharArrayRangeSymbol;
                     }
+                    else if (parameters.Length == 1 && IsReadOnlyCharSpanType(parameters[0]))
+                    {
+                        runtimeSymbol = RiscVRuntime.NewStringFromReadOnlySpanSymbol;
+                    }
                     else
                     {
                         throw Unsupported(node, "Unsupported System.String constructor shape");
@@ -7446,6 +7848,18 @@ namespace Cnidaria.Cs
                     => type.Kind == RuntimeTypeKind.Pointer &&
                        type.ElementType is not null &&
                        IsCharType(type.ElementType);
+
+                private static bool IsReadOnlyCharSpanType(RuntimeType type)
+                {
+                    if (!StringComparer.Ordinal.Equals(type.Namespace, "System") ||
+                        !type.Name.StartsWith("ReadOnlySpan", StringComparison.Ordinal))
+                    {
+                        return false;
+                    }
+
+                    var arguments = type.GenericTypeArguments;
+                    return arguments.Length == 1 && IsCharType(arguments[0]);
+                }
 
                 private static bool IsSystemStringType(RuntimeType type)
                     => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
@@ -7707,17 +8121,6 @@ namespace Cnidaria.Cs
                         _owner.Emit(RVInstruction.R(RVInstrKind.Mul, RVRegister.X31, index, RVRegister.X31));
                     }
                     _owner.Emit(RVInstruction.R(RVInstrKind.Add, destination, baseRegister, RVRegister.X31));
-                }
-
-                private void EmitPointerToByRef(GenTree node)
-                {
-                    if (node.Uses.Length != 1)
-                        throw Unsupported(node, "Pointer-to-byref conversion requires one operand");
-                    EmitRegisterMove(
-                        RequireResultRegister(node),
-                        RequireUseRegisterForOperand(node, 0, "pointer-to-byref operand"),
-                        node.Type,
-                        node.StackKind);
                 }
 
                 private void EmitPointerDifference(GenTree node)

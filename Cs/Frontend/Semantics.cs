@@ -969,28 +969,36 @@ namespace Cnidaria.Cs
                         yield return cd;
                         break;
 
-                    case PropertyDeclarationSyntax pd:
+                    case PropertyDeclarationSyntax pd when kv.Value is PropertySymbol property:
                         {
                             if (pd.ExpressionBody != null)
                             {
-                                yield return pd;
+                                if (property.GetMethod is not null)
+                                    yield return pd;
                                 break;
                             }
 
                             var al = pd.AccessorList;
                             if (al == null) break;
 
+                            var backingField = (property as SourcePropertySymbol)?.BackingFieldOpt;
                             foreach (var acc in al.Accessors)
                             {
-                                if (acc.Body != null || acc.ExpressionBody != null)
+                                switch (acc.Kind)
                                 {
-                                    yield return acc;
-                                    continue;
-                                }
-                                if (acc.Kind is SyntaxKind.GetAccessorDeclaration or SyntaxKind.SetAccessorDeclaration)
-                                    yield return acc;
-                            }
+                                    case SyntaxKind.GetAccessorDeclaration when property.GetMethod is not null:
+                                        if (acc.Body != null || acc.ExpressionBody != null || backingField is not null)
+                                            yield return acc;
+                                        break;
 
+                                    case SyntaxKind.SetAccessorDeclaration:
+                                    case SyntaxKind.InitAccessorDeclaration:
+                                        if (property.SetMethod is not null &&
+                                            (acc.Body != null || acc.ExpressionBody != null || backingField is not null))
+                                            yield return acc;
+                                        break;
+                                }
+                            }
                         }
                         break;
                     case IndexerDeclarationSyntax ids:
@@ -1031,31 +1039,41 @@ namespace Cnidaria.Cs
         {
             Compilation compilation = this;
             var model = compilation.GetSemanticModel(tree);
-            var diagnostics = model.GetDiagnostics();
-            if (print && diagnostics.Length > 0)
-            {
-                foreach (var diagnostic in diagnostics)
-                    Console.WriteLine(diagnostic);
-            }
-            if (!diagnostics.Any(d => d.Severity == DiagnosticSeverity.Error))
-                IRLowering.PrepareIteratorStateMachines(compilation, tree, model);
             var rootNs = includeCoreTypesInTypeDefs
                 ? compilation.GlobalNamespace
                 : compilation.SourceGlobalNamespace;
             var systemObject = compilation.GetSpecialType(SpecialType.System_Object);
-            var tokens = new MetadataTokenProvider(
-                moduleName,
-                rootNs,
-                systemObject,
-                defaultExternalAssemblyName,
-                externalAssemblyResolver);
+            MetadataTokenProvider? tokens = null;
+
+            MetadataTokenProvider CreateTokenProvider()
+                => new MetadataTokenProvider(
+                    moduleName,
+                    rootNs,
+                    systemObject,
+                    defaultExternalAssemblyName,
+                    externalAssemblyResolver);
 
             var functions = new Dictionary<int, Cnidaria.Cs.BytecodeFunction>();
+            var diagnostics = ImmutableArray<Diagnostic>.Empty;
 
             try
             {
+                diagnostics = model.GetDiagnostics();
+                if (print && diagnostics.Length > 0)
+                {
+                    foreach (var diagnostic in diagnostics)
+                        Console.WriteLine(diagnostic);
+                }
                 if (diagnostics.Any(d => d.Severity == DiagnosticSeverity.Error))
+                {
+                    tokens = CreateTokenProvider();
                     return (tokens.Image, functions, diagnostics, null);
+                }
+
+                IRLowering.PrepareIteratorStateMachines(compilation, tree, model);
+                var tokenProvider = CreateTokenProvider();
+                tokens = tokenProvider;
+
                 void AddFn(Cnidaria.Cs.BytecodeFunction fn)
                 {
                     if (!functions.TryAdd(fn.MethodToken, fn))
@@ -1070,7 +1088,7 @@ namespace Cnidaria.Cs
                     }
 
                     var lowered = IRLowering.Rewrite(compilation, body);
-                    var emit = Cnidaria.Cs.BytecodeEmitter.Emit(lowered, tokens, compilation.Target);
+                    var emit = Cnidaria.Cs.BytecodeEmitter.Emit(lowered, tokenProvider, compilation.Target);
 
                     AddFn(emit.Entry);
                     foreach (var lf in emit.AdditionalMethods)
@@ -1099,7 +1117,7 @@ namespace Cnidaria.Cs
                 }
                 foreach (var ctor in EnumerateSynthesizedInstanceCtorsInTree(rootNs, tree))
                 {
-                    int ctorTok = tokens.GetMethodToken(ctor);
+                    int ctorTok = tokenProvider.GetMethodToken(ctor);
                     if (functions.ContainsKey(ctorTok))
                         continue;
                     var ret = new BoundReturnStatement(tree.Root, expression: null);
@@ -1109,19 +1127,20 @@ namespace Cnidaria.Cs
                 }
                 foreach (var cctor in EnumerateSynthesizedStaticCctorsInTree(rootNs, tree))
                 {
-                    int cctorTok = tokens.GetMethodToken(cctor);
+                    int cctorTok = tokenProvider.GetMethodToken(cctor);
                     if (functions.ContainsKey(cctorTok))
                         continue;
 
                     var body = BuildSynthesizedTypeInitializerBody(compilation, tree, model, cctor);
                     EmitBody(body);
                 }
-                return (tokens.Image, functions, diagnostics, null);
+                return (tokenProvider.Image, functions, diagnostics, null);
             }
             catch (Exception ex)
             {
                 if (print)
                     Console.WriteLine(ex.Message);
+                tokens ??= CreateTokenProvider();
                 return (tokens.Image, functions, diagnostics, ex);
             }
 
@@ -1824,6 +1843,7 @@ namespace Cnidaria.Cs
                         break;
 
                     case SyntaxKind.SetAccessorDeclaration:
+                    case SyntaxKind.InitAccessorDeclaration:
                         if (property.SetMethod is MethodSymbol setMethod)
                         {
                             if (acc.Body != null || acc.ExpressionBody != null)
@@ -2612,6 +2632,7 @@ namespace Cnidaria.Cs
         UnsafeRegion = 1 << 5,
         CheckedContext = 1 << 6,
         UncheckedContext = 1 << 7,
+        EnumMemberInitializer = 1 << 8,
     }
     /// <summary>Identifies the runtime shape of a bound node</summary>
     public enum BoundNodeKind
@@ -2677,6 +2698,7 @@ namespace Cnidaria.Cs
         ExpressionStatement,
         LocalDeclaration,
         UsingStatement,
+        LockStatement,
         LocalFunctionStatement,
         EmptyStatement,
         Throw,

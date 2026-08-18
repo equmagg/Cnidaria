@@ -1838,7 +1838,7 @@ namespace Cnidaria.Cs
             if (node.Kind is GenTreeKind.Arg or GenTreeKind.Local or GenTreeKind.Temp)
                 return SsaSlotHelpers.TryGetDirectLoadSlot(node, out var slot) && localStorageByRefAliases.Contains(slot);
 
-            if (node.Kind is GenTreeKind.FieldAddr or GenTreeKind.PointerToByRef or GenTreeKind.PointerElementAddr)
+            if ((node.Kind is GenTreeKind.FieldAddr or GenTreeKind.PointerElementAddr) || (node.Kind == GenTreeKind.Unary && node.SourceOp == BytecodeOp.PtrToByRef))
             {
                 for (int i = 0; i < node.Operands.Length; i++)
                 {

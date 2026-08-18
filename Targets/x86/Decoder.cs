@@ -244,6 +244,24 @@ namespace Cnidaria.X86
                 var decoded = DecodeModRm(reader, target, opSize, rexR, rexX, rexB, vector: false);
                 return X86Instruction.Binary(X86InstrKind.Imul, X86Operand.RegisterOperand(Gpr(decoded.Reg), opSize), decoded.Rm);
             }
+            if (opcode is 0xB0 or 0xB1)
+            {
+                int size = opcode == 0xB0 ? 1 : opSize;
+                var decoded = DecodeModRm(reader, target, size, rexR, rexX, rexB, vector: false);
+                return X86Instruction.Binary(
+                    X86InstrKind.Cmpxchg,
+                    decoded.Rm,
+                    X86Operand.RegisterOperand(Gpr(decoded.Reg), size));
+            }
+            if (opcode is 0xC0 or 0xC1)
+            {
+                int size = opcode == 0xC0 ? 1 : opSize;
+                var decoded = DecodeModRm(reader, target, size, rexR, rexX, rexB, vector: false);
+                return X86Instruction.Binary(
+                    X86InstrKind.Xadd,
+                    decoded.Rm,
+                    X86Operand.RegisterOperand(Gpr(decoded.Reg), size));
+            }
             if (opcode is 0xBE or 0xBF or 0xB6 or 0xB7)
             {
                 var srcSize = opcode is 0xBE or 0xB6 ? 1 : 2;

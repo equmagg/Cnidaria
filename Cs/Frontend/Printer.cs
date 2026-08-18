@@ -903,6 +903,7 @@ namespace Cnidaria.Cs
                     BoundStatementList => "BoundStatementList",
                     BoundExpressionStatement => "BoundExpressionStatement",
                     BoundLocalDeclarationStatement => "BoundLocalDeclarationStatement",
+                    BoundLockStatement => "BoundLockStatement",
                     BoundEmptyStatement => "BoundEmptyStatement",
                     BoundReturnStatement => "BoundReturnStatement",
                     BoundThrowStatement => "BoundThrowStatement",
@@ -1074,6 +1075,13 @@ namespace Cnidaria.Cs
                                 list.Add(new Child($"Arguments[{i}]", call.Arguments[i]));
                             return list.ToArray();
                         }
+                    case BoundLockStatement ls:
+                        return new[]
+                        {
+                            new Child("Expression", ls.Expression),
+                            new Child("Body", ls.Body),
+                        };
+
                     case BoundIfStatement ifs:
                         return new[]
                         {
