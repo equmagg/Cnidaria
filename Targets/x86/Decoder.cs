@@ -149,6 +149,12 @@ namespace Cnidaria.X86
                     var decoded = DecodeModRm(reader, target, size, rexR, rexX, rexB, vector: false);
                     return X86Instruction.Binary(X86InstrKind.Test, decoded.Rm, X86Operand.RegisterOperand(Gpr(decoded.Reg), size));
                 }
+                if (opcode is 0x86 or 0x87)
+                {
+                    var size = opcode == 0x86 ? 1 : opSize;
+                    var decoded = DecodeModRm(reader, target, size, rexR, rexX, rexB, vector: false);
+                    return X86Instruction.Binary(X86InstrKind.Xchg, decoded.Rm, X86Operand.RegisterOperand(Gpr(decoded.Reg), size));
+                }
                 if (opcode is 0xF6 or 0xF7)
                 {
                     var size = opcode == 0xF6 ? 1 : opSize;
@@ -261,6 +267,11 @@ namespace Cnidaria.X86
                     X86InstrKind.Xadd,
                     decoded.Rm,
                     X86Operand.RegisterOperand(Gpr(decoded.Reg), size));
+            }
+            if (opcode == 0xAE && reader.PeekByte() == 0xF0)
+            {
+                reader.ReadByte();
+                return new X86Instruction(X86InstrKind.Mfence);
             }
             if (opcode is 0xBE or 0xBF or 0xB6 or 0xB7)
             {

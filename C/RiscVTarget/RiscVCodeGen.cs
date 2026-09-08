@@ -21,6 +21,7 @@ namespace Cnidaria.C
     {
         private const string TextSectionName = ".text";
         private const string RodataSectionName = ".rodata";
+        private const string StringSectionName = ".rodata.str1.1";
         private const string DataSectionName = ".data";
         private const string BssSectionName = ".bss";
 
@@ -60,6 +61,8 @@ namespace Cnidaria.C
         private readonly HashSet<string> _usedLabels = new HashSet<string>(StringComparer.Ordinal);
         private readonly List<RVObjectSymbol> _symbols = new List<RVObjectSymbol>();
         private readonly DataSectionBuilder _rodata = new DataSectionBuilder(RodataSectionName, RVObjectSectionKind.Rodata);
+        // String literals live in their own section: they are interned while a global is mid-emission into .rodata
+        private readonly DataSectionBuilder _strings = new DataSectionBuilder(StringSectionName, RVObjectSectionKind.Rodata);
         private readonly DataSectionBuilder _data = new DataSectionBuilder(DataSectionName, RVObjectSectionKind.Data);
         private readonly BssSectionBuilder _bss = new BssSectionBuilder(BssSectionName);
         private TextSectionBuilder _text = null!;
@@ -139,6 +142,7 @@ namespace Cnidaria.C
             AddSectionSymbols();
             var dataSections = ImmutableArray.CreateBuilder<RVDataSection>();
             dataSections.Add(_rodata.ToSection());
+            dataSections.Add(_strings.ToSection());
             dataSections.Add(_data.ToSection());
             dataSections.Add(_bss.ToSection());
 
@@ -210,6 +214,7 @@ namespace Cnidaria.C
         {
             _symbols.Add(new RVObjectSymbol(TextSectionName, TextSectionName, 0, _text.ByteLength, RVObjectSymbolBinding.Local, RVObjectSymbolKind.Section));
             _symbols.Add(new RVObjectSymbol(RodataSectionName, RodataSectionName, 0, _rodata.ByteLength, RVObjectSymbolBinding.Local, RVObjectSymbolKind.Section));
+            _symbols.Add(new RVObjectSymbol(StringSectionName, StringSectionName, 0, _strings.ByteLength, RVObjectSymbolBinding.Local, RVObjectSymbolKind.Section));
             _symbols.Add(new RVObjectSymbol(DataSectionName, DataSectionName, 0, _data.ByteLength, RVObjectSymbolBinding.Local, RVObjectSymbolKind.Section));
             _symbols.Add(new RVObjectSymbol(BssSectionName, BssSectionName, 0, _bss.ByteLength, RVObjectSymbolBinding.Local, RVObjectSymbolKind.Section));
         }
@@ -391,13 +396,22 @@ namespace Cnidaria.C
 
         private int EmitConstantInitializer(DataSectionBuilder section, QualifiedType type, object? value, int availableSize)
         {
-            if (value is string text && type.Type is ArrayType)
+            if (value is string text)
             {
-                var bytes = Encoding.UTF8.GetBytes(text);
-                var count = Math.Min(availableSize, checked(bytes.Length + 1));
-                for (var i = 0; i < count; i++)
-                    section.EmitByte(i < bytes.Length ? bytes[i] : (byte)0);
-                return count;
+                if (type.Type is ArrayType)
+                {
+                    var bytes = Encoding.UTF8.GetBytes(text);
+                    var count = Math.Min(availableSize, checked(bytes.Length + 1));
+                    for (var i = 0; i < count; i++)
+                        section.EmitByte(i < bytes.Length ? bytes[i] : (byte)0);
+                    return count;
+                }
+
+                if (IsPointerLike(type))
+                {
+                    EmitPointerRelocation(section, CreateStringLiteral(text));
+                    return Math.Min(availableSize, _target.PointerSize);
+                }
             }
 
             if (IsFloatType(type))
@@ -503,10 +517,10 @@ namespace Cnidaria.C
 
             var label = CreateLocalLabel("str");
             var bytes = Encoding.UTF8.GetBytes(text);
-            var offset = _rodata.Align(1);
-            _rodata.DefineSymbol(label, offset, bytes.Length + 1, RVObjectSymbolBinding.Local, _symbols);
-            _rodata.EmitBytes(bytes, bytes.Length);
-            _rodata.EmitByte(0);
+            var offset = _strings.Align(1);
+            _strings.DefineSymbol(label, offset, bytes.Length + 1, RVObjectSymbolBinding.Local, _symbols);
+            _strings.EmitBytes(bytes, bytes.Length);
+            _strings.EmitByte(0);
             _stringLabels.Add(text, label);
             return label;
         }
@@ -616,6 +630,7 @@ namespace Cnidaria.C
             private readonly int _riscVVarArgsSaveAreaSize;
             private readonly int _totalFrameSize;
             private readonly IntegerRepresentationFact[] _integerRepresentationFacts = new IntegerRepresentationFact[32];
+            private readonly HashSet<MachineRegister> _callOperandRegisters = new HashSet<MachineRegister>();
             private int _currentInstructionPosition;
             private LirBlock? _fallthroughBlock;
             private bool _useCallPreservationSources;
@@ -861,7 +876,8 @@ namespace Cnidaria.C
                 var namedOperands = new Dictionary<string, int>(StringComparer.Ordinal);
                 var labels = new List<string>();
                 var namedLabels = new Dictionary<string, int>(StringComparer.Ordinal);
-                var outputFinalizers = new List<Action>();
+                var outputBindings = new List<RiscVAsmRegisterBinding>();
+                var inputBindings = new List<RiscVAsmRegisterBinding>();
                 var operandIndex = 0;
                 var copyIndex = 0;
 
@@ -883,7 +899,11 @@ namespace Cnidaria.C
                         if (copyIndex >= instruction.ParallelCopies.Length)
                             throw Unsupported(instruction, "Inline assembly output register is missing from LIR.");
                         var destination = instruction.ParallelCopies[copyIndex++].Destination;
-                        formatted = CreateRiscVAsmOutputOperand(output, destination, instruction, outputFinalizers);
+                        var binding = new RiscVAsmRegisterBinding(output, destination, null);
+                        outputBindings.Add(binding);
+                        formatted = new InlineAsmFormattedOperand(
+                            output.Name,
+                            modifier => RVRegisters.Format(ToAnyRegister(binding.Register)));
                     }
 
                     AddAsmOperand(operands, namedOperands, formatted);
@@ -894,8 +914,25 @@ namespace Cnidaria.C
                     if (operandIndex >= instruction.Operands.Length)
                         throw Unsupported(instruction, "Inline assembly input operand is missing from LIR.");
 
-                    var operand = instruction.Operands[operandIndex++];
-                    var formatted = CreateRiscVAsmInputOperand(input, operand, instruction);
+                    var value = instruction.Operands[operandIndex++];
+                    var storage = InlineAsmConstraints.PreferredStorage(input.Constraint, value.Type);
+                    InlineAsmFormattedOperand formatted;
+                    if (storage == InlineAsmOperandStorage.Memory)
+                    {
+                        formatted = new InlineAsmFormattedOperand(input.Name, modifier => FormatRiscVAsmMemoryOperand(value));
+                    }
+                    else if (storage == InlineAsmOperandStorage.Immediate)
+                    {
+                        formatted = new InlineAsmFormattedOperand(input.Name, modifier => FormatRiscVAsmImmediate(value));
+                    }
+                    else
+                    {
+                        var binding = new RiscVAsmRegisterBinding(input, null, value);
+                        inputBindings.Add(binding);
+                        formatted = new InlineAsmFormattedOperand(
+                            input.Name,
+                            modifier => RVRegisters.Format(ToAnyRegister(binding.Register)));
+                    }
                     AddAsmOperand(operands, namedOperands, formatted);
                 }
 
@@ -914,6 +951,11 @@ namespace Cnidaria.C
                     labels.Add(text);
                 }
 
+                var unavailable = GetRiscVAsmUnavailableRegisters(asmStatement, outputBindings, inputBindings, instruction);
+                ResolveRiscVAsmMatchingOperands(outputBindings, inputBindings, instruction);
+                AllocateRiscVAsmRegisters(outputBindings, inputBindings, unavailable, instruction);
+                EmitRiscVAsmInputMoves(outputBindings, inputBindings, instruction);
+
                 var expanded = InlineAsmTemplateExpander.Expand(
                     asmStatement.Text,
                     operands,
@@ -923,8 +965,7 @@ namespace Cnidaria.C
                     _owner.CreateLocalLabel(_functionLabel + "_asm_id"));
                 EmitInlineAssemblyText(instruction, expanded);
 
-                foreach (var finalize in outputFinalizers)
-                    finalize();
+                EmitRiscVAsmOutputMoves(outputBindings, instruction);
 
                 if (asmStatement.IsGoto && instruction.Target is not null && !IsFallthroughTarget(instruction.Target))
                     EmitJump(LabelOf(instruction.Target));
@@ -937,59 +978,431 @@ namespace Cnidaria.C
                 operands.Add(operand);
             }
 
-            private InlineAsmFormattedOperand CreateRiscVAsmOutputOperand(
-                GimpleAsmOperand operand, LirVirtualRegister destination, LirInstruction instruction, List<Action> finalizers)
+            private void ResolveRiscVAsmMatchingOperands(
+                IReadOnlyList<RiscVAsmRegisterBinding> outputs,
+                IReadOnlyList<RiscVAsmRegisterBinding> inputs,
+                LirInstruction instruction)
             {
-                var fixedRegister = TryGetRiscVConstraintRegister(operand.Constraint, destination.Type);
-                if (fixedRegister.HasValue)
+                var namedOutputs = new Dictionary<string, RiscVAsmRegisterBinding>(StringComparer.Ordinal);
+                foreach (var output in outputs)
                 {
-                    if (operand.IsReadWrite)
-                        LoadOperandIntoAs(LirOperand.ForRegister(destination), fixedRegister.Value, destination.Type, instruction);
-                    finalizers.Add(() => StoreRiscVAsmOutput(destination, fixedRegister.Value));
-                    return new InlineAsmFormattedOperand(operand.Name, modifier => RVRegisters.Format(ToAnyRegister(fixedRegister.Value)));
+                    if (output.Operand.Name is not null && !namedOutputs.ContainsKey(output.Operand.Name))
+                        namedOutputs.Add(output.Operand.Name, output);
                 }
 
-                if (InlineAsmConstraints.HasExplicitRegister(operand.Constraint))
-                    throw Unsupported(instruction, $"Invalid or unsupported explicit register constraint '{operand.Constraint}'.");
-
-                var register = GetWritableRegister(destination, PreferredScratch(destination.Type, GpScratch0, FpScratch0, VecScratch0));
-                finalizers.Add(() =>
+                foreach (var input in inputs)
                 {
-                    NormalizeScalarRegister(register, destination.Type);
-                    StoreWritableRegisterIfSpilled(destination, register);
-                });
-                return new InlineAsmFormattedOperand(operand.Name, modifier => RVRegisters.Format(ToAnyRegister(register)));
+                    var matching = InlineAsmConstraints.MatchingOperand(input.Operand.Constraint);
+                    if (matching is null)
+                        continue;
+
+                    RiscVAsmRegisterBinding? output = null;
+                    if (int.TryParse(matching, NumberStyles.None, CultureInfo.InvariantCulture, out var index))
+                    {
+                        if ((uint)index < (uint)outputs.Count)
+                            output = outputs[index];
+                    }
+                    else
+                    {
+                        namedOutputs.TryGetValue(matching, out output);
+                    }
+
+                    if (output is null)
+                        throw Unsupported(instruction, $"Inline assembly matching constraint '{input.Operand.Constraint}' does not name a register output.");
+                    if (RiscVAsmRegisterClass(input.Type) != RiscVAsmRegisterClass(output.Type))
+                        throw Unsupported(instruction, "Inline assembly matching operands use incompatible register classes.");
+
+                    input.MatchingOutput = output;
+                }
             }
 
-            private InlineAsmFormattedOperand CreateRiscVAsmInputOperand(GimpleAsmOperand operand, LirOperand value, LirInstruction instruction)
+            private HashSet<MachineRegister> GetRiscVAsmUnavailableRegisters(
+                GimpleAsmStatement asmStatement,
+                IReadOnlyList<RiscVAsmRegisterBinding> outputs,
+                IReadOnlyList<RiscVAsmRegisterBinding> inputs,
+                LirInstruction instruction)
             {
-                var storage = InlineAsmConstraints.PreferredStorage(operand.Constraint, value.Type);
-                if (storage == InlineAsmOperandStorage.Memory)
-                    return new InlineAsmFormattedOperand(operand.Name, modifier => FormatRiscVAsmMemoryOperand(value));
-                if (storage == InlineAsmOperandStorage.Immediate)
-                    return new InlineAsmFormattedOperand(operand.Name, modifier => FormatRiscVAsmImmediate(value));
-
-                var fixedRegister = TryGetRiscVConstraintRegister(operand.Constraint, value.Type);
-                if (fixedRegister.HasValue)
+                var result = new HashSet<MachineRegister>();
+                foreach (var clobber in asmStatement.Clobbers)
                 {
-                    LoadOperandIntoAs(value, fixedRegister.Value, value.Type, instruction);
-                    return new InlineAsmFormattedOperand(operand.Name, modifier => RVRegisters.Format(ToAnyRegister(fixedRegister.Value)));
+                    if (string.Equals(clobber, "memory", StringComparison.Ordinal) ||
+                        string.Equals(clobber, "cc", StringComparison.Ordinal) ||
+                        string.Equals(clobber, "redzone", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    if (!TryParseRiscVAsmRegister(clobber, out var register))
+                        throw Unsupported(instruction, $"Invalid or unsupported RISC-V inline assembly clobber '{clobber}'.");
+                    result.Add(register);
                 }
 
-                if (InlineAsmConstraints.HasExplicitRegister(operand.Constraint))
-                    throw Unsupported(instruction, $"Invalid or unsupported explicit register constraint '{operand.Constraint}'.");
+                // A hard-coded register in the template is unavailable to a generic operand unless
+                // that register is itself named by an explicit operand constraint. This mirrors the
+                // LSRA's conservative template scan and prevents a generic operand from silently
+                // aliasing a scratch register used directly by the template.
+                var explicitOperands = new HashSet<MachineRegister>();
+                foreach (var binding in outputs.Concat(inputs))
+                {
+                    var fixedRegister = TryGetRiscVConstraintRegister(binding.Operand.Constraint, binding.Type);
+                    if (fixedRegister.HasValue)
+                        explicitOperands.Add(fixedRegister.Value);
+                }
 
-                var preferred = PreferredScratch(value.Type, GpScratch1, FpScratch1, VecScratch1);
-                return new InlineAsmFormattedOperand(operand.Name, modifier => RVRegisters.Format(ToAnyRegister(LoadOperand(value, preferred))));
+                foreach (var register in RiscVAsmTemplateRegisters(asmStatement.Text))
+                {
+                    if (!explicitOperands.Contains(register))
+                        result.Add(register);
+                }
+
+                return result;
             }
 
-            private void StoreRiscVAsmOutput(LirVirtualRegister destination, MachineRegister source)
+            private IEnumerable<MachineRegister> RiscVAsmTemplateRegisters(string text)
             {
-                var writable = GetWritableRegister(destination, source);
-                if (writable != source)
-                    MoveRegister(writable, source);
-                NormalizeScalarRegister(writable, destination.Type);
-                StoreWritableRegisterIfSpilled(destination, writable);
+                if (string.IsNullOrEmpty(text))
+                    yield break;
+
+                var start = -1;
+                for (var i = 0; i <= text.Length; i++)
+                {
+                    var isIdentifier = i < text.Length && (char.IsLetterOrDigit(text[i]) || text[i] == '_');
+                    if (isIdentifier)
+                    {
+                        if (start < 0)
+                            start = i;
+                        continue;
+                    }
+
+                    if (start < 0)
+                        continue;
+
+                    var token = text.Substring(start, i - start);
+                    if (TryParseRiscVAsmRegister(token, out var register))
+                        yield return register;
+                    start = -1;
+                }
+            }
+
+            private bool TryParseRiscVAsmRegister(string text, out MachineRegister register)
+            {
+                foreach (var registerClass in new[]
+                {
+                    LirRegisterClass.General,
+                    LirRegisterClass.Address,
+                    LirRegisterClass.Floating,
+                    LirRegisterClass.Vector,
+                })
+                {
+                    if (TargetRegisterInfo.TryParseExplicitRegister(_owner._target, text, registerClass, out register))
+                        return true;
+                }
+
+                register = MachineRegister.Invalid;
+                return false;
+            }
+
+            private void AllocateRiscVAsmRegisters(
+                IReadOnlyList<RiscVAsmRegisterBinding> outputs,
+                IReadOnlyList<RiscVAsmRegisterBinding> inputs,
+                HashSet<MachineRegister> unavailable,
+                LirInstruction instruction)
+            {
+                var used = new HashSet<MachineRegister>();
+
+                foreach (var output in outputs)
+                {
+                    var fixedRegister = TryGetRiscVConstraintRegister(output.Operand.Constraint, output.Type);
+                    if (!fixedRegister.HasValue)
+                        continue;
+                    AssignRiscVAsmRegister(output, fixedRegister.Value, used, unavailable, instruction, "output");
+                }
+
+                foreach (var input in inputs)
+                {
+                    if (input.MatchingOutput is not null)
+                        continue;
+                    var fixedRegister = TryGetRiscVConstraintRegister(input.Operand.Constraint, input.Type);
+                    if (!fixedRegister.HasValue)
+                        continue;
+                    AssignRiscVAsmRegister(input, fixedRegister.Value, used, unavailable, instruction, "input");
+                }
+
+                foreach (var output in outputs)
+                {
+                    if (output.Register != MachineRegister.Invalid)
+                        continue;
+                    var selected = SelectRiscVAsmRegister(output.Type, used, unavailable);
+                    if (selected == MachineRegister.Invalid)
+                        throw Unsupported(instruction, $"Cannot satisfy RISC-V inline assembly output constraint '{output.Operand.Constraint}'.");
+                    AssignRiscVAsmRegister(output, selected, used, unavailable, instruction, "output");
+                }
+
+                foreach (var input in inputs)
+                {
+                    if (input.MatchingOutput is null)
+                        continue;
+                    input.Register = input.MatchingOutput.Register;
+                }
+
+                foreach (var input in inputs)
+                {
+                    if (input.Register != MachineRegister.Invalid)
+                        continue;
+                    var selected = SelectRiscVAsmRegister(input.Type, used, unavailable);
+                    if (selected == MachineRegister.Invalid)
+                        throw Unsupported(instruction, $"Cannot satisfy RISC-V inline assembly input constraint '{input.Operand.Constraint}'.");
+                    AssignRiscVAsmRegister(input, selected, used, unavailable, instruction, "input");
+                }
+            }
+
+            private void AssignRiscVAsmRegister(
+                RiscVAsmRegisterBinding binding,
+                MachineRegister register,
+                HashSet<MachineRegister> used,
+                HashSet<MachineRegister> unavailable,
+                LirInstruction instruction,
+                string kind)
+            {
+                if (unavailable.Contains(register))
+                    throw Unsupported(instruction, $"RISC-V inline assembly {kind} register {RVRegisters.Format(ToAnyRegister(register))} is clobbered or used directly by the template.");
+                if (!used.Add(register))
+                    throw Unsupported(instruction, $"RISC-V inline assembly operands require incompatible values in {RVRegisters.Format(ToAnyRegister(register))}.");
+                binding.Register = register;
+            }
+
+            private MachineRegister SelectRiscVAsmRegister(
+                QualifiedType type,
+                HashSet<MachineRegister> used,
+                HashSet<MachineRegister> unavailable)
+            {
+                foreach (var register in RiscVAsmRegisterCandidates(type))
+                {
+                    if (!used.Contains(register) && !unavailable.Contains(register))
+                        return register;
+                }
+                return MachineRegister.Invalid;
+            }
+
+            private IEnumerable<MachineRegister> RiscVAsmRegisterCandidates(QualifiedType type)
+            {
+                var allocated = RiscVAsmRegisterClass(type) switch
+                {
+                    LirRegisterClass.Floating => _owner._allocationOptions.FloatingRegisters,
+                    LirRegisterClass.Vector => _owner._allocationOptions.VectorRegisters,
+                    _ => _owner._allocationOptions.GeneralRegisters,
+                };
+
+                // Generic asm operands are deliberately kept out of the code generator's t0/t1/etc.
+                // scratch registers: formatting memory operands and materializing large stack offsets
+                // may use those scratches before the asm executes. The LSRA reserves the requested
+                // register class at an asm site, so caller-saved allocatable registers are free here.
+                foreach (var register in allocated)
+                {
+                    if (!TargetRegisterInfo.IsCalleeSaved(_owner._target, register))
+                        yield return register;
+                }
+            }
+
+            private LirRegisterClass RiscVAsmRegisterClass(QualifiedType type)
+            {
+                var registerClass = CAbi.PreferredLirRegisterClass(_owner._target, type);
+                return registerClass == LirRegisterClass.Address ? LirRegisterClass.General : registerClass;
+            }
+
+            private void EmitRiscVAsmInputMoves(
+                IReadOnlyList<RiscVAsmRegisterBinding> outputs,
+                IReadOnlyList<RiscVAsmRegisterBinding> inputs,
+                LirInstruction instruction)
+            {
+                var moves = new List<RiscVAsmInputMove>();
+                foreach (var output in outputs)
+                {
+                    if (output.Operand.IsReadWrite && output.Output is not null)
+                        AddRiscVAsmInputMove(moves, output.Register, LirOperand.ForRegister(output.Output), output.Type, instruction);
+                }
+                foreach (var input in inputs)
+                {
+                    if (input.Input is not null)
+                        AddRiscVAsmInputMove(moves, input.Register, input.Input, input.Type, instruction);
+                }
+                EmitRiscVAsmParallelInputMoves(moves, instruction);
+            }
+
+            private void AddRiscVAsmInputMove(
+                List<RiscVAsmInputMove> moves,
+                MachineRegister destination,
+                LirOperand source,
+                QualifiedType type,
+                LirInstruction instruction)
+            {
+                foreach (var existing in moves)
+                {
+                    if (existing.Destination != destination)
+                        continue;
+                    if (SameRiscVAsmInputValue(existing.SourceOperand, source))
+                        return;
+                    throw Unsupported(instruction, $"Inline assembly requires multiple values in {RVRegisters.Format(ToAnyRegister(destination))}.");
+                }
+
+                moves.Add(new RiscVAsmInputMove(destination, source, type));
+            }
+
+            private static bool SameRiscVAsmInputValue(LirOperand? left, LirOperand right)
+            {
+                if (left is null || left.Kind != right.Kind)
+                    return false;
+                if (left.Kind == LirOperandKind.Register)
+                    return ReferenceEquals(left.Register, right.Register);
+                if (left.Kind == LirOperandKind.Immediate)
+                    return Equals(left.Immediate, right.Immediate) && left.Type.Equals(right.Type);
+                return ReferenceEquals(left, right);
+            }
+
+            private void EmitRiscVAsmParallelInputMoves(List<RiscVAsmInputMove> moves, LirInstruction instruction)
+            {
+                foreach (var move in moves)
+                {
+                    if (move.SourceOperand is not null && TryGetPhysicalRegister(move.SourceOperand, out var sourceRegister))
+                    {
+                        move.SourceRegister = sourceRegister;
+                        move.SourceOperand = null;
+                    }
+                }
+
+                for (var i = moves.Count - 1; i >= 0; i--)
+                {
+                    if (moves[i].HasRegisterSource && moves[i].SourceRegister == moves[i].Destination)
+                        moves.RemoveAt(i);
+                }
+
+                while (moves.Count != 0)
+                {
+                    var emitted = false;
+                    for (var i = 0; i < moves.Count; i++)
+                    {
+                        var destination = moves[i].Destination;
+                        var isSource = moves.Any(other => other.HasRegisterSource && other.SourceRegister == destination);
+                        if (isSource)
+                            continue;
+
+                        EmitRiscVAsmInputMove(moves[i], instruction);
+                        moves.RemoveAt(i);
+                        emitted = true;
+                        break;
+                    }
+                    if (emitted)
+                        continue;
+
+                    var cycleMove = moves.FirstOrDefault(static move => move.HasRegisterSource);
+                    if (cycleMove is null)
+                        throw Unsupported(instruction, "Cannot resolve RISC-V inline assembly input operands.");
+                    SpillRiscVAsmInputCycle(moves, cycleMove.SourceRegister, cycleMove.Type, instruction);
+                }
+            }
+
+            private void SpillRiscVAsmInputCycle(
+                List<RiscVAsmInputMove> moves,
+                MachineRegister source,
+                QualifiedType type,
+                LirInstruction instruction)
+            {
+                RequireRiscVAsmTemp(type, instruction);
+                StoreToMemory(source, Sp, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(type));
+                foreach (var move in moves)
+                {
+                    if (!move.HasRegisterSource || move.SourceRegister != source)
+                        continue;
+                    move.SourceRegister = MachineRegister.Invalid;
+                    move.UsesTemp = true;
+                }
+            }
+
+            private void EmitRiscVAsmInputMove(RiscVAsmInputMove move, LirInstruction instruction)
+            {
+                if (move.UsesTemp)
+                {
+                    LoadFromMemory(move.Destination, Sp, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(move.Type), IsSignedIntegerType(move.Type));
+                    NormalizeScalarRegister(move.Destination, move.Type);
+                    return;
+                }
+                if (move.HasRegisterSource)
+                {
+                    MoveRegister(move.Destination, move.SourceRegister);
+                    return;
+                }
+                if (move.SourceOperand is null)
+                    throw Unsupported(instruction, "RISC-V inline assembly input move has no source.");
+                LoadOperandIntoAs(move.SourceOperand, move.Destination, move.Type, instruction);
+            }
+
+            private void EmitRiscVAsmOutputMoves(IReadOnlyList<RiscVAsmRegisterBinding> outputs, LirInstruction instruction)
+            {
+                var moves = new List<RiscVAsmRegisterMove>();
+                foreach (var output in outputs)
+                {
+                    if (output.Output is null)
+                        continue;
+
+                    NormalizeScalarRegister(output.Register, output.Type);
+                    if (!TryGetPhysicalRegister(output.Output, out var destination))
+                    {
+                        StoreWritableRegisterIfSpilled(output.Output, output.Register);
+                        continue;
+                    }
+                    if (destination != output.Register)
+                        moves.Add(new RiscVAsmRegisterMove(destination, output.Register, output.Type));
+                }
+
+                EmitRiscVAsmParallelRegisterMoves(moves, instruction);
+            }
+
+            private void EmitRiscVAsmParallelRegisterMoves(List<RiscVAsmRegisterMove> moves, LirInstruction instruction)
+            {
+                while (moves.Count != 0)
+                {
+                    var emitted = false;
+                    for (var i = 0; i < moves.Count; i++)
+                    {
+                        var destination = moves[i].Destination;
+                        if (moves.Any(move => move.Source == destination))
+                            continue;
+                        MoveRegister(destination, moves[i].Source);
+                        moves.RemoveAt(i);
+                        emitted = true;
+                        break;
+                    }
+                    if (emitted)
+                        continue;
+
+                    var source = moves[0].Source;
+                    var type = moves[0].Type;
+                    RequireRiscVAsmTemp(type, instruction);
+                    StoreToMemory(source, Sp, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(type));
+                    var tempConsumers = new List<RiscVAsmRegisterMove>();
+                    for (var i = moves.Count - 1; i >= 0; i--)
+                    {
+                        if (moves[i].Source != source)
+                            continue;
+                        tempConsumers.Add(moves[i]);
+                        moves.RemoveAt(i);
+                    }
+                    EmitRiscVAsmParallelRegisterMoves(moves, instruction);
+                    foreach (var move in tempConsumers)
+                    {
+                        LoadFromMemory(move.Destination, Sp, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(move.Type), IsSignedIntegerType(move.Type));
+                        NormalizeScalarRegister(move.Destination, move.Type);
+                    }
+                }
+            }
+
+            private void RequireRiscVAsmTemp(QualifiedType type, LirInstruction instruction)
+            {
+                var required = AlignUp(
+                    Math.Max(_owner._allocationOptions.SpillSlotSize, SizeOfRegisterType(type)),
+                    _owner._allocationOptions.SpillSlotAlignment);
+                if (_allocation.Frame.ParallelCopyTempSize < required)
+                    throw Unsupported(instruction, "RISC-V inline assembly parallel-copy spill slot is too small.");
             }
 
             private MachineRegister? TryGetRiscVConstraintRegister(string constraint, QualifiedType type)
@@ -1029,6 +1442,55 @@ namespace Cnidaria.C
                 }
             }
 
+            private sealed class RiscVAsmRegisterBinding
+            {
+                public GimpleAsmOperand Operand { get; }
+                public LirVirtualRegister? Output { get; }
+                public LirOperand? Input { get; }
+                public QualifiedType Type => Output?.Type ?? Input!.Type;
+                public RiscVAsmRegisterBinding? MatchingOutput { get; set; }
+                public MachineRegister Register { get; set; }
+
+                public RiscVAsmRegisterBinding(GimpleAsmOperand operand, LirVirtualRegister? output, LirOperand? input)
+                {
+                    Operand = operand ?? throw new ArgumentNullException(nameof(operand));
+                    Output = output;
+                    Input = input;
+                    Register = MachineRegister.Invalid;
+                }
+            }
+
+            private sealed class RiscVAsmInputMove
+            {
+                public MachineRegister Destination { get; }
+                public LirOperand? SourceOperand { get; set; }
+                public MachineRegister SourceRegister { get; set; }
+                public QualifiedType Type { get; }
+                public bool UsesTemp { get; set; }
+                public bool HasRegisterSource => SourceRegister != MachineRegister.Invalid;
+
+                public RiscVAsmInputMove(MachineRegister destination, LirOperand sourceOperand, QualifiedType type)
+                {
+                    Destination = destination;
+                    SourceOperand = sourceOperand ?? throw new ArgumentNullException(nameof(sourceOperand));
+                    SourceRegister = MachineRegister.Invalid;
+                    Type = type;
+                }
+            }
+
+            private readonly struct RiscVAsmRegisterMove
+            {
+                public MachineRegister Destination { get; }
+                public MachineRegister Source { get; }
+                public QualifiedType Type { get; }
+
+                public RiscVAsmRegisterMove(MachineRegister destination, MachineRegister source, QualifiedType type)
+                {
+                    Destination = destination;
+                    Source = source;
+                    Type = type;
+                }
+            }
 
             private void EmitInlineAssemblyText(LirInstruction instruction, string text)
             {
@@ -1132,6 +1594,8 @@ namespace Cnidaria.C
                 var destination = GetWritableRegister(instruction.Result, PreferredScratch(type, GpScratch0, FpScratch0, VecScratch0));
                 if (scalarLocation.Kind == AbiLocationKind.Register)
                 {
+                    if (!IsFloatRegister(scalarLocation.Register) && !IsVectorRegister(scalarLocation.Register))
+                        SetIntegerRepresentation(scalarLocation.Register, IncomingParameterRepresentation(type));
                     MoveRegister(destination, scalarLocation.Register);
                 }
                 else if (scalarLocation.Kind == AbiLocationKind.Stack)
@@ -2092,9 +2556,12 @@ namespace Cnidaria.C
                     case ">>":
                         var shiftBits = wordOp ? 32 : _owner._target.RegisterSize * 8;
                         var shiftAmount = GetShiftImmediate(rightOperand, shiftBits);
+                        // A shift takes no usual arithmetic conversions: only the left operand decides
+                        // whether the right shift is arithmetic
+                        var shiftSigned = IsSignedIntegerType(instruction.Operands[0].Type);
                         var shiftOpcode = op == "<<"
                             ? (wordOp ? RVInstrKind.Slliw : RVInstrKind.Slli)
-                            : signed
+                            : shiftSigned
                                 ? (wordOp ? RVInstrKind.Sraiw : RVInstrKind.Srai)
                                 : (wordOp ? RVInstrKind.Srliw : RVInstrKind.Srli);
                         EmitShiftImmediate(shiftOpcode, dst, LoadOperand(leftOperand, GpScratch1), shiftAmount);
@@ -2149,7 +2616,8 @@ namespace Cnidaria.C
                     case "^": Emit(RVInstruction.R(RVInstrKind.Xor, ToRegister(dst), ToRegister(left), ToRegister(right))); return;
                     case "<<": Emit(RVInstruction.R(wordOp ? RVInstrKind.Sllw : RVInstrKind.Sll, ToRegister(dst), ToRegister(left), ToRegister(right))); return;
                     case ">>":
-                        Emit(RVInstruction.R(signed
+                        // Only the left operand decides whether the right shift is arithmetic
+                        Emit(RVInstruction.R(IsSignedIntegerType(instruction.Operands[0].Type)
                         ? (wordOp ? RVInstrKind.Sraw : RVInstrKind.Sra)
                         : (wordOp ? RVInstrKind.Srlw : RVInstrKind.Srl), ToRegister(dst), ToRegister(left), ToRegister(right))); return;
                     case "==": EmitEquality(dst, left, right, equal: true); return;
@@ -2878,9 +3346,40 @@ namespace Cnidaria.C
             private void MarshalCallArguments(LirInstruction instruction, int startOperand)
             {
                 var cursor = new AbiCursor();
+                CollectCallOperandRegisters(instruction);
                 MarshalHiddenReturnBufferArgument(instruction, ref cursor);
                 for (var i = startOperand; i < instruction.Operands.Length; i++)
                     MarshalCallArgument(instruction, instruction.Operands[i], ref cursor, i - startOperand);
+                _callOperandRegisters.Clear();
+            }
+
+            /// <summary>
+            /// Records the physical registers the call reads, so a materialized argument can be built
+            /// straight in its ABI register without clobbering a value another argument still needs.
+            /// </summary>
+            private void CollectCallOperandRegisters(LirInstruction instruction)
+            {
+                _callOperandRegisters.Clear();
+                foreach (var operand in instruction.Operands)
+                {
+                    if (TryGetPhysicalRegister(operand, out var physicalRegister))
+                        _callOperandRegisters.Add(physicalRegister);
+                }
+            }
+
+            /// <summary>Picks the ABI register itself as the materialization target when that is safe</summary>
+            private MachineRegister PreferredArgumentScratch(LirOperand operand, AbiLocation location, MachineRegister fallback)
+            {
+                if (operand.Kind == LirOperandKind.Register ||
+                    location.Kind != AbiLocationKind.Register ||
+                    _callOperandRegisters.Contains(location.Register) ||
+                    IsFloatRegister(location.Register) != IsFloatRegister(fallback) ||
+                    IsVectorRegister(location.Register) != IsVectorRegister(fallback))
+                {
+                    return fallback;
+                }
+
+                return location.Register;
             }
 
             private void MarshalHiddenReturnBufferArgument(LirInstruction instruction, ref AbiCursor cursor)
@@ -2957,10 +3456,13 @@ namespace Cnidaria.C
             private MachineRegister LoadOperandForArgument(LirOperand operand, AbiRegisterClass registerClass, AbiLocation location, LirInstruction instruction)
             {
                 if (!IsFloatType(operand.Type))
-                    return LoadOperand(operand, GpScratch0);
+                    return LoadOperand(operand, PreferredArgumentScratch(operand, location, GpScratch0));
 
                 if (registerClass == AbiRegisterClass.Floating || location.Kind == AbiLocationKind.Stack)
-                    return LoadOperand(operand, UsesHardwareFloating(operand.Type) ? FpScratch0 : GpScratch0);
+                {
+                    var scratch = UsesHardwareFloating(operand.Type) ? FpScratch0 : GpScratch0;
+                    return LoadOperand(operand, PreferredArgumentScratch(operand, location, scratch));
+                }
 
                 return LoadFloatingOperandBitsToInteger(operand, instruction);
             }
@@ -3171,6 +3673,12 @@ namespace Cnidaria.C
                     var leftRegister = LoadOperandAsFloating(left, floatType, FpScratch1, instruction);
                     var rightRegister = LoadOperandAsFloating(right, floatType, FpScratch2, instruction);
                     EmitFloatingRelation(instruction.Operator, floatType, GpScratch0, leftRegister, rightRegister);
+                    if (PrefersInvertedBranch(instruction))
+                    {
+                        EmitBranch(RVInstrKind.Beq, GpScratch0, MachineRegister.X0, LabelOf(instruction.FalseTarget));
+                        return;
+                    }
+
                     EmitBranch(RVInstrKind.Bne, GpScratch0, MachineRegister.X0, LabelOf(instruction.TrueTarget));
                     if (!IsFallthroughTarget(instruction.FalseTarget))
                         EmitJump(LabelOf(instruction.FalseTarget));
@@ -3190,14 +3698,35 @@ namespace Cnidaria.C
                 var rightRegisterInteger = LoadIntegerBranchOperand(right, GpScratch2);
                 var signed = IsSignedIntegerType(left.Type) || IsSignedIntegerType(right.Type);
                 var opcode = SelectIntegerBranchOpcode(instruction.Operator, signed, out var swapOperands);
-                EmitBranch(
-                    opcode,
-                    swapOperands ? rightRegisterInteger : leftRegisterInteger,
-                    swapOperands ? leftRegisterInteger : rightRegisterInteger,
-                    LabelOf(instruction.TrueTarget));
+                var first = swapOperands ? rightRegisterInteger : leftRegisterInteger;
+                var second = swapOperands ? leftRegisterInteger : rightRegisterInteger;
+
+                if (PrefersInvertedBranch(instruction))
+                {
+                    EmitBranch(InvertBranchOpcode(opcode), first, second, LabelOf(instruction.FalseTarget));
+                    return;
+                }
+
+                EmitBranch(opcode, first, second, LabelOf(instruction.TrueTarget));
                 if (!IsFallthroughTarget(instruction.FalseTarget))
                     EmitJump(LabelOf(instruction.FalseTarget));
             }
+
+            /// <summary>Reports whether the true target falls through, so branching on the negated condition removes the jump</summary>
+            private bool PrefersInvertedBranch(LirInstruction instruction)
+                => IsFallthroughTarget(instruction.TrueTarget) && !IsFallthroughTarget(instruction.FalseTarget);
+
+            private static RVInstrKind InvertBranchOpcode(RVInstrKind opcode)
+                => opcode switch
+                {
+                    RVInstrKind.Beq => RVInstrKind.Bne,
+                    RVInstrKind.Bne => RVInstrKind.Beq,
+                    RVInstrKind.Blt => RVInstrKind.Bge,
+                    RVInstrKind.Bge => RVInstrKind.Blt,
+                    RVInstrKind.Bltu => RVInstrKind.Bgeu,
+                    RVInstrKind.Bgeu => RVInstrKind.Bltu,
+                    _ => throw new ArgumentOutOfRangeException(nameof(opcode)),
+                };
 
             private void EmitWideComparisonBranch(LirInstruction instruction)
             {
@@ -4681,6 +5210,19 @@ namespace Cnidaria.C
                 SetIntegerRepresentation(register, required);
             }
 
+            /// <summary>
+            /// Reports what an incoming argument register is already known to hold. The psABI widens a
+            /// narrower scalar according to its own sign and then sign-extends to XLEN, which agrees with
+            /// the canonical form everywhere except a 32-bit unsigned value on a 64-bit target.
+            /// </summary>
+            private IntegerRepresentationFact IncomingParameterRepresentation(QualifiedType type)
+            {
+                if (_owner._target.Is64Bit && SizeOf(type) == 4 && IsUnsignedIntegerType(type))
+                    return IntegerRepresentationFact.Unknown;
+
+                return CanonicalIntegerRepresentation(type);
+            }
+
             private IntegerRepresentationFact CanonicalIntegerRepresentation(QualifiedType type)
             {
                 if (!IsIntegerLike(type) || IsPointerLike(type))
@@ -4770,6 +5312,11 @@ namespace Cnidaria.C
                 var fact = IntegerRepresentationFact.Unknown;
                 switch (instruction.Opcode)
                 {
+                    // A register move carries the source representation, so a following no-op
+                    // conversion does not have to re-extend the value
+                    case RVInstrKind.Addi when instruction.Immediate == 0:
+                        fact = source;
+                        break;
                     case RVInstrKind.Lb:
                         fact = IntegerRepresentationFact.SignExtended(8);
                         break;
@@ -4797,6 +5344,11 @@ namespace Cnidaria.C
                         break;
                     case RVInstrKind.Lwu:
                         fact = IntegerRepresentationFact.ZeroExtended(32);
+                        break;
+                    // A logical 32-bit right shift clears bit 31, so the sign extension to 64 bits is
+                    // a no-op and the result is known to be zero-extended
+                    case RVInstrKind.Srliw when instruction.Immediate > 0:
+                        fact = IntegerRepresentationFact.ZeroExtended(32 - instruction.Immediate);
                         break;
                     case RVInstrKind.Addiw:
                     case RVInstrKind.Slliw:

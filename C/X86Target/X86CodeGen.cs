@@ -20,6 +20,7 @@ namespace Cnidaria.C
     {
         private const string TextSectionName = ".text";
         private const string RodataSectionName = ".rodata";
+        private const string StringSectionName = ".rodata.str1.1";
         private const string DataSectionName = ".data";
         private const string BssSectionName = ".bss";
 
@@ -39,6 +40,8 @@ namespace Cnidaria.C
         private readonly HashSet<string> _externalLabels = new HashSet<string>(StringComparer.Ordinal);
         private readonly List<X86ObjectSymbol> _symbols = new List<X86ObjectSymbol>();
         private readonly DataSectionBuilder _rodata = new DataSectionBuilder(RodataSectionName, X86ObjectSectionKind.Rodata);
+        // String literals live in their own section: they are interned while a global is mid-emission into .rodata
+        private readonly DataSectionBuilder _strings = new DataSectionBuilder(StringSectionName, X86ObjectSectionKind.Rodata);
         private readonly DataSectionBuilder _data = new DataSectionBuilder(DataSectionName, X86ObjectSectionKind.Data);
         private readonly BssSectionBuilder _bss = new BssSectionBuilder(BssSectionName);
         private TextSectionBuilder _text = null!;
@@ -114,6 +117,7 @@ namespace Cnidaria.C
             AddSectionSymbols();
             var dataSections = ImmutableArray.CreateBuilder<X86DataSection>();
             dataSections.Add(_rodata.ToSection());
+            dataSections.Add(_strings.ToSection());
             dataSections.Add(_data.ToSection());
             dataSections.Add(_bss.ToSection());
 
@@ -270,6 +274,7 @@ namespace Cnidaria.C
         {
             _symbols.Add(new X86ObjectSymbol(TextSectionName, TextSectionName, 0, _text.ByteLength, X86ObjectSymbolBinding.Local, X86ObjectSymbolKind.Section));
             _symbols.Add(new X86ObjectSymbol(RodataSectionName, RodataSectionName, 0, _rodata.ByteLength, X86ObjectSymbolBinding.Local, X86ObjectSymbolKind.Section));
+            _symbols.Add(new X86ObjectSymbol(StringSectionName, StringSectionName, 0, _strings.ByteLength, X86ObjectSymbolBinding.Local, X86ObjectSymbolKind.Section));
             _symbols.Add(new X86ObjectSymbol(DataSectionName, DataSectionName, 0, _data.ByteLength, X86ObjectSymbolBinding.Local, X86ObjectSymbolKind.Section));
             _symbols.Add(new X86ObjectSymbol(BssSectionName, BssSectionName, 0, _bss.ByteLength, X86ObjectSymbolBinding.Local, X86ObjectSymbolKind.Section));
         }
@@ -458,13 +463,22 @@ namespace Cnidaria.C
 
         private int EmitConstantInitializer(DataSectionBuilder section, QualifiedType type, object? value, int availableSize)
         {
-            if (value is string text && type.Type is ArrayType)
+            if (value is string text)
             {
-                var bytes = Encoding.UTF8.GetBytes(text);
-                var count = Math.Min(availableSize, checked(bytes.Length + 1));
-                for (var i = 0; i < count; i++)
-                    section.EmitByte(i < bytes.Length ? bytes[i] : (byte)0);
-                return count;
+                if (type.Type is ArrayType)
+                {
+                    var bytes = Encoding.UTF8.GetBytes(text);
+                    var count = Math.Min(availableSize, checked(bytes.Length + 1));
+                    for (var i = 0; i < count; i++)
+                        section.EmitByte(i < bytes.Length ? bytes[i] : (byte)0);
+                    return count;
+                }
+
+                if (IsPointerLike(type))
+                {
+                    EmitPointerRelocation(section, CreateStringLiteral(text));
+                    return Math.Min(availableSize, _target.PointerSize);
+                }
             }
 
             if (IsFloatType(type))
@@ -571,10 +585,10 @@ namespace Cnidaria.C
 
             var label = CreateLocalLabel("str");
             var bytes = Encoding.UTF8.GetBytes(text);
-            var offset = _rodata.Align(1);
-            _rodata.DefineSymbol(label, offset, bytes.Length + 1, X86ObjectSymbolBinding.Local, _symbols);
-            _rodata.EmitBytes(bytes, bytes.Length);
-            _rodata.EmitByte(0);
+            var offset = _strings.Align(1);
+            _strings.DefineSymbol(label, offset, bytes.Length + 1, X86ObjectSymbolBinding.Local, _symbols);
+            _strings.EmitBytes(bytes, bytes.Length);
+            _strings.EmitByte(0);
             _stringLabels.Add(text, label);
             return label;
         }
@@ -2019,9 +2033,36 @@ namespace Cnidaria.C
                 if (instruction.ParallelCopies.Length == 0)
                     return;
 
+                var copies = new List<LirParallelCopy>(instruction.ParallelCopies.Length);
+                foreach (var candidate in instruction.ParallelCopies)
+                {
+                    if (_allocation.RequiresPhysicalParallelCopy(candidate))
+                        copies.Add(candidate);
+                }
+
+                if (copies.Count == 0)
+                    return;
+
+                if (copies.Count == 1)
+                {
+                    EmitValueCopy(copies[0].Destination, copies[0].Source, instruction);
+                    return;
+                }
+
+                if (CanEmitDirectParallelCopies(copies) &&
+                    _allocation.TryOrderParallelCopies(copies, out var ordered))
+                {
+                    foreach (var copy in ordered)
+                        EmitValueCopy(copy.Destination, copy.Source, instruction);
+                    return;
+                }
+
+                if (_allocation.Frame.ParallelCopyTempSize == 0)
+                    throw Unsupported(instruction, "Parallel copy requires a temporary frame area.");
+
                 var tempOffset = _allocation.Frame.ParallelCopyTempOffset;
                 var cursor = 0;
-                foreach (var copy in instruction.ParallelCopies)
+                foreach (var copy in copies)
                 {
                     var size = Math.Max(SizeOfStorage(copy.Destination.Type), SizeOfStorage(copy.Source.Type));
                     var temp = Mem(X86Register.Rsp, tempOffset + cursor, size);
@@ -2030,12 +2071,27 @@ namespace Cnidaria.C
                 }
 
                 cursor = 0;
-                foreach (var copy in instruction.ParallelCopies)
+                foreach (var copy in copies)
                 {
                     var size = Math.Max(SizeOfStorage(copy.Destination.Type), SizeOfStorage(copy.Source.Type));
                     EmitMemoryToDestination(Mem(X86Register.Rsp, tempOffset + cursor, size), copy.Destination, size);
                     cursor += AlignUp(Math.Max(size, _owner._allocationOptions.SpillSlotSize), _owner._allocationOptions.SpillSlotAlignment);
                 }
+            }
+
+            private bool CanEmitDirectParallelCopies(IReadOnlyList<LirParallelCopy> copies)
+            {
+                foreach (var copy in copies)
+                {
+                    if (RequiresBlockCopyStorage(copy.Destination.Type) ||
+                        IsX86WideInteger(copy.Destination.Type) ||
+                        IsX86WideInteger(copy.Source.Type))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
             }
 
             private void EmitZero(LirInstruction instruction)
@@ -2720,7 +2776,11 @@ namespace Cnidaria.C
                 var left = instruction.Operands[0];
                 var right = instruction.Operands[1];
                 var size = RegisterSize(instruction.Result.Type);
-                var dst = GetWritableRegister(instruction.Result, Scratch0);
+                var destination = GetWritableRegister(instruction.Result, Scratch0);
+
+                // Every sequence below writes the destination from the left operand before reading the
+                // right one, and the result may have been given the register the right operand lives in
+                var dst = OccupiesRegister(right, destination) ? Scratch0 : destination;
 
                 switch (instruction.Operator)
                 {
@@ -2787,8 +2847,19 @@ namespace Cnidaria.C
                         throw Unsupported(instruction, $"Unsupported binary operator '{instruction.Operator}'.");
                 }
 
-                NormalizeIntegerRegister(dst, instruction.Result.Type);
-                StoreWritableRegisterIfSpilled(instruction.Result, dst);
+                MoveRegister(destination, dst, size);
+                NormalizeIntegerRegister(destination, instruction.Result.Type);
+                StoreWritableRegisterIfSpilled(instruction.Result, destination);
+            }
+
+            private bool OccupiesRegister(LirOperand operand, X86Register register)
+            {
+                if (operand.Kind != LirOperandKind.Register || operand.Register is null)
+                    return false;
+
+                var allocation = _allocation[operand.Register];
+                return !allocation.IsSpilled &&
+                    ToX86Register(allocation.PhysicalRegister, _owner._machineTarget) == register;
             }
 
             private void EmitCommutativeBinary(X86InstrKind opcode, LirOperand left, LirOperand right, X86Register dst, LirInstruction instruction, int size)
@@ -2858,12 +2929,16 @@ namespace Cnidaria.C
             {
                 var size = RegisterSize(instruction.Operands[0].Type);
                 var dst = GetWritableRegister(instruction.Result!, Scratch0);
-                LoadOperandInto(instruction.Operands[0], dst, instruction, size);
                 if (instruction.Operands[1].Kind == LirOperandKind.Immediate)
+                {
+                    LoadOperandInto(instruction.Operands[0], dst, instruction, size);
                     Emit(X86Instruction.Binary(opcode, Reg(dst, size), Imm(ConvertIntegerConstant(instruction.Operands[1].Immediate) & 0x3f)));
+                }
                 else
                 {
+                    // The count goes to cl first: the destination may be the register holding it
                     LoadOperandInto(instruction.Operands[1], X86Register.Rcx, instruction, 1);
+                    LoadOperandInto(instruction.Operands[0], dst, instruction, size);
                     Emit(X86Instruction.Binary(opcode, Reg(dst, size), Reg(X86Register.Rcx, 1)));
                 }
                 NormalizeIntegerRegister(dst, instruction.Result!.Type);
@@ -2875,8 +2950,8 @@ namespace Cnidaria.C
                 var left = instruction.Operands[0];
                 var right = instruction.Operands[1];
                 var size = Math.Max(RegisterSize(left.Type), RegisterSize(right.Type));
-                LoadOperandInto(left, Scratch0, instruction, size);
-                Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(Scratch0, size), LoadOperandForIntegerOperation(right, Scratch1, instruction, size)));
+                var leftOperand = LoadComparisonLeft(left, instruction, size);
+                Emit(X86Instruction.Binary(X86InstrKind.Cmp, leftOperand, LoadOperandForIntegerOperation(right, Scratch1, instruction, size)));
                 var condition = instruction.Operator switch
                 {
                     "==" => X86Condition.E,
@@ -2950,10 +3025,19 @@ namespace Cnidaria.C
                             throw Unsupported(instruction, "Floating-point arithmetic result must have a floating-point type.");
                         var operationType = SelectFloatingOperationType(left.Type, right.Type, result.Type);
                         var writable = GetWritableRegister(result, FpScratch0);
+
+                        // Same collision as the integer path: resolve the right operand before the left
+                        // one overwrites the register it lives in
+                        var stagedRight = OccupiesRegister(right, writable)
+                            ? LoadOperandAsFloating(right, operationType, FpScratch1, instruction)
+                            : X86Register.Invalid;
+
                         var leftReg = LoadOperandAsFloating(left, operationType, writable, instruction);
                         if (writable != leftReg)
                             EmitFloatingMove(writable, leftReg, operationType);
-                        var rightReg = LoadOperandAsFloating(right, operationType, FpScratch1, instruction);
+                        var rightReg = stagedRight != X86Register.Invalid
+                            ? stagedRight
+                            : LoadOperandAsFloating(right, operationType, FpScratch1, instruction);
                         Emit(X86Instruction.Binary(FloatingArithmeticOpcode(instruction.Operator, operationType),
                             Reg(writable, FloatingStorageSize(operationType)), Reg(rightReg, FloatingStorageSize(operationType))));
                         if (!SameFloatingType(operationType, result.Type))
@@ -3290,7 +3374,10 @@ namespace Cnidaria.C
                 if (instruction.Result is null || instruction.Address is null)
                     throw Unsupported(instruction, "AddressOf instruction expects result and address.");
                 var dst = GetWritableRegister(instruction.Result, Scratch0);
-                MaterializeAddress(instruction.Address, dst, instruction);
+                if (TryBuildAddressOperand(instruction.Address, _wordSize, Scratch1, Scratch0, instruction, out var folded))
+                    Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(dst, _wordSize), folded));
+                else
+                    MaterializeAddress(instruction.Address, dst, instruction);
                 StoreWritableRegisterIfSpilled(instruction.Result, dst);
             }
 
@@ -3301,8 +3388,10 @@ namespace Cnidaria.C
                 if (IsFloatType(instruction.Result.Type))
                 {
                     var fpDst = GetWritableRegister(instruction.Result, FpScratch0);
-                    var fpAddress = MaterializeAddress(instruction.Address, Scratch1, instruction);
-                    EmitFloatingLoad(fpDst, RegMem(fpAddress, FloatingStorageSize(instruction.Result.Type)), instruction.Result.Type);
+                    var fpSize = FloatingStorageSize(instruction.Result.Type);
+                    if (!TryBuildAddressOperand(instruction.Address, fpSize, Scratch1, Scratch0, instruction, out var fpSource))
+                        fpSource = RegMem(MaterializeAddress(instruction.Address, Scratch1, instruction), fpSize);
+                    EmitFloatingLoad(fpDst, fpSource, instruction.Result.Type);
                     StoreWritableRegisterIfSpilled(instruction.Result, fpDst);
                     return;
                 }
@@ -3326,8 +3415,10 @@ namespace Cnidaria.C
                 }
 
                 var dst = GetWritableRegister(instruction.Result, PreferredScratch(instruction.Result.Type));
-                var address = MaterializeAddress(instruction.Address, Scratch1, instruction);
-                EmitLoadFromMemory(dst, RegMem(address, RegisterSize(instruction.Result.Type)), IsSignedIntegerType(instruction.Result.Type));
+                var scalarSize = RegisterSize(instruction.Result.Type);
+                if (!TryBuildAddressOperand(instruction.Address, scalarSize, Scratch1, Scratch0, instruction, out var scalarSource))
+                    scalarSource = RegMem(MaterializeAddress(instruction.Address, Scratch1, instruction), scalarSize);
+                EmitLoadFromMemory(dst, scalarSource, IsSignedIntegerType(instruction.Result.Type));
                 StoreWritableRegisterIfSpilled(instruction.Result, dst);
             }
 
@@ -3339,9 +3430,11 @@ namespace Cnidaria.C
                 var value = instruction.Operands[0];
                 if (IsFloatType(value.Type))
                 {
-                    var fpDestination = MaterializeAddress(instruction.Address, Scratch0, instruction);
+                    var fpSize = FloatingStorageSize(value.Type);
                     var fpSource = LoadFloatingOperand(value, FpScratch0, instruction);
-                    EmitFloatingStore(RegMem(fpDestination, FloatingStorageSize(value.Type)), fpSource, value.Type);
+                    if (!TryBuildAddressOperand(instruction.Address, fpSize, Scratch0, Scratch1, instruction, out var fpDestination))
+                        fpDestination = RegMem(MaterializeAddress(instruction.Address, Scratch0, instruction), fpSize);
+                    EmitFloatingStore(fpDestination, fpSource, value.Type);
                     return;
                 }
                 var size = SizeOfStorage(value.Type);
@@ -3356,21 +3449,24 @@ namespace Cnidaria.C
                     return;
                 }
                 {
-                    var destination = MaterializeAddress(instruction.Address, Scratch0, instruction);
                     if (RequiresBlockCopyStorage(value.Type))
                     {
-                        EmitOperandToMemory(value, RegMem(destination, size), size, instruction);
+                        var blockDestination = MaterializeAddress(instruction.Address, Scratch0, instruction);
+                        EmitOperandToMemory(value, RegMem(blockDestination, size), size, instruction);
                         return;
                     }
 
                     var scalarSize = RegisterSize(value.Type);
+                    if (!TryBuildAddressOperand(instruction.Address, scalarSize, Scratch0, X86Register.Invalid, instruction, out var destination))
+                        destination = RegMem(MaterializeAddress(instruction.Address, Scratch0, instruction), scalarSize);
+
                     var source = LoadOperandForRead(value, Scratch1, instruction, scalarSize);
                     if (source.Kind == X86OperandKind.Memory || (scalarSize == 8 && (source.Kind == X86OperandKind.Immediate || source.Kind == X86OperandKind.Symbol)))
                     {
                         Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(Scratch1, scalarSize), source));
                         source = Reg(Scratch1, scalarSize);
                     }
-                    Emit(X86Instruction.Binary(X86InstrKind.Mov, RegMem(destination, scalarSize), source));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, destination, source));
                 }
             }
 
@@ -4130,12 +4226,26 @@ namespace Cnidaria.C
                 }
 
                 var size = Math.Max(RegisterSize(left.Type), RegisterSize(right.Type));
-                LoadOperandInto(left, Scratch0, instruction, size);
-                Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(Scratch0, size), LoadOperandForIntegerOperation(right, Scratch1, instruction, size)));
-                Emit(X86Instruction.ConditionalBranch(SelectIntegerComparisonCondition(instruction.Operator, IsSignedIntegerType(left.Type)), Label(instruction.TrueTarget)));
+                var leftOperand = LoadComparisonLeft(left, instruction, size);
+                Emit(X86Instruction.Binary(X86InstrKind.Cmp, leftOperand, LoadOperandForIntegerOperation(right, Scratch1, instruction, size)));
+                var condition = SelectIntegerComparisonCondition(instruction.Operator, IsSignedIntegerType(left.Type));
+                if (PrefersInvertedBranch(instruction))
+                {
+                    Emit(X86Instruction.ConditionalBranch(InvertCondition(condition), Label(instruction.FalseTarget)));
+                    return;
+                }
+
+                Emit(X86Instruction.ConditionalBranch(condition, Label(instruction.TrueTarget)));
                 if (!IsFallthroughTarget(instruction.FalseTarget))
                     EmitJump(instruction.FalseTarget);
             }
+
+            /// <summary>Reports whether the true target falls through, so branching on the negated condition removes the jump</summary>
+            private bool PrefersInvertedBranch(LirInstruction instruction)
+                => IsFallthroughTarget(instruction.TrueTarget) && !IsFallthroughTarget(instruction.FalseTarget);
+
+            private static X86Condition InvertCondition(X86Condition condition)
+                => (X86Condition)((byte)condition ^ 1);
 
             private void EmitFloatingComparisonBranch(LirInstruction instruction)
             {
@@ -4157,10 +4267,21 @@ namespace Cnidaria.C
                         Emit(X86Instruction.ConditionalBranch(X86Condition.P, Label(instruction.FalseTarget)));
                         Emit(X86Instruction.ConditionalBranch(X86Condition.Be, Label(instruction.TrueTarget)));
                         break;
+                    // An unordered result leaves CF set, so the inverted condition also selects the false target
                     case ">":
+                        if (PrefersInvertedBranch(instruction))
+                        {
+                            Emit(X86Instruction.ConditionalBranch(X86Condition.Be, Label(instruction.FalseTarget)));
+                            return;
+                        }
                         Emit(X86Instruction.ConditionalBranch(X86Condition.A, Label(instruction.TrueTarget)));
                         break;
                     case ">=":
+                        if (PrefersInvertedBranch(instruction))
+                        {
+                            Emit(X86Instruction.ConditionalBranch(X86Condition.B, Label(instruction.FalseTarget)));
+                            return;
+                        }
                         Emit(X86Instruction.ConditionalBranch(X86Condition.Ae, Label(instruction.TrueTarget)));
                         break;
                     default:
@@ -4486,6 +4607,107 @@ namespace Cnidaria.C
                 return scratch;
             }
 
+            /// <summary>Folds a LIR address into one memory operand, taking a scratch register for each part the addressing mode cannot express</summary>
+            private bool TryBuildAddressOperand(
+                LirAddress address,
+                int size,
+                X86Register primaryScratch,
+                X86Register secondaryScratch,
+                LirInstruction instruction,
+                out X86Operand operand)
+            {
+                operand = default;
+
+                var chain = new List<LirAddress>();
+                var root = address;
+                while (root.Kind is LirAddressKind.Field or LirAddressKind.Element)
+                {
+                    if (root.BaseAddress is null)
+                        return false;
+                    chain.Add(root);
+                    root = root.BaseAddress;
+                }
+
+                var takenScratchCount = 0;
+                X86Register TakeScratch()
+                {
+                    var scratch = takenScratchCount switch
+                    {
+                        0 => primaryScratch,
+                        1 => secondaryScratch,
+                        _ => X86Register.Invalid,
+                    };
+                    takenScratchCount++;
+                    return scratch;
+                }
+
+                X86Register baseRegister;
+                long displacement;
+                switch (root.Kind)
+                {
+                    case LirAddressKind.StackSlot:
+                        if (root.StackSlot is null)
+                            return false;
+                        baseRegister = X86Register.Rsp;
+                        displacement = _allocation.Frame.StackSlotOffsets[root.StackSlot];
+                        break;
+                    case LirAddressKind.Indirect:
+                        if (root.BaseOperand is null)
+                            return false;
+                        displacement = 0;
+                        if (root.BaseOperand.Kind == LirOperandKind.Register &&
+                            root.BaseOperand.Register is not null &&
+                            GetRegisterReadOperand(root.BaseOperand.Register, X86Register.Invalid, _wordSize) is
+                                { Kind: X86OperandKind.Register } allocatedBase)
+                        {
+                            baseRegister = allocatedBase.Register;
+                        }
+                        else
+                        {
+                            baseRegister = TakeScratch();
+                            if (baseRegister == X86Register.Invalid)
+                                return false;
+                            LoadOperandInto(root.BaseOperand, baseRegister, instruction, _wordSize);
+                        }
+                        break;
+                    default:
+                        return false;
+                }
+
+                var indexRegister = X86Register.Invalid;
+                var scale = 1;
+                for (var i = chain.Count - 1; i >= 0; i--)
+                {
+                    var node = chain[i];
+                    displacement += node.Displacement;
+                    if (node.Kind == LirAddressKind.Field || node.Index is null)
+                        continue;
+
+                    var index = node.Index;
+                    if (index.Kind == LirOperandKind.Immediate && index.Immediate is not string)
+                    {
+                        displacement += ImmediateToInt64(index) * node.Scale;
+                        continue;
+                    }
+
+                    if (indexRegister != X86Register.Invalid || node.Scale is not (1 or 2 or 4 or 8))
+                        return false;
+
+                    indexRegister = TakeScratch();
+                    if (indexRegister == X86Register.Invalid)
+                        return false;
+
+                    LoadOperandInto(index, indexRegister, instruction, _wordSize);
+                    scale = node.Scale;
+                }
+
+                if (displacement < int.MinValue || displacement > int.MaxValue)
+                    return false;
+
+                operand = X86Operand.Memory(baseRegister, displacement, Math.Max(1, size), indexRegister, scale);
+                return true;
+            }
+
             private X86Register MaterializeAddress(LirAddress address, X86Register scratch, LirInstruction instruction)
             {
                 switch (address.Kind)
@@ -4511,7 +4733,10 @@ namespace Cnidaria.C
                         MaterializeAddress(address.BaseAddress, scratch, instruction);
                         if (address.Index is not null)
                         {
-                            var indexScratch = scratch == Scratch1 ? Scratch0 : Scratch1;
+                            // The index needs a temporary of its own, and it cannot be the other of
+                            // Scratch0/Scratch1: a caller copying an aggregate holds the opposite address
+                            // in one of them while this one is being built
+                            var indexScratch = scratch != Scratch2 ? Scratch2 : Scratch1;
                             LoadOperandInto(address.Index, indexScratch, instruction, _wordSize);
                             if (address.Scale != 1)
                                 Emit(X86Instruction.Ternary(X86InstrKind.Imul, Reg(indexScratch, _wordSize), Reg(indexScratch, _wordSize), Imm(address.Scale)));
@@ -4536,6 +4761,21 @@ namespace Cnidaria.C
                     Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(destination, _wordSize), X86Operand.RipRelative(symbol, 0, _wordSize)));
                 else
                     Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(destination, _wordSize), X86Operand.SymbolOperand(symbol, _wordSize, X86ObjectRelocationKind.Absolute32)));
+            }
+
+            private X86Operand LoadComparisonLeft(LirOperand left, LirInstruction instruction, int size)
+            {
+                if (left.Kind == LirOperandKind.Register &&
+                    left.Register is not null &&
+                    RegisterSize(left.Type) == size &&
+                    GetRegisterReadOperand(left.Register, X86Register.Invalid, size) is
+                        { Kind: X86OperandKind.Register } inPlace)
+                {
+                    return inPlace;
+                }
+
+                LoadOperandInto(left, Scratch0, instruction, size);
+                return Reg(Scratch0, size);
             }
 
             private X86Operand LoadOperandForIntegerOperation(LirOperand operand, X86Register scratch, LirInstruction instruction, int size)
@@ -4660,6 +4900,13 @@ namespace Cnidaria.C
             {
                 if (source.Kind == X86OperandKind.Register && source.Register == destination && source.Size == size)
                     return;
+
+                if (source.Kind == X86OperandKind.Immediate && source.Immediate == 0 && size is 4 or 8)
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(destination, 4), Reg(destination, 4)));
+                    return;
+                }
+
                 Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(destination, size), source.WithSize(size)));
             }
 

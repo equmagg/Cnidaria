@@ -86,6 +86,12 @@ namespace Cnidaria.Cs
                 _method.EnsurePromotedStructFieldLocals();
                 BindSelectedFieldDescriptors();
 
+                foreach (var kv in _selectedByParentLclNum)
+                {
+                    if (kv.Value.WholeStructAccessCount != 0)
+                        kv.Value.Parent.HasPromotionSync = true;
+                }
+
                 var rewrittenBlocks = ImmutableArray.CreateBuilder<GenTreeBlock>(_method.Blocks.Length);
                 bool changed = false;
 
@@ -97,7 +103,7 @@ namespace Cnidaria.Cs
                     {
                         var statement = block.Statements[s];
                         int countBefore = statements.Count;
-                        RewriteStatement(statement, statements);
+                        AppendStatementWithMemorySync(statement, statements);
                         changed |= statements.Count != countBefore + 1 || !ReferenceEquals(statements[countBefore], statement);
                     }
 
@@ -162,14 +168,11 @@ namespace Cnidaria.Cs
             {
                 fields = ImmutableArray<RuntimeField>.Empty;
 
-                if (descriptor.AddressExposed || descriptor.MemoryAliased || descriptor.IsImplicitByRef || descriptor.Pinned || descriptor.IsRefLike)
+                if (descriptor.AddressExposed || descriptor.MemoryAliased || descriptor.IsImplicitByRef || descriptor.Pinned)
                     return false;
 
                 var type = descriptor.Type;
                 if (type is null || !type.IsValueType || type.Kind != RuntimeTypeKind.Struct)
-                    return false;
-
-                if (LclVarDsc.IsRefLikeStorageType(type))
                     return false;
 
                 if (type.SizeOf <= 0 || type.SizeOf > options.MaxPromotedStructSize)
@@ -205,9 +208,6 @@ namespace Cnidaria.Cs
                 var fieldType = field.FieldType;
                 var stackKind = StackKindForStorage(fieldType);
 
-                if (fieldType.Kind == RuntimeTypeKind.ByRef || stackKind is GenStackKind.ByRef)
-                    return false;
-
                 if (stackKind is GenStackKind.Void or GenStackKind.Unknown or GenStackKind.Value)
                     return false;
 
@@ -215,7 +215,7 @@ namespace Cnidaria.Cs
                     return false;
 
                 return MachineAbi.IsPhysicallyPromotableStorage(fieldType, stackKind) ||
-                       stackKind is GenStackKind.Ref or GenStackKind.Ptr or GenStackKind.NativeInt or GenStackKind.NativeUInt;
+                       stackKind is GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Ptr or GenStackKind.NativeInt or GenStackKind.NativeUInt;
             }
 
             private static bool HasNonOverlappingInstanceFields(RuntimeField[] fields)
@@ -259,7 +259,10 @@ namespace Cnidaria.Cs
                     if (!fieldAccess.Candidate.HasField(fieldAccess.Field))
                         fieldAccess.Candidate.Reject();
                     else if (node.Kind != GenTreeKind.StoreField || isStatementRoot)
+                    {
                         fieldAccess.Candidate.NotePromotableAccess();
+                        fieldAccess.Candidate.NoteAddressTemplate(node.Operands[fieldAccess.ReceiverOperandIndex]);
+                    }
                     if (node.Kind == GenTreeKind.StoreField && !isStatementRoot)
                         fieldAccess.Candidate.Reject();
 
@@ -295,7 +298,9 @@ namespace Cnidaria.Cs
                     }
                     else
                     {
-                        loadCandidate.Reject();
+                        // Reading the struct as a whole is served from its memory, kept current by a
+                        // write-back of the promoted fields in front of the statement.
+                        loadCandidate.NoteWholeStructAccess();
                     }
                 }
 
@@ -306,6 +311,10 @@ namespace Cnidaria.Cs
                         storeCandidate.NotePromotableAccess();
                         if (sourceCandidate is not null)
                             storeCandidate.NoteCopyDependency(sourceCandidate);
+                    }
+                    else if (isStatementRoot)
+                    {
+                        storeCandidate.NoteWholeStructAccess();
                     }
                     else
                     {
@@ -417,9 +426,49 @@ namespace Cnidaria.Cs
                 foreach (var kv in _candidatesByParentLclNum)
                 {
                     var candidate = kv.Value;
-                    if (!candidate.Rejected && candidate.HasPromotableAccess)
-                        _selectedByParentLclNum.Add(kv.Key, candidate);
+                    if (candidate.Rejected || !candidate.HasPromotableAccess)
+                        continue;
+
+                    // Every whole-struct access costs a write-back or read-back of the whole field set,
+                    // so promoting only pays off while field accesses outnumber them.
+                    if (candidate.WholeStructAccessCount != 0 &&
+                        candidate.FieldAccessCount <= candidate.WholeStructAccessCount * candidate.Fields.Length)
+                    {
+                        continue;
+                    }
+
+                    if (candidate.WholeStructAccessCount != 0 && candidate.AddressTemplate is null)
+                        continue;
+
+                    _selectedByParentLclNum.Add(kv.Key, candidate);
                 }
+
+                // A whole-struct copy is rewritten field by field only when both
+                // endpoints are selected. Profitability can exclude a dependency
+                // that survived access analysis, so close the selected set again.
+                // Otherwise the copy updates the parent home while later reads
+                // use promoted fields that were never initialized.
+                bool changed;
+                do
+                {
+                    changed = false;
+                    foreach (var kv in _candidatesByParentLclNum)
+                    {
+                        if (!_selectedByParentLclNum.ContainsKey(kv.Key))
+                            continue;
+
+                        foreach (int dependency in kv.Value.CopyDependencyParentLclNums)
+                        {
+                            if (!_selectedByParentLclNum.ContainsKey(dependency))
+                            {
+                                _selectedByParentLclNum.Remove(kv.Key);
+                                changed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                while (changed);
             }
 
             private void RejectUnselectedCandidates()
@@ -449,6 +498,137 @@ namespace Cnidaria.Cs
                         candidate.SetFieldDescriptor(field, fieldDescriptor);
                     }
                 }
+            }
+
+            /// <summary>
+            /// Memory stays the source of truth for the struct as a whole: promoted fields are written back
+            /// in front of a statement that reads it and read back after a statement that overwrites it.
+            /// </summary>
+            private void AppendStatementWithMemorySync(GenTree statement, ImmutableArray<GenTree>.Builder statements)
+            {
+                if (IsRewrittenFieldWise(statement))
+                {
+                    RewriteStatement(statement, statements);
+                    return;
+                }
+
+                List<PromotionCandidate>? writeBack = null;
+                List<PromotionCandidate>? readBack = null;
+
+                if (TryGetSelectedDirectStore(statement, out var destination) && destination.WholeStructAccessCount != 0)
+                    (readBack ??= new List<PromotionCandidate>()).Add(destination);
+
+                CollectWholeStructReads(statement, isStatementRoot: true, ref writeBack);
+
+                if (writeBack is not null)
+                {
+                    for (int i = 0; i < writeBack.Count; i++)
+                        AppendFieldWriteBack(statement, writeBack[i], statements);
+                }
+
+                RewriteStatement(statement, statements);
+
+                if (readBack is not null)
+                {
+                    for (int i = 0; i < readBack.Count; i++)
+                        AppendFieldReadBack(statement, readBack[i], statements);
+                }
+            }
+
+            private bool IsRewrittenFieldWise(GenTree statement)
+            {
+                if (!TryGetSelectedDirectStore(statement, out var destination) || statement.Operands.Length != 1)
+                    return false;
+
+                if (IsDefaultValueForParent(statement.Operands[0], destination.Parent))
+                    return true;
+
+                return TryGetSelectedDirectLoad(statement.Operands[0], out var source) &&
+                       ReferenceEquals(source.Parent.Type, destination.Parent.Type) &&
+                       FieldsMatch(source, destination);
+            }
+
+            private void CollectWholeStructReads(GenTree node, bool isStatementRoot, ref List<PromotionCandidate>? reads)
+            {
+                if (!isStatementRoot && TryGetSelectedDirectLoad(node, out var candidate) && candidate.WholeStructAccessCount != 0)
+                {
+                    reads ??= new List<PromotionCandidate>();
+                    if (!reads.Contains(candidate))
+                        reads.Add(candidate);
+                }
+
+                for (int i = 0; i < node.Operands.Length; i++)
+                    CollectWholeStructReads(node.Operands[i], isStatementRoot: false, ref reads);
+            }
+
+            private void AppendFieldWriteBack(GenTree template, PromotionCandidate candidate, ImmutableArray<GenTree>.Builder statements)
+            {
+                for (int i = 0; i < candidate.Fields.Length; i++)
+                {
+                    var field = candidate.Fields[i];
+                    var value = CreateLocalLikeLoad(template, candidate.GetFieldDescriptor(field), template.SourceOp);
+                    statements.Add(CreateSyncFieldStore(template, candidate, field, value));
+                }
+            }
+
+            private void AppendFieldReadBack(GenTree template, PromotionCandidate candidate, ImmutableArray<GenTree>.Builder statements)
+            {
+                for (int i = 0; i < candidate.Fields.Length; i++)
+                {
+                    var field = candidate.Fields[i];
+                    var load = CreateSyncFieldLoad(template, candidate, field);
+                    statements.Add(CreateLocalLikeStore(template, candidate.GetFieldDescriptor(field), load, template.SourceOp));
+                }
+            }
+
+            private GenTree CreateParentAddress(GenTree template, PromotionCandidate candidate)
+            {
+                var address = candidate.AddressTemplate
+                    ?? throw new InvalidOperationException("Physical promotion has no parent address template for " + candidate.Parent.LclNum + ".");
+
+                var node = new GenTree(
+                    _nextTreeId++,
+                    address.Kind,
+                    template.Pc,
+                    address.SourceOp,
+                    address.Type,
+                    address.StackKind,
+                    address.Flags,
+                    ImmutableArray<GenTree>.Empty,
+                    int32: address.Int32,
+                    runtimeType: address.RuntimeType);
+                AttachDescriptor(node, candidate.Parent);
+                return node;
+            }
+
+            private GenTree CreateSyncFieldLoad(GenTree template, PromotionCandidate candidate, RuntimeField field)
+            {
+                return new GenTree(
+                    _nextTreeId++,
+                    GenTreeKind.Field,
+                    template.Pc,
+                    template.SourceOp,
+                    field.FieldType,
+                    StackKindForStorage(field.FieldType),
+                    GenTreeFlags.MemoryRead | GenTreeFlags.Ordered | GenTreeFlags.NullCheckEliminated | GenTreeFlags.PromotionSync,
+                    ImmutableArray.Create(CreateParentAddress(template, candidate)),
+                    field: field,
+                    runtimeType: field.FieldType);
+            }
+
+            private GenTree CreateSyncFieldStore(GenTree template, PromotionCandidate candidate, RuntimeField field, GenTree value)
+            {
+                return new GenTree(
+                    _nextTreeId++,
+                    GenTreeKind.StoreField,
+                    template.Pc,
+                    template.SourceOp,
+                    null,
+                    GenStackKind.Void,
+                    GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect | GenTreeFlags.Ordered | GenTreeFlags.NullCheckEliminated | GenTreeFlags.PromotionSync,
+                    ImmutableArray.Create(CreateParentAddress(template, candidate), value),
+                    field: field,
+                    runtimeType: field.FieldType);
             }
 
             private void RewriteStatement(GenTree statement, ImmutableArray<GenTree>.Builder statements)
@@ -820,6 +1000,12 @@ namespace Cnidaria.Cs
             public ImmutableArray<RuntimeField> Fields { get; }
             public bool Rejected { get; private set; }
             public bool HasPromotableAccess { get; private set; }
+            public int FieldAccessCount { get; private set; }
+            public int WholeStructAccessCount { get; private set; }
+
+            /// <summary>An address node of the parent, cloned when synthesising write-back and read-back.</summary>
+            public GenTree? AddressTemplate { get; private set; }
+
             public IEnumerable<int> CopyDependencyParentLclNums => _copyDependencyParentLclNums;
 
             private readonly HashSet<int> _copyDependencyParentLclNums = new HashSet<int>();
@@ -850,6 +1036,17 @@ namespace Cnidaria.Cs
             public void NotePromotableAccess()
             {
                 HasPromotableAccess = true;
+                FieldAccessCount++;
+            }
+
+            public void NoteWholeStructAccess()
+            {
+                WholeStructAccessCount++;
+            }
+
+            public void NoteAddressTemplate(GenTree address)
+            {
+                AddressTemplate ??= address;
             }
 
             public void NoteCopyDependency(PromotionCandidate candidate)

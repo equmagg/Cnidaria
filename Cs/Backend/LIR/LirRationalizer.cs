@@ -1499,6 +1499,7 @@ namespace Cnidaria.Cs
             private bool TryCreateContainedOperand(GenTree parent, int operandIndex, GenTree operand, out LirOperandFlags result)
             {
                 if (CanContainBinaryImmediate(parent, operandIndex, operand) ||
+                    CanContainPointerElementImmediate(parent, operandIndex, operand) ||
                     CanContainDefaultStoreValue(parent, operandIndex, operand))
                 {
                     operand.IsContainedInLinear = true;
@@ -1552,6 +1553,18 @@ namespace Cnidaria.Cs
                 }
 
                 return IsBinaryImmediateOp(parent.SourceOp);
+            }
+
+            private bool CanContainPointerElementImmediate(GenTree parent, int operandIndex, GenTree operand)
+            {
+                if ((!_target.IsX86 && !_target.IsRiscV) || parent.Kind != GenTreeKind.PointerElementAddr || operandIndex != 1)
+                    return false;
+
+                if (operand.Operands.Length != 0)
+                    return false;
+
+                return operand.Kind == GenTreeKind.ConstI4 ||
+                       (_target.Is64Bit && operand.Kind == GenTreeKind.ConstI8);
             }
 
             private static bool IsBinaryImmediateOp(BytecodeOp op)

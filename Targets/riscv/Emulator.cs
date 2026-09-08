@@ -2162,7 +2162,9 @@ namespace Cnidaria.RiscV
                 {
                     1 => _ram[(int)offset],
                     2 => (ulong)(_ram[(int)offset] | (_ram[(int)offset + 1] << 8)),
-                    4 => (ulong)(_ram[(int)offset] | (_ram[(int)offset + 1] << 8) | (_ram[(int)offset + 2] << 16) | (_ram[(int)offset + 3] << 24)),
+                    // The byte shifts promote to int, so the top byte lands on the sign bit: truncate
+                    // through uint before widening, otherwise an unsigned word load comes back sign-extended
+                    4 => (ulong)(uint)(_ram[(int)offset] | (_ram[(int)offset + 1] << 8) | (_ram[(int)offset + 2] << 16) | (_ram[(int)offset + 3] << 24)),
                     _ => (ulong)_ram[(int)offset] | ((ulong)_ram[(int)offset + 1] << 8) | ((ulong)_ram[(int)offset + 2] << 16) | ((ulong)_ram[(int)offset + 3] << 24) | ((ulong)_ram[(int)offset + 4] << 32) | ((ulong)_ram[(int)offset + 5] << 40) | ((ulong)_ram[(int)offset + 6] << 48) | ((ulong)_ram[(int)offset + 7] << 56),
                 };
                 return true;

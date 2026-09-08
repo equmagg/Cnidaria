@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Globalization;
@@ -1937,21 +1937,23 @@ namespace Cnidaria.C
 
                 try
                 {
+                    // Parsed as unsigned: a literal above long.MaxValue is still valid while it
+                    // fits unsigned long long, and the bit pattern is what callers need
                     if (trimmed.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
                     {
                         if (trimmed.Length == 2)
                             return false;
-                        value = Convert.ToInt64(trimmed[2..], 16);
+                        value = unchecked((long)Convert.ToUInt64(trimmed[2..], 16));
                         return true;
                     }
 
                     if (trimmed.Length > 1 && trimmed[0] == '0')
                     {
-                        value = Convert.ToInt64(trimmed[1..], 8);
+                        value = unchecked((long)Convert.ToUInt64(trimmed[1..], 8));
                         return true;
                     }
 
-                    value = Convert.ToInt64(trimmed, 10);
+                    value = unchecked((long)Convert.ToUInt64(trimmed, 10));
                     return true;
                 }
                 catch

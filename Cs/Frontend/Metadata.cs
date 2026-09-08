@@ -2192,6 +2192,9 @@ namespace Cnidaria.Cs
                 typeFlags |= (int)System.Reflection.TypeAttributes.Sealed;
             }
 
+            if (type.IsRefLikeType)
+                typeFlags |= MetadataFlagBits.TypeByRefLike;
+
             bool hasExplicitStaticConstructor = false;
             for (int i = 0; i < members.Length; i++)
             {

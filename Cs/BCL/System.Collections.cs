@@ -826,7 +826,12 @@ namespace System.Collections.Generic
     }
     public abstract class EqualityComparer<T> : IEqualityComparer, IEqualityComparer<T>
     {
-        public static EqualityComparer<T> Default { get; } = null;
+        public static EqualityComparer<T> Default { get; } = CreateDefaultEqualityComparer();
+
+        private static EqualityComparer<T> CreateDefaultEqualityComparer()
+        {
+            return new ObjectEqualityComparer<T>();
+        }
 
         public static EqualityComparer<T> Create(Func<T?, T?, bool> equals, Func<T, int>? getHashCode = null)
         {

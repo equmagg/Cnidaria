@@ -201,6 +201,9 @@ namespace Cnidaria.Cs
         public const ushort Extern = 0x8000;
         public const ushort Extension = 0x8000;
         public const int CustomAttribute = 0x0C000000;
+
+        /// <summary>ref struct; outside the range System.Reflection.TypeAttributes uses.</summary>
+        public const int TypeByRefLike = 0x4000_0000;
     }
     /// <summary>Reads method behavior encoded by recognized attributes</summary>
     internal static class MethodAttributeFacts

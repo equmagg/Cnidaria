@@ -1769,7 +1769,8 @@ namespace Cnidaria.Cs
                     {
                         IsBeforeFieldInit = (typeAttributes & System.Reflection.TypeAttributes.BeforeFieldInit) != 0,
                         IsFinal = kind is RuntimeTypeKind.Struct or RuntimeTypeKind.Enum ||
-                            (typeAttributes & System.Reflection.TypeAttributes.Sealed) != 0
+                            (typeAttributes & System.Reflection.TypeAttributes.Sealed) != 0,
+                        IsByRefLike = (td.Flags & MetadataFlagBits.TypeByRefLike) != 0
                     };
                     _typeCache[(m.Name, tok)] = rt;
                     _namedTypes[(m.Name, ns, name)] = rt;
@@ -1784,6 +1785,21 @@ namespace Cnidaria.Cs
                 throw new ArgumentNullException(nameof(type));
 
             EnsureLayout(type);
+        }
+
+        // Constructed generic, array, pointer and by-ref types are interned lazily while the IR is
+        // imported. The backend reads sizes and field offsets directly, so every interned type has
+        // to carry a computed layout once importing is done.
+        internal void EnsureAllTypesReady()
+        {
+            int previousCount = -1;
+            while (_typeById.Count != previousCount)
+            {
+                previousCount = _typeById.Count;
+                var snapshot = new List<RuntimeType>(_typeById.Values);
+                for (int i = 0; i < snapshot.Count; i++)
+                    EnsureLayout(snapshot[i]);
+            }
         }
         private void EnsureLayout(RuntimeType? t)
         {
@@ -1843,6 +1859,9 @@ namespace Cnidaria.Cs
                         t.AlignOf = Target.PointerSize;
                         t.ContainsGcPointers = true;
                         t.GcPointerOffsets = new[] { 0 };
+
+                        if (t.Kind == RuntimeTypeKind.Array)
+                            EnsureLayout(t.ElementType);
 
                         EnsureLayout(t.BaseType);
 
@@ -2725,22 +2744,28 @@ namespace Cnidaria.Cs
                     return field;
                 }
 
-                if (!ReferenceEquals(field.DeclaringType, ctxOwner.GenericTypeDefinition))
+                // A field declared by a nested type of the context owner still shares the enclosing
+                // type parameters, so its declaring type has to be instantiated with the same arguments.
+                RuntimeType constructedOwner = ReferenceEquals(field.DeclaringType, ctxOwner.GenericTypeDefinition)
+                    ? ctxOwner
+                    : SubstituteRuntimeType(field.DeclaringType, ownerTypeArgs, methodTypeArgs);
+
+                if (ReferenceEquals(constructedOwner, field.DeclaringType))
                 {
                     _fieldInMethodContextCache[key] = field;
                     return field;
                 }
 
-                EnsureConstructedMembers(ctxOwner);
-                EnsureLayout(ctxOwner);
+                EnsureConstructedMembers(constructedOwner);
+                EnsureLayout(constructedOwner);
 
                 var defFields = field.IsStatic
-                    ? ctxOwner.GenericTypeDefinition.StaticFields
-                    : ctxOwner.GenericTypeDefinition.InstanceFields;
+                    ? field.DeclaringType.StaticFields
+                    : field.DeclaringType.InstanceFields;
 
                 var actualFields = field.IsStatic
-                    ? ctxOwner.StaticFields
-                    : ctxOwner.InstanceFields;
+                    ? constructedOwner.StaticFields
+                    : constructedOwner.InstanceFields;
 
                 for (int i = 0; i < defFields.Length && i < actualFields.Length; i++)
                 {
@@ -3797,6 +3822,7 @@ namespace Cnidaria.Cs
             t.GenericTypeArguments = args;
             t.IsBeforeFieldInit = genericDef.IsBeforeFieldInit;
             t.IsFinal = genericDef.IsFinal;
+            t.IsByRefLike = genericDef.IsByRefLike;
 
             _constructedTypes[key] = t;
             _typeById[t.TypeId] = t;
@@ -3930,6 +3956,7 @@ namespace Cnidaria.Cs
                 methodContext.DeclaringType.GenericTypeArguments,
                 methodContext.MethodGenericArguments);
 
+            EnsureLayout(result);
             _typeInMethodContextCache[key] = result;
             return result;
         }
@@ -4176,6 +4203,7 @@ namespace Cnidaria.Cs
         public RuntimePrimitiveKind PrimitiveKind { get; internal set; }
         public bool IsBeforeFieldInit { get; internal set; }
         public bool IsFinal { get; internal set; }
+        public bool IsByRefLike { get; internal set; }
 
         public bool IsValueType => Kind is RuntimeTypeKind.Struct or RuntimeTypeKind.Enum or RuntimeTypeKind.FunctionPointer;
         public bool IsReferenceType => !IsValueType && Kind is not (RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.FunctionPointer);

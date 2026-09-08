@@ -106,6 +106,7 @@ namespace Cnidaria.Cs
             private readonly Dictionary<int, SpillSpec> _spillSpecs = new();
             private readonly Dictionary<int, OutgoingArgumentSpec> _outgoingArgumentSpecs = new();
             private readonly Dictionary<int, StackFrameSlot> _spillSlots = new();
+            private readonly HashSet<int> _explicitArgumentSlots = new();
             private readonly HashSet<int> _explicitLocalSlots = new();
             private readonly HashSet<int> _explicitTempSlots = new();
             private StackFrameLayout _layout = StackFrameLayout.Empty;
@@ -287,6 +288,17 @@ namespace Cnidaria.Cs
                     case GenTreeKind.TempAddr:
                         if (ContainsDescriptorIndex(_method.GenTreeMethod.TempDescriptors, GenLocalKind.Temporary, node.Int32))
                             _explicitTempSlots.Add(node.Int32);
+                        return;
+
+                    case GenTreeKind.Arg:
+                    case GenTreeKind.StoreArg:
+                    case GenTreeKind.ArgAddr:
+                        if (node.Int32 >= _method.GenTreeMethod.ArgTypes.Length &&
+                            ContainsDescriptorIndex(_method.GenTreeMethod.ArgDescriptors, GenLocalKind.Argument, node.Int32) &&
+                            (node.Kind == GenTreeKind.ArgAddr || SurvivingLocalLikeNodeRequiresHome(node)))
+                        {
+                            _explicitArgumentSlots.Add(node.Int32);
+                        }
                         return;
                 }
             }
@@ -472,6 +484,15 @@ namespace Cnidaria.Cs
                 bool saveReturnAddress = RegisterInfo.ReturnAddress(Target) != MachineRegister.Invalid &&
                     (_options.SaveReturnAddressForLeafMethods || (_options.SaveReturnAddressForNonLeafMethods && MethodMayCall()));
 
+                // The outgoing argument area has to sit at the bottom of the frame: the stack pointer
+                // points at it when the call executes, which is where the callee reads its stack
+                // arguments from.
+                int outgoingOffset = cursor;
+                var outgoingSlots = ImmutableArray.CreateBuilder<StackFrameSlot>();
+                AllocateOutgoingArgumentSlots(outgoingSlots, ref cursor);
+                int outgoingSize = cursor - outgoingOffset;
+
+                cursor = AlignUp(cursor, frameAlignment);
                 var calleeSaved = ImmutableArray.CreateBuilder<StackFrameSlot>();
                 int calleeSaveOffset = cursor;
                 if (saveReturnAddress || _options.SaveUsedCalleeSavedRegisters || usesFramePointer)
@@ -503,12 +524,6 @@ namespace Cnidaria.Cs
                 var spillSlots = ImmutableArray.CreateBuilder<StackFrameSlot>();
                 AllocateSpillSlots(spillSlots, ref cursor);
                 int spillSize = cursor - spillOffset;
-
-                cursor = AlignUp(cursor, frameAlignment);
-                int outgoingOffset = cursor;
-                var outgoingSlots = ImmutableArray.CreateBuilder<StackFrameSlot>();
-                AllocateOutgoingArgumentSlots(outgoingSlots, ref cursor);
-                int outgoingSize = cursor - outgoingOffset;
 
                 int gcSpillOffset = cursor;
                 int gcRootSpillSlotCount = 0;
@@ -1136,6 +1151,26 @@ namespace Cnidaria.Cs
                     var storage = StorageForType(argTypes[i]);
                     cursor = AlignUp(cursor, storage.Alignment);
                     slots.Add(new StackFrameSlot(StackFrameSlotKind.Argument, i, cursor, storage.Size, storage.Alignment, RegisterClass.Invalid, argTypes[i]));
+                    cursor = checked(cursor + storage.Size);
+                }
+
+                // Promoted fields of a struct argument carry synthetic indices past the real argument list and
+                // are homed like locals: the prolog writes them from the parent's ABI location.
+                var argDescriptors = _method.GenTreeMethod.ArgDescriptors;
+                var allocated = new HashSet<int>();
+                for (int i = 0; i < argDescriptors.Length; i++)
+                {
+                    var descriptor = argDescriptors[i];
+                    if (descriptor.Kind != GenLocalKind.Argument || descriptor.Index < argTypes.Length)
+                        continue;
+                    if (!allocated.Add(descriptor.Index))
+                        continue;
+                    if (!RequiresDescriptorHome(descriptor, _explicitArgumentSlots))
+                        continue;
+
+                    var storage = StorageForDescriptor(descriptor);
+                    cursor = AlignUp(cursor, storage.Alignment);
+                    slots.Add(new StackFrameSlot(StackFrameSlotKind.Argument, descriptor.Index, cursor, storage.Size, storage.Alignment, RegisterClass.Invalid, descriptor.Type));
                     cursor = checked(cursor + storage.Size);
                 }
             }

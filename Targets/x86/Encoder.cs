@@ -139,6 +139,14 @@ namespace Cnidaria.X86
                 case X86InstrKind.Cmpxchg:
                     EncodeCmpxchg(instruction.Operand0, instruction.Operand1, target, writer, nextIp, symbols);
                     break;
+                case X86InstrKind.Xchg:
+                    EncodeXchg(instruction.Operand0, instruction.Operand1, target, writer, nextIp, symbols);
+                    break;
+                case X86InstrKind.Mfence:
+                    writer.WriteByte(0x0F);
+                    writer.WriteByte(0xAE);
+                    writer.WriteByte(0xF0);
+                    break;
                 case X86InstrKind.Xadd:
                     EncodeXadd(instruction.Operand0, instruction.Operand1, target, writer, nextIp, symbols);
                     break;
@@ -435,6 +443,22 @@ namespace Cnidaria.X86
             EmitRexForModRm(writer, target, size == 8, reg, destination, RequiresByteRex(source) || RequiresByteRex(destination));
             writer.WriteByte(0x0F);
             writer.WriteByte(size == 1 ? (byte)0xB0 : (byte)0xB1);
+            EmitModRm(writer, reg, destination, target, nextIp, symbols);
+        }
+
+        private static void EncodeXchg(X86Operand destination, X86Operand source, X86Target target, X86InstructionWriter writer, ulong nextIp, IReadOnlyDictionary<string, ulong>? symbols)
+        {
+            if (source.Kind != X86OperandKind.Register || destination.Kind is not (X86OperandKind.Register or X86OperandKind.Memory))
+                throw new NotSupportedException("xchg requires r/m, register operands");
+
+            int size = CommonSize(destination, source, target);
+            if (size is not (1 or 2 or 4 or 8) || (size == 8 && !target.Is64Bit))
+                throw new NotSupportedException($"unsupported xchg operand size {size}");
+
+            EmitSizePrefix(writer, size);
+            int reg = X86Registers.Index(source.Register);
+            EmitRexForModRm(writer, target, size == 8, reg, destination, RequiresByteRex(source) || RequiresByteRex(destination));
+            writer.WriteByte(size == 1 ? (byte)0x86 : (byte)0x87);
             EmitModRm(writer, reg, destination, target, nextIp, symbols);
         }
 

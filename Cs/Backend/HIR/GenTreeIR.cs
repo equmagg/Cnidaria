@@ -154,6 +154,8 @@ namespace Cnidaria.Cs
         DivModNoOverflow = 1u << 21,
         MakeCse = 1u << 22,
         ExplicitInit = 1u << 23,
+        /// <summary>Field access that addresses the parent struct's storage even though the parent is promoted.</summary>
+        PromotionSync = 1u << 24,
         AssertionProperties = NullCheckEliminated | BoundsCheckEliminated | DivModNoByZero | DivModNoOverflow,
     }
     internal static class GenTreeIntrinsicSemantics
@@ -277,7 +279,7 @@ namespace Cnidaria.Cs
         IsCompilerTemp = 1 << 4,
         IsImplicitByRef = 1 << 5,
         IsPinned = 1 << 6,
-        IsRefLike = 1 << 7,
+        HasPromotionSync = 1 << 7,
         MemoryAliased = 1 << 8,
         InSsa = 1 << 9,
         Tracked = 1 << 10,
@@ -445,7 +447,8 @@ namespace Cnidaria.Cs
         public bool IsCompilerTemp { get => (LocalFlags & GenLocalFlags.IsCompilerTemp) != 0; internal set => SetLocalFlag(GenLocalFlags.IsCompilerTemp, value); }
         public bool IsImplicitByRef { get => (LocalFlags & GenLocalFlags.IsImplicitByRef) != 0; internal set => SetLocalFlag(GenLocalFlags.IsImplicitByRef, value); }
         public bool Pinned { get => (LocalFlags & GenLocalFlags.IsPinned) != 0; internal set => SetLocalFlag(GenLocalFlags.IsPinned, value); }
-        public bool IsRefLike { get => (LocalFlags & GenLocalFlags.IsRefLike) != 0; internal set => SetLocalFlag(GenLocalFlags.IsRefLike, value); }
+        /// <summary>Physical promotion inserted explicit write-back/read-back, so a whole-struct access does not alias the field locals.</summary>
+        public bool HasPromotionSync { get => (LocalFlags & GenLocalFlags.HasPromotionSync) != 0; internal set => SetLocalFlag(GenLocalFlags.HasPromotionSync, value); }
         public bool IsStructField { get => (LocalFlags & GenLocalFlags.IsStructField) != 0; internal set => SetLocalFlag(GenLocalFlags.IsStructField, value); }
         public bool IsStructMaterializationTemp { get => (LocalFlags & GenLocalFlags.IsStructMaterializationTemp) != 0; internal set => SetLocalFlag(GenLocalFlags.IsStructMaterializationTemp, value); }
         public bool IsLocalStorageByRefAlias { get => (LocalFlags & GenLocalFlags.IsLocalStorageByRefAlias) != 0; internal set => SetLocalFlag(GenLocalFlags.IsLocalStorageByRefAlias, value); }
@@ -489,8 +492,8 @@ namespace Cnidaria.Cs
             SsaPromoted = false;
             LRACandidate = false;
             IsLocalStorageByRefAlias = false;
-            DoNotEnregister = promotedParent || AddressExposed || MemoryAliased || IsCompilerTemp || Pinned || IsRefLike;
-            if (promotedField && !AddressExposed && !MemoryAliased && !IsImplicitByRef && !Pinned && !IsRefLike)
+            DoNotEnregister = promotedParent || AddressExposed || MemoryAliased || IsCompilerTemp || Pinned;
+            if (promotedField && !AddressExposed && !MemoryAliased && !IsImplicitByRef && !Pinned)
                 DoNotEnregister = false;
             UseCount = 0;
             DefCount = 0;
@@ -507,6 +510,7 @@ namespace Cnidaria.Cs
             bool wasPromotedParent = Category == GenLocalCategory.PromotedStruct && HasPromotedStructFields;
             bool wasPromotedField = IsStructField && ParentLclNum >= 0 && PromotedField is not null;
             bool wasStructMaterializationTemp = IsStructMaterializationTemp;
+            bool hadPromotionSync = HasPromotionSync;
             int oldParentLclNum = ParentLclNum;
             int oldFieldOrdinal = FieldOrdinal;
             int oldFieldOffset = FieldOffset;
@@ -526,6 +530,9 @@ namespace Cnidaria.Cs
             if (wasStructMaterializationTemp)
                 IsStructMaterializationTemp = true;
 
+            if (hadPromotionSync)
+                HasPromotionSync = true;
+
             if (wasPromotedField)
             {
                 MarkPromotedStructField(
@@ -542,7 +549,7 @@ namespace Cnidaria.Cs
 
             if (Kind == GenLocalKind.Temporary && !wasPromotedField && !wasPromotedParent)
             {
-                if (wasStructMaterializationTemp && IsPromotableStructMaterializationType(Type) && !IsRefLikeStorageType(Type))
+                if (wasStructMaterializationTemp && IsPromotableStructMaterializationType(Type))
                 {
                     MarkPromotedStructParent();
                 }
@@ -561,10 +568,8 @@ namespace Cnidaria.Cs
             if (StackKind == GenStackKind.ByRef || Type?.Kind == RuntimeTypeKind.ByRef)
                 IsImplicitByRef = true;
 
-            if (IsKnownRefLike(Type))
-                IsRefLike = true;
-
-            if (Pinned || IsRefLike)
+            // A ref struct never lives on the heap, so only pinning forces its storage into memory.
+            if (Pinned)
             {
                 Category = GenLocalCategory.ImplicitByRefPinnedRefLikeLocal;
                 DoNotEnregister = true;
@@ -662,7 +667,7 @@ namespace Cnidaria.Cs
 
         internal void MarkRegularPromotedScalar(int denseVarIndex)
         {
-            if (HasMemoryAlias || Pinned || IsRefLike)
+            if (HasMemoryAlias || Pinned)
                 throw new InvalidOperationException($"Cannot mark memory-aliased local as an SSA scalar: {this}.");
 
             if (IsImplicitByRef && IsLocalStorageByRefAlias)
@@ -727,23 +732,6 @@ namespace Cnidaria.Cs
                    type.IsValueType &&
                    type.Kind == RuntimeTypeKind.Struct &&
                    type.InstanceFields.Length != 0;
-        }
-
-        internal static bool IsRefLikeStorageType(RuntimeType? type)
-        {
-            return type is not null &&
-                   (type.Kind == RuntimeTypeKind.ByRef || IsKnownRefLike(type));
-        }
-
-        private static bool IsKnownRefLike(RuntimeType? type)
-        {
-            if (type is null)
-                return false;
-
-            return type.Name == "Span`1" ||
-                   type.Name == "ReadOnlySpan`1" ||
-                   type.Name == "Span" ||
-                   type.Name == "ReadOnlySpan";
         }
 
         internal void ResetRegisterAllocationState()
@@ -1088,6 +1076,11 @@ namespace Cnidaria.Cs
         }
 
         public bool HasBoundsCheckIndexOverride => BoundsCheckIndexOverride >= 0;
+
+        /// <summary>Reports whether array covariance can still invalidate the access, which only a store or an element address on a reference element type can</summary>
+        public static bool RequiresArrayElementTypeCheck(GenTreeKind kind, RuntimeType? elementType)
+            => elementType is { IsReferenceType: true } &&
+               kind is GenTreeKind.ArrayElementAddr or GenTreeKind.StoreArrayElement;
 
         internal void SetBoundsCheckIndexOverride(int index)
         {
@@ -1793,10 +1786,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < args.Length; i++)
             {
                 var stackKind = StackKindForDescriptor(args[i]);
-                var category = IsRefLikeDescriptorType(args[i])
-                    ? GenLocalCategory.ImplicitByRefPinnedRefLikeLocal
-                    : GenLocalCategory.Unclassified;
-                builder.Add(new GenLocalDescriptor(i, GenLocalKind.Argument, i, args[i], stackKind, category));
+                builder.Add(new GenLocalDescriptor(i, GenLocalKind.Argument, i, args[i], stackKind, GenLocalCategory.Unclassified));
             }
             return builder.ToImmutable();
         }
@@ -1807,10 +1797,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < locals.Length; i++)
             {
                 var stackKind = StackKindForDescriptor(locals[i]);
-                var category = IsRefLikeDescriptorType(locals[i])
-                    ? GenLocalCategory.ImplicitByRefPinnedRefLikeLocal
-                    : GenLocalCategory.Unclassified;
-                builder.Add(new GenLocalDescriptor(lclNumBase + i, GenLocalKind.Local, i, locals[i], stackKind, category));
+                builder.Add(new GenLocalDescriptor(lclNumBase + i, GenLocalKind.Local, i, locals[i], stackKind, GenLocalCategory.Unclassified));
             }
             return builder.ToImmutable();
         }
@@ -1825,8 +1812,7 @@ namespace Cnidaria.Cs
                 bool isCommonSubexpression = temp.Kind == GenTempKind.CommonSubexpression;
                 bool canPromoteTemp = temp.Kind is GenTempKind.StructMaterialization or GenTempKind.InlineArg or GenTempKind.InlineLocal or GenTempKind.InlineReturn;
                 bool promoteParent = canPromoteTemp &&
-                    LclVarDsc.IsPromotableStructMaterializationType(temp.Type) &&
-                    !LclVarDsc.IsRefLikeStorageType(temp.Type);
+                    LclVarDsc.IsPromotableStructMaterializationType(temp.Type);
                 var category = promoteParent ? GenLocalCategory.PromotedStruct : GenLocalCategory.CompilerTemp;
                 var descriptor = new GenLocalDescriptor(lclNumBase + i, GenLocalKind.Temporary, temp.Index, temp.Type, temp.StackKind, category);
 
@@ -1865,17 +1851,6 @@ namespace Cnidaria.Cs
                     throw new InvalidOperationException("LclVarDsc table must be dense by lclNum.");
             }
             return builder.ToImmutable();
-        }
-
-        private static bool IsRefLikeDescriptorType(RuntimeType? type)
-        {
-            if (type is null)
-                return false;
-
-            return type.Name == "Span`1" ||
-                   type.Name == "ReadOnlySpan`1" ||
-                   type.Name == "Span" ||
-                   type.Name == "ReadOnlySpan";
         }
 
         private static GenStackKind StackKindForDescriptor(RuntimeType type)
@@ -1917,6 +1892,12 @@ namespace Cnidaria.Cs
             void PromoteFrom(ImmutableArray<GenLocalDescriptor>.Builder descriptors, GenLocalKind kind, ref int nextLclNum, ref bool changed)
             {
                 int originalCount = descriptors.Count;
+
+                // Indices are not dense (eliminated temps leave holes), so start past the highest one in use.
+                int nextIndex = 0;
+                for (int i = 0; i < originalCount; i++)
+                    nextIndex = Math.Max(nextIndex, descriptors[i].Index + 1);
+
                 for (int i = 0; i < originalCount; i++)
                 {
                     var parent = descriptors[i];
@@ -1924,7 +1905,7 @@ namespace Cnidaria.Cs
                         continue;
                     if (parent.AddressExposed || parent.MemoryAliased)
                         continue;
-                    if (parent.IsRefLike || parent.IsImplicitByRef)
+                    if (parent.IsImplicitByRef)
                         continue;
                     if (parent.HasPromotedStructFields)
                         continue;
@@ -1944,11 +1925,10 @@ namespace Cnidaria.Cs
                         if (!TryFindExistingPromotedFieldDescriptor(descriptors, parent, field, out var fieldDescriptor))
                         {
                             var stackKind = StackKindForDescriptor(field.FieldType);
-                            int fieldIndex = descriptors.Count;
                             fieldDescriptor = new GenLocalDescriptor(
                                 nextLclNum++,
                                 kind,
-                                fieldIndex,
+                                nextIndex++,
                                 field.FieldType,
                                 stackKind,
                                 GenLocalCategory.PromotedStructField);
@@ -2000,8 +1980,6 @@ namespace Cnidaria.Cs
             {
                 if (type is null || !type.IsValueType || type.Kind != RuntimeTypeKind.Struct)
                     return false;
-                if (LclVarDsc.IsRefLikeStorageType(type))
-                    return false;
                 if (type.InstanceFields.Length == 0)
                     return false;
                 return true;
@@ -2012,8 +1990,6 @@ namespace Cnidaria.Cs
                 if (field.IsStatic)
                     return false;
                 var stackKind = StackKindForDescriptor(field.FieldType);
-                if (field.FieldType.Kind == RuntimeTypeKind.ByRef || stackKind is GenStackKind.ByRef)
-                    return false;
                 if (stackKind is GenStackKind.Void or GenStackKind.Unknown or GenStackKind.Value)
                     return false;
                 if (field.FieldType.IsValueType && field.FieldType.ContainsGcPointers)

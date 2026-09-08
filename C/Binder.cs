@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Globalization;
@@ -2221,16 +2221,16 @@ namespace Cnidaria.C
             {
                 try
                 {
-                    long result = 0;
+                    ulong result = 0;
                     foreach (var ch in trimmed)
                     {
                         if (ch < '0' || ch > '7')
                             return false;
 
-                        result = checked(result * 8 + (ch - '0'));
+                        result = checked(result * 8 + (ulong)(ch - '0'));
                     }
 
-                    value = result;
+                    value = unchecked((long)result);
                     return true;
                 }
                 catch (OverflowException)
@@ -2241,6 +2241,13 @@ namespace Cnidaria.C
 
             if (long.TryParse(trimmed, numberStyles, CultureInfo.InvariantCulture, out value))
                 return true;
+
+            // A literal above long.MaxValue is still valid while it fits unsigned long long
+            if (ulong.TryParse(trimmed, numberStyles, CultureInfo.InvariantCulture, out var unsignedValue))
+            {
+                value = unchecked((long)unsignedValue);
+                return true;
+            }
 
             return false;
         }

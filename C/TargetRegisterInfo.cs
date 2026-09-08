@@ -12,6 +12,21 @@ namespace Cnidaria.C
         public static bool IsWindowsArm64(TargetInfo target)
             => target.Architecture == TargetArchitectureKind.Arm64 && target.OperatingSystem == OperatingSystemKind.Windows;
 
+        public static bool IsX86(TargetInfo target)
+            => target.Architecture is TargetArchitectureKind.X86_64 or TargetArchitectureKind.I386;
+
+        private static bool IsSystemVX64(TargetInfo target)
+            => target.Architecture == TargetArchitectureKind.X86_64 && !IsWindowsX64(target);
+
+        // rax, rdx and rcx are written by the fixed divide and variable shift sequences
+        public static MachineRegister X86AccumulatorRegister(TargetInfo target) => MachineRegister.X0;
+
+        public static MachineRegister X86DataRegister(TargetInfo target)
+            => IsSystemVX64(target) ? MachineRegister.X3 : MachineRegister.X2;
+
+        public static MachineRegister X86CounterRegister(TargetInfo target)
+            => IsSystemVX64(target) ? MachineRegister.X4 : MachineRegister.X1;
+
 
         public static bool TryParseExplicitRegister(TargetInfo target, string? text, LirRegisterClass registerClass, out MachineRegister register)
         {

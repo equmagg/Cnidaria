@@ -3799,15 +3799,16 @@ namespace Cnidaria.Cs
         }
         private int EnsureStaticStorage(RuntimeType t)
         {
-            if (_staticBaseByTypeId.TryGetValue(t.TypeId, out int abs))
+            if (_staticBaseByTypeId.TryGetValue(t.TypeId, out int abs) && abs != 0)
                 return abs;
+
+            // Static layout can still be pending when the type is first touched, so an empty
+            // result is never cached.
+            _rts.EnsureConstructedMembers(t);
 
             int size = t.StaticSize;
             if (size <= 0)
-            {
-                _staticBaseByTypeId[t.TypeId] = 0;
                 return 0;
-            }
 
             int align = Math.Max(8, t.StaticAlign);
             abs = AllocHeapBytes(size, align);
@@ -5519,7 +5520,20 @@ namespace Cnidaria.Cs
 
         private int CompareEqual(Slot a, Slot b)
         {
-            if (a.Kind == SlotKind.Null && b.Kind == SlotKind.Null) return 1;
+            if (a.Kind == SlotKind.Null || b.Kind == SlotKind.Null)
+            {
+                if (a.Kind == SlotKind.Null && b.Kind == SlotKind.Null) return 1;
+
+                // A null reference compares equal to a zero pointer or a zero native integer
+                var other = a.Kind == SlotKind.Null ? b : a;
+                return other.Kind switch
+                {
+                    SlotKind.I4 => other.AsI4Checked() == 0 ? 1 : 0,
+                    SlotKind.I8 => other.AsI8Checked() == 0 ? 1 : 0,
+                    SlotKind.Ptr or SlotKind.ByRef or SlotKind.Ref => other.Payload == 0 ? 1 : 0,
+                    _ => 0
+                };
+            }
             if (a.Kind != b.Kind) return 0;
 
             switch (a.Kind)
@@ -6639,6 +6653,33 @@ namespace Cnidaria.Cs
                             if (InterlockedSlotBits(original, compareExchange.Size) == InterlockedSlotBits(comparand, compareExchange.Size))
                                 StoreSlotAsValue(address, 0, compareExchange.ValueType, value);
                             PushSlot(original);
+                            return true;
+                        }
+                    case RuntimeIntrinsicId.InterlockedExchange:
+                        {
+                            InterlockedExchangeIntrinsic exchange = runtimeIntrinsic.Exchange;
+                            if (totalArgs != 2)
+                                throw new InvalidOperationException("Interlocked.Exchange requires exactly two arguments.");
+
+                            Slot value = PopSlot();
+                            Slot location = PopSlot();
+                            if (location.Kind == SlotKind.Null || location.Payload == 0)
+                                throw new NullReferenceException();
+                            if (location.Kind != SlotKind.ByRef)
+                                throw new InvalidOperationException($"Interlocked.Exchange location must be byref, got {location.Kind}.");
+
+                            int address = checked((int)location.Payload);
+                            Slot original = LoadValueAsSlot(address, 0, exchange.ValueType);
+                            StoreSlotAsValue(address, 0, exchange.ValueType, value);
+                            PushSlot(original);
+                            return true;
+                        }
+                    case RuntimeIntrinsicId.MemoryBarrier:
+                        {
+                            if (totalArgs != 0)
+                                throw new InvalidOperationException("Interlocked.MemoryBarrier does not take arguments.");
+
+                            // The stack VM runs one instruction at a time, so a barrier has nothing to order
                             return true;
                         }
                     case RuntimeIntrinsicId.InterlockedExchangeAdd:

@@ -6,6 +6,77 @@ using System.Linq;
 
 namespace Cnidaria.C
 {
+    public sealed class GimplePipelineOptions
+    {
+        public static GimplePipelineOptions Default { get; } = new GimplePipelineOptions();
+
+        public SsaOptions Ssa { get; }
+        public SsaOptimizationOptions Optimization { get; }
+        public ValueNumberingOptions ValueNumbering { get; }
+        public ScalarReplacementOptions ScalarReplacement { get; }
+        /// <summary>Gets how much of the GIMPLE invariant set the pipeline checks</summary>
+        public GimpleVerificationLevel Verification { get; }
+
+        public GimplePipelineOptions(
+            SsaOptions? ssa = null,
+            SsaOptimizationOptions? optimization = null,
+            ValueNumberingOptions? valueNumbering = null,
+            GimpleVerificationLevel verification = GimpleVerificationLevel.None,
+            ScalarReplacementOptions? scalarReplacement = null)
+        {
+            Ssa = ssa ?? SsaOptions.Default;
+            Optimization = optimization ?? SsaOptimizationOptions.Default;
+            ValueNumbering = valueNumbering ?? ValueNumberingOptions.Default;
+            Verification = verification;
+            ScalarReplacement = scalarReplacement ?? ScalarReplacementOptions.Default;
+        }
+    }
+
+    public static class GimplePipeline
+    {
+        public static GimplePipelineResult Run(SemanticModel semanticModel, GimplePipelineOptions? options = null)
+        {
+            if (semanticModel is null)
+                throw new ArgumentNullException(nameof(semanticModel));
+
+            return Run(semanticModel.GetGimpleTree(), options);
+        }
+
+        public static GimplePipelineResult Run(GimpleTree gimpleTree, GimplePipelineOptions? options = null)
+        {
+            if (gimpleTree is null)
+                throw new ArgumentNullException(nameof(gimpleTree));
+
+            var compilationOptions = gimpleTree.SemanticModel.Compilation.Options;
+            options ??= compilationOptions.Gimple;
+            var inlinedTree = Inliner.Inline(gimpleTree, compilationOptions.Inlining);
+            var replacedTree = options.Ssa.PromoteTemporaries
+                ? ScalarReplacement.Replace(inlinedTree, options.ScalarReplacement) : inlinedTree;
+            return RunCore(ControlFlowGraph.Build(replacedTree), options);
+        }
+
+        public static GimplePipelineResult Run(ControlFlowGraph controlFlowGraph, GimplePipelineOptions? options = null)
+        {
+            if (controlFlowGraph is null)
+                throw new ArgumentNullException(nameof(controlFlowGraph));
+
+            options ??= controlFlowGraph.SemanticModel.Compilation.Options.Gimple;
+            var replacedTree = options.Ssa.PromoteTemporaries
+                ? ScalarReplacement.Replace(controlFlowGraph.GimpleTree, options.ScalarReplacement) : controlFlowGraph.GimpleTree;
+            if (!ReferenceEquals(replacedTree, controlFlowGraph.GimpleTree))
+                controlFlowGraph = ControlFlowGraph.Build(replacedTree);
+            return RunCore(controlFlowGraph, options);
+        }
+
+        private static GimplePipelineResult RunCore(ControlFlowGraph controlFlowGraph, GimplePipelineOptions options)
+        {
+            return GimplePipelineResult.Build(controlFlowGraph, options.Ssa, options.ValueNumbering)
+                .Optimize(options.Optimization, options.ValueNumbering)
+                .Trim(controlFlowGraph.SemanticModel.Compilation.Options.Trimming)
+                .Verify(options.Verification);
+        }
+    }
+
     /// <summary>Identifies the concrete shape of a lowered node</summary>
     public enum GimpleNodeKind : ushort
     {
@@ -18,11 +89,10 @@ namespace Cnidaria.C
         Label,
 
         DeclarationStatement,
-        AssignmentStatement,
-        ZeroInitializeStatement,
-        ExpressionStatement,
+        AssignStatement,
+        CallStatement,
+        CondStatement,
         GotoStatement,
-        ConditionalGotoStatement,
         SwitchStatement,
         ReturnStatement,
         AsmStatement,
@@ -39,8 +109,10 @@ namespace Cnidaria.C
         IndirectExpression,
         ElementAccessExpression,
         MemberAccessExpression,
-        CallExpression,
         ErrorValue,
+
+        PhiStatement,
+        GimpleName,
     }
 
     /// <summary>Identifies the semantic conversion preserved by a lowered expression</summary>
@@ -129,19 +201,22 @@ namespace Cnidaria.C
         /// <summary>Gets basic blocks in emitted order</summary>
         public ImmutableArray<GimpleBasicBlock> Blocks { get; }
         public GimpleLabel EntryLabel { get; }
+        internal bool HasScalarReplacementApplied { get; }
 
         public GimpleFunctionDefinition(
             SyntaxNode? syntax,
             FunctionSymbol? symbol,
             ImmutableArray<GimpleTemporaryValue> temporaries,
             ImmutableArray<GimpleBasicBlock> blocks,
-            GimpleLabel entryLabel)
+            GimpleLabel entryLabel,
+            bool hasScalarReplacementApplied = false)
             : base(syntax)
         {
             Symbol = symbol;
             Temporaries = NormalizeTemporaries(temporaries);
             EntryLabel = entryLabel ?? throw new ArgumentNullException(nameof(entryLabel));
             Blocks = NormalizeBlocks(blocks, EntryLabel);
+            HasScalarReplacementApplied = hasScalarReplacementApplied;
         }
 
         private static ImmutableArray<GimpleTemporaryValue> NormalizeTemporaries(ImmutableArray<GimpleTemporaryValue> temporaries)
@@ -418,48 +493,191 @@ namespace Cnidaria.C
         }
     }
 
-    /// <summary>Stores a value into an assignable place</summary>
-    public sealed class GimpleAssignmentStatement : GimpleStatement
+    /// <summary>Computes one tree code over its operands and stores the result into a place</summary>
+    /// <remarks>
+    /// The subcode selects the operation and its right-hand side class fixes the operand count.
+    /// A single right-hand side carries a copy, a memory reference, an address, or an aggregate
+    /// constructor, while the unary, binary, and ternary classes carry computations whose operands
+    /// are restricted to GIMPLE values.
+    /// </remarks>
+    public sealed class GimpleAssignStatement : GimpleStatement
     {
-        public override GimpleNodeKind Kind => GimpleNodeKind.AssignmentStatement;
+        public override GimpleNodeKind Kind => GimpleNodeKind.AssignStatement;
 
-        public GimplePlace Target { get; }
-        public GimpleValue Value { get; }
+        public GimplePlace Lhs { get; }
+        public GimpleTreeCode Subcode { get; }
+        public GimpleRhsClass RhsClass { get; }
+        /// <summary>Gets the right-hand side operands in tree code order</summary>
+        public ImmutableArray<GimpleValue> Operands { get; }
 
-        public GimpleAssignmentStatement(GimplePlace target, GimpleValue value, SyntaxNode? syntax = null)
-            : base(syntax ?? target?.Syntax ?? value?.Syntax)
+        public GimpleValue? Op1 => Operands.Length > 0 ? Operands[0] : null;
+        public GimpleValue? Op2 => Operands.Length > 1 ? Operands[1] : null;
+        public GimpleValue? Op3 => Operands.Length > 2 ? Operands[2] : null;
+
+        /// <summary>Gets whether the statement only moves an operand without computing</summary>
+        public bool IsCopy => RhsClass == GimpleRhsClass.Single;
+
+        /// <summary>Gets whether the statement fills its target with a zero constructor</summary>
+        public bool IsConstructor => Subcode == GimpleTreeCode.Constructor;
+
+        public GimpleAssignStatement(
+            GimplePlace lhs,
+            GimpleTreeCode subcode,
+            ImmutableArray<GimpleValue> operands,
+            SyntaxNode? syntax = null)
+            : base(syntax ?? lhs?.Syntax)
         {
-            Target = target ?? throw new ArgumentNullException(nameof(target));
-            Value = value ?? throw new ArgumentNullException(nameof(value));
+            Lhs = lhs ?? throw new ArgumentNullException(nameof(lhs));
+            Subcode = subcode;
+            RhsClass = GimpleOperators.RhsClassOf(subcode);
+            Operands = NormalizeOperands(subcode, RhsClass, operands);
         }
+
+        /// <summary>Creates a copy, load, address, or reference assignment whose subcode follows its operand</summary>
+        public static GimpleAssignStatement Single(GimplePlace lhs, GimpleValue value, SyntaxNode? syntax = null)
+        {
+            if (value is null)
+                throw new ArgumentNullException(nameof(value));
+
+            return new GimpleAssignStatement(lhs, GimpleOperators.CodeOf(value), ImmutableArray.Create(value), syntax);
+        }
+
+        public static GimpleAssignStatement Unary(GimplePlace lhs, GimpleTreeCode subcode, GimpleValue operand, SyntaxNode? syntax = null)
+        {
+            if (operand is null)
+                throw new ArgumentNullException(nameof(operand));
+
+            return new GimpleAssignStatement(lhs, subcode, ImmutableArray.Create(operand), syntax);
+        }
+
+        public static GimpleAssignStatement Binary(
+            GimplePlace lhs,
+            GimpleTreeCode subcode,
+            GimpleValue left,
+            GimpleValue right,
+            SyntaxNode? syntax = null)
+        {
+            if (left is null)
+                throw new ArgumentNullException(nameof(left));
+            if (right is null)
+                throw new ArgumentNullException(nameof(right));
+
+            return new GimpleAssignStatement(lhs, subcode, ImmutableArray.Create(left, right), syntax);
+        }
+
+        public static GimpleAssignStatement Ternary(
+            GimplePlace lhs,
+            GimpleTreeCode subcode,
+            GimpleValue first,
+            GimpleValue second,
+            GimpleValue third,
+            SyntaxNode? syntax = null)
+            => new GimpleAssignStatement(lhs, subcode, ImmutableArray.Create(first, second, third), syntax);
+
+        /// <summary>Creates the empty constructor assignment that zero-initializes a place</summary>
+        public static GimpleAssignStatement Constructor(GimplePlace lhs, SyntaxNode? syntax = null)
+            => new GimpleAssignStatement(lhs, GimpleTreeCode.Constructor, ImmutableArray<GimpleValue>.Empty, syntax);
+
+        /// <summary>Creates a statement with the same subcode and a replaced operand list</summary>
+        public GimpleAssignStatement WithOperands(GimplePlace lhs, ImmutableArray<GimpleValue> operands)
+        {
+            var subcode = RhsClass == GimpleRhsClass.Single && operands.Length == 1
+                ? GimpleOperators.CodeOf(operands[0])
+                : Subcode;
+
+            return new GimpleAssignStatement(lhs, subcode, operands, Syntax);
+        }
+
+        private static ImmutableArray<GimpleValue> NormalizeOperands(
+            GimpleTreeCode subcode,
+            GimpleRhsClass rhsClass,
+            ImmutableArray<GimpleValue> operands)
+        {
+            var normalized = operands.IsDefault ? ImmutableArray<GimpleValue>.Empty : operands;
+            for (var i = 0; i < normalized.Length; i++)
+            {
+                if (normalized[i] is null)
+                    throw new ArgumentException("A GIMPLE assignment cannot contain a null operand.", nameof(operands));
+            }
+
+            if (rhsClass == GimpleRhsClass.Invalid)
+                throw new ArgumentException($"Tree code '{GimpleOperators.Name(subcode)}' cannot form a GIMPLE assignment.", nameof(subcode));
+
+            if (subcode == GimpleTreeCode.Constructor)
+                return ImmutableArray<GimpleValue>.Empty;
+
+            var expected = GimpleOperators.Arity(subcode);
+            if (normalized.Length != expected)
+            {
+                throw new ArgumentException(
+                    $"Tree code '{GimpleOperators.Name(subcode)}' expects {expected.ToString(CultureInfo.InvariantCulture)} operands.",
+                    nameof(operands));
+            }
+
+            return normalized;
+        }
+
+        public override string ToString()
+            => RhsClass == GimpleRhsClass.Single
+                ? $"{Lhs} = {Op1?.ToString() ?? GimpleOperators.Name(Subcode)}"
+                : $"{Lhs} = {GimpleOperators.Name(Subcode)}(...)";
     }
 
-    /// <summary>Zero-initializes an aggregate place</summary>
-    public sealed class GimpleZeroInitializeStatement : GimpleStatement
+    /// <summary>Invokes a callee with ordered arguments and optionally stores the result</summary>
+    /// <remarks>Calls never nest inside another statement so side effects stay explicitly sequenced</remarks>
+    public sealed class GimpleCallStatement : GimpleStatement
     {
-        public override GimpleNodeKind Kind => GimpleNodeKind.ZeroInitializeStatement;
+        public override GimpleNodeKind Kind => GimpleNodeKind.CallStatement;
 
-        public GimplePlace Target { get; }
+        /// <summary>Gets the destination of the call result or null when the result is discarded</summary>
+        public GimplePlace? Lhs { get; }
+        public GimpleValue Function { get; }
+        public ImmutableArray<GimpleValue> Arguments { get; }
+        /// <summary>Gets the resolved call signature when available</summary>
+        public FunctionType? FunctionType { get; }
+        /// <summary>Gets the type produced by the call</summary>
+        public QualifiedType Type { get; }
+        public bool IsTailCall { get; }
+        public bool IsNoReturn { get; }
 
-        public GimpleZeroInitializeStatement(GimplePlace target, SyntaxNode? syntax = null)
-            : base(syntax ?? target?.Syntax)
+        public GimpleCallStatement(
+            GimplePlace? lhs,
+            GimpleValue function,
+            ImmutableArray<GimpleValue> arguments,
+            FunctionType? functionType,
+            QualifiedType type,
+            SyntaxNode? syntax = null,
+            bool isTailCall = false,
+            bool isNoReturn = false)
+            : base(syntax ?? lhs?.Syntax ?? function?.Syntax)
         {
-            Target = target ?? throw new ArgumentNullException(nameof(target));
+            Lhs = lhs;
+            Function = function ?? throw new ArgumentNullException(nameof(function));
+            Arguments = NormalizeArguments(arguments);
+            FunctionType = functionType;
+            Type = GimpleTypeHelpers.Normalize(type);
+            IsTailCall = isTailCall;
+            IsNoReturn = isNoReturn;
         }
-    }
 
-    /// <summary>Evaluates a value only for its side effects</summary>
-    public sealed class GimpleExpressionStatement : GimpleStatement
-    {
-        public override GimpleNodeKind Kind => GimpleNodeKind.ExpressionStatement;
+        /// <summary>Creates a statement with the same signature and a replaced destination and operand list</summary>
+        public GimpleCallStatement WithOperands(GimplePlace? lhs, GimpleValue function, ImmutableArray<GimpleValue> arguments)
+            => new GimpleCallStatement(lhs, function, arguments, FunctionType, Type, Syntax, IsTailCall, IsNoReturn);
 
-        public GimpleValue Expression { get; }
-
-        public GimpleExpressionStatement(GimpleValue expression, SyntaxNode? syntax = null)
-            : base(syntax ?? expression?.Syntax)
+        private static ImmutableArray<GimpleValue> NormalizeArguments(ImmutableArray<GimpleValue> arguments)
         {
-            Expression = expression ?? throw new ArgumentNullException(nameof(expression));
+            var normalized = arguments.IsDefault ? ImmutableArray<GimpleValue>.Empty : arguments;
+            for (var i = 0; i < normalized.Length; i++)
+            {
+                if (normalized[i] is null)
+                    throw new ArgumentException("A GIMPLE call cannot contain a null argument.", nameof(arguments));
+            }
+
+            return normalized;
         }
+
+        public override string ToString()
+            => Lhs is null ? $"{Function}(...)" : $"{Lhs} = {Function}(...)";
     }
 
     /// <summary>Transfers control unconditionally to a label</summary>
@@ -477,27 +695,44 @@ namespace Cnidaria.C
         }
     }
 
-    /// <summary>Transfers control to one of two labels based on a value</summary>
-    public sealed class GimpleConditionalGotoStatement : GimpleStatement
+    /// <summary>Compares two operands and transfers control to one of two labels</summary>
+    /// <remarks>The comparison is part of the terminator so a branch never depends on a separate truth value</remarks>
+    public sealed class GimpleCondStatement : GimpleStatement
     {
-        public override GimpleNodeKind Kind => GimpleNodeKind.ConditionalGotoStatement;
+        public override GimpleNodeKind Kind => GimpleNodeKind.CondStatement;
         public override bool IsTerminator => true;
 
-        public GimpleValue Condition { get; }
+        public GimpleTreeCode Code { get; }
+        public GimpleValue Lhs { get; }
+        public GimpleValue Rhs { get; }
         public GimpleLabel WhenTrue { get; }
         public GimpleLabel WhenFalse { get; }
 
-        public GimpleConditionalGotoStatement(
-            GimpleValue condition,
+        public GimpleCondStatement(
+            GimpleTreeCode code,
+            GimpleValue lhs,
+            GimpleValue rhs,
             GimpleLabel whenTrue,
             GimpleLabel whenFalse,
             SyntaxNode? syntax = null)
-            : base(syntax ?? condition?.Syntax)
+            : base(syntax ?? lhs?.Syntax)
         {
-            Condition = condition ?? throw new ArgumentNullException(nameof(condition));
+            if (!GimpleOperators.IsComparison(code))
+                throw new ArgumentException($"Tree code '{GimpleOperators.Name(code)}' cannot terminate a GIMPLE block.", nameof(code));
+
+            Code = code;
+            Lhs = lhs ?? throw new ArgumentNullException(nameof(lhs));
+            Rhs = rhs ?? throw new ArgumentNullException(nameof(rhs));
             WhenTrue = whenTrue ?? throw new ArgumentNullException(nameof(whenTrue));
             WhenFalse = whenFalse ?? throw new ArgumentNullException(nameof(whenFalse));
         }
+
+        /// <summary>Creates a statement with the same targets and replaced comparison operands</summary>
+        public GimpleCondStatement WithOperands(GimpleTreeCode code, GimpleValue lhs, GimpleValue rhs)
+            => new GimpleCondStatement(code, lhs, rhs, WhenTrue, WhenFalse, Syntax);
+
+        public override string ToString()
+            => $"if ({Lhs} {GimpleOperators.Spelling(Code)} {Rhs}) goto {WhenTrue}; else goto {WhenFalse};";
     }
 
     /// <summary>Dispatches an integral value to case or default labels</summary>
@@ -729,38 +964,46 @@ namespace Cnidaria.C
         public override string ToString() => Value?.ToString() ?? "null";
     }
 
-    /// <summary>Applies a unary operator to one lowered operand</summary>
+    /// <summary>Applies a unary tree code to one operand inside a constant expression</summary>
+    /// <remarks>Gimplified code carries unary operations as assignment subcodes instead</remarks>
     public sealed class GimpleUnaryExpression : GimpleValue
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.UnaryExpression;
 
-        public SyntaxToken OperatorToken { get; }
+        public GimpleTreeCode Code { get; }
         public GimpleValue Operand { get; }
 
-        public GimpleUnaryExpression(SyntaxToken operatorToken, GimpleValue operand, QualifiedType type, SyntaxNode? syntax = null)
+        public GimpleUnaryExpression(GimpleTreeCode code, GimpleValue operand, QualifiedType type, SyntaxNode? syntax = null)
             : base(syntax ?? operand?.Syntax, type)
         {
-            OperatorToken = operatorToken;
+            Code = code;
             Operand = operand ?? throw new ArgumentNullException(nameof(operand));
         }
+
+        public override string ToString()
+            => $"{GimpleOperators.Spelling(Code)}{Operand}";
     }
 
-    /// <summary>Applies a binary operator to two lowered operands</summary>
+    /// <summary>Applies a binary tree code to two operands inside a constant expression</summary>
+    /// <remarks>Gimplified code carries binary operations as assignment subcodes instead</remarks>
     public sealed class GimpleBinaryExpression : GimpleValue
     {
         public override GimpleNodeKind Kind => GimpleNodeKind.BinaryExpression;
 
         public GimpleValue Left { get; }
-        public SyntaxToken OperatorToken { get; }
+        public GimpleTreeCode Code { get; }
         public GimpleValue Right { get; }
 
-        public GimpleBinaryExpression(GimpleValue left, SyntaxToken operatorToken, GimpleValue right, QualifiedType type, SyntaxNode? syntax = null)
+        public GimpleBinaryExpression(GimpleValue left, GimpleTreeCode code, GimpleValue right, QualifiedType type, SyntaxNode? syntax = null)
             : base(syntax ?? left?.Syntax ?? right?.Syntax, type)
         {
             Left = left ?? throw new ArgumentNullException(nameof(left));
-            OperatorToken = operatorToken;
+            Code = code;
             Right = right ?? throw new ArgumentNullException(nameof(right));
         }
+
+        public override string ToString()
+            => $"{Left} {GimpleOperators.Spelling(Code)} {Right}";
     }
 
     /// <summary>Preserves a semantic conversion around a lowered operand</summary>
@@ -770,12 +1013,21 @@ namespace Cnidaria.C
 
         public GimpleValue Operand { get; }
         public GimpleConversionKind ConversionKind { get; }
+        /// <summary>Gets the tree code the conversion lowers to</summary>
+        public GimpleTreeCode Code { get; }
 
         public GimpleConversionExpression(GimpleValue operand, QualifiedType type, GimpleConversionKind conversionKind, SyntaxNode? syntax = null)
             : base(syntax ?? operand?.Syntax, type)
         {
             Operand = operand ?? throw new ArgumentNullException(nameof(operand));
             ConversionKind = conversionKind;
+            Code = conversionKind switch
+            {
+                GimpleConversionKind.ArrayToPointer or GimpleConversionKind.FunctionToPointer => GimpleTreeCode.AddrExpr,
+                GimpleConversionKind.Identity or GimpleConversionKind.LValueToRValue => GimpleTreeCode.NopExpr,
+                GimpleConversionKind.Error => GimpleTreeCode.ErrorMark,
+                _ => GimpleOperators.ConversionCode(Operand.Type, Type),
+            };
         }
     }
 
@@ -844,14 +1096,16 @@ namespace Cnidaria.C
         public override GimpleNodeKind Kind => GimpleNodeKind.MemberAccessExpression;
 
         public GimpleValue Expression { get; }
-        public SyntaxToken OperatorToken { get; }
+        /// <summary>Gets whether the base operand is a pointer rather than an aggregate place</summary>
+        public bool ThroughPointer { get; }
         public SyntaxToken NameToken { get; }
         /// <summary>Gets the resolved field or null when binding failed</summary>
         public FieldSymbol? Field { get; }
+        public string Name => Field?.Name ?? NameToken.Text ?? string.Empty;
 
         public GimpleMemberAccessExpression(
             GimpleValue expression,
-            SyntaxToken operatorToken,
+            bool throughPointer,
             SyntaxToken nameToken,
             FieldSymbol? field,
             QualifiedType type,
@@ -859,46 +1113,13 @@ namespace Cnidaria.C
             : base(syntax ?? expression?.Syntax, type)
         {
             Expression = expression ?? throw new ArgumentNullException(nameof(expression));
-            OperatorToken = operatorToken;
+            ThroughPointer = throughPointer;
             NameToken = nameToken;
             Field = field;
         }
-    }
 
-    /// <summary>Invokes a lowered callee with ordered argument values</summary>
-    public sealed class GimpleCallExpression : GimpleValue
-    {
-        public override GimpleNodeKind Kind => GimpleNodeKind.CallExpression;
-
-        public GimpleValue Callee { get; }
-        public ImmutableArray<GimpleValue> Arguments { get; }
-        /// <summary>Gets the resolved call signature when available</summary>
-        public FunctionType? FunctionType { get; }
-
-        public GimpleCallExpression(
-            GimpleValue callee,
-            ImmutableArray<GimpleValue> arguments,
-            FunctionType? functionType,
-            QualifiedType type,
-            SyntaxNode? syntax = null)
-            : base(syntax ?? callee?.Syntax, type)
-        {
-            Callee = callee ?? throw new ArgumentNullException(nameof(callee));
-            Arguments = NormalizeArguments(arguments);
-            FunctionType = functionType;
-        }
-
-        private static ImmutableArray<GimpleValue> NormalizeArguments(ImmutableArray<GimpleValue> arguments)
-        {
-            var normalized = arguments.IsDefault ? ImmutableArray<GimpleValue>.Empty : arguments;
-            for (var i = 0; i < normalized.Length; i++)
-            {
-                if (normalized[i] is null)
-                    throw new ArgumentException("A GIMPLE call cannot contain a null argument.", nameof(arguments));
-            }
-
-            return normalized;
-        }
+        public override string ToString()
+            => ThroughPointer ? $"{Expression}->{Name}" : $"{Expression}.{Name}";
     }
 
     /// <summary>Represents an invalid value while preserving source and type shape</summary>
@@ -914,4 +1135,55 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>Answers the operand-shape questions the GIMPLE invariants are stated in terms of</summary>
+    public static class GimpleOperandRules
+    {
+        /// <summary>Gets whether a value is a renamed register or a compile-time invariant</summary>
+        /// <remarks>This is the operand shape a computation may consume once renaming has run</remarks>
+        public static bool IsValue(GimpleValue value)
+            => value is GimpleName or GimpleConstantValue or GimpleErrorValue ||
+               (value is GimpleAddressOfExpression address && IsInvariantAddress(address));
+
+        /// <summary>Gets whether a value is a register operand before renaming has run</summary>
+        /// <remarks>Declarations still stand for registers until promotion decides otherwise</remarks>
+        public static bool IsRegisterOperand(GimpleValue value)
+            => IsValue(value) || value is GimpleSymbolValue or GimpleTemporaryValue;
+
+        /// <summary>Gets whether a value denotes storage that can appear as an assignment target</summary>
+        public static bool IsPlace(GimpleValue value)
+            => value is GimplePlace;
+
+        /// <summary>Gets whether a value is a memory reference tree rather than a register operand</summary>
+        public static bool IsMemoryReference(GimpleValue value)
+            => value is GimpleIndirectExpression or GimpleElementAccessExpression or GimpleMemberAccessExpression;
+
+        /// <summary>Gets whether a value may stand on the single right-hand side of an assignment</summary>
+        public static bool IsSingleRhs(GimpleValue value)
+            => IsRegisterOperand(value) || IsMemoryReference(value) || value is GimpleAddressOfExpression;
+
+        /// <summary>Gets whether an address operand is formed over a declaration rather than a computation</summary>
+        public static bool IsInvariantAddress(GimpleAddressOfExpression address)
+        {
+            GimpleValue current = address.Target;
+            while (true)
+            {
+                switch (current)
+                {
+                    case GimpleSymbolValue:
+                    case GimpleTemporaryValue:
+                        return true;
+                    case GimpleMemberAccessExpression member:
+                        current = member.Expression;
+                        continue;
+                    case GimpleElementAccessExpression element:
+                        if (element.Index is not null && element.Index is not GimpleConstantValue)
+                            return false;
+                        current = element.Expression;
+                        continue;
+                    default:
+                        return false;
+                }
+            }
+        }
+    }
 }

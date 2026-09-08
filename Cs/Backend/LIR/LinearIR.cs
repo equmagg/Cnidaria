@@ -276,6 +276,8 @@ namespace Cnidaria.Cs
 
             if (IsAbiCall(source))
                 flags |= GenTreeLinearFlags.AbiCall | GenTreeLinearFlags.CallerSavedKill;
+            else if (EmitsReturningHelperCall(source))
+                flags |= GenTreeLinearFlags.CallerSavedKill;
             else if (PreservesCallerSavedRegisters(source, _target, memoryAccess))
                 flags |= GenTreeLinearFlags.CallerSavedRegistersPreserved;
             else if (MayClobberCallerSaved(source, _target))
@@ -572,6 +574,21 @@ namespace Cnidaria.Cs
                 GenTreeKind.VirtualCall or
                 GenTreeKind.DelegateInvoke or
                 GenTreeKind.NewObject;
+        }
+
+        // Helper sequences that return to their caller clobber the caller-saved set even on targets
+        // where the remaining non-call operations are register preserving.
+        private bool EmitsReturningHelperCall(GenTree source)
+        {
+            if (_target.IsRegisterBytecode)
+                return false;
+
+            return source.Kind is
+                GenTreeKind.NewArray or
+                GenTreeKind.Box or
+                GenTreeKind.NewDelegate or
+                GenTreeKind.DelegateCombine or
+                GenTreeKind.DelegateRemove;
         }
 
         private static bool PreservesCallerSavedRegisters(GenTree source, TargetInfo target, LinearMemoryAccess memoryAccess)

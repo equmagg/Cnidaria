@@ -865,7 +865,7 @@ namespace Cnidaria.Cs
         internal static GenTreeFlags NormalizeLocalFieldFlags(GenTree node, SsaLocalAccess localFieldAccess)
         {
             GenTreeFlags flags =
-                (node.Flags & GenTreeFlags.ExplicitInit) |
+                (node.Flags & (GenTreeFlags.ExplicitInit | GenTreeFlags.PromotionSync)) |
                 GenTreeFlags.NullCheckEliminated;
             for (int i = 0; i < node.Operands.Length; i++)
             {
@@ -904,12 +904,199 @@ namespace Cnidaria.Cs
             return flags;
         }
     }
+    /// <summary>
+    /// Folds <c>sttmp t, &amp;lcl</c> plus <c>field(t)</c> back into <c>field(&amp;lcl)</c>. The importer spills a
+    /// locals address into a temporary whenever it materializes the evaluation stack, the normal shape for
+    /// compound field assignment and for every Span member access, which otherwise leaves the address
+    /// under a non field parent and marks the local address exposed. Rematerializing a locals address at
+    /// each use is always safe.
+    /// </summary>
+    internal static class GenTreeLocalAddressForwarder
+    {
+        public static GenTreeMethod ForwardMethod(GenTreeMethod method)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+
+            var addressByTemp = new Dictionary<int, GenTree>();
+            var blocked = new HashSet<int>();
+
+            for (int b = 0; b < method.Blocks.Length; b++)
+            {
+                var statements = method.Blocks[b].Statements;
+                for (int s = 0; s < statements.Length; s++)
+                    Scan(statements[s], parent: null, operandIndex: -1, isStatementRoot: true, addressByTemp, blocked);
+            }
+
+            foreach (int tempIndex in blocked)
+                addressByTemp.Remove(tempIndex);
+
+            if (addressByTemp.Count == 0)
+                return method;
+
+            int nextTreeId = ComputeNextTreeId(method);
+            var blocks = ImmutableArray.CreateBuilder<GenTreeBlock>(method.Blocks.Length);
+            bool changed = false;
+
+            for (int b = 0; b < method.Blocks.Length; b++)
+            {
+                var block = method.Blocks[b];
+                var statements = ImmutableArray.CreateBuilder<GenTree>(block.Statements.Length);
+                for (int s = 0; s < block.Statements.Length; s++)
+                {
+                    var statement = block.Statements[s];
+                    if (IsForwardedAddressStore(statement, addressByTemp))
+                    {
+                        changed = true;
+                        continue;
+                    }
+
+                    Replace(statement, addressByTemp, ref nextTreeId, ref changed);
+                    statements.Add(statement);
+                }
+
+                blocks.Add(new GenTreeBlock(
+                    block.Id,
+                    block.StartPc,
+                    block.EndPcExclusive,
+                    block.EntryStackDepth,
+                    block.ExitStackDepth,
+                    block.JumpKind,
+                    block.Flags,
+                    statements.ToImmutable(),
+                    block.SuccessorBlockIds,
+                    block.SuccessorPcs,
+                    block.RegionPc));
+            }
+
+            if (!changed)
+                return method;
+
+            method.ReplaceBlocksPreservingFlow(blocks.ToImmutable());
+            return method;
+        }
+
+        private static void Scan(
+            GenTree node,
+            GenTree? parent,
+            int operandIndex,
+            bool isStatementRoot,
+            Dictionary<int, GenTree> addressByTemp,
+            HashSet<int> blocked)
+        {
+            if (isStatementRoot &&
+                node.Kind == GenTreeKind.StoreTemp &&
+                node.Operands.Length == 1 &&
+                IsLocalAddressLeaf(node.Operands[0]))
+            {
+                var address = node.Operands[0];
+                if (addressByTemp.TryGetValue(node.Int32, out var existing))
+                {
+                    if (existing.Kind != address.Kind || existing.Int32 != address.Int32)
+                        blocked.Add(node.Int32);
+                }
+                else
+                {
+                    addressByTemp.Add(node.Int32, address);
+                }
+
+                return;
+            }
+
+            switch (node.Kind)
+            {
+                case GenTreeKind.Temp:
+                    if (parent is null || !SsaSlotHelpers.IsContainedLocalFieldAddressUse(parent, operandIndex))
+                        blocked.Add(node.Int32);
+                    break;
+
+                case GenTreeKind.TempAddr:
+                case GenTreeKind.StoreTemp:
+                    blocked.Add(node.Int32);
+                    break;
+            }
+
+            for (int i = 0; i < node.Operands.Length; i++)
+                Scan(node.Operands[i], node, i, isStatementRoot: false, addressByTemp, blocked);
+        }
+
+        private static void Replace(GenTree node, Dictionary<int, GenTree> addressByTemp, ref int nextTreeId, ref bool changed)
+        {
+            ImmutableArray<GenTree>.Builder? operands = null;
+            for (int i = 0; i < node.Operands.Length; i++)
+            {
+                var operand = node.Operands[i];
+                if (operand.Kind == GenTreeKind.Temp && addressByTemp.TryGetValue(operand.Int32, out var address))
+                {
+                    operands ??= node.Operands.ToBuilder();
+                    operands[i] = CloneAddress(address, operand, ref nextTreeId);
+                    changed = true;
+                    continue;
+                }
+
+                Replace(operand, addressByTemp, ref nextTreeId, ref changed);
+            }
+
+            if (operands is not null)
+                node.SetOperands(operands.ToImmutable());
+        }
+
+        private static GenTree CloneAddress(GenTree address, GenTree use, ref int nextTreeId)
+        {
+            var clone = new GenTree(
+                nextTreeId++,
+                address.Kind,
+                use.Pc,
+                address.SourceOp,
+                address.Type,
+                address.StackKind,
+                address.Flags,
+                ImmutableArray<GenTree>.Empty,
+                int32: address.Int32,
+                runtimeType: address.RuntimeType);
+            clone.LocalDescriptor = address.LocalDescriptor;
+            return clone;
+        }
+
+        private static bool IsForwardedAddressStore(GenTree statement, Dictionary<int, GenTree> addressByTemp)
+            => statement.Kind == GenTreeKind.StoreTemp &&
+               statement.Operands.Length == 1 &&
+               IsLocalAddressLeaf(statement.Operands[0]) &&
+               addressByTemp.ContainsKey(statement.Int32);
+
+        private static bool IsLocalAddressLeaf(GenTree node)
+            => node.Operands.Length == 0 &&
+               node.Kind is GenTreeKind.LocalAddr or GenTreeKind.ArgAddr or GenTreeKind.TempAddr;
+
+        private static int ComputeNextTreeId(GenTreeMethod method)
+        {
+            int max = -1;
+            for (int b = 0; b < method.Blocks.Length; b++)
+            {
+                var statements = method.Blocks[b].Statements;
+                for (int s = 0; s < statements.Length; s++)
+                    max = Math.Max(max, MaxId(statements[s]));
+            }
+
+            return max + 1;
+
+            static int MaxId(GenTree node)
+            {
+                int max = node.Id;
+                for (int i = 0; i < node.Operands.Length; i++)
+                    max = Math.Max(max, MaxId(node.Operands[i]));
+                return max;
+            }
+        }
+    }
     internal static class GenTreeLocalRewriter
     {
         public static GenTreeMethod RewriteMethod(GenTreeMethod method)
         {
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
+
+            method = GenTreeLocalAddressForwarder.ForwardMethod(method);
 
             ResetDescriptors(method.ArgDescriptors);
             ResetDescriptors(method.LocalDescriptors);

@@ -189,6 +189,65 @@ namespace System.Buffers
 
             return buffer;
         }
+
+        public override void Return(T[] array, bool clearArray = false)
+        {
+            if (array is null)
+            {
+                throw new ArgumentNullException();
+            }
+
+            // Determine with what bucket this array length is associated
+            int bucketIndex = Utilities.SelectBucketIndex(array.Length);
+
+            // Make sure our bucket index is in the correct range and the array is the right length
+            if ((uint)bucketIndex < (uint)NumBuckets)
+            {
+                if (clearArray)
+                {
+                    Array.Clear(array);
+                }
+
+                if (array.Length != Utilities.GetMaxSizeForBucket(bucketIndex))
+                {
+                    throw new ArgumentException();
+                }
+
+                // Store the array into the TLS bucket. If there is already an array in it, push that
+                // array down into the partitions, preferring to keep the latest one in TLS for locality.
+                SharedArrayPoolThreadLocalArray[] tlsBuckets = t_tlsBuckets ?? InitializeTlsBuckets();
+                Array? prev = tlsBuckets[bucketIndex].Array;
+                tlsBuckets[bucketIndex] = new SharedArrayPoolThreadLocalArray(array);
+                if (prev is not null)
+                {
+                    SharedArrayPoolPartitions partitionsForArraySize = _buckets[bucketIndex] ?? CreatePerCorePartitions(bucketIndex);
+                    partitionsForArraySize.TryPush(prev);
+                }
+            }
+        }
+
+        /// <summary>Initializes the thread-local array cache for the current thread.</summary>
+        private SharedArrayPoolThreadLocalArray[] InitializeTlsBuckets()
+        {
+            var tlsBuckets = new SharedArrayPoolThreadLocalArray[NumBuckets];
+            t_tlsBuckets = tlsBuckets;
+            _trimCallbackCreated = true;
+            return tlsBuckets;
+        }
+
+        public bool Trim()
+        {
+            int currentMilliseconds = Environment.TickCount;
+            Utilities.MemoryPressure pressure = Utilities.MemoryPressure.Low;
+
+            SharedArrayPoolPartitions?[] perCoreBuckets = _buckets;
+            for (int i = 0; i < perCoreBuckets.Length; i++)
+            {
+                perCoreBuckets[i]?.Trim(currentMilliseconds, Id, pressure);
+            }
+
+            return true;
+        }
     }
     internal sealed class ConfigurableArrayPool<T> : ArrayPool<T>
     {
@@ -233,6 +292,73 @@ namespace System.Buffers
         /// <summary>Gets an ID for the pool to use with events.</summary>
         private int Id => GetHashCode();
 
+        public override T[] Rent(int minimumLength)
+        {
+            // Arrays can not be smaller than zero
+            if (minimumLength < 0)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+            if (minimumLength == 0)
+            {
+                // No need for events with the empty array. Our pool is effectively infinite.
+                return Array.Empty<T>();
+            }
+
+            int index = Utilities.SelectBucketIndex(minimumLength);
+            if (index < _buckets.Length)
+            {
+                // Search for an array starting at the 'index' bucket. If the bucket is empty, bump up to the
+                // next higher bucket and try that one, but only try at most a few buckets.
+                const int MaxBucketsToTry = 2;
+                int i = index;
+                do
+                {
+                    T[]? pooled = _buckets[i].Rent();
+                    if (pooled is not null)
+                    {
+                        return pooled;
+                    }
+                }
+                while (++i < _buckets.Length && i != index + MaxBucketsToTry);
+
+                // The pool was exhausted for this buffer size. Allocate a new buffer with a size corresponding
+                // to the appropriate bucket so that when it is returned it can be pooled.
+                return new T[_buckets[index]._bufferLength];
+            }
+
+            // The request was for a size too large for the pool. Allocate an array of exactly the requested length.
+            return new T[minimumLength];
+        }
+
+        public override void Return(T[] array, bool clearArray = false)
+        {
+            if (array is null)
+            {
+                throw new ArgumentNullException();
+            }
+            if (array.Length == 0)
+            {
+                // Ignore empty arrays. Nothing was rented from the pool for them.
+                return;
+            }
+
+            // Determine with what bucket this array length is associated
+            int bucket = Utilities.SelectBucketIndex(array.Length);
+
+            // If we can tell that the buffer was allocated, drop it. Otherwise, check if it is
+            // the correct size for this bucket and return it to the pool.
+            if (bucket < _buckets.Length)
+            {
+                if (clearArray)
+                {
+                    Array.Clear(array);
+                }
+
+                _buckets[bucket].Return(array);
+            }
+        }
+
         /// <summary>Provides a thread-safe bucket containing buffers that can be Rent'd and Return'd.</summary>
         private sealed class Bucket
         {
@@ -247,6 +373,51 @@ namespace System.Buffers
                 _buffers = new T[numberOfBuffers][];
                 _bufferLength = bufferLength;
                 _poolId = poolId;
+            }
+
+            /// <summary>Takes an array from the bucket. If the bucket is empty, returns null.</summary>
+            internal T[]? Rent()
+            {
+                T[]?[] buffers = _buffers;
+                T[]? buffer = null;
+
+                // While holding the lock, grab whatever is at the next available index and update the index.
+                bool allocateBuffer = false;
+                System.Threading.Monitor.Enter(this);
+                if (_index < buffers.Length)
+                {
+                    buffer = buffers[_index];
+                    buffers[_index++] = null;
+                    allocateBuffer = buffer is null;
+                }
+                System.Threading.Monitor.Exit(this);
+
+                // The buffer slot was empty, which means the pool has not yet allocated this array. Allocate
+                // it outside of the lock, the slot has already been reserved by bumping the index.
+                if (allocateBuffer)
+                {
+                    buffer = new T[_bufferLength];
+                }
+
+                return buffer;
+            }
+
+            /// <summary>Attempts to return the buffer to the bucket. If successful, the buffer will be stored
+            /// in the bucket and true will be returned; otherwise, the buffer will be discarded.</summary>
+            internal void Return(T[] array)
+            {
+                // Check to see if the buffer is the correct size for this bucket.
+                if (array.Length != _bufferLength)
+                {
+                    throw new ArgumentException();
+                }
+
+                System.Threading.Monitor.Enter(this);
+                if (_index != 0)
+                {
+                    _buffers[--_index] = array;
+                }
+                System.Threading.Monitor.Exit(this);
             }
         }
     }

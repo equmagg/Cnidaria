@@ -2139,7 +2139,7 @@ namespace Cnidaria.Cs
 
                     EmitExpression(aea.Expression, EmitMode.Value);
                     for (int i = 0; i < aea.Indices.Length; i++)
-                        EmitExpression(aea.Indices[i], EmitMode.Value);
+                        EmitArrayIndex(aea.Indices[i]);
                     EmitExpression(assignment.Right, EmitMode.Value);
 
                     bool useLinearAccess = aea.Indices.Length == 1 && arrayType.Rank != 1;
@@ -2216,10 +2216,19 @@ namespace Cnidaria.Cs
 
                     EmitExpression(assignment.Right, EmitMode.Value);
 
-                    if (mode == EmitMode.Value)
-                        _il.Emit(BytecodeOp.Dup, pop: 1, push: 2); // recv, val, val
+                    if (mode == EmitMode.Discard)
+                    {
+                        _il.Emit(BytecodeOp.Stfld, operand0: tok, pop: 2, push: 0);
+                        return;
+                    }
 
+                    // Stack: recv, val. The stored value is the result, so keep it in a spill
+                    // local instead of duplicating it under the receiver.
+                    int fieldSpill = AllocateSpillLocal(assignment.Type);
+                    _il.Emit(BytecodeOp.Dup, pop: 1, push: 2);
+                    _il.Emit(BytecodeOp.Stloc, operand0: fieldSpill, pop: 1, push: 0);
                     _il.Emit(BytecodeOp.Stfld, operand0: tok, pop: 2, push: 0);
+                    _il.Emit(BytecodeOp.Ldloc, operand0: fieldSpill, pop: 0, push: 1);
                     return;
                 }
                 if (assignment.Left is BoundClosureAccessExpression closureAccess)
@@ -2244,7 +2253,8 @@ namespace Cnidaria.Cs
                 if (assignment.Left is BoundLocalExpression leftLocal)
                 {
                     int idx = GetOrCreateLocal(leftLocal.Local);
-                    if (leftLocal.Local.IsByRef)
+                    // 'r = ref x' rebinds the ref local itself, everything else writes through it
+                    if (leftLocal.Local.IsByRef && assignment.Right is not BoundRefExpression)
                     {
                         _il.Emit(BytecodeOp.Ldloc, operand0: idx, pop: 0, push: 1); // load address
                         EmitExpression(assignment.Right, EmitMode.Value);
@@ -2278,7 +2288,7 @@ namespace Cnidaria.Cs
                 if (assignment.Left is BoundParameterExpression leftPar)
                 {
                     int idx = GetArgIndex(leftPar.Parameter);
-                    if (leftPar.Parameter.Type is ByRefTypeSymbol byRefPar)
+                    if (leftPar.Parameter.Type is ByRefTypeSymbol byRefPar && assignment.Right is not BoundRefExpression)
                     {
                         _il.Emit(BytecodeOp.Ldarg, operand0: idx, pop: 0, push: 1);
                         EmitExpression(assignment.Right, EmitMode.Value);
@@ -2409,6 +2419,39 @@ namespace Cnidaria.Cs
                     }
                 }
             }
+            /// <summary>Emits an array index expression normalized to a 32-bit index</summary>
+            private void EmitArrayIndex(BoundExpression index)
+            {
+                EmitExpression(index, EmitMode.Value);
+
+                var type = index.Type;
+                var special = type is NamedTypeSymbol nt && nt.TypeKind == TypeKind.Enum
+                    ? (nt.EnumUnderlyingType?.SpecialType ?? SpecialType.System_Int32)
+                    : type?.SpecialType ?? SpecialType.None;
+
+                switch (special)
+                {
+                    case SpecialType.System_Int64:
+                    case SpecialType.System_IntPtr:
+                        _il.Emit(
+                            BytecodeOp.Conv,
+                            operand0: (int)NumericConvKind.I4,
+                            operand1: (int)NumericConvFlags.Checked,
+                            pop: 1,
+                            push: 1);
+                        break;
+
+                    case SpecialType.System_UInt64:
+                    case SpecialType.System_UIntPtr:
+                        _il.Emit(
+                            BytecodeOp.Conv,
+                            operand0: (int)NumericConvKind.I4,
+                            operand1: (int)(NumericConvFlags.Checked | NumericConvFlags.SourceUnsigned),
+                            pop: 1,
+                            push: 1);
+                        break;
+                }
+            }
             private void EmitArrayElementAccess(BoundArrayElementAccessExpression aea, EmitMode mode)
             {
                 if (aea.Expression.Type is not ArrayTypeSymbol arrayType)
@@ -2416,7 +2459,7 @@ namespace Cnidaria.Cs
 
                 EmitExpression(aea.Expression, EmitMode.Value);
                 for (int i = 0; i < aea.Indices.Length; i++)
-                    EmitExpression(aea.Indices[i], EmitMode.Value);
+                    EmitArrayIndex(aea.Indices[i]);
 
                 bool useLinearAccess = aea.Indices.Length == 1 && arrayType.Rank != 1;
                 if (arrayType.IsSZArray || useLinearAccess)
@@ -3652,7 +3695,7 @@ namespace Cnidaria.Cs
 
                             EmitExpression(aea.Expression, EmitMode.Value);
                             for (int i = 0; i < aea.Indices.Length; i++)
-                                EmitExpression(aea.Indices[i], EmitMode.Value);
+                                EmitArrayIndex(aea.Indices[i]);
 
                             bool useLinearAccess = aea.Indices.Length == 1 && arrayType.Rank != 1;
                             if (arrayType.IsSZArray || useLinearAccess)

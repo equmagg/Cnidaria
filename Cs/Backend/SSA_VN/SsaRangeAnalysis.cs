@@ -578,6 +578,24 @@ namespace Cnidaria.Cs
                 _assertionSearchPath.Clear();
 
                 range = GetRange(value, depth: 0);
+
+                // A loop-carried index merges its entry value with a back-edge value expressed in terms
+                // of itself, so the first pass yields a dependent - or outright unusable - range. Knowing
+                // the value only ever increases lets the merge keep the bound the back edge asserts,
+                // which is what proves an index against the length it is tested on
+                if (RangeNeedsMonotonicity(range))
+                {
+                    _searchPath.Clear();
+                    if (IsMonotonicIncreasing(value, new HashSet<ValueNumber>(), rejectNegative: false, depth: 0))
+                    {
+                        _monotonicIncreasing = true;
+                        _cache.Clear();
+                        _searchPath.Clear();
+                        _assertionSearchPath.Clear();
+                        range = GetRange(value, depth: 0);
+                    }
+                }
+
                 if (range.IsUnknown || !range.IsValid)
                     return false;
 
@@ -585,20 +603,14 @@ namespace Cnidaria.Cs
                 if (MayOverflow(value, range, active, new HashSet<ValueNumber>(), depth: 0))
                     return false;
 
-                if ((range.Lower.Kind == SsaRangeLimitKind.Dependent || range.Upper.Kind == SsaRangeLimitKind.Dependent) &&
-                    IsMonotonicIncreasing(value, new HashSet<ValueNumber>(), rejectNegative: false, depth: 0))
-                {
-                    _monotonicIncreasing = true;
-                    _cache.Clear();
-                    _searchPath.Clear();
-                    _assertionSearchPath.Clear();
-                    range = GetRange(value, depth: 0);
-                    if (range.IsUnknown || !range.IsValid)
-                        return false;
-                }
-
                 return true;
             }
+
+            private static bool RangeNeedsMonotonicity(SsaRange range)
+                => range.IsUnknown ||
+                   !range.IsValid ||
+                   range.Lower.Kind == SsaRangeLimitKind.Dependent ||
+                   range.Upper.Kind == SsaRangeLimitKind.Dependent;
 
             private static bool IsRangeNonNegative(SsaRange range)
                 => TryGetLimitMinimum(range.Lower, out int minimum) && minimum >= 0;

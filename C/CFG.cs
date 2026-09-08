@@ -55,15 +55,11 @@ namespace Cnidaria.C
             return Build(semanticModel.GetGimpleTree());
         }
 
-        /// <summary>Applies configured inlining then builds control flow</summary>
+        /// <summary>Builds control flow for an already lowered GIMPLE tree</summary>
         public static ControlFlowGraph Build(GimpleTree gimpleTree)
         {
             if (gimpleTree is null)
                 throw new ArgumentNullException(nameof(gimpleTree));
-
-            gimpleTree = Inliner.Inline(
-                gimpleTree,
-                gimpleTree.SemanticModel.Compilation.Options.Inlining);
 
             var functions = ImmutableArray.CreateBuilder<ControlFlowFunction>();
             foreach (var member in gimpleTree.Members)
@@ -256,7 +252,7 @@ namespace Cnidaria.C
                             AddLabelEdge(block, @goto.Target, ControlFlowEdgeKind.Goto, @goto, switchValue: null);
                             break;
 
-                        case GimpleConditionalGotoStatement conditional:
+                        case GimpleCondStatement conditional:
                             AddLabelEdge(block, conditional.WhenTrue, ControlFlowEdgeKind.ConditionalTrue, conditional, switchValue: null);
                             AddLabelEdge(block, conditional.WhenFalse, ControlFlowEdgeKind.ConditionalFalse, conditional, switchValue: null);
                             break;

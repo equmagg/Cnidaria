@@ -305,8 +305,11 @@ namespace Cnidaria.C
         }
 
 
-        private static int DefinitionPosition(LirInstruction instruction, int position)
-            => instruction.Kind is LirInstructionKind.Copy or LirInstructionKind.ParallelCopy or LirInstructionKind.Call
+        // A definition one slot past the reads lets the result reuse a register that dies here. Copies
+        // and calls were already modelled that way, and a two-address instruction has the same shape
+        private int DefinitionPosition(LirInstruction instruction, int position)
+            => instruction.Kind is LirInstructionKind.Copy or LirInstructionKind.ParallelCopy or LirInstructionKind.Call ||
+               (TargetRegisterInfo.IsX86(_target) && IsTwoAddressOnFirstOperand(instruction))
                 ? position + 1
                 : position;
 
@@ -373,6 +376,27 @@ namespace Cnidaria.C
                 clobbers.Add(MachineRegister.X11);
                 clobbers.Add(MachineRegister.X12);
                 clobbers.Add(MachineRegister.X13);
+            }
+
+            if (TargetRegisterInfo.IsX86(_target) &&
+                instruction.Kind == LirInstructionKind.Binary &&
+                instruction.Result is not null &&
+                instruction.Result.RegisterClass is LirRegisterClass.General or LirRegisterClass.Address)
+            {
+                if (instruction.Operator is "/" or "%")
+                {
+                    // div and idiv read and write rax:rdx, and the emitted sequence parks the divisor in rcx
+                    clobbers.Add(TargetRegisterInfo.X86AccumulatorRegister(_target));
+                    clobbers.Add(TargetRegisterInfo.X86DataRegister(_target));
+                    clobbers.Add(TargetRegisterInfo.X86CounterRegister(_target));
+                }
+                else if (instruction.Operator is "<<" or ">>" &&
+                         instruction.Operands.Length == 2 &&
+                         instruction.Operands[1].Kind != LirOperandKind.Immediate)
+                {
+                    // A variable shift count has to be in cl
+                    clobbers.Add(TargetRegisterInfo.X86CounterRegister(_target));
+                }
             }
 
             if (clobbers.Count != 0)
@@ -755,7 +779,9 @@ namespace Cnidaria.C
 
         private void RecordCopyPreferences(LirInstruction instruction)
         {
-            if (instruction.Kind == LirInstructionKind.Copy &&
+            // Convert is included because most conversions are register no-ops or an in-place
+            // extension: sharing a register with the source removes the move that carries them
+            if (instruction.Kind is LirInstructionKind.Copy or LirInstructionKind.Convert &&
                 instruction.Result is not null &&
                 instruction.Operands.Length != 0 &&
                 instruction.Operands[0].Kind == LirOperandKind.Register &&
@@ -763,6 +789,8 @@ namespace Cnidaria.C
             {
                 AddCopyPreference(instruction.Result, instruction.Operands[0].Register!);
             }
+
+            RecordTwoAddressPreference(instruction);
 
             if (instruction.Kind != LirInstructionKind.ParallelCopy)
                 return;
@@ -774,6 +802,57 @@ namespace Cnidaria.C
             }
         }
 
+        // x86 arithmetic is two-address, so sharing the destination with the first operand collapses the
+        // move and the operation into one instruction. One-directional: the operand is allocated first
+        private void RecordTwoAddressPreference(LirInstruction instruction)
+        {
+            if (!TargetRegisterInfo.IsX86(_target) || instruction.Result is null)
+                return;
+
+            if (!IsTwoAddressOnFirstOperand(instruction))
+                return;
+
+            var source = instruction.Operands[0];
+            if (source.Kind != LirOperandKind.Register || source.Register is null)
+                return;
+
+            if (!ShouldTrack(instruction.Result) || !ShouldTrack(source.Register))
+                return;
+
+            if (!AreCoalescableClasses(instruction.Result.RegisterClass, source.Register.RegisterClass))
+                return;
+
+            AddPreferenceEdge(instruction.Result, source.Register);
+        }
+
+        // Division and comparison are excluded: the first lands in fixed registers, the second writes
+        // the destination through setcc
+        private bool IsTwoAddressOnFirstOperand(LirInstruction instruction)
+        {
+            // Wider than a register is a software sequence over fixed pairs, not an in-place operation
+            if (instruction.Result is null ||
+                Math.Max(1, _target.SizeOf(instruction.Result.Type)) > Math.Max(1, _target.RegisterSize))
+                return false;
+
+            switch (instruction.Kind)
+            {
+                case LirInstructionKind.Unary:
+                    return instruction.Operands.Length == 1 &&
+                        instruction.Operator is "+" or "-" or "~" or "!";
+
+                case LirInstructionKind.Binary:
+                    return instruction.Operands.Length == 2 &&
+                        instruction.Operator is "+" or "-" or "*" or "&" or "|" or "^" or "<<" or ">>";
+
+                default:
+                    return false;
+            }
+        }
+
+        /// <summary>
+        /// Records the pair in both directions: the preference is resolved through whichever side is
+        /// allocated first, and for a phi copy on a loop latch that is the destination, not the source.
+        /// </summary>
         private void AddCopyPreference(LirVirtualRegister destination, LirVirtualRegister source)
         {
             if (!ShouldTrack(destination) || !ShouldTrack(source))
@@ -782,14 +861,20 @@ namespace Cnidaria.C
             if (!AreCoalescableClasses(destination.RegisterClass, source.RegisterClass))
                 return;
 
-            if (!_copyPreferences.TryGetValue(destination, out var list))
+            AddPreferenceEdge(destination, source);
+            AddPreferenceEdge(source, destination);
+        }
+
+        private void AddPreferenceEdge(LirVirtualRegister from, LirVirtualRegister to)
+        {
+            if (!_copyPreferences.TryGetValue(from, out var list))
             {
                 list = new List<LirVirtualRegister>();
-                _copyPreferences.Add(destination, list);
+                _copyPreferences.Add(from, list);
             }
 
-            if (!list.Contains(source))
-                list.Add(source);
+            if (!list.Contains(to))
+                list.Add(to);
         }
 
         private static bool AreCoalescableClasses(LirRegisterClass left, LirRegisterClass right)
@@ -2325,6 +2410,107 @@ namespace Cnidaria.C
 
     }
 
+    internal readonly struct PhysicalStorageKey : IEquatable<PhysicalStorageKey>
+    {
+        private readonly int _registerPlusOne;
+        private readonly int _stackOffsetPlusOne;
+
+        private PhysicalStorageKey(int registerPlusOne, int stackOffsetPlusOne)
+        {
+            _registerPlusOne = registerPlusOne;
+            _stackOffsetPlusOne = stackOffsetPlusOne;
+        }
+
+        public static PhysicalStorageKey ForRegister(MachineRegister register)
+            => new PhysicalStorageKey((int)register + 1, 0);
+
+        public static PhysicalStorageKey ForStackOffset(int stackOffset)
+            => new PhysicalStorageKey(0, stackOffset + 1);
+
+        public bool IsKnown => _registerPlusOne != 0 || _stackOffsetPlusOne != 0;
+
+        public bool Equals(PhysicalStorageKey other)
+            => _registerPlusOne == other._registerPlusOne && _stackOffsetPlusOne == other._stackOffsetPlusOne;
+
+        public override bool Equals(object? obj) => obj is PhysicalStorageKey other && Equals(other);
+
+        public override int GetHashCode() => HashCode.Combine(_registerPlusOne, _stackOffsetPlusOne);
+    }
+
+    internal static class ParallelCopySequencer
+    {
+        /// <summary>Orders the copies so each one runs before whichever copy overwrites the storage it reads</summary>
+        public static bool TryOrder(
+            IReadOnlyList<PhysicalStorageKey> destinations,
+            IReadOnlyList<PhysicalStorageKey> sources,
+            out ImmutableArray<int> order)
+        {
+            order = ImmutableArray<int>.Empty;
+            if (destinations is null)
+                throw new ArgumentNullException(nameof(destinations));
+            if (sources is null)
+                throw new ArgumentNullException(nameof(sources));
+            if (destinations.Count != sources.Count)
+                throw new ArgumentException("Destination and source storage counts must match.", nameof(sources));
+
+            var count = destinations.Count;
+            if (count == 0)
+                return true;
+
+            for (var i = 0; i < count; i++)
+            {
+                if (!destinations[i].IsKnown)
+                    return false;
+
+                for (var j = i + 1; j < count; j++)
+                {
+                    if (destinations[i].Equals(destinations[j]))
+                        return false;
+                }
+            }
+
+            var blockers = new int[count];
+            for (var i = 0; i < count; i++)
+            {
+                for (var j = 0; j < count; j++)
+                {
+                    if (i != j && sources[j].IsKnown && sources[j].Equals(destinations[i]))
+                        blockers[i]++;
+                }
+            }
+
+            var emitted = new bool[count];
+            var result = ImmutableArray.CreateBuilder<int>(count);
+            while (result.Count < count)
+            {
+                var progressed = false;
+                for (var i = 0; i < count; i++)
+                {
+                    if (emitted[i] || blockers[i] != 0)
+                        continue;
+
+                    emitted[i] = true;
+                    result.Add(i);
+                    progressed = true;
+                    if (!sources[i].IsKnown)
+                        continue;
+
+                    for (var k = 0; k < count; k++)
+                    {
+                        if (k != i && !emitted[k] && sources[i].Equals(destinations[k]))
+                            blockers[k]--;
+                    }
+                }
+
+                if (!progressed)
+                    return false;
+            }
+
+            order = result.ToImmutable();
+            return true;
+        }
+    }
+
     internal sealed class AllocationResult
     {
         private readonly IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> _allocations;
@@ -2362,6 +2548,143 @@ namespace Cnidaria.C
 
         public bool TryGetAllocation(LirVirtualRegister register, out VirtualRegisterAllocation allocation)
             => _allocations.TryGetValue(register, out allocation!);
+
+        public bool TryGetPhysicalRegister(LirVirtualRegister register, out MachineRegister physicalRegister)
+        {
+            physicalRegister = MachineRegister.Invalid;
+            if (register is null || !_allocations.TryGetValue(register, out var allocation) || allocation.IsSpilled)
+                return false;
+
+            physicalRegister = allocation.PhysicalRegister;
+            return physicalRegister != MachineRegister.Invalid;
+        }
+
+        public bool TryGetPhysicalRegister(LirOperand operand, out MachineRegister physicalRegister)
+        {
+            physicalRegister = MachineRegister.Invalid;
+            return operand.Kind == LirOperandKind.Register &&
+                operand.Register is not null &&
+                TryGetPhysicalRegister(operand.Register, out physicalRegister);
+        }
+
+        public bool TryGetStackOffset(LirVirtualRegister register, out int stackOffset)
+        {
+            stackOffset = -1;
+            if (register is null || !_allocations.TryGetValue(register, out var allocation) || !allocation.IsSpilled)
+                return false;
+
+            stackOffset = allocation.StackOffset;
+            return stackOffset >= 0;
+        }
+
+        public bool TryGetStackOffset(LirOperand operand, out int stackOffset)
+        {
+            stackOffset = -1;
+            return operand.Kind == LirOperandKind.Register &&
+                operand.Register is not null &&
+                TryGetStackOffset(operand.Register, out stackOffset);
+        }
+
+        public bool ReferencesSamePhysicalStorage(LirOperand source, LirVirtualRegister destination)
+        {
+            if (source.Kind != LirOperandKind.Register || source.Register is null)
+                return false;
+
+            if (!_allocations.TryGetValue(source.Register, out var sourceAllocation) ||
+                !_allocations.TryGetValue(destination, out var destinationAllocation))
+            {
+                return false;
+            }
+
+            if (!sourceAllocation.IsSpilled && !destinationAllocation.IsSpilled)
+                return sourceAllocation.PhysicalRegister == destinationAllocation.PhysicalRegister;
+
+            return sourceAllocation.IsSpilled && destinationAllocation.IsSpilled &&
+                sourceAllocation.StackOffset == destinationAllocation.StackOffset;
+        }
+
+        public bool RequiresPhysicalParallelCopy(LirParallelCopy copy)
+        {
+            if (copy.Destination.RegisterClass is LirRegisterClass.Void or LirRegisterClass.Memory)
+                return false;
+
+            if (copy.Source.Kind is LirOperandKind.Void or LirOperandKind.None)
+                return false;
+
+            if (copy.Source.Kind == LirOperandKind.Register &&
+                copy.Source.Register is { RegisterClass: LirRegisterClass.Void or LirRegisterClass.Memory })
+            {
+                return false;
+            }
+
+            return !ReferencesSamePhysicalStorage(copy.Source, copy.Destination);
+        }
+
+        public bool TryOrderParallelCopies(IReadOnlyList<LirParallelCopy> copies, out ImmutableArray<LirParallelCopy> ordered)
+        {
+            ordered = ImmutableArray<LirParallelCopy>.Empty;
+            if (copies is null)
+                throw new ArgumentNullException(nameof(copies));
+
+            var destinations = new PhysicalStorageKey[copies.Count];
+            var sources = new PhysicalStorageKey[copies.Count];
+            for (var i = 0; i < copies.Count; i++)
+            {
+                destinations[i] = TryGetPhysicalRegister(copies[i].Destination, out var destinationRegister)
+                    ? PhysicalStorageKey.ForRegister(destinationRegister)
+                    : TryGetStackOffset(copies[i].Destination, out var destinationOffset)
+                        ? PhysicalStorageKey.ForStackOffset(destinationOffset)
+                        : default;
+                sources[i] = TryGetPhysicalRegister(copies[i].Source, out var sourceRegister)
+                    ? PhysicalStorageKey.ForRegister(sourceRegister)
+                    : TryGetStackOffset(copies[i].Source, out var sourceOffset)
+                        ? PhysicalStorageKey.ForStackOffset(sourceOffset)
+                        : default;
+            }
+
+            if (!ParallelCopySequencer.TryOrder(destinations, sources, out var order))
+                return false;
+
+            var result = ImmutableArray.CreateBuilder<LirParallelCopy>(order.Length);
+            foreach (var index in order)
+                result.Add(copies[index]);
+            ordered = result.ToImmutable();
+            return true;
+        }
+
+        public bool HasPhysicalStorageClobber(IReadOnlyList<LirParallelCopy> copies)
+        {
+            for (var i = 0; i < copies.Count; i++)
+            {
+                var destination = copies[i].Destination;
+                var hasDestinationRegister = TryGetPhysicalRegister(destination, out var destinationRegister);
+                var hasDestinationStackOffset = TryGetStackOffset(destination, out var destinationStackOffset);
+                if (!hasDestinationRegister && !hasDestinationStackOffset)
+                    continue;
+
+                for (var j = 0; j < copies.Count; j++)
+                {
+                    if (i == j && ReferencesSamePhysicalStorage(copies[j].Source, destination))
+                        continue;
+
+                    if (hasDestinationRegister &&
+                        TryGetPhysicalRegister(copies[j].Source, out var sourceRegister) &&
+                        sourceRegister == destinationRegister)
+                    {
+                        return true;
+                    }
+
+                    if (hasDestinationStackOffset &&
+                        TryGetStackOffset(copies[j].Source, out var sourceStackOffset) &&
+                        sourceStackOffset == destinationStackOffset)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
 
         public ImmutableArray<CallPreservation> GetCallPreservations(int position)
             => _callPreservations.TryGetValue(position, out var preservations)

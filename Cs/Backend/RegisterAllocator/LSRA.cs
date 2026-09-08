@@ -6682,14 +6682,59 @@ namespace Cnidaria.Cs
 
                 foreach (var node in method.LinearNodes)
                 {
-                    if (node.RegisterResult is null || node.RegisterUses.Length != 1)
+                    if (node.RegisterResult is null)
                         continue;
 
-                    if (node.LinearKind == GenTreeLinearKind.Copy || IsPromotedStoreDef(node) || IsPromotedLoadUse(node))
-                        AddClassCompatiblePreference(method, result, node.RegisterResult, node.RegisterUses[0]);
+                    if (node.RegisterUses.Length == 1)
+                    {
+                        if (node.LinearKind == GenTreeLinearKind.Copy || IsPromotedStoreDef(node) || IsPromotedLoadUse(node))
+                            AddClassCompatiblePreference(method, result, node.RegisterResult, node.RegisterUses[0]);
+                        continue;
+                    }
+
+                    AddTwoAddressPreferences(method, result, node);
                 }
 
                 return result;
+            }
+
+            // x86 arithmetic is two-address, so sharing the destination with an operand removes the move.
+            // The first operand needs no fixup; a commutative operator can also take the second
+            private static void AddTwoAddressPreferences(
+                GenTreeMethod method,
+                Dictionary<GenTree, List<GenTree>> result,
+                GenTree node)
+            {
+                if (!method.Target.IsX86 || node.Kind != GenTreeKind.Binary || node.RegisterUses.Length != 2)
+                    return;
+
+                switch (node.SourceOp)
+                {
+                    case BytecodeOp.Add:
+                    case BytecodeOp.Mul:
+                    case BytecodeOp.And:
+                    case BytecodeOp.Or:
+                    case BytecodeOp.Xor:
+                        AddDirectedClassCompatiblePreference(method, result, node.RegisterResult!, node.RegisterUses[0]);
+                        AddDirectedClassCompatiblePreference(method, result, node.RegisterResult!, node.RegisterUses[1]);
+                        return;
+
+                    // The emitter can land Sub on the right operand, but pays with negate-and-add, or a
+                    // stack slot for floats
+                    case BytecodeOp.Sub:
+                        AddDirectedClassCompatiblePreference(method, result, node.RegisterResult!, node.RegisterUses[0]);
+                        return;
+
+                    // The count is pinned to rcx and the emitter rejects a destination colliding with it
+                    case BytecodeOp.Shl:
+                    case BytecodeOp.Shr:
+                    case BytecodeOp.Shr_Un:
+                        AddDirectedClassCompatiblePreference(method, result, node.RegisterResult!, node.RegisterUses[0]);
+                        return;
+
+                    default:
+                        return;
+                }
             }
 
             private static bool IsPromotedStoreDef(GenTree node)
@@ -6714,14 +6759,29 @@ namespace Cnidaria.Cs
                 GenTree left,
                 GenTree right)
             {
-                var leftClass = method.GetValueInfo(left).RegisterClass;
-                var rightClass = method.GetValueInfo(right).RegisterClass;
-                if (leftClass != rightClass)
+                if (!SameRegisterClass(method, left, right))
                     return;
 
                 AddPreference(map, left, right);
                 AddPreference(map, right, left);
             }
+
+            // The operand is allocated first and gains nothing from pointing back at a result with no
+            // register yet, so a two-address edge only runs one way
+            private static void AddDirectedClassCompatiblePreference(
+                GenTreeMethod method,
+                Dictionary<GenTree, List<GenTree>> map,
+                GenTree from,
+                GenTree to)
+            {
+                if (!SameRegisterClass(method, from, to))
+                    return;
+
+                AddPreference(map, from, to);
+            }
+
+            private static bool SameRegisterClass(GenTreeMethod method, GenTree left, GenTree right)
+                => method.GetValueInfo(left).RegisterClass == method.GetValueInfo(right).RegisterClass;
 
             private static void AddPreference(Dictionary<GenTree, List<GenTree>> map, GenTree value, GenTree preferred)
             {

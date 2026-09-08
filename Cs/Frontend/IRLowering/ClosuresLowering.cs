@@ -398,17 +398,20 @@ namespace Cnidaria.Cs
             public readonly LocalFunctionSymbol Lowered;
             public readonly ImmutableArray<Symbol> CapturedSymbols;
             public readonly ImmutableArray<ParameterSymbol> HiddenParameters;
+            public readonly ImmutableArray<TypeSymbol> TypeArguments;
 
             public CaptureInfo(
                 LocalFunctionSymbol original,
                 LocalFunctionSymbol lowered,
                 ImmutableArray<Symbol> capturedSymbols,
-                ImmutableArray<ParameterSymbol> hiddenParameters)
+                ImmutableArray<ParameterSymbol> hiddenParameters,
+                ImmutableArray<TypeSymbol> typeArguments = default)
             {
                 Original = original;
                 Lowered = lowered;
                 CapturedSymbols = capturedSymbols.IsDefault ? ImmutableArray<Symbol>.Empty : capturedSymbols;
                 HiddenParameters = hiddenParameters.IsDefault ? ImmutableArray<ParameterSymbol>.Empty : hiddenParameters;
+                TypeArguments = typeArguments.IsDefault ? ImmutableArray<TypeSymbol>.Empty : typeArguments;
             }
         }
 
@@ -620,7 +623,7 @@ namespace Cnidaria.Cs
 
                     rewrittenArguments = builder.ToImmutable();
                 }
-                var targetMethod = RewriteLocalFunctionCallTarget(node.Method, localFunction, info.Lowered);
+                var targetMethod = RewriteLocalFunctionCallTarget(node.Method, localFunction, info);
                 if (!ReferenceEquals(receiver, node.ReceiverOpt) ||
                     argsChanged ||
                     !ReferenceEquals(targetMethod, node.Method) ||
@@ -641,10 +644,9 @@ namespace Cnidaria.Cs
         private MethodSymbol RewriteLocalFunctionCallTarget(
             MethodSymbol method,
             LocalFunctionSymbol original,
-            LocalFunctionSymbol lowered)
+            CaptureInfo info)
         {
-            if (ReferenceEquals(method, original))
-                return lowered;
+            var lowered = info.Lowered;
 
             if (method is ConstructedMethodSymbol constructed &&
                 ReferenceEquals(constructed.OriginalDefinition, original))
@@ -654,6 +656,9 @@ namespace Cnidaria.Cs
                     constructed.TypeArguments,
                     _compilation.TypeManager);
             }
+
+            if (!info.TypeArguments.IsDefaultOrEmpty)
+                return new ConstructedMethodSymbol(lowered, info.TypeArguments, _compilation.TypeManager);
 
             return lowered;
         }
@@ -742,8 +747,9 @@ namespace Cnidaria.Cs
         {
             var original = statement.LocalFunction;
             var capturedSymbols = CollectRequiredCaptures(original, statement.Body);
+            var enclosingTypeParameters = GetEnclosingMethodTypeParameters(original);
 
-            if (capturedSymbols.IsDefaultOrEmpty)
+            if (capturedSymbols.IsDefaultOrEmpty && enclosingTypeParameters.IsDefaultOrEmpty)
                 return new CaptureInfo(original, original, capturedSymbols, ImmutableArray<ParameterSymbol>.Empty);
 
             var declaration = original.Declaration;
@@ -760,7 +766,12 @@ namespace Cnidaria.Cs
                 original.IsStatic,
                 original.IsAsync,
                 original.IsExtern);
-            lowered.SetTypeParameters(original.TypeParameters);
+            // A local function is emitted as a method of a non-generic host type, so the type
+            // parameters of the enclosing method have to become its own and be passed by every call.
+            var loweredTypeParameters = enclosingTypeParameters.IsDefaultOrEmpty
+                ? original.TypeParameters
+                : enclosingTypeParameters;
+            lowered.SetTypeParameters(loweredTypeParameters);
 
             var allParameters = ImmutableArray.CreateBuilder<ParameterSymbol>(original.Parameters.Length + capturedSymbols.Length);
             allParameters.AddRange(original.Parameters);
@@ -786,7 +797,26 @@ namespace Cnidaria.Cs
                 original,
                 lowered,
                 capturedSymbols,
-                hiddenParameters.ToImmutable());
+                hiddenParameters.ToImmutable(),
+                ImmutableArray<TypeSymbol>.CastUp(enclosingTypeParameters));
+        }
+
+        /// <summary>Type parameters of the method the local function is declared in</summary>
+        private static ImmutableArray<TypeParameterSymbol> GetEnclosingMethodTypeParameters(LocalFunctionSymbol localFunction)
+        {
+            // A local function that declares its own type parameters would collide with the
+            // enclosing ones on the method type parameter ordinals, so it is left alone.
+            if (!localFunction.TypeParameters.IsDefaultOrEmpty)
+                return ImmutableArray<TypeParameterSymbol>.Empty;
+
+            Symbol? containing = localFunction.ContainingSymbol;
+            while (containing is LocalFunctionSymbol nested)
+                containing = nested.ContainingSymbol;
+
+            if (containing is not MethodSymbol method || method.TypeParameters.IsDefaultOrEmpty)
+                return ImmutableArray<TypeParameterSymbol>.Empty;
+
+            return method.TypeParameters;
         }
 
         /// <summary>Chooses the by-ref transport type for a captured symbol</summary>

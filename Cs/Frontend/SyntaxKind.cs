@@ -7,7 +7,7 @@ namespace Cnidaria.Cs
     public enum SyntaxKind : ushort
     {
         None = 0,
-        List = 1, // GreenNode.ListKind
+        List = 1, //GreenNode.ListKind,
 
         // punctuation
         /// <summary>Represents <c>~</c> token.</summary>
@@ -421,6 +421,12 @@ namespace Cnidaria.Cs
         AllowsKeyword = 8450,
         /// <summary>Represents <see langword="extension"/>.</summary>
         ExtensionKeyword = 8451,
+        /// <summary>Represents <see langword="union"/>.</summary>
+        UnionKeyword = 8452,
+        /// <summary>Represents <see langword="closed"/>.</summary>
+        ClosedKeyword = 8453,
+        /// <summary>Represents <see langword="safe"/>.</summary>
+        SafeKeyword = 8454,
 
         // when adding a contextual keyword following functions must be adapted:
         // <see cref="SyntaxFacts.GetContextualKeywordKinds()"/>
@@ -712,6 +718,7 @@ namespace Cnidaria.Cs
         RefValueExpression = 8766,
         RefTypeExpression = 8767,
         // NameOfExpression = 8768, // we represent nameof(x) as an invocation expression
+        UnsafeExpression = 8769,
 
         // query expressions
         QueryExpression = 8774,
@@ -932,5 +939,7 @@ namespace Cnidaria.Cs
         IgnoredDirectiveTrivia = 9080,
 
         WithElement = 9081,
+
+        UnionDeclaration = 9082,
     }
 }

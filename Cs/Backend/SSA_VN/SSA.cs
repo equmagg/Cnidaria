@@ -1216,7 +1216,7 @@ namespace Cnidaria.Cs
                 var receiver = node.Operands[0];
                 if (TryGetContainedLocalAddressSlot(receiver, out var parentSlot))
                 {
-                    var slot = ResolvePromotedFieldSlot(receiver, parentSlot, node.Field);
+                    var slot = ResolvePromotedFieldSlot(node, receiver, parentSlot, node.Field);
                     access = new SsaLocalAccess(SsaLocalAccessKind.Use, slot, node.Field, receiver, 0, parentSlot);
                     return true;
                 }
@@ -1227,7 +1227,7 @@ namespace Cnidaria.Cs
                 var receiver = node.Operands[0];
                 if (TryGetContainedLocalAddressSlot(receiver, out var parentSlot))
                 {
-                    var slot = ResolvePromotedFieldSlot(receiver, parentSlot, node.Field);
+                    var slot = ResolvePromotedFieldSlot(node, receiver, parentSlot, node.Field);
                     var kind = slot.Equals(parentSlot) ? SsaLocalAccessKind.PartialDefinition : SsaLocalAccessKind.FullDefinition;
                     access = new SsaLocalAccess(kind, slot, node.Field, receiver, 0, parentSlot);
                     return true;
@@ -1238,8 +1238,12 @@ namespace Cnidaria.Cs
             return false;
         }
 
-        private static SsaSlot ResolvePromotedFieldSlot(GenTree receiver, SsaSlot parentSlot, RuntimeField? field)
+        private static SsaSlot ResolvePromotedFieldSlot(GenTree node, GenTree receiver, SsaSlot parentSlot, RuntimeField? field)
         {
+            // A sync access deliberately addresses the parent's storage, not the promoted field local.
+            if ((node.Flags & GenTreeFlags.PromotionSync) != 0)
+                return parentSlot;
+
             if (field is not null && receiver.LocalDescriptor is not null && receiver.LocalDescriptor.TryGetPromotedField(field, out var fieldDescriptor))
                 return new SsaSlot(fieldDescriptor);
 
@@ -1611,7 +1615,7 @@ namespace Cnidaria.Cs
                     descriptor.MarkAddressExposed();
                 else if (descriptor.MemoryAliased)
                     descriptor.MarkMemoryAliased();
-                else if (descriptor.IsImplicitByRef || descriptor.Pinned || descriptor.IsRefLike)
+                else if (descriptor.IsImplicitByRef || descriptor.Pinned)
                     descriptor.MarkMemoryAliased();
                 else if (descriptor.IsCompilerTemp)
                     descriptor.MarkMemoryAliased();
@@ -1680,10 +1684,7 @@ namespace Cnidaria.Cs
                 if (descriptor.AddressExposed || descriptor.MemoryAliased)
                     return false;
 
-                if (descriptor.Pinned || descriptor.IsRefLike)
-                    return false;
-
-                if (descriptor.IsStructField && descriptor.IsImplicitByRef)
+                if (descriptor.Pinned)
                     return false;
 
                 if (descriptor.Category is GenLocalCategory.AddressExposedLocal or GenLocalCategory.MemoryAliasedLocal or GenLocalCategory.ImplicitByRefPinnedRefLikeLocal)
@@ -1704,9 +1705,6 @@ namespace Cnidaria.Cs
                     return false;
 
                 if (descriptor.IsImplicitByRef && descriptor.IsLocalStorageByRefAlias)
-                    return false;
-
-                if (descriptor.IsStructField && descriptor.IsImplicitByRef)
                     return false;
 
                 if (descriptor.Category == GenLocalCategory.PromotedStruct)
@@ -1876,10 +1874,12 @@ namespace Cnidaria.Cs
                     return;
                 }
 
+                // Physical promotion keeps the parent coherent with explicit write-back/read-back, so a
+                // whole-struct access there does not invalidate the field locals.
                 if (SsaSlotHelpers.TryGetDirectLoadSlot(node, out _) ||
                     SsaSlotHelpers.TryGetDirectStoreSlot(node, out _))
                 {
-                    if (node.LocalDescriptor is { HasPromotedStructFields: true } descriptor)
+                    if (node.LocalDescriptor is { HasPromotedStructFields: true, HasPromotionSync: false } descriptor)
                         blocked.Add(descriptor.LclNum);
                 }
 

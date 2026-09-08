@@ -2346,6 +2346,10 @@ namespace Cnidaria.C
                 RequireScalar(left.Type, instruction);
                 RequireScalar(right.Type, instruction);
 
+                // The selected conditions are all false on unordered operands, so their inverses stay NaN-correct
+                var inverted = PrefersInvertedBranch(instruction);
+                var branchTarget = LabelOf(inverted ? instruction.FalseTarget : instruction.TrueTarget);
+
                 if (IsFloatType(left.Type) || IsFloatType(right.Type))
                 {
                     if (!IsFloatType(left.Type) || !IsFloatType(right.Type) || RegisterSize(left.Type) != RegisterSize(right.Type))
@@ -2362,7 +2366,7 @@ namespace Cnidaria.C
                         ArmInstrKind.Fcmp,
                         Reg(ToArmRegister(FpScratch1), size),
                         Reg(ToArmRegister(FpScratch2), size)));
-                    EmitConditionalJump(SelectFloatingCondition(instruction.Operator), LabelOf(instruction.TrueTarget));
+                    EmitConditionalJump(MaybeInvert(SelectFloatingCondition(instruction.Operator), inverted), branchTarget);
                 }
                 else
                 {
@@ -2374,12 +2378,19 @@ namespace Cnidaria.C
                     if (rightRegister != Scratch2)
                         MoveRegister(Scratch2, rightRegister, size);
                     Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch1), size), Reg(ToArm(Scratch2), size)));
-                    EmitConditionalJump(SelectCondition(instruction.Operator, IsSignedIntegerType(left.Type)), LabelOf(instruction.TrueTarget));
+                    EmitConditionalJump(MaybeInvert(SelectCondition(instruction.Operator, IsSignedIntegerType(left.Type)), inverted), branchTarget);
                 }
 
-                if (!IsFallthroughTarget(instruction.FalseTarget))
+                if (!inverted && !IsFallthroughTarget(instruction.FalseTarget))
                     EmitJump(LabelOf(instruction.FalseTarget));
             }
+
+            /// <summary>Reports whether the true target falls through, so branching on the negated condition removes the jump</summary>
+            private bool PrefersInvertedBranch(LirInstruction instruction)
+                => IsFallthroughTarget(instruction.TrueTarget) && !IsFallthroughTarget(instruction.FalseTarget);
+
+            private static ArmCondition MaybeInvert(ArmCondition condition, bool invert)
+                => invert ? (ArmCondition)((byte)condition ^ 1) : condition;
 
             private static bool IsComparisonOperator(string op)
                 => op is "==" or "!=" or "<" or "<=" or ">" or ">=";
@@ -2442,7 +2453,7 @@ namespace Cnidaria.C
 
             private void EmitParallelCopy(LirInstruction instruction)
             {
-                var copies = instruction.ParallelCopies.Where(copy => !ReferencesSamePhysicalStorage(copy.Source, copy.Destination)).ToArray();
+                var copies = instruction.ParallelCopies.Where(_allocation.RequiresPhysicalParallelCopy).ToArray();
                 if (copies.Length == 0)
                     return;
                 foreach (var copy in copies)
@@ -2453,11 +2464,14 @@ namespace Cnidaria.C
 
                 if (copies.Length == 1)
                 {
-                    var destination = GetWritableRegister(
-                        copies[0].Destination,
-                        PreferredScratch(copies[0].Destination.Type, Scratch0, FpScratch0));
-                    LoadOperandIntoAs(copies[0].Source, destination, copies[0].Destination.Type, instruction);
-                    StoreWritableRegisterIfSpilled(copies[0].Destination, destination);
+                    EmitDirectParallelCopy(copies[0], instruction);
+                    return;
+                }
+
+                if (_allocation.TryOrderParallelCopies(copies, out var ordered))
+                {
+                    foreach (var copy in ordered)
+                        EmitDirectParallelCopy(copy, instruction);
                     return;
                 }
 
@@ -2489,15 +2503,13 @@ namespace Cnidaria.C
                 }
             }
 
-            private bool ReferencesSamePhysicalStorage(LirOperand source, LirVirtualRegister destination)
+            private void EmitDirectParallelCopy(LirParallelCopy copy, LirInstruction instruction)
             {
-                if (source.Kind != LirOperandKind.Register || source.Register is null)
-                    return false;
-                var sourceAllocation = _allocation[source.Register];
-                var destinationAllocation = _allocation[destination];
-                if (!sourceAllocation.IsSpilled && !destinationAllocation.IsSpilled)
-                    return sourceAllocation.PhysicalRegister == destinationAllocation.PhysicalRegister;
-                return sourceAllocation.IsSpilled && destinationAllocation.IsSpilled && sourceAllocation.StackOffset == destinationAllocation.StackOffset;
+                var destination = GetWritableRegister(
+                    copy.Destination,
+                    PreferredScratch(copy.Destination.Type, Scratch0, FpScratch0));
+                LoadOperandIntoAs(copy.Source, destination, copy.Destination.Type, instruction);
+                StoreWritableRegisterIfSpilled(copy.Destination, destination);
             }
 
             private MachineRegister LoadOperandAs(LirOperand operand, QualifiedType targetType, MachineRegister scratch, LirInstruction instruction)

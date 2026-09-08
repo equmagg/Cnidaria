@@ -830,6 +830,22 @@ namespace Cnidaria.Cs
                         return true;
                     }
 
+                    if (i == parentArgumentIndex && abi.PassingKind is AbiValuePassingKind.Indirect or AbiValuePassingKind.Stack)
+                    {
+                        // Such an argument always has an incoming home holding its bytes; read the field out of it.
+                        if (!_method.StackFrame.TryGetArgumentSlot(parentArgumentIndex, out StackFrameSlot indirectHome))
+                            return false;
+
+                        source = RegisterOperand.ForFrameSlot(
+                            fieldRegisterClass == RegisterClass.Invalid ? RegisterClass.General : fieldRegisterClass,
+                            StackFrameSlotKind.Argument,
+                            RegisterFrameBase.StackPointer,
+                            indirectHome.Index,
+                            checked(indirectHome.Offset + fieldOffset),
+                            fieldSize);
+                        return true;
+                    }
+
                     if (abi.PassingKind == AbiValuePassingKind.Void)
                         continue;
 

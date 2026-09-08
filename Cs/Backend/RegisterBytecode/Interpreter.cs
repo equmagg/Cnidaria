@@ -2805,6 +2805,62 @@ namespace Cnidaria.Cs
             return true;
         }
 
+        private bool IntrinsicInterlockedExchange(RuntimeMethod rm, InterlockedExchangeIntrinsic intrinsic)
+        {
+            long location = ReadAbiScalarArgument(rm, 0);
+            if (location == 0)
+                throw new NullReferenceException();
+
+            int address = checked((int)location);
+            ulong mask = intrinsic.Size switch
+            {
+                1 => 0xFFUL,
+                2 => 0xFFFFUL,
+                4 => 0xFFFFFFFFUL,
+                8 => ulong.MaxValue,
+                _ => throw new InvalidOperationException($"Unsupported Interlocked.Exchange size: {intrinsic.Size}.")
+            };
+            ulong value = unchecked((ulong)ReadAbiScalarArgument(rm, 1)) & mask;
+            ulong original = intrinsic.Size switch
+            {
+                1 => ReadU8(address),
+                2 => ReadU16(address),
+                4 => unchecked((uint)ReadI32(address)),
+                8 => unchecked((ulong)ReadI64(address)),
+                _ => throw new InvalidOperationException()
+            };
+
+            switch (intrinsic.Size)
+            {
+                case 1:
+                    WriteU8(address, unchecked((byte)value));
+                    break;
+                case 2:
+                    WriteU16(address, unchecked((ushort)value));
+                    break;
+                case 4:
+                    WriteI32(address, unchecked((int)value));
+                    break;
+                case 8:
+                    WriteI64(address, unchecked((long)value));
+                    break;
+            }
+
+            long result = intrinsic.Size switch
+            {
+                1 when intrinsic.IsSigned => unchecked((sbyte)original),
+                2 when intrinsic.IsSigned => unchecked((short)original),
+                4 when intrinsic.IsSigned => unchecked((int)original),
+                1 => unchecked((byte)original),
+                2 => unchecked((ushort)original),
+                4 => unchecked((uint)original),
+                8 => unchecked((long)original),
+                _ => throw new InvalidOperationException()
+            };
+            SetGpr(MachineRegisters.ReturnValue0, result);
+            return true;
+        }
+
         private bool IntrinsicInterlockedExchangeAdd(RuntimeMethod rm, InterlockedExchangeAddIntrinsic intrinsic)
         {
             long location = ReadAbiScalarArgument(rm, 0);
@@ -2848,6 +2904,11 @@ namespace Cnidaria.Cs
                         return IntrinsicInterlockedCompareExchange(rm, runtimeIntrinsic.CompareExchange);
                     case RuntimeIntrinsicId.InterlockedExchangeAdd:
                         return IntrinsicInterlockedExchangeAdd(rm, runtimeIntrinsic.ExchangeAdd);
+                    case RuntimeIntrinsicId.InterlockedExchange:
+                        return IntrinsicInterlockedExchange(rm, runtimeIntrinsic.Exchange);
+                    case RuntimeIntrinsicId.MemoryBarrier:
+                        // The register VM runs one instruction at a time, so a barrier has nothing to order
+                        return true;
                     default:
                         return false;
                 }
@@ -2917,7 +2978,7 @@ namespace Cnidaria.Cs
                 return true;
             }
 
-            if (rm.DeclaringType.Namespace == "System" &&
+            if (rm.DeclaringType.Namespace == "System.Runtime" &&
                 rm.DeclaringType.Name == "RuntimeImports" &&
                 rm.HasInternalCall &&
                 !rm.HasThis &&

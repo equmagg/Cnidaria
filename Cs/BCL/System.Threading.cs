@@ -1,4 +1,4 @@
-﻿namespace System.Threading
+namespace System.Threading
 {
     public class SynchronizationLockException : SystemException
     {
@@ -582,6 +582,160 @@
         #endregion
 
         #region Exchange
+        /// <summary>Sets an 8-bit signed integer to a specified value and returns the original value, as an atomic operation.</summary>
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static sbyte Exchange(ref sbyte location1, sbyte value) =>
+            (sbyte)Exchange(ref Unsafe.As<sbyte, byte>(ref location1), (byte)value);
+
+        /// <summary>Sets an 8-bit unsigned integer to a specified value and returns the original value, as an atomic operation.</summary>
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static byte Exchange(ref byte location1, byte value)
+        {
+            return Exchange(ref location1, value); // Must expand intrinsic
+        }
+
+        /// <summary>Sets a 16-bit signed integer to a specified value and returns the original value, as an atomic operation.</summary>
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static short Exchange(ref short location1, short value) =>
+            (short)Exchange(ref Unsafe.As<short, ushort>(ref location1), (ushort)value);
+
+        /// <summary>Sets a 16-bit unsigned integer to a specified value and returns the original value, as an atomic operation.</summary>
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static ushort Exchange(ref ushort location1, ushort value)
+        {
+            return Exchange(ref location1, value); // Must expand intrinsic
+        }
+
+        /// <summary>Sets a 32-bit signed integer to a specified value and returns the original value, as an atomic operation.</summary>
+        /// <param name="location1">The variable to set to the specified value.</param>
+        /// <param name="value">The value to which the <paramref name="location1"/> parameter is set.</param>
+        /// <returns>The original value of <paramref name="location1"/>.</returns>
+        /// <exception cref="NullReferenceException">The address of location1 is a null pointer.</exception>
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int Exchange(ref int location1, int value)
+        {
+            return Exchange(ref location1, value); // Must expand intrinsic
+        }
+
+        /// <summary>Sets a 32-bit unsigned integer to a specified value and returns the original value, as an atomic operation.</summary>
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static uint Exchange(ref uint location1, uint value) =>
+            (uint)Exchange(ref Unsafe.As<uint, int>(ref location1), (int)value);
+
+        /// <summary>Sets a 64-bit signed integer to a specified value and returns the original value, as an atomic operation.</summary>
+        /// <param name="location1">The variable to set to the specified value.</param>
+        /// <param name="value">The value to which the <paramref name="location1"/> parameter is set.</param>
+        /// <returns>The original value of <paramref name="location1"/>.</returns>
+        /// <exception cref="NullReferenceException">The address of location1 is a null pointer.</exception>
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static long Exchange(ref long location1, long value)
+        {
+            return Exchange(ref location1, value); // Must expand intrinsic
+        }
+
+        /// <summary>Sets a 64-bit unsigned integer to a specified value and returns the original value, as an atomic operation.</summary>
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static ulong Exchange(ref ulong location1, ulong value) =>
+            (ulong)Exchange(ref Unsafe.As<ulong, long>(ref location1), (long)value);
+
+        /// <summary>Sets a single-precision floating point number to a specified value and returns the original value, as an atomic operation.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Exchange(ref float location1, float value)
+            => Unsafe.BitCast<int, float>(Exchange(ref Unsafe.As<float, int>(ref location1), Unsafe.BitCast<float, int>(value)));
+
+        /// <summary>Sets a double-precision floating point number to a specified value and returns the original value, as an atomic operation.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static double Exchange(ref double location1, double value)
+            => Unsafe.BitCast<long, double>(Exchange(ref Unsafe.As<double, long>(ref location1), Unsafe.BitCast<double, long>(value)));
+
+        /// <summary>Sets a platform-specific handle or pointer to a specified value and returns the original value, as an atomic operation.</summary>
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static nint Exchange(ref nint location1, nint value)
+        {
+#if TARGET_64BIT
+            return (nint)Exchange(ref Unsafe.As<nint, long>(ref location1), (long)value);
+#else
+            return (nint)Exchange(ref Unsafe.As<nint, int>(ref location1), (int)value);
+#endif
+        }
+
+        /// <summary>Sets a platform-specific handle or pointer to a specified value and returns the original value, as an atomic operation.</summary>
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static nuint Exchange(ref nuint location1, nuint value)
+        {
+#if TARGET_64BIT
+            return (nuint)Exchange(ref Unsafe.As<nuint, long>(ref location1), (long)value);
+#else
+            return (nuint)Exchange(ref Unsafe.As<nuint, int>(ref location1), (int)value);
+#endif
+        }
+
+        /// <summary>Sets an object to a specified value and returns a reference to the original object, as an atomic operation.</summary>
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static object? Exchange(ref object? location1, object? value)
+        {
+            return Exchange(ref location1, value); // Must expand intrinsic
+        }
+
+        /// <summary>Sets a variable of the specified type <typeparamref name="T"/> to a specified value and returns the original value, as an atomic operation.</summary>
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe T Exchange<T>(ref T location1, T value)
+        {
+            // Handle all reference types with Exchange(ref object, ...).
+            if (!typeof(T).IsValueType)
+            {
+                object? result = Exchange(ref Unsafe.As<T, object?>(ref location1), value);
+                return Unsafe.As<object?, T>(ref result);
+            }
+
+            // Handle everything else with an Exchange overload for the integral type of the corresponding size.
+            // Only primitive types and enum types (which are backed by primitive types) are supported.
+            if (!typeof(T).IsPrimitive && !typeof(T).IsEnum)
+            {
+                throw new NotSupportedException();
+            }
+
+            if (sizeof(T) == 1)
+            {
+                return Unsafe.BitCast<byte, T>(
+                    Exchange(
+                        ref Unsafe.As<T, byte>(ref location1),
+                        Unsafe.BitCast<T, byte>(value)));
+            }
+
+            if (sizeof(T) == 2)
+            {
+                return Unsafe.BitCast<ushort, T>(
+                    Exchange(
+                        ref Unsafe.As<T, ushort>(ref location1),
+                        Unsafe.BitCast<T, ushort>(value)));
+            }
+
+            if (sizeof(T) == 4)
+            {
+                return Unsafe.BitCast<int, T>(
+                    Exchange(
+                        ref Unsafe.As<T, int>(ref location1),
+                        Unsafe.BitCast<T, int>(value)));
+            }
+
+            return Unsafe.BitCast<long, T>(
+                Exchange(
+                    ref Unsafe.As<T, long>(ref location1),
+                    Unsafe.BitCast<T, long>(value)));
+        }
         #endregion
 
         #region CompareExchange
@@ -781,6 +935,30 @@
         #endregion
 
         #region MemoryBarrier
+        /// <summary>
+        /// Synchronizes memory access as follows:
+        /// The processor that executes the current thread cannot reorder instructions in such a way that memory accesses before
+        /// the call to <see cref="MemoryBarrier"/> execute after memory accesses that follow the call to <see cref="MemoryBarrier"/>.
+        /// </summary>
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void MemoryBarrier() => MemoryBarrier(); // Must expand intrinsic
+
+        /// <summary>
+        /// Synchronizes memory access as follows: the processor executing the current thread cannot reorder
+        /// instructions in such a way that memory reads before the call to <see cref="ReadMemoryBarrier"/>
+        /// execute after memory accesses that follow the call to <see cref="ReadMemoryBarrier"/>.
+        /// </summary>
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static void ReadMemoryBarrier()
+        {
+            ReadMemoryBarrier(); // Must expand intrinsic
+        }
+
+        /// <summary>Provides a process-wide memory barrier that ensures that reads and writes from any CPU cannot move across the barrier.</summary>
+        /// <remarks>The runtime has no way to interrupt other processors, so this is a full barrier on the current one.</remarks>
+        public static void MemoryBarrierProcessWide() => MemoryBarrier();
         #endregion
     }
 }

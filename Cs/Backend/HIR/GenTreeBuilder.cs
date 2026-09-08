@@ -88,6 +88,7 @@ namespace Cnidaria.Cs
                 }
             }
 
+            _rts.EnsureAllTypesReady();
             return new GenTreeProgram(_rts, SortedBuiltMethods());
         }
 
@@ -166,6 +167,7 @@ namespace Cnidaria.Cs
                     break;
             }
 
+            _rts.EnsureAllTypesReady();
             return new GenTreeProgram(_rts, SortedBuiltMethods());
 
             bool Enqueue(RuntimeMethod method)

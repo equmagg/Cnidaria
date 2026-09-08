@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Globalization;
@@ -99,61 +99,61 @@ namespace Cnidaria.C
     public sealed class LirModule
     {
         public SemanticModel SemanticModel { get; }
-        public GimpleTree GimpleTree { get; }
-        public SsaGraph SsaGraph { get; }
+        public GimpleTree InputGimpleTree { get; }
+        public GimplePipelineResult Gimple { get; }
         public ImmutableArray<LirGlobal> Globals { get; }
         public ImmutableArray<LirFunction> Functions { get; }
         public ImmutableArray<LirProblem> Problems { get; }
 
         private LirModule(
-            SsaGraph ssaGraph,
+            GimplePipelineResult gimple,
             ImmutableArray<LirGlobal> globals,
             ImmutableArray<LirFunction> functions,
             ImmutableArray<LirProblem> problems)
         {
-            SsaGraph = ssaGraph ?? throw new ArgumentNullException(nameof(ssaGraph));
-            GimpleTree = ssaGraph.GimpleTree;
-            SemanticModel = ssaGraph.SemanticModel;
+            Gimple = gimple ?? throw new ArgumentNullException(nameof(gimple));
+            InputGimpleTree = gimple.InputTree;
+            SemanticModel = gimple.SemanticModel;
             Globals = globals.IsDefault ? ImmutableArray<LirGlobal>.Empty : globals;
             Functions = functions.IsDefault ? ImmutableArray<LirFunction>.Empty : functions;
             Problems = problems.IsDefault ? ImmutableArray<LirProblem>.Empty : problems;
         }
 
-        public static LirModule Lower(SemanticModel semanticModel, SsaOptions? ssaOptions = null, LirOptions? options = null)
+        public static LirModule Lower(SemanticModel semanticModel, GimplePipelineOptions? gimpleOptions = null, LirOptions? options = null)
         {
             if (semanticModel is null)
                 throw new ArgumentNullException(nameof(semanticModel));
 
-            return Lower(SsaGraph.Build(semanticModel, ssaOptions), options);
+            return Lower(GimplePipeline.Run(semanticModel, gimpleOptions), options);
         }
 
-        public static LirModule Lower(GimpleTree gimpleTree, SsaOptions? ssaOptions = null, LirOptions? options = null)
+        public static LirModule Lower(GimpleTree gimpleTree, GimplePipelineOptions? gimpleOptions = null, LirOptions? options = null)
         {
             if (gimpleTree is null)
                 throw new ArgumentNullException(nameof(gimpleTree));
 
-            return Lower(SsaGraph.Build(gimpleTree, ssaOptions), options);
+            return Lower(GimplePipeline.Run(gimpleTree, gimpleOptions), options);
         }
 
-        public static LirModule Lower(ControlFlowGraph controlFlowGraph, SsaOptions? ssaOptions = null, LirOptions? options = null)
+        public static LirModule Lower(ControlFlowGraph controlFlowGraph, GimplePipelineOptions? gimpleOptions = null, LirOptions? options = null)
         {
             if (controlFlowGraph is null)
                 throw new ArgumentNullException(nameof(controlFlowGraph));
 
-            return Lower(SsaGraph.Build(controlFlowGraph, ssaOptions), options);
+            return Lower(GimplePipeline.Run(controlFlowGraph, gimpleOptions), options);
         }
 
-        public static LirModule Lower(SsaGraph ssaGraph, LirOptions? options = null)
+        public static LirModule Lower(GimplePipelineResult gimple, LirOptions? options = null)
         {
-            if (ssaGraph is null)
-                throw new ArgumentNullException(nameof(ssaGraph));
+            if (gimple is null)
+                throw new ArgumentNullException(nameof(gimple));
 
             options ??= LirOptions.Default;
             var globals = ImmutableArray.CreateBuilder<LirGlobal>();
             var functions = ImmutableArray.CreateBuilder<LirFunction>();
             var problems = ImmutableArray.CreateBuilder<LirProblem>();
 
-            foreach (var member in ssaGraph.GimpleTree.Members)
+            foreach (var member in gimple.InputTree.Members)
             {
                 if (member is not GimpleGlobalDeclaration global)
                     continue;
@@ -171,17 +171,17 @@ namespace Cnidaria.C
                 }
             }
 
-            foreach (var function in ssaGraph.Functions)
+            foreach (var function in gimple.Functions)
             {
-                var lowered = LirFunctionBuilder.Lower(function, options, ssaGraph.SemanticModel.Compilation.Options.Target);
+                var lowered = LirFunctionBuilder.Lower(function, options, gimple.SemanticModel.Compilation.Options.Target);
                 functions.Add(lowered.Function);
                 problems.AddRange(lowered.Problems);
             }
 
-            foreach (var ssaProblem in ssaGraph.Problems)
-                problems.Add(new LirProblem(LirProblemKind.UnsupportedNode, ssaProblem.Block, null, ssaProblem.Message));
+            foreach (var gimpleProblem in gimple.Problems)
+                problems.Add(new LirProblem(LirProblemKind.UnsupportedNode, gimpleProblem.Block, null, gimpleProblem.Message));
 
-            return new LirModule(ssaGraph, globals.ToImmutable(), functions.ToImmutable(), problems.ToImmutable());
+            return new LirModule(gimple, globals.ToImmutable(), functions.ToImmutable(), problems.ToImmutable());
         }
 
         public override string ToString()
@@ -206,8 +206,8 @@ namespace Cnidaria.C
 
     public sealed class LirFunction
     {
-        public SsaFunction SsaFunction { get; }
-        public FunctionSymbol? Symbol => SsaFunction.Symbol;
+        public GimpleFunctionAnnotations GimpleFunctionAnnotations { get; }
+        public FunctionSymbol? Symbol => GimpleFunctionAnnotations.Symbol;
         public LirBlock Entry { get; }
         public ImmutableArray<LirVirtualRegister> VirtualRegisters { get; }
         public ImmutableArray<LirStackSlot> StackSlots { get; }
@@ -215,14 +215,14 @@ namespace Cnidaria.C
         public ImmutableArray<LirProblem> Problems { get; }
 
         internal LirFunction(
-            SsaFunction ssaFunction,
+            GimpleFunctionAnnotations gimpleFunction,
             LirBlock entry,
             ImmutableArray<LirVirtualRegister> virtualRegisters,
             ImmutableArray<LirStackSlot> stackSlots,
             ImmutableArray<LirBlock> blocks,
             ImmutableArray<LirProblem> problems)
         {
-            SsaFunction = ssaFunction ?? throw new ArgumentNullException(nameof(ssaFunction));
+            GimpleFunctionAnnotations = gimpleFunction ?? throw new ArgumentNullException(nameof(gimpleFunction));
             Entry = entry ?? throw new ArgumentNullException(nameof(entry));
             VirtualRegisters = virtualRegisters.IsDefault ? ImmutableArray<LirVirtualRegister>.Empty : virtualRegisters;
             StackSlots = stackSlots.IsDefault ? ImmutableArray<LirStackSlot>.Empty : stackSlots;
@@ -270,13 +270,13 @@ namespace Cnidaria.C
         public string Name { get; }
         public QualifiedType Type { get; }
         public LirRegisterClass RegisterClass { get; }
-        public SsaName? SourceName { get; }
+        public GimpleName? SourceName { get; }
         public ValueNumber? ValueNumber { get; }
         public MachineRegister FixedRegister { get; }
         public bool HasFixedRegister => FixedRegister != MachineRegister.Invalid;
         public bool IsCompilerTemporary => SourceName is null;
 
-        internal LirVirtualRegister(int ordinal, QualifiedType type, LirRegisterClass registerClass, SsaName? sourceName, ValueNumber? valueNumber, MachineRegister fixedRegister)
+        internal LirVirtualRegister(int ordinal, QualifiedType type, LirRegisterClass registerClass, GimpleName? sourceName, ValueNumber? valueNumber, MachineRegister fixedRegister)
         {
             if (ordinal < 0)
                 throw new ArgumentOutOfRangeException(nameof(ordinal));
@@ -427,7 +427,7 @@ namespace Cnidaria.C
         public LirStackSlot? StackSlot { get; }
         public LirAddress? Address { get; }
         public LirBlock? Label { get; }
-        public SsaName? UndefinedName { get; }
+        public GimpleName? UndefinedName { get; }
 
         private LirOperand(
             LirOperandKind kind,
@@ -438,7 +438,7 @@ namespace Cnidaria.C
             LirStackSlot? stackSlot,
             LirAddress? address,
             LirBlock? label,
-            SsaName? undefinedName)
+            GimpleName? undefinedName)
         {
             Kind = kind;
             Type = GimpleTypeHelpers.Normalize(type);
@@ -494,7 +494,7 @@ namespace Cnidaria.C
             return new LirOperand(LirOperandKind.Label, new QualifiedType(TypeCatalog.Instance.Void), null, null, null, null, null, block, null);
         }
 
-        public static LirOperand Undefined(SsaName? name, QualifiedType type)
+        public static LirOperand Undefined(GimpleName? name, QualifiedType type)
             => new LirOperand(LirOperandKind.Undefined, type, null, null, null, null, null, null, name);
 
         public bool ReferencesSameRegister(LirVirtualRegister register)
@@ -533,6 +533,8 @@ namespace Cnidaria.C
         public ImmutableArray<LirOperand> Operands { get; }
         public LirAddress? Address { get; }
         public string Operator { get; }
+        /// <summary>Gets the tree code the instruction was selected from</summary>
+        public GimpleTreeCode TreeCode { get; }
         public GimpleConversionKind? ConversionKind { get; }
         public FunctionType? CallSignature { get; }
         public ImmutableArray<LirParallelCopy> ParallelCopies { get; }
@@ -542,7 +544,7 @@ namespace Cnidaria.C
         public LirBlock? FalseTarget { get; }
         public GimpleStatement? SourceStatement { get; }
         public GimpleValue? SourceValue { get; }
-        public SsaInstruction? SourceInstruction { get; }
+        public GimpleStatementAnnotations? SourceInstruction { get; }
         public ValueNumber? ValueNumber { get; }
         public bool IsTerminator => Kind is LirInstructionKind.Jump or LirInstructionKind.Branch or LirInstructionKind.Switch or LirInstructionKind.Return or LirInstructionKind.Unreachable ||
             (Kind == LirInstructionKind.InlineAssembly && SourceStatement is GimpleAsmStatement { IsGoto: true });
@@ -563,8 +565,9 @@ namespace Cnidaria.C
             LirBlock? falseTarget,
             GimpleStatement? sourceStatement,
             GimpleValue? sourceValue,
-            SsaInstruction? sourceInstruction,
-            ValueNumber? valueNumber)
+            GimpleStatementAnnotations? sourceInstruction,
+            ValueNumber? valueNumber,
+            GimpleTreeCode treeCode = GimpleTreeCode.None)
         {
             if (ordinal < 0)
                 throw new ArgumentOutOfRangeException(nameof(ordinal));
@@ -575,6 +578,7 @@ namespace Cnidaria.C
             Operands = operands.IsDefault ? ImmutableArray<LirOperand>.Empty : operands;
             Address = address;
             Operator = op ?? string.Empty;
+            TreeCode = treeCode;
             ConversionKind = conversionKind;
             CallSignature = callSignature;
             ParallelCopies = parallelCopies.IsDefault ? ImmutableArray<LirParallelCopy>.Empty : parallelCopies;
@@ -587,6 +591,11 @@ namespace Cnidaria.C
             SourceInstruction = sourceInstruction;
             ValueNumber = valueNumber;
         }
+
+        internal LirInstruction WithResult(LirVirtualRegister result)
+            => new LirInstruction(Ordinal, Kind, result, Operands, Address, Operator, ConversionKind, CallSignature,
+                ParallelCopies, SwitchCases, Target, TrueTarget, FalseTarget, SourceStatement, SourceValue,
+                SourceInstruction, ValueNumber, TreeCode);
     }
 
     public sealed class LirProblem
@@ -609,7 +618,7 @@ namespace Cnidaria.C
 
     internal sealed class LirFunctionBuilder
     {
-        private readonly SsaFunction _function;
+        private readonly GimpleFunctionAnnotations _function;
         private readonly ControlFlowFunction _controlFlowFunction;
         private readonly LirOptions _options;
         private readonly TargetInfo _target;
@@ -617,28 +626,26 @@ namespace Cnidaria.C
         private readonly List<LirStackSlot> _stackSlots = new();
         private readonly List<LirBlock> _blocks = new();
         private readonly List<LirProblem> _problems = new();
-        private readonly Dictionary<SsaName, LirVirtualRegister> _registersByName = new();
+        private readonly Dictionary<GimpleName, LirVirtualRegister> _registersByName = new();
         private readonly Dictionary<ControlFlowBlock, LirBlock> _blocksByControlFlowBlock = new();
         private readonly Dictionary<Symbol, LirStackSlot> _stackSlotsBySymbol = new();
         private readonly Dictionary<GimpleTemporaryValue, LirStackSlot> _stackSlotsByTemporary = new();
         private readonly Dictionary<Symbol, GimpleVariableDeclaration> _localDeclarationsBySymbol = new();
-        private readonly Dictionary<Symbol, SsaVariable> _promotedSymbols = new();
-        private readonly Dictionary<GimpleTemporaryValue, SsaVariable> _promotedTemporaries = new();
+        private readonly Dictionary<Symbol, GimpleVariable> _promotedSymbols = new();
+        private readonly Dictionary<GimpleTemporaryValue, GimpleVariable> _promotedTemporaries = new();
         private readonly Dictionary<(ControlFlowBlock Source, ControlFlowBlock Target), LirBlock> _edgeSplitBlocks = new();
         private readonly Dictionary<(ControlFlowBlock Source, ControlFlowBlock Target), List<LirParallelCopy>> _edgeCopies = new();
         private readonly Dictionary<LirBlock, List<LirInstruction>> _instructions = new();
-        private readonly HashSet<SsaName> _usedSsaNames = new();
-        private readonly Dictionary<SsaName, int> _ssaUseCounts = new();
-        private readonly Dictionary<SsaName, SsaExpression> _comparisonConditionsByName = new();
-        private readonly HashSet<SsaName> _foldedComparisonDefinitions = new();
+        private readonly HashSet<GimpleName> _usedGimpleNames = new();
+        private readonly Dictionary<GimpleName, int> _gimpleUseCounts = new();
         private readonly HashSet<ControlFlowBlock> _reachableControlFlowBlocks = new();
-        private readonly Dictionary<ControlFlowBlock, SsaBlock> _ssaBlocksByControlFlowBlock = new();
+        private readonly Dictionary<ControlFlowBlock, GimpleBlockAnnotations> _gimpleBlocksByControlFlowBlock = new();
 
         private int _nextInstructionOrdinal;
-        private SsaInstruction? _currentInstruction;
+        private GimpleStatementAnnotations? _currentInstruction;
         private LirBlock? _currentBlock;
 
-        private LirFunctionBuilder(SsaFunction function, LirOptions options, TargetInfo target)
+        private LirFunctionBuilder(GimpleFunctionAnnotations function, LirOptions options, TargetInfo target)
         {
             _function = function ?? throw new ArgumentNullException(nameof(function));
             _controlFlowFunction = function.ControlFlowFunction;
@@ -646,7 +653,7 @@ namespace Cnidaria.C
             _target = target;
         }
 
-        public static LoweredLirFunction Lower(SsaFunction function, LirOptions options, TargetInfo? target)
+        public static LoweredLirFunction Lower(GimpleFunctionAnnotations function, LirOptions options, TargetInfo? target)
         {
             var builder = new LirFunctionBuilder(function, options, target ?? TargetInfo.Default);
             return builder.Lower();
@@ -657,15 +664,15 @@ namespace Cnidaria.C
             IndexPromotedVariables();
             IndexReachableControlFlowBlocks();
             ScanLocalDeclarations();
-            IndexUsedSsaNames();
-            IndexComparisonBranches();
-            CreateVirtualRegistersForSsaNames();
+            IndexUsedGimpleNames();
+            CreateVirtualRegistersForGimpleNames();
             CreateBaseBlocks();
             CreateParameterStackSlots();
             CreateEdgeSplitBlocksForPhis();
             TranslateBaseBlocks();
             TranslateEdgeSplitBlocks();
             SealBlocks();
+            CoalesceCopies();
             LayoutBlocks();
 
             var entry = _blocksByControlFlowBlock.TryGetValue(_controlFlowFunction.Entry, out var entryBlock)
@@ -691,7 +698,7 @@ namespace Cnidaria.C
                 if (_reachableControlFlowBlocks.Count != 0 && !_reachableControlFlowBlocks.Contains(block.ControlFlowBlock))
                     continue;
 
-                foreach (var instruction in block.Instructions)
+                foreach (var instruction in block.Statements)
                 {
                     if (instruction.Statement is not GimpleDeclarationStatement)
                         SymbolCollector.Collect(instruction.Statement, referencedSymbols);
@@ -703,7 +710,7 @@ namespace Cnidaria.C
                 if (_reachableControlFlowBlocks.Count != 0 && !_reachableControlFlowBlocks.Contains(block.ControlFlowBlock))
                     continue;
 
-                foreach (var instruction in block.Instructions)
+                foreach (var instruction in block.Statements)
                 {
                     if (instruction.Statement is not GimpleDeclarationStatement declarationStatement ||
                         declarationStatement.Symbol is null ||
@@ -723,9 +730,9 @@ namespace Cnidaria.C
         {
             foreach (var variable in _function.Variables)
             {
-                if (variable.Kind == SsaVariableKind.Symbol && variable.Symbol is not null && !_promotedSymbols.ContainsKey(variable.Symbol))
+                if (variable.Kind == GimpleVariableKind.Symbol && variable.Symbol is not null && !_promotedSymbols.ContainsKey(variable.Symbol))
                     _promotedSymbols.Add(variable.Symbol, variable);
-                else if (variable.Kind == SsaVariableKind.Temporary && variable.Temporary is not null && !_promotedTemporaries.ContainsKey(variable.Temporary))
+                else if (variable.Kind == GimpleVariableKind.Temporary && variable.Temporary is not null && !_promotedTemporaries.ContainsKey(variable.Temporary))
                     _promotedTemporaries.Add(variable.Temporary, variable);
             }
         }
@@ -733,20 +740,20 @@ namespace Cnidaria.C
         private void IndexReachableControlFlowBlocks()
         {
             _reachableControlFlowBlocks.Clear();
-            _ssaBlocksByControlFlowBlock.Clear();
+            _gimpleBlocksByControlFlowBlock.Clear();
             if (_function.Blocks.Length == 0)
                 return;
 
             foreach (var block in _function.Blocks)
             {
-                if (!_ssaBlocksByControlFlowBlock.ContainsKey(block.ControlFlowBlock))
-                    _ssaBlocksByControlFlowBlock.Add(block.ControlFlowBlock, block);
+                if (!_gimpleBlocksByControlFlowBlock.ContainsKey(block.ControlFlowBlock))
+                    _gimpleBlocksByControlFlowBlock.Add(block.ControlFlowBlock, block);
             }
 
-            if (!_ssaBlocksByControlFlowBlock.TryGetValue(_controlFlowFunction.Entry, out var entry))
+            if (!_gimpleBlocksByControlFlowBlock.TryGetValue(_controlFlowFunction.Entry, out var entry))
                 entry = _function.Blocks[0];
 
-            var stack = new Stack<SsaBlock>();
+            var stack = new Stack<GimpleBlockAnnotations>();
             _reachableControlFlowBlocks.Add(entry.ControlFlowBlock);
             stack.Push(entry);
 
@@ -761,15 +768,15 @@ namespace Cnidaria.C
                     if (!_reachableControlFlowBlocks.Add(successor))
                         continue;
 
-                    if (_ssaBlocksByControlFlowBlock.TryGetValue(successor, out var successorBlock))
+                    if (_gimpleBlocksByControlFlowBlock.TryGetValue(successor, out var successorBlock))
                         stack.Push(successorBlock);
                 }
             }
         }
 
-        private IEnumerable<ControlFlowBlock> EnumerateOptimizedSuccessors(SsaBlock block)
+        private IEnumerable<ControlFlowBlock> EnumerateOptimizedSuccessors(GimpleBlockAnnotations block)
         {
-            var terminator = block.Instructions.Length == 0 ? null : block.Instructions[^1].Statement;
+            var terminator = block.Statements.Length == 0 ? null : block.Statements[^1].Statement;
             switch (terminator)
             {
                 case GimpleGotoStatement gotoStatement:
@@ -777,7 +784,7 @@ namespace Cnidaria.C
                         yield return gotoTarget;
                     yield break;
 
-                case GimpleConditionalGotoStatement conditional:
+                case GimpleCondStatement conditional:
                     if (_controlFlowFunction.TryGetBlock(conditional.WhenTrue, out var trueTarget) && trueTarget is not null)
                         yield return trueTarget;
                     if (_controlFlowFunction.TryGetBlock(conditional.WhenFalse, out var falseTarget) && falseTarget is not null && !ReferenceEquals(falseTarget, trueTarget))
@@ -807,17 +814,17 @@ namespace Cnidaria.C
             }
         }
 
-        private void CreateVirtualRegistersForSsaNames()
+        private void CreateVirtualRegistersForGimpleNames()
         {
             foreach (var definition in _function.Definitions)
             {
-                if (definition.Name.Variable.Kind == SsaVariableKind.Memory || definition.Name.IsUndefined)
+                if (definition.Name.Variable.Kind == GimpleVariableKind.Memory || definition.Name.IsUndefined)
                     continue;
 
                 if (_registersByName.ContainsKey(definition.Name))
                     continue;
 
-                if (!IsSsaNameUsed(definition.Name))
+                if (!IsGimpleNameUsed(definition.Name))
                     continue;
 
                 _function.ValueNumbering.TryGetValueNumber(definition.Name, out var valueNumber);
@@ -826,7 +833,7 @@ namespace Cnidaria.C
             }
         }
 
-        private void IndexUsedSsaNames()
+        private void IndexUsedGimpleNames()
         {
             foreach (var block in _function.Blocks)
             {
@@ -837,72 +844,31 @@ namespace Cnidaria.C
                 {
                     foreach (var operand in phi.Operands)
                     {
-                        if (!operand.Value.IsUndefined && operand.Value.Variable.Kind != SsaVariableKind.Memory)
-                            RecordSsaUse(operand.Value);
+                        if (!operand.Value.IsUndefined && operand.Value.Variable.Kind != GimpleVariableKind.Memory)
+                            RecordGimpleUse(operand.Value);
                     }
                 }
 
-                foreach (var instruction in block.Instructions)
+                foreach (var instruction in block.Statements)
                 {
                     foreach (var use in instruction.Uses)
                     {
-                        if (use.Kind != SsaUseKind.Memory && !use.Name.IsUndefined && use.Name.Variable.Kind != SsaVariableKind.Memory)
-                            RecordSsaUse(use.Name);
+                        if (use.Kind != GimpleUseKind.Memory && !use.Name.IsUndefined && use.Name.Variable.Kind != GimpleVariableKind.Memory)
+                            RecordGimpleUse(use.Name);
                     }
                 }
             }
         }
 
-        private void RecordSsaUse(SsaName name)
+        private void RecordGimpleUse(GimpleName name)
         {
-            _usedSsaNames.Add(name);
-            _ssaUseCounts.TryGetValue(name, out var count);
-            _ssaUseCounts[name] = count + 1;
+            _usedGimpleNames.Add(name);
+            _gimpleUseCounts.TryGetValue(name, out var count);
+            _gimpleUseCounts[name] = count + 1;
         }
 
-        private void IndexComparisonBranches()
-        {
-            foreach (var block in _function.Blocks)
-            {
-                if (_reachableControlFlowBlocks.Count != 0 && !_reachableControlFlowBlocks.Contains(block.ControlFlowBlock))
-                    continue;
-
-                for (var index = 1; index < block.Instructions.Length; index++)
-                {
-                    var branchInstruction = block.Instructions[index];
-                    if (branchInstruction.Statement is not GimpleConditionalGotoStatement ||
-                        !TryGetExpression(branchInstruction, 0, out var conditionExpression) ||
-                        conditionExpression.Name is not { } conditionName ||
-                        !_ssaUseCounts.TryGetValue(conditionName, out var useCount) ||
-                        useCount != 1)
-                    {
-                        continue;
-                    }
-
-                    var producer = block.Instructions[index - 1];
-                    if (producer.Statement is not GimpleAssignmentStatement assignment)
-                        continue;
-
-                    var definition = GetPrimaryDefinition(producer);
-                    if (definition is null || !ReferenceEquals(definition.Name, conditionName))
-                        continue;
-
-                    if (!TryGetAssignmentValueExpression(producer, assignment, out var valueExpression) ||
-                        valueExpression.Original is not GimpleBinaryExpression binary ||
-                        !IsComparisonOperator(TokenText(binary.OperatorToken)))
-                    {
-                        continue;
-                    }
-
-                    _comparisonConditionsByName[conditionName] = valueExpression;
-                    _foldedComparisonDefinitions.Add(conditionName);
-                    _usedSsaNames.Remove(conditionName);
-                }
-            }
-        }
-
-        private bool IsSsaNameUsed(SsaName name)
-            => _usedSsaNames.Contains(name);
+        private bool IsGimpleNameUsed(GimpleName name)
+            => _usedGimpleNames.Contains(name);
 
         private void CreateBaseBlocks()
         {
@@ -946,16 +912,18 @@ namespace Cnidaria.C
 
                 foreach (var phi in block.Phis)
                 {
-                    if (phi.Result.Variable.Kind == SsaVariableKind.Memory || !IsSsaNameUsed(phi.Result))
+                    if (phi.Result.Variable.Kind == GimpleVariableKind.Memory || !IsGimpleNameUsed(phi.Result))
                         continue;
 
                     if (!_blocksByControlFlowBlock.ContainsKey(phi.Block))
                         continue;
 
                     var destination = GetRegister(phi.Result);
+                    var seenPredecessors = new HashSet<ControlFlowBlock>();
                     foreach (var operand in phi.Operands)
                     {
-                        if (!_blocksByControlFlowBlock.ContainsKey(operand.Predecessor))
+                        if (!seenPredecessors.Add(operand.Predecessor) ||
+                            !_blocksByControlFlowBlock.ContainsKey(operand.Predecessor))
                             continue;
 
                         var source = GetOperand(operand.Value);
@@ -997,7 +965,7 @@ namespace Cnidaria.C
 
         private bool CanInlineEdgeCopies(ControlFlowBlock source, ControlFlowBlock target)
         {
-            if (!_ssaBlocksByControlFlowBlock.TryGetValue(source, out var sourceBlock))
+            if (!_gimpleBlocksByControlFlowBlock.TryGetValue(source, out var sourceBlock))
                 return source.UniqueSuccessors.Length == 1 && ReferenceEquals(source.UniqueSuccessors[0], target);
 
             var successorCount = 0;
@@ -1015,26 +983,26 @@ namespace Cnidaria.C
             if (successorCount != 1)
                 return false;
 
-            var terminator = sourceBlock.Instructions.Length == 0 ? null : sourceBlock.Instructions[^1].Statement;
-            return terminator is null or GimpleGotoStatement or GimpleConditionalGotoStatement;
+            var terminator = sourceBlock.Statements.Length == 0 ? null : sourceBlock.Statements[^1].Statement;
+            return terminator is null or GimpleGotoStatement or GimpleCondStatement;
         }
 
         private void TranslateBaseBlocks()
         {
-            foreach (var ssaBlock in _function.Blocks)
+            foreach (var gimpleBlock in _function.Blocks)
             {
-                if (!_blocksByControlFlowBlock.TryGetValue(ssaBlock.ControlFlowBlock, out var block))
+                if (!_blocksByControlFlowBlock.TryGetValue(gimpleBlock.ControlFlowBlock, out var block))
                     continue;
 
                 _currentBlock = block;
 
-                if (ReferenceEquals(ssaBlock.ControlFlowBlock, _controlFlowFunction.Entry))
+                if (ReferenceEquals(gimpleBlock.ControlFlowBlock, _controlFlowFunction.Entry))
                     EmitEntryParameters(block);
 
-                foreach (var instruction in ssaBlock.Instructions)
+                foreach (var instruction in gimpleBlock.Statements)
                     TranslateInstruction(block, instruction);
 
-                EnsureTerminator(block, ssaBlock.ControlFlowBlock);
+                EnsureTerminator(block, gimpleBlock.ControlFlowBlock);
                 _currentBlock = null;
             }
         }
@@ -1049,9 +1017,9 @@ namespace Cnidaria.C
             {
                 var parameter = functionType.Parameters[i];
                 var definition = _function.Definitions.FirstOrDefault(d =>
-                    d.Kind == SsaDefinitionKind.Entry &&
+                    d.Kind == GimpleDefinitionKind.Entry &&
                     ReferenceEquals(d.Parameter, parameter) &&
-                    d.Name.Variable.Kind != SsaVariableKind.Memory);
+                    d.Name.Variable.Kind != GimpleVariableKind.Memory);
 
                 if (definition is not null && _registersByName.TryGetValue(definition.Name, out var register))
                 {
@@ -1086,7 +1054,7 @@ namespace Cnidaria.C
             }
         }
 
-        private void TranslateInstruction(LirBlock block, SsaInstruction instruction)
+        private void TranslateInstruction(LirBlock block, GimpleStatementAnnotations instruction)
         {
             _currentInstruction = instruction;
 
@@ -1097,27 +1065,20 @@ namespace Cnidaria.C
                         EmitNop(block, declaration);
                     break;
 
-                case GimpleAssignmentStatement assignment:
-                    TranslateAssignment(block, instruction, assignment);
+                case GimpleAssignStatement assign:
+                    TranslateAssign(block, instruction, assign);
                     break;
 
-                case GimpleZeroInitializeStatement zeroInitialize:
-                    TranslateZeroInitialize(block, instruction, zeroInitialize);
-                    break;
-
-                case GimpleExpressionStatement expressionStatement:
-                    if (TryGetExpression(instruction, 0, out var expression))
-                        _ = EmitValue(block, expression, materializeCallResult: false);
-                    else
-                        _ = EmitValue(block, expressionStatement.Expression, expression: null, materializeCallResult: false);
+                case GimpleCallStatement call:
+                    TranslateCall(block, instruction, call);
                     break;
 
                 case GimpleGotoStatement gotoStatement:
                     EmitJump(block, instruction.Block, gotoStatement.Target, gotoStatement);
                     break;
 
-                case GimpleConditionalGotoStatement conditional:
-                    TranslateConditionalGoto(block, instruction, conditional);
+                case GimpleCondStatement conditional:
+                    TranslateCond(block, instruction, conditional);
                     break;
 
                 case GimpleSwitchStatement switchStatement:
@@ -1147,30 +1108,24 @@ namespace Cnidaria.C
             _currentInstruction = null;
         }
 
-        private void TranslateAssignment(LirBlock block, SsaInstruction instruction, GimpleAssignmentStatement assignment)
+        private void TranslateAssign(LirBlock block, GimpleStatementAnnotations instruction, GimpleAssignStatement assign)
         {
-            var valueExpression = TryGetAssignmentValueExpression(instruction, assignment, out var expression)
-                ? expression
-                : null;
             var definition = GetPrimaryDefinition(instruction);
+            var operandStart = definition is null ? 1 : 0;
 
-            if (definition is not null && _foldedComparisonDefinitions.Contains(definition.Name))
-                return;
-
-            if (definition is not null && !IsSsaNameUsed(definition.Name))
+            if (assign.IsConstructor)
             {
-                if (valueExpression is null)
-                    _ = EmitValue(block, assignment.Value, expression: null, materializeCallResult: false);
-                else
-                    _ = EmitValue(block, valueExpression, materializeCallResult: false);
+                TranslateConstructor(block, instruction, assign, definition);
                 return;
             }
 
+            if (definition is not null && !IsGimpleNameUsed(definition.Name))
+                return;
+
             var destination = definition is null ? null : GetRegister(definition.Name);
-            var value = valueExpression is null
-                ? EmitValue(block, assignment.Value, expression: null, materializeCallResult: true, destination: destination)
-                : EmitValue(block, valueExpression, materializeCallResult: true, destination: destination);
-            if (IsVoid(assignment.Target.Type) || value.Kind == LirOperandKind.Void || IsVoid(value.Type))
+            var value = EmitRhs(block, instruction, assign, operandStart, destination);
+
+            if (IsVoid(assign.Lhs.Type) || value.Kind == LirOperandKind.Void || IsVoid(value.Type))
                 return;
 
             if (definition is not null && destination is not null)
@@ -1178,53 +1133,175 @@ namespace Cnidaria.C
                 if (value.ReferencesSameRegister(destination))
                     return;
 
-                _function.ValueNumbering.TryGetValueNumber(definition, out var valueNumber);
-                Emit(block, LirInstructionKind.Copy, destination, ImmutableArray.Create(value), address: null, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: assignment, sourceValue: assignment.Value, sourceInstruction: instruction, valueNumber: valueNumber);
-                return;
-            }
-
-            var address = TryGetAssignmentTargetAddressExpression(instruction, out var addressExpression)
-                ? EmitAddress(block, addressExpression)
-                : EmitAddress(block, assignment.Target);
-
-            Emit(block, LirInstructionKind.Store, null, ImmutableArray.Create(value), address, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: assignment, sourceValue: assignment.Value, sourceInstruction: instruction, valueNumber: null);
-        }
-
-        private void TranslateZeroInitialize(LirBlock block, SsaInstruction instruction, GimpleZeroInitializeStatement zeroInitialize)
-        {
-            var definition = GetPrimaryDefinition(instruction);
-            if (definition is not null)
-            {
-                var destination = GetRegister(definition.Name);
-                _function.ValueNumbering.TryGetValueNumber(definition, out var valueNumber);
-                Emit(block, LirInstructionKind.Zero, destination, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: zeroInitialize, sourceValue: null, sourceInstruction: instruction, valueNumber: valueNumber);
+                _function.ValueNumbering.TryGetValueNumber(definition, out var definitionValueNumber);
+                Emit(block, LirInstructionKind.Copy, destination, ImmutableArray.Create(value), address: null, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: assign, sourceValue: assign.Op1, sourceInstruction: instruction, valueNumber: definitionValueNumber);
                 return;
             }
 
             var address = TryGetExpression(instruction, 0, out var addressExpression)
                 ? EmitAddress(block, addressExpression)
-                : EmitAddress(block, zeroInitialize.Target);
-            var size = _target.SizeOf(zeroInitialize.Target.Type);
-            Emit(block, LirInstructionKind.ZeroMemory, null, ImmutableArray.Create(LirOperand.ImmediateValue(size, TypeCatalog.Instance.Builtin(BuiltinTypeKind.Int))), address, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: zeroInitialize, sourceValue: null, sourceInstruction: instruction, valueNumber: null);
+                : EmitAddress(block, assign.Lhs);
+
+            Emit(block, LirInstructionKind.Store, null, ImmutableArray.Create(value), address, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: assign, sourceValue: assign.Op1, sourceInstruction: instruction, valueNumber: null);
         }
 
-        private void TranslateConditionalGoto(LirBlock block, SsaInstruction instruction, GimpleConditionalGotoStatement conditional)
+        /// <summary>Selects the instruction that computes an assignment right-hand side</summary>
+        private LirOperand EmitRhs(
+            LirBlock block,
+            GimpleStatementAnnotations instruction,
+            GimpleAssignStatement assign,
+            int operandStart,
+            LirVirtualRegister? destination)
         {
-            var hasExpression = TryGetExpression(instruction, 0, out var expression);
-            ImmutableArray<LirOperand> operands;
-            string op;
-            LirOperand? condition = null;
-
-            if (!TryEmitComparisonCondition(block, conditional.Condition, hasExpression ? expression : null, out operands, out op))
+            switch (assign.RhsClass)
             {
-                var conditionValue = hasExpression
-                    ? EmitValue(block, expression)
-                    : EmitValue(block, conditional.Condition);
-                condition = conditionValue;
-                operands = ImmutableArray.Create(conditionValue);
-                op = string.Empty;
+                case GimpleRhsClass.Single:
+                    return EmitOperand(block, instruction, assign, operandStart, destination);
+
+                case GimpleRhsClass.Unary:
+                    return EmitUnaryRhs(block, instruction, assign, operandStart, destination);
+
+                case GimpleRhsClass.Binary:
+                    return EmitBinaryRhs(block, instruction, assign, operandStart, destination);
+
+                default:
+                    _problems.Add(new LirProblem(
+                        LirProblemKind.UnsupportedNode,
+                        instruction.Block,
+                        assign,
+                        "Unsupported GIMPLE assignment subcode in LIR lowering: " + GimpleOperators.Name(assign.Subcode)));
+                    return LirOperand.Undefined(null, assign.Lhs.Type);
+            }
+        }
+
+        private LirOperand EmitOperand(
+            LirBlock block,
+            GimpleStatementAnnotations instruction,
+            GimpleAssignStatement assign,
+            int index,
+            LirVirtualRegister? destination)
+        {
+            return TryGetExpression(instruction, index, out var expression)
+                ? EmitValue(block, expression, destination: destination)
+                : EmitValue(block, assign.Operands[0], expression: null, destination: destination);
+        }
+
+        private LirOperand EmitUnaryRhs(
+            LirBlock block,
+            GimpleStatementAnnotations instruction,
+            GimpleAssignStatement assign,
+            int operandStart,
+            LirVirtualRegister? destination)
+        {
+            var operandExpression = TryGetExpression(instruction, operandStart, out var rewritten) ? rewritten : null;
+            var operand = operandExpression is null
+                ? EmitValue(block, assign.Operands[0])
+                : EmitValue(block, operandExpression);
+
+            if (IsVoid(assign.Lhs.Type))
+                return LirOperand.Void;
+
+            var result = GetResultRegister(assign.Lhs.Type, GetDefinitionValueNumber(instruction), destination);
+
+            if (GimpleOperators.IsConversion(assign.Subcode))
+            {
+                var kind = assign.Subcode == GimpleTreeCode.ViewConvertExpr
+                    ? LirInstructionKind.Cast
+                    : LirInstructionKind.Convert;
+
+                Emit(block, kind, result, ImmutableArray.Create(operand), address: null, op: GimpleOperators.Name(assign.Subcode),
+                    conversionKind: ConversionKindOf(assign.Subcode), callSignature: null, parallelCopies: default, switchCases: default,
+                    target: null, trueTarget: null, falseTarget: null, sourceStatement: assign, sourceValue: assign.Op1,
+                    sourceInstruction: instruction, valueNumber: GetDefinitionValueNumber(instruction), treeCode: assign.Subcode);
+                return LirOperand.ForRegister(result);
             }
 
+            Emit(block, LirInstructionKind.Unary, result, ImmutableArray.Create(operand), address: null, op: GimpleOperators.Spelling(assign.Subcode),
+                conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null,
+                falseTarget: null, sourceStatement: assign, sourceValue: assign.Op1, sourceInstruction: instruction,
+                valueNumber: GetDefinitionValueNumber(instruction), treeCode: assign.Subcode);
+            return LirOperand.ForRegister(result);
+        }
+
+        private LirOperand EmitBinaryRhs(
+            LirBlock block,
+            GimpleStatementAnnotations instruction,
+            GimpleAssignStatement assign,
+            int operandStart,
+            LirVirtualRegister? destination)
+        {
+            var leftExpression = TryGetExpression(instruction, operandStart, out var rewrittenLeft) ? rewrittenLeft : null;
+            var rightExpression = TryGetExpression(instruction, operandStart + 1, out var rewrittenRight) ? rewrittenRight : null;
+            var left = leftExpression is null ? EmitValue(block, assign.Operands[0]) : EmitValue(block, leftExpression);
+            var right = rightExpression is null ? EmitValue(block, assign.Operands[1]) : EmitValue(block, rightExpression);
+
+            if (IsVoid(assign.Lhs.Type))
+                return LirOperand.Void;
+
+            var result = GetResultRegister(assign.Lhs.Type, GetDefinitionValueNumber(instruction), destination);
+            Emit(block, LirInstructionKind.Binary, result, ImmutableArray.Create(left, right), address: null,
+                op: GimpleOperators.Spelling(assign.Subcode), conversionKind: null, callSignature: null, parallelCopies: default,
+                switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: assign,
+                sourceValue: assign.Op1, sourceInstruction: instruction, valueNumber: GetDefinitionValueNumber(instruction),
+                treeCode: assign.Subcode);
+            return LirOperand.ForRegister(result);
+        }
+
+        private void TranslateConstructor(
+            LirBlock block,
+            GimpleStatementAnnotations instruction,
+            GimpleAssignStatement assign,
+            GimpleDefinition? definition)
+        {
+            if (definition is not null)
+            {
+                var destination = GetRegister(definition.Name);
+                _function.ValueNumbering.TryGetValueNumber(definition, out var valueNumber);
+                Emit(block, LirInstructionKind.Zero, destination, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: assign, sourceValue: null, sourceInstruction: instruction, valueNumber: valueNumber);
+                return;
+            }
+
+            var address = TryGetExpression(instruction, 0, out var addressExpression)
+                ? EmitAddress(block, addressExpression)
+                : EmitAddress(block, assign.Lhs);
+            var size = _target.SizeOf(assign.Lhs.Type);
+            Emit(block, LirInstructionKind.ZeroMemory, null, ImmutableArray.Create(LirOperand.ImmediateValue(size, TypeCatalog.Instance.Builtin(BuiltinTypeKind.Int))), address, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: assign, sourceValue: null, sourceInstruction: instruction, valueNumber: null);
+        }
+
+        private void TranslateCall(LirBlock block, GimpleStatementAnnotations instruction, GimpleCallStatement call)
+        {
+            var definition = GetPrimaryDefinition(instruction);
+            var hasLhsAddress = call.Lhs is not null && definition is null;
+            var functionIndex = hasLhsAddress ? 1 : 0;
+
+            var destination = definition is not null && IsGimpleNameUsed(definition.Name)
+                ? GetRegister(definition.Name)
+                : null;
+
+            var value = EmitCall(block, instruction, call, functionIndex, destination);
+
+            if (call.Lhs is null || value.Kind == LirOperandKind.Void || IsVoid(call.Type))
+                return;
+
+            if (definition is not null)
+            {
+                if (destination is null || value.ReferencesSameRegister(destination))
+                    return;
+
+                _function.ValueNumbering.TryGetValueNumber(definition, out var valueNumber);
+                Emit(block, LirInstructionKind.Copy, destination, ImmutableArray.Create(value), address: null, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: call, sourceValue: null, sourceInstruction: instruction, valueNumber: valueNumber);
+                return;
+            }
+
+            var address = TryGetExpression(instruction, 0, out var addressExpression)
+                ? EmitAddress(block, addressExpression)
+                : EmitAddress(block, call.Lhs);
+
+            Emit(block, LirInstructionKind.Store, null, ImmutableArray.Create(value), address, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: call, sourceValue: null, sourceInstruction: instruction, valueNumber: null);
+        }
+
+        private void TranslateCond(LirBlock block, GimpleStatementAnnotations instruction, GimpleCondStatement conditional)
+        {
             var trueTarget = ResolveTarget(instruction.Block, conditional.WhenTrue, conditional);
             var falseTarget = ResolveTarget(instruction.Block, conditional.WhenFalse, conditional);
 
@@ -1234,68 +1311,56 @@ namespace Cnidaria.C
                 return;
             }
 
-            if (condition is not null && TryGetImmediateTruth(condition, out var truth))
+            var leftExpression = TryGetExpression(instruction, 0, out var rewrittenLeft) ? rewrittenLeft : null;
+            var rightExpression = TryGetExpression(instruction, 1, out var rewrittenRight) ? rewrittenRight : null;
+            var left = leftExpression is null ? EmitValue(block, conditional.Lhs) : EmitValue(block, leftExpression);
+
+            // A test against zero stays a single-operand branch so the target keeps its truth test
+            if (conditional.Code == GimpleTreeCode.NeExpr && IsZeroConstant(conditional.Rhs))
             {
-                EmitJump(block, instruction.Block, truth ? conditional.WhenTrue : conditional.WhenFalse, conditional);
+                if (TryGetImmediateTruth(left, out var truth))
+                {
+                    EmitJump(block, instruction.Block, truth ? conditional.WhenTrue : conditional.WhenFalse, conditional);
+                    return;
+                }
+
+                Emit(block, LirInstructionKind.Branch, null, ImmutableArray.Create(left), address: null, op: string.Empty, conversionKind: null,
+                    callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: trueTarget,
+                    falseTarget: falseTarget, sourceStatement: conditional, sourceValue: conditional.Lhs, sourceInstruction: instruction,
+                    valueNumber: null, treeCode: conditional.Code);
                 return;
             }
 
-            Emit(block, LirInstructionKind.Branch, null, operands, address: null, op: op, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: trueTarget, falseTarget: falseTarget, sourceStatement: conditional, sourceValue: conditional.Condition, sourceInstruction: instruction, valueNumber: null);
+            var right = rightExpression is null ? EmitValue(block, conditional.Rhs) : EmitValue(block, rightExpression);
+            Emit(block, LirInstructionKind.Branch, null, ImmutableArray.Create(left, right), address: null,
+                op: GimpleOperators.Spelling(conditional.Code), conversionKind: null, callSignature: null, parallelCopies: default,
+                switchCases: default, target: null, trueTarget: trueTarget, falseTarget: falseTarget, sourceStatement: conditional,
+                sourceValue: conditional.Lhs, sourceInstruction: instruction, valueNumber: null, treeCode: conditional.Code);
         }
 
-        private bool TryEmitComparisonCondition(
-            LirBlock block,
-            GimpleValue condition,
-            SsaExpression? expression,
-            out ImmutableArray<LirOperand> operands,
-            out string op)
+        private static bool IsZeroConstant(GimpleValue value)
+            => value is GimpleConstantValue constant && IsZeroObject(constant.Value);
+
+        private static bool IsZeroObject(object? value)
         {
-            SsaExpression? binaryExpression = null;
-            GimpleBinaryExpression? binary = null;
-
-            if (expression?.Original is GimpleBinaryExpression expressionBinary)
+            switch (value)
             {
-                binaryExpression = expression;
-                binary = expressionBinary;
+                case null: return true;
+                case sbyte number: return number == 0;
+                case byte number: return number == 0;
+                case short number: return number == 0;
+                case ushort number: return number == 0;
+                case int number: return number == 0;
+                case uint number: return number == 0;
+                case long number: return number == 0;
+                case ulong number: return number == 0;
+                case bool flag: return !flag;
+                case char character: return character == '\0';
+                default: return false;
             }
-            else if (expression?.Name is { } conditionName &&
-                     _comparisonConditionsByName.TryGetValue(conditionName, out var foldedExpression) &&
-                     foldedExpression.Original is GimpleBinaryExpression foldedBinary)
-            {
-                binaryExpression = foldedExpression;
-                binary = foldedBinary;
-            }
-            else if (condition is GimpleBinaryExpression conditionBinary)
-            {
-                binary = conditionBinary;
-            }
-
-            if (binary is null)
-            {
-                operands = default;
-                op = string.Empty;
-                return false;
-            }
-
-            op = TokenText(binary.OperatorToken);
-            if (!IsComparisonOperator(op))
-            {
-                operands = default;
-                op = string.Empty;
-                return false;
-            }
-
-            var left = GetChild(binaryExpression, 0) is { } leftExpression
-                ? EmitValue(block, leftExpression)
-                : EmitValue(block, binary.Left);
-            var right = GetChild(binaryExpression, 1) is { } rightExpression
-                ? EmitValue(block, rightExpression)
-                : EmitValue(block, binary.Right);
-            operands = ImmutableArray.Create(left, right);
-            return true;
         }
 
-        private void TranslateSwitch(LirBlock block, SsaInstruction instruction, GimpleSwitchStatement switchStatement)
+        private void TranslateSwitch(LirBlock block, GimpleStatementAnnotations instruction, GimpleSwitchStatement switchStatement)
         {
             var value = TryGetExpression(instruction, 0, out var expression)
                 ? EmitValue(block, expression)
@@ -1312,7 +1377,7 @@ namespace Cnidaria.C
             Emit(block, LirInstructionKind.Switch, null, ImmutableArray.Create(value), address: null, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: cases.ToImmutable(), target: defaultTarget, trueTarget: null, falseTarget: null, sourceStatement: switchStatement, sourceValue: switchStatement.Expression, sourceInstruction: instruction, valueNumber: null);
         }
 
-        private void TranslateReturn(LirBlock block, SsaInstruction instruction, GimpleReturnStatement returnStatement)
+        private void TranslateReturn(LirBlock block, GimpleStatementAnnotations instruction, GimpleReturnStatement returnStatement)
         {
             var operands = ImmutableArray<LirOperand>.Empty;
             if (returnStatement.Expression is not null)
@@ -1326,20 +1391,20 @@ namespace Cnidaria.C
             Emit(block, LirInstructionKind.Return, null, operands, address: null, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: returnStatement, sourceValue: returnStatement.Expression, sourceInstruction: instruction, valueNumber: null);
         }
 
-        private void TranslateAsm(LirBlock block, SsaInstruction instruction, GimpleAsmStatement asmStatement)
+        private void TranslateAsm(LirBlock block, GimpleStatementAnnotations instruction, GimpleAsmStatement asmStatement)
         {
             var operands = ImmutableArray.CreateBuilder<LirOperand>();
             var copies = ImmutableArray.CreateBuilder<LirParallelCopy>();
-            var postStores = new List<(GimplePlace Target, LirVirtualRegister Register, SsaExpression? AddressExpression)>();
+            var postStores = new List<(GimplePlace Target, LirVirtualRegister Register, GimpleOperandInfo? AddressExpression)>();
             var definitions = instruction.Definitions
-                .Where(static definition => definition.Name.Variable.Kind != SsaVariableKind.Memory)
+                .Where(static definition => definition.Name.Variable.Kind != GimpleVariableKind.Memory)
                 .ToArray();
             var definitionIndex = 0;
             var expressionIndex = 0;
 
             foreach (var output in asmStatement.Outputs)
             {
-                SsaExpression? initialExpression = null;
+                GimpleOperandInfo? initialExpression = null;
                 if (output.IsReadWrite && output.Value is not null)
                 {
                     if (TryGetExpression(instruction, expressionIndex, out var expression))
@@ -1347,7 +1412,7 @@ namespace Cnidaria.C
                     expressionIndex++;
                 }
 
-                SsaExpression? addressExpression = null;
+                GimpleOperandInfo? addressExpression = null;
                 var storage = output.Target is null
                     ? InlineAsmOperandStorage.Register
                     : InlineAsmConstraints.PreferredStorage(output.Constraint, output.Target.Type);
@@ -1397,7 +1462,7 @@ namespace Cnidaria.C
 
             foreach (var input in asmStatement.Inputs)
             {
-                SsaExpression? expression = null;
+                GimpleOperandInfo? expression = null;
                 if (TryGetExpression(instruction, expressionIndex, out var rewritten))
                     expression = rewritten;
                 expressionIndex++;
@@ -1450,7 +1515,7 @@ namespace Cnidaria.C
             return null;
         }
 
-        private LirOperand MaterializeAsmRegisterInput(LirBlock block, GimpleAsmStatement statement, GimpleValue sourceValue, LirOperand value, SsaInstruction instruction)
+        private LirOperand MaterializeAsmRegisterInput(LirBlock block, GimpleAsmStatement statement, GimpleValue sourceValue, LirOperand value, GimpleStatementAnnotations instruction)
         {
             if (value.Kind == LirOperandKind.Register)
                 return value;
@@ -1460,7 +1525,7 @@ namespace Cnidaria.C
             return LirOperand.ForRegister(register);
         }
 
-        private static bool TryGetVariableDefinitionTarget(GimplePlace target, SsaDefinition[] definitions, int startIndex)
+        private static bool TryGetVariableDefinitionTarget(GimplePlace target, GimpleDefinition[] definitions, int startIndex)
         {
             for (var i = startIndex; i < definitions.Length; i++)
             {
@@ -1481,7 +1546,7 @@ namespace Cnidaria.C
             return false;
         }
 
-        private LirOperand EmitValue(LirBlock block, SsaExpression expression, bool materializeCallResult = true, LirVirtualRegister? destination = null)
+        private LirOperand EmitValue(LirBlock block, GimpleOperandInfo expression, LirVirtualRegister? destination = null)
         {
             if (expression.Name is not null && !expression.IsAddress)
                 return GetOperand(expression.Name);
@@ -1492,57 +1557,45 @@ namespace Cnidaria.C
                 return EmitAddressValue(block, address, expression.Original, expression, destination);
             }
 
-            return EmitValue(block, expression.Original, expression, materializeCallResult, destination);
+            return EmitValue(block, expression.Original, expression, destination);
         }
 
         private LirOperand EmitValue(LirBlock block, GimpleValue value)
-            => EmitValue(block, value, expression: null, materializeCallResult: true, destination: null);
+            => EmitValue(block, value, expression: null, destination: null);
 
-        private LirOperand EmitValue(LirBlock block, GimpleValue value, SsaExpression? expression, bool materializeCallResult = true, LirVirtualRegister? destination = null)
+        private LirOperand EmitValue(LirBlock block, GimpleValue value, GimpleOperandInfo? expression, LirVirtualRegister? destination = null)
         {
             switch (value)
             {
+                case GimpleName name:
+                    return GetOperand(name);
+
                 case GimpleSymbolValue symbolValue:
                     if (expression?.Name is not null)
                         return GetOperand(expression.Name);
                     if (symbolValue.Symbol is FunctionSymbol)
                         return LirOperand.ForSymbol(symbolValue.Symbol, new QualifiedType(TypeCatalog.Instance.PointerTo(symbolValue.Type)));
-                    return EmitLoad(block, EmitAddress(block, symbolValue), symbolValue.Type, value, expression);
+                    return EmitLoad(block, EmitAddress(block, symbolValue), symbolValue.Type, value, expression, destination);
 
                 case GimpleTemporaryValue temporary:
                     if (expression?.Name is not null)
                         return GetOperand(expression.Name);
-                    return EmitLoad(block, EmitAddress(block, temporary), temporary.Type, value, expression);
+                    return EmitLoad(block, EmitAddress(block, temporary), temporary.Type, value, expression, destination);
 
                 case GimpleConstantValue constant:
                     return LirOperand.ImmediateValue(constant.Value, constant.Type);
 
-                case GimpleUnaryExpression unary:
-                    return EmitUnary(block, unary, expression, destination);
-
-                case GimpleBinaryExpression binary:
-                    return EmitBinary(block, binary, expression, destination);
-
-                case GimpleConversionExpression conversion:
-                    return EmitConversion(block, conversion, expression, materializeCallResult, destination);
-
-                case GimpleCastExpression cast:
-                    return EmitCast(block, cast, expression, materializeCallResult, destination);
-
                 case GimpleAddressOfExpression addressOf:
-                    return EmitAddressValue(block, EmitAddress(block, addressOf.Target, GetChild(expression, 0)), addressOf, expression);
+                    return EmitAddressOf(block, addressOf, expression, destination);
 
                 case GimpleIndirectExpression indirect:
-                    return EmitLoad(block, EmitAddress(block, indirect, expression), indirect.Type, indirect, expression);
+                    return EmitLoad(block, EmitAddress(block, indirect, expression), indirect.Type, indirect, expression, destination);
 
                 case GimpleElementAccessExpression elementAccess:
-                    return EmitLoad(block, EmitAddress(block, elementAccess, expression), elementAccess.Type, elementAccess, expression);
+                    return EmitLoad(block, EmitAddress(block, elementAccess, expression), elementAccess.Type, elementAccess, expression, destination);
 
                 case GimpleMemberAccessExpression memberAccess:
-                    return EmitLoad(block, EmitAddress(block, memberAccess, expression), memberAccess.Type, memberAccess, expression);
-
-                case GimpleCallExpression call:
-                    return EmitCall(block, call, expression, materializeCallResult, destination);
+                    return EmitLoad(block, EmitAddress(block, memberAccess, expression), memberAccess.Type, memberAccess, expression, destination);
 
                 case GimpleErrorValue:
                     return LirOperand.Undefined(null, value.Type);
@@ -1553,234 +1606,173 @@ namespace Cnidaria.C
             }
         }
 
-        private LirOperand EmitUnary(LirBlock block, GimpleUnaryExpression unary, SsaExpression? expression, LirVirtualRegister? destination = null)
+        // A declaration address stays a symbol operand so direct references keep their relocation
+        private LirOperand EmitAddressOf(LirBlock block, GimpleAddressOfExpression addressOf, GimpleOperandInfo? expression, LirVirtualRegister? destination)
         {
-            var operand = GetChild(expression, 0) is { } child
-                ? EmitValue(block, child)
-                : EmitValue(block, unary.Operand);
-            var result = GetResultRegister(unary.Type, expression, destination);
-            Emit(block, LirInstructionKind.Unary, result, ImmutableArray.Create(operand), address: null, op: TokenText(unary.OperatorToken),
-                conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
-                sourceStatement: _currentInstruction?.Statement, sourceValue: unary, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
-            return LirOperand.ForRegister(result);
-        }
-
-        private LirOperand EmitBinary(LirBlock block, GimpleBinaryExpression binary, SsaExpression? expression, LirVirtualRegister? destination = null)
-        {
-            var left = GetChild(expression, 0) is { } leftExpression
-                ? EmitValue(block, leftExpression)
-                : EmitValue(block, binary.Left);
-            var right = GetChild(expression, 1) is { } rightExpression
-                ? EmitValue(block, rightExpression)
-                : EmitValue(block, binary.Right);
-            var result = GetResultRegister(binary.Type, expression, destination);
-            Emit(block, LirInstructionKind.Binary, result, ImmutableArray.Create(left, right), address: null, op: TokenText(binary.OperatorToken),
-                conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
-                sourceStatement: _currentInstruction?.Statement, sourceValue: binary, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
-            return LirOperand.ForRegister(result);
-        }
-
-        private LirOperand EmitConversion(LirBlock block, GimpleConversionExpression conversion, SsaExpression? expression, bool materializeResult = true, LirVirtualRegister? destination = null)
-        {
-            if (!materializeResult)
-            {
-                if (GetChild(expression, 0) is { } discardedChild)
-                    _ = EmitValue(block, discardedChild, materializeCallResult: false);
-                else
-                    _ = EmitValue(block, conversion.Operand, expression: null, materializeCallResult: false);
-                return LirOperand.Void;
-            }
-
-            if (conversion.ConversionKind == GimpleConversionKind.ArrayToPointer)
-                return EmitArrayToPointer(block, conversion, expression, destination);
-
-            var forwardsDestination = conversion.ConversionKind == GimpleConversionKind.Identity &&
-                SameType(conversion.Operand.Type, conversion.Type);
-            var operand = GetChild(expression, 0) is { } child
-                ? EmitValue(block, child, destination: forwardsDestination ? destination : null)
-                : EmitValue(block, conversion.Operand, expression: null, materializeCallResult: true, destination: forwardsDestination ? destination : null);
-
-            if (conversion.ConversionKind == GimpleConversionKind.Identity && SameType(operand.Type, conversion.Type))
-                return operand;
-
-            if (IsVoid(conversion.Type))
-                return LirOperand.Void;
-
-            if (conversion.ConversionKind == GimpleConversionKind.FunctionToPointer &&
-                operand.Kind == LirOperandKind.Symbol &&
-                operand.Symbol is FunctionSymbol function)
+            if (addressOf.Target is GimpleSymbolValue { Symbol: FunctionSymbol function } functionValue)
             {
                 if (function.IntrinsicKind is RuntimeIntrinsicKind.BuiltinVaStart or RuntimeIntrinsicKind.BuiltinVaArg)
                 {
                     _problems.Add(new LirProblem(
                         LirProblemKind.UnsupportedNode,
                         _currentInstruction?.Block,
-                        conversion,
+                        addressOf,
                         "Cannot take address of compiler intrinsic. "));
-                    return LirOperand.Undefined(null, conversion.Type);
+                    return LirOperand.Undefined(null, addressOf.Type);
                 }
-                return LirOperand.ForSymbol(operand.Symbol, conversion.Type);
+
+                return LirOperand.ForSymbol(functionValue.Symbol, addressOf.Type);
             }
 
-            var result = GetResultRegister(conversion.Type, expression, destination);
-            Emit(block, LirInstructionKind.Convert, result, ImmutableArray.Create(operand), address: null, op: conversion.ConversionKind.ToString(),
-                conversionKind: conversion.ConversionKind, callSignature: null, parallelCopies: default, switchCases: default, target: null,
-                trueTarget: null, falseTarget: null, sourceStatement: _currentInstruction?.Statement, sourceValue: conversion,
-                sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
-            return LirOperand.ForRegister(result);
+            return EmitAddressValue(block, EmitAddress(block, addressOf.Target, GetChild(expression, 0)), addressOf.Type, addressOf, expression, destination);
         }
-        private LirOperand EmitArrayToPointer(LirBlock block, GimpleConversionExpression conversion, SsaExpression? expression, LirVirtualRegister? destination = null)
+
+        /// <summary>Maps a conversion tree code onto the semantic conversion the pipeline records</summary>
+        private static GimpleConversionKind ConversionKindOf(GimpleTreeCode code)
         {
-            var child = GetChild(expression, 0);
-
-            if (conversion.Operand is GimpleConstantValue { Value: string text })
-                return LirOperand.ImmediateValue(text, conversion.Type);
-
-            if (child?.Original is GimpleConstantValue { Value: string childText })
-                return LirOperand.ImmediateValue(childText, conversion.Type);
-
-            if (child is not null && child.IsAddress)
-                return EmitAddressValue(block, EmitAddress(block, child), conversion.Type, conversion, expression, destination);
-
-            if (conversion.Operand is GimplePlace place)
-                return EmitAddressValue(block, EmitAddress(block, place, child), conversion.Type, conversion, expression, destination);
-
-            if (child?.Original is GimplePlace childPlace)
-                return EmitAddressValue(block, EmitAddress(block, childPlace, child), conversion.Type, conversion, expression, destination);
-
-            _problems.Add(new LirProblem(
-                LirProblemKind.InvalidAddress,
-                _currentInstruction?.Block,
-                conversion,
-                "Cannot decay a non-addressable array expression to pointer."));
-
-            return LirOperand.Undefined(null, conversion.Type);
-        }
-        private LirOperand EmitCast(LirBlock block, GimpleCastExpression cast, SsaExpression? expression, bool materializeResult = true, LirVirtualRegister? destination = null)
-        {
-            if (!materializeResult)
+            switch (code)
             {
-                if (GetChild(expression, 0) is { } discardedChild)
-                    _ = EmitValue(block, discardedChild, materializeCallResult: false);
-                else
-                    _ = EmitValue(block, cast.Operand, expression: null, materializeCallResult: false);
-                return LirOperand.Void;
+                case GimpleTreeCode.FloatExpr:
+                case GimpleTreeCode.FixTruncExpr:
+                case GimpleTreeCode.ConvertExpr:
+                    return GimpleConversionKind.Explicit;
+                case GimpleTreeCode.ViewConvertExpr:
+                    return GimpleConversionKind.Explicit;
+                case GimpleTreeCode.NopExpr:
+                    return GimpleConversionKind.Implicit;
+                default:
+                    return GimpleConversionKind.Identity;
             }
-
-            var operand = GetChild(expression, 0) is { } child
-                ? EmitValue(block, child)
-                : EmitValue(block, cast.Operand);
-            if (IsVoid(cast.Type))
-                return LirOperand.Void;
-            var result = GetResultRegister(cast.Type, expression, destination);
-            Emit(block, LirInstructionKind.Cast, result, ImmutableArray.Create(operand), address: null, op: "cast", conversionKind: null,
-                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
-                sourceStatement: _currentInstruction?.Statement, sourceValue: cast, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
-            return LirOperand.ForRegister(result);
         }
 
-        private LirOperand EmitCall(LirBlock block, GimpleCallExpression call, SsaExpression? expression, bool materializeResult = true, LirVirtualRegister? destination = null)
+        private ValueNumber? GetDefinitionValueNumber(GimpleStatementAnnotations instruction)
         {
-            if (TryGetRuntimeIntrinsic(call.Callee, out var intrinsic))
+            var definition = GetPrimaryDefinition(instruction);
+            if (definition is null)
+                return null;
+
+            _function.ValueNumbering.TryGetValueNumber(definition, out var valueNumber);
+            return valueNumber;
+        }
+
+        private LirOperand EmitCall(
+            LirBlock block,
+            GimpleStatementAnnotations instruction,
+            GimpleCallStatement call,
+            int functionIndex,
+            LirVirtualRegister? destination)
+        {
+            if (TryGetRuntimeIntrinsic(call.Function, out var intrinsic))
             {
                 switch (intrinsic)
                 {
                     case RuntimeIntrinsicKind.BuiltinVaStart:
-                        return EmitVaStart(block, call, expression, destination);
+                        return EmitVaStart(block, instruction, call, functionIndex, destination);
                     case RuntimeIntrinsicKind.BuiltinVaArg:
-                        return EmitVaArg(block, call, expression, destination);
+                        return EmitVaArg(block, instruction, call, functionIndex, destination);
                 }
             }
-            var operands = ImmutableArray.CreateBuilder<LirOperand>();
-            operands.Add(GetChild(expression, 0) is { } calleeExpression
-                ? EmitValue(block, calleeExpression)
-                : EmitValue(block, call.Callee));
 
+            var operands = ImmutableArray.CreateBuilder<LirOperand>(call.Arguments.Length + 1);
+            operands.Add(EmitCallOperand(block, instruction, functionIndex, call.Function));
             for (var i = 0; i < call.Arguments.Length; i++)
-            {
-                var child = GetChild(expression, i + 1);
-                operands.Add(child is null ? EmitValue(block, call.Arguments[i]) : EmitValue(block, child));
-            }
+                operands.Add(EmitCallOperand(block, instruction, functionIndex + 1 + i, call.Arguments[i]));
 
-            var needsMaterializedResult = materializeResult || RequiresMaterializedCallResult(call);
-            LirVirtualRegister? result = IsVoid(call.Type) || !needsMaterializedResult
+            // A destination the renamer left in memory still needs the result materialized before it is stored
+            var storesToMemory = call.Lhs is not null && GetPrimaryDefinition(instruction) is null;
+            var needsResult = destination is not null || storesToMemory || RequiresMaterializedCallResult(call.Type);
+            LirVirtualRegister? result = IsVoid(call.Type) || !needsResult
                 ? null
-                : GetResultRegister(call.Type, expression, destination);
+                : destination ?? NewVirtualRegister(call.Type, sourceName: null, valueNumber: null);
+
             Emit(block, LirInstructionKind.Call, result, operands.ToImmutable(), address: null, op: string.Empty, conversionKind: null,
                 callSignature: call.FunctionType, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
-                sourceStatement: _currentInstruction?.Statement, sourceValue: call, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
+                sourceStatement: call, sourceValue: null, sourceInstruction: instruction, valueNumber: GetDefinitionValueNumber(instruction),
+                treeCode: GimpleTreeCode.CallExpr);
             return result is null ? LirOperand.Void : LirOperand.ForRegister(result);
         }
 
-        private bool RequiresMaterializedCallResult(GimpleCallExpression call)
+        private LirOperand EmitCallOperand(LirBlock block, GimpleStatementAnnotations instruction, int index, GimpleValue original)
+            => TryGetExpression(instruction, index, out var expression)
+                ? EmitValue(block, expression)
+                : EmitValue(block, original);
+
+        private bool RequiresMaterializedCallResult(QualifiedType type)
         {
-            if (IsVoid(call.Type))
+            if (IsVoid(type))
                 return false;
 
-            return call.Type.Type is RVVectorType || CAbi.RequiresHiddenReturnBuffer(_target, call.Type);
+            return type.Type is RVVectorType || CAbi.RequiresHiddenReturnBuffer(_target, type);
         }
 
-        private LirOperand EmitVaStart(LirBlock block, GimpleCallExpression call, SsaExpression? expression, LirVirtualRegister? destination = null)
+        private LirOperand EmitVaStart(
+            LirBlock block,
+            GimpleStatementAnnotations instruction,
+            GimpleCallStatement call,
+            int functionIndex,
+            LirVirtualRegister? destination)
         {
             if (call.Arguments.Length > 1)
             {
                 _problems.Add(new LirProblem(
                     LirProblemKind.UnsupportedNode,
-                    _currentInstruction?.Block,
+                    instruction.Block,
                     call,
                     "__builtin_va_start expects zero or one explicit argument after macro expansion."));
             }
 
-            var operands = ImmutableArray.CreateBuilder<LirOperand>();
-            if (call.Arguments.Length == 1)
-            {
-                var child = GetChild(expression, 1);
-                operands.Add(child is null ? EmitValue(block, call.Arguments[0]) : EmitValue(block, child));
-            }
+            var operands = ImmutableArray.CreateBuilder<LirOperand>(call.Arguments.Length);
+            for (var i = 0; i < call.Arguments.Length; i++)
+                operands.Add(EmitCallOperand(block, instruction, functionIndex + 1 + i, call.Arguments[i]));
 
-            LirVirtualRegister? result = IsVoid(call.Type) ? null : GetResultRegister(call.Type, expression, destination);
+            LirVirtualRegister? result = IsVoid(call.Type)
+                ? null
+                : destination ?? NewVirtualRegister(call.Type, sourceName: null, valueNumber: null);
+
             Emit(block, LirInstructionKind.VaStart, result, operands.ToImmutable(), address: null, op: string.Empty, conversionKind: null,
                 callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
-                sourceStatement: _currentInstruction?.Statement, sourceValue: call, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
+                sourceStatement: call, sourceValue: null, sourceInstruction: instruction, valueNumber: GetDefinitionValueNumber(instruction));
             return result is null ? LirOperand.Void : LirOperand.ForRegister(result);
         }
 
-        private LirOperand EmitVaArg(LirBlock block, GimpleCallExpression call, SsaExpression? expression, LirVirtualRegister? destination = null)
+        private LirOperand EmitVaArg(
+            LirBlock block,
+            GimpleStatementAnnotations instruction,
+            GimpleCallStatement call,
+            int functionIndex,
+            LirVirtualRegister? destination)
         {
             if (call.Arguments.Length != 4)
             {
                 _problems.Add(new LirProblem(
                     LirProblemKind.UnsupportedNode,
-                    _currentInstruction?.Block,
+                    instruction.Block,
                     call,
                     "__builtin_va_arg expects a va_list pointer, kind, size, and alignment."));
             }
 
-            var operands = ImmutableArray.CreateBuilder<LirOperand>();
+            var operands = ImmutableArray.CreateBuilder<LirOperand>(call.Arguments.Length);
             for (var i = 0; i < call.Arguments.Length; i++)
-            {
-                var child = GetChild(expression, i + 1);
-                operands.Add(child is null ? EmitValue(block, call.Arguments[i]) : EmitValue(block, child));
-            }
+                operands.Add(EmitCallOperand(block, instruction, functionIndex + 1 + i, call.Arguments[i]));
 
-            LirVirtualRegister? result = IsVoid(call.Type) ? null : GetResultRegister(call.Type, expression, destination);
+            LirVirtualRegister? result = IsVoid(call.Type)
+                ? null
+                : destination ?? NewVirtualRegister(call.Type, sourceName: null, valueNumber: null);
+
             Emit(block, LirInstructionKind.VaArg, result, operands.ToImmutable(), address: null, op: string.Empty, conversionKind: null,
                 callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
-                sourceStatement: _currentInstruction?.Statement, sourceValue: call, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
+                sourceStatement: call, sourceValue: null, sourceInstruction: instruction, valueNumber: GetDefinitionValueNumber(instruction));
             return result is null ? LirOperand.Void : LirOperand.ForRegister(result);
         }
+
         private static bool TryGetRuntimeIntrinsic(GimpleValue value, out RuntimeIntrinsicKind intrinsic)
         {
             while (true)
             {
                 switch (value)
                 {
-                    case GimpleConversionExpression conversion
-                    when conversion.ConversionKind is GimpleConversionKind.FunctionToPointer or GimpleConversionKind.Identity:
-                        value = conversion.Operand;
-                        continue;
-                    case GimpleCastExpression cast:
-                        value = cast.Operand;
+                    case GimpleAddressOfExpression address:
+                        value = address.Target;
                         continue;
                     case GimpleSymbolValue { Symbol: FunctionSymbol function } when function.IntrinsicKind != RuntimeIntrinsicKind.None:
                         intrinsic = function.IntrinsicKind;
@@ -1792,18 +1784,18 @@ namespace Cnidaria.C
             }
         }
 
-        private LirOperand EmitLoad(LirBlock block, LirAddress address, QualifiedType type, GimpleValue sourceValue, SsaExpression? expression)
+        private LirOperand EmitLoad(LirBlock block, LirAddress address, QualifiedType type, GimpleValue sourceValue, GimpleOperandInfo? expression, LirVirtualRegister? destination = null)
         {
-            var result = NewVirtualRegister(type, sourceName: null, GetValueNumber(expression));
+            var result = GetResultRegister(type, GetValueNumber(expression), destination);
             Emit(block, LirInstructionKind.Load, result, ImmutableArray<LirOperand>.Empty, address, op: string.Empty, conversionKind: null,
                 callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
                 sourceStatement: _currentInstruction?.Statement, sourceValue: sourceValue, sourceInstruction: _currentInstruction, valueNumber: GetValueNumber(expression));
             return LirOperand.ForRegister(result);
         }
 
-        private LirOperand EmitAddressValue(LirBlock block, LirAddress address, GimpleValue sourceValue, SsaExpression? expression, LirVirtualRegister? destination = null)
+        private LirOperand EmitAddressValue(LirBlock block, LirAddress address, GimpleValue sourceValue, GimpleOperandInfo? expression, LirVirtualRegister? destination = null)
             => EmitAddressValue(block, address, new QualifiedType(TypeCatalog.Instance.PointerTo(address.ElementType)), sourceValue, expression, destination);
-        private LirOperand EmitAddressValue(LirBlock block, LirAddress address, QualifiedType resultType, GimpleValue sourceValue, SsaExpression? expression, LirVirtualRegister? destination = null)
+        private LirOperand EmitAddressValue(LirBlock block, LirAddress address, QualifiedType resultType, GimpleValue sourceValue, GimpleOperandInfo? expression, LirVirtualRegister? destination = null)
         {
             var result = GetResultRegister(resultType, expression, destination);
             Emit(block, LirInstructionKind.AddressOf, result, ImmutableArray<LirOperand>.Empty, address, op: string.Empty, conversionKind: null,
@@ -1812,7 +1804,7 @@ namespace Cnidaria.C
             return LirOperand.ForRegister(result);
         }
 
-        private LirAddress EmitAddress(LirBlock block, SsaExpression expression)
+        private LirAddress EmitAddress(LirBlock block, GimpleOperandInfo expression)
         {
             if (expression.Name is not null && expression.IsAddress)
                 return EmitPromotedAddress(block, expression);
@@ -1823,10 +1815,10 @@ namespace Cnidaria.C
         private LirAddress EmitAddress(LirBlock block, GimplePlace place)
             => EmitAddress(block, place, expression: null);
 
-        private LirAddress EmitAddress(LirBlock block, GimplePlace place, SsaExpression? expression)
+        private LirAddress EmitAddress(LirBlock block, GimplePlace place, GimpleOperandInfo? expression)
             => EmitAddress(block, (GimpleValue)place, expression);
 
-        private LirAddress EmitAddress(LirBlock block, GimpleValue value, SsaExpression? expression)
+        private LirAddress EmitAddress(LirBlock block, GimpleValue value, GimpleOperandInfo? expression)
         {
             if (expression?.Name is not null && expression.IsAddress)
                 return EmitPromotedAddress(block, expression);
@@ -1865,7 +1857,7 @@ namespace Cnidaria.C
             }
         }
 
-        private LirAddress EmitElementAddress(LirBlock block, GimpleElementAccessExpression elementAccess, SsaExpression? expression)
+        private LirAddress EmitElementAddress(LirBlock block, GimpleElementAccessExpression elementAccess, GimpleOperandInfo? expression)
         {
             var baseExpression = GetChild(expression, 0);
             LirAddress baseAddress;
@@ -1897,7 +1889,7 @@ namespace Cnidaria.C
             var scale = _target.SizeOf(elementAccess.Type);
             return LirAddress.Element(baseAddress, index, elementAccess.Type, scale);
         }
-        private LirOperand EmitPointerElementBaseValue(LirBlock block, GimpleValue originalBase, SsaExpression? rewrittenBase)
+        private LirOperand EmitPointerElementBaseValue(LirBlock block, GimpleValue originalBase, GimpleOperandInfo? rewrittenBase)
         {
             if (rewrittenBase?.Name is not null)
                 return GetOperand(rewrittenBase.Name);
@@ -1906,11 +1898,11 @@ namespace Cnidaria.C
                 ? EmitValue(block, originalBase)
                 : EmitValue(block, originalBase, rewrittenBase);
         }
-        private LirAddress EmitMemberAddress(LirBlock block, GimpleMemberAccessExpression memberAccess, SsaExpression? expression)
+        private LirAddress EmitMemberAddress(LirBlock block, GimpleMemberAccessExpression memberAccess, GimpleOperandInfo? expression)
         {
             var baseExpression = GetChild(expression, 0);
             LirAddress baseAddress;
-            if (memberAccess.OperatorToken.Kind.ToString().Contains("Arrow", StringComparison.Ordinal))
+            if (memberAccess.ThroughPointer)
             {
                 var pointer = baseExpression is null ? EmitValue(block, memberAccess.Expression) : EmitValue(block, baseExpression);
                 baseAddress = LirAddress.Indirect(pointer, memberAccess.Expression.Type);
@@ -1931,16 +1923,16 @@ namespace Cnidaria.C
             return LirAddress.ForField(baseAddress, memberAccess.Field, memberAccess.Type, GetFieldOffset(memberAccess.Field));
         }
 
-        private LirAddress EmitPromotedAddress(LirBlock block, SsaExpression expression)
+        private LirAddress EmitPromotedAddress(LirBlock block, GimpleOperandInfo expression)
         {
             var name = expression.Name!;
-            if (name.Variable.Kind != SsaVariableKind.Temporary)
+            if (name.Variable.Kind != GimpleVariableKind.Temporary)
             {
                 _problems.Add(new LirProblem(
                 LirProblemKind.PromotedAddressTakenValue,
                 _currentInstruction?.Block,
                 expression.Original,
-                $"Address was requested for promoted SSA value '{name}'."));
+                $"Address was requested for promoted GIMPLE value '{name}'."));
             }
 
             LirStackSlot slot;
@@ -1999,7 +1991,7 @@ namespace Cnidaria.C
             ControlFlowBlock source,
             ControlFlowBlock target,
             GimpleStatement? statement,
-            SsaInstruction? sourceInstruction)
+            GimpleStatementAnnotations? sourceInstruction)
         {
             if (_edgeSplitBlocks.TryGetValue((source, target), out var split))
             {
@@ -2015,7 +2007,7 @@ namespace Cnidaria.C
             LirBlock block,
             LirBlock target,
             GimpleStatement? statement,
-            SsaInstruction? sourceInstruction)
+            GimpleStatementAnnotations? sourceInstruction)
         {
             Emit(block, LirInstructionKind.Jump, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null,
                 parallelCopies: default, switchCases: default, target: target, trueTarget: null, falseTarget: null, sourceStatement: statement, sourceValue: null,
@@ -2067,6 +2059,124 @@ namespace Cnidaria.C
                 else
                     block.SetInstructions(ImmutableArray<LirInstruction>.Empty);
             }
+        }
+
+        /// <summary>
+        /// Folds <c>%dst = copy %src</c> into the instruction that defines <c>%src</c> whenever that
+        /// definition is the only one, the copy is its only use, and both registers hold the same
+        /// representation. Without this the register allocator has to coalesce the pair, and a
+        /// missed coalesce becomes a machine move.
+        /// </summary>
+        private void CoalesceCopies()
+        {
+            var definitions = new Dictionary<LirVirtualRegister, int>();
+            var uses = new Dictionary<LirVirtualRegister, int>();
+            foreach (var block in _blocks)
+            {
+                foreach (var instruction in block.Instructions)
+                {
+                    CountDefinitions(instruction, definitions);
+                    CountUses(instruction, uses);
+                }
+            }
+
+            foreach (var block in _blocks)
+            {
+                List<LirInstruction>? rewritten = null;
+                var definitionIndices = new Dictionary<LirVirtualRegister, int>();
+                var instructions = block.Instructions;
+
+                for (var i = 0; i < instructions.Length; i++)
+                {
+                    var instruction = instructions[i];
+                    if (instruction.Kind == LirInstructionKind.Copy &&
+                        instruction.Result is { } destination &&
+                        instruction.Operands.Length == 1 &&
+                        instruction.Operands[0].Kind == LirOperandKind.Register &&
+                        instruction.Operands[0].Register is { } source &&
+                        !ReferenceEquals(source, destination) &&
+                        !source.HasFixedRegister &&
+                        !destination.HasFixedRegister &&
+                        source.RegisterClass == destination.RegisterClass &&
+                        SameType(source.Type, destination.Type) &&
+                        Count(definitions, source) == 1 &&
+                        Count(uses, source) == 1 &&
+                        Count(definitions, destination) == 1 &&
+                        definitionIndices.TryGetValue(source, out var definitionIndex))
+                    {
+                        rewritten ??= new List<LirInstruction>(instructions);
+                        rewritten[definitionIndex] = rewritten[definitionIndex].WithResult(destination);
+                        definitionIndices[destination] = definitionIndex;
+                        rewritten[i] = null!;
+                        continue;
+                    }
+
+                    if (instruction.Result is not null && IsRetargetableDefinition(instruction))
+                        definitionIndices[instruction.Result] = i;
+                }
+
+                if (rewritten is not null)
+                    block.SetInstructions(rewritten.Where(static instruction => instruction is not null).ToImmutableArray());
+            }
+        }
+
+        private static bool IsRetargetableDefinition(LirInstruction instruction)
+            => instruction.Kind is not (LirInstructionKind.Parameter or LirInstructionKind.InlineAssembly);
+
+        private static int Count(Dictionary<LirVirtualRegister, int> counts, LirVirtualRegister register)
+            => counts.TryGetValue(register, out var count) ? count : 0;
+
+        private static void Add(Dictionary<LirVirtualRegister, int> counts, LirVirtualRegister register)
+            => counts[register] = Count(counts, register) + 1;
+
+        private static void CountDefinitions(LirInstruction instruction, Dictionary<LirVirtualRegister, int> definitions)
+        {
+            if (instruction.Result is not null)
+                Add(definitions, instruction.Result);
+
+            foreach (var copy in instruction.ParallelCopies)
+                Add(definitions, copy.Destination);
+        }
+
+        private static void CountUses(LirInstruction instruction, Dictionary<LirVirtualRegister, int> uses)
+        {
+            foreach (var operand in instruction.Operands)
+                CountOperandUses(operand, uses);
+
+            if (instruction.Address is not null)
+                CountAddressUses(instruction.Address, uses);
+
+            foreach (var copy in instruction.ParallelCopies)
+                CountOperandUses(copy.Source, uses);
+
+            foreach (var @case in instruction.SwitchCases)
+                CountOperandUses(@case.Value, uses);
+        }
+
+        private static void CountOperandUses(LirOperand operand, Dictionary<LirVirtualRegister, int> uses)
+        {
+            switch (operand.Kind)
+            {
+                case LirOperandKind.Register:
+                    if (operand.Register is not null)
+                        Add(uses, operand.Register);
+                    break;
+
+                case LirOperandKind.Address:
+                    if (operand.Address is not null)
+                        CountAddressUses(operand.Address, uses);
+                    break;
+            }
+        }
+
+        private static void CountAddressUses(LirAddress address, Dictionary<LirVirtualRegister, int> uses)
+        {
+            if (address.BaseOperand is not null)
+                CountOperandUses(address.BaseOperand, uses);
+            if (address.BaseAddress is not null)
+                CountAddressUses(address.BaseAddress, uses);
+            if (address.Index is not null)
+                CountOperandUses(address.Index, uses);
         }
 
         private void LayoutBlocks()
@@ -2287,8 +2397,9 @@ namespace Cnidaria.C
             LirBlock? falseTarget,
             GimpleStatement? sourceStatement,
             GimpleValue? sourceValue,
-            SsaInstruction? sourceInstruction,
-            ValueNumber? valueNumber)
+            GimpleStatementAnnotations? sourceInstruction,
+            ValueNumber? valueNumber,
+            GimpleTreeCode treeCode = GimpleTreeCode.None)
         {
             var instruction = new LirInstruction(
                 _nextInstructionOrdinal++,
@@ -2307,7 +2418,8 @@ namespace Cnidaria.C
                 sourceStatement,
                 sourceValue,
                 sourceInstruction,
-                valueNumber);
+                valueNumber,
+                treeCode);
 
             if (!_instructions.TryGetValue(block, out var list))
             {
@@ -2338,7 +2450,7 @@ namespace Cnidaria.C
             return block;
         }
 
-        private LirVirtualRegister NewVirtualRegister(QualifiedType type, SsaName? sourceName, ValueNumber? valueNumber)
+        private LirVirtualRegister NewVirtualRegister(QualifiedType type, GimpleName? sourceName, ValueNumber? valueNumber)
         {
             var registerClass = GetRegisterClass(type);
             var fixedRegister = TryGetFixedRegister(sourceName, registerClass);
@@ -2347,15 +2459,18 @@ namespace Cnidaria.C
             return register;
         }
 
-        private LirVirtualRegister GetResultRegister(QualifiedType type, SsaExpression? expression, LirVirtualRegister? destination)
+        private LirVirtualRegister GetResultRegister(QualifiedType type, GimpleOperandInfo? expression, LirVirtualRegister? destination)
+            => GetResultRegister(type, GetValueNumber(expression), destination);
+
+        private LirVirtualRegister GetResultRegister(QualifiedType type, ValueNumber? valueNumber, LirVirtualRegister? destination)
         {
             if (destination is not null && SameType(destination.Type, type))
                 return destination;
 
-            return NewVirtualRegister(type, sourceName: null, GetValueNumber(expression));
+            return NewVirtualRegister(type, sourceName: null, valueNumber);
         }
 
-        private MachineRegister TryGetFixedRegister(SsaName? sourceName, LirRegisterClass registerClass)
+        private MachineRegister TryGetFixedRegister(GimpleName? sourceName, LirRegisterClass registerClass)
         {
             if (sourceName?.Variable.Symbol is not VariableSymbol variable || variable.ExplicitRegisterName is null)
                 return MachineRegister.Invalid;
@@ -2364,7 +2479,7 @@ namespace Cnidaria.C
                 : MachineRegister.Invalid;
         }
 
-        private LirVirtualRegister GetRegister(SsaName name)
+        private LirVirtualRegister GetRegister(GimpleName name)
         {
             if (!_registersByName.TryGetValue(name, out var register))
             {
@@ -2376,7 +2491,7 @@ namespace Cnidaria.C
             return register;
         }
 
-        private LirOperand GetOperand(SsaName name)
+        private LirOperand GetOperand(GimpleName name)
         {
             if (name.IsUndefined)
                 return LirOperand.Undefined(name, name.Type);
@@ -2428,22 +2543,22 @@ namespace Cnidaria.C
             return slot;
         }
 
-        private SsaDefinition? GetPrimaryDefinition(SsaInstruction instruction)
+        private GimpleDefinition? GetPrimaryDefinition(GimpleStatementAnnotations instruction)
         {
             foreach (var definition in instruction.Definitions)
             {
-                if (definition.Name.Variable.Kind != SsaVariableKind.Memory)
+                if (definition.Name.Variable.Kind != GimpleVariableKind.Memory)
                     return definition;
             }
 
             return null;
         }
 
-        private bool TryGetExpression(SsaInstruction instruction, int index, out SsaExpression expression)
+        private bool TryGetExpression(GimpleStatementAnnotations instruction, int index, out GimpleOperandInfo expression)
         {
-            if (index >= 0 && index < instruction.Expressions.Length)
+            if (index >= 0 && index < instruction.Operands.Length)
             {
-                expression = instruction.Expressions[index];
+                expression = instruction.Operands[index];
                 return true;
             }
 
@@ -2451,39 +2566,7 @@ namespace Cnidaria.C
             return false;
         }
 
-        private bool TryGetAssignmentTargetAddressExpression(SsaInstruction instruction, out SsaExpression expression)
-        {
-            if (instruction.Statement is GimpleAssignmentStatement assignment &&
-                GetPrimaryDefinition(instruction) is null &&
-                instruction.Expressions.Length >= 2)
-            {
-                expression = instruction.Expressions[0];
-                return true;
-            }
-
-            expression = null!;
-            return false;
-        }
-
-        private bool TryGetAssignmentValueExpression(SsaInstruction instruction, GimpleAssignmentStatement assignment, out SsaExpression expression)
-        {
-            if (GetPrimaryDefinition(instruction) is not null && instruction.Expressions.Length >= 1)
-            {
-                expression = instruction.Expressions[0];
-                return true;
-            }
-
-            if (GetPrimaryDefinition(instruction) is null && instruction.Expressions.Length >= 2)
-            {
-                expression = instruction.Expressions[1];
-                return true;
-            }
-
-            expression = null!;
-            return false;
-        }
-
-        private SsaExpression? GetChild(SsaExpression? expression, int index)
+        private GimpleOperandInfo? GetChild(GimpleOperandInfo? expression, int index)
         {
             if (expression is null || index < 0 || index >= expression.Children.Length)
                 return null;
@@ -2491,7 +2574,7 @@ namespace Cnidaria.C
             return expression.Children[index];
         }
 
-        private ValueNumber? GetValueNumber(SsaExpression? expression)
+        private ValueNumber? GetValueNumber(GimpleOperandInfo? expression)
         {
             if (expression is null)
                 return null;

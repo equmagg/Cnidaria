@@ -224,7 +224,7 @@ namespace Cnidaria.Cs
             return method.HasInternalCall &&
                    method.IsStatic &&
                    !method.HasThis &&
-                   StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System") &&
+                   StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Runtime") &&
                    StringComparer.Ordinal.Equals(method.DeclaringType.Name, "RuntimeImports") &&
                    StringComparer.Ordinal.Equals(method.Name, "RhAllocateNewArray") &&
                    method.ParameterTypes.Length == 2 &&
@@ -293,9 +293,8 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException($"RISC-V runtime compilation failed: {string.Join("\n", errors)}");
 
             var semanticModel = compilation.GetSemanticModel(compilation.SyntaxTrees[0]);
-            var cfg = Cnidaria.C.ControlFlowGraph.Build(semanticModel);
-            var ssa = Cnidaria.C.SsaGraph.Build(cfg);
-            var lir = Cnidaria.C.LirModule.Lower(ssa);
+            var gimple = Cnidaria.C.GimplePipeline.Run(semanticModel);
+            var lir = Cnidaria.C.LirModule.Lower(gimple);
             return Cnidaria.C.RiscVCodeGenerator.Generate(
                 lir,
                 options: new Cnidaria.C.RiscVCodeGeneratorOptions

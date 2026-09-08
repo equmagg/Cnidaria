@@ -95,14 +95,18 @@ namespace Cnidaria.C
         public TargetInfo Target { get; }
         public InliningOptions Inlining { get; }
         public TrimmingOptions Trimming { get; }
+        public GimplePipelineOptions Gimple { get; }
+
         public CompilationOptions(
             TargetInfo? target = null,
             InliningOptions? inlining = null,
-            TrimmingOptions? trimming = null)
+            TrimmingOptions? trimming = null,
+            GimplePipelineOptions? gimple = null)
         {
             Target = target ?? TargetInfo.Default;
             Inlining = inlining ?? InliningOptions.Default;
             Trimming = trimming ?? TrimmingOptions.Default;
+            Gimple = gimple ?? GimplePipelineOptions.Default;
         }
     }
 

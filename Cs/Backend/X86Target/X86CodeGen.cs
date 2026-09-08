@@ -2036,17 +2036,13 @@ namespace Cnidaria.Cs
                     Emit(X86Instruction.Binary(X86InstrKind.Mov, Mem(X86Register.Rbp, -8, 8), Reg(targetArgument, 8)));
                     Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.R11, 8), Reg(contextArgument, 8)));
 
-                    MachineRegister scratchMachineRegister = MachineRegister.Invalid;
                     ImmutableArray<MachineRegister> generalRegisters = RegisterInfo.AllocatableGeneralRegisters(_target);
                     for (int i = 0; i < generalRegisters.Length; i++)
                     {
                         MachineRegister register = generalRegisters[i];
                         X86Register physical = ToX86Register(register, _target);
                         if (physical == X86Register.R11)
-                        {
-                            scratchMachineRegister = register;
-                            continue;
-                        }
+                            throw new InvalidOperationException("x86 EH transfer cannot restore its own context pointer register.");
 
                         Emit(X86Instruction.Binary(
                             X86InstrKind.Mov,
@@ -2065,12 +2061,6 @@ namespace Cnidaria.Cs
                             Mem(X86Register.R11, 256 + registerIndex * 16, 16)));
                     }
 
-                    if (scratchMachineRegister == MachineRegister.Invalid)
-                        throw new InvalidOperationException("x86 EH transfer requires R11 in the allocatable register set.");
-                    Emit(X86Instruction.Binary(
-                        X86InstrKind.Mov,
-                        Reg(X86Register.R11, 8),
-                        Mem(X86Register.R11, (byte)scratchMachineRegister * 8, 8)));
                     Emit(X86Instruction.Binary(
                         X86InstrKind.Lea,
                         Reg(X86Register.Rsp, 8),
@@ -2369,6 +2359,8 @@ namespace Cnidaria.Cs
                 private readonly string _returnThunkLabel;
                 private readonly List<GcPollStub> _gcPollStubs = new List<GcPollStub>();
                 private int _nextBlockId = -1;
+                private int _currentBlockId = -1;
+                private bool _conditionalBranchTookFallthrough;
                 private bool _ehFrameRegistered;
                 private bool _returnThunkNeeded;
 
@@ -2399,6 +2391,8 @@ namespace Cnidaria.Cs
                     {
                         int blockId = order[i];
                         _nextBlockId = i + 1 < order.Length ? order[i + 1] : -1;
+                        _currentBlockId = blockId;
+                        _conditionalBranchTookFallthrough = false;
                         GenTreeBlock block = _method.Blocks[blockId];
                         int firstBodyNode = blockId == 0 ? GenTreeLirKinds.PrologPrefixLength(block.LinearNodes) : 0;
                         for (int n = 0; n < firstBodyNode; n++)
@@ -2409,6 +2403,7 @@ namespace Cnidaria.Cs
                         EmitFallthroughFixup(blockId, _nextBlockId);
                         _owner.DefineLabel(_blockEndLabels[blockId]);
                     }
+                    _currentBlockId = -1;
                     EmitGcPollStubs();
                     BindEhNativeRanges();
                     if (_returnThunkNeeded)
@@ -3323,6 +3318,7 @@ namespace Cnidaria.Cs
                     EmitCopyFrameToAddress(
                         node,
                         returnBuffer,
+                        0,
                         node.Uses[0],
                         StorageSize(_method.RuntimeMethod.ReturnType, MachineAbi.StackKindForType(_method.RuntimeMethod.ReturnType)));
                 }
@@ -3497,7 +3493,7 @@ namespace Cnidaria.Cs
                             if (node.SourceOp == BytecodeOp.Leave && _ehMethod is not null)
                                 EmitLeave(node);
                             else
-                                EmitJump(LabelForTarget(node));
+                                EmitBlockJump(ResolveBranchTarget(RequireTargetBlock(node)));
                             return;
                         case GenTreeKind.BranchTrue:
                         case GenTreeKind.BranchFalse:
@@ -3556,6 +3552,9 @@ namespace Cnidaria.Cs
                             return;
                         case GenTreeKind.IsInst:
                             EmitRuntimeTypeCheck(node, throwOnFailure: false);
+                            return;
+                        case GenTreeKind.UnboxAny:
+                            EmitUnboxAny(node);
                             return;
                         case GenTreeKind.NewDelegate:
                             EmitNewDelegate(node);
@@ -3721,23 +3720,58 @@ namespace Cnidaria.Cs
 
                 private void EmitPointerElementAddress(GenTree node)
                 {
-                    if (node.Uses.Length != 2 || node.Results.Length != 1)
+                    if (node.Uses.Length is < 1 or > 2 || node.Results.Length != 1)
                         throw Unsupported(node, "Pointer element address requires base and index operands and one result");
                     if (node.Int32 <= 0)
                         throw Unsupported(node, "Pointer element size must be positive");
 
                     int baseUseIndex = RequireCodegenUseIndexForOperand(node, 0, "pointer base");
-                    int indexUseIndex = RequireCodegenUseIndexForOperand(node, 1, "pointer index");
-                    if (!node.Uses[baseUseIndex].IsRegister || !node.Uses[indexUseIndex].IsRegister)
-                        throw Unsupported(node, "Pointer element address requires register operands");
+                    if (!node.Uses[baseUseIndex].IsRegister)
+                        throw Unsupported(node, "Pointer element address requires a register base operand");
 
                     X86Register destination = ToX86Register(RequireResultRegister(node), Target);
                     X86Register baseRegister = ToX86Register(node.Uses[baseUseIndex].Register, Target);
-                    X86Register indexRegister = ToX86Register(node.Uses[indexUseIndex].Register, Target);
                     X86Register scaledIndex = ToX86Register(RequireInternalGeneralRegister(node, 0), Target);
                     RuntimeType? indexType = OperandType(node, 1);
                     GenStackKind indexKind = OperandStackKind(node, 1);
+                    int scale = node.Int32;
 
+                    if (TryGetContainedIntegerImmediate(node, 1, out long immediateIndex))
+                    {
+                        if (Target.Is64Bit && indexKind == GenStackKind.I4 && IsUnsigned(indexType))
+                            immediateIndex = unchecked((uint)(int)immediateIndex);
+                        else if (indexKind == GenStackKind.I4)
+                            immediateIndex = unchecked((int)immediateIndex);
+
+                        long offset = Target.Is64Bit
+                            ? unchecked(immediateIndex * scale)
+                            : unchecked((int)(immediateIndex * scale));
+
+                        if (Target.Is32Bit || (offset >= int.MinValue && offset <= int.MaxValue))
+                        {
+                            _owner.Emit(X86Instruction.Binary(
+                                X86InstrKind.Lea,
+                                Reg(destination, Target.PointerSize),
+                                X86Operand.Memory(baseRegister, Target.Is32Bit ? unchecked((int)offset) : offset, Target.PointerSize)));
+                            return;
+                        }
+
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Reg(scaledIndex, Target.PointerSize),
+                            Imm(offset)));
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Lea,
+                            Reg(destination, Target.PointerSize),
+                            X86Operand.Memory(baseRegister, 0, Target.PointerSize, scaledIndex, 1)));
+                        return;
+                    }
+
+                    int indexUseIndex = RequireCodegenUseIndexForOperand(node, 1, "pointer index");
+                    if (!node.Uses[indexUseIndex].IsRegister)
+                        throw Unsupported(node, "Pointer element address requires a register index operand");
+
+                    X86Register indexRegister = ToX86Register(node.Uses[indexUseIndex].Register, Target);
                     if (indexKind == GenStackKind.I4)
                     {
                         bool unsignedIndex = IsUnsigned(indexType);
@@ -3762,7 +3796,6 @@ namespace Cnidaria.Cs
                             Reg(indexRegister, Target.PointerSize)));
                     }
 
-                    int scale = node.Int32;
                     if (scale is 1 or 2 or 4 or 8)
                     {
                         _owner.Emit(X86Instruction.Binary(
@@ -4164,26 +4197,14 @@ namespace Cnidaria.Cs
                             return;
 
                         case GenTreeKind.Field:
-                            {
-                                X86Register address = SelectAddressScratch(node, instance);
-                                _owner.Emit(X86Instruction.Binary(
-                                    X86InstrKind.Lea,
-                                    Reg(address, Target.PointerSize),
-                                    Mem(instance, field.Offset, Target.PointerSize)));
-                                EmitValueFromAddress(node, fieldType, kind, address);
-                                return;
-                            }
+                            EmitValueFromAddress(node, fieldType, kind, instance, field.Offset);
+                            return;
 
                         case GenTreeKind.StoreField:
                             {
-                                X86Register address = SelectAddressScratch(node, instance);
-                                _owner.Emit(X86Instruction.Binary(
-                                    X86InstrKind.Lea,
-                                    Reg(address, Target.PointerSize),
-                                    Mem(instance, field.Offset, Target.PointerSize)));
                                 if (IsContainedDefaultValue(node, 1))
                                 {
-                                    EmitZeroAddress(node, address, StorageSize(fieldType, kind));
+                                    EmitZeroAddress(node, instance, field.Offset, StorageSize(fieldType, kind));
                                     return;
                                 }
                                 EmitValueToAddress(
@@ -4191,7 +4212,8 @@ namespace Cnidaria.Cs
                                     RequireCodegenUseIndexForOperand(node, 1, "field store value"),
                                     fieldType,
                                     kind,
-                                    address);
+                                    instance,
+                                    field.Offset);
                                 return;
                             }
 
@@ -4363,7 +4385,7 @@ namespace Cnidaria.Cs
                     if (node.Results.Length != 1 || !node.Results[0].IsRegister)
                         throw Unsupported(node, "Array element address requires one register result");
 
-                    EmitArrayElementTypeCheck(node, elementType, requireExact: true);
+                    EmitArrayElementAccessChecks(node, elementType, requireExact: true);
                     X86Register address = ToX86Register(node.Results[0].Register, Target);
                     X86Register scaledIndex = SelectAddressScratch(node, address);
                     ComputeArrayElementAddress(node, elementType, scaledIndex, address, nullChecked: true);
@@ -4372,7 +4394,7 @@ namespace Cnidaria.Cs
                 private void EmitArrayElementLoad(GenTree node, RuntimeType elementType)
                 {
                     int size = ArrayElementSize(elementType);
-                    EmitArrayElementTypeCheck(node, elementType, requireExact: false);
+                    EmitArrayElementAccessChecks(node, elementType, requireExact: false);
 
                     if (IsAggregate(elementType, MachineAbi.StackKindForType(elementType)) || size is not (1 or 2 or 4 or 8))
                     {
@@ -4400,7 +4422,7 @@ namespace Cnidaria.Cs
 
                     int size = ArrayElementSize(elementType);
                     X86Register array = ToX86Register(node.Uses[arrayUseIndex].Register, Target);
-                    EmitArrayElementTypeCheck(node, elementType, requireExact: false, arrayUseIndex: arrayUseIndex);
+                    EmitArrayElementAccessChecks(node, elementType, requireExact: false, arrayUseIndex: arrayUseIndex);
 
                     if (IsAggregate(elementType, MachineAbi.StackKindForType(elementType)) || size is not (1 or 2 or 4 or 8))
                     {
@@ -4553,7 +4575,8 @@ namespace Cnidaria.Cs
                     _owner.DefineLabel(inRange);
                 }
 
-                private void EmitArrayElementTypeCheck(
+                /// <summary>Emits the null check every array access owes, and the element type check only where covariance can break it</summary>
+                private void EmitArrayElementAccessChecks(
                     GenTree node,
                     RuntimeType elementType,
                     bool requireExact,
@@ -4567,6 +4590,9 @@ namespace Cnidaria.Cs
                     X86Register array = ToX86Register(node.Uses[arrayUseIndex].Register, Target);
                     if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
                         EmitNullCheck(node, array, "array_type");
+
+                    if (!GenTree.RequiresArrayElementTypeCheck(node.Kind, elementType))
+                        return;
 
                     string done = _owner.CreateLocalLabel($"{_methodLabel}_array_element_type_ok_{node.LinearId}");
                     string fail = _owner.CreateLocalLabel($"{_methodLabel}_array_element_type_fail_{node.LinearId}");
@@ -4938,6 +4964,12 @@ namespace Cnidaria.Cs
                         case RuntimeIntrinsicId.InterlockedExchangeAdd:
                             EmitInterlockedExchangeAdd(node, intrinsic.ExchangeAdd);
                             return;
+                        case RuntimeIntrinsicId.InterlockedExchange:
+                            EmitInterlockedExchange(node, intrinsic.Exchange);
+                            return;
+                        case RuntimeIntrinsicId.MemoryBarrier:
+                            _owner.Emit(new X86Instruction(X86InstrKind.Mfence));
+                            return;
                         default:
                             throw Unsupported(node, $"unsupported runtime intrinsic {intrinsic.Id}");
                     }
@@ -5050,6 +5082,41 @@ namespace Cnidaria.Cs
                             X86InstrKind.Mov,
                             Reg(X86Register.Rax, intrinsic.Size),
                             Reg(value, intrinsic.Size)));
+                    }
+                }
+
+                private void EmitInterlockedExchange(GenTree node, InterlockedExchangeIntrinsic intrinsic)
+                {
+                    if (intrinsic.Size == 8 && Target.PointerSize == 4)
+                        throw Unsupported(node, "64-bit Interlocked.Exchange is not supported on i386");
+                    if (node.Uses.Length != 2 || !node.Uses[0].IsRegister || !node.Uses[1].IsRegister)
+                        throw Unsupported(node, "Interlocked.Exchange requires two scalar ABI register operands");
+
+                    X86Register location = ToX86Register(node.Uses[0].Register, Target);
+                    X86Register value = ToX86Register(node.Uses[1].Register, Target);
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        EmitNullCheck(node, location, "interlocked_exchange");
+
+                    // xchg with a memory operand is locked without the prefix
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Xchg,
+                        Mem(location, 0, intrinsic.Size),
+                        Reg(value, intrinsic.Size)));
+
+                    if (value != X86Register.Rax)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Reg(X86Register.Rax, intrinsic.Size),
+                            Reg(value, intrinsic.Size)));
+                    }
+
+                    if (intrinsic.Size is 1 or 2)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            intrinsic.IsSigned ? X86InstrKind.Movsx : X86InstrKind.Movzx,
+                            Reg(X86Register.Rax, 4),
+                            Reg(X86Register.Rax, intrinsic.Size)));
                     }
                 }
 
@@ -5238,7 +5305,7 @@ namespace Cnidaria.Cs
                     _owner.DefineLabel(safePoint.ReturnLabel);
                 }
 
-                private static MachineRegister RequireVirtualCallReceiverRegister(GenTree node)
+                private MachineRegister RequireVirtualCallReceiverRegister(GenTree node)
                 {
                     for (int i = 0; i < node.Uses.Length; i++)
                     {
@@ -5406,6 +5473,123 @@ namespace Cnidaria.Cs
                         Math.Max(1, allocationType.SizeOf));
                     EmitRegisterMove(destination, MachineRegister.X0, Target.PointerSize);
                     _owner.DefineLabel(done);
+                }
+
+                private void EmitUnboxAny(GenTree node)
+                {
+                    RuntimeType targetType = RequireRuntimeType(node);
+                    if (!targetType.IsValueType)
+                    {
+                        EmitRuntimeTypeCheck(node, throwOnFailure: true);
+                        return;
+                    }
+
+                    X86Register source = ToX86Register(RequireUseRegister(node, 0), Target);
+                    if (TryGetNullableInfo(targetType, out RuntimeType underlyingType, out RuntimeField hasValueField, out RuntimeField valueField))
+                    {
+                        EmitNullableUnboxAny(node, targetType, underlyingType, hasValueField, valueField, source);
+                        return;
+                    }
+
+                    EmitNullCheck(node, source, "unbox");
+
+                    string typeMatch = _owner.CreateLocalLabel($"{_methodLabel}_unbox_type_match_{node.LinearId}");
+                    string typeFail = _owner.CreateLocalLabel($"{_methodLabel}_unbox_type_fail_{node.LinearId}");
+                    EmitBoxedTypeCheck(node, source, targetType, typeMatch, typeFail, "exact");
+                    _owner.DefineLabel(typeFail);
+                    EmitManagedExceptionThrow(node, "InvalidCastException");
+                    _owner.DefineLabel(typeMatch);
+                    EmitValueFromAddress(node, targetType, node.StackKind, source, Target.ManagedObjectHeaderSize);
+                }
+
+                private void EmitNullableUnboxAny(
+                    GenTree node,
+                    RuntimeType nullableType,
+                    RuntimeType underlyingType,
+                    RuntimeField hasValueField,
+                    RuntimeField valueField,
+                    X86Register source)
+                {
+                    int size = Math.Max(1, nullableType.SizeOf);
+                    if (TypeOperationScratchSize < size)
+                        throw Unsupported(node, "Type-operation scratch area is smaller than the nullable result");
+
+                    string nullValue = _owner.CreateLocalLabel($"{_methodLabel}_unbox_nullable_null_{node.LinearId}");
+                    string underlyingValue = _owner.CreateLocalLabel($"{_methodLabel}_unbox_nullable_underlying_{node.LinearId}");
+                    string typeFail = _owner.CreateLocalLabel($"{_methodLabel}_unbox_nullable_fail_{node.LinearId}");
+                    string done = _owner.CreateLocalLabel($"{_methodLabel}_unbox_nullable_done_{node.LinearId}");
+
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(source, 8), Reg(source, 8)));
+                    _owner.Emit(X86Instruction.ConditionalBranch(
+                        X86Condition.E,
+                        X86Operand.SymbolOperand(nullValue, 4, X86ObjectRelocationKind.Relative32)));
+                    EmitBoxedTypeCheck(node, source, underlyingType, underlyingValue, typeFail, "nullable");
+
+                    _owner.DefineLabel(typeFail);
+                    EmitManagedExceptionThrow(node, "InvalidCastException");
+
+                    _owner.DefineLabel(nullValue);
+                    EmitDefaultValue(node);
+                    EmitJump(done);
+
+                    _owner.DefineLabel(underlyingValue);
+                    for (int offset = 0; offset < size; offset++)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Mem(X86Register.Rbp, checked(TypeOperationScratchOffset + offset), 1),
+                            Imm(0)));
+                    }
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Mov,
+                        Mem(X86Register.Rbp, checked(TypeOperationScratchOffset + hasValueField.Offset), Math.Max(1, hasValueField.FieldType.SizeOf)),
+                        Imm(1)));
+                    EmitCopyAddressToAddress(
+                        X86Register.Rbp,
+                        checked(TypeOperationScratchOffset + valueField.Offset),
+                        source,
+                        Target.ManagedObjectHeaderSize,
+                        Math.Max(1, underlyingType.SizeOf));
+                    EmitValueFromAddress(node, nullableType, node.StackKind, X86Register.Rbp, TypeOperationScratchOffset);
+                    _owner.DefineLabel(done);
+                }
+
+                private void EmitBoxedTypeCheck(
+                    GenTree node,
+                    X86Register objectRegister,
+                    RuntimeType type,
+                    string match,
+                    string mismatch,
+                    string suffix)
+                {
+                    string cleanupMatch = _owner.CreateLocalLabel($"{_methodLabel}_unbox_{suffix}_cleanup_ok_{node.LinearId}");
+                    string cleanupMismatch = _owner.CreateLocalLabel($"{_methodLabel}_unbox_{suffix}_cleanup_fail_{node.LinearId}");
+
+                    PushTypeCheckScratch();
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Mov,
+                        Reg(X86Register.R10, 8),
+                        PreservedTypeCheckScratchSource(objectRegister, 8)));
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Mov,
+                        Reg(X86Register.R10, 8),
+                        Mem(X86Register.R10, 0, 8)));
+                    _owner.EmitLea(X86Register.Rax, _owner.GetTypeDescriptorLabel(type));
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Cmp,
+                        Reg(X86Register.R10, 8),
+                        Reg(X86Register.Rax, 8)));
+                    _owner.Emit(X86Instruction.ConditionalBranch(
+                        X86Condition.E,
+                        X86Operand.SymbolOperand(cleanupMatch, 4, X86ObjectRelocationKind.Relative32)));
+                    EmitJump(cleanupMismatch);
+
+                    _owner.DefineLabel(cleanupMatch);
+                    PopTypeCheckScratch();
+                    EmitJump(match);
+                    _owner.DefineLabel(cleanupMismatch);
+                    PopTypeCheckScratch();
+                    EmitJump(mismatch);
                 }
 
                 private RuntimeType BoxSourceRuntimeType(GenTree node)
@@ -6594,7 +6778,7 @@ namespace Cnidaria.Cs
                     _owner.DefineLabel(doneLabel);
                 }
 
-                private static X86InstrKind BinaryOpcode(GenTree node)
+                private X86InstrKind BinaryOpcode(GenTree node)
                 {
                     X86InstrKind opcode = node.SourceOp switch
                     {
@@ -6712,7 +6896,7 @@ namespace Cnidaria.Cs
                     EmitUnreachableTrap();
                 }
 
-                private static MachineRegister RequireInternalGeneralRegister(GenTree node, int index)
+                private MachineRegister RequireInternalGeneralRegister(GenTree node, int index)
                 {
                     int seen = 0;
                     for (int i = 0; i < node.InternalRegisters.Length; i++)
@@ -7192,7 +7376,8 @@ namespace Cnidaria.Cs
                     GenTree node,
                     RuntimeType? type,
                     GenStackKind kind,
-                    X86Register address)
+                    X86Register address,
+                    int displacement = 0)
                 {
                     var abi = MachineAbi.ClassifyStorageValue(type, kind, Target);
                     var segments = MachineAbi.GetRegisterSegments(abi, Target);
@@ -7202,8 +7387,8 @@ namespace Cnidaria.Cs
 
                     if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
                     {
-                        address = PreserveAggregateAddress(node, address);
-                        EmitMultiRegisterLoadFromAddress(node, address, segments);
+                        address = PreserveAggregateAddress(node, address, ref displacement);
+                        EmitMultiRegisterLoadFromAddress(node, address, displacement, segments);
                         return;
                     }
 
@@ -7216,16 +7401,16 @@ namespace Cnidaria.Cs
                     {
                         if (!result.IsFrameSlot)
                             throw Unsupported(node, "stack-resident load has no frame result");
-                        EmitCopyAddressToFrame(node, result, address, StorageSize(type, kind));
+                        EmitCopyAddressToFrame(node, result, address, displacement, StorageSize(type, kind));
                         return;
                     }
 
                     if (result.IsRegister)
                     {
                         if (IsAggregate(type, kind) && segments.Length == 1)
-                            EmitAggregateSegmentLoad(result.Register, address, segments[0]);
+                            EmitAggregateSegmentLoad(result.Register, address, checked(displacement + segments[0].Offset), segments[0]);
                         else
-                            EmitScalarLoad(ToX86Register(result.Register, Target), Mem(address, 0, StorageSize(type, kind)), type, StorageSize(type, kind));
+                            EmitScalarLoad(ToX86Register(result.Register, Target), Mem(address, displacement, StorageSize(type, kind)), type, StorageSize(type, kind));
                         return;
                     }
 
@@ -7235,9 +7420,9 @@ namespace Cnidaria.Cs
                         RegisterClass registerClass = segments.Length == 1 ? segments[0].RegisterClass : result.RegisterClass;
                         X86Register scratch = SelectValueScratch(node, registerClass, address);
                         if (IsAggregate(type, kind) && segments.Length == 1)
-                            EmitAggregateSegmentLoad(scratch, address, segments[0]);
+                            EmitAggregateSegmentLoad(scratch, address, checked(displacement + segments[0].Offset), segments[0]);
                         else
-                            EmitScalarLoad(scratch, Mem(address, 0, size), type, size);
+                            EmitScalarLoad(scratch, Mem(address, displacement, size), type, size);
                         EmitFrameRegisterStore(result, scratch, registerClass, size);
                         return;
                     }
@@ -7250,15 +7435,16 @@ namespace Cnidaria.Cs
                     int firstUseIndex,
                     RuntimeType type,
                     GenStackKind kind,
-                    X86Register address)
+                    X86Register address,
+                    int displacement = 0)
                 {
                     var abi = MachineAbi.ClassifyStorageValue(type, kind, Target);
                     var segments = MachineAbi.GetRegisterSegments(abi, Target);
 
                     if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
                     {
-                        address = PreserveAggregateAddress(node, address);
-                        EmitMultiRegisterStoreToAddress(node, firstUseIndex, address, segments);
+                        address = PreserveAggregateAddress(node, address, ref displacement);
+                        EmitMultiRegisterStoreToAddress(node, firstUseIndex, address, displacement, segments);
                         return;
                     }
 
@@ -7271,16 +7457,16 @@ namespace Cnidaria.Cs
                     {
                         if (!source.IsFrameSlot)
                             throw Unsupported(node, "stack-resident store value has no addressable home");
-                        EmitCopyFrameToAddress(node, address, source, StorageSize(type, kind));
+                        EmitCopyFrameToAddress(node, address, displacement, source, StorageSize(type, kind));
                         return;
                     }
 
                     if (source.IsRegister)
                     {
                         if (IsAggregate(type, kind) && segments.Length == 1)
-                            EmitAggregateSegmentStore(source.Register, address, segments[0]);
+                            EmitAggregateSegmentStore(source.Register, address, checked(displacement + segments[0].Offset), segments[0]);
                         else
-                            EmitScalarStore(Mem(address, 0, StorageSize(type, kind)), ToX86Register(source.Register, Target), StorageSize(type, kind));
+                            EmitScalarStore(Mem(address, displacement, StorageSize(type, kind)), ToX86Register(source.Register, Target), StorageSize(type, kind));
                         return;
                     }
 
@@ -7291,9 +7477,9 @@ namespace Cnidaria.Cs
                         X86Register scratch = SelectValueScratch(node, registerClass, address);
                         EmitFrameRegisterLoad(scratch, source, registerClass, size);
                         if (IsAggregate(type, kind) && segments.Length == 1)
-                            EmitAggregateSegmentStore(scratch, address, segments[0]);
+                            EmitAggregateSegmentStore(scratch, address, checked(displacement + segments[0].Offset), segments[0]);
                         else
-                            EmitScalarStore(Mem(address, 0, size), scratch, size);
+                            EmitScalarStore(Mem(address, displacement, size), scratch, size);
                         return;
                     }
 
@@ -7303,6 +7489,7 @@ namespace Cnidaria.Cs
                 private void EmitMultiRegisterLoadFromAddress(
                     GenTree node,
                     X86Register address,
+                    int displacement,
                     ImmutableArray<AbiRegisterSegment> segments)
                 {
                     if (segments.Length <= 1 || node.Results.Length != segments.Length)
@@ -7314,14 +7501,14 @@ namespace Cnidaria.Cs
                         RegisterOperand destination = node.Results[i];
                         if (destination.IsRegister)
                         {
-                            EmitAggregateSegmentLoad(destination.Register, address, segment);
+                            EmitAggregateSegmentLoad(destination.Register, address, checked(displacement + segment.Offset), segment);
                             continue;
                         }
 
                         if (destination.IsFrameSlot)
                         {
                             X86Register scratch = SelectValueScratch(node, segment.RegisterClass, address);
-                            EmitAggregateSegmentLoad(scratch, address, segment);
+                            EmitAggregateSegmentLoad(scratch, address, checked(displacement + segment.Offset), segment);
                             EmitFrameRegisterStore(destination, scratch, segment.RegisterClass, segment.Size);
                             continue;
                         }
@@ -7334,6 +7521,7 @@ namespace Cnidaria.Cs
                     GenTree node,
                     int firstUseIndex,
                     X86Register address,
+                    int displacement,
                     ImmutableArray<AbiRegisterSegment> segments)
                 {
                     if (segments.Length <= 1 || firstUseIndex + segments.Length > node.Uses.Length)
@@ -7345,7 +7533,7 @@ namespace Cnidaria.Cs
                         RegisterOperand source = node.Uses[firstUseIndex + i];
                         if (source.IsRegister)
                         {
-                            EmitAggregateSegmentStore(source.Register, address, segment);
+                            EmitAggregateSegmentStore(source.Register, address, checked(displacement + segment.Offset), segment);
                             continue;
                         }
 
@@ -7353,7 +7541,7 @@ namespace Cnidaria.Cs
                         {
                             X86Register scratch = SelectValueScratch(node, segment.RegisterClass, address);
                             EmitFrameRegisterLoad(scratch, source, segment.RegisterClass, segment.Size);
-                            EmitAggregateSegmentStore(scratch, address, segment);
+                            EmitAggregateSegmentStore(scratch, address, checked(displacement + segment.Offset), segment);
                             continue;
                         }
 
@@ -7535,6 +7723,7 @@ namespace Cnidaria.Cs
                     GenTree node,
                     RegisterOperand destination,
                     X86Register sourceAddress,
+                    int sourceDisplacement,
                     int size)
                 {
                     if (!destination.IsFrameSlot)
@@ -7551,7 +7740,7 @@ namespace Cnidaria.Cs
                         _owner.Emit(X86Instruction.Binary(
                             X86InstrKind.Mov,
                             Reg(scratch, chunk),
-                            Mem(sourceAddress, offset, chunk)));
+                            Mem(sourceAddress, checked(sourceDisplacement + offset), chunk)));
                         _owner.Emit(X86Instruction.Binary(
                             X86InstrKind.Mov,
                             Mem(destinationBase, checked(destinationOffset + offset), chunk),
@@ -7563,6 +7752,7 @@ namespace Cnidaria.Cs
                 private void EmitCopyFrameToAddress(
                     GenTree node,
                     X86Register destinationAddress,
+                    int destinationDisplacement,
                     RegisterOperand source,
                     int size)
                 {
@@ -7583,7 +7773,7 @@ namespace Cnidaria.Cs
                             Mem(sourceBase, checked(sourceOffset + offset), chunk)));
                         _owner.Emit(X86Instruction.Binary(
                             X86InstrKind.Mov,
-                            Mem(destinationAddress, offset, chunk),
+                            Mem(destinationAddress, checked(destinationDisplacement + offset), chunk),
                             Reg(scratch, chunk)));
                         offset += chunk;
                     }
@@ -7650,6 +7840,9 @@ namespace Cnidaria.Cs
                 }
 
                 private void EmitZeroAddress(GenTree node, X86Register address, int size)
+                    => EmitZeroAddress(node, address, 0, size);
+
+                private void EmitZeroAddress(GenTree node, X86Register address, int displacement, int size)
                 {
                     if (size < 0)
                         throw Unsupported(node, "zero-initialization size is negative");
@@ -7657,7 +7850,7 @@ namespace Cnidaria.Cs
                     {
                         _owner.Emit(X86Instruction.Binary(
                             X86InstrKind.Mov,
-                            Mem(address, offset, 1),
+                            Mem(address, checked(displacement + offset), 1),
                             Imm(0)));
                     }
                 }
@@ -7704,19 +7897,20 @@ namespace Cnidaria.Cs
                     _owner.Emit(X86Instruction.Binary(opcode, FrameMemory(destination, size), Reg(source, size)));
                 }
 
-                private X86Register PreserveAggregateAddress(GenTree node, X86Register address)
+                private X86Register PreserveAggregateAddress(GenTree node, X86Register address, ref int displacement)
                 {
                     if (!TryGetInternalRegister(node, RegisterClass.General, 0, out MachineRegister scratchRegister))
                         return address;
 
                     X86Register scratch = ToX86Register(scratchRegister, Target);
-                    if (scratch != address)
+                    if (scratch != address || displacement != 0)
                     {
                         _owner.Emit(X86Instruction.Binary(
-                            X86InstrKind.Mov,
+                            X86InstrKind.Lea,
                             Reg(scratch, Target.PointerSize),
-                            Reg(address, Target.PointerSize)));
+                            Mem(address, displacement, Target.PointerSize)));
                     }
+                    displacement = 0;
                     return scratch;
                 }
 
@@ -7870,6 +8064,10 @@ namespace Cnidaria.Cs
                 private void EmitConditionalBranch(GenTree node)
                 {
                     bool branchWhenTrue = node.TreeKind == GenTreeKind.BranchTrue;
+                    bool inverted = TryInvertConditionalBranch(node, out int invertedTarget);
+                    if (inverted)
+                        branchWhenTrue = !branchWhenTrue;
+
                     if (node.SourceOp is BytecodeOp.Ceq or BytecodeOp.Clt or BytecodeOp.Clt_Un or BytecodeOp.Cgt or BytecodeOp.Cgt_Un)
                     {
                         MachineRegister left = RequireUseRegister(node, 0);
@@ -7878,6 +8076,14 @@ namespace Cnidaria.Cs
                         GenStackKind kind = OperandStackKind(node, 0);
                         if (IsFloating(type, kind))
                         {
+                            // The unordered cases need a scratch label of their own, so this path keeps the
+                            // branch as written rather than folding it into the layout
+                            if (inverted)
+                            {
+                                _conditionalBranchTookFallthrough = false;
+                                branchWhenTrue = node.TreeKind == GenTreeKind.BranchTrue;
+                            }
+
                             EmitFloatingConditionalBranch(node, left, right, StorageSize(type, kind), branchWhenTrue);
                             return;
                         }
@@ -7889,7 +8095,7 @@ namespace Cnidaria.Cs
                             Reg(ToX86Register(right, Target), size)));
                         _owner.Emit(X86Instruction.ConditionalBranch(
                             ComparisonBranchCondition(node.SourceOp, branchWhenTrue),
-                            X86Operand.SymbolOperand(LabelForTarget(node), 4, X86ObjectRelocationKind.Relative32)));
+                            X86Operand.SymbolOperand(BranchTargetLabel(node, inverted, invertedTarget), 4, X86ObjectRelocationKind.Relative32)));
                         return;
                     }
                     MachineRegister condition = RequireUseRegister(node, 0);
@@ -7898,8 +8104,11 @@ namespace Cnidaria.Cs
                     _owner.Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(register, conditionSize), Reg(register, conditionSize)));
                     _owner.Emit(X86Instruction.ConditionalBranch(
                         branchWhenTrue ? X86Condition.Ne : X86Condition.E,
-                        X86Operand.SymbolOperand(LabelForTarget(node), 4, X86ObjectRelocationKind.Relative32)));
+                        X86Operand.SymbolOperand(BranchTargetLabel(node, inverted, invertedTarget), 4, X86ObjectRelocationKind.Relative32)));
                 }
+
+                private string BranchTargetLabel(GenTree node, bool inverted, int invertedTarget)
+                    => _blockLabels[inverted ? invertedTarget : ResolveBranchTarget(RequireTargetBlock(node))];
 
                 private void EmitFloatingConditionalBranch(
                     GenTree node,
@@ -8319,20 +8528,157 @@ namespace Cnidaria.Cs
                 }
 
                 private int EffectiveFrameOffset(RegisterOperand operand)
+                    // The call pushes the return address between the caller outgoing argument area
+                    // and this frame, so incoming stack arguments start one slot above the frame.
                     => operand.FrameBase == RegisterFrameBase.IncomingArgumentBase
-                        ? checked(operand.FrameOffset + _method.StackFrame.FrameSize)
+                        ? checked(operand.FrameOffset + _method.StackFrame.FrameSize + Target.PointerSize)
                         : operand.FrameOffset;
 
                 private void EmitFallthroughFixup(int blockId, int nextBlockId)
                 {
+                    // An inverted conditional branch already jumped to the fall-through successor and left
+                    // its own target to fall through, so the roles are swapped and no fixup is due
+                    if (_conditionalBranchTookFallthrough)
+                        return;
+
                     foreach (CfgEdge edge in _method.Cfg.Blocks[blockId].Successors)
                     {
-                        if (edge.Kind == CfgEdgeKind.FallThrough && edge.ToBlockId != nextBlockId)
+                        if (edge.Kind == CfgEdgeKind.FallThrough)
                         {
-                            EmitJump(_blockLabels[edge.ToBlockId]);
+                            EmitBlockJump(ResolveBranchTarget(edge.ToBlockId), nextBlockId);
                             return;
                         }
                     }
+                }
+
+                // Blocks that only forward control - an empty one, or one holding a single unconditional
+                // branch - would cost a jump into a jump, so branches are pointed at the real target
+                // instead. Left alone under exception regions, where funclet layout owns the flow
+                private int ResolveBranchTarget(int blockId)
+                {
+                    if (_ehMethod is not null || _method.Cfg.ExceptionRegions.Length != 0)
+                        return blockId;
+
+                    for (int step = 0; step < _method.Blocks.Length; step++)
+                    {
+                        if (blockId == 0 || !TryGetForwardedBlock(blockId, out int next))
+                            return blockId;
+
+                        blockId = next;
+                    }
+
+                    return blockId;
+                }
+
+                private bool TryGetForwardedBlock(int blockId, out int forwarded)
+                {
+                    forwarded = -1;
+                    foreach (GenTree node in _method.Blocks[blockId].LinearNodes)
+                    {
+                        if (EmitsNothing(node))
+                            continue;
+
+                        if (forwarded >= 0 ||
+                            node.TreeKind != GenTreeKind.Branch ||
+                            node.SourceOp == BytecodeOp.Leave ||
+                            (uint)node.TargetBlockId >= (uint)_method.Blocks.Length)
+                        {
+                            forwarded = -1;
+                            return false;
+                        }
+
+                        forwarded = node.TargetBlockId;
+                    }
+
+                    return forwarded >= 0 || TryGetForwardingSuccessor(blockId, out forwarded);
+                }
+
+                // Mirrors what EmitNode does with these kinds. Phi copies that the allocator resolved onto
+                // one register are the common case: the block carries them but emits no instruction, so
+                // branching past it is exact
+                private static bool EmitsNothing(GenTree node)
+                {
+                    switch (node.TreeKind)
+                    {
+                        case GenTreeKind.Nop:
+                        case GenTreeKind.Eval:
+                            return true;
+                        case GenTreeKind.Copy:
+                        case GenTreeKind.Reload:
+                        case GenTreeKind.Spill:
+                            return node.Results.Length == 1 &&
+                                node.Uses.Length == 1 &&
+                                node.Results[0].Equals(node.Uses[0]);
+                        default:
+                            return false;
+                    }
+                }
+
+                private bool TryGetForwardingSuccessor(int blockId, out int successor)
+                {
+                    successor = -1;
+                    foreach (CfgEdge edge in _method.Cfg.Blocks[blockId].Successors)
+                    {
+                        if (edge.Kind == CfgEdgeKind.Exception)
+                            return false;
+                        if (successor >= 0 && successor != edge.ToBlockId)
+                            return false;
+                        successor = edge.ToBlockId;
+                    }
+
+                    return successor >= 0;
+                }
+
+                private void EmitBlockJump(int targetBlockId)
+                    => EmitBlockJump(targetBlockId, _nextBlockId);
+
+                private void EmitBlockJump(int targetBlockId, int nextBlockId)
+                {
+                    if (nextBlockId >= 0 && targetBlockId == ResolveBranchTarget(nextBlockId))
+                        return;
+
+                    EmitJump(_blockLabels[targetBlockId]);
+                }
+
+                private int RequireTargetBlock(GenTree node)
+                {
+                    if ((uint)node.TargetBlockId >= (uint)_blockLabels.Length)
+                        throw Unsupported(node, $"invalid branch target block {node.TargetBlockId}");
+                    return node.TargetBlockId;
+                }
+
+                // A conditional branch onto the next block is a branch over nothing. Negating it and
+                // targeting the fall-through successor instead turns a taken jump plus a fixup jump into
+                // one instruction
+                private bool TryInvertConditionalBranch(GenTree node, out int target)
+                {
+                    target = -1;
+                    if (_ehMethod is not null || _currentBlockId < 0 || _nextBlockId < 0)
+                        return false;
+
+                    ImmutableArray<GenTree> nodes = _method.Blocks[_currentBlockId].LinearNodes;
+                    if (nodes.Length == 0 || !ReferenceEquals(nodes[nodes.Length - 1], node))
+                        return false;
+
+                    int taken = ResolveBranchTarget(RequireTargetBlock(node));
+                    if (taken != ResolveBranchTarget(_nextBlockId))
+                        return false;
+
+                    foreach (CfgEdge edge in _method.Cfg.Blocks[_currentBlockId].Successors)
+                    {
+                        if (edge.Kind != CfgEdgeKind.FallThrough)
+                            continue;
+
+                        int notTaken = ResolveBranchTarget(edge.ToBlockId);
+                        if (notTaken == taken)
+                            return false;
+
+                        target = notTaken;
+                        _conditionalBranchTookFallthrough = true;
+                        return true;
+                    }
+
+                    return false;
                 }
 
                 private void EmitJump(string target)
@@ -8561,6 +8907,15 @@ namespace Cnidaria.Cs
                 {
                     if (kind is GenStackKind.Ref or GenStackKind.Ptr or GenStackKind.ByRef or GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Null)
                         return Target.PointerSize;
+                    // The memory width comes from the type: a byte or short lives on the evaluation
+                    // stack as an Int32 but occupies one or two bytes in memory.
+                    if (type is not null)
+                    {
+                        if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef)
+                            return Target.PointerSize;
+                        if (type.SizeOf > 0)
+                            return type.SizeOf;
+                    }
                     if (kind == GenStackKind.I8)
                         return 8;
                     if (kind == GenStackKind.I4)
@@ -8569,13 +8924,6 @@ namespace Cnidaria.Cs
                         return 4;
                     if (kind == GenStackKind.R8)
                         return 8;
-                    if (type is not null)
-                    {
-                        if (type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef)
-                            return Target.PointerSize;
-                        if (type.SizeOf > 0)
-                            return type.SizeOf;
-                    }
                     return Target.PointerSize;
                 }
 
@@ -8615,8 +8963,10 @@ namespace Cnidaria.Cs
                     => kind is GenStackKind.R4 or GenStackKind.R8 ||
                        type?.PrimitiveKind is RuntimePrimitiveKind.Single or RuntimePrimitiveKind.Double;
 
-                private static NotSupportedException Unsupported(GenTree node, string message)
-                    => new NotSupportedException($"Code generation failed for {node.TreeKind} at IL_{node.Pc:X4}, LIR {node.LinearId}: {message}.");
+                private NotSupportedException Unsupported(GenTree node, string message)
+                    => new NotSupportedException(
+                        $"Code generation failed for {node.TreeKind} at IL_{node.Pc:X4}, LIR {node.LinearId} in " +
+                        $"{_method.RuntimeMethod.DeclaringType.Namespace}.{_method.RuntimeMethod.DeclaringType.Name}.{_method.RuntimeMethod.Name}: {message}.");
             }
 
             private readonly struct RuntimeMetadataLabels

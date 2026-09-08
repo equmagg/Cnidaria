@@ -949,8 +949,9 @@ namespace Cnidaria.Cs
                     break;
 
                 case GenTreeKind.Field:
+                    // The receiver may be a temporary holding a local's address: classify like an indirect access.
                     if (!SsaSlotHelpers.TryGetLocalFieldAccess(node, out _))
-                        uses = uses.Add(SsaMemoryKind.GcHeap);
+                        uses |= IndirectMemoryKinds(node);
                     break;
 
                 case GenTreeKind.StaticField:
@@ -964,8 +965,9 @@ namespace Cnidaria.Cs
                     break;
 
                 case GenTreeKind.StoreField:
+                    // See Field: a store through such a temporary must invalidate byref-exposed memory too.
                     if (!SsaSlotHelpers.TryGetLocalFieldAccess(node, out _))
-                        defs = defs.Add(SsaMemoryKind.GcHeap);
+                        defs |= IndirectMemoryKinds(node);
                     break;
 
                 case GenTreeKind.StoreStaticField:

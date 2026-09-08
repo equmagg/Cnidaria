@@ -2521,9 +2521,11 @@ namespace Cnidaria.Cs
                 return true;
             }
 
-            private void EmitCallGcSafePointAfterPreamble(GenTree instruction, bool preambleEmitted)
+            /// <summary>Reports the GC root set at the call instruction itself, which is the PC the
+            /// runtime stores in the caller frame while the callee runs.</summary>
+            private void EmitCallGcSafePoint(GenTree instruction)
             {
-                if (!preambleEmitted || !_options.EmitGcInfo || !ShouldEmitGcReportPoint(instruction))
+                if (!_options.EmitGcInfo || !ShouldEmitGcReportPoint(instruction))
                     return;
 
                 EmitGcSafePoint(_asm.Pc, instruction);
@@ -2759,7 +2761,8 @@ namespace Cnidaria.Cs
                     EmitReferenceNewObjectAllocation(instruction, method, obj);
                     EmitStore(objectHome, obj, method.DeclaringType, GenStackKind.Ref);
                     EmitReferenceTypeNewObjectThisArgument(obj, method);
-                    EmitCallGcSafePointAfterPreamble(instruction, EmitKnownManagedCallPreamble(method));
+                    EmitKnownManagedCallPreamble(method);
+                    EmitCallGcSafePoint(instruction);
                     _asm.CallDirect(Op.CallVoid, ResolveDirectCallTarget(instruction, method), BuildCallFlags(method, Op.CallVoid));
                     return;
                 }
@@ -2790,6 +2793,20 @@ namespace Cnidaria.Cs
                         case RuntimeIntrinsicId.InterlockedExchangeAdd:
                             {
                                 Op intrinsicOp = Op.CallInternalI;
+                                CallFlags intrinsicFlags = BuildCallFlags(method, intrinsicOp) & ~CallFlags.GcSafePoint;
+                                _asm.Emit(InstrDesc.Call(intrinsicOp, method.MethodId, intrinsicFlags));
+                                return;
+                            }
+                        case RuntimeIntrinsicId.InterlockedExchange:
+                            {
+                                Op intrinsicOp = intrinsic.Exchange.IsReference ? Op.CallInternalRef : Op.CallInternalI;
+                                CallFlags intrinsicFlags = BuildCallFlags(method, intrinsicOp) & ~CallFlags.GcSafePoint;
+                                _asm.Emit(InstrDesc.Call(intrinsicOp, method.MethodId, intrinsicFlags));
+                                return;
+                            }
+                        case RuntimeIntrinsicId.MemoryBarrier:
+                            {
+                                Op intrinsicOp = Op.CallInternalVoid;
                                 CallFlags intrinsicFlags = BuildCallFlags(method, intrinsicOp) & ~CallFlags.GcSafePoint;
                                 _asm.Emit(InstrDesc.Call(intrinsicOp, method.MethodId, intrinsicFlags));
                                 return;
@@ -2832,14 +2849,14 @@ namespace Cnidaria.Cs
 
                         if (IsInternalCallOp(directOp))
                         {
-                            bool directInternalPreambleEmitted = EmitKnownManagedCallPreamble(method);
-                            EmitCallGcSafePointAfterPreamble(instruction, directInternalPreambleEmitted);
+                            EmitKnownManagedCallPreamble(method);
+                            EmitCallGcSafePoint(instruction);
                             _asm.Emit(InstrDesc.Call(directOp, method.MethodId, directFlags));
                             return;
                         }
 
-                        bool directPreambleEmitted = EmitKnownManagedCallPreamble(method);
-                        EmitCallGcSafePointAfterPreamble(instruction, directPreambleEmitted);
+                        EmitKnownManagedCallPreamble(method);
+                        EmitCallGcSafePoint(instruction);
                         _asm.CallDirect(directOp, ResolveDirectCallTarget(instruction, method), directFlags);
                         return;
                     }
@@ -2852,7 +2869,7 @@ namespace Cnidaria.Cs
                         (source.Flags & GenTreeFlags.NullCheckEliminated) != 0
                             ? InstructionFlags.NoNullCheck
                             : InstructionFlags.None);
-                    EmitCallGcSafePointAfterPreamble(instruction, preambleEmitted: false);
+                    EmitCallGcSafePoint(instruction);
                     _asm.Emit(new InstrDesc(
                         op,
                         rs1: RegisterVmIsa.EncodeRegister(target),
@@ -2862,8 +2879,8 @@ namespace Cnidaria.Cs
 
                 if (IsInternalCallOp(op))
                 {
-                    bool internalPreambleEmitted = EmitKnownManagedCallPreamble(method);
-                    EmitCallGcSafePointAfterPreamble(instruction, internalPreambleEmitted);
+                    EmitKnownManagedCallPreamble(method);
+                    EmitCallGcSafePoint(instruction);
                     _asm.Emit(InstrDesc.Call(op, method.MethodId, (CallFlags)aux));
                     return;
                 }
@@ -2872,13 +2889,13 @@ namespace Cnidaria.Cs
                 {
                     if (hasHiddenReturnBufferOperand)
                         callFlags |= CallFlags.HiddenReturnBuffer;
-                    EmitCallGcSafePointAfterPreamble(instruction, preambleEmitted: false);
+                    EmitCallGcSafePoint(instruction);
                     _asm.CallDirect(op, _state.DelegateInvokeStubLabel(method), callFlags);
                     return;
                 }
 
-                bool preambleEmitted = EmitKnownManagedCallPreamble(method);
-                EmitCallGcSafePointAfterPreamble(instruction, preambleEmitted);
+                EmitKnownManagedCallPreamble(method);
+                EmitCallGcSafePoint(instruction);
                 _asm.CallDirect(op, ResolveDirectCallTarget(instruction, method), (CallFlags)aux);
             }
 
@@ -2929,7 +2946,7 @@ namespace Cnidaria.Cs
                 if (hasHiddenReturnBuffer)
                     flags |= CallFlags.HiddenReturnBuffer;
 
-                EmitCallGcSafePointAfterPreamble(instruction, preambleEmitted: false);
+                EmitCallGcSafePoint(instruction);
                 _asm.Emit(new InstrDesc(
                     op,
                     rs1: RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, targetIndex)),

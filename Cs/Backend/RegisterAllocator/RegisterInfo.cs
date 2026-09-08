@@ -25,8 +25,6 @@ namespace Cnidaria.Cs
 
         private static readonly ImmutableArray<MachineRegister> X64WindowsGeneralRegisters = ImmutableArray.Create(
             MachineRegister.X0,
-            MachineRegister.X5,
-            MachineRegister.X6,
             MachineRegister.X4,
             MachineRegister.X3,
             MachineRegister.X2,
@@ -41,8 +39,6 @@ namespace Cnidaria.Cs
 
         private static readonly ImmutableArray<MachineRegister> X64SystemVGeneralRegisters = ImmutableArray.Create(
             MachineRegister.X0,
-            MachineRegister.X7,
-            MachineRegister.X8,
             MachineRegister.X6,
             MachineRegister.X5,
             MachineRegister.X3,
@@ -206,7 +202,16 @@ namespace Cnidaria.Cs
             if (target.Architecture == TargetArchitectureKind.I386)
                 return register is MachineRegister.Esp or MachineRegister.Ebp;
             if (target.Architecture == TargetArchitectureKind.X86_64)
-                return register is MachineRegister.X10 or MachineRegister.X15;
+            {
+                if (register is MachineRegister.X10 or MachineRegister.X15)
+                    return true;
+                // r10/r11 are the fixed code-generator scratch pair on x64: address computations,
+                // memory to memory moves and the runtime type checks use them without asking the
+                // register allocator, so they must never hold an allocated value.
+                return IsWindowsX64(target)
+                    ? register is MachineRegister.X5 or MachineRegister.X6
+                    : register is MachineRegister.X7 or MachineRegister.X8;
+            }
             return MachineRegisters.IsReserved(register);
         }
 

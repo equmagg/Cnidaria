@@ -1,4 +1,4 @@
-﻿namespace Internal.Runtime
+namespace Internal.Runtime
 {
     internal static class GCStaticRegionConstants
     {

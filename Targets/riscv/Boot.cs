@@ -896,9 +896,8 @@ namespace Cnidaria.RiscV
             if (diagnostics.Length != 0)
                 throw new InvalidOperationException($"User compilation failed: {string.Join('\n', diagnostics)}");
             var semanticModel = compilation.GetSemanticModel(compilation.SyntaxTrees[0]);
-            var cfg = Cnidaria.C.ControlFlowGraph.Build(semanticModel);
-            var ssa = Cnidaria.C.SsaGraph.Build(cfg);
-            var lir = Cnidaria.C.LirModule.Lower(ssa);
+            var gimple = Cnidaria.C.GimplePipeline.Run(semanticModel);
+            var lir = Cnidaria.C.LirModule.Lower(gimple);
             return Cnidaria.C.RiscVCodeGenerator.Generate(lir);
         }
     }
@@ -973,9 +972,9 @@ namespace Cnidaria.RiscV
         private static RiscVProgram CompileKernel(string source)
         {
             var options = new Cnidaria.C.CompilationOptions(Cnidaria.C.TargetInfo.RiscV64.WithFeatures(
-                TargetArchitectureFeatures.RiscVG | 
-                TargetArchitectureFeatures.RiscVPrivileged | 
-                TargetArchitectureFeatures.RiscVV | 
+                TargetArchitectureFeatures.RiscVG |
+                TargetArchitectureFeatures.RiscVPrivileged |
+                TargetArchitectureFeatures.RiscVV |
                 TargetArchitectureFeatures.RiscVB));
             var compilation = Cnidaria.C.Compilation.CreateFromSource(
                 source,
@@ -989,9 +988,8 @@ namespace Cnidaria.RiscV
             if (diagnostics.Length != 0)
                 throw new InvalidOperationException($"kernel C compilation failed: {string.Join('\n', diagnostics)}");
             var semanticModel = compilation.GetSemanticModel(compilation.SyntaxTrees[0]);
-            var cfg = Cnidaria.C.ControlFlowGraph.Build(semanticModel);
-            var ssa = Cnidaria.C.SsaGraph.Build(cfg);
-            var lir = Cnidaria.C.LirModule.Lower(ssa);
+            var gimple = Cnidaria.C.GimplePipeline.Run(semanticModel);
+            var lir = Cnidaria.C.LirModule.Lower(gimple);
             return Cnidaria.C.RiscVCodeGenerator.Generate(lir);
         }
 

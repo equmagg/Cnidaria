@@ -6,10 +6,10 @@ using System.Linq;
 
 namespace Cnidaria.C
 {
-    internal static class SsaOptimizer
+    internal static partial class SsaOptimizer
     {
-        public static SsaFunction Optimize(
-            SsaFunction function,
+        public static GimpleFunctionAnnotations Optimize(
+            GimpleFunctionAnnotations function,
             TargetInfo target,
             SsaOptimizationOptions options,
             ValueNumberingOptions valueNumberingOptions)
@@ -26,7 +26,8 @@ namespace Cnidaria.C
             if (!options.EnableConstantFolding &&
                 !options.EnableCopyPropagation &&
                 !options.EnableBranchFolding &&
-                !options.EnableDeadCodeElimination)
+                !options.EnableDeadCodeElimination &&
+                !options.EnableCommonSubexpressionElimination)
             {
                 return function;
             }
@@ -45,26 +46,26 @@ namespace Cnidaria.C
             return current;
         }
 
-        private sealed class Pass
+        private sealed partial class Pass
         {
-            private readonly SsaFunction _function;
+            private readonly GimpleFunctionAnnotations _function;
             private readonly TargetInfo _target;
             private readonly SsaOptimizationOptions _options;
             private readonly ValueNumberingOptions _valueNumberingOptions;
-            private readonly Dictionary<SsaName, SsaName> _copies = new();
-            private readonly Dictionary<SsaName, GimpleConstantValue> _constants = new();
-            private readonly Dictionary<int, List<SsaName>> _representativesByValueNumber = new();
-            private readonly Dictionary<SsaName, int> _useCounts = new();
-            private readonly Dictionary<SsaName, int> _definitionOrder = new();
+            private readonly Dictionary<GimpleName, GimpleName> _copies = new();
+            private readonly Dictionary<GimpleName, GimpleConstantValue> _constants = new();
+            private readonly Dictionary<int, List<GimpleName>> _representativesByValueNumber = new();
+            private readonly Dictionary<GimpleName, int> _useCounts = new();
+            private readonly Dictionary<GimpleName, int> _definitionOrder = new();
             private readonly Dictionary<ControlFlowBlock, int> _dominatorDepths = new();
-            private readonly Dictionary<SsaDefinition, SsaDefinition> _definitionMap = new();
-            private readonly HashSet<SsaDefinition> _removedDefinitions = new();
-            private readonly List<SsaUse> _uses = new();
+            private readonly Dictionary<GimpleDefinition, GimpleDefinition> _definitionMap = new();
+            private readonly HashSet<GimpleDefinition> _removedDefinitions = new();
+            private readonly List<GimpleUse> _uses = new();
 
             public bool Changed { get; private set; }
 
             public Pass(
-                SsaFunction function,
+                GimpleFunctionAnnotations function,
                 TargetInfo target,
                 SsaOptimizationOptions options,
                 ValueNumberingOptions valueNumberingOptions)
@@ -76,13 +77,15 @@ namespace Cnidaria.C
                 IndexUseCounts();
                 IndexDefinitionOrder();
                 IndexDominatorDepths();
+                if (_options.EnableCommonSubexpressionElimination)
+                    FindCommonSubexpressions();
             }
 
             private void IndexUseCounts()
             {
                 foreach (var use in _function.Uses)
                 {
-                    if (use.Name.Variable.Kind == SsaVariableKind.Memory)
+                    if (use.Name.Variable.Kind == GimpleVariableKind.Memory)
                         continue;
 
                     _useCounts.TryGetValue(use.Name, out var count);
@@ -95,7 +98,7 @@ namespace Cnidaria.C
                     {
                         foreach (var operand in phi.Operands)
                         {
-                            if (operand.Value.Variable.Kind == SsaVariableKind.Memory)
+                            if (operand.Value.Variable.Kind == GimpleVariableKind.Memory)
                                 continue;
 
                             _useCounts.TryGetValue(operand.Value, out var count);
@@ -109,17 +112,17 @@ namespace Cnidaria.C
             {
                 foreach (var definition in _function.Definitions)
                 {
-                    if (definition.Kind == SsaDefinitionKind.Entry)
+                    if (definition.Kind == GimpleDefinitionKind.Entry)
                         _definitionOrder[definition.Name] = -2;
-                    else if (definition.Kind == SsaDefinitionKind.Phi)
+                    else if (definition.Kind == GimpleDefinitionKind.Phi)
                         _definitionOrder[definition.Name] = -1;
                 }
 
                 foreach (var block in _function.Blocks)
                 {
-                    for (var instructionIndex = 0; instructionIndex < block.Instructions.Length; instructionIndex++)
+                    for (var instructionIndex = 0; instructionIndex < block.Statements.Length; instructionIndex++)
                     {
-                        foreach (var definition in block.Instructions[instructionIndex].Definitions)
+                        foreach (var definition in block.Statements[instructionIndex].Definitions)
                             _definitionOrder[definition.Name] = instructionIndex;
                     }
                 }
@@ -138,9 +141,9 @@ namespace Cnidaria.C
                 }
             }
 
-            public SsaFunction Run()
+            public GimpleFunctionAnnotations Run()
             {
-                var blocksByControlFlowBlock = new Dictionary<ControlFlowBlock, SsaBlock>();
+                var blocksByControlFlowBlock = new Dictionary<ControlFlowBlock, GimpleBlockAnnotations>();
 
                 foreach (var controlFlowBlock in _function.ControlFlowFunction.ReversePostOrder)
                 {
@@ -152,10 +155,10 @@ namespace Cnidaria.C
 
                     var rewrittenPhis = RewritePhis(block);
                     var rewrittenInstructions = RewriteInstructions(block);
-                    blocksByControlFlowBlock[controlFlowBlock] = new SsaBlock(controlFlowBlock, rewrittenPhis, rewrittenInstructions);
+                    blocksByControlFlowBlock[controlFlowBlock] = new GimpleBlockAnnotations(controlFlowBlock, rewrittenPhis, rewrittenInstructions);
                 }
 
-                var blocks = ImmutableArray.CreateBuilder<SsaBlock>();
+                var blocks = ImmutableArray.CreateBuilder<GimpleBlockAnnotations>();
                 foreach (var block in _function.Blocks)
                 {
                     if (blocksByControlFlowBlock.TryGetValue(block.ControlFlowBlock, out var rewritten))
@@ -177,7 +180,7 @@ namespace Cnidaria.C
                 RebuildUsesFromBlocks(blockArray);
                 var definitions = RewriteDefinitionList();
 
-                return new SsaFunction(
+                return new GimpleFunctionAnnotations(
                     _function.ControlFlowFunction,
                     _function.MemoryVariable,
                     _function.Variables,
@@ -186,12 +189,13 @@ namespace Cnidaria.C
                     _uses.ToImmutableArray(),
                     _function.Problems,
                     CreateUndefinedNameMap(),
-                    _valueNumberingOptions);
+                    _valueNumberingOptions,
+                    _target);
             }
 
-            private ImmutableArray<SsaDefinition> RewriteDefinitionList()
+            private ImmutableArray<GimpleDefinition> RewriteDefinitionList()
             {
-                var definitions = ImmutableArray.CreateBuilder<SsaDefinition>(_function.Definitions.Length);
+                var definitions = ImmutableArray.CreateBuilder<GimpleDefinition>(_function.Definitions.Length);
                 foreach (var definition in _function.Definitions)
                 {
                     if (_removedDefinitions.Contains(definition))
@@ -211,12 +215,12 @@ namespace Cnidaria.C
                 return definitions.ToImmutable();
             }
 
-            private void RebuildUsesFromBlocks(ImmutableArray<SsaBlock> blocks)
+            private void RebuildUsesFromBlocks(ImmutableArray<GimpleBlockAnnotations> blocks)
             {
                 _uses.Clear();
                 foreach (var block in blocks)
                 {
-                    foreach (var instruction in block.Instructions)
+                    foreach (var instruction in block.Statements)
                     {
                         foreach (var use in instruction.Uses)
                             _uses.Add(use);
@@ -224,18 +228,18 @@ namespace Cnidaria.C
                 }
             }
 
-            private ImmutableArray<SsaBlock> EliminateDeadCode(ImmutableArray<SsaBlock> blocks)
+            private ImmutableArray<GimpleBlockAnnotations> EliminateDeadCode(ImmutableArray<GimpleBlockAnnotations> blocks)
             {
-                var instructionByDefinition = new Dictionary<SsaName, SsaInstruction>();
-                var phiByResult = new Dictionary<SsaName, SsaPhi>();
-                var declarationsBySymbol = new Dictionary<Symbol, List<SsaInstruction>>();
+                var instructionByDefinition = new Dictionary<GimpleName, GimpleStatementAnnotations>();
+                var phiByResult = new Dictionary<GimpleName, GimplePhi>();
+                var declarationsBySymbol = new Dictionary<Symbol, List<GimpleStatementAnnotations>>();
 
                 foreach (var block in blocks)
                 {
                     foreach (var phi in block.Phis)
                         phiByResult[phi.Result] = phi;
 
-                    foreach (var instruction in block.Instructions)
+                    foreach (var instruction in block.Statements)
                     {
                         foreach (var definition in instruction.Definitions)
                             instructionByDefinition[definition.Name] = instruction;
@@ -244,7 +248,7 @@ namespace Cnidaria.C
                         {
                             if (!declarationsBySymbol.TryGetValue(declaration.Symbol, out var declarations))
                             {
-                                declarations = new List<SsaInstruction>();
+                                declarations = new List<GimpleStatementAnnotations>();
                                 declarationsBySymbol.Add(declaration.Symbol, declarations);
                             }
 
@@ -253,19 +257,19 @@ namespace Cnidaria.C
                     }
                 }
 
-                var liveInstructions = new HashSet<SsaInstruction>();
-                var livePhis = new HashSet<SsaPhi>();
-                var workList = new Queue<SsaName>();
+                var liveInstructions = new HashSet<GimpleStatementAnnotations>();
+                var livePhis = new HashSet<GimplePhi>();
+                var workList = new Queue<GimpleName>();
 
                 foreach (var block in blocks)
                 {
                     foreach (var phi in block.Phis)
                     {
-                        if (phi.Result.Variable.Kind == SsaVariableKind.Memory)
+                        if (phi.Result.Variable.Kind == GimpleVariableKind.Memory)
                             MarkPhiLive(phi, livePhis, workList);
                     }
 
-                    foreach (var instruction in block.Instructions)
+                    foreach (var instruction in block.Statements)
                     {
                         if (!IsRemovableInstruction(instruction))
                             MarkInstructionLive(instruction, liveInstructions, workList);
@@ -301,14 +305,14 @@ namespace Cnidaria.C
                         MarkInstructionLive(declaration, liveInstructions, workList);
                 }
 
-                var result = ImmutableArray.CreateBuilder<SsaBlock>(blocks.Length);
+                var result = ImmutableArray.CreateBuilder<GimpleBlockAnnotations>(blocks.Length);
                 foreach (var block in blocks)
                 {
                     var phisChanged = false;
-                    var phis = ImmutableArray.CreateBuilder<SsaPhi>(block.Phis.Length);
+                    var phis = ImmutableArray.CreateBuilder<GimplePhi>(block.Phis.Length);
                     foreach (var phi in block.Phis)
                     {
-                        if (phi.Result.Variable.Kind == SsaVariableKind.Memory || livePhis.Contains(phi))
+                        if (phi.Result.Variable.Kind == GimpleVariableKind.Memory || livePhis.Contains(phi))
                         {
                             phis.Add(phi);
                             continue;
@@ -319,8 +323,8 @@ namespace Cnidaria.C
                     }
 
                     var instructionsChanged = false;
-                    var instructions = ImmutableArray.CreateBuilder<SsaInstruction>(block.Instructions.Length);
-                    foreach (var instruction in block.Instructions)
+                    var instructions = ImmutableArray.CreateBuilder<GimpleStatementAnnotations>(block.Statements.Length);
+                    foreach (var instruction in block.Statements)
                     {
                         if (!IsRemovableInstruction(instruction) || liveInstructions.Contains(instruction))
                         {
@@ -335,7 +339,7 @@ namespace Cnidaria.C
                     if (phisChanged || instructionsChanged)
                     {
                         Changed = true;
-                        result.Add(new SsaBlock(block.ControlFlowBlock, phis.ToImmutable(), instructions.ToImmutable()));
+                        result.Add(new GimpleBlockAnnotations(block.ControlFlowBlock, phis.ToImmutable(), instructions.ToImmutable()));
                     }
                     else
                     {
@@ -346,18 +350,18 @@ namespace Cnidaria.C
                 return result.ToImmutable();
             }
 
-            private static bool IsRemovableInstruction(SsaInstruction instruction)
+            private static bool IsRemovableInstruction(GimpleStatementAnnotations instruction)
             {
                 if (instruction.Statement.IsTerminator)
                     return false;
 
-                if ((instruction.Flags & (SsaInstructionFlags.ReadsMemory | SsaInstructionFlags.WritesMemory | SsaInstructionFlags.ContainsCall)) != 0)
+                if ((instruction.Flags & (GimpleStatementFlags.ReadsMemory | GimpleStatementFlags.WritesMemory | GimpleStatementFlags.ContainsCall)) != 0)
                     return false;
 
                 if (instruction.Statement is GimpleDeclarationStatement or GimpleNopStatement)
                     return true;
 
-                if (instruction.Definitions.Length == 0 && instruction.Statement is not GimpleExpressionStatement)
+                if (instruction.Definitions.Length == 0)
                     return false;
 
                 if (instruction.MemoryInput is not null || instruction.MemoryOutput is not null)
@@ -365,7 +369,7 @@ namespace Cnidaria.C
 
                 foreach (var definition in instruction.Definitions)
                 {
-                    if (definition.Name.Variable.Kind == SsaVariableKind.Memory)
+                    if (definition.Name.Variable.Kind == GimpleVariableKind.Memory)
                         return false;
                 }
 
@@ -373,76 +377,76 @@ namespace Cnidaria.C
             }
 
             private static void MarkInstructionLive(
-                SsaInstruction instruction,
-                HashSet<SsaInstruction> liveInstructions,
-                Queue<SsaName> workList)
+                GimpleStatementAnnotations instruction,
+                HashSet<GimpleStatementAnnotations> liveInstructions,
+                Queue<GimpleName> workList)
             {
                 if (!liveInstructions.Add(instruction))
                     return;
 
                 foreach (var use in instruction.Uses)
                 {
-                    if (use.Kind != SsaUseKind.Memory && use.Name.Variable.Kind != SsaVariableKind.Memory)
+                    if (use.Kind != GimpleUseKind.Memory && use.Name.Variable.Kind != GimpleVariableKind.Memory)
                         workList.Enqueue(use.Name);
                 }
             }
 
             private static void MarkPhiLive(
-                SsaPhi phi,
-                HashSet<SsaPhi> livePhis,
-                Queue<SsaName> workList)
+                GimplePhi phi,
+                HashSet<GimplePhi> livePhis,
+                Queue<GimpleName> workList)
             {
                 if (!livePhis.Add(phi))
                     return;
 
                 foreach (var operand in phi.Operands)
                 {
-                    if (operand.Value.Variable.Kind != SsaVariableKind.Memory)
+                    if (operand.Value.Variable.Kind != GimpleVariableKind.Memory)
                         workList.Enqueue(operand.Value);
                 }
             }
 
-            private void RemoveInstructionDefinitions(SsaInstruction instruction)
+            private void RemoveInstructionDefinitions(GimpleStatementAnnotations instruction)
             {
                 foreach (var definition in instruction.Definitions)
                     _removedDefinitions.Add(definition);
             }
 
-            private void RemovePhiDefinition(SsaPhi phi)
+            private void RemovePhiDefinition(GimplePhi phi)
             {
                 if (_function.TryGetDefinition(phi.Result, out var definition) && definition is not null)
                     _removedDefinitions.Add(definition);
             }
 
-            private static ImmutableArray<SsaExpression> PruneExpressionsForStatement(
+            private static ImmutableArray<GimpleOperandInfo> PruneExpressionsForStatement(
                 GimpleStatement statement,
-                ImmutableArray<SsaExpression> expressions)
+                ImmutableArray<GimpleOperandInfo> expressions)
             {
                 return statement switch
                 {
-                    GimpleGotoStatement => ImmutableArray<SsaExpression>.Empty,
-                    GimpleReturnStatement { Expression: null } => ImmutableArray<SsaExpression>.Empty,
+                    GimpleGotoStatement => ImmutableArray<GimpleOperandInfo>.Empty,
+                    GimpleReturnStatement { Expression: null } => ImmutableArray<GimpleOperandInfo>.Empty,
                     _ => expressions,
                 };
             }
 
-            private Dictionary<SsaVariable, SsaName> CreateUndefinedNameMap()
+            private Dictionary<GimpleVariable, GimpleName> CreateUndefinedNameMap()
             {
-                var result = new Dictionary<SsaVariable, SsaName>();
+                var result = new Dictionary<GimpleVariable, GimpleName>();
                 foreach (var variable in _function.Variables)
                     result[variable] = _function.GetUndefinedName(variable);
                 return result;
             }
 
-            private ImmutableArray<SsaPhi> RewritePhis(SsaBlock block)
+            private ImmutableArray<GimplePhi> RewritePhis(GimpleBlockAnnotations block)
             {
                 if (block.Phis.Length == 0)
-                    return ImmutableArray<SsaPhi>.Empty;
+                    return ImmutableArray<GimplePhi>.Empty;
 
-                var phis = ImmutableArray.CreateBuilder<SsaPhi>(block.Phis.Length);
+                var phis = ImmutableArray.CreateBuilder<GimplePhi>(block.Phis.Length);
                 foreach (var phi in block.Phis)
                 {
-                    var operands = ImmutableArray.CreateBuilder<SsaPhiOperand>(phi.Operands.Length);
+                    var operands = ImmutableArray.CreateBuilder<GimplePhiOperand>(phi.Operands.Length);
                     var changed = false;
                     foreach (var operand in phi.Operands)
                     {
@@ -459,11 +463,11 @@ namespace Cnidaria.C
                         if (!ReferenceEquals(value, operand.Value))
                             changed = true;
 
-                        operands.Add(new SsaPhiOperand(operand.Predecessor, value));
+                        operands.Add(new GimplePhiOperand(operand.Edge, value));
                     }
 
                     var rewritten = changed
-                        ? new SsaPhi(phi.Ordinal, phi.Block, phi.Variable, phi.Result, operands.ToImmutable())
+                        ? new GimplePhi(phi.Ordinal, phi.Block, phi.Variable, phi.Result, operands.ToImmutable())
                         : phi;
 
                     if (changed)
@@ -488,13 +492,13 @@ namespace Cnidaria.C
                 return phis.ToImmutable();
             }
 
-            private ImmutableArray<SsaInstruction> RewriteInstructions(SsaBlock block)
+            private ImmutableArray<GimpleStatementAnnotations> RewriteInstructions(GimpleBlockAnnotations block)
             {
-                if (block.Instructions.Length == 0)
-                    return ImmutableArray<SsaInstruction>.Empty;
+                if (block.Statements.Length == 0)
+                    return ImmutableArray<GimpleStatementAnnotations>.Empty;
 
-                var instructions = ImmutableArray.CreateBuilder<SsaInstruction>(block.Instructions.Length);
-                foreach (var instruction in block.Instructions)
+                var instructions = ImmutableArray.CreateBuilder<GimpleStatementAnnotations>(block.Statements.Length);
+                foreach (var instruction in block.Statements)
                 {
                     var rewritten = RewriteInstruction(instruction);
                     instructions.Add(rewritten);
@@ -504,20 +508,30 @@ namespace Cnidaria.C
                 return instructions.ToImmutable();
             }
 
-            private SsaInstruction RewriteInstruction(SsaInstruction instruction)
+            private GimpleStatementAnnotations RewriteInstruction(GimpleStatementAnnotations instruction)
             {
-                var expressions = ImmutableArray.CreateBuilder<SsaExpression>(instruction.Expressions.Length);
-                foreach (var expression in instruction.Expressions)
+                var expressions = ImmutableArray.CreateBuilder<GimpleOperandInfo>(instruction.Operands.Length);
+                foreach (var expression in instruction.Operands)
                     expressions.Add(RewriteExpression(expression, instruction.Block, instruction.Statement));
 
-                var newStatement = MaterializeStatement(instruction.Statement, instruction, expressions.ToImmutable());
-                var expressionArray = PruneExpressionsForStatement(newStatement, expressions.ToImmutable());
-                var definitions = ImmutableArray.CreateBuilder<SsaDefinition>(instruction.Definitions.Length);
+                var rewrittenExpressions = expressions.ToImmutable();
+                GimpleStatement newStatement;
+                if (_commonAssignments.TryGetValue(instruction, out var replacement) && instruction.Statement is GimpleAssignStatement assign)
+                {
+                    rewrittenExpressions = ImmutableArray.Create(RewriteExpression(replacement, instruction.Block, instruction.Statement));
+                    newStatement = GimpleAssignStatement.Single(assign.Lhs, GimpleNameMaterializer.MaterializeValue(rewrittenExpressions[0]), assign.Syntax);
+                }
+                else
+                {
+                    newStatement = MaterializeStatement(instruction.Statement, instruction, ref rewrittenExpressions);
+                }
+                var expressionArray = PruneExpressionsForStatement(newStatement, rewrittenExpressions);
+                var definitions = ImmutableArray.CreateBuilder<GimpleDefinition>(instruction.Definitions.Length);
                 foreach (var definition in instruction.Definitions)
                 {
                     var rewrittenDefinition = ReferenceEquals(newStatement, definition.Statement)
                         ? definition
-                        : new SsaDefinition(
+                        : new GimpleDefinition(
                             definition.Name,
                             definition.Kind,
                             definition.Block,
@@ -535,19 +549,19 @@ namespace Cnidaria.C
 
                 var flags = TranslateFlags(expressionArray);
                 if (instruction.MemoryOutput is not null)
-                    flags |= SsaInstructionFlags.WritesMemory;
-                if ((instruction.Flags & SsaInstructionFlags.ContainsCall) != 0)
-                    flags |= SsaInstructionFlags.ContainsCall;
+                    flags |= GimpleStatementFlags.WritesMemory;
+                if ((instruction.Flags & GimpleStatementFlags.ContainsCall) != 0)
+                    flags |= GimpleStatementFlags.ContainsCall;
                 if (newStatement is GimpleAsmStatement)
-                    flags |= SsaInstructionFlags.ReadsMemory | SsaInstructionFlags.WritesMemory | SsaInstructionFlags.ContainsCall;
+                    flags |= GimpleStatementFlags.ReadsMemory | GimpleStatementFlags.WritesMemory | GimpleStatementFlags.ContainsCall;
 
-                var uses = ImmutableArray.CreateBuilder<SsaUse>();
+                var uses = ImmutableArray.CreateBuilder<GimpleUse>();
                 CollectUses(expressionArray, instruction.Block, newStatement, uses);
 
                 var memoryInput = instruction.MemoryInput;
-                if (memoryInput is not null && (flags & (SsaInstructionFlags.ReadsMemory | SsaInstructionFlags.WritesMemory)) != 0)
+                if (memoryInput is not null && (flags & (GimpleStatementFlags.ReadsMemory | GimpleStatementFlags.WritesMemory)) != 0)
                 {
-                    var memoryUse = new SsaUse(memoryInput, SsaUseKind.Memory, instruction.Block, newStatement, value: null);
+                    var memoryUse = new GimpleUse(memoryInput, GimpleUseKind.Memory, instruction.Block, newStatement, value: null);
                     uses.Add(memoryUse);
                     _uses.Add(memoryUse);
                 }
@@ -557,14 +571,15 @@ namespace Cnidaria.C
                     memoryInput = null;
                 }
 
-                var memoryOutput = (flags & SsaInstructionFlags.WritesMemory) != 0 ? instruction.MemoryOutput : null;
+                var memoryOutput = (flags & GimpleStatementFlags.WritesMemory) != 0 ? instruction.MemoryOutput : null;
                 if (!ReferenceEquals(memoryOutput, instruction.MemoryOutput))
                     Changed = true;
 
-                var rewritten = new SsaInstruction(
+                var rewritten = new GimpleStatementAnnotations(
                     instruction.Ordinal,
                     instruction.Block,
                     newStatement,
+                    instruction.InputStatement,
                     expressionArray,
                     uses.ToImmutable(),
                     definitions.ToImmutable(),
@@ -576,7 +591,7 @@ namespace Cnidaria.C
                     !ReferenceEquals(memoryInput, instruction.MemoryInput) ||
                     !ReferenceEquals(memoryOutput, instruction.MemoryOutput) ||
                     flags != instruction.Flags ||
-                    !SameExpressions(instruction.Expressions, expressionArray))
+                    !SameExpressions(instruction.Operands, expressionArray))
                 {
                     Changed = true;
                 }
@@ -584,11 +599,16 @@ namespace Cnidaria.C
                 return rewritten;
             }
 
-            private SsaExpression RewriteExpression(
-                SsaExpression expression,
+            private GimpleOperandInfo RewriteExpression(
+                GimpleOperandInfo expression,
                 ControlFlowBlock useBlock,
                 GimpleStatement statement)
             {
+                if (_commonOperands.TryGetValue(expression, out var common))
+                {
+                    Changed = true;
+                    expression = common;
+                }
                 if (expression.Name is not null)
                 {
                     if (expression.IsAddress)
@@ -620,7 +640,7 @@ namespace Cnidaria.C
                     if (!ReferenceEquals(name, expression.Name))
                     {
                         Changed = true;
-                        return CreateNameExpression(MaterializeNameValue(name, expression.Original), name, expression.Role);
+                        return CreateNameExpression(name, name, expression.Role);
                     }
 
                     return expression;
@@ -629,7 +649,7 @@ namespace Cnidaria.C
                 if (expression.Children.Length == 0)
                     return expression;
 
-                var children = ImmutableArray.CreateBuilder<SsaExpression>(expression.Children.Length);
+                var children = ImmutableArray.CreateBuilder<GimpleOperandInfo>(expression.Children.Length);
                 var changed = false;
                 foreach (var child in expression.Children)
                 {
@@ -640,15 +660,6 @@ namespace Cnidaria.C
                 }
 
                 var childArray = children.ToImmutable();
-                if (_options.EnableConstantFolding &&
-                    !expression.ContainsCall &&
-                    !expression.WritesMemory &&
-                    TryFoldExpression(expression, childArray, out var folded))
-                {
-                    Changed = true;
-                    return folded;
-                }
-
                 if (!changed)
                     return expression;
 
@@ -658,48 +669,19 @@ namespace Cnidaria.C
 
             private GimpleStatement MaterializeStatement(
                 GimpleStatement statement,
-                SsaInstruction instruction,
-                ImmutableArray<SsaExpression> expressions)
+                GimpleStatementAnnotations instruction,
+                ref ImmutableArray<GimpleOperandInfo> expressions)
             {
                 switch (statement)
                 {
-                    case GimpleAssignmentStatement assignment:
-                        if (TryGetAssignmentValueExpression(instruction, expressions, out var valueExpression) &&
-                            TryMaterializeValue(valueExpression, out var value))
-                        {
-                            return ReferenceEquals(value, assignment.Value)
-                                ? statement
-                                : new GimpleAssignmentStatement(assignment.Target, value, statement.Syntax);
-                        }
-                        break;
+                    case GimpleAssignStatement assign:
+                        return MaterializeAssign(assign, instruction, ref expressions);
 
-                    case GimpleExpressionStatement expressionStatement:
-                        if (expressions.Length >= 1 && TryMaterializeValue(expressions[0], out var expression))
-                        {
-                            return ReferenceEquals(expression, expressionStatement.Expression)
-                                ? statement
-                                : new GimpleExpressionStatement(expression, statement.Syntax);
-                        }
-                        break;
+                    case GimpleCallStatement call:
+                        return MaterializeCall(call, instruction, expressions);
 
-                    case GimpleConditionalGotoStatement conditional:
-                        if (_options.EnableBranchFolding && ReferenceEquals(conditional.WhenTrue, conditional.WhenFalse))
-                            return new GimpleGotoStatement(conditional.WhenTrue, statement.Syntax);
-
-                        if (expressions.Length >= 1 && TryMaterializeValue(expressions[0], out var condition))
-                        {
-                            if (_options.EnableBranchFolding &&
-                                TryGetConstant(expressions[0], out var conditionConstant) &&
-                                TryGetBranchTruth(conditionConstant, out var truth))
-                            {
-                                return new GimpleGotoStatement(truth ? conditional.WhenTrue : conditional.WhenFalse, statement.Syntax);
-                            }
-
-                            return ReferenceEquals(condition, conditional.Condition)
-                                ? statement
-                                : new GimpleConditionalGotoStatement(condition, conditional.WhenTrue, conditional.WhenFalse, statement.Syntax);
-                        }
-                        break;
+                    case GimpleCondStatement conditional:
+                        return MaterializeCond(conditional, expressions);
 
                     case GimpleSwitchStatement switchStatement:
                         if (expressions.Length >= 1 && TryMaterializeValue(expressions[0], out var switchValue))
@@ -730,13 +712,113 @@ namespace Cnidaria.C
                 return statement;
             }
 
-            private void AnalyzeInstructionDefinition(SsaInstruction instruction)
+            /// <summary>Rebuilds an assignment from rewritten operands, folding the computation when possible</summary>
+            private GimpleStatement MaterializeAssign(
+                GimpleAssignStatement assign,
+                GimpleStatementAnnotations instruction,
+                ref ImmutableArray<GimpleOperandInfo> expressions)
+            {
+                var start = GetRhsOperandStart(instruction);
+                if (assign.Operands.Length == 0 || start + assign.Operands.Length > expressions.Length)
+                    return assign;
+
+                var operands = ImmutableArray.CreateBuilder<GimpleOperandInfo>(assign.Operands.Length);
+                for (var i = 0; i < assign.Operands.Length; i++)
+                    operands.Add(expressions[start + i]);
+
+                var operandArray = operands.ToImmutable();
+                if (_options.EnableConstantFolding && TryFoldAssign(assign, operandArray, out var folded))
+                {
+                    Changed = true;
+                    expressions = ReplaceRhsExpressions(expressions, start, assign.Operands.Length, ImmutableArray.Create(folded));
+                    return GimpleAssignStatement.Single(assign.Lhs, GimpleNameMaterializer.MaterializeValue(folded), assign.Syntax);
+                }
+
+                var values = ImmutableArray.CreateBuilder<GimpleValue>(operandArray.Length);
+                var changed = false;
+                for (var i = 0; i < operandArray.Length; i++)
+                {
+                    var value = GimpleNameMaterializer.MaterializeValue(operandArray[i]);
+                    changed |= !ReferenceEquals(value, assign.Operands[i]);
+                    values.Add(value);
+                }
+
+                return changed ? assign.WithOperands(assign.Lhs, values.ToImmutable()) : assign;
+            }
+
+            private static GimpleStatement MaterializeCall(
+                GimpleCallStatement call,
+                GimpleStatementAnnotations instruction,
+                ImmutableArray<GimpleOperandInfo> expressions)
+            {
+                var hasLhsAddress = call.Lhs is not null && GetPrimaryDefinition(instruction) is null;
+                var start = hasLhsAddress ? 1 : 0;
+                if (start + call.Arguments.Length + 1 > expressions.Length)
+                    return call;
+
+                var function = GimpleNameMaterializer.MaterializeValue(expressions[start]);
+                var arguments = ImmutableArray.CreateBuilder<GimpleValue>(call.Arguments.Length);
+                var changed = !ReferenceEquals(function, call.Function);
+                for (var i = 0; i < call.Arguments.Length; i++)
+                {
+                    var argument = GimpleNameMaterializer.MaterializeValue(expressions[start + 1 + i]);
+                    changed |= !ReferenceEquals(argument, call.Arguments[i]);
+                    arguments.Add(argument);
+                }
+
+                return changed ? call.WithOperands(call.Lhs, function, arguments.ToImmutable()) : call;
+            }
+
+            /// <summary>Rebuilds a branch, resolving it to a jump when the comparison is decided</summary>
+            private GimpleStatement MaterializeCond(GimpleCondStatement conditional, ImmutableArray<GimpleOperandInfo> expressions)
+            {
+                if (_options.EnableBranchFolding && ReferenceEquals(conditional.WhenTrue, conditional.WhenFalse))
+                    return new GimpleGotoStatement(conditional.WhenTrue, conditional.Syntax);
+
+                if (expressions.Length < 2)
+                    return conditional;
+
+                if (_options.EnableBranchFolding &&
+                    TryGetConstant(expressions[0], out var leftConstant) &&
+                    TryGetConstant(expressions[1], out var rightConstant) &&
+                    TryGetIntegerConstant(leftConstant, out var leftValue, out var leftInfo) &&
+                    TryGetIntegerConstant(rightConstant, out var rightValue, out _) &&
+                    TryCompareIntegers(leftValue, rightValue, leftInfo, conditional.Code, out var truth))
+                {
+                    return new GimpleGotoStatement(truth ? conditional.WhenTrue : conditional.WhenFalse, conditional.Syntax);
+                }
+
+                var left = GimpleNameMaterializer.MaterializeValue(expressions[0]);
+                var right = GimpleNameMaterializer.MaterializeValue(expressions[1]);
+                return ReferenceEquals(left, conditional.Lhs) && ReferenceEquals(right, conditional.Rhs)
+                    ? conditional
+                    : conditional.WithOperands(conditional.Code, left, right);
+            }
+
+            private static ImmutableArray<GimpleOperandInfo> ReplaceRhsExpressions(
+                ImmutableArray<GimpleOperandInfo> expressions,
+                int start,
+                int length,
+                ImmutableArray<GimpleOperandInfo> replacement)
+            {
+                var builder = ImmutableArray.CreateBuilder<GimpleOperandInfo>(start + replacement.Length);
+                for (var i = 0; i < start; i++)
+                    builder.Add(expressions[i]);
+
+                builder.AddRange(replacement);
+                for (var i = start + length; i < expressions.Length; i++)
+                    builder.Add(expressions[i]);
+
+                return builder.ToImmutable();
+            }
+
+            private void AnalyzeInstructionDefinition(GimpleStatementAnnotations instruction)
             {
                 var definition = GetPrimaryDefinition(instruction);
                 if (definition is null)
                     return;
 
-                if (instruction.Statement is GimpleZeroInitializeStatement && IsScalarZeroFoldable(definition.Name.Type))
+                if (instruction.Statement is GimpleAssignStatement { IsConstructor: true } && IsScalarZeroFoldable(definition.Name.Type))
                 {
                     AddConstant(definition.Name, CreateZeroConstant(definition.Name.Type, instruction.Statement.Syntax));
                     return;
@@ -749,17 +831,17 @@ namespace Cnidaria.C
                     return;
                 }
 
-                if ((instruction.Flags & (SsaInstructionFlags.WritesMemory | SsaInstructionFlags.ContainsCall)) != 0)
+                if ((instruction.Flags & (GimpleStatementFlags.WritesMemory | GimpleStatementFlags.ContainsCall)) != 0)
                     return;
 
-                if (instruction.Statement is not GimpleAssignmentStatement)
+                if (instruction.Statement is not GimpleAssignStatement { RhsClass: GimpleRhsClass.Single })
                 {
                     if (_options.EnableCopyPropagation)
                         TryAddValueNumberCopy(definition.Name, instruction.Block);
                     return;
                 }
 
-                if (!TryGetAssignmentValueExpression(instruction, instruction.Expressions, out var valueExpression))
+                if (!TryGetSingleRhsExpression(instruction, instruction.Operands, out var valueExpression))
                     return;
 
                 if (_options.EnableConstantFolding && TryGetConstant(valueExpression, out var constant))
@@ -771,7 +853,7 @@ namespace Cnidaria.C
                 if (_options.EnableCopyPropagation &&
                     valueExpression.Name is not null &&
                     !valueExpression.Name.IsUndefined &&
-                    valueExpression.Name.Variable.Kind != SsaVariableKind.Memory &&
+                    valueExpression.Name.Variable.Kind != GimpleVariableKind.Memory &&
                     SameType(valueExpression.Name.Type, definition.Name.Type))
                 {
                     AddCopy(definition.Name, valueExpression.Name);
@@ -782,12 +864,12 @@ namespace Cnidaria.C
                     TryAddValueNumberCopy(definition.Name, instruction.Block);
             }
 
-            private void TryAddValueNumberCopy(SsaName name, ControlFlowBlock useBlock)
+            private void TryAddValueNumberCopy(GimpleName name, ControlFlowBlock useBlock)
             {
                 if (!_options.EnableCopyPropagation)
                     return;
 
-                if (name.IsUndefined || name.Variable.Kind == SsaVariableKind.Memory)
+                if (name.IsUndefined || name.Variable.Kind == GimpleVariableKind.Memory)
                     return;
 
                 if (!_function.ValueNumbering.TryGetValueNumber(name, out var valueNumber) || valueNumber is null)
@@ -805,7 +887,7 @@ namespace Cnidaria.C
 
                 if (!_representativesByValueNumber.TryGetValue(valueNumber.Id, out var list))
                 {
-                    list = new List<SsaName>();
+                    list = new List<GimpleName>();
                     _representativesByValueNumber.Add(valueNumber.Id, list);
                 }
 
@@ -813,7 +895,7 @@ namespace Cnidaria.C
                     list.Add(name);
             }
 
-            private bool TryGetValueNumberRepresentative(SsaName name, ControlFlowBlock useBlock, out SsaName representative)
+            private bool TryGetValueNumberRepresentative(GimpleName name, ControlFlowBlock useBlock, out GimpleName representative)
             {
                 representative = null!;
 
@@ -828,9 +910,9 @@ namespace Cnidaria.C
 
             private bool TryGetValueNumberRepresentative(
                 ValueNumber valueNumber,
-                SsaName useName,
+                GimpleName useName,
                 ControlFlowBlock useBlock,
-                out SsaName representative)
+                out GimpleName representative)
             {
                 representative = null!;
 
@@ -841,7 +923,7 @@ namespace Cnidaria.C
                 for (var i = 0; i < candidates.Count; i++)
                 {
                     var candidate = ResolveCopyForBlock(candidates[i], useBlock);
-                    if (candidate.IsUndefined || candidate.Variable.Kind == SsaVariableKind.Memory)
+                    if (candidate.IsUndefined || candidate.Variable.Kind == GimpleVariableKind.Memory)
                         continue;
 
                     if (ReferenceEquals(candidate, useName))
@@ -872,13 +954,13 @@ namespace Cnidaria.C
                 return valueNumber.Kind is ValueNumberKind.Entry or ValueNumberKind.Constant or ValueNumberKind.Expression or ValueNumberKind.Phi;
             }
 
-            private int ScoreCopyCandidate(SsaName useName, SsaName candidate, ControlFlowBlock useBlock)
+            private int ScoreCopyCandidate(GimpleName useName, GimpleName candidate, ControlFlowBlock useBlock)
             {
                 var score = 1;
 
-                if (useName.Variable.Kind == SsaVariableKind.Temporary)
+                if (useName.Variable.Kind == GimpleVariableKind.Temporary)
                     score += 8;
-                if (candidate.Variable.Kind == SsaVariableKind.Temporary)
+                if (candidate.Variable.Kind == GimpleVariableKind.Temporary)
                     score -= 8;
 
                 if (ReferenceEquals(useName.Variable, candidate.Variable))
@@ -899,7 +981,7 @@ namespace Cnidaria.C
                 return score;
             }
 
-            private SsaName ResolveCopyForBlock(SsaName name, ControlFlowBlock useBlock)
+            private GimpleName ResolveCopyForBlock(GimpleName name, ControlFlowBlock useBlock)
             {
                 var current = name;
                 var remaining = _copies.Count + 1;
@@ -915,11 +997,11 @@ namespace Cnidaria.C
                 return current;
             }
 
-            private void AddCopy(SsaName destination, SsaName source)
+            private void AddCopy(GimpleName destination, GimpleName source)
             {
                 if (destination.IsUndefined || source.IsUndefined)
                     return;
-                if (destination.Variable.Kind == SsaVariableKind.Memory || source.Variable.Kind == SsaVariableKind.Memory)
+                if (destination.Variable.Kind == GimpleVariableKind.Memory || source.Variable.Kind == GimpleVariableKind.Memory)
                     return;
                 if (!CanSubstituteName(destination, source))
                     return;
@@ -936,7 +1018,7 @@ namespace Cnidaria.C
                 _copies[destination] = source;
             }
 
-            private static bool CanSubstituteName(SsaName destination, SsaName source)
+            private static bool CanSubstituteName(GimpleName destination, GimpleName source)
             {
                 if (!SameType(destination.Type, source.Type))
                     return false;
@@ -950,15 +1032,15 @@ namespace Cnidaria.C
                 return !HasExplicitRegister(destination) && !HasExplicitRegister(source);
             }
 
-            private static bool HasExplicitRegister(SsaName name)
+            private static bool HasExplicitRegister(GimpleName name)
                 => name.Variable.Symbol is VariableSymbol { ExplicitRegisterName: not null };
 
-            private static bool CanReplaceNameWithConstant(SsaName name)
+            private static bool CanReplaceNameWithConstant(GimpleName name)
                 => !IsVolatileOrAtomic(name.Type) && !HasExplicitRegister(name);
 
-            private void AddConstant(SsaName destination, GimpleConstantValue constant)
+            private void AddConstant(GimpleName destination, GimpleConstantValue constant)
             {
-                if (destination.IsUndefined || destination.Variable.Kind == SsaVariableKind.Memory)
+                if (destination.IsUndefined || destination.Variable.Kind == GimpleVariableKind.Memory)
                     return;
                 if (!CanReplaceNameWithConstant(destination) || !SameType(destination.Type, constant.Type))
                     return;
@@ -966,12 +1048,12 @@ namespace Cnidaria.C
                 _constants[destination] = constant;
             }
 
-            private bool CanUseNameAtDefinition(SsaName name, SsaDefinition destination)
+            private bool CanUseNameAtDefinition(GimpleName name, GimpleDefinition destination)
             {
                 if (!_function.TryGetDefinition(name, out var source) || source is null)
                     return false;
 
-                if (source.Kind == SsaDefinitionKind.Undefined || source.Block is null || destination.Block is null)
+                if (source.Kind == GimpleDefinitionKind.Undefined || source.Block is null || destination.Block is null)
                     return false;
 
                 if (!ReferenceEquals(source.Block, destination.Block))
@@ -989,12 +1071,12 @@ namespace Cnidaria.C
                 return sourceOrder < destinationOrder;
             }
 
-            private bool CanUseNameAtBlock(SsaName name, ControlFlowBlock useBlock)
+            private bool CanUseNameAtBlock(GimpleName name, ControlFlowBlock useBlock)
             {
                 if (!_function.TryGetDefinition(name, out var definition) || definition is null)
                     return false;
 
-                if (definition.Kind == SsaDefinitionKind.Undefined)
+                if (definition.Kind == GimpleDefinitionKind.Undefined)
                     return false;
 
                 if (definition.Block is null)
@@ -1003,14 +1085,14 @@ namespace Cnidaria.C
                 return definition.Block.Dominates(useBlock);
             }
 
-            private static bool TryGetTrivialPhiCopy(SsaPhi phi, out SsaName copy)
+            private static bool TryGetTrivialPhiCopy(GimplePhi phi, out GimpleName copy)
             {
                 copy = null!;
                 if (phi.Operands.Length == 0)
                     return false;
 
                 var first = phi.Operands[0].Value;
-                if (first.IsUndefined || first.Variable.Kind == SsaVariableKind.Memory)
+                if (first.IsUndefined || first.Variable.Kind == GimpleVariableKind.Memory)
                     return false;
 
                 for (var i = 1; i < phi.Operands.Length; i++)
@@ -1023,10 +1105,10 @@ namespace Cnidaria.C
                 return true;
             }
 
-            private bool TryGetValueNumberPhiCopy(SsaPhi phi, out SsaName copy)
+            private bool TryGetValueNumberPhiCopy(GimplePhi phi, out GimpleName copy)
             {
                 copy = null!;
-                if (phi.Operands.Length == 0 || phi.Result.Variable.Kind == SsaVariableKind.Memory)
+                if (phi.Operands.Length == 0 || phi.Result.Variable.Kind == GimpleVariableKind.Memory)
                     return false;
 
                 if (!_function.ValueNumbering.TryGetValueNumber(phi.Operands[0].Value, out var valueNumber) ||
@@ -1068,7 +1150,7 @@ namespace Cnidaria.C
                 return copy is not null;
             }
 
-            private bool TryGetPhiConstant(SsaPhi phi, out GimpleConstantValue constant)
+            private bool TryGetPhiConstant(GimplePhi phi, out GimpleConstantValue constant)
             {
                 constant = null!;
                 if (phi.Operands.Length == 0 || !CanReplaceNameWithConstant(phi.Result))
@@ -1094,31 +1176,31 @@ namespace Cnidaria.C
                 return true;
             }
 
-            private static SsaDefinition? GetPrimaryDefinition(SsaInstruction instruction)
+            private static GimpleDefinition? GetPrimaryDefinition(GimpleStatementAnnotations instruction)
             {
                 foreach (var definition in instruction.Definitions)
                 {
-                    if (definition.Name.Variable.Kind != SsaVariableKind.Memory)
+                    if (definition.Name.Variable.Kind != GimpleVariableKind.Memory)
                         return definition;
                 }
 
                 return null;
             }
 
-            private static bool TryGetAssignmentValueExpression(
-                SsaInstruction instruction,
-                ImmutableArray<SsaExpression> expressions,
-                out SsaExpression expression)
-            {
-                if (GetPrimaryDefinition(instruction) is not null && expressions.Length >= 1)
-                {
-                    expression = expressions[0];
-                    return true;
-                }
+            /// <summary>Gets the operand index at which an assignment right-hand side starts</summary>
+            /// <remarks>A memory target contributes its address ahead of the right-hand side operands</remarks>
+            private static int GetRhsOperandStart(GimpleStatementAnnotations instruction)
+                => GetPrimaryDefinition(instruction) is null ? 1 : 0;
 
-                if (GetPrimaryDefinition(instruction) is null && expressions.Length >= 2)
+            private static bool TryGetSingleRhsExpression(
+                GimpleStatementAnnotations instruction,
+                ImmutableArray<GimpleOperandInfo> expressions,
+                out GimpleOperandInfo expression)
+            {
+                var index = GetRhsOperandStart(instruction);
+                if (index < expressions.Length)
                 {
-                    expression = expressions[1];
+                    expression = expressions[index];
                     return true;
                 }
 
@@ -1127,15 +1209,15 @@ namespace Cnidaria.C
             }
 
             private static void CollectExpressionUses(
-                SsaExpression expression,
+                GimpleOperandInfo expression,
                 ControlFlowBlock block,
                 GimpleStatement statement,
-                ImmutableArray<SsaUse>.Builder uses)
+                ImmutableArray<GimpleUse>.Builder uses)
             {
                 if (expression.Name is not null)
                 {
-                    var kind = expression.IsAddress ? SsaUseKind.Address : SsaUseKind.Value;
-                    uses.Add(new SsaUse(expression.Name, kind, block, statement, expression.Original));
+                    var kind = expression.IsAddress ? GimpleUseKind.Address : GimpleUseKind.Value;
+                    uses.Add(new GimpleUse(expression.Name, kind, block, statement, expression.Original));
                     return;
                 }
 
@@ -1143,7 +1225,7 @@ namespace Cnidaria.C
                     CollectExpressionUses(child, block, statement, uses);
             }
 
-            private void CollectUses(ImmutableArray<SsaExpression> expressions, ControlFlowBlock block, GimpleStatement statement, ImmutableArray<SsaUse>.Builder uses)
+            private void CollectUses(ImmutableArray<GimpleOperandInfo> expressions, ControlFlowBlock block, GimpleStatement statement, ImmutableArray<GimpleUse>.Builder uses)
             {
                 foreach (var expression in expressions)
                 {
@@ -1154,23 +1236,23 @@ namespace Cnidaria.C
                     _uses.Add(use);
             }
 
-            private static SsaInstructionFlags TranslateFlags(ImmutableArray<SsaExpression> expressions)
+            private static GimpleStatementFlags TranslateFlags(ImmutableArray<GimpleOperandInfo> expressions)
             {
-                var flags = SsaInstructionFlags.None;
+                var flags = GimpleStatementFlags.None;
                 foreach (var expression in expressions)
                 {
                     if (expression.ReadsMemory)
-                        flags |= SsaInstructionFlags.ReadsMemory;
+                        flags |= GimpleStatementFlags.ReadsMemory;
                     if (expression.WritesMemory)
-                        flags |= SsaInstructionFlags.WritesMemory;
+                        flags |= GimpleStatementFlags.WritesMemory;
                     if (expression.ContainsCall)
-                        flags |= SsaInstructionFlags.ContainsCall;
+                        flags |= GimpleStatementFlags.ContainsCall;
                 }
 
                 return flags;
             }
 
-            private static bool SameExpressions(ImmutableArray<SsaExpression> left, ImmutableArray<SsaExpression> right)
+            private static bool SameExpressions(ImmutableArray<GimpleOperandInfo> left, ImmutableArray<GimpleOperandInfo> right)
             {
                 if (left.Length != right.Length)
                     return false;
@@ -1184,13 +1266,13 @@ namespace Cnidaria.C
                 return true;
             }
 
-            private static SsaExpression CreateNameExpression(GimpleValue original, SsaName name, SsaExpressionRole role)
-                => new SsaExpression(original, name, ImmutableArray<SsaExpression>.Empty, readsMemory: false, writesMemory: false, containsCall: false, role);
+            private static GimpleOperandInfo CreateNameExpression(GimpleValue original, GimpleName name, GimpleOperandRole role)
+                => new GimpleOperandInfo(original, name, ImmutableArray<GimpleOperandInfo>.Empty, readsMemory: false, writesMemory: false, containsCall: false, role);
 
-            private static SsaExpression CreateConstantExpression(GimpleConstantValue constant)
-                => new SsaExpression(constant, name: null, ImmutableArray<SsaExpression>.Empty, readsMemory: false, writesMemory: false, containsCall: false);
+            private static GimpleOperandInfo CreateConstantExpression(GimpleConstantValue constant)
+                => new GimpleOperandInfo(constant, name: null, ImmutableArray<GimpleOperandInfo>.Empty, readsMemory: false, writesMemory: false, containsCall: false);
 
-            private static SsaExpression CreateCompositeExpression(GimpleValue original, ImmutableArray<SsaExpression> children, SsaExpressionRole role)
+            private static GimpleOperandInfo CreateCompositeExpression(GimpleValue original, ImmutableArray<GimpleOperandInfo> children, GimpleOperandRole role)
             {
                 var readsMemory = false;
                 var writesMemory = false;
@@ -1209,128 +1291,50 @@ namespace Cnidaria.C
                     case GimpleIndirectExpression:
                     case GimpleElementAccessExpression:
                     case GimpleMemberAccessExpression:
-                        if (role == SsaExpressionRole.Value)
+                        if (role == GimpleOperandRole.Value)
                             readsMemory = true;
                         break;
 
-                    case GimpleCallExpression:
-                        readsMemory = true;
-                        writesMemory = true;
-                        containsCall = true;
-                        break;
                 }
 
-                return new SsaExpression(original, name: null, children, readsMemory, writesMemory, containsCall, role);
+                return new GimpleOperandInfo(original, name: null, children, readsMemory, writesMemory, containsCall, role);
             }
 
-            private static GimpleValue MaterializeNameValue(SsaName name, GimpleValue fallback)
+            private static bool TryMaterializeValue(GimpleOperandInfo expression, out GimpleValue value)
             {
-                if (name.Variable.Symbol is TypedSymbol typedSymbol)
-                    return new GimpleSymbolValue(typedSymbol, name.Type, fallback.Syntax);
-
-                if (name.Variable.Temporary is not null)
-                    return name.Variable.Temporary;
-
-                return fallback;
+                value = GimpleNameMaterializer.MaterializeValue(expression);
+                return true;
             }
 
-            private static bool TryMaterializeValue(SsaExpression expression, out GimpleValue value)
+            /// <summary>Folds an assignment right-hand side into a single value when its operands allow it</summary>
+            /// <remarks>This is the statement-level counterpart of the GCC fold_stmt pass</remarks>
+            private bool TryFoldAssign(
+                GimpleAssignStatement assign,
+                ImmutableArray<GimpleOperandInfo> operands,
+                out GimpleOperandInfo folded)
             {
-                if (expression.Name is not null && !expression.IsAddress)
+                switch (assign.RhsClass)
                 {
-                    value = MaterializeNameValue(expression.Name, expression.Original);
-                    return true;
-                }
+                    case GimpleRhsClass.Unary when operands.Length == 1:
+                        return TryFoldUnary(assign.Subcode, assign.Lhs.Type, assign.Syntax, operands[0], out folded);
 
-                if (expression.Original is GimpleConstantValue constant && expression.Children.Length == 0)
-                {
-                    value = constant;
-                    return true;
-                }
-
-                if (expression.Children.Length == 0)
-                {
-                    value = expression.Original;
-                    return false;
-                }
-
-                var children = ImmutableArray.CreateBuilder<GimpleValue>(expression.Children.Length);
-                foreach (var child in expression.Children)
-                {
-                    if (!TryMaterializeValue(child, out var childValue))
-                    {
-                        value = expression.Original;
-                        return false;
-                    }
-
-                    children.Add(childValue);
-                }
-
-                switch (expression.Original)
-                {
-                    case GimpleUnaryExpression unary when children.Count == 1:
-                        value = new GimpleUnaryExpression(unary.OperatorToken, children[0], unary.Type, unary.Syntax);
-                        return true;
-
-                    case GimpleBinaryExpression binary when children.Count == 2:
-                        value = new GimpleBinaryExpression(children[0], binary.OperatorToken, children[1], binary.Type, binary.Syntax);
-                        return true;
-
-                    case GimpleConversionExpression conversion when children.Count == 1:
-                        value = new GimpleConversionExpression(children[0], conversion.Type, conversion.ConversionKind, conversion.Syntax);
-                        return true;
-
-                    case GimpleCastExpression cast when children.Count == 1:
-                        value = new GimpleCastExpression(children[0], cast.Type, cast.Syntax);
-                        return true;
-
-                    case GimpleCallExpression call when children.Count == call.Arguments.Length + 1:
-                        value = new GimpleCallExpression(
-                            children[0],
-                            children.Skip(1).ToImmutableArray(),
-                            call.FunctionType,
-                            call.Type,
-                            call.Syntax);
-                        return true;
-                }
-
-                value = expression.Original;
-                return false;
-            }
-
-            private bool TryFoldExpression(
-                SsaExpression expression,
-                ImmutableArray<SsaExpression> children,
-                out SsaExpression folded)
-            {
-                switch (expression.Original)
-                {
-                    case GimpleUnaryExpression unary when children.Length == 1:
-                        return TryFoldUnary(unary, children[0], out folded);
-
-                    case GimpleBinaryExpression binary when children.Length == 2:
-                        return TryFoldBinary(binary, children[0], children[1], out folded);
-
-                    case GimpleConversionExpression conversion when children.Length == 1:
-                        return TryFoldConversion(conversion, children[0], out folded);
-
-                    case GimpleCastExpression cast when children.Length == 1:
-                        return TryFoldCast(cast, children[0], out folded);
+                    case GimpleRhsClass.Binary when operands.Length == 2:
+                        return TryFoldBinary(assign.Subcode, assign.Lhs.Type, assign.Syntax, operands[0], operands[1], out folded);
                 }
 
                 folded = null!;
                 return false;
             }
 
-            private bool TryFoldUnary(GimpleUnaryExpression unary, SsaExpression operand, out SsaExpression folded)
+            private bool TryFoldUnary(
+                GimpleTreeCode code,
+                QualifiedType type,
+                SyntaxNode? syntax,
+                GimpleOperandInfo operand,
+                out GimpleOperandInfo folded)
             {
-                var kind = unary.OperatorToken.Kind;
-
-                if (kind == SyntaxKind.PlusToken && SameType(operand.Original.Type, unary.Type))
-                {
-                    folded = operand;
-                    return true;
-                }
+                if (GimpleOperators.IsConversion(code))
+                    return TryFoldConversion(code, type, syntax, operand, out folded);
 
                 if (!TryGetConstant(operand, out var constant))
                 {
@@ -1338,9 +1342,9 @@ namespace Cnidaria.C
                     return false;
                 }
 
-                if (kind == SyntaxKind.BangToken && TryGetIntegerConstant(constant, out var truthValue, out _))
+                if (code == GimpleTreeCode.TruthNotExpr && TryGetIntegerConstant(constant, out var truthValue, out _))
                 {
-                    folded = CreateConstantExpression(CreateIntegerConstant(truthValue == 0 ? 1UL : 0UL, unary.Type, unary.Syntax));
+                    folded = CreateConstantExpression(CreateIntegerConstant(truthValue == 0 ? 1UL : 0UL, type, syntax));
                     return true;
                 }
 
@@ -1350,26 +1354,18 @@ namespace Cnidaria.C
                     return false;
                 }
 
-                switch (kind)
+                switch (code)
                 {
-                    case SyntaxKind.PlusToken:
-                        if (TryCastInteger(value, unary.Type, unary.Syntax, out var plus))
-                        {
-                            folded = CreateConstantExpression(plus);
-                            return true;
-                        }
-                        break;
-
-                    case SyntaxKind.MinusToken:
-                        if (TryNegateInteger(value, info, unary.Type, unary.Syntax, out var negated))
+                    case GimpleTreeCode.NegateExpr:
+                        if (TryNegateInteger(value, info, type, syntax, out var negated))
                         {
                             folded = CreateConstantExpression(negated);
                             return true;
                         }
                         break;
 
-                    case SyntaxKind.TildeToken:
-                        if (TryCastInteger(~value, unary.Type, unary.Syntax, out var complemented))
+                    case GimpleTreeCode.BitNotExpr:
+                        if (TryCastInteger(~value, type, syntax, out var complemented))
                         {
                             folded = CreateConstantExpression(complemented);
                             return true;
@@ -1381,42 +1377,75 @@ namespace Cnidaria.C
                 return false;
             }
 
-            private bool TryFoldBinary(GimpleBinaryExpression binary, SsaExpression left, SsaExpression right, out SsaExpression folded)
+            private bool TryFoldConversion(
+                GimpleTreeCode code,
+                QualifiedType type,
+                SyntaxNode? syntax,
+                GimpleOperandInfo operand,
+                out GimpleOperandInfo folded)
             {
-                if (TryFoldBinaryConstants(binary, left, right, out folded))
+                if (code == GimpleTreeCode.NopExpr && SameType(operand.Original.Type, type))
+                {
+                    folded = operand;
+                    return true;
+                }
+
+                if (TryGetConstant(operand, out var constant) && TryCastIntegerConstant(constant, type, syntax, out var casted))
+                {
+                    folded = CreateConstantExpression(casted);
+                    return true;
+                }
+
+                folded = null!;
+                return false;
+            }
+
+            private bool TryFoldBinary(
+                GimpleTreeCode code,
+                QualifiedType type,
+                SyntaxNode? syntax,
+                GimpleOperandInfo left,
+                GimpleOperandInfo right,
+                out GimpleOperandInfo folded)
+            {
+                if (TryFoldBinaryConstants(code, type, syntax, left, right, out folded))
                     return true;
 
-                if (TryFoldBinaryIdentity(binary, left, right, out folded))
+                if (TryFoldBinaryIdentity(code, type, left, right, out folded))
                     return true;
 
-                if (TryFoldSameNameComparison(binary, left, right, out folded))
+                if (TryFoldSameNameComparison(code, type, syntax, left, right, out folded))
                     return true;
 
                 folded = null!;
                 return false;
             }
 
-            private bool TryFoldBinaryConstants(GimpleBinaryExpression binary, SsaExpression left, SsaExpression right, out SsaExpression folded)
+            private bool TryFoldBinaryConstants(
+                GimpleTreeCode code,
+                QualifiedType type,
+                SyntaxNode? syntax,
+                GimpleOperandInfo left,
+                GimpleOperandInfo right,
+                out GimpleOperandInfo folded)
             {
                 folded = null!;
                 if (!TryGetConstant(left, out var leftConstant) || !TryGetConstant(right, out var rightConstant))
                     return false;
 
-                var kind = binary.OperatorToken.Kind;
-
-                if ((kind is SyntaxKind.AmpersandAmpersandToken or SyntaxKind.PipePipeToken) &&
+                if (code is GimpleTreeCode.TruthAndExpr or GimpleTreeCode.TruthOrExpr &&
                     TryGetIntegerConstant(leftConstant, out var leftTruth, out _) &&
                     TryGetIntegerConstant(rightConstant, out var rightTruth, out _))
                 {
-                    var result = kind == SyntaxKind.AmpersandAmpersandToken
+                    var truth = code == GimpleTreeCode.TruthAndExpr
                         ? (leftTruth != 0 && rightTruth != 0)
                         : (leftTruth != 0 || rightTruth != 0);
-                    folded = CreateConstantExpression(CreateIntegerConstant(result ? 1UL : 0UL, binary.Type, binary.Syntax));
+                    folded = CreateConstantExpression(CreateIntegerConstant(truth ? 1UL : 0UL, type, syntax));
                     return true;
                 }
 
                 if (!TryGetIntegerConstant(leftConstant, out var leftValue, out var leftInfo) ||
-                    !TryGetIntegerConstant(rightConstant, out var rightValue, out var rightInfo))
+                    !TryGetIntegerConstant(rightConstant, out var rightValue, out _))
                 {
                     return false;
                 }
@@ -1424,76 +1453,80 @@ namespace Cnidaria.C
                 if (!SameType(leftConstant.Type, rightConstant.Type))
                     return false;
 
-                if (kind is SyntaxKind.EqualsEqualsToken or SyntaxKind.BangEqualsToken or
-                    SyntaxKind.LessThanToken or SyntaxKind.LessThanEqualsToken or
-                    SyntaxKind.GreaterThanToken or SyntaxKind.GreaterThanEqualsToken)
+                if (GimpleOperators.IsComparison(code))
                 {
-                    if (TryCompareIntegers(leftValue, rightValue, leftInfo, kind, out var comparison))
+                    if (TryCompareIntegers(leftValue, rightValue, leftInfo, code, out var comparison))
                     {
-                        folded = CreateConstantExpression(CreateIntegerConstant(comparison ? 1UL : 0UL, binary.Type, binary.Syntax));
+                        folded = CreateConstantExpression(CreateIntegerConstant(comparison ? 1UL : 0UL, type, syntax));
                         return true;
                     }
 
                     return false;
                 }
 
-                if (!SameType(leftConstant.Type, binary.Type))
+                if (!SameType(leftConstant.Type, type))
                     return false;
 
+                if (TryEvaluateIntegerBinary(leftValue, rightValue, leftInfo, code, type, syntax, out var result))
                 {
-                    if (TryEvaluateIntegerBinary(leftValue, rightValue, leftInfo, kind, binary.Type, binary.Syntax, out var result))
-                    {
-                        folded = CreateConstantExpression(result);
-                        return true;
-                    }
+                    folded = CreateConstantExpression(result);
+                    return true;
                 }
-
 
                 return false;
             }
 
-            private bool TryFoldBinaryIdentity(GimpleBinaryExpression binary, SsaExpression left, SsaExpression right, out SsaExpression folded)
+            private bool TryFoldBinaryIdentity(
+                GimpleTreeCode code,
+                QualifiedType type,
+                GimpleOperandInfo left,
+                GimpleOperandInfo right,
+                out GimpleOperandInfo folded)
             {
                 folded = null!;
-                var kind = binary.OperatorToken.Kind;
 
-                if (IsZero(right) && SameType(left.Original.Type, binary.Type))
+                if (IsZero(right) && SameType(left.Original.Type, type))
                 {
-                    switch (kind)
+                    switch (code)
                     {
-                        case SyntaxKind.PlusToken:
-                        case SyntaxKind.MinusToken:
-                        case SyntaxKind.PipeToken:
-                        case SyntaxKind.HatToken:
+                        case GimpleTreeCode.PlusExpr:
+                        case GimpleTreeCode.PointerPlusExpr:
+                        case GimpleTreeCode.MinusExpr:
+                        case GimpleTreeCode.BitIorExpr:
+                        case GimpleTreeCode.BitXorExpr:
+                        case GimpleTreeCode.LshiftExpr:
+                        case GimpleTreeCode.RshiftExpr:
                             folded = left;
                             return true;
                     }
                 }
 
-                if (IsZero(left) && SameType(right.Original.Type, binary.Type))
+                if (IsZero(left) && SameType(right.Original.Type, type))
                 {
-                    switch (kind)
+                    switch (code)
                     {
-                        case SyntaxKind.PlusToken:
-                        case SyntaxKind.PipeToken:
-                        case SyntaxKind.HatToken:
+                        case GimpleTreeCode.PlusExpr:
+                        case GimpleTreeCode.BitIorExpr:
+                        case GimpleTreeCode.BitXorExpr:
                             folded = right;
                             return true;
                     }
                 }
 
-                if (IsOne(right) && SameType(left.Original.Type, binary.Type))
+                if (IsOne(right) && SameType(left.Original.Type, type))
                 {
-                    switch (kind)
+                    switch (code)
                     {
-                        case SyntaxKind.StarToken:
-                        case SyntaxKind.SlashToken:
+                        case GimpleTreeCode.MultExpr:
+                        case GimpleTreeCode.TruncDivExpr:
+                        case GimpleTreeCode.ExactDivExpr:
+                        case GimpleTreeCode.RdivExpr:
                             folded = left;
                             return true;
                     }
                 }
 
-                if (IsOne(left) && SameType(right.Original.Type, binary.Type) && kind == SyntaxKind.StarToken)
+                if (IsOne(left) && SameType(right.Original.Type, type) && code == GimpleTreeCode.MultExpr)
                 {
                     folded = right;
                     return true;
@@ -1502,7 +1535,13 @@ namespace Cnidaria.C
                 return false;
             }
 
-            private bool TryFoldSameNameComparison(GimpleBinaryExpression binary, SsaExpression left, SsaExpression right, out SsaExpression folded)
+            private bool TryFoldSameNameComparison(
+                GimpleTreeCode code,
+                QualifiedType type,
+                SyntaxNode? syntax,
+                GimpleOperandInfo left,
+                GimpleOperandInfo right,
+                out GimpleOperandInfo folded)
             {
                 folded = null!;
                 if (left.Name is null || right.Name is null || !ReferenceEquals(left.Name, right.Name))
@@ -1511,47 +1550,17 @@ namespace Cnidaria.C
                 if (!IsIntegerLike(left.Name.Type) && !IsPointerLike(left.Name.Type))
                     return false;
 
-                switch (binary.OperatorToken.Kind)
+                switch (code)
                 {
-                    case SyntaxKind.EqualsEqualsToken:
-                        folded = CreateConstantExpression(CreateIntegerConstant(1UL, binary.Type, binary.Syntax));
+                    case GimpleTreeCode.EqExpr:
+                        folded = CreateConstantExpression(CreateIntegerConstant(1UL, type, syntax));
                         return true;
 
-                    case SyntaxKind.BangEqualsToken:
-                        folded = CreateConstantExpression(CreateIntegerConstant(0UL, binary.Type, binary.Syntax));
+                    case GimpleTreeCode.NeExpr:
+                        folded = CreateConstantExpression(CreateIntegerConstant(0UL, type, syntax));
                         return true;
                 }
 
-                return false;
-            }
-
-            private bool TryFoldConversion(GimpleConversionExpression conversion, SsaExpression operand, out SsaExpression folded)
-            {
-                if (conversion.ConversionKind == GimpleConversionKind.Identity && SameType(operand.Original.Type, conversion.Type))
-                {
-                    folded = operand;
-                    return true;
-                }
-
-                if (TryGetConstant(operand, out var constant) && TryCastIntegerConstant(constant, conversion.Type, conversion.Syntax, out var casted))
-                {
-                    folded = CreateConstantExpression(casted);
-                    return true;
-                }
-
-                folded = null!;
-                return false;
-            }
-
-            private bool TryFoldCast(GimpleCastExpression cast, SsaExpression operand, out SsaExpression folded)
-            {
-                if (TryGetConstant(operand, out var constant) && TryCastIntegerConstant(constant, cast.Type, cast.Syntax, out var casted))
-                {
-                    folded = CreateConstantExpression(casted);
-                    return true;
-                }
-
-                folded = null!;
                 return false;
             }
 
@@ -1559,7 +1568,7 @@ namespace Cnidaria.C
                 ulong left,
                 ulong right,
                 IntegerInfo info,
-                SyntaxKind kind,
+                GimpleTreeCode code,
                 QualifiedType resultType,
                 SyntaxNode? syntax,
                 out GimpleConstantValue result)
@@ -1575,34 +1584,35 @@ namespace Cnidaria.C
                     {
                         checked
                         {
-                            switch (kind)
+                            switch (code)
                             {
-                                case SyntaxKind.PlusToken:
+                                case GimpleTreeCode.PlusExpr:
                                     signedResult = leftSigned + rightSigned;
                                     break;
-                                case SyntaxKind.MinusToken:
+                                case GimpleTreeCode.MinusExpr:
                                     signedResult = leftSigned - rightSigned;
                                     break;
-                                case SyntaxKind.StarToken:
+                                case GimpleTreeCode.MultExpr:
                                     signedResult = leftSigned * rightSigned;
                                     break;
-                                case SyntaxKind.SlashToken:
+                                case GimpleTreeCode.TruncDivExpr:
+                                case GimpleTreeCode.ExactDivExpr:
                                     if (rightSigned == 0 || (leftSigned == MinSigned(info.Bits) && rightSigned == -1))
                                         return false;
                                     signedResult = leftSigned / rightSigned;
                                     break;
-                                case SyntaxKind.PercentToken:
+                                case GimpleTreeCode.TruncModExpr:
                                     if (rightSigned == 0 || (leftSigned == MinSigned(info.Bits) && rightSigned == -1))
                                         return false;
                                     signedResult = leftSigned % rightSigned;
                                     break;
-                                case SyntaxKind.AmpersandToken:
+                                case GimpleTreeCode.BitAndExpr:
                                     result = CreateIntegerConstant(left & right, resultType, syntax);
                                     return true;
-                                case SyntaxKind.PipeToken:
+                                case GimpleTreeCode.BitIorExpr:
                                     result = CreateIntegerConstant(left | right, resultType, syntax);
                                     return true;
-                                case SyntaxKind.HatToken:
+                                case GimpleTreeCode.BitXorExpr:
                                     result = CreateIntegerConstant(left ^ right, resultType, syntax);
                                     return true;
                                 default:
@@ -1624,34 +1634,35 @@ namespace Cnidaria.C
 
                 var mask = Mask(info.Bits);
                 ulong unsignedResult;
-                switch (kind)
+                switch (code)
                 {
-                    case SyntaxKind.PlusToken:
+                    case GimpleTreeCode.PlusExpr:
                         unsignedResult = (left + right) & mask;
                         break;
-                    case SyntaxKind.MinusToken:
+                    case GimpleTreeCode.MinusExpr:
                         unsignedResult = (left - right) & mask;
                         break;
-                    case SyntaxKind.StarToken:
+                    case GimpleTreeCode.MultExpr:
                         unsignedResult = (left * right) & mask;
                         break;
-                    case SyntaxKind.SlashToken:
+                    case GimpleTreeCode.TruncDivExpr:
+                    case GimpleTreeCode.ExactDivExpr:
                         if (right == 0)
                             return false;
                         unsignedResult = left / right;
                         break;
-                    case SyntaxKind.PercentToken:
+                    case GimpleTreeCode.TruncModExpr:
                         if (right == 0)
                             return false;
                         unsignedResult = left % right;
                         break;
-                    case SyntaxKind.AmpersandToken:
+                    case GimpleTreeCode.BitAndExpr:
                         unsignedResult = left & right;
                         break;
-                    case SyntaxKind.PipeToken:
+                    case GimpleTreeCode.BitIorExpr:
                         unsignedResult = left | right;
                         break;
-                    case SyntaxKind.HatToken:
+                    case GimpleTreeCode.BitXorExpr:
                         unsignedResult = left ^ right;
                         break;
                     default:
@@ -1662,40 +1673,40 @@ namespace Cnidaria.C
                 return true;
             }
 
-            private bool TryCompareIntegers(ulong left, ulong right, IntegerInfo info, SyntaxKind kind, out bool result)
+            private bool TryCompareIntegers(ulong left, ulong right, IntegerInfo info, GimpleTreeCode code, out bool result)
             {
+                var supported = code is GimpleTreeCode.EqExpr or GimpleTreeCode.NeExpr or
+                    GimpleTreeCode.LtExpr or GimpleTreeCode.LeExpr or
+                    GimpleTreeCode.GtExpr or GimpleTreeCode.GeExpr;
+
                 if (info.IsSigned)
                 {
                     var leftSigned = ToSigned(left, info.Bits);
                     var rightSigned = ToSigned(right, info.Bits);
-                    result = kind switch
+                    result = code switch
                     {
-                        SyntaxKind.EqualsEqualsToken => leftSigned == rightSigned,
-                        SyntaxKind.BangEqualsToken => leftSigned != rightSigned,
-                        SyntaxKind.LessThanToken => leftSigned < rightSigned,
-                        SyntaxKind.LessThanEqualsToken => leftSigned <= rightSigned,
-                        SyntaxKind.GreaterThanToken => leftSigned > rightSigned,
-                        SyntaxKind.GreaterThanEqualsToken => leftSigned >= rightSigned,
+                        GimpleTreeCode.EqExpr => leftSigned == rightSigned,
+                        GimpleTreeCode.NeExpr => leftSigned != rightSigned,
+                        GimpleTreeCode.LtExpr => leftSigned < rightSigned,
+                        GimpleTreeCode.LeExpr => leftSigned <= rightSigned,
+                        GimpleTreeCode.GtExpr => leftSigned > rightSigned,
+                        GimpleTreeCode.GeExpr => leftSigned >= rightSigned,
                         _ => false,
                     };
-                    return kind is SyntaxKind.EqualsEqualsToken or SyntaxKind.BangEqualsToken or
-                        SyntaxKind.LessThanToken or SyntaxKind.LessThanEqualsToken or
-                        SyntaxKind.GreaterThanToken or SyntaxKind.GreaterThanEqualsToken;
+                    return supported;
                 }
 
-                result = kind switch
+                result = code switch
                 {
-                    SyntaxKind.EqualsEqualsToken => left == right,
-                    SyntaxKind.BangEqualsToken => left != right,
-                    SyntaxKind.LessThanToken => left < right,
-                    SyntaxKind.LessThanEqualsToken => left <= right,
-                    SyntaxKind.GreaterThanToken => left > right,
-                    SyntaxKind.GreaterThanEqualsToken => left >= right,
+                    GimpleTreeCode.EqExpr => left == right,
+                    GimpleTreeCode.NeExpr => left != right,
+                    GimpleTreeCode.LtExpr => left < right,
+                    GimpleTreeCode.LeExpr => left <= right,
+                    GimpleTreeCode.GtExpr => left > right,
+                    GimpleTreeCode.GeExpr => left >= right,
                     _ => false,
                 };
-                return kind is SyntaxKind.EqualsEqualsToken or SyntaxKind.BangEqualsToken or
-                    SyntaxKind.LessThanToken or SyntaxKind.LessThanEqualsToken or
-                    SyntaxKind.GreaterThanToken or SyntaxKind.GreaterThanEqualsToken;
+                return supported;
             }
 
             private bool TryNegateInteger(ulong value, IntegerInfo info, QualifiedType resultType, SyntaxNode? syntax, out GimpleConstantValue result)
@@ -1876,7 +1887,7 @@ namespace Cnidaria.C
             private bool IsScalarZeroFoldable(QualifiedType type)
                 => TryGetIntegerInfo(type, out _);
 
-            private bool TryGetConstant(SsaExpression expression, out GimpleConstantValue constant)
+            private bool TryGetConstant(GimpleOperandInfo expression, out GimpleConstantValue constant)
             {
                 if (expression.Name is null && expression.Children.Length == 0 && expression.Original is GimpleConstantValue value)
                 {
@@ -1904,10 +1915,10 @@ namespace Cnidaria.C
                 return false;
             }
 
-            private bool IsZero(SsaExpression expression)
+            private bool IsZero(GimpleOperandInfo expression)
                 => TryGetConstant(expression, out var constant) && TryGetIntegerConstant(constant, out var value, out _) && value == 0;
 
-            private bool IsOne(SsaExpression expression)
+            private bool IsOne(GimpleOperandInfo expression)
                 => TryGetConstant(expression, out var constant) && TryGetIntegerConstant(constant, out var value, out _) && value == 1;
 
             private bool TryGetBranchTruth(GimpleConstantValue constant, out bool truth)

@@ -1108,6 +1108,10 @@ namespace Cnidaria.Cs
                     {
                         body = PrependTypeInitializerStatements(compilation, tree, model, body);
                     }
+                    else if (RunsInstanceFieldInitializers(body.Method, owner))
+                    {
+                        body = PrependInstanceInitializerStatements(compilation, tree, model, body);
+                    }
                     EmitBody(body);
                 }
                 foreach (var iteratorInfo in compilation.GetIteratorStateMachinesForTree(tree))
@@ -1120,8 +1124,10 @@ namespace Cnidaria.Cs
                     int ctorTok = tokenProvider.GetMethodToken(ctor);
                     if (functions.ContainsKey(ctorTok))
                         continue;
-                    var ret = new BoundReturnStatement(tree.Root, expression: null);
-                    var block = new BoundBlockStatement(tree.Root, ImmutableArray.Create<BoundStatement>(ret));
+                    var stmts = ImmutableArray.CreateBuilder<BoundStatement>();
+                    stmts.AddRange(BuildInstanceInitializerStatements(compilation, tree, model, ctor));
+                    stmts.Add(new BoundReturnStatement(tree.Root, expression: null));
+                    var block = new BoundBlockStatement(tree.Root, stmts.ToImmutable());
                     var body = new BoundMethodBody(tree.Root, ctor, block);
                     EmitBody(body);
                 }
@@ -1164,8 +1170,19 @@ namespace Cnidaria.Cs
             SyntaxTree tree,
             SemanticModel model,
             BoundMethodBody body)
+            => PrependInitializerStatements(body, BuildTypeInitializerStatements(compilation, tree, model, body.Method));
+
+        private static BoundMethodBody PrependInstanceInitializerStatements(
+            Compilation compilation,
+            SyntaxTree tree,
+            SemanticModel model,
+            BoundMethodBody body)
+            => PrependInitializerStatements(body, BuildInstanceInitializerStatements(compilation, tree, model, body.Method));
+
+        private static BoundMethodBody PrependInitializerStatements(
+            BoundMethodBody body,
+            ImmutableArray<BoundStatement> initializers)
         {
-            var initializers = BuildTypeInitializerStatements(compilation, tree, model, body.Method);
             if (initializers.IsDefaultOrEmpty)
                 return body;
 
@@ -1180,11 +1197,38 @@ namespace Cnidaria.Cs
             return new BoundMethodBody(body.Syntax, body.Method, new BoundBlockStatement(body.Body.Syntax, stmts.ToImmutable()));
         }
 
+        // Instance field initializers run ahead of the base constructor call in every constructor
+        // that does not chain to this(...), which runs them instead.
+        private static bool RunsInstanceFieldInitializers(MethodSymbol method, SyntaxNode ownerSyntax)
+        {
+            if (method.IsStatic || !method.IsConstructor)
+                return false;
+
+            return ownerSyntax is not ConstructorDeclarationSyntax ctorSyntax ||
+                   ctorSyntax.Initializer is null ||
+                   ctorSyntax.Initializer.ThisOrBaseKeyword.Kind != SyntaxKind.ThisKeyword;
+        }
+
         private static ImmutableArray<BoundStatement> BuildTypeInitializerStatements(
             Compilation compilation,
             SyntaxTree tree,
             SemanticModel model,
             MethodSymbol cctor)
+            => BuildFieldInitializerStatements(compilation, tree, model, cctor, staticFields: true);
+
+        private static ImmutableArray<BoundStatement> BuildInstanceInitializerStatements(
+            Compilation compilation,
+            SyntaxTree tree,
+            SemanticModel model,
+            MethodSymbol ctor)
+            => BuildFieldInitializerStatements(compilation, tree, model, ctor, staticFields: false);
+
+        private static ImmutableArray<BoundStatement> BuildFieldInitializerStatements(
+            Compilation compilation,
+            SyntaxTree tree,
+            SemanticModel model,
+            MethodSymbol initializerOwner,
+            bool staticFields)
         {
             var bag = new DiagnosticBag();
 
@@ -1193,19 +1237,20 @@ namespace Cnidaria.Cs
 
             var importScopeMap = ImportsBuilder.BuildImportScopeMap(compilation, tree, recorder, bag);
             var typeBinder = new TypeBinder(parent: null, flags: BinderFlags.None, compilation: compilation, importScopeMap: importScopeMap);
-            var exprBinder = new LocalScopeBinder(parent: typeBinder, flags: BinderFlags.InMethod, containing: cctor);
+            var binderFlags = staticFields ? BinderFlags.InMethod : BinderFlags.InMethod | BinderFlags.InConstructor;
+            var exprBinder = new LocalScopeBinder(parent: typeBinder, flags: binderFlags, containing: initializerOwner);
 
-            var ctx = new BindingContext(compilation, model, cctor, recorder);
+            var ctx = new BindingContext(compilation, model, initializerOwner, recorder);
             var stmts = ImmutableArray.CreateBuilder<BoundStatement>();
 
-            var ownerType = (NamedTypeSymbol)cctor.ContainingSymbol!;
+            var ownerType = (NamedTypeSymbol)initializerOwner.ContainingSymbol!;
             var members = ownerType.GetMembers();
 
             for (int i = 0; i < members.Length; i++)
             {
                 if (members[i] is not SourceFieldSymbol fs)
                     continue;
-                if (!fs.IsStatic || fs.IsConst)
+                if (fs.IsStatic != staticFields || fs.IsConst)
                     continue;
 
                 var declRefs = fs.DeclaringSyntaxReferences;
@@ -1228,7 +1273,7 @@ namespace Cnidaria.Cs
 
                 var lhs = new BoundMemberAccessExpression(
                     syntax: rhsSyntax,
-                    receiverOpt: null,
+                    receiverOpt: staticFields ? null : new BoundThisExpression(rhsSyntax, ownerType, isLValue: true),
                     member: fs,
                     type: fs.Type,
                     isLValue: true);

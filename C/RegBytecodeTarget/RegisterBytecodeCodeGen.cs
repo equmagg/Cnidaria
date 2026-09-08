@@ -2062,10 +2062,12 @@ namespace Cnidaria.C
                 if (instruction.ParallelCopies.Length == 0)
                     return;
 
+                // A copy whose operands share storage is dropped here so the retained set matches
+                // the one the allocator sized the parallel-copy temporary area from
                 var physicalCopiesBuilder = ImmutableArray.CreateBuilder<LirParallelCopy>(instruction.ParallelCopies.Length);
                 foreach (var copy in instruction.ParallelCopies)
                 {
-                    if (RequiresPhysicalParallelCopy(copy))
+                    if (RequiresPhysicalParallelCopy(copy) && !ReferencesSamePhysicalStorage(copy.Source, copy.Destination))
                         physicalCopiesBuilder.Add(copy);
                 }
 

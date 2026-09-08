@@ -89,6 +89,7 @@ namespace Cnidaria.C
             string entryFunctionName = "main",
             InliningOptions? inlining = null,
             TrimmingOptions? trimming = null,
+            GimplePipelineOptions? gimple = null,
             IEnumerable<SourceFile>? libraryTranslationUnits = null)
         {
             var requestedTrimming = trimming ?? TrimmingOptions.Default;
@@ -99,7 +100,8 @@ namespace Cnidaria.C
             CompilationOptions = new CompilationOptions(
                 target ?? throw new ArgumentNullException(nameof(target)),
                 inlining,
-                effectiveTrimming);
+                effectiveTrimming,
+                gimple);
             IncludeFiles = includeFiles?.ToImmutableArray() ?? ImmutableArray<IncludeFile>.Empty;
             IncludeSearchPaths = includeSearchPaths?.ToImmutableArray() ?? ImmutableArray<string>.Empty;
             IncludeResolver = includeResolver;
@@ -462,7 +464,8 @@ namespace Cnidaria.C
 
                 try
                 {
-                    var lir = LirModule.Lower(semanticModel);
+                    var gimple = GimplePipeline.Run(semanticModel);
+                    var lir = LirModule.Lower(gimple);
                     foreach (var problem in lir.Problems)
                     {
                         diagnostics.Add(new LinkerDiagnostic(
@@ -801,11 +804,6 @@ namespace Cnidaria.C
                     break;
                 case GimpleMemberAccessExpression member:
                     AddRegisterBytecodeValueReferences(member.Expression, unit, references);
-                    break;
-                case GimpleCallExpression call:
-                    AddRegisterBytecodeValueReferences(call.Callee, unit, references);
-                    foreach (var argument in call.Arguments)
-                        AddRegisterBytecodeValueReferences(argument, unit, references);
                     break;
             }
         }

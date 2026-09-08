@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 
 namespace Cnidaria.Cs
 {
@@ -7,6 +7,8 @@ namespace Cnidaria.Cs
         None,
         InterlockedCompareExchange,
         InterlockedExchangeAdd,
+        InterlockedExchange,
+        MemoryBarrier,
     }
 
     [Flags]
@@ -43,6 +45,22 @@ namespace Cnidaria.Cs
         }
     }
 
+    internal readonly struct InterlockedExchangeIntrinsic
+    {
+        public RuntimeType ValueType { get; }
+        public int Size { get; }
+        public bool IsReference { get; }
+        public bool IsSigned { get; }
+
+        public InterlockedExchangeIntrinsic(RuntimeType valueType, int size, bool isReference, bool isSigned)
+        {
+            ValueType = valueType;
+            Size = size;
+            IsReference = isReference;
+            IsSigned = isSigned;
+        }
+    }
+
     internal readonly struct InterlockedExchangeAddIntrinsic
     {
         public RuntimeType ValueType { get; }
@@ -61,6 +79,7 @@ namespace Cnidaria.Cs
         public RuntimeIntrinsicFlags Flags { get; }
         public InterlockedCompareExchangeIntrinsic CompareExchange { get; }
         public InterlockedExchangeAddIntrinsic ExchangeAdd { get; }
+        public InterlockedExchangeIntrinsic Exchange { get; }
 
         public bool IsSpecialImport => (Flags & RuntimeIntrinsicFlags.SpecialImport) != 0;
         public bool IsNoInline => (Flags & RuntimeIntrinsicFlags.NoInline) != 0;
@@ -71,12 +90,14 @@ namespace Cnidaria.Cs
             RuntimeIntrinsicId id,
             RuntimeIntrinsicFlags flags,
             InterlockedCompareExchangeIntrinsic compareExchange = default,
-            InterlockedExchangeAddIntrinsic exchangeAdd = default)
+            InterlockedExchangeAddIntrinsic exchangeAdd = default,
+            InterlockedExchangeIntrinsic exchange = default)
         {
             Id = id;
             Flags = flags;
             CompareExchange = compareExchange;
             ExchangeAdd = exchangeAdd;
+            Exchange = exchange;
         }
     }
 
@@ -94,6 +115,18 @@ namespace Cnidaria.Cs
             RuntimeIntrinsicFlags.MemoryWrite |
             RuntimeIntrinsicFlags.GlobalRef |
             RuntimeIntrinsicFlags.Indirect |
+            RuntimeIntrinsicFlags.Ordered;
+
+        // A barrier has no operands and no result, so it needs neither the call ABI nor a null check
+        private const RuntimeIntrinsicFlags MemoryBarrierFlags =
+            RuntimeIntrinsicFlags.SpecialImport |
+            RuntimeIntrinsicFlags.NoInline |
+            RuntimeIntrinsicFlags.NoGcSafePoint |
+            RuntimeIntrinsicFlags.AtomicMemory |
+            RuntimeIntrinsicFlags.SideEffect |
+            RuntimeIntrinsicFlags.MemoryRead |
+            RuntimeIntrinsicFlags.MemoryWrite |
+            RuntimeIntrinsicFlags.GlobalRef |
             RuntimeIntrinsicFlags.Ordered;
 
         public static RuntimeIntrinsicId GetIntrinsicId(RuntimeMethod? method)
@@ -121,6 +154,28 @@ namespace Cnidaria.Cs
                 return RuntimeIntrinsicId.InterlockedExchangeAdd;
             }
 
+            if (!method.HasThis &&
+                method.IsStatic &&
+                method.ParameterTypes.Length == 2 &&
+                StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Threading") &&
+                StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Interlocked") &&
+                StringComparer.Ordinal.Equals(method.Name, "Exchange"))
+            {
+                return RuntimeIntrinsicId.InterlockedExchange;
+            }
+
+            if (!method.HasThis &&
+                method.IsStatic &&
+                method.ParameterTypes.Length == 0 &&
+                method.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Void &&
+                StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Threading") &&
+                StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Interlocked") &&
+                (StringComparer.Ordinal.Equals(method.Name, "MemoryBarrier") ||
+                 StringComparer.Ordinal.Equals(method.Name, "ReadMemoryBarrier")))
+            {
+                return RuntimeIntrinsicId.MemoryBarrier;
+            }
+
             return RuntimeIntrinsicId.None;
         }
 
@@ -129,6 +184,8 @@ namespace Cnidaria.Cs
             {
                 RuntimeIntrinsicId.InterlockedCompareExchange => AtomicReadModifyWriteFlags,
                 RuntimeIntrinsicId.InterlockedExchangeAdd => AtomicReadModifyWriteFlags,
+                RuntimeIntrinsicId.InterlockedExchange => AtomicReadModifyWriteFlags,
+                RuntimeIntrinsicId.MemoryBarrier => MemoryBarrierFlags,
                 _ => RuntimeIntrinsicFlags.None,
             };
 
@@ -163,6 +220,16 @@ namespace Cnidaria.Cs
                         return true;
                     }
                     break;
+                case RuntimeIntrinsicId.InterlockedExchange:
+                    if (TryGetInterlockedExchange(method, target.PointerSize, out var exchange))
+                    {
+                        intrinsic = new RuntimeIntrinsicInfo(id, AtomicReadModifyWriteFlags, exchange: exchange);
+                        return true;
+                    }
+                    break;
+                case RuntimeIntrinsicId.MemoryBarrier:
+                    intrinsic = new RuntimeIntrinsicInfo(id, MemoryBarrierFlags);
+                    return true;
             }
 
             intrinsic = default;
@@ -180,6 +247,20 @@ namespace Cnidaria.Cs
                     Cnidaria.TargetArchitectureKind.RiscV32 or
                     Cnidaria.TargetArchitectureKind.RiscV64,
                 RuntimeIntrinsicId.InterlockedExchangeAdd => target.Architecture is
+                    Cnidaria.TargetArchitectureKind.RegisterBytecode or
+                    Cnidaria.TargetArchitectureKind.RegisterBytecode64 or
+                    Cnidaria.TargetArchitectureKind.I386 or
+                    Cnidaria.TargetArchitectureKind.X86_64 or
+                    Cnidaria.TargetArchitectureKind.RiscV32 or
+                    Cnidaria.TargetArchitectureKind.RiscV64,
+                RuntimeIntrinsicId.InterlockedExchange => target.Architecture is
+                    Cnidaria.TargetArchitectureKind.RegisterBytecode or
+                    Cnidaria.TargetArchitectureKind.RegisterBytecode64 or
+                    Cnidaria.TargetArchitectureKind.I386 or
+                    Cnidaria.TargetArchitectureKind.X86_64 or
+                    Cnidaria.TargetArchitectureKind.RiscV32 or
+                    Cnidaria.TargetArchitectureKind.RiscV64,
+                RuntimeIntrinsicId.MemoryBarrier => target.Architecture is
                     Cnidaria.TargetArchitectureKind.RegisterBytecode or
                     Cnidaria.TargetArchitectureKind.RegisterBytecode64 or
                     Cnidaria.TargetArchitectureKind.I386 or
@@ -211,7 +292,28 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            RuntimeType valueType = signatureValueType;
+            if (!TryClassifyAtomicValue(signatureValueType, method, pointerSize, out RuntimeType classifiedType, out int classifiedSize, out bool classifiedReference, out bool classifiedSigned))
+                return false;
+
+            intrinsic = new InterlockedCompareExchangeIntrinsic(classifiedType, classifiedSize, classifiedReference, classifiedSigned);
+            return true;
+        }
+
+        /// <summary>Resolves the storage shape an atomic read-modify-write operates on</summary>
+        private static bool TryClassifyAtomicValue(
+            RuntimeType signatureValueType,
+            RuntimeMethod method,
+            int pointerSize,
+            out RuntimeType valueType,
+            out int size,
+            out bool isReference,
+            out bool isSigned)
+        {
+            size = 0;
+            isReference = false;
+            isSigned = false;
+
+            valueType = signatureValueType;
             if (valueType.Kind == RuntimeTypeKind.TypeParam)
             {
                 if (!valueType.IsMethodGenericParameter ||
@@ -224,7 +326,8 @@ namespace Cnidaria.Cs
 
             if (valueType.IsReferenceType)
             {
-                intrinsic = new InterlockedCompareExchangeIntrinsic(valueType, pointerSize, isReference: true, isSigned: false);
+                size = pointerSize;
+                isReference = true;
                 return true;
             }
 
@@ -233,7 +336,6 @@ namespace Cnidaria.Cs
                 scalarType = scalarType.ElementType;
 
             RuntimePrimitiveKind primitive = scalarType.PrimitiveKind;
-            int size;
             bool signed;
             switch (primitive)
             {
@@ -287,7 +389,35 @@ namespace Cnidaria.Cs
                     break;
             }
 
-            intrinsic = new InterlockedCompareExchangeIntrinsic(valueType, size, isReference: false, isSigned: signed);
+            isSigned = signed;
+            return true;
+        }
+
+        private static bool TryGetInterlockedExchange(
+            RuntimeMethod method,
+            int pointerSize,
+            out InterlockedExchangeIntrinsic intrinsic)
+        {
+            intrinsic = default;
+
+            if (GetIntrinsicId(method) != RuntimeIntrinsicId.InterlockedExchange)
+                return false;
+
+            RuntimeType locationType = method.ParameterTypes[0];
+            if (locationType.Kind != RuntimeTypeKind.ByRef || locationType.ElementType is null)
+                return false;
+
+            RuntimeType signatureValueType = locationType.ElementType;
+            if (!SameType(signatureValueType, method.ParameterTypes[1]) ||
+                !SameType(signatureValueType, method.ReturnType))
+            {
+                return false;
+            }
+
+            if (!TryClassifyAtomicValue(signatureValueType, method, pointerSize, out RuntimeType valueType, out int size, out bool isReference, out bool isSigned))
+                return false;
+
+            intrinsic = new InterlockedExchangeIntrinsic(valueType, size, isReference, isSigned);
             return true;
         }
 

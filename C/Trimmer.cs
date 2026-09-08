@@ -28,11 +28,11 @@ namespace Cnidaria.C
     internal readonly struct TrimResult
     {
         public ControlFlowGraph ControlFlowGraph { get; }
-        public ImmutableArray<SsaFunction> Functions { get; }
+        public ImmutableArray<GimpleFunctionAnnotations> Functions { get; }
 
         public TrimResult(
             ControlFlowGraph controlFlowGraph,
-            ImmutableArray<SsaFunction> functions)
+            ImmutableArray<GimpleFunctionAnnotations> functions)
         {
             ControlFlowGraph = controlFlowGraph;
             Functions = functions;
@@ -43,7 +43,7 @@ namespace Cnidaria.C
     {
         public static TrimResult Trim(
             ControlFlowGraph controlFlowGraph,
-            ImmutableArray<SsaFunction> functions,
+            ImmutableArray<GimpleFunctionAnnotations> functions,
             TrimmingOptions options)
         {
             if (controlFlowGraph is null)
@@ -62,13 +62,13 @@ namespace Cnidaria.C
             private readonly ControlFlowGraph _controlFlowGraph;
             private readonly GimpleTree _tree;
             private readonly FileScopeLinkageMap _fileScopeLinkage;
-            private readonly ImmutableArray<SsaFunction> _ssaFunctions;
+            private readonly ImmutableArray<GimpleFunctionAnnotations> _gimpleFunctions;
             private readonly TrimmingOptions _options;
             private readonly Dictionary<FunctionSymbol, List<GimpleFunctionDefinition>> _functionsBySymbol = new();
             private readonly Dictionary<string, List<GimpleFunctionDefinition>> _functionsByName = new(StringComparer.Ordinal);
             private readonly Dictionary<Symbol, List<GimpleVariableDeclaration>> _globalsBySymbol = new();
             private readonly Dictionary<string, List<GimpleVariableDeclaration>> _globalsByName = new(StringComparer.Ordinal);
-            private readonly Dictionary<GimpleFunctionDefinition, SsaFunction> _ssaByFunction = new();
+            private readonly Dictionary<GimpleFunctionDefinition, GimpleFunctionAnnotations> _gimpleByFunction = new();
             private readonly HashSet<GimpleFunctionDefinition> _liveFunctions = new();
             private readonly HashSet<GimpleVariableDeclaration> _liveGlobals = new();
             private readonly Queue<GimpleFunctionDefinition> _functionWorkList = new();
@@ -76,13 +76,13 @@ namespace Cnidaria.C
 
             public Pass(
                 ControlFlowGraph controlFlowGraph,
-                ImmutableArray<SsaFunction> ssaFunctions,
+                ImmutableArray<GimpleFunctionAnnotations> gimpleFunctions,
                 TrimmingOptions options)
             {
                 _controlFlowGraph = controlFlowGraph;
                 _tree = controlFlowGraph.GimpleTree;
                 _fileScopeLinkage = FileScopeLinkageMap.Create(_tree.SemanticModel);
-                _ssaFunctions = ssaFunctions.IsDefault ? ImmutableArray<SsaFunction>.Empty : ssaFunctions;
+                _gimpleFunctions = gimpleFunctions.IsDefault ? ImmutableArray<GimpleFunctionAnnotations>.Empty : gimpleFunctions;
                 _options = options;
             }
 
@@ -96,8 +96,8 @@ namespace Cnidaria.C
 
             private void IndexMembers()
             {
-                foreach (var function in _ssaFunctions)
-                    _ssaByFunction[function.Function] = function;
+                foreach (var function in _gimpleFunctions)
+                    _gimpleByFunction[function.InputFunction] = function;
 
                 foreach (var member in _tree.Members)
                 {
@@ -199,11 +199,11 @@ namespace Cnidaria.C
                 HashSet<Symbol> references,
                 HashSet<string> names)
             {
-                if (_ssaByFunction.TryGetValue(function, out var ssaFunction))
+                if (_gimpleByFunction.TryGetValue(function, out var gimpleFunction))
                 {
-                    foreach (var block in EnumerateReachableBlocks(ssaFunction))
+                    foreach (var block in EnumerateReachableBlocks(gimpleFunction))
                     {
-                        foreach (var instruction in block.Instructions)
+                        foreach (var instruction in block.Statements)
                             SymbolCollector.Collect(instruction.Statement, references, names);
                     }
 
@@ -217,12 +217,12 @@ namespace Cnidaria.C
                 }
             }
 
-            private static IEnumerable<SsaBlock> EnumerateReachableBlocks(SsaFunction function)
+            private static IEnumerable<GimpleBlockAnnotations> EnumerateReachableBlocks(GimpleFunctionAnnotations function)
             {
                 if (function.Blocks.Length == 0)
                     yield break;
 
-                var byControlFlowBlock = new Dictionary<ControlFlowBlock, SsaBlock>();
+                var byControlFlowBlock = new Dictionary<ControlFlowBlock, GimpleBlockAnnotations>();
                 foreach (var block in function.Blocks)
                     byControlFlowBlock[block.ControlFlowBlock] = block;
 
@@ -230,7 +230,7 @@ namespace Cnidaria.C
                     entry = function.Blocks[0];
 
                 var visited = new HashSet<ControlFlowBlock>();
-                var stack = new Stack<SsaBlock>();
+                var stack = new Stack<GimpleBlockAnnotations>();
                 visited.Add(entry.ControlFlowBlock);
                 stack.Push(entry);
 
@@ -252,9 +252,9 @@ namespace Cnidaria.C
 
             private static IEnumerable<ControlFlowBlock> EnumerateOptimizedSuccessors(
                 ControlFlowFunction function,
-                SsaBlock block)
+                GimpleBlockAnnotations block)
             {
-                var terminator = block.Instructions.Length == 0 ? null : block.Instructions[^1].Statement;
+                var terminator = block.Statements.Length == 0 ? null : block.Statements[^1].Statement;
                 switch (terminator)
                 {
                     case GimpleGotoStatement gotoStatement:
@@ -262,7 +262,7 @@ namespace Cnidaria.C
                             yield return gotoTarget;
                         yield break;
 
-                    case GimpleConditionalGotoStatement conditional:
+                    case GimpleCondStatement conditional:
                         if (function.TryGetBlock(conditional.WhenTrue, out var trueTarget) && trueTarget is not null)
                             yield return trueTarget;
                         if (function.TryGetBlock(conditional.WhenFalse, out var falseTarget) && falseTarget is not null && !ReferenceEquals(falseTarget, trueTarget))
@@ -400,10 +400,10 @@ namespace Cnidaria.C
                     }
                 }
 
-                var functions = ImmutableArray.CreateBuilder<SsaFunction>(_ssaFunctions.Length);
-                foreach (var function in _ssaFunctions)
+                var functions = ImmutableArray.CreateBuilder<GimpleFunctionAnnotations>(_gimpleFunctions.Length);
+                foreach (var function in _gimpleFunctions)
                 {
-                    if (_liveFunctions.Contains(function.Function))
+                    if (_liveFunctions.Contains(function.InputFunction))
                         functions.Add(function);
                 }
 
@@ -457,21 +457,23 @@ namespace Cnidaria.C
                     Collect(declaration.Declaration.Initializer, symbols, names);
                     break;
 
-                case GimpleAssignmentStatement assignment:
-                    Collect(assignment.Target, symbols, names);
-                    Collect(assignment.Value, symbols, names);
+                case GimpleAssignStatement assign:
+                    Collect(assign.Lhs, symbols, names);
+                    foreach (var operand in assign.Operands)
+                        Collect(operand, symbols, names);
                     break;
 
-                case GimpleZeroInitializeStatement zeroInitialize:
-                    Collect(zeroInitialize.Target, symbols, names);
+                case GimpleCallStatement call:
+                    if (call.Lhs is not null)
+                        Collect(call.Lhs, symbols, names);
+                    Collect(call.Function, symbols, names);
+                    foreach (var argument in call.Arguments)
+                        Collect(argument, symbols, names);
                     break;
 
-                case GimpleExpressionStatement expressionStatement:
-                    Collect(expressionStatement.Expression, symbols, names);
-                    break;
-
-                case GimpleConditionalGotoStatement conditional:
-                    Collect(conditional.Condition, symbols, names);
+                case GimpleCondStatement conditional:
+                    Collect(conditional.Lhs, symbols, names);
+                    Collect(conditional.Rhs, symbols, names);
                     break;
 
                 case GimpleSwitchStatement switchStatement:
@@ -530,6 +532,10 @@ namespace Cnidaria.C
         {
             switch (value)
             {
+                case GimpleName { Variable.Symbol: not null } name:
+                    symbols.Add(name.Variable.Symbol);
+                    break;
+
                 case GimpleSymbolValue symbolValue:
                     symbols.Add(symbolValue.Symbol);
                     break;
@@ -567,12 +573,6 @@ namespace Cnidaria.C
 
                 case GimpleMemberAccessExpression memberAccess:
                     Collect(memberAccess.Expression, symbols, names);
-                    break;
-
-                case GimpleCallExpression call:
-                    Collect(call.Callee, symbols, names);
-                    foreach (var argument in call.Arguments)
-                        Collect(argument, symbols, names);
                     break;
             }
         }

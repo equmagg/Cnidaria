@@ -16,25 +16,19 @@ namespace Cnidaria.C
         public bool PromoteAddressTakenVariables { get; }
         public bool PromoteAggregateVariables { get; }
         public bool PromoteVolatileVariables { get; }
-        public ValueNumberingOptions ValueNumbering { get; }
-        public SsaOptimizationOptions Optimization { get; }
 
         public SsaOptions(
             bool trackMemory = true,
             bool promoteTemporaries = true,
             bool promoteAddressTakenVariables = false,
             bool promoteAggregateVariables = false,
-            bool promoteVolatileVariables = false,
-            ValueNumberingOptions? valueNumbering = null,
-            SsaOptimizationOptions? optimization = null)
+            bool promoteVolatileVariables = false)
         {
             TrackMemory = trackMemory;
             PromoteTemporaries = promoteTemporaries;
             PromoteAddressTakenVariables = promoteAddressTakenVariables;
             PromoteAggregateVariables = promoteAggregateVariables;
             PromoteVolatileVariables = promoteVolatileVariables;
-            ValueNumbering = valueNumbering ?? ValueNumberingOptions.Default;
-            Optimization = optimization ?? SsaOptimizationOptions.Default;
         }
     }
 
@@ -46,6 +40,7 @@ namespace Cnidaria.C
         public bool EnableCopyPropagation { get; }
         public bool EnableBranchFolding { get; }
         public bool EnableDeadCodeElimination { get; }
+        public bool EnableCommonSubexpressionElimination { get; }
         public int MaxIterations { get; }
 
         public SsaOptimizationOptions(
@@ -53,24 +48,26 @@ namespace Cnidaria.C
             bool enableCopyPropagation = true,
             bool enableBranchFolding = true,
             bool enableDeadCodeElimination = true,
-            int maxIterations = 3)
+            int maxIterations = 3,
+            bool enableCommonSubexpressionElimination = true)
         {
             EnableConstantFolding = enableConstantFolding;
             EnableCopyPropagation = enableCopyPropagation;
             EnableBranchFolding = enableBranchFolding;
             EnableDeadCodeElimination = enableDeadCodeElimination;
+            EnableCommonSubexpressionElimination = enableCommonSubexpressionElimination;
             MaxIterations = maxIterations < 1 ? 1 : maxIterations;
         }
     }
 
-    public enum SsaVariableKind : byte
+    public enum GimpleVariableKind : byte
     {
         Symbol,
         Temporary,
         Memory,
     }
 
-    public enum SsaDefinitionKind : byte
+    public enum GimpleDefinitionKind : byte
     {
         Undefined,
         Entry,
@@ -79,21 +76,22 @@ namespace Cnidaria.C
         MemoryStatement,
     }
 
-    public enum SsaUseKind : byte
+    public enum GimpleUseKind : byte
     {
         Value,
         Address,
         Memory,
+        Phi,
     }
 
-    public enum SsaExpressionRole : byte
+    public enum GimpleOperandRole : byte
     {
         Value,
         Address,
     }
 
     [Flags]
-    public enum SsaInstructionFlags : byte
+    public enum GimpleStatementFlags : byte
     {
         None = 0,
         ReadsMemory = 1,
@@ -101,117 +99,151 @@ namespace Cnidaria.C
         ContainsCall = 4,
     }
 
-    public enum SsaProblemKind : byte
+    public enum GimpleProblemKind : byte
     {
         ControlFlowProblem,
         MissingPhiInput,
+        InvalidStatement,
+        InvalidOperand,
+        InvalidPhi,
     }
 
-    public sealed class SsaGraph
+    public sealed class GimplePipelineResult
     {
         public ControlFlowGraph ControlFlowGraph { get; }
         public SemanticModel SemanticModel => ControlFlowGraph.SemanticModel;
-        public GimpleTree GimpleTree => ControlFlowGraph.GimpleTree;
-        public ImmutableArray<SsaFunction> Functions { get; }
-        public ImmutableArray<SsaProblem> Problems { get; }
+        public GimpleTree InputTree => ControlFlowGraph.GimpleTree;
+        public ImmutableArray<GimpleFunctionAnnotations> Functions { get; }
+        public ImmutableArray<GimpleProblem> Problems { get; }
 
-        private SsaGraph(ControlFlowGraph controlFlowGraph, ImmutableArray<SsaFunction> functions)
+        private GimplePipelineResult(
+            ControlFlowGraph controlFlowGraph,
+            ImmutableArray<GimpleFunctionAnnotations> functions,
+            ImmutableArray<GimpleProblem> verificationProblems = default)
         {
             ControlFlowGraph = controlFlowGraph ?? throw new ArgumentNullException(nameof(controlFlowGraph));
-            Functions = functions.IsDefault ? ImmutableArray<SsaFunction>.Empty : functions;
+            Functions = functions.IsDefault ? ImmutableArray<GimpleFunctionAnnotations>.Empty : functions;
 
-            var problems = ImmutableArray.CreateBuilder<SsaProblem>();
+            var problems = ImmutableArray.CreateBuilder<GimpleProblem>();
             foreach (var problem in controlFlowGraph.Problems)
-                problems.Add(SsaProblem.FromControlFlowProblem(problem));
+                problems.Add(GimpleProblem.FromControlFlowProblem(problem));
             foreach (var function in Functions)
                 problems.AddRange(function.Problems);
+            if (!verificationProblems.IsDefault)
+                problems.AddRange(verificationProblems);
             Problems = problems.ToImmutable();
         }
 
-        public static SsaGraph Build(SemanticModel semanticModel, SsaOptions? options = null)
-        {
-            if (semanticModel is null)
-                throw new ArgumentNullException(nameof(semanticModel));
-
-            return Build(ControlFlowGraph.Build(semanticModel), options);
-        }
-
-        public static SsaGraph Build(GimpleTree gimpleTree, SsaOptions? options = null)
-        {
-            if (gimpleTree is null)
-                throw new ArgumentNullException(nameof(gimpleTree));
-
-            return Build(ControlFlowGraph.Build(gimpleTree), options);
-        }
-
-        public static SsaGraph Build(ControlFlowGraph controlFlowGraph, SsaOptions? options = null)
+        public static GimplePipelineResult Build(
+            ControlFlowGraph controlFlowGraph,
+            SsaOptions? options = null,
+            ValueNumberingOptions? valueNumberingOptions = null)
         {
             if (controlFlowGraph is null)
                 throw new ArgumentNullException(nameof(controlFlowGraph));
 
             options ??= SsaOptions.Default;
-            var functions = ImmutableArray.CreateBuilder<SsaFunction>();
-            var target = controlFlowGraph.SemanticModel.Compilation.Options.Target;
+            valueNumberingOptions ??= ValueNumberingOptions.Default;
+            var functions = ImmutableArray.CreateBuilder<GimpleFunctionAnnotations>(controlFlowGraph.Functions.Length);
             foreach (var function in controlFlowGraph.Functions)
+                functions.Add(GimpleAnnotationBuilder.Build(function, options, valueNumberingOptions, controlFlowGraph.SemanticModel.Compilation.Options.Target));
+
+            return new GimplePipelineResult(controlFlowGraph, functions.ToImmutable());
+        }
+
+        public GimplePipelineResult Optimize(
+            SsaOptimizationOptions? optimizationOptions = null,
+            ValueNumberingOptions? valueNumberingOptions = null)
+        {
+            optimizationOptions ??= SsaOptimizationOptions.Default;
+            valueNumberingOptions ??= ValueNumberingOptions.Default;
+
+            var target = SemanticModel.Compilation.Options.Target;
+            var functions = ImmutableArray.CreateBuilder<GimpleFunctionAnnotations>(Functions.Length);
+            foreach (var function in Functions)
+                functions.Add(SsaOptimizer.Optimize(function, target, optimizationOptions, valueNumberingOptions));
+
+            return new GimplePipelineResult(ControlFlowGraph, functions.ToImmutable());
+        }
+
+        public GimplePipelineResult Trim(TrimmingOptions? options = null)
+        {
+            options ??= SemanticModel.Compilation.Options.Trimming;
+            var trimResult = Trimmer.Trim(ControlFlowGraph, Functions, options);
+            if (ReferenceEquals(trimResult.ControlFlowGraph, ControlFlowGraph) &&
+                trimResult.Functions.Equals(Functions))
             {
-                var ssaFunction = SsaFunctionBuilder.Build(function, options);
-                ssaFunction = SsaOptimizer.Optimize(ssaFunction, target, options.Optimization, options.ValueNumbering);
-                functions.Add(ssaFunction);
+                return this;
             }
 
-            var functionArray = functions.ToImmutable();
-            var trimResult = Trimmer.Trim(
-                controlFlowGraph,
-                functionArray,
-                controlFlowGraph.SemanticModel.Compilation.Options.Trimming);
-            return new SsaGraph(trimResult.ControlFlowGraph, trimResult.Functions);
+            return new GimplePipelineResult(trimResult.ControlFlowGraph, trimResult.Functions);
+        }
+
+        /// <summary>Checks the GIMPLE invariants and reports every violation as a problem</summary>
+        public GimplePipelineResult Verify(GimpleVerificationLevel level = GimpleVerificationLevel.Full)
+        {
+            if (level == GimpleVerificationLevel.None)
+                return this;
+
+            var problems = ImmutableArray.CreateBuilder<GimpleProblem>();
+            foreach (var function in Functions)
+                problems.AddRange(GimpleVerifier.Verify(function, level));
+
+            return problems.Count == 0
+                ? this
+                : new GimplePipelineResult(ControlFlowGraph, Functions, problems.ToImmutable());
         }
     }
 
-    public sealed class SsaFunction
+    public sealed class GimpleFunctionAnnotations
     {
-        private readonly Dictionary<ControlFlowBlock, SsaBlock> _blocksByControlFlowBlock;
-        private readonly Dictionary<SsaVariable, SsaName> _undefinedNames;
-        private readonly Dictionary<SsaName, SsaDefinition> _definitionsByName;
+        private readonly Dictionary<ControlFlowBlock, GimpleBlockAnnotations> _blocksByControlFlowBlock;
+        private readonly Dictionary<GimpleVariable, GimpleName> _undefinedNames;
+        private readonly Dictionary<GimpleName, GimpleDefinition> _definitionsByName;
+        private readonly Dictionary<GimpleName, ImmutableArray<GimpleUse>> _immediateUsesByName;
 
         public ControlFlowFunction ControlFlowFunction { get; }
-        public GimpleFunctionDefinition Function => ControlFlowFunction.Function;
+        public GimpleFunctionDefinition InputFunction => ControlFlowFunction.Function;
         public FunctionSymbol? Symbol => ControlFlowFunction.Symbol;
-        public SsaVariable? MemoryVariable { get; }
-        public ImmutableArray<SsaVariable> Variables { get; }
-        public ImmutableArray<SsaBlock> Blocks { get; }
-        public ImmutableArray<SsaDefinition> Definitions { get; }
-        public ImmutableArray<SsaUse> Uses { get; }
-        public ImmutableArray<SsaProblem> Problems { get; }
-        public SsaValueNumbering ValueNumbering { get; }
+        public GimpleVariable? MemoryVariable { get; }
+        public ImmutableArray<GimpleVariable> Variables { get; }
+        public ImmutableArray<GimpleBlockAnnotations> Blocks { get; }
+        public ImmutableArray<GimpleDefinition> Definitions { get; }
+        public ImmutableArray<GimpleUse> Uses { get; }
+        public ImmutableArray<GimpleProblem> Problems { get; }
+        public GimpleValueNumbering ValueNumbering { get; }
+        internal TargetInfo Target { get; }
 
-        internal SsaFunction(
+        internal GimpleFunctionAnnotations(
             ControlFlowFunction controlFlowFunction,
-            SsaVariable? memoryVariable,
-            ImmutableArray<SsaVariable> variables,
-            ImmutableArray<SsaBlock> blocks,
-            ImmutableArray<SsaDefinition> definitions,
-            ImmutableArray<SsaUse> uses,
-            ImmutableArray<SsaProblem> problems,
-            Dictionary<SsaVariable, SsaName> undefinedNames,
-            ValueNumberingOptions valueNumberingOptions)
+            GimpleVariable? memoryVariable,
+            ImmutableArray<GimpleVariable> variables,
+            ImmutableArray<GimpleBlockAnnotations> blocks,
+            ImmutableArray<GimpleDefinition> definitions,
+            ImmutableArray<GimpleUse> uses,
+            ImmutableArray<GimpleProblem> problems,
+            Dictionary<GimpleVariable, GimpleName> undefinedNames,
+            ValueNumberingOptions valueNumberingOptions,
+            TargetInfo target)
         {
             ControlFlowFunction = controlFlowFunction ?? throw new ArgumentNullException(nameof(controlFlowFunction));
+            Target = target;
             MemoryVariable = memoryVariable;
-            Variables = variables.IsDefault ? ImmutableArray<SsaVariable>.Empty : variables;
-            Blocks = blocks.IsDefault ? ImmutableArray<SsaBlock>.Empty : blocks;
-            Definitions = definitions.IsDefault ? ImmutableArray<SsaDefinition>.Empty : definitions;
-            Uses = uses.IsDefault ? ImmutableArray<SsaUse>.Empty : uses;
-            Problems = problems.IsDefault ? ImmutableArray<SsaProblem>.Empty : problems;
+            Variables = variables.IsDefault ? ImmutableArray<GimpleVariable>.Empty : variables;
+            Blocks = blocks.IsDefault ? ImmutableArray<GimpleBlockAnnotations>.Empty : blocks;
+            Definitions = definitions.IsDefault ? ImmutableArray<GimpleDefinition>.Empty : definitions;
+            Uses = uses.IsDefault ? ImmutableArray<GimpleUse>.Empty : uses;
+            Problems = problems.IsDefault ? ImmutableArray<GimpleProblem>.Empty : problems;
             _undefinedNames = undefinedNames is null
-                ? new Dictionary<SsaVariable, SsaName>()
-                : new Dictionary<SsaVariable, SsaName>(undefinedNames);
+                ? new Dictionary<GimpleVariable, GimpleName>()
+                : new Dictionary<GimpleVariable, GimpleName>(undefinedNames);
             _blocksByControlFlowBlock = Blocks.ToDictionary(static block => block.ControlFlowBlock);
             _definitionsByName = Definitions.ToDictionary(static definition => definition.Name);
-            ValueNumbering = SsaValueNumbering.Build(this, valueNumberingOptions);
+            _immediateUsesByName = BuildImmediateUses(Uses, Blocks);
+            ValueNumbering = GimpleValueNumbering.Build(this, valueNumberingOptions);
         }
 
-        public bool TryGetBlock(ControlFlowBlock controlFlowBlock, out SsaBlock? block)
+        public bool TryGetBlock(ControlFlowBlock controlFlowBlock, out GimpleBlockAnnotations? block)
         {
             if (controlFlowBlock is null)
                 throw new ArgumentNullException(nameof(controlFlowBlock));
@@ -219,7 +251,7 @@ namespace Cnidaria.C
             return _blocksByControlFlowBlock.TryGetValue(controlFlowBlock, out block);
         }
 
-        public bool TryGetDefinition(SsaName name, out SsaDefinition? definition)
+        public bool TryGetDefinition(GimpleName name, out GimpleDefinition? definition)
         {
             if (name is null)
                 throw new ArgumentNullException(nameof(name));
@@ -227,7 +259,7 @@ namespace Cnidaria.C
             return _definitionsByName.TryGetValue(name, out definition);
         }
 
-        public SsaName GetUndefinedName(SsaVariable variable)
+        public GimpleName GetUndefinedName(GimpleVariable variable)
         {
             if (variable is null)
                 throw new ArgumentNullException(nameof(variable));
@@ -235,22 +267,91 @@ namespace Cnidaria.C
             return _undefinedNames[variable];
         }
 
+        public ImmutableArray<GimpleUse> GetImmediateUses(GimpleName name)
+        {
+            if (name is null)
+                throw new ArgumentNullException(nameof(name));
+
+            return _immediateUsesByName.TryGetValue(name, out var uses)
+                ? uses
+                : ImmutableArray<GimpleUse>.Empty;
+        }
+
+        public bool HasZeroUses(GimpleName name)
+            => GetImmediateUses(name).Length == 0;
+
+        public bool HasSingleUse(GimpleName name)
+            => GetImmediateUses(name).Length == 1;
+
+        public bool TryGetSingleUse(GimpleName name, out GimpleUse? use)
+        {
+            var uses = GetImmediateUses(name);
+            if (uses.Length == 1)
+            {
+                use = uses[0];
+                return true;
+            }
+
+            use = null;
+            return false;
+        }
+
+        private static Dictionary<GimpleName, ImmutableArray<GimpleUse>> BuildImmediateUses(
+            ImmutableArray<GimpleUse> uses,
+            ImmutableArray<GimpleBlockAnnotations> blocks)
+        {
+            var builders = new Dictionary<GimpleName, ImmutableArray<GimpleUse>.Builder>();
+            foreach (var use in uses)
+                AddImmediateUse(builders, use);
+
+            foreach (var block in blocks)
+            {
+                foreach (var phi in block.Phis)
+                {
+                    foreach (var operand in phi.Operands)
+                    {
+                        AddImmediateUse(
+                            builders,
+                            new GimpleUse(operand.Value, GimpleUseKind.Phi, phi.Block, phi, operand.Value, operand.Edge));
+                    }
+                }
+            }
+
+            var result = new Dictionary<GimpleName, ImmutableArray<GimpleUse>>(builders.Count);
+            foreach (var pair in builders)
+                result.Add(pair.Key, pair.Value.ToImmutable());
+            return result;
+        }
+
+        private static void AddImmediateUse(
+            Dictionary<GimpleName, ImmutableArray<GimpleUse>.Builder> builders,
+            GimpleUse use)
+        {
+            if (!builders.TryGetValue(use.Name, out var builder))
+            {
+                builder = ImmutableArray.CreateBuilder<GimpleUse>();
+                builders.Add(use.Name, builder);
+            }
+
+            builder.Add(use);
+        }
+
         public override string ToString()
             => Symbol?.Name ?? "<anonymous-function>";
     }
 
-    public sealed class SsaVariable
+    public sealed class GimpleVariable
     {
         public int Ordinal { get; }
-        public SsaVariableKind Kind { get; }
+        public GimpleVariableKind Kind { get; }
         public Symbol? Symbol { get; }
         public GimpleTemporaryValue? Temporary { get; }
         public QualifiedType Type { get; }
         public string Name { get; }
 
-        internal SsaVariable(
+        internal GimpleVariable(
             int ordinal,
-            SsaVariableKind kind,
+            GimpleVariableKind kind,
             Symbol? symbol,
             GimpleTemporaryValue? temporary,
             QualifiedType type,
@@ -270,14 +371,19 @@ namespace Cnidaria.C
         public override string ToString() => Name;
     }
 
-    public sealed class SsaName
+    public sealed class GimpleName : GimplePlace
     {
-        public SsaVariable Variable { get; }
-        public int Version { get; }
-        public QualifiedType Type => Variable.Type;
-        public bool IsUndefined { get; }
+        private GimpleDefinition? _definition;
 
-        internal SsaName(SsaVariable variable, int version, bool isUndefined)
+        public override GimpleNodeKind Kind => GimpleNodeKind.GimpleName;
+        public GimpleVariable Variable { get; }
+        public int Version { get; }
+        public bool IsUndefined { get; }
+        public GimpleDefinition? Definition => _definition;
+        public bool IsDefaultDefinition => _definition?.Kind is GimpleDefinitionKind.Undefined or GimpleDefinitionKind.Entry;
+
+        internal GimpleName(GimpleVariable variable, int version, bool isUndefined)
+            : base(GetSyntax(variable), variable?.Type ?? default)
         {
             if (version < 0)
                 throw new ArgumentOutOfRangeException(nameof(version));
@@ -287,24 +393,30 @@ namespace Cnidaria.C
             IsUndefined = isUndefined;
         }
 
+        internal void BindDefinition(GimpleDefinition definition)
+            => _definition = definition ?? throw new ArgumentNullException(nameof(definition));
+
+        private static SyntaxNode? GetSyntax(GimpleVariable? variable)
+            => variable?.Temporary?.Syntax ?? (variable?.Symbol as TypedSymbol)?.DeclaringSyntax;
+
         public override string ToString()
             => IsUndefined
                 ? $"{Variable.Name}_undef"
                 : $"{Variable.Name}_{Version.ToString(CultureInfo.InvariantCulture)}";
     }
 
-    public sealed class SsaDefinition
+    public sealed class GimpleDefinition
     {
-        public SsaName Name { get; }
-        public SsaDefinitionKind Kind { get; }
+        public GimpleName Name { get; }
+        public GimpleDefinitionKind Kind { get; }
         public ControlFlowBlock? Block { get; }
-        public GimpleStatement? Statement { get; }
-        public GimplePlace? Target { get; }
+        public GimpleStatement? Statement { get; private set; }
+        public GimplePlace? Target { get; private set; }
         public ParameterSymbol? Parameter { get; }
 
-        internal SsaDefinition(
-            SsaName name,
-            SsaDefinitionKind kind,
+        internal GimpleDefinition(
+            GimpleName name,
+            GimpleDefinitionKind kind,
             ControlFlowBlock? block,
             GimpleStatement? statement,
             GimplePlace? target,
@@ -316,54 +428,70 @@ namespace Cnidaria.C
             Statement = statement;
             Target = target;
             Parameter = parameter;
+            Name.BindDefinition(this);
+        }
+
+        internal void BindStatement(GimpleStatement? statement, GimplePlace? target = null)
+        {
+            Statement = statement;
+            if (target is not null)
+                Target = target;
         }
 
         public override string ToString()
-            => Kind == SsaDefinitionKind.Phi
+            => Kind == GimpleDefinitionKind.Phi
                 ? $"{Name} = phi"
                 : $"{Name} = {Kind}";
     }
 
-    public sealed class SsaUse
+    public sealed class GimpleUse
     {
-        public SsaName Name { get; }
-        public SsaUseKind Kind { get; }
+        public GimpleName Name { get; }
+        public GimpleUseKind Kind { get; }
         public ControlFlowBlock Block { get; }
-        public GimpleStatement? Statement { get; }
+        public GimpleStatement? Statement { get; private set; }
         public GimpleValue? Value { get; }
+        public ControlFlowEdge? Edge { get; }
 
-        internal SsaUse(
-            SsaName name,
-            SsaUseKind kind,
+        internal GimpleUse(
+            GimpleName name,
+            GimpleUseKind kind,
             ControlFlowBlock block,
             GimpleStatement? statement,
-            GimpleValue? value)
+            GimpleValue? value,
+            ControlFlowEdge? edge = null)
         {
             Name = name ?? throw new ArgumentNullException(nameof(name));
             Kind = kind;
             Block = block ?? throw new ArgumentNullException(nameof(block));
             Statement = statement;
             Value = value;
+            Edge = edge;
         }
+
+        internal void BindStatement(GimpleStatement? statement)
+            => Statement = statement;
 
         public override string ToString()
             => $"{Name} ({Kind})";
     }
 
-    public sealed class SsaPhi
+    public sealed class GimplePhi : GimpleStatement
     {
+        public override GimpleNodeKind Kind => GimpleNodeKind.PhiStatement;
         public int Ordinal { get; }
         public ControlFlowBlock Block { get; }
-        public SsaVariable Variable { get; }
-        public SsaName Result { get; }
-        public ImmutableArray<SsaPhiOperand> Operands { get; }
+        public GimpleVariable Variable { get; }
+        public GimpleName Result { get; }
+        public ImmutableArray<GimplePhiOperand> Operands { get; }
 
-        internal SsaPhi(
+        internal GimplePhi(
             int ordinal,
             ControlFlowBlock block,
-            SsaVariable variable,
-            SsaName result,
-            ImmutableArray<SsaPhiOperand> operands)
+            GimpleVariable variable,
+            GimpleName result,
+            ImmutableArray<GimplePhiOperand> operands)
+            : base(result?.Syntax)
         {
             if (ordinal < 0)
                 throw new ArgumentOutOfRangeException(nameof(ordinal));
@@ -372,21 +500,23 @@ namespace Cnidaria.C
             Block = block ?? throw new ArgumentNullException(nameof(block));
             Variable = variable ?? throw new ArgumentNullException(nameof(variable));
             Result = result ?? throw new ArgumentNullException(nameof(result));
-            Operands = operands.IsDefault ? ImmutableArray<SsaPhiOperand>.Empty : operands;
+            Operands = operands.IsDefault ? ImmutableArray<GimplePhiOperand>.Empty : operands;
+            Result.Definition?.BindStatement(this, Result);
         }
 
         public override string ToString()
             => $"{Result} = phi({string.Join(", ", Operands.Select(static operand => operand.Value.ToString()))})";
     }
 
-    public readonly struct SsaPhiOperand
+    public readonly struct GimplePhiOperand
     {
-        public ControlFlowBlock Predecessor { get; }
-        public SsaName Value { get; }
+        public ControlFlowEdge Edge { get; }
+        public ControlFlowBlock Predecessor => Edge.Source;
+        public GimpleName Value { get; }
 
-        public SsaPhiOperand(ControlFlowBlock predecessor, SsaName value)
+        public GimplePhiOperand(ControlFlowEdge edge, GimpleName value)
         {
-            Predecessor = predecessor ?? throw new ArgumentNullException(nameof(predecessor));
+            Edge = edge ?? throw new ArgumentNullException(nameof(edge));
             Value = value ?? throw new ArgumentNullException(nameof(value));
         }
 
@@ -394,29 +524,29 @@ namespace Cnidaria.C
             => $"{Predecessor}: {Value}";
     }
 
-    public sealed class SsaExpression
+    public sealed class GimpleOperandInfo
     {
         public GimpleValue Original { get; }
-        public SsaName? Name { get; }
-        public ImmutableArray<SsaExpression> Children { get; }
-        public SsaExpressionRole Role { get; }
-        public bool IsAddress => Role == SsaExpressionRole.Address;
+        public GimpleName? Name { get; }
+        public ImmutableArray<GimpleOperandInfo> Children { get; }
+        public GimpleOperandRole Role { get; }
+        public bool IsAddress => Role == GimpleOperandRole.Address;
         public bool ReadsMemory { get; }
         public bool WritesMemory { get; }
         public bool ContainsCall { get; }
 
-        internal SsaExpression(
+        internal GimpleOperandInfo(
             GimpleValue original,
-            SsaName? name,
-            ImmutableArray<SsaExpression> children,
+            GimpleName? name,
+            ImmutableArray<GimpleOperandInfo> children,
             bool readsMemory,
             bool writesMemory,
             bool containsCall,
-            SsaExpressionRole role = SsaExpressionRole.Value)
+            GimpleOperandRole role = GimpleOperandRole.Value)
         {
             Original = original ?? throw new ArgumentNullException(nameof(original));
             Name = name;
-            Children = children.IsDefault ? ImmutableArray<SsaExpression>.Empty : children;
+            Children = children.IsDefault ? ImmutableArray<GimpleOperandInfo>.Empty : children;
             Role = role;
             ReadsMemory = readsMemory;
             WritesMemory = writesMemory;
@@ -427,28 +557,32 @@ namespace Cnidaria.C
             => Name?.ToString() ?? Original.ToString() ?? Original.Kind.ToString();
     }
 
-    public sealed class SsaInstruction
+    public sealed class GimpleStatementAnnotations
     {
         public int Ordinal { get; }
         public ControlFlowBlock Block { get; }
         public GimpleStatement Statement { get; }
-        public ImmutableArray<SsaExpression> Expressions { get; }
-        public ImmutableArray<SsaUse> Uses { get; }
-        public ImmutableArray<SsaDefinition> Definitions { get; }
-        public SsaName? MemoryInput { get; }
-        public SsaName? MemoryOutput { get; }
-        public SsaInstructionFlags Flags { get; }
+        public GimpleStatement InputStatement { get; }
+        public ImmutableArray<GimpleOperandInfo> Operands { get; }
+        public ImmutableArray<GimpleUse> Uses { get; }
+        public ImmutableArray<GimpleDefinition> Definitions { get; }
+        public GimpleName? MemoryInput { get; }
+        public GimpleName? MemoryOutput { get; }
+        public GimpleName? VUse => MemoryInput;
+        public GimpleName? VDef => MemoryOutput;
+        public GimpleStatementFlags Flags { get; }
 
-        internal SsaInstruction(
+        internal GimpleStatementAnnotations(
             int ordinal,
             ControlFlowBlock block,
             GimpleStatement statement,
-            ImmutableArray<SsaExpression> expressions,
-            ImmutableArray<SsaUse> uses,
-            ImmutableArray<SsaDefinition> definitions,
-            SsaName? memoryInput,
-            SsaName? memoryOutput,
-            SsaInstructionFlags flags)
+            GimpleStatement inputStatement,
+            ImmutableArray<GimpleOperandInfo> operands,
+            ImmutableArray<GimpleUse> uses,
+            ImmutableArray<GimpleDefinition> definitions,
+            GimpleName? memoryInput,
+            GimpleName? memoryOutput,
+            GimpleStatementFlags flags)
         {
             if (ordinal < 0)
                 throw new ArgumentOutOfRangeException(nameof(ordinal));
@@ -456,9 +590,10 @@ namespace Cnidaria.C
             Ordinal = ordinal;
             Block = block ?? throw new ArgumentNullException(nameof(block));
             Statement = statement ?? throw new ArgumentNullException(nameof(statement));
-            Expressions = expressions.IsDefault ? ImmutableArray<SsaExpression>.Empty : expressions;
-            Uses = uses.IsDefault ? ImmutableArray<SsaUse>.Empty : uses;
-            Definitions = definitions.IsDefault ? ImmutableArray<SsaDefinition>.Empty : definitions;
+            InputStatement = inputStatement ?? throw new ArgumentNullException(nameof(inputStatement));
+            Operands = operands.IsDefault ? ImmutableArray<GimpleOperandInfo>.Empty : operands;
+            Uses = uses.IsDefault ? ImmutableArray<GimpleUse>.Empty : uses;
+            Definitions = definitions.IsDefault ? ImmutableArray<GimpleDefinition>.Empty : definitions;
             MemoryInput = memoryInput;
             MemoryOutput = memoryOutput;
             Flags = flags;
@@ -468,90 +603,277 @@ namespace Cnidaria.C
             => Statement.Kind.ToString();
     }
 
-    public sealed class SsaBlock
+    public sealed class GimpleBlockAnnotations
     {
         public ControlFlowBlock ControlFlowBlock { get; }
-        public ImmutableArray<SsaPhi> Phis { get; }
-        public ImmutableArray<SsaInstruction> Instructions { get; }
+        public GimpleBasicBlock? GimpleBlock => ControlFlowBlock.GimpleBlock;
+        public ImmutableArray<GimplePhi> Phis { get; }
+        public ImmutableArray<GimpleStatementAnnotations> Statements { get; }
         public bool IsReachable => ControlFlowBlock.IsReachable;
 
-        internal SsaBlock(
+        internal GimpleBlockAnnotations(
             ControlFlowBlock controlFlowBlock,
-            ImmutableArray<SsaPhi> phis,
-            ImmutableArray<SsaInstruction> instructions)
+            ImmutableArray<GimplePhi> phis,
+            ImmutableArray<GimpleStatementAnnotations> statements)
         {
             ControlFlowBlock = controlFlowBlock ?? throw new ArgumentNullException(nameof(controlFlowBlock));
-            Phis = phis.IsDefault ? ImmutableArray<SsaPhi>.Empty : phis;
-            Instructions = instructions.IsDefault ? ImmutableArray<SsaInstruction>.Empty : instructions;
+            Phis = phis.IsDefault ? ImmutableArray<GimplePhi>.Empty : phis;
+            Statements = statements.IsDefault ? ImmutableArray<GimpleStatementAnnotations>.Empty : statements;
         }
 
         public override string ToString()
             => ControlFlowBlock.ToString();
     }
 
-    public sealed class SsaProblem
+    public sealed class GimpleProblem
     {
-        public SsaProblemKind Kind { get; }
+        public GimpleProblemKind Kind { get; }
         public ControlFlowBlock? Block { get; }
         public string Message { get; }
 
-        internal SsaProblem(SsaProblemKind kind, ControlFlowBlock? block, string message)
+        internal GimpleProblem(GimpleProblemKind kind, ControlFlowBlock? block, string message)
         {
             Kind = kind;
             Block = block;
             Message = message ?? string.Empty;
         }
 
-        internal static SsaProblem FromControlFlowProblem(ControlFlowProblem problem)
+        internal static GimpleProblem FromControlFlowProblem(ControlFlowProblem problem)
         {
             if (problem is null)
                 throw new ArgumentNullException(nameof(problem));
 
-            return new SsaProblem(SsaProblemKind.ControlFlowProblem, problem.Block, problem.Message);
+            return new GimpleProblem(GimpleProblemKind.ControlFlowProblem, problem.Block, problem.Message);
         }
 
         public override string ToString() => Message;
     }
 
 
-    internal sealed class SsaFunctionBuilder
+    internal static class GimpleNameMaterializer
     {
+        public static GimpleStatement MaterializeStatement(
+            GimpleStatement statement,
+            ImmutableArray<GimpleOperandInfo> expressions,
+            ImmutableArray<GimpleDefinition> definitions)
+        {
+            if (statement is null)
+                throw new ArgumentNullException(nameof(statement));
+
+            var definition = GetPrimaryDefinition(definitions);
+            switch (statement)
+            {
+                case GimpleAssignStatement assign:
+                    {
+                        var lhs = definition?.Name ?? MaterializePlace(expressions, 0, assign.Lhs);
+                        var operandStart = definition is null ? 1 : 0;
+                        var operands = MaterializeOperands(expressions, operandStart, assign.Operands);
+
+                        if (ReferenceEquals(lhs, assign.Lhs) && operands.IsDefault)
+                            return statement;
+
+                        return assign.WithOperands(lhs, operands.IsDefault ? assign.Operands : operands);
+                    }
+
+                case GimpleCallStatement call:
+                    {
+                        var hasLhsAddress = call.Lhs is not null && definition is null;
+                        var lhs = definition?.Name ?? (call.Lhs is null ? null : MaterializePlace(expressions, 0, call.Lhs));
+                        var index = hasLhsAddress ? 1 : 0;
+                        var function = index < expressions.Length ? MaterializeValue(expressions[index]) : call.Function;
+                        var arguments = MaterializeOperands(expressions, index + 1, call.Arguments);
+
+                        if (ReferenceEquals(lhs, call.Lhs) && ReferenceEquals(function, call.Function) && arguments.IsDefault)
+                            return statement;
+
+                        return call.WithOperands(lhs, function, arguments.IsDefault ? call.Arguments : arguments);
+                    }
+
+                case GimpleCondStatement conditional when expressions.Length > 1:
+                    {
+                        var left = MaterializeValue(expressions[0]);
+                        var right = MaterializeValue(expressions[1]);
+                        return ReferenceEquals(left, conditional.Lhs) && ReferenceEquals(right, conditional.Rhs)
+                            ? statement
+                            : conditional.WithOperands(conditional.Code, left, right);
+                    }
+
+                case GimpleSwitchStatement switchStatement when expressions.Length != 0:
+                    {
+                        var expression = MaterializeValue(expressions[0]);
+                        return ReferenceEquals(expression, switchStatement.Expression)
+                            ? statement
+                            : new GimpleSwitchStatement(expression, switchStatement.Cases, switchStatement.DefaultLabel, statement.Syntax);
+                    }
+
+                case GimpleReturnStatement returnStatement when returnStatement.Expression is not null && expressions.Length != 0:
+                    {
+                        var expression = MaterializeValue(expressions[0]);
+                        return ReferenceEquals(expression, returnStatement.Expression)
+                            ? statement
+                            : new GimpleReturnStatement(returnStatement.Function, expression, statement.Syntax);
+                    }
+
+                default:
+                    return statement;
+            }
+        }
+
+        // A default array signals that nothing changed and the original operands stand
+        private static ImmutableArray<GimpleValue> MaterializeOperands(
+            ImmutableArray<GimpleOperandInfo> expressions,
+            int start,
+            ImmutableArray<GimpleValue> originals)
+        {
+            if (originals.Length == 0 || start + originals.Length > expressions.Length)
+                return default;
+
+            ImmutableArray<GimpleValue>.Builder? builder = null;
+            for (var i = 0; i < originals.Length; i++)
+            {
+                var materialized = MaterializeValue(expressions[start + i]);
+                if (builder is null)
+                {
+                    if (ReferenceEquals(materialized, originals[i]))
+                        continue;
+
+                    builder = ImmutableArray.CreateBuilder<GimpleValue>(originals.Length);
+                    for (var seen = 0; seen < i; seen++)
+                        builder.Add(originals[seen]);
+                }
+
+                builder.Add(materialized);
+            }
+
+            return builder is null ? default : builder.ToImmutable();
+        }
+
+        private static GimplePlace MaterializePlace(ImmutableArray<GimpleOperandInfo> expressions, int index, GimplePlace original)
+        {
+            if (index >= expressions.Length)
+                return original;
+
+            return MaterializeValue(expressions[index]) as GimplePlace ?? original;
+        }
+
+        public static GimpleValue MaterializeValue(GimpleOperandInfo expression)
+        {
+            if (expression is null)
+                throw new ArgumentNullException(nameof(expression));
+
+            if (expression.Name is not null)
+                return expression.IsAddress ? expression.Original : expression.Name;
+
+            if (expression.Children.Length == 0)
+                return expression.Original;
+
+            var children = ImmutableArray.CreateBuilder<GimpleValue>(expression.Children.Length);
+            foreach (var child in expression.Children)
+                children.Add(MaterializeValue(child));
+
+            switch (expression.Original)
+            {
+                case GimpleUnaryExpression unary when children.Count == 1:
+                    return new GimpleUnaryExpression(unary.Code, children[0], unary.Type, unary.Syntax);
+
+                case GimpleBinaryExpression binary when children.Count == 2:
+                    return new GimpleBinaryExpression(children[0], binary.Code, children[1], binary.Type, binary.Syntax);
+
+                case GimpleConversionExpression conversion when children.Count == 1:
+                    return new GimpleConversionExpression(children[0], conversion.Type, conversion.ConversionKind, conversion.Syntax);
+
+                case GimpleCastExpression cast when children.Count == 1:
+                    return new GimpleCastExpression(children[0], cast.Type, cast.Syntax);
+
+                case GimpleAddressOfExpression addressOf when children.Count == 1 && children[0] is GimplePlace target:
+                    return new GimpleAddressOfExpression(target, addressOf.Type, addressOf.Syntax);
+
+                case GimpleIndirectExpression indirect when children.Count == 1:
+                    return new GimpleIndirectExpression(children[0], indirect.Type, indirect.Syntax);
+
+                case GimpleElementAccessExpression elementAccess when elementAccess.Index is null && children.Count == 1:
+                    return new GimpleElementAccessExpression(children[0], null, elementAccess.Type, elementAccess.Syntax);
+
+                case GimpleElementAccessExpression elementAccess when elementAccess.Index is not null && children.Count == 2:
+                    return new GimpleElementAccessExpression(children[0], children[1], elementAccess.Type, elementAccess.Syntax);
+
+                case GimpleMemberAccessExpression memberAccess when children.Count == 1:
+                    return new GimpleMemberAccessExpression(
+                        children[0],
+                        memberAccess.ThroughPointer,
+                        memberAccess.NameToken,
+                        memberAccess.Field,
+                        memberAccess.Type,
+                        memberAccess.Syntax);
+
+                default:
+                    return expression.Original;
+            }
+        }
+
+        private static GimpleDefinition? GetPrimaryDefinition(ImmutableArray<GimpleDefinition> definitions)
+        {
+            foreach (var definition in definitions)
+            {
+                if (definition.Name.Variable.Kind != GimpleVariableKind.Memory)
+                    return definition;
+            }
+
+            return null;
+        }
+    }
+
+
+    internal sealed class GimpleAnnotationBuilder
+    {
+        private readonly TargetInfo _target;
         private readonly ControlFlowFunction _controlFlowFunction;
         private readonly SsaOptions _options;
-        private readonly Dictionary<SsaVariableKey, CandidateInfo> _candidates = new();
+        private readonly ValueNumberingOptions _valueNumberingOptions;
+        private readonly Dictionary<GimpleVariableKey, CandidateInfo> _candidates = new();
         private readonly List<CandidateInfo> _candidateOrder = new();
-        private readonly HashSet<SsaVariableKey> _addressTaken = new();
+        private readonly HashSet<GimpleVariableKey> _addressTaken = new();
         private readonly HashSet<Symbol> _functionLocalSymbols = new();
-        private readonly Dictionary<SsaVariableKey, SsaVariable> _variablesByKey = new();
-        private readonly Dictionary<SsaVariable, HashSet<ControlFlowBlock>> _definitionBlocks = new();
-        private readonly Dictionary<SsaVariable, HashSet<ControlFlowBlock>> _liveInBlocks = new();
+        private readonly Dictionary<GimpleVariableKey, GimpleVariable> _variablesByKey = new();
+        private readonly Dictionary<GimpleVariable, HashSet<ControlFlowBlock>> _definitionBlocks = new();
+        private readonly Dictionary<GimpleVariable, HashSet<ControlFlowBlock>> _liveInBlocks = new();
         private readonly Dictionary<ControlFlowBlock, List<PhiBuilder>> _phisByBlock = new();
-        private readonly Dictionary<ControlFlowBlock, List<SsaInstruction>> _instructionsByBlock = new();
-        private readonly Dictionary<SsaVariable, Stack<SsaName>> _stacks = new();
-        private readonly Dictionary<SsaVariable, int> _nextVersions = new();
-        private readonly Dictionary<SsaVariable, SsaName> _undefinedNames = new();
-        private readonly Dictionary<ParameterSymbol, SsaVariable> _parameterVariables = new();
-        private readonly List<SsaVariable> _variables = new();
-        private readonly List<SsaDefinition> _definitions = new();
-        private readonly List<SsaUse> _uses = new();
-        private readonly List<SsaProblem> _problems = new();
+        private readonly Dictionary<ControlFlowBlock, List<GimpleStatementAnnotations>> _instructionsByBlock = new();
+        private readonly Dictionary<GimpleVariable, Stack<GimpleName>> _stacks = new();
+        private readonly Dictionary<GimpleVariable, int> _nextVersions = new();
+        private readonly Dictionary<GimpleVariable, GimpleName> _undefinedNames = new();
+        private readonly Dictionary<ParameterSymbol, GimpleVariable> _parameterVariables = new();
+        private readonly List<GimpleVariable> _variables = new();
+        private readonly List<GimpleDefinition> _definitions = new();
+        private readonly List<GimpleUse> _uses = new();
+        private readonly List<GimpleProblem> _problems = new();
 
-        private SsaVariable? _memoryVariable;
+        private GimpleVariable? _memoryVariable;
         private ControlFlowBlock? _currentBlock;
         private GimpleStatement? _currentStatement;
         private int _phiOrdinal;
         private int _instructionOrdinal;
 
-        private SsaFunctionBuilder(ControlFlowFunction controlFlowFunction, SsaOptions options)
+        private GimpleAnnotationBuilder(
+            ControlFlowFunction controlFlowFunction,
+            SsaOptions options,
+            ValueNumberingOptions valueNumberingOptions,
+            TargetInfo target)
         {
+            _target = target;
             _controlFlowFunction = controlFlowFunction ?? throw new ArgumentNullException(nameof(controlFlowFunction));
             _options = options ?? throw new ArgumentNullException(nameof(options));
+            _valueNumberingOptions = valueNumberingOptions ?? throw new ArgumentNullException(nameof(valueNumberingOptions));
         }
 
-        public static SsaFunction Build(ControlFlowFunction controlFlowFunction, SsaOptions options)
-            => new SsaFunctionBuilder(controlFlowFunction, options).Build();
+        public static GimpleFunctionAnnotations Build(
+            ControlFlowFunction controlFlowFunction,
+            SsaOptions options,
+            ValueNumberingOptions valueNumberingOptions,
+            TargetInfo target)
+            => new GimpleAnnotationBuilder(controlFlowFunction, options, valueNumberingOptions, target).Build();
 
-        private SsaFunction Build()
+        private GimpleFunctionAnnotations Build()
         {
             ScanCandidatesAndAddressTaken();
             CreateVariables();
@@ -563,21 +885,26 @@ namespace Cnidaria.C
             if (_controlFlowFunction.Entry.IsReachable)
                 RenameBlock(_controlFlowFunction.Entry);
 
-            var blocks = ImmutableArray.CreateBuilder<SsaBlock>();
+            var blocks = ImmutableArray.CreateBuilder<GimpleBlockAnnotations>();
             foreach (var block in _controlFlowFunction.RealBlocks)
             {
-                var phis = ImmutableArray<SsaPhi>.Empty;
+                var phis = ImmutableArray<GimplePhi>.Empty;
                 if (_phisByBlock.TryGetValue(block, out var phiBuilders))
-                    phis = phiBuilders.Select(static phi => phi.Build()).ToImmutableArray();
+                {
+                    var phiArray = ImmutableArray.CreateBuilder<GimplePhi>(phiBuilders.Count);
+                    foreach (var phiBuilder in phiBuilders)
+                        phiArray.Add(phiBuilder.Build(_undefinedNames[phiBuilder.Variable], _problems));
+                    phis = phiArray.ToImmutable();
+                }
 
                 var instructions = _instructionsByBlock.TryGetValue(block, out var instructionList)
                     ? instructionList.ToImmutableArray()
-                    : ImmutableArray<SsaInstruction>.Empty;
+                    : ImmutableArray<GimpleStatementAnnotations>.Empty;
 
-                blocks.Add(new SsaBlock(block, phis, instructions));
+                blocks.Add(new GimpleBlockAnnotations(block, phis, instructions));
             }
 
-            return new SsaFunction(
+            return new GimpleFunctionAnnotations(
                 _controlFlowFunction,
                 _memoryVariable,
                 _variables.ToImmutableArray(),
@@ -586,7 +913,8 @@ namespace Cnidaria.C
                 _uses.ToImmutableArray(),
                 _problems.ToImmutableArray(),
                 _undefinedNames,
-                _options.ValueNumbering);
+                _valueNumberingOptions,
+                _target);
         }
 
         private void ScanCandidatesAndAddressTaken()
@@ -597,12 +925,12 @@ namespace Cnidaria.C
                 foreach (var parameter in functionType.Parameters)
                 {
                     _functionLocalSymbols.Add(parameter);
-                    AddCandidate(SsaVariableKey.FromSymbol(parameter), parameter.Type, parameter.Name, StorageClass.Auto);
+                    AddCandidate(GimpleVariableKey.FromSymbol(parameter), parameter.Type, parameter.Name, StorageClass.Auto);
                 }
             }
 
             foreach (var temporary in _controlFlowFunction.Function.Temporaries)
-                AddCandidate(SsaVariableKey.FromTemporary(temporary), temporary.Type, temporary.Name, StorageClass.Auto);
+                AddCandidate(GimpleVariableKey.FromTemporary(temporary), temporary.Type, temporary.Name, StorageClass.Auto);
 
             foreach (var block in _controlFlowFunction.RealBlocks)
             {
@@ -619,21 +947,22 @@ namespace Cnidaria.C
                     if (declaration.Symbol is TypedSymbol typed && declaration.Symbol is VariableSymbol or ParameterSymbol)
                     {
                         _functionLocalSymbols.Add(declaration.Symbol);
-                        AddCandidate(SsaVariableKey.FromSymbol(declaration.Symbol), typed.Type, declaration.Symbol.Name, declaration.StorageClass);
+                        AddCandidate(GimpleVariableKey.FromSymbol(declaration.Symbol), typed.Type, declaration.Symbol.Name, declaration.StorageClass);
                     }
                     break;
 
-                case GimpleAssignmentStatement assignment:
-                    ScanPlace(assignment.Target, addressContext: false);
-                    ScanValue(assignment.Value);
+                case GimpleAssignStatement assign:
+                    ScanPlace(assign.Lhs, addressContext: false);
+                    foreach (var operand in assign.Operands)
+                        ScanValue(operand);
                     break;
 
-                case GimpleZeroInitializeStatement zeroInitialize:
-                    ScanPlace(zeroInitialize.Target, addressContext: false);
-                    break;
-
-                case GimpleExpressionStatement expressionStatement:
-                    ScanValue(expressionStatement.Expression);
+                case GimpleCallStatement call:
+                    if (call.Lhs is not null)
+                        ScanPlace(call.Lhs, addressContext: false);
+                    ScanValue(call.Function);
+                    foreach (var argument in call.Arguments)
+                        ScanValue(argument);
                     break;
 
                 case GimpleAsmStatement asmStatement:
@@ -671,8 +1000,9 @@ namespace Cnidaria.C
                     }
                     break;
 
-                case GimpleConditionalGotoStatement conditional:
-                    ScanValue(conditional.Condition);
+                case GimpleCondStatement conditional:
+                    ScanValue(conditional.Lhs);
+                    ScanValue(conditional.Rhs);
                     break;
 
                 case GimpleSwitchStatement switchStatement:
@@ -695,7 +1025,7 @@ namespace Cnidaria.C
                     break;
 
                 case GimpleTemporaryValue temporary:
-                    AddCandidate(SsaVariableKey.FromTemporary(temporary), temporary.Type, temporary.Name, StorageClass.Auto);
+                    AddCandidate(GimpleVariableKey.FromTemporary(temporary), temporary.Type, temporary.Name, StorageClass.Auto);
                     break;
 
                 case GimpleUnaryExpression unary:
@@ -733,12 +1063,6 @@ namespace Cnidaria.C
                 case GimpleMemberAccessExpression memberAccess:
                     ScanValue(memberAccess.Expression);
                     break;
-
-                case GimpleCallExpression call:
-                    ScanValue(call.Callee);
-                    foreach (var argument in call.Arguments)
-                        ScanValue(argument);
-                    break;
             }
         }
 
@@ -766,7 +1090,7 @@ namespace Cnidaria.C
                     break;
 
                 case GimpleTemporaryValue temporary:
-                    _addressTaken.Add(SsaVariableKey.FromTemporary(temporary));
+                    _addressTaken.Add(GimpleVariableKey.FromTemporary(temporary));
                     break;
 
                 case GimpleIndirectExpression indirect:
@@ -794,7 +1118,7 @@ namespace Cnidaria.C
                     break;
 
                 case GimpleTemporaryValue temporary:
-                    _addressTaken.Add(SsaVariableKey.FromTemporary(temporary));
+                    _addressTaken.Add(GimpleVariableKey.FromTemporary(temporary));
                     break;
 
                 default:
@@ -803,7 +1127,7 @@ namespace Cnidaria.C
             }
         }
 
-        private void AddCandidate(SsaVariableKey key, QualifiedType type, string name, StorageClass storageClass)
+        private void AddCandidate(GimpleVariableKey key, QualifiedType type, string name, StorageClass storageClass)
         {
             if (!_candidates.TryGetValue(key, out var candidate))
             {
@@ -823,9 +1147,9 @@ namespace Cnidaria.C
             var ordinal = 0;
             if (_options.TrackMemory)
             {
-                _memoryVariable = new SsaVariable(
+                _memoryVariable = new GimpleVariable(
                     ordinal++,
-                    SsaVariableKind.Memory,
+                    GimpleVariableKind.Memory,
                     symbol: null,
                     temporary: null,
                     new QualifiedType(TypeCatalog.Instance.Void),
@@ -838,7 +1162,7 @@ namespace Cnidaria.C
                 if (!IsPromotable(candidate))
                     continue;
 
-                var variable = new SsaVariable(
+                var variable = new GimpleVariable(
                     ordinal++,
                     candidate.Key.Kind,
                     candidate.Key.Symbol,
@@ -856,7 +1180,7 @@ namespace Cnidaria.C
 
         private bool IsPromotable(CandidateInfo candidate)
         {
-            if (candidate.Key.Kind == SsaVariableKind.Temporary && !_options.PromoteTemporaries)
+            if (candidate.Key.Kind == GimpleVariableKind.Temporary && !_options.PromoteTemporaries)
                 return false;
 
             if (!_options.PromoteAddressTakenVariables && _addressTaken.Contains(candidate.Key))
@@ -917,32 +1241,22 @@ namespace Cnidaria.C
 
         private void CollectStatementDefinitionBlocks(ControlFlowBlock block, GimpleStatement statement)
         {
+            if (GimpleMemoryEffects.HasOrderedAccess(statement))
+                AddMemoryDefinitionBlock(block);
             switch (statement)
             {
-                case GimpleAssignmentStatement assignment:
-                    {
-                        if (TryGetVariable(assignment.Target, out var targetVariable))
-                            _definitionBlocks[targetVariable].Add(block);
-                        else
-                            AddMemoryDefinitionBlock(block);
-
-                        if (ExpressionWritesMemory(assignment.Value))
-                            AddMemoryDefinitionBlock(block);
-                    }
-                    break;
-
-                case GimpleZeroInitializeStatement zeroInitialize:
-                    {
-                        if (TryGetVariable(zeroInitialize.Target, out var targetVariable))
-                            _definitionBlocks[targetVariable].Add(block);
-                        else
-                            AddMemoryDefinitionBlock(block);
-                    }
-                    break;
-
-                case GimpleExpressionStatement expressionStatement:
-                    if (ExpressionWritesMemory(expressionStatement.Expression))
+                case GimpleAssignStatement assign:
+                    if (TryGetVariable(assign.Lhs, out var assignTargetVariable))
+                        _definitionBlocks[assignTargetVariable].Add(block);
+                    else
                         AddMemoryDefinitionBlock(block);
+                    break;
+
+                case GimpleCallStatement call:
+                    if (call.Lhs is not null && TryGetVariable(call.Lhs, out var callTargetVariable))
+                        _definitionBlocks[callTargetVariable].Add(block);
+
+                    AddMemoryDefinitionBlock(block);
                     break;
 
                 case GimpleAsmStatement asmStatement:
@@ -958,20 +1272,6 @@ namespace Cnidaria.C
                     AddMemoryDefinitionBlock(block);
                     break;
 
-                case GimpleConditionalGotoStatement conditional:
-                    if (ExpressionWritesMemory(conditional.Condition))
-                        AddMemoryDefinitionBlock(block);
-                    break;
-
-                case GimpleSwitchStatement switchStatement:
-                    if (ExpressionWritesMemory(switchStatement.Expression))
-                        AddMemoryDefinitionBlock(block);
-                    break;
-
-                case GimpleReturnStatement returnStatement when returnStatement.Expression is not null:
-                    if (ExpressionWritesMemory(returnStatement.Expression))
-                        AddMemoryDefinitionBlock(block);
-                    break;
             }
         }
 
@@ -983,17 +1283,17 @@ namespace Cnidaria.C
 
         private void ComputeLiveInBlocks()
         {
-            var blockUses = new Dictionary<ControlFlowBlock, HashSet<SsaVariable>>();
-            var blockDefs = new Dictionary<ControlFlowBlock, HashSet<SsaVariable>>();
-            var liveOut = new Dictionary<ControlFlowBlock, HashSet<SsaVariable>>();
+            var blockUses = new Dictionary<ControlFlowBlock, HashSet<GimpleVariable>>();
+            var blockDefs = new Dictionary<ControlFlowBlock, HashSet<GimpleVariable>>();
+            var liveOut = new Dictionary<ControlFlowBlock, HashSet<GimpleVariable>>();
 
             foreach (var variable in _variables)
                 _liveInBlocks[variable] = new HashSet<ControlFlowBlock>();
 
             foreach (var block in _controlFlowFunction.RealBlocks)
             {
-                var uses = new HashSet<SsaVariable>();
-                var defs = new HashSet<SsaVariable>();
+                var uses = new HashSet<GimpleVariable>();
+                var defs = new HashSet<GimpleVariable>();
 
                 if (ReferenceEquals(block, _controlFlowFunction.Entry))
                 {
@@ -1012,7 +1312,7 @@ namespace Cnidaria.C
 
                 blockUses[block] = uses;
                 blockDefs[block] = defs;
-                liveOut[block] = new HashSet<SsaVariable>();
+                liveOut[block] = new HashSet<GimpleVariable>();
             }
 
             var changed = true;
@@ -1025,7 +1325,7 @@ namespace Cnidaria.C
                     if (!blockUses.TryGetValue(block, out var uses))
                         continue;
 
-                    var newOut = new HashSet<SsaVariable>();
+                    var newOut = new HashSet<GimpleVariable>();
                     foreach (var successor in block.UniqueSuccessors)
                     {
                         if (!blockUses.TryGetValue(successor, out _))
@@ -1035,7 +1335,7 @@ namespace Cnidaria.C
                             newOut.Add(variable);
                     }
 
-                    var newIn = new HashSet<SsaVariable>(uses);
+                    var newIn = new HashSet<GimpleVariable>(uses);
                     foreach (var variable in newOut)
                     {
                         if (!blockDefs[block].Contains(variable))
@@ -1063,46 +1363,45 @@ namespace Cnidaria.C
 
         private void CollectStatementLiveUsesAndDefs(
             GimpleStatement statement,
-            HashSet<SsaVariable> uses,
-            HashSet<SsaVariable> defs)
+            HashSet<GimpleVariable> uses,
+            HashSet<GimpleVariable> defs)
         {
             switch (statement)
             {
-                case GimpleAssignmentStatement assignment:
-                    if (TryGetVariable(assignment.Target, out var targetVariable))
+                case GimpleAssignStatement assign:
+                    if (TryGetVariable(assign.Lhs, out var assignTargetVariable))
                     {
-                        CollectValueLiveUses(assignment.Value, uses, defs);
-                        defs.Add(targetVariable);
+                        foreach (var operand in assign.Operands)
+                            CollectValueLiveUses(operand, uses, defs);
+
+                        defs.Add(assignTargetVariable);
                     }
                     else
                     {
-                        CollectPlaceAddressLiveUses(assignment.Target, uses, defs);
-                        CollectValueLiveUses(assignment.Value, uses, defs);
-                        if (_memoryVariable is not null)
-                            defs.Add(_memoryVariable);
-                    }
+                        CollectPlaceAddressLiveUses(assign.Lhs, uses, defs);
+                        foreach (var operand in assign.Operands)
+                            CollectValueLiveUses(operand, uses, defs);
 
-                    if (_memoryVariable is not null && ExpressionWritesMemory(assignment.Value))
-                        defs.Add(_memoryVariable);
-                    break;
-
-                case GimpleZeroInitializeStatement zeroInitialize:
-                    if (TryGetVariable(zeroInitialize.Target, out var zeroTargetVariable))
-                    {
-                        defs.Add(zeroTargetVariable);
-                    }
-                    else
-                    {
-                        CollectPlaceAddressLiveUses(zeroInitialize.Target, uses, defs);
                         if (_memoryVariable is not null)
                             defs.Add(_memoryVariable);
                     }
                     break;
 
-                case GimpleExpressionStatement expressionStatement:
-                    CollectValueLiveUses(expressionStatement.Expression, uses, defs);
-                    if (_memoryVariable is not null && ExpressionWritesMemory(expressionStatement.Expression))
+                case GimpleCallStatement call:
+                    CollectValueLiveUses(call.Function, uses, defs);
+                    foreach (var argument in call.Arguments)
+                        CollectValueLiveUses(argument, uses, defs);
+
+                    if (call.Lhs is not null && TryGetVariable(call.Lhs, out var callTargetVariable))
+                        defs.Add(callTargetVariable);
+                    else if (call.Lhs is not null)
+                        CollectPlaceAddressLiveUses(call.Lhs, uses, defs);
+
+                    if (_memoryVariable is not null)
+                    {
+                        MarkLiveUse(_memoryVariable, uses, defs);
                         defs.Add(_memoryVariable);
+                    }
                     break;
 
                 case GimpleAsmStatement asmStatement:
@@ -1137,8 +1436,9 @@ namespace Cnidaria.C
                     }
                     break;
 
-                case GimpleConditionalGotoStatement conditional:
-                    CollectValueLiveUses(conditional.Condition, uses, defs);
+                case GimpleCondStatement conditional:
+                    CollectValueLiveUses(conditional.Lhs, uses, defs);
+                    CollectValueLiveUses(conditional.Rhs, uses, defs);
                     break;
 
                 case GimpleSwitchStatement switchStatement:
@@ -1153,8 +1453,8 @@ namespace Cnidaria.C
 
         private void CollectValueLiveUses(
             GimpleValue value,
-            HashSet<SsaVariable> uses,
-            HashSet<SsaVariable> defs)
+            HashSet<GimpleVariable> uses,
+            HashSet<GimpleVariable> defs)
         {
             switch (value)
             {
@@ -1216,21 +1516,13 @@ namespace Cnidaria.C
                     if (_memoryVariable is not null)
                         MarkLiveUse(_memoryVariable, uses, defs);
                     break;
-
-                case GimpleCallExpression call:
-                    CollectValueLiveUses(call.Callee, uses, defs);
-                    foreach (var argument in call.Arguments)
-                        CollectValueLiveUses(argument, uses, defs);
-                    if (_memoryVariable is not null)
-                        MarkLiveUse(_memoryVariable, uses, defs);
-                    break;
             }
         }
 
         private void CollectPlaceAddressLiveUses(
             GimplePlace place,
-            HashSet<SsaVariable> uses,
-            HashSet<SsaVariable> defs)
+            HashSet<GimpleVariable> uses,
+            HashSet<GimpleVariable> defs)
         {
             switch (place)
             {
@@ -1260,8 +1552,8 @@ namespace Cnidaria.C
 
         private void CollectPlaceAddressLiveUsesForBase(
             GimpleValue value,
-            HashSet<SsaVariable> uses,
-            HashSet<SsaVariable> defs)
+            HashSet<GimpleVariable> uses,
+            HashSet<GimpleVariable> defs)
         {
             if (value is GimplePlace place)
                 CollectPlaceAddressLiveUses(place, uses, defs);
@@ -1270,9 +1562,9 @@ namespace Cnidaria.C
         }
 
         private static void MarkLiveUse(
-            SsaVariable variable,
-            HashSet<SsaVariable> uses,
-            HashSet<SsaVariable> defs)
+            GimpleVariable variable,
+            HashSet<GimpleVariable> uses,
+            HashSet<GimpleVariable> defs)
         {
             if (!defs.Contains(variable))
                 uses.Add(variable);
@@ -1281,9 +1573,9 @@ namespace Cnidaria.C
         private static bool SetEquals<T>(HashSet<T> left, HashSet<T> right)
             => left.Count == right.Count && left.SetEquals(right);
 
-        private bool ShouldInsertPhi(SsaVariable variable, ControlFlowBlock block)
+        private bool ShouldInsertPhi(GimpleVariable variable, ControlFlowBlock block)
         {
-            if (variable.Kind == SsaVariableKind.Memory)
+            if (variable.Kind == GimpleVariableKind.Memory)
                 return true;
 
             return _liveInBlocks.TryGetValue(variable, out var liveIn) && liveIn.Contains(block);
@@ -1322,7 +1614,7 @@ namespace Cnidaria.C
             }
         }
 
-        private void AddPhi(ControlFlowBlock block, SsaVariable variable)
+        private void AddPhi(ControlFlowBlock block, GimpleVariable variable)
         {
             if (!_phisByBlock.TryGetValue(block, out var phis))
             {
@@ -1338,18 +1630,18 @@ namespace Cnidaria.C
         {
             foreach (var variable in _variables)
             {
-                _stacks.Add(variable, new Stack<SsaName>());
+                _stacks.Add(variable, new Stack<GimpleName>());
                 _nextVersions.Add(variable, 0);
                 var undefined = CreateName(variable, isUndefined: true);
                 _undefinedNames.Add(variable, undefined);
                 _stacks[variable].Push(undefined);
-                _definitions.Add(new SsaDefinition(undefined, SsaDefinitionKind.Undefined, block: null, statement: null, target: null, parameter: null));
+                _definitions.Add(new GimpleDefinition(undefined, GimpleDefinitionKind.Undefined, block: null, statement: null, target: null, parameter: null));
             }
         }
 
         private void RenameBlock(ControlFlowBlock block)
         {
-            var pushed = new List<SsaVariable>();
+            var pushed = new List<GimpleVariable>();
 
             if (ReferenceEquals(block, _controlFlowFunction.Entry))
             {
@@ -1357,14 +1649,14 @@ namespace Cnidaria.C
                 {
                     if (_parameterVariables.TryGetValue(parameter, out var variable))
                     {
-                        _ = PushDefinition(variable, SsaDefinitionKind.Entry, block, statement: null, target: null, parameter: parameter);
+                        _ = PushDefinition(variable, GimpleDefinitionKind.Entry, block, statement: null, target: null, parameter: parameter);
                         pushed.Add(variable);
                     }
                 }
 
                 if (_memoryVariable is not null)
                 {
-                    _ = PushDefinition(_memoryVariable, SsaDefinitionKind.Entry, block, statement: null, target: null, parameter: null);
+                    _ = PushDefinition(_memoryVariable, GimpleDefinitionKind.Entry, block, statement: null, target: null, parameter: null);
                     pushed.Add(_memoryVariable);
                 }
             }
@@ -1373,7 +1665,7 @@ namespace Cnidaria.C
             {
                 foreach (var phi in phis)
                 {
-                    phi.Result = PushDefinition(phi.Variable, SsaDefinitionKind.Phi, block, statement: null, target: null, parameter: null).Name;
+                    phi.Result = PushDefinition(phi.Variable, GimpleDefinitionKind.Phi, block, statement: null, target: null, parameter: null).Name;
                     pushed.Add(phi.Variable);
                 }
             }
@@ -1383,7 +1675,7 @@ namespace Cnidaria.C
                 var instruction = RenameStatement(block, statement, pushed);
                 if (!_instructionsByBlock.TryGetValue(block, out var instructions))
                 {
-                    instructions = new List<SsaInstruction>();
+                    instructions = new List<GimpleStatementAnnotations>();
                     _instructionsByBlock.Add(block, instructions);
                 }
 
@@ -1402,39 +1694,42 @@ namespace Cnidaria.C
                 _stacks[pushed[i]].Pop();
         }
 
-        private SsaInstruction RenameStatement(ControlFlowBlock block, GimpleStatement statement, List<SsaVariable> pushed)
+        private GimpleStatementAnnotations RenameStatement(ControlFlowBlock block, GimpleStatement statement, List<GimpleVariable> pushed)
         {
             _currentBlock = block;
             _currentStatement = statement;
 
-            var uses = ImmutableArray.CreateBuilder<SsaUse>();
-            var definitions = ImmutableArray.CreateBuilder<SsaDefinition>();
-            var expressions = ImmutableArray.CreateBuilder<SsaExpression>();
-            var flags = SsaInstructionFlags.None;
+            var uses = ImmutableArray.CreateBuilder<GimpleUse>();
+            var definitions = ImmutableArray.CreateBuilder<GimpleDefinition>();
+            var expressions = ImmutableArray.CreateBuilder<GimpleOperandInfo>();
+            var flags = GimpleStatementFlags.None;
             bool explicitMemoryWrite = false;
 
             switch (statement)
             {
-                case GimpleAssignmentStatement assignment:
-                    if (!TryGetVariable(assignment.Target, out _))
+                case GimpleAssignStatement assign:
+                    if (!TryGetVariable(assign.Lhs, out _))
                     {
-                        expressions.Add(RewritePlaceAddress(assignment.Target, uses));
+                        expressions.Add(RewritePlaceAddress(assign.Lhs, uses));
                         explicitMemoryWrite = true;
                     }
 
-                    expressions.Add(RewriteValue(assignment.Value, uses));
+                    foreach (var operand in assign.Operands)
+                        expressions.Add(RewriteValue(operand, uses));
                     break;
 
-                case GimpleZeroInitializeStatement zeroInitialize:
-                    if (!TryGetVariable(zeroInitialize.Target, out _))
+                case GimpleCallStatement call:
+                    if (call.Lhs is not null && !TryGetVariable(call.Lhs, out _))
                     {
-                        expressions.Add(RewritePlaceAddress(zeroInitialize.Target, uses));
+                        expressions.Add(RewritePlaceAddress(call.Lhs, uses));
                         explicitMemoryWrite = true;
                     }
-                    break;
 
-                case GimpleExpressionStatement expressionStatement:
-                    expressions.Add(RewriteValue(expressionStatement.Expression, uses));
+                    expressions.Add(RewriteValue(call.Function, uses));
+                    foreach (var argument in call.Arguments)
+                        expressions.Add(RewriteValue(argument, uses));
+
+                    flags |= GimpleStatementFlags.ReadsMemory | GimpleStatementFlags.WritesMemory | GimpleStatementFlags.ContainsCall;
                     break;
 
                 case GimpleAsmStatement asmStatement:
@@ -1460,11 +1755,12 @@ namespace Cnidaria.C
                             expressions.Add(RewriteValue(input.Value, uses));
                     }
 
-                    flags |= SsaInstructionFlags.ReadsMemory | SsaInstructionFlags.WritesMemory | SsaInstructionFlags.ContainsCall;
+                    flags |= GimpleStatementFlags.ReadsMemory | GimpleStatementFlags.WritesMemory | GimpleStatementFlags.ContainsCall;
                     break;
 
-                case GimpleConditionalGotoStatement conditional:
-                    expressions.Add(RewriteValue(conditional.Condition, uses));
+                case GimpleCondStatement conditional:
+                    expressions.Add(RewriteValue(conditional.Lhs, uses));
+                    expressions.Add(RewriteValue(conditional.Rhs, uses));
                     break;
 
                 case GimpleSwitchStatement switchStatement:
@@ -1479,38 +1775,38 @@ namespace Cnidaria.C
             foreach (var expression in expressions)
             {
                 if (expression.ReadsMemory)
-                    flags |= SsaInstructionFlags.ReadsMemory;
+                    flags |= GimpleStatementFlags.ReadsMemory;
                 if (expression.WritesMemory)
-                    flags |= SsaInstructionFlags.WritesMemory;
+                    flags |= GimpleStatementFlags.WritesMemory;
                 if (expression.ContainsCall)
-                    flags |= SsaInstructionFlags.ContainsCall;
+                    flags |= GimpleStatementFlags.ContainsCall;
             }
 
-            if (explicitMemoryWrite)
-                flags |= SsaInstructionFlags.WritesMemory;
+            if (explicitMemoryWrite || GimpleMemoryEffects.HasOrderedAccess(statement))
+                flags |= GimpleStatementFlags.WritesMemory;
 
-            SsaName? memoryInput = null;
-            if (_memoryVariable is not null && (flags & (SsaInstructionFlags.ReadsMemory | SsaInstructionFlags.WritesMemory)) != 0)
+            GimpleName? memoryInput = null;
+            if (_memoryVariable is not null && (flags & (GimpleStatementFlags.ReadsMemory | GimpleStatementFlags.WritesMemory)) != 0)
             {
                 memoryInput = Peek(_memoryVariable);
-                var memoryUse = new SsaUse(memoryInput, SsaUseKind.Memory, block, statement, value: null);
+                var memoryUse = new GimpleUse(memoryInput, GimpleUseKind.Memory, block, statement, value: null);
                 uses.Add(memoryUse);
                 _uses.Add(memoryUse);
             }
 
             switch (statement)
             {
-                case GimpleAssignmentStatement assignment when TryGetVariable(assignment.Target, out var targetVariable):
+                case GimpleAssignStatement assign when TryGetVariable(assign.Lhs, out var targetVariable):
                     {
-                        var definition = PushDefinition(targetVariable, SsaDefinitionKind.Statement, block, statement, assignment.Target, parameter: null);
+                        var definition = PushDefinition(targetVariable, GimpleDefinitionKind.Statement, block, statement, assign.Lhs, parameter: null);
                         definitions.Add(definition);
                         pushed.Add(targetVariable);
                     }
                     break;
 
-                case GimpleZeroInitializeStatement zeroInitialize when TryGetVariable(zeroInitialize.Target, out var targetVariable):
+                case GimpleCallStatement call when call.Lhs is not null && TryGetVariable(call.Lhs, out var targetVariable):
                     {
-                        var definition = PushDefinition(targetVariable, SsaDefinitionKind.Statement, block, statement, zeroInitialize.Target, parameter: null);
+                        var definition = PushDefinition(targetVariable, GimpleDefinitionKind.Statement, block, statement, call.Lhs, parameter: null);
                         definitions.Add(definition);
                         pushed.Add(targetVariable);
                     }
@@ -1523,7 +1819,7 @@ namespace Cnidaria.C
                             InlineAsmConstraints.PreferredStorage(output.Constraint, output.Target.Type) != InlineAsmOperandStorage.Memory &&
                             TryGetVariable(output.Target, out var outputVariable))
                         {
-                            var definition = PushDefinition(outputVariable, SsaDefinitionKind.Statement, block, statement, output.Target, parameter: null);
+                            var definition = PushDefinition(outputVariable, GimpleDefinitionKind.Statement, block, statement, output.Target, parameter: null);
                             definitions.Add(definition);
                             pushed.Add(outputVariable);
                         }
@@ -1531,22 +1827,40 @@ namespace Cnidaria.C
                     break;
             }
 
-            SsaName? memoryOutput = null;
-            if (_memoryVariable is not null && (flags & SsaInstructionFlags.WritesMemory) != 0)
+            GimpleName? memoryOutput = null;
+            if (_memoryVariable is not null && (flags & GimpleStatementFlags.WritesMemory) != 0)
             {
-                var memoryDefinition = PushDefinition(_memoryVariable, SsaDefinitionKind.MemoryStatement, block, statement, target: null, parameter: null);
+                var memoryDefinition = PushDefinition(_memoryVariable, GimpleDefinitionKind.MemoryStatement, block, statement, target: null, parameter: null);
                 memoryOutput = memoryDefinition.Name;
                 definitions.Add(memoryDefinition);
                 pushed.Add(_memoryVariable);
             }
 
-            var instruction = new SsaInstruction(
+            var expressionArray = expressions.ToImmutable();
+            var definitionArray = definitions.ToImmutable();
+            var useArray = uses.ToImmutable();
+            var gimpleStatement = GimpleNameMaterializer.MaterializeStatement(statement, expressionArray, definitionArray);
+
+            foreach (var definition in definitionArray)
+            {
+                var target = definition.Name.Variable.Kind != GimpleVariableKind.Memory &&
+                    gimpleStatement is GimpleAssignStatement or GimpleCallStatement
+                        ? definition.Name
+                        : null;
+                definition.BindStatement(gimpleStatement, target);
+            }
+
+            foreach (var use in useArray)
+                use.BindStatement(gimpleStatement);
+
+            var instruction = new GimpleStatementAnnotations(
                 _instructionOrdinal++,
                 block,
+                gimpleStatement,
                 statement,
-                expressions.ToImmutable(),
-                uses.ToImmutable(),
-                definitions.ToImmutable(),
+                expressionArray,
+                useArray,
+                definitionArray,
                 memoryInput,
                 memoryOutput,
                 flags);
@@ -1556,24 +1870,24 @@ namespace Cnidaria.C
             return instruction;
         }
 
-        private SsaExpression RewriteValue(GimpleValue value, ImmutableArray<SsaUse>.Builder uses)
+        private GimpleOperandInfo RewriteValue(GimpleValue value, ImmutableArray<GimpleUse>.Builder uses)
         {
             switch (value)
             {
                 case GimpleSymbolValue symbolValue when TryGetVariable(symbolValue, out var variable):
-                    return CreateNameExpression(symbolValue, variable, uses, SsaUseKind.Value);
+                    return CreateNameExpression(symbolValue, variable, uses, GimpleUseKind.Value);
 
                 case GimpleTemporaryValue temporary when TryGetVariable(temporary, out var variable):
-                    return CreateNameExpression(temporary, variable, uses, SsaUseKind.Value);
+                    return CreateNameExpression(temporary, variable, uses, GimpleUseKind.Value);
 
                 case GimpleSymbolValue symbolValue:
-                    return new SsaExpression(symbolValue, name: null, ImmutableArray<SsaExpression>.Empty, IsMemoryBackedDirectRead(symbolValue), writesMemory: false, containsCall: false);
+                    return new GimpleOperandInfo(symbolValue, name: null, ImmutableArray<GimpleOperandInfo>.Empty, IsMemoryBackedDirectRead(symbolValue), writesMemory: false, containsCall: false);
 
                 case GimpleTemporaryValue temporary:
-                    return new SsaExpression(temporary, name: null, ImmutableArray<SsaExpression>.Empty, readsMemory: true, writesMemory: false, containsCall: false);
+                    return new GimpleOperandInfo(temporary, name: null, ImmutableArray<GimpleOperandInfo>.Empty, readsMemory: true, writesMemory: false, containsCall: false);
 
                 case GimpleConstantValue constant:
-                    return new SsaExpression(constant, name: null, ImmutableArray<SsaExpression>.Empty, readsMemory: false, writesMemory: false, containsCall: false);
+                    return new GimpleOperandInfo(constant, name: null, ImmutableArray<GimpleOperandInfo>.Empty, readsMemory: false, writesMemory: false, containsCall: false);
 
                 case GimpleUnaryExpression unary:
                     return CreateCompositeExpression(unary, RewriteValue(unary.Operand, uses));
@@ -1601,89 +1915,79 @@ namespace Cnidaria.C
                 case GimpleMemberAccessExpression memberAccess:
                     return CreateCompositeExpression(memberAccess, RewriteValue(memberAccess.Expression, uses), readsMemoryOverride: true);
 
-                case GimpleCallExpression call:
-                    {
-                        var children = ImmutableArray.CreateBuilder<SsaExpression>();
-                        children.Add(RewriteValue(call.Callee, uses));
-                        foreach (var argument in call.Arguments)
-                            children.Add(RewriteValue(argument, uses));
-
-                        return CreateCompositeExpression(call, children.ToImmutable(), readsMemoryOverride: true, writesMemoryOverride: true, containsCallOverride: true, role: SsaExpressionRole.Value);
-                    }
-
                 default:
-                    return new SsaExpression(value, name: null, ImmutableArray<SsaExpression>.Empty, readsMemory: false, writesMemory: false, containsCall: false);
+                    return new GimpleOperandInfo(value, name: null, ImmutableArray<GimpleOperandInfo>.Empty, readsMemory: false, writesMemory: false, containsCall: false);
             }
         }
 
-        private SsaExpression RewritePlaceAddress(GimplePlace place, ImmutableArray<SsaUse>.Builder uses)
+        private GimpleOperandInfo RewritePlaceAddress(GimplePlace place, ImmutableArray<GimpleUse>.Builder uses)
         {
             switch (place)
             {
                 case GimpleSymbolValue symbolValue when TryGetVariable(symbolValue, out var variable):
-                    return CreateNameExpression(symbolValue, variable, uses, SsaUseKind.Address);
+                    return CreateNameExpression(symbolValue, variable, uses, GimpleUseKind.Address);
 
                 case GimpleTemporaryValue temporary when TryGetVariable(temporary, out var variable):
-                    return CreateNameExpression(temporary, variable, uses, SsaUseKind.Address);
+                    return CreateNameExpression(temporary, variable, uses, GimpleUseKind.Address);
 
                 case GimpleSymbolValue symbolValue:
-                    return new SsaExpression(symbolValue, name: null, ImmutableArray<SsaExpression>.Empty, readsMemory: false, writesMemory: false, containsCall: false, role: SsaExpressionRole.Address);
+                    return new GimpleOperandInfo(symbolValue, name: null, ImmutableArray<GimpleOperandInfo>.Empty, readsMemory: false, writesMemory: false, containsCall: false, role: GimpleOperandRole.Address);
 
                 case GimpleTemporaryValue temporary:
-                    return new SsaExpression(temporary, name: null, ImmutableArray<SsaExpression>.Empty, readsMemory: false, writesMemory: false, containsCall: false, role: SsaExpressionRole.Address);
+                    return new GimpleOperandInfo(temporary, name: null, ImmutableArray<GimpleOperandInfo>.Empty, readsMemory: false, writesMemory: false, containsCall: false, role: GimpleOperandRole.Address);
 
                 case GimpleIndirectExpression indirect:
-                    return CreateCompositeExpression(indirect, RewriteValue(indirect.Address, uses), role: SsaExpressionRole.Address);
+                    return CreateCompositeExpression(indirect, RewriteValue(indirect.Address, uses), role: GimpleOperandRole.Address);
 
                 case GimpleElementAccessExpression elementAccess:
                     return elementAccess.Index is null
-                        ? CreateCompositeExpression(elementAccess, RewriteAddressBase(elementAccess.Expression, uses), role: SsaExpressionRole.Address)
-                        : CreateCompositeExpression(elementAccess, RewriteAddressBase(elementAccess.Expression, uses), RewriteValue(elementAccess.Index, uses), role: SsaExpressionRole.Address);
+                        ? CreateCompositeExpression(elementAccess, RewriteAddressBase(elementAccess.Expression, uses), role: GimpleOperandRole.Address)
+                        : CreateCompositeExpression(elementAccess, RewriteAddressBase(elementAccess.Expression, uses), RewriteValue(elementAccess.Index, uses), role: GimpleOperandRole.Address);
 
                 case GimpleMemberAccessExpression memberAccess:
-                    if (memberAccess.OperatorToken.Kind == SyntaxKind.ArrowToken)
-                        return CreateCompositeExpression(memberAccess, RewriteValue(memberAccess.Expression, uses), role: SsaExpressionRole.Address);
+                    if (memberAccess.ThroughPointer)
+                        return CreateCompositeExpression(memberAccess, RewriteValue(memberAccess.Expression, uses), role: GimpleOperandRole.Address);
 
-                    return CreateCompositeExpression(memberAccess, RewriteAddressBase(memberAccess.Expression, uses), role: SsaExpressionRole.Address);
+                    return CreateCompositeExpression(memberAccess, RewriteAddressBase(memberAccess.Expression, uses), role: GimpleOperandRole.Address);
 
                 default:
                     return RewriteValue(place, uses);
             }
         }
 
-        private SsaExpression RewriteAddressBase(GimpleValue value, ImmutableArray<SsaUse>.Builder uses)
+        private GimpleOperandInfo RewriteAddressBase(GimpleValue value, ImmutableArray<GimpleUse>.Builder uses)
         {
-            return value is GimplePlace place
+            return value.Type.Type is not PointerType && value is GimplePlace place
                 ? RewritePlaceAddress(place, uses)
                 : RewriteValue(value, uses);
         }
 
-        private SsaExpression CreateNameExpression(GimpleValue original, SsaVariable variable, ImmutableArray<SsaUse>.Builder uses, SsaUseKind kind)
+        private GimpleOperandInfo CreateNameExpression(GimpleValue original, GimpleVariable variable, ImmutableArray<GimpleUse>.Builder uses, GimpleUseKind kind)
         {
             var name = Peek(variable);
-            var use = new SsaUse(name, kind, _currentBlock!, _currentStatement, original);
+            var use = new GimpleUse(name, kind, _currentBlock!, _currentStatement, original);
             uses.Add(use);
             _uses.Add(use);
-            var role = kind == SsaUseKind.Address ? SsaExpressionRole.Address : SsaExpressionRole.Value;
-            return new SsaExpression(original, name, ImmutableArray<SsaExpression>.Empty, readsMemory: false, writesMemory: false, containsCall: false, role);
+            var role = kind == GimpleUseKind.Address ? GimpleOperandRole.Address : GimpleOperandRole.Value;
+            return new GimpleOperandInfo(original, name, ImmutableArray<GimpleOperandInfo>.Empty, readsMemory: false, writesMemory: false, containsCall: false, role);
         }
 
-        private static SsaExpression CreateCompositeExpression(GimpleValue original, params SsaExpression[] children)
-            => CreateCompositeExpression(original, children.ToImmutableArray(), readsMemoryOverride: null, writesMemoryOverride: null, containsCallOverride: null, role: SsaExpressionRole.Value);
+        private static GimpleOperandInfo CreateCompositeExpression(GimpleValue original, params GimpleOperandInfo[] children)
+            => CreateCompositeExpression(original, children.ToImmutableArray(), readsMemoryOverride: null, writesMemoryOverride: null, containsCallOverride: null, role: GimpleOperandRole.Value);
 
-        private static SsaExpression CreateCompositeExpression(GimpleValue original, SsaExpression child, bool? readsMemoryOverride = null, SsaExpressionRole role = SsaExpressionRole.Value)
+        private static GimpleOperandInfo CreateCompositeExpression(GimpleValue original, GimpleOperandInfo child, bool? readsMemoryOverride = null, GimpleOperandRole role = GimpleOperandRole.Value)
             => CreateCompositeExpression(original, ImmutableArray.Create(child), readsMemoryOverride, writesMemoryOverride: null, containsCallOverride: null, role);
 
-        private static SsaExpression CreateCompositeExpression(GimpleValue original, SsaExpression left, SsaExpression right, bool? readsMemoryOverride = null, SsaExpressionRole role = SsaExpressionRole.Value)
+        private static GimpleOperandInfo CreateCompositeExpression(GimpleValue original, GimpleOperandInfo left, GimpleOperandInfo right, bool? readsMemoryOverride = null, GimpleOperandRole role = GimpleOperandRole.Value)
             => CreateCompositeExpression(original, ImmutableArray.Create(left, right), readsMemoryOverride, writesMemoryOverride: null, containsCallOverride: null, role);
 
-        private static SsaExpression CreateCompositeExpression(
+        private static GimpleOperandInfo CreateCompositeExpression(
             GimpleValue original,
-            ImmutableArray<SsaExpression> children,
+            ImmutableArray<GimpleOperandInfo> children,
             bool? readsMemoryOverride,
             bool? writesMemoryOverride,
             bool? containsCallOverride,
-            SsaExpressionRole role)
+            GimpleOperandRole role)
         {
             var readsMemory = children.Any(static child => child.ReadsMemory);
             var writesMemory = children.Any(static child => child.WritesMemory);
@@ -1696,7 +2000,7 @@ namespace Cnidaria.C
             if (containsCallOverride.HasValue)
                 containsCall = containsCallOverride.Value || containsCall;
 
-            return new SsaExpression(original, name: null, children, readsMemory, writesMemory, containsCall, role);
+            return new GimpleOperandInfo(original, name: null, children, readsMemory, writesMemory, containsCall, role);
         }
 
         private void AddPhiInputsToSuccessors(ControlFlowBlock block)
@@ -1711,9 +2015,9 @@ namespace Cnidaria.C
             }
         }
 
-        private SsaDefinition PushDefinition(
-            SsaVariable variable,
-            SsaDefinitionKind kind,
+        private GimpleDefinition PushDefinition(
+            GimpleVariable variable,
+            GimpleDefinitionKind kind,
             ControlFlowBlock? block,
             GimpleStatement? statement,
             GimplePlace? target,
@@ -1721,22 +2025,22 @@ namespace Cnidaria.C
         {
             var name = CreateName(variable, isUndefined: false);
             _stacks[variable].Push(name);
-            var definition = new SsaDefinition(name, kind, block, statement, target, parameter);
+            var definition = new GimpleDefinition(name, kind, block, statement, target, parameter);
             _definitions.Add(definition);
             return definition;
         }
 
-        private SsaName CreateName(SsaVariable variable, bool isUndefined)
+        private GimpleName CreateName(GimpleVariable variable, bool isUndefined)
         {
             var version = _nextVersions[variable];
             _nextVersions[variable] = version + 1;
-            return new SsaName(variable, version, isUndefined);
+            return new GimpleName(variable, version, isUndefined);
         }
 
-        private SsaName Peek(SsaVariable variable)
+        private GimpleName Peek(GimpleVariable variable)
             => _stacks[variable].Peek();
 
-        private bool TryGetVariable(GimpleValue value, out SsaVariable variable)
+        private bool TryGetVariable(GimpleValue value, out GimpleVariable variable)
         {
             if (TryCreateKey(value, out var key) && _variablesByKey.TryGetValue(key, out variable!))
                 return true;
@@ -1745,16 +2049,16 @@ namespace Cnidaria.C
             return false;
         }
 
-        private static bool TryCreateKey(GimpleValue value, out SsaVariableKey key)
+        private static bool TryCreateKey(GimpleValue value, out GimpleVariableKey key)
         {
             switch (value)
             {
                 case GimpleSymbolValue { Symbol: VariableSymbol or ParameterSymbol } symbolValue:
-                    key = SsaVariableKey.FromSymbol(symbolValue.Symbol);
+                    key = GimpleVariableKey.FromSymbol(symbolValue.Symbol);
                     return true;
 
                 case GimpleTemporaryValue temporary:
-                    key = SsaVariableKey.FromTemporary(temporary);
+                    key = GimpleVariableKey.FromTemporary(temporary);
                     return true;
 
                 default:
@@ -1773,70 +2077,14 @@ namespace Cnidaria.C
         private static bool IsMemoryBackedDirectRead(GimpleSymbolValue value)
             => value.Symbol is VariableSymbol or ParameterSymbol;
 
-        private static bool ExpressionWritesMemory(GimpleValue value)
-        {
-            switch (value)
-            {
-                case GimpleCallExpression:
-                    return true;
-
-                case GimpleUnaryExpression unary:
-                    return ExpressionWritesMemory(unary.Operand);
-
-                case GimpleBinaryExpression binary:
-                    return ExpressionWritesMemory(binary.Left) || ExpressionWritesMemory(binary.Right);
-
-                case GimpleConversionExpression conversion:
-                    return ExpressionWritesMemory(conversion.Operand);
-
-                case GimpleCastExpression cast:
-                    return ExpressionWritesMemory(cast.Operand);
-
-                case GimpleAddressOfExpression addressOf:
-                    return PlaceAddressWritesMemory(addressOf.Target);
-
-                case GimpleIndirectExpression indirect:
-                    return ExpressionWritesMemory(indirect.Address);
-
-                case GimpleElementAccessExpression elementAccess:
-                    return ExpressionWritesMemory(elementAccess.Expression) ||
-                           (elementAccess.Index is not null && ExpressionWritesMemory(elementAccess.Index));
-
-                case GimpleMemberAccessExpression memberAccess:
-                    return ExpressionWritesMemory(memberAccess.Expression);
-
-                default:
-                    return false;
-            }
-        }
-
-        private static bool PlaceAddressWritesMemory(GimplePlace place)
-        {
-            switch (place)
-            {
-                case GimpleIndirectExpression indirect:
-                    return ExpressionWritesMemory(indirect.Address);
-
-                case GimpleElementAccessExpression elementAccess:
-                    return ExpressionWritesMemory(elementAccess.Expression) ||
-                           (elementAccess.Index is not null && ExpressionWritesMemory(elementAccess.Index));
-
-                case GimpleMemberAccessExpression memberAccess:
-                    return ExpressionWritesMemory(memberAccess.Expression);
-
-                default:
-                    return false;
-            }
-        }
-
         private sealed class CandidateInfo
         {
-            public SsaVariableKey Key { get; }
+            public GimpleVariableKey Key { get; }
             public QualifiedType Type { get; set; }
             public string Name { get; }
             public StorageClass StorageClass { get; set; }
 
-            public CandidateInfo(SsaVariableKey key, QualifiedType type, string name, StorageClass storageClass)
+            public CandidateInfo(GimpleVariableKey key, QualifiedType type, string name, StorageClass storageClass)
             {
                 Key = key;
                 Type = type;
@@ -1847,14 +2095,14 @@ namespace Cnidaria.C
 
         private sealed class PhiBuilder
         {
-            private readonly Dictionary<ControlFlowBlock, SsaName> _inputs = new();
+            private readonly Dictionary<ControlFlowBlock, GimpleName> _inputs = new();
 
             public int Ordinal { get; }
             public ControlFlowBlock Block { get; }
-            public SsaVariable Variable { get; }
-            public SsaName? Result { get; set; }
+            public GimpleVariable Variable { get; }
+            public GimpleName? Result { get; set; }
 
-            public PhiBuilder(int ordinal, ControlFlowBlock block, SsaVariable variable)
+            public PhiBuilder(int ordinal, ControlFlowBlock block, GimpleVariable variable)
             {
                 if (ordinal < 0)
                     throw new ArgumentOutOfRangeException(nameof(ordinal));
@@ -1864,47 +2112,58 @@ namespace Cnidaria.C
                 Variable = variable ?? throw new ArgumentNullException(nameof(variable));
             }
 
-            public void SetInput(ControlFlowBlock predecessor, SsaName name)
+            public void SetInput(ControlFlowBlock predecessor, GimpleName name)
                 => _inputs[predecessor] = name;
 
-            public SsaPhi Build()
+            public GimplePhi Build(GimpleName undefinedName, List<GimpleProblem> problems)
             {
-                var operands = ImmutableArray.CreateBuilder<SsaPhiOperand>();
-                foreach (var predecessor in Block.UniquePredecessors)
+                var operands = ImmutableArray.CreateBuilder<GimplePhiOperand>(Block.Predecessors.Length);
+                foreach (var edge in Block.Predecessors)
                 {
-                    if (_inputs.TryGetValue(predecessor, out var value))
-                        operands.Add(new SsaPhiOperand(predecessor, value));
+                    if (!_inputs.TryGetValue(edge.Source, out var value))
+                    {
+                        value = undefinedName;
+                        if (edge.Source.IsReachable)
+                        {
+                            problems.Add(new GimpleProblem(
+                                GimpleProblemKind.MissingPhiInput,
+                                Block,
+                                $"Missing GIMPLE phi input for {Variable.Name} from {edge.Source}."));
+                        }
+                    }
+
+                    operands.Add(new GimplePhiOperand(edge, value));
                 }
 
-                return new SsaPhi(Ordinal, Block, Variable, Result!, operands.ToImmutable());
+                return new GimplePhi(Ordinal, Block, Variable, Result!, operands.ToImmutable());
             }
         }
     }
 
-    internal readonly struct SsaVariableKey : IEquatable<SsaVariableKey>
+    internal readonly struct GimpleVariableKey : IEquatable<GimpleVariableKey>
     {
-        public SsaVariableKind Kind { get; }
+        public GimpleVariableKind Kind { get; }
         public Symbol? Symbol { get; }
         public GimpleTemporaryValue? Temporary { get; }
 
-        private SsaVariableKey(SsaVariableKind kind, Symbol? symbol, GimpleTemporaryValue? temporary)
+        private GimpleVariableKey(GimpleVariableKind kind, Symbol? symbol, GimpleTemporaryValue? temporary)
         {
             Kind = kind;
             Symbol = symbol;
             Temporary = temporary;
         }
 
-        public static SsaVariableKey FromSymbol(Symbol symbol)
-            => new SsaVariableKey(SsaVariableKind.Symbol, symbol ?? throw new ArgumentNullException(nameof(symbol)), temporary: null);
+        public static GimpleVariableKey FromSymbol(Symbol symbol)
+            => new GimpleVariableKey(GimpleVariableKind.Symbol, symbol ?? throw new ArgumentNullException(nameof(symbol)), temporary: null);
 
-        public static SsaVariableKey FromTemporary(GimpleTemporaryValue temporary)
-            => new SsaVariableKey(SsaVariableKind.Temporary, symbol: null, temporary ?? throw new ArgumentNullException(nameof(temporary)));
+        public static GimpleVariableKey FromTemporary(GimpleTemporaryValue temporary)
+            => new GimpleVariableKey(GimpleVariableKind.Temporary, symbol: null, temporary ?? throw new ArgumentNullException(nameof(temporary)));
 
-        public bool Equals(SsaVariableKey other)
+        public bool Equals(GimpleVariableKey other)
             => Kind == other.Kind && ReferenceEquals(Symbol, other.Symbol) && ReferenceEquals(Temporary, other.Temporary);
 
         public override bool Equals(object? obj)
-            => obj is SsaVariableKey other && Equals(other);
+            => obj is GimpleVariableKey other && Equals(other);
 
         public override int GetHashCode()
         {
@@ -1917,5 +2176,4 @@ namespace Cnidaria.C
             }
         }
     }
-
 }

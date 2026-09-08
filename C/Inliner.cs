@@ -200,7 +200,7 @@ namespace Cnidaria.C
 
                 foreach (var site in EnumerateInlineSites(current))
                 {
-                    if (!TryResolveDirectCallee(site.Call.Callee, out var calleeSymbol))
+                    if (!TryResolveDirectCallee(site.Call.Function, out var calleeSymbol))
                         continue;
                     if (!definitions.TryGetValue(calleeSymbol, out var callee))
                         continue;
@@ -354,17 +354,8 @@ namespace Cnidaria.C
                 var statements = function.Blocks[blockIndex].Statements;
                 for (var statementIndex = 0; statementIndex < statements.Length; statementIndex++)
                 {
-                    var statement = statements[statementIndex];
-                    switch (statement)
-                    {
-                        case GimpleAssignmentStatement { Value: GimpleCallExpression call } assignment:
-                            yield return new InlineSite(blockIndex, statementIndex, statement, call, assignment.Target);
-                            break;
-
-                        case GimpleExpressionStatement { Expression: GimpleCallExpression call }:
-                            yield return new InlineSite(blockIndex, statementIndex, statement, call, resultTarget: null);
-                            break;
-                    }
+                    if (statements[statementIndex] is GimpleCallStatement call)
+                        yield return new InlineSite(blockIndex, statementIndex, call);
                 }
             }
         }
@@ -378,7 +369,7 @@ namespace Cnidaria.C
             {
                 foreach (var call in EnumerateCalls(function))
                 {
-                    if (!TryResolveDirectCallee(call.Callee, out var symbol) || !definitions.ContainsKey(symbol))
+                    if (!TryResolveDirectCallee(call.Function, out var symbol) || !definitions.ContainsKey(symbol))
                         continue;
 
                     var canonical = definitions[symbol].Symbol;
@@ -393,7 +384,7 @@ namespace Cnidaria.C
             return result;
         }
 
-        private static IEnumerable<GimpleCallExpression> EnumerateCalls(GimpleFunctionDefinition function)
+        private static IEnumerable<GimpleCallStatement> EnumerateCalls(GimpleFunctionDefinition function)
         {
             var cfg = ControlFlowFunction.Build(function);
             foreach (var block in cfg.RealBlocks)
@@ -403,140 +394,9 @@ namespace Cnidaria.C
 
                 foreach (var statement in block.Statements)
                 {
-                    foreach (var call in EnumerateCalls(statement))
+                    if (statement is GimpleCallStatement call)
                         yield return call;
                 }
-            }
-        }
-
-        private static IEnumerable<GimpleCallExpression> EnumerateCalls(GimpleStatement statement)
-        {
-            switch (statement)
-            {
-                case GimpleAssignmentStatement assignment:
-                    foreach (var call in EnumerateCalls(assignment.Target))
-                        yield return call;
-                    foreach (var call in EnumerateCalls(assignment.Value))
-                        yield return call;
-                    break;
-
-                case GimpleZeroInitializeStatement zeroInitialize:
-                    foreach (var call in EnumerateCalls(zeroInitialize.Target))
-                        yield return call;
-                    break;
-
-                case GimpleExpressionStatement expressionStatement:
-                    foreach (var call in EnumerateCalls(expressionStatement.Expression))
-                        yield return call;
-                    break;
-
-                case GimpleConditionalGotoStatement conditional:
-                    foreach (var call in EnumerateCalls(conditional.Condition))
-                        yield return call;
-                    break;
-
-                case GimpleSwitchStatement switchStatement:
-                    foreach (var call in EnumerateCalls(switchStatement.Expression))
-                        yield return call;
-                    break;
-
-                case GimpleReturnStatement returnStatement when returnStatement.Expression is not null:
-                    foreach (var call in EnumerateCalls(returnStatement.Expression))
-                        yield return call;
-                    break;
-
-                case GimpleAsmStatement asmStatement:
-                    foreach (var operand in asmStatement.Outputs)
-                    {
-                        if (operand.Target is not null)
-                        {
-                            foreach (var call in EnumerateCalls(operand.Target))
-                                yield return call;
-                        }
-                        if (operand.Value is not null)
-                        {
-                            foreach (var call in EnumerateCalls(operand.Value))
-                                yield return call;
-                        }
-                    }
-                    foreach (var operand in asmStatement.Inputs)
-                    {
-                        if (operand.Target is not null)
-                        {
-                            foreach (var call in EnumerateCalls(operand.Target))
-                                yield return call;
-                        }
-                        if (operand.Value is not null)
-                        {
-                            foreach (var call in EnumerateCalls(operand.Value))
-                                yield return call;
-                        }
-                    }
-                    break;
-            }
-        }
-
-        private static IEnumerable<GimpleCallExpression> EnumerateCalls(GimpleValue value)
-        {
-            switch (value)
-            {
-                case GimpleCallExpression call:
-                    yield return call;
-                    foreach (var nested in EnumerateCalls(call.Callee))
-                        yield return nested;
-                    foreach (var argument in call.Arguments)
-                    {
-                        foreach (var nested in EnumerateCalls(argument))
-                            yield return nested;
-                    }
-                    break;
-
-                case GimpleUnaryExpression unary:
-                    foreach (var call in EnumerateCalls(unary.Operand))
-                        yield return call;
-                    break;
-
-                case GimpleBinaryExpression binary:
-                    foreach (var call in EnumerateCalls(binary.Left))
-                        yield return call;
-                    foreach (var call in EnumerateCalls(binary.Right))
-                        yield return call;
-                    break;
-
-                case GimpleConversionExpression conversion:
-                    foreach (var call in EnumerateCalls(conversion.Operand))
-                        yield return call;
-                    break;
-
-                case GimpleCastExpression cast:
-                    foreach (var call in EnumerateCalls(cast.Operand))
-                        yield return call;
-                    break;
-
-                case GimpleAddressOfExpression addressOf:
-                    foreach (var call in EnumerateCalls(addressOf.Target))
-                        yield return call;
-                    break;
-
-                case GimpleIndirectExpression indirect:
-                    foreach (var call in EnumerateCalls(indirect.Address))
-                        yield return call;
-                    break;
-
-                case GimpleElementAccessExpression elementAccess:
-                    foreach (var call in EnumerateCalls(elementAccess.Expression))
-                        yield return call;
-                    if (elementAccess.Index is not null)
-                    {
-                        foreach (var call in EnumerateCalls(elementAccess.Index))
-                            yield return call;
-                    }
-                    break;
-
-                case GimpleMemberAccessExpression memberAccess:
-                    foreach (var call in EnumerateCalls(memberAccess.Expression))
-                        yield return call;
-                    break;
             }
         }
 
@@ -621,16 +481,36 @@ namespace Cnidaria.C
             {
                 GimpleDeclarationStatement => new NodeCost(0, 0),
                 GimpleNopStatement => new NodeCost(0, 0),
-                GimpleAssignmentStatement assignment => ValueCost(assignment.Target) + ValueCost(assignment.Value) + new NodeCost(1, 1),
-                GimpleZeroInitializeStatement zeroInitialize => ValueCost(zeroInitialize.Target) + new NodeCost(1, 2),
-                GimpleExpressionStatement expressionStatement => ValueCost(expressionStatement.Expression) + new NodeCost(1, 1),
+                GimpleAssignStatement assign => AssignCost(assign),
+                GimpleCallStatement call => CallCost(call),
                 GimpleGotoStatement => new NodeCost(0, 0),
-                GimpleConditionalGotoStatement conditional => ValueCost(conditional.Condition) + new NodeCost(1, 2),
+                GimpleCondStatement conditional => ValueCost(conditional.Lhs) + ValueCost(conditional.Rhs) + new NodeCost(1, 2),
                 GimpleSwitchStatement switchStatement => ValueCost(switchStatement.Expression) + new NodeCost(2, 3 + switchStatement.Cases.Length),
                 GimpleReturnStatement returnStatement => returnStatement.Expression is null ? new NodeCost(0, 0) : ValueCost(returnStatement.Expression),
                 GimpleAsmStatement asmStatement => new NodeCost(8, 16 + asmStatement.Inputs.Length + asmStatement.Outputs.Length),
                 _ => new NodeCost(1, 2),
             };
+        }
+
+        private static NodeCost AssignCost(GimpleAssignStatement assign)
+        {
+            var cost = ValueCost(assign.Lhs) + new NodeCost(1, assign.IsConstructor ? 2 : 1);
+            foreach (var operand in assign.Operands)
+                cost += ValueCost(operand);
+
+            return cost;
+        }
+
+        private static NodeCost CallCost(GimpleCallStatement call)
+        {
+            var cost = ValueCost(call.Function) + new NodeCost(6, 12);
+            if (call.Lhs is not null)
+                cost += ValueCost(call.Lhs);
+
+            foreach (var argument in call.Arguments)
+                cost += ValueCost(argument);
+
+            return cost;
         }
 
         private static NodeCost ValueCost(GimpleValue value)
@@ -652,9 +532,6 @@ namespace Cnidaria.C
                     (elementAccess.Index is null ? new NodeCost(0, 0) : ValueCost(elementAccess.Index)) +
                     new NodeCost(1, 2),
                 GimpleMemberAccessExpression memberAccess => ValueCost(memberAccess.Expression) + new NodeCost(1, 1),
-                GimpleCallExpression call =>
-                    ValueCost(call.Callee) +
-                    call.Arguments.Aggregate(new NodeCost(6, 12), static (cost, argument) => cost + ValueCost(argument)),
                 _ => new NodeCost(1, 1),
             };
         }
@@ -662,7 +539,7 @@ namespace Cnidaria.C
         private sealed class InlineCloner
         {
             private readonly GimpleFunctionDefinition _callee;
-            private readonly GimpleCallExpression _call;
+            private readonly GimpleCallStatement _call;
             private readonly GimplePlace? _resultTarget;
             private readonly GimpleLabel _continuationLabel;
             private readonly int _siteOrdinal;
@@ -677,7 +554,7 @@ namespace Cnidaria.C
 
             public InlineCloner(
                 GimpleFunctionDefinition callee,
-                GimpleCallExpression call,
+                GimpleCallStatement call,
                 GimplePlace? resultTarget,
                 GimpleLabel continuationLabel,
                 int siteOrdinal,
@@ -711,20 +588,12 @@ namespace Cnidaria.C
                     {
                         if (statement is GimpleReturnStatement returnStatement)
                         {
-                            if (returnStatement.Expression is not null)
+                            if (returnStatement.Expression is not null && _resultTarget is not null)
                             {
-                                var expression = CloneValue(returnStatement.Expression);
-                                if (_resultTarget is not null)
-                                {
-                                    statements.Add(new GimpleAssignmentStatement(
-                                        _resultTarget,
-                                        expression,
-                                        returnStatement.Syntax));
-                                }
-                                else
-                                {
-                                    statements.Add(new GimpleExpressionStatement(expression, returnStatement.Syntax));
-                                }
+                                statements.Add(GimpleAssignStatement.Single(
+                                    _resultTarget,
+                                    CloneValue(returnStatement.Expression),
+                                    returnStatement.Syntax));
                             }
 
                             statements.Add(new GimpleGotoStatement(_continuationLabel, returnStatement.Syntax));
@@ -834,7 +703,7 @@ namespace Cnidaria.C
                             variable.Type,
                             StorageClass.Auto,
                             syntax: parameter.DeclaringSyntax)));
-                    statements.Add(new GimpleAssignmentStatement(
+                    statements.Add(GimpleAssignStatement.Single(
                         new GimpleSymbolValue(variable, variable.Type, parameter.DeclaringSyntax),
                         _call.Arguments[i],
                         _call.Syntax));
@@ -846,12 +715,25 @@ namespace Cnidaria.C
                 return statement switch
                 {
                     GimpleDeclarationStatement declaration => new GimpleDeclarationStatement(CloneDeclaration(declaration.Declaration)),
-                    GimpleAssignmentStatement assignment => new GimpleAssignmentStatement(ClonePlace(assignment.Target), CloneValue(assignment.Value), assignment.Syntax),
-                    GimpleZeroInitializeStatement zeroInitialize => new GimpleZeroInitializeStatement(ClonePlace(zeroInitialize.Target), zeroInitialize.Syntax),
-                    GimpleExpressionStatement expressionStatement => new GimpleExpressionStatement(CloneValue(expressionStatement.Expression), expressionStatement.Syntax),
+                    GimpleAssignStatement assign => new GimpleAssignStatement(
+                        ClonePlace(assign.Lhs),
+                        assign.Subcode,
+                        assign.Operands.Select(CloneValue).ToImmutableArray(),
+                        assign.Syntax),
+                    GimpleCallStatement call => new GimpleCallStatement(
+                        call.Lhs is null ? null : ClonePlace(call.Lhs),
+                        CloneValue(call.Function),
+                        call.Arguments.Select(CloneValue).ToImmutableArray(),
+                        call.FunctionType,
+                        call.Type,
+                        call.Syntax,
+                        call.IsTailCall,
+                        call.IsNoReturn),
                     GimpleGotoStatement gotoStatement => new GimpleGotoStatement(CloneLabel(gotoStatement.Target), gotoStatement.Syntax),
-                    GimpleConditionalGotoStatement conditional => new GimpleConditionalGotoStatement(
-                        CloneValue(conditional.Condition),
+                    GimpleCondStatement conditional => new GimpleCondStatement(
+                        conditional.Code,
+                        CloneValue(conditional.Lhs),
+                        CloneValue(conditional.Rhs),
                         CloneLabel(conditional.WhenTrue),
                         CloneLabel(conditional.WhenFalse),
                         conditional.Syntax),
@@ -952,13 +834,13 @@ namespace Cnidaria.C
                     GimpleTemporaryValue temporary => MapTemporary(temporary),
                     GimpleConstantValue constant => new GimpleConstantValue(constant.Value, constant.Type, constant.Syntax),
                     GimpleUnaryExpression unary => new GimpleUnaryExpression(
-                        unary.OperatorToken,
+                        unary.Code,
                         CloneValue(unary.Operand),
                         unary.Type,
                         unary.Syntax),
                     GimpleBinaryExpression binary => new GimpleBinaryExpression(
                         CloneValue(binary.Left),
-                        binary.OperatorToken,
+                        binary.Code,
                         CloneValue(binary.Right),
                         binary.Type,
                         binary.Syntax),
@@ -986,17 +868,11 @@ namespace Cnidaria.C
                         elementAccess.Syntax),
                     GimpleMemberAccessExpression memberAccess => new GimpleMemberAccessExpression(
                         CloneValue(memberAccess.Expression),
-                        memberAccess.OperatorToken,
+                        memberAccess.ThroughPointer,
                         memberAccess.NameToken,
                         memberAccess.Field,
                         memberAccess.Type,
                         memberAccess.Syntax),
-                    GimpleCallExpression call => new GimpleCallExpression(
-                        CloneValue(call.Callee),
-                        call.Arguments.Select(CloneValue).ToImmutableArray(),
-                        call.FunctionType,
-                        call.Type,
-                        call.Syntax),
                     GimpleErrorValue error => new GimpleErrorValue(error.Syntax),
                     _ => throw new InvalidOperationException("Unsupported GIMPLE value kind: " + value.Kind),
                 };
@@ -1056,7 +932,7 @@ namespace Cnidaria.C
 
                     foreach (var call in EnumerateCalls(function))
                     {
-                        if (TryResolveDirectCallee(call.Callee, out var callee) &&
+                        if (TryResolveDirectCallee(call.Function, out var callee) &&
                             definitions.TryGetValue(callee, out var definition) &&
                             definition.Symbol is not null)
                         {
@@ -1220,22 +1096,15 @@ namespace Cnidaria.C
         {
             public int BlockIndex { get; }
             public int StatementIndex { get; }
-            public GimpleStatement Statement { get; }
-            public GimpleCallExpression Call { get; }
-            public GimplePlace? ResultTarget { get; }
+            public GimpleCallStatement Call { get; }
+            public GimpleStatement Statement => Call;
+            public GimplePlace? ResultTarget => Call.Lhs;
 
-            public InlineSite(
-                int blockIndex,
-                int statementIndex,
-                GimpleStatement statement,
-                GimpleCallExpression call,
-                GimplePlace? resultTarget)
+            public InlineSite(int blockIndex, int statementIndex, GimpleCallStatement call)
             {
                 BlockIndex = blockIndex;
                 StatementIndex = statementIndex;
-                Statement = statement;
                 Call = call;
-                ResultTarget = resultTarget;
             }
         }
 
