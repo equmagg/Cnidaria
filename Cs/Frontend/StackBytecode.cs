@@ -805,6 +805,9 @@ namespace Cnidaria.Cs
                     return true;
                 }
 
+                if (type is NamedTypeSymbol { TypeKind: TypeKind.Enum } enumType && enumType.EnumUnderlyingType is { } underlying)
+                    return TryGetElementSize(underlying, out size);
+
                 return false;
             }
             private int GetElementSizeOrThrow(TypeSymbol type)
@@ -3564,8 +3567,10 @@ namespace Cnidaria.Cs
             /// <summary>Allocates stack storage and writes initializer elements in order</summary>
             private void EmitStackAlloc(BoundStackAllocArrayCreationExpression sa, EmitMode mode)
             {
-                int size = GetElementSizeOrThrow(sa.ElementType);
-                if (sa.Count.ConstantValueOpt.HasValue && sa.Count.ConstantValueOpt.Value is int constantCount)
+                bool constantSize = TryGetElementSize(sa.ElementType, out int size);
+                TypeSymbol countType = sa.Count.Type ?? sa.ElementType;
+
+                if (constantSize && sa.Count.ConstantValueOpt.HasValue && sa.Count.ConstantValueOpt.Value is int constantCount)
                 {
                     long byteCount = unchecked((long)(uint)constantCount * size);
                     if (byteCount < uint.MaxValue)
@@ -3578,10 +3583,17 @@ namespace Cnidaria.Cs
                         _il.Emit(BytecodeOp.StackAlloc, operand0: size, pop: 1, push: 1);
                     }
                 }
-                else
+                else if (constantSize)
                 {
                     EmitExpression(sa.Count, EmitMode.Value);
                     _il.Emit(BytecodeOp.StackAlloc, operand0: size, pop: 1, push: 1);
+                }
+                else
+                {
+                    EmitExpression(sa.Count, EmitMode.Value);
+                    EmitRuntimeElementSize(sa.ElementType, countType);
+                    _il.Emit(BytecodeOp.Mul, pop: 2, push: 1);
+                    _il.Emit(BytecodeOp.StackAlloc, operand0: 1, pop: 1, push: 1);
                 }
 
                 int elemTok = _tokens.GetTypeToken(sa.ElementType);
@@ -3590,11 +3602,11 @@ namespace Cnidaria.Cs
                     var elems = sa.InitializerOpt.Elements;
                     for (int i = 0; i < elems.Length; i++)
                     {
-                        _il.Emit(BytecodeOp.Dup, pop: 1, push: 2); // ptr, ptr
-                        _il.Emit(BytecodeOp.Ldc_I4, operand0: i, pop: 0, push: 1); // ptr, ptr, i
-                        _il.Emit(BytecodeOp.PtrElemAddr, operand0: size, pop: 2, push: 1); // ptr, addr
-                        EmitExpression(elems[i], EmitMode.Value); // ptr, addr, val
-                        _il.Emit(BytecodeOp.Stobj, operand0: elemTok, pop: 2, push: 0); // ptr
+                        _il.Emit(BytecodeOp.Dup, pop: 1, push: 2);
+                        _il.Emit(BytecodeOp.Ldc_I4, operand0: i, pop: 0, push: 1);
+                        EmitPointerElementAddress(sa.ElementType, countType);
+                        EmitExpression(elems[i], EmitMode.Value);
+                        _il.Emit(BytecodeOp.Stobj, operand0: elemTok, pop: 2, push: 0);
                     }
                 }
 

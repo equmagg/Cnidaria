@@ -2594,7 +2594,49 @@ namespace Cnidaria.Cs
                     break;
             }
 
+            if (IsProvenTypeCheck(ins.Op, value, statements, operandType))
+            {
+                Push(stack, value);
+                return;
+            }
+
             PushImportedValue(stack, statements, Node(kind, pc, ins.Op, type: type, stackKind: stackKind, operands: One(value.Node), int32: ins.Operand0, runtimeType: operandType));
+        }
+
+        // The code generator turns a surviving cast into an inline walk of the type hierarchy, so an
+        // upcast off a known exact type - the receiver of a fresh allocation, say - is worth proving here
+        private bool IsProvenTypeCheck(
+            BytecodeOp op,
+            StackValue value,
+            List<GenTree> statements,
+            RuntimeType? targetType)
+        {
+            if (op is not (BytecodeOp.CastClass or BytecodeOp.Isinst) ||
+                targetType is null ||
+                targetType.IsValueType ||
+                targetType.Kind == RuntimeTypeKind.TypeParam ||
+                value.StackKind != GenStackKind.Ref)
+            {
+                return false;
+            }
+
+            DevirtualizationReceiverInfo info = GetDevirtualizationReceiverInfo(
+                value.Node,
+                statements,
+                statements.Count,
+                new HashSet<int>());
+
+            if (!info.IsExact ||
+                info.Type is null ||
+                info.Type.Kind == RuntimeTypeKind.TypeParam ||
+                !_rts.IsAssignableTo(info.Type, targetType))
+            {
+                return false;
+            }
+
+            // isinst yields null for a null operand, which is the operand itself, but only a non-null
+            // proof rules out a runtime type that the exact type does not describe
+            return op == BytecodeOp.CastClass || info.IsNonNull;
         }
 
         private void EmitBinary(List<StackValue> stack, List<GenTree> statements, int pc, Instruction ins)

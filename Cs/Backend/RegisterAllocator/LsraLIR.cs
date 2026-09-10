@@ -323,6 +323,7 @@ namespace Cnidaria.Cs
                 GenTreeLinearFlags.GcSafePoint,
                 sourceLowering.InternalGeneralRegisters,
                 sourceLowering.InternalFloatRegisters);
+            node.SafePointLiveRegisters = source?.SafePointLiveRegisters ?? 0;
             return Attach(
                 node,
                 id,

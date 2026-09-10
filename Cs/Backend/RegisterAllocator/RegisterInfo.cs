@@ -29,6 +29,7 @@ namespace Cnidaria.Cs
             MachineRegister.X3,
             MachineRegister.X2,
             MachineRegister.X1,
+            MachineRegister.X5,
             MachineRegister.X8,
             MachineRegister.X9,
             MachineRegister.X7,
@@ -45,6 +46,7 @@ namespace Cnidaria.Cs
             MachineRegister.X4,
             MachineRegister.X2,
             MachineRegister.X1,
+            MachineRegister.X7,
             MachineRegister.X9,
             MachineRegister.X11,
             MachineRegister.X12,
@@ -203,14 +205,11 @@ namespace Cnidaria.Cs
                 return register is MachineRegister.Esp or MachineRegister.Ebp;
             if (target.Architecture == TargetArchitectureKind.X86_64)
             {
-                if (register is MachineRegister.X10 or MachineRegister.X15)
-                    return true;
-                // r10/r11 are the fixed code-generator scratch pair on x64: address computations,
-                // memory to memory moves and the runtime type checks use them without asking the
-                // register allocator, so they must never hold an allocated value.
-                return IsWindowsX64(target)
-                    ? register is MachineRegister.X5 or MachineRegister.X6
-                    : register is MachineRegister.X7 or MachineRegister.X8;
+                // Only the register that resolves parallel copies stays back. It stages the memory to
+                // memory moves an edge can require, and those sit between nodes, where there is no node
+                // to hang an internal register on and any allocatable register may already be live
+                return register is MachineRegister.X10 or MachineRegister.X15 ||
+                    register == ParallelCopyScratch(target, RegisterClass.General);
             }
             return MachineRegisters.IsReserved(register);
         }
@@ -415,6 +414,25 @@ namespace Cnidaria.Cs
             ValidateTarget(target);
             return target.IsX86 ? MachineRegister.Invalid : MachineRegisters.ReturnAddress;
         }
+
+        // The code generator still needs a couple of registers of its own for the sequences it expands
+        // inline - address arithmetic, block moves, the runtime type checks. Rather than holding them
+        // back from every method, the nodes that expand into those sequences report the pair as killed,
+        // so the allocator keeps them free exactly where they are needed and uses them everywhere else
+        public static ImmutableArray<MachineRegister> CodegenScratchRegisters(TargetInfo target)
+        {
+            ValidateTarget(target);
+            if (target.Architecture == TargetArchitectureKind.X86_64)
+            {
+                return IsWindowsX64(target)
+                    ? ImmutableArray.Create(MachineRegister.X6, MachineRegister.X5)
+                    : ImmutableArray.Create(MachineRegister.X8, MachineRegister.X7);
+            }
+            return ImmutableArray<MachineRegister>.Empty;
+        }
+
+        public static ulong CodegenScratchMask(TargetInfo target)
+            => MachineRegisters.MaskOf(CodegenScratchRegisters(target));
 
         public static MachineRegister ParallelCopyScratch(TargetInfo target, RegisterClass registerClass)
         {

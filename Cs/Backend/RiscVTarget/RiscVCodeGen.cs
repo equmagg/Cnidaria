@@ -4081,28 +4081,34 @@ namespace Cnidaria.Cs
                     {
                         GcPollStub stub = _gcPollStubs[i];
                         _owner.DefineLabel(stub.SlowLabel);
-                        int saveAreaSize = EmitSaveCallerSavedRegistersForGcPoll();
+                        var saveLocations = BuildGcPollSaveLocations(stub.Node, out int saveAreaSize);
+                        EmitSaveCallerSavedRegistersForGcPoll(saveLocations, saveAreaSize);
                         SafePointDraft safePoint = PrepareSafePoint(stub.Node);
                         PublishGcTransition(safePoint);
                         MarkEhGcPollCallSite(stub.Node);
                         _owner.EmitPcrelTransfer(_owner.ResolveExternalSymbol(RiscVRuntime.GcPollSymbol), link: true);
                         _owner.DefineLabel(safePoint.ReturnLabel);
-                        EmitRestoreCallerSavedRegistersForGcPoll(saveAreaSize);
+                        EmitRestoreCallerSavedRegistersForGcPoll(saveLocations, saveAreaSize);
                         ReloadGcRegisterRoots(stub.Node);
                         _owner.EmitPcrelTransfer(stub.ContinuationLabel, link: false);
                     }
                     _owner.DefineLabel(endLabel);
                 }
 
-                private int EmitSaveCallerSavedRegistersForGcPoll()
+                // The hot path is promised its caller-saved registers survive, so the stub preserves the
+                // ones the allocator left a live value in across the poll
+                private List<(MachineRegister Register, int Offset, int Size)> BuildGcPollSaveLocations(
+                    GenTree node,
+                    out int saveAreaSize)
                 {
+                    ulong live = node.SafePointLiveRegisters;
                     ImmutableArray<MachineRegister> registers = RegisterInfo.CallerSavedScalarRegisters(Target);
                     int offset = checked(RegisterInfo.MinimumOutgoingArgumentSlots(Target) * Target.PointerSize);
                     var locations = new List<(MachineRegister Register, int Offset, int Size)>();
                     for (int i = 0; i < registers.Length; i++)
                     {
                         MachineRegister register = registers[i];
-                        if (RegisterInfo.IsReserved(Target, register))
+                        if (RegisterInfo.IsReserved(Target, register) || (live & MachineRegisters.MaskOf(register)) == 0)
                             continue;
                         int size = RegisterInfo.RegisterSaveSize(Target, register);
                         int alignment = RegisterInfo.RegisterSaveAlignment(Target, register);
@@ -4111,7 +4117,16 @@ namespace Cnidaria.Cs
                         offset = checked(offset + size);
                     }
 
-                    int saveAreaSize = AlignUp(offset, Math.Max(Target.PointerSize, Target.CallFrameAlignment));
+                    saveAreaSize = locations.Count == 0
+                        ? 0
+                        : AlignUp(offset, Math.Max(Target.PointerSize, Target.CallFrameAlignment));
+                    return locations;
+                }
+
+                private void EmitSaveCallerSavedRegistersForGcPoll(
+                    List<(MachineRegister Register, int Offset, int Size)> locations,
+                    int saveAreaSize)
+                {
                     if (saveAreaSize != 0)
                         _owner.EmitAddImmediate(RVRegister.X2, RVRegister.X2, -saveAreaSize);
                     for (int i = 0; i < locations.Count; i++)
@@ -4119,25 +4134,12 @@ namespace Cnidaria.Cs
                         var location = locations[i];
                         EmitMemoryStore(location.Register, RVRegister.X2, location.Offset, location.Size);
                     }
-                    return saveAreaSize;
                 }
 
-                private void EmitRestoreCallerSavedRegistersForGcPoll(int saveAreaSize)
+                private void EmitRestoreCallerSavedRegistersForGcPoll(
+                    List<(MachineRegister Register, int Offset, int Size)> locations,
+                    int saveAreaSize)
                 {
-                    ImmutableArray<MachineRegister> registers = RegisterInfo.CallerSavedScalarRegisters(Target);
-                    int offset = checked(RegisterInfo.MinimumOutgoingArgumentSlots(Target) * Target.PointerSize);
-                    var locations = new List<(MachineRegister Register, int Offset, int Size)>();
-                    for (int i = 0; i < registers.Length; i++)
-                    {
-                        MachineRegister register = registers[i];
-                        if (RegisterInfo.IsReserved(Target, register))
-                            continue;
-                        int size = RegisterInfo.RegisterSaveSize(Target, register);
-                        int alignment = RegisterInfo.RegisterSaveAlignment(Target, register);
-                        offset = AlignUp(offset, alignment);
-                        locations.Add((register, offset, size));
-                        offset = checked(offset + size);
-                    }
                     for (int i = locations.Count - 1; i >= 0; i--)
                     {
                         var location = locations[i];

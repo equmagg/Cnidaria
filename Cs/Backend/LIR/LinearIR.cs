@@ -184,8 +184,11 @@ namespace Cnidaria.Cs
         public bool Writes => (Flags & LinearMemoryAccessFlags.Write) != 0;
         public bool IsAddressProducer => (Flags & LinearMemoryAccessFlags.Address) != 0;
         public bool IsBlockCopy => (Flags & LinearMemoryAccessFlags.BlockCopy) != 0;
-        public bool HasAddressOperand(int operandIndex) => AddressOperandIndex == operandIndex || IndexOperandIndex == operandIndex;
-        public bool HasValueOperand(int operandIndex) => ValueOperandIndex == operandIndex;
+        // None comes from default, where the operand indices are zero rather than the -1 the
+        // constructor uses for absent, so a node with no memory access would claim operand zero
+        public bool HasAddressOperand(int operandIndex)
+            => !IsNone && (AddressOperandIndex == operandIndex || IndexOperandIndex == operandIndex);
+        public bool HasValueOperand(int operandIndex) => !IsNone && ValueOperandIndex == operandIndex;
 
         public override string ToString()
         {
@@ -624,7 +627,8 @@ namespace Cnidaria.Cs
 
             if (source.Kind == GenTreeKind.Binary)
             {
-                if (target.IsRiscV &&
+                // Neither target has an instruction for a floating remainder, so it becomes a call
+                if ((target.IsRiscV || target.IsX86) &&
                     source.SourceOp == BytecodeOp.Rem &&
                     source.StackKind is GenStackKind.R4 or GenStackKind.R8)
                 {
@@ -747,6 +751,15 @@ namespace Cnidaria.Cs
             if (_target.IsX86 && IsIntegerDivRem(source, result, _target))
                 count++;
 
+            if (_target.IsX86 && (IsCheckedIntegerBinary(source) || IsCheckedIntegerConversion(source)))
+                count++;
+
+            // The field and indirection expansions can need an address register beyond what the value
+            // itself takes. Asking for it here is what lets them stay out of UsesX86CodegenScratch, so
+            // the allocator can keep using the scratch registers across them
+            if (_target.IsX86 && IsX86AddressScratchNode(source))
+                count++;
+
             if ((memoryAccess.Flags & LinearMemoryAccessFlags.RequiresWriteBarrier) != 0)
                 count++;
 
@@ -755,6 +768,57 @@ namespace Cnidaria.Cs
 
             return (byte)count;
         }
+
+        // Node kinds whose x86 expansion needs registers of its own beyond the operands and the result.
+        // The allocator keeps the code generator scratch pair free across them and is free to use it
+        // anywhere else, which is why the pair is not reserved for the whole method
+        private static bool IsX86AddressScratchNode(GenTree source)
+            => source.Kind is GenTreeKind.Field or GenTreeKind.FieldAddr or
+                GenTreeKind.StaticField or GenTreeKind.StaticFieldAddr or GenTreeKind.StoreStaticField or
+                GenTreeKind.StoreField or GenTreeKind.LoadIndirect or GenTreeKind.StoreIndirect;
+
+        internal static bool UsesX86CodegenScratch(GenTree source, TargetInfo target)
+        {
+            if (!target.IsX86)
+                return false;
+
+            switch (source.Kind)
+            {
+                case GenTreeKind.VirtualCall:
+                case GenTreeKind.ClassInit:
+                case GenTreeKind.CastClass:
+                case GenTreeKind.IsInst:
+                case GenTreeKind.UnboxAny:
+                case GenTreeKind.NewDelegate:
+                case GenTreeKind.DelegateInvoke:
+                case GenTreeKind.DelegateCombine:
+                case GenTreeKind.DelegateRemove:
+                case GenTreeKind.ArrayElement:
+                case GenTreeKind.ArrayElementAddr:
+                case GenTreeKind.StoreArrayElement:
+                case GenTreeKind.ArrayDataRef:
+                case GenTreeKind.Box:
+                case GenTreeKind.Return:
+                    return true;
+                case GenTreeKind.Copy:
+                case GenTreeKind.Reload:
+                case GenTreeKind.Spill:
+                    return false;
+                default:
+                    return false;
+            }
+        }
+
+        internal static bool IsCheckedIntegerBinary(GenTree source)
+            => source.Kind == GenTreeKind.Binary &&
+               source.SourceOp is BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un or
+                   BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un or
+                   BytecodeOp.Mul_Ovf or BytecodeOp.Mul_Ovf_Un;
+
+        internal static bool IsCheckedIntegerConversion(GenTree source)
+            => source.Kind == GenTreeKind.Conv &&
+               (source.ConvFlags & NumericConvFlags.Checked) != 0 &&
+               source.ConvKind is not (NumericConvKind.R4 or NumericConvKind.R8 or NumericConvKind.Bool);
 
         private static bool IsIntegerDivRem(GenTree source, GenTree? result, TargetInfo target)
         {

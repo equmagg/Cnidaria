@@ -81,7 +81,7 @@ namespace Cnidaria.Cs
                 {
                     AddRegisterKillMask(result, node, usePosition, MachineRegisters.MaskOf(RegisterInfo.CallerSavedScalarRegisters(target)));
                 }
-                else if (X86IntegerDivRem(node, target))
+                else if (X86IntegerDivRem(node, target) || X86UnsignedCheckedMultiply(node, target))
                 {
                     AddRegisterKillMask(
                         result,
@@ -89,6 +89,13 @@ namespace Cnidaria.Cs
                         usePosition,
                         MachineRegisters.MaskOf(RegisterInfo.AccumulatorRegister(target)) |
                         MachineRegisters.MaskOf(RegisterInfo.DataRegister(target)));
+                }
+
+                if (GenTreeLinearLoweringClassifier.UsesX86CodegenScratch(node, target))
+                {
+                    ulong scratch = RegisterInfo.CodegenScratchMask(target);
+                    if (scratch != 0)
+                        AddRegisterKillMask(result, node, usePosition, scratch);
                 }
 
             }
@@ -459,7 +466,7 @@ namespace Cnidaria.Cs
             if (operandIndex == 1 && node.SourceOp is BytecodeOp.Shl or BytecodeOp.Shr or BytecodeOp.Shr_Un)
                 return RegisterInfo.CountRegister(target);
 
-            if (operandIndex == 0 && X86IntegerDivRem(node, target))
+            if (operandIndex == 0 && (X86IntegerDivRem(node, target) || X86UnsignedCheckedMultiply(node, target)))
                 return RegisterInfo.AccumulatorRegister(target);
 
             return MachineRegister.Invalid;
@@ -471,16 +478,33 @@ namespace Cnidaria.Cs
             int operandIndex,
             RegisterClass registerClass)
         {
+            if (registerClass != RegisterClass.General)
+                return 0;
+
+            ulong mask = X86CodegenScratchFreeMask(target, node, registerClass);
+
             if (target.Architecture != TargetArchitectureKind.I386 ||
-                registerClass != RegisterClass.General ||
                 !node.LinearMemoryAccess.Writes ||
                 !node.LinearMemoryAccess.HasValueOperand(operandIndex) ||
                 node.LinearMemoryAccess.Size != 1)
             {
-                return 0;
+                return mask;
             }
 
-            return RegisterInfo.ByteAddressableRegisterMask(target);
+            ulong byteAddressable = RegisterInfo.ByteAddressableRegisterMask(target);
+            return mask == 0 ? byteAddressable : mask & byteAddressable;
+        }
+
+        private static ulong X86CodegenScratchFreeMask(TargetInfo target, GenTree node, RegisterClass registerClass)
+        {
+            if (registerClass != RegisterClass.General || !GenTreeLinearLoweringClassifier.UsesX86CodegenScratch(node, target))
+                return 0;
+
+            ulong scratch = RegisterInfo.CodegenScratchMask(target);
+            if (scratch == 0)
+                return 0;
+
+            return MachineRegisters.DefaultMaskForClass(RegisterClass.General) & ~scratch;
         }
 
         private static MachineRegister X86FixedDefinitionRegister(
@@ -501,8 +525,25 @@ namespace Cnidaria.Cs
             GenTree node,
             RegisterClass registerClass)
         {
+            if (registerClass != RegisterClass.General)
+                return 0;
+
+            // The count occupies the count register across the shift, so the result cannot be given the
+            // same one. Saying so here leaves the allocator free everywhere else, where reserving the
+            // register outright or repairing the collision in the code generator would not
+            ulong scratchFree = X86CodegenScratchFreeMask(target, node, registerClass);
+
+            if (X86ShiftNeedsCountRegister(target, node))
+            {
+                ulong shiftMask = MachineRegisters.DefaultMaskForClass(RegisterClass.General) &
+                    ~MachineRegisters.MaskOf(RegisterInfo.CountRegister(target));
+                return scratchFree == 0 ? shiftMask : shiftMask & scratchFree;
+            }
+
+            if (scratchFree != 0)
+                return scratchFree;
+
             if (target.Architecture != TargetArchitectureKind.I386 ||
-                registerClass != RegisterClass.General ||
                 node.Kind != GenTreeKind.Binary ||
                 node.SourceOp is not (BytecodeOp.Ceq or BytecodeOp.Cgt or BytecodeOp.Cgt_Un or BytecodeOp.Clt or BytecodeOp.Clt_Un))
             {
@@ -510,6 +551,34 @@ namespace Cnidaria.Cs
             }
 
             return RegisterInfo.ByteAddressableRegisterMask(target);
+        }
+
+        private static bool X86ShiftNeedsCountRegister(TargetInfo target, GenTree node)
+        {
+            if (!target.IsX86 ||
+                node.Kind != GenTreeKind.Binary ||
+                node.SourceOp is not (BytecodeOp.Shl or BytecodeOp.Shr or BytecodeOp.Shr_Un))
+            {
+                return false;
+            }
+
+            for (int u = 0; u < node.RegisterUses.Length; u++)
+            {
+                if (GetOperandIndexForRegisterUse(node, u) == 1)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool X86UnsignedCheckedMultiply(GenTree node, TargetInfo target)
+        {
+            if (!target.IsX86 || node.Kind != GenTreeKind.Binary || node.SourceOp != BytecodeOp.Mul_Ovf_Un)
+                return false;
+
+            if (target.Architecture == TargetArchitectureKind.I386 && node.StackKind == GenStackKind.I8)
+                return false;
+            return node.StackKind is not (GenStackKind.R4 or GenStackKind.R8);
         }
 
         private static bool X86IntegerDivRem(GenTree node, TargetInfo target)

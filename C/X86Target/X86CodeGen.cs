@@ -817,14 +817,52 @@ namespace Cnidaria.C
                 var baseFrameSize = _allocation.Frame.FrameSize;
                 if (_sysVX64RegisterSaveAreaOffset >= 0)
                     baseFrameSize = checked(_sysVX64RegisterSaveAreaOffset + SysVX64RegisterSaveAreaSize);
+                else if (_savedVectorRegisters.Count == 0)
+                {
+                    // Callee-saved general registers are pushed here rather than stored into their frame
+                    // slots, so with no vector register to save the whole area is dead space
+                    baseFrameSize = Math.Min(baseFrameSize, _allocation.Frame.SavedRegisterAreaOffset);
+                }
 
-                var frameSize = AlignUp(baseFrameSize, Math.Max(1, _owner._allocationOptions.StackAlignment));
-                if (_owner._machineTarget.Is64Bit)
+                // The 16-byte stack alignment the ABI asks for is only observable at a call, and nothing
+                // else in this frame needs it, so a leaf keeps whatever it actually uses
+                var alignment = IsAlignmentFreeLeaf() ? _wordSize : Math.Max(1, _owner._allocationOptions.StackAlignment);
+                var frameSize = AlignUp(baseFrameSize, alignment);
+                if (_owner._machineTarget.Is64Bit && alignment >= 16)
                 {
                     while (PositiveModulo(8 - _savedGeneralRegisters.Count * _wordSize - frameSize, 16) != 0)
                         frameSize += 8;
                 }
                 return frameSize;
+            }
+
+            private bool IsAlignmentFreeLeaf()
+            {
+                if (_sysVX64RegisterSaveAreaOffset >= 0 ||
+                    _savedVectorRegisters.Count != 0 ||
+                    _allocation.Frame.ParallelCopyTempSize != 0 ||
+                    _allocation.Frame.FloatingImmediateTempSize != 0 ||
+                    _allocation.Frame.HasVarArgsPointer)
+                {
+                    return false;
+                }
+
+                foreach (var slot in _function.StackSlots)
+                {
+                    if (slot.Alignment > _wordSize)
+                        return false;
+                }
+
+                foreach (var block in _function.Blocks)
+                {
+                    foreach (var instruction in block.Instructions)
+                    {
+                        if (instruction.Kind is LirInstructionKind.Call or LirInstructionKind.InlineAssembly)
+                            return false;
+                    }
+                }
+
+                return true;
             }
 
             private void SaveCalleeSavedVectorRegisters()

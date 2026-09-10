@@ -623,7 +623,16 @@ namespace Cnidaria.X86
 
             options ??= X86AssemblyWriterOptions.Default;
             var sb = new StringBuilder();
-            var labelsByOffset = text.Labels.GroupBy(kv => kv.Value).ToDictionary(g => g.Key, g => g.Select(kv => kv.Key).OrderBy(static s => s, StringComparer.Ordinal).ToImmutableArray());
+            // Symbols first, so a function whose prologue is empty still reads as the owner of the block
+            // labels sharing its offset rather than as a label inside them
+            var labelsByOffset = text.Labels
+                .GroupBy(kv => kv.Value)
+                .ToDictionary(
+                    g => g.Key,
+                    g => g.Select(kv => kv.Key)
+                        .OrderBy(static s => s.StartsWith(".", StringComparison.Ordinal) ? 1 : 0)
+                        .ThenBy(static s => s, StringComparer.Ordinal)
+                        .ToImmutableArray());
             var position = 0;
             foreach (var instruction in text.Instructions)
             {

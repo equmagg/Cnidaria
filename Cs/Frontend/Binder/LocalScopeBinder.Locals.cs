@@ -2080,7 +2080,7 @@ namespace Cnidaria.Cs
             }
 
             var elemType = BindType(at.ElementType, context, diagnostics);
-            if (elemType.IsReferenceType || elemType is ArrayTypeSymbol)
+            if (!GenericConstraintFacts.IsUnmanagedType(elemType))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_STACKALLOC002",
@@ -2183,7 +2183,7 @@ namespace Cnidaria.Cs
                     requireImplicit: true);
             }
 
-            if (elemType.IsReferenceType || elemType is ArrayTypeSymbol)
+            if (!GenericConstraintFacts.IsUnmanagedType(elemType))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_STACKALLOC_IMP002",

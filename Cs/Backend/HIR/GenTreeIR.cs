@@ -930,6 +930,7 @@ namespace Cnidaria.Cs
         public GenTreeLinearLoweringInfo LinearLowering { get; internal set; }
         public LinearMemoryAccess LinearMemoryAccess { get; internal set; } = LinearMemoryAccess.None;
         public RegisterAllocationInfo? RegisterAllocation { get; internal set; }
+        public ulong SafePointLiveRegisters { get; internal set; }
         public RegisterOperand RegisterHome { get; internal set; } = RegisterOperand.None;
         public RegisterValueLocation RegisterLocationAtDefinition { get; internal set; }
         public int LinearPhiCopyFromBlockId { get; internal set; } = -1;
@@ -1160,6 +1161,7 @@ namespace Cnidaria.Cs
             LinearLowering = default;
             LinearMemoryAccess = LinearMemoryAccess.None;
             RegisterAllocation = null;
+            SafePointLiveRegisters = 0;
             RegisterHome = RegisterOperand.None;
             RegisterLocationAtDefinition = default;
             LinearPhiCopyFromBlockId = -1;

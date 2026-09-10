@@ -193,6 +193,7 @@ namespace Cnidaria.Cs
             private readonly HashSet<SsaValueName> _usedSsaValues = new();
             private readonly List<GenTree> _allNodes = new();
             private readonly List<GenTree>[] _nodesByBlock;
+            private int[]? _reversePostOrderIndex;
             private int _nextNodeId;
             private int _nextSyntheticTreeId;
             private int _currentBlockId;
@@ -233,6 +234,8 @@ namespace Cnidaria.Cs
                     PrepareSsaValues();
 
                 LowerBlocks();
+
+                EmitLoopBackEdgeGcPolls();
 
                 if (_ssa is not null)
                     EmitPhiCopies();
@@ -981,9 +984,6 @@ namespace Cnidaria.Cs
 
                 var uses = LowerOperands(tree);
 
-                if (IsBackwardBranch(tree))
-                    EmitGcPoll(tree);
-
                 GenTree? result = ProducesValue(tree)
                     ? NewTemp(tree)
                     : null;
@@ -1059,9 +1059,6 @@ namespace Cnidaria.Cs
                     branch.SourceOp = condition.CompareOp;
                     branch.SetOperands(ImmutableArray.Create(left, right));
 
-                    if (IsBackwardBranch(branch))
-                        EmitGcPoll(branch);
-
                     EmitTree(branch, ImmutableArray.Create(LirOperandFlags.None, LirOperandFlags.None), result: null);
                     return true;
                 }
@@ -1071,9 +1068,6 @@ namespace Cnidaria.Cs
                 branch.Kind = condition.BranchWhenTrue ? GenTreeKind.BranchTrue : GenTreeKind.BranchFalse;
                 branch.SourceOp = condition.BranchWhenTrue ? BytecodeOp.Brtrue : BytecodeOp.Brfalse;
                 branch.SetOperands(ImmutableArray.Create(value));
-
-                if (IsBackwardBranch(branch))
-                    EmitGcPoll(branch);
 
                 EmitTree(branch, ImmutableArray.Create(LirOperandFlags.None), result: null);
                 return true;
@@ -1102,9 +1096,6 @@ namespace Cnidaria.Cs
                     branch.SourceOp = condition.CompareOp;
                     branch.SetOperands(ImmutableArray.Create(left.Source, right.Source));
 
-                    if (IsBackwardBranch(branch))
-                        EmitGcPoll(branch);
-
                     EmitTree(branch, ImmutableArray.Create(LirOperandFlags.None, LirOperandFlags.None), result: null);
                     return true;
                 }
@@ -1114,9 +1105,6 @@ namespace Cnidaria.Cs
                 branch.Kind = condition.BranchWhenTrue ? GenTreeKind.BranchTrue : GenTreeKind.BranchFalse;
                 branch.SourceOp = condition.BranchWhenTrue ? BytecodeOp.Brtrue : BytecodeOp.Brfalse;
                 branch.SetOperands(ImmutableArray.Create(value.Source));
-
-                if (IsBackwardBranch(branch))
-                    EmitGcPoll(branch);
 
                 EmitTree(branch, ImmutableArray.Create(LirOperandFlags.None), result: null);
                 return true;
@@ -1319,9 +1307,6 @@ namespace Cnidaria.Cs
                     return;
 
                 var uses = LowerOperands(tree);
-
-                if (IsBackwardBranch(tree.Source))
-                    EmitGcPoll(tree.Source);
 
                 GenTree? result = ProducesValue(tree.Source)
                     ? NewTemp(tree.Source)
@@ -1921,7 +1906,7 @@ namespace Cnidaria.Cs
                 return tree;
             }
 
-            private GenTree EmitGcPoll(GenTree? sourceTree)
+            private GenTree CreateGcPoll(GenTree? sourceTree)
             {
                 var pollTree = new GenTree(
                     _nextSyntheticTreeId++,
@@ -1953,7 +1938,6 @@ namespace Cnidaria.Cs
                     ImmutableArray<GenTree>.Empty,
                     lowering,
                     LinearMemoryAccess.None);
-                RecordNode(pollTree);
                 return pollTree;
             }
 
@@ -2102,12 +2086,76 @@ namespace Cnidaria.Cs
                 return builder.ToImmutable();
             }
 
-            private bool IsBackwardBranch(GenTree source)
+            // Every cycle needs a poll to stay preemptible, and every cycle contains at least one
+            // retreating edge, so placement runs off the CFG. Branch trees are not enough: a latch that
+            // is a bare goto carries no statement, and its jump is synthesized from the block layout.
+            private void EmitLoopBackEdgeGcPolls()
             {
-                if (source.Kind is not (GenTreeKind.Branch or GenTreeKind.BranchTrue or GenTreeKind.BranchFalse))
+                var order = GetReversePostOrderIndex();
+                for (int blockId = 0; blockId < _nodesByBlock.Length; blockId++)
+                {
+                    if (!HasRetreatingSuccessor(blockId, order))
+                        continue;
+
+                    _currentBlockId = blockId;
+                    _currentBlockOrdinal = _nodesByBlock[blockId].Count;
+                    InsertNodeBeforeTerminator(blockId, CreateGcPoll(sourceTree: null));
+                }
+            }
+
+            private bool HasRetreatingSuccessor(int blockId, int[] order)
+            {
+                if ((uint)blockId >= (uint)_cfg.Blocks.Length)
                     return false;
 
-                return source.TargetBlockId >= 0 && source.TargetBlockId <= _currentBlockId;
+                int sourceOrder = (uint)blockId < (uint)order.Length ? order[blockId] : -1;
+                var successors = _cfg.Blocks[blockId].Successors;
+                for (int i = 0; i < successors.Length; i++)
+                {
+                    var edge = successors[i];
+                    if (edge.Kind == CfgEdgeKind.Exception)
+                        continue;
+
+                    int target = edge.ToBlockId;
+                    if ((uint)target >= (uint)order.Length)
+                        continue;
+
+                    int targetOrder = order[target];
+
+                    // Unreachable from the entry, so it has no post-order position to compare
+                    if (targetOrder < 0 || sourceOrder < 0)
+                    {
+                        if (target <= blockId)
+                            return true;
+                        continue;
+                    }
+
+                    if (targetOrder <= sourceOrder)
+                        return true;
+                }
+
+                return false;
+            }
+
+            private int[] GetReversePostOrderIndex()
+            {
+                if (_reversePostOrderIndex is not null)
+                    return _reversePostOrderIndex;
+
+                var index = new int[_cfg.Blocks.Length];
+                for (int i = 0; i < index.Length; i++)
+                    index[i] = -1;
+
+                var order = _cfg.ReversePostOrder;
+                for (int i = 0; i < order.Length; i++)
+                {
+                    int blockId = order[i];
+                    if ((uint)blockId < (uint)index.Length)
+                        index[blockId] = i;
+                }
+
+                _reversePostOrderIndex = index;
+                return index;
             }
 
             private void RecordNode(GenTree node)

@@ -143,6 +143,7 @@ namespace Cnidaria.Cs
             public const byte CurrentRegister = 0;
             public const byte StackSlot = 1;
             public const byte Snapshot = 2;
+            public const byte Unavailable = 3;
 
             public readonly byte Kind;
             public readonly int Address;
@@ -5117,6 +5118,8 @@ namespace Cnidaria.Cs
                 return 0;
 
             GprStorageLocation location = ResolveFrameGprLocation(frameOffset, encodedRegister);
+            if (location.Kind == GprStorageLocation.Unavailable)
+                return 0;
             if (location.Kind == GprStorageLocation.StackSlot)
                 return ReadNative(location.Address);
             if (location.Kind == GprStorageLocation.Snapshot)
@@ -5135,6 +5138,8 @@ namespace Cnidaria.Cs
                 return;
 
             GprStorageLocation location = ResolveFrameGprLocation(frameOffset, encodedRegister);
+            if (location.Kind == GprStorageLocation.Unavailable)
+                return;
             if (location.Kind == GprStorageLocation.StackSlot)
             {
                 WriteNative(location.Address, value);
@@ -5166,12 +5171,25 @@ namespace Cnidaria.Cs
             }
 
             MachineRegister register = (MachineRegister)encodedRegister;
+            bool found = false;
             GprStorageLocation location = new GprStorageLocation(GprStorageLocation.CurrentRegister);
             for (int child = top; child > frameOffset; child -= ShadowFrameSize)
             {
                 if (TryGetSavedRegisterSlot(child, register, out int slotAddress))
+                {
                     location = new GprStorageLocation(GprStorageLocation.StackSlot, address: slotAddress);
+                    found = true;
+                }
             }
+
+            // A suspended frame records the program counter of the call it is inside, and that safe
+            // point still lists the outgoing arguments. Those sit in caller-saved registers that the
+            // callee is free to reuse, so the live register no longer holds the caller's value and
+            // there is nothing to recover it from. Whatever is still needed is reported by the frame
+            // that owns it now, so the root is simply not this frame's to report
+            if (!found && !MachineRegisters.IsCalleeSaved(register))
+                return new GprStorageLocation(GprStorageLocation.Unavailable);
+
             return location;
         }
 

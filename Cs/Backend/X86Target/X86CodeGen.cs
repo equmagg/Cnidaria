@@ -937,24 +937,33 @@ namespace Cnidaria.Cs
                 }
 
                 GenTreeMethod? firstStaticParameterless = null;
+                GenTreeMethod? namedMain = null;
                 foreach (GenTreeMethod method in _program.Methods)
                 {
                     RuntimeMethod runtimeMethod = method.RuntimeMethod;
                     if (runtimeMethod.IsStatic && runtimeMethod.ParameterTypes.Length == 0 && firstStaticParameterless is null)
                         firstStaticParameterless = method;
 
-                    if (!StringComparer.Ordinal.Equals(runtimeMethod.Name, "Main"))
+                    bool isTopLevelEntry = StringComparer.Ordinal.Equals(runtimeMethod.Name, "<Main>$");
+                    if (!isTopLevelEntry && !StringComparer.Ordinal.Equals(runtimeMethod.Name, "Main"))
                         continue;
                     if (!runtimeMethod.IsStatic)
                         continue;
-                    if (runtimeMethod.ParameterTypes.Length == 0 ||
-                        (runtimeMethod.ParameterTypes.Length == 1 && IsStringArray(runtimeMethod.ParameterTypes[0])))
+                    if (runtimeMethod.ParameterTypes.Length != 0 &&
+                        (runtimeMethod.ParameterTypes.Length != 1 || !IsStringArray(runtimeMethod.ParameterTypes[0])))
                     {
-                        return method;
+                        continue;
                     }
+
+                    // Top-level statements compile to <Main>$ and are the entry whenever one exists, so it
+                    // wins over any Main the program also happens to carry
+                    if (isTopLevelEntry)
+                        return method;
+
+                    namedMain ??= method;
                 }
 
-                return firstStaticParameterless ?? _program.Methods[0];
+                return namedMain ?? firstStaticParameterless ?? _program.Methods[0];
             }
 
             private void EmitMethod(GenTreeMethod method)
@@ -2363,6 +2372,7 @@ namespace Cnidaria.Cs
                 private bool _conditionalBranchTookFallthrough;
                 private bool _ehFrameRegistered;
                 private bool _returnThunkNeeded;
+                private readonly bool _methodAllocatesOnStack;
 
                 public MethodEmitter(Generator owner, GenTreeMethod method, string methodLabel)
                 {
@@ -2379,6 +2389,18 @@ namespace Cnidaria.Cs
                     }
                     owner._ehMethodsByMethodId.TryGetValue(method.RuntimeMethod.MethodId, out _ehMethod);
                     _returnThunkLabel = owner.CreateLocalLabel(methodLabel + "_eh_return");
+                    _methodAllocatesOnStack = MethodAllocatesOnStack(method);
+                }
+
+                private static bool MethodAllocatesOnStack(GenTreeMethod method)
+                {
+                    for (int i = 0; i < method.LinearNodes.Length; i++)
+                    {
+                        if (method.LinearNodes[i].TreeKind == GenTreeKind.StackAlloc)
+                            return true;
+                    }
+
+                    return false;
                 }
 
                 private TargetInfo Target => _owner._target;
@@ -2834,28 +2856,34 @@ namespace Cnidaria.Cs
                         GcPollStub stub = _gcPollStubs[i];
                         _owner.DefineLabel(stub.SlowLabel);
 
-                        int saveAreaSize = EmitSaveCallerSavedRegistersForGcPoll();
+                        var saveLocations = BuildGcPollSaveLocations(stub.Node, out int saveAreaSize);
+                        EmitSaveCallerSavedRegistersForGcPoll(saveLocations, saveAreaSize);
                         SafePointDraft safePoint = PrepareSafePoint(stub.Node, dynamicStackAdjustment: saveAreaSize);
                         PublishGcTransition(safePoint);
                         MarkEhGcPollCallSite(stub.Node);
                         _owner.EmitCall(_owner.ResolveExternalFunction(X86Runtime.GcPollSymbol));
                         _owner.DefineLabel(safePoint.ReturnLabel);
-                        EmitRestoreCallerSavedRegistersForGcPoll(saveAreaSize);
+                        EmitRestoreCallerSavedRegistersForGcPoll(saveLocations, saveAreaSize);
                         ReloadGcRegisterRoots(stub.Node);
                         EmitJump(stub.ContinuationLabel);
                     }
                     _owner.DefineLabel(endLabel);
                 }
 
-                private int EmitSaveCallerSavedRegistersForGcPoll()
+                // The hot path is promised its caller-saved registers survive, so the stub preserves the
+                // ones the allocator left a live value in across the poll
+                private List<(MachineRegister Register, int Offset, int Size)> BuildGcPollSaveLocations(
+                    GenTree node,
+                    out int saveAreaSize)
                 {
+                    ulong live = node.SafePointLiveRegisters;
                     ImmutableArray<MachineRegister> registers = RegisterInfo.CallerSavedScalarRegisters(Target);
                     int offset = checked(RegisterInfo.MinimumOutgoingArgumentSlots(Target) * Target.PointerSize);
                     var locations = new List<(MachineRegister Register, int Offset, int Size)>();
                     for (int i = 0; i < registers.Length; i++)
                     {
                         MachineRegister register = registers[i];
-                        if (RegisterInfo.IsReserved(Target, register))
+                        if (RegisterInfo.IsReserved(Target, register) || (live & MachineRegisters.MaskOf(register)) == 0)
                             continue;
                         int size = RegisterInfo.RegisterSaveSize(Target, register);
                         int alignment = RegisterInfo.RegisterSaveAlignment(Target, register);
@@ -2864,7 +2892,16 @@ namespace Cnidaria.Cs
                         offset = checked(offset + size);
                     }
 
-                    int saveAreaSize = AlignUp(offset, Math.Max(Target.PointerSize, Target.CallFrameAlignment));
+                    saveAreaSize = locations.Count == 0
+                        ? 0
+                        : AlignUp(offset, Math.Max(Target.PointerSize, Target.CallFrameAlignment));
+                    return locations;
+                }
+
+                private void EmitSaveCallerSavedRegistersForGcPoll(
+                    List<(MachineRegister Register, int Offset, int Size)> locations,
+                    int saveAreaSize)
+                {
                     if (saveAreaSize != 0)
                     {
                         _owner.Emit(X86Instruction.Binary(
@@ -2885,26 +2922,12 @@ namespace Cnidaria.Cs
                             Mem(X86Register.Rsp, location.Offset, location.Size),
                             Reg(register, location.Size)));
                     }
-                    return saveAreaSize;
                 }
 
-                private void EmitRestoreCallerSavedRegistersForGcPoll(int saveAreaSize)
+                private void EmitRestoreCallerSavedRegistersForGcPoll(
+                    List<(MachineRegister Register, int Offset, int Size)> locations,
+                    int saveAreaSize)
                 {
-                    ImmutableArray<MachineRegister> registers = RegisterInfo.CallerSavedScalarRegisters(Target);
-                    int offset = checked(RegisterInfo.MinimumOutgoingArgumentSlots(Target) * Target.PointerSize);
-                    var locations = new List<(MachineRegister Register, int Offset, int Size)>();
-                    for (int i = 0; i < registers.Length; i++)
-                    {
-                        MachineRegister register = registers[i];
-                        if (RegisterInfo.IsReserved(Target, register))
-                            continue;
-                        int size = RegisterInfo.RegisterSaveSize(Target, register);
-                        int alignment = RegisterInfo.RegisterSaveAlignment(Target, register);
-                        offset = AlignUp(offset, alignment);
-                        locations.Add((register, offset, size));
-                        offset = checked(offset + size);
-                    }
-
                     for (int i = locations.Count - 1; i >= 0; i--)
                     {
                         var location = locations[i];
@@ -3485,6 +3508,9 @@ namespace Cnidaria.Cs
                         case GenTreeKind.PointerElementAddr:
                             EmitPointerElementAddress(node);
                             return;
+                        case GenTreeKind.PointerDiff:
+                            EmitPointerDifference(node);
+                            return;
                         case GenTreeKind.LoadIndirect:
                         case GenTreeKind.StoreIndirect:
                             EmitIndirect(node);
@@ -3608,6 +3634,11 @@ namespace Cnidaria.Cs
 
                     X86Register destination = ToX86Register(RequireResultRegister(node), Target);
 
+                    // The outgoing argument area sits at the stack pointer so a callee can read its
+                    // stack arguments from there, so it has to move down with every allocation. The
+                    // block therefore starts one area above the new stack pointer
+                    int outgoingSize = OutgoingArgumentAreaSize;
+
                     if (node.Operands.Length == 0)
                     {
                         if (node.Int64 <= 0)
@@ -3639,10 +3670,7 @@ namespace Cnidaria.Cs
                                 Reg(destination, Target.PointerSize)));
                         }
 
-                        _owner.Emit(X86Instruction.Binary(
-                            X86InstrKind.Mov,
-                            Reg(destination, Target.PointerSize),
-                            Reg(X86Register.Rsp, Target.PointerSize)));
+                        EmitStackAllocResult(destination, outgoingSize);
                         return;
                     }
 
@@ -3695,10 +3723,29 @@ namespace Cnidaria.Cs
                         X86InstrKind.Sub,
                         Reg(X86Register.Rsp, Target.PointerSize),
                         Reg(destination, Target.PointerSize)));
+                    EmitStackAllocResult(destination, outgoingSize);
+                }
+
+                private int OutgoingArgumentAreaSize
+                    => AlignUp(
+                        _method.StackFrame.OutgoingArgumentAreaSize,
+                        Math.Max(1, Target.CallFrameAlignment));
+
+                private void EmitStackAllocResult(X86Register destination, int outgoingSize)
+                {
+                    if (outgoingSize == 0)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            X86InstrKind.Mov,
+                            Reg(destination, Target.PointerSize),
+                            Reg(X86Register.Rsp, Target.PointerSize)));
+                        return;
+                    }
+
                     _owner.Emit(X86Instruction.Binary(
-                        X86InstrKind.Mov,
+                        X86InstrKind.Lea,
                         Reg(destination, Target.PointerSize),
-                        Reg(X86Register.Rsp, Target.PointerSize)));
+                        Mem(X86Register.Rsp, outgoingSize, Target.PointerSize)));
                 }
 
                 private void EmitStackAllocFailure()
@@ -3814,6 +3861,78 @@ namespace Cnidaria.Cs
                         X86InstrKind.Lea,
                         Reg(destination, Target.PointerSize),
                         X86Operand.Memory(baseRegister, 0, Target.PointerSize, scaledIndex, 1)));
+                }
+
+                private void EmitPointerDifference(GenTree node)
+                {
+                    if (node.Uses.Length < 2 || node.Results.Length != 1)
+                        throw Unsupported(node, "Pointer difference requires two operands and one result");
+
+                    int leftUseIndex = RequireCodegenUseIndexForOperand(node, 0, "pointer difference left operand");
+                    int rightUseIndex = RequireCodegenUseIndexForOperand(node, 1, "pointer difference right operand");
+                    if (!node.Uses[leftUseIndex].IsRegister || !node.Uses[rightUseIndex].IsRegister)
+                        throw Unsupported(node, "Pointer difference requires register operands");
+
+                    int size = Target.PointerSize;
+                    X86Register destination = ToX86Register(RequireResultRegister(node), Target);
+                    X86Register left = ToX86Register(node.Uses[leftUseIndex].Register, Target);
+                    X86Register right = ToX86Register(node.Uses[rightUseIndex].Register, Target);
+
+                    if (destination == right && destination != left)
+                    {
+                        // Subtracting in place would give the operands the wrong way round
+                        _owner.Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(destination, size), Reg(left, size)));
+                        _owner.Emit(X86Instruction.Unary(X86InstrKind.Neg, Reg(destination, size)));
+                    }
+                    else
+                    {
+                        if (destination != left)
+                            _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(destination, size), Reg(left, size)));
+                        _owner.Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(destination, size), Reg(right, size)));
+                    }
+
+                    long scale = node.Int32 > 0 ? node.Int32 : 1;
+                    if (scale == 1)
+                        return;
+
+                    int shift = 0;
+                    while ((scale & 1) == 0)
+                    {
+                        scale >>= 1;
+                        shift++;
+                    }
+
+                    // The byte difference is an exact multiple of the element size, so the power of two
+                    // divides out arithmetically even when the difference is negative
+                    if (shift != 0)
+                        _owner.Emit(X86Instruction.Binary(X86InstrKind.Sar, Reg(destination, size), Imm(shift)));
+
+                    if (scale == 1)
+                        return;
+
+                    // The rest is odd, so it divides out by multiplying with its modular inverse - exact
+                    // for the same reason, and it needs no fixed accumulator or data register
+                    X86Register scratch = ToX86Register(RequireInternalGeneralRegister(node, 0), Target);
+                    if (scratch == destination)
+                        throw Unsupported(node, "Pointer difference scratch register conflicts with the result register");
+
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Mov,
+                        Reg(scratch, size),
+                        Imm(ModularInverse(scale, size))));
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Imul,
+                        Reg(destination, size),
+                        Reg(scratch, size)));
+                }
+
+                private static long ModularInverse(long value, int size)
+                {
+                    ulong odd = unchecked((ulong)value);
+                    ulong inverse = odd;
+                    for (int i = 0; i < 6; i++)
+                        inverse = unchecked(inverse * (2UL - odd * inverse));
+                    return size == 8 ? unchecked((long)inverse) : unchecked((int)(uint)inverse);
                 }
 
                 private void EmitRuntimeTypeCheck(GenTree node, bool throwOnFailure)
@@ -3950,7 +4069,7 @@ namespace Cnidaria.Cs
                     }
                     if (!source.IsRegister && destination.IsRegister)
                     {
-                        EmitLoad(destination.Register, source, size);
+                        EmitLoad(destination.Register, source, size, IsSignedNarrowInteger(node));
                         return;
                     }
                     if (source.IsRegister && !destination.IsRegister)
@@ -4046,7 +4165,7 @@ namespace Cnidaria.Cs
                                 throw Unsupported(node, "multi-register local, argument, or temp fragment count does not match its storage ABI");
 
                             for (int i = 0; i < segments.Length; i++)
-                                EmitMoveBetween(node.Results[i], node.Uses[i], segments[i].Size);
+                                EmitMoveBetween(node.Results[i], node.Uses[i], segments[i].Size, IsSignedNarrowInteger(node));
                             return;
                         }
 
@@ -4057,7 +4176,7 @@ namespace Cnidaria.Cs
                     {
                         RegisterOperand home = FrameSlotForLocalLike(node, size, node.Results[0].RegisterClass);
                         if (node.Results[0].IsRegister)
-                            EmitLoad(node.Results[0].Register, home, size);
+                            EmitLoad(node.Results[0].Register, home, size, IsSignedNarrowInteger(node));
                         else
                             EmitMemoryToMemory(node.Results[0], home, size);
                         return;
@@ -4075,7 +4194,7 @@ namespace Cnidaria.Cs
 
                     if (node.Results.Length == 1 && node.Uses.Length == 1)
                     {
-                        EmitMoveBetween(node.Results[0], node.Uses[0], size);
+                        EmitMoveBetween(node.Results[0], node.Uses[0], size, IsSignedNarrowInteger(node));
                         return;
                     }
 
@@ -5466,6 +5585,7 @@ namespace Cnidaria.Cs
                     _owner.DefineLabel(safePoint.ReturnLabel);
 
                     EmitCopyAddressToAddress(
+                        node,
                         X86Register.Rax,
                         Target.ManagedObjectHeaderSize,
                         X86Register.Rbp,
@@ -5545,6 +5665,7 @@ namespace Cnidaria.Cs
                         Mem(X86Register.Rbp, checked(TypeOperationScratchOffset + hasValueField.Offset), Math.Max(1, hasValueField.FieldType.SizeOf)),
                         Imm(1)));
                     EmitCopyAddressToAddress(
+                        node,
                         X86Register.Rbp,
                         checked(TypeOperationScratchOffset + valueField.Offset),
                         source,
@@ -6528,6 +6649,12 @@ namespace Cnidaria.Cs
                         return;
                     }
 
+                    if (IsCheckedIntegerBinary(node))
+                    {
+                        EmitCheckedIntegerBinary(node, dst, lhs, rhs, size);
+                        return;
+                    }
+
                     bool isShift = node.SourceOp is BytecodeOp.Shl or BytecodeOp.Shr or BytecodeOp.Shr_Un;
                     if (isShift && rhs != X86Register.Rcx)
                         throw Unsupported(node, "variable shift count was not allocated to RCX");
@@ -6582,6 +6709,12 @@ namespace Cnidaria.Cs
                     if (MachineRegisters.GetClass(destination) != RegisterClass.Float)
                         throw Unsupported(node, "floating-point arithmetic result is not in a floating-point register");
 
+                    if (node.SourceOp == BytecodeOp.Rem)
+                    {
+                        EmitFloatingRemainder(node, destination, left, right, size);
+                        return;
+                    }
+
                     X86InstrKind opcode = node.SourceOp switch
                     {
                         BytecodeOp.Add => size == 4 ? X86InstrKind.Addss : X86InstrKind.Addsd,
@@ -6625,6 +6758,57 @@ namespace Cnidaria.Cs
                             Reg(lhs, size)));
                     }
                     _owner.Emit(X86Instruction.Binary(opcode, Reg(dst, size), Reg(rhs, size)));
+                }
+
+                // There is no instruction for a floating remainder, so it goes to the runtime helper.
+                // The node reports itself as clobbering caller-saved registers, which is what keeps a
+                // live value out of them and gives the frame its outgoing argument area
+                private void EmitFloatingRemainder(
+                    GenTree node,
+                    MachineRegister destination,
+                    MachineRegister left,
+                    MachineRegister right,
+                    int size)
+                {
+                    if (Target.Architecture != TargetArchitectureKind.X86_64)
+                        throw Unsupported(node, "floating remainder is implemented for x86-64 only");
+
+                    X86Register argument0 = ToX86Register(RegisterInfo.GetFloatArgumentRegister(Target, 0), Target);
+                    X86Register argument1 = ToX86Register(RegisterInfo.GetFloatArgumentRegister(Target, 1), Target);
+                    X86Register dst = ToX86Register(destination, Target);
+                    X86Register lhs = ToX86Register(left, Target);
+                    X86Register rhs = ToX86Register(right, Target);
+                    X86InstrKind move = size == 4 ? X86InstrKind.Movss : X86InstrKind.Movsd;
+
+                    if (lhs == argument1 && rhs == argument0)
+                    {
+                        _owner.Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(X86Register.Rsp, Target.PointerSize), Imm(16)));
+                        _owner.Emit(X86Instruction.Binary(move, Mem(X86Register.Rsp, 0, size), Reg(lhs, size)));
+                        _owner.Emit(X86Instruction.Binary(move, Reg(argument1, size), Reg(rhs, size)));
+                        _owner.Emit(X86Instruction.Binary(move, Reg(argument0, size), Mem(X86Register.Rsp, 0, size)));
+                        _owner.Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rsp, Target.PointerSize), Imm(16)));
+                    }
+                    else if (rhs == argument0 && lhs != argument0)
+                    {
+                        _owner.Emit(X86Instruction.Binary(move, Reg(argument1, size), Reg(rhs, size)));
+                        _owner.Emit(X86Instruction.Binary(move, Reg(argument0, size), Reg(lhs, size)));
+                    }
+                    else
+                    {
+                        if (lhs != argument0)
+                            _owner.Emit(X86Instruction.Binary(move, Reg(argument0, size), Reg(lhs, size)));
+                        if (rhs != argument1)
+                            _owner.Emit(X86Instruction.Binary(move, Reg(argument1, size), Reg(rhs, size)));
+                    }
+
+                    MarkEhCallSite(node, "floating_remainder");
+                    _owner.EmitCall(_owner.ResolveExternalFunction(size == 4
+                        ? X86Runtime.FloatingRemainderSingleSymbol
+                        : X86Runtime.FloatingRemainderDoubleSymbol));
+
+                    X86Register returnRegister = ToX86Register(RegisterInfo.GetFloatReturnRegister(Target, 0), Target);
+                    if (dst != returnRegister)
+                        _owner.Emit(X86Instruction.Binary(move, Reg(dst, size), Reg(returnRegister, size)));
                 }
 
                 private void EmitFloatingComparison(
@@ -6723,6 +6907,14 @@ namespace Cnidaria.Cs
                     if (node.SourceOp is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un)
                         throw Unsupported(node, "integer division cannot use a contained immediate operand");
 
+                    if (IsCheckedIntegerBinary(node))
+                    {
+                        X86Register staged = ToX86Register(RequireInternalGeneralRegister(node, 0), Target);
+                        _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(staged, size), Imm(immediate)));
+                        EmitCheckedIntegerBinary(node, dst, lhs, staged, size);
+                        return;
+                    }
+
                     if (node.SourceOp == BytecodeOp.Mul)
                     {
                         _owner.Emit(X86Instruction.Ternary(
@@ -6796,6 +6988,79 @@ namespace Cnidaria.Cs
                     if (opcode == X86InstrKind.Invalid)
                         throw Unsupported(node, $"unsupported binary opcode {node.SourceOp}");
                     return opcode;
+                }
+
+                private static bool IsCheckedIntegerBinary(GenTree node)
+                    => node.SourceOp is BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un or
+                        BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un or
+                        BytecodeOp.Mul_Ovf or BytecodeOp.Mul_Ovf_Un;
+
+                private void EmitCheckedIntegerBinary(GenTree node, X86Register dst, X86Register lhs, X86Register rhs, int size)
+                {
+                    if (size is not (4 or 8))
+                        throw Unsupported(node, "checked arithmetic requires a 32-bit or 64-bit operand");
+                    if (size == 8 && Target.Is32Bit)
+                        throw Unsupported(node, "64-bit checked arithmetic on i386 requires a soft-long lowering pass");
+
+                    bool unsigned = node.SourceOp is BytecodeOp.Add_Ovf_Un or BytecodeOp.Sub_Ovf_Un or BytecodeOp.Mul_Ovf_Un;
+                    if (node.SourceOp == BytecodeOp.Mul_Ovf_Un)
+                    {
+                        EmitCheckedUnsignedMultiply(node, dst, lhs, rhs, size);
+                        return;
+                    }
+
+                    X86InstrKind opcode = node.SourceOp switch
+                    {
+                        BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un => X86InstrKind.Add,
+                        BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un => X86InstrKind.Sub,
+                        _ => X86InstrKind.Imul,
+                    };
+
+                    X86Register source = rhs;
+                    if (dst == rhs && dst != lhs)
+                    {
+                        if (opcode == X86InstrKind.Sub)
+                        {
+                            // The overflow flag has to come from the subtraction itself, so the negate and
+                            // add the unchecked path uses here would report the wrong thing
+                            X86Register staged = ToX86Register(RequireInternalGeneralRegister(node, 0), Target);
+                            _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(staged, size), Reg(lhs, size)));
+                            _owner.Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(staged, size), Reg(rhs, size)));
+                            _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(dst, size), Reg(staged, size)));
+                            EmitOverflowGuard(node, unsigned ? X86Condition.C : X86Condition.O);
+                            return;
+                        }
+
+                        source = lhs;
+                    }
+                    else if (dst != lhs)
+                    {
+                        _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(dst, size), Reg(lhs, size)));
+                    }
+
+                    _owner.Emit(X86Instruction.Binary(opcode, Reg(dst, size), Reg(source, size)));
+                    EmitOverflowGuard(node, unsigned ? X86Condition.C : X86Condition.O);
+                }
+
+                private void EmitCheckedUnsignedMultiply(GenTree node, X86Register dst, X86Register lhs, X86Register rhs, int size)
+                {
+                    // The one-operand form is the only unsigned multiply that reports the high half, and it
+                    // reads and writes the accumulator and data registers the allocator pinned for it
+                    X86Register accumulator = ToX86Register(RegisterInfo.AccumulatorRegister(Target), Target);
+                    if (lhs != accumulator || dst != accumulator)
+                        throw Unsupported(node, "checked unsigned multiply does not satisfy the fixed accumulator constraint");
+
+                    _owner.Emit(X86Instruction.Unary(X86InstrKind.Mul, Reg(rhs, size)));
+                    EmitOverflowGuard(node, X86Condition.C);
+                }
+
+                private void EmitOverflowGuard(GenTree node, X86Condition overflowCondition)
+                {
+                    X86Condition ok = overflowCondition == X86Condition.C ? X86Condition.Nc : X86Condition.No;
+                    string valid = _owner.CreateLocalLabel($"{_methodLabel}_ovf_ok_{node.LinearId}");
+                    EmitConditionalJump(ok, valid);
+                    EmitManagedExceptionThrow(node, "OverflowException");
+                    _owner.DefineLabel(valid);
                 }
 
                 private void EmitIntegerDivRem(
@@ -6939,7 +7204,7 @@ namespace Cnidaria.Cs
                     if (checkedConversion && sourceFloat && !targetFloat && node.ConvKind != NumericConvKind.Bool)
                         EmitCheckedFloatConversionGuard(node, source, sourceType, sourceKind);
                     else if (checkedConversion && !sourceFloat && !targetFloat && node.ConvKind != NumericConvKind.Bool)
-                        throw Unsupported(node, "checked integer conversions are not implemented by the x86 backend");
+                        EmitCheckedIntegerConversionGuard(node, source, sourceType, sourceKind, sourceUnsigned);
 
                     switch (node.ConvKind)
                     {
@@ -7363,6 +7628,82 @@ namespace Cnidaria.Cs
                     _owner.DefineLabel(valid);
                 }
 
+                private void EmitCheckedIntegerConversionGuard(
+                    GenTree node,
+                    MachineRegister source,
+                    RuntimeType? sourceType,
+                    GenStackKind sourceKind,
+                    bool sourceUnsigned)
+                {
+                    int targetBits;
+                    bool targetUnsigned;
+                    switch (node.ConvKind)
+                    {
+                        case NumericConvKind.I1: targetBits = 8; targetUnsigned = false; break;
+                        case NumericConvKind.U1: targetBits = 8; targetUnsigned = true; break;
+                        case NumericConvKind.I2: targetBits = 16; targetUnsigned = false; break;
+                        case NumericConvKind.U2:
+                        case NumericConvKind.Char: targetBits = 16; targetUnsigned = true; break;
+                        case NumericConvKind.I4: targetBits = 32; targetUnsigned = false; break;
+                        case NumericConvKind.U4: targetBits = 32; targetUnsigned = true; break;
+                        case NumericConvKind.I8: targetBits = 64; targetUnsigned = false; break;
+                        case NumericConvKind.U8: targetBits = 64; targetUnsigned = true; break;
+                        case NumericConvKind.NativeInt: targetBits = Target.PointerSize * 8; targetUnsigned = false; break;
+                        case NumericConvKind.NativeUInt: targetBits = Target.PointerSize * 8; targetUnsigned = true; break;
+                        default: return;
+                    }
+
+                    int sourceSize = StorageSize(sourceType, sourceKind);
+                    if (sourceSize is not (4 or 8))
+                        throw Unsupported(node, "checked integer conversion requires a 32-bit or 64-bit source");
+                    if ((sourceSize == 8 || targetBits == 64) && Target.Is32Bit)
+                        throw Unsupported(node, "64-bit checked conversions on i386 require a soft-long lowering pass");
+
+                    int sourceBits = sourceSize * 8;
+                    X86Register src = ToX86Register(source, Target);
+                    string overflow = _owner.CreateLocalLabel($"{_methodLabel}_conv_overflow_{node.LinearId}");
+                    string valid = _owner.CreateLocalLabel($"{_methodLabel}_conv_valid_{node.LinearId}");
+
+                    if (targetBits >= sourceBits)
+                    {
+                        // Widening only loses a value when the sign bit means different things on the two
+                        // sides, and then it is exactly the sign bit that decides
+                        if (sourceUnsigned == targetUnsigned || (targetBits > sourceBits && sourceUnsigned))
+                            return;
+
+                        _owner.Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(src, sourceSize), Reg(src, sourceSize)));
+                        EmitConditionalJump(X86Condition.S, overflow);
+                    }
+                    else
+                    {
+                        // Narrowing round-trips exactly when re-extending the truncated value reproduces it
+                        X86Register staged = ToX86Register(RequireInternalGeneralRegister(node, 0), Target);
+                        if (targetUnsigned)
+                        {
+                            if (targetBits == 32)
+                                _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(staged, 4), Reg(src, 4)));
+                            else
+                                _owner.Emit(X86Instruction.Binary(X86InstrKind.Movzx, Reg(staged, sourceSize), Reg(src, targetBits / 8)));
+                        }
+                        else if (targetBits == 32)
+                        {
+                            _owner.Emit(X86Instruction.Binary(X86InstrKind.Movsxd, Reg(staged, 8), Reg(src, 4)));
+                        }
+                        else
+                        {
+                            _owner.Emit(X86Instruction.Binary(X86InstrKind.Movsx, Reg(staged, sourceSize), Reg(src, targetBits / 8)));
+                        }
+
+                        _owner.Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(staged, sourceSize), Reg(src, sourceSize)));
+                        EmitConditionalJump(X86Condition.Ne, overflow);
+                    }
+
+                    EmitJump(valid);
+                    _owner.DefineLabel(overflow);
+                    EmitManagedExceptionThrow(node, "OverflowException");
+                    _owner.DefineLabel(valid);
+                }
+
                 private X86Operand FloatingConstantOperand(double value, int size, string prefix)
                 {
                     byte[] bytes = size == 4
@@ -7780,6 +8121,7 @@ namespace Cnidaria.Cs
                 }
 
                 private void EmitCopyAddressToAddress(
+                    GenTree node,
                     X86Register destinationBase,
                     int destinationOffset,
                     X86Register sourceBase,
@@ -7792,7 +8134,7 @@ namespace Cnidaria.Cs
                         return;
 
                     X86Register scratch = X86Register.Invalid;
-                    foreach (X86Register candidate in GeneralScratchCandidates())
+                    foreach (X86Register candidate in GeneralScratchCandidates(node))
                     {
                         if (candidate != destinationBase && candidate != sourceBase)
                         {
@@ -7919,7 +8261,7 @@ namespace Cnidaria.Cs
                     if (TryGetInternalRegister(node, RegisterClass.General, 0, out MachineRegister allocated))
                         return ToX86Register(allocated, Target);
 
-                    foreach (X86Register candidate in GeneralScratchCandidates())
+                    foreach (X86Register candidate in GeneralScratchCandidates(node))
                     {
                         if (candidate != avoid && !NodeUsesRegister(node, candidate))
                             return candidate;
@@ -7951,7 +8293,7 @@ namespace Cnidaria.Cs
                         throw Unsupported(node, "no floating-point scratch register is available");
                     }
 
-                    foreach (X86Register candidate in GeneralScratchCandidates())
+                    foreach (X86Register candidate in GeneralScratchCandidates(node))
                     {
                         if (candidate != avoid && !NodeUsesRegister(node, candidate))
                             return candidate;
@@ -7959,16 +8301,18 @@ namespace Cnidaria.Cs
                     throw Unsupported(node, "no value scratch register is available");
                 }
 
-                private ReadOnlySpan<X86Register> GeneralScratchCandidates() =>
-                    Target.Architecture == TargetArchitectureKind.I386
-                        ? [X86Register.Rdx, X86Register.Rcx, X86Register.Rax]
-                        : [
-                            X86Register.R11,
-                            X86Register.R10,
-                            X86Register.Rax,
-                            X86Register.Rcx,
-                            X86Register.Rdx
-                        ];
+                // Only the pair the allocator keeps free across this node may be taken without asking.
+                // A node reaching here whose kind is not declared in UsesX86CodegenScratch would be
+                // clobbering a live value, so it fails loudly rather than silently
+                private ReadOnlySpan<X86Register> GeneralScratchCandidates(GenTree node)
+                {
+                    if (Target.Architecture == TargetArchitectureKind.I386)
+                        return [X86Register.Rdx, X86Register.Rcx, X86Register.Rax];
+
+                    return GenTreeLinearLoweringClassifier.UsesX86CodegenScratch(node, Target)
+                        ? [X86Register.R11, X86Register.R10]
+                        : ReadOnlySpan<X86Register>.Empty;
+                }
 
 
                 private static bool TryGetInternalRegister(GenTree node, RegisterClass registerClass, int index, out MachineRegister result)
@@ -8235,7 +8579,7 @@ namespace Cnidaria.Cs
                     throw Unsupported(node, "default-value destination is not addressable");
                 }
 
-                private void EmitMoveBetween(RegisterOperand destination, RegisterOperand source, int size)
+                private void EmitMoveBetween(RegisterOperand destination, RegisterOperand source, int size, bool signedInteger = false)
                 {
                     if (destination.Equals(source))
                         return;
@@ -8248,7 +8592,7 @@ namespace Cnidaria.Cs
                     else if (source.IsRegister && destination.IsRegister)
                         EmitRegisterMove(destination.Register, source.Register, size);
                     else if (!source.IsRegister && destination.IsRegister)
-                        EmitLoad(destination.Register, source, size);
+                        EmitLoad(destination.Register, source, size, signedInteger);
                     else if (source.IsRegister)
                         EmitStore(destination, source.Register, size);
                     else
@@ -8301,7 +8645,9 @@ namespace Cnidaria.Cs
                         return;
                     }
 
-                    int moveSize = destinationClass == RegisterClass.General && size is not (1 or 2 or 4 or 8)
+                    // A byte or word move writes only part of the register and leaves the rest of the
+                    // normalized value behind, so anything narrower than a word travels full width
+                    int moveSize = destinationClass == RegisterClass.General
                         ? (size <= 4 ? 4 : Target.GeneralRegisterSize)
                         : size;
                     X86InstrKind opcode = destinationClass switch
@@ -8318,12 +8664,24 @@ namespace Cnidaria.Cs
                         Reg(ToX86Register(source, Target), moveSize)));
                 }
 
-                private void EmitLoad(MachineRegister destination, RegisterOperand source, int size)
+                private void EmitLoad(MachineRegister destination, RegisterOperand source, int size, bool signedInteger = false)
                 {
                     if (!source.IsFrameSlot)
                         throw new InvalidOperationException($"Load source is not a finalized frame slot: {source}.");
 
                     RegisterClass registerClass = MachineRegisters.GetClass(destination);
+
+                    // A narrow integer is stored as its own bytes but lives sign or zero extended in a
+                    // word-wide register, so reading one back has to widen it again rather than write
+                    // part of the register and leave the rest of the previous value in place
+                    if (registerClass == RegisterClass.General && size is 1 or 2)
+                    {
+                        _owner.Emit(X86Instruction.Binary(
+                            signedInteger ? X86InstrKind.Movsx : X86InstrKind.Movzx,
+                            Reg(ToX86Register(destination, Target), 4),
+                            Mem(FrameBase(source), EffectiveFrameOffset(source), size)));
+                        return;
+                    }
                     if (registerClass == RegisterClass.General && size is not (1 or 2 or 4 or 8))
                     {
                         EmitIntegerFragmentLoad(
@@ -8387,9 +8745,11 @@ namespace Cnidaria.Cs
                     if (size == 0 || destination.Equals(source))
                         return;
 
+                    // Moves the allocator synthesises sit between nodes, with no node to carry an internal
+                    // register, so this is the one place that uses the register held back for exactly that
                     X86Register scratch = Target.Architecture == TargetArchitectureKind.I386
                         ? X86Register.Rax
-                        : X86Register.R10;
+                        : ToX86Register(RegisterInfo.ParallelCopyScratch(Target, RegisterClass.General), Target);
                     X86Register destinationBase = FrameBase(destination);
                     X86Register sourceBase = FrameBase(source);
                     int destinationOffset = EffectiveFrameOffset(destination);
@@ -8518,6 +8878,17 @@ namespace Cnidaria.Cs
 
                 private X86Register FrameBase(RegisterOperand operand)
                 {
+                    // A stack allocation lowers the stack pointer for the rest of the method, and a
+                    // callee reads its stack arguments from wherever the stack pointer sits when the
+                    // call executes. The outgoing argument area therefore travels with the stack
+                    // pointer, while every other slot stays anchored to the frame pointer
+                    if (_methodAllocatesOnStack &&
+                        operand.IsFrameSlot &&
+                        operand.FrameSlotKind == StackFrameSlotKind.OutgoingArgument)
+                    {
+                        return X86Register.Rsp;
+                    }
+
                     return operand.FrameBase switch
                     {
                         RegisterFrameBase.StackPointer => X86Register.Rsp,
@@ -8598,6 +8969,10 @@ namespace Cnidaria.Cs
                 // branching past it is exact
                 private static bool EmitsNothing(GenTree node)
                 {
+                    // A poll is a Nop by tree kind, but branching past it drops the loop's safe point
+                    if (node.LinearKind == GenTreeLinearKind.GcPoll)
+                        return false;
+
                     switch (node.TreeKind)
                     {
                         case GenTreeKind.Nop:
@@ -8951,6 +9326,9 @@ namespace Cnidaria.Cs
                     }
                     return false;
                 }
+
+                private bool IsSignedNarrowInteger(GenTree node)
+                    => !IsUnsigned(ValueType(node));
 
                 private static bool IsUnsigned(RuntimeType? type)
                     => type?.PrimitiveKind is

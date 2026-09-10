@@ -42,6 +42,8 @@ namespace Cnidaria.Cs
         public const string EhRegisterContextsSymbol = "RhpEhRegisterContexts";
         public const string CurrentExceptionSymbol = "RhpCurrentException";
         public const string FailFastSymbol = "RhpFallbackFailFast";
+        public const string FloatingRemainderSingleSymbol = "RhpFmodF";
+        public const string FloatingRemainderDoubleSymbol = "RhpFmod";
         private const string ConsoleWriteUtf16Symbol = "RhpConsoleWriteUtf16";
         private const string ConsoleWriteUtf16ZSymbol = "RhpConsoleWriteUtf16Z";
         private const string ConsoleWriteStringSymbol = "RhpConsoleWriteString";

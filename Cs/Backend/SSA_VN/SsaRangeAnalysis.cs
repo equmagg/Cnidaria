@@ -113,6 +113,9 @@ namespace Cnidaria.Cs
                 MergeLower(left.Lower, right.Lower, monotonicIncreasing),
                 MergeUpper(left.Upper, right.Upper));
 
+        public static SsaRangeLimit MergeUpperLimit(SsaRangeLimit left, SsaRangeLimit right)
+            => MergeUpper(left, right);
+
         public static SsaRange Add(SsaRange left, SsaRange right)
         {
             SsaRangeLimit lower = Add(left.Lower, right.Lower);
@@ -704,6 +707,7 @@ namespace Cnidaria.Cs
             private SsaRange GetPhiRange(SsaPhi phi, int depth)
             {
                 SsaRange result = new SsaRange(SsaRangeLimit.Undefined, SsaRangeLimit.Undefined);
+                SsaRangeLimit backEdgeUpper = SsaRangeLimit.Undefined;
                 bool hasRange = false;
 
                 for (int i = 0; i < phi.Inputs.Length; i++)
@@ -714,13 +718,28 @@ namespace Cnidaria.Cs
 
                     ValueNumber inputValue = _store.VNNormalValue(pair.Conservative);
                     SsaRange inputRange = GetRange(inputValue, depth + 1);
+                    bool viaBackEdge = inputRange.Upper.Kind == SsaRangeLimitKind.Dependent;
                     var edgeAssertions = GetPhiInputAssertions(phi, input.PredecessorBlockId);
                     inputRange = GetAssertionRange(inputValue, edgeAssertions, inputRange);
+                    if (viaBackEdge)
+                        backEdgeUpper = SsaRangeOperations.MergeUpperLimit(backEdgeUpper, inputRange.Upper);
                     result = hasRange ? SsaRangeOperations.Merge(result, inputRange, _monotonicIncreasing) : inputRange;
                     hasRange = true;
                 }
 
-                return hasRange ? result : SsaRange.Unknown;
+                if (!hasRange)
+                    return SsaRange.Unknown;
+
+                // An increasing value is bounded inside the loop by what the back edge asserts; merging
+                // the entry bound in would only widen an array bound back to Unknown. A use after the
+                // loop is still held by the exit assertion GetRange applies on the way out
+                if (_monotonicIncreasing &&
+                    backEdgeUpper.Kind is SsaRangeLimitKind.Constant or SsaRangeLimitKind.ArrayBound)
+                {
+                    result = new SsaRange(result.Lower, backEdgeUpper);
+                }
+
+                return result;
             }
 
             private bool MayOverflow(

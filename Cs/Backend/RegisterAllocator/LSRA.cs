@@ -1504,6 +1504,7 @@ namespace Cnidaria.Cs
             {
                 AllocateIntervals();
                 AttachAllocationsToGenTrees();
+                AttachSafePointLiveRegisters();
 
                 int copyScratchSlot = -1;
 
@@ -1582,6 +1583,45 @@ namespace Cnidaria.Cs
                 {
                     allocation.Value.AttachRegisterAllocation(allocation, _method.Target);
                 }
+            }
+
+            // Recorded here rather than in the code generator: the resolution moves emitted below shift
+            // node positions, so this is the last point where positions and allocations agree.
+            private void AttachSafePointLiveRegisters()
+            {
+                for (int i = 0; i < _method.LinearNodes.Length; i++)
+                {
+                    GenTree node = _method.LinearNodes[i];
+                    node.SafePointLiveRegisters = 0;
+                    if (!node.HasLoweringFlag(GenTreeLinearFlags.GcSafePoint) ||
+                        !node.HasLoweringFlag(GenTreeLinearFlags.CallerSavedRegistersPreserved) ||
+                        !_nodePositions.TryGetValue(node.LinearId, out int position))
+                    {
+                        continue;
+                    }
+
+                    ulong mask = 0;
+                    foreach (var allocation in _allocations.Values)
+                    {
+                        mask |= LiveRegisterMask(allocation.Segments, position);
+                        for (int f = 0; f < allocation.Fragments.Length; f++)
+                            mask |= LiveRegisterMask(allocation.Fragments[f].Segments, position);
+                    }
+
+                    node.SafePointLiveRegisters = mask;
+                }
+            }
+
+            private static ulong LiveRegisterMask(ImmutableArray<RegisterAllocationSegment> segments, int position)
+            {
+                ulong mask = 0;
+                for (int i = 0; i < segments.Length; i++)
+                {
+                    RegisterAllocationSegment segment = segments[i];
+                    if (segment.Contains(position) && segment.Location.Kind == RegisterOperandKind.Register)
+                        mask |= MachineRegisters.MaskOf(segment.Location.Register);
+                }
+                return mask;
             }
 
             private enum AllocationStreamItemKind : byte

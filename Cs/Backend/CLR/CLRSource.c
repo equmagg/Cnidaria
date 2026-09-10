@@ -187,7 +187,7 @@ typedef union RhEhRegisterContext
     usize alignment;
 } RhEhRegisterContext;
 
-#if defined(__riscv_flen) && __riscv_flen >= 32
+#if (defined(__riscv_flen) && __riscv_flen >= 32) || defined(__i386__) || defined(__x86_64__)
 typedef union RhFloatBits
 {
     float value;
@@ -195,7 +195,7 @@ typedef union RhFloatBits
 } RhFloatBits;
 #endif
 
-#if defined(__riscv_flen) && __riscv_flen >= 64 && __SIZEOF_POINTER__ == 8
+#if (defined(__riscv_flen) && __riscv_flen >= 64 || defined(__x86_64__)) && __SIZEOF_POINTER__ == 8
 typedef union RhDoubleBits
 {
     double value;
@@ -266,7 +266,7 @@ RhEhFrame RhpEhFrames[RH_EH_MAX_FRAMES];
 RhEhRegisterContext RhpEhRegisterContexts[RH_EH_MAX_FRAMES];
 RhObject* RhpCurrentException;
 
-#if defined(__riscv_flen) && __riscv_flen >= 32
+#if (defined(__riscv_flen) && __riscv_flen >= 32) || defined(__i386__) || defined(__x86_64__)
 float RhpFmodF(float x, float y)
 {
     RhFloatBits ux;
@@ -369,7 +369,7 @@ float RhpFmodF(float x, float y)
 }
 #endif
 
-#if defined(__riscv_flen) && __riscv_flen >= 64 && __SIZEOF_POINTER__ == 8
+#if (defined(__riscv_flen) && __riscv_flen >= 64 || defined(__x86_64__)) && __SIZEOF_POINTER__ == 8
 double RhpFmod(double x, double y)
 {
     RhDoubleBits ux;
