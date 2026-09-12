@@ -15,6 +15,7 @@ namespace Cnidaria.Cs
         public bool EmitStartup { get; set; } = true;
         public bool MarkMethodsCodeGenerated { get; set; } = true;
         public bool EmbedRuntime { get; set; } = true;
+        public bool TrimRuntime { get; set; } = true;
         public Func<RuntimeMethod, string>? InternalCallSymbolResolver { get; set; }
         public Func<RuntimeMethod, string>? ExternalSymbolResolver { get; set; }
     }
@@ -51,9 +52,49 @@ namespace Cnidaria.Cs
             }
 
             X86Program managed = new Generator(program, target, X86Target.FromTargetInfo(target), options).Generate();
-            return options.EmbedRuntime
-                ? X86ObjectComposer.Compose(managed, X86Runtime.GetObject(target))
-                : managed;
+            if (!options.EmbedRuntime)
+                return managed;
+
+            X86Program runtime = X86Runtime.GetObject(target);
+            if (options.TrimRuntime)
+                runtime = X86Runtime.Trim(runtime, CollectUndefinedSymbols(managed));
+            return X86ObjectComposer.Compose(managed, runtime);
+        }
+
+        private static List<string> CollectUndefinedSymbols(X86Program managed)
+        {
+            var defined = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var label in managed.Text.Labels)
+                defined.Add(label.Key);
+            foreach (var symbol in managed.Symbols)
+            {
+                if (symbol.Binding != X86ObjectSymbolBinding.External && symbol.Name.Length != 0)
+                    defined.Add(symbol.Name);
+            }
+
+            var undefined = new List<string>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+
+            void Add(string name)
+            {
+                if (name.Length != 0 && !defined.Contains(name) && seen.Add(name))
+                    undefined.Add(name);
+            }
+
+            foreach (var symbol in managed.Symbols)
+            {
+                if (symbol.Binding == X86ObjectSymbolBinding.External)
+                    Add(symbol.Name);
+            }
+            foreach (var relocation in managed.Text.Relocations)
+                Add(relocation.SymbolName);
+            foreach (var section in managed.DataSections)
+            {
+                foreach (var relocation in section.Relocations)
+                    Add(relocation.SymbolName);
+            }
+
+            return undefined;
         }
 
         private sealed class Generator
@@ -8415,11 +8456,11 @@ namespace Cnidaria.Cs
                     if (node.SourceOp is BytecodeOp.Ceq or BytecodeOp.Clt or BytecodeOp.Clt_Un or BytecodeOp.Cgt or BytecodeOp.Cgt_Un)
                     {
                         MachineRegister left = RequireUseRegister(node, 0);
-                        MachineRegister right = RequireUseRegister(node, 1);
                         RuntimeType? type = OperandType(node, 0);
                         GenStackKind kind = OperandStackKind(node, 0);
                         if (IsFloating(type, kind))
                         {
+                            MachineRegister right = RequireUseRegister(node, 1);
                             // The unordered cases need a scratch label of their own, so this path keeps the
                             // branch as written rather than folding it into the layout
                             if (inverted)
@@ -8433,10 +8474,13 @@ namespace Cnidaria.Cs
                         }
 
                         int size = StorageSize(type, kind);
+                        X86Operand rightOperand = TryGetContainedIntegerImmediate(node, 1, out long immediate)
+                            ? Imm(immediate)
+                            : Reg(ToX86Register(RequireUseRegister(node, 1), Target), size);
                         _owner.Emit(X86Instruction.Binary(
                             X86InstrKind.Cmp,
                             Reg(ToX86Register(left, Target), size),
-                            Reg(ToX86Register(right, Target), size)));
+                            rightOperand));
                         _owner.Emit(X86Instruction.ConditionalBranch(
                             ComparisonBranchCondition(node.SourceOp, branchWhenTrue),
                             X86Operand.SymbolOperand(BranchTargetLabel(node, inverted, invertedTarget), 4, X86ObjectRelocationKind.Relative32)));

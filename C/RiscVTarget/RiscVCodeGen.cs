@@ -3994,6 +3994,16 @@ namespace Cnidaria.C
                     return;
                 }
 
+                // Copies that read what another one writes only need an order, not a detour through
+                // the frame, and one exists unless the reads and writes form a cycle
+                if (!HasBlockCopyParallelCopy(copies) &&
+                    _allocation.TryOrderParallelCopies(copies, out var ordered))
+                {
+                    foreach (var copy in ordered)
+                        EmitDirectParallelCopy(copy, instruction);
+                    return;
+                }
+
                 if (_allocation.Frame.ParallelCopyTempSize == 0)
                     throw Unsupported(instruction, "Parallel copy requires a temporary frame area.");
 
@@ -4051,11 +4061,14 @@ namespace Cnidaria.C
             }
 
             private bool CanEmitDirectParallelCopies(IReadOnlyList<LirParallelCopy> copies)
+                => !HasBlockCopyParallelCopy(copies) && !HasPhysicalStorageClobber(copies);
+
+            private bool HasBlockCopyParallelCopy(IReadOnlyList<LirParallelCopy> copies)
             {
                 foreach (var copy in copies)
                     if (RequiresBlockCopyStorage(copy.Destination.Type))
-                        return false;
-                return !HasPhysicalStorageClobber(copies);
+                        return true;
+                return false;
             }
 
             private bool HasPhysicalStorageClobber(IReadOnlyList<LirParallelCopy> copies)

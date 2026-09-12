@@ -1,4 +1,4 @@
-using Cnidaria.RiscV;
+using Cnidaria.Arm;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -11,7 +11,7 @@ using System.Threading;
 
 namespace Cnidaria.Cs
 {
-    internal static class RiscVRuntime
+    internal static class ArmRuntime
     {
         public const string InitializeSymbol = "RhpInitialize";
         public const string GcPollSymbol = "RhpGcPoll";
@@ -30,8 +30,6 @@ namespace Cnidaria.Cs
         public const string ArrayGetLengthSymbol = "RhpArrayGetLength";
         public const string ArrayClearSymbol = "RhpArrayClear";
         public const string ArrayCopySymbol = "RhpArrayCopy";
-        public const string FloatingRemainderSingleSymbol = "RhpFmodF";
-        public const string FloatingRemainderDoubleSymbol = "RhpFmod";
         public const string NewStringFromCharSymbol = "RhpNewStringFromChar";
         public const string NewStringFromUtf16Symbol = "RhpNewStringFromUtf16";
         public const string NewStringFromCharArraySymbol = "RhpNewStringFromCharArray";
@@ -47,6 +45,8 @@ namespace Cnidaria.Cs
         public const string EhRegisterContextsSymbol = "RhpEhRegisterContexts";
         public const string CurrentExceptionSymbol = "RhpCurrentException";
         public const string FailFastSymbol = "RhpFallbackFailFast";
+        public const string FloatingRemainderSingleSymbol = "RhpFmodF";
+        public const string FloatingRemainderDoubleSymbol = "RhpFmod";
         private const string ConsoleWriteUtf16Symbol = "RhpConsoleWriteUtf16";
         private const string ConsoleWriteUtf16ZSymbol = "RhpConsoleWriteUtf16Z";
         private const string ConsoleWriteStringSymbol = "RhpConsoleWriteString";
@@ -58,51 +58,57 @@ namespace Cnidaria.Cs
         private sealed class TrimAnalysis
         {
             public ObjectTrimmer Trimmer { get; }
-            public ConcurrentDictionary<string, RiscVProgram> Results { get; } = new ConcurrentDictionary<string, RiscVProgram>(StringComparer.Ordinal);
+            public ConcurrentDictionary<string, ArmProgram> Results { get; } = new ConcurrentDictionary<string, ArmProgram>(StringComparer.Ordinal);
 
             public TrimAnalysis(ObjectTrimmer trimmer) => Trimmer = trimmer;
         }
 
-        private static readonly ConditionalWeakTable<RiscVProgram, TrimAnalysis> TrimAnalyses = new ConditionalWeakTable<RiscVProgram, TrimAnalysis>();
+        private static readonly ConditionalWeakTable<ArmProgram, TrimAnalysis> TrimAnalyses = new ConditionalWeakTable<ArmProgram, TrimAnalysis>();
 
 
-        private static readonly ConcurrentDictionary<string, Lazy<RiscVProgram>> RuntimeObjects =
-            new ConcurrentDictionary<string, Lazy<RiscVProgram>>(StringComparer.Ordinal);
+        private static readonly ConcurrentDictionary<string, Lazy<ArmProgram>> RuntimeObjects =
+            new ConcurrentDictionary<string, Lazy<ArmProgram>>(StringComparer.Ordinal);
 
-        public static RiscVProgram GetObject(TargetInfo target)
+        public static ArmProgram GetObject(TargetInfo target)
         {
             if (target is null)
                 throw new ArgumentNullException(nameof(target));
-            if (!target.IsRiscV || target.OperatingSystem != OperatingSystemKind.Linux)
-                throw new NotSupportedException("The embedded RISC-V runtime supports Linux RISC-V targets only.");
+            if (target.Architecture != TargetArchitectureKind.Arm64 ||
+                target.OperatingSystem is not (OperatingSystemKind.Linux or OperatingSystemKind.Windows))
+            {
+                throw new NotSupportedException("The embedded ARM runtime supports Linux and Windows arm64 targets only.");
+            }
 
-            string key = $"{target.Architecture}:{(ulong)target.ArchitectureFeatures}:{target.Endianness}";
+            string key = $"{target.Architecture}:{target.OperatingSystem}:{(ulong)target.ArchitectureFeatures}:{target.Endianness}";
             return RuntimeObjects.GetOrAdd(
                 key,
-                _ => new Lazy<RiscVProgram>(
+                _ => new Lazy<ArmProgram>(
                     () => Compile(target),
                     LazyThreadSafetyMode.ExecutionAndPublication)).Value;
         }
 
-        private static TrimAnalysis Analyze(RiscVProgram runtime)
+        private static TrimAnalysis Analyze(ArmProgram runtime)
         {
             var trimmer = new ObjectTrimmer();
-            trimmer.AddSection(TextSectionName, checked(runtime.Text.Instructions.Length * 4), 1);
+            trimmer.AddSection(TextSectionName, runtime.Text.SizeInBytes, 1);
             foreach (var section in runtime.DataSections)
                 trimmer.AddSection(section.Name, checked(section.Data.Length + section.BssSize), section.Alignment);
 
             foreach (var symbol in runtime.Symbols)
             {
-                if (symbol.Kind == RVObjectSymbolKind.Section || symbol.Binding == RVObjectSymbolBinding.External)
+                if (symbol.Kind == ArmObjectSymbolKind.Section || symbol.Binding == ArmObjectSymbolBinding.External)
                     continue;
                 trimmer.AddDefinition(symbol.Name, symbol.SectionName, symbol.Offset, symbol.Size);
             }
 
             for (int i = 0; i < runtime.Text.Instructions.Length; i++)
             {
-                RVInstruction instruction = runtime.Text.Instructions[i];
-                if (instruction.HasSymbol)
-                    trimmer.AddReference(TextSectionName, checked(i * 4), instruction.Symbol!);
+                ArmInstruction instruction = runtime.Text.Instructions[i];
+                int offset = checked(i * 4);
+                AddOperandReference(trimmer, offset, instruction.Operand0);
+                AddOperandReference(trimmer, offset, instruction.Operand1);
+                AddOperandReference(trimmer, offset, instruction.Operand2);
+                AddOperandReference(trimmer, offset, instruction.Operand3);
             }
 
             foreach (var relocation in runtime.Text.Relocations)
@@ -116,7 +122,7 @@ namespace Cnidaria.Cs
             return new TrimAnalysis(trimmer);
         }
 
-        public static RiscVProgram Trim(RiscVProgram runtime, IEnumerable<string> rootSymbols)
+        public static ArmProgram Trim(ArmProgram runtime, IEnumerable<string> rootSymbols)
         {
             if (runtime is null)
                 throw new ArgumentNullException(nameof(runtime));
@@ -128,10 +134,10 @@ namespace Cnidaria.Cs
             ObjectTrimLayout layout = trimmer.Trim(rootSymbols);
             if (!layout.RemovedAnything)
                 return runtime;
-            if (analysis.Results.TryGetValue(layout.LiveKey, out RiscVProgram? cached))
+            if (analysis.Results.TryGetValue(layout.LiveKey, out ArmProgram? cached))
                 return cached;
 
-            var instructions = ImmutableArray.CreateBuilder<RVInstruction>();
+            var instructions = ImmutableArray.CreateBuilder<ArmInstruction>();
             for (int i = 0; i < runtime.Text.Instructions.Length; i++)
             {
                 if (layout.IsLive(TextSectionName, checked(i * 4)))
@@ -141,18 +147,18 @@ namespace Cnidaria.Cs
             var labels = new Dictionary<string, int>(StringComparer.Ordinal);
             foreach (var label in runtime.Text.Labels)
             {
-                if (layout.IsLive(TextSectionName, label.Value) || label.Value == checked(runtime.Text.Instructions.Length * 4))
+                if (layout.IsLive(TextSectionName, label.Value) || label.Value == runtime.Text.SizeInBytes)
                     labels[label.Key] = layout.Map(TextSectionName, label.Value);
             }
 
-            var textRelocations = ImmutableArray.CreateBuilder<RVObjectRelocation>();
+            var textRelocations = ImmutableArray.CreateBuilder<ArmObjectRelocation>();
             var referenced = new HashSet<string>(StringComparer.Ordinal);
             foreach (var relocation in runtime.Text.Relocations)
             {
                 if (!layout.IsLive(TextSectionName, relocation.Offset))
                     continue;
                 referenced.Add(relocation.SymbolName);
-                textRelocations.Add(new RVObjectRelocation(
+                textRelocations.Add(new ArmObjectRelocation(
                     relocation.SectionName,
                     layout.Map(TextSectionName, relocation.Offset),
                     relocation.SymbolName,
@@ -160,7 +166,7 @@ namespace Cnidaria.Cs
                     relocation.Kind));
             }
 
-            var dataSections = ImmutableArray.CreateBuilder<RVDataSection>(runtime.DataSections.Length);
+            var dataSections = ImmutableArray.CreateBuilder<ArmDataSection>(runtime.DataSections.Length);
             foreach (var section in runtime.DataSections)
             {
                 var data = ImmutableArray.CreateBuilder<byte>();
@@ -177,13 +183,13 @@ namespace Cnidaria.Cs
                         bssSize++;
                 }
 
-                var relocations = ImmutableArray.CreateBuilder<RVObjectRelocation>();
+                var relocations = ImmutableArray.CreateBuilder<ArmObjectRelocation>();
                 foreach (var relocation in section.Relocations)
                 {
                     if (!layout.IsLive(section.Name, relocation.Offset))
                         continue;
                     referenced.Add(relocation.SymbolName);
-                    relocations.Add(new RVObjectRelocation(
+                    relocations.Add(new ArmObjectRelocation(
                         relocation.SectionName,
                         layout.Map(section.Name, relocation.Offset),
                         relocation.SymbolName,
@@ -191,7 +197,7 @@ namespace Cnidaria.Cs
                         relocation.Kind));
                 }
 
-                dataSections.Add(new RVDataSection(
+                dataSections.Add(new ArmDataSection(
                     section.Name,
                     section.Kind,
                     section.Alignment,
@@ -200,10 +206,10 @@ namespace Cnidaria.Cs
                     relocations.ToImmutable()));
             }
 
-            var symbols = ImmutableArray.CreateBuilder<RVObjectSymbol>();
+            var symbols = ImmutableArray.CreateBuilder<ArmObjectSymbol>();
             foreach (var symbol in runtime.Symbols)
             {
-                if (symbol.Binding == RVObjectSymbolBinding.External)
+                if (symbol.Binding == ArmObjectSymbolBinding.External)
                 {
                     if (referenced.Contains(symbol.Name))
                         symbols.Add(symbol);
@@ -212,11 +218,11 @@ namespace Cnidaria.Cs
 
                 int originalSize = symbol.SectionName.Length == 0
                     ? symbol.Size
-                    : symbol.Kind == RVObjectSymbolKind.Section
+                    : symbol.Kind == ArmObjectSymbolKind.Section
                         ? SectionOriginalSize(runtime, symbol.SectionName)
                         : symbol.Size;
 
-                if (symbol.Kind != RVObjectSymbolKind.Section)
+                if (symbol.Kind != ArmObjectSymbolKind.Section)
                 {
                     bool keep = symbol.Size > 0
                         ? layout.IsDefinitionLive(symbol.Name)
@@ -227,7 +233,7 @@ namespace Cnidaria.Cs
 
                 int start = layout.Map(symbol.SectionName, symbol.Offset);
                 int end = layout.Map(symbol.SectionName, checked(symbol.Offset + originalSize));
-                symbols.Add(new RVObjectSymbol(
+                symbols.Add(new ArmObjectSymbol(
                     symbol.Name,
                     symbol.SectionName,
                     start,
@@ -237,9 +243,9 @@ namespace Cnidaria.Cs
                     symbol.IsTentative));
             }
 
-            var trimmed = new RiscVProgram(
+            var trimmed = new ArmProgram(
                 runtime.Target,
-                new RVTextSection(instructions.ToImmutable(), labels, textRelocations.ToImmutable()),
+                new ArmTextSection(instructions.ToImmutable(), labels, textRelocations.ToImmutable()),
                 dataSections.ToImmutable(),
                 symbols.ToImmutable(),
                 runtime.EntrySymbol);
@@ -247,10 +253,16 @@ namespace Cnidaria.Cs
             return trimmed;
         }
 
-        private static int SectionOriginalSize(RiscVProgram runtime, string sectionName)
+        private static void AddOperandReference(ObjectTrimmer trimmer, int offset, ArmOperand operand)
+        {
+            if (operand.HasSymbol)
+                trimmer.AddReference(TextSectionName, offset, operand.Symbol!);
+        }
+
+        private static int SectionOriginalSize(ArmProgram runtime, string sectionName)
         {
             if (StringComparer.Ordinal.Equals(sectionName, TextSectionName))
-                return checked(runtime.Text.Instructions.Length * 4);
+                return runtime.Text.SizeInBytes;
             foreach (var section in runtime.DataSections)
             {
                 if (StringComparer.Ordinal.Equals(section.Name, sectionName))
@@ -269,7 +281,7 @@ namespace Cnidaria.Cs
             if (IsSystemType(method.DeclaringType, "Array"))
             {
                 if (method.HasThis &&
-                    !method.IsStatic &&
+                   !method.IsStatic &&
                     method.ParameterTypes.Length == 0 &&
                     method.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Int32 &&
                     StringComparer.Ordinal.Equals(method.Name, "get_Length") &&
@@ -465,15 +477,15 @@ namespace Cnidaria.Cs
             => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
                StringComparer.Ordinal.Equals(type.Name, name);
 
-        private static RiscVProgram Compile(TargetInfo target)
+        private static ArmProgram Compile(TargetInfo target)
         {
             var cTarget = Cnidaria.C.TargetInfo
-                .ForArchitecture(target.Architecture, OperatingSystemKind.Linux, target.ArchitectureFeatures)
+                .ForArchitecture(target.Architecture, target.OperatingSystem, target.ArchitectureFeatures)
                 .WithFeatures(target.ArchitectureFeatures);
             string source = ReadRuntimeSource("CLRSource.c");
             var compilation = Cnidaria.C.Compilation.CreateFromSource(
                 source,
-                filePath: "runtime/riscv_linux_runtime.c",
+                filePath: $"runtime/arm64_{(target.OperatingSystem == OperatingSystemKind.Windows ? "windows" : "linux")}_runtime.c",
                 includeStandardHeaders: false,
                 options: new Cnidaria.C.CompilationOptions(cTarget));
             var errors = compilation.GetDiagnostics()
@@ -481,14 +493,14 @@ namespace Cnidaria.Cs
                 .Select(diagnostic => diagnostic.GetMessage(source))
                 .ToArray();
             if (errors.Length != 0)
-                throw new InvalidOperationException($"RISC-V runtime compilation failed: {string.Join("\n", errors)}");
+                throw new InvalidOperationException($"ARM runtime compilation failed: {string.Join("\n", errors)}");
 
             var semanticModel = compilation.GetSemanticModel(compilation.SyntaxTrees[0]);
             var gimple = Cnidaria.C.GimplePipeline.Run(semanticModel);
             var lir = Cnidaria.C.LirModule.Lower(gimple);
-            return Cnidaria.C.RiscVCodeGenerator.Generate(
+            return Cnidaria.C.ArmCodeGenerator.Generate(
                 lir,
-                options: new Cnidaria.C.RiscVCodeGeneratorOptions
+                options: new Cnidaria.C.ArmCodeGeneratorOptions
                 {
                     EmitStartup = false,
                     EntryFunctionName = InitializeSymbol,
@@ -496,7 +508,7 @@ namespace Cnidaria.Cs
         }
         private static string ReadRuntimeSource(string fileName)
         {
-            var asm = typeof(RiscVRuntime).Assembly;
+            var asm = typeof(ArmRuntime).Assembly;
             string resourceName = $"Cnidaria.Cs.Backend.CLR.{fileName}";
             using (var s = asm.GetManifestResourceStream(resourceName))
             {

@@ -1315,7 +1315,34 @@ namespace Cnidaria.Cs
             slots.AddRange(layout.LocalSlots);
             slots.AddRange(layout.TempSlots);
             slots.AddRange(layout.SpillSlots);
-            slots.AddRange(layout.OutgoingArgumentSlots);
+
+            // The outgoing area is a union over the call sites, so its slots overlap by design
+            int outgoingEnd = layout.OutgoingArgumentAreaOffset;
+            for (int i = 0; i < layout.OutgoingArgumentSlots.Length; i++)
+            {
+                var outgoing = layout.OutgoingArgumentSlots[i];
+                if (outgoing.Offset < 0 || outgoing.Size < 0 || outgoing.Alignment <= 0)
+                    throw new InvalidOperationException($"Invalid stack frame slot {outgoing}.");
+                if (outgoing.Offset % outgoing.Alignment != 0)
+                    throw new InvalidOperationException($"Misaligned stack frame slot {outgoing}.");
+                if (outgoing.EndOffset > layout.FrameSize)
+                    throw new InvalidOperationException($"Stack frame slot escapes frame: " + outgoing + ".");
+                outgoingEnd = Math.Max(outgoingEnd, outgoing.EndOffset);
+            }
+
+            if (outgoingEnd > checked(layout.OutgoingArgumentAreaOffset + layout.OutgoingArgumentAreaSize))
+                throw new InvalidOperationException("Outgoing argument slot escapes the outgoing argument area.");
+
+            if (layout.OutgoingArgumentSlots.Length != 0)
+            {
+                slots.Add(new StackFrameSlot(
+                    StackFrameSlotKind.OutgoingArgument,
+                    0,
+                    layout.OutgoingArgumentAreaOffset,
+                    checked(outgoingEnd - layout.OutgoingArgumentAreaOffset),
+                    Math.Max(1, method.GenTreeMethod.Target.StackSlotSize),
+                    RegisterClass.General));
+            }
 
             for (int i = 0; i < slots.Count; i++)
             {

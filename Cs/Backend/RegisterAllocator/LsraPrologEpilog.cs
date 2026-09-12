@@ -412,7 +412,8 @@ namespace Cnidaria.Cs
                         checked(slot.Offset + offset),
                         chunk);
 
-                    if (Target.IsX86)
+                    var zero = RegisterInfo.ZeroRegister(Target);
+                    if (zero == MachineRegister.Invalid)
                     {
                         nodes.Add(GenTreeLirFactory.DefaultValue(
                             _nextNodeId++,
@@ -430,7 +431,7 @@ namespace Cnidaria.Cs
                             blockId,
                             nodes.Count,
                             destination,
-                            RegisterOperand.ForRegister(MachineRegisters.Zero),
+                            RegisterOperand.ForRegister(zero),
                             destinationValue: null,
                             sourceValue: null,
                             comment: "prolog: zero GC home slot",
@@ -1083,9 +1084,7 @@ namespace Cnidaria.Cs
                 ref int floatArgumentIndex,
                 ref int incomingStackArgumentIndex)
             {
-                var source = MachineAbi.AssignScalarArgumentLocation(
-                    RegisterClass.General,
-                    Target.PointerSize,
+                var source = MachineAbi.AssignHiddenReturnBufferLocation(
                     ref generalArgumentIndex,
                     ref floatArgumentIndex,
                     ref incomingStackArgumentIndex,
@@ -1299,9 +1298,7 @@ namespace Cnidaria.Cs
                 ref int floatArgumentIndex,
                 ref int incomingStackArgumentIndex)
             {
-                _ = MachineAbi.AssignScalarArgumentLocation(
-                    RegisterClass.General,
-                    Target.PointerSize,
+                _ = MachineAbi.AssignHiddenReturnBufferLocation(
                     ref generalArgumentIndex,
                     ref floatArgumentIndex,
                     ref incomingStackArgumentIndex,

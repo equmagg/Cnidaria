@@ -528,7 +528,7 @@ namespace Cnidaria.Cs
                 int gcSpillOffset = cursor;
                 int gcRootSpillSlotCount = 0;
                 int gcSpillSize = 0;
-                bool supportsGcTransitionArea = Target.IsRiscV || Target.IsX86;
+                bool supportsGcTransitionArea = Target.IsRiscV || Target.IsX86 || Target.IsArm;
                 bool hasGcSafePoint = supportsGcTransitionArea && MethodHasGcSafePoint();
                 int typeOperationScratchSize = supportsGcTransitionArea ? ComputeTypeOperationScratchSize() : 0;
                 if (supportsGcTransitionArea && (hasGcSafePoint || typeOperationScratchSize != 0))
@@ -629,7 +629,8 @@ namespace Cnidaria.Cs
                             return true;
                         if (method.HasInternalCall != true ||
                              (Target.IsRiscV && RiscVRuntime.IsGcSafePointInternalCall(method)) ||
-                             (Target.IsX86 && X86Runtime.IsGcSafePointInternalCall(method)))
+                             (Target.IsX86 && X86Runtime.IsGcSafePointInternalCall(method)) ||
+                             (Target.IsArm && ArmRuntime.IsGcSafePointInternalCall(method)))
                         {
                             return true;
                         }
@@ -862,9 +863,9 @@ namespace Cnidaria.Cs
 
             private bool RequiresFramePointer()
             {
-                if ((Target.IsRiscV || Target.IsX86) && MethodHasGcSafePoint())
+                if ((Target.IsRiscV || Target.IsX86 || Target.IsArm) && MethodHasGcSafePoint())
                     return true;
-                if ((Target.IsRiscV || Target.IsX86) && ComputeTypeOperationScratchSize() != 0)
+                if ((Target.IsRiscV || Target.IsX86 || Target.IsArm) && ComputeTypeOperationScratchSize() != 0)
                     return true;
 
                 if (_options.UseFramePointerForFunclets && _method.Funclets.Length > 1)
@@ -1220,9 +1221,7 @@ namespace Cnidaria.Cs
                 {
                     if (hiddenReturnBufferIndex == i)
                     {
-                        _ = MachineAbi.AssignScalarArgumentLocation(
-                            RegisterClass.General,
-                            Target.PointerSize,
+                        _ = MachineAbi.AssignHiddenReturnBufferLocation(
                             ref generalArgumentIndex,
                             ref floatArgumentIndex,
                             ref incomingStackArgumentIndex,
@@ -1411,9 +1410,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i <= argumentIndex; i++)
                 {
                     if (hiddenReturnBufferIndex == i)
-                        _ = MachineAbi.AssignScalarArgumentLocation(
-                            RegisterClass.General,
-                            Target.PointerSize,
+                        _ = MachineAbi.AssignHiddenReturnBufferLocation(
                             ref generalArgumentIndex,
                             ref floatArgumentIndex,
                             ref incomingStackArgumentIndex,
@@ -1531,50 +1528,52 @@ namespace Cnidaria.Cs
                 return new StorageInfo(size, align);
             }
 
+            // The callee reads its stack arguments off a fixed grid, so the area is that grid: a
+            // wide argument covers the slots after its own instead of pushing them along
             private void AllocateOutgoingArgumentSlots(ImmutableArray<StackFrameSlot>.Builder slots, ref int cursor)
             {
                 if (_outgoingArgumentSpecs.Count == 0)
                     return;
 
-                var specs = new List<OutgoingArgumentSpec>(_outgoingArgumentSpecs.Values);
-                specs.Sort(static (a, b) => a.Index.CompareTo(b.Index));
-
-                int nextIndex = 0;
-                for (int i = 0; i < specs.Count; i++)
+                int slotSize = Math.Max(1, Target.StackSlotSize);
+                int lastIndex = 0;
+                int areaSize = 0;
+                int areaAlignment = slotSize;
+                foreach (var spec in _outgoingArgumentSpecs.Values)
                 {
-                    var spec = specs[i];
-                    if (spec.Index < nextIndex)
-                        continue;
+                    lastIndex = Math.Max(lastIndex, spec.Index);
+                    int specSize = spec.Size <= 0 ? slotSize : spec.Size;
+                    areaSize = Math.Max(areaSize, checked(spec.Index * slotSize + specSize));
+                    areaAlignment = Math.Max(areaAlignment, spec.Alignment);
+                }
 
-                    while (nextIndex < spec.Index)
-                    {
-                        var defaultStorage = StorageForOutgoingArgumentSlot(RegisterClass.General, StorageForRegisterClass(RegisterClass.General));
-                        cursor = AlignUp(cursor, defaultStorage.Alignment);
-                        slots.Add(new StackFrameSlot(
-                            StackFrameSlotKind.OutgoingArgument,
-                            nextIndex++,
-                            cursor,
-                            defaultStorage.Size,
-                            defaultStorage.Alignment,
-                            RegisterClass.General));
-                        cursor = checked(cursor + defaultStorage.Size);
-                    }
+                cursor = AlignUp(cursor, areaAlignment);
+                int baseOffset = cursor;
 
-                    RegisterClass registerClass = spec.RegisterClass == RegisterClass.Invalid ? RegisterClass.General : spec.RegisterClass;
-                    var fallback = StorageForRegisterClass(registerClass);
-                    int size = spec.Size <= 0 ? fallback.Size : spec.Size;
-                    int align = spec.Alignment <= 0 ? fallback.Alignment : spec.Alignment;
-                    cursor = AlignUp(cursor, align);
+                for (int index = 0; index <= lastIndex; index++)
+                {
+                    _outgoingArgumentSpecs.TryGetValue(index, out var spec);
+                    RegisterClass registerClass = spec is null || spec.RegisterClass == RegisterClass.Invalid
+                        ? RegisterClass.General
+                        : spec.RegisterClass;
+                    var storage = StorageForOutgoingArgumentSlot(registerClass, StorageForRegisterClass(registerClass));
+                    int size = spec is null || spec.Size <= 0 ? storage.Size : spec.Size;
+                    int align = spec is null || spec.Alignment <= 0 ? storage.Alignment : spec.Alignment;
+                    int offset = checked(baseOffset + index * slotSize);
+
+                    while (align > slotSize && offset % align != 0)
+                        align >>= 1;
+
                     slots.Add(new StackFrameSlot(
                         StackFrameSlotKind.OutgoingArgument,
-                        spec.Index,
-                        cursor,
+                        index,
+                        offset,
                         size,
                         align,
                         registerClass));
-                    cursor = checked(cursor + size);
-                    nextIndex = checked(spec.Index + MachineAbi.StackSlotsForArgumentSize(size, Target));
                 }
+
+                cursor = checked(baseOffset + Math.Max(areaSize, checked((lastIndex + 1) * slotSize)));
             }
 
             private ImmutableArray<GenTreeBlock> RewriteBlocks(out ImmutableArray<GenTree> allNodes)

@@ -701,7 +701,7 @@ namespace Cnidaria.Cs
         public RegisterValueLocation ValueLocationAt(int position, AbiValueInfo abi)
         {
             var scalar = LocationAt(position);
-            if (scalar.IsNone || abi.PassingKind == AbiValuePassingKind.Void)
+            if (abi.PassingKind == AbiValuePassingKind.Void)
                 return new RegisterValueLocation(Value, abi.PassingKind, RegisterOperand.None);
 
             if (abi.PassingKind != AbiValuePassingKind.MultiRegister)
@@ -713,8 +713,10 @@ namespace Cnidaria.Cs
             {
                 if (TryGetAllocatedFragment(i, out var fragment))
                     fragments.Add(fragment.LocationAt(position));
-                else
+                else if (!scalar.IsNone)
                     fragments.Add(OperandAtOffset(scalar, abiSegments[i]));
+                else
+                    return new RegisterValueLocation(Value, abi.PassingKind, RegisterOperand.None);
             }
 
             return new RegisterValueLocation(Value, abi.PassingKind, RegisterOperand.None, fragments.ToImmutable());
@@ -2435,14 +2437,93 @@ namespace Cnidaria.Cs
                     }
                 }
 
-                if (bestRegister == MachineRegister.Invalid || currentNextUse >= bestBlockingNextUse)
+                if (bestRegister != MachineRegister.Invalid && currentNextUse < bestBlockingNextUse)
                 {
-                    SpillFrom(current, allocationStart);
+                    SplitBlockingIntervals(bestRegister, current, allocationStart, bestSegmentEnd, stream, ref streamIndex);
+                    AssignRegisterSegment(current, allocationStart, bestRegister, bestSegmentEnd, stream, ref streamIndex);
                     return;
                 }
 
-                SplitBlockingIntervals(bestRegister, current, allocationStart, bestSegmentEnd, stream, ref streamIndex);
-                AssignRegisterSegment(current, allocationStart, bestRegister, bestSegmentEnd, stream, ref streamIndex);
+                // A reference that must see a register cannot be answered by spilling the interval
+                // that holds it. Nothing is free for even one position, so a register is borrowed for
+                // exactly this reference and whatever held it comes back straight after
+                if (current.RequiresRegisterAt(allocationStart) &&
+                    TryBorrowRegisterForReference(current, allocationStart, stream, ref streamIndex))
+                {
+                    return;
+                }
+
+                // The interval goes to memory only up to its next reference that needs a register,
+                // where it is allocated again rather than staying spilled for the rest of its life
+                int nextRegisterReference = current.NextRegisterReferenceAfter(allocationStart);
+                if (nextRegisterReference != int.MaxValue && nextRegisterReference < current.End)
+                {
+                    current.SplitAssignedRegisterToSpill(allocationStart, nextRegisterReference, GetOrCreateSpillHome(current));
+                    AssignHome(current);
+                    _handled.Add(current);
+                    ScheduleContinuationAt(current, nextRegisterReference, stream, ref streamIndex);
+                    return;
+                }
+
+                SpillFrom(current, allocationStart);
+            }
+
+            private bool TryBorrowRegisterForReference(
+                AllocationInterval current,
+                int allocationStart,
+                List<AllocationStreamItem> stream,
+                ref int streamIndex)
+            {
+                int window = checked(allocationStart + 1);
+                var registers = _options.GetAllocatableRegisters(current.RegisterClass);
+                for (int i = 0; i < registers.Length; i++)
+                {
+                    var reg = registers[i];
+                    if (!RegisterAllowedAtRefPosition(current, reg, allocationStart))
+                        continue;
+                    if (ComputeRegisterSegmentEnd(current, allocationStart, reg, int.MaxValue) < window)
+                        continue;
+                    if (!CanEvictBlockingIntervals(reg, current, allocationStart))
+                        continue;
+
+                    SplitBlockingIntervals(reg, current, allocationStart, window, stream, ref streamIndex);
+                    AssignRegisterSegment(current, allocationStart, reg, window, stream, ref streamIndex);
+                    return true;
+                }
+
+                return false;
+            }
+
+            // An interval can give up the register only where it has somewhere else to be: one that is
+            // referenced at this very position would be left without a location of its own
+            private bool CanEvictBlockingIntervals(MachineRegister register, AllocationInterval current, int position)
+            {
+                return CanEvictBlockingIntervals(_active, register, current, position) &&
+                       CanEvictBlockingIntervals(_inactive, register, current, position);
+            }
+
+            private static bool CanEvictBlockingIntervals(
+                List<AllocationInterval> intervals,
+                MachineRegister register,
+                AllocationInterval current,
+                int position)
+            {
+                for (int i = 0; i < intervals.Count; i++)
+                {
+                    var interval = intervals[i];
+                    if (interval.AssignedRegister != register)
+                        continue;
+
+                    int split = interval.FirstRegisterIntersection(current, position, int.MaxValue);
+                    if (split == int.MaxValue)
+                        continue;
+                    if (interval.MustStayInMemory)
+                        return false;
+                    if (interval.NextRequiredRefPositionAtOrAfter(split) <= position)
+                        return false;
+                }
+
+                return true;
             }
 
             private bool IsAllocatable(MachineRegister register)
@@ -4276,19 +4357,7 @@ namespace Cnidaria.Cs
             }
 
             private bool IsScratchRegister(MachineRegister register)
-            {
-                return (!_method.Target.IsX86 &&
-                        (register == RegisterInfo.ParallelCopyScratch(_method.Target, RegisterClass.General) ||
-                         register == RegisterInfo.ParallelCopyScratch(_method.Target, RegisterClass.Float))) ||
-                       register == MachineRegisters.BackendScratch ||
-                       register == MachineRegisters.TreeScratch3 ||
-                       register == MachineRegisters.ParallelCopyScratch0 ||
-                       register == MachineRegisters.ParallelCopyScratch1 ||
-                       register == MachineRegisters.FloatBackendScratch ||
-                       register == MachineRegisters.FloatTreeScratch3 ||
-                       register == MachineRegisters.FloatParallelCopyScratch0 ||
-                       register == MachineRegisters.FloatParallelCopyScratch1;
-            }
+                => RegisterInfo.IsScratchRegister(_method.Target, register);
 
             private static string MergeMoveComments(string? left, string? right, string fallback)
             {
@@ -5164,23 +5233,15 @@ namespace Cnidaria.Cs
                     return true;
                 }
 
-                var reservedPool = registerClass switch
-                {
-                    RegisterClass.General => MachineRegisters.TreeScratchGprs,
-                    RegisterClass.Float => MachineRegisters.TreeScratchFprs,
-                    _ => ImmutableArray<MachineRegister>.Empty,
-                };
+                var reservedPool = RegisterInfo.TreeScratchRegisters(_method.Target, registerClass);
 
                 var targetScratch = RegisterInfo.ParallelCopyScratch(_method.Target, registerClass);
                 if (TryCandidate(targetScratch, out var selected))
                     return selected;
 
-                if (!_method.Target.IsX86)
-                {
-                    for (int i = 0; i < reservedPool.Length; i++)
-                        if (TryCandidate(reservedPool[i], out selected))
-                            return selected;
-                }
+                for (int i = 0; i < reservedPool.Length; i++)
+                    if (TryCandidate(reservedPool[i], out selected))
+                        return selected;
 
                 var allocatable = _options.GetAllocatableRegisters(registerClass);
                 for (int i = 0; i < allocatable.Length; i++)
@@ -5318,7 +5379,9 @@ namespace Cnidaria.Cs
                 var valueInfo = _method.GetValueInfo(value);
                 var abi = MachineAbi.ClassifyValue(valueInfo.Type, valueInfo.StackKind, isReturn: true, target: _method.Target);
                 var sourceLocation = ValueLocationForUse(value, position, abi);
-                var sourceOperand = sourceLocation.IsScalar ? sourceLocation.Scalar : HomeForUse(value, position);
+                var sourceOperand = sourceLocation.IsFragmented
+                    ? RegisterOperand.None
+                    : sourceLocation.IsScalar ? sourceLocation.Scalar : HomeForUse(value, position);
 
                 if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
                 {
@@ -6611,7 +6674,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i <= argumentIndex; i++)
                 {
                     if (hiddenReturnBufferInsertionIndex == i)
-                        _ = GetMaybeArgumentRegister(RegisterClass.General, ref general, ref floating);
+                        _ = MachineAbi.ConsumeHiddenReturnBufferRegister(method.Target, ref general, ref floating);
 
                     RuntimeType currentType = method.ArgTypes[i];
                     GenStackKind currentStackKind = i == argumentIndex ? info.StackKind : MachineAbi.StackKindForType(currentType);
@@ -7063,6 +7126,34 @@ namespace Cnidaria.Cs
                     if (UsePositions[i] >= position)
                         return UsePositions[i];
                 }
+                return int.MaxValue;
+            }
+
+            public bool RequiresRegisterAt(int position)
+            {
+                for (int i = 0; i < RefPositions.Length; i++)
+                {
+                    var refPosition = RefPositions[i];
+                    if (refPosition.Position != position)
+                        continue;
+                    if ((refPosition.Flags & (LinearRefPositionFlags.RequiresRegister | LinearRefPositionFlags.FixedRegister)) != 0)
+                        return true;
+                }
+
+                return false;
+            }
+
+            public int NextRegisterReferenceAfter(int position)
+            {
+                for (int i = 0; i < RefPositions.Length; i++)
+                {
+                    var refPosition = RefPositions[i];
+                    if (refPosition.Position <= position)
+                        continue;
+                    if ((refPosition.Flags & (LinearRefPositionFlags.RequiresRegister | LinearRefPositionFlags.FixedRegister)) != 0)
+                        return refPosition.Position;
+                }
+
                 return int.MaxValue;
             }
 

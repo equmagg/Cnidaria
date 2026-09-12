@@ -1,3 +1,4 @@
+using Cnidaria.Arm;
 using Cnidaria.C;
 using Cnidaria.RiscV;
 using Cnidaria.X86;
@@ -194,6 +195,58 @@ namespace Cnidaria.Cs
                 lowered.RegisterAllocatedProgram,
                 codeGeneratorOptions,
                 lowered.RegisterAllocatedProgram.Target);
+        }
+
+        public static ArmProgram CompileArmProgram(
+            GenTreeProgram program,
+            BackendOptions? options = null,
+            ArmCodeGeneratorOptions? codeGeneratorOptions = null)
+        {
+            if (program is null)
+                throw new ArgumentNullException(nameof(program));
+
+            var lowered = GenTreeBackendPipeline.RunProgram(
+                program, options ?? BackendOptions.Default, nonCallOperationsClobberCallerSavedRegisters: true);
+            return ArmCodeGenerator.Build(
+                lowered.RegisterAllocatedProgram, codeGeneratorOptions, lowered.RegisterAllocatedProgram.Target);
+        }
+
+        internal static ArmProgram CompileArmMethod(
+            GenTreeMethod method,
+            BackendOptions? options = null,
+            ArmCodeGeneratorOptions? codeGeneratorOptions = null)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+
+            var lowered = GenTreeBackendPipeline.RunMethod(
+                method, options ?? BackendOptions.Default, nonCallOperationsClobberCallerSavedRegisters: true);
+            return ArmCodeGenerator.Build(
+                lowered.RegisterAllocatedProgram, codeGeneratorOptions, lowered.RegisterAllocatedProgram.Target);
+        }
+
+        internal static GenTreeProgram LowerArmProgram(GenTreeProgram program, BackendOptions? options = null)
+        {
+            if (program is null)
+                throw new ArgumentNullException(nameof(program));
+
+            var lowered = GenTreeBackendPipeline.RunProgram(
+                program,
+                options ?? BackendOptions.Default,
+                nonCallOperationsClobberCallerSavedRegisters: true);
+            return lowered.RegisterAllocatedProgram;
+        }
+
+        internal static GenTreeMethod LowerArmMethod(GenTreeMethod method, BackendOptions? options = null)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+
+            var lowered = GenTreeBackendPipeline.RunMethod(
+                method,
+                options ?? BackendOptions.Default,
+                nonCallOperationsClobberCallerSavedRegisters: true);
+            return lowered.RegisterAllocatedProgram.Methods[0];
         }
     }
     internal static class GenTreeBackendPipeline

@@ -187,7 +187,7 @@ typedef union RhEhRegisterContext
     usize alignment;
 } RhEhRegisterContext;
 
-#if (defined(__riscv_flen) && __riscv_flen >= 32) || defined(__i386__) || defined(__x86_64__)
+#if (defined(__riscv_flen) && __riscv_flen >= 32) || defined(__i386__) || defined(__x86_64__) || defined(__aarch64__)
 typedef union RhFloatBits
 {
     float value;
@@ -195,7 +195,7 @@ typedef union RhFloatBits
 } RhFloatBits;
 #endif
 
-#if (defined(__riscv_flen) && __riscv_flen >= 64 || defined(__x86_64__)) && __SIZEOF_POINTER__ == 8
+#if (defined(__riscv_flen) && __riscv_flen >= 64 || defined(__x86_64__) || defined(__aarch64__)) && __SIZEOF_POINTER__ == 8
 typedef union RhDoubleBits
 {
     double value;
@@ -266,7 +266,7 @@ RhEhFrame RhpEhFrames[RH_EH_MAX_FRAMES];
 RhEhRegisterContext RhpEhRegisterContexts[RH_EH_MAX_FRAMES];
 RhObject* RhpCurrentException;
 
-#if (defined(__riscv_flen) && __riscv_flen >= 32) || defined(__i386__) || defined(__x86_64__)
+#if (defined(__riscv_flen) && __riscv_flen >= 32) || defined(__i386__) || defined(__x86_64__) || defined(__aarch64__)
 float RhpFmodF(float x, float y)
 {
     RhFloatBits ux;
@@ -369,7 +369,7 @@ float RhpFmodF(float x, float y)
 }
 #endif
 
-#if (defined(__riscv_flen) && __riscv_flen >= 64 || defined(__x86_64__)) && __SIZEOF_POINTER__ == 8
+#if (defined(__riscv_flen) && __riscv_flen >= 64 || defined(__x86_64__) || defined(__aarch64__)) && __SIZEOF_POINTER__ == 8
 double RhpFmod(double x, double y)
 {
     RhDoubleBits ux;
@@ -1957,6 +1957,20 @@ static usize rh_current_thread_id(void)
         :
         : "ecx", "edx", "memory");
     return result;
+#elif defined(_WIN32) && defined(__aarch64__)
+    usize result;
+    __asm__ volatile(
+        "sub sp, sp, #16\n"
+        "str x30, [sp]\n"
+        "ldr x16, __imp_GetCurrentThreadId\n"
+        "blr x16\n"
+        "ldr x30, [sp]\n"
+        "add sp, sp, #16"
+        : "={x0}"(result)
+        :
+        : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+        "x16", "x17", "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "memory");
+    return result;
 #endif
 }
 
@@ -2029,12 +2043,29 @@ static usize rh_atomic_compare_exchange(volatile usize* address, usize comparand
         : [address] "r"(address), [value] "r"(value)
         : "cc", "memory");
     return original;
+#elif defined(__aarch64__)
+    usize original;
+    usize status;
+    __asm__ volatile(
+        ".Lrh_cas_retry_%=:\n"
+        "ldaxr %[original], [%[address]]\n"
+        "cmp %[original], %[comparand]\n"
+        "b.ne .Lrh_cas_done_%=\n"
+        "stlxr %[status], %[value], [%[address]]\n"
+        "cbnz %[status], .Lrh_cas_retry_%=\n"
+        ".Lrh_cas_done_%=:"
+        : [original] "=&r"(original), [status] "=&r"(status)
+        : [address] "r"(address), [comparand] "r"(comparand), [value] "r"(value)
+        : "cc", "memory");
+    return original;
 #endif
 }
 
 static void rh_cpu_relax(void)
 {
-#if defined(__x86_64__) || defined(__i386__) || defined(__riscv)
+#if defined(__aarch64__)
+    __asm__ volatile("yield" : : : "memory");
+#elif defined(__x86_64__) || defined(__i386__) || defined(__riscv)
     __asm__ volatile("nop" : : : "memory");
 #endif
 }

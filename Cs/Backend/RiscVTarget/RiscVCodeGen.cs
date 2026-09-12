@@ -15,6 +15,7 @@ namespace Cnidaria.Cs
         public bool EmitStartup { get; set; } = true;
         public bool MarkMethodsCodeGenerated { get; set; } = true;
         public bool EmbedRuntime { get; set; } = true;
+        public bool TrimRuntime { get; set; } = true;
         public Func<RuntimeMethod, string>? InternalCallSymbolResolver { get; set; }
         public Func<RuntimeMethod, string>? ExternalSymbolResolver { get; set; }
     }
@@ -190,9 +191,50 @@ namespace Cnidaria.Cs
                     entryLabel);
 
                 if (_options.EmbedRuntime && _target.OperatingSystem == OperatingSystemKind.Linux)
-                    result = RiscVObjectComposer.Compose(result, RiscVRuntime.GetObject(_target));
+                {
+                    RiscVProgram runtime = RiscVRuntime.GetObject(_target);
+                    if (_options.TrimRuntime)
+                        runtime = RiscVRuntime.Trim(runtime, CollectUndefinedSymbols(result));
+                    result = RiscVObjectComposer.Compose(result, runtime);
+                }
 
                 return result;
+            }
+
+            private static List<string> CollectUndefinedSymbols(RiscVProgram managed)
+            {
+                var defined = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var label in managed.Text.Labels)
+                    defined.Add(label.Key);
+                foreach (var symbol in managed.Symbols)
+                {
+                    if (symbol.Binding != RVObjectSymbolBinding.External && symbol.Name.Length != 0)
+                        defined.Add(symbol.Name);
+                }
+
+                var undefined = new List<string>();
+                var seen = new HashSet<string>(StringComparer.Ordinal);
+
+                void Add(string name)
+                {
+                    if (name.Length != 0 && !defined.Contains(name) && seen.Add(name))
+                        undefined.Add(name);
+                }
+
+                foreach (var symbol in managed.Symbols)
+                {
+                    if (symbol.Binding == RVObjectSymbolBinding.External)
+                        Add(symbol.Name);
+                }
+                foreach (var relocation in managed.Text.Relocations)
+                    Add(relocation.SymbolName);
+                foreach (var section in managed.DataSections)
+                {
+                    foreach (var relocation in section.Relocations)
+                        Add(relocation.SymbolName);
+                }
+
+                return undefined;
             }
 
             private void IndexMethods()

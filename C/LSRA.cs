@@ -289,6 +289,21 @@ namespace Cnidaria.C
                         end = start;
                     }
 
+                    // A value that arrives live and is written again later in the block is dead between
+                    // its last read and that write. Leaving the gap out of the interval is what lets the
+                    // allocator hand the write the register the value it reads from already holds, which
+                    // on a loop latch is the difference between an in-place update and a copy back
+                    if (liveIn[block].Contains(register) &&
+                        blockFirstDefs[block].TryGetValue(register, out var rewrite) &&
+                        rewrite > range.Start &&
+                        blockLastUses[block].TryGetValue(register, out var lastRead) &&
+                        lastRead < rewrite)
+                    {
+                        interval.AddRange(range.Start, lastRead + 1);
+                        interval.AddRange(rewrite, Math.Max(rewrite, end));
+                        continue;
+                    }
+
                     interval.AddRange(start, Math.Max(start, end));
                 }
             }
@@ -1983,8 +1998,12 @@ namespace Cnidaria.C
                     continue;
 
                 var copies = physicalCopies.ToImmutable();
-                if (!HasBlockCopyParallelCopy(copies) && !HasPhysicalStorageClobber(copies, allocations, spillOffsets))
+                if (!HasBlockCopyParallelCopy(copies) &&
+                    (!HasPhysicalStorageClobber(copies, allocations, spillOffsets) ||
+                     CanOrderParallelCopies(copies, allocations, spillOffsets)))
+                {
                     continue;
+                }
 
                 var size = 0;
                 foreach (var copy in copies)
@@ -2061,6 +2080,34 @@ namespace Cnidaria.C
             }
 
             return false;
+        }
+
+        /// <summary>
+        /// Reports whether the copies can be run in an order that never reads storage an earlier one
+        /// wrote, which is what lets the frame skip a staging area for them.
+        /// </summary>
+        private static bool CanOrderParallelCopies(
+            ImmutableArray<LirParallelCopy> copies,
+            IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
+            IReadOnlyDictionary<LirVirtualRegister, int> spillOffsets)
+        {
+            var destinations = new PhysicalStorageKey[copies.Length];
+            var sources = new PhysicalStorageKey[copies.Length];
+            for (var i = 0; i < copies.Length; i++)
+            {
+                destinations[i] = TryGetDestinationPhysicalRegister(copies[i].Destination, allocations, out var destinationRegister)
+                    ? PhysicalStorageKey.ForRegister(destinationRegister)
+                    : TryGetDestinationStackOffset(copies[i].Destination, allocations, spillOffsets, out var destinationOffset)
+                        ? PhysicalStorageKey.ForStackOffset(destinationOffset)
+                        : default;
+                sources[i] = TryGetOperandPhysicalRegister(copies[i].Source, allocations, out var sourceRegister)
+                    ? PhysicalStorageKey.ForRegister(sourceRegister)
+                    : TryGetOperandStackOffset(copies[i].Source, allocations, spillOffsets, out var sourceOffset)
+                        ? PhysicalStorageKey.ForStackOffset(sourceOffset)
+                        : default;
+            }
+
+            return ParallelCopySequencer.TryOrder(destinations, sources, out _);
         }
 
         private static bool HasPhysicalStorageClobber(
@@ -2509,6 +2556,7 @@ namespace Cnidaria.C
             order = result.ToImmutable();
             return true;
         }
+
     }
 
     internal sealed class AllocationResult

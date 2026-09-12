@@ -596,7 +596,7 @@ namespace Cnidaria.Cs
 
         private static bool PreservesCallerSavedRegisters(GenTree source, TargetInfo target, LinearMemoryAccess memoryAccess)
         {
-            if (!target.IsRiscV || source.Kind is not (GenTreeKind.LoadIndirect or GenTreeKind.StoreIndirect))
+            if ((!target.IsRiscV && !target.IsArm) || source.Kind is not (GenTreeKind.LoadIndirect or GenTreeKind.StoreIndirect))
                 return false;
 
             if (memoryAccess.IsBlockCopy)
@@ -627,8 +627,8 @@ namespace Cnidaria.Cs
 
             if (source.Kind == GenTreeKind.Binary)
             {
-                // Neither target has an instruction for a floating remainder, so it becomes a call
-                if ((target.IsRiscV || target.IsX86) &&
+                // No machine target has a floating remainder instruction, so it becomes a call
+                if (!target.IsRegisterBytecode &&
                     source.SourceOp == BytecodeOp.Rem &&
                     source.StackKind is GenStackKind.R4 or GenStackKind.R8)
                 {
@@ -748,10 +748,19 @@ namespace Cnidaria.Cs
                 _ => 0,
             };
 
-            if (_target.IsX86 && IsIntegerDivRem(source, result, _target))
+            if ((_target.IsX86 || _target.IsArm) && IsIntegerDivRem(source, result, _target))
                 count++;
 
-            if (_target.IsX86 && (IsCheckedIntegerBinary(source) || IsCheckedIntegerConversion(source)))
+            if ((_target.IsX86 || _target.IsArm) && (IsCheckedIntegerBinary(source) || IsCheckedIntegerConversion(source)))
+                count++;
+
+            // ARM64 keeps two scratch registers out of allocation, and a block-copied value needs both
+            // of them, so the address it is copied through has to be allocated
+            if (_target.IsArm && count == 0 && RequiresArmBlockCopyAddress(source, result))
+                count = 1;
+
+            // The ARM64 type check walks a hierarchy with one pointer more live than those two
+            if (_target.IsArm && RequiresArmTypeCheckRegister(source))
                 count++;
 
             // The field and indirection expansions can need an address register beyond what the value
@@ -866,6 +875,38 @@ namespace Cnidaria.Cs
             return MachineAbi.IsBlockCopyValue(operand.RuntimeType ?? operand.Type, operand.StackKind, _target);
         }
 
+        private static bool RequiresArmTypeCheckRegister(GenTree source)
+            => source.Kind is GenTreeKind.CastClass or GenTreeKind.IsInst ||
+               (source.Kind == GenTreeKind.UnboxAny && (source.RuntimeType ?? source.Type)?.IsValueType != true);
+
+        private bool RequiresArmBlockCopyAddress(GenTree source, GenTree? result)
+        {
+            GenTree? value = source.Kind switch
+            {
+                GenTreeKind.Field or GenTreeKind.ArrayElement or GenTreeKind.LoadIndirect or
+                GenTreeKind.StaticField or GenTreeKind.UnboxAny => result,
+                GenTreeKind.StoreField or GenTreeKind.StoreIndirect => OperandValue(source, 1),
+                GenTreeKind.StoreStaticField or GenTreeKind.Box => OperandValue(source, 0),
+                GenTreeKind.StoreArrayElement => StoreArrayElementOperandValue(source),
+                _ => null,
+            };
+
+            if (value is null)
+                return false;
+
+            AbiValueInfo abi = MachineAbi.ClassifyStorageValue(value.Type, value.StackKind, _target);
+            return abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect;
+        }
+
+        private static GenTree? OperandValue(GenTree node, int operandIndex)
+        {
+            if ((uint)operandIndex >= (uint)node.Operands.Length)
+                return null;
+
+            var operand = node.Operands[operandIndex];
+            return operand.RegisterResult ?? operand;
+        }
+
         private GenTree? MultiRegisterOperandValue(GenTree node, int operandIndex)
         {
             if ((uint)operandIndex >= (uint)node.Operands.Length)
@@ -962,6 +1003,13 @@ namespace Cnidaria.Cs
                 {
                     count++;
                 }
+            }
+
+            // The ARM64 element type check needs one pointer more than that target's two scratch registers
+            if (_target.IsArm && count == 0 &&
+                GenTree.RequiresArrayElementTypeCheck(source.Kind, source.RuntimeType ?? source.Type))
+            {
+                count = 1;
             }
 
             return count;

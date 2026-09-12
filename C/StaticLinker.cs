@@ -92,15 +92,10 @@ namespace Cnidaria.C
             GimplePipelineOptions? gimple = null,
             IEnumerable<SourceFile>? libraryTranslationUnits = null)
         {
-            var requestedTrimming = trimming ?? TrimmingOptions.Default;
-            var effectiveTrimming = new TrimmingOptions(
-                enabled: requestedTrimming.Enabled,
-                preserveExternallyVisibleSymbols: true,
-                rootSymbols: requestedTrimming.RootSymbols);
             CompilationOptions = new CompilationOptions(
                 target ?? throw new ArgumentNullException(nameof(target)),
                 inlining,
-                effectiveTrimming,
+                trimming,
                 gimple);
             IncludeFiles = includeFiles?.ToImmutableArray() ?? ImmutableArray<IncludeFile>.Empty;
             IncludeSearchPaths = includeSearchPaths?.ToImmutableArray() ?? ImmutableArray<string>.Empty;
@@ -380,6 +375,31 @@ namespace Cnidaria.C
             }
 
             var libraryUnits = CompileUnits(librarySources.ToImmutable(), options, diagnostics);
+            var trimming = options.CompilationOptions.Trimming;
+            if (!HasErrors(diagnostics) && trimming.Enabled && !trimming.PreserveExternallyVisibleSymbols)
+            {
+                var units = userUnits.AddRange(libraryUnits);
+                var trimmed = Trimmer.TrimLinked(units.Select(static unit => unit.Gimple).ToImmutableArray(),
+                    userUnits.Length, options.EntryFunctionName, trimming);
+                var users = ImmutableArray.CreateBuilder<CompiledUnit>();
+                var libraries = ImmutableArray.CreateBuilder<CompiledUnit>();
+                for (var i = 0; i < units.Length; i++)
+                {
+                    var unit = units[i];
+                    var rewritten = new CompiledUnit(unit.Source, unit.SemanticModel, unit.Linkage, trimmed[i]);
+                    (i < userUnits.Length ? users : libraries).Add(rewritten);
+                }
+                userUnits = LowerUnits(users.ToImmutable(), diagnostics);
+                libraryUnits = LowerUnits(libraries.ToImmutable(), diagnostics);
+                if (!HasErrors(diagnostics))
+                    FindPrimaryUnit(userUnits, options, diagnostics);
+                return new CompiledInputs(userUnits.AddRange(libraryUnits.Where(static unit =>
+                    unit.Lir.Functions.Length != 0 || unit.Lir.Globals.Any(static global =>
+                        global.Initializer is not null || global.StorageClass != StorageClass.Extern))),
+                    ImmutableArray<CompiledUnit>.Empty);
+            }
+            userUnits = LowerUnits(userUnits, diagnostics);
+            libraryUnits = LowerUnits(libraryUnits, diagnostics);
             return new CompiledInputs(userUnits, libraryUnits);
         }
 
@@ -389,6 +409,13 @@ namespace Cnidaria.C
             ImmutableArray<LinkerDiagnostic>.Builder diagnostics)
         {
             var units = ImmutableArray.CreateBuilder<CompiledUnit>(sources.Length);
+            var compilationOptions = options.CompilationOptions;
+            if (compilationOptions.Trimming.Enabled && !compilationOptions.Trimming.PreserveExternallyVisibleSymbols)
+            {
+                // External definitions must survive until references from other units are known.
+                compilationOptions = new CompilationOptions(compilationOptions.Target, compilationOptions.Inlining,
+                    new TrimmingOptions(rootSymbols: compilationOptions.Trimming.RootSymbols), compilationOptions.Gimple);
+            }
             foreach (var source in sources)
             {
                 SyntaxTree tree;
@@ -407,7 +434,7 @@ namespace Cnidaria.C
                     compilation = Compilation.Create(
                         new[] { tree },
                         source.FilePath,
-                        options.CompilationOptions);
+                        compilationOptions);
                 }
                 catch (Exception exception)
                 {
@@ -465,18 +492,7 @@ namespace Cnidaria.C
                 try
                 {
                     var gimple = GimplePipeline.Run(semanticModel);
-                    var lir = LirModule.Lower(gimple);
-                    foreach (var problem in lir.Problems)
-                    {
-                        diagnostics.Add(new LinkerDiagnostic(
-                            DiagnosticSeverity.Error,
-                            LinkerStage.Lowering,
-                            problem.Message,
-                            source.FilePath));
-                        unitHasErrors = true;
-                    }
-                    if (!unitHasErrors)
-                        units.Add(new CompiledUnit(source, semanticModel, linkage, lir));
+                    units.Add(new CompiledUnit(source, semanticModel, linkage, gimple));
                 }
                 catch (Exception exception)
                 {
@@ -488,6 +504,30 @@ namespace Cnidaria.C
                 }
             }
             return units.ToImmutable();
+        }
+
+        private static ImmutableArray<CompiledUnit> LowerUnits(
+            ImmutableArray<CompiledUnit> units,
+            ImmutableArray<LinkerDiagnostic>.Builder diagnostics)
+        {
+            var lowered = ImmutableArray.CreateBuilder<CompiledUnit>(units.Length);
+            foreach (var unit in units)
+            {
+                try
+                {
+                    foreach (var problem in unit.Lir.Problems)
+                        diagnostics.Add(new LinkerDiagnostic(DiagnosticSeverity.Error, LinkerStage.Lowering,
+                            problem.Message, unit.Source.FilePath));
+                    if (unit.Lir.Problems.Length == 0)
+                        lowered.Add(unit);
+                }
+                catch (Exception exception)
+                {
+                    diagnostics.Add(new LinkerDiagnostic(DiagnosticSeverity.Error, LinkerStage.Lowering,
+                        exception.Message, unit.Source.FilePath));
+                }
+            }
+            return lowered.ToImmutable();
         }
 
         private static int FindPrimaryUnit(
@@ -1285,21 +1325,23 @@ namespace Cnidaria.C
 
         private sealed class CompiledUnit
         {
+            private LirModule? _lir;
             public SourceFile Source { get; }
             public SemanticModel SemanticModel { get; }
             public FileScopeLinkageMap Linkage { get; }
-            public LirModule Lir { get; }
+            public GimplePipelineResult Gimple { get; }
+            public LirModule Lir => _lir ??= LirModule.Lower(Gimple);
 
             public CompiledUnit(
                 SourceFile source,
                 SemanticModel semanticModel,
                 FileScopeLinkageMap linkage,
-                LirModule lir)
+                GimplePipelineResult gimple)
             {
                 Source = source;
                 SemanticModel = semanticModel;
                 Linkage = linkage;
-                Lir = lir;
+                Gimple = gimple;
             }
         }
 

@@ -27,7 +27,8 @@ namespace Cnidaria.C
                 !options.EnableCopyPropagation &&
                 !options.EnableBranchFolding &&
                 !options.EnableDeadCodeElimination &&
-                !options.EnableCommonSubexpressionElimination)
+                !options.EnableCommonSubexpressionElimination &&
+                !options.EnableLoopInvariantCodeMotion)
             {
                 return function;
             }
@@ -38,12 +39,15 @@ namespace Cnidaria.C
                 var pass = new Pass(current, target, options, valueNumberingOptions);
                 var next = pass.Run();
                 if (!pass.Changed)
-                    return current;
+                    break;
 
                 current = next;
             }
 
-            return current;
+            var hoisted = LoopInvariantCodeMotion.Optimize(current, target, options, valueNumberingOptions);
+            return ReferenceEquals(hoisted, current)
+                ? current
+                : new Pass(hoisted, target, options, valueNumberingOptions).Run();
         }
 
         private sealed partial class Pass

@@ -1053,13 +1053,14 @@ namespace Cnidaria.Cs
                     if (!CanEmitDirectCompareBranch(condition.CompareOp, left, right, condition.BranchWhenTrue))
                         return false;
 
-                    left.RegisterResult = LowerValue(left);
-                    right.RegisterResult = LowerValue(right);
                     branch.Kind = condition.BranchWhenTrue ? GenTreeKind.BranchTrue : GenTreeKind.BranchFalse;
                     branch.SourceOp = condition.CompareOp;
+                    left.RegisterResult = LowerValue(left);
+
+                    var operandFlags = LowerCompareBranchRightOperand(branch, left, right);
                     branch.SetOperands(ImmutableArray.Create(left, right));
 
-                    EmitTree(branch, ImmutableArray.Create(LirOperandFlags.None, LirOperandFlags.None), result: null);
+                    EmitTree(branch, operandFlags, result: null);
                     return true;
                 }
 
@@ -1090,13 +1091,25 @@ namespace Cnidaria.Cs
                     if (!CanEmitDirectCompareBranch(condition.CompareOp, left.Source, right.Source, condition.BranchWhenTrue))
                         return false;
 
-                    left.Source.RegisterResult = LowerValue(left);
-                    right.Source.RegisterResult = LowerValue(right);
                     branch.Kind = condition.BranchWhenTrue ? GenTreeKind.BranchTrue : GenTreeKind.BranchFalse;
                     branch.SourceOp = condition.CompareOp;
+                    left.Source.RegisterResult = LowerValue(left);
+
+                    ImmutableArray<LirOperandFlags> operandFlags;
+                    if (CanContainCompareBranchImmediate(branch, left.Source, right.Source))
+                    {
+                        right.Source.IsContainedInLinear = true;
+                        operandFlags = ImmutableArray.Create(LirOperandFlags.None, LirOperandFlags.Contained);
+                    }
+                    else
+                    {
+                        right.Source.RegisterResult = LowerValue(right);
+                        operandFlags = ImmutableArray.Create(LirOperandFlags.None, LirOperandFlags.None);
+                    }
+
                     branch.SetOperands(ImmutableArray.Create(left.Source, right.Source));
 
-                    EmitTree(branch, ImmutableArray.Create(LirOperandFlags.None, LirOperandFlags.None), result: null);
+                    EmitTree(branch, operandFlags, result: null);
                     return true;
                 }
 
@@ -1509,9 +1522,44 @@ namespace Cnidaria.Cs
                 };
             }
 
+            /// <summary>
+            /// Reports whether a comparison folded into its branch can keep the compared constant as an
+            /// immediate, which needs a target whose compare instruction takes one.
+            /// </summary>
+            /// <remarks>
+            /// The RISC-V branches compare two registers, so there the constant has to be materialized
+            /// and containing it would only move the load.
+            /// </remarks>
+            private ImmutableArray<LirOperandFlags> LowerCompareBranchRightOperand(GenTree branch, GenTree left, GenTree right)
+            {
+                if (CanContainCompareBranchImmediate(branch, left, right))
+                {
+                    right.IsContainedInLinear = true;
+                    return ImmutableArray.Create(LirOperandFlags.None, LirOperandFlags.Contained);
+                }
+
+                right.RegisterResult = LowerValue(right);
+                return ImmutableArray.Create(LirOperandFlags.None, LirOperandFlags.None);
+            }
+
+            // The parent of a folded comparison reports the branch, not what was compared, so the
+            // operand kinds the immediate rules depend on have to come from the left side
+            private bool CanContainCompareBranchImmediate(GenTree branch, GenTree left, GenTree right)
+                => !IsFloatLike(left.Type, left.StackKind) &&
+                   left.StackKind is not (GenStackKind.Ref or GenStackKind.Null) &&
+                   CanContainBinaryImmediate(branch, operandIndex: 1, right);
+
+            private bool IsCompareBranchWithImmediate(GenTree parent)
+                => parent.Kind is GenTreeKind.BranchTrue or GenTreeKind.BranchFalse &&
+                   parent.SourceOp is BytecodeOp.Ceq or BytecodeOp.Clt or BytecodeOp.Clt_Un or BytecodeOp.Cgt or BytecodeOp.Cgt_Un &&
+                   (_target.IsX86 || RegisterInfo.IsArm64(_target));
+
             private bool CanContainBinaryImmediate(GenTree parent, int operandIndex, GenTree operand)
             {
-                if (parent.Kind != GenTreeKind.Binary || operandIndex != 1)
+                if (operandIndex != 1)
+                    return false;
+
+                if (parent.Kind != GenTreeKind.Binary && !IsCompareBranchWithImmediate(parent))
                     return false;
 
                 if (operand.Operands.Length != 0)
@@ -1537,12 +1585,97 @@ namespace Cnidaria.Cs
                     return false;
                 }
 
-                return IsBinaryImmediateOp(parent.SourceOp);
+                if (!IsBinaryImmediateOp(parent.SourceOp))
+                    return false;
+
+                if (RegisterInfo.IsArm64(_target))
+                {
+                    long value = operand.Kind == GenTreeKind.ConstI8 ? operand.Int64 : operand.Int32;
+                    return IsArm64ContainableImmediate(parent.SourceOp, value, IsArm64WideOperation(parent, operand));
+                }
+
+                return true;
+            }
+
+            // A comparison reports the width of its result, not of what it compared
+            private static bool IsArm64WideOperation(GenTree parent, GenTree operand)
+            {
+                var stackKind = parent.SourceOp is BytecodeOp.Ceq or BytecodeOp.Clt or BytecodeOp.Clt_Un or BytecodeOp.Cgt or BytecodeOp.Cgt_Un
+                    ? operand.StackKind
+                    : parent.StackKind;
+
+                return stackKind is GenStackKind.I8 or GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr or GenStackKind.ByRef;
+            }
+
+            private static bool IsArm64ContainableImmediate(BytecodeOp op, long value, bool is64Bit)
+            {
+                switch (op)
+                {
+                    case BytecodeOp.Shl:
+                    case BytecodeOp.Shr:
+                    case BytecodeOp.Shr_Un:
+                        return value >= 0 && value < (is64Bit ? 64 : 32);
+
+                    case BytecodeOp.And:
+                    case BytecodeOp.Or:
+                    case BytecodeOp.Xor:
+                        return IsArm64LogicalImmediate(value, is64Bit);
+
+                    // Subtracting the immediate is adding its negation, so either sign fits
+                    default:
+                        return IsArm64AddSubImmediate(value) || IsArm64AddSubImmediate(-value);
+                }
+            }
+
+            private static bool IsArm64AddSubImmediate(long value)
+            {
+                if (value < 0)
+                    return false;
+                if (value <= 0xFFF)
+                    return true;
+                return (value & 0xFFF) == 0 && (value >> 12) <= 0xFFF;
+            }
+
+            // A run of ones rotated inside a power of two wide element repeated across the register
+            private static bool IsArm64LogicalImmediate(long value, bool is64Bit)
+            {
+                ulong bits = is64Bit ? (ulong)value : (uint)value;
+                if (!is64Bit)
+                    bits |= bits << 32;
+
+                if (bits == 0 || bits == ulong.MaxValue)
+                    return false;
+
+                int width = 64;
+                while (width > 2)
+                {
+                    int half = width >> 1;
+                    ulong halfMask = (1UL << half) - 1;
+                    if ((bits & halfMask) != ((bits >> half) & halfMask))
+                        break;
+                    width = half;
+                }
+
+                ulong mask = width == 64 ? ulong.MaxValue : (1UL << width) - 1;
+                ulong element = bits & mask;
+                if (element == 0 || element == mask)
+                    return false;
+
+                for (int rotation = 0; rotation < width; rotation++)
+                {
+                    ulong rotated = rotation == 0
+                        ? element
+                        : ((element >> rotation) | (element << (width - rotation))) & mask;
+                    if (((rotated + 1) & rotated) == 0)
+                        return true;
+                }
+
+                return false;
             }
 
             private bool CanContainPointerElementImmediate(GenTree parent, int operandIndex, GenTree operand)
             {
-                if ((!_target.IsX86 && !_target.IsRiscV) || parent.Kind != GenTreeKind.PointerElementAddr || operandIndex != 1)
+                if ((!_target.IsX86 && !_target.IsRiscV && !_target.IsArm) || parent.Kind != GenTreeKind.PointerElementAddr || operandIndex != 1)
                     return false;
 
                 if (operand.Operands.Length != 0)

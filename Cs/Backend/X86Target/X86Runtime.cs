@@ -1,6 +1,9 @@
 using Cnidaria.X86;
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Runtime.CompilerServices;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -50,6 +53,25 @@ namespace Cnidaria.Cs
         private const string MemsetSymbol = "RhpMemset";
         private const string GetCurrentProcessorNumberSymbol = "RhpGetCurrentProcessorNumber";
 
+        private const string TextSectionName = ".text";
+
+        private sealed class TrimAnalysis
+        {
+            public ObjectTrimmer Trimmer { get; }
+            public ConcurrentDictionary<string, X86Program> Results { get; } = new ConcurrentDictionary<string, X86Program>(StringComparer.Ordinal);
+            public int[] InstructionOffsets { get; }
+            public int TextSize => InstructionOffsets.Length == 0 ? 0 : InstructionOffsets[^1];
+
+            public TrimAnalysis(ObjectTrimmer trimmer, int[] instructionOffsets)
+            {
+                Trimmer = trimmer;
+                InstructionOffsets = instructionOffsets;
+            }
+        }
+
+        private static readonly ConditionalWeakTable<X86Program, TrimAnalysis> TrimAnalyses = new ConditionalWeakTable<X86Program, TrimAnalysis>();
+
+
         private static readonly ConcurrentDictionary<string, Lazy<X86Program>> RuntimeObjects =
             new ConcurrentDictionary<string, Lazy<X86Program>>(StringComparer.Ordinal);
 
@@ -66,6 +88,196 @@ namespace Cnidaria.Cs
                 _ => new Lazy<X86Program>(
                     () => Compile(target),
                     LazyThreadSafetyMode.ExecutionAndPublication)).Value;
+        }
+
+        private static TrimAnalysis Analyze(X86Program runtime)
+        {
+            var instructionOffsets = new int[checked(runtime.Text.Instructions.Length + 1)];
+            for (int i = 0; i < runtime.Text.Instructions.Length; i++)
+            {
+                instructionOffsets[i + 1] = checked(
+                    instructionOffsets[i] + X86CodeEncoder.GetEncodedLength(runtime.Text.Instructions[i], runtime.Target));
+            }
+
+            var trimmer = new ObjectTrimmer();
+            trimmer.AddSection(TextSectionName, instructionOffsets[^1], 1);
+            foreach (var section in runtime.DataSections)
+                trimmer.AddSection(section.Name, checked(section.Data.Length + section.BssSize), section.Alignment);
+
+            foreach (var symbol in runtime.Symbols)
+            {
+                if (symbol.Kind == X86ObjectSymbolKind.Section || symbol.Binding == X86ObjectSymbolBinding.External)
+                    continue;
+                trimmer.AddDefinition(symbol.Name, symbol.SectionName, symbol.Offset, symbol.Size);
+            }
+
+            for (int i = 0; i < runtime.Text.Instructions.Length; i++)
+            {
+                X86Instruction instruction = runtime.Text.Instructions[i];
+                int offset = instructionOffsets[i];
+                AddOperandReference(trimmer, offset, instruction.Operand0);
+                AddOperandReference(trimmer, offset, instruction.Operand1);
+                AddOperandReference(trimmer, offset, instruction.Operand2);
+            }
+
+            foreach (var relocation in runtime.Text.Relocations)
+                trimmer.AddReference(TextSectionName, relocation.Offset, relocation.SymbolName);
+            foreach (var section in runtime.DataSections)
+            {
+                foreach (var relocation in section.Relocations)
+                    trimmer.AddReference(section.Name, relocation.Offset, relocation.SymbolName);
+            }
+
+            return new TrimAnalysis(trimmer, instructionOffsets);
+        }
+
+        public static X86Program Trim(X86Program runtime, IEnumerable<string> rootSymbols)
+        {
+            if (runtime is null)
+                throw new ArgumentNullException(nameof(runtime));
+            if (rootSymbols is null)
+                throw new ArgumentNullException(nameof(rootSymbols));
+
+            TrimAnalysis analysis = TrimAnalyses.GetValue(runtime, Analyze);
+            ObjectTrimmer trimmer = analysis.Trimmer;
+            ObjectTrimLayout layout = trimmer.Trim(rootSymbols);
+            if (!layout.RemovedAnything)
+                return runtime;
+            if (analysis.Results.TryGetValue(layout.LiveKey, out X86Program? cached))
+                return cached;
+
+            var instructions = ImmutableArray.CreateBuilder<X86Instruction>();
+            for (int i = 0; i < runtime.Text.Instructions.Length; i++)
+            {
+                if (layout.IsLive(TextSectionName, analysis.InstructionOffsets[i]))
+                    instructions.Add(runtime.Text.Instructions[i]);
+            }
+
+            var labels = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var label in runtime.Text.Labels)
+            {
+                if (layout.IsLive(TextSectionName, label.Value) || label.Value == analysis.TextSize)
+                    labels[label.Key] = layout.Map(TextSectionName, label.Value);
+            }
+
+            var textRelocations = ImmutableArray.CreateBuilder<X86ObjectRelocation>();
+            var referenced = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var relocation in runtime.Text.Relocations)
+            {
+                if (!layout.IsLive(TextSectionName, relocation.Offset))
+                    continue;
+                referenced.Add(relocation.SymbolName);
+                textRelocations.Add(new X86ObjectRelocation(
+                    relocation.SectionName,
+                    layout.Map(TextSectionName, relocation.Offset),
+                    relocation.SymbolName,
+                    relocation.Addend,
+                    relocation.Kind));
+            }
+
+            var dataSections = ImmutableArray.CreateBuilder<X86DataSection>(runtime.DataSections.Length);
+            foreach (var section in runtime.DataSections)
+            {
+                var data = ImmutableArray.CreateBuilder<byte>();
+                for (int i = 0; i < section.Data.Length; i++)
+                {
+                    if (layout.IsLive(section.Name, i))
+                        data.Add(section.Data[i]);
+                }
+
+                int bssSize = 0;
+                for (int i = 0; i < section.BssSize; i++)
+                {
+                    if (layout.IsLive(section.Name, checked(section.Data.Length + i)))
+                        bssSize++;
+                }
+
+                var relocations = ImmutableArray.CreateBuilder<X86ObjectRelocation>();
+                foreach (var relocation in section.Relocations)
+                {
+                    if (!layout.IsLive(section.Name, relocation.Offset))
+                        continue;
+                    referenced.Add(relocation.SymbolName);
+                    relocations.Add(new X86ObjectRelocation(
+                        relocation.SectionName,
+                        layout.Map(section.Name, relocation.Offset),
+                        relocation.SymbolName,
+                        relocation.Addend,
+                        relocation.Kind));
+                }
+
+                dataSections.Add(new X86DataSection(
+                    section.Name,
+                    section.Kind,
+                    section.Alignment,
+                    data.ToImmutable(),
+                    bssSize,
+                    relocations.ToImmutable()));
+            }
+
+            var symbols = ImmutableArray.CreateBuilder<X86ObjectSymbol>();
+            foreach (var symbol in runtime.Symbols)
+            {
+                if (symbol.Binding == X86ObjectSymbolBinding.External)
+                {
+                    if (referenced.Contains(symbol.Name))
+                        symbols.Add(symbol);
+                    continue;
+                }
+
+                int originalSize = symbol.SectionName.Length == 0
+                    ? symbol.Size
+                    : symbol.Kind == X86ObjectSymbolKind.Section
+                        ? SectionOriginalSize(runtime, symbol.SectionName, analysis.TextSize)
+                        : symbol.Size;
+
+                if (symbol.Kind != X86ObjectSymbolKind.Section)
+                {
+                    bool keep = symbol.Size > 0
+                        ? layout.IsDefinitionLive(symbol.Name)
+                        : layout.IsLive(symbol.SectionName, symbol.Offset);
+                    if (!keep)
+                        continue;
+                }
+
+                int start = layout.Map(symbol.SectionName, symbol.Offset);
+                int end = layout.Map(symbol.SectionName, checked(symbol.Offset + originalSize));
+                symbols.Add(new X86ObjectSymbol(
+                    symbol.Name,
+                    symbol.SectionName,
+                    start,
+                    Math.Max(0, end - start),
+                    symbol.Binding,
+                    symbol.Kind,
+                    symbol.IsTentative));
+            }
+
+            var trimmed = new X86Program(
+                runtime.Target,
+                new X86TextSection(instructions.ToImmutable(), labels, textRelocations.ToImmutable()),
+                dataSections.ToImmutable(),
+                symbols.ToImmutable(),
+                runtime.EntrySymbol);
+            analysis.Results.TryAdd(layout.LiveKey, trimmed);
+            return trimmed;
+        }
+
+        private static void AddOperandReference(ObjectTrimmer trimmer, int offset, X86Operand operand)
+        {
+            if (!string.IsNullOrEmpty(operand.Symbol))
+                trimmer.AddReference(TextSectionName, offset, operand.Symbol!);
+        }
+
+        private static int SectionOriginalSize(X86Program runtime, string sectionName, int textSize)
+        {
+            if (StringComparer.Ordinal.Equals(sectionName, TextSectionName))
+                return textSize;
+            foreach (var section in runtime.DataSections)
+            {
+                if (StringComparer.Ordinal.Equals(section.Name, sectionName))
+                    return checked(section.Data.Length + section.BssSize);
+            }
+            return 0;
         }
 
         public static string ResolveInternalCall(RuntimeMethod method)

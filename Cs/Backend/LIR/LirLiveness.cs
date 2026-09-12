@@ -179,7 +179,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i <= argumentIndex; i++)
             {
                 if (hiddenReturnBufferInsertionIndex == i)
-                    _ = GetMaybeArgumentRegister(target, RegisterClass.General, ref general, ref floating);
+                    _ = MachineAbi.ConsumeHiddenReturnBufferRegister(target, ref general, ref floating);
 
                 RuntimeType currentType = method.ArgTypes[i];
                 GenStackKind currentStackKind = i == argumentIndex ? info.StackKind : StackKindForAbi(currentType);

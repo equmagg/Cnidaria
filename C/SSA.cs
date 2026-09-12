@@ -41,6 +41,9 @@ namespace Cnidaria.C
         public bool EnableBranchFolding { get; }
         public bool EnableDeadCodeElimination { get; }
         public bool EnableCommonSubexpressionElimination { get; }
+        public bool EnableLoopInvariantCodeMotion { get; }
+        public int MaxLoopHoistsPerLoop { get; }
+        public int MaxLoopAnalysisWork { get; }
         public int MaxIterations { get; }
 
         public SsaOptimizationOptions(
@@ -49,13 +52,19 @@ namespace Cnidaria.C
             bool enableBranchFolding = true,
             bool enableDeadCodeElimination = true,
             int maxIterations = 3,
-            bool enableCommonSubexpressionElimination = true)
+            bool enableCommonSubexpressionElimination = true,
+            bool enableLoopInvariantCodeMotion = true,
+            int maxLoopHoistsPerLoop = 16,
+            int maxLoopAnalysisWork = 100_000)
         {
             EnableConstantFolding = enableConstantFolding;
             EnableCopyPropagation = enableCopyPropagation;
             EnableBranchFolding = enableBranchFolding;
             EnableDeadCodeElimination = enableDeadCodeElimination;
             EnableCommonSubexpressionElimination = enableCommonSubexpressionElimination;
+            EnableLoopInvariantCodeMotion = enableLoopInvariantCodeMotion;
+            MaxLoopHoistsPerLoop = Math.Max(0, maxLoopHoistsPerLoop);
+            MaxLoopAnalysisWork = Math.Max(0, maxLoopAnalysisWork);
             MaxIterations = maxIterations < 1 ? 1 : maxIterations;
         }
     }
@@ -116,7 +125,7 @@ namespace Cnidaria.C
         public ImmutableArray<GimpleFunctionAnnotations> Functions { get; }
         public ImmutableArray<GimpleProblem> Problems { get; }
 
-        private GimplePipelineResult(
+        internal GimplePipelineResult(
             ControlFlowGraph controlFlowGraph,
             ImmutableArray<GimpleFunctionAnnotations> functions,
             ImmutableArray<GimpleProblem> verificationProblems = default)

@@ -71,10 +71,132 @@ namespace Cnidaria.Cs
             MachineRegister.Xmm14,
             MachineRegister.Xmm15);
 
+        // Volatile first, then the argument registers in reverse, then the callee saved block
+        private static readonly ImmutableArray<MachineRegister> Arm64GeneralRegisters = ImmutableArray.Create(
+            MachineRegister.X9,
+            MachineRegister.X10,
+            MachineRegister.X11,
+            MachineRegister.X12,
+            MachineRegister.X13,
+            MachineRegister.X14,
+            MachineRegister.X15,
+            MachineRegister.X8,
+            MachineRegister.X7,
+            MachineRegister.X6,
+            MachineRegister.X5,
+            MachineRegister.X4,
+            MachineRegister.X3,
+            MachineRegister.X2,
+            MachineRegister.X1,
+            MachineRegister.X0,
+            MachineRegister.X19,
+            MachineRegister.X20,
+            MachineRegister.X21,
+            MachineRegister.X22,
+            MachineRegister.X23,
+            MachineRegister.X24,
+            MachineRegister.X25,
+            MachineRegister.X26,
+            MachineRegister.X27,
+            MachineRegister.X28);
+
+        private static readonly ImmutableArray<MachineRegister> Arm64FloatRegisters = ImmutableArray.Create(
+            MachineRegister.F16,
+            MachineRegister.F17,
+            MachineRegister.F18,
+            MachineRegister.F19,
+            MachineRegister.F20,
+            MachineRegister.F21,
+            MachineRegister.F22,
+            MachineRegister.F23,
+            MachineRegister.F24,
+            MachineRegister.F25,
+            MachineRegister.F26,
+            MachineRegister.F27,
+            MachineRegister.F7,
+            MachineRegister.F6,
+            MachineRegister.F5,
+            MachineRegister.F4,
+            MachineRegister.F3,
+            MachineRegister.F2,
+            MachineRegister.F1,
+            MachineRegister.F0,
+            MachineRegister.F8,
+            MachineRegister.F9,
+            MachineRegister.F10,
+            MachineRegister.F11,
+            MachineRegister.F12,
+            MachineRegister.F13,
+            MachineRegister.F14,
+            MachineRegister.F15);
+
+        private static readonly ImmutableArray<MachineRegister> Arm64CallerSavedScalarRegisters = ImmutableArray.Create(
+            MachineRegister.X0,
+            MachineRegister.X1,
+            MachineRegister.X2,
+            MachineRegister.X3,
+            MachineRegister.X4,
+            MachineRegister.X5,
+            MachineRegister.X6,
+            MachineRegister.X7,
+            MachineRegister.X8,
+            MachineRegister.X9,
+            MachineRegister.X10,
+            MachineRegister.X11,
+            MachineRegister.X12,
+            MachineRegister.X13,
+            MachineRegister.X14,
+            MachineRegister.X15,
+            MachineRegister.X16,
+            MachineRegister.X17,
+            MachineRegister.X30,
+            MachineRegister.F0,
+            MachineRegister.F1,
+            MachineRegister.F2,
+            MachineRegister.F3,
+            MachineRegister.F4,
+            MachineRegister.F5,
+            MachineRegister.F6,
+            MachineRegister.F7,
+            MachineRegister.F16,
+            MachineRegister.F17,
+            MachineRegister.F18,
+            MachineRegister.F19,
+            MachineRegister.F20,
+            MachineRegister.F21,
+            MachineRegister.F22,
+            MachineRegister.F23,
+            MachineRegister.F24,
+            MachineRegister.F25,
+            MachineRegister.F26,
+            MachineRegister.F27,
+            MachineRegister.F28,
+            MachineRegister.F29,
+            MachineRegister.F30,
+            MachineRegister.F31);
+
+        private static readonly ImmutableArray<MachineRegister> Arm64TreeScratchGprs = ImmutableArray.Create(
+            MachineRegister.X16,
+            MachineRegister.X17);
+
+        private static readonly ImmutableArray<MachineRegister> Arm64TreeScratchFprs = ImmutableArray.Create(
+            MachineRegister.F30,
+            MachineRegister.F31,
+            MachineRegister.F29,
+            MachineRegister.F28);
+
         public static void ValidateTarget(TargetInfo target)
         {
             if (target is null)
                 throw new ArgumentNullException(nameof(target));
+            if (target.Architecture == TargetArchitectureKind.Arm32)
+                throw new NotSupportedException("The register allocator has no Arm32 register model.");
+        }
+
+        public static bool IsArm64(TargetInfo target)
+        {
+            ValidateTarget(target);
+            return target.Architecture == TargetArchitectureKind.Arm64;
         }
 
         public static int AbiFloatingRegisterSize(TargetInfo target)
@@ -90,6 +212,8 @@ namespace Cnidaria.Cs
                 return X86GeneralRegisters;
             if (target.Architecture == TargetArchitectureKind.X86_64)
                 return IsWindowsX64(target) ? X64WindowsGeneralRegisters : X64SystemVGeneralRegisters;
+            if (IsArm64(target))
+                return Arm64GeneralRegisters;
             return target.IsRegisterBytecode
                 ? MachineRegisters.RegisterBytecodeAllocatableGprs
                 : MachineRegisters.DefaultAllocatableGprs;
@@ -102,6 +226,8 @@ namespace Cnidaria.Cs
                 return X86FloatRegisters;
             if (target.Architecture == TargetArchitectureKind.X86_64)
                 return X64FloatRegisters;
+            if (IsArm64(target))
+                return Arm64FloatRegisters;
             if (target.IsRiscV && AbiFloatingRegisterSize(target) == 0)
                 return ImmutableArray<MachineRegister>.Empty;
             return target.IsRegisterBytecode
@@ -159,6 +285,9 @@ namespace Cnidaria.Cs
                 return builder.ToImmutable();
             }
 
+            if (IsArm64(target))
+                return Arm64CallerSavedScalarRegisters;
+
             return target.IsRiscV && AbiFloatingRegisterSize(target) == 0
                 ? MachineRegisters.CallerSavedGprs
                 : MachineRegisters.CallerSavedScalarRegisters;
@@ -183,6 +312,13 @@ namespace Cnidaria.Cs
                 }
 
                 return register is MachineRegister.X9 or MachineRegister.X10 or MachineRegister.X11 or MachineRegister.X12 or MachineRegister.X13 or MachineRegister.X14;
+            }
+
+            if (IsArm64(target))
+            {
+                if ((int)register >= (int)MachineRegister.X19 && (int)register <= (int)MachineRegister.X29)
+                    return true;
+                return (int)register >= (int)MachineRegister.F8 && (int)register <= (int)MachineRegister.F15;
             }
 
             return MachineRegisters.IsCalleeSaved(register);
@@ -210,6 +346,14 @@ namespace Cnidaria.Cs
                 // to hang an internal register on and any allocatable register may already be live
                 return register is MachineRegister.X10 or MachineRegister.X15 ||
                     register == ParallelCopyScratch(target, RegisterClass.General);
+            }
+            if (IsArm64(target))
+            {
+                // x18 belongs to the platform, x16 and x17 stage the moves that sit between nodes
+                return register is
+                    MachineRegister.X16 or MachineRegister.X17 or MachineRegister.X18 or
+                    MachineRegister.X29 or MachineRegister.X30 or MachineRegister.X31 ||
+                    ((int)register >= (int)MachineRegister.F28 && (int)register <= (int)MachineRegister.F31);
             }
             return MachineRegisters.IsReserved(register);
         }
@@ -280,6 +424,13 @@ namespace Cnidaria.Cs
                 };
             }
 
+            if (IsArm64(target))
+            {
+                return (uint)index < 8u
+                    ? (MachineRegister)((int)MachineRegister.X0 + index)
+                    : MachineRegister.Invalid;
+            }
+
             return MachineRegisters.GetIntegerArgumentRegister(index);
         }
 
@@ -293,6 +444,12 @@ namespace Cnidaria.Cs
                 int count = IsWindowsX64(target) ? 4 : 8;
                 return (uint)index < (uint)count
                     ? (MachineRegister)((int)MachineRegister.Xmm0 + index)
+                    : MachineRegister.Invalid;
+            }
+            if (IsArm64(target))
+            {
+                return (uint)index < 8u
+                    ? (MachineRegister)((int)MachineRegister.F0 + index)
                     : MachineRegister.Invalid;
             }
             return target.IsRiscV && AbiFloatingRegisterSize(target) == 0
@@ -321,6 +478,12 @@ namespace Cnidaria.Cs
                     _ => MachineRegister.Invalid,
                 };
             }
+            if (IsArm64(target))
+            {
+                return (uint)index < 2u
+                    ? (MachineRegister)((int)MachineRegister.X0 + index)
+                    : MachineRegister.Invalid;
+            }
 
             return index switch
             {
@@ -339,6 +502,12 @@ namespace Cnidaria.Cs
                 return index == 0 ? MachineRegister.Xmm0 : index == 1 && target.Architecture == TargetArchitectureKind.X86_64 ? MachineRegister.Xmm1 : MachineRegister.Invalid;
             if (target.IsRiscV && AbiFloatingRegisterSize(target) == 0)
                 return MachineRegister.Invalid;
+            if (IsArm64(target))
+            {
+                return (uint)index < 4u
+                    ? (MachineRegister)((int)MachineRegister.F0 + index)
+                    : MachineRegister.Invalid;
+            }
 
             return index switch
             {
@@ -396,6 +565,8 @@ namespace Cnidaria.Cs
                 return MachineRegister.Esp;
             if (target.Architecture == TargetArchitectureKind.X86_64)
                 return MachineRegister.X15;
+            if (IsArm64(target))
+                return MachineRegister.X31;
             return MachineRegisters.StackPointer;
         }
 
@@ -406,13 +577,33 @@ namespace Cnidaria.Cs
                 return MachineRegister.Ebp;
             if (target.Architecture == TargetArchitectureKind.X86_64)
                 return MachineRegister.X10;
+            if (IsArm64(target))
+                return MachineRegister.X29;
             return MachineRegisters.FramePointer;
         }
 
         public static MachineRegister ReturnAddress(TargetInfo target)
         {
             ValidateTarget(target);
-            return target.IsX86 ? MachineRegister.Invalid : MachineRegisters.ReturnAddress;
+            if (target.IsX86)
+                return MachineRegister.Invalid;
+            return IsArm64(target) ? MachineRegister.X30 : MachineRegisters.ReturnAddress;
+        }
+
+        // Targets without one store an immediate instead of moving out of it
+        public static MachineRegister ZeroRegister(TargetInfo target)
+        {
+            ValidateTarget(target);
+            if (target.IsX86 || IsArm64(target))
+                return MachineRegister.Invalid;
+            return MachineRegisters.Zero;
+        }
+
+        // A dedicated register costs no argument slot, unlike passing the pointer as an argument
+        public static MachineRegister ReturnBufferRegister(TargetInfo target)
+        {
+            ValidateTarget(target);
+            return IsArm64(target) ? MachineRegister.X8 : MachineRegister.Invalid;
         }
 
         // The code generator still needs a couple of registers of its own for the sequences it expands
@@ -455,7 +646,62 @@ namespace Cnidaria.Cs
                     _ => MachineRegister.Invalid,
                 };
             }
+            if (IsArm64(target))
+            {
+                return registerClass switch
+                {
+                    RegisterClass.General => MachineRegister.X16,
+                    RegisterClass.Float => MachineRegister.F30,
+                    _ => MachineRegister.Invalid,
+                };
+            }
             return MachineRegisters.GetParallelCopyScratch(registerClass);
+        }
+
+        // Registers held back from the allocator for the sequences the code generator expands
+        public static ImmutableArray<MachineRegister> TreeScratchRegisters(TargetInfo target, RegisterClass registerClass)
+        {
+            ValidateTarget(target);
+            if (target.IsX86)
+                return ImmutableArray<MachineRegister>.Empty;
+
+            if (IsArm64(target))
+            {
+                return registerClass switch
+                {
+                    RegisterClass.General => Arm64TreeScratchGprs,
+                    RegisterClass.Float => Arm64TreeScratchFprs,
+                    _ => ImmutableArray<MachineRegister>.Empty,
+                };
+            }
+
+            return registerClass switch
+            {
+                RegisterClass.General => MachineRegisters.TreeScratchGprs,
+                RegisterClass.Float => MachineRegisters.TreeScratchFprs,
+                RegisterClass.Vector => MachineRegisters.TreeScratchVprs,
+                _ => ImmutableArray<MachineRegister>.Empty,
+            };
+        }
+
+        public static bool IsScratchRegister(TargetInfo target, MachineRegister register)
+        {
+            ValidateTarget(target);
+            if (register == MachineRegister.Invalid)
+                return false;
+            if (register == ParallelCopyScratch(target, RegisterClass.General) ||
+                register == ParallelCopyScratch(target, RegisterClass.Float))
+            {
+                return !target.IsX86;
+            }
+
+            var pool = TreeScratchRegisters(target, MachineRegisters.GetClass(register));
+            for (int i = 0; i < pool.Length; i++)
+            {
+                if (pool[i] == register)
+                    return true;
+            }
+            return false;
         }
 
         public static MachineRegister IndirectCallTargetRegister(TargetInfo target)
@@ -465,7 +711,7 @@ namespace Cnidaria.Cs
                 return MachineRegister.Eax;
             if (target.Architecture == TargetArchitectureKind.X86_64)
                 return IsWindowsX64(target) ? MachineRegister.X6 : MachineRegister.X8;
-            return MachineRegisters.TreeScratch3;
+            return IsArm64(target) ? MachineRegister.X17 : MachineRegisters.TreeScratch3;
         }
 
         public static int MinimumOutgoingArgumentSlots(TargetInfo target)
@@ -499,6 +745,8 @@ namespace Cnidaria.Cs
                 return registerClass == RegisterClass.General
                     ? (int)register <= (int)MachineRegister.X15
                     : registerClass == RegisterClass.Float && (int)register <= (int)MachineRegister.Xmm15;
+            if (target.IsArm)
+                return registerClass is RegisterClass.General or RegisterClass.Float;
             return !target.IsRiscV || registerClass != RegisterClass.Float || AbiFloatingRegisterSize(target) != 0;
         }
     }

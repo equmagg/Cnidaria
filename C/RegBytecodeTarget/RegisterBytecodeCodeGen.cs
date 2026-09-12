@@ -2095,8 +2095,18 @@ namespace Cnidaria.C
                         return false;
                 }
 
+                // Copies that read what another one writes only need an order, not a detour through
+                // temporaries, and one exists unless the reads and writes form a cycle
                 if (HasPhysicalStorageClobber(copies))
-                    return false;
+                {
+                    if (!_allocation.TryOrderParallelCopies(copies, out var ordered))
+                        return false;
+
+                    foreach (var copy in ordered)
+                        EmitDirectParallelCopy(copy, instruction);
+
+                    return true;
+                }
 
                 foreach (var copy in copies)
                     EmitDirectParallelCopy(copy, instruction);

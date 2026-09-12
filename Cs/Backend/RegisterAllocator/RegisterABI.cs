@@ -231,6 +231,9 @@ namespace Cnidaria.Cs
         private static MachineRegister FloatingArgumentRegister(TargetInfo? target, int index)
             => RegisterInfo.GetFloatArgumentRegister(EffectiveTarget(target), index);
 
+        private static int MaxFloatAggregateFields(TargetInfo? target)
+            => RegisterInfo.IsArm64(EffectiveTarget(target)) ? 4 : MaxFlattenedFloatAggregateFields;
+
         public static int RiscVAbiFloatingRegisterSize(TargetInfo? target)
         {
             var effectiveTarget = EffectiveTarget(target);
@@ -446,10 +449,17 @@ namespace Cnidaria.Cs
                 return new AbiValueInfo(isReturn ? AbiValuePassingKind.Indirect : AbiValuePassingKind.Stack, RegisterClass.General, size, align, type.ContainsGcPointers);
             }
 
+            // The sixteen byte ceiling belongs to the integer register pair, not to v0-v3
+            if (RegisterInfo.IsArm64(effectiveTarget) &&
+                TryClassifyHomogeneousFloatAggregate(type, size, maxFields: MaxFloatAggregateFields(effectiveTarget), target: effectiveTarget, out var armFloatAggregate))
+            {
+                return armFloatAggregate;
+            }
+
             if (size > MaxRegisterAggregateBytes)
                 return new AbiValueInfo(isReturn ? AbiValuePassingKind.Indirect : AbiValuePassingKind.Stack, RegisterClass.General, size, align, type.ContainsGcPointers);
 
-            if (TryClassifyHomogeneousFloatAggregate(type, size, maxFields: MaxFlattenedFloatAggregateFields, target: target, out var hfaStruct))
+            if (TryClassifyHomogeneousFloatAggregate(type, size, maxFields: MaxFloatAggregateFields(target), target: target, out var hfaStruct))
                 return hfaStruct;
 
             if (TryClassifySingleRegisterStruct(type, size, align, target, out var singleRegisterStruct))
@@ -544,6 +554,9 @@ namespace Cnidaria.Cs
                     abi.ContainsGcPointers);
             }
 
+            if (RegisterInfo.IsArm64(effectiveTarget))
+                return AdjustArm64ArgumentAbi(abi, generalArgumentIndex, floatArgumentIndex, effectiveTarget);
+
             if (!effectiveTarget.IsRiscV)
                 return abi;
 
@@ -578,6 +591,42 @@ namespace Cnidaria.Cs
                 MaxIntegerRegisterSlots,
                 (offset, segmentSize) => SegmentRangeContainsGcPointer(segments, offset, segmentSize),
                 effectiveTarget);
+        }
+
+        // AAPCS64 sends a whole aggregate to the stack rather than splitting it across the boundary
+        private static AbiValueInfo AdjustArm64ArgumentAbi(
+            AbiValueInfo abi,
+            int generalArgumentIndex,
+            int floatArgumentIndex,
+            TargetInfo target)
+        {
+            // Saying this about a scalar would cost it its register home for the whole method
+            if (abi.PassingKind != AbiValuePassingKind.MultiRegister)
+                return abi;
+
+            var segments = GetRegisterSegments(abi, target);
+            int requiredGeneralRegisters = 0;
+            int requiredFloatRegisters = 0;
+            for (int i = 0; i < segments.Length; i++)
+            {
+                if (segments[i].RegisterClass == RegisterClass.Float)
+                    requiredFloatRegisters++;
+                else
+                    requiredGeneralRegisters++;
+            }
+
+            if (HasArgumentRegisters(RegisterClass.General, generalArgumentIndex, requiredGeneralRegisters, target) &&
+                HasArgumentRegisters(RegisterClass.Float, floatArgumentIndex, requiredFloatRegisters, target))
+            {
+                return abi;
+            }
+
+            return new AbiValueInfo(
+                AbiValuePassingKind.Stack,
+                RegisterClass.General,
+                Math.Max(1, abi.Size),
+                Math.Max(1, abi.Alignment),
+                abi.ContainsGcPointers);
         }
 
         internal static bool HaveMatchingArgumentValueLayout(
@@ -826,9 +875,7 @@ namespace Cnidaria.Cs
                     return;
 
                 var addressAbi = AddressValue(target);
-                var location = AssignScalarArgumentLocation(
-                    addressAbi.RegisterClass,
-                    addressAbi.Size,
+                var location = AssignHiddenReturnBufferLocation(
                     ref generalArg,
                     ref floatArg,
                     ref outgoingArg,
@@ -891,6 +938,38 @@ namespace Cnidaria.Cs
                 aggregateStackSlot,
                 stackOffset,
                 segment.Size);
+        }
+
+        internal static AbiArgumentLocation AssignHiddenReturnBufferLocation(
+            ref int generalIndex,
+            ref int floatIndex,
+            ref int outgoingIndex,
+            TargetInfo? target = null)
+        {
+            var effectiveTarget = EffectiveTarget(target);
+            var dedicated = RegisterInfo.ReturnBufferRegister(effectiveTarget);
+            if (dedicated != MachineRegister.Invalid)
+                return AbiArgumentLocation.ForRegister(RegisterClass.General, dedicated, PointerSizeFor(effectiveTarget));
+
+            return AssignScalarArgumentLocation(
+                RegisterClass.General,
+                PointerSizeFor(effectiveTarget),
+                ref generalIndex,
+                ref floatIndex,
+                ref outgoingIndex,
+                effectiveTarget);
+        }
+
+        internal static MachineRegister ConsumeHiddenReturnBufferRegister(
+            TargetInfo target,
+            ref int generalIndex,
+            ref int floatIndex)
+        {
+            var dedicated = RegisterInfo.ReturnBufferRegister(target);
+            if (dedicated != MachineRegister.Invalid)
+                return dedicated;
+
+            return ConsumeArgumentRegister(target, RegisterClass.General, ref generalIndex, ref floatIndex);
         }
 
         internal static AbiArgumentLocation AssignScalarArgumentLocation(
@@ -1046,11 +1125,15 @@ namespace Cnidaria.Cs
         {
             abi = default;
 
-            if (TryClassifyHomogeneousFloatAggregate(type, size, maxFields: MaxFlattenedFloatAggregateFields, target: target, out abi))
+            if (TryClassifyHomogeneousFloatAggregate(type, size, maxFields: MaxFloatAggregateFields(target), target: target, out abi))
                 return true;
 
-            if (TryClassifyMixedFieldRegisterStruct(type, size, align, target, out abi))
+            // A composite that is not homogeneous goes to the integer registers whole under AAPCS64
+            if (!RegisterInfo.IsArm64(EffectiveTarget(target)) &&
+                TryClassifyMixedFieldRegisterStruct(type, size, align, target, out abi))
+            {
                 return true;
+            }
 
             int registerSlotSize = GeneralRegisterSlotSizeFor(target);
             if (size > registerSlotSize * MaxIntegerRegisterSlots)

@@ -1606,6 +1606,13 @@ namespace Cnidaria.C
                     return;
                 if (instruction.Operands.Length == 0)
                     throw Unsupported(instruction, "Copy-like instruction has no source operand.");
+
+                if (IsAggregateType(instruction.Result.Type))
+                {
+                    EmitAggregateCopy(instruction.Result, instruction.Operands[0], instruction);
+                    return;
+                }
+
                 RequireScalar(instruction.Result.Type, instruction);
                 RequireScalar(instruction.Operands[0].Type, instruction);
 
@@ -2076,6 +2083,15 @@ namespace Cnidaria.C
             {
                 if (instruction.Result is null || instruction.Address is null)
                     throw Unsupported(instruction, "Invalid load instruction.");
+
+                if (IsAggregateType(instruction.Result.Type))
+                {
+                    var aggregateDestination = MaterializeVirtualRegisterStorageAddress(instruction.Result, Scratch0);
+                    MaterializeAddress(instruction.Address, Scratch1);
+                    CopyMemory(aggregateDestination, Scratch1, SizeOf(instruction.Result.Type));
+                    return;
+                }
+
                 RequireScalar(instruction.Result.Type, instruction);
                 var destination = GetWritableRegister(
                     instruction.Result,
@@ -2091,6 +2107,15 @@ namespace Cnidaria.C
             {
                 if (instruction.Address is null || instruction.Operands.Length == 0)
                     throw Unsupported(instruction, "Invalid store instruction.");
+
+                if (IsAggregateType(instruction.Address.ElementType))
+                {
+                    MaterializeAddress(instruction.Address, Scratch0);
+                    var aggregateSource = MaterializeOperandStorageAddress(instruction.Operands[0], Scratch1, instruction);
+                    CopyMemory(Scratch0, aggregateSource, SizeOf(instruction.Address.ElementType));
+                    return;
+                }
+
                 RequireScalar(instruction.Address.ElementType, instruction);
                 RequireScalar(instruction.Operands[0].Type, instruction);
                 var source = LoadOperandAs(
@@ -2643,6 +2668,45 @@ namespace Cnidaria.C
                 if (!IsFloatType(register.Type))
                     NormalizeIntegerRegister(preferred, register.Type);
                 return preferred;
+            }
+
+            private MachineRegister MaterializeVirtualRegisterStorageAddress(LirVirtualRegister register, MachineRegister destination)
+            {
+                var allocation = _allocation[register];
+                if (!allocation.IsSpilled)
+                    throw new NotSupportedException($"Virtual register {register.Name} must be stack-backed.");
+                AddImmediate(destination, StackPointer, allocation.StackOffset);
+                return destination;
+            }
+
+            private MachineRegister MaterializeOperandStorageAddress(LirOperand operand, MachineRegister destination, LirInstruction instruction)
+            {
+                switch (operand.Kind)
+                {
+                    case LirOperandKind.Register:
+                        if (operand.Register is null)
+                            throw Unsupported(instruction, "Register operand has no register.");
+                        return MaterializeVirtualRegisterStorageAddress(operand.Register, destination);
+                    case LirOperandKind.StackSlot:
+                        if (operand.StackSlot is null || !_allocation.Frame.StackSlotOffsets.TryGetValue(operand.StackSlot, out var slotOffset))
+                            throw Unsupported(instruction, "Stack-slot operand has no offset.");
+                        AddImmediate(destination, StackPointer, slotOffset);
+                        return destination;
+                    case LirOperandKind.Address:
+                        if (operand.Address is null)
+                            throw Unsupported(instruction, "Address operand has no address.");
+                        MaterializeAddress(operand.Address, destination);
+                        return destination;
+                    default:
+                        throw Unsupported(instruction, $"Cannot take the storage address of LIR operand kind {operand.Kind}.");
+                }
+            }
+
+            private void EmitAggregateCopy(LirVirtualRegister destination, LirOperand source, LirInstruction instruction)
+            {
+                var destinationAddress = MaterializeVirtualRegisterStorageAddress(destination, Scratch0);
+                var sourceAddress = MaterializeOperandStorageAddress(source, Scratch1, instruction);
+                CopyMemory(destinationAddress, sourceAddress, SizeOf(destination.Type));
             }
 
             private MachineRegister GetWritableRegister(LirVirtualRegister register, MachineRegister scratch)
@@ -3497,7 +3561,7 @@ namespace Cnidaria.C
             }
 
             private NotSupportedException Unsupported(LirInstruction instruction, string message)
-                => new NotSupportedException($"{message} Function '{_function.Symbol?.Name ?? _functionLabel}', LIR instruction #{instruction.Ordinal}.");
+                => new NotSupportedException($"{message} Function '{_function.Symbol?.Name ?? _functionLabel}', LIR instruction #{instruction.Ordinal} [{instruction.Kind}/{instruction.TreeCode}].");
 
             private readonly struct AddressParts
             {

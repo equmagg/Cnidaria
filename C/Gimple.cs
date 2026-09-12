@@ -70,6 +70,7 @@ namespace Cnidaria.C
 
         private static GimplePipelineResult RunCore(ControlFlowGraph controlFlowGraph, GimplePipelineOptions options)
         {
+            controlFlowGraph = LoopInvariantCodeMotion.CreatePreheaders(controlFlowGraph, options.Optimization);
             return GimplePipelineResult.Build(controlFlowGraph, options.Ssa, options.ValueNumbering)
                 .Optimize(options.Optimization, options.ValueNumbering)
                 .Trim(controlFlowGraph.SemanticModel.Compilation.Options.Trimming)

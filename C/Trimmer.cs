@@ -57,6 +57,105 @@ namespace Cnidaria.C
             return new Pass(controlFlowGraph, functions, options).Run();
         }
 
+        public static ImmutableArray<GimplePipelineResult> TrimLinked(
+            ImmutableArray<GimplePipelineResult> units, int userUnitCount, string entry, TrimmingOptions options)
+            => new LinkedPass(units, userUnitCount, entry, options).Run();
+
+        private sealed class LinkedPass
+        {
+            private readonly Pass[] _passes;
+            private readonly int _userUnitCount;
+            private readonly string _entry;
+            private readonly TrimmingOptions _options;
+            private readonly Dictionary<string, List<Pass>> _definitions = new(StringComparer.Ordinal);
+            private readonly HashSet<Pass> _active = new();
+            private readonly HashSet<Pass> _pending = new();
+            private readonly Queue<Pass> _workList = new();
+
+            public LinkedPass(ImmutableArray<GimplePipelineResult> units, int userUnitCount, string entry, TrimmingOptions options)
+            {
+                _passes = new Pass[units.Length];
+                _userUnitCount = userUnitCount;
+                _entry = entry;
+                _options = options;
+                for (var i = 0; i < units.Length; i++)
+                {
+                    var pass = new Pass(units[i].ControlFlowGraph, units[i].Functions, options, Schedule, MarkExternal);
+                    _passes[i] = pass;
+                    pass.IndexMembers();
+                    foreach (var name in pass.ExternalDefinitions())
+                    {
+                        if (!_definitions.TryGetValue(name, out var providers))
+                            _definitions.Add(name, providers = new List<Pass>());
+                        providers.Add(pass);
+                    }
+                }
+            }
+
+            public ImmutableArray<GimplePipelineResult> Run()
+            {
+                for (var i = 0; i < _userUnitCount; i++)
+                {
+                    Activate(_passes[i]);
+                    _passes[i].MarkByName(_entry);
+                }
+                foreach (var root in _options.RootSymbols)
+                {
+                    MarkExternal(root);
+                    foreach (var pass in _passes)
+                    {
+                        if (pass.HasInternalDefinition(root))
+                            Activate(pass);
+                    }
+                }
+                while (_workList.Count != 0)
+                {
+                    var pass = _workList.Dequeue();
+                    pass.ProcessWorkLists();
+                    _pending.Remove(pass);
+                }
+                var result = ImmutableArray.CreateBuilder<GimplePipelineResult>(_passes.Length);
+                foreach (var pass in _passes)
+                {
+                    var trimmed = pass.Rewrite();
+                    result.Add(new GimplePipelineResult(trimmed.ControlFlowGraph, trimmed.Functions));
+                }
+                return result.ToImmutable();
+            }
+
+            private void Activate(Pass pass)
+            {
+                if (_active.Add(pass))
+                    pass.MarkRoots();
+            }
+
+            private void Schedule(Pass pass)
+            {
+                if (_pending.Add(pass))
+                    _workList.Enqueue(pass);
+            }
+
+            private void MarkExternal(string name)
+            {
+                if (!_definitions.TryGetValue(name, out var providers))
+                    return;
+                bool found = false;
+                foreach (var pass in providers)
+                {
+                    if (!_active.Contains(pass))
+                        continue;
+                    pass.MarkByName(name);
+                    found = true;
+                }
+                if (!found)
+                {
+                    var pass = providers[0];
+                    Activate(pass);
+                    pass.MarkByName(name);
+                }
+            }
+        }
+
         private sealed class Pass
         {
             private readonly ControlFlowGraph _controlFlowGraph;
@@ -64,6 +163,8 @@ namespace Cnidaria.C
             private readonly FileScopeLinkageMap _fileScopeLinkage;
             private readonly ImmutableArray<GimpleFunctionAnnotations> _gimpleFunctions;
             private readonly TrimmingOptions _options;
+            private readonly Action<Pass>? _schedule;
+            private readonly Action<string>? _markExternal;
             private readonly Dictionary<FunctionSymbol, List<GimpleFunctionDefinition>> _functionsBySymbol = new();
             private readonly Dictionary<string, List<GimpleFunctionDefinition>> _functionsByName = new(StringComparer.Ordinal);
             private readonly Dictionary<Symbol, List<GimpleVariableDeclaration>> _globalsBySymbol = new();
@@ -77,13 +178,17 @@ namespace Cnidaria.C
             public Pass(
                 ControlFlowGraph controlFlowGraph,
                 ImmutableArray<GimpleFunctionAnnotations> gimpleFunctions,
-                TrimmingOptions options)
+                TrimmingOptions options,
+                Action<Pass>? schedule = null,
+                Action<string>? markExternal = null)
             {
                 _controlFlowGraph = controlFlowGraph;
                 _tree = controlFlowGraph.GimpleTree;
                 _fileScopeLinkage = FileScopeLinkageMap.Create(_tree.SemanticModel);
                 _gimpleFunctions = gimpleFunctions.IsDefault ? ImmutableArray<GimpleFunctionAnnotations>.Empty : gimpleFunctions;
                 _options = options;
+                _schedule = schedule;
+                _markExternal = markExternal;
             }
 
             public TrimResult Run()
@@ -94,7 +199,7 @@ namespace Cnidaria.C
                 return Rewrite();
             }
 
-            private void IndexMembers()
+            public void IndexMembers()
             {
                 foreach (var function in _gimpleFunctions)
                     _gimpleByFunction[function.InputFunction] = function;
@@ -126,7 +231,31 @@ namespace Cnidaria.C
                 }
             }
 
-            private void MarkRoots()
+            public IEnumerable<string> ExternalDefinitions()
+            {
+                var names = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var pair in _functionsBySymbol)
+                {
+                    if (!_fileScopeLinkage.IsInternal(pair.Key) && names.Add(pair.Key.Name))
+                        yield return pair.Key.Name;
+                }
+                foreach (var pair in _globalsBySymbol)
+                {
+                    if (_fileScopeLinkage.IsInternal(pair.Key) || names.Contains(pair.Key.Name))
+                        continue;
+                    foreach (var declaration in pair.Value)
+                    {
+                        if (declaration.Initializer is not null || declaration.StorageClass != StorageClass.Extern)
+                        {
+                            names.Add(pair.Key.Name);
+                            yield return pair.Key.Name;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            public void MarkRoots()
             {
                 foreach (var member in _tree.Members)
                 {
@@ -166,7 +295,7 @@ namespace Cnidaria.C
                     MarkByName(root);
             }
 
-            private void ProcessWorkLists()
+            public void ProcessWorkLists()
             {
                 var references = new HashSet<Symbol>();
                 var names = new HashSet<string>(StringComparer.Ordinal);
@@ -295,9 +424,40 @@ namespace Cnidaria.C
             private void MarkReferences(HashSet<Symbol> references, HashSet<string> names)
             {
                 foreach (var symbol in references)
+                {
                     MarkSymbol(symbol);
+                    if (_markExternal is not null && !_fileScopeLinkage.IsInternal(symbol) &&
+                        (symbol is FunctionSymbol or VariableSymbol { StorageClass: StorageClass.Extern } ||
+                         _globalsBySymbol.ContainsKey(symbol)))
+                        _markExternal(symbol.Name);
+                }
                 foreach (var name in names)
+                {
                     MarkByName(name);
+                    if (_markExternal is not null && !HasInternalDefinition(name))
+                        _markExternal(name);
+                }
+            }
+
+            public bool HasInternalDefinition(string name)
+            {
+                if (_functionsByName.TryGetValue(name, out var functions))
+                {
+                    foreach (var function in functions)
+                    {
+                        if (_fileScopeLinkage.IsInternal(function.Symbol!))
+                            return true;
+                    }
+                }
+                if (_globalsByName.TryGetValue(name, out var globals))
+                {
+                    foreach (var global in globals)
+                    {
+                        if (_fileScopeLinkage.IsInternal(global.Symbol!))
+                            return true;
+                    }
+                }
+                return false;
             }
 
             private void MarkSymbol(Symbol symbol)
@@ -329,7 +489,7 @@ namespace Cnidaria.C
                     MarkGlobalsByName(symbol.Name);
             }
 
-            private void MarkByName(string name)
+            public void MarkByName(string name)
             {
                 if (_functionsByName.TryGetValue(name, out var functions))
                 {
@@ -352,16 +512,22 @@ namespace Cnidaria.C
             private void MarkFunction(GimpleFunctionDefinition function)
             {
                 if (_liveFunctions.Add(function))
+                {
                     _functionWorkList.Enqueue(function);
+                    _schedule?.Invoke(this);
+                }
             }
 
             private void MarkGlobal(GimpleVariableDeclaration global)
             {
                 if (_liveGlobals.Add(global))
+                {
                     _globalWorkList.Enqueue(global);
+                    _schedule?.Invoke(this);
+                }
             }
 
-            private TrimResult Rewrite()
+            public TrimResult Rewrite()
             {
                 var members = ImmutableArray.CreateBuilder<GimpleNode>(_tree.Members.Length);
                 foreach (var member in _tree.Members)
