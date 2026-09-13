@@ -525,6 +525,377 @@ namespace Cnidaria.C
         }
     }
 
+    /// <summary>A two-armed branch whose only effect is choosing one of two values for one register</summary>
+    public readonly struct LirSelectDiamond
+    {
+        public LirInstruction Branch { get; }
+        public LirBlock TrueArm { get; }
+        public LirBlock FalseArm { get; }
+        public LirBlock Join { get; }
+        public LirVirtualRegister Destination { get; }
+        public LirOperand TrueValue { get; }
+        public LirOperand FalseValue { get; }
+
+        internal LirSelectDiamond(
+            LirInstruction branch,
+            LirBlock trueArm,
+            LirBlock falseArm,
+            LirBlock join,
+            LirVirtualRegister destination,
+            LirOperand trueValue,
+            LirOperand falseValue)
+        {
+            Branch = branch;
+            TrueArm = trueArm;
+            FalseArm = falseArm;
+            Join = join;
+            Destination = destination;
+            TrueValue = trueValue;
+            FalseValue = falseValue;
+        }
+    }
+
+    /// <summary>Finds the conditional expressions a backend can turn into a conditional move</summary>
+    public static class LirSelect
+    {
+        /// <summary>Maps each head block whose branch only picks between two values for one register</summary>
+        public static Dictionary<LirBlock, LirSelectDiamond> FindDiamonds(LirFunction function, TargetInfo target)
+        {
+            var result = new Dictionary<LirBlock, LirSelectDiamond>();
+            if (function is null || target is null || function.Blocks.Length < 4)
+                return result;
+
+            var predecessors = CountPredecessors(function);
+            foreach (var block in function.Blocks)
+            {
+                if (block.Instructions.Length == 0)
+                    continue;
+                var branch = block.Instructions[block.Instructions.Length - 1];
+                if (branch.Kind != LirInstructionKind.Branch ||
+                    branch.TrueTarget is not { } trueArm ||
+                    branch.FalseTarget is not { } falseArm ||
+                    ReferenceEquals(trueArm, falseArm))
+                {
+                    continue;
+                }
+
+                if (!TryReadArm(trueArm, predecessors, out var trueCopy, out var join) ||
+                    !TryReadArm(falseArm, predecessors, out var falseCopy, out var falseJoin) ||
+                    !ReferenceEquals(join, falseJoin) ||
+                    !ReferenceEquals(trueCopy.Destination, falseCopy.Destination))
+                {
+                    continue;
+                }
+
+                var destination = trueCopy.Destination;
+                if (destination.RegisterClass is not (LirRegisterClass.General or LirRegisterClass.Address))
+                    continue;
+                if (Math.Max(1, target.SizeOf(destination.Type)) > Math.Max(1, target.RegisterSize))
+                    continue;
+                if (!IsSelectableValue(trueCopy.Source, target) || !IsSelectableValue(falseCopy.Source, target))
+                    continue;
+
+                result.Add(block, new LirSelectDiamond(
+                    branch, trueArm, falseArm, join, destination, trueCopy.Source, falseCopy.Source));
+            }
+
+            return result;
+        }
+
+        // An arm may do nothing but move one value into the shared register and fall into the join
+        private static bool TryReadArm(
+            LirBlock arm,
+            Dictionary<LirBlock, int> predecessors,
+            out LirParallelCopy copy,
+            out LirBlock join)
+        {
+            copy = default;
+            join = null!;
+            if (!predecessors.TryGetValue(arm, out var count) || count != 1)
+                return false;
+            if (arm.Instructions.Length != 2)
+                return false;
+
+            var move = arm.Instructions[0];
+            if (move.Kind != LirInstructionKind.ParallelCopy || move.ParallelCopies.Length != 1)
+                return false;
+
+            var jump = arm.Instructions[1];
+            if (jump.Kind != LirInstructionKind.Jump || jump.Target is null)
+                return false;
+
+            copy = move.ParallelCopies[0];
+            join = jump.Target;
+            return true;
+        }
+
+        private static bool IsSelectableValue(LirOperand operand, TargetInfo target)
+        {
+            if (operand.Kind == LirOperandKind.Register && operand.Register is not null)
+            {
+                return operand.Register.RegisterClass is LirRegisterClass.General or LirRegisterClass.Address &&
+                    Math.Max(1, target.SizeOf(operand.Register.Type)) <= Math.Max(1, target.RegisterSize);
+            }
+
+            return operand.Kind == LirOperandKind.Immediate && operand.Immediate is not string;
+        }
+
+        private static Dictionary<LirBlock, int> CountPredecessors(LirFunction function)
+        {
+            var counts = new Dictionary<LirBlock, int>(function.Blocks.Length);
+            foreach (var block in function.Blocks)
+                counts[block] = 0;
+
+            foreach (var block in function.Blocks)
+            {
+                foreach (var instruction in block.Instructions)
+                {
+                    Count(counts, instruction.Target);
+                    Count(counts, instruction.TrueTarget);
+                    Count(counts, instruction.FalseTarget);
+                    foreach (var switchCase in instruction.SwitchCases)
+                        Count(counts, switchCase.Target);
+                }
+            }
+
+            return counts;
+        }
+
+        private static void Count(Dictionary<LirBlock, int> counts, LirBlock? block)
+        {
+            if (block is not null && counts.TryGetValue(block, out var count))
+                counts[block] = count + 1;
+        }
+    }
+
+    /// <summary>Divisors and multipliers that an integer operation can be reduced to shifts for</summary>
+    public static class LirStrengthReduction
+    {
+        /// <summary>Reports a divisor of 2^k or -2^k, with the shift and whether the quotient has to be negated</summary>
+        public static bool TryGetPowerOfTwoDivisor(LirInstruction instruction, TargetInfo target, out int shift, out bool negated)
+        {
+            shift = 0;
+            negated = false;
+            if (instruction is null || target is null)
+                return false;
+            if (instruction.Operator is not "/" and not "%")
+                return false;
+            if (!TryGetOperationShape(instruction, target, out var bits, out var isSigned))
+                return false;
+            if (!TryGetIntegerConstant(instruction.Operands[1], bits, isSigned, out var divisor))
+                return false;
+
+            var magnitude = unchecked((ulong)divisor);
+            if (isSigned && divisor < 0)
+            {
+                magnitude = MaskBits(unchecked(0UL - magnitude), bits);
+                // The remainder keeps the sign of the dividend, so only the quotient cares about the divisor's
+                negated = instruction.Operator == "/";
+            }
+
+            if (magnitude == 0 || (magnitude & (magnitude - 1)) != 0)
+                return false;
+            shift = CountTrailingZeros(magnitude);
+            // A divisor of one is an identity the folder already handles
+            return shift >= 1 && shift < bits;
+        }
+
+        /// <summary>Reports a multiplier of 2^k, which a shift computes in less latency than a multiply</summary>
+        public static bool TryGetPowerOfTwoFactor(LirInstruction instruction, TargetInfo target, out int shift)
+        {
+            shift = 0;
+            if (instruction is null || target is null || instruction.Operator != "*")
+                return false;
+            if (!TryGetOperationShape(instruction, target, out var bits, out var isSigned))
+                return false;
+            if (!TryGetIntegerConstant(instruction.Operands[1], bits, isSigned, out var factor))
+                return false;
+
+            var magnitude = unchecked((ulong)factor);
+            if (magnitude == 0 || (magnitude & (magnitude - 1)) != 0)
+                return false;
+            shift = CountTrailingZeros(magnitude);
+            return shift >= 1 && shift < bits;
+        }
+
+        /// <summary>Sign or zero extends a constant of the given width to the whole 64 bit domain</summary>
+        public static long NormalizeConstant(long value, int bits, bool isSigned)
+        {
+            if (bits >= 64)
+                return value;
+            var mask = (1UL << bits) - 1;
+            var raw = unchecked((ulong)value) & mask;
+            if (isSigned && (raw & (1UL << (bits - 1))) != 0)
+                raw |= ~mask;
+            return unchecked((long)raw);
+        }
+
+        // The operation has to run in one machine register: wider is a software sequence over pairs
+        private static bool TryGetOperationShape(LirInstruction instruction, TargetInfo target, out int bits, out bool isSigned)
+        {
+            bits = 0;
+            isSigned = false;
+            if (instruction.Kind != LirInstructionKind.Binary || instruction.Operands.Length != 2 || instruction.Result is null)
+                return false;
+
+            var type = instruction.Operands[0].Type;
+            if (type.Type.Kind is not (TypeKind.Builtin or TypeKind.Enum) || IsFloating(type))
+                return false;
+
+            var size = Math.Max(1, target.SizeOf(type));
+            if (size < 4 || size > Math.Max(1, target.RegisterSize))
+                return false;
+
+            bits = size * 8;
+            isSigned = IsSignedInteger(type);
+            return true;
+        }
+
+        private static bool TryGetIntegerConstant(LirOperand operand, int bits, bool isSigned, out long value)
+        {
+            value = 0;
+            if (operand.Kind != LirOperandKind.Immediate || operand.Immediate is string || IsFloating(operand.Type))
+                return false;
+            value = NormalizeConstant(ToInt64(operand.Immediate), bits, isSigned);
+            return true;
+        }
+
+        private static bool IsSignedInteger(QualifiedType type)
+        {
+            if (type.Type is EnumType)
+                return true;
+            return type.Type is BuiltinType builtin && builtin.BuiltinKind is BuiltinTypeKind.SignedChar or BuiltinTypeKind.Short
+                or BuiltinTypeKind.Int or BuiltinTypeKind.Long or BuiltinTypeKind.LongLong;
+        }
+
+        private static bool IsFloating(QualifiedType type)
+            => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Float or BuiltinTypeKind.Double or BuiltinTypeKind.LongDouble };
+
+        private static long ToInt64(object? value)
+            => value switch
+            {
+                null => 0,
+                bool b => b ? 1 : 0,
+                byte b => b,
+                sbyte s => s,
+                short s => s,
+                ushort u => u,
+                int i => i,
+                uint u => u,
+                long l => l,
+                ulong u => unchecked((long)u),
+                char c => c,
+                _ => Convert.ToInt64(value, CultureInfo.InvariantCulture),
+            };
+
+        private static ulong MaskBits(ulong value, int bits)
+            => bits >= 64 ? value : value & ((1UL << bits) - 1);
+
+        private static int CountTrailingZeros(ulong value)
+        {
+            var count = 0;
+            while ((value & 1) == 0)
+            {
+                value >>= 1;
+                count++;
+            }
+            return count;
+        }
+    }
+
+    /// <summary>A switch lowered to one indexed branch through a table of block labels</summary>
+    public readonly struct LirJumpTablePlan
+    {
+        /// <summary>The case value the first table entry stands for; the index is the selector minus this</summary>
+        public long Minimum { get; }
+        /// <summary>One entry per value in the covered range, gaps filled with the default block</summary>
+        public ImmutableArray<LirBlock> Targets { get; }
+
+        internal LirJumpTablePlan(long minimum, ImmutableArray<LirBlock> targets)
+        {
+            Minimum = minimum;
+            Targets = targets;
+        }
+    }
+
+    public static class LirJumpTable
+    {
+        // A handful of compares predicts better than an indirect branch, so the table has to earn its place
+        private const int MinimumCaseCount = 5;
+        // Gaps cost a default entry each, so where gcc allows eight times the case count this allows three
+        private const int MaximumSpreadRatio = 3;
+        // A backstop against a crafted range that passes the ratio test only because the switch is huge
+        private const int MaximumEntryCount = 1024;
+
+        /// <summary>Reports whether a table beats a compare chain, and builds it when it does</summary>
+        public static bool TryPlan(
+            ImmutableArray<LirSwitchCase> cases,
+            IReadOnlyList<long> caseValues,
+            LirBlock? defaultTarget,
+            int selectorSize,
+            bool selectorIsSigned,
+            out LirJumpTablePlan plan)
+        {
+            plan = default;
+            if (defaultTarget is null || cases.IsDefaultOrEmpty || caseValues is null || caseValues.Count != cases.Length)
+                return false;
+            if (cases.Length < MinimumCaseCount || selectorSize <= 0 || selectorSize > 8)
+                return false;
+
+            var bits = selectorSize * 8;
+            var normalized = new long[cases.Length];
+            for (var i = 0; i < normalized.Length; i++)
+                normalized[i] = Normalize(caseValues[i], bits, selectorIsSigned);
+
+            var minimum = normalized[0];
+            var maximum = normalized[0];
+            for (var i = 1; i < normalized.Length; i++)
+            {
+                if (normalized[i] < minimum)
+                    minimum = normalized[i];
+                if (normalized[i] > maximum)
+                    maximum = normalized[i];
+            }
+
+            // Unsigned so that a range spanning the whole selector width fails the cap instead of overflowing
+            var spread = unchecked((ulong)maximum - (ulong)minimum);
+            if (spread >= MaximumEntryCount)
+                return false;
+
+            var entryCount = (int)spread + 1;
+            if (entryCount < cases.Length || entryCount > (long)cases.Length * MaximumSpreadRatio)
+                return false;
+
+            var targets = new LirBlock[entryCount];
+            var assigned = new bool[entryCount];
+            for (var i = 0; i < entryCount; i++)
+                targets[i] = defaultTarget;
+            foreach (var (value, @case) in normalized.Zip(cases))
+            {
+                // C forbids duplicate case values; should the tree carry one, the chain would take the first
+                var index = (int)(value - minimum);
+                if (assigned[index])
+                    continue;
+                assigned[index] = true;
+                targets[index] = @case.Target;
+            }
+
+            plan = new LirJumpTablePlan(minimum, ImmutableArray.Create(targets));
+            return true;
+        }
+
+        private static long Normalize(long value, int bits, bool signed)
+        {
+            if (bits >= 64)
+                return value;
+            var mask = (1UL << bits) - 1;
+            var raw = unchecked((ulong)value) & mask;
+            if (signed && (raw & (1UL << (bits - 1))) != 0)
+                raw |= ~mask;
+            return unchecked((long)raw);
+        }
+    }
+
     public sealed class LirInstruction
     {
         public int Ordinal { get; }
@@ -618,6 +989,11 @@ namespace Cnidaria.C
 
     internal sealed class LirFunctionBuilder
     {
+        private const int MaxRotatedLoopHeaderInstructions = 8;
+
+        private readonly Dictionary<LirVirtualRegister, LirVirtualRegister> _widenedIndices = new();
+        private readonly HashSet<object> _sharedIndices = new();
+
         private readonly GimpleFunctionAnnotations _function;
         private readonly ControlFlowFunction _controlFlowFunction;
         private readonly LirOptions _options;
@@ -995,6 +1371,8 @@ namespace Cnidaria.C
                     continue;
 
                 _currentBlock = block;
+                _widenedIndices.Clear();
+                CountSharedAddressIndices(gimpleBlock);
 
                 if (ReferenceEquals(gimpleBlock.ControlFlowBlock, _controlFlowFunction.Entry))
                     EmitEntryParameters(block);
@@ -1880,15 +2258,161 @@ namespace Cnidaria.C
             }
 
             LirOperand? index = null;
+            GimpleOperandInfo? indexExpression = null;
             if (elementAccess.Index is not null)
             {
-                var indexExpression = GetChild(expression, 1);
+                indexExpression = GetChild(expression, 1);
                 index = indexExpression is null ? EmitValue(block, elementAccess.Index) : EmitValue(block, indexExpression);
             }
 
             var scale = _target.SizeOf(elementAccess.Type);
+            if (AddressIndexKey(indexExpression?.Name) is { } indexKey && _sharedIndices.Contains(indexKey))
+                index = WidenAddressIndex(block, index);
             return LirAddress.Element(baseAddress, index, elementAccess.Type, scale);
         }
+        // Widening here instead of in the emitter gives the value a register and shares it across a block
+        private LirOperand? WidenAddressIndex(LirBlock block, LirOperand? index)
+        {
+            if (index is null || index.Kind != LirOperandKind.Register || index.Register is null)
+                return index;
+
+            // Only a scaled-index addressing mode reads the index as a register of its own
+            if (!TargetRegisterInfo.IsX86(_target))
+                return index;
+
+            var register = index.Register;
+            if (register.RegisterClass is not (LirRegisterClass.General or LirRegisterClass.Address))
+                return index;
+            if (register.Type.Type.Kind is not (TypeKind.Builtin or TypeKind.Enum))
+                return index;
+
+            var pointerSize = Math.Max(1, _target.PointerSize);
+            if (Math.Max(1, _target.SizeOf(register.Type)) >= pointerSize)
+                return index;
+            if (!TryGetPointerSizedIntegerType(register.Type, pointerSize, out var widenedType))
+                return index;
+
+            if (_widenedIndices.TryGetValue(register, out var cached))
+                return LirOperand.ForRegister(cached);
+
+            var result = NewVirtualRegister(widenedType, sourceName: null, valueNumber: null);
+            Emit(block, LirInstructionKind.Convert, result, ImmutableArray.Create(index), address: null,
+                op: GimpleOperators.Name(GimpleTreeCode.NopExpr), conversionKind: GimpleConversionKind.Implicit,
+                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null,
+                falseTarget: null, sourceStatement: null, sourceValue: null, sourceInstruction: null, valueNumber: null);
+            _widenedIndices.Add(register, result);
+            return LirOperand.ForRegister(result);
+        }
+
+        // One widened value has to replace several, or the emitter temporary is the cheaper way to get it
+        private void CountSharedAddressIndices(GimpleBlockAnnotations gimpleBlock)
+        {
+            _sharedIndices.Clear();
+            var counts = new Dictionary<object, int>();
+            foreach (var instruction in gimpleBlock.Statements)
+                CountStatementIndices(instruction.Statement, counts);
+
+            foreach (var pair in counts)
+            {
+                if (pair.Value > 1)
+                    _sharedIndices.Add(pair.Key);
+            }
+        }
+
+        private static void CountStatementIndices(GimpleStatement statement, Dictionary<object, int> counts)
+        {
+            switch (statement)
+            {
+                case GimpleAssignStatement assign:
+                    CountValueIndices(assign.Lhs, counts);
+                    foreach (var operand in assign.Operands)
+                        CountValueIndices(operand, counts);
+                    break;
+                case GimpleCallStatement call:
+                    CountValueIndices(call.Lhs, counts);
+                    foreach (var argument in call.Arguments)
+                        CountValueIndices(argument, counts);
+                    break;
+                case GimpleCondStatement branch:
+                    CountValueIndices(branch.Lhs, counts);
+                    CountValueIndices(branch.Rhs, counts);
+                    break;
+                case GimpleReturnStatement @return:
+                    CountValueIndices(@return.Expression, counts);
+                    break;
+                case GimpleSwitchStatement dispatch:
+                    CountValueIndices(dispatch.Expression, counts);
+                    break;
+            }
+        }
+
+        // An unrecognized node only hides accesses, which leaves the widening out and changes nothing else
+        private static void CountValueIndices(GimpleValue? value, Dictionary<object, int> counts)
+        {
+            switch (value)
+            {
+                case null:
+                    return;
+                case GimpleElementAccessExpression element:
+                    CountValueIndices(element.Expression, counts);
+                    CountValueIndices(element.Index, counts);
+                    if (element.Index is GimpleName indexName && AddressIndexKey(indexName) is { } key)
+                    {
+                        counts.TryGetValue(key, out var count);
+                        counts[key] = count + 1;
+                    }
+                    return;
+                case GimpleMemberAccessExpression member:
+                    CountValueIndices(member.Expression, counts);
+                    return;
+                case GimpleIndirectExpression indirect:
+                    CountValueIndices(indirect.Address, counts);
+                    return;
+                case GimpleAddressOfExpression address:
+                    CountValueIndices(address.Target, counts);
+                    return;
+                case GimpleUnaryExpression unary:
+                    CountValueIndices(unary.Operand, counts);
+                    return;
+                case GimpleBinaryExpression binary:
+                    CountValueIndices(binary.Left, counts);
+                    CountValueIndices(binary.Right, counts);
+                    return;
+                case GimpleConversionExpression conversion:
+                    CountValueIndices(conversion.Operand, counts);
+                    return;
+                case GimpleCastExpression cast:
+                    CountValueIndices(cast.Operand, counts);
+                    return;
+            }
+        }
+
+        private static object? AddressIndexKey(GimpleName? index)
+            => index is null ? null : (index.Variable, index.Version);
+
+        private bool TryGetPointerSizedIntegerType(QualifiedType source, int pointerSize, out QualifiedType type)
+        {
+            var unsigned = IsUnsignedIntegerType(source);
+            foreach (var candidate in new[]
+            {
+                unsigned ? TypeCatalog.Instance.UnsignedLong : TypeCatalog.Instance.Long,
+                unsigned ? TypeCatalog.Instance.UnsignedLongLong : TypeCatalog.Instance.LongLong,
+            })
+            {
+                type = new QualifiedType(candidate);
+                if (_target.SizeOf(type) == pointerSize)
+                    return true;
+            }
+
+            type = default;
+            return false;
+        }
+
+        private static bool IsUnsignedIntegerType(QualifiedType type)
+            => type.Type is BuiltinType builtin &&
+               builtin.BuiltinKind is BuiltinTypeKind.Bool or BuiltinTypeKind.UnsignedChar or BuiltinTypeKind.UnsignedShort
+                   or BuiltinTypeKind.UnsignedInt or BuiltinTypeKind.UnsignedLong or BuiltinTypeKind.UnsignedLongLong;
+
         private LirOperand EmitPointerElementBaseValue(LirBlock block, GimpleValue originalBase, GimpleOperandInfo? rewrittenBase)
         {
             if (rewrittenBase?.Name is not null)
@@ -2231,9 +2755,95 @@ namespace Cnidaria.C
                 current = fallback;
             }
 
+            RotateLoopHeaders(layout);
             _blocks.Clear();
             _blocks.AddRange(layout);
         }
+
+        // A loop laid out test first pays two taken branches an iteration, the conditional one at the top
+        // and the unconditional back edge. Moving the test behind the body leaves only the conditional one
+        private static void RotateLoopHeaders(List<LirBlock> layout)
+        {
+            var index = new Dictionary<LirBlock, int>(layout.Count);
+            for (var i = 0; i < layout.Count; i++)
+                index[layout[i]] = i;
+
+            var predecessors = new Dictionary<LirBlock, List<LirBlock>>(layout.Count);
+            foreach (var block in layout)
+            {
+                foreach (var successor in EnumerateLirSuccessors(block))
+                {
+                    if (!index.ContainsKey(successor))
+                        continue;
+                    if (!predecessors.TryGetValue(successor, out var list))
+                    {
+                        list = new List<LirBlock>();
+                        predecessors.Add(successor, list);
+                    }
+                    list.Add(block);
+                }
+            }
+
+            // A rotation reorders only the blocks of its own loop, so one pass settles nested loops too
+            for (var latch = 1; latch < layout.Count; latch++)
+            {
+                var terminator = LayoutTerminator(layout[latch]);
+                if (terminator is null || terminator.Kind != LirInstructionKind.Jump || terminator.Target is null)
+                    continue;
+                if (!index.TryGetValue(terminator.Target, out var header) || header == 0 || header >= latch)
+                    continue;
+                if (!CanRotateLoopHeader(layout, index, predecessors, header, latch))
+                    continue;
+
+                var block = layout[header];
+                layout.RemoveAt(header);
+                layout.Insert(latch, block);
+                for (var i = header; i <= latch; i++)
+                    index[layout[i]] = i;
+            }
+        }
+
+        private static bool CanRotateLoopHeader(
+            List<LirBlock> layout,
+            Dictionary<LirBlock, int> index,
+            Dictionary<LirBlock, List<LirBlock>> predecessors,
+            int header,
+            int latch)
+        {
+            var terminator = LayoutTerminator(layout[header]);
+            if (terminator is null || terminator.Kind != LirInstructionKind.Branch)
+                return false;
+            if (terminator.TrueTarget is null || terminator.FalseTarget is null)
+                return false;
+
+            // One edge has to continue into the body and the other has to leave, or nothing is gained
+            if (IsInside(index, terminator.TrueTarget, header, latch) == IsInside(index, terminator.FalseTarget, header, latch))
+                return false;
+
+            // The test now runs into the body instead of being jumped to, so it has to be cheap
+            if (layout[header].Instructions.Length > MaxRotatedLoopHeaderInstructions)
+                return false;
+
+            // Anything reaching the body from outside the loop would jump over the test
+            for (var i = header + 1; i <= latch; i++)
+            {
+                if (!predecessors.TryGetValue(layout[i], out var list))
+                    continue;
+                foreach (var predecessor in list)
+                {
+                    if (!index.TryGetValue(predecessor, out var position) || position < header || position > latch)
+                        return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static bool IsInside(Dictionary<LirBlock, int> index, LirBlock block, int header, int latch)
+            => index.TryGetValue(block, out var position) && position > header && position <= latch;
+
+        private static LirInstruction? LayoutTerminator(LirBlock block)
+            => block.Instructions.Length == 0 ? null : block.Instructions[^1];
 
         private LirBlock? SelectLayoutSuccessor(
             LirBlock block,

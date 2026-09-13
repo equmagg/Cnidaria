@@ -858,7 +858,7 @@ namespace Cnidaria.C
                     valueExpression.Name is not null &&
                     !valueExpression.Name.IsUndefined &&
                     valueExpression.Name.Variable.Kind != GimpleVariableKind.Memory &&
-                    SameType(valueExpression.Name.Type, definition.Name.Type))
+                    SameRepresentation(valueExpression.Name.Type, definition.Name.Type))
                 {
                     AddCopy(definition.Name, valueExpression.Name);
                     return;
@@ -1024,7 +1024,7 @@ namespace Cnidaria.C
 
             private static bool CanSubstituteName(GimpleName destination, GimpleName source)
             {
-                if (!SameType(destination.Type, source.Type))
+                if (!SameRepresentation(destination.Type, source.Type))
                     return false;
 
                 if (IsVolatileOrAtomic(destination.Type) || IsVolatileOrAtomic(source.Type))
@@ -1388,7 +1388,7 @@ namespace Cnidaria.C
                 GimpleOperandInfo operand,
                 out GimpleOperandInfo folded)
             {
-                if (code == GimpleTreeCode.NopExpr && SameType(operand.Original.Type, type))
+                if (IsIdentityConversion(code, operand.Original.Type, type))
                 {
                     folded = operand;
                     return true;
@@ -1986,6 +1986,18 @@ namespace Cnidaria.C
 
             private static long MaxSigned(int bits)
                 => bits >= 64 ? long.MaxValue : (1L << (bits - 1)) - 1L;
+
+            // A conversion between two spellings of one representation only moves the value
+            private static bool IsIdentityConversion(GimpleTreeCode code, QualifiedType source, QualifiedType destination)
+                => code is GimpleTreeCode.NopExpr or GimpleTreeCode.ConvertExpr &&
+                   !IsVolatileOrAtomic(source) && !IsVolatileOrAtomic(destination) &&
+                   string.Equals(RepresentationKey(source), RepresentationKey(destination), StringComparison.Ordinal);
+
+            private static string RepresentationKey(QualifiedType type)
+                => GimpleTypeHelpers.Normalize(type).Type.ToDisplayString();
+
+            private static bool SameRepresentation(QualifiedType left, QualifiedType right)
+                => string.Equals(RepresentationKey(left), RepresentationKey(right), StringComparison.Ordinal);
 
             private static bool SameType(QualifiedType left, QualifiedType right)
                 => string.Equals(

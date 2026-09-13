@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Globalization;
@@ -123,13 +123,16 @@ namespace Cnidaria.C
                             items.Add(new GimpleInitializerListItem(
                                 item.Syntax,
                                 item.Designators,
-                                LowerInitializerForDeclaration(item.Initializer)));
+                                LowerInitializerForDeclaration(item.Initializer),
+                                item.ElementIndex));
                         }
 
                         return new GimpleInitializerList(
                             initializerList.Syntax,
                             initializerList.TargetType,
-                            items.ToImmutable());
+                            initializerList.TargetType.Type is ArrayType
+                                ? PlaceArrayInitializerItems(items)
+                                : items.ToImmutable());
                     }
 
                 default:
@@ -448,6 +451,16 @@ namespace Cnidaria.C
             {
                 if (item.Designators.Length != 0)
                 {
+                    // A single index the binder already folded needs no second look at the syntax
+                    if (item.Designators.Length == 1 && item.ElementIndex >= 0)
+                    {
+                        LowerInitializer(
+                            CreateElementAccess(target, item.ElementIndex, arrayType.ElementType, item.Syntax),
+                            item.Initializer);
+                        nextIndex = item.ElementIndex + 1;
+                        continue;
+                    }
+
                     if (TryApplyDesignators(target, target.Type, item.Designators, out var designatedTarget, out _))
                     {
                         LowerInitializer(designatedTarget, item.Initializer);
@@ -699,6 +712,35 @@ namespace Cnidaria.C
             }
 
             return tag.TryGetField(fieldDesignator.NameToken.Text, out field!) && field is not null;
+        }
+
+        /// <summary>Places each item at the element its designator names, or at the running cursor, last write winning</summary>
+        private static ImmutableArray<GimpleInitializerListItem> PlaceArrayInitializerItems(
+            ImmutableArray<GimpleInitializerListItem>.Builder items)
+        {
+            var placed = new SortedDictionary<long, GimpleInitializerListItem>();
+            var cursor = 0L;
+
+            foreach (var item in items)
+            {
+                if (item.Designators.Length != 0)
+                {
+                    // A designator reaching into the element is left for the backend to reject rather than misplace
+                    if (item.Designators.Length != 1 || item.ElementIndex < 0)
+                        return items.ToImmutable();
+
+                    cursor = item.ElementIndex;
+                }
+
+                placed[cursor] = new GimpleInitializerListItem(
+                    item.Syntax,
+                    ImmutableArray<DesignatorSyntax>.Empty,
+                    item.Initializer,
+                    cursor);
+                cursor++;
+            }
+
+            return placed.Values.ToImmutableArray();
         }
 
         private static bool TryGetFirstArrayDesignatorIndex(

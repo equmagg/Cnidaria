@@ -349,13 +349,24 @@ namespace Cnidaria.C
             {
                 var elementType = array.ElementType;
                 var elementSize = Math.Max(1, _target.SizeOf(elementType));
+                var nextIndex = 0L;
                 foreach (var item in list.Items)
                 {
                     if (section.ByteLength - start >= availableSize)
                         break;
+                    // An element a designator skipped past stays zero
+                    if (item.ElementIndex > nextIndex)
+                    {
+                        section.EmitZero((int)Math.Min((item.ElementIndex - nextIndex) * elementSize, availableSize - (section.ByteLength - start)));
+                        nextIndex = item.ElementIndex;
+                        if (section.ByteLength - start >= availableSize)
+                            break;
+                    }
+
                     var used = EmitInitializer(section, elementType, item.Initializer, Math.Min(elementSize, availableSize - (section.ByteLength - start)));
                     if (used < elementSize && section.ByteLength - start < availableSize)
                         section.EmitZero(Math.Min(elementSize - used, availableSize - (section.ByteLength - start)));
+                    nextIndex++;
                 }
             }
             else
@@ -378,15 +389,10 @@ namespace Cnidaria.C
             if (expression is GimpleConstantValue constant)
                 return EmitConstantInitializer(section, type, constant.Value, availableSize);
 
-            if (expression is GimpleSymbolValue symbolValue)
+            // Array decay and element or field access all resolve to a symbol plus a constant offset
+            if (GimpleStaticAddress.TryResolve(expression, _target, out var addressSymbol, out var addend))
             {
-                EmitPointerRelocation(section, GetSymbolLabel(symbolValue.Symbol));
-                return Math.Min(availableSize, _target.PointerSize);
-            }
-
-            if (expression is GimpleAddressOfExpression addressOf && addressOf.Target is GimpleSymbolValue addressSymbol)
-            {
-                EmitPointerRelocation(section, GetSymbolLabel(addressSymbol.Symbol));
+                EmitPointerRelocation(section, GetSymbolLabel(addressSymbol), addend);
                 return Math.Min(availableSize, _target.PointerSize);
             }
 
@@ -434,11 +440,23 @@ namespace Cnidaria.C
             return size;
         }
 
-        private void EmitPointerRelocation(DataSectionBuilder section, string symbol)
+        // Absolute code addresses: the image is linked at a fixed base, so no runtime relocation is needed
+        private string CreateJumpTable(IReadOnlyList<string> targetLabels)
+        {
+            var label = CreateLocalLabel("jump_table");
+            var entrySize = _target.PointerSize;
+            var offset = _rodata.Align(entrySize);
+            _rodata.DefineSymbol(label, offset, targetLabels.Count * entrySize, RVObjectSymbolBinding.Local, _symbols);
+            foreach (var targetLabel in targetLabels)
+                EmitPointerRelocation(_rodata, targetLabel);
+            return label;
+        }
+
+        private void EmitPointerRelocation(DataSectionBuilder section, string symbol, long addend = 0)
         {
             var offset = section.ByteLength;
             section.EmitZero(_target.PointerSize);
-            section.AddRelocation(offset, symbol, 0, _target.PointerSize == 8 ? RVObjectRelocationKind.Absolute64 : RVObjectRelocationKind.Absolute32);
+            section.AddRelocation(offset, symbol, checked((int)addend), _target.PointerSize == 8 ? RVObjectRelocationKind.Absolute64 : RVObjectRelocationKind.Absolute32);
         }
 
         private string GetSymbolLabel(Symbol symbol)
@@ -624,6 +642,10 @@ namespace Cnidaria.C
             private readonly AllocationResult _allocation;
             private readonly string _functionLabel;
             private readonly IReadOnlyDictionary<LirBlock, string> _labels;
+            private readonly Dictionary<LirBlock, LirSelectDiamond> _selectDiamonds = new();
+            private readonly HashSet<LirBlock> _foldedSelectArms = new();
+            private LirBlock? _currentBlock;
+            private int _currentBlockIndex;
             private readonly bool _hasCalls;
             private readonly int _raSaveOffset;
             private readonly int _riscVVarArgsSaveAreaOffset;
@@ -696,6 +718,7 @@ namespace Cnidaria.C
 
             public void EmitBlocks()
             {
+                FindSelectDiamonds();
                 _currentInstructionPosition = 0;
                 for (var blockIndex = 0; blockIndex < _function.Blocks.Length; blockIndex++)
                 {
@@ -704,7 +727,15 @@ namespace Cnidaria.C
                         ? _function.Blocks[blockIndex + 1]
                         : null;
                     ClearIntegerRepresentationFacts();
+                    _currentBlock = block;
+                    _currentBlockIndex = blockIndex;
                     _owner._text.DefineLabel(LabelOf(block));
+                    if (_foldedSelectArms.Contains(block))
+                    {
+                        _currentInstructionPosition += block.Instructions.Length * 2;
+                        continue;
+                    }
+
                     foreach (var instruction in block.Instructions)
                     {
                         EmitInstruction(instruction);
@@ -712,6 +743,97 @@ namespace Cnidaria.C
                     }
                 }
                 _fallthroughBlock = null;
+            }
+
+            // Zicond turns a conditional expression into two masked moves and an or, with no branch at all
+            private void FindSelectDiamonds()
+            {
+                if (!_owner._machineTarget.HasZicond)
+                    return;
+
+                foreach (var pair in LirSelect.FindDiamonds(_function, _owner._target))
+                {
+                    if (!IsSelectableCondition(pair.Value.Branch))
+                        continue;
+                    _selectDiamonds.Add(pair.Key, pair.Value);
+                    _foldedSelectArms.Add(pair.Value.TrueArm);
+                    _foldedSelectArms.Add(pair.Value.FalseArm);
+                }
+            }
+
+            private bool IsSelectableCondition(LirInstruction branch)
+            {
+                foreach (var operand in branch.Operands)
+                {
+                    if (IsFloatType(operand.Type) || IsRv32WideInteger(operand.Type) || RequiresStackBackedScalar(operand.Type))
+                        return false;
+                }
+
+                return branch.Operands.Length == 1 ||
+                    (branch.Operands.Length == 2 && IsComparisonOperator(branch.Operator));
+            }
+
+            private bool TryEmitSelect(LirInstruction instruction)
+            {
+                if (_currentBlock is null ||
+                    !_selectDiamonds.TryGetValue(_currentBlock, out var diamond) ||
+                    !ReferenceEquals(diamond.Branch, instruction))
+                {
+                    return false;
+                }
+
+                var condition = EmitSelectCondition(instruction);
+                var destination = GetWritableRegister(diamond.Destination, GpScratch0);
+
+                var trueValue = LoadOperand(diamond.TrueValue, GpScratch1);
+                Emit(RVInstruction.R(RVInstrKind.CzeroEqz, ToRegister(GpScratch1), ToRegister(trueValue), ToRegister(condition)));
+                var falseValue = LoadOperand(diamond.FalseValue, GpScratch2);
+                Emit(RVInstruction.R(RVInstrKind.CzeroNez, ToRegister(GpScratch2), ToRegister(falseValue), ToRegister(condition)));
+                Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(destination), ToRegister(GpScratch1), ToRegister(GpScratch2)));
+
+                SetIntegerRepresentation(destination, IntegerRepresentationFact.Unknown);
+                NormalizeIntegerRegister(destination, diamond.Destination.Type);
+                StoreWritableRegisterIfSpilled(diamond.Destination, destination);
+                if (!FallsThroughToJoin(diamond.Join))
+                    EmitJump(LabelOf(diamond.Join));
+                return true;
+            }
+
+            // czero reads the whole register, so the condition only has to be zero or non-zero
+            private MachineRegister EmitSelectCondition(LirInstruction branch)
+            {
+                if (branch.Operands.Length == 1)
+                    return LoadIntegerBranchOperand(branch.Operands[0], GpScratch3);
+
+                var left = LoadOperand(branch.Operands[0], GpScratch1);
+                var right = LoadOperand(branch.Operands[1], GpScratch2);
+                var signed = IsSignedIntegerType(branch.Operands[0].Type) || IsSignedIntegerType(branch.Operands[1].Type);
+                switch (branch.Operator)
+                {
+                    case "==": EmitEquality(GpScratch3, left, right, equal: true); break;
+                    case "!=": EmitEquality(GpScratch3, left, right, equal: false); break;
+                    case "<": EmitLessThan(GpScratch3, left, right, signed); break;
+                    case ">": EmitLessThan(GpScratch3, right, left, signed); break;
+                    case "<=": EmitLessThan(GpScratch3, right, left, signed); EmitImm(RVInstrKind.Xori, GpScratch3, GpScratch3, 1); break;
+                    default: EmitLessThan(GpScratch3, left, right, signed); EmitImm(RVInstrKind.Xori, GpScratch3, GpScratch3, 1); break;
+                }
+
+                return GpScratch3;
+            }
+
+            // The folded arms emit nothing, so the join is still reached by falling off the end of this block
+            private bool FallsThroughToJoin(LirBlock join)
+            {
+                for (var index = _currentBlockIndex + 1; index < _function.Blocks.Length; index++)
+                {
+                    var block = _function.Blocks[index];
+                    if (ReferenceEquals(block, join))
+                        return true;
+                    if (!_foldedSelectArms.Contains(block))
+                        return false;
+                }
+
+                return false;
             }
 
             public void EmitTrap()
@@ -2502,6 +2624,9 @@ namespace Cnidaria.C
                 var rightOperand = instruction.Operands[1];
                 var op = instruction.Operator;
 
+                if (op is "*" or "/" or "%" && TryEmitPowerOfTwoArithmetic(instruction, dst, leftOperand))
+                    return true;
+
                 if (rightOperand.Kind != LirOperandKind.Immediate && leftOperand.Kind == LirOperandKind.Immediate)
                 {
                     if (op is "+" or "&" or "|" or "^" or "==" or "!=")
@@ -2592,6 +2717,83 @@ namespace Cnidaria.C
                     default:
                         return false;
                 }
+            }
+
+            private bool TryEmitPowerOfTwoArithmetic(LirInstruction instruction, MachineRegister dst, LirOperand leftOperand)
+            {
+                var wordOp = _owner._target.Is64Bit && SizeOf(instruction.Operands[0].Type) <= 4;
+                var bits = wordOp ? 32 : _owner._target.RegisterSize * 8;
+
+                if (instruction.Operator == "*")
+                {
+                    if (!LirStrengthReduction.TryGetPowerOfTwoFactor(instruction, _owner._target, out var factorShift))
+                        return false;
+                    EmitShiftImmediate(wordOp ? RVInstrKind.Slliw : RVInstrKind.Slli, dst, LoadOperand(leftOperand, GpScratch1), factorShift);
+                    return true;
+                }
+
+                if (!LirStrengthReduction.TryGetPowerOfTwoDivisor(instruction, _owner._target, out var shift, out var negated))
+                    return false;
+
+                var wantRemainder = instruction.Operator == "%";
+                var dividend = LoadOperand(leftOperand, GpScratch1);
+                if (!IsSignedIntegerType(instruction.Operands[0].Type))
+                {
+                    if (!wantRemainder)
+                        EmitShiftImmediate(wordOp ? RVInstrKind.Srliw : RVInstrKind.Srli, dst, dividend, shift);
+                    else
+                        EmitKeepLowBits(dst, dividend, shift, wordOp, bits);
+                    return true;
+                }
+
+                // The bias is 2^k - 1 for a negative dividend and zero otherwise, so the shift truncates toward zero
+                if (shift == 1)
+                {
+                    EmitShiftImmediate(wordOp ? RVInstrKind.Srliw : RVInstrKind.Srli, GpScratch2, dividend, bits - 1);
+                }
+                else
+                {
+                    EmitShiftImmediate(wordOp ? RVInstrKind.Sraiw : RVInstrKind.Srai, GpScratch2, dividend, bits - 1);
+                    EmitShiftImmediate(wordOp ? RVInstrKind.Srliw : RVInstrKind.Srli, GpScratch2, GpScratch2, bits - shift);
+                }
+
+                Emit(RVInstruction.R(wordOp ? RVInstrKind.Addw : RVInstrKind.Add, ToRegister(GpScratch2), ToRegister(dividend), ToRegister(GpScratch2)));
+                if (wantRemainder)
+                {
+                    EmitClearLowBits(GpScratch2, GpScratch2, shift, wordOp, bits);
+                    Emit(RVInstruction.R(wordOp ? RVInstrKind.Subw : RVInstrKind.Sub, ToRegister(dst), ToRegister(dividend), ToRegister(GpScratch2)));
+                    return true;
+                }
+
+                EmitShiftImmediate(wordOp ? RVInstrKind.Sraiw : RVInstrKind.Srai, dst, GpScratch2, shift);
+                if (negated)
+                    Emit(RVInstruction.R(wordOp ? RVInstrKind.Subw : RVInstrKind.Sub, ToRegister(dst), RVRegister.X0, ToRegister(dst)));
+                return true;
+            }
+
+            // andi reaches twelve signed bits, and past that a pair of shifts still beats materializing the mask
+            private void EmitKeepLowBits(MachineRegister destination, MachineRegister source, int shift, bool wordOp, int bits)
+            {
+                var mask = (1L << shift) - 1;
+                if (FitsSignedImmediate(mask, 12))
+                {
+                    EmitImm(RVInstrKind.Andi, destination, source, (int)mask);
+                    return;
+                }
+                EmitShiftImmediate(wordOp ? RVInstrKind.Slliw : RVInstrKind.Slli, destination, source, bits - shift);
+                EmitShiftImmediate(wordOp ? RVInstrKind.Srliw : RVInstrKind.Srli, destination, destination, bits - shift);
+            }
+
+            private void EmitClearLowBits(MachineRegister destination, MachineRegister source, int shift, bool wordOp, int bits)
+            {
+                var mask = -(1L << shift);
+                if (FitsSignedImmediate(mask, 12))
+                {
+                    EmitImm(RVInstrKind.Andi, destination, source, (int)mask);
+                    return;
+                }
+                EmitShiftImmediate(wordOp ? RVInstrKind.Srliw : RVInstrKind.Srli, destination, source, shift);
+                EmitShiftImmediate(wordOp ? RVInstrKind.Slliw : RVInstrKind.Slli, destination, destination, shift);
             }
 
             private void EmitIntegerBinaryRegisters(LirInstruction instruction, MachineRegister dst, MachineRegister left, MachineRegister right)
@@ -3617,6 +3819,9 @@ namespace Cnidaria.C
 
             private void EmitBranch(LirInstruction instruction)
             {
+                if (TryEmitSelect(instruction))
+                    return;
+
                 if (instruction.Operands.Length == 2 && IsComparisonOperator(instruction.Operator))
                 {
                     EmitComparisonBranch(instruction);
@@ -3886,6 +4091,9 @@ namespace Cnidaria.C
                 if (RequiresStackBackedScalar(instruction.Operands[0].Type))
                     throw HelperRequired(instruction, SelectScalarMoveHelper(instruction.Operands[0].Type), "Switch on scalar wider than one machine register is not implemented yet.");
 
+                if (TryEmitSwitchTable(instruction, SizeOf(instruction.Operands[0].Type)))
+                    return;
+
                 var key = LoadIntegerBranchOperand(instruction.Operands[0], GpScratch0);
                 foreach (var @case in instruction.SwitchCases)
                 {
@@ -3898,6 +4106,61 @@ namespace Cnidaria.C
 
                 if (!IsFallthroughTarget(instruction.Target))
                     EmitJump(LabelOf(instruction.Target));
+            }
+
+            private bool TryEmitSwitchTable(LirInstruction instruction, int size)
+            {
+                // A narrower selector would leave the bits above it undefined in the index register
+                if (size < 4)
+                    return false;
+
+                var values = new long[instruction.SwitchCases.Length];
+                for (var i = 0; i < values.Length; i++)
+                    values[i] = ImmediateToInt64(instruction.SwitchCases[i].Value);
+                if (!LirJumpTable.TryPlan(instruction.SwitchCases, values, instruction.Target,
+                        size, IsSignedIntegerType(instruction.Operands[0].Type), out var plan))
+                    return false;
+
+                var targetLabels = new string[plan.Targets.Length];
+                for (var i = 0; i < targetLabels.Length; i++)
+                {
+                    if (!_labels.TryGetValue(plan.Targets[i], out var targetLabel))
+                        return false;
+                    targetLabels[i] = targetLabel;
+                }
+
+                var index = LoadIntegerBranchOperand(instruction.Operands[0], GpScratch0);
+                if (plan.Minimum != 0)
+                {
+                    var bias = unchecked(-plan.Minimum);
+                    if (FitsSignedImmediate(bias, 12))
+                    {
+                        EmitImm(RVInstrKind.Addi, GpScratch0, index, (int)bias);
+                    }
+                    else
+                    {
+                        LoadImmediate(GpScratch1, plan.Minimum);
+                        Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch0), ToRegister(index), ToRegister(GpScratch1)));
+                    }
+                    index = GpScratch0;
+                    SetIntegerRepresentation(GpScratch0, IntegerRepresentationFact.Unknown);
+                }
+
+                LoadImmediate(GpScratch1, plan.Targets.Length);
+                EmitBranch(RVInstrKind.Bgeu, index, GpScratch1, LabelOf(instruction.Target));
+
+                var entryShift = _owner._target.PointerSize == 8 ? 3 : 2;
+                MaterializeSymbolAddress(_owner.CreateJumpTable(targetLabels), GpScratch1);
+                Emit(RVInstruction.I(RVInstrKind.Slli, ToRegister(GpScratch2), ToRegister(index), entryShift));
+                Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(GpScratch1), ToRegister(GpScratch1), ToRegister(GpScratch2)));
+                Emit(RVInstruction.I(
+                    _owner._target.PointerSize == 8 ? RVInstrKind.Ld : RVInstrKind.Lw,
+                    ToRegister(GpScratch2),
+                    ToRegister(GpScratch1),
+                    0));
+                Emit(RVInstruction.I(RVInstrKind.Jalr, RVRegister.X0, ToRegister(GpScratch2), 0));
+                SetIntegerRepresentation(GpScratch2, IntegerRepresentationFact.Unknown);
+                return true;
             }
 
             private void EmitReturn(LirInstruction instruction)

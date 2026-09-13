@@ -333,20 +333,135 @@ namespace Cnidaria.C
     }
 
     /// <summary>Pairs an initializer with the designator path selecting its target</summary>
+    /// <summary>Resolves the constant address a static initializer stores into a pointer</summary>
+    public static class GimpleStaticAddress
+    {
+        /// <summary>Reports the symbol and byte offset an initializer names, through decay and member access</summary>
+        public static bool TryResolve(GimpleValue? expression, TargetInfo target, out Symbol symbol, out long offset)
+        {
+            symbol = null!;
+            offset = 0;
+            if (expression is null || target is null)
+                return false;
+
+            // An array or function name decays to its own address, so the conversion carries no offset
+            while (expression is GimpleConversionExpression conversion)
+                expression = conversion.Operand;
+
+            if (expression is GimpleAddressOfExpression addressOf)
+                return TryResolvePlace(addressOf.Target, target, ref offset, out symbol);
+
+            if (expression is GimpleSymbolValue value)
+            {
+                symbol = value.Symbol;
+                return symbol is not null;
+            }
+
+            if (expression is GimplePlace place && place is not GimpleTemporaryValue)
+                return TryResolvePlace(place, target, ref offset, out symbol);
+
+            return false;
+        }
+
+        private static bool TryResolvePlace(GimplePlace place, TargetInfo target, ref long offset, out Symbol symbol)
+        {
+            symbol = null!;
+            switch (place)
+            {
+                case GimpleSymbolValue value:
+                    symbol = value.Symbol;
+                    return symbol is not null;
+
+                case GimpleElementAccessExpression element:
+                {
+                    if (!TryUnwrapPlace(element.Expression, out var elementBase))
+                        return false;
+                    var index = 0L;
+                    if (element.Index is not null && !TryGetConstantIndex(element.Index, out index))
+                        return false;
+                    offset = checked(offset + index * Math.Max(1, target.SizeOf(element.Type)));
+                    return TryResolvePlace(elementBase, target, ref offset, out symbol);
+                }
+
+                case GimpleMemberAccessExpression member:
+                {
+                    if (member.Field is null || !TryUnwrapPlace(member.Expression, out var memberBase))
+                        return false;
+                    offset = checked(offset + FieldOffset(member.Field, target));
+                    return TryResolvePlace(memberBase, target, ref offset, out symbol);
+                }
+
+                default:
+                    return false;
+            }
+        }
+
+        // An array name reaches the element access as a decay conversion, which carries no offset of its own
+        private static bool TryUnwrapPlace(GimpleValue value, out GimplePlace place)
+        {
+            while (value is GimpleConversionExpression conversion)
+                value = conversion.Operand;
+            place = (value as GimplePlace)!;
+            return place is not null and not GimpleTemporaryValue;
+        }
+
+        private static long FieldOffset(FieldSymbol field, TargetInfo target)
+        {
+            if (field.ContainingTag.TagKind == TagKind.Union)
+                return 0;
+
+            var offset = 0L;
+            foreach (var candidate in field.ContainingTag.Fields)
+            {
+                var alignment = Math.Max(1, target.AlignOf(candidate.Type));
+                var remainder = offset % alignment;
+                if (remainder != 0)
+                    offset = checked(offset + alignment - remainder);
+                if (ReferenceEquals(candidate, field))
+                    return offset;
+                offset = checked(offset + Math.Max(1, target.SizeOf(candidate.Type)));
+            }
+
+            return offset;
+        }
+
+        private static bool TryGetConstantIndex(GimpleValue index, out long value)
+        {
+            value = 0;
+            while (index is GimpleConversionExpression conversion)
+                index = conversion.Operand;
+            if (index is not GimpleConstantValue constant || constant.Value is string)
+                return false;
+            try
+            {
+                value = Convert.ToInt64(constant.Value, CultureInfo.InvariantCulture);
+                return true;
+            }
+            catch (Exception exception) when (exception is FormatException or InvalidCastException or OverflowException)
+            {
+                return false;
+            }
+        }
+    }
+
     public readonly struct GimpleInitializerListItem
     {
         public SyntaxNode? Syntax { get; }
         public ImmutableArray<DesignatorSyntax> Designators { get; }
         public GimpleInitializer Initializer { get; }
+        /// <summary>The array element this item initializes, or -1 when the list does not target an array</summary>
+        public long ElementIndex { get; }
 
         public GimpleInitializerListItem(
             SyntaxNode? syntax,
             ImmutableArray<DesignatorSyntax> designators,
-            GimpleInitializer initializer)
+            GimpleInitializer initializer,
+            long elementIndex = -1)
         {
             Syntax = syntax;
             Designators = designators.IsDefault ? ImmutableArray<DesignatorSyntax>.Empty : designators;
             Initializer = initializer ?? throw new ArgumentNullException(nameof(initializer));
+            ElementIndex = elementIndex;
         }
     }
 

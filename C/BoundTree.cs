@@ -256,10 +256,13 @@ namespace Cnidaria.C
         /// <summary>Field and element path relative to the enclosing initializer</summary>
         public ImmutableArray<DesignatorSyntax> Designators { get; }
         public BoundInitializer Initializer { get; }
+        /// <summary>The array element this item initializes, or -1 when the enclosing initializer is not an array</summary>
+        public long ElementIndex { get; }
 
-        public BoundInitializerListItem(InitializerListItemSyntax syntax, BoundInitializer initializer)
+        public BoundInitializerListItem(InitializerListItemSyntax syntax, BoundInitializer initializer, long elementIndex = -1)
             : base(syntax)
         {
+            ElementIndex = elementIndex;
             Designators = syntax.Designators.IsDefault
                 ? ImmutableArray<DesignatorSyntax>.Empty
                 : syntax.Designators;

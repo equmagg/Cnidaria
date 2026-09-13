@@ -415,10 +415,96 @@ namespace Cnidaria.C
                 return IndirectForTarget(target, type, size, alignment);
             }
 
-            if (size <= checked(target.RegisterSize * MaxRegisterAggregateRegisters))
-                return AbiValue.MultiRegister(type, size, alignment, CreateGeneralSegments(target, size, alignment, requireVariadicAlignedPair: false));
+            if (size <= checked(target.RegisterSize * MaxRegisterAggregateRegisters) && !ContainsLongDouble(type))
+                return AbiValue.MultiRegister(type, size, alignment, CreateSystemVSegments(target, type, size));
 
             return isReturn ? IndirectForTarget(target, type, size, alignment) : AbiValue.Stack(type, size, alignment);
+        }
+
+        // System V classifies every eightbyte on its own, and one holding nothing but float or double is SSE
+        private static ImmutableArray<AbiSegment> CreateSystemVSegments(TargetInfo target, QualifiedType type, int size)
+        {
+            var registerSize = Math.Max(1, target.RegisterSize);
+            var segments = ImmutableArray.CreateBuilder<AbiSegment>();
+            for (var offset = 0; offset < size; offset += registerSize)
+            {
+                var segmentSize = Math.Min(registerSize, size - offset);
+                var registerClass = IsFloatingEightbyte(target, type, 0, offset, checked(offset + segmentSize))
+                    ? AbiRegisterClass.Vector
+                    : AbiRegisterClass.General;
+                segments.Add(CreateSegment(target, offset, segmentSize, registerClass));
+            }
+
+            return segments.ToImmutable();
+        }
+
+        private static bool IsFloatingEightbyte(TargetInfo target, QualifiedType type, int typeOffset, int start, int end)
+        {
+            if (typeOffset >= end || checked(typeOffset + Math.Max(1, target.SizeOf(type))) <= start)
+                return true;
+
+            if (type.Type is ArrayType array)
+            {
+                var elementSize = Math.Max(1, target.SizeOf(array.ElementType));
+                var length = array.Length ?? 0;
+                for (long i = 0; i < length; i++)
+                {
+                    if (!IsFloatingEightbyte(target, array.ElementType, checked(typeOffset + (int)(i * elementSize)), start, end))
+                        return false;
+                }
+
+                return true;
+            }
+
+            if (type.Type is TagType { Symbol.TagKind: not TagKind.Enum } tag && tag.Symbol.IsComplete)
+            {
+                foreach (var field in tag.Symbol.Fields)
+                {
+                    if (!IsFloatingEightbyte(target, field.Type, checked(typeOffset + FieldOffset(target, field)), start, end))
+                        return false;
+                }
+
+                return true;
+            }
+
+            return IsFloat32(type) || IsFloat64(type);
+        }
+
+        private static bool ContainsLongDouble(QualifiedType type)
+        {
+            if (type.Type is ArrayType array)
+                return ContainsLongDouble(array.ElementType);
+
+            if (type.Type is TagType { Symbol.TagKind: not TagKind.Enum } tag && tag.Symbol.IsComplete)
+            {
+                foreach (var field in tag.Symbol.Fields)
+                {
+                    if (ContainsLongDouble(field.Type))
+                        return true;
+                }
+
+                return false;
+            }
+
+            return IsLongDouble(type);
+        }
+
+        private static int FieldOffset(TargetInfo target, FieldSymbol field)
+        {
+            var tag = field.ContainingTag;
+            if (tag.TagKind == TagKind.Union)
+                return 0;
+
+            var offset = 0;
+            foreach (var candidate in tag.Fields)
+            {
+                offset = AlignUp(offset, Math.Max(1, target.AlignOf(candidate.Type)));
+                if (ReferenceEquals(candidate, field))
+                    return offset;
+                offset = checked(offset + Math.Max(1, target.SizeOf(candidate.Type)));
+            }
+
+            return 0;
         }
 
         private static AbiValue ClassifySmallRegisterAggregate(TargetInfo target, QualifiedType type, bool isReturn, bool passLargeByReference)

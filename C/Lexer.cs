@@ -350,6 +350,8 @@ namespace Cnidaria.C
                     macros["__riscv_zaamo"] = "1000000";
                     macros["__riscv_zacas"] = "1000000";
                 }
+                if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVZicond) != 0)
+                    macros["__riscv_zicond"] = "1000000";
                 if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVF) != 0)
                     macros["__riscv_flen"] = "32";
                 if ((target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVD) != 0)

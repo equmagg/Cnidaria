@@ -282,6 +282,7 @@ namespace Cnidaria.RiscV
         Zacas = 1UL << 18,
         Zaamo = 1UL << 19,
         Zalrsc = 1UL << 20,
+        Zicond = 1UL << 21,
         Privileged = 1UL << 32,
     }
 
@@ -666,6 +667,8 @@ namespace Cnidaria.RiscV
         Sh1AddUw,
         Sh2AddUw,
         Sh3AddUw,
+        CzeroEqz,
+        CzeroNez,
         SlliUw,
         Bclr,
         Bext,
@@ -971,6 +974,8 @@ namespace Cnidaria.RiscV
                 flags |= RVIsaFlags.H;
             if ((features & TargetArchitectureFeatures.RiscVZacas) != 0)
                 flags |= RVIsaFlags.Zacas;
+            if ((features & TargetArchitectureFeatures.RiscVZicond) != 0)
+                flags |= RVIsaFlags.Zicond;
             if ((features & TargetArchitectureFeatures.RiscVPrivileged) != 0)
                 flags |= RVIsaFlags.Privileged;
 
@@ -1011,6 +1016,8 @@ namespace Cnidaria.RiscV
                 flags |= RVIsaFlags.H;
             if ((features & TargetArchitectureFeatures.RiscVZacas) != 0)
                 flags |= RVIsaFlags.Zacas;
+            if ((features & TargetArchitectureFeatures.RiscVZicond) != 0)
+                flags |= RVIsaFlags.Zicond;
             if ((features & TargetArchitectureFeatures.RiscVPrivileged) != 0)
                 flags |= RVIsaFlags.Privileged;
 
@@ -1041,6 +1048,7 @@ namespace Cnidaria.RiscV
         public bool HasZacas => Has(RVIsaFlags.Zacas);
         public bool HasZaamo => Has(RVIsaFlags.Zaamo);
         public bool HasZalrsc => Has(RVIsaFlags.Zalrsc);
+        public bool HasZicond => Has(RVIsaFlags.Zicond);
         public bool HasPrivileged => Has(RVIsaFlags.Privileged);
 
         public RVTarget(int xlen, RVAbiKind abi, RVIsaFlags isa, TargetEndianness endianness = TargetEndianness.Little, OperatingSystemKind operatingSystem = OperatingSystemKind.None)
@@ -1097,6 +1105,8 @@ namespace Cnidaria.RiscV
                 suffix += "_zalrsc";
             if (HasZacas)
                 suffix += "_zacas";
+            if (HasZicond)
+                suffix += "_zicond";
             return suffix;
         }
     }
@@ -2027,6 +2037,8 @@ namespace Cnidaria.RiscV
             RVInstrKind.Sh1AddUw => "sh1add.uw",
             RVInstrKind.Sh2AddUw => "sh2add.uw",
             RVInstrKind.Sh3AddUw => "sh3add.uw",
+            RVInstrKind.CzeroEqz => "czero.eqz",
+            RVInstrKind.CzeroNez => "czero.nez",
             RVInstrKind.SlliUw => "slli.uw",
             RVInstrKind.Bclr => "bclr",
             RVInstrKind.Bext => "bext",
@@ -2470,6 +2482,8 @@ namespace Cnidaria.RiscV
             Add(map, RVInstrKind.Sh1AddUw, RVInstructionFormat.R, RVIsaFlags.B, true, 0x3B, 2, 0x10);
             Add(map, RVInstrKind.Sh2AddUw, RVInstructionFormat.R, RVIsaFlags.B, true, 0x3B, 4, 0x10);
             Add(map, RVInstrKind.Sh3AddUw, RVInstructionFormat.R, RVIsaFlags.B, true, 0x3B, 6, 0x10);
+            Add(map, RVInstrKind.CzeroEqz, RVInstructionFormat.R, RVIsaFlags.Zicond, false, 0x33, 5, 0x07);
+            Add(map, RVInstrKind.CzeroNez, RVInstructionFormat.R, RVIsaFlags.Zicond, false, 0x33, 7, 0x07);
             Add(map, RVInstrKind.SlliUw, RVInstructionFormat.BitmanipShiftI, RVIsaFlags.B, true, 0x1B, 1, 0x04);
             Add(map, RVInstrKind.Bclr, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 1, 0x24);
             Add(map, RVInstrKind.Bext, RVInstructionFormat.R, RVIsaFlags.B, false, 0x33, 5, 0x24);

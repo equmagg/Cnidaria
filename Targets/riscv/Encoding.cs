@@ -1340,6 +1340,8 @@ namespace Cnidaria.RiscV
                 (0x05, 5) when target.HasB => RVInstrKind.Minu,
                 (0x30, 1) when target.HasB => RVInstrKind.Rol,
                 (0x30, 5) when target.HasB => RVInstrKind.Ror,
+                (0x07, 5) when target.HasZicond => RVInstrKind.CzeroEqz,
+                (0x07, 7) when target.HasZicond => RVInstrKind.CzeroNez,
                 (0x10, 2) when target.HasB => RVInstrKind.Sh1Add,
                 (0x10, 4) when target.HasB => RVInstrKind.Sh2Add,
                 (0x10, 6) when target.HasB => RVInstrKind.Sh3Add,

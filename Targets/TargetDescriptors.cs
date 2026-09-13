@@ -31,11 +31,12 @@ namespace Cnidaria
         RiscVH = 1UL << 7, // not supported by the emulator
         RiscVG = RiscVM | RiscVF | RiscVD | RiscVA,
         RVA22 = RiscVG | RiscVPrivileged | RiscVB | RiscVC,
-        RVA23 = RVA22 | RiscVV | RiscVH,
+        RVA23 = RVA22 | RiscVV | RiscVH | RiscVZicond,
         RiscVPrivileged = 1UL << 8,
         RiscVZacas = 1UL << 9,
         RiscVZaamo = 1UL << 10,
         RiscVZalrsc = 1UL << 11,
+        RiscVZicond = 1UL << 12,
         X86Sse2 = 1UL << 16,
         X86Avx = 1UL << 17,
         X86Avx2 = 1UL << 18,

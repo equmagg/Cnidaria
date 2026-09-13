@@ -265,6 +265,8 @@ namespace Cnidaria.C
         private readonly List<FunctionPointerFixup> _functionPointerFixups = new List<FunctionPointerFixup>();
         private int _entryMethodId;
         private int _writableGlobalDataBlobOffset = -1;
+        private readonly List<GlobalPointerFixup> _globalPointerFixups = new();
+        private readonly List<GlobalPointerFixup> _pendingPointerFixups = new();
         private int _writableGlobalDataSize;
 
         private RegisterBytecodeCodeGenerator(
@@ -541,11 +543,13 @@ namespace Cnidaria.C
                     var global = definition.Value.Global;
                     var size = GetGlobalStorageSize(global.Type);
                     var bytes = new byte[size];
+                    _pendingPointerFixups.Clear();
                     if (global.Initializer is not null)
                         WriteGlobalInitializer(bytes, 0, global.Type, global.Initializer, size);
 
                     GlobalStorage storage;
-                    if (IsReadOnlyGlobal(global) || IsStringLiteralSymbol(global.Symbol))
+                    // A global holding an address is patched at startup, so it cannot sit in the read-only blob
+                    if (_pendingPointerFixups.Count == 0 && (IsReadOnlyGlobal(global) || IsStringLiteralSymbol(global.Symbol)))
                     {
                         storage = GlobalStorage.ReadOnly(_assembler.AddBlob(bytes), bytes.Length);
                     }
@@ -557,6 +561,8 @@ namespace Cnidaria.C
                             writableGlobalData.Add(0);
                         writableGlobalData.AddRange(bytes);
                         storage = GlobalStorage.Writable(offset);
+                        foreach (var fixup in _pendingPointerFixups)
+                            _globalPointerFixups.Add(fixup.Rebase(offset));
                     }
 
                     if (key.UnitIndex >= 0)
@@ -579,6 +585,32 @@ namespace Cnidaria.C
                     writableGlobalData.Add(0);
                 _writableGlobalDataBlobOffset = _assembler.AddBlob(writableGlobalData.ToArray());
             }
+        }
+
+        /// <summary>A pointer field of a global whose value is only known once the machine has placed the data</summary>
+        private readonly struct GlobalPointerFixup
+        {
+            public int ByteOffset { get; }
+            public Symbol? Target { get; }
+            public string? Text { get; }
+            public long Addend { get; }
+
+            private GlobalPointerFixup(int byteOffset, Symbol? target, string? text, long addend)
+            {
+                ByteOffset = byteOffset;
+                Target = target;
+                Text = text;
+                Addend = addend;
+            }
+
+            public static GlobalPointerFixup ForSymbol(int byteOffset, Symbol target, long addend)
+                => new GlobalPointerFixup(byteOffset, target, null, addend);
+
+            public static GlobalPointerFixup ForText(int byteOffset, string text)
+                => new GlobalPointerFixup(byteOffset, null, text, 0);
+
+            public GlobalPointerFixup Rebase(int regionOffset)
+                => new GlobalPointerFixup(checked(ByteOffset + regionOffset), Target, Text, Addend);
         }
 
         private static bool IsReadOnlyGlobal(LirGlobal global)
@@ -637,7 +669,8 @@ namespace Cnidaria.C
                 var elementSize = Math.Max(1, _target.SizeOf(array.ElementType));
                 for (var index = 0; index < list.Items.Length; index++)
                 {
-                    var offset = checked(index * elementSize);
+                    var element = list.Items[index].ElementIndex;
+                    var offset = checked((int)(element < 0 ? index : element) * elementSize);
                     if (offset >= availableSize)
                         break;
                     WriteGlobalInitializer(
@@ -691,10 +724,23 @@ namespace Cnidaria.C
             GimpleValue expression,
             int availableSize)
         {
+            // Array decay and element or field access all resolve to a symbol plus a constant offset
+            if (GimpleStaticAddress.TryResolve(expression, _target, out var addressSymbol, out var addend))
+            {
+                _pendingPointerFixups.Add(GlobalPointerFixup.ForSymbol(destinationOffset, addressSymbol, addend));
+                return;
+            }
+
             if (expression is not GimpleConstantValue constant)
-                throw new NotSupportedException("Global pointer relocations are not supported by the register-bytecode backend.");
+                throw new NotSupportedException($"Unsupported global initializer expression '{expression.GetType().Name}'.");
 
             var value = constant.Value;
+            if (value is string literal && type.Type is not ArrayType)
+            {
+                _pendingPointerFixups.Add(GlobalPointerFixup.ForText(destinationOffset, literal));
+                return;
+            }
+
             if (value is string text && type.Type is ArrayType)
             {
                 var bytes = Encoding.UTF8.GetBytes(text);
@@ -987,7 +1033,32 @@ namespace Cnidaria.C
                 EmitRaw(Op.StackAlloc, MachineRegisters.GlobalPointer, GpScratch0, imm: 16);
                 LoadStaticBlob(_owner._writableGlobalDataBlobOffset, _owner._writableGlobalDataSize, GpScratch0);
                 EmitRaw(Op.CpBlk, MachineRegisters.GlobalPointer, GpScratch0, imm: _owner._writableGlobalDataSize);
+                EmitGlobalPointerFixups();
                 _asm.Bind(initialized);
+            }
+
+            // The template carries zeros where an address belongs, and the address only exists now
+            private void EmitGlobalPointerFixups()
+            {
+                foreach (var fixup in _owner._globalPointerFixups)
+                {
+                    if (fixup.Text is not null)
+                        LoadCStringLiteral(fixup.Text, GpScratch0);
+                    else if (fixup.Target is null || !TryMaterializeStaticSymbolAddress(fixup.Target, GpScratch0))
+                        throw new NotSupportedException($"Global initializer refers to '{fixup.Target?.Name}', which has no static address.");
+
+                    if (fixup.Addend != 0)
+                        EmitI64Imm(Op.I64AddImm, GpScratch0, GpScratch0, fixup.Addend);
+
+                    EmitMem(
+                        Op.StPtr,
+                        GpScratch0,
+                        MachineRegister.Invalid,
+                        fixup.ByteOffset,
+                        MachineRegister.Invalid,
+                        MemoryBase.GlobalPointer,
+                        _owner._target.PointerAlignment);
+                }
             }
 
             private void StoreIncomingHiddenReturnBufferAddress(int frameOffset)
@@ -1295,6 +1366,12 @@ namespace Cnidaria.C
                 var usesFloatingOperands = IsFloatType(leftType) || IsFloatType(rightType) || IsFloatType(resultType);
                 var dst = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
                 var op = SelectBinaryOp(instruction.Operator, leftType, rightType, resultType);
+                if (!usesFloatingOperands && TryEmitPowerOfTwoImmediate(instruction, dst))
+                {
+                    StoreWritableRegisterIfSpilled(instruction.Result, dst);
+                    return;
+                }
+
                 if (!usesFloatingOperands && TryEmitBinaryImmediate(instruction, dst, op))
                 {
                     StoreWritableRegisterIfSpilled(instruction.Result, dst);
@@ -1351,6 +1428,36 @@ namespace Cnidaria.C
                 var integerSource = LoadOperand(operand, generalScratch);
                 EmitFloatConversion(floatScratch, integerSource, operand.Type, floatType, instruction);
                 return floatScratch;
+            }
+
+            // One dispatch either way, so only a reduction that stays a single instruction pays off here
+            private bool TryEmitPowerOfTwoImmediate(LirInstruction instruction, MachineRegister destination)
+            {
+                var is64 = Is64BitInteger(instruction.Operands[0].Type) || Is64BitInteger(instruction.Operands[1].Type);
+                Op immediateOp;
+                long immediate;
+
+                if (LirStrengthReduction.TryGetPowerOfTwoFactor(instruction, _owner._target, out var factorShift))
+                {
+                    immediateOp = is64 ? Op.I64ShlImm : Op.I32ShlImm;
+                    immediate = factorShift;
+                }
+                else if (IsUnsignedInteger(instruction.Operands[0].Type) &&
+                    LirStrengthReduction.TryGetPowerOfTwoDivisor(instruction, _owner._target, out var shift, out _))
+                {
+                    var wantRemainder = instruction.Operator == "%";
+                    immediateOp = wantRemainder
+                        ? (is64 ? Op.I64AndImm : Op.I32AndImm)
+                        : (is64 ? Op.U64ShrImm : Op.U32ShrImm);
+                    immediate = wantRemainder ? (1L << shift) - 1 : shift;
+                }
+                else
+                {
+                    return false;
+                }
+
+                EmitI64Imm(immediateOp, destination, LoadOperand(instruction.Operands[0], GpScratch1), immediate);
+                return true;
             }
 
             private bool TryEmitBinaryImmediate(LirInstruction instruction, MachineRegister destination, Op binaryOp)

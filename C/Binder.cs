@@ -239,14 +239,27 @@ namespace Cnidaria.C
 
                 case InitializerListSyntax initializerList:
                     {
+                        // C lets the string literal that initializes a character array be wrapped in braces
+                        if (TryGetBracedNarrowStringInitializer(targetType, initializerList, out var bracedString))
+                            return BindInitializer(bracedString, targetType);
+
                         var items = ImmutableArray.CreateBuilder<BoundInitializerListItem>();
                         int nextField = 0;
+                        // The scope is only in reach here, so the element a designator names is resolved now
+                        long nextElement = targetType.Type is ArrayType ? 0 : -1;
 
                         foreach (var item in initializerList.Items)
                         {
+                            if (nextElement >= 0 && item.Designators.Length != 0)
+                                nextElement = BindArrayDesignatorIndex(item.Designators);
+
+                            var elementIndex = nextElement;
+                            if (nextElement >= 0)
+                                nextElement++;
+
                             var itemTargetType = GetInitializerItemTargetType(targetType, item, ref nextField);
                             var boundItemInitializer = BindInitializer(item.Initializer, itemTargetType);
-                            items.Add(new BoundInitializerListItem(item, boundItemInitializer));
+                            items.Add(new BoundInitializerListItem(item, boundItemInitializer, elementIndex));
                         }
 
                         return new BoundInitializerList(initializerList, targetType, items.ToImmutable());
@@ -329,6 +342,45 @@ namespace Cnidaria.C
             }
 
             return itemTargetType;
+        }
+
+        /// <summary>Returns the designated element, or -1 when the index is not a constant that folds</summary>
+        private long BindArrayDesignatorIndex(ImmutableArray<DesignatorSyntax> designators)
+        {
+            if (designators[0] is not ArrayDesignatorSyntax arrayDesignator)
+                return -1;
+
+            var index = BindExpression(arrayDesignator.Expression);
+            if (TryConvertConstantToLong(index.ConstantValue, out var value))
+                return value < 0 ? -1 : value;
+
+            // Binding folds a literal but not arithmetic over one, so the declarator's evaluator finishes the job
+            var scope = _semanticModel.GetScope(arrayDesignator.Expression) ?? _compilation.GlobalScope;
+            if (DeclarationCollector.TryEvaluateConstantExpression(arrayDesignator.Expression, scope, out value) && value >= 0)
+                return value;
+
+            return -1;
+        }
+
+        private static bool TryGetBracedNarrowStringInitializer(
+            QualifiedType targetType,
+            InitializerListSyntax initializerList,
+            out ExpressionInitializerSyntax bracedString)
+        {
+            bracedString = null!;
+            if (targetType.Type is not ArrayType targetArray || !IsNarrowCharacterType(targetArray.ElementType))
+                return false;
+            if (initializerList.Items.Length != 1 || !initializerList.Items[0].Designators.IsDefaultOrEmpty)
+                return false;
+            if (initializerList.Items[0].Initializer is not ExpressionInitializerSyntax expressionInitializer ||
+                expressionInitializer.Expression is not LiteralExpressionSyntax literal ||
+                literal.LiteralToken.Kind is not SyntaxKind.StringLiteralToken and not SyntaxKind.Utf8StringLiteralToken)
+            {
+                return false;
+            }
+
+            bracedString = expressionInitializer;
+            return true;
         }
 
         private static bool IsNarrowStringArrayInitializer(QualifiedType targetType, BoundExpression expression)

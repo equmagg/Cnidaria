@@ -384,7 +384,7 @@ namespace Cnidaria.C
             return false;
         }
 
-        private static bool TryEvaluateEnumeratorAtom(
+        internal static bool TryEvaluateEnumeratorAtom(
             SyntaxToken token,
             Scope scope,
             out long value)
@@ -475,8 +475,8 @@ namespace Cnidaria.C
 
             var name = identifier.Value.Text;
             var declaredType = DeclaratorTypeBuilder.Build(initDeclarator.Declarator, specifiers.BaseType, _types, scope);
-            // String initializers complete an otherwise unspecified array bound
-            declaredType = CompleteArrayTypeFromInitializer(declaredType, initDeclarator.Initializer);
+            // An initializer completes an otherwise unspecified array bound
+            declaredType = CompleteArrayTypeFromInitializer(declaredType, initDeclarator.Initializer, scope);
 
             Symbol symbol;
             if (specifiers.IsTypedef)
@@ -512,14 +512,193 @@ namespace Cnidaria.C
                 VisitInitializer(initDeclarator.Initializer, scope);
         }
 
-        private QualifiedType CompleteArrayTypeFromInitializer(QualifiedType type, InitializerSyntax? initializer)
+        private QualifiedType CompleteArrayTypeFromInitializer(QualifiedType type, InitializerSyntax? initializer, Scope scope)
         {
             if (initializer is null || type.Type is not ArrayType { Length: null } array)
                 return type;
-            if (!TryGetStringInitializerLength(array.ElementType, initializer, out var length))
+            if (!TryGetStringInitializerLength(array.ElementType, initializer, out var length) &&
+                !TryGetInitializerListLength(array.ElementType, initializer, scope, out length))
+            {
                 return type;
+            }
 
             return new QualifiedType(_types.ArrayOf(array.ElementType, length), type.Qualifiers);
+        }
+
+        /// <summary>Completes the bound from the largest index the initializer reaches, which a designator can move</summary>
+        private static bool TryGetInitializerListLength(QualifiedType elementType, InitializerSyntax initializer, Scope scope, out long length)
+        {
+            length = 0;
+            if (initializer is not InitializerListSyntax list || list.Items.Length == 0)
+                return false;
+
+            // A string literal in braces initializes a character array the same way a bare one does
+            if (list.Items.Length == 1 && list.Items[0].Designators.Length == 0 &&
+                TryGetStringInitializerLength(elementType, list.Items[0].Initializer, out length))
+            {
+                return true;
+            }
+
+            long next = 0;
+            foreach (var item in list.Items)
+            {
+                if (item.Designators.Length != 0)
+                {
+                    if (item.Designators[0] is not ArrayDesignatorSyntax designator ||
+                        !TryEvaluateDesignatorIndex(designator.Expression, scope, out next) ||
+                        next < 0)
+                    {
+                        length = 0;
+                        return false;
+                    }
+                }
+
+                if (next == long.MaxValue)
+                {
+                    length = 0;
+                    return false;
+                }
+
+                next++;
+                if (next > length)
+                    length = next;
+            }
+
+            return true;
+        }
+
+        private static bool TryEvaluateDesignatorIndex(ExpressionSyntax expression, Scope scope, out long value)
+        {
+            value = 0;
+            try
+            {
+                return TryEvaluateConstantExpression(expression, scope, out value);
+            }
+            catch (OverflowException)
+            {
+                value = 0;
+                return false;
+            }
+        }
+
+        /// <summary>Evaluates the same integer subset a fixed array bound accepts, over syntax rather than tokens</summary>
+        /// <remarks>Kept iterative so that a deeply nested constant cannot overflow the evaluator's own stack</remarks>
+        internal static bool TryEvaluateConstantExpression(ExpressionSyntax expression, Scope scope, out long value)
+        {
+            value = 0;
+            var steps = new Stack<ConstantStep>();
+            var operands = new Stack<long>();
+            steps.Push(ConstantStep.Evaluate(expression));
+
+            while (steps.Count != 0)
+            {
+                var step = steps.Pop();
+                switch (step.Kind)
+                {
+                    case ConstantStepKind.ApplyUnary:
+                    {
+                        var operand = operands.Pop();
+                        switch (step.Operator)
+                        {
+                            case SyntaxKind.PlusToken: break;
+                            case SyntaxKind.MinusToken: operand = checked(-operand); break;
+                            case SyntaxKind.TildeToken: operand = ~operand; break;
+                            case SyntaxKind.BangToken: operand = operand == 0 ? 1 : 0; break;
+                            default: return false;
+                        }
+                        operands.Push(operand);
+                        continue;
+                    }
+
+                    case ConstantStepKind.ApplyBinary:
+                    {
+                        var right = operands.Pop();
+                        var left = operands.Pop();
+                        if (!DeclaratorParser.ArrayLengthExpressionEvaluator.TryApplyBinary(step.Operator, left, right, out var applied))
+                            return false;
+                        operands.Push(applied);
+                        continue;
+                    }
+
+                    case ConstantStepKind.Select:
+                        steps.Push(ConstantStep.Evaluate(operands.Pop() != 0 ? step.Expression! : step.Alternative!));
+                        continue;
+                }
+
+                var node = step.Expression;
+                while (node is ParenthesizedExpressionSyntax parenthesized)
+                    node = parenthesized.Expression;
+                while (node is CastExpressionSyntax cast)
+                    node = cast.Expression;
+
+                switch (node)
+                {
+                    case LiteralExpressionSyntax literal:
+                        if (!TryEvaluateEnumeratorAtom(literal.LiteralToken, scope, out var literalValue))
+                            return false;
+                        operands.Push(literalValue);
+                        break;
+
+                    case NameExpressionSyntax name:
+                        if (!TryEvaluateEnumeratorAtom(name.IdentifierToken, scope, out var namedValue))
+                            return false;
+                        operands.Push(namedValue);
+                        break;
+
+                    case UnaryExpressionSyntax unary when unary.Operand is not null:
+                        steps.Push(ConstantStep.Apply(ConstantStepKind.ApplyUnary, unary.OperatorToken.Kind));
+                        steps.Push(ConstantStep.Evaluate(unary.Operand));
+                        break;
+
+                    case BinaryExpressionSyntax binary:
+                        steps.Push(ConstantStep.Apply(ConstantStepKind.ApplyBinary, binary.OperatorToken.Kind));
+                        steps.Push(ConstantStep.Evaluate(binary.Right));
+                        steps.Push(ConstantStep.Evaluate(binary.Left));
+                        break;
+
+                    case ConditionalExpressionSyntax conditional:
+                        steps.Push(ConstantStep.Choose(conditional.WhenTrue, conditional.WhenFalse));
+                        steps.Push(ConstantStep.Evaluate(conditional.Condition));
+                        break;
+
+                    default:
+                        return false;
+                }
+            }
+
+            if (operands.Count != 1)
+                return false;
+
+            value = operands.Pop();
+            return true;
+        }
+
+        private enum ConstantStepKind : byte { Evaluate, ApplyUnary, ApplyBinary, Select }
+
+        /// <summary>One entry of the evaluator's work list: a subexpression to read or an operator to apply</summary>
+        private readonly struct ConstantStep
+        {
+            public ConstantStepKind Kind { get; }
+            public ExpressionSyntax? Expression { get; }
+            public ExpressionSyntax? Alternative { get; }
+            public SyntaxKind Operator { get; }
+
+            private ConstantStep(ConstantStepKind kind, ExpressionSyntax? expression, ExpressionSyntax? alternative, SyntaxKind op)
+            {
+                Kind = kind;
+                Expression = expression;
+                Alternative = alternative;
+                Operator = op;
+            }
+
+            public static ConstantStep Evaluate(ExpressionSyntax expression)
+                => new ConstantStep(ConstantStepKind.Evaluate, expression, null, SyntaxKind.None);
+
+            public static ConstantStep Apply(ConstantStepKind kind, SyntaxKind op)
+                => new ConstantStep(kind, null, null, op);
+
+            public static ConstantStep Choose(ExpressionSyntax whenTrue, ExpressionSyntax whenFalse)
+                => new ConstantStep(ConstantStepKind.Select, whenTrue, whenFalse, SyntaxKind.None);
         }
 
         private static bool TryGetStringInitializerLength(QualifiedType elementType, InitializerSyntax initializer, out long length)
@@ -1687,19 +1866,21 @@ namespace Cnidaria.C
             if (tokens.IsDefaultOrEmpty)
                 return null;
 
-            var evaluator = new ArrayLengthExpressionEvaluator(tokens);
+            var evaluator = new ArrayLengthExpressionEvaluator(tokens, _scope);
             return evaluator.TryEvaluate(out var value) && value >= 0 ? value : null;
         }
 
         /// <summary>Evaluates the integer-only subset accepted for fixed array bounds</summary>
-        private sealed class ArrayLengthExpressionEvaluator
+        internal sealed class ArrayLengthExpressionEvaluator
         {
             private readonly ImmutableArray<SyntaxToken> _tokens;
+            private readonly Scope _scope;
             private int _position;
 
-            public ArrayLengthExpressionEvaluator(ImmutableArray<SyntaxToken> tokens)
+            public ArrayLengthExpressionEvaluator(ImmutableArray<SyntaxToken> tokens, Scope scope)
             {
                 _tokens = tokens;
+                _scope = scope;
             }
 
             /// <summary>Evaluates the full token sequence without overflow</summary>
@@ -1815,6 +1996,12 @@ namespace Cnidaria.C
                     return true;
                 }
 
+                if (DeclarationCollector.TryEvaluateEnumeratorAtom(token, _scope, out value))
+                {
+                    _position++;
+                    return true;
+                }
+
                 return false;
             }
 
@@ -1847,7 +2034,7 @@ namespace Cnidaria.C
                 return precedence != 0;
             }
 
-            private static bool TryApplyBinary(
+            internal static bool TryApplyBinary(
                 SyntaxKind kind,
                 long left,
                 long right,

@@ -397,13 +397,24 @@ namespace Cnidaria.C
             {
                 var elementType = array.ElementType;
                 var elementSize = Math.Max(1, _target.SizeOf(elementType));
+                var nextIndex = 0L;
                 foreach (var item in list.Items)
                 {
                     if (section.ByteLength - start >= availableSize)
                         break;
+                    // An element a designator skipped past stays zero
+                    if (item.ElementIndex > nextIndex)
+                    {
+                        section.EmitZero((int)Math.Min((item.ElementIndex - nextIndex) * elementSize, availableSize - (section.ByteLength - start)));
+                        nextIndex = item.ElementIndex;
+                        if (section.ByteLength - start >= availableSize)
+                            break;
+                    }
+
                     var used = EmitInitializer(section, elementType, item.Initializer, Math.Min(elementSize, availableSize - (section.ByteLength - start)));
                     if (used < elementSize && section.ByteLength - start < availableSize)
                         section.EmitZero(Math.Min(elementSize - used, availableSize - (section.ByteLength - start)));
+                    nextIndex++;
                 }
             }
             else
@@ -426,15 +437,10 @@ namespace Cnidaria.C
             if (expression is GimpleConstantValue constant)
                 return EmitConstantInitializer(section, type, constant.Value, availableSize);
 
-            if (expression is GimpleSymbolValue symbolValue)
+            // Array decay and element or field access all resolve to a symbol plus a constant offset
+            if (GimpleStaticAddress.TryResolve(expression, _target, out var addressSymbol, out var addend))
             {
-                EmitPointerRelocation(section, GetSymbolLabel(symbolValue.Symbol));
-                return Math.Min(availableSize, _target.PointerSize);
-            }
-
-            if (expression is GimpleAddressOfExpression addressOf && addressOf.Target is GimpleSymbolValue addressSymbol)
-            {
-                EmitPointerRelocation(section, GetSymbolLabel(addressSymbol.Symbol));
+                EmitPointerRelocation(section, GetSymbolLabel(addressSymbol), addend);
                 return Math.Min(availableSize, _target.PointerSize);
             }
 
@@ -485,11 +491,11 @@ namespace Cnidaria.C
             return size;
         }
 
-        private void EmitPointerRelocation(DataSectionBuilder section, string symbol)
+        private void EmitPointerRelocation(DataSectionBuilder section, string symbol, long addend = 0)
         {
             var offset = section.ByteLength;
             section.EmitZero(_target.PointerSize);
-            section.AddRelocation(offset, symbol, 0, ArmObjectRelocationKind.AbsolutePointer);
+            section.AddRelocation(offset, symbol, addend, ArmObjectRelocationKind.AbsolutePointer);
         }
 
         private string GetSymbolLabel(Symbol symbol)
@@ -575,6 +581,18 @@ namespace Cnidaria.C
             _strings.EmitBytes(bytes, bytes.Length);
             _strings.EmitByte(0);
             _stringLabels.Add(text, label);
+            return label;
+        }
+
+        // Absolute code addresses: the image is linked at a fixed base, so no runtime relocation is needed
+        private string CreateJumpTable(IReadOnlyList<string> targetLabels)
+        {
+            var label = CreateLocalLabel("jump_table");
+            var entrySize = _target.PointerSize;
+            var offset = _rodata.Align(entrySize);
+            _rodata.DefineSymbol(label, offset, targetLabels.Count * entrySize, ArmObjectSymbolBinding.Local, _symbols);
+            foreach (var targetLabel in targetLabels)
+                EmitPointerRelocation(_rodata, targetLabel);
             return label;
         }
 
@@ -1730,62 +1748,75 @@ namespace Cnidaria.C
 
                 var size = Math.Max(RegisterSize(instruction.Operands[0].Type), RegisterSize(instruction.Operands[1].Type));
                 var destination = GetWritableRegister(instruction.Result, Scratch0);
-                var left = LoadOperand(instruction.Operands[0], Scratch1);
-                if (left != Scratch1)
-                    MoveRegister(Scratch1, left, size);
-                var right = LoadOperand(instruction.Operands[1], Scratch2);
-                if (right != Scratch2)
-                    MoveRegister(Scratch2, right, size);
-                InvalidateIntegerRepresentation(destination);
+                if (!TryEmitIntegerBinaryImmediate(instruction, destination, size))
+                {
+                    // AArch64 data processing is three-address, so staging the operands in scratch only adds moves
+                    var left = LoadOperand(instruction.Operands[0], Scratch1);
+                    var right = LoadOperand(instruction.Operands[1], Scratch2);
+                    InvalidateIntegerRepresentation(destination);
+                    EmitIntegerBinaryRegisters(instruction, destination, left, right, size);
+                }
 
+                RecordIntegerRegisterWrite(destination, size);
+                NormalizeIntegerRegister(destination, instruction.Result.Type);
+                StoreWritableRegisterIfSpilled(instruction.Result, destination);
+            }
+
+            private void EmitIntegerBinaryRegisters(
+                LirInstruction instruction,
+                MachineRegister destination,
+                MachineRegister left,
+                MachineRegister right,
+                int size)
+            {
                 switch (instruction.Operator)
                 {
                     case "+":
-                        Emit(ArmInstruction.Ternary(ArmInstrKind.Add, Reg(ToArm(destination), size), Reg(ToArm(Scratch1), size), Reg(ToArm(Scratch2), size)));
+                        Emit(ArmInstruction.Ternary(ArmInstrKind.Add, Reg(ToArm(destination), size), Reg(ToArm(left), size), Reg(ToArm(right), size)));
                         break;
                     case "-":
-                        Emit(ArmInstruction.Ternary(ArmInstrKind.Sub, Reg(ToArm(destination), size), Reg(ToArm(Scratch1), size), Reg(ToArm(Scratch2), size)));
+                        Emit(ArmInstruction.Ternary(ArmInstrKind.Sub, Reg(ToArm(destination), size), Reg(ToArm(left), size), Reg(ToArm(right), size)));
                         break;
                     case "*":
-                        Emit(ArmInstruction.Ternary(ArmInstrKind.Mul, Reg(ToArm(destination), size), Reg(ToArm(Scratch1), size), Reg(ToArm(Scratch2), size)));
+                        Emit(ArmInstruction.Ternary(ArmInstrKind.Mul, Reg(ToArm(destination), size), Reg(ToArm(left), size), Reg(ToArm(right), size)));
                         break;
                     case "/":
                         Emit(ArmInstruction.Ternary(
                             IsSignedIntegerType(instruction.Operands[0].Type) ? ArmInstrKind.Sdiv : ArmInstrKind.Udiv,
                             Reg(ToArm(destination), size),
-                            Reg(ToArm(Scratch1), size),
-                            Reg(ToArm(Scratch2), size)));
+                            Reg(ToArm(left), size),
+                            Reg(ToArm(right), size)));
                         break;
                     case "%":
                         Emit(ArmInstruction.Ternary(
                             IsSignedIntegerType(instruction.Operands[0].Type) ? ArmInstrKind.Sdiv : ArmInstrKind.Udiv,
                             Reg(ToArm(Scratch3), size),
-                            Reg(ToArm(Scratch1), size),
-                            Reg(ToArm(Scratch2), size)));
+                            Reg(ToArm(left), size),
+                            Reg(ToArm(right), size)));
                         Emit(ArmInstruction.Quaternary(_owner._machineTarget.Is64Bit ? ArmInstrKind.Msub : ArmInstrKind.Mls,
                             Reg(ToArm(destination), size),
                             Reg(ToArm(Scratch3), size),
-                            Reg(ToArm(Scratch2), size),
-                            Reg(ToArm(Scratch1), size)));
+                            Reg(ToArm(right), size),
+                            Reg(ToArm(left), size)));
                         break;
                     case "&":
-                        Emit(ArmInstruction.Ternary(ArmInstrKind.And, Reg(ToArm(destination), size), Reg(ToArm(Scratch1), size), Reg(ToArm(Scratch2), size)));
+                        Emit(ArmInstruction.Ternary(ArmInstrKind.And, Reg(ToArm(destination), size), Reg(ToArm(left), size), Reg(ToArm(right), size)));
                         break;
                     case "|":
-                        Emit(ArmInstruction.Ternary(ArmInstrKind.Orr, Reg(ToArm(destination), size), Reg(ToArm(Scratch1), size), Reg(ToArm(Scratch2), size)));
+                        Emit(ArmInstruction.Ternary(ArmInstrKind.Orr, Reg(ToArm(destination), size), Reg(ToArm(left), size), Reg(ToArm(right), size)));
                         break;
                     case "^":
-                        Emit(ArmInstruction.Ternary(ArmInstrKind.Eor, Reg(ToArm(destination), size), Reg(ToArm(Scratch1), size), Reg(ToArm(Scratch2), size)));
+                        Emit(ArmInstruction.Ternary(ArmInstrKind.Eor, Reg(ToArm(destination), size), Reg(ToArm(left), size), Reg(ToArm(right), size)));
                         break;
                     case "<<":
-                        Emit(ArmInstruction.Ternary(ArmInstrKind.Lsl, Reg(ToArm(destination), size), Reg(ToArm(Scratch1), size), Reg(ToArm(Scratch2), size)));
+                        Emit(ArmInstruction.Ternary(ArmInstrKind.Lsl, Reg(ToArm(destination), size), Reg(ToArm(left), size), Reg(ToArm(right), size)));
                         break;
                     case ">>":
                         Emit(ArmInstruction.Ternary(
                             IsSignedIntegerType(instruction.Operands[0].Type) ? ArmInstrKind.Asr : ArmInstrKind.Lsr,
                             Reg(ToArm(destination), size),
-                            Reg(ToArm(Scratch1), size),
-                            Reg(ToArm(Scratch2), size)));
+                            Reg(ToArm(left), size),
+                            Reg(ToArm(right), size)));
                         break;
                     case "==":
                     case "!=":
@@ -1795,29 +1826,258 @@ namespace Cnidaria.C
                     case ">=":
                         EmitComparisonResult(
                             destination,
-                            Scratch1,
-                            Scratch2,
+                            left,
+                            right,
                             SelectCondition(instruction.Operator, IsSignedIntegerType(instruction.Operands[0].Type)),
                             size,
                             rightIsZero: false);
                         break;
                     case "&&":
-                        EmitBooleanFromRegister(Scratch3, Scratch1);
-                        EmitBooleanFromRegister(Scratch4, Scratch2);
+                        EmitBooleanFromRegister(Scratch3, left);
+                        EmitBooleanFromRegister(Scratch4, right);
                         Emit(ArmInstruction.Ternary(ArmInstrKind.And, Reg(ToArm(destination), size), Reg(ToArm(Scratch3), size), Reg(ToArm(Scratch4), size)));
                         SetIntegerRepresentation(destination, IntegerRepresentationFact.ZeroExtended(1));
                         break;
                     case "||":
-                        Emit(ArmInstruction.Ternary(ArmInstrKind.Orr, Reg(ToArm(Scratch3), size), Reg(ToArm(Scratch1), size), Reg(ToArm(Scratch2), size)));
+                        Emit(ArmInstruction.Ternary(ArmInstrKind.Orr, Reg(ToArm(Scratch3), size), Reg(ToArm(left), size), Reg(ToArm(right), size)));
                         EmitBooleanFromRegister(destination, Scratch3);
                         break;
                     default:
                         throw Unsupported(instruction, $"Unsupported binary operator '{instruction.Operator}'.");
                 }
+            }
 
-                RecordIntegerRegisterWrite(destination, size);
-                NormalizeIntegerRegister(destination, instruction.Result.Type);
-                StoreWritableRegisterIfSpilled(instruction.Result, destination);
+            // AArch64 carries a constant inside the instruction; AArch32 keeps the register form, its encoding is narrower
+            private bool TryEmitIntegerBinaryImmediate(LirInstruction instruction, MachineRegister destination, int size)
+            {
+                if (!_owner._machineTarget.Is64Bit)
+                    return false;
+
+                var leftOperand = instruction.Operands[0];
+                var rightOperand = instruction.Operands[1];
+                var op = instruction.Operator;
+
+                if (rightOperand.Kind != LirOperandKind.Immediate && leftOperand.Kind == LirOperandKind.Immediate)
+                {
+                    if (op is "+" or "*" or "&" or "|" or "^" or "==" or "!=")
+                    {
+                        (leftOperand, rightOperand) = (rightOperand, leftOperand);
+                    }
+                    else
+                    {
+                        var swappedRelation = op switch
+                        {
+                            "<" => ">",
+                            "<=" => ">=",
+                            ">" => "<",
+                            ">=" => "<=",
+                            _ => null,
+                        };
+                        if (swappedRelation is null)
+                            return false;
+                        (leftOperand, rightOperand) = (rightOperand, leftOperand);
+                        op = swappedRelation;
+                    }
+                }
+
+                if (!IsIntegerImmediate(rightOperand))
+                    return false;
+
+                var operationBits = size * 8;
+                var bits = GetIntegerImmediateBits(rightOperand, operationBits);
+
+                switch (op)
+                {
+                    case "+":
+                    case "-":
+                    {
+                        var subtract = op == "-";
+                        if (!TryGetAddSubImmediate(bits, operationBits, ref subtract, out var addend))
+                            return false;
+                        EmitBinaryImmediate(subtract ? ArmInstrKind.Sub : ArmInstrKind.Add, destination, leftOperand, addend, size);
+                        return true;
+                    }
+                    case "*":
+                    {
+                        // No multiply form takes an immediate, so only a power of two reaches one instruction
+                        if (!LirStrengthReduction.TryGetPowerOfTwoFactor(instruction, _owner._target, out var factorShift))
+                            return false;
+                        EmitBinaryImmediate(ArmInstrKind.Lsl, destination, leftOperand, factorShift, size);
+                        return true;
+                    }
+                    case "/":
+                    case "%":
+                        return TryEmitDivideByPowerOfTwo(instruction, destination, leftOperand, size);
+                    case "&":
+                    case "|":
+                    case "^":
+                    {
+                        if (!ArmCodeEncoder.IsEncodableLogicalImmediate(bits, operationBits))
+                            return false;
+                        var logicalOpcode = op == "&" ? ArmInstrKind.And : op == "|" ? ArmInstrKind.Orr : ArmInstrKind.Eor;
+                        EmitBinaryImmediate(logicalOpcode, destination, leftOperand, unchecked((long)bits), size);
+                        return true;
+                    }
+                    case "<<":
+                    case ">>":
+                    {
+                        // The register form masks the amount by the operation width, so masking here matches it
+                        var amount = (int)(bits & (ulong)(operationBits - 1));
+                        var shiftOpcode = op == "<<"
+                            ? ArmInstrKind.Lsl
+                            : IsSignedIntegerType(instruction.Operands[0].Type) ? ArmInstrKind.Asr : ArmInstrKind.Lsr;
+                        EmitBinaryImmediate(shiftOpcode, destination, leftOperand, amount, size);
+                        return true;
+                    }
+                    case "==":
+                    case "!=":
+                    case "<":
+                    case "<=":
+                    case ">":
+                    case ">=":
+                    {
+                        if (!TryGetCompareImmediate(bits, operationBits, out var compareOpcode, out var compareValue))
+                            return false;
+                        var source = LoadOperand(leftOperand, Scratch1);
+                        InvalidateIntegerRepresentation(destination);
+                        EmitComparisonResult(
+                            destination,
+                            source,
+                            compareOpcode,
+                            ArmOperand.ImmediateOperand(compareValue),
+                            SelectCondition(op, IsSignedIntegerType(leftOperand.Type)),
+                            size);
+                        return true;
+                    }
+                    default:
+                        return false;
+                }
+            }
+
+            private bool TryEmitDivideByPowerOfTwo(LirInstruction instruction, MachineRegister destination, LirOperand leftOperand, int size)
+            {
+                if (!LirStrengthReduction.TryGetPowerOfTwoDivisor(instruction, _owner._target, out var shift, out var negated))
+                    return false;
+
+                var bits = size * 8;
+                var wantRemainder = instruction.Operator == "%";
+                var dividend = LoadOperand(leftOperand, Scratch1);
+                InvalidateIntegerRepresentation(destination);
+
+                if (!IsSignedIntegerType(instruction.Operands[0].Type))
+                {
+                    Emit(ArmInstruction.Ternary(
+                        wantRemainder ? ArmInstrKind.And : ArmInstrKind.Lsr,
+                        Reg(ToArm(destination), size),
+                        Reg(ToArm(dividend), size),
+                        ArmOperand.ImmediateOperand(wantRemainder ? (1L << shift) - 1 : shift)));
+                    return true;
+                }
+
+                // The bias is 2^k - 1 for a negative dividend and zero otherwise, so the shift truncates toward zero
+                if (shift == 1)
+                {
+                    Emit(ArmInstruction.Ternary(ArmInstrKind.Lsr, Reg(ToArm(Scratch2), size), Reg(ToArm(dividend), size), ArmOperand.ImmediateOperand(bits - 1)));
+                }
+                else
+                {
+                    Emit(ArmInstruction.Ternary(ArmInstrKind.Asr, Reg(ToArm(Scratch2), size), Reg(ToArm(dividend), size), ArmOperand.ImmediateOperand(bits - 1)));
+                    Emit(ArmInstruction.Ternary(ArmInstrKind.Lsr, Reg(ToArm(Scratch2), size), Reg(ToArm(Scratch2), size), ArmOperand.ImmediateOperand(bits - shift)));
+                }
+
+                Emit(ArmInstruction.Ternary(ArmInstrKind.Add, Reg(ToArm(Scratch2), size), Reg(ToArm(dividend), size), Reg(ToArm(Scratch2), size)));
+                if (wantRemainder)
+                {
+                    Emit(ArmInstruction.Ternary(ArmInstrKind.And, Reg(ToArm(Scratch2), size), Reg(ToArm(Scratch2), size), ArmOperand.ImmediateOperand(-(1L << shift))));
+                    Emit(ArmInstruction.Ternary(ArmInstrKind.Sub, Reg(ToArm(destination), size), Reg(ToArm(dividend), size), Reg(ToArm(Scratch2), size)));
+                    return true;
+                }
+
+                Emit(ArmInstruction.Ternary(ArmInstrKind.Asr, Reg(ToArm(destination), size), Reg(ToArm(Scratch2), size), ArmOperand.ImmediateOperand(shift)));
+                if (negated)
+                    Emit(ArmInstruction.Ternary(ArmInstrKind.Sub, Reg(ToArm(destination), size), Reg(ArmRegister.Xzr, size), Reg(ToArm(destination), size)));
+                return true;
+            }
+
+            private void EmitBinaryImmediate(ArmInstrKind opcode, MachineRegister destination, LirOperand left, long immediate, int size)
+            {
+                var source = LoadOperand(left, Scratch1);
+                InvalidateIntegerRepresentation(destination);
+                Emit(ArmInstruction.Ternary(
+                    opcode,
+                    Reg(ToArm(destination), size),
+                    Reg(ToArm(source), size),
+                    ArmOperand.ImmediateOperand(immediate)));
+            }
+
+            // add and sub share one immediate encoding, so a constant that misses one may still fit the other negated
+            private static bool TryGetAddSubImmediate(ulong bits, int operationBits, ref bool subtract, out long immediate)
+            {
+                if (TryEncodeAddSubImmediate(bits, out immediate))
+                    return true;
+                if (TryEncodeAddSubImmediate(MaskIntegerBits(unchecked(0UL - bits), operationBits), out immediate))
+                {
+                    subtract = !subtract;
+                    return true;
+                }
+                return false;
+            }
+
+            // cmn compares against the negated constant, which widens the reach of the compare immediate
+            private static bool TryGetCompareImmediate(ulong bits, int operationBits, out ArmInstrKind opcode, out long immediate)
+            {
+                opcode = ArmInstrKind.Cmp;
+                if (TryEncodeAddSubImmediate(bits, out immediate))
+                    return true;
+                if (TryEncodeAddSubImmediate(MaskIntegerBits(unchecked(0UL - bits), operationBits), out immediate))
+                {
+                    opcode = ArmInstrKind.Cmn;
+                    return true;
+                }
+                return false;
+            }
+
+            private static bool TryEncodeAddSubImmediate(ulong value, out long immediate)
+            {
+                immediate = unchecked((long)value);
+                if (value <= 0xFFF)
+                    return true;
+                return (value & 0xFFF) == 0 && (value >> 12) <= 0xFFF;
+            }
+
+            private static bool IsIntegerImmediate(LirOperand operand)
+                => operand.Kind == LirOperandKind.Immediate && operand.Immediate is not string && !IsFloatType(operand.Type);
+
+            private ulong GetIntegerImmediateBits(LirOperand operand, int operationBits)
+            {
+                var registerBits = _owner._target.RegisterSize * 8;
+                var raw = unchecked((ulong)ConvertIntegerConstant(operand.Immediate));
+                if (IsIntegerLike(operand.Type))
+                {
+                    var typeBits = checked(SizeOf(operand.Type) * 8);
+                    if (typeBits > 0 && typeBits < registerBits)
+                    {
+                        var typeMask = (1UL << typeBits) - 1;
+                        raw &= typeMask;
+                        if (IsSignedIntegerType(operand.Type) && (raw & (1UL << (typeBits - 1))) != 0)
+                            raw |= ~typeMask;
+                    }
+                }
+                return MaskIntegerBits(raw, operationBits);
+            }
+
+            private static ulong MaskIntegerBits(ulong value, int bits)
+                => bits >= 64 ? value : value & ((1UL << bits) - 1);
+
+            private static int CountTrailingZeros(ulong value)
+            {
+                var count = 0;
+                while ((value & 1) == 0)
+                {
+                    value >>= 1;
+                    count++;
+                }
+                return count;
             }
 
             private void EmitFloatingUnary(LirInstruction instruction)
@@ -1865,19 +2125,15 @@ namespace Cnidaria.C
 
                 var size = RegisterSize(leftType);
                 var left = LoadOperand(instruction.Operands[0], FpScratch1);
-                if (left != FpScratch1)
-                    MoveRegister(FpScratch1, left, size);
                 var right = LoadOperand(instruction.Operands[1], FpScratch2);
-                if (right != FpScratch2)
-                    MoveRegister(FpScratch2, right, size);
 
                 if (instruction.Operator is "==" or "!=" or "<" or "<=" or ">" or ">=")
                 {
                     var destination = GetWritableRegister(instruction.Result!, Scratch0);
                     EmitFloatingComparisonResult(
                         destination,
-                        FpScratch1,
-                        FpScratch2,
+                        left,
+                        right,
                         SelectFloatingCondition(instruction.Operator),
                         size);
                     NormalizeIntegerRegister(destination, instruction.Result!.Type);
@@ -1888,8 +2144,8 @@ namespace Cnidaria.C
                 if (instruction.Operator is "&&" or "||")
                 {
                     LoadFloatingImmediate(FpScratch0, 0.0, leftType);
-                    EmitFloatingComparisonResult(Scratch1, FpScratch1, FpScratch0, ArmCondition.Ne, size);
-                    EmitFloatingComparisonResult(Scratch2, FpScratch2, FpScratch0, ArmCondition.Ne, size);
+                    EmitFloatingComparisonResult(Scratch1, left, FpScratch0, ArmCondition.Ne, size);
+                    EmitFloatingComparisonResult(Scratch2, right, FpScratch0, ArmCondition.Ne, size);
                     var destination = GetWritableRegister(instruction.Result!, Scratch0);
                     Emit(ArmInstruction.Ternary(
                         instruction.Operator == "&&" ? ArmInstrKind.And : ArmInstrKind.Orr,
@@ -1913,8 +2169,8 @@ namespace Cnidaria.C
                 Emit(ArmInstruction.Ternary(
                     opcode,
                     Reg(ToArmRegister(floatingDestination), size),
-                    Reg(ToArmRegister(FpScratch1), size),
-                    Reg(ToArmRegister(FpScratch2), size)));
+                    Reg(ToArmRegister(left), size),
+                    Reg(ToArmRegister(right), size)));
                 StoreWritableRegisterIfSpilled(instruction.Result!, floatingDestination);
             }
 
@@ -1941,63 +2197,29 @@ namespace Cnidaria.C
 
                 if (op == "+" && IsPointerLike(leftType) && IsIntegerLike(rightType))
                 {
-                    var destination = GetWritableRegister(instruction.Result!, Scratch0);
-                    InvalidateIntegerRepresentation(destination);
-                    var pointer = LoadOperand(instruction.Operands[0], Scratch1);
-                    if (pointer != Scratch1)
-                        MoveRegister(Scratch1, pointer, size);
-                    var index = LoadOperand(instruction.Operands[1], Scratch2);
-                    if (index != Scratch2)
-                        MoveRegister(Scratch2, index, size);
-                    ScaleIndex(Scratch2, PointerScale(leftType), Scratch3);
-                    Emit(ArmInstruction.Ternary(ArmInstrKind.Add, Reg(ToArm(destination), size), Reg(ToArm(Scratch1), size), Reg(ToArm(Scratch2), size)));
-                    StoreWritableRegisterIfSpilled(instruction.Result, destination);
+                    EmitScaledPointerArithmetic(instruction, ArmInstrKind.Add, instruction.Operands[0], instruction.Operands[1], PointerScale(leftType), size);
                     return true;
                 }
 
                 if (op == "+" && IsIntegerLike(leftType) && IsPointerLike(rightType))
                 {
-                    var destination = GetWritableRegister(instruction.Result!, Scratch0);
-                    InvalidateIntegerRepresentation(destination);
-                    var index = LoadOperand(instruction.Operands[0], Scratch2);
-                    if (index != Scratch2)
-                        MoveRegister(Scratch2, index, size);
-                    var pointer = LoadOperand(instruction.Operands[1], Scratch1);
-                    if (pointer != Scratch1)
-                        MoveRegister(Scratch1, pointer, size);
-                    ScaleIndex(Scratch2, PointerScale(rightType), Scratch3);
-                    Emit(ArmInstruction.Ternary(ArmInstrKind.Add, Reg(ToArm(destination), size), Reg(ToArm(Scratch1), size), Reg(ToArm(Scratch2), size)));
-                    StoreWritableRegisterIfSpilled(instruction.Result, destination);
+                    EmitScaledPointerArithmetic(instruction, ArmInstrKind.Add, instruction.Operands[1], instruction.Operands[0], PointerScale(rightType), size);
                     return true;
                 }
 
                 if (op == "-" && IsPointerLike(leftType) && IsIntegerLike(rightType))
                 {
-                    var destination = GetWritableRegister(instruction.Result!, Scratch0);
-                    InvalidateIntegerRepresentation(destination);
-                    var pointer = LoadOperand(instruction.Operands[0], Scratch1);
-                    if (pointer != Scratch1)
-                        MoveRegister(Scratch1, pointer, size);
-                    var index = LoadOperand(instruction.Operands[1], Scratch2);
-                    if (index != Scratch2)
-                        MoveRegister(Scratch2, index, size);
-                    ScaleIndex(Scratch2, PointerScale(leftType), Scratch3);
-                    Emit(ArmInstruction.Ternary(ArmInstrKind.Sub, Reg(ToArm(destination), size), Reg(ToArm(Scratch1), size), Reg(ToArm(Scratch2), size)));
-                    StoreWritableRegisterIfSpilled(instruction.Result, destination);
+                    EmitScaledPointerArithmetic(instruction, ArmInstrKind.Sub, instruction.Operands[0], instruction.Operands[1], PointerScale(leftType), size);
                     return true;
                 }
 
                 if (op == "-" && IsPointerLike(leftType) && IsPointerLike(rightType))
                 {
                     var destination = GetWritableRegister(instruction.Result!, Scratch0);
-                    InvalidateIntegerRepresentation(destination);
                     var left = LoadOperand(instruction.Operands[0], Scratch1);
-                    if (left != Scratch1)
-                        MoveRegister(Scratch1, left, size);
                     var right = LoadOperand(instruction.Operands[1], Scratch2);
-                    if (right != Scratch2)
-                        MoveRegister(Scratch2, right, size);
-                    Emit(ArmInstruction.Ternary(ArmInstrKind.Sub, Reg(ToArm(destination), size), Reg(ToArm(Scratch1), size), Reg(ToArm(Scratch2), size)));
+                    InvalidateIntegerRepresentation(destination);
+                    Emit(ArmInstruction.Ternary(ArmInstrKind.Sub, Reg(ToArm(destination), size), Reg(ToArm(left), size), Reg(ToArm(right), size)));
                     var scale = PointerScale(leftType);
                     if (scale > 1)
                     {
@@ -2019,6 +2241,73 @@ namespace Cnidaria.C
                 return false;
             }
 
+            // Relational operators read backwards when the constant side moves to the right of the compare
+            private static string? TrySwapComparison(string op)
+                => op switch
+                {
+                    "==" => "==",
+                    "!=" => "!=",
+                    "<" => ">",
+                    "<=" => ">=",
+                    ">" => "<",
+                    ">=" => "<=",
+                    _ => null,
+                };
+
+            // add and sub take a shifted register operand, so a power of two element size needs no separate shift
+            private void EmitScaledPointerArithmetic(
+                LirInstruction instruction,
+                ArmInstrKind opcode,
+                LirOperand pointerOperand,
+                LirOperand indexOperand,
+                int scale,
+                int size)
+            {
+                var destination = GetWritableRegister(instruction.Result!, Scratch0);
+                var pointer = LoadOperand(pointerOperand, Scratch1);
+
+                if (_owner._machineTarget.Is64Bit && IsIntegerImmediate(indexOperand))
+                {
+                    var offsetBits = MaskIntegerBits(
+                        unchecked((ulong)(GetIntegerImmediateBits(indexOperand, size * 8) * (ulong)(uint)scale)), size * 8);
+                    var subtract = opcode == ArmInstrKind.Sub;
+                    if (TryGetAddSubImmediate(offsetBits, size * 8, ref subtract, out var offset))
+                    {
+                        InvalidateIntegerRepresentation(destination);
+                        Emit(ArmInstruction.Ternary(
+                            subtract ? ArmInstrKind.Sub : ArmInstrKind.Add,
+                            Reg(ToArm(destination), size),
+                            Reg(ToArm(pointer), size),
+                            ArmOperand.ImmediateOperand(offset)));
+                        StoreWritableRegisterIfSpilled(instruction.Result!, destination);
+                        return;
+                    }
+                }
+
+                var index = LoadOperand(indexOperand, Scratch2);
+                if (scale != 1 && !(_owner._machineTarget.Is64Bit && IsPowerOfTwo(scale)))
+                {
+                    // A scale that has no shifted form has to be applied in a scratch of its own
+                    if (index != Scratch2)
+                    {
+                        MoveRegister(Scratch2, index, size);
+                        index = Scratch2;
+                    }
+                    ScaleIndex(index, scale, Scratch3);
+                    scale = 1;
+                }
+
+                InvalidateIntegerRepresentation(destination);
+                Emit(ArmInstruction.Ternary(
+                    opcode,
+                    Reg(ToArm(destination), size),
+                    Reg(ToArm(pointer), size),
+                    scale == 1
+                        ? Reg(ToArm(index), size)
+                        : ArmOperand.ShiftedRegister(ToArm(index), ArmShiftKind.Lsl, Log2(scale), size)));
+                StoreWritableRegisterIfSpilled(instruction.Result!, destination);
+            }
+
             private static ArmCondition SelectCondition(string op, bool signed)
             {
                 return op switch
@@ -2034,8 +2323,17 @@ namespace Cnidaria.C
             }
 
             private void EmitComparisonResult(MachineRegister destination, MachineRegister left, MachineRegister right, ArmCondition condition, int size, bool rightIsZero)
+                => EmitComparisonResult(
+                    destination,
+                    left,
+                    ArmInstrKind.Cmp,
+                    rightIsZero ? ArmOperand.ImmediateOperand(0) : Reg(ToArm(right), size),
+                    condition,
+                    size);
+
+            private void EmitComparisonResult(MachineRegister destination, MachineRegister left, ArmInstrKind compare, ArmOperand right, ArmCondition condition, int size)
             {
-                Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(left), size), rightIsZero ? ArmOperand.ImmediateOperand(0) : Reg(ToArm(right), size)));
+                Emit(ArmInstruction.Binary(compare, Reg(ToArm(left), size), right));
                 var trueLabel = _owner.CreateLocalLabel(_functionLabel + "_cmp_true");
                 var doneLabel = _owner.CreateLocalLabel(_functionLabel + "_cmp_done");
                 LoadImmediate(destination, 0, size);
@@ -2382,28 +2680,39 @@ namespace Cnidaria.C
 
                     var size = RegisterSize(left.Type);
                     var leftRegister = LoadOperand(left, FpScratch1);
-                    if (leftRegister != FpScratch1)
-                        MoveRegister(FpScratch1, leftRegister, size);
                     var rightRegister = LoadOperand(right, FpScratch2);
-                    if (rightRegister != FpScratch2)
-                        MoveRegister(FpScratch2, rightRegister, size);
                     Emit(ArmInstruction.Binary(
                         ArmInstrKind.Fcmp,
-                        Reg(ToArmRegister(FpScratch1), size),
-                        Reg(ToArmRegister(FpScratch2), size)));
+                        Reg(ToArmRegister(leftRegister), size),
+                        Reg(ToArmRegister(rightRegister), size)));
                     EmitConditionalJump(MaybeInvert(SelectFloatingCondition(instruction.Operator), inverted), branchTarget);
                 }
                 else
                 {
                     var size = Math.Max(RegisterSize(left.Type), RegisterSize(right.Type));
-                    var leftRegister = LoadOperand(left, Scratch1);
-                    if (leftRegister != Scratch1)
-                        MoveRegister(Scratch1, leftRegister, size);
-                    var rightRegister = LoadOperand(right, Scratch2);
-                    if (rightRegister != Scratch2)
-                        MoveRegister(Scratch2, rightRegister, size);
-                    Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch1), size), Reg(ToArm(Scratch2), size)));
-                    EmitConditionalJump(MaybeInvert(SelectCondition(instruction.Operator, IsSignedIntegerType(left.Type)), inverted), branchTarget);
+                    var op = instruction.Operator;
+                    // The condition follows whichever operand ends up on the left of the compare
+                    var conditionType = left.Type;
+                    if (_owner._machineTarget.Is64Bit && IsIntegerImmediate(right) &&
+                        TryGetCompareImmediate(GetIntegerImmediateBits(right, size * 8), size * 8, out var compareOpcode, out var compareValue))
+                    {
+                        Emit(ArmInstruction.Binary(compareOpcode, Reg(ToArm(LoadOperand(left, Scratch1)), size), ArmOperand.ImmediateOperand(compareValue)));
+                    }
+                    else if (_owner._machineTarget.Is64Bit && IsIntegerImmediate(left) && !IsIntegerImmediate(right) &&
+                        TrySwapComparison(op) is { } swappedOperator &&
+                        TryGetCompareImmediate(GetIntegerImmediateBits(left, size * 8), size * 8, out var swappedOpcode, out var swappedValue))
+                    {
+                        op = swappedOperator;
+                        conditionType = right.Type;
+                        Emit(ArmInstruction.Binary(swappedOpcode, Reg(ToArm(LoadOperand(right, Scratch1)), size), ArmOperand.ImmediateOperand(swappedValue)));
+                    }
+                    else
+                    {
+                        var leftRegister = LoadOperand(left, Scratch1);
+                        var rightRegister = LoadOperand(right, Scratch2);
+                        Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(leftRegister), size), Reg(ToArm(rightRegister), size)));
+                    }
+                    EmitConditionalJump(MaybeInvert(SelectCondition(op, IsSignedIntegerType(conditionType)), inverted), branchTarget);
                 }
 
                 if (!inverted && !IsFallthroughTarget(instruction.FalseTarget))
@@ -2426,17 +2735,89 @@ namespace Cnidaria.C
                     throw Unsupported(instruction, "Switch expects one key operand.");
                 RequireScalar(instruction.Operands[0].Type, instruction);
                 var size = RegisterSize(instruction.Operands[0].Type);
+                if (TryEmitSwitchTable(instruction, size))
+                    return;
                 var key = LoadOperand(instruction.Operands[0], Scratch0);
-                if (key != Scratch0)
-                    MoveRegister(Scratch0, key, size);
                 foreach (var @case in instruction.SwitchCases)
                 {
-                    LoadImmediate(Scratch1, ImmediateToInt64(@case.Value), size);
-                    Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch0), size), Reg(ToArm(Scratch1), size)));
+                    if (_owner._machineTarget.Is64Bit && IsIntegerImmediate(@case.Value) &&
+                        TryGetCompareImmediate(GetIntegerImmediateBits(@case.Value, size * 8), size * 8, out var compareOpcode, out var compareValue))
+                    {
+                        Emit(ArmInstruction.Binary(compareOpcode, Reg(ToArm(key), size), ArmOperand.ImmediateOperand(compareValue)));
+                    }
+                    else
+                    {
+                        LoadImmediate(Scratch1, ImmediateToInt64(@case.Value), size);
+                        Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(key), size), Reg(ToArm(Scratch1), size)));
+                    }
                     EmitConditionalJump(ArmCondition.Eq, LabelOf(@case.Target));
                 }
                 if (!IsFallthroughTarget(instruction.Target))
                     EmitJump(LabelOf(instruction.Target));
+            }
+
+            private bool TryEmitSwitchTable(LirInstruction instruction, int size)
+            {
+                // A narrower selector would leave the bits above it undefined in the index register
+                if (!_owner._machineTarget.Is64Bit || size < 4)
+                    return false;
+
+                var values = new long[instruction.SwitchCases.Length];
+                for (var i = 0; i < values.Length; i++)
+                    values[i] = ImmediateToInt64(instruction.SwitchCases[i].Value);
+                if (!LirJumpTable.TryPlan(instruction.SwitchCases, values, instruction.Target,
+                        size, IsSignedIntegerType(instruction.Operands[0].Type), out var plan))
+                    return false;
+
+                var targetLabels = new string[plan.Targets.Length];
+                for (var i = 0; i < targetLabels.Length; i++)
+                {
+                    if (!_labels.TryGetValue(plan.Targets[i], out var targetLabel))
+                        return false;
+                    targetLabels[i] = targetLabel;
+                }
+
+                var index = LoadOperand(instruction.Operands[0], Scratch0);
+                if (plan.Minimum != 0)
+                {
+                    var subtract = true;
+                    if (TryGetAddSubImmediate(MaskIntegerBits(unchecked((ulong)plan.Minimum), size * 8), size * 8, ref subtract, out var bias))
+                    {
+                        Emit(ArmInstruction.Ternary(
+                            subtract ? ArmInstrKind.Sub : ArmInstrKind.Add,
+                            Reg(ToArm(Scratch0), size),
+                            Reg(ToArm(index), size),
+                            ArmOperand.ImmediateOperand(bias)));
+                    }
+                    else
+                    {
+                        LoadImmediate(Scratch1, plan.Minimum, size);
+                        Emit(ArmInstruction.Ternary(ArmInstrKind.Sub, Reg(ToArm(Scratch0), size), Reg(ToArm(index), size), Reg(ToArm(Scratch1), size)));
+                    }
+                    index = Scratch0;
+                    InvalidateIntegerRepresentation(Scratch0);
+                }
+
+                Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(index), size), ArmOperand.ImmediateOperand(plan.Targets.Length - 1)));
+                EmitConditionalJump(ArmCondition.Hi, LabelOf(instruction.Target));
+
+                // uxtw takes the low half of a 32-bit selector, which the range check above has already bounded
+                MaterializeSymbolAddress(_owner.CreateJumpTable(targetLabels), Scratch1);
+                Emit(ArmInstruction.Binary(
+                    ArmInstrKind.Ldr,
+                    Reg(ToArm(Scratch2), _owner._target.PointerSize),
+                    ArmOperand.Memory(
+                        ToArm(Scratch1),
+                        0,
+                        _owner._target.PointerSize,
+                        ArmAddressingMode.Offset,
+                        ToArm(index),
+                        ArmShiftKind.Lsl,
+                        Log2(_owner._target.PointerSize),
+                        size == 8 ? ArmExtendKind.Uxtx : ArmExtendKind.Uxtw)));
+                Emit(ArmInstruction.Unary(ArmInstrKind.Br, Reg(ToArm(Scratch2), _owner._target.PointerSize)));
+                InvalidateIntegerRepresentation(Scratch2);
+                return true;
             }
 
             private void EmitReturn(LirInstruction instruction)
@@ -2585,10 +2966,8 @@ namespace Cnidaria.C
 
             private void LoadOperandIntoAs(LirOperand operand, MachineRegister destination, QualifiedType targetType, LirInstruction instruction)
             {
-                var scratch = IsFloatType(targetType)
-                    ? destination == FpScratch0 ? FpScratch1 : FpScratch0
-                    : destination == Scratch0 ? Scratch1 : Scratch0;
-                var source = LoadOperandAs(operand, targetType, scratch, instruction);
+                // The destination is being defined here, so it doubles as the staging register
+                var source = LoadOperandAs(operand, targetType, destination, instruction);
                 MoveRegister(destination, source, RegisterSize(targetType));
             }
 
@@ -2777,11 +3156,32 @@ namespace Cnidaria.C
                         var elementBase = BuildAddress(address.BaseAddress, scratchBase, scratchIndex);
                         if (address.Index is null)
                             return elementBase;
+                        var scale = Math.Max(1, address.Scale);
+                        if (IsIntegerImmediate(address.Index) &&
+                            TryGetConstantElementOffset(address.Index, scale, elementBase.Offset, out var constantOffset))
+                        {
+                            return new AddressParts(elementBase.BaseRegister, constantOffset);
+                        }
+
                         var index = LoadOperand(address.Index, scratchIndex);
-                        if (index != scratchIndex)
-                            MoveRegister(scratchIndex, index, _owner._target.RegisterSize);
-                        var scaleScratch = SelectAddressScratch(ToArm(scratchIndex), ToArm(scratchBase));
-                        ScaleIndex(scratchIndex, Math.Max(1, address.Scale), scaleScratch);
+                        var indexShift = 0;
+                        if (scale != 1)
+                        {
+                            // A power of two rides along in the shifted register operand of the add below
+                            if (_owner._machineTarget.Is64Bit && IsPowerOfTwo(scale))
+                            {
+                                indexShift = Log2(scale);
+                            }
+                            else
+                            {
+                                if (index != scratchIndex)
+                                {
+                                    MoveRegister(scratchIndex, index, _owner._target.RegisterSize);
+                                    index = scratchIndex;
+                                }
+                                ScaleIndex(index, scale, SelectAddressScratch(ToArm(index), ToArm(scratchBase)));
+                            }
+                        }
                         if (elementBase.Offset != 0)
                         {
                             AddImmediate(scratchBase, elementBase.BaseRegister, elementBase.Offset);
@@ -2791,14 +3191,25 @@ namespace Cnidaria.C
                         Emit(ArmInstruction.Ternary(
                             ArmInstrKind.Add,
                             Reg(ToArm(scratchBase), _owner._target.PointerSize),
-                            Reg(ToArm(elementBase.BaseRegister),
-                            _owner._target.PointerSize),
-                            Reg(ToArm(scratchIndex),
-                            _owner._target.PointerSize)));
+                            Reg(ToArm(elementBase.BaseRegister), _owner._target.PointerSize),
+                            indexShift == 0
+                                ? Reg(ToArm(index), _owner._target.PointerSize)
+                                : ArmOperand.ShiftedRegister(ToArm(index), ArmShiftKind.Lsl, indexShift, _owner._target.PointerSize)));
                         return new AddressParts(scratchBase, 0);
                     default:
                         throw new NotSupportedException($"Unsupported LIR address kind {address.Kind}.");
                 }
+            }
+
+            // A constant index is displacement, not arithmetic, as long as it still fits the offset field
+            private static bool TryGetConstantElementOffset(LirOperand index, int scale, int baseOffset, out int offset)
+            {
+                offset = 0;
+                var scaled = ImmediateToInt64(index) * scale + baseOffset;
+                if (scaled < int.MinValue || scaled > int.MaxValue)
+                    return false;
+                offset = (int)scaled;
+                return true;
             }
 
             private void ScaleIndex(MachineRegister index, int scale, MachineRegister scratch)

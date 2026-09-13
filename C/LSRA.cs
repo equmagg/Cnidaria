@@ -398,7 +398,9 @@ namespace Cnidaria.C
                 instruction.Result is not null &&
                 instruction.Result.RegisterClass is LirRegisterClass.General or LirRegisterClass.Address)
             {
-                if (instruction.Operator is "/" or "%")
+                // A power of two divisor is reduced to shifts, which need none of the fixed registers
+                if (instruction.Operator is "/" or "%" &&
+                    !LirStrengthReduction.TryGetPowerOfTwoDivisor(instruction, _target, out _, out _))
                 {
                     // div and idiv read and write rax:rdx, and the emitted sequence parks the divisor in rcx
                     clobbers.Add(TargetRegisterInfo.X86AccumulatorRegister(_target));
@@ -414,9 +416,45 @@ namespace Cnidaria.C
                 }
             }
 
+            // The x86 emitter builds copies through memory with a third scratch register
+            if (TargetRegisterInfo.IsX86(_target) && NeedsX86BlockCopyScratch(instruction))
+                clobbers.Add(TargetRegisterInfo.X86AccumulatorRegister(_target));
+
             if (clobbers.Count != 0)
                 _instructionClobbers[position] = clobbers.ToImmutable();
         }
+
+        private bool NeedsX86BlockCopyScratch(LirInstruction instruction)
+        {
+            if (instruction.Kind is LirInstructionKind.ZeroMemory or LirInstructionKind.InlineAssembly or
+                LirInstructionKind.VaStart or LirInstructionKind.VaArg)
+            {
+                return true;
+            }
+
+            if (instruction.Result is not null && IsX86BlockCopyStorage(instruction.Result.Type))
+                return true;
+
+            foreach (var operand in instruction.Operands)
+            {
+                if (IsX86BlockCopyStorage(operand.Type))
+                    return true;
+            }
+
+            foreach (var copy in instruction.ParallelCopies)
+            {
+                if (IsX86BlockCopyStorage(copy.Destination.Type) || IsX86BlockCopyStorage(copy.Source.Type))
+                    return true;
+            }
+
+            return false;
+        }
+
+        // Mirrors RequiresBlockCopyStorage in the x86 code generator
+        private bool IsX86BlockCopyStorage(QualifiedType type)
+            => type.Type.Kind is TypeKind.Struct or TypeKind.Union or TypeKind.Array ||
+               (type.Type.Kind is not (TypeKind.Pointer or TypeKind.Function) &&
+                Math.Max(1, _target.SizeOf(type)) > Math.Max(1, _target.RegisterSize));
 
         private void RecordCallArgumentTargets(LirInstruction instruction, int position)
         {

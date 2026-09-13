@@ -134,6 +134,626 @@ namespace Cnidaria.C
         private static bool Enabled(SsaOptimizationOptions options)
             => options.EnableLoopInvariantCodeMotion && options.MaxLoopHoistsPerLoop > 0 && options.MaxLoopAnalysisWork > 0;
 
+        private const int MaxUnrollTripCount = 4;
+        private const int MaxUnrollLoopBlocks = 8;
+        // Past this the straight-line body needs more registers than the loop overhead it saves
+        private const int MaxUnrollStatements = 32;
+
+        private sealed class UnrollPlan
+        {
+            public Loop Loop = null!;
+            public int TripCount;
+            public GimpleLabel InLoopTarget = null!;
+            public GimpleLabel ExitTarget = null!;
+        }
+
+        private static GimpleFunctionDefinition Unroll(ControlFlowFunction flow, int budget)
+        {
+            var analysis = new Analysis(flow, budget);
+            if (analysis.Remaining <= 0 || flow.Problems.Length != 0)
+                return flow.Function;
+
+            var headers = new HashSet<ControlFlowBlock>();
+            foreach (var loop in analysis.Loops)
+                headers.Add(loop.Header);
+
+            var plans = new Dictionary<ControlFlowBlock, UnrollPlan>();
+            var claimed = new HashSet<ControlFlowBlock>();
+            foreach (var loop in analysis.Loops)
+            {
+                if (!TryPlanUnroll(flow, analysis, loop, headers, out var plan))
+                    continue;
+                var overlaps = false;
+                foreach (var block in loop.Blocks)
+                    overlaps |= claimed.Contains(block);
+                if (overlaps)
+                    continue;
+                foreach (var block in loop.Blocks)
+                    claimed.Add(block);
+                plans.Add(loop.Header, plan);
+            }
+
+            return plans.Count == 0 ? flow.Function : RewriteUnrolled(flow, plans, claimed);
+        }
+
+        private static bool TryPlanUnroll(
+            ControlFlowFunction flow,
+            Analysis analysis,
+            Loop loop,
+            HashSet<ControlFlowBlock> headers,
+            out UnrollPlan plan)
+        {
+            plan = null!;
+            if (loop.Blocks.Count > MaxUnrollLoopBlocks)
+                return false;
+
+            // Innermost loops only: cloning an outer loop would clone the labels of the inner one as well
+            var statements = 0;
+            foreach (var block in loop.Blocks)
+            {
+                if (!ReferenceEquals(block, loop.Header) && headers.Contains(block))
+                    return false;
+                if (!block.IsReachable || block.Label is null)
+                    return false;
+
+                // Only the header may be reached from outside, or a clone would leave a dangling label
+                if (!ReferenceEquals(block, loop.Header))
+                {
+                    foreach (var predecessor in block.UniquePredecessors)
+                    {
+                        if (predecessor.IsReachable && !loop.Blocks.Contains(predecessor))
+                            return false;
+                    }
+                }
+
+                foreach (var statement in block.Statements)
+                {
+                    if (statement is GimpleAsmStatement)
+                        return false;
+                    statements++;
+                }
+            }
+
+            if (loop.Header.Terminator is not GimpleCondStatement condition)
+                return false;
+
+            var whenTrueInside = ContainsLabel(loop, condition.WhenTrue);
+            var whenFalseInside = ContainsLabel(loop, condition.WhenFalse);
+            if (whenTrueInside == whenFalseInside)
+                return false;
+
+            if (!TryDescribeInductionVariable(loop.Header.Statements, condition, out var variable, out var limit, out var comparison, out var variableOnLeft))
+                return false;
+            if (!TryFindInductionStep(loop, variable, out var step))
+                return false;
+            if (!TryFindInductionStart(flow, loop, variable, out var start))
+                return false;
+            if (IsInductionVariableEscaped(flow, variable))
+                return false;
+
+            if (!TrySimulateTripCount(variable, start, step, limit, comparison, variableOnLeft, out var trips))
+                return false;
+            if (checked(trips * statements) > MaxUnrollStatements)
+                return false;
+            if (!analysis.Spend())
+                return false;
+
+            plan = new UnrollPlan
+            {
+                Loop = loop,
+                TripCount = trips,
+                InLoopTarget = whenTrueInside ? condition.WhenTrue : condition.WhenFalse,
+                ExitTarget = whenTrueInside ? condition.WhenFalse : condition.WhenTrue,
+            };
+            return true;
+        }
+
+        private static bool ContainsLabel(Loop loop, GimpleLabel label)
+        {
+            foreach (var block in loop.Blocks)
+            {
+                if (block.Label is not null && StringComparer.Ordinal.Equals(block.Label.Name, label.Name))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryDescribeInductionVariable(
+            ImmutableArray<GimpleStatement> statements,
+            GimpleCondStatement condition,
+            out VariableSymbol variable,
+            out long limit,
+            out GimpleTreeCode comparison,
+            out bool variableOnLeft)
+        {
+            variable = null!;
+            limit = 0;
+            comparison = condition.Code;
+            variableOnLeft = true;
+            if (!IsCountedComparison(condition.Code))
+                return false;
+
+            var before = statements.Length == 0 ? 0 : statements.Length - 1;
+            if (TryResolveVariable(statements, before, condition.Lhs, out variable) &&
+                TryResolveConstant(statements, before, condition.Rhs, out limit))
+            {
+                return true;
+            }
+
+            if (TryResolveVariable(statements, before, condition.Rhs, out variable) &&
+                TryResolveConstant(statements, before, condition.Lhs, out limit))
+            {
+                variableOnLeft = false;
+                return true;
+            }
+
+            return false;
+        }
+
+        private const int MaxResolveDepth = 8;
+
+        // Looks back through the block for the assignment that produced a temporary
+        private static bool TryFindDefinition(
+            ImmutableArray<GimpleStatement> statements,
+            int before,
+            GimpleValue value,
+            out GimpleAssignStatement definition)
+        {
+            definition = null!;
+            if (value is not GimpleTemporaryValue temporary)
+                return false;
+
+            for (var i = Math.Min(before, statements.Length) - 1; i >= 0; i--)
+            {
+                if (statements[i] is not GimpleAssignStatement assign)
+                {
+                    if (statements[i] is GimpleCallStatement call && call.Lhs is GimpleTemporaryValue other &&
+                        other.Ordinal == temporary.Ordinal)
+                    {
+                        return false;
+                    }
+                    continue;
+                }
+
+                if (assign.Lhs is not GimpleTemporaryValue target || target.Ordinal != temporary.Ordinal)
+                    continue;
+                definition = assign;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryResolveConstant(ImmutableArray<GimpleStatement> statements, int before, GimpleValue value, out long constant)
+            => TryResolveConstant(statements, before, value, MaxResolveDepth, out constant);
+
+        private static bool TryResolveConstant(ImmutableArray<GimpleStatement> statements, int before, GimpleValue value, int depth, out long constant)
+        {
+            constant = 0;
+            if (TryGetIntegerConstant(value, out constant))
+                return true;
+            if (depth == 0 || !TryFindDefinition(statements, before, value, out var definition))
+                return false;
+            if (!IsMove(definition))
+                return false;
+            if (!TryResolveConstant(statements, before, definition.Operands[0], depth - 1, out constant))
+                return false;
+
+            // A constant only survives the conversion when the target can still hold it
+            return TryGetIntegerRange(definition.Lhs.Type, out var minimum, out var maximum) &&
+                   constant >= minimum && constant <= maximum;
+        }
+
+        private static bool TryResolveVariable(ImmutableArray<GimpleStatement> statements, int before, GimpleValue value, out VariableSymbol variable)
+            => TryResolveVariable(statements, before, value, MaxResolveDepth, out variable);
+
+        private static bool TryResolveVariable(ImmutableArray<GimpleStatement> statements, int before, GimpleValue value, int depth, out VariableSymbol variable)
+        {
+            if (TryGetLocalVariable(value, out variable))
+                return true;
+            variable = null!;
+            if (depth == 0 || !TryFindDefinition(statements, before, value, out var definition))
+                return false;
+            if (!IsValuePreservingMove(definition))
+                return false;
+            if (!TryResolveVariable(statements, before, definition.Operands[0], depth - 1, out variable))
+                return false;
+
+            // A widening that keeps every value of the source lets the trip count be counted in the source
+            return RangeContains(definition.Lhs.Type, variable.Type);
+        }
+
+        // A copy or an integer conversion, which may or may not keep the value
+        private static bool IsMove(GimpleAssignStatement assign)
+            => assign.Operands.Length == 1 &&
+               (assign.RhsClass == GimpleRhsClass.Single ||
+                assign.Subcode is GimpleTreeCode.NopExpr or GimpleTreeCode.ConvertExpr);
+
+        // A copy, or a conversion that cannot change the value it carries
+        private static bool IsValuePreservingMove(GimpleAssignStatement assign)
+            => IsMove(assign) &&
+               (assign.RhsClass == GimpleRhsClass.Single || RangeContains(assign.Lhs.Type, assign.Operands[0].Type));
+
+        private static bool RangeContains(QualifiedType outer, QualifiedType inner)
+            => TryGetIntegerRange(outer, out var outerMinimum, out var outerMaximum) &&
+               TryGetIntegerRange(inner, out var innerMinimum, out var innerMaximum) &&
+               outerMinimum <= innerMinimum && outerMaximum >= innerMaximum;
+
+        private static bool IsCountedComparison(GimpleTreeCode code)
+            => code is GimpleTreeCode.LtExpr or GimpleTreeCode.LeExpr or GimpleTreeCode.GtExpr
+                or GimpleTreeCode.GeExpr or GimpleTreeCode.EqExpr or GimpleTreeCode.NeExpr;
+
+        // The step has to be the one and only write to the variable inside the loop
+        private static bool TryFindInductionStep(Loop loop, VariableSymbol variable, out long step)
+        {
+            step = 0;
+            var found = false;
+            foreach (var block in loop.Blocks)
+            {
+                for (var index = 0; index < block.Statements.Length; index++)
+                {
+                    var statement = block.Statements[index];
+                    if (statement is GimpleCallStatement call)
+                    {
+                        if (call.Lhs is not null && WritesVariable(call.Lhs, variable))
+                            return false;
+                        continue;
+                    }
+
+                    if (statement is not GimpleAssignStatement assign)
+                        continue;
+                    if (!WritesVariable(assign.Lhs, variable))
+                        continue;
+                    if (found)
+                        return false;
+                    if (assign.Subcode is not (GimpleTreeCode.PlusExpr or GimpleTreeCode.MinusExpr))
+                        return false;
+                    if (assign.Operands.Length != 2)
+                        return false;
+                    if (!TryResolveVariable(block.Statements, index, assign.Operands[0], out var operand) ||
+                        !ReferenceEquals(operand, variable))
+                    {
+                        return false;
+                    }
+                    if (!TryResolveConstant(block.Statements, index, assign.Operands[1], out var amount) || amount == 0)
+                        return false;
+
+                    step = assign.Subcode == GimpleTreeCode.PlusExpr ? amount : -amount;
+                    found = true;
+                }
+            }
+
+            return found;
+        }
+
+        // The single entry into the loop has to leave a known constant behind
+        private static bool TryFindInductionStart(ControlFlowFunction flow, Loop loop, VariableSymbol variable, out long start)
+        {
+            start = 0;
+            ControlFlowBlock? entry = null;
+            foreach (var predecessor in loop.Header.UniquePredecessors)
+            {
+                if (loop.Blocks.Contains(predecessor) || !predecessor.IsReachable)
+                    continue;
+                if (entry is not null)
+                    return false;
+                entry = predecessor;
+            }
+
+            if (entry is null)
+                return false;
+
+            var found = false;
+            for (var index = 0; index < entry.Statements.Length; index++)
+            {
+                var statement = entry.Statements[index];
+                if (statement is GimpleCallStatement call)
+                {
+                    if (call.Lhs is not null && WritesVariable(call.Lhs, variable))
+                        return false;
+                    continue;
+                }
+
+                if (statement is not GimpleAssignStatement assign || !WritesVariable(assign.Lhs, variable))
+                    continue;
+                if (!IsMove(assign))
+                    return false;
+                if (!TryResolveConstant(entry.Statements, index, assign.Operands[0], out start))
+                    return false;
+                found = true;
+            }
+
+            return found;
+        }
+
+        // Anything that can reach the variable through memory puts the trip count out of reach
+        private static bool IsInductionVariableEscaped(ControlFlowFunction flow, VariableSymbol variable)
+        {
+            if (variable.StorageClass is StorageClass.Static or StorageClass.Extern)
+                return true;
+            if ((GimpleTypeHelpers.Normalize(variable.Type).Qualifiers & (TypeQualifiers.Volatile | TypeQualifiers.Atomic)) != 0)
+                return true;
+
+            foreach (var block in flow.RealBlocks)
+            {
+                foreach (var statement in block.Statements)
+                {
+                    if (statement is GimpleAsmStatement)
+                        return true;
+                    if (statement is GimpleAssignStatement assign)
+                    {
+                        foreach (var operand in assign.Operands)
+                        {
+                            if (operand is GimpleAddressOfExpression address && WritesVariable(address.Target, variable))
+                                return true;
+                        }
+                    }
+                    else if (statement is GimpleCallStatement call)
+                    {
+                        foreach (var argument in call.Arguments)
+                        {
+                            if (argument is GimpleAddressOfExpression address && WritesVariable(address.Target, variable))
+                                return true;
+                        }
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static bool TrySimulateTripCount(
+            VariableSymbol variable,
+            long start,
+            long step,
+            long limit,
+            GimpleTreeCode comparison,
+            bool variableOnLeft,
+            out int trips)
+        {
+            trips = 0;
+            if (!TryGetIntegerRange(variable.Type, out var minimum, out var maximum))
+                return false;
+            if (start < minimum || start > maximum)
+                return false;
+
+            var value = start;
+            while (Holds(value))
+            {
+                if (trips == MaxUnrollTripCount)
+                    return false;
+                trips++;
+                value = checked(value + step);
+                if (value < minimum || value > maximum)
+                    return false;
+            }
+
+            return true;
+
+            bool Holds(long current)
+            {
+                var left = variableOnLeft ? current : limit;
+                var right = variableOnLeft ? limit : current;
+                return comparison switch
+                {
+                    GimpleTreeCode.LtExpr => left < right,
+                    GimpleTreeCode.LeExpr => left <= right,
+                    GimpleTreeCode.GtExpr => left > right,
+                    GimpleTreeCode.GeExpr => left >= right,
+                    GimpleTreeCode.EqExpr => left == right,
+                    _ => left != right,
+                };
+            }
+        }
+
+        private static bool TryGetIntegerRange(QualifiedType type, out long minimum, out long maximum)
+        {
+            minimum = 0;
+            maximum = 0;
+            if (type.Type is not BuiltinType builtin)
+                return false;
+
+            switch (builtin.BuiltinKind)
+            {
+                case BuiltinTypeKind.Char:
+                case BuiltinTypeKind.SignedChar:
+                    minimum = sbyte.MinValue; maximum = sbyte.MaxValue; return true;
+                case BuiltinTypeKind.UnsignedChar:
+                    maximum = byte.MaxValue; return true;
+                case BuiltinTypeKind.Short:
+                    minimum = short.MinValue; maximum = short.MaxValue; return true;
+                case BuiltinTypeKind.UnsignedShort:
+                    maximum = ushort.MaxValue; return true;
+                case BuiltinTypeKind.Int:
+                    minimum = int.MinValue; maximum = int.MaxValue; return true;
+                case BuiltinTypeKind.UnsignedInt:
+                    maximum = uint.MaxValue; return true;
+                case BuiltinTypeKind.Long:
+                case BuiltinTypeKind.LongLong:
+                    minimum = long.MinValue; maximum = long.MaxValue; return true;
+                default:
+                    return false;
+            }
+        }
+
+        private static bool TryGetLocalVariable(GimpleValue value, out VariableSymbol variable)
+        {
+            variable = null!;
+            if (value is not GimpleSymbolValue symbol || symbol.Symbol is not VariableSymbol candidate)
+                return false;
+
+            variable = candidate;
+            return true;
+        }
+
+        private static bool WritesVariable(GimplePlace place, VariableSymbol variable)
+            => place is GimpleSymbolValue symbol && ReferenceEquals(symbol.Symbol, variable);
+
+        private static bool TryGetIntegerConstant(GimpleValue value, out long constant)
+        {
+            constant = 0;
+            if (value is not GimpleConstantValue literal)
+                return false;
+
+            switch (literal.Value)
+            {
+                case int number: constant = number; return true;
+                case long number: constant = number; return true;
+                case short number: constant = number; return true;
+                case sbyte number: constant = number; return true;
+                case byte number: constant = number; return true;
+                case ushort number: constant = number; return true;
+                case uint number: constant = number; return true;
+                case ulong number when number <= long.MaxValue: constant = (long)number; return true;
+                case char number: constant = number; return true;
+                case bool flag: constant = flag ? 1 : 0; return true;
+                default: return false;
+            }
+        }
+
+        private static GimpleFunctionDefinition RewriteUnrolled(
+            ControlFlowFunction flow,
+            Dictionary<ControlFlowBlock, UnrollPlan> plans,
+            HashSet<ControlFlowBlock> claimed)
+        {
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var block in flow.RealBlocks)
+                names.Add(block.Label!.Name);
+
+            // One label per loop block per copy, so every clone keeps its own control flow
+            var copies = new Dictionary<UnrollPlan, List<Dictionary<string, GimpleLabel>>>();
+            foreach (var plan in plans.Values)
+            {
+                var perCopy = new List<Dictionary<string, GimpleLabel>>(plan.TripCount);
+                for (var copy = 0; copy < plan.TripCount; copy++)
+                {
+                    var map = new Dictionary<string, GimpleLabel>(StringComparer.Ordinal);
+                    foreach (var block in OrderedLoopBlocks(flow, plan.Loop))
+                    {
+                        var name = block.Label!.Name + "_u" + copy.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                        while (!names.Add(name))
+                            name += "_";
+                        map.Add(block.Label!.Name, new GimpleLabel(name, block.Label!.Symbol, block.Label!.Syntax));
+                    }
+                    perCopy.Add(map);
+                }
+                copies.Add(plan, perCopy);
+            }
+
+            var blocks = ImmutableArray.CreateBuilder<GimpleBasicBlock>();
+            foreach (var block in flow.RealBlocks)
+            {
+                if (plans.TryGetValue(block, out var plan))
+                {
+                    EmitCopies(flow, plan, copies[plan], blocks);
+                    continue;
+                }
+                if (claimed.Contains(block))
+                    continue;
+
+                blocks.Add(new GimpleBasicBlock(block.Label!, RedirectStatements(block.Statements, OutsideRedirect)));
+            }
+
+            var definition = flow.Function;
+            return new GimpleFunctionDefinition(definition.Syntax, definition.Symbol, definition.Temporaries,
+                blocks.ToImmutable(), definition.EntryLabel, definition.HasScalarReplacementApplied);
+
+            GimpleLabel OutsideRedirect(GimpleLabel target)
+            {
+                foreach (var pair in plans)
+                {
+                    if (!StringComparer.Ordinal.Equals(pair.Key.Label!.Name, target.Name))
+                        continue;
+                    return pair.Value.TripCount == 0
+                        ? pair.Value.ExitTarget
+                        : copies[pair.Value][0][target.Name];
+                }
+
+                return target;
+            }
+        }
+
+        private static void EmitCopies(
+            ControlFlowFunction flow,
+            UnrollPlan plan,
+            List<Dictionary<string, GimpleLabel>> copies,
+            ImmutableArray<GimpleBasicBlock>.Builder blocks)
+        {
+            var ordered = OrderedLoopBlocks(flow, plan.Loop);
+            for (var copy = 0; copy < plan.TripCount; copy++)
+            {
+                var map = copies[copy];
+                var last = copy == plan.TripCount - 1;
+                foreach (var block in ordered)
+                {
+                    var statements = RedirectStatements(block.Statements, Redirect);
+                    if (ReferenceEquals(block, plan.Loop.Header))
+                    {
+                        // The trip count is proven, so the test becomes a jump into the body
+                        statements = statements.SetItem(statements.Length - 1,
+                            new GimpleGotoStatement(Redirect(plan.InLoopTarget), plan.Loop.Header.Terminator!.Syntax));
+                    }
+
+                    blocks.Add(new GimpleBasicBlock(map[block.Label!.Name], statements));
+                }
+
+                GimpleLabel Redirect(GimpleLabel target)
+                {
+                    if (!map.TryGetValue(target.Name, out var replacement))
+                        return target;
+                    if (!StringComparer.Ordinal.Equals(target.Name, plan.Loop.Header.Label!.Name))
+                        return replacement;
+                    return last ? plan.ExitTarget : copies[copy + 1][target.Name];
+                }
+            }
+        }
+
+        private static List<ControlFlowBlock> OrderedLoopBlocks(ControlFlowFunction flow, Loop loop)
+        {
+            var ordered = new List<ControlFlowBlock>(loop.Blocks.Count);
+            foreach (var block in flow.RealBlocks)
+            {
+                if (loop.Blocks.Contains(block))
+                    ordered.Add(block);
+            }
+
+            return ordered;
+        }
+
+        private static ImmutableArray<GimpleStatement> RedirectStatements(
+            ImmutableArray<GimpleStatement> statements,
+            Func<GimpleLabel, GimpleLabel> redirect)
+        {
+            var builder = ImmutableArray.CreateBuilder<GimpleStatement>(statements.Length);
+            foreach (var statement in statements)
+                builder.Add(CloneStatement(statement, redirect));
+            return builder.MoveToImmutable();
+        }
+
+        private static GimpleStatement CloneStatement(GimpleStatement statement, Func<GimpleLabel, GimpleLabel> redirect)
+            => statement switch
+            {
+                GimpleAssignStatement assign => new GimpleAssignStatement(assign.Lhs, assign.Subcode, assign.Operands, assign.Syntax),
+                GimpleCallStatement call => call.WithOperands(call.Lhs, call.Function, call.Arguments),
+                GimpleGotoStatement jump => new GimpleGotoStatement(redirect(jump.Target), jump.Syntax),
+                GimpleCondStatement branch => new GimpleCondStatement(branch.Code, branch.Lhs, branch.Rhs,
+                    redirect(branch.WhenTrue), redirect(branch.WhenFalse), branch.Syntax),
+                GimpleSwitchStatement dispatch => RedirectSwitch(dispatch, redirect),
+                GimpleReturnStatement @return => new GimpleReturnStatement(@return.Function, @return.Expression, @return.Syntax),
+                GimpleNopStatement nop => new GimpleNopStatement(nop.Syntax),
+                GimpleDeclarationStatement declaration => new GimpleDeclarationStatement(declaration.Declaration),
+                _ => statement,
+            };
+
+        private static GimpleSwitchStatement RedirectSwitch(GimpleSwitchStatement dispatch, Func<GimpleLabel, GimpleLabel> redirect)
+        {
+            var cases = ImmutableArray.CreateBuilder<GimpleSwitchCase>(dispatch.Cases.Length);
+            foreach (var entry in dispatch.Cases)
+                cases.Add(new GimpleSwitchCase(entry.Value, redirect(entry.Target)));
+            return new GimpleSwitchStatement(dispatch.Expression, cases.MoveToImmutable(), redirect(dispatch.DefaultLabel), dispatch.Syntax);
+        }
+
         public static ControlFlowGraph CreatePreheaders(ControlFlowGraph graph, SsaOptimizationOptions options)
         {
             if (!Enabled(options))
@@ -142,8 +762,12 @@ namespace Cnidaria.C
             var functions = ImmutableArray.CreateBuilder<ControlFlowFunction>(graph.Functions.Length);
             foreach (var flow in graph.Functions)
             {
-                var rewritten = CreatePreheaders(flow, options.MaxLoopAnalysisWork);
-                functions.Add(ReferenceEquals(rewritten, flow.Function) ? flow : ControlFlowFunction.Build(rewritten));
+                var current = flow;
+                var unrolled = Unroll(current, options.MaxLoopAnalysisWork);
+                if (!ReferenceEquals(unrolled, current.Function))
+                    current = ControlFlowFunction.Build(unrolled);
+                var rewritten = CreatePreheaders(current, options.MaxLoopAnalysisWork);
+                functions.Add(ReferenceEquals(rewritten, current.Function) ? current : ControlFlowFunction.Build(rewritten));
                 replacements.Add(flow.Function, rewritten);
             }
             bool changed = false;

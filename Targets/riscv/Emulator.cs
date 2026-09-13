@@ -743,6 +743,15 @@ namespace Cnidaria.RiscV
                                     default: trapped = true; value = 0; break;
                                 }
                             }
+                            else if (funct7 == 0x0E000000U)
+                            {
+                                switch (instruction & Funct3Mask)
+                                {
+                                    case 0x5000U: value = b == 0 ? 0UL : a; break;
+                                    case 0x7000U: value = b != 0 ? 0UL : a; break;
+                                    default: trapped = true; value = 0; break;
+                                }
+                            }
                             else
                             {
                                 trapped = true;

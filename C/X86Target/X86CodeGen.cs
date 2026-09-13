@@ -61,11 +61,12 @@ namespace Cnidaria.C
 
         private static LSRAOptions ReserveCodeGenScratchRegisters(TargetInfo target, LSRAOptions options)
         {
+            // LSRA kills the accumulator and the counter at the few instructions that need them
             var reservedGeneral = target.Architecture switch
             {
                 TargetArchitectureKind.I386 => ImmutableHashSet.Create(MachineRegister.X0, MachineRegister.X1, MachineRegister.X2),
-                TargetArchitectureKind.X86_64 when TargetRegisterInfo.IsWindowsX64(target) => ImmutableHashSet.Create(MachineRegister.X0, MachineRegister.X1, MachineRegister.X5, MachineRegister.X6),
-                TargetArchitectureKind.X86_64 => ImmutableHashSet.Create(MachineRegister.X0, MachineRegister.X4, MachineRegister.X7, MachineRegister.X8),
+                TargetArchitectureKind.X86_64 when TargetRegisterInfo.IsWindowsX64(target) => ImmutableHashSet.Create(MachineRegister.X5, MachineRegister.X6),
+                TargetArchitectureKind.X86_64 => ImmutableHashSet.Create(MachineRegister.X7, MachineRegister.X8),
                 _ => ImmutableHashSet<MachineRegister>.Empty,
             };
 
@@ -76,7 +77,7 @@ namespace Cnidaria.C
                 TargetArchitectureKind.X86_64 => MachineRegister.V15,
                 _ => throw new NotSupportedException("x86 block copy scratch register is unavailable for the selected target."),
             };
-            var reservedVector = ImmutableHashSet.Create(MachineRegister.V0, MachineRegister.V1, MachineRegister.V2, blockCopyScratch);
+            var reservedVector = ImmutableHashSet.Create(MachineRegister.V0, MachineRegister.V1, blockCopyScratch);
 
             return new LSRAOptions(
                 generalRegisters: options.GeneralRegisters.Where(r => !reservedGeneral.Contains(r)).ToImmutableArray(),
@@ -416,13 +417,24 @@ namespace Cnidaria.C
             {
                 var elementType = array.ElementType;
                 var elementSize = Math.Max(1, _target.SizeOf(elementType));
+                var nextIndex = 0L;
                 foreach (var item in list.Items)
                 {
                     if (section.ByteLength - start >= availableSize)
                         break;
+                    // An element a designator skipped past stays zero
+                    if (item.ElementIndex > nextIndex)
+                    {
+                        section.EmitZero((int)Math.Min((item.ElementIndex - nextIndex) * elementSize, availableSize - (section.ByteLength - start)));
+                        nextIndex = item.ElementIndex;
+                        if (section.ByteLength - start >= availableSize)
+                            break;
+                    }
+
                     var used = EmitInitializer(section, elementType, item.Initializer, Math.Min(elementSize, availableSize - (section.ByteLength - start)));
                     if (used < elementSize && section.ByteLength - start < availableSize)
                         section.EmitZero(Math.Min(elementSize - used, availableSize - (section.ByteLength - start)));
+                    nextIndex++;
                 }
             }
             else
@@ -445,15 +457,10 @@ namespace Cnidaria.C
             if (expression is GimpleConstantValue constant)
                 return EmitConstantInitializer(section, type, constant.Value, availableSize);
 
-            if (expression is GimpleSymbolValue symbolValue)
+            // Array decay and element or field access all resolve to a symbol plus a constant offset
+            if (GimpleStaticAddress.TryResolve(expression, _target, out var addressSymbol, out var addend))
             {
-                EmitPointerRelocation(section, GetSymbolLabel(symbolValue.Symbol));
-                return Math.Min(availableSize, _target.PointerSize);
-            }
-
-            if (expression is GimpleAddressOfExpression addressOf && addressOf.Target is GimpleSymbolValue addressSymbol)
-            {
-                EmitPointerRelocation(section, GetSymbolLabel(addressSymbol.Symbol));
+                EmitPointerRelocation(section, GetSymbolLabel(addressSymbol), addend);
                 return Math.Min(availableSize, _target.PointerSize);
             }
 
@@ -500,11 +507,11 @@ namespace Cnidaria.C
             return size;
         }
 
-        private void EmitPointerRelocation(DataSectionBuilder section, string symbol)
+        private void EmitPointerRelocation(DataSectionBuilder section, string symbol, long addend = 0)
         {
             var offset = section.ByteLength;
             section.EmitZero(_target.PointerSize);
-            section.AddRelocation(offset, symbol, 0, _target.PointerSize == 8 ? X86ObjectRelocationKind.Absolute64 : X86ObjectRelocationKind.Absolute32);
+            section.AddRelocation(offset, symbol, addend, _target.PointerSize == 8 ? X86ObjectRelocationKind.Absolute64 : X86ObjectRelocationKind.Absolute32);
         }
 
         private string GetSymbolLabel(Symbol symbol)
@@ -639,6 +646,18 @@ namespace Cnidaria.C
             return label;
         }
 
+        // Absolute code addresses: the image is linked at a fixed base, so no runtime relocation is needed
+        private string CreateJumpTable(IReadOnlyList<string> targetLabels)
+        {
+            var label = CreateLocalLabel("jump_table");
+            var entrySize = _target.PointerSize;
+            var offset = _rodata.Align(entrySize);
+            _rodata.DefineSymbol(label, offset, targetLabels.Count * entrySize, X86ObjectSymbolBinding.Local, _symbols);
+            foreach (var targetLabel in targetLabels)
+                EmitPointerRelocation(_rodata, targetLabel);
+            return label;
+        }
+
         private static string SanitizeSymbolName(string name)
         {
             if (string.IsNullOrWhiteSpace(name))
@@ -729,8 +748,14 @@ namespace Cnidaria.C
             private readonly int _frameSize;
             private readonly int _stackArgumentSlotSize;
             private readonly int _sysVX64RegisterSaveAreaOffset;
+            private readonly Dictionary<LirVirtualRegister, LirInstruction> _foldableLoads = new();
+            private readonly Dictionary<LirVirtualRegister, X86Operand> _foldedAddresses = new();
             private int _currentInstructionPosition;
             private LirBlock? _fallthroughBlock;
+            private LirBlock? _currentBlock;
+            private int _currentBlockIndex;
+            private readonly Dictionary<LirBlock, LirSelectDiamond> _selectDiamonds = new();
+            private readonly HashSet<LirBlock> _foldedSelectArms = new();
             private bool _useCallPreservationSources;
 
             public FunctionEmissionContext(
@@ -784,6 +809,8 @@ namespace Cnidaria.C
 
             public void EmitBlocks()
             {
+                FindFoldableLoads();
+                FindSelectDiamonds();
                 _currentInstructionPosition = 0;
                 for (var blockIndex = 0; blockIndex < _function.Blocks.Length; blockIndex++)
                 {
@@ -791,14 +818,141 @@ namespace Cnidaria.C
                     _fallthroughBlock = blockIndex + 1 < _function.Blocks.Length
                         ? _function.Blocks[blockIndex + 1]
                         : null;
+                    _currentBlock = block;
+                    _currentBlockIndex = blockIndex;
                     DefineBlockLabel(block);
+                    if (_foldedSelectArms.Contains(block))
+                    {
+                        _currentInstructionPosition += block.Instructions.Length * 2;
+                        continue;
+                    }
+
                     foreach (var instruction in block.Instructions)
                     {
-                        EmitInstruction(instruction);
+                        if (instruction.Result is null || !_foldableLoads.ContainsKey(instruction.Result))
+                            EmitInstruction(instruction);
                         _currentInstructionPosition += 2;
                     }
                 }
                 _fallthroughBlock = null;
+            }
+
+            // A conditional expression reaches the backend as a diamond; cmov collapses it without a branch
+            private void FindSelectDiamonds()
+            {
+                foreach (var pair in LirSelect.FindDiamonds(_function, _owner._target))
+                {
+                    if (!IsSelectableCondition(pair.Value.Branch))
+                        continue;
+                    _selectDiamonds.Add(pair.Key, pair.Value);
+                    _foldedSelectArms.Add(pair.Value.TrueArm);
+                    _foldedSelectArms.Add(pair.Value.FalseArm);
+                }
+            }
+
+            private bool IsSelectableCondition(LirInstruction branch)
+            {
+                if (branch.Operands.Length == 2 && IsComparisonOperator(branch.Operator))
+                {
+                    return !IsFloatType(branch.Operands[0].Type) &&
+                        !IsFloatType(branch.Operands[1].Type) &&
+                        !IsX86WideInteger(branch.Operands[0].Type);
+                }
+
+                return branch.Operands.Length == 1 &&
+                    !IsFloatType(branch.Operands[0].Type) &&
+                    !IsX86WideInteger(branch.Operands[0].Type);
+            }
+
+            private bool TryEmitSelect(LirInstruction instruction)
+            {
+                if (!_selectDiamonds.TryGetValue(_currentBlock!, out var diamond) ||
+                    !ReferenceEquals(diamond.Branch, instruction))
+                {
+                    return false;
+                }
+
+                var size = Math.Max(4, RegisterSize(diamond.Destination.Type));
+                var destination = GetWritableRegister(diamond.Destination, Scratch0);
+
+                // The compare comes first and only mov and cmov follow it, so the flags survive to the move
+                var condition = EmitSelectCondition(instruction);
+                if (OccupiesRegister(diamond.TrueValue, destination))
+                {
+                    Emit(X86Instruction.Cmovcc(InvertCondition(condition), Reg(destination, size),
+                        Reg(LoadSelectValue(diamond.FalseValue, Scratch1, size, instruction), size)));
+                }
+                else
+                {
+                    if (!OccupiesRegister(diamond.FalseValue, destination))
+                        MoveSelectValue(destination, diamond.FalseValue, size, instruction);
+                    Emit(X86Instruction.Cmovcc(condition, Reg(destination, size),
+                        Reg(LoadSelectValue(diamond.TrueValue, Scratch1, size, instruction), size)));
+                }
+
+                NormalizeIntegerRegister(destination, diamond.Destination.Type);
+                StoreWritableRegisterIfSpilled(diamond.Destination, destination);
+                if (!FallsThroughToJoin(diamond.Join))
+                    EmitJump(diamond.Join);
+                return true;
+            }
+
+            // mov rather than the usual zeroing xor, which would destroy the compare's flags
+            private void MoveSelectValue(X86Register destination, LirOperand operand, int size, LirInstruction instruction)
+            {
+                if (operand.Kind == LirOperandKind.Immediate)
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(destination, size), Imm(ConvertIntegerConstant(operand.Immediate))));
+                    return;
+                }
+
+                MoveRegister(destination, LoadOperand(operand, destination, instruction, size), size);
+            }
+
+            private X86Register LoadSelectValue(LirOperand operand, X86Register scratch, int size, LirInstruction instruction)
+            {
+                if (operand.Kind == LirOperandKind.Immediate)
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(scratch, size), Imm(ConvertIntegerConstant(operand.Immediate))));
+                    return scratch;
+                }
+
+                return LoadOperand(operand, scratch, instruction, size);
+            }
+
+            // The folded arms emit nothing, so the join is still reached by falling off the end of this block
+            private bool FallsThroughToJoin(LirBlock join)
+            {
+                for (var index = _currentBlockIndex + 1; index < _function.Blocks.Length; index++)
+                {
+                    var block = _function.Blocks[index];
+                    if (ReferenceEquals(block, join))
+                        return true;
+                    if (!_foldedSelectArms.Contains(block))
+                        return false;
+                }
+
+                return false;
+            }
+
+            // Leaves the flags the conditional move reads and reports the condition that selects the true value
+            private X86Condition EmitSelectCondition(LirInstruction branch)
+            {
+                if (branch.Operands.Length == 2 && IsComparisonOperator(branch.Operator))
+                {
+                    var left = branch.Operands[0];
+                    var right = branch.Operands[1];
+                    var size = Math.Max(RegisterSize(left.Type), RegisterSize(right.Type));
+                    Emit(X86Instruction.Binary(X86InstrKind.Cmp,
+                        LoadComparisonLeft(left, branch, size),
+                        LoadOperandForIntegerOperation(right, Scratch1, branch, size)));
+                    return SelectIntegerComparisonCondition(branch.Operator, IsSignedIntegerType(left.Type));
+                }
+
+                var conditionSize = RegisterSize(branch.Operands[0].Type);
+                var conditionRegister = LoadOperand(branch.Operands[0], Scratch1, branch, conditionSize);
+                Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(conditionRegister, conditionSize), Reg(conditionRegister, conditionSize)));
+                return X86Condition.Ne;
             }
 
             public void EmitEpilogue()
@@ -1752,7 +1906,7 @@ namespace Cnidaria.C
                             throw Unsupported(instruction, "Inline assembly indirect address is missing its base.");
                         return "[" + FormatX86AsmRegisterOperand(address.BaseOperand, instruction, _wordSize) + "]";
                     default:
-                        var register = MaterializeAddress(address, Scratch0, instruction);
+                        var register = MaterializeAddress(address, Scratch0, instruction, Scratch1);
                         return "[" + X86Registers.Format(register, _wordSize) + "]";
                 }
             }
@@ -2018,7 +2172,8 @@ namespace Cnidaria.C
                     if (RequiresBlockCopyStorage(destination.Type))
                     {
                         if (location.Kind == AbiLocationKind.Register)
-                            EmitStoreToMemory(ToX86Register(location.Register, _owner._machineTarget), destinationAddress, segment.Offset, Math.Min(segment.Size, _wordSize));
+                            EmitSegmentStore(segment.RegisterClass, ToX86Register(location.Register, _owner._machineTarget),
+                                Mem(destinationAddress, segment.Offset, Math.Min(segment.Size, _wordSize)));
                         else if (location.Kind == AbiLocationKind.Stack)
                             EmitMemoryCopy(Mem(X86Register.Rsp, IncomingStackOffset(location.StackByteOffset(_stackArgumentSlotSize)), segment.Size),
                                 Mem(destinationAddress, segment.Offset, segment.Size), segment.Size);
@@ -2818,7 +2973,10 @@ namespace Cnidaria.C
 
                 // Every sequence below writes the destination from the left operand before reading the
                 // right one, and the result may have been given the register the right operand lives in
-                var dst = OccupiesRegister(right, destination) ? Scratch0 : destination;
+                var conflicts = TryReadFoldedLoad(right, size, out var rightMemory)
+                    ? OperandUsesRegister(rightMemory, destination)
+                    : OccupiesRegister(right, destination);
+                var dst = conflicts ? Scratch0 : destination;
 
                 switch (instruction.Operator)
                 {
@@ -2850,6 +3008,11 @@ namespace Cnidaria.C
                         break;
                     case "*":
                         LoadOperandInto(left, dst, instruction, size);
+                        if (LirStrengthReduction.TryGetPowerOfTwoFactor(instruction, _owner._target, out var factorShift))
+                        {
+                            Emit(X86Instruction.Binary(X86InstrKind.Shl, Reg(dst, size), Imm(factorShift)));
+                            break;
+                        }
                         var multiplier = LoadOperandForRead(right, Scratch1, instruction, size);
                         if (multiplier.Kind == X86OperandKind.Immediate && FitsSignedInt32(multiplier.Immediate))
                             Emit(X86Instruction.Ternary(X86InstrKind.Imul, Reg(dst, size), Reg(dst, size), multiplier));
@@ -2934,6 +3097,9 @@ namespace Cnidaria.C
 
             private void EmitDivide(LirInstruction instruction, bool signed, bool wantRemainder)
             {
+                if (TryEmitDivideByPowerOfTwo(instruction, signed, wantRemainder))
+                    return;
+
                 var size = RegisterSize(instruction.Operands[0].Type);
                 LoadOperandInto(instruction.Operands[0], X86Register.Rax, instruction, size);
                 var divisor = LoadOperandForRead(instruction.Operands[1], X86Register.Rcx, instruction, size);
@@ -2961,6 +3127,83 @@ namespace Cnidaria.C
                 MoveRegister(dst, wantRemainder ? X86Register.Rdx : X86Register.Rax, size);
                 NormalizeIntegerRegister(dst, instruction.Result!.Type);
                 StoreWritableRegisterIfSpilled(instruction.Result!, dst);
+            }
+
+            private bool TryEmitDivideByPowerOfTwo(LirInstruction instruction, bool signed, bool wantRemainder)
+            {
+                if (!LirStrengthReduction.TryGetPowerOfTwoDivisor(instruction, _owner._target, out var shift, out var negated))
+                    return false;
+
+                var size = RegisterSize(instruction.Operands[0].Type);
+                var bits = size * 8;
+                var dst = GetWritableRegister(instruction.Result!, Scratch0);
+                LoadOperandInto(instruction.Operands[0], dst, instruction, size);
+
+                if (!signed)
+                {
+                    if (wantRemainder)
+                        EmitKeepLowBits(dst, shift, size);
+                    else
+                        Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(dst, size), Imm(shift)));
+                }
+                else
+                {
+                    EmitSignedDivisionBias(dst, shift, bits, size);
+                    if (wantRemainder)
+                    {
+                        Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(Scratch1, size), Reg(dst, size)));
+                        EmitClearLowBits(Scratch1, shift, size);
+                        Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(dst, size), Reg(Scratch1, size)));
+                    }
+                    else
+                    {
+                        Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(dst, size), Reg(Scratch1, size)));
+                        Emit(X86Instruction.Binary(X86InstrKind.Sar, Reg(dst, size), Imm(shift)));
+                        if (negated)
+                            Emit(X86Instruction.Unary(X86InstrKind.Neg, Reg(dst, size)));
+                    }
+                }
+
+                NormalizeIntegerRegister(dst, instruction.Result!.Type);
+                StoreWritableRegisterIfSpilled(instruction.Result!, dst);
+                return true;
+            }
+
+            // Leaves 2^shift - 1 in the scratch for a negative dividend and zero otherwise, so the shift truncates toward zero
+            private void EmitSignedDivisionBias(X86Register dividend, int shift, int bits, int size)
+            {
+                MoveRegister(Scratch1, dividend, size);
+                if (shift == 1)
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(Scratch1, size), Imm(bits - 1)));
+                    return;
+                }
+                Emit(X86Instruction.Binary(X86InstrKind.Sar, Reg(Scratch1, size), Imm(bits - 1)));
+                Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(Scratch1, size), Imm(bits - shift)));
+            }
+
+            private void EmitKeepLowBits(X86Register register, int shift, int size)
+            {
+                var mask = (1L << shift) - 1;
+                if (FitsSignedInt32(mask))
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.And, Reg(register, size), Imm(mask)));
+                    return;
+                }
+                Emit(X86Instruction.Binary(X86InstrKind.Shl, Reg(register, size), Imm(size * 8 - shift)));
+                Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(register, size), Imm(size * 8 - shift)));
+            }
+
+            private void EmitClearLowBits(X86Register register, int shift, int size)
+            {
+                var mask = -(1L << shift);
+                if (FitsSignedInt32(mask))
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.And, Reg(register, size), Imm(mask)));
+                    return;
+                }
+                Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(register, size), Imm(shift)));
+                Emit(X86Instruction.Binary(X86InstrKind.Shl, Reg(register, size), Imm(shift)));
             }
 
             private void EmitShift(LirInstruction instruction, X86InstrKind opcode)
@@ -3075,7 +3318,7 @@ namespace Cnidaria.C
                             EmitFloatingMove(writable, leftReg, operationType);
                         var rightReg = stagedRight != X86Register.Invalid
                             ? stagedRight
-                            : LoadOperandAsFloating(right, operationType, FpScratch1, instruction);
+                            : LoadOperandAsFloatingForRead(right, operationType, FpScratch1, instruction);
                         Emit(X86Instruction.Binary(FloatingArithmeticOpcode(instruction.Operator, operationType),
                             Reg(writable, FloatingStorageSize(operationType)), Reg(rightReg, FloatingStorageSize(operationType))));
                         if (!SameFloatingType(operationType, result.Type))
@@ -3089,8 +3332,8 @@ namespace Cnidaria.C
                     case ">":
                     case ">=":
                         var comparisonType = SelectFloatingOperationType(left.Type, right.Type, IsFloatType(result.Type) ? left.Type : result.Type);
-                        var leftCmp = LoadOperandAsFloating(left, comparisonType, FpScratch0, instruction);
-                        var rightCmp = LoadOperandAsFloating(right, comparisonType, FpScratch1, instruction);
+                        var leftCmp = LoadOperandAsFloatingForRead(left, comparisonType, FpScratch0, instruction);
+                        var rightCmp = LoadOperandAsFloatingForRead(right, comparisonType, FpScratch1, instruction);
                         var dst = GetWritableRegister(result, Scratch0);
                         EmitFloatingRelation(instruction.Operator, comparisonType, leftCmp, rightCmp, dst);
                         StoreWritableRegisterIfSpilled(result, dst);
@@ -3167,6 +3410,14 @@ namespace Cnidaria.C
                 throw Unsupported(instruction, $"Unsupported floating-point operand kind: {operand.Kind}.");
             }
 
+            // An operand the instruction only reads stays where the allocator put it, saving a move
+            private X86Register LoadOperandAsFloatingForRead(LirOperand operand, QualifiedType destinationType, X86Register scratch, LirInstruction instruction)
+            {
+                if (IsFloatType(operand.Type) && SameFloatingType(operand.Type, destinationType))
+                    return LoadFloatingOperand(operand, scratch, instruction);
+                return LoadOperandAsFloating(operand, destinationType, scratch, instruction);
+            }
+
             private X86Register LoadOperandAsFloating(LirOperand operand, QualifiedType destinationType, X86Register destination, LirInstruction instruction)
             {
                 if (IsFloatType(operand.Type))
@@ -3231,7 +3482,7 @@ namespace Cnidaria.C
             private void EmitFloatingTruthValue(X86Register source, QualifiedType sourceType, X86Register destination)
             {
                 Emit(X86Instruction.Binary(FloatingCompareOpcode(sourceType), Reg(source, FloatingStorageSize(sourceType)),
-                    Reg(LoadFloatingZero(FpScratch2, sourceType), FloatingStorageSize(sourceType))));
+                    Reg(LoadFloatingZero(OtherFloatingScratch(source), sourceType), FloatingStorageSize(sourceType))));
                 Emit(X86Instruction.Setcc(X86Condition.Ne, Reg(destination, 1)));
                 Emit(X86Instruction.Setcc(X86Condition.P, Reg(Scratch1, 1)));
                 Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(destination, 1), Reg(Scratch1, 1)));
@@ -3329,8 +3580,9 @@ namespace Cnidaria.C
                 var bits = IsFloat32(type) ? 0x80000000UL : 0x8000000000000000UL;
                 var label = _owner.CreateFloatingBitsLiteral(type, bits);
                 EmitSymbolAddress(Scratch1, label);
-                EmitFloatingLoad(FpScratch2, Mem(Scratch1, 0, FloatingStorageSize(type)), type);
-                Emit(X86Instruction.Binary(FloatingXorOpcode(type), Reg(destination, 16), Reg(FpScratch2, 16)));
+                var mask = OtherFloatingScratch(destination);
+                EmitFloatingLoad(mask, Mem(Scratch1, 0, FloatingStorageSize(type)), type);
+                Emit(X86Instruction.Binary(FloatingXorOpcode(type), Reg(destination, 16), Reg(mask, 16)));
             }
 
             private void EmitFloatingMove(X86Register destination, X86Register source, QualifiedType type)
@@ -3447,7 +3699,7 @@ namespace Cnidaria.C
                 if (RequiresBlockCopyStorage(instruction.Result.Type))
                 {
                     var destination = MaterializeVirtualRegisterStorageAddress(instruction.Result, Scratch0);
-                    var source = MaterializeAddress(instruction.Address, Scratch1, instruction);
+                    var source = MaterializeAddress(instruction.Address, Scratch1, instruction, Scratch0);
                     EmitMemoryCopy(RegMem(source, 1), RegMem(destination, 1), size);
                     return;
                 }
@@ -3803,14 +4055,16 @@ namespace Cnidaria.C
                 public int SourceOffset { get; }
                 public int Size { get; }
                 public bool IsVariadicUnnamed { get; }
+                public AbiRegisterClass RegisterClass { get; }
 
-                public PendingCallArgumentSegment(LirOperand operand, AbiLocation location, int sourceOffset, int size, bool isVariadicUnnamed)
+                public PendingCallArgumentSegment(LirOperand operand, AbiLocation location, int sourceOffset, int size, bool isVariadicUnnamed, AbiRegisterClass registerClass)
                 {
                     Operand = operand;
                     Location = location;
                     SourceOffset = sourceOffset;
                     Size = size;
                     IsVariadicUnnamed = isVariadicUnnamed;
+                    RegisterClass = registerClass;
                 }
             }
 
@@ -3835,13 +4089,13 @@ namespace Cnidaria.C
                     foreach (var segment in value.Segments)
                     {
                         var loc = CAbi.AssignSegmentArgumentLocation(segment, ref cursor, _stackArgumentSlotSize);
-                        AddPendingCallArgumentSegment(stackArguments, registerArguments, operand, loc, segment.Offset, segment.Size, isVariadicUnnamed);
+                        AddPendingCallArgumentSegment(stackArguments, registerArguments, operand, loc, segment.Offset, segment.Size, isVariadicUnnamed, segment.RegisterClass);
                     }
                     return;
                 }
 
                 var location = CAbi.AssignArgumentLocation(value, ref cursor, _stackArgumentSlotSize);
-                AddPendingCallArgumentSegment(stackArguments, registerArguments, operand, location, 0, Math.Min(SizeOfStorage(operand.Type), Math.Max(1, value.Size)), isVariadicUnnamed);
+                AddPendingCallArgumentSegment(stackArguments, registerArguments, operand, location, 0, Math.Min(SizeOfStorage(operand.Type), Math.Max(1, value.Size)), isVariadicUnnamed, AbiRegisterClass.General);
             }
 
             private static void AddPendingCallArgumentSegment(
@@ -3851,9 +4105,10 @@ namespace Cnidaria.C
                 AbiLocation location,
                 int sourceOffset,
                 int size,
-                bool isVariadicUnnamed)
+                bool isVariadicUnnamed,
+                AbiRegisterClass registerClass)
             {
-                var segment = new PendingCallArgumentSegment(operand, location, sourceOffset, size, isVariadicUnnamed);
+                var segment = new PendingCallArgumentSegment(operand, location, sourceOffset, size, isVariadicUnnamed, registerClass);
                 if (location.Kind == AbiLocationKind.Stack)
                     stackArguments.Add(segment);
                 else
@@ -3863,7 +4118,7 @@ namespace Cnidaria.C
             private void EmitPendingCallArgumentSegments(List<PendingCallArgumentSegment> segments, LirInstruction instruction)
             {
                 foreach (var segment in segments)
-                    StoreArgumentSegment(segment.Operand, segment.Location, segment.SourceOffset, segment.Size, instruction, segment.IsVariadicUnnamed);
+                    StoreArgumentSegment(segment.Operand, segment.Location, segment.SourceOffset, segment.Size, instruction, segment.IsVariadicUnnamed, segment.RegisterClass);
             }
 
             private void StoreArgument(LirOperand operand, AbiValue value, ref AbiCursor cursor, LirInstruction instruction, bool isVariadicUnnamed)
@@ -3879,16 +4134,16 @@ namespace Cnidaria.C
                     foreach (var segment in value.Segments)
                     {
                         var loc = CAbi.AssignSegmentArgumentLocation(segment, ref cursor, _stackArgumentSlotSize);
-                        StoreArgumentSegment(operand, loc, segment.Offset, segment.Size, instruction, isVariadicUnnamed);
+                        StoreArgumentSegment(operand, loc, segment.Offset, segment.Size, instruction, isVariadicUnnamed, segment.RegisterClass);
                     }
                     return;
                 }
 
                 var location = CAbi.AssignArgumentLocation(value, ref cursor, _stackArgumentSlotSize);
-                StoreArgumentSegment(operand, location, 0, Math.Min(SizeOfStorage(operand.Type), Math.Max(1, value.Size)), instruction, isVariadicUnnamed);
+                StoreArgumentSegment(operand, location, 0, Math.Min(SizeOfStorage(operand.Type), Math.Max(1, value.Size)), instruction, isVariadicUnnamed, AbiRegisterClass.General);
             }
 
-            private void StoreArgumentSegment(LirOperand operand, AbiLocation location, int sourceOffset, int size, LirInstruction instruction, bool isVariadicUnnamed)
+            private void StoreArgumentSegment(LirOperand operand, AbiLocation location, int sourceOffset, int size, LirInstruction instruction, bool isVariadicUnnamed, AbiRegisterClass registerClass)
             {
                 if (IsFloatType(operand.Type) && !RequiresBlockCopyStorage(operand.Type))
                 {
@@ -3913,8 +4168,8 @@ namespace Cnidaria.C
                     if (RequiresBlockCopyStorage(operand.Type))
                     {
                         var source = MaterializeScalarStorageAddress(operand, Scratch0, instruction);
-                        EmitLoadFromMemory(ToX86Register(location.Register, _owner._machineTarget),
-                            RegMem(source, Math.Min(RegisterSize(operand.Type), size)).WithDisplacement(sourceOffset), false);
+                        EmitSegmentLoad(registerClass, ToX86Register(location.Register, _owner._machineTarget),
+                            RegMem(source, Math.Min(RegisterSize(operand.Type), size)).WithDisplacement(sourceOffset));
                     }
                     else
                     {
@@ -4020,13 +4275,12 @@ namespace Cnidaria.C
 
                 if (value.PassingKind == AbiPassingKind.MultiRegister)
                 {
-                    var destinationAddress = MaterializeVirtualRegisterStorageAddress(destination, X86Register.Rcx);
+                    var destinationAddress = MaterializeVirtualRegisterStorageAddress(destination, AggregateReturnAddressScratch);
+                    var loadCursor = new AbiCursor();
                     foreach (var segment in value.Segments)
                     {
-                        var reg = segment.ReturnRegisters.Length > 0
-                            ? segment.ReturnRegisters[Math.Min(segment.ReturnRegisters.Length - 1, segment.Offset / Math.Max(1, _wordSize))]
-                            : MachineRegister.X0;
-                        EmitStoreToMemory(ToX86Register(reg, _owner._machineTarget), destinationAddress, segment.Offset, Math.Min(segment.Size, _wordSize));
+                        var reg = NextReturnRegister(segment, ref loadCursor);
+                        EmitSegmentStore(segment.RegisterClass, reg, Mem(destinationAddress, segment.Offset, Math.Min(segment.Size, _wordSize)));
                     }
                     return;
                 }
@@ -4181,6 +4435,9 @@ namespace Cnidaria.C
 
             private void EmitBranch(LirInstruction instruction)
             {
+                if (TryEmitSelect(instruction))
+                    return;
+
                 if (instruction.Operands.Length == 2 && IsComparisonOperator(instruction.Operator))
                 {
                     EmitComparisonBranch(instruction);
@@ -4247,8 +4504,8 @@ namespace Cnidaria.C
                     if (IsLongDouble(left.Type) || IsLongDouble(right.Type))
                         throw Unsupported(instruction, "x86 backend does not support long double comparison branches.");
                     var comparisonType = SelectFloatingOperationType(left.Type, right.Type, IsFloatType(left.Type) ? left.Type : right.Type);
-                    var leftRegister = LoadOperandAsFloating(left, comparisonType, FpScratch0, instruction);
-                    var rightRegister = LoadOperandAsFloating(right, comparisonType, FpScratch1, instruction);
+                    var leftRegister = LoadOperandAsFloatingForRead(left, comparisonType, FpScratch0, instruction);
+                    var rightRegister = LoadOperandAsFloatingForRead(right, comparisonType, FpScratch1, instruction);
                     Emit(X86Instruction.Binary(
                         FloatingCompareOpcode(comparisonType),
                         Reg(leftRegister, FloatingStorageSize(comparisonType)),
@@ -4413,6 +4670,8 @@ namespace Cnidaria.C
                     return;
                 }
                 var size = RegisterSize(instruction.Operands[0].Type);
+                if (TryEmitSwitchTable(instruction, size))
+                    return;
                 var reg = LoadOperand(instruction.Operands[0], Scratch0, instruction, size);
                 foreach (var switchCase in instruction.SwitchCases)
                 {
@@ -4429,6 +4688,60 @@ namespace Cnidaria.C
                     Emit(X86Instruction.ConditionalBranch(X86Condition.E, Label(switchCase.Target)));
                 }
                 EmitJump(instruction.Target);
+            }
+
+            private bool TryEmitSwitchTable(LirInstruction instruction, int size)
+            {
+                // A narrower selector would leave the bits above it undefined in the index register
+                if (size < 4)
+                    return false;
+
+                var values = new long[instruction.SwitchCases.Length];
+                for (var i = 0; i < values.Length; i++)
+                    values[i] = ImmediateToInt64(instruction.SwitchCases[i].Value);
+                if (!LirJumpTable.TryPlan(instruction.SwitchCases, values, instruction.Target,
+                        size, IsSignedIntegerType(instruction.Operands[0].Type), out var plan))
+                    return false;
+
+                var targetLabels = new string[plan.Targets.Length];
+                for (var i = 0; i < targetLabels.Length; i++)
+                {
+                    if (!_blockLabels.TryGetValue(plan.Targets[i], out var targetLabel))
+                        return false;
+                    targetLabels[i] = targetLabel;
+                }
+
+                // A write at the selector width clears the rest of the register, which the scaled index needs
+                var biased = plan.Minimum != 0;
+                var index = LoadOperand(instruction.Operands[0], Scratch0, instruction, size);
+                if (index != Scratch0 && (biased || size < _wordSize))
+                {
+                    MoveRegister(Scratch0, index, size);
+                    index = Scratch0;
+                }
+
+                if (biased)
+                {
+                    // sub takes a 32-bit immediate, which covers every bias of a 32-bit selector
+                    if (size <= 4 || FitsSignedInt32(plan.Minimum))
+                    {
+                        Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(index, size), Imm(unchecked((int)plan.Minimum))));
+                    }
+                    else
+                    {
+                        MoveIntoRegister(Scratch1, Imm(plan.Minimum), size);
+                        Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(index, size), Reg(Scratch1, size)));
+                    }
+                }
+
+                Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(index, size), Imm(plan.Targets.Length - 1)));
+                Emit(X86Instruction.ConditionalBranch(X86Condition.A, Label(instruction.Target)));
+
+                // A 32-bit subtract already cleared the upper half, so the index scales as a full pointer
+                EmitSymbolAddress(Scratch1, _owner.CreateJumpTable(targetLabels));
+                Emit(X86Instruction.Branch(X86InstrKind.Jmp,
+                    X86Operand.Memory(Scratch1, 0, _wordSize, index, _wordSize)));
+                return true;
             }
 
             private void EmitReturn(LirInstruction instruction)
@@ -4462,7 +4775,7 @@ namespace Cnidaria.C
                     if (!_allocation.Frame.HasHiddenReturnBuffer)
                         throw Unsupported(instruction, "Hidden return buffer is required but not available.");
                     EmitLoadFromStack(Scratch0, _allocation.Frame.HiddenReturnBufferOffset, _wordSize, false);
-                    var source = MaterializeScalarStorageAddress(operand, Scratch1, instruction);
+                    var source = MaterializeScalarStorageAddress(operand, Scratch1, instruction, Scratch0);
                     EmitMemoryCopy(RegMem(source, 1), RegMem(Scratch0, 1), SizeOfStorage(operand.Type));
                     MoveRegister(X86Register.Rax, Scratch0, _wordSize);
                     return;
@@ -4478,17 +4791,47 @@ namespace Cnidaria.C
 
                 if (value.PassingKind == AbiPassingKind.MultiRegister)
                 {
-                    var source = MaterializeScalarStorageAddress(operand, X86Register.Rcx, instruction);
-                    for (var i = 0; i < value.Segments.Length; i++)
+                    var source = MaterializeScalarStorageAddress(operand, AggregateReturnAddressScratch, instruction);
+                    var storeCursor = new AbiCursor();
+                    foreach (var segment in value.Segments)
                     {
-                        var segment = value.Segments[i];
-                        var reg = segment.ReturnRegisters.Length > i ? segment.ReturnRegisters[i] : MachineRegister.X0;
-                        EmitLoadFromMemory(ToX86Register(reg, _owner._machineTarget), RegMem(source, Math.Min(segment.Size, _wordSize)).WithDisplacement(segment.Offset), false);
+                        var reg = NextReturnRegister(segment, ref storeCursor);
+                        EmitSegmentLoad(segment.RegisterClass, reg, RegMem(source, Math.Min(segment.Size, _wordSize)).WithDisplacement(segment.Offset));
                     }
                     return;
                 }
 
                 throw Unsupported(instruction, "Unsupported return ABI value.");
+            }
+
+            // A vector segment lives in an xmm register, which the integer moves cannot reach
+            private void EmitSegmentLoad(AbiRegisterClass registerClass, X86Register register, X86Operand slot)
+            {
+                if (registerClass == AbiRegisterClass.Vector)
+                    Emit(X86Instruction.Binary(slot.Size == 4 ? X86InstrKind.Movss : X86InstrKind.Movsd, Reg(register, slot.Size), slot));
+                else
+                    EmitLoadFromMemory(register, slot, false);
+            }
+
+            private void EmitSegmentStore(AbiRegisterClass registerClass, X86Register register, X86Operand slot)
+            {
+                if (registerClass == AbiRegisterClass.Vector)
+                    Emit(X86Instruction.Binary(slot.Size == 4 ? X86InstrKind.Movss : X86InstrKind.Movsd, slot, Reg(register, slot.Size)));
+                else
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, slot, Reg(register, slot.Size)));
+            }
+
+            // Segments of different classes draw from their own return registers, so each class counts separately
+            private X86Register NextReturnRegister(AbiSegment segment, ref AbiCursor cursor)
+            {
+                var index = segment.RegisterClass switch
+                {
+                    AbiRegisterClass.Vector => cursor.Vector++,
+                    AbiRegisterClass.Floating => cursor.Float++,
+                    _ => cursor.Integer++,
+                };
+                var reg = segment.ReturnRegisters.Length > index ? segment.ReturnRegisters[index] : MachineRegister.X0;
+                return ToX86Register(reg, _owner._machineTarget);
             }
 
             private void EmitJump(LirBlock? target)
@@ -4564,7 +4907,8 @@ namespace Cnidaria.C
 
                 if (RequiresBlockCopyStorage(source.Type))
                 {
-                    var address = MaterializeScalarStorageAddress(source, Scratch1, instruction);
+                    var held = OperandUsesRegister(destination, Scratch0) ? Scratch0 : X86Register.Invalid;
+                    var address = MaterializeScalarStorageAddress(source, Scratch1, instruction, held);
                     EmitMemoryCopy(RegMem(address, 1), destination, size);
                     return;
                 }
@@ -4610,7 +4954,7 @@ namespace Cnidaria.C
                 }
             }
 
-            private X86Register MaterializeScalarStorageAddress(LirOperand operand, X86Register scratch, LirInstruction instruction)
+            private X86Register MaterializeScalarStorageAddress(LirOperand operand, X86Register scratch, LirInstruction instruction, X86Register reservedScratch = X86Register.Invalid)
             {
                 if (IsX86WideInteger(operand.Type) && operand.Kind is LirOperandKind.Immediate or LirOperandKind.Undefined or LirOperandKind.Void or LirOperandKind.None)
                 {
@@ -4631,7 +4975,7 @@ namespace Cnidaria.C
                     return scratch;
                 }
                 if (operand.Kind == LirOperandKind.Address && operand.Address is not null)
-                    return MaterializeAddress(operand.Address, scratch, instruction);
+                    return MaterializeAddress(operand.Address, scratch, instruction, reservedScratch);
                 throw Unsupported(instruction, "Operand has no addressable storage.");
             }
 
@@ -4731,6 +5075,17 @@ namespace Cnidaria.C
                     if (indexRegister != X86Register.Invalid || node.Scale is not (1 or 2 or 4 or 8))
                         return false;
 
+                    // An index that is already a pointer-sized register needs no temporary of its own
+                    if (index.Kind == LirOperandKind.Register && index.Register is not null &&
+                        RegisterSize(index.Register.Type) == _wordSize &&
+                        GetRegisterReadOperand(index.Register, X86Register.Invalid, _wordSize) is
+                            { Kind: X86OperandKind.Register } allocatedIndex)
+                    {
+                        indexRegister = allocatedIndex.Register;
+                        scale = node.Scale;
+                        continue;
+                    }
+
                     indexRegister = TakeScratch();
                     if (indexRegister == X86Register.Invalid)
                         return false;
@@ -4746,7 +5101,7 @@ namespace Cnidaria.C
                 return true;
             }
 
-            private X86Register MaterializeAddress(LirAddress address, X86Register scratch, LirInstruction instruction)
+            private X86Register MaterializeAddress(LirAddress address, X86Register scratch, LirInstruction instruction, X86Register reservedScratch = X86Register.Invalid)
             {
                 switch (address.Kind)
                 {
@@ -4768,13 +5123,11 @@ namespace Cnidaria.C
                     case LirAddressKind.Element:
                         if (address.BaseAddress is null)
                             throw Unsupported(instruction, "Element address without base address.");
-                        MaterializeAddress(address.BaseAddress, scratch, instruction);
+                        MaterializeAddress(address.BaseAddress, scratch, instruction, reservedScratch);
                         if (address.Index is not null)
                         {
-                            // The index needs a temporary of its own, and it cannot be the other of
-                            // Scratch0/Scratch1: a caller copying an aggregate holds the opposite address
-                            // in one of them while this one is being built
-                            var indexScratch = scratch != Scratch2 ? Scratch2 : Scratch1;
+                            // The index needs a temporary of its own
+                            var indexScratch = SelectIndexScratch(scratch, reservedScratch);
                             LoadOperandInto(address.Index, indexScratch, instruction, _wordSize);
                             if (address.Scale != 1)
                                 Emit(X86Instruction.Ternary(X86InstrKind.Imul, Reg(indexScratch, _wordSize), Reg(indexScratch, _wordSize), Imm(address.Scale)));
@@ -4784,13 +5137,22 @@ namespace Cnidaria.C
                     case LirAddressKind.Field:
                         if (address.BaseAddress is null)
                             throw Unsupported(instruction, "Field address without base address.");
-                        MaterializeAddress(address.BaseAddress, scratch, instruction);
+                        MaterializeAddress(address.BaseAddress, scratch, instruction, reservedScratch);
                         if (address.Displacement != 0)
                             Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(scratch, _wordSize), Imm(address.Displacement)));
                         return scratch;
                     default:
                         throw Unsupported(instruction, $"Unsupported LIR address kind: {address.Kind}.");
                 }
+            }
+
+            private X86Register SelectIndexScratch(X86Register addressScratch, X86Register reservedScratch)
+            {
+                if (Scratch0 != addressScratch && Scratch0 != reservedScratch)
+                    return Scratch0;
+                if (Scratch1 != addressScratch && Scratch1 != reservedScratch)
+                    return Scratch1;
+                return Scratch2;
             }
 
             private void EmitSymbolAddress(X86Register destination, string symbol)
@@ -4829,6 +5191,9 @@ namespace Cnidaria.C
 
             private X86Operand LoadOperandForRead(LirOperand operand, X86Register scratch, LirInstruction instruction, int size)
             {
+                if (TryReadFoldedLoad(operand, size, out var folded))
+                    return folded;
+
                 switch (operand.Kind)
                 {
                     case LirOperandKind.Immediate:
@@ -4910,6 +5275,111 @@ namespace Cnidaria.C
                     return Reg(ToX86Register(allocation.PhysicalRegister, _owner._machineTarget), size);
                 }
                 return Mem(X86Register.Rsp, allocation.StackOffset, size);
+            }
+
+            // A load whose only reader is the very next instruction can become that reader's memory operand
+            private void FindFoldableLoads()
+            {
+                var uses = new Dictionary<LirVirtualRegister, int>();
+                foreach (var block in _function.Blocks)
+                {
+                    foreach (var instruction in block.Instructions)
+                        CountInstructionUses(instruction, uses);
+                }
+
+                foreach (var block in _function.Blocks)
+                {
+                    for (var i = 0; i + 1 < block.Instructions.Length; i++)
+                    {
+                        var load = block.Instructions[i];
+                        if (!IsFoldableLoad(load, block.Instructions[i + 1], uses))
+                            continue;
+                        _foldableLoads.Add(load.Result!, load);
+                    }
+                }
+            }
+
+            private bool IsFoldableLoad(LirInstruction load, LirInstruction consumer, Dictionary<LirVirtualRegister, int> uses)
+            {
+                if (load.Kind != LirInstructionKind.Load || load.Result is null || load.Address is null)
+                    return false;
+                if (!uses.TryGetValue(load.Result, out var count) || count != 1)
+                    return false;
+
+                var type = load.Result.Type;
+                if (IsFloatType(type) || RequiresBlockCopyStorage(type) || IsX86WideInteger(type))
+                    return false;
+
+                // A narrower load reaches its reader through a widening move, which has nowhere to fold into
+                if (SizeOfStorage(type) != RegisterSize(type))
+                    return false;
+                if (_allocation[load.Result].IsSpilled)
+                    return false;
+
+                // Only a binary operation is known to read its second operand after writing the destination
+                if (consumer.Kind != LirInstructionKind.Binary || consumer.Result is null || consumer.Operands.Length != 2)
+                    return false;
+                if (IsFloatType(consumer.Result.Type) || IsFloatType(consumer.Operands[0].Type))
+                    return false;
+                if (RegisterSize(consumer.Operands[0].Type) != RegisterSize(type))
+                    return false;
+                if (consumer.Operator is "/" or "%" or "<<" or ">>")
+                    return false;
+
+                var right = consumer.Operands[1];
+                return right.Kind == LirOperandKind.Register && ReferenceEquals(right.Register, load.Result);
+            }
+
+            private static void CountInstructionUses(LirInstruction instruction, Dictionary<LirVirtualRegister, int> uses)
+            {
+                foreach (var operand in instruction.Operands)
+                    CountOperandUse(operand, uses);
+                foreach (var copy in instruction.ParallelCopies)
+                    CountOperandUse(copy.Source, uses);
+                if (instruction.Address is not null)
+                    CountAddressUse(instruction.Address, uses);
+            }
+
+            private static void CountAddressUse(LirAddress address, Dictionary<LirVirtualRegister, int> uses)
+            {
+                if (address.BaseOperand is not null)
+                    CountOperandUse(address.BaseOperand, uses);
+                if (address.Index is not null)
+                    CountOperandUse(address.Index, uses);
+                if (address.BaseAddress is not null)
+                    CountAddressUse(address.BaseAddress, uses);
+            }
+
+            private static void CountOperandUse(LirOperand operand, Dictionary<LirVirtualRegister, int> uses)
+            {
+                if (operand.Kind != LirOperandKind.Register || operand.Register is null)
+                    return;
+                uses.TryGetValue(operand.Register, out var count);
+                uses[operand.Register] = count + 1;
+            }
+
+            // Scratch1 is free for the address: only the destination is written between here and the reader
+            private bool TryReadFoldedLoad(LirOperand operand, int size, out X86Operand memory)
+            {
+                memory = default;
+                if (operand.Kind != LirOperandKind.Register || operand.Register is null)
+                    return false;
+                if (_foldedAddresses.TryGetValue(operand.Register, out var built))
+                {
+                    memory = built.WithSize(Math.Max(1, size));
+                    return true;
+                }
+                if (!_foldableLoads.TryGetValue(operand.Register, out var load))
+                    return false;
+                if (TryBuildAddressOperand(load.Address!, size, Scratch1, X86Register.Invalid, load, out memory))
+                {
+                    _foldedAddresses.Add(operand.Register, memory);
+                    return true;
+                }
+
+                _foldableLoads.Remove(operand.Register);
+                EmitLoad(load);
+                return false;
             }
 
             private X86Register GetWritableRegister(LirVirtualRegister register, X86Register fallback)
@@ -5161,8 +5631,8 @@ namespace Cnidaria.C
                     return Scratch1;
                 if (!OperandUsesRegister(first, Scratch0) && !OperandUsesRegister(second, Scratch0))
                     return Scratch0;
-                if (!OperandUsesRegister(first, X86Register.Rcx) && !OperandUsesRegister(second, X86Register.Rcx))
-                    return X86Register.Rcx;
+                if (!OperandUsesRegister(first, Scratch2) && !OperandUsesRegister(second, Scratch2))
+                    return Scratch2;
                 throw new NotSupportedException("No scratch register is available for memory copy emission.");
             }
 
@@ -5233,6 +5703,10 @@ namespace Cnidaria.C
             private X86Register Scratch2
                 => _owner._machineTarget.Is64Bit ? X86Register.Rax : X86Register.Rcx;
 
+            // Scratch2 is a return register on x64, so it cannot carry the address
+            private X86Register AggregateReturnAddressScratch
+                => _owner._machineTarget.Is64Bit ? Scratch0 : X86Register.Rcx;
+
             private X86Register BlockCopyScratch
                 => !_owner._machineTarget.Is64Bit
                     ? X86Register.Xmm7
@@ -5247,8 +5721,8 @@ namespace Cnidaria.C
             private static X86Register FpScratch1
                 => X86Register.Xmm1;
 
-            private static X86Register FpScratch2
-                => X86Register.Xmm2;
+            private static X86Register OtherFloatingScratch(X86Register busy)
+                => busy != FpScratch0 ? FpScratch0 : FpScratch1;
 
             private static X86Operand Imm(long value)
                 => X86Operand.ImmediateOperand(value);
