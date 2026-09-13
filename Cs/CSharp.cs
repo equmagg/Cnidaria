@@ -784,7 +784,7 @@ namespace Cnidaria.Cs
             return ms.ToArray();
         }
 
-        private static (byte[] flatMetadata, byte[] stackFunctions, byte[] registerImage) DeserializeRegisterRunnableApplication(byte[] image)
+        public static (byte[] flatMetadata, byte[] stackFunctions, byte[] registerImage) DeserializeRegisterRunnableApplication(byte[] image)
         {
             using var ms = new MemoryStream(image, writable: false);
             using var br = new BinaryReader(ms, Encoding.UTF8, leaveOpen: true);

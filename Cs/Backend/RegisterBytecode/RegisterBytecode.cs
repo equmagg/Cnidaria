@@ -2868,7 +2868,7 @@ namespace Cnidaria.Cs
         }
     }
 
-    internal static class ImageSerializer
+    public static class ImageSerializer
     {
         public static byte[] ToBytes(CodeImage image)
         {

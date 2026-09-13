@@ -1526,16 +1526,23 @@ namespace Cnidaria.C
 
             private void SignExtend32ToPointer(MachineRegister register)
             {
-                Emit(ArmInstruction.Ternary(
-                    ArmInstrKind.Lsl,
-                    Reg(ToArm(register), 8),
-                    Reg(ToArm(register), 8),
-                    ArmOperand.ImmediateOperand(32)));
-                Emit(ArmInstruction.Ternary(
-                    ArmInstrKind.Asr,
-                    Reg(ToArm(register), 8),
-                    Reg(ToArm(register), 8),
-                    ArmOperand.ImmediateOperand(32)));
+                if (_owner._machineTarget.Is64Bit)
+                {
+                    Emit(ArmInstruction.Binary(ArmInstrKind.Sxtw, Reg(ToArm(register), 8), Reg(ToArm(register), 4)));
+                }
+                else
+                {
+                    Emit(ArmInstruction.Ternary(
+                        ArmInstrKind.Lsl,
+                        Reg(ToArm(register), 8),
+                        Reg(ToArm(register), 8),
+                        ArmOperand.ImmediateOperand(32)));
+                    Emit(ArmInstruction.Ternary(
+                        ArmInstrKind.Asr,
+                        Reg(ToArm(register), 8),
+                        Reg(ToArm(register), 8),
+                        ArmOperand.ImmediateOperand(32)));
+                }
                 InvalidateIntegerRepresentation(register);
             }
 
@@ -3486,21 +3493,18 @@ namespace Cnidaria.C
 
             private void EmitMemoryLoad(ArmRegister destination, ArmRegister baseRegister, int offset, int size, bool signed)
             {
-                if (CanEncodeMemoryOffset(offset, size, signed))
+                var vector = ArmRegisters.IsVector(destination);
+                var extend = signed && !vector;
+                var target = Reg(destination, vector ? size : RegisterOperandSize(size, extend));
+                if (CanEncodeMemoryOffset(offset, size, extend))
                 {
-                    Emit(ArmInstruction.Binary(
-                        LoadOpcode(size, signed),
-                        Reg(destination, ArmRegisters.IsVector(destination) ? size : RegisterOperandSize(size, signed)),
-                        Mem(baseRegister, offset, size)));
+                    Emit(ArmInstruction.Binary(LoadOpcode(size, extend), target, Mem(baseRegister, offset, size)));
                     return;
                 }
 
                 var addressScratch = SelectAddressScratch(baseRegister, ArmRegister.Invalid);
                 AddImmediate(addressScratch, FromArm(baseRegister), offset);
-                Emit(ArmInstruction.Binary(
-                    LoadOpcode(size, signed),
-                    Reg(destination, ArmRegisters.IsVector(destination) ? size : RegisterOperandSize(size, signed)),
-                    Mem(ToArm(addressScratch), 0, size)));
+                Emit(ArmInstruction.Binary(LoadOpcode(size, extend), target, Mem(ToArm(addressScratch), 0, size)));
             }
 
             private void EmitMemoryStore(ArmRegister source, ArmRegister baseRegister, int offset, int size)
@@ -3541,13 +3545,15 @@ namespace Cnidaria.C
                 };
             }
 
-            private static ArmInstrKind LoadOpcode(int size, bool signed)
+            private ArmInstrKind LoadOpcode(int size, bool signed)
             {
                 return size switch
                 {
                     1 => signed ? ArmInstrKind.Ldrsb : ArmInstrKind.Ldrb,
                     2 => signed ? ArmInstrKind.Ldrsh : ArmInstrKind.Ldrh,
-                    4 or 8 or 16 => ArmInstrKind.Ldr,
+                    // A word loaded into an x register is zero-extended, so a signed one widens as it loads
+                    4 => signed && _owner._machineTarget.Is64Bit ? ArmInstrKind.Ldrsw : ArmInstrKind.Ldr,
+                    8 or 16 => ArmInstrKind.Ldr,
                     _ => throw new NotSupportedException($"Unsupported scalar load size {size}."),
                 };
             }
@@ -3565,7 +3571,7 @@ namespace Cnidaria.C
 
             private int RegisterOperandSize(int memorySize, bool signed)
             {
-                if (_owner._machineTarget.Is64Bit && signed && memorySize < 4)
+                if (_owner._machineTarget.Is64Bit && signed && memorySize <= 4)
                     return _owner._target.RegisterSize;
                 return memorySize == 8 ? 8 : 4;
             }
@@ -3643,6 +3649,12 @@ namespace Cnidaria.C
                 if (!required.IsKnown || IntegerRepresentationSatisfies(GetIntegerRepresentation(register), required))
                     return;
 
+                if (TryEmitExtend(register, required))
+                {
+                    SetIntegerRepresentation(register, required);
+                    return;
+                }
+
                 var registerBits = _owner._target.RegisterSize * 8;
                 var shift = registerBits - required.Bits;
                 Emit(ArmInstruction.Ternary(
@@ -3660,6 +3672,28 @@ namespace Cnidaria.C
                     _owner._target.RegisterSize),
                     ArmOperand.ImmediateOperand(shift)));
                 SetIntegerRepresentation(register, required);
+            }
+
+            // AArch64 reaches every canonical width with one bitfield move, where a shift pair takes two
+            private bool TryEmitExtend(MachineRegister register, IntegerRepresentationFact required)
+            {
+                if (!_owner._machineTarget.Is64Bit)
+                    return false;
+
+                var signed = required.Kind == IntegerRepresentationKind.SignExtended;
+                var opcode = required.Bits switch
+                {
+                    8 => signed ? ArmInstrKind.Sxtb : ArmInstrKind.Uxtb,
+                    16 => signed ? ArmInstrKind.Sxth : ArmInstrKind.Uxth,
+                    // Writing a w register clears the upper half, which is the zero extension itself
+                    32 => signed ? ArmInstrKind.Sxtw : ArmInstrKind.Mov,
+                    _ => ArmInstrKind.Invalid,
+                };
+                if (opcode == ArmInstrKind.Invalid)
+                    return false;
+
+                Emit(ArmInstruction.Binary(opcode, Reg(ToArm(register), signed ? 8 : 4), Reg(ToArm(register), 4)));
+                return true;
             }
 
             private void EmitDirectCall(string label)
@@ -3827,7 +3861,7 @@ namespace Cnidaria.C
                 if (bits >= registerBits)
                     return IntegerRepresentationFact.Unknown;
                 if (_owner._machineTarget.Is64Bit && size == 4)
-                    return IntegerRepresentationFact.ZeroExtended(32);
+                    return signed ? IntegerRepresentationFact.SignExtended(32) : IntegerRepresentationFact.ZeroExtended(32);
                 return signed ? IntegerRepresentationFact.SignExtended(bits) : IntegerRepresentationFact.ZeroExtended(bits);
             }
 

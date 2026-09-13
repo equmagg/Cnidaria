@@ -2501,9 +2501,8 @@ namespace Cnidaria.C
                     else
                     {
                         var index = LoadOperand(instruction.Operands[1], GpScratch2);
-                        MoveRegister(GpScratch2, index);
-                        ScaleIndex(GpScratch2, PointerScale(lhsType), GpScratch3);
-                        Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(dst), ToRegister(ptr), ToRegister(GpScratch2)));
+                        var scaled = ScaleIndex(GpScratch2, index, PointerScale(lhsType), GpScratch3);
+                        Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(dst), ToRegister(ptr), ToRegister(scaled)));
                     }
                     StoreWritableRegisterIfSpilled(instruction.Result, dst);
                     return true;
@@ -2520,9 +2519,8 @@ namespace Cnidaria.C
                     else
                     {
                         var index = LoadOperand(instruction.Operands[0], GpScratch2);
-                        MoveRegister(GpScratch2, index);
-                        ScaleIndex(GpScratch2, PointerScale(rhsType), GpScratch3);
-                        Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(dst), ToRegister(ptr), ToRegister(GpScratch2)));
+                        var scaled = ScaleIndex(GpScratch2, index, PointerScale(rhsType), GpScratch3);
+                        Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(dst), ToRegister(ptr), ToRegister(scaled)));
                     }
                     StoreWritableRegisterIfSpilled(instruction.Result, dst);
                     return true;
@@ -2539,9 +2537,8 @@ namespace Cnidaria.C
                     else
                     {
                         var index = LoadOperand(instruction.Operands[1], GpScratch2);
-                        MoveRegister(GpScratch2, index);
-                        ScaleIndex(GpScratch2, PointerScale(lhsType), GpScratch3);
-                        Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(dst), ToRegister(ptr), ToRegister(GpScratch2)));
+                        var scaled = ScaleIndex(GpScratch2, index, PointerScale(lhsType), GpScratch3);
+                        Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(dst), ToRegister(ptr), ToRegister(scaled)));
                     }
                     StoreWritableRegisterIfSpilled(instruction.Result, dst);
                     return true;
@@ -4829,17 +4826,20 @@ namespace Cnidaria.C
                         if (address.BaseAddress is null)
                             throw new InvalidOperationException("Element address has no base address.");
                         var baseAddress = BuildAddress(address.BaseAddress, scratchBase, scratchIndex);
+                        var elementBase = baseAddress.BaseRegister;
                         if (baseAddress.Offset != 0)
-                            AddImmediate(scratchBase, baseAddress.BaseRegister, baseAddress.Offset);
-                        else if (baseAddress.BaseRegister != scratchBase)
-                            MoveRegister(scratchBase, baseAddress.BaseRegister);
-                        if (address.Index is not null)
                         {
-                            var index = LoadOperand(address.Index, scratchIndex);
-                            MoveRegister(scratchIndex, index);
-                            ScaleIndex(scratchIndex, address.Scale, scratchIndex == GpScratch3 ? GpScratch2 : GpScratch3);
-                            Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(scratchBase), ToRegister(scratchBase), ToRegister(scratchIndex)));
+                            AddImmediate(scratchBase, elementBase, baseAddress.Offset);
+                            elementBase = scratchBase;
                         }
+
+                        if (address.Index is null)
+                            return new AddressParts(elementBase, address.Displacement);
+
+                        // The add reads both sources, so neither the base nor the index needs a copy
+                        var index = LoadOperand(address.Index, scratchIndex);
+                        var scaled = ScaleIndex(scratchIndex, index, address.Scale, scratchIndex == GpScratch3 ? GpScratch2 : GpScratch3);
+                        Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(scratchBase), ToRegister(elementBase), ToRegister(scaled)));
                         return new AddressParts(scratchBase, address.Displacement);
                     case LirAddressKind.Field:
                         if (address.BaseAddress is null)
@@ -4851,19 +4851,21 @@ namespace Cnidaria.C
                 }
             }
 
-            private void ScaleIndex(MachineRegister index, int scale, MachineRegister scratch)
+            // Reports where the scaled index landed, which is the index itself when nothing had to scale
+            private MachineRegister ScaleIndex(MachineRegister destination, MachineRegister index, int scale, MachineRegister scratch)
             {
                 if (scale <= 1)
-                    return;
+                    return index;
                 if (IsPowerOfTwo(scale))
                 {
-                    EmitShiftImmediate(RVInstrKind.Slli, index, index, Log2(scale));
-                    return;
+                    EmitShiftImmediate(RVInstrKind.Slli, destination, index, Log2(scale));
+                    return destination;
                 }
                 if (!_owner._machineTarget.HasM)
                     throw new NotSupportedException("Non power-of-two pointer scale requires M extension.");
                 LoadImmediate(scratch, scale);
-                Emit(RVInstruction.R(RVInstrKind.Mul, ToRegister(index), ToRegister(index), ToRegister(scratch)));
+                Emit(RVInstruction.R(RVInstrKind.Mul, ToRegister(destination), ToRegister(index), ToRegister(scratch)));
+                return destination;
             }
 
             private void DivideRegisterByScale(MachineRegister register, int scale, MachineRegister scratch)

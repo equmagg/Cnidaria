@@ -2973,9 +2973,25 @@ namespace Cnidaria.C
 
                 // Every sequence below writes the destination from the left operand before reading the
                 // right one, and the result may have been given the register the right operand lives in
-                var conflicts = TryReadFoldedLoad(right, size, out var rightMemory)
+                var rightIsFoldedLoad = TryReadFoldedLoad(right, size, out var rightMemory);
+                var conflicts = rightIsFoldedLoad
                     ? OperandUsesRegister(rightMemory, destination)
                     : OccupiesRegister(right, destination);
+
+                if (!rightIsFoldedLoad && TryEmitLeaBinary(instruction, left, right, destination, size))
+                {
+                    NormalizeIntegerRegister(destination, instruction.Result.Type);
+                    StoreWritableRegisterIfSpilled(instruction.Result, destination);
+                    return;
+                }
+
+                // A commutative operator can read the destination's occupant as its second source
+                if (conflicts && !rightIsFoldedLoad && IsCommutativeInteger(instruction, left, right, size))
+                {
+                    (left, right) = (right, left);
+                    conflicts = false;
+                }
+
                 var dst = conflicts ? Scratch0 : destination;
 
                 switch (instruction.Operator)
@@ -2996,6 +3012,9 @@ namespace Cnidaria.C
                     case "-":
                         LoadOperandInto(left, dst, instruction, size);
                         EmitScaledSub(dst, right, IsPointerLike(left.Type) && IsIntegerLike(right.Type) ? PointerScale(left.Type) : 1, instruction, size);
+                        // Subtracting two pointers leaves a byte count that still has to become an element count
+                        if (IsPointerLike(left.Type) && IsPointerLike(right.Type))
+                            EmitExactDivide(dst, PointerScale(left.Type), size);
                         break;
                     case "&":
                         EmitCommutativeBinary(X86InstrKind.And, left, right, dst, instruction, size);
@@ -3067,6 +3086,133 @@ namespace Cnidaria.C
             {
                 LoadOperandInto(left, dst, instruction, size);
                 Emit(X86Instruction.Binary(opcode, Reg(dst, size), LoadOperandForIntegerOperation(right, Scratch1, instruction, size)));
+            }
+
+            // The second operand is read at the operation's width, so neither side may need widening
+            private bool IsCommutativeInteger(LirInstruction instruction, LirOperand left, LirOperand right, int size)
+            {
+                if (instruction.Operator is not ("+" or "*" or "&" or "|" or "^"))
+                    return false;
+                if (instruction.Operator is "+" or "*" && (IsPointerLike(left.Type) || IsPointerLike(right.Type)))
+                    return false;
+                return HasExactRegisterWidth(left, size) && HasExactRegisterWidth(right, size);
+            }
+
+            private bool HasExactRegisterWidth(LirOperand operand, int size)
+                => operand.Kind == LirOperandKind.Register &&
+                    operand.Register is not null &&
+                    RegisterSize(operand.Register.Type) == size;
+
+            /// <summary>Emits the operation as an address computation, which needs no move ahead of it</summary>
+            private bool TryEmitLeaBinary(LirInstruction instruction, LirOperand left, LirOperand right, X86Register destination, int size)
+            {
+                if (size is not (4 or 8) || instruction.Operator is not ("+" or "-" or "*"))
+                    return false;
+                if (!TryGetLeaRegister(left, size, out var baseRegister) || baseRegister == destination)
+                    return false;
+
+                if (instruction.Operator == "*")
+                {
+                    if (!LirStrengthReduction.TryGetConstantFactor(instruction, _owner._target, out var factor))
+                        return false;
+                    return factor switch
+                    {
+                        2 => EmitLea(destination, baseRegister, baseRegister, 1, 0, size),
+                        3 => EmitLea(destination, baseRegister, baseRegister, 2, 0, size),
+                        4 => EmitLea(destination, X86Register.Invalid, baseRegister, 4, 0, size),
+                        5 => EmitLea(destination, baseRegister, baseRegister, 4, 0, size),
+                        8 => EmitLea(destination, X86Register.Invalid, baseRegister, 8, 0, size),
+                        9 => EmitLea(destination, baseRegister, baseRegister, 8, 0, size),
+                        _ => false,
+                    };
+                }
+
+                var scale = IsPointerLike(left.Type) && IsIntegerLike(right.Type) ? PointerScale(left.Type) : 1;
+                if (instruction.Operator == "-")
+                {
+                    return TryGetLeaDisplacement(right, size, -scale, out var subtracted) &&
+                        EmitLea(destination, baseRegister, X86Register.Invalid, 1, subtracted, size);
+                }
+
+                // Integer plus pointer keeps the pointer unscaled, which the lowering below relies on
+                if (IsIntegerLike(left.Type) && IsPointerLike(right.Type) && PointerScale(right.Type) != 1)
+                    return false;
+                if (TryGetLeaDisplacement(right, size, scale, out var displacement))
+                    return EmitLea(destination, baseRegister, X86Register.Invalid, 1, displacement, size);
+                return scale is 1 or 2 or 4 or 8 &&
+                    TryGetLeaRegister(right, size, out var indexRegister) &&
+                    EmitLea(destination, baseRegister, indexRegister, scale, 0, size);
+            }
+
+            private bool EmitLea(X86Register destination, X86Register baseRegister, X86Register indexRegister, int scale, long displacement, int size)
+            {
+                if (indexRegister == X86Register.Rsp)
+                    return false;
+                Emit(X86Instruction.Binary(
+                    X86InstrKind.Lea,
+                    Reg(destination, size),
+                    X86Operand.Memory(baseRegister, displacement, size, indexRegister, scale)));
+                return true;
+            }
+
+            // An address form has nowhere to widen or narrow a source it is handed
+            private bool TryGetLeaRegister(LirOperand operand, int size, out X86Register register)
+            {
+                register = X86Register.Invalid;
+                if (!HasExactRegisterWidth(operand, size))
+                    return false;
+                if (_foldableLoads.ContainsKey(operand.Register!) || _foldedAddresses.ContainsKey(operand.Register!))
+                    return false;
+                if (GetRegisterReadOperand(operand.Register!, X86Register.Invalid, size) is not
+                    { Kind: X86OperandKind.Register } allocated)
+                {
+                    return false;
+                }
+
+                register = allocated.Register;
+                return register != X86Register.Rsp && register != X86Register.Rip;
+            }
+
+            private bool TryGetLeaDisplacement(LirOperand operand, int size, int scale, out long displacement)
+            {
+                displacement = 0;
+                if (operand.Kind != LirOperandKind.Immediate || operand.Immediate is string || IsFloatType(operand.Type))
+                    return false;
+
+                var value = ConvertIntegerConstant(operand.Immediate);
+                // The displacement carries the same 32 bits the immediate form of the operation would
+                if (size == 4)
+                {
+                    displacement = unchecked((int)value * scale);
+                    return true;
+                }
+
+                if (!FitsSignedInt32(value))
+                    return false;
+                displacement = value * scale;
+                return FitsSignedInt32(displacement);
+            }
+
+            // idiv needs the accumulator and the counter, which a subtract never reserved
+            private void EmitExactDivide(X86Register dst, int divisor, int size)
+            {
+                if (divisor <= 1)
+                    return;
+
+                LirStrengthReduction.GetExactDivisorFactors(divisor, size * 8, out var shift, out var inverse);
+                if (shift != 0)
+                    Emit(X86Instruction.Binary(X86InstrKind.Sar, Reg(dst, size), Imm(shift)));
+                if (inverse == 1)
+                    return;
+
+                if (FitsSignedInt32(inverse))
+                {
+                    Emit(X86Instruction.Ternary(X86InstrKind.Imul, Reg(dst, size), Reg(dst, size), Imm(inverse)));
+                    return;
+                }
+
+                MoveIntoRegister(Scratch1, Imm(inverse), size);
+                Emit(X86Instruction.Binary(X86InstrKind.Imul, Reg(dst, size), Reg(Scratch1, size)));
             }
 
             private void EmitScaledAdd(X86Register dst, LirOperand right, int scale, LirInstruction instruction, int size)
@@ -3569,20 +3715,26 @@ namespace Cnidaria.C
                 => Emit(X86Instruction.Binary(FloatingXorOpcode(type), Reg(destination, 16), Reg(destination, 16)));
 
             private void LoadFloatingImmediate(X86Register destination, object? value, QualifiedType type)
-            {
-                var label = _owner.CreateFloatingLiteral(type, value);
-                EmitSymbolAddress(Scratch1, label);
-                EmitFloatingLoad(destination, Mem(Scratch1, 0, FloatingStorageSize(type)), type);
-            }
+                => EmitFloatingLoad(destination, LiteralOperand(_owner.CreateFloatingLiteral(type, value), type), type);
 
             private void EmitFloatingNegate(X86Register destination, QualifiedType type)
             {
                 var bits = IsFloat32(type) ? 0x80000000UL : 0x8000000000000000UL;
                 var label = _owner.CreateFloatingBitsLiteral(type, bits);
-                EmitSymbolAddress(Scratch1, label);
                 var mask = OtherFloatingScratch(destination);
-                EmitFloatingLoad(mask, Mem(Scratch1, 0, FloatingStorageSize(type)), type);
+                EmitFloatingLoad(mask, LiteralOperand(label, type), type);
                 Emit(X86Instruction.Binary(FloatingXorOpcode(type), Reg(destination, 16), Reg(mask, 16)));
+            }
+
+            /// <summary>Reads a constant pool entry in place, which rip-relative addressing does without a scratch register</summary>
+            private X86Operand LiteralOperand(string label, QualifiedType type)
+            {
+                var size = FloatingStorageSize(type);
+                if (_owner._machineTarget.Is64Bit)
+                    return X86Operand.RipRelative(label, 0, size);
+
+                EmitSymbolAddress(Scratch1, label);
+                return Mem(Scratch1, 0, size);
             }
 
             private void EmitFloatingMove(X86Register destination, X86Register source, QualifiedType type)
@@ -5025,6 +5177,7 @@ namespace Cnidaria.C
 
                 X86Register baseRegister;
                 long displacement;
+                string? ripSymbol = null;
                 switch (root.Kind)
                 {
                     case LirAddressKind.StackSlot:
@@ -5032,6 +5185,14 @@ namespace Cnidaria.C
                             return false;
                         baseRegister = X86Register.Rsp;
                         displacement = _allocation.Frame.StackSlotOffsets[root.StackSlot];
+                        break;
+                    case LirAddressKind.Symbol:
+                        // Rip-relative addressing has no index register, and 32-bit mode has no rip
+                        if (root.Symbol is null || !_owner._machineTarget.Is64Bit || ChainNeedsIndexRegister(chain))
+                            return false;
+                        ripSymbol = _owner.GetSymbolLabel(root.Symbol);
+                        baseRegister = X86Register.Rip;
+                        displacement = 0;
                         break;
                     case LirAddressKind.Indirect:
                         if (root.BaseOperand is null)
@@ -5097,8 +5258,24 @@ namespace Cnidaria.C
                 if (displacement < int.MinValue || displacement > int.MaxValue)
                     return false;
 
-                operand = X86Operand.Memory(baseRegister, displacement, Math.Max(1, size), indexRegister, scale);
+                operand = ripSymbol is null
+                    ? X86Operand.Memory(baseRegister, displacement, Math.Max(1, size), indexRegister, scale)
+                    : X86Operand.RipRelative(ripSymbol, displacement, Math.Max(1, size));
                 return true;
+            }
+
+            // Answered before anything is emitted, so the fallback path starts from a clean slate
+            private static bool ChainNeedsIndexRegister(List<LirAddress> chain)
+            {
+                foreach (var node in chain)
+                {
+                    if (node.Kind == LirAddressKind.Field || node.Index is null)
+                        continue;
+                    if (node.Index.Kind != LirOperandKind.Immediate || node.Index.Immediate is string)
+                        return true;
+                }
+
+                return false;
             }
 
             private X86Register MaterializeAddress(LirAddress address, X86Register scratch, LirInstruction instruction, X86Register reservedScratch = X86Register.Invalid)

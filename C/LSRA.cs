@@ -320,11 +320,12 @@ namespace Cnidaria.C
         }
 
 
-        // A definition one slot past the reads lets the result reuse a register that dies here. Copies
-        // and calls were already modelled that way, and a two-address instruction has the same shape
+        // A definition one slot past the reads lets the result reuse a register that dies here, which is
+        // sound for every operator below: each reads its sources before it writes the destination
         private int DefinitionPosition(LirInstruction instruction, int position)
-            => instruction.Kind is LirInstructionKind.Copy or LirInstructionKind.ParallelCopy or LirInstructionKind.Call ||
-               (TargetRegisterInfo.IsX86(_target) && IsTwoAddressOnFirstOperand(instruction))
+            => instruction.Kind is LirInstructionKind.Copy or LirInstructionKind.ParallelCopy or LirInstructionKind.Call
+                   or LirInstructionKind.Convert ||
+               UpdatesFirstOperandInPlace(instruction)
                 ? position + 1
                 : position;
 
@@ -843,7 +844,7 @@ namespace Cnidaria.C
                 AddCopyPreference(instruction.Result, instruction.Operands[0].Register!);
             }
 
-            RecordTwoAddressPreference(instruction);
+            RecordFirstOperandPreference(instruction);
 
             if (instruction.Kind != LirInstructionKind.ParallelCopy)
                 return;
@@ -855,14 +856,11 @@ namespace Cnidaria.C
             }
         }
 
-        // x86 arithmetic is two-address, so sharing the destination with the first operand collapses the
-        // move and the operation into one instruction. One-directional: the operand is allocated first
-        private void RecordTwoAddressPreference(LirInstruction instruction)
+        // Collapses the move into a two-address operation on x86, and elsewhere keeps a recurrence in
+        // place, which costs the loop latch its copies. One-directional: the operand is allocated first
+        private void RecordFirstOperandPreference(LirInstruction instruction)
         {
-            if (!TargetRegisterInfo.IsX86(_target) || instruction.Result is null)
-                return;
-
-            if (!IsTwoAddressOnFirstOperand(instruction))
+            if (instruction.Result is null || !UpdatesFirstOperandInPlace(instruction))
                 return;
 
             var source = instruction.Operands[0];
@@ -880,7 +878,7 @@ namespace Cnidaria.C
 
         // Division and comparison are excluded: the first lands in fixed registers, the second writes
         // the destination through setcc
-        private bool IsTwoAddressOnFirstOperand(LirInstruction instruction)
+        private bool UpdatesFirstOperandInPlace(LirInstruction instruction)
         {
             // Wider than a register is a software sequence over fixed pairs, not an in-place operation
             if (instruction.Result is null ||

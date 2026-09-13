@@ -718,6 +718,33 @@ namespace Cnidaria.C
             return shift >= 1 && shift < bits;
         }
 
+        /// <summary>Reports a constant multiplier of any value, normalized to the operation's width</summary>
+        public static bool TryGetConstantFactor(LirInstruction instruction, TargetInfo target, out long factor)
+        {
+            factor = 0;
+            if (instruction is null || target is null || instruction.Operator != "*")
+                return false;
+            if (!TryGetOperationShape(instruction, target, out var bits, out var isSigned))
+                return false;
+            return TryGetIntegerConstant(instruction.Operands[1], bits, isSigned, out factor);
+        }
+
+        /// <summary>Splits a divisor into the shift and odd inverse that divide an exact multiple of it</summary>
+        /// <remarks>A pointer difference is always a whole number of elements, so it needs no real divide</remarks>
+        public static void GetExactDivisorFactors(int divisor, int bits, out int shift, out long inverse)
+        {
+            if (divisor <= 0)
+                throw new ArgumentOutOfRangeException(nameof(divisor));
+
+            shift = CountTrailingZeros((ulong)divisor);
+            var odd = (ulong)divisor >> shift;
+            // Newton iteration doubles the number of correct bits, and an odd seed starts with three
+            var reciprocal = odd;
+            for (var i = 0; i < 6; i++)
+                reciprocal = unchecked(reciprocal * (2UL - odd * reciprocal));
+            inverse = NormalizeConstant(unchecked((long)reciprocal), bits, isSigned: true);
+        }
+
         /// <summary>Sign or zero extends a constant of the given width to the whole 64 bit domain</summary>
         public static long NormalizeConstant(long value, int bits, bool isSigned)
         {

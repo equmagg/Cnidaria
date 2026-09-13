@@ -2202,32 +2202,103 @@ namespace Cnidaria.C
 
         // Literal typing and parsing
 
+        // C11 6.4.4.1: a suffix names where the search starts, not the type on its own
         private QualifiedType InferIntegerLiteralType(string text, out object? value)
         {
-            value = TryParseIntegerLiteral(text, out var parsed) ? parsed : null;
+            var parsed = TryParseIntegerLiteral(text, out var bits);
+            value = parsed ? bits : null;
 
-            if (text.EndsWith("ULL", StringComparison.OrdinalIgnoreCase) ||
-                text.EndsWith("LLU", StringComparison.OrdinalIgnoreCase))
+            var candidates = IntegerLiteralTypeCandidates(text);
+            if (parsed)
             {
-                return _types.Builtin(BuiltinTypeKind.UnsignedLongLong);
+                var magnitude = unchecked((ulong)bits);
+                foreach (var candidate in candidates)
+                {
+                    if (IntegerTypeRepresents(candidate, magnitude))
+                        return _types.Builtin(candidate);
+                }
             }
 
-            if (text.EndsWith("LL", StringComparison.OrdinalIgnoreCase))
-                return _types.Builtin(BuiltinTypeKind.LongLong);
+            return _types.Builtin(candidates[candidates.Length - 1]);
+        }
 
-            if (text.EndsWith("UL", StringComparison.OrdinalIgnoreCase) ||
-                text.EndsWith("LU", StringComparison.OrdinalIgnoreCase))
+        private static readonly BuiltinTypeKind[] UnsignedCandidates =
+            { BuiltinTypeKind.UnsignedInt, BuiltinTypeKind.UnsignedLong, BuiltinTypeKind.UnsignedLongLong };
+        private static readonly BuiltinTypeKind[] UnsignedLongCandidates =
+            { BuiltinTypeKind.UnsignedLong, BuiltinTypeKind.UnsignedLongLong };
+        private static readonly BuiltinTypeKind[] UnsignedLongLongCandidates =
+            { BuiltinTypeKind.UnsignedLongLong };
+        private static readonly BuiltinTypeKind[] DecimalCandidates =
+            { BuiltinTypeKind.Int, BuiltinTypeKind.Long, BuiltinTypeKind.LongLong };
+        private static readonly BuiltinTypeKind[] DecimalLongCandidates =
+            { BuiltinTypeKind.Long, BuiltinTypeKind.LongLong };
+        private static readonly BuiltinTypeKind[] DecimalLongLongCandidates =
+            { BuiltinTypeKind.LongLong };
+        private static readonly BuiltinTypeKind[] RadixCandidates =
+        {
+            BuiltinTypeKind.Int, BuiltinTypeKind.UnsignedInt,
+            BuiltinTypeKind.Long, BuiltinTypeKind.UnsignedLong,
+            BuiltinTypeKind.LongLong, BuiltinTypeKind.UnsignedLongLong,
+        };
+        private static readonly BuiltinTypeKind[] RadixLongCandidates =
+        {
+            BuiltinTypeKind.Long, BuiltinTypeKind.UnsignedLong,
+            BuiltinTypeKind.LongLong, BuiltinTypeKind.UnsignedLongLong,
+        };
+        private static readonly BuiltinTypeKind[] RadixLongLongCandidates =
+            { BuiltinTypeKind.LongLong, BuiltinTypeKind.UnsignedLongLong };
+
+        private static BuiltinTypeKind[] IntegerLiteralTypeCandidates(string text)
+        {
+            var longCount = CountLongSuffixLetters(text);
+            if (text.IndexOf('u') >= 0 || text.IndexOf('U') >= 0)
+                return longCount switch
+                {
+                    0 => UnsignedCandidates,
+                    1 => UnsignedLongCandidates,
+                    _ => UnsignedLongLongCandidates,
+                };
+
+            // A decimal constant without a u suffix never becomes an unsigned type
+            if (!text.StartsWith("0", StringComparison.Ordinal))
+                return longCount switch
+                {
+                    0 => DecimalCandidates,
+                    1 => DecimalLongCandidates,
+                    _ => DecimalLongLongCandidates,
+                };
+
+            return longCount switch
             {
-                return _types.Builtin(BuiltinTypeKind.UnsignedLong);
+                0 => RadixCandidates,
+                1 => RadixLongCandidates,
+                _ => RadixLongLongCandidates,
+            };
+        }
+
+        private static int CountLongSuffixLetters(string text)
+        {
+            var count = 0;
+            for (var i = text.Length - 1; i >= 0; i--)
+            {
+                var ch = text[i];
+                if (ch is 'l' or 'L')
+                    count++;
+                else if (ch is not ('u' or 'U'))
+                    break;
             }
 
-            if (text.EndsWith("U", StringComparison.OrdinalIgnoreCase))
-                return _types.Builtin(BuiltinTypeKind.UnsignedInt);
+            return count;
+        }
 
-            if (text.EndsWith("L", StringComparison.OrdinalIgnoreCase))
-                return _types.Builtin(BuiltinTypeKind.Long);
+        private bool IntegerTypeRepresents(BuiltinTypeKind kind, ulong magnitude)
+        {
+            var bits = _compilation.Options.Target.SizeOf(_types.Builtin(kind)) * 8;
+            if (bits <= 0 || bits >= 64)
+                return kind is BuiltinTypeKind.UnsignedLong or BuiltinTypeKind.UnsignedLongLong || magnitude <= long.MaxValue;
 
-            return _types.Builtin(BuiltinTypeKind.Int);
+            var isUnsigned = kind is BuiltinTypeKind.UnsignedInt or BuiltinTypeKind.UnsignedLong or BuiltinTypeKind.UnsignedLongLong;
+            return magnitude <= (isUnsigned ? (1UL << bits) - 1 : (1UL << (bits - 1)) - 1);
         }
 
         private QualifiedType InferFloatingLiteralType(string text)
