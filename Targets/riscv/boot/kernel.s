@@ -33,7 +33,8 @@ kernel_boot_hang:
 
 supervisor_trap_vector:
     csrrw sp, sscratch, sp
-    addi sp, sp, -288
+    addi sp, sp, -1184
+    addi sp, sp, -1184
     sd x0, 0(sp)
     sd x1, 8(sp)
     sd x5, 40(sp)
@@ -75,6 +76,23 @@ supervisor_trap_vector:
     sd t0, 272(sp)
     csrrs t0, stval, zero
     sd t0, 280(sp)
+    csrrs t1, vtype, zero
+    sd t1, 288(sp)
+    csrrs t1, vl, zero
+    sd t1, 296(sp)
+    csrrs t1, vstart, zero
+    sd t1, 304(sp)
+    csrrs t2, vlenb, zero
+    slli t2, t2, 3
+    addi t3, sp, 320
+    vsetvli t1, zero, e8, m8
+    vse8.v v0, (t3)
+    add t3, t3, t2
+    vse8.v v8, (t3)
+    add t3, t3, t2
+    vse8.v v16, (t3)
+    add t3, t3, t2
+    vse8.v v24, (t3)
     mv a0, sp
     li t0, ${ZKERNEL_TRAP_DISPATCH_ADDRESS}
     jalr ra, t0, 0
@@ -82,6 +100,22 @@ supervisor_trap_vector:
     csrrw zero, sepc, t0
     ld t0, 264(sp)
     csrrw zero, sstatus, t0
+    csrrs t2, vlenb, zero
+    slli t2, t2, 3
+    addi t3, sp, 320
+    vsetvli t1, zero, e8, m8
+    vle8.v v0, (t3)
+    add t3, t3, t2
+    vle8.v v8, (t3)
+    add t3, t3, t2
+    vle8.v v16, (t3)
+    add t3, t3, t2
+    vle8.v v24, (t3)
+    ld t1, 288(sp)
+    ld t2, 296(sp)
+    vsetvl zero, t2, t1
+    ld t1, 304(sp)
+    csrrw zero, vstart, t1
     ld x1, 8(sp)
     ld x3, 24(sp)
     ld x4, 32(sp)
@@ -109,7 +143,8 @@ supervisor_trap_vector:
     ld x29, 232(sp)
     ld x30, 240(sp)
     ld x31, 248(sp)
-    addi x5, sp, 288
+    addi x5, sp, 1184
+    addi x5, x5, 1184
     csrrw zero, sscratch, x5
     ld x5, 40(sp)
     ld x6, 48(sp)

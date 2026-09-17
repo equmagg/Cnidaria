@@ -252,7 +252,7 @@ namespace Cnidaria.C
         ///<summary>Tests the visible declaration of an identifier</summary>
         public bool IsTypeName(string name)
         {
-            if (RVVectorType.TryParseBuiltinName(name, out _))
+            if (RVVectorType.IsBuiltinName(name))
                 return true;
 
             foreach (var scope in _scopes)
@@ -1637,15 +1637,16 @@ namespace Cnidaria.C
             for (var i = 0; i < fixedParameterCount; i++)
             {
                 var parameter = macro.Parameters[i];
-                var raw = i < arguments.Length ? arguments[i] : string.Empty;
+                // The argument is a token sequence: space around it is not part of it, and ## must not paste it in
+                var raw = (i < arguments.Length ? arguments[i] : string.Empty).Trim();
                 rawArguments[parameter] = raw;
-                expandedArguments[parameter] = ExpandMacroArgumentToText(raw, macro.Name, sourceToken.Position);
+                expandedArguments[parameter] = ExpandMacroArgumentToText(raw, macro.Name, sourceToken.Position).Trim();
             }
 
             if (macro.IsVariadic)
             {
-                var variadicRaw = JoinMacroArguments(arguments, fixedParameterCount);
-                var variadicExpanded = ExpandMacroArgumentToText(variadicRaw, macro.Name, sourceToken.Position);
+                var variadicRaw = JoinMacroArguments(arguments, fixedParameterCount).Trim();
+                var variadicExpanded = ExpandMacroArgumentToText(variadicRaw, macro.Name, sourceToken.Position).Trim();
 
                 rawArguments["__VA_ARGS__"] = variadicRaw;
                 expandedArguments["__VA_ARGS__"] = variadicExpanded;

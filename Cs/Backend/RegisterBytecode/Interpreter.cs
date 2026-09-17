@@ -1089,6 +1089,8 @@ namespace Cnidaria.Cs
 
                             if (!_image.MethodIndexByEntryPc.TryGetValue(targetEntryPc, out int targetMethodIndex))
                                 throw new InvalidOperationException($"Invalid direct call target PC {targetEntryPc}");
+                            if (TryInvokeManagedHostOverride(targetMethodIndex, (CallFlags)ins.Aux, ct))
+                                break;
                             if (_frameCount >= MaxCallFramesHard)
                                 throw new InvalidOperationException("Register VM call stack limit exceeded.");
                             if (_frameCount >= limits.MaxCallDepth)
@@ -1116,6 +1118,8 @@ namespace Cnidaria.Cs
                                 throw new NullReferenceException("function pointer is null.");
                             if (!_image.MethodIndexByEntryPc.TryGetValue(targetEntryPc, out int targetMethodIndex))
                                 throw new MissingMethodException($"Indirect register call target PC is absent from register image: {targetEntryPc}");
+                            if (TryInvokeManagedHostOverride(targetMethodIndex, (CallFlags)ins.Aux, ct))
+                                break;
                             if (_frameCount >= MaxCallFramesHard)
                                 throw new InvalidOperationException("Register VM call stack limit exceeded.");
                             if (_frameCount >= limits.MaxCallDepth)
@@ -2672,9 +2676,12 @@ namespace Cnidaria.Cs
 
             if (value.Kind == VmValueKind.Value)
             {
-                RuntimeType valueType = _rts.GetTypeById(value.Aux);
-                if (valueType.TypeId != type.TypeId)
-                    throw new InvalidOperationException($"Struct return type mismatch: value={valueType.Namespace}.{valueType.Name}, target={type.Namespace}.{type.Name}.");
+                if (value.Aux != 0)
+                {
+                    RuntimeType valueType = _rts.GetTypeById(value.Aux);
+                    if (valueType.TypeId != type.TypeId)
+                        throw new InvalidOperationException($"Struct return type mismatch: value={valueType.Namespace}.{valueType.Name}, target={type.Namespace}.{type.Name}.");
+                }
                 LoadTypedValueToReturn(checked((int)value.Payload), type);
                 return;
             }
@@ -2722,13 +2729,37 @@ namespace Cnidaria.Cs
             return false;
         }
 
+        /// <summary>Redirects a call to a method with a body into its host handler when one is installed</summary>
+        private bool TryInvokeManagedHostOverride(int targetMethodIndex, CallFlags callFlags, CancellationToken ct)
+        {
+            if (_hostOverrides.Count == 0)
+                return false;
+
+            int runtimeMethodId = _image.Methods[targetMethodIndex].RuntimeMethodId;
+            if (runtimeMethodId < 0 || !_hostOverrides.ContainsKey(runtimeMethodId))
+                return false;
+
+            RuntimeMethod target = _rts.GetMethodById(runtimeMethodId);
+            CallFlags previousActiveCallFlags = _activeCallFlags;
+            RuntimeMethod? previousActiveCallTargetMethod = _activeCallTargetMethod;
+            _activeCallFlags = callFlags;
+            _activeCallTargetMethod = target;
+            try
+            {
+                return TryInvokeHostOverride(target, ct);
+            }
+            finally
+            {
+                _activeCallFlags = previousActiveCallFlags;
+                _activeCallTargetMethod = previousActiveCallTargetMethod;
+            }
+        }
+
         private bool TryInvokeHostOverride(RuntimeMethod rm, CancellationToken ct)
         {
             if (!_hostOverrides.TryGetValue(rm.MethodId, out var ov))
                 return false;
 
-            if (!rm.HasInternalCall)
-                throw new InvalidOperationException($"Host override target is not InternalCall: {rm.DeclaringType.Namespace}.{rm.DeclaringType.Name}.{rm.Name}");
             if (!rm.IsStatic || rm.HasThis)
                 throw new InvalidOperationException("Only static host overrides are supported by the register VM.");
 

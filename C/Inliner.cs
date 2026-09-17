@@ -257,6 +257,8 @@ namespace Cnidaria.C
                 return false;
             if ((calleeSymbol.FunctionSpecifiers & FunctionSpecifiers.NoReturn) != 0)
                 return false;
+            if ((calleeSymbol.FunctionSpecifiers & FunctionSpecifiers.NoInline) != 0)
+                return false;
 
             var functionType = calleeSymbol.FunctionType;
             var callType = site.Call.FunctionType;

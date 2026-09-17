@@ -229,6 +229,8 @@ namespace Cnidaria.C
                 asmCloseParen = MatchToken(SyntaxKind.CloseParenToken);
             }
 
+            var trailingAttributes = ParseTrailingAttributeSpecifiers();
+
             if (Current.Kind == SyntaxKind.EqualsToken)
             {
                 equalsToken = NextToken();
@@ -242,7 +244,25 @@ namespace Cnidaria.C
                 asmRegisterName,
                 asmCloseParen,
                 equalsToken,
-                initializer);
+                initializer,
+                trailingAttributes);
+        }
+
+        /// <summary>Reads attribute specifiers sitting between a declarator and its initializer</summary>
+        private ImmutableArray<SyntaxToken> ParseTrailingAttributeSpecifiers()
+        {
+            if (Current.Kind is not (SyntaxKind.AttributeKeyword or SyntaxKind.DeclspecKeyword))
+                return ImmutableArray<SyntaxToken>.Empty;
+
+            var tokens = ImmutableArray.CreateBuilder<SyntaxToken>();
+            while (Current.Kind is SyntaxKind.AttributeKeyword or SyntaxKind.DeclspecKeyword)
+            {
+                tokens.Add(NextToken());
+                if (Current.Kind == SyntaxKind.OpenParenToken)
+                    ReadBalancedTokenSequence(tokens);
+            }
+
+            return tokens.ToImmutable();
         }
 
         private DeclaratorSyntax ParseDeclarator()

@@ -26,7 +26,8 @@ namespace Cnidaria.C
     {
         None = 0,
         Inline = 1,
-        NoReturn = 2
+        NoReturn = 2,
+        NoInline = 4
     }
 
 
@@ -489,7 +490,7 @@ namespace Cnidaria.C
                     name,
                     declaredType,
                     specifiers.StorageClass,
-                    specifiers.FunctionSpecifiers,
+                    specifiers.FunctionSpecifiers | DeclarationTypeParser.ParseAttributeSpecifiers(initDeclarator.TrailingAttributeTokens),
                     isDefinition: false,
                     initDeclarator,
                     GetRuntimeIntrinsicKind(name));
@@ -973,11 +974,15 @@ namespace Cnidaria.C
         {
             if (!scope.TryDeclareOrdinary(symbol, out var existing))
             {
-                if (existing is FunctionSymbol existingFunction &&
-                    existingFunction.IsIntrinsic &&
-                    symbol is FunctionSymbol)
+                if (existing is FunctionSymbol existingFunction && symbol is FunctionSymbol redeclaration)
                 {
-                    scope.ReplaceOrdinary(symbol);
+                    // Specifiers spread over a prototype and a definition all belong to the one function
+                    var merged = existingFunction.FunctionSpecifiers | redeclaration.FunctionSpecifiers;
+                    existingFunction.MergeFunctionSpecifiers(merged);
+                    redeclaration.MergeFunctionSpecifiers(merged);
+
+                    if (existingFunction.IsIntrinsic)
+                        scope.ReplaceOrdinary(symbol);
                 }
             }
         }
@@ -1037,6 +1042,22 @@ namespace Cnidaria.C
             return parser.Parse();
         }
 
+        /// <summary>Reads function specifiers out of a standalone run of attribute specifiers</summary>
+        public static FunctionSpecifiers ParseAttributeSpecifiers(ImmutableArray<SyntaxToken> tokens)
+        {
+            if (tokens.IsDefaultOrEmpty)
+                return FunctionSpecifiers.None;
+
+            var specifiers = FunctionSpecifiers.None;
+            for (var i = 0; i < tokens.Length; i++)
+            {
+                if (tokens[i].Kind is SyntaxKind.AttributeKeyword or SyntaxKind.DeclspecKeyword)
+                    specifiers |= ReadAttributeSpecifiers(tokens, ref i);
+            }
+
+            return specifiers;
+        }
+
         private DeclarationSpecifiers Parse()
         {
             var storageClass = StorageClass.None;
@@ -1076,6 +1097,12 @@ namespace Cnidaria.C
 
                 if (braceDepth != 0)
                     continue;
+
+                if (token.Kind is SyntaxKind.AttributeKeyword or SyntaxKind.DeclspecKeyword)
+                {
+                    functionSpecifiers |= ReadAttributeSpecifiers(_tokens, ref i);
+                    continue;
+                }
 
                 switch (token.Kind)
                 {
@@ -1217,10 +1244,51 @@ namespace Cnidaria.C
                 functionSpecifiers);
         }
 
+        /// <summary>Consumes one attribute specifier and reports the function specifiers its names carry</summary>
+        /// <remarks>Its contents never take part in base type selection, so an attribute cannot qualify the declared type</remarks>
+        private static FunctionSpecifiers ReadAttributeSpecifiers(ImmutableArray<SyntaxToken> tokens, ref int index)
+        {
+            var specifiers = FunctionSpecifiers.None;
+            var i = index + 1;
+            if (i >= tokens.Length || tokens[i].Kind != SyntaxKind.OpenParenToken)
+            {
+                index = i - 1;
+                return specifiers;
+            }
+
+            var depth = 0;
+            for (; i < tokens.Length; i++)
+            {
+                var kind = tokens[i].Kind;
+                if (kind == SyntaxKind.OpenParenToken)
+                {
+                    depth++;
+                    continue;
+                }
+
+                if (kind == SyntaxKind.CloseParenToken)
+                {
+                    if (--depth == 0)
+                        break;
+                    continue;
+                }
+
+                if (kind == SyntaxKind.IdentifierToken && IsNoInlineAttributeName(tokens[i].Text))
+                    specifiers |= FunctionSpecifiers.NoInline;
+            }
+
+            index = i;
+            return specifiers;
+        }
+
+        private static bool IsNoInlineAttributeName(string text)
+            => string.Equals(text, "noinline", StringComparison.Ordinal) ||
+               string.Equals(text, "__noinline__", StringComparison.Ordinal);
+
         private QualifiedType ResolveTypedefName(SyntaxToken token)
         {
-            if (RVVectorType.TryParseBuiltinName(token.Text, out var vectorKind))
-                return _types.RiscVVector(vectorKind);
+            if (RVVectorType.TryParseBuiltinName(token.Text, out var vectorType))
+                return new QualifiedType(vectorType);
 
             if (_scope.LookupOrdinary(token.Text) is TypeAliasSymbol alias)
                 return alias.TargetType;

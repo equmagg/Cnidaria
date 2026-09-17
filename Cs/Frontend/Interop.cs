@@ -187,10 +187,10 @@ namespace Cnidaria.Cs
         public readonly int MethodId;
         public readonly HostMethod Handler;
 
-        public HostOverride(Cnidaria.Cs.RuntimeMethod method, HostMethod handler)
+        public HostOverride(Cnidaria.Cs.RuntimeMethod method, HostMethod handler, bool requireInternalCall = true)
         {
             if (method is null) throw new ArgumentNullException(nameof(method));
-            if (!method.HasInternalCall)
+            if (requireInternalCall && !method.HasInternalCall)
                 throw new InvalidOperationException($"Host override target must be marked InternalCall: {method.DeclaringType.Namespace}.{method.DeclaringType.Name}.{method.Name}");
             MethodId = method.MethodId;
             Handler = handler ?? throw new ArgumentNullException(nameof(handler));
@@ -206,6 +206,8 @@ namespace Cnidaria.Cs
         private readonly Cnidaria.Cs.RegisterBasedVm? _registerVm;
         private readonly Cnidaria.Cs.RuntimeTypeSystem _rts;
         private readonly IReadOnlyDictionary<string, Cnidaria.Cs.RuntimeModule> _modules;
+        private readonly string? _defaultOwnerAssembly;
+        private readonly string? _defaultOwnerTypeFullName;
 
         internal HostInterface(Cnidaria.Cs.StackBasedVm vm, Cnidaria.Cs.RuntimeTypeSystem rts, IReadOnlyDictionary<string, Cnidaria.Cs.RuntimeModule> modules)
         {
@@ -214,11 +216,18 @@ namespace Cnidaria.Cs
             _modules = modules ?? throw new ArgumentNullException(nameof(modules));
         }
 
-        internal HostInterface(Cnidaria.Cs.RegisterBasedVm vm, Cnidaria.Cs.RuntimeTypeSystem rts, IReadOnlyDictionary<string, Cnidaria.Cs.RuntimeModule> modules)
+        internal HostInterface(
+            Cnidaria.Cs.RegisterBasedVm vm,
+            Cnidaria.Cs.RuntimeTypeSystem rts,
+            IReadOnlyDictionary<string, Cnidaria.Cs.RuntimeModule> modules,
+            string? defaultOwnerAssembly = null,
+            string? defaultOwnerTypeFullName = null)
         {
             _registerVm = vm ?? throw new ArgumentNullException(nameof(vm));
             _rts = rts ?? throw new ArgumentNullException(nameof(rts));
             _modules = modules ?? throw new ArgumentNullException(nameof(modules));
+            _defaultOwnerAssembly = defaultOwnerAssembly;
+            _defaultOwnerTypeFullName = defaultOwnerTypeFullName;
         }
 
         /// <summary>Registers a typed host delegate for a static runtime method</summary>
@@ -243,6 +252,54 @@ namespace Cnidaria.Cs
             var stackRet = MapClrTypeToVmStack(returnType);
             var stackMethod = ResolveStaticMethodStack(assemblyName, typeFullName, methodName, stackParams, stackRet);
             RegisterHostOverride(new HostOverride(stackMethod, handler));
+        }
+
+        /// <summary>Registers a typed host delegate for a function of the engine's default owner type</summary>
+        public void OverrideFunction(string functionName, Delegate handler)
+        {
+            if (handler is null) throw new ArgumentNullException(nameof(handler));
+            var (assemblyName, typeFullName) = RequireDefaultOwner();
+            var sig = ExtractSignatureStack(handler);
+            var method = ResolveStaticMethodStack(assemblyName, typeFullName, functionName, sig.ParamTypes, sig.ReturnType, requireInternalCall: false);
+            RejectAggregateReturn(method);
+            RegisterHostOverride(new HostOverride(method, BuildWrapperStack(handler, sig, method), requireInternalCall: false));
+        }
+
+        /// <summary>Registers a raw host handler for a function of the engine's default owner type</summary>
+        /// <remarks>The function is resolved by name alone, so signatures that no host type can express are reachable too</remarks>
+        public void OverrideFunctionRaw(string functionName, HostMethod handler)
+        {
+            if (handler is null) throw new ArgumentNullException(nameof(handler));
+            var (assemblyName, typeFullName) = RequireDefaultOwner();
+            SplitTypeFullName(typeFullName, out var ns, out var name);
+            var owner = ResolveOwnerType(assemblyName, ns, name);
+            Cnidaria.Cs.RuntimeMethod? match = null;
+            for (int i = 0; i < owner.Methods.Length; i++)
+            {
+                var m = owner.Methods[i];
+                if (!m.IsStatic || m.HasThis || !StringComparer.Ordinal.Equals(m.Name, functionName)) continue;
+                if (match != null) throw new MissingMethodException($"Function '{functionName}' is ambiguous in '{typeFullName}'.");
+                match = m;
+            }
+            if (match is null) throw new MissingMethodException($"Function '{functionName}' not found in '{typeFullName}'.");
+            RejectAggregateReturn(match);
+            RegisterHostOverride(new HostOverride(match, handler, requireInternalCall: false));
+        }
+
+        /// <summary>Refuses targets whose aggregate return the source language and the VM place differently</summary>
+        private static void RejectAggregateReturn(Cnidaria.Cs.RuntimeMethod method)
+        {
+            var ret = method.ReturnType;
+            if (ret.Kind == Cnidaria.Cs.RuntimeTypeKind.Struct && ret.PrimitiveKind == Cnidaria.Cs.RuntimePrimitiveKind.None)
+                throw new NotSupportedException($"Host overrides cannot return the aggregate type of '{method.Name}'; return a pointer to it instead.");
+        }
+
+        /// <summary>Gets the owner type that unqualified function overrides resolve against</summary>
+        private (string AssemblyName, string TypeFullName) RequireDefaultOwner()
+        {
+            if (_defaultOwnerAssembly is null || _defaultOwnerTypeFullName is null)
+                throw new InvalidOperationException("This host interface has no default function owner; use OverrideStatic instead.");
+            return (_defaultOwnerAssembly, _defaultOwnerTypeFullName);
         }
         /// <summary>Installs an override in the active execution engine</summary>
         private void RegisterHostOverride(HostOverride ov)
@@ -334,9 +391,17 @@ namespace Cnidaria.Cs
             if (clr == typeof(ulong)) return unchecked((ulong)v.AsInt64());
             if (clr == typeof(double)) return v.AsDouble();
             if (clr == typeof(float)) return (float)v.AsDouble();
-            if (clr == typeof(IntPtr)) return _rts.Target.PointerSize == 8 ? new IntPtr(v.AsInt64()) : new IntPtr(v.AsInt32());
-            if (clr == typeof(UIntPtr)) return _rts.Target.PointerSize == 8 ? new UIntPtr(unchecked((ulong)v.AsInt64())) : new UIntPtr(unchecked((uint)v.AsInt32()));
+            if (clr == typeof(IntPtr)) return new IntPtr(ReadNativeInteger(ctx, v));
+            if (clr == typeof(UIntPtr)) return new UIntPtr(unchecked((ulong)ReadNativeInteger(ctx, v)));
             throw new NotSupportedException($"Host arg type not supported: {clr.FullName}");
+        }
+
+        /// <summary>Reads a numeric or address-like runtime value as a pointer-sized integer</summary>
+        private long ReadNativeInteger(VmCallContext ctx, VmValue v)
+        {
+            if (v.Kind is VmValueKind.Ptr or VmValueKind.ByRef or VmValueKind.Ref)
+                return ctx.GetAddress(v);
+            return _rts.Target.PointerSize == 8 ? v.AsInt64() : v.AsInt32();
         }
         /// <summary>Creates an enum value from a normalized underlying value</summary>
         private static object CreateEnumValue(Type enumType, object raw)
@@ -434,6 +499,13 @@ namespace Cnidaria.Cs
                 }
                 return vmArr;
             }
+            if (IsAddressLikeRuntimeType(actualVmType) && (clr == typeof(IntPtr) || clr == typeof(UIntPtr)))
+            {
+                long address = clr == typeof(IntPtr)
+                    ? ((IntPtr)(retObj ?? IntPtr.Zero)).ToInt64()
+                    : unchecked((long)((UIntPtr)(retObj ?? UIntPtr.Zero)).ToUInt64());
+                return address == 0 ? VmValue.Null : new VmValue(VmValueKind.Ptr, address);
+            }
             return ConvertScalarRet(ctx, retObj, clr);
         }
 
@@ -471,18 +543,16 @@ namespace Cnidaria.Cs
 
 
         /// <summary>Resolves a unique static internal method compatible with the requested signature</summary>
-        private Cnidaria.Cs.RuntimeMethod ResolveStaticMethodStack(string assemblyName, string typeFullName, string methodName, Cnidaria.Cs.RuntimeType[] ps, Cnidaria.Cs.RuntimeType ret)
+        private Cnidaria.Cs.RuntimeMethod ResolveStaticMethodStack(string assemblyName, string typeFullName, string methodName, Cnidaria.Cs.RuntimeType[] ps, Cnidaria.Cs.RuntimeType ret, bool requireInternalCall = true)
         {
-            if (!_modules.TryGetValue(assemblyName, out var mod)) throw new TypeLoadException($"Module '{assemblyName}' not loaded.");
             SplitTypeFullName(typeFullName, out var ns, out var name);
-            if (!mod.TypeDefByFullName.TryGetValue((ns, name), out var typeDefTok)) throw new TypeLoadException($"Type '{ns}.{name}' not found in '{assemblyName}'.");
-            var owner = _rts.ResolveType(mod, typeDefTok);
+            var owner = ResolveOwnerType(assemblyName, ns, name);
             Cnidaria.Cs.RuntimeMethod? match = null;
             int bestScore = int.MaxValue;
             for (int i = 0; i < owner.Methods.Length; i++)
             {
                 var m = owner.Methods[i];
-                if (!m.IsStatic || m.HasThis || !m.HasInternalCall || !StringComparer.Ordinal.Equals(m.Name, methodName) || m.ParameterTypes.Length != ps.Length) continue;
+                if (!m.IsStatic || m.HasThis || (requireInternalCall && !m.HasInternalCall) || !StringComparer.Ordinal.Equals(m.Name, methodName) || m.ParameterTypes.Length != ps.Length) continue;
                 if (!TryGetHostTypeMatchCostStack(m.ReturnType, ret, out int score)) continue;
                 bool ok = true;
                 for (int p = 0; p < ps.Length; p++)
@@ -497,15 +567,37 @@ namespace Cnidaria.Cs
             return match ?? throw new MissingMethodException($"Static method '{typeFullName}.{methodName}' not found or ambiguous in '{assemblyName}'.");
         }
 
-        /// <summary>Ranks exact type matches before enum-underlying matches</summary>
+        /// <summary>Resolves the declaring type of an override target from metadata or from synthetic registrations</summary>
+        private Cnidaria.Cs.RuntimeType ResolveOwnerType(string assemblyName, string ns, string name)
+        {
+            if (_modules.TryGetValue(assemblyName, out var mod) && mod.TypeDefByFullName.TryGetValue((ns, name), out var typeDefTok))
+                return _rts.ResolveType(mod, typeDefTok);
+            try
+            {
+                return _rts.GetRequiredNamedType(assemblyName, ns, name);
+            }
+            catch (Exception exception)
+            {
+                throw new TypeLoadException($"Type '{ns}.{name}' not found in '{assemblyName}'.", exception);
+            }
+        }
+
+        /// <summary>Ranks exact type matches before enum-underlying and native-integer matches</summary>
         private bool TryGetHostTypeMatchCostStack(Cnidaria.Cs.RuntimeType actual, Cnidaria.Cs.RuntimeType requested, out int cost)
         {
             if (actual.TypeId == requested.TypeId) { cost = 0; return true; }
             if (actual.Kind == Cnidaria.Cs.RuntimeTypeKind.Enum && actual.ElementType != null && actual.ElementType.TypeId == requested.TypeId) { cost = 1; return true; }
             if (requested.Kind == Cnidaria.Cs.RuntimeTypeKind.Enum && requested.ElementType != null && requested.ElementType.TypeId == actual.TypeId) { cost = 1; return true; }
+            if (IsAddressLikeRuntimeType(actual) && IsNativeIntegerRuntimeType(requested)) { cost = 2; return true; }
             cost = 0;
             return false;
         }
+
+        private static bool IsAddressLikeRuntimeType(Cnidaria.Cs.RuntimeType type)
+            => type.Kind is Cnidaria.Cs.RuntimeTypeKind.Pointer or Cnidaria.Cs.RuntimeTypeKind.FunctionPointer or Cnidaria.Cs.RuntimeTypeKind.ByRef;
+
+        private static bool IsNativeIntegerRuntimeType(Cnidaria.Cs.RuntimeType type)
+            => type.Namespace == "System" && (type.Name == "IntPtr" || type.Name == "UIntPtr");
 
 
         /// <summary>Maps a supported host type to its runtime type</summary>

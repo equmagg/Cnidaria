@@ -734,8 +734,8 @@ namespace Cnidaria.C
                 case BuiltinType builtin:
                     return GetPrimitiveLayout(builtin.BuiltinKind).Size;
 
-                case RVVectorType:
-                    return Math.Max(1, TargetRegisterInfo.VectorRegisterSize(this));
+                case RVVectorType vector:
+                    return Math.Max(1, TargetRegisterInfo.VectorRegisterSize(this) * vector.RegisterCount);
 
                 case PointerType:
                     return PointerSize;
@@ -1044,90 +1044,119 @@ namespace Cnidaria.C
         }
     }
 
-    /// <summary>Identifies a supported scalable vector built-in type</summary>
-    public enum RVVectorTypeKind : byte
-    {
-        Bool64,
-        Bool32,
-        Bool16,
-        Bool8,
-        Int8M1,
-        UInt8M1,
-        Int16M1,
-        UInt16M1,
-        Int32M1,
-        UInt32M1,
-        Int64M1,
-        UInt64M1,
-        Float32M1,
-        Float64M1
-    }
-
     /// <summary>Describes a scalable vector built-in and its element properties</summary>
     public sealed class RVVectorType : CType
     {
-        public RVVectorTypeKind VectorKind { get; }
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, RVVectorType?> Cache = new(StringComparer.Ordinal);
+
         public int ElementWidth { get; }
+        public int LengthMultiplierLog2 { get; }
         public bool IsMask { get; }
         public bool IsFloating { get; }
         public bool IsUnsigned { get; }
         public string BuiltinName { get; }
 
+        /// <summary>Counts the fields a segment tuple holds, which is one for a plain vector</summary>
+        public int SegmentCount { get; }
+
+        /// <summary>Counts the vector registers one field of this type occupies</summary>
+        public int FieldRegisterCount => IsMask || LengthMultiplierLog2 <= 0 ? 1 : 1 << LengthMultiplierLog2;
+
+        /// <summary>Counts the vector registers one value of this type occupies</summary>
+        public int RegisterCount => SegmentCount * FieldRegisterCount;
+
         public override TypeKind Kind => TypeKind.Vector;
 
-        public RVVectorType(RVVectorTypeKind kind)
+        private RVVectorType(string builtinName, int elementWidth, int lengthMultiplierLog2, bool isMask, bool isFloating, bool isUnsigned, int segmentCount = 1)
         {
-            VectorKind = kind;
-            (ElementWidth, IsMask, IsFloating, IsUnsigned, BuiltinName) = kind switch
-            {
-                RVVectorTypeKind.Bool64 => (1, true, false, false, "__rvv_bool64_t"),
-                RVVectorTypeKind.Bool32 => (1, true, false, false, "__rvv_bool32_t"),
-                RVVectorTypeKind.Bool16 => (1, true, false, false, "__rvv_bool16_t"),
-                RVVectorTypeKind.Bool8 => (1, true, false, false, "__rvv_bool8_t"),
-                RVVectorTypeKind.Int8M1 => (8, false, false, false, "__rvv_int8m1_t"),
-                RVVectorTypeKind.UInt8M1 => (8, false, false, true, "__rvv_uint8m1_t"),
-                RVVectorTypeKind.Int16M1 => (16, false, false, false, "__rvv_int16m1_t"),
-                RVVectorTypeKind.UInt16M1 => (16, false, false, true, "__rvv_uint16m1_t"),
-                RVVectorTypeKind.Int32M1 => (32, false, false, false, "__rvv_int32m1_t"),
-                RVVectorTypeKind.UInt32M1 => (32, false, false, true, "__rvv_uint32m1_t"),
-                RVVectorTypeKind.Int64M1 => (64, false, false, false, "__rvv_int64m1_t"),
-                RVVectorTypeKind.UInt64M1 => (64, false, false, true, "__rvv_uint64m1_t"),
-                RVVectorTypeKind.Float32M1 => (32, false, true, false, "__rvv_float32m1_t"),
-                RVVectorTypeKind.Float64M1 => (64, false, true, false, "__rvv_float64m1_t"),
-                _ => throw new ArgumentOutOfRangeException(nameof(kind)),
-            };
+            BuiltinName = builtinName;
+            ElementWidth = elementWidth;
+            LengthMultiplierLog2 = lengthMultiplierLog2;
+            IsMask = isMask;
+            IsFloating = isFloating;
+            IsUnsigned = isUnsigned;
+            SegmentCount = segmentCount;
         }
 
         public override string ToDisplayString()
             => BuiltinName;
 
-        /// <summary>Maps a vector built-in name to its semantic kind</summary>
-        public static bool TryParseBuiltinName(string name, out RVVectorTypeKind kind)
-        {
-            kind = name switch
-            {
-                "__rvv_bool64_t" => RVVectorTypeKind.Bool64,
-                "__rvv_bool32_t" => RVVectorTypeKind.Bool32,
-                "__rvv_bool16_t" => RVVectorTypeKind.Bool16,
-                "__rvv_bool8_t" => RVVectorTypeKind.Bool8,
-                "__rvv_int8m1_t" => RVVectorTypeKind.Int8M1,
-                "__rvv_uint8m1_t" => RVVectorTypeKind.UInt8M1,
-                "__rvv_int16m1_t" => RVVectorTypeKind.Int16M1,
-                "__rvv_uint16m1_t" => RVVectorTypeKind.UInt16M1,
-                "__rvv_int32m1_t" => RVVectorTypeKind.Int32M1,
-                "__rvv_uint32m1_t" => RVVectorTypeKind.UInt32M1,
-                "__rvv_int64m1_t" => RVVectorTypeKind.Int64M1,
-                "__rvv_uint64m1_t" => RVVectorTypeKind.UInt64M1,
-                "__rvv_float32m1_t" => RVVectorTypeKind.Float32M1,
-                "__rvv_float64m1_t" => RVVectorTypeKind.Float64M1,
-                _ => default,
-            };
+        /// <summary>Tests whether an identifier names a vector built-in</summary>
+        public static bool IsBuiltinName(string name)
+            => Parse(name) is not null;
 
-            return name is "__rvv_bool64_t" or "__rvv_bool32_t" or "__rvv_bool16_t" or "__rvv_bool8_t"
-                or "__rvv_int8m1_t" or "__rvv_uint8m1_t" or "__rvv_int16m1_t" or "__rvv_uint16m1_t"
-                or "__rvv_int32m1_t" or "__rvv_uint32m1_t" or "__rvv_int64m1_t" or "__rvv_uint64m1_t"
-                or "__rvv_float32m1_t" or "__rvv_float64m1_t";
+        /// <summary>Maps a vector built-in name to its canonical type</summary>
+        public static bool TryParseBuiltinName(string name, out RVVectorType type)
+        {
+            type = Parse(name)!;
+            return type is not null;
         }
+
+        private static RVVectorType? Parse(string name)
+            => name is null ? null : Cache.GetOrAdd(name, static candidate => Create(candidate));
+
+        private static RVVectorType? Create(string name)
+        {
+            if (!name.StartsWith("__rvv_", StringComparison.Ordinal) || !name.EndsWith("_t", StringComparison.Ordinal))
+                return null;
+
+            var body = name.Substring("__rvv_".Length, name.Length - "__rvv_".Length - "_t".Length);
+            if (body.StartsWith("bool", StringComparison.Ordinal))
+            {
+                return TryParseUnsigned(body.Substring("bool".Length), out var ratio) && ratio is 1 or 2 or 4 or 8 or 16 or 32 or 64
+                    ? new RVVectorType(name, 1, 0, isMask: true, isFloating: false, isUnsigned: true)
+                    : null;
+            }
+
+            bool floating = body.StartsWith("float", StringComparison.Ordinal);
+            bool unsigned = body.StartsWith("uint", StringComparison.Ordinal);
+            var prefix = floating ? "float" : unsigned ? "uint" : "int";
+            if (!body.StartsWith(prefix, StringComparison.Ordinal))
+                return null;
+
+            var multiplierIndex = body.IndexOf('m', prefix.Length);
+            if (multiplierIndex < 0)
+                return null;
+
+            if (!TryParseUnsigned(body.Substring(prefix.Length, multiplierIndex - prefix.Length), out var elementWidth))
+                return null;
+            if (elementWidth is not (8 or 16 or 32 or 64) || (floating && elementWidth is not (32 or 64)))
+                return null;
+
+            var multiplier = body.Substring(multiplierIndex + 1);
+            // A segment tuple spells the count of fields it holds after its length multiplier
+            var segments = 1;
+            var segmentIndex = multiplier.IndexOf('x');
+            if (segmentIndex >= 0)
+            {
+                if (!TryParseUnsigned(multiplier.Substring(segmentIndex + 1), out segments) || segments is < 2 or > 8)
+                    return null;
+                multiplier = multiplier.Substring(0, segmentIndex);
+            }
+
+            var fractional = multiplier.StartsWith("f", StringComparison.Ordinal);
+            if (!TryParseUnsigned(fractional ? multiplier.Substring(1) : multiplier, out var scale) || scale is not (1 or 2 or 4 or 8))
+                return null;
+            if (fractional && scale == 1)
+                return null;
+
+            var log2 = System.Numerics.BitOperations.Log2((uint)scale);
+            if (fractional)
+                log2 = -log2;
+
+            // A group must hold at least one element and no more than ELEN of them
+            var elementsPerGroup = log2 <= 0 ? elementWidth << -log2 : elementWidth >> log2;
+            if (elementsPerGroup is < 1 or > 64)
+                return null;
+
+            if (segments * (log2 <= 0 ? 1 : 1 << log2) > 8)
+                return null;
+
+            return new RVVectorType(name, elementWidth, log2, isMask: false, isFloating: floating, isUnsigned: unsigned, segments);
+        }
+
+        private static bool TryParseUnsigned(string text, out int value)
+            => int.TryParse(text, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out value);
     }
 
     /// <summary>Represents a pointer to a qualified type</summary>
@@ -1272,21 +1301,6 @@ namespace Cnidaria.C
         public BuiltinType Double { get; } = new BuiltinType(BuiltinTypeKind.Double);
         public BuiltinType LongDouble { get; } = new BuiltinType(BuiltinTypeKind.LongDouble);
 
-        public RVVectorType RiscVBool64 { get; } = new RVVectorType(RVVectorTypeKind.Bool64);
-        public RVVectorType RiscVBool32 { get; } = new RVVectorType(RVVectorTypeKind.Bool32);
-        public RVVectorType RiscVBool16 { get; } = new RVVectorType(RVVectorTypeKind.Bool16);
-        public RVVectorType RiscVBool8 { get; } = new RVVectorType(RVVectorTypeKind.Bool8);
-        public RVVectorType RiscVInt8M1 { get; } = new RVVectorType(RVVectorTypeKind.Int8M1);
-        public RVVectorType RiscVUInt8M1 { get; } = new RVVectorType(RVVectorTypeKind.UInt8M1);
-        public RVVectorType RiscVInt16M1 { get; } = new RVVectorType(RVVectorTypeKind.Int16M1);
-        public RVVectorType RiscVUInt16M1 { get; } = new RVVectorType(RVVectorTypeKind.UInt16M1);
-        public RVVectorType RiscVInt32M1 { get; } = new RVVectorType(RVVectorTypeKind.Int32M1);
-        public RVVectorType RiscVUInt32M1 { get; } = new RVVectorType(RVVectorTypeKind.UInt32M1);
-        public RVVectorType RiscVInt64M1 { get; } = new RVVectorType(RVVectorTypeKind.Int64M1);
-        public RVVectorType RiscVUInt64M1 { get; } = new RVVectorType(RVVectorTypeKind.UInt64M1);
-        public RVVectorType RiscVFloat32M1 { get; } = new RVVectorType(RVVectorTypeKind.Float32M1);
-        public RVVectorType RiscVFloat64M1 { get; } = new RVVectorType(RVVectorTypeKind.Float64M1);
-
         private TypeCatalog() { }
 
         /// <summary>Creates a pointer type</summary>
@@ -1349,29 +1363,6 @@ namespace Cnidaria.C
             }
         }
 
-        /// <summary>Gets a qualified canonical vector built-in type</summary>
-        public QualifiedType RiscVVector(RVVectorTypeKind kind, TypeQualifiers qualifiers = TypeQualifiers.None)
-        {
-            var type = kind switch
-            {
-                RVVectorTypeKind.Bool64 => RiscVBool64,
-                RVVectorTypeKind.Bool32 => RiscVBool32,
-                RVVectorTypeKind.Bool16 => RiscVBool16,
-                RVVectorTypeKind.Bool8 => RiscVBool8,
-                RVVectorTypeKind.Int8M1 => RiscVInt8M1,
-                RVVectorTypeKind.UInt8M1 => RiscVUInt8M1,
-                RVVectorTypeKind.Int16M1 => RiscVInt16M1,
-                RVVectorTypeKind.UInt16M1 => RiscVUInt16M1,
-                RVVectorTypeKind.Int32M1 => RiscVInt32M1,
-                RVVectorTypeKind.UInt32M1 => RiscVUInt32M1,
-                RVVectorTypeKind.Int64M1 => RiscVInt64M1,
-                RVVectorTypeKind.UInt64M1 => RiscVUInt64M1,
-                RVVectorTypeKind.Float32M1 => RiscVFloat32M1,
-                RVVectorTypeKind.Float64M1 => RiscVFloat64M1,
-                _ => throw new ArgumentOutOfRangeException(nameof(kind)),
-            };
-            return new QualifiedType(type, qualifiers);
-        }
     }
 
 

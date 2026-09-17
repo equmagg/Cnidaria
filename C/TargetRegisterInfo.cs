@@ -455,12 +455,21 @@ namespace Cnidaria.C
                 return target.HasFeature(TargetArchitectureFeatures.X86Avx) ? 32 : 16;
 
             if (target.IsRiscV && target.HasFeature(TargetArchitectureFeatures.RiscVV))
-                return 16;
+                return Cnidaria.RiscV.RVVector.RegisterBytes;
 
             if (target.Architecture == TargetArchitectureKind.Arm64 || (target.Architecture == TargetArchitectureKind.Arm32 && target.HasFeature(TargetArchitectureFeatures.ArmNeon)))
                 return 16;
 
             return 0;
+        }
+
+        /// <summary>Counts the consecutive physical registers one value of a type occupies</summary>
+        public static int RegisterGroupCount(TargetInfo target, QualifiedType type)
+        {
+            if (target is null)
+                throw new ArgumentNullException(nameof(target));
+
+            return type.Type is RVVectorType vector ? vector.RegisterCount : 1;
         }
 
         public static LirRegisterClass PreferredFloatingPointRegisterClass(TargetInfo target, QualifiedType type, bool isVariadicUnnamedArgument)
@@ -683,7 +692,7 @@ namespace Cnidaria.C
                     : Range(MachineRegister.V0, 16);
 
             if (target.IsRiscV && target.HasFeature(TargetArchitectureFeatures.RiscVV))
-                return Range(MachineRegister.V0, 28);
+                return Range(MachineRegister.V0, 32);
 
             if (target.Architecture == TargetArchitectureKind.Arm64)
                 return Range(MachineRegister.V0, 32);

@@ -70,6 +70,7 @@ namespace Cnidaria.C
     {
         public static ImmutableArray<SourceFile> CreateFiles()
             => ImmutableArray.Create(
+                new SourceFile("C/StandardLibrary/libc.c", ReadEmbeddedText("libc.c")),
                 new SourceFile("C/StandardLibrary/stdio.c", ReadEmbeddedText("stdio.c")),
                 new SourceFile("C/StandardLibrary/stdlib.c", ReadEmbeddedText("stdlib.c")),
                 new SourceFile("C/StandardLibrary/string.c", ReadEmbeddedText("string.c")));

@@ -5,6 +5,16 @@ typedef unsigned long long u64;
 typedef signed long long s64;
 typedef unsigned long usize;
 
+#if __riscv_vector
+/* Declared here rather than included: the kernel is freestanding */
+typedef __rvv_uint8m8_t vuint8m8_t;
+u64 __riscv_vsetvl_e8m8(u64 avl);
+vuint8m8_t __riscv_vle8_v_u8m8(const u8* rs1, u64 vl);
+void __riscv_vse8_v_u8m8(u8* rs1, vuint8m8_t vs3, u64 vl);
+vuint8m8_t __riscv_vmv_v_i_u8m8(int simm5, u64 vl);
+u64 __riscv_vsetvlmax_e8m8(void);
+#endif
+
 #define NULL ((void*)0)
 #define RAM_BASE 0x80000000ul
 #define RAM_LIMIT 0x88000000ul
@@ -16,6 +26,12 @@ typedef unsigned long usize;
 #define KERNEL_STACK_RESERVE_SIZE 0x00400000ul
 #define USER_ELF_BUFFER 0x82000000ul
 #define USER_ELF_BUFFER_SIZE 0x01000000ul
+#define USER_INTERP_BUFFER 0x83000000ul
+#define USER_INTERP_BUFFER_SIZE 0x00400000ul
+#define USER_MMAP_BASE 0x3000000000ul
+#define USER_HOST_BRIDGE_BASE 0x2F00000000ul
+#define USER_FRAMEBUFFER_BASE 0x2E00000000ul
+#define HOST_BRIDGE_WINDOW_SIZE 0x1000ul
 #define USER_STACK_TOP 0x4000000000ul
 #define USER_STACK_SIZE 0x00100000ul
 #define USER_VA_LIMIT 0x4000000000ul
@@ -32,6 +48,9 @@ typedef unsigned long usize;
 #define PTE_D 0x080ul
 #define PTE_SOFT_NOACCESS 0x100ul
 #define SATP_MODE_SV39 0x8000000000000000ul
+#define ELF_PT_LOAD 1u
+#define ELF_PT_INTERP 3u
+#define ELF_PT_PHDR 6u
 #define ELF_PF_X 1u
 #define ELF_PF_W 2u
 #define ELF_PF_R 4u
@@ -92,6 +111,9 @@ typedef unsigned long usize;
 #define AT_PHENT 4ul
 #define AT_PHNUM 5ul
 #define AT_PHDR 3ul
+#define AT_BASE 7ul
+#define AT_HOST_BRIDGE 0x1000ul
+#define AT_FRAMEBUFFER 0x1001ul
 #define MAX_OPEN_FILES 32u
 #define PATH_BUFFER_SIZE 128u
 #define VFS_NODE_NONE 0u
@@ -128,6 +150,8 @@ typedef unsigned long usize;
 #define TCSETSW 0x5403ul
 #define TCSETSF 0x5404ul
 #define MAX_PROCESSES 16u
+#define TRAP_FRAME_VECTOR_WORDS 256u
+#define MAX_VECTOR_REGISTER_BYTES 64u
 #define MAX_VM_REGIONS 64u
 #define MAX_EXEC_ARGS 16u
 #define MAX_EXEC_ARG_BYTES 512u
@@ -165,6 +189,11 @@ struct trap_frame
     u64 sstatus;
     u64 scause;
     u64 stval;
+    u64 vtype;
+    u64 vl;
+    u64 vstart;
+    u64 vreserved;
+    u64 v[TRAP_FRAME_VECTOR_WORDS];
 };
 
 struct boot_device
@@ -173,6 +202,10 @@ struct boot_device
     u64 uart_base;
     u64 ram_base;
     u64 ram_size;
+    u64 host_bridge_base;
+    u64 framebuffer_base;
+    u64 framebuffer_size;
+    u64 framebuffer_window;
 };
 
 struct fat32_volume
@@ -188,10 +221,13 @@ struct fat32_volume
 struct elf_image
 {
     u64 entry;
+    u64 start_entry;
+    u64 interp_base;
     u64 phdr;
     u64 phent;
     u64 phnum;
     u64 brk_start;
+    char interp[PATH_BUFFER_SIZE];
 };
 
 struct exec_arguments
@@ -275,6 +311,7 @@ extern void kernel_enter_user(u64 entry, u64 stack);
 static struct boot_device boot_device;
 static struct fat32_volume boot_volume;
 static u64 kernel_root_page_table;
+static u64 device_root_page_table;
 static u64 current_user_root_page_table;
 static u64 free_page_cursor;
 static u64 free_page_end;
@@ -290,6 +327,9 @@ static struct virtio_block_request virtio_request;
 static u8 sector_buffer[SECTOR_SIZE];
 static u8 fat_buffer[SECTOR_SIZE];
 static u8 dir_buffer[SECTOR_SIZE];
+
+/* A directory record is built somewhere else, so that it does not overwrite the sector the walk is reading */
+static u8 dirent_buffer[64];
 static u32 fat_buffer_lba;
 static u32 dir_buffer_lba;
 static u64 fat_buffer_valid;
@@ -310,6 +350,7 @@ static int vfs_lookup(const char* path, struct vfs_node* node);
 static int fat_read_path_to_memory(const char* path, void* destination, u32 max_size, u32* out_size);
 static int fat_read_at(struct vfs_node* node, u64 offset, void* destination, u32 count, u32* read_count);
 static int load_elf64(const u8* image, u32 image_size, u64 root, struct elf_image* loaded);
+static int load_process_image(u64 root, const u8* image, u32 image_size, struct elf_image* loaded);
 static s64 capture_exec_arguments(u64 argv, const char* fallback, struct exec_arguments* arguments);
 static int make_kernel_arguments(const char* path, struct exec_arguments* arguments);
 static int build_user_stack(u64 root, struct elf_image* image, struct exec_arguments* arguments, u64* out_stack);
@@ -375,6 +416,8 @@ static void sbi_system_reset(u64 reset_type, u64 reset_reason)
     __asm__ volatile("ecall" : : [arg0] "{a0}"(reset_type), [arg1] "{a1}"(reset_reason), [fid] "{a6}"(fid), [eid] "{a7}"(eid) : "memory");
 }
 
+static void fbcon_putchar(int ch);
+
 static int uart_can_read(void)
 {
     u64 value = boot_device.uart_base;
@@ -435,9 +478,16 @@ static void uart_putchar(int ch)
         : "memory");
 }
 
+/* What a program writes reaches the screen as well; what the kernel says stays on the serial line */
 static void uart_write_buffer(const u8* data, u64 count)
 {
     u64 base = boot_device.uart_base;
+    u64 drawn = 0ul;
+    while (drawn < count)
+    {
+        fbcon_putchar((int)data[drawn]);
+        drawn = drawn + 1ul;
+    }
     __asm__ volatile(
         "beq %[count], zero, .Luart_write_done_%=\n"
         ".Luart_write_next_%=:\n"
@@ -558,20 +608,14 @@ static void mem_copy(void* dst, const void* src, u64 count)
     const u8* s = (const u8*)src;
 
 #if __riscv_vector
-    __asm__ volatile(
-        "beq %[count], zero, .Lmem_copy_done_%=\n"
-        ".Lmem_copy_loop_%=:\n"
-        "vsetvli a3, %[count], e8, m8, ta, ma\n"
-        "vle8.v v8, (%[src])\n"
-        "vse8.v v8, (%[dst])\n"
-        "add %[dst], %[dst], a3\n"
-        "add %[src], %[src], a3\n"
-        "sub %[count], %[count], a3\n"
-        "bne %[count], zero, .Lmem_copy_loop_%=\n"
-        ".Lmem_copy_done_%=:"
-        :
-    : [dst] "{a0}"(d), [src] "{a1}"(s), [count] "{a2}"(count)
-        : "memory");
+    while (count != 0ul)
+    {
+        u64 vl = __riscv_vsetvl_e8m8(count);
+        __riscv_vse8_v_u8m8(d, __riscv_vle8_v_u8m8(s, vl), vl);
+        d = d + vl;
+        s = s + vl;
+        count = count - vl;
+    }
 #else
     while (count != 0ul && ((((u64)d | (u64)s) & 7ul) != 0ul))
     {
@@ -625,20 +669,14 @@ static void mem_zero(void* dst, u64 count)
     u8* bytes = (u8*)dst;
 
 #if __riscv_vector
-    __asm__ volatile(
-        "beq %[count], zero, .Lmem_zero_done_%=\n"
-        "vsetvli a2, zero, e8, m8, ta, ma\n"
-        "vxor.vv v8, v8, v8\n"
-        ".Lmem_zero_loop_%=:\n"
-        "vsetvli a2, %[count], e8, m8, ta, ma\n"
-        "vse8.v v8, (%[dst])\n"
-        "add %[dst], %[dst], a2\n"
-        "sub %[count], %[count], a2\n"
-        "bne %[count], zero, .Lmem_zero_loop_%=\n"
-        ".Lmem_zero_done_%=:"
-        :
-    : [dst] "{a0}"(bytes), [count] "{a1}"(count)
-        : "memory");
+    vuint8m8_t zero = __riscv_vmv_v_i_u8m8(0, __riscv_vsetvlmax_e8m8());
+    while (count != 0ul)
+    {
+        u64 vl = __riscv_vsetvl_e8m8(count);
+        __riscv_vse8_v_u8m8(bytes, zero, vl);
+        bytes = bytes + vl;
+        count = count - vl;
+    }
 #else
     while (count != 0ul && (((u64)bytes & 7ul) != 0ul))
     {
@@ -665,6 +703,227 @@ static void mem_zero(void* dst, u64 count)
         count = count - 1ul;
     }
 #endif
+}
+
+/* The console the guest can see: the same glyphs the framebuffer library draws, drawn by the kernel */
+#define FBCON_GLYPH_WIDTH 8ul
+#define FBCON_GLYPH_HEIGHT 8ul
+#define FBCON_FIRST_GLYPH 32u
+#define FBCON_LAST_GLYPH 126u
+#define FBCON_MAGIC 0x465542454D415246ul
+#define FBCON_FOREGROUND 0x00C8D0D8u
+
+static const u8 fbcon_font[(FBCON_LAST_GLYPH - FBCON_FIRST_GLYPH + 1u) * FBCON_GLYPH_HEIGHT] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /*   */
+    0x10, 0x10, 0x10, 0x10, 0x10, 0x00, 0x10, 0x00, /* ! */
+    0x28, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* " */
+    0x28, 0x28, 0x7C, 0x28, 0x7C, 0x28, 0x28, 0x00, /* # */
+    0x10, 0x3C, 0x50, 0x38, 0x14, 0x78, 0x10, 0x00, /* $ */
+    0x60, 0x64, 0x08, 0x10, 0x20, 0x4C, 0x0C, 0x00, /* % */
+    0x30, 0x48, 0x50, 0x20, 0x54, 0x48, 0x34, 0x00, /* & */
+    0x10, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, /* ' */
+    0x08, 0x10, 0x20, 0x20, 0x20, 0x10, 0x08, 0x00, /* ( */
+    0x20, 0x10, 0x08, 0x08, 0x08, 0x10, 0x20, 0x00, /* ) */
+    0x00, 0x10, 0x54, 0x38, 0x54, 0x10, 0x00, 0x00, /* * */
+    0x00, 0x10, 0x10, 0x7C, 0x10, 0x10, 0x00, 0x00, /* + */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x20, /* , */
+    0x00, 0x00, 0x00, 0x7C, 0x00, 0x00, 0x00, 0x00, /* - */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, /* . */
+    0x04, 0x08, 0x08, 0x10, 0x20, 0x20, 0x40, 0x00, /* / */
+    0x38, 0x44, 0x4C, 0x54, 0x64, 0x44, 0x38, 0x00, /* 0 */
+    0x10, 0x30, 0x10, 0x10, 0x10, 0x10, 0x38, 0x00, /* 1 */
+    0x38, 0x44, 0x04, 0x08, 0x10, 0x20, 0x7C, 0x00, /* 2 */
+    0x7C, 0x08, 0x10, 0x08, 0x04, 0x44, 0x38, 0x00, /* 3 */
+    0x08, 0x18, 0x28, 0x48, 0x7C, 0x08, 0x08, 0x00, /* 4 */
+    0x7C, 0x40, 0x78, 0x04, 0x04, 0x44, 0x38, 0x00, /* 5 */
+    0x18, 0x20, 0x40, 0x78, 0x44, 0x44, 0x38, 0x00, /* 6 */
+    0x7C, 0x04, 0x08, 0x10, 0x20, 0x20, 0x20, 0x00, /* 7 */
+    0x38, 0x44, 0x44, 0x38, 0x44, 0x44, 0x38, 0x00, /* 8 */
+    0x38, 0x44, 0x44, 0x3C, 0x04, 0x08, 0x30, 0x00, /* 9 */
+    0x00, 0x00, 0x10, 0x00, 0x00, 0x10, 0x00, 0x00, /* : */
+    0x00, 0x00, 0x10, 0x00, 0x00, 0x10, 0x10, 0x20, /* ; */
+    0x08, 0x10, 0x20, 0x40, 0x20, 0x10, 0x08, 0x00, /* < */
+    0x00, 0x00, 0x7C, 0x00, 0x7C, 0x00, 0x00, 0x00, /* = */
+    0x20, 0x10, 0x08, 0x04, 0x08, 0x10, 0x20, 0x00, /* > */
+    0x38, 0x44, 0x04, 0x08, 0x10, 0x00, 0x10, 0x00, /* ? */
+    0x38, 0x44, 0x5C, 0x54, 0x5C, 0x40, 0x38, 0x00, /* @ */
+    0x38, 0x44, 0x44, 0x7C, 0x44, 0x44, 0x44, 0x00, /* A */
+    0x78, 0x44, 0x44, 0x78, 0x44, 0x44, 0x78, 0x00, /* B */
+    0x38, 0x44, 0x40, 0x40, 0x40, 0x44, 0x38, 0x00, /* C */
+    0x70, 0x48, 0x44, 0x44, 0x44, 0x48, 0x70, 0x00, /* D */
+    0x7C, 0x40, 0x40, 0x78, 0x40, 0x40, 0x7C, 0x00, /* E */
+    0x7C, 0x40, 0x40, 0x78, 0x40, 0x40, 0x40, 0x00, /* F */
+    0x38, 0x44, 0x40, 0x5C, 0x44, 0x44, 0x3C, 0x00, /* G */
+    0x44, 0x44, 0x44, 0x7C, 0x44, 0x44, 0x44, 0x00, /* H */
+    0x38, 0x10, 0x10, 0x10, 0x10, 0x10, 0x38, 0x00, /* I */
+    0x1C, 0x08, 0x08, 0x08, 0x08, 0x48, 0x30, 0x00, /* J */
+    0x44, 0x48, 0x50, 0x60, 0x50, 0x48, 0x44, 0x00, /* K */
+    0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x7C, 0x00, /* L */
+    0x44, 0x6C, 0x54, 0x54, 0x44, 0x44, 0x44, 0x00, /* M */
+    0x44, 0x64, 0x54, 0x4C, 0x44, 0x44, 0x44, 0x00, /* N */
+    0x38, 0x44, 0x44, 0x44, 0x44, 0x44, 0x38, 0x00, /* O */
+    0x78, 0x44, 0x44, 0x78, 0x40, 0x40, 0x40, 0x00, /* P */
+    0x38, 0x44, 0x44, 0x44, 0x54, 0x48, 0x34, 0x00, /* Q */
+    0x78, 0x44, 0x44, 0x78, 0x50, 0x48, 0x44, 0x00, /* R */
+    0x3C, 0x40, 0x40, 0x38, 0x04, 0x04, 0x78, 0x00, /* S */
+    0x7C, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x00, /* T */
+    0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x38, 0x00, /* U */
+    0x44, 0x44, 0x44, 0x44, 0x44, 0x28, 0x10, 0x00, /* V */
+    0x44, 0x44, 0x44, 0x54, 0x54, 0x6C, 0x44, 0x00, /* W */
+    0x44, 0x44, 0x28, 0x10, 0x28, 0x44, 0x44, 0x00, /* X */
+    0x44, 0x44, 0x28, 0x10, 0x10, 0x10, 0x10, 0x00, /* Y */
+    0x7C, 0x04, 0x08, 0x10, 0x20, 0x40, 0x7C, 0x00, /* Z */
+    0x38, 0x20, 0x20, 0x20, 0x20, 0x20, 0x38, 0x00, /* [ */
+    0x40, 0x20, 0x20, 0x10, 0x08, 0x08, 0x04, 0x00, /* \\ */
+    0x38, 0x08, 0x08, 0x08, 0x08, 0x08, 0x38, 0x00, /* ] */
+    0x10, 0x28, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, /* ^ */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7C, /* _ */
+    0x20, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* ` */
+    0x00, 0x00, 0x38, 0x04, 0x3C, 0x44, 0x3C, 0x00, /* a */
+    0x40, 0x40, 0x78, 0x44, 0x44, 0x44, 0x78, 0x00, /* b */
+    0x00, 0x00, 0x38, 0x40, 0x40, 0x44, 0x38, 0x00, /* c */
+    0x04, 0x04, 0x3C, 0x44, 0x44, 0x44, 0x3C, 0x00, /* d */
+    0x00, 0x00, 0x38, 0x44, 0x7C, 0x40, 0x38, 0x00, /* e */
+    0x18, 0x24, 0x20, 0x70, 0x20, 0x20, 0x20, 0x00, /* f */
+    0x00, 0x00, 0x3C, 0x44, 0x44, 0x3C, 0x04, 0x38, /* g */
+    0x40, 0x40, 0x78, 0x44, 0x44, 0x44, 0x44, 0x00, /* h */
+    0x10, 0x00, 0x30, 0x10, 0x10, 0x10, 0x38, 0x00, /* i */
+    0x08, 0x00, 0x18, 0x08, 0x08, 0x08, 0x48, 0x30, /* j */
+    0x40, 0x40, 0x48, 0x50, 0x60, 0x50, 0x48, 0x00, /* k */
+    0x30, 0x10, 0x10, 0x10, 0x10, 0x10, 0x38, 0x00, /* l */
+    0x00, 0x00, 0x68, 0x54, 0x54, 0x54, 0x54, 0x00, /* m */
+    0x00, 0x00, 0x78, 0x44, 0x44, 0x44, 0x44, 0x00, /* n */
+    0x00, 0x00, 0x38, 0x44, 0x44, 0x44, 0x38, 0x00, /* o */
+    0x00, 0x00, 0x78, 0x44, 0x44, 0x78, 0x40, 0x40, /* p */
+    0x00, 0x00, 0x3C, 0x44, 0x44, 0x3C, 0x04, 0x04, /* q */
+    0x00, 0x00, 0x58, 0x64, 0x40, 0x40, 0x40, 0x00, /* r */
+    0x00, 0x00, 0x3C, 0x40, 0x38, 0x04, 0x78, 0x00, /* s */
+    0x20, 0x20, 0x70, 0x20, 0x20, 0x24, 0x18, 0x00, /* t */
+    0x00, 0x00, 0x44, 0x44, 0x44, 0x44, 0x3C, 0x00, /* u */
+    0x00, 0x00, 0x44, 0x44, 0x44, 0x28, 0x10, 0x00, /* v */
+    0x00, 0x00, 0x44, 0x54, 0x54, 0x54, 0x28, 0x00, /* w */
+    0x00, 0x00, 0x44, 0x28, 0x10, 0x28, 0x44, 0x00, /* x */
+    0x00, 0x00, 0x44, 0x44, 0x44, 0x3C, 0x04, 0x38, /* y */
+    0x00, 0x00, 0x7C, 0x08, 0x10, 0x20, 0x7C, 0x00, /* z */
+    0x18, 0x20, 0x20, 0x60, 0x20, 0x20, 0x18, 0x00, /* { */
+    0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x00, /* | */
+    0x30, 0x08, 0x08, 0x0C, 0x08, 0x08, 0x30, 0x00, /* } */
+    0x00, 0x00, 0x34, 0x4C, 0x00, 0x00, 0x00, 0x00, /* ~ */
+};
+
+static volatile u64* fbcon_registers;
+static u32* fbcon_pixels;
+static u64 fbcon_row_pixels;
+static u64 fbcon_columns;
+static u64 fbcon_rows;
+static u64 fbcon_column;
+static u64 fbcon_row;
+
+static void fbcon_init(void)
+{
+    volatile u64* registers;
+    if (boot_device.framebuffer_base == 0ul)
+        return;
+    registers = (volatile u64*)boot_device.framebuffer_base;
+    if (registers[0] != FBCON_MAGIC)
+        return;
+
+    fbcon_pixels = (u32*)(boot_device.framebuffer_base + registers[5]);
+    fbcon_row_pixels = registers[4] / 4ul;
+    fbcon_columns = registers[2] / FBCON_GLYPH_WIDTH;
+    fbcon_rows = registers[3] / FBCON_GLYPH_HEIGHT;
+    if (fbcon_columns == 0ul || fbcon_rows == 0ul)
+        return;
+
+    mem_zero(fbcon_pixels, registers[6]);
+    fbcon_registers = registers;
+    fbcon_registers[8] = 1ul;
+}
+
+static void fbcon_draw_glyph(u64 column, u64 row, u32 code)
+{
+    const u8* glyph;
+    u32* target;
+    u64 line = 0ul;
+
+    if (code < FBCON_FIRST_GLYPH || code > FBCON_LAST_GLYPH)
+        code = (u32)'?';
+    glyph = fbcon_font + (u64)(code - FBCON_FIRST_GLYPH) * FBCON_GLYPH_HEIGHT;
+    target = fbcon_pixels + row * FBCON_GLYPH_HEIGHT * fbcon_row_pixels + column * FBCON_GLYPH_WIDTH;
+
+    while (line < FBCON_GLYPH_HEIGHT)
+    {
+        u32 bits = (u32)glyph[line];
+        u64 pixel = 0ul;
+        while (pixel < FBCON_GLYPH_WIDTH)
+        {
+            target[pixel] = (bits & (0x80u >> pixel)) != 0u ? FBCON_FOREGROUND : 0u;
+            pixel = pixel + 1ul;
+        }
+        target = target + fbcon_row_pixels;
+        line = line + 1ul;
+    }
+}
+
+static void fbcon_newline(void)
+{
+    u64 kept;
+    u64 shift;
+    fbcon_column = 0ul;
+    fbcon_row = fbcon_row + 1ul;
+    if (fbcon_row < fbcon_rows)
+        return;
+
+    /* The screen is full, so everything moves up by one row of glyphs */
+    fbcon_row = fbcon_rows - 1ul;
+    kept = (fbcon_rows - 1ul) * FBCON_GLYPH_HEIGHT * fbcon_row_pixels;
+    shift = FBCON_GLYPH_HEIGHT * fbcon_row_pixels;
+    mem_copy(fbcon_pixels, fbcon_pixels + shift, kept * 4ul);
+    mem_zero(fbcon_pixels + kept, shift * 4ul);
+}
+
+static void fbcon_putchar(int ch)
+{
+    if (fbcon_registers == (volatile u64*)0)
+        return;
+
+    if (ch == '\n')
+    {
+        fbcon_newline();
+    }
+    else if (ch == '\r')
+    {
+        fbcon_column = 0ul;
+    }
+    else if (ch == '\b')
+    {
+        if (fbcon_column != 0ul)
+            fbcon_column = fbcon_column - 1ul;
+    }
+    else if (ch == '\t')
+    {
+        u64 stop = (fbcon_column + 8ul) & ~7ul;
+        while (fbcon_column < stop && fbcon_column < fbcon_columns)
+        {
+            fbcon_draw_glyph(fbcon_column, fbcon_row, (u32)' ');
+            fbcon_column = fbcon_column + 1ul;
+        }
+        if (fbcon_column >= fbcon_columns)
+            fbcon_newline();
+    }
+    else if (ch >= 32 && ch < 127)
+    {
+        if (fbcon_column >= fbcon_columns)
+            fbcon_newline();
+        fbcon_draw_glyph(fbcon_column, fbcon_row, (u32)ch);
+        fbcon_column = fbcon_column + 1ul;
+    }
+    else
+    {
+        return;
+    }
+
+    fbcon_registers[8] = 1ul;
 }
 
 static u16 le16(const u8* p)
@@ -876,6 +1135,8 @@ static u64 physical_reserved_limit(u64 address, u64 size)
         return KERNEL_RESERVED_END;
     if (ranges_overlap(address, size, USER_ELF_BUFFER, USER_ELF_BUFFER_SIZE))
         return USER_ELF_BUFFER + USER_ELF_BUFFER_SIZE;
+    if (ranges_overlap(address, size, USER_INTERP_BUFFER, USER_INTERP_BUFFER_SIZE))
+        return USER_INTERP_BUFFER + USER_INTERP_BUFFER_SIZE;
     if (ranges_overlap(address, size, KERNEL_STACK_TOP - KERNEL_STACK_RESERVE_SIZE, KERNEL_STACK_RESERVE_SIZE))
         return KERNEL_STACK_TOP;
     return address;
@@ -1129,11 +1390,22 @@ static int user_address_range_valid(u64 address, u64 size)
     return 1;
 }
 
+static int user_device_window(u64 address, u64 size)
+{
+    if (ranges_overlap(address, size, USER_HOST_BRIDGE_BASE, HOST_BRIDGE_WINDOW_SIZE))
+        return boot_device.host_bridge_base != 0ul;
+    if (ranges_overlap(address, size, USER_FRAMEBUFFER_BASE, boot_device.framebuffer_window))
+        return 1;
+    return 0;
+}
+
 static int user_mapping_range_valid(u64 address, u64 size)
 {
     if (!user_address_range_valid(address, size))
         return 0;
     if (ranges_overlap(address, size, USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE))
+        return 0;
+    if (user_device_window(address, size))
         return 0;
     return 1;
 }
@@ -1333,6 +1605,11 @@ static void map_kernel_address_space(u64 root)
     map_range_4k(root, boot_device.virtio_blk_base, boot_device.virtio_blk_base, 0x00001000ul, PTE_R | PTE_W | PTE_A | PTE_D);
     map_range_4k(root, CLINT_MMIO_BASE, CLINT_MMIO_BASE, 0x00010000ul, PTE_R | PTE_W | PTE_A | PTE_D);
     map_range_4k(root, PLIC_MMIO_BASE, PLIC_MMIO_BASE, 0x00400000ul, PTE_R | PTE_W | PTE_A | PTE_D);
+    if (boot_device.framebuffer_base != 0ul)
+    {
+        map_range_2m(root, boot_device.framebuffer_base, boot_device.framebuffer_base,
+            boot_device.framebuffer_window, PTE_R | PTE_W | PTE_A | PTE_D);
+    }
 }
 
 static void copy_4k_mapping_table(u64 destination_root, u64 source_root, u64 virtual_address)
@@ -1367,6 +1644,27 @@ static void copy_4k_mapping_table(u64 destination_root, u64 source_root, u64 vir
     ((u64*)destination_middle)[middle_index] = pte_make(destination_leaf, 0ul);
 }
 
+static void share_device_window(u64 root, u64 virtual_address)
+{
+    u32 index = sv39_index(virtual_address, 2);
+    ((u64*)root)[index] = ((u64*)device_root_page_table)[index];
+}
+
+static void device_mappings_init(void)
+{
+    device_root_page_table = alloc_page();
+    if (boot_device.host_bridge_base != 0ul)
+    {
+        map_page(device_root_page_table, USER_HOST_BRIDGE_BASE, boot_device.host_bridge_base,
+            PTE_R | PTE_W | PTE_U | PTE_A | PTE_D);
+    }
+    if (boot_device.framebuffer_base != 0ul)
+    {
+        map_range_2m(device_root_page_table, USER_FRAMEBUFFER_BASE, boot_device.framebuffer_base,
+            boot_device.framebuffer_window, PTE_R | PTE_W | PTE_U | PTE_A | PTE_D);
+    }
+}
+
 static u64 create_user_address_space(void)
 {
     u64 root = alloc_page();
@@ -1374,8 +1672,17 @@ static u64 create_user_address_space(void)
     map_range_2m(root, RAM_BASE, RAM_BASE, ram_size, PTE_R | PTE_W | PTE_X | PTE_A | PTE_D);
     map_range_4k(root, boot_device.uart_base, boot_device.uart_base, 0x00010000ul, PTE_R | PTE_W | PTE_A | PTE_D);
     map_range_4k(root, boot_device.virtio_blk_base, boot_device.virtio_blk_base, 0x00001000ul, PTE_R | PTE_W | PTE_A | PTE_D);
+    if (boot_device.framebuffer_base != 0ul)
+    {
+        map_range_2m(root, boot_device.framebuffer_base, boot_device.framebuffer_base,
+            boot_device.framebuffer_window, PTE_R | PTE_W | PTE_A | PTE_D);
+    }
     copy_4k_mapping_table(root, kernel_root_page_table, PLIC_MMIO_BASE);
     copy_4k_mapping_table(root, kernel_root_page_table, PLIC_MMIO_BASE + 0x00200000ul);
+    if (boot_device.host_bridge_base != 0ul)
+        share_device_window(root, USER_HOST_BRIDGE_BASE);
+    if (boot_device.framebuffer_base != 0ul)
+        share_device_window(root, USER_FRAMEBUFFER_BASE);
     return root;
 }
 
@@ -1409,6 +1716,13 @@ static void timer_enable(void)
 {
     timer_program_next();
     __asm__ volatile("csrrs zero, sie, t0" : : [stie] "{t0}"(SIE_STIE) : "memory");
+}
+
+static u64 vector_register_bytes(void)
+{
+    u64 value;
+    __asm__ volatile("csrrs %[value], vlenb, zero" : [value] "=r"(value) : : );
+    return value;
 }
 
 static void process_clear(struct process* process)
@@ -1565,13 +1879,13 @@ static int copy_user_page_table_level(u64 dst_root, u64 src_table, int level, u6
                 }
                 else if ((pte & (PTE_R | PTE_X)) != 0ul)
                 {
-                    if ((pte & PTE_U) != 0ul)
+                    if ((pte & PTE_U) != 0ul && !user_device_window(virtual_address, PAGE_SIZE))
                     {
                         if (!copy_user_leaf_pages(dst_root, virtual_address, pte, level))
                             return 0;
                     }
                 }
-                else if (level > 0)
+                else if (level > 0 && !user_device_window(virtual_address, PAGE_SIZE))
                 {
                     if (!copy_user_page_table_level(dst_root, pte_physical(pte), level - 1, virtual_address))
                         return 0;
@@ -1775,11 +2089,15 @@ static void process_exit_current(struct trap_frame* frame, u64 status)
     process_reparent_children(pid);
     current_task->exit_status = (u32)code;
     current_task->state = PROC_ZOMBIE;
-    puts("kernel: process ");
-    put_dec(pid);
-    puts(" exited with status ");
-    put_dec(code);
-    puts("\n");
+    /* A process that ended the way it meant to says nothing: the console belongs to the terminal */
+    if (code != 0ul)
+    {
+        puts("kernel: process ");
+        put_dec(pid);
+        puts(" exited with status ");
+        put_dec(code);
+        puts("\n");
+    }
     process_wake_vfork_parent(current_task);
     process_wake_waiter(current_task);
     scheduler_switch(frame);
@@ -1823,7 +2141,7 @@ static s64 sys_execve_impl(struct trap_frame* frame, u64 path_pointer, u64 argv,
     if (!fat_read_path_to_memory(path, (void*)USER_ELF_BUFFER, (u32)USER_ELF_BUFFER_SIZE, &image_size))
         return -2l;
     new_root = create_user_address_space();
-    if (!load_elf64((const u8*)USER_ELF_BUFFER, image_size, new_root, &image))
+    if (!load_process_image(new_root, (const u8*)USER_ELF_BUFFER, image_size, &image))
     {
         current_user_root_page_table = old_root;
         process_brk = old_brk;
@@ -1841,7 +2159,7 @@ static s64 sys_execve_impl(struct trap_frame* frame, u64 path_pointer, u64 argv,
     }
     current_user_root_page_table = new_root;
     mem_zero(current_task->vm_regions, sizeof(struct vm_region) * (u64)MAX_VM_REGIONS);
-    frame->sepc = image.entry;
+    frame->sepc = image.start_entry;
     frame->sstatus = (frame->sstatus & ~SSTATUS_SPP) | SSTATUS_SPIE;
     frame->x[2] = stack;
     frame->x[10] = 0ul;
@@ -1921,12 +2239,18 @@ static void parse_fdt(void* fdt)
     int memory_node[16];
     int virtio_node[16];
     int serial_node[16];
+    int host_bridge_node[16];
+    int framebuffer_node[16];
     int depth = -1;
 
     boot_device.virtio_blk_base = VIRTIO_MMIO_DEFAULT_BASE;
     boot_device.uart_base = UART_MMIO_BASE;
     boot_device.ram_base = RAM_BASE;
     boot_device.ram_size = RAM_LIMIT - RAM_BASE;
+    boot_device.host_bridge_base = 0ul;
+    boot_device.framebuffer_base = 0ul;
+    boot_device.framebuffer_size = 0ul;
+    boot_device.framebuffer_window = 0ul;
 
     if (magic != 0xd00dfeedu)
         return;
@@ -1970,6 +2294,8 @@ static void parse_fdt(void* fdt)
             memory_node[depth] = fdt_node_unit_name_equals(current_node, "memory");
             virtio_node[depth] = 0;
             serial_node[depth] = 0;
+            host_bridge_node[depth] = 0;
+            framebuffer_node[depth] = 0;
             structp = structp + len + 1;
             structp = (const u8*)align_up((u64)structp, 4ul);
         }
@@ -2003,6 +2329,10 @@ static void parse_fdt(void* fdt)
                     virtio_node[depth] = 1;
                 else if (string_equals(prop, "compatible") && prop_contains_string(data, length, "ns16550a"))
                     serial_node[depth] = 1;
+                else if (string_equals(prop, "compatible") && prop_contains_string(data, length, "cnidaria,host-bridge"))
+                    host_bridge_node[depth] = 1;
+                else if (string_equals(prop, "compatible") && prop_contains_string(data, length, "cnidaria,framebuffer"))
+                    framebuffer_node[depth] = 1;
                 else if (string_equals(prop, "device_type") && prop_contains_string(data, length, "memory"))
                     memory_node[depth] = 1;
                 else if (string_equals(prop, "reg"))
@@ -2018,6 +2348,14 @@ static void parse_fdt(void* fdt)
                             boot_device.virtio_blk_base = reg_base;
                         else if (serial_node[depth])
                             boot_device.uart_base = reg_base;
+                        else if (host_bridge_node[depth])
+                            boot_device.host_bridge_base = reg_base;
+                        else if (framebuffer_node[depth])
+                        {
+                            boot_device.framebuffer_base = reg_base;
+                            boot_device.framebuffer_size = reg_size;
+                            boot_device.framebuffer_window = align_up(reg_size, 0x200000ul);
+                        }
                         else if (memory_node[depth])
                         {
                             boot_device.ram_base = reg_base;
@@ -3176,8 +3514,10 @@ static s64 vfs_getdents64(u64 fd_value, u64 user_buffer, u64 count)
                 return -22l;
             break;
         }
-        build_dirent64(dir_buffer, inode, file->offset + 1ul, type, name, record_length);
-        if (!user_copy_to_writable(current_user_root_page_table, user_buffer + done, dir_buffer, (u64)record_length))
+        if ((u64)record_length > sizeof(dirent_buffer))
+            return -22l;
+        build_dirent64(dirent_buffer, inode, file->offset + 1ul, type, name, record_length);
+        if (!user_copy_to_writable(current_user_root_page_table, user_buffer + done, dirent_buffer, (u64)record_length))
             return -14l;
         done = done + (u64)record_length;
         file->offset = file->offset + 1ul;
@@ -3721,12 +4061,32 @@ static int load_elf64(const u8* image, u32 image_size, u64 root, struct elf_imag
         return 0;
     if (phoff + (u64)phentsize * (u64)phnum > (u64)image_size)
         return 0;
+    loaded->phdr = 0ul;
+    loaded->interp[0] = 0;
     index = 0;
     while (index < phnum)
     {
         const u8* ph = image + phoff + (u64)index * (u64)phentsize;
         u32 type = le32(ph + 0);
-        if (type == 1u)
+        if (type == ELF_PT_PHDR)
+            loaded->phdr = le64(ph + 16);
+        if (type == ELF_PT_INTERP)
+        {
+            u64 interp_offset = le64(ph + 8);
+            u64 interp_size = le64(ph + 32);
+            u64 cursor = 0ul;
+            if (interp_size == 0ul || interp_size > (u64)PATH_BUFFER_SIZE)
+                return 0;
+            if (interp_offset + interp_size > (u64)image_size)
+                return 0;
+            while (cursor < interp_size)
+            {
+                loaded->interp[cursor] = (char)image[interp_offset + cursor];
+                cursor = cursor + 1ul;
+            }
+            loaded->interp[interp_size - 1ul] = 0;
+        }
+        if (type == ELF_PT_LOAD)
         {
             u32 flags = le32(ph + 4);
             u64 offset = le64(ph + 8);
@@ -3757,7 +4117,8 @@ static int load_elf64(const u8* image, u32 image_size, u64 root, struct elf_imag
         index = index + 1;
     }
     loaded->entry = le64(image + 24);
-    loaded->phdr = 0ul;
+    loaded->start_entry = loaded->entry;
+    loaded->interp_base = 0ul;
     loaded->phent = phentsize;
     loaded->phnum = phnum;
     loaded->brk_start = align_up(high, PAGE_SIZE);
@@ -3765,9 +4126,28 @@ static int load_elf64(const u8* image, u32 image_size, u64 root, struct elf_imag
         return 0;
     if (!user_translate(root, loaded->entry, PTE_X, &entry_physical))
         return 0;
+    return 1;
+}
+
+static int load_process_image(u64 root, const u8* image, u32 image_size, struct elf_image* loaded)
+{
+    struct elf_image interpreter;
+    u32 interpreter_size;
+    if (!load_elf64(image, image_size, root, loaded))
+        return 0;
     process_brk = loaded->brk_start;
     process_brk_min = loaded->brk_start;
-    user_mmap_cursor = 0x3000000000ul;
+    user_mmap_cursor = USER_MMAP_BASE;
+    if (loaded->interp[0] == 0)
+        return 1;
+    if (!fat_read_path_to_memory(loaded->interp, (void*)USER_INTERP_BUFFER, (u32)USER_INTERP_BUFFER_SIZE, &interpreter_size))
+        return 0;
+    if (!load_elf64((const u8*)USER_INTERP_BUFFER, interpreter_size, root, &interpreter))
+        return 0;
+    if (interpreter.interp[0] != 0)
+        return 0;
+    loaded->interp_base = 0ul;
+    loaded->start_entry = interpreter.entry;
     return 1;
 }
 
@@ -3775,7 +4155,7 @@ static int build_user_stack(u64 root, struct elf_image* image, struct exec_argum
 {
     u64 strings = USER_STACK_TOP - (u64)arguments->bytes_used;
     u64 sp;
-    u64 stack[MAX_EXEC_ARGS + 15u];
+    u64 stack[MAX_EXEC_ARGS + 23u];
     u32 word = 0u;
     u32 index = 0u;
     if (arguments->count == 0u)
@@ -3806,6 +4186,15 @@ static int build_user_stack(u64 root, struct elf_image* image, struct exec_argum
     word = word + 2u;
     stack[word] = AT_PHDR;
     stack[word + 1u] = image->phdr;
+    word = word + 2u;
+    stack[word] = AT_BASE;
+    stack[word + 1u] = image->interp_base;
+    word = word + 2u;
+    stack[word] = AT_HOST_BRIDGE;
+    stack[word + 1u] = boot_device.host_bridge_base == 0ul ? 0ul : USER_HOST_BRIDGE_BASE;
+    word = word + 2u;
+    stack[word] = AT_FRAMEBUFFER;
+    stack[word + 1u] = boot_device.framebuffer_base == 0ul ? 0ul : USER_FRAMEBUFFER_BASE;
     word = word + 2u;
     stack[word] = AT_NULL;
     stack[word + 1u] = 0ul;
@@ -4035,9 +4424,13 @@ void kernel_main(u64 hartid, void* fdt)
     __asm__ volatile("csrrs zero, sstatus, %[vs]" : : [vs] "{t0}"(SSTATUS_VS) : "memory");
 #endif
     console_init();
+    fbcon_init();
     memory_manager_init();
     kernel_mmu_init();
+    device_mappings_init();
 
+    if (vector_register_bytes() > MAX_VECTOR_REGISTER_BYTES)
+        panic("vector registers exceed the saved context");
     if (!block_subsystem_init())
         panic("block subsystem init failed");
     if (!fat_mount())
@@ -4056,7 +4449,7 @@ void kernel_main(u64 hartid, void* fdt)
 
     current_user_root_page_table = create_user_address_space();
     current_task->root_page_table = current_user_root_page_table;
-    if (!load_elf64((const u8*)USER_ELF_BUFFER, init_size, current_user_root_page_table, &image))
+    if (!load_process_image(current_user_root_page_table, (const u8*)USER_ELF_BUFFER, init_size, &image))
         panic("invalid INIT.ELF");
     if (!make_kernel_arguments(init_path, &arguments))
         panic("init arguments setup failed");
@@ -4069,6 +4462,6 @@ void kernel_main(u64 hartid, void* fdt)
     current_task->mmap_cursor = user_mmap_cursor;
     activate_page_table(current_user_root_page_table);
     timer_enable();
-    kernel_enter_user(image.entry, stack);
+    kernel_enter_user(image.start_entry, stack);
     halt();
 }

@@ -73,6 +73,9 @@ namespace Cnidaria.C
         public bool LinkStandardLibrary { get; }
         public bool EmitStartup { get; }
         public bool AllowUndefinedSymbols { get; }
+        public bool IndirectExternalData { get; }
+        public bool CLibraryStartup { get; }
+        public bool PositionIndependentCode { get; }
         public string EntryFunctionName { get; }
 
         public StaticLinkerOptions(
@@ -87,6 +90,9 @@ namespace Cnidaria.C
             bool emitStartup = true,
             bool allowUndefinedSymbols = false,
             string entryFunctionName = "main",
+            bool indirectExternalData = false,
+            bool cLibraryStartup = false,
+            bool positionIndependentCode = false,
             InliningOptions? inlining = null,
             TrimmingOptions? trimming = null,
             GimplePipelineOptions? gimple = null,
@@ -113,6 +119,9 @@ namespace Cnidaria.C
             LinkStandardLibrary = linkStandardLibrary;
             EmitStartup = emitStartup;
             AllowUndefinedSymbols = allowUndefinedSymbols;
+            IndirectExternalData = indirectExternalData;
+            CLibraryStartup = cLibraryStartup;
+            PositionIndependentCode = positionIndependentCode;
             EntryFunctionName = string.IsNullOrWhiteSpace(entryFunctionName)
                 ? throw new ArgumentException("The entry function name cannot be empty.", nameof(entryFunctionName))
                 : entryFunctionName;
@@ -576,6 +585,9 @@ namespace Cnidaria.C
                         {
                             EmitStartup = options.EmitStartup && i == primaryIndex,
                             EntryFunctionName = options.EntryFunctionName,
+                            IndirectExternalData = options.IndirectExternalData,
+                            CLibraryStartup = options.CLibraryStartup,
+                            PositionIndependentCode = options.PositionIndependentCode,
                         });
                     result.Add(new ObjectUnit<X86Program>(units[i], program));
                 }
@@ -632,6 +644,7 @@ namespace Cnidaria.C
                         {
                             EmitStartup = options.EmitStartup && i == primaryIndex,
                             EntryFunctionName = options.EntryFunctionName,
+                            CLibraryStartup = options.CLibraryStartup,
                         });
                     result.Add(new ObjectUnit<ArmProgram>(units[i], program));
                 }
@@ -1155,7 +1168,7 @@ namespace Cnidaria.C
                     {
                         (CErrorType, CErrorType) => true,
                         (BuiltinType l, BuiltinType r) => l.BuiltinKind == r.BuiltinKind,
-                        (RVVectorType l, RVVectorType r) => l.VectorKind == r.VectorKind,
+                        (RVVectorType l, RVVectorType r) => string.Equals(l.BuiltinName, r.BuiltinName, StringComparison.Ordinal),
                         (PointerType l, PointerType r) => AreCompatible(l.PointeeType, r.PointeeType),
                         (ArrayType l, ArrayType r) =>
                             AreCompatible(l.ElementType, r.ElementType) &&

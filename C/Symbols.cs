@@ -94,7 +94,7 @@ namespace Cnidaria.C
         public override SymbolKind Kind => SymbolKind.Function;
         public override string Name { get; }
         public StorageClass StorageClass { get; }
-        public FunctionSpecifiers FunctionSpecifiers { get; }
+        public FunctionSpecifiers FunctionSpecifiers { get; private set; }
         /// <summary>Whether the symbol originates from a function definition</summary>
         public bool IsDefinition { get; }
         /// <summary>Dedicated lowering assigned to this function</summary>
@@ -121,6 +121,9 @@ namespace Cnidaria.C
             IsDefinition = isDefinition;
             IntrinsicKind = intrinsicKind;
         }
+
+        /// <summary>Adopts specifiers written on another declaration of the same function</summary>
+        internal void MergeFunctionSpecifiers(FunctionSpecifiers specifiers) => FunctionSpecifiers |= specifiers;
     }
 
     /// <summary>Represents a function parameter</summary>

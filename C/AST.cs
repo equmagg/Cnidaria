@@ -131,6 +131,8 @@ namespace Cnidaria.C
         public SyntaxToken? AsmOpenParenToken { get; }
         public ImmutableArray<SyntaxToken> AsmRegisterNameTokens { get; }
         public SyntaxToken? AsmCloseParenToken { get; }
+        /// <summary>Attribute specifiers written after the declarator, which bind to it alone</summary>
+        public ImmutableArray<SyntaxToken> TrailingAttributeTokens { get; }
         public SyntaxToken? EqualsToken { get; }
         public InitializerSyntax? Initializer { get; }
 
@@ -141,7 +143,8 @@ namespace Cnidaria.C
             ImmutableArray<SyntaxToken> asmRegisterNameTokens,
             SyntaxToken? asmCloseParenToken,
             SyntaxToken? equalsToken,
-            InitializerSyntax? initializer)
+            InitializerSyntax? initializer,
+            ImmutableArray<SyntaxToken> trailingAttributeTokens = default)
         {
             Declarator = declarator;
             AsmKeyword = asmKeyword;
@@ -150,6 +153,9 @@ namespace Cnidaria.C
                 ? ImmutableArray<SyntaxToken>.Empty
                 : asmRegisterNameTokens;
             AsmCloseParenToken = asmCloseParenToken;
+            TrailingAttributeTokens = trailingAttributeTokens.IsDefault
+                ? ImmutableArray<SyntaxToken>.Empty
+                : trailingAttributeTokens;
             EqualsToken = equalsToken;
             Initializer = initializer;
         }

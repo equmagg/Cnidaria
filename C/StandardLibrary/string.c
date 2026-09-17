@@ -1,5 +1,9 @@
 #include <stddef.h>
 
+#if defined(__riscv_vector)
+#include <riscv_vector.h>
+#endif
+
 void* memcpy(void* restrict destination, const void* restrict source, size_t count)
 {
     unsigned char* destination_bytes = (unsigned char*)destination;
@@ -11,17 +15,8 @@ void* memcpy(void* restrict destination, const void* restrict source, size_t cou
 #if defined(__riscv_vector)
     while (count != 0)
     {
-        size_t vector_length;
-        __asm__ volatile(
-            "vsetvli %[vector_length], %[count], e8, m1, ta, ma"
-            : [vector_length] "=r"(vector_length)
-            : [count] "r"(count));
-        __asm__ volatile(
-            "vle8.v v0, 0(%[source])\n"
-            "vse8.v v0, 0(%[destination])"
-            :
-        : [destination] "r"(destination_bytes), [source] "r"(source_bytes)
-            : "v0", "memory");
+        size_t vector_length = __riscv_vsetvl_e8m8(count);
+        __riscv_vse8_v_u8m8(destination_bytes, __riscv_vle8_v_u8m8(source_bytes, vector_length), vector_length);
         destination_bytes = destination_bytes + vector_length;
         source_bytes = source_bytes + vector_length;
         count = count - vector_length;
@@ -80,20 +75,11 @@ void* memset(void* destination, int value, size_t count)
         return destination;
 
 #if defined(__riscv_vector)
+    vuint8m8_t fill = __riscv_vmv_v_x_u8m8(byte_value, __riscv_vsetvlmax_e8m8());
     while (count != 0)
     {
-        size_t vector_length;
-        __asm__ volatile(
-            "vsetvli %[vector_length], %[count], e8, m1, ta, ma"
-            : [vector_length] "=r"(vector_length)
-            : [count] "r"(count));
-        __asm__ volatile(
-            "vxor.vv v0, v0, v0\n"
-            "vadd.vx v0, v0, %[value]\n"
-            "vse8.v v0, 0(%[destination])"
-            :
-        : [destination] "r"(destination_bytes), [value] "r"((size_t)byte_value)
-            : "v0", "memory");
+        size_t vector_length = __riscv_vsetvl_e8m8(count);
+        __riscv_vse8_v_u8m8(destination_bytes, fill, vector_length);
         destination_bytes = destination_bytes + vector_length;
         count = count - vector_length;
     }

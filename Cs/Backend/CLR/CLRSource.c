@@ -10,6 +10,15 @@ typedef unsigned int usize;
 typedef signed int isize;
 #endif
 
+#ifdef __riscv_vector
+typedef __rvv_uint8m8_t rh_bytes;
+usize __riscv_vsetvl_e8m8(usize avl);
+usize __riscv_vsetvlmax_e8m8(void);
+rh_bytes __riscv_vle8_v_u8m8(const u8* rs1, usize vl);
+void __riscv_vse8_v_u8m8(u8* rs1, rh_bytes vs3, usize vl);
+rh_bytes __riscv_vmv_v_x_u8m8(u8 rs1, usize vl);
+#endif
+
 #define SYNC_BLOCK_SIZE __SIZEOF_POINTER__
 #define MANAGED_OBJECT_HEADER_SIZE __SIZEOF_POINTER__
 #define MINIMUM_MANAGED_OBJECT_SIZE __SIZEOF_POINTER__ * 2
@@ -1566,18 +1575,14 @@ static void rh_zero(void* address, usize size)
 #ifdef __riscv_vector
     if (size >= 64ul)
     {
-        __asm__ volatile(
-            "vsetvli a2, zero, e8, m8, ta, ma\n"
-            "vxor.vv v8, v8, v8\n"
-            ".Lrh_zero_loop_%=:\n"
-            "vsetvli a2, %[count], e8, m8, ta, ma\n"
-            "vse8.v v8, (%[destination])\n"
-            "add %[destination], %[destination], a2\n"
-            "sub %[count], %[count], a2\n"
-            "bne %[count], zero, .Lrh_zero_loop_%="
-            :
-        : [destination] "{a0}"(bytes), [count] "{a1}"(size)
-            : "memory");
+        rh_bytes zeros = __riscv_vmv_v_x_u8m8(0u, __riscv_vsetvlmax_e8m8());
+        while (size != 0ul)
+        {
+            usize step = __riscv_vsetvl_e8m8(size);
+            __riscv_vse8_v_u8m8(bytes, zeros, step);
+            bytes = bytes + step;
+            size = size - step;
+        }
         return;
     }
 #endif
@@ -1843,22 +1848,15 @@ void RhpMemset(void* destination, int value, usize length)
     u8* bytes = (u8*)destination;
     u8 fill = (u8)value;
 #if defined(__riscv_vector)
-    while (length != 0ul)
     {
-        usize vector_length;
-        __asm__ volatile(
-            "vsetvli %[vector_length], %[length], e8, m1, ta, ma"
-            : [vector_length] "=r"(vector_length)
-            : [length] "r"(length));
-        __asm__ volatile(
-            "vxor.vv v0, v0, v0\n"
-            "vadd.vx v0, v0, %[value]\n"
-            "vse8.v v0, 0(%[destination])"
-            :
-        : [destination] "r"(bytes), [value] "r"((usize)fill)
-            : "v0", "memory");
-        bytes = bytes + vector_length;
-        length = length - vector_length;
+        rh_bytes pattern = __riscv_vmv_v_x_u8m8(fill, __riscv_vsetvlmax_e8m8());
+        while (length != 0ul)
+        {
+            usize step = __riscv_vsetvl_e8m8(length);
+            __riscv_vse8_v_u8m8(bytes, pattern, step);
+            bytes = bytes + step;
+            length = length - step;
+        }
     }
 #else
     usize word = (usize)fill;
@@ -3230,18 +3228,14 @@ void RhpArrayClear(void* array, int index, int length)
 #ifdef __riscv_vector
     if (byte_count >= 16ul)
     {
-        __asm__ volatile(
-            "vsetvli a2, zero, e8, m8, ta, ma\n"
-            "vxor.vv v8, v8, v8\n"
-            ".Lrhp_array_clear_loop_%=:\n"
-            "vsetvli a2, %[count], e8, m8, ta, ma\n"
-            "vse8.v v8, (%[destination])\n"
-            "add %[destination], %[destination], a2\n"
-            "sub %[count], %[count], a2\n"
-            "bne %[count], zero, .Lrhp_array_clear_loop_%="
-            :
-        : [destination] "{a0}"(destination), [count] "{a1}"(byte_count)
-            : "memory");
+        rh_bytes zeros = __riscv_vmv_v_x_u8m8(0u, __riscv_vsetvlmax_e8m8());
+        while (byte_count != 0ul)
+        {
+            usize step = __riscv_vsetvl_e8m8(byte_count);
+            __riscv_vse8_v_u8m8(destination, zeros, step);
+            destination = destination + step;
+            byte_count = byte_count - step;
+        }
         return;
     }
 #endif
@@ -3320,35 +3314,27 @@ int RhpArrayCopy(
         if ((usize)destination < (usize)source ||
             (usize)destination >= (usize)source + byte_count)
         {
-            __asm__ volatile(
-                ".Lrhp_array_copy_forward_loop_%=:\n"
-                "vsetvli a3, %[count], e8, m8, ta, ma\n"
-                "vle8.v v8, (%[source])\n"
-                "vse8.v v8, (%[destination])\n"
-                "add %[source], %[source], a3\n"
-                "add %[destination], %[destination], a3\n"
-                "sub %[count], %[count], a3\n"
-                "bne %[count], zero, .Lrhp_array_copy_forward_loop_%="
-                :
-            : [destination] "{a0}"(destination), [source] "{a1}"(source), [count] "{a2}"(byte_count)
-                : "memory");
+            while (byte_count != 0ul)
+            {
+                usize step = __riscv_vsetvl_e8m8(byte_count);
+                __riscv_vse8_v_u8m8(destination, __riscv_vle8_v_u8m8(source, step), step);
+                source = source + step;
+                destination = destination + step;
+                byte_count = byte_count - step;
+            }
             return 1;
         }
 
         source = source + byte_count;
         destination = destination + byte_count;
-        __asm__ volatile(
-            ".Lrhp_array_copy_backward_loop_%=:\n"
-            "vsetvli a3, %[count], e8, m8, ta, ma\n"
-            "sub %[source], %[source], a3\n"
-            "sub %[destination], %[destination], a3\n"
-            "vle8.v v8, (%[source])\n"
-            "vse8.v v8, (%[destination])\n"
-            "sub %[count], %[count], a3\n"
-            "bne %[count], zero, .Lrhp_array_copy_backward_loop_%="
-            :
-        : [destination] "{a0}"(destination), [source] "{a1}"(source), [count] "{a2}"(byte_count)
-            : "memory");
+        while (byte_count != 0ul)
+        {
+            usize step = __riscv_vsetvl_e8m8(byte_count);
+            source = source - step;
+            destination = destination - step;
+            __riscv_vse8_v_u8m8(destination, __riscv_vle8_v_u8m8(source, step), step);
+            byte_count = byte_count - step;
+        }
         return 1;
     }
 #endif

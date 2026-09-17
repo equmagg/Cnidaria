@@ -3,432 +3,381 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
 
-namespace Cnidaria.X86
+namespace Cnidaria.X86;
+
+public static class X86ElfWriter
 {
-    internal static class X86ElfExecutableWriter
+    public const string DefaultInterpreterPath = "/lib64/ld-linux-x86-64.so.2";
+    public const string DefaultStandardLibrarySoName = "libc.so.6";
+
+    private const ushort Em386 = 3;
+    private const ushort EmX86_64 = 62;
+    private const int PltEntrySize = 16;
+    private const int ReservedGotEntries = 3;
+
+    private const uint X86Absolute64 = 1;
+    private const uint X86GlobalData = 6;
+    private const uint X86JumpSlot = 7;
+    private const uint X86Relative = 8;
+
+    public static ulong DefaultImageBase(X86Target target)
+        => target.Is64Bit ? 0x400000UL : 0x08048000UL;
+
+    public static byte[] WriteExecutable(
+        X86Program program,
+        ulong imageBase = 0,
+        IReadOnlyDictionary<string, ulong>? externalSymbols = null)
+        => Write(program, new ElfImageOptions
+        {
+            Kind = ElfImageKind.Executable,
+            ImageBase = imageBase == 0 ? DefaultImageBase(program.Target) : imageBase,
+            ExternalSymbols = externalSymbols,
+        });
+
+    public static byte[] WriteDynamicExecutable(
+        X86Program program,
+        ulong imageBase = 0,
+        string? interpreter = null,
+        IEnumerable<string>? needed = null)
+        => Write(program, new ElfImageOptions
+        {
+            Kind = ElfImageKind.DynamicExecutable,
+            ImageBase = imageBase == 0 ? DefaultImageBase(program.Target) : imageBase,
+            Interpreter = string.IsNullOrEmpty(interpreter) ? DefaultInterpreterPath : interpreter,
+            Needed = needed?.ToImmutableArray() ?? ImmutableArray.Create(DefaultStandardLibrarySoName),
+        });
+
+    public static byte[] WriteSharedObject(
+        X86Program program,
+        string soName,
+        IEnumerable<string>? needed = null,
+        string? initSymbol = null)
+        => Write(program, new ElfImageOptions
+        {
+            Kind = ElfImageKind.SharedObject,
+            SoName = soName ?? string.Empty,
+            Needed = needed?.ToImmutableArray() ?? ImmutableArray<string>.Empty,
+            InitSymbol = initSymbol ?? string.Empty,
+        });
+
+    public static byte[] Write(X86Program program, ElfImageOptions options)
     {
-        private const int PageAlignment = 0x1000;
-        private const ushort EtExec = 2;
-        private const uint EvCurrent = 1;
-        private const uint PtLoad = 1;
-        private const uint PfX = 1;
-        private const uint PfW = 2;
-        private const uint PfR = 4;
-        private const ushort Em386 = 3;
-        private const ushort EmX86_64 = 62;
+        if (program is null)
+            throw new ArgumentNullException(nameof(program));
+        if (program.Target.OperatingSystem != OperatingSystemKind.Linux)
+            throw new ArgumentException("The ELF writer requires a Linux x86 target.", nameof(program));
+        if (options.Dynamic && !program.Target.Is64Bit)
+            throw new NotSupportedException("A 32-bit x86 dynamic image needs REL-format relocations, which are not implemented.");
+        ElfImageBuilder.Validate(options);
+        if (options.Shared)
+            RequirePositionIndependentText(program);
 
-        public static ulong DefaultImageBase(X86Target target)
-            => target.Is64Bit ? 0x400000UL : 0x08048000UL;
+        var imports = options.Dynamic ? CollectImports(program) : ElfImportSet.Empty;
+        var rewritten = RedirectDataImports(program, imports.Data);
 
-        public static byte[] WriteExecutable(X86Program obj, ulong imageBase = 0, IReadOnlyDictionary<string, ulong>? externalSymbols = null)
+        var descriptor = new ElfTarget
         {
-            if (obj is null)
-                throw new ArgumentNullException(nameof(obj));
-            if (obj.Target.OperatingSystem != OperatingSystemKind.Linux)
-                throw new ArgumentException("ELF executable writer requires a Linux x86 target.", nameof(obj));
-            if (imageBase == 0)
-                imageBase = DefaultImageBase(obj.Target);
-            if (imageBase % PageAlignment != 0)
-                throw new ArgumentException("ELF image base must be page-aligned.", nameof(imageBase));
-
-            var textSize = ComputeTextSize(obj.Text, obj.Target);
-            var sections = CreateSectionLayouts(obj, textSize);
-            var segments = LayoutSections(sections, obj.Target, imageBase);
-            var sectionMap = sections.ToDictionary(static s => s.Name, StringComparer.Ordinal);
-            var symbols = BuildSymbolAddressMap(obj, sectionMap, externalSymbols);
-            var entryAddress = string.IsNullOrEmpty(obj.EntrySymbol)
-                ? sectionMap[".text"].Address
-                : ResolveSymbol(symbols, obj.EntrySymbol);
-            var fileSize = sections.Count == 0 ? HeaderSize(obj.Target, 1) : sections.Max(static s => s.FileOffset + s.FileSize);
-            if (fileSize < HeaderSize(obj.Target, segments.Count))
-                fileSize = HeaderSize(obj.Target, segments.Count);
-            var image = new byte[fileSize];
-
-            WriteHeaders(image, obj.Target, entryAddress, segments);
-            EncodeText(obj, sectionMap[".text"], symbols, image);
-            ApplyTextRelocations(obj, sectionMap[".text"], symbols, image);
-            CopyDataSections(sections, image);
-            ApplyDataRelocations(obj, sectionMap, symbols, image);
-
-            return image;
-        }
-
-        private static List<ElfSectionLayout> CreateSectionLayouts(X86Program obj, int textSize)
-        {
-            var referencedDataSections = new HashSet<string>(
-                obj.Symbols
-                    .Where(static s => s.Binding != X86ObjectSymbolBinding.External && s.Kind != X86ObjectSymbolKind.Section && !string.IsNullOrEmpty(s.SectionName))
-                    .Select(static s => s.SectionName),
-                StringComparer.Ordinal);
-
-            var sections = new List<ElfSectionLayout>
+            Machine = program.Target.Is64Bit ? EmX86_64 : Em386,
+            Is64Bit = program.Target.Is64Bit,
+            Endianness = TargetEndianness.Little,
+            PltEntrySize = PltEntrySize,
+            ReservedGlobalOffsetTableEntries = ReservedGotEntries,
+            AbsoluteRelocation = X86Absolute64,
+            RelativeRelocation = X86Relative,
+            JumpSlotRelocation = X86JumpSlot,
+            GlobalDataRelocation = X86GlobalData,
+            EmitPltEntry = EmitPltEntry,
+            EncodeText = (symbols, image, fileOffset, address) =>
             {
-                new ElfSectionLayout(".text", X86ObjectSectionKind.Text, Math.Max(1, obj.Target.Is64Bit ? 16 : 4), new byte[textSize], textSize)
+                EncodeText(rewritten, fileOffset, address, symbols, image);
+                ApplyTextRelocations(rewritten, fileOffset, address, symbols, image);
+            },
+        };
+
+        return new ElfImageBuilder(
+            descriptor,
+            options,
+            CreateSections(program),
+            CreateSymbols(program),
+            CreateRelocations(program),
+            imports.Functions,
+            imports.Data,
+            program.EntrySymbol).Build();
+    }
+
+    private static int ComputeTextSize(X86TextSection text, X86Target target)
+    {
+        var size = 0;
+        foreach (var instruction in text.Instructions)
+            size = checked(size + X86CodeEncoder.GetEncodedLength(instruction, target));
+        return size;
+    }
+
+    private static void EncodeText(X86Program obj, int textFileOffset, ulong textAddress, IReadOnlyDictionary<string, ulong> symbols, byte[] image)
+    {
+        var offset = 0;
+        foreach (var instruction in obj.Text.Instructions)
+        {
+            var encoded = X86CodeEncoder.Encode(instruction, obj.Target, checked(textAddress + (ulong)offset), symbols);
+            Array.Copy(encoded, 0, image, textFileOffset + offset, encoded.Length);
+            offset = checked(offset + encoded.Length);
+        }
+    }
+
+    private static void ApplyTextRelocations(X86Program obj, int textFileOffset, ulong textAddress, IReadOnlyDictionary<string, ulong> symbols, byte[] image)
+    {
+        foreach (var relocation in obj.Text.Relocations)
+            ApplyRelocation(image, textFileOffset + relocation.Offset, textAddress, relocation.Offset, relocation, symbols, obj.Target);
+    }
+
+    private static void ApplyRelocation(
+        byte[] image,
+        int imageOffset,
+        ulong sectionAddress,
+        int sectionOffset,
+        X86ObjectRelocation relocation,
+        IReadOnlyDictionary<string, ulong> symbols,
+        X86Target target)
+    {
+        var symbolAddress = ResolveSymbol(symbols, relocation.SymbolName);
+        var value = checked((long)symbolAddress + relocation.Addend);
+        switch (relocation.Kind)
+        {
+            case X86ObjectRelocationKind.Relative8:
+                WriteSigned(image, imageOffset, checked(value - (long)(sectionAddress + (ulong)sectionOffset + 1)), 1);
+                break;
+            case X86ObjectRelocationKind.Relative32:
+            case X86ObjectRelocationKind.RipRelative32:
+                WriteSigned(image, imageOffset, checked(value - (long)(sectionAddress + (ulong)sectionOffset + 4)), 4);
+                break;
+            case X86ObjectRelocationKind.AbsolutePointer:
+                WriteUnsigned(image, imageOffset, checked((ulong)value), target.Is32Bit ? 4 : 8);
+                break;
+            case X86ObjectRelocationKind.Absolute32:
+                WriteUnsigned(image, imageOffset, checked((ulong)value), 4);
+                break;
+            case X86ObjectRelocationKind.Absolute64:
+                WriteUnsigned(image, imageOffset, checked((ulong)value), 8);
+                break;
+            default:
+                throw new NotSupportedException("Unsupported x86 relocation: " + relocation.Kind);
+        }
+    }
+
+    private static void RequirePositionIndependentText(X86Program program)
+    {
+        foreach (var instruction in program.Text.Instructions)
+        {
+            foreach (var operand in Operands(instruction))
+            {
+                if (operand.HasSymbol &&
+                    operand.RelocationKind is X86ObjectRelocationKind.Absolute32 or X86ObjectRelocationKind.Absolute64)
+                {
+                    throw new NotSupportedException(
+                        $"A shared object cannot hold the absolute address of {operand.Symbol}; compile it as position independent code.");
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<ElfSectionInput> CreateSections(X86Program program)
+    {
+        var referenced = new HashSet<string>(
+            program.Symbols
+                .Where(static s => s.Binding != X86ObjectSymbolBinding.External && s.Kind != X86ObjectSymbolKind.Section && !string.IsNullOrEmpty(s.SectionName))
+                .Select(static s => s.SectionName),
+            StringComparer.Ordinal);
+
+        yield return new ElfSectionInput
+        {
+            Name = ".text",
+            Kind = ElfSectionKind.Text,
+            Alignment = 16,
+            Data = new byte[ComputeTextSize(program.Text, program.Target)],
+        };
+
+        foreach (var section in program.DataSections)
+        {
+            var memorySize = section.Kind == X86ObjectSectionKind.Bss ? section.BssSize : section.Data.Length;
+            if (memorySize == 0 && section.Relocations.Length == 0 && !referenced.Contains(section.Name))
+                continue;
+            yield return new ElfSectionInput
+            {
+                Name = section.Name,
+                Kind = section.Kind switch
+                {
+                    X86ObjectSectionKind.Rodata => ElfSectionKind.Rodata,
+                    X86ObjectSectionKind.Bss => ElfSectionKind.Bss,
+                    _ => ElfSectionKind.Data,
+                },
+                Alignment = Math.Max(1, section.Alignment),
+                Data = section.Kind == X86ObjectSectionKind.Bss ? Array.Empty<byte>() : section.Data.ToArray(),
+                MemorySize = memorySize,
             };
-
-            foreach (var section in obj.DataSections)
-            {
-                var memorySize = section.Kind == X86ObjectSectionKind.Bss ? section.BssSize : section.Data.Length;
-                if (memorySize == 0 && section.Relocations.Length == 0 && !referencedDataSections.Contains(section.Name))
-                    continue;
-                var raw = section.Kind == X86ObjectSectionKind.Bss ? Array.Empty<byte>() : section.Data.ToArray();
-                sections.Add(new ElfSectionLayout(section.Name, section.Kind, section.Alignment, raw, memorySize));
-            }
-
-            return sections;
         }
+    }
 
-        private static List<ElfSegmentLayout> LayoutSections(IReadOnlyList<ElfSectionLayout> sections, X86Target target, ulong imageBase)
+    private static IEnumerable<ElfSymbolInput> CreateSymbols(X86Program program)
+    {
+        foreach (var label in program.Text.Labels)
+            yield return new ElfSymbolInput { Name = label.Key, SectionName = ".text", Offset = label.Value };
+
+        foreach (var symbol in program.Symbols)
         {
-            var segments = new List<ElfSegmentLayout>();
-            var headerSize = HeaderSize(target, SegmentCount(sections));
-            var cursor = AlignUp(headerSize, sections[0].Alignment);
-
-            var text = sections[0];
-            cursor = LayoutOne(text, cursor, imageBase);
-            segments.Add(new ElfSegmentLayout(0, imageBase, cursor, cursor, PfR | PfX, PageAlignment));
-
-            var rodata = sections.Where(static s => s.Kind == X86ObjectSectionKind.Rodata).ToArray();
-            if (rodata.Length != 0)
+            if (symbol.Binding == X86ObjectSymbolBinding.External ||
+                string.IsNullOrEmpty(symbol.SectionName) ||
+                (symbol.Kind == X86ObjectSymbolKind.Section && symbol.Size == 0))
             {
-                var start = AlignUp(cursor, PageAlignment);
-                cursor = start;
-                foreach (var section in rodata)
-                    cursor = LayoutOne(section, cursor, imageBase);
-                segments.Add(new ElfSegmentLayout(start, checked(imageBase + (ulong)start), cursor - start, cursor - start, PfR, PageAlignment));
+                continue;
             }
-
-            var writable = sections.Where(static s => s.Kind is X86ObjectSectionKind.Data or X86ObjectSectionKind.Bss).ToArray();
-            if (writable.Length != 0)
+            yield return new ElfSymbolInput
             {
-                var start = AlignUp(cursor, PageAlignment);
-                cursor = start;
-                var fileEnd = start;
-                foreach (var section in writable.Where(static s => s.Kind != X86ObjectSectionKind.Bss))
+                Name = symbol.Name,
+                SectionName = symbol.SectionName,
+                Offset = symbol.Offset,
+                Size = symbol.Size,
+                IsFunction = symbol.Kind == X86ObjectSymbolKind.Function,
+                IsGlobal = symbol.Binding == X86ObjectSymbolBinding.Global && symbol.Kind != X86ObjectSymbolKind.Section,
+            };
+        }
+    }
+
+    private static IEnumerable<ElfRelocationInput> CreateRelocations(X86Program program)
+    {
+        foreach (var section in program.DataSections)
+        {
+            foreach (var relocation in section.Relocations)
+            {
+                yield return new ElfRelocationInput
                 {
-                    cursor = LayoutOne(section, cursor, imageBase);
-                    fileEnd = Math.Max(fileEnd, cursor);
-                }
-                foreach (var section in writable.Where(static s => s.Kind == X86ObjectSectionKind.Bss))
-                    cursor = LayoutOne(section, cursor, imageBase);
-                segments.Add(new ElfSegmentLayout(start, checked(imageBase + (ulong)start), fileEnd - start, cursor - start, PfR | PfW, PageAlignment));
+                    SectionName = section.Name,
+                    Offset = relocation.Offset,
+                    Size = relocation.Kind switch
+                    {
+                        X86ObjectRelocationKind.AbsolutePointer => 8,
+                        X86ObjectRelocationKind.Absolute32 => 4,
+                        X86ObjectRelocationKind.Absolute64 => 8,
+                        _ => throw new NotSupportedException($"Unsupported data relocation: {relocation.Kind}"),
+                    },
+                    SymbolName = relocation.SymbolName,
+                    Addend = relocation.Addend,
+                };
             }
+        }
+    }
 
-            return segments;
+    private static ElfImportSet CollectImports(X86Program program)
+    {
+        var defined = new HashSet<string>(program.Text.Labels.Keys, StringComparer.Ordinal);
+        foreach (var symbol in program.Symbols)
+        {
+            if (symbol.Binding != X86ObjectSymbolBinding.External)
+                defined.Add(symbol.Name);
         }
 
-        private static int LayoutOne(ElfSectionLayout section, int cursor, ulong imageBase)
-        {
-            cursor = AlignUp(cursor, section.Alignment);
-            section.FileOffset = cursor;
-            section.Address = checked(imageBase + (ulong)cursor);
-            return checked(cursor + section.MemorySize);
-        }
+        var objects = new HashSet<string>(
+            program.Symbols
+                .Where(static s => s.Binding == X86ObjectSymbolBinding.External && s.Kind == X86ObjectSymbolKind.Object)
+                .Select(static s => s.Name),
+            StringComparer.Ordinal);
 
-        private static int SegmentCount(IReadOnlyList<ElfSectionLayout> sections)
-        {
-            var count = 1;
-            if (sections.Any(static s => s.Kind == X86ObjectSectionKind.Rodata))
-                count++;
-            if (sections.Any(static s => s.Kind is X86ObjectSectionKind.Data or X86ObjectSectionKind.Bss))
-                count++;
-            return count;
-        }
+        return ElfImportSet.Collect(defined, EnumerateReferences(program), objects);
+    }
 
-        private static int HeaderSize(X86Target target, int segmentCount)
+    private static IEnumerable<string> EnumerateReferences(X86Program program)
+    {
+        foreach (var instruction in program.Text.Instructions)
         {
-            var ehSize = target.Is64Bit ? 64 : 52;
-            var phSize = target.Is64Bit ? 56 : 32;
-            return checked(ehSize + phSize * segmentCount);
-        }
-
-        private static int ComputeTextSize(X86TextSection text, X86Target target)
-        {
-            var size = 0;
-            foreach (var instruction in text.Instructions)
-                size = checked(size + X86CodeEncoder.GetEncodedLength(instruction, target));
-            return size;
-        }
-
-        private static Dictionary<string, ulong> BuildSymbolAddressMap(
-            X86Program obj,
-            IReadOnlyDictionary<string, ElfSectionLayout> sections,
-            IReadOnlyDictionary<string, ulong>? externalSymbols)
-        {
-            var result = new Dictionary<string, ulong>(StringComparer.Ordinal);
-            var text = sections[".text"];
-            foreach (var label in obj.Text.Labels)
-                result[label.Key] = checked(text.Address + (ulong)label.Value);
-
-            foreach (var symbol in obj.Symbols)
+            foreach (var operand in Operands(instruction))
             {
-                if (symbol.Binding == X86ObjectSymbolBinding.External)
-                    continue;
-                if (string.IsNullOrEmpty(symbol.SectionName))
-                    continue;
-                if (!sections.TryGetValue(symbol.SectionName, out var section))
-                {
-                    if (symbol.Kind == X86ObjectSymbolKind.Section && symbol.Size == 0)
-                        continue;
-                    throw new InvalidOperationException($"Symbol section does not exist: {symbol.SectionName}");
-                }
-                result[symbol.Name] = checked(section.Address + (ulong)symbol.Offset);
+                if (operand.Symbol is { Length: > 0 } symbol)
+                    yield return symbol;
             }
+        }
+        foreach (var relocation in program.Text.Relocations)
+            yield return relocation.SymbolName;
+        foreach (var section in program.DataSections)
+        {
+            foreach (var relocation in section.Relocations)
+                yield return relocation.SymbolName;
+        }
+    }
 
-            if (externalSymbols is not null)
+    private static IEnumerable<X86Operand> Operands(X86Instruction instruction)
+    {
+        yield return instruction.Operand0;
+        yield return instruction.Operand1;
+        yield return instruction.Operand2;
+    }
+
+    private static void EmitPltEntry(byte[] data, int offset, ulong entry, ulong slot)
+    {
+        var displacement = checked((long)slot - (long)(entry + 6));
+        if (displacement < int.MinValue || displacement > int.MaxValue)
+            throw new OverflowException("A procedure linkage table entry is out of reach of its table slot.");
+        data[offset + 0] = 0xff;
+        data[offset + 1] = 0x25;
+        for (var i = 0; i < 4; i++)
+            data[offset + 2 + i] = (byte)((uint)displacement >> (i * 8));
+        for (var i = 6; i < PltEntrySize; i++)
+            data[offset + i] = 0x90;
+    }
+
+    /// <summary>Turns the lea of an address into a load, so an imported object is read from its table slot.</summary>
+    private static X86Program RedirectDataImports(X86Program program, ImmutableArray<string> dataImports)
+    {
+        if (dataImports.Length == 0)
+            return program;
+
+        var imports = dataImports.ToImmutableHashSet(StringComparer.Ordinal);
+        var instructions = program.Text.Instructions.ToBuilder();
+        for (var i = 0; i < instructions.Count; i++)
+        {
+            var instruction = instructions[i];
+            if (!Operands(instruction).Any(operand => operand.IsRipRelative && operand.Symbol is { } name && imports.Contains(name)))
+                continue;
+
+            var source = instruction.Operand1;
+            if (instruction.Opcode != X86InstrKind.Lea ||
+                !source.IsRipRelative ||
+                source.Symbol is null ||
+                !imports.Contains(source.Symbol) ||
+                source.Addend != 0)
             {
-                foreach (var pair in externalSymbols)
-                    result[pair.Key] = pair.Value;
+                throw new NotSupportedException(
+                    $"An imported data object is addressed in place rather than through its address: {source.Symbol ?? "?"}");
             }
 
-            return result;
+            instructions[i] = X86Instruction.Binary(X86InstrKind.Mov, instruction.Operand0, source);
         }
 
-        private static void EncodeText(X86Program obj, ElfSectionLayout text, IReadOnlyDictionary<string, ulong> symbols, byte[] image)
-        {
-            var offset = 0;
-            foreach (var instruction in obj.Text.Instructions)
-            {
-                var encoded = X86CodeEncoder.Encode(instruction, obj.Target, checked(text.Address + (ulong)offset), symbols);
-                Array.Copy(encoded, 0, image, text.FileOffset + offset, encoded.Length);
-                offset = checked(offset + encoded.Length);
-            }
-        }
+        return new X86Program(
+            program.Target,
+            new X86TextSection(instructions.ToImmutable(), program.Text.Labels, program.Text.Relocations),
+            program.DataSections,
+            program.Symbols,
+            program.EntrySymbol);
+    }
 
-        private static void ApplyTextRelocations(X86Program obj, ElfSectionLayout text, IReadOnlyDictionary<string, ulong> symbols, byte[] image)
-        {
-            foreach (var relocation in obj.Text.Relocations)
-                ApplyRelocation(image, text.FileOffset + relocation.Offset, text.Address, relocation.Offset, relocation, symbols, obj.Target);
-        }
+    private static ulong ResolveSymbol(IReadOnlyDictionary<string, ulong> symbols, string symbol)
+    {
+        if (symbols.TryGetValue(symbol, out var address))
+            return address;
+        throw new InvalidOperationException($"Unresolved symbol: {symbol}");
+    }
 
-        private static void CopyDataSections(IEnumerable<ElfSectionLayout> sections, byte[] image)
-        {
-            foreach (var section in sections)
-            {
-                if (section.Kind == X86ObjectSectionKind.Text || section.Kind == X86ObjectSectionKind.Bss || section.FileSize == 0)
-                    continue;
-                Array.Copy(section.RawData, 0, image, section.FileOffset, section.RawData.Length);
-            }
-        }
+    private static void WriteSigned(byte[] image, int offset, long value, int size)
+    {
+        if (size == 1 && (value < sbyte.MinValue || value > sbyte.MaxValue))
+            throw new OverflowException("8-bit relocation overflow.");
+        if (size == 4 && (value < int.MinValue || value > int.MaxValue))
+            throw new OverflowException("32-bit relocation overflow.");
+        WriteUnsigned(image, offset, unchecked((ulong)value), size);
+    }
 
-        private static void ApplyDataRelocations(
-            X86Program obj,
-            IReadOnlyDictionary<string, ElfSectionLayout> sections,
-            IReadOnlyDictionary<string, ulong> symbols,
-            byte[] image)
-        {
-            foreach (var section in obj.DataSections)
-            {
-                if (section.Relocations.Length == 0)
-                    continue;
-                if (!sections.TryGetValue(section.Name, out var layout))
-                    continue;
-                if (section.Kind == X86ObjectSectionKind.Bss)
-                    throw new InvalidOperationException("BSS relocations cannot be represented in an ELF executable without runtime relocations.");
-                foreach (var relocation in section.Relocations)
-                    ApplyRelocation(image, layout.FileOffset + relocation.Offset, layout.Address, relocation.Offset, relocation, symbols, obj.Target);
-            }
-        }
-
-        private static void ApplyRelocation(
-            byte[] image,
-            int imageOffset,
-            ulong sectionAddress,
-            int sectionOffset,
-            X86ObjectRelocation relocation,
-            IReadOnlyDictionary<string, ulong> symbols,
-            X86Target target)
-        {
-            var symbolAddress = ResolveSymbol(symbols, relocation.SymbolName);
-            var value = checked((long)symbolAddress + relocation.Addend);
-            switch (relocation.Kind)
-            {
-                case X86ObjectRelocationKind.Relative8:
-                    WriteSigned(image, imageOffset, checked(value - (long)(sectionAddress + (ulong)sectionOffset + 1)), 1);
-                    break;
-                case X86ObjectRelocationKind.Relative32:
-                case X86ObjectRelocationKind.RipRelative32:
-                    WriteSigned(image, imageOffset, checked(value - (long)(sectionAddress + (ulong)sectionOffset + 4)), 4);
-                    break;
-                case X86ObjectRelocationKind.AbsolutePointer:
-                    WriteUnsigned(image, imageOffset, checked((ulong)value), target.Is32Bit ? 4 : 8);
-                    break;
-                case X86ObjectRelocationKind.Absolute32:
-                    WriteUnsigned(image, imageOffset, checked((ulong)value), 4);
-                    break;
-                case X86ObjectRelocationKind.Absolute64:
-                    WriteUnsigned(image, imageOffset, checked((ulong)value), 8);
-                    break;
-                default:
-                    throw new NotSupportedException("Unsupported x86 relocation: " + relocation.Kind);
-            }
-        }
-
-        private static void WriteHeaders(byte[] image, X86Target target, ulong entryAddress, IReadOnlyList<ElfSegmentLayout> segments)
-        {
-            image[0] = 0x7f;
-            image[1] = (byte)'E';
-            image[2] = (byte)'L';
-            image[3] = (byte)'F';
-            image[4] = target.Is64Bit ? (byte)2 : (byte)1;
-            image[5] = 1;
-            image[6] = 1;
-
-            if (target.Is64Bit)
-                WriteElf64Header(image, target, entryAddress, segments);
-            else
-                WriteElf32Header(image, target, entryAddress, segments);
-        }
-
-        private static void WriteElf64Header(byte[] image, X86Target target, ulong entryAddress, IReadOnlyList<ElfSegmentLayout> segments)
-        {
-            WriteUInt16(image, 16, EtExec);
-            WriteUInt16(image, 18, target.Is64Bit ? EmX86_64 : Em386);
-            WriteUInt32(image, 20, EvCurrent);
-            WriteUInt64(image, 24, entryAddress);
-            WriteUInt64(image, 32, 64);
-            WriteUInt64(image, 40, 0);
-            WriteUInt32(image, 48, 0);
-            WriteUInt16(image, 52, 64);
-            WriteUInt16(image, 54, 56);
-            WriteUInt16(image, 56, checked((ushort)segments.Count));
-            WriteUInt16(image, 58, 0);
-            WriteUInt16(image, 60, 0);
-            WriteUInt16(image, 62, 0);
-
-            var offset = 64;
-            foreach (var segment in segments)
-            {
-                WriteUInt32(image, offset + 0, PtLoad);
-                WriteUInt32(image, offset + 4, segment.Flags);
-                WriteUInt64(image, offset + 8, checked((ulong)segment.FileOffset));
-                WriteUInt64(image, offset + 16, segment.Address);
-                WriteUInt64(image, offset + 24, segment.Address);
-                WriteUInt64(image, offset + 32, checked((ulong)segment.FileSize));
-                WriteUInt64(image, offset + 40, checked((ulong)segment.MemorySize));
-                WriteUInt64(image, offset + 48, checked((ulong)segment.Alignment));
-                offset += 56;
-            }
-        }
-
-        private static void WriteElf32Header(byte[] image, X86Target target, ulong entryAddress, IReadOnlyList<ElfSegmentLayout> segments)
-        {
-            WriteUInt16(image, 16, EtExec);
-            WriteUInt16(image, 18, target.Is64Bit ? EmX86_64 : Em386);
-            WriteUInt32(image, 20, EvCurrent);
-            WriteUInt32(image, 24, checked((uint)entryAddress));
-            WriteUInt32(image, 28, 52);
-            WriteUInt32(image, 32, 0);
-            WriteUInt32(image, 36, 0);
-            WriteUInt16(image, 40, 52);
-            WriteUInt16(image, 42, 32);
-            WriteUInt16(image, 44, checked((ushort)segments.Count));
-            WriteUInt16(image, 46, 0);
-            WriteUInt16(image, 48, 0);
-            WriteUInt16(image, 50, 0);
-
-            var offset = 52;
-            foreach (var segment in segments)
-            {
-                WriteUInt32(image, offset + 0, PtLoad);
-                WriteUInt32(image, offset + 4, checked((uint)segment.FileOffset));
-                WriteUInt32(image, offset + 8, checked((uint)segment.Address));
-                WriteUInt32(image, offset + 12, checked((uint)segment.Address));
-                WriteUInt32(image, offset + 16, checked((uint)segment.FileSize));
-                WriteUInt32(image, offset + 20, checked((uint)segment.MemorySize));
-                WriteUInt32(image, offset + 24, segment.Flags);
-                WriteUInt32(image, offset + 28, checked((uint)segment.Alignment));
-                offset += 32;
-            }
-        }
-
-        private static ulong ResolveSymbol(IReadOnlyDictionary<string, ulong> symbols, string symbol)
-        {
-            if (symbols.TryGetValue(symbol, out var value))
-                return value;
-            throw new KeyNotFoundException($"Undefined x86 symbol: {symbol}");
-        }
-
-        private static int AlignUp(int value, int alignment)
-        {
-            alignment = Math.Max(1, alignment);
-            var mask = alignment - 1;
-            return checked((value + mask) & ~mask);
-        }
-
-        private static void WriteSigned(byte[] image, int offset, long value, int size)
-        {
-            switch (size)
-            {
-                case 1:
-                    if (value < sbyte.MinValue || value > sbyte.MaxValue)
-                        throw new OverflowException("x86 relocation does not fit in 8 bits.");
-                    image[offset] = unchecked((byte)(sbyte)value);
-                    break;
-                case 4:
-                    if (value < int.MinValue || value > int.MaxValue)
-                        throw new OverflowException("x86 relocation does not fit in 32 bits.");
-                    WriteUnsigned(image, offset, unchecked((uint)(int)value), 4);
-                    break;
-                default:
-                    throw new ArgumentOutOfRangeException(nameof(size));
-            }
-        }
-
-        private static void WriteUInt16(byte[] image, int offset, ushort value)
-            => WriteUnsigned(image, offset, value, 2);
-
-        private static void WriteUInt32(byte[] image, int offset, uint value)
-            => WriteUnsigned(image, offset, value, 4);
-
-        private static void WriteUInt64(byte[] image, int offset, ulong value)
-            => WriteUnsigned(image, offset, value, 8);
-
-        private static void WriteUnsigned(byte[] image, int offset, ulong value, int size)
-        {
-            for (var i = 0; i < size; i++)
-                image[offset + i] = (byte)(value >> (i * 8));
-        }
-
-        private sealed class ElfSectionLayout
-        {
-            public string Name { get; }
-            public X86ObjectSectionKind Kind { get; }
-            public int Alignment { get; }
-            public byte[] RawData { get; }
-            public int MemorySize { get; }
-            public int FileOffset { get; set; }
-            public int FileSize => RawData.Length;
-            public ulong Address { get; set; }
-
-            public ElfSectionLayout(string name, X86ObjectSectionKind kind, int alignment, byte[] rawData, int memorySize)
-            {
-                Name = name ?? string.Empty;
-                Kind = kind;
-                Alignment = Math.Max(1, alignment);
-                RawData = rawData ?? Array.Empty<byte>();
-                MemorySize = Math.Max(memorySize, RawData.Length);
-            }
-        }
-
-        private sealed class ElfSegmentLayout
-        {
-            public int FileOffset { get; }
-            public ulong Address { get; }
-            public int FileSize { get; }
-            public int MemorySize { get; }
-            public uint Flags { get; }
-            public int Alignment { get; }
-
-            public ElfSegmentLayout(int fileOffset, ulong address, int fileSize, int memorySize, uint flags, int alignment)
-            {
-                FileOffset = Math.Max(0, fileOffset);
-                Address = address;
-                FileSize = Math.Max(0, fileSize);
-                MemorySize = Math.Max(FileSize, memorySize);
-                Flags = flags;
-                Alignment = Math.Max(1, alignment);
-            }
-        }
+    private static void WriteUnsigned(byte[] image, int offset, ulong value, int size)
+    {
+        for (var i = 0; i < size; i++)
+            image[offset + i] = (byte)(value >> (i * 8));
     }
 }

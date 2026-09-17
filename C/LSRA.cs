@@ -117,6 +117,8 @@ namespace Cnidaria.C
             _abiPreferences.Clear();
             BuildIncomingParameterRegisters();
             var intervals = BuildIntervals();
+            foreach (var interval in intervals.Values)
+                interval.RegisterCount = TargetRegisterInfo.RegisterGroupCount(_target, interval.Register.Type);
             var allocations = new Dictionary<LirVirtualRegister, VirtualRegisterAllocation>();
 
             foreach (var interval in intervals.Values)
@@ -1091,13 +1093,13 @@ namespace Cnidaria.C
                     continue;
                 }
 
-                if (ActiveRegisterCount(interval, active, allowedRegisters) == allowedRegisters.Length)
+                var reg = PreferredFreeRegister(interval, allowedRegisters, active, allocations, copyPreferences, abiPreferences, valueNumberPreferredRegisters, target, callBoundarySplitClasses.Contains(interval.Register.RegisterClass) && IntervalSpansPosition(interval, callPositions));
+                if (reg == MachineRegister.Invalid)
                 {
                     SpillAtInterval(interval, active, allocations, valueNumberPreferredRegisters, allowedRegisters);
                 }
                 else
                 {
-                    var reg = PreferredFreeRegister(interval, allowedRegisters, active, allocations, copyPreferences, abiPreferences, valueNumberPreferredRegisters, target, callBoundarySplitClasses.Contains(interval.Register.RegisterClass) && IntervalSpansPosition(interval, callPositions));
                     interval.PhysicalRegister = reg;
                     allocations[interval.Register] = VirtualRegisterAllocation.InRegister(interval.Register, reg);
                     RememberValueNumberRegister(interval, reg, valueNumberPreferredRegisters);
@@ -1328,23 +1330,6 @@ namespace Cnidaria.C
             return safeRegister;
         }
 
-        private static int ActiveRegisterCount(LiveInterval current, List<LiveInterval> active, ImmutableArray<MachineRegister> registers)
-        {
-            var count = 0;
-            foreach (var register in registers)
-            {
-                foreach (var interval in active)
-                {
-                    if (interval.PhysicalRegister != register || !interval.Overlaps(current))
-                        continue;
-                    count++;
-                    break;
-                }
-            }
-
-            return count;
-        }
-
         private static bool ContainsRegister(ImmutableArray<MachineRegister> registers, MachineRegister register)
         {
             foreach (var candidate in registers)
@@ -1436,28 +1421,26 @@ namespace Cnidaria.C
             valueNumberPreferredRegisters[valueNumber] = register;
         }
 
+        /// <summary>A value wider than one register needs an aligned run, the way a vector group is addressed</summary>
+        private static bool IsGroupBase(MachineRegister register, int registerCount)
+            => registerCount <= 1 || (((int)register - (int)MachineRegister.V0) & (registerCount - 1)) == 0;
+
         private static bool IsFreeRegister(LiveInterval current, MachineRegister register, ImmutableArray<MachineRegister> physicalRegisters, List<LiveInterval> active)
         {
-            if (register == MachineRegister.Invalid)
+            if (register == MachineRegister.Invalid || !IsGroupBase(register, current.RegisterCount))
                 return false;
 
-            var isAllocatable = false;
-            foreach (var physicalRegister in physicalRegisters)
+            for (var offset = 0; offset < current.RegisterCount; offset++)
             {
-                if (physicalRegister == register)
-                {
-                    isAllocatable = true;
-                    break;
-                }
-            }
-
-            if (!isAllocatable)
-                return false;
-
-            foreach (var interval in active)
-            {
-                if (interval.PhysicalRegister == register && interval.Overlaps(current))
+                var member = (MachineRegister)((int)register + offset);
+                if (!ContainsRegister(physicalRegisters, member))
                     return false;
+
+                foreach (var interval in active)
+                {
+                    if (interval.Occupies(member) && interval.Overlaps(current))
+                        return false;
+                }
             }
 
             return true;
@@ -1467,17 +1450,7 @@ namespace Cnidaria.C
         {
             foreach (var register in physicalRegisters)
             {
-                var used = false;
-                foreach (var interval in active)
-                {
-                    if (interval.PhysicalRegister == register && interval.Overlaps(current))
-                    {
-                        used = true;
-                        break;
-                    }
-                }
-
-                if (!used)
+                if (IsFreeRegister(current, register, physicalRegisters, active))
                     return register;
             }
 
@@ -1497,13 +1470,16 @@ namespace Cnidaria.C
             var spillEnd = -1;
             foreach (var register in allowedRegisters)
             {
+                if (!IsGroupBase(register, current.RegisterCount) || !CoversGroup(register, current.RegisterCount, allowedRegisters))
+                    continue;
+
                 var conflicts = new List<LiveInterval>();
                 var hasFixedConflict = false;
                 var nearestNextUse = int.MaxValue;
                 var farthestEnd = -1;
                 foreach (var candidate in active)
                 {
-                    if (candidate.PhysicalRegister != register || !candidate.Overlaps(current))
+                    if (!OverlapsGroup(candidate, register, current.RegisterCount) || !candidate.Overlaps(current))
                         continue;
                     if (candidate.Register.HasFixedRegister)
                     {
@@ -1557,6 +1533,28 @@ namespace Cnidaria.C
             }
 
             allocations[current.Register] = VirtualRegisterAllocation.Spilled(current.Register, current.Register.RegisterClass);
+        }
+
+        private static bool CoversGroup(MachineRegister register, int registerCount, ImmutableArray<MachineRegister> registers)
+        {
+            for (var offset = 0; offset < registerCount; offset++)
+            {
+                if (!ContainsRegister(registers, (MachineRegister)((int)register + offset)))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static bool OverlapsGroup(LiveInterval interval, MachineRegister register, int registerCount)
+        {
+            for (var offset = 0; offset < registerCount; offset++)
+            {
+                if (interval.Occupies((MachineRegister)((int)register + offset)))
+                    return true;
+            }
+
+            return false;
         }
 
         private static void InsertActive(List<LiveInterval> active, LiveInterval interval)
@@ -2341,6 +2339,13 @@ namespace Cnidaria.C
             public int Start { get; set; }
             public int End { get; set; }
             public MachineRegister PhysicalRegister { get; set; }
+            public int RegisterCount { get; set; } = 1;
+
+            /// <summary>Tests whether the assignment of this interval covers a physical register</summary>
+            public bool Occupies(MachineRegister register)
+                => PhysicalRegister != MachineRegister.Invalid &&
+                   register >= PhysicalRegister &&
+                   (int)register < (int)PhysicalRegister + RegisterCount;
 
             public LiveInterval(LirVirtualRegister register, int start, int end)
             {
