@@ -10,4 +10,31 @@ typedef unsigned int uint32_t;
 typedef signed long long int64_t;
 typedef unsigned long long uint64_t;
 
+#if defined(_WIN64)
+typedef long long intptr_t;
+typedef unsigned long long uintptr_t;
+#elif defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 4
+typedef int intptr_t;
+typedef unsigned int uintptr_t;
+#else
+typedef long intptr_t;
+typedef unsigned long uintptr_t;
+#endif
+
+typedef long long intmax_t;
+typedef unsigned long long uintmax_t;
+
+#define INT8_MIN (-128)
+#define INT8_MAX 127
+#define UINT8_MAX 255
+#define INT16_MIN (-32768)
+#define INT16_MAX 32767
+#define UINT16_MAX 65535
+#define INT32_MIN (-2147483647 - 1)
+#define INT32_MAX 2147483647
+#define UINT32_MAX 4294967295u
+#define INT64_MIN (-9223372036854775807ll - 1)
+#define INT64_MAX 9223372036854775807ll
+#define UINT64_MAX 18446744073709551615ull
+
 #endif

@@ -461,7 +461,8 @@ public static class RiscVZBoot
         var files = new List<RiscVBootFile> { new RiscVBootFile(layout.KernelFileName, kernelImage) };
         if (additionalBootFiles is not null)
             files.AddRange(additionalBootFiles);
-        if (files.Count == 0 || files.Count > 16)
+        // The root holds a run of clusters, and half of what it holds is left for the guest to fill
+        if (files.Count == 0 || files.Count > RootDirectoryClusters * DirectoryEntriesPerSector / 2)
             throw new ArgumentOutOfRangeException(nameof(additionalBootFiles));
         var shortNames = new HashSet<string>(StringComparer.Ordinal);
         foreach (var file in files)
@@ -513,7 +514,7 @@ public static class RiscVZBoot
 
         var clusterMap = new List<(RiscVBootFile File, uint FirstCluster, uint ClusterCount)>();
         const uint rootCluster = 2;
-        uint nextFreeCluster = 3;
+        uint nextFreeCluster = rootCluster + RootDirectoryClusters;
         uint usedFileClusters = 0;
         foreach (var file in files)
         {
@@ -527,14 +528,18 @@ public static class RiscVZBoot
 
         WriteMbr(storage, partitionStartLba, totalSectors);
         WriteFat32BootSector(storage.AsSpan(partitionOffset, sectorSize), partitionStartLba, totalSectors, fatSectors, rootCluster);
-        WriteFat32FsInfo(storage.AsSpan(partitionOffset + sectorSize, sectorSize), clusterCount - usedFileClusters - 1, nextFreeCluster);
+        WriteFat32FsInfo(storage.AsSpan(partitionOffset + sectorSize, sectorSize), clusterCount - usedFileClusters - RootDirectoryClusters, nextFreeCluster);
         storage.AsSpan(partitionOffset + 6 * sectorSize, sectorSize).Clear();
         storage.AsSpan(partitionOffset, sectorSize).CopyTo(storage.AsSpan(partitionOffset + 6 * sectorSize, sectorSize));
 
         int fatOffset = checked(partitionOffset + reservedSectors * sectorSize);
         WriteLe32(storage, fatOffset + 0, 0x0ffffff8U);
         WriteLe32(storage, fatOffset + 4, 0xffffffffU);
-        WriteLe32(storage, fatOffset + (int)rootCluster * 4, 0x0fffffffU);
+        for (uint cluster = rootCluster; cluster < rootCluster + RootDirectoryClusters; cluster++)
+        {
+            var next = cluster + 1 == rootCluster + RootDirectoryClusters ? 0x0fffffffU : cluster + 1;
+            WriteLe32(storage, checked(fatOffset + (int)cluster * 4), next);
+        }
         foreach (var item in clusterMap)
         {
             uint lastCluster = checked(item.FirstCluster + item.ClusterCount - 1);
@@ -555,6 +560,11 @@ public static class RiscVZBoot
             Buffer.BlockCopy(item.File.Contents, 0, storage, fileOffset, item.File.Contents.Length);
         }
     }
+
+    /// <summary>Clusters the root directory spans, which is what bounds how many names a volume can hold at once</summary>
+    private const uint RootDirectoryClusters = 8;
+
+    private const int DirectoryEntriesPerSector = (int)RVMmioBlockDevice.SectorSize / 32;
 
     private static void WriteMbr(byte[] storage, uint partitionStartLba, uint partitionSectors)
     {
@@ -881,6 +891,18 @@ public static class RiscVUserland
     public static string DefaultInitSource => ReadUserSource("init.c");
     public static string DefaultShellSource => ReadUserSource("shell.c");
     public static string DefaultEchoSource => ReadUserSource("echo.c");
+    public static string DefaultLsSource => ReadUserSource("ls.c");
+    public static string DefaultCatSource => ReadUserSource("cat.c");
+    public static string DefaultWcSource => ReadUserSource("wc.c");
+    public static string DefaultHeadSource => ReadUserSource("head.c");
+    public static string DefaultPwdSource => ReadUserSource("pwd.c");
+    public static string DefaultUnameSource => ReadUserSource("uname.c");
+    public static string DefaultCpSource => ReadUserSource("cp.c");
+    public static string DefaultRmSource => ReadUserSource("rm.c");
+    public static string DefaultTouchSource => ReadUserSource("touch.c");
+    public static string DefaultMkdirSource => ReadUserSource("mkdir.c");
+    public static string DefaultRmdirSource => ReadUserSource("rmdir.c");
+    public static string DefaultEnvSource => ReadUserSource("env.c");
     public static string DefaultAutorunSource => ReadUserSource("autorun.c");
     public static string DynamicLoaderSource => ReadUserSource("ldso.c");
     public static string HostLibrarySource => ReadUserSource("hostlib.c");
@@ -888,6 +910,18 @@ public static class RiscVUserland
     public static readonly byte[] DefaultInit = BuildProgram(DefaultInitSource, "riscv/os/init.c");
     public static readonly byte[] DefaultShell = BuildProgram(DefaultShellSource, "riscv/os/shell.c");
     public static readonly byte[] DefaultEcho = BuildProgram(DefaultEchoSource, "riscv/os/echo.c");
+    public static readonly byte[] DefaultLs = BuildProgram(DefaultLsSource, "riscv/os/ls.c");
+    public static readonly byte[] DefaultCat = BuildProgram(DefaultCatSource, "riscv/os/cat.c");
+    public static readonly byte[] DefaultWc = BuildProgram(DefaultWcSource, "riscv/os/wc.c");
+    public static readonly byte[] DefaultHead = BuildProgram(DefaultHeadSource, "riscv/os/head.c");
+    public static readonly byte[] DefaultPwd = BuildProgram(DefaultPwdSource, "riscv/os/pwd.c");
+    public static readonly byte[] DefaultUname = BuildProgram(DefaultUnameSource, "riscv/os/uname.c");
+    public static readonly byte[] DefaultCp = BuildProgram(DefaultCpSource, "riscv/os/cp.c");
+    public static readonly byte[] DefaultRm = BuildProgram(DefaultRmSource, "riscv/os/rm.c");
+    public static readonly byte[] DefaultTouch = BuildProgram(DefaultTouchSource, "riscv/os/touch.c");
+    public static readonly byte[] DefaultMkdir = BuildProgram(DefaultMkdirSource, "riscv/os/mkdir.c");
+    public static readonly byte[] DefaultRmdir = BuildProgram(DefaultRmdirSource, "riscv/os/rmdir.c");
+    public static readonly byte[] DefaultEnv = BuildProgram(DefaultEnvSource, "riscv/os/env.c");
     public static readonly byte[] DefaultAutorun = BuildProgram(DefaultAutorunSource, "riscv/os/autorun.c");
 
     public const string InterpreterPath = "/ld.so";
@@ -917,16 +951,28 @@ public static class RiscVUserland
         byte[]? hostLibrary = null)
     {
         return ImmutableArray.Create(
-                new RiscVBootFile("INIT.ELF", DefaultInit),
-                new RiscVBootFile("SHELL.ELF", DefaultShell),
-                new RiscVBootFile("ECHO.ELF", DefaultEcho),
+                new RiscVBootFile("INIT", DefaultInit),
+                new RiscVBootFile("SHELL", DefaultShell),
+                new RiscVBootFile("ECHO", DefaultEcho),
+                new RiscVBootFile("LS", DefaultLs),
+                new RiscVBootFile("CAT", DefaultCat),
+                new RiscVBootFile("WC", DefaultWc),
+                new RiscVBootFile("HEAD", DefaultHead),
+                new RiscVBootFile("PWD", DefaultPwd),
+                new RiscVBootFile("UNAME", DefaultUname),
+                new RiscVBootFile("CP", DefaultCp),
+                new RiscVBootFile("RM", DefaultRm),
+                new RiscVBootFile("TOUCH", DefaultTouch),
+                new RiscVBootFile("MKDIR", DefaultMkdir),
+                new RiscVBootFile("RMDIR", DefaultRmdir),
+                new RiscVBootFile("ENV", DefaultEnv),
                 new RiscVBootFile(InterpreterFileName, DefaultDynamicLoader),
                 new RiscVBootFile(StandardLibraryFileName, DefaultSharedStandardLibrary),
                 new RiscVBootFile(HostLibraryFileName, hostLibrary ?? DefaultHostLibrary),
                 new RiscVBootFile(FramebufferLibraryFileName, DefaultFramebufferLibrary),
                 autorunSource == null
-                ? new RiscVBootFile("AUTORUN.ELF", DefaultAutorun)
-                : new RiscVBootFile("AUTORUN.ELF", autorunSource));
+                ? new RiscVBootFile("AUTORUN", DefaultAutorun)
+                : new RiscVBootFile("AUTORUN", autorunSource));
     }
 
     public static Cnidaria.C.StaticLinkResult<RiscVProgram> LinkDynamicObject(

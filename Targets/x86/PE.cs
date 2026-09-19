@@ -30,7 +30,10 @@ internal static class X86PortableExecutableWriter
     private static readonly ImmutableArray<WindowsImportDll> Kernel32Imports = ImmutableArray.Create(
         new WindowsImportDll("KERNEL32.dll", ImmutableArray.Create(
             "GetStdHandle", "WriteFile", "ExitProcess", "GetCurrentThreadId", "GetCurrentProcessorNumber", "GetProcessHeap", 
-            "HeapAlloc", "HeapReAlloc", "HeapFree", "VirtualAlloc", "VirtualFree")));
+            "HeapAlloc", "HeapReAlloc", "HeapFree", "VirtualAlloc", "VirtualFree",
+            "CreateFileA", "ReadFile", "CloseHandle", "SetFilePointerEx", "SetEndOfFile", "FlushFileBuffers",
+            "GetFileSizeEx", "GetFileAttributesA", "DeleteFileA", "MoveFileExA", "CreateDirectoryA", "RemoveDirectoryA",
+            "GetFileType", "GetCurrentDirectoryA", "SetCurrentDirectoryA")));
 
     public static ulong DefaultImageBase(X86Target target)
         => target is not null && target.Is64Bit ? 0x0000000140000000UL : 0x00400000UL;

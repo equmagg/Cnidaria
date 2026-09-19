@@ -15,13 +15,13 @@ public sealed class X86CodeGeneratorOptions
     public bool EmitStartup { get; set; } = true;
     public string EntryFunctionName { get; set; } = "main";
 
-    /// <summary>Keeps an undefined symbol out of a memory operand, so a dynamic image can route it through the global offset table.</summary>
+    /// <summary>Keeps an undefined symbol out of a memory operand, so a dynamic image can route it through the global offset table</summary>
     public bool IndirectExternalData { get; set; }
 
-    /// <summary>Hands control to __libc_start_main instead of calling main and exiting through a raw system call.</summary>
+    /// <summary>Hands control to __libc_start_main instead of calling main and exiting through a raw system call</summary>
     public bool CLibraryStartup { get; set; }
 
-    /// <summary>Reaches a symbol relative to the instruction pointer, which a shared object needs to load at any base.</summary>
+    /// <summary>Reaches a symbol relative to the instruction pointer, which a shared object needs to load at any base</summary>
     public bool PositionIndependentCode { get; set; }
 }
 
@@ -158,6 +158,21 @@ public sealed class X86CodeGenerator
         AddExternalSymbol("__imp_HeapFree", X86ObjectSymbolKind.Object);
         AddExternalSymbol("__imp_VirtualAlloc", X86ObjectSymbolKind.Object);
         AddExternalSymbol("__imp_VirtualFree", X86ObjectSymbolKind.Object);
+        AddExternalSymbol("__imp_CreateFileA", X86ObjectSymbolKind.Object);
+        AddExternalSymbol("__imp_ReadFile", X86ObjectSymbolKind.Object);
+        AddExternalSymbol("__imp_CloseHandle", X86ObjectSymbolKind.Object);
+        AddExternalSymbol("__imp_SetFilePointerEx", X86ObjectSymbolKind.Object);
+        AddExternalSymbol("__imp_SetEndOfFile", X86ObjectSymbolKind.Object);
+        AddExternalSymbol("__imp_FlushFileBuffers", X86ObjectSymbolKind.Object);
+        AddExternalSymbol("__imp_GetFileSizeEx", X86ObjectSymbolKind.Object);
+        AddExternalSymbol("__imp_GetFileAttributesA", X86ObjectSymbolKind.Object);
+        AddExternalSymbol("__imp_DeleteFileA", X86ObjectSymbolKind.Object);
+        AddExternalSymbol("__imp_MoveFileExA", X86ObjectSymbolKind.Object);
+        AddExternalSymbol("__imp_CreateDirectoryA", X86ObjectSymbolKind.Object);
+        AddExternalSymbol("__imp_RemoveDirectoryA", X86ObjectSymbolKind.Object);
+        AddExternalSymbol("__imp_GetFileType", X86ObjectSymbolKind.Object);
+        AddExternalSymbol("__imp_GetCurrentDirectoryA", X86ObjectSymbolKind.Object);
+        AddExternalSymbol("__imp_SetCurrentDirectoryA", X86ObjectSymbolKind.Object);
 
         return EmitWindowsStart(userEntryLabel);
     }
@@ -170,7 +185,7 @@ public sealed class X86CodeGenerator
 
         var label = CreateUniqueGlobalLabel("_start");
         var startOffset = _text.ByteLength;
-        _text.DefineLabel(label);
+        DefineLabel(label);
         if (_machineTarget.Is64Bit)
         {
             Emit(X86Instruction.Unary(X86InstrKind.Pop, Reg(X86Register.Rdi, 8)));
@@ -216,7 +231,7 @@ public sealed class X86CodeGenerator
 
         var label = CreateUniqueGlobalLabel("_start");
         var startOffset = _text.ByteLength;
-        _text.DefineLabel(label);
+        DefineLabel(label);
         AddExternalSymbol(LibcStartMain, X86ObjectSymbolKind.Function);
 
         Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rbp, 4), Reg(X86Register.Rbp, 4)));
@@ -241,7 +256,7 @@ public sealed class X86CodeGenerator
     {
         var label = CreateUniqueGlobalLabel("_start");
         var startOffset = _text.ByteLength;
-        _text.DefineLabel(label);
+        DefineLabel(label);
         if (_machineTarget.Is64Bit)
         {
             Emit(X86Instruction.Binary(X86InstrKind.And, Reg(X86Register.Rsp, 8), Imm(-16)));
@@ -286,7 +301,149 @@ public sealed class X86CodeGenerator
     }
 
     private void Emit(X86Instruction instruction)
-        => _text.Emit(_options.PositionIndependentCode ? RelaxToRipRelative(instruction) : instruction);
+    {
+        RecordZeroExtension(instruction);
+        _text.Emit(_options.PositionIndependentCode ? RelaxToRipRelative(instruction) : instruction);
+    }
+
+    /// <summary>Defines a label, which is also where control may arrive holding anything at all</summary>
+    internal void DefineLabel(string label)
+    {
+        ForgetZeroExtensions();
+        _text.DefineLabel(label);
+    }
+
+    /// <summary>How far up a general register is known to be zero, in bits, or zero for nothing known</summary>
+    private readonly int[] _zeroExtendedBits = new int[16];
+
+    internal void ForgetZeroExtensions() => Array.Clear(_zeroExtendedBits, 0, _zeroExtendedBits.Length);
+
+    internal int GetZeroExtendedBits(X86Register register)
+    {
+        var index = (int)register;
+        return (uint)index < (uint)_zeroExtendedBits.Length ? _zeroExtendedBits[index] : 0;
+    }
+
+    private void SetZeroExtendedBits(X86Register register, int bits)
+    {
+        var index = (int)register;
+        if ((uint)index < (uint)_zeroExtendedBits.Length)
+            _zeroExtendedBits[index] = bits;
+    }
+
+    /// <summary>
+    /// Follows what each emitted instruction leaves in the high bits of its destination. Only the opcodes
+    /// listed here are understood to write one register and nothing else; anything else forgets everything,
+    /// so an opcode with a hidden destination can never leave a stale fact behind.
+    /// </summary>
+    private void RecordZeroExtension(X86Instruction instruction)
+    {
+        switch (instruction.Opcode)
+        {
+            case X86InstrKind.Cmp:
+            case X86InstrKind.Test:
+            case X86InstrKind.Jmp:
+            case X86InstrKind.Jcc:
+            case X86InstrKind.Ud2:
+                return;
+
+            // These move the stack pointer without naming it, so it is the one register they unsettle
+            case X86InstrKind.Push:
+                SetZeroExtendedBits(X86Register.Rsp, 0);
+                return;
+            case X86InstrKind.Pop:
+                SetZeroExtendedBits(X86Register.Rsp, 0);
+                break;
+
+            case X86InstrKind.Mov:
+            case X86InstrKind.Movzx:
+            case X86InstrKind.Movsx:
+            case X86InstrKind.Movsxd:
+            case X86InstrKind.Lea:
+            case X86InstrKind.Add:
+            case X86InstrKind.Sub:
+            case X86InstrKind.And:
+            case X86InstrKind.Or:
+            case X86InstrKind.Xor:
+            case X86InstrKind.Shl:
+            case X86InstrKind.Shr:
+            case X86InstrKind.Sar:
+            case X86InstrKind.Imul:
+            case X86InstrKind.Neg:
+            case X86InstrKind.Not:
+            case X86InstrKind.Inc:
+            case X86InstrKind.Dec:
+            case X86InstrKind.Setcc:
+            case X86InstrKind.Cmovcc:
+                break;
+
+            default:
+                ForgetZeroExtensions();
+                return;
+        }
+
+        // The one-operand multiply spreads its product over rdx:rax without naming either
+        if (instruction.Opcode == X86InstrKind.Imul && instruction.Operand1.Kind == X86OperandKind.None)
+        {
+            ForgetZeroExtensions();
+            return;
+        }
+
+        var destination = instruction.Operand0;
+        if (destination.Kind != X86OperandKind.Register)
+            return;
+        if (!IsGeneralRegister(destination.Register))
+        {
+            ForgetZeroExtensions();
+            return;
+        }
+
+        SetZeroExtensionFrom(instruction, destination);
+    }
+
+    private void SetZeroExtensionFrom(X86Instruction instruction, X86Operand destination)
+    {
+        // movzx names the width it carried over, which is narrower than the register it cleared
+        if (instruction.Opcode == X86InstrKind.Movzx && destination.Size >= 4)
+        {
+            var source = instruction.Operand1;
+            var carried = Math.Max(1, source.Size) * 8;
+            SetZeroExtendedBits(destination.Register, carried);
+            return;
+        }
+
+        // Zeroing a register by subtracting it from itself leaves nothing above the low bit
+        if (instruction.Opcode == X86InstrKind.Xor &&
+            instruction.Operand1.Kind == X86OperandKind.Register &&
+            instruction.Operand1.Register == destination.Register)
+        {
+            SetZeroExtendedBits(destination.Register, 1);
+            return;
+        }
+
+        if (instruction.Opcode == X86InstrKind.Mov &&
+            instruction.Operand1.Kind == X86OperandKind.Immediate &&
+            !instruction.Operand1.HasSymbol &&
+            instruction.Operand1.Immediate >= 0)
+        {
+            SetZeroExtendedBits(destination.Register, SignificantBits(instruction.Operand1.Immediate));
+            return;
+        }
+
+        // Writing a 32-bit register clears the half above it, which is the widest fact left to state
+        SetZeroExtendedBits(destination.Register, _machineTarget.Is64Bit && destination.Size == 4 ? 32 : 0);
+    }
+
+    private static int SignificantBits(long value)
+    {
+        var bits = 1;
+        while (bits < 64 && (value >> bits) != 0)
+            bits++;
+        return bits;
+    }
+
+    private static bool IsGeneralRegister(X86Register register)
+        => register >= X86Register.Rax && register <= X86Register.R15;
 
     /// <summary>An absolute symbol immediate only reaches its target where the image is loaded at its link address.</summary>
     private X86Instruction RelaxToRipRelative(X86Instruction instruction)
@@ -498,6 +655,47 @@ public sealed class X86CodeGenerator
                 nextIndex++;
             }
         }
+        else if (!list.IsByteImage && type.Type is TagType tag)
+        {
+            // Members are written in order, so the gaps between their offsets need zeroes
+            var fields = tag.Symbol.Fields;
+            var index = 0;
+            foreach (var item in list.Items)
+            {
+                if (section.ByteLength - start >= availableSize)
+                    break;
+                // An unnamed bit-field takes no initializer
+                while (index < fields.Length && fields[index].IsBitField && fields[index].Name.Length == 0)
+                    index++;
+                if (index >= fields.Length)
+                    break;
+
+                var field = fields[index++];
+                var fieldOffset = tag.Symbol.TagKind == TagKind.Union ? 0 : _target.GetFieldPlacement(field).ByteOffset;
+                var written = section.ByteLength - start;
+                if (fieldOffset > written)
+                {
+                    section.EmitZero(Math.Min(fieldOffset - written, availableSize - written));
+                    written = section.ByteLength - start;
+                }
+
+                // Bit-fields sharing a storage unit are emitted once
+                if (fieldOffset < written)
+                    continue;
+
+                var fieldSize = Math.Max(1, _target.SizeOf(field.Type));
+                var used = EmitInitializer(section, field.Type, item.Initializer, Math.Min(fieldSize, availableSize - written));
+                if (used < fieldSize && section.ByteLength - start < availableSize)
+                    section.EmitZero(Math.Min(fieldSize - used, availableSize - (section.ByteLength - start)));
+
+                if (tag.Symbol.TagKind == TagKind.Union)
+                    break;
+            }
+
+            // Zero-fill the tail up to the object size
+            if (section.ByteLength - start < availableSize)
+                section.EmitZero(availableSize - (section.ByteLength - start));
+        }
         else
         {
             foreach (var item in list.Items)
@@ -610,7 +808,7 @@ public sealed class X86CodeGenerator
 
         var context = new FunctionEmissionContext(this, function, allocation, label, blockLabels);
         var startOffset = _text.ByteLength;
-        _text.DefineLabel(label);
+        DefineLabel(label);
         context.EmitPrologue();
         context.EmitBlocks();
         context.EmitEpilogue();
@@ -810,6 +1008,8 @@ public sealed class X86CodeGenerator
         private readonly int _stackArgumentSlotSize;
         private readonly int _sysVX64RegisterSaveAreaOffset;
         private readonly Dictionary<LirVirtualRegister, LirInstruction> _foldableLoads = new();
+        private readonly Dictionary<LirInstruction, LirInstruction> _divRemPartners = new();
+        private readonly HashSet<LirInstruction> _fusedDivRem = new();
         private readonly Dictionary<LirVirtualRegister, X86Operand> _foldedAddresses = new();
         private int _currentInstructionPosition;
         private LirBlock? _fallthroughBlock;
@@ -872,6 +1072,7 @@ public sealed class X86CodeGenerator
         {
             FindFoldableLoads();
             FindSelectDiamonds();
+            FindDivRemPairs();
             _currentInstructionPosition = 0;
             for (var blockIndex = 0; blockIndex < _function.Blocks.Length; blockIndex++)
             {
@@ -890,6 +1091,11 @@ public sealed class X86CodeGenerator
 
                 foreach (var instruction in block.Instructions)
                 {
+                    if (_fusedDivRem.Contains(instruction))
+                    {
+                        _currentInstructionPosition += 2;
+                        continue;
+                    }
                     if (instruction.Result is null || !_foldableLoads.ContainsKey(instruction.Result))
                         EmitInstruction(instruction);
                     _currentInstructionPosition += 2;
@@ -951,7 +1157,6 @@ public sealed class X86CodeGenerator
                     Reg(LoadSelectValue(diamond.TrueValue, Scratch1, size, instruction), size)));
             }
 
-            NormalizeIntegerRegister(destination, diamond.Destination.Type);
             StoreWritableRegisterIfSpilled(diamond.Destination, destination);
             if (!FallsThroughToJoin(diamond.Join))
                 EmitJump(diamond.Join);
@@ -1018,7 +1223,7 @@ public sealed class X86CodeGenerator
 
         public void EmitEpilogue()
         {
-            _owner._text.DefineLabel(_epilogueLabel);
+            _owner.DefineLabel(_epilogueLabel);
             RestoreCalleeSavedVectorRegisters();
             if (_frameSize != 0)
                 Emit(X86Instruction.Binary(X86InstrKind.Add, StackPointer(), Imm(_frameSize)));
@@ -2202,6 +2407,17 @@ public sealed class X86CodeGenerator
                 throw Unsupported(instruction, "Unsupported parameter location for aggregate parameter.");
             }
             {
+                var allocation = _allocation[destination];
+                if (location.Kind == AbiLocationKind.Register && allocation.IsSpilled)
+                {
+                    // The parameter already sits in a register, and its slot is where it has to end up
+                    EmitStoreToStack(
+                        ToX86Register(location.Register, _owner._machineTarget),
+                        allocation.StackOffset,
+                        Math.Min(RegisterSize(destination.Type), size));
+                    return;
+                }
+
                 var writable = GetWritableRegister(destination, PreferredScratch(destination.Type));
                 if (location.Kind == AbiLocationKind.Register)
                 {
@@ -2408,7 +2624,6 @@ public sealed class X86CodeGenerator
                 default:
                     throw Unsupported(instruction, $"Unsupported unary operator '{instruction.Operator}'.");
             }
-            NormalizeIntegerRegister(dst, instruction.Result.Type);
             StoreWritableRegisterIfSpilled(instruction.Result, dst);
         }
 
@@ -2553,10 +2768,6 @@ public sealed class X86CodeGenerator
                 Emit(X86Instruction.Setcc(X86Condition.Ne, Reg(X86Register.Rax, 1)));
                 Emit(X86Instruction.Binary(X86InstrKind.Movzx, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 1)));
             }
-            else
-            {
-                NormalizeIntegerRegister(X86Register.Rax, instruction.Result.Type);
-            }
 
             var destination = GetWritableRegister(instruction.Result, X86Register.Rax);
             MoveRegister(destination, X86Register.Rax, RegisterSize(instruction.Result.Type));
@@ -2616,7 +2827,7 @@ public sealed class X86CodeGenerator
             StoreWideIntegerResult(instruction.Result!, X86Register.Rax, X86Register.Rdx);
             Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(done, 4, X86ObjectRelocationKind.Relative32)));
 
-            _owner._text.DefineLabel(large);
+            _owner.DefineLabel(large);
             Emit(X86Instruction.Binary(X86InstrKind.And, Reg(X86Register.Rcx, 4), Imm(31)));
             if (instruction.Operator == "<<")
             {
@@ -2642,10 +2853,10 @@ public sealed class X86CodeGenerator
             StoreWideIntegerResult(instruction.Result!, X86Register.Rax, X86Register.Rdx);
             Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(done, 4, X86ObjectRelocationKind.Relative32)));
 
-            _owner._text.DefineLabel(zero);
+            _owner.DefineLabel(zero);
             LoadWideIntegerTemp(0, X86Register.Rax, X86Register.Rdx);
             StoreWideIntegerResult(instruction.Result!, X86Register.Rax, X86Register.Rdx);
-            _owner._text.DefineLabel(done);
+            _owner.DefineLabel(done);
         }
 
         private void EmitWideIntegerMultiply(LirInstruction instruction)
@@ -2661,7 +2872,7 @@ public sealed class X86CodeGenerator
             Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rax, 4), WideTempMemory(1, 4)));
             Emit(X86Instruction.ConditionalBranch(X86Condition.E, X86Operand.SymbolOperand(done, 4, X86ObjectRelocationKind.Relative32)));
 
-            _owner._text.DefineLabel(loop);
+            _owner.DefineLabel(loop);
             Emit(X86Instruction.Binary(X86InstrKind.Test, WideTempMemory(1, 0), Imm(1)));
             Emit(X86Instruction.ConditionalBranch(X86Condition.E, X86Operand.SymbolOperand(skipAdd, 4, X86ObjectRelocationKind.Relative32)));
             LoadWideIntegerResult(instruction.Result!, X86Register.Rax, X86Register.Rdx);
@@ -2669,7 +2880,7 @@ public sealed class X86CodeGenerator
             Emit(X86Instruction.Binary(X86InstrKind.Adc, Reg(X86Register.Rdx, 4), WideTempMemory(0, 4)));
             StoreWideIntegerResult(instruction.Result!, X86Register.Rax, X86Register.Rdx);
 
-            _owner._text.DefineLabel(skipAdd);
+            _owner.DefineLabel(skipAdd);
             LoadWideIntegerTemp(0, X86Register.Rax, X86Register.Rdx);
             Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
             Emit(X86Instruction.Binary(X86InstrKind.Adc, Reg(X86Register.Rdx, 4), Reg(X86Register.Rdx, 4)));
@@ -2686,7 +2897,7 @@ public sealed class X86CodeGenerator
             MoveRegister(X86Register.Rcx, X86Register.Rax, 4);
             Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rcx, 4), Reg(X86Register.Rdx, 4)));
             Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, X86Operand.SymbolOperand(loop, 4, X86ObjectRelocationKind.Relative32)));
-            _owner._text.DefineLabel(done);
+            _owner.DefineLabel(done);
         }
 
         private void EmitWideIntegerDivide(LirInstruction instruction, bool wantRemainder)
@@ -2704,7 +2915,7 @@ public sealed class X86CodeGenerator
             Emit(new X86Instruction(X86InstrKind.Ud2));
             ZeroWideIntegerResult(instruction.Result!);
             Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(done, 4, X86ObjectRelocationKind.Relative32)));
-            _owner._text.DefineLabel(divisorReady);
+            _owner.DefineLabel(divisorReady);
 
             ZeroWideIntegerTemp(2);
             ZeroWideIntegerTemp(3);
@@ -2724,7 +2935,7 @@ public sealed class X86CodeGenerator
             }
 
             Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rcx, 4), Imm(64)));
-            _owner._text.DefineLabel(loop);
+            _owner.DefineLabel(loop);
             LoadWideIntegerTemp(0, X86Register.Rax, X86Register.Rdx);
             Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
             Emit(X86Instruction.Binary(X86InstrKind.Adc, Reg(X86Register.Rdx, 4), Reg(X86Register.Rdx, 4)));
@@ -2740,13 +2951,13 @@ public sealed class X86CodeGenerator
             Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.Rax, 4), WideTempMemory(1, 0)));
             Emit(X86Instruction.ConditionalBranch(X86Condition.B, X86Operand.SymbolOperand(skipSubtract, 4, X86ObjectRelocationKind.Relative32)));
 
-            _owner._text.DefineLabel(subtract);
+            _owner.DefineLabel(subtract);
             Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(X86Register.Rax, 4), WideTempMemory(1, 0)));
             Emit(X86Instruction.Binary(X86InstrKind.Sbb, Reg(X86Register.Rdx, 4), WideTempMemory(1, 4)));
             StoreWideIntegerTemp(2, X86Register.Rax, X86Register.Rdx);
             Emit(X86Instruction.Binary(X86InstrKind.Or, WideTempMemory(0, 0), Imm(1)));
 
-            _owner._text.DefineLabel(skipSubtract);
+            _owner.DefineLabel(skipSubtract);
             Emit(X86Instruction.Unary(X86InstrKind.Dec, Reg(X86Register.Rcx, 4)));
             Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, X86Operand.SymbolOperand(loop, 4, X86ObjectRelocationKind.Relative32)));
 
@@ -2765,7 +2976,7 @@ public sealed class X86CodeGenerator
                     EmitConditionalNegateWideResult(instruction.Result!, WideTempMemory(3, 4));
             }
 
-            _owner._text.DefineLabel(done);
+            _owner.DefineLabel(done);
         }
 
         private void EmitWideIntegerComparison(LirInstruction instruction)
@@ -2817,12 +3028,12 @@ public sealed class X86CodeGenerator
             Emit(X86Instruction.ConditionalBranch(lowCondition, X86Operand.SymbolOperand(trueLabel, 4, X86ObjectRelocationKind.Relative32)));
             Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(falseLabel, 4, X86ObjectRelocationKind.Relative32)));
 
-            _owner._text.DefineLabel(trueLabel);
+            _owner.DefineLabel(trueLabel);
             Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 4), Imm(1)));
             Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(doneLabel, 4, X86ObjectRelocationKind.Relative32)));
-            _owner._text.DefineLabel(falseLabel);
+            _owner.DefineLabel(falseLabel);
             Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
-            _owner._text.DefineLabel(doneLabel);
+            _owner.DefineLabel(doneLabel);
             StoreWideComparisonResult(instruction.Result!, X86Register.Rax);
         }
 
@@ -2986,7 +3197,7 @@ public sealed class X86CodeGenerator
             Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rax, 4), Imm(1)));
             Emit(X86Instruction.Binary(X86InstrKind.Adc, Reg(X86Register.Rdx, 4), Imm(0)));
             StoreWideIntegerTemp(index, X86Register.Rax, X86Register.Rdx);
-            _owner._text.DefineLabel(done);
+            _owner.DefineLabel(done);
         }
 
         private void EmitConditionalNegateWideResult(LirVirtualRegister result, X86Operand condition)
@@ -3000,7 +3211,7 @@ public sealed class X86CodeGenerator
             Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rax, 4), Imm(1)));
             Emit(X86Instruction.Binary(X86InstrKind.Adc, Reg(X86Register.Rdx, 4), Imm(0)));
             StoreWideIntegerResult(result, X86Register.Rax, X86Register.Rdx);
-            _owner._text.DefineLabel(done);
+            _owner.DefineLabel(done);
         }
 
         private void StoreWideComparisonResult(LirVirtualRegister result, X86Register source)
@@ -3041,7 +3252,6 @@ public sealed class X86CodeGenerator
 
             if (!rightIsFoldedLoad && TryEmitLeaBinary(instruction, left, right, destination, size))
             {
-                NormalizeIntegerRegister(destination, instruction.Result.Type);
                 StoreWritableRegisterIfSpilled(instruction.Result, destination);
                 return;
             }
@@ -3129,7 +3339,6 @@ public sealed class X86CodeGenerator
             }
 
             MoveRegister(destination, dst, size);
-            NormalizeIntegerRegister(destination, instruction.Result.Type);
             StoreWritableRegisterIfSpilled(instruction.Result, destination);
         }
 
@@ -3302,9 +3511,38 @@ public sealed class X86CodeGenerator
             Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(dst, size), Reg(Scratch1, size)));
         }
 
+        // A quotient and a remainder over the same operands are one division, so the pair is emitted together
+        private void FindDivRemPairs()
+        {
+            _divRemPartners.Clear();
+            _fusedDivRem.Clear();
+            foreach (var block in _function.Blocks)
+            {
+                var instructions = block.Instructions;
+                for (var i = 0; i + 1 < instructions.Length; i++)
+                {
+                    var first = instructions[i];
+                    var second = instructions[i + 1];
+                    if (!LirStrengthReduction.IsDivideRemainderPair(first, second))
+                        continue;
+                    // A power of two is a shift for each, which is already cheaper than sharing a division
+                    if (LirStrengthReduction.TryGetPowerOfTwoDivisor(first, _owner._target, out _, out _))
+                        continue;
+                    if (IsX86WideInteger(first.Result!.Type) || IsX86WideInteger(second.Result!.Type))
+                        continue;
+                    _divRemPartners.Add(first, second);
+                    _fusedDivRem.Add(second);
+                    i++;
+                }
+            }
+        }
+
         private void EmitDivide(LirInstruction instruction, bool signed, bool wantRemainder)
         {
+            _divRemPartners.TryGetValue(instruction, out var partner);
             if (TryEmitDivideByPowerOfTwo(instruction, signed, wantRemainder))
+                return;
+            if (TryEmitDivideByMagic(instruction, signed, wantRemainder, partner))
                 return;
 
             var size = RegisterSize(instruction.Operands[0].Type);
@@ -3330,10 +3568,156 @@ public sealed class X86CodeGenerator
                 Emit(X86Instruction.Unary(X86InstrKind.Div, divisor));
             }
 
-            var dst = GetWritableRegister(instruction.Result!, wantRemainder ? X86Register.Rdx : X86Register.Rax);
-            MoveRegister(dst, wantRemainder ? X86Register.Rdx : X86Register.Rax, size);
-            NormalizeIntegerRegister(dst, instruction.Result!.Type);
-            StoreWritableRegisterIfSpilled(instruction.Result!, dst);
+            // idiv names the quotient and the remainder at once, so a paired neighbour is already answered
+            StoreDivideResults(
+                instruction,
+                wantRemainder ? X86Register.Rdx : X86Register.Rax,
+                partner,
+                wantRemainder ? X86Register.Rax : X86Register.Rdx,
+                X86Register.Rcx,
+                size);
+        }
+
+        // Either destination may be the register the other value sits in, so the order matters
+        private void StoreDivideResults(
+            LirInstruction first,
+            X86Register firstSource,
+            LirInstruction? second,
+            X86Register secondSource,
+            X86Register spare,
+            int size)
+        {
+            var firstDestination = GetWritableRegister(first.Result!, firstSource);
+            if (second is null)
+            {
+                MoveRegister(firstDestination, firstSource, size);
+                StoreWritableRegisterIfSpilled(first.Result!, firstDestination);
+                return;
+            }
+
+            var secondDestination = GetWritableRegister(second.Result!, secondSource);
+            if (firstDestination == secondSource && secondDestination == firstSource)
+            {
+                MoveRegister(spare, firstSource, size);
+                MoveRegister(secondDestination, secondSource, size);
+                MoveRegister(firstDestination, spare, size);
+            }
+            else if (firstDestination == secondSource)
+            {
+                MoveRegister(secondDestination, secondSource, size);
+                MoveRegister(firstDestination, firstSource, size);
+            }
+            else
+            {
+                MoveRegister(firstDestination, firstSource, size);
+                MoveRegister(secondDestination, secondSource, size);
+            }
+
+            StoreWritableRegisterIfSpilled(first.Result!, firstDestination);
+            StoreWritableRegisterIfSpilled(second.Result!, secondDestination);
+        }
+
+        // rax, rcx and rdx are reserved for every divide that is not a shift, so the sequence works in them
+        private bool TryEmitDivideByMagic(LirInstruction instruction, bool signed, bool wantRemainder, LirInstruction? partner)
+        {
+            var size = RegisterSize(instruction.Operands[0].Type);
+            if (size != _wordSize && size * 2 > _wordSize && size != 4)
+                return false;
+            if (!LirStrengthReduction.TryGetMagicDivisor(instruction, _owner._target, out var magic))
+                return false;
+
+            var bits = size * 8;
+            var dividend = X86Register.Rcx;
+            var quotient = X86Register.Rax;
+            var helper = X86Register.Rdx;
+
+            LoadOperandInto(instruction.Operands[0], dividend, instruction, size);
+            EmitHighMultiply(quotient, dividend, magic.Multiplier, signed, size);
+
+            if (signed)
+            {
+                // A reciprocal too wide for the signed width is off by exactly one dividend
+                if (magic.AddDividend)
+                    Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(quotient, size), Reg(dividend, size)));
+                else if (magic.SubtractDividend)
+                    Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(quotient, size), Reg(dividend, size)));
+                if (magic.Shift != 0)
+                    Emit(X86Instruction.Binary(X86InstrKind.Sar, Reg(quotient, size), Imm(magic.Shift)));
+                // Truncation rounds toward zero, which for a negative quotient is one above the shift
+                MoveRegister(helper, quotient, size);
+                Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(helper, size), Imm(bits - 1)));
+                Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(quotient, size), Reg(helper, size)));
+            }
+            else if (magic.AddDividend)
+            {
+                // Averaging the dividend back in recovers the bit the reciprocal could not hold
+                MoveRegister(helper, dividend, size);
+                Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(helper, size), Reg(quotient, size)));
+                Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(helper, size), Imm(1)));
+                Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(quotient, size), Reg(helper, size)));
+                Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(quotient, size), Imm(magic.Shift - 1)));
+            }
+            else if (magic.Shift != 0)
+            {
+                Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(quotient, size), Imm(magic.Shift)));
+            }
+
+            // The remainder is what the quotient leaves behind, so one chain answers a paired neighbour too
+            var needsRemainder = wantRemainder || partner is not null;
+            if (needsRemainder)
+            {
+                EmitMultiplyIntoRegister(helper, quotient, ConvertIntegerConstant(instruction.Operands[1].Immediate), size);
+                Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(dividend, size), Reg(helper, size)));
+            }
+
+            StoreDivideResults(
+                instruction,
+                wantRemainder ? dividend : quotient,
+                partner,
+                wantRemainder ? quotient : dividend,
+                helper,
+                size);
+            return true;
+        }
+
+        // The product goes somewhere of its own so that the quotient it came from survives it
+        private void EmitMultiplyIntoRegister(X86Register destination, X86Register source, long value, int size)
+        {
+            if (size < 8 || (value >= int.MinValue && value <= int.MaxValue))
+            {
+                Emit(X86Instruction.Ternary(X86InstrKind.Imul, Reg(destination, size), Reg(source, size), Imm(value)));
+                return;
+            }
+
+            Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(destination, size), Imm(value)));
+            Emit(X86Instruction.Binary(X86InstrKind.Imul, Reg(destination, size), Reg(source, size)));
+        }
+
+        private void EmitHighMultiply(X86Register destination, X86Register source, long multiplier, bool signed, int size)
+        {
+            if (size * 2 <= _wordSize)
+            {
+                var wide = size * 2;
+                if (signed)
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.Movsxd, Reg(destination, wide), Reg(source, size)));
+                    Emit(X86Instruction.Ternary(X86InstrKind.Imul, Reg(destination, wide), Reg(destination, wide), Imm(multiplier)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Sar, Reg(destination, wide), Imm(size * 8)));
+                }
+                else
+                {
+                    // Both halves are known non-negative at the wider width, so one signed multiply serves
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(destination, size), Imm(multiplier)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Imul, Reg(destination, wide), Reg(source, wide)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(destination, wide), Imm(size * 8)));
+                }
+                return;
+            }
+
+            // No wider register to hold the product, so the one-operand form spreads it over rdx:rax
+            Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, size), Imm(multiplier)));
+            Emit(X86Instruction.Unary(signed ? X86InstrKind.Imul : X86InstrKind.Mul, Reg(source, size)));
+            MoveRegister(destination, X86Register.Rdx, size);
         }
 
         private bool TryEmitDivideByPowerOfTwo(LirInstruction instruction, bool signed, bool wantRemainder)
@@ -3371,7 +3755,6 @@ public sealed class X86CodeGenerator
                 }
             }
 
-            NormalizeIntegerRegister(dst, instruction.Result!.Type);
             StoreWritableRegisterIfSpilled(instruction.Result!, dst);
             return true;
         }
@@ -3429,7 +3812,6 @@ public sealed class X86CodeGenerator
                 LoadOperandInto(instruction.Operands[0], dst, instruction, size);
                 Emit(X86Instruction.Binary(opcode, Reg(dst, size), Reg(X86Register.Rcx, 1)));
             }
-            NormalizeIntegerRegister(dst, instruction.Result!.Type);
             StoreWritableRegisterIfSpilled(instruction.Result!, dst);
         }
 
@@ -3683,7 +4065,6 @@ public sealed class X86CodeGenerator
             Emit(X86Instruction.Binary(IsFloat32(sourceType)
                 ? X86InstrKind.Cvttss2si
                 : X86InstrKind.Cvttsd2si, Reg(destination, convertSize), Reg(source, FloatingStorageSize(sourceType))));
-            NormalizeIntegerRegister(destination, destinationType);
         }
 
         private void EmitFloatingTruthValue(X86Register source, QualifiedType sourceType, X86Register destination)
@@ -4269,8 +4650,9 @@ public sealed class X86CodeGenerator
             public int Size { get; }
             public bool IsVariadicUnnamed { get; }
             public AbiRegisterClass RegisterClass { get; }
+            public bool PassesAddress { get; }
 
-            public PendingCallArgumentSegment(LirOperand operand, AbiLocation location, int sourceOffset, int size, bool isVariadicUnnamed, AbiRegisterClass registerClass)
+            public PendingCallArgumentSegment(LirOperand operand, AbiLocation location, int sourceOffset, int size, bool isVariadicUnnamed, AbiRegisterClass registerClass, bool passesAddress = false)
             {
                 Operand = operand;
                 Location = location;
@@ -4278,6 +4660,7 @@ public sealed class X86CodeGenerator
                 Size = size;
                 IsVariadicUnnamed = isVariadicUnnamed;
                 RegisterClass = registerClass;
+                PassesAddress = passesAddress;
             }
         }
 
@@ -4296,6 +4679,14 @@ public sealed class X86CodeGenerator
                 return;
             if (value.PassingKind == AbiPassingKind.Unsupported)
                 throw Unsupported(instruction, $"Unsupported ABI argument: {operand.Type.ToDisplayString()}.");
+
+            // An indirect argument is the callee's own object, so the caller hands over its address
+            if (value.PassingKind == AbiPassingKind.Indirect)
+            {
+                var indirectLocation = CAbi.AssignArgumentLocation(value, ref cursor, _stackArgumentSlotSize);
+                AddPendingCallArgumentSegment(stackArguments, registerArguments, operand, indirectLocation, 0, _wordSize, isVariadicUnnamed, AbiRegisterClass.General, passesAddress: true);
+                return;
+            }
 
             if (value.PassingKind == AbiPassingKind.MultiRegister)
             {
@@ -4319,9 +4710,10 @@ public sealed class X86CodeGenerator
             int sourceOffset,
             int size,
             bool isVariadicUnnamed,
-            AbiRegisterClass registerClass)
+            AbiRegisterClass registerClass,
+            bool passesAddress = false)
         {
-            var segment = new PendingCallArgumentSegment(operand, location, sourceOffset, size, isVariadicUnnamed, registerClass);
+            var segment = new PendingCallArgumentSegment(operand, location, sourceOffset, size, isVariadicUnnamed, registerClass, passesAddress);
             if (location.Kind == AbiLocationKind.Stack)
                 stackArguments.Add(segment);
             else
@@ -4331,7 +4723,12 @@ public sealed class X86CodeGenerator
         private void EmitPendingCallArgumentSegments(List<PendingCallArgumentSegment> segments, LirInstruction instruction)
         {
             foreach (var segment in segments)
-                StoreArgumentSegment(segment.Operand, segment.Location, segment.SourceOffset, segment.Size, instruction, segment.IsVariadicUnnamed, segment.RegisterClass);
+            {
+                if (segment.PassesAddress)
+                    StoreArgumentAddress(segment.Operand, segment.Location, instruction);
+                else
+                    StoreArgumentSegment(segment.Operand, segment.Location, segment.SourceOffset, segment.Size, instruction, segment.IsVariadicUnnamed, segment.RegisterClass);
+            }
         }
 
         private void StoreArgument(LirOperand operand, AbiValue value, ref AbiCursor cursor, LirInstruction instruction, bool isVariadicUnnamed)
@@ -4342,6 +4739,12 @@ public sealed class X86CodeGenerator
                 return;
             if (value.PassingKind == AbiPassingKind.Unsupported)
                 throw Unsupported(instruction, $"Unsupported ABI argument: {operand.Type.ToDisplayString()}.");
+            if (value.PassingKind == AbiPassingKind.Indirect)
+            {
+                StoreArgumentAddress(operand, CAbi.AssignArgumentLocation(value, ref cursor, _stackArgumentSlotSize), instruction);
+                return;
+            }
+
             if (value.PassingKind == AbiPassingKind.MultiRegister)
             {
                 foreach (var segment in value.Segments)
@@ -4354,6 +4757,24 @@ public sealed class X86CodeGenerator
 
             var location = CAbi.AssignArgumentLocation(value, ref cursor, _stackArgumentSlotSize);
             StoreArgumentSegment(operand, location, 0, Math.Min(SizeOfStorage(operand.Type), Math.Max(1, value.Size)), instruction, isVariadicUnnamed, AbiRegisterClass.General);
+        }
+
+        private void StoreArgumentAddress(LirOperand operand, AbiLocation location, LirInstruction instruction)
+        {
+            var address = MaterializeScalarStorageAddress(operand, Scratch0, instruction);
+            if (location.Kind == AbiLocationKind.Register)
+            {
+                MoveRegister(ToX86Register(location.Register, _owner._machineTarget), address, _wordSize);
+                return;
+            }
+
+            if (location.Kind == AbiLocationKind.Stack)
+            {
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, Mem(X86Register.Rsp, location.StackByteOffset(_stackArgumentSlotSize), _wordSize), Reg(address, _wordSize)));
+                return;
+            }
+
+            throw Unsupported(instruction, "Unsupported indirect ABI argument location.");
         }
 
         private void StoreArgumentSegment(LirOperand operand, AbiLocation location, int sourceOffset, int size, LirInstruction instruction, bool isVariadicUnnamed, AbiRegisterClass registerClass)
@@ -4608,9 +5029,9 @@ public sealed class X86CodeGenerator
             }
 
             Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(doneLabel, 4, X86ObjectRelocationKind.Relative32)));
-            _owner._text.DefineLabel(overflowLabel);
+            _owner.DefineLabel(overflowLabel);
             EmitSysVX64OverflowVaArg(ap, size, align);
-            _owner._text.DefineLabel(doneLabel);
+            _owner.DefineLabel(doneLabel);
 
             var dst = GetWritableRegister(instruction.Result!, Scratch0);
             MoveRegister(dst, Scratch1, _wordSize);
@@ -4877,7 +5298,7 @@ public sealed class X86CodeGenerator
                     Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, X86Operand.SymbolOperand(next, 4, X86ObjectRelocationKind.Relative32)));
                     Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.Rax, 4), Imm(unchecked((int)value))));
                     Emit(X86Instruction.ConditionalBranch(X86Condition.E, Label(switchCase.Target)));
-                    _owner._text.DefineLabel(next);
+                    _owner.DefineLabel(next);
                 }
                 EmitJump(instruction.Target);
                 return;
@@ -4998,6 +5419,15 @@ public sealed class X86CodeGenerator
             {
                 var segment = value.Segments.Length != 0 ? value.Segments[0] : new AbiSegment(0, value.Size, AbiRegisterClass.General);
                 var reg = segment.ReturnRegisters.Length == 0 ? MachineRegister.X0 : segment.ReturnRegisters[0];
+
+                // A register-sized aggregate is storage: load its bytes, not its address
+                if (GimpleTypes.IsAggregate(operand.Type))
+                {
+                    var storage = MaterializeScalarStorageAddress(operand, AggregateReturnAddressScratch, instruction);
+                    EmitSegmentLoad(segment.RegisterClass, ToX86Register(reg, _owner._machineTarget), RegMem(storage, Math.Min(value.Size, _wordSize)));
+                    return;
+                }
+
                 MoveIntoRegister(ToX86Register(reg, _owner._machineTarget), LoadOperandForRead(operand, Scratch0, instruction, RegisterSize(operand.Type)), RegisterSize(operand.Type));
                 return;
             }
@@ -5083,10 +5513,32 @@ public sealed class X86CodeGenerator
             }
 
             var size = RegisterSize(destination.Type);
+            if (TryEmitValueCopyToSpillSlot(destination, source, size, instruction))
+                return;
+
             var dst = GetWritableRegister(destination, PreferredScratch(destination.Type));
             LoadOperandInto(source, dst, instruction, size);
-            NormalizeIntegerRegister(dst, destination.Type);
             StoreWritableRegisterIfSpilled(destination, dst);
+        }
+
+        // A spilled destination is a memory operand, and a store reads its source wherever it already is
+        private bool TryEmitValueCopyToSpillSlot(LirVirtualRegister destination, LirOperand source, int size, LirInstruction instruction)
+        {
+            var allocation = _allocation[destination];
+            if (!allocation.IsSpilled)
+                return false;
+            if (RegisterSize(source.Type) != size || SizeOfStorage(source.Type) != SizeOfStorage(destination.Type))
+                return false;
+
+            var storeSize = Math.Min(size, SizeOfStorage(destination.Type));
+            EmitOperandToMemory(source, Mem(X86Register.Rsp, allocation.StackOffset, storeSize), storeSize, instruction);
+            return true;
+        }
+
+        private bool IsAlreadyZeroExtended(X86Register register, int valueSize)
+        {
+            var known = _owner.GetZeroExtendedBits(register);
+            return known != 0 && known <= valueSize * 8;
         }
 
         private void EmitOperandToMemory(LirOperand source, X86Operand destination, int size, LirInstruction instruction)
@@ -5194,6 +5646,12 @@ public sealed class X86CodeGenerator
 
         private X86Register MaterializeVirtualRegisterStorageAddress(LirVirtualRegister register, X86Register scratch)
         {
+            if (register.HomeSlot is { } home)
+            {
+                Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(scratch, _wordSize), Mem(X86Register.Rsp, _allocation.Frame.StackSlotOffsets[home], _wordSize)));
+                return scratch;
+            }
+
             var allocation = _allocation[register];
             if (allocation.IsSpilled)
                 Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(scratch, _wordSize), Mem(X86Register.Rsp, allocation.StackOffset, _wordSize)));
@@ -5484,6 +5942,15 @@ public sealed class X86CodeGenerator
             var source = LoadOperandForRead(operand, destination, instruction, readSize);
             if ((source.Kind == X86OperandKind.Register || source.Kind == X86OperandKind.Memory) && source.Size < size)
             {
+                // The value may already sit in the destination with its high bits cleared, and widening
+                // a zero-extended value is what the instruction below would spend an instruction doing
+                if (source.Kind == X86OperandKind.Register &&
+                    source.Register == destination &&
+                    !IsSignedIntegerType(operand.Type) &&
+                    IsIntegerLike(operand.Type) &&
+                    IsAlreadyZeroExtended(destination, source.Size))
+                    return;
+
                 if (source.Size == 4 && size == 8)
                 {
                     if (IsSignedIntegerType(operand.Type))
@@ -5665,16 +6132,6 @@ public sealed class X86CodeGenerator
             Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(destination, size), Reg(source, size)));
         }
 
-        private void NormalizeIntegerRegister(X86Register register, QualifiedType type)
-        {
-            if (!IsIntegerLike(type) || IsSignedIntegerType(type))
-                return;
-            var size = SizeOfStorage(type);
-            if (size >= RegisterSize(type))
-                return;
-            Emit(X86Instruction.Binary(X86InstrKind.Movzx, Reg(register, RegisterSize(type)), Reg(register, size)));
-        }
-
         private void EmitLoadFromStack(X86Register destination, int offset, int size, bool signed)
             => EmitLoadFromMemory(destination, Mem(X86Register.Rsp, offset, size), signed);
 
@@ -5716,7 +6173,7 @@ public sealed class X86CodeGenerator
             Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(Scratch2, _wordSize), Imm(size / loopStride)));
 
             var loop = _owner.CreateLocalLabel(_functionLabel + "_memcpy_loop");
-            _owner._text.DefineLabel(loop);
+            _owner.DefineLabel(loop);
             for (var offset = 0; offset < loopStride; offset += vectorSize)
             {
                 Emit(X86Instruction.Binary(
@@ -5800,7 +6257,7 @@ public sealed class X86CodeGenerator
             Emit(X86Instruction.Binary(X86InstrKind.Pxor, Reg(BlockCopyScratch, vectorSize), Reg(BlockCopyScratch, vectorSize)));
 
             var loop = _owner.CreateLocalLabel(_functionLabel + "_memzero_loop");
-            _owner._text.DefineLabel(loop);
+            _owner.DefineLabel(loop);
             for (var offset = 0; offset < loopStride; offset += vectorSize)
             {
                 Emit(X86Instruction.Binary(
@@ -5889,7 +6346,7 @@ public sealed class X86CodeGenerator
         private void DefineBlockLabel(LirBlock block)
         {
             if (_blockLabels.TryGetValue(block, out var label))
-                _owner._text.DefineLabel(label);
+                _owner.DefineLabel(label);
         }
 
         private void Emit(X86Instruction instruction)

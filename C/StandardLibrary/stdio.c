@@ -1,223 +1,613 @@
+#include <errno.h>
 #include <stddef.h>
 #include <stdarg.h>
+#include <stdio.h>
 
-#if defined(_WIN32) && defined(__x86_64__)
-static void __printf(const char* text)
+#if defined(__CNIDARIA_FILES)
+
+#include <fcntl.h>
+#include <string.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+int __io_rename(const char* from, const char* to);
+
+#define __FILE_READABLE 1
+#define __FILE_WRITABLE 2
+#define __FILE_AT_END 4
+#define __FILE_FAILED 8
+#define __FILE_APPEND 16
+#define __FILE_LINE 32
+#define __FILE_NONE 64
+#define __FILE_TAKEN 128
+
+struct __file
 {
-    unsigned int length = 0;
-    unsigned int written = 0;
-    void* handle;
+    int descriptor;
+    int flags;
+    int ungot;
+    size_t position;
+    size_t pending;
+    char buffer[BUFSIZ];
+};
 
-    while (text[length] != 0)
-        length = length + 1;
+// Every stream a program can hold, so opening one never asks the allocator
+static FILE __file_table[FOPEN_MAX];
+static int __file_ready;
 
-    __asm__ volatile(
-        "sub rsp, 32\n"
-        "mov ecx, -11\n"
-        "call qword ptr[rip + __imp_GetStdHandle]\n"
-        "add rsp, 32"
-        : "={rax}"(handle)
-        :
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
-
-    __asm__ volatile(
-        "mov rcx, % [handle]\n"
-        "mov rdx, % [text]\n"
-        "mov r8d, % [length]\n"
-        "lea r9, % [written]\n"
-        "sub rsp, 48\n"
-        "mov qword ptr[rsp + 32], 0\n"
-        "call qword ptr[rip + __imp_WriteFile]\n"
-        "add rsp, 48"
-        :
-    : [handle] "{rcx}"(handle), [text] "{rdx}"(text), [length] "{r8}"(length), [written] "m"(written)
-        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
-}
-#elif defined(_WIN32) && defined(__i386__)
-static void __printf(const char* text)
+static void __file_prepare(void)
 {
-    unsigned int length = 0;
-    unsigned int written = 0;
-    void* handle;
+    int index;
+    if (__file_ready != 0)
+        return;
+    __file_ready = 1;
 
-    while (text[length] != 0)
-        length = length + 1;
+    for (index = 0; index < FOPEN_MAX; index++)
+    {
+        __file_table[index].descriptor = -1;
+        __file_table[index].flags = 0;
+        __file_table[index].ungot = -1;
+        __file_table[index].position = 0;
+        __file_table[index].pending = 0;
+    }
 
-    __asm__ volatile(
-        "push - 11\n"
-        "call dword ptr[__imp_GetStdHandle]"
-        : "={eax}"(handle)
-        :
-        : "ecx", "edx", "memory");
-
-    __asm__ volatile(
-        "mov eax, % [handle]\n"
-        "mov ecx, % [text]\n"
-        "mov edx, % [length]\n"
-        "push ebx\n"
-        "lea ebx, % [written]\n"
-        "add ebx, 4\n"
-        "push 0\n"
-        "push ebx\n"
-        "push edx\n"
-        "push ecx\n"
-        "push eax\n"
-        "call dword ptr[__imp_WriteFile]\n"
-        "pop ebx"
-        :
-    : [handle] "{eax}"(handle), [text] "{ecx}"(text), [length] "{edx}"(length), [written] "m"(written)
-        : "eax", "ecx", "edx", "memory");
+    __file_table[0].descriptor = STDIN_FILENO;
+    __file_table[0].flags = __FILE_READABLE | __FILE_TAKEN;
+    // Nothing flushes a stream when main returns, so what goes to the console leaves at once
+    __file_table[1].descriptor = STDOUT_FILENO;
+    __file_table[1].flags = __FILE_WRITABLE | __FILE_TAKEN | __FILE_NONE;
+    __file_table[2].descriptor = STDERR_FILENO;
+    __file_table[2].flags = __FILE_WRITABLE | __FILE_TAKEN | __FILE_NONE;
 }
-#elif defined(_WIN32) && defined(__aarch64__)
-static void __printf(const char* text)
+
+FILE* __stdio_stream(int index)
 {
-    unsigned int length = 0;
-    unsigned int written = 0;
-    void* handle = (void*)(long)-11;
-
-    while (text[length] != 0)
-        length = length + 1;
-
-    __asm__ volatile(
-        "sub sp, sp, #16\n"
-        "str x30, [sp]\n"
-        "ldr x16, __imp_GetStdHandle\n"
-        "blr x16\n"
-        "ldr x30, [sp]\n"
-        "add sp, sp, #16"
-        : "+{x0}"(handle)
-        :
-        : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
-        "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "memory");
-
-    __asm__ volatile(
-        "sub sp, sp, #16\n"
-        "str x30, [sp]\n"
-        "mov x4, #0\n"
-        "ldr x16, __imp_WriteFile\n"
-        "blr x16\n"
-        "ldr x30, [sp]\n"
-        "add sp, sp, #16"
-        : "+{x0}"(handle)
-        : [text] "{x1}"(text), [length] "{x2}"(length), [written] "{x3}"(&written)
-        : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
-        "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "memory");
+    __file_prepare();
+    return &__file_table[index];
 }
-#elif defined(_WIN32) && defined(__arm__)
-static void __printf(const char* text)
+
+static FILE* __file_take(void)
 {
-    unsigned int length = 0;
-    unsigned int written = 0;
-    void* handle = (void*)(long)-11;
-
-    while (text[length] != 0)
-        length = length + 1;
-
-    __asm__ volatile(
-        "push {r4, lr}\n"
-        "ldr r12, __imp_GetStdHandle\n"
-        "blx r12\n"
-        "pop {r4, lr}"
-        : "+{r0}"(handle)
-        :
-        : "r1", "r2", "r3", "r12", "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "memory");
-
-    __asm__ volatile(
-        "push {lr}\n"
-        "mov r12, #0\n"
-        "push {r12}\n"
-        "ldr r12, __imp_WriteFile\n"
-        "blx r12\n"
-        "add sp, sp, #4\n"
-        "pop {lr}"
-        : "+{r0}"(handle)
-        : [text] "{r1}"(text), [length] "{r2}"(length), [written] "{r3}"(&written)
-        : "r12", "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "memory");
+    int index;
+    __file_prepare();
+    for (index = 3; index < FOPEN_MAX; index++)
+    {
+        if ((__file_table[index].flags & __FILE_TAKEN) == 0)
+        {
+            __file_table[index].flags = __FILE_TAKEN;
+            __file_table[index].ungot = -1;
+            __file_table[index].position = 0;
+            __file_table[index].pending = 0;
+            return &__file_table[index];
+        }
+    }
+    return (FILE*)0;
 }
-#elif defined(__linux__) && defined(__x86_64__)
-static void __printf(const char* text)
+
+static int __file_drain(FILE* stream)
 {
-    unsigned long length = 0;
+    size_t written = 0;
 
-    while (text[length] != 0)
-        length = length + 1;
+    if ((stream->flags & __FILE_WRITABLE) == 0 || stream->pending == 0)
+        return 0;
 
-    __asm__ volatile(
-        "mov eax, 1\n"
-        "mov edi, 1\n"
-        "syscall"
-        :
-    : [text] "{rsi}"(text), [length] "{rdx}"(length)
-        : "rax", "rdi", "rcx", "r11", "memory");
+    while (written < stream->pending)
+    {
+        ssize_t step = write(stream->descriptor, stream->buffer + written, stream->pending - written);
+        if (step <= 0)
+        {
+            stream->flags = stream->flags | __FILE_FAILED;
+            stream->pending = 0;
+            return -1;
+        }
+        written = written + (size_t)step;
+    }
+
+    stream->pending = 0;
+    return 0;
 }
-#elif defined(__linux__) && defined(__i386__)
-static void __printf(const char* text)
+
+static int __file_put(FILE* stream, int value)
 {
-    unsigned long length = 0;
+    if ((stream->flags & __FILE_WRITABLE) == 0)
+    {
+        stream->flags = stream->flags | __FILE_FAILED;
+        return EOF;
+    }
 
-    while (text[length] != 0)
-        length = length + 1;
+    stream->buffer[stream->pending] = (char)value;
+    stream->pending = stream->pending + 1;
 
-    __asm__ volatile(
-        "push ebx\n"
-        "mov eax, 4\n"
-        "mov ebx, 1\n"
-        ".byte 0xcd, 0x80\n"
-        "pop ebx"
-        :
-    : [text] "{ecx}"(text), [length] "{edx}"(length)
-        : "eax", "ecx", "edx", "memory");
+    if (stream->pending == (size_t)BUFSIZ ||
+        (stream->flags & __FILE_NONE) != 0 ||
+        ((stream->flags & __FILE_LINE) != 0 && (char)value == '\n'))
+    {
+        if (__file_drain(stream) != 0)
+            return EOF;
+    }
+
+    return (int)(unsigned char)value;
 }
-#elif defined(__linux__) && defined(__aarch64__)
-static void __printf(const char* text)
+
+// Text on its way out goes through the stream buffer, never a byte at a time to the system
+static size_t __file_write_bytes(FILE* stream, const char* text, size_t count)
 {
-    unsigned long length = 0;
+    size_t done = 0;
 
-    while (text[length] != 0)
-        length = length + 1;
+    if ((stream->flags & __FILE_WRITABLE) == 0)
+    {
+        stream->flags = stream->flags | __FILE_FAILED;
+        return 0;
+    }
 
-    __asm__ volatile(
-        "mov x8, #64\n"
-        "mov x0, #1\n"
-        "svc #0"
-        :
-    : [text] "{x1}"(text), [length] "{x2}"(length)
-        : "x0", "x8", "memory");
+    while (done < count)
+    {
+        size_t room = (size_t)BUFSIZ - stream->pending;
+        size_t step = count - done;
+        if (step > room)
+            step = room;
+
+        memcpy(stream->buffer + stream->pending, text + done, step);
+        stream->pending = stream->pending + step;
+        done = done + step;
+
+        if (stream->pending == (size_t)BUFSIZ && __file_drain(stream) != 0)
+            return done;
+    }
+
+    if ((stream->flags & __FILE_NONE) != 0)
+    {
+        if (__file_drain(stream) != 0)
+            return done;
+    }
+    else if ((stream->flags & __FILE_LINE) != 0 && memchr(text, '\n', count) != (void*)0)
+    {
+        if (__file_drain(stream) != 0)
+            return done;
+    }
+
+    return done;
 }
-#elif defined(__linux__) && defined(__arm__)
-static void __printf(const char* text)
+
+static int __file_fill(FILE* stream)
 {
-    unsigned long length = 0;
+    ssize_t step;
 
-    while (text[length] != 0)
-        length = length + 1;
+    if ((stream->flags & __FILE_READABLE) == 0)
+    {
+        stream->flags = stream->flags | __FILE_FAILED;
+        return -1;
+    }
+    if (stream->position < stream->pending)
+        return 0;
 
-    __asm__ volatile(
-        "mov r7, #4\n"
-        "mov r0, #1\n"
-        "svc #0"
-        :
-    : [text] "{r1}"(text), [length] "{r2}"(length)
-        : "r0", "r7", "memory");
+    step = read(stream->descriptor, stream->buffer, (size_t)BUFSIZ);
+    if (step < 0)
+    {
+        stream->flags = stream->flags | __FILE_FAILED;
+        return -1;
+    }
+    if (step == 0)
+    {
+        stream->flags = stream->flags | __FILE_AT_END;
+        return -1;
+    }
+
+    stream->position = 0;
+    stream->pending = (size_t)step;
+    return 0;
 }
-#elif defined(__linux__) && defined(__riscv)
-static void __printf(const char* text)
+
+static int __file_flags_of(const char* mode)
 {
-    unsigned long length = 0;
+    int flags = 0;
 
-    while (text[length] != 0)
-        length = length + 1;
+    if (mode[0] == 'r')
+        flags = __FILE_READABLE;
+    else if (mode[0] == 'w')
+        flags = __FILE_WRITABLE;
+    else if (mode[0] == 'a')
+        flags = __FILE_WRITABLE | __FILE_APPEND;
+    else
+        return 0;
 
-    __asm__ volatile(
-        "addi a7, zero, 64\n"
-        "addi a0, zero, 1\n"
-        "ecall"
-        :
-    : [text] "{a1}"(text), [length] "{a2}"(length)
-        : "a0", "a7", "memory");
+    if (mode[1] == '+' || (mode[1] == 'b' && mode[2] == '+'))
+        flags = flags | __FILE_READABLE | __FILE_WRITABLE;
+
+    return flags;
 }
+
+static int __file_open_flags(const char* mode)
+{
+    int flags = __file_flags_of(mode);
+    int access;
+
+    if ((flags & __FILE_READABLE) != 0 && (flags & __FILE_WRITABLE) != 0)
+        access = O_RDWR;
+    else if ((flags & __FILE_WRITABLE) != 0)
+        access = O_WRONLY;
+    else
+        access = O_RDONLY;
+
+    if (mode[0] == 'w')
+        access = access | O_CREAT | O_TRUNC;
+    else if (mode[0] == 'a')
+        access = access | O_CREAT | O_APPEND;
+
+    return access;
+}
+
+FILE* fopen(const char* path, const char* mode)
+{
+    int flags = __file_flags_of(mode);
+    int descriptor;
+    FILE* stream;
+
+    if (flags == 0)
+    {
+        errno = EINVAL;
+        return (FILE*)0;
+    }
+
+    descriptor = open(path, __file_open_flags(mode));
+    if (descriptor < 0)
+        return (FILE*)0;
+
+    stream = __file_take();
+    if (stream == (FILE*)0)
+    {
+        close(descriptor);
+        errno = EMFILE;
+        return (FILE*)0;
+    }
+
+    stream->descriptor = descriptor;
+    stream->flags = flags | __FILE_TAKEN;
+    return stream;
+}
+
+FILE* fdopen(int descriptor, const char* mode)
+{
+    int flags = __file_flags_of(mode);
+    FILE* stream;
+
+    if (flags == 0)
+    {
+        errno = EINVAL;
+        return (FILE*)0;
+    }
+
+    stream = __file_take();
+    if (stream == (FILE*)0)
+    {
+        errno = EMFILE;
+        return (FILE*)0;
+    }
+
+    stream->descriptor = descriptor;
+    stream->flags = flags | __FILE_TAKEN;
+    return stream;
+}
+
+int fflush(FILE* stream)
+{
+    int index;
+    int result = 0;
+
+    if (stream != (FILE*)0)
+        return __file_drain(stream);
+
+    __file_prepare();
+    for (index = 0; index < FOPEN_MAX; index++)
+    {
+        if ((__file_table[index].flags & __FILE_TAKEN) != 0 && __file_drain(&__file_table[index]) != 0)
+            result = EOF;
+    }
+    return result;
+}
+
+int fclose(FILE* stream)
+{
+    int result;
+
+    if (stream == (FILE*)0)
+        return EOF;
+
+    result = __file_drain(stream);
+    if (stream->descriptor > 2 && close(stream->descriptor) != 0)
+        result = EOF;
+
+    stream->flags = 0;
+    stream->descriptor = -1;
+    stream->ungot = -1;
+    stream->position = 0;
+    stream->pending = 0;
+    return result;
+}
+
+FILE* freopen(const char* path, const char* mode, FILE* stream)
+{
+    if (stream == (FILE*)0)
+        return (FILE*)0;
+
+    __file_drain(stream);
+    if (stream->descriptor > 2)
+        close(stream->descriptor);
+    stream->descriptor = -1;
+    stream->position = 0;
+    stream->pending = 0;
+    stream->ungot = -1;
+
+    if (path == (const char*)0)
+        return (FILE*)0;
+
+    stream->descriptor = open(path, __file_open_flags(mode));
+    if (stream->descriptor < 0)
+    {
+        stream->flags = 0;
+        return (FILE*)0;
+    }
+
+    stream->flags = __file_flags_of(mode) | __FILE_TAKEN;
+    return stream;
+}
+
+int fileno(FILE* stream)
+{
+    if (stream == (FILE*)0)
+    {
+        errno = EBADF;
+        return -1;
+    }
+    return stream->descriptor;
+}
+
+int setvbuf(FILE* stream, char* buffer, int mode, size_t size)
+{
+    (void)buffer;
+    (void)size;
+
+    if (stream == (FILE*)0)
+        return EOF;
+
+    __file_drain(stream);
+    stream->flags = stream->flags & ~(__FILE_LINE | __FILE_NONE);
+    if (mode == _IOLBF)
+        stream->flags = stream->flags | __FILE_LINE;
+    else if (mode == _IONBF)
+        stream->flags = stream->flags | __FILE_NONE;
+    return 0;
+}
+
+void setbuf(FILE* stream, char* buffer)
+{
+    setvbuf(stream, buffer, buffer == (char*)0 ? _IONBF : _IOFBF, (size_t)BUFSIZ);
+}
+
+int fputc(int value, FILE* stream)
+{
+    if (stream == (FILE*)0)
+        return EOF;
+    return __file_put(stream, value);
+}
+
+int putc(int value, FILE* stream)
+{
+    return fputc(value, stream);
+}
+
+int fputs(const char* text, FILE* stream)
+{
+    size_t length;
+
+    if (stream == (FILE*)0 || text == (const char*)0)
+        return EOF;
+
+    length = strlen(text);
+    return __file_write_bytes(stream, text, length) == length ? 0 : EOF;
+}
+
+int fgetc(FILE* stream)
+{
+    if (stream == (FILE*)0)
+        return EOF;
+
+    if (stream->ungot >= 0)
+    {
+        int value = stream->ungot;
+        stream->ungot = -1;
+        return value;
+    }
+
+    if (__file_fill(stream) != 0)
+        return EOF;
+
+    return (int)(unsigned char)stream->buffer[stream->position++];
+}
+
+int getc(FILE* stream)
+{
+    return fgetc(stream);
+}
+
+int getchar(void)
+{
+    return fgetc(stdin);
+}
+
+int ungetc(int value, FILE* stream)
+{
+    if (stream == (FILE*)0 || value == EOF)
+        return EOF;
+    stream->ungot = (int)(unsigned char)value;
+    stream->flags = stream->flags & ~__FILE_AT_END;
+    return stream->ungot;
+}
+
+char* fgets(char* text, int size, FILE* stream)
+{
+    int index = 0;
+
+    if (text == (char*)0 || size <= 0 || stream == (FILE*)0)
+        return (char*)0;
+
+    while (index < size - 1)
+    {
+        int value = fgetc(stream);
+        if (value == EOF)
+            break;
+        text[index] = (char)value;
+        index = index + 1;
+        if (value == '\n')
+            break;
+    }
+
+    if (index == 0)
+        return (char*)0;
+
+    text[index] = 0;
+    return text;
+}
+
+size_t fread(void* destination, size_t size, size_t count, FILE* stream)
+{
+    unsigned char* bytes = (unsigned char*)destination;
+    size_t wanted;
+    size_t done = 0;
+
+    if (stream == (FILE*)0 || size == 0 || count == 0)
+        return 0;
+
+    wanted = size * count;
+    while (done < wanted)
+    {
+        size_t available;
+        size_t step;
+
+        if (stream->ungot >= 0)
+        {
+            bytes[done] = (unsigned char)stream->ungot;
+            stream->ungot = -1;
+            done = done + 1;
+            continue;
+        }
+
+        if (__file_fill(stream) != 0)
+            break;
+
+        available = stream->pending - stream->position;
+        step = wanted - done;
+        if (step > available)
+            step = available;
+
+        memcpy(bytes + done, stream->buffer + stream->position, step);
+        stream->position = stream->position + step;
+        done = done + step;
+    }
+
+    return done / size;
+}
+
+size_t fwrite(const void* source, size_t size, size_t count, FILE* stream)
+{
+    size_t wanted;
+
+    if (stream == (FILE*)0 || size == 0 || count == 0)
+        return 0;
+
+    wanted = size * count;
+    return __file_write_bytes(stream, (const char*)source, wanted) / size;
+}
+
+int fseek(FILE* stream, long offset, int whence)
+{
+    off_t placed;
+
+    if (stream == (FILE*)0)
+        return -1;
+
+    __file_drain(stream);
+    if (whence == SEEK_CUR)
+        offset = offset - (long)(stream->pending - stream->position);
+
+    stream->position = 0;
+    stream->pending = 0;
+    stream->ungot = -1;
+    stream->flags = stream->flags & ~__FILE_AT_END;
+
+    placed = lseek(stream->descriptor, (off_t)offset, whence);
+    return placed < 0 ? -1 : 0;
+}
+
+long ftell(FILE* stream)
+{
+    off_t placed;
+
+    if (stream == (FILE*)0)
+        return -1;
+
+    __file_drain(stream);
+    placed = lseek(stream->descriptor, 0, SEEK_CUR);
+    if (placed < 0)
+        return -1;
+
+    return (long)(placed - (off_t)(stream->pending - stream->position));
+}
+
+void rewind(FILE* stream)
+{
+    fseek(stream, 0, SEEK_SET);
+    if (stream != (FILE*)0)
+        stream->flags = stream->flags & ~__FILE_FAILED;
+}
+
+int feof(FILE* stream)
+{
+    return stream != (FILE*)0 && (stream->flags & __FILE_AT_END) != 0;
+}
+
+int ferror(FILE* stream)
+{
+    return stream != (FILE*)0 && (stream->flags & __FILE_FAILED) != 0;
+}
+
+void clearerr(FILE* stream)
+{
+    if (stream != (FILE*)0)
+        stream->flags = stream->flags & ~(__FILE_AT_END | __FILE_FAILED);
+}
+
+void __stdio_shutdown(void)
+{
+    fflush((FILE*)0);
+}
+
+int remove(const char* path)
+{
+    return unlink(path);
+}
+
+int rename(const char* from, const char* to)
+{
+    return __io_rename(from, to);
+}
+
+void perror(const char* text)
+{
+    if (text != (const char*)0 && text[0] != 0)
+    {
+        fputs(text, stderr);
+        fputs(": ", stderr);
+    }
+    fputs(strerror(errno), stderr);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
 #else
+
 void __printf(const char* text);
+
 #endif
 
 #define __PRINTF_LEN_NONE 0
@@ -230,13 +620,88 @@ void __printf(const char* text);
 #define __PRINTF_LEN_T 7
 #define __PRINTF_LEN_CAPITAL_L 8
 #define __PRINTF_PRECISION_LIMIT 18
+#define __PRINTF_CHUNK 240
+
+// Output goes either into the caller's buffer or through a staging chunk on the caller's stack,
+// so nothing the format produces is ever allocated
+typedef struct __printf_sink
+{
+    char* buffer;
+    size_t limit;
+    size_t produced;
+    void* stream;
+    int outward;
+    int pending;
+    char chunk[__PRINTF_CHUNK + 1];
+} __printf_sink;
+
+static __printf_sink* __printf_out;
+
+static void __printf_flush(__printf_sink* sink)
+{
+    if (sink->pending == 0)
+        return;
+
+#if defined(__CNIDARIA_FILES)
+    __file_write_bytes((FILE*)sink->stream, sink->chunk, (size_t)sink->pending);
+#else
+    sink->chunk[sink->pending] = 0;
+    __printf(sink->chunk);
+#endif
+
+    sink->pending = 0;
+}
+
+static void __printf_open_stream(__printf_sink* sink, void* stream)
+{
+    sink->buffer = (char*)0;
+    sink->limit = 0;
+    sink->produced = 0;
+    sink->stream = stream;
+    sink->outward = 1;
+    sink->pending = 0;
+    __printf_out = sink;
+}
+
+static void __printf_open_buffer(__printf_sink* sink, char* buffer, size_t limit)
+{
+    sink->buffer = buffer;
+    sink->limit = limit;
+    sink->produced = 0;
+    sink->stream = (void*)0;
+    sink->outward = 0;
+    sink->pending = 0;
+    __printf_out = sink;
+}
+
+static int __printf_close(__printf_sink* sink)
+{
+    if (sink->outward != 0)
+        __printf_flush(sink);
+    else if (sink->buffer != (char*)0 && sink->limit != 0)
+        sink->buffer[sink->produced < sink->limit - 1 ? sink->produced : sink->limit - 1] = 0;
+
+    __printf_out = (__printf_sink*)0;
+    return (int)sink->produced;
+}
 
 static int __printf_putchar(int ch)
 {
-    char text[2];
-    text[0] = (char)ch;
-    text[1] = 0;
-    __printf(text);
+    __printf_sink* sink = __printf_out;
+
+    if (sink->outward != 0)
+    {
+        sink->chunk[sink->pending] = (char)ch;
+        sink->pending = sink->pending + 1;
+        if (sink->pending == __PRINTF_CHUNK)
+            __printf_flush(sink);
+    }
+    else if (sink->buffer != (char*)0 && sink->limit != 0 && sink->produced < sink->limit - 1)
+    {
+        sink->buffer[sink->produced] = (char)ch;
+    }
+
+    sink->produced = sink->produced + 1;
     return 1;
 }
 
@@ -726,12 +1191,10 @@ static int __printf_bad_format(const char* format, int start, int end)
     return count;
 }
 
-int printf(const char* format, ...)
+static int __printf_format(const char* format, va_list* ap)
 {
-    va_list ap;
     int index = 0;
     int count = 0;
-    va_start(ap, format);
 
     while (format[index] != 0)
     {
@@ -773,7 +1236,7 @@ int printf(const char* format, ...)
 
         if (format[index] == '*')
         {
-            width = va_arg(ap, int);
+            width = va_arg(*ap, int);
             if (width < 0)
             {
                 left = 1;
@@ -796,7 +1259,7 @@ int printf(const char* format, ...)
             precision = 0;
             if (format[index] == '*')
             {
-                precision = va_arg(ap, int);
+                precision = va_arg(*ap, int);
                 if (precision < 0)
                     precision = -1;
                 index = index + 1;
@@ -867,18 +1330,18 @@ int printf(const char* format, ...)
         if (spec == '%')
             count = count + __printf_emit_char('%', left, width);
         else if (spec == 'c')
-            count = count + __printf_emit_char(va_arg(ap, int), left, width);
+            count = count + __printf_emit_char(va_arg(*ap, int), left, width);
         else if (spec == 's')
-            count = count + __printf_emit_string(va_arg(ap, char*), left, width, precision);
+            count = count + __printf_emit_string(va_arg(*ap, char*), left, width, precision);
         else if (spec == 'd' || spec == 'i')
         {
             int negative = 0;
-            unsigned long long value = __printf_read_signed(&ap, length, &negative);
+            unsigned long long value = __printf_read_signed(ap, length, &negative);
             count = count + __printf_emit_integer(value, negative, 1, 10, 0, 0, zero, left, plus, space, width, precision, 0);
         }
         else if (spec == 'u' || spec == 'o' || spec == 'x' || spec == 'X')
         {
-            unsigned long long value = __printf_read_unsigned(&ap, length);
+            unsigned long long value = __printf_read_unsigned(ap, length);
             unsigned int base = 10;
             int upper = 0;
             if (spec == 'o')
@@ -891,7 +1354,7 @@ int printf(const char* format, ...)
         }
         else if (spec == 'p')
         {
-            void* ptr = va_arg(ap, void*);
+            void* ptr = va_arg(*ap, void*);
             count = count + __printf_emit_integer((unsigned long long)(size_t)ptr, 0, 0, 16, 0, 0, zero, left, 0, 0, width, precision, 1);
         }
         else if (spec == 'f' || spec == 'F' || spec == 'e' || spec == 'E' || spec == 'g' || spec == 'G' || spec == 'a' || spec == 'A')
@@ -899,18 +1362,159 @@ int printf(const char* format, ...)
             int upper = 0;
             if (spec == 'F' || spec == 'E' || spec == 'G' || spec == 'A')
                 upper = 1;
-            count = count + __printf_emit_float(va_arg(ap, double), spec, upper, alt, zero, left, plus, space, width, precision);
+            count = count + __printf_emit_float(va_arg(*ap, double), spec, upper, alt, zero, left, plus, space, width, precision);
         }
         else if (spec == 'n')
-            __printf_store_count(&ap, length, count);
+            __printf_store_count(ap, length, count);
         else
             count = count + __printf_bad_format(format, start, index + 1);
 
         index = index + 1;
     }
 
+    return count;
+}
+
+#if defined(__CNIDARIA_FILES)
+
+int vfprintf(FILE* stream, const char* format, va_list arguments)
+{
+    __printf_sink sink;
+    va_list ap;
+    int count;
+
+    if (stream == (FILE*)0)
+        return -1;
+
+    va_copy(ap, arguments);
+    __printf_open_stream(&sink, stream);
+    count = __printf_format(format, &ap);
+    va_end(ap);
+    __printf_close(&sink);
+    return count;
+}
+
+int fprintf(FILE* stream, const char* format, ...)
+{
+    va_list ap;
+    int count;
+
+    va_start(ap, format);
+    count = vfprintf(stream, format, ap);
     va_end(ap);
     return count;
+}
+
+#endif
+
+static void* __printf_console(void)
+{
+#if defined(__CNIDARIA_FILES)
+    return (void*)stdout;
+#else
+    return (void*)0;
+#endif
+}
+
+int vprintf(const char* format, va_list arguments)
+{
+    __printf_sink sink;
+    va_list ap;
+    int count;
+
+    va_copy(ap, arguments);
+    __printf_open_stream(&sink, __printf_console());
+    count = __printf_format(format, &ap);
+    va_end(ap);
+    __printf_close(&sink);
+    return count;
+}
+
+int printf(const char* format, ...)
+{
+    __printf_sink sink;
+    va_list ap;
+    int count;
+
+    va_start(ap, format);
+    __printf_open_stream(&sink, __printf_console());
+    count = __printf_format(format, &ap);
+    va_end(ap);
+    __printf_close(&sink);
+    return count;
+}
+
+int vsnprintf(char* buffer, size_t size, const char* format, va_list arguments)
+{
+    __printf_sink sink;
+    va_list ap;
+    int count;
+
+    va_copy(ap, arguments);
+    __printf_open_buffer(&sink, buffer, size);
+    count = __printf_format(format, &ap);
+    va_end(ap);
+    __printf_close(&sink);
+    return count;
+}
+
+int snprintf(char* buffer, size_t size, const char* format, ...)
+{
+    __printf_sink sink;
+    va_list ap;
+    int count;
+
+    va_start(ap, format);
+    __printf_open_buffer(&sink, buffer, size);
+    count = __printf_format(format, &ap);
+    va_end(ap);
+    __printf_close(&sink);
+    return count;
+}
+
+int vsprintf(char* buffer, const char* format, va_list arguments)
+{
+    return vsnprintf(buffer, (size_t)-1, format, arguments);
+}
+
+int sprintf(char* buffer, const char* format, ...)
+{
+    __printf_sink sink;
+    va_list ap;
+    int count;
+
+    va_start(ap, format);
+    __printf_open_buffer(&sink, buffer, (size_t)-1);
+    count = __printf_format(format, &ap);
+    va_end(ap);
+    __printf_close(&sink);
+    return count;
+}
+
+int putchar(int character)
+{
+    __printf_sink sink;
+
+    __printf_open_stream(&sink, __printf_console());
+    __printf_putchar((int)(unsigned char)character);
+    __printf_close(&sink);
+    return (int)(unsigned char)character;
+}
+
+int puts(const char* text)
+{
+    __printf_sink sink;
+    int index = 0;
+
+    __printf_open_stream(&sink, __printf_console());
+    while (text[index] != 0)
+    {
+        __printf_putchar((int)(unsigned char)text[index]);
+        index = index + 1;
+    }
+    __printf_putchar('\n');
+    __printf_close(&sink);
+    return index + 1;
 }
 
 

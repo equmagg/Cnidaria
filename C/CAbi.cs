@@ -2,1279 +2,1272 @@ using System;
 using System.Collections.Immutable;
 using Cnidaria.Cs;
 
-namespace Cnidaria.C
+namespace Cnidaria.C;
+
+internal static class CAbi
 {
-    internal static class CAbi
+    public const int RegisterCount = 8;
+    public const int MaxRegisterAggregateRegisters = 2;
+
+    public static LirRegisterClass PreferredLirRegisterClass(TargetInfo target, QualifiedType type)
     {
-        public const int RegisterCount = 8;
-        public const int MaxRegisterAggregateRegisters = 2;
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
 
-        public static LirRegisterClass PreferredLirRegisterClass(TargetInfo target, QualifiedType type)
+        if (type.Type is BuiltinType builtin)
         {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            if (type.Type is BuiltinType builtin)
+            return builtin.BuiltinKind switch
             {
-                return builtin.BuiltinKind switch
-                {
-                    BuiltinTypeKind.Void => LirRegisterClass.Void,
-                    BuiltinTypeKind.Float or BuiltinTypeKind.Double or BuiltinTypeKind.LongDouble =>
-                        TargetRegisterInfo.PreferredFloatingPointRegisterClass(target, type, isVariadicUnnamedArgument: false),
-                    _ => LirRegisterClass.General,
-                };
-            }
-
-            if (type.Type is RVVectorType)
-                return LirRegisterClass.Vector;
-
-            return type.Type.Kind switch
-            {
-                TypeKind.Pointer or TypeKind.Function => LirRegisterClass.Address,
-                TypeKind.Array or TypeKind.Struct or TypeKind.Union => LirRegisterClass.Aggregate,
-                TypeKind.Enum => LirRegisterClass.General,
-                TypeKind.Error => LirRegisterClass.Unknown,
-                _ => LirRegisterClass.Unknown,
+                BuiltinTypeKind.Void => LirRegisterClass.Void,
+                BuiltinTypeKind.Float or BuiltinTypeKind.Double or BuiltinTypeKind.LongDouble =>
+                    TargetRegisterInfo.PreferredFloatingPointRegisterClass(target, type, isVariadicUnnamedArgument: false),
+                _ => LirRegisterClass.General,
             };
         }
 
-        public static bool UsesHardwareFloatingRegister(TargetInfo target, QualifiedType type, bool isVariadicUnnamedArgument)
+        if (type.Type is RVVectorType)
+            return LirRegisterClass.Vector;
+
+        return type.Type.Kind switch
         {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
+            TypeKind.Pointer or TypeKind.Function => LirRegisterClass.Address,
+            TypeKind.Array or TypeKind.Struct or TypeKind.Union => LirRegisterClass.Aggregate,
+            TypeKind.Enum => LirRegisterClass.General,
+            TypeKind.Error => LirRegisterClass.Unknown,
+            _ => LirRegisterClass.Unknown,
+        };
+    }
 
-            return HardwareFloatingAbiRegisterClass(target, type, isVariadicUnnamedArgument, isVariadicFunction: false).HasValue;
-        }
+    public static bool UsesHardwareFloatingRegister(TargetInfo target, QualifiedType type, bool isVariadicUnnamedArgument)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
 
-        private static AbiRegisterClass? HardwareFloatingAbiRegisterClass(
-            TargetInfo target,
-            QualifiedType type,
-            bool isVariadicUnnamedArgument,
-            bool isVariadicFunction)
+        return HardwareFloatingAbiRegisterClass(target, type, isVariadicUnnamedArgument, isVariadicFunction: false).HasValue;
+    }
+
+    private static AbiRegisterClass? HardwareFloatingAbiRegisterClass(
+        TargetInfo target,
+        QualifiedType type,
+        bool isVariadicUnnamedArgument,
+        bool isVariadicFunction)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        if (!IsFloating(type))
+            return null;
+
+        if (target.IsRiscV)
         {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            if (!IsFloating(type))
+            if (isVariadicUnnamedArgument)
                 return null;
 
-            if (target.IsRiscV)
-            {
-                if (isVariadicUnnamedArgument)
-                    return null;
-
-                var abiFlen = RiscVAbiFloatingRegisterSize(target);
-                return abiFlen > 0 && Math.Max(1, target.SizeOf(type)) <= abiFlen
-                    ? AbiRegisterClass.Floating
-                    : null;
-            }
-
-            if (target.IsArm)
-            {
-                if (target.Architecture == TargetArchitectureKind.Arm32 && (isVariadicUnnamedArgument || isVariadicFunction))
-                    return null;
-                if (TargetRegisterInfo.IsWindowsArm64(target) && isVariadicFunction)
-                    return null;
-
-                var abiFlen = TargetRegisterInfo.ArmAbiFloatingRegisterSize(target);
-                if (abiFlen == 0 || Math.Max(1, target.SizeOf(type)) > abiFlen)
-                    return null;
-                return target.Architecture == TargetArchitectureKind.Arm64
-                    ? AbiRegisterClass.Vector
-                    : AbiRegisterClass.Floating;
-            }
-
-            if (target.IsX86)
-            {
-                var abiFlen = TargetRegisterInfo.X86AbiFloatingRegisterSize(target);
-                return abiFlen > 0 && Math.Max(1, target.SizeOf(type)) <= abiFlen
-                    ? AbiRegisterClass.Vector
-                    : null;
-            }
-
-            return AbiRegisterClass.Floating;
+            var abiFlen = RiscVAbiFloatingRegisterSize(target);
+            return abiFlen > 0 && Math.Max(1, target.SizeOf(type)) <= abiFlen
+                ? AbiRegisterClass.Floating
+                : null;
         }
 
-        internal static AbiValue ClassifyValue(
-            TargetInfo target,
-            QualifiedType type,
-            bool isReturn,
-            bool isVariadicUnnamedArgument,
-            bool isVariadicFunction = false)
+        if (target.IsArm)
         {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
+            if (target.Architecture == TargetArchitectureKind.Arm32 && (isVariadicUnnamedArgument || isVariadicFunction))
+                return null;
+            if (TargetRegisterInfo.IsWindowsArm64(target) && isVariadicFunction)
+                return null;
 
-            if (IsVoid(type))
-                return AbiValue.Void(type);
-
-            if (target.IsRiscV)
-                return ClassifyRiscVValue(target, type, isReturn, isVariadicUnnamedArgument);
-
-            if (target.IsArm)
-                return ClassifyArmValue(target, type, isReturn, isVariadicUnnamedArgument, isVariadicFunction);
-
-            if (target.IsX86)
-                return ClassifyX86Value(target, type, isReturn, isVariadicUnnamedArgument);
-
-            return ClassifyRegisterBytecodeValue(target, type, isReturn);
-        }
-
-        private static AbiValue ClassifyRegisterBytecodeValue(TargetInfo target, QualifiedType type, bool isReturn)
-        {
-            if (IsFloat32(type))
-                return ScalarForTarget(target, type, AbiRegisterClass.Floating, size: 4, alignment: Math.Max(1, target.AlignOf(type)));
-            if (IsFloat64(type) || IsLongDouble(type))
-                return ScalarForTarget(target, type, AbiRegisterClass.Floating, size: Math.Min(8, Math.Max(1, target.SizeOf(type))), alignment: Math.Max(1, target.AlignOf(type)));
-
-            if (IsAggregate(type))
-                return ClassifySmallRegisterAggregate(target, type, isReturn, passLargeByReference: false);
-
-            if (IsPointerLike(type))
-                return ScalarForTarget(target, type, AbiRegisterClass.General, size: target.PointerSize, alignment: target.PointerAlignment);
-            if (IsIntegerLike(type))
-            {
-                var size = Math.Max(1, target.SizeOf(type));
-                return ScalarForTarget(target, type, AbiRegisterClass.General, size, Math.Max(1, target.AlignOf(type)));
-            }
-
-            return AbiValue.Unsupported(type);
-        }
-
-        private static AbiValue ClassifyRiscVValue(TargetInfo target, QualifiedType type, bool isReturn, bool isVariadicUnnamedArgument)
-        {
-            var size = Math.Max(1, target.SizeOf(type));
-            var alignment = Math.Max(1, target.AlignOf(type));
-
-            var fpClass = HardwareFloatingAbiRegisterClass(target, type, isVariadicUnnamedArgument, isVariadicFunction: false);
-            if (fpClass.HasValue)
-                return ScalarForTarget(target, type, fpClass.Value, size, alignment);
-
-            if (IsAggregate(type))
-                return ClassifySmallRegisterAggregate(target, type, isReturn, passLargeByReference: true);
-
-            if (IsPointerLike(type))
-                return ScalarForTarget(target, type, AbiRegisterClass.General, size: target.PointerSize, alignment: target.PointerAlignment);
-
-            if (IsIntegerLike(type) || IsFloating(type))
-                return ClassifyIntegerConventionScalar(target, type, size, alignment, isReturn, isVariadicUnnamedArgument);
-
-            return AbiValue.Unsupported(type);
-        }
-
-
-        private static AbiValue ClassifyArmValue(
-            TargetInfo target,
-            QualifiedType type,
-            bool isReturn,
-            bool isVariadicUnnamedArgument,
-            bool isVariadicFunction)
-        {
-            var size = Math.Max(1, target.SizeOf(type));
-            var alignment = Math.Max(1, target.AlignOf(type));
-
-            var fpClass = HardwareFloatingAbiRegisterClass(target, type, isVariadicUnnamedArgument, isVariadicFunction);
-            if (fpClass.HasValue)
-                return ScalarForTarget(target, type, fpClass.Value, size, alignment);
-
-            if (IsAggregate(type))
-            {
-                if (TryClassifyArmHomogeneousAggregate(target, type, isReturn, isVariadicFunction, out var homogeneous))
-                    return homogeneous;
-
-                return target.Architecture == TargetArchitectureKind.Arm64
-                    ? ClassifyArm64Aggregate(target, type, isReturn)
-                    : ClassifyArm32Aggregate(target, type, isReturn);
-            }
-
-            if (IsPointerLike(type))
-                return ScalarForTarget(target, type, AbiRegisterClass.General, target.PointerSize, target.PointerAlignment);
-
-            if (IsIntegerLike(type) || IsFloating(type))
-                return target.Architecture == TargetArchitectureKind.Arm32
-                    ? ClassifyArm32Scalar(target, type, size, alignment, isReturn)
-                    : ClassifyArm64Scalar(target, type, size, alignment, isReturn);
-
-            return AbiValue.Unsupported(type);
-        }
-
-        private static bool TryClassifyArmHomogeneousAggregate(
-            TargetInfo target,
-            QualifiedType type,
-            bool isReturn,
-            bool isVariadicFunction,
-            out AbiValue value)
-        {
-            value = default;
-            if (target.Architecture == TargetArchitectureKind.Arm32 && TargetRegisterInfo.ArmAbiFloatingRegisterSize(target) == 0)
-                return false;
-            if (!isReturn && target.Architecture == TargetArchitectureKind.Arm32 && isVariadicFunction)
-                return false;
-            if (!isReturn && TargetRegisterInfo.IsWindowsArm64(target) && isVariadicFunction)
-                return false;
-            if (!TryDescribeArmHomogeneousAggregate(target, type, out var baseSize, out var elementCount))
-                return false;
-
-            var registerClass = target.Architecture == TargetArchitectureKind.Arm64
+            var abiFlen = TargetRegisterInfo.ArmAbiFloatingRegisterSize(target);
+            if (abiFlen == 0 || Math.Max(1, target.SizeOf(type)) > abiFlen)
+                return null;
+            return target.Architecture == TargetArchitectureKind.Arm64
                 ? AbiRegisterClass.Vector
                 : AbiRegisterClass.Floating;
-            var segments = ImmutableArray.CreateBuilder<AbiSegment>(elementCount);
-            for (var i = 0; i < elementCount; i++)
-                segments.Add(CreateSegment(target, checked(i * baseSize), baseSize, registerClass));
+        }
 
-            value = AbiValue.MultiRegister(
-                type,
-                Math.Max(1, target.SizeOf(type)),
-                Math.Max(1, target.AlignOf(type)),
-                segments.ToImmutable(),
-                requiresAllRegisters: true);
+        if (target.IsX86)
+        {
+            var abiFlen = TargetRegisterInfo.X86AbiFloatingRegisterSize(target);
+            return abiFlen > 0 && Math.Max(1, target.SizeOf(type)) <= abiFlen
+                ? AbiRegisterClass.Vector
+                : null;
+        }
+
+        return AbiRegisterClass.Floating;
+    }
+
+    internal static AbiValue ClassifyValue(
+        TargetInfo target,
+        QualifiedType type,
+        bool isReturn,
+        bool isVariadicUnnamedArgument,
+        bool isVariadicFunction = false)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        if (IsVoid(type))
+            return AbiValue.Void(type);
+
+        if (target.IsRiscV)
+            return ClassifyRiscVValue(target, type, isReturn, isVariadicUnnamedArgument);
+
+        if (target.IsArm)
+            return ClassifyArmValue(target, type, isReturn, isVariadicUnnamedArgument, isVariadicFunction);
+
+        if (target.IsX86)
+            return ClassifyX86Value(target, type, isReturn, isVariadicUnnamedArgument);
+
+        return ClassifyRegisterBytecodeValue(target, type, isReturn);
+    }
+
+    private static AbiValue ClassifyRegisterBytecodeValue(TargetInfo target, QualifiedType type, bool isReturn)
+    {
+        if (IsFloat32(type))
+            return ScalarForTarget(target, type, AbiRegisterClass.Floating, size: 4, alignment: Math.Max(1, target.AlignOf(type)));
+        if (IsFloat64(type) || IsLongDouble(type))
+            return ScalarForTarget(target, type, AbiRegisterClass.Floating, size: Math.Min(8, Math.Max(1, target.SizeOf(type))), alignment: Math.Max(1, target.AlignOf(type)));
+
+        if (IsAggregate(type))
+        {
+            // The only channel out of a frame is a register, so a returned aggregate takes the buffer
+            if (isReturn)
+            {
+                var size = Math.Max(1, target.SizeOf(type));
+                return IndirectForTarget(target, type, size, Math.Max(1, target.AlignOf(type)));
+            }
+
+            return ClassifySmallRegisterAggregate(target, type, isReturn, passLargeByReference: false);
+        }
+
+        if (IsPointerLike(type))
+            return ScalarForTarget(target, type, AbiRegisterClass.General, size: target.PointerSize, alignment: target.PointerAlignment);
+        if (IsIntegerLike(type))
+        {
+            var size = Math.Max(1, target.SizeOf(type));
+            return ScalarForTarget(target, type, AbiRegisterClass.General, size, Math.Max(1, target.AlignOf(type)));
+        }
+
+        return AbiValue.Unsupported(type);
+    }
+
+    private static AbiValue ClassifyRiscVValue(TargetInfo target, QualifiedType type, bool isReturn, bool isVariadicUnnamedArgument)
+    {
+        var size = Math.Max(1, target.SizeOf(type));
+        var alignment = Math.Max(1, target.AlignOf(type));
+
+        var fpClass = HardwareFloatingAbiRegisterClass(target, type, isVariadicUnnamedArgument, isVariadicFunction: false);
+        if (fpClass.HasValue)
+            return ScalarForTarget(target, type, fpClass.Value, size, alignment);
+
+        if (IsAggregate(type))
+            return ClassifySmallRegisterAggregate(target, type, isReturn, passLargeByReference: true);
+
+        if (IsPointerLike(type))
+            return ScalarForTarget(target, type, AbiRegisterClass.General, size: target.PointerSize, alignment: target.PointerAlignment);
+
+        if (IsIntegerLike(type) || IsFloating(type))
+            return ClassifyIntegerConventionScalar(target, type, size, alignment, isReturn, isVariadicUnnamedArgument);
+
+        return AbiValue.Unsupported(type);
+    }
+
+
+    private static AbiValue ClassifyArmValue(
+        TargetInfo target,
+        QualifiedType type,
+        bool isReturn,
+        bool isVariadicUnnamedArgument,
+        bool isVariadicFunction)
+    {
+        var size = Math.Max(1, target.SizeOf(type));
+        var alignment = Math.Max(1, target.AlignOf(type));
+
+        var fpClass = HardwareFloatingAbiRegisterClass(target, type, isVariadicUnnamedArgument, isVariadicFunction);
+        if (fpClass.HasValue)
+            return ScalarForTarget(target, type, fpClass.Value, size, alignment);
+
+        if (IsAggregate(type))
+        {
+            if (TryClassifyArmHomogeneousAggregate(target, type, isReturn, isVariadicFunction, out var homogeneous))
+                return homogeneous;
+
+            return target.Architecture == TargetArchitectureKind.Arm64
+                ? ClassifyArm64Aggregate(target, type, isReturn)
+                : ClassifyArm32Aggregate(target, type, isReturn);
+        }
+
+        if (IsPointerLike(type))
+            return ScalarForTarget(target, type, AbiRegisterClass.General, target.PointerSize, target.PointerAlignment);
+
+        if (IsIntegerLike(type) || IsFloating(type))
+            return target.Architecture == TargetArchitectureKind.Arm32
+                ? ClassifyArm32Scalar(target, type, size, alignment, isReturn)
+                : ClassifyArm64Scalar(target, type, size, alignment, isReturn);
+
+        return AbiValue.Unsupported(type);
+    }
+
+    private static bool TryClassifyArmHomogeneousAggregate(
+        TargetInfo target,
+        QualifiedType type,
+        bool isReturn,
+        bool isVariadicFunction,
+        out AbiValue value)
+    {
+        value = default;
+        if (target.Architecture == TargetArchitectureKind.Arm32 && TargetRegisterInfo.ArmAbiFloatingRegisterSize(target) == 0)
+            return false;
+        if (!isReturn && target.Architecture == TargetArchitectureKind.Arm32 && isVariadicFunction)
+            return false;
+        if (!isReturn && TargetRegisterInfo.IsWindowsArm64(target) && isVariadicFunction)
+            return false;
+        if (!TryDescribeArmHomogeneousAggregate(target, type, out var baseSize, out var elementCount))
+            return false;
+
+        var registerClass = target.Architecture == TargetArchitectureKind.Arm64
+            ? AbiRegisterClass.Vector
+            : AbiRegisterClass.Floating;
+        var segments = ImmutableArray.CreateBuilder<AbiSegment>(elementCount);
+        for (var i = 0; i < elementCount; i++)
+            segments.Add(CreateSegment(target, checked(i * baseSize), baseSize, registerClass));
+
+        value = AbiValue.MultiRegister(
+            type,
+            Math.Max(1, target.SizeOf(type)),
+            Math.Max(1, target.AlignOf(type)),
+            segments.ToImmutable(),
+            requiresAllRegisters: true);
+        return true;
+    }
+
+    private static bool TryDescribeArmHomogeneousAggregate(
+        TargetInfo target,
+        QualifiedType type,
+        out int baseSize,
+        out int elementCount)
+    {
+        baseSize = 0;
+        elementCount = 0;
+
+        if (type.Type is BuiltinType builtin &&
+            builtin.BuiltinKind is BuiltinTypeKind.Float or BuiltinTypeKind.Double or BuiltinTypeKind.LongDouble)
+        {
+            var size = Math.Max(1, target.SizeOf(type));
+            if (size is not (4 or 8 or 16))
+                return false;
+            baseSize = size;
+            elementCount = 1;
             return true;
         }
 
-        private static bool TryDescribeArmHomogeneousAggregate(
-            TargetInfo target,
-            QualifiedType type,
-            out int baseSize,
-            out int elementCount)
+        if (type.Type is ArrayType array && array.Length is > 0 and <= 4)
         {
-            baseSize = 0;
-            elementCount = 0;
-
-            if (type.Type is BuiltinType builtin &&
-                builtin.BuiltinKind is BuiltinTypeKind.Float or BuiltinTypeKind.Double or BuiltinTypeKind.LongDouble)
-            {
-                var size = Math.Max(1, target.SizeOf(type));
-                if (size is not (4 or 8 or 16))
-                    return false;
-                baseSize = size;
-                elementCount = 1;
-                return true;
-            }
-
-            if (type.Type is ArrayType array && array.Length is > 0 and <= 4)
-            {
-                if (!TryDescribeArmHomogeneousAggregate(target, array.ElementType, out baseSize, out var nestedCount))
-                    return false;
-                elementCount = checked(nestedCount * (int)array.Length.Value);
-                return elementCount <= 4 && target.SizeOf(type) == checked(baseSize * elementCount);
-            }
-
-            if (type.Type is not TagType tag || !tag.Symbol.IsComplete || tag.Symbol.Fields.Length == 0 || tag.Symbol.TagKind == TagKind.Enum)
+            if (!TryDescribeArmHomogeneousAggregate(target, array.ElementType, out baseSize, out var nestedCount))
                 return false;
-
-            var count = 0;
-            foreach (var field in tag.Symbol.Fields)
-            {
-                if (!TryDescribeArmHomogeneousAggregate(target, field.Type, out var fieldBaseSize, out var fieldCount))
-                    return false;
-                if (baseSize != 0 && baseSize != fieldBaseSize)
-                    return false;
-                baseSize = fieldBaseSize;
-                count = tag.Symbol.TagKind == TagKind.Union
-                    ? Math.Max(count, fieldCount)
-                    : checked(count + fieldCount);
-                if (count > 4)
-                    return false;
-            }
-
-            elementCount = count;
-            return elementCount is >= 1 and <= 4 && target.SizeOf(type) == checked(baseSize * elementCount);
+            elementCount = checked(nestedCount * (int)array.Length.Value);
+            return elementCount <= 4 && target.SizeOf(type) == checked(baseSize * elementCount);
         }
 
-        private static AbiValue ClassifyArm64Scalar(TargetInfo target, QualifiedType type, int size, int alignment, bool isReturn)
+        if (type.Type is not TagType tag || !tag.Symbol.IsComplete || tag.Symbol.Fields.Length == 0 || tag.Symbol.TagKind == TagKind.Enum)
+            return false;
+
+        var count = 0;
+        foreach (var field in tag.Symbol.Fields)
         {
-            if (size <= target.RegisterSize)
-                return ScalarForTarget(target, type, AbiRegisterClass.General, size, alignment);
-
-            if (size <= checked(target.RegisterSize * 2))
-            {
-                var requireAlignedPair = !isReturn && alignment >= checked(target.RegisterSize * 2);
-                return AbiValue.MultiRegister(
-                    type,
-                    size,
-                    alignment,
-                    CreateGeneralSegments(target, size, alignment, requireAlignedPair),
-                    requiresAllRegisters: !isReturn);
-            }
-
-            return IndirectForTarget(target, type, size, alignment);
+            if (!TryDescribeArmHomogeneousAggregate(target, field.Type, out var fieldBaseSize, out var fieldCount))
+                return false;
+            if (baseSize != 0 && baseSize != fieldBaseSize)
+                return false;
+            baseSize = fieldBaseSize;
+            count = tag.Symbol.TagKind == TagKind.Union
+                ? Math.Max(count, fieldCount)
+                : checked(count + fieldCount);
+            if (count > 4)
+                return false;
         }
 
-        private static AbiValue ClassifyArm64Aggregate(TargetInfo target, QualifiedType type, bool isReturn)
+        elementCount = count;
+        return elementCount is >= 1 and <= 4 && target.SizeOf(type) == checked(baseSize * elementCount);
+    }
+
+    private static AbiValue ClassifyArm64Scalar(TargetInfo target, QualifiedType type, int size, int alignment, bool isReturn)
+    {
+        if (size <= target.RegisterSize)
+            return ScalarForTarget(target, type, AbiRegisterClass.General, size, alignment);
+
+        if (size <= checked(target.RegisterSize * 2))
         {
-            var size = Math.Max(1, target.SizeOf(type));
-            var alignment = Math.Max(1, target.AlignOf(type));
-            if (size <= checked(target.RegisterSize * 2))
-            {
-                var requireAlignedPair = !isReturn && alignment >= checked(target.RegisterSize * 2);
-                return AbiValue.MultiRegister(
-                    type,
-                    size,
-                    alignment,
-                    CreateGeneralSegments(target, size, alignment, requireAlignedPair),
-                    requiresAllRegisters: !isReturn);
-            }
-
-            return IndirectForTarget(target, type, size, alignment);
-        }
-
-        private static AbiValue ClassifyArm32Scalar(TargetInfo target, QualifiedType type, int size, int alignment, bool isReturn)
-        {
-            if (size <= target.RegisterSize)
-                return ScalarForTarget(target, type, AbiRegisterClass.General, size, alignment);
-
-            if (size <= checked(target.RegisterSize * 2))
-            {
-                var requireAlignedPair = !isReturn && alignment >= checked(target.RegisterSize * 2);
-                return AbiValue.MultiRegister(type, size, alignment, CreateGeneralSegments(target, size, alignment, requireAlignedPair));
-            }
-
-            return isReturn ? IndirectForTarget(target, type, size, alignment) : AbiValue.Stack(type, size, alignment);
-        }
-
-        private static AbiValue ClassifyArm32Aggregate(TargetInfo target, QualifiedType type, bool isReturn)
-        {
-            var size = Math.Max(1, target.SizeOf(type));
-            var alignment = Math.Max(1, target.AlignOf(type));
-
-            if (isReturn)
-            {
-                if (size <= target.RegisterSize)
-                    return AbiValue.MultiRegister(type, size, alignment, CreateGeneralSegments(target, size, alignment, requireVariadicAlignedPair: false));
-                return IndirectForTarget(target, type, size, alignment);
-            }
-
+            var requireAlignedPair = !isReturn && alignment >= checked(target.RegisterSize * 2);
             return AbiValue.MultiRegister(
                 type,
                 size,
                 alignment,
-                CreateGeneralSegments(target, size, alignment, requireVariadicAlignedPair: alignment >= checked(target.RegisterSize * 2)));
+                CreateGeneralSegments(target, size, alignment, requireAlignedPair),
+                requiresAllRegisters: !isReturn);
         }
 
-        private static AbiValue ClassifyX86Value(TargetInfo target, QualifiedType type, bool isReturn, bool isVariadicUnnamedArgument)
+        return IndirectForTarget(target, type, size, alignment);
+    }
+
+    private static AbiValue ClassifyArm64Aggregate(TargetInfo target, QualifiedType type, bool isReturn)
+    {
+        var size = Math.Max(1, target.SizeOf(type));
+        var alignment = Math.Max(1, target.AlignOf(type));
+        if (size <= checked(target.RegisterSize * 2))
         {
-            var size = Math.Max(1, target.SizeOf(type));
-            var alignment = Math.Max(1, target.AlignOf(type));
-
-            var fpClass = HardwareFloatingAbiRegisterClass(target, type, isVariadicUnnamedArgument, isVariadicFunction: false);
-            if (fpClass.HasValue)
-                return ScalarForTarget(target, type, fpClass.Value, size, alignment);
-
-            if (IsLongDouble(type))
-                return isReturn || TargetRegisterInfo.IsWindowsX64(target)
-                    ? IndirectForTarget(target, type, size, alignment)
-                    : AbiValue.Stack(type, size, alignment);
-
-            if (IsAggregate(type))
-                return ClassifyX86Aggregate(target, type, isReturn);
-
-            if (IsPointerLike(type))
-                return ScalarForTarget(target, type, AbiRegisterClass.General, target.PointerSize, target.PointerAlignment);
-
-            if (IsIntegerLike(type) || IsFloating(type))
-                return ClassifyX86Scalar(target, type, size, alignment, isReturn);
-
-            return AbiValue.Unsupported(type);
+            var requireAlignedPair = !isReturn && alignment >= checked(target.RegisterSize * 2);
+            return AbiValue.MultiRegister(
+                type,
+                size,
+                alignment,
+                CreateGeneralSegments(target, size, alignment, requireAlignedPair),
+                requiresAllRegisters: !isReturn);
         }
 
-        private static AbiValue ClassifyX86Scalar(TargetInfo target, QualifiedType type, int size, int alignment, bool isReturn)
+        return IndirectForTarget(target, type, size, alignment);
+    }
+
+    private static AbiValue ClassifyArm32Scalar(TargetInfo target, QualifiedType type, int size, int alignment, bool isReturn)
+    {
+        if (size <= target.RegisterSize)
+            return ScalarForTarget(target, type, AbiRegisterClass.General, size, alignment);
+
+        if (size <= checked(target.RegisterSize * 2))
         {
-            if (target.Architecture == TargetArchitectureKind.I386)
-            {
-                if (size <= target.RegisterSize)
-                    return ScalarForTarget(target, type, AbiRegisterClass.General, size, alignment);
+            var requireAlignedPair = !isReturn && alignment >= checked(target.RegisterSize * 2);
+            return AbiValue.MultiRegister(type, size, alignment, CreateGeneralSegments(target, size, alignment, requireAlignedPair));
+        }
 
-                if (size <= 8)
-                    return AbiValue.MultiRegister(type, size, alignment, CreateGeneralSegments(target, size, alignment, requireVariadicAlignedPair: false));
+        return isReturn ? IndirectForTarget(target, type, size, alignment) : AbiValue.Stack(type, size, alignment);
+    }
 
-                return isReturn ? IndirectForTarget(target, type, size, alignment) : AbiValue.Stack(type, size, alignment);
-            }
+    private static AbiValue ClassifyArm32Aggregate(TargetInfo target, QualifiedType type, bool isReturn)
+    {
+        var size = Math.Max(1, target.SizeOf(type));
+        var alignment = Math.Max(1, target.AlignOf(type));
 
+        if (isReturn)
+        {
+            if (size <= target.RegisterSize)
+                return AbiValue.MultiRegister(type, size, alignment, CreateGeneralSegments(target, size, alignment, requireVariadicAlignedPair: false));
+            return IndirectForTarget(target, type, size, alignment);
+        }
+
+        return AbiValue.MultiRegister(
+            type,
+            size,
+            alignment,
+            CreateGeneralSegments(target, size, alignment, requireVariadicAlignedPair: alignment >= checked(target.RegisterSize * 2)));
+    }
+
+    private static AbiValue ClassifyX86Value(TargetInfo target, QualifiedType type, bool isReturn, bool isVariadicUnnamedArgument)
+    {
+        var size = Math.Max(1, target.SizeOf(type));
+        var alignment = Math.Max(1, target.AlignOf(type));
+
+        var fpClass = HardwareFloatingAbiRegisterClass(target, type, isVariadicUnnamedArgument, isVariadicFunction: false);
+        if (fpClass.HasValue)
+            return ScalarForTarget(target, type, fpClass.Value, size, alignment);
+
+        if (IsLongDouble(type))
+            return isReturn || TargetRegisterInfo.IsWindowsX64(target)
+                ? IndirectForTarget(target, type, size, alignment)
+                : AbiValue.Stack(type, size, alignment);
+
+        if (IsAggregate(type))
+            return ClassifyX86Aggregate(target, type, isReturn);
+
+        if (IsPointerLike(type))
+            return ScalarForTarget(target, type, AbiRegisterClass.General, target.PointerSize, target.PointerAlignment);
+
+        if (IsIntegerLike(type) || IsFloating(type))
+            return ClassifyX86Scalar(target, type, size, alignment, isReturn);
+
+        return AbiValue.Unsupported(type);
+    }
+
+    private static AbiValue ClassifyX86Scalar(TargetInfo target, QualifiedType type, int size, int alignment, bool isReturn)
+    {
+        if (target.Architecture == TargetArchitectureKind.I386)
+        {
             if (size <= target.RegisterSize)
                 return ScalarForTarget(target, type, AbiRegisterClass.General, size, alignment);
 
-            if (size <= checked(target.RegisterSize * MaxRegisterAggregateRegisters))
+            if (size <= 8)
                 return AbiValue.MultiRegister(type, size, alignment, CreateGeneralSegments(target, size, alignment, requireVariadicAlignedPair: false));
 
             return isReturn ? IndirectForTarget(target, type, size, alignment) : AbiValue.Stack(type, size, alignment);
         }
 
-        private static AbiValue ClassifyX86Aggregate(TargetInfo target, QualifiedType type, bool isReturn)
-        {
-            var size = Math.Max(1, target.SizeOf(type));
-            var alignment = Math.Max(1, target.AlignOf(type));
+        if (size <= target.RegisterSize)
+            return ScalarForTarget(target, type, AbiRegisterClass.General, size, alignment);
 
-            if (target.Architecture == TargetArchitectureKind.I386)
-                return isReturn ? IndirectForTarget(target, type, size, alignment) : AbiValue.Stack(type, size, alignment);
+        if (size <= checked(target.RegisterSize * MaxRegisterAggregateRegisters))
+            return AbiValue.MultiRegister(type, size, alignment, CreateGeneralSegments(target, size, alignment, requireVariadicAlignedPair: false));
 
-            if (TargetRegisterInfo.IsWindowsX64(target))
-            {
-                if (size is 1 or 2 or 4 or 8)
-                    return ScalarForTarget(target, type, AbiRegisterClass.General, size, alignment);
+        return isReturn ? IndirectForTarget(target, type, size, alignment) : AbiValue.Stack(type, size, alignment);
+    }
 
-                return IndirectForTarget(target, type, size, alignment);
-            }
+    private static AbiValue ClassifyX86Aggregate(TargetInfo target, QualifiedType type, bool isReturn)
+    {
+        var size = Math.Max(1, target.SizeOf(type));
+        var alignment = Math.Max(1, target.AlignOf(type));
 
-            if (size <= checked(target.RegisterSize * MaxRegisterAggregateRegisters) && !ContainsLongDouble(type))
-                return AbiValue.MultiRegister(type, size, alignment, CreateSystemVSegments(target, type, size));
-
+        if (target.Architecture == TargetArchitectureKind.I386)
             return isReturn ? IndirectForTarget(target, type, size, alignment) : AbiValue.Stack(type, size, alignment);
-        }
 
-        // System V classifies every eightbyte on its own, and one holding nothing but float or double is SSE
-        private static ImmutableArray<AbiSegment> CreateSystemVSegments(TargetInfo target, QualifiedType type, int size)
+        if (TargetRegisterInfo.IsWindowsX64(target))
         {
-            var registerSize = Math.Max(1, target.RegisterSize);
-            var segments = ImmutableArray.CreateBuilder<AbiSegment>();
-            for (var offset = 0; offset < size; offset += registerSize)
-            {
-                var segmentSize = Math.Min(registerSize, size - offset);
-                var registerClass = IsFloatingEightbyte(target, type, 0, offset, checked(offset + segmentSize))
-                    ? AbiRegisterClass.Vector
-                    : AbiRegisterClass.General;
-                segments.Add(CreateSegment(target, offset, segmentSize, registerClass));
-            }
-
-            return segments.ToImmutable();
-        }
-
-        private static bool IsFloatingEightbyte(TargetInfo target, QualifiedType type, int typeOffset, int start, int end)
-        {
-            if (typeOffset >= end || checked(typeOffset + Math.Max(1, target.SizeOf(type))) <= start)
-                return true;
-
-            if (type.Type is ArrayType array)
-            {
-                var elementSize = Math.Max(1, target.SizeOf(array.ElementType));
-                var length = array.Length ?? 0;
-                for (long i = 0; i < length; i++)
-                {
-                    if (!IsFloatingEightbyte(target, array.ElementType, checked(typeOffset + (int)(i * elementSize)), start, end))
-                        return false;
-                }
-
-                return true;
-            }
-
-            if (type.Type is TagType { Symbol.TagKind: not TagKind.Enum } tag && tag.Symbol.IsComplete)
-            {
-                foreach (var field in tag.Symbol.Fields)
-                {
-                    if (!IsFloatingEightbyte(target, field.Type, checked(typeOffset + FieldOffset(target, field)), start, end))
-                        return false;
-                }
-
-                return true;
-            }
-
-            return IsFloat32(type) || IsFloat64(type);
-        }
-
-        private static bool ContainsLongDouble(QualifiedType type)
-        {
-            if (type.Type is ArrayType array)
-                return ContainsLongDouble(array.ElementType);
-
-            if (type.Type is TagType { Symbol.TagKind: not TagKind.Enum } tag && tag.Symbol.IsComplete)
-            {
-                foreach (var field in tag.Symbol.Fields)
-                {
-                    if (ContainsLongDouble(field.Type))
-                        return true;
-                }
-
-                return false;
-            }
-
-            return IsLongDouble(type);
-        }
-
-        private static int FieldOffset(TargetInfo target, FieldSymbol field)
-        {
-            var tag = field.ContainingTag;
-            if (tag.TagKind == TagKind.Union)
-                return 0;
-
-            var offset = 0;
-            foreach (var candidate in tag.Fields)
-            {
-                offset = AlignUp(offset, Math.Max(1, target.AlignOf(candidate.Type)));
-                if (ReferenceEquals(candidate, field))
-                    return offset;
-                offset = checked(offset + Math.Max(1, target.SizeOf(candidate.Type)));
-            }
-
-            return 0;
-        }
-
-        private static AbiValue ClassifySmallRegisterAggregate(TargetInfo target, QualifiedType type, bool isReturn, bool passLargeByReference)
-        {
-            var size = Math.Max(1, target.SizeOf(type));
-            var alignment = Math.Max(1, target.AlignOf(type));
-            if (size <= MaxRegisterAggregateSize(target))
-                return AbiValue.MultiRegister(type, size, alignment, CreateGeneralSegments(target, size, alignment, requireVariadicAlignedPair: false));
-
-            if (passLargeByReference)
-                return IndirectForTarget(target, type, size, alignment);
-
-            return new AbiValue(type, isReturn ? AbiPassingKind.Indirect : AbiPassingKind.Stack, size, alignment, ImmutableArray<AbiSegment>.Empty, indirectSize: target.PointerSize);
-        }
-
-        private static AbiValue ClassifyIntegerConventionScalar(
-            TargetInfo target,
-            QualifiedType type,
-            int size,
-            int alignment,
-            bool isReturn,
-            bool isVariadicUnnamedArgument)
-        {
-            var registerSize = Math.Max(1, target.RegisterSize);
-            if (size <= registerSize)
+            if (size is 1 or 2 or 4 or 8)
                 return ScalarForTarget(target, type, AbiRegisterClass.General, size, alignment);
-
-            if (size <= checked(registerSize * MaxRegisterAggregateRegisters))
-            {
-                var requirePair = isVariadicUnnamedArgument && size == checked(registerSize * 2) && alignment >= checked(registerSize * 2);
-                return AbiValue.MultiRegister(type, size, alignment, CreateGeneralSegments(target, size, alignment, requirePair));
-            }
 
             return IndirectForTarget(target, type, size, alignment);
         }
 
-        private static AbiValue ScalarForTarget(TargetInfo target, QualifiedType type, AbiRegisterClass registerClass, int size, int alignment)
-            => new AbiValue(type, AbiPassingKind.Scalar, size, alignment, ImmutableArray.Create(CreateSegment(target, 0, size, registerClass)));
+        if (size <= checked(target.RegisterSize * MaxRegisterAggregateRegisters) && !ContainsLongDouble(type))
+            return AbiValue.MultiRegister(type, size, alignment, CreateSystemVSegments(target, type, size));
 
-        private static AbiValue IndirectForTarget(TargetInfo target, QualifiedType type, int size, int alignment)
-            => new AbiValue(type, AbiPassingKind.Indirect, size, alignment, ImmutableArray.Create(CreateSegment(target, 0, target.PointerSize, AbiRegisterClass.General)), indirectSize: target.PointerSize);
+        return isReturn ? IndirectForTarget(target, type, size, alignment) : AbiValue.Stack(type, size, alignment);
+    }
 
-        private static ImmutableArray<AbiSegment> CreateGeneralSegments(TargetInfo target, int size, int alignment, bool requireVariadicAlignedPair)
+    // System V classifies every eightbyte on its own, and one holding nothing but float or double is SSE
+    private static ImmutableArray<AbiSegment> CreateSystemVSegments(TargetInfo target, QualifiedType type, int size)
+    {
+        var registerSize = Math.Max(1, target.RegisterSize);
+        var segments = ImmutableArray.CreateBuilder<AbiSegment>();
+        for (var offset = 0; offset < size; offset += registerSize)
         {
-            var registerSize = Math.Max(1, target.RegisterSize);
-            var segments = ImmutableArray.CreateBuilder<AbiSegment>();
-            for (var offset = 0; offset < size; offset += registerSize)
-            {
-                var segmentSize = Math.Min(registerSize, size - offset);
-                var isFirstSegment = offset == 0;
-                var registerSlotAlignment = requireVariadicAlignedPair && isFirstSegment ? 2 : 1;
-                var minimumRegisterSlots = requireVariadicAlignedPair && isFirstSegment ? 2 : 1;
-                var forceStackAfterStack = requireVariadicAlignedPair && isFirstSegment;
-                var stackSlotAlignment = isFirstSegment ? Math.Max(1, AlignUp(alignment, registerSize) / registerSize) : 1;
-                segments.Add(CreateSegment(target, offset, segmentSize, AbiRegisterClass.General, registerSlotAlignment, minimumRegisterSlots, forceStackAfterStack, stackSlotAlignment));
-            }
-
-            return segments.ToImmutable();
+            var segmentSize = Math.Min(registerSize, size - offset);
+            var registerClass = IsFloatingEightbyte(target, type, 0, offset, checked(offset + segmentSize))
+                ? AbiRegisterClass.Vector
+                : AbiRegisterClass.General;
+            segments.Add(CreateSegment(target, offset, segmentSize, registerClass));
         }
 
-        private static AbiSegment CreateSegment(
-            TargetInfo target,
-            int offset,
-            int size,
-            AbiRegisterClass registerClass,
-            int registerSlotAlignment = 1,
-            int minimumRegisterSlots = 1,
-            bool forceStackAfterStack = false,
-            int stackSlotAlignment = 1)
+        return segments.ToImmutable();
+    }
+
+    private static bool IsFloatingEightbyte(TargetInfo target, QualifiedType type, int typeOffset, int start, int end)
+    {
+        if (typeOffset >= end || checked(typeOffset + Math.Max(1, target.SizeOf(type))) <= start)
+            return true;
+
+        if (type.Type is ArrayType array)
         {
-            var usesArm32VfpSlots = target.Architecture == TargetArchitectureKind.Arm32 && registerClass == AbiRegisterClass.Floating;
-            var registerSlotsConsumed = usesArm32VfpSlots && size > 4 ? 2 : 1;
-            if (usesArm32VfpSlots)
+            var elementSize = Math.Max(1, target.SizeOf(array.ElementType));
+            var length = array.Length ?? 0;
+            for (long i = 0; i < length; i++)
             {
-                registerSlotAlignment = Math.Max(registerSlotAlignment, registerSlotsConsumed);
-                minimumRegisterSlots = Math.Max(minimumRegisterSlots, registerSlotsConsumed);
-                stackSlotAlignment = Math.Max(stackSlotAlignment, registerSlotsConsumed);
+                if (!IsFloatingEightbyte(target, array.ElementType, checked(typeOffset + (int)(i * elementSize)), start, end))
+                    return false;
             }
 
-            var argumentRegisters = registerClass switch
-            {
-                AbiRegisterClass.Floating => TargetRegisterInfo.FloatingArgumentRegisters(target),
-                AbiRegisterClass.Vector => TargetRegisterInfo.VectorArgumentRegisters(target),
-                _ => TargetRegisterInfo.IntegerArgumentRegisters(target),
-            };
-            var returnRegisters = registerClass switch
-            {
-                AbiRegisterClass.Floating => TargetRegisterInfo.FloatingReturnRegisters(target, size),
-                AbiRegisterClass.Vector => TargetRegisterInfo.VectorReturnRegisters(target),
-                _ => TargetRegisterInfo.IntegerReturnRegisters(target),
-            };
-
-            return new AbiSegment(
-                offset,
-                size,
-                registerClass,
-                registerSlotAlignment,
-                minimumRegisterSlots,
-                forceStackAfterStack,
-                stackSlotAlignment,
-                argumentRegisters,
-                returnRegisters,
-                TargetRegisterInfo.UsesUnifiedArgumentCursor(target),
-                registerSlotsConsumed,
-                usesArm32VfpSlots);
+            return true;
         }
 
-        public static AbiLocation AssignArgumentLocation(AbiValue value, ref AbiCursor cursor, int stackSlotSize)
+        if (type.Type is TagType { Symbol.TagKind: not TagKind.Enum } tag && tag.Symbol.IsComplete)
         {
-            var locations = AssignArgumentLocations(value, ref cursor, stackSlotSize);
-            if (locations.Length == 0)
-                return AbiLocation.None;
-            if (locations.Length == 1)
-                return locations[0];
-
-            foreach (var location in locations)
+            foreach (var field in tag.Symbol.Fields)
             {
-                if (location.Kind == AbiLocationKind.Stack)
-                    return location;
+                if (!IsFloatingEightbyte(target, field.Type, checked(typeOffset + FieldOffset(target, field)), start, end))
+                    return false;
             }
 
-            return AbiLocation.RegisterGroup;
+            return true;
         }
 
-        public static ImmutableArray<AbiLocation> AssignArgumentLocations(AbiValue value, ref AbiCursor cursor, int stackSlotSize)
+        return IsFloat32(type) || IsFloat64(type);
+    }
+
+    private static bool ContainsLongDouble(QualifiedType type)
+    {
+        if (type.Type is ArrayType array)
+            return ContainsLongDouble(array.ElementType);
+
+        if (type.Type is TagType { Symbol.TagKind: not TagKind.Enum } tag && tag.Symbol.IsComplete)
         {
-            if (value.PassingKind == AbiPassingKind.Void)
-                return ImmutableArray<AbiLocation>.Empty;
-            if (value.PassingKind == AbiPassingKind.Unsupported)
-                throw new NotSupportedException("Unsupported ABI value: " + value.Type.ToDisplayString() + ".");
-
-            if (value.PassingKind == AbiPassingKind.Indirect)
+            foreach (var field in tag.Symbol.Fields)
             {
-                var segment = value.Segments.Length != 0 ? value.Segments[0] : new AbiSegment(0, value.IndirectSize, AbiRegisterClass.General);
-                return ImmutableArray.Create(AssignSegmentArgumentLocation(segment, ref cursor, stackSlotSize));
-            }
-
-            if (value.PassingKind == AbiPassingKind.Scalar)
-            {
-                var segment = value.Segments.Length != 0 ? value.Segments[0] : new AbiSegment(0, value.Size, AbiRegisterClass.General);
-                return ImmutableArray.Create(AssignSegmentArgumentLocation(segment, ref cursor, stackSlotSize));
-            }
-
-            if (value.PassingKind == AbiPassingKind.MultiRegister)
-            {
-                if (value.RequiresAllRegisters)
-                    return AssignAllOrStackArgumentLocations(value, ref cursor, stackSlotSize);
-
-                var builder = ImmutableArray.CreateBuilder<AbiLocation>(value.Segments.Length);
-                foreach (var segment in value.Segments)
-                    builder.Add(AssignSegmentArgumentLocation(segment, ref cursor, stackSlotSize));
-                return builder.ToImmutable();
-            }
-
-            return AssignWholeValueToStack(value, ref cursor, stackSlotSize);
-        }
-
-        private static ImmutableArray<AbiLocation> AssignAllOrStackArgumentLocations(AbiValue value, ref AbiCursor cursor, int stackSlotSize)
-        {
-            if (value.Segments.Length == 0)
-                return AssignWholeValueToStack(value, ref cursor, stackSlotSize);
-
-            var first = value.Segments[0];
-            var registers = first.ArgumentRegisters;
-            if (first.UsesArm32VfpSlots)
-            {
-                var requiredSlots = 0;
-                foreach (var segment in value.Segments)
-                    requiredSlots = checked(requiredSlots + segment.RegisterSlotsConsumed);
-
-                if (TryAllocateArm32VfpSlots(
-                    ref cursor,
-                    requiredSlots,
-                    first.RegisterSlotAlignment,
-                    registers.Length,
-                    out var vfpRegisterCursor))
-                {
-                    var builder = ImmutableArray.CreateBuilder<AbiLocation>(value.Segments.Length);
-                    var registerOffset = 0;
-                    foreach (var segment in value.Segments)
-                    {
-                        var slot = vfpRegisterCursor + registerOffset;
-                        builder.Add(AbiLocation.FromRegister(
-                            registers[slot],
-                            segment.Size,
-                            segment.RegisterClass,
-                            segment.Offset,
-                            Arm32VfpRegisterByteOffset(slot, segment.Size)));
-                        registerOffset = checked(registerOffset + segment.RegisterSlotsConsumed);
-                    }
-                    return builder.ToImmutable();
-                }
-
-                cursor.Arm32VfpUnavailable = true;
-                return AssignWholeValueToStack(value, ref cursor, stackSlotSize);
-            }
-
-            var requiredRegisters = 0;
-            foreach (var segment in value.Segments)
-                requiredRegisters = checked(requiredRegisters + segment.RegisterSlotsConsumed);
-
-            var registerCursor = first.RegisterClass switch
-            {
-                AbiRegisterClass.Floating => cursor.Float,
-                AbiRegisterClass.Vector => cursor.Vector,
-                _ => cursor.Integer,
-            };
-            registerCursor = AlignRegisterCursor(registerCursor, first.RegisterSlotAlignment);
-            var forceStack = first.RegisterClass == AbiRegisterClass.General && cursor.ForceStack;
-
-            if (!forceStack && registers.Length != 0 && registerCursor + requiredRegisters <= registers.Length)
-            {
-                var builder = ImmutableArray.CreateBuilder<AbiLocation>(value.Segments.Length);
-                var registerOffset = 0;
-                foreach (var segment in value.Segments)
-                {
-                    builder.Add(AbiLocation.FromRegister(
-                        registers[registerCursor + registerOffset],
-                        segment.Size,
-                        segment.RegisterClass,
-                        segment.Offset));
-                    registerOffset = checked(registerOffset + segment.RegisterSlotsConsumed);
-                }
-
-                switch (first.RegisterClass)
-                {
-                    case AbiRegisterClass.Floating:
-                        cursor.Float = registerCursor + requiredRegisters;
-                        break;
-                    case AbiRegisterClass.Vector:
-                        cursor.Vector = registerCursor + requiredRegisters;
-                        break;
-                    default:
-                        cursor.Integer = registerCursor + requiredRegisters;
-                        break;
-                }
-
-                return builder.ToImmutable();
-            }
-
-            switch (first.RegisterClass)
-            {
-                case AbiRegisterClass.Floating:
-                    cursor.Float = registers.Length;
-                    break;
-                case AbiRegisterClass.Vector:
-                    cursor.Vector = registers.Length;
-                    break;
-                default:
-                    cursor.Integer = registers.Length;
-                    break;
-            }
-
-            return AssignWholeValueToStack(value, ref cursor, stackSlotSize);
-        }
-
-        private static ImmutableArray<AbiLocation> AssignWholeValueToStack(AbiValue value, ref AbiCursor cursor, int stackSlotSize)
-        {
-            stackSlotSize = Math.Max(1, stackSlotSize);
-            cursor.Stack = AlignRegisterCursor(cursor.Stack, Math.Max(1, AlignUp(value.Alignment, stackSlotSize) / stackSlotSize));
-            var slot = cursor.Stack;
-            cursor.Stack = checked(cursor.Stack + SlotsFor(value.Size, stackSlotSize));
-            return ImmutableArray.Create(AbiLocation.FromStack(slot, 0, value.Size, value.Alignment));
-        }
-
-        private static int Arm32VfpRegisterByteOffset(int slot, int size)
-            => size <= 4 && (slot & 1) != 0 ? 4 : 0;
-
-        private static bool TryAllocateArm32VfpSlots(
-            ref AbiCursor cursor,
-            int slotCount,
-            int alignment,
-            int registerCount,
-            out int firstSlot)
-        {
-            firstSlot = -1;
-            if (cursor.Arm32VfpUnavailable || slotCount <= 0 || slotCount > registerCount)
-                return false;
-
-            var mask = slotCount == 32 ? uint.MaxValue : checked((1u << slotCount) - 1u);
-            for (var start = 0; start + slotCount <= registerCount; start++)
-            {
-                if (AlignRegisterCursor(start, alignment) != start)
-                    continue;
-                var shiftedMask = mask << start;
-                if ((cursor.Arm32VfpMask & shiftedMask) != 0)
-                    continue;
-                cursor.Arm32VfpMask |= shiftedMask;
-                cursor.Float = Math.Max(cursor.Float, start + slotCount);
-                firstSlot = start;
-                return true;
+                if (ContainsLongDouble(field.Type))
+                    return true;
             }
 
             return false;
         }
 
-        public static AbiLocation AssignSegmentArgumentLocation(AbiSegment segment, ref AbiCursor cursor, int stackSlotSize)
-            => AssignScalarArgumentLocation(
-                segment.RegisterClass,
-                segment.Size,
+        return IsLongDouble(type);
+    }
+
+    private static int FieldOffset(TargetInfo target, FieldSymbol field)
+        => target.GetFieldPlacement(field).ByteOffset;
+
+    private static AbiValue ClassifySmallRegisterAggregate(TargetInfo target, QualifiedType type, bool isReturn, bool passLargeByReference)
+    {
+        var size = Math.Max(1, target.SizeOf(type));
+        var alignment = Math.Max(1, target.AlignOf(type));
+        if (size <= MaxRegisterAggregateSize(target))
+            return AbiValue.MultiRegister(type, size, alignment, CreateGeneralSegments(target, size, alignment, requireVariadicAlignedPair: false));
+
+        if (passLargeByReference)
+            return IndirectForTarget(target, type, size, alignment);
+
+        return new AbiValue(type, isReturn ? AbiPassingKind.Indirect : AbiPassingKind.Stack, size, alignment, ImmutableArray<AbiSegment>.Empty, indirectSize: target.PointerSize);
+    }
+
+    private static AbiValue ClassifyIntegerConventionScalar(
+        TargetInfo target,
+        QualifiedType type,
+        int size,
+        int alignment,
+        bool isReturn,
+        bool isVariadicUnnamedArgument)
+    {
+        var registerSize = Math.Max(1, target.RegisterSize);
+        if (size <= registerSize)
+            return ScalarForTarget(target, type, AbiRegisterClass.General, size, alignment);
+
+        if (size <= checked(registerSize * MaxRegisterAggregateRegisters))
+        {
+            var requirePair = isVariadicUnnamedArgument && size == checked(registerSize * 2) && alignment >= checked(registerSize * 2);
+            return AbiValue.MultiRegister(type, size, alignment, CreateGeneralSegments(target, size, alignment, requirePair));
+        }
+
+        return IndirectForTarget(target, type, size, alignment);
+    }
+
+    private static AbiValue ScalarForTarget(TargetInfo target, QualifiedType type, AbiRegisterClass registerClass, int size, int alignment)
+        => new AbiValue(type, AbiPassingKind.Scalar, size, alignment, ImmutableArray.Create(CreateSegment(target, 0, size, registerClass)));
+
+    private static AbiValue IndirectForTarget(TargetInfo target, QualifiedType type, int size, int alignment)
+        => new AbiValue(type, AbiPassingKind.Indirect, size, alignment, ImmutableArray.Create(CreateSegment(target, 0, target.PointerSize, AbiRegisterClass.General)), indirectSize: target.PointerSize);
+
+    private static ImmutableArray<AbiSegment> CreateGeneralSegments(TargetInfo target, int size, int alignment, bool requireVariadicAlignedPair)
+    {
+        var registerSize = Math.Max(1, target.RegisterSize);
+        var segments = ImmutableArray.CreateBuilder<AbiSegment>();
+        for (var offset = 0; offset < size; offset += registerSize)
+        {
+            var segmentSize = Math.Min(registerSize, size - offset);
+            var isFirstSegment = offset == 0;
+            var registerSlotAlignment = requireVariadicAlignedPair && isFirstSegment ? 2 : 1;
+            var minimumRegisterSlots = requireVariadicAlignedPair && isFirstSegment ? 2 : 1;
+            var forceStackAfterStack = requireVariadicAlignedPair && isFirstSegment;
+            var stackSlotAlignment = isFirstSegment ? Math.Max(1, AlignUp(alignment, registerSize) / registerSize) : 1;
+            segments.Add(CreateSegment(target, offset, segmentSize, AbiRegisterClass.General, registerSlotAlignment, minimumRegisterSlots, forceStackAfterStack, stackSlotAlignment));
+        }
+
+        return segments.ToImmutable();
+    }
+
+    private static AbiSegment CreateSegment(
+        TargetInfo target,
+        int offset,
+        int size,
+        AbiRegisterClass registerClass,
+        int registerSlotAlignment = 1,
+        int minimumRegisterSlots = 1,
+        bool forceStackAfterStack = false,
+        int stackSlotAlignment = 1)
+    {
+        var usesArm32VfpSlots = target.Architecture == TargetArchitectureKind.Arm32 && registerClass == AbiRegisterClass.Floating;
+        var registerSlotsConsumed = usesArm32VfpSlots && size > 4 ? 2 : 1;
+        if (usesArm32VfpSlots)
+        {
+            registerSlotAlignment = Math.Max(registerSlotAlignment, registerSlotsConsumed);
+            minimumRegisterSlots = Math.Max(minimumRegisterSlots, registerSlotsConsumed);
+            stackSlotAlignment = Math.Max(stackSlotAlignment, registerSlotsConsumed);
+        }
+
+        var argumentRegisters = registerClass switch
+        {
+            AbiRegisterClass.Floating => TargetRegisterInfo.FloatingArgumentRegisters(target),
+            AbiRegisterClass.Vector => TargetRegisterInfo.VectorArgumentRegisters(target),
+            _ => TargetRegisterInfo.IntegerArgumentRegisters(target),
+        };
+        var returnRegisters = registerClass switch
+        {
+            AbiRegisterClass.Floating => TargetRegisterInfo.FloatingReturnRegisters(target, size),
+            AbiRegisterClass.Vector => TargetRegisterInfo.VectorReturnRegisters(target),
+            _ => TargetRegisterInfo.IntegerReturnRegisters(target),
+        };
+
+        return new AbiSegment(
+            offset,
+            size,
+            registerClass,
+            registerSlotAlignment,
+            minimumRegisterSlots,
+            forceStackAfterStack,
+            stackSlotAlignment,
+            argumentRegisters,
+            returnRegisters,
+            TargetRegisterInfo.UsesUnifiedArgumentCursor(target),
+            registerSlotsConsumed,
+            usesArm32VfpSlots);
+    }
+
+    public static AbiLocation AssignArgumentLocation(AbiValue value, ref AbiCursor cursor, int stackSlotSize)
+    {
+        var locations = AssignArgumentLocations(value, ref cursor, stackSlotSize);
+        if (locations.Length == 0)
+            return AbiLocation.None;
+        if (locations.Length == 1)
+            return locations[0];
+
+        foreach (var location in locations)
+        {
+            if (location.Kind == AbiLocationKind.Stack)
+                return location;
+        }
+
+        return AbiLocation.RegisterGroup;
+    }
+
+    public static ImmutableArray<AbiLocation> AssignArgumentLocations(AbiValue value, ref AbiCursor cursor, int stackSlotSize)
+    {
+        if (value.PassingKind == AbiPassingKind.Void)
+            return ImmutableArray<AbiLocation>.Empty;
+        if (value.PassingKind == AbiPassingKind.Unsupported)
+            throw new NotSupportedException("Unsupported ABI value: " + value.Type.ToDisplayString() + ".");
+
+        if (value.PassingKind == AbiPassingKind.Indirect)
+        {
+            var segment = value.Segments.Length != 0 ? value.Segments[0] : new AbiSegment(0, value.IndirectSize, AbiRegisterClass.General);
+            return ImmutableArray.Create(AssignSegmentArgumentLocation(segment, ref cursor, stackSlotSize));
+        }
+
+        if (value.PassingKind == AbiPassingKind.Scalar)
+        {
+            var segment = value.Segments.Length != 0 ? value.Segments[0] : new AbiSegment(0, value.Size, AbiRegisterClass.General);
+            return ImmutableArray.Create(AssignSegmentArgumentLocation(segment, ref cursor, stackSlotSize));
+        }
+
+        if (value.PassingKind == AbiPassingKind.MultiRegister)
+        {
+            if (value.RequiresAllRegisters)
+                return AssignAllOrStackArgumentLocations(value, ref cursor, stackSlotSize);
+
+            var builder = ImmutableArray.CreateBuilder<AbiLocation>(value.Segments.Length);
+            foreach (var segment in value.Segments)
+                builder.Add(AssignSegmentArgumentLocation(segment, ref cursor, stackSlotSize));
+            return builder.ToImmutable();
+        }
+
+        return AssignWholeValueToStack(value, ref cursor, stackSlotSize);
+    }
+
+    private static ImmutableArray<AbiLocation> AssignAllOrStackArgumentLocations(AbiValue value, ref AbiCursor cursor, int stackSlotSize)
+    {
+        if (value.Segments.Length == 0)
+            return AssignWholeValueToStack(value, ref cursor, stackSlotSize);
+
+        var first = value.Segments[0];
+        var registers = first.ArgumentRegisters;
+        if (first.UsesArm32VfpSlots)
+        {
+            var requiredSlots = 0;
+            foreach (var segment in value.Segments)
+                requiredSlots = checked(requiredSlots + segment.RegisterSlotsConsumed);
+
+            if (TryAllocateArm32VfpSlots(
                 ref cursor,
-                stackSlotSize,
-                segment.Offset,
-                segment.RegisterSlotAlignment,
-                segment.MinimumRegisterSlots,
-                segment.ForceStackAfterStack,
-                segment.StackSlotAlignment,
-                segment.ArgumentRegisters,
-                segment.UsesUnifiedArgumentCursor,
-                segment.RegisterSlotsConsumed,
-                segment.UsesArm32VfpSlots);
+                requiredSlots,
+                first.RegisterSlotAlignment,
+                registers.Length,
+                out var vfpRegisterCursor))
+            {
+                var builder = ImmutableArray.CreateBuilder<AbiLocation>(value.Segments.Length);
+                var registerOffset = 0;
+                foreach (var segment in value.Segments)
+                {
+                    var slot = vfpRegisterCursor + registerOffset;
+                    builder.Add(AbiLocation.FromRegister(
+                        registers[slot],
+                        segment.Size,
+                        segment.RegisterClass,
+                        segment.Offset,
+                        Arm32VfpRegisterByteOffset(slot, segment.Size)));
+                    registerOffset = checked(registerOffset + segment.RegisterSlotsConsumed);
+                }
+                return builder.ToImmutable();
+            }
 
-        public static AbiLocation AssignScalarArgumentLocation(
-            AbiRegisterClass registerClass,
-            int size,
-            ref AbiCursor cursor,
-            int stackSlotSize,
-            int stackOffset = 0,
-            int registerSlotAlignment = 1,
-            int minimumRegisterSlots = 1,
-            bool forceStackAfterStack = false,
-            int stackSlotAlignment = 1,
-            ImmutableArray<MachineRegister> argumentRegisters = default,
-            bool usesUnifiedArgumentCursor = false,
-            int registerSlotsConsumed = 1,
-            bool usesArm32VfpSlots = false)
+            cursor.Arm32VfpUnavailable = true;
+            return AssignWholeValueToStack(value, ref cursor, stackSlotSize);
+        }
+
+        var requiredRegisters = 0;
+        foreach (var segment in value.Segments)
+            requiredRegisters = checked(requiredRegisters + segment.RegisterSlotsConsumed);
+
+        var registerCursor = first.RegisterClass switch
         {
-            if (stackSlotSize <= 0)
-                stackSlotSize = 1;
+            AbiRegisterClass.Floating => cursor.Float,
+            AbiRegisterClass.Vector => cursor.Vector,
+            _ => cursor.Integer,
+        };
+        registerCursor = AlignRegisterCursor(registerCursor, first.RegisterSlotAlignment);
+        var forceStack = first.RegisterClass == AbiRegisterClass.General && cursor.ForceStack;
 
-            if (argumentRegisters.IsDefault)
+        if (!forceStack && registers.Length != 0 && registerCursor + requiredRegisters <= registers.Length)
+        {
+            var builder = ImmutableArray.CreateBuilder<AbiLocation>(value.Segments.Length);
+            var registerOffset = 0;
+            foreach (var segment in value.Segments)
             {
-                argumentRegisters = registerClass switch
-                {
-                    AbiRegisterClass.Floating => ImmutableArray.Create(MachineRegister.F10, MachineRegister.F11, MachineRegister.F12, MachineRegister.F13, MachineRegister.F14, MachineRegister.F15, MachineRegister.F16, MachineRegister.F17),
-                    AbiRegisterClass.Vector => ImmutableArray.Create(MachineRegister.V0, MachineRegister.V1, MachineRegister.V2, MachineRegister.V3, MachineRegister.V4, MachineRegister.V5, MachineRegister.V6, MachineRegister.V7),
-                    _ => ImmutableArray.Create(MachineRegister.X10, MachineRegister.X11, MachineRegister.X12, MachineRegister.X13, MachineRegister.X14, MachineRegister.X15, MachineRegister.X16, MachineRegister.X17),
-                };
+                builder.Add(AbiLocation.FromRegister(
+                    registers[registerCursor + registerOffset],
+                    segment.Size,
+                    segment.RegisterClass,
+                    segment.Offset));
+                registerOffset = checked(registerOffset + segment.RegisterSlotsConsumed);
             }
 
-            if (usesArm32VfpSlots)
+            switch (first.RegisterClass)
             {
-                if (TryAllocateArm32VfpSlots(
-                    ref cursor,
-                    Math.Max(1, registerSlotsConsumed),
-                    registerSlotAlignment,
-                    argumentRegisters.Length,
-                    out var vfpSlot))
-                {
-                    return AbiLocation.FromRegister(
-                        argumentRegisters[vfpSlot],
-                        size,
-                        registerClass,
-                        stackOffset,
-                        Arm32VfpRegisterByteOffset(vfpSlot, size));
-                }
-
-                cursor.Arm32VfpUnavailable = true;
-            }
-            else if (!(registerClass == AbiRegisterClass.General && cursor.ForceStack) && argumentRegisters.Length != 0)
-            {
-                if (usesUnifiedArgumentCursor)
-                {
-                    var slot = cursor.Unified++;
-                    if (slot < argumentRegisters.Length)
-                        return AbiLocation.FromRegister(argumentRegisters[slot], size, registerClass, stackOffset);
-                }
-                else if (registerClass == AbiRegisterClass.Floating)
-                {
-                    var alignedFloatCursor = AlignRegisterCursor(cursor.Float, registerSlotAlignment);
-                    if (alignedFloatCursor + Math.Max(1, registerSlotsConsumed) <= argumentRegisters.Length)
-                    {
-                        cursor.Float = alignedFloatCursor + Math.Max(1, registerSlotsConsumed);
-                        return AbiLocation.FromRegister(argumentRegisters[alignedFloatCursor], size, registerClass, stackOffset);
-                    }
-                }
-                else if (registerClass == AbiRegisterClass.Vector)
-                {
-                    var alignedVectorCursor = AlignRegisterCursor(cursor.Vector, registerSlotAlignment);
-                    if (alignedVectorCursor + Math.Max(1, registerSlotsConsumed) <= argumentRegisters.Length)
-                    {
-                        cursor.Vector = alignedVectorCursor + Math.Max(1, registerSlotsConsumed);
-                        return AbiLocation.FromRegister(argumentRegisters[alignedVectorCursor], size, registerClass, stackOffset);
-                    }
-                }
-                else
-                {
-                    var alignedIntegerCursor = AlignRegisterCursor(cursor.Integer, registerSlotAlignment);
-                    if (alignedIntegerCursor + Math.Max(Math.Max(1, minimumRegisterSlots), registerSlotsConsumed) <= argumentRegisters.Length)
-                    {
-                        cursor.Integer = alignedIntegerCursor + Math.Max(1, registerSlotsConsumed);
-                        return AbiLocation.FromRegister(argumentRegisters[alignedIntegerCursor], size, registerClass, stackOffset);
-                    }
-                }
+                case AbiRegisterClass.Floating:
+                    cursor.Float = registerCursor + requiredRegisters;
+                    break;
+                case AbiRegisterClass.Vector:
+                    cursor.Vector = registerCursor + requiredRegisters;
+                    break;
+                default:
+                    cursor.Integer = registerCursor + requiredRegisters;
+                    break;
             }
 
+            return builder.ToImmutable();
+        }
+
+        switch (first.RegisterClass)
+        {
+            case AbiRegisterClass.Floating:
+                cursor.Float = registers.Length;
+                break;
+            case AbiRegisterClass.Vector:
+                cursor.Vector = registers.Length;
+                break;
+            default:
+                cursor.Integer = registers.Length;
+                break;
+        }
+
+        return AssignWholeValueToStack(value, ref cursor, stackSlotSize);
+    }
+
+    private static ImmutableArray<AbiLocation> AssignWholeValueToStack(AbiValue value, ref AbiCursor cursor, int stackSlotSize)
+    {
+        stackSlotSize = Math.Max(1, stackSlotSize);
+        cursor.Stack = AlignRegisterCursor(cursor.Stack, Math.Max(1, AlignUp(value.Alignment, stackSlotSize) / stackSlotSize));
+        var slot = cursor.Stack;
+        cursor.Stack = checked(cursor.Stack + SlotsFor(value.Size, stackSlotSize));
+        return ImmutableArray.Create(AbiLocation.FromStack(slot, 0, value.Size, value.Alignment));
+    }
+
+    private static int Arm32VfpRegisterByteOffset(int slot, int size)
+        => size <= 4 && (slot & 1) != 0 ? 4 : 0;
+
+    private static bool TryAllocateArm32VfpSlots(
+        ref AbiCursor cursor,
+        int slotCount,
+        int alignment,
+        int registerCount,
+        out int firstSlot)
+    {
+        firstSlot = -1;
+        if (cursor.Arm32VfpUnavailable || slotCount <= 0 || slotCount > registerCount)
+            return false;
+
+        var mask = slotCount == 32 ? uint.MaxValue : checked((1u << slotCount) - 1u);
+        for (var start = 0; start + slotCount <= registerCount; start++)
+        {
+            if (AlignRegisterCursor(start, alignment) != start)
+                continue;
+            var shiftedMask = mask << start;
+            if ((cursor.Arm32VfpMask & shiftedMask) != 0)
+                continue;
+            cursor.Arm32VfpMask |= shiftedMask;
+            cursor.Float = Math.Max(cursor.Float, start + slotCount);
+            firstSlot = start;
+            return true;
+        }
+
+        return false;
+    }
+
+    public static AbiLocation AssignSegmentArgumentLocation(AbiSegment segment, ref AbiCursor cursor, int stackSlotSize)
+        => AssignScalarArgumentLocation(
+            segment.RegisterClass,
+            segment.Size,
+            ref cursor,
+            stackSlotSize,
+            segment.Offset,
+            segment.RegisterSlotAlignment,
+            segment.MinimumRegisterSlots,
+            segment.ForceStackAfterStack,
+            segment.StackSlotAlignment,
+            segment.ArgumentRegisters,
+            segment.UsesUnifiedArgumentCursor,
+            segment.RegisterSlotsConsumed,
+            segment.UsesArm32VfpSlots);
+
+    public static AbiLocation AssignScalarArgumentLocation(
+        AbiRegisterClass registerClass,
+        int size,
+        ref AbiCursor cursor,
+        int stackSlotSize,
+        int stackOffset = 0,
+        int registerSlotAlignment = 1,
+        int minimumRegisterSlots = 1,
+        bool forceStackAfterStack = false,
+        int stackSlotAlignment = 1,
+        ImmutableArray<MachineRegister> argumentRegisters = default,
+        bool usesUnifiedArgumentCursor = false,
+        int registerSlotsConsumed = 1,
+        bool usesArm32VfpSlots = false)
+    {
+        if (stackSlotSize <= 0)
+            stackSlotSize = 1;
+
+        if (argumentRegisters.IsDefault)
+        {
+            argumentRegisters = registerClass switch
+            {
+                AbiRegisterClass.Floating => ImmutableArray.Create(MachineRegister.F10, MachineRegister.F11, MachineRegister.F12, MachineRegister.F13, MachineRegister.F14, MachineRegister.F15, MachineRegister.F16, MachineRegister.F17),
+                AbiRegisterClass.Vector => ImmutableArray.Create(MachineRegister.V0, MachineRegister.V1, MachineRegister.V2, MachineRegister.V3, MachineRegister.V4, MachineRegister.V5, MachineRegister.V6, MachineRegister.V7),
+                _ => ImmutableArray.Create(MachineRegister.X10, MachineRegister.X11, MachineRegister.X12, MachineRegister.X13, MachineRegister.X14, MachineRegister.X15, MachineRegister.X16, MachineRegister.X17),
+            };
+        }
+
+        if (usesArm32VfpSlots)
+        {
+            if (TryAllocateArm32VfpSlots(
+                ref cursor,
+                Math.Max(1, registerSlotsConsumed),
+                registerSlotAlignment,
+                argumentRegisters.Length,
+                out var vfpSlot))
+            {
+                return AbiLocation.FromRegister(
+                    argumentRegisters[vfpSlot],
+                    size,
+                    registerClass,
+                    stackOffset,
+                    Arm32VfpRegisterByteOffset(vfpSlot, size));
+            }
+
+            cursor.Arm32VfpUnavailable = true;
+        }
+        else if (!(registerClass == AbiRegisterClass.General && cursor.ForceStack) && argumentRegisters.Length != 0)
+        {
             if (usesUnifiedArgumentCursor)
-                cursor.Stack = Math.Max(cursor.Stack, argumentRegisters.Length);
-
-            cursor.Stack = AlignRegisterCursor(cursor.Stack, stackSlotAlignment);
-            var stackSlot = cursor.Stack;
-            var offset = PositiveModulo(stackOffset, stackSlotSize);
-            cursor.Stack = checked(cursor.Stack + Math.Max(1, SlotsFor(offset + Math.Max(1, size), stackSlotSize)));
-            if (forceStackAfterStack)
-                cursor.ForceStack = true;
-            return AbiLocation.FromStack(stackSlot, offset, size, Math.Min(Math.Max(1, size), stackSlotSize));
-        }
-
-        public static int ReturnRegisterByteOffset(AbiSegment segment, int ordinal)
-            => segment.UsesArm32VfpSlots && segment.Size <= 4 && (ordinal & 1) != 0 ? 4 : 0;
-
-        public static MachineRegister ReturnRegister(AbiSegment segment, int ordinal)
-        {
-            if (ordinal >= 0 && ordinal < segment.ReturnRegisters.Length)
-                return segment.ReturnRegisters[ordinal];
-
-            if (segment.RegisterClass == AbiRegisterClass.Floating)
-                return (MachineRegister)((int)MachineRegister.F10 + ordinal);
-            if (segment.RegisterClass == AbiRegisterClass.Vector)
-                return (MachineRegister)((int)MachineRegister.V0 + ordinal);
-            return (MachineRegister)((int)MachineRegister.X10 + ordinal);
-        }
-
-        public static bool RequiresHiddenReturnBuffer(TargetInfo target, QualifiedType returnType)
-            => ClassifyValue(target, returnType, isReturn: true, isVariadicUnnamedArgument: false).PassingKind == AbiPassingKind.Indirect;
-
-        public static AbiLocation AssignHiddenReturnBufferLocation(TargetInfo target, ref AbiCursor cursor, int stackSlotSize)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            if (target.Architecture == TargetArchitectureKind.Arm64)
-                return AbiLocation.FromRegister(MachineRegister.X8, target.PointerSize, AbiRegisterClass.General);
-
-            return AssignSegmentArgumentLocation(CreateSegment(target, 0, target.PointerSize, AbiRegisterClass.General), ref cursor, stackSlotSize);
-        }
-
-        public static int MaxRegisterAggregateSize(TargetInfo target)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-            return checked(Math.Max(1, target.RegisterSize) * MaxRegisterAggregateRegisters);
-        }
-
-        public static int ComputeOutgoingArgumentAreaSize(LirInstruction instruction, int startOperand, TargetInfo target, int stackSlotSize, bool includeVariadicHomeArea)
-        {
-            if (instruction is null)
-                throw new ArgumentNullException(nameof(instruction));
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            var cursor = new AbiCursor();
-            var maxByte = TargetRegisterInfo.MinimumOutgoingArgumentAreaSize(target, stackSlotSize);
-            if (instruction.Result is not null && RequiresHiddenReturnBuffer(target, instruction.Result.Type))
             {
-                var hidden = AssignHiddenReturnBufferLocation(target, ref cursor, stackSlotSize);
-                if (hidden.Kind == AbiLocationKind.Stack)
-                    maxByte = Math.Max(maxByte, hidden.EndByte(stackSlotSize));
+                var slot = cursor.Unified++;
+                if (slot < argumentRegisters.Length)
+                    return AbiLocation.FromRegister(argumentRegisters[slot], size, registerClass, stackOffset);
             }
-
-            var signature = instruction.CallSignature;
-            for (var i = startOperand; i < instruction.Operands.Length; i++)
+            else if (registerClass == AbiRegisterClass.Floating)
             {
-                var isVariadicUnnamed = IsVariadicUnnamedArgument(signature, i - startOperand);
-                var value = ClassifyValue(
-                    target,
-                    instruction.Operands[i].Type,
-                    isReturn: false,
-                    isVariadicUnnamed,
-                    isVariadicFunction: signature?.IsVariadic == true);
-                foreach (var location in AssignArgumentLocations(value, ref cursor, stackSlotSize))
+                var alignedFloatCursor = AlignRegisterCursor(cursor.Float, registerSlotAlignment);
+                if (alignedFloatCursor + Math.Max(1, registerSlotsConsumed) <= argumentRegisters.Length)
                 {
-                    if (location.Kind == AbiLocationKind.Stack)
-                        maxByte = Math.Max(maxByte, location.EndByte(stackSlotSize));
+                    cursor.Float = alignedFloatCursor + Math.Max(1, registerSlotsConsumed);
+                    return AbiLocation.FromRegister(argumentRegisters[alignedFloatCursor], size, registerClass, stackOffset);
                 }
             }
-
-            if (includeVariadicHomeArea && target.IsRegisterBytecode && signature is not null && signature.IsVariadic)
+            else if (registerClass == AbiRegisterClass.Vector)
             {
-                var fixedCount = signature.Parameters.Length;
-                var variadicCount = Math.Max(0, instruction.Operands.Length - 1 - fixedCount);
-                var homeSlotSize = VariadicHomeSlotSize(target, stackSlotSize);
-                maxByte = checked(AlignUp(Math.Max(maxByte, cursor.Stack * stackSlotSize), homeSlotSize) + variadicCount * homeSlotSize);
+                var alignedVectorCursor = AlignRegisterCursor(cursor.Vector, registerSlotAlignment);
+                if (alignedVectorCursor + Math.Max(1, registerSlotsConsumed) <= argumentRegisters.Length)
+                {
+                    cursor.Vector = alignedVectorCursor + Math.Max(1, registerSlotsConsumed);
+                    return AbiLocation.FromRegister(argumentRegisters[alignedVectorCursor], size, registerClass, stackOffset);
+                }
             }
-
-            return AlignUp(maxByte, stackSlotSize);
+            else
+            {
+                var alignedIntegerCursor = AlignRegisterCursor(cursor.Integer, registerSlotAlignment);
+                if (alignedIntegerCursor + Math.Max(Math.Max(1, minimumRegisterSlots), registerSlotsConsumed) <= argumentRegisters.Length)
+                {
+                    cursor.Integer = alignedIntegerCursor + Math.Max(1, registerSlotsConsumed);
+                    return AbiLocation.FromRegister(argumentRegisters[alignedIntegerCursor], size, registerClass, stackOffset);
+                }
+            }
         }
 
-        public static int VariadicHomeSlotSize(TargetInfo target, int stackSlotSize)
+        if (usesUnifiedArgumentCursor)
+            cursor.Stack = Math.Max(cursor.Stack, argumentRegisters.Length);
+
+        cursor.Stack = AlignRegisterCursor(cursor.Stack, stackSlotAlignment);
+        var stackSlot = cursor.Stack;
+        var offset = PositiveModulo(stackOffset, stackSlotSize);
+        cursor.Stack = checked(cursor.Stack + Math.Max(1, SlotsFor(offset + Math.Max(1, size), stackSlotSize)));
+        if (forceStackAfterStack)
+            cursor.ForceStack = true;
+        return AbiLocation.FromStack(stackSlot, offset, size, Math.Min(Math.Max(1, size), stackSlotSize));
+    }
+
+    public static int ReturnRegisterByteOffset(AbiSegment segment, int ordinal)
+        => segment.UsesArm32VfpSlots && segment.Size <= 4 && (ordinal & 1) != 0 ? 4 : 0;
+
+    public static MachineRegister ReturnRegister(AbiSegment segment, int ordinal)
+    {
+        if (ordinal >= 0 && ordinal < segment.ReturnRegisters.Length)
+            return segment.ReturnRegisters[ordinal];
+
+        if (segment.RegisterClass == AbiRegisterClass.Floating)
+            return (MachineRegister)((int)MachineRegister.F10 + ordinal);
+        if (segment.RegisterClass == AbiRegisterClass.Vector)
+            return (MachineRegister)((int)MachineRegister.V0 + ordinal);
+        return (MachineRegister)((int)MachineRegister.X10 + ordinal);
+    }
+
+    public static bool RequiresHiddenReturnBuffer(TargetInfo target, QualifiedType returnType)
+        => ClassifyValue(target, returnType, isReturn: true, isVariadicUnnamedArgument: false).PassingKind == AbiPassingKind.Indirect;
+
+    public static AbiLocation AssignHiddenReturnBufferLocation(TargetInfo target, ref AbiCursor cursor, int stackSlotSize)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        if (target.Architecture == TargetArchitectureKind.Arm64)
+            return AbiLocation.FromRegister(MachineRegister.X8, target.PointerSize, AbiRegisterClass.General);
+
+        return AssignSegmentArgumentLocation(CreateSegment(target, 0, target.PointerSize, AbiRegisterClass.General), ref cursor, stackSlotSize);
+    }
+
+    public static int MaxRegisterAggregateSize(TargetInfo target)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+        return checked(Math.Max(1, target.RegisterSize) * MaxRegisterAggregateRegisters);
+    }
+
+    public static int ComputeOutgoingArgumentAreaSize(LirInstruction instruction, int startOperand, TargetInfo target, int stackSlotSize, bool includeVariadicHomeArea)
+    {
+        if (instruction is null)
+            throw new ArgumentNullException(nameof(instruction));
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        var cursor = new AbiCursor();
+        var maxByte = TargetRegisterInfo.MinimumOutgoingArgumentAreaSize(target, stackSlotSize);
+        if (instruction.Result is not null && RequiresHiddenReturnBuffer(target, instruction.Result.Type))
         {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-            return target.IsRiscV || target.Architecture == TargetArchitectureKind.Arm64
-                ? Math.Max(8, Math.Max(1, stackSlotSize))
-                : Math.Max(1, stackSlotSize);
+            var hidden = AssignHiddenReturnBufferLocation(target, ref cursor, stackSlotSize);
+            if (hidden.Kind == AbiLocationKind.Stack)
+                maxByte = Math.Max(maxByte, hidden.EndByte(stackSlotSize));
         }
 
-        public static int RiscVAbiFloatingRegisterSize(TargetInfo target)
+        var signature = instruction.CallSignature;
+        for (var i = startOperand; i < instruction.Operands.Length; i++)
         {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
+            var isVariadicUnnamed = IsVariadicUnnamedArgument(signature, i - startOperand);
+            var value = ClassifyValue(
+                target,
+                instruction.Operands[i].Type,
+                isReturn: false,
+                isVariadicUnnamed,
+                isVariadicFunction: signature?.IsVariadic == true);
+            foreach (var location in AssignArgumentLocations(value, ref cursor, stackSlotSize))
+            {
+                if (location.Kind == AbiLocationKind.Stack)
+                    maxByte = Math.Max(maxByte, location.EndByte(stackSlotSize));
+            }
+        }
 
-            if (!target.IsRiscV)
-                return 0;
+        if (includeVariadicHomeArea && target.IsRegisterBytecode && signature is not null && signature.IsVariadic)
+        {
+            var fixedCount = signature.Parameters.Length;
+            var variadicCount = Math.Max(0, instruction.Operands.Length - 1 - fixedCount);
+            var homeSlotSize = VariadicHomeSlotSize(target, stackSlotSize);
+            maxByte = checked(AlignUp(Math.Max(maxByte, cursor.Stack * stackSlotSize), homeSlotSize) + variadicCount * homeSlotSize);
+        }
 
-            var features = target.ArchitectureFeatures;
-            if ((features & TargetArchitectureFeatures.RiscVD) != 0)
-                return 8;
-            if ((features & TargetArchitectureFeatures.RiscVF) != 0)
-                return 4;
+        return AlignUp(maxByte, stackSlotSize);
+    }
+
+    public static int VariadicHomeSlotSize(TargetInfo target, int stackSlotSize)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+        return target.IsRiscV || target.Architecture == TargetArchitectureKind.Arm64
+            ? Math.Max(8, Math.Max(1, stackSlotSize))
+            : Math.Max(1, stackSlotSize);
+    }
+
+    public static int RiscVAbiFloatingRegisterSize(TargetInfo target)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        if (!target.IsRiscV)
             return 0;
-        }
 
-        public static int SlotsFor(int size, int stackSlotSize)
-            => size <= 0 ? 0 : Math.Max(1, AlignUp(size, stackSlotSize) / stackSlotSize);
-
-        public static int AlignUp(int value, int alignment)
-        {
-            if (alignment <= 1)
-                return value;
-            var remainder = value % alignment;
-            return remainder == 0 ? value : checked(value + alignment - remainder);
-        }
-
-        public static bool IsAggregate(QualifiedType type)
-            => type.Type.Kind is TypeKind.Struct or TypeKind.Union or TypeKind.Array;
-
-        private static bool IsVariadicUnnamedArgument(FunctionType? signature, int zeroBasedArgumentIndex)
-            => signature is not null && signature.IsVariadic && zeroBasedArgumentIndex >= signature.Parameters.Length;
-
-        private static int AlignRegisterCursor(int value, int alignment)
-        {
-            if (alignment <= 1)
-                return value;
-            var remainder = value % alignment;
-            return remainder == 0 ? value : checked(value + alignment - remainder);
-        }
-
-        private static int PositiveModulo(int value, int modulus)
-        {
-            if (modulus <= 1)
-                return 0;
-            var remainder = value % modulus;
-            return remainder < 0 ? remainder + modulus : remainder;
-        }
-
-        private static bool IsVoid(QualifiedType type)
-            => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Void };
-
-        private static bool IsPointerLike(QualifiedType type)
-            => type.Type.Kind is TypeKind.Pointer or TypeKind.Array or TypeKind.Function;
-
-        private static bool IsIntegerLike(QualifiedType type)
-            => (type.Type.Kind is TypeKind.Builtin or TypeKind.Enum) && !IsFloating(type) && !IsVoid(type);
-
-        internal static bool IsFloating(QualifiedType type)
-            => IsFloat32(type) || IsFloat64(type) || IsLongDouble(type);
-
-        private static bool IsFloat32(QualifiedType type)
-            => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Float };
-
-        private static bool IsFloat64(QualifiedType type)
-            => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Double };
-
-        private static bool IsLongDouble(QualifiedType type)
-            => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.LongDouble };
+        var features = target.ArchitectureFeatures;
+        if ((features & TargetArchitectureFeatures.RiscVD) != 0)
+            return 8;
+        if ((features & TargetArchitectureFeatures.RiscVF) != 0)
+            return 4;
+        return 0;
     }
 
-    internal enum AbiPassingKind
+    public static int SlotsFor(int size, int stackSlotSize)
+        => size <= 0 ? 0 : Math.Max(1, AlignUp(size, stackSlotSize) / stackSlotSize);
+
+    public static int AlignUp(int value, int alignment)
     {
-        Void,
-        Scalar,
-        MultiRegister,
-        Stack,
-        Indirect,
-        Unsupported,
+        if (alignment <= 1)
+            return value;
+        var remainder = value % alignment;
+        return remainder == 0 ? value : checked(value + alignment - remainder);
     }
 
-    internal enum AbiRegisterClass
+    public static bool IsAggregate(QualifiedType type)
+        => type.Type.Kind is TypeKind.Struct or TypeKind.Union or TypeKind.Array;
+
+    private static bool IsVariadicUnnamedArgument(FunctionType? signature, int zeroBasedArgumentIndex)
+        => signature is not null && signature.IsVariadic && zeroBasedArgumentIndex >= signature.Parameters.Length;
+
+    private static int AlignRegisterCursor(int value, int alignment)
     {
-        General,
-        Floating,
-        Vector,
+        if (alignment <= 1)
+            return value;
+        var remainder = value % alignment;
+        return remainder == 0 ? value : checked(value + alignment - remainder);
     }
 
-    internal enum AbiLocationKind
+    private static int PositiveModulo(int value, int modulus)
     {
-        None,
-        Register,
-        RegisterGroup,
-        Stack,
+        if (modulus <= 1)
+            return 0;
+        var remainder = value % modulus;
+        return remainder < 0 ? remainder + modulus : remainder;
     }
 
-    internal struct AbiCursor
+    private static bool IsVoid(QualifiedType type)
+        => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Void };
+
+    private static bool IsPointerLike(QualifiedType type)
+        => type.Type.Kind is TypeKind.Pointer or TypeKind.Array or TypeKind.Function;
+
+    private static bool IsIntegerLike(QualifiedType type)
+        => (type.Type.Kind is TypeKind.Builtin or TypeKind.Enum) && !IsFloating(type) && !IsVoid(type);
+
+    internal static bool IsFloating(QualifiedType type)
+        => IsFloat32(type) || IsFloat64(type) || IsLongDouble(type);
+
+    private static bool IsFloat32(QualifiedType type)
+        => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Float };
+
+    private static bool IsFloat64(QualifiedType type)
+        => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Double };
+
+    private static bool IsLongDouble(QualifiedType type)
+        => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.LongDouble };
+}
+
+internal enum AbiPassingKind
+{
+    Void,
+    Scalar,
+    MultiRegister,
+    Stack,
+    Indirect,
+    Unsupported,
+}
+
+internal enum AbiRegisterClass
+{
+    General,
+    Floating,
+    Vector,
+}
+
+internal enum AbiLocationKind
+{
+    None,
+    Register,
+    RegisterGroup,
+    Stack,
+}
+
+internal struct AbiCursor
+{
+    public int Integer;
+    public int Float;
+    public int Vector;
+    public int Stack;
+    public int Unified;
+    public uint Arm32VfpMask;
+    public bool Arm32VfpUnavailable;
+    public bool ForceStack;
+}
+
+internal readonly struct AbiSegment
+{
+    public int Offset { get; }
+    public int Size { get; }
+    public AbiRegisterClass RegisterClass { get; }
+    public int RegisterSlotAlignment { get; }
+    public int MinimumRegisterSlots { get; }
+    public bool ForceStackAfterStack { get; }
+    public int StackSlotAlignment { get; }
+    public ImmutableArray<MachineRegister> ArgumentRegisters { get; }
+    public ImmutableArray<MachineRegister> ReturnRegisters { get; }
+    public bool UsesUnifiedArgumentCursor { get; }
+    public int RegisterSlotsConsumed { get; }
+    public bool UsesArm32VfpSlots { get; }
+
+    public AbiSegment(
+        int offset,
+        int size,
+        AbiRegisterClass registerClass,
+        int registerSlotAlignment = 1,
+        int minimumRegisterSlots = 1,
+        bool forceStackAfterStack = false,
+        int stackSlotAlignment = 1,
+        ImmutableArray<MachineRegister> argumentRegisters = default,
+        ImmutableArray<MachineRegister> returnRegisters = default,
+        bool usesUnifiedArgumentCursor = false,
+        int registerSlotsConsumed = 1,
+        bool usesArm32VfpSlots = false)
     {
-        public int Integer;
-        public int Float;
-        public int Vector;
-        public int Stack;
-        public int Unified;
-        public uint Arm32VfpMask;
-        public bool Arm32VfpUnavailable;
-        public bool ForceStack;
+        Offset = offset < 0 ? 0 : offset;
+        Size = size <= 0 ? 1 : size;
+        RegisterClass = registerClass;
+        RegisterSlotAlignment = registerSlotAlignment <= 1 ? 1 : registerSlotAlignment;
+        MinimumRegisterSlots = minimumRegisterSlots <= 1 ? 1 : minimumRegisterSlots;
+        ForceStackAfterStack = forceStackAfterStack;
+        StackSlotAlignment = stackSlotAlignment <= 1 ? 1 : stackSlotAlignment;
+        ArgumentRegisters = argumentRegisters.IsDefault ? ImmutableArray<MachineRegister>.Empty : argumentRegisters;
+        ReturnRegisters = returnRegisters.IsDefault ? ImmutableArray<MachineRegister>.Empty : returnRegisters;
+        UsesUnifiedArgumentCursor = usesUnifiedArgumentCursor;
+        RegisterSlotsConsumed = registerSlotsConsumed <= 1 ? 1 : registerSlotsConsumed;
+        UsesArm32VfpSlots = usesArm32VfpSlots;
     }
+}
 
-    internal readonly struct AbiSegment
+internal readonly struct AbiValue
+{
+    public QualifiedType Type { get; }
+    public AbiPassingKind PassingKind { get; }
+    public int Size { get; }
+    public int Alignment { get; }
+    public ImmutableArray<AbiSegment> Segments { get; }
+    public int IndirectSize { get; }
+    public bool RequiresAllRegisters { get; }
+
+    public AbiValue(
+        QualifiedType type,
+        AbiPassingKind passingKind,
+        int size,
+        int alignment,
+        ImmutableArray<AbiSegment> segments,
+        int indirectSize = 0,
+        bool requiresAllRegisters = false)
     {
-        public int Offset { get; }
-        public int Size { get; }
-        public AbiRegisterClass RegisterClass { get; }
-        public int RegisterSlotAlignment { get; }
-        public int MinimumRegisterSlots { get; }
-        public bool ForceStackAfterStack { get; }
-        public int StackSlotAlignment { get; }
-        public ImmutableArray<MachineRegister> ArgumentRegisters { get; }
-        public ImmutableArray<MachineRegister> ReturnRegisters { get; }
-        public bool UsesUnifiedArgumentCursor { get; }
-        public int RegisterSlotsConsumed { get; }
-        public bool UsesArm32VfpSlots { get; }
-
-        public AbiSegment(
-            int offset,
-            int size,
-            AbiRegisterClass registerClass,
-            int registerSlotAlignment = 1,
-            int minimumRegisterSlots = 1,
-            bool forceStackAfterStack = false,
-            int stackSlotAlignment = 1,
-            ImmutableArray<MachineRegister> argumentRegisters = default,
-            ImmutableArray<MachineRegister> returnRegisters = default,
-            bool usesUnifiedArgumentCursor = false,
-            int registerSlotsConsumed = 1,
-            bool usesArm32VfpSlots = false)
-        {
-            Offset = offset < 0 ? 0 : offset;
-            Size = size <= 0 ? 1 : size;
-            RegisterClass = registerClass;
-            RegisterSlotAlignment = registerSlotAlignment <= 1 ? 1 : registerSlotAlignment;
-            MinimumRegisterSlots = minimumRegisterSlots <= 1 ? 1 : minimumRegisterSlots;
-            ForceStackAfterStack = forceStackAfterStack;
-            StackSlotAlignment = stackSlotAlignment <= 1 ? 1 : stackSlotAlignment;
-            ArgumentRegisters = argumentRegisters.IsDefault ? ImmutableArray<MachineRegister>.Empty : argumentRegisters;
-            ReturnRegisters = returnRegisters.IsDefault ? ImmutableArray<MachineRegister>.Empty : returnRegisters;
-            UsesUnifiedArgumentCursor = usesUnifiedArgumentCursor;
-            RegisterSlotsConsumed = registerSlotsConsumed <= 1 ? 1 : registerSlotsConsumed;
-            UsesArm32VfpSlots = usesArm32VfpSlots;
-        }
+        Type = type;
+        PassingKind = passingKind;
+        Size = Math.Max(0, size);
+        Alignment = Math.Max(1, alignment);
+        Segments = segments.IsDefault ? ImmutableArray<AbiSegment>.Empty : segments;
+        IndirectSize = indirectSize <= 0 ? Math.Max(1, Size) : indirectSize;
+        RequiresAllRegisters = requiresAllRegisters;
     }
 
-    internal readonly struct AbiValue
+    public static AbiValue Void(QualifiedType type)
+        => new AbiValue(type, AbiPassingKind.Void, 0, 1, ImmutableArray<AbiSegment>.Empty);
+
+    public static AbiValue Scalar(QualifiedType type, AbiRegisterClass registerClass, int size, int alignment)
+        => new AbiValue(type, AbiPassingKind.Scalar, size, alignment, ImmutableArray.Create(new AbiSegment(0, size, registerClass)));
+
+    public static AbiValue MultiRegister(
+        QualifiedType type,
+        int size,
+        int alignment,
+        ImmutableArray<AbiSegment> segments,
+        bool requiresAllRegisters = false)
+        => new AbiValue(type, AbiPassingKind.MultiRegister, size, alignment, segments, requiresAllRegisters: requiresAllRegisters);
+
+    public static AbiValue Stack(QualifiedType type, int size, int alignment)
+        => new AbiValue(type, AbiPassingKind.Stack, size, alignment, ImmutableArray<AbiSegment>.Empty);
+
+    public static AbiValue Indirect(QualifiedType type, int size, int alignment, int pointerSize)
+        => new AbiValue(type, AbiPassingKind.Indirect, size, alignment, ImmutableArray<AbiSegment>.Empty, indirectSize: pointerSize);
+
+    public static AbiValue Unsupported(QualifiedType type)
+        => new AbiValue(type, AbiPassingKind.Unsupported, 0, 1, ImmutableArray<AbiSegment>.Empty);
+}
+
+internal readonly struct AbiLocation
+{
+    private readonly AbiLocationKind _kind;
+    private readonly MachineRegister _register;
+    private readonly int _stackSlotIndex;
+    private readonly int _stackOffset;
+    private readonly int _size;
+    private readonly int _alignment;
+    private readonly int _registerByteOffset;
+    private readonly AbiRegisterClass _registerClass;
+
+    public static readonly AbiLocation None = new AbiLocation(AbiLocationKind.None, MachineRegister.Invalid, 0, 0, 0, 1, AbiRegisterClass.General);
+    public static readonly AbiLocation RegisterGroup = new AbiLocation(AbiLocationKind.RegisterGroup, MachineRegister.Invalid, 0, 0, 0, 1, AbiRegisterClass.General);
+
+    public AbiLocationKind Kind => _kind;
+    public MachineRegister Register => _register;
+    public int StackSlotIndex => _stackSlotIndex;
+    public int StackOffset => _stackOffset;
+    public int Size => _size;
+    public int Alignment => _alignment;
+    public int RegisterByteOffset => _registerByteOffset;
+    public AbiRegisterClass RegisterClass => _registerClass;
+
+    private AbiLocation(
+        AbiLocationKind kind,
+        MachineRegister register,
+        int stackSlotIndex,
+        int stackOffset,
+        int size,
+        int alignment,
+        AbiRegisterClass registerClass,
+        int registerByteOffset = 0)
     {
-        public QualifiedType Type { get; }
-        public AbiPassingKind PassingKind { get; }
-        public int Size { get; }
-        public int Alignment { get; }
-        public ImmutableArray<AbiSegment> Segments { get; }
-        public int IndirectSize { get; }
-        public bool RequiresAllRegisters { get; }
-
-        public AbiValue(
-            QualifiedType type,
-            AbiPassingKind passingKind,
-            int size,
-            int alignment,
-            ImmutableArray<AbiSegment> segments,
-            int indirectSize = 0,
-            bool requiresAllRegisters = false)
-        {
-            Type = type;
-            PassingKind = passingKind;
-            Size = Math.Max(0, size);
-            Alignment = Math.Max(1, alignment);
-            Segments = segments.IsDefault ? ImmutableArray<AbiSegment>.Empty : segments;
-            IndirectSize = indirectSize <= 0 ? Math.Max(1, Size) : indirectSize;
-            RequiresAllRegisters = requiresAllRegisters;
-        }
-
-        public static AbiValue Void(QualifiedType type)
-            => new AbiValue(type, AbiPassingKind.Void, 0, 1, ImmutableArray<AbiSegment>.Empty);
-
-        public static AbiValue Scalar(QualifiedType type, AbiRegisterClass registerClass, int size, int alignment)
-            => new AbiValue(type, AbiPassingKind.Scalar, size, alignment, ImmutableArray.Create(new AbiSegment(0, size, registerClass)));
-
-        public static AbiValue MultiRegister(
-            QualifiedType type,
-            int size,
-            int alignment,
-            ImmutableArray<AbiSegment> segments,
-            bool requiresAllRegisters = false)
-            => new AbiValue(type, AbiPassingKind.MultiRegister, size, alignment, segments, requiresAllRegisters: requiresAllRegisters);
-
-        public static AbiValue Stack(QualifiedType type, int size, int alignment)
-            => new AbiValue(type, AbiPassingKind.Stack, size, alignment, ImmutableArray<AbiSegment>.Empty);
-
-        public static AbiValue Indirect(QualifiedType type, int size, int alignment, int pointerSize)
-            => new AbiValue(type, AbiPassingKind.Indirect, size, alignment, ImmutableArray<AbiSegment>.Empty, indirectSize: pointerSize);
-
-        public static AbiValue Unsupported(QualifiedType type)
-            => new AbiValue(type, AbiPassingKind.Unsupported, 0, 1, ImmutableArray<AbiSegment>.Empty);
+        _kind = kind;
+        _register = register;
+        _stackSlotIndex = stackSlotIndex;
+        _stackOffset = stackOffset < 0 ? 0 : stackOffset;
+        _size = size < 0 ? 0 : size;
+        _alignment = alignment < 1 ? 1 : alignment;
+        _registerClass = registerClass;
+        _registerByteOffset = registerByteOffset < 0 ? 0 : registerByteOffset;
     }
 
-    internal readonly struct AbiLocation
+    public static AbiLocation FromRegister(
+        MachineRegister register,
+        int size,
+        AbiRegisterClass registerClass,
+        int stackOffset = 0,
+        int registerByteOffset = 0)
     {
-        private readonly AbiLocationKind _kind;
-        private readonly MachineRegister _register;
-        private readonly int _stackSlotIndex;
-        private readonly int _stackOffset;
-        private readonly int _size;
-        private readonly int _alignment;
-        private readonly int _registerByteOffset;
-        private readonly AbiRegisterClass _registerClass;
-
-        public static readonly AbiLocation None = new AbiLocation(AbiLocationKind.None, MachineRegister.Invalid, 0, 0, 0, 1, AbiRegisterClass.General);
-        public static readonly AbiLocation RegisterGroup = new AbiLocation(AbiLocationKind.RegisterGroup, MachineRegister.Invalid, 0, 0, 0, 1, AbiRegisterClass.General);
-
-        public AbiLocationKind Kind => _kind;
-        public MachineRegister Register => _register;
-        public int StackSlotIndex => _stackSlotIndex;
-        public int StackOffset => _stackOffset;
-        public int Size => _size;
-        public int Alignment => _alignment;
-        public int RegisterByteOffset => _registerByteOffset;
-        public AbiRegisterClass RegisterClass => _registerClass;
-
-        private AbiLocation(
-            AbiLocationKind kind,
-            MachineRegister register,
-            int stackSlotIndex,
-            int stackOffset,
-            int size,
-            int alignment,
-            AbiRegisterClass registerClass,
-            int registerByteOffset = 0)
-        {
-            _kind = kind;
-            _register = register;
-            _stackSlotIndex = stackSlotIndex;
-            _stackOffset = stackOffset < 0 ? 0 : stackOffset;
-            _size = size < 0 ? 0 : size;
-            _alignment = alignment < 1 ? 1 : alignment;
-            _registerClass = registerClass;
-            _registerByteOffset = registerByteOffset < 0 ? 0 : registerByteOffset;
-        }
-
-        public static AbiLocation FromRegister(
-            MachineRegister register,
-            int size,
-            AbiRegisterClass registerClass,
-            int stackOffset = 0,
-            int registerByteOffset = 0)
-        {
-            var alignment = Math.Min(size < 1 ? 1 : size, 8);
-            return new AbiLocation(
-                AbiLocationKind.Register,
-                register,
-                -1,
-                stackOffset,
-                size,
-                alignment,
-                registerClass,
-                registerByteOffset);
-        }
-
-        public static AbiLocation FromStack(int slotIndex, int offset, int size, int alignment)
-            => new AbiLocation(AbiLocationKind.Stack, MachineRegister.Invalid, slotIndex, offset, size, alignment, AbiRegisterClass.General);
-
-        public int StackByteOffset(int stackSlotSize)
-            => checked(_stackSlotIndex * stackSlotSize + _stackOffset);
-
-        public int EndByte(int stackSlotSize)
-            => checked(StackByteOffset(stackSlotSize) + Math.Max(1, _size));
+        var alignment = Math.Min(size < 1 ? 1 : size, 8);
+        return new AbiLocation(
+            AbiLocationKind.Register,
+            register,
+            -1,
+            stackOffset,
+            size,
+            alignment,
+            registerClass,
+            registerByteOffset);
     }
+
+    public static AbiLocation FromStack(int slotIndex, int offset, int size, int alignment)
+        => new AbiLocation(AbiLocationKind.Stack, MachineRegister.Invalid, slotIndex, offset, size, alignment, AbiRegisterClass.General);
+
+    public int StackByteOffset(int stackSlotSize)
+        => checked(_stackSlotIndex * stackSlotSize + _stackOffset);
+
+    public int EndByte(int stackSlotSize)
+        => checked(StackByteOffset(stackSlotSize) + Math.Max(1, _size));
 }

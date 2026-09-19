@@ -1,277 +1,276 @@
-namespace Cnidaria.C
+namespace Cnidaria.C;
+
+public enum SyntaxKind : ushort
 {
-    public enum SyntaxKind : ushort
-    {
-        None = 0,
+    None = 0,
 
-        // Special tokens
+    // Special tokens
 
-        BadToken,
-        MissingToken,
-        EndOfFileToken,
+    BadToken,
+    MissingToken,
+    EndOfFileToken,
 
-        // Trivia
+    // Trivia
 
-        WhitespaceTrivia,
-        EndOfLineTrivia,
-        SingleLineCommentTrivia,
-        MultiLineCommentTrivia,
-        LineContinuationTrivia,
-        DirectiveTrivia,
-        DisabledTextTrivia,
-        BomTrivia,
+    WhitespaceTrivia,
+    EndOfLineTrivia,
+    SingleLineCommentTrivia,
+    MultiLineCommentTrivia,
+    LineContinuationTrivia,
+    DirectiveTrivia,
+    DisabledTextTrivia,
+    BomTrivia,
 
-        // Identifiers
+    // Identifiers
 
-        IdentifierToken,
-        TypedefNameToken,
+    IdentifierToken,
+    TypedefNameToken,
 
-        // Literals
+    // Literals
 
-        IntegerLiteralToken,
-        FloatingLiteralToken,
+    IntegerLiteralToken,
+    FloatingLiteralToken,
 
-        CharacterLiteralToken,
-        WideCharacterLiteralToken,       // L'x'
-        Utf8CharacterLiteralToken,       // u8'x' in C23
-        Utf16CharacterLiteralToken,      // u'x'
-        Utf32CharacterLiteralToken,      // U'x'
+    CharacterLiteralToken,
+    WideCharacterLiteralToken,       // L'x'
+    Utf8CharacterLiteralToken,       // u8'x' in C23
+    Utf16CharacterLiteralToken,      // u'x'
+    Utf32CharacterLiteralToken,      // U'x'
 
-        StringLiteralToken,
-        WideStringLiteralToken,          // L"..."
-        Utf8StringLiteralToken,          // u8"..."
-        Utf16StringLiteralToken,         // u"..."
-        Utf32StringLiteralToken,         // U"..."
+    StringLiteralToken,
+    WideStringLiteralToken,          // L"..."
+    Utf8StringLiteralToken,          // u8"..."
+    Utf16StringLiteralToken,         // u"..."
+    Utf32StringLiteralToken,         // U"..."
 
-        // Punctuators / operators
+    // Punctuators / operators
 
-        OpenParenToken,                  // (
-        CloseParenToken,                 // )
+    OpenParenToken,                  // (
+    CloseParenToken,                 // )
 
-        OpenBraceToken,                  // {
-        CloseBraceToken,                 // }
+    OpenBraceToken,                  // {
+    CloseBraceToken,                 // }
 
-        OpenBracketToken,                // [
-        CloseBracketToken,               // ]
+    OpenBracketToken,                // [
+    CloseBracketToken,               // ]
 
-        SemicolonToken,                  // ;
-        ColonToken,                      // :
-        CommaToken,                      // ,
-        DotToken,                        // .
-        ArrowToken,                      // ->
-        QuestionToken,                   // ?
-        EllipsisToken,                   // ...
+    SemicolonToken,                  // ;
+    ColonToken,                      // :
+    CommaToken,                      // ,
+    DotToken,                        // .
+    ArrowToken,                      // ->
+    QuestionToken,                   // ?
+    EllipsisToken,                   // ...
 
-        PlusToken,                       // +
-        PlusPlusToken,                   // ++
-        PlusEqualsToken,                 // +=
+    PlusToken,                       // +
+    PlusPlusToken,                   // ++
+    PlusEqualsToken,                 // +=
 
-        MinusToken,                      // -
-        MinusMinusToken,                 // --
-        MinusEqualsToken,                // -=
+    MinusToken,                      // -
+    MinusMinusToken,                 // --
+    MinusEqualsToken,                // -=
 
-        StarToken,                       // *
-        StarEqualsToken,                 // *=
+    StarToken,                       // *
+    StarEqualsToken,                 // *=
 
-        SlashToken,                      // /
-        SlashEqualsToken,                // /=
+    SlashToken,                      // /
+    SlashEqualsToken,                // /=
 
-        PercentToken,                    // %
-        PercentEqualsToken,              // %=
+    PercentToken,                    // %
+    PercentEqualsToken,              // %=
 
-        AmpersandToken,                  // &
-        AmpersandAmpersandToken,         // &&
-        AmpersandEqualsToken,            // &=
+    AmpersandToken,                  // &
+    AmpersandAmpersandToken,         // &&
+    AmpersandEqualsToken,            // &=
 
-        PipeToken,                       // |
-        PipePipeToken,                   // ||
-        PipeEqualsToken,                 // |=
+    PipeToken,                       // |
+    PipePipeToken,                   // ||
+    PipeEqualsToken,                 // |=
 
-        HatToken,                        // ^
-        HatEqualsToken,                  // ^=
+    HatToken,                        // ^
+    HatEqualsToken,                  // ^=
 
-        TildeToken,                      // ~
+    TildeToken,                      // ~
 
-        BangToken,                       // !
-        BangEqualsToken,                 // !=
+    BangToken,                       // !
+    BangEqualsToken,                 // !=
 
-        EqualsToken,                     // =
-        EqualsEqualsToken,               // ==
+    EqualsToken,                     // =
+    EqualsEqualsToken,               // ==
 
-        LessThanToken,                   // <
-        LessThanEqualsToken,             // <=
-        LessThanLessThanToken,           // <<
-        LessThanLessThanEqualsToken,     // <<=
+    LessThanToken,                   // <
+    LessThanEqualsToken,             // <=
+    LessThanLessThanToken,           // <<
+    LessThanLessThanEqualsToken,     // <<=
 
-        GreaterThanToken,                // >
-        GreaterThanEqualsToken,          // >=
-        GreaterThanGreaterThanToken,     // >>
-        GreaterThanGreaterThanEqualsToken, // >>=
+    GreaterThanToken,                // >
+    GreaterThanEqualsToken,          // >=
+    GreaterThanGreaterThanToken,     // >>
+    GreaterThanGreaterThanEqualsToken, // >>=
 
-        HashToken,                       // #
-        HashHashToken,                   // ##
+    HashToken,                       // #
+    HashHashToken,                   // ##
 
-        BackslashToken,                  // \\
+    BackslashToken,                  // \\
 
-        // Digraph punctuators
+    // Digraph punctuators
 
-        OpenBracketDigraphToken,         // <:
-        CloseBracketDigraphToken,        // :>
-        OpenBraceDigraphToken,           // <%
-        CloseBraceDigraphToken,          // %>
-        HashDigraphToken,                // %:
-        HashHashDigraphToken,            // %:%:
+    OpenBracketDigraphToken,         // <:
+    CloseBracketDigraphToken,        // :>
+    OpenBraceDigraphToken,           // <%
+    CloseBraceDigraphToken,          // %>
+    HashDigraphToken,                // %:
+    HashHashDigraphToken,            // %:%:
 
-        // ISO C90 / C95 keywords
+    // ISO C90 / C95 keywords
 
-        AutoKeyword,
-        BreakKeyword,
-        CaseKeyword,
-        CharKeyword,
-        ConstKeyword,
-        ContinueKeyword,
-        DefaultKeyword,
-        DoKeyword,
-        DoubleKeyword,
-        ElseKeyword,
-        EnumKeyword,
-        ExternKeyword,
-        FloatKeyword,
-        ForKeyword,
-        GotoKeyword,
-        IfKeyword,
-        IntKeyword,
-        LongKeyword,
-        RegisterKeyword,
-        ReturnKeyword,
-        ShortKeyword,
-        SignedKeyword,
-        SizeofKeyword,
-        StaticKeyword,
-        StructKeyword,
-        SwitchKeyword,
-        TypedefKeyword,
-        UnionKeyword,
-        UnsignedKeyword,
-        VoidKeyword,
-        VolatileKeyword,
-        WhileKeyword,
-        AtomicKeyword,
+    AutoKeyword,
+    BreakKeyword,
+    CaseKeyword,
+    CharKeyword,
+    ConstKeyword,
+    ContinueKeyword,
+    DefaultKeyword,
+    DoKeyword,
+    DoubleKeyword,
+    ElseKeyword,
+    EnumKeyword,
+    ExternKeyword,
+    FloatKeyword,
+    ForKeyword,
+    GotoKeyword,
+    IfKeyword,
+    IntKeyword,
+    LongKeyword,
+    RegisterKeyword,
+    ReturnKeyword,
+    ShortKeyword,
+    SignedKeyword,
+    SizeofKeyword,
+    StaticKeyword,
+    StructKeyword,
+    SwitchKeyword,
+    TypedefKeyword,
+    UnionKeyword,
+    UnsignedKeyword,
+    VoidKeyword,
+    VolatileKeyword,
+    WhileKeyword,
+    AtomicKeyword,
 
-        // C99 keywords
+    // C99 keywords
 
-        InlineKeyword,
-        RestrictKeyword,
+    InlineKeyword,
+    RestrictKeyword,
 
-        UnderscoreBoolKeyword,           // _Bool
-        UnderscoreComplexKeyword,        // _Complex
-        UnderscoreImaginaryKeyword,      // _Imaginary
-        UnderscorePragmaKeyword,         // _Pragma
+    UnderscoreBoolKeyword,           // _Bool
+    UnderscoreComplexKeyword,        // _Complex
+    UnderscoreImaginaryKeyword,      // _Imaginary
+    UnderscorePragmaKeyword,         // _Pragma
 
-        // C11 keywords
+    // C11 keywords
 
-        UnderscoreAlignasKeyword,        // _Alignas
-        UnderscoreAlignofKeyword,        // _Alignof
-        UnderscoreAtomicKeyword,         // _Atomic
-        UnderscoreGenericKeyword,        // _Generic
-        UnderscoreNoreturnKeyword,       // _Noreturn
-        UnderscoreStaticAssertKeyword,   // _Static_assert
-        UnderscoreThreadLocalKeyword,    // _Thread_local
+    UnderscoreAlignasKeyword,        // _Alignas
+    UnderscoreAlignofKeyword,        // _Alignof
+    UnderscoreAtomicKeyword,         // _Atomic
+    UnderscoreGenericKeyword,        // _Generic
+    UnderscoreNoreturnKeyword,       // _Noreturn
+    UnderscoreStaticAssertKeyword,   // _Static_assert
+    UnderscoreThreadLocalKeyword,    // _Thread_local
 
-        // C23 keywords and keyword spellings
+    // C23 keywords and keyword spellings
 
-        AlignasKeyword,                  // alignas
-        AlignofKeyword,                  // alignof
-        BoolKeyword,                     // bool
-        ConstexprKeyword,                // constexpr
-        FalseKeyword,                    // false
-        NullptrKeyword,                  // nullptr
-        StaticAssertKeyword,             // static_assert
-        ThreadLocalKeyword,              // thread_local
-        TrueKeyword,                     // true
-        TypeofKeyword,                   // typeof
-        TypeofUnqualKeyword,             // typeof_unqual
+    AlignasKeyword,                  // alignas
+    AlignofKeyword,                  // alignof
+    BoolKeyword,                     // bool
+    ConstexprKeyword,                // constexpr
+    FalseKeyword,                    // false
+    NullptrKeyword,                  // nullptr
+    StaticAssertKeyword,             // static_assert
+    ThreadLocalKeyword,              // thread_local
+    TrueKeyword,                     // true
+    TypeofKeyword,                   // typeof
+    TypeofUnqualKeyword,             // typeof_unqual
 
-        UnderscoreBitIntKeyword,         // _BitInt
+    UnderscoreBitIntKeyword,         // _BitInt
 
-        // Conditionally-supported keywords
+    // Conditionally-supported keywords
 
-        AsmKeyword,
-        FortranKeyword,
+    AsmKeyword,
+    FortranKeyword,
 
-        UnderscoreDecimal32Keyword,      // _Decimal32
-        UnderscoreDecimal64Keyword,      // _Decimal64
-        UnderscoreDecimal128Keyword,     // _Decimal128
+    UnderscoreDecimal32Keyword,      // _Decimal32
+    UnderscoreDecimal64Keyword,      // _Decimal64
+    UnderscoreDecimal128Keyword,     // _Decimal128
 
-        // Common extension keywords
+    // Common extension keywords
 
-        ExtensionKeyword,                // __extension__
-        AttributeKeyword,                // __attribute__
-        DeclspecKeyword,                 // __declspec
+    ExtensionKeyword,                // __extension__
+    AttributeKeyword,                // __attribute__
+    DeclspecKeyword,                 // __declspec
 
-        BuiltinVaArgKeyword,             // __builtin_va_arg
-        BuiltinOffsetofKeyword,          // __builtin_offsetof
-        BuiltinTypesCompatiblePKeyword,  // __builtin_types_compatible_p
-        BuiltinChooseExprKeyword,        // __builtin_choose_expr
+    BuiltinVaArgKeyword,             // __builtin_va_arg
+    BuiltinOffsetofKeyword,          // __builtin_offsetof
+    BuiltinTypesCompatiblePKeyword,  // __builtin_types_compatible_p
+    BuiltinChooseExprKeyword,        // __builtin_choose_expr
 
-        AsmExtensionKeyword,             // __asm, __asm__
-        InlineExtensionKeyword,          // __inline, __inline__
-        RestrictExtensionKeyword,        // __restrict, __restrict__
-        TypeofExtensionKeyword,          // __typeof, __typeof__
-        VolatileExtensionKeyword,        // __volatile, __volatile__
-        ConstExtensionKeyword,           // __const, __const__
+    AsmExtensionKeyword,             // __asm, __asm__
+    InlineExtensionKeyword,          // __inline, __inline__
+    RestrictExtensionKeyword,        // __restrict, __restrict__
+    TypeofExtensionKeyword,          // __typeof, __typeof__
+    VolatileExtensionKeyword,        // __volatile, __volatile__
+    ConstExtensionKeyword,           // __const, __const__
 
-        // Syntax nodes
+    // Syntax nodes
 
-        TranslationUnit,
-        FunctionDefinition,
-        Declaration,
-        StaticAssertDeclaration,
-        InitDeclarator,
-        Declarator,
-        ExpressionInitializer,
-        InitializerList,
-        InitializerListItem,
-        FieldDesignator,
-        ArrayDesignator,
+    TranslationUnit,
+    FunctionDefinition,
+    Declaration,
+    StaticAssertDeclaration,
+    InitDeclarator,
+    Declarator,
+    ExpressionInitializer,
+    InitializerList,
+    InitializerListItem,
+    FieldDesignator,
+    ArrayDesignator,
 
-        CompoundStatement,
-        IfStatement,
-        SwitchStatement,
-        WhileStatement,
-        DoStatement,
-        ForStatement,
-        BreakStatement,
-        ContinueStatement,
-        GotoStatement,
-        LabelStatement,
-        CaseStatement,
-        DefaultStatement,
-        ReturnStatement,
-        ExpressionStatement,
-        AsmStatement,
-        AsmOperand,
-        AsmClobber,
-        SkippedExternalDeclaration,
-        SkippedStatement,
+    CompoundStatement,
+    IfStatement,
+    SwitchStatement,
+    WhileStatement,
+    DoStatement,
+    ForStatement,
+    BreakStatement,
+    ContinueStatement,
+    GotoStatement,
+    LabelStatement,
+    CaseStatement,
+    DefaultStatement,
+    ReturnStatement,
+    ExpressionStatement,
+    AsmStatement,
+    AsmOperand,
+    AsmClobber,
+    SkippedExternalDeclaration,
+    SkippedStatement,
 
-        LiteralExpression,
-        NameExpression,
-        UnaryExpression,
-        BinaryExpression,
-        AssignmentExpression,
-        ConditionalExpression,
-        CastExpression,
-        SizeofExpression,
-        ParenthesizedExpression,
-        CompoundLiteralExpression,
-        GenericSelectionExpression,
-        GenericAssociation,
-        StatementExpression,
-        CallExpression,
-        ElementAccessExpression,
-        MemberAccessExpression,
-        PostfixUnaryExpression,
-        InvalidExpression,
-    }
+    LiteralExpression,
+    NameExpression,
+    UnaryExpression,
+    BinaryExpression,
+    AssignmentExpression,
+    ConditionalExpression,
+    CastExpression,
+    SizeofExpression,
+    ParenthesizedExpression,
+    CompoundLiteralExpression,
+    GenericSelectionExpression,
+    GenericAssociation,
+    StatementExpression,
+    CallExpression,
+    ElementAccessExpression,
+    MemberAccessExpression,
+    PostfixUnaryExpression,
+    InvalidExpression,
 }

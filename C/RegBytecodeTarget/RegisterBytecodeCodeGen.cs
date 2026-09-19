@@ -348,6 +348,11 @@ public sealed class RegisterBytecodeCodeGenerator
         IndexGlobals();
         CreateMethodEntryLabels();
 
+        // PC 0 must stay unreachable: a null function pointer is zero
+        _assembler.BeginMethod(-1);
+        _assembler.Trap(0);
+        _assembler.EndMethod();
+
         for (var unitIndex = 0; unitIndex < _units.Length; unitIndex++)
         {
             foreach (var function in _units[unitIndex].Module.Functions)
@@ -720,6 +725,23 @@ public sealed class RegisterBytecodeCodeGenerator
                 throw new NotSupportedException("Designated global initializers are not supported by the register-bytecode backend.");
         }
 
+        // A tag packing bit-fields arrives as a byte image
+        if (list.IsByteImage)
+        {
+            var imageSize = Math.Min(list.Items.Length, availableSize);
+            for (var index = 0; index < imageSize; index++)
+            {
+                WriteGlobalInitializer(
+                    destination,
+                    checked(destinationOffset + index),
+                    list.Items[index].Initializer.TargetType,
+                    list.Items[index].Initializer,
+                    1);
+            }
+
+            return;
+        }
+
         if (type.Type is ArrayType array)
         {
             var elementSize = Math.Max(1, _target.SizeOf(array.ElementType));
@@ -825,20 +847,7 @@ public sealed class RegisterBytecodeCodeGenerator
     }
 
     private int GetFieldOffset(FieldSymbol field)
-    {
-        if (field.ContainingTag.TagKind == TagKind.Union)
-            return 0;
-
-        var offset = 0;
-        foreach (var candidate in field.ContainingTag.Fields)
-        {
-            offset = AlignTo(offset, Math.Max(1, _target.AlignOf(candidate.Type)));
-            if (ReferenceEquals(candidate, field))
-                return offset;
-            offset = checked(offset + Math.Max(1, _target.SizeOf(candidate.Type)));
-        }
-        return 0;
-    }
+        => _target.GetFieldPlacement(field).ByteOffset;
 
     private static int AlignTo(int value, int alignment)
     {
@@ -2667,6 +2676,12 @@ public sealed class RegisterBytecodeCodeGenerator
         }
         private MachineRegister MaterializeVirtualRegisterStorageAddress(LirVirtualRegister register, MachineRegister destination)
         {
+            if (register.HomeSlot is { } home)
+            {
+                EmitI64Imm(Op.I64AddImm, destination, Sp, _allocation.Frame.StackSlotOffsets[home]);
+                return destination;
+            }
+
             var alloc = _allocation[register];
             if (!alloc.IsSpilled)
                 throw new NotSupportedException("Aggregate virtual register " + register.Name + " must be stack-backed.");

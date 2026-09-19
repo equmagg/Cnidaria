@@ -932,15 +932,15 @@ public sealed class RiscVEmulator
                             uint funct3 = instruction & Funct3Mask;
                             if (funct3 == 0x2000U)
                             {
-                                _x[rd] = ((uint)a << 1) + b; break;
+                                _x[rd] = ((ulong)(uint)a << 1) + b; break;
                             }
                             else if (funct3 == 0x4000U)
                             {
-                                _x[rd] = ((uint)a << 2) + b; break;
+                                _x[rd] = ((ulong)(uint)a << 2) + b; break;
                             }
                             else if (funct3 == 0x6000U)
                             {
-                                _x[rd] = ((uint)a << 3) + b; break;
+                                _x[rd] = ((ulong)(uint)a << 3) + b; break;
                             }
                         }
                         else if (funct7 == 0x60000000U)
@@ -1950,7 +1950,7 @@ public sealed class RiscVEmulator
                                         }
                                     }
                                 }
-                                _f[rd] = 0xFFFFFFFFFFFF0000UL | BitConverter.HalfToUInt16Bits(narrow);
+                                _f[rd] = 0xFFFFFFFFFFFF0000UL | (Half.IsNaN(narrow) ? CanonicalNaN16 : BitConverter.HalfToUInt16Bits(narrow));
                                 goto outer_break;
                             }
                             case 0x72:
@@ -6035,6 +6035,11 @@ public sealed class RiscVEmulator
             }
         }
     }
+    /* Every operation that makes a NaN makes this one, sign clear and only the quiet bit set */
+    private const uint CanonicalNaN32 = 0x7FC00000U;
+    private const ulong CanonicalNaN64 = 0x7FF8000000000000UL;
+    private const ushort CanonicalNaN16 = 0x7E00;
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private float ReadFloat32(int register)
         => BitConverter.Int32BitsToSingle((int)_f[register]);
@@ -6051,10 +6056,10 @@ public sealed class RiscVEmulator
         => BitConverter.Int64BitsToDouble((long)_f[register]);
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void WriteFloat32(int register, float value)
-        => _f[register] = 0xFFFFFFFF00000000UL | BitConverter.SingleToUInt32Bits(value);
+        => _f[register] = 0xFFFFFFFF00000000UL | (float.IsNaN(value) ? CanonicalNaN32 : BitConverter.SingleToUInt32Bits(value));
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void WriteFloat64(int register, double value)
-        => _f[register] = (ulong)BitConverter.DoubleToInt64Bits(value);
+        => _f[register] = double.IsNaN(value) ? CanonicalNaN64 : (ulong)BitConverter.DoubleToInt64Bits(value);
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static ulong ClassifyFloat32(uint bits)
     {
@@ -6111,9 +6116,9 @@ public sealed class RiscVEmulator
 
             switch (funct6)
             {
-                case 0x48000000U: result = source & ~(1UL << immediate & 63); return true;
-                case 0x68000000U: result = source ^ (1UL << immediate & 63); return true;
-                case 0x28000000U: result = source | (1UL << immediate & 63); return true;
+                case 0x48000000U: result = source & ~(1UL << (immediate & 63)); return true;
+                case 0x68000000U: result = source ^ (1UL << (immediate & 63)); return true;
+                case 0x28000000U: result = source | (1UL << (immediate & 63)); return true;
             }
         }
         else if (funct3 == 0x5000U)
@@ -6134,7 +6139,7 @@ public sealed class RiscVEmulator
             }
             if (funct6 == 0x48000000U)
             {
-                result = (source >> immediate & 63) & 1UL; return true;
+                result = (source >> (immediate & 63)) & 1UL; return true;
             }
         }
 

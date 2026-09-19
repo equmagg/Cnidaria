@@ -453,6 +453,47 @@ public sealed class ArmCodeGenerator
                 nextIndex++;
             }
         }
+        else if (!list.IsByteImage && type.Type is TagType tag)
+        {
+            // Members are written in order, so the gaps between their offsets need zeroes
+            var fields = tag.Symbol.Fields;
+            var index = 0;
+            foreach (var item in list.Items)
+            {
+                if (section.ByteLength - start >= availableSize)
+                    break;
+                // An unnamed bit-field takes no initializer
+                while (index < fields.Length && fields[index].IsBitField && fields[index].Name.Length == 0)
+                    index++;
+                if (index >= fields.Length)
+                    break;
+
+                var field = fields[index++];
+                var fieldOffset = tag.Symbol.TagKind == TagKind.Union ? 0 : _target.GetFieldPlacement(field).ByteOffset;
+                var written = section.ByteLength - start;
+                if (fieldOffset > written)
+                {
+                    section.EmitZero(Math.Min(fieldOffset - written, availableSize - written));
+                    written = section.ByteLength - start;
+                }
+
+                // Bit-fields sharing a storage unit are emitted once
+                if (fieldOffset < written)
+                    continue;
+
+                var fieldSize = Math.Max(1, _target.SizeOf(field.Type));
+                var used = EmitInitializer(section, field.Type, item.Initializer, Math.Min(fieldSize, availableSize - written));
+                if (used < fieldSize && section.ByteLength - start < availableSize)
+                    section.EmitZero(Math.Min(fieldSize - used, availableSize - (section.ByteLength - start)));
+
+                if (tag.Symbol.TagKind == TagKind.Union)
+                    break;
+            }
+
+            // Zero-fill the tail up to the object size
+            if (section.ByteLength - start < availableSize)
+                section.EmitZero(availableSize - (section.ByteLength - start));
+        }
         else
         {
             foreach (var item in list.Items)
@@ -665,23 +706,33 @@ public sealed class ArmCodeGenerator
     {
         if (_machineTarget.Is64Bit)
         {
-            var bits = size == 4 ? unchecked((uint)value) : unchecked((ulong)value);
             var width = size == 4 ? 32 : 64;
+            var mask = width == 32 ? 0xFFFFFFFFUL : ulong.MaxValue;
+            var bits = unchecked((ulong)value) & mask;
+
+            // movz starts from zero and movn from all ones, so whichever leaves fewer parts to fill wins
+            var negated = ~bits & mask;
+            var inverted = CountNonZeroParts(negated, width) < CountNonZeroParts(bits, width);
+            var seed = inverted ? ArmInstrKind.Movn : ArmInstrKind.Movz;
+            var parts = inverted ? negated : bits;
+
             var first = true;
             for (var shift = 0; shift < width; shift += 16)
             {
-                var part = (int)((bits >> shift) & 0xFFFF);
-                if (!first && part == 0)
+                var part = (int)((parts >> shift) & 0xFFFF);
+                if (part == 0)
                     continue;
+                // movn writes the complement of its own part, so only the seed reads the inverted value
                 Emit(ArmInstruction.Ternary(
-                    first ? ArmInstrKind.Movz : ArmInstrKind.Movk,
+                    first ? seed : ArmInstrKind.Movk,
                     Reg(destination, size),
-                    ArmOperand.ImmediateOperand(part),
+                    ArmOperand.ImmediateOperand(first ? part : (int)((bits >> shift) & 0xFFFF)),
                     ArmOperand.ImmediateOperand(shift)));
                 first = false;
             }
+            // Every part matched the seed's own fill, so the seed alone with a zero part is the value
             if (first)
-                Emit(ArmInstruction.Ternary(ArmInstrKind.Movz, Reg(destination, size), ArmOperand.ImmediateOperand(0), ArmOperand.ImmediateOperand(0)));
+                Emit(ArmInstruction.Ternary(seed, Reg(destination, size), ArmOperand.ImmediateOperand(0), ArmOperand.ImmediateOperand(0)));
             return;
         }
 
@@ -689,6 +740,17 @@ public sealed class ArmCodeGenerator
         Emit(ArmInstruction.Binary(ArmInstrKind.Movw, Reg(destination, 4), ArmOperand.ImmediateOperand(raw & 0xFFFF)));
         if ((raw >> 16) != 0)
             Emit(ArmInstruction.Binary(ArmInstrKind.Movt, Reg(destination, 4), ArmOperand.ImmediateOperand(raw >> 16)));
+    }
+
+    private static int CountNonZeroParts(ulong bits, int width)
+    {
+        var count = 0;
+        for (var shift = 0; shift < width; shift += 16)
+        {
+            if (((bits >> shift) & 0xFFFF) != 0)
+                count++;
+        }
+        return count;
     }
 
     private void EmitAddImmediate(ArmRegister destination, ArmRegister source, int immediate, int size)
@@ -1600,7 +1662,6 @@ public sealed class ArmCodeGenerator
         {
             if (instruction.Result is null)
                 return;
-            RequireScalar(instruction.Result.Type, instruction);
 
             var parameterIndex = FindParameterIndex(instruction.Operator);
             if (parameterIndex < 0)
@@ -1624,6 +1685,47 @@ public sealed class ArmCodeGenerator
 
             var type = functionType.Parameters[parameterIndex].Type;
             var value = CAbi.ClassifyValue(_owner._target, type, false, false, functionType.IsVariadic);
+
+            if (value.PassingKind == AbiPassingKind.Indirect)
+            {
+                var indirect = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                var home = MaterializeVirtualRegisterStorageAddress(instruction.Result, Scratch0);
+                CopyMemory(home, IncomingIndirectArgumentAddress(indirect, Scratch1, instruction), value.Size);
+                return;
+            }
+
+            if (value.PassingKind == AbiPassingKind.MultiRegister)
+            {
+                var home = MaterializeVirtualRegisterStorageAddress(instruction.Result, Scratch0);
+                foreach (var segment in value.Segments)
+                {
+                    var segmentLocation = CAbi.AssignSegmentArgumentLocation(segment, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                    var source = segmentLocation.Register;
+                    if (segmentLocation.Kind == AbiLocationKind.Stack)
+                    {
+                        source = segment.RegisterClass == AbiRegisterClass.Vector ? FpScratch1 : Scratch1;
+                        LoadFromMemory(source, IncomingStackOffset(segmentLocation.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)), RawStorageSize(segment.Size), false);
+                    }
+                    else if (segmentLocation.Kind != AbiLocationKind.Register)
+                    {
+                        throw Unsupported(instruction, "Invalid aggregate parameter segment location.");
+                    }
+
+                    StoreToMemory(source, home, segment.Offset, RawStorageSize(segment.Size));
+                }
+                return;
+            }
+
+            if (value.PassingKind == AbiPassingKind.Stack && IsAggregateType(type))
+            {
+                var stacked = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                var home = MaterializeVirtualRegisterStorageAddress(instruction.Result, Scratch0);
+                AddImmediate(Scratch1, StackPointer, IncomingStackOffset(stacked.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)));
+                CopyMemory(home, Scratch1, value.Size);
+                return;
+            }
+
+            RequireScalar(instruction.Result.Type, instruction);
             if (value.PassingKind != AbiPassingKind.Scalar || value.Segments.Length != 1 ||
                 value.Segments[0].RegisterClass is not (AbiRegisterClass.General or AbiRegisterClass.Vector))
                 throw Unsupported(instruction, "Unsupported scalar ARM parameter class.");
@@ -1677,6 +1779,15 @@ public sealed class ArmCodeGenerator
             RequireScalar(instruction.Result.Type, instruction);
             RequireScalar(instruction.Operands[0].Type, instruction);
 
+            var copyAllocation = _allocation[instruction.Result];
+            if (copyAllocation.IsSpilled &&
+                TryStoreZeroToStack(
+                    instruction.Operands[0],
+                    instruction.Result.Type,
+                    copyAllocation.StackOffset,
+                    Math.Min(RegisterSize(instruction.Result.Type), SizeOf(instruction.Result.Type))))
+                return;
+
             var destination = GetWritableRegister(
                 instruction.Result,
                 PreferredScratch(instruction.Result.Type, Scratch0, FpScratch0));
@@ -1705,7 +1816,7 @@ public sealed class ArmCodeGenerator
                 else
                 {
                     var source = LoadOperand(instruction.Operands[0], destination == Scratch0 ? Scratch1 : Scratch0);
-                    EmitBooleanFromRegister(destination, source);
+                    EmitBooleanFromRegister(destination, source, RegisterSize(instruction.Operands[0].Type));
                 }
             }
             else
@@ -1745,7 +1856,7 @@ public sealed class ArmCodeGenerator
 
             var size = RegisterSize(instruction.Result.Type);
             var destination = GetWritableRegister(instruction.Result, Scratch0);
-            var source = LoadOperand(instruction.Operands[0], Scratch1);
+            var source = LoadOperandAtWidth(instruction.Operands[0], Scratch1, size);
             if (instruction.Operator != "+")
                 InvalidateIntegerRepresentation(destination);
             switch (instruction.Operator)
@@ -1754,6 +1865,11 @@ public sealed class ArmCodeGenerator
                     MoveRegister(destination, source, size);
                     break;
                 case "-":
+                    if (_owner._machineTarget.Is64Bit)
+                    {
+                        Emit(ArmInstruction.Ternary(ArmInstrKind.Sub, Reg(ToArm(destination), size), Reg(ArmRegister.Xzr, size), Reg(ToArm(source), size)));
+                        break;
+                    }
                     LoadImmediate(Scratch2, 0, size);
                     Emit(ArmInstruction.Ternary(ArmInstrKind.Sub, Reg(ToArm(destination), size), Reg(ToArm(Scratch2), size), Reg(ToArm(source), size)));
                     break;
@@ -1794,8 +1910,8 @@ public sealed class ArmCodeGenerator
             if (!TryEmitIntegerBinaryImmediate(instruction, destination, size))
             {
                 // AArch64 data processing is three-address, so staging the operands in scratch only adds moves
-                var left = LoadOperand(instruction.Operands[0], Scratch1);
-                var right = LoadOperand(instruction.Operands[1], Scratch2);
+                var left = LoadOperandAtWidth(instruction.Operands[0], Scratch1, size);
+                var right = LoadOperandAtWidth(instruction.Operands[1], Scratch2, size);
                 InvalidateIntegerRepresentation(destination);
                 EmitIntegerBinaryRegisters(instruction, destination, left, right, size);
             }
@@ -1876,14 +1992,14 @@ public sealed class ArmCodeGenerator
                         rightIsZero: false);
                     break;
                 case "&&":
-                    EmitBooleanFromRegister(Scratch3, left);
-                    EmitBooleanFromRegister(Scratch4, right);
+                    EmitBooleanFromRegister(Scratch3, left, RegisterSize(instruction.Operands[0].Type));
+                    EmitBooleanFromRegister(Scratch4, right, RegisterSize(instruction.Operands[1].Type));
                     Emit(ArmInstruction.Ternary(ArmInstrKind.And, Reg(ToArm(destination), size), Reg(ToArm(Scratch3), size), Reg(ToArm(Scratch4), size)));
                     SetIntegerRepresentation(destination, IntegerRepresentationFact.ZeroExtended(1));
                     break;
                 case "||":
                     Emit(ArmInstruction.Ternary(ArmInstrKind.Orr, Reg(ToArm(Scratch3), size), Reg(ToArm(left), size), Reg(ToArm(right), size)));
-                    EmitBooleanFromRegister(destination, Scratch3);
+                    EmitBooleanFromRegister(destination, Scratch3, size);
                     break;
                 default:
                     throw Unsupported(instruction, $"Unsupported binary operator '{instruction.Operator}'.");
@@ -1950,7 +2066,8 @@ public sealed class ArmCodeGenerator
                 }
                 case "/":
                 case "%":
-                    return TryEmitDivideByPowerOfTwo(instruction, destination, leftOperand, size);
+                    return TryEmitDivideByPowerOfTwo(instruction, destination, leftOperand, size) ||
+                        TryEmitDivideByMagic(instruction, destination, leftOperand, size);
                 case "&":
                 case "|":
                 case "^":
@@ -1981,7 +2098,7 @@ public sealed class ArmCodeGenerator
                 {
                     if (!TryGetCompareImmediate(bits, operationBits, out var compareOpcode, out var compareValue))
                         return false;
-                    var source = LoadOperand(leftOperand, Scratch1);
+                    var source = LoadOperandAtWidth(leftOperand, Scratch1, size);
                     InvalidateIntegerRepresentation(destination);
                     EmitComparisonResult(
                         destination,
@@ -1997,6 +2114,79 @@ public sealed class ArmCodeGenerator
             }
         }
 
+        /// <summary>Replaces a division by a constant with a multiply by its reciprocal</summary>
+        private bool TryEmitDivideByMagic(LirInstruction instruction, MachineRegister destination, LirOperand leftOperand, int size)
+        {
+            if (!_owner._machineTarget.Is64Bit)
+                return false;
+            if (!LirStrengthReduction.TryGetMagicDivisor(instruction, _owner._target, out var magic))
+                return false;
+
+            var signed = IsSignedIntegerType(instruction.Operands[0].Type);
+            var bits = size * 8;
+            var dividend = Scratch1;
+            MoveRegister(dividend, LoadOperandAtWidth(leftOperand, Scratch1, size), size);
+
+            var quotient = Scratch2;
+            // The product is taken at the full width, so the reciprocal has to arrive extended to it
+            LoadImmediate(Scratch3, magic.Multiplier, 8);
+            if (size < 8)
+            {
+                // Both halves fit a full register once widened, so one 64-bit multiply holds the product
+                var wide = ExtendOperandToWidth(dividend, instruction.Operands[0].Type, 64, Scratch0);
+                Emit(ArmInstruction.Ternary(ArmInstrKind.Mul, Reg(ToArm(quotient), 8), Reg(ToArm(wide), 8), Reg(ToArm(Scratch3), 8)));
+                Emit(ArmInstruction.Ternary(
+                    signed ? ArmInstrKind.Asr : ArmInstrKind.Lsr,
+                    Reg(ToArm(quotient), 8), Reg(ToArm(quotient), 8), ArmOperand.ImmediateOperand(32)));
+            }
+            else
+            {
+                Emit(ArmInstruction.Ternary(
+                    signed ? ArmInstrKind.Smulh : ArmInstrKind.Umulh,
+                    Reg(ToArm(quotient), 8), Reg(ToArm(dividend), 8), Reg(ToArm(Scratch3), 8)));
+            }
+            InvalidateIntegerRepresentation(quotient);
+
+            if (signed)
+            {
+                if (magic.AddDividend)
+                    Emit(ArmInstruction.Ternary(ArmInstrKind.Add, Reg(ToArm(quotient), size), Reg(ToArm(quotient), size), Reg(ToArm(dividend), size)));
+                else if (magic.SubtractDividend)
+                    Emit(ArmInstruction.Ternary(ArmInstrKind.Sub, Reg(ToArm(quotient), size), Reg(ToArm(quotient), size), Reg(ToArm(dividend), size)));
+                if (magic.Shift != 0)
+                    Emit(ArmInstruction.Ternary(ArmInstrKind.Asr, Reg(ToArm(quotient), size), Reg(ToArm(quotient), size), ArmOperand.ImmediateOperand(magic.Shift)));
+                Emit(ArmInstruction.Ternary(ArmInstrKind.Lsr, Reg(ToArm(Scratch3), size), Reg(ToArm(quotient), size), ArmOperand.ImmediateOperand(bits - 1)));
+                Emit(ArmInstruction.Ternary(ArmInstrKind.Add, Reg(ToArm(quotient), size), Reg(ToArm(quotient), size), Reg(ToArm(Scratch3), size)));
+            }
+            else if (magic.AddDividend)
+            {
+                Emit(ArmInstruction.Ternary(ArmInstrKind.Sub, Reg(ToArm(Scratch3), size), Reg(ToArm(dividend), size), Reg(ToArm(quotient), size)));
+                Emit(ArmInstruction.Ternary(ArmInstrKind.Lsr, Reg(ToArm(Scratch3), size), Reg(ToArm(Scratch3), size), ArmOperand.ImmediateOperand(1)));
+                Emit(ArmInstruction.Ternary(ArmInstrKind.Add, Reg(ToArm(quotient), size), Reg(ToArm(quotient), size), Reg(ToArm(Scratch3), size)));
+                Emit(ArmInstruction.Ternary(ArmInstrKind.Lsr, Reg(ToArm(quotient), size), Reg(ToArm(quotient), size), ArmOperand.ImmediateOperand(magic.Shift - 1)));
+            }
+            else if (magic.Shift != 0)
+            {
+                Emit(ArmInstruction.Ternary(ArmInstrKind.Lsr, Reg(ToArm(quotient), size), Reg(ToArm(quotient), size), ArmOperand.ImmediateOperand(magic.Shift)));
+            }
+
+            InvalidateIntegerRepresentation(destination);
+            if (instruction.Operator == "%")
+            {
+                LoadImmediate(Scratch3, ConvertIntegerConstant(instruction.Operands[1].Immediate), size);
+                Emit(ArmInstruction.Quaternary(
+                    ArmInstrKind.Msub,
+                    Reg(ToArm(destination), size),
+                    Reg(ToArm(quotient), size),
+                    Reg(ToArm(Scratch3), size),
+                    Reg(ToArm(dividend), size)));
+                return true;
+            }
+
+            MoveRegister(destination, quotient, size);
+            return true;
+        }
+
         private bool TryEmitDivideByPowerOfTwo(LirInstruction instruction, MachineRegister destination, LirOperand leftOperand, int size)
         {
             if (!LirStrengthReduction.TryGetPowerOfTwoDivisor(instruction, _owner._target, out var shift, out var negated))
@@ -2004,7 +2194,7 @@ public sealed class ArmCodeGenerator
 
             var bits = size * 8;
             var wantRemainder = instruction.Operator == "%";
-            var dividend = LoadOperand(leftOperand, Scratch1);
+            var dividend = LoadOperandAtWidth(leftOperand, Scratch1, size);
             InvalidateIntegerRepresentation(destination);
 
             if (!IsSignedIntegerType(instruction.Operands[0].Type))
@@ -2044,7 +2234,7 @@ public sealed class ArmCodeGenerator
 
         private void EmitBinaryImmediate(ArmInstrKind opcode, MachineRegister destination, LirOperand left, long immediate, int size)
         {
-            var source = LoadOperand(left, Scratch1);
+            var source = LoadOperandAtWidth(left, Scratch1, size);
             InvalidateIntegerRepresentation(destination);
             Emit(ArmInstruction.Ternary(
                 opcode,
@@ -2090,6 +2280,21 @@ public sealed class ArmCodeGenerator
 
         private static bool IsIntegerImmediate(LirOperand operand)
             => operand.Kind == LirOperandKind.Immediate && operand.Immediate is not string && !IsFloatType(operand.Type);
+
+        /// <summary>Reports whether the zero register can stand in for this operand read as that type</summary>
+        private bool IsZeroSource(LirOperand operand, QualifiedType asType)
+            => _owner._machineTarget.Is64Bit &&
+                !IsFloatType(asType) &&
+                IsIntegerImmediate(operand) &&
+                ConvertIntegerConstant(operand.Immediate) == 0;
+
+        private bool TryStoreZeroToStack(LirOperand operand, QualifiedType asType, int offset, int size)
+        {
+            if (!IsZeroSource(operand, asType))
+                return false;
+            EmitMemoryStore(ArmRegister.Xzr, StackPointerArm, offset, size);
+            return true;
+        }
 
         private ulong GetIntegerImmediateBits(LirOperand operand, int operationBits)
         {
@@ -2327,7 +2532,7 @@ public sealed class ArmCodeGenerator
                 }
             }
 
-            var index = LoadOperand(indexOperand, Scratch2);
+            var index = LoadOperandAtWidth(indexOperand, Scratch2, size);
             if (scale != 1 && !(_owner._machineTarget.Is64Bit && IsPowerOfTwo(scale)))
             {
                 // A scale that has no shifted form has to be applied in a scratch of its own
@@ -2408,8 +2613,9 @@ public sealed class ArmCodeGenerator
             _owner._text.DefineLabel(doneLabel);
         }
 
-        private void EmitBooleanFromRegister(MachineRegister destination, MachineRegister source)
-            => EmitComparisonResult(destination, source, Scratch4, ArmCondition.Ne, _owner._target.RegisterSize, rightIsZero: true);
+        // The test reads only as far as the value goes: above it the register holds nothing this may see
+        private void EmitBooleanFromRegister(MachineRegister destination, MachineRegister source, int size)
+            => EmitComparisonResult(destination, source, Scratch4, ArmCondition.Ne, size, rightIsZero: true);
 
         private void EmitAddressOf(LirInstruction instruction)
         {
@@ -2459,13 +2665,23 @@ public sealed class ArmCodeGenerator
 
             RequireScalar(instruction.Address.ElementType, instruction);
             RequireScalar(instruction.Operands[0].Type, instruction);
+            var storeSize = Math.Min(RegisterSize(instruction.Address.ElementType), SizeOf(instruction.Address.ElementType));
+
+            // The zero register is a source everywhere, so storing a constant zero needs nothing to hold it
+            if (IsZeroSource(instruction.Operands[0], instruction.Address.ElementType))
+            {
+                var zeroAddress = BuildAddress(instruction.Address, Scratch1, Scratch2);
+                EmitMemoryStore(ArmRegister.Xzr, ToArmRegister(zeroAddress.BaseRegister), zeroAddress.Offset, storeSize);
+                return;
+            }
+
             var source = LoadOperandAs(
                 instruction.Operands[0],
                 instruction.Address.ElementType,
                 PreferredScratch(instruction.Address.ElementType, Scratch0, FpScratch0),
                 instruction);
             var address = BuildAddress(instruction.Address, Scratch1, Scratch2);
-            StoreToMemory(source, address.BaseRegister, address.Offset, Math.Min(RegisterSize(instruction.Address.ElementType), SizeOf(instruction.Address.ElementType)));
+            StoreToMemory(source, address.BaseRegister, address.Offset, storeSize);
         }
 
         private void EmitZeroMemory(LirInstruction instruction)
@@ -2555,14 +2771,14 @@ public sealed class ArmCodeGenerator
         private void MarshalCallArguments(LirInstruction instruction, int startOperand)
         {
             var cursor = new AbiCursor();
+            AbiLocation? hiddenReturnBuffer = null;
             if (instruction.Result is not null && CAbi.RequiresHiddenReturnBuffer(_owner._target, instruction.Result.Type))
-                throw Unsupported(instruction, "Hidden return buffers are not implemented for calls.");
+                hiddenReturnBuffer = CAbi.AssignHiddenReturnBufferLocation(_owner._target, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
 
             var locations = new List<(LirOperand Operand, AbiLocation Location, int ValueSize, int RegisterSize)>();
             for (var i = startOperand; i < instruction.Operands.Length; i++)
             {
                 var operand = instruction.Operands[i];
-                RequireScalar(operand.Type, instruction);
                 var argumentIndex = i - startOperand;
                 var isVariadicUnnamed = instruction.CallSignature is not null
                     && instruction.CallSignature.IsVariadic
@@ -2573,6 +2789,10 @@ public sealed class ArmCodeGenerator
                     false,
                     isVariadicUnnamed,
                     instruction.CallSignature?.IsVariadic == true);
+                if (EmitAggregateCallArgument(instruction, operand, value, ref cursor))
+                    continue;
+
+                RequireScalar(operand.Type, instruction);
                 if (value.PassingKind != AbiPassingKind.Scalar || value.Segments.Length != 1 ||
                     value.Segments[0].RegisterClass is not (AbiRegisterClass.General or AbiRegisterClass.Vector))
                     throw Unsupported(instruction, "Unsupported scalar ARM call argument class.");
@@ -2584,10 +2804,13 @@ public sealed class ArmCodeGenerator
 
             for (var i = 0; i < locations.Count; i++)
             {
+                var stagingOffset = stagingBase + i * _owner._allocationOptions.StackArgumentSlotSize;
+                if (TryStoreZeroToStack(locations[i].Operand, locations[i].Operand.Type, stagingOffset, locations[i].RegisterSize))
+                    continue;
                 var source = LoadOperand(
                     locations[i].Operand,
                     PreferredScratch(locations[i].Operand.Type, Scratch0, FpScratch0));
-                StoreToMemory(source, stagingBase + i * _owner._allocationOptions.StackArgumentSlotSize, locations[i].RegisterSize);
+                StoreToMemory(source, stagingOffset, locations[i].RegisterSize);
             }
 
             for (var i = 0; i < locations.Count; i++)
@@ -2605,12 +2828,93 @@ public sealed class ArmCodeGenerator
                 else
                     throw Unsupported(instruction, "Invalid call argument ABI location.");
             }
+
+            // The buffer register is a scratch the arguments above were still using, so it is filled last
+            if (hiddenReturnBuffer is { } buffer)
+            {
+                var address = MaterializeVirtualRegisterStorageAddress(instruction.Result!, Scratch0);
+                if (buffer.Kind == AbiLocationKind.Register)
+                    MoveRegister(buffer.Register, address, _owner._target.PointerSize);
+                else if (buffer.Kind == AbiLocationKind.Stack)
+                    StoreToMemory(address, _allocation.Frame.OutgoingArgumentAreaOffset + buffer.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), _owner._target.PointerSize);
+                else
+                    throw Unsupported(instruction, "Invalid hidden return buffer ABI location.");
+            }
+        }
+
+        /// <summary>Places an argument the ABI does not carry in one register, reporting whether it did</summary>
+        private bool EmitAggregateCallArgument(LirInstruction instruction, LirOperand operand, AbiValue value, ref AbiCursor cursor)
+        {
+            if (value.PassingKind == AbiPassingKind.Indirect)
+            {
+                var source = MaterializeOperandStorageAddress(operand, Scratch1, instruction);
+                var location = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                if (location.Kind == AbiLocationKind.Register)
+                    MoveRegister(location.Register, source, _owner._target.PointerSize);
+                else if (location.Kind == AbiLocationKind.Stack)
+                    StoreToMemory(source, _allocation.Frame.OutgoingArgumentAreaOffset + location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), _owner._target.PointerSize);
+                else
+                    throw Unsupported(instruction, "Invalid indirect call argument ABI location.");
+                return true;
+            }
+
+            if (value.PassingKind == AbiPassingKind.MultiRegister)
+            {
+                var source = MaterializeOperandStorageAddress(operand, Scratch0, instruction);
+                foreach (var segment in value.Segments)
+                {
+                    var location = CAbi.AssignSegmentArgumentLocation(segment, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                    var width = RawStorageSize(segment.Size);
+                    if (location.Kind == AbiLocationKind.Register)
+                    {
+                        LoadFromMemory(location.Register, source, segment.Offset, width, false);
+                    }
+                    else if (location.Kind == AbiLocationKind.Stack)
+                    {
+                        var staged = segment.RegisterClass == AbiRegisterClass.Vector ? FpScratch1 : Scratch1;
+                        LoadFromMemory(staged, source, segment.Offset, width, false);
+                        StoreToMemory(staged, _allocation.Frame.OutgoingArgumentAreaOffset + location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), width);
+                    }
+                    else
+                    {
+                        throw Unsupported(instruction, "Invalid aggregate call argument segment location.");
+                    }
+                }
+                return true;
+            }
+
+            if (value.PassingKind == AbiPassingKind.Stack && IsAggregateType(operand.Type))
+            {
+                var source = MaterializeOperandStorageAddress(operand, Scratch1, instruction);
+                var location = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                AddImmediate(Scratch0, StackPointer, _allocation.Frame.OutgoingArgumentAreaOffset + location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize));
+                CopyMemory(Scratch0, source, value.Size);
+                return true;
+            }
+
+            return false;
         }
 
         private void EmitCallResult(LirInstruction instruction)
         {
             if (instruction.Result is null)
                 return;
+
+            var aggregate = CAbi.ClassifyValue(_owner._target, instruction.Result.Type, true, false);
+            if (aggregate.PassingKind == AbiPassingKind.Indirect)
+                return;
+
+            if (aggregate.PassingKind == AbiPassingKind.MultiRegister)
+            {
+                var home = MaterializeVirtualRegisterStorageAddress(instruction.Result, Scratch0);
+                for (var i = 0; i < aggregate.Segments.Length; i++)
+                {
+                    var segment = aggregate.Segments[i];
+                    StoreToMemory(CAbi.ReturnRegister(segment, i), home, segment.Offset, RawStorageSize(segment.Size));
+                }
+                return;
+            }
+
             RequireScalar(instruction.Result.Type, instruction);
             var value = CAbi.ClassifyValue(_owner._target, instruction.Result.Type, true, false);
             if (value.PassingKind != AbiPassingKind.Scalar || value.Segments.Length != 1 ||
@@ -2739,7 +3043,7 @@ public sealed class ArmCodeGenerator
                 if (_owner._machineTarget.Is64Bit && IsIntegerImmediate(right) &&
                     TryGetCompareImmediate(GetIntegerImmediateBits(right, size * 8), size * 8, out var compareOpcode, out var compareValue))
                 {
-                    Emit(ArmInstruction.Binary(compareOpcode, Reg(ToArm(LoadOperand(left, Scratch1)), size), ArmOperand.ImmediateOperand(compareValue)));
+                    Emit(ArmInstruction.Binary(compareOpcode, Reg(ToArm(LoadOperandAtWidth(left, Scratch1, size)), size), ArmOperand.ImmediateOperand(compareValue)));
                 }
                 else if (_owner._machineTarget.Is64Bit && IsIntegerImmediate(left) && !IsIntegerImmediate(right) &&
                     TrySwapComparison(op) is { } swappedOperator &&
@@ -2747,12 +3051,12 @@ public sealed class ArmCodeGenerator
                 {
                     op = swappedOperator;
                     conditionType = right.Type;
-                    Emit(ArmInstruction.Binary(swappedOpcode, Reg(ToArm(LoadOperand(right, Scratch1)), size), ArmOperand.ImmediateOperand(swappedValue)));
+                    Emit(ArmInstruction.Binary(swappedOpcode, Reg(ToArm(LoadOperandAtWidth(right, Scratch1, size)), size), ArmOperand.ImmediateOperand(swappedValue)));
                 }
                 else
                 {
-                    var leftRegister = LoadOperand(left, Scratch1);
-                    var rightRegister = LoadOperand(right, Scratch2);
+                    var leftRegister = LoadOperandAtWidth(left, Scratch1, size);
+                    var rightRegister = LoadOperandAtWidth(right, Scratch2, size);
                     Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(leftRegister), size), Reg(ToArm(rightRegister), size)));
                 }
                 EmitConditionalJump(MaybeInvert(SelectCondition(op, IsSignedIntegerType(conditionType)), inverted), branchTarget);
@@ -2868,9 +3172,38 @@ public sealed class ArmCodeGenerator
             if (instruction.Operands.Length != 0 && !IsVoid(instruction.Operands[0].Type))
             {
                 var operand = instruction.Operands[0];
-                RequireScalar(operand.Type, instruction);
                 var returnType = _function.Symbol?.FunctionType?.ReturnType ?? operand.Type;
                 var value = CAbi.ClassifyValue(_owner._target, returnType, true, false);
+
+                if (value.PassingKind == AbiPassingKind.Indirect)
+                {
+                    var source = MaterializeOperandStorageAddress(operand, Scratch1, instruction);
+                    LoadFromMemory(Scratch0, _allocation.Frame.HiddenReturnBufferOffset, _owner._target.PointerSize, false);
+                    CopyMemory(Scratch0, source, value.Size);
+                    EmitEpilogue();
+                    Emit(ArmInstruction.Unary(
+                        _owner._machineTarget.Is64Bit ? ArmInstrKind.Ret : ArmInstrKind.Bx,
+                        Reg(_owner._machineTarget.Is64Bit ? ArmRegister.X30 : ArmRegister.Lr, _owner._target.PointerSize)));
+                    return;
+                }
+
+                if (value.PassingKind == AbiPassingKind.MultiRegister)
+                {
+                    var source = MaterializeOperandStorageAddress(operand, Scratch0, instruction);
+                    for (var i = 0; i < value.Segments.Length; i++)
+                    {
+                        var segment = value.Segments[i];
+                        LoadFromMemory(CAbi.ReturnRegister(segment, i), source, segment.Offset, RawStorageSize(segment.Size), false);
+                    }
+
+                    EmitEpilogue();
+                    Emit(ArmInstruction.Unary(
+                        _owner._machineTarget.Is64Bit ? ArmInstrKind.Ret : ArmInstrKind.Bx,
+                        Reg(_owner._machineTarget.Is64Bit ? ArmRegister.X30 : ArmRegister.Lr, _owner._target.PointerSize)));
+                    return;
+                }
+
+                RequireScalar(operand.Type, instruction);
                 if (value.PassingKind != AbiPassingKind.Scalar || value.Segments.Length != 1 ||
                     value.Segments[0].RegisterClass is not (AbiRegisterClass.General or AbiRegisterClass.Vector))
                     throw Unsupported(instruction, "Unsupported scalar ARM return class.");
@@ -2972,9 +3305,15 @@ public sealed class ArmCodeGenerator
                     throw Unsupported(instruction, "Floating-point conversion requires a vector scratch register.");
                 if (IsFloatType(operand.Type))
                 {
-                    if (RegisterSize(operand.Type) != RegisterSize(targetType))
-                        throw Unsupported(instruction, "AArch64 float/double precision conversion is not implemented.");
-                    return LoadOperand(operand, scratch);
+                    if (RegisterSize(operand.Type) == RegisterSize(targetType))
+                        return LoadOperand(operand, scratch);
+
+                    var narrowed = LoadOperand(operand, FpScratch1);
+                    Emit(ArmInstruction.Binary(
+                        ArmInstrKind.Fcvt,
+                        Reg(ToArmRegister(scratch), RegisterSize(targetType)),
+                        Reg(ToArmRegister(narrowed), RegisterSize(operand.Type))));
+                    return scratch;
                 }
 
                 var integerSource = LoadOperand(operand, Scratch1);
@@ -2999,11 +3338,12 @@ public sealed class ArmCodeGenerator
             }
 
             var source = LoadOperand(operand, scratch);
-            if (!NeedsIntegerConversion(operand.Type, targetType) || IntegerRepresentationSatisfies(GetIntegerRepresentation(source), targetType))
+            var required = ConversionRepresentation(operand.Type, targetType);
+            if (!required.IsKnown || IntegerRepresentationSatisfies(KnownIntegerRepresentation(source, operand.Type), required))
                 return source;
             if (source != scratch)
                 MoveRegister(scratch, source, RegisterSize(targetType));
-            NormalizeIntegerRegister(scratch, targetType);
+            ExtendIntegerRegister(scratch, required);
             return scratch;
         }
 
@@ -3094,6 +3434,12 @@ public sealed class ArmCodeGenerator
 
         private MachineRegister MaterializeVirtualRegisterStorageAddress(LirVirtualRegister register, MachineRegister destination)
         {
+            if (register.HomeSlot is { } home)
+            {
+                AddImmediate(destination, StackPointer, _allocation.Frame.StackSlotOffsets[home]);
+                return destination;
+            }
+
             var allocation = _allocation[register];
             if (!allocation.IsSpilled)
                 throw new NotSupportedException($"Virtual register {register.Name} must be stack-backed.");
@@ -3122,6 +3468,21 @@ public sealed class ArmCodeGenerator
                 default:
                     throw Unsupported(instruction, $"Cannot take the storage address of LIR operand kind {operand.Kind}.");
             }
+        }
+
+        private static int RawStorageSize(int size)
+            => size <= 1 ? 1 : size <= 2 ? 2 : size <= 4 ? 4 : 8;
+
+        /// <summary>Gets where an argument the ABI passed by reference actually lives</summary>
+        private MachineRegister IncomingIndirectArgumentAddress(AbiLocation location, MachineRegister scratch, LirInstruction instruction)
+        {
+            if (location.Kind == AbiLocationKind.Register)
+                return location.Register;
+            if (location.Kind != AbiLocationKind.Stack)
+                throw Unsupported(instruction, "Invalid indirect argument ABI location.");
+
+            LoadFromMemory(scratch, IncomingStackOffset(location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)), _owner._target.PointerSize, false);
+            return scratch;
         }
 
         private void EmitAggregateCopy(LirVirtualRegister destination, LirOperand source, LirInstruction instruction)
@@ -3206,7 +3567,11 @@ public sealed class ArmCodeGenerator
                         return new AddressParts(elementBase.BaseRegister, constantOffset);
                     }
 
-                    var index = LoadOperand(address.Index, scratchIndex);
+                    var index = ExtendOperandToWidth(
+                        LoadOperand(address.Index, scratchIndex),
+                        address.Index.Type,
+                        _owner._target.PointerSize * 8,
+                        scratchIndex);
                     var indexShift = 0;
                     if (scale != 1)
                     {
@@ -3471,6 +3836,12 @@ public sealed class ArmCodeGenerator
 
         private void EmitInlineZeroMemory(MachineRegister destination, int size)
         {
+            if (_owner._machineTarget.Is64Bit)
+            {
+                EmitInlineZeroMemoryFrom(ArmRegister.Xzr, ToArmRegister(destination), size);
+                return;
+            }
+
             LoadImmediate(Scratch1, 0, _owner._target.RegisterSize);
             var offset = 0;
             while (size - offset >= _owner._target.RegisterSize)
@@ -3492,6 +3863,19 @@ public sealed class ArmCodeGenerator
             {
                 StoreToMemory(Scratch1, destination, offset, 1);
                 offset++;
+            }
+        }
+
+        private void EmitInlineZeroMemoryFrom(ArmRegister zero, ArmRegister destination, int size)
+        {
+            var offset = 0;
+            for (var width = _owner._target.RegisterSize; width >= 1; width >>= 1)
+            {
+                while (size - offset >= width)
+                {
+                    EmitMemoryStore(zero, destination, offset, width);
+                    offset += width;
+                }
             }
         }
 
@@ -3685,6 +4069,11 @@ public sealed class ArmCodeGenerator
             if (!required.IsKnown || IntegerRepresentationSatisfies(GetIntegerRepresentation(register), required))
                 return;
 
+            ExtendIntegerRegister(register, required);
+        }
+
+        private void ExtendIntegerRegister(MachineRegister register, IntegerRepresentationFact required)
+        {
             if (TryEmitExtend(register, required))
             {
                 SetIntegerRepresentation(register, required);
@@ -3712,6 +4101,9 @@ public sealed class ArmCodeGenerator
 
         // AArch64 reaches every canonical width with one bitfield move, where a shift pair takes two
         private bool TryEmitExtend(MachineRegister register, IntegerRepresentationFact required)
+            => TryEmitExtend(register, register, required);
+
+        private bool TryEmitExtend(MachineRegister destination, MachineRegister source, IntegerRepresentationFact required)
         {
             if (!_owner._machineTarget.Is64Bit)
                 return false;
@@ -3728,7 +4120,7 @@ public sealed class ArmCodeGenerator
             if (opcode == ArmInstrKind.Invalid)
                 return false;
 
-            Emit(ArmInstruction.Binary(opcode, Reg(ToArm(register), signed ? 8 : 4), Reg(ToArm(register), 4)));
+            Emit(ArmInstruction.Binary(opcode, Reg(ToArm(destination), signed ? 8 : 4), Reg(ToArm(source), 4)));
             return true;
         }
 
@@ -3823,17 +4215,55 @@ public sealed class ArmCodeGenerator
                 SetIntegerRepresentation(register, IntegerRepresentationFact.ZeroExtended(32));
         }
 
+        // Arithmetic on a value this narrow reads and writes a w register, so the canonical form only has
+        // to reach the width the operations use. Anything wider takes its extension at the use that wants it
         private IntegerRepresentationFact CanonicalIntegerRepresentation(QualifiedType type)
         {
             if (!IsIntegerLike(type) || IsPointerLike(type))
                 return IntegerRepresentationFact.Unknown;
-            var registerBits = _owner._target.RegisterSize * 8;
-            var bits = Math.Min(registerBits, SizeOf(type) * 8);
-            if (bits >= registerBits)
+            var operationBits = RegisterSize(type) * 8;
+            var bits = Math.Min(operationBits, SizeOf(type) * 8);
+            if (bits >= operationBits)
                 return IntegerRepresentationFact.Unknown;
             return IsUnsignedIntegerType(type)
                 ? IntegerRepresentationFact.ZeroExtended(bits)
                 : IntegerRepresentationFact.SignExtended(bits);
+        }
+
+        /// <summary>Reports what a value of this type has to look like to stand in for one that wide</summary>
+        private IntegerRepresentationFact WideningRepresentation(QualifiedType source, int destinationBits)
+        {
+            if (!IsIntegerLike(source) && !IsPointerLike(source))
+                return IntegerRepresentationFact.Unknown;
+            var bits = Math.Min(SizeOf(source) * 8, destinationBits);
+            if (bits >= destinationBits)
+                return IntegerRepresentationFact.Unknown;
+            return IsUnsignedIntegerType(source) || IsPointerLike(source)
+                ? IntegerRepresentationFact.ZeroExtended(bits)
+                : IntegerRepresentationFact.SignExtended(bits);
+        }
+
+        /// <summary>Reports what materializing a value of the source type as the destination type requires</summary>
+        private IntegerRepresentationFact ConversionRepresentation(QualifiedType source, QualifiedType destination)
+        {
+            if ((!IsIntegerLike(source) && !IsPointerLike(source)) ||
+                (!IsIntegerLike(destination) && !IsPointerLike(destination)))
+                return IntegerRepresentationFact.Unknown;
+
+            if (IsPointerLike(destination))
+                return WideningRepresentation(source, _owner._target.PointerSize * 8);
+
+            var required = CanonicalIntegerRepresentation(destination);
+            return required.IsKnown
+                ? required
+                : WideningRepresentation(source, RegisterSize(destination) * 8);
+        }
+
+        // A register with no tracked fact still holds whatever the canonical form of its type guarantees
+        private IntegerRepresentationFact KnownIntegerRepresentation(MachineRegister register, QualifiedType type)
+        {
+            var fact = GetIntegerRepresentation(register);
+            return fact.IsKnown ? fact : CanonicalIntegerRepresentation(type);
         }
 
         private bool IntegerRepresentationSatisfies(IntegerRepresentationFact actual, QualifiedType type)
@@ -3945,18 +4375,32 @@ public sealed class ArmCodeGenerator
             return IntegerRepresentationFact.Unknown;
         }
 
-        private bool NeedsIntegerConversion(QualifiedType source, QualifiedType destination)
+        /// <summary>Widens a value that is about to be read at more bits than its own type carries</summary>
+        private MachineRegister ExtendOperandToWidth(MachineRegister register, QualifiedType type, int destinationBits, MachineRegister scratch)
         {
-            if ((!IsIntegerLike(source) && !IsPointerLike(source)) || (!IsIntegerLike(destination) && !IsPointerLike(destination)))
-                return false;
-            if (IsPointerLike(destination))
-                return false;
+            var required = WideningRepresentation(type, destinationBits);
+            if (!required.IsKnown || IntegerRepresentationSatisfies(KnownIntegerRepresentation(register, type), required))
+                return register;
 
-            var required = CanonicalIntegerRepresentation(destination);
-            if (!required.IsKnown)
-                return false;
-            return !IntegerRepresentationSatisfies(CanonicalIntegerRepresentation(source), required);
+            // One bitfield move reads the value where it sits and leaves the widened copy in the scratch
+            if (TryEmitExtend(scratch, register, required))
+            {
+                SetIntegerRepresentation(scratch, required);
+                return scratch;
+            }
+
+            if (register != scratch)
+            {
+                MoveRegister(scratch, register, _owner._target.RegisterSize);
+                register = scratch;
+            }
+
+            ExtendIntegerRegister(register, required);
+            return register;
         }
+
+        private MachineRegister LoadOperandAtWidth(LirOperand operand, MachineRegister scratch, int size)
+            => ExtendOperandToWidth(LoadOperand(operand, scratch), operand.Type, size * 8, scratch);
 
         private static bool IsPowerOfTwo(int value)
             => value > 0 && (value & (value - 1)) == 0;

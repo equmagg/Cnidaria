@@ -2,159 +2,147 @@ using System;
 using System.Collections.Immutable;
 using Cnidaria.Cs;
 
-namespace Cnidaria.C
+namespace Cnidaria.C;
+
+internal static class TargetRegisterInfo
 {
-    internal static class TargetRegisterInfo
+    public static bool IsWindowsX64(TargetInfo target)
+        => target.Architecture == TargetArchitectureKind.X86_64 && target.OperatingSystem == OperatingSystemKind.Windows;
+
+    public static bool IsWindowsArm64(TargetInfo target)
+        => target.Architecture == TargetArchitectureKind.Arm64 && target.OperatingSystem == OperatingSystemKind.Windows;
+
+    public static bool IsX86(TargetInfo target)
+        => target.Architecture is TargetArchitectureKind.X86_64 or TargetArchitectureKind.I386;
+
+    /// <summary>
+    /// Reports a target whose memory operand cannot name a symbol, so every access first pays a
+    /// register and an address sequence. x86 reaches a global through a displacement and the
+    /// register bytecode through its global pointer, and neither gains from holding the address.
+    /// </summary>
+    public static bool MaterializesSymbolAddresses(TargetInfo target)
+        => target.Architecture is TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64
+            or TargetArchitectureKind.Arm32 or TargetArchitectureKind.Arm64;
+
+    private static bool IsSystemVX64(TargetInfo target)
+        => target.Architecture == TargetArchitectureKind.X86_64 && !IsWindowsX64(target);
+
+    // rax, rdx and rcx are written by the fixed divide and variable shift sequences
+    public static MachineRegister X86AccumulatorRegister(TargetInfo target) => MachineRegister.X0;
+
+    public static MachineRegister X86DataRegister(TargetInfo target)
+        => IsSystemVX64(target) ? MachineRegister.X3 : MachineRegister.X2;
+
+    public static MachineRegister X86CounterRegister(TargetInfo target)
+        => IsSystemVX64(target) ? MachineRegister.X4 : MachineRegister.X1;
+
+
+    public static bool TryParseExplicitRegister(TargetInfo target, string? text, LirRegisterClass registerClass, out MachineRegister register)
     {
-        public static bool IsWindowsX64(TargetInfo target)
-            => target.Architecture == TargetArchitectureKind.X86_64 && target.OperatingSystem == OperatingSystemKind.Windows;
-
-        public static bool IsWindowsArm64(TargetInfo target)
-            => target.Architecture == TargetArchitectureKind.Arm64 && target.OperatingSystem == OperatingSystemKind.Windows;
-
-        public static bool IsX86(TargetInfo target)
-            => target.Architecture is TargetArchitectureKind.X86_64 or TargetArchitectureKind.I386;
-
-        private static bool IsSystemVX64(TargetInfo target)
-            => target.Architecture == TargetArchitectureKind.X86_64 && !IsWindowsX64(target);
-
-        // rax, rdx and rcx are written by the fixed divide and variable shift sequences
-        public static MachineRegister X86AccumulatorRegister(TargetInfo target) => MachineRegister.X0;
-
-        public static MachineRegister X86DataRegister(TargetInfo target)
-            => IsSystemVX64(target) ? MachineRegister.X3 : MachineRegister.X2;
-
-        public static MachineRegister X86CounterRegister(TargetInfo target)
-            => IsSystemVX64(target) ? MachineRegister.X4 : MachineRegister.X1;
-
-
-        public static bool TryParseExplicitRegister(TargetInfo target, string? text, LirRegisterClass registerClass, out MachineRegister register)
-        {
-            register = MachineRegister.Invalid;
-            if (target is null || string.IsNullOrWhiteSpace(text))
-                return false;
-
-            var name = NormalizeExplicitRegisterName(text);
-            if (target.IsX86)
-                return TryParseX86ExplicitRegister(target, name, registerClass, out register);
-            if (target.IsRiscV)
-                return TryParseRiscVExplicitRegister(name, registerClass, out register);
-            if (target.IsArm)
-                return TryParseArmExplicitRegister(target, name, registerClass, out register);
+        register = MachineRegister.Invalid;
+        if (target is null || string.IsNullOrWhiteSpace(text))
             return false;
-        }
 
-        private static string NormalizeExplicitRegisterName(string text)
+        var name = NormalizeExplicitRegisterName(text);
+        if (target.IsX86)
+            return TryParseX86ExplicitRegister(target, name, registerClass, out register);
+        if (target.IsRiscV)
+            return TryParseRiscVExplicitRegister(name, registerClass, out register);
+        if (target.IsArm)
+            return TryParseArmExplicitRegister(target, name, registerClass, out register);
+        return false;
+    }
+
+    private static string NormalizeExplicitRegisterName(string text)
+    {
+        text = text.Trim();
+        if (text.Length >= 2 && text[0] == '{' && text[text.Length - 1] == '}')
+            text = text.Substring(1, text.Length - 2).Trim();
+        while (text.StartsWith("%", StringComparison.Ordinal))
+            text = text.Substring(1);
+        return text.ToLowerInvariant();
+    }
+
+    private static bool TryParseX86ExplicitRegister(TargetInfo target, string name, LirRegisterClass registerClass, out MachineRegister register)
+    {
+        register = MachineRegister.Invalid;
+        if (name.StartsWith("xmm", StringComparison.Ordinal) || name.StartsWith("ymm", StringComparison.Ordinal))
         {
-            text = text.Trim();
-            if (text.Length >= 2 && text[0] == '{' && text[text.Length - 1] == '}')
-                text = text.Substring(1, text.Length - 2).Trim();
-            while (text.StartsWith("%", StringComparison.Ordinal))
-                text = text.Substring(1);
-            return text.ToLowerInvariant();
-        }
-
-        private static bool TryParseX86ExplicitRegister(TargetInfo target, string name, LirRegisterClass registerClass, out MachineRegister register)
-        {
-            register = MachineRegister.Invalid;
-            if (name.StartsWith("xmm", StringComparison.Ordinal) || name.StartsWith("ymm", StringComparison.Ordinal))
-            {
-                if (!int.TryParse(name.Substring(3), out var vectorIndex) || vectorIndex < 0 || vectorIndex > 15)
-                    return false;
-                if (target.Architecture == TargetArchitectureKind.I386 && vectorIndex >= 8)
-                    return false;
-                if (registerClass is not LirRegisterClass.Vector and not LirRegisterClass.Floating)
-                    return false;
-                register = (MachineRegister)((int)MachineRegister.V0 + vectorIndex);
-                return true;
-            }
-
-            var canonical = CanonicalX86GeneralRegisterName(name);
-            if (canonical is null)
+            if (!int.TryParse(name.Substring(3), out var vectorIndex) || vectorIndex < 0 || vectorIndex > 15)
                 return false;
-            if (registerClass is not LirRegisterClass.General and not LirRegisterClass.Address)
+            if (target.Architecture == TargetArchitectureKind.I386 && vectorIndex >= 8)
                 return false;
-
-            return TryMapX86GeneralRegister(target, canonical, out register);
+            if (registerClass is not LirRegisterClass.Vector and not LirRegisterClass.Floating)
+                return false;
+            register = (MachineRegister)((int)MachineRegister.V0 + vectorIndex);
+            return true;
         }
 
-        private static string? CanonicalX86GeneralRegisterName(string name)
+        var canonical = CanonicalX86GeneralRegisterName(name);
+        if (canonical is null)
+            return false;
+        if (registerClass is not LirRegisterClass.General and not LirRegisterClass.Address)
+            return false;
+
+        return TryMapX86GeneralRegister(target, canonical, out register);
+    }
+
+    private static string? CanonicalX86GeneralRegisterName(string name)
+    {
+        return name switch
         {
-            return name switch
-            {
-                "al" or "ah" or "ax" or "eax" or "rax" => "rax",
-                "cl" or "ch" or "cx" or "ecx" or "rcx" => "rcx",
-                "dl" or "dh" or "dx" or "edx" or "rdx" => "rdx",
-                "bl" or "bh" or "bx" or "ebx" or "rbx" => "rbx",
-                "sil" or "si" or "esi" or "rsi" => "rsi",
-                "dil" or "di" or "edi" or "rdi" => "rdi",
-                "bpl" or "bp" or "ebp" or "rbp" => "rbp",
-                "spl" or "sp" or "esp" or "rsp" => "rsp",
-                "r8b" or "r8w" or "r8d" or "r8" => "r8",
-                "r9b" or "r9w" or "r9d" or "r9" => "r9",
-                "r10b" or "r10w" or "r10d" or "r10" => "r10",
-                "r11b" or "r11w" or "r11d" or "r11" => "r11",
-                "r12b" or "r12w" or "r12d" or "r12" => "r12",
-                "r13b" or "r13w" or "r13d" or "r13" => "r13",
-                "r14b" or "r14w" or "r14d" or "r14" => "r14",
-                "r15b" or "r15w" or "r15d" or "r15" => "r15",
-                _ => null,
-            };
-        }
+            "al" or "ah" or "ax" or "eax" or "rax" => "rax",
+            "cl" or "ch" or "cx" or "ecx" or "rcx" => "rcx",
+            "dl" or "dh" or "dx" or "edx" or "rdx" => "rdx",
+            "bl" or "bh" or "bx" or "ebx" or "rbx" => "rbx",
+            "sil" or "si" or "esi" or "rsi" => "rsi",
+            "dil" or "di" or "edi" or "rdi" => "rdi",
+            "bpl" or "bp" or "ebp" or "rbp" => "rbp",
+            "spl" or "sp" or "esp" or "rsp" => "rsp",
+            "r8b" or "r8w" or "r8d" or "r8" => "r8",
+            "r9b" or "r9w" or "r9d" or "r9" => "r9",
+            "r10b" or "r10w" or "r10d" or "r10" => "r10",
+            "r11b" or "r11w" or "r11d" or "r11" => "r11",
+            "r12b" or "r12w" or "r12d" or "r12" => "r12",
+            "r13b" or "r13w" or "r13d" or "r13" => "r13",
+            "r14b" or "r14w" or "r14d" or "r14" => "r14",
+            "r15b" or "r15w" or "r15d" or "r15" => "r15",
+            _ => null,
+        };
+    }
 
-        private static bool TryMapX86GeneralRegister(TargetInfo target, string canonical, out MachineRegister register)
+    private static bool TryMapX86GeneralRegister(TargetInfo target, string canonical, out MachineRegister register)
+    {
+        register = MachineRegister.Invalid;
+        if (target.Architecture == TargetArchitectureKind.I386)
         {
-            register = MachineRegister.Invalid;
-            if (target.Architecture == TargetArchitectureKind.I386)
-            {
-                register = canonical switch
-                {
-                    "rax" => MachineRegister.X0,
-                    "rcx" => MachineRegister.X1,
-                    "rdx" => MachineRegister.X2,
-                    "rbx" => MachineRegister.X3,
-                    "rsi" => MachineRegister.X4,
-                    "rdi" => MachineRegister.X5,
-                    _ => MachineRegister.Invalid,
-                };
-                return register != MachineRegister.Invalid;
-            }
-
-            if (IsWindowsX64(target))
-            {
-                register = canonical switch
-                {
-                    "rax" => MachineRegister.X0,
-                    "rcx" => MachineRegister.X1,
-                    "rdx" => MachineRegister.X2,
-                    "r8" => MachineRegister.X3,
-                    "r9" => MachineRegister.X4,
-                    "r10" => MachineRegister.X5,
-                    "r11" => MachineRegister.X6,
-                    "rbx" => MachineRegister.X7,
-                    "rsi" => MachineRegister.X8,
-                    "rdi" => MachineRegister.X9,
-                    "r12" => MachineRegister.X11,
-                    "r13" => MachineRegister.X12,
-                    "r14" => MachineRegister.X13,
-                    "r15" => MachineRegister.X14,
-                    _ => MachineRegister.Invalid,
-                };
-                return register != MachineRegister.Invalid;
-            }
-
             register = canonical switch
             {
                 "rax" => MachineRegister.X0,
-                "rdi" => MachineRegister.X1,
-                "rsi" => MachineRegister.X2,
-                "rdx" => MachineRegister.X3,
-                "rcx" => MachineRegister.X4,
-                "r8" => MachineRegister.X5,
-                "r9" => MachineRegister.X6,
-                "r10" => MachineRegister.X7,
-                "r11" => MachineRegister.X8,
-                "rbx" => MachineRegister.X9,
+                "rcx" => MachineRegister.X1,
+                "rdx" => MachineRegister.X2,
+                "rbx" => MachineRegister.X3,
+                "rsi" => MachineRegister.X4,
+                "rdi" => MachineRegister.X5,
+                _ => MachineRegister.Invalid,
+            };
+            return register != MachineRegister.Invalid;
+        }
+
+        if (IsWindowsX64(target))
+        {
+            register = canonical switch
+            {
+                "rax" => MachineRegister.X0,
+                "rcx" => MachineRegister.X1,
+                "rdx" => MachineRegister.X2,
+                "r8" => MachineRegister.X3,
+                "r9" => MachineRegister.X4,
+                "r10" => MachineRegister.X5,
+                "r11" => MachineRegister.X6,
+                "rbx" => MachineRegister.X7,
+                "rsi" => MachineRegister.X8,
+                "rdi" => MachineRegister.X9,
                 "r12" => MachineRegister.X11,
                 "r13" => MachineRegister.X12,
                 "r14" => MachineRegister.X13,
@@ -164,764 +152,394 @@ namespace Cnidaria.C
             return register != MachineRegister.Invalid;
         }
 
-        private static bool TryParseArmExplicitRegister(TargetInfo target, string name, LirRegisterClass registerClass, out MachineRegister register)
+        register = canonical switch
         {
-            register = MachineRegister.Invalid;
+            "rax" => MachineRegister.X0,
+            "rdi" => MachineRegister.X1,
+            "rsi" => MachineRegister.X2,
+            "rdx" => MachineRegister.X3,
+            "rcx" => MachineRegister.X4,
+            "r8" => MachineRegister.X5,
+            "r9" => MachineRegister.X6,
+            "r10" => MachineRegister.X7,
+            "r11" => MachineRegister.X8,
+            "rbx" => MachineRegister.X9,
+            "r12" => MachineRegister.X11,
+            "r13" => MachineRegister.X12,
+            "r14" => MachineRegister.X13,
+            "r15" => MachineRegister.X14,
+            _ => MachineRegister.Invalid,
+        };
+        return register != MachineRegister.Invalid;
+    }
 
-            if (registerClass is LirRegisterClass.General or LirRegisterClass.Address)
+    private static bool TryParseArmExplicitRegister(TargetInfo target, string name, LirRegisterClass registerClass, out MachineRegister register)
+    {
+        register = MachineRegister.Invalid;
+
+        if (registerClass is LirRegisterClass.General or LirRegisterClass.Address)
+        {
+            if (target.Architecture == TargetArchitectureKind.Arm32)
             {
-                if (target.Architecture == TargetArchitectureKind.Arm32)
+                if (TryParseIndexedRegister(name, 'r', 0, 13, out var index) || TryParseArm32IntegerAlias(name, out index))
                 {
-                    if (TryParseIndexedRegister(name, 'r', 0, 13, out var index) || TryParseArm32IntegerAlias(name, out index))
-                    {
-                        register = (MachineRegister)((int)MachineRegister.X0 + index);
-                        return true;
-                    }
+                    register = (MachineRegister)((int)MachineRegister.X0 + index);
+                    return true;
                 }
-                else
-                {
-                    if ((TryParseIndexedRegister(name, 'x', 0, 29, out var index) || TryParseIndexedRegister(name, 'w', 0, 29, out index)) && index != 18)
-                    {
-                        register = (MachineRegister)((int)MachineRegister.X0 + index);
-                        return true;
-                    }
-                }
-
-                return false;
             }
-
-            if (registerClass == LirRegisterClass.Floating)
+            else
             {
-                if (target.Architecture != TargetArchitectureKind.Arm32)
-                    return false;
-
-                var count = target.HasFeature(TargetArchitectureFeatures.ArmVfpD32) || target.HasFeature(TargetArchitectureFeatures.ArmNeon) ? 32 : 16;
-                if (TryParseIndexedRegister(name, 'd', 0, count, out var index) || TryParseIndexedRegister(name, 'f', 0, count, out index))
+                if ((TryParseIndexedRegister(name, 'x', 0, 29, out var index) || TryParseIndexedRegister(name, 'w', 0, 29, out index)) && index != 18)
                 {
-                    register = (MachineRegister)((int)MachineRegister.F0 + index);
+                    register = (MachineRegister)((int)MachineRegister.X0 + index);
                     return true;
-                }
-                if (TryParseIndexedRegister(name, 's', 0, 32, out index))
-                {
-                    register = (MachineRegister)((int)MachineRegister.F0 + index / 2);
-                    return true;
-                }
-
-                return false;
-            }
-
-            if (registerClass == LirRegisterClass.Vector)
-            {
-                var count = target.Architecture == TargetArchitectureKind.Arm32 ? 16 : 32;
-                if (TryParseIndexedRegister(name, 'v', 0, count, out var index) || TryParseIndexedRegister(name, 'q', 0, count, out index))
-                {
-                    register = (MachineRegister)((int)MachineRegister.V0 + index);
-                    return true;
-                }
-
-                if (target.Architecture == TargetArchitectureKind.Arm64)
-                {
-                    foreach (var prefix in new[] { 'b', 'h', 's', 'd', 'f' })
-                    {
-                        if (!TryParseIndexedRegister(name, prefix, 0, 32, out index))
-                            continue;
-                        register = (MachineRegister)((int)MachineRegister.V0 + index);
-                        return true;
-                    }
                 }
             }
 
             return false;
         }
 
-        private static bool TryParseArm32IntegerAlias(string name, out int index)
+        if (registerClass == LirRegisterClass.Floating)
         {
-            index = name switch
-            {
-                "a1" => 0,
-                "a2" => 1,
-                "a3" => 2,
-                "a4" => 3,
-                "v1" => 4,
-                "v2" => 5,
-                "v3" => 6,
-                "v4" => 7,
-                "v5" => 8,
-                "v6" or "sb" => 9,
-                "v7" or "sl" => 10,
-                "v8" or "fp" => 11,
-                "ip" => 12,
-                _ => -1,
-            };
-            return index >= 0;
-        }
+            if (target.Architecture != TargetArchitectureKind.Arm32)
+                return false;
 
-        private static bool TryParseRiscVExplicitRegister(string name, LirRegisterClass registerClass, out MachineRegister register)
-        {
-            register = MachineRegister.Invalid;
-            if (TryParseIndexedRegister(name, 'x', 0, out var index))
+            var count = target.HasFeature(TargetArchitectureFeatures.ArmVfpD32) || target.HasFeature(TargetArchitectureFeatures.ArmNeon) ? 32 : 16;
+            if (TryParseIndexedRegister(name, 'd', 0, count, out var index) || TryParseIndexedRegister(name, 'f', 0, count, out index))
             {
-                if (registerClass is not LirRegisterClass.General and not LirRegisterClass.Address)
-                    return false;
-                if (IsReservedRiscVExplicitIntegerRegister(index))
-                    return false;
-                register = (MachineRegister)((int)MachineRegister.X0 + index);
-                return true;
-            }
-            if (TryParseIndexedRegister(name, 'f', 0, out index))
-            {
-                if (registerClass != LirRegisterClass.Floating)
-                    return false;
                 register = (MachineRegister)((int)MachineRegister.F0 + index);
                 return true;
             }
-            if (TryParseIndexedRegister(name, 'v', 0, out index))
+            if (TryParseIndexedRegister(name, 's', 0, 32, out index))
             {
-                if (registerClass != LirRegisterClass.Vector)
-                    return false;
+                register = (MachineRegister)((int)MachineRegister.F0 + index / 2);
+                return true;
+            }
+
+            return false;
+        }
+
+        if (registerClass == LirRegisterClass.Vector)
+        {
+            var count = target.Architecture == TargetArchitectureKind.Arm32 ? 16 : 32;
+            if (TryParseIndexedRegister(name, 'v', 0, count, out var index) || TryParseIndexedRegister(name, 'q', 0, count, out index))
+            {
                 register = (MachineRegister)((int)MachineRegister.V0 + index);
                 return true;
             }
 
-            if (TryParseRiscVIntegerAbiRegister(name, out index))
+            if (target.Architecture == TargetArchitectureKind.Arm64)
             {
-                if (registerClass is not LirRegisterClass.General and not LirRegisterClass.Address)
-                    return false;
-                if (IsReservedRiscVExplicitIntegerRegister(index))
-                    return false;
-                register = (MachineRegister)((int)MachineRegister.X0 + index);
-                return true;
+                foreach (var prefix in new[] { 'b', 'h', 's', 'd', 'f' })
+                {
+                    if (!TryParseIndexedRegister(name, prefix, 0, 32, out index))
+                        continue;
+                    register = (MachineRegister)((int)MachineRegister.V0 + index);
+                    return true;
+                }
             }
-            if (TryParseRiscVFloatAbiRegister(name, out index))
-            {
-                if (registerClass != LirRegisterClass.Floating)
-                    return false;
-                register = (MachineRegister)((int)MachineRegister.F0 + index);
-                return true;
-            }
-            return false;
         }
 
-        private static bool TryParseIndexedRegister(string name, char prefix, int first, out int index)
-            => TryParseIndexedRegister(name, prefix, first, 32, out index);
+        return false;
+    }
 
-        private static bool TryParseIndexedRegister(string name, char prefix, int first, int maxExclusive, out int index)
+    private static bool TryParseArm32IntegerAlias(string name, out int index)
+    {
+        index = name switch
         {
-            index = -1;
-            if (name.Length < 2 || name[0] != prefix)
+            "a1" => 0,
+            "a2" => 1,
+            "a3" => 2,
+            "a4" => 3,
+            "v1" => 4,
+            "v2" => 5,
+            "v3" => 6,
+            "v4" => 7,
+            "v5" => 8,
+            "v6" or "sb" => 9,
+            "v7" or "sl" => 10,
+            "v8" or "fp" => 11,
+            "ip" => 12,
+            _ => -1,
+        };
+        return index >= 0;
+    }
+
+    private static bool TryParseRiscVExplicitRegister(string name, LirRegisterClass registerClass, out MachineRegister register)
+    {
+        register = MachineRegister.Invalid;
+        if (TryParseIndexedRegister(name, 'x', 0, out var index))
+        {
+            if (registerClass is not LirRegisterClass.General and not LirRegisterClass.Address)
                 return false;
-            if (!int.TryParse(name.Substring(1), out index))
+            if (IsReservedRiscVExplicitIntegerRegister(index))
                 return false;
-            return index >= first && index < maxExclusive;
+            register = (MachineRegister)((int)MachineRegister.X0 + index);
+            return true;
         }
-
-        private static bool IsReservedRiscVExplicitIntegerRegister(int index)
-            => index is 0 or 1 or 2 or 3 or 4 or 8;
-
-        private static bool TryParseRiscVIntegerAbiRegister(string name, out int index)
+        if (TryParseIndexedRegister(name, 'f', 0, out index))
         {
-            index = name switch
-            {
-                "zero" => 0,
-                "ra" => 1,
-                "sp" => 2,
-                "gp" => 3,
-                "tp" => 4,
-                "t0" => 5,
-                "t1" => 6,
-                "t2" => 7,
-                "s0" or "fp" => 8,
-                "s1" => 9,
-                "a0" => 10,
-                "a1" => 11,
-                "a2" => 12,
-                "a3" => 13,
-                "a4" => 14,
-                "a5" => 15,
-                "a6" => 16,
-                "a7" => 17,
-                "s2" => 18,
-                "s3" => 19,
-                "s4" => 20,
-                "s5" => 21,
-                "s6" => 22,
-                "s7" => 23,
-                "s8" => 24,
-                "s9" => 25,
-                "s10" => 26,
-                "s11" => 27,
-                "t3" => 28,
-                "t4" => 29,
-                "t5" => 30,
-                "t6" => 31,
-                _ => -1,
-            };
-            return index >= 0;
-        }
-
-        private static bool TryParseRiscVFloatAbiRegister(string name, out int index)
-        {
-            index = name switch
-            {
-                "ft0" => 0,
-                "ft1" => 1,
-                "ft2" => 2,
-                "ft3" => 3,
-                "ft4" => 4,
-                "ft5" => 5,
-                "ft6" => 6,
-                "ft7" => 7,
-                "fs0" => 8,
-                "fs1" => 9,
-                "fa0" => 10,
-                "fa1" => 11,
-                "fa2" => 12,
-                "fa3" => 13,
-                "fa4" => 14,
-                "fa5" => 15,
-                "fa6" => 16,
-                "fa7" => 17,
-                "fs2" => 18,
-                "fs3" => 19,
-                "fs4" => 20,
-                "fs5" => 21,
-                "fs6" => 22,
-                "fs7" => 23,
-                "fs8" => 24,
-                "fs9" => 25,
-                "fs10" => 26,
-                "fs11" => 27,
-                "ft8" => 28,
-                "ft9" => 29,
-                "ft10" => 30,
-                "ft11" => 31,
-                _ => -1,
-            };
-            return index >= 0;
-        }
-
-        public static bool UsesUnifiedArgumentCursor(TargetInfo target)
-            => IsWindowsX64(target);
-
-        public static int MinimumOutgoingArgumentAreaSize(TargetInfo target, int stackSlotSize)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            return IsWindowsX64(target) ? checked(4 * Math.Max(1, stackSlotSize)) : 0;
-        }
-
-        public static int X86AbiFloatingRegisterSize(TargetInfo target)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            if (!target.IsX86)
-                return 0;
-
-            return target.HasFeature(TargetArchitectureFeatures.X86Sse2) ? 8 : 0;
-        }
-
-        public static int ArmHardwareFloatingRegisterSize(TargetInfo target)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            if (target.Architecture == TargetArchitectureKind.Arm64)
-                return 16;
-            if (target.Architecture != TargetArchitectureKind.Arm32)
-                return 0;
-            return target.HasFeature(TargetArchitectureFeatures.ArmVfp) ? 8 : 0;
-        }
-
-        public static int ArmAbiFloatingRegisterSize(TargetInfo target)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            if (target.Architecture == TargetArchitectureKind.Arm64)
-                return 16;
-            if (target.Architecture != TargetArchitectureKind.Arm32)
-                return 0;
-            return target.HasFeature(TargetArchitectureFeatures.ArmVfp) && target.HasFeature(TargetArchitectureFeatures.ArmHardFloat) ? 8 : 0;
-        }
-
-        public static int VectorRegisterSize(TargetInfo target)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            if (target.IsX86)
-                return target.HasFeature(TargetArchitectureFeatures.X86Avx) ? 32 : 16;
-
-            if (target.IsRiscV && target.HasFeature(TargetArchitectureFeatures.RiscVV))
-                return Cnidaria.RiscV.RVVector.RegisterBytes;
-
-            if (target.Architecture == TargetArchitectureKind.Arm64 || (target.Architecture == TargetArchitectureKind.Arm32 && target.HasFeature(TargetArchitectureFeatures.ArmNeon)))
-                return 16;
-
-            return 0;
-        }
-
-        /// <summary>Counts the consecutive physical registers one value of a type occupies</summary>
-        public static int RegisterGroupCount(TargetInfo target, QualifiedType type)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            return type.Type is RVVectorType vector ? vector.RegisterCount : 1;
-        }
-
-        public static LirRegisterClass PreferredFloatingPointRegisterClass(TargetInfo target, QualifiedType type, bool isVariadicUnnamedArgument)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            if (!CAbi.IsFloating(type))
-                return LirRegisterClass.General;
-
-            if (target.IsRiscV)
-            {
-                if (isVariadicUnnamedArgument)
-                    return LirRegisterClass.General;
-
-                var abiFlen = CAbi.RiscVAbiFloatingRegisterSize(target);
-                return abiFlen > 0 && Math.Max(1, target.SizeOf(type)) <= abiFlen
-                    ? LirRegisterClass.Floating
-                    : LirRegisterClass.General;
-            }
-
-            if (target.IsArm)
-            {
-                if ((target.Architecture == TargetArchitectureKind.Arm32 || IsWindowsArm64(target)) && isVariadicUnnamedArgument)
-                    return LirRegisterClass.General;
-
-                var hardwareFlen = ArmHardwareFloatingRegisterSize(target);
-                if (hardwareFlen == 0 || Math.Max(1, target.SizeOf(type)) > hardwareFlen)
-                    return LirRegisterClass.General;
-                return target.Architecture == TargetArchitectureKind.Arm64
-                    ? LirRegisterClass.Vector
-                    : LirRegisterClass.Floating;
-            }
-
-            if (target.IsX86)
-            {
-                var abiFlen = X86AbiFloatingRegisterSize(target);
-                return abiFlen > 0 && Math.Max(1, target.SizeOf(type)) <= abiFlen
-                    ? LirRegisterClass.Vector
-                    : LirRegisterClass.General;
-            }
-
-            return LirRegisterClass.Floating;
-        }
-
-        public static ImmutableArray<MachineRegister> AllocatableGeneralRegisters(TargetInfo target)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            return target.Architecture switch
-            {
-                TargetArchitectureKind.I386 => ImmutableArray.Create(
-                    MachineRegister.X0,
-                    MachineRegister.X1,
-                    MachineRegister.X2,
-                    MachineRegister.X3,
-                    MachineRegister.X4,
-                    MachineRegister.X5),
-
-                TargetArchitectureKind.X86_64 => ImmutableArray.Create(
-                    MachineRegister.X0,
-                    MachineRegister.X1,
-                    MachineRegister.X2,
-                    MachineRegister.X3,
-                    MachineRegister.X4,
-                    MachineRegister.X5,
-                    MachineRegister.X6,
-                    MachineRegister.X7,
-                    MachineRegister.X8,
-                    MachineRegister.X9,
-                    MachineRegister.X11,
-                    MachineRegister.X12,
-                    MachineRegister.X13,
-                    MachineRegister.X14),
-
-                TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64 => ImmutableArray.Create(
-                    MachineRegister.X10,
-                    MachineRegister.X11,
-                    MachineRegister.X12,
-                    MachineRegister.X13,
-                    MachineRegister.X14,
-                    MachineRegister.X15,
-                    MachineRegister.X16,
-                    MachineRegister.X17,
-                    MachineRegister.X9,
-                    MachineRegister.X18,
-                    MachineRegister.X19,
-                    MachineRegister.X20,
-                    MachineRegister.X21,
-                    MachineRegister.X22,
-                    MachineRegister.X23,
-                    MachineRegister.X24,
-                    MachineRegister.X25,
-                    MachineRegister.X26,
-                    MachineRegister.X27),
-
-                TargetArchitectureKind.Arm32 => Arm32AllocatableGeneralRegisters(target),
-
-                TargetArchitectureKind.Arm64 => ImmutableArray.Create(
-                    MachineRegister.X0,
-                    MachineRegister.X1,
-                    MachineRegister.X2,
-                    MachineRegister.X3,
-                    MachineRegister.X4,
-                    MachineRegister.X5,
-                    MachineRegister.X6,
-                    MachineRegister.X7,
-                    MachineRegister.X8,
-                    MachineRegister.X9,
-                    MachineRegister.X10,
-                    MachineRegister.X11,
-                    MachineRegister.X12,
-                    MachineRegister.X13,
-                    MachineRegister.X14,
-                    MachineRegister.X15,
-                    MachineRegister.X19,
-                    MachineRegister.X20,
-                    MachineRegister.X21,
-                    MachineRegister.X22,
-                    MachineRegister.X23,
-                    MachineRegister.X24,
-                    MachineRegister.X25,
-                    MachineRegister.X26,
-                    MachineRegister.X27,
-                    MachineRegister.X28),
-
-                _ => ImmutableArray.Create(
-                    MachineRegister.X18,
-                    MachineRegister.X19,
-                    MachineRegister.X20,
-                    MachineRegister.X21,
-                    MachineRegister.X22,
-                    MachineRegister.X23,
-                    MachineRegister.X24,
-                    MachineRegister.X25,
-                    MachineRegister.X26,
-                    MachineRegister.X27),
-            };
-        }
-
-        public static ImmutableArray<MachineRegister> AllocatableFloatingRegisters(TargetInfo target)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            if (target.IsX86)
-                return ImmutableArray<MachineRegister>.Empty;
-
-            if (target.IsRiscV)
-            {
-                return CAbi.RiscVAbiFloatingRegisterSize(target) == 0
-                    ? ImmutableArray<MachineRegister>.Empty
-                    : ImmutableArray.Create(
-                        MachineRegister.F10,
-                        MachineRegister.F11,
-                        MachineRegister.F12,
-                        MachineRegister.F13,
-                        MachineRegister.F14,
-                        MachineRegister.F15,
-                        MachineRegister.F16,
-                        MachineRegister.F17,
-                        MachineRegister.F3,
-                        MachineRegister.F4,
-                        MachineRegister.F5,
-                        MachineRegister.F6,
-                        MachineRegister.F7,
-                        MachineRegister.F28,
-                        MachineRegister.F29,
-                        MachineRegister.F30,
-                        MachineRegister.F31,
-                        MachineRegister.F8,
-                        MachineRegister.F9,
-                        MachineRegister.F18,
-                        MachineRegister.F19,
-                        MachineRegister.F20,
-                        MachineRegister.F21,
-                        MachineRegister.F22,
-                        MachineRegister.F23,
-                        MachineRegister.F24,
-                        MachineRegister.F25,
-                        MachineRegister.F26,
-                        MachineRegister.F27);
-            }
-
-            if (target.Architecture == TargetArchitectureKind.Arm32)
-                return ArmHardwareFloatingRegisterSize(target) == 0
-                    ? ImmutableArray<MachineRegister>.Empty
-                    : Range(MachineRegister.F0, target.HasFeature(TargetArchitectureFeatures.ArmVfpD32) || target.HasFeature(TargetArchitectureFeatures.ArmNeon) ? 32 : 16);
-
-            if (target.Architecture == TargetArchitectureKind.Arm64)
-                return ImmutableArray<MachineRegister>.Empty;
-
-            return ImmutableArray.Create(
-                MachineRegister.F18,
-                MachineRegister.F19,
-                MachineRegister.F20,
-                MachineRegister.F21,
-                MachineRegister.F22,
-                MachineRegister.F23,
-                MachineRegister.F24,
-                MachineRegister.F25,
-                MachineRegister.F26,
-                MachineRegister.F27);
-        }
-
-        public static ImmutableArray<MachineRegister> AllocatableVectorRegisters(TargetInfo target)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            if (target.Architecture == TargetArchitectureKind.I386)
-                return X86AbiFloatingRegisterSize(target) == 0
-                    ? ImmutableArray<MachineRegister>.Empty
-                    : Range(MachineRegister.V0, 8);
-
-            if (target.Architecture == TargetArchitectureKind.X86_64)
-                return X86AbiFloatingRegisterSize(target) == 0
-                    ? ImmutableArray<MachineRegister>.Empty
-                    : Range(MachineRegister.V0, 16);
-
-            if (target.IsRiscV && target.HasFeature(TargetArchitectureFeatures.RiscVV))
-                return Range(MachineRegister.V0, 32);
-
-            if (target.Architecture == TargetArchitectureKind.Arm64)
-                return Range(MachineRegister.V0, 32);
-
-            if (target.Architecture == TargetArchitectureKind.Arm32 && target.HasFeature(TargetArchitectureFeatures.ArmNeon))
-                return ImmutableArray<MachineRegister>.Empty;
-
-            return ImmutableArray<MachineRegister>.Empty;
-        }
-
-        public static ImmutableArray<MachineRegister> IntegerArgumentRegisters(TargetInfo target)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            return target.Architecture switch
-            {
-                TargetArchitectureKind.I386 => ImmutableArray.Create(MachineRegister.X1, MachineRegister.X2),
-                TargetArchitectureKind.X86_64 => IsWindowsX64(target)
-                    ? ImmutableArray.Create(MachineRegister.X1, MachineRegister.X2, MachineRegister.X3, MachineRegister.X4)
-                    : ImmutableArray.Create(MachineRegister.X1, MachineRegister.X2, MachineRegister.X3, MachineRegister.X4, MachineRegister.X5, MachineRegister.X6),
-                TargetArchitectureKind.Arm32 => ImmutableArray.Create(MachineRegister.X0, MachineRegister.X1, MachineRegister.X2, MachineRegister.X3),
-                TargetArchitectureKind.Arm64 => ImmutableArray.Create(MachineRegister.X0, MachineRegister.X1, MachineRegister.X2, MachineRegister.X3, MachineRegister.X4, MachineRegister.X5, MachineRegister.X6, MachineRegister.X7),
-                _ => ImmutableArray.Create(MachineRegister.X10, MachineRegister.X11, MachineRegister.X12, MachineRegister.X13, MachineRegister.X14, MachineRegister.X15, MachineRegister.X16, MachineRegister.X17),
-            };
-        }
-
-        public static ImmutableArray<MachineRegister> FloatingArgumentRegisters(TargetInfo target)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            if (target.IsX86)
-                return ImmutableArray<MachineRegister>.Empty;
-
-            if (target.Architecture == TargetArchitectureKind.Arm32)
-                return ArmAbiFloatingRegisterSize(target) == 0
-                    ? ImmutableArray<MachineRegister>.Empty
-                    : Arm32VfpSlotRegisters(16);
-
-            if (target.Architecture == TargetArchitectureKind.Arm64)
-                return ImmutableArray<MachineRegister>.Empty;
-
-            return ImmutableArray.Create(
-                MachineRegister.F10,
-                MachineRegister.F11,
-                MachineRegister.F12,
-                MachineRegister.F13,
-                MachineRegister.F14,
-                MachineRegister.F15,
-                MachineRegister.F16,
-                MachineRegister.F17);
-        }
-
-        public static ImmutableArray<MachineRegister> VectorArgumentRegisters(TargetInfo target)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            return target.Architecture switch
-            {
-                TargetArchitectureKind.I386 => ImmutableArray<MachineRegister>.Empty,
-                TargetArchitectureKind.X86_64 => IsWindowsX64(target)
-                    ? ImmutableArray.Create(MachineRegister.V0, MachineRegister.V1, MachineRegister.V2, MachineRegister.V3)
-                    : ImmutableArray.Create(MachineRegister.V0, MachineRegister.V1, MachineRegister.V2, MachineRegister.V3, MachineRegister.V4, MachineRegister.V5, MachineRegister.V6, MachineRegister.V7),
-                TargetArchitectureKind.Arm64 => ImmutableArray.Create(MachineRegister.V0, MachineRegister.V1, MachineRegister.V2, MachineRegister.V3, MachineRegister.V4, MachineRegister.V5, MachineRegister.V6, MachineRegister.V7),
-                _ => ImmutableArray<MachineRegister>.Empty,
-            };
-        }
-
-        public static ImmutableArray<MachineRegister> IntegerReturnRegisters(TargetInfo target)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            return target.Architecture switch
-            {
-                TargetArchitectureKind.I386 => ImmutableArray.Create(MachineRegister.X0, MachineRegister.X2),
-                TargetArchitectureKind.X86_64 => IsWindowsX64(target)
-                    ? ImmutableArray.Create(MachineRegister.X0, MachineRegister.X2)
-                    : ImmutableArray.Create(MachineRegister.X0, MachineRegister.X3),
-                TargetArchitectureKind.Arm32 or TargetArchitectureKind.Arm64 => ImmutableArray.Create(MachineRegister.X0, MachineRegister.X1),
-                _ => ImmutableArray.Create(MachineRegister.X10, MachineRegister.X11),
-            };
-        }
-
-        public static ImmutableArray<MachineRegister> FloatingReturnRegisters(TargetInfo target)
-            => FloatingReturnRegisters(target, 8);
-
-        public static ImmutableArray<MachineRegister> FloatingReturnRegisters(TargetInfo target, int valueSize)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            if (target.IsX86 || target.Architecture == TargetArchitectureKind.Arm64)
-                return ImmutableArray<MachineRegister>.Empty;
-
-            if (target.Architecture == TargetArchitectureKind.Arm32)
-            {
-                if (ArmAbiFloatingRegisterSize(target) == 0)
-                    return ImmutableArray<MachineRegister>.Empty;
-                return valueSize <= 4
-                    ? Arm32VfpSlotRegisters(4)
-                    : Range(MachineRegister.F0, 4);
-            }
-
-            return ImmutableArray.Create(MachineRegister.F10, MachineRegister.F11);
-        }
-
-        public static ImmutableArray<MachineRegister> VectorReturnRegisters(TargetInfo target)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            if (target.IsX86)
-                return ImmutableArray.Create(MachineRegister.V0, MachineRegister.V1);
-
-            if (target.Architecture == TargetArchitectureKind.Arm64)
-                return ImmutableArray.Create(MachineRegister.V0, MachineRegister.V1, MachineRegister.V2, MachineRegister.V3);
-
-            return ImmutableArray<MachineRegister>.Empty;
-        }
-
-        public static bool IsCalleeSaved(TargetInfo target, MachineRegister register)
-        {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
-
-            if (register == MachineRegister.Invalid)
+            if (registerClass != LirRegisterClass.Floating)
                 return false;
-
-            var registerClass = MachineRegisters.GetClass(register);
-            if (target.Architecture == TargetArchitectureKind.I386)
-            {
-                if (registerClass == RegisterClass.Vector)
-                    return false;
-
-                return register is MachineRegister.X3 or MachineRegister.X4 or MachineRegister.X5;
-            }
-
-            if (target.Architecture == TargetArchitectureKind.X86_64)
-            {
-                if (registerClass == RegisterClass.Vector)
-                    return IsWindowsX64(target) && register >= MachineRegister.V6 && register <= MachineRegister.V15;
-
-                if (registerClass == RegisterClass.Float)
-                    return false;
-
-                return IsWindowsX64(target)
-                    ? register is MachineRegister.X7 or MachineRegister.X8 or MachineRegister.X9 or MachineRegister.X11 or MachineRegister.X12 or MachineRegister.X13 or MachineRegister.X14
-                    : register is MachineRegister.X9 or MachineRegister.X11 or MachineRegister.X12 or MachineRegister.X13 or MachineRegister.X14;
-            }
-
-            if (target.IsRiscV)
-            {
-                if (registerClass == RegisterClass.Vector)
-                    return false;
-
-                if (registerClass == RegisterClass.Float)
-                    return register is MachineRegister.F8 or MachineRegister.F9 or MachineRegister.F18 or MachineRegister.F19 or MachineRegister.F20 or MachineRegister.F21 or MachineRegister.F22 or MachineRegister.F23 or MachineRegister.F24 or MachineRegister.F25 or MachineRegister.F26 or MachineRegister.F27;
-
-                return register is MachineRegister.X8 or MachineRegister.X9 or MachineRegister.X18 or MachineRegister.X19 or MachineRegister.X20 or MachineRegister.X21 or MachineRegister.X22 or MachineRegister.X23 or MachineRegister.X24 or MachineRegister.X25 or MachineRegister.X26 or MachineRegister.X27;
-            }
-
-            if (target.Architecture == TargetArchitectureKind.Arm32)
-            {
-                if (registerClass == RegisterClass.Vector)
-                    return register >= MachineRegister.V4 && register <= MachineRegister.V7;
-
-                if (registerClass == RegisterClass.Float)
-                    return register >= MachineRegister.F8 && register <= MachineRegister.F15;
-
-                return register >= MachineRegister.X4 && register <= MachineRegister.X11;
-            }
-
-            if (target.Architecture == TargetArchitectureKind.Arm64)
-            {
-                if (registerClass == RegisterClass.Vector)
-                    return register >= MachineRegister.V8 && register <= MachineRegister.V15;
-
-                if (registerClass == RegisterClass.Float)
-                    return false;
-
-                return register >= MachineRegister.X19 && register <= MachineRegister.X28;
-            }
-
+            register = (MachineRegister)((int)MachineRegister.F0 + index);
+            return true;
+        }
+        if (TryParseIndexedRegister(name, 'v', 0, out index))
+        {
+            if (registerClass != LirRegisterClass.Vector)
+                return false;
+            register = (MachineRegister)((int)MachineRegister.V0 + index);
             return true;
         }
 
-        public static int RegisterSaveSize(TargetInfo target, MachineRegister register, int defaultSpillSlotSize)
+        if (TryParseRiscVIntegerAbiRegister(name, out index))
         {
-            if (target is null)
-                throw new ArgumentNullException(nameof(target));
+            if (registerClass is not LirRegisterClass.General and not LirRegisterClass.Address)
+                return false;
+            if (IsReservedRiscVExplicitIntegerRegister(index))
+                return false;
+            register = (MachineRegister)((int)MachineRegister.X0 + index);
+            return true;
+        }
+        if (TryParseRiscVFloatAbiRegister(name, out index))
+        {
+            if (registerClass != LirRegisterClass.Floating)
+                return false;
+            register = (MachineRegister)((int)MachineRegister.F0 + index);
+            return true;
+        }
+        return false;
+    }
 
-            var registerClass = MachineRegisters.GetClass(register);
-            if (registerClass == RegisterClass.Vector)
-                return Math.Max(1, Math.Max(VectorRegisterSize(target), defaultSpillSlotSize));
+    private static bool TryParseIndexedRegister(string name, char prefix, int first, out int index)
+        => TryParseIndexedRegister(name, prefix, first, 32, out index);
 
-            if (registerClass == RegisterClass.Float)
-            {
-                if (target.IsRiscV)
-                    return Math.Max(4, CAbi.RiscVAbiFloatingRegisterSize(target));
+    private static bool TryParseIndexedRegister(string name, char prefix, int first, int maxExclusive, out int index)
+    {
+        index = -1;
+        if (name.Length < 2 || name[0] != prefix)
+            return false;
+        if (!int.TryParse(name.Substring(1), out index))
+            return false;
+        return index >= first && index < maxExclusive;
+    }
 
-                if (target.IsArm)
-                    return Math.Max(8, defaultSpillSlotSize);
+    private static bool IsReservedRiscVExplicitIntegerRegister(int index)
+        => index is 0 or 1 or 2 or 3 or 4 or 8;
 
-                return Math.Max(1, defaultSpillSlotSize);
-            }
+    private static bool TryParseRiscVIntegerAbiRegister(string name, out int index)
+    {
+        index = name switch
+        {
+            "zero" => 0,
+            "ra" => 1,
+            "sp" => 2,
+            "gp" => 3,
+            "tp" => 4,
+            "t0" => 5,
+            "t1" => 6,
+            "t2" => 7,
+            "s0" or "fp" => 8,
+            "s1" => 9,
+            "a0" => 10,
+            "a1" => 11,
+            "a2" => 12,
+            "a3" => 13,
+            "a4" => 14,
+            "a5" => 15,
+            "a6" => 16,
+            "a7" => 17,
+            "s2" => 18,
+            "s3" => 19,
+            "s4" => 20,
+            "s5" => 21,
+            "s6" => 22,
+            "s7" => 23,
+            "s8" => 24,
+            "s9" => 25,
+            "s10" => 26,
+            "s11" => 27,
+            "t3" => 28,
+            "t4" => 29,
+            "t5" => 30,
+            "t6" => 31,
+            _ => -1,
+        };
+        return index >= 0;
+    }
 
-            return Math.Max(1, target.RegisterSize);
+    private static bool TryParseRiscVFloatAbiRegister(string name, out int index)
+    {
+        index = name switch
+        {
+            "ft0" => 0,
+            "ft1" => 1,
+            "ft2" => 2,
+            "ft3" => 3,
+            "ft4" => 4,
+            "ft5" => 5,
+            "ft6" => 6,
+            "ft7" => 7,
+            "fs0" => 8,
+            "fs1" => 9,
+            "fa0" => 10,
+            "fa1" => 11,
+            "fa2" => 12,
+            "fa3" => 13,
+            "fa4" => 14,
+            "fa5" => 15,
+            "fa6" => 16,
+            "fa7" => 17,
+            "fs2" => 18,
+            "fs3" => 19,
+            "fs4" => 20,
+            "fs5" => 21,
+            "fs6" => 22,
+            "fs7" => 23,
+            "fs8" => 24,
+            "fs9" => 25,
+            "fs10" => 26,
+            "fs11" => 27,
+            "ft8" => 28,
+            "ft9" => 29,
+            "ft10" => 30,
+            "ft11" => 31,
+            _ => -1,
+        };
+        return index >= 0;
+    }
+
+    public static bool UsesUnifiedArgumentCursor(TargetInfo target)
+        => IsWindowsX64(target);
+
+    public static int MinimumOutgoingArgumentAreaSize(TargetInfo target, int stackSlotSize)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        return IsWindowsX64(target) ? checked(4 * Math.Max(1, stackSlotSize)) : 0;
+    }
+
+    public static int X86AbiFloatingRegisterSize(TargetInfo target)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        if (!target.IsX86)
+            return 0;
+
+        return target.HasFeature(TargetArchitectureFeatures.X86Sse2) ? 8 : 0;
+    }
+
+    public static int ArmHardwareFloatingRegisterSize(TargetInfo target)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        if (target.Architecture == TargetArchitectureKind.Arm64)
+            return 16;
+        if (target.Architecture != TargetArchitectureKind.Arm32)
+            return 0;
+        return target.HasFeature(TargetArchitectureFeatures.ArmVfp) ? 8 : 0;
+    }
+
+    public static int ArmAbiFloatingRegisterSize(TargetInfo target)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        if (target.Architecture == TargetArchitectureKind.Arm64)
+            return 16;
+        if (target.Architecture != TargetArchitectureKind.Arm32)
+            return 0;
+        return target.HasFeature(TargetArchitectureFeatures.ArmVfp) && target.HasFeature(TargetArchitectureFeatures.ArmHardFloat) ? 8 : 0;
+    }
+
+    public static int VectorRegisterSize(TargetInfo target)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        if (target.IsX86)
+            return target.HasFeature(TargetArchitectureFeatures.X86Avx) ? 32 : 16;
+
+        if (target.IsRiscV && target.HasFeature(TargetArchitectureFeatures.RiscVV))
+            return Cnidaria.RiscV.RVVector.RegisterBytes;
+
+        if (target.Architecture == TargetArchitectureKind.Arm64 || (target.Architecture == TargetArchitectureKind.Arm32 && target.HasFeature(TargetArchitectureFeatures.ArmNeon)))
+            return 16;
+
+        return 0;
+    }
+
+    /// <summary>Counts the consecutive physical registers one value of a type occupies</summary>
+    public static int RegisterGroupCount(TargetInfo target, QualifiedType type)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        return type.Type is RVVectorType vector ? vector.RegisterCount : 1;
+    }
+
+    public static LirRegisterClass PreferredFloatingPointRegisterClass(TargetInfo target, QualifiedType type, bool isVariadicUnnamedArgument)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        if (!CAbi.IsFloating(type))
+            return LirRegisterClass.General;
+
+        if (target.IsRiscV)
+        {
+            if (isVariadicUnnamedArgument)
+                return LirRegisterClass.General;
+
+            var abiFlen = CAbi.RiscVAbiFloatingRegisterSize(target);
+            return abiFlen > 0 && Math.Max(1, target.SizeOf(type)) <= abiFlen
+                ? LirRegisterClass.Floating
+                : LirRegisterClass.General;
         }
 
-        private static ImmutableArray<MachineRegister> Arm32VfpSlotRegisters(int slotCount)
+        if (target.IsArm)
         {
-            if (slotCount <= 0)
-                return ImmutableArray<MachineRegister>.Empty;
+            if ((target.Architecture == TargetArchitectureKind.Arm32 || IsWindowsArm64(target)) && isVariadicUnnamedArgument)
+                return LirRegisterClass.General;
 
-            var builder = ImmutableArray.CreateBuilder<MachineRegister>(slotCount);
-            for (var slot = 0; slot < slotCount; slot++)
-                builder.Add((MachineRegister)((int)MachineRegister.F0 + slot / 2));
-            return builder.MoveToImmutable();
+            var hardwareFlen = ArmHardwareFloatingRegisterSize(target);
+            if (hardwareFlen == 0 || Math.Max(1, target.SizeOf(type)) > hardwareFlen)
+                return LirRegisterClass.General;
+            return target.Architecture == TargetArchitectureKind.Arm64
+                ? LirRegisterClass.Vector
+                : LirRegisterClass.Floating;
         }
 
-        private static ImmutableArray<MachineRegister> Arm32AllocatableGeneralRegisters(TargetInfo target)
+        if (target.IsX86)
         {
-            if (target.OperatingSystem != OperatingSystemKind.Windows)
-                return Range(MachineRegister.X0, 13);
+            var abiFlen = X86AbiFloatingRegisterSize(target);
+            return abiFlen > 0 && Math.Max(1, target.SizeOf(type)) <= abiFlen
+                ? LirRegisterClass.Vector
+                : LirRegisterClass.General;
+        }
 
-            return ImmutableArray.Create(
+        return LirRegisterClass.Floating;
+    }
+
+    public static ImmutableArray<MachineRegister> AllocatableGeneralRegisters(TargetInfo target)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        return target.Architecture switch
+        {
+            TargetArchitectureKind.I386 => ImmutableArray.Create(
+                MachineRegister.X0,
+                MachineRegister.X1,
+                MachineRegister.X2,
+                MachineRegister.X3,
+                MachineRegister.X4,
+                MachineRegister.X5),
+
+            TargetArchitectureKind.X86_64 => ImmutableArray.Create(
                 MachineRegister.X0,
                 MachineRegister.X1,
                 MachineRegister.X2,
@@ -931,20 +549,410 @@ namespace Cnidaria.C
                 MachineRegister.X6,
                 MachineRegister.X7,
                 MachineRegister.X8,
+                MachineRegister.X9,
+                MachineRegister.X11,
+                MachineRegister.X12,
+                MachineRegister.X13,
+                MachineRegister.X14),
+
+            TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64 => ImmutableArray.Create(
                 MachineRegister.X10,
-                MachineRegister.X12);
-        }
+                MachineRegister.X11,
+                MachineRegister.X12,
+                MachineRegister.X13,
+                MachineRegister.X14,
+                MachineRegister.X15,
+                MachineRegister.X16,
+                MachineRegister.X17,
+                MachineRegister.X9,
+                MachineRegister.X18,
+                MachineRegister.X19,
+                MachineRegister.X20,
+                MachineRegister.X21,
+                MachineRegister.X22,
+                MachineRegister.X23,
+                MachineRegister.X24,
+                MachineRegister.X25,
+                MachineRegister.X26,
+                MachineRegister.X27),
 
-        private static ImmutableArray<MachineRegister> Range(MachineRegister first, int count)
+            TargetArchitectureKind.Arm32 => Arm32AllocatableGeneralRegisters(target),
+
+            TargetArchitectureKind.Arm64 => ImmutableArray.Create(
+                MachineRegister.X0,
+                MachineRegister.X1,
+                MachineRegister.X2,
+                MachineRegister.X3,
+                MachineRegister.X4,
+                MachineRegister.X5,
+                MachineRegister.X6,
+                MachineRegister.X7,
+                MachineRegister.X8,
+                MachineRegister.X9,
+                MachineRegister.X10,
+                MachineRegister.X11,
+                MachineRegister.X12,
+                MachineRegister.X13,
+                MachineRegister.X14,
+                MachineRegister.X15,
+                MachineRegister.X19,
+                MachineRegister.X20,
+                MachineRegister.X21,
+                MachineRegister.X22,
+                MachineRegister.X23,
+                MachineRegister.X24,
+                MachineRegister.X25,
+                MachineRegister.X26,
+                MachineRegister.X27,
+                MachineRegister.X28),
+
+            _ => ImmutableArray.Create(
+                MachineRegister.X18,
+                MachineRegister.X19,
+                MachineRegister.X20,
+                MachineRegister.X21,
+                MachineRegister.X22,
+                MachineRegister.X23,
+                MachineRegister.X24,
+                MachineRegister.X25,
+                MachineRegister.X26,
+                MachineRegister.X27),
+        };
+    }
+
+    public static ImmutableArray<MachineRegister> AllocatableFloatingRegisters(TargetInfo target)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        if (target.IsX86)
+            return ImmutableArray<MachineRegister>.Empty;
+
+        if (target.IsRiscV)
         {
-            if (count <= 0)
-                return ImmutableArray<MachineRegister>.Empty;
-
-            var builder = ImmutableArray.CreateBuilder<MachineRegister>(count);
-            var start = (int)first;
-            for (var i = 0; i < count; i++)
-                builder.Add((MachineRegister)(start + i));
-            return builder.MoveToImmutable();
+            return CAbi.RiscVAbiFloatingRegisterSize(target) == 0
+                ? ImmutableArray<MachineRegister>.Empty
+                : ImmutableArray.Create(
+                    MachineRegister.F10,
+                    MachineRegister.F11,
+                    MachineRegister.F12,
+                    MachineRegister.F13,
+                    MachineRegister.F14,
+                    MachineRegister.F15,
+                    MachineRegister.F16,
+                    MachineRegister.F17,
+                    MachineRegister.F3,
+                    MachineRegister.F4,
+                    MachineRegister.F5,
+                    MachineRegister.F6,
+                    MachineRegister.F7,
+                    MachineRegister.F28,
+                    MachineRegister.F29,
+                    MachineRegister.F30,
+                    MachineRegister.F31,
+                    MachineRegister.F8,
+                    MachineRegister.F9,
+                    MachineRegister.F18,
+                    MachineRegister.F19,
+                    MachineRegister.F20,
+                    MachineRegister.F21,
+                    MachineRegister.F22,
+                    MachineRegister.F23,
+                    MachineRegister.F24,
+                    MachineRegister.F25,
+                    MachineRegister.F26,
+                    MachineRegister.F27);
         }
+
+        if (target.Architecture == TargetArchitectureKind.Arm32)
+            return ArmHardwareFloatingRegisterSize(target) == 0
+                ? ImmutableArray<MachineRegister>.Empty
+                : Range(MachineRegister.F0, target.HasFeature(TargetArchitectureFeatures.ArmVfpD32) || target.HasFeature(TargetArchitectureFeatures.ArmNeon) ? 32 : 16);
+
+        if (target.Architecture == TargetArchitectureKind.Arm64)
+            return ImmutableArray<MachineRegister>.Empty;
+
+        return ImmutableArray.Create(
+            MachineRegister.F18,
+            MachineRegister.F19,
+            MachineRegister.F20,
+            MachineRegister.F21,
+            MachineRegister.F22,
+            MachineRegister.F23,
+            MachineRegister.F24,
+            MachineRegister.F25,
+            MachineRegister.F26,
+            MachineRegister.F27);
+    }
+
+    public static ImmutableArray<MachineRegister> AllocatableVectorRegisters(TargetInfo target)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        if (target.Architecture == TargetArchitectureKind.I386)
+            return X86AbiFloatingRegisterSize(target) == 0
+                ? ImmutableArray<MachineRegister>.Empty
+                : Range(MachineRegister.V0, 8);
+
+        if (target.Architecture == TargetArchitectureKind.X86_64)
+            return X86AbiFloatingRegisterSize(target) == 0
+                ? ImmutableArray<MachineRegister>.Empty
+                : Range(MachineRegister.V0, 16);
+
+        if (target.IsRiscV && target.HasFeature(TargetArchitectureFeatures.RiscVV))
+            return Range(MachineRegister.V0, 32);
+
+        if (target.Architecture == TargetArchitectureKind.Arm64)
+            return Range(MachineRegister.V0, 32);
+
+        if (target.Architecture == TargetArchitectureKind.Arm32 && target.HasFeature(TargetArchitectureFeatures.ArmNeon))
+            return ImmutableArray<MachineRegister>.Empty;
+
+        return ImmutableArray<MachineRegister>.Empty;
+    }
+
+    public static ImmutableArray<MachineRegister> IntegerArgumentRegisters(TargetInfo target)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        return target.Architecture switch
+        {
+            TargetArchitectureKind.I386 => ImmutableArray.Create(MachineRegister.X1, MachineRegister.X2),
+            TargetArchitectureKind.X86_64 => IsWindowsX64(target)
+                ? ImmutableArray.Create(MachineRegister.X1, MachineRegister.X2, MachineRegister.X3, MachineRegister.X4)
+                : ImmutableArray.Create(MachineRegister.X1, MachineRegister.X2, MachineRegister.X3, MachineRegister.X4, MachineRegister.X5, MachineRegister.X6),
+            TargetArchitectureKind.Arm32 => ImmutableArray.Create(MachineRegister.X0, MachineRegister.X1, MachineRegister.X2, MachineRegister.X3),
+            TargetArchitectureKind.Arm64 => ImmutableArray.Create(MachineRegister.X0, MachineRegister.X1, MachineRegister.X2, MachineRegister.X3, MachineRegister.X4, MachineRegister.X5, MachineRegister.X6, MachineRegister.X7),
+            _ => ImmutableArray.Create(MachineRegister.X10, MachineRegister.X11, MachineRegister.X12, MachineRegister.X13, MachineRegister.X14, MachineRegister.X15, MachineRegister.X16, MachineRegister.X17),
+        };
+    }
+
+    public static ImmutableArray<MachineRegister> FloatingArgumentRegisters(TargetInfo target)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        if (target.IsX86)
+            return ImmutableArray<MachineRegister>.Empty;
+
+        if (target.Architecture == TargetArchitectureKind.Arm32)
+            return ArmAbiFloatingRegisterSize(target) == 0
+                ? ImmutableArray<MachineRegister>.Empty
+                : Arm32VfpSlotRegisters(16);
+
+        if (target.Architecture == TargetArchitectureKind.Arm64)
+            return ImmutableArray<MachineRegister>.Empty;
+
+        return ImmutableArray.Create(
+            MachineRegister.F10,
+            MachineRegister.F11,
+            MachineRegister.F12,
+            MachineRegister.F13,
+            MachineRegister.F14,
+            MachineRegister.F15,
+            MachineRegister.F16,
+            MachineRegister.F17);
+    }
+
+    public static ImmutableArray<MachineRegister> VectorArgumentRegisters(TargetInfo target)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        return target.Architecture switch
+        {
+            TargetArchitectureKind.I386 => ImmutableArray<MachineRegister>.Empty,
+            TargetArchitectureKind.X86_64 => IsWindowsX64(target)
+                ? ImmutableArray.Create(MachineRegister.V0, MachineRegister.V1, MachineRegister.V2, MachineRegister.V3)
+                : ImmutableArray.Create(MachineRegister.V0, MachineRegister.V1, MachineRegister.V2, MachineRegister.V3, MachineRegister.V4, MachineRegister.V5, MachineRegister.V6, MachineRegister.V7),
+            TargetArchitectureKind.Arm64 => ImmutableArray.Create(MachineRegister.V0, MachineRegister.V1, MachineRegister.V2, MachineRegister.V3, MachineRegister.V4, MachineRegister.V5, MachineRegister.V6, MachineRegister.V7),
+            _ => ImmutableArray<MachineRegister>.Empty,
+        };
+    }
+
+    public static ImmutableArray<MachineRegister> IntegerReturnRegisters(TargetInfo target)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        return target.Architecture switch
+        {
+            TargetArchitectureKind.I386 => ImmutableArray.Create(MachineRegister.X0, MachineRegister.X2),
+            TargetArchitectureKind.X86_64 => IsWindowsX64(target)
+                ? ImmutableArray.Create(MachineRegister.X0, MachineRegister.X2)
+                : ImmutableArray.Create(MachineRegister.X0, MachineRegister.X3),
+            TargetArchitectureKind.Arm32 or TargetArchitectureKind.Arm64 => ImmutableArray.Create(MachineRegister.X0, MachineRegister.X1),
+            _ => ImmutableArray.Create(MachineRegister.X10, MachineRegister.X11),
+        };
+    }
+
+    public static ImmutableArray<MachineRegister> FloatingReturnRegisters(TargetInfo target)
+        => FloatingReturnRegisters(target, 8);
+
+    public static ImmutableArray<MachineRegister> FloatingReturnRegisters(TargetInfo target, int valueSize)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        if (target.IsX86 || target.Architecture == TargetArchitectureKind.Arm64)
+            return ImmutableArray<MachineRegister>.Empty;
+
+        if (target.Architecture == TargetArchitectureKind.Arm32)
+        {
+            if (ArmAbiFloatingRegisterSize(target) == 0)
+                return ImmutableArray<MachineRegister>.Empty;
+            return valueSize <= 4
+                ? Arm32VfpSlotRegisters(4)
+                : Range(MachineRegister.F0, 4);
+        }
+
+        return ImmutableArray.Create(MachineRegister.F10, MachineRegister.F11);
+    }
+
+    public static ImmutableArray<MachineRegister> VectorReturnRegisters(TargetInfo target)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        if (target.IsX86)
+            return ImmutableArray.Create(MachineRegister.V0, MachineRegister.V1);
+
+        if (target.Architecture == TargetArchitectureKind.Arm64)
+            return ImmutableArray.Create(MachineRegister.V0, MachineRegister.V1, MachineRegister.V2, MachineRegister.V3);
+
+        return ImmutableArray<MachineRegister>.Empty;
+    }
+
+    public static bool IsCalleeSaved(TargetInfo target, MachineRegister register)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        if (register == MachineRegister.Invalid)
+            return false;
+
+        var registerClass = MachineRegisters.GetClass(register);
+        if (target.Architecture == TargetArchitectureKind.I386)
+        {
+            if (registerClass == RegisterClass.Vector)
+                return false;
+
+            return register is MachineRegister.X3 or MachineRegister.X4 or MachineRegister.X5;
+        }
+
+        if (target.Architecture == TargetArchitectureKind.X86_64)
+        {
+            if (registerClass == RegisterClass.Vector)
+                return IsWindowsX64(target) && register >= MachineRegister.V6 && register <= MachineRegister.V15;
+
+            if (registerClass == RegisterClass.Float)
+                return false;
+
+            return IsWindowsX64(target)
+                ? register is MachineRegister.X7 or MachineRegister.X8 or MachineRegister.X9 or MachineRegister.X11 or MachineRegister.X12 or MachineRegister.X13 or MachineRegister.X14
+                : register is MachineRegister.X9 or MachineRegister.X11 or MachineRegister.X12 or MachineRegister.X13 or MachineRegister.X14;
+        }
+
+        if (target.IsRiscV)
+        {
+            if (registerClass == RegisterClass.Vector)
+                return false;
+
+            if (registerClass == RegisterClass.Float)
+                return register is MachineRegister.F8 or MachineRegister.F9 or MachineRegister.F18 or MachineRegister.F19 or MachineRegister.F20 or MachineRegister.F21 or MachineRegister.F22 or MachineRegister.F23 or MachineRegister.F24 or MachineRegister.F25 or MachineRegister.F26 or MachineRegister.F27;
+
+            return register is MachineRegister.X8 or MachineRegister.X9 or MachineRegister.X18 or MachineRegister.X19 or MachineRegister.X20 or MachineRegister.X21 or MachineRegister.X22 or MachineRegister.X23 or MachineRegister.X24 or MachineRegister.X25 or MachineRegister.X26 or MachineRegister.X27;
+        }
+
+        if (target.Architecture == TargetArchitectureKind.Arm32)
+        {
+            if (registerClass == RegisterClass.Vector)
+                return register >= MachineRegister.V4 && register <= MachineRegister.V7;
+
+            if (registerClass == RegisterClass.Float)
+                return register >= MachineRegister.F8 && register <= MachineRegister.F15;
+
+            return register >= MachineRegister.X4 && register <= MachineRegister.X11;
+        }
+
+        if (target.Architecture == TargetArchitectureKind.Arm64)
+        {
+            if (registerClass == RegisterClass.Vector)
+                return register >= MachineRegister.V8 && register <= MachineRegister.V15;
+
+            if (registerClass == RegisterClass.Float)
+                return false;
+
+            return register >= MachineRegister.X19 && register <= MachineRegister.X28;
+        }
+
+        return true;
+    }
+
+    public static int RegisterSaveSize(TargetInfo target, MachineRegister register, int defaultSpillSlotSize)
+    {
+        if (target is null)
+            throw new ArgumentNullException(nameof(target));
+
+        var registerClass = MachineRegisters.GetClass(register);
+        if (registerClass == RegisterClass.Vector)
+            return Math.Max(1, Math.Max(VectorRegisterSize(target), defaultSpillSlotSize));
+
+        if (registerClass == RegisterClass.Float)
+        {
+            if (target.IsRiscV)
+                return Math.Max(4, CAbi.RiscVAbiFloatingRegisterSize(target));
+
+            if (target.IsArm)
+                return Math.Max(8, defaultSpillSlotSize);
+
+            return Math.Max(1, defaultSpillSlotSize);
+        }
+
+        return Math.Max(1, target.RegisterSize);
+    }
+
+    private static ImmutableArray<MachineRegister> Arm32VfpSlotRegisters(int slotCount)
+    {
+        if (slotCount <= 0)
+            return ImmutableArray<MachineRegister>.Empty;
+
+        var builder = ImmutableArray.CreateBuilder<MachineRegister>(slotCount);
+        for (var slot = 0; slot < slotCount; slot++)
+            builder.Add((MachineRegister)((int)MachineRegister.F0 + slot / 2));
+        return builder.MoveToImmutable();
+    }
+
+    private static ImmutableArray<MachineRegister> Arm32AllocatableGeneralRegisters(TargetInfo target)
+    {
+        if (target.OperatingSystem != OperatingSystemKind.Windows)
+            return Range(MachineRegister.X0, 13);
+
+        return ImmutableArray.Create(
+            MachineRegister.X0,
+            MachineRegister.X1,
+            MachineRegister.X2,
+            MachineRegister.X3,
+            MachineRegister.X4,
+            MachineRegister.X5,
+            MachineRegister.X6,
+            MachineRegister.X7,
+            MachineRegister.X8,
+            MachineRegister.X10,
+            MachineRegister.X12);
+    }
+
+    private static ImmutableArray<MachineRegister> Range(MachineRegister first, int count)
+    {
+        if (count <= 0)
+            return ImmutableArray<MachineRegister>.Empty;
+
+        var builder = ImmutableArray.CreateBuilder<MachineRegister>(count);
+        var start = (int)first;
+        for (var i = 0; i < count; i++)
+            builder.Add((MachineRegister)(start + i));
+        return builder.MoveToImmutable();
     }
 }

@@ -2,763 +2,851 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 
-namespace Cnidaria.C
+namespace Cnidaria.C;
+
+public sealed class TrimmingOptions
 {
-    public sealed class TrimmingOptions
+    public static TrimmingOptions Default { get; } = new TrimmingOptions();
+
+    public bool Enabled { get; }
+    public bool PreserveExternallyVisibleSymbols { get; }
+    public ImmutableHashSet<string> RootSymbols { get; }
+
+    public TrimmingOptions(
+        bool enabled = true,
+        bool preserveExternallyVisibleSymbols = true,
+        IEnumerable<string>? rootSymbols = null)
     {
-        public static TrimmingOptions Default { get; } = new TrimmingOptions();
+        Enabled = enabled;
+        PreserveExternallyVisibleSymbols = preserveExternallyVisibleSymbols;
+        RootSymbols = rootSymbols is null
+            ? ImmutableHashSet<string>.Empty.WithComparer(StringComparer.Ordinal)
+            : rootSymbols.ToImmutableHashSet(StringComparer.Ordinal);
+    }
+}
 
-        public bool Enabled { get; }
-        public bool PreserveExternallyVisibleSymbols { get; }
-        public ImmutableHashSet<string> RootSymbols { get; }
+internal readonly struct TrimResult
+{
+    public ControlFlowGraph ControlFlowGraph { get; }
+    public ImmutableArray<GimpleFunctionAnnotations> Functions { get; }
 
-        public TrimmingOptions(
-            bool enabled = true,
-            bool preserveExternallyVisibleSymbols = true,
-            IEnumerable<string>? rootSymbols = null)
-        {
-            Enabled = enabled;
-            PreserveExternallyVisibleSymbols = preserveExternallyVisibleSymbols;
-            RootSymbols = rootSymbols is null
-                ? ImmutableHashSet<string>.Empty.WithComparer(StringComparer.Ordinal)
-                : rootSymbols.ToImmutableHashSet(StringComparer.Ordinal);
-        }
+    public TrimResult(
+        ControlFlowGraph controlFlowGraph,
+        ImmutableArray<GimpleFunctionAnnotations> functions)
+    {
+        ControlFlowGraph = controlFlowGraph;
+        Functions = functions;
+    }
+}
+
+internal static class Trimmer
+{
+    public static TrimResult Trim(
+        ControlFlowGraph controlFlowGraph,
+        ImmutableArray<GimpleFunctionAnnotations> functions,
+        TrimmingOptions options)
+    {
+        if (controlFlowGraph is null)
+            throw new ArgumentNullException(nameof(controlFlowGraph));
+        if (options is null)
+            throw new ArgumentNullException(nameof(options));
+
+        if (!options.Enabled)
+            return new TrimResult(controlFlowGraph, functions);
+
+        return new Pass(controlFlowGraph, functions, options).Run();
     }
 
-    internal readonly struct TrimResult
+    public static ImmutableArray<GimplePipelineResult> TrimLinked(
+        ImmutableArray<GimplePipelineResult> units, int userUnitCount, string entry, TrimmingOptions options)
     {
-        public ControlFlowGraph ControlFlowGraph { get; }
-        public ImmutableArray<GimpleFunctionAnnotations> Functions { get; }
-
-        public TrimResult(
-            ControlFlowGraph controlFlowGraph,
-            ImmutableArray<GimpleFunctionAnnotations> functions)
+        var graphs = ImmutableArray.CreateBuilder<ControlFlowGraph>(units.Length);
+        var annotations = ImmutableArray.CreateBuilder<ImmutableArray<GimpleFunctionAnnotations>>(units.Length);
+        var unitOptions = ImmutableArray.CreateBuilder<TrimmingOptions>(units.Length);
+        foreach (var unit in units)
         {
-            ControlFlowGraph = controlFlowGraph;
-            Functions = functions;
+            graphs.Add(unit.ControlFlowGraph);
+            annotations.Add(unit.Functions);
+            unitOptions.Add(options);
         }
+
+        var trimmed = new LinkedPass(graphs.ToImmutable(), annotations.ToImmutable(), unitOptions.ToImmutable(),
+            userUnitCount, entry, options).Run();
+        var result = ImmutableArray.CreateBuilder<GimplePipelineResult>(trimmed.Length);
+        foreach (var unit in trimmed)
+            result.Add(new GimplePipelineResult(unit.ControlFlowGraph, unit.Functions));
+        return result.ToImmutable();
     }
 
-    internal static class Trimmer
+    /// <summary>Trims across units on plain GIMPLE, before inlining, annotation or optimization</summary>
+    public static ImmutableArray<GimpleTree> TrimLinked(
+        ImmutableArray<GimpleTree> units,
+        ImmutableArray<TrimmingOptions> unitOptions,
+        int userUnitCount,
+        string entry,
+        TrimmingOptions options)
+        => new LinkedPass(units, unitOptions, userUnitCount, entry, options).RunOverTrees();
+
+    private sealed class LinkedPass
     {
-        public static TrimResult Trim(
-            ControlFlowGraph controlFlowGraph,
-            ImmutableArray<GimpleFunctionAnnotations> functions,
+        private readonly Pass[] _passes;
+        private readonly int _userUnitCount;
+        private readonly string _entry;
+        private readonly TrimmingOptions _options;
+        private readonly Dictionary<string, List<Pass>> _definitions = new(StringComparer.Ordinal);
+        private readonly HashSet<Pass> _active = new();
+        private readonly HashSet<Pass> _pending = new();
+        private readonly Queue<Pass> _workList = new();
+
+        public LinkedPass(
+            ImmutableArray<ControlFlowGraph> units,
+            ImmutableArray<ImmutableArray<GimpleFunctionAnnotations>> annotations,
+            ImmutableArray<TrimmingOptions> unitOptions,
+            int userUnitCount,
+            string entry,
             TrimmingOptions options)
         {
-            if (controlFlowGraph is null)
-                throw new ArgumentNullException(nameof(controlFlowGraph));
-            if (options is null)
-                throw new ArgumentNullException(nameof(options));
-
-            if (!options.Enabled)
-                return new TrimResult(controlFlowGraph, functions);
-
-            return new Pass(controlFlowGraph, functions, options).Run();
+            _passes = new Pass[units.Length];
+            _userUnitCount = userUnitCount;
+            _entry = entry;
+            _options = options;
+            for (var i = 0; i < units.Length; i++)
+                Index(i, new Pass(units[i], annotations[i], unitOptions[i], Schedule, MarkExternal));
         }
 
-        public static ImmutableArray<GimplePipelineResult> TrimLinked(
-            ImmutableArray<GimplePipelineResult> units, int userUnitCount, string entry, TrimmingOptions options)
-            => new LinkedPass(units, userUnitCount, entry, options).Run();
-
-        private sealed class LinkedPass
+        public LinkedPass(
+            ImmutableArray<GimpleTree> units,
+            ImmutableArray<TrimmingOptions> unitOptions,
+            int userUnitCount,
+            string entry,
+            TrimmingOptions options)
         {
-            private readonly Pass[] _passes;
-            private readonly int _userUnitCount;
-            private readonly string _entry;
-            private readonly TrimmingOptions _options;
-            private readonly Dictionary<string, List<Pass>> _definitions = new(StringComparer.Ordinal);
-            private readonly HashSet<Pass> _active = new();
-            private readonly HashSet<Pass> _pending = new();
-            private readonly Queue<Pass> _workList = new();
+            _passes = new Pass[units.Length];
+            _userUnitCount = userUnitCount;
+            _entry = entry;
+            _options = options;
+            for (var i = 0; i < units.Length; i++)
+                Index(i, new Pass(units[i], unitOptions[i], Schedule, MarkExternal));
+        }
 
-            public LinkedPass(ImmutableArray<GimplePipelineResult> units, int userUnitCount, string entry, TrimmingOptions options)
-            {
-                _passes = new Pass[units.Length];
-                _userUnitCount = userUnitCount;
-                _entry = entry;
-                _options = options;
-                for (var i = 0; i < units.Length; i++)
-                {
-                    var pass = new Pass(units[i].ControlFlowGraph, units[i].Functions, options, Schedule, MarkExternal);
-                    _passes[i] = pass;
-                    pass.IndexMembers();
-                    foreach (var name in pass.ExternalDefinitions())
-                    {
-                        if (!_definitions.TryGetValue(name, out var providers))
-                            _definitions.Add(name, providers = new List<Pass>());
-                        providers.Add(pass);
-                    }
-                }
-            }
-
-            public ImmutableArray<GimplePipelineResult> Run()
-            {
-                for (var i = 0; i < _userUnitCount; i++)
-                {
-                    Activate(_passes[i]);
-                    _passes[i].MarkByName(_entry);
-                }
-                foreach (var root in _options.RootSymbols)
-                {
-                    MarkExternal(root);
-                    foreach (var pass in _passes)
-                    {
-                        if (pass.HasInternalDefinition(root))
-                            Activate(pass);
-                    }
-                }
-                while (_workList.Count != 0)
-                {
-                    var pass = _workList.Dequeue();
-                    pass.ProcessWorkLists();
-                    _pending.Remove(pass);
-                }
-                var result = ImmutableArray.CreateBuilder<GimplePipelineResult>(_passes.Length);
-                foreach (var pass in _passes)
-                {
-                    var trimmed = pass.Rewrite();
-                    result.Add(new GimplePipelineResult(trimmed.ControlFlowGraph, trimmed.Functions));
-                }
-                return result.ToImmutable();
-            }
-
-            private void Activate(Pass pass)
-            {
-                if (_active.Add(pass))
-                    pass.MarkRoots();
-            }
-
-            private void Schedule(Pass pass)
-            {
-                if (_pending.Add(pass))
-                    _workList.Enqueue(pass);
-            }
-
-            private void MarkExternal(string name)
+        private void Index(int index, Pass pass)
+        {
+            _passes[index] = pass;
+            pass.IndexMembers();
+            foreach (var name in pass.ExternalDefinitions())
             {
                 if (!_definitions.TryGetValue(name, out var providers))
-                    return;
-                bool found = false;
-                foreach (var pass in providers)
-                {
-                    if (!_active.Contains(pass))
-                        continue;
-                    pass.MarkByName(name);
-                    found = true;
-                }
-                if (!found)
-                {
-                    var pass = providers[0];
-                    Activate(pass);
-                    pass.MarkByName(name);
-                }
+                    _definitions.Add(name, providers = new List<Pass>());
+                providers.Add(pass);
             }
         }
 
-        private sealed class Pass
+        public ImmutableArray<GimpleTree> RunOverTrees()
         {
-            private readonly ControlFlowGraph _controlFlowGraph;
-            private readonly GimpleTree _tree;
-            private readonly FileScopeLinkageMap _fileScopeLinkage;
-            private readonly ImmutableArray<GimpleFunctionAnnotations> _gimpleFunctions;
-            private readonly TrimmingOptions _options;
-            private readonly Action<Pass>? _schedule;
-            private readonly Action<string>? _markExternal;
-            private readonly Dictionary<FunctionSymbol, List<GimpleFunctionDefinition>> _functionsBySymbol = new();
-            private readonly Dictionary<string, List<GimpleFunctionDefinition>> _functionsByName = new(StringComparer.Ordinal);
-            private readonly Dictionary<Symbol, List<GimpleVariableDeclaration>> _globalsBySymbol = new();
-            private readonly Dictionary<string, List<GimpleVariableDeclaration>> _globalsByName = new(StringComparer.Ordinal);
-            private readonly Dictionary<GimpleFunctionDefinition, GimpleFunctionAnnotations> _gimpleByFunction = new();
-            private readonly HashSet<GimpleFunctionDefinition> _liveFunctions = new();
-            private readonly HashSet<GimpleVariableDeclaration> _liveGlobals = new();
-            private readonly Queue<GimpleFunctionDefinition> _functionWorkList = new();
-            private readonly Queue<GimpleVariableDeclaration> _globalWorkList = new();
+            Mark();
+            var result = ImmutableArray.CreateBuilder<GimpleTree>(_passes.Length);
+            foreach (var pass in _passes)
+                result.Add(pass.RewriteTree());
+            return result.ToImmutable();
+        }
 
-            public Pass(
-                ControlFlowGraph controlFlowGraph,
-                ImmutableArray<GimpleFunctionAnnotations> gimpleFunctions,
-                TrimmingOptions options,
-                Action<Pass>? schedule = null,
-                Action<string>? markExternal = null)
+        public ImmutableArray<TrimResult> Run()
+        {
+            Mark();
+            var result = ImmutableArray.CreateBuilder<TrimResult>(_passes.Length);
+            foreach (var pass in _passes)
+                result.Add(pass.Rewrite());
+            return result.ToImmutable();
+        }
+
+        private void Mark()
+        {
+            for (var i = 0; i < _userUnitCount; i++)
             {
-                _controlFlowGraph = controlFlowGraph;
-                _tree = controlFlowGraph.GimpleTree;
-                _fileScopeLinkage = FileScopeLinkageMap.Create(_tree.SemanticModel);
-                _gimpleFunctions = gimpleFunctions.IsDefault ? ImmutableArray<GimpleFunctionAnnotations>.Empty : gimpleFunctions;
-                _options = options;
-                _schedule = schedule;
-                _markExternal = markExternal;
+                Activate(_passes[i]);
+                _passes[i].MarkByName(_entry);
             }
-
-            public TrimResult Run()
+            foreach (var root in _options.RootSymbols)
             {
-                IndexMembers();
-                MarkRoots();
-                ProcessWorkLists();
-                return Rewrite();
-            }
-
-            public void IndexMembers()
-            {
-                foreach (var function in _gimpleFunctions)
-                    _gimpleByFunction[function.InputFunction] = function;
-
-                foreach (var member in _tree.Members)
+                MarkExternal(root);
+                foreach (var pass in _passes)
                 {
-                    if (member is GimpleFunctionDefinition function)
-                    {
-                        if (function.Symbol is not null)
-                        {
-                            Add(_functionsBySymbol, function.Symbol, function);
-                            Add(_functionsByName, function.Symbol.Name, function);
-                        }
-
-                        continue;
-                    }
-
-                    if (member is not GimpleGlobalDeclaration global)
-                        continue;
-
-                    foreach (var declaration in global.Declarators)
-                    {
-                        if (!IsObjectDeclaration(declaration) || declaration.Symbol is null)
-                            continue;
-
-                        Add(_globalsBySymbol, declaration.Symbol, declaration);
-                        Add(_globalsByName, declaration.Symbol.Name, declaration);
-                    }
+                    if (pass.HasInternalDefinition(root))
+                        Activate(pass);
                 }
             }
-
-            public IEnumerable<string> ExternalDefinitions()
+            while (_workList.Count != 0)
             {
-                var names = new HashSet<string>(StringComparer.Ordinal);
-                foreach (var pair in _functionsBySymbol)
-                {
-                    if (!_fileScopeLinkage.IsInternal(pair.Key) && names.Add(pair.Key.Name))
-                        yield return pair.Key.Name;
-                }
-                foreach (var pair in _globalsBySymbol)
-                {
-                    if (_fileScopeLinkage.IsInternal(pair.Key) || names.Contains(pair.Key.Name))
-                        continue;
-                    foreach (var declaration in pair.Value)
-                    {
-                        if (declaration.Initializer is not null || declaration.StorageClass != StorageClass.Extern)
-                        {
-                            names.Add(pair.Key.Name);
-                            yield return pair.Key.Name;
-                            break;
-                        }
-                    }
-                }
+                var pass = _workList.Dequeue();
+                pass.ProcessWorkLists();
+                _pending.Remove(pass);
             }
+        }
 
-            public void MarkRoots()
+        private void Activate(Pass pass)
+        {
+            if (_active.Add(pass))
+                pass.MarkRoots();
+        }
+
+        private void Schedule(Pass pass)
+        {
+            if (_pending.Add(pass))
+                _workList.Enqueue(pass);
+        }
+
+        private void MarkExternal(string name)
+        {
+            if (!_definitions.TryGetValue(name, out var providers))
+                return;
+            bool found = false;
+            foreach (var pass in providers)
             {
-                foreach (var member in _tree.Members)
-                {
-                    if (member is GimpleFunctionDefinition function)
-                    {
-                        if (function.Symbol is null ||
-                            _options.RootSymbols.Contains(function.Symbol.Name) ||
-                            (_options.PreserveExternallyVisibleSymbols && !_fileScopeLinkage.IsInternal(function.Symbol)))
-                        {
-                            MarkFunction(function);
-                        }
-
-                        continue;
-                    }
-
-                    if (member is not GimpleGlobalDeclaration global)
-                        continue;
-
-                    foreach (var declaration in global.Declarators)
-                    {
-                        if (!IsObjectDeclaration(declaration))
-                            continue;
-
-                        if (declaration.Symbol is null)
-                        {
-                            MarkGlobal(declaration);
-                        }
-                        else if (_options.RootSymbols.Contains(declaration.Symbol.Name) ||
-                            (_options.PreserveExternallyVisibleSymbols && !_fileScopeLinkage.IsInternal(declaration.Symbol)))
-                        {
-                            MarkGlobalsByName(declaration.Symbol.Name);
-                        }
-                    }
-                }
-
-                foreach (var root in _options.RootSymbols)
-                    MarkByName(root);
+                if (!_active.Contains(pass))
+                    continue;
+                pass.MarkByName(name);
+                found = true;
             }
-
-            public void ProcessWorkLists()
+            if (!found)
             {
-                var references = new HashSet<Symbol>();
-                var names = new HashSet<string>(StringComparer.Ordinal);
-
-                while (_functionWorkList.Count != 0 || _globalWorkList.Count != 0)
-                {
-                    while (_functionWorkList.Count != 0)
-                    {
-                        var function = _functionWorkList.Dequeue();
-                        references.Clear();
-                        names.Clear();
-                        CollectFunctionReferences(function, references, names);
-                        MarkReferences(references, names);
-                    }
-
-                    while (_globalWorkList.Count != 0)
-                    {
-                        var global = _globalWorkList.Dequeue();
-                        references.Clear();
-                        names.Clear();
-                        if (global.Initializer is not null)
-                            SymbolCollector.Collect(global.Initializer, references, names);
-                        MarkReferences(references, names);
-                    }
-                }
-            }
-
-            private void CollectFunctionReferences(
-                GimpleFunctionDefinition function,
-                HashSet<Symbol> references,
-                HashSet<string> names)
-            {
-                if (_gimpleByFunction.TryGetValue(function, out var gimpleFunction))
-                {
-                    foreach (var block in EnumerateReachableBlocks(gimpleFunction))
-                    {
-                        foreach (var instruction in block.Statements)
-                            SymbolCollector.Collect(instruction.Statement, references, names);
-                    }
-
-                    return;
-                }
-
-                foreach (var block in function.Blocks)
-                {
-                    foreach (var statement in block.Statements)
-                        SymbolCollector.Collect(statement, references, names);
-                }
-            }
-
-            private static IEnumerable<GimpleBlockAnnotations> EnumerateReachableBlocks(GimpleFunctionAnnotations function)
-            {
-                if (function.Blocks.Length == 0)
-                    yield break;
-
-                var byControlFlowBlock = new Dictionary<ControlFlowBlock, GimpleBlockAnnotations>();
-                foreach (var block in function.Blocks)
-                    byControlFlowBlock[block.ControlFlowBlock] = block;
-
-                if (!byControlFlowBlock.TryGetValue(function.ControlFlowFunction.Entry, out var entry))
-                    entry = function.Blocks[0];
-
-                var visited = new HashSet<ControlFlowBlock>();
-                var stack = new Stack<GimpleBlockAnnotations>();
-                visited.Add(entry.ControlFlowBlock);
-                stack.Push(entry);
-
-                while (stack.Count != 0)
-                {
-                    var block = stack.Pop();
-                    yield return block;
-
-                    foreach (var successor in EnumerateOptimizedSuccessors(function.ControlFlowFunction, block))
-                    {
-                        if (successor.IsExit || !visited.Add(successor))
-                            continue;
-
-                        if (byControlFlowBlock.TryGetValue(successor, out var successorBlock))
-                            stack.Push(successorBlock);
-                    }
-                }
-            }
-
-            private static IEnumerable<ControlFlowBlock> EnumerateOptimizedSuccessors(
-                ControlFlowFunction function,
-                GimpleBlockAnnotations block)
-            {
-                var terminator = block.Statements.Length == 0 ? null : block.Statements[^1].Statement;
-                switch (terminator)
-                {
-                    case GimpleGotoStatement gotoStatement:
-                        if (function.TryGetBlock(gotoStatement.Target, out var gotoTarget) && gotoTarget is not null)
-                            yield return gotoTarget;
-                        yield break;
-
-                    case GimpleCondStatement conditional:
-                        if (function.TryGetBlock(conditional.WhenTrue, out var trueTarget) && trueTarget is not null)
-                            yield return trueTarget;
-                        if (function.TryGetBlock(conditional.WhenFalse, out var falseTarget) && falseTarget is not null && !ReferenceEquals(falseTarget, trueTarget))
-                            yield return falseTarget;
-                        yield break;
-
-                    case GimpleSwitchStatement switchStatement:
-                        var seen = new HashSet<ControlFlowBlock>();
-                        foreach (var switchCase in switchStatement.Cases)
-                        {
-                            if (function.TryGetBlock(switchCase.Target, out var caseTarget) && caseTarget is not null && seen.Add(caseTarget))
-                                yield return caseTarget;
-                        }
-
-                        if (function.TryGetBlock(switchStatement.DefaultLabel, out var defaultTarget) && defaultTarget is not null && seen.Add(defaultTarget))
-                            yield return defaultTarget;
-                        yield break;
-
-                    case GimpleReturnStatement:
-                        yield break;
-                }
-
-                foreach (var edge in block.ControlFlowBlock.Successors)
-                {
-                    if (!edge.Target.IsExit)
-                        yield return edge.Target;
-                }
-            }
-
-            private void MarkReferences(HashSet<Symbol> references, HashSet<string> names)
-            {
-                foreach (var symbol in references)
-                {
-                    MarkSymbol(symbol);
-                    if (_markExternal is not null && !_fileScopeLinkage.IsInternal(symbol) &&
-                        (symbol is FunctionSymbol or VariableSymbol { StorageClass: StorageClass.Extern } ||
-                         _globalsBySymbol.ContainsKey(symbol)))
-                        _markExternal(symbol.Name);
-                }
-                foreach (var name in names)
-                {
-                    MarkByName(name);
-                    if (_markExternal is not null && !HasInternalDefinition(name))
-                        _markExternal(name);
-                }
-            }
-
-            public bool HasInternalDefinition(string name)
-            {
-                if (_functionsByName.TryGetValue(name, out var functions))
-                {
-                    foreach (var function in functions)
-                    {
-                        if (_fileScopeLinkage.IsInternal(function.Symbol!))
-                            return true;
-                    }
-                }
-                if (_globalsByName.TryGetValue(name, out var globals))
-                {
-                    foreach (var global in globals)
-                    {
-                        if (_fileScopeLinkage.IsInternal(global.Symbol!))
-                            return true;
-                    }
-                }
-                return false;
-            }
-
-            private void MarkSymbol(Symbol symbol)
-            {
-                if (symbol is FunctionSymbol function)
-                {
-                    if (_functionsBySymbol.TryGetValue(function, out var definitions))
-                    {
-                        foreach (var definition in definitions)
-                            MarkFunction(definition);
-                    }
-                    else
-                    {
-                        MarkByName(function.Name);
-                    }
-
-                    return;
-                }
-
-                if (_globalsBySymbol.TryGetValue(symbol, out var globals))
-                {
-                    foreach (var global in globals)
-                        MarkGlobal(global);
-                    MarkGlobalsByName(symbol.Name);
-                    return;
-                }
-
-                if (symbol is VariableSymbol { StorageClass: StorageClass.Extern })
-                    MarkGlobalsByName(symbol.Name);
-            }
-
-            public void MarkByName(string name)
-            {
-                if (_functionsByName.TryGetValue(name, out var functions))
-                {
-                    foreach (var function in functions)
-                        MarkFunction(function);
-                }
-
-                MarkGlobalsByName(name);
-            }
-
-            private void MarkGlobalsByName(string name)
-            {
-                if (!_globalsByName.TryGetValue(name, out var globals))
-                    return;
-
-                foreach (var global in globals)
-                    MarkGlobal(global);
-            }
-
-            private void MarkFunction(GimpleFunctionDefinition function)
-            {
-                if (_liveFunctions.Add(function))
-                {
-                    _functionWorkList.Enqueue(function);
-                    _schedule?.Invoke(this);
-                }
-            }
-
-            private void MarkGlobal(GimpleVariableDeclaration global)
-            {
-                if (_liveGlobals.Add(global))
-                {
-                    _globalWorkList.Enqueue(global);
-                    _schedule?.Invoke(this);
-                }
-            }
-
-            public TrimResult Rewrite()
-            {
-                var members = ImmutableArray.CreateBuilder<GimpleNode>(_tree.Members.Length);
-                foreach (var member in _tree.Members)
-                {
-                    switch (member)
-                    {
-                        case GimpleFunctionDefinition function when _liveFunctions.Contains(function):
-                            members.Add(function);
-                            break;
-
-                        case GimpleFunctionDefinition:
-                            break;
-
-                        case GimpleGlobalDeclaration global:
-                            var declarators = ImmutableArray.CreateBuilder<GimpleVariableDeclaration>(global.Declarators.Length);
-                            foreach (var declaration in global.Declarators)
-                            {
-                                if (!IsObjectDeclaration(declaration) ||
-                                    _liveGlobals.Contains(declaration))
-                                {
-                                    declarators.Add(declaration);
-                                }
-                            }
-
-                            if (declarators.Count != 0)
-                            {
-                                members.Add(declarators.Count == global.Declarators.Length
-                                    ? global
-                                    : new GimpleGlobalDeclaration(global.Syntax, global.StorageClass, declarators.ToImmutable()));
-                            }
-                            break;
-
-                        default:
-                            members.Add(member);
-                            break;
-                    }
-                }
-
-                var functions = ImmutableArray.CreateBuilder<GimpleFunctionAnnotations>(_gimpleFunctions.Length);
-                foreach (var function in _gimpleFunctions)
-                {
-                    if (_liveFunctions.Contains(function.InputFunction))
-                        functions.Add(function);
-                }
-
-                var tree = new GimpleTree(
-                    _tree.SemanticModel,
-                    members.ToImmutable(),
-                    _tree.Diagnostics,
-                    _tree.HasInliningApplied);
-                var functionArray = functions.ToImmutable();
-                var controlFlowFunctions = ImmutableArray.CreateBuilder<ControlFlowFunction>(functionArray.Length);
-                foreach (var function in functionArray)
-                    controlFlowFunctions.Add(function.ControlFlowFunction);
-                var controlFlowGraph = _controlFlowGraph.WithTrimmedMembers(tree, controlFlowFunctions.ToImmutable());
-
-                return new TrimResult(controlFlowGraph, functionArray);
-            }
-
-            private static bool IsObjectDeclaration(GimpleVariableDeclaration declaration)
-                => declaration.StorageClass != StorageClass.Typedef &&
-                   declaration.Symbol is not TypeAliasSymbol &&
-                   declaration.Symbol is not FunctionSymbol &&
-                   declaration.Type.Type is not FunctionType;
-
-            private static void Add<TKey, TValue>(
-                Dictionary<TKey, List<TValue>> dictionary,
-                TKey key,
-                TValue value)
-                where TKey : notnull
-            {
-                if (!dictionary.TryGetValue(key, out var values))
-                {
-                    values = new List<TValue>();
-                    dictionary.Add(key, values);
-                }
-
-                values.Add(value);
+                var pass = providers[0];
+                Activate(pass);
+                pass.MarkByName(name);
             }
         }
     }
 
-    internal static class SymbolCollector
+    private sealed class Pass
     {
-        public static void Collect(
-            GimpleStatement statement,
-            HashSet<Symbol> symbols,
-            HashSet<string>? names = null)
+        private readonly ControlFlowGraph? _controlFlowGraph;
+        private readonly GimpleTree _tree;
+        private readonly FileScopeLinkageMap _fileScopeLinkage;
+        private readonly ImmutableArray<GimpleFunctionAnnotations> _gimpleFunctions;
+        private readonly TrimmingOptions _options;
+        private readonly Action<Pass>? _schedule;
+        private readonly Action<string>? _markExternal;
+        private readonly Dictionary<FunctionSymbol, List<GimpleFunctionDefinition>> _functionsBySymbol = new();
+        private readonly Dictionary<string, List<GimpleFunctionDefinition>> _functionsByName = new(StringComparer.Ordinal);
+        private readonly Dictionary<Symbol, List<GimpleVariableDeclaration>> _globalsBySymbol = new();
+        private readonly Dictionary<string, List<GimpleVariableDeclaration>> _globalsByName = new(StringComparer.Ordinal);
+        private readonly Dictionary<GimpleFunctionDefinition, GimpleFunctionAnnotations> _gimpleByFunction = new();
+        private readonly HashSet<GimpleFunctionDefinition> _liveFunctions = new();
+        private readonly HashSet<GimpleVariableDeclaration> _liveGlobals = new();
+        private readonly Queue<GimpleFunctionDefinition> _functionWorkList = new();
+        private readonly Queue<GimpleVariableDeclaration> _globalWorkList = new();
+
+        public Pass(
+            GimpleTree tree,
+            TrimmingOptions options,
+            Action<Pass>? schedule = null,
+            Action<string>? markExternal = null)
         {
-            switch (statement)
-            {
-                case GimpleDeclarationStatement declaration when declaration.Declaration.Initializer is not null:
-                    Collect(declaration.Declaration.Initializer, symbols, names);
-                    break;
-
-                case GimpleAssignStatement assign:
-                    Collect(assign.Lhs, symbols, names);
-                    foreach (var operand in assign.Operands)
-                        Collect(operand, symbols, names);
-                    break;
-
-                case GimpleCallStatement call:
-                    if (call.Lhs is not null)
-                        Collect(call.Lhs, symbols, names);
-                    Collect(call.Function, symbols, names);
-                    foreach (var argument in call.Arguments)
-                        Collect(argument, symbols, names);
-                    break;
-
-                case GimpleCondStatement conditional:
-                    Collect(conditional.Lhs, symbols, names);
-                    Collect(conditional.Rhs, symbols, names);
-                    break;
-
-                case GimpleSwitchStatement switchStatement:
-                    Collect(switchStatement.Expression, symbols, names);
-                    break;
-
-                case GimpleReturnStatement returnStatement when returnStatement.Expression is not null:
-                    Collect(returnStatement.Expression, symbols, names);
-                    break;
-
-                case GimpleAsmStatement asmStatement:
-                    foreach (var output in asmStatement.Outputs)
-                    {
-                        if (output.Target is not null)
-                            Collect(output.Target, symbols, names);
-                        if (output.Value is not null)
-                            Collect(output.Value, symbols, names);
-                    }
-
-                    foreach (var input in asmStatement.Inputs)
-                    {
-                        if (input.Target is not null)
-                            Collect(input.Target, symbols, names);
-                        if (input.Value is not null)
-                            Collect(input.Value, symbols, names);
-                    }
-
-                    if (names is not null)
-                        CollectIdentifiers(asmStatement.Text, names);
-                    break;
-            }
+            _controlFlowGraph = null;
+            _tree = tree;
+            _fileScopeLinkage = FileScopeLinkageMap.Create(tree.SemanticModel);
+            _gimpleFunctions = ImmutableArray<GimpleFunctionAnnotations>.Empty;
+            _options = options;
+            _schedule = schedule;
+            _markExternal = markExternal;
         }
 
-        public static void Collect(
-            GimpleInitializer initializer,
-            HashSet<Symbol> symbols,
-            HashSet<string>? names = null)
+        public Pass(
+            ControlFlowGraph controlFlowGraph,
+            ImmutableArray<GimpleFunctionAnnotations> gimpleFunctions,
+            TrimmingOptions options,
+            Action<Pass>? schedule = null,
+            Action<string>? markExternal = null)
         {
-            switch (initializer)
-            {
-                case GimpleExpressionInitializer expression:
-                    Collect(expression.Expression, symbols, names);
-                    break;
-
-                case GimpleInitializerList list:
-                    foreach (var item in list.Items)
-                        Collect(item.Initializer, symbols, names);
-                    break;
-            }
+            _controlFlowGraph = controlFlowGraph;
+            _tree = controlFlowGraph.GimpleTree;
+            _fileScopeLinkage = FileScopeLinkageMap.Create(_tree.SemanticModel);
+            _gimpleFunctions = gimpleFunctions.IsDefault ? ImmutableArray<GimpleFunctionAnnotations>.Empty : gimpleFunctions;
+            _options = options;
+            _schedule = schedule;
+            _markExternal = markExternal;
         }
 
-        public static void Collect(
-            GimpleValue value,
-            HashSet<Symbol> symbols,
-            HashSet<string>? names = null)
+        public TrimResult Run()
         {
-            switch (value)
-            {
-                case GimpleName { Variable.Symbol: not null } name:
-                    symbols.Add(name.Variable.Symbol);
-                    break;
-
-                case GimpleSymbolValue symbolValue:
-                    symbols.Add(symbolValue.Symbol);
-                    break;
-
-                case GimpleUnaryExpression unary:
-                    Collect(unary.Operand, symbols, names);
-                    break;
-
-                case GimpleBinaryExpression binary:
-                    Collect(binary.Left, symbols, names);
-                    Collect(binary.Right, symbols, names);
-                    break;
-
-                case GimpleConversionExpression conversion:
-                    Collect(conversion.Operand, symbols, names);
-                    break;
-
-                case GimpleCastExpression cast:
-                    Collect(cast.Operand, symbols, names);
-                    break;
-
-                case GimpleAddressOfExpression addressOf:
-                    Collect(addressOf.Target, symbols, names);
-                    break;
-
-                case GimpleIndirectExpression indirect:
-                    Collect(indirect.Address, symbols, names);
-                    break;
-
-                case GimpleElementAccessExpression elementAccess:
-                    Collect(elementAccess.Expression, symbols, names);
-                    if (elementAccess.Index is not null)
-                        Collect(elementAccess.Index, symbols, names);
-                    break;
-
-                case GimpleMemberAccessExpression memberAccess:
-                    Collect(memberAccess.Expression, symbols, names);
-                    break;
-            }
+            IndexMembers();
+            MarkRoots();
+            ProcessWorkLists();
+            return Rewrite();
         }
 
-        private static void CollectIdentifiers(string text, HashSet<string> names)
+        public void IndexMembers()
         {
-            var index = 0;
-            while (index < text.Length)
+            foreach (var function in _gimpleFunctions)
+                _gimpleByFunction[function.InputFunction] = function;
+
+            foreach (var member in _tree.Members)
             {
-                if (text[index] != '_' && !char.IsLetter(text[index]))
+                if (member is GimpleFunctionDefinition function)
                 {
-                    index++;
+                    if (function.Symbol is not null)
+                    {
+                        Add(_functionsBySymbol, function.Symbol, function);
+                        Add(_functionsByName, function.Symbol.Name, function);
+                    }
+
                     continue;
                 }
 
-                var start = index++;
-                while (index < text.Length && (text[index] == '_' || char.IsLetterOrDigit(text[index])))
-                    index++;
-                names.Add(text.Substring(start, index - start));
+                if (member is not GimpleGlobalDeclaration global)
+                    continue;
+
+                foreach (var declaration in global.Declarators)
+                {
+                    if (!IsObjectDeclaration(declaration) || declaration.Symbol is null)
+                        continue;
+
+                    Add(_globalsBySymbol, declaration.Symbol, declaration);
+                    Add(_globalsByName, declaration.Symbol.Name, declaration);
+                }
             }
+        }
+
+        public IEnumerable<string> ExternalDefinitions()
+        {
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var pair in _functionsBySymbol)
+            {
+                if (!_fileScopeLinkage.IsInternal(pair.Key) && names.Add(pair.Key.Name))
+                    yield return pair.Key.Name;
+            }
+            foreach (var pair in _globalsBySymbol)
+            {
+                if (_fileScopeLinkage.IsInternal(pair.Key) || names.Contains(pair.Key.Name))
+                    continue;
+                foreach (var declaration in pair.Value)
+                {
+                    if (declaration.Initializer is not null || declaration.StorageClass != StorageClass.Extern)
+                    {
+                        names.Add(pair.Key.Name);
+                        yield return pair.Key.Name;
+                        break;
+                    }
+                }
+            }
+        }
+
+        public void MarkRoots()
+        {
+            foreach (var member in _tree.Members)
+            {
+                if (member is GimpleFunctionDefinition function)
+                {
+                    if (function.Symbol is null ||
+                        _options.RootSymbols.Contains(function.Symbol.Name) ||
+                        (_options.PreserveExternallyVisibleSymbols && !_fileScopeLinkage.IsInternal(function.Symbol)))
+                    {
+                        MarkFunction(function);
+                    }
+
+                    continue;
+                }
+
+                if (member is not GimpleGlobalDeclaration global)
+                    continue;
+
+                foreach (var declaration in global.Declarators)
+                {
+                    if (!IsObjectDeclaration(declaration))
+                        continue;
+
+                    if (declaration.Symbol is null)
+                    {
+                        MarkGlobal(declaration);
+                    }
+                    else if (_options.RootSymbols.Contains(declaration.Symbol.Name) ||
+                        (_options.PreserveExternallyVisibleSymbols && !_fileScopeLinkage.IsInternal(declaration.Symbol)))
+                    {
+                        MarkGlobalsByName(declaration.Symbol.Name);
+                    }
+                }
+            }
+
+            foreach (var root in _options.RootSymbols)
+                MarkByName(root);
+        }
+
+        public void ProcessWorkLists()
+        {
+            var references = new HashSet<Symbol>();
+            var names = new HashSet<string>(StringComparer.Ordinal);
+
+            while (_functionWorkList.Count != 0 || _globalWorkList.Count != 0)
+            {
+                while (_functionWorkList.Count != 0)
+                {
+                    var function = _functionWorkList.Dequeue();
+                    references.Clear();
+                    names.Clear();
+                    CollectFunctionReferences(function, references, names);
+                    MarkReferences(references, names);
+                }
+
+                while (_globalWorkList.Count != 0)
+                {
+                    var global = _globalWorkList.Dequeue();
+                    references.Clear();
+                    names.Clear();
+                    if (global.Initializer is not null)
+                        SymbolCollector.Collect(global.Initializer, references, names);
+                    MarkReferences(references, names);
+                }
+            }
+        }
+
+        private void CollectFunctionReferences(
+            GimpleFunctionDefinition function,
+            HashSet<Symbol> references,
+            HashSet<string> names)
+        {
+            if (_gimpleByFunction.TryGetValue(function, out var gimpleFunction))
+            {
+                foreach (var block in EnumerateReachableBlocks(gimpleFunction))
+                {
+                    foreach (var instruction in block.Statements)
+                        SymbolCollector.Collect(instruction.Statement, references, names);
+                }
+
+                return;
+            }
+
+            foreach (var block in function.Blocks)
+            {
+                foreach (var statement in block.Statements)
+                    SymbolCollector.Collect(statement, references, names);
+            }
+        }
+
+        private static IEnumerable<GimpleBlockAnnotations> EnumerateReachableBlocks(GimpleFunctionAnnotations function)
+        {
+            if (function.Blocks.Length == 0)
+                yield break;
+
+            var byControlFlowBlock = new Dictionary<ControlFlowBlock, GimpleBlockAnnotations>();
+            foreach (var block in function.Blocks)
+                byControlFlowBlock[block.ControlFlowBlock] = block;
+
+            if (!byControlFlowBlock.TryGetValue(function.ControlFlowFunction.Entry, out var entry))
+                entry = function.Blocks[0];
+
+            var visited = new HashSet<ControlFlowBlock>();
+            var stack = new Stack<GimpleBlockAnnotations>();
+            visited.Add(entry.ControlFlowBlock);
+            stack.Push(entry);
+
+            while (stack.Count != 0)
+            {
+                var block = stack.Pop();
+                yield return block;
+
+                foreach (var successor in EnumerateOptimizedSuccessors(function.ControlFlowFunction, block))
+                {
+                    if (successor.IsExit || !visited.Add(successor))
+                        continue;
+
+                    if (byControlFlowBlock.TryGetValue(successor, out var successorBlock))
+                        stack.Push(successorBlock);
+                }
+            }
+        }
+
+        private static IEnumerable<ControlFlowBlock> EnumerateOptimizedSuccessors(
+            ControlFlowFunction function,
+            GimpleBlockAnnotations block)
+        {
+            var terminator = block.Statements.Length == 0 ? null : block.Statements[^1].Statement;
+            switch (terminator)
+            {
+                case GimpleGotoStatement gotoStatement:
+                    if (function.TryGetBlock(gotoStatement.Target, out var gotoTarget) && gotoTarget is not null)
+                        yield return gotoTarget;
+                    yield break;
+
+                case GimpleCondStatement conditional:
+                    if (function.TryGetBlock(conditional.WhenTrue, out var trueTarget) && trueTarget is not null)
+                        yield return trueTarget;
+                    if (function.TryGetBlock(conditional.WhenFalse, out var falseTarget) && falseTarget is not null && !ReferenceEquals(falseTarget, trueTarget))
+                        yield return falseTarget;
+                    yield break;
+
+                case GimpleSwitchStatement switchStatement:
+                    var seen = new HashSet<ControlFlowBlock>();
+                    foreach (var switchCase in switchStatement.Cases)
+                    {
+                        if (function.TryGetBlock(switchCase.Target, out var caseTarget) && caseTarget is not null && seen.Add(caseTarget))
+                            yield return caseTarget;
+                    }
+
+                    if (function.TryGetBlock(switchStatement.DefaultLabel, out var defaultTarget) && defaultTarget is not null && seen.Add(defaultTarget))
+                        yield return defaultTarget;
+                    yield break;
+
+                case GimpleReturnStatement:
+                    yield break;
+            }
+
+            foreach (var edge in block.ControlFlowBlock.Successors)
+            {
+                if (!edge.Target.IsExit)
+                    yield return edge.Target;
+            }
+        }
+
+        private void MarkReferences(HashSet<Symbol> references, HashSet<string> names)
+        {
+            foreach (var symbol in references)
+            {
+                MarkSymbol(symbol);
+                if (_markExternal is not null && !_fileScopeLinkage.IsInternal(symbol) &&
+                    (symbol is FunctionSymbol or VariableSymbol { StorageClass: StorageClass.Extern } ||
+                     _globalsBySymbol.ContainsKey(symbol)))
+                    _markExternal(symbol.Name);
+            }
+            foreach (var name in names)
+            {
+                MarkByName(name);
+                if (_markExternal is not null && !HasInternalDefinition(name))
+                    _markExternal(name);
+            }
+        }
+
+        public bool HasInternalDefinition(string name)
+        {
+            if (_functionsByName.TryGetValue(name, out var functions))
+            {
+                foreach (var function in functions)
+                {
+                    if (_fileScopeLinkage.IsInternal(function.Symbol!))
+                        return true;
+                }
+            }
+            if (_globalsByName.TryGetValue(name, out var globals))
+            {
+                foreach (var global in globals)
+                {
+                    if (_fileScopeLinkage.IsInternal(global.Symbol!))
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        private void MarkSymbol(Symbol symbol)
+        {
+            if (symbol is FunctionSymbol function)
+            {
+                if (_functionsBySymbol.TryGetValue(function, out var definitions))
+                {
+                    foreach (var definition in definitions)
+                        MarkFunction(definition);
+                }
+                else
+                {
+                    MarkByName(function.Name);
+                }
+
+                return;
+            }
+
+            if (_globalsBySymbol.TryGetValue(symbol, out var globals))
+            {
+                foreach (var global in globals)
+                    MarkGlobal(global);
+                MarkGlobalsByName(symbol.Name);
+                return;
+            }
+
+            if (symbol is VariableSymbol { StorageClass: StorageClass.Extern })
+                MarkGlobalsByName(symbol.Name);
+        }
+
+        public void MarkByName(string name)
+        {
+            if (_functionsByName.TryGetValue(name, out var functions))
+            {
+                foreach (var function in functions)
+                    MarkFunction(function);
+            }
+
+            MarkGlobalsByName(name);
+        }
+
+        private void MarkGlobalsByName(string name)
+        {
+            if (!_globalsByName.TryGetValue(name, out var globals))
+                return;
+
+            foreach (var global in globals)
+                MarkGlobal(global);
+        }
+
+        private void MarkFunction(GimpleFunctionDefinition function)
+        {
+            if (_liveFunctions.Add(function))
+            {
+                _functionWorkList.Enqueue(function);
+                _schedule?.Invoke(this);
+            }
+        }
+
+        private void MarkGlobal(GimpleVariableDeclaration global)
+        {
+            if (_liveGlobals.Add(global))
+            {
+                _globalWorkList.Enqueue(global);
+                _schedule?.Invoke(this);
+            }
+        }
+
+        public GimpleTree RewriteTree()
+        {
+            var members = ImmutableArray.CreateBuilder<GimpleNode>(_tree.Members.Length);
+            foreach (var member in _tree.Members)
+            {
+                switch (member)
+                {
+                    case GimpleFunctionDefinition function when _liveFunctions.Contains(function):
+                        members.Add(function);
+                        break;
+
+                    case GimpleFunctionDefinition:
+                        break;
+
+                    case GimpleGlobalDeclaration global:
+                        var declarators = ImmutableArray.CreateBuilder<GimpleVariableDeclaration>(global.Declarators.Length);
+                        foreach (var declaration in global.Declarators)
+                        {
+                            if (!IsObjectDeclaration(declaration) ||
+                                _liveGlobals.Contains(declaration))
+                            {
+                                declarators.Add(declaration);
+                            }
+                        }
+
+                        if (declarators.Count != 0)
+                        {
+                            members.Add(declarators.Count == global.Declarators.Length
+                                ? global
+                                : new GimpleGlobalDeclaration(global.Syntax, global.StorageClass, declarators.ToImmutable()));
+                        }
+                        break;
+
+                    default:
+                        members.Add(member);
+                        break;
+                }
+            }
+
+            var functions = ImmutableArray.CreateBuilder<GimpleFunctionAnnotations>(_gimpleFunctions.Length);
+            foreach (var function in _gimpleFunctions)
+            {
+                if (_liveFunctions.Contains(function.InputFunction))
+                    functions.Add(function);
+            }
+
+            var tree = new GimpleTree(
+                _tree.SemanticModel,
+                members.ToImmutable(),
+                _tree.Diagnostics,
+                _tree.HasInliningApplied);
+            return tree;
+        }
+
+        public TrimResult Rewrite()
+        {
+            var tree = RewriteTree();
+            var functions = ImmutableArray.CreateBuilder<GimpleFunctionAnnotations>(_gimpleFunctions.Length);
+            foreach (var function in _gimpleFunctions)
+            {
+                if (_liveFunctions.Contains(function.InputFunction))
+                    functions.Add(function);
+            }
+
+            var functionArray = functions.ToImmutable();
+            var controlFlowFunctions = ImmutableArray.CreateBuilder<ControlFlowFunction>(functionArray.Length);
+            foreach (var function in functionArray)
+                controlFlowFunctions.Add(function.ControlFlowFunction);
+
+            return new TrimResult(
+                _controlFlowGraph!.WithTrimmedMembers(tree, controlFlowFunctions.ToImmutable()),
+                functionArray);
+        }
+
+        private static bool IsObjectDeclaration(GimpleVariableDeclaration declaration)
+            => declaration.StorageClass != StorageClass.Typedef &&
+               declaration.Symbol is not TypeAliasSymbol &&
+               declaration.Symbol is not FunctionSymbol &&
+               declaration.Type.Type is not FunctionType;
+
+        private static void Add<TKey, TValue>(
+            Dictionary<TKey, List<TValue>> dictionary,
+            TKey key,
+            TValue value)
+            where TKey : notnull
+        {
+            if (!dictionary.TryGetValue(key, out var values))
+            {
+                values = new List<TValue>();
+                dictionary.Add(key, values);
+            }
+
+            values.Add(value);
+        }
+    }
+}
+
+internal static class SymbolCollector
+{
+    public static void Collect(
+        GimpleStatement statement,
+        HashSet<Symbol> symbols,
+        HashSet<string>? names = null)
+    {
+        switch (statement)
+        {
+            case GimpleDeclarationStatement declaration when declaration.Declaration.Initializer is not null:
+                Collect(declaration.Declaration.Initializer, symbols, names);
+                break;
+
+            case GimpleAssignStatement assign:
+                Collect(assign.Lhs, symbols, names);
+                foreach (var operand in assign.Operands)
+                    Collect(operand, symbols, names);
+                break;
+
+            case GimpleCallStatement call:
+                if (call.Lhs is not null)
+                    Collect(call.Lhs, symbols, names);
+                Collect(call.Function, symbols, names);
+                foreach (var argument in call.Arguments)
+                    Collect(argument, symbols, names);
+                break;
+
+            case GimpleCondStatement conditional:
+                Collect(conditional.Lhs, symbols, names);
+                Collect(conditional.Rhs, symbols, names);
+                break;
+
+            case GimpleSwitchStatement switchStatement:
+                Collect(switchStatement.Expression, symbols, names);
+                break;
+
+            case GimpleReturnStatement returnStatement when returnStatement.Expression is not null:
+                Collect(returnStatement.Expression, symbols, names);
+                break;
+
+            case GimpleAsmStatement asmStatement:
+                foreach (var output in asmStatement.Outputs)
+                {
+                    if (output.Target is not null)
+                        Collect(output.Target, symbols, names);
+                    if (output.Value is not null)
+                        Collect(output.Value, symbols, names);
+                }
+
+                foreach (var input in asmStatement.Inputs)
+                {
+                    if (input.Target is not null)
+                        Collect(input.Target, symbols, names);
+                    if (input.Value is not null)
+                        Collect(input.Value, symbols, names);
+                }
+
+                if (names is not null)
+                    CollectIdentifiers(asmStatement.Text, names);
+                break;
+        }
+    }
+
+    public static void Collect(
+        GimpleInitializer initializer,
+        HashSet<Symbol> symbols,
+        HashSet<string>? names = null)
+    {
+        switch (initializer)
+        {
+            case GimpleExpressionInitializer expression:
+                Collect(expression.Expression, symbols, names);
+                break;
+
+            case GimpleInitializerList list:
+                foreach (var item in list.Items)
+                    Collect(item.Initializer, symbols, names);
+                break;
+        }
+    }
+
+    public static void Collect(
+        GimpleValue value,
+        HashSet<Symbol> symbols,
+        HashSet<string>? names = null)
+    {
+        switch (value)
+        {
+            case GimpleName { Variable.Symbol: not null } name:
+                symbols.Add(name.Variable.Symbol);
+                break;
+
+            case GimpleSymbolValue symbolValue:
+                symbols.Add(symbolValue.Symbol);
+                break;
+
+            case GimpleUnaryExpression unary:
+                Collect(unary.Operand, symbols, names);
+                break;
+
+            case GimpleBinaryExpression binary:
+                Collect(binary.Left, symbols, names);
+                Collect(binary.Right, symbols, names);
+                break;
+
+            case GimpleConversionExpression conversion:
+                Collect(conversion.Operand, symbols, names);
+                break;
+
+            case GimpleCastExpression cast:
+                Collect(cast.Operand, symbols, names);
+                break;
+
+            case GimpleAddressOfExpression addressOf:
+                Collect(addressOf.Target, symbols, names);
+                break;
+
+            case GimpleIndirectExpression indirect:
+                Collect(indirect.Address, symbols, names);
+                break;
+
+            case GimpleElementAccessExpression elementAccess:
+                Collect(elementAccess.Expression, symbols, names);
+                if (elementAccess.Index is not null)
+                    Collect(elementAccess.Index, symbols, names);
+                break;
+
+            case GimpleMemberAccessExpression memberAccess:
+                Collect(memberAccess.Expression, symbols, names);
+                break;
+        }
+    }
+
+    private static void CollectIdentifiers(string text, HashSet<string> names)
+    {
+        var index = 0;
+        while (index < text.Length)
+        {
+            if (text[index] != '_' && !char.IsLetter(text[index]))
+            {
+                index++;
+                continue;
+            }
+
+            var start = index++;
+            while (index < text.Length && (text[index] == '_' || char.IsLetterOrDigit(text[index])))
+                index++;
+            names.Add(text.Substring(start, index - start));
         }
     }
 }

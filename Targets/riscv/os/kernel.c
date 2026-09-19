@@ -6,7 +6,6 @@ typedef signed long long s64;
 typedef unsigned long usize;
 
 #if __riscv_vector
-/* Declared here rather than included: the kernel is freestanding */
 typedef __rvv_uint8m8_t vuint8m8_t;
 u64 __riscv_vsetvl_e8m8(u64 avl);
 vuint8m8_t __riscv_vle8_v_u8m8(const u8* rs1, u64 vl);
@@ -57,6 +56,7 @@ u64 __riscv_vsetvlmax_e8m8(void);
 #define VIRTIO_QUEUE_SIZE 8u
 #define SECTOR_SIZE 512u
 #define FAT_EOC 0x0ffffff8u
+#define FAT_END 0x0fffffffu
 #define FAT_READ_ERROR 0xffffffffu
 #define SYS_GETCWD 17ul
 #define SYS_IOCTL 29ul
@@ -123,8 +123,19 @@ u64 __riscv_vsetvlmax_e8m8(void);
 #define VFS_NODE_FAT_FILE 4u
 #define VFS_NODE_ROOT_DIR 5u
 #define VFS_NODE_DEV_DIR 6u
+#define VFS_NODE_FAT_DIR 7u
+#define FAT_ATTRIBUTE_DIRECTORY 16u
 #define O_ACCMODE 3ul
+#define O_RDONLY 0ul
 #define O_WRONLY 1ul
+#define O_CREAT 64ul
+#define O_EXCL 128ul
+#define O_TRUNC 512ul
+#define O_APPEND 1024ul
+#define SYS_UNLINKAT 35ul
+#define SYS_MKDIRAT 34ul
+#define SYS_CHDIR 49ul
+#define AT_REMOVEDIR 0x200ul
 #define O_RDWR 2ul
 #define O_NONBLOCK 2048ul
 #define AT_FDCWD ((u64)-100l)
@@ -171,6 +182,10 @@ u64 __riscv_vsetvlmax_e8m8(void);
 #define SSTATUS_VS 0x600ul
 #define WNOHANG 1ul
 #define SIGCHLD 17ul
+#define SIGILL 4ul
+#define SIGTRAP 5ul
+#define SIGBUS 7ul
+#define SIGSEGV 11ul
 #define CLONE_VM 0x00000100ul
 #define CLONE_FS 0x00000200ul
 #define CLONE_FILES 0x00000400ul
@@ -216,6 +231,8 @@ struct fat32_volume
     u32 root_cluster;
     u32 sectors_per_cluster;
     u32 fat_sectors;
+    u32 fat_count;
+    u32 cluster_count;
 };
 
 struct elf_image
@@ -233,8 +250,10 @@ struct elf_image
 struct exec_arguments
 {
     u32 count;
+    u32 environment_count;
     u32 bytes_used;
     u32 offsets[MAX_EXEC_ARGS];
+    u32 environment_offsets[MAX_EXEC_ARGS];
     char bytes[MAX_EXEC_ARG_BYTES];
 };
 
@@ -267,6 +286,8 @@ struct vfs_node
     u32 first_cluster;
     u32 size;
     u32 mode;
+    u32 entry_lba;
+    u32 entry_offset;
 };
 
 struct file_descriptor
@@ -275,6 +296,16 @@ struct file_descriptor
     u32 flags;
     u64 offset;
     struct vfs_node node;
+};
+
+struct path_result
+{
+    struct vfs_node parent;
+    struct vfs_node node;
+    char leaf[11];
+    u32 has_parent;
+    u32 has_node;
+    u32 leaf_valid;
 };
 
 struct vm_region
@@ -293,8 +324,11 @@ struct process
     u32 pid;
     u32 ppid;
     u32 exit_status;
+    u32 exit_signal;
     u32 time_slice;
     u32 vfork_parent_pid;
+    struct vfs_node cwd;
+    char cwd_path[PATH_BUFFER_SIZE];
     u64 root_page_table;
     u64 brk;
     u64 brk_min;
@@ -328,7 +362,6 @@ static u8 sector_buffer[SECTOR_SIZE];
 static u8 fat_buffer[SECTOR_SIZE];
 static u8 dir_buffer[SECTOR_SIZE];
 
-/* A directory record is built somewhere else, so that it does not overwrite the sector the walk is reading */
 static u8 dirent_buffer[64];
 static u32 fat_buffer_lba;
 static u32 dir_buffer_lba;
@@ -342,7 +375,7 @@ static u32 current_task_slot;
 static u32 next_pid;
 static u64 scheduler_ticks;
 static int console_ready;
-static const char init_path[] = "/init.elf";
+static const char init_path[] = "/init";
 
 static int user_copy_to_writable(u64 root, u64 destination, const void* source, u64 count);
 static int copy_user_string(u64 source, char* destination, u32 capacity);
@@ -351,7 +384,7 @@ static int fat_read_path_to_memory(const char* path, void* destination, u32 max_
 static int fat_read_at(struct vfs_node* node, u64 offset, void* destination, u32 count, u32* read_count);
 static int load_elf64(const u8* image, u32 image_size, u64 root, struct elf_image* loaded);
 static int load_process_image(u64 root, const u8* image, u32 image_size, struct elf_image* loaded);
-static s64 capture_exec_arguments(u64 argv, const char* fallback, struct exec_arguments* arguments);
+static s64 capture_exec_arguments(u64 argv, u64 envp, const char* fallback, struct exec_arguments* arguments);
 static int make_kernel_arguments(const char* path, struct exec_arguments* arguments);
 static int build_user_stack(u64 root, struct elf_image* image, struct exec_arguments* arguments, u64* out_stack);
 
@@ -478,7 +511,7 @@ static void uart_putchar(int ch)
         : "memory");
 }
 
-/* What a program writes reaches the screen as well; what the kernel says stays on the serial line */
+// What a program writes reaches the screen as well; what the kernel says stays on the serial line
 static void uart_write_buffer(const u8* data, u64 count)
 {
     u64 base = boot_device.uart_base;
@@ -705,7 +738,7 @@ static void mem_zero(void* dst, u64 count)
 #endif
 }
 
-/* The console the guest can see: the same glyphs the framebuffer library draws, drawn by the kernel */
+// The console the guest can see
 #define FBCON_GLYPH_WIDTH 8ul
 #define FBCON_GLYPH_HEIGHT 8ul
 #define FBCON_FIRST_GLYPH 32u
@@ -714,101 +747,101 @@ static void mem_zero(void* dst, u64 count)
 #define FBCON_FOREGROUND 0x00C8D0D8u
 
 static const u8 fbcon_font[(FBCON_LAST_GLYPH - FBCON_FIRST_GLYPH + 1u) * FBCON_GLYPH_HEIGHT] = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /*   */
-    0x10, 0x10, 0x10, 0x10, 0x10, 0x00, 0x10, 0x00, /* ! */
-    0x28, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* " */
-    0x28, 0x28, 0x7C, 0x28, 0x7C, 0x28, 0x28, 0x00, /* # */
-    0x10, 0x3C, 0x50, 0x38, 0x14, 0x78, 0x10, 0x00, /* $ */
-    0x60, 0x64, 0x08, 0x10, 0x20, 0x4C, 0x0C, 0x00, /* % */
-    0x30, 0x48, 0x50, 0x20, 0x54, 0x48, 0x34, 0x00, /* & */
-    0x10, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, /* ' */
-    0x08, 0x10, 0x20, 0x20, 0x20, 0x10, 0x08, 0x00, /* ( */
-    0x20, 0x10, 0x08, 0x08, 0x08, 0x10, 0x20, 0x00, /* ) */
-    0x00, 0x10, 0x54, 0x38, 0x54, 0x10, 0x00, 0x00, /* * */
-    0x00, 0x10, 0x10, 0x7C, 0x10, 0x10, 0x00, 0x00, /* + */
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x20, /* , */
-    0x00, 0x00, 0x00, 0x7C, 0x00, 0x00, 0x00, 0x00, /* - */
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, /* . */
-    0x04, 0x08, 0x08, 0x10, 0x20, 0x20, 0x40, 0x00, /* / */
-    0x38, 0x44, 0x4C, 0x54, 0x64, 0x44, 0x38, 0x00, /* 0 */
-    0x10, 0x30, 0x10, 0x10, 0x10, 0x10, 0x38, 0x00, /* 1 */
-    0x38, 0x44, 0x04, 0x08, 0x10, 0x20, 0x7C, 0x00, /* 2 */
-    0x7C, 0x08, 0x10, 0x08, 0x04, 0x44, 0x38, 0x00, /* 3 */
-    0x08, 0x18, 0x28, 0x48, 0x7C, 0x08, 0x08, 0x00, /* 4 */
-    0x7C, 0x40, 0x78, 0x04, 0x04, 0x44, 0x38, 0x00, /* 5 */
-    0x18, 0x20, 0x40, 0x78, 0x44, 0x44, 0x38, 0x00, /* 6 */
-    0x7C, 0x04, 0x08, 0x10, 0x20, 0x20, 0x20, 0x00, /* 7 */
-    0x38, 0x44, 0x44, 0x38, 0x44, 0x44, 0x38, 0x00, /* 8 */
-    0x38, 0x44, 0x44, 0x3C, 0x04, 0x08, 0x30, 0x00, /* 9 */
-    0x00, 0x00, 0x10, 0x00, 0x00, 0x10, 0x00, 0x00, /* : */
-    0x00, 0x00, 0x10, 0x00, 0x00, 0x10, 0x10, 0x20, /* ; */
-    0x08, 0x10, 0x20, 0x40, 0x20, 0x10, 0x08, 0x00, /* < */
-    0x00, 0x00, 0x7C, 0x00, 0x7C, 0x00, 0x00, 0x00, /* = */
-    0x20, 0x10, 0x08, 0x04, 0x08, 0x10, 0x20, 0x00, /* > */
-    0x38, 0x44, 0x04, 0x08, 0x10, 0x00, 0x10, 0x00, /* ? */
-    0x38, 0x44, 0x5C, 0x54, 0x5C, 0x40, 0x38, 0x00, /* @ */
-    0x38, 0x44, 0x44, 0x7C, 0x44, 0x44, 0x44, 0x00, /* A */
-    0x78, 0x44, 0x44, 0x78, 0x44, 0x44, 0x78, 0x00, /* B */
-    0x38, 0x44, 0x40, 0x40, 0x40, 0x44, 0x38, 0x00, /* C */
-    0x70, 0x48, 0x44, 0x44, 0x44, 0x48, 0x70, 0x00, /* D */
-    0x7C, 0x40, 0x40, 0x78, 0x40, 0x40, 0x7C, 0x00, /* E */
-    0x7C, 0x40, 0x40, 0x78, 0x40, 0x40, 0x40, 0x00, /* F */
-    0x38, 0x44, 0x40, 0x5C, 0x44, 0x44, 0x3C, 0x00, /* G */
-    0x44, 0x44, 0x44, 0x7C, 0x44, 0x44, 0x44, 0x00, /* H */
-    0x38, 0x10, 0x10, 0x10, 0x10, 0x10, 0x38, 0x00, /* I */
-    0x1C, 0x08, 0x08, 0x08, 0x08, 0x48, 0x30, 0x00, /* J */
-    0x44, 0x48, 0x50, 0x60, 0x50, 0x48, 0x44, 0x00, /* K */
-    0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x7C, 0x00, /* L */
-    0x44, 0x6C, 0x54, 0x54, 0x44, 0x44, 0x44, 0x00, /* M */
-    0x44, 0x64, 0x54, 0x4C, 0x44, 0x44, 0x44, 0x00, /* N */
-    0x38, 0x44, 0x44, 0x44, 0x44, 0x44, 0x38, 0x00, /* O */
-    0x78, 0x44, 0x44, 0x78, 0x40, 0x40, 0x40, 0x00, /* P */
-    0x38, 0x44, 0x44, 0x44, 0x54, 0x48, 0x34, 0x00, /* Q */
-    0x78, 0x44, 0x44, 0x78, 0x50, 0x48, 0x44, 0x00, /* R */
-    0x3C, 0x40, 0x40, 0x38, 0x04, 0x04, 0x78, 0x00, /* S */
-    0x7C, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x00, /* T */
-    0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x38, 0x00, /* U */
-    0x44, 0x44, 0x44, 0x44, 0x44, 0x28, 0x10, 0x00, /* V */
-    0x44, 0x44, 0x44, 0x54, 0x54, 0x6C, 0x44, 0x00, /* W */
-    0x44, 0x44, 0x28, 0x10, 0x28, 0x44, 0x44, 0x00, /* X */
-    0x44, 0x44, 0x28, 0x10, 0x10, 0x10, 0x10, 0x00, /* Y */
-    0x7C, 0x04, 0x08, 0x10, 0x20, 0x40, 0x7C, 0x00, /* Z */
-    0x38, 0x20, 0x20, 0x20, 0x20, 0x20, 0x38, 0x00, /* [ */
-    0x40, 0x20, 0x20, 0x10, 0x08, 0x08, 0x04, 0x00, /* \\ */
-    0x38, 0x08, 0x08, 0x08, 0x08, 0x08, 0x38, 0x00, /* ] */
-    0x10, 0x28, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, /* ^ */
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7C, /* _ */
-    0x20, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* ` */
-    0x00, 0x00, 0x38, 0x04, 0x3C, 0x44, 0x3C, 0x00, /* a */
-    0x40, 0x40, 0x78, 0x44, 0x44, 0x44, 0x78, 0x00, /* b */
-    0x00, 0x00, 0x38, 0x40, 0x40, 0x44, 0x38, 0x00, /* c */
-    0x04, 0x04, 0x3C, 0x44, 0x44, 0x44, 0x3C, 0x00, /* d */
-    0x00, 0x00, 0x38, 0x44, 0x7C, 0x40, 0x38, 0x00, /* e */
-    0x18, 0x24, 0x20, 0x70, 0x20, 0x20, 0x20, 0x00, /* f */
-    0x00, 0x00, 0x3C, 0x44, 0x44, 0x3C, 0x04, 0x38, /* g */
-    0x40, 0x40, 0x78, 0x44, 0x44, 0x44, 0x44, 0x00, /* h */
-    0x10, 0x00, 0x30, 0x10, 0x10, 0x10, 0x38, 0x00, /* i */
-    0x08, 0x00, 0x18, 0x08, 0x08, 0x08, 0x48, 0x30, /* j */
-    0x40, 0x40, 0x48, 0x50, 0x60, 0x50, 0x48, 0x00, /* k */
-    0x30, 0x10, 0x10, 0x10, 0x10, 0x10, 0x38, 0x00, /* l */
-    0x00, 0x00, 0x68, 0x54, 0x54, 0x54, 0x54, 0x00, /* m */
-    0x00, 0x00, 0x78, 0x44, 0x44, 0x44, 0x44, 0x00, /* n */
-    0x00, 0x00, 0x38, 0x44, 0x44, 0x44, 0x38, 0x00, /* o */
-    0x00, 0x00, 0x78, 0x44, 0x44, 0x78, 0x40, 0x40, /* p */
-    0x00, 0x00, 0x3C, 0x44, 0x44, 0x3C, 0x04, 0x04, /* q */
-    0x00, 0x00, 0x58, 0x64, 0x40, 0x40, 0x40, 0x00, /* r */
-    0x00, 0x00, 0x3C, 0x40, 0x38, 0x04, 0x78, 0x00, /* s */
-    0x20, 0x20, 0x70, 0x20, 0x20, 0x24, 0x18, 0x00, /* t */
-    0x00, 0x00, 0x44, 0x44, 0x44, 0x44, 0x3C, 0x00, /* u */
-    0x00, 0x00, 0x44, 0x44, 0x44, 0x28, 0x10, 0x00, /* v */
-    0x00, 0x00, 0x44, 0x54, 0x54, 0x54, 0x28, 0x00, /* w */
-    0x00, 0x00, 0x44, 0x28, 0x10, 0x28, 0x44, 0x00, /* x */
-    0x00, 0x00, 0x44, 0x44, 0x44, 0x3C, 0x04, 0x38, /* y */
-    0x00, 0x00, 0x7C, 0x08, 0x10, 0x20, 0x7C, 0x00, /* z */
-    0x18, 0x20, 0x20, 0x60, 0x20, 0x20, 0x18, 0x00, /* { */
-    0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x00, /* | */
-    0x30, 0x08, 0x08, 0x0C, 0x08, 0x08, 0x30, 0x00, /* } */
-    0x00, 0x00, 0x34, 0x4C, 0x00, 0x00, 0x00, 0x00, /* ~ */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //  
+    0x10, 0x10, 0x10, 0x10, 0x10, 0x00, 0x10, 0x00, // !
+    0x28, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // "
+    0x28, 0x28, 0x7C, 0x28, 0x7C, 0x28, 0x28, 0x00, // #
+    0x10, 0x3C, 0x50, 0x38, 0x14, 0x78, 0x10, 0x00, // $
+    0x60, 0x64, 0x08, 0x10, 0x20, 0x4C, 0x0C, 0x00, // %
+    0x30, 0x48, 0x50, 0x20, 0x54, 0x48, 0x34, 0x00, // &
+    0x10, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, // '
+    0x08, 0x10, 0x20, 0x20, 0x20, 0x10, 0x08, 0x00, // (
+    0x20, 0x10, 0x08, 0x08, 0x08, 0x10, 0x20, 0x00, // )
+    0x00, 0x10, 0x54, 0x38, 0x54, 0x10, 0x00, 0x00, // *
+    0x00, 0x10, 0x10, 0x7C, 0x10, 0x10, 0x00, 0x00, // +
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x20, // ,
+    0x00, 0x00, 0x00, 0x7C, 0x00, 0x00, 0x00, 0x00, // -
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, // .
+    0x04, 0x08, 0x08, 0x10, 0x20, 0x20, 0x40, 0x00, // /
+    0x38, 0x44, 0x4C, 0x54, 0x64, 0x44, 0x38, 0x00, // 0
+    0x10, 0x30, 0x10, 0x10, 0x10, 0x10, 0x38, 0x00, // 1
+    0x38, 0x44, 0x04, 0x08, 0x10, 0x20, 0x7C, 0x00, // 2
+    0x7C, 0x08, 0x10, 0x08, 0x04, 0x44, 0x38, 0x00, // 3
+    0x08, 0x18, 0x28, 0x48, 0x7C, 0x08, 0x08, 0x00, // 4
+    0x7C, 0x40, 0x78, 0x04, 0x04, 0x44, 0x38, 0x00, // 5
+    0x18, 0x20, 0x40, 0x78, 0x44, 0x44, 0x38, 0x00, // 6
+    0x7C, 0x04, 0x08, 0x10, 0x20, 0x20, 0x20, 0x00, // 7
+    0x38, 0x44, 0x44, 0x38, 0x44, 0x44, 0x38, 0x00, // 8
+    0x38, 0x44, 0x44, 0x3C, 0x04, 0x08, 0x30, 0x00, // 9
+    0x00, 0x00, 0x10, 0x00, 0x00, 0x10, 0x00, 0x00, // :
+    0x00, 0x00, 0x10, 0x00, 0x00, 0x10, 0x10, 0x20, // ;
+    0x08, 0x10, 0x20, 0x40, 0x20, 0x10, 0x08, 0x00, // <
+    0x00, 0x00, 0x7C, 0x00, 0x7C, 0x00, 0x00, 0x00, // =
+    0x20, 0x10, 0x08, 0x04, 0x08, 0x10, 0x20, 0x00, // >
+    0x38, 0x44, 0x04, 0x08, 0x10, 0x00, 0x10, 0x00, // ?
+    0x38, 0x44, 0x5C, 0x54, 0x5C, 0x40, 0x38, 0x00, // @
+    0x38, 0x44, 0x44, 0x7C, 0x44, 0x44, 0x44, 0x00, // A
+    0x78, 0x44, 0x44, 0x78, 0x44, 0x44, 0x78, 0x00, // B
+    0x38, 0x44, 0x40, 0x40, 0x40, 0x44, 0x38, 0x00, // C
+    0x70, 0x48, 0x44, 0x44, 0x44, 0x48, 0x70, 0x00, // D
+    0x7C, 0x40, 0x40, 0x78, 0x40, 0x40, 0x7C, 0x00, // E
+    0x7C, 0x40, 0x40, 0x78, 0x40, 0x40, 0x40, 0x00, // F
+    0x38, 0x44, 0x40, 0x5C, 0x44, 0x44, 0x3C, 0x00, // G
+    0x44, 0x44, 0x44, 0x7C, 0x44, 0x44, 0x44, 0x00, // H
+    0x38, 0x10, 0x10, 0x10, 0x10, 0x10, 0x38, 0x00, // I
+    0x1C, 0x08, 0x08, 0x08, 0x08, 0x48, 0x30, 0x00, // J
+    0x44, 0x48, 0x50, 0x60, 0x50, 0x48, 0x44, 0x00, // K
+    0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x7C, 0x00, // L
+    0x44, 0x6C, 0x54, 0x54, 0x44, 0x44, 0x44, 0x00, // M
+    0x44, 0x64, 0x54, 0x4C, 0x44, 0x44, 0x44, 0x00, // N
+    0x38, 0x44, 0x44, 0x44, 0x44, 0x44, 0x38, 0x00, // O
+    0x78, 0x44, 0x44, 0x78, 0x40, 0x40, 0x40, 0x00, // P
+    0x38, 0x44, 0x44, 0x44, 0x54, 0x48, 0x34, 0x00, // Q
+    0x78, 0x44, 0x44, 0x78, 0x50, 0x48, 0x44, 0x00, // R
+    0x3C, 0x40, 0x40, 0x38, 0x04, 0x04, 0x78, 0x00, // S
+    0x7C, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x00, // T
+    0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x38, 0x00, // U
+    0x44, 0x44, 0x44, 0x44, 0x44, 0x28, 0x10, 0x00, // V
+    0x44, 0x44, 0x44, 0x54, 0x54, 0x6C, 0x44, 0x00, // W
+    0x44, 0x44, 0x28, 0x10, 0x28, 0x44, 0x44, 0x00, // X
+    0x44, 0x44, 0x28, 0x10, 0x10, 0x10, 0x10, 0x00, // Y
+    0x7C, 0x04, 0x08, 0x10, 0x20, 0x40, 0x7C, 0x00, // Z
+    0x38, 0x20, 0x20, 0x20, 0x20, 0x20, 0x38, 0x00, // [
+    0x40, 0x20, 0x20, 0x10, 0x08, 0x08, 0x04, 0x00, // \/
+    0x38, 0x08, 0x08, 0x08, 0x08, 0x08, 0x38, 0x00, // ]
+    0x10, 0x28, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, // ^
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7C, // _
+    0x20, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // `
+    0x00, 0x00, 0x38, 0x04, 0x3C, 0x44, 0x3C, 0x00, // a
+    0x40, 0x40, 0x78, 0x44, 0x44, 0x44, 0x78, 0x00, // b
+    0x00, 0x00, 0x38, 0x40, 0x40, 0x44, 0x38, 0x00, // c
+    0x04, 0x04, 0x3C, 0x44, 0x44, 0x44, 0x3C, 0x00, // d
+    0x00, 0x00, 0x38, 0x44, 0x7C, 0x40, 0x38, 0x00, // e
+    0x18, 0x24, 0x20, 0x70, 0x20, 0x20, 0x20, 0x00, // f
+    0x00, 0x00, 0x3C, 0x44, 0x44, 0x3C, 0x04, 0x38, // g
+    0x40, 0x40, 0x78, 0x44, 0x44, 0x44, 0x44, 0x00, // h
+    0x10, 0x00, 0x30, 0x10, 0x10, 0x10, 0x38, 0x00, // i
+    0x08, 0x00, 0x18, 0x08, 0x08, 0x08, 0x48, 0x30, // j
+    0x40, 0x40, 0x48, 0x50, 0x60, 0x50, 0x48, 0x00, // k
+    0x30, 0x10, 0x10, 0x10, 0x10, 0x10, 0x38, 0x00, // l
+    0x00, 0x00, 0x68, 0x54, 0x54, 0x54, 0x54, 0x00, // m
+    0x00, 0x00, 0x78, 0x44, 0x44, 0x44, 0x44, 0x00, // n
+    0x00, 0x00, 0x38, 0x44, 0x44, 0x44, 0x38, 0x00, // o
+    0x00, 0x00, 0x78, 0x44, 0x44, 0x78, 0x40, 0x40, // p
+    0x00, 0x00, 0x3C, 0x44, 0x44, 0x3C, 0x04, 0x04, // q
+    0x00, 0x00, 0x58, 0x64, 0x40, 0x40, 0x40, 0x00, // r
+    0x00, 0x00, 0x3C, 0x40, 0x38, 0x04, 0x78, 0x00, // s
+    0x20, 0x20, 0x70, 0x20, 0x20, 0x24, 0x18, 0x00, // t
+    0x00, 0x00, 0x44, 0x44, 0x44, 0x44, 0x3C, 0x00, // u
+    0x00, 0x00, 0x44, 0x44, 0x44, 0x28, 0x10, 0x00, // v
+    0x00, 0x00, 0x44, 0x54, 0x54, 0x54, 0x28, 0x00, // w
+    0x00, 0x00, 0x44, 0x28, 0x10, 0x28, 0x44, 0x00, // x
+    0x00, 0x00, 0x44, 0x44, 0x44, 0x3C, 0x04, 0x38, // y
+    0x00, 0x00, 0x7C, 0x08, 0x10, 0x20, 0x7C, 0x00, // z
+    0x18, 0x20, 0x20, 0x60, 0x20, 0x20, 0x18, 0x00, // {
+    0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x00, // |
+    0x30, 0x08, 0x08, 0x0C, 0x08, 0x08, 0x30, 0x00, // }
+    0x00, 0x00, 0x34, 0x4C, 0x00, 0x00, 0x00, 0x00, // ~
 };
 
 static volatile u64* fbcon_registers;
@@ -818,6 +851,7 @@ static u64 fbcon_columns;
 static u64 fbcon_rows;
 static u64 fbcon_column;
 static u64 fbcon_row;
+static int fbcon_cursor_shown;
 
 static void fbcon_init(void)
 {
@@ -837,6 +871,7 @@ static void fbcon_init(void)
 
     mem_zero(fbcon_pixels, registers[6]);
     fbcon_registers = registers;
+    fbcon_draw_cursor(1);
     fbcon_registers[8] = 1ul;
 }
 
@@ -865,6 +900,27 @@ static void fbcon_draw_glyph(u64 column, u64 row, u32 code)
     }
 }
 
+// The mark that says where the next character will land
+static void fbcon_draw_cursor(int shown)
+{
+    u32* target;
+    u64 line = FBCON_GLYPH_HEIGHT - 2ul;
+    if (fbcon_column >= fbcon_columns || fbcon_row >= fbcon_rows)
+        return;
+    target = fbcon_pixels + fbcon_row * FBCON_GLYPH_HEIGHT * fbcon_row_pixels + fbcon_column * FBCON_GLYPH_WIDTH;
+    while (line < FBCON_GLYPH_HEIGHT)
+    {
+        u64 pixel = 0ul;
+        while (pixel < FBCON_GLYPH_WIDTH)
+        {
+            target[line * fbcon_row_pixels + pixel] = shown ? FBCON_FOREGROUND : 0u;
+            pixel = pixel + 1ul;
+        }
+        line = line + 1ul;
+    }
+    fbcon_cursor_shown = shown;
+}
+
 static void fbcon_newline(void)
 {
     u64 kept;
@@ -874,7 +930,7 @@ static void fbcon_newline(void)
     if (fbcon_row < fbcon_rows)
         return;
 
-    /* The screen is full, so everything moves up by one row of glyphs */
+    // The screen is full, so everything moves up by one row of glyphs
     fbcon_row = fbcon_rows - 1ul;
     kept = (fbcon_rows - 1ul) * FBCON_GLYPH_HEIGHT * fbcon_row_pixels;
     shift = FBCON_GLYPH_HEIGHT * fbcon_row_pixels;
@@ -886,6 +942,8 @@ static void fbcon_putchar(int ch)
 {
     if (fbcon_registers == (volatile u64*)0)
         return;
+    if (fbcon_cursor_shown)
+        fbcon_draw_cursor(0);
 
     if (ch == '\n')
     {
@@ -920,9 +978,11 @@ static void fbcon_putchar(int ch)
     }
     else
     {
+        fbcon_draw_cursor(1);
         return;
     }
 
+    fbcon_draw_cursor(1);
     fbcon_registers[8] = 1ul;
 }
 
@@ -1747,6 +1807,10 @@ static void process_table_init(void)
     current_task->pid = next_pid;
     current_task->ppid = 0u;
     current_task->time_slice = DEFAULT_TIME_SLICE;
+    // The first process stands at the root, and every later one inherits where its parent stood
+    vfs_root_node(&current_task->cwd);
+    current_task->cwd_path[0] = '/';
+    current_task->cwd_path[1] = 0;
     next_pid = next_pid + 1u;
     open_files = current_task->files;
 }
@@ -1937,6 +2001,8 @@ static int process_clone(struct trap_frame* frame, u64 flags, u64 child_stack)
     child->time_slice = DEFAULT_TIME_SLICE;
     if ((flags & CLONE_VFORK) != 0ul)
         child->vfork_parent_pid = current_task->pid;
+    child->cwd = current_task->cwd;
+    mem_copy(child->cwd_path, current_task->cwd_path, (u64)PATH_BUFFER_SIZE);
     mem_copy(child->files, open_files, sizeof(struct file_descriptor) * (u64)MAX_OPEN_FILES);
     mem_copy(child->vm_regions, current_task->vm_regions, sizeof(struct vm_region) * (u64)MAX_VM_REGIONS);
     mem_copy(&child->frame, frame, sizeof(struct trap_frame));
@@ -1961,9 +2027,9 @@ static int process_match_wait_pid(struct process* child, u64 wait_pid)
     return 0;
 }
 
-static int process_store_wait_status(struct process* parent, u64 status_pointer, u32 exit_status)
+static int process_store_wait_status(struct process* parent, u64 status_pointer, u32 exit_status, u32 exit_signal)
 {
-    u32 wait_status = exit_status << 8;
+    u32 wait_status = exit_signal != 0u ? exit_signal : exit_status << 8;
     if (status_pointer == 0ul)
         return 1;
     return user_copy_to_writable(parent->root_page_table, status_pointer, &wait_status, 4ul);
@@ -1983,7 +2049,7 @@ static int process_try_wait(struct process* parent, u64 pid, u64 status_pointer,
             {
                 u32 child_pid = child->pid;
                 u32 exit_status = child->exit_status;
-                if (!process_store_wait_status(parent, status_pointer, exit_status))
+                if (!process_store_wait_status(parent, status_pointer, exit_status, child->exit_signal))
                 {
                     *result = -14l;
                     return 1;
@@ -2056,7 +2122,7 @@ static void process_wake_waiter(struct process* child)
         struct process* parent = &processes[index];
         if (parent->used != 0u && parent->state == PROC_WAITING && parent->pid == child->ppid && process_match_wait_pid(child, parent->wait_pid))
         {
-            if (process_store_wait_status(parent, parent->wait_status_pointer, child->exit_status))
+            if (process_store_wait_status(parent, parent->wait_status_pointer, child->exit_status, child->exit_signal))
                 parent->frame.x[10] = (u64)child->pid;
             else
                 parent->frame.x[10] = (u64)-14l;
@@ -2089,7 +2155,7 @@ static void process_exit_current(struct trap_frame* frame, u64 status)
     process_reparent_children(pid);
     current_task->exit_status = (u32)code;
     current_task->state = PROC_ZOMBIE;
-    /* A process that ended the way it meant to says nothing: the console belongs to the terminal */
+    // A process that ended the way it meant to says nothing: the console belongs to the terminal
     if (code != 0ul)
     {
         puts("kernel: process ");
@@ -2101,6 +2167,18 @@ static void process_exit_current(struct trap_frame* frame, u64 status)
     process_wake_vfork_parent(current_task);
     process_wake_waiter(current_task);
     scheduler_switch(frame);
+}
+
+// The signal a fault would carry, so a program ends the way it would on the kernel we follow
+static u64 fault_signal(u64 cause)
+{
+    if (cause == 2ul)
+        return SIGILL;
+    if (cause == 3ul)
+        return SIGTRAP;
+    if (cause == 0ul || cause == 4ul || cause == 6ul || cause == 1ul || cause == 5ul || cause == 7ul)
+        return SIGBUS;
+    return SIGSEGV;
 }
 
 static void scheduler_timer_interrupt(struct trap_frame* frame)
@@ -2130,11 +2208,10 @@ static s64 sys_execve_impl(struct trap_frame* frame, u64 path_pointer, u64 argv,
     u64 old_brk = process_brk;
     u64 old_brk_min = process_brk_min;
     u64 old_mmap_cursor = user_mmap_cursor;
-    (void)envp;
     if (!copy_user_string(path_pointer, path, PATH_BUFFER_SIZE))
         return -14l;
     {
-        s64 argument_result = capture_exec_arguments(argv, path, &arguments);
+        s64 argument_result = capture_exec_arguments(argv, envp, path, &arguments);
         if (argument_result != 0l)
             return argument_result;
     }
@@ -2544,6 +2621,7 @@ static int fat_mount(void)
     u8* mbr = sector_buffer;
     u8* bpb = sector_buffer;
     int part;
+    fat_walk_forget();
     fat_buffer_valid = 0ul;
     dir_buffer_valid = 0ul;
     if (!disk_read_sector(0u, mbr))
@@ -2578,9 +2656,41 @@ static int fat_mount(void)
     boot_volume.fat_sectors = le32(bpb + 36);
     boot_volume.root_cluster = le32(bpb + 44);
     boot_volume.fat_lba = boot_volume.partition_lba + (u32)le16(bpb + 14);
-    boot_volume.data_lba = boot_volume.fat_lba + boot_volume.fat_sectors * (u32)bpb[16];
+    boot_volume.fat_count = (u32)bpb[16];
+    boot_volume.data_lba = boot_volume.fat_lba + boot_volume.fat_sectors * boot_volume.fat_count;
+    {
+        u32 total = le32(bpb + 32);
+        if (total == 0u)
+            total = (u32)le16(bpb + 19);
+        boot_volume.cluster_count = total > boot_volume.data_lba - boot_volume.partition_lba
+            ? (total - (boot_volume.data_lba - boot_volume.partition_lba)) / boot_volume.sectors_per_cluster + 2u
+            : 2u;
+    }
     if (boot_volume.sectors_per_cluster == 0u || boot_volume.fat_sectors == 0u || boot_volume.root_cluster < 2u)
         return 0;
+    return 1;
+}
+
+// Every reader and writer of a cached sector comes through here, so the tag never lies
+static int fat_sector_load(u32 lba)
+{
+    if (fat_buffer_valid != 0ul && fat_buffer_lba == lba)
+        return 1;
+    if (!disk_read_sector(lba, fat_buffer))
+        return 0;
+    fat_buffer_lba = lba;
+    fat_buffer_valid = 1ul;
+    return 1;
+}
+
+static int dir_sector_load(u32 lba)
+{
+    if (dir_buffer_valid != 0ul && dir_buffer_lba == lba)
+        return 1;
+    if (!disk_read_sector(lba, dir_buffer))
+        return 0;
+    dir_buffer_lba = lba;
+    dir_buffer_valid = 1ul;
     return 1;
 }
 
@@ -2594,19 +2704,213 @@ static u32 fat_next_cluster(u32 cluster)
     u64 fat_offset = (u64)cluster << 2ul;
     u32 lba = boot_volume.fat_lba + (u32)(fat_offset >> 9ul);
     u32 sector_offset = (u32)(fat_offset & (u64)(SECTOR_SIZE - 1u));
-    if (fat_buffer_valid == 0ul || fat_buffer_lba != lba)
-    {
-        if (!disk_read_sector(lba, fat_buffer))
-            return FAT_READ_ERROR;
-        fat_buffer_lba = lba;
-        fat_buffer_valid = 1ul;
-    }
+    if (!fat_sector_load(lba))
+        return FAT_READ_ERROR;
     return le32(fat_buffer + sector_offset) & 0x0fffffffu;
 }
 
-static int fat_find_short(const char* short_name, u32* first_cluster, u32* size)
+// Writing a sector makes any cached copy of it stale
+static int disk_write_sector(u32 lba, void* buffer)
 {
-    u32 cluster = boot_volume.root_cluster;
+    if (fat_buffer_valid != 0ul && fat_buffer_lba == lba)
+        fat_buffer_valid = 0ul;
+    if (dir_buffer_valid != 0ul && dir_buffer_lba == lba)
+        dir_buffer_valid = 0ul;
+    return block_write_sector((u64)lba, buffer);
+}
+
+// Where the last read of a file left off in its cluster chain
+static u32 fat_walk_first_cluster;
+static u32 fat_walk_cluster;
+static u64 fat_walk_index;
+
+static void fat_walk_forget(void)
+{
+    fat_walk_first_cluster = 0u;
+    fat_walk_cluster = 0u;
+    fat_walk_index = 0ul;
+}
+
+// A volume keeps more than one copy of its table, and they are kept in step
+static int fat_set_cluster(u32 cluster, u32 value)
+{
+    fat_walk_forget();
+    u64 fat_offset = (u64)cluster << 2ul;
+    u32 sector = (u32)(fat_offset >> 9ul);
+    u32 offset = (u32)(fat_offset & (u64)(SECTOR_SIZE - 1u));
+    u32 copy = 0u;
+    u32 previous;
+
+    if (sector >= boot_volume.fat_sectors)
+        return 0;
+    if (!fat_sector_load(boot_volume.fat_lba + sector))
+        return 0;
+    previous = le32(fat_buffer + offset);
+    store_le32(fat_buffer + offset, (previous & 0xf0000000u) | (value & 0x0fffffffu));
+    while (copy < boot_volume.fat_count)
+    {
+        if (!disk_write_sector(boot_volume.fat_lba + copy * boot_volume.fat_sectors + sector, fat_buffer))
+            return 0;
+        copy = copy + 1u;
+    }
+    return 1;
+}
+
+static u32 fat_allocation_hint = 2u;
+
+static u32 fat_allocate_cluster(void)
+{
+    u32 limit = boot_volume.cluster_count;
+    u32 scanned = 0u;
+    u32 cluster = fat_allocation_hint < 2u ? 2u : fat_allocation_hint;
+
+    if (limit < 3u)
+        return 0u;
+    while (scanned < limit)
+    {
+        u32 value;
+        if (cluster >= limit)
+            cluster = 2u;
+        value = fat_next_cluster(cluster);
+        if (value == FAT_READ_ERROR)
+            return 0u;
+        if (value == 0u)
+        {
+            if (!fat_set_cluster(cluster, FAT_END))
+                return 0u;
+            fat_allocation_hint = cluster + 1u;
+            return cluster;
+        }
+        cluster = cluster + 1u;
+        scanned = scanned + 1u;
+    }
+    return 0u;
+}
+
+static int fat_clear_cluster(u32 cluster)
+{
+    u32 sector_index = 0u;
+    mem_zero(sector_buffer, SECTOR_SIZE);
+    while (sector_index < boot_volume.sectors_per_cluster)
+    {
+        if (!disk_write_sector(fat_cluster_lba(cluster) + sector_index, sector_buffer))
+            return 0;
+        sector_index = sector_index + 1u;
+    }
+    return 1;
+}
+
+static int fat_free_chain(u32 cluster)
+{
+    while (cluster >= 2u && cluster < FAT_EOC)
+    {
+        u32 next = fat_next_cluster(cluster);
+        if (next == FAT_READ_ERROR)
+            return 0;
+        if (!fat_set_cluster(cluster, 0u))
+            return 0;
+        if (cluster < fat_allocation_hint)
+            fat_allocation_hint = cluster;
+        cluster = next;
+    }
+    return 1;
+}
+
+// Walks a chain to the cluster holding an offset, growing it when it does not reach that far
+static int fat_cluster_for_offset(struct vfs_node* node, u64 offset, int grow, u32* out_cluster)
+{
+    u64 bytes_per_cluster = (u64)boot_volume.sectors_per_cluster * (u64)SECTOR_SIZE;
+    u64 wanted = offset / bytes_per_cluster;
+    u32 cluster = node->first_cluster;
+    u64 index = 0ul;
+
+    if (cluster < 2u || cluster >= FAT_EOC)
+    {
+        if (!grow)
+            return 0;
+        cluster = fat_allocate_cluster();
+        if (cluster == 0u || !fat_clear_cluster(cluster))
+            return 0;
+        node->first_cluster = cluster;
+    }
+
+    while (index < wanted)
+    {
+        u32 next = fat_next_cluster(cluster);
+        if (next == FAT_READ_ERROR)
+            return 0;
+        if (next < 2u || next >= FAT_EOC)
+        {
+            if (!grow)
+                return 0;
+            next = fat_allocate_cluster();
+            if (next == 0u || !fat_clear_cluster(next) || !fat_set_cluster(cluster, next))
+                return 0;
+        }
+        cluster = next;
+        index = index + 1ul;
+    }
+    *out_cluster = cluster;
+    return 1;
+}
+
+static int fat_write_entry(struct vfs_node* node)
+{
+    if (node->entry_lba == 0u)
+        return 1;
+    if (!dir_sector_load(node->entry_lba))
+        return 0;
+    store_le16(dir_buffer + node->entry_offset + 20u, (u16)(node->first_cluster >> 16));
+    store_le16(dir_buffer + node->entry_offset + 26u, (u16)node->first_cluster);
+    store_le32(dir_buffer + node->entry_offset + 28u, node->size);
+    return disk_write_sector(node->entry_lba, dir_buffer);
+}
+
+// Puts bytes into a file, reaching for more clusters when it runs past the end
+static int fat_write_at(struct vfs_node* node, u64 offset, const u8* source, u32 count, u32* written)
+{
+    u64 bytes_per_cluster = (u64)boot_volume.sectors_per_cluster * (u64)SECTOR_SIZE;
+    u32 done = 0u;
+    *written = 0u;
+
+    while (done < count)
+    {
+        u64 position = offset + (u64)done;
+        u64 within = position % bytes_per_cluster;
+        u32 cluster;
+        u32 sector_index = (u32)(within / (u64)SECTOR_SIZE);
+        u32 sector_offset = (u32)(within % (u64)SECTOR_SIZE);
+        u32 chunk = SECTOR_SIZE - sector_offset;
+        u32 lba;
+
+        if (chunk > count - done)
+            chunk = count - done;
+        if (!fat_cluster_for_offset(node, position, 1, &cluster))
+            return 0;
+        lba = fat_cluster_lba(cluster) + sector_index;
+
+        // A partial sector keeps what it already held
+        if (chunk != SECTOR_SIZE)
+        {
+            if (!disk_read_sector(lba, sector_buffer))
+                return 0;
+        }
+        mem_copy(sector_buffer + sector_offset, source + done, (u64)chunk);
+        if (!disk_write_sector(lba, sector_buffer))
+            return 0;
+        done = done + chunk;
+    }
+
+    if (offset + (u64)count > (u64)node->size)
+        node->size = (u32)(offset + (u64)count);
+    *written = done;
+    return fat_write_entry(node);
+}
+
+// Looks a name up inside the directory a cluster chain holds
+static int fat_find_in(u32 directory, const char* short_name, struct vfs_node* out)
+{
+    u32 cluster = directory;
     while (cluster >= 2u && cluster < FAT_EOC)
     {
         u32 sector_index = 0u;
@@ -2614,13 +2918,8 @@ static int fat_find_short(const char* short_name, u32* first_cluster, u32* size)
         {
             u32 lba = fat_cluster_lba(cluster) + sector_index;
             u32 offset = 0u;
-            if (dir_buffer_valid == 0ul || dir_buffer_lba != lba)
-            {
-                if (!disk_read_sector(lba, dir_buffer))
-                    return 0;
-                dir_buffer_lba = lba;
-                dir_buffer_valid = 1ul;
-            }
+            if (!dir_sector_load(lba))
+                return 0;
             while (offset < SECTOR_SIZE)
             {
                 const u8* entry = dir_buffer + offset;
@@ -2638,8 +2937,15 @@ static int fat_find_short(const char* short_name, u32* first_cluster, u32* size)
                     name_index = name_index + 1u;
                 if (name_index == 11u)
                 {
-                    *first_cluster = ((u32)le16(entry + 20) << 16) | (u32)le16(entry + 26);
-                    *size = le32(entry + 28);
+                    u32 found = ((u32)le16(entry + 20) << 16) | (u32)le16(entry + 26);
+                    int directory_entry = (attributes & FAT_ATTRIBUTE_DIRECTORY) != 0u;
+                    out->type = directory_entry ? VFS_NODE_FAT_DIR : VFS_NODE_FAT_FILE;
+                    // A directory whose entry says cluster zero is the root
+                    out->first_cluster = directory_entry && found == 0u ? boot_volume.root_cluster : found;
+                    out->size = directory_entry ? 0u : le32(entry + 28);
+                    out->mode = directory_entry ? (S_IFDIR | 493u) : (S_IFREG | 438u);
+                    out->entry_lba = lba;
+                    out->entry_offset = offset;
                     return 1;
                 }
                 offset = offset + 32u;
@@ -2653,6 +2959,161 @@ static int fat_find_short(const char* short_name, u32* first_cluster, u32* size)
     return 0;
 }
 
+
+// Puts a name in a directory, taking a free slot or making one
+static int fat_create_in(u32 directory, const char* short_name, u32 attributes, u32* out_lba, u32* out_offset)
+{
+    u32 cluster = directory;
+    u32 previous = 0u;
+
+    while (cluster >= 2u && cluster < FAT_EOC)
+    {
+        u32 sector_index = 0u;
+        while (sector_index < boot_volume.sectors_per_cluster)
+        {
+            u32 lba = fat_cluster_lba(cluster) + sector_index;
+            u32 offset = 0u;
+            if (!dir_sector_load(lba))
+                return 0;
+            while (offset < SECTOR_SIZE)
+            {
+                u8 first = dir_buffer[offset];
+                if (first == 0u || first == 0xe5u)
+                {
+                    u32 index = 0u;
+                    mem_zero(dir_buffer + offset, 32ul);
+                    while (index < 11u)
+                    {
+                        dir_buffer[offset + index] = (u8)short_name[index];
+                        index = index + 1u;
+                    }
+                    dir_buffer[offset + 11u] = (u8)(attributes != 0u ? attributes : 32u);
+                    // A fresh name owns nothing yet, so it has no cluster and no length
+                    if (!disk_write_sector(lba, dir_buffer))
+                        return 0;
+                    *out_lba = lba;
+                    *out_offset = offset;
+                    return 1;
+                }
+                offset = offset + 32u;
+            }
+            sector_index = sector_index + 1u;
+        }
+        previous = cluster;
+        cluster = fat_next_cluster(cluster);
+        if (cluster == FAT_READ_ERROR)
+            return 0;
+    }
+
+    // The directory is full, so it grows by a cluster
+    if (previous == 0u)
+        return 0;
+    cluster = fat_allocate_cluster();
+    if (cluster == 0u || !fat_clear_cluster(cluster) || !fat_set_cluster(previous, cluster))
+        return 0;
+    return fat_create_in(directory, short_name, attributes, out_lba, out_offset);
+}
+
+static int fat_remove_in(u32 directory, const char* short_name)
+{
+    struct vfs_node found;
+    if (!fat_find_in(directory, short_name, &found))
+        return 0;
+    if (!dir_sector_load(found.entry_lba))
+        return 0;
+    dir_buffer[found.entry_offset] = 0xe5u;
+    if (!disk_write_sector(found.entry_lba, dir_buffer))
+        return 0;
+    return fat_free_chain(found.first_cluster);
+}
+
+// A directory holds nothing once its own two names are taken out of the count
+static int fat_directory_is_empty(u32 directory)
+{
+    u32 cluster = directory;
+    while (cluster >= 2u && cluster < FAT_EOC)
+    {
+        u32 sector_index = 0u;
+        while (sector_index < boot_volume.sectors_per_cluster)
+        {
+            u32 lba = fat_cluster_lba(cluster) + sector_index;
+            u32 offset = 0u;
+            if (!dir_sector_load(lba))
+                return 0;
+            while (offset < SECTOR_SIZE)
+            {
+                const u8* entry = dir_buffer + offset;
+                u8 first = entry[0];
+                u8 attributes = entry[11];
+                if (first == 0u)
+                    return 1;
+                if (first != 0xe5u && (attributes & 15u) != 15u && (attributes & 8u) == 0u)
+                {
+                    if (!(entry[0] == (u8)'.' && (entry[1] == (u8)' ' || (entry[1] == (u8)'.' && entry[2] == (u8)' '))))
+                        return 0;
+                }
+                offset = offset + 32u;
+            }
+            sector_index = sector_index + 1u;
+        }
+        cluster = fat_next_cluster(cluster);
+        if (cluster == FAT_READ_ERROR)
+            return 0;
+    }
+    return 1;
+}
+
+// A fresh directory knows itself and its parent before it knows anything else
+static int fat_make_directory(u32 parent, const char* short_name, struct vfs_node* out)
+{
+    u32 cluster = fat_allocate_cluster();
+    u32 entry_lba;
+    u32 entry_offset;
+    u32 index;
+
+    if (cluster == 0u || !fat_clear_cluster(cluster))
+        return 0;
+    if (!fat_create_in(parent, short_name, FAT_ATTRIBUTE_DIRECTORY, &entry_lba, &entry_offset))
+        return 0;
+    if (!dir_sector_load(entry_lba))
+        return 0;
+    store_le16(dir_buffer + entry_offset + 20u, (u16)(cluster >> 16));
+    store_le16(dir_buffer + entry_offset + 26u, (u16)cluster);
+    store_le32(dir_buffer + entry_offset + 28u, 0u);
+    if (!disk_write_sector(entry_lba, dir_buffer))
+        return 0;
+
+    if (!dir_sector_load(fat_cluster_lba(cluster)))
+        return 0;
+    mem_zero(dir_buffer, 64ul);
+    index = 0u;
+    while (index < 11u)
+    {
+        dir_buffer[index] = (u8)' ';
+        dir_buffer[32u + index] = (u8)' ';
+        index = index + 1u;
+    }
+    dir_buffer[0] = (u8)'.';
+    dir_buffer[11] = FAT_ATTRIBUTE_DIRECTORY;
+    store_le16(dir_buffer + 20, (u16)(cluster >> 16));
+    store_le16(dir_buffer + 26, (u16)cluster);
+    dir_buffer[32] = (u8)'.';
+    dir_buffer[33] = (u8)'.';
+    dir_buffer[43] = FAT_ATTRIBUTE_DIRECTORY;
+    // The root is written as cluster zero, which is what every volume expects
+    store_le16(dir_buffer + 52, (u16)(parent == boot_volume.root_cluster ? 0u : parent >> 16));
+    store_le16(dir_buffer + 58, (u16)(parent == boot_volume.root_cluster ? 0u : parent));
+    if (!disk_write_sector(fat_cluster_lba(cluster), dir_buffer))
+        return 0;
+
+    out->type = VFS_NODE_FAT_DIR;
+    out->first_cluster = cluster;
+    out->size = 0u;
+    out->mode = S_IFDIR | 493u;
+    out->entry_lba = entry_lba;
+    out->entry_offset = entry_offset;
+    return 1;
+}
 
 static int user_copy_to_writable(u64 root, u64 destination, const void* source, u64 count)
 {
@@ -2750,57 +3211,99 @@ static int add_kernel_argument(struct exec_arguments* arguments, const char* tex
     return 1;
 }
 
+static int add_kernel_environment(struct exec_arguments* arguments, const char* text)
+{
+    u32 offset;
+    u32 index = 0u;
+    if (arguments->environment_count >= MAX_EXEC_ARGS)
+        return 0;
+    offset = arguments->bytes_used;
+    while (text[index] != 0)
+    {
+        if (arguments->bytes_used + 1u >= MAX_EXEC_ARG_BYTES)
+            return 0;
+        arguments->bytes[arguments->bytes_used] = text[index];
+        arguments->bytes_used = arguments->bytes_used + 1u;
+        index = index + 1u;
+    }
+    if (arguments->bytes_used >= MAX_EXEC_ARG_BYTES)
+        return 0;
+    arguments->bytes[arguments->bytes_used] = 0;
+    arguments->bytes_used = arguments->bytes_used + 1u;
+    arguments->environment_offsets[arguments->environment_count] = offset;
+    arguments->environment_count = arguments->environment_count + 1u;
+    return 1;
+}
+
+// The first process is handed the environment every later one inherits
 static int make_kernel_arguments(const char* path, struct exec_arguments* arguments)
 {
     mem_zero(arguments, sizeof(struct exec_arguments));
-    return add_kernel_argument(arguments, path);
+    if (!add_kernel_argument(arguments, path))
+        return 0;
+    if (!add_kernel_environment(arguments, "PATH=/bin:/"))
+        return 0;
+    if (!add_kernel_environment(arguments, "HOME=/"))
+        return 0;
+    if (!add_kernel_environment(arguments, "SHELL=/shell"))
+        return 0;
+    return add_kernel_environment(arguments, "TERM=cnidaria");
 }
 
-static s64 capture_exec_arguments(u64 argv, const char* fallback, struct exec_arguments* arguments)
+// Copies one null terminated vector out of the caller, which is what argv and envp both are
+static s64 capture_exec_vector(u64 vector, struct exec_arguments* arguments, u32* offsets, u32* count)
 {
-    u32 argument_index = 0u;
-    mem_zero(arguments, sizeof(struct exec_arguments));
-    if (argv != 0ul)
+    u32 index = 0u;
+    *count = 0u;
+    if (vector == 0ul)
+        return 0l;
+    while (index < MAX_EXEC_ARGS)
     {
-        while (argument_index < MAX_EXEC_ARGS)
+        u64 source;
+        u32 offset;
+        u32 string_index = 0u;
+        if (!user_copy_from_readable(current_user_root_page_table, &source, vector + (u64)index * 8ul, 8ul))
+            return -14l;
+        if (source == 0ul)
+            return 0l;
+        offset = arguments->bytes_used;
+        for (;;)
         {
-            u64 source;
-            u32 offset;
-            u32 string_index = 0u;
-            if (!user_copy_from_readable(current_user_root_page_table, &source, argv + (u64)argument_index * 8ul, 8ul))
-                return -14l;
-            if (source == 0ul)
-                break;
-            offset = arguments->bytes_used;
-            for (;;)
-            {
-                u8 ch;
-                if (arguments->bytes_used >= MAX_EXEC_ARG_BYTES)
-                    return -7l;
-                if (!user_load_u8(current_user_root_page_table, source + (u64)string_index, &ch))
-                    return -14l;
-                arguments->bytes[arguments->bytes_used] = (char)ch;
-                arguments->bytes_used = arguments->bytes_used + 1u;
-                string_index = string_index + 1u;
-                if (ch == 0u)
-                    break;
-            }
-            arguments->offsets[argument_index] = offset;
-            arguments->count = arguments->count + 1u;
-            argument_index = argument_index + 1u;
-        }
-        if (argument_index == MAX_EXEC_ARGS)
-        {
-            u64 next;
-            if (!user_copy_from_readable(current_user_root_page_table, &next, argv + (u64)argument_index * 8ul, 8ul))
-                return -14l;
-            if (next != 0ul)
+            u8 ch;
+            if (arguments->bytes_used >= MAX_EXEC_ARG_BYTES)
                 return -7l;
+            if (!user_load_u8(current_user_root_page_table, source + (u64)string_index, &ch))
+                return -14l;
+            arguments->bytes[arguments->bytes_used] = (char)ch;
+            arguments->bytes_used = arguments->bytes_used + 1u;
+            string_index = string_index + 1u;
+            if (ch == 0u)
+                break;
         }
+        offsets[index] = offset;
+        *count = *count + 1u;
+        index = index + 1u;
     }
+    {
+        u64 next;
+        if (!user_copy_from_readable(current_user_root_page_table, &next, vector + (u64)index * 8ul, 8ul))
+            return -14l;
+        if (next != 0ul)
+            return -7l;
+    }
+    return 0l;
+}
+
+static s64 capture_exec_arguments(u64 argv, u64 envp, const char* fallback, struct exec_arguments* arguments)
+{
+    s64 result;
+    mem_zero(arguments, sizeof(struct exec_arguments));
+    result = capture_exec_vector(argv, arguments, arguments->offsets, &arguments->count);
+    if (result < 0l)
+        return result;
     if (arguments->count == 0u && !add_kernel_argument(arguments, fallback))
         return -7l;
-    return 0l;
+    return capture_exec_vector(envp, arguments, arguments->environment_offsets, &arguments->environment_count);
 }
 
 static int ascii_to_upper(int ch)
@@ -2893,59 +3396,237 @@ static int path_to_fat_short_name(const char* path, char* short_name)
     return *p == 0;
 }
 
-static int vfs_lookup(const char* path, struct vfs_node* node)
+static void vfs_root_node(struct vfs_node* node)
+{
+    node->type = VFS_NODE_ROOT_DIR;
+    node->first_cluster = boot_volume.root_cluster;
+    node->size = 0u;
+    node->mode = S_IFDIR | 493u;
+    node->entry_lba = 0u;
+    node->entry_offset = 0u;
+}
+
+static void vfs_device_node(struct vfs_node* node, u32 type)
+{
+    node->type = type;
+    node->first_cluster = 0u;
+    node->size = 0u;
+    node->mode = type == VFS_NODE_DEV_DIR ? (S_IFDIR | 365u) : (S_IFCHR | 438u);
+    node->entry_lba = 0u;
+    node->entry_offset = 0u;
+}
+
+static int component_equals(const char* name, u32 length, const char* literal)
+{
+    u32 index = 0u;
+    while (index < length && literal[index] != 0)
+    {
+        if (name[index] != literal[index])
+            return 0;
+        index = index + 1u;
+    }
+    return index == length && literal[index] == 0;
+}
+
+// One name of a path, in the eight and three a volume can hold
+static int component_to_short_name(const char* name, u32 length, char* short_name)
+{
+    u32 index = 0u;
+    u32 written = 0u;
+    u32 extension = 0u;
+    while (index < 11u)
+    {
+        short_name[index] = ' ';
+        index = index + 1u;
+    }
+    index = 0u;
+    while (index < length && name[index] != '.')
+    {
+        int ch = ascii_to_upper((int)name[index]);
+        if (written >= 8u || !fat_name_char_valid(ch))
+            return 0;
+        short_name[written] = (char)ch;
+        written = written + 1u;
+        index = index + 1u;
+    }
+    if (written == 0u)
+        return 0;
+    if (index < length)
+    {
+        index = index + 1u;
+        while (index < length)
+        {
+            int ch = ascii_to_upper((int)name[index]);
+            if (extension >= 3u || !fat_name_char_valid(ch))
+                return 0;
+            short_name[8u + extension] = (char)ch;
+            extension = extension + 1u;
+            index = index + 1u;
+        }
+    }
+    return 1;
+}
+
+// The cluster a directory says its parent lives in, which is zero for the root
+static int fat_parent_cluster(u32 directory, u32* out)
+{
+    if (!dir_sector_load(fat_cluster_lba(directory)))
+        return 0;
+    if (dir_buffer[32] != (u8)'.' || dir_buffer[33] != (u8)'.')
+        return 0;
+    *out = ((u32)le16(dir_buffer + 52) << 16) | (u32)le16(dir_buffer + 58);
+    if (*out == 0u)
+        *out = boot_volume.root_cluster;
+    return 1;
+}
+
+static int vfs_component_lookup(struct vfs_node* directory, const char* name, u32 length, struct vfs_node* out)
 {
     char short_name[11];
-    u32 first_cluster;
-    u32 size;
-    if (path_is_root(path))
+
+    if (component_equals(name, length, "."))
     {
-        node->type = VFS_NODE_ROOT_DIR;
-        node->first_cluster = boot_volume.root_cluster;
-        node->size = 0u;
-        node->mode = S_IFDIR | 365u;
+        *out = *directory;
         return 1;
     }
-    if (path_equal_literal_skip_root(path, "dev"))
+
+    if (directory->type == VFS_NODE_DEV_DIR)
     {
-        node->type = VFS_NODE_DEV_DIR;
-        node->first_cluster = 0u;
-        node->size = 0u;
-        node->mode = S_IFDIR | 365u;
-        return 1;
-    }
-    if (path_equal_literal_skip_root(path, "dev/console") || path_equal_literal_skip_root(path, "dev/tty") || path_equal_literal_skip_root(path, "dev/ttyS0"))
-    {
-        node->type = VFS_NODE_CONSOLE;
-        node->first_cluster = 0u;
-        node->size = 0u;
-        node->mode = S_IFCHR | 438u;
-        return 1;
-    }
-    if (path_equal_literal_skip_root(path, "dev/null"))
-    {
-        node->type = VFS_NODE_NULL;
-        node->first_cluster = 0u;
-        node->size = 0u;
-        node->mode = S_IFCHR | 438u;
-        return 1;
-    }
-    if (path_equal_literal_skip_root(path, "dev/zero"))
-    {
-        node->type = VFS_NODE_ZERO;
-        node->first_cluster = 0u;
-        node->size = 0u;
-        node->mode = S_IFCHR | 438u;
-        return 1;
-    }
-    if (!path_to_fat_short_name(path, short_name))
+        if (component_equals(name, length, ".."))
+        {
+            vfs_root_node(out);
+            return 1;
+        }
+        if (component_equals(name, length, "console") || component_equals(name, length, "tty") ||
+            component_equals(name, length, "ttyS0"))
+        {
+            vfs_device_node(out, VFS_NODE_CONSOLE);
+            return 1;
+        }
+        if (component_equals(name, length, "null"))
+        {
+            vfs_device_node(out, VFS_NODE_NULL);
+            return 1;
+        }
+        if (component_equals(name, length, "zero"))
+        {
+            vfs_device_node(out, VFS_NODE_ZERO);
+            return 1;
+        }
         return 0;
-    if (!fat_find_short(short_name, &first_cluster, &size))
+    }
+
+    if (directory->type != VFS_NODE_ROOT_DIR && directory->type != VFS_NODE_FAT_DIR)
         return 0;
-    node->type = VFS_NODE_FAT_FILE;
-    node->first_cluster = first_cluster;
-    node->size = size;
-    node->mode = S_IFREG | 365u;
+
+    if (component_equals(name, length, ".."))
+    {
+        u32 parent;
+        if (directory->type == VFS_NODE_ROOT_DIR)
+        {
+            vfs_root_node(out);
+            return 1;
+        }
+        if (!fat_parent_cluster(directory->first_cluster, &parent))
+            return 0;
+        if (parent == boot_volume.root_cluster)
+            vfs_root_node(out);
+        else
+        {
+            out->type = VFS_NODE_FAT_DIR;
+            out->first_cluster = parent;
+            out->size = 0u;
+            out->mode = S_IFDIR | 493u;
+            out->entry_lba = 0u;
+            out->entry_offset = 0u;
+        }
+        return 1;
+    }
+
+    // The device directory hangs off the root and lives nowhere on the volume
+    if (directory->type == VFS_NODE_ROOT_DIR && component_equals(name, length, "dev"))
+    {
+        vfs_device_node(out, VFS_NODE_DEV_DIR);
+        return 1;
+    }
+
+    if (!component_to_short_name(name, length, short_name))
+        return 0;
+    return fat_find_in(directory->first_cluster, short_name, out);
+}
+
+static int vfs_walk(struct vfs_node* start, const char* path, struct path_result* result)
+{
+    struct vfs_node current;
+    const char* cursor = path;
+
+    if (*cursor == '/')
+    {
+        vfs_root_node(&current);
+        while (*cursor == '/')
+            cursor = cursor + 1;
+    }
+    else
+    {
+        current = *start;
+    }
+
+    result->has_parent = 0u;
+    result->has_node = 1u;
+    result->leaf_valid = 0u;
+    result->node = current;
+
+    for (;;)
+    {
+        const char* begin = cursor;
+        u32 length = 0u;
+        while (*cursor != 0 && *cursor != '/')
+        {
+            cursor = cursor + 1;
+            length = length + 1u;
+        }
+        if (length != 0u)
+        {
+            struct vfs_node next;
+            result->parent = current;
+            result->has_parent = 1u;
+            result->leaf_valid = (u32)component_to_short_name(begin, length, result->leaf);
+            if (!vfs_component_lookup(&current, begin, length, &next))
+            {
+                result->has_node = 0u;
+                while (*cursor == '/')
+                    cursor = cursor + 1;
+                return *cursor == 0 ? 1 : 0;
+            }
+            current = next;
+            result->node = current;
+            result->has_node = 1u;
+        }
+        while (*cursor == '/')
+            cursor = cursor + 1;
+        if (*cursor == 0)
+            return 1;
+    }
+}
+
+static struct vfs_node* vfs_working_directory(void);
+
+static int vfs_lookup(const char* path, struct vfs_node* node)
+{
+    struct path_result walked;
+    if (!vfs_walk(vfs_working_directory(), path, &walked) || !walked.has_node)
+        return 0;
+    *node = walked.node;
+    return 1;
+}
+
+static int fat_find_short(const char* short_name, u32* first_cluster, u32* size)
+{
+    struct vfs_node found;
+    if (!fat_find_in(boot_volume.root_cluster, short_name, &found))
+        return 0;
+    *first_cluster = found.first_cluster;
+    *size = found.size;
     return 1;
 }
 
@@ -3037,6 +3718,7 @@ static int fat_read_at(struct vfs_node* node, u64 offset, void* destination, u32
 {
     u32 cluster = node->first_cluster;
     u64 cluster_size = (u64)boot_volume.sectors_per_cluster * (u64)SECTOR_SIZE;
+    u64 cluster_index;
     u64 skip_clusters;
     u64 inner_offset;
     u8* dst = (u8*)destination;
@@ -3052,8 +3734,18 @@ static int fat_read_at(struct vfs_node* node, u64 offset, void* destination, u32
     if (count == 0u)
         return 1;
 
-    skip_clusters = offset / cluster_size;
-    inner_offset = offset - skip_clusters * cluster_size;
+    cluster_index = offset / cluster_size;
+    inner_offset = offset - cluster_index * cluster_size;
+    skip_clusters = cluster_index;
+
+    // Reading a file in order otherwise walks its chain again from the start on every call
+    if (fat_walk_first_cluster == node->first_cluster && fat_walk_index <= cluster_index &&
+        fat_walk_cluster >= 2u && fat_walk_cluster < FAT_EOC)
+    {
+        cluster = fat_walk_cluster;
+        skip_clusters = cluster_index - fat_walk_index;
+    }
+
     while (skip_clusters != 0ul)
     {
         cluster = fat_next_cluster(cluster);
@@ -3063,6 +3755,10 @@ static int fat_read_at(struct vfs_node* node, u64 offset, void* destination, u32
             return 0;
         skip_clusters = skip_clusters - 1ul;
     }
+
+    fat_walk_first_cluster = node->first_cluster;
+    fat_walk_cluster = cluster;
+    fat_walk_index = cluster_index;
 
     while (done < count)
     {
@@ -3082,6 +3778,9 @@ static int fat_read_at(struct vfs_node* node, u64 offset, void* destination, u32
             cluster = fat_next_cluster(cluster);
             if (cluster == FAT_READ_ERROR || cluster < 2u || cluster >= FAT_EOC)
                 return 0;
+            cluster_index = cluster_index + 1ul;
+            fat_walk_cluster = cluster;
+            fat_walk_index = cluster_index;
         }
     }
 
@@ -3128,6 +3827,8 @@ static void fd_install(u32 fd, struct vfs_node* node, u64 flags)
     open_files[fd].node.first_cluster = node->first_cluster;
     open_files[fd].node.size = node->size;
     open_files[fd].node.mode = node->mode;
+    open_files[fd].node.entry_lba = node->entry_lba;
+    open_files[fd].node.entry_offset = node->entry_offset;
 }
 
 static void vfs_init(void)
@@ -3264,6 +3965,32 @@ static s64 console_write_from_user(u64 buffer, u64 count)
     return (s64)count;
 }
 
+// Carries what a program wrote into the file it named, a page of its memory at a time
+static s64 fat_write_from_user(struct file_descriptor* file, u64 buffer, u64 count)
+{
+    u64 done = 0ul;
+    if ((file->flags & O_APPEND) != 0ul)
+        file->offset = (u64)file->node.size;
+    while (done < count)
+    {
+        u64 physical;
+        u64 chunk;
+        u32 written;
+        if (!user_translate(current_user_root_page_table, buffer + done, PTE_R, &physical))
+            return -14l;
+        chunk = PAGE_SIZE - (physical & PAGE_MASK);
+        if (chunk > count - done)
+            chunk = count - done;
+        if (!fat_write_at(&file->node, file->offset, (const u8*)physical, (u32)chunk, &written))
+            return done != 0ul ? (s64)done : -5l;
+        file->offset = file->offset + (u64)written;
+        done = done + (u64)written;
+        if (written == 0u)
+            break;
+    }
+    return (s64)done;
+}
+
 static s64 vfs_write(u64 fd_value, u64 buffer, u64 count)
 {
     struct file_descriptor* file;
@@ -3278,7 +4005,9 @@ static s64 vfs_write(u64 fd_value, u64 buffer, u64 count)
         return console_write_from_user(buffer, count);
     if (type == VFS_NODE_NULL || type == VFS_NODE_ZERO)
         return (s64)count;
-    if (type == VFS_NODE_FAT_FILE || type == VFS_NODE_ROOT_DIR || type == VFS_NODE_DEV_DIR)
+    if (type == VFS_NODE_FAT_FILE)
+        return fat_write_from_user(file, buffer, count);
+    if (type == VFS_NODE_ROOT_DIR || type == VFS_NODE_DEV_DIR)
         return -30l;
     return -9l;
 }
@@ -3286,6 +4015,7 @@ static s64 vfs_write(u64 fd_value, u64 buffer, u64 count)
 static s64 vfs_openat(u64 dirfd, u64 path_pointer, u64 flags, u64 mode)
 {
     char path[PATH_BUFFER_SIZE];
+    struct path_result walked;
     struct vfs_node node;
     int fd;
     (void)mode;
@@ -3293,17 +4023,225 @@ static s64 vfs_openat(u64 dirfd, u64 path_pointer, u64 flags, u64 mode)
         return -9l;
     if (!copy_user_string(path_pointer, path, PATH_BUFFER_SIZE))
         return -14l;
-    if (!vfs_lookup(path, &node))
+    if (!vfs_walk_at(dirfd, path, &walked))
         return -2l;
-    if ((node.type == VFS_NODE_ROOT_DIR || node.type == VFS_NODE_DEV_DIR) && ((flags & O_ACCMODE) != 0ul))
+    if (!walked.has_node)
+    {
+        u32 entry_lba;
+        u32 entry_offset;
+        if ((flags & O_CREAT) == 0ul)
+            return -2l;
+        if (!walked.has_parent || !walked.leaf_valid)
+            return -22l;
+        if (walked.parent.type != VFS_NODE_ROOT_DIR && walked.parent.type != VFS_NODE_FAT_DIR)
+            return -30l;
+        if (!fat_create_in(walked.parent.first_cluster, walked.leaf, 0u, &entry_lba, &entry_offset))
+            return -28l;
+        node.type = VFS_NODE_FAT_FILE;
+        node.first_cluster = 0u;
+        node.size = 0u;
+        node.mode = S_IFREG | 438u;
+        node.entry_lba = entry_lba;
+        node.entry_offset = entry_offset;
+    }
+    else
+    {
+        node = walked.node;
+        if (node.type == VFS_NODE_FAT_FILE && (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL))
+            return -17l;
+    }
+    if ((node.type == VFS_NODE_ROOT_DIR || node.type == VFS_NODE_DEV_DIR || node.type == VFS_NODE_FAT_DIR) &&
+        ((flags & O_ACCMODE) != 0ul))
+    {
         return -21l;
-    if (node.type == VFS_NODE_FAT_FILE && ((flags & O_ACCMODE) != 0ul))
-        return -30l;
+    }
+    // Opening for writing with a truncation gives back everything the file held
+    if (node.type == VFS_NODE_FAT_FILE && (flags & O_TRUNC) != 0ul && (flags & O_ACCMODE) != O_RDONLY)
+    {
+        if (!fat_free_chain(node.first_cluster))
+            return -5l;
+        node.first_cluster = 0u;
+        node.size = 0u;
+        if (!fat_write_entry(&node))
+            return -5l;
+    }
     fd = fd_alloc();
     if (fd < 0)
         return -24l;
     fd_install((u32)fd, &node, flags);
     return (s64)fd;
+}
+
+static struct vfs_node vfs_fallback_directory;
+
+// Before there is a process to ask, a walk starts where the volume does
+static struct vfs_node* vfs_working_directory(void)
+{
+    if (current_task == (struct process*)NULL || current_task->cwd.type == VFS_NODE_NONE)
+    {
+        vfs_root_node(&vfs_fallback_directory);
+        return &vfs_fallback_directory;
+    }
+    return &current_task->cwd;
+}
+
+// A walk may start at a descriptor rather than the working directory, which is what the at calls are for
+static int vfs_walk_at(u64 dirfd, const char* path, struct path_result* result)
+{
+    if (dirfd == AT_FDCWD || path[0] == '/')
+        return vfs_walk(vfs_working_directory(), path, result);
+    if (!fd_valid(dirfd))
+        return 0;
+    return vfs_walk(&open_files[(u32)dirfd].node, path, result);
+}
+
+// Builds the name a working directory will answer with, resolving what the path says about itself
+static int path_canonical(const char* base, const char* path, char* out, u32 capacity)
+{
+    u32 length = 0u;
+    const char* cursor = path;
+
+    if (*cursor == '/')
+    {
+        out[0] = '/';
+        length = 1u;
+        while (*cursor == '/')
+            cursor = cursor + 1;
+    }
+    else
+    {
+        while (base[length] != 0 && length + 1u < capacity)
+        {
+            out[length] = base[length];
+            length = length + 1u;
+        }
+        if (length == 0u)
+        {
+            out[0] = '/';
+            length = 1u;
+        }
+    }
+
+    for (;;)
+    {
+        const char* begin = cursor;
+        u32 size = 0u;
+        while (*cursor != 0 && *cursor != '/')
+        {
+            cursor = cursor + 1;
+            size = size + 1u;
+        }
+        if (size != 0u && !component_equals(begin, size, "."))
+        {
+            if (component_equals(begin, size, ".."))
+            {
+                while (length > 1u && out[length - 1u] != '/')
+                    length = length - 1u;
+                if (length > 1u)
+                    length = length - 1u;
+            }
+            else
+            {
+                u32 index = 0u;
+                if (length != 1u)
+                {
+                    if (length + 1u >= capacity)
+                        return 0;
+                    out[length] = '/';
+                    length = length + 1u;
+                }
+                while (index < size)
+                {
+                    if (length + 1u >= capacity)
+                        return 0;
+                    out[length] = begin[index];
+                    length = length + 1u;
+                    index = index + 1u;
+                }
+            }
+        }
+        while (*cursor == '/')
+            cursor = cursor + 1;
+        if (*cursor == 0)
+            break;
+    }
+
+    out[length] = 0;
+    return 1;
+}
+
+static s64 vfs_chdir(u64 path_pointer)
+{
+    char path[PATH_BUFFER_SIZE];
+    char canonical[PATH_BUFFER_SIZE];
+    struct path_result walked;
+    if (!copy_user_string(path_pointer, path, PATH_BUFFER_SIZE))
+        return -14l;
+    if (!vfs_walk(vfs_working_directory(), path, &walked) || !walked.has_node)
+        return -2l;
+    if (walked.node.type != VFS_NODE_ROOT_DIR && walked.node.type != VFS_NODE_FAT_DIR &&
+        walked.node.type != VFS_NODE_DEV_DIR)
+        return -20l;
+    if (!path_canonical(current_task->cwd_path, path, canonical, PATH_BUFFER_SIZE))
+        return -36l;
+    current_task->cwd = walked.node;
+    {
+        u32 index = 0u;
+        while (canonical[index] != 0 && index + 1u < PATH_BUFFER_SIZE)
+        {
+            current_task->cwd_path[index] = canonical[index];
+            index = index + 1u;
+        }
+        current_task->cwd_path[index] = 0;
+    }
+    return 0l;
+}
+
+static s64 vfs_mkdirat(u64 dirfd, u64 path_pointer, u64 mode)
+{
+    char path[PATH_BUFFER_SIZE];
+    struct path_result walked;
+    struct vfs_node made;
+    (void)mode;
+    if (!copy_user_string(path_pointer, path, PATH_BUFFER_SIZE))
+        return -14l;
+    if (!vfs_walk_at(dirfd, path, &walked))
+        return -2l;
+    if (walked.has_node)
+        return -17l;
+    if (!walked.has_parent || !walked.leaf_valid)
+        return -22l;
+    if (walked.parent.type != VFS_NODE_ROOT_DIR && walked.parent.type != VFS_NODE_FAT_DIR)
+        return -30l;
+    return fat_make_directory(walked.parent.first_cluster, walked.leaf, &made) ? 0l : -28l;
+}
+
+static s64 vfs_unlinkat(u64 dirfd, u64 path_pointer, u64 flags)
+{
+    char path[PATH_BUFFER_SIZE];
+    struct path_result walked;
+    int removing_directory = (flags & AT_REMOVEDIR) != 0ul;
+
+    if (!copy_user_string(path_pointer, path, PATH_BUFFER_SIZE))
+        return -14l;
+    if (!vfs_walk_at(dirfd, path, &walked) || !walked.has_node)
+        return -2l;
+    if (!walked.has_parent || !walked.leaf_valid)
+        return -22l;
+    if (removing_directory)
+    {
+        if (walked.node.type != VFS_NODE_FAT_DIR)
+            return walked.node.type == VFS_NODE_ROOT_DIR ? -16l : -20l;
+        if (!fat_directory_is_empty(walked.node.first_cluster))
+            return -39l;
+    }
+    else if (walked.node.type != VFS_NODE_FAT_FILE)
+    {
+        return walked.node.type == VFS_NODE_FAT_DIR ? -21l : -1l;
+    }
+    if (walked.parent.type != VFS_NODE_ROOT_DIR && walked.parent.type != VFS_NODE_FAT_DIR)
+        return -30l;
+    return fat_remove_in(walked.parent.first_cluster, walked.leaf) ? 0l : -5l;
 }
 
 static s64 vfs_close(u64 fd)
@@ -3370,9 +4308,9 @@ static void fat_format_short_name(const u8* entry, char* name)
     name[output] = 0;
 }
 
-static int fat_root_entry_at(u64 requested, char* name, u32* type, u64* inode)
+static int fat_entry_at(u32 directory, u64 requested, char* name, u32* type, u64* inode)
 {
-    u32 cluster = boot_volume.root_cluster;
+    u32 cluster = directory;
     u64 current = 0ul;
     while (cluster >= 2u && cluster < FAT_EOC)
     {
@@ -3381,13 +4319,8 @@ static int fat_root_entry_at(u64 requested, char* name, u32* type, u64* inode)
         {
             u32 lba = fat_cluster_lba(cluster) + sector_index;
             u32 offset = 0u;
-            if (dir_buffer_valid == 0ul || dir_buffer_lba != lba)
-            {
-                if (!disk_read_sector(lba, dir_buffer))
-                    return 0;
-                dir_buffer_lba = lba;
-                dir_buffer_valid = 1ul;
-            }
+            if (!dir_sector_load(lba))
+                return 0;
             while (offset < SECTOR_SIZE)
             {
                 u8* entry = dir_buffer + offset;
@@ -3478,8 +4411,11 @@ static s64 vfs_getdents64(u64 fd_value, u64 user_buffer, u64 count)
     if (!fd_valid(fd_value))
         return -9l;
     file = &open_files[(u32)fd_value];
-    if (file->node.type != VFS_NODE_ROOT_DIR && file->node.type != VFS_NODE_DEV_DIR)
+    if (file->node.type != VFS_NODE_ROOT_DIR && file->node.type != VFS_NODE_DEV_DIR &&
+        file->node.type != VFS_NODE_FAT_DIR)
+    {
         return -20l;
+    }
     while (done < count)
     {
         const char* name;
@@ -3494,10 +4430,16 @@ static s64 vfs_getdents64(u64 fd_value, u64 user_buffer, u64 count)
             type = root_dir_entry_type(file->offset);
             if (name == NULL)
             {
-                if (file->offset < 3ul || !fat_root_entry_at(file->offset - 3ul, fat_name, &type, &inode))
+                if (file->offset < 3ul || !fat_entry_at(file->node.first_cluster, file->offset - 3ul, fat_name, &type, &inode))
                     break;
                 name = fat_name;
             }
+        }
+        else if (file->node.type == VFS_NODE_FAT_DIR)
+        {
+            if (!fat_entry_at(file->node.first_cluster, file->offset, fat_name, &type, &inode))
+                break;
+            name = fat_name;
         }
         else
         {
@@ -3557,7 +4499,8 @@ static void stat_store_node(u8* stat_buffer, struct vfs_node* node)
     store_le64(stat_buffer + 0, 1ul);
     store_le64(stat_buffer + 8, ((u64)node->type << 32) | (u64)node->first_cluster);
     store_le32(stat_buffer + 16, node->mode);
-    store_le32(stat_buffer + 20, node->type == VFS_NODE_ROOT_DIR || node->type == VFS_NODE_DEV_DIR ? 2u : 1u);
+    store_le32(stat_buffer + 20, node->type == VFS_NODE_ROOT_DIR || node->type == VFS_NODE_DEV_DIR ||
+        node->type == VFS_NODE_FAT_DIR ? 2u : 1u);
     store_le32(stat_buffer + 24, 0u);
     store_le32(stat_buffer + 28, 0u);
     store_le64(stat_buffer + 32, node->type == VFS_NODE_CONSOLE ? 1ul : 0ul);
@@ -3669,12 +4612,11 @@ static s64 sys_reboot_impl(u64 magic1, u64 magic2, u64 cmd)
 
 static s64 sys_getcwd_impl(u64 user_buffer, u64 size)
 {
-    char cwd[2];
-    if (size < 2ul)
+    const char* cwd = current_task->cwd_path[0] != 0 ? current_task->cwd_path : "/";
+    u64 length = (u64)string_length(cwd) + 1ul;
+    if (size < length)
         return -34l;
-    cwd[0] = '/';
-    cwd[1] = 0;
-    if (!user_copy_to_writable(current_user_root_page_table, user_buffer, cwd, 2ul))
+    if (!user_copy_to_writable(current_user_root_page_table, user_buffer, cwd, length))
         return -14l;
     return (s64)user_buffer;
 }
@@ -4155,7 +5097,7 @@ static int build_user_stack(u64 root, struct elf_image* image, struct exec_argum
 {
     u64 strings = USER_STACK_TOP - (u64)arguments->bytes_used;
     u64 sp;
-    u64 stack[MAX_EXEC_ARGS + 23u];
+    u64 stack[MAX_EXEC_ARGS * 2u + 24u];
     u32 word = 0u;
     u32 index = 0u;
     if (arguments->count == 0u)
@@ -4170,6 +5112,13 @@ static int build_user_stack(u64 root, struct elf_image* image, struct exec_argum
     }
     stack[word] = 0ul;
     word = word + 1u;
+    index = 0u;
+    while (index < arguments->environment_count)
+    {
+        stack[word] = strings + (u64)arguments->environment_offsets[index];
+        word = word + 1u;
+        index = index + 1u;
+    }
     stack[word] = 0ul;
     word = word + 1u;
     stack[word] = AT_PAGESZ;
@@ -4289,6 +5238,21 @@ void kernel_trap_dispatch(struct trap_frame* frame)
             frame->x[10] = (u64)sys_ioctl_impl(frame->x[10], frame->x[11], frame->x[12]);
             return;
         }
+        if (nr == SYS_CHDIR)
+        {
+            frame->x[10] = (u64)vfs_chdir(frame->x[10]);
+            return;
+        }
+        if (nr == SYS_MKDIRAT)
+        {
+            frame->x[10] = (u64)vfs_mkdirat(frame->x[10], frame->x[11], frame->x[12]);
+            return;
+        }
+        if (nr == SYS_UNLINKAT)
+        {
+            frame->x[10] = (u64)vfs_unlinkat(frame->x[10], frame->x[11], frame->x[12]);
+            return;
+        }
         if (nr == SYS_READLINKAT)
         {
             frame->x[10] = (u64)sys_readlinkat_impl(frame->x[10], frame->x[11], frame->x[12], frame->x[13]);
@@ -4401,6 +5365,23 @@ void kernel_trap_dispatch(struct trap_frame* frame)
             return;
     }
 
+    // A fault a program took is the program's to die of; only the kernel's own are fatal
+    if ((frame->sstatus & SSTATUS_SPP) == 0ul && current_task != (struct process*)NULL && current_task->used != 0u)
+    {
+        puts("kernel: process ");
+        put_dec(current_task->pid);
+        puts(" faulted, cause=");
+        put_hex64(frame->scause);
+        puts(" sepc=");
+        put_hex64(frame->sepc);
+        puts(" stval=");
+        put_hex64(frame->stval);
+        puts("\n");
+        current_task->exit_signal = (u32)fault_signal(cause);
+        process_exit_current(frame, 0ul);
+        return;
+    }
+
     puts("kernel: trap cause=");
     put_hex64(frame->scause);
     puts(" sepc=");
@@ -4435,7 +5416,7 @@ void kernel_main(u64 hartid, void* fdt)
         panic("block subsystem init failed");
     if (!fat_mount())
         panic("boot FAT32 mount failed");
-    init_read_result = fat_read_short_to_memory("INIT    ELF", (void*)USER_ELF_BUFFER, (u32)USER_ELF_BUFFER_SIZE, &init_size);
+    init_read_result = fat_read_short_to_memory("INIT       ", (void*)USER_ELF_BUFFER, (u32)USER_ELF_BUFFER_SIZE, &init_size);
     if (init_read_result == 1u)
         panic("INIT.ELF directory entry not found");
     if (init_read_result == 2u)

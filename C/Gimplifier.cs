@@ -5,2459 +5,2744 @@ using System.Globalization;
 using System.Linq;
 using System.Text;
 
-namespace Cnidaria.C
+namespace Cnidaria.C;
+
+/// <summary>Lowers bound declarations and expressions into explicit blocks and temporaries</summary>
+internal sealed class Gimplifier
 {
-    /// <summary>Lowers bound declarations and expressions into explicit blocks and temporaries</summary>
-    internal sealed class Gimplifier
+    private readonly TypeCatalog _types = TypeCatalog.Instance;
+
+    // Function-local lowering state is reset before each definition
+    private readonly Dictionary<LabelSymbol, GimpleLabel> _labels = new();
+    private readonly Stack<GimpleLabel> _breakTargets = new();
+    private readonly Stack<GimpleLabel> _continueTargets = new();
+    private readonly Stack<SwitchContext> _switches = new();
+    private readonly List<BlockBuilder> _blocks = new();
+    private readonly List<GimpleTemporaryValue> _temporaries = new();
+
+    private FunctionSymbol? _currentFunction;
+    private BlockBuilder? _currentBlock;
+    private int _labelOrdinal;
+    private int _temporaryOrdinal;
+
+    private readonly TargetInfo _target;
+
+    private Gimplifier(TargetInfo target)
     {
-        private readonly TypeCatalog _types = TypeCatalog.Instance;
+        _target = target ?? TargetInfo.Default;
+    }
 
-        // Function-local lowering state is reset before each definition
-        private readonly Dictionary<LabelSymbol, GimpleLabel> _labels = new();
-        private readonly Stack<GimpleLabel> _breakTargets = new();
-        private readonly Stack<GimpleLabel> _continueTargets = new();
-        private readonly Stack<SwitchContext> _switches = new();
-        private readonly List<BlockBuilder> _blocks = new();
-        private readonly List<GimpleTemporaryValue> _temporaries = new();
+    /// <summary>Lowers a semantic model into a lowered tree</summary>
+    internal static GimpleTree Lower(SemanticModel semanticModel)
+    {
+        if (semanticModel is null)
+            throw new ArgumentNullException(nameof(semanticModel));
 
-        private FunctionSymbol? _currentFunction;
-        private BlockBuilder? _currentBlock;
-        private int _labelOrdinal;
-        private int _temporaryOrdinal;
+        return Lower(semanticModel.GetBoundTree());
+    }
 
-        private Gimplifier()
+    /// <summary>Lowers all bound top-level members</summary>
+    /// <remarks>Preserves source order</remarks>
+    private static GimpleTree Lower(BoundTree boundTree)
+    {
+        if (boundTree is null)
+            throw new ArgumentNullException(nameof(boundTree));
+
+        var lowerer = new Gimplifier(boundTree.SemanticModel.Compilation.Options.Target);
+        var members = ImmutableArray.CreateBuilder<GimpleNode>();
+
+        foreach (var member in boundTree.Root.Members)
+            members.Add(lowerer.LowerTopLevelMember(member));
+
+        return new GimpleTree(boundTree.SemanticModel, members.ToImmutable(), boundTree.Diagnostics);
+    }
+
+    private GimpleNode LowerTopLevelMember(BoundNode node)
+    {
+        switch (node)
         {
+            case BoundFunctionDefinition function:
+                return LowerFunction(function);
+
+            case BoundDeclaration declaration:
+                return LowerGlobalDeclaration(declaration);
+
+            case BoundStaticAssertDeclaration staticAssert:
+                return new GimpleStaticAssertDeclaration(
+                    staticAssert.Syntax,
+                    LowerStaticExpression(staticAssert.Condition),
+                    staticAssert.Message is null ? null : LowerStaticExpression(staticAssert.Message));
+
+            default:
+                return new GimpleSkippedDeclaration(node.Syntax);
         }
+    }
 
-        /// <summary>Lowers a semantic model into a lowered tree</summary>
-        internal static GimpleTree Lower(SemanticModel semanticModel)
+    private GimpleGlobalDeclaration LowerGlobalDeclaration(BoundDeclaration declaration)
+    {
+        var declarators = ImmutableArray.CreateBuilder<GimpleVariableDeclaration>();
+        foreach (var declarator in declaration.Declarators)
+            declarators.Add(LowerVariableDeclaration(declarator, declaration.StorageClass, includeInitializer: true));
+
+        return new GimpleGlobalDeclaration(
+            declaration.Syntax,
+            declaration.StorageClass,
+            declarators.ToImmutable());
+    }
+
+    private GimpleVariableDeclaration LowerVariableDeclaration(
+        BoundDeclarator declarator,
+        StorageClass storageClass,
+        bool includeInitializer)
+    {
+        var initializer = includeInitializer && declarator.Initializer is not null
+            ? LowerInitializerForDeclaration(declarator.Initializer)
+            : null;
+
+        return new GimpleVariableDeclaration(
+            declarator.Symbol,
+            declarator.Type,
+            storageClass,
+            initializer,
+            declarator.Syntax);
+    }
+
+    // Global initializers are represented without emitting function statements
+    private GimpleInitializer LowerInitializerForDeclaration(BoundInitializer initializer)
+    {
+        switch (initializer)
         {
-            if (semanticModel is null)
-                throw new ArgumentNullException(nameof(semanticModel));
+            case BoundExpressionInitializer expressionInitializer:
+                return new GimpleExpressionInitializer(
+                    expressionInitializer.Syntax,
+                    expressionInitializer.TargetType,
+                    LowerStaticExpression(expressionInitializer.Expression));
 
-            return Lower(semanticModel.GetBoundTree());
-        }
-
-        /// <summary>Lowers all bound top-level members</summary>
-        /// <remarks>Preserves source order</remarks>
-        private static GimpleTree Lower(BoundTree boundTree)
-        {
-            if (boundTree is null)
-                throw new ArgumentNullException(nameof(boundTree));
-
-            var lowerer = new Gimplifier();
-            var members = ImmutableArray.CreateBuilder<GimpleNode>();
-
-            foreach (var member in boundTree.Root.Members)
-                members.Add(lowerer.LowerTopLevelMember(member));
-
-            return new GimpleTree(boundTree.SemanticModel, members.ToImmutable(), boundTree.Diagnostics);
-        }
-
-        private GimpleNode LowerTopLevelMember(BoundNode node)
-        {
-            switch (node)
-            {
-                case BoundFunctionDefinition function:
-                    return LowerFunction(function);
-
-                case BoundDeclaration declaration:
-                    return LowerGlobalDeclaration(declaration);
-
-                case BoundStaticAssertDeclaration staticAssert:
-                    return new GimpleStaticAssertDeclaration(
-                        staticAssert.Syntax,
-                        LowerStaticExpression(staticAssert.Condition),
-                        staticAssert.Message is null ? null : LowerStaticExpression(staticAssert.Message));
-
-                default:
-                    return new GimpleSkippedDeclaration(node.Syntax);
-            }
-        }
-
-        private GimpleGlobalDeclaration LowerGlobalDeclaration(BoundDeclaration declaration)
-        {
-            var declarators = ImmutableArray.CreateBuilder<GimpleVariableDeclaration>();
-            foreach (var declarator in declaration.Declarators)
-                declarators.Add(LowerVariableDeclaration(declarator, declaration.StorageClass, includeInitializer: true));
-
-            return new GimpleGlobalDeclaration(
-                declaration.Syntax,
-                declaration.StorageClass,
-                declarators.ToImmutable());
-        }
-
-        private GimpleVariableDeclaration LowerVariableDeclaration(
-            BoundDeclarator declarator,
-            StorageClass storageClass,
-            bool includeInitializer)
-        {
-            var initializer = includeInitializer && declarator.Initializer is not null
-                ? LowerInitializerForDeclaration(declarator.Initializer)
-                : null;
-
-            return new GimpleVariableDeclaration(
-                declarator.Symbol,
-                declarator.Type,
-                storageClass,
-                initializer,
-                declarator.Syntax);
-        }
-
-        // Global initializers are represented without emitting function statements
-        private GimpleInitializer LowerInitializerForDeclaration(BoundInitializer initializer)
-        {
-            switch (initializer)
-            {
-                case BoundExpressionInitializer expressionInitializer:
-                    return new GimpleExpressionInitializer(
-                        expressionInitializer.Syntax,
-                        expressionInitializer.TargetType,
-                        LowerStaticExpression(expressionInitializer.Expression));
-
-                case BoundInitializerList initializerList:
+            case BoundInitializerList initializerList:
+                {
+                    var items = ImmutableArray.CreateBuilder<GimpleInitializerListItem>();
+                    foreach (var item in initializerList.Items)
                     {
-                        var items = ImmutableArray.CreateBuilder<GimpleInitializerListItem>();
-                        foreach (var item in initializerList.Items)
-                        {
-                            items.Add(new GimpleInitializerListItem(
-                                item.Syntax,
-                                item.Designators,
-                                LowerInitializerForDeclaration(item.Initializer),
-                                item.ElementIndex));
-                        }
-
-                        return new GimpleInitializerList(
-                            initializerList.Syntax,
-                            initializerList.TargetType,
-                            initializerList.TargetType.Type is ArrayType
-                                ? PlaceArrayInitializerItems(items)
-                                : items.ToImmutable());
+                        items.Add(new GimpleInitializerListItem(
+                            item.Syntax,
+                            item.Designators,
+                            LowerInitializerForDeclaration(item.Initializer),
+                            item.ElementIndex));
                     }
 
-                default:
-                    return new GimpleExpressionInitializer(
-                        initializer.Syntax,
-                        initializer.TargetType,
-                        CreateZeroValue(initializer.TargetType, initializer.Syntax));
-            }
-        }
+                    var list = new GimpleInitializerList(
+                        initializerList.Syntax,
+                        initializerList.TargetType,
+                        initializerList.TargetType.Type is ArrayType
+                            ? PlaceArrayInitializerItems(items)
+                            : items.ToImmutable());
 
-        /// <summary>Lowers one function into labeled blocks and allocated temporaries</summary>
-        private GimpleFunctionDefinition LowerFunction(BoundFunctionDefinition function)
-        {
-            ResetFunctionState(function.Symbol);
-
-            var entry = CreateGeneratedLabel("entry");
-            StartBlock(entry);
-            LowerCompoundStatement(function.Body);
-
-            if (!IsCurrentBlockTerminated())
-            {
-                GimpleValue? expression = null;
-                var returnType = function.Symbol?.FunctionType?.ReturnType;
-                if (returnType.HasValue &&
-                    returnType.Value.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Int } &&
-                    string.Equals(function.Symbol?.Name, "main", StringComparison.Ordinal))
-                {
-                    expression = CreateZeroValue(returnType.Value, function.Syntax);
+                    return TryPackBitFieldImage(list, out var packed) ? packed : list;
                 }
 
-                Emit(new GimpleReturnStatement(function.Symbol, expression, function.Syntax));
-            }
+            default:
+                return new GimpleExpressionInitializer(
+                    initializer.Syntax,
+                    initializer.TargetType,
+                    CreateZeroValue(initializer.TargetType, initializer.Syntax));
+        }
+    }
 
-            var blocks = _blocks.Select(static block => block.ToImmutable()).ToImmutableArray();
-            return new GimpleFunctionDefinition(
-                function.Syntax,
-                function.Symbol,
-                _temporaries.ToImmutableArray(),
-                blocks,
-                entry);
+    /// <summary>Rewrites a tag that packs bit-fields as the bytes it occupies, which every back end already emits</summary>
+    private bool TryPackBitFieldImage(GimpleInitializerList list, out GimpleInitializer packed)
+    {
+        packed = list;
+        if (list.TargetType.Type is not TagType tag || !HasBitFields(tag.Symbol))
+            return false;
+
+        var size = _target.SizeOf(list.TargetType);
+        if (size <= 0)
+            return false;
+
+        var image = new byte[size];
+        if (!TryWriteInitializerImage(list, image, 0))
+            return false;
+
+        var byteType = _types.Builtin(BuiltinTypeKind.UnsignedChar);
+        var items = ImmutableArray.CreateBuilder<GimpleInitializerListItem>(size);
+        foreach (var value in image)
+        {
+            items.Add(new GimpleInitializerListItem(
+                list.Syntax,
+                ImmutableArray<DesignatorSyntax>.Empty,
+                new GimpleExpressionInitializer(list.Syntax, byteType, new GimpleConstantValue((long)value, byteType, list.Syntax))));
         }
 
-        private void ResetFunctionState(FunctionSymbol? function)
+        packed = new GimpleInitializerList(list.Syntax, list.TargetType, items.ToImmutable(), isByteImage: true);
+        return true;
+    }
+
+    private static bool HasBitFields(TagSymbol symbol)
+    {
+        foreach (var field in symbol.Fields)
         {
-            _currentFunction = function;
-            _labels.Clear();
-            _breakTargets.Clear();
-            _continueTargets.Clear();
-            _switches.Clear();
-            _blocks.Clear();
-            _temporaries.Clear();
-            _currentBlock = null;
-            _labelOrdinal = 0;
-            _temporaryOrdinal = 0;
-        }
-
-        private void LowerNode(BoundNode node)
-        {
-            switch (node)
-            {
-                case BoundDeclaration declaration:
-                    LowerLocalDeclaration(declaration);
-                    break;
-
-                case BoundStaticAssertDeclaration:
-                case BoundSkippedDeclaration:
-                    break;
-
-                case BoundStatement statement:
-                    LowerStatement(statement);
-                    break;
-
-                default:
-                    Emit(new GimpleNopStatement(node.Syntax));
-                    break;
-            }
-        }
-
-        private void LowerStatement(BoundStatement statement)
-        {
-            switch (statement)
-            {
-                case BoundCompoundStatement compound:
-                    LowerCompoundStatement(compound);
-                    break;
-
-                case BoundIfStatement ifStatement:
-                    LowerIfStatement(ifStatement);
-                    break;
-
-                case BoundSwitchStatement switchStatement:
-                    LowerSwitchStatement(switchStatement);
-                    break;
-
-                case BoundWhileStatement whileStatement:
-                    LowerWhileStatement(whileStatement);
-                    break;
-
-                case BoundDoStatement doStatement:
-                    LowerDoStatement(doStatement);
-                    break;
-
-                case BoundForStatement forStatement:
-                    LowerForStatement(forStatement);
-                    break;
-
-                case BoundBreakStatement breakStatement:
-                    Emit(new GimpleGotoStatement(GetBreakTarget(), breakStatement.Syntax));
-                    break;
-
-                case BoundContinueStatement continueStatement:
-                    Emit(new GimpleGotoStatement(GetContinueTarget(), continueStatement.Syntax));
-                    break;
-
-                case BoundGotoStatement gotoStatement:
-                    Emit(new GimpleGotoStatement(GetLabel(gotoStatement.Label), gotoStatement.Syntax));
-                    break;
-
-                case BoundLabelStatement labelStatement:
-                    StartBlock(GetLabel(labelStatement.Label, labelStatement.Syntax));
-                    LowerStatement(labelStatement.Statement);
-                    break;
-
-                case BoundCaseStatement caseStatement:
-                    StartBlock(GetCaseLabel(caseStatement));
-                    LowerStatement(caseStatement.Statement);
-                    break;
-
-                case BoundDefaultStatement defaultStatement:
-                    StartBlock(GetDefaultLabel(defaultStatement));
-                    LowerStatement(defaultStatement.Statement);
-                    break;
-
-                case BoundReturnStatement returnStatement:
-                    LowerReturnStatement(returnStatement);
-                    break;
-
-                case BoundExpressionStatement expressionStatement:
-                    LowerExpressionForSideEffects(expressionStatement.Expression);
-                    break;
-
-                case BoundAsmStatement asmStatement:
-                    LowerAsmStatement(asmStatement);
-                    break;
-
-                case BoundEmptyStatement emptyStatement:
-                    Emit(new GimpleNopStatement(emptyStatement.Syntax));
-                    break;
-
-                case BoundErrorStatement errorStatement:
-                    Emit(new GimpleNopStatement(errorStatement.Syntax));
-                    break;
-
-                default:
-                    Emit(new GimpleNopStatement(statement.Syntax));
-                    break;
-            }
-        }
-
-        /// <summary>Lowers assembly operands and creates a fallthrough block for goto assembly</summary>
-        private void LowerAsmStatement(BoundAsmStatement statement)
-        {
-            var outputs = ImmutableArray.CreateBuilder<GimpleAsmOperand>();
-            foreach (var output in statement.Outputs)
-            {
-                var target = LowerPlace(output.Expression);
-                outputs.Add(new GimpleAsmOperand(
-                    output.Name,
-                    output.Constraint,
-                    target,
-                    output.IsReadWrite ? target : null,
-                    isOutput: true,
-                    output.IsReadWrite,
-                    output.Syntax));
-            }
-
-            var inputs = ImmutableArray.CreateBuilder<GimpleAsmOperand>();
-            foreach (var input in statement.Inputs)
-            {
-                inputs.Add(new GimpleAsmOperand(
-                    input.Name,
-                    input.Constraint,
-                    target: null,
-                    LowerExpression(input.Expression),
-                    isOutput: false,
-                    isReadWrite: false,
-                    input.Syntax));
-            }
-
-            var labels = statement.GotoLabels.Select(label => GetLabel(label)).ToImmutableArray();
-            Emit(new GimpleAsmStatement(
-                statement.Text,
-                statement.IsVolatile,
-                statement.IsInline,
-                statement.IsGoto,
-                outputs.ToImmutable(),
-                inputs.ToImmutable(),
-                statement.Clobbers,
-                labels,
-                statement.Syntax));
-
-            if (statement.IsGoto)
-                StartBlock(CreateGeneratedLabel("asm_fallthrough"));
-        }
-
-        private void LowerCompoundStatement(BoundCompoundStatement statement)
-        {
-            foreach (var member in statement.Members)
-                LowerNode(member);
-        }
-
-        // Emit storage declarations before executable initialization
-        private void LowerLocalDeclaration(BoundDeclaration declaration)
-        {
-            foreach (var declarator in declaration.Declarators)
-            {
-                Emit(new GimpleDeclarationStatement(
-                    LowerVariableDeclaration(declarator, declaration.StorageClass, includeInitializer: false)));
-
-                if (declarator.Symbol is not TypedSymbol typedSymbol || declarator.Initializer is null)
-                    continue;
-
-                var target = new GimpleSymbolValue(typedSymbol, typedSymbol.Type, declarator.Syntax);
-                LowerInitializer(target, declarator.Initializer);
-            }
-        }
-
-        /// <summary>Emits executable initialization for a local place</summary>
-        private void LowerInitializer(GimplePlace target, BoundInitializer initializer)
-        {
-            switch (initializer)
-            {
-                case BoundExpressionInitializer expressionInitializer
-                    when target.Type.Type is ArrayType arrayType && expressionInitializer.Expression.ConstantValue is string text:
-                    LowerStringArrayInitializer(target, arrayType, text, expressionInitializer.Syntax);
-                    break;
-
-                case BoundExpressionInitializer expressionInitializer:
-                    EmitStore(target, LowerRValue(expressionInitializer.Expression), expressionInitializer.Syntax);
-                    break;
-
-                case BoundInitializerList initializerList:
-                    LowerInitializerList(target, initializerList);
-                    break;
-
-                default:
-                    EmitZeroInitialize(target, initializer.Syntax);
-                    break;
-            }
-        }
-
-        // Zero-fill first so truncation and the optional terminator need no special tail handling
-        private void LowerStringArrayInitializer(GimplePlace target, ArrayType arrayType, string text, SyntaxNode? syntax)
-        {
-            EmitZeroInitialize(target, syntax);
-            if (!arrayType.Length.HasValue)
-                return;
-
-            var bytes = Encoding.UTF8.GetBytes(text);
-            var count = Math.Min(arrayType.Length.Value, (long)bytes.Length + 1L);
-            for (long index = 0; index < count; index++)
-            {
-                var value = index < bytes.Length ? bytes[index] : (byte)0;
-                var element = CreateElementAccess(target, index, arrayType.ElementType, syntax);
-                EmitStore(element, new GimpleConstantValue(value, arrayType.ElementType, syntax), syntax);
-            }
-        }
-
-        /// <summary>Zero-fills the destination then applies initializer items in source order</summary>
-        private void LowerInitializerList(GimplePlace target, BoundInitializerList initializer)
-        {
-            EmitZeroInitialize(target, initializer.Syntax);
-
-            switch (target.Type.Type)
-            {
-                case ArrayType arrayType:
-                    LowerArrayInitializerList(target, arrayType, initializer);
-                    break;
-
-                case TagType tagType when tagType.Symbol.TagKind == TagKind.Struct:
-                    LowerStructInitializerList(target, tagType.Symbol, initializer);
-                    break;
-
-                case TagType tagType when tagType.Symbol.TagKind == TagKind.Union:
-                    LowerUnionInitializerList(target, tagType.Symbol, initializer);
-                    break;
-
-                default:
-                    LowerScalarInitializerList(target, initializer);
-                    break;
-            }
-        }
-
-        private void LowerScalarInitializerList(GimplePlace target, BoundInitializerList initializer)
-        {
-            if (initializer.Items.Length == 0)
-                return;
-
-            var first = initializer.Items[0];
-            if (first.Designators.Length != 0)
-            {
-                if (TryApplyDesignators(target, target.Type, first.Designators, out var designatedTarget, out _))
-                    LowerInitializer(designatedTarget, first.Initializer);
-
-                return;
-            }
-
-            LowerInitializer(target, first.Initializer);
-        }
-
-        private void LowerArrayInitializerList(GimplePlace target, ArrayType arrayType, BoundInitializerList initializer)
-        {
-            var nextIndex = 0L;
-
-            foreach (var item in initializer.Items)
-            {
-                if (item.Designators.Length != 0)
-                {
-                    // A single index the binder already folded needs no second look at the syntax
-                    if (item.Designators.Length == 1 && item.ElementIndex >= 0)
-                    {
-                        LowerInitializer(
-                            CreateElementAccess(target, item.ElementIndex, arrayType.ElementType, item.Syntax),
-                            item.Initializer);
-                        nextIndex = item.ElementIndex + 1;
-                        continue;
-                    }
-
-                    if (TryApplyDesignators(target, target.Type, item.Designators, out var designatedTarget, out _))
-                    {
-                        LowerInitializer(designatedTarget, item.Initializer);
-
-                        if (TryGetFirstArrayDesignatorIndex(item.Designators, out var index))
-                            nextIndex = index + 1;
-                    }
-
-                    continue;
-                }
-
-                if (arrayType.Length.HasValue && nextIndex >= arrayType.Length.Value)
-                    continue;
-
-                var elementTarget = CreateElementAccess(target, nextIndex, arrayType.ElementType, item.Syntax);
-                LowerInitializer(elementTarget, item.Initializer);
-                nextIndex++;
-            }
-        }
-
-        private void LowerStructInitializerList(GimplePlace target, TagSymbol tag, BoundInitializerList initializer)
-        {
-            var fields = tag.Fields;
-            var nextField = 0;
-
-            foreach (var item in initializer.Items)
-            {
-                if (item.Designators.Length != 0)
-                {
-                    if (TryApplyDesignators(target, target.Type, item.Designators, out var designatedTarget, out _))
-                    {
-                        LowerInitializer(designatedTarget, item.Initializer);
-
-                        if (TryGetFirstFieldDesignator(tag, item.Designators, out var firstField))
-                            nextField = Math.Min(firstField.Ordinal + 1, fields.Length);
-                    }
-
-                    continue;
-                }
-
-                if (nextField >= fields.Length)
-                    continue;
-
-                var field = fields[nextField++];
-                var fieldTarget = CreateMemberAccess(target, field, item.Syntax);
-                LowerInitializer(fieldTarget, item.Initializer);
-            }
-        }
-
-        private void LowerUnionInitializerList(GimplePlace target, TagSymbol tag, BoundInitializerList initializer)
-        {
-            if (initializer.Items.Length == 0)
-                return;
-
-            foreach (var item in initializer.Items)
-            {
-                if (item.Designators.Length != 0)
-                {
-                    if (TryApplyDesignators(target, target.Type, item.Designators, out var designatedTarget, out _))
-                        LowerInitializer(designatedTarget, item.Initializer);
-
-                    continue;
-                }
-
-                if (tag.Fields.Length == 0)
-                    continue;
-
-                var fieldTarget = CreateMemberAccess(target, tag.Fields[0], item.Syntax);
-                LowerInitializer(fieldTarget, item.Initializer);
-            }
-        }
-
-        private void EmitZeroInitialize(GimplePlace target, SyntaxNode? syntax)
-        {
-            if (IsAggregateType(target.Type))
-            {
-                Emit(GimpleAssignStatement.Constructor(GimplifyReference(target), syntax));
-                return;
-            }
-
-            EmitStore(target, CreateZeroValue(target.Type, syntax), syntax);
-        }
-
-        private GimpleConstantValue CreateZeroValue(QualifiedType type, SyntaxNode? syntax)
-        {
-            object value = 0;
-
-            if (type.Type is BuiltinType builtin &&
-                builtin.BuiltinKind is BuiltinTypeKind.Float or BuiltinTypeKind.Double or BuiltinTypeKind.LongDouble)
-            {
-                value = 0.0;
-            }
-
-            return new GimpleConstantValue(value, type.IsError ? _types.Builtin(BuiltinTypeKind.Int) : type, syntax);
-        }
-
-        private static bool IsAggregateType(QualifiedType type)
-        {
-            if (type.Type is ArrayType)
+            if (field.IsBitField)
                 return true;
-
-            return type.Type is TagType tagType &&
-                   tagType.Symbol.TagKind is TagKind.Struct or TagKind.Union;
         }
 
-        /// <summary>Resolves a designator chain into a nested assignable place</summary>
-        private bool TryApplyDesignators(
-            GimplePlace root,
-            QualifiedType rootType,
-            ImmutableArray<DesignatorSyntax> designators,
-            out GimplePlace target,
-            out QualifiedType targetType)
+        return false;
+    }
+
+    private bool TryWriteInitializerImage(GimpleInitializer initializer, byte[] image, int offset)
+    {
+        switch (initializer)
         {
-            target = root;
-            targetType = rootType;
+            case GimpleExpressionInitializer expression:
+                return TryWriteConstantImage(expression.TargetType, expression.Expression, image, offset, bitOffset: 0, bitWidth: 0);
 
-            foreach (var designator in designators)
-            {
-                switch (designator)
+            case GimpleInitializerList list when list.TargetType.Type is ArrayType array:
                 {
-                    case FieldDesignatorSyntax fieldDesignator:
+                    var elementSize = Math.Max(1, _target.SizeOf(array.ElementType));
+                    foreach (var item in list.Items)
+                    {
+                        if (!item.Designators.IsEmpty || item.ElementIndex < 0)
+                            return false;
+                        if (!TryWriteInitializerImage(item.Initializer, image, checked(offset + (int)item.ElementIndex * elementSize)))
+                            return false;
+                    }
+
+                    return true;
+                }
+
+            case GimpleInitializerList list when list.TargetType.Type is TagType tag:
+                {
+                    var members = tag.Symbol.Fields;
+                    var index = 0;
+                    foreach (var item in list.Items)
+                    {
+                        if (!item.Designators.IsEmpty)
+                            return false;
+                        // An unnamed bit-field takes no initializer
+                        while (index < members.Length && members[index].IsBitField && members[index].Name.Length == 0)
+                            index++;
+                        if (index >= members.Length)
+                            return false;
+
+                        var member = members[index++];
+                        var placement = _target.GetFieldPlacement(member);
+                        var memberOffset = checked(offset + placement.ByteOffset);
+                        if (member.IsBitField)
                         {
-                            if (!TryFindFieldPath(targetType, fieldDesignator.NameToken.Text, out var path))
-                                return false;
-
-                            foreach (var field in path)
-                                target = CreateMemberAccess(target, field, fieldDesignator);
-
-                            targetType = path[^1].Type;
-                            break;
-                        }
-
-                    case ArrayDesignatorSyntax arrayDesignator:
-                        {
-                            if (targetType.Type is not ArrayType arrayType ||
-                                !TryEvaluateIntegerConstantExpression(arrayDesignator.Expression, out var index))
+                            if (item.Initializer is not GimpleExpressionInitializer bits ||
+                                !TryWriteConstantImage(member.Type, bits.Expression, image, memberOffset, placement.BitOffset, placement.BitWidth))
                             {
                                 return false;
                             }
 
-                            target = CreateElementAccess(target, index, arrayType.ElementType, arrayDesignator);
-                            targetType = arrayType.ElementType;
-                            break;
+                            continue;
                         }
 
-                    default:
-                        return false;
-                }
-            }
+                        if (!TryWriteInitializerImage(item.Initializer, image, memberOffset))
+                            return false;
+                    }
 
-            return true;
-        }
-
-        /// <summary>Finds a direct or anonymous aggregate field path by name</summary>
-        private static bool TryFindFieldPath(QualifiedType aggregateType, string name, out ImmutableArray<FieldSymbol> path)
-        {
-            path = ImmutableArray<FieldSymbol>.Empty;
-
-            if (aggregateType.Type is not TagType tagType ||
-                tagType.Symbol.TagKind is not TagKind.Struct and not TagKind.Union)
-            {
-                return false;
-            }
-
-            var builder = ImmutableArray.CreateBuilder<FieldSymbol>();
-            if (!TryFindFieldPath(tagType.Symbol, name, new HashSet<TagSymbol>(), builder))
-                return false;
-
-            path = builder.ToImmutable();
-            return path.Length != 0;
-        }
-
-        // Track visited tags so recursive anonymous aggregates cannot cycle
-        private static bool TryFindFieldPath(
-            TagSymbol tag,
-            string name,
-            HashSet<TagSymbol> visited,
-            ImmutableArray<FieldSymbol>.Builder path)
-        {
-            if (!visited.Add(tag))
-                return false;
-
-            foreach (var field in tag.Fields)
-            {
-                if (string.Equals(field.Name, name, StringComparison.Ordinal))
-                {
-                    path.Add(field);
                     return true;
                 }
+
+            default:
+                return false;
+        }
+    }
+
+    private bool TryWriteConstantImage(QualifiedType type, GimpleValue value, byte[] image, int offset, int bitOffset, int bitWidth)
+    {
+        while (value is GimpleConversionExpression conversion)
+            value = conversion.Operand;
+        if (value is not GimpleConstantValue constant)
+            return false;
+
+        var size = Math.Max(1, _target.SizeOf(type));
+        if (offset < 0 || checked(offset + size) > image.Length)
+            return false;
+
+        if (constant.Value is string)
+            return false;
+
+        ulong bits;
+        if (GimpleTypes.IsFloating(type))
+        {
+            if (bitWidth != 0)
+                return false;
+            var number = Convert.ToDouble(constant.Value ?? 0, CultureInfo.InvariantCulture);
+            bits = size == 4
+                ? BitConverter.ToUInt32(BitConverter.GetBytes((float)number), 0)
+                : BitConverter.ToUInt64(BitConverter.GetBytes(number), 0);
+        }
+        else
+        {
+            bits = unchecked((ulong)Convert.ToInt64(constant.Value ?? 0, CultureInfo.InvariantCulture));
+        }
+
+        if (bitWidth != 0)
+        {
+            bits = (bits & MaskBits(bitWidth)) << bitOffset;
+            size = Math.Max(1, _target.SizeOf(type));
+        }
+        else if (size < 8)
+        {
+            bits &= MaskBits(size * 8);
+        }
+
+        for (var i = 0; i < size; i++)
+        {
+            var shift = _target.Endianness == TargetEndianness.Little ? i * 8 : (size - 1 - i) * 8;
+            image[offset + i] |= (byte)((bits >> shift) & 0xFF);
+        }
+
+        return true;
+    }
+
+    /// <summary>Lowers one function into labeled blocks and allocated temporaries</summary>
+    private GimpleFunctionDefinition LowerFunction(BoundFunctionDefinition function)
+    {
+        ResetFunctionState(function.Symbol);
+
+        var entry = CreateGeneratedLabel("entry");
+        StartBlock(entry);
+        LowerCompoundStatement(function.Body);
+
+        if (!IsCurrentBlockTerminated())
+        {
+            GimpleValue? expression = null;
+            var returnType = function.Symbol?.FunctionType?.ReturnType;
+            if (returnType.HasValue &&
+                returnType.Value.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Int } &&
+                string.Equals(function.Symbol?.Name, "main", StringComparison.Ordinal))
+            {
+                expression = CreateZeroValue(returnType.Value, function.Syntax);
             }
 
-            foreach (var field in tag.Fields)
+            Emit(new GimpleReturnStatement(function.Symbol, expression, function.Syntax));
+        }
+
+        var blocks = _blocks.Select(static block => block.ToImmutable()).ToImmutableArray();
+        return new GimpleFunctionDefinition(
+            function.Syntax,
+            function.Symbol,
+            _temporaries.ToImmutableArray(),
+            blocks,
+            entry);
+    }
+
+    private void ResetFunctionState(FunctionSymbol? function)
+    {
+        _currentFunction = function;
+        _labels.Clear();
+        _breakTargets.Clear();
+        _continueTargets.Clear();
+        _switches.Clear();
+        _blocks.Clear();
+        _temporaries.Clear();
+        _currentBlock = null;
+        _labelOrdinal = 0;
+        _temporaryOrdinal = 0;
+    }
+
+    private void LowerNode(BoundNode node)
+    {
+        switch (node)
+        {
+            case BoundDeclaration declaration:
+                LowerLocalDeclaration(declaration);
+                break;
+
+            case BoundStaticAssertDeclaration:
+            case BoundSkippedDeclaration:
+                break;
+
+            case BoundStatement statement:
+                LowerStatement(statement);
+                break;
+
+            default:
+                Emit(new GimpleNopStatement(node.Syntax));
+                break;
+        }
+    }
+
+    private void LowerStatement(BoundStatement statement)
+    {
+        switch (statement)
+        {
+            case BoundCompoundStatement compound:
+                LowerCompoundStatement(compound);
+                break;
+
+            case BoundIfStatement ifStatement:
+                LowerIfStatement(ifStatement);
+                break;
+
+            case BoundSwitchStatement switchStatement:
+                LowerSwitchStatement(switchStatement);
+                break;
+
+            case BoundWhileStatement whileStatement:
+                LowerWhileStatement(whileStatement);
+                break;
+
+            case BoundDoStatement doStatement:
+                LowerDoStatement(doStatement);
+                break;
+
+            case BoundForStatement forStatement:
+                LowerForStatement(forStatement);
+                break;
+
+            case BoundBreakStatement breakStatement:
+                Emit(new GimpleGotoStatement(GetBreakTarget(), breakStatement.Syntax));
+                break;
+
+            case BoundContinueStatement continueStatement:
+                Emit(new GimpleGotoStatement(GetContinueTarget(), continueStatement.Syntax));
+                break;
+
+            case BoundGotoStatement gotoStatement:
+                Emit(new GimpleGotoStatement(GetLabel(gotoStatement.Label), gotoStatement.Syntax));
+                break;
+
+            case BoundLabelStatement labelStatement:
+                StartBlock(GetLabel(labelStatement.Label, labelStatement.Syntax));
+                LowerStatement(labelStatement.Statement);
+                break;
+
+            case BoundCaseStatement caseStatement:
+                StartBlock(GetCaseLabel(caseStatement));
+                LowerStatement(caseStatement.Statement);
+                break;
+
+            case BoundDefaultStatement defaultStatement:
+                StartBlock(GetDefaultLabel(defaultStatement));
+                LowerStatement(defaultStatement.Statement);
+                break;
+
+            case BoundReturnStatement returnStatement:
+                LowerReturnStatement(returnStatement);
+                break;
+
+            case BoundExpressionStatement expressionStatement:
+                LowerExpressionForSideEffects(expressionStatement.Expression);
+                break;
+
+            case BoundAsmStatement asmStatement:
+                LowerAsmStatement(asmStatement);
+                break;
+
+            case BoundEmptyStatement emptyStatement:
+                Emit(new GimpleNopStatement(emptyStatement.Syntax));
+                break;
+
+            case BoundErrorStatement errorStatement:
+                Emit(new GimpleNopStatement(errorStatement.Syntax));
+                break;
+
+            default:
+                Emit(new GimpleNopStatement(statement.Syntax));
+                break;
+        }
+    }
+
+    /// <summary>Lowers assembly operands and creates a fallthrough block for goto assembly</summary>
+    private void LowerAsmStatement(BoundAsmStatement statement)
+    {
+        var outputs = ImmutableArray.CreateBuilder<GimpleAsmOperand>();
+        foreach (var output in statement.Outputs)
+        {
+            var target = LowerPlace(output.Expression);
+            outputs.Add(new GimpleAsmOperand(
+                output.Name,
+                output.Constraint,
+                target,
+                output.IsReadWrite ? target : null,
+                isOutput: true,
+                output.IsReadWrite,
+                output.Syntax));
+        }
+
+        var inputs = ImmutableArray.CreateBuilder<GimpleAsmOperand>();
+        foreach (var input in statement.Inputs)
+        {
+            inputs.Add(new GimpleAsmOperand(
+                input.Name,
+                input.Constraint,
+                target: null,
+                LowerExpression(input.Expression),
+                isOutput: false,
+                isReadWrite: false,
+                input.Syntax));
+        }
+
+        var labels = statement.GotoLabels.Select(label => GetLabel(label)).ToImmutableArray();
+        Emit(new GimpleAsmStatement(
+            statement.Text,
+            statement.IsVolatile,
+            statement.IsInline,
+            statement.IsGoto,
+            outputs.ToImmutable(),
+            inputs.ToImmutable(),
+            statement.Clobbers,
+            labels,
+            statement.Syntax));
+
+        if (statement.IsGoto)
+            StartBlock(CreateGeneratedLabel("asm_fallthrough"));
+    }
+
+    private void LowerCompoundStatement(BoundCompoundStatement statement)
+    {
+        foreach (var member in statement.Members)
+            LowerNode(member);
+    }
+
+    // Emit storage declarations before executable initialization
+    private void LowerLocalDeclaration(BoundDeclaration declaration)
+    {
+        foreach (var declarator in declaration.Declarators)
+        {
+            Emit(new GimpleDeclarationStatement(
+                LowerVariableDeclaration(declarator, declaration.StorageClass, includeInitializer: false)));
+
+            if (declarator.Symbol is not TypedSymbol typedSymbol || declarator.Initializer is null)
+                continue;
+
+            var target = new GimpleSymbolValue(typedSymbol, typedSymbol.Type, declarator.Syntax);
+            LowerInitializer(target, declarator.Initializer);
+        }
+    }
+
+    /// <summary>Emits executable initialization for a local place</summary>
+    private void LowerInitializer(GimplePlace target, BoundInitializer initializer)
+    {
+        switch (initializer)
+        {
+            case BoundExpressionInitializer expressionInitializer
+                when target.Type.Type is ArrayType arrayType && expressionInitializer.Expression.ConstantValue is string text:
+                LowerStringArrayInitializer(target, arrayType, text, expressionInitializer.Syntax);
+                break;
+
+            case BoundExpressionInitializer expressionInitializer:
+                EmitStore(target, LowerRValue(expressionInitializer.Expression), expressionInitializer.Syntax);
+                break;
+
+            case BoundInitializerList initializerList:
+                LowerInitializerList(target, initializerList);
+                break;
+
+            default:
+                EmitZeroInitialize(target, initializer.Syntax);
+                break;
+        }
+    }
+
+    // Zero-fill first so truncation and the optional terminator need no special tail handling
+    private void LowerStringArrayInitializer(GimplePlace target, ArrayType arrayType, string text, SyntaxNode? syntax)
+    {
+        EmitZeroInitialize(target, syntax);
+        if (!arrayType.Length.HasValue)
+            return;
+
+        var bytes = Encoding.UTF8.GetBytes(text);
+        var count = Math.Min(arrayType.Length.Value, (long)bytes.Length + 1L);
+        for (long index = 0; index < count; index++)
+        {
+            var value = index < bytes.Length ? bytes[index] : (byte)0;
+            var element = CreateElementAccess(target, index, arrayType.ElementType, syntax);
+            EmitStore(element, new GimpleConstantValue(value, arrayType.ElementType, syntax), syntax);
+        }
+    }
+
+    /// <summary>Zero-fills the destination then applies initializer items in source order</summary>
+    private void LowerInitializerList(GimplePlace target, BoundInitializerList initializer)
+    {
+        EmitZeroInitialize(target, initializer.Syntax);
+
+        switch (target.Type.Type)
+        {
+            case ArrayType arrayType:
+                LowerArrayInitializerList(target, arrayType, initializer);
+                break;
+
+            case TagType tagType when tagType.Symbol.TagKind == TagKind.Struct:
+                LowerStructInitializerList(target, tagType.Symbol, initializer);
+                break;
+
+            case TagType tagType when tagType.Symbol.TagKind == TagKind.Union:
+                LowerUnionInitializerList(target, tagType.Symbol, initializer);
+                break;
+
+            default:
+                LowerScalarInitializerList(target, initializer);
+                break;
+        }
+    }
+
+    private void LowerScalarInitializerList(GimplePlace target, BoundInitializerList initializer)
+    {
+        if (initializer.Items.Length == 0)
+            return;
+
+        var first = initializer.Items[0];
+        if (first.Designators.Length != 0)
+        {
+            if (TryApplyDesignators(target, target.Type, first.Designators, out var designatedTarget, out _))
+                LowerInitializer(designatedTarget, first.Initializer);
+
+            return;
+        }
+
+        LowerInitializer(target, first.Initializer);
+    }
+
+    private void LowerArrayInitializerList(GimplePlace target, ArrayType arrayType, BoundInitializerList initializer)
+    {
+        var nextIndex = 0L;
+
+        foreach (var item in initializer.Items)
+        {
+            if (item.Designators.Length != 0)
             {
-                if (field.Name.Length != 0 ||
-                    field.Type.Type is not TagType anonymousTag ||
-                    anonymousTag.Symbol.TagKind is not TagKind.Struct and not TagKind.Union)
+                // A single index the binder already folded needs no second look at the syntax
+                if (item.Designators.Length == 1 && item.ElementIndex >= 0)
                 {
+                    LowerInitializer(
+                        CreateElementAccess(target, item.ElementIndex, arrayType.ElementType, item.Syntax),
+                        item.Initializer);
+                    nextIndex = item.ElementIndex + 1;
                     continue;
                 }
 
-                var startLength = path.Count;
+                if (TryApplyDesignators(target, target.Type, item.Designators, out var designatedTarget, out _))
+                {
+                    LowerInitializer(designatedTarget, item.Initializer);
+
+                    if (TryGetFirstArrayDesignatorIndex(item.Designators, out var index))
+                        nextIndex = index + 1;
+                }
+
+                continue;
+            }
+
+            if (arrayType.Length.HasValue && nextIndex >= arrayType.Length.Value)
+                continue;
+
+            var elementTarget = CreateElementAccess(target, nextIndex, arrayType.ElementType, item.Syntax);
+            LowerInitializer(elementTarget, item.Initializer);
+            nextIndex++;
+        }
+    }
+
+    private void LowerStructInitializerList(GimplePlace target, TagSymbol tag, BoundInitializerList initializer)
+    {
+        var fields = tag.Fields;
+        var nextField = 0;
+
+        foreach (var item in initializer.Items)
+        {
+            if (item.Designators.Length != 0)
+            {
+                if (TryApplyDesignators(target, target.Type, item.Designators, out var designatedTarget, out _))
+                {
+                    LowerInitializer(designatedTarget, item.Initializer);
+
+                    if (TryGetFirstFieldDesignator(tag, item.Designators, out var firstField))
+                        nextField = Math.Min(firstField.Ordinal + 1, fields.Length);
+                }
+
+                continue;
+            }
+
+            if (nextField >= fields.Length)
+                continue;
+
+            var field = fields[nextField++];
+            var fieldTarget = CreateMemberAccess(target, field, item.Syntax);
+            LowerInitializer(fieldTarget, item.Initializer);
+        }
+    }
+
+    private void LowerUnionInitializerList(GimplePlace target, TagSymbol tag, BoundInitializerList initializer)
+    {
+        if (initializer.Items.Length == 0)
+            return;
+
+        foreach (var item in initializer.Items)
+        {
+            if (item.Designators.Length != 0)
+            {
+                if (TryApplyDesignators(target, target.Type, item.Designators, out var designatedTarget, out _))
+                    LowerInitializer(designatedTarget, item.Initializer);
+
+                continue;
+            }
+
+            if (tag.Fields.Length == 0)
+                continue;
+
+            var fieldTarget = CreateMemberAccess(target, tag.Fields[0], item.Syntax);
+            LowerInitializer(fieldTarget, item.Initializer);
+        }
+    }
+
+    private void EmitZeroInitialize(GimplePlace target, SyntaxNode? syntax)
+    {
+        if (IsAggregateType(target.Type))
+        {
+            Emit(GimpleAssignStatement.Constructor(GimplifyReference(target), syntax));
+            return;
+        }
+
+        EmitStore(target, CreateZeroValue(target.Type, syntax), syntax);
+    }
+
+    private GimpleConstantValue CreateZeroValue(QualifiedType type, SyntaxNode? syntax)
+    {
+        object value = 0;
+
+        if (type.Type is BuiltinType builtin &&
+            builtin.BuiltinKind is BuiltinTypeKind.Float or BuiltinTypeKind.Double or BuiltinTypeKind.LongDouble)
+        {
+            value = 0.0;
+        }
+
+        return new GimpleConstantValue(value, type.IsError ? _types.Builtin(BuiltinTypeKind.Int) : type, syntax);
+    }
+
+    private static bool IsAggregateType(QualifiedType type)
+    {
+        if (type.Type is ArrayType)
+            return true;
+
+        return type.Type is TagType tagType &&
+               tagType.Symbol.TagKind is TagKind.Struct or TagKind.Union;
+    }
+
+    /// <summary>Resolves a designator chain into a nested assignable place</summary>
+    private bool TryApplyDesignators(
+        GimplePlace root,
+        QualifiedType rootType,
+        ImmutableArray<DesignatorSyntax> designators,
+        out GimplePlace target,
+        out QualifiedType targetType)
+    {
+        target = root;
+        targetType = rootType;
+
+        foreach (var designator in designators)
+        {
+            switch (designator)
+            {
+                case FieldDesignatorSyntax fieldDesignator:
+                    {
+                        if (!TryFindFieldPath(targetType, fieldDesignator.NameToken.Text, out var path))
+                            return false;
+
+                        foreach (var field in path)
+                            target = CreateMemberAccess(target, field, fieldDesignator);
+
+                        targetType = path[^1].Type;
+                        break;
+                    }
+
+                case ArrayDesignatorSyntax arrayDesignator:
+                    {
+                        if (targetType.Type is not ArrayType arrayType ||
+                            !TryEvaluateIntegerConstantExpression(arrayDesignator.Expression, out var index))
+                        {
+                            return false;
+                        }
+
+                        target = CreateElementAccess(target, index, arrayType.ElementType, arrayDesignator);
+                        targetType = arrayType.ElementType;
+                        break;
+                    }
+
+                default:
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>Finds a direct or anonymous aggregate field path by name</summary>
+    private static bool TryFindFieldPath(QualifiedType aggregateType, string name, out ImmutableArray<FieldSymbol> path)
+    {
+        path = ImmutableArray<FieldSymbol>.Empty;
+
+        if (aggregateType.Type is not TagType tagType ||
+            tagType.Symbol.TagKind is not TagKind.Struct and not TagKind.Union)
+        {
+            return false;
+        }
+
+        var builder = ImmutableArray.CreateBuilder<FieldSymbol>();
+        if (!TryFindFieldPath(tagType.Symbol, name, new HashSet<TagSymbol>(), builder))
+            return false;
+
+        path = builder.ToImmutable();
+        return path.Length != 0;
+    }
+
+    // Track visited tags so recursive anonymous aggregates cannot cycle
+    private static bool TryFindFieldPath(
+        TagSymbol tag,
+        string name,
+        HashSet<TagSymbol> visited,
+        ImmutableArray<FieldSymbol>.Builder path)
+    {
+        if (!visited.Add(tag))
+            return false;
+
+        foreach (var field in tag.Fields)
+        {
+            if (string.Equals(field.Name, name, StringComparison.Ordinal))
+            {
                 path.Add(field);
+                return true;
+            }
+        }
 
-                if (TryFindFieldPath(anonymousTag.Symbol, name, visited, path))
+        foreach (var field in tag.Fields)
+        {
+            if (field.Name.Length != 0 ||
+                field.Type.Type is not TagType anonymousTag ||
+                anonymousTag.Symbol.TagKind is not TagKind.Struct and not TagKind.Union)
+            {
+                continue;
+            }
+
+            var startLength = path.Count;
+            path.Add(field);
+
+            if (TryFindFieldPath(anonymousTag.Symbol, name, visited, path))
+                return true;
+
+            while (path.Count > startLength)
+                path.RemoveAt(path.Count - 1);
+        }
+
+        return false;
+    }
+
+    private GimplePlace CreateMemberAccess(GimpleValue expression, FieldSymbol field, SyntaxNode? syntax)
+    {
+        var nameToken = syntax is FieldDesignatorSyntax namedFieldDesignator
+            ? namedFieldDesignator.NameToken
+            : CreateSyntheticToken(SyntaxKind.IdentifierToken, field.Name);
+
+        return new GimpleMemberAccessExpression(
+            expression,
+            throughPointer: false,
+            nameToken,
+            field,
+            field.Type,
+            syntax);
+    }
+
+    private GimplePlace CreateElementAccess(GimpleValue expression, long index, QualifiedType elementType, SyntaxNode? syntax)
+    {
+        return new GimpleElementAccessExpression(
+            expression,
+            new GimpleConstantValue(index, _types.Builtin(BuiltinTypeKind.Long), syntax),
+            elementType,
+            syntax);
+    }
+
+    private static bool TryGetFirstFieldDesignator(
+        TagSymbol tag,
+        ImmutableArray<DesignatorSyntax> designators,
+        out FieldSymbol field)
+    {
+        field = null!;
+
+        if (designators.Length == 0 ||
+            designators[0] is not FieldDesignatorSyntax fieldDesignator)
+        {
+            return false;
+        }
+
+        return tag.TryGetField(fieldDesignator.NameToken.Text, out field!) && field is not null;
+    }
+
+    /// <summary>Places each item at the element its designator names, or at the running cursor, last write winning</summary>
+    private static ImmutableArray<GimpleInitializerListItem> PlaceArrayInitializerItems(
+        ImmutableArray<GimpleInitializerListItem>.Builder items)
+    {
+        var placed = new SortedDictionary<long, GimpleInitializerListItem>();
+        var cursor = 0L;
+
+        foreach (var item in items)
+        {
+            if (item.Designators.Length != 0)
+            {
+                // A designator reaching into the element is left for the backend to reject rather than misplace
+                if (item.Designators.Length != 1 || item.ElementIndex < 0)
+                    return items.ToImmutable();
+
+                cursor = item.ElementIndex;
+            }
+
+            placed[cursor] = new GimpleInitializerListItem(
+                item.Syntax,
+                ImmutableArray<DesignatorSyntax>.Empty,
+                item.Initializer,
+                cursor);
+            cursor++;
+        }
+
+        return placed.Values.ToImmutableArray();
+    }
+
+    private static bool TryGetFirstArrayDesignatorIndex(
+        ImmutableArray<DesignatorSyntax> designators,
+        out long index)
+    {
+        index = 0;
+
+        return designators.Length != 0 &&
+               designators[0] is ArrayDesignatorSyntax arrayDesignator &&
+               TryEvaluateIntegerConstantExpression(arrayDesignator.Expression, out index);
+    }
+
+    // Emit explicit branch targets and a common continuation block
+    private void LowerIfStatement(BoundIfStatement statement)
+    {
+        var thenLabel = CreateGeneratedLabel("if_then");
+        var elseLabel = statement.ElseStatement is null ? null : CreateGeneratedLabel("if_else");
+        var endLabel = CreateGeneratedLabel("if_end");
+
+        EmitConditional(statement.Condition, thenLabel, elseLabel ?? endLabel);
+
+        StartBlock(thenLabel);
+        LowerStatement(statement.ThenStatement);
+        if (!IsCurrentBlockTerminated())
+            Emit(new GimpleGotoStatement(endLabel));
+
+        if (statement.ElseStatement is not null && elseLabel is not null)
+        {
+            StartBlock(elseLabel);
+            LowerStatement(statement.ElseStatement);
+            if (!IsCurrentBlockTerminated())
+                Emit(new GimpleGotoStatement(endLabel));
+        }
+
+        StartBlock(endLabel);
+    }
+
+    // Continue targets the test block while break targets the continuation
+    private void LowerWhileStatement(BoundWhileStatement statement)
+    {
+        var testLabel = CreateGeneratedLabel("while_test");
+        var bodyLabel = CreateGeneratedLabel("while_body");
+        var endLabel = CreateGeneratedLabel("while_end");
+
+        Emit(new GimpleGotoStatement(testLabel));
+        StartBlock(testLabel);
+        EmitConditional(statement.Condition, bodyLabel, endLabel);
+
+        StartBlock(bodyLabel);
+        _breakTargets.Push(endLabel);
+        _continueTargets.Push(testLabel);
+        LowerStatement(statement.Statement);
+        _continueTargets.Pop();
+        _breakTargets.Pop();
+
+        if (!IsCurrentBlockTerminated())
+            Emit(new GimpleGotoStatement(testLabel));
+
+        StartBlock(endLabel);
+    }
+
+    // The body precedes the test so the first iteration is unconditional
+    private void LowerDoStatement(BoundDoStatement statement)
+    {
+        var bodyLabel = CreateGeneratedLabel("do_body");
+        var testLabel = CreateGeneratedLabel("do_test");
+        var endLabel = CreateGeneratedLabel("do_end");
+
+        StartBlock(bodyLabel);
+        _breakTargets.Push(endLabel);
+        _continueTargets.Push(testLabel);
+        LowerStatement(statement.Statement);
+        _continueTargets.Pop();
+        _breakTargets.Pop();
+
+        if (!IsCurrentBlockTerminated())
+            Emit(new GimpleGotoStatement(testLabel));
+
+        StartBlock(testLabel);
+        EmitConditional(statement.Condition, bodyLabel, endLabel);
+        StartBlock(endLabel);
+    }
+
+    // Continue targets the increment block
+    private void LowerForStatement(BoundForStatement statement)
+    {
+        var testLabel = CreateGeneratedLabel("for_test");
+        var bodyLabel = CreateGeneratedLabel("for_body");
+        var incrementLabel = CreateGeneratedLabel("for_step");
+        var endLabel = CreateGeneratedLabel("for_end");
+
+        // An expression initializer is a bare BoundExpression, which LowerNode would drop as a nop
+        if (statement.Initializer is BoundExpression initializer)
+            LowerExpressionForSideEffects(initializer);
+        else if (statement.Initializer is not null)
+            LowerNode(statement.Initializer);
+
+        Emit(new GimpleGotoStatement(testLabel));
+        StartBlock(testLabel);
+
+        if (statement.Condition is null)
+            Emit(new GimpleGotoStatement(bodyLabel));
+        else
+            EmitConditional(statement.Condition, bodyLabel, endLabel);
+
+        StartBlock(bodyLabel);
+        _breakTargets.Push(endLabel);
+        _continueTargets.Push(incrementLabel);
+        LowerStatement(statement.Statement);
+        _continueTargets.Pop();
+        _breakTargets.Pop();
+
+        if (!IsCurrentBlockTerminated())
+            Emit(new GimpleGotoStatement(incrementLabel));
+
+        StartBlock(incrementLabel);
+        if (statement.Increment is not null)
+            LowerExpressionForSideEffects(statement.Increment);
+        if (!IsCurrentBlockTerminated())
+            Emit(new GimpleGotoStatement(testLabel));
+
+        StartBlock(endLabel);
+    }
+
+    // Collect labels before lowering the body so forward case edges are stable
+    private void LowerSwitchStatement(BoundSwitchStatement statement)
+    {
+        var endLabel = CreateGeneratedLabel("switch_end");
+        var labels = CollectSwitchLabels(statement.Statement);
+        var defaultLabel = labels.DefaultLabel ?? endLabel;
+        var value = GimplifyValue(LowerExpression(statement.Expression));
+
+        Emit(new GimpleSwitchStatement(value, labels.Cases, defaultLabel, statement.Syntax));
+
+        _breakTargets.Push(endLabel);
+        _switches.Push(new SwitchContext(endLabel, labels.CaseLabels, defaultLabel));
+        LowerStatement(statement.Statement);
+        _switches.Pop();
+        _breakTargets.Pop();
+
+        if (!IsCurrentBlockTerminated())
+            Emit(new GimpleGotoStatement(endLabel));
+
+        StartBlock(endLabel);
+    }
+
+    private void LowerReturnStatement(BoundReturnStatement statement)
+    {
+        var expression = statement.Expression is null
+            ? null
+            : GimplifyReturnOperand(LowerExpression(statement.Expression));
+
+        Emit(new GimpleReturnStatement(statement.Function ?? _currentFunction, expression, statement.Syntax));
+    }
+
+    /// <summary>Lowers a static expression without emitting function statements</summary>
+    private GimpleValue LowerStaticExpression(BoundExpression expression)
+    {
+        if (TryEvaluateIntegerConstantValue(expression, out var integerValue))
+            return new GimpleConstantValue(integerValue, expression.Type, expression.Syntax);
+
+        if (TryEvaluateFloatingConstantValue(expression, out var floatingValue))
+            return new GimpleConstantValue(floatingValue, expression.Type, expression.Syntax);
+
+        if (expression.ConstantValue is not null)
+            return new GimpleConstantValue(expression.ConstantValue, expression.Type, expression.Syntax);
+
+        if (TryEvaluateStringConstantValue(expression, out var text))
+            return new GimpleConstantValue(text, expression.Type, expression.Syntax);
+
+        return LowerExpressionNoEmit(expression);
+    }
+
+    /// <summary>
+    /// Folds a string literal that reached a pointer initializer through array-to-pointer decay, so it
+    /// arrives at code generation as a constant the backend can turn into a relocation.
+    /// </summary>
+    private static bool TryEvaluateStringConstantValue(BoundExpression expression, out string text)
+    {
+        switch (expression)
+        {
+            case BoundConversionExpression conversion:
+                return TryEvaluateStringConstantValue(conversion.Expression, out text);
+
+            case BoundParenthesizedExpression parenthesized:
+                return TryEvaluateStringConstantValue(parenthesized.Expression, out text);
+
+            case BoundCastExpression cast:
+                return TryEvaluateStringConstantValue(cast.Expression, out text);
+
+            default:
+                text = (expression.ConstantValue as string)!;
+                return text is not null;
+        }
+    }
+
+    /// <summary>
+    /// Folds the floating-point constant subset that appears in static initializers. Without this the
+    /// value reaches code generation as a conversion node, which every backend silently emits as zero.
+    /// </summary>
+    private static bool TryEvaluateFloatingConstantValue(BoundExpression expression, out double value)
+    {
+        switch (expression)
+        {
+            case BoundConversionExpression conversion:
+                return TryEvaluateFloatingConstantValue(conversion.Expression, out value);
+
+            case BoundParenthesizedExpression parenthesized:
+                return TryEvaluateFloatingConstantValue(parenthesized.Expression, out value);
+
+            case BoundCastExpression cast:
+                return TryEvaluateFloatingConstantValue(cast.Expression, out value);
+
+            case BoundUnaryExpression unary when unary.OperatorToken.Kind is SyntaxKind.PlusToken or SyntaxKind.MinusToken:
+                if (!TryEvaluateFloatingConstantValue(unary.Operand, out value))
+                    return false;
+                if (unary.OperatorToken.Kind == SyntaxKind.MinusToken)
+                    value = -value;
+                return true;
+
+            default:
+                return TryConvertConstantToDouble(expression.ConstantValue, out value);
+        }
+    }
+
+    private static bool TryConvertConstantToDouble(object? constantValue, out double value)
+    {
+        switch (constantValue)
+        {
+            case double doubleValue:
+                value = doubleValue;
+                return true;
+            case float singleValue:
+                value = singleValue;
+                return true;
+            case decimal decimalValue:
+                value = (double)decimalValue;
+                return true;
+            default:
+                value = 0;
+                return false;
+        }
+    }
+
+    /// <summary>Builds a side-effect-free lowered value for static contexts</summary>
+    /// <remarks>Unsupported forms become error values</remarks>
+    private GimpleValue LowerExpressionNoEmit(BoundExpression expression)
+    {
+        switch (expression)
+        {
+            case BoundLiteralExpression literal:
+                return new GimpleConstantValue(literal.ConstantValue, literal.Type, literal.Syntax);
+
+            case BoundNameExpression name:
+                return LowerNameExpression(name);
+
+            case BoundParenthesizedExpression parenthesized:
+                return LowerExpressionNoEmit(parenthesized.Expression);
+
+            case BoundConversionExpression conversion:
+                if (conversion.ConversionKind is BoundConversionKind.Identity or BoundConversionKind.LValueToRValue)
+                    return LowerExpressionNoEmit(conversion.Expression);
+
+                return new GimpleConversionExpression(
+                    LowerExpressionNoEmit(conversion.Expression),
+                    conversion.Type,
+                    ToGimpleConversionKind(conversion.ConversionKind),
+                    conversion.Syntax);
+
+            case BoundCastExpression cast:
+                return new GimpleCastExpression(
+                    LowerExpressionNoEmit(cast.Expression),
+                    cast.Type,
+                    cast.Syntax);
+
+            case BoundUnaryExpression unary when unary.OperatorToken.Kind == SyntaxKind.AmpersandToken:
+                return new GimpleAddressOfExpression(
+                    LowerPlaceNoEmit(unary.Operand),
+                    unary.Type,
+                    unary.Syntax);
+
+            case BoundUnaryExpression unary when unary.OperatorToken.Kind == SyntaxKind.StarToken:
+                return new GimpleIndirectExpression(
+                    LowerExpressionNoEmit(unary.Operand),
+                    unary.Type,
+                    unary.Syntax);
+
+            case BoundUnaryExpression unary:
+                return new GimpleUnaryExpression(
+                    GimpleOperators.FromUnaryOperator(unary.OperatorToken.Kind),
+                    LowerExpressionNoEmit(unary.Operand),
+                    unary.Type,
+                    unary.Syntax);
+
+            case BoundBinaryExpression binary:
+                {
+                    var left = LowerExpressionNoEmit(binary.Left);
+                    var right = LowerExpressionNoEmit(binary.Right);
+                    return new GimpleBinaryExpression(
+                        left,
+                        GimpleOperators.FromBinaryOperator(binary.OperatorToken.Kind, left.Type, right.Type),
+                        right,
+                        binary.Type,
+                        binary.Syntax);
+                }
+
+            case BoundSizeofExpression sizeofExpression:
+                return new GimpleConstantValue(sizeofExpression.ConstantValue, sizeofExpression.Type, sizeofExpression.Syntax);
+
+            case BoundGenericSelectionExpression generic:
+                return generic.SelectedExpression is null
+                    ? new GimpleErrorValue(generic.Syntax)
+                    : LowerExpressionNoEmit(generic.SelectedExpression);
+
+            case BoundElementAccessExpression elementAccess:
+                return new GimpleElementAccessExpression(
+                    LowerExpressionNoEmit(elementAccess.Expression),
+                    elementAccess.Index is null ? null : LowerExpressionNoEmit(elementAccess.Index),
+                    elementAccess.Type,
+                    elementAccess.Syntax);
+
+            case BoundMemberAccessExpression memberAccess:
+                return new GimpleMemberAccessExpression(
+                    LowerExpressionNoEmit(memberAccess.Expression),
+                    memberAccess.OperatorToken.Kind == SyntaxKind.ArrowToken,
+                    memberAccess.NameToken,
+                    memberAccess.Field,
+                    memberAccess.Type,
+                    memberAccess.Syntax);
+
+            default:
+                if (TryEvaluateIntegerConstantValue(expression, out var integerValue))
+                    return new GimpleConstantValue(integerValue, expression.Type, expression.Syntax);
+
+                return new GimpleErrorValue(expression.Syntax);
+        }
+    }
+
+    /// <summary>Builds an assignable place without emitting statements</summary>
+    private GimplePlace LowerPlaceNoEmit(BoundExpression expression)
+    {
+        switch (expression)
+        {
+            case BoundNameExpression name when name.Symbol is not null:
+                return new GimpleSymbolValue(name.Symbol, name.Type, name.Syntax);
+
+            case BoundParenthesizedExpression parenthesized:
+                return LowerPlaceNoEmit(parenthesized.Expression);
+
+            case BoundUnaryExpression unary when unary.OperatorToken.Kind == SyntaxKind.StarToken:
+                return new GimpleIndirectExpression(LowerExpressionNoEmit(unary.Operand), unary.Type, unary.Syntax);
+
+            case BoundElementAccessExpression elementAccess:
+                return new GimpleElementAccessExpression(
+                    LowerExpressionNoEmit(elementAccess.Expression),
+                    elementAccess.Index is null ? null : LowerExpressionNoEmit(elementAccess.Index),
+                    elementAccess.Type,
+                    elementAccess.Syntax);
+
+            case BoundMemberAccessExpression memberAccess:
+                return new GimpleMemberAccessExpression(
+                    LowerExpressionNoEmit(memberAccess.Expression),
+                    memberAccess.OperatorToken.Kind == SyntaxKind.ArrowToken,
+                    memberAccess.NameToken,
+                    memberAccess.Field,
+                    memberAccess.Type,
+                    memberAccess.Syntax);
+
+            case BoundConversionExpression conversion when conversion.ConversionKind == BoundConversionKind.Identity:
+                return LowerPlaceNoEmit(conversion.Expression);
+
+            default:
+                return new GimpleIndirectExpression(new GimpleErrorValue(expression.Syntax), expression.Type, expression.Syntax);
+        }
+    }
+
+    /// <summary>Lowers an expression when its resulting value is discarded</summary>
+    private void LowerExpressionForSideEffects(BoundExpression expression)
+    {
+        switch (expression)
+        {
+            case BoundParenthesizedExpression parenthesized:
+                LowerExpressionForSideEffects(parenthesized.Expression);
+                break;
+
+            case BoundCallExpression call:
+                EmitCall(call, discardResult: true);
+                break;
+
+            default:
+                _ = LowerExpression(expression);
+                break;
+        }
+    }
+
+    private GimpleValue LowerExpression(BoundExpression expression)
+    {
+        switch (expression)
+        {
+            case BoundLiteralExpression literal:
+                return new GimpleConstantValue(literal.ConstantValue, literal.Type, literal.Syntax);
+
+            case BoundNameExpression name:
+                return LowerNameExpression(name);
+
+            case BoundParenthesizedExpression parenthesized:
+                return LowerExpression(parenthesized.Expression);
+
+            case BoundConversionExpression conversion:
+                return LowerConversionExpression(conversion);
+
+            case BoundCastExpression cast:
+                return EmitConvert(
+                    LowerExpression(cast.Expression),
+                    cast.Type,
+                    cast.Syntax);
+
+            case BoundUnaryExpression unary:
+                return LowerUnaryExpression(unary);
+
+            case BoundPostfixUnaryExpression postfix:
+                return LowerPostfixUnaryExpression(postfix);
+
+            case BoundBinaryExpression binary:
+                return LowerBinaryExpression(binary);
+
+            case BoundAssignmentExpression assignment:
+                return LowerAssignmentExpression(assignment);
+
+            case BoundConditionalExpression conditional:
+                return LowerConditionalExpressionToValue(conditional);
+
+            case BoundSizeofExpression sizeofExpression:
+                return new GimpleConstantValue(sizeofExpression.ConstantValue, sizeofExpression.Type, sizeofExpression.Syntax);
+
+            case BoundCompoundLiteralExpression compoundLiteral:
+                return LowerCompoundLiteralExpression(compoundLiteral);
+
+            case BoundGenericSelectionExpression generic:
+                return generic.SelectedExpression is null
+                    ? new GimpleErrorValue(generic.Syntax)
+                    : LowerExpression(generic.SelectedExpression);
+
+            case BoundStatementExpression statementExpression:
+                return LowerStatementExpression(statementExpression);
+
+            case BoundCallExpression call:
+                return EmitCall(call, discardResult: false);
+
+            case BoundElementAccessExpression elementAccess:
+                return LowerElementAccessExpression(elementAccess);
+
+            case BoundMemberAccessExpression memberAccess:
+                return LowerMemberAccessExpression(memberAccess);
+
+            case BoundErrorExpression error:
+                return new GimpleErrorValue(error.Syntax);
+
+            default:
+                return new GimpleErrorValue(expression.Syntax);
+        }
+    }
+
+    /// <summary>Lowers an expression while preserving sequencing and value semantics</summary>
+    private GimpleValue LowerRValue(BoundExpression expression)
+    {
+        switch (expression)
+        {
+            case BoundBinaryExpression binary when binary.OperatorToken.Kind == SyntaxKind.CommaToken:
+                LowerExpressionForSideEffects(binary.Left);
+                return LowerRValue(binary.Right);
+
+            case BoundBinaryExpression binary when IsLogicalOperator(binary.OperatorToken.Kind):
+                return LowerConditionalExpressionToValue(binary);
+
+            case BoundConditionalExpression conditional:
+                return LowerConditionalExpressionToValue(conditional);
+
+            case BoundAssignmentExpression assignment:
+                return LowerAssignmentExpression(assignment);
+
+            case BoundUnaryExpression unary when unary.OperatorToken.Kind is SyntaxKind.PlusPlusToken or SyntaxKind.MinusMinusToken:
+                return LowerUnaryExpression(unary);
+
+            case BoundPostfixUnaryExpression postfix:
+                return LowerPostfixUnaryExpression(postfix);
+
+            case BoundCallExpression call:
+                return EmitCall(call, discardResult: false);
+
+            default:
+                return LowerExpression(expression);
+        }
+    }
+
+    private GimpleValue LowerNameExpression(BoundNameExpression expression)
+    {
+        if (expression.Symbol is null)
+            return new GimpleErrorValue(expression.Syntax);
+
+        if (expression.Symbol is EnumConstantSymbol enumConstant)
+            return new GimpleConstantValue(enumConstant.Value, expression.Type, expression.Syntax);
+
+        return new GimpleSymbolValue(expression.Symbol, expression.Type, expression.Syntax);
+    }
+
+    private GimpleValue LowerConversionExpression(BoundConversionExpression expression)
+    {
+        if (expression.ConversionKind is BoundConversionKind.Identity or BoundConversionKind.LValueToRValue)
+            return LowerExpression(expression.Expression);
+
+        var operand = LowerExpression(expression.Expression);
+
+        switch (expression.ConversionKind)
+        {
+            case BoundConversionKind.ArrayToPointer:
+            case BoundConversionKind.FunctionToPointer:
+                return EmitDecay(operand, expression.Type, expression.Syntax);
+
+            default:
+                return EmitConvert(operand, expression.Type, expression.Syntax);
+        }
+    }
+
+    /// <summary>Emits the address that an array or function operand decays to</summary>
+    private GimpleValue EmitDecay(GimpleValue operand, QualifiedType type, SyntaxNode? syntax)
+    {
+        if (operand is GimpleConstantValue constant)
+            return new GimpleConstantValue(constant.Value, type, syntax);
+
+        if (operand is not GimplePlace place)
+            return EmitConvert(operand, type, syntax);
+
+        var target = CreateTemporary(type, syntax);
+        Emit(GimpleAssignStatement.Single(
+            target,
+            new GimpleAddressOfExpression(GimplifyReference(place), type, syntax),
+            syntax));
+        return target;
+    }
+
+    /// <summary>Emits the conversion that produces a value of the destination type</summary>
+    private GimpleValue EmitConvert(GimpleValue operand, QualifiedType type, SyntaxNode? syntax)
+    {
+        var code = GimpleOperators.ConversionCode(operand.Type, type);
+        return EmitUnary(code, operand, type, syntax);
+    }
+
+    private GimpleValue LowerUnaryExpression(BoundUnaryExpression expression)
+    {
+        switch (expression.OperatorToken.Kind)
+        {
+            case SyntaxKind.AmpersandToken:
+                {
+                    var target = CreateTemporary(expression.Type, expression.Syntax);
+                    Emit(GimpleAssignStatement.Single(
+                        target,
+                        new GimpleAddressOfExpression(
+                            GimplifyReference(LowerPlace(expression.Operand)),
+                            expression.Type,
+                            expression.Syntax),
+                        expression.Syntax));
+                    return target;
+                }
+
+            case SyntaxKind.StarToken:
+                return new GimpleIndirectExpression(
+                    GimplifyValue(LowerExpression(expression.Operand)),
+                    expression.Type,
+                    expression.Syntax);
+
+            case SyntaxKind.PlusPlusToken:
+            case SyntaxKind.MinusMinusToken:
+                return LowerIncrement(
+                    LowerPlace(expression.Operand),
+                    expression.OperatorToken.Kind == SyntaxKind.PlusPlusToken,
+                    returnUpdatedValue: true,
+                    expression.Syntax);
+
+            case SyntaxKind.PlusToken:
+                return LowerExpression(expression.Operand);
+
+            default:
+                return EmitUnary(
+                    GimpleOperators.FromUnaryOperator(expression.OperatorToken.Kind),
+                    LowerExpression(expression.Operand),
+                    expression.Type,
+                    expression.Syntax);
+        }
+    }
+
+    private GimpleValue LowerPostfixUnaryExpression(BoundPostfixUnaryExpression expression)
+    {
+        return LowerIncrement(
+            LowerPlace(expression.Operand),
+            expression.OperatorToken.Kind == SyntaxKind.PlusPlusToken,
+            returnUpdatedValue: false,
+            expression.Syntax);
+    }
+
+    /// <summary>Steps a place by one and yields the requested version of its value</summary>
+    /// <remarks>A register-like place updates in place, while a memory place is loaded, stepped, and stored</remarks>
+    private GimpleValue LowerIncrement(GimplePlace target, bool increment, bool returnUpdatedValue, SyntaxNode? syntax)
+    {
+        var place = GimplifyReference(target);
+        var one = CreateIntegerOne(place.Type, syntax);
+        var code = GimpleOperators.FromBinaryOperator(
+            increment ? SyntaxKind.PlusToken : SyntaxKind.MinusToken,
+            place.Type,
+            one.Type);
+
+        var step = code == GimpleTreeCode.PointerPlusExpr && !increment
+            ? CreateIntegerConstant(-1, one.Type, syntax)
+            : one;
+
+        if (GimpleOperandRules.IsRegisterOperand(place))
+        {
+            var previous = returnUpdatedValue ? null : Materialize(place);
+            Emit(GimpleAssignStatement.Binary(place, code, place, step, syntax));
+            return previous ?? (GimpleValue)place;
+        }
+
+        var oldValue = Materialize(place);
+        var updated = EmitBinary(code, oldValue, step, place.Type, syntax);
+        EmitStore(place, updated, syntax);
+        return returnUpdatedValue ? updated : oldValue;
+    }
+
+    private GimpleValue LowerBinaryExpression(BoundBinaryExpression expression)
+    {
+        if (expression.OperatorToken.Kind == SyntaxKind.CommaToken)
+        {
+            LowerExpressionForSideEffects(expression.Left);
+            return LowerExpression(expression.Right);
+        }
+
+        if (IsLogicalOperator(expression.OperatorToken.Kind))
+            return LowerConditionalExpressionToValue(expression);
+
+        var left = LowerExpression(expression.Left);
+        var right = LowerExpression(expression.Right);
+        return EmitArithmetic(expression.OperatorToken.Kind, left, right, expression.Type, expression.Syntax);
+    }
+
+    /// <summary>Emits one arithmetic or comparison statement for a C operator</summary>
+    /// <remarks>Stepping a pointer backwards becomes a pointer addition over a negated offset</remarks>
+    private GimpleValue EmitArithmetic(SyntaxKind kind, GimpleValue left, GimpleValue right, QualifiedType type, SyntaxNode? syntax)
+    {
+        var code = GimpleOperators.FromBinaryOperator(kind, left.Type, right.Type);
+        if (GimpleOperators.NegatesPointerOffset(kind, left.Type, right.Type))
+            right = NegateOffset(right, syntax);
+
+        return EmitBinary(code, left, right, type, syntax);
+    }
+
+    /// <summary>Produces the negation of a pointer offset, folding it when the offset is constant</summary>
+    /// <remarks>Widen before negating: an unsigned offset negated at its own width steps forward</remarks>
+    private GimpleValue NegateOffset(GimpleValue offset, SyntaxNode? syntax)
+    {
+        var type = PointerOffsetType(offset.Type);
+        if (offset is GimpleConstantValue constant && TryConvertConstantToLong(constant.Value, out var value))
+            return CreateIntegerConstant(-value, type, syntax);
+
+        return EmitUnary(GimpleTreeCode.NegateExpr, EmitConvert(offset, type, syntax), type, syntax);
+    }
+
+    /// <summary>Signed type for pointer offsets, never narrower than a pointer</summary>
+    private QualifiedType PointerOffsetType(QualifiedType offsetType)
+    {
+        if (_target.SizeOf(offsetType) >= _target.PointerSize)
+            return offsetType;
+
+        foreach (var candidate in new[] { BuiltinTypeKind.Int, BuiltinTypeKind.Long, BuiltinTypeKind.LongLong })
+        {
+            var type = _types.Builtin(candidate);
+            if (_target.SizeOf(type) >= _target.PointerSize)
+                return type;
+        }
+
+        return _types.Builtin(BuiltinTypeKind.LongLong);
+    }
+
+    /// <summary>Emits a store and yields the stored value</summary>
+    private GimpleValue LowerAssignmentExpression(BoundAssignmentExpression expression)
+    {
+        var target = GimplifyReference(LowerPlace(expression.Left));
+
+        if (expression.OperatorToken.Kind == SyntaxKind.EqualsToken)
+        {
+            var assigned = LowerRValue(expression.Right);
+            EmitStore(target, assigned, expression.Syntax);
+            return GimpleOperandRules.IsRegisterOperand(assigned) ? assigned : target;
+        }
+
+        var operand = LowerExpression(expression.Right);
+        var code = GimpleOperators.FromBinaryOperator(
+            GimpleOperators.CompoundAssignmentOperator(expression.OperatorToken.Kind),
+            target.Type,
+            operand.Type);
+
+        if (GimpleOperators.NegatesPointerOffset(
+                GimpleOperators.CompoundAssignmentOperator(expression.OperatorToken.Kind),
+                target.Type,
+                operand.Type))
+        {
+            operand = NegateOffset(operand, expression.Syntax);
+        }
+
+        if (GimpleOperandRules.IsRegisterOperand(target))
+        {
+            Emit(GimpleAssignStatement.Binary(target, code, target, GimplifyValue(operand), expression.Syntax));
+            return target;
+        }
+
+        var oldValue = Materialize(target);
+        var updated = EmitBinary(code, oldValue, operand, target.Type, expression.Syntax);
+        EmitStore(target, updated, expression.Syntax);
+        return updated;
+    }
+
+    /// <summary>Converts conditional evaluation into branches assigning one result temporary</summary>
+    private GimpleValue LowerConditionalExpressionToValue(BoundExpression expression)
+    {
+        var result = CreateTemporary(expression.Type, expression.Syntax);
+        var trueLabel = CreateGeneratedLabel("cond_true");
+        var falseLabel = CreateGeneratedLabel("cond_false");
+        var endLabel = CreateGeneratedLabel("cond_end");
+
+        switch (expression)
+        {
+            case BoundConditionalExpression conditional:
+                EmitConditional(conditional.Condition, trueLabel, falseLabel);
+
+                StartBlock(trueLabel);
+                EmitStore(result, LowerRValue(conditional.WhenTrue), conditional.WhenTrue.Syntax);
+                Emit(new GimpleGotoStatement(endLabel));
+
+                StartBlock(falseLabel);
+                EmitStore(result, LowerRValue(conditional.WhenFalse), conditional.WhenFalse.Syntax);
+                Emit(new GimpleGotoStatement(endLabel));
+                break;
+
+            case BoundBinaryExpression logical when IsLogicalOperator(logical.OperatorToken.Kind):
+                {
+                    var rightLabel = CreateGeneratedLabel("logical_rhs");
+                    if (logical.OperatorToken.Kind == SyntaxKind.AmpersandAmpersandToken)
+                        EmitConditional(logical.Left, rightLabel, falseLabel);
+                    else
+                        EmitConditional(logical.Left, trueLabel, rightLabel);
+
+                    StartBlock(rightLabel);
+                    EmitConditional(logical.Right, trueLabel, falseLabel);
+
+                    StartBlock(trueLabel);
+                    EmitStore(result, CreateIntegerOne(result.Type, logical.Syntax), logical.Syntax);
+                    Emit(new GimpleGotoStatement(endLabel));
+
+                    StartBlock(falseLabel);
+                    EmitStore(result, CreateIntegerZero(result.Type, logical.Syntax), logical.Syntax);
+                    Emit(new GimpleGotoStatement(endLabel));
+                    break;
+                }
+
+            default:
+                EmitConditional(expression, trueLabel, falseLabel);
+
+                StartBlock(trueLabel);
+                EmitStore(result, CreateIntegerOne(result.Type, expression.Syntax), expression.Syntax);
+                Emit(new GimpleGotoStatement(endLabel));
+
+                StartBlock(falseLabel);
+                EmitStore(result, CreateIntegerZero(result.Type, expression.Syntax), expression.Syntax);
+                Emit(new GimpleGotoStatement(endLabel));
+                break;
+        }
+
+        StartBlock(endLabel);
+        return result;
+    }
+
+    private GimpleValue LowerCompoundLiteralExpression(BoundCompoundLiteralExpression expression)
+    {
+        var target = CreateTemporary(expression.Type, expression.Syntax);
+        if (expression.InitializerList is not null)
+            LowerInitializer(target, expression.InitializerList);
+        else
+            EmitZeroInitialize(target, expression.Syntax);
+
+        return target;
+    }
+
+    // Only the final expression statement contributes the extension value
+    private GimpleValue LowerStatementExpression(BoundStatementExpression expression)
+    {
+        var members = expression.Statement.Members;
+        if (members.Length == 0)
+            return new GimpleConstantValue(null, expression.Type, expression.Syntax);
+
+        for (var i = 0; i < members.Length - 1; i++)
+            LowerNode(members[i]);
+
+        if (members[^1] is BoundExpressionStatement expressionStatement)
+            return LowerExpression(expressionStatement.Expression);
+
+        LowerNode(members[^1]);
+        return new GimpleConstantValue(null, expression.Type, expression.Syntax);
+    }
+
+    /// <summary>Emits a call statement and yields the temporary that receives its result</summary>
+    /// <remarks>A discarded result leaves the call without a destination</remarks>
+    private GimpleValue EmitCall(BoundCallExpression expression, bool discardResult)
+    {
+        var callee = LowerCallCalleeExpression(expression.Expression);
+        var arguments = ImmutableArray.CreateBuilder<GimpleValue>(expression.Arguments.Length);
+        foreach (var argument in expression.Arguments)
+            arguments.Add(GimplifyArgument(LowerExpression(argument)));
+
+        var producesValue = !discardResult && !GimpleTypes.IsVoid(expression.Type) && !expression.Type.IsError;
+        var result = producesValue ? CreateTemporary(expression.Type, expression.Syntax) : null;
+
+        Emit(new GimpleCallStatement(
+            result,
+            callee,
+            arguments.ToImmutable(),
+            expression.FunctionType,
+            expression.Type,
+            expression.Syntax,
+            isTailCall: false,
+            isNoReturn: IsNoReturnCallee(callee)));
+
+        return (GimpleValue?)result ?? new GimpleConstantValue(null, expression.Type, expression.Syntax);
+    }
+
+    // A direct callee stays a function declaration so the call site keeps its symbol
+    private GimpleValue LowerCallCalleeExpression(BoundExpression expression)
+    {
+        switch (expression)
+        {
+            case BoundParenthesizedExpression parenthesized:
+                return LowerCallCalleeExpression(parenthesized.Expression);
+
+            case BoundConversionExpression conversion
+                when conversion.ConversionKind is BoundConversionKind.Identity or BoundConversionKind.FunctionToPointer:
+                return LowerCallCalleeExpression(conversion.Expression);
+
+            case BoundNameExpression name when name.Symbol is FunctionSymbol:
+                return LowerNameExpression(name);
+
+            default:
+                return GimplifyValue(LowerExpression(expression));
+        }
+    }
+
+    private static bool IsNoReturnCallee(GimpleValue callee)
+        => callee is GimpleSymbolValue { Symbol: FunctionSymbol function } &&
+           (function.FunctionSpecifiers & FunctionSpecifiers.NoReturn) != 0;
+
+    private GimplePlace LowerElementAccessExpression(BoundElementAccessExpression expression)
+    {
+        var target = LowerExpression(expression.Expression);
+        var index = expression.Index is null ? null : GimplifyValue(LowerExpression(expression.Index));
+
+        return new GimpleElementAccessExpression(
+            GimplifyReferenceBase(target),
+            index,
+            expression.Type,
+            expression.Syntax);
+    }
+
+    private GimplePlace LowerMemberAccessExpression(BoundMemberAccessExpression expression)
+    {
+        var throughPointer = expression.OperatorToken.Kind == SyntaxKind.ArrowToken;
+        var target = LowerExpression(expression.Expression);
+
+        return new GimpleMemberAccessExpression(
+            throughPointer ? GimplifyValue(target) : GimplifyReferenceBase(target),
+            throughPointer,
+            expression.NameToken,
+            expression.Field,
+            expression.Type,
+            expression.Syntax);
+    }
+
+    /// <summary>Lowers an assignable expression and recovers with a temporary when needed</summary>
+    private GimplePlace LowerPlace(BoundExpression expression)
+    {
+        switch (expression)
+        {
+            case BoundNameExpression name when name.Symbol is not null:
+                return new GimpleSymbolValue(name.Symbol, name.Type, name.Syntax);
+
+            case BoundParenthesizedExpression parenthesized:
+                return LowerPlace(parenthesized.Expression);
+
+            case BoundUnaryExpression unary when unary.OperatorToken.Kind == SyntaxKind.StarToken:
+                return new GimpleIndirectExpression(GimplifyValue(LowerExpression(unary.Operand)), unary.Type, unary.Syntax);
+
+            case BoundElementAccessExpression elementAccess:
+                return LowerElementAccessExpression(elementAccess);
+
+            case BoundMemberAccessExpression memberAccess:
+                return LowerMemberAccessExpression(memberAccess);
+
+            case BoundCompoundLiteralExpression compoundLiteral:
+                return (GimplePlace)LowerCompoundLiteralExpression(compoundLiteral);
+
+            case BoundConversionExpression conversion when conversion.ConversionKind == BoundConversionKind.Identity:
+                return LowerPlace(conversion.Expression);
+
+            default:
+                var lowered = LowerExpression(expression);
+                return lowered as GimplePlace ?? CreateTemporary(expression.Type, expression.Syntax);
+        }
+    }
+
+    /// <summary>Emits short-circuit control flow for a condition</summary>
+    private void EmitConditional(BoundExpression condition, GimpleLabel whenTrue, GimpleLabel whenFalse)
+    {
+        switch (condition)
+        {
+            case BoundParenthesizedExpression parenthesized:
+                EmitConditional(parenthesized.Expression, whenTrue, whenFalse);
+                return;
+
+            case BoundConversionExpression conversion when conversion.ConversionKind == BoundConversionKind.LValueToRValue ||
+                                                        conversion.ConversionKind == BoundConversionKind.Identity:
+                EmitConditional(conversion.Expression, whenTrue, whenFalse);
+                return;
+
+            case BoundBinaryExpression binary when binary.OperatorToken.Kind == SyntaxKind.AmpersandAmpersandToken:
+                {
+                    var rightLabel = CreateGeneratedLabel("logical_rhs");
+                    EmitConditional(binary.Left, rightLabel, whenFalse);
+                    StartBlock(rightLabel);
+                    EmitConditional(binary.Right, whenTrue, whenFalse);
+                    return;
+                }
+
+            case BoundBinaryExpression binary when binary.OperatorToken.Kind == SyntaxKind.PipePipeToken:
+                {
+                    var rightLabel = CreateGeneratedLabel("logical_rhs");
+                    EmitConditional(binary.Left, whenTrue, rightLabel);
+                    StartBlock(rightLabel);
+                    EmitConditional(binary.Right, whenTrue, whenFalse);
+                    return;
+                }
+
+            case BoundConditionalExpression conditional:
+                {
+                    var trueArm = CreateGeneratedLabel("cond_branch_true");
+                    var falseArm = CreateGeneratedLabel("cond_branch_false");
+                    EmitConditional(conditional.Condition, trueArm, falseArm);
+                    StartBlock(trueArm);
+                    EmitConditional(conditional.WhenTrue, whenTrue, whenFalse);
+                    StartBlock(falseArm);
+                    EmitConditional(conditional.WhenFalse, whenTrue, whenFalse);
+                    return;
+                }
+        }
+
+        EmitBranch(condition, whenTrue, whenFalse);
+    }
+
+    /// <summary>Emits the comparison terminator that selects between two labels</summary>
+    /// <remarks>A condition that is not already a comparison is tested against zero</remarks>
+    private void EmitBranch(BoundExpression condition, GimpleLabel whenTrue, GimpleLabel whenFalse)
+    {
+        if (condition is BoundUnaryExpression { OperatorToken.Kind: SyntaxKind.BangToken } negation)
+        {
+            EmitBranch(negation.Operand, whenFalse, whenTrue);
+            return;
+        }
+
+        if (condition is BoundBinaryExpression binary)
+        {
+            var comparison = GimpleOperators.FromBinaryOperator(
+                binary.OperatorToken.Kind,
+                binary.Left.Type,
+                binary.Right.Type);
+
+            if (GimpleOperators.IsComparison(comparison))
+            {
+                var left = GimplifyValue(LowerExpression(binary.Left));
+                var right = GimplifyValue(LowerExpression(binary.Right));
+                Emit(new GimpleCondStatement(comparison, left, right, whenTrue, whenFalse, condition.Syntax));
+                return;
+            }
+        }
+
+        var value = GimplifyValue(LowerExpression(condition));
+        Emit(new GimpleCondStatement(
+            GimpleTreeCode.NeExpr,
+            value,
+            CreateIntegerZero(value.Type, condition.Syntax),
+            whenTrue,
+            whenFalse,
+            condition.Syntax));
+    }
+
+    /// <summary>Stores a value into a fresh temporary and returns it</summary>
+    private GimpleTemporaryValue Materialize(GimpleValue value)
+    {
+        if (value is GimpleTemporaryValue temporary)
+            return temporary;
+
+        if (TryGetBitFieldAccess(value, out var member, out var placement))
+            return Materialize(ExtractBitField(member, placement));
+
+        var target = CreateTemporary(value.Type, value.Syntax);
+        Emit(GimpleAssignStatement.Single(target, value, value.Syntax));
+        return target;
+    }
+
+    /// <summary>Emits the store that gives a place its value</summary>
+    private void EmitStore(GimplePlace target, GimpleValue value, SyntaxNode? syntax)
+    {
+        if (TryGetBitFieldAccess(target, out var member, out var placement))
+        {
+            InsertBitField(member, placement, value, syntax);
+            return;
+        }
+
+        Emit(GimpleAssignStatement.Single(
+            GimplifyReference(target),
+            GimplifyStoredValue(value),
+            syntax));
+    }
+
+    private bool TryGetBitFieldAccess(GimpleValue value, out GimpleMemberAccessExpression member, out FieldPlacement placement)
+    {
+        member = null!;
+        placement = default;
+        if (value is not GimpleMemberAccessExpression access || !access.Field!.IsBitField)
+            return false;
+
+        placement = _target.GetFieldPlacement(access.Field);
+        if (!placement.IsBitField || placement.BitWidth <= 0)
+            return false;
+
+        member = access;
+        return placement.BitWidth < StorageBits(access.Field.Type);
+    }
+
+    /// <summary>Reads the storage a bit-field shares and shifts its own bits down into place</summary>
+    private GimpleValue ExtractBitField(GimpleMemberAccessExpression member, FieldPlacement placement)
+    {
+        var unitType = member.Field!.Type;
+        var unitBits = StorageBits(unitType);
+        var syntax = member.Syntax;
+        var unit = ReadBitFieldStorage(member);
+
+        if (!IsSignedStorageType(unitType))
+        {
+            var shifted = placement.BitOffset == 0
+                ? unit
+                : EmitBinary(GimpleTreeCode.RshiftExpr, unit, CreateIntegerConstant(placement.BitOffset, unitType, syntax), unitType, syntax);
+            return EmitBinary(GimpleTreeCode.BitAndExpr, shifted, CreateMaskConstant(placement.BitWidth, unitType, syntax), unitType, syntax);
+        }
+
+        // A signed field takes its sign from its own top bit, which only an arithmetic pair can spread
+        var upper = unitBits - placement.BitOffset - placement.BitWidth;
+        var raised = upper == 0
+            ? unit
+            : EmitBinary(GimpleTreeCode.LshiftExpr, unit, CreateIntegerConstant(upper, unitType, syntax), unitType, syntax);
+        return EmitBinary(
+            GimpleTreeCode.RshiftExpr,
+            raised,
+            CreateIntegerConstant(unitBits - placement.BitWidth, unitType, syntax),
+            unitType,
+            syntax);
+    }
+
+    /// <summary>Writes a bit-field back by clearing its bits in the shared storage and merging the new ones</summary>
+    private void InsertBitField(GimpleMemberAccessExpression member, FieldPlacement placement, GimpleValue value, SyntaxNode? syntax)
+    {
+        var unitType = member.Field!.Type;
+        var unit = ReadBitFieldStorage(member);
+        var keepMask = ~(MaskBits(placement.BitWidth) << placement.BitOffset) & MaskBits(StorageBits(unitType));
+
+        var cleared = EmitBinary(
+            GimpleTreeCode.BitAndExpr,
+            unit,
+            CreateIntegerConstant(unchecked((long)keepMask), unitType, syntax),
+            unitType,
+            syntax);
+        var narrowed = EmitBinary(
+            GimpleTreeCode.BitAndExpr,
+            ConvertToStorage(value, unitType, syntax),
+            CreateMaskConstant(placement.BitWidth, unitType, syntax),
+            unitType,
+            syntax);
+        var placed = placement.BitOffset == 0
+            ? narrowed
+            : EmitBinary(GimpleTreeCode.LshiftExpr, narrowed, CreateIntegerConstant(placement.BitOffset, unitType, syntax), unitType, syntax);
+        var merged = EmitBinary(GimpleTreeCode.BitIorExpr, cleared, placed, unitType, syntax);
+
+        Emit(GimpleAssignStatement.Single(GimplifyReference(member), GimplifyValue(merged), syntax));
+    }
+
+    private GimpleValue ReadBitFieldStorage(GimpleMemberAccessExpression member)
+    {
+        var target = CreateTemporary(member.Field!.Type, member.Syntax);
+        Emit(GimpleAssignStatement.Single(target, GimplifyReference(member), member.Syntax));
+        return target;
+    }
+
+    private GimpleValue ConvertToStorage(GimpleValue value, QualifiedType unitType, SyntaxNode? syntax)
+    {
+        var operand = GimplifyValue(value);
+        if (ReferenceEquals(operand.Type.Type, unitType.Type))
+            return operand;
+
+        return EmitConvert(operand, unitType, syntax);
+    }
+
+    private GimpleConstantValue CreateMaskConstant(int bitWidth, QualifiedType unitType, SyntaxNode? syntax)
+        => CreateIntegerConstant(unchecked((long)MaskBits(bitWidth)), unitType, syntax);
+
+    private static ulong MaskBits(int bitWidth)
+        => bitWidth >= 64 ? ulong.MaxValue : (1UL << bitWidth) - 1;
+
+    private int StorageBits(QualifiedType type)
+        => Math.Max(1, _target.SizeOf(type)) * 8;
+
+    // Matches the back ends, which read a plain char without a sign
+    private static bool IsSignedStorageType(QualifiedType type)
+        => type.Type is EnumType ||
+           (type.Type is BuiltinType builtin && builtin.BuiltinKind is
+               BuiltinTypeKind.SignedChar or BuiltinTypeKind.Short or BuiltinTypeKind.Int or
+               BuiltinTypeKind.Long or BuiltinTypeKind.LongLong);
+
+    /// <summary>Emits a unary computation into a fresh temporary</summary>
+    private GimpleValue EmitUnary(GimpleTreeCode code, GimpleValue operand, QualifiedType type, SyntaxNode? syntax)
+    {
+        if (code == GimpleTreeCode.None || code == GimpleTreeCode.ErrorMark)
+            return new GimpleErrorValue(syntax);
+
+        var target = CreateTemporary(type, syntax);
+        Emit(GimpleAssignStatement.Unary(target, code, GimplifyValue(operand), syntax));
+        return target;
+    }
+
+    /// <summary>Emits a binary computation into a fresh temporary</summary>
+    private GimpleValue EmitBinary(GimpleTreeCode code, GimpleValue left, GimpleValue right, QualifiedType type, SyntaxNode? syntax)
+    {
+        if (code == GimpleTreeCode.None || code == GimpleTreeCode.ErrorMark)
+            return new GimpleErrorValue(syntax);
+
+        var target = CreateTemporary(type, syntax);
+        Emit(GimpleAssignStatement.Binary(target, code, GimplifyValue(left), GimplifyValue(right), syntax));
+        return target;
+    }
+
+    /// <summary>Reduces an operand to a register or an invariant a computation may consume</summary>
+    private GimpleValue GimplifyValue(GimpleValue value)
+    {
+        if (GimpleOperandRules.IsRegisterOperand(value))
+            return value;
+
+        if (value is GimplePlace place)
+            return Materialize(GimplifyReference(place));
+
+        return Materialize(value);
+    }
+
+    /// <summary>Reduces a call argument to an operand the call statement may carry</summary>
+    private GimpleValue GimplifyArgument(GimpleValue value)
+        => GimpleTypes.IsAggregate(value.Type) && value is GimplePlace aggregate
+            ? GimplifyReference(aggregate)
+            : GimplifyValue(value);
+
+    /// <summary>Reduces a returned operand to a shape the return statement may carry</summary>
+    private GimpleValue GimplifyReturnOperand(GimpleValue value)
+        => GimpleTypes.IsAggregate(value.Type) && value is GimplePlace aggregate
+            ? GimplifyReference(aggregate)
+            : GimplifyValue(value);
+
+    /// <summary>Reduces a stored value to a single right-hand side</summary>
+    /// <remarks>An aggregate keeps its reference form so the store copies memory in place</remarks>
+    private GimpleValue GimplifyStoredValue(GimpleValue value)
+    {
+        if (GimpleTypes.IsAggregate(value.Type) && value is GimplePlace aggregate)
+            return GimplifyReference(aggregate);
+
+        return GimplifyValue(value);
+    }
+
+    /// <summary>Reduces a reference tree so each of its operands satisfies the operand rules</summary>
+    private GimplePlace GimplifyReference(GimplePlace place)
+    {
+        switch (place)
+        {
+            case GimpleIndirectExpression indirect:
+                {
+                    var address = GimplifyValue(indirect.Address);
+                    return ReferenceEquals(address, indirect.Address)
+                        ? indirect
+                        : new GimpleIndirectExpression(address, indirect.Type, indirect.Syntax);
+                }
+
+            case GimpleElementAccessExpression element:
+                {
+                    var target = GimplifyReferenceBase(element.Expression);
+                    var index = element.Index is null ? null : GimplifyValue(element.Index);
+                    return ReferenceEquals(target, element.Expression) && ReferenceEquals(index, element.Index)
+                        ? element
+                        : new GimpleElementAccessExpression(target, index, element.Type, element.Syntax);
+                }
+
+            case GimpleMemberAccessExpression member:
+                {
+                    var target = member.ThroughPointer
+                        ? GimplifyValue(member.Expression)
+                        : GimplifyReferenceBase(member.Expression);
+
+                    return ReferenceEquals(target, member.Expression)
+                        ? member
+                        : new GimpleMemberAccessExpression(
+                            target,
+                            member.ThroughPointer,
+                            member.NameToken,
+                            member.Field,
+                            member.Type,
+                            member.Syntax);
+                }
+
+            default:
+                return place;
+        }
+    }
+
+    /// <summary>Reduces the base of a reference tree, which may stay a nested reference</summary>
+    private GimpleValue GimplifyReferenceBase(GimpleValue value)
+    {
+        if (value is GimpleSymbolValue or GimpleTemporaryValue)
+            return value;
+
+        if (value is GimplePlace place)
+        {
+            var reference = GimplifyReference(place);
+
+            // A pointer base is addressed indirectly, so it has to be a plain value
+            if (reference is GimpleIndirectExpression && GimpleTypes.IsPointerLike(reference.Type))
+                return GimplifyValue(reference);
+
+            return reference;
+        }
+
+        return GimplifyValue(value);
+    }
+
+    private GimpleTemporaryValue CreateTemporary(QualifiedType type, SyntaxNode? syntax)
+    {
+        var temporary = new GimpleTemporaryValue(_temporaryOrdinal++, type, syntax);
+        _temporaries.Add(temporary);
+        return temporary;
+    }
+
+    private GimpleConstantValue CreateIntegerZero(QualifiedType type, SyntaxNode? syntax)
+        => CreateIntegerConstant(0, type, syntax);
+
+    private GimpleConstantValue CreateIntegerOne(QualifiedType type, SyntaxNode? syntax)
+        => CreateIntegerConstant(1, type, syntax);
+
+    private GimpleConstantValue CreateIntegerConstant(long value, QualifiedType type, SyntaxNode? syntax)
+    {
+        var constantType = type.IsError || GimpleTypes.IsPointerLike(type)
+            ? _types.Builtin(BuiltinTypeKind.Int)
+            : type;
+
+        return new GimpleConstantValue((int)value == value ? (int)value : value, constantType, syntax);
+    }
+
+    // Statements after a terminator begin a distinct unreachable block
+    private void Emit(GimpleStatement statement)
+    {
+        if (_currentBlock is null || _currentBlock.HasTerminator)
+            StartBlock(CreateGeneratedLabel("unreachable"));
+
+        _currentBlock!.Statements.Add(statement);
+    }
+
+    // Preserve fallthrough explicitly when the previous block has no terminator
+    private void StartBlock(GimpleLabel label)
+    {
+        if (label is null)
+            throw new ArgumentNullException(nameof(label));
+
+        if (_currentBlock is not null && !_currentBlock.HasTerminator)
+            _currentBlock.Statements.Add(new GimpleGotoStatement(label));
+
+        _currentBlock = new BlockBuilder(label);
+        _blocks.Add(_currentBlock);
+    }
+
+    private bool IsCurrentBlockTerminated() => _currentBlock?.HasTerminator == true;
+
+    private GimpleLabel CreateGeneratedLabel(string prefix)
+        => new GimpleLabel($"{prefix}_{_labelOrdinal++.ToString(CultureInfo.InvariantCulture)}");
+
+    private GimpleLabel GetLabel(LabelSymbol? symbol, SyntaxNode? syntax = null)
+    {
+        if (symbol is null)
+            return CreateGeneratedLabel("missing_label");
+
+        if (!_labels.TryGetValue(symbol, out var label))
+        {
+            label = new GimpleLabel(symbol.Name, symbol, syntax ?? symbol.DeclaringSyntax);
+            _labels.Add(symbol, label);
+        }
+
+        return label;
+    }
+
+    private GimpleLabel GetBreakTarget()
+        => _breakTargets.Count != 0 ? _breakTargets.Peek() : CreateGeneratedLabel("invalid_break");
+
+    private GimpleLabel GetContinueTarget()
+        => _continueTargets.Count != 0 ? _continueTargets.Peek() : CreateGeneratedLabel("invalid_continue");
+
+    private GimpleLabel GetCaseLabel(BoundCaseStatement statement)
+    {
+        if (_switches.Count != 0 && _switches.Peek().CaseLabels.TryGetValue(statement, out var label))
+            return label;
+
+        return CreateGeneratedLabel("case");
+    }
+
+    private GimpleLabel GetDefaultLabel(BoundDefaultStatement statement)
+    {
+        if (_switches.Count != 0)
+            return _switches.Peek().DefaultLabel;
+
+        return CreateGeneratedLabel("default");
+    }
+
+    /// <summary>Collects case labels owned by one switch while skipping nested switches</summary>
+    private SwitchLabels CollectSwitchLabels(BoundStatement statement)
+    {
+        var cases = ImmutableArray.CreateBuilder<GimpleSwitchCase>();
+        var caseLabels = new Dictionary<BoundCaseStatement, GimpleLabel>();
+        GimpleLabel? defaultLabel = null;
+
+        void Visit(BoundStatement current)
+        {
+            switch (current)
+            {
+                case BoundCaseStatement caseStatement:
+                    {
+                        var label = CreateGeneratedLabel("case");
+                        caseLabels.Add(caseStatement, label);
+                        var value = TryEvaluateIntegerConstantValue(caseStatement.Expression, out var constantValue)
+                            ? new GimpleConstantValue(constantValue, caseStatement.Expression.Type, caseStatement.Expression.Syntax)
+                            : new GimpleConstantValue(null, caseStatement.Expression.Type, caseStatement.Expression.Syntax);
+
+                        cases.Add(new GimpleSwitchCase(value, label));
+                        Visit(caseStatement.Statement);
+                        break;
+                    }
+
+                case BoundDefaultStatement defaultStatement:
+                    defaultLabel ??= CreateGeneratedLabel("default");
+                    Visit(defaultStatement.Statement);
+                    break;
+
+                case BoundCompoundStatement compound:
+                    foreach (var member in compound.Members)
+                    {
+                        if (member is BoundStatement nested)
+                            Visit(nested);
+                    }
+                    break;
+
+                case BoundLabelStatement labelStatement:
+                    Visit(labelStatement.Statement);
+                    break;
+
+                case BoundSwitchStatement:
+                    break;
+            }
+        }
+
+        Visit(statement);
+        return new SwitchLabels(cases.ToImmutable(), caseLabels, defaultLabel);
+    }
+
+    /// <summary>Evaluates the supported bound integer constant expression subset</summary>
+    private static bool TryEvaluateIntegerConstantValue(BoundExpression expression, out long value)
+    {
+        switch (expression)
+        {
+            case BoundConversionExpression conversion:
+                return TryEvaluateIntegerConstantValue(conversion.Expression, out value);
+
+            case BoundParenthesizedExpression parenthesized:
+                return TryEvaluateIntegerConstantValue(parenthesized.Expression, out value);
+
+            case BoundCastExpression cast:
+                return TryEvaluateIntegerConstantValue(cast.Expression, out value);
+
+            case BoundSizeofExpression sizeofExpression:
+                return TryConvertConstantToLong(sizeofExpression.ConstantValue, out value);
+
+            case BoundLiteralExpression literal:
+                return TryConvertConstantToLong(literal.ConstantValue, out value);
+
+            case BoundUnaryExpression unary:
+                return TryEvaluateUnaryIntegerConstant(unary.OperatorToken.Kind, unary.Operand, out value);
+
+            case BoundBinaryExpression binary:
+                return TryEvaluateBinaryIntegerConstant(binary.Left, binary.OperatorToken.Kind, binary.Right, out value);
+
+            case BoundConditionalExpression conditional:
+                return TryEvaluateConditionalIntegerConstant(conditional.Condition, conditional.WhenTrue, conditional.WhenFalse, out value);
+
+            default:
+                return TryConvertConstantToLong(expression.ConstantValue, out value);
+        }
+    }
+
+    /// <summary>Evaluates the supported syntax-only integer constant expression subset</summary>
+    private static bool TryEvaluateIntegerConstantExpression(ExpressionSyntax expression, out long value)
+    {
+        switch (expression)
+        {
+            case LiteralExpressionSyntax literal:
+                return TryConvertConstantToLong(literal.LiteralToken.Value, out value) ||
+                       TryParseIntegerLiteral(literal.LiteralToken.Text, out value);
+
+            case ParenthesizedExpressionSyntax parenthesized:
+                return TryEvaluateIntegerConstantExpression(parenthesized.Expression, out value);
+
+            case CastExpressionSyntax cast:
+                return TryEvaluateIntegerConstantExpression(cast.Expression, out value);
+
+            case UnaryExpressionSyntax unary:
+                return TryEvaluateUnaryIntegerConstant(unary.OperatorToken.Kind, unary.Operand, out value);
+
+            case BinaryExpressionSyntax binary:
+                return TryEvaluateBinaryIntegerConstant(binary.Left, binary.OperatorToken.Kind, binary.Right, out value);
+
+            case ConditionalExpressionSyntax conditional:
+                return TryEvaluateConditionalIntegerConstant(
+                    conditional.Condition,
+                    conditional.WhenTrue,
+                    conditional.WhenFalse,
+                    out value);
+
+            default:
+                value = 0;
+                return false;
+        }
+    }
+
+    private static bool TryEvaluateUnaryIntegerConstant(
+        SyntaxKind operatorKind,
+        BoundExpression operandExpression,
+        out long value)
+    {
+        value = 0;
+        if (!TryEvaluateIntegerConstantValue(operandExpression, out var operand))
+            return false;
+
+        return TryEvaluateUnaryIntegerConstant(operatorKind, operand, out value);
+    }
+
+    private static bool TryEvaluateUnaryIntegerConstant(
+        SyntaxKind operatorKind,
+        ExpressionSyntax operandExpression,
+        out long value)
+    {
+        value = 0;
+        if (!TryEvaluateIntegerConstantExpression(operandExpression, out var operand))
+            return false;
+
+        return TryEvaluateUnaryIntegerConstant(operatorKind, operand, out value);
+    }
+
+    // Checked arithmetic turns overflow into a failed constant evaluation
+    private static bool TryEvaluateUnaryIntegerConstant(SyntaxKind operatorKind, long operand, out long value)
+    {
+        value = 0;
+
+        try
+        {
+            switch (operatorKind)
+            {
+                case SyntaxKind.PlusToken:
+                    value = operand;
                     return true;
+                case SyntaxKind.MinusToken:
+                    value = checked(-operand);
+                    return true;
+                case SyntaxKind.TildeToken:
+                    value = ~operand;
+                    return true;
+                case SyntaxKind.BangToken:
+                    value = operand == 0 ? 1 : 0;
+                    return true;
+                default:
+                    return false;
+            }
+        }
+        catch (OverflowException)
+        {
+            value = 0;
+            return false;
+        }
+    }
 
-                while (path.Count > startLength)
-                    path.RemoveAt(path.Count - 1);
+    private static bool TryEvaluateBinaryIntegerConstant(
+        BoundExpression leftExpression,
+        SyntaxKind operatorKind,
+        BoundExpression rightExpression,
+        out long value)
+    {
+        value = 0;
+
+        if (!TryEvaluateIntegerConstantValue(leftExpression, out var left) ||
+            !TryEvaluateIntegerConstantValue(rightExpression, out var right))
+        {
+            return false;
+        }
+
+        return TryEvaluateBinaryIntegerConstant(left, operatorKind, right, out value);
+    }
+
+    private static bool TryEvaluateBinaryIntegerConstant(
+        ExpressionSyntax leftExpression,
+        SyntaxKind operatorKind,
+        ExpressionSyntax rightExpression,
+        out long value)
+    {
+        value = 0;
+
+        if (!TryEvaluateIntegerConstantExpression(leftExpression, out var left) ||
+            !TryEvaluateIntegerConstantExpression(rightExpression, out var right))
+        {
+            return false;
+        }
+
+        return TryEvaluateBinaryIntegerConstant(left, operatorKind, right, out value);
+    }
+
+    // Reject invalid shifts, division by zero, and arithmetic overflow
+    private static bool TryEvaluateBinaryIntegerConstant(
+        long left,
+        SyntaxKind operatorKind,
+        long right,
+        out long value)
+    {
+        value = 0;
+
+        try
+        {
+            switch (operatorKind)
+            {
+                case SyntaxKind.StarToken:
+                    value = checked(left * right);
+                    return true;
+                case SyntaxKind.SlashToken:
+                    if (right == 0)
+                        return false;
+                    value = left / right;
+                    return true;
+                case SyntaxKind.PercentToken:
+                    if (right == 0)
+                        return false;
+                    value = left % right;
+                    return true;
+                case SyntaxKind.PlusToken:
+                    value = checked(left + right);
+                    return true;
+                case SyntaxKind.MinusToken:
+                    value = checked(left - right);
+                    return true;
+                case SyntaxKind.LessThanLessThanToken:
+                    if (right < 0 || right >= 64)
+                        return false;
+                    value = checked(left << (int)right);
+                    return true;
+                case SyntaxKind.GreaterThanGreaterThanToken:
+                    if (right < 0 || right >= 64)
+                        return false;
+                    value = left >> (int)right;
+                    return true;
+                case SyntaxKind.LessThanToken:
+                    value = left < right ? 1 : 0;
+                    return true;
+                case SyntaxKind.LessThanEqualsToken:
+                    value = left <= right ? 1 : 0;
+                    return true;
+                case SyntaxKind.GreaterThanToken:
+                    value = left > right ? 1 : 0;
+                    return true;
+                case SyntaxKind.GreaterThanEqualsToken:
+                    value = left >= right ? 1 : 0;
+                    return true;
+                case SyntaxKind.EqualsEqualsToken:
+                    value = left == right ? 1 : 0;
+                    return true;
+                case SyntaxKind.BangEqualsToken:
+                    value = left != right ? 1 : 0;
+                    return true;
+                case SyntaxKind.AmpersandToken:
+                    value = left & right;
+                    return true;
+                case SyntaxKind.PipeToken:
+                    value = left | right;
+                    return true;
+                case SyntaxKind.HatToken:
+                    value = left ^ right;
+                    return true;
+                case SyntaxKind.AmpersandAmpersandToken:
+                    value = left != 0 && right != 0 ? 1 : 0;
+                    return true;
+                case SyntaxKind.PipePipeToken:
+                    value = left != 0 || right != 0 ? 1 : 0;
+                    return true;
+                case SyntaxKind.CommaToken:
+                    value = right;
+                    return true;
+                default:
+                    return false;
+            }
+        }
+        catch (OverflowException)
+        {
+            value = 0;
+            return false;
+        }
+    }
+
+    private static bool TryEvaluateConditionalIntegerConstant(
+        BoundExpression condition,
+        BoundExpression whenTrue,
+        BoundExpression whenFalse,
+        out long value)
+    {
+        value = 0;
+
+        if (!TryEvaluateIntegerConstantValue(condition, out var conditionValue))
+            return false;
+
+        return conditionValue != 0
+            ? TryEvaluateIntegerConstantValue(whenTrue, out value)
+            : TryEvaluateIntegerConstantValue(whenFalse, out value);
+    }
+
+    private static bool TryEvaluateConditionalIntegerConstant(
+        ExpressionSyntax condition,
+        ExpressionSyntax whenTrue,
+        ExpressionSyntax whenFalse,
+        out long value)
+    {
+        value = 0;
+
+        if (!TryEvaluateIntegerConstantExpression(condition, out var conditionValue))
+            return false;
+
+        return conditionValue != 0
+            ? TryEvaluateIntegerConstantExpression(whenTrue, out value)
+            : TryEvaluateIntegerConstantExpression(whenFalse, out value);
+    }
+
+    private static bool TryConvertConstantToLong(object? constantValue, out long value)
+    {
+        switch (constantValue)
+        {
+            case byte byteValue:
+                value = byteValue;
+                return true;
+            case sbyte signedByteValue:
+                value = signedByteValue;
+                return true;
+            case short shortValue:
+                value = shortValue;
+                return true;
+            case ushort unsignedShortValue:
+                value = unsignedShortValue;
+                return true;
+            case int intValue:
+                value = intValue;
+                return true;
+            case uint unsignedIntValue:
+                value = unsignedIntValue;
+                return true;
+            case long longValue:
+                value = longValue;
+                return true;
+            case ulong unsignedLongValue when unsignedLongValue <= long.MaxValue:
+                value = (long)unsignedLongValue;
+                return true;
+            case char charValue:
+                value = charValue;
+                return true;
+            case bool boolValue:
+                value = boolValue ? 1 : 0;
+                return true;
+            default:
+                value = 0;
+                return false;
+        }
+    }
+
+    /// <summary>Parses decimal, hexadecimal, or octal integer spelling into a signed value</summary>
+    private static bool TryParseIntegerLiteral(string text, out long value)
+    {
+        value = 0;
+
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+
+        var trimmed = text.Trim().Replace("'", string.Empty);
+        trimmed = trimmed.TrimEnd('u', 'U', 'l', 'L');
+
+        try
+        {
+            if (trimmed.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            {
+                return long.TryParse(
+                    trimmed.Substring(2),
+                    NumberStyles.AllowHexSpecifier,
+                    CultureInfo.InvariantCulture,
+                    out value);
+            }
+
+            if (trimmed.Length > 1 && trimmed[0] == '0')
+                return TryParseOctalIntegerLiteral(trimmed, out value);
+
+            if (long.TryParse(trimmed, NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
+                return true;
+
+            // A literal above long.MaxValue is still valid while it fits unsigned long long
+            if (ulong.TryParse(trimmed, NumberStyles.Integer, CultureInfo.InvariantCulture, out var unsignedValue))
+            {
+                value = unchecked((long)unsignedValue);
+                return true;
             }
 
             return false;
         }
-
-        private GimplePlace CreateMemberAccess(GimpleValue expression, FieldSymbol field, SyntaxNode? syntax)
-        {
-            var nameToken = syntax is FieldDesignatorSyntax namedFieldDesignator
-                ? namedFieldDesignator.NameToken
-                : CreateSyntheticToken(SyntaxKind.IdentifierToken, field.Name);
-
-            return new GimpleMemberAccessExpression(
-                expression,
-                throughPointer: false,
-                nameToken,
-                field,
-                field.Type,
-                syntax);
-        }
-
-        private GimplePlace CreateElementAccess(GimpleValue expression, long index, QualifiedType elementType, SyntaxNode? syntax)
-        {
-            return new GimpleElementAccessExpression(
-                expression,
-                new GimpleConstantValue(index, _types.Builtin(BuiltinTypeKind.Long), syntax),
-                elementType,
-                syntax);
-        }
-
-        private static bool TryGetFirstFieldDesignator(
-            TagSymbol tag,
-            ImmutableArray<DesignatorSyntax> designators,
-            out FieldSymbol field)
-        {
-            field = null!;
-
-            if (designators.Length == 0 ||
-                designators[0] is not FieldDesignatorSyntax fieldDesignator)
-            {
-                return false;
-            }
-
-            return tag.TryGetField(fieldDesignator.NameToken.Text, out field!) && field is not null;
-        }
-
-        /// <summary>Places each item at the element its designator names, or at the running cursor, last write winning</summary>
-        private static ImmutableArray<GimpleInitializerListItem> PlaceArrayInitializerItems(
-            ImmutableArray<GimpleInitializerListItem>.Builder items)
-        {
-            var placed = new SortedDictionary<long, GimpleInitializerListItem>();
-            var cursor = 0L;
-
-            foreach (var item in items)
-            {
-                if (item.Designators.Length != 0)
-                {
-                    // A designator reaching into the element is left for the backend to reject rather than misplace
-                    if (item.Designators.Length != 1 || item.ElementIndex < 0)
-                        return items.ToImmutable();
-
-                    cursor = item.ElementIndex;
-                }
-
-                placed[cursor] = new GimpleInitializerListItem(
-                    item.Syntax,
-                    ImmutableArray<DesignatorSyntax>.Empty,
-                    item.Initializer,
-                    cursor);
-                cursor++;
-            }
-
-            return placed.Values.ToImmutableArray();
-        }
-
-        private static bool TryGetFirstArrayDesignatorIndex(
-            ImmutableArray<DesignatorSyntax> designators,
-            out long index)
-        {
-            index = 0;
-
-            return designators.Length != 0 &&
-                   designators[0] is ArrayDesignatorSyntax arrayDesignator &&
-                   TryEvaluateIntegerConstantExpression(arrayDesignator.Expression, out index);
-        }
-
-        // Emit explicit branch targets and a common continuation block
-        private void LowerIfStatement(BoundIfStatement statement)
-        {
-            var thenLabel = CreateGeneratedLabel("if_then");
-            var elseLabel = statement.ElseStatement is null ? null : CreateGeneratedLabel("if_else");
-            var endLabel = CreateGeneratedLabel("if_end");
-
-            EmitConditional(statement.Condition, thenLabel, elseLabel ?? endLabel);
-
-            StartBlock(thenLabel);
-            LowerStatement(statement.ThenStatement);
-            if (!IsCurrentBlockTerminated())
-                Emit(new GimpleGotoStatement(endLabel));
-
-            if (statement.ElseStatement is not null && elseLabel is not null)
-            {
-                StartBlock(elseLabel);
-                LowerStatement(statement.ElseStatement);
-                if (!IsCurrentBlockTerminated())
-                    Emit(new GimpleGotoStatement(endLabel));
-            }
-
-            StartBlock(endLabel);
-        }
-
-        // Continue targets the test block while break targets the continuation
-        private void LowerWhileStatement(BoundWhileStatement statement)
-        {
-            var testLabel = CreateGeneratedLabel("while_test");
-            var bodyLabel = CreateGeneratedLabel("while_body");
-            var endLabel = CreateGeneratedLabel("while_end");
-
-            Emit(new GimpleGotoStatement(testLabel));
-            StartBlock(testLabel);
-            EmitConditional(statement.Condition, bodyLabel, endLabel);
-
-            StartBlock(bodyLabel);
-            _breakTargets.Push(endLabel);
-            _continueTargets.Push(testLabel);
-            LowerStatement(statement.Statement);
-            _continueTargets.Pop();
-            _breakTargets.Pop();
-
-            if (!IsCurrentBlockTerminated())
-                Emit(new GimpleGotoStatement(testLabel));
-
-            StartBlock(endLabel);
-        }
-
-        // The body precedes the test so the first iteration is unconditional
-        private void LowerDoStatement(BoundDoStatement statement)
-        {
-            var bodyLabel = CreateGeneratedLabel("do_body");
-            var testLabel = CreateGeneratedLabel("do_test");
-            var endLabel = CreateGeneratedLabel("do_end");
-
-            StartBlock(bodyLabel);
-            _breakTargets.Push(endLabel);
-            _continueTargets.Push(testLabel);
-            LowerStatement(statement.Statement);
-            _continueTargets.Pop();
-            _breakTargets.Pop();
-
-            if (!IsCurrentBlockTerminated())
-                Emit(new GimpleGotoStatement(testLabel));
-
-            StartBlock(testLabel);
-            EmitConditional(statement.Condition, bodyLabel, endLabel);
-            StartBlock(endLabel);
-        }
-
-        // Continue targets the increment block
-        private void LowerForStatement(BoundForStatement statement)
-        {
-            var testLabel = CreateGeneratedLabel("for_test");
-            var bodyLabel = CreateGeneratedLabel("for_body");
-            var incrementLabel = CreateGeneratedLabel("for_step");
-            var endLabel = CreateGeneratedLabel("for_end");
-
-            // An expression initializer is a bare BoundExpression, which LowerNode would drop as a nop
-            if (statement.Initializer is BoundExpression initializer)
-                LowerExpressionForSideEffects(initializer);
-            else if (statement.Initializer is not null)
-                LowerNode(statement.Initializer);
-
-            Emit(new GimpleGotoStatement(testLabel));
-            StartBlock(testLabel);
-
-            if (statement.Condition is null)
-                Emit(new GimpleGotoStatement(bodyLabel));
-            else
-                EmitConditional(statement.Condition, bodyLabel, endLabel);
-
-            StartBlock(bodyLabel);
-            _breakTargets.Push(endLabel);
-            _continueTargets.Push(incrementLabel);
-            LowerStatement(statement.Statement);
-            _continueTargets.Pop();
-            _breakTargets.Pop();
-
-            if (!IsCurrentBlockTerminated())
-                Emit(new GimpleGotoStatement(incrementLabel));
-
-            StartBlock(incrementLabel);
-            if (statement.Increment is not null)
-                LowerExpressionForSideEffects(statement.Increment);
-            if (!IsCurrentBlockTerminated())
-                Emit(new GimpleGotoStatement(testLabel));
-
-            StartBlock(endLabel);
-        }
-
-        // Collect labels before lowering the body so forward case edges are stable
-        private void LowerSwitchStatement(BoundSwitchStatement statement)
-        {
-            var endLabel = CreateGeneratedLabel("switch_end");
-            var labels = CollectSwitchLabels(statement.Statement);
-            var defaultLabel = labels.DefaultLabel ?? endLabel;
-            var value = GimplifyValue(LowerExpression(statement.Expression));
-
-            Emit(new GimpleSwitchStatement(value, labels.Cases, defaultLabel, statement.Syntax));
-
-            _breakTargets.Push(endLabel);
-            _switches.Push(new SwitchContext(endLabel, labels.CaseLabels, defaultLabel));
-            LowerStatement(statement.Statement);
-            _switches.Pop();
-            _breakTargets.Pop();
-
-            if (!IsCurrentBlockTerminated())
-                Emit(new GimpleGotoStatement(endLabel));
-
-            StartBlock(endLabel);
-        }
-
-        private void LowerReturnStatement(BoundReturnStatement statement)
-        {
-            var expression = statement.Expression is null
-                ? null
-                : GimplifyReturnOperand(LowerExpression(statement.Expression));
-
-            Emit(new GimpleReturnStatement(statement.Function ?? _currentFunction, expression, statement.Syntax));
-        }
-
-        /// <summary>Lowers a static expression without emitting function statements</summary>
-        private GimpleValue LowerStaticExpression(BoundExpression expression)
-        {
-            if (TryEvaluateIntegerConstantValue(expression, out var integerValue))
-                return new GimpleConstantValue(integerValue, expression.Type, expression.Syntax);
-
-            if (TryEvaluateFloatingConstantValue(expression, out var floatingValue))
-                return new GimpleConstantValue(floatingValue, expression.Type, expression.Syntax);
-
-            if (expression.ConstantValue is not null)
-                return new GimpleConstantValue(expression.ConstantValue, expression.Type, expression.Syntax);
-
-            if (TryEvaluateStringConstantValue(expression, out var text))
-                return new GimpleConstantValue(text, expression.Type, expression.Syntax);
-
-            return LowerExpressionNoEmit(expression);
-        }
-
-        /// <summary>
-        /// Folds a string literal that reached a pointer initializer through array-to-pointer decay, so it
-        /// arrives at code generation as a constant the backend can turn into a relocation.
-        /// </summary>
-        private static bool TryEvaluateStringConstantValue(BoundExpression expression, out string text)
-        {
-            switch (expression)
-            {
-                case BoundConversionExpression conversion:
-                    return TryEvaluateStringConstantValue(conversion.Expression, out text);
-
-                case BoundParenthesizedExpression parenthesized:
-                    return TryEvaluateStringConstantValue(parenthesized.Expression, out text);
-
-                case BoundCastExpression cast:
-                    return TryEvaluateStringConstantValue(cast.Expression, out text);
-
-                default:
-                    text = (expression.ConstantValue as string)!;
-                    return text is not null;
-            }
-        }
-
-        /// <summary>
-        /// Folds the floating-point constant subset that appears in static initializers. Without this the
-        /// value reaches code generation as a conversion node, which every backend silently emits as zero.
-        /// </summary>
-        private static bool TryEvaluateFloatingConstantValue(BoundExpression expression, out double value)
-        {
-            switch (expression)
-            {
-                case BoundConversionExpression conversion:
-                    return TryEvaluateFloatingConstantValue(conversion.Expression, out value);
-
-                case BoundParenthesizedExpression parenthesized:
-                    return TryEvaluateFloatingConstantValue(parenthesized.Expression, out value);
-
-                case BoundCastExpression cast:
-                    return TryEvaluateFloatingConstantValue(cast.Expression, out value);
-
-                case BoundUnaryExpression unary when unary.OperatorToken.Kind is SyntaxKind.PlusToken or SyntaxKind.MinusToken:
-                    if (!TryEvaluateFloatingConstantValue(unary.Operand, out value))
-                        return false;
-                    if (unary.OperatorToken.Kind == SyntaxKind.MinusToken)
-                        value = -value;
-                    return true;
-
-                default:
-                    return TryConvertConstantToDouble(expression.ConstantValue, out value);
-            }
-        }
-
-        private static bool TryConvertConstantToDouble(object? constantValue, out double value)
-        {
-            switch (constantValue)
-            {
-                case double doubleValue:
-                    value = doubleValue;
-                    return true;
-                case float singleValue:
-                    value = singleValue;
-                    return true;
-                case decimal decimalValue:
-                    value = (double)decimalValue;
-                    return true;
-                default:
-                    value = 0;
-                    return false;
-            }
-        }
-
-        /// <summary>Builds a side-effect-free lowered value for static contexts</summary>
-        /// <remarks>Unsupported forms become error values</remarks>
-        private GimpleValue LowerExpressionNoEmit(BoundExpression expression)
-        {
-            switch (expression)
-            {
-                case BoundLiteralExpression literal:
-                    return new GimpleConstantValue(literal.ConstantValue, literal.Type, literal.Syntax);
-
-                case BoundNameExpression name:
-                    return LowerNameExpression(name);
-
-                case BoundParenthesizedExpression parenthesized:
-                    return LowerExpressionNoEmit(parenthesized.Expression);
-
-                case BoundConversionExpression conversion:
-                    if (conversion.ConversionKind is BoundConversionKind.Identity or BoundConversionKind.LValueToRValue)
-                        return LowerExpressionNoEmit(conversion.Expression);
-
-                    return new GimpleConversionExpression(
-                        LowerExpressionNoEmit(conversion.Expression),
-                        conversion.Type,
-                        ToGimpleConversionKind(conversion.ConversionKind),
-                        conversion.Syntax);
-
-                case BoundCastExpression cast:
-                    return new GimpleCastExpression(
-                        LowerExpressionNoEmit(cast.Expression),
-                        cast.Type,
-                        cast.Syntax);
-
-                case BoundUnaryExpression unary when unary.OperatorToken.Kind == SyntaxKind.AmpersandToken:
-                    return new GimpleAddressOfExpression(
-                        LowerPlaceNoEmit(unary.Operand),
-                        unary.Type,
-                        unary.Syntax);
-
-                case BoundUnaryExpression unary when unary.OperatorToken.Kind == SyntaxKind.StarToken:
-                    return new GimpleIndirectExpression(
-                        LowerExpressionNoEmit(unary.Operand),
-                        unary.Type,
-                        unary.Syntax);
-
-                case BoundUnaryExpression unary:
-                    return new GimpleUnaryExpression(
-                        GimpleOperators.FromUnaryOperator(unary.OperatorToken.Kind),
-                        LowerExpressionNoEmit(unary.Operand),
-                        unary.Type,
-                        unary.Syntax);
-
-                case BoundBinaryExpression binary:
-                    {
-                        var left = LowerExpressionNoEmit(binary.Left);
-                        var right = LowerExpressionNoEmit(binary.Right);
-                        return new GimpleBinaryExpression(
-                            left,
-                            GimpleOperators.FromBinaryOperator(binary.OperatorToken.Kind, left.Type, right.Type),
-                            right,
-                            binary.Type,
-                            binary.Syntax);
-                    }
-
-                case BoundSizeofExpression sizeofExpression:
-                    return new GimpleConstantValue(sizeofExpression.ConstantValue, sizeofExpression.Type, sizeofExpression.Syntax);
-
-                case BoundGenericSelectionExpression generic:
-                    return generic.SelectedExpression is null
-                        ? new GimpleErrorValue(generic.Syntax)
-                        : LowerExpressionNoEmit(generic.SelectedExpression);
-
-                case BoundElementAccessExpression elementAccess:
-                    return new GimpleElementAccessExpression(
-                        LowerExpressionNoEmit(elementAccess.Expression),
-                        elementAccess.Index is null ? null : LowerExpressionNoEmit(elementAccess.Index),
-                        elementAccess.Type,
-                        elementAccess.Syntax);
-
-                case BoundMemberAccessExpression memberAccess:
-                    return new GimpleMemberAccessExpression(
-                        LowerExpressionNoEmit(memberAccess.Expression),
-                        memberAccess.OperatorToken.Kind == SyntaxKind.ArrowToken,
-                        memberAccess.NameToken,
-                        memberAccess.Field,
-                        memberAccess.Type,
-                        memberAccess.Syntax);
-
-                default:
-                    if (TryEvaluateIntegerConstantValue(expression, out var integerValue))
-                        return new GimpleConstantValue(integerValue, expression.Type, expression.Syntax);
-
-                    return new GimpleErrorValue(expression.Syntax);
-            }
-        }
-
-        /// <summary>Builds an assignable place without emitting statements</summary>
-        private GimplePlace LowerPlaceNoEmit(BoundExpression expression)
-        {
-            switch (expression)
-            {
-                case BoundNameExpression name when name.Symbol is not null:
-                    return new GimpleSymbolValue(name.Symbol, name.Type, name.Syntax);
-
-                case BoundParenthesizedExpression parenthesized:
-                    return LowerPlaceNoEmit(parenthesized.Expression);
-
-                case BoundUnaryExpression unary when unary.OperatorToken.Kind == SyntaxKind.StarToken:
-                    return new GimpleIndirectExpression(LowerExpressionNoEmit(unary.Operand), unary.Type, unary.Syntax);
-
-                case BoundElementAccessExpression elementAccess:
-                    return new GimpleElementAccessExpression(
-                        LowerExpressionNoEmit(elementAccess.Expression),
-                        elementAccess.Index is null ? null : LowerExpressionNoEmit(elementAccess.Index),
-                        elementAccess.Type,
-                        elementAccess.Syntax);
-
-                case BoundMemberAccessExpression memberAccess:
-                    return new GimpleMemberAccessExpression(
-                        LowerExpressionNoEmit(memberAccess.Expression),
-                        memberAccess.OperatorToken.Kind == SyntaxKind.ArrowToken,
-                        memberAccess.NameToken,
-                        memberAccess.Field,
-                        memberAccess.Type,
-                        memberAccess.Syntax);
-
-                case BoundConversionExpression conversion when conversion.ConversionKind == BoundConversionKind.Identity:
-                    return LowerPlaceNoEmit(conversion.Expression);
-
-                default:
-                    return new GimpleIndirectExpression(new GimpleErrorValue(expression.Syntax), expression.Type, expression.Syntax);
-            }
-        }
-
-        /// <summary>Lowers an expression when its resulting value is discarded</summary>
-        private void LowerExpressionForSideEffects(BoundExpression expression)
-        {
-            switch (expression)
-            {
-                case BoundParenthesizedExpression parenthesized:
-                    LowerExpressionForSideEffects(parenthesized.Expression);
-                    break;
-
-                case BoundCallExpression call:
-                    EmitCall(call, discardResult: true);
-                    break;
-
-                default:
-                    _ = LowerExpression(expression);
-                    break;
-            }
-        }
-
-        private GimpleValue LowerExpression(BoundExpression expression)
-        {
-            switch (expression)
-            {
-                case BoundLiteralExpression literal:
-                    return new GimpleConstantValue(literal.ConstantValue, literal.Type, literal.Syntax);
-
-                case BoundNameExpression name:
-                    return LowerNameExpression(name);
-
-                case BoundParenthesizedExpression parenthesized:
-                    return LowerExpression(parenthesized.Expression);
-
-                case BoundConversionExpression conversion:
-                    return LowerConversionExpression(conversion);
-
-                case BoundCastExpression cast:
-                    return EmitConvert(
-                        LowerExpression(cast.Expression),
-                        cast.Type,
-                        cast.Syntax);
-
-                case BoundUnaryExpression unary:
-                    return LowerUnaryExpression(unary);
-
-                case BoundPostfixUnaryExpression postfix:
-                    return LowerPostfixUnaryExpression(postfix);
-
-                case BoundBinaryExpression binary:
-                    return LowerBinaryExpression(binary);
-
-                case BoundAssignmentExpression assignment:
-                    return LowerAssignmentExpression(assignment);
-
-                case BoundConditionalExpression conditional:
-                    return LowerConditionalExpressionToValue(conditional);
-
-                case BoundSizeofExpression sizeofExpression:
-                    return new GimpleConstantValue(sizeofExpression.ConstantValue, sizeofExpression.Type, sizeofExpression.Syntax);
-
-                case BoundCompoundLiteralExpression compoundLiteral:
-                    return LowerCompoundLiteralExpression(compoundLiteral);
-
-                case BoundGenericSelectionExpression generic:
-                    return generic.SelectedExpression is null
-                        ? new GimpleErrorValue(generic.Syntax)
-                        : LowerExpression(generic.SelectedExpression);
-
-                case BoundStatementExpression statementExpression:
-                    return LowerStatementExpression(statementExpression);
-
-                case BoundCallExpression call:
-                    return EmitCall(call, discardResult: false);
-
-                case BoundElementAccessExpression elementAccess:
-                    return LowerElementAccessExpression(elementAccess);
-
-                case BoundMemberAccessExpression memberAccess:
-                    return LowerMemberAccessExpression(memberAccess);
-
-                case BoundErrorExpression error:
-                    return new GimpleErrorValue(error.Syntax);
-
-                default:
-                    return new GimpleErrorValue(expression.Syntax);
-            }
-        }
-
-        /// <summary>Lowers an expression while preserving sequencing and value semantics</summary>
-        private GimpleValue LowerRValue(BoundExpression expression)
-        {
-            switch (expression)
-            {
-                case BoundBinaryExpression binary when binary.OperatorToken.Kind == SyntaxKind.CommaToken:
-                    LowerExpressionForSideEffects(binary.Left);
-                    return LowerRValue(binary.Right);
-
-                case BoundBinaryExpression binary when IsLogicalOperator(binary.OperatorToken.Kind):
-                    return LowerConditionalExpressionToValue(binary);
-
-                case BoundConditionalExpression conditional:
-                    return LowerConditionalExpressionToValue(conditional);
-
-                case BoundAssignmentExpression assignment:
-                    return LowerAssignmentExpression(assignment);
-
-                case BoundUnaryExpression unary when unary.OperatorToken.Kind is SyntaxKind.PlusPlusToken or SyntaxKind.MinusMinusToken:
-                    return LowerUnaryExpression(unary);
-
-                case BoundPostfixUnaryExpression postfix:
-                    return LowerPostfixUnaryExpression(postfix);
-
-                case BoundCallExpression call:
-                    return EmitCall(call, discardResult: false);
-
-                default:
-                    return LowerExpression(expression);
-            }
-        }
-
-        private GimpleValue LowerNameExpression(BoundNameExpression expression)
-        {
-            if (expression.Symbol is null)
-                return new GimpleErrorValue(expression.Syntax);
-
-            if (expression.Symbol is EnumConstantSymbol enumConstant)
-                return new GimpleConstantValue(enumConstant.Value, expression.Type, expression.Syntax);
-
-            return new GimpleSymbolValue(expression.Symbol, expression.Type, expression.Syntax);
-        }
-
-        private GimpleValue LowerConversionExpression(BoundConversionExpression expression)
-        {
-            if (expression.ConversionKind is BoundConversionKind.Identity or BoundConversionKind.LValueToRValue)
-                return LowerExpression(expression.Expression);
-
-            var operand = LowerExpression(expression.Expression);
-
-            switch (expression.ConversionKind)
-            {
-                case BoundConversionKind.ArrayToPointer:
-                case BoundConversionKind.FunctionToPointer:
-                    return EmitDecay(operand, expression.Type, expression.Syntax);
-
-                default:
-                    return EmitConvert(operand, expression.Type, expression.Syntax);
-            }
-        }
-
-        /// <summary>Emits the address that an array or function operand decays to</summary>
-        private GimpleValue EmitDecay(GimpleValue operand, QualifiedType type, SyntaxNode? syntax)
-        {
-            if (operand is GimpleConstantValue constant)
-                return new GimpleConstantValue(constant.Value, type, syntax);
-
-            if (operand is not GimplePlace place)
-                return EmitConvert(operand, type, syntax);
-
-            var target = CreateTemporary(type, syntax);
-            Emit(GimpleAssignStatement.Single(
-                target,
-                new GimpleAddressOfExpression(GimplifyReference(place), type, syntax),
-                syntax));
-            return target;
-        }
-
-        /// <summary>Emits the conversion that produces a value of the destination type</summary>
-        private GimpleValue EmitConvert(GimpleValue operand, QualifiedType type, SyntaxNode? syntax)
-        {
-            var code = GimpleOperators.ConversionCode(operand.Type, type);
-            return EmitUnary(code, operand, type, syntax);
-        }
-
-        private GimpleValue LowerUnaryExpression(BoundUnaryExpression expression)
-        {
-            switch (expression.OperatorToken.Kind)
-            {
-                case SyntaxKind.AmpersandToken:
-                    {
-                        var target = CreateTemporary(expression.Type, expression.Syntax);
-                        Emit(GimpleAssignStatement.Single(
-                            target,
-                            new GimpleAddressOfExpression(
-                                GimplifyReference(LowerPlace(expression.Operand)),
-                                expression.Type,
-                                expression.Syntax),
-                            expression.Syntax));
-                        return target;
-                    }
-
-                case SyntaxKind.StarToken:
-                    return new GimpleIndirectExpression(
-                        GimplifyValue(LowerExpression(expression.Operand)),
-                        expression.Type,
-                        expression.Syntax);
-
-                case SyntaxKind.PlusPlusToken:
-                case SyntaxKind.MinusMinusToken:
-                    return LowerIncrement(
-                        LowerPlace(expression.Operand),
-                        expression.OperatorToken.Kind == SyntaxKind.PlusPlusToken,
-                        returnUpdatedValue: true,
-                        expression.Syntax);
-
-                case SyntaxKind.PlusToken:
-                    return LowerExpression(expression.Operand);
-
-                default:
-                    return EmitUnary(
-                        GimpleOperators.FromUnaryOperator(expression.OperatorToken.Kind),
-                        LowerExpression(expression.Operand),
-                        expression.Type,
-                        expression.Syntax);
-            }
-        }
-
-        private GimpleValue LowerPostfixUnaryExpression(BoundPostfixUnaryExpression expression)
-        {
-            return LowerIncrement(
-                LowerPlace(expression.Operand),
-                expression.OperatorToken.Kind == SyntaxKind.PlusPlusToken,
-                returnUpdatedValue: false,
-                expression.Syntax);
-        }
-
-        /// <summary>Steps a place by one and yields the requested version of its value</summary>
-        /// <remarks>A register-like place updates in place, while a memory place is loaded, stepped, and stored</remarks>
-        private GimpleValue LowerIncrement(GimplePlace target, bool increment, bool returnUpdatedValue, SyntaxNode? syntax)
-        {
-            var place = GimplifyReference(target);
-            var one = CreateIntegerOne(place.Type, syntax);
-            var code = GimpleOperators.FromBinaryOperator(
-                increment ? SyntaxKind.PlusToken : SyntaxKind.MinusToken,
-                place.Type,
-                one.Type);
-
-            var step = code == GimpleTreeCode.PointerPlusExpr && !increment
-                ? CreateIntegerConstant(-1, one.Type, syntax)
-                : one;
-
-            if (GimpleOperandRules.IsRegisterOperand(place))
-            {
-                var previous = returnUpdatedValue ? null : Materialize(place);
-                Emit(GimpleAssignStatement.Binary(place, code, place, step, syntax));
-                return previous ?? (GimpleValue)place;
-            }
-
-            var oldValue = Materialize(place);
-            var updated = EmitBinary(code, oldValue, step, place.Type, syntax);
-            EmitStore(place, updated, syntax);
-            return returnUpdatedValue ? updated : oldValue;
-        }
-
-        private GimpleValue LowerBinaryExpression(BoundBinaryExpression expression)
-        {
-            if (expression.OperatorToken.Kind == SyntaxKind.CommaToken)
-            {
-                LowerExpressionForSideEffects(expression.Left);
-                return LowerExpression(expression.Right);
-            }
-
-            if (IsLogicalOperator(expression.OperatorToken.Kind))
-                return LowerConditionalExpressionToValue(expression);
-
-            var left = LowerExpression(expression.Left);
-            var right = LowerExpression(expression.Right);
-            return EmitArithmetic(expression.OperatorToken.Kind, left, right, expression.Type, expression.Syntax);
-        }
-
-        /// <summary>Emits one arithmetic or comparison statement for a C operator</summary>
-        /// <remarks>Stepping a pointer backwards becomes a pointer addition over a negated offset</remarks>
-        private GimpleValue EmitArithmetic(SyntaxKind kind, GimpleValue left, GimpleValue right, QualifiedType type, SyntaxNode? syntax)
-        {
-            var code = GimpleOperators.FromBinaryOperator(kind, left.Type, right.Type);
-            if (GimpleOperators.NegatesPointerOffset(kind, left.Type, right.Type))
-                right = NegateOffset(right, syntax);
-
-            return EmitBinary(code, left, right, type, syntax);
-        }
-
-        /// <summary>Produces the negation of a pointer offset, folding it when the offset is constant</summary>
-        private GimpleValue NegateOffset(GimpleValue offset, SyntaxNode? syntax)
-        {
-            if (offset is GimpleConstantValue constant && TryConvertConstantToLong(constant.Value, out var value))
-                return CreateIntegerConstant(-value, constant.Type, syntax);
-
-            return EmitUnary(GimpleTreeCode.NegateExpr, offset, offset.Type, syntax);
-        }
-
-        /// <summary>Emits a store and yields the stored value</summary>
-        private GimpleValue LowerAssignmentExpression(BoundAssignmentExpression expression)
-        {
-            var target = GimplifyReference(LowerPlace(expression.Left));
-
-            if (expression.OperatorToken.Kind == SyntaxKind.EqualsToken)
-            {
-                var assigned = LowerRValue(expression.Right);
-                EmitStore(target, assigned, expression.Syntax);
-                return GimpleOperandRules.IsRegisterOperand(assigned) ? assigned : target;
-            }
-
-            var operand = LowerExpression(expression.Right);
-            var code = GimpleOperators.FromBinaryOperator(
-                GimpleOperators.CompoundAssignmentOperator(expression.OperatorToken.Kind),
-                target.Type,
-                operand.Type);
-
-            if (GimpleOperators.NegatesPointerOffset(
-                    GimpleOperators.CompoundAssignmentOperator(expression.OperatorToken.Kind),
-                    target.Type,
-                    operand.Type))
-            {
-                operand = NegateOffset(operand, expression.Syntax);
-            }
-
-            if (GimpleOperandRules.IsRegisterOperand(target))
-            {
-                Emit(GimpleAssignStatement.Binary(target, code, target, GimplifyValue(operand), expression.Syntax));
-                return target;
-            }
-
-            var oldValue = Materialize(target);
-            var updated = EmitBinary(code, oldValue, operand, target.Type, expression.Syntax);
-            EmitStore(target, updated, expression.Syntax);
-            return updated;
-        }
-
-        /// <summary>Converts conditional evaluation into branches assigning one result temporary</summary>
-        private GimpleValue LowerConditionalExpressionToValue(BoundExpression expression)
-        {
-            var result = CreateTemporary(expression.Type, expression.Syntax);
-            var trueLabel = CreateGeneratedLabel("cond_true");
-            var falseLabel = CreateGeneratedLabel("cond_false");
-            var endLabel = CreateGeneratedLabel("cond_end");
-
-            switch (expression)
-            {
-                case BoundConditionalExpression conditional:
-                    EmitConditional(conditional.Condition, trueLabel, falseLabel);
-
-                    StartBlock(trueLabel);
-                    EmitStore(result, LowerRValue(conditional.WhenTrue), conditional.WhenTrue.Syntax);
-                    Emit(new GimpleGotoStatement(endLabel));
-
-                    StartBlock(falseLabel);
-                    EmitStore(result, LowerRValue(conditional.WhenFalse), conditional.WhenFalse.Syntax);
-                    Emit(new GimpleGotoStatement(endLabel));
-                    break;
-
-                case BoundBinaryExpression logical when IsLogicalOperator(logical.OperatorToken.Kind):
-                    {
-                        var rightLabel = CreateGeneratedLabel("logical_rhs");
-                        if (logical.OperatorToken.Kind == SyntaxKind.AmpersandAmpersandToken)
-                            EmitConditional(logical.Left, rightLabel, falseLabel);
-                        else
-                            EmitConditional(logical.Left, trueLabel, rightLabel);
-
-                        StartBlock(rightLabel);
-                        EmitConditional(logical.Right, trueLabel, falseLabel);
-
-                        StartBlock(trueLabel);
-                        EmitStore(result, CreateIntegerOne(result.Type, logical.Syntax), logical.Syntax);
-                        Emit(new GimpleGotoStatement(endLabel));
-
-                        StartBlock(falseLabel);
-                        EmitStore(result, CreateIntegerZero(result.Type, logical.Syntax), logical.Syntax);
-                        Emit(new GimpleGotoStatement(endLabel));
-                        break;
-                    }
-
-                default:
-                    EmitConditional(expression, trueLabel, falseLabel);
-
-                    StartBlock(trueLabel);
-                    EmitStore(result, CreateIntegerOne(result.Type, expression.Syntax), expression.Syntax);
-                    Emit(new GimpleGotoStatement(endLabel));
-
-                    StartBlock(falseLabel);
-                    EmitStore(result, CreateIntegerZero(result.Type, expression.Syntax), expression.Syntax);
-                    Emit(new GimpleGotoStatement(endLabel));
-                    break;
-            }
-
-            StartBlock(endLabel);
-            return result;
-        }
-
-        private GimpleValue LowerCompoundLiteralExpression(BoundCompoundLiteralExpression expression)
-        {
-            var target = CreateTemporary(expression.Type, expression.Syntax);
-            if (expression.InitializerList is not null)
-                LowerInitializer(target, expression.InitializerList);
-            else
-                EmitZeroInitialize(target, expression.Syntax);
-
-            return target;
-        }
-
-        // Only the final expression statement contributes the extension value
-        private GimpleValue LowerStatementExpression(BoundStatementExpression expression)
-        {
-            var members = expression.Statement.Members;
-            if (members.Length == 0)
-                return new GimpleConstantValue(null, expression.Type, expression.Syntax);
-
-            for (var i = 0; i < members.Length - 1; i++)
-                LowerNode(members[i]);
-
-            if (members[^1] is BoundExpressionStatement expressionStatement)
-                return LowerExpression(expressionStatement.Expression);
-
-            LowerNode(members[^1]);
-            return new GimpleConstantValue(null, expression.Type, expression.Syntax);
-        }
-
-        /// <summary>Emits a call statement and yields the temporary that receives its result</summary>
-        /// <remarks>A discarded result leaves the call without a destination</remarks>
-        private GimpleValue EmitCall(BoundCallExpression expression, bool discardResult)
-        {
-            var callee = LowerCallCalleeExpression(expression.Expression);
-            var arguments = ImmutableArray.CreateBuilder<GimpleValue>(expression.Arguments.Length);
-            foreach (var argument in expression.Arguments)
-                arguments.Add(GimplifyArgument(LowerExpression(argument)));
-
-            var producesValue = !discardResult && !GimpleTypes.IsVoid(expression.Type) && !expression.Type.IsError;
-            var result = producesValue ? CreateTemporary(expression.Type, expression.Syntax) : null;
-
-            Emit(new GimpleCallStatement(
-                result,
-                callee,
-                arguments.ToImmutable(),
-                expression.FunctionType,
-                expression.Type,
-                expression.Syntax,
-                isTailCall: false,
-                isNoReturn: IsNoReturnCallee(callee)));
-
-            return (GimpleValue?)result ?? new GimpleConstantValue(null, expression.Type, expression.Syntax);
-        }
-
-        // A direct callee stays a function declaration so the call site keeps its symbol
-        private GimpleValue LowerCallCalleeExpression(BoundExpression expression)
-        {
-            switch (expression)
-            {
-                case BoundParenthesizedExpression parenthesized:
-                    return LowerCallCalleeExpression(parenthesized.Expression);
-
-                case BoundConversionExpression conversion
-                    when conversion.ConversionKind is BoundConversionKind.Identity or BoundConversionKind.FunctionToPointer:
-                    return LowerCallCalleeExpression(conversion.Expression);
-
-                case BoundNameExpression name when name.Symbol is FunctionSymbol:
-                    return LowerNameExpression(name);
-
-                default:
-                    return GimplifyValue(LowerExpression(expression));
-            }
-        }
-
-        private static bool IsNoReturnCallee(GimpleValue callee)
-            => callee is GimpleSymbolValue { Symbol: FunctionSymbol function } &&
-               (function.FunctionSpecifiers & FunctionSpecifiers.NoReturn) != 0;
-
-        private GimplePlace LowerElementAccessExpression(BoundElementAccessExpression expression)
-        {
-            var target = LowerExpression(expression.Expression);
-            var index = expression.Index is null ? null : GimplifyValue(LowerExpression(expression.Index));
-
-            return new GimpleElementAccessExpression(
-                GimplifyReferenceBase(target),
-                index,
-                expression.Type,
-                expression.Syntax);
-        }
-
-        private GimplePlace LowerMemberAccessExpression(BoundMemberAccessExpression expression)
-        {
-            var throughPointer = expression.OperatorToken.Kind == SyntaxKind.ArrowToken;
-            var target = LowerExpression(expression.Expression);
-
-            return new GimpleMemberAccessExpression(
-                throughPointer ? GimplifyValue(target) : GimplifyReferenceBase(target),
-                throughPointer,
-                expression.NameToken,
-                expression.Field,
-                expression.Type,
-                expression.Syntax);
-        }
-
-        /// <summary>Lowers an assignable expression and recovers with a temporary when needed</summary>
-        private GimplePlace LowerPlace(BoundExpression expression)
-        {
-            switch (expression)
-            {
-                case BoundNameExpression name when name.Symbol is not null:
-                    return new GimpleSymbolValue(name.Symbol, name.Type, name.Syntax);
-
-                case BoundParenthesizedExpression parenthesized:
-                    return LowerPlace(parenthesized.Expression);
-
-                case BoundUnaryExpression unary when unary.OperatorToken.Kind == SyntaxKind.StarToken:
-                    return new GimpleIndirectExpression(GimplifyValue(LowerExpression(unary.Operand)), unary.Type, unary.Syntax);
-
-                case BoundElementAccessExpression elementAccess:
-                    return LowerElementAccessExpression(elementAccess);
-
-                case BoundMemberAccessExpression memberAccess:
-                    return LowerMemberAccessExpression(memberAccess);
-
-                case BoundCompoundLiteralExpression compoundLiteral:
-                    return (GimplePlace)LowerCompoundLiteralExpression(compoundLiteral);
-
-                case BoundConversionExpression conversion when conversion.ConversionKind == BoundConversionKind.Identity:
-                    return LowerPlace(conversion.Expression);
-
-                default:
-                    var lowered = LowerExpression(expression);
-                    return lowered as GimplePlace ?? CreateTemporary(expression.Type, expression.Syntax);
-            }
-        }
-
-        /// <summary>Emits short-circuit control flow for a condition</summary>
-        private void EmitConditional(BoundExpression condition, GimpleLabel whenTrue, GimpleLabel whenFalse)
-        {
-            switch (condition)
-            {
-                case BoundParenthesizedExpression parenthesized:
-                    EmitConditional(parenthesized.Expression, whenTrue, whenFalse);
-                    return;
-
-                case BoundConversionExpression conversion when conversion.ConversionKind == BoundConversionKind.LValueToRValue ||
-                                                            conversion.ConversionKind == BoundConversionKind.Identity:
-                    EmitConditional(conversion.Expression, whenTrue, whenFalse);
-                    return;
-
-                case BoundBinaryExpression binary when binary.OperatorToken.Kind == SyntaxKind.AmpersandAmpersandToken:
-                    {
-                        var rightLabel = CreateGeneratedLabel("logical_rhs");
-                        EmitConditional(binary.Left, rightLabel, whenFalse);
-                        StartBlock(rightLabel);
-                        EmitConditional(binary.Right, whenTrue, whenFalse);
-                        return;
-                    }
-
-                case BoundBinaryExpression binary when binary.OperatorToken.Kind == SyntaxKind.PipePipeToken:
-                    {
-                        var rightLabel = CreateGeneratedLabel("logical_rhs");
-                        EmitConditional(binary.Left, whenTrue, rightLabel);
-                        StartBlock(rightLabel);
-                        EmitConditional(binary.Right, whenTrue, whenFalse);
-                        return;
-                    }
-
-                case BoundConditionalExpression conditional:
-                    {
-                        var trueArm = CreateGeneratedLabel("cond_branch_true");
-                        var falseArm = CreateGeneratedLabel("cond_branch_false");
-                        EmitConditional(conditional.Condition, trueArm, falseArm);
-                        StartBlock(trueArm);
-                        EmitConditional(conditional.WhenTrue, whenTrue, whenFalse);
-                        StartBlock(falseArm);
-                        EmitConditional(conditional.WhenFalse, whenTrue, whenFalse);
-                        return;
-                    }
-            }
-
-            EmitBranch(condition, whenTrue, whenFalse);
-        }
-
-        /// <summary>Emits the comparison terminator that selects between two labels</summary>
-        /// <remarks>A condition that is not already a comparison is tested against zero</remarks>
-        private void EmitBranch(BoundExpression condition, GimpleLabel whenTrue, GimpleLabel whenFalse)
-        {
-            if (condition is BoundUnaryExpression { OperatorToken.Kind: SyntaxKind.BangToken } negation)
-            {
-                EmitBranch(negation.Operand, whenFalse, whenTrue);
-                return;
-            }
-
-            if (condition is BoundBinaryExpression binary)
-            {
-                var comparison = GimpleOperators.FromBinaryOperator(
-                    binary.OperatorToken.Kind,
-                    binary.Left.Type,
-                    binary.Right.Type);
-
-                if (GimpleOperators.IsComparison(comparison))
-                {
-                    var left = GimplifyValue(LowerExpression(binary.Left));
-                    var right = GimplifyValue(LowerExpression(binary.Right));
-                    Emit(new GimpleCondStatement(comparison, left, right, whenTrue, whenFalse, condition.Syntax));
-                    return;
-                }
-            }
-
-            var value = GimplifyValue(LowerExpression(condition));
-            Emit(new GimpleCondStatement(
-                GimpleTreeCode.NeExpr,
-                value,
-                CreateIntegerZero(value.Type, condition.Syntax),
-                whenTrue,
-                whenFalse,
-                condition.Syntax));
-        }
-
-        /// <summary>Stores a value into a fresh temporary and returns it</summary>
-        private GimpleTemporaryValue Materialize(GimpleValue value)
-        {
-            if (value is GimpleTemporaryValue temporary)
-                return temporary;
-
-            var target = CreateTemporary(value.Type, value.Syntax);
-            Emit(GimpleAssignStatement.Single(target, value, value.Syntax));
-            return target;
-        }
-
-        /// <summary>Emits the store that gives a place its value</summary>
-        private void EmitStore(GimplePlace target, GimpleValue value, SyntaxNode? syntax)
-            => Emit(GimpleAssignStatement.Single(
-                GimplifyReference(target),
-                GimplifyStoredValue(value),
-                syntax));
-
-        /// <summary>Emits a unary computation into a fresh temporary</summary>
-        private GimpleValue EmitUnary(GimpleTreeCode code, GimpleValue operand, QualifiedType type, SyntaxNode? syntax)
-        {
-            if (code == GimpleTreeCode.None || code == GimpleTreeCode.ErrorMark)
-                return new GimpleErrorValue(syntax);
-
-            var target = CreateTemporary(type, syntax);
-            Emit(GimpleAssignStatement.Unary(target, code, GimplifyValue(operand), syntax));
-            return target;
-        }
-
-        /// <summary>Emits a binary computation into a fresh temporary</summary>
-        private GimpleValue EmitBinary(GimpleTreeCode code, GimpleValue left, GimpleValue right, QualifiedType type, SyntaxNode? syntax)
-        {
-            if (code == GimpleTreeCode.None || code == GimpleTreeCode.ErrorMark)
-                return new GimpleErrorValue(syntax);
-
-            var target = CreateTemporary(type, syntax);
-            Emit(GimpleAssignStatement.Binary(target, code, GimplifyValue(left), GimplifyValue(right), syntax));
-            return target;
-        }
-
-        /// <summary>Reduces an operand to a register or an invariant a computation may consume</summary>
-        private GimpleValue GimplifyValue(GimpleValue value)
-        {
-            if (GimpleOperandRules.IsRegisterOperand(value))
-                return value;
-
-            if (value is GimplePlace place)
-                return Materialize(GimplifyReference(place));
-
-            return Materialize(value);
-        }
-
-        /// <summary>Reduces a call argument to an operand the call statement may carry</summary>
-        private GimpleValue GimplifyArgument(GimpleValue value)
-            => GimpleTypes.IsAggregate(value.Type) && value is GimplePlace aggregate
-                ? GimplifyReference(aggregate)
-                : GimplifyValue(value);
-
-        /// <summary>Reduces a returned operand to a shape the return statement may carry</summary>
-        private GimpleValue GimplifyReturnOperand(GimpleValue value)
-            => GimpleTypes.IsAggregate(value.Type) && value is GimplePlace aggregate
-                ? GimplifyReference(aggregate)
-                : GimplifyValue(value);
-
-        /// <summary>Reduces a stored value to a single right-hand side</summary>
-        /// <remarks>An aggregate keeps its reference form so the store copies memory in place</remarks>
-        private GimpleValue GimplifyStoredValue(GimpleValue value)
-        {
-            if (GimpleTypes.IsAggregate(value.Type) && value is GimplePlace aggregate)
-                return GimplifyReference(aggregate);
-
-            return GimplifyValue(value);
-        }
-
-        /// <summary>Reduces a reference tree so each of its operands satisfies the operand rules</summary>
-        private GimplePlace GimplifyReference(GimplePlace place)
-        {
-            switch (place)
-            {
-                case GimpleIndirectExpression indirect:
-                    {
-                        var address = GimplifyValue(indirect.Address);
-                        return ReferenceEquals(address, indirect.Address)
-                            ? indirect
-                            : new GimpleIndirectExpression(address, indirect.Type, indirect.Syntax);
-                    }
-
-                case GimpleElementAccessExpression element:
-                    {
-                        var target = GimplifyReferenceBase(element.Expression);
-                        var index = element.Index is null ? null : GimplifyValue(element.Index);
-                        return ReferenceEquals(target, element.Expression) && ReferenceEquals(index, element.Index)
-                            ? element
-                            : new GimpleElementAccessExpression(target, index, element.Type, element.Syntax);
-                    }
-
-                case GimpleMemberAccessExpression member:
-                    {
-                        var target = member.ThroughPointer
-                            ? GimplifyValue(member.Expression)
-                            : GimplifyReferenceBase(member.Expression);
-
-                        return ReferenceEquals(target, member.Expression)
-                            ? member
-                            : new GimpleMemberAccessExpression(
-                                target,
-                                member.ThroughPointer,
-                                member.NameToken,
-                                member.Field,
-                                member.Type,
-                                member.Syntax);
-                    }
-
-                default:
-                    return place;
-            }
-        }
-
-        /// <summary>Reduces the base of a reference tree, which may stay a nested reference</summary>
-        private GimpleValue GimplifyReferenceBase(GimpleValue value)
-        {
-            if (value is GimpleSymbolValue or GimpleTemporaryValue)
-                return value;
-
-            if (value is GimplePlace place)
-            {
-                var reference = GimplifyReference(place);
-
-                // A pointer base is addressed indirectly, so it has to be a plain value
-                if (reference is GimpleIndirectExpression && GimpleTypes.IsPointerLike(reference.Type))
-                    return GimplifyValue(reference);
-
-                return reference;
-            }
-
-            return GimplifyValue(value);
-        }
-
-        private GimpleTemporaryValue CreateTemporary(QualifiedType type, SyntaxNode? syntax)
-        {
-            var temporary = new GimpleTemporaryValue(_temporaryOrdinal++, type, syntax);
-            _temporaries.Add(temporary);
-            return temporary;
-        }
-
-        private GimpleConstantValue CreateIntegerZero(QualifiedType type, SyntaxNode? syntax)
-            => CreateIntegerConstant(0, type, syntax);
-
-        private GimpleConstantValue CreateIntegerOne(QualifiedType type, SyntaxNode? syntax)
-            => CreateIntegerConstant(1, type, syntax);
-
-        private GimpleConstantValue CreateIntegerConstant(long value, QualifiedType type, SyntaxNode? syntax)
-        {
-            var constantType = type.IsError || GimpleTypes.IsPointerLike(type)
-                ? _types.Builtin(BuiltinTypeKind.Int)
-                : type;
-
-            return new GimpleConstantValue((int)value == value ? (int)value : value, constantType, syntax);
-        }
-
-        // Statements after a terminator begin a distinct unreachable block
-        private void Emit(GimpleStatement statement)
-        {
-            if (_currentBlock is null || _currentBlock.HasTerminator)
-                StartBlock(CreateGeneratedLabel("unreachable"));
-
-            _currentBlock!.Statements.Add(statement);
-        }
-
-        // Preserve fallthrough explicitly when the previous block has no terminator
-        private void StartBlock(GimpleLabel label)
-        {
-            if (label is null)
-                throw new ArgumentNullException(nameof(label));
-
-            if (_currentBlock is not null && !_currentBlock.HasTerminator)
-                _currentBlock.Statements.Add(new GimpleGotoStatement(label));
-
-            _currentBlock = new BlockBuilder(label);
-            _blocks.Add(_currentBlock);
-        }
-
-        private bool IsCurrentBlockTerminated() => _currentBlock?.HasTerminator == true;
-
-        private GimpleLabel CreateGeneratedLabel(string prefix)
-            => new GimpleLabel($"{prefix}_{_labelOrdinal++.ToString(CultureInfo.InvariantCulture)}");
-
-        private GimpleLabel GetLabel(LabelSymbol? symbol, SyntaxNode? syntax = null)
-        {
-            if (symbol is null)
-                return CreateGeneratedLabel("missing_label");
-
-            if (!_labels.TryGetValue(symbol, out var label))
-            {
-                label = new GimpleLabel(symbol.Name, symbol, syntax ?? symbol.DeclaringSyntax);
-                _labels.Add(symbol, label);
-            }
-
-            return label;
-        }
-
-        private GimpleLabel GetBreakTarget()
-            => _breakTargets.Count != 0 ? _breakTargets.Peek() : CreateGeneratedLabel("invalid_break");
-
-        private GimpleLabel GetContinueTarget()
-            => _continueTargets.Count != 0 ? _continueTargets.Peek() : CreateGeneratedLabel("invalid_continue");
-
-        private GimpleLabel GetCaseLabel(BoundCaseStatement statement)
-        {
-            if (_switches.Count != 0 && _switches.Peek().CaseLabels.TryGetValue(statement, out var label))
-                return label;
-
-            return CreateGeneratedLabel("case");
-        }
-
-        private GimpleLabel GetDefaultLabel(BoundDefaultStatement statement)
-        {
-            if (_switches.Count != 0)
-                return _switches.Peek().DefaultLabel;
-
-            return CreateGeneratedLabel("default");
-        }
-
-        /// <summary>Collects case labels owned by one switch while skipping nested switches</summary>
-        private SwitchLabels CollectSwitchLabels(BoundStatement statement)
-        {
-            var cases = ImmutableArray.CreateBuilder<GimpleSwitchCase>();
-            var caseLabels = new Dictionary<BoundCaseStatement, GimpleLabel>();
-            GimpleLabel? defaultLabel = null;
-
-            void Visit(BoundStatement current)
-            {
-                switch (current)
-                {
-                    case BoundCaseStatement caseStatement:
-                        {
-                            var label = CreateGeneratedLabel("case");
-                            caseLabels.Add(caseStatement, label);
-                            var value = TryEvaluateIntegerConstantValue(caseStatement.Expression, out var constantValue)
-                                ? new GimpleConstantValue(constantValue, caseStatement.Expression.Type, caseStatement.Expression.Syntax)
-                                : new GimpleConstantValue(null, caseStatement.Expression.Type, caseStatement.Expression.Syntax);
-
-                            cases.Add(new GimpleSwitchCase(value, label));
-                            Visit(caseStatement.Statement);
-                            break;
-                        }
-
-                    case BoundDefaultStatement defaultStatement:
-                        defaultLabel ??= CreateGeneratedLabel("default");
-                        Visit(defaultStatement.Statement);
-                        break;
-
-                    case BoundCompoundStatement compound:
-                        foreach (var member in compound.Members)
-                        {
-                            if (member is BoundStatement nested)
-                                Visit(nested);
-                        }
-                        break;
-
-                    case BoundLabelStatement labelStatement:
-                        Visit(labelStatement.Statement);
-                        break;
-
-                    case BoundSwitchStatement:
-                        break;
-                }
-            }
-
-            Visit(statement);
-            return new SwitchLabels(cases.ToImmutable(), caseLabels, defaultLabel);
-        }
-
-        /// <summary>Evaluates the supported bound integer constant expression subset</summary>
-        private static bool TryEvaluateIntegerConstantValue(BoundExpression expression, out long value)
-        {
-            switch (expression)
-            {
-                case BoundConversionExpression conversion:
-                    return TryEvaluateIntegerConstantValue(conversion.Expression, out value);
-
-                case BoundParenthesizedExpression parenthesized:
-                    return TryEvaluateIntegerConstantValue(parenthesized.Expression, out value);
-
-                case BoundCastExpression cast:
-                    return TryEvaluateIntegerConstantValue(cast.Expression, out value);
-
-                case BoundSizeofExpression sizeofExpression:
-                    return TryConvertConstantToLong(sizeofExpression.ConstantValue, out value);
-
-                case BoundLiteralExpression literal:
-                    return TryConvertConstantToLong(literal.ConstantValue, out value);
-
-                case BoundUnaryExpression unary:
-                    return TryEvaluateUnaryIntegerConstant(unary.OperatorToken.Kind, unary.Operand, out value);
-
-                case BoundBinaryExpression binary:
-                    return TryEvaluateBinaryIntegerConstant(binary.Left, binary.OperatorToken.Kind, binary.Right, out value);
-
-                case BoundConditionalExpression conditional:
-                    return TryEvaluateConditionalIntegerConstant(conditional.Condition, conditional.WhenTrue, conditional.WhenFalse, out value);
-
-                default:
-                    return TryConvertConstantToLong(expression.ConstantValue, out value);
-            }
-        }
-
-        /// <summary>Evaluates the supported syntax-only integer constant expression subset</summary>
-        private static bool TryEvaluateIntegerConstantExpression(ExpressionSyntax expression, out long value)
-        {
-            switch (expression)
-            {
-                case LiteralExpressionSyntax literal:
-                    return TryConvertConstantToLong(literal.LiteralToken.Value, out value) ||
-                           TryParseIntegerLiteral(literal.LiteralToken.Text, out value);
-
-                case ParenthesizedExpressionSyntax parenthesized:
-                    return TryEvaluateIntegerConstantExpression(parenthesized.Expression, out value);
-
-                case CastExpressionSyntax cast:
-                    return TryEvaluateIntegerConstantExpression(cast.Expression, out value);
-
-                case UnaryExpressionSyntax unary:
-                    return TryEvaluateUnaryIntegerConstant(unary.OperatorToken.Kind, unary.Operand, out value);
-
-                case BinaryExpressionSyntax binary:
-                    return TryEvaluateBinaryIntegerConstant(binary.Left, binary.OperatorToken.Kind, binary.Right, out value);
-
-                case ConditionalExpressionSyntax conditional:
-                    return TryEvaluateConditionalIntegerConstant(
-                        conditional.Condition,
-                        conditional.WhenTrue,
-                        conditional.WhenFalse,
-                        out value);
-
-                default:
-                    value = 0;
-                    return false;
-            }
-        }
-
-        private static bool TryEvaluateUnaryIntegerConstant(
-            SyntaxKind operatorKind,
-            BoundExpression operandExpression,
-            out long value)
+        catch (OverflowException)
         {
             value = 0;
-            if (!TryEvaluateIntegerConstantValue(operandExpression, out var operand))
+            return false;
+        }
+    }
+
+    private static bool TryParseOctalIntegerLiteral(string text, out long value)
+    {
+        value = 0;
+        ulong result = 0;
+
+        foreach (var ch in text)
+        {
+            if (ch < '0' || ch > '7')
                 return false;
 
-            return TryEvaluateUnaryIntegerConstant(operatorKind, operand, out value);
-        }
-
-        private static bool TryEvaluateUnaryIntegerConstant(
-            SyntaxKind operatorKind,
-            ExpressionSyntax operandExpression,
-            out long value)
-        {
-            value = 0;
-            if (!TryEvaluateIntegerConstantExpression(operandExpression, out var operand))
-                return false;
-
-            return TryEvaluateUnaryIntegerConstant(operatorKind, operand, out value);
-        }
-
-        // Checked arithmetic turns overflow into a failed constant evaluation
-        private static bool TryEvaluateUnaryIntegerConstant(SyntaxKind operatorKind, long operand, out long value)
-        {
-            value = 0;
-
-            try
+            checked
             {
-                switch (operatorKind)
-                {
-                    case SyntaxKind.PlusToken:
-                        value = operand;
-                        return true;
-                    case SyntaxKind.MinusToken:
-                        value = checked(-operand);
-                        return true;
-                    case SyntaxKind.TildeToken:
-                        value = ~operand;
-                        return true;
-                    case SyntaxKind.BangToken:
-                        value = operand == 0 ? 1 : 0;
-                        return true;
-                    default:
-                        return false;
-                }
-            }
-            catch (OverflowException)
-            {
-                value = 0;
-                return false;
+                result = result * 8 + (ulong)(ch - '0');
             }
         }
 
-        private static bool TryEvaluateBinaryIntegerConstant(
-            BoundExpression leftExpression,
-            SyntaxKind operatorKind,
-            BoundExpression rightExpression,
-            out long value)
+        value = unchecked((long)result);
+        return true;
+    }
+
+    private static GimpleConversionKind ToGimpleConversionKind(BoundConversionKind kind)
+    {
+        return kind switch
         {
-            value = 0;
+            BoundConversionKind.Identity => GimpleConversionKind.Identity,
+            BoundConversionKind.LValueToRValue => GimpleConversionKind.LValueToRValue,
+            BoundConversionKind.ArrayToPointer => GimpleConversionKind.ArrayToPointer,
+            BoundConversionKind.FunctionToPointer => GimpleConversionKind.FunctionToPointer,
+            BoundConversionKind.Implicit => GimpleConversionKind.Implicit,
+            BoundConversionKind.Explicit => GimpleConversionKind.Explicit,
+            BoundConversionKind.Error => GimpleConversionKind.Error,
+            _ => GimpleConversionKind.Error,
+        };
+    }
 
-            if (!TryEvaluateIntegerConstantValue(leftExpression, out var left) ||
-                !TryEvaluateIntegerConstantValue(rightExpression, out var right))
-            {
-                return false;
-            }
+    private static bool IsLogicalOperator(SyntaxKind kind)
+        => kind is SyntaxKind.AmpersandAmpersandToken or SyntaxKind.PipePipeToken;
 
-            return TryEvaluateBinaryIntegerConstant(left, operatorKind, right, out value);
+    private static SyntaxToken CreateSyntheticToken(SyntaxKind kind, string text)
+    {
+        return new SyntaxToken(
+            kind,
+            0,
+            text,
+            value: null,
+            ImmutableArray<SyntaxTrivia>.Empty,
+            ImmutableArray<SyntaxTrivia>.Empty);
+    }
+
+    /// <summary>Tracks labels active while lowering one switch body</summary>
+    private sealed class SwitchContext
+    {
+        public GimpleLabel BreakLabel { get; }
+        internal Dictionary<BoundCaseStatement, GimpleLabel> CaseLabels { get; }
+        public GimpleLabel DefaultLabel { get; }
+
+        public SwitchContext(
+            GimpleLabel breakLabel,
+            Dictionary<BoundCaseStatement, GimpleLabel> caseLabels,
+            GimpleLabel defaultLabel)
+        {
+            BreakLabel = breakLabel;
+            CaseLabels = caseLabels ?? throw new ArgumentNullException(nameof(caseLabels));
+            DefaultLabel = defaultLabel ?? throw new ArgumentNullException(nameof(defaultLabel));
+        }
+    }
+
+    /// <summary>Stores labels collected before a switch body is emitted</summary>
+    private readonly struct SwitchLabels
+    {
+        public ImmutableArray<GimpleSwitchCase> Cases { get; }
+        internal Dictionary<BoundCaseStatement, GimpleLabel> CaseLabels { get; }
+        public GimpleLabel? DefaultLabel { get; }
+
+        public SwitchLabels(
+            ImmutableArray<GimpleSwitchCase> cases,
+            Dictionary<BoundCaseStatement, GimpleLabel> caseLabels,
+            GimpleLabel? defaultLabel)
+        {
+            Cases = cases.IsDefault ? ImmutableArray<GimpleSwitchCase>.Empty : cases;
+            CaseLabels = caseLabels ?? throw new ArgumentNullException(nameof(caseLabels));
+            DefaultLabel = defaultLabel;
+        }
+    }
+
+    /// <summary>Accumulates statements for one basic block</summary>
+    private sealed class BlockBuilder
+    {
+        public GimpleLabel Label { get; }
+        public List<GimpleStatement> Statements { get; } = new();
+        public bool HasTerminator => Statements.Count != 0 && Statements[^1].IsTerminator;
+
+        public BlockBuilder(GimpleLabel label)
+        {
+            Label = label ?? throw new ArgumentNullException(nameof(label));
         }
 
-        private static bool TryEvaluateBinaryIntegerConstant(
-            ExpressionSyntax leftExpression,
-            SyntaxKind operatorKind,
-            ExpressionSyntax rightExpression,
-            out long value)
-        {
-            value = 0;
-
-            if (!TryEvaluateIntegerConstantExpression(leftExpression, out var left) ||
-                !TryEvaluateIntegerConstantExpression(rightExpression, out var right))
-            {
-                return false;
-            }
-
-            return TryEvaluateBinaryIntegerConstant(left, operatorKind, right, out value);
-        }
-
-        // Reject invalid shifts, division by zero, and arithmetic overflow
-        private static bool TryEvaluateBinaryIntegerConstant(
-            long left,
-            SyntaxKind operatorKind,
-            long right,
-            out long value)
-        {
-            value = 0;
-
-            try
-            {
-                switch (operatorKind)
-                {
-                    case SyntaxKind.StarToken:
-                        value = checked(left * right);
-                        return true;
-                    case SyntaxKind.SlashToken:
-                        if (right == 0)
-                            return false;
-                        value = left / right;
-                        return true;
-                    case SyntaxKind.PercentToken:
-                        if (right == 0)
-                            return false;
-                        value = left % right;
-                        return true;
-                    case SyntaxKind.PlusToken:
-                        value = checked(left + right);
-                        return true;
-                    case SyntaxKind.MinusToken:
-                        value = checked(left - right);
-                        return true;
-                    case SyntaxKind.LessThanLessThanToken:
-                        if (right < 0 || right >= 64)
-                            return false;
-                        value = checked(left << (int)right);
-                        return true;
-                    case SyntaxKind.GreaterThanGreaterThanToken:
-                        if (right < 0 || right >= 64)
-                            return false;
-                        value = left >> (int)right;
-                        return true;
-                    case SyntaxKind.LessThanToken:
-                        value = left < right ? 1 : 0;
-                        return true;
-                    case SyntaxKind.LessThanEqualsToken:
-                        value = left <= right ? 1 : 0;
-                        return true;
-                    case SyntaxKind.GreaterThanToken:
-                        value = left > right ? 1 : 0;
-                        return true;
-                    case SyntaxKind.GreaterThanEqualsToken:
-                        value = left >= right ? 1 : 0;
-                        return true;
-                    case SyntaxKind.EqualsEqualsToken:
-                        value = left == right ? 1 : 0;
-                        return true;
-                    case SyntaxKind.BangEqualsToken:
-                        value = left != right ? 1 : 0;
-                        return true;
-                    case SyntaxKind.AmpersandToken:
-                        value = left & right;
-                        return true;
-                    case SyntaxKind.PipeToken:
-                        value = left | right;
-                        return true;
-                    case SyntaxKind.HatToken:
-                        value = left ^ right;
-                        return true;
-                    case SyntaxKind.AmpersandAmpersandToken:
-                        value = left != 0 && right != 0 ? 1 : 0;
-                        return true;
-                    case SyntaxKind.PipePipeToken:
-                        value = left != 0 || right != 0 ? 1 : 0;
-                        return true;
-                    case SyntaxKind.CommaToken:
-                        value = right;
-                        return true;
-                    default:
-                        return false;
-                }
-            }
-            catch (OverflowException)
-            {
-                value = 0;
-                return false;
-            }
-        }
-
-        private static bool TryEvaluateConditionalIntegerConstant(
-            BoundExpression condition,
-            BoundExpression whenTrue,
-            BoundExpression whenFalse,
-            out long value)
-        {
-            value = 0;
-
-            if (!TryEvaluateIntegerConstantValue(condition, out var conditionValue))
-                return false;
-
-            return conditionValue != 0
-                ? TryEvaluateIntegerConstantValue(whenTrue, out value)
-                : TryEvaluateIntegerConstantValue(whenFalse, out value);
-        }
-
-        private static bool TryEvaluateConditionalIntegerConstant(
-            ExpressionSyntax condition,
-            ExpressionSyntax whenTrue,
-            ExpressionSyntax whenFalse,
-            out long value)
-        {
-            value = 0;
-
-            if (!TryEvaluateIntegerConstantExpression(condition, out var conditionValue))
-                return false;
-
-            return conditionValue != 0
-                ? TryEvaluateIntegerConstantExpression(whenTrue, out value)
-                : TryEvaluateIntegerConstantExpression(whenFalse, out value);
-        }
-
-        private static bool TryConvertConstantToLong(object? constantValue, out long value)
-        {
-            switch (constantValue)
-            {
-                case byte byteValue:
-                    value = byteValue;
-                    return true;
-                case sbyte signedByteValue:
-                    value = signedByteValue;
-                    return true;
-                case short shortValue:
-                    value = shortValue;
-                    return true;
-                case ushort unsignedShortValue:
-                    value = unsignedShortValue;
-                    return true;
-                case int intValue:
-                    value = intValue;
-                    return true;
-                case uint unsignedIntValue:
-                    value = unsignedIntValue;
-                    return true;
-                case long longValue:
-                    value = longValue;
-                    return true;
-                case ulong unsignedLongValue when unsignedLongValue <= long.MaxValue:
-                    value = (long)unsignedLongValue;
-                    return true;
-                case char charValue:
-                    value = charValue;
-                    return true;
-                case bool boolValue:
-                    value = boolValue ? 1 : 0;
-                    return true;
-                default:
-                    value = 0;
-                    return false;
-            }
-        }
-
-        /// <summary>Parses decimal, hexadecimal, or octal integer spelling into a signed value</summary>
-        private static bool TryParseIntegerLiteral(string text, out long value)
-        {
-            value = 0;
-
-            if (string.IsNullOrWhiteSpace(text))
-                return false;
-
-            var trimmed = text.Trim().Replace("'", string.Empty);
-            trimmed = trimmed.TrimEnd('u', 'U', 'l', 'L');
-
-            try
-            {
-                if (trimmed.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
-                {
-                    return long.TryParse(
-                        trimmed.Substring(2),
-                        NumberStyles.AllowHexSpecifier,
-                        CultureInfo.InvariantCulture,
-                        out value);
-                }
-
-                if (trimmed.Length > 1 && trimmed[0] == '0')
-                    return TryParseOctalIntegerLiteral(trimmed, out value);
-
-                if (long.TryParse(trimmed, NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
-                    return true;
-
-                // A literal above long.MaxValue is still valid while it fits unsigned long long
-                if (ulong.TryParse(trimmed, NumberStyles.Integer, CultureInfo.InvariantCulture, out var unsignedValue))
-                {
-                    value = unchecked((long)unsignedValue);
-                    return true;
-                }
-
-                return false;
-            }
-            catch (OverflowException)
-            {
-                value = 0;
-                return false;
-            }
-        }
-
-        private static bool TryParseOctalIntegerLiteral(string text, out long value)
-        {
-            value = 0;
-            ulong result = 0;
-
-            foreach (var ch in text)
-            {
-                if (ch < '0' || ch > '7')
-                    return false;
-
-                checked
-                {
-                    result = result * 8 + (ulong)(ch - '0');
-                }
-            }
-
-            value = unchecked((long)result);
-            return true;
-        }
-
-        private static GimpleConversionKind ToGimpleConversionKind(BoundConversionKind kind)
-        {
-            return kind switch
-            {
-                BoundConversionKind.Identity => GimpleConversionKind.Identity,
-                BoundConversionKind.LValueToRValue => GimpleConversionKind.LValueToRValue,
-                BoundConversionKind.ArrayToPointer => GimpleConversionKind.ArrayToPointer,
-                BoundConversionKind.FunctionToPointer => GimpleConversionKind.FunctionToPointer,
-                BoundConversionKind.Implicit => GimpleConversionKind.Implicit,
-                BoundConversionKind.Explicit => GimpleConversionKind.Explicit,
-                BoundConversionKind.Error => GimpleConversionKind.Error,
-                _ => GimpleConversionKind.Error,
-            };
-        }
-
-        private static bool IsLogicalOperator(SyntaxKind kind)
-            => kind is SyntaxKind.AmpersandAmpersandToken or SyntaxKind.PipePipeToken;
-
-        private static SyntaxToken CreateSyntheticToken(SyntaxKind kind, string text)
-        {
-            return new SyntaxToken(
-                kind,
-                0,
-                text,
-                value: null,
-                ImmutableArray<SyntaxTrivia>.Empty,
-                ImmutableArray<SyntaxTrivia>.Empty);
-        }
-
-        /// <summary>Tracks labels active while lowering one switch body</summary>
-        private sealed class SwitchContext
-        {
-            public GimpleLabel BreakLabel { get; }
-            internal Dictionary<BoundCaseStatement, GimpleLabel> CaseLabels { get; }
-            public GimpleLabel DefaultLabel { get; }
-
-            public SwitchContext(
-                GimpleLabel breakLabel,
-                Dictionary<BoundCaseStatement, GimpleLabel> caseLabels,
-                GimpleLabel defaultLabel)
-            {
-                BreakLabel = breakLabel;
-                CaseLabels = caseLabels ?? throw new ArgumentNullException(nameof(caseLabels));
-                DefaultLabel = defaultLabel ?? throw new ArgumentNullException(nameof(defaultLabel));
-            }
-        }
-
-        /// <summary>Stores labels collected before a switch body is emitted</summary>
-        private readonly struct SwitchLabels
-        {
-            public ImmutableArray<GimpleSwitchCase> Cases { get; }
-            internal Dictionary<BoundCaseStatement, GimpleLabel> CaseLabels { get; }
-            public GimpleLabel? DefaultLabel { get; }
-
-            public SwitchLabels(
-                ImmutableArray<GimpleSwitchCase> cases,
-                Dictionary<BoundCaseStatement, GimpleLabel> caseLabels,
-                GimpleLabel? defaultLabel)
-            {
-                Cases = cases.IsDefault ? ImmutableArray<GimpleSwitchCase>.Empty : cases;
-                CaseLabels = caseLabels ?? throw new ArgumentNullException(nameof(caseLabels));
-                DefaultLabel = defaultLabel;
-            }
-        }
-
-        /// <summary>Accumulates statements for one basic block</summary>
-        private sealed class BlockBuilder
-        {
-            public GimpleLabel Label { get; }
-            public List<GimpleStatement> Statements { get; } = new();
-            public bool HasTerminator => Statements.Count != 0 && Statements[^1].IsTerminator;
-
-            public BlockBuilder(GimpleLabel label)
-            {
-                Label = label ?? throw new ArgumentNullException(nameof(label));
-            }
-
-            public GimpleBasicBlock ToImmutable()
-                => new GimpleBasicBlock(Label, Statements.ToImmutableArray());
-        }
+        public GimpleBasicBlock ToImmutable()
+            => new GimpleBasicBlock(Label, Statements.ToImmutableArray());
     }
 }
