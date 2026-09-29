@@ -641,7 +641,7 @@ internal static class X86AssemblyWriter
                 foreach (var label in labels)
                     sb.Append(label).AppendLine(":");
             }
-            sb.Append("    ").AppendLine(WriteInstruction(instruction, options));
+            sb.Append("    ").AppendLine(WriteInstruction(instruction, options, target.Is64Bit ? 8 : 4));
             position = checked(position + X86CodeEncoder.GetEncodedLength(instruction, target));
         }
         if (options.IncludeLabels && labelsByOffset.TryGetValue(position, out var endLabels))
@@ -653,6 +653,9 @@ internal static class X86AssemblyWriter
     }
 
     public static string WriteInstruction(X86Instruction instruction, X86AssemblyWriterOptions? options = null)
+        => WriteInstruction(instruction, options, addressSize: 8);
+
+    private static string WriteInstruction(X86Instruction instruction, X86AssemblyWriterOptions? options, int addressSize)
     {
         options ??= X86AssemblyWriterOptions.Default;
         if (instruction.Opcode == X86InstrKind.Raw)
@@ -668,28 +671,28 @@ internal static class X86AssemblyWriter
 
         var operands = new List<string>();
         if (instruction.Operand0.Kind != X86OperandKind.None)
-            operands.Add(WriteOperand(instruction.Operand0, options));
+            operands.Add(WriteOperand(instruction.Operand0, options, addressSize));
         if (instruction.Operand1.Kind != X86OperandKind.None)
-            operands.Add(WriteOperand(instruction.Operand1, options));
+            operands.Add(WriteOperand(instruction.Operand1, options, addressSize));
         if (instruction.Operand2.Kind != X86OperandKind.None)
-            operands.Add(WriteOperand(instruction.Operand2, options));
+            operands.Add(WriteOperand(instruction.Operand2, options, addressSize));
 
         return operands.Count == 0 ? mnemonic : mnemonic + " " + string.Join(", ", operands);
     }
 
-    private static string WriteOperand(X86Operand operand, X86AssemblyWriterOptions options)
+    private static string WriteOperand(X86Operand operand, X86AssemblyWriterOptions options, int addressSize)
     {
         return operand.Kind switch
         {
             X86OperandKind.Register => X86Registers.Format(operand.Register, operand.Size),
             X86OperandKind.Immediate => FormatInteger(operand.Immediate, options),
             X86OperandKind.Symbol => operand.Symbol ?? string.Empty,
-            X86OperandKind.Memory => WriteMemory(operand, options),
+            X86OperandKind.Memory => WriteMemory(operand, options, addressSize),
             _ => string.Empty,
         };
     }
 
-    private static string WriteMemory(X86Operand operand, X86AssemblyWriterOptions options)
+    private static string WriteMemory(X86Operand operand, X86AssemblyWriterOptions options, int addressSize)
     {
         var sb = new StringBuilder();
         if (options.IncludeMemorySize && operand.Size != 0)
@@ -708,11 +711,11 @@ internal static class X86AssemblyWriter
         if (operand.IsRipRelative || operand.BaseRegister == X86Register.Rip)
             Add("rip");
         else if (X86Registers.IsGeneral(operand.BaseRegister))
-            Add(X86Registers.Format(operand.BaseRegister, 8));
+            Add(X86Registers.Format(operand.BaseRegister, addressSize));
 
         if (X86Registers.IsGeneral(operand.IndexRegister))
         {
-            var text = X86Registers.Format(operand.IndexRegister, 8);
+            var text = X86Registers.Format(operand.IndexRegister, addressSize);
             if (operand.Scale != 1)
                 text += "*" + operand.Scale.ToString(CultureInfo.InvariantCulture);
             Add(text);

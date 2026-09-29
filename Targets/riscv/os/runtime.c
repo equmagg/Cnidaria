@@ -7,6 +7,12 @@ typedef unsigned long usize;
 
 #define NULL ((void*)0)
 #define SYS_GETCWD 17ul
+#define SYS_IOCTL 29ul
+#define SYS_KILL 129ul
+#define SYS_RT_SIGACTION 134ul
+#define SYS_SETPGID 154ul
+#define SYS_SETSID 157ul
+#define SYS_GETPID 172ul
 #define SYS_MKDIRAT 34ul
 #define SYS_UNLINKAT 35ul
 #define SYS_CHDIR 49ul
@@ -43,7 +49,24 @@ typedef unsigned long usize;
 #define S_IFDIR 16384u
 #define S_IFREG 32768u
 #define STAT_SIZE 128ul
+#define SIGINT 2
+#define SIGQUIT 3
+#define SIGKILL 9
+#define SIGTERM 15
 #define SIGCHLD 17ul
+#define SIGCONT 18
+#define SIGSTOP 19
+#define SIGTSTP 20
+#define SIGTTIN 21
+#define SIGTTOU 22
+#define SIG_DFL 0ul
+#define SIG_IGN 1ul
+#define WNOHANG 1ul
+#define WUNTRACED 2ul
+#define WCONTINUED 8ul
+#define TIOCSCTTY 0x540eul
+#define TIOCGPGRP 0x540ful
+#define TIOCSPGRP 0x5410ul
 
 static s64 syscall1(u64 number, u64 arg0)
 {
@@ -198,6 +221,41 @@ static s64 sys_execve(const char* path, char** argv, char** envp)
 static s64 sys_wait4(s64 pid, int* status, u64 options)
 {
     return syscall4(SYS_WAIT4, (u64)pid, (u64)status, options, 0ul);
+}
+
+static s64 sys_ioctl(int fd, u64 request, u64 argument)
+{
+    return syscall3(SYS_IOCTL, (u64)fd, request, argument);
+}
+
+static s64 sys_kill(s64 pid, int signal)
+{
+    return syscall3(SYS_KILL, (u64)pid, (u64)signal, 0ul);
+}
+
+static s64 sys_setpgid(s64 pid, s64 group)
+{
+    return syscall3(SYS_SETPGID, (u64)pid, (u64)group, 0ul);
+}
+
+static s64 sys_setsid(void)
+{
+    return syscall1(SYS_SETSID, 0ul);
+}
+
+static s64 sys_getpid(void)
+{
+    return syscall1(SYS_GETPID, 0ul);
+}
+
+// A handler here is left without SA_RESTART, so a signal ends whatever read it arrives during
+static s64 sys_signal(int signal, u64 handler)
+{
+    u64 action[3];
+    action[0] = handler;
+    action[1] = 0ul;
+    action[2] = 0ul;
+    return syscall4(SYS_RT_SIGACTION, (u64)signal, (u64)action, 0ul, 8ul);
 }
 
 static void sys_exit(int status)

@@ -573,6 +573,7 @@ public sealed class ArmCodeGenerator
         var offset = section.ByteLength;
         section.EmitZero(_target.PointerSize);
         section.AddRelocation(offset, symbol, addend, ArmObjectRelocationKind.AbsolutePointer);
+        _text.Reference(symbol);
     }
 
     private string GetSymbolLabel(Symbol symbol)
@@ -4506,6 +4507,7 @@ public sealed class ArmCodeGenerator
         private readonly List<ArmInstruction> _instructions = new List<ArmInstruction>();
         private readonly Dictionary<string, int> _labels = new Dictionary<string, int>(StringComparer.Ordinal);
         private readonly List<ArmObjectRelocation> _relocations = new List<ArmObjectRelocation>();
+        private readonly HashSet<string> _referenced = new HashSet<string>(StringComparer.Ordinal);
 
         public string Name { get; }
         public int ByteLength => checked(_instructions.Count * 4);
@@ -4522,7 +4524,22 @@ public sealed class ArmCodeGenerator
         }
 
         public void Emit(ArmInstruction instruction)
-            => _instructions.Add(instruction);
+        {
+            Reference(instruction.Operand0);
+            Reference(instruction.Operand1);
+            Reference(instruction.Operand2);
+            Reference(instruction.Operand3);
+            _instructions.Add(instruction);
+        }
+
+        public void Reference(string symbol)
+            => _referenced.Add(symbol);
+
+        private void Reference(ArmOperand operand)
+        {
+            if (operand.HasSymbol)
+                _referenced.Add(operand.Symbol!);
+        }
 
         public void EmitAssembly(string text, string labelPrefix, ArmTarget target)
         {
@@ -4577,7 +4594,10 @@ public sealed class ArmCodeGenerator
                 : operand;
 
         public void AddRelocation(int offset, string symbol, long addend, ArmObjectRelocationKind kind)
-            => _relocations.Add(new ArmObjectRelocation(Name, offset, symbol, addend, kind));
+        {
+            _relocations.Add(new ArmObjectRelocation(Name, offset, symbol, addend, kind));
+            _referenced.Add(symbol);
+        }
 
         public void RelaxBranches(List<ArmObjectSymbol> symbols, ArmTarget target)
         {
@@ -4912,7 +4932,14 @@ public sealed class ArmCodeGenerator
         private int _nextRelaxationLabelId;
 
         public ArmTextSection ToSection()
-            => new ArmTextSection(_instructions, _labels, _relocations.ToImmutableArray());
+        {
+            foreach (var label in _labels.Keys.Where(IsUnreferenced).ToList())
+                _labels.Remove(label);
+            return new ArmTextSection(_instructions, _labels, _relocations.ToImmutableArray());
+        }
+
+        private bool IsUnreferenced(string label)
+            => label.StartsWith(".L", StringComparison.Ordinal) && !_referenced.Contains(label);
     }
 
     private sealed class DataSectionBuilder

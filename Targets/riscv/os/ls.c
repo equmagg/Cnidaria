@@ -1,5 +1,6 @@
 #define LS_MAX_ENTRIES 128
-#define LS_NAME_CAPACITY 32
+#define LS_NAME_CAPACITY 768
+#define LS_PATH_CAPACITY 2048
 #define LS_TERMINAL_COLUMNS 80
 
 static char ls_names[LS_MAX_ENTRIES][LS_NAME_CAPACITY];
@@ -33,7 +34,7 @@ static int ls_before(const char* left, const char* right)
     return right[index] != 0;
 }
 
-/* The names come out of the directory in the order it stores them, and a listing is sorted */
+// The names come out of the directory in the order it stores them, and a listing is sorted
 static void ls_sort(void)
 {
     int outer = 1;
@@ -75,16 +76,15 @@ static u16 ls_load_u16(const u8* bytes)
     return (u16)((u16)bytes[0] | ((u16)bytes[1] << 8));
 }
 
-/* A flat volume holds every name at the root, so a name is a path with a slash in front */
 static void ls_build_path(const char* directory, const char* name, char* path)
 {
     int index = 0;
-    /* A name in the working directory stands on its own; anywhere else it hangs off its directory */
+    // A name in the working directory stands on its own; anywhere else it hangs off its directory
     if (!(directory[0] == '.' && directory[1] == 0))
     {
         if (!(directory[0] == '/' && directory[1] == 0))
         {
-            while (directory[index] != 0 && index < LS_NAME_CAPACITY)
+            while (directory[index] != 0 && index < LS_PATH_CAPACITY - LS_NAME_CAPACITY)
             {
                 path[index] = directory[index];
                 index = index + 1;
@@ -93,7 +93,7 @@ static void ls_build_path(const char* directory, const char* name, char* path)
         path[index] = '/';
         index = index + 1;
     }
-    while (*name != 0 && index < LS_NAME_CAPACITY * 2 - 1)
+    while (*name != 0 && index < LS_PATH_CAPACITY - 1)
     {
         path[index] = *name;
         index = index + 1;
@@ -102,7 +102,7 @@ static void ls_build_path(const char* directory, const char* name, char* path)
     path[index] = 0;
 }
 
-/* The nine bits every listing spells out as three groups of three */
+// The nine bits every listing spells out as three groups of three
 static void ls_write_permissions(u32 mode)
 {
     int bit = 8;
@@ -116,7 +116,7 @@ static void ls_write_permissions(u32 mode)
 
 static void ls_write_long(const char* directory, const char* name, u32 kind)
 {
-    char path[LS_NAME_CAPACITY * 2];
+    char path[LS_PATH_CAPACITY];
     u32 mode;
     ls_build_path(directory, name, path);
     mode = path_mode(path);
@@ -132,7 +132,7 @@ static void ls_write_long(const char* directory, const char* name, u32 kind)
     write_text("\n");
 }
 
-/* Names go across the screen the way a terminal shows them, as many to a line as fit */
+// Names go across the screen the way a terminal shows them, as many to a line as fit
 static void ls_write_columns(void)
 {
     int widest = 0;
@@ -173,7 +173,7 @@ static void ls_write_columns(void)
 
 static int ls_directory(const char* path, int all, int longFormat, int onePerLine)
 {
-    u8 buffer[512];
+    u8 buffer[2048];
     s64 fd = sys_openat((s64)AT_FDCWD, path, O_RDONLY, 0ul);
     int index;
     if (fd < 0l)
@@ -185,7 +185,7 @@ static int ls_directory(const char* path, int all, int longFormat, int onePerLin
     ls_count = 0;
     for (;;)
     {
-        s64 count = sys_getdents64((int)fd, buffer, 512ul);
+        s64 count = sys_getdents64((int)fd, buffer, sizeof(buffer));
         usize offset = 0ul;
         if (count <= 0l)
             break;

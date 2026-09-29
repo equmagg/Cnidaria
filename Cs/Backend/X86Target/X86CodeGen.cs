@@ -6958,6 +6958,15 @@ namespace Cnidaria.Cs
 
                     if (node.SourceOp == BytecodeOp.Mul)
                     {
+                        if (immediate is 3 or 5 or 9)
+                        {
+                            _owner.Emit(X86Instruction.Binary(
+                                X86InstrKind.Lea,
+                                Reg(dst, size),
+                                X86Operand.Memory(lhs, 0, Target.PointerSize, lhs, (int)(immediate - 1))));
+                            return;
+                        }
+
                         _owner.Emit(X86Instruction.Ternary(
                             X86InstrKind.Imul,
                             Reg(dst, size),

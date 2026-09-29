@@ -25,12 +25,16 @@ public static class StandardHeaders
     internal static string StdintH { get; } = ReadEmbeddedText("stdint.h");
     internal static string StdioH { get; } = ReadEmbeddedText("stdio.h");
     internal static string StdlibH { get; } = ReadEmbeddedText("stdlib.h");
+    internal static string SignalH { get; } = ReadEmbeddedText("signal.h");
     internal static string StringH { get; } = ReadEmbeddedText("string.h");
     internal static string SysStatH { get; } = ReadEmbeddedText("stat.h");
+    internal static string SysTimeH { get; } = ReadEmbeddedText("sys.time.h");
+    internal static string SysIoctlH { get; } = ReadEmbeddedText("sys.ioctl.h");
+    internal static string TermiosH { get; } = ReadEmbeddedText("termios.h");
     internal static string SysTypesH { get; } = ReadEmbeddedText("types.h");
     internal static string UnistdH { get; } = ReadEmbeddedText("unistd.h");
     internal static string RiscVVectorH { get; } = ReadEmbeddedText("riscv_vector.h");
-    private static string ReadEmbeddedText(string fileName)
+    internal static string ReadEmbeddedText(string fileName)
     {
         var assembly = typeof(StandardHeaders).Assembly;
         var suffix = "." + fileName;
@@ -58,6 +62,7 @@ public static class StandardHeaders
             new IncludeFile("errno.h", ErrnoH),
             new IncludeFile("fcntl.h", FcntlH),
             new IncludeFile("limits.h", LimitsH),
+            new IncludeFile("signal.h", SignalH),
             new IncludeFile("stdarg.h", StdargH),
             new IncludeFile("stdbool.h", StdboolH),
             new IncludeFile("stddef.h", StddefH),
@@ -66,6 +71,9 @@ public static class StandardHeaders
             new IncludeFile("stdlib.h", StdlibH),
             new IncludeFile("string.h", StringH),
             new IncludeFile("sys/stat.h", SysStatH),
+            new IncludeFile("sys/time.h", SysTimeH),
+            new IncludeFile("sys/ioctl.h", SysIoctlH),
+            new IncludeFile("termios.h", TermiosH),
             new IncludeFile("sys/types.h", SysTypesH),
             new IncludeFile("unistd.h", UnistdH),
             new IncludeFile("riscv_vector.h", RiscVVectorH));
@@ -82,6 +90,27 @@ public static class StandardHeaders
         return files;
     }
 }
+internal static class RiscVVectorIntrinsics
+{
+    private static readonly Lazy<Dictionary<string, string>> Declarations = new(Load);
+
+    public static bool TryGetDeclaration(string name, out string declaration)
+        => Declarations.Value.TryGetValue(name, out declaration!);
+
+    private static Dictionary<string, string> Load()
+    {
+        var declarations = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var line in StandardHeaders.ReadEmbeddedText("riscv_vector.def").Split('\n'))
+        {
+            var text = line.TrimEnd('\r');
+            var open = text.IndexOf('(');
+            if (open > 0)
+                declarations.TryAdd(text[(text.LastIndexOf(' ', open) + 1)..open], text);
+        }
+        return declarations;
+    }
+}
+
 public static class StandardLibrarySources
 {
     public static ImmutableArray<SourceFile> CreateFiles()
@@ -89,9 +118,11 @@ public static class StandardLibrarySources
             new SourceFile("C/StandardLibrary/ctype.c", ReadEmbeddedText("ctype.c")),
             new SourceFile("C/StandardLibrary/io.c", ReadEmbeddedText("io.c")),
             new SourceFile("C/StandardLibrary/libc.c", ReadEmbeddedText("libc.c")),
+            new SourceFile("C/StandardLibrary/signal.c", ReadEmbeddedText("signal.c")),
             new SourceFile("C/StandardLibrary/stdio.c", ReadEmbeddedText("stdio.c")),
             new SourceFile("C/StandardLibrary/stdlib.c", ReadEmbeddedText("stdlib.c")),
-            new SourceFile("C/StandardLibrary/string.c", ReadEmbeddedText("string.c")));
+            new SourceFile("C/StandardLibrary/string.c", ReadEmbeddedText("string.c")),
+            new SourceFile("C/StandardLibrary/termios.c", ReadEmbeddedText("termios.c")));
 
     private static string ReadEmbeddedText(string fileName)
     {

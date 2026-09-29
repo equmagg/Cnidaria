@@ -840,6 +840,8 @@ namespace Cnidaria.Cs
                 TargetArchitectureKind.Arm64 => new TargetInfo(architecture, pointerSize: 8, 8, 8, 8, 16, 16, operatingSystem: operatingSystem,
                 architectureFeatures: features | TargetArchitectureFeatures.ArmVfp | TargetArchitectureFeatures.ArmVfpD32
                 | TargetArchitectureFeatures.ArmNeon | TargetArchitectureFeatures.ArmHardFloat),
+                TargetArchitectureKind.Wasm32 => new TargetInfo(architecture, pointerSize: 4, 4, 8, 4, 16, 16, operatingSystem: operatingSystem, architectureFeatures: features),
+                TargetArchitectureKind.Wasm64 => new TargetInfo(architecture, pointerSize: 8, 8, 8, 8, 16, 16, operatingSystem: operatingSystem, architectureFeatures: features),
                 _ => throw new ArgumentOutOfRangeException(nameof(architecture))
             };
         }

@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -137,6 +138,11 @@ static long __sys(long number, long a, long b, long c, long d, long e)
     return result;
 }
 
+long __syscall(long number, long a, long b, long c, long d, long e)
+{
+    return __sys(number, a, b, c, d, e);
+}
+
 // A failed call comes back as the negated error, which is where errno gets its value
 static long __sys_result(long value)
 {
@@ -239,6 +245,17 @@ char* getcwd(char* buffer, size_t size)
 int __io_rename(const char* from, const char* to)
 {
     return (int)__sys_result(__sys(__NR_renameat, AT_FDCWD, (long)(uintptr_t)from, AT_FDCWD, (long)(uintptr_t)to, 0));
+}
+
+int ioctl(int descriptor, unsigned long request, ...)
+{
+    va_list arguments;
+    void* argument;
+
+    va_start(arguments, request);
+    argument = va_arg(arguments, void*);
+    va_end(arguments);
+    return (int)__sys_result(__sys(__NR_ioctl, (long)descriptor, (long)request, (long)(uintptr_t)argument, 0, 0));
 }
 
 int isatty(int descriptor)

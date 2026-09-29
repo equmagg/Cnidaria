@@ -12,7 +12,7 @@ int main(int argc, char** argv, char** envp)
 
     while (index < argc)
     {
-        /* A name that is already there is left as it is, which is what touch promises */
+        // A name that is already there is left as it is, which is what touch promises
         s64 fd = sys_openat((s64)AT_FDCWD, argv[index], O_WRONLY | O_CREAT, 420ul);
         if (fd < 0l)
         {

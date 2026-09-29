@@ -228,12 +228,10 @@ public static class RiscVZBoot
         {
             if (file is null)
                 throw new ArgumentException("Boot file collection contains null.", nameof(additionalBootFiles));
-            var shortName = Encoding.ASCII.GetString(BuildFatShortName(file.FileName));
             var replaced = false;
             for (int i = 0; i < files.Count; i++)
             {
-                var existingShortName = Encoding.ASCII.GetString(BuildFatShortName(files[i].FileName));
-                if (!string.Equals(existingShortName, shortName, StringComparison.Ordinal))
+                if (!FatNameComparer.Instance.Equals(files[i].FileName, file.FileName))
                     continue;
                 files[i] = file;
                 replaced = true;
@@ -461,16 +459,20 @@ public static class RiscVZBoot
         var files = new List<RiscVBootFile> { new RiscVBootFile(layout.KernelFileName, kernelImage) };
         if (additionalBootFiles is not null)
             files.AddRange(additionalBootFiles);
-        // The root holds a run of clusters, and half of what it holds is left for the guest to fill
-        if (files.Count == 0 || files.Count > RootDirectoryClusters * DirectoryEntriesPerSector / 2)
-            throw new ArgumentOutOfRangeException(nameof(additionalBootFiles));
         var shortNames = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var file in files)
+        var names = new HashSet<string>(FatNameComparer.Instance);
+        var slots = new List<byte[]>[files.Count];
+        int slotCount = 0;
+        for (int i = 0; i < files.Count; i++)
         {
-            var shortName = Encoding.ASCII.GetString(BuildFatShortName(file.FileName));
-            if (!shortNames.Add(shortName))
-                throw new ArgumentException("Duplicate FAT boot file name: " + file.FileName, nameof(additionalBootFiles));
+            if (!names.Add(files[i].FileName))
+                throw new ArgumentException("Duplicate FAT boot file name: " + files[i].FileName, nameof(additionalBootFiles));
+            slots[i] = BuildDirectorySlots(files[i].FileName, shortNames);
+            slotCount += slots[i].Count;
         }
+        // The root holds a run of clusters, and half of what it holds is left for the guest to fill
+        if (slotCount > RootDirectoryClusters * DirectoryEntriesPerSector / 2)
+            throw new ArgumentOutOfRangeException(nameof(additionalBootFiles));
         if ((layout.KernelStorageOffset & ((int)RVMmioBlockDevice.SectorSize - 1)) != 0)
             throw new ArgumentOutOfRangeException(nameof(layout));
         if ((layout.KernelPartitionImageSize & ((int)RVMmioBlockDevice.SectorSize - 1)) != 0)
@@ -552,10 +554,19 @@ public static class RiscVZBoot
 
         int dataOffset = checked(fatOffset + (int)fatSectors * fatCount * sectorSize);
         int rootOffset = checked(dataOffset + ((int)rootCluster - 2) * sectorsPerCluster * sectorSize);
+        int slot = 0;
         for (int i = 0; i < clusterMap.Count; i++)
         {
             var item = clusterMap[i];
-            WriteDirectoryEntry(storage.AsSpan(rootOffset + i * 32, 32), item.File.FileName, item.FirstCluster, checked((uint)item.File.Contents.Length));
+            var entry = slots[i][^1];
+            WriteLe16(entry, 20, (ushort)(item.FirstCluster >> 16));
+            WriteLe16(entry, 26, (ushort)item.FirstCluster);
+            WriteLe32(entry, 28, checked((uint)item.File.Contents.Length));
+            foreach (var bytes in slots[i])
+            {
+                bytes.CopyTo(storage.AsSpan(rootOffset + slot * 32, 32));
+                slot++;
+            }
             int fileOffset = checked(dataOffset + ((int)item.FirstCluster - 2) * sectorsPerCluster * sectorSize);
             Buffer.BlockCopy(item.File.Contents, 0, storage, fileOffset, item.File.Contents.Length);
         }
@@ -630,15 +641,140 @@ public static class RiscVZBoot
         sector[511] = 0xaa;
     }
 
-    private static void WriteDirectoryEntry(Span<byte> entry, string fileName, uint firstCluster, uint fileSize)
+    private static readonly int[] LongNameOffsets = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+
+    /// <summary>
+    /// The slots a name takes in a directory: an exact capitalised eight and three stands alone, and
+    /// anything else is spelled out in long-name slots ahead of an alias, the way the guest writes names
+    /// </summary>
+    private static List<byte[]> BuildDirectorySlots(string fileName, HashSet<string> shortNames)
     {
-        entry.Clear();
-        var shortName = BuildFatShortName(fileName);
-        shortName.AsSpan().CopyTo(entry);
+        var name = fileName.TrimEnd('.');
+        if (name.Length == 0 || name.Length > 255 || name.Any(static c => c < 0x20 || "\"*/:<>?\\|".IndexOf(c) >= 0))
+            throw new ArgumentException("Boot file name is not a valid FAT long name: " + fileName, nameof(fileName));
+        var shortName = TryBuildExactShortName(name);
+        bool spelledOut = shortName is null || name.Any(static c => c is >= 'a' and <= 'z');
+        shortName ??= BuildShortAlias(name, shortNames);
+        if (!shortNames.Add(Encoding.ASCII.GetString(shortName)))
+            throw new ArgumentException("Duplicate FAT boot file name: " + fileName, nameof(fileName));
+
+        var slots = new List<byte[]>();
+        if (spelledOut)
+        {
+            int count = (name.Length + 12) / 13;
+            byte checksum = 0;
+            foreach (var b in shortName)
+                checksum = (byte)(((checksum & 1) << 7) + (checksum >> 1) + b);
+            for (int index = 0; index < count; index++)
+            {
+                int sequence = count - index;
+                var slot = new byte[32];
+                slot[0] = (byte)(sequence | (index == 0 ? 0x40 : 0));
+                slot[11] = 0x0F;
+                slot[13] = checksum;
+                for (int position = 0; position < 13; position++)
+                {
+                    int unit = (sequence - 1) * 13 + position;
+                    WriteLe16(slot, LongNameOffsets[position], unit < name.Length ? name[unit] : unit == name.Length ? (ushort)0 : (ushort)0xFFFF);
+                }
+                slots.Add(slot);
+            }
+        }
+        var entry = new byte[32];
+        shortName.CopyTo(entry, 0);
         entry[11] = 0x20;
-        WriteLe16(entry, 20, (ushort)(firstCluster >> 16));
-        WriteLe16(entry, 26, (ushort)firstCluster);
-        WriteLe32(entry, 28, fileSize);
+        slots.Add(entry);
+        return slots;
+    }
+
+    private static byte[]? TryBuildExactShortName(string name)
+    {
+        int dot = name.IndexOf('.');
+        string stem = dot < 0 ? name : name.Substring(0, dot);
+        string ext = dot < 0 ? string.Empty : name.Substring(dot + 1);
+        if (stem.Length == 0 || stem.Length > 8 || ext.Length > 3 || ext.IndexOf('.') >= 0)
+            return null;
+        var result = new byte[11];
+        Array.Fill(result, (byte)' ');
+        for (int i = 0; i < stem.Length + ext.Length; i++)
+        {
+            char c = i < stem.Length ? stem[i] : ext[i - stem.Length];
+            if (c is >= 'a' and <= 'z')
+                c = (char)(c - 32);
+            if (!IsFatShortNameChar(c))
+                return null;
+            result[i < stem.Length ? i : 8 + i - stem.Length] = (byte)c;
+        }
+        return result;
+    }
+
+    private static byte[] BuildShortAlias(string name, HashSet<string> shortNames)
+    {
+        int dot = name.LastIndexOf('.');
+        if (dot <= 0)
+            dot = name.Length;
+        var basis = AliasPart(name, 0, dot, 8);
+        if (basis.Length == 0)
+            basis = "_";
+        var extension = AliasPart(name, Math.Min(dot + 1, name.Length), name.Length, 3).PadRight(3);
+        for (int number = 1; number < 1000000; number++)
+        {
+            var tail = "~" + number.ToString(CultureInfo.InvariantCulture);
+            var candidate = (basis.Substring(0, Math.Min(basis.Length, 8 - tail.Length)) + tail).PadRight(8) + extension;
+            if (!shortNames.Contains(candidate))
+                return Encoding.ASCII.GetBytes(candidate);
+        }
+        throw new ArgumentException("No free FAT alias is left for " + name, nameof(name));
+    }
+
+    private static string AliasPart(string name, int begin, int end, int capacity)
+    {
+        var part = new StringBuilder();
+        for (int i = begin; i < end && part.Length < capacity; i++)
+        {
+            char c = name[i];
+            if (c is '.' or ' ' || char.IsLowSurrogate(c))
+                continue;
+            if (c is >= 'a' and <= 'z')
+                c = (char)(c - 32);
+            part.Append(c < 0x80 && IsFatShortNameChar(c) ? c : '_');
+        }
+        return part.ToString();
+    }
+
+    private static bool IsFatShortNameChar(char c)
+        => c is (>= 'A' and <= 'Z') or (>= '0' and <= '9') or '_' or '$' or '~' or '!' or '#' or '%' or '&' or '-' or '@' or '^' or '`' or '{' or '}' or '(' or ')';
+
+    /// <summary>A volume tells names apart the way the guest does: ignoring trailing dots and the case of ASCII letters</summary>
+    private sealed class FatNameComparer : IEqualityComparer<string>
+    {
+        public static readonly FatNameComparer Instance = new();
+
+        public bool Equals(string? x, string? y)
+        {
+            if (x is null || y is null)
+                return ReferenceEquals(x, y);
+            x = x.TrimEnd('.');
+            y = y.TrimEnd('.');
+            if (x.Length != y.Length)
+                return false;
+            for (int i = 0; i < x.Length; i++)
+            {
+                if (Fold(x[i]) != Fold(y[i]))
+                    return false;
+            }
+            return true;
+        }
+
+        public int GetHashCode(string value)
+        {
+            var hash = new HashCode();
+            foreach (var c in value.TrimEnd('.'))
+                hash.Add(Fold(c));
+            return hash.ToHashCode();
+        }
+
+        private static char Fold(char c) => c is >= 'a' and <= 'z' ? (char)(c - 32) : c;
     }
 
     private static byte[] BuildFatShortName(string fileName)
@@ -662,11 +798,7 @@ public static class RiscVZBoot
 
     private static byte FatShortNameByte(char c, string paramName)
     {
-        if (c >= 'A' && c <= 'Z')
-            return (byte)c;
-        if (c >= '0' && c <= '9')
-            return (byte)c;
-        if (c is '_' or '$' or '~' or '!' or '#' or '%' or '&' or '-' or '@' or '^' or '`' or '{' or '}' or '(' or ')')
+        if (IsFatShortNameChar(c))
             return (byte)c;
         throw new ArgumentException("Kernel file name contains a character that is not valid in a FAT 8.3 alias.", paramName);
     }

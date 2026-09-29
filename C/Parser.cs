@@ -12,6 +12,8 @@ public sealed class Parser
     private readonly TypeNameTable _typeNames;
     private readonly List<SyntaxToken> _buffer = new();
     private readonly List<SyntaxDiagnostic> _diagnostics = new();
+    private readonly Stack<ImmutableArray<SyntaxToken>.Builder> _tokenLists = new();
+    private int _bufferStart;
     private int _position;
 
     private Parser(Lexer lexer, TypeNameTable typeNames)
@@ -40,7 +42,16 @@ public sealed class Parser
             .Concat(parser.Diagnostics)
             .ToImmutableArray();
 
-        return new ParseResult(root, diagnostics, typeNames);
+        return new ParseResult(root, diagnostics, typeNames, lexer.DeclaresRiscVVectorIntrinsics);
+    }
+
+    /// <summary>Parses one file-scope declaration against the type names an existing translation unit declared</summary>
+    internal static DeclarationSyntax? ParseDeclaration(string text, TypeNameTable typeNames)
+    {
+        var lexer = new Lexer(text, typeNames, new PreprocessorOptions(includeStandardHeaders: false));
+        var parser = new Parser(lexer, typeNames);
+        var root = parser.ParseTranslationUnit();
+        return lexer.Diagnostics.Count == 0 && parser.Diagnostics.Count == 0 && root.Members is [DeclarationSyntax declaration] ? declaration : null;
     }
 
     // Translation unit and declarations
@@ -171,7 +182,7 @@ public sealed class Parser
 
     private ImmutableArray<SyntaxToken> ParseDeclarationSpecifiers()
     {
-        var specifiers = ImmutableArray.CreateBuilder<SyntaxToken>();
+        var specifiers = RentTokenList();
 
         while (IsDeclarationSpecifierStart(Current.Kind))
         {
@@ -194,7 +205,7 @@ public sealed class Parser
             specifiers.Add(NextToken());
         }
 
-        return specifiers.ToImmutable();
+        return ToImmutableAndFree(specifiers);
     }
 
     private void ParseTagSpecifier(ImmutableArray<SyntaxToken>.Builder tokens)
@@ -254,7 +265,7 @@ public sealed class Parser
         if (Current.Kind is not (SyntaxKind.AttributeKeyword or SyntaxKind.DeclspecKeyword))
             return ImmutableArray<SyntaxToken>.Empty;
 
-        var tokens = ImmutableArray.CreateBuilder<SyntaxToken>();
+        var tokens = RentTokenList();
         while (Current.Kind is SyntaxKind.AttributeKeyword or SyntaxKind.DeclspecKeyword)
         {
             tokens.Add(NextToken());
@@ -262,14 +273,19 @@ public sealed class Parser
                 ReadBalancedTokenSequence(tokens);
         }
 
-        return tokens.ToImmutable();
+        return ToImmutableAndFree(tokens);
     }
 
     private DeclaratorSyntax ParseDeclarator()
     {
-        var tokens = ImmutableArray.CreateBuilder<SyntaxToken>();
+        var tokens = RentTokenList();
         SyntaxToken? identifier = null;
+        ParseDeclarator(tokens, ref identifier);
+        return new DeclaratorSyntax(ToImmutableAndFree(tokens), identifier);
+    }
 
+    private void ParseDeclarator(ImmutableArray<SyntaxToken>.Builder tokens, ref SyntaxToken? identifier)
+    {
         while (Current.Kind == SyntaxKind.StarToken)
         {
             tokens.Add(NextToken());
@@ -282,8 +298,6 @@ public sealed class Parser
 
         while (Current.Kind is SyntaxKind.OpenBracketToken or SyntaxKind.OpenParenToken)
             ReadBalancedTokenSequence(tokens);
-
-        return new DeclaratorSyntax(tokens.ToImmutable(), identifier);
     }
 
     private void ParseDirectDeclarator(
@@ -302,11 +316,9 @@ public sealed class Parser
         {
             tokens.Add(NextToken());
 
-            var inner = ParseDeclarator();
-            tokens.AddRange(inner.Tokens);
-
-            if (identifier is null)
-                identifier = inner.Identifier;
+            SyntaxToken? innerIdentifier = null;
+            ParseDeclarator(tokens, ref innerIdentifier);
+            identifier ??= innerIdentifier;
 
             tokens.Add(MatchToken(SyntaxKind.CloseParenToken));
             return;
@@ -1225,7 +1237,7 @@ public sealed class Parser
 
     private ImmutableArray<SyntaxToken> ReadTypeNameTokens()
     {
-        var tokens = ImmutableArray.CreateBuilder<SyntaxToken>();
+        var tokens = RentTokenList();
         var parenDepth = 0;
         var bracketDepth = 0;
         var braceDepth = 0;
@@ -1269,7 +1281,7 @@ public sealed class Parser
             }
         }
 
-        return tokens.ToImmutable();
+        return ToImmutableAndFree(tokens);
     }
 
     // Recovery and balanced token capture
@@ -1449,12 +1461,34 @@ public sealed class Parser
 
     // Token stream and missing token recovery
 
+    // A token list is gathered in a builder that keeps its capacity, so the list costs only its exact-size array
+    private ImmutableArray<SyntaxToken>.Builder RentTokenList()
+        => _tokenLists.Count != 0 ? _tokenLists.Pop() : ImmutableArray.CreateBuilder<SyntaxToken>();
+
+    private ImmutableArray<SyntaxToken> ToImmutableAndFree(ImmutableArray<SyntaxToken>.Builder tokens)
+    {
+        var list = tokens.ToImmutable();
+        tokens.Clear();
+        _tokenLists.Push(tokens);
+        return list;
+    }
+
     private SyntaxToken Peek(int offset)
     {
-        var index = _position + offset;
+        var index = _position - _bufferStart + offset;
+        if (index >= _buffer.Count)
+        {
+            // The parser never goes back, so once every buffered token is consumed the buffer starts over
+            if (_position - _bufferStart == _buffer.Count)
+            {
+                _buffer.Clear();
+                _bufferStart = _position;
+                index = offset;
+            }
 
-        while (index >= _buffer.Count)
-            _buffer.Add(_lexer.NextToken());
+            while (index >= _buffer.Count)
+                _buffer.Add(_lexer.NextToken());
+        }
 
         return _buffer[index];
     }

@@ -1241,6 +1241,8 @@ internal sealed class LirFunctionBuilder
     private readonly Dictionary<LirVirtualRegister, LirVirtualRegister> _widenedIndices = new();
     private readonly Dictionary<Symbol, (LirVirtualRegister Register, ControlFlowBlock Block)> _symbolBases = new();
     private readonly HashSet<Symbol> _sharedSymbols = new();
+    private readonly Dictionary<GimpleStatementAnnotations, GimpleStatementAnnotations> _divisionPartners = new();
+    private readonly HashSet<GimpleStatementAnnotations> _answeredDivisions = new();
     private readonly HashSet<object> _sharedAddressKeys = new();
 
     private readonly GimpleFunctionAnnotations _function;
@@ -1549,7 +1551,8 @@ internal sealed class LirFunctionBuilder
                 foreach (var operand in phi.Operands)
                 {
                     if (!seenPredecessors.Add(operand.Predecessor) ||
-                        !_blocksByControlFlowBlock.ContainsKey(operand.Predecessor))
+                        !_blocksByControlFlowBlock.ContainsKey(operand.Predecessor) ||
+                        !StillReaches(operand.Predecessor, phi.Block))
                         continue;
 
                     var source = GetOperand(operand.Value);
@@ -1579,6 +1582,19 @@ internal sealed class LirFunctionBuilder
             var split = NewBlock(name, sourceBlock: source, isEdgeSplit: true);
             _edgeSplitBlocks.Add(pair.Key, split);
         }
+    }
+
+    // A branch folded after SSA construction leaves the phi an input for an edge nothing takes any more
+    private bool StillReaches(ControlFlowBlock source, ControlFlowBlock target)
+    {
+        if (!_gimpleBlocksByControlFlowBlock.TryGetValue(source, out var block))
+            return true;
+        foreach (var successor in EnumerateOptimizedSuccessors(block))
+        {
+            if (ReferenceEquals(successor, target))
+                return true;
+        }
+        return false;
     }
 
     private bool RequiresEdgeSplitForCopies(ControlFlowBlock source, ControlFlowBlock target)
@@ -1616,6 +1632,7 @@ internal sealed class LirFunctionBuilder
     private void TranslateBaseBlocks()
     {
         CountSharedSymbols();
+        FindDivisionPairs();
         _symbolBases.Clear();
         foreach (var gimpleBlock in _function.Blocks)
         {
@@ -1760,7 +1777,7 @@ internal sealed class LirFunctionBuilder
             return;
         }
 
-        if (definition is not null && !IsGimpleNameUsed(definition.Name))
+        if (definition is not null && !IsGimpleNameUsed(definition.Name) || _answeredDivisions.Contains(instruction))
             return;
 
         var destination = definition is null ? null : GetRegister(definition.Name);
@@ -1892,12 +1909,124 @@ internal sealed class LirFunctionBuilder
             return LirOperand.Void;
 
         var result = GetResultRegister(assign.Lhs.Type, GetDefinitionValueNumber(instruction), destination);
-        Emit(block, LirInstructionKind.Binary, result, ImmutableArray.Create(left, right), address: null,
-            op: GimpleOperators.Spelling(assign.Subcode), conversionKind: null, callSignature: null, parallelCopies: default,
-            switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: assign,
-            sourceValue: assign.Op1, sourceInstruction: instruction, valueNumber: GetDefinitionValueNumber(instruction),
-            treeCode: assign.Subcode);
+        if (_divisionPartners.TryGetValue(instruction, out var partner))
+            EmitDivisionPair(block, instruction, left, right, result, partner);
+        else
+            EmitBinary(block, instruction, assign.Subcode, left, right, result, GetDefinitionValueNumber(instruction));
         return LirOperand.ForRegister(result);
+    }
+
+    private void EmitBinary(LirBlock block, GimpleStatementAnnotations instruction, GimpleTreeCode code, LirOperand left, LirOperand right,
+        LirVirtualRegister result, ValueNumber? valueNumber)
+    {
+        var assign = (GimpleAssignStatement)instruction.Statement;
+        Emit(block, LirInstructionKind.Binary, result, ImmutableArray.Create(left, right), address: null,
+            op: GimpleOperators.Spelling(code), conversionKind: null, callSignature: null, parallelCopies: default,
+            switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: assign,
+            sourceValue: assign.Op1, sourceInstruction: instruction, valueNumber: valueNumber, treeCode: code);
+    }
+
+    // x86 divides once for an adjacent quotient and remainder; elsewhere the remainder is a - q*b
+    private void EmitDivisionPair(LirBlock block, GimpleStatementAnnotations instruction, LirOperand left, LirOperand right,
+        LirVirtualRegister result, GimpleStatementAnnotations partner)
+    {
+        var partnerResult = GetRegister(GetPrimaryDefinition(partner)!.Name);
+        var quotientFirst = ((GimpleAssignStatement)instruction.Statement).Subcode == GimpleTreeCode.TruncDivExpr;
+        var (quotient, quotientSource) = quotientFirst ? (result, instruction) : (partnerResult, partner);
+        var (remainder, remainderSource) = quotientFirst ? (partnerResult, partner) : (result, instruction);
+        EmitBinary(block, quotientSource, GimpleTreeCode.TruncDivExpr, left, right, quotient, GetDefinitionValueNumber(quotientSource));
+        if (TargetRegisterInfo.IsX86(_target))
+        {
+            EmitBinary(block, remainderSource, GimpleTreeCode.TruncModExpr, left, right, remainder, GetDefinitionValueNumber(remainderSource));
+            return;
+        }
+
+        var product = NewVirtualRegister(remainder.Type, sourceName: null, valueNumber: null);
+        EmitBinary(block, remainderSource, GimpleTreeCode.MultExpr, LirOperand.ForRegister(quotient), right, product, valueNumber: null);
+        EmitBinary(block, remainderSource, GimpleTreeCode.MinusExpr, left, LirOperand.ForRegister(product), remainder,
+            GetDefinitionValueNumber(remainderSource));
+    }
+
+    private void FindDivisionPairs()
+    {
+        _divisionPartners.Clear();
+        _answeredDivisions.Clear();
+        if (_target.IsRegisterBytecode)
+            return;
+
+        var divisions = new Dictionary<(GimpleName Dividend, object Divisor), List<(GimpleStatementAnnotations Instruction, int Index)>>();
+        foreach (var gimpleBlock in _function.Blocks)
+        {
+            if (!_blocksByControlFlowBlock.ContainsKey(gimpleBlock.ControlFlowBlock))
+                continue;
+            for (var i = 0; i < gimpleBlock.Statements.Length; i++)
+            {
+                var instruction = gimpleBlock.Statements[i];
+                if (!TryGetDivisionKey(instruction, out var key))
+                    continue;
+                if (!divisions.TryGetValue(key, out var list))
+                    divisions.Add(key, list = new List<(GimpleStatementAnnotations, int)>());
+                list.Add((instruction, i));
+            }
+        }
+
+        foreach (var list in divisions.Values)
+        {
+            for (var i = 0; i < list.Count; i++)
+            {
+                for (var j = i + 1; j < list.Count; j++)
+                {
+                    var (first, firstIndex) = list[i];
+                    var (second, secondIndex) = list[j];
+                    var firstAssign = (GimpleAssignStatement)first.Statement;
+                    var secondAssign = (GimpleAssignStatement)second.Statement;
+                    if (IsPaired(first) || IsPaired(second) || firstAssign.Subcode == secondAssign.Subcode ||
+                        !SameType(firstAssign.Lhs.Type, secondAssign.Lhs.Type))
+                        continue;
+                    if (Precedes(first.Block, firstIndex, second.Block, secondIndex))
+                        Pair(first, second);
+                    else if (Precedes(second.Block, secondIndex, first.Block, firstIndex))
+                        Pair(second, first);
+                }
+            }
+        }
+    }
+
+    private bool IsPaired(GimpleStatementAnnotations instruction)
+        => _divisionPartners.ContainsKey(instruction) || _answeredDivisions.Contains(instruction);
+
+    private void Pair(GimpleStatementAnnotations earlier, GimpleStatementAnnotations later)
+    {
+        _divisionPartners.Add(earlier, later);
+        _answeredDivisions.Add(later);
+    }
+
+    private static bool Precedes(ControlFlowBlock block, int index, ControlFlowBlock other, int otherIndex)
+        => ReferenceEquals(block, other) ? index < otherIndex : block.Dominates(other);
+
+    private bool TryGetDivisionKey(GimpleStatementAnnotations instruction, out (GimpleName Dividend, object Divisor) key)
+    {
+        key = default;
+        if (instruction.Statement is not GimpleAssignStatement { RhsClass: GimpleRhsClass.Binary } assign ||
+            assign.Subcode is not (GimpleTreeCode.TruncDivExpr or GimpleTreeCode.TruncModExpr) ||
+            GetPrimaryDefinition(instruction) is not { } definition || !IsGimpleNameUsed(definition.Name) ||
+            instruction.Operands.Length != 2 || instruction.Operands[0].Name is not { } dividend ||
+            !GimpleTypes.IsIntegerLike(assign.Lhs.Type) || _target.SizeOf(assign.Lhs.Type) > _target.RegisterSize)
+            return false;
+
+        var divisor = instruction.Operands[1];
+        if (divisor.Name is { } name)
+        {
+            key = (dividend, name);
+            return true;
+        }
+        if (divisor.Original is not GimpleConstantValue constant || !ScalarEvolution.TryGetInteger(constant.Value, out var value))
+            return false;
+        var magnitude = value < 0 ? unchecked(0UL - (ulong)value) : (ulong)value;
+        if ((magnitude & (magnitude - 1)) == 0)
+            return false;
+        key = (dividend, value);
+        return true;
     }
 
     private void TranslateConstructor(

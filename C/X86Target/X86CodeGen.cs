@@ -302,8 +302,83 @@ public sealed class X86CodeGenerator
 
     private void Emit(X86Instruction instruction)
     {
+        if (!_machineTarget.Is64Bit && FindUnencodableByteRegister(instruction) is var legacy && legacy != X86Register.Invalid)
+        {
+            EmitThroughByteRegister(instruction, legacy);
+            return;
+        }
+
         RecordZeroExtension(instruction);
         _text.Emit(_options.PositionIndependentCode ? RelaxToRipRelative(instruction) : instruction);
+    }
+
+    // Without REX the byte forms of esp, ebp, esi and edi encode ah, ch, dh and bh
+    private static X86Register FindUnencodableByteRegister(X86Instruction instruction)
+    {
+        foreach (var operand in new[] { instruction.Operand0, instruction.Operand1, instruction.Operand2 })
+        {
+            if (operand.Kind == X86OperandKind.Register && operand.Size == 1 &&
+                X86Registers.IsGeneral(operand.Register) && X86Registers.Index(operand.Register) >= 4)
+            {
+                return operand.Register;
+            }
+        }
+
+        return X86Register.Invalid;
+    }
+
+    private void EmitThroughByteRegister(X86Instruction instruction, X86Register legacy)
+    {
+        var partner = X86Register.Invalid;
+        foreach (var candidate in new[] { X86Register.Rbx, X86Register.Rdx, X86Register.Rcx, X86Register.Rax })
+        {
+            if (!ReferencesRegister(instruction, candidate))
+            {
+                partner = candidate;
+                break;
+            }
+        }
+
+        if (partner == X86Register.Invalid)
+            throw new NotSupportedException($"No byte register is free to stand in for {legacy} in {instruction.Opcode}.");
+
+        Emit(X86Instruction.Binary(X86InstrKind.Xchg, Reg(partner, 4), Reg(legacy, 4)));
+        Emit(new X86Instruction(instruction.Opcode, Rename(instruction.Operand0, legacy, partner),
+            Rename(instruction.Operand1, legacy, partner), Rename(instruction.Operand2, legacy, partner),
+            instruction.Condition, instruction.RawBytes));
+        Emit(X86Instruction.Binary(X86InstrKind.Xchg, Reg(partner, 4), Reg(legacy, 4)));
+    }
+
+    private static bool ReferencesRegister(X86Instruction instruction, X86Register register)
+    {
+        foreach (var operand in new[] { instruction.Operand0, instruction.Operand1, instruction.Operand2 })
+        {
+            if (operand.Kind == X86OperandKind.Register && operand.Register == register)
+                return true;
+            if (operand.Kind == X86OperandKind.Memory && (operand.BaseRegister == register || operand.IndexRegister == register))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static X86Operand Rename(X86Operand operand, X86Register from, X86Register to)
+    {
+        if (operand.Kind == X86OperandKind.Register)
+            return operand.Register == from ? X86Operand.RegisterOperand(to, operand.Size) : operand;
+        if (operand.Kind != X86OperandKind.Memory || (operand.BaseRegister != from && operand.IndexRegister != from))
+            return operand;
+
+        return X86Operand.Memory(
+            operand.BaseRegister == from ? to : operand.BaseRegister,
+            operand.Displacement,
+            operand.Size,
+            operand.IndexRegister == from ? to : operand.IndexRegister,
+            operand.Scale,
+            operand.Symbol,
+            operand.RelocationKind,
+            operand.Addend,
+            operand.IsRipRelative);
     }
 
     /// <summary>Defines a label, which is also where control may arrive holding anything at all</summary>
@@ -771,6 +846,7 @@ public sealed class X86CodeGenerator
         var offset = section.ByteLength;
         section.EmitZero(_target.PointerSize);
         section.AddRelocation(offset, symbol, addend, _target.PointerSize == 8 ? X86ObjectRelocationKind.Absolute64 : X86ObjectRelocationKind.Absolute32);
+        _text.Reference(symbol);
     }
 
     private string GetSymbolLabel(Symbol symbol)
@@ -3939,6 +4015,20 @@ public sealed class X86CodeGenerator
             if (IsLongDouble(result.Type) || IsLongDouble(source.Type))
                 throw Unsupported(instruction, "x86 backend does not support long double code generation.");
 
+            if (IsFloatType(result.Type) && IsX86WideInteger(source.Type))
+            {
+                var wideDestination = GetWritableRegister(result, FpScratch0);
+                EmitWideIntegerToFloating(source, wideDestination, result.Type, instruction);
+                StoreWritableRegisterIfSpilled(result, wideDestination);
+                return;
+            }
+
+            if (IsFloatType(source.Type) && IsX86WideInteger(result.Type))
+            {
+                EmitFloatingToWideInteger(LoadFloatingOperand(source, FpScratch0, instruction), source.Type, result, instruction);
+                return;
+            }
+
             if (IsFloatType(result.Type))
             {
                 var writable = GetWritableRegister(result, FpScratch0);
@@ -3972,6 +4062,135 @@ public sealed class X86CodeGenerator
             }
 
             EmitValueCopy(result, source, instruction);
+        }
+
+        private void EmitWideIntegerToFloating(LirOperand operand, X86Register destination, QualifiedType destinationType, LirInstruction instruction)
+        {
+            var doubleType = TypeCatalog.Instance.Builtin(BuiltinTypeKind.Double);
+            LoadWideIntegerOperand(operand, X86Register.Rax, X86Register.Rdx, instruction);
+            Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rcx, 4), Reg(X86Register.Rax, 4)));
+            if (IsUnsignedIntegerType(operand.Type))
+                EmitUnsignedWordToDouble(X86Register.Rdx, destination);
+            else
+                Emit(X86Instruction.Binary(X86InstrKind.Cvtsi2sd, Reg(destination, 8), Reg(X86Register.Rdx, 4)));
+            LoadFloatingImmediate(FpScratch1, 4294967296.0, doubleType);
+            Emit(X86Instruction.Binary(X86InstrKind.Mulsd, Reg(destination, 8), Reg(FpScratch1, 8)));
+            EmitUnsignedWordToDouble(X86Register.Rcx, FpScratch1);
+            Emit(X86Instruction.Binary(X86InstrKind.Addsd, Reg(destination, 8), Reg(FpScratch1, 8)));
+            if (IsFloat32(destinationType))
+                Emit(X86Instruction.Binary(X86InstrKind.Cvtsd2ss, Reg(destination, 4), Reg(destination, 8)));
+        }
+
+        private void EmitUnsignedWordToDouble(X86Register word, X86Register destination)
+        {
+            Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(word, 4), Imm(unchecked((int)0x80000000))));
+            Emit(X86Instruction.Binary(X86InstrKind.Cvtsi2sd, Reg(destination, 8), Reg(word, 4)));
+            LoadFloatingImmediate(BlockCopyScratch, 2147483648.0, TypeCatalog.Instance.Builtin(BuiltinTypeKind.Double));
+            Emit(X86Instruction.Binary(X86InstrKind.Addsd, Reg(destination, 8), Reg(BlockCopyScratch, 8)));
+        }
+
+        private void EmitFloatingToWideInteger(X86Register source, QualifiedType sourceType, LirVirtualRegister result, LirInstruction instruction)
+        {
+            var doubleType = TypeCatalog.Instance.Builtin(BuiltinTypeKind.Double);
+            EmitFloatingPrecisionMove(FpScratch0, source, sourceType, doubleType);
+            Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rcx, 4), Reg(X86Register.Rcx, 4)));
+            if (!IsUnsignedIntegerType(result.Type))
+            {
+                var positive = _owner.CreateLocalLabel(_functionLabel + "_f2i64_positive");
+                EmitFloatingZero(FpScratch1, doubleType);
+                Emit(X86Instruction.Binary(X86InstrKind.Ucomisd, Reg(FpScratch0, 8), Reg(FpScratch1, 8)));
+                Emit(X86Instruction.ConditionalBranch(X86Condition.Ae, X86Operand.SymbolOperand(positive, 4, X86ObjectRelocationKind.Relative32)));
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rcx, 4), Imm(1)));
+                Emit(X86Instruction.Binary(X86InstrKind.Subsd, Reg(FpScratch1, 8), Reg(FpScratch0, 8)));
+                EmitFloatingMove(FpScratch0, FpScratch1, doubleType);
+                _owner.DefineLabel(positive);
+            }
+
+            LoadFloatingImmediate(FpScratch1, 1.0 / 4294967296.0, doubleType);
+            Emit(X86Instruction.Binary(X86InstrKind.Mulsd, Reg(FpScratch1, 8), Reg(FpScratch0, 8)));
+            EmitTruncateToUnsignedWord(FpScratch1, X86Register.Rax);
+            Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rdx, 4), Reg(X86Register.Rax, 4)));
+            EmitUnsignedWordToDouble(X86Register.Rdx, FpScratch1);
+            LoadFloatingImmediate(BlockCopyScratch, 4294967296.0, doubleType);
+            Emit(X86Instruction.Binary(X86InstrKind.Mulsd, Reg(FpScratch1, 8), Reg(BlockCopyScratch, 8)));
+            Emit(X86Instruction.Binary(X86InstrKind.Subsd, Reg(FpScratch0, 8), Reg(FpScratch1, 8)));
+            EmitTruncateToUnsignedWord(FpScratch0, X86Register.Rdx);
+            Emit(X86Instruction.Binary(X86InstrKind.Xchg, Reg(X86Register.Rax, 4), Reg(X86Register.Rdx, 4)));
+
+            var done = _owner.CreateLocalLabel(_functionLabel + "_f2i64_done");
+            Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(X86Register.Rcx, 4), Reg(X86Register.Rcx, 4)));
+            Emit(X86Instruction.ConditionalBranch(X86Condition.E, X86Operand.SymbolOperand(done, 4, X86ObjectRelocationKind.Relative32)));
+            Emit(X86Instruction.Unary(X86InstrKind.Neg, Reg(X86Register.Rax, 4)));
+            Emit(X86Instruction.Binary(X86InstrKind.Adc, Reg(X86Register.Rdx, 4), Imm(0)));
+            Emit(X86Instruction.Unary(X86InstrKind.Neg, Reg(X86Register.Rdx, 4)));
+            _owner.DefineLabel(done);
+            StoreWideIntegerResult(result, X86Register.Rax, X86Register.Rdx);
+        }
+
+        private void EmitTruncateToUnsigned64(X86Register destination)
+        {
+            var doubleType = TypeCatalog.Instance.Builtin(BuiltinTypeKind.Double);
+            var large = _owner.CreateLocalLabel(_functionLabel + "_f2u64_large");
+            var done = _owner.CreateLocalLabel(_functionLabel + "_f2u64_done");
+            LoadFloatingImmediate(FpScratch1, 9223372036854775808.0, doubleType);
+            Emit(X86Instruction.Binary(X86InstrKind.Ucomisd, Reg(BlockCopyScratch, 8), Reg(FpScratch1, 8)));
+            Emit(X86Instruction.ConditionalBranch(X86Condition.Ae, X86Operand.SymbolOperand(large, 4, X86ObjectRelocationKind.Relative32)));
+            Emit(X86Instruction.Binary(X86InstrKind.Cvttsd2si, Reg(destination, 8), Reg(BlockCopyScratch, 8)));
+            Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(done, 4, X86ObjectRelocationKind.Relative32)));
+            _owner.DefineLabel(large);
+            Emit(X86Instruction.Binary(X86InstrKind.Subsd, Reg(BlockCopyScratch, 8), Reg(FpScratch1, 8)));
+            Emit(X86Instruction.Binary(X86InstrKind.Cvttsd2si, Reg(destination, 8), Reg(BlockCopyScratch, 8)));
+            var bit = destination == Scratch1 ? Scratch0 : Scratch1;
+            Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(bit, 8), Imm(long.MinValue)));
+            Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(destination, 8), Reg(bit, 8)));
+            _owner.DefineLabel(done);
+        }
+
+        // Halving keeps the low bit so the single rounding in cvtsi2sd still lands where the full value would
+        private void EmitUnsigned64ToFloating(LirOperand operand, X86Register destination, QualifiedType destinationType, LirInstruction instruction)
+        {
+            if (!_owner._machineTarget.Is64Bit)
+            {
+                EmitWideIntegerToFloating(operand, destination, destinationType, instruction);
+                return;
+            }
+
+            var convert = IsFloat32(destinationType) ? X86InstrKind.Cvtsi2ss : X86InstrKind.Cvtsi2sd;
+            var add = IsFloat32(destinationType) ? X86InstrKind.Addss : X86InstrKind.Addsd;
+            var size = FloatingStorageSize(destinationType);
+            var large = _owner.CreateLocalLabel(_functionLabel + "_u64f_large");
+            var done = _owner.CreateLocalLabel(_functionLabel + "_u64f_done");
+            LoadOperandInto(operand, Scratch0, instruction, 8);
+            Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(Scratch0, 8), Reg(Scratch0, 8)));
+            Emit(X86Instruction.ConditionalBranch(X86Condition.S, X86Operand.SymbolOperand(large, 4, X86ObjectRelocationKind.Relative32)));
+            Emit(X86Instruction.Binary(convert, Reg(destination, size), Reg(Scratch0, 8)));
+            Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(done, 4, X86ObjectRelocationKind.Relative32)));
+            _owner.DefineLabel(large);
+            MoveRegister(Scratch1, Scratch0, 8);
+            Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(Scratch1, 8), Imm(1)));
+            Emit(X86Instruction.Binary(X86InstrKind.And, Reg(Scratch0, 8), Imm(1)));
+            Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(Scratch1, 8), Reg(Scratch0, 8)));
+            Emit(X86Instruction.Binary(convert, Reg(destination, size), Reg(Scratch1, 8)));
+            Emit(X86Instruction.Binary(add, Reg(destination, size), Reg(destination, size)));
+            _owner.DefineLabel(done);
+        }
+
+        // cvttsd2si rounds toward zero, which is floor only while the value is not negative
+        private void EmitTruncateToUnsignedWord(X86Register value, X86Register destination)
+        {
+            var doubleType = TypeCatalog.Instance.Builtin(BuiltinTypeKind.Double);
+            var large = _owner.CreateLocalLabel(_functionLabel + "_f2u32_large");
+            var done = _owner.CreateLocalLabel(_functionLabel + "_f2u32_done");
+            LoadFloatingImmediate(BlockCopyScratch, 2147483648.0, doubleType);
+            Emit(X86Instruction.Binary(X86InstrKind.Ucomisd, Reg(value, 8), Reg(BlockCopyScratch, 8)));
+            Emit(X86Instruction.ConditionalBranch(X86Condition.Ae, X86Operand.SymbolOperand(large, 4, X86ObjectRelocationKind.Relative32)));
+            Emit(X86Instruction.Binary(X86InstrKind.Cvttsd2si, Reg(destination, 4), Reg(value, 8)));
+            Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(done, 4, X86ObjectRelocationKind.Relative32)));
+            _owner.DefineLabel(large);
+            Emit(X86Instruction.Binary(X86InstrKind.Subsd, Reg(value, 8), Reg(BlockCopyScratch, 8)));
+            Emit(X86Instruction.Binary(X86InstrKind.Cvttsd2si, Reg(destination, 4), Reg(value, 8)));
+            Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(destination, 4), Imm(unchecked((int)0x80000000))));
+            _owner.DefineLabel(done);
         }
 
         private X86Register LoadFloatingOperand(LirOperand operand, X86Register scratch, LirInstruction instruction)
@@ -4033,12 +4252,19 @@ public sealed class X86CodeGenerator
             if (isUnsigned && sourceSize == 4)
             {
                 if (_wordSize < 8)
-                    throw Unsupported(instruction, "x86 unsigned 32-bit integer to floating-point conversion requires 64-bit integer registers.");
+                {
+                    LoadOperandInto(operand, Scratch0, instruction, 4);
+                    EmitUnsignedWordToDouble(Scratch0, destination);
+                    if (IsFloat32(destinationType))
+                        Emit(X86Instruction.Binary(X86InstrKind.Cvtsd2ss, Reg(destination, 4), Reg(destination, 8)));
+                    return;
+                }
                 convertSize = 8;
             }
             else if (isUnsigned && sourceSize >= 8)
             {
-                throw Unsupported(instruction, "Unsigned 64-bit integer to floating-point conversion is not implemented.");
+                EmitUnsigned64ToFloating(operand, destination, destinationType, instruction);
+                return;
             }
 
             LoadOperandInto(operand, Scratch0, instruction, convertSize);
@@ -4060,7 +4286,23 @@ public sealed class X86CodeGenerator
             if (convertSize > _wordSize)
                 throw Unsupported(instruction, "Floating-point conversion target does not fit a native integer register.");
             if ((IsUnsignedIntegerType(destinationType) || IsPointerLike(destinationType)) && SizeOfStorage(destinationType) >= 4)
-                throw Unsupported(instruction, "Floating-point to unsigned 32/64-bit conversion is not implemented by X86CodeGenerator.");
+            {
+                var doubleType = TypeCatalog.Instance.Builtin(BuiltinTypeKind.Double);
+                if (!_owner._machineTarget.Is64Bit)
+                {
+                    EmitFloatingPrecisionMove(FpScratch1, source, sourceType, doubleType);
+                    EmitTruncateToUnsignedWord(FpScratch1, destination);
+                    return;
+                }
+                EmitFloatingPrecisionMove(BlockCopyScratch, source, sourceType, doubleType);
+                if (SizeOfStorage(destinationType) == 4)
+                {
+                    Emit(X86Instruction.Binary(X86InstrKind.Cvttsd2si, Reg(destination, 8), Reg(BlockCopyScratch, 8)));
+                    return;
+                }
+                EmitTruncateToUnsigned64(destination);
+                return;
+            }
 
             Emit(X86Instruction.Binary(IsFloat32(sourceType)
                 ? X86InstrKind.Cvttss2si
@@ -4157,7 +4399,15 @@ public sealed class X86CodeGenerator
             => Emit(X86Instruction.Binary(FloatingXorOpcode(type), Reg(destination, 16), Reg(destination, 16)));
 
         private void LoadFloatingImmediate(X86Register destination, object? value, QualifiedType type)
-            => EmitFloatingLoad(destination, LiteralOperand(_owner.CreateFloatingLiteral(type, value), type), type);
+        {
+            var positiveZero = IsFloat32(type)
+                ? BitConverter.SingleToInt32Bits(Convert.ToSingle(value, CultureInfo.InvariantCulture)) == 0
+                : BitConverter.DoubleToInt64Bits(Convert.ToDouble(value, CultureInfo.InvariantCulture)) == 0;
+            if (positiveZero)
+                EmitFloatingZero(destination, type);
+            else
+                EmitFloatingLoad(destination, LiteralOperand(_owner.CreateFloatingLiteral(type, value), type), type);
+        }
 
         private void EmitFloatingNegate(X86Register destination, QualifiedType type)
         {
@@ -4781,10 +5031,13 @@ public sealed class X86CodeGenerator
         {
             if (IsFloatType(operand.Type) && !RequiresBlockCopyStorage(operand.Type))
             {
-                var fpArgumentSource = LoadFloatingOperand(operand, FpScratch0, instruction);
+                // xmm0 may already carry an earlier argument, so no argument is staged through it
+                var fpDestination = location.Kind == AbiLocationKind.Register
+                    ? ToX86Register(location.Register, _owner._machineTarget)
+                    : BlockCopyScratch;
+                var fpArgumentSource = LoadFloatingOperand(operand, fpDestination, instruction);
                 if (location.Kind == AbiLocationKind.Register)
                 {
-                    var fpDestination = ToX86Register(location.Register, _owner._machineTarget);
                     EmitFloatingMove(fpDestination, fpArgumentSource, operand.Type);
                     DuplicateWindowsX64VariadicFloatingArgument(operand, fpDestination, location, isVariadicUnnamed, instruction);
                     return;
@@ -6377,7 +6630,7 @@ public sealed class X86CodeGenerator
         }
 
         private bool RequiresBlockCopyStorage(QualifiedType type)
-            => IsAggregateType(type) || (!IsPointerLike(type) && SizeOfStorage(type) > _wordSize);
+            => IsAggregateType(type) || (!IsPointerLike(type) && !(IsFloatType(type) && !IsLongDouble(type)) && SizeOfStorage(type) > _wordSize);
 
         private static X86Operand Reg(X86Register register, int size)
             => X86Operand.RegisterOperand(register, Math.Max(1, size));
@@ -6531,6 +6784,7 @@ public sealed class X86CodeGenerator
         private readonly X86Target _target;
         private readonly X86InstructionBuilder _builder;
         private readonly List<X86ObjectRelocation> _relocations = new List<X86ObjectRelocation>();
+        private readonly HashSet<string> _referenced = new HashSet<string>(StringComparer.Ordinal);
 
         public string Name { get; }
         public int ByteLength => _builder.Position;
@@ -6549,7 +6803,21 @@ public sealed class X86CodeGenerator
             => _builder.DefineLabel(label);
 
         public void Emit(X86Instruction instruction)
-            => _builder.Emit(instruction);
+        {
+            Reference(instruction.Operand0);
+            Reference(instruction.Operand1);
+            Reference(instruction.Operand2);
+            _builder.Emit(instruction);
+        }
+
+        public void Reference(string symbol)
+            => _referenced.Add(symbol);
+
+        private void Reference(X86Operand operand)
+        {
+            if (operand.HasSymbol)
+                _referenced.Add(operand.Symbol!);
+        }
 
         public void EmitAssembly(string text, string labelPrefix)
         {
@@ -6575,7 +6843,7 @@ public sealed class X86CodeGenerator
             {
                 DefineInlineLabels(labelsByOffset, offset);
                 var rewritten = RewriteInlineLabelReferences(instruction, renamedLabels);
-                _builder.Emit(rewritten);
+                Emit(rewritten);
                 offset = checked(offset + X86CodeEncoder.GetEncodedLength(instruction, _target));
             }
 
@@ -6611,13 +6879,20 @@ public sealed class X86CodeGenerator
         }
 
         public void AddRelocation(int offset, string symbol, long addend, X86ObjectRelocationKind kind)
-            => _relocations.Add(new X86ObjectRelocation(Name, offset, symbol, addend, kind));
+        {
+            _relocations.Add(new X86ObjectRelocation(Name, offset, symbol, addend, kind));
+            _referenced.Add(symbol);
+        }
 
         public X86TextSection ToSection()
         {
             var section = _builder.ToTextSection();
-            return new X86TextSection(section.Instructions, section.Labels, _relocations.ToImmutableArray());
+            var labels = section.Labels.RemoveRange(section.Labels.Keys.Where(IsUnreferenced));
+            return new X86TextSection(section.Instructions, labels, _relocations.ToImmutableArray());
         }
+
+        private bool IsUnreferenced(string label)
+            => label.StartsWith(".L", StringComparison.Ordinal) && !_referenced.Contains(label);
     }
 
     private sealed class DataSectionBuilder

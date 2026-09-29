@@ -33,8 +33,8 @@ kernel_boot_hang:
 
 supervisor_trap_vector:
     csrrw sp, sscratch, sp
-    addi sp, sp, -1184
-    addi sp, sp, -1184
+    addi sp, sp, -1320
+    addi sp, sp, -1320
     sd x0, 0(sp)
     sd x1, 8(sp)
     sd x5, 40(sp)
@@ -82,6 +82,8 @@ supervisor_trap_vector:
     sd t1, 296(sp)
     csrrs t1, vstart, zero
     sd t1, 304(sp)
+    csrrs t1, vcsr, zero
+    sd t1, 312(sp)
     csrrs t2, vlenb, zero
     slli t2, t2, 3
     addi t3, sp, 320
@@ -93,6 +95,42 @@ supervisor_trap_vector:
     vse8.v v16, (t3)
     add t3, t3, t2
     vse8.v v24, (t3)
+    addi t3, sp, 2047
+    addi t3, t3, 321
+    fsd f0, 0(t3)
+    fsd f1, 8(t3)
+    fsd f2, 16(t3)
+    fsd f3, 24(t3)
+    fsd f4, 32(t3)
+    fsd f5, 40(t3)
+    fsd f6, 48(t3)
+    fsd f7, 56(t3)
+    fsd f8, 64(t3)
+    fsd f9, 72(t3)
+    fsd f10, 80(t3)
+    fsd f11, 88(t3)
+    fsd f12, 96(t3)
+    fsd f13, 104(t3)
+    fsd f14, 112(t3)
+    fsd f15, 120(t3)
+    fsd f16, 128(t3)
+    fsd f17, 136(t3)
+    fsd f18, 144(t3)
+    fsd f19, 152(t3)
+    fsd f20, 160(t3)
+    fsd f21, 168(t3)
+    fsd f22, 176(t3)
+    fsd f23, 184(t3)
+    fsd f24, 192(t3)
+    fsd f25, 200(t3)
+    fsd f26, 208(t3)
+    fsd f27, 216(t3)
+    fsd f28, 224(t3)
+    fsd f29, 232(t3)
+    fsd f30, 240(t3)
+    fsd f31, 248(t3)
+    csrrs t1, fcsr, zero
+    sd t1, 256(t3)
     mv a0, sp
     li t0, ${ZKERNEL_TRAP_DISPATCH_ADDRESS}
     jalr ra, t0, 0
@@ -116,6 +154,44 @@ supervisor_trap_vector:
     vsetvl zero, t2, t1
     ld t1, 304(sp)
     csrrw zero, vstart, t1
+    ld t1, 312(sp)
+    csrrw zero, vcsr, t1
+    addi t3, sp, 2047
+    addi t3, t3, 321
+    fld f0, 0(t3)
+    fld f1, 8(t3)
+    fld f2, 16(t3)
+    fld f3, 24(t3)
+    fld f4, 32(t3)
+    fld f5, 40(t3)
+    fld f6, 48(t3)
+    fld f7, 56(t3)
+    fld f8, 64(t3)
+    fld f9, 72(t3)
+    fld f10, 80(t3)
+    fld f11, 88(t3)
+    fld f12, 96(t3)
+    fld f13, 104(t3)
+    fld f14, 112(t3)
+    fld f15, 120(t3)
+    fld f16, 128(t3)
+    fld f17, 136(t3)
+    fld f18, 144(t3)
+    fld f19, 152(t3)
+    fld f20, 160(t3)
+    fld f21, 168(t3)
+    fld f22, 176(t3)
+    fld f23, 184(t3)
+    fld f24, 192(t3)
+    fld f25, 200(t3)
+    fld f26, 208(t3)
+    fld f27, 216(t3)
+    fld f28, 224(t3)
+    fld f29, 232(t3)
+    fld f30, 240(t3)
+    fld f31, 248(t3)
+    ld t1, 256(t3)
+    csrrw zero, fcsr, t1
     ld x1, 8(sp)
     ld x3, 24(sp)
     ld x4, 32(sp)
@@ -143,8 +219,8 @@ supervisor_trap_vector:
     ld x29, 232(sp)
     ld x30, 240(sp)
     ld x31, 248(sp)
-    addi x5, sp, 1184
-    addi x5, x5, 1184
+    addi x5, sp, 1320
+    addi x5, x5, 1320
     csrrw zero, sscratch, x5
     ld x5, 40(sp)
     ld x6, 48(sp)

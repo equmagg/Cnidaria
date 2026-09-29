@@ -1,6 +1,7 @@
 typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
+typedef signed int s32;
 typedef unsigned long long u64;
 typedef signed long long s64;
 typedef unsigned long usize;
@@ -74,9 +75,25 @@ u64 __riscv_vsetvlmax_e8m8(void);
 #define SYS_SET_TID_ADDRESS 96ul
 #define SYS_SET_ROBUST_LIST 99ul
 #define SYS_NANOSLEEP 101ul
+#define SYS_GETITIMER 102ul
+#define SYS_SETITIMER 103ul
 #define SYS_SCHED_YIELD 124ul
+#define SYS_RESTART_SYSCALL 128ul
+#define SYS_KILL 129ul
+#define SYS_TKILL 130ul
+#define SYS_TGKILL 131ul
+#define SYS_SIGALTSTACK 132ul
+#define SYS_RT_SIGSUSPEND 133ul
 #define SYS_RT_SIGACTION 134ul
 #define SYS_RT_SIGPROCMASK 135ul
+#define SYS_RT_SIGPENDING 136ul
+#define SYS_RT_SIGTIMEDWAIT 137ul
+#define SYS_RT_SIGQUEUEINFO 138ul
+#define SYS_RT_SIGRETURN 139ul
+#define SYS_SETPGID 154ul
+#define SYS_GETPGID 155ul
+#define SYS_GETSID 156ul
+#define SYS_SETSID 157ul
 #define SYS_REBOOT 142ul
 #define SYS_UNAME 160ul
 #define LINUX_REBOOT_MAGIC1 0xfee1deadul
@@ -114,8 +131,9 @@ u64 __riscv_vsetvlmax_e8m8(void);
 #define AT_BASE 7ul
 #define AT_HOST_BRIDGE 0x1000ul
 #define AT_FRAMEBUFFER 0x1001ul
+#define AT_MINSIGSTKSZ 51ul
 #define MAX_OPEN_FILES 32u
-#define PATH_BUFFER_SIZE 128u
+#define PATH_BUFFER_SIZE 1024u
 #define VFS_NODE_NONE 0u
 #define VFS_NODE_CONSOLE 1u
 #define VFS_NODE_NULL 2u
@@ -124,7 +142,12 @@ u64 __riscv_vsetvlmax_e8m8(void);
 #define VFS_NODE_ROOT_DIR 5u
 #define VFS_NODE_DEV_DIR 6u
 #define VFS_NODE_FAT_DIR 7u
+#define VFS_NODE_CURRENT_TTY 8u
 #define FAT_ATTRIBUTE_DIRECTORY 16u
+#define FAT_ATTRIBUTE_VOLUME 8u
+#define FAT_ATTRIBUTE_LONG_NAME 15u
+#define FAT_NAME_MAX 255u
+#define FAT_NAME_BYTES 768u
 #define O_ACCMODE 3ul
 #define O_RDONLY 0ul
 #define O_WRONLY 1ul
@@ -137,6 +160,7 @@ u64 __riscv_vsetvlmax_e8m8(void);
 #define SYS_CHDIR 49ul
 #define AT_REMOVEDIR 0x200ul
 #define O_RDWR 2ul
+#define O_NOCTTY 256ul
 #define O_NONBLOCK 2048ul
 #define AT_FDCWD ((u64)-100l)
 #define AT_EMPTY_PATH 0x1000ul
@@ -155,11 +179,69 @@ u64 __riscv_vsetvlmax_e8m8(void);
 #define MAP_PRIVATE 2ul
 #define MAP_FIXED 16ul
 #define MAP_ANONYMOUS 32ul
-#define TIOCGWINSZ 0x5413ul
 #define TCGETS 0x5401ul
 #define TCSETS 0x5402ul
 #define TCSETSW 0x5403ul
 #define TCSETSF 0x5404ul
+#define TCSBRK 0x5409ul
+#define TCXONC 0x540aul
+#define TCFLSH 0x540bul
+#define TIOCSCTTY 0x540eul
+#define TIOCGPGRP 0x540ful
+#define TIOCSPGRP 0x5410ul
+#define TIOCOUTQ 0x5411ul
+#define TIOCGWINSZ 0x5413ul
+#define TIOCSWINSZ 0x5414ul
+#define FIONREAD 0x541bul
+#define FIONBIO 0x5421ul
+#define TIOCNOTTY 0x5422ul
+#define TCSBRKP 0x5425ul
+#define TIOCGSID 0x5429ul
+#define TTY_NCCS 19u
+#define TTY_TERMIOS_SIZE 36u
+#define TTY_BUFFER_SIZE 4096u
+#define TTY_MARK_LINE 1u
+#define TTY_MARK_EOF 2u
+#define TTY_VINTR 0u
+#define TTY_VQUIT 1u
+#define TTY_VERASE 2u
+#define TTY_VKILL 3u
+#define TTY_VEOF 4u
+#define TTY_VTIME 5u
+#define TTY_VMIN 6u
+#define TTY_VSTART 8u
+#define TTY_VSTOP 9u
+#define TTY_VSUSP 10u
+#define TTY_VEOL 11u
+#define TTY_VREPRINT 12u
+#define TTY_VDISCARD 13u
+#define TTY_VWERASE 14u
+#define TTY_VLNEXT 15u
+#define TTY_VEOL2 16u
+#define TTY_ISTRIP 0x20u
+#define TTY_INLCR 0x40u
+#define TTY_IGNCR 0x80u
+#define TTY_ICRNL 0x100u
+#define TTY_IXON 0x400u
+#define TTY_IUTF8 0x4000u
+#define TTY_OPOST 1u
+#define TTY_ONLCR 4u
+#define TTY_OCRNL 8u
+#define TTY_B38400 0xfu
+#define TTY_CS8 0x30u
+#define TTY_CREAD 0x80u
+#define TTY_HUPCL 0x400u
+#define TTY_ISIG 1u
+#define TTY_ICANON 2u
+#define TTY_ECHO 8u
+#define TTY_ECHOE 0x10u
+#define TTY_ECHOK 0x20u
+#define TTY_ECHONL 0x40u
+#define TTY_NOFLSH 0x80u
+#define TTY_TOSTOP 0x100u
+#define TTY_ECHOCTL 0x200u
+#define TTY_ECHOKE 0x800u
+#define TTY_IEXTEN 0x8000u
 #define MAX_PROCESSES 16u
 #define TRAP_FRAME_VECTOR_WORDS 256u
 #define MAX_VECTOR_REGISTER_BYTES 64u
@@ -172,7 +254,17 @@ u64 __riscv_vsetvlmax_e8m8(void);
 #define PROC_WAITING 3u
 #define PROC_ZOMBIE 4u
 #define PROC_VFORK 5u
+#define PROC_STOPPED 6u
+#define SLEEP_NONE 0u
+#define SLEEP_CHILD 1u
+#define SLEEP_SIGNAL 2u
+#define SLEEP_TIMER 3u
+#define SLEEP_CONSOLE 4u
+#define SLEEP_SIGWAIT 5u
+#define STOP_REPORT_STOPPED 1u
+#define STOP_REPORT_CONTINUED 2u
 #define DEFAULT_TIME_SLICE 4u
+#define DEFAULT_TIMEBASE 10000000ul
 #define TIMER_INTERVAL 50000ul
 #define CLINT_MTIME_OFFSET 0xbff8ul
 #define SIE_STIE 32ul
@@ -180,12 +272,82 @@ u64 __riscv_vsetvlmax_e8m8(void);
 #define SSTATUS_SPIE 32ul
 #define SSTATUS_SPP 256ul
 #define SSTATUS_VS 0x600ul
+#define SSTATUS_VS_INITIAL 0x200ul
 #define WNOHANG 1ul
-#define SIGCHLD 17ul
+#define WUNTRACED 2ul
+#define WCONTINUED 8ul
+#define WAIT_THREAD_OPTIONS 0xe0000000ul
+#define SIGHUP 1ul
+#define SIGINT 2ul
+#define SIGQUIT 3ul
 #define SIGILL 4ul
 #define SIGTRAP 5ul
 #define SIGBUS 7ul
+#define SIGKILL 9ul
 #define SIGSEGV 11ul
+#define SIGALRM 14ul
+#define SIGCHLD 17ul
+#define SIGCONT 18ul
+#define SIGSTOP 19ul
+#define SIGTSTP 20ul
+#define SIGTTIN 21ul
+#define SIGTTOU 22ul
+#define SIGWINCH 28ul
+#define SIGVTALRM 26ul
+#define SIGPROF 27ul
+#define SIGRTMIN 32ul
+#define SIGNAL_COUNT 64ul
+#define SIGNAL_QUEUE_SIZE 64u
+#define SIGNAL_RT_QUEUE_LIMIT 32u
+#define SIGNAL_UNBLOCKABLE 0x00040100ul
+#define SIGNAL_STOP_MASK 0x003c0000ul
+#define SIGNAL_IGNORE_MASK 0x08430000ul
+#define SIGNAL_SYNCHRONOUS_MASK 0x400004d8ul
+#define SIG_DFL 0ul
+#define SIG_IGN 1ul
+#define SA_NOCLDSTOP 1ul
+#define SA_NOCLDWAIT 2ul
+#define SA_ONSTACK 0x08000000ul
+#define SA_RESTART 0x10000000ul
+#define SA_NODEFER 0x40000000ul
+#define SA_RESETHAND 0x80000000ul
+#define SIG_BLOCK 0ul
+#define SIG_UNBLOCK 1ul
+#define SIG_SETMASK 2ul
+#define SS_ONSTACK 1u
+#define SS_DISABLE 2u
+#define SS_AUTODISARM 0x80000000u
+#define MINSIGSTKSZ 2048ul
+#define SI_USER 0
+#define SI_KERNEL 0x80
+#define SI_TKILL (-6)
+#define CLD_EXITED 1
+#define CLD_KILLED 2
+#define CLD_STOPPED 5
+#define CLD_CONTINUED 6
+#define SEGV_MAPERR 1
+#define SEGV_ACCERR 2
+#define BUS_ADRALN 1
+#define ILL_ILLOPC 1
+#define ILL_ILLTRP 4
+#define TRAP_BRKPT 1
+#define EINTR 4l
+#define EAGAIN 11l
+#define ERESTARTSYS 512l
+#define ERESTARTNOINTR 513l
+#define ERESTARTNOHAND 514l
+#define ERESTART_RESTARTBLOCK 516l
+#define ITIMER_REAL 0ul
+#define ITIMER_VIRTUAL 1ul
+#define ITIMER_PROF 2ul
+#define USER_SIGRETURN_BASE 0x2D00000000ul
+#define SIGFRAME_SIZE 1088ul
+#define SIGFRAME_UCONTEXT 128ul
+#define SIGFRAME_MCONTEXT 304ul
+#define SIGFRAME_FP 560ul
+#define SIGFRAME_EXTENSION 1080ul
+#define SIGFRAME_VECTOR_STATE 56ul
+#define RISCV_V_MAGIC 0x53465457u
 #define CLONE_VM 0x00000100ul
 #define CLONE_FS 0x00000200ul
 #define CLONE_FILES 0x00000400ul
@@ -207,8 +369,10 @@ struct trap_frame
     u64 vtype;
     u64 vl;
     u64 vstart;
-    u64 vreserved;
+    u64 vcsr;
     u64 v[TRAP_FRAME_VECTOR_WORDS];
+    u64 f[32];
+    u64 fcsr;
 };
 
 struct boot_device
@@ -221,6 +385,7 @@ struct boot_device
     u64 framebuffer_base;
     u64 framebuffer_size;
     u64 framebuffer_window;
+    u64 timebase;
 };
 
 struct fat32_volume
@@ -288,6 +453,8 @@ struct vfs_node
     u32 mode;
     u32 entry_lba;
     u32 entry_offset;
+    u32 slot_first;
+    u32 slot_entry;
 };
 
 struct file_descriptor
@@ -302,10 +469,10 @@ struct path_result
 {
     struct vfs_node parent;
     struct vfs_node node;
-    char leaf[11];
+    const char* leaf;
+    u32 leaf_length;
     u32 has_parent;
     u32 has_node;
-    u32 leaf_valid;
 };
 
 struct vm_region
@@ -317,16 +484,67 @@ struct vm_region
     u32 used;
 };
 
+struct signal_action
+{
+    u64 handler;
+    u64 flags;
+    u64 mask;
+};
+
+struct signal_entry
+{
+    u32 signo;
+    s32 code;
+    u32 pid;
+    u32 uid;
+    u64 value;
+    s32 status;
+    u32 reserved;
+};
+
 struct process
 {
     u32 used;
     u32 state;
     u32 pid;
     u32 ppid;
+    u32 pgid;
+    u32 sid;
     u32 exit_status;
     u32 exit_signal;
+    u32 child_signal;
+    u32 did_exec;
     u32 time_slice;
     u32 vfork_parent_pid;
+    u32 sleep_reason;
+    u32 wait_options;
+    u32 stop_signal;
+    u32 stop_report;
+    u32 signal_queue_count;
+    u32 signal_restore_mask;
+    u32 altstack_flags;
+    u32 restart_pending;
+    u32 ctty;
+    u32 tty_timed_out;
+    u64 signal_blocked;
+    u64 signal_pending;
+    u64 signal_saved_blocked;
+    u64 orig_a0;
+    u64 sleep_deadline;
+    u64 sleep_user_pointer;
+    u64 sigwait_set;
+    u64 restart_deadline;
+    u64 restart_user_pointer;
+    u64 altstack_sp;
+    u64 altstack_size;
+    u64 itimer_real_deadline;
+    u64 itimer_real_interval;
+    u64 itimer_virtual_value;
+    u64 itimer_virtual_interval;
+    u64 itimer_prof_value;
+    u64 itimer_prof_interval;
+    struct signal_action signal_actions[SIGNAL_COUNT];
+    struct signal_entry signal_queue[SIGNAL_QUEUE_SIZE];
     struct vfs_node cwd;
     char cwd_path[PATH_BUFFER_SIZE];
     u64 root_page_table;
@@ -362,7 +580,7 @@ static u8 sector_buffer[SECTOR_SIZE];
 static u8 fat_buffer[SECTOR_SIZE];
 static u8 dir_buffer[SECTOR_SIZE];
 
-static u8 dirent_buffer[64];
+static u8 dirent_buffer[800];
 static u32 fat_buffer_lba;
 static u32 dir_buffer_lba;
 static u64 fat_buffer_valid;
@@ -376,8 +594,10 @@ static u32 next_pid;
 static u64 scheduler_ticks;
 static int console_ready;
 static const char init_path[] = "/init";
+static u64 sigreturn_page;
 
 static int user_copy_to_writable(u64 root, u64 destination, const void* source, u64 count);
+static int user_copy_from_readable(u64 root, void* destination, u64 source, u64 count);
 static int copy_user_string(u64 source, char* destination, u32 capacity);
 static int vfs_lookup(const char* path, struct vfs_node* node);
 static int fat_read_path_to_memory(const char* path, void* destination, u32 max_size, u32* out_size);
@@ -475,21 +695,6 @@ static int uart_try_read(void)
         ".Luart_try_read_empty_%=:\n"
         "addi %[value], zero, -1\n"
         ".Luart_try_read_done_%=:"
-        : [value] "+{a0}"(value)
-        :
-        : "memory");
-    return (int)value;
-}
-
-static int uart_read_blocking(void)
-{
-    u64 value = boot_device.uart_base;
-    __asm__ volatile(
-        ".Luart_read_wait_%=:\n"
-        "lbu a1, 5(%[value])\n"
-        "andi a1, a1, 1\n"
-        "beq a1, zero, .Luart_read_wait_%=\n"
-        "lbu %[value], 0(%[value])"
         : [value] "+{a0}"(value)
         :
         : "memory");
@@ -1452,6 +1657,8 @@ static int user_address_range_valid(u64 address, u64 size)
 
 static int user_device_window(u64 address, u64 size)
 {
+    if (ranges_overlap(address, size, USER_SIGRETURN_BASE, PAGE_SIZE))
+        return 1;
     if (ranges_overlap(address, size, USER_HOST_BRIDGE_BASE, HOST_BRIDGE_WINDOW_SIZE))
         return boot_device.host_bridge_base != 0ul;
     if (ranges_overlap(address, size, USER_FRAMEBUFFER_BASE, boot_device.framebuffer_window))
@@ -1652,7 +1859,7 @@ static int user_translate_with_brk_fault(u64 root, u64 address, u64 required, u6
         return 1;
     if (root != current_user_root_page_table || (required & PTE_X) != 0ul)
         return 0;
-    if (!map_user_brk_fault(root, address))
+    if (!map_user_brk_fault(root, address) && !map_user_stack_fault(root, address))
         return 0;
     return user_translate(root, address, required, physical);
 }
@@ -1743,7 +1950,17 @@ static u64 create_user_address_space(void)
         share_device_window(root, USER_HOST_BRIDGE_BASE);
     if (boot_device.framebuffer_base != 0ul)
         share_device_window(root, USER_FRAMEBUFFER_BASE);
+    if (sigreturn_page != 0ul)
+        map_page(root, USER_SIGRETURN_BASE, sigreturn_page, PTE_R | PTE_X | PTE_U | PTE_A);
     return root;
+}
+
+// Every address space shares the page a handler returns through, as the vDSO serves on the kernel we follow
+static void sigreturn_page_init(void)
+{
+    sigreturn_page = alloc_page();
+    ((u32*)sigreturn_page)[0] = 0x08b00893u;
+    ((u32*)sigreturn_page)[1] = 0x00000073u;
 }
 
 static void kernel_mmu_init(void)
@@ -1806,6 +2023,8 @@ static void process_table_init(void)
     current_task->state = PROC_RUNNING;
     current_task->pid = next_pid;
     current_task->ppid = 0u;
+    current_task->pgid = next_pid;
+    current_task->sid = next_pid;
     current_task->time_slice = DEFAULT_TIME_SLICE;
     // The first process stands at the root, and every later one inherits where its parent stood
     vfs_root_node(&current_task->cwd);
@@ -1875,18 +2094,22 @@ static int scheduler_pick_next(void)
     return -1;
 }
 
+static void scheduler_poll(u64 now);
+static int scheduler_can_wake(void);
+
 static void scheduler_switch(struct trap_frame* frame)
 {
     int next;
     if (current_task != NULL)
         process_save_active(current_task, frame);
     next = scheduler_pick_next();
-    if (next < 0)
+    // Nothing to run is idleness while a clock or the console may still wake someone, and the end otherwise
+    while (next < 0)
     {
-        if (current_task != NULL && current_task->used != 0u && current_task->state == PROC_RUNNABLE)
-            next = (int)current_task_slot;
-        else
+        if (!scheduler_can_wake())
             halt();
+        scheduler_poll(timer_now());
+        next = scheduler_pick_next();
     }
     current_task_slot = (u32)next;
     processes[current_task_slot].state = PROC_RUNNING;
@@ -1994,6 +2217,15 @@ static int process_clone(struct trap_frame* frame, u64 flags, u64 child_stack)
     child->state = PROC_RUNNABLE;
     child->pid = next_pid;
     child->ppid = current_task->pid;
+    child->pgid = current_task->pgid;
+    child->sid = current_task->sid;
+    child->ctty = current_task->ctty;
+    child->child_signal = (u32)(flags & 255ul);
+    child->signal_blocked = current_task->signal_blocked;
+    child->altstack_sp = current_task->altstack_sp;
+    child->altstack_size = current_task->altstack_size;
+    child->altstack_flags = current_task->altstack_flags;
+    mem_copy(child->signal_actions, current_task->signal_actions, sizeof(struct signal_action) * SIGNAL_COUNT);
     child->root_page_table = child_root;
     child->brk = process_brk;
     child->brk_min = process_brk_min;
@@ -2018,48 +2250,116 @@ static void process_reap(struct process* process)
     process_clear(process);
 }
 
-static int process_match_wait_pid(struct process* child, u64 wait_pid)
+static struct process* process_find(u64 pid)
 {
-    if (wait_pid == 0ul || wait_pid == (u64)-1l)
-        return 1;
-    if (wait_pid == (u64)child->pid)
-        return 1;
-    return 0;
+    u32 index = 0u;
+    while (index < MAX_PROCESSES)
+    {
+        if (processes[index].used != 0u && (u64)processes[index].pid == pid)
+            return &processes[index];
+        index = index + 1u;
+    }
+    return NULL;
 }
 
-static int process_store_wait_status(struct process* parent, u64 status_pointer, u32 exit_status, u32 exit_signal)
+static void process_wake(struct process* process)
 {
-    u32 wait_status = exit_signal != 0u ? exit_signal : exit_status << 8;
+    process->state = PROC_RUNNABLE;
+    process->sleep_reason = SLEEP_NONE;
+    process->sleep_deadline = 0ul;
+    process->wait_pid = 0ul;
+    process->wait_status_pointer = 0ul;
+}
+
+static void process_store_remaining(struct process* task, u64 pointer, u64 deadline);
+
+// The caller has already placed what the call returns should a signal cut the sleep short
+static void process_sleep(struct trap_frame* frame, u32 reason, u64 deadline)
+{
+    if ((current_task->signal_pending & ~current_task->signal_blocked) != 0ul)
+    {
+        if (reason == SLEEP_TIMER)
+        {
+            process_store_remaining(current_task, current_task->sleep_user_pointer, deadline);
+            current_task->restart_deadline = deadline;
+            current_task->restart_user_pointer = current_task->sleep_user_pointer;
+            current_task->restart_pending = 1u;
+        }
+        return;
+    }
+    current_task->sleep_reason = reason;
+    current_task->sleep_deadline = deadline;
+    current_task->state = PROC_WAITING;
+    scheduler_switch(frame);
+}
+
+static int process_match_wait_pid(struct process* parent, struct process* child, u64 wait_pid)
+{
+    s64 pid = (s64)(int)wait_pid;
+    if (pid == -1l)
+        return 1;
+    if (pid > 0l)
+        return (s64)child->pid == pid;
+    if (pid == 0l)
+        return child->pgid == parent->pgid;
+    return (s64)child->pgid == -pid;
+}
+
+static int process_store_wait_status(struct process* parent, u64 status_pointer, u32 wait_status)
+{
     if (status_pointer == 0ul)
         return 1;
     return user_copy_to_writable(parent->root_page_table, status_pointer, &wait_status, 4ul);
 }
 
-static int process_try_wait(struct process* parent, u64 pid, u64 status_pointer, s64* result)
+static int process_try_wait(struct process* parent, u64 pid, u64 status_pointer, u64 options, u64 usage_pointer, s64* result)
 {
     u32 index = 0u;
     int has_child = 0;
     while (index < MAX_PROCESSES)
     {
         struct process* child = &processes[index];
-        if (child->used != 0u && child->ppid == parent->pid && process_match_wait_pid(child, pid))
+        u32 wait_status;
+        u32 reported = 0u;
+        index = index + 1u;
+        if (child->used == 0u || child->ppid != parent->pid || !process_match_wait_pid(parent, child, pid))
+            continue;
+        has_child = 1;
+        if (child->state == PROC_ZOMBIE)
+            wait_status = child->exit_signal != 0u ? child->exit_signal : child->exit_status << 8;
+        else if ((options & WUNTRACED) != 0ul && child->state == PROC_STOPPED && (child->stop_report & STOP_REPORT_STOPPED) != 0u)
         {
-            has_child = 1;
-            if (child->state == PROC_ZOMBIE)
+            wait_status = (child->stop_signal << 8) | 0x7fu;
+            reported = STOP_REPORT_STOPPED;
+        }
+        else if ((options & WCONTINUED) != 0ul && (child->stop_report & STOP_REPORT_CONTINUED) != 0u)
+        {
+            wait_status = 0xffffu;
+            reported = STOP_REPORT_CONTINUED;
+        }
+        else
+            continue;
+        if (!process_store_wait_status(parent, status_pointer, wait_status))
+        {
+            *result = -14l;
+            return 1;
+        }
+        if (usage_pointer != 0ul)
+        {
+            u8 usage[144];
+            mem_zero(usage, 144ul);
+            if (!user_copy_to_writable(parent->root_page_table, usage_pointer, usage, 144ul))
             {
-                u32 child_pid = child->pid;
-                u32 exit_status = child->exit_status;
-                if (!process_store_wait_status(parent, status_pointer, exit_status, child->exit_signal))
-                {
-                    *result = -14l;
-                    return 1;
-                }
-                process_reap(child);
-                *result = (s64)child_pid;
+                *result = -14l;
                 return 1;
             }
         }
-        index = index + 1u;
+        *result = (s64)child->pid;
+        if (child->state == PROC_ZOMBIE)
+            process_reap(child);
+        else
+            child->stop_report = child->stop_report & ~reported;
+        return 1;
     }
     if (!has_child)
     {
@@ -2069,15 +2369,16 @@ static int process_try_wait(struct process* parent, u64 pid, u64 status_pointer,
     return 0;
 }
 
-static void sys_wait4_dispatch(struct trap_frame* frame, u64 pid, u64 status_pointer, u64 options)
+static void sys_wait4_dispatch(struct trap_frame* frame, u64 pid, u64 status_pointer, u64 options, u64 usage_pointer)
 {
     s64 result;
-    if ((options & ~WNOHANG) != 0ul)
+    options = options & 0xfffffffful;
+    if ((options & ~(WNOHANG | WUNTRACED | WCONTINUED | WAIT_THREAD_OPTIONS)) != 0ul)
     {
         frame->x[10] = (u64)-22l;
         return;
     }
-    if (process_try_wait(current_task, pid, status_pointer, &result))
+    if (process_try_wait(current_task, pid, status_pointer, options, usage_pointer, &result))
     {
         frame->x[10] = (u64)result;
         return;
@@ -2089,9 +2390,10 @@ static void sys_wait4_dispatch(struct trap_frame* frame, u64 pid, u64 status_poi
     }
     current_task->wait_pid = pid;
     current_task->wait_status_pointer = status_pointer;
-    current_task->state = PROC_WAITING;
-    frame->x[10] = (u64)-4l;
-    scheduler_switch(frame);
+    current_task->wait_options = (u32)options;
+    current_task->sleep_user_pointer = usage_pointer;
+    frame->x[10] = (u64)-ERESTARTSYS;
+    process_sleep(frame, SLEEP_CHILD, 0ul);
 }
 
 static void process_wake_vfork_parent(struct process* child)
@@ -2114,27 +2416,333 @@ static void process_wake_vfork_parent(struct process* child)
     child->vfork_parent_pid = 0u;
 }
 
-static void process_wake_waiter(struct process* child)
+static void process_notify_waiter(u32 parent_pid)
+{
+    struct process* parent = process_find((u64)parent_pid);
+    s64 result;
+    if (parent == NULL || parent->state != PROC_WAITING || parent->sleep_reason != SLEEP_CHILD)
+        return;
+    if (!process_try_wait(parent, parent->wait_pid, parent->wait_status_pointer, (u64)parent->wait_options, parent->sleep_user_pointer, &result))
+        return;
+    parent->frame.x[10] = (u64)result;
+    process_wake(parent);
+}
+
+static u64 signal_bit(u64 sig)
+{
+    return 1ul << (sig - 1ul);
+}
+
+static void signal_entry_init(struct signal_entry* entry, u64 sig, s32 code, u32 pid)
+{
+    mem_zero(entry, sizeof(struct signal_entry));
+    entry->signo = (u32)sig;
+    entry->code = code;
+    entry->pid = pid;
+}
+
+static int signal_queue_push(struct process* task, const struct signal_entry* entry)
+{
+    u64 sig = (u64)entry->signo;
+    if (sig < SIGRTMIN && (task->signal_pending & signal_bit(sig)) != 0ul)
+        return 1;
+    if (sig >= SIGRTMIN && task->signal_queue_count >= SIGNAL_RT_QUEUE_LIMIT)
+        return 0;
+    mem_copy(&task->signal_queue[task->signal_queue_count], entry, sizeof(struct signal_entry));
+    task->signal_queue_count = task->signal_queue_count + 1u;
+    task->signal_pending = task->signal_pending | signal_bit(sig);
+    return 1;
+}
+
+static void signal_queue_remove(struct process* task, u32 index)
+{
+    u32 sig = task->signal_queue[index].signo;
+    u32 cursor = 0u;
+    task->signal_queue_count = task->signal_queue_count - 1u;
+    while (index < task->signal_queue_count)
+    {
+        mem_copy(&task->signal_queue[index], &task->signal_queue[index + 1u], sizeof(struct signal_entry));
+        index = index + 1u;
+    }
+    while (cursor < task->signal_queue_count)
+    {
+        if (task->signal_queue[cursor].signo == sig)
+            return;
+        cursor = cursor + 1u;
+    }
+    task->signal_pending = task->signal_pending & ~signal_bit((u64)sig);
+}
+
+static void signal_queue_flush(struct process* task, u64 mask)
+{
+    u32 index = 0u;
+    while (index < task->signal_queue_count)
+    {
+        if ((signal_bit((u64)task->signal_queue[index].signo) & mask) != 0ul)
+            signal_queue_remove(task, index);
+        else
+            index = index + 1u;
+    }
+}
+
+// A fault goes first so its handler sees the instruction that failed; otherwise the lowest number does
+static u64 signal_queue_take(struct process* task, u64 mask, struct signal_entry* entry)
+{
+    u64 ready = task->signal_pending & mask;
+    u64 sig = 1ul;
+    u32 index = 0u;
+    if (ready == 0ul)
+        return 0ul;
+    if ((ready & SIGNAL_SYNCHRONOUS_MASK) != 0ul)
+        ready = ready & SIGNAL_SYNCHRONOUS_MASK;
+    while ((ready & 1ul) == 0ul)
+    {
+        ready = ready >> 1;
+        sig = sig + 1ul;
+    }
+    while ((u64)task->signal_queue[index].signo != sig)
+        index = index + 1u;
+    mem_copy(entry, &task->signal_queue[index], sizeof(struct signal_entry));
+    signal_queue_remove(task, index);
+    return sig;
+}
+
+static int signal_default_ignored(u64 sig)
+{
+    return (SIGNAL_IGNORE_MASK & signal_bit(sig)) != 0ul;
+}
+
+static int signal_default_stops(u64 sig)
+{
+    return (SIGNAL_STOP_MASK & signal_bit(sig)) != 0ul;
+}
+
+static int signal_ignored(struct process* task, u64 sig)
+{
+    u64 handler = task->signal_actions[sig - 1ul].handler;
+    if ((task->signal_blocked & signal_bit(sig)) != 0ul)
+        return 0;
+    if (task->pid == 1u && handler == SIG_DFL)
+        return 1;
+    return handler == SIG_IGN || (handler == SIG_DFL && signal_default_ignored(sig));
+}
+
+static int signal_fatal(struct process* task, u64 sig)
+{
+    return task->signal_actions[sig - 1ul].handler == SIG_DFL && !signal_default_ignored(sig) &&
+        !signal_default_stops(sig) && (task->signal_blocked & signal_bit(sig)) == 0ul;
+}
+
+static u64 time_to_ticks(u64 seconds, u64 fraction, u64 unit)
+{
+    u64 timebase = boot_device.timebase;
+    if (seconds > 0x100000000ul)
+        seconds = 0x100000000ul;
+    return seconds * timebase + (fraction * timebase + unit - 1ul) / unit;
+}
+
+static void time_from_ticks(u64 ticks, u64 unit, u64* seconds, u64* fraction)
+{
+    u64 timebase = boot_device.timebase;
+    *seconds = ticks / timebase;
+    *fraction = (ticks % timebase) * unit / timebase;
+}
+
+static void process_store_remaining(struct process* task, u64 pointer, u64 deadline)
+{
+    u64 now = timer_now();
+    u64 remaining[2];
+    if (pointer == 0ul)
+        return;
+    time_from_ticks(deadline > now ? deadline - now : 0ul, 1000000000ul, &remaining[0], &remaining[1]);
+    user_copy_to_writable(task->root_page_table, pointer, remaining, 16ul);
+}
+
+static void signal_store_info(u8* info, const struct signal_entry* entry)
+{
+    mem_zero(info, 128ul);
+    store_le32(info, entry->signo);
+    store_le32(info + 8, (u32)entry->code);
+    if ((signal_bit((u64)entry->signo) & SIGNAL_SYNCHRONOUS_MASK) != 0ul && entry->code > 0)
+    {
+        store_le64(info + 16, entry->value);
+        return;
+    }
+    store_le32(info + 16, entry->pid);
+    store_le32(info + 20, entry->uid);
+    if ((u64)entry->signo == SIGCHLD && entry->code > 0)
+        store_le32(info + 24, (u32)entry->status);
+    else
+        store_le64(info + 24, entry->value);
+}
+
+static int signal_copy_info(u64 root, u64 pointer, const struct signal_entry* entry)
+{
+    u8 info[128];
+    if (pointer == 0ul)
+        return 1;
+    signal_store_info(info, entry);
+    return user_copy_to_writable(root, pointer, info, 128ul);
+}
+
+static void signal_notify_stop(struct process* child, s32 code, u32 status);
+
+static void signal_wake(struct process* task, u64 sig)
+{
+    u64 bit = signal_bit(sig);
+    struct signal_entry entry;
+    if (task->state == PROC_STOPPED || task->state == PROC_VFORK)
+    {
+        if (signal_fatal(task, sig))
+        {
+            task->state = PROC_RUNNABLE;
+            task->stop_report = 0u;
+        }
+        return;
+    }
+    if (task->state != PROC_WAITING)
+        return;
+    if (task->sleep_reason == SLEEP_SIGWAIT && (task->sigwait_set & bit) != 0ul)
+    {
+        if (signal_queue_take(task, bit, &entry) == 0ul)
+            return;
+        task->frame.x[10] = signal_copy_info(task->root_page_table, task->sleep_user_pointer, &entry) ? sig : (u64)-14l;
+        process_wake(task);
+        return;
+    }
+    if ((task->signal_blocked & bit) != 0ul)
+        return;
+    if (task->sleep_reason == SLEEP_TIMER)
+    {
+        process_store_remaining(task, task->sleep_user_pointer, task->sleep_deadline);
+        task->restart_deadline = task->sleep_deadline;
+        task->restart_user_pointer = task->sleep_user_pointer;
+        task->restart_pending = 1u;
+    }
+    else if (task->sleep_reason == SLEEP_SIGWAIT)
+        task->frame.x[10] = (u64)-EINTR;
+    process_wake(task);
+}
+
+static int signal_send(struct process* task, const struct signal_entry* entry)
+{
+    u64 sig = (u64)entry->signo;
+    if (task->state == PROC_ZOMBIE)
+        return 1;
+    if (signal_default_stops(sig))
+        signal_queue_flush(task, signal_bit(SIGCONT));
+    else if (sig == SIGCONT)
+    {
+        signal_queue_flush(task, SIGNAL_STOP_MASK);
+        if (task->state == PROC_STOPPED)
+        {
+            task->state = PROC_RUNNABLE;
+            task->stop_report = STOP_REPORT_CONTINUED;
+            signal_notify_stop(task, CLD_CONTINUED, (u32)SIGCONT);
+        }
+    }
+    if (signal_ignored(task, sig))
+        return 1;
+    if (!signal_queue_push(task, entry))
+        return 0;
+    signal_wake(task, sig);
+    return 1;
+}
+
+static void signal_send_kernel(struct process* task, u64 sig, s32 code)
+{
+    struct signal_entry entry;
+    signal_entry_init(&entry, sig, code, 0u);
+    signal_send(task, &entry);
+}
+
+// A waiting parent collects its answer before the signal about it can cut the wait short
+static void signal_notify_stop(struct process* child, s32 code, u32 status)
+{
+    u32 parent_pid = child->ppid;
+    struct process* parent;
+    struct signal_entry entry;
+    signal_entry_init(&entry, SIGCHLD, code, child->pid);
+    entry.status = (s32)status;
+    process_notify_waiter(parent_pid);
+    parent = process_find((u64)parent_pid);
+    if (parent != NULL && (parent->signal_actions[SIGCHLD - 1ul].flags & SA_NOCLDSTOP) == 0ul)
+        signal_send(parent, &entry);
+}
+
+// The parent hears of a death unless it asked for its children to vanish unclaimed
+static void process_report_exit(struct process* child)
+{
+    u32 parent_pid = child->ppid;
+    struct process* parent = process_find((u64)parent_pid);
+    struct signal_entry entry;
+    u64 sig = (u64)child->child_signal;
+    if (parent == NULL)
+        return;
+    signal_entry_init(&entry, sig, child->exit_signal != 0u ? CLD_KILLED : CLD_EXITED, child->pid);
+    entry.status = (s32)(child->exit_signal != 0u ? child->exit_signal : child->exit_status);
+    if (sig == SIGCHLD)
+    {
+        struct signal_action* action = &parent->signal_actions[SIGCHLD - 1ul];
+        if (action->handler == SIG_IGN)
+            sig = 0ul;
+        if (action->handler == SIG_IGN || (action->flags & SA_NOCLDWAIT) != 0ul)
+            process_reap(child);
+    }
+    process_notify_waiter(parent_pid);
+    if (sig != 0ul)
+        signal_send(parent, &entry);
+}
+
+static void process_group_signal(u32 pgid, u64 sig)
 {
     u32 index = 0u;
     while (index < MAX_PROCESSES)
     {
-        struct process* parent = &processes[index];
-        if (parent->used != 0u && parent->state == PROC_WAITING && parent->pid == child->ppid && process_match_wait_pid(child, parent->wait_pid))
-        {
-            if (process_store_wait_status(parent, parent->wait_status_pointer, child->exit_status, child->exit_signal))
-                parent->frame.x[10] = (u64)child->pid;
-            else
-                parent->frame.x[10] = (u64)-14l;
-            parent->wait_pid = 0ul;
-            parent->wait_status_pointer = 0ul;
-            parent->state = PROC_RUNNABLE;
-            process_reap(child);
-            return;
-        }
+        struct process* task = &processes[index];
         index = index + 1u;
+        if (task->used != 0u && task->state != PROC_ZOMBIE && task->pgid == pgid)
+            signal_send_kernel(task, sig, SI_KERNEL);
     }
 }
+
+// A group is orphaned once no member has a parent in another group of the same session to resume it
+static int process_group_orphaned(u32 pgid, struct process* ignored)
+{
+    u32 index = 0u;
+    while (index < MAX_PROCESSES)
+    {
+        struct process* task = &processes[index];
+        index = index + 1u;
+        if (task->used != 0u && task->state != PROC_ZOMBIE && task != ignored && task->pgid == pgid)
+        {
+            struct process* parent = process_find((u64)task->ppid);
+            if (parent != NULL && parent != ignored && parent->state != PROC_ZOMBIE && parent->pgid != pgid && parent->sid == task->sid)
+                return 0;
+        }
+    }
+    return 1;
+}
+
+// Stopped members of a group nothing can resume any more are woken to hear the line is gone
+static void process_group_hang_up_orphaned(u32 pgid, struct process* ignored)
+{
+    u32 index = 0u;
+    int stopped = 0;
+    while (index < MAX_PROCESSES)
+    {
+        if (processes[index].used != 0u && processes[index].pgid == pgid && processes[index].state == PROC_STOPPED)
+            stopped = 1;
+        index = index + 1u;
+    }
+    if (stopped && process_group_orphaned(pgid, ignored))
+    {
+        process_group_signal(pgid, SIGHUP);
+        process_group_signal(pgid, SIGCONT);
+    }
+}
+
+static void tty_release_session(u32 sid, int hang_up);
 
 static void process_reparent_children(u32 parent_pid)
 {
@@ -2142,21 +2750,53 @@ static void process_reparent_children(u32 parent_pid)
     u32 new_parent = parent_pid == 1u ? 0u : 1u;
     while (index < MAX_PROCESSES)
     {
-        if (processes[index].used != 0u && processes[index].ppid == parent_pid)
-            processes[index].ppid = new_parent;
+        struct process* child = &processes[index];
+        if (child->used != 0u && child->ppid == parent_pid)
+        {
+            child->ppid = new_parent;
+            if (child->state == PROC_ZOMBIE)
+                process_report_exit(child);
+        }
         index = index + 1u;
     }
 }
 
-static void process_exit_current(struct trap_frame* frame, u64 status)
+static void process_exit_current(struct trap_frame* frame, u64 status, u64 sig)
 {
-    u32 pid = current_task->pid;
+    struct process* task = current_task;
+    struct process* parent = process_find((u64)task->ppid);
+    u32 pid = task->pid;
     u64 code = status & 255ul;
+    u32 groups[MAX_PROCESSES];
+    u32 group_count = 0u;
+    u32 index = 0u;
+    if (task->sid == pid && task->ctty != 0u)
+        tty_release_session(task->sid, 1);
+    while (index < MAX_PROCESSES)
+    {
+        struct process* child = &processes[index];
+        if (child->used != 0u && child->ppid == pid && child->pgid != task->pgid && child->sid == task->sid)
+        {
+            groups[group_count] = child->pgid;
+            group_count = group_count + 1u;
+        }
+        index = index + 1u;
+    }
     process_reparent_children(pid);
-    current_task->exit_status = (u32)code;
-    current_task->state = PROC_ZOMBIE;
+    task->exit_status = (u32)code;
+    task->exit_signal = (u32)sig;
+    task->state = PROC_ZOMBIE;
+    task->itimer_real_deadline = 0ul;
+    if (parent != NULL && parent->pgid != task->pgid && parent->sid == task->sid)
+        process_group_hang_up_orphaned(task->pgid, task);
+    index = 0u;
+    while (index < group_count)
+    {
+        process_group_hang_up_orphaned(groups[index], (struct process*)NULL);
+        index = index + 1u;
+    }
     // A process that ended the way it meant to says nothing: the console belongs to the terminal
-    if (code != 0ul)
+    if (code != 0ul && sig == 0ul)
     {
         puts("kernel: process ");
         put_dec(pid);
@@ -2164,29 +2804,792 @@ static void process_exit_current(struct trap_frame* frame, u64 status)
         put_dec(code);
         puts("\n");
     }
-    process_wake_vfork_parent(current_task);
-    process_wake_waiter(current_task);
+    process_wake_vfork_parent(task);
+    process_report_exit(task);
     scheduler_switch(frame);
 }
 
-// The signal a fault would carry, so a program ends the way it would on the kernel we follow
-static u64 fault_signal(u64 cause)
+static void signal_stop_current(struct trap_frame* frame, u64 sig)
 {
-    if (cause == 2ul)
-        return SIGILL;
-    if (cause == 3ul)
-        return SIGTRAP;
-    if (cause == 0ul || cause == 4ul || cause == 6ul || cause == 1ul || cause == 5ul || cause == 7ul)
+    current_task->state = PROC_STOPPED;
+    current_task->stop_signal = (u32)sig;
+    current_task->stop_report = STOP_REPORT_STOPPED;
+    signal_notify_stop(current_task, CLD_STOPPED, (u32)sig);
+    scheduler_switch(frame);
+}
+
+// A fault cannot be ignored or held back, so a handler it would skip gives way to the default
+static void signal_force(struct process* task, u64 sig, s32 code, u64 address)
+{
+    struct signal_action* action = &task->signal_actions[sig - 1ul];
+    struct signal_entry entry;
+    if (action->handler == SIG_IGN || (task->signal_blocked & signal_bit(sig)) != 0ul)
+    {
+        action->handler = SIG_DFL;
+        task->signal_blocked = task->signal_blocked & ~signal_bit(sig);
+    }
+    signal_entry_init(&entry, sig, code, 0u);
+    entry.value = address;
+    signal_queue_push(task, &entry);
+}
+
+static int signal_unhandled(struct process* task, u64 sig)
+{
+    u64 handler = task->signal_actions[sig - 1ul].handler;
+    return task->pid == 1u || handler == SIG_DFL || handler == SIG_IGN || (task->signal_blocked & signal_bit(sig)) != 0ul;
+}
+
+// The signal a fault carries and what it points at, so a program ends or recovers the way it would on the kernel we follow
+static u64 signal_for_fault(struct trap_frame* frame, s32* code, u64* address)
+{
+    u64 cause = frame->scause;
+    u64 physical;
+    *address = frame->sepc;
+    if (cause == 0ul || cause == 4ul || cause == 6ul)
+    {
+        *code = BUS_ADRALN;
         return SIGBUS;
-    return SIGSEGV;
+    }
+    if (cause == 1ul || cause == 5ul || cause == 7ul)
+    {
+        *code = SEGV_ACCERR;
+        return SIGSEGV;
+    }
+    if (cause == 2ul)
+    {
+        *code = ILL_ILLOPC;
+        return SIGILL;
+    }
+    if (cause == 3ul)
+    {
+        *code = TRAP_BRKPT;
+        return SIGTRAP;
+    }
+    if (cause == 12ul || cause == 13ul || cause == 15ul)
+    {
+        *address = frame->stval;
+        *code = user_translate(current_user_root_page_table, frame->stval, 0ul, &physical) ? SEGV_ACCERR : SEGV_MAPERR;
+        return SIGSEGV;
+    }
+    *code = ILL_ILLTRP;
+    return SIGILL;
+}
+
+static int signal_on_stack(struct process* task, u64 sp)
+{
+    if ((task->altstack_flags & SS_AUTODISARM) != 0u)
+        return 0;
+    return sp > task->altstack_sp && sp - task->altstack_sp <= task->altstack_size;
+}
+
+static u32 signal_stack_flags(struct process* task, u64 sp)
+{
+    if (task->altstack_size == 0ul)
+        return SS_DISABLE;
+    return signal_on_stack(task, sp) ? SS_ONSTACK : 0u;
+}
+
+static s64 signal_set_altstack(struct process* task, u64 sp, u64 stack, u32 flags, u64 size)
+{
+    u32 mode = flags & ~SS_AUTODISARM;
+    if (task->altstack_sp == stack && task->altstack_size == size && task->altstack_flags == flags)
+        return 0l;
+    if (signal_on_stack(task, sp))
+        return -1l;
+    if (mode != 0u && mode != SS_ONSTACK && mode != SS_DISABLE)
+        return -22l;
+    if (mode == SS_DISABLE)
+    {
+        stack = 0ul;
+        size = 0ul;
+    }
+    else if (size < MINSIGSTKSZ)
+        return -12l;
+    task->altstack_sp = stack;
+    task->altstack_size = size;
+    task->altstack_flags = flags;
+    return 0l;
+}
+
+static int signal_setup_frame(struct trap_frame* frame, struct process* task, const struct signal_entry* entry, struct signal_action* action)
+{
+    u64 buffer[(SIGFRAME_SIZE + SIGFRAME_VECTOR_STATE + 32ul * MAX_VECTOR_REGISTER_BYTES + 8ul) / 8ul];
+    u8* bytes = (u8*)buffer;
+    u64 vlenb = vector_register_bytes();
+    int vector = (frame->sstatus & SSTATUS_VS) == SSTATUS_VS;
+    u64 size = SIGFRAME_SIZE + (vector ? SIGFRAME_VECTOR_STATE + 32ul * vlenb : 0ul);
+    u64 sp = frame->x[2];
+    u64 sig = (u64)entry->signo;
+    u64 base;
+    u32 index;
+    if (signal_on_stack(task, sp) && !signal_on_stack(task, sp - size))
+        return 0;
+    if ((action->flags & SA_ONSTACK) != 0ul && signal_stack_flags(task, sp) == 0u)
+        sp = task->altstack_sp + task->altstack_size;
+    base = (sp - size) & ~15ul;
+    mem_zero(bytes, size);
+    signal_store_info(bytes, entry);
+    store_le64(bytes + SIGFRAME_UCONTEXT + 16ul, task->altstack_sp);
+    store_le32(bytes + SIGFRAME_UCONTEXT + 24ul, task->altstack_flags);
+    store_le64(bytes + SIGFRAME_UCONTEXT + 32ul, task->altstack_size);
+    store_le64(bytes + SIGFRAME_UCONTEXT + 40ul, task->signal_restore_mask != 0u ? task->signal_saved_blocked : task->signal_blocked);
+    store_le64(bytes + SIGFRAME_MCONTEXT, frame->sepc);
+    index = 1u;
+    while (index < 32u)
+    {
+        store_le64(bytes + SIGFRAME_MCONTEXT + (u64)index * 8ul, frame->x[index]);
+        index = index + 1u;
+    }
+    index = 0u;
+    while (index < 32u)
+    {
+        store_le64(bytes + SIGFRAME_FP + (u64)index * 8ul, frame->f[index]);
+        index = index + 1u;
+    }
+    store_le32(bytes + SIGFRAME_FP + 256ul, (u32)frame->fcsr);
+    if (vector)
+    {
+        u8* state = bytes + SIGFRAME_SIZE;
+        store_le32(bytes + SIGFRAME_EXTENSION, RISCV_V_MAGIC);
+        store_le32(bytes + SIGFRAME_EXTENSION + 4ul, (u32)(SIGFRAME_VECTOR_STATE + 32ul * vlenb));
+        store_le64(state, frame->vstart);
+        store_le64(state + 8, frame->vl);
+        store_le64(state + 16, frame->vtype);
+        store_le64(state + 24, frame->vcsr);
+        store_le64(state + 32, vlenb);
+        store_le64(state + 40, base + SIGFRAME_SIZE + 48ul);
+        mem_copy(state + 48, frame->v, 32ul * vlenb);
+    }
+    if (!user_copy_to_writable(current_user_root_page_table, base, bytes, size))
+        return 0;
+    if ((task->altstack_flags & SS_AUTODISARM) != 0u)
+    {
+        task->altstack_sp = 0ul;
+        task->altstack_size = 0ul;
+        task->altstack_flags = SS_DISABLE;
+    }
+    task->signal_blocked = (task->signal_blocked | action->mask | ((action->flags & SA_NODEFER) != 0ul ? 0ul : signal_bit(sig))) & ~SIGNAL_UNBLOCKABLE;
+    task->signal_restore_mask = 0u;
+    frame->x[1] = USER_SIGRETURN_BASE;
+    frame->x[2] = base;
+    frame->x[10] = sig;
+    frame->x[11] = base;
+    frame->x[12] = base + SIGFRAME_UCONTEXT;
+    frame->sepc = action->handler;
+    if ((action->flags & SA_RESETHAND) != 0ul)
+        action->handler = SIG_DFL;
+    return 1;
+}
+
+// A call a signal cut short either resumes where it stood or reports the interruption
+static void signal_restart(struct trap_frame* frame, struct process* task, int handled, u64 flags)
+{
+    s64 result = (s64)frame->x[10];
+    if (frame->scause != 8ul)
+        return;
+    if (handled)
+    {
+        frame->scause = ~0ul;
+        if (result == -ERESTART_RESTARTBLOCK || result == -ERESTARTNOHAND || (result == -ERESTARTSYS && (flags & SA_RESTART) == 0ul))
+        {
+            frame->x[10] = (u64)-EINTR;
+            return;
+        }
+        if (result != -ERESTARTSYS && result != -ERESTARTNOINTR)
+            return;
+    }
+    else if (result == -ERESTART_RESTARTBLOCK)
+        frame->x[17] = SYS_RESTART_SYSCALL;
+    else if (result != -ERESTARTSYS && result != -ERESTARTNOINTR && result != -ERESTARTNOHAND)
+        return;
+    frame->x[10] = task->orig_a0;
+    frame->sepc = frame->sepc - 4ul;
+}
+
+static void signal_return_to_user(struct trap_frame* frame)
+{
+    for (;;)
+    {
+        struct process* task = current_task;
+        struct signal_entry entry;
+        struct signal_action* action;
+        u64 sig;
+        if (task == NULL || task->used == 0u || task->state != PROC_RUNNING || (frame->sstatus & SSTATUS_SPP) != 0ul)
+            return;
+        sig = signal_queue_take(task, ~task->signal_blocked, &entry);
+        if (sig == 0ul)
+        {
+            signal_restart(frame, task, 0, 0ul);
+            if (task->signal_restore_mask != 0u)
+            {
+                task->signal_blocked = task->signal_saved_blocked;
+                task->signal_restore_mask = 0u;
+            }
+            return;
+        }
+        action = &task->signal_actions[sig - 1ul];
+        if (action->handler == SIG_IGN || (action->handler == SIG_DFL && signal_default_ignored(sig)))
+            continue;
+        if (action->handler == SIG_DFL)
+        {
+            if (signal_default_stops(sig) && sig != SIGSTOP && process_group_orphaned(task->pgid, (struct process*)NULL))
+                continue;
+            if (signal_default_stops(sig))
+                signal_stop_current(frame, sig);
+            else
+                process_exit_current(frame, 0ul, sig);
+            continue;
+        }
+        signal_restart(frame, task, 1, action->flags);
+        if (!signal_setup_frame(frame, task, &entry, action))
+        {
+            if (sig == SIGSEGV)
+                action->handler = SIG_DFL;
+            signal_force(task, SIGSEGV, SI_KERNEL, 0ul);
+        }
+    }
+}
+
+static s64 sys_rt_sigaction_impl(u64 sig, u64 new_pointer, u64 old_pointer, u64 size)
+{
+    struct signal_action action;
+    struct signal_action old;
+    struct signal_action* slot;
+    if (size != 8ul || sig == 0ul || sig > SIGNAL_COUNT)
+        return -22l;
+    slot = &current_task->signal_actions[sig - 1ul];
+    mem_copy(&old, slot, sizeof(struct signal_action));
+    if (new_pointer != 0ul)
+    {
+        if (sig == SIGKILL || sig == SIGSTOP)
+            return -22l;
+        if (!user_copy_from_readable(current_user_root_page_table, &action, new_pointer, sizeof(struct signal_action)))
+            return -14l;
+        action.mask = action.mask & ~SIGNAL_UNBLOCKABLE;
+        mem_copy(slot, &action, sizeof(struct signal_action));
+        if (action.handler == SIG_IGN || (action.handler == SIG_DFL && signal_default_ignored(sig)))
+            signal_queue_flush(current_task, signal_bit(sig));
+    }
+    if (old_pointer != 0ul && !user_copy_to_writable(current_user_root_page_table, old_pointer, &old, sizeof(struct signal_action)))
+        return -14l;
+    return 0l;
+}
+
+static s64 sys_rt_sigprocmask_impl(u64 how, u64 set_pointer, u64 old_pointer, u64 size)
+{
+    u64 old = current_task->signal_blocked;
+    u64 set;
+    if (size != 8ul)
+        return -22l;
+    if (set_pointer != 0ul)
+    {
+        if (!user_copy_from_readable(current_user_root_page_table, &set, set_pointer, 8ul))
+            return -14l;
+        if (how == SIG_BLOCK)
+            set = old | set;
+        else if (how == SIG_UNBLOCK)
+            set = old & ~set;
+        else if (how != SIG_SETMASK)
+            return -22l;
+        current_task->signal_blocked = set & ~SIGNAL_UNBLOCKABLE;
+    }
+    if (old_pointer != 0ul && !user_copy_to_writable(current_user_root_page_table, old_pointer, &old, 8ul))
+        return -14l;
+    return 0l;
+}
+
+static s64 sys_rt_sigpending_impl(u64 set_pointer, u64 size)
+{
+    u64 pending = current_task->signal_pending & current_task->signal_blocked;
+    if (size > 8ul)
+        return -22l;
+    if (!user_copy_to_writable(current_user_root_page_table, set_pointer, &pending, size))
+        return -14l;
+    return 0l;
+}
+
+static void sys_rt_sigsuspend_dispatch(struct trap_frame* frame, u64 mask_pointer, u64 size)
+{
+    u64 mask;
+    if (size != 8ul)
+    {
+        frame->x[10] = (u64)-22l;
+        return;
+    }
+    if (!user_copy_from_readable(current_user_root_page_table, &mask, mask_pointer, 8ul))
+    {
+        frame->x[10] = (u64)-14l;
+        return;
+    }
+    current_task->signal_saved_blocked = current_task->signal_blocked;
+    current_task->signal_restore_mask = 1u;
+    current_task->signal_blocked = mask & ~SIGNAL_UNBLOCKABLE;
+    frame->x[10] = (u64)-ERESTARTNOHAND;
+    if ((current_task->signal_pending & ~current_task->signal_blocked) == 0ul)
+        process_sleep(frame, SLEEP_SIGNAL, 0ul);
+}
+
+static void sys_rt_sigtimedwait_dispatch(struct trap_frame* frame, u64 set_pointer, u64 info_pointer, u64 timeout_pointer, u64 size)
+{
+    struct signal_entry entry;
+    u64 timeout[2];
+    u64 set;
+    u64 deadline = 0ul;
+    u64 sig;
+    if (size != 8ul)
+    {
+        frame->x[10] = (u64)-22l;
+        return;
+    }
+    if (!user_copy_from_readable(current_user_root_page_table, &set, set_pointer, 8ul))
+    {
+        frame->x[10] = (u64)-14l;
+        return;
+    }
+    set = set & ~SIGNAL_UNBLOCKABLE;
+    if (timeout_pointer != 0ul)
+    {
+        if (!user_copy_from_readable(current_user_root_page_table, timeout, timeout_pointer, 16ul))
+        {
+            frame->x[10] = (u64)-14l;
+            return;
+        }
+        if ((s64)timeout[0] < 0l || timeout[1] >= 1000000000ul)
+        {
+            frame->x[10] = (u64)-22l;
+            return;
+        }
+        deadline = time_to_ticks(timeout[0], timeout[1], 1000000000ul);
+    }
+    sig = signal_queue_take(current_task, set, &entry);
+    if (sig != 0ul)
+    {
+        frame->x[10] = signal_copy_info(current_user_root_page_table, info_pointer, &entry) ? sig : (u64)-14l;
+        return;
+    }
+    if (timeout_pointer != 0ul && deadline == 0ul)
+    {
+        frame->x[10] = (u64)-EAGAIN;
+        return;
+    }
+    current_task->sigwait_set = set;
+    current_task->sleep_user_pointer = info_pointer;
+    frame->x[10] = (u64)-EINTR;
+    process_sleep(frame, SLEEP_SIGWAIT, deadline == 0ul ? 0ul : timer_now() + deadline);
+}
+
+static s64 signal_send_user(struct process* task, u64 sig, s32 code)
+{
+    struct signal_entry entry;
+    if (sig == 0ul)
+        return 0l;
+    signal_entry_init(&entry, sig, code, current_task->pid);
+    return signal_send(task, &entry) ? 0l : -EAGAIN;
+}
+
+static s64 sys_rt_sigqueueinfo_impl(u64 pid, u64 sig, u64 info_pointer)
+{
+    struct signal_entry entry;
+    struct process* task;
+    u8 info[128];
+    s32 code;
+    if (sig > SIGNAL_COUNT)
+        return -22l;
+    if (!user_copy_from_readable(current_user_root_page_table, info, info_pointer, 128ul))
+        return -14l;
+    code = (s32)le32(info + 8);
+    if ((code >= 0 || code == SI_TKILL) && pid != (u64)current_task->pid)
+        return -1l;
+    task = process_find(pid);
+    if (task == NULL)
+        return -3l;
+    if (sig == 0ul)
+        return 0l;
+    signal_entry_init(&entry, sig, code, le32(info + 16));
+    entry.uid = le32(info + 20);
+    entry.value = le64(info + 24);
+    return signal_send(task, &entry) ? 0l : -EAGAIN;
+}
+
+static s64 sys_kill_impl(u64 pid_value, u64 sig)
+{
+    s64 pid = (s64)(int)pid_value;
+    s64 error = 0l;
+    int found = 0;
+    int delivered = 0;
+    u32 index = 0u;
+    if (sig > SIGNAL_COUNT)
+        return -22l;
+    if (pid > 0l)
+    {
+        struct process* task = process_find((u64)pid);
+        return task == NULL ? -3l : signal_send_user(task, sig, SI_USER);
+    }
+    while (index < MAX_PROCESSES)
+    {
+        struct process* task = &processes[index];
+        index = index + 1u;
+        if (task->used == 0u)
+            continue;
+        if (pid == 0l ? task->pgid != current_task->pgid :
+            pid == -1l ? task->pid <= 1u || task == current_task :
+            (s64)task->pgid != -pid)
+            continue;
+        found = 1;
+        error = signal_send_user(task, sig, SI_USER);
+        if (error == 0l)
+            delivered = 1;
+    }
+    if (!found)
+        return -3l;
+    return delivered ? 0l : error;
+}
+
+static s64 sys_tgkill_impl(s64 tgid, s64 tid, u64 sig)
+{
+    struct process* task;
+    if (tid <= 0l || tgid == 0l || tgid < -1l || sig > SIGNAL_COUNT)
+        return -22l;
+    task = process_find((u64)tid);
+    if (task == NULL || (tgid > 0l && tgid != tid))
+        return -3l;
+    return signal_send_user(task, sig, SI_TKILL);
+}
+
+static s64 sys_sigaltstack_impl(struct trap_frame* frame, u64 new_pointer, u64 old_pointer)
+{
+    u64 stack[3];
+    u64 old[3];
+    s64 result;
+    old[0] = current_task->altstack_sp;
+    old[1] = (u64)(signal_stack_flags(current_task, frame->x[2]) | (current_task->altstack_flags & SS_AUTODISARM));
+    old[2] = current_task->altstack_size;
+    if (new_pointer != 0ul)
+    {
+        if (!user_copy_from_readable(current_user_root_page_table, stack, new_pointer, 24ul))
+            return -14l;
+        result = signal_set_altstack(current_task, frame->x[2], stack[0], (u32)stack[1], stack[2]);
+        if (result != 0l)
+            return result;
+    }
+    if (old_pointer != 0ul && !user_copy_to_writable(current_user_root_page_table, old_pointer, old, 24ul))
+        return -14l;
+    return 0l;
+}
+
+static void sys_rt_sigreturn_impl(struct trap_frame* frame)
+{
+    u64 buffer[SIGFRAME_SIZE / 8ul];
+    u64 state[6];
+    u8* bytes = (u8*)buffer;
+    u64 base = frame->x[2];
+    u64 vector_size = SIGFRAME_VECTOR_STATE + 32ul * vector_register_bytes();
+    u32 magic;
+    u32 index;
+    frame->scause = ~0ul;
+    if (!user_copy_from_readable(current_user_root_page_table, bytes, base, SIGFRAME_SIZE) || le32(bytes + SIGFRAME_FP + 516ul) != 0u)
+    {
+        signal_force(current_task, SIGSEGV, SI_KERNEL, 0ul);
+        return;
+    }
+    magic = le32(bytes + SIGFRAME_EXTENSION);
+    if (magic == RISCV_V_MAGIC)
+    {
+        if ((u64)le32(bytes + SIGFRAME_EXTENSION + 4ul) != vector_size ||
+            !user_copy_from_readable(current_user_root_page_table, state, base + SIGFRAME_SIZE, 48ul) ||
+            !user_copy_from_readable(current_user_root_page_table, frame->v, state[5], vector_size - SIGFRAME_VECTOR_STATE))
+        {
+            signal_force(current_task, SIGSEGV, SI_KERNEL, 0ul);
+            return;
+        }
+        frame->vstart = state[0];
+        frame->vl = state[1];
+        frame->vtype = state[2];
+        frame->vcsr = state[3];
+    }
+    else if (magic != 0u)
+    {
+        signal_force(current_task, SIGSEGV, SI_KERNEL, 0ul);
+        return;
+    }
+    current_task->signal_blocked = le64(bytes + SIGFRAME_UCONTEXT + 40ul) & ~SIGNAL_UNBLOCKABLE;
+    frame->sepc = le64(bytes + SIGFRAME_MCONTEXT);
+    index = 1u;
+    while (index < 32u)
+    {
+        frame->x[index] = le64(bytes + SIGFRAME_MCONTEXT + (u64)index * 8ul);
+        index = index + 1u;
+    }
+    index = 0u;
+    while (index < 32u)
+    {
+        frame->f[index] = le64(bytes + SIGFRAME_FP + (u64)index * 8ul);
+        index = index + 1u;
+    }
+    frame->fcsr = (u64)le32(bytes + SIGFRAME_FP + 256ul);
+    signal_set_altstack(current_task, frame->x[2], le64(bytes + SIGFRAME_UCONTEXT + 16ul),
+        le32(bytes + SIGFRAME_UCONTEXT + 24ul), le64(bytes + SIGFRAME_UCONTEXT + 32ul));
+}
+
+static s64 sys_setpgid_impl(u64 pid_value, u64 pgid_value)
+{
+    s64 pid = (s64)(int)pid_value;
+    s64 pgid = (s64)(int)pgid_value;
+    struct process* task;
+    u32 index = 0u;
+    int found = 0;
+    if (pid == 0l)
+        pid = (s64)current_task->pid;
+    if (pgid == 0l)
+        pgid = pid;
+    if (pgid < 0l)
+        return -22l;
+    task = process_find((u64)pid);
+    if (task == NULL)
+        return -3l;
+    if (task->ppid == current_task->pid)
+    {
+        if (task->sid != current_task->sid)
+            return -1l;
+        if (task->did_exec != 0u)
+            return -13l;
+    }
+    else if (task != current_task)
+        return -3l;
+    if (task->sid == task->pid)
+        return -1l;
+    if (pgid != pid)
+    {
+        while (index < MAX_PROCESSES)
+        {
+            if (processes[index].used != 0u && (s64)processes[index].pgid == pgid && processes[index].sid == current_task->sid)
+                found = 1;
+            index = index + 1u;
+        }
+        if (!found)
+            return -1l;
+    }
+    task->pgid = (u32)pgid;
+    return 0l;
+}
+
+static s64 sys_getpgid_impl(u64 pid_value, int session)
+{
+    s64 pid = (s64)(int)pid_value;
+    struct process* task = pid == 0l ? current_task : pid < 0l ? NULL : process_find((u64)pid);
+    if (task == NULL)
+        return -3l;
+    return (s64)(session ? task->sid : task->pgid);
+}
+
+static s64 sys_setsid_impl(void)
+{
+    u32 index = 0u;
+    while (index < MAX_PROCESSES)
+    {
+        if (processes[index].used != 0u && processes[index].pgid == current_task->pid)
+            return -1l;
+        index = index + 1u;
+    }
+    current_task->sid = current_task->pid;
+    current_task->pgid = current_task->pid;
+    current_task->ctty = 0u;
+    return (s64)current_task->pid;
+}
+
+static void itimer_read(struct process* task, u64 which, u64* values)
+{
+    u64 now = timer_now();
+    u64 interval = task->itimer_prof_interval;
+    u64 value = task->itimer_prof_value;
+    if (which == ITIMER_REAL)
+    {
+        interval = task->itimer_real_interval;
+        value = task->itimer_real_deadline == 0ul ? 0ul : task->itimer_real_deadline > now ? task->itimer_real_deadline - now : 1ul;
+    }
+    else if (which == ITIMER_VIRTUAL)
+    {
+        interval = task->itimer_virtual_interval;
+        value = task->itimer_virtual_value;
+    }
+    time_from_ticks(interval, 1000000ul, &values[0], &values[1]);
+    time_from_ticks(value, 1000000ul, &values[2], &values[3]);
+    if (value != 0ul && values[2] == 0ul && values[3] == 0ul)
+        values[3] = 1ul;
+}
+
+static s64 sys_getitimer_impl(u64 which, u64 pointer)
+{
+    u64 values[4];
+    if (which > ITIMER_PROF)
+        return -22l;
+    itimer_read(current_task, which, values);
+    if (!user_copy_to_writable(current_user_root_page_table, pointer, values, 32ul))
+        return -14l;
+    return 0l;
+}
+
+static s64 sys_setitimer_impl(u64 which, u64 new_pointer, u64 old_pointer)
+{
+    u64 values[4];
+    u64 old[4];
+    u64 interval;
+    u64 value;
+    if (which > ITIMER_PROF)
+        return -22l;
+    mem_zero(values, 32ul);
+    if (new_pointer != 0ul && !user_copy_from_readable(current_user_root_page_table, values, new_pointer, 32ul))
+        return -14l;
+    if ((s64)values[0] < 0l || values[1] >= 1000000ul || (s64)values[2] < 0l || values[3] >= 1000000ul)
+        return -22l;
+    itimer_read(current_task, which, old);
+    interval = time_to_ticks(values[0], values[1], 1000000ul);
+    value = time_to_ticks(values[2], values[3], 1000000ul);
+    if (which == ITIMER_REAL)
+    {
+        current_task->itimer_real_interval = interval;
+        current_task->itimer_real_deadline = value == 0ul ? 0ul : timer_now() + value;
+    }
+    else if (which == ITIMER_VIRTUAL)
+    {
+        current_task->itimer_virtual_interval = interval;
+        current_task->itimer_virtual_value = value;
+    }
+    else
+    {
+        current_task->itimer_prof_interval = interval;
+        current_task->itimer_prof_value = value;
+    }
+    if (old_pointer != 0ul && !user_copy_to_writable(current_user_root_page_table, old_pointer, old, 32ul))
+        return -14l;
+    return 0l;
+}
+
+static void sys_sleep_until(struct trap_frame* frame, u64 deadline, u64 remaining_pointer)
+{
+    if (timer_now() >= deadline)
+    {
+        frame->x[10] = 0ul;
+        return;
+    }
+    current_task->sleep_user_pointer = remaining_pointer;
+    frame->x[10] = (u64)-ERESTART_RESTARTBLOCK;
+    process_sleep(frame, SLEEP_TIMER, deadline);
+}
+
+static void sys_nanosleep_dispatch(struct trap_frame* frame, u64 request_pointer, u64 remaining_pointer)
+{
+    u64 request[2];
+    if (!user_copy_from_readable(current_user_root_page_table, request, request_pointer, 16ul))
+    {
+        frame->x[10] = (u64)-14l;
+        return;
+    }
+    if ((s64)request[0] < 0l || request[1] >= 1000000000ul)
+    {
+        frame->x[10] = (u64)-22l;
+        return;
+    }
+    current_task->restart_pending = 0u;
+    sys_sleep_until(frame, timer_now() + time_to_ticks(request[0], request[1], 1000000000ul), remaining_pointer);
+}
+
+static void sys_restart_syscall_dispatch(struct trap_frame* frame)
+{
+    if (current_task->restart_pending == 0u)
+    {
+        frame->x[10] = (u64)-EINTR;
+        return;
+    }
+    current_task->restart_pending = 0u;
+    sys_sleep_until(frame, current_task->restart_deadline, current_task->restart_user_pointer);
+}
+
+static int tty_poll(void);
+static int tty_readable(void);
+static int tty_has_foreground(void);
+
+static void scheduler_poll(u64 now)
+{
+    u32 index = 0u;
+    int input;
+    tty_poll();
+    input = tty_readable();
+    while (index < MAX_PROCESSES)
+    {
+        struct process* task = &processes[index];
+        index = index + 1u;
+        if (task->used == 0u || task->state == PROC_ZOMBIE)
+            continue;
+        if (task->itimer_real_deadline != 0ul && now >= task->itimer_real_deadline)
+        {
+            task->itimer_real_deadline = task->itimer_real_interval == 0ul ? 0ul : task->itimer_real_deadline + task->itimer_real_interval;
+            if (task->itimer_real_deadline != 0ul && task->itimer_real_deadline <= now)
+                task->itimer_real_deadline = now + task->itimer_real_interval;
+            signal_send_kernel(task, SIGALRM, SI_KERNEL);
+        }
+        if (task->state != PROC_WAITING)
+            continue;
+        if (task->sleep_reason == SLEEP_CONSOLE)
+        {
+            if (input != 0 || (task->sleep_deadline != 0ul && now >= task->sleep_deadline))
+            {
+                task->tty_timed_out = input == 0 ? 1u : 0u;
+                task->frame.x[10] = task->orig_a0;
+                task->frame.sepc = task->frame.sepc - 4ul;
+                process_wake(task);
+            }
+        }
+        else if (task->sleep_deadline != 0ul && now >= task->sleep_deadline)
+        {
+            task->frame.x[10] = task->sleep_reason == SLEEP_TIMER ? 0ul : (u64)-EAGAIN;
+            process_wake(task);
+        }
+    }
+}
+
+static int scheduler_can_wake(void)
+{
+    u32 index = 0u;
+    // Keys still reach a foreground group, so a terminal in use is never idle for good
+    if (tty_has_foreground())
+        return 1;
+    while (index < MAX_PROCESSES)
+    {
+        struct process* task = &processes[index];
+        index = index + 1u;
+        if (task->used == 0u || task->state == PROC_ZOMBIE)
+            continue;
+        if (task->itimer_real_deadline != 0ul)
+            return 1;
+        if (task->state == PROC_WAITING && (task->sleep_deadline != 0ul || task->sleep_reason == SLEEP_CONSOLE))
+            return 1;
+    }
+    return 0;
+}
+
+static void itimer_account(struct process* task, u64* value, u64 interval, u64 sig)
+{
+    if (*value == 0ul)
+        return;
+    if (*value > TIMER_INTERVAL)
+    {
+        *value = *value - TIMER_INTERVAL;
+        return;
+    }
+    *value = interval;
+    signal_send_kernel(task, sig, SI_KERNEL);
 }
 
 static void scheduler_timer_interrupt(struct trap_frame* frame)
 {
     scheduler_ticks = scheduler_ticks + 1ul;
     timer_program_next();
+    scheduler_poll(timer_now());
     if (current_task == NULL || current_task->used == 0u)
         return;
+    itimer_account(current_task, &current_task->itimer_virtual_value, current_task->itimer_virtual_interval, SIGVTALRM);
+    itimer_account(current_task, &current_task->itimer_prof_value, current_task->itimer_prof_interval, SIGPROF);
     if (current_task->time_slice > 0u)
         current_task->time_slice = current_task->time_slice - 1u;
     if (current_task->time_slice == 0u)
@@ -2236,8 +3639,26 @@ static s64 sys_execve_impl(struct trap_frame* frame, u64 path_pointer, u64 argv,
     }
     current_user_root_page_table = new_root;
     mem_zero(current_task->vm_regions, sizeof(struct vm_region) * (u64)MAX_VM_REGIONS);
+    {
+        u32 index = 0u;
+        while (index < (u32)SIGNAL_COUNT)
+        {
+            struct signal_action* action = &current_task->signal_actions[index];
+            if (action->handler != SIG_IGN)
+                action->handler = SIG_DFL;
+            action->flags = 0ul;
+            action->mask = 0ul;
+            index = index + 1u;
+        }
+    }
+    current_task->altstack_sp = 0ul;
+    current_task->altstack_size = 0ul;
+    current_task->altstack_flags = SS_DISABLE;
+    current_task->restart_pending = 0u;
+    current_task->did_exec = 1u;
     frame->sepc = image.start_entry;
-    frame->sstatus = (frame->sstatus & ~SSTATUS_SPP) | SSTATUS_SPIE;
+    // A new image has touched no vector register yet, so its signal frames carry none until it does
+    frame->sstatus = (frame->sstatus & ~(SSTATUS_SPP | SSTATUS_VS)) | SSTATUS_SPIE | SSTATUS_VS_INITIAL;
     frame->x[2] = stack;
     frame->x[10] = 0ul;
     current_task->root_page_table = current_user_root_page_table;
@@ -2328,6 +3749,7 @@ static void parse_fdt(void* fdt)
     boot_device.framebuffer_base = 0ul;
     boot_device.framebuffer_size = 0ul;
     boot_device.framebuffer_window = 0ul;
+    boot_device.timebase = DEFAULT_TIMEBASE;
 
     if (magic != 0xd00dfeedu)
         return;
@@ -2402,6 +3824,8 @@ static void parse_fdt(void* fdt)
                     if (cells <= 2u)
                         size_cells[depth] = cells;
                 }
+                else if (string_equals(prop, "timebase-frequency") && length >= 4u && be32(data) != 0u)
+                    boot_device.timebase = (u64)be32(data);
                 else if (string_equals(prop, "compatible") && prop_contains_string(data, length, "virtio,mmio"))
                     virtio_node[depth] = 1;
                 else if (string_equals(prop, "compatible") && prop_contains_string(data, length, "ns16550a"))
@@ -2907,184 +4331,607 @@ static int fat_write_at(struct vfs_node* node, u64 offset, const u8* source, u32
     return fat_write_entry(node);
 }
 
-// Looks a name up inside the directory a cluster chain holds
-static int fat_find_in(u32 directory, const char* short_name, struct vfs_node* out)
+struct fat_dir_cursor
 {
-    u32 cluster = directory;
-    while (cluster >= 2u && cluster < FAT_EOC)
+    u32 cluster;
+    u32 sector;
+    u32 offset;
+    u32 index;
+};
+
+struct fat_dir_item
+{
+    u8 entry[32];
+    u32 lba;
+    u32 offset;
+    u32 first_slot;
+    u32 index;
+    char short_name[13];
+    char name[FAT_NAME_BYTES];
+};
+
+static const u8 fat_long_name_offsets[13] = { 1u, 3u, 5u, 7u, 9u, 14u, 16u, 18u, 20u, 22u, 24u, 28u, 30u };
+
+static int fat_name_char_valid(int ch);
+static void fat_format_short_name(const u8* entry, char* name);
+static int component_to_short_name(const char* name, u32 length, char* short_name);
+static int ascii_to_upper(int ch);
+
+static void fat_dir_start(struct fat_dir_cursor* cursor, u32 directory)
+{
+    cursor->cluster = directory;
+    cursor->sector = 0u;
+    cursor->offset = 0u;
+    cursor->index = 0u;
+}
+
+static int fat_dir_valid(struct fat_dir_cursor* cursor)
+{
+    return cursor->cluster >= 2u && cursor->cluster < FAT_EOC;
+}
+
+static u32 fat_dir_lba(struct fat_dir_cursor* cursor)
+{
+    return fat_cluster_lba(cursor->cluster) + cursor->sector;
+}
+
+static u8* fat_dir_slot(struct fat_dir_cursor* cursor)
+{
+    if (!dir_sector_load(fat_dir_lba(cursor)))
+        return (u8*)NULL;
+    return dir_buffer + cursor->offset;
+}
+
+// Steps to the next slot, and to the next cluster of the chain when this one is used up
+static int fat_dir_advance(struct fat_dir_cursor* cursor)
+{
+    cursor->index = cursor->index + 1u;
+    cursor->offset = cursor->offset + 32u;
+    if (cursor->offset < SECTOR_SIZE)
+        return 1;
+    cursor->offset = 0u;
+    cursor->sector = cursor->sector + 1u;
+    if (cursor->sector < boot_volume.sectors_per_cluster)
+        return 1;
+    cursor->sector = 0u;
+    cursor->cluster = fat_next_cluster(cursor->cluster);
+    return fat_dir_valid(cursor);
+}
+
+static int fat_dir_seek(struct fat_dir_cursor* cursor, u32 directory, u32 index)
+{
+    fat_dir_start(cursor, directory);
+    while (cursor->index < index)
     {
-        u32 sector_index = 0u;
-        while (sector_index < boot_volume.sectors_per_cluster)
+        if (!fat_dir_advance(cursor))
+            return 0;
+    }
+    return 1;
+}
+
+static u8 fat_short_checksum(const u8* short_name)
+{
+    u8 sum = 0u;
+    u32 index = 0u;
+    while (index < 11u)
+    {
+        sum = (u8)((u8)((sum & 1u) << 7) + (u8)(sum >> 1) + short_name[index]);
+        index = index + 1u;
+    }
+    return sum;
+}
+
+static u32 fat_utf16_to_utf8(const u16* units, u32 count, char* text)
+{
+    u32 index = 0u;
+    u32 length = 0u;
+    while (index < count)
+    {
+        u32 code = (u32)units[index];
+        index = index + 1u;
+        if (code >= 0xd800u && code < 0xdc00u && index < count && units[index] >= 0xdc00u && units[index] < 0xe000u)
         {
-            u32 lba = fat_cluster_lba(cluster) + sector_index;
-            u32 offset = 0u;
-            if (!dir_sector_load(lba))
-                return 0;
-            while (offset < SECTOR_SIZE)
-            {
-                const u8* entry = dir_buffer + offset;
-                u8 first = entry[0];
-                u8 attributes = entry[11];
-                u32 name_index = 0u;
-                if (first == 0u)
-                    return 0;
-                if (first == 0xe5u || (attributes & 15u) == 15u || (attributes & 8u) != 0u)
-                {
-                    offset = offset + 32u;
-                    continue;
-                }
-                while (name_index < 11u && entry[name_index] == (u8)short_name[name_index])
-                    name_index = name_index + 1u;
-                if (name_index == 11u)
-                {
-                    u32 found = ((u32)le16(entry + 20) << 16) | (u32)le16(entry + 26);
-                    int directory_entry = (attributes & FAT_ATTRIBUTE_DIRECTORY) != 0u;
-                    out->type = directory_entry ? VFS_NODE_FAT_DIR : VFS_NODE_FAT_FILE;
-                    // A directory whose entry says cluster zero is the root
-                    out->first_cluster = directory_entry && found == 0u ? boot_volume.root_cluster : found;
-                    out->size = directory_entry ? 0u : le32(entry + 28);
-                    out->mode = directory_entry ? (S_IFDIR | 493u) : (S_IFREG | 438u);
-                    out->entry_lba = lba;
-                    out->entry_offset = offset;
-                    return 1;
-                }
-                offset = offset + 32u;
-            }
-            sector_index = sector_index + 1u;
+            code = 0x10000u + ((code - 0xd800u) << 10) + ((u32)units[index] - 0xdc00u);
+            index = index + 1u;
         }
-        cluster = fat_next_cluster(cluster);
-        if (cluster == FAT_READ_ERROR)
+        if (code < 0x80u)
+            text[length++] = (char)code;
+        else if (code < 0x800u)
+        {
+            text[length++] = (char)(0xc0u | (code >> 6));
+            text[length++] = (char)(0x80u | (code & 0x3fu));
+        }
+        else if (code < 0x10000u)
+        {
+            text[length++] = (char)(0xe0u | (code >> 12));
+            text[length++] = (char)(0x80u | ((code >> 6) & 0x3fu));
+            text[length++] = (char)(0x80u | (code & 0x3fu));
+        }
+        else
+        {
+            text[length++] = (char)(0xf0u | (code >> 18));
+            text[length++] = (char)(0x80u | ((code >> 12) & 0x3fu));
+            text[length++] = (char)(0x80u | ((code >> 6) & 0x3fu));
+            text[length++] = (char)(0x80u | (code & 0x3fu));
+        }
+    }
+    text[length] = 0;
+    return length;
+}
+
+// A long name is stored as UTF-16, so a name that is not valid UTF-8 or will not fit cannot be written
+static s64 fat_utf8_to_utf16(const char* text, u32 length, u16* units, u32* count)
+{
+    u32 index = 0u;
+    u32 written = 0u;
+    while (index < length)
+    {
+        u32 code = (u8)text[index];
+        u32 extra = 0u;
+        if (code >= 0xf0u && code < 0xf5u)
+        {
+            code = code & 7u;
+            extra = 3u;
+        }
+        else if (code >= 0xe0u && code < 0xf0u)
+        {
+            code = code & 15u;
+            extra = 2u;
+        }
+        else if (code >= 0xc2u && code < 0xe0u)
+        {
+            code = code & 31u;
+            extra = 1u;
+        }
+        else if (code >= 0x80u)
+            return -22l;
+        if (index + extra >= length)
+            return -22l;
+        index = index + 1u;
+        while (extra != 0u)
+        {
+            u32 next = (u8)text[index];
+            if ((next & 0xc0u) != 0x80u)
+                return -22l;
+            code = (code << 6) | (next & 0x3fu);
+            index = index + 1u;
+            extra = extra - 1u;
+        }
+        if (code < 0x20u || code == '"' || code == '*' || code == '/' || code == ':' || code == '<' ||
+            code == '>' || code == '?' || code == '\\' || code == '|' || code > 0x10ffffu)
+            return -22l;
+        if (code >= 0x10000u)
+        {
+            if (written + 2u > FAT_NAME_MAX)
+                return -36l;
+            code = code - 0x10000u;
+            units[written++] = (u16)(0xd800u + (code >> 10));
+            units[written++] = (u16)(0xdc00u + (code & 0x3ffu));
+        }
+        else
+        {
+            if (written + 1u > FAT_NAME_MAX)
+                return -36l;
+            units[written++] = (u16)code;
+        }
+    }
+    *count = written;
+    return written != 0u ? 0l : -22l;
+}
+
+// The next name a directory holds, with the long name its preceding slots spell when they belong to it
+static int fat_dir_next_item(struct fat_dir_cursor* cursor, struct fat_dir_item* item)
+{
+    u16 units[20u * 13u];
+    u32 expected = 0u;
+    u32 total = 0u;
+    u32 first_slot = 0u;
+    u8 checksum = 0u;
+    while (fat_dir_valid(cursor))
+    {
+        u8* entry = fat_dir_slot(cursor);
+        if (entry == (u8*)NULL || entry[0] == 0u)
+            return 0;
+        if (entry[0] == 0xe5u)
+            total = 0u;
+        else if ((entry[11] & 63u) == FAT_ATTRIBUTE_LONG_NAME)
+        {
+            u32 sequence = (u32)(entry[0] & 31u);
+            if ((entry[0] & 0x40u) != 0u && sequence != 0u && sequence <= 20u)
+            {
+                expected = sequence;
+                total = sequence * 13u;
+                checksum = entry[13];
+                first_slot = cursor->index;
+            }
+            if (total != 0u && sequence == expected && entry[13] == checksum)
+            {
+                u32 position = 0u;
+                while (position < 13u)
+                {
+                    units[(sequence - 1u) * 13u + position] = le16(entry + fat_long_name_offsets[position]);
+                    position = position + 1u;
+                }
+                expected = expected - 1u;
+            }
+            else
+                total = 0u;
+        }
+        else if ((entry[11] & FAT_ATTRIBUTE_VOLUME) != 0u)
+            total = 0u;
+        else
+        {
+            mem_copy(item->entry, entry, 32ul);
+            item->lba = fat_dir_lba(cursor);
+            item->offset = cursor->offset;
+            item->index = cursor->index;
+            item->first_slot = cursor->index;
+            fat_format_short_name(entry, item->short_name);
+            if (total != 0u && expected == 0u && fat_short_checksum(entry) == checksum)
+            {
+                u32 length = 0u;
+                while (length < total && units[length] != 0u && units[length] != 0xffffu)
+                    length = length + 1u;
+                if (length != 0u)
+                {
+                    fat_utf16_to_utf8(units, length, item->name);
+                    item->first_slot = first_slot;
+                }
+                else
+                    mem_copy(item->name, item->short_name, 13ul);
+            }
+            else
+                mem_copy(item->name, item->short_name, 13ul);
+            fat_dir_advance(cursor);
+            return 1;
+        }
+        if (!fat_dir_advance(cursor))
             return 0;
     }
     return 0;
 }
 
-
-// Puts a name in a directory, taking a free slot or making one
-static int fat_create_in(u32 directory, const char* short_name, u32 attributes, u32* out_lba, u32* out_offset)
+// A volume compares names without regard to case, the way it was written to
+static int fat_name_matches(const char* name, u32 length, const char* candidate)
 {
-    u32 cluster = directory;
-    u32 previous = 0u;
-
-    while (cluster >= 2u && cluster < FAT_EOC)
+    u32 index = 0u;
+    while (index < length)
     {
-        u32 sector_index = 0u;
-        while (sector_index < boot_volume.sectors_per_cluster)
-        {
-            u32 lba = fat_cluster_lba(cluster) + sector_index;
-            u32 offset = 0u;
-            if (!dir_sector_load(lba))
-                return 0;
-            while (offset < SECTOR_SIZE)
-            {
-                u8 first = dir_buffer[offset];
-                if (first == 0u || first == 0xe5u)
-                {
-                    u32 index = 0u;
-                    mem_zero(dir_buffer + offset, 32ul);
-                    while (index < 11u)
-                    {
-                        dir_buffer[offset + index] = (u8)short_name[index];
-                        index = index + 1u;
-                    }
-                    dir_buffer[offset + 11u] = (u8)(attributes != 0u ? attributes : 32u);
-                    // A fresh name owns nothing yet, so it has no cluster and no length
-                    if (!disk_write_sector(lba, dir_buffer))
-                        return 0;
-                    *out_lba = lba;
-                    *out_offset = offset;
-                    return 1;
-                }
-                offset = offset + 32u;
-            }
-            sector_index = sector_index + 1u;
-        }
-        previous = cluster;
-        cluster = fat_next_cluster(cluster);
-        if (cluster == FAT_READ_ERROR)
+        if (candidate[index] == 0 || ascii_to_upper((int)(u8)name[index]) != ascii_to_upper((int)(u8)candidate[index]))
             return 0;
+        index = index + 1u;
     }
-
-    // The directory is full, so it grows by a cluster
-    if (previous == 0u)
-        return 0;
-    cluster = fat_allocate_cluster();
-    if (cluster == 0u || !fat_clear_cluster(cluster) || !fat_set_cluster(previous, cluster))
-        return 0;
-    return fat_create_in(directory, short_name, attributes, out_lba, out_offset);
+    return candidate[length] == 0;
 }
 
-static int fat_remove_in(u32 directory, const char* short_name)
+static void fat_node_from_item(struct fat_dir_item* item, struct vfs_node* out)
 {
-    struct vfs_node found;
-    if (!fat_find_in(directory, short_name, &found))
+    u32 found = ((u32)le16(item->entry + 20) << 16) | (u32)le16(item->entry + 26);
+    int directory_entry = (item->entry[11] & FAT_ATTRIBUTE_DIRECTORY) != 0u;
+    out->type = directory_entry ? VFS_NODE_FAT_DIR : VFS_NODE_FAT_FILE;
+    // A directory whose entry says cluster zero is the root
+    out->first_cluster = directory_entry && found == 0u ? boot_volume.root_cluster : found;
+    out->size = directory_entry ? 0u : le32(item->entry + 28);
+    out->mode = directory_entry ? (S_IFDIR | 493u) : (S_IFREG | 438u);
+    out->entry_lba = item->lba;
+    out->entry_offset = item->offset;
+    out->slot_first = item->first_slot;
+    out->slot_entry = item->index;
+}
+
+// Looks a name up inside the directory a cluster chain holds, by its long name or by its alias
+static int fat_find_in(u32 directory, const char* name, u32 length, struct vfs_node* out)
+{
+    struct fat_dir_cursor cursor;
+    struct fat_dir_item item;
+    fat_dir_start(&cursor, directory);
+    while (fat_dir_next_item(&cursor, &item))
+    {
+        if (fat_name_matches(name, length, item.name) || fat_name_matches(name, length, item.short_name))
+        {
+            fat_node_from_item(&item, out);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int fat_short_name_taken(u32 directory, const u8* short_name)
+{
+    struct fat_dir_cursor cursor;
+    struct fat_dir_item item;
+    fat_dir_start(&cursor, directory);
+    while (fat_dir_next_item(&cursor, &item))
+    {
+        u32 index = 0u;
+        while (index < 11u && item.entry[index] == short_name[index])
+            index = index + 1u;
+        if (index == 11u)
+            return 1;
+    }
+    return 0;
+}
+
+static u32 fat_alias_part(const char* name, u32 begin, u32 end, u8* out, u32 capacity)
+{
+    u32 written = 0u;
+    while (begin < end && written < capacity)
+    {
+        u32 ch = (u8)name[begin];
+        begin = begin + 1u;
+        if (ch == '.' || ch == ' ')
+            continue;
+        if (ch >= 0x80u)
+        {
+            while (begin < end && ((u8)name[begin] & 0xc0u) == 0x80u)
+                begin = begin + 1u;
+            ch = '_';
+        }
+        ch = (u32)ascii_to_upper((int)ch);
+        out[written] = (u8)(fat_name_char_valid((int)ch) ? ch : '_');
+        written = written + 1u;
+    }
+    return written;
+}
+
+// The eight and three a long name also answers to: its first letters, a tilde and the lowest free number
+static int fat_make_alias(u32 directory, const char* name, u32 length, u8* short_name)
+{
+    u8 basis[8];
+    u32 dot = length;
+    u32 basis_length;
+    u32 number = 1u;
+    u32 index = length;
+    while (index != 0u)
+    {
+        index = index - 1u;
+        if (name[index] == '.')
+        {
+            dot = index;
+            break;
+        }
+    }
+    if (dot == 0u)
+        dot = length;
+    basis_length = fat_alias_part(name, 0u, dot, basis, 8u);
+    if (basis_length == 0u)
+    {
+        basis[0] = (u8)'_';
+        basis_length = 1u;
+    }
+    mem_zero(short_name, 11ul);
+    index = 0u;
+    while (index < 11u)
+    {
+        short_name[index] = (u8)' ';
+        index = index + 1u;
+    }
+    fat_alias_part(name, dot < length ? dot + 1u : length, length, short_name + 8, 3u);
+    while (number < 1000000u)
+    {
+        char digits[8];
+        u32 digit_count = 0u;
+        u32 value = number;
+        u32 keep;
+        while (value != 0u)
+        {
+            digits[digit_count] = (char)('0' + value % 10u);
+            digit_count = digit_count + 1u;
+            value = value / 10u;
+        }
+        keep = basis_length < 7u - digit_count ? basis_length : 7u - digit_count;
+        index = 0u;
+        while (index < 8u)
+        {
+            short_name[index] = (u8)' ';
+            index = index + 1u;
+        }
+        mem_copy(short_name, basis, (u64)keep);
+        short_name[keep] = (u8)'~';
+        index = 0u;
+        while (index < digit_count)
+        {
+            short_name[keep + 1u + index] = (u8)digits[digit_count - 1u - index];
+            index = index + 1u;
+        }
+        if (!fat_short_name_taken(directory, short_name))
+            return 1;
+        number = number + 1u;
+    }
+    return 0;
+}
+
+// Finds a run of free slots long enough for a name, growing the directory when it holds none
+static int fat_dir_find_free(u32 directory, u32 needed, u32* first)
+{
+    struct fat_dir_cursor cursor;
+    u32 run = 0u;
+    u32 start = 0u;
+    u32 last = directory;
+    fat_dir_start(&cursor, directory);
+    for (;;)
+    {
+        u8* entry;
+        last = cursor.cluster;
+        entry = fat_dir_slot(&cursor);
+        if (entry == (u8*)NULL)
+            return 0;
+        if (entry[0] == 0u || entry[0] == 0xe5u)
+        {
+            if (run == 0u)
+                start = cursor.index;
+            run = run + 1u;
+            if (run == needed)
+            {
+                *first = start;
+                return 1;
+            }
+        }
+        else
+            run = 0u;
+        if (!fat_dir_advance(&cursor))
+            break;
+    }
+    while (run < needed)
+    {
+        u32 cluster = fat_allocate_cluster();
+        if (cluster == 0u || !fat_clear_cluster(cluster) || !fat_set_cluster(last, cluster))
+            return 0;
+        if (run == 0u)
+            start = cursor.index;
+        run = run + boot_volume.sectors_per_cluster * (SECTOR_SIZE / 32u);
+        cursor.index = cursor.index + boot_volume.sectors_per_cluster * (SECTOR_SIZE / 32u);
+        last = cluster;
+    }
+    *first = start;
+    return 1;
+}
+
+static int fat_dir_write_slot(u32 directory, u32 index, const u8* slot, u32* lba, u32* offset)
+{
+    struct fat_dir_cursor cursor;
+    u8* entry;
+    if (!fat_dir_seek(&cursor, directory, index))
         return 0;
-    if (!dir_sector_load(found.entry_lba))
+    entry = fat_dir_slot(&cursor);
+    if (entry == (u8*)NULL)
         return 0;
-    dir_buffer[found.entry_offset] = 0xe5u;
-    if (!disk_write_sector(found.entry_lba, dir_buffer))
+    mem_copy(entry, slot, 32ul);
+    *lba = fat_dir_lba(&cursor);
+    *offset = cursor.offset;
+    return disk_write_sector(*lba, dir_buffer);
+}
+
+// A name the eight and three hold exactly in capitals needs nothing more; any other is spelled out in long-name slots
+static s64 fat_create_in(u32 directory, const char* name, u32 length, u32 attributes, struct vfs_node* out)
+{
+    u16 units[FAT_NAME_MAX];
+    u8 short_name[12];
+    u8 slot[32];
+    u32 count;
+    u32 slots = 0u;
+    u32 first;
+    u32 index = 0u;
+    u32 lba;
+    u32 offset;
+    u8 checksum;
+    s64 converted = fat_utf8_to_utf16(name, length, units, &count);
+    if (converted != 0l)
+        return converted;
+    if (component_to_short_name(name, length, (char*)short_name))
+    {
+        while (index < length)
+        {
+            if (name[index] >= 'a' && name[index] <= 'z')
+                slots = (count + 12u) / 13u;
+            index = index + 1u;
+        }
+    }
+    else
+    {
+        slots = (count + 12u) / 13u;
+        if (!fat_make_alias(directory, name, length, short_name))
+            return -17l;
+    }
+    if (!fat_dir_find_free(directory, slots + 1u, &first))
+        return -28l;
+    checksum = fat_short_checksum(short_name);
+    index = 0u;
+    while (index < slots)
+    {
+        u32 sequence = slots - index;
+        u32 position = 0u;
+        mem_zero(slot, 32ul);
+        slot[0] = (u8)(sequence | (index == 0u ? 0x40u : 0u));
+        slot[11] = FAT_ATTRIBUTE_LONG_NAME;
+        slot[13] = checksum;
+        while (position < 13u)
+        {
+            u32 unit = (sequence - 1u) * 13u + position;
+            store_le16(slot + fat_long_name_offsets[position], unit < count ? units[unit] : unit == count ? 0u : 0xffffu);
+            position = position + 1u;
+        }
+        if (!fat_dir_write_slot(directory, first + index, slot, &lba, &offset))
+            return -5l;
+        index = index + 1u;
+    }
+    mem_zero(slot, 32ul);
+    mem_copy(slot, short_name, 11ul);
+    slot[11] = (u8)(attributes != 0u ? attributes : 32u);
+    // A fresh name owns nothing yet, so it has no cluster and no length
+    if (!fat_dir_write_slot(directory, first + slots, slot, &lba, &offset))
+        return -5l;
+    out->type = (attributes & FAT_ATTRIBUTE_DIRECTORY) != 0u ? VFS_NODE_FAT_DIR : VFS_NODE_FAT_FILE;
+    out->first_cluster = 0u;
+    out->size = 0u;
+    out->mode = out->type == VFS_NODE_FAT_DIR ? (S_IFDIR | 493u) : (S_IFREG | 438u);
+    out->entry_lba = lba;
+    out->entry_offset = offset;
+    out->slot_first = first;
+    out->slot_entry = first + slots;
+    return 0l;
+}
+
+static int fat_remove_node(u32 directory, struct vfs_node* node)
+{
+    struct fat_dir_cursor cursor;
+    if (!fat_dir_seek(&cursor, directory, node->slot_first))
         return 0;
-    return fat_free_chain(found.first_cluster);
+    for (;;)
+    {
+        u8* entry = fat_dir_slot(&cursor);
+        if (entry == (u8*)NULL)
+            return 0;
+        entry[0] = 0xe5u;
+        if (!disk_write_sector(fat_dir_lba(&cursor), dir_buffer))
+            return 0;
+        if (cursor.index >= node->slot_entry)
+            break;
+        if (!fat_dir_advance(&cursor))
+            return 0;
+    }
+    return fat_free_chain(node->first_cluster);
 }
 
 // A directory holds nothing once its own two names are taken out of the count
 static int fat_directory_is_empty(u32 directory)
 {
-    u32 cluster = directory;
-    while (cluster >= 2u && cluster < FAT_EOC)
+    struct fat_dir_cursor cursor;
+    struct fat_dir_item item;
+    fat_dir_start(&cursor, directory);
+    while (fat_dir_next_item(&cursor, &item))
     {
-        u32 sector_index = 0u;
-        while (sector_index < boot_volume.sectors_per_cluster)
-        {
-            u32 lba = fat_cluster_lba(cluster) + sector_index;
-            u32 offset = 0u;
-            if (!dir_sector_load(lba))
-                return 0;
-            while (offset < SECTOR_SIZE)
-            {
-                const u8* entry = dir_buffer + offset;
-                u8 first = entry[0];
-                u8 attributes = entry[11];
-                if (first == 0u)
-                    return 1;
-                if (first != 0xe5u && (attributes & 15u) != 15u && (attributes & 8u) == 0u)
-                {
-                    if (!(entry[0] == (u8)'.' && (entry[1] == (u8)' ' || (entry[1] == (u8)'.' && entry[2] == (u8)' '))))
-                        return 0;
-                }
-                offset = offset + 32u;
-            }
-            sector_index = sector_index + 1u;
-        }
-        cluster = fat_next_cluster(cluster);
-        if (cluster == FAT_READ_ERROR)
+        if (!(item.entry[0] == (u8)'.' && (item.entry[1] == (u8)' ' || (item.entry[1] == (u8)'.' && item.entry[2] == (u8)' '))))
             return 0;
     }
     return 1;
 }
 
 // A fresh directory knows itself and its parent before it knows anything else
-static int fat_make_directory(u32 parent, const char* short_name, struct vfs_node* out)
+static s64 fat_make_directory(u32 parent, const char* name, u32 length, struct vfs_node* out)
 {
     u32 cluster = fat_allocate_cluster();
-    u32 entry_lba;
-    u32 entry_offset;
     u32 index;
+    s64 created;
 
     if (cluster == 0u || !fat_clear_cluster(cluster))
-        return 0;
-    if (!fat_create_in(parent, short_name, FAT_ATTRIBUTE_DIRECTORY, &entry_lba, &entry_offset))
-        return 0;
-    if (!dir_sector_load(entry_lba))
-        return 0;
-    store_le16(dir_buffer + entry_offset + 20u, (u16)(cluster >> 16));
-    store_le16(dir_buffer + entry_offset + 26u, (u16)cluster);
-    store_le32(dir_buffer + entry_offset + 28u, 0u);
-    if (!disk_write_sector(entry_lba, dir_buffer))
-        return 0;
+        return -28l;
+    created = fat_create_in(parent, name, length, FAT_ATTRIBUTE_DIRECTORY, out);
+    if (created != 0l)
+    {
+        fat_free_chain(cluster);
+        return created;
+    }
+    if (!dir_sector_load(out->entry_lba))
+        return -5l;
+    store_le16(dir_buffer + out->entry_offset + 20u, (u16)(cluster >> 16));
+    store_le16(dir_buffer + out->entry_offset + 26u, (u16)cluster);
+    store_le32(dir_buffer + out->entry_offset + 28u, 0u);
+    if (!disk_write_sector(out->entry_lba, dir_buffer))
+        return -5l;
 
     if (!dir_sector_load(fat_cluster_lba(cluster)))
-        return 0;
+        return -5l;
     mem_zero(dir_buffer, 64ul);
     index = 0u;
     while (index < 11u)
@@ -3104,15 +4951,9 @@ static int fat_make_directory(u32 parent, const char* short_name, struct vfs_nod
     store_le16(dir_buffer + 52, (u16)(parent == boot_volume.root_cluster ? 0u : parent >> 16));
     store_le16(dir_buffer + 58, (u16)(parent == boot_volume.root_cluster ? 0u : parent));
     if (!disk_write_sector(fat_cluster_lba(cluster), dir_buffer))
-        return 0;
-
-    out->type = VFS_NODE_FAT_DIR;
+        return -5l;
     out->first_cluster = cluster;
-    out->size = 0u;
-    out->mode = S_IFDIR | 493u;
-    out->entry_lba = entry_lba;
-    out->entry_offset = entry_offset;
-    return 1;
+    return 0l;
 }
 
 static int user_copy_to_writable(u64 root, u64 destination, const void* source, u64 count)
@@ -3356,46 +5197,6 @@ static int path_equal_literal_skip_root(const char* path, const char* literal)
     return path_equal_literal(skip_root_slashes(path), literal);
 }
 
-static int path_to_fat_short_name(const char* path, char* short_name)
-{
-    const char* p = skip_root_slashes(path);
-    u32 i = 0;
-    u32 ext = 0;
-    while (i < 11u)
-    {
-        short_name[i] = ' ';
-        i = i + 1u;
-    }
-    i = 0;
-    while (*p != 0 && *p != '.' && *p != '/')
-    {
-        int ch = ascii_to_upper((int)*p);
-        if (i >= 8u || !fat_name_char_valid(ch))
-            return 0;
-        short_name[i] = (char)ch;
-        i = i + 1u;
-        p = p + 1;
-    }
-    if (i == 0u)
-        return 0;
-    if (*p == '.')
-    {
-        p = p + 1;
-        while (*p != 0 && *p != '/')
-        {
-            int ch = ascii_to_upper((int)*p);
-            if (ext >= 3u || !fat_name_char_valid(ch))
-                return 0;
-            short_name[8u + ext] = (char)ch;
-            ext = ext + 1u;
-            p = p + 1;
-        }
-        if (ext == 0u)
-            return 0;
-    }
-    return *p == 0;
-}
-
 static void vfs_root_node(struct vfs_node* node)
 {
     node->type = VFS_NODE_ROOT_DIR;
@@ -3467,6 +5268,16 @@ static int component_to_short_name(const char* name, u32 length, char* short_nam
     return 1;
 }
 
+// Trailing dots mean nothing to a volume, which is how "name." and "name" are one file
+static u32 fat_trimmed_length(const char* name, u32 length)
+{
+    if (component_equals(name, length, ".") || component_equals(name, length, ".."))
+        return length;
+    while (length != 0u && name[length - 1u] == '.')
+        length = length - 1u;
+    return length;
+}
+
 // The cluster a directory says its parent lives in, which is zero for the root
 static int fat_parent_cluster(u32 directory, u32* out)
 {
@@ -3482,8 +5293,6 @@ static int fat_parent_cluster(u32 directory, u32* out)
 
 static int vfs_component_lookup(struct vfs_node* directory, const char* name, u32 length, struct vfs_node* out)
 {
-    char short_name[11];
-
     if (component_equals(name, length, "."))
     {
         *out = *directory;
@@ -3497,10 +5306,15 @@ static int vfs_component_lookup(struct vfs_node* directory, const char* name, u3
             vfs_root_node(out);
             return 1;
         }
-        if (component_equals(name, length, "console") || component_equals(name, length, "tty") ||
-            component_equals(name, length, "ttyS0"))
+        if (component_equals(name, length, "console") || component_equals(name, length, "ttyS0"))
         {
             vfs_device_node(out, VFS_NODE_CONSOLE);
+            out->first_cluster = component_equals(name, length, "console") ? 1u : 0u;
+            return 1;
+        }
+        if (component_equals(name, length, "tty"))
+        {
+            vfs_device_node(out, VFS_NODE_CURRENT_TTY);
             return 1;
         }
         if (component_equals(name, length, "null"))
@@ -3550,9 +5364,8 @@ static int vfs_component_lookup(struct vfs_node* directory, const char* name, u3
         return 1;
     }
 
-    if (!component_to_short_name(name, length, short_name))
-        return 0;
-    return fat_find_in(directory->first_cluster, short_name, out);
+    length = fat_trimmed_length(name, length);
+    return length != 0u && fat_find_in(directory->first_cluster, name, length, out);
 }
 
 static int vfs_walk(struct vfs_node* start, const char* path, struct path_result* result)
@@ -3573,7 +5386,8 @@ static int vfs_walk(struct vfs_node* start, const char* path, struct path_result
 
     result->has_parent = 0u;
     result->has_node = 1u;
-    result->leaf_valid = 0u;
+    result->leaf = cursor;
+    result->leaf_length = 0u;
     result->node = current;
 
     for (;;)
@@ -3590,7 +5404,8 @@ static int vfs_walk(struct vfs_node* start, const char* path, struct path_result
             struct vfs_node next;
             result->parent = current;
             result->has_parent = 1u;
-            result->leaf_valid = (u32)component_to_short_name(begin, length, result->leaf);
+            result->leaf = begin;
+            result->leaf_length = fat_trimmed_length(begin, length);
             if (!vfs_component_lookup(&current, begin, length, &next))
             {
                 result->has_node = 0u;
@@ -3620,27 +5435,15 @@ static int vfs_lookup(const char* path, struct vfs_node* node)
     return 1;
 }
 
-static int fat_find_short(const char* short_name, u32* first_cluster, u32* size)
+static u32 fat_read_node_to_memory(struct vfs_node* node, void* destination, u32 max_size, u32* out_size)
 {
-    struct vfs_node found;
-    if (!fat_find_in(boot_volume.root_cluster, short_name, &found))
-        return 0;
-    *first_cluster = found.first_cluster;
-    *size = found.size;
-    return 1;
-}
-
-static u32 fat_read_short_to_memory(const char* short_name, void* destination, u32 max_size, u32* out_size)
-{
-    u32 cluster;
-    u32 file_size;
+    u32 cluster = node->first_cluster;
+    u32 file_size = node->size;
     u32 remaining;
     u32 cluster_bytes;
     u8* dst = (u8*)destination;
 
     *out_size = 0u;
-    if (!fat_find_short(short_name, &cluster, &file_size))
-        return 1u;
     if (file_size > max_size)
         return 2u;
 
@@ -3708,10 +5511,10 @@ static u32 fat_read_short_to_memory(const char* short_name, void* destination, u
 
 static int fat_read_path_to_memory(const char* path, void* destination, u32 max_size, u32* out_size)
 {
-    char short_name[11];
-    if (!path_to_fat_short_name(path, short_name))
+    struct vfs_node node;
+    if (!vfs_lookup(path, &node) || node.type != VFS_NODE_FAT_FILE)
         return 0;
-    return fat_read_short_to_memory(short_name, destination, max_size, out_size) == 0u;
+    return fat_read_node_to_memory(&node, destination, max_size, out_size) == 0u;
 }
 
 static int fat_read_at(struct vfs_node* node, u64 offset, void* destination, u32 count, u32* read_count)
@@ -3823,12 +5626,7 @@ static void fd_install(u32 fd, struct vfs_node* node, u64 flags)
     open_files[fd].used = 1u;
     open_files[fd].flags = (u32)flags;
     open_files[fd].offset = 0ul;
-    open_files[fd].node.type = node->type;
-    open_files[fd].node.first_cluster = node->first_cluster;
-    open_files[fd].node.size = node->size;
-    open_files[fd].node.mode = node->mode;
-    open_files[fd].node.entry_lba = node->entry_lba;
-    open_files[fd].node.entry_offset = node->entry_offset;
+    mem_copy(&open_files[fd].node, node, sizeof(struct vfs_node));
 }
 
 static void vfs_init(void)
@@ -3844,6 +5642,10 @@ static void vfs_init(void)
     console.first_cluster = 0u;
     console.size = 0u;
     console.mode = S_IFCHR | 438u;
+    console.entry_lba = 0u;
+    console.entry_offset = 0u;
+    console.slot_first = 0u;
+    console.slot_entry = 0u;
     fd_install(0u, &console, O_RDWR);
     fd_install(1u, &console, O_RDWR);
     fd_install(2u, &console, O_RDWR);
@@ -3860,33 +5662,732 @@ static int fd_write_allowed(struct file_descriptor* file)
     return mode == O_WRONLY || mode == O_RDWR;
 }
 
-static s64 console_read_to_user(u64 buffer, u64 count, u32 flags)
+struct tty
 {
+    u32 iflag;
+    u32 oflag;
+    u32 cflag;
+    u32 lflag;
+    u8 line;
+    u8 cc[TTY_NCCS];
+    u32 session;
+    u32 pgrp;
+    u16 rows;
+    u16 columns;
+    u32 head;
+    u32 count;
+    u32 lines;
+    u32 edit_length;
+    u32 edit_column;
+    u32 column;
+    u32 literal;
+    u8 ring[TTY_BUFFER_SIZE];
+    u8 marks[TTY_BUFFER_SIZE];
+    u8 edit[TTY_BUFFER_SIZE];
+};
+
+static struct tty console_tty;
+
+// The settings a terminal comes up with on the kernel we follow
+static void tty_init(void)
+{
+    struct tty* tty = &console_tty;
+    mem_zero(tty, sizeof(struct tty));
+    tty->iflag = TTY_ICRNL | TTY_IXON | TTY_IUTF8;
+    tty->oflag = TTY_OPOST | TTY_ONLCR;
+    tty->cflag = TTY_B38400 | TTY_CS8 | TTY_CREAD | TTY_HUPCL;
+    tty->lflag = TTY_ISIG | TTY_ICANON | TTY_ECHO | TTY_ECHOE | TTY_ECHOK | TTY_ECHOCTL | TTY_ECHOKE | TTY_IEXTEN;
+    tty->cc[TTY_VINTR] = 3u;
+    tty->cc[TTY_VQUIT] = 28u;
+    tty->cc[TTY_VERASE] = 127u;
+    tty->cc[TTY_VKILL] = 21u;
+    tty->cc[TTY_VEOF] = 4u;
+    tty->cc[TTY_VMIN] = 1u;
+    tty->cc[TTY_VSTART] = 17u;
+    tty->cc[TTY_VSTOP] = 19u;
+    tty->cc[TTY_VSUSP] = 26u;
+    tty->cc[TTY_VREPRINT] = 18u;
+    tty->cc[TTY_VDISCARD] = 15u;
+    tty->cc[TTY_VWERASE] = 23u;
+    tty->cc[TTY_VLNEXT] = 22u;
+    tty->rows = 25u;
+    tty->columns = 80u;
+}
+
+static u32 tty_advance_column(u32 column, u8 ch)
+{
+    if (ch == '\r' || ch == '\n')
+        return 0u;
+    if (ch == '\b')
+        return column != 0u ? column - 1u : 0u;
+    if (ch == '\t')
+        return (column | 7u) + 1u;
+    if (ch < 32u || ch == 127u || (ch & 0xc0u) == 0x80u)
+        return column;
+    return column + 1u;
+}
+
+static void tty_emit(u8 ch)
+{
+    fbcon_putchar((int)ch);
+    uart_putchar((int)ch);
+    console_tty.column = tty_advance_column(console_tty.column, ch);
+}
+
+static void tty_output(u8 ch)
+{
+    struct tty* tty = &console_tty;
+    if ((tty->oflag & TTY_OPOST) != 0u)
+    {
+        if (ch == '\n' && (tty->oflag & TTY_ONLCR) != 0u)
+            tty_emit('\r');
+        else if (ch == '\r' && (tty->oflag & TTY_OCRNL) != 0u)
+            ch = '\n';
+    }
+    tty_emit(ch);
+}
+
+static int tty_control(u8 ch)
+{
+    return (ch < 32u && ch != '\t' && ch != '\n') || ch == 127u;
+}
+
+static void tty_echo(u8 ch)
+{
+    if ((console_tty.lflag & TTY_ECHOCTL) != 0u && tty_control(ch))
+    {
+        tty_output('^');
+        tty_output(ch == 127u ? (u8)'?' : (u8)(ch ^ 64u));
+        return;
+    }
+    tty_output(ch);
+}
+
+static int tty_matches(u8 ch, u32 index)
+{
+    return console_tty.cc[index] != 0u && ch == console_tty.cc[index];
+}
+
+static void tty_push(u8 ch, u8 mark)
+{
+    struct tty* tty = &console_tty;
+    if (tty->count >= TTY_BUFFER_SIZE)
+        return;
+    tty->ring[(tty->head + tty->count) % TTY_BUFFER_SIZE] = ch;
+    tty->marks[(tty->head + tty->count) % TTY_BUFFER_SIZE] = mark;
+    tty->count = tty->count + 1u;
+    if (mark != 0u)
+        tty->lines = tty->lines + 1u;
+}
+
+static void tty_flush_input(void)
+{
+    console_tty.head = 0u;
+    console_tty.count = 0u;
+    console_tty.lines = 0u;
+    console_tty.edit_length = 0u;
+    console_tty.literal = 0u;
+}
+
+// A finished line moves to where readers take from, whole or not at all
+static void tty_commit(u8 ch, u8 mark)
+{
+    struct tty* tty = &console_tty;
+    u32 index = 0u;
+    if (tty->count + tty->edit_length + 1u > TTY_BUFFER_SIZE)
+    {
+        tty->edit_length = 0u;
+        return;
+    }
+    while (index < tty->edit_length)
+    {
+        tty_push(tty->edit[index], 0u);
+        index = index + 1u;
+    }
+    tty_push(ch, mark);
+    tty->edit_length = 0u;
+}
+
+// How wide a character of the line being edited was drawn, which is how far an erase must back up
+static u32 tty_edit_width(u32 index)
+{
+    struct tty* tty = &console_tty;
+    u32 column = tty->edit_column;
+    u32 position = 0u;
+    u8 ch = tty->edit[index];
+    while (position < index)
+    {
+        u8 before = tty->edit[position];
+        column = (tty->lflag & TTY_ECHOCTL) != 0u && tty_control(before) ? column + 2u : tty_advance_column(column, before);
+        position = position + 1u;
+    }
+    if ((tty->lflag & TTY_ECHOCTL) != 0u && tty_control(ch))
+        return 2u;
+    return tty_advance_column(column, ch) - column;
+}
+
+static void tty_rub_out(void)
+{
+    struct tty* tty = &console_tty;
+    u32 start = tty->edit_length - 1u;
+    u32 width;
+    while (start != 0u && (tty->edit[start] & 0xc0u) == 0x80u && (tty->iflag & TTY_IUTF8) != 0u)
+        start = start - 1u;
+    width = tty_edit_width(start);
+    tty->edit_length = start;
+    if ((tty->lflag & TTY_ECHO) == 0u)
+        return;
+    while (width != 0u)
+    {
+        tty_output('\b');
+        tty_output(' ');
+        tty_output('\b');
+        width = width - 1u;
+    }
+}
+
+static void tty_erase(u8 ch, int word)
+{
+    struct tty* tty = &console_tty;
+    if (tty->edit_length == 0u)
+        return;
+    if ((tty->lflag & TTY_ECHOE) == 0u)
+    {
+        tty->edit_length = tty->edit_length - 1u;
+        if ((tty->lflag & TTY_ECHO) != 0u)
+            tty_echo(ch);
+        return;
+    }
+    if (!word)
+    {
+        tty_rub_out();
+        return;
+    }
+    while (tty->edit_length != 0u && (tty->edit[tty->edit_length - 1u] == ' ' || tty->edit[tty->edit_length - 1u] == '\t'))
+        tty_rub_out();
+    while (tty->edit_length != 0u && tty->edit[tty->edit_length - 1u] != ' ' && tty->edit[tty->edit_length - 1u] != '\t')
+        tty_rub_out();
+}
+
+static void tty_kill(u8 ch)
+{
+    struct tty* tty = &console_tty;
+    if ((tty->lflag & (TTY_ECHOKE | TTY_ECHOE)) == (TTY_ECHOKE | TTY_ECHOE))
+    {
+        while (tty->edit_length != 0u)
+            tty_rub_out();
+        return;
+    }
+    tty->edit_length = 0u;
+    if ((tty->lflag & TTY_ECHO) != 0u)
+    {
+        tty_echo(ch);
+        if ((tty->lflag & TTY_ECHOK) != 0u)
+            tty_output('\n');
+    }
+}
+
+static void tty_reprint(u8 ch)
+{
+    struct tty* tty = &console_tty;
+    u32 index = 0u;
+    if ((tty->lflag & TTY_ECHO) == 0u)
+        return;
+    tty_echo(ch);
+    tty_output('\n');
+    tty->edit_column = tty->column;
+    while (index < tty->edit_length)
+    {
+        tty_echo(tty->edit[index]);
+        index = index + 1u;
+    }
+}
+
+static void tty_add(u8 ch)
+{
+    struct tty* tty = &console_tty;
+    if ((tty->lflag & TTY_ICANON) != 0u)
+    {
+        if (tty->edit_length + 1u >= TTY_BUFFER_SIZE)
+            return;
+        if (tty->edit_length == 0u)
+            tty->edit_column = tty->column;
+        tty->edit[tty->edit_length] = ch;
+        tty->edit_length = tty->edit_length + 1u;
+    }
+    else
+        tty_push(ch, 0u);
+    if ((tty->lflag & TTY_ECHO) != 0u)
+        tty_echo(ch);
+}
+
+// What a key means before any reader sees it: the settings decide what is taken out, turned into a signal, or edited
+static void tty_receive(u8 ch)
+{
+    struct tty* tty = &console_tty;
+    if (tty->literal != 0u)
+    {
+        tty->literal = 0u;
+        if ((tty->lflag & (TTY_ECHO | TTY_ECHOCTL)) == (TTY_ECHO | TTY_ECHOCTL))
+            tty_output('\b');
+        tty_add(ch);
+        return;
+    }
+    if ((tty->iflag & TTY_ISTRIP) != 0u)
+        ch = (u8)(ch & 127u);
+    if (ch == '\r')
+    {
+        if ((tty->iflag & TTY_IGNCR) != 0u)
+            return;
+        if ((tty->iflag & TTY_ICRNL) != 0u)
+            ch = '\n';
+    }
+    else if (ch == '\n' && (tty->iflag & TTY_INLCR) != 0u)
+        ch = '\r';
+    if ((tty->iflag & TTY_IXON) != 0u && (tty_matches(ch, TTY_VSTART) || tty_matches(ch, TTY_VSTOP)))
+        return;
+    if ((tty->lflag & TTY_ISIG) != 0u)
+    {
+        u64 sig = tty_matches(ch, TTY_VINTR) ? SIGINT : tty_matches(ch, TTY_VQUIT) ? SIGQUIT : tty_matches(ch, TTY_VSUSP) ? SIGTSTP : 0ul;
+        if (sig != 0ul)
+        {
+            if ((tty->lflag & TTY_NOFLSH) == 0u)
+                tty_flush_input();
+            if ((tty->lflag & TTY_ECHO) != 0u)
+                tty_echo(ch);
+            if (tty->pgrp != 0u)
+                process_group_signal(tty->pgrp, sig);
+            return;
+        }
+    }
+    if ((tty->lflag & TTY_ICANON) != 0u)
+    {
+        // A terminal may send either backspace or delete for the key that erases
+        if (tty_matches(ch, TTY_VERASE) || ch == '\b')
+        {
+            tty_erase(ch, 0);
+            return;
+        }
+        if ((tty->lflag & TTY_IEXTEN) != 0u && tty_matches(ch, TTY_VWERASE))
+        {
+            tty_erase(ch, 1);
+            return;
+        }
+        if (tty_matches(ch, TTY_VKILL))
+        {
+            tty_kill(ch);
+            return;
+        }
+        if ((tty->lflag & TTY_IEXTEN) != 0u && tty_matches(ch, TTY_VREPRINT))
+        {
+            tty_reprint(ch);
+            return;
+        }
+        if ((tty->lflag & TTY_IEXTEN) != 0u && tty_matches(ch, TTY_VLNEXT))
+        {
+            tty->literal = 1u;
+            if ((tty->lflag & (TTY_ECHO | TTY_ECHOCTL)) == (TTY_ECHO | TTY_ECHOCTL))
+            {
+                tty_output('^');
+                tty_output('\b');
+            }
+            return;
+        }
+        if (tty_matches(ch, TTY_VEOF))
+        {
+            tty_commit(0u, TTY_MARK_EOF);
+            return;
+        }
+        if (ch == '\n' || tty_matches(ch, TTY_VEOL) || ((tty->lflag & TTY_IEXTEN) != 0u && tty_matches(ch, TTY_VEOL2)))
+        {
+            if ((tty->lflag & TTY_ECHO) != 0u || (ch == '\n' && (tty->lflag & TTY_ECHONL) != 0u))
+                tty_echo(ch);
+            tty_commit(ch, TTY_MARK_LINE);
+            return;
+        }
+    }
+    tty_add(ch);
+}
+
+static int tty_has_foreground(void)
+{
+    return console_tty.pgrp != 0u;
+}
+
+static int tty_readable(void)
+{
+    return (console_tty.lflag & TTY_ICANON) != 0u ? console_tty.lines != 0u : console_tty.count != 0u;
+}
+
+// Keys are taken off the line on every tick, so a signal key reaches a program that never reads
+static int tty_poll(void)
+{
+    int received = 0;
+    while (uart_can_read())
+    {
+        tty_receive((u8)uart_try_read());
+        received = 1;
+    }
+    return received;
+}
+
+static int signal_ignored_or_blocked(struct process* task, u64 sig)
+{
+    return (task->signal_blocked & signal_bit(sig)) != 0ul || task->signal_actions[sig - 1ul].handler == SIG_IGN;
+}
+
+// A group outside the foreground that touches the terminal is stopped for it, or refused when nothing could resume it
+static s64 tty_job_check(u64 sig)
+{
+    struct process* task = current_task;
+    struct tty* tty = &console_tty;
+    if (task->ctty == 0u || tty->session != task->sid || tty->pgrp == 0u || task->pgid == tty->pgrp)
+        return 0l;
+    if (signal_ignored_or_blocked(task, sig))
+        return sig == SIGTTIN ? -5l : 0l;
+    if (process_group_orphaned(task->pgid, (struct process*)NULL))
+        return -5l;
+    process_group_signal(task->pgid, sig);
+    return -ERESTARTSYS;
+}
+
+static s64 tty_read(u64 buffer, u64 count, u32 flags)
+{
+    struct tty* tty = &console_tty;
+    u8 chunk[512];
     u64 done = 0ul;
+    s64 check = tty_job_check(SIGTTIN);
+    current_task->sleep_deadline = 0ul;
+    if (check != 0l)
+        return check;
+    tty_poll();
     if (count == 0ul)
         return 0l;
-    if ((flags & (u32)O_NONBLOCK) != 0u && !uart_can_read())
-        return -11l;
+    if ((tty->lflag & TTY_ICANON) != 0u)
+    {
+        if (tty->lines == 0u)
+            return (flags & (u32)O_NONBLOCK) != 0u ? -EAGAIN : -ERESTARTSYS;
+    }
+    else
+    {
+        u64 wanted = tty->cc[TTY_VMIN] < count ? (u64)tty->cc[TTY_VMIN] : count;
+        int timed_out = current_task->tty_timed_out != 0u;
+        current_task->tty_timed_out = 0u;
+        if ((u64)tty->count < (wanted == 0ul ? 1ul : wanted) && !timed_out && (wanted != 0ul || tty->cc[TTY_VTIME] != 0u))
+        {
+            if ((flags & (u32)O_NONBLOCK) != 0u)
+                return -EAGAIN;
+            if (tty->cc[TTY_VTIME] != 0u && (wanted == 0ul || tty->count != 0u))
+                current_task->sleep_deadline = timer_now() + (u64)tty->cc[TTY_VTIME] * boot_device.timebase / 10ul;
+            return -ERESTARTSYS;
+        }
+    }
+    while (done < count && tty->count != 0u)
+    {
+        u32 taken = 0u;
+        int ended = 0;
+        while (taken < sizeof(chunk) && done + (u64)taken < count && tty->count != 0u)
+        {
+            u8 ch = tty->ring[tty->head];
+            u8 mark = tty->marks[tty->head];
+            tty->head = (tty->head + 1u) % TTY_BUFFER_SIZE;
+            tty->count = tty->count - 1u;
+            if (mark != 0u)
+            {
+                tty->lines = tty->lines - 1u;
+                ended = 1;
+            }
+            if (mark != TTY_MARK_EOF)
+            {
+                chunk[taken] = ch;
+                taken = taken + 1u;
+            }
+            if (ended)
+                break;
+        }
+        if (taken != 0u && !user_copy_to_writable(current_user_root_page_table, buffer + done, chunk, (u64)taken))
+            return done != 0ul ? (s64)done : -14l;
+        done = done + (u64)taken;
+        if (ended)
+            break;
+    }
+    return (s64)done;
+}
+
+static s64 tty_write(u64 buffer, u64 count)
+{
+    struct tty* tty = &console_tty;
+    u64 done = 0ul;
+    if ((tty->lflag & TTY_TOSTOP) != 0u)
+    {
+        s64 check = tty_job_check(SIGTTOU);
+        if (check != 0l)
+            return check;
+    }
     while (done < count)
     {
         u64 physical;
         u64 chunk;
-        u64 offset = 0ul;
-        if (!user_translate(current_user_root_page_table, buffer + done, PTE_W, &physical))
-            return -14l;
+        if (!user_translate(current_user_root_page_table, buffer + done, PTE_R, &physical))
+            return done != 0ul ? (s64)done : -14l;
         chunk = PAGE_SIZE - (physical & PAGE_MASK);
         if (chunk > count - done)
             chunk = count - done;
-        while (offset < chunk)
+        // The settings nearly every program runs with have a fast path; anything else goes a byte at a time
+        if ((tty->oflag & (TTY_OPOST | TTY_ONLCR | TTY_OCRNL)) == (TTY_OPOST | TTY_ONLCR))
         {
-            ((u8*)physical)[offset] = (u8)uart_read_blocking();
-            offset = offset + 1ul;
-            done = done + 1ul;
-            if ((flags & (u32)O_NONBLOCK) != 0u && !uart_can_read())
-                return (s64)done;
+            u64 index = 0ul;
+            uart_write_buffer((const u8*)physical, chunk);
+            while (index < chunk)
+            {
+                tty->column = tty_advance_column(tty->column, ((const u8*)physical)[index]);
+                index = index + 1ul;
+            }
+        }
+        else
+        {
+            u64 index = 0ul;
+            while (index < chunk)
+            {
+                tty_output(((const u8*)physical)[index]);
+                index = index + 1ul;
+            }
+        }
+        done = done + chunk;
+    }
+    return (s64)count;
+}
+
+// A session gives up its terminal when its leader goes, and the foreground hears the line drop
+static void tty_release_session(u32 sid, int hang_up)
+{
+    struct tty* tty = &console_tty;
+    u32 index = 0u;
+    if (tty->session != sid)
+        return;
+    if (hang_up != 0 && tty->pgrp != 0u)
+    {
+        process_group_signal(tty->pgrp, SIGHUP);
+        if (hang_up > 1)
+            process_group_signal(tty->pgrp, SIGCONT);
+    }
+    tty->session = 0u;
+    tty->pgrp = 0u;
+    while (index < MAX_PROCESSES)
+    {
+        if (processes[index].used != 0u && processes[index].sid == sid)
+            processes[index].ctty = 0u;
+        index = index + 1u;
+    }
+}
+
+static int tty_acquire(struct process* task, int steal)
+{
+    struct tty* tty = &console_tty;
+    if (task->sid != task->pid || task->ctty != 0u)
+        return task->ctty != 0u && tty->session == task->sid;
+    if (tty->session != 0u)
+    {
+        if (!steal)
+            return 0;
+        tty_release_session(tty->session, 0);
+    }
+    tty->session = task->sid;
+    tty->pgrp = task->pgid;
+    task->ctty = 1u;
+    return 1;
+}
+
+static void tty_store_termios(u8* data)
+{
+    struct tty* tty = &console_tty;
+    mem_zero(data, TTY_TERMIOS_SIZE);
+    store_le32(data, tty->iflag);
+    store_le32(data + 4, tty->oflag);
+    store_le32(data + 8, tty->cflag);
+    store_le32(data + 12, tty->lflag);
+    data[16] = tty->line;
+    mem_copy(data + 17, tty->cc, (u64)TTY_NCCS);
+}
+
+// Leaving line editing hands over what was typed so far; returning to it takes up what was not yet read
+static void tty_load_termios(const u8* data)
+{
+    struct tty* tty = &console_tty;
+    u32 was_canonical = tty->lflag & TTY_ICANON;
+    tty->iflag = le32(data);
+    tty->oflag = le32(data + 4);
+    tty->cflag = le32(data + 8);
+    tty->lflag = le32(data + 12);
+    tty->line = data[16];
+    mem_copy(tty->cc, data + 17, (u64)TTY_NCCS);
+    if (was_canonical != 0u && (tty->lflag & TTY_ICANON) == 0u)
+    {
+        u32 index = 0u;
+        while (index < tty->edit_length)
+        {
+            tty_push(tty->edit[index], 0u);
+            index = index + 1u;
+        }
+        tty->edit_length = 0u;
+        tty->lines = 0u;
+        index = 0u;
+        while (index < tty->count)
+        {
+            tty->marks[(tty->head + index) % TTY_BUFFER_SIZE] = 0u;
+            index = index + 1u;
         }
     }
-    return (s64)done;
+    else if (was_canonical == 0u && (tty->lflag & TTY_ICANON) != 0u)
+    {
+        u32 length = 0u;
+        while (tty->count != 0u && length + 1u < TTY_BUFFER_SIZE)
+        {
+            tty->edit[length] = tty->ring[tty->head];
+            tty->head = (tty->head + 1u) % TTY_BUFFER_SIZE;
+            tty->count = tty->count - 1u;
+            length = length + 1u;
+        }
+        tty->edit_length = length;
+        tty->edit_column = tty->column;
+    }
+}
+
+static s64 tty_ioctl(struct file_descriptor* file, u64 request, u64 argument)
+{
+    struct tty* tty = &console_tty;
+    struct process* task = current_task;
+    int controlling = task->ctty != 0u && tty->session == task->sid;
+    u8 data[TTY_TERMIOS_SIZE];
+    u32 value;
+    s64 check;
+    if (request == TCGETS)
+    {
+        tty_store_termios(data);
+        return user_copy_to_writable(current_user_root_page_table, argument, data, (u64)TTY_TERMIOS_SIZE) ? 0l : -14l;
+    }
+    if (request == TCSETS || request == TCSETSW || request == TCSETSF)
+    {
+        check = tty_job_check(SIGTTOU);
+        if (check != 0l)
+            return check;
+        if (!user_copy_from_readable(current_user_root_page_table, data, argument, (u64)TTY_TERMIOS_SIZE))
+            return -14l;
+        if (request == TCSETSF)
+            tty_flush_input();
+        tty_load_termios(data);
+        return 0l;
+    }
+    if (request == TIOCGWINSZ)
+    {
+        mem_zero(data, 8ul);
+        store_le16(data, tty->rows);
+        store_le16(data + 2, tty->columns);
+        return user_copy_to_writable(current_user_root_page_table, argument, data, 8ul) ? 0l : -14l;
+    }
+    if (request == TIOCSWINSZ)
+    {
+        if (!user_copy_from_readable(current_user_root_page_table, data, argument, 8ul))
+            return -14l;
+        if (le16(data) != tty->rows || le16(data + 2) != tty->columns)
+        {
+            tty->rows = le16(data);
+            tty->columns = le16(data + 2);
+            if (tty->pgrp != 0u)
+                process_group_signal(tty->pgrp, SIGWINCH);
+        }
+        return 0l;
+    }
+    if (request == TIOCGPGRP || request == TIOCGSID)
+    {
+        if (!controlling)
+            return -25l;
+        value = request == TIOCGPGRP ? tty->pgrp : tty->session;
+        return user_copy_to_writable(current_user_root_page_table, argument, &value, 4ul) ? 0l : -14l;
+    }
+    if (request == TIOCSPGRP)
+    {
+        u32 index = 0u;
+        int found = 0;
+        if (!controlling)
+            return -25l;
+        check = tty_job_check(SIGTTOU);
+        if (check != 0l)
+            return check;
+        if (!user_copy_from_readable(current_user_root_page_table, &value, argument, 4ul))
+            return -14l;
+        if ((s32)value <= 0)
+            return -22l;
+        while (index < MAX_PROCESSES)
+        {
+            if (processes[index].used != 0u && processes[index].pgid == value && processes[index].sid == task->sid)
+                found = 1;
+            index = index + 1u;
+        }
+        if (!found)
+            return -1l;
+        tty->pgrp = value;
+        return 0l;
+    }
+    if (request == TIOCSCTTY)
+        return tty_acquire(task, argument == 1ul) ? 0l : -1l;
+    if (request == TIOCNOTTY)
+    {
+        if (!controlling)
+            return -25l;
+        if (task->sid == task->pid)
+            tty_release_session(task->sid, 2);
+        else
+            task->ctty = 0u;
+        return 0l;
+    }
+    if (request == FIONREAD)
+    {
+        tty_poll();
+        value = 0u;
+        if ((tty->lflag & TTY_ICANON) == 0u)
+            value = tty->count;
+        else
+        {
+            u32 index = 0u;
+            while (index < tty->count)
+            {
+                u8 mark = tty->marks[(tty->head + index) % TTY_BUFFER_SIZE];
+                index = index + 1u;
+                if (mark != 0u)
+                    value = index;
+            }
+        }
+        return user_copy_to_writable(current_user_root_page_table, argument, &value, 4ul) ? 0l : -14l;
+    }
+    if (request == FIONBIO)
+    {
+        if (!user_copy_from_readable(current_user_root_page_table, &value, argument, 4ul))
+            return -14l;
+        file->flags = value != 0u ? file->flags | (u32)O_NONBLOCK : file->flags & ~(u32)O_NONBLOCK;
+        return 0l;
+    }
+    if (request == TCFLSH)
+    {
+        check = tty_job_check(SIGTTOU);
+        if (check != 0l)
+            return check;
+        if (argument > 2ul)
+            return -22l;
+        if (argument != 1ul)
+            tty_flush_input();
+        return 0l;
+    }
+    if (request == TCSBRK || request == TCSBRKP || request == TCXONC || request == TIOCOUTQ)
+    {
+        if (request == TIOCOUTQ)
+        {
+            value = 0u;
+            return user_copy_to_writable(current_user_root_page_table, argument, &value, 4ul) ? 0l : -14l;
+        }
+        return 0l;
+    }
+    return -25l;
 }
 
 static s64 zero_read_to_user(u64 buffer, u64 count)
@@ -3935,7 +6436,7 @@ static s64 vfs_read(u64 fd_value, u64 buffer, u64 count)
         return -9l;
     type = file->node.type;
     if (type == VFS_NODE_CONSOLE)
-        return console_read_to_user(buffer, count, file->flags);
+        return tty_read(buffer, count, file->flags);
     if (type == VFS_NODE_NULL)
         return 0l;
     if (type == VFS_NODE_ZERO)
@@ -3947,25 +6448,6 @@ static s64 vfs_read(u64 fd_value, u64 buffer, u64 count)
     return -9l;
 }
 
-static s64 console_write_from_user(u64 buffer, u64 count)
-{
-    u64 done = 0ul;
-    while (done < count)
-    {
-        u64 physical;
-        u64 chunk;
-        if (!user_translate(current_user_root_page_table, buffer + done, PTE_R, &physical))
-            return -14l;
-        chunk = PAGE_SIZE - (physical & PAGE_MASK);
-        if (chunk > count - done)
-            chunk = count - done;
-        uart_write_buffer((const u8*)physical, chunk);
-        done = done + chunk;
-    }
-    return (s64)count;
-}
-
-// Carries what a program wrote into the file it named, a page of its memory at a time
 static s64 fat_write_from_user(struct file_descriptor* file, u64 buffer, u64 count)
 {
     u64 done = 0ul;
@@ -4002,7 +6484,7 @@ static s64 vfs_write(u64 fd_value, u64 buffer, u64 count)
         return -9l;
     type = file->node.type;
     if (type == VFS_NODE_CONSOLE)
-        return console_write_from_user(buffer, count);
+        return tty_write(buffer, count);
     if (type == VFS_NODE_NULL || type == VFS_NODE_ZERO)
         return (s64)count;
     if (type == VFS_NODE_FAT_FILE)
@@ -4027,22 +6509,16 @@ static s64 vfs_openat(u64 dirfd, u64 path_pointer, u64 flags, u64 mode)
         return -2l;
     if (!walked.has_node)
     {
-        u32 entry_lba;
-        u32 entry_offset;
+        s64 created;
         if ((flags & O_CREAT) == 0ul)
             return -2l;
-        if (!walked.has_parent || !walked.leaf_valid)
+        if (!walked.has_parent || walked.leaf_length == 0u)
             return -22l;
         if (walked.parent.type != VFS_NODE_ROOT_DIR && walked.parent.type != VFS_NODE_FAT_DIR)
             return -30l;
-        if (!fat_create_in(walked.parent.first_cluster, walked.leaf, 0u, &entry_lba, &entry_offset))
-            return -28l;
-        node.type = VFS_NODE_FAT_FILE;
-        node.first_cluster = 0u;
-        node.size = 0u;
-        node.mode = S_IFREG | 438u;
-        node.entry_lba = entry_lba;
-        node.entry_offset = entry_offset;
+        created = fat_create_in(walked.parent.first_cluster, walked.leaf, walked.leaf_length, 0u, &node);
+        if (created != 0l)
+            return created;
     }
     else
     {
@@ -4050,6 +6526,16 @@ static s64 vfs_openat(u64 dirfd, u64 path_pointer, u64 flags, u64 mode)
         if (node.type == VFS_NODE_FAT_FILE && (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL))
             return -17l;
     }
+    if (node.type == VFS_NODE_CURRENT_TTY)
+    {
+        if (current_task->ctty == 0u || console_tty.session != current_task->sid)
+            return -6l;
+        node.type = VFS_NODE_CONSOLE;
+        node.first_cluster = 1u;
+    }
+    // A session leader without a terminal takes the first one it opens, as a login does
+    if (node.type == VFS_NODE_CONSOLE && node.first_cluster == 0u && (flags & O_NOCTTY) == 0ul)
+        tty_acquire(current_task, 0);
     if ((node.type == VFS_NODE_ROOT_DIR || node.type == VFS_NODE_DEV_DIR || node.type == VFS_NODE_FAT_DIR) &&
         ((flags & O_ACCMODE) != 0ul))
     {
@@ -4209,11 +6695,11 @@ static s64 vfs_mkdirat(u64 dirfd, u64 path_pointer, u64 mode)
         return -2l;
     if (walked.has_node)
         return -17l;
-    if (!walked.has_parent || !walked.leaf_valid)
+    if (!walked.has_parent || walked.leaf_length == 0u)
         return -22l;
     if (walked.parent.type != VFS_NODE_ROOT_DIR && walked.parent.type != VFS_NODE_FAT_DIR)
         return -30l;
-    return fat_make_directory(walked.parent.first_cluster, walked.leaf, &made) ? 0l : -28l;
+    return fat_make_directory(walked.parent.first_cluster, walked.leaf, walked.leaf_length, &made);
 }
 
 static s64 vfs_unlinkat(u64 dirfd, u64 path_pointer, u64 flags)
@@ -4226,8 +6712,8 @@ static s64 vfs_unlinkat(u64 dirfd, u64 path_pointer, u64 flags)
         return -14l;
     if (!vfs_walk_at(dirfd, path, &walked) || !walked.has_node)
         return -2l;
-    if (!walked.has_parent || !walked.leaf_valid)
-        return -22l;
+    if (!walked.has_parent || walked.node.entry_lba == 0u)
+        return walked.node.type == VFS_NODE_ROOT_DIR ? -16l : -22l;
     if (removing_directory)
     {
         if (walked.node.type != VFS_NODE_FAT_DIR)
@@ -4241,7 +6727,7 @@ static s64 vfs_unlinkat(u64 dirfd, u64 path_pointer, u64 flags)
     }
     if (walked.parent.type != VFS_NODE_ROOT_DIR && walked.parent.type != VFS_NODE_FAT_DIR)
         return -30l;
-    return fat_remove_in(walked.parent.first_cluster, walked.leaf) ? 0l : -5l;
+    return fat_remove_node(walked.parent.first_cluster, &walked.node) ? 0l : -5l;
 }
 
 static s64 vfs_close(u64 fd)
@@ -4310,43 +6796,21 @@ static void fat_format_short_name(const u8* entry, char* name)
 
 static int fat_entry_at(u32 directory, u64 requested, char* name, u32* type, u64* inode)
 {
-    u32 cluster = directory;
+    struct fat_dir_cursor cursor;
+    struct fat_dir_item item;
     u64 current = 0ul;
-    while (cluster >= 2u && cluster < FAT_EOC)
+    fat_dir_start(&cursor, directory);
+    while (fat_dir_next_item(&cursor, &item))
     {
-        u32 sector_index = 0u;
-        while (sector_index < boot_volume.sectors_per_cluster)
+        if (current == requested)
         {
-            u32 lba = fat_cluster_lba(cluster) + sector_index;
-            u32 offset = 0u;
-            if (!dir_sector_load(lba))
-                return 0;
-            while (offset < SECTOR_SIZE)
-            {
-                u8* entry = dir_buffer + offset;
-                u8 first = entry[0];
-                u8 attributes = entry[11];
-                if (first == 0u)
-                    return 0;
-                if (first != 0xe5u && (attributes & 15u) != 15u && (attributes & 8u) == 0u)
-                {
-                    if (current == requested)
-                    {
-                        u32 first_cluster = ((u32)le16(entry + 20) << 16) | (u32)le16(entry + 26);
-                        fat_format_short_name(entry, name);
-                        *type = (attributes & 16u) != 0u ? DT_DIR : DT_REG;
-                        *inode = ((u64)first_cluster << 32) | current;
-                        return 1;
-                    }
-                    current = current + 1ul;
-                }
-                offset = offset + 32u;
-            }
-            sector_index = sector_index + 1u;
+            u32 first_cluster = ((u32)le16(item.entry + 20) << 16) | (u32)le16(item.entry + 26);
+            mem_copy(name, item.name, (u64)FAT_NAME_BYTES);
+            *type = (item.entry[11] & FAT_ATTRIBUTE_DIRECTORY) != 0u ? DT_DIR : DT_REG;
+            *inode = ((u64)first_cluster << 32) | current;
+            return 1;
         }
-        cluster = fat_next_cluster(cluster);
-        if (cluster == FAT_READ_ERROR)
-            return 0;
+        current = current + 1ul;
     }
     return 0;
 }
@@ -4419,7 +6883,7 @@ static s64 vfs_getdents64(u64 fd_value, u64 user_buffer, u64 count)
     while (done < count)
     {
         const char* name;
-        char fat_name[13];
+        char fat_name[FAT_NAME_BYTES];
         u32 type;
         u32 name_length;
         u32 record_length;
@@ -4540,10 +7004,12 @@ static s64 vfs_newfstatat(u64 dirfd, u64 path_pointer, u64 stat_pointer, u64 fla
     }
     if (dirfd != AT_FDCWD && !fd_valid(dirfd))
         return -9l;
+    struct path_result walked;
     if (!copy_user_string(path_pointer, path, PATH_BUFFER_SIZE))
         return -14l;
-    if (!vfs_lookup(path, &node))
+    if (!vfs_walk_at(dirfd, path, &walked) || !walked.has_node)
         return -2l;
+    node = walked.node;
     stat_store_node(sector_buffer, &node);
     if (!user_copy_to_writable(current_user_root_page_table, stat_pointer, sector_buffer, 128ul))
         return -14l;
@@ -4623,30 +7089,11 @@ static s64 sys_getcwd_impl(u64 user_buffer, u64 size)
 
 static s64 sys_ioctl_impl(u64 fd_value, u64 request, u64 argument)
 {
-    u8 data[64];
     if (!fd_valid(fd_value))
         return -9l;
     if (open_files[(u32)fd_value].node.type != VFS_NODE_CONSOLE)
         return -25l;
-    if (request == TIOCGWINSZ)
-    {
-        mem_zero(data, 8ul);
-        store_le16(data + 0, 25u);
-        store_le16(data + 2, 80u);
-        if (!user_copy_to_writable(current_user_root_page_table, argument, data, 8ul))
-            return -14l;
-        return 0l;
-    }
-    if (request == TCGETS)
-    {
-        mem_zero(data, 64ul);
-        if (!user_copy_to_writable(current_user_root_page_table, argument, data, 64ul))
-            return -14l;
-        return 0l;
-    }
-    if (request == TCSETS || request == TCSETSW || request == TCSETSF)
-        return 0l;
-    return -25l;
+    return tty_ioctl(&open_files[(u32)fd_value], request, argument);
 }
 
 static s64 sys_readlinkat_impl(u64 dirfd, u64 path_pointer, u64 buffer, u64 size)
@@ -5145,6 +7592,9 @@ static int build_user_stack(u64 root, struct elf_image* image, struct exec_argum
     stack[word] = AT_FRAMEBUFFER;
     stack[word + 1u] = boot_device.framebuffer_base == 0ul ? 0ul : USER_FRAMEBUFFER_BASE;
     word = word + 2u;
+    stack[word] = AT_MINSIGSTKSZ;
+    stack[word + 1u] = SIGFRAME_SIZE + SIGFRAME_VECTOR_STATE + 32ul * vector_register_bytes();
+    word = word + 2u;
     stack[word] = AT_NULL;
     stack[word + 1u] = 0ul;
     word = word + 2u;
@@ -5181,16 +7631,20 @@ static int grow_user_brk(u64 requested)
     return 1;
 }
 
-void kernel_trap_dispatch(struct trap_frame* frame)
+static void trap_dispatch(struct trap_frame* frame)
 {
     u64 cause = frame->scause;
     if (cause == 8ul)
     {
         u64 nr = frame->x[17];
         frame->sepc = frame->sepc + 4ul;
+        current_task->orig_a0 = frame->x[10];
         if (nr == SYS_READ)
         {
-            frame->x[10] = (u64)vfs_read(frame->x[10], frame->x[11], frame->x[12]);
+            s64 result = vfs_read(frame->x[10], frame->x[11], frame->x[12]);
+            frame->x[10] = (u64)result;
+            if (result == -ERESTARTSYS)
+                process_sleep(frame, SLEEP_CONSOLE, current_task->sleep_deadline);
             return;
         }
         if (nr == SYS_WRITE)
@@ -5278,9 +7732,100 @@ void kernel_trap_dispatch(struct trap_frame* frame)
             frame->x[10] = 0ul;
             return;
         }
-        if (nr == SYS_SET_ROBUST_LIST || nr == SYS_RT_SIGACTION || nr == SYS_RT_SIGPROCMASK || nr == SYS_PRLIMIT64)
+        if (nr == SYS_SET_ROBUST_LIST || nr == SYS_PRLIMIT64)
         {
             frame->x[10] = 0ul;
+            return;
+        }
+        if (nr == SYS_RT_SIGACTION)
+        {
+            frame->x[10] = (u64)sys_rt_sigaction_impl(frame->x[10], frame->x[11], frame->x[12], frame->x[13]);
+            return;
+        }
+        if (nr == SYS_RT_SIGPROCMASK)
+        {
+            frame->x[10] = (u64)sys_rt_sigprocmask_impl(frame->x[10], frame->x[11], frame->x[12], frame->x[13]);
+            return;
+        }
+        if (nr == SYS_RT_SIGPENDING)
+        {
+            frame->x[10] = (u64)sys_rt_sigpending_impl(frame->x[10], frame->x[11]);
+            return;
+        }
+        if (nr == SYS_RT_SIGSUSPEND)
+        {
+            sys_rt_sigsuspend_dispatch(frame, frame->x[10], frame->x[11]);
+            return;
+        }
+        if (nr == SYS_RT_SIGTIMEDWAIT)
+        {
+            sys_rt_sigtimedwait_dispatch(frame, frame->x[10], frame->x[11], frame->x[12], frame->x[13]);
+            return;
+        }
+        if (nr == SYS_RT_SIGQUEUEINFO)
+        {
+            frame->x[10] = (u64)sys_rt_sigqueueinfo_impl(frame->x[10], frame->x[11], frame->x[12]);
+            return;
+        }
+        if (nr == SYS_RT_SIGRETURN)
+        {
+            sys_rt_sigreturn_impl(frame);
+            return;
+        }
+        if (nr == SYS_SIGALTSTACK)
+        {
+            frame->x[10] = (u64)sys_sigaltstack_impl(frame, frame->x[10], frame->x[11]);
+            return;
+        }
+        if (nr == SYS_KILL)
+        {
+            frame->x[10] = (u64)sys_kill_impl(frame->x[10], frame->x[11]);
+            return;
+        }
+        if (nr == SYS_TKILL)
+        {
+            frame->x[10] = (u64)sys_tgkill_impl(-1l, (s64)(int)frame->x[10], frame->x[11]);
+            return;
+        }
+        if (nr == SYS_TGKILL)
+        {
+            s64 tgid = (s64)(int)frame->x[10];
+            frame->x[10] = tgid <= 0l ? (u64)-22l : (u64)sys_tgkill_impl(tgid, (s64)(int)frame->x[11], frame->x[12]);
+            return;
+        }
+        if (nr == SYS_SETPGID)
+        {
+            frame->x[10] = (u64)sys_setpgid_impl(frame->x[10], frame->x[11]);
+            return;
+        }
+        if (nr == SYS_GETPGID || nr == SYS_GETSID)
+        {
+            frame->x[10] = (u64)sys_getpgid_impl(frame->x[10], nr == SYS_GETSID);
+            return;
+        }
+        if (nr == SYS_SETSID)
+        {
+            frame->x[10] = (u64)sys_setsid_impl();
+            return;
+        }
+        if (nr == SYS_GETITIMER)
+        {
+            frame->x[10] = (u64)sys_getitimer_impl(frame->x[10], frame->x[11]);
+            return;
+        }
+        if (nr == SYS_SETITIMER)
+        {
+            frame->x[10] = (u64)sys_setitimer_impl(frame->x[10], frame->x[11], frame->x[12]);
+            return;
+        }
+        if (nr == SYS_NANOSLEEP)
+        {
+            sys_nanosleep_dispatch(frame, frame->x[10], frame->x[11]);
+            return;
+        }
+        if (nr == SYS_RESTART_SYSCALL)
+        {
+            sys_restart_syscall_dispatch(frame);
             return;
         }
         if (nr == SYS_SCHED_YIELD)
@@ -5310,7 +7855,7 @@ void kernel_trap_dispatch(struct trap_frame* frame)
         }
         if (nr == SYS_WAIT4)
         {
-            sys_wait4_dispatch(frame, frame->x[10], frame->x[11], frame->x[12]);
+            sys_wait4_dispatch(frame, frame->x[10], frame->x[11], frame->x[12], frame->x[13]);
             return;
         }
         if (nr == SYS_MMAP)
@@ -5346,7 +7891,7 @@ void kernel_trap_dispatch(struct trap_frame* frame)
         }
         if (nr == SYS_EXIT || nr == SYS_EXIT_GROUP)
         {
-            process_exit_current(frame, frame->x[10]);
+            process_exit_current(frame, frame->x[10], 0ul);
             return;
         }
         frame->x[10] = (u64)-38l;
@@ -5365,20 +7910,25 @@ void kernel_trap_dispatch(struct trap_frame* frame)
             return;
     }
 
-    // A fault a program took is the program's to die of; only the kernel's own are fatal
+    // A fault a program took is the program's to handle or die of; only the kernel's own are fatal
     if ((frame->sstatus & SSTATUS_SPP) == 0ul && current_task != (struct process*)NULL && current_task->used != 0u)
     {
-        puts("kernel: process ");
-        put_dec(current_task->pid);
-        puts(" faulted, cause=");
-        put_hex64(frame->scause);
-        puts(" sepc=");
-        put_hex64(frame->sepc);
-        puts(" stval=");
-        put_hex64(frame->stval);
-        puts("\n");
-        current_task->exit_signal = (u32)fault_signal(cause);
-        process_exit_current(frame, 0ul);
+        s32 code;
+        u64 address;
+        u64 sig = signal_for_fault(frame, &code, &address);
+        if (signal_unhandled(current_task, sig))
+        {
+            puts("kernel: process ");
+            put_dec(current_task->pid);
+            puts(" faulted, cause=");
+            put_hex64(frame->scause);
+            puts(" sepc=");
+            put_hex64(frame->sepc);
+            puts(" stval=");
+            put_hex64(frame->stval);
+            puts("\n");
+        }
+        signal_force(current_task, sig, code, address);
         return;
     }
 
@@ -5392,10 +7942,17 @@ void kernel_trap_dispatch(struct trap_frame* frame)
     halt();
 }
 
+void kernel_trap_dispatch(struct trap_frame* frame)
+{
+    trap_dispatch(frame);
+    signal_return_to_user(frame);
+}
+
 void kernel_main(u64 hartid, void* fdt)
 {
     u32 init_size;
     u32 init_read_result;
+    struct vfs_node init_node;
     struct elf_image image;
     struct exec_arguments arguments;
     u64 stack;
@@ -5406,9 +7963,11 @@ void kernel_main(u64 hartid, void* fdt)
 #endif
     console_init();
     fbcon_init();
+    tty_init();
     memory_manager_init();
     kernel_mmu_init();
     device_mappings_init();
+    sigreturn_page_init();
 
     if (vector_register_bytes() > MAX_VECTOR_REGISTER_BYTES)
         panic("vector registers exceed the saved context");
@@ -5416,9 +7975,9 @@ void kernel_main(u64 hartid, void* fdt)
         panic("block subsystem init failed");
     if (!fat_mount())
         panic("boot FAT32 mount failed");
-    init_read_result = fat_read_short_to_memory("INIT       ", (void*)USER_ELF_BUFFER, (u32)USER_ELF_BUFFER_SIZE, &init_size);
-    if (init_read_result == 1u)
+    if (!vfs_lookup(init_path, &init_node) || init_node.type != VFS_NODE_FAT_FILE)
         panic("INIT.ELF directory entry not found");
+    init_read_result = fat_read_node_to_memory(&init_node, (void*)USER_ELF_BUFFER, (u32)USER_ELF_BUFFER_SIZE, &init_size);
     if (init_read_result == 2u)
         panic("INIT.ELF exceeds staging buffer");
     if (init_read_result == 3u)

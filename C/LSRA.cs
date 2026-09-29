@@ -9,8 +9,6 @@ namespace Cnidaria.C;
 
 public sealed class LSRAOptions
 {
-    public static LSRAOptions Default { get; } = new LSRAOptions();
-
     public ImmutableArray<MachineRegister> GeneralRegisters { get; }
     public ImmutableArray<MachineRegister> FloatingRegisters { get; }
     public ImmutableArray<MachineRegister> VectorRegisters { get; }
@@ -65,7 +63,9 @@ public sealed class LSRAOptions
             TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64 => CreateTargetOptions(target),
             TargetArchitectureKind.I386 or TargetArchitectureKind.X86_64 => CreateTargetOptions(target),
             TargetArchitectureKind.Arm32 or TargetArchitectureKind.Arm64 => CreateTargetOptions(target),
-            _ => Default
+            _ => new LSRAOptions(
+                generalRegisters: TargetRegisterInfo.AllocatableGeneralRegisters(target),
+                floatingRegisters: TargetRegisterInfo.AllocatableFloatingRegisters(target))
         };
     }
 
@@ -1852,7 +1852,7 @@ internal sealed class LinearScanRegisterAllocator
     private bool NeedsFloatingImmediateTemp()
     {
         if (_target.IsRegisterBytecode)
-            return NeedsRegisterBytecodeFloatingImmediateTemp();
+            return false;
 
         if (_target.Architecture == TargetArchitectureKind.I386)
             return HasWideScalarUse();
@@ -1862,54 +1862,6 @@ internal sealed class LinearScanRegisterAllocator
 
         if (_target.Architecture == TargetArchitectureKind.X86_64 && TargetRegisterInfo.IsWindowsX64(_target))
             return HasWindowsX64VariadicFloatingArgument();
-
-        return false;
-    }
-
-    private bool NeedsRegisterBytecodeFloatingImmediateTemp()
-    {
-        foreach (var instruction in _function.Blocks.SelectMany(static b => b.Instructions))
-        {
-            if (instruction.Kind == LirInstructionKind.Zero &&
-                instruction.Result is not null &&
-                CAbi.IsFloating(instruction.Result.Type))
-            {
-                return true;
-            }
-
-            if (instruction.Kind == LirInstructionKind.Unary &&
-                instruction.Operator == "!" &&
-                instruction.Operands.Length != 0 &&
-                CAbi.IsFloating(instruction.Operands[0].Type))
-            {
-                return true;
-            }
-
-            if (instruction.Kind == LirInstructionKind.Branch &&
-                instruction.Operands.Length == 1 &&
-                CAbi.IsFloating(instruction.Operands[0].Type))
-            {
-                return true;
-            }
-
-            foreach (var operand in instruction.Operands)
-            {
-                if (CAbi.IsFloating(operand.Type) &&
-                    operand.Kind is LirOperandKind.Immediate or LirOperandKind.Undefined or LirOperandKind.Void or LirOperandKind.None)
-                {
-                    return true;
-                }
-            }
-
-            foreach (var copy in instruction.ParallelCopies)
-            {
-                if (CAbi.IsFloating(copy.Source.Type) &&
-                    copy.Source.Kind is LirOperandKind.Immediate or LirOperandKind.Undefined or LirOperandKind.Void or LirOperandKind.None)
-                {
-                    return true;
-                }
-            }
-        }
 
         return false;
     }
@@ -2047,12 +1999,8 @@ internal sealed class LinearScanRegisterAllocator
                 continue;
 
             var copies = physicalCopies.ToImmutable();
-            if (!HasBlockCopyParallelCopy(copies) &&
-                (!HasPhysicalStorageClobber(copies, allocations, spillOffsets) ||
-                 CanOrderParallelCopies(copies, allocations, spillOffsets)))
-            {
+            if (!HasBlockCopyParallelCopy(copies) && CanOrderParallelCopies(copies, allocations, spillOffsets))
                 continue;
-            }
 
             var size = 0;
             foreach (var copy in copies)
@@ -2125,6 +2073,10 @@ internal sealed class LinearScanRegisterAllocator
         foreach (var copy in copies)
         {
             if (copy.Destination.RegisterClass == LirRegisterClass.Aggregate || RequiresStackBackedScalar(copy.Destination))
+                return true;
+            // The i386 emitter stages a 64-bit integer through the frame, even from registers
+            if (_target.Architecture == TargetArchitectureKind.I386 && GimpleTypes.IsIntegerLike(copy.Destination.Type) &&
+                SizeOfStorage(copy.Destination.Type) > _target.PointerSize)
                 return true;
         }
 

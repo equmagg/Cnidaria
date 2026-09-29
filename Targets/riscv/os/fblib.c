@@ -200,7 +200,7 @@ void fb_present(void)
         fb_registers[FB_REGISTER_PRESENT] = 1ul;
 }
 
-/* Eight registers at a time: one store covers the widest group the hardware offers */
+// Eight registers at a time: one store covers the widest group the hardware offers
 static void fb_fill_run(u32* destination, u64 count, u32 color)
 {
     while (count != 0ul)

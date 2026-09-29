@@ -1,6 +1,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1101,5 +1102,14 @@ void exit(int status)
 
 void abort(void)
 {
-    _Exit(134);
+#if defined(__linux__)
+    sigset_t abort_only;
+    sigemptyset(&abort_only);
+    sigaddset(&abort_only, SIGABRT);
+    sigprocmask(SIG_UNBLOCK, &abort_only, (sigset_t*)0);
+#endif
+    raise(SIGABRT);
+    signal(SIGABRT, SIG_DFL);
+    raise(SIGABRT);
+    _Exit(127);
 }

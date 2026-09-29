@@ -25,6 +25,9 @@ internal sealed class Gimplifier
     private int _labelOrdinal;
     private int _temporaryOrdinal;
 
+    private readonly Dictionary<Symbol, VariableSymbol> _staticLocals = new();
+    private readonly List<GimpleNode> _hoistedStatics = new();
+
     private readonly TargetInfo _target;
 
     private Gimplifier(TargetInfo target)
@@ -52,7 +55,11 @@ internal sealed class Gimplifier
         var members = ImmutableArray.CreateBuilder<GimpleNode>();
 
         foreach (var member in boundTree.Root.Members)
+        {
             members.Add(lowerer.LowerTopLevelMember(member));
+            members.AddRange(lowerer._hoistedStatics);
+            lowerer._hoistedStatics.Clear();
+        }
 
         return new GimpleTree(boundTree.SemanticModel, members.ToImmutable(), boundTree.Diagnostics);
     }
@@ -503,6 +510,12 @@ internal sealed class Gimplifier
     {
         foreach (var declarator in declaration.Declarators)
         {
+            if (declaration.StorageClass == StorageClass.Static && declarator.Symbol is VariableSymbol variable)
+            {
+                HoistStaticLocal(declaration, declarator, variable);
+                continue;
+            }
+
             Emit(new GimpleDeclarationStatement(
                 LowerVariableDeclaration(declarator, declaration.StorageClass, includeInitializer: false)));
 
@@ -513,6 +526,20 @@ internal sealed class Gimplifier
             LowerInitializer(target, declarator.Initializer);
         }
     }
+
+    // A dot keeps the object's own name from meeting any C identifier in the same unit
+    private void HoistStaticLocal(BoundDeclaration declaration, BoundDeclarator declarator, VariableSymbol variable)
+    {
+        var hoisted = new VariableSymbol(variable.Name + "." + _staticLocals.Count.ToString(CultureInfo.InvariantCulture),
+            variable.Type, StorageClass.Static, variable.DeclaringSyntax);
+        _staticLocals.Add(variable, hoisted);
+        var initializer = declarator.Initializer is null ? null : LowerInitializerForDeclaration(declarator.Initializer);
+        _hoistedStatics.Add(new GimpleGlobalDeclaration(declaration.Syntax, StorageClass.Static, ImmutableArray.Create(
+            new GimpleVariableDeclaration(hoisted, declarator.Type, StorageClass.Static, initializer, declarator.Syntax))));
+    }
+
+    private Symbol Resolve(Symbol symbol)
+        => _staticLocals.TryGetValue(symbol, out var hoisted) ? hoisted : symbol;
 
     /// <summary>Emits executable initialization for a local place</summary>
     private void LowerInitializer(GimplePlace target, BoundInitializer initializer)
@@ -1240,7 +1267,7 @@ internal sealed class Gimplifier
         switch (expression)
         {
             case BoundNameExpression name when name.Symbol is not null:
-                return new GimpleSymbolValue(name.Symbol, name.Type, name.Syntax);
+                return new GimpleSymbolValue(Resolve(name.Symbol), name.Type, name.Syntax);
 
             case BoundParenthesizedExpression parenthesized:
                 return LowerPlaceNoEmit(parenthesized.Expression);
@@ -1283,6 +1310,10 @@ internal sealed class Gimplifier
 
             case BoundCallExpression call:
                 EmitCall(call, discardResult: true);
+                break;
+
+            case BoundCastExpression cast when GimpleTypes.IsVoid(cast.Type):
+                LowerExpressionForSideEffects(cast.Expression);
                 break;
 
             default:
@@ -1399,7 +1430,7 @@ internal sealed class Gimplifier
         if (expression.Symbol is EnumConstantSymbol enumConstant)
             return new GimpleConstantValue(enumConstant.Value, expression.Type, expression.Syntax);
 
-        return new GimpleSymbolValue(expression.Symbol, expression.Type, expression.Syntax);
+        return new GimpleSymbolValue(Resolve(expression.Symbol), expression.Type, expression.Syntax);
     }
 
     private GimpleValue LowerConversionExpression(BoundConversionExpression expression)
@@ -1578,6 +1609,9 @@ internal sealed class Gimplifier
         return _types.Builtin(BuiltinTypeKind.LongLong);
     }
 
+    private static bool SameRepresentation(QualifiedType left, QualifiedType right)
+        => ReferenceEquals(left.Type, right.Type) || left.Type is BuiltinType a && right.Type is BuiltinType b && a.BuiltinKind == b.BuiltinKind;
+
     /// <summary>Emits a store and yields the stored value</summary>
     private GimpleValue LowerAssignmentExpression(BoundAssignmentExpression expression)
     {
@@ -1591,6 +1625,17 @@ internal sealed class Gimplifier
         }
 
         var operand = LowerExpression(expression.Right);
+        if (expression.ComputationType is { } computation && !SameRepresentation(computation, target.Type))
+        {
+            var operation = GimpleOperators.FromBinaryOperator(
+                GimpleOperators.CompoundAssignmentOperator(expression.OperatorToken.Kind), computation, operand.Type);
+            var widened = EmitConvert(Materialize(target), computation, expression.Syntax);
+            var computed = EmitBinary(operation, widened, GimplifyValue(operand), computation, expression.Syntax);
+            var narrowed = EmitConvert(computed, target.Type, expression.Syntax);
+            EmitStore(target, narrowed, expression.Syntax);
+            return GimpleOperandRules.IsRegisterOperand(target) ? target : narrowed;
+        }
+
         var code = GimpleOperators.FromBinaryOperator(
             GimpleOperators.CompoundAssignmentOperator(expression.OperatorToken.Kind),
             target.Type,
@@ -1785,7 +1830,7 @@ internal sealed class Gimplifier
         switch (expression)
         {
             case BoundNameExpression name when name.Symbol is not null:
-                return new GimpleSymbolValue(name.Symbol, name.Type, name.Syntax);
+                return new GimpleSymbolValue(Resolve(name.Symbol), name.Type, name.Syntax);
 
             case BoundParenthesizedExpression parenthesized:
                 return LowerPlace(parenthesized.Expression);

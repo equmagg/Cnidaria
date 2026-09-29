@@ -6,131 +6,6 @@ namespace Cnidaria.C;
 
 internal static class LoopInvariantCodeMotion
 {
-    private sealed class Loop
-    {
-        public readonly ControlFlowBlock Header;
-        public readonly HashSet<ControlFlowBlock> Blocks = new();
-        public ControlFlowBlock? Preheader;
-
-        public Loop(ControlFlowBlock header)
-        {
-            Header = header;
-            Blocks.Add(header);
-        }
-    }
-
-    private sealed class Analysis
-    {
-        private readonly int[] _start;
-        private readonly int[] _end;
-        public readonly List<Loop> Loops = new();
-        public int Remaining;
-
-        public Analysis(ControlFlowFunction function, int budget)
-        {
-            Remaining = budget;
-            _start = new int[function.Blocks.Length];
-            _end = new int[function.Blocks.Length];
-            var walk = new Stack<(ControlFlowBlock Block, bool Exit)>();
-            walk.Push((function.Entry, false));
-            int clock = 0;
-            while (walk.Count != 0)
-            {
-                if (!Spend())
-                    return;
-                var (block, exit) = walk.Pop();
-                if (exit)
-                {
-                    _end[block.Ordinal] = clock;
-                    continue;
-                }
-                _start[block.Ordinal] = ++clock;
-                walk.Push((block, true));
-                foreach (var child in block.DominatorChildren)
-                    walk.Push((child, false));
-            }
-
-            var byHeader = new Dictionary<ControlFlowBlock, Loop>();
-            foreach (var block in function.ReversePostOrder)
-            {
-                foreach (var successor in block.UniqueSuccessors)
-                {
-                    if (!Spend())
-                        return;
-                    if (successor.IsExit || !Dominates(successor, block))
-                        continue;
-                    if (!byHeader.TryGetValue(successor, out var loop))
-                    {
-                        loop = new Loop(successor);
-                        byHeader.Add(successor, loop);
-                    }
-                    loop.Blocks.Add(block);
-                }
-            }
-
-            var pending = new Stack<ControlFlowBlock>();
-            foreach (var loop in byHeader.Values)
-            {
-                foreach (var latch in loop.Blocks)
-                {
-                    if (!ReferenceEquals(latch, loop.Header))
-                        pending.Push(latch);
-                }
-                bool reducible = true;
-                while (pending.Count != 0)
-                {
-                    var block = pending.Pop();
-                    foreach (var predecessor in block.UniquePredecessors)
-                    {
-                        if (!Spend())
-                            return;
-                        if (!predecessor.IsReachable)
-                            continue;
-                        if (!Dominates(loop.Header, predecessor))
-                        {
-                            reducible = false;
-                            continue;
-                        }
-                        if (loop.Blocks.Add(predecessor))
-                            pending.Push(predecessor);
-                    }
-                }
-                if (!reducible || ReferenceEquals(loop.Header, function.Entry))
-                    continue;
-                ControlFlowBlock? entry = null;
-                int entries = 0;
-                foreach (var predecessor in loop.Header.UniquePredecessors)
-                {
-                    if (!Spend())
-                        return;
-                    if (!loop.Blocks.Contains(predecessor))
-                    {
-                        entry = predecessor;
-                        entries++;
-                    }
-                }
-                if (entries == 0)
-                    continue;
-                if (entries == 1 && entry!.IsReachable && entry.UniqueSuccessors.Length == 1 &&
-                    entry.Terminator is GimpleGotoStatement)
-                    loop.Preheader = entry;
-                Loops.Add(loop);
-            }
-            Loops.Sort(static (left, right) =>
-            {
-                int size = left.Blocks.Count.CompareTo(right.Blocks.Count);
-                return size != 0 ? size : left.Header.Ordinal.CompareTo(right.Header.Ordinal);
-            });
-        }
-
-        public bool Spend() => Remaining-- > 0;
-
-        public bool Dominates(ControlFlowBlock definition, ControlFlowBlock use)
-            => _start[definition.Ordinal] != 0 &&
-               _start[definition.Ordinal] <= _start[use.Ordinal] &&
-               _end[use.Ordinal] <= _end[definition.Ordinal];
-    }
-
     private static bool Enabled(SsaOptimizationOptions options)
         => options.EnableLoopInvariantCodeMotion && options.MaxLoopHoistsPerLoop > 0 && options.MaxLoopAnalysisWork > 0;
 
@@ -141,7 +16,7 @@ internal static class LoopInvariantCodeMotion
 
     private sealed class UnrollPlan
     {
-        public Loop Loop = null!;
+        public NaturalLoop Loop = null!;
         public int TripCount;
         public GimpleLabel InLoopTarget = null!;
         public GimpleLabel ExitTarget = null!;
@@ -149,7 +24,7 @@ internal static class LoopInvariantCodeMotion
 
     private static GimpleFunctionDefinition Unroll(ControlFlowFunction flow, int budget)
     {
-        var analysis = new Analysis(flow, budget);
+        var analysis = new NaturalLoopAnalysis(flow, budget);
         if (analysis.Remaining <= 0 || flow.Problems.Length != 0)
             return flow.Function;
 
@@ -178,8 +53,8 @@ internal static class LoopInvariantCodeMotion
 
     private static bool TryPlanUnroll(
         ControlFlowFunction flow,
-        Analysis analysis,
-        Loop loop,
+        NaturalLoopAnalysis analysis,
+        NaturalLoop loop,
         HashSet<ControlFlowBlock> headers,
         out UnrollPlan plan)
     {
@@ -248,7 +123,7 @@ internal static class LoopInvariantCodeMotion
         return true;
     }
 
-    private static bool ContainsLabel(Loop loop, GimpleLabel label)
+    private static bool ContainsLabel(NaturalLoop loop, GimpleLabel label)
     {
         foreach (var block in loop.Blocks)
         {
@@ -385,7 +260,7 @@ internal static class LoopInvariantCodeMotion
             or GimpleTreeCode.GeExpr or GimpleTreeCode.EqExpr or GimpleTreeCode.NeExpr;
 
     // The step has to be the one and only write to the variable inside the loop
-    private static bool TryFindInductionStep(Loop loop, VariableSymbol variable, out long step)
+    private static bool TryFindInductionStep(NaturalLoop loop, VariableSymbol variable, out long step)
     {
         step = 0;
         var found = false;
@@ -428,7 +303,7 @@ internal static class LoopInvariantCodeMotion
     }
 
     // The single entry into the loop has to leave a known constant behind
-    private static bool TryFindInductionStart(ControlFlowFunction flow, Loop loop, VariableSymbol variable, out long start)
+    private static bool TryFindInductionStart(ControlFlowFunction flow, NaturalLoop loop, VariableSymbol variable, out long start)
     {
         start = 0;
         ControlFlowBlock? entry = null;
@@ -709,7 +584,7 @@ internal static class LoopInvariantCodeMotion
         }
     }
 
-    private static List<ControlFlowBlock> OrderedLoopBlocks(ControlFlowFunction flow, Loop loop)
+    private static List<ControlFlowBlock> OrderedLoopBlocks(ControlFlowFunction flow, NaturalLoop loop)
     {
         var ordered = new List<ControlFlowBlock>(loop.Blocks.Count);
         foreach (var block in flow.RealBlocks)
@@ -793,10 +668,10 @@ internal static class LoopInvariantCodeMotion
 
     private static GimpleFunctionDefinition CreatePreheaders(ControlFlowFunction flow, int budget)
     {
-        var analysis = new Analysis(flow, budget);
+        var analysis = new NaturalLoopAnalysis(flow, budget);
         if (analysis.Remaining <= 0 || flow.Problems.Length != 0)
             return flow.Function;
-        var preheaders = new Dictionary<GimpleLabel, (Loop Loop, GimpleLabel Label)>();
+        var preheaders = new Dictionary<GimpleLabel, (NaturalLoop Loop, GimpleLabel Label)>();
         var names = new HashSet<string>(StringComparer.Ordinal);
         foreach (var block in flow.RealBlocks)
             names.Add(block.Label!.Name);
@@ -857,7 +732,7 @@ internal static class LoopInvariantCodeMotion
     {
         if (!Enabled(options) || function.Problems.Length != 0)
             return function;
-        var analysis = new Analysis(function.ControlFlowFunction, options.MaxLoopAnalysisWork);
+        var analysis = new NaturalLoopAnalysis(function.ControlFlowFunction, options.MaxLoopAnalysisWork);
         if (analysis.Remaining <= 0 || analysis.Loops.Count == 0)
             return function;
         return new Hoister(function, target, options, valueNumberingOptions, analysis).Run();
@@ -870,7 +745,7 @@ internal static class LoopInvariantCodeMotion
         private readonly GimpleFunctionAnnotations _function;
         private readonly SsaOptimizationOptions _options;
         private readonly ValueNumberingOptions _valueNumberingOptions;
-        private readonly Analysis _analysis;
+        private readonly NaturalLoopAnalysis _analysis;
         private readonly int _registers;
         private readonly Dictionary<ControlFlowBlock, List<GimpleStatementAnnotations>> _statements = new();
         private readonly Dictionary<GimpleName, ControlFlowBlock?> _locations = new();
@@ -879,7 +754,7 @@ internal static class LoopInvariantCodeMotion
         private bool _changed;
 
         public Hoister(GimpleFunctionAnnotations function, TargetInfo target, SsaOptimizationOptions options,
-            ValueNumberingOptions valueNumberingOptions, Analysis analysis)
+            ValueNumberingOptions valueNumberingOptions, NaturalLoopAnalysis analysis)
         {
             _function = function;
             _options = options;
@@ -912,7 +787,7 @@ internal static class LoopInvariantCodeMotion
             return _changed ? Rebuild() : _function;
         }
 
-        private void Hoist(Loop loop)
+        private void Hoist(NaturalLoop loop)
         {
             bool writesMemory = false;
             bool containsCall = false;
@@ -1047,7 +922,7 @@ internal static class LoopInvariantCodeMotion
             return pressure;
         }
 
-        private int EstimateTemporaryPressure(Loop loop, HashSet<GimpleName> live)
+        private int EstimateTemporaryPressure(NaturalLoop loop, HashSet<GimpleName> live)
         {
             int peak = 0;
             foreach (var block in loop.Blocks)
@@ -1097,7 +972,7 @@ internal static class LoopInvariantCodeMotion
             return peak;
         }
 
-        private bool TrySelectPlan(GimpleStatementAnnotations root, Loop loop, bool writesMemory, int limit,
+        private bool TrySelectPlan(GimpleStatementAnnotations root, NaturalLoop loop, bool writesMemory, int limit,
             out List<GimpleStatementAnnotations> plan, out int cost)
         {
             plan = new List<GimpleStatementAnnotations>();
@@ -1121,7 +996,7 @@ internal static class LoopInvariantCodeMotion
             return true;
         }
 
-        private bool TryBuildPlan(GimpleStatementAnnotations root, Loop loop, bool writesMemory, int limit,
+        private bool TryBuildPlan(GimpleStatementAnnotations root, NaturalLoop loop, bool writesMemory, int limit,
             List<GimpleStatementAnnotations> plan, out int cost)
         {
             int totalCost = 0;
@@ -1164,7 +1039,7 @@ internal static class LoopInvariantCodeMotion
             }
         }
 
-        private bool IsProfitable(List<GimpleStatementAnnotations> plan, int cost, Loop loop,
+        private bool IsProfitable(List<GimpleStatementAnnotations> plan, int cost, NaturalLoop loop,
             HashSet<GimpleName> live, Dictionary<GimpleName, int> useCounts, int livePressure, int temporaryPressure, bool containsCall,
             out HashSet<GimpleName> released, out HashSet<GimpleName> carried)
         {
@@ -1207,7 +1082,7 @@ internal static class LoopInvariantCodeMotion
                 livePressure + temporaryPressure + growth <= Math.Max(1, _registers - 2);
         }
 
-        private bool UsedBeyondLoop(GimpleName name, Loop loop)
+        private bool UsedBeyondLoop(GimpleName name, NaturalLoop loop)
         {
             foreach (var use in _function.GetImmediateUses(name))
             {

@@ -782,18 +782,22 @@ public sealed class BoundAssignmentExpression : BoundExpression
     public BoundExpression Left { get; }
     public SyntaxToken OperatorToken { get; }
     public BoundExpression Right { get; }
+    /// <summary>Gets the type a compound assignment computes in before the result is stored back</summary>
+    public QualifiedType? ComputationType { get; }
 
     public BoundAssignmentExpression(
         AssignmentExpressionSyntax syntax,
         BoundExpression left,
         SyntaxToken operatorToken,
         BoundExpression right,
-        QualifiedType type)
+        QualifiedType type,
+        QualifiedType? computationType = null)
         : base(syntax, type, BoundValueKind.RValue)
     {
         Left = left ?? throw new ArgumentNullException(nameof(left));
         OperatorToken = operatorToken;
         Right = right ?? throw new ArgumentNullException(nameof(right));
+        ComputationType = computationType;
     }
 }
 

@@ -1320,6 +1320,7 @@ public sealed class Binder
     {
         var left = BindExpression(syntax.Left);
         var right = ApplyDefaultConversions(BindExpression(syntax.Right));
+        QualifiedType? computation = null;
 
         if (!IsModifiableLValue(left))
         {
@@ -1336,13 +1337,20 @@ public sealed class Binder
         {
             right = ConvertImplicitValue(right, left.Type);
         }
+        else if (IsArithmeticType(left.Type) && IsArithmeticType(right.Type))
+        {
+            var shift = syntax.OperatorToken.Kind is SyntaxKind.LessThanLessThanEqualsToken or SyntaxKind.GreaterThanGreaterThanEqualsToken;
+            computation = shift ? IntegerPromote(left.Type) : UsualArithmeticConversion(left.Type, right.Type);
+            right = ConvertImplicitValue(right, shift ? IntegerPromote(right.Type) : computation.Value);
+        }
 
         return new BoundAssignmentExpression(
             syntax,
             left,
             syntax.OperatorToken,
             right,
-            left.Type.IsError ? ErrorType : left.Type);
+            left.Type.IsError ? ErrorType : left.Type,
+            computation);
     }
 
     private BoundExpression BindConditionalExpression(ConditionalExpressionSyntax syntax)
@@ -1802,164 +1810,7 @@ public sealed class Binder
     }
 
     private QualifiedType BindTypeName(ImmutableArray<SyntaxToken> tokens, Scope scope)
-    {
-        if (tokens.IsDefaultOrEmpty)
-            return ErrorType;
-
-        // Type names reuse declaration parsing with an abstract declarator
-        SplitTypeNameTokens(tokens, scope, out var specifierTokens, out var declaratorTokens);
-
-        if (specifierTokens.Length == 0)
-            return ErrorType;
-
-        var specifiers = DeclarationTypeParser.ParseSpecifiers(specifierTokens, scope, _types);
-        if (declaratorTokens.Length == 0)
-            return specifiers.BaseType;
-
-        return DeclaratorTypeBuilder.Build(
-            new DeclaratorSyntax(declaratorTokens, identifier: null),
-            specifiers.BaseType,
-            _types,
-            scope);
-    }
-
-    private static void SplitTypeNameTokens(
-        ImmutableArray<SyntaxToken> tokens,
-        Scope scope,
-        out ImmutableArray<SyntaxToken> specifierTokens,
-        out ImmutableArray<SyntaxToken> declaratorTokens)
-    {
-        var specifiers = ImmutableArray.CreateBuilder<SyntaxToken>();
-        var index = 0;
-
-        while (index < tokens.Length)
-        {
-            var token = tokens[index];
-
-            if (!IsTypeNameSpecifierToken(token.Kind) && !IsTypedefNameToken(token, scope))
-                break;
-
-            specifiers.Add(token);
-            index++;
-
-            if (token.Kind is SyntaxKind.StructKeyword or SyntaxKind.UnionKeyword or SyntaxKind.EnumKeyword)
-            {
-                if (index < tokens.Length &&
-                    tokens[index].Kind is SyntaxKind.IdentifierToken or SyntaxKind.TypedefNameToken)
-                {
-                    specifiers.Add(tokens[index]);
-                    index++;
-                }
-
-                if (index < tokens.Length && tokens[index].Kind == SyntaxKind.OpenBraceToken)
-                    ReadBalancedTokenSequence(tokens, specifiers, ref index);
-
-                continue;
-            }
-
-            if (IsParenthesizedTypeSpecifier(token.Kind) &&
-                index < tokens.Length &&
-                tokens[index].Kind == SyntaxKind.OpenParenToken)
-            {
-                ReadBalancedTokenSequence(tokens, specifiers, ref index);
-                continue;
-            }
-        }
-
-        specifierTokens = specifiers.ToImmutable();
-        declaratorTokens = tokens.Skip(index).ToImmutableArray();
-    }
-
-    private static void ReadBalancedTokenSequence(
-        ImmutableArray<SyntaxToken> tokens,
-        ImmutableArray<SyntaxToken>.Builder destination,
-        ref int index)
-    {
-        if (index >= tokens.Length)
-            return;
-
-        var openKind = tokens[index].Kind;
-        var closeKind = openKind switch
-        {
-            SyntaxKind.OpenParenToken => SyntaxKind.CloseParenToken,
-            SyntaxKind.OpenBraceToken => SyntaxKind.CloseBraceToken,
-            SyntaxKind.OpenBracketToken => SyntaxKind.CloseBracketToken,
-            _ => SyntaxKind.None,
-        };
-
-        if (closeKind == SyntaxKind.None)
-            return;
-
-        var depth = 0;
-        while (index < tokens.Length)
-        {
-            var token = tokens[index++];
-            destination.Add(token);
-
-            if (token.Kind == openKind)
-            {
-                depth++;
-                continue;
-            }
-
-            if (token.Kind == closeKind)
-            {
-                depth--;
-                if (depth == 0)
-                    break;
-            }
-        }
-    }
-
-    private static bool IsParenthesizedTypeSpecifier(SyntaxKind kind)
-    {
-        return kind is SyntaxKind.AtomicKeyword
-            or SyntaxKind.UnderscoreAtomicKeyword
-            or SyntaxKind.TypeofKeyword
-            or SyntaxKind.TypeofUnqualKeyword
-            or SyntaxKind.TypeofExtensionKeyword;
-    }
-    private static bool IsTypedefNameToken(SyntaxToken token, Scope scope)
-    {
-        return token.Kind == SyntaxKind.IdentifierToken &&
-            scope.LookupOrdinary(token.Text) is TypeAliasSymbol;
-    }
-    private static bool IsTypeNameSpecifierToken(SyntaxKind kind)
-    {
-        switch (kind)
-        {
-            case SyntaxKind.VoidKeyword:
-            case SyntaxKind.BoolKeyword:
-            case SyntaxKind.UnderscoreBoolKeyword:
-            case SyntaxKind.CharKeyword:
-            case SyntaxKind.ShortKeyword:
-            case SyntaxKind.IntKeyword:
-            case SyntaxKind.LongKeyword:
-            case SyntaxKind.SignedKeyword:
-            case SyntaxKind.UnsignedKeyword:
-            case SyntaxKind.FloatKeyword:
-            case SyntaxKind.DoubleKeyword:
-            case SyntaxKind.StructKeyword:
-            case SyntaxKind.UnionKeyword:
-            case SyntaxKind.EnumKeyword:
-            case SyntaxKind.TypedefNameToken:
-            case SyntaxKind.TypeofKeyword:
-            case SyntaxKind.TypeofUnqualKeyword:
-            case SyntaxKind.TypeofExtensionKeyword:
-            case SyntaxKind.ConstKeyword:
-            case SyntaxKind.ConstExtensionKeyword:
-            case SyntaxKind.VolatileKeyword:
-            case SyntaxKind.VolatileExtensionKeyword:
-            case SyntaxKind.RestrictKeyword:
-            case SyntaxKind.RestrictExtensionKeyword:
-            case SyntaxKind.AtomicKeyword:
-            case SyntaxKind.UnderscoreAtomicKeyword:
-                return true;
-
-            default:
-                return false;
-        }
-    }
+        => TypeNameParser.Parse(tokens, scope, _types) ?? ErrorType;
 
     private FunctionType? GetFunctionType(QualifiedType type)
     {
@@ -2041,10 +1892,35 @@ public sealed class Binder
         if (!IsArithmeticType(left) || !IsArithmeticType(right))
             return ErrorType;
 
+        left = IntegerPromote(left);
+        right = IntegerPromote(right);
         var leftRank = ArithmeticRank(left);
         var rightRank = ArithmeticRank(right);
-        return leftRank >= rightRank ? IntegerPromote(left) : IntegerPromote(right);
+        if (IsFloatingType(left) || IsFloatingType(right) || !IsIntegerType(left) || !IsIntegerType(right) ||
+            IsUnsignedIntegerType(left) == IsUnsignedIntegerType(right))
+            return leftRank >= rightRank ? left : right;
+
+        // C11 6.3.1.8: the unsigned side wins unless the signed type can hold all of its values
+        var unsigned = IsUnsignedIntegerType(left) ? left : right;
+        var signed = ReferenceEquals(unsigned.Type, left.Type) ? right : left;
+        if (ArithmeticRank(unsigned) >= ArithmeticRank(signed))
+            return unsigned;
+        var target = _compilation.Options.Target;
+        return target.SizeOf(signed) > target.SizeOf(unsigned) ? signed : ToUnsigned(signed);
     }
+
+    private static bool IsUnsignedIntegerType(QualifiedType type)
+        => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.UnsignedInt or BuiltinTypeKind.UnsignedLong or BuiltinTypeKind.UnsignedLongLong };
+
+    private QualifiedType ToUnsigned(QualifiedType type)
+        => type.Type is BuiltinType builtin
+            ? _types.Builtin(builtin.BuiltinKind switch
+            {
+                BuiltinTypeKind.Long => BuiltinTypeKind.UnsignedLong,
+                BuiltinTypeKind.LongLong => BuiltinTypeKind.UnsignedLongLong,
+                _ => BuiltinTypeKind.UnsignedInt,
+            })
+            : type;
 
     private QualifiedType IntegerPromote(QualifiedType type)
     {

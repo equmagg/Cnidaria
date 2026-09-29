@@ -141,6 +141,8 @@ public struct SyntaxToken
     public readonly object? Value;
     public readonly ImmutableArray<SyntaxTrivia> LeadingTrivia;
     public ImmutableArray<SyntaxTrivia> TrailingTrivia;
+    /// <summary>Gets a number unique among the tokens of one translation unit, since positions restart in every included file</summary>
+    public readonly int Ordinal;
 
     public TextSpan Span => new TextSpan(Position, Text.Length);
 
@@ -150,7 +152,8 @@ public struct SyntaxToken
         string text,
         object? value,
         ImmutableArray<SyntaxTrivia> leadingTrivia,
-        ImmutableArray<SyntaxTrivia> trailingTrivia)
+        ImmutableArray<SyntaxTrivia> trailingTrivia,
+        int ordinal = 0)
     {
         Kind = kind;
         Position = position;
@@ -158,6 +161,7 @@ public struct SyntaxToken
         Value = value;
         LeadingTrivia = leadingTrivia;
         TrailingTrivia = trailingTrivia;
+        Ordinal = ordinal;
     }
 }
 
@@ -875,6 +879,10 @@ public sealed class PreprocessorOptions
     public int MaxMacroExpansionDepth { get; }
     public int MaxMacroExpansionTokens { get; }
     public bool IncludeStandardHeaders { get; }
+
+    /// <summary>Whether tokens carry their whitespace, comments and directives, which parsing does not need</summary>
+    public bool PreserveTrivia { get; }
+
     public PreprocessorOptions(
         string? filePath = null,
         PreprocessorEnvironment? environment = null,
@@ -888,9 +896,11 @@ public sealed class PreprocessorOptions
         int maxIncludeBytes = 1 * 1024 * 1024,
         int maxMacroExpansionDepth = 200,
         int maxMacroExpansionTokens = 1_000_000,
-        bool includeStandardHeaders = true)
+        bool includeStandardHeaders = true,
+        bool preserveTrivia = false)
     {
         FilePath = filePath;
+        PreserveTrivia = preserveTrivia;
         Environment = environment ?? PreprocessorEnvironment.Default;
         IncludeSearchPaths = includeSearchPaths?.ToImmutableArray() ?? ImmutableArray<string>.Empty;
         IncludeStandardHeaders = includeStandardHeaders;
@@ -921,7 +931,8 @@ public sealed class PreprocessorOptions
         IEnumerable<string>? includeSearchPaths = null,
         IIncludeResolver? includeResolver = null,
         IReadOnlyDictionary<string, string>? predefinedMacros = null,
-        bool includeStandardHeaders = true)
+        bool includeStandardHeaders = true,
+        bool preserveTrivia = false)
     {
         if (target is null)
             throw new ArgumentNullException(nameof(target));
@@ -934,7 +945,8 @@ public sealed class PreprocessorOptions
             includeSearchPaths,
             includeResolver,
             includeFiles,
-            includeStandardHeaders: includeStandardHeaders);
+            includeStandardHeaders: includeStandardHeaders,
+            preserveTrivia: preserveTrivia);
     }
     public static PreprocessorOptions CreateForInMemoryFiles(
         string? filePath = null,
@@ -1173,6 +1185,17 @@ public static class SyntaxFacts
     public static bool TryGetPunctuatorKind(string text, out SyntaxKind kind)
         => s_punctuatorKinds.TryGetValue(text, out kind);
 
+    private static readonly Dictionary<string, SyntaxKind>.AlternateLookup<ReadOnlySpan<char>> s_punctuatorLookup =
+        s_punctuatorKinds.GetAlternateLookup<ReadOnlySpan<char>>();
+    private static readonly Dictionary<string, SyntaxKind>.AlternateLookup<ReadOnlySpan<char>> s_keywordLookup =
+        s_keywordKinds.GetAlternateLookup<ReadOnlySpan<char>>();
+
+    internal static bool TryGetPunctuator(ReadOnlySpan<char> text, out string punctuator, out SyntaxKind kind)
+        => s_punctuatorLookup.TryGetValue(text, out punctuator!, out kind);
+
+    internal static bool TryGetKeyword(ReadOnlySpan<char> text, out string keyword, out SyntaxKind kind)
+        => s_keywordLookup.TryGetValue(text, out keyword!, out kind);
+
     public static int MaxPunctuatorTextLength { get; } =
         s_punctuatorKinds.Keys.Max(static text => text.Length);
 }
@@ -1255,9 +1278,15 @@ public sealed class Lexer
     private readonly Stack<ConditionalFrame> _conditionalStack = new();
     private readonly Stack<InputFrame> _inputStack = new();
     private readonly Queue<SyntaxToken> _pendingTokens = new();
-    private readonly HashSet<string> _disabledMacroNames = new(StringComparer.Ordinal);
-    private readonly List<SyntaxDiagnostic> _diagnostics = new();
+    private readonly HashSet<string> _disabledMacroNames;
+    private readonly HashSet<int> _paintedTokens;
+    private readonly HashSet<string> _onceFiles = new(StringComparer.Ordinal);
+    private readonly TokenOrdinals _ordinals;
+    private readonly List<SyntaxDiagnostic> _diagnostics;
     private readonly PreprocessorOptions _options;
+    private readonly ImmutableArray<SyntaxTrivia>.Builder _trivia = ImmutableArray.CreateBuilder<SyntaxTrivia>();
+    private readonly bool _isExpansion;
+    private readonly bool _keepTrivia;
     private int _macroExpansionDepth;
     private int _macroExpansionTokenCount;
 
@@ -1281,10 +1310,33 @@ public sealed class Lexer
         if (_text.Length > _options.MaxInputLength)
             throw new ArgumentException($"Input length {_text.Length} exceeds the configured lexer limit {_options.MaxInputLength}.", nameof(text));
         _filePath = _options.FilePath;
+        _keepTrivia = _options.PreserveTrivia;
         _macros = new Dictionary<string, MacroInfo>(StringComparer.Ordinal);
+        _disabledMacroNames = new HashSet<string>(StringComparer.Ordinal);
+        _paintedTokens = new HashSet<int>();
+        _ordinals = new TokenOrdinals();
+        _diagnostics = new List<SyntaxDiagnostic>();
 
         foreach (var pair in _options.PredefinedMacros)
             DefineObjectMacro(pair.Key, pair.Value);
+    }
+
+    // Rescans replacement text with the macros of the lexer that expands it; what an expansion produces is never a directive
+    private Lexer(Lexer parent, string text, bool keepTrivia)
+    {
+        _text = text;
+        _typeNames = parent._typeNames;
+        _options = parent._options;
+        _filePath = parent._filePath;
+        _macros = parent._macros;
+        _disabledMacroNames = parent._disabledMacroNames;
+        _paintedTokens = parent._paintedTokens;
+        _ordinals = parent._ordinals;
+        _diagnostics = parent._diagnostics;
+        _macroExpansionDepth = parent._macroExpansionDepth + 1;
+        _macroExpansionTokenCount = parent._macroExpansionTokenCount;
+        _isExpansion = true;
+        _keepTrivia = keepTrivia;
     }
 
     public IReadOnlyList<SyntaxDiagnostic> Diagnostics => _diagnostics;
@@ -1440,8 +1492,12 @@ public sealed class Lexer
         if (!_macros.TryGetValue(token.Text, out var macro))
             return false;
 
+        // A name met while its own macro is being replaced stays unexpanded wherever the token goes (C11 6.10.3.4p2)
         if (_disabledMacroNames.Contains(macro.Name))
+        {
+            _paintedTokens.Add(token.Ordinal);
             return false;
+        }
 
         if (_macroExpansionDepth >= _options.MaxMacroExpansionDepth)
         {
@@ -1648,13 +1704,13 @@ public sealed class Lexer
             // The argument is a token sequence: space around it is not part of it, and ## must not paste it in
             var raw = (i < arguments.Length ? arguments[i] : string.Empty).Trim();
             rawArguments[parameter] = raw;
-            expandedArguments[parameter] = ExpandMacroArgumentToText(raw, macro.Name, sourceToken.Position).Trim();
+            expandedArguments[parameter] = MacroExpandTextToString(raw, sourceToken.Position).Trim();
         }
 
         if (macro.IsVariadic)
         {
             var variadicRaw = JoinMacroArguments(arguments, fixedParameterCount).Trim();
-            var variadicExpanded = ExpandMacroArgumentToText(variadicRaw, macro.Name, sourceToken.Position).Trim();
+            var variadicExpanded = MacroExpandTextToString(variadicRaw, sourceToken.Position).Trim();
 
             rawArguments["__VA_ARGS__"] = variadicRaw;
             expandedArguments["__VA_ARGS__"] = variadicExpanded;
@@ -1757,22 +1813,10 @@ public sealed class Lexer
             return;
         }
 
-        var expansionOptions = CreateMacroExpansionOptions();
-        var nested = new Lexer(replacementText, _typeNames, expansionOptions);
-        nested._macros.Clear();
-
-        foreach (var pair in _macros)
-            nested._macros[pair.Key] = pair.Value;
-
-        foreach (var name in _disabledMacroNames)
-            nested._disabledMacroNames.Add(name);
-
-        nested._disabledMacroNames.Add(macro.Name);
-        nested._macroExpansionDepth = _macroExpansionDepth + 1;
-        nested._macroExpansionTokenCount = _macroExpansionTokenCount;
-
-        _disabledMacroNames.Add(macro.Name);
+        var nested = new Lexer(this, replacementText, _keepTrivia);
+        var disabled = _disabledMacroNames.Add(macro.Name);
         _macroExpansionDepth++;
+        SyntaxToken? last = null;
 
         try
         {
@@ -1788,43 +1832,70 @@ public sealed class Lexer
                 if (token.Kind == SyntaxKind.EndOfFileToken)
                     break;
 
-                _pendingTokens.Enqueue(token);
+                if (last is { } previous)
+                    _pendingTokens.Enqueue(previous);
+                last = token;
             }
-
-            foreach (var diagnostic in nested.Diagnostics)
-                _diagnostics.Add(diagnostic);
         }
         finally
         {
             _macroExpansionDepth--;
-            _disabledMacroNames.Remove(macro.Name);
+            if (disabled)
+                _disabledMacroNames.Remove(macro.Name);
         }
+
+        if (last is { } tail && !TryExpandTrailingInvocation(tail))
+            _pendingTokens.Enqueue(tail);
     }
 
-    private string ExpandMacroArgumentToText(string text, string disabledMacroName, int diagnosticPosition)
-        => MacroExpandTextToString(text, disabledMacroName, diagnosticPosition);
+    // Rescanning goes on into the text after the invocation, so a function-like macro named last takes its arguments from there
+    private bool TryExpandTrailingInvocation(SyntaxToken tail)
+    {
+        if (_paintedTokens.Contains(tail.Ordinal) || !IsMacroExpansionCandidate(tail) ||
+            !_macros.TryGetValue(tail.Text, out var macro) || !macro.IsFunctionLike || !IsOpenParenAhead())
+            return false;
 
-    private string MacroExpandTextToString(string text, string? disabledMacroName, int diagnosticPosition)
+        tail.TrailingTrivia = ReadTrivia(leading: false);
+        return TryExpandMacro(tail);
+    }
+
+    private bool IsOpenParenAhead()
+    {
+        var index = _position;
+        while (index < _text.Length)
+        {
+            var ch = _text[index];
+            if (ch is ' ' or '\t' or '\v' or '\f' or '\r' or '\n')
+                index++;
+            else if (ch == '\\' && index + 1 < _text.Length && IsLineBreak(_text[index + 1]))
+                index += 2;
+            else if (ch == '/' && index + 1 < _text.Length && _text[index + 1] == '/')
+            {
+                while (index < _text.Length && !IsLineBreak(_text[index]))
+                    index++;
+            }
+            else if (ch == '/' && index + 1 < _text.Length && _text[index + 1] == '*')
+            {
+                var end = _text.IndexOf("*/", index + 2, StringComparison.Ordinal);
+                if (end < 0)
+                    return false;
+                index = end + 2;
+            }
+            else
+                return ch == '(';
+        }
+
+        return false;
+    }
+
+    // An argument is expanded on its own before substitution, while the macro it belongs to can still expand in it
+    private string MacroExpandTextToString(string text, int diagnosticPosition)
     {
         if (string.IsNullOrEmpty(text))
             return string.Empty;
 
-        var expansionOptions = CreateMacroExpansionOptions();
-        var nested = new Lexer(text, _typeNames, expansionOptions);
-        nested._macros.Clear();
-
-        foreach (var pair in _macros)
-            nested._macros[pair.Key] = pair.Value;
-
-        foreach (var name in _disabledMacroNames)
-            nested._disabledMacroNames.Add(name);
-
-        if (disabledMacroName is not null)
-            nested._disabledMacroNames.Add(disabledMacroName);
-
-        nested._macroExpansionDepth = _macroExpansionDepth + 1;
-        nested._macroExpansionTokenCount = _macroExpansionTokenCount;
-
+        // The text is rebuilt from the tokens, so the space between them has to be kept
+        var nested = new Lexer(this, text, keepTrivia: true);
         var builder = new System.Text.StringBuilder(text.Length);
 
         while (true)
@@ -1843,9 +1914,6 @@ public sealed class Lexer
             builder.Append(token.Text);
             AppendTriviaText(builder, token.TrailingTrivia);
         }
-
-        foreach (var diagnostic in nested.Diagnostics)
-            _diagnostics.Add(diagnostic);
 
         return builder.ToString();
     }
@@ -2064,21 +2132,6 @@ public sealed class Lexer
         return true;
     }
 
-    private PreprocessorOptions CreateMacroExpansionOptions()
-        => new PreprocessorOptions(
-            filePath: _filePath,
-            environment: new PreprocessorEnvironment("unknown", "unknown"),
-            predefinedMacros: ImmutableDictionary<string, string>.Empty,
-            includeSearchPaths: ImmutableArray<string>.Empty,
-            includeResolver: NullIncludeResolver.Instance,
-            maxIncludeDepth: _options.MaxIncludeDepth,
-            maxInputLength: _options.MaxInputLength,
-            maxTokenLength: _options.MaxTokenLength,
-            maxIncludeBytes: _options.MaxIncludeBytes,
-            maxMacroExpansionDepth: _options.MaxMacroExpansionDepth,
-            maxMacroExpansionTokens: _options.MaxMacroExpansionTokens,
-            includeStandardHeaders: false);
-
     // Token scanning
 
     private SyntaxToken LexToken(ImmutableArray<SyntaxTrivia> leadingTrivia)
@@ -2155,12 +2208,10 @@ public sealed class Lexer
                 Advance();
         }
 
+        if (SyntaxFacts.TryGetKeyword(_text.AsSpan(start, _position - start), out var keyword, out var keywordKind))
+            return MakeToken(keywordKind, start, keyword, null, leadingTrivia);
+
         var text = _text[start.._position];
-
-        var keywordKind = SyntaxFacts.GetKeywordKind(text);
-        if (keywordKind != SyntaxKind.IdentifierToken)
-            return MakeToken(keywordKind, start, text, null, leadingTrivia);
-
         var kind = _typeNames.IsTypeName(text)
             ? SyntaxKind.TypedefNameToken
             : SyntaxKind.IdentifierToken;
@@ -2668,10 +2719,8 @@ public sealed class Lexer
 
         for (var length = maxLength; length >= 1; length--)
         {
-            var text = _text.Substring(_position, length);
-
-            if (SyntaxFacts.TryGetPunctuatorKind(text, out var kind))
-                return MakeFixedToken(kind, leadingTrivia, length);
+            if (SyntaxFacts.TryGetPunctuator(_text.AsSpan(_position, length), out var text, out var kind))
+                return MakeFixedToken(kind, leadingTrivia, text);
         }
 
         return MakeBadToken(leadingTrivia);
@@ -2681,7 +2730,8 @@ public sealed class Lexer
 
     private ImmutableArray<SyntaxTrivia> ReadTrivia(bool leading)
     {
-        var trivia = ImmutableArray.CreateBuilder<SyntaxTrivia>();
+        var trivia = _trivia;
+        trivia.Clear();
 
         while (true)
         {
@@ -2695,15 +2745,16 @@ public sealed class Lexer
                 AdvancePreservingLineStart();
                 _seenBom = true;
 
-                trivia.Add(new SyntaxTrivia(
-                    SyntaxKind.BomTrivia,
-                    start,
-                    _text[start.._position]));
+                if (_keepTrivia)
+                    trivia.Add(new SyntaxTrivia(
+                        SyntaxKind.BomTrivia,
+                        start,
+                        _text[start.._position]));
 
                 continue;
             }
 
-            if (leading && _atStartOfLine && IsDirectiveIntroducer())
+            if (leading && _atStartOfLine && !_isExpansion && IsDirectiveIntroducer())
             {
                 ReadDirectiveTrivia(trivia);
                 continue;
@@ -2714,10 +2765,11 @@ public sealed class Lexer
                 while (Current is ' ' or '\t' or '\v' or '\f')
                     AdvancePreservingLineStart();
 
-                trivia.Add(new SyntaxTrivia(
-                    SyntaxKind.WhitespaceTrivia,
-                    start,
-                    _text[start.._position]));
+                if (_keepTrivia)
+                    trivia.Add(new SyntaxTrivia(
+                        SyntaxKind.WhitespaceTrivia,
+                        start,
+                        WhitespaceText(start)));
 
                 continue;
             }
@@ -2732,10 +2784,11 @@ public sealed class Lexer
             {
                 ReadLineContinuation();
 
-                trivia.Add(new SyntaxTrivia(
-                    SyntaxKind.LineContinuationTrivia,
-                    start,
-                    _text[start.._position]));
+                if (_keepTrivia)
+                    trivia.Add(new SyntaxTrivia(
+                        SyntaxKind.LineContinuationTrivia,
+                        start,
+                        _text[start.._position]));
 
                 continue;
             }
@@ -2744,10 +2797,11 @@ public sealed class Lexer
             {
                 ReadLineBreak();
 
-                trivia.Add(new SyntaxTrivia(
-                    SyntaxKind.EndOfLineTrivia,
-                    start,
-                    _text[start.._position]));
+                if (_keepTrivia)
+                    trivia.Add(new SyntaxTrivia(
+                        SyntaxKind.EndOfLineTrivia,
+                        start,
+                        _position - start == 1 ? (_text[start] == '\n' ? "\n" : "\r") : "\r\n"));
 
                 _atStartOfLine = true;
                 continue;
@@ -2772,10 +2826,11 @@ public sealed class Lexer
                     Advance();
                 }
 
-                trivia.Add(new SyntaxTrivia(
-                    SyntaxKind.SingleLineCommentTrivia,
-                    start,
-                    _text[start.._position]));
+                if (_keepTrivia)
+                    trivia.Add(new SyntaxTrivia(
+                        SyntaxKind.SingleLineCommentTrivia,
+                        start,
+                        _text[start.._position]));
 
                 continue;
             }
@@ -2816,10 +2871,11 @@ public sealed class Lexer
                 if (!terminated)
                     Error(start, _position - start, "Unterminated block comment.");
 
-                trivia.Add(new SyntaxTrivia(
-                    SyntaxKind.MultiLineCommentTrivia,
-                    start,
-                    _text[start.._position]));
+                if (_keepTrivia)
+                    trivia.Add(new SyntaxTrivia(
+                        SyntaxKind.MultiLineCommentTrivia,
+                        start,
+                        _text[start.._position]));
 
                 continue;
             }
@@ -2827,7 +2883,18 @@ public sealed class Lexer
             break;
         }
 
-        return trivia.ToImmutable();
+        return trivia.Count == 0 ? ImmutableArray<SyntaxTrivia>.Empty : trivia.ToImmutable();
+    }
+
+    // Indentation repeats on almost every line, so runs of spaces share their strings
+    private static readonly string[] s_spaces = Enumerable.Range(0, 33).Select(static count => new string(' ', count)).ToArray();
+
+    private string WhitespaceText(int start)
+    {
+        var length = _position - start;
+        if (length < s_spaces.Length && _text.AsSpan(start, length).IndexOfAnyExcept(' ') < 0)
+            return s_spaces[length];
+        return length == 1 && _text[start] == '\t' ? "\t" : _text[start.._position];
     }
 
     private bool ReadDisabledTextTrivia(ImmutableArray<SyntaxTrivia>.Builder trivia)
@@ -2870,10 +2937,11 @@ public sealed class Lexer
             return false;
         }
 
-        trivia.Add(new SyntaxTrivia(
-            SyntaxKind.DisabledTextTrivia,
-            start,
-            _text[start.._position]));
+        if (_keepTrivia)
+            trivia.Add(new SyntaxTrivia(
+                SyntaxKind.DisabledTextTrivia,
+                start,
+                _text[start.._position]));
 
         _mode = previousMode;
         return true;
@@ -2914,10 +2982,11 @@ public sealed class Lexer
         var text = _text[start.._position];
         var pushedInput = ProcessDirectiveText(text, start);
 
-        trivia.Add(new SyntaxTrivia(
-            SyntaxKind.DirectiveTrivia,
-            start,
-            text));
+        if (_keepTrivia)
+            trivia.Add(new SyntaxTrivia(
+                SyntaxKind.DirectiveTrivia,
+                start,
+                text));
 
         if (!pushedInput)
         {
@@ -3013,7 +3082,11 @@ public sealed class Lexer
                 return false;
 
             case "line":
+                return false;
+
             case "pragma":
+                if (IsCurrentlyActive)
+                    ProcessPragmaDirective(rest);
                 return false;
 
             case "embed":
@@ -3023,6 +3096,23 @@ public sealed class Lexer
 
             default:
                 return false;
+        }
+    }
+
+    /// <summary>Gets whether a pragma asked for the RISC-V vector intrinsics to be declared on first use</summary>
+    public bool DeclaresRiscVVectorIntrinsics { get; private set; }
+
+    private void ProcessPragmaDirective(string rest)
+    {
+        var words = rest.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        if (words is ["once"])
+        {
+            if (_filePath is not null)
+                _onceFiles.Add(_filePath);
+        }
+        else if (words is ["cnidaria", "riscv", "intrinsic", "vector"])
+        {
+            DeclaresRiscVVectorIntrinsics = true;
         }
     }
 
@@ -3038,7 +3128,7 @@ public sealed class Lexer
         {
             if (!TryParseIncludeName(rest, out var includeName, out var isAngled))
             {
-                var expandedRest = MacroExpandTextToString(rest, disabledMacroName: null, position);
+                var expandedRest = MacroExpandTextToString(rest, position);
                 if (!TryParseIncludeName(expandedRest, out includeName, out isAngled))
                 {
                     Error(position, rest.Length, $"Unsupported or malformed #{directiveName} directive.");
@@ -3057,6 +3147,9 @@ public sealed class Lexer
                 Error(position, rest.Length, $"Cannot resolve include '{includeName}'.");
                 return false;
             }
+
+            if (_onceFiles.Contains(includeFile.Path))
+                return false;
 
             if (includeFile.Text.Length > _options.MaxIncludeBytes)
             {
@@ -3374,13 +3467,10 @@ public sealed class Lexer
     private SyntaxToken MakeFixedToken(
         SyntaxKind kind,
         ImmutableArray<SyntaxTrivia> leadingTrivia,
-        int length)
+        string text)
     {
         var start = _position;
-        var text = _text.Substring(start, length);
-
-        for (var i = 0; i < length; i++)
-            Advance();
+        _position += text.Length;
 
         return MakeToken(kind, start, text, null, leadingTrivia);
     }
@@ -3414,7 +3504,13 @@ public sealed class Lexer
             text,
             value,
             leadingTrivia,
-            ImmutableArray<SyntaxTrivia>.Empty);
+            ImmutableArray<SyntaxTrivia>.Empty,
+            ++_ordinals.Last);
+    }
+
+    private sealed class TokenOrdinals
+    {
+        public int Last;
     }
 
     private char Current => Peek(0);

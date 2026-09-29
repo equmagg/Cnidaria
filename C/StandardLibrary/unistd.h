@@ -35,4 +35,19 @@ int access(const char* path, int mode);
 int chdir(const char* path);
 char* getcwd(char* buffer, size_t size);
 
+#if defined(__linux__)
+pid_t getpid(void);
+pid_t getppid(void);
+pid_t getpgrp(void);
+pid_t getpgid(pid_t pid);
+int setpgid(pid_t pid, pid_t group);
+pid_t getsid(pid_t pid);
+pid_t setsid(void);
+int pause(void);
+unsigned int alarm(unsigned int seconds);
+unsigned int sleep(unsigned int seconds);
+pid_t tcgetpgrp(int descriptor);
+int tcsetpgrp(int descriptor, pid_t group);
+#endif
+
 #endif

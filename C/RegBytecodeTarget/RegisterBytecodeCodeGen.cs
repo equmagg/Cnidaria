@@ -300,7 +300,7 @@ public sealed class RegisterBytecodeCodeGenerator
         _entryFunctionName = string.IsNullOrWhiteSpace(entryFunctionName)
             ? throw new ArgumentException("The entry function name cannot be empty.", nameof(entryFunctionName))
             : entryFunctionName;
-        _allocationOptions = allocationOptions ?? LSRAOptions.Default;
+        _allocationOptions = allocationOptions ?? LSRAOptions.ForTarget(_target);
 
         foreach (var unit in units)
         {
@@ -1354,8 +1354,7 @@ public sealed class RegisterBytecodeCodeGenerator
             if (IsAggregateType(instruction.Result.Type))
             {
                 var destinationAddress = MaterializeVirtualRegisterStorageAddress(instruction.Result, GpScratch0);
-                _asm.LiI32(GpScratch1, 0);
-                EmitRaw(Op.InitBlk, destinationAddress, GpScratch1, MachineRegister.Invalid, imm: Math.Max(1, SizeOf(instruction.Result.Type)));
+                EmitRaw(Op.InitBlk, destinationAddress, MachineRegister.X0, MachineRegister.Invalid, imm: Math.Max(1, SizeOf(instruction.Result.Type)));
                 return;
             }
 
@@ -1414,7 +1413,16 @@ public sealed class RegisterBytecodeCodeGenerator
                 throw Unsupported(instruction, $"Unsupported unary operator '{op}'.");
             }
 
+            NormalizeNarrowResult(dst, instruction);
             StoreWritableRegisterIfSpilled(instruction.Result, dst);
+        }
+
+        // A char or short result wraps at its own width, which 32-bit arithmetic does not do by itself
+        private void NormalizeNarrowResult(MachineRegister dst, LirInstruction instruction)
+        {
+            var type = instruction.Result!.Type;
+            if (IsIntegerLike(type) && !IsFloatType(type) && SizeOf(type) < 4)
+                EmitConversion(dst, dst, TypeCatalog.Instance.Builtin(BuiltinTypeKind.Int), type, instruction);
         }
 
         private void EmitBinary(LirInstruction instruction)
@@ -1433,12 +1441,14 @@ public sealed class RegisterBytecodeCodeGenerator
             var op = SelectBinaryOp(instruction.Operator, leftType, rightType, resultType);
             if (!usesFloatingOperands && TryEmitPowerOfTwoImmediate(instruction, dst))
             {
+                NormalizeNarrowResult(dst, instruction);
                 StoreWritableRegisterIfSpilled(instruction.Result, dst);
                 return;
             }
 
             if (!usesFloatingOperands && TryEmitBinaryImmediate(instruction, dst, op))
             {
+                NormalizeNarrowResult(dst, instruction);
                 StoreWritableRegisterIfSpilled(instruction.Result, dst);
                 return;
             }
@@ -1458,6 +1468,8 @@ public sealed class RegisterBytecodeCodeGenerator
             }
 
             EmitRaw(op, dst, left, right, MayThrow(op));
+            if (!usesFloatingOperands)
+                NormalizeNarrowResult(dst, instruction);
             StoreWritableRegisterIfSpilled(instruction.Result, dst);
         }
 
@@ -1583,6 +1595,31 @@ public sealed class RegisterBytecodeCodeGenerator
             }
         }
 
+        private bool TryGetPointerOffset(LirOperand index, QualifiedType indexType, long scale, bool negate, out long offset)
+        {
+            offset = 0;
+            if (index.Kind != LirOperandKind.Immediate || !TryGetIntegerImmediate(index.Immediate, out var value))
+                return false;
+            if (!Is64BitInteger(indexType))
+                value = unchecked((int)value);
+            if (value is < int.MinValue or > int.MaxValue)
+                return false;
+            offset = (negate ? -value : value) * scale;
+            return true;
+        }
+
+        private static bool TryFoldOffset(long offset, long index, int scale, out int folded)
+        {
+            folded = 0;
+            if (index is < int.MinValue or > int.MaxValue)
+                return false;
+            var total = offset + index * scale;
+            if (total is < int.MinValue or > int.MaxValue)
+                return false;
+            folded = (int)total;
+            return true;
+        }
+
         private static bool TryGetIntegerImmediate(object? value, out long immediate)
         {
             switch (value)
@@ -1632,6 +1669,15 @@ public sealed class RegisterBytecodeCodeGenerator
             var rhsType = instruction.Operands[1].Type;
             var resultType = instruction.Result!.Type;
             var opText = instruction.Operator;
+
+            if (opText is "+" or "-" && IsPointerLike(lhsType) && IsIntegerLike(rhsType) &&
+                TryGetPointerOffset(instruction.Operands[1], rhsType, PointerScale(lhsType), opText == "-", out var delta))
+            {
+                var dst = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
+                EmitI64Imm(Op.I64AddImm, dst, LoadOperand(instruction.Operands[0], GpScratch1), delta);
+                StoreWritableRegisterIfSpilled(instruction.Result, dst);
+                return true;
+            }
 
             if (opText == "+" && IsPointerLike(lhsType) && IsIntegerLike(rhsType))
             {
@@ -1760,8 +1806,7 @@ public sealed class RegisterBytecodeCodeGenerator
 
             var size = instruction.Operands.Length == 0 ? SizeOf(instruction.Address.ElementType) : ImmediateToInt32(instruction.Operands[0]);
             MaterializeAddress(instruction.Address, GpScratch0);
-            _asm.LiI32(GpScratch1, 0);
-            EmitRaw(Op.InitBlk, GpScratch0, GpScratch1, MachineRegister.Invalid, imm: size);
+            EmitRaw(Op.InitBlk, GpScratch0, MachineRegister.X0, MachineRegister.Invalid, imm: size);
         }
 
         private void EmitCall(LirInstruction instruction)
@@ -2592,6 +2637,8 @@ public sealed class RegisterBytecodeCodeGenerator
                     return LoadVirtualRegister(operand.Register, preferred);
 
                 case LirOperandKind.Immediate:
+                    if (!IsFloatType(operand.Type) && TryGetIntegerImmediate(operand.Immediate, out var constant) && constant == 0)
+                        return MachineRegister.X0;
                     EmitImmediate(preferred, operand.Immediate, operand.Type);
                     return preferred;
 
@@ -2625,10 +2672,9 @@ public sealed class RegisterBytecodeCodeGenerator
                 case LirOperandKind.Undefined:
                 case LirOperandKind.Void:
                 case LirOperandKind.None:
-                    if (IsFloatType(operand.Type))
-                        EmitLiFloat(preferred, 0.0, operand.Type);
-                    else
-                        _asm.LiI64(preferred, 0);
+                    if (!IsFloatType(operand.Type))
+                        return MachineRegister.X0;
+                    EmitLiFloat(preferred, 0.0, operand.Type);
                     return preferred;
 
                 default:
@@ -3033,6 +3079,10 @@ public sealed class RegisterBytecodeCodeGenerator
                             return baseParts.WithOffset(checked(baseParts.Offset + address.Displacement));
 
                         var scale = Math.Max(1, address.Scale);
+                        if (address.Index.Kind == LirOperandKind.Immediate &&
+                            TryGetIntegerImmediate(address.Index.Immediate, out var constantIndex) &&
+                            TryFoldOffset(baseParts.Offset + (long)address.Displacement, constantIndex, scale, out var folded))
+                            return baseParts.WithOffset(folded);
                         if (baseParts.IndexRegister == MachineRegister.Invalid && IsPowerOfTwo(scale))
                         {
                             var simpleIndex = LoadOperand(address.Index, scratchIndex);
@@ -3165,13 +3215,13 @@ public sealed class RegisterBytecodeCodeGenerator
 
             if (dstSize == 2)
             {
-                EmitRaw(Op.TruncI32ToI16, dst, src);
+                EmitRaw(IsUnsignedInteger(dstType) ? Op.TruncI32ToI16 : Op.SignExtendI16ToI32, dst, src);
                 return;
             }
 
             if (dstSize == 1)
             {
-                EmitRaw(Op.TruncI32ToI8, dst, src);
+                EmitRaw(IsUnsignedInteger(dstType) ? Op.TruncI32ToI8 : Op.SignExtendI8ToI32, dst, src);
                 return;
             }
 
@@ -3440,22 +3490,10 @@ public sealed class RegisterBytecodeCodeGenerator
             if (!IsFloatRegister(destination))
                 throw new InvalidOperationException("Floating-point immediate destination must be an FPR.");
 
-            var scratchOffset = _allocation.Frame.FloatingImmediateTempOffset;
-            if (scratchOffset < 0)
-                throw new InvalidOperationException("Floating-point immediate scratch slot was not reserved.");
-
             if (IsFloat32(type))
-            {
-                _asm.LiI32(GpScratch2, BitConverter.SingleToInt32Bits((float)value));
-                EmitMem(Op.StI4, GpScratch2, MachineRegister.Invalid, scratchOffset, MachineRegister.Invalid, MemoryBase.StackPointer, 4);
-                EmitMem(Op.LdF32, destination, MachineRegister.Invalid, scratchOffset, MachineRegister.Invalid, MemoryBase.StackPointer, 4);
-            }
+                _asm.LiF32Bits(destination, BitConverter.SingleToInt32Bits((float)value));
             else
-            {
-                _asm.LiI64(GpScratch2, BitConverter.DoubleToInt64Bits(value));
-                EmitMem(Op.StI8, GpScratch2, MachineRegister.Invalid, scratchOffset, MachineRegister.Invalid, MemoryBase.StackPointer, 8);
-                EmitMem(Op.LdF64, destination, MachineRegister.Invalid, scratchOffset, MachineRegister.Invalid, MemoryBase.StackPointer, 8);
-            }
+                _asm.LiF64Bits(destination, BitConverter.DoubleToInt64Bits(value));
         }
 
         private bool IsFallthroughTarget(LirBlock? target)

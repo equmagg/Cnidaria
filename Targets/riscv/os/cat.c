@@ -57,7 +57,7 @@ int main(int argc, char** argv, char** envp)
         index = index + 1;
     }
 
-    /* With nothing named, a filter reads what it is given */
+    // With nothing named, a filter reads what it is given
     if (index == argc)
         return cat_stream(0, numbered);
 

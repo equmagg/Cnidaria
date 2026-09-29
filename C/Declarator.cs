@@ -53,6 +53,183 @@ internal readonly struct DeclarationSpecifiers
         FunctionSpecifiers = functionSpecifiers;
     }
 }
+/// <summary>What only the first parse of a declaration uses: the target for sizeof and a sink for its diagnostics</summary>
+internal sealed class DeclarationContext
+{
+    public TargetInfo Target { get; }
+    public List<SemanticDiagnostic> Diagnostics { get; }
+
+    public DeclarationContext(TargetInfo target, List<SemanticDiagnostic> diagnostics)
+    {
+        Target = target;
+        Diagnostics = diagnostics;
+    }
+}
+
+/// <summary>Resolves a type name such as the operand of a cast or of sizeof</summary>
+internal static class TypeNameParser
+{
+    public static QualifiedType? Parse(ImmutableArray<SyntaxToken> tokens, Scope scope, TypeCatalog types, DeclarationContext? context = null)
+    {
+        if (tokens.IsDefaultOrEmpty)
+            return null;
+
+        // Type names reuse declaration parsing with an abstract declarator
+        SplitTypeNameTokens(tokens, scope, out var specifierTokens, out var declaratorTokens);
+
+        if (specifierTokens.Length == 0)
+            return null;
+
+        var specifiers = DeclarationTypeParser.ParseSpecifiers(specifierTokens, scope, types, context);
+        if (declaratorTokens.Length == 0)
+            return specifiers.BaseType;
+
+        return DeclaratorTypeBuilder.Build(
+            new DeclaratorSyntax(declaratorTokens, identifier: null),
+            specifiers.BaseType,
+            types,
+            scope,
+            context);
+    }
+
+    /// <summary>Reports whether a token can open a type name</summary>
+    public static bool StartsTypeName(SyntaxToken token, Scope scope)
+        => IsTypeNameSpecifierToken(token.Kind) || IsTypedefNameToken(token, scope);
+
+    private static void SplitTypeNameTokens(
+        ImmutableArray<SyntaxToken> tokens,
+        Scope scope,
+        out ImmutableArray<SyntaxToken> specifierTokens,
+        out ImmutableArray<SyntaxToken> declaratorTokens)
+    {
+        var index = 0;
+
+        while (index < tokens.Length)
+        {
+            var token = tokens[index];
+
+            if (!IsTypeNameSpecifierToken(token.Kind) && !IsTypedefNameToken(token, scope))
+                break;
+
+            index++;
+
+            if (token.Kind is SyntaxKind.StructKeyword or SyntaxKind.UnionKeyword or SyntaxKind.EnumKeyword)
+            {
+                if (index < tokens.Length &&
+                    tokens[index].Kind is SyntaxKind.IdentifierToken or SyntaxKind.TypedefNameToken)
+                {
+                    index++;
+                }
+
+                if (index < tokens.Length && tokens[index].Kind == SyntaxKind.OpenBraceToken)
+                    SkipBalancedTokenSequence(tokens, ref index);
+
+                continue;
+            }
+
+            if (IsParenthesizedTypeSpecifier(token.Kind) &&
+                index < tokens.Length &&
+                tokens[index].Kind == SyntaxKind.OpenParenToken)
+            {
+                SkipBalancedTokenSequence(tokens, ref index);
+                continue;
+            }
+        }
+
+        specifierTokens = tokens[..index];
+        declaratorTokens = tokens[index..];
+    }
+
+    private static void SkipBalancedTokenSequence(
+        ImmutableArray<SyntaxToken> tokens,
+        ref int index)
+    {
+        if (index >= tokens.Length)
+            return;
+
+        var openKind = tokens[index].Kind;
+        var closeKind = openKind switch
+        {
+            SyntaxKind.OpenParenToken => SyntaxKind.CloseParenToken,
+            SyntaxKind.OpenBraceToken => SyntaxKind.CloseBraceToken,
+            SyntaxKind.OpenBracketToken => SyntaxKind.CloseBracketToken,
+            _ => SyntaxKind.None,
+        };
+
+        if (closeKind == SyntaxKind.None)
+            return;
+
+        var depth = 0;
+        while (index < tokens.Length)
+        {
+            var token = tokens[index++];
+
+            if (token.Kind == openKind)
+            {
+                depth++;
+                continue;
+            }
+
+            if (token.Kind == closeKind)
+            {
+                depth--;
+                if (depth == 0)
+                    break;
+            }
+        }
+    }
+
+    private static bool IsParenthesizedTypeSpecifier(SyntaxKind kind)
+    {
+        return kind is SyntaxKind.AtomicKeyword
+            or SyntaxKind.UnderscoreAtomicKeyword
+            or SyntaxKind.TypeofKeyword
+            or SyntaxKind.TypeofUnqualKeyword
+            or SyntaxKind.TypeofExtensionKeyword;
+    }
+    private static bool IsTypedefNameToken(SyntaxToken token, Scope scope)
+    {
+        return token.Kind == SyntaxKind.IdentifierToken &&
+            scope.LookupOrdinary(token.Text) is TypeAliasSymbol;
+    }
+    private static bool IsTypeNameSpecifierToken(SyntaxKind kind)
+    {
+        switch (kind)
+        {
+            case SyntaxKind.VoidKeyword:
+            case SyntaxKind.BoolKeyword:
+            case SyntaxKind.UnderscoreBoolKeyword:
+            case SyntaxKind.CharKeyword:
+            case SyntaxKind.ShortKeyword:
+            case SyntaxKind.IntKeyword:
+            case SyntaxKind.LongKeyword:
+            case SyntaxKind.SignedKeyword:
+            case SyntaxKind.UnsignedKeyword:
+            case SyntaxKind.FloatKeyword:
+            case SyntaxKind.DoubleKeyword:
+            case SyntaxKind.StructKeyword:
+            case SyntaxKind.UnionKeyword:
+            case SyntaxKind.EnumKeyword:
+            case SyntaxKind.TypedefNameToken:
+            case SyntaxKind.TypeofKeyword:
+            case SyntaxKind.TypeofUnqualKeyword:
+            case SyntaxKind.TypeofExtensionKeyword:
+            case SyntaxKind.ConstKeyword:
+            case SyntaxKind.ConstExtensionKeyword:
+            case SyntaxKind.VolatileKeyword:
+            case SyntaxKind.VolatileExtensionKeyword:
+            case SyntaxKind.RestrictKeyword:
+            case SyntaxKind.RestrictExtensionKeyword:
+            case SyntaxKind.AtomicKeyword:
+            case SyntaxKind.UnderscoreAtomicKeyword:
+                return true;
+
+            default:
+                return false;
+        }
+    }
+}
+
 /// <summary>Builds scopes and symbol maps before expression binding</summary>
 internal sealed class DeclarationCollector
 {
@@ -62,10 +239,14 @@ internal sealed class DeclarationCollector
     private readonly Dictionary<SyntaxNode, Symbol> _declaredSymbols = new();
     private readonly Dictionary<ExpressionSyntax, Symbol> _referencedSymbols = new();
     private readonly Dictionary<SyntaxNode, Scope> _scopes = new();
+    private readonly DeclarationContext _context;
+    private SyntaxTree? _tree;
+    private Scope? _globalScope;
 
     private DeclarationCollector(Compilation compilation)
     {
         _compilation = compilation ?? throw new ArgumentNullException(nameof(compilation));
+        _context = new DeclarationContext(compilation.Options.Target, _diagnostics);
     }
 
     /// <summary>Collects symbols scopes and early diagnostics</summary>
@@ -75,8 +256,12 @@ internal sealed class DeclarationCollector
         var globalScope = new Scope(parent: null, declaringSyntax: null);
 
         // Declarations from all trees share one global scope
+        collector._globalScope = globalScope;
         foreach (var tree in compilation.SyntaxTrees)
+        {
+            collector._tree = tree;
             collector.CollectTranslationUnit(tree.Root, globalScope);
+        }
 
         return new SemanticState(
             globalScope,
@@ -120,9 +305,9 @@ internal sealed class DeclarationCollector
     {
         _scopes[functionDefinition] = scope;
 
-        var specifiers = DeclarationTypeParser.ParseSpecifiers(functionDefinition.Specifiers, scope, _types);
+        var specifiers = DeclarationTypeParser.ParseSpecifiers(functionDefinition.Specifiers, scope, _types, _context);
         CollectEnumConstants(functionDefinition.Specifiers, scope);
-        var type = DeclaratorTypeBuilder.Build(functionDefinition.Declarator, specifiers.BaseType, _types, scope);
+        var type = DeclaratorTypeBuilder.Build(functionDefinition.Declarator, specifiers.BaseType, _types, scope, _context);
 
         if (functionDefinition.Declarator.Identifier is null)
             return;
@@ -197,7 +382,7 @@ internal sealed class DeclarationCollector
     {
         _scopes[declaration] = scope;
 
-        var specifiers = DeclarationTypeParser.ParseSpecifiers(declaration.Specifiers, scope, _types);
+        var specifiers = DeclarationTypeParser.ParseSpecifiers(declaration.Specifiers, scope, _types, _context);
         CollectEnumConstants(declaration.Specifiers, scope);
 
         if (declaration.Declarators.Length == 0)
@@ -289,7 +474,6 @@ internal sealed class DeclarationCollector
         out ImmutableArray<SyntaxToken> bodyTokens,
         out int closeBraceIndex)
     {
-        var builder = ImmutableArray.CreateBuilder<SyntaxToken>();
         var depth = 0;
 
         for (var i = openBraceIndex + 1; i < tokens.Length; i++)
@@ -297,12 +481,10 @@ internal sealed class DeclarationCollector
             var token = tokens[i];
             if (token.Kind == SyntaxKind.CloseBraceToken && depth == 0)
             {
-                bodyTokens = builder.ToImmutable();
+                bodyTokens = tokens[(openBraceIndex + 1)..i];
                 closeBraceIndex = i;
                 return true;
             }
-
-            builder.Add(token);
 
             if (token.Kind == SyntaxKind.OpenBraceToken)
                 depth++;
@@ -318,19 +500,18 @@ internal sealed class DeclarationCollector
     private static IEnumerable<ImmutableArray<SyntaxToken>> SplitEnumMembers(
         ImmutableArray<SyntaxToken> tokens)
     {
-        var builder = ImmutableArray.CreateBuilder<SyntaxToken>();
+        var start = 0;
         var depth = 0;
 
-        foreach (var token in tokens)
+        for (var i = 0; i < tokens.Length; i++)
         {
+            var token = tokens[i];
             if (token.Kind == SyntaxKind.CommaToken && depth == 0)
             {
-                yield return builder.ToImmutable();
-                builder.Clear();
+                yield return tokens[start..i];
+                start = i + 1;
                 continue;
             }
-
-            builder.Add(token);
 
             if (token.Kind is SyntaxKind.OpenParenToken or SyntaxKind.OpenBracketToken or SyntaxKind.OpenBraceToken)
                 depth++;
@@ -339,8 +520,8 @@ internal sealed class DeclarationCollector
                 depth--;
         }
 
-        if (builder.Count > 0)
-            yield return builder.ToImmutable();
+        if (start < tokens.Length)
+            yield return tokens[start..];
     }
 
     private static bool TryEvaluateEnumeratorValue(
@@ -475,7 +656,7 @@ internal sealed class DeclarationCollector
             return;
 
         var name = identifier.Value.Text;
-        var declaredType = DeclaratorTypeBuilder.Build(initDeclarator.Declarator, specifiers.BaseType, _types, scope);
+        var declaredType = DeclaratorTypeBuilder.Build(initDeclarator.Declarator, specifiers.BaseType, _types, scope, _context);
         // An initializer completes an otherwise unspecified array bound
         declaredType = CompleteArrayTypeFromInitializer(declaredType, initDeclarator.Initializer, scope);
 
@@ -857,6 +1038,18 @@ internal sealed class DeclarationCollector
         CollectStatement(forStatement.Statement, forScope);
     }
 
+    private Symbol? DeclareRiscVVectorIntrinsic(string name)
+    {
+        if (_tree is not { ParseResult.DeclaresRiscVVectorIntrinsics: true } tree || _globalScope is null ||
+            !name.StartsWith("__riscv_", StringComparison.Ordinal) ||
+            !RiscVVectorIntrinsics.TryGetDeclaration(name, out var text) ||
+            Parser.ParseDeclaration(text, tree.ParseResult.TypeNames) is not { } declaration)
+            return null;
+
+        CollectDeclaration(declaration, _globalScope);
+        return _globalScope.LookupOrdinary(name);
+    }
+
     private void VisitExpression(ExpressionSyntax expression, Scope scope)
     {
         _scopes[expression] = scope;
@@ -865,7 +1058,8 @@ internal sealed class DeclarationCollector
         {
             case NameExpressionSyntax nameExpression:
                 {
-                    var symbol = scope.LookupOrdinary(nameExpression.IdentifierToken.Text);
+                    var name = nameExpression.IdentifierToken.Text;
+                    var symbol = scope.LookupOrdinary(name) ?? DeclareRiscVVectorIntrinsic(name);
                     if (symbol is not null)
                         _referencedSymbols[nameExpression] = symbol;
                     break;
@@ -1021,24 +1215,29 @@ internal sealed class DeclarationTypeParser
     private readonly ImmutableArray<SyntaxToken> _tokens;
     private readonly Scope _scope;
     private readonly TypeCatalog _types;
+    private readonly DeclarationContext? _context;
 
     private DeclarationTypeParser(
         ImmutableArray<SyntaxToken> tokens,
         Scope scope,
-        TypeCatalog types)
+        TypeCatalog types,
+        DeclarationContext? context)
     {
         _tokens = tokens;
         _scope = scope;
         _types = types;
+        _context = context;
     }
 
     /// <summary>Parses storage class type qualifiers and function specifiers</summary>
+    /// <remarks>Only the first parse of a declaration passes diagnostics, since later parses meet the tags it declared</remarks>
     public static DeclarationSpecifiers ParseSpecifiers(
         ImmutableArray<SyntaxToken> tokens,
         Scope scope,
-        TypeCatalog types)
+        TypeCatalog types,
+        DeclarationContext? context = null)
     {
-        var parser = new DeclarationTypeParser(tokens, scope, types);
+        var parser = new DeclarationTypeParser(tokens, scope, types, context);
         return parser.Parse();
     }
 
@@ -1305,26 +1504,30 @@ internal sealed class DeclarationTypeParser
                 : TagKind.Enum;
 
         var name = FindTagName(keywordIndex);
-        if (string.IsNullOrEmpty(name))
-            name = "<anonymous@" + _tokens[keywordIndex].Position.ToString() + ">";
+        var named = !string.IsNullOrEmpty(name);
+        if (!named)
+            name = "<anonymous@" + _tokens[keywordIndex].Position.ToString() + "#" + _tokens[keywordIndex].Ordinal.ToString() + ">";
 
-        // Reuse a compatible tag so declarations and definitions share identity
-        var existing = _scope.LookupTag(name);
-        if (existing is null || existing.TagKind != tagKind)
+        // A body declares the tag in this scope, hiding an outer one; a bare reference reuses the nearest
+        var hasBody = TryFindTagBody(keywordIndex, out var bodyTokens);
+        var existing = hasBody ? _scope.LookupOwnTag(name!) : _scope.LookupTag(name!);
+        if (existing is not null && existing.TagKind != tagKind)
         {
-            existing = new TagSymbol(name, tagKind, declaringSyntax: null);
+            Report($"'{name}' was declared as a different kind of tag.", keywordIndex);
+            existing = null;
+        }
+        if (existing is null)
+        {
+            existing = new TagSymbol(name!, tagKind, declaringSyntax: null);
             _scope.TryDeclareTag(existing, out _);
         }
 
-        if (tagKind != TagKind.Enum && TryFindTagBody(keywordIndex, out var bodyTokens))
+        if (tagKind != TagKind.Enum && hasBody)
         {
-            var fields = StructUnionFieldParser.ParseFields(
-                bodyTokens,
-                _scope,
-                _types,
-                existing);
-
-            existing.TryDefineFields(fields);
+            if (!existing.IsComplete)
+                existing.TryDefineFields(StructUnionFieldParser.ParseFields(bodyTokens, _scope, _types, existing, _context));
+            else if (named)
+                Report($"Redefinition of '{(tagKind == TagKind.Struct ? "struct" : "union")} {name}'.", keywordIndex);
         }
 
         if (tagKind == TagKind.Enum)
@@ -1332,6 +1535,9 @@ internal sealed class DeclarationTypeParser
 
         return new QualifiedType(new TagType(existing));
     }
+
+    private void Report(string message, int tokenIndex)
+        => _context?.Diagnostics.Add(SemanticDiagnostic.Error(message, _tokens[tokenIndex].Span));
 
     private string? FindTagName(int keywordIndex)
     {
@@ -1371,7 +1577,6 @@ internal sealed class DeclarationTypeParser
         SyntaxKind closeKind,
         out ImmutableArray<SyntaxToken> content)
     {
-        var builder = ImmutableArray.CreateBuilder<SyntaxToken>();
         var depth = 0;
 
         for (var i = openIndex + 1; i < _tokens.Length; i++)
@@ -1380,11 +1585,9 @@ internal sealed class DeclarationTypeParser
 
             if (token.Kind == closeKind && depth == 0)
             {
-                content = builder.ToImmutable();
+                content = _tokens[(openIndex + 1)..i];
                 return true;
             }
-
-            builder.Add(token);
 
             if (token.Kind == openKind)
                 depth++;
@@ -1452,7 +1655,8 @@ internal static class StructUnionFieldParser
         ImmutableArray<SyntaxToken> bodyTokens,
         Scope scope,
         TypeCatalog types,
-        TagSymbol containingTag)
+        TagSymbol containingTag,
+        DeclarationContext? context = null)
     {
         if (bodyTokens.IsDefaultOrEmpty)
             return ImmutableArray<FieldSymbol>.Empty;
@@ -1460,7 +1664,7 @@ internal static class StructUnionFieldParser
         var fields = ImmutableArray.CreateBuilder<FieldSymbol>();
 
         foreach (var declarationTokens in SplitTopLevel(bodyTokens, SyntaxKind.SemicolonToken))
-            ParseFieldDeclaration(declarationTokens, scope, types, containingTag, fields);
+            ParseFieldDeclaration(declarationTokens, scope, types, containingTag, fields, context);
 
         return fields.ToImmutable();
     }
@@ -1470,7 +1674,8 @@ internal static class StructUnionFieldParser
         Scope scope,
         TypeCatalog types,
         TagSymbol containingTag,
-        ImmutableArray<FieldSymbol>.Builder fields)
+        ImmutableArray<FieldSymbol>.Builder fields,
+        DeclarationContext? context)
     {
         if (declarationTokens.IsDefaultOrEmpty)
             return;
@@ -1479,8 +1684,8 @@ internal static class StructUnionFieldParser
         if (specifierTokens.Length == 0)
             return;
 
-        var specifiers = DeclarationTypeParser.ParseSpecifiers(specifierTokens, scope, types);
-        var declaratorTokens = declarationTokens.Skip(declaratorStart).ToImmutableArray();
+        var specifiers = DeclarationTypeParser.ParseSpecifiers(specifierTokens, scope, types, context);
+        var declaratorTokens = declarationTokens[declaratorStart..];
 
         if (declaratorTokens.Length == 0)
         {
@@ -1492,7 +1697,7 @@ internal static class StructUnionFieldParser
         foreach (var rawDeclarator in SplitTopLevel(declaratorTokens, SyntaxKind.CommaToken))
         {
             var cleanDeclarator = StripFieldSuffix(rawDeclarator);
-            var bitWidth = TryReadFieldWidth(rawDeclarator, scope);
+            var bitWidth = TryReadFieldWidth(rawDeclarator, scope, context);
             var identifier = FindDeclaratorIdentifier(cleanDeclarator);
 
             if (!identifier.HasValue)
@@ -1507,7 +1712,8 @@ internal static class StructUnionFieldParser
                 new DeclaratorSyntax(cleanDeclarator, identifier),
                 specifiers.BaseType,
                 types,
-                scope);
+                scope,
+                context);
 
             fields.Add(new FieldSymbol(
                 identifier.Value.Text,
@@ -1520,17 +1726,17 @@ internal static class StructUnionFieldParser
     }
 
     /// <summary>Reads the constant width a member declarator carries after a colon</summary>
-    private static int? TryReadFieldWidth(ImmutableArray<SyntaxToken> tokens, Scope scope)
+    private static int? TryReadFieldWidth(ImmutableArray<SyntaxToken> tokens, Scope scope, DeclarationContext? context)
     {
         var colon = FindTopLevelColon(tokens);
         if (colon < 0)
             return null;
 
-        var widthTokens = ImmutableArray.CreateRange(tokens.Skip(colon + 1));
+        var widthTokens = tokens[(colon + 1)..];
         if (widthTokens.Length == 0)
             return null;
 
-        var evaluator = new DeclaratorParser.ArrayLengthExpressionEvaluator(widthTokens, scope);
+        var evaluator = new DeclaratorParser.ArrayLengthExpressionEvaluator(widthTokens, scope, context);
         return evaluator.TryEvaluate(out var value) && value >= 0 && value <= int.MaxValue
             ? (int)value
             : null;
@@ -1596,13 +1802,11 @@ internal static class StructUnionFieldParser
         ImmutableArray<SyntaxToken> tokens,
         out int nextIndex)
     {
-        var builder = ImmutableArray.CreateBuilder<SyntaxToken>();
         var index = 0;
 
         while (index < tokens.Length && IsDeclarationSpecifierStart(tokens[index].Kind))
         {
             var token = tokens[index];
-            builder.Add(token);
             index++;
 
             if (token.Kind is SyntaxKind.StructKeyword or SyntaxKind.UnionKeyword or SyntaxKind.EnumKeyword)
@@ -1610,12 +1814,11 @@ internal static class StructUnionFieldParser
                 if (index < tokens.Length &&
                     tokens[index].Kind is SyntaxKind.IdentifierToken or SyntaxKind.TypedefNameToken)
                 {
-                    builder.Add(tokens[index]);
                     index++;
                 }
 
                 if (index < tokens.Length && tokens[index].Kind == SyntaxKind.OpenBraceToken)
-                    ReadBalancedTokenSequence(tokens, builder, ref index, SyntaxKind.OpenBraceToken, SyntaxKind.CloseBraceToken);
+                    SkipBalancedTokenSequence(tokens, ref index, SyntaxKind.OpenBraceToken, SyntaxKind.CloseBraceToken);
 
                 continue;
             }
@@ -1624,12 +1827,12 @@ internal static class StructUnionFieldParser
                 index < tokens.Length &&
                 tokens[index].Kind == SyntaxKind.OpenParenToken)
             {
-                ReadBalancedTokenSequence(tokens, builder, ref index, SyntaxKind.OpenParenToken, SyntaxKind.CloseParenToken);
+                SkipBalancedTokenSequence(tokens, ref index, SyntaxKind.OpenParenToken, SyntaxKind.CloseParenToken);
             }
         }
 
         nextIndex = index;
-        return builder.ToImmutable();
+        return tokens[..index];
     }
 
     private static ImmutableArray<ImmutableArray<SyntaxToken>> SplitTopLevel(
@@ -1637,21 +1840,20 @@ internal static class StructUnionFieldParser
         SyntaxKind separator)
     {
         var result = ImmutableArray.CreateBuilder<ImmutableArray<SyntaxToken>>();
-        var current = ImmutableArray.CreateBuilder<SyntaxToken>();
+        var start = 0;
         var parenDepth = 0;
         var bracketDepth = 0;
         var braceDepth = 0;
 
-        foreach (var token in tokens)
+        for (var i = 0; i < tokens.Length; i++)
         {
+            var token = tokens[i];
             if (token.Kind == separator && parenDepth == 0 && bracketDepth == 0 && braceDepth == 0)
             {
-                result.Add(current.ToImmutable());
-                current.Clear();
+                result.Add(tokens[start..i]);
+                start = i + 1;
                 continue;
             }
-
-            current.Add(token);
 
             switch (token.Kind)
             {
@@ -1680,29 +1882,28 @@ internal static class StructUnionFieldParser
             }
         }
 
-        if (current.Count > 0)
-            result.Add(current.ToImmutable());
+        if (start < tokens.Length)
+            result.Add(tokens[start..]);
 
         return result.ToImmutable();
     }
 
     private static ImmutableArray<SyntaxToken> StripFieldSuffix(ImmutableArray<SyntaxToken> tokens)
     {
-        var builder = ImmutableArray.CreateBuilder<SyntaxToken>();
         var parenDepth = 0;
         var bracketDepth = 0;
         var braceDepth = 0;
 
-        foreach (var token in tokens)
+        for (var i = 0; i < tokens.Length; i++)
         {
+            var token = tokens[i];
+
             // Field widths and default initializers do not affect the declared type
             if ((token.Kind == SyntaxKind.ColonToken || token.Kind == SyntaxKind.EqualsToken) &&
                 parenDepth == 0 && bracketDepth == 0 && braceDepth == 0)
             {
-                break;
+                return tokens[..i];
             }
-
-            builder.Add(token);
 
             switch (token.Kind)
             {
@@ -1731,7 +1932,7 @@ internal static class StructUnionFieldParser
             }
         }
 
-        return builder.ToImmutable();
+        return tokens;
     }
 
     private static SyntaxToken? FindDeclaratorIdentifier(ImmutableArray<SyntaxToken> tokens)
@@ -1745,9 +1946,8 @@ internal static class StructUnionFieldParser
         return null;
     }
 
-    private static void ReadBalancedTokenSequence(
+    private static void SkipBalancedTokenSequence(
         ImmutableArray<SyntaxToken> tokens,
-        ImmutableArray<SyntaxToken>.Builder builder,
         ref int index,
         SyntaxKind openKind,
         SyntaxKind closeKind)
@@ -1756,11 +1956,9 @@ internal static class StructUnionFieldParser
             return;
 
         var depth = 0;
-
         while (index < tokens.Length)
         {
             var token = tokens[index];
-            builder.Add(token);
             index++;
 
             if (token.Kind == openKind)
@@ -1865,14 +2063,15 @@ internal static class DeclaratorTypeBuilder
         DeclaratorSyntax declarator,
         QualifiedType baseType,
         TypeCatalog types,
-        Scope? scope = null)
+        Scope? scope = null,
+        DeclarationContext? context = null)
     {
         if (declarator is null)
             throw new ArgumentNullException(nameof(declarator));
         if (types is null)
             throw new ArgumentNullException(nameof(types));
 
-        var parser = new DeclaratorParser(declarator.Tokens, types, scope ?? new Scope(parent: null, declaringSyntax: null));
+        var parser = new DeclaratorParser(declarator.Tokens, types, scope ?? new Scope(parent: null, declaringSyntax: null), context);
         var node = parser.ParseDeclarator();
         // Applying inward nodes preserves declarator precedence
         return node.Apply(baseType, types);
@@ -1885,13 +2084,15 @@ internal sealed class DeclaratorParser
     private readonly ImmutableArray<SyntaxToken> _tokens;
     private readonly TypeCatalog _types;
     private readonly Scope _scope;
+    private readonly DeclarationContext? _context;
     private int _position;
 
-    public DeclaratorParser(ImmutableArray<SyntaxToken> tokens, TypeCatalog types, Scope scope)
+    public DeclaratorParser(ImmutableArray<SyntaxToken> tokens, TypeCatalog types, Scope scope, DeclarationContext? context = null)
     {
         _tokens = tokens;
         _types = types ?? throw new ArgumentNullException(nameof(types));
         _scope = scope ?? throw new ArgumentNullException(nameof(scope));
+        _context = context;
     }
 
     /// <summary>Parses a complete or abstract declarator</summary>
@@ -1969,7 +2170,8 @@ internal sealed class DeclaratorParser
             return ImmutableArray<SyntaxToken>.Empty;
 
         NextToken();
-        var builder = ImmutableArray.CreateBuilder<SyntaxToken>();
+        var start = _position;
+        var end = _position;
         var depth = 0;
 
         while (Current.Kind != SyntaxKind.EndOfFileToken &&
@@ -1982,7 +2184,7 @@ internal sealed class DeclaratorParser
             }
 
             var token = NextToken();
-            builder.Add(token);
+            end = _position;
 
             if (token.Kind == openKind)
                 depth++;
@@ -1990,7 +2192,7 @@ internal sealed class DeclaratorParser
                 depth--;
         }
 
-        return builder.ToImmutable();
+        return _tokens[start..end];
     }
 
     private long? TryReadArrayLength(ImmutableArray<SyntaxToken> tokens)
@@ -1998,8 +2200,15 @@ internal sealed class DeclaratorParser
         if (tokens.IsDefaultOrEmpty)
             return null;
 
-        var evaluator = new ArrayLengthExpressionEvaluator(tokens, _scope);
-        return evaluator.TryEvaluate(out var value) && value >= 0 ? value : null;
+        var evaluator = new ArrayLengthExpressionEvaluator(tokens, _scope, _context);
+        if (!evaluator.TryEvaluate(out var value))
+            return null;
+        if (value < 0)
+        {
+            _context?.Diagnostics.Add(SemanticDiagnostic.Error("Array size is negative.", tokens[0].Span));
+            return null;
+        }
+        return value;
     }
 
     /// <summary>Evaluates the integer-only subset accepted for fixed array bounds</summary>
@@ -2007,12 +2216,14 @@ internal sealed class DeclaratorParser
     {
         private readonly ImmutableArray<SyntaxToken> _tokens;
         private readonly Scope _scope;
+        private readonly DeclarationContext? _context;
         private int _position;
 
-        public ArrayLengthExpressionEvaluator(ImmutableArray<SyntaxToken> tokens, Scope scope)
+        public ArrayLengthExpressionEvaluator(ImmutableArray<SyntaxToken> tokens, Scope scope, DeclarationContext? context = null)
         {
             _tokens = tokens;
             _scope = scope;
+            _context = context;
         }
 
         /// <summary>Evaluates the full token sequence without overflow</summary>
@@ -2101,7 +2312,87 @@ internal sealed class DeclaratorParser
                 return true;
             }
 
+            if (Match(SyntaxKind.SizeofKeyword))
+                return TryParseSizeof(out value);
+
             return TryParsePrimary(out value);
+        }
+
+        private bool TryParseSizeof(out long value)
+        {
+            value = 0;
+            QualifiedType? type;
+            if (_context is null)
+                return false;
+            if (_position + 1 < _tokens.Length && _tokens[_position].Kind == SyntaxKind.OpenParenToken &&
+                TypeNameParser.StartsTypeName(_tokens[_position + 1], _scope))
+            {
+                var close = FindClosingParen(_position);
+                if (close < 0)
+                    return false;
+                type = TypeNameParser.Parse(_tokens[(_position + 1)..close], _scope, TypeCatalog.Instance, _context);
+                _position = close + 1;
+            }
+            else
+            {
+                type = TryParseOperandType();
+            }
+
+            if (type is not { } operand || operand.IsError)
+                return false;
+            value = _context.Target.SizeOf(operand);
+            return value > 0;
+        }
+
+        // Enough of an expression's type for sizeof: a name, dereferences, subscripts and parentheses
+        private QualifiedType? TryParseOperandType()
+        {
+            QualifiedType? type;
+            if (Match(SyntaxKind.StarToken))
+                type = TryParseOperandType() is { Type: PointerType pointer } ? pointer.PointeeType : null;
+            else if (Match(SyntaxKind.OpenParenToken))
+                type = TryParseOperandType() is { } inner && Match(SyntaxKind.CloseParenToken) ? inner : null;
+            else if (_position < _tokens.Length && _tokens[_position].Kind == SyntaxKind.IdentifierToken &&
+                _scope.LookupOrdinary(_tokens[_position].Text) is TypedSymbol { } symbol and not EnumConstantSymbol)
+            {
+                _position++;
+                type = symbol.Type;
+            }
+            else
+            {
+                return null;
+            }
+
+            while (type is { } current && _position < _tokens.Length && _tokens[_position].Kind == SyntaxKind.OpenBracketToken)
+            {
+                var close = FindClosing(_position, SyntaxKind.OpenBracketToken, SyntaxKind.CloseBracketToken);
+                if (close < 0)
+                    return null;
+                _position = close + 1;
+                type = current.Type switch
+                {
+                    ArrayType array => array.ElementType,
+                    PointerType pointer => pointer.PointeeType,
+                    _ => null,
+                };
+            }
+            return type;
+        }
+
+        private int FindClosingParen(int open)
+            => FindClosing(open, SyntaxKind.OpenParenToken, SyntaxKind.CloseParenToken);
+
+        private int FindClosing(int open, SyntaxKind openKind, SyntaxKind closeKind)
+        {
+            var depth = 0;
+            for (var i = open; i < _tokens.Length; i++)
+            {
+                if (_tokens[i].Kind == openKind)
+                    depth++;
+                else if (_tokens[i].Kind == closeKind && --depth == 0)
+                    return i;
+            }
+            return -1;
         }
 
         private bool TryParsePrimary(out long value)
@@ -2316,7 +2607,7 @@ internal sealed class DeclaratorParser
             }
 
             var specifiers = DeclarationTypeParser.ParseSpecifiers(specifierTokens, _scope, _types);
-            var declaratorTokens = parameterTokens.Skip(declaratorStart).ToImmutableArray();
+            var declaratorTokens = parameterTokens[declaratorStart..];
             var identifier = FindDeclaratorIdentifier(declaratorTokens);
             var parameterDeclarator = new DeclaratorSyntax(declaratorTokens, identifier);
             var type = DeclaratorTypeBuilder.Build(parameterDeclarator, specifiers.BaseType, _types, _scope);
@@ -2346,13 +2637,11 @@ internal sealed class DeclaratorParser
         ImmutableArray<SyntaxToken> tokens,
         out int nextIndex)
     {
-        var builder = ImmutableArray.CreateBuilder<SyntaxToken>();
         var index = 0;
 
         while (index < tokens.Length && IsDeclarationSpecifierToken(tokens[index].Kind))
         {
             var token = tokens[index];
-            builder.Add(token);
             index++;
 
             if (token.Kind is SyntaxKind.StructKeyword or SyntaxKind.UnionKeyword or SyntaxKind.EnumKeyword)
@@ -2360,17 +2649,16 @@ internal sealed class DeclaratorParser
                 if (index < tokens.Length &&
                     tokens[index].Kind is SyntaxKind.IdentifierToken or SyntaxKind.TypedefNameToken)
                 {
-                    builder.Add(tokens[index]);
                     index++;
                 }
 
                 if (index < tokens.Length && tokens[index].Kind == SyntaxKind.OpenBraceToken)
-                    ReadBalancedTokenSequence(tokens, builder, ref index, SyntaxKind.OpenBraceToken, SyntaxKind.CloseBraceToken);
+                    SkipBalancedTokenSequence(tokens, ref index, SyntaxKind.OpenBraceToken, SyntaxKind.CloseBraceToken);
             }
         }
 
         nextIndex = index;
-        return builder.ToImmutable();
+        return tokens[..index];
     }
 
     private static ImmutableArray<ImmutableArray<SyntaxToken>> SplitTopLevel(
@@ -2378,21 +2666,20 @@ internal sealed class DeclaratorParser
         SyntaxKind separator)
     {
         var result = ImmutableArray.CreateBuilder<ImmutableArray<SyntaxToken>>();
-        var current = ImmutableArray.CreateBuilder<SyntaxToken>();
+        var start = 0;
         var parenDepth = 0;
         var bracketDepth = 0;
         var braceDepth = 0;
 
-        foreach (var token in tokens)
+        for (var i = 0; i < tokens.Length; i++)
         {
+            var token = tokens[i];
             if (token.Kind == separator && parenDepth == 0 && bracketDepth == 0 && braceDepth == 0)
             {
-                result.Add(current.ToImmutable());
-                current.Clear();
+                result.Add(tokens[start..i]);
+                start = i + 1;
                 continue;
             }
-
-            current.Add(token);
 
             switch (token.Kind)
             {
@@ -2421,15 +2708,14 @@ internal sealed class DeclaratorParser
             }
         }
 
-        if (current.Count != 0)
-            result.Add(current.ToImmutable());
+        if (start < tokens.Length)
+            result.Add(tokens[start..]);
 
         return result.ToImmutable();
     }
 
-    private static void ReadBalancedTokenSequence(
+    private static void SkipBalancedTokenSequence(
         ImmutableArray<SyntaxToken> tokens,
-        ImmutableArray<SyntaxToken>.Builder builder,
         ref int index,
         SyntaxKind openKind,
         SyntaxKind closeKind)
@@ -2441,7 +2727,6 @@ internal sealed class DeclaratorParser
         while (index < tokens.Length)
         {
             var token = tokens[index];
-            builder.Add(token);
             index++;
 
             if (token.Kind == openKind)

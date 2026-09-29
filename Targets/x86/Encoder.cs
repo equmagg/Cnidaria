@@ -1143,7 +1143,11 @@ internal static class X86CodeEncoder
     private static void EmitRex(X86InstructionWriter writer, X86Target target, bool w = false, bool r = false, bool x = false, bool b = false, bool force = false)
     {
         if (!target.Is64Bit)
+        {
+            if (force)
+                throw new NotSupportedException("i386 has no byte form of esp, ebp, esi or edi.");
             return;
+        }
         if (!w && !r && !x && !b && !force)
             return;
         writer.WriteByte((byte)(0x40 | (w ? 0x08 : 0) | (r ? 0x04 : 0) | (x ? 0x02 : 0) | (b ? 0x01 : 0)));

@@ -15,7 +15,9 @@ public enum TargetArchitectureKind : byte
     I386,
     X86_64,
     Arm32,
-    Arm64
+    Arm64,
+    Wasm32,
+    Wasm64
 }
 [Flags]
 public enum TargetArchitectureFeatures : ulong

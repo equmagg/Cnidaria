@@ -76,7 +76,7 @@ int main(int argc, char** argv, char** envp)
             index = index + 1;
             continue;
         }
-        /* Several files each say which one they are, the way head has always done it */
+        // Several files each say which one they are, the way head has always done it
         if (files > 1)
         {
             write_text("==> ");

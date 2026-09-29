@@ -12,22 +12,33 @@ public sealed class ParseResult
     public TranslationUnitSyntax Root { get; }
     public ImmutableArray<SyntaxDiagnostic> Diagnostics { get; }
     public TypeNameTable TypeNames { get; }
+    public bool DeclaresRiscVVectorIntrinsics { get; }
 
     public ParseResult(
         TranslationUnitSyntax root,
         ImmutableArray<SyntaxDiagnostic> diagnostics,
-        TypeNameTable typeNames)
+        TypeNameTable typeNames,
+        bool declaresRiscVVectorIntrinsics = false)
     {
         Root = root;
         Diagnostics = diagnostics;
         TypeNames = typeNames;
+        DeclaresRiscVVectorIntrinsics = declaresRiscVVectorIntrinsics;
     }
 }
 
 ///<summary>Base class for parsed source constructs</summary>
 public abstract class SyntaxNode
 {
+    // Semantic maps key nodes by identity; a stored hash spares the runtime from assigning each node an identity hash
+    private static int s_nextHashCode;
+    private readonly int _hashCode = s_nextHashCode++;
+
     public abstract SyntaxKind Kind { get; }
+
+    public sealed override bool Equals(object? obj) => ReferenceEquals(this, obj);
+
+    public sealed override int GetHashCode() => _hashCode;
 }
 
 ///<summary>Represents the complete source file</summary>

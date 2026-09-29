@@ -607,6 +607,14 @@ internal static class TargetRegisterInfo
                 MachineRegister.X28),
 
             _ => ImmutableArray.Create(
+                MachineRegister.X10,
+                MachineRegister.X11,
+                MachineRegister.X12,
+                MachineRegister.X13,
+                MachineRegister.X14,
+                MachineRegister.X15,
+                MachineRegister.X16,
+                MachineRegister.X17,
                 MachineRegister.X18,
                 MachineRegister.X19,
                 MachineRegister.X20,
@@ -673,6 +681,19 @@ internal static class TargetRegisterInfo
             return ImmutableArray<MachineRegister>.Empty;
 
         return ImmutableArray.Create(
+            MachineRegister.F10,
+            MachineRegister.F11,
+            MachineRegister.F12,
+            MachineRegister.F13,
+            MachineRegister.F14,
+            MachineRegister.F15,
+            MachineRegister.F16,
+            MachineRegister.F17,
+            MachineRegister.F3,
+            MachineRegister.F4,
+            MachineRegister.F5,
+            MachineRegister.F6,
+            MachineRegister.F7,
             MachineRegister.F18,
             MachineRegister.F19,
             MachineRegister.F20,
@@ -888,7 +909,7 @@ internal static class TargetRegisterInfo
             return register >= MachineRegister.X19 && register <= MachineRegister.X28;
         }
 
-        return true;
+        return MachineRegisters.IsCalleeSaved(register);
     }
 
     public static int RegisterSaveSize(TargetInfo target, MachineRegister register, int defaultSpillSlotSize)

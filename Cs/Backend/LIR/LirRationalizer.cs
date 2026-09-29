@@ -1725,6 +1725,7 @@ namespace Cnidaria.Cs
                     tree.Operands[0],
                     tree.Operands[1],
                     operandIndex => LowerGenTreeOperandForLoweredTree(tree.Operands[operandIndex]),
+                    _ => false,
                     null,
                     out result))
                     return true;
@@ -1734,6 +1735,7 @@ namespace Cnidaria.Cs
                     tree.Operands[0],
                     tree.Operands[1],
                     operandIndex => LowerGenTreeOperandForLoweredTree(tree.Operands[operandIndex]),
+                    _ => false,
                     null,
                     out result))
                     return true;
@@ -1752,6 +1754,7 @@ namespace Cnidaria.Cs
                     tree.Operands[0].Source,
                     tree.Operands[1].Source,
                     operandIndex => LowerSsaOperandForLoweredTree(tree.Operands[operandIndex]),
+                    operandIndex => tree.Operands[operandIndex].Value.HasValue,
                     tree,
                     out result))
                     return true;
@@ -1761,6 +1764,7 @@ namespace Cnidaria.Cs
                     tree.Operands[0].Source,
                     tree.Operands[1].Source,
                     operandIndex => LowerSsaOperandForLoweredTree(tree.Operands[operandIndex]),
+                    operandIndex => tree.Operands[operandIndex].Value.HasValue,
                     tree,
                     out result))
                     return true;
@@ -1792,6 +1796,7 @@ namespace Cnidaria.Cs
                 GenTree leftSource,
                 GenTree rightSource,
                 Func<int, GenTree> lowerOperand,
+                Func<int, bool> isSharedOperand,
                 SsaTree? ssaTree,
                 out GenTree? result)
             {
@@ -1800,38 +1805,67 @@ namespace Cnidaria.Cs
                     return false;
 
                 int bits = GenTreeArithmeticSemantics.IntegralBits(template.Type, template.StackKind, _target);
-                bool rightConst = GenTreeArithmeticSemantics.TryGetIntegralConstant(rightSource, bits, out long rightSigned, out ulong rightUnsigned);
-                bool leftConst = GenTreeArithmeticSemantics.TryGetIntegralConstant(leftSource, bits, out long leftSigned, out ulong leftUnsigned);
+                int valueIndex;
+                long multiplier;
+                if (GenTreeArithmeticSemantics.TryGetIntegralConstant(rightSource, bits, out multiplier, out _))
+                    valueIndex = 0;
+                else if (GenTreeArithmeticSemantics.TryGetIntegralConstant(leftSource, bits, out multiplier, out _))
+                    valueIndex = 1;
+                else
+                    return false;
 
-                if (rightConst && rightSigned == -1)
+                GenTree source = valueIndex == 0 ? leftSource : rightSource;
+                ulong magnitude = MaskToWidth(multiplier < 0 ? unchecked(0UL - (ulong)multiplier) : (ulong)multiplier, bits);
+
+                if (multiplier == -1)
                 {
-                    GenTree value = lowerOperand(0);
-                    result = EmitFinalUnaryLoweredTree(template, BytecodeOp.Neg, leftSource, value, ssaTree);
+                    GenTree value = lowerOperand(valueIndex);
+                    result = EmitFinalUnaryLoweredTree(template, BytecodeOp.Neg, source, value, ssaTree);
                     return true;
                 }
 
-                if (leftConst && leftSigned == -1)
+                if (GenTreeArithmeticSemantics.TryGetUnsignedPowerOfTwoDivisor(magnitude, bits, out int shift))
                 {
-                    GenTree value = lowerOperand(1);
-                    result = EmitFinalUnaryLoweredTree(template, BytecodeOp.Neg, rightSource, value, ssaTree);
+                    bool negate = multiplier < 0 && !GenTreeArithmeticSemantics.IsSignedMinValue(multiplier, bits);
+                    if (negate && _target.IsRegisterBytecode)
+                        return false;
+
+                    GenTree value = lowerOperand(valueIndex);
+                    GenTree operand = Use(source, value);
+                    if (negate)
+                        operand = EmitSyntheticUnary(template, BytecodeOp.Neg, operand);
+                    result = EmitFinalBinaryImmediateLoweredTree(template, BytecodeOp.Shl, operand, operand.RegisterResult!, shift, ssaTree);
                     return true;
                 }
 
-                if (rightConst && GenTreeArithmeticSemantics.TryGetUnsignedPowerOfTwoDivisor(rightUnsigned, bits, out int rightShift))
+                if (!_target.IsX86)
+                    return false;
+
+                ulong lowestBit = magnitude & unchecked(0UL - magnitude);
+                ulong factor = lowestBit is 2 or 4 or 8 ? magnitude / lowestBit : 0;
+                if (factor is 3 or 5 or 9)
                 {
-                    GenTree value = lowerOperand(0);
-                    result = EmitFinalBinaryImmediateLoweredTree(template, BytecodeOp.Shl, leftSource, value, rightShift, ssaTree);
+                    GenTree value = lowerOperand(valueIndex);
+                    GenTree operand = Use(source, value);
+                    if (multiplier < 0)
+                        operand = EmitSyntheticUnary(template, BytecodeOp.Neg, operand);
+                    GenTree scaled = EmitSyntheticBinaryImmediate(template, BytecodeOp.Mul, operand, factor);
+                    result = EmitFinalBinaryImmediateLoweredTree(template, BytecodeOp.Shl, scaled, scaled, Log2(lowestBit), ssaTree);
                     return true;
                 }
 
-                if (leftConst && GenTreeArithmeticSemantics.TryGetUnsignedPowerOfTwoDivisor(leftUnsigned, bits, out int leftShift))
-                {
-                    GenTree value = lowerOperand(1);
-                    result = EmitFinalBinaryImmediateLoweredTree(template, BytecodeOp.Shl, rightSource, value, leftShift, ssaTree);
-                    return true;
-                }
+                if (!_target.Is64Bit || multiplier is 3 or 5 or 9 || multiplier <= 0 || !isSharedOperand(valueIndex))
+                    return false;
 
-                return false;
+                ulong positive = (ulong)multiplier;
+                bool useSub = IsPowerOfTwo(positive + 1);
+                if (!useSub && !IsPowerOfTwo(positive - 1))
+                    return false;
+
+                GenTree multiplicand = lowerOperand(valueIndex);
+                GenTree shifted = EmitSyntheticBinaryImmediate(template, BytecodeOp.Shl, Use(source, multiplicand), (ulong)Log2(useSub ? positive + 1 : positive - 1));
+                result = EmitFinalBinaryLoweredTree(template, useSub ? BytecodeOp.Sub : BytecodeOp.Add, shifted, UseOf(multiplicand), ssaTree);
+                return true;
             }
 
             private bool TryLowerDivRemStrengthReduction(
@@ -1839,6 +1873,7 @@ namespace Cnidaria.Cs
                 GenTree dividendSource,
                 GenTree divisorSource,
                 Func<int, GenTree> lowerOperand,
+                Func<int, bool> isSharedOperand,
                 SsaTree? ssaTree,
                 out GenTree? result)
             {
@@ -1847,34 +1882,172 @@ namespace Cnidaria.Cs
                     return false;
 
                 int bits = GenTreeArithmeticSemantics.IntegralBits(template.Type, template.StackKind, _target);
-                if (!GenTreeArithmeticSemantics.TryGetIntegralConstant(divisorSource, bits, out _, out ulong unsignedDivisor))
+                if (!GenTreeArithmeticSemantics.TryGetIntegralConstant(divisorSource, bits, out long signedDivisor, out ulong unsignedDivisor) ||
+                    GenTreeArithmeticSemantics.TryGetIntegralConstant(dividendSource, bits, out _, out _))
                     return false;
 
+                unsignedDivisor = MaskToWidth(unsignedDivisor, bits);
                 if (unsignedDivisor == 0)
                     return false;
 
-                if (template.SourceOp == BytecodeOp.Div_Un)
+                if (template.SourceOp is BytecodeOp.Div_Un or BytecodeOp.Rem_Un)
                 {
-                    if (!GenTreeArithmeticSemantics.TryGetUnsignedPowerOfTwoDivisor(unsignedDivisor, bits, out int shift))
-                        return false;
+                    if (GenTreeArithmeticSemantics.TryGetUnsignedPowerOfTwoDivisor(unsignedDivisor, bits, out int unsignedShift))
+                    {
+                        GenTree dividend = lowerOperand(0);
+                        result = template.SourceOp == BytecodeOp.Div_Un
+                            ? EmitFinalBinaryImmediateLoweredTree(template, BytecodeOp.Shr_Un, dividendSource, dividend, unsignedShift, ssaTree)
+                            : EmitFinalBinaryImmediateLoweredTree(template, BytecodeOp.And, dividendSource, dividend, unsignedDivisor - 1, ssaTree);
+                        return true;
+                    }
 
+                    if (template.SourceOp == BytecodeOp.Div_Un && !_target.IsRegisterBytecode && unsignedDivisor > MaskToWidth(ulong.MaxValue, bits) / 2)
+                    {
+                        GenTree dividend = lowerOperand(0);
+                        GenTree limit = LowerConstant(template, unsignedDivisor - 1);
+                        result = EmitFinalBinaryLoweredTree(template, BytecodeOp.Cgt_Un, Use(dividendSource, dividend), limit, ssaTree);
+                        return true;
+                    }
+
+                    return false;
+                }
+
+                // x / -1 and x % -1 have to throw for the minimum value, x / 0 and x % 0 always
+                if (_target.IsRegisterBytecode || signedDivisor == -1)
+                    return false;
+
+                bool isDiv = template.SourceOp == BytecodeOp.Div;
+                if (isDiv && GenTreeArithmeticSemantics.IsSignedMinValue(signedDivisor, bits))
+                {
                     GenTree dividend = lowerOperand(0);
-                    result = EmitFinalBinaryImmediateLoweredTree(template, BytecodeOp.Shr_Un, dividendSource, dividend, shift, ssaTree);
+                    result = EmitFinalBinaryLoweredTree(template, BytecodeOp.Ceq, Use(dividendSource, dividend), LowerConstant(template, unsignedDivisor), ssaTree);
                     return true;
                 }
 
-                if (template.SourceOp == BytecodeOp.Rem_Un)
-                {
-                    if (!GenTreeArithmeticSemantics.TryGetUnsignedPowerOfTwoDivisor(unsignedDivisor, bits, out _))
-                        return false;
+                ulong absDivisor = MaskToWidth(signedDivisor < 0 ? unchecked(0UL - (ulong)signedDivisor) : (ulong)signedDivisor, bits);
+                if (!IsPowerOfTwo(absDivisor) || !isSharedOperand(0))
+                    return false;
 
-                    ulong mask = MaskToWidth(unchecked(unsignedDivisor - 1), bits);
-                    GenTree dividend = lowerOperand(0);
-                    result = EmitFinalBinaryImmediateLoweredTree(template, BytecodeOp.And, dividendSource, dividend, mask, ssaTree);
+                GenTree value = lowerOperand(0);
+                GenTree adjustment = absDivisor == 2
+                    ? EmitSyntheticBinaryImmediate(template, BytecodeOp.Shr_Un, Use(dividendSource, value), (ulong)(bits - 1))
+                    : EmitSyntheticBinaryImmediate(template, BytecodeOp.And,
+                        EmitSyntheticBinaryImmediate(template, BytecodeOp.Shr, Use(dividendSource, value), (ulong)(bits - 1)), absDivisor - 1);
+                GenTree adjusted = EmitSyntheticBinary(template, BytecodeOp.Add, adjustment, UseOf(value));
+
+                if (!isDiv)
+                {
+                    GenTree rounded = EmitSyntheticBinaryImmediate(template, BytecodeOp.And, adjusted, MaskToWidth(~(absDivisor - 1), bits));
+                    result = EmitFinalBinaryLoweredTree(template, BytecodeOp.Sub, UseOf(value), rounded, ssaTree);
                     return true;
                 }
 
-                return false;
+                if (signedDivisor > 0)
+                {
+                    result = EmitFinalBinaryImmediateLoweredTree(template, BytecodeOp.Shr, adjusted, adjusted, Log2(absDivisor), ssaTree);
+                    return true;
+                }
+
+                GenTree quotient = EmitSyntheticBinaryImmediate(template, BytecodeOp.Shr, adjusted, (ulong)Log2(absDivisor));
+                result = EmitFinalUnaryLoweredTree(template, BytecodeOp.Neg, quotient, quotient, ssaTree);
+                return true;
+            }
+
+            private static bool IsPowerOfTwo(ulong value)
+                => value != 0 && (value & (value - 1)) == 0;
+
+            private static int Log2(ulong value)
+            {
+                int result = 0;
+                while ((value >>= 1) != 0)
+                    result++;
+                return result;
+            }
+
+            private static GenTree Use(GenTree source, GenTree value)
+            {
+                source.RegisterResult = value;
+                return source;
+            }
+
+            private GenTree UseOf(GenTree value)
+            {
+                var use = new GenTree(
+                    _nextSyntheticTreeId++,
+                    GenTreeKind.Nop,
+                    pc: -1,
+                    BytecodeOp.Nop,
+                    value.Type,
+                    value.StackKind,
+                    GenTreeFlags.None,
+                    ImmutableArray<GenTree>.Empty);
+                use.RegisterResult = value;
+                return use;
+            }
+
+            private GenTree EmitSyntheticUnary(GenTree template, BytecodeOp op, GenTree operand)
+            {
+                var node = new GenTree(
+                    _nextSyntheticTreeId++,
+                    GenTreeKind.Unary,
+                    template.Pc,
+                    op,
+                    template.Type,
+                    template.StackKind,
+                    GenTreeFlags.None,
+                    ImmutableArray.Create(operand));
+                EmitTree(node, ImmutableArray.Create(LirOperandFlags.None), NewTemp(node));
+                return node;
+            }
+
+            private GenTree EmitSyntheticBinary(GenTree template, BytecodeOp op, GenTree left, GenTree right)
+            {
+                var node = new GenTree(
+                    _nextSyntheticTreeId++,
+                    GenTreeKind.Binary,
+                    template.Pc,
+                    op,
+                    template.Type,
+                    template.StackKind,
+                    GenTreeFlags.None,
+                    ImmutableArray.Create(left, right));
+                EmitTree(node, ImmutableArray.Create(LirOperandFlags.None, LirOperandFlags.None), NewTemp(node));
+                return node;
+            }
+
+            private GenTree EmitSyntheticBinaryImmediate(GenTree template, BytecodeOp op, GenTree left, ulong immediate)
+            {
+                var constant = CreateIntegerConstant(template, immediate);
+                var node = new GenTree(
+                    _nextSyntheticTreeId++,
+                    GenTreeKind.Binary,
+                    template.Pc,
+                    op,
+                    template.Type,
+                    template.StackKind,
+                    GenTreeFlags.None,
+                    ImmutableArray.Create(left, constant));
+                EmitTree(node, ImmutableArray.Create(LirOperandFlags.None, ContainImmediateOrLower(node, constant)), NewTemp(node));
+                return node;
+            }
+
+            private GenTree LowerConstant(GenTree template, ulong value)
+            {
+                var constant = CreateIntegerConstant(template, value);
+                constant.RegisterResult = LowerValue(constant);
+                return constant;
+            }
+
+            private LirOperandFlags ContainImmediateOrLower(GenTree parent, GenTree constant)
+            {
+                if (CanContainBinaryImmediate(parent, 1, constant))
+                {
+                    constant.IsContainedInLinear = true;
+                    return LirOperandFlags.Contained;
+                }
+
+                constant.RegisterResult = LowerValue(constant);
+                return LirOperandFlags.None;
             }
 
             private GenTree EmitFinalUnaryLoweredTree(GenTree template, BytecodeOp op, GenTree operandSource, GenTree operandValue, SsaTree? ssaTree)
@@ -1887,18 +2060,27 @@ namespace Cnidaria.Cs
                 return EmitFinalLoweredTree(template, ImmutableArray.Create(LirOperandFlags.None), ssaTree);
             }
 
+            private GenTree EmitFinalBinaryLoweredTree(GenTree template, BytecodeOp op, GenTree left, GenTree right, SsaTree? ssaTree)
+            {
+                template.Kind = GenTreeKind.Binary;
+                template.SourceOp = op;
+                template.Flags = GenTreeFlags.None;
+                template.SetOperands(ImmutableArray.Create(left, right));
+                return EmitFinalLoweredTree(template, ImmutableArray.Create(LirOperandFlags.None, LirOperandFlags.None), ssaTree);
+            }
+
             private GenTree EmitFinalBinaryImmediateLoweredTree(GenTree template, BytecodeOp op, GenTree leftSource, GenTree leftValue, long immediate, SsaTree? ssaTree)
                 => EmitFinalBinaryImmediateLoweredTree(template, op, leftSource, leftValue, unchecked((ulong)immediate), ssaTree);
 
             private GenTree EmitFinalBinaryImmediateLoweredTree(GenTree template, BytecodeOp op, GenTree leftSource, GenTree leftValue, ulong immediate, SsaTree? ssaTree)
             {
                 leftSource.RegisterResult = leftValue;
-                var constant = CreateContainedIntegerConstant(template, immediate);
+                var constant = CreateIntegerConstant(template, immediate);
                 template.Kind = GenTreeKind.Binary;
                 template.SourceOp = op;
                 template.Flags = GenTreeFlags.None;
                 template.SetOperands(ImmutableArray.Create(leftSource, constant));
-                return EmitFinalLoweredTree(template, ImmutableArray.Create(LirOperandFlags.None, LirOperandFlags.Contained), ssaTree);
+                return EmitFinalLoweredTree(template, ImmutableArray.Create(LirOperandFlags.None, ContainImmediateOrLower(template, constant)), ssaTree);
             }
 
             private GenTree EmitFinalLoweredTree(GenTree finalNode, ImmutableArray<LirOperandFlags> operandFlags, SsaTree? ssaTree)
@@ -1922,10 +2104,10 @@ namespace Cnidaria.Cs
                 return result;
             }
 
-            private GenTree CreateContainedIntegerConstant(GenTree template, ulong value)
+            private GenTree CreateIntegerConstant(GenTree template, ulong value)
             {
                 int bits = GenTreeArithmeticSemantics.IntegralBits(template.Type, template.StackKind, _target);
-                GenTree node = bits <= 32
+                return bits <= 32
                     ? new GenTree(
                         _nextSyntheticTreeId++,
                         GenTreeKind.ConstI4,
@@ -1946,8 +2128,6 @@ namespace Cnidaria.Cs
                         flags: GenTreeFlags.None,
                         operands: ImmutableArray<GenTree>.Empty,
                         int64: unchecked((long)value));
-                node.IsContainedInLinear = true;
-                return node;
             }
 
             private static ulong MaskToWidth(ulong value, int bits)

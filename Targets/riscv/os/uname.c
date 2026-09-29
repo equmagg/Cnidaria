@@ -46,7 +46,7 @@ int main(int argc, char** argv, char** envp)
     if (wanted == 0)
         wanted = 1;
 
-    /* The fields sit one after another, each as wide as the last */
+    // The fields sit one after another, each as wide as the last
     index = 0;
     while (index < 5)
     {

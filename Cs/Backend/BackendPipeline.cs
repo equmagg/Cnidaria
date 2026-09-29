@@ -675,6 +675,7 @@ namespace Cnidaria.Cs
             var target = method.Target;
             bool methodChanged = false;
             var blocks = ImmutableArray.CreateBuilder<GenTreeBlock>(method.Blocks.Length);
+            var ids = new TreeIds(method);
 
             for (int b = 0; b < method.Blocks.Length; b++)
             {
@@ -685,7 +686,7 @@ namespace Cnidaria.Cs
                 for (int s = 0; s < block.Statements.Length; s++)
                 {
                     GenTree statement = block.Statements[s];
-                    GenTree morphed = MorphTree(statement, target, ref blockChanged);
+                    GenTree morphed = MorphTree(statement, target, ids, ref blockChanged);
                     morphed.SetParent(null);
                     statements.Add(morphed);
                 }
@@ -719,8 +720,25 @@ namespace Cnidaria.Cs
             return method;
         }
 
-        private static GenTree MorphTree(GenTree tree, TargetInfo target, ref bool changed)
+        private sealed class TreeIds
         {
+            private readonly GenTreeMethod _method;
+            private int _next = -1;
+
+            public TreeIds(GenTreeMethod method) => _method = method;
+
+            public int Next()
+            {
+                if (_next < 0)
+                    _next = GenTreeLocalAddressForwarder.ComputeNextTreeId(_method);
+                return _next++;
+            }
+        }
+
+        private static GenTree MorphTree(GenTree tree, TargetInfo target, TreeIds ids, ref bool changed)
+        {
+            changed |= TryMorphPowerOfTwoRemainderTest(tree);
+
             if (!tree.Operands.IsDefaultOrEmpty)
             {
                 bool operandsChanged = false;
@@ -728,7 +746,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < tree.Operands.Length; i++)
                 {
                     GenTree original = tree.Operands[i];
-                    GenTree morphed = MorphTree(original, target, ref changed);
+                    GenTree morphed = MorphTree(original, target, ids, ref changed);
                     operandsChanged |= !ReferenceEquals(original, morphed);
                     operands.Add(morphed);
                 }
@@ -747,7 +765,133 @@ namespace Cnidaria.Cs
                 return folded;
             }
 
+            if (TryMorphRemainderToSubtraction(tree, target, ids, out var subtraction))
+            {
+                changed = true;
+                return subtraction;
+            }
+
             return tree;
+        }
+
+        // Only whether x % 2^n is zero is asked, which the low bits answer for either sign
+        private static bool TryMorphPowerOfTwoRemainderTest(GenTree tree)
+        {
+            GenTree? tested = null;
+            if (tree.Kind is GenTreeKind.BranchTrue or GenTreeKind.BranchFalse && tree.Operands.Length == 1)
+                tested = tree.Operands[0];
+            else if (tree.Kind == GenTreeKind.Binary && tree.SourceOp is BytecodeOp.Ceq or BytecodeOp.Cgt_Un && tree.Operands.Length == 2)
+                tested = IsIntegralZero(tree.Operands[1]) ? tree.Operands[0] : IsIntegralZero(tree.Operands[0]) ? tree.Operands[1] : null;
+
+            if (tested is not { Kind: GenTreeKind.Binary, SourceOp: BytecodeOp.Rem } || tested.Operands.Length != 2)
+                return false;
+
+            GenTree divisor = tested.Operands[1];
+            long value = divisor.Kind switch
+            {
+                GenTreeKind.ConstI4 => divisor.Int32,
+                GenTreeKind.ConstI8 => divisor.Int64,
+                _ => 0,
+            };
+            if (value <= 0 || (value & (value - 1)) != 0)
+                return false;
+
+            var mask = GenTreeFolder.CreateConstant(
+                divisor,
+                divisor.Kind == GenTreeKind.ConstI4 ? GenTreeConstantValue.ForI4((int)value - 1) : GenTreeConstantValue.ForI8(value - 1));
+            tested.SourceOp = BytecodeOp.And;
+            tested.Flags &= ~(GenTreeFlags.DivModNoByZero | GenTreeFlags.DivModNoOverflow);
+            tested.SetOperands(ImmutableArray.Create(tested.Operands[0], mask));
+            return true;
+        }
+
+        private static bool IsIntegralZero(GenTree node)
+            => node.Kind == GenTreeKind.ConstI4 && node.Int32 == 0 || node.Kind == GenTreeKind.ConstI8 && node.Int64 == 0;
+
+        // ARM64 has no remainder instruction; elsewhere only a divisor lowered to a multiplication gains
+        private static bool TryMorphRemainderToSubtraction(GenTree tree, TargetInfo target, TreeIds ids, out GenTree result)
+        {
+            result = tree;
+            bool arm64 = RegisterInfo.IsArm64(target);
+            if (tree.Kind != GenTreeKind.Binary || tree.Operands.Length != 2 || target.IsRegisterBytecode ||
+                (target.IsArm && !arm64) ||
+                !(tree.SourceOp == BytecodeOp.Rem || arm64 && tree.SourceOp == BytecodeOp.Rem_Un) ||
+                !GenTreeArithmeticSemantics.IsIntegralArithmeticType(tree.Type, tree.StackKind))
+                return false;
+
+            GenTree dividend = tree.Operands[0];
+            GenTree divisor = tree.Operands[1];
+            if (!IsInvariantOrLocal(dividend) || !IsInvariantOrLocal(divisor))
+                return false;
+
+            int bits = GenTreeArithmeticSemantics.IntegralBits(tree.Type, tree.StackKind, target);
+            bool constant = GenTreeArithmeticSemantics.TryGetIntegralConstant(divisor, bits, out long signedDivisor, out ulong unsignedDivisor);
+            if (arm64)
+            {
+                if (tree.SourceOp == BytecodeOp.Rem_Un && constant &&
+                    GenTreeArithmeticSemantics.TryGetUnsignedPowerOfTwoDivisor(unsignedDivisor, bits, out _))
+                    return false;
+            }
+            else
+            {
+                ulong magnitude = signedDivisor < 0 ? unchecked(0UL - (ulong)signedDivisor) : (ulong)signedDivisor;
+                if (bits <= 32)
+                    magnitude = unchecked((uint)magnitude);
+                if (!constant || magnitude != 0 && (magnitude & (magnitude - 1)) == 0)
+                    return false;
+            }
+
+            var division = new GenTree(
+                ids.Next(),
+                GenTreeKind.Binary,
+                tree.Pc,
+                tree.SourceOp == BytecodeOp.Rem ? BytecodeOp.Div : BytecodeOp.Div_Un,
+                tree.Type,
+                tree.StackKind,
+                tree.Flags,
+                ImmutableArray.Create(dividend, divisor));
+            var product = new GenTree(
+                ids.Next(),
+                GenTreeKind.Binary,
+                tree.Pc,
+                BytecodeOp.Mul,
+                tree.Type,
+                tree.StackKind,
+                GenTreeFlags.None,
+                ImmutableArray.Create(MorphNode(division, target), CloneLeaf(divisor, ids)));
+            var difference = new GenTree(
+                ids.Next(),
+                GenTreeKind.Binary,
+                tree.Pc,
+                BytecodeOp.Sub,
+                tree.Type,
+                tree.StackKind,
+                GenTreeFlags.None,
+                ImmutableArray.Create(CloneLeaf(dividend, ids), MorphNode(product, target)));
+            result = MorphNode(difference, target);
+            return true;
+        }
+
+        private static bool IsInvariantOrLocal(GenTree node)
+            => node.Operands.Length == 0 &&
+               node.Kind is GenTreeKind.ConstI4 or GenTreeKind.ConstI8 or GenTreeKind.Local or GenTreeKind.Arg or GenTreeKind.Temp;
+
+        private static GenTree CloneLeaf(GenTree node, TreeIds ids)
+        {
+            var clone = new GenTree(
+                ids.Next(),
+                node.Kind,
+                node.Pc,
+                node.SourceOp,
+                node.Type,
+                node.StackKind,
+                node.Flags,
+                ImmutableArray<GenTree>.Empty,
+                int32: node.Int32,
+                int64: node.Int64,
+                runtimeType: node.RuntimeType);
+            clone.LocalDescriptor = node.LocalDescriptor;
+            return clone;
         }
 
         internal static GenTree MorphNode(GenTree node, TargetInfo target)
@@ -1121,7 +1265,7 @@ namespace Cnidaria.Cs
             => node.Operands.Length == 0 &&
                node.Kind is GenTreeKind.LocalAddr or GenTreeKind.ArgAddr or GenTreeKind.TempAddr;
 
-        private static int ComputeNextTreeId(GenTreeMethod method)
+        internal static int ComputeNextTreeId(GenTreeMethod method)
         {
             int max = -1;
             for (int b = 0; b < method.Blocks.Length; b++)

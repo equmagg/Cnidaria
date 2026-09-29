@@ -42,6 +42,8 @@ public sealed class SsaOptimizationOptions
     public bool EnableDeadCodeElimination { get; }
     public bool EnableCommonSubexpressionElimination { get; }
     public bool EnableLoopInvariantCodeMotion { get; }
+    public bool EnableInductionVariables { get; }
+    public bool EnableAssertionPropagation { get; }
     public int MaxLoopHoistsPerLoop { get; }
     public int MaxLoopAnalysisWork { get; }
     public int MaxIterations { get; }
@@ -55,7 +57,9 @@ public sealed class SsaOptimizationOptions
         bool enableCommonSubexpressionElimination = true,
         bool enableLoopInvariantCodeMotion = true,
         int maxLoopHoistsPerLoop = 16,
-        int maxLoopAnalysisWork = 100_000)
+        int maxLoopAnalysisWork = 100_000,
+        bool enableInductionVariables = true,
+        bool enableAssertionPropagation = true)
     {
         EnableConstantFolding = enableConstantFolding;
         EnableCopyPropagation = enableCopyPropagation;
@@ -63,6 +67,8 @@ public sealed class SsaOptimizationOptions
         EnableDeadCodeElimination = enableDeadCodeElimination;
         EnableCommonSubexpressionElimination = enableCommonSubexpressionElimination;
         EnableLoopInvariantCodeMotion = enableLoopInvariantCodeMotion;
+        EnableInductionVariables = enableInductionVariables;
+        EnableAssertionPropagation = enableAssertionPropagation;
         MaxLoopHoistsPerLoop = Math.Max(0, maxLoopHoistsPerLoop);
         MaxLoopAnalysisWork = Math.Max(0, maxLoopAnalysisWork);
         MaxIterations = maxIterations < 1 ? 1 : maxIterations;
@@ -1107,13 +1113,19 @@ internal sealed class GimpleAnnotationBuilder
                 break;
 
             case GimpleElementAccessExpression elementAccess:
-                MarkAddressTakenBase(elementAccess.Expression);
+                if (elementAccess.Expression.Type.Type is PointerType)
+                    ScanValue(elementAccess.Expression);
+                else
+                    MarkAddressTakenBase(elementAccess.Expression);
                 if (elementAccess.Index is not null)
                     ScanValue(elementAccess.Index);
                 break;
 
             case GimpleMemberAccessExpression memberAccess:
-                MarkAddressTakenBase(memberAccess.Expression);
+                if (memberAccess.ThroughPointer)
+                    ScanValue(memberAccess.Expression);
+                else
+                    MarkAddressTakenBase(memberAccess.Expression);
                 break;
         }
     }

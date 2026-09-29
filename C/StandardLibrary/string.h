@@ -39,5 +39,6 @@ char* strtok_r(char* restrict text, const char* restrict separators, char** rest
 char* strdup(const char* text);
 char* strndup(const char* text, size_t limit);
 char* strerror(int number);
+char* strsignal(int sig);
 
 #endif

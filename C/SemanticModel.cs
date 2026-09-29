@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Frozen;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.IO;
@@ -115,6 +116,7 @@ public sealed class CompilationOptions
 public sealed class Compilation
 {
     private readonly Lazy<SemanticState> _semanticState;
+    private readonly Lazy<BoundTree>[] _boundTrees;
 
     public string? AssemblyName { get; }
     public ImmutableArray<SyntaxTree> SyntaxTrees { get; }
@@ -132,7 +134,18 @@ public sealed class Compilation
         _semanticState = new Lazy<SemanticState>(
             () => DeclarationCollector.Collect(this),
             isThreadSafe: true);
+
+        // Diagnostics and lowering both need a tree bound, and binding it twice would only repeat the work
+        _boundTrees = new Lazy<BoundTree>[syntaxTrees.Length];
+        for (var i = 0; i < syntaxTrees.Length; i++)
+        {
+            var tree = syntaxTrees[i];
+            _boundTrees[i] = new Lazy<BoundTree>(() => Binder.BindTree(new SemanticModel(this, tree)), isThreadSafe: true);
+        }
     }
+
+    internal BoundTree GetBoundTree(SyntaxTree syntaxTree)
+        => _boundTrees[SyntaxTrees.IndexOf(syntaxTree)].Value;
 
     /// <summary>Gets the lazily collected declaration state</summary>
     internal SemanticState SemanticState => _semanticState.Value;
@@ -279,7 +292,7 @@ public sealed class SemanticModel
     public TranslationUnitSyntax Root => _syntaxTree.Root;
 
     /// <summary>Binds the syntax tree into a typed semantic tree</summary>
-    public BoundTree GetBoundTree() => Binder.BindTree(this);
+    public BoundTree GetBoundTree() => _compilation.GetBoundTree(_syntaxTree);
 
     /// <summary>Lowers the bound tree into explicit control-flow form</summary>
     public GimpleTree GetGimpleTree() => GimpleTree.Lower(this);
@@ -337,13 +350,14 @@ public sealed class SemanticModel
 /// <summary>Stores declaration, reference, and scope maps shared by semantic models</summary>
 internal sealed class SemanticState
 {
-    private readonly Dictionary<SyntaxNode, Symbol> _declaredSymbols = new();
-    private readonly Dictionary<ExpressionSyntax, Symbol> _referencedSymbols = new();
-    private readonly Dictionary<SyntaxNode, Scope> _scopes = new();
+    private readonly Dictionary<SyntaxNode, Symbol> _declaredSymbols;
+    private readonly Dictionary<ExpressionSyntax, Symbol> _referencedSymbols;
+    private readonly Dictionary<SyntaxNode, Scope> _scopes;
 
     public Scope GlobalScope { get; }
     public ImmutableArray<SemanticDiagnostic> Diagnostics { get; }
 
+    /// <summary>Takes over the maps the declaration collector built, which nothing else holds afterwards</summary>
     public SemanticState(
         Scope globalScope,
         Dictionary<SyntaxNode, Symbol> declaredSymbols,
@@ -352,16 +366,9 @@ internal sealed class SemanticState
         ImmutableArray<SemanticDiagnostic> diagnostics)
     {
         GlobalScope = globalScope ?? throw new ArgumentNullException(nameof(globalScope));
-
-        foreach (var pair in declaredSymbols)
-            _declaredSymbols[pair.Key] = pair.Value;
-
-        foreach (var pair in referencedSymbols)
-            _referencedSymbols[pair.Key] = pair.Value;
-
-        foreach (var pair in scopes)
-            _scopes[pair.Key] = pair.Value;
-
+        _declaredSymbols = declaredSymbols;
+        _referencedSymbols = referencedSymbols;
+        _scopes = scopes;
         Diagnostics = diagnostics;
     }
 
@@ -501,6 +508,8 @@ public sealed class TargetInfo
             TargetArchitectureKind.Arm64 => operatingSystem == OperatingSystemKind.Windows
                 ? CreateWindowsArm64(features)
                 : CreateArm64(features, operatingSystem),
+            TargetArchitectureKind.Wasm32 => CreateILP32(TargetArchitectureKind.Wasm32, features, operatingSystem),
+            TargetArchitectureKind.Wasm64 => CreateLP64(TargetArchitectureKind.Wasm64, features, operatingSystem),
             _ => throw new ArgumentOutOfRangeException(nameof(architecture)),
         };
     }
@@ -1148,7 +1157,8 @@ public sealed class BuiltinType : CType
 /// <summary>Describes a scalable vector built-in and its element properties</summary>
 public sealed class RVVectorType : CType
 {
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, RVVectorType?> Cache = new(StringComparer.Ordinal);
+    // Every built-in the V extension defines, spelt the one way the intrinsics spell it
+    private static readonly FrozenDictionary<string, RVVectorType> Builtins = CreateBuiltins();
 
     public int ElementWidth { get; }
     public int LengthMultiplierLog2 { get; }
@@ -1194,7 +1204,34 @@ public sealed class RVVectorType : CType
     }
 
     private static RVVectorType? Parse(string name)
-        => name is null ? null : Cache.GetOrAdd(name, static candidate => Create(candidate));
+        => name is not null && name.StartsWith("__rvv_", StringComparison.Ordinal) && Builtins.TryGetValue(name, out var type) ? type : null;
+
+    private static FrozenDictionary<string, RVVectorType> CreateBuiltins()
+    {
+        var names = new List<string>();
+        foreach (var ratio in new[] { 1, 2, 4, 8, 16, 32, 64 })
+            names.Add($"__rvv_bool{ratio}_t");
+        foreach (var prefix in new[] { "int", "uint", "float" })
+        {
+            foreach (var width in new[] { 8, 16, 32, 64 })
+            {
+                foreach (var multiplier in new[] { "mf8", "mf4", "mf2", "m1", "m2", "m4", "m8" })
+                {
+                    names.Add($"__rvv_{prefix}{width}{multiplier}_t");
+                    for (var segments = 2; segments <= 8; segments++)
+                        names.Add($"__rvv_{prefix}{width}{multiplier}x{segments}_t");
+                }
+            }
+        }
+
+        var builtins = new Dictionary<string, RVVectorType>(StringComparer.Ordinal);
+        foreach (var name in names)
+        {
+            if (Create(name) is { } type)
+                builtins.Add(name, type);
+        }
+        return builtins.ToFrozenDictionary(StringComparer.Ordinal);
+    }
 
     private static RVVectorType? Create(string name)
     {
@@ -1546,6 +1583,10 @@ public sealed class Scope
 
         return null;
     }
+
+    /// <summary>Looks up a tag declared in this scope itself</summary>
+    public TagSymbol? LookupOwnTag(string name)
+        => _tagSymbols.TryGetValue(name, out var symbol) ? symbol : null;
 
     /// <summary>Looks up a tag through the parent chain</summary>
     public TagSymbol? LookupTag(string name)

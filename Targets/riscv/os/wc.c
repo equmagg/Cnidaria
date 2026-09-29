@@ -90,7 +90,7 @@ int main(int argc, char** argv, char** envp)
         wantBytes = 1;
     }
 
-    /* With nothing named, a filter counts what it is given */
+    // With nothing named, a filter counts what it is given
     if (index == argc)
     {
         u64 lines;

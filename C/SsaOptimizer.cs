@@ -28,7 +28,9 @@ internal static partial class SsaOptimizer
             !options.EnableBranchFolding &&
             !options.EnableDeadCodeElimination &&
             !options.EnableCommonSubexpressionElimination &&
-            !options.EnableLoopInvariantCodeMotion)
+            !options.EnableLoopInvariantCodeMotion &&
+            !options.EnableInductionVariables &&
+            !options.EnableAssertionPropagation)
         {
             return function;
         }
@@ -45,9 +47,14 @@ internal static partial class SsaOptimizer
         }
 
         var hoisted = LoopInvariantCodeMotion.Optimize(current, target, options, valueNumberingOptions);
-        return ReferenceEquals(hoisted, current)
+        if (!ReferenceEquals(hoisted, current))
+            current = new Pass(hoisted, target, options, valueNumberingOptions).Run();
+
+        var asserted = AssertionPropagation.Optimize(current, target, options, valueNumberingOptions, out var assertions);
+        var induced = InductionVariables.Optimize(asserted, target, options, valueNumberingOptions, assertions);
+        return ReferenceEquals(induced, current)
             ? current
-            : new Pass(hoisted, target, options, valueNumberingOptions).Run();
+            : new Pass(induced, target, options, valueNumberingOptions).Run();
     }
 
     private sealed partial class Pass
@@ -1419,7 +1426,10 @@ internal static partial class SsaOptimizer
                 return true;
             }
 
-            if (TryGetConstant(operand, out var constant) && TryCastIntegerConstant(constant, type, syntax, out var casted))
+            if (TryGetConstant(operand, out var constant) &&
+                (TryCastIntegerConstant(constant, type, syntax, out var casted) ||
+                 code is GimpleTreeCode.FloatExpr or GimpleTreeCode.ConvertExpr or GimpleTreeCode.NopExpr &&
+                 TryCastFloatingConstant(constant, type, syntax, out casted)))
             {
                 folded = CreateConstantExpression(casted);
                 return true;
@@ -1427,6 +1437,40 @@ internal static partial class SsaOptimizer
 
             folded = null!;
             return false;
+        }
+
+        private bool TryCastFloatingConstant(GimpleConstantValue constant, QualifiedType type, SyntaxNode? syntax, out GimpleConstantValue casted)
+        {
+            casted = null!;
+            if (!TryGetFloatOrDouble(type, out var single))
+                return false;
+
+            double value;
+            if (TryGetIntegerConstant(constant, out var raw, out var info))
+            {
+                value = info.IsSigned
+                    ? single ? (double)(float)ToSigned(raw, info.Bits) : (double)ToSigned(raw, info.Bits)
+                    : single ? (double)(float)raw : (double)raw;
+            }
+            else if (constant.Value is double or float && TryGetFloatOrDouble(constant.Type, out _))
+            {
+                var source = Convert.ToDouble(constant.Value, CultureInfo.InvariantCulture);
+                value = single ? (float)source : source;
+            }
+            else
+            {
+                return false;
+            }
+
+            casted = new GimpleConstantValue(value, type, syntax);
+            return true;
+        }
+
+        private static bool TryGetFloatOrDouble(QualifiedType type, out bool single)
+        {
+            var builtin = GimpleTypeHelpers.Normalize(type).Type as BuiltinType;
+            single = builtin?.BuiltinKind == BuiltinTypeKind.Float;
+            return builtin?.BuiltinKind is BuiltinTypeKind.Float or BuiltinTypeKind.Double;
         }
 
         private bool TryFoldBinary(
