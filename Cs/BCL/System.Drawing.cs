@@ -1,3 +1,5 @@
+using System.Diagnostics.CodeAnalysis;
+
 namespace System.Drawing
 {
     public enum KnownColor

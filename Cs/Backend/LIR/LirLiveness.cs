@@ -463,7 +463,7 @@ namespace Cnidaria.Cs
             if (!target.IsX86 || registerClass != RegisterClass.General || node.Kind != GenTreeKind.Binary)
                 return MachineRegister.Invalid;
 
-            if (operandIndex == 1 && node.SourceOp is BytecodeOp.Shl or BytecodeOp.Shr or BytecodeOp.Shr_Un)
+            if (operandIndex == 1 && node.Operator is GenTreeOperator.Shl or GenTreeOperator.Shr or GenTreeOperator.ShrUn)
                 return RegisterInfo.CountRegister(target);
 
             if (operandIndex == 0 && (X86IntegerDivRem(node, target) || X86UnsignedCheckedMultiply(node, target)))
@@ -515,7 +515,7 @@ namespace Cnidaria.Cs
             if (!target.IsX86 || registerClass != RegisterClass.General || !X86IntegerDivRem(node, target))
                 return MachineRegister.Invalid;
 
-            return node.SourceOp is BytecodeOp.Rem or BytecodeOp.Rem_Un
+            return node.Operator is GenTreeOperator.Rem or GenTreeOperator.RemUn
                 ? RegisterInfo.DataRegister(target)
                 : RegisterInfo.AccumulatorRegister(target);
         }
@@ -545,7 +545,7 @@ namespace Cnidaria.Cs
 
             if (target.Architecture != TargetArchitectureKind.I386 ||
                 node.Kind != GenTreeKind.Binary ||
-                node.SourceOp is not (BytecodeOp.Ceq or BytecodeOp.Cgt or BytecodeOp.Cgt_Un or BytecodeOp.Clt or BytecodeOp.Clt_Un))
+                node.Operator is not (GenTreeOperator.Ceq or GenTreeOperator.Cgt or GenTreeOperator.CgtUn or GenTreeOperator.Clt or GenTreeOperator.CltUn))
             {
                 return 0;
             }
@@ -557,7 +557,7 @@ namespace Cnidaria.Cs
         {
             if (!target.IsX86 ||
                 node.Kind != GenTreeKind.Binary ||
-                node.SourceOp is not (BytecodeOp.Shl or BytecodeOp.Shr or BytecodeOp.Shr_Un))
+                node.Operator is not (GenTreeOperator.Shl or GenTreeOperator.Shr or GenTreeOperator.ShrUn))
             {
                 return false;
             }
@@ -573,7 +573,7 @@ namespace Cnidaria.Cs
 
         private static bool X86UnsignedCheckedMultiply(GenTree node, TargetInfo target)
         {
-            if (!target.IsX86 || node.Kind != GenTreeKind.Binary || node.SourceOp != BytecodeOp.Mul_Ovf_Un)
+            if (!target.IsX86 || node.Kind != GenTreeKind.Binary || node.Operator != GenTreeOperator.MulOvfUn)
                 return false;
 
             if (target.Architecture == TargetArchitectureKind.I386 && node.StackKind == GenStackKind.I8)
@@ -584,7 +584,7 @@ namespace Cnidaria.Cs
         private static bool X86IntegerDivRem(GenTree node, TargetInfo target)
         {
             if (!target.IsX86 || node.Kind != GenTreeKind.Binary ||
-                node.SourceOp is not (BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un))
+                node.Operator is not (GenTreeOperator.Div or GenTreeOperator.DivUn or GenTreeOperator.Rem or GenTreeOperator.RemUn))
             {
                 return false;
             }

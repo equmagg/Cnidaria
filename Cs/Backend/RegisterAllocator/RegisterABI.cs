@@ -331,6 +331,30 @@ namespace Cnidaria.Cs
             return ClassifyValue(method.ReturnType, returnStackKind, isReturn: true, target: target).PassingKind == AbiValuePassingKind.Indirect;
         }
 
+        // A small struct keeps the register class its ABI passes it in, so its copies agree with argument and return passing.
+        public static GenStackKind StorageStackKind(RuntimeType type, TargetInfo? target = null)
+        {
+            if (type.IsReferenceType)
+                return GenStackKind.Ref;
+            if (type.Kind == RuntimeTypeKind.ByRef)
+                return GenStackKind.ByRef;
+            if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer)
+                return GenStackKind.Ptr;
+            if (type.Name == "Single")
+                return GenStackKind.R4;
+            if (type.Name == "Double")
+                return GenStackKind.R8;
+            if (type.SizeOf > 8)
+                return GenStackKind.Value;
+
+            var abi = ClassifyValue(type, StackKindForType(type), isReturn: false, target: target);
+            if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
+                return GenStackKind.Value;
+            if (abi.PassingKind == AbiValuePassingKind.ScalarRegister && abi.RegisterClass == RegisterClass.Float)
+                return type.SizeOf <= 4 ? GenStackKind.R4 : GenStackKind.R8;
+            return type.SizeOf <= 4 ? GenStackKind.I4 : GenStackKind.I8;
+        }
+
         public static AbiValueInfo ClassifyStorageValue(RuntimeType? type, GenStackKind stackKind, TargetInfo? target = null)
         {
             var abi = ClassifyValue(type, stackKind, isReturn: false, target: target);

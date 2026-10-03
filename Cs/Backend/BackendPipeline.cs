@@ -438,7 +438,7 @@ namespace Cnidaria.Cs
             if (options.SplitCriticalEdgesBeforeSsa)
             {
                 GenTreeMethod split;
-                if (method.Function.ExceptionHandlers.Length == 0)
+                if (method.ExceptionHandlers.Length == 0)
                 {
                     split = GenTreeCriticalEdgeSplitter.SplitCriticalEdges(method);
                 }
@@ -538,7 +538,7 @@ namespace Cnidaria.Cs
                 nextId,
                 GenTreeKind.ClassInit,
                 entry.StartPc,
-                BytecodeOp.Nop,
+                GenTreeOperator.None,
                 type: null,
                 stackKind: GenStackKind.Void,
                 flags: GenTreeFlags.ContainsCall | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.GlobalRef | GenTreeFlags.Ordered,
@@ -572,7 +572,7 @@ namespace Cnidaria.Cs
         {
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
-            if (method.Function.ExceptionHandlers.Length != 0)
+            if (method.ExceptionHandlers.Length != 0)
                 return method;
 
             bool hasClassInit = false;
@@ -780,10 +780,10 @@ namespace Cnidaria.Cs
             GenTree? tested = null;
             if (tree.Kind is GenTreeKind.BranchTrue or GenTreeKind.BranchFalse && tree.Operands.Length == 1)
                 tested = tree.Operands[0];
-            else if (tree.Kind == GenTreeKind.Binary && tree.SourceOp is BytecodeOp.Ceq or BytecodeOp.Cgt_Un && tree.Operands.Length == 2)
+            else if (tree.Kind == GenTreeKind.Binary && tree.Operator is GenTreeOperator.Ceq or GenTreeOperator.CgtUn && tree.Operands.Length == 2)
                 tested = IsIntegralZero(tree.Operands[1]) ? tree.Operands[0] : IsIntegralZero(tree.Operands[0]) ? tree.Operands[1] : null;
 
-            if (tested is not { Kind: GenTreeKind.Binary, SourceOp: BytecodeOp.Rem } || tested.Operands.Length != 2)
+            if (tested is not { Kind: GenTreeKind.Binary, Operator: GenTreeOperator.Rem } || tested.Operands.Length != 2)
                 return false;
 
             GenTree divisor = tested.Operands[1];
@@ -799,7 +799,7 @@ namespace Cnidaria.Cs
             var mask = GenTreeFolder.CreateConstant(
                 divisor,
                 divisor.Kind == GenTreeKind.ConstI4 ? GenTreeConstantValue.ForI4((int)value - 1) : GenTreeConstantValue.ForI8(value - 1));
-            tested.SourceOp = BytecodeOp.And;
+            tested.Operator = GenTreeOperator.And;
             tested.Flags &= ~(GenTreeFlags.DivModNoByZero | GenTreeFlags.DivModNoOverflow);
             tested.SetOperands(ImmutableArray.Create(tested.Operands[0], mask));
             return true;
@@ -815,7 +815,7 @@ namespace Cnidaria.Cs
             bool arm64 = RegisterInfo.IsArm64(target);
             if (tree.Kind != GenTreeKind.Binary || tree.Operands.Length != 2 || target.IsRegisterBytecode ||
                 (target.IsArm && !arm64) ||
-                !(tree.SourceOp == BytecodeOp.Rem || arm64 && tree.SourceOp == BytecodeOp.Rem_Un) ||
+                !(tree.Operator == GenTreeOperator.Rem || arm64 && tree.Operator == GenTreeOperator.RemUn) ||
                 !GenTreeArithmeticSemantics.IsIntegralArithmeticType(tree.Type, tree.StackKind))
                 return false;
 
@@ -828,7 +828,7 @@ namespace Cnidaria.Cs
             bool constant = GenTreeArithmeticSemantics.TryGetIntegralConstant(divisor, bits, out long signedDivisor, out ulong unsignedDivisor);
             if (arm64)
             {
-                if (tree.SourceOp == BytecodeOp.Rem_Un && constant &&
+                if (tree.Operator == GenTreeOperator.RemUn && constant &&
                     GenTreeArithmeticSemantics.TryGetUnsignedPowerOfTwoDivisor(unsignedDivisor, bits, out _))
                     return false;
             }
@@ -845,7 +845,7 @@ namespace Cnidaria.Cs
                 ids.Next(),
                 GenTreeKind.Binary,
                 tree.Pc,
-                tree.SourceOp == BytecodeOp.Rem ? BytecodeOp.Div : BytecodeOp.Div_Un,
+                tree.Operator == GenTreeOperator.Rem ? GenTreeOperator.Div : GenTreeOperator.DivUn,
                 tree.Type,
                 tree.StackKind,
                 tree.Flags,
@@ -854,7 +854,7 @@ namespace Cnidaria.Cs
                 ids.Next(),
                 GenTreeKind.Binary,
                 tree.Pc,
-                BytecodeOp.Mul,
+                GenTreeOperator.Mul,
                 tree.Type,
                 tree.StackKind,
                 GenTreeFlags.None,
@@ -863,7 +863,7 @@ namespace Cnidaria.Cs
                 ids.Next(),
                 GenTreeKind.Binary,
                 tree.Pc,
-                BytecodeOp.Sub,
+                GenTreeOperator.Sub,
                 tree.Type,
                 tree.StackKind,
                 GenTreeFlags.None,
@@ -882,7 +882,7 @@ namespace Cnidaria.Cs
                 ids.Next(),
                 node.Kind,
                 node.Pc,
-                node.SourceOp,
+                node.Operator,
                 node.Type,
                 node.StackKind,
                 node.Flags,
@@ -1035,7 +1035,7 @@ namespace Cnidaria.Cs
                     break;
 
                 case GenTreeKind.Binary:
-                    if (GenTreeArithmeticSemantics.BinaryOperationCanThrow(node.SourceOp, node.Type, node.StackKind, node.Operands, target))
+                    if (GenTreeArithmeticSemantics.BinaryOperationCanThrow(node.Operator, node.Type, node.StackKind, node.Operands, target))
                         flags |= GenTreeFlags.CanThrow;
                     break;
 
@@ -1051,7 +1051,7 @@ namespace Cnidaria.Cs
             }
 
             if (node.Kind == GenTreeKind.Binary &&
-                (node.SourceOp is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un) &&
+                (node.Operator is GenTreeOperator.Div or GenTreeOperator.DivUn or GenTreeOperator.Rem or GenTreeOperator.RemUn) &&
                 !GenTreeArithmeticSemantics.DivRemCanThrow(node, target))
                 flags = ClearNodeOwnedCanThrow(flags, node.Operands);
 
@@ -1244,7 +1244,7 @@ namespace Cnidaria.Cs
                 nextTreeId++,
                 address.Kind,
                 use.Pc,
-                address.SourceOp,
+                address.Operator,
                 address.Type,
                 address.StackKind,
                 address.Flags,

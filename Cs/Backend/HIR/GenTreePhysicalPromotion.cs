@@ -161,7 +161,7 @@ namespace Cnidaria.Cs
                 };
             }
 
-            private static bool CanPromoteParentDescriptor(
+            private bool CanPromoteParentDescriptor(
                 GenLocalDescriptor descriptor,
                 PhysicalPromotionOptions options,
                 out ImmutableArray<RuntimeField> fields)
@@ -176,6 +176,10 @@ namespace Cnidaria.Cs
                     return false;
 
                 if (type.SizeOf <= 0 || type.SizeOf > options.MaxPromotedStructSize)
+                    return false;
+
+                // An inline array's one declared field covers only its first element.
+                if (type.InlineArrayLength > 0)
                     return false;
 
                 if (type.InstanceFields.Length == 0 || type.InstanceFields.Length > options.MaxPromotedFieldsPerStruct)
@@ -197,7 +201,7 @@ namespace Cnidaria.Cs
                 return true;
             }
 
-            private static bool CanPromoteField(RuntimeField field)
+            private bool CanPromoteField(RuntimeField field)
             {
                 if (field is null)
                     return false;
@@ -566,7 +570,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < candidate.Fields.Length; i++)
                 {
                     var field = candidate.Fields[i];
-                    var value = CreateLocalLikeLoad(template, candidate.GetFieldDescriptor(field), template.SourceOp);
+                    var value = CreateLocalLikeLoad(template, candidate.GetFieldDescriptor(field), template.Operator);
                     statements.Add(CreateSyncFieldStore(template, candidate, field, value));
                 }
             }
@@ -577,7 +581,7 @@ namespace Cnidaria.Cs
                 {
                     var field = candidate.Fields[i];
                     var load = CreateSyncFieldLoad(template, candidate, field);
-                    statements.Add(CreateLocalLikeStore(template, candidate.GetFieldDescriptor(field), load, template.SourceOp));
+                    statements.Add(CreateLocalLikeStore(template, candidate.GetFieldDescriptor(field), load, template.Operator));
                 }
             }
 
@@ -590,7 +594,7 @@ namespace Cnidaria.Cs
                     _nextTreeId++,
                     address.Kind,
                     template.Pc,
-                    address.SourceOp,
+                    address.Operator,
                     address.Type,
                     address.StackKind,
                     address.Flags,
@@ -607,7 +611,7 @@ namespace Cnidaria.Cs
                     _nextTreeId++,
                     GenTreeKind.Field,
                     template.Pc,
-                    template.SourceOp,
+                    template.Operator,
                     field.FieldType,
                     StackKindForStorage(field.FieldType),
                     GenTreeFlags.MemoryRead | GenTreeFlags.Ordered | GenTreeFlags.NullCheckEliminated | GenTreeFlags.PromotionSync,
@@ -622,7 +626,7 @@ namespace Cnidaria.Cs
                     _nextTreeId++,
                     GenTreeKind.StoreField,
                     template.Pc,
-                    template.SourceOp,
+                    template.Operator,
                     null,
                     GenStackKind.Void,
                     GenTreeFlags.MemoryWrite | GenTreeFlags.SideEffect | GenTreeFlags.Ordered | GenTreeFlags.NullCheckEliminated | GenTreeFlags.PromotionSync,
@@ -661,11 +665,11 @@ namespace Cnidaria.Cs
                     var fieldDescriptor = fieldAccess.Candidate.GetFieldDescriptor(fieldAccess.Field);
                     if (node.Kind == GenTreeKind.Field)
                     {
-                        return CreateLocalLikeLoad(node, fieldDescriptor, node.SourceOp);
+                        return CreateLocalLikeLoad(node, fieldDescriptor, node.Operator);
                     }
 
                     var value = RewriteNode(node.Operands[1]);
-                    return CreateLocalLikeStore(node, fieldDescriptor, value, node.SourceOp);
+                    return CreateLocalLikeStore(node, fieldDescriptor, value, node.Operator);
                 }
 
                 if (node.Operands.Length == 0)
@@ -694,7 +698,7 @@ namespace Cnidaria.Cs
                     var field = destination.Fields[i];
                     var fieldDescriptor = destination.GetFieldDescriptor(field);
                     var value = CreateDefaultValue(template, field.FieldType);
-                    statements.Add(CreateLocalLikeStore(template, fieldDescriptor, value, template.SourceOp));
+                    statements.Add(CreateLocalLikeStore(template, fieldDescriptor, value, template.Operator));
                 }
             }
 
@@ -710,12 +714,12 @@ namespace Cnidaria.Cs
                     var sourceField = source.Fields[i];
                     var sourceDescriptor = source.GetFieldDescriptor(sourceField);
                     var destinationDescriptor = destination.GetFieldDescriptor(destinationField);
-                    var value = CreateLocalLikeLoad(template, sourceDescriptor, template.SourceOp);
-                    statements.Add(CreateLocalLikeStore(template, destinationDescriptor, value, template.SourceOp));
+                    var value = CreateLocalLikeLoad(template, sourceDescriptor, template.Operator);
+                    statements.Add(CreateLocalLikeStore(template, destinationDescriptor, value, template.Operator));
                 }
             }
 
-            private GenTree CreateLocalLikeLoad(GenTree template, GenLocalDescriptor descriptor, BytecodeOp sourceOp)
+            private GenTree CreateLocalLikeLoad(GenTree template, GenLocalDescriptor descriptor, GenTreeOperator oper)
             {
                 var kind = descriptor.Kind switch
                 {
@@ -729,7 +733,7 @@ namespace Cnidaria.Cs
                     _nextTreeId++,
                     kind,
                     template.Pc,
-                    sourceOp,
+                    oper,
                     descriptor.Type,
                     descriptor.StackKind,
                     GenTreeFlags.LocalUse | GenTreeFlags.Ordered,
@@ -740,7 +744,7 @@ namespace Cnidaria.Cs
                 return node;
             }
 
-            private GenTree CreateLocalLikeStore(GenTree template, GenLocalDescriptor descriptor, GenTree value, BytecodeOp sourceOp)
+            private GenTree CreateLocalLikeStore(GenTree template, GenLocalDescriptor descriptor, GenTree value, GenTreeOperator oper)
             {
                 var kind = descriptor.Kind switch
                 {
@@ -754,7 +758,7 @@ namespace Cnidaria.Cs
                     _nextTreeId++,
                     kind,
                     template.Pc,
-                    sourceOp,
+                    oper,
                     descriptor.Type,
                     descriptor.StackKind,
                     GenTreeFlags.LocalDef | GenTreeFlags.VarDef | GenTreeFlags.SideEffect | GenTreeFlags.Ordered |
@@ -772,7 +776,7 @@ namespace Cnidaria.Cs
                     _nextTreeId++,
                     GenTreeKind.DefaultValue,
                     template.Pc,
-                    template.SourceOp,
+                    template.Operator,
                     type,
                     StackKindForStorage(type),
                     GenTreeFlags.None,
@@ -786,7 +790,7 @@ namespace Cnidaria.Cs
                     _nextTreeId++,
                     node.Kind,
                     node.Pc,
-                    node.SourceOp,
+                    node.Operator,
                     node.Type,
                     node.StackKind,
                     node.Flags,
@@ -956,24 +960,8 @@ namespace Cnidaria.Cs
                        (ReferenceEquals(node.RuntimeType, parent.Type) || ReferenceEquals(node.Type, parent.Type));
             }
 
-            private static GenStackKind StackKindForStorage(RuntimeType type)
-            {
-                if (type.IsReferenceType)
-                    return GenStackKind.Ref;
-                if (type.Kind == RuntimeTypeKind.ByRef)
-                    return GenStackKind.ByRef;
-                if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer)
-                    return GenStackKind.Ptr;
-                if (type.Name == "Single")
-                    return GenStackKind.R4;
-                if (type.Name == "Double")
-                    return GenStackKind.R8;
-                if (type.SizeOf <= 4)
-                    return GenStackKind.I4;
-                if (type.SizeOf <= 8)
-                    return GenStackKind.I8;
-                return GenStackKind.Value;
-            }
+            private GenStackKind StackKindForStorage(RuntimeType type)
+                => MachineAbi.StorageStackKind(type, _method.Target);
 
             private static int ComputeNextTreeId(GenTreeMethod method)
             {

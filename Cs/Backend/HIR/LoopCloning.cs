@@ -243,7 +243,7 @@ namespace Cnidaria.Cs
                 id,
                 node.Kind,
                 node.Pc,
-                node.SourceOp,
+                node.Operator,
                 node.Type,
                 node.StackKind,
                 flags,
@@ -282,7 +282,7 @@ namespace Cnidaria.Cs
                 allocator.AllocateTreeId(),
                 GenTreeKind.Branch,
                 pc,
-                BytecodeOp.Br,
+                GenTreeOperator.None,
                 type: null,
                 stackKind: GenStackKind.Void,
                 flags: GenTreeFlags.ControlFlow | GenTreeFlags.Ordered,
@@ -456,7 +456,7 @@ namespace Cnidaria.Cs
                         var branch = block.Statements[branchIndex];
                         return branch.Kind == GenTreeKind.Branch &&
                                branch.Operands.Length == 0 &&
-                               branch.SourceOp != BytecodeOp.Leave &&
+                               branch.Operator != GenTreeOperator.Leave &&
                                distinctSuccessors.Contains(branch.TargetBlockId) &&
                                !ContainsControlTransfer(block.Statements, branchIndex);
                     }
@@ -476,7 +476,7 @@ namespace Cnidaria.Cs
 
                         return appended is null ||
                                (appended.Operands.Length == 0 &&
-                                appended.SourceOp != BytecodeOp.Leave &&
+                                appended.Operator != GenTreeOperator.Leave &&
                                 distinctSuccessors.Contains(appended.TargetBlockId));
                     }
 

@@ -52,6 +52,7 @@ namespace Cnidaria.Cs
         private const string ConsoleWriteStringSymbol = "RhpConsoleWriteString";
         private const string MemsetSymbol = "RhpMemset";
         private const string GetCurrentProcessorNumberSymbol = "RhpGetCurrentProcessorNumber";
+        private const string GetObjectHashCodeSymbol = "RhpGetObjectHashCode";
 
         private const string TextSectionName = ".text";
 
@@ -361,6 +362,14 @@ namespace Cnidaria.Cs
                 IsSystemType(method.ReturnType, "Int32"))
             {
                 return GetCurrentProcessorNumberSymbol;
+            }
+
+            // An address-derived hash exists for every object, so trying to get one always succeeds
+            if (StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Runtime") &&
+                StringComparer.Ordinal.Equals(method.DeclaringType.Name, "RuntimeImports") &&
+                method.Name is "RhGetObjectHashCode" or "RhTryGetObjectHashCode")
+            {
+                return GetObjectHashCodeSymbol;
             }
 
             if (StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Threading") &&

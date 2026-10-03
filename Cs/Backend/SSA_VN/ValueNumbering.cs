@@ -127,7 +127,6 @@ namespace Cnidaria.Cs
         SsaSlot,
         PhysicalSelector,
         ArrayElementClass,
-        MethodBody,
         Block,
         Heap,
     }
@@ -417,7 +416,6 @@ namespace Cnidaria.Cs
                 equivalenceClass,
                 ((long)Math.Max(0, Math.Min(size, 0x7fffffff)) << 32) | (uint)exactTypeId,
                 null);
-        public static ValueNumberConstantKey MethodBody(RuntimeMethod method) => new ValueNumberConstantKey(ValueNumberConstantKind.MethodBody, GenStackKind.NativeInt, method.DeclaringType, method.MethodId, method.Body?.GetHashCode() ?? 0, method);
         public static ValueNumberConstantKey Block(int blockId) => new ValueNumberConstantKey(ValueNumberConstantKind.Block, GenStackKind.I4, null, blockId, 0, null);
         public static ValueNumberConstantKey Heap(RuntimeMethod method) => new ValueNumberConstantKey(ValueNumberConstantKind.Heap, GenStackKind.Unknown, method.DeclaringType, method.MethodId, 0, method);
 
@@ -2473,6 +2471,8 @@ namespace Cnidaria.Cs
                         return ValueNumberPair.Same(_store.VNForNull(node.Type));
                     case GenTreeKind.ConstString:
                         return ValueNumberPair.Same(_store.VNForConstant(ValueNumberConstantKey.String(node.Text)));
+                    case GenTreeKind.TypeHandle:
+                        return ValueNumberPair.Same(_store.VNForConstant(ValueNumberConstantKey.TypeHandle(node.RuntimeType)));
                     case GenTreeKind.SizeOf:
                         return ValueNumberPair.Same(_store.VNForInt32(node.RuntimeType?.SizeOf ?? node.Type?.SizeOf ?? node.Int32));
                     case GenTreeKind.DefaultValue:
@@ -2636,11 +2636,11 @@ namespace Cnidaria.Cs
 
             private ValueNumberPair Unary(GenTree node, ImmutableArray<ValueNumberPair> operands, int blockId)
             {
-                var func = node.SourceOp switch
+                var func = node.Operator switch
                 {
-                    BytecodeOp.Neg => ValueNumberFunction.Neg,
-                    BytecodeOp.Not => ValueNumberFunction.Not,
-                    BytecodeOp.PtrToByRef => ValueNumberFunction.PointerToByRef,
+                    GenTreeOperator.Neg => ValueNumberFunction.Neg,
+                    GenTreeOperator.Not => ValueNumberFunction.Not,
+                    GenTreeOperator.PtrToByRef => ValueNumberFunction.PointerToByRef,
                     _ => ValueNumberFunction.None,
                 };
                 if (func == ValueNumberFunction.None)
@@ -2657,12 +2657,12 @@ namespace Cnidaria.Cs
 
             private ValueNumberPair Binary(GenTree node, ImmutableArray<ValueNumberPair> operands, int blockId)
             {
-                var func = BinaryFunction(node.SourceOp);
+                var func = BinaryFunction(node.Operator);
                 if (func == ValueNumberFunction.None)
                     return ValueNumberPair.Same(_store.VNForStableUnique(node.Id, node.StackKind,
                         node.Type, ValueNumberFunction.MemOpaque, OpaqueArgs(blockId)));
 
-                if (IsCheckedOverflowBinaryOp(node.SourceOp))
+                if (IsCheckedOverflowBinaryOp(node.Operator))
                 {
                     ValueNumber leftLiberalChecked = operands.Length > 0 ? OperandNormal(operands, 0, ValueNumberCategory.Liberal) : ValueNumberStore.NoVN;
                     ValueNumber rightLiberalChecked = operands.Length > 1 ? OperandNormal(operands, 1, ValueNumberCategory.Liberal) : ValueNumberStore.NoVN;
@@ -3111,7 +3111,7 @@ namespace Cnidaria.Cs
                 if (node.Kind is GenTreeKind.Arg or GenTreeKind.Local or GenTreeKind.Temp)
                     return node.LocalDescriptor is { IsLocalStorageByRefAlias: true };
 
-                if ((node.Kind is GenTreeKind.FieldAddr or GenTreeKind.PointerElementAddr) || (node.Kind == GenTreeKind.Unary && node.SourceOp == BytecodeOp.PtrToByRef))
+                if ((node.Kind is GenTreeKind.FieldAddr or GenTreeKind.PointerElementAddr) || (node.Kind == GenTreeKind.Unary && node.Operator == GenTreeOperator.PtrToByRef))
                 {
                     for (int i = 0; i < node.Operands.Length; i++)
                     {
@@ -3344,10 +3344,10 @@ namespace Cnidaria.Cs
                 switch (node.Kind)
                 {
                     case GenTreeKind.Binary:
-                        if (IsCheckedOverflowBinaryOp(node.SourceOp))
+                        if (IsCheckedOverflowBinaryOp(node.Operator))
                             result = AddException(result, ValueNumberFunction.OverflowExc, normalValue);
 
-                        if ((node.SourceOp is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un) &&
+                        if ((node.Operator is GenTreeOperator.Div or GenTreeOperator.DivUn or GenTreeOperator.Rem or GenTreeOperator.RemUn) &&
                             GenTreeArithmeticSemantics.IsIntegralArithmeticType(node.Type, node.StackKind))
                         {
                             ValueNumber dividend = OperandNormal(operands, 0);
@@ -3355,7 +3355,7 @@ namespace Cnidaria.Cs
                             if (DivRemMayThrowDivideByZero(node, divisor))
                                 result = AddException(result, ValueNumberFunction.DivideByZeroExc, divisor);
                             if (SignedDivRemMayThrowArithmetic(node, dividend, divisor))
-                                result = AddException(result, ValueNumberFunction.ArithmeticExc, normalValue, _store.VNForInt32((int)node.SourceOp));
+                                result = AddException(result, ValueNumberFunction.ArithmeticExc, normalValue, _store.VNForInt32((int)node.Operator));
                         }
                         break;
 
@@ -3512,7 +3512,7 @@ namespace Cnidaria.Cs
             private bool SignedDivRemMayThrowArithmetic(GenTree node, ValueNumber dividend, ValueNumber divisor)
             {
                 if ((node.Flags & GenTreeFlags.DivModNoOverflow) != 0 ||
-                    node.SourceOp is not (BytecodeOp.Div or BytecodeOp.Rem))
+                    node.Operator is not (GenTreeOperator.Div or GenTreeOperator.Rem))
                 {
                     return false;
                 }
@@ -3853,32 +3853,32 @@ namespace Cnidaria.Cs
                 return result;
             }
 
-            private static bool IsCheckedOverflowBinaryOp(BytecodeOp op)
-                => op is BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un
-                    or BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un
-                    or BytecodeOp.Mul_Ovf or BytecodeOp.Mul_Ovf_Un;
-            private static ValueNumberFunction BinaryFunction(BytecodeOp op)
+            private static bool IsCheckedOverflowBinaryOp(GenTreeOperator op)
+                => op is GenTreeOperator.AddOvf or GenTreeOperator.AddOvfUn
+                    or GenTreeOperator.SubOvf or GenTreeOperator.SubOvfUn
+                    or GenTreeOperator.MulOvf or GenTreeOperator.MulOvfUn;
+            private static ValueNumberFunction BinaryFunction(GenTreeOperator op)
             {
                 return op switch
                 {
-                    BytecodeOp.Add or BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un => ValueNumberFunction.Add,
-                    BytecodeOp.Sub or BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un => ValueNumberFunction.Sub,
-                    BytecodeOp.Mul or BytecodeOp.Mul_Ovf or BytecodeOp.Mul_Ovf_Un => ValueNumberFunction.Mul,
-                    BytecodeOp.Div => ValueNumberFunction.Div,
-                    BytecodeOp.Div_Un => ValueNumberFunction.DivUn,
-                    BytecodeOp.Rem => ValueNumberFunction.Rem,
-                    BytecodeOp.Rem_Un => ValueNumberFunction.RemUn,
-                    BytecodeOp.And => ValueNumberFunction.And,
-                    BytecodeOp.Or => ValueNumberFunction.Or,
-                    BytecodeOp.Xor => ValueNumberFunction.Xor,
-                    BytecodeOp.Shl => ValueNumberFunction.Shl,
-                    BytecodeOp.Shr => ValueNumberFunction.Shr,
-                    BytecodeOp.Shr_Un => ValueNumberFunction.ShrUn,
-                    BytecodeOp.Ceq => ValueNumberFunction.Ceq,
-                    BytecodeOp.Clt => ValueNumberFunction.Clt,
-                    BytecodeOp.Clt_Un => ValueNumberFunction.CltUn,
-                    BytecodeOp.Cgt => ValueNumberFunction.Cgt,
-                    BytecodeOp.Cgt_Un => ValueNumberFunction.CgtUn,
+                    GenTreeOperator.Add or GenTreeOperator.AddOvf or GenTreeOperator.AddOvfUn => ValueNumberFunction.Add,
+                    GenTreeOperator.Sub or GenTreeOperator.SubOvf or GenTreeOperator.SubOvfUn => ValueNumberFunction.Sub,
+                    GenTreeOperator.Mul or GenTreeOperator.MulOvf or GenTreeOperator.MulOvfUn => ValueNumberFunction.Mul,
+                    GenTreeOperator.Div => ValueNumberFunction.Div,
+                    GenTreeOperator.DivUn => ValueNumberFunction.DivUn,
+                    GenTreeOperator.Rem => ValueNumberFunction.Rem,
+                    GenTreeOperator.RemUn => ValueNumberFunction.RemUn,
+                    GenTreeOperator.And => ValueNumberFunction.And,
+                    GenTreeOperator.Or => ValueNumberFunction.Or,
+                    GenTreeOperator.Xor => ValueNumberFunction.Xor,
+                    GenTreeOperator.Shl => ValueNumberFunction.Shl,
+                    GenTreeOperator.Shr => ValueNumberFunction.Shr,
+                    GenTreeOperator.ShrUn => ValueNumberFunction.ShrUn,
+                    GenTreeOperator.Ceq => ValueNumberFunction.Ceq,
+                    GenTreeOperator.Clt => ValueNumberFunction.Clt,
+                    GenTreeOperator.CltUn => ValueNumberFunction.CltUn,
+                    GenTreeOperator.Cgt => ValueNumberFunction.Cgt,
+                    GenTreeOperator.CgtUn => ValueNumberFunction.CgtUn,
                     _ => ValueNumberFunction.None,
                 };
             }

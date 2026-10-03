@@ -577,7 +577,7 @@ namespace Cnidaria.Cs
             if (expression.Kind != GenTreeKind.Binary || expression.Operands.Length != 2)
                 return false;
 
-            if (expression.SourceOp == BytecodeOp.Ceq)
+            if (expression.Operator == GenTreeOperator.Ceq)
             {
                 if (TryGetBooleanConstant(expression.Operands[1], out bool rightBoolean) &&
                     TryParseRawPredicate(expression.Operands[0], negate ^ !rightBoolean, out predicate))
@@ -593,25 +593,25 @@ namespace Cnidaria.Cs
 
             LoopRelop relop;
             bool unsigned;
-            switch (expression.SourceOp)
+            switch (expression.Operator)
             {
-                case BytecodeOp.Ceq:
+                case GenTreeOperator.Ceq:
                     relop = LoopRelop.Equal;
                     unsigned = false;
                     break;
-                case BytecodeOp.Clt:
+                case GenTreeOperator.Clt:
                     relop = LoopRelop.LessThan;
                     unsigned = false;
                     break;
-                case BytecodeOp.Clt_Un:
+                case GenTreeOperator.CltUn:
                     relop = LoopRelop.LessThan;
                     unsigned = true;
                     break;
-                case BytecodeOp.Cgt:
+                case GenTreeOperator.Cgt:
                     relop = LoopRelop.GreaterThan;
                     unsigned = false;
                     break;
-                case BytecodeOp.Cgt_Un:
+                case GenTreeOperator.CgtUn:
                     relop = LoopRelop.GreaterThan;
                     unsigned = true;
                     break;
@@ -639,7 +639,7 @@ namespace Cnidaria.Cs
             }
 
             if (expression.Kind == GenTreeKind.Binary &&
-                expression.SourceOp == BytecodeOp.Ceq &&
+                expression.Operator == GenTreeOperator.Ceq &&
                 expression.Operands.Length == 2)
             {
                 if (TryGetScalarUse(expression.Operands[0], out slot) &&
@@ -818,9 +818,9 @@ namespace Cnidaria.Cs
                 return false;
 
             IterationOperation operation;
-            if (value.SourceOp == BytecodeOp.Add)
+            if (value.Operator == GenTreeOperator.Add)
                 operation = IterationOperation.Add;
-            else if (value.SourceOp == BytecodeOp.Sub)
+            else if (value.Operator == GenTreeOperator.Sub)
                 operation = IterationOperation.Subtract;
             else
                 return false;
@@ -1231,7 +1231,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.ArrayLength => 2,
                 GenTreeKind.Field or GenTreeKind.FieldAddr or GenTreeKind.StaticField or GenTreeKind.StaticFieldAddr => 3,
                 GenTreeKind.LoadIndirect or GenTreeKind.StoreIndirect => 3,
-                GenTreeKind.Binary => node.SourceOp is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un ? 6 : 2,
+                GenTreeKind.Binary => node.Operator is GenTreeOperator.Div or GenTreeOperator.DivUn or GenTreeOperator.Rem or GenTreeOperator.RemUn ? 6 : 2,
                 GenTreeKind.Conv => 2,
                 _ => 1,
             };
@@ -1516,7 +1516,7 @@ namespace Cnidaria.Cs
                     node.Id,
                     GenTreeKind.ConstI4,
                     node.Pc,
-                    BytecodeOp.Ldc_I4,
+                    GenTreeOperator.None,
                     type: null,
                     stackKind: GenStackKind.I4,
                     flags: GenTreeFlags.None,

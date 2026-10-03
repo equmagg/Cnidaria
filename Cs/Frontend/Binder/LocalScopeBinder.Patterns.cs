@@ -604,13 +604,32 @@ namespace Cnidaria.Cs
                         return MakeLogicalNot(unaryPattern, inner, context, diagnostics);
                     }
 
-                case VarPatternSyntax:
-                    diagnostics.Add(new Diagnostic(
-                    "CN_PAT_IS002",
-                    DiagnosticSeverity.Error,
-                    "'var' patterns are not supported.",
-                    new Location(context.SemanticModel.SyntaxTree, pattern.Span)));
-                    return new BoundBadExpression(wholeSyntax);
+                case RecursivePatternSyntax recursive:
+                    return BindRecursivePattern(wholeSyntax, operand, recursive, context, diagnostics);
+
+                case VarPatternSyntax varPattern:
+                    {
+                        if (varPattern.Designation is ParenthesizedVariableDesignationSyntax)
+                        {
+                            diagnostics.Add(new Diagnostic(
+                                "CN_PAT_IS002",
+                                DiagnosticSeverity.Error,
+                                "Deconstructing 'var' patterns are not supported.",
+                                new Location(context.SemanticModel.SyntaxTree, pattern.Span)));
+                            return new BoundBadExpression(wholeSyntax);
+                        }
+
+                        if (!TryBindPatternDesignation(varPattern.Designation, operand.Type, context, diagnostics, out var local, out var isDiscard))
+                            return new BoundBadExpression(wholeSyntax);
+
+                        return new BoundIsPatternExpression(
+                            syntax: wholeSyntax,
+                            operand: operand,
+                            boolType: context.Compilation.GetSpecialType(SpecialType.System_Boolean),
+                            patternKind: BoundIsPatternKind.Var,
+                            declaredLocalOpt: local,
+                            isDiscard: isDiscard);
+                    }
 
                 case DiscardPatternSyntax:
                     diagnostics.Add(new Diagnostic(
@@ -629,6 +648,123 @@ namespace Cnidaria.Cs
                     return new BoundBadExpression(wholeSyntax);
             }
         }
+        // `T { M: p, ... } d`: a type test (or a non-null test without T) that captures the value, then each
+        // subpattern against a member of it, all joined with &&.
+        private BoundExpression BindRecursivePattern(
+            SyntaxNode wholeSyntax,
+            BoundExpression operand,
+            RecursivePatternSyntax pattern,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            if (pattern.PositionalPatternClause is not null)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PAT_IS014",
+                    DiagnosticSeverity.Error,
+                    "Positional patterns are not supported.",
+                    new Location(context.SemanticModel.SyntaxTree, pattern.PositionalPatternClause.Span)));
+                return new BoundBadExpression(wholeSyntax);
+            }
+
+            TypeSymbol valueType;
+            if (pattern.Type is not null)
+            {
+                valueType = BindType(pattern.Type, context, diagnostics);
+                if (valueType is ErrorTypeSymbol)
+                    return new BoundBadExpression(wholeSyntax);
+            }
+            else
+            {
+                valueType = TryGetSystemNullableInfo(operand.Type, out _, out var underlying) ? underlying : operand.Type;
+            }
+
+            LocalSymbol? value = null;
+            bool isDiscard = false;
+            if (pattern.Designation is not null &&
+                !TryBindPatternDesignation(pattern.Designation, valueType, context, diagnostics, out value, out isDiscard))
+            {
+                return new BoundBadExpression(wholeSyntax);
+            }
+
+            var subpatterns = pattern.PropertyPatternClause?.Subpatterns;
+            if (value is null && subpatterns is { Count: > 0 })
+                value = NewTemp("$recursivePattern", valueType);
+
+            var result = BindIsTypePattern(
+                wholeSyntax,
+                operand,
+                valueType,
+                value,
+                isDiscard,
+                pattern.Type,
+                pattern,
+                requirePatternCompatibility: pattern.Type is not null,
+                context,
+                diagnostics);
+
+            if (result.HasErrors || subpatterns is null)
+                return result;
+
+            for (int i = 0; i < subpatterns.Value.Count; i++)
+            {
+                var subpattern = subpatterns.Value[i];
+                if (subpattern.ExpressionColon is null)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_PAT_IS015",
+                        DiagnosticSeverity.Error,
+                        "A property subpattern requires a member name.",
+                        new Location(context.SemanticModel.SyntaxTree, subpattern.Span)));
+                    return new BoundBadExpression(wholeSyntax);
+                }
+
+                var memberBinder = CreateFlowScopeBinderForTrue(result, withinExpression: true);
+                var member = memberBinder.BindSubpatternMember(
+                    subpattern.ExpressionColon.Expression,
+                    new BoundLocalExpression(subpattern.ExpressionColon.Expression, value!),
+                    context,
+                    diagnostics);
+                if (member.HasErrors)
+                    return new BoundBadExpression(wholeSyntax);
+
+                var test = memberBinder.BindIsPatternCore(wholeSyntax, member, subpattern.Pattern, context, diagnostics);
+                result = MakeLogicalAnd(subpattern, result, test, context, diagnostics);
+            }
+
+            return result;
+        }
+
+        // `M` or, for an extended property pattern, `M.N.O` read from the matched value.
+        private BoundExpression BindSubpatternMember(
+            ExpressionSyntax memberSyntax,
+            BoundExpression value,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            switch (memberSyntax)
+            {
+                case SimpleNameSyntax name:
+                    return BindMemberOnBoundReceiver(name, value, name, BindValueKind.RValue, context, diagnostics);
+
+                case MemberAccessExpressionSyntax access when access.Kind == SyntaxKind.SimpleMemberAccessExpression:
+                    {
+                        var receiver = BindSubpatternMember(access.Expression, value, context, diagnostics);
+                        if (receiver.HasErrors)
+                            return receiver;
+                        return BindMemberOnBoundReceiver(access, receiver, access.Name, BindValueKind.RValue, context, diagnostics);
+                    }
+
+                default:
+                    diagnostics.Add(new Diagnostic(
+                        "CN_PAT_IS016",
+                        DiagnosticSeverity.Error,
+                        "A property subpattern must name a field or property.",
+                        new Location(context.SemanticModel.SyntaxTree, memberSyntax.Span)));
+                    return new BoundBadExpression(memberSyntax);
+            }
+        }
+
         private BoundExpression BindRelationalPattern(
             SyntaxNode wholeSyntax,
             BoundExpression operand,
@@ -919,7 +1055,7 @@ namespace Cnidaria.Cs
             TypeSymbol patternType,
             LocalSymbol? declaredLocalOpt,
             bool isDiscard,
-            TypeSyntax patternTypeSyntax,
+            TypeSyntax? patternTypeSyntax,
             SyntaxNode diagnosticNode,
             bool requirePatternCompatibility,
             BindingContext context,

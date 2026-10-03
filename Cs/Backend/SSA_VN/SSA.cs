@@ -1586,7 +1586,7 @@ namespace Cnidaria.Cs
             var trackedList = new List<SsaSlot>(tracked);
             trackedList.Sort();
 
-            bool suppressScalarSsaForEh = cfg.ExceptionRegions.Length != 0 || method.Function.ExceptionHandlers.Length != 0;
+            bool suppressScalarSsaForEh = cfg.ExceptionRegions.Length != 0 || method.ExceptionHandlers.Length != 0;
 
             for (int i = 0; i < trackedList.Count; i++)
             {
@@ -1836,7 +1836,7 @@ namespace Cnidaria.Cs
             if (node.Kind is GenTreeKind.Arg or GenTreeKind.Local or GenTreeKind.Temp)
                 return SsaSlotHelpers.TryGetDirectLoadSlot(node, out var slot) && localStorageByRefAliases.Contains(slot);
 
-            if ((node.Kind is GenTreeKind.FieldAddr or GenTreeKind.PointerElementAddr) || (node.Kind == GenTreeKind.Unary && node.SourceOp == BytecodeOp.PtrToByRef))
+            if ((node.Kind is GenTreeKind.FieldAddr or GenTreeKind.PointerElementAddr) || (node.Kind == GenTreeKind.Unary && node.Operator == GenTreeOperator.PtrToByRef))
             {
                 for (int i = 0; i < node.Operands.Length; i++)
                 {

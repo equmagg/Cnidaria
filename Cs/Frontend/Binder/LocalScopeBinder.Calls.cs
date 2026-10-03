@@ -155,7 +155,9 @@ namespace Cnidaria.Cs
                 }
             }
 
-            var operand = BindAssignableValue(argSyntax.Expression, context, diagnostics);
+            var operand = isReadOnlyPass
+                ? BindReadOnlyReference(argSyntax.Expression, context, diagnostics)
+                : BindAssignableValue(argSyntax.Expression, context, diagnostics);
             if (operand.HasErrors)
                 return operand;
             if (operand is BoundOutVarPendingExpression)
@@ -221,6 +223,28 @@ namespace Cnidaria.Cs
             return new BoundRefExpression(argSyntax, byRefType, operand);
         }
 
+        // An 'in' argument refers to a variable without writing it, so readonly fields qualify.
+        private BoundExpression BindReadOnlyReference(ExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
+        {
+            var operand = BindExpression(node, context, diagnostics);
+            if (operand.HasErrors ||
+                operand.IsLValue ||
+                operand is BoundMemberAccessExpression { Member: FieldSymbol } or BoundThisExpression ||
+                operand is BoundCallExpression { Method.ReturnType: ByRefTypeSymbol } ||
+                operand is BoundConditionalExpression { Type: ByRefTypeSymbol } ||
+                operand is BoundIndexerAccessExpression { Indexer.GetMethod.ReturnType: ByRefTypeSymbol })
+            {
+                return operand;
+            }
+
+            diagnostics.Add(new Diagnostic(
+                "CN_REF004",
+                DiagnosticSeverity.Error,
+                "An 'in' argument must be a variable.",
+                new Location(context.SemanticModel.SyntaxTree, node.Span)));
+            return new BoundBadExpression(node);
+        }
+
         private static ParameterRefKind GetArgRefKind(SyntaxToken? tok)
         {
             if (tok is null)
@@ -249,6 +273,16 @@ namespace Cnidaria.Cs
             if (argKind == ParameterRefKind.In && paramKind == ParameterRefKind.Ref && parameter.IsReadOnlyRef)
                 return true;
             return argKind == paramKind;
+        }
+        // A params parameter collects its expanded arguments into a single-dimensional array or a span.
+        private static bool TryGetParamsElementType(TypeSymbol parameterType, out TypeSymbol elementType)
+        {
+            if (parameterType is ArrayTypeSymbol { Rank: 1, IsSZArray: true } array)
+            {
+                elementType = array.ElementType;
+                return true;
+            }
+            return TryGetSpanLikeElementType(parameterType, out _, out elementType);
         }
         private static bool IsInterpolatedStringHandlerParameter(ParameterSymbol parameter)
         {
@@ -938,8 +972,7 @@ namespace Cnidaria.Cs
                 return new BoundCallExpression(inv, receiverOpt: null, method: chosen!, arguments: convertedArgs);
             }
             {
-                var methodCtx = context.ContainingSymbol as MethodSymbol;
-                var containingType = methodCtx?.ContainingSymbol as NamedTypeSymbol;
+                var containingType = GetEnclosingType(context.ContainingSymbol, out bool staticContext);
                 if (containingType is null)
                 {
                     diagnostics.Add(new Diagnostic("CN_CALL011", DiagnosticSeverity.Error,
@@ -949,8 +982,11 @@ namespace Cnidaria.Cs
                 }
 
                 var candidates = LookupMethods(containingType, name);
-                if (methodCtx != null && methodCtx.IsStatic)
+                if (staticContext)
                     candidates = candidates.Where(m => m.IsStatic).ToImmutableArray();
+                // An enclosing type's static methods are in scope; its instance methods have no receiver here
+                for (var outer = containingType.ContainingSymbol as NamedTypeSymbol; candidates.IsDefaultOrEmpty && outer is not null; outer = outer.ContainingSymbol as NamedTypeSymbol)
+                    candidates = LookupMethods(outer, name).Where(m => m.IsStatic).ToImmutableArray();
                 bool fromUsingStatic = false;
                 if (candidates.IsDefaultOrEmpty)
                 {
@@ -994,7 +1030,7 @@ namespace Cnidaria.Cs
                     return new BoundBadExpression(inv);
                 }
 
-                if (methodCtx != null && methodCtx.IsStatic && chosen is { IsStatic: false })
+                if (staticContext && chosen is { IsStatic: false })
                 {
                     diagnostics.Add(new Diagnostic("CN_CALL013", DiagnosticSeverity.Error,
                         "An object reference is required for the non-static method.",
@@ -1005,6 +1041,20 @@ namespace Cnidaria.Cs
                 // A null receiver represents implicit this for instance methods
                 return new BoundCallExpression(inv, receiverOpt: null, method: chosen!, arguments: convertedArgs);
             }
+        }
+        // Calls from a local function or lambda find the methods of the type that declares the outermost method;
+        // a static method or static local function on the way leaves no 'this'.
+        private static NamedTypeSymbol? GetEnclosingType(Symbol? symbol, out bool staticContext)
+        {
+            staticContext = false;
+            for (; symbol is not null; symbol = symbol.ContainingSymbol)
+            {
+                if (symbol is NamedTypeSymbol type)
+                    return type;
+                if (symbol is MethodSymbol { IsStatic: true })
+                    staticContext = true;
+            }
+            return null;
         }
         private BoundExpression BindMemberAccessInvocation(
             InvocationExpressionSyntax inv,
@@ -1081,6 +1131,11 @@ namespace Cnidaria.Cs
             {
                 candidates = candidates.Where(m => !m.IsStatic).ToImmutableArray();
             }
+            if (receiverValue is null && candidates.IsDefaultOrEmpty && receiverType is not null &&
+                TryBindStaticExtensionInvocation(inv, ma, name, receiverType, argSyntaxes, args, context, diagnostics) is BoundExpression staticExtension)
+            {
+                return staticExtension;
+            }
 
             bool methodFound = !candidates.IsDefaultOrEmpty;
 
@@ -1115,24 +1170,7 @@ namespace Cnidaria.Cs
                         return new BoundBadExpression(inv);
                     }
 
-                    var constructed = ImmutableArray.CreateBuilder<MethodSymbol>(arityMatches.Length);
-                    for (int i = 0; i < arityMatches.Length; i++)
-                    {
-                        var def = arityMatches[i];
-                        if (!GenericConstraintChecker.CheckMethodInstantiation(
-                            methodDefinition: def,
-                            typeArguments: explicitTypeArgs,
-                            getArgSpan: a => gName.TypeArgumentList.Arguments[a].Span,
-                            context: context,
-                            diagnostics: diagnostics))
-                        {
-                            continue;
-                        }
-
-                        constructed.Add(new ConstructedMethodSymbol(def, explicitTypeArgs, context.Compilation.TypeManager));
-                    }
-
-                    candidates = constructed.ToImmutable();
+                    candidates = ConstructWithExplicitTypeArguments(arityMatches, explicitTypeArgs, gName.TypeArgumentList, context, diagnostics);
                 }
                 else
                 {
@@ -1158,7 +1196,10 @@ namespace Cnidaria.Cs
                         selectedReceiver,
                         chosen,
                         context);
-                    return new BoundCallExpression(inv, receiverOpt: callReceiver, method: chosen!, arguments: convertedArgs);
+                    TypeSymbol? constrainedTo = receiverValue is null && receiverTypeParameter is not null && chosen.IsStatic
+                        ? receiverTypeParameter
+                        : null;
+                    return new BoundCallExpression(inv, receiverOpt: callReceiver, method: chosen!, arguments: convertedArgs, constrainedToTypeOpt: constrainedTo);
                 }
                 return new BoundBadExpression(inv);
             }
@@ -1166,30 +1207,89 @@ namespace Cnidaria.Cs
             if (receiverValue is not null)
             {
                 var extensionCandidates = LookupExtensionMethods(name, receiverValue, context);
+                if (!extensionCandidates.IsDefaultOrEmpty && ma.Name is GenericNameSyntax extensionName)
+                {
+                    var explicitTypeArgs = BindTypeArguments(extensionName.TypeArgumentList.Arguments, context, diagnostics);
+                    extensionCandidates = extensionCandidates
+                        .Select(m => ConstructInstanceExtensionCandidate(m, explicitTypeArgs, receiverValue, context))
+                        .OfType<MethodSymbol>()
+                        .ToImmutableArray();
+                }
 
                 if (!extensionCandidates.IsDefaultOrEmpty)
                 {
-                    var extArgsBuilder = ImmutableArray.CreateBuilder<BoundExpression>(args.Length + 1);
-                    extArgsBuilder.Add(receiverValue);
-                    extArgsBuilder.AddRange(args);
-                    var extArgs = extArgsBuilder.ToImmutable();
+                    // A ref or in 'this' parameter takes the receiver by reference (C# 7.2); an rvalue goes through a copy for 'in'.
+                    bool receiverIsVariable = receiverValue.IsLValue ||
+                        receiverValue is BoundMemberAccessExpression { Member: FieldSymbol } or BoundThisExpression;
+                    var byValue = extensionCandidates.Where(m => m.Parameters[0].Type is not ByRefTypeSymbol).ToImmutableArray();
+                    var byRef = extensionCandidates
+                        .Where(m => m.Parameters[0].Type is ByRefTypeSymbol && (receiverIsVariable || m.Parameters[0].IsReadOnlyRef))
+                        .ToImmutableArray();
 
-                    if (TryResolveOverload(
-                        candidates: extensionCandidates,
-                        args: extArgs,
-                        getArgExprSyntax: i => i == 0 ? ma.Expression : argSyntaxes[i - 1].Expression,
-                        getArgRefKindKeyword: i => i == 0 ? null : argSyntaxes[i - 1].RefKindKeyword,
-                        getArgName: i => i == 0 ? null : argSyntaxes[i - 1].NameColon?.Name.Identifier.ValueText,
-                        chosen: out var chosen,
-                        convertedArgs: out var convertedArgs,
-                        context: context,
-                        diagnostics: diagnostics,
-                        diagnosticNode: inv))
+                    if (!byValue.IsDefaultOrEmpty)
                     {
-                        return new BoundCallExpression(inv, receiverOpt: null, method: chosen!, arguments: convertedArgs);
+                        var valueDiagnostics = byRef.IsDefaultOrEmpty ? diagnostics : new DiagnosticBag();
+                        if (TryResolveExtensionCall(byValue, receiverValue, receiverKeyword: null, valueDiagnostics, out var call))
+                            return call;
+                        if (byRef.IsDefaultOrEmpty)
+                            return new BoundBadExpression(inv);
                     }
 
-                    return new BoundBadExpression(inv);
+                    if (!byRef.IsDefaultOrEmpty)
+                    {
+                        var refKeyword = new SyntaxToken(SyntaxKind.RefKeyword, ma.Expression.Span, "ref", null,
+                            Array.Empty<SyntaxTrivia>(), Array.Empty<SyntaxTrivia>());
+                        if (TryResolveExtensionCall(byRef, ReferenceToReceiver(), refKeyword, diagnostics, out var call))
+                            return call;
+                        return new BoundBadExpression(inv);
+                    }
+
+                    BoundExpression ReferenceToReceiver()
+                    {
+                        var byRefType = context.Compilation.CreateByRefType(receiverValue.Type);
+                        if (receiverIsVariable)
+                            return new BoundRefExpression(ma.Expression, byRefType, receiverValue);
+
+                        var copy = NewTemp("<in$>", receiverValue.Type);
+                        var store = new BoundExpressionStatement(ma.Expression, new BoundAssignmentExpression(
+                            ma.Expression, new BoundLocalExpression(ma.Expression, copy), receiverValue));
+                        return new BoundSequenceExpression(
+                            ma.Expression,
+                            locals: ImmutableArray.Create(copy),
+                            sideEffects: ImmutableArray.Create<BoundStatement>(store),
+                            value: new BoundRefExpression(ma.Expression, byRefType, new BoundLocalExpression(ma.Expression, copy)));
+                    }
+
+                    bool TryResolveExtensionCall(
+                        ImmutableArray<MethodSymbol> candidates,
+                        BoundExpression receiverArgument,
+                        SyntaxToken? receiverKeyword,
+                        DiagnosticBag resolveDiagnostics,
+                        out BoundExpression call)
+                    {
+                        var extArgsBuilder = ImmutableArray.CreateBuilder<BoundExpression>(args.Length + 1);
+                        extArgsBuilder.Add(receiverArgument);
+                        extArgsBuilder.AddRange(args);
+
+                        if (TryResolveOverload(
+                            candidates: candidates,
+                            args: extArgsBuilder.ToImmutable(),
+                            getArgExprSyntax: i => i == 0 ? ma.Expression : argSyntaxes[i - 1].Expression,
+                            getArgRefKindKeyword: i => i == 0 ? receiverKeyword : argSyntaxes[i - 1].RefKindKeyword,
+                            getArgName: i => i == 0 ? null : argSyntaxes[i - 1].NameColon?.Name.Identifier.ValueText,
+                            chosen: out var chosen,
+                            convertedArgs: out var convertedArgs,
+                            context: context,
+                            diagnostics: resolveDiagnostics,
+                            diagnosticNode: inv))
+                        {
+                            call = new BoundCallExpression(inv, receiverOpt: null, method: chosen!, arguments: convertedArgs);
+                            return true;
+                        }
+
+                        call = null!;
+                        return false;
+                    }
                 }
             }
 
@@ -1299,8 +1399,7 @@ namespace Cnidaria.Cs
                 return new BoundCallExpression(inv, receiverOpt: null, method: localChosen!, arguments: localConvertedArgs);
             }
 
-            var methodCtx = context.ContainingSymbol as MethodSymbol;
-            var containingType = methodCtx?.ContainingSymbol as NamedTypeSymbol;
+            var containingType = GetEnclosingType(context.ContainingSymbol, out bool staticContext);
             if (containingType is null)
             {
                 diagnostics.Add(new Diagnostic("CN_CALLG002", DiagnosticSeverity.Error,
@@ -1310,7 +1409,7 @@ namespace Cnidaria.Cs
             }
 
             var candidates = LookupMethods(containingType, name);
-            if (methodCtx != null && methodCtx.IsStatic)
+            if (staticContext)
                 candidates = candidates.Where(m => m.IsStatic).ToImmutableArray();
             bool fromUsingStatic = false;
             if (candidates.IsDefaultOrEmpty)
@@ -1370,7 +1469,7 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(inv);
             }
 
-            if (methodCtx != null && methodCtx.IsStatic && chosen is { IsStatic: false })
+            if (staticContext && chosen is { IsStatic: false })
             {
                 diagnostics.Add(new Diagnostic("CN_CALLG005", DiagnosticSeverity.Error,
                     "An object reference is required for the non-static method.",
@@ -1524,6 +1623,7 @@ namespace Cnidaria.Cs
             bool isPointerAccess = ma.Kind == SyntaxKind.PointerMemberAccessExpression;
             BoundExpression? receiverValue;
             NamedTypeSymbol? receiverType;
+            TypeSymbol? constrainedTo = null;
             if (!TryBindReceiverForMemberAccess(
                 ma.Expression,
                 isPointerAccess,
@@ -1546,6 +1646,11 @@ namespace Cnidaria.Cs
                 var sym = BindNamespaceOrType(ma.Expression, context, diagnostics);
                 receiverType = sym as NamedTypeSymbol;
                 receiverValue = null;
+                if (sym is TypeParameterSymbol typeParameter && FindStaticMemberConstraint(typeParameter, name) is NamedTypeSymbol constraint)
+                {
+                    receiverType = constraint;
+                    constrainedTo = typeParameter;
+                }
             }
             bool receiverMayAlsoBeIdenticalType =
                 ReceiverMayAlsoBeIdenticalTypeName(ma.Expression, receiverValue, context);
@@ -1562,6 +1667,24 @@ namespace Cnidaria.Cs
                 var objectType = context.Compilation.GetSpecialType(SpecialType.System_Object) as NamedTypeSymbol;
                 if (objectType is not null)
                     members = LookupMembers(objectType, name);
+            }
+            if (members.IsDefaultOrEmpty && receiverValue?.Type is TypeParameterSymbol receiverTypeParameter)
+            {
+                foreach (var constraint in EnumerateConstraintTypes(receiverTypeParameter))
+                {
+                    var constraintMembers = LookupMembers(constraint, name);
+                    if (!constraintMembers.IsDefaultOrEmpty)
+                    {
+                        receiverType = constraint;
+                        members = constraintMembers;
+                        break;
+                    }
+                }
+            }
+            if (members.IsDefaultOrEmpty &&
+                TryBindExtensionProperty(ma, name, receiverValue, receiverValue is null ? receiverType : null, valueKind, context, diagnostics) is BoundExpression extensionProperty)
+            {
+                return extensionProperty;
             }
             if (members.IsDefaultOrEmpty)
             {
@@ -1811,7 +1934,30 @@ namespace Cnidaria.Cs
                 receiverValue,
                 prop,
                 prop.Type,
-                isLValue: canWriteProperty || allowCtorAutoPropWrite);
+                isLValue: canWriteProperty || allowCtorAutoPropWrite,
+                constrainedToTypeOpt: constrainedTo);
+        }
+        // T.Member reaches a static abstract or virtual member of one of T's constraint interfaces.
+        private static NamedTypeSymbol? FindStaticMemberConstraint(TypeParameterSymbol typeParameter, string name)
+        {
+            var constraints = typeParameter.ConstraintTypes;
+            for (int i = 0; i < constraints.Length; i++)
+            {
+                if (constraints[i] is TypeParameterSymbol nested)
+                {
+                    if (FindStaticMemberConstraint(nested, name) is NamedTypeSymbol nestedConstraint)
+                        return nestedConstraint;
+                    continue;
+                }
+                if (constraints[i] is not NamedTypeSymbol { TypeKind: TypeKind.Interface } constraint)
+                    continue;
+                foreach (var member in LookupMembers(constraint, name))
+                {
+                    if (member is MethodSymbol { IsStatic: true } or PropertySymbol { IsStatic: true })
+                        return constraint;
+                }
+            }
+            return null;
         }
         private TypeSymbol GetFieldValueType(FieldSymbol field)
         {
@@ -1866,7 +2012,8 @@ namespace Cnidaria.Cs
 
             return b.Count == members.Length ? members : b.ToImmutable();
         }
-        private IEnumerable<NamedTypeSymbol> EnumerateExtensionContainerTypes(BindingContext context)
+        // Metadata types say whether they hold extension methods or C# 14 extension blocks, so lookups decode only those
+        private IEnumerable<NamedTypeSymbol> EnumerateExtensionContainerTypes(BindingContext context, bool blocksOnly = false)
         {
             var imports = GetImports(context);
             var seen = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
@@ -1875,7 +2022,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < imports.StaticTypes.Length; i++)
             {
                 var t = imports.StaticTypes[i];
-                if (seen.Add(t))
+                if (MayHold(t) && seen.Add(t))
                     yield return t;
             }
 
@@ -1885,7 +2032,7 @@ namespace Cnidaria.Cs
                 switch (imports.Containers[i])
                 {
                     case NamedTypeSymbol nt:
-                        if (seen.Add(nt))
+                        if (MayHold(nt) && seen.Add(nt))
                             yield return nt;
                         break;
 
@@ -1893,7 +2040,7 @@ namespace Cnidaria.Cs
                         {
                             var types = ns.GetTypeMembers();
                             for (int j = 0; j < types.Length; j++)
-                                if (seen.Add(types[j]))
+                                if (MayHold(types[j]) && seen.Add(types[j]))
                                     yield return types[j];
                             break;
                         }
@@ -1907,11 +2054,13 @@ namespace Cnidaria.Cs
                 {
                     var types = curNs.GetTypeMembers();
                     for (int j = 0; j < types.Length; j++)
-                        if (seen.Add(types[j]))
+                        if (MayHold(types[j]) && seen.Add(types[j]))
                             yield return types[j];
                     break;
                 }
             }
+
+            bool MayHold(NamedTypeSymbol type) => blocksOnly ? type.MayContainExtensionBlocks : type.MayContainExtensionMembers;
         }
         // Extension lookup preserves import scope order before overload resolution
         private ImmutableArray<MethodSymbol> LookupExtensionMethods(
@@ -1945,7 +2094,7 @@ namespace Cnidaria.Cs
                         continue;
                     }
 
-                    var firstParamType = m.Parameters[0].Type;
+                    var firstParamType = m.Parameters[0].Type is ByRefTypeSymbol byRefThis ? byRefThis.ElementType : m.Parameters[0].Type;
                     var conv = ClassifyConversion(receiver, firstParamType, context);
                     if (!conv.Exists || !conv.IsImplicit)
                         continue;
@@ -1971,9 +2120,9 @@ namespace Cnidaria.Cs
                         if (!StringComparer.Ordinal.Equals(m.Name, name))
                             continue;
 
-                        if (m is MethodSymbol ms && ms.ExplicitInterfaceImplementation is not null)
+                        if (m is MethodSymbol { IsExplicitInterfaceImplementation: true })
                             continue;
-                        if (m is PropertySymbol ps && ps.ExplicitInterfaceImplementation is not null)
+                        if (m is PropertySymbol { IsExplicitInterfaceImplementation: true })
                             continue;
 
                         b.Add(m);
@@ -1992,9 +2141,9 @@ namespace Cnidaria.Cs
                     if (!StringComparer.Ordinal.Equals(m.Name, name))
                         continue;
 
-                    if (m is MethodSymbol ms && ms.ExplicitInterfaceImplementation is not null)
+                    if (m is MethodSymbol { IsExplicitInterfaceImplementation: true })
                         continue;
-                    if (m is PropertySymbol ps && ps.ExplicitInterfaceImplementation is not null)
+                    if (m is PropertySymbol { IsExplicitInterfaceImplementation: true })
                         continue;
 
                     b.Add(m);
@@ -2141,16 +2290,17 @@ namespace Cnidaria.Cs
             {
                 foreach (var t in EnumerateInterfaceClosure(type))
                 {
+                    int inheritedStart = b.Count;
                     var members = t.GetMembers();
                     for (int i = 0; i < members.Length; i++)
                     {
                         if (members[i] is MethodSymbol ms &&
                             !ms.IsConstructor &&
-                            ms.ExplicitInterfaceImplementation is null &&
+                            !ms.IsExplicitInterfaceImplementation &&
                             StringComparer.Ordinal.Equals(ms.Name, name))
                         {
                             bool dup = false;
-                            for (int j = 0; j < b.Count; j++)
+                            for (int j = 0; j < inheritedStart; j++)
                             {
                                 if (SameSignature(b[j], ms))
                                 {
@@ -2168,18 +2318,20 @@ namespace Cnidaria.Cs
                 return b.ToImmutable();
             }
 
+            // A method hides same-signature methods of base types only; `M(T)` and `M(int)` of `C<int>` both stay.
             for (NamedTypeSymbol? t = type; t != null; t = t.BaseType as NamedTypeSymbol)
             {
+                int inheritedStart = b.Count;
                 var members = t.GetMembers();
                 for (int i = 0; i < members.Length; i++)
                 {
                     if (members[i] is MethodSymbol ms &&
                         !ms.IsConstructor &&
-                        ms.ExplicitInterfaceImplementation is null &&
+                        !ms.IsExplicitInterfaceImplementation &&
                         StringComparer.Ordinal.Equals(ms.Name, name))
                     {
                         bool dup = false;
-                        for (int j = 0; j < b.Count; j++)
+                        for (int j = 0; j < inheritedStart; j++)
                         {
                             if (SameSignature(b[j], ms))
                             {
@@ -2223,7 +2375,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < members.Length; i++)
                 {
                     if (members[i] is PropertySymbol p &&
-                        p.ExplicitInterfaceImplementation is null
+                        !p.IsExplicitInterfaceImplementation
                         && p.Parameters.Length != 0)
                         builder.Add(p);
                 }
@@ -2233,6 +2385,31 @@ namespace Cnidaria.Cs
             }
 
             return ImmutableArray<PropertySymbol>.Empty;
+        }
+        // A type parameter offers the indexers of the interfaces and class it is constrained to.
+        private static ImmutableArray<PropertySymbol> LookupConstraintIndexers(TypeParameterSymbol typeParameter)
+        {
+            var builder = ImmutableArray.CreateBuilder<PropertySymbol>();
+            foreach (var constraint in EnumerateConstraintTypes(typeParameter))
+            {
+                foreach (var member in constraint.GetMembers())
+                {
+                    if (member is PropertySymbol { Parameters.Length: > 0, ExplicitInterfaceImplementation: null } indexer)
+                        builder.Add(indexer);
+                }
+            }
+            return builder.ToImmutable();
+        }
+        // As in member access, a type parameter offers the members of the first constraint type that declares the name
+        private static ImmutableArray<Symbol> LookupConstraintMembers(TypeParameterSymbol typeParameter, string name)
+        {
+            foreach (var constraint in EnumerateConstraintTypes(typeParameter))
+            {
+                var members = LookupMembers(constraint, name);
+                if (!members.IsDefaultOrEmpty)
+                    return members;
+            }
+            return ImmutableArray<Symbol>.Empty;
         }
         private static ImmutableArray<MethodSymbol> LookupConstructors(NamedTypeSymbol type)
         {
@@ -2374,6 +2551,8 @@ namespace Cnidaria.Cs
         private BoundExpression BindObjectCreation(ObjectCreationExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
             var createdType = BindType(node.Type, context, diagnostics);
+            if (createdType is TypeParameterSymbol typeParameter)
+                return BindTypeParameterCreation(node, typeParameter, context, diagnostics);
             if (createdType is not NamedTypeSymbol nt)
             {
                 diagnostics.Add(new Diagnostic("CN_NEW001", DiagnosticSeverity.Error,
@@ -2411,6 +2590,49 @@ namespace Cnidaria.Cs
                 diagnostics: diagnostics);
             }
 
+            return BindObjectCreationInitializer(node, created, node.Initializer, context, diagnostics);
+        }
+
+        // 'new T()' is Activator.CreateInstance<T>(), which each backend expands for the exact T
+        private BoundExpression BindTypeParameterCreation(
+            ObjectCreationExpressionSyntax node,
+            TypeParameterSymbol typeParameter,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            string? error = null;
+            if (node.ArgumentList is { Arguments.Count: > 0 })
+                error = $"Cannot provide arguments when creating an instance of the variable type '{typeParameter.Name}'.";
+            else if ((typeParameter.GenericConstraint & (GenericConstraintsFlags.ConstructorConstraint | GenericConstraintsFlags.StructConstraint)) == 0)
+                error = $"Cannot create an instance of the variable type '{typeParameter.Name}' because it does not have the new() constraint.";
+
+            MethodSymbol? createInstance = null;
+            if (error is null)
+            {
+                var activator = GetWellKnownType(context.Compilation, new[] { "System" }, "Activator", 0);
+                foreach (var member in activator?.GetMembers() ?? ImmutableArray<Symbol>.Empty)
+                {
+                    if (member is MethodSymbol { Name: "CreateInstance", IsStatic: true } method &&
+                        method.TypeParameters.Length == 1 && method.Parameters.Length == 0)
+                    {
+                        createInstance = method;
+                    }
+                }
+                if (createInstance is null)
+                    error = "The core library does not define System.Activator.CreateInstance<T>().";
+            }
+
+            if (error is not null)
+            {
+                diagnostics.Add(new Diagnostic("CN_NEW004", DiagnosticSeverity.Error, error,
+                    new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                var bad = new BoundBadExpression(node);
+                bad.SetType(typeParameter);
+                return bad;
+            }
+
+            var constructed = new ConstructedMethodSymbol(createInstance!, ImmutableArray.Create<TypeSymbol>(typeParameter), context.Compilation.TypeManager);
+            BoundExpression created = new BoundCallExpression(node, receiverOpt: null, constructed, ImmutableArray<BoundExpression>.Empty);
             return BindObjectCreationInitializer(node, created, node.Initializer, context, diagnostics);
         }
 
@@ -3042,14 +3264,7 @@ namespace Cnidaria.Cs
                 return true;
 
             if (candidate is ConstructedMethodSymbol)
-            {
-                return GenericConstraintChecker.CheckMethodInstantiation(
-                    methodDefinition: candidate.OriginalDefinition,
-                    typeArguments: candidate.TypeArguments,
-                    getArgSpan: _ => diagnosticNode.Span,
-                    context: context,
-                    diagnostics: new DiagnosticBag());
-            }
+                return CheckCandidateConstraints(candidate, candidate.TypeArguments, diagnosticNode, context);
 
             var existingTypeArguments = candidate.TypeArguments;
             if (existingTypeArguments.Length == typeParameters.Length)
@@ -3079,6 +3294,10 @@ namespace Cnidaria.Cs
             var exactInferences = new bool[typeParameters.Length];
             var parameters = candidate.Parameters;
             int paramsIndex = usesParamsExpansion ? parameters.Length - 1 : -1;
+            ImmutableArray<TypeSymbol> fixedTypeArguments = default;
+            _fixedLeadingTypeArguments?.TryGetValue(candidate, out fixedTypeArguments);
+            for (int i = 0; !fixedTypeArguments.IsDefault && i < fixedTypeArguments.Length; i++)
+                inferences[i] = fixedTypeArguments[i];
             var expandedParamsArgs = paramsElementArgIndices is null
                 ? null
                 : new HashSet<int>(paramsElementArgIndices);
@@ -3097,10 +3316,8 @@ namespace Cnidaria.Cs
                 if (usesParamsExpansion && p == paramsIndex &&
                     expandedParamsArgs is not null && expandedParamsArgs.Contains(a))
                 {
-                    if (parameterType is not ArrayTypeSymbol paramsArray || paramsArray.Rank != 1 || !paramsArray.IsSZArray)
+                    if (!TryGetParamsElementType(parameterType, out parameterType))
                         return false;
-
-                    parameterType = paramsArray.ElementType;
                 }
 
                 InferMethodTypeArgumentsFromParameter(
@@ -3110,6 +3327,10 @@ namespace Cnidaria.Cs
                     inferences,
                     exactInferences);
             }
+
+            for (int i = 0; !fixedTypeArguments.IsDefault && i < fixedTypeArguments.Length; i++)
+                inferences[i] = fixedTypeArguments[i];
+            InferFromLambdaReturnTypes(args, argToParamMap, parameters, typeParameters, inferences, exactInferences, context);
 
             var typeArguments = ImmutableArray.CreateBuilder<TypeSymbol>(typeParameters.Length);
             for (int i = 0; i < typeParameters.Length; i++)
@@ -3124,15 +3345,8 @@ namespace Cnidaria.Cs
             var inferredTypeArguments = typeArguments.ToImmutable();
 
             // Constraint failures make the candidate inapplicable
-            if (!GenericConstraintChecker.CheckMethodInstantiation(
-                methodDefinition: candidate,
-                typeArguments: inferredTypeArguments,
-                getArgSpan: _ => diagnosticNode.Span,
-                context: context,
-                diagnostics: new DiagnosticBag()))
-            {
+            if (!CheckCandidateConstraints(candidate, inferredTypeArguments, diagnosticNode, context))
                 return false;
-            }
 
             constructed = new ConstructedMethodSymbol(
                 candidate,
@@ -3140,6 +3354,117 @@ namespace Cnidaria.Cs
                 context.Compilation.TypeManager);
 
             return true;
+        }
+
+        // Output type inference repeats, since a lambda's inferred return type can fix a later lambda's parameter types
+        private void InferFromLambdaReturnTypes(
+            ImmutableArray<BoundExpression> args,
+            int[] argToParamMap,
+            ImmutableArray<ParameterSymbol> parameters,
+            ImmutableArray<TypeParameterSymbol> typeParameters,
+            TypeSymbol?[] inferences,
+            bool[] exactInferences,
+            BindingContext context)
+        {
+            var done = new bool[args.Length];
+            bool progress = true;
+            while (progress)
+            {
+                progress = false;
+                for (int a = 0; a < args.Length; a++)
+                {
+                    if (done[a] || args[a] is not BoundUnboundLambdaExpression lambda)
+                        continue;
+                    int p = argToParamMap[a];
+                    if ((uint)p >= (uint)parameters.Length || !TryGetDelegateInvokeMethod(parameters[p].Type, out _, out var invoke))
+                        continue;
+
+                    var map = ImmutableDictionary.CreateBuilder<TypeParameterSymbol, TypeSymbol>();
+                    for (int i = 0; i < typeParameters.Length; i++)
+                    {
+                        if (inferences[i] is TypeSymbol inferred)
+                            map[typeParameters[i]] = inferred;
+                    }
+                    var known = map.ToImmutable();
+                    var lambdaParameterTypes = ImmutableArray.CreateBuilder<TypeSymbol>(invoke.Parameters.Length);
+                    foreach (var parameter in invoke.Parameters)
+                    {
+                        var type = TypeSubstituter.Substitute(parameter.Type, context.Compilation.TypeManager, known);
+                        if (MentionsTypeParameter(type, typeParameters))
+                            break;
+                        lambdaParameterTypes.Add(type);
+                    }
+                    if (lambdaParameterTypes.Count != invoke.Parameters.Length)
+                        continue;
+
+                    done[a] = true;
+                    if (InferLambdaReturnType(lambda, lambdaParameterTypes.ToImmutable(), context) is not TypeSymbol returnType)
+                        continue;
+                    int before = CountInferred(inferences);
+                    InferMethodTypeArgumentsFromTypes(invoke.ReturnType, returnType, typeParameters, inferences, exactInferences,
+                        exactInference: false, lambda.Syntax as ExpressionSyntax);
+                    progress |= CountInferred(inferences) != before;
+                }
+            }
+
+            static int CountInferred(TypeSymbol?[] inferences)
+            {
+                int count = 0;
+                foreach (var inference in inferences)
+                    count += inference is null ? 0 : 1;
+                return count;
+            }
+        }
+
+        private static bool MentionsTypeParameter(TypeSymbol type, ImmutableArray<TypeParameterSymbol> typeParameters)
+        {
+            switch (type)
+            {
+                case TypeParameterSymbol tp:
+                    return typeParameters.Contains(tp);
+                case ArrayTypeSymbol array:
+                    return MentionsTypeParameter(array.ElementType, typeParameters);
+                case PointerTypeSymbol pointer:
+                    return MentionsTypeParameter(pointer.PointedAtType, typeParameters);
+                case ByRefTypeSymbol byRef:
+                    return MentionsTypeParameter(byRef.ElementType, typeParameters);
+                case TupleTypeSymbol tuple:
+                    foreach (var element in tuple.ElementTypes)
+                    {
+                        if (MentionsTypeParameter(element, typeParameters))
+                            return true;
+                    }
+                    return false;
+                case NamedTypeSymbol named:
+                    foreach (var argument in named.TypeArguments)
+                    {
+                        if (!ReferenceEquals(argument, named) && MentionsTypeParameter(argument, typeParameters))
+                            return true;
+                    }
+                    return false;
+                default:
+                    return false;
+            }
+        }
+
+        private bool CheckCandidateConstraints(MethodSymbol candidate, ImmutableArray<TypeSymbol> typeArguments, SyntaxNode diagnosticNode, BindingContext context)
+        {
+            var bag = new DiagnosticBag();
+            if (GenericConstraintChecker.CheckMethodInstantiation(candidate, typeArguments, _ => diagnosticNode.Span, context, bag))
+                return true;
+
+            if (_overloadConstraintFailure is null)
+            {
+                foreach (var d in bag.ToImmutable())
+                {
+                    if (d.Severity == DiagnosticSeverity.Error)
+                    {
+                        _overloadConstraintFailure = d.Message;
+                        break;
+                    }
+                }
+            }
+            return false;
         }
 
         private static void InferMethodTypeArgumentsFromParameter(
@@ -3161,7 +3486,8 @@ namespace Cnidaria.Cs
                 typeParameters,
                 inferences,
                 exactInferences,
-                exactInference: false);
+                exactInference: false,
+                argument.Syntax as ExpressionSyntax);
         }
 
         private static void InferMethodTypeArgumentsFromTypes(
@@ -3170,11 +3496,12 @@ namespace Cnidaria.Cs
             ImmutableArray<TypeParameterSymbol> typeParameters,
             TypeSymbol?[] inferences,
             bool[] exactInferences,
-            bool exactInference)
+            bool exactInference,
+            ExpressionSyntax? syntax)
         {
             if (TryGetMethodTypeParameterOrdinal(parameterType, typeParameters, out int ordinal))
             {
-                AddMethodTypeInference(ordinal, argumentType, inferences, exactInferences, exactInference);
+                AddMethodTypeInference(ordinal, argumentType, inferences, exactInferences, exactInference, syntax);
                 return;
             }
 
@@ -3188,7 +3515,8 @@ namespace Cnidaria.Cs
                             typeParameters,
                             inferences,
                             exactInferences,
-                            exactInference: true);
+                            exactInference: true,
+                            syntax);
                     return;
 
                 case ArrayTypeSymbol parameterArray:
@@ -3201,7 +3529,8 @@ namespace Cnidaria.Cs
                             typeParameters,
                             inferences,
                             exactInferences,
-                            exactInference);
+                            exactInference || !argumentArray.ElementType.IsReferenceType,
+                            syntax);
                     return;
 
                 case PointerTypeSymbol parameterPointer:
@@ -3212,7 +3541,8 @@ namespace Cnidaria.Cs
                             typeParameters,
                             inferences,
                             exactInferences,
-                            exactInference);
+                            exactInference: true,
+                            syntax);
                     return;
 
                 case FunctionPointerTypeSymbol parameterFunctionPointer:
@@ -3227,7 +3557,8 @@ namespace Cnidaria.Cs
                             typeParameters,
                             inferences,
                             exactInferences,
-                            exactInference);
+                            exactInference,
+                            syntax);
                         for (int i = 0; i < parameterFunctionPointer.Parameters.Length; i++)
                         {
                             if (parameterFunctionPointer.Parameters[i].RefKind != argumentFunctionPointer.Parameters[i].RefKind)
@@ -3238,7 +3569,8 @@ namespace Cnidaria.Cs
                                 typeParameters,
                                 inferences,
                                 exactInferences,
-                                exactInference);
+                                exactInference,
+                                syntax);
                         }
                     }
                     return;
@@ -3255,7 +3587,8 @@ namespace Cnidaria.Cs
                                 typeParameters,
                                 inferences,
                                 exactInferences,
-                                exactInference);
+                                exactInference,
+                                syntax);
                         }
                     }
                     return;
@@ -3278,7 +3611,8 @@ namespace Cnidaria.Cs
                                 typeParameters,
                                 inferences,
                                 exactInferences,
-                                exactInference);
+                                exactInference: true,
+                                syntax);
                         }
                     }
                     return;
@@ -3311,7 +3645,8 @@ namespace Cnidaria.Cs
             TypeSymbol inferredType,
             TypeSymbol?[] inferences,
             bool[] exactInferences,
-            bool exactInference)
+            bool exactInference,
+            ExpressionSyntax? syntax)
         {
             var existing = inferences[ordinal];
             if (existing is null)
@@ -3338,8 +3673,52 @@ namespace Cnidaria.Cs
                 return;
             }
 
+            // Two lower bounds fix to the one the other converts to
+            if (!existingExact && syntax is not null && existing is not DefaultLiteralTypeSymbol)
+            {
+                if (HasImplicitTypeConversion(syntax, inferredType, existing))
+                    return;
+                if (HasImplicitTypeConversion(syntax, existing, inferredType))
+                {
+                    inferences[ordinal] = inferredType;
+                    return;
+                }
+            }
+
             inferences[ordinal] = DefaultLiteralTypeSymbol.Instance;
         }
+
+        /// <summary>Constructs each candidate whose constraints the explicit type arguments satisfy</summary>
+        private static ImmutableArray<MethodSymbol> ConstructWithExplicitTypeArguments(
+            ImmutableArray<MethodSymbol> definitions,
+            ImmutableArray<TypeSymbol> typeArguments,
+            TypeArgumentListSyntax typeArgumentList,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            var constructed = ImmutableArray.CreateBuilder<MethodSymbol>(definitions.Length);
+            DiagnosticBag? firstFailure = null;
+            foreach (var definition in definitions)
+            {
+                var bag = new DiagnosticBag();
+                if (!GenericConstraintChecker.CheckMethodInstantiation(
+                    definition, typeArguments, a => typeArgumentList.Arguments[a].Span, context, bag))
+                {
+                    firstFailure ??= bag;
+                    continue;
+                }
+
+                diagnostics.AddRange(bag);
+                constructed.Add(new ConstructedMethodSymbol(definition, typeArguments, context.Compilation.TypeManager));
+            }
+
+            // A candidate whose constraints fail drops out of overload resolution; it is the error only when none is left
+            if (constructed.Count == 0 && firstFailure is not null)
+                diagnostics.AddRange(firstFailure);
+            return constructed.ToImmutable();
+        }
+        private static bool HasImplicitTypeConversion(ExpressionSyntax syntax, TypeSymbol source, TypeSymbol target)
+            => ClassifyConversion(new BoundTypeOnlyExpression(syntax, source), target) is { Exists: true, IsImplicit: true };
 
         private static bool ContainsAnyMethodTypeParameter(
             TypeSymbol type,
@@ -3449,36 +3828,48 @@ namespace Cnidaria.Cs
             Func<int, string?>? getArgName = null,
             bool allowParamsExpansion = true)
         {
+            // Scoring binds lambda bodies, which resolve their own overloads
+            string? outerConstraintFailure = _overloadConstraintFailure;
+            _overloadConstraintFailure = null;
+            try
+            {
+                return TryResolveOverloadCore(candidates, args, getArgExprSyntax, out chosen, out convertedArgs, context, diagnostics,
+                    diagnosticNode, getArgRefKindKeyword, getArgName, allowParamsExpansion);
+            }
+            finally
+            {
+                _overloadConstraintFailure = outerConstraintFailure;
+            }
+        }
+        private bool TryResolveOverloadCore(
+            ImmutableArray<MethodSymbol> candidates,
+            ImmutableArray<BoundExpression> args,
+            Func<int, ExpressionSyntax> getArgExprSyntax,
+            out MethodSymbol? chosen,
+            out ImmutableArray<BoundExpression> convertedArgs,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            SyntaxNode diagnosticNode,
+            Func<int, SyntaxToken?>? getArgRefKindKeyword,
+            Func<int, string?>? getArgName,
+            bool allowParamsExpansion)
+        {
             chosen = null;
             convertedArgs = default;
 
             if (getArgName is not null)
             {
-                bool sawNamed = false;
                 var seenNames = new HashSet<string>(StringComparer.Ordinal);
 
                 for (int i = 0; i < args.Length; i++)
                 {
                     var n = getArgName(i);
-                    if (!string.IsNullOrEmpty(n))
-                    {
-                        sawNamed = true;
-                        if (!seenNames.Add(n!))
-                        {
-                            diagnostics.Add(new Diagnostic(
-                                "CN_NAMEDARG002",
-                                DiagnosticSeverity.Error,
-                                $"Named argument '{n}' is specified multiple times.",
-                                new Location(context.SemanticModel.SyntaxTree, getArgExprSyntax(i).Span)));
-                            return false;
-                        }
-                    }
-                    else if (sawNamed)
+                    if (!string.IsNullOrEmpty(n) && !seenNames.Add(n!))
                     {
                         diagnostics.Add(new Diagnostic(
-                            "CN_NAMEDARG001",
+                            "CN_NAMEDARG002",
                             DiagnosticSeverity.Error,
-                            "Positional arguments cannot appear after named arguments.",
+                            $"Named argument '{n}' is specified multiple times.",
                             new Location(context.SemanticModel.SyntaxTree, getArgExprSyntax(i).Span)));
                         return false;
                     }
@@ -3551,15 +3942,15 @@ namespace Cnidaria.Cs
                 }
 
                 // Expanded params form
-                if (allowParamsExpansion && ps.Length > 0 && ps[^1].IsParams && ps[^1].Type is ArrayTypeSymbol at && at.Rank == 1 && at.IsSZArray)
+                if (allowParamsExpansion && ps.Length > 0 && ps[^1].IsParams && TryGetParamsElementType(ps[^1].Type, out _))
                 {
                     int fixedCount = ps.Length - 1;
 
                     if (TryScoreParamsExpanded(m, args, fixedCount, getArgRefKindKeyword, getArgName,
                         context, out var scoredMethod, out int score, out var map, out var paramsElementArgIndices))
                     {
-                        // Penalize params expansion so non-expanded matches win ties
-                        score += 5;
+                        // Penalize params expansion so non-expanded matches win ties; a params span beats a params array.
+                        score += ps[^1].Type is ArrayTypeSymbol ? 5 : 4;
                         ConsiderCandidate(scoredMethod, usesParamsExpansion: true, score, map, paramsElementArgIndices);
                     }
                 }
@@ -3570,7 +3961,9 @@ namespace Cnidaria.Cs
                 diagnostics.Add(new Diagnostic(
                     "CN_OVL001",
                     DiagnosticSeverity.Error,
-                    "No overload matches the argument list.",
+                    _overloadConstraintFailure is null
+                        ? "No overload matches the argument list."
+                        : $"No overload matches the argument list. {_overloadConstraintFailure}",
                     new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
                 return false;
             }
@@ -3645,8 +4038,7 @@ namespace Cnidaria.Cs
                 int paramsIndex = ps.Length - 1;
 
                 var paramsParam = ps[paramsIndex];
-                var paramsArrayType = (ArrayTypeSymbol)paramsParam.Type;
-                var elementType = paramsArrayType.ElementType;
+                TryGetParamsElementType(paramsParam.Type, out var elementType);
 
                 // Map arguments to fixed parameters
                 var fixedArgIndex = new int[fixedCount];
@@ -3684,6 +4076,28 @@ namespace Cnidaria.Cs
                 var paramElems = bestParamsElementArgIndices ?? Array.Empty<int>();
                 int elemCount = paramElems.Length;
                 var int32Type = context.Compilation.GetSpecialType(SpecialType.System_Int32);
+
+                if (paramsParam.Type is not ArrayTypeSymbol paramsArrayType)
+                {
+                    var spanElements = ImmutableArray.CreateBuilder<BoundExpression>(elemCount);
+                    for (int i = 0; i < elemCount; i++)
+                    {
+                        int argIndex = paramElems[i];
+                        spanElements.Add(ApplyConversion(
+                            exprSyntax: getArgExprSyntax(argIndex),
+                            expr: args[argIndex],
+                            targetType: elementType,
+                            diagnosticNode: diagnosticNode,
+                            context: context,
+                            diagnostics: diagnostics,
+                            requireImplicit: true));
+                    }
+                    converted[paramsIndex] = new BoundSpanCollectionExpression(
+                        diagnosticNode, (NamedTypeSymbol)paramsParam.Type, elementType, spanElements.MoveToImmutable());
+                    chosen = best;
+                    convertedArgs = ImmutableArray.Create(converted);
+                    return true;
+                }
 
                 var arrLocal = NewTemp("<params$>", paramsArrayType);
                 var sideEffects = ImmutableArray.CreateBuilder<BoundStatement>(2 + elemCount);
@@ -3810,7 +4224,93 @@ namespace Cnidaria.Cs
                 if (tieBreak > 0)
                     return;
 
+                var specificity = CompareParameterSpecificity(
+                    m,
+                    usesParamsExpansion,
+                    argToParamMap,
+                    paramsElementArgIndices,
+                    currentBest,
+                    bestUsesParamsExpansion,
+                    currentBestArgToParamMap,
+                    bestParamsElementArgIndices);
+                if (specificity < 0)
+                {
+                    best = m;
+                    bestUsesParamsExpansion = usesParamsExpansion;
+                    bestArgToParamMap = argToParamMap;
+                    bestParamsElementArgIndices = paramsElementArgIndices;
+                    ambiguous = false;
+                    return;
+                }
+
+                if (specificity > 0)
+                    return;
+
                 ambiguous = true;
+            }
+
+            // C# 12.6.4.3: with equal parameter types after substitution, the candidate whose declared parameter
+            // types are more specific wins; a type parameter is less specific than any other type.
+            int CompareParameterSpecificity(
+                MethodSymbol left,
+                bool leftUsesParamsExpansion,
+                int[] leftMap,
+                int[]? leftParamsElementArgIndices,
+                MethodSymbol right,
+                bool rightUsesParamsExpansion,
+                int[] rightMap,
+                int[]? rightParamsElementArgIndices)
+            {
+                bool leftMore = false;
+                bool rightMore = false;
+                for (int a = 0; a < args.Length; a++)
+                {
+                    if (!AreSameType(
+                        GetEffectiveParameterType(left, leftUsesParamsExpansion, leftMap[a], a, leftParamsElementArgIndices),
+                        GetEffectiveParameterType(right, rightUsesParamsExpansion, rightMap[a], a, rightParamsElementArgIndices)))
+                    {
+                        return 0;
+                    }
+
+                    CompareTypeSpecificity(
+                        GetEffectiveParameterType(left.OriginalDefinition, leftUsesParamsExpansion, leftMap[a], a, leftParamsElementArgIndices),
+                        GetEffectiveParameterType(right.OriginalDefinition, rightUsesParamsExpansion, rightMap[a], a, rightParamsElementArgIndices),
+                        ref leftMore,
+                        ref rightMore);
+                }
+
+                if (leftMore == rightMore)
+                    return 0;
+
+                return leftMore ? -1 : 1;
+            }
+
+            static void CompareTypeSpecificity(TypeSymbol left, TypeSymbol right, ref bool leftMore, ref bool rightMore)
+            {
+                switch (left, right)
+                {
+                    case (TypeParameterSymbol, TypeParameterSymbol):
+                        return;
+                    case (TypeParameterSymbol, _):
+                        rightMore = true;
+                        return;
+                    case (_, TypeParameterSymbol):
+                        leftMore = true;
+                        return;
+                    case (ByRefTypeSymbol l, ByRefTypeSymbol r):
+                        CompareTypeSpecificity(l.ElementType, r.ElementType, ref leftMore, ref rightMore);
+                        return;
+                    case (PointerTypeSymbol l, PointerTypeSymbol r):
+                        CompareTypeSpecificity(l.PointedAtType, r.PointedAtType, ref leftMore, ref rightMore);
+                        return;
+                    case (ArrayTypeSymbol l, ArrayTypeSymbol r) when l.Rank == r.Rank:
+                        CompareTypeSpecificity(l.ElementType, r.ElementType, ref leftMore, ref rightMore);
+                        return;
+                    case (NamedTypeSymbol l, NamedTypeSymbol r) when l.TypeArguments.Length == r.TypeArguments.Length:
+                        for (int i = 0; i < l.TypeArguments.Length; i++)
+                            CompareTypeSpecificity(l.TypeArguments[i], r.TypeArguments[i], ref leftMore, ref rightMore);
+                        return;
+                }
             }
 
             int CompareArgumentConversions(
@@ -3873,7 +4373,7 @@ namespace Cnidaria.Cs
                 var parameterType = method.Parameters[parameterIndex].Type;
                 if (!usesParamsExpansion ||
                     parameterIndex != method.Parameters.Length - 1 ||
-                    parameterType is not ArrayTypeSymbol arrayType ||
+                    !TryGetParamsElementType(parameterType, out var paramsElementType) ||
                     paramsElementArgIndices is null)
                 {
                     return parameterType;
@@ -3882,7 +4382,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < paramsElementArgIndices.Length; i++)
                 {
                     if (paramsElementArgIndices[i] == argumentIndex)
-                        return arrayType.ElementType;
+                        return paramsElementType;
                 }
 
                 return parameterType;
@@ -4134,10 +4634,8 @@ namespace Cnidaria.Cs
                 ps = scoredMethod.Parameters;
                 int paramsIndex = ps.Length - 1;
 
-                if (ps[paramsIndex].Type is not ArrayTypeSymbol constructedParamsArray || constructedParamsArray.Rank != 1 || !constructedParamsArray.IsSZArray)
+                if (!TryGetParamsElementType(ps[paramsIndex].Type, out var elementType))
                     return false;
-
-                var elementType = constructedParamsArray.ElementType;
 
                 for (int a = 0; a < args.Length; a++)
                 {
@@ -4204,6 +4702,7 @@ namespace Cnidaria.Cs
                 }
 
                 int nextPositional = 0;
+                int lastPositional = LastPositionalArgument(argCount, getArgName);
 
                 for (int a = 0; a < argCount; a++)
                 {
@@ -4213,6 +4712,7 @@ namespace Cnidaria.Cs
                         int p = IndexOfParameter(parameters, name!);
                         if (p < 0) return false;
                         if (assigned[p]) return false;
+                        if (a < lastPositional && p != a) return false;
 
                         assigned[p] = true;
                         map[a] = p;
@@ -4273,6 +4773,7 @@ namespace Cnidaria.Cs
 
                 var elemList = new List<int>();
                 int nextPositional = 0;
+                int lastPositional = LastPositionalArgument(argCount, getArgName);
 
                 for (int a = 0; a < argCount; a++)
                 {
@@ -4281,6 +4782,7 @@ namespace Cnidaria.Cs
                     {
                         int p = IndexOfParameter(parameters, name!);
                         if (p < 0) return false;
+                        if (a < lastPositional && (p != a || p == paramsIndex)) return false;
 
                         if (p != paramsIndex)
                         {
@@ -4319,6 +4821,17 @@ namespace Cnidaria.Cs
                 return true;
             }
 
+            // A named argument that precedes a positional one must name the parameter at its own position.
+            static int LastPositionalArgument(int argCount, Func<int, string?> getArgName)
+            {
+                for (int a = argCount - 1; a >= 0; a--)
+                {
+                    if (string.IsNullOrEmpty(getArgName(a)))
+                        return a;
+                }
+                return -1;
+            }
+
             static int IndexOfParameter(ImmutableArray<ParameterSymbol> parameters, string name)
             {
                 for (int i = 0; i < parameters.Length; i++)
@@ -4338,6 +4851,9 @@ namespace Cnidaria.Cs
                 {
                     if (p.Type is not ArrayTypeSymbol at || at.Rank != 1 || !at.IsSZArray)
                     {
+                        if (TryGetSpanLikeElementType(p.Type, out _, out _))
+                            return MakeDefaultValue(diagnosticNode, p.Type);
+
                         var bad = new BoundBadExpression(diagnosticNode);
                         bad.SetType(p.Type);
                         return bad;
@@ -4361,15 +4877,47 @@ namespace Cnidaria.Cs
                     return bad;
                 }
 
+                if (TryGetCallerArgumentExpression(p, out var callerArgumentExpression))
+                    return new BoundLiteralExpression(diagnosticNode, p.Type, callerArgumentExpression);
+
                 if (p.DefaultValueOpt.Value is null && p.Type.IsValueType)
                     return MakeDefaultValue(diagnosticNode, p.Type);
 
                 return new BoundLiteralExpression(diagnosticNode, p.Type, p.DefaultValueOpt.Value);
             }
+            bool TryGetCallerArgumentExpression(ParameterSymbol p, out string text)
+            {
+                text = string.Empty;
+                if (p.Type.SpecialType != SpecialType.System_String)
+                    return false;
+
+                foreach (var attribute in p.GetAttributes())
+                {
+                    if (!IsAttributeByMetadataName(attribute, "System.Runtime.CompilerServices", "CallerArgumentExpressionAttribute") ||
+                        attribute.ConstructorArguments is not [{ Value: string parameterName }])
+                    {
+                        continue;
+                    }
+
+                    int target = IndexOfParameter(best.Parameters, parameterName);
+                    for (int a = 0; a < args.Length && target >= 0; a++)
+                    {
+                        if (chosenMap[a] == target)
+                        {
+                            var span = getArgExprSyntax(a).Span;
+                            text = context.SemanticModel.SyntaxTree.Text.Substring(span.Start, span.Length);
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                return false;
+            }
             static int ConversionScore(ConversionKind k) => k switch
             {
                 ConversionKind.Identity => 0,
                 ConversionKind.ImplicitStackAlloc => 1,
+                ConversionKind.ImplicitInlineArray => 1,
                 ConversionKind.ImplicitNumeric => 1,
                 ConversionKind.ImplicitConstant => 1,
                 ConversionKind.ImplicitReference => 1,
@@ -4402,24 +4950,28 @@ namespace Cnidaria.Cs
                 rightType: null,
                 metadataNames: names,
                 parameterCount: 1,
-                context: context);
+                context: context,
+                extensionSyntax: operatorSyntax);
 
             if (candidates.IsDefaultOrEmpty)
                 return false;
 
             var args = ImmutableArray.Create(operand);
-            if (!TryResolveOverload(
-                    candidates: candidates,
-                    args: args,
-                    getArgExprSyntax: _ => operandSyntax,
-                    chosen: out var chosen,
-                    convertedArgs: out var convertedArgs,
-                    context: context,
-                    diagnostics: diagnostics,
-                    diagnosticNode: operatorSyntax))
-            {
+            var resolveDiagnostics = new DiagnosticBag();
+            bool resolved = TryResolveOverload(
+                candidates: candidates,
+                args: args,
+                getArgExprSyntax: _ => operandSyntax,
+                chosen: out var chosen,
+                convertedArgs: out var convertedArgs,
+                context: context,
+                diagnostics: resolveDiagnostics,
+                diagnosticNode: operatorSyntax);
+            if (!resolved && NoUserDefinedOperatorApplies(resolveDiagnostics))
+                return false;
+            AddDiagnostics(diagnostics, resolveDiagnostics);
+            if (!resolved)
                 return true;
-            }
 
             if (chosen!.ReturnType.SpecialType == SpecialType.System_Void)
             {
@@ -4431,7 +4983,8 @@ namespace Cnidaria.Cs
                 return true;
             }
 
-            result = new BoundCallExpression(operatorSyntax, receiverOpt: null, chosen, convertedArgs);
+            result = new BoundCallExpression(operatorSyntax, receiverOpt: null, chosen, convertedArgs,
+                constrainedToTypeOpt: FindOperatorConstraintOwner(chosen, operand.Type));
             return true;
         }
         private bool TryBindUserDefinedBinaryOperator(
@@ -4457,24 +5010,28 @@ namespace Cnidaria.Cs
                 rightType: right.Type,
                 metadataNames: names,
                 parameterCount: 2,
-                context: context);
+                context: context,
+                extensionSyntax: operatorSyntax);
 
             if (candidates.IsDefaultOrEmpty)
                 return false;
 
             var args = ImmutableArray.Create(left, right);
-            if (!TryResolveOverload(
+            var resolveDiagnostics = new DiagnosticBag();
+            bool resolved = TryResolveOverload(
                 candidates: candidates,
                 args: args,
                 getArgExprSyntax: i => i == 0 ? leftSyntax : rightSyntax,
                 chosen: out var chosen,
                 convertedArgs: out var convertedArgs,
                 context: context,
-                diagnostics: diagnostics,
-                diagnosticNode: operatorSyntax))
-            {
+                diagnostics: resolveDiagnostics,
+                diagnosticNode: operatorSyntax);
+            if (!resolved && NoUserDefinedOperatorApplies(resolveDiagnostics))
+                return false;
+            AddDiagnostics(diagnostics, resolveDiagnostics);
+            if (!resolved)
                 return true;
-            }
 
             if (chosen!.ReturnType.SpecialType == SpecialType.System_Void)
             {
@@ -4496,8 +5053,20 @@ namespace Cnidaria.Cs
                 return true;
             }
 
-            result = new BoundCallExpression(operatorSyntax, receiverOpt: null, chosen, convertedArgs);
+            result = new BoundCallExpression(operatorSyntax, receiverOpt: null, chosen, convertedArgs,
+                constrainedToTypeOpt: FindOperatorConstraintOwner(chosen, left.Type, right.Type));
             return true;
+        }
+        // C# 12.4.5: with no applicable user-defined operator the predefined ones (string concatenation, numeric) still apply.
+        private static bool NoUserDefinedOperatorApplies(DiagnosticBag resolveDiagnostics)
+        {
+            var items = resolveDiagnostics.ToImmutable();
+            return items.Length == 1 && items[0].Id == "CN_OVL001";
+        }
+        private static void AddDiagnostics(DiagnosticBag target, DiagnosticBag source)
+        {
+            foreach (var d in source.ToImmutable())
+                target.Add(d);
         }
         private bool TryBindDirectCompoundAssignmentOperator(
             AssignmentExpressionSyntax node,
@@ -4591,7 +5160,8 @@ namespace Cnidaria.Cs
                 rightType: right.Type,
                 metadataNames: names,
                 parameterCount: 2,
-                context: context);
+                context: context,
+                extensionSyntax: node);
 
             if (candidates.IsDefaultOrEmpty)
                 return false;
@@ -4620,7 +5190,8 @@ namespace Cnidaria.Cs
                 return true;
             }
 
-            result = new BoundCallExpression(node, receiverOpt: null, chosen, convertedArgs);
+            result = new BoundCallExpression(node, receiverOpt: null, chosen, convertedArgs,
+                constrainedToTypeOpt: FindOperatorConstraintOwner(chosen, left.Type, right.Type));
             return true;
         }
         private bool TryBindDirectIncrementDecrementOperator(
@@ -4707,7 +5278,8 @@ namespace Cnidaria.Cs
                 rightType: null,
                 metadataNames: names,
                 parameterCount: 1,
-                context: context);
+                context: context,
+                extensionSyntax: operatorSyntax);
 
             if (candidates.IsDefaultOrEmpty)
                 return false;
@@ -4736,7 +5308,8 @@ namespace Cnidaria.Cs
                 return true;
             }
 
-            result = new BoundCallExpression(operatorSyntax, receiverOpt: null, chosen, convertedArgs);
+            result = new BoundCallExpression(operatorSyntax, receiverOpt: null, chosen, convertedArgs,
+                constrainedToTypeOpt: FindOperatorConstraintOwner(chosen, operand.Type));
             return true;
         }
         private ImmutableArray<MethodSymbol> LookupInstanceUserDefinedOperatorMethods(
@@ -4787,12 +5360,66 @@ namespace Cnidaria.Cs
                 return false;
             }
         }
+        // An operator found through a type parameter's constraints is a static abstract or virtual member called through that parameter.
+        internal static TypeSymbol? FindOperatorConstraintOwner(MethodSymbol method, TypeSymbol? first, TypeSymbol? second = null)
+        {
+            if (!method.IsStatic || method.ContainingSymbol is not NamedTypeSymbol { TypeKind: TypeKind.Interface } declaringInterface)
+                return null;
+            if (first is TypeParameterSymbol firstParameter && ConstraintsInclude(firstParameter, declaringInterface))
+                return firstParameter;
+            if (second is TypeParameterSymbol secondParameter && ConstraintsInclude(secondParameter, declaringInterface))
+                return secondParameter;
+            return null;
+        }
+        private static bool ConstraintsInclude(TypeParameterSymbol typeParameter, NamedTypeSymbol type)
+        {
+            foreach (var constraint in EnumerateConstraintTypes(typeParameter))
+            {
+                if (AreSameType(constraint, type))
+                    return true;
+            }
+            return false;
+        }
+        // The interfaces a type parameter is constrained to, with their base interfaces, and its class constraint with its bases.
+        private static IEnumerable<NamedTypeSymbol> EnumerateConstraintTypes(TypeParameterSymbol typeParameter)
+        {
+            var visitedParameters = new HashSet<TypeParameterSymbol>(ReferenceEqualityComparer<TypeParameterSymbol>.Instance);
+            var pending = new Stack<TypeSymbol>();
+            pending.Push(typeParameter);
+            while (pending.Count != 0)
+            {
+                var current = pending.Pop();
+                if (current is TypeParameterSymbol parameter)
+                {
+                    if (!visitedParameters.Add(parameter))
+                        continue;
+                    var constraints = parameter.ConstraintTypes;
+                    for (int i = constraints.Length - 1; i >= 0; i--)
+                        pending.Push(constraints[i]);
+                    continue;
+                }
+                if (current is not NamedTypeSymbol named)
+                    continue;
+                yield return named;
+                if (named.TypeKind == TypeKind.Interface)
+                {
+                    var interfaces = named.Interfaces;
+                    for (int i = interfaces.Length - 1; i >= 0; i--)
+                        pending.Push(interfaces[i]);
+                }
+                else if (named.BaseType is NamedTypeSymbol baseType)
+                {
+                    pending.Push(baseType);
+                }
+            }
+        }
         private ImmutableArray<MethodSymbol> LookupUserDefinedOperatorMethods(
             TypeSymbol leftType,
             TypeSymbol? rightType,
             ImmutableArray<string> metadataNames,
             int parameterCount,
-            BindingContext context)
+            BindingContext context,
+            ExpressionSyntax? extensionSyntax = null)
         {
             var types = new List<NamedTypeSymbol>();
             var seenTypes = new HashSet<NamedTypeSymbol>();
@@ -4808,7 +5435,7 @@ namespace Cnidaria.Cs
                 {
                     if (m is not MethodSymbol ms)
                         continue;
-                    if (!ms.IsStatic || ms.IsConstructor)
+                    if (!ms.IsStatic || ms.IsConstructor || ms.IsExplicitInterfaceImplementation)
                         continue;
                     if (ms.Parameters.Length != parameterCount)
                         continue;
@@ -4821,16 +5448,68 @@ namespace Cnidaria.Cs
                 }
             }
 
+            // In a checked context a checked operator hides the regular one with the same parameters.
+            for (int i = methods.Count - 1; i >= 0; i--)
+            {
+                var regular = methods[i];
+                if (regular.Name.StartsWith("op_Checked", StringComparison.Ordinal))
+                    continue;
+                string checkedName = "op_Checked" + regular.Name.Substring("op_".Length);
+                for (int j = 0; j < methods.Count; j++)
+                {
+                    if (string.Equals(methods[j].Name, checkedName, StringComparison.Ordinal) &&
+                        ReferenceEquals(methods[j].ContainingSymbol, regular.ContainingSymbol) &&
+                        SameSignature(methods[j], regular))
+                    {
+                        methods.RemoveAt(i);
+                        break;
+                    }
+                }
+            }
+
+            // Extension operators are consulted when the operand types declare no candidate (C# 14)
+            if (methods.Count == 0 && extensionSyntax is not null)
+            {
+                foreach (var name in metadataNames)
+                {
+                    foreach (var definition in EnumerateExtensionMembers(context, name, ExtensionMemberKind.Operator, isStatic: true))
+                    {
+                        if (definition.Parameters.Length != parameterCount || !AccessibilityHelper.IsAccessible(definition, context))
+                            continue;
+                        foreach (var operandType in rightType is null ? new[] { leftType } : new[] { leftType, rightType })
+                        {
+                            var blockArgs = InferExtensionBlockTypeArguments(
+                                definition, new BoundTypeOnlyExpression(extensionSyntax, operandType), isStaticAccess: true, context);
+                            if (!blockArgs.IsDefault)
+                            {
+                                methods.Add(ConstructExtensionMember(definition, blockArgs, context));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
             return methods.ToImmutable();
 
             void AddTypeAndBases(TypeSymbol type)
             {
+                if (type is TypeParameterSymbol typeParameter)
+                {
+                    foreach (var constraint in EnumerateConstraintTypes(typeParameter))
+                    {
+                        if (seenTypes.Add(constraint))
+                            types.Add(constraint);
+                    }
+                    return;
+                }
                 if (type is not NamedTypeSymbol nt)
                     return;
 
+                // Inside a generic type its definition and its self-instantiation are distinct symbols for one type.
                 for (NamedTypeSymbol? cur = nt; cur is not null; cur = cur.BaseType as NamedTypeSymbol)
                 {
-                    if (seenTypes.Add(cur))
+                    if (seenTypes.Add(cur) && !types.Exists(existing => AreSameType(existing, cur)))
                         types.Add(cur);
                 }
             }

@@ -81,6 +81,9 @@ public enum LirInstructionKind : ushort
     Call,
     VaStart,
     VaArg,
+    StackAllocate,
+    StackSave,
+    StackRestore,
     InlineAssembly,
     Jump,
     Branch,
@@ -2481,6 +2484,12 @@ internal sealed class LirFunctionBuilder
                     return EmitVaStart(block, instruction, call, functionIndex, destination);
                 case RuntimeIntrinsicKind.BuiltinVaArg:
                     return EmitVaArg(block, instruction, call, functionIndex, destination);
+                case RuntimeIntrinsicKind.StackAllocate:
+                    return EmitStackIntrinsic(LirInstructionKind.StackAllocate, block, instruction, call, functionIndex, destination);
+                case RuntimeIntrinsicKind.StackSave:
+                    return EmitStackIntrinsic(LirInstructionKind.StackSave, block, instruction, call, functionIndex, destination);
+                case RuntimeIntrinsicKind.StackRestore:
+                    return EmitStackIntrinsic(LirInstructionKind.StackRestore, block, instruction, call, functionIndex, destination);
             }
         }
 
@@ -2517,6 +2526,28 @@ internal sealed class LirFunctionBuilder
             return false;
 
         return type.Type is RVVectorType || CAbi.RequiresHiddenReturnBuffer(_target, type);
+    }
+
+    private LirOperand EmitStackIntrinsic(
+        LirInstructionKind kind,
+        LirBlock block,
+        GimpleStatementAnnotations instruction,
+        GimpleCallStatement call,
+        int functionIndex,
+        LirVirtualRegister? destination)
+    {
+        var operands = ImmutableArray.CreateBuilder<LirOperand>(call.Arguments.Length);
+        for (var i = 0; i < call.Arguments.Length; i++)
+            operands.Add(EmitCallOperand(block, instruction, functionIndex + 1 + i, call.Arguments[i]));
+
+        LirVirtualRegister? result = IsVoid(call.Type)
+            ? null
+            : destination ?? NewVirtualRegister(call.Type, sourceName: null, valueNumber: null);
+
+        Emit(block, kind, result, operands.ToImmutable(), address: null, op: string.Empty, conversionKind: null,
+            callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
+            sourceStatement: call, sourceValue: null, sourceInstruction: instruction, valueNumber: null);
+        return result is null ? LirOperand.Void : LirOperand.ForRegister(result);
     }
 
     private LirOperand EmitVaStart(
@@ -4065,6 +4096,21 @@ public sealed class LirPrinter
                 if (instruction.Result is not null)
                     line += FormatResult(instruction) + " = ";
                 line += "vaarg " + string.Join(", ", instruction.Operands.Select(FormatOperand));
+                break;
+
+            case LirInstructionKind.StackAllocate:
+            case LirInstructionKind.StackSave:
+            case LirInstructionKind.StackRestore:
+                if (instruction.Result is not null)
+                    line += FormatResult(instruction) + " = ";
+                line += instruction.Kind switch
+                {
+                    LirInstructionKind.StackAllocate => "stackalloc",
+                    LirInstructionKind.StackSave => "stacksave",
+                    _ => "stackrestore",
+                };
+                if (instruction.Operands.Length != 0)
+                    line += " " + string.Join(", ", instruction.Operands.Select(FormatOperand));
                 break;
 
             case LirInstructionKind.InlineAssembly:

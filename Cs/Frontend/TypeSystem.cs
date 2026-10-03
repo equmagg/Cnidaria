@@ -8,27 +8,67 @@ namespace Cnidaria.Cs
     public sealed class RuntimeModule : Cnidaria.Cs.IRuntimeMetadataModule
     {
         public string Name { get; }
-        public IMetadataView Md { get; }
-        public IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> MethodsByDefToken { get; }
+        public EcmaMetadata Md { get; }
 
         public Dictionary<(string ns, string name), int> TypeDefByFullName { get; } = new();
 
-        public Dictionary<(int typeDefToken, string methodName, string sigKey), int> MethodDefIndex { get; } = new();
         internal Dictionary<int, DllImportData> PInvokesByMethodToken { get; } = new();
         private readonly Dictionary<int, string> _sigKeyCache = new();
+        private readonly Dictionary<int, CilMethodBody?> _cilBodies = new();
+        private Dictionary<int, int>? _fieldRvaByRid;
         private readonly Dictionary<int, int> _enclosingByNestedRid = new();
         private readonly Dictionary<int, (string ns, string name)> _fullTypeNameCache = new();
-        public RuntimeModule(string name, IMetadataView md, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> methodsByDefToken)
+        public RuntimeModule(string name, EcmaMetadata md)
         {
             Name = name;
             Md = md ?? throw new ArgumentNullException(nameof(md));
-            MethodsByDefToken = methodsByDefToken;
 
             BuildTypeIndex();
-            BuildMethodIndex();
             BuildPInvokeIndex();
         }
 
+        internal int GetFieldRva(int fieldRid)
+        {
+            if (_fieldRvaByRid is null)
+            {
+                _fieldRvaByRid = new Dictionary<int, int>();
+                int count = Md.GetRowCount(MetadataTableKind.FieldRva);
+                for (int rid = 1; rid <= count; rid++)
+                {
+                    var row = Md.GetFieldRva(rid);
+                    _fieldRvaByRid[row.FieldRid] = row.Rva;
+                }
+            }
+            return _fieldRvaByRid.TryGetValue(fieldRid, out int rva) ? rva : 0;
+        }
+
+        // ECMA-335 II.22.8 keeps ClassLayout sorted by Parent.
+        internal bool TryGetClassLayout(int typeDefRid, out ClassLayoutRow layout)
+        {
+            int lo = 1, hi = Md.GetRowCount(MetadataTableKind.ClassLayout);
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) >>> 1;
+                layout = Md.GetClassLayout(mid);
+                if (layout.ParentTypeDefRid == typeDefRid)
+                    return true;
+                if (layout.ParentTypeDefRid < typeDefRid)
+                    lo = mid + 1;
+                else
+                    hi = mid - 1;
+            }
+            layout = default;
+            return false;
+        }
+        internal CilMethodBody? GetCilBody(int methodDefToken)
+        {
+            if (_cilBodies.TryGetValue(methodDefToken, out var body))
+                return body;
+            int rva = Md.GetMethodDef(MetadataToken.Rid(methodDefToken)).Rva;
+            body = rva == 0 ? null : CilBodyReader.Read(Md, rva);
+            _cilBodies.Add(methodDefToken, body);
+            return body;
+        }
         private string GetSigKey(int sigBlobIdx)
         {
             if (sigBlobIdx == 0) return "";
@@ -170,7 +210,7 @@ namespace Cnidaria.Cs
 
             if (tag == 1)
             {
-                var (asm, ns, name) = Domain.ResolveTypeRefFullName(this, rid); // nested aware
+                var (asm, ns, name) = MetadataTypeNames.ResolveTypeRefFullName(this, rid); // nested aware
                 sb.Append(":").Append(asm).Append(':').Append(ns).Append('.').Append(name);
                 return;
             }
@@ -223,29 +263,6 @@ namespace Cnidaria.Cs
             }
         }
 
-        void BuildMethodIndex()
-        {
-            for (int td = 0; td < Md.GetRowCount(MetadataTableKind.TypeDef); td++)
-            {
-                int typeTok = MetadataToken.Make(MetadataToken.TypeDef, td + 1);
-                int startRid = Md.GetTypeDef(td + 1).MethodList;
-                int endRid = (td + 1 < Md.GetRowCount(MetadataTableKind.TypeDef))
-                    ? Md.GetTypeDef(td + 2).MethodList
-                    : (Md.GetRowCount(MetadataTableKind.MethodDef) + 1);
-
-                for (int rid = startRid; rid < endRid; rid++)
-                {
-                    int methodTok = MetadataToken.Make(MetadataToken.MethodDef, rid);
-                    var mrow = Md.GetMethodDef(rid);
-                    var name = Md.GetString(mrow.Name);
-
-                    string sigKey = GetSigKey(mrow.Signature);
-
-                    MethodDefIndex[(typeTok, name, sigKey)] = methodTok;
-                }
-            }
-        }
-
         private void BuildPInvokeIndex()
         {
             int count = Md.GetRowCount(MetadataTableKind.PInvokeMap);
@@ -257,7 +274,12 @@ namespace Cnidaria.Cs
                 int methodRid = MetadataToken.Rid(row.MethodToken);
                 if (methodRid <= 0 || methodRid > Md.GetRowCount(MetadataTableKind.MethodDef))
                     throw new InvalidOperationException($"P/Invoke map method token is out of range: 0x{row.MethodToken:X8}.");
-                var data = PInvokeMetadataFlags.Decode(Md.GetString(row.ModuleName), Md.GetString(row.EntryPointName), row.Flags);
+                var method = Md.GetMethodDef(methodRid);
+                var data = PInvokeMetadataFlags.Decode(
+                    Md.GetString(Md.GetModuleRef(row.ImportScope).Name),
+                    Md.GetString(row.ImportName),
+                    row.MappingFlags,
+                    (method.ImplFlags & MetadataFlagBits.PreserveSig) != 0);
                 if (!PInvokesByMethodToken.TryAdd(row.MethodToken, data))
                     throw new InvalidOperationException($"Duplicate P/Invoke map for method token 0x{row.MethodToken:X8}.");
             }
@@ -305,347 +327,9 @@ namespace Cnidaria.Cs
             throw new InvalidOperationException("Bad compressed uint.");
         }
     }
-    public sealed class Domain
+    // Assembly-qualified names of metadata type references, as the runtime type system keys its types.
+    internal static class MetadataTypeNames
     {
-        private readonly Dictionary<string, RuntimeModule> _modulesByName = new(StringComparer.Ordinal);
-
-        public void Add(RuntimeModule m) => _modulesByName[m.Name] = m;
-
-        public (RuntimeModule? module, Cnidaria.Cs.BytecodeFunction fn) ResolveCall(RuntimeModule caller, int methodToken)
-        {
-            int table = MetadataToken.Table(methodToken);
-            int rid = MetadataToken.Rid(methodToken);
-
-            if (table == MetadataToken.MethodSpec)
-            {
-                var ms = caller.Md.GetMethodSpec(rid);
-                return ResolveCall(caller, ms.Method);
-            }
-            if (table == MetadataToken.MethodDef)
-            {
-                if (!caller.MethodsByDefToken.TryGetValue(methodToken, out var fn))
-                    throw new MissingMethodException($"No body for MethodDef 0x{methodToken:X8} in {caller.Name}");
-                return (default, fn);
-            }
-
-            if (table != MetadataToken.MemberRef)
-                throw new NotSupportedException($"Call token table not supported: 0x{methodToken:X8}");
-
-            var mr = caller.Md.GetMemberRef(rid);
-            var methodName = caller.Md.GetString(mr.Name);
-
-            string sigKey = caller.GetSignatureKeyFromThisModule(mr.Signature);
-
-            var (asmName, ns, typeName) = ResolveMemberRefClass(caller, mr.ClassToken);
-
-            if (!_modulesByName.TryGetValue(asmName, out var targetModule))
-                throw new TypeLoadException($"Assembly '{asmName}' not loaded");
-
-            if (!targetModule.TypeDefByFullName.TryGetValue((ns, typeName), out var typeDefTok))
-                throw new TypeLoadException($"Type '{ns}.{typeName}' not found in '{asmName}'");
-
-            if (!targetModule.MethodDefIndex.TryGetValue((typeDefTok, methodName, sigKey), out var methodDefTok))
-            {
-                if (!TryResolveMethodDefByCompatibleSignature(
-                    memberRefModule: caller,
-                    targetModule: targetModule,
-                    ownerTypeDefToken: typeDefTok,
-                    methodName: methodName,
-                    memberRefSigBlob: mr.Signature,
-                    methodDefToken: out methodDefTok))
-                {
-                    throw new MissingMethodException(
-                        $"{ns}.{typeName}.{methodName} (sigKey={sigKey}) not found in '{asmName}'");
-                }
-                targetModule.MethodDefIndex[(typeDefTok, methodName, sigKey)] = methodDefTok;
-            }
-
-            if (!targetModule.MethodsByDefToken.TryGetValue(methodDefTok, out var fn2))
-                throw new MissingMethodException($"No body for resolved MethodDef 0x{methodDefTok:X8} in '{asmName}'");
-
-            return (targetModule, fn2);
-        }
-        private static bool TryResolveMethodDefByCompatibleSignature(
-            RuntimeModule memberRefModule,
-            RuntimeModule targetModule,
-            int ownerTypeDefToken,
-            string methodName,
-            int memberRefSigBlob,
-            out int methodDefToken)
-        {
-            methodDefToken = 0;
-            if (MetadataToken.Table(ownerTypeDefToken) != MetadataToken.TypeDef)
-                return false;
-
-            int ownerRid = MetadataToken.Rid(ownerTypeDefToken);
-            var md = targetModule.Md;
-
-            int startRid = md.GetTypeDef(ownerRid).MethodList;
-            int endRid = (ownerRid < md.GetRowCount(MetadataTableKind.TypeDef))
-                ? md.GetTypeDef(ownerRid + 1).MethodList
-                : (md.GetRowCount(MetadataTableKind.MethodDef) + 1);
-
-            for (int rid = startRid; rid < endRid; rid++)
-            {
-                var row = md.GetMethodDef(rid);
-                if (!StringComparer.Ordinal.Equals(md.GetString(row.Name), methodName))
-                    continue;
-
-                if (IsSignatureCompatible(targetModule, row.Signature, memberRefModule, memberRefSigBlob))
-                {
-                    methodDefToken = MetadataToken.Make(MetadataToken.MethodDef, rid);
-                    return true;
-                }
-            }
-
-            return false;
-        }
-        private static bool IsSignatureCompatible(
-            RuntimeModule defModule,
-            int defSigBlob,
-            RuntimeModule memberRefModule,
-            int memberRefSigBlob)
-        {
-            var defSig = defModule.Md.GetBlob(defSigBlob);
-            var mrSig = memberRefModule.Md.GetBlob(memberRefSigBlob);
-
-            var d = new SigReader(defSig);
-            var m = new SigReader(mrSig);
-
-            byte dCc = d.ReadByte();
-            byte mCc = m.ReadByte();
-            if (dCc != mCc)
-                return false;
-
-            if (((dCc | mCc) & 0x10) != 0)
-            {
-                if ((dCc & 0x10) == 0 || (mCc & 0x10) == 0)
-                    return false;
-                if (d.ReadCompressedUInt() != m.ReadCompressedUInt())
-                    return false;
-            }
-
-            uint dPc = d.ReadCompressedUInt();
-            uint mPc = m.ReadCompressedUInt();
-            if (dPc != mPc)
-                return false;
-
-            if (!MatchType(defModule, ref d, memberRefModule, ref m))
-                return false;
-
-            for (int i = 0; i < dPc; i++)
-            {
-                if (!MatchType(defModule, ref d, memberRefModule, ref m))
-                    return false;
-            }
-
-            return true;
-        }
-        private static bool MatchType(
-            RuntimeModule defModule,
-            ref SigReader def,
-            RuntimeModule memberRefModule,
-            ref SigReader mr)
-        {
-            var dEt = (SigElementType)def.ReadByte();
-            var mEt = (SigElementType)mr.ReadByte();
-
-            if (dEt == SigElementType.VAR || dEt == SigElementType.MVAR)
-            {
-                _ = def.ReadCompressedUInt();
-                SkipType(mEt, ref mr);
-                return true;
-            }
-
-            if ((dEt == SigElementType.CLASS || dEt == SigElementType.VALUETYPE) &&
-                mEt == SigElementType.GENERICINST)
-            {
-                var mKind = (SigElementType)mr.ReadByte();
-                if (mKind != dEt)
-                    return false;
-
-                int dTok = DecodeTypeDefOrRefEncodedToToken((int)def.ReadCompressedUInt());
-                int mOwnerTok = DecodeTypeDefOrRefEncodedToToken((int)mr.ReadCompressedUInt());
-
-                var dName = ResolveTypeTokenFullName(defModule, dTok);
-                var mOwner = ResolveTypeTokenFullName(memberRefModule, mOwnerTok);
-                if (dName != mOwner)
-                    return false;
-
-                uint mArgc = mr.ReadCompressedUInt();
-                for (int i = 0; i < mArgc; i++)
-                    SkipType((SigElementType)mr.ReadByte(), ref mr);
-
-                return true;
-            }
-
-            if (dEt != mEt)
-                return false;
-
-            switch (dEt)
-
-            {
-                case SigElementType.CLASS:
-                case SigElementType.VALUETYPE:
-                    {
-                        int dTok = DecodeTypeDefOrRefEncodedToToken((int)def.ReadCompressedUInt());
-                        int mTok = DecodeTypeDefOrRefEncodedToToken((int)mr.ReadCompressedUInt());
-                        var dName = ResolveTypeTokenFullName(defModule, dTok);
-                        var mName = ResolveTypeTokenFullName(memberRefModule, mTok);
-                        return dName == mName;
-                    }
-
-                case SigElementType.SZARRAY:
-                case SigElementType.PTR:
-                case SigElementType.BYREF:
-                    return MatchType(defModule, ref def, memberRefModule, ref mr);
-
-                case SigElementType.CMOD_REQD:
-                case SigElementType.CMOD_OPT:
-                    {
-                        int dModifierToken = DecodeTypeDefOrRefEncodedToToken((int)def.ReadCompressedUInt());
-                        int mModifierToken = DecodeTypeDefOrRefEncodedToToken((int)mr.ReadCompressedUInt());
-                        if (ResolveTypeTokenFullName(defModule, dModifierToken) !=
-                            ResolveTypeTokenFullName(memberRefModule, mModifierToken))
-                        {
-                            return false;
-                        }
-                        return MatchType(defModule, ref def, memberRefModule, ref mr);
-                    }
-
-                case SigElementType.ARRAY:
-                    {
-                        if (!MatchType(defModule, ref def, memberRefModule, ref mr))
-                            return false;
-
-                        uint dRank = def.ReadCompressedUInt();
-                        uint mRank = mr.ReadCompressedUInt();
-                        if (dRank != mRank)
-                            return false;
-
-                        uint dNsizes = def.ReadCompressedUInt();
-                        uint mNsizes = mr.ReadCompressedUInt();
-                        if (dNsizes != mNsizes)
-                            return false;
-                        for (int i = 0; i < dNsizes; i++)
-                            if (def.ReadCompressedUInt() != mr.ReadCompressedUInt())
-                                return false;
-
-                        uint dNlb = def.ReadCompressedUInt();
-                        uint mNlb = mr.ReadCompressedUInt();
-                        if (dNlb != mNlb)
-                            return false;
-                        for (int i = 0; i < dNlb; i++)
-                            if (def.ReadCompressedUInt() != mr.ReadCompressedUInt())
-                                return false;
-
-                        return true;
-                    }
-
-                case SigElementType.GENERICINST:
-                    {
-                        var dKind = (SigElementType)def.ReadByte();
-                        var mKind = (SigElementType)mr.ReadByte();
-                        if (dKind != mKind)
-                            return false;
-
-                        int dOwnerTok = DecodeTypeDefOrRefEncodedToToken((int)def.ReadCompressedUInt());
-                        int mOwnerTok = DecodeTypeDefOrRefEncodedToToken((int)mr.ReadCompressedUInt());
-                        var dOwner = ResolveTypeTokenFullName(defModule, dOwnerTok);
-                        var mOwner = ResolveTypeTokenFullName(memberRefModule, mOwnerTok);
-                        if (dOwner != mOwner)
-                            return false;
-
-                        uint dArgc = def.ReadCompressedUInt();
-                        uint mArgc = mr.ReadCompressedUInt();
-                        if (dArgc != mArgc)
-                            return false;
-
-                        for (int i = 0; i < dArgc; i++)
-                            if (!MatchType(defModule, ref def, memberRefModule, ref mr))
-                                return false;
-
-                        return true;
-                    }
-
-                case SigElementType.FNPTR:
-                    {
-                        if (def.ReadByte() != mr.ReadByte())
-                            return false;
-
-                        uint dParameterCount = def.ReadCompressedUInt();
-                        uint mParameterCount = mr.ReadCompressedUInt();
-                        if (dParameterCount != mParameterCount)
-                            return false;
-
-                        if (!MatchType(defModule, ref def, memberRefModule, ref mr))
-                            return false;
-
-                        for (int i = 0; i < dParameterCount; i++)
-                            if (!MatchType(defModule, ref def, memberRefModule, ref mr))
-                                return false;
-
-                        return true;
-                    }
-            }
-
-            return true;
-        }
-        private static void SkipType(SigElementType et, ref SigReader r)
-        {
-            switch (et)
-            {
-                case SigElementType.CLASS:
-                case SigElementType.VALUETYPE:
-                    _ = r.ReadCompressedUInt();
-                    return;
-
-                case SigElementType.SZARRAY:
-                case SigElementType.PTR:
-                case SigElementType.BYREF:
-                    SkipType((SigElementType)r.ReadByte(), ref r);
-                    return;
-
-                case SigElementType.CMOD_REQD:
-                case SigElementType.CMOD_OPT:
-                    _ = r.ReadCompressedUInt();
-                    SkipType((SigElementType)r.ReadByte(), ref r);
-                    return;
-
-                case SigElementType.ARRAY:
-                    SkipType((SigElementType)r.ReadByte(), ref r);
-                    _ = r.ReadCompressedUInt();
-                    uint nsizes = r.ReadCompressedUInt();
-                    for (int i = 0; i < nsizes; i++) _ = r.ReadCompressedUInt();
-                    uint nlb = r.ReadCompressedUInt();
-                    for (int i = 0; i < nlb; i++) _ = r.ReadCompressedUInt();
-                    return;
-
-                case SigElementType.GENERICINST:
-                    _ = r.ReadByte();
-                    _ = r.ReadCompressedUInt();
-                    uint argc = r.ReadCompressedUInt();
-                    for (int i = 0; i < argc; i++)
-                        SkipType((SigElementType)r.ReadByte(), ref r);
-                    return;
-
-                case SigElementType.FNPTR:
-                    _ = r.ReadByte();
-                    uint parameterCount = r.ReadCompressedUInt();
-                    SkipType((SigElementType)r.ReadByte(), ref r);
-                    for (int i = 0; i < parameterCount; i++)
-                        SkipType((SigElementType)r.ReadByte(), ref r);
-                    return;
-
-                case SigElementType.VAR:
-                case SigElementType.MVAR:
-                    _ = r.ReadCompressedUInt();
-                    return;
-
-                default:
-                    return;
-            }
-        }
         public static (string asm, string ns, string name) ResolveTypeRefFullName(RuntimeModule caller, int typeRefRid)
         {
             var tr = caller.Md.GetTypeRef(typeRefRid);
@@ -703,32 +387,6 @@ namespace Cnidaria.Cs
             }
 
             return (ns, name);
-        }
-        static (string asm, string ns, string name) ResolveMemberRefClass(RuntimeModule caller, int classToken)
-        {
-            int table = MetadataToken.Table(classToken);
-            int rid = MetadataToken.Rid(classToken);
-
-            if (table == MetadataToken.TypeRef)
-            {
-                return ResolveTypeRefFullName(caller, rid);
-            }
-
-            if (table == MetadataToken.TypeDef)
-            {
-                var (ns, name) = GetTypeDefFullNameByRid(caller, rid);
-                return (caller.Name, ns, name);
-            }
-
-            if (table == MetadataToken.TypeSpec)
-            {
-                var ts = caller.Md.GetTypeSpec(rid);
-                var sig = caller.Md.GetBlob(ts.Signature);
-                var sr = new SigReader(sig);
-                return ResolveTypeSpecOwner(caller, ref sr);
-            }
-
-            throw new NotSupportedException($"MemberRef.Class token not supported: 0x{classToken:X8}");
         }
         private static (string asm, string ns, string name) ResolveTypeSpecOwner(RuntimeModule caller, ref SigReader sr)
         {
@@ -940,6 +598,8 @@ namespace Cnidaria.Cs
 
         private readonly Dictionary<int, RuntimeType> _typeById = new();
         private readonly Dictionary<int, RuntimeMethod> _methodById = new();
+        private readonly Dictionary<int, (RuntimeModule Module, int Rid)> _typeDefOrigins = new();
+        private readonly Dictionary<int, List<int>> _methodImplRowsByTypeId = new();
 
         private int _nextTypeId = 1;
         private int _nextFieldId = 1;
@@ -967,11 +627,10 @@ namespace Cnidaria.Cs
             IndexWellKnownCoreTypes();
             BindBaseTypes();
             BindInterfaces();
-            BuildAllMembers();
-            BindMethodImpls();
+            BuildAllFields();
+            IndexMethodImpls();
             foreach (var t in _typeCache.Values)
                 EnsureLayout(t);
-            BuildAllVTables();
         }
         public RuntimeMethod ResolveMethod(RuntimeModule module, int methodToken)
         {
@@ -982,7 +641,10 @@ namespace Cnidaria.Cs
             int rid = MetadataToken.Rid(methodToken);
 
             if (table == MetadataToken.MethodDef)
+            {
+                LoadMethodDefOwner(module, rid);
                 return _methodCache[(module.Name, methodToken)];
+            }
 
             if (table == MetadataToken.MethodSpec)
             {
@@ -1017,6 +679,27 @@ namespace Cnidaria.Cs
             var ps = new RuntimeType[paramCount];
             for (int i = 0; i < ps.Length; i++)
                 ps[i] = ReadTypeSig(module, ref sr);
+
+            // The signature is the definition's, so `M(!0)` and `M(int)` of `C<int>` are told apart before substitution.
+            if (owner.GenericTypeDefinition is RuntimeType ownerDefinition)
+            {
+                for (int i = 0; i < ownerDefinition.Methods.Length; i++)
+                {
+                    var definition = ownerDefinition.Methods[i];
+                    if (!StringComparer.Ordinal.Equals(definition.Name, methodName) ||
+                        definition.HasThis != hasThis ||
+                        definition.GenericArity != genericArity ||
+                        !ReferenceEquals(definition.ReturnType, ret) ||
+                        !SameTypes(definition.ParameterTypes, ps))
+                    {
+                        continue;
+                    }
+
+                    var constructed = owner.Methods[i];
+                    _methodCache[(module.Name, methodToken)] = constructed;
+                    return constructed;
+                }
+            }
 
             var ownerTypeArgs = owner.GenericTypeArguments ?? Array.Empty<RuntimeType>();
             if (ownerTypeArgs.Length != 0)
@@ -1084,6 +767,18 @@ namespace Cnidaria.Cs
             }
 
             throw new MissingMethodException($"{owner.Namespace}.{owner.Name}.{methodName} not found (memberref in {module.Name})");
+
+            static bool SameTypes(RuntimeType[] a, RuntimeType[] b)
+            {
+                if (a.Length != b.Length)
+                    return false;
+                for (int i = 0; i < a.Length; i++)
+                {
+                    if (!ReferenceEquals(a[i], b[i]))
+                        return false;
+                }
+                return true;
+            }
 
             static bool CompatibleType(RuntimeType def, RuntimeType actual)
             {
@@ -1612,7 +1307,7 @@ namespace Cnidaria.Cs
                 implFlags: genericMethod.ImplFlags);
 
             m.BodyModule = genericMethod.BodyModule;
-            m.Body = genericMethod.Body;
+            m.MethodDefToken = genericMethod.MethodDefToken;
             m.DllImportData = genericMethod.DllImportData;
             m.GenericMethodDefinition = genericMethod;
             m.GenericArity = genericMethod.GenericArity;
@@ -1760,9 +1455,11 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < m.Md.GetRowCount(MetadataTableKind.TypeDef); i++)
                 {
                     int rid = i + 1;
+                    if (m.Md.IsModuleTypeDef(rid))
+                        continue;
                     int tok = MetadataToken.Make(MetadataToken.TypeDef, rid);
 
-                    var (ns, name) = Domain.GetTypeDefFullNameByRid(m, rid);
+                    var (ns, name) = MetadataTypeNames.GetTypeDefFullNameByRid(m, rid);
                     var td = m.Md.GetTypeDef(i + 1);
 
                     RuntimeTypeKind kind = InferKindFromTypeDef(m, td);
@@ -1773,8 +1470,11 @@ namespace Cnidaria.Cs
                         IsBeforeFieldInit = (typeAttributes & System.Reflection.TypeAttributes.BeforeFieldInit) != 0,
                         IsFinal = kind is RuntimeTypeKind.Struct or RuntimeTypeKind.Enum ||
                             (typeAttributes & System.Reflection.TypeAttributes.Sealed) != 0,
-                        IsByRefLike = (td.Flags & MetadataFlagBits.TypeByRefLike) != 0
+                        IsByRefLike = HasCustomAttribute(m, tok, "System.Runtime.CompilerServices", "IsByRefLikeAttribute")
                     };
+                    rt.Loader = this;
+                    rt.MethodsPending = true;
+                    _typeDefOrigins[rt.TypeId] = (m, rid);
                     _typeCache[(m.Name, tok)] = rt;
                     _namedTypes[(m.Name, ns, name)] = rt;
                     _typeById[rt.TypeId] = rt;
@@ -1795,13 +1495,11 @@ namespace Cnidaria.Cs
         // to carry a computed layout once importing is done.
         internal void EnsureAllTypesReady()
         {
-            int previousCount = -1;
-            while (_typeById.Count != previousCount)
+            // Type ids grow with interning, so one pass in id order also reaches the types a layout interns
+            for (int id = 1; id < _nextTypeId; id++)
             {
-                previousCount = _typeById.Count;
-                var snapshot = new List<RuntimeType>(_typeById.Values);
-                for (int i = 0; i < snapshot.Count; i++)
-                    EnsureLayout(snapshot[i]);
+                if (_typeById.TryGetValue(id, out RuntimeType? type))
+                    EnsureLayout(type);
             }
         }
         private void EnsureLayout(RuntimeType? t)
@@ -1901,6 +1599,8 @@ namespace Cnidaria.Cs
                         {
                             var f = t.InstanceFields[i];
                             var (fs, fa) = GetStorageSizeAlign(f.FieldType);
+                            if (t.PackingSize != 0)
+                                fa = Math.Min(fa, t.PackingSize);
                             int repeat = (t.InlineArrayLength > 0 && ReferenceEquals(f, t.InlineArrayElementField))
                                 ? t.InlineArrayLength
                                 : 1;
@@ -1915,7 +1615,7 @@ namespace Cnidaria.Cs
                             if (fa > maxAlign) maxAlign = fa;
                         }
 
-                        int size = AlignUp(offset, maxAlign);
+                        int size = Math.Max(AlignUp(offset, maxAlign), t.ClassSize);
                         if (size == 0) size = 1;
                         t.SizeOf = size;
                         t.AlignOf = maxAlign;
@@ -2141,6 +1841,7 @@ namespace Cnidaria.Cs
                 return null;
             }
 
+            objectType = objectType.ArrayOfT ?? objectType;
             EnsureConstructedMembers(objectType);
             EnsureVirtualTable(objectType);
 
@@ -2410,6 +2111,11 @@ namespace Cnidaria.Cs
             return matchedImplementation;
         }
 
+        private static bool SameMethodDefinition(RuntimeMethod a, RuntimeMethod b)
+            => a.MethodDefToken != 0 &&
+               a.MethodDefToken == b.MethodDefToken &&
+               ReferenceEquals(a.BodyModule, b.BodyModule);
+
         private RuntimeMethod ProjectRuntimeMethodToOwner(RuntimeType owner, RuntimeMethod method)
         {
             RuntimeMethod methodDefinition = method.GenericMethodDefinition ?? method;
@@ -2432,10 +2138,7 @@ namespace Cnidaria.Cs
                 {
                     RuntimeMethod sourceMethod = sourceMethods[i];
                     if (sourceMethod.MethodId == methodDefinition.MethodId ||
-                        (sourceMethod.Body is not null &&
-                         methodDefinition.Body is not null &&
-                         ReferenceEquals(sourceMethod.Body, methodDefinition.Body) &&
-                         StringComparer.Ordinal.Equals(sourceMethod.Name, methodDefinition.Name)))
+                        SameMethodDefinition(sourceMethod, methodDefinition))
                     {
                         return ownerMethods[i];
                     }
@@ -2453,12 +2156,8 @@ namespace Cnidaria.Cs
                     continue;
                 }
 
-                if (candidate.Body is not null &&
-                    methodDefinition.Body is not null &&
-                    ReferenceEquals(candidate.Body, methodDefinition.Body))
-                {
+                if (SameMethodDefinition(candidate, methodDefinition))
                     return candidate;
-                }
 
                 if (SameRuntimeSignature(candidate, methodDefinition))
                     return candidate;
@@ -2817,10 +2516,8 @@ namespace Cnidaria.Cs
             RuntimeType owner = ResolveMemberRefOwnerType(contextModule, mr.ClassToken);
 
             if (ownerTypeArgs.Length != 0 || methodTypeArgs.Length != 0)
-            {
                 owner = SubstituteRuntimeType(owner, ownerTypeArgs, methodTypeArgs);
-                fieldType = SubstituteRuntimeType(fieldType, ownerTypeArgs, methodTypeArgs);
-            }
+            fieldType = SubstituteMemberRefFieldType(owner, fieldType);
 
             EnsureConstructedMembers(owner);
             EnsureLayout(owner);
@@ -2877,6 +2574,7 @@ namespace Cnidaria.Cs
             RuntimeType fieldType = ReadTypeSig(contextModule, ref sr);
 
             RuntimeType owner = ResolveMemberRefOwnerType(contextModule, mr.ClassToken);
+            fieldType = SubstituteMemberRefFieldType(owner, fieldType);
 
             EnsureConstructedMembers(owner);
             EnsureLayout(owner);
@@ -2899,6 +2597,12 @@ namespace Cnidaria.Cs
             throw new MissingFieldException($"{owner.Namespace}.{owner.Name}.{fieldName} not found.");
         }
 
+        // A MemberRef field signature is the definition's, so VAR refers to the owner's own type arguments.
+        private RuntimeType SubstituteMemberRefFieldType(RuntimeType owner, RuntimeType fieldType)
+        {
+            var ownerTypeArgs = owner.GenericTypeArguments ?? Array.Empty<RuntimeType>();
+            return ownerTypeArgs.Length == 0 ? fieldType : SubstituteRuntimeType(fieldType, ownerTypeArgs);
+        }
         private RuntimeType ResolveMemberRefOwnerType(RuntimeModule caller, int classToken)
         {
             int table = MetadataToken.Table(classToken);
@@ -2909,11 +2613,11 @@ namespace Cnidaria.Cs
             string asm, ns, name;
             if (table == MetadataToken.TypeRef)
             {
-                (asm, ns, name) = Domain.ResolveTypeRefFullName(caller, rid);
+                (asm, ns, name) = MetadataTypeNames.ResolveTypeRefFullName(caller, rid);
             }
             else if (table == MetadataToken.TypeDef)
             {
-                var full = Domain.GetTypeDefFullNameByRid(caller, rid);
+                var full = MetadataTypeNames.GetTypeDefFullNameByRid(caller, rid);
                 asm = caller.Name;
                 ns = full.ns;
                 name = full.name;
@@ -2955,6 +2659,8 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < m.Md.GetRowCount(MetadataTableKind.TypeDef); i++)
                 {
                     int rid = i + 1;
+                    if (m.Md.IsModuleTypeDef(rid))
+                        continue;
                     int tok = MetadataToken.Make(MetadataToken.TypeDef, rid);
                     var rt = _typeCache[(m.Name, tok)];
 
@@ -3013,7 +2719,7 @@ namespace Cnidaria.Cs
                     _typeById[pair.Key].Interfaces = pair.Value.ToArray();
             }
         }
-        private void BindMethodImpls()
+        private void IndexMethodImpls()
         {
             foreach (var kv in _modules)
             {
@@ -3021,42 +2727,54 @@ namespace Cnidaria.Cs
                 int count = m.Md.GetRowCount(MetadataTableKind.MethodImpl);
                 for (int rid = 1; rid <= count; rid++)
                 {
-                    var row = m.Md.GetMethodImpl(rid);
-                    int classTok = MetadataToken.Make(MetadataToken.TypeDef, row.ClassTypeDefRid);
+                    int classTok = MetadataToken.Make(MetadataToken.TypeDef, m.Md.GetMethodImpl(rid).ClassTypeDefRid);
                     if (!_typeCache.TryGetValue((m.Name, classTok), out var owner))
                         continue;
-
-                    var body = ResolveMethod(m, row.BodyMethodToken);
-                    var decl = ResolveMethod(m, row.DeclarationMethodToken);
-
-                    owner.MethodImpls ??= new Dictionary<int, RuntimeMethod>();
-                    owner.MethodImpls[decl.MethodId] = body;
-                    ProjectMethodImplToExistingConstructedTypes(owner, decl.MethodId, body);
+                    if (!_methodImplRowsByTypeId.TryGetValue(owner.TypeId, out var rows))
+                        _methodImplRowsByTypeId[owner.TypeId] = rows = new List<int>();
+                    rows.Add(rid);
                 }
             }
         }
 
-        private void ProjectMethodImplToExistingConstructedTypes(
-            RuntimeType genericDefinition,
-            int declarationMethodId,
-            RuntimeMethod body)
+        // A compilation reaches a small part of the libraries, so a type decodes its methods and MethodImpls on first use
+        internal void LoadMethods(RuntimeType type)
         {
-            RuntimeType[] constructedTypes = _constructedTypes.Values.ToArray();
-            for (int i = 0; i < constructedTypes.Length; i++)
+            if (_typeDefOrigins.Remove(type.TypeId, out var origin))
             {
-                RuntimeType constructedType = constructedTypes[i];
-                if (!ReferenceEquals(constructedType.GenericTypeDefinition, genericDefinition) ||
-                    !constructedType.ConstructedMembersInitialized)
+                type.MethodsPending = false;
+                BuildMethodsForType(origin.Module, type, origin.Rid - 1, origin.Module.Md.GetTypeDef(origin.Rid));
+                if (_methodImplRowsByTypeId.Remove(type.TypeId, out var rows))
                 {
-                    continue;
+                    var methodImpls = new Dictionary<int, RuntimeMethod>(rows.Count);
+                    foreach (int rid in rows)
+                    {
+                        var row = origin.Module.Md.GetMethodImpl(rid);
+                        var body = ResolveMethod(origin.Module, row.BodyMethodToken);
+                        var decl = ResolveMethod(origin.Module, row.DeclarationMethodToken);
+                        methodImpls[decl.MethodId] = body;
+                    }
+                    type.MethodImpls = methodImpls;
                 }
-
-                RuntimeMethod projectedBody = BindMethodToReceiver(body, constructedType);
-                constructedType.MethodImpls ??= new Dictionary<int, RuntimeMethod>();
-                constructedType.MethodImpls[declarationMethodId] = projectedBody;
-                constructedType.VTable = Array.Empty<RuntimeMethod>();
-                constructedType.VTableBuildState = 0;
+                return;
             }
+
+            if (type.GenericTypeDefinition is RuntimeType genericDef)
+            {
+                EnsureConstructedMembers(type);
+                type.MethodsPending = false;
+                SubstituteMethods(type, genericDef);
+                return;
+            }
+
+            type.MethodsPending = false;
+        }
+
+        private void LoadMethodDefOwner(RuntimeModule module, int methodRid)
+        {
+            int ownerRid = module.Md.GetMethodOwnerTypeDefRid(methodRid);
+            if (ownerRid != 0 && _typeCache.TryGetValue((module.Name, MetadataToken.Make(MetadataToken.TypeDef, ownerRid)), out var owner))
+                _ = owner.Methods;
         }
 
         private void IndexWellKnownCoreTypes()
@@ -3068,13 +2786,34 @@ namespace Cnidaria.Cs
             SystemEnum = FindRequired("std", "System", "Enum");
         }
 
+        internal RuntimeType FindPrimitive(RuntimePrimitiveKind kind) => FindRequired("std", "System", kind switch
+        {
+            RuntimePrimitiveKind.Void => "Void",
+            RuntimePrimitiveKind.Boolean => "Boolean",
+            RuntimePrimitiveKind.Char => "Char",
+            RuntimePrimitiveKind.Int8 => "SByte",
+            RuntimePrimitiveKind.UInt8 => "Byte",
+            RuntimePrimitiveKind.Int16 => "Int16",
+            RuntimePrimitiveKind.UInt16 => "UInt16",
+            RuntimePrimitiveKind.Int32 => "Int32",
+            RuntimePrimitiveKind.UInt32 => "UInt32",
+            RuntimePrimitiveKind.Int64 => "Int64",
+            RuntimePrimitiveKind.UInt64 => "UInt64",
+            RuntimePrimitiveKind.NativeInt => "IntPtr",
+            RuntimePrimitiveKind.NativeUInt => "UIntPtr",
+            RuntimePrimitiveKind.Single => "Single",
+            RuntimePrimitiveKind.Double => "Double",
+            RuntimePrimitiveKind.Decimal => "Decimal",
+            _ => throw new ArgumentOutOfRangeException(nameof(kind)),
+        });
+
         private RuntimeType FindRequired(string asm, string ns, string name)
         {
             if (!_namedTypes.TryGetValue((asm, ns, name), out var t))
                 throw new TypeLoadException($"Core type not found: {asm}:{ns}.{name}");
             return t;
         }
-        private void BuildAllMembers()
+        private void BuildAllFields()
         {
             foreach (var kv in _modules)
             {
@@ -3082,12 +2821,13 @@ namespace Cnidaria.Cs
                 for (int tdIndex = 0; tdIndex < m.Md.GetRowCount(MetadataTableKind.TypeDef); tdIndex++)
                 {
                     int typeRid = tdIndex + 1;
+                    if (m.Md.IsModuleTypeDef(typeRid))
+                        continue;
                     int typeTok = MetadataToken.Make(MetadataToken.TypeDef, typeRid);
                     var declaringType = _typeCache[(m.Name, typeTok)];
                     var td = m.Md.GetTypeDef(tdIndex + 1);
 
                     BuildFieldsForType(m, declaringType, tdIndex, td);
-                    BuildMethodsForType(m, declaringType, tdIndex, td);
                 }
             }
         }
@@ -3123,6 +2863,11 @@ namespace Cnidaria.Cs
                 RuntimeType fieldType = ReadTypeSig(m, ref r);
 
                 var rf = new RuntimeField(_nextFieldId++, declaringType, name, fieldType, isStatic);
+                if ((attrs & System.Reflection.FieldAttributes.HasFieldRVA) != 0)
+                {
+                    rf.RvaModule = m;
+                    rf.Rva = m.GetFieldRva(rid);
+                }
                 _fieldCache[(m.Name, fieldTok)] = rf;
 
                 if (declaringType.Kind == RuntimeTypeKind.Enum && !isStatic && name == "value__")
@@ -3136,6 +2881,11 @@ namespace Cnidaria.Cs
             declaringType.StaticFields = stat.ToArray();
 
             int typeTok = MetadataToken.Make(MetadataToken.TypeDef, tdIndex + 1);
+            if (m.TryGetClassLayout(tdIndex + 1, out var classLayout))
+            {
+                declaringType.PackingSize = classLayout.PackingSize;
+                declaringType.ClassSize = classLayout.ClassSize;
+            }
             if (TryGetInlineArrayLengthFromMetadata(m, typeTok, out int inlineArrayLength))
             {
                 declaringType.InlineArrayLength = inlineArrayLength;
@@ -3150,77 +2900,43 @@ namespace Cnidaria.Cs
             }
         }
 
-        private bool TryGetInlineArrayLengthFromMetadata(RuntimeModule module, int typeToken, out int length)
+        private static bool TryGetInlineArrayLengthFromMetadata(RuntimeModule module, int typeToken, out int length)
         {
-            length = 0;
-            int count = module.Md.GetRowCount(MetadataTableKind.CustomAttribute);
-            for (int rid = 1; rid <= count; rid++)
+            var (start, end) = module.Md.GetCustomAttributeRange(typeToken);
+            for (int rid = start; rid < end; rid++)
             {
                 var row = module.Md.GetCustomAttribute(rid);
-                if (row.ParentToken != typeToken)
+                if (!module.Md.IsAttribute(row.ConstructorToken, "System.Runtime.CompilerServices", "InlineArrayAttribute"))
                     continue;
-                if (!IsInlineArrayAttributeType(module, row.AttributeTypeToken))
-                    continue;
-                if (TryReadInlineArrayLength(module.Md.GetBlob(row.Value), out length))
-                    return true;
-            }
-
-            return false;
-        }
-
-        private static bool IsInlineArrayAttributeType(RuntimeModule module, int attributeTypeToken)
-        {
-            int table = MetadataToken.Table(attributeTypeToken);
-            int rid = MetadataToken.Rid(attributeTypeToken);
-            string ns;
-            string name;
-
-            if (table == MetadataToken.TypeDef)
-            {
-                (ns, name) = Domain.GetTypeDefFullNameByRid(module, rid);
-            }
-            else if (table == MetadataToken.TypeRef)
-            {
-                var resolved = Domain.ResolveTypeRefFullName(module, rid);
-                ns = resolved.ns;
-                name = resolved.name;
-            }
-            else
-            {
-                return false;
-            }
-
-            return string.Equals(ns, "System.Runtime.CompilerServices", StringComparison.Ordinal) &&
-                   string.Equals(name, "InlineArrayAttribute", StringComparison.Ordinal);
-        }
-
-        private static bool TryReadInlineArrayLength(ReadOnlySpan<byte> blob, out int length)
-        {
-            length = 0;
-            try
-            {
-                var reader = new AttrBlobReader(blob);
-                int ctorParamCount = reader.ReadInt32();
-                for (int i = 0; i < ctorParamCount; i++)
-                    _ = reader.ReadInt32();
-
-                int ctorArgCount = reader.ReadInt32();
-                if (ctorArgCount != 1)
-                    return false;
-
-                _ = reader.ReadInt32();
-                byte kind = reader.ReadByte();
-                if (kind != 7)
-                    return false;
-
-                length = reader.ReadInt32();
+                var reader = new CustomAttributeBlobReader(module.Md.GetBlob(row.Value));
+                length = unchecked((int)reader.ReadUInt32());
                 return true;
             }
-            catch
+
+            length = 0;
+            return false;
+        }
+        // Equality of these types is equality of their bits; floating point is not (NaN, -0.0) and structs may override Equals.
+        internal static bool IsBitwiseEquatable(RuntimeType type)
+            => type.Kind is RuntimeTypeKind.Enum or RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer ||
+               type.PrimitiveKind is RuntimePrimitiveKind.Boolean or RuntimePrimitiveKind.Char or
+                   RuntimePrimitiveKind.Int8 or RuntimePrimitiveKind.UInt8 or RuntimePrimitiveKind.Int16 or RuntimePrimitiveKind.UInt16 or
+                   RuntimePrimitiveKind.Int32 or RuntimePrimitiveKind.UInt32 or RuntimePrimitiveKind.Int64 or RuntimePrimitiveKind.UInt64 or
+                   RuntimePrimitiveKind.NativeInt or RuntimePrimitiveKind.NativeUInt;
+
+        // Vector*.IsHardwareAccelerated recurse into themselves for the JIT to replace; no backend vectorizes.
+        internal static bool IsHardwareAccelerationQuery(RuntimeMethod method)
+            => method.IsStatic && StringComparer.Ordinal.Equals(method.Name, "get_IsHardwareAccelerated") &&
+               method.DeclaringType.Namespace is "System.Numerics" or "System.Runtime.Intrinsics";
+        internal static bool HasCustomAttribute(RuntimeModule module, int token, string @namespace, string name)
+        {
+            var (start, end) = module.Md.GetCustomAttributeRange(token);
+            for (int rid = start; rid < end; rid++)
             {
-                length = 0;
-                return false;
+                if (module.Md.IsAttribute(module.Md.GetCustomAttribute(rid).ConstructorToken, @namespace, name))
+                    return true;
             }
+            return false;
         }
 
         private void BuildMethodsForType(RuntimeModule m, RuntimeType declaringType, int tdIndex, TypeDefRow td)
@@ -3278,11 +2994,10 @@ namespace Cnidaria.Cs
                     mr.Flags,
                     mr.ImplFlags);
                 rm.BodyModule = m;
+                rm.MethodDefToken = methodTok;
                 rm.GenericArity = genericArity;
                 if (m.PInvokesByMethodToken.TryGetValue(methodTok, out var dllImport))
                     rm.DllImportData = dllImport;
-                if (m.MethodsByDefToken.TryGetValue(methodTok, out var bodyFn))
-                    rm.Body = bodyFn;
                 _methodById[rm.MethodId] = rm;
                 _methodCache[(m.Name, methodTok)] = rm;
                 methods.Add(rm);
@@ -3290,12 +3005,6 @@ namespace Cnidaria.Cs
 
             declaringType.Methods = methods.ToArray();
         }
-        private void BuildAllVTables()
-        {
-            foreach (RuntimeType type in _typeCache.Values)
-                EnsureVirtualTable(type);
-        }
-
         internal void EnsureVirtualTable(RuntimeType type)
         {
             if (type is null)
@@ -3314,6 +3023,14 @@ namespace Cnidaria.Cs
                 return;
             if (type.VTableBuildState == 1)
                 throw new TypeLoadException($"Circular virtual method table inheritance involving '{type.Namespace}.{type.Name}'.");
+
+            if (type.ArrayOfT is RuntimeType arrayOfT)
+            {
+                EnsureVirtualTable(arrayOfT);
+                type.VTable = arrayOfT.VTable;
+                type.VTableBuildState = 2;
+                return;
+            }
 
             EnsureConstructedMembers(type);
             type.VTableBuildState = 1;
@@ -3541,7 +3258,7 @@ namespace Cnidaria.Cs
                 return nestedDef;
             }
 
-            var (asm, ns, name) = Domain.ResolveTypeRefFullName(contextModule, typeRefRid);
+            var (asm, ns, name) = MetadataTypeNames.ResolveTypeRefFullName(contextModule, typeRefRid);
             if (_namedTypes.TryGetValue((asm, ns, name), out var t))
                 return t;
 
@@ -3753,6 +3470,7 @@ namespace Cnidaria.Cs
                 name: elem.Name + suffix);
 
             t.BaseType = SystemArray;
+            t.Loader = this;
             t.ElementType = elem;
             t.ArrayRank = rank;
             t.IsSzArray = isSzArray;
@@ -3760,6 +3478,12 @@ namespace Cnidaria.Cs
 
             _constructedTypes[key] = t;
             _typeById[t.TypeId] = t;
+            // The instantiation may name T[] again, which is cached now
+            if (isSzArray && elem.Kind is not (RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef) &&
+                !elem.IsByRefLike && _namedTypes.TryGetValue((SystemArray.AssemblyName, "System", "Array`1"), out var arrayOfT))
+            {
+                t.ArrayOfT = GetOrCreateGenericInstanceType(arrayOfT, new[] { elem });
+            }
             return t;
         }
         private RuntimeType GetOrCreateGenericParamType(bool isMethodParam, int ordinal)
@@ -3823,6 +3547,8 @@ namespace Cnidaria.Cs
 
             t.GenericTypeDefinition = genericDef;
             t.GenericTypeArguments = args;
+            t.Loader = this;
+            t.MethodsPending = true;
             t.IsBeforeFieldInit = genericDef.IsBeforeFieldInit;
             t.IsFinal = genericDef.IsFinal;
             t.IsByRefLike = genericDef.IsByRefLike;
@@ -3833,6 +3559,13 @@ namespace Cnidaria.Cs
         }
         internal void EnsureConstructedMembers(RuntimeType t)
         {
+            if (t.ArrayOfT is RuntimeType arrayOfT)
+            {
+                EnsureConstructedMembers(arrayOfT);
+                t.Interfaces = arrayOfT.Interfaces;
+                return;
+            }
+
             if (t.GenericTypeDefinition is null)
                 return;
 
@@ -3842,10 +3575,9 @@ namespace Cnidaria.Cs
             {
                 bool staleInstanceFields = genericDef.InstanceFields.Length != 0 && t.InstanceFields.Length == 0;
                 bool staleStaticFields = genericDef.StaticFields.Length != 0 && t.StaticFields.Length == 0;
-                bool staleMethods = genericDef.Methods.Length != 0 && t.Methods.Length == 0;
                 bool staleInterfaces = genericDef.Interfaces.Length != 0 && t.Interfaces.Length == 0;
 
-                if (!staleInstanceFields && !staleStaticFields && !staleMethods && !staleInterfaces)
+                if (!staleInstanceFields && !staleStaticFields && !staleInterfaces)
                     return;
             }
             t.ConstructedMembersInitialized = true;
@@ -3854,6 +3586,8 @@ namespace Cnidaria.Cs
 
             t.InlineArrayLength = genericDef.InlineArrayLength;
             t.InlineArrayElementField = null;
+            t.PackingSize = genericDef.PackingSize;
+            t.ClassSize = genericDef.ClassSize;
 
             t.BaseType = genericDef.BaseType is null
                 ? null
@@ -3892,6 +3626,20 @@ namespace Cnidaria.Cs
                 t.StaticFields = stat;
             }
 
+            t.Methods = Array.Empty<RuntimeMethod>();
+            t.MethodImpls = null;
+            t.MethodsPending = true;
+
+            if (t.BaseType is not null)
+                EnsureConstructedMembers(t.BaseType);
+
+            t.VTable = Array.Empty<RuntimeMethod>();
+            t.VTableBuildState = 0;
+        }
+
+        private void SubstituteMethods(RuntimeType t, RuntimeType genericDef)
+        {
+            var typeArgs = t.GenericTypeArguments;
             if (genericDef.Methods.Length != 0)
             {
                 var methods = new RuntimeMethod[genericDef.Methods.Length];
@@ -3919,7 +3667,7 @@ namespace Cnidaria.Cs
                         src.ImplFlags);
 
                     dst.BodyModule = src.BodyModule;
-                    dst.Body = src.Body;
+                    dst.MethodDefToken = src.MethodDefToken;
                     dst.DllImportData = src.DllImportData;
                     dst.GenericArity = src.GenericArity;
                     _methodById[dst.MethodId] = dst;
@@ -3936,12 +3684,6 @@ namespace Cnidaria.Cs
                     map[pair.Key] = BindMethodToReceiver(pair.Value, t);
                 t.MethodImpls = map;
             }
-
-            if (t.BaseType is not null)
-                EnsureConstructedMembers(t.BaseType);
-
-            t.VTable = Array.Empty<RuntimeMethod>();
-            t.VTableBuildState = 0;
         }
         internal RuntimeType ResolveTypeInMethodContext(RuntimeModule contextModule, int typeToken, RuntimeMethod? methodContext)
         {
@@ -3962,6 +3704,51 @@ namespace Cnidaria.Cs
             EnsureLayout(result);
             _typeInMethodContextCache[key] = result;
             return result;
+        }
+        internal byte[] GetFieldRvaData(RuntimeField field)
+        {
+            if (field.RvaModule is not RuntimeModule module || field.Rva == 0)
+                throw new InvalidOperationException($"Field '{field.Name}' has no RVA data.");
+            EnsureLayout(field.FieldType);
+            return module.Md.GetRvaData(field.Rva, field.FieldType.SizeOf).ToArray();
+        }
+        // A calli signature is a stand-alone method signature; it reads the same as an FNPTR element body.
+        internal RuntimeType ResolveCalliSignatureInMethodContext(RuntimeModule contextModule, int signatureToken, RuntimeMethod methodContext)
+        {
+            var row = contextModule.Md.GetStandAloneSig(MetadataToken.Rid(signatureToken));
+            var blob = contextModule.Md.GetBlob(row.Signature);
+            var withPrefix = new byte[blob.Length + 1];
+            withPrefix[0] = (byte)SigElementType.FNPTR;
+            blob.CopyTo(withPrefix.AsSpan(1));
+            var reader = new SigReader(withPrefix);
+            var type = SubstituteRuntimeType(
+                ReadTypeSig(contextModule, ref reader),
+                methodContext.DeclaringType.GenericTypeArguments,
+                methodContext.MethodGenericArguments);
+            EnsureLayout(type);
+            return type;
+        }
+        internal RuntimeType[] ResolveLocalSignatureInMethodContext(RuntimeModule contextModule, int signatureToken, RuntimeMethod methodContext)
+        {
+            if (signatureToken == 0)
+                return Array.Empty<RuntimeType>();
+            var row = contextModule.Md.GetStandAloneSig(MetadataToken.Rid(signatureToken));
+            var reader = new SigReader(contextModule.Md.GetBlob(row.Signature));
+            if (reader.ReadByte() != 0x07)
+                throw new BadImageFormatException($"StandAloneSig 0x{signatureToken:X8} is not a local signature.");
+            var locals = new RuntimeType[checked((int)reader.ReadCompressedUInt())];
+            for (int i = 0; i < locals.Length; i++)
+            {
+                if (reader.PeekByte() == (byte)SigElementType.PINNED)
+                    _ = reader.ReadByte();
+                var local = SubstituteRuntimeType(
+                    ReadTypeSig(contextModule, ref reader),
+                    methodContext.DeclaringType.GenericTypeArguments,
+                    methodContext.MethodGenericArguments);
+                EnsureLayout(local);
+                locals[i] = local;
+            }
+            return locals;
         }
         private RuntimeType SubstituteRuntimeType(RuntimeType type, RuntimeType[] ownerTypeArgs)
             => SubstituteRuntimeType(type, ownerTypeArgs, Array.Empty<RuntimeType>());
@@ -4143,13 +3930,13 @@ namespace Cnidaria.Cs
 
             if (table == MetadataToken.TypeDef)
             {
-                var (ns, name) = Domain.GetTypeDefFullNameByRid(contextModule, rid);
+                var (ns, name) = MetadataTypeNames.GetTypeDefFullNameByRid(contextModule, rid);
                 return (contextModule.Name, ns, name);
             }
 
             if (table == MetadataToken.TypeRef)
             {
-                return Domain.ResolveTypeRefFullName(contextModule, rid);
+                return MetadataTypeNames.ResolveTypeRefFullName(contextModule, rid);
             }
 
             if (table == MetadataToken.TypeSpec)
@@ -4174,6 +3961,121 @@ namespace Cnidaria.Cs
         FunctionPointer,
     }
 
+    // Mirrors the flag constants of the BCL's System.RuntimeType.
+    [Flags]
+    internal enum RuntimeTypeInfoFlags
+    {
+        None = 0,
+        ValueType = 1 << 0,
+        Enum = 1 << 1,
+        Primitive = 1 << 2,
+        Array = 1 << 3,
+        Pointer = 1 << 4,
+        ByRef = 1 << 5,
+        Interface = 1 << 6,
+        GenericParameter = 1 << 7,
+    }
+    // What System.Type reports for a runtime type; every backend hands these to the BCL's RuntimeType.
+    internal static class RuntimeTypeNames
+    {
+        public static string Name(RuntimeType type) => type.Kind switch
+        {
+            RuntimeTypeKind.Array => Name(type.ElementType!) + ArraySuffix(type),
+            RuntimeTypeKind.Pointer => Name(type.ElementType!) + "*",
+            RuntimeTypeKind.ByRef => Name(type.ElementType!) + "&",
+            RuntimeTypeKind.TypeParam or RuntimeTypeKind.FunctionPointer => type.Name,
+            _ => SimpleName(type.GenericTypeDefinition ?? type),
+        };
+
+        public static string? Namespace(RuntimeType type) => type.Kind switch
+        {
+            RuntimeTypeKind.Array or RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef => Namespace(type.ElementType!),
+            RuntimeTypeKind.TypeParam or RuntimeTypeKind.FunctionPointer => null,
+            _ => (type.GenericTypeDefinition ?? type).Namespace is { Length: > 0 } ns ? ns : null,
+        };
+
+        // Null while the type still depends on generic parameters, as in runtime.
+        public static string? FullName(RuntimeType type) => ContainsGenericParameters(type) ? null : Format(type, fullName: true);
+
+        public static string DisplayName(RuntimeType type) => Format(type, fullName: false);
+
+        public static RuntimeTypeInfoFlags Flags(RuntimeType type)
+        {
+            var flags = RuntimeTypeInfoFlags.None;
+            if (type.Kind is RuntimeTypeKind.Struct or RuntimeTypeKind.Enum)
+                flags |= RuntimeTypeInfoFlags.ValueType;
+            if (type.Kind == RuntimeTypeKind.Enum)
+                flags |= RuntimeTypeInfoFlags.Enum;
+            else if (type.PrimitiveKind is not (RuntimePrimitiveKind.None or RuntimePrimitiveKind.Void or RuntimePrimitiveKind.Decimal))
+                flags |= RuntimeTypeInfoFlags.Primitive;
+            flags |= type.Kind switch
+            {
+                RuntimeTypeKind.Array => RuntimeTypeInfoFlags.Array,
+                RuntimeTypeKind.Pointer => RuntimeTypeInfoFlags.Pointer,
+                RuntimeTypeKind.ByRef => RuntimeTypeInfoFlags.ByRef,
+                RuntimeTypeKind.Interface => RuntimeTypeInfoFlags.Interface,
+                RuntimeTypeKind.TypeParam => RuntimeTypeInfoFlags.GenericParameter,
+                _ => RuntimeTypeInfoFlags.None,
+            };
+            return flags;
+        }
+
+        // Nested types carry their enclosing chain, "Outer+Inner", in the metadata name.
+        private static string SimpleName(RuntimeType definition)
+            => definition.Name.Substring(definition.Name.LastIndexOf('+') + 1);
+
+        private static string ArraySuffix(RuntimeType array)
+            => array.IsSzArray ? "[]" : array.ArrayRank == 1 ? "[*]" : "[" + new string(',', array.ArrayRank - 1) + "]";
+
+        private static string Format(RuntimeType type, bool fullName)
+        {
+            switch (type.Kind)
+            {
+                case RuntimeTypeKind.Array:
+                    return Format(type.ElementType!, fullName) + ArraySuffix(type);
+                case RuntimeTypeKind.Pointer:
+                    return Format(type.ElementType!, fullName) + "*";
+                case RuntimeTypeKind.ByRef:
+                    return Format(type.ElementType!, fullName) + "&";
+                case RuntimeTypeKind.TypeParam:
+                case RuntimeTypeKind.FunctionPointer:
+                    return type.Name;
+            }
+
+            RuntimeType definition = type.GenericTypeDefinition ?? type;
+            string qualified = definition.Namespace.Length == 0 ? definition.Name : definition.Namespace + "." + definition.Name;
+            if (type.GenericTypeDefinition is null || type.GenericTypeArguments.Length == 0)
+                return qualified;
+
+            // FullName qualifies each argument with its assembly; ToString does not.
+            var sb = new StringBuilder(qualified).Append('[');
+            for (int i = 0; i < type.GenericTypeArguments.Length; i++)
+            {
+                RuntimeType argument = type.GenericTypeArguments[i];
+                if (i != 0)
+                    sb.Append(',');
+                if (fullName)
+                    sb.Append('[').Append(Format(argument, fullName: true)).Append(", ").Append(argument.AssemblyName).Append(']');
+                else
+                    sb.Append(Format(argument, fullName: false));
+            }
+            return sb.Append(']').ToString();
+        }
+
+        private static bool ContainsGenericParameters(RuntimeType type)
+        {
+            if (type.Kind == RuntimeTypeKind.TypeParam)
+                return true;
+            if (type.ElementType is { } element && ContainsGenericParameters(element))
+                return true;
+            foreach (RuntimeType argument in type.GenericTypeArguments)
+            {
+                if (ContainsGenericParameters(argument))
+                    return true;
+            }
+            return false;
+        }
+    }
     internal enum RuntimePrimitiveKind : byte
     {
         None,
@@ -4211,6 +4113,8 @@ namespace Cnidaria.Cs
         public bool IsValueType => Kind is RuntimeTypeKind.Struct or RuntimeTypeKind.Enum or RuntimeTypeKind.FunctionPointer;
         public bool IsReferenceType => !IsValueType && Kind is not (RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.FunctionPointer);
         public RuntimeType? BaseType { get; internal set; }
+        // NativeAOT's closest def type of an SZ array: its base type stays System.Array, but its vtable, interfaces and dispatch are Array<T>'s
+        internal RuntimeType? ArrayOfT { get; set; }
         public RuntimeType? ElementType { get; internal set; }
         public byte FunctionPointerCallingConvention { get; internal set; }
         public RuntimeType? FunctionPointerReturnType { get; internal set; }
@@ -4234,13 +4138,47 @@ namespace Cnidaria.Cs
         public int[] GcPointerOffsets { get; internal set; } = Array.Empty<int>();
         public int InlineArrayLength { get; internal set; }
         public RuntimeField? InlineArrayElementField { get; internal set; }
+        internal int PackingSize { get; set; }
+        internal int ClassSize { get; set; }
         public RuntimeType[] Interfaces { get; internal set; } = Array.Empty<RuntimeType>();
         public RuntimeField[] InstanceFields { get; internal set; } = Array.Empty<RuntimeField>();
         public RuntimeField[] StaticFields { get; internal set; } = Array.Empty<RuntimeField>();
-        public RuntimeMethod[] Methods { get; internal set; } = Array.Empty<RuntimeMethod>();
-        public RuntimeMethod[] VTable { get; internal set; } = Array.Empty<RuntimeMethod>();
+        internal RuntimeTypeSystem? Loader { get; set; }
+        internal bool MethodsPending { get; set; }
+        public RuntimeMethod[] Methods
+        {
+            get
+            {
+                if (MethodsPending)
+                    Loader!.LoadMethods(this);
+                return _methods;
+            }
+            internal set => _methods = value;
+        }
+        public RuntimeMethod[] VTable
+        {
+            get
+            {
+                if (VTableBuildState == 0 && Loader is RuntimeTypeSystem loader)
+                    loader.EnsureVirtualTable(this);
+                return _vtable;
+            }
+            internal set => _vtable = value;
+        }
         internal byte VTableBuildState { get; set; }
-        public Dictionary<int, RuntimeMethod>? MethodImpls { get; internal set; }
+        public Dictionary<int, RuntimeMethod>? MethodImpls
+        {
+            get
+            {
+                if (MethodsPending)
+                    Loader!.LoadMethods(this);
+                return _methodImpls;
+            }
+            internal set => _methodImpls = value;
+        }
+        private RuntimeMethod[] _methods = Array.Empty<RuntimeMethod>();
+        private RuntimeMethod[] _vtable = Array.Empty<RuntimeMethod>();
+        private Dictionary<int, RuntimeMethod>? _methodImpls;
         public RuntimeType(int typeId, RuntimeTypeKind kind, string asm, string ns, string name)
         {
             TypeId = typeId;
@@ -4262,6 +4200,8 @@ namespace Cnidaria.Cs
         public RuntimeType FieldType { get; }
         public bool IsStatic { get; }
         public int Offset { get; internal set; }
+        internal RuntimeModule? RvaModule { get; set; }
+        internal int Rva { get; set; }
         public RuntimeField(int fieldId, RuntimeType declType, string name, RuntimeType fieldType, bool isStatic)
         {
             FieldId = fieldId;
@@ -4293,10 +4233,25 @@ namespace Cnidaria.Cs
         public bool HasInternalCall => (ImplFlags & MetadataFlagBits.InternalCall) != 0;
         public bool HasNoInlining => (ImplFlags & MetadataFlagBits.NoInlining) != 0;
         public bool HasAggressiveInlining => (ImplFlags & MetadataFlagBits.AggressiveInlining) != 0;
+        private byte _doesNotReturn;
+        internal bool DoesNotReturn
+        {
+            get
+            {
+                if (_doesNotReturn == 0)
+                {
+                    _doesNotReturn = BodyModule is not null && MethodDefToken != 0 &&
+                        RuntimeTypeSystem.HasCustomAttribute(BodyModule, MethodDefToken, "System.Diagnostics.CodeAnalysis", "DoesNotReturnAttribute")
+                        ? (byte)2 : (byte)1;
+                }
+                return _doesNotReturn == 2;
+            }
+        }
         internal bool RequiresClassInitializationEntryCheck { get; set; }
         public int VTableSlot { get; internal set; } = -1;
         public RuntimeModule? BodyModule { get; internal set; }
-        public BytecodeFunction? Body { get; internal set; }
+        internal int MethodDefToken { get; set; }
+        internal CilMethodBody? CilBody => MethodDefToken == 0 ? null : BodyModule?.GetCilBody(MethodDefToken);
         public RuntimeMethod? GenericMethodDefinition { get; internal set; }
         internal RuntimeType[] MethodGenericArguments { get; set; } = Array.Empty<RuntimeType>();
         public int GenericArity { get; internal set; }

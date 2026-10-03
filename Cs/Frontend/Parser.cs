@@ -2493,7 +2493,7 @@ namespace Cnidaria.Cs
                 SyntaxKind.ThrowKeyword => ParseThrowStatement(),
                 SyntaxKind.UsingKeyword => ParseUsingLikeStatement(default),
 
-                SyntaxKind.UnsafeKeyword => ParseUnsafeStatement(),
+                SyntaxKind.UnsafeKeyword when _tokens.Peek(1).Kind == SyntaxKind.OpenBraceToken => ParseUnsafeStatement(),
                 SyntaxKind.FixedKeyword => ParseFixedStatement(),
                 SyntaxKind.LockKeyword => ParseLockStatement(),
 
@@ -4615,8 +4615,9 @@ namespace Cnidaria.Cs
 
         private RefExpressionSyntax ParseRefExpression()
         {
+            // 'ref' applies to a whole expression, so `ref c ? ref a : ref b` refers to the conditional.
             var refKeyword = MatchToken(SyntaxKind.RefKeyword);
-            var expression = ParseUnaryExpression();
+            var expression = ParseExpression();
             return new RefExpressionSyntax(refKeyword, expression);
         }
         private ThrowExpressionSyntax ParseThrowExpression()
@@ -6678,44 +6679,6 @@ namespace Cnidaria.Cs
             return _tokens.Peek(2).Kind == SyntaxKind.OpenParenToken;
         }
 
-        private static bool ContainsGenericName(SyntaxNode node)
-        {
-            if (node is GenericNameSyntax) return true;
-
-            return node switch
-            {
-                QualifiedNameSyntax q => ContainsGenericName(q.Left) || ContainsGenericName(q.Right),
-                AliasQualifiedNameSyntax a => ContainsGenericName(a.Name),
-                NullableTypeSyntax n => ContainsGenericName(n.ElementType),
-                ScopedTypeSyntax s => ContainsGenericName(s.Type),
-                ArrayTypeSyntax a => ContainsGenericName(a.ElementType),
-                PointerTypeSyntax p => ContainsGenericName(p.ElementType),
-                RefTypeSyntax r => ContainsGenericName(r.Type),
-                FunctionPointerTypeSyntax f => ContainsGenericNameInFunctionPointerType(f),
-                TupleTypeSyntax t => ContainsGenericNameInTupleType(t),
-                _ => false
-            };
-        }
-        private static bool ContainsGenericNameInTupleType(TupleTypeSyntax t)
-        {
-            for (int i = 0; i < t.Elements.Count; i++)
-            {
-                if (ContainsGenericName(t.Elements[i].Type))
-                    return true;
-            }
-            return false;
-        }
-
-        private static bool ContainsGenericNameInFunctionPointerType(FunctionPointerTypeSyntax t)
-        {
-            for (int i = 0; i < t.ParameterList.Parameters.Count; i++)
-            {
-                if (ContainsGenericName(t.ParameterList.Parameters[i].Type))
-                    return true;
-            }
-
-            return false;
-        }
         private static bool TypeDefinitelyNotExpression(TypeSyntax t)
         {
             if (t is PredefinedTypeSyntax) return true;
@@ -6726,8 +6689,6 @@ namespace Cnidaria.Cs
             if (t is PointerTypeSyntax) return true;
             if (t is FunctionPointerTypeSyntax) return true;
             if (t is AliasQualifiedNameSyntax) return true;
-
-            if (ContainsGenericName(t)) return true;
 
             return false;
         }

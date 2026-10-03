@@ -378,13 +378,13 @@ namespace Cnidaria.Cs
 
         private static ImmutableArray<CfgExceptionRegion> BuildExceptionRegions(GenTreeMethod method)
         {
-            if (method.Function.ExceptionHandlers.Length == 0)
+            if (method.ExceptionHandlers.Length == 0)
                 return ImmutableArray<CfgExceptionRegion>.Empty;
 
-            var raw = new List<RawExceptionRegion>(method.Function.ExceptionHandlers.Length);
-            for (int i = 0; i < method.Function.ExceptionHandlers.Length; i++)
+            var raw = new List<RawExceptionRegion>(method.ExceptionHandlers.Length);
+            for (int i = 0; i < method.ExceptionHandlers.Length; i++)
             {
-                var eh = method.Function.ExceptionHandlers[i];
+                var eh = method.ExceptionHandlers[i];
                 int tryStartBlock = FindBlockStart(method, eh.TryStartPc);
                 if (tryStartBlock < 0)
                     continue;

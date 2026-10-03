@@ -189,10 +189,10 @@ namespace Cnidaria.Cs
         public TypeSymbol ValueType { get; }
         public BoundExpression InitialValue { get; }
 
-        public BoundClosureCellCreationExpression(SyntaxNode syntax, NamedTypeSymbol objectType, TypeSymbol valueType, BoundExpression initialValue)
+        public BoundClosureCellCreationExpression(SyntaxNode syntax, TypeSymbol cellType, TypeSymbol valueType, BoundExpression initialValue)
             : base(syntax)
         {
-            Type = objectType;
+            Type = cellType;
             ValueType = valueType;
             InitialValue = initialValue;
             ConstantValueOpt = Optional<object>.None;
@@ -206,10 +206,10 @@ namespace Cnidaria.Cs
         public override BoundNodeKind Kind => BoundNodeKind.ClosureCreation;
         public ImmutableArray<BoundExpression> Cells { get; }
 
-        public BoundClosureCreationExpression(SyntaxNode syntax, NamedTypeSymbol objectType, ImmutableArray<BoundExpression> cells)
+        public BoundClosureCreationExpression(SyntaxNode syntax, TypeSymbol closureType, ImmutableArray<BoundExpression> cells)
             : base(syntax)
         {
-            Type = objectType;
+            Type = closureType;
             Cells = cells.IsDefault ? ImmutableArray<BoundExpression>.Empty : cells;
             ConstantValueOpt = Optional<object>.None;
 
@@ -231,10 +231,10 @@ namespace Cnidaria.Cs
         public BoundExpression Closure { get; }
         public int SlotIndex { get; }
 
-        public BoundClosureSlotExpression(SyntaxNode syntax, NamedTypeSymbol objectType, BoundExpression closure, int slotIndex)
+        public BoundClosureSlotExpression(SyntaxNode syntax, TypeSymbol cellType, BoundExpression closure, int slotIndex)
             : base(syntax)
         {
-            Type = objectType;
+            Type = cellType;
             Closure = closure;
             SlotIndex = slotIndex;
             ConstantValueOpt = Optional<object>.None;
@@ -1050,12 +1050,13 @@ namespace Cnidaria.Cs
         public override BoundNodeKind Kind => BoundNodeKind.This;
         public NamedTypeSymbol ContainingType { get; }
         public override bool IsLValue { get; }
+        // In a struct instance member 'this' is a variable; readonly structs are guarded where it is written.
         public BoundThisExpression(ExpressionSyntax syntax, NamedTypeSymbol containingType, bool isLValue = false)
             : base(syntax)
         {
             ContainingType = containingType;
             Type = containingType;
-            IsLValue = isLValue;
+            IsLValue = isLValue || containingType.IsValueType;
         }
     }
     /// <summary>Bound base-typed reference to the current instance</summary>
@@ -1083,6 +1084,8 @@ namespace Cnidaria.Cs
         public override BoundNodeKind Kind => BoundNodeKind.MemberAccess;
         public BoundExpression? ReceiverOpt { get; }
         public Symbol Member { get; }
+        /// <summary>Type parameter a static abstract or virtual interface member is accessed through</summary>
+        public TypeSymbol? ConstrainedToTypeOpt { get; }
 
         private readonly bool _isLValue;
         public override bool IsLValue => _isLValue;
@@ -1093,11 +1096,13 @@ namespace Cnidaria.Cs
             TypeSymbol type,
             bool isLValue,
             Optional<object> constantValueOpt = default,
-            bool hasErrors = false)
+            bool hasErrors = false,
+            TypeSymbol? constrainedToTypeOpt = null)
             : base(syntax)
         {
             ReceiverOpt = receiverOpt;
             Member = member;
+            ConstrainedToTypeOpt = constrainedToTypeOpt;
             Type = type;
             _isLValue = isLValue;
 
@@ -1449,6 +1454,7 @@ namespace Cnidaria.Cs
         Array,
         String,
         Span,
+        InlineArray,
         Pattern,
         Interface
     }
@@ -1520,7 +1526,8 @@ namespace Cnidaria.Cs
 
             if (enumeratorKind != BoundForEachEnumeratorKind.Array &&
                 enumeratorKind != BoundForEachEnumeratorKind.String &&
-                enumeratorKind != BoundForEachEnumeratorKind.Span)
+                enumeratorKind != BoundForEachEnumeratorKind.Span &&
+                enumeratorKind != BoundForEachEnumeratorKind.InlineArray)
             {
                 if (GetEnumeratorMethodOpt is null || CurrentPropertyOpt is null || MoveNextMethodOpt is null)
                     HasErrors = true;
@@ -1817,17 +1824,21 @@ namespace Cnidaria.Cs
         public BoundExpression? ReceiverOpt { get; }
         public MethodSymbol Method { get; }
         public ImmutableArray<BoundExpression> Arguments { get; }
+        /// <summary>Type parameter a static abstract or virtual interface member is called through</summary>
+        public TypeSymbol? ConstrainedToTypeOpt { get; }
         public override bool IsLValue => Method.ReturnType is ByRefTypeSymbol;
         public BoundCallExpression(
             SyntaxNode syntax,
             BoundExpression? receiverOpt,
             MethodSymbol method,
-            ImmutableArray<BoundExpression> arguments)
+            ImmutableArray<BoundExpression> arguments,
+            TypeSymbol? constrainedToTypeOpt = null)
             : base(syntax)
         {
             ReceiverOpt = receiverOpt;
             Method = method;
             Arguments = arguments;
+            ConstrainedToTypeOpt = constrainedToTypeOpt;
             Type = method.ReturnType is ByRefTypeSymbol br ? br.ElementType : method.ReturnType;
 
             bool hasArgErrors = false;
@@ -1904,6 +1915,32 @@ namespace Cnidaria.Cs
             Kind = kind;
             Syntax = syntax;
             Expression = expression;
+        }
+    }
+    /// <summary>A conditional expression without a natural type, awaiting a target type (C# 9)</summary>
+    internal sealed class BoundUnboundConditionalExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.UnboundConditional;
+        public BoundExpression Condition { get; }
+        public BoundExpression WhenTrue { get; }
+        public BoundExpression WhenFalse { get; }
+        /// <summary>Reported when no conversion supplies a target type</summary>
+        public Diagnostic NoNaturalType { get; }
+
+        public BoundUnboundConditionalExpression(
+            ConditionalExpressionSyntax syntax,
+            BoundExpression condition,
+            BoundExpression whenTrue,
+            BoundExpression whenFalse,
+            Diagnostic noNaturalType)
+            : base(syntax)
+        {
+            Condition = condition;
+            WhenTrue = whenTrue;
+            WhenFalse = whenFalse;
+            NoNaturalType = noNaturalType;
+            Type = new ErrorTypeSymbol("<unbound conditional>", containing: null, ImmutableArray<Location>.Empty);
+            ConstantValueOpt = Optional<object>.None;
         }
     }
     /// <summary>Collection elements awaiting a target collection type</summary>
@@ -2075,6 +2112,8 @@ namespace Cnidaria.Cs
         Type,
         Null,
         Constant,
+        // `var x`: always matches, null included, and captures the value
+        Var,
     }
     /// <summary>Bound test against a resolved type, null, or constant pattern</summary>
     internal sealed class BoundIsPatternExpression : BoundExpression

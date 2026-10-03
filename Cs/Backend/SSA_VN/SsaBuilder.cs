@@ -1023,7 +1023,7 @@ namespace Cnidaria.Cs
                 if (SsaSlotHelpers.TryGetAddressExposedSlot(node, out _))
                     return true;
 
-                if (node.Kind == GenTreeKind.Unary && node.SourceOp == BytecodeOp.PtrToByRef)
+                if (node.Kind == GenTreeKind.Unary && node.Operator == GenTreeOperator.PtrToByRef)
                     return true;
 
                 if (node.Kind == GenTreeKind.FieldAddr && node.Operands.Length != 0)

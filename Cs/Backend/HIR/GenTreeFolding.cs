@@ -91,7 +91,7 @@ namespace Cnidaria.Cs
                     nodeId,
                     GenTreeKind.ConstI4,
                     template.Pc,
-                    BytecodeOp.Ldc_I4,
+                    GenTreeOperator.None,
                     template.Type,
                     template.StackKind,
                     GenTreeFlags.None,
@@ -101,7 +101,7 @@ namespace Cnidaria.Cs
                     nodeId,
                     GenTreeKind.ConstI8,
                     template.Pc,
-                    BytecodeOp.Ldc_I8,
+                    GenTreeOperator.None,
                     template.Type,
                     template.StackKind,
                     GenTreeFlags.None,
@@ -111,7 +111,7 @@ namespace Cnidaria.Cs
                     nodeId,
                     GenTreeKind.ConstNull,
                     template.Pc,
-                    BytecodeOp.Ldnull,
+                    GenTreeOperator.None,
                     template.Type,
                     GenStackKind.Null,
                     GenTreeFlags.None,
@@ -129,14 +129,14 @@ namespace Cnidaria.Cs
             int bits = GenTreeArithmeticSemantics.IntegralBits(source.Type, source.StackKind, target);
             long value = ConstantAsSigned(operand, bits);
 
-            switch (source.SourceOp)
+            switch (source.Operator)
             {
-                case BytecodeOp.Neg:
+                case GenTreeOperator.Neg:
                     result = bits > 32
                         ? GenTreeConstantValue.ForI8(unchecked(-value))
                         : GenTreeConstantValue.ForI4(unchecked(-(int)value));
                     return true;
-                case BytecodeOp.Not:
+                case GenTreeOperator.Not:
                     result = bits > 32
                         ? GenTreeConstantValue.ForI8(~value)
                         : GenTreeConstantValue.ForI4(~(int)value);
@@ -158,7 +158,7 @@ namespace Cnidaria.Cs
 
             if (left.Kind == GenTreeConstantKind.Null || right.Kind == GenTreeConstantKind.Null)
             {
-                if (source.SourceOp == BytecodeOp.Ceq)
+                if (source.Operator == GenTreeOperator.Ceq)
                 {
                     result = GenTreeConstantValue.ForI4(left.Kind == GenTreeConstantKind.Null && right.Kind == GenTreeConstantKind.Null ? 1 : 0);
                     return true;
@@ -177,101 +177,101 @@ namespace Cnidaria.Cs
 
             try
             {
-                switch (source.SourceOp)
+                switch (source.Operator)
                 {
-                    case BytecodeOp.Add_Ovf:
+                    case GenTreeOperator.AddOvf:
                         result = SignedResult(bits, bits > 32 ? checked(leftSigned + rightSigned) : checked((int)leftSigned + (int)rightSigned));
                         return true;
-                    case BytecodeOp.Sub_Ovf:
+                    case GenTreeOperator.SubOvf:
                         result = SignedResult(bits, bits > 32 ? checked(leftSigned - rightSigned) : checked((int)leftSigned - (int)rightSigned));
                         return true;
-                    case BytecodeOp.Mul_Ovf:
+                    case GenTreeOperator.MulOvf:
                         result = SignedResult(bits, bits > 32 ? checked(leftSigned * rightSigned) : checked((int)leftSigned * (int)rightSigned));
                         return true;
-                    case BytecodeOp.Add_Ovf_Un:
+                    case GenTreeOperator.AddOvfUn:
                         if (bits > 32)
                             result = GenTreeConstantValue.ForI8(unchecked((long)checked(leftUnsigned + rightUnsigned)));
                         else
                             result = GenTreeConstantValue.ForI4(unchecked((int)checked((uint)leftUnsigned + (uint)rightUnsigned)));
                         return true;
-                    case BytecodeOp.Sub_Ovf_Un:
+                    case GenTreeOperator.SubOvfUn:
                         if (bits > 32)
                             result = GenTreeConstantValue.ForI8(unchecked((long)checked(leftUnsigned - rightUnsigned)));
                         else
                             result = GenTreeConstantValue.ForI4(unchecked((int)checked((uint)leftUnsigned - (uint)rightUnsigned)));
                         return true;
-                    case BytecodeOp.Mul_Ovf_Un:
+                    case GenTreeOperator.MulOvfUn:
                         if (bits > 32)
                             result = GenTreeConstantValue.ForI8(unchecked((long)checked(leftUnsigned * rightUnsigned)));
                         else
                             result = GenTreeConstantValue.ForI4(unchecked((int)checked((uint)leftUnsigned * (uint)rightUnsigned)));
                         return true;
-                    case BytecodeOp.Add:
+                    case GenTreeOperator.Add:
                         result = bits > 32
                             ? GenTreeConstantValue.ForI8(unchecked(leftSigned + rightSigned))
                             : GenTreeConstantValue.ForI4(unchecked((int)leftSigned + (int)rightSigned));
                         return true;
-                    case BytecodeOp.Sub:
+                    case GenTreeOperator.Sub:
                         result = bits > 32
                             ? GenTreeConstantValue.ForI8(unchecked(leftSigned - rightSigned))
                             : GenTreeConstantValue.ForI4(unchecked((int)leftSigned - (int)rightSigned));
                         return true;
-                    case BytecodeOp.Mul:
+                    case GenTreeOperator.Mul:
                         result = bits > 32
                             ? GenTreeConstantValue.ForI8(unchecked(leftSigned * rightSigned))
                             : GenTreeConstantValue.ForI4(unchecked((int)leftSigned * (int)rightSigned));
                         return true;
-                    case BytecodeOp.Div:
+                    case GenTreeOperator.Div:
                         if (rightSigned == 0 || (GenTreeArithmeticSemantics.IsSignedMinValue(leftSigned, bits) && rightSigned == -1))
                             return false;
                         result = SignedResult(bits, leftSigned / rightSigned);
                         return true;
-                    case BytecodeOp.Div_Un:
+                    case GenTreeOperator.DivUn:
                         if (rightUnsigned == 0)
                             return false;
                         result = UnsignedResult(bits, leftUnsigned / rightUnsigned);
                         return true;
-                    case BytecodeOp.Rem:
+                    case GenTreeOperator.Rem:
                         if (rightSigned == 0 || (GenTreeArithmeticSemantics.IsSignedMinValue(leftSigned, bits) && rightSigned == -1))
                             return false;
                         result = SignedResult(bits, leftSigned % rightSigned);
                         return true;
-                    case BytecodeOp.Rem_Un:
+                    case GenTreeOperator.RemUn:
                         if (rightUnsigned == 0)
                             return false;
                         result = UnsignedResult(bits, leftUnsigned % rightUnsigned);
                         return true;
-                    case BytecodeOp.And:
+                    case GenTreeOperator.And:
                         result = UnsignedResult(bits, leftUnsigned & rightUnsigned);
                         return true;
-                    case BytecodeOp.Or:
+                    case GenTreeOperator.Or:
                         result = UnsignedResult(bits, leftUnsigned | rightUnsigned);
                         return true;
-                    case BytecodeOp.Xor:
+                    case GenTreeOperator.Xor:
                         result = UnsignedResult(bits, leftUnsigned ^ rightUnsigned);
                         return true;
-                    case BytecodeOp.Shl:
+                    case GenTreeOperator.Shl:
                         result = UnsignedResult(bits, leftUnsigned << ((int)rightUnsigned & (bits - 1)));
                         return true;
-                    case BytecodeOp.Shr:
+                    case GenTreeOperator.Shr:
                         result = SignedResult(bits, leftSigned >> ((int)rightUnsigned & (bits - 1)));
                         return true;
-                    case BytecodeOp.Shr_Un:
+                    case GenTreeOperator.ShrUn:
                         result = UnsignedResult(bits, leftUnsigned >> ((int)rightUnsigned & (bits - 1)));
                         return true;
-                    case BytecodeOp.Ceq:
+                    case GenTreeOperator.Ceq:
                         result = GenTreeConstantValue.ForI4(leftUnsigned == rightUnsigned ? 1 : 0);
                         return true;
-                    case BytecodeOp.Clt:
+                    case GenTreeOperator.Clt:
                         result = GenTreeConstantValue.ForI4(leftSigned < rightSigned ? 1 : 0);
                         return true;
-                    case BytecodeOp.Clt_Un:
+                    case GenTreeOperator.CltUn:
                         result = GenTreeConstantValue.ForI4(leftUnsigned < rightUnsigned ? 1 : 0);
                         return true;
-                    case BytecodeOp.Cgt:
+                    case GenTreeOperator.Cgt:
                         result = GenTreeConstantValue.ForI4(leftSigned > rightSigned ? 1 : 0);
                         return true;
-                    case BytecodeOp.Cgt_Un:
+                    case GenTreeOperator.CgtUn:
                         result = GenTreeConstantValue.ForI4(leftUnsigned > rightUnsigned ? 1 : 0);
                         return true;
                     default:
@@ -392,9 +392,9 @@ namespace Cnidaria.Cs
             if (TryGetConstant(operand, out var constant) && TryFoldUnary(tree, constant, target, out var folded))
                 return CreateConstant(tree, folded);
 
-            if (tree.SourceOp is BytecodeOp.Neg or BytecodeOp.Not &&
+            if (tree.Operator is GenTreeOperator.Neg or GenTreeOperator.Not &&
                 operand.Kind == GenTreeKind.Unary &&
-                operand.SourceOp == tree.SourceOp &&
+                operand.Operator == tree.Operator &&
                 operand.Operands.Length == 1 &&
                 GenTreeArithmeticSemantics.IsIntegralArithmeticType(tree.Type, tree.StackKind))
             {
@@ -447,57 +447,57 @@ namespace Cnidaria.Cs
             ulong value = ConstantAsUnsigned(constant, bits);
             bool constantOnRight = rightConstant;
 
-            switch (tree.SourceOp)
+            switch (tree.Operator)
             {
-                case BytecodeOp.Add:
-                case BytecodeOp.Add_Ovf:
-                case BytecodeOp.Add_Ovf_Un:
+                case GenTreeOperator.Add:
+                case GenTreeOperator.AddOvf:
+                case GenTreeOperator.AddOvfUn:
                     if (value == 0)
                         return other;
                     break;
-                case BytecodeOp.Sub:
-                case BytecodeOp.Sub_Ovf:
-                case BytecodeOp.Sub_Ovf_Un:
+                case GenTreeOperator.Sub:
+                case GenTreeOperator.SubOvf:
+                case GenTreeOperator.SubOvfUn:
                     if (constantOnRight && value == 0)
                         return other;
                     break;
-                case BytecodeOp.Mul:
-                case BytecodeOp.Mul_Ovf:
-                case BytecodeOp.Mul_Ovf_Un:
+                case GenTreeOperator.Mul:
+                case GenTreeOperator.MulOvf:
+                case GenTreeOperator.MulOvfUn:
                     if (value == 1)
                         return other;
                     if (value == 0 && CanDiscard(other, PersistentEffects))
                         return CreateConstant(tree, Zero(bits));
                     break;
-                case BytecodeOp.Div:
-                case BytecodeOp.Div_Un:
+                case GenTreeOperator.Div:
+                case GenTreeOperator.DivUn:
                     if (constantOnRight && value == 1)
                         return tree.Operands[0];
                     break;
-                case BytecodeOp.Rem:
-                case BytecodeOp.Rem_Un:
+                case GenTreeOperator.Rem:
+                case GenTreeOperator.RemUn:
                     if (constantOnRight && value == 1 && CanDiscard(tree.Operands[0], PersistentEffects))
                         return CreateConstant(tree, Zero(bits));
                     break;
-                case BytecodeOp.And:
+                case GenTreeOperator.And:
                     if (value == 0 && CanDiscard(other, PersistentEffects))
                         return CreateConstant(tree, Zero(bits));
                     if (value == (bits > 32 ? ulong.MaxValue : uint.MaxValue))
                         return other;
                     break;
-                case BytecodeOp.Or:
+                case GenTreeOperator.Or:
                     if (value == 0)
                         return other;
                     if (value == (bits > 32 ? ulong.MaxValue : uint.MaxValue) && CanDiscard(other, PersistentEffects))
                         return CreateConstant(tree, SignedResult(bits, -1));
                     break;
-                case BytecodeOp.Xor:
+                case GenTreeOperator.Xor:
                     if (value == 0)
                         return other;
                     break;
-                case BytecodeOp.Shl:
-                case BytecodeOp.Shr:
-                case BytecodeOp.Shr_Un:
+                case GenTreeOperator.Shl:
+                case GenTreeOperator.Shr:
+                case GenTreeOperator.ShrUn:
                     if (value == 0)
                     {
                         if (constantOnRight)
@@ -521,16 +521,16 @@ namespace Cnidaria.Cs
             if (!StructurallyEqual(left, right))
                 return tree;
 
-            switch (tree.SourceOp)
+            switch (tree.Operator)
             {
-                case BytecodeOp.Ceq:
+                case GenTreeOperator.Ceq:
                     if (!IsFloating(left.StackKind))
                         return CreateConstant(tree, GenTreeConstantValue.ForI4(1));
                     break;
-                case BytecodeOp.Clt:
-                case BytecodeOp.Clt_Un:
-                case BytecodeOp.Cgt:
-                case BytecodeOp.Cgt_Un:
+                case GenTreeOperator.Clt:
+                case GenTreeOperator.CltUn:
+                case GenTreeOperator.Cgt:
+                case GenTreeOperator.CgtUn:
                     if (GenTreeArithmeticSemantics.IsIntegralArithmeticType(left.Type, left.StackKind))
                         return CreateConstant(tree, GenTreeConstantValue.ForI4(0));
                     break;
@@ -590,7 +590,7 @@ namespace Cnidaria.Cs
             if (ReferenceEquals(left, right))
                 return true;
             if (left.Kind != right.Kind ||
-                left.SourceOp != right.SourceOp ||
+                left.Operator != right.Operator ||
                 !ReferenceEquals(left.Type, right.Type) ||
                 left.StackKind != right.StackKind ||
                 left.Int32 != right.Int32 ||
@@ -625,7 +625,7 @@ namespace Cnidaria.Cs
             if (direct)
                 return true;
 
-            if (left.Kind == GenTreeKind.Binary && left.Operands.Length == 2 && IsCommutative(left.SourceOp))
+            if (left.Kind == GenTreeKind.Binary && left.Operands.Length == 2 && IsCommutative(left.Operator))
                 return StructurallyEqual(left.Operands[0], right.Operands[1]) && StructurallyEqual(left.Operands[1], right.Operands[0]);
 
             return false;
@@ -639,10 +639,10 @@ namespace Cnidaria.Cs
             return !left.HasValue || left.Value.Equals(right!.Value);
         }
 
-        private static bool IsCommutative(BytecodeOp op)
-            => op is BytecodeOp.Add or BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un or
-                BytecodeOp.Mul or BytecodeOp.Mul_Ovf or BytecodeOp.Mul_Ovf_Un or
-                BytecodeOp.And or BytecodeOp.Or or BytecodeOp.Xor or BytecodeOp.Ceq;
+        private static bool IsCommutative(GenTreeOperator op)
+            => op is GenTreeOperator.Add or GenTreeOperator.AddOvf or GenTreeOperator.AddOvfUn or
+                GenTreeOperator.Mul or GenTreeOperator.MulOvf or GenTreeOperator.MulOvfUn or
+                GenTreeOperator.And or GenTreeOperator.Or or GenTreeOperator.Xor or GenTreeOperator.Ceq;
 
         private static bool CanDiscard(GenTree tree, GenTreeFlags effects)
             => (tree.Flags & effects) == 0;

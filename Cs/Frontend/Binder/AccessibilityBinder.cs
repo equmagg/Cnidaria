@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace Cnidaria.Cs
 {
@@ -87,6 +88,27 @@ namespace Cnidaria.Cs
             {
                 if (cur is NamedTypeSymbol nt && IsSameTypeDefinition(nt, baseType))
                     return true;
+            }
+
+            return baseType.TypeKind == TypeKind.Interface && HasInterfaceDefinition(type, baseType);
+        }
+
+        // Protected interface members are accessible in the interfaces that derive from it and in the types that implement it.
+        private static bool HasInterfaceDefinition(NamedTypeSymbol type, NamedTypeSymbol interfaceType)
+        {
+            var pending = new Stack<TypeSymbol>();
+            for (TypeSymbol? cur = type; cur is not null; cur = cur.BaseType)
+                pending.Push(cur);
+
+            var visited = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer.Instance);
+            while (pending.Count != 0)
+            {
+                if (pending.Pop() is not NamedTypeSymbol current || !visited.Add(current.OriginalDefinition))
+                    continue;
+                if (current.TypeKind == TypeKind.Interface && IsSameTypeDefinition(current, interfaceType))
+                    return true;
+                foreach (var implemented in current.Interfaces)
+                    pending.Push(implemented);
             }
 
             return false;

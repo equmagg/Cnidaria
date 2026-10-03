@@ -111,28 +111,6 @@ namespace Cnidaria.Cs
             }
         }
 
-        private sealed class ClosureData
-        {
-            public readonly Slot[] Cells;
-
-            public ClosureData(Slot[] cells)
-            {
-                Cells = cells;
-            }
-        }
-
-        private sealed class ClosureCellData
-        {
-            public readonly RuntimeType ValueType;
-            public Slot Value;
-
-            public ClosureCellData(RuntimeType valueType, Slot value)
-            {
-                ValueType = valueType;
-                Value = value;
-            }
-        }
-
         private sealed class PendingDelegateInvocation
         {
             public readonly RuntimeMethod InvokeMethod;
@@ -175,10 +153,6 @@ namespace Cnidaria.Cs
             // Jump continuation
             public readonly int TargetPc;
 
-            // Return continuation
-            public readonly bool HasReturnValue;
-            public readonly Slot ReturnValue;
-
             // Throw continuation
             public readonly bool HasPendingException;
             public readonly Slot PendingException;
@@ -190,8 +164,6 @@ namespace Cnidaria.Cs
                 int nextFromPc,
                 FinallyContinuationKind kind,
                 int targetPc,
-                bool hasReturnValue,
-                Slot returnValue,
                 bool hasPendingException,
                 Slot pendingException)
             {
@@ -201,13 +173,11 @@ namespace Cnidaria.Cs
                 NextFromPc = nextFromPc;
                 Kind = kind;
                 TargetPc = targetPc;
-                HasReturnValue = hasReturnValue;
-                ReturnValue = returnValue;
                 HasPendingException = hasPendingException;
                 PendingException = pendingException;
             }
 
-            public static FinallyContext ForJump(int frameBase, ExceptionHandler h, int targetPc)
+            public static FinallyContext ForJump(int frameBase, CilExceptionClause h, int targetPc)
                 => new FinallyContext(
                     frameBase,
                     finallyStartPc: h.HandlerStartPc,
@@ -215,25 +185,10 @@ namespace Cnidaria.Cs
                     nextFromPc: h.TryEndPc,
                     kind: FinallyContinuationKind.Jump,
                     targetPc: targetPc,
-                    hasReturnValue: false,
-                    returnValue: default,
                     hasPendingException: false,
                     pendingException: default);
 
-            public static FinallyContext ForReturn(int frameBase, ExceptionHandler h, bool hasRet, Slot retVal)
-                => new FinallyContext(
-                    frameBase,
-                    finallyStartPc: h.HandlerStartPc,
-                    finallyEndPc: h.HandlerEndPc,
-                    nextFromPc: h.TryEndPc,
-                    kind: FinallyContinuationKind.Return,
-                    targetPc: -1,
-                    hasReturnValue: hasRet,
-                    returnValue: retVal,
-                    hasPendingException: false,
-                    pendingException: default);
-
-            public static FinallyContext ForThrow(int frameBase, ExceptionHandler h, Slot ex)
+            public static FinallyContext ForThrow(int frameBase, CilExceptionClause h, Slot ex)
                 => new FinallyContext(
                     frameBase,
                     finallyStartPc: h.HandlerStartPc,
@@ -241,8 +196,6 @@ namespace Cnidaria.Cs
                     nextFromPc: h.TryEndPc,
                     kind: FinallyContinuationKind.Throw,
                     targetPc: -1,
-                    hasReturnValue: false,
-                    returnValue: default,
                     hasPendingException: true,
                     pendingException: ex);
         }
@@ -261,7 +214,6 @@ namespace Cnidaria.Cs
         private enum FinallyContinuationKind : byte
         {
             Jump,
-            Return,
             Throw,
         }
         private enum FastCellKind : byte
@@ -287,14 +239,36 @@ namespace Cnidaria.Cs
             public int[] LocalSizes = Array.Empty<int>();
             public FastCellKind[] LocalFastKinds = Array.Empty<FastCellKind>();
             public int LocalsAreaSize;
+
+            public int EvalBlobCapacity;
         }
-        private const int FinallyCatchTypeToken = -1;
 
         private const int SlotSize = 16;
         private int ObjectHeaderSize => _rts.Target.ObjectHeaderSize;
 
         private const int GcFlagMark = 1 << 0;
         private const int GcFlagAllocated = 1 << 1;
+        private const int IdentityHashShift = 2;
+        private uint _identityHashState = 0x9E3779B9u;
+        // Identity hashes live above the two GC flag bits of the header
+        private int GetIdentityHash(int obj, bool assign)
+        {
+            int flags = ReadI32(obj + 4);
+            int hash = (int)((uint)flags >> IdentityHashShift);
+            if (hash == 0 && assign)
+            {
+                do
+                {
+                    _identityHashState ^= _identityHashState << 13;
+                    _identityHashState ^= _identityHashState >> 17;
+                    _identityHashState ^= _identityHashState << 5;
+                    hash = (int)(_identityHashState >> IdentityHashShift);
+                }
+                while (hash == 0);
+                WriteI32(obj + 4, flags | (hash << IdentityHashShift));
+            }
+            return hash;
+        }
 
         private int ArrayLengthOffset => ObjectHeaderSize;    // +8
         private int ArrayDataOffset => ObjectHeaderSize + 8;  // +16 aligned
@@ -325,24 +299,21 @@ namespace Cnidaria.Cs
 
         private long _fuel;
         private int _tick;
-        private readonly RuntimeModule[] _moduleById;
-        private readonly Dictionary<string, int> _moduleIdByName;
         private readonly Dictionary<int, int> _staticBaseByTypeId = new();
         private readonly Dictionary<int, byte> _typeInitState = new(); // 0 = not started, 1 = running, 2 = done
         private readonly Dictionary<int, int> _pendingTypeInitFrames = new();
-        private readonly Domain _domain;
         private readonly RuntimeTypeSystem _rts;
         private readonly IReadOnlyDictionary<string, RuntimeModule> _modules;
         private readonly Dictionary<int, PendingCtorResult> _pendingCtorResults = new();
         private readonly Dictionary<int, DelegateData> _delegateDataByObject = new();
-        private readonly Dictionary<int, ClosureData> _closureDataByObject = new();
-        private readonly Dictionary<int, ClosureCellData> _closureCellDataByObject = new();
         private readonly Dictionary<int, PendingDelegateInvocation> _pendingDelegateInvocations = new();
         private readonly List<CatchContext> _catchStack = new();
         private readonly List<FinallyContext> _finallyStack = new();
         private readonly Dictionary<int, MethodExecLayout> _methodLayouts = new();
-        private readonly Dictionary<(BytecodeFunction Function, int Pc), int> _staticDataByInstruction = new();
-        private readonly Dictionary<(BytecodeFunction Function, int Pc), int> _staticDataHeapObjectByInstruction = new();
+        private readonly Dictionary<int, int> _staticDataByField = new();
+        private readonly Dictionary<int, int> _staticDataHeapObjectByField = new();
+        private readonly RuntimeType?[] _primitiveTypes = new RuntimeType?[(int)RuntimePrimitiveKind.Decimal + 1];
+        private RuntimeType? _runtimeTypeHandleType;
         private readonly List<int> _heapObjects = new();
         private readonly Dictionary<string, int> _internPool = new(StringComparer.Ordinal);
         private readonly TextWriter _textWriter;
@@ -350,7 +321,8 @@ namespace Cnidaria.Cs
         private readonly VmCallContext _hostCtx;
 
         private RuntimeModule? _curModule;
-        private BytecodeFunction? _curFn;
+        private RuntimeMethod? _curMethod;
+        private CilMethodBody? _curBody;
         private MethodExecLayout? _curLayout;
 
         private int _curArgsAbs;
@@ -379,7 +351,6 @@ namespace Cnidaria.Cs
             byte[] memory,
             int staticEnd,
             int stackEnd,
-            Domain domain,
             RuntimeTypeSystem rts,
             IReadOnlyDictionary<string, RuntimeModule> modules,
             TextWriter textWriter)
@@ -402,16 +373,7 @@ namespace Cnidaria.Cs
             if (_heapBase > _heapEnd)
                 throw new ArgumentOutOfRangeException("Heap region is empty or invalid.");
 
-            _domain = domain ?? throw new ArgumentNullException(nameof(domain));
             _modules = modules ?? throw new ArgumentNullException(nameof(modules));
-
-            var list = new List<RuntimeModule>(_modules.Count);
-            foreach (var kv in _modules) list.Add(kv.Value);
-            list.Sort((a, b) => StringComparer.Ordinal.Compare(a.Name, b.Name));
-            _moduleById = list.ToArray();
-            _moduleIdByName = new Dictionary<string, int>(StringComparer.Ordinal);
-            for (int i = 0; i < _moduleById.Length; i++)
-                _moduleIdByName[_moduleById[i].Name] = i;
 
             if (!(0 <= _staticEnd && _staticEnd <= _stackBase && _stackBase < _stackEnd && _stackEnd <= _mem.Length))
                 throw new ArgumentOutOfRangeException("Bad memory layout.");
@@ -420,45 +382,37 @@ namespace Cnidaria.Cs
 
             RecomputeGcThresholds();
         }
-        // Frame header layout (all int32, little-endian)
-        // 0:  prevFrameBase
-        // 4:  returnPc
-        // 8:  returnMethodToken
-        // 12: returnModuleId
-        // 16: thisMethodToken
-        // 20: thisModuleId
-        // 24: pc
-        // 28: evalBase
-        // 32: evalSp (slot index)
-        // 36: maxEval (slot capacity)
-        // 40: argsBase
-        // 44: localsBase
-        // 48: evalBlobBase
-        // 52: evalBlobSp (bytes)
-        // 56: evalBlobCap (bytes)
-        // 60: stackallocBase
-        // 64: stackallocSp (bytes)
-        // 68: frameEnd (absolute)
-        // 72: runtimeMethodId (0 if unresolved)
-        private const int FrameHeaderSize = 76;
+        // Frame header layout (all int32)
+        private const int FramePrevBase = 0;
+        private const int FrameReturnPc = 4;
+        private const int FrameMethodId = 8;
+        private const int FramePc = 12;
+        private const int FrameEvalBase = 16;
+        private const int FrameEvalSp = 20;
+        private const int FrameEvalMax = 24;
+        private const int FrameArgsBase = 28;
+        private const int FrameLocalsBase = 32;
+        private const int FrameEvalBlobBase = 36;
+        private const int FrameEvalBlobSp = 40;
+        private const int FrameEvalBlobCap = 44;
+        private const int FrameScratchBase = 48;
+        private const int FrameScratchSp = 52;
+        private const int FrameEnd = 56;
+        private const int FrameHeaderSize = 60;
         public void Execute(
-            RuntimeModule entryModule,
-            BytecodeFunction entry,
+            RuntimeMethod entry,
             CancellationToken ct,
             ExecutionLimits limits,
             ReadOnlySpan<Slot> initialArgs = default)
         {
-            if (entryModule is null) throw new ArgumentNullException(nameof(entryModule));
-            if (entry is null) throw new ArgumentNullException(nameof(entry));
-            if (limits is null) throw new ArgumentNullException(nameof(limits));
+            ArgumentNullException.ThrowIfNull(entry);
+            ArgumentNullException.ThrowIfNull(limits);
 
             _instructionLimit = limits.MaxInstructions;
             _fuel = limits.MaxInstructions;
             _tick = 0;
 
-            // Push initial frame
-            PushFrame(entryModule, entry, returnPc: -1, returnMethodToken: 0, returnModuleId: -1, ct, limits,
-                runtimeMethod: ResolveRuntimeMethodOrThrow(entryModule, entry.MethodToken), initialArgs: initialArgs);
+            PushFrame(entry, returnPc: -1, ct, limits, initialArgs: initialArgs);
 
             while (_frameBase >= 0)
             {
@@ -476,685 +430,414 @@ namespace Cnidaria.Cs
                 PruneCatchContextsForPc(_curPc);
 
                 var mod = _curModule ?? throw new InvalidOperationException("No current module.");
-                var fn = _curFn ?? throw new InvalidOperationException("No current function.");
+                var body = _curBody ?? throw new InvalidOperationException("No current method body.");
                 int pc = _curPc;
-                if ((uint)pc >= (uint)fn.Instructions.Length)
+                if ((uint)pc >= (uint)body.Instructions.Length)
                     throw new InvalidOperationException($"PC out of range: {pc}");
 
-                var ins = fn.Instructions[pc];
+                var ins = body.Instructions[pc];
                 _curPc = pc + 1;
                 try
                 {
                     switch (ins.Op)
                     {
-                        case BytecodeOp.Nop:
+                        case ILOpCode.Nop:
                             break;
 
-                        case BytecodeOp.Ldc_I4:
-                            PushSlot(new Slot(SlotKind.I4, ins.Operand0));
+                        case ILOpCode.Ldc_I4:
+                            PushSlot(new Slot(SlotKind.I4, ins.Int32));
                             break;
 
-                        case BytecodeOp.Ldc_I8:
-                            PushSlot(new Slot(SlotKind.I8, ins.Operand2));
+                        case ILOpCode.Ldc_I8:
+                            PushSlot(new Slot(SlotKind.I8, ins.Operand));
                             break;
 
-                        case BytecodeOp.Ldc_R4:
-                            PushSlot(new Slot(SlotKind.R4, ins.Operand0));
+                        case ILOpCode.Ldc_R4:
+                            PushSlot(new Slot(SlotKind.R4, ins.Int32));
                             break;
 
-                        case BytecodeOp.Ldc_R8:
-                            PushSlot(new Slot(SlotKind.R8, ins.Operand2));
+                        case ILOpCode.Ldc_R8:
+                            PushSlot(new Slot(SlotKind.R8, ins.Operand));
                             break;
 
-                        case BytecodeOp.Ldnull:
+                        case ILOpCode.Ldnull:
                             PushSlot(new Slot(SlotKind.Null, 0));
                             break;
 
-                        case BytecodeOp.DefaultValue:
-                            ExecDefaultValue(mod, ins.Operand0);
+                        case ILOpCode.Ldstr:
+                            ExecLdstr(mod, ins.Token);
                             break;
 
-                        case BytecodeOp.Sizeof:
-                            ExecSizeof(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.TypeIsValueType:
-                            ExecTypeIsValueType(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.TypeIsPrimitive:
-                            ExecTypeIsPrimitive(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.TypeIsEnum:
-                            ExecTypeIsEnum(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.TypeEquals:
-                            ExecTypeEquals(mod, ins.Operand0, ins.Operand1);
-                            break;
-
-                        case BytecodeOp.ObjectTypeEquals:
-                            ExecObjectTypeEquals(mod, ins.Operand0, ins.Operand1);
-                            break;
-
-                        case BytecodeOp.Pop:
+                        case ILOpCode.Pop:
                             _ = PopSlot();
                             break;
 
-                        case BytecodeOp.Dup:
+                        case ILOpCode.Dup:
+                            PushSlot(PeekSlot());
+                            break;
+
+                        case ILOpCode.Ldloc:
+                            LoadLocal(ins.Int32);
+                            break;
+
+                        case ILOpCode.Stloc:
+                            StoreLocal(ins.Int32, PopSlot());
+                            break;
+
+                        case ILOpCode.Ldloca:
                             {
-                                var v = PeekSlot();
-                                PushSlot(v);
+                                var layout = _curLayout ?? throw new InvalidOperationException("No current layout.");
+                                PushSlot(new Slot(SlotKind.ByRef, _curLocalsAbs + layout.LocalOffsets[ins.Int32], aux: layout.LocalSizes[ins.Int32]));
                             }
                             break;
 
-                        case BytecodeOp.Ldloc:
+                        case ILOpCode.Ldarg:
+                            LoadArg(ins.Int32);
+                            break;
+
+                        case ILOpCode.Starg:
+                            StoreArg(ins.Int32, PopSlot());
+                            break;
+
+                        case ILOpCode.Ldarga:
                             {
-                                int loc = ins.Operand0;
-                                LoadLocal(loc);
+                                var layout = _curLayout ?? throw new InvalidOperationException("No current layout.");
+                                PushSlot(new Slot(SlotKind.ByRef, _curArgsAbs + layout.ArgOffsets[ins.Int32], aux: layout.ArgSizes[ins.Int32]));
                             }
                             break;
 
-                        case BytecodeOp.Stloc:
-                            {
-                                int loc = ins.Operand0;
-                                StoreLocal(loc, PopSlot());
-                            }
-                            break;
-
-                        case BytecodeOp.Ldarg:
-                            {
-                                int arg = ins.Operand0;
-                                LoadArg(arg);
-                            }
-                            break;
-
-                        case BytecodeOp.Starg:
-                            {
-                                int arg = ins.Operand0;
-                                StoreArg(arg, PopSlot());
-                            }
-                            break;
-
-                        case BytecodeOp.Ldthis:
-                            LoadArg(0);
-                            break;
-
-                        case BytecodeOp.Neg:
+                        case ILOpCode.Neg:
                             ExecNeg();
                             break;
-
-                        case BytecodeOp.Not:
+                        case ILOpCode.Not:
                             ExecNot();
                             break;
-
-                        case BytecodeOp.Add:
+                        case ILOpCode.Add:
                             ExecAdd();
                             break;
-                        case BytecodeOp.Add_Ovf:
+                        case ILOpCode.Add_Ovf:
                             ExecAddChecked(unsigned: false);
                             break;
-                        case BytecodeOp.Add_Ovf_Un:
+                        case ILOpCode.Add_Ovf_Un:
                             ExecAddChecked(unsigned: true);
                             break;
-
-                        case BytecodeOp.Sub:
+                        case ILOpCode.Sub:
                             ExecSubtract();
                             break;
-                        case BytecodeOp.Sub_Ovf:
+                        case ILOpCode.Sub_Ovf:
                             ExecSubtractChecked(unsigned: false);
                             break;
-                        case BytecodeOp.Sub_Ovf_Un:
+                        case ILOpCode.Sub_Ovf_Un:
                             ExecSubtractChecked(unsigned: true);
                             break;
-
-                        case BytecodeOp.Mul:
+                        case ILOpCode.Mul:
                             ExecMultiply();
                             break;
-                        case BytecodeOp.Mul_Ovf:
+                        case ILOpCode.Mul_Ovf:
                             ExecMultiplyChecked(unsigned: false);
                             break;
-                        case BytecodeOp.Mul_Ovf_Un:
+                        case ILOpCode.Mul_Ovf_Un:
                             ExecMultiplyChecked(unsigned: true);
                             break;
-
-                        case BytecodeOp.Div:
+                        case ILOpCode.Div:
                             ExecDivide();
                             break;
-
-                        case BytecodeOp.Div_Un:
+                        case ILOpCode.Div_Un:
                             ExecUnsignedDivide();
                             break;
-
-                        case BytecodeOp.Rem:
+                        case ILOpCode.Rem:
                             ExecRemeinder();
                             break;
-
-                        case BytecodeOp.Rem_Un:
+                        case ILOpCode.Rem_Un:
                             ExecUnsignedRemeinder();
                             break;
-
-                        case BytecodeOp.And:
+                        case ILOpCode.And:
                             ExecBitwiseAnd();
                             break;
-
-                        case BytecodeOp.Or:
+                        case ILOpCode.Or:
                             ExecBitwiseOr();
                             break;
-
-                        case BytecodeOp.Xor:
+                        case ILOpCode.Xor:
                             ExecBitwiseXor();
                             break;
-
-                        case BytecodeOp.Shl:
+                        case ILOpCode.Shl:
                             ExecShiftLeft();
                             break;
-
-                        case BytecodeOp.Shr:
+                        case ILOpCode.Shr:
                             ExecShiftRight();
                             break;
-
-                        case BytecodeOp.Shr_Un:
+                        case ILOpCode.Shr_Un:
                             ExecUnsignedShiftRight();
                             break;
 
-                        case BytecodeOp.Clt:
+                        case ILOpCode.Ceq:
+                        case ILOpCode.Cgt:
+                        case ILOpCode.Cgt_Un:
+                        case ILOpCode.Clt:
+                        case ILOpCode.Clt_Un:
                             {
-                                var b = PopSlot();
-                                var a = PopSlot();
-                                PushSlot(new Slot(SlotKind.I4, CompareLess(a, b)));
+                                var (a, b) = PopComparisonOperands();
+                                PushSlot(new Slot(SlotKind.I4, Compare(ins.Op, a, b) ? 1 : 0));
                             }
                             break;
 
-                        case BytecodeOp.Clt_Un:
+                        case ILOpCode.Br:
+                            _curPc = ins.TargetPc;
+                            break;
+                        case ILOpCode.Brtrue:
+                            if (ToBool(PopSlot()))
+                                _curPc = ins.TargetPc;
+                            break;
+                        case ILOpCode.Brfalse:
+                            if (!ToBool(PopSlot()))
+                                _curPc = ins.TargetPc;
+                            break;
+                        case ILOpCode.Beq:
+                        case ILOpCode.Bne_Un:
+                        case ILOpCode.Bge:
+                        case ILOpCode.Bge_Un:
+                        case ILOpCode.Bgt:
+                        case ILOpCode.Bgt_Un:
+                        case ILOpCode.Ble:
+                        case ILOpCode.Ble_Un:
+                        case ILOpCode.Blt:
+                        case ILOpCode.Blt_Un:
                             {
-                                var b = PopSlot();
-                                var a = PopSlot();
-                                PushSlot(new Slot(SlotKind.I4, CompareLessUnsigned(a, b)));
+                                var (a, b) = PopComparisonOperands();
+                                if (Compare(ins.Op, a, b))
+                                    _curPc = ins.TargetPc;
+                            }
+                            break;
+                        case ILOpCode.Switch:
+                            {
+                                long index = IntegerPayload(PopSlot());
+                                var targets = body.GetSwitchTargets(ins);
+                                if ((ulong)index < (ulong)targets.Length)
+                                    _curPc = targets[(int)index];
+                            }
+                            break;
+                        case ILOpCode.Leave:
+                            ExecLeave(fromPc: pc, targetPc: ins.TargetPc);
+                            break;
+
+                        case ILOpCode.Conv_I1:
+                        case ILOpCode.Conv_I2:
+                        case ILOpCode.Conv_I4:
+                        case ILOpCode.Conv_I8:
+                        case ILOpCode.Conv_U1:
+                        case ILOpCode.Conv_U2:
+                        case ILOpCode.Conv_U4:
+                        case ILOpCode.Conv_U8:
+                        case ILOpCode.Conv_I:
+                        case ILOpCode.Conv_U:
+                        case ILOpCode.Conv_R4:
+                        case ILOpCode.Conv_R8:
+                        case ILOpCode.Conv_R_Un:
+                        case ILOpCode.Conv_Ovf_I1:
+                        case ILOpCode.Conv_Ovf_I2:
+                        case ILOpCode.Conv_Ovf_I4:
+                        case ILOpCode.Conv_Ovf_I8:
+                        case ILOpCode.Conv_Ovf_U1:
+                        case ILOpCode.Conv_Ovf_U2:
+                        case ILOpCode.Conv_Ovf_U4:
+                        case ILOpCode.Conv_Ovf_U8:
+                        case ILOpCode.Conv_Ovf_I:
+                        case ILOpCode.Conv_Ovf_U:
+                        case ILOpCode.Conv_Ovf_I1_Un:
+                        case ILOpCode.Conv_Ovf_I2_Un:
+                        case ILOpCode.Conv_Ovf_I4_Un:
+                        case ILOpCode.Conv_Ovf_I8_Un:
+                        case ILOpCode.Conv_Ovf_U1_Un:
+                        case ILOpCode.Conv_Ovf_U2_Un:
+                        case ILOpCode.Conv_Ovf_U4_Un:
+                        case ILOpCode.Conv_Ovf_U8_Un:
+                        case ILOpCode.Conv_Ovf_I_Un:
+                        case ILOpCode.Conv_Ovf_U_Un:
+                            PushSlot(ConvertCil(ins.Op, PopSlot()));
+                            break;
+
+                        case ILOpCode.Ldind_I1:
+                        case ILOpCode.Ldind_U1:
+                        case ILOpCode.Ldind_I2:
+                        case ILOpCode.Ldind_U2:
+                        case ILOpCode.Ldind_I4:
+                        case ILOpCode.Ldind_U4:
+                        case ILOpCode.Ldind_I8:
+                        case ILOpCode.Ldind_I:
+                        case ILOpCode.Ldind_R4:
+                        case ILOpCode.Ldind_R8:
+                        case ILOpCode.Ldind_Ref:
+                            ExecLdind(IndirectType(ins.Op));
+                            break;
+
+                        case ILOpCode.Stind_I1:
+                        case ILOpCode.Stind_I2:
+                        case ILOpCode.Stind_I4:
+                        case ILOpCode.Stind_I8:
+                        case ILOpCode.Stind_I:
+                        case ILOpCode.Stind_R4:
+                        case ILOpCode.Stind_R8:
+                        case ILOpCode.Stind_Ref:
+                            ExecStind(IndirectType(ins.Op));
+                            break;
+
+                        case ILOpCode.Ldobj:
+                            ExecLdobj(mod, ins.Token);
+                            break;
+                        case ILOpCode.Stobj:
+                            ExecStobj(mod, ins.Token);
+                            break;
+                        case ILOpCode.Cpobj:
+                            ExecCpobj(mod, ins.Token);
+                            break;
+                        case ILOpCode.Initobj:
+                            ExecInitobj(mod, ins.Token);
+                            break;
+                        case ILOpCode.Cpblk:
+                            ExecCpblk();
+                            break;
+                        case ILOpCode.Initblk:
+                            ExecInitblk();
+                            break;
+
+                        case ILOpCode.Call:
+                        case ILOpCode.Callvirt:
+                            ExecCall(mod, ins, pc, ct, limits);
+                            break;
+
+                        case ILOpCode.Calli:
+                            ExecCalli(mod, ins.Token, pc, ct, limits);
+                            break;
+
+                        case ILOpCode.Ldftn:
+                            PushSlot(new Slot(SlotKind.FunctionPointer, ResolveRuntimeMethodOrThrow(mod, ins.Token, _curMethod).MethodId));
+                            break;
+
+                        case ILOpCode.Ldvirtftn:
+                            {
+                                var declared = ResolveRuntimeMethodOrThrow(mod, ins.Token, _curMethod);
+                                var target = ResolveVirtualDispatch(GetObjectTypeFromRef(PopSlot()), declared);
+                                PushSlot(new Slot(SlotKind.FunctionPointer, target.MethodId));
                             }
                             break;
 
-                        case BytecodeOp.Cgt:
+                        case ILOpCode.Ret:
                             {
-                                var b = PopSlot();
-                                var a = PopSlot();
-                                PushSlot(new Slot(SlotKind.I4, CompareGreater(a, b)));
-                            }
-                            break;
-
-                        case BytecodeOp.Cgt_Un:
-                            {
-                                var b = PopSlot();
-                                var a = PopSlot();
-                                PushSlot(new Slot(SlotKind.I4, CompareGreaterUnsigned(a, b)));
-                            }
-                            break;
-
-                        case BytecodeOp.Ceq:
-                            {
-                                var b = PopSlot();
-                                var a = PopSlot();
-                                int res = CompareEqual(a, b);
-                                PushSlot(new Slot(SlotKind.I4, res));
-                            }
-                            break;
-
-                        case BytecodeOp.Br:
-                            _curPc = ins.Operand0;
-                            break;
-                        case BytecodeOp.Leave:
-                            ExecLeave(fn, fromPc: pc, targetPc: ins.Operand0);
-                            break;
-                        case BytecodeOp.Brtrue:
-                            {
-                                var cond = PopSlot();
-                                if (ToBool(cond))
-                                    _curPc = ins.Operand0;
-                            }
-                            break;
-
-                        case BytecodeOp.Brfalse:
-                            {
-                                var cond = PopSlot();
-                                if (!ToBool(cond))
-                                    _curPc = ins.Operand0;
-                            }
-                            break;
-
-                        case BytecodeOp.Conv:
-                            {
-                                var v = PopSlot();
-                                var kind = (NumericConvKind)ins.Operand0;
-                                var flags = (NumericConvFlags)ins.Operand1;
-                                PushSlot(DoConv(v, kind, flags));
-                            }
-                            break;
-
-                        case BytecodeOp.Call:
-                            {
-                                int callTok = ins.Operand0;
-                                int packed = ins.Operand1;
-                                int argCount = packed & 0x7FFF;
-                                int hasThis = (packed >> 15) & 1;
-                                int total = argCount + hasThis;
-
-                                var rm = ResolveRuntimeMethodOrThrow(mod, callTok, _curLayout?.Method);
-
-                                if (rm.IsStatic && !StringComparer.Ordinal.Equals(rm.Name, ".cctor"))
-                                {
-                                    if (TryDeferTypeInitialization(rm.DeclaringType, resumePc: pc, ct, limits))
-                                        break;
-                                }
-
-                                if (rm.IsExtern)
-                                    throw new PlatformNotSupportedException(
-                                        $"Extern method calls are not supported by the stack VM: {rm.DeclaringType.Namespace}.{rm.DeclaringType.Name}.{rm.Name}");
-
-                                if (hasThis != 0 && rm.DeclaringType.IsValueType)
-                                {
-                                    int thisIndex = _curEvalSp - total;
-                                    if ((uint)thisIndex >= (uint)_curEvalSp)
-                                        throw new InvalidOperationException("Eval stack underflow for value-type 'this'.");
-
-                                    var thisSlot = _hotEvalSlots[thisIndex];
-                                    if (thisSlot.Kind == SlotKind.Ref)
-                                    {
-                                        var actualThisType = GetObjectTypeFromRef(thisSlot);
-                                        if (actualThisType.TypeId != rm.DeclaringType.TypeId)
-                                            throw new InvalidOperationException(
-                                                $"Boxed receiver type mismatch: have '{actualThisType.Namespace}.{actualThisType.Name}', need '{rm.DeclaringType.Namespace}.{rm.DeclaringType.Name}'.");
-
-                                        int boxedObjAbs = checked((int)thisSlot.Payload);
-                                        int payloadAbs = GetBoxedValuePayloadAbs(boxedObjAbs);
-                                        var (sz, _) = GetStorageSizeAlign(rm.DeclaringType);
-                                        _hotEvalSlots[thisIndex] = new Slot(SlotKind.ByRef, payloadAbs, aux: sz);
-                                    }
-                                }
-
-                                if (rm.IsStatic && TryInvokeHostOverride(rm, total, ct))
-                                    break;
-
-                                if (TryInvokeIntrinsic(rm, total, ct))
-                                    break;
-
-                                var targetModule = rm.BodyModule;
-                                var targetFn = rm.Body;
-
-                                if (targetModule is null || targetFn is null)
-                                    throw new MissingMethodException(
-                                        $"No body for target: {rm.DeclaringType.Namespace}.{rm.DeclaringType.Name}.{rm.Name}");
-
-                                int callerModuleId = ReadI32(_frameBase + 20);
-
-                                PushFrame(
-                                    targetModule,
-                                    targetFn,
-                                    returnPc: _curPc,
-                                    returnMethodToken: fn.MethodToken,
-                                    returnModuleId: callerModuleId,
-                                    ct,
-                                    limits,
-                                    totalArgsOnCallerStack: total,
-                                    runtimeMethod: rm);
-
-                            }
-                            break;
-
-                        case BytecodeOp.Ldftn:
-                            {
-                                var method = ResolveRuntimeMethodOrThrow(mod, ins.Operand0, _curLayout?.Method);
-                                if (!method.IsStatic)
-                                    throw new InvalidOperationException("Function pointers to instance methods are not supported.");
-                                PushSlot(new Slot(SlotKind.FunctionPointer, method.MethodId));
-                            }
-                            break;
-
-                        case BytecodeOp.FnPtrToPtr:
-                            {
-                                var functionPointer = PopSlot();
-                                if (functionPointer.Kind == SlotKind.Null)
-                                {
-                                    PushSlot(functionPointer);
-                                    break;
-                                }
-                                if (functionPointer.Kind != SlotKind.FunctionPointer)
-                                    throw new InvalidOperationException($"FnPtrToPtr requires a function pointer, got {functionPointer.Kind}.");
-                                PushSlot(new Slot(SlotKind.Ptr, GetFunctionPointerNativeValue(functionPointer)));
-                            }
-                            break;
-
-                        case BytecodeOp.PtrToFnPtr:
-                            {
-                                var pointer = PopSlot();
-                                if (pointer.Kind == SlotKind.Null)
-                                {
-                                    PushSlot(pointer);
-                                    break;
-                                }
-                                if (pointer.Kind != SlotKind.Ptr)
-                                    throw new InvalidOperationException($"PtrToFnPtr requires a pointer, got {pointer.Kind}.");
-                                PushSlot(CreateFunctionPointerSlot(pointer.Payload));
-                            }
-                            break;
-
-                        case BytecodeOp.Calli:
-                            {
-                                int argumentCount = ins.Operand1;
-                                int functionPointerIndex = _curEvalSp - argumentCount - 1;
-                                if ((uint)functionPointerIndex >= (uint)_curEvalSp)
-                                    throw new InvalidOperationException("Eval stack underflow for Calli.");
-
-                                var functionPointer = _hotEvalSlots[functionPointerIndex];
-                                if (functionPointer.Kind == SlotKind.Null)
-                                    throw new NullReferenceException("Attempted to invoke a null function pointer.");
-                                if (functionPointer.Kind != SlotKind.FunctionPointer)
-                                    throw new InvalidOperationException($"Calli requires a function pointer, got {functionPointer.Kind}.");
-                                if (functionPointer.Aux != 0)
-                                    throw new PlatformNotSupportedException("Calls through native function pointer addresses are not supported by the stack VM.");
-
-                                var target = _rts.GetMethodById(checked((int)functionPointer.Payload));
-                                var signature = _rts.ResolveTypeInMethodContext(mod, ins.Operand0, _curLayout?.Method);
-                                ValidateFunctionPointerCallTarget(signature, target, argumentCount);
-
-                                if (target.IsStatic && !StringComparer.Ordinal.Equals(target.Name, ".cctor"))
-                                {
-                                    if (TryDeferTypeInitialization(target.DeclaringType, resumePc: pc, ct, limits))
-                                        break;
-                                }
-
-                                if (target.IsExtern)
-                                    throw new PlatformNotSupportedException(
-                                        $"Extern function pointer calls are not supported by the stack VM: {target.DeclaringType.Namespace}.{target.DeclaringType.Name}.{target.Name}");
-
-                                for (int i = 0; i < argumentCount; i++)
-                                    _hotEvalSlots[functionPointerIndex + i] = _hotEvalSlots[functionPointerIndex + i + 1];
-                                _curEvalSp--;
-
-                                if (TryInvokeHostOverride(target, argumentCount, ct))
-                                    break;
-
-                                if (TryInvokeIntrinsic(target, argumentCount, ct))
-                                    break;
-
-                                var targetModule = target.BodyModule;
-                                var targetFunction = target.Body;
-                                if (targetModule is null || targetFunction is null)
-                                    throw new MissingMethodException(
-                                        $"No body for function pointer target: {target.DeclaringType.Namespace}.{target.DeclaringType.Name}.{target.Name}");
-
-                                int callerModuleId = ReadI32(_frameBase + 20);
-                                PushFrame(
-                                    targetModule,
-                                    targetFunction,
-                                    returnPc: _curPc,
-                                    returnMethodToken: fn.MethodToken,
-                                    returnModuleId: callerModuleId,
-                                    ct,
-                                    limits,
-                                    totalArgsOnCallerStack: argumentCount,
-                                    runtimeMethod: target);
-                            }
-                            break;
-
-                        case BytecodeOp.CallVirt:
-                            {
-                                int callTok = ins.Operand0;
-                                int packed = ins.Operand1;
-                                int argCount = packed & 0x7FFF;
-                                int hasThis = (packed >> 15) & 1;
-                                int total = argCount + hasThis;
-
-                                if (hasThis == 0)
-                                    throw new InvalidOperationException("CallVirt without 'this' is not supported.");
-
-                                int thisIndex = _curEvalSp - total;
-                                if ((uint)thisIndex >= (uint)_curEvalSp)
-                                    throw new InvalidOperationException("Eval stack underflow for CallVirt.");
-
-                                var receiver = _hotEvalSlots[thisIndex];
-                                var receiverType = GetObjectTypeFromRef(receiver); // includes null check
-
-                                var declared = ResolveRuntimeMethodOrThrow(mod, callTok, _curLayout?.Method);
-                                var targetRm = ResolveVirtualDispatch(receiverType, declared);
-                                if (targetRm.IsExtern)
-                                    throw new PlatformNotSupportedException(
-                                        $"Extern method calls are not supported by the stack VM: {targetRm.DeclaringType.Namespace}.{targetRm.DeclaringType.Name}.{targetRm.Name}");
-                                if (targetRm.DeclaringType.IsValueType && receiver.Kind == SlotKind.Ref)
-                                {
-                                    int boxedObjAbs = checked((int)receiver.Payload);
-                                    int payloadAbs = GetBoxedValuePayloadAbs(boxedObjAbs);
-                                    var (sz, _) = GetStorageSizeAlign(targetRm.DeclaringType);
-                                    _hotEvalSlots[thisIndex] = new Slot(SlotKind.ByRef, payloadAbs, aux: sz);
-                                }
-                                if (TryInvokeIntrinsic(targetRm, total, ct))
-                                    break;
-
-                                var targetModule = targetRm.BodyModule;
-                                var targetFn = targetRm.Body;
-                                if (targetModule is null || targetFn is null)
-                                    throw new MissingMethodException(
-                                        $"No body for virtual target: {targetRm.DeclaringType.Namespace}.{targetRm.DeclaringType.Name}.{targetRm.Name}");
-
-                                int callerModuleId = ReadI32(_frameBase + 20);
-
-                                PushFrame(
-                                    targetModule,
-                                    targetFn,
-                                    returnPc: _curPc,
-                                    returnMethodToken: fn.MethodToken,
-                                    returnModuleId: callerModuleId,
-                                    ct, limits,
-                                    totalArgsOnCallerStack: total,
-                                    runtimeMethod: targetRm);
-                            }
-                            break;
-
-                        case BytecodeOp.Ret:
-                            {
-                                Slot retVal = default;
-                                bool hasRet = ins.Pop == 1;
-                                if (hasRet)
-                                    retVal = PopSlot();
-
-                                if (TryBeginFinallyForReturn(fn, fromPc: pc, hasRet: hasRet, retVal: retVal))
-                                    break;
-
+                                bool hasRet = !IsVoidReturn((_curMethod ?? throw new InvalidOperationException("No current method.")).ReturnType);
+                                Slot retVal = hasRet ? PopSlot() : default;
                                 CompleteReturnFromCurrentFrame(hasRet, retVal, ct, limits);
                             }
                             break;
-                        case BytecodeOp.Throw:
-                            {
-                                var ex = NormalizeThrownException(PopSlot());
-                                ThrowException(ex, throwPc: pc);
-                            }
+
+                        case ILOpCode.Throw:
+                            ThrowException(NormalizeThrownException(PopSlot()), throwPc: pc);
                             break;
-                        case BytecodeOp.Rethrow:
-                            {
-                                var ex = GetCurrentCatchExceptionOrThrow();
-                                ThrowException(ex, throwPc: pc);
-                            }
+                        case ILOpCode.Rethrow:
+                            ThrowException(GetCurrentCatchExceptionOrThrow(), throwPc: pc);
                             break;
-                        case BytecodeOp.Ldexception:
-                            PushSlot(GetCurrentCatchExceptionOrThrow());
-                            break;
-                        case BytecodeOp.Endfinally:
-                            ExecEndfinally(pc, ct, limits);
-                            break;
-                        case BytecodeOp.Ldloca:
-                            {
-                                int loc = ins.Operand0;
-                                var layout = _curLayout ?? throw new InvalidOperationException("No current layout.");
-                                int abs = _curLocalsAbs + layout.LocalOffsets[loc];
-                                int sz = layout.LocalSizes[loc];
-                                PushSlot(new Slot(SlotKind.ByRef, abs, aux: sz));
-                            }
+                        case ILOpCode.Endfinally:
+                            ExecEndfinally(ct, limits);
                             break;
 
-                        case BytecodeOp.Ldarga:
-                            {
-                                int arg = ins.Operand0;
-                                var layout = _curLayout ?? throw new InvalidOperationException("No current layout.");
-                                int abs = _curArgsAbs + layout.ArgOffsets[arg];
-                                int sz = layout.ArgSizes[arg];
-                                PushSlot(new Slot(SlotKind.ByRef, abs, aux: sz));
-                            }
+                        case ILOpCode.Localloc:
+                            ExecLocalloc(body.InitLocals);
                             break;
 
-                        case BytecodeOp.StaticData:
-                            ExecStaticData(fn, pc, ins.Operand0, ins.Operand1);
-                            break;
-
-                        case BytecodeOp.StackAlloc:
-                            if (ins.Operand1 == 0)
-                                ExecStackAlloc(ins.Operand0);
-                            else if (ins.Operand1 == 1)
-                                ExecStackAllocConstant(ins.Operand2, ins.Operand0);
-                            else
-                                throw new InvalidOperationException("Bad stackalloc encoding.");
-                            break;
-
-                        case BytecodeOp.PtrToByRef:
-                            ExecPtrToByRef();
-                            break;
-
-                        case BytecodeOp.LdArrayDataRef:
-                            ExecLdArrayDataRef();
-                            break;
-
-                        case BytecodeOp.PtrElemAddr:
-                            ExecPtrElemAddr(ins.Operand0);
-                            break;
-
-                        case BytecodeOp.PtrDiff:
-                            ExecPtrDiff(ins.Operand0);
-                            break;
-
-                        case BytecodeOp.Ldobj:
-                            ExecLdobj(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.Stobj:
-                            ExecStobj(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.Newobj:
-                            if (TryDeferTypeInitializationForNewobj(mod, ctorToken: ins.Operand0, resumePc: pc, ct, limits))
+                        case ILOpCode.Newobj:
+                            if (TryDeferTypeInitializationForNewobj(mod, ctorToken: ins.Token, resumePc: pc, ct, limits))
                                 break;
-                            ExecNewobj(mod, ins.Operand0, ins.Operand1, ct, limits);
+                            ExecNewobj(mod, ins.Token, ct, limits);
                             break;
 
-                        case BytecodeOp.Ldfld:
-                            ExecLdfld(mod, ins.Operand0);
+                        case ILOpCode.Ldfld:
+                            ExecLdfld(mod, ins.Token);
+                            break;
+                        case ILOpCode.Ldflda:
+                            ExecLdflda(mod, ins.Token);
+                            break;
+                        case ILOpCode.Stfld:
+                            ExecStfld(mod, ins.Token);
                             break;
 
-                        case BytecodeOp.Ldflda:
-                            ExecLdflda(mod, ins.Operand0);
+                        case ILOpCode.Ldsfld:
+                            if (!TryDeferTypeInitializationForStaticField(mod, fieldToken: ins.Token, resumePc: pc, ct, limits))
+                                ExecLdsfld(mod, ins.Token);
+                            break;
+                        case ILOpCode.Ldsflda:
+                            if (!TryDeferTypeInitializationForStaticField(mod, fieldToken: ins.Token, resumePc: pc, ct, limits))
+                                ExecLdsflda(mod, ins.Token);
+                            break;
+                        case ILOpCode.Stsfld:
+                            if (!TryDeferTypeInitializationForStaticField(mod, fieldToken: ins.Token, resumePc: pc, ct, limits))
+                                ExecStsfld(mod, ins.Token);
                             break;
 
-                        case BytecodeOp.Stfld:
-                            ExecStfld(mod, ins.Operand0);
+                        case ILOpCode.Newarr:
+                            ExecNewarr(mod, ins.Token);
                             break;
-
-                        case BytecodeOp.Ldsfld:
-                            if (!TryDeferTypeInitializationForStaticField(mod, fieldToken: ins.Operand0, resumePc: pc, ct, limits))
-                                ExecLdsfld(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.Ldsflda:
-                            if (!TryDeferTypeInitializationForStaticField(mod, fieldToken: ins.Operand0, resumePc: pc, ct, limits))
-                                ExecLdsflda(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.Stsfld:
-                            if (!TryDeferTypeInitializationForStaticField(mod, fieldToken: ins.Operand0, resumePc: pc, ct, limits))
-                                ExecStsfld(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.Ldstr:
-                            ExecLdstr(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.Newarr:
-                            ExecNewarr(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.Ldelem:
-                            ExecLdelem(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.Ldelema:
-                            ExecLdelema(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.Stelem:
-                            ExecStelem(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.CastClass:
-                            ExecCastClass(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.Isinst:
-                            ExecIsinst(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.NewClosureCell:
-                            ExecNewClosureCell(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.LdClosureCell:
-                            ExecLdClosureCell(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.StClosureCell:
-                            ExecStClosureCell(mod, ins.Operand0);
-                            break;
-
-                        case BytecodeOp.NewClosure:
-                            ExecNewClosure(ins.Operand0);
-                            break;
-
-                        case BytecodeOp.LdClosureSlot:
-                            ExecLdClosureSlot(ins.Operand0);
-                            break;
-
-                        case BytecodeOp.NewDelegate:
-                            ExecNewDelegate(mod, ins.Operand0, ins.Operand1);
-                            break;
-
-                        case BytecodeOp.NewDelegateClosed:
-                            ExecNewDelegateClosed(mod, ins.Operand0, ins.Operand1);
-                            break;
-
-                        case BytecodeOp.DelegateCombine:
+                        case ILOpCode.Ldlen:
                             {
-                                var b = PopSlot();
-                                var a = PopSlot();
-                                PushSlot(ExecDelegateCombine(a, b));
-                                break;
+                                var array = PopSlot();
+                                ValidateArrayRefAny(array, out _, out int length, out _);
+                                PushSlot(NativeIntSlot(length));
                             }
-
-                        case BytecodeOp.DelegateRemove:
-                            {
-                                var value = PopSlot();
-                                var source = PopSlot();
-                                PushSlot(ExecDelegateRemove(source, value));
-                                break;
-                            }
-
-                        case BytecodeOp.DelegateInvoke:
-                            ExecDelegateInvoke(mod, ins.Operand0, ins.Operand1, ct, limits);
+                            break;
+                        case ILOpCode.Ldelema:
+                            ExecLdelema(mod, ins.Token);
+                            break;
+                        case ILOpCode.Ldelem:
+                            ExecLdelem(ResolveTypeTokenInCurrentMethod(mod, ins.Token));
+                            break;
+                        case ILOpCode.Ldelem_I1:
+                        case ILOpCode.Ldelem_U1:
+                        case ILOpCode.Ldelem_I2:
+                        case ILOpCode.Ldelem_U2:
+                        case ILOpCode.Ldelem_I4:
+                        case ILOpCode.Ldelem_U4:
+                        case ILOpCode.Ldelem_I8:
+                        case ILOpCode.Ldelem_I:
+                        case ILOpCode.Ldelem_R4:
+                        case ILOpCode.Ldelem_R8:
+                        case ILOpCode.Ldelem_Ref:
+                            ExecLdelem(ElementType(ins.Op));
+                            break;
+                        case ILOpCode.Stelem:
+                            ExecStelem(ResolveTypeTokenInCurrentMethod(mod, ins.Token));
+                            break;
+                        case ILOpCode.Stelem_I1:
+                        case ILOpCode.Stelem_I2:
+                        case ILOpCode.Stelem_I4:
+                        case ILOpCode.Stelem_I8:
+                        case ILOpCode.Stelem_I:
+                        case ILOpCode.Stelem_R4:
+                        case ILOpCode.Stelem_R8:
+                        case ILOpCode.Stelem_Ref:
+                            ExecStelem(ElementType(ins.Op));
                             break;
 
-                        case BytecodeOp.Box:
-                            ExecBox(mod, ins.Operand0);
+                        case ILOpCode.Castclass:
+                            ExecCastClass(mod, ins.Token);
+                            break;
+                        case ILOpCode.Isinst:
+                            ExecIsinst(mod, ins.Token);
+                            break;
+                        case ILOpCode.Box:
+                            ExecBox(mod, ins.Token);
+                            break;
+                        case ILOpCode.Unbox:
+                            ExecUnbox(mod, ins.Token);
+                            break;
+                        case ILOpCode.Unbox_Any:
+                            ExecUnboxAny(mod, ins.Token);
                             break;
 
-                        case BytecodeOp.UnboxAny:
-                            ExecUnboxAny(mod, ins.Operand0);
+                        case ILOpCode.Sizeof:
+                            ExecSizeof(mod, ins.Token);
                             break;
 
+                        case ILOpCode.Ldtoken:
+                            ExecLdtoken(mod, ins.Token);
+                            break;
 
                         default:
                             throw new NotSupportedException($"Opcode not supported: {ins.Op}");
@@ -1180,6 +863,515 @@ namespace Cnidaria.Cs
 
                 }
             }
+        }
+        private void ExecCall(RuntimeModule mod, in CilInstruction ins, int pc, CancellationToken ct, ExecutionLimits limits)
+        {
+            var method = ResolveRuntimeMethodOrThrow(mod, ins.Token, _curMethod);
+            int total = method.ParameterTypes.Length + (method.HasThis ? 1 : 0);
+            bool isVirtual = ins.Op == ILOpCode.Callvirt;
+
+            if ((ins.Prefixes & CilPrefix.Constrained) != 0)
+                ResolveConstrainedCall(mod, ins.ConstrainedToken, total, ref method, ref isVirtual);
+
+            if (isVirtual && method.HasThis)
+            {
+                int thisIndex = _curEvalSp - total;
+                if ((uint)thisIndex >= (uint)_curEvalSp)
+                    throw new InvalidOperationException("Eval stack underflow for callvirt.");
+
+                var receiver = _hotEvalSlots[thisIndex];
+                if (receiver.Kind == SlotKind.Null)
+                    throw new NullReferenceException();
+                if (method.IsVirtual && receiver.Kind == SlotKind.Ref && !IsDelegateInvoke(method))
+                    method = ResolveVirtualDispatch(GetObjectTypeFromRef(receiver), method);
+            }
+
+            InvokeMethod(method, total, resumePc: pc, ct, limits);
+        }
+        private void ResolveConstrainedCall(RuntimeModule mod, int constrainedToken, int total, ref RuntimeMethod method, ref bool isVirtual)
+        {
+            var constrainedType = ResolveTypeTokenInCurrentMethod(mod, constrainedToken);
+            if (!method.HasThis)
+            {
+                // A static abstract or virtual member resolves against the exact type argument it is called through.
+                method = _rts.ResolveVirtualMethod(method, constrainedType)
+                    ?? throw new MissingMethodException($"{constrainedType.Namespace}.{constrainedType.Name} does not implement {Describe(method)}.");
+                isVirtual = false;
+                return;
+            }
+
+            int thisIndex = _curEvalSp - total;
+            if ((uint)thisIndex >= (uint)_curEvalSp)
+                throw new InvalidOperationException("Eval stack underflow for constrained receiver.");
+
+            int address = GetAddressAbsOrThrow(_hotEvalSlots[thisIndex]);
+            if (!constrainedType.IsValueType)
+            {
+                _hotEvalSlots[thisIndex] = LoadValueAsSlot(address, 0, constrainedType);
+                return;
+            }
+
+            var implementation = method.IsVirtual || method.DeclaringType.Kind == RuntimeTypeKind.Interface
+                ? _rts.ResolveVirtualMethod(method, constrainedType)
+                : null;
+            if (implementation is not null && ReferenceEquals(implementation.DeclaringType, constrainedType))
+            {
+                method = implementation;
+                isVirtual = false;
+                return;
+            }
+
+            _hotEvalSlots[thisIndex] = BoxValue(constrainedType, LoadValueAsSlot(address, 0, constrainedType));
+        }
+        private void InvokeMethod(RuntimeMethod method, int total, int resumePc, CancellationToken ct, ExecutionLimits limits)
+        {
+            if (method.IsStatic && !IsTypeInitializer(method) && TryDeferTypeInitialization(method.DeclaringType, resumePc, ct, limits))
+                return;
+
+            if (method.HasThis && method.DeclaringType.IsValueType)
+            {
+                int thisIndex = _curEvalSp - total;
+                var thisSlot = _hotEvalSlots[thisIndex];
+                if (thisSlot.Kind == SlotKind.Ref)
+                {
+                    var actualThisType = GetObjectTypeFromRef(thisSlot);
+                    if (actualThisType.TypeId != method.DeclaringType.TypeId)
+                        throw new InvalidOperationException(
+                            $"Boxed receiver type mismatch: have '{actualThisType.Namespace}.{actualThisType.Name}', need '{method.DeclaringType.Namespace}.{method.DeclaringType.Name}'.");
+
+                    var (sz, _) = GetStorageSizeAlign(method.DeclaringType);
+                    _hotEvalSlots[thisIndex] = new Slot(SlotKind.ByRef, GetBoxedValuePayloadAbs(checked((int)thisSlot.Payload)), aux: sz);
+                }
+            }
+
+            if (method.IsStatic && TryInvokeHostOverride(method, total, ct))
+                return;
+            if (IsSystemMethod(method, "System", "Activator", "CreateInstance") && method.MethodGenericArguments.Length == 1)
+            {
+                ExecCreateInstance(method.MethodGenericArguments[0], resumePc, ct, limits);
+                return;
+            }
+            if (TryInvokeIntrinsic(method, total, ct))
+                return;
+            if (IsDelegateInvoke(method))
+            {
+                ExecDelegateInvoke(method, total, ct, limits);
+                return;
+            }
+            if (method.IsExtern)
+                throw new PlatformNotSupportedException($"Extern method calls are not supported by the stack VM: {Describe(method)}");
+
+            PushFrame(method, returnPc: _curPc, ct, limits, totalArgsOnCallerStack: total);
+        }
+        private void ExecCalli(RuntimeModule mod, int signatureToken, int pc, CancellationToken ct, ExecutionLimits limits)
+        {
+            var signature = _rts.ResolveCalliSignatureInMethodContext(mod, signatureToken, _curMethod ?? throw new InvalidOperationException("No current method."));
+            int argumentCount = signature.FunctionPointerParameterTypes.Length;
+
+            var functionPointer = PeekSlot();
+            if (functionPointer.Kind == SlotKind.Null)
+                throw new NullReferenceException("Attempted to invoke a null function pointer.");
+            if (functionPointer.Kind != SlotKind.FunctionPointer)
+                throw new InvalidOperationException($"Calli requires a function pointer, got {functionPointer.Kind}.");
+            if (functionPointer.Aux != 0)
+                throw new PlatformNotSupportedException("Calls through native function pointer addresses are not supported by the stack VM.");
+
+            var target = _rts.GetMethodById(checked((int)functionPointer.Payload));
+            ValidateFunctionPointerCallTarget(signature, target, argumentCount);
+            if (!IsTypeInitializer(target) && TryDeferTypeInitialization(target.DeclaringType, resumePc: pc, ct, limits))
+                return;
+
+            _ = PopSlot();
+            InvokeMethod(target, argumentCount, resumePc: pc, ct, limits);
+        }
+        private static bool IsTypeInitializer(RuntimeMethod method)
+            => StringComparer.Ordinal.Equals(method.Name, ".cctor");
+        private static bool IsSystemMethod(RuntimeMethod method, string ns, string typeName, string name)
+            => StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, ns) &&
+               StringComparer.Ordinal.Equals(method.DeclaringType.Name, typeName) &&
+               StringComparer.Ordinal.Equals(method.Name, name);
+        private static string Describe(RuntimeMethod method)
+            => $"{method.DeclaringType.Namespace}.{method.DeclaringType.Name}.{method.Name}";
+        private bool IsDelegateInvoke(RuntimeMethod method)
+            => method.HasThis && method.CilBody is null && StringComparer.Ordinal.Equals(method.Name, "Invoke") &&
+               IsDelegateLikeRuntimeType(method.DeclaringType);
+
+        // A type token yields the RuntimeTypeHandle of its type id, the handle object headers carry too.
+        private void ExecLdtoken(RuntimeModule mod, int token)
+        {
+            if (MetadataToken.Table(token) is not (MetadataToken.TypeDef or MetadataToken.TypeRef or MetadataToken.TypeSpec))
+                throw new NotSupportedException("ldtoken of a field or method is not supported by the stack VM.");
+
+            var type = ResolveTypeTokenInCurrentMethod(mod, token);
+            var handleType = RuntimeTypeHandleType;
+            int abs = AllocEvalBlobBytes(handleType.SizeOf);
+            Array.Clear(_mem, abs, handleType.SizeOf);
+            WriteNativeInt(abs, type.TypeId);
+            PushSlot(new Slot(SlotKind.Value, abs, handleType.TypeId));
+        }
+        private RuntimeType RuntimeTypeHandleType => _runtimeTypeHandleType ??= ResolveCoreTypeOrThrow("System", "RuntimeTypeHandle");
+        private bool TryInvokeRuntimeTypeQuery(RuntimeMethod rm)
+        {
+            if (rm.Name == "RhGetObjectTypeHandle")
+            {
+                PushSlot(NativeIntSlot(GetObjectTypeFromRef(PopSlot()).TypeId));
+                return true;
+            }
+            if (!rm.Name.StartsWith("RhGetType", StringComparison.Ordinal))
+                return false;
+
+            var type = _rts.GetTypeById(checked((int)IntegerPayload(PopSlot())));
+            if (rm.Name == "RhGetTypeFlags")
+            {
+                PushSlot(new Slot(SlotKind.I4, (int)RuntimeTypeNames.Flags(type)));
+                return true;
+            }
+            string? text = rm.Name switch
+            {
+                "RhGetTypeName" => RuntimeTypeNames.Name(type),
+                "RhGetTypeNamespace" => RuntimeTypeNames.Namespace(type),
+                "RhGetTypeFullName" => RuntimeTypeNames.FullName(type),
+                "RhGetTypeDisplayName" => RuntimeTypeNames.DisplayName(type),
+                "RhGetTypeAssemblyName" => type.AssemblyName,
+                _ => throw new NotSupportedException($"Unknown runtime type query {rm.Name}."),
+            };
+            PushSlot(text is null ? new Slot(SlotKind.Null, 0) : new Slot(SlotKind.Ref, AllocStringFromManaged(text)));
+            return true;
+        }
+        private RuntimeType Primitive(RuntimePrimitiveKind kind)
+        {
+            var type = _primitiveTypes[(int)kind];
+            if (type is null)
+                _primitiveTypes[(int)kind] = type = _rts.FindPrimitive(kind);
+            return type;
+        }
+        private RuntimeType IndirectType(ILOpCode op) => op switch
+        {
+            ILOpCode.Ldind_I1 or ILOpCode.Stind_I1 => Primitive(RuntimePrimitiveKind.Int8),
+            ILOpCode.Ldind_U1 => Primitive(RuntimePrimitiveKind.UInt8),
+            ILOpCode.Ldind_I2 or ILOpCode.Stind_I2 => Primitive(RuntimePrimitiveKind.Int16),
+            ILOpCode.Ldind_U2 => Primitive(RuntimePrimitiveKind.UInt16),
+            ILOpCode.Ldind_I4 or ILOpCode.Stind_I4 => Primitive(RuntimePrimitiveKind.Int32),
+            ILOpCode.Ldind_U4 => Primitive(RuntimePrimitiveKind.UInt32),
+            ILOpCode.Ldind_I8 or ILOpCode.Stind_I8 => Primitive(RuntimePrimitiveKind.Int64),
+            ILOpCode.Ldind_I or ILOpCode.Stind_I => Primitive(RuntimePrimitiveKind.NativeInt),
+            ILOpCode.Ldind_R4 or ILOpCode.Stind_R4 => Primitive(RuntimePrimitiveKind.Single),
+            ILOpCode.Ldind_R8 or ILOpCode.Stind_R8 => Primitive(RuntimePrimitiveKind.Double),
+            ILOpCode.Ldind_Ref or ILOpCode.Stind_Ref => _rts.SystemObject,
+            _ => throw new InvalidOperationException($"{op} is not an indirect access."),
+        };
+        private RuntimeType? ElementType(ILOpCode op) => op switch
+        {
+            ILOpCode.Ldelem_I1 or ILOpCode.Stelem_I1 => Primitive(RuntimePrimitiveKind.Int8),
+            ILOpCode.Ldelem_U1 => Primitive(RuntimePrimitiveKind.UInt8),
+            ILOpCode.Ldelem_I2 or ILOpCode.Stelem_I2 => Primitive(RuntimePrimitiveKind.Int16),
+            ILOpCode.Ldelem_U2 => Primitive(RuntimePrimitiveKind.UInt16),
+            ILOpCode.Ldelem_I4 or ILOpCode.Stelem_I4 => Primitive(RuntimePrimitiveKind.Int32),
+            ILOpCode.Ldelem_U4 => Primitive(RuntimePrimitiveKind.UInt32),
+            ILOpCode.Ldelem_I8 or ILOpCode.Stelem_I8 => Primitive(RuntimePrimitiveKind.Int64),
+            ILOpCode.Ldelem_I or ILOpCode.Stelem_I => Primitive(RuntimePrimitiveKind.NativeInt),
+            ILOpCode.Ldelem_R4 or ILOpCode.Stelem_R4 => Primitive(RuntimePrimitiveKind.Single),
+            ILOpCode.Ldelem_R8 or ILOpCode.Stelem_R8 => Primitive(RuntimePrimitiveKind.Double),
+            ILOpCode.Ldelem_Ref or ILOpCode.Stelem_Ref => null,
+            _ => throw new InvalidOperationException($"{op} is not an element access."),
+        };
+        private void ExecLdind(RuntimeType type)
+        {
+            int abs = GetAddressAbsOrThrow(PopSlot());
+            CheckIndirectAccess(abs, GetStorageSizeAlign(type).size, writable: false);
+            PushSlot(LoadValueAsSlot(abs, 0, type));
+        }
+        private void ExecStind(RuntimeType type)
+        {
+            var value = PopSlot();
+            int abs = GetAddressAbsOrThrow(PopSlot());
+            CheckIndirectAccess(abs, GetStorageSizeAlign(type).size, writable: true);
+            StoreSlotAsValue(abs, 0, type, value);
+        }
+        private void ExecCpobj(RuntimeModule mod, int typeToken)
+        {
+            var type = ResolveTypeTokenInCurrentMethod(mod, typeToken);
+            int size = GetStorageSizeAlign(type).size;
+            int source = GetAddressAbsOrThrow(PopSlot());
+            int destination = GetAddressAbsOrThrow(PopSlot());
+            CheckIndirectAccess(source, size, writable: false);
+            CheckIndirectAccess(destination, size, writable: true);
+            Buffer.BlockCopy(_mem, source, _mem, destination, size);
+        }
+        private void ExecInitobj(RuntimeModule mod, int typeToken)
+        {
+            var type = ResolveTypeTokenInCurrentMethod(mod, typeToken);
+            int size = GetStorageSizeAlign(type).size;
+            int destination = GetAddressAbsOrThrow(PopSlot());
+            CheckIndirectAccess(destination, size, writable: true);
+            Array.Clear(_mem, destination, size);
+        }
+        private void ExecCpblk()
+        {
+            int size = checked((int)(uint)IntegerPayload(PopSlot()));
+            var sourceSlot = PopSlot();
+            var destinationSlot = PopSlot();
+            if (size == 0)
+                return;
+            int source = GetAddressAbsOrThrow(sourceSlot);
+            int destination = GetAddressAbsOrThrow(destinationSlot);
+            CheckIndirectAccess(source, size, writable: false);
+            CheckIndirectAccess(destination, size, writable: true);
+            Buffer.BlockCopy(_mem, source, _mem, destination, size);
+        }
+        private void ExecInitblk()
+        {
+            int size = checked((int)(uint)IntegerPayload(PopSlot()));
+            byte value = unchecked((byte)IntegerPayload(PopSlot()));
+            var destinationSlot = PopSlot();
+            if (size == 0)
+                return;
+            int destination = GetAddressAbsOrThrow(destinationSlot);
+            CheckIndirectAccess(destination, size, writable: true);
+            _mem.AsSpan(destination, size).Fill(value);
+        }
+        private void ExecLocalloc(bool zeroInit)
+        {
+            ulong bytes = unchecked((ulong)IntegerPayload(PopSlot()));
+            if (_rts.Target.PointerSize == 4)
+                bytes = (uint)bytes;
+            if (bytes == 0)
+            {
+                PushSlot(new Slot(SlotKind.Ptr, 0));
+                return;
+            }
+            if (bytes > int.MaxValue)
+                throw new InvalidOperationException("Stack overflow (localloc).");
+
+            int abs = AllocFrameScratch((int)bytes, 8);
+            if (zeroInit)
+                Array.Clear(_mem, abs, (int)bytes);
+            PushSlot(new Slot(SlotKind.Ptr, abs));
+        }
+        private int GetArrayElementAddress(Slot array, Slot index, out RuntimeType elementType)
+        {
+            ValidateArrayRefAny(array, out int arrayAbs, out int length, out var arrayType);
+            elementType = arrayType.ElementType ?? throw new InvalidOperationException("Corrupted array type (no ElementType).");
+
+            long i = IntegerPayload(index);
+            if ((ulong)i >= (ulong)length)
+                throw new IndexOutOfRangeException();
+
+            int elementSize = GetStorageSizeAlign(elementType).size;
+            int elementAbs = checked(arrayAbs + ArrayDataOffset + (int)i * elementSize);
+            CheckHeapAccess(elementAbs, elementSize, writable: false);
+            return elementAbs;
+        }
+        private void ExecLdelem(RuntimeType? type)
+        {
+            var index = PopSlot();
+            var array = PopSlot();
+            int elementAbs = GetArrayElementAddress(array, index, out var elementType);
+            PushSlot(LoadValueAsSlot(elementAbs, 0, type ?? elementType));
+        }
+        private void ExecStelem(RuntimeType? type)
+        {
+            var value = PopSlot();
+            var index = PopSlot();
+            var array = PopSlot();
+            int elementAbs = GetArrayElementAddress(array, index, out var elementType);
+            var storeType = type ?? elementType;
+            if (storeType.IsReferenceType && value.Kind == SlotKind.Ref && !IsAssignableTo(GetObjectTypeFromRef(value), elementType))
+                throw new ArrayTypeMismatchException();
+            StoreSlotAsValue(elementAbs, 0, storeType, value);
+        }
+        private void ExecUnbox(RuntimeModule mod, int typeToken)
+        {
+            var targetType = ResolveTypeTokenInCurrentMethod(mod, typeToken);
+            var boxed = PopSlot();
+            if (boxed.Kind == SlotKind.Null)
+                throw new NullReferenceException();
+            if (TryGetNullableInfo(targetType, out _, out _, out _))
+                throw new NotSupportedException("unbox to Nullable<T> is not supported by the stack VM.");
+
+            var actualType = GetObjectTypeFromRef(boxed);
+            if (actualType.TypeId != targetType.TypeId)
+                throw new InvalidCastException($"Cannot unbox '{actualType.Namespace}.{actualType.Name}' as '{targetType.Namespace}.{targetType.Name}'.");
+
+            PushSlot(new Slot(SlotKind.ByRef, GetBoxedValuePayloadAbs(checked((int)boxed.Payload)), aux: targetType.SizeOf));
+        }
+        private Slot ConvertCil(ILOpCode op, Slot value)
+        {
+            // Unsafe.AsPointer and pointer casts convert an address that must stay one
+            if (value.Kind is SlotKind.ByRef or SlotKind.Ptr && op is ILOpCode.Conv_U or ILOpCode.Conv_I)
+                return new Slot(SlotKind.Ptr, value.Payload, value.Aux);
+
+            const NumericConvFlags Checked = NumericConvFlags.Checked;
+            const NumericConvFlags CheckedUn = NumericConvFlags.Checked | NumericConvFlags.SourceUnsigned;
+            // Unchecked widening to an unsigned type zero-extends an int32 operand.
+            var (kind, flags) = op switch
+            {
+                ILOpCode.Conv_I1 => (NumericConvKind.I1, NumericConvFlags.None),
+                ILOpCode.Conv_I2 => (NumericConvKind.I2, NumericConvFlags.None),
+                ILOpCode.Conv_I4 => (NumericConvKind.I4, NumericConvFlags.None),
+                ILOpCode.Conv_I8 => (NumericConvKind.I8, NumericConvFlags.None),
+                ILOpCode.Conv_U1 => (NumericConvKind.U1, NumericConvFlags.None),
+                ILOpCode.Conv_U2 => (NumericConvKind.U2, NumericConvFlags.None),
+                ILOpCode.Conv_U4 => (NumericConvKind.U4, NumericConvFlags.None),
+                ILOpCode.Conv_U8 => (NumericConvKind.U8, NumericConvFlags.SourceUnsigned),
+                ILOpCode.Conv_I => (NumericConvKind.NativeInt, NumericConvFlags.None),
+                ILOpCode.Conv_U => (NumericConvKind.NativeUInt, NumericConvFlags.SourceUnsigned),
+                ILOpCode.Conv_R4 => (NumericConvKind.R4, NumericConvFlags.None),
+                ILOpCode.Conv_R8 => (NumericConvKind.R8, NumericConvFlags.None),
+                ILOpCode.Conv_R_Un => (NumericConvKind.R8, NumericConvFlags.SourceUnsigned),
+                ILOpCode.Conv_Ovf_I1 => (NumericConvKind.I1, Checked),
+                ILOpCode.Conv_Ovf_I2 => (NumericConvKind.I2, Checked),
+                ILOpCode.Conv_Ovf_I4 => (NumericConvKind.I4, Checked),
+                ILOpCode.Conv_Ovf_I8 => (NumericConvKind.I8, Checked),
+                ILOpCode.Conv_Ovf_U1 => (NumericConvKind.U1, Checked),
+                ILOpCode.Conv_Ovf_U2 => (NumericConvKind.U2, Checked),
+                ILOpCode.Conv_Ovf_U4 => (NumericConvKind.U4, Checked),
+                ILOpCode.Conv_Ovf_U8 => (NumericConvKind.U8, Checked),
+                ILOpCode.Conv_Ovf_I => (NumericConvKind.NativeInt, Checked),
+                ILOpCode.Conv_Ovf_U => (NumericConvKind.NativeUInt, Checked),
+                ILOpCode.Conv_Ovf_I1_Un => (NumericConvKind.I1, CheckedUn),
+                ILOpCode.Conv_Ovf_I2_Un => (NumericConvKind.I2, CheckedUn),
+                ILOpCode.Conv_Ovf_I4_Un => (NumericConvKind.I4, CheckedUn),
+                ILOpCode.Conv_Ovf_I8_Un => (NumericConvKind.I8, CheckedUn),
+                ILOpCode.Conv_Ovf_U1_Un => (NumericConvKind.U1, CheckedUn),
+                ILOpCode.Conv_Ovf_U2_Un => (NumericConvKind.U2, CheckedUn),
+                ILOpCode.Conv_Ovf_U4_Un => (NumericConvKind.U4, CheckedUn),
+                ILOpCode.Conv_Ovf_U8_Un => (NumericConvKind.U8, CheckedUn),
+                ILOpCode.Conv_Ovf_I_Un => (NumericConvKind.NativeInt, CheckedUn),
+                ILOpCode.Conv_Ovf_U_Un => (NumericConvKind.NativeUInt, CheckedUn),
+                _ => throw new InvalidOperationException($"{op} is not a conversion."),
+            };
+            return DoConv(value, kind, flags);
+        }
+        private static long IntegerPayload(Slot value) => value.Kind switch
+        {
+            SlotKind.I4 => unchecked((int)value.Payload),
+            SlotKind.I8 or SlotKind.Ptr or SlotKind.ByRef or SlotKind.Ref or SlotKind.Null => value.Payload,
+            _ => throw new InvalidOperationException($"Expected an integer or address, got {value.Kind}."),
+        };
+        private Slot NativeIntSlot(long value)
+            => _rts.Target.PointerSize == 8 ? new Slot(SlotKind.I8, value) : new Slot(SlotKind.I4, unchecked((int)value));
+        private Slot AsArithmeticOperand(Slot value)
+            => value.Kind is SlotKind.Ptr or SlotKind.ByRef or SlotKind.Null ? NativeIntSlot(value.Payload) : value;
+        // CIL mixes int32 with native int and float32 with float64; addresses act as native ints outside add and sub.
+        private (Slot a, Slot b) PopOperands()
+        {
+            var b = AsArithmeticOperand(PopSlot());
+            var a = AsArithmeticOperand(PopSlot());
+            if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I8)
+                a = new Slot(SlotKind.I8, unchecked((int)a.Payload));
+            else if (a.Kind == SlotKind.I8 && b.Kind == SlotKind.I4)
+                b = new Slot(SlotKind.I8, unchecked((int)b.Payload));
+            else if (a.Kind == SlotKind.R4 && b.Kind == SlotKind.R8)
+                a = new Slot(SlotKind.R8, BitConverter.DoubleToInt64Bits(a.AsR4Checked()));
+            else if (a.Kind == SlotKind.R8 && b.Kind == SlotKind.R4)
+                b = new Slot(SlotKind.R8, BitConverter.DoubleToInt64Bits(b.AsR4Checked()));
+            return (a, b);
+        }
+        // Address +/- integer keeps the address kind, so dereferences and GC roots still see an address.
+        private bool TryExecAddressArithmetic(bool subtract)
+        {
+            if (_curEvalSp < 2)
+                return false;
+            var a = _hotEvalSlots[_curEvalSp - 2];
+            var b = _hotEvalSlots[_curEvalSp - 1];
+            bool aAddress = a.Kind is SlotKind.Ptr or SlotKind.ByRef;
+            bool bAddress = b.Kind is SlotKind.Ptr or SlotKind.ByRef;
+            if (!aAddress && !bAddress)
+                return false;
+
+            _curEvalSp -= 2;
+            long x = IntegerPayload(a);
+            long y = IntegerPayload(b);
+            if (subtract)
+            {
+                PushSlot(aAddress && !bAddress ? new Slot(a.Kind, x - y, a.Aux) : NativeIntSlot(x - y));
+                return true;
+            }
+
+            var kind = aAddress && bAddress
+                ? (a.Kind == SlotKind.ByRef || b.Kind == SlotKind.ByRef ? SlotKind.ByRef : SlotKind.Ptr)
+                : (aAddress ? a.Kind : b.Kind);
+            PushSlot(new Slot(kind, x + y, aAddress ? a.Aux : b.Aux));
+            return true;
+        }
+        private (Slot a, Slot b) PopComparisonOperands()
+        {
+            var b = PopSlot();
+            var a = PopSlot();
+            return (a, b);
+        }
+        private bool Compare(ILOpCode op, Slot a, Slot b)
+        {
+            if (a.Kind is SlotKind.R4 or SlotKind.R8 || b.Kind is SlotKind.R4 or SlotKind.R8)
+            {
+                double x = a.Kind == SlotKind.R4 ? a.AsR4Checked() : a.AsR8Checked();
+                double y = b.Kind == SlotKind.R4 ? b.AsR4Checked() : b.AsR8Checked();
+                return op switch
+                {
+                    ILOpCode.Ceq or ILOpCode.Beq => x == y,
+                    ILOpCode.Bne_Un => !(x == y),
+                    ILOpCode.Cgt or ILOpCode.Bgt => x > y,
+                    ILOpCode.Cgt_Un or ILOpCode.Bgt_Un => !(x <= y),
+                    ILOpCode.Bge => x >= y,
+                    ILOpCode.Bge_Un => !(x < y),
+                    ILOpCode.Clt or ILOpCode.Blt => x < y,
+                    ILOpCode.Clt_Un or ILOpCode.Blt_Un => !(x >= y),
+                    ILOpCode.Ble => x <= y,
+                    ILOpCode.Ble_Un => !(x > y),
+                    _ => throw new InvalidOperationException($"{op} is not a comparison."),
+                };
+            }
+
+            if (op is ILOpCode.Ceq or ILOpCode.Beq)
+                return CompareEqual(a, b) != 0;
+            if (op == ILOpCode.Bne_Un)
+                return CompareEqual(a, b) == 0;
+
+            // Ordering compares references and addresses as native integers, as the null check cgt.un does
+            bool wide = a.Kind != SlotKind.I4 || b.Kind != SlotKind.I4;
+            long sx = IntegerPayload(a);
+            long sy = IntegerPayload(b);
+            ulong ux = wide ? unchecked((ulong)sx) : unchecked((uint)sx);
+            ulong uy = wide ? unchecked((ulong)sy) : unchecked((uint)sy);
+            return op switch
+            {
+                ILOpCode.Cgt or ILOpCode.Bgt => sx > sy,
+                ILOpCode.Cgt_Un or ILOpCode.Bgt_Un => ux > uy,
+                ILOpCode.Bge => sx >= sy,
+                ILOpCode.Bge_Un => ux >= uy,
+                ILOpCode.Clt or ILOpCode.Blt => sx < sy,
+                ILOpCode.Clt_Un or ILOpCode.Blt_Un => ux < uy,
+                ILOpCode.Ble => sx <= sy,
+                ILOpCode.Ble_Un => ux <= uy,
+                _ => throw new InvalidOperationException($"{op} is not a comparison."),
+            };
+        }
+        private int GetStaticDataAddress(RuntimeField field)
+        {
+            if (_staticDataByField.TryGetValue(field.FieldId, out int existing))
+                return existing;
+
+            byte[] data = _rts.GetFieldRvaData(field);
+            if (data.Length == 0)
+            {
+                _staticDataByField[field.FieldId] = 0;
+                return 0;
+            }
+
+            if (TryAllocPersistentStaticDataBytes(data.Length, align: 8, out int abs))
+            {
+                _staticDataRegionBytes = checked(_staticDataRegionBytes + data.Length);
+            }
+            else
+            {
+                int heapObject = AllocStaticDataHeapArray(data.Length);
+                abs = checked(heapObject + ArrayDataOffset);
+                _staticDataHeapObjectByField[field.FieldId] = heapObject;
+            }
+            data.CopyTo(_mem.AsSpan(abs, data.Length));
+            _staticDataByField[field.FieldId] = abs;
+            return abs;
         }
         private void CollectGarbage()
         {
@@ -1287,26 +1479,12 @@ namespace Cnidaria.Cs
             }
 
             // Mark roots from all active frames
-            for (int frame = _frameBase; frame >= 0; frame = ReadI32(frame + 0))
+            for (int frame = _frameBase; frame >= 0; frame = ReadI32(frame + FramePrevBase))
             {
-                int methodTok = ReadI32(frame + 16);
-                int moduleId = ReadI32(frame + 20);
-
-                if ((uint)moduleId >= (uint)_moduleById.Length)
-                    throw new InvalidOperationException($"Bad moduleId in frame: {moduleId}");
-
-                var mod = _moduleById[moduleId];
-                if (!mod.MethodsByDefToken.TryGetValue(methodTok, out var fn))
-                    throw new MissingMethodException($"Frame method not found: {mod.Name} 0x{methodTok:X8}");
-
-                int runtimeMethodId = ReadI32(frame + 72);
-                var rm = runtimeMethodId != 0
-                    ? _rts.GetMethodById(runtimeMethodId)
-                    : ResolveRuntimeMethodOrThrow(mod, methodTok);
-                var frameLayout = GetOrCreateMethodLayout(mod, fn, rm);
+                var frameLayout = GetOrCreateMethodLayout(_rts.GetMethodById(ReadI32(frame + FrameMethodId)));
 
                 // Args
-                int argsAbs = ReadI32(frame + 40);
+                int argsAbs = ReadI32(frame + FrameArgsBase);
                 for (int i = 0; i < frameLayout.ArgTypes.Length; i++)
                 {
                     var t = frameLayout.ArgTypes[i];
@@ -1315,7 +1493,7 @@ namespace Cnidaria.Cs
                 }
 
                 // Locals
-                int localsAbs = ReadI32(frame + 44);
+                int localsAbs = ReadI32(frame + FrameLocalsBase);
                 for (int i = 0; i < frameLayout.LocalTypes.Length; i++)
                 {
                     var t = frameLayout.LocalTypes[i];
@@ -1324,8 +1502,8 @@ namespace Cnidaria.Cs
                 }
 
                 // Eval stack
-                int evalBase = ReadI32(frame + 28);
-                int evalSp = ReadI32(frame + 32);
+                int evalBase = ReadI32(frame + FrameEvalBase);
+                int evalSp = ReadI32(frame + FrameEvalSp);
                 for (int i = 0; i < evalSp; i++)
                 {
                     var slot = ReadSlot(evalBase + i * SlotSize);
@@ -1408,18 +1586,6 @@ namespace Cnidaria.Cs
                         VisitManagedRefCellsInTypedStorage(checked((int)ex.Payload), vt, VisitRefCell);
                     }
                 }
-
-                if (ctx.HasReturnValue)
-                {
-                    var rv = ctx.ReturnValue;
-                    if (rv.Kind == SlotKind.Ref)
-                        TryMarkObject(checked((int)rv.Payload));
-                    else if (rv.Kind == SlotKind.Value)
-                    {
-                        var vt = _rts.GetTypeById(rv.Aux);
-                        VisitManagedRefCellsInTypedStorage(checked((int)rv.Payload), vt, VisitRefCell);
-                    }
-                }
             }
             // Static field roots
             foreach (var kv in _staticBaseByTypeId)
@@ -1438,11 +1604,8 @@ namespace Cnidaria.Cs
                 }
             }
             // Static data heap fallback roots
-            foreach (var kv in _staticDataHeapObjectByInstruction)
-            {
-                if (kv.Value != 0)
-                    TryMarkObject(kv.Value);
-            }
+            foreach (var kv in _staticDataHeapObjectByField)
+                TryMarkObject(kv.Value);
             // Intern pool roots
             foreach (var kv in _internPool)
             {
@@ -1467,15 +1630,6 @@ namespace Cnidaria.Cs
                             TryMarkObject(invocationList[i]);
                     }
                 }
-
-                if (_closureDataByObject.TryGetValue(objAbs, out var closureData))
-                {
-                    for (int i = 0; i < closureData.Cells.Length; i++)
-                        VisitSlotRoot(closureData.Cells[i]);
-                }
-
-                if (_closureCellDataByObject.TryGetValue(objAbs, out var closureCellData))
-                    VisitSlotRoot(closureCellData.Value);
             }
             // Sweep
             var live = new List<int>(_heapObjects.Count);
@@ -1499,8 +1653,6 @@ namespace Cnidaria.Cs
                 else
                 {
                     _delegateDataByObject.Remove(objAbs);
-                    _closureDataByObject.Remove(objAbs);
-                    _closureCellDataByObject.Remove(objAbs);
                     Array.Clear(_mem, objAbs, size);
                     AddFreeBlock(objAbs, size);
                 }
@@ -1703,8 +1855,10 @@ namespace Cnidaria.Cs
                 for (int i = fields.Length - 1; i >= 0; i--)
                 {
                     var f = fields[i];
-                    int fieldAbs = checked(curAbs + f.Offset);
-                    work.Push((fieldAbs, f.FieldType));
+                    int repeat = curType.InlineArrayLength > 0 && ReferenceEquals(f, curType.InlineArrayElementField) ? curType.InlineArrayLength : 1;
+                    int stride = repeat > 1 ? GetStorageSizeAlign(f.FieldType).size : 0;
+                    for (int e = repeat - 1; e >= 0; e--)
+                        work.Push((checked(curAbs + f.Offset + e * stride), f.FieldType));
                 }
             }
         }
@@ -1828,103 +1982,13 @@ namespace Cnidaria.Cs
         private static bool IsSameRuntimeType(RuntimeType a, RuntimeType b)
             => a.TypeId == b.TypeId;
 
-        private int AllocClosureCellObject(RuntimeType valueType, Slot value)
-        {
-            if (value.Kind == SlotKind.Value)
-                throw new NotSupportedException("Capturing non-scalar struct values in lambdas is not implemented by closure cells yet.");
 
-            int objAbs = AllocObject(_rts.SystemObject);
-            _closureCellDataByObject[objAbs] = new ClosureCellData(valueType, value);
-            return objAbs;
-        }
 
-        private int AllocClosureObject(Slot[] cells)
-        {
-            int objAbs = AllocObject(_rts.SystemObject);
-            _closureDataByObject[objAbs] = new ClosureData(cells);
-            return objAbs;
-        }
 
-        private int GetObjectAbsFromSlot(Slot slot, string operandName)
-        {
-            if (slot.Kind == SlotKind.Null)
-                throw new NullReferenceException();
-            if (slot.Kind != SlotKind.Ref)
-                throw new InvalidOperationException($"{operandName} must be an object reference.");
-            return checked((int)slot.Payload);
-        }
 
-        private void ExecNewClosureCell(RuntimeModule callerModule, int valueTypeToken)
-        {
-            var valueType = _rts.ResolveTypeInMethodContext(callerModule, valueTypeToken, _curLayout?.Method);
-            var initialValue = PopSlot();
-            int objAbs = AllocClosureCellObject(valueType, initialValue);
-            PushSlot(new Slot(SlotKind.Ref, objAbs));
-        }
 
-        private void ExecLdClosureCell(RuntimeModule callerModule, int valueTypeToken)
-        {
-            var expectedType = _rts.ResolveTypeInMethodContext(callerModule, valueTypeToken, _curLayout?.Method);
-            var cellSlot = PopSlot();
-            int cellObjAbs = GetObjectAbsFromSlot(cellSlot, "Closure cell");
-            if (!_closureCellDataByObject.TryGetValue(cellObjAbs, out var cell))
-                throw new InvalidOperationException("Object is not a VM closure cell.");
 
-            if (cell.ValueType.TypeId != expectedType.TypeId)
-                throw new InvalidOperationException($"Closure cell type mismatch: expected {expectedType.Namespace}.{expectedType.Name}, got {cell.ValueType.Namespace}.{cell.ValueType.Name}.");
 
-            PushSlot(cell.Value);
-        }
-
-        private void ExecStClosureCell(RuntimeModule callerModule, int valueTypeToken)
-        {
-            var expectedType = _rts.ResolveTypeInMethodContext(callerModule, valueTypeToken, _curLayout?.Method);
-            var value = PopSlot();
-            if (value.Kind == SlotKind.Value)
-                throw new NotSupportedException("Capturing non-scalar struct values in lambdas is not implemented by closure cells yet.");
-
-            var cellSlot = PopSlot();
-            int cellObjAbs = GetObjectAbsFromSlot(cellSlot, "Closure cell");
-            if (!_closureCellDataByObject.TryGetValue(cellObjAbs, out var cell))
-                throw new InvalidOperationException("Object is not a VM closure cell.");
-
-            if (cell.ValueType.TypeId != expectedType.TypeId)
-                throw new InvalidOperationException($"Closure cell type mismatch: expected {expectedType.Namespace}.{expectedType.Name}, got {cell.ValueType.Namespace}.{cell.ValueType.Name}.");
-
-            cell.Value = value;
-        }
-
-        private void ExecNewClosure(int cellCount)
-        {
-            if (cellCount < 0)
-                throw new InvalidOperationException("Negative closure cell count.");
-
-            var cells = new Slot[cellCount];
-            for (int i = cellCount - 1; i >= 0; i--)
-            {
-                var cell = PopSlot();
-                int cellObjAbs = GetObjectAbsFromSlot(cell, "Closure cell");
-                if (!_closureCellDataByObject.ContainsKey(cellObjAbs))
-                    throw new InvalidOperationException("Closure can contain only VM closure cells.");
-                cells[i] = cell;
-            }
-
-            int objAbs = AllocClosureObject(cells);
-            PushSlot(new Slot(SlotKind.Ref, objAbs));
-        }
-
-        private void ExecLdClosureSlot(int slotIndex)
-        {
-            var closureSlot = PopSlot();
-            int closureObjAbs = GetObjectAbsFromSlot(closureSlot, "Closure");
-            if (!_closureDataByObject.TryGetValue(closureObjAbs, out var closure))
-                throw new InvalidOperationException("Object is not a VM closure.");
-
-            if ((uint)slotIndex >= (uint)closure.Cells.Length)
-                throw new InvalidOperationException("Closure slot index is out of range.");
-
-            PushSlot(closure.Cells[slotIndex]);
-        }
 
         private int AllocDelegateObject(RuntimeType delegateType, RuntimeMethod targetMethod, Slot target)
         {
@@ -1959,37 +2023,7 @@ namespace Cnidaria.Cs
             return objAbs;
         }
 
-        private void ExecNewDelegate(RuntimeModule callerModule, int delegateTypeToken, int targetMethodToken)
-        {
-            var delegateType = _rts.ResolveTypeInMethodContext(callerModule, delegateTypeToken, _curLayout?.Method);
-            if (!IsDelegateLikeRuntimeType(delegateType))
-                throw new InvalidOperationException($"NewDelegate expects delegate type, got '{delegateType.Namespace}.{delegateType.Name}'.");
 
-            var targetMethod = ResolveRuntimeMethodOrThrow(callerModule, targetMethodToken, _curLayout?.Method);
-            if (targetMethod.HasThis)
-                throw new NotSupportedException("Closed instance delegates are not implemented by NewDelegate yet.");
-
-            int objAbs = AllocDelegateObject(delegateType, targetMethod, new Slot(SlotKind.Null, 0));
-            PushSlot(new Slot(SlotKind.Ref, objAbs));
-        }
-
-        private void ExecNewDelegateClosed(RuntimeModule callerModule, int delegateTypeToken, int targetMethodToken)
-        {
-            var target = PopSlot();
-            if (target.Kind == SlotKind.Null)
-                throw new NullReferenceException();
-            if (target.Kind != SlotKind.Ref)
-                throw new InvalidOperationException("Closed delegate target must be an object reference.");
-
-            var delegateType = _rts.ResolveTypeInMethodContext(callerModule, delegateTypeToken, _curLayout?.Method);
-            if (!IsDelegateLikeRuntimeType(delegateType))
-                throw new InvalidOperationException($"NewDelegateClosed expects delegate type, got '{delegateType.Namespace}.{delegateType.Name}'.");
-
-            var targetMethod = ResolveRuntimeMethodOrThrow(callerModule, targetMethodToken, _curLayout?.Method);
-
-            int objAbs = AllocDelegateObject(delegateType, targetMethod, target);
-            PushSlot(new Slot(SlotKind.Ref, objAbs));
-        }
 
         private int[] GetFlattenedDelegateTargets(int delegateObjAbs)
         {
@@ -2110,14 +2144,11 @@ namespace Cnidaria.Cs
             return new Slot(SlotKind.Ref, objAbs);
         }
 
-        private void ExecDelegateInvoke(RuntimeModule callerModule, int invokeMethodToken, int argCount, CancellationToken ct, ExecutionLimits limits)
+        private void ExecDelegateInvoke(RuntimeMethod invokeMethod, int total, CancellationToken ct, ExecutionLimits limits)
         {
-            var invokeMethod = ResolveRuntimeMethodOrThrow(callerModule, invokeMethodToken, _curLayout?.Method);
-            if (!IsDelegateLikeRuntimeType(invokeMethod.DeclaringType) ||
-                !StringComparer.Ordinal.Equals(invokeMethod.Name, "Invoke"))
-            {
-                throw new InvalidOperationException("DelegateInvoke expects a delegate Invoke method token.");
-            }
+            int argCount = total - 1;
+            if (argCount != invokeMethod.ParameterTypes.Length)
+                throw new InvalidOperationException($"Delegate Invoke arg count mismatch: expected {invokeMethod.ParameterTypes.Length}, got {argCount}.");
 
             var args = new Slot[argCount];
             for (int i = argCount - 1; i >= 0; i--)
@@ -2127,15 +2158,12 @@ namespace Cnidaria.Cs
             if (receiver.Kind == SlotKind.Null)
                 throw new NullReferenceException();
             if (receiver.Kind != SlotKind.Ref)
-                throw new InvalidOperationException("DelegateInvoke receiver must be a delegate reference.");
+                throw new InvalidOperationException("Delegate Invoke receiver must be a delegate reference.");
 
             int delegateObjAbs = checked((int)receiver.Payload);
             var receiverType = GetObjectTypeFromRef(receiver);
             if (!IsDelegateLikeRuntimeType(receiverType))
-                throw new InvalidOperationException($"DelegateInvoke receiver is not a delegate: {receiverType.Namespace}.{receiverType.Name}.");
-
-            if (argCount != invokeMethod.ParameterTypes.Length)
-                throw new InvalidOperationException($"DelegateInvoke arg count mismatch: expected {invokeMethod.ParameterTypes.Length}, got {argCount}.");
+                throw new InvalidOperationException($"Delegate Invoke receiver is not a delegate: {receiverType.Namespace}.{receiverType.Name}.");
 
             var targets = GetFlattenedDelegateTargets(delegateObjAbs);
             if (targets.Length == 0)
@@ -2189,29 +2217,9 @@ namespace Cnidaria.Cs
             for (int i = 0; i < context.Arguments.Length; i++)
                 initialArgs[dst++] = context.Arguments[i];
 
-            var targetFn = targetMethod.Body;
-            if (targetMethod.BodyModule is null || targetFn is null)
-            {
-                throw new MissingMethodException(
-                    $"No body for delegate target: {targetMethod.DeclaringType.Namespace}.{targetMethod.DeclaringType.Name}.{targetMethod.Name}");
-            }
-
-            var callerFn = _curFn ?? throw new InvalidOperationException("No current function.");
-            int callerModuleId = ReadI32(_frameBase + 20);
-            int returnPc = _curPc;
-
             context.NextIndex = targetIndex + 1;
 
-            PushFrame(
-                targetMethod.BodyModule,
-                targetFn,
-                returnPc: returnPc,
-                returnMethodToken: callerFn.MethodToken,
-                returnModuleId: callerModuleId,
-                ct,
-                limits,
-                runtimeMethod: targetMethod,
-                initialArgs: initialArgs);
+            PushFrame(targetMethod, returnPc: _curPc, ct, limits, initialArgs: initialArgs);
 
             if (context.NextIndex < context.Targets.Length)
                 _pendingDelegateInvocations[_frameBase] = context;
@@ -2314,41 +2322,6 @@ namespace Cnidaria.Cs
             actualElemType = actualType.ElementType;
 
             if (actualElemType.TypeId != expectedElemType.TypeId)
-                throw new ArrayTypeMismatchException(
-                    $"Array element type mismatch: actual={actualElemType.Namespace}.{actualElemType.Name}, " +
-                    $"expected={expectedElemType.Namespace}.{expectedElemType.Name}");
-
-            length = GetArrayLengthFromObject(arrObjAbs);
-        }
-
-        private void ValidateArrayRefReadable(
-            Slot s,
-            RuntimeType expectedElemType,
-            out int arrObjAbs,
-            out int length,
-            out RuntimeType actualElemType)
-        {
-            if (s.Kind == SlotKind.Null)
-                throw new NullReferenceException();
-
-            if (s.Kind != SlotKind.Ref)
-                throw new InvalidOperationException($"Expected array ref, got {s.Kind}");
-
-            arrObjAbs = checked((int)s.Payload);
-
-            var actualType = GetObjectTypeFromRef(s);
-            if (actualType.Kind != RuntimeTypeKind.Array || actualType.ElementType is null)
-                throw new InvalidOperationException($"Expected array, got {actualType.Namespace}.{actualType.Name}");
-
-            actualElemType = actualType.ElementType;
-
-            bool ok =
-                actualElemType.TypeId == expectedElemType.TypeId ||
-                (actualElemType.IsReferenceType &&
-                 expectedElemType.IsReferenceType &&
-                 IsAssignableTo(actualElemType, expectedElemType));
-
-            if (!ok)
                 throw new ArrayTypeMismatchException(
                     $"Array element type mismatch: actual={actualElemType.Namespace}.{actualElemType.Name}, " +
                     $"expected={expectedElemType.Namespace}.{expectedElemType.Name}");
@@ -2505,12 +2478,8 @@ namespace Cnidaria.Cs
             if (ReferenceEquals(actual, target))
                 return true;
 
-            if (target.Kind == RuntimeTypeKind.Interface)
-            {
-                var seen = new HashSet<int>();
-                if (ImplementsInterface(actual, target, seen))
-                    return true;
-            }
+            if (target.Kind == RuntimeTypeKind.Interface && _rts.IsAssignableTo(actual, target))
+                return true;
 
             if (actual.Kind == RuntimeTypeKind.Array &&
                 target.Kind == RuntimeTypeKind.Array)
@@ -2533,25 +2502,6 @@ namespace Cnidaria.Cs
             }
 
             return false;
-
-            static bool ImplementsInterface(RuntimeType current, RuntimeType target, HashSet<int> seen)
-            {
-                if (!seen.Add(current.TypeId))
-                    return false;
-
-                var interfaces = current.Interfaces;
-                for (int i = 0; i < interfaces.Length; i++)
-                {
-                    var iface = interfaces[i];
-                    if (ReferenceEquals(iface, target))
-                        return true;
-
-                    if (ImplementsInterface(iface, target, seen))
-                        return true;
-                }
-
-                return current.BaseType is not null && ImplementsInterface(current.BaseType, target, seen);
-            }
         }
 
         private void CheckHeapAccess(int abs, int size, bool writable)
@@ -2596,7 +2546,7 @@ namespace Cnidaria.Cs
         }
         private static bool UsesBlobOnEvalStack(RuntimeType t)
             => t.IsValueType && !IsEvalScalarValueType(t);
-        private int ComputeEvalBlobCapacity(RuntimeModule module, BytecodeFunction fn, RuntimeMethod rm)
+        private int ComputeEvalBlobCapacity(RuntimeMethod rm, CilMethodBody body, MethodExecLayout layout)
         {
             int maxBlobSize = 0;
 
@@ -2610,90 +2560,59 @@ namespace Cnidaria.Cs
                     maxBlobSize = sz;
             }
 
-            // Method signature / locals
             Consider(rm.ReturnType);
+            for (int i = 0; i < layout.ArgTypes.Length; i++)
+                Consider(layout.ArgTypes[i]);
+            for (int i = 0; i < layout.LocalTypes.Length; i++)
+                Consider(layout.LocalTypes[i]);
 
-            int argCount = rm.HasThis ? 1 + rm.ParameterTypes.Length : rm.ParameterTypes.Length;
-            for (int i = 0; i < argCount; i++)
-                Consider(GetArgType(rm, i));
-
-            for (int i = 0; i < fn.LocalTypeTokens.Length; i++)
-                Consider(_rts.ResolveTypeInMethodContext(module, fn.LocalTypeTokens[i], rm));
-
-            // Instruction operands
-            foreach (var ins in fn.Instructions)
+            // Every other struct reaching the eval stack is produced by one of these
+            var module = rm.BodyModule ?? throw new InvalidOperationException($"No body module for {Describe(rm)}.");
+            foreach (var ins in body.Instructions)
             {
                 switch (ins.Op)
                 {
-                    case BytecodeOp.Ldfld:
-                    case BytecodeOp.Stfld:
-                    case BytecodeOp.Ldsfld:
-                    case BytecodeOp.Stsfld:
-                        {
-                            var f = _rts.ResolveField(module, ins.Operand0);
-                            Consider(f.FieldType);
-                            break;
-                        }
-
-                    case BytecodeOp.NewClosureCell:
-                    case BytecodeOp.LdClosureCell:
-                    case BytecodeOp.StClosureCell:
-                        Consider(_rts.ResolveTypeInMethodContext(module, ins.Operand0, rm));
+                    case ILOpCode.Ldfld:
+                    case ILOpCode.Ldsfld:
+                        Consider(_rts.ResolveFieldInMethodContext(module, ins.Token, rm).FieldType);
                         break;
 
-                    case BytecodeOp.Newobj:
-                        {
-                            var ctor = ResolveRuntimeMethodOrThrow(module, ins.Operand0, rm);
-                            Consider(ctor.DeclaringType);
-                            for (int i = 0; i < ctor.ParameterTypes.Length; i++)
-                                Consider(ctor.ParameterTypes[i]);
-                            break;
-                        }
+                    case ILOpCode.Newobj:
+                        Consider(ResolveRuntimeMethodOrThrow(module, ins.Token, rm).DeclaringType);
+                        break;
 
-                    case BytecodeOp.Call:
-                    case BytecodeOp.CallVirt:
-                        {
-                            var callee = ResolveRuntimeMethodOrThrow(module, ins.Operand0, rm);
-                            Consider(callee.ReturnType);
-                            if (callee.HasThis)
-                                Consider(callee.DeclaringType);
-                            for (int i = 0; i < callee.ParameterTypes.Length; i++)
-                                Consider(callee.ParameterTypes[i]);
-                            break;
-                        }
+                    case ILOpCode.Call:
+                    case ILOpCode.Callvirt:
+                        Consider(ResolveRuntimeMethodOrThrow(module, ins.Token, rm).ReturnType);
+                        break;
 
-                    case BytecodeOp.Calli:
-                        {
-                            var signature = _rts.ResolveTypeInMethodContext(module, ins.Operand0, rm);
-                            Consider(signature.FunctionPointerReturnType);
-                            for (int i = 0; i < signature.FunctionPointerParameterTypes.Length; i++)
-                                Consider(signature.FunctionPointerParameterTypes[i]);
-                            break;
-                        }
+                    case ILOpCode.Calli:
+                        Consider(_rts.ResolveCalliSignatureInMethodContext(module, ins.Token, rm).FunctionPointerReturnType);
+                        break;
 
-                    case BytecodeOp.UnboxAny:
-                    case BytecodeOp.Ldelem:
-                    case BytecodeOp.Stelem:
-                    case BytecodeOp.Newarr:
-                        {
-                            var t = _rts.ResolveTypeInMethodContext(module, ins.Operand0, rm);
-                            Consider(t);
-                            break;
-                        }
+                    case ILOpCode.Ldobj:
+                    case ILOpCode.Unbox_Any:
+                    case ILOpCode.Ldelem:
+                        Consider(_rts.ResolveTypeInMethodContext(module, ins.Token, rm));
+                        break;
+
+                    case ILOpCode.Ldtoken:
+                        Consider(RuntimeTypeHandleType);
+                        break;
                 }
             }
 
-            if (maxBlobSize == 0 || fn.MaxStack <= 0)
+            if (maxBlobSize == 0 || body.MaxStack <= 0)
                 return 0;
 
-            return checked(fn.MaxStack * maxBlobSize);
+            return checked(body.MaxStack * maxBlobSize);
         }
         private void SyncEvalBlobSpToEvalStack()
         {
             if (_frameBase < 0)
                 return;
 
-            int blobBase = ReadI32(_frameBase + 48);
+            int blobBase = ReadI32(_frameBase + FrameEvalBlobBase);
             int spSlots = _curEvalSp;
 
             int newBlobSp = 0;
@@ -2712,16 +2631,16 @@ namespace Cnidaria.Cs
                 break;
             }
 
-            WriteI32(_frameBase + 52, newBlobSp);
+            WriteI32(_frameBase + FrameEvalBlobSp, newBlobSp);
         }
         private int AllocEvalBlobBytes(int bytes)
         {
             if (bytes < 0)
                 throw new InvalidOperationException("Negative eval blob size.");
 
-            int blobBase = ReadI32(_frameBase + 48);
-            int blobSp = ReadI32(_frameBase + 52);
-            int blobCap = ReadI32(_frameBase + 56);
+            int blobBase = ReadI32(_frameBase + FrameEvalBlobBase);
+            int blobSp = ReadI32(_frameBase + FrameEvalBlobSp);
+            int blobCap = ReadI32(_frameBase + FrameEvalBlobCap);
 
             int dst = checked(blobBase + blobSp);
             int newSp = checked(blobSp + bytes);
@@ -2730,7 +2649,7 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException(
                     $"Eval blob arena overflow. Need {bytes} bytes, used {blobSp}/{blobCap}.");
 
-            WriteI32(_frameBase + 52, newSp);
+            WriteI32(_frameBase + FrameEvalBlobSp, newSp);
             return dst;
         }
         private void ExecSizeof(RuntimeModule mod, int typeToken)
@@ -2741,76 +2660,6 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException($"Unbound generic type parameter in sizeof: {t.Name}");
             int size = _rts.GetStorageSizeAlign(t).size;
             PushSlot(new Slot(SlotKind.I4, size));
-        }
-        private void ExecTypeIsValueType(RuntimeModule mod, int typeToken)
-        {
-            var rm = _curLayout?.Method ?? throw new InvalidOperationException("No current method layout.");
-            var t = _rts.ResolveTypeInMethodContext(mod, typeToken, rm);
-            if (t.Kind == RuntimeTypeKind.TypeParam)
-                throw new InvalidOperationException($"Unbound generic type parameter in typeof(T).IsValueType: {t.Name}");
-            PushSlot(new Slot(SlotKind.I4, t.IsValueType ? 1 : 0));
-        }
-        private void ExecTypeIsPrimitive(RuntimeModule mod, int typeToken)
-        {
-            var rm = _curLayout?.Method ?? throw new InvalidOperationException("No current method layout.");
-            var t = _rts.ResolveTypeInMethodContext(mod, typeToken, rm);
-            if (t.Kind == RuntimeTypeKind.TypeParam)
-                throw new InvalidOperationException($"Unbound generic type parameter in typeof(T).IsPrimitive: {t.Name}");
-            _rts.EnsureRuntimeTypeReady(t);
-            PushSlot(new Slot(SlotKind.I4, IsPrimitiveRuntimeType(t) ? 1 : 0));
-        }
-        private void ExecTypeIsEnum(RuntimeModule mod, int typeToken)
-        {
-            var rm = _curLayout?.Method ?? throw new InvalidOperationException("No current method layout.");
-            var t = _rts.ResolveTypeInMethodContext(mod, typeToken, rm);
-            if (t.Kind == RuntimeTypeKind.TypeParam)
-                throw new InvalidOperationException($"Unbound generic type parameter in typeof(T).IsEnum: {t.Name}");
-            PushSlot(new Slot(SlotKind.I4, t.Kind == RuntimeTypeKind.Enum ? 1 : 0));
-        }
-        private void ExecTypeEquals(RuntimeModule mod, int leftTypeToken, int rightTypeToken)
-        {
-            var rm = _curLayout?.Method ?? throw new InvalidOperationException("No current method layout.");
-            var left = _rts.ResolveTypeInMethodContext(mod, leftTypeToken, rm);
-            var right = _rts.ResolveTypeInMethodContext(mod, rightTypeToken, rm);
-            if (left.Kind == RuntimeTypeKind.TypeParam || right.Kind == RuntimeTypeKind.TypeParam)
-                throw new InvalidOperationException("Unbound generic type parameter in type equality check.");
-            PushSlot(new Slot(SlotKind.I4, left.TypeId == right.TypeId ? 1 : 0));
-        }
-        private void ExecObjectTypeEquals(RuntimeModule mod, int receiverTypeToken, int targetTypeToken)
-        {
-            var rm = _curLayout?.Method ?? throw new InvalidOperationException("No current method layout.");
-            var receiverType = _rts.ResolveTypeInMethodContext(mod, receiverTypeToken, rm);
-            var targetType = _rts.ResolveTypeInMethodContext(mod, targetTypeToken, rm);
-            if (receiverType.Kind == RuntimeTypeKind.TypeParam || targetType.Kind == RuntimeTypeKind.TypeParam)
-                throw new InvalidOperationException("Unbound generic type parameter in GetType equality check.");
-
-            Slot receiver = PopSlot();
-            RuntimeType actualType;
-            if (receiverType.IsValueType &&
-                TryGetNullableInfo(receiverType, out var nullableUnderlying, out var hasValueField, out _))
-            {
-                if (receiver.Kind != SlotKind.Value)
-                    throw new InvalidOperationException($"Nullable GetType expects struct value slot, got {receiver.Kind}.");
-
-                var slotType = GetValueSlotType(receiver);
-                if (slotType.TypeId != receiverType.TypeId)
-                    throw new InvalidOperationException(
-                        $"Nullable GetType type mismatch: slot={slotType.Name}, token={receiverType.Name}.");
-
-                int srcAbs = checked((int)receiver.Payload);
-                var hasValueSlot = LoadValueAsSlot(srcAbs, hasValueField.Offset, hasValueField.FieldType);
-                if (hasValueSlot.Kind != SlotKind.I4 || hasValueSlot.AsI4Checked() == 0)
-                    throw new NullReferenceException();
-
-                actualType = nullableUnderlying;
-            }
-            else
-            {
-                actualType = receiverType.IsValueType
-                    ? receiverType
-                    : GetObjectTypeFromRef(receiver);
-            }
-            PushSlot(new Slot(SlotKind.I4, actualType.TypeId == targetType.TypeId ? 1 : 0));
         }
         private static bool IsPrimitiveRuntimeType(RuntimeType type)
         {
@@ -2829,29 +2678,6 @@ namespace Cnidaria.Cs
                 RuntimePrimitiveKind.NativeUInt or
                 RuntimePrimitiveKind.Single or
                 RuntimePrimitiveKind.Double;
-        }
-        private void ExecDefaultValue(RuntimeModule mod, int typeToken)
-        {
-            var t = ResolveTypeTokenInCurrentMethod(mod, typeToken);
-
-            // Reference types default to null
-            if (t.IsReferenceType)
-            {
-                PushSlot(new Slot(SlotKind.Null, 0));
-                return;
-            }
-
-            // Pointers and byrefs default to null ptr
-            if (t.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.FunctionPointer)
-            {
-                PushSlot(new Slot(SlotKind.Null, 0));
-                return;
-            }
-
-            if (!t.IsValueType)
-                throw new InvalidOperationException($"DefaultValue for '{t.Namespace}.{t.Name}' is not supported.");
-
-            PushDefaultValue(t);
         }
         private RuntimeType ResolveTypeTokenInCurrentMethod(RuntimeModule mod, int typeToken)
         {
@@ -2963,9 +2789,9 @@ namespace Cnidaria.Cs
             PushSlot(value);
         }
         private void ExecBox(RuntimeModule mod, int typeToken)
+            => PushSlot(BoxValue(ResolveTypeTokenInCurrentMethod(mod, typeToken), PopSlot()));
+        private Slot BoxValue(RuntimeType boxedType, Slot value)
         {
-            var boxedType = ResolveTypeTokenInCurrentMethod(mod, typeToken);
-            var value = PopSlot();
 
             if (!boxedType.IsValueType)
             {
@@ -2973,10 +2799,7 @@ namespace Cnidaria.Cs
                 if (boxedType.IsReferenceType)
                 {
                     if (value.Kind is SlotKind.Ref or SlotKind.Null)
-                    {
-                        PushSlot(value);
-                        return;
-                    }
+                        return value;
 
                     throw new InvalidOperationException(
                         $"box of reference type expects ref/null slot, got {value.Kind} for '{boxedType.Namespace}.{boxedType.Name}'.");
@@ -3002,24 +2825,19 @@ namespace Cnidaria.Cs
                 var hasValueSlot = LoadValueAsSlot(srcAbs, hasValueField.Offset, hasValueField.FieldType);
                 bool hasValue = hasValueSlot.Kind == SlotKind.I4 && hasValueSlot.AsI4Checked() != 0;
                 if (!hasValue)
-                {
-                    PushSlot(new Slot(SlotKind.Null, 0));
-                    return;
-                }
+                    return new Slot(SlotKind.Null, 0);
 
                 var underlyingSlot = LoadValueAsSlot(srcAbs, nullableValueField.Offset, nullableUnderlying);
                 int boxedUnderlyingAbs = AllocBoxedValueObject(nullableUnderlying);
                 int boxedUnderlyingPayloadAbs = GetBoxedValuePayloadAbs(boxedUnderlyingAbs);
                 StoreSlotAsValue(boxedUnderlyingPayloadAbs, 0, nullableUnderlying, underlyingSlot);
-                PushSlot(new Slot(SlotKind.Ref, boxedUnderlyingAbs));
-                return;
+                return new Slot(SlotKind.Ref, boxedUnderlyingAbs);
             }
 
             int boxedAbs = AllocBoxedValueObject(boxedType);
             int payloadAbs = GetBoxedValuePayloadAbs(boxedAbs);
             StoreSlotAsValue(payloadAbs, 0, boxedType, value);
-            PushSlot(new Slot(SlotKind.Ref, boxedAbs));
-
+            return new Slot(SlotKind.Ref, boxedAbs);
         }
         private void ExecUnboxAny(RuntimeModule mod, int typeToken)
         {
@@ -3157,145 +2975,29 @@ namespace Cnidaria.Cs
         }
         private void ExecNewarr(RuntimeModule mod, int elemTypeToken)
         {
-            int len = PopSlot().AsI4Checked();
-            if (len < 0)
-                throw new InvalidOperationException("Negative array length.");
+            long len = IntegerPayload(PopSlot());
+            if (len < 0 || len > int.MaxValue)
+                throw new OverflowException("Array length is negative or too large.");
 
             var elemType = ResolveTypeTokenInCurrentMethod(mod, elemTypeToken);
             var arrayType = _rts.GetArrayType(elemType);
 
-            int arrAbs = AllocArrayObject(arrayType, len);
+            int arrAbs = AllocArrayObject(arrayType, (int)len);
             PushSlot(new Slot(SlotKind.Ref, arrAbs));
         }
 
         private void ExecLdelema(RuntimeModule mod, int elemTypeToken)
         {
-            int index = PopSlot().AsI4Checked();
+            var index = PopSlot();
             var arr = PopSlot();
 
             var elemType = ResolveTypeTokenInCurrentMethod(mod, elemTypeToken);
-            ValidateArrayRefExact(arr, elemType, out int arrAbs, out int length, out var actualElemType);
+            ValidateArrayRefExact(arr, elemType, out _, out _, out _);
 
-            if ((uint)index >= (uint)length)
-                throw new IndexOutOfRangeException();
-
-            var (elemSize, _) = GetStorageSizeAlign(elemType);
-            int elemAbs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
-
-            CheckHeapAccess(elemAbs, elemSize, writable: false);
-            PushSlot(new Slot(SlotKind.ByRef, elemAbs, aux: elemSize));
-        }
-        private void ExecLdelem(RuntimeModule mod, int elemTypeToken)
-        {
-            int index = PopSlot().AsI4Checked();
-            var arr = PopSlot();
-
-            var elemType = ResolveTypeTokenInCurrentMethod(mod, elemTypeToken);
-            ValidateArrayRefReadable(arr, elemType, out int arrAbs, out int length, out var actualElemType);
-
-            if ((uint)index >= (uint)length)
-                throw new IndexOutOfRangeException();
-
-            var (elemSize, _) = GetStorageSizeAlign(elemType);
-            int elemAbs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
-
-            CheckHeapAccess(elemAbs, elemSize, writable: false);
-            var v = LoadValueAsSlot(elemAbs, 0, elemType);
-            PushSlot(v);
-        }
-        private void ExecStelem(RuntimeModule mod, int elemTypeToken)
-        {
-            var value = PopSlot();
-            int index = PopSlot().AsI4Checked();
-            var arr = PopSlot();
-
-            var elemType = ResolveTypeTokenInCurrentMethod(mod, elemTypeToken);
-            ValidateArrayRefReadable(arr, elemType, out int arrAbs, out int length, out var actualElemType);
-
-            if ((uint)index >= (uint)length)
-                throw new IndexOutOfRangeException();
-
-            var (elemSize, _) = GetStorageSizeAlign(elemType);
-            int elemAbs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
-
-            CheckHeapAccess(elemAbs, elemSize, writable: true);
-            StoreSlotAsValue(elemAbs, 0, elemType, value);
-        }
-        private void ExecPtrToByRef()
-        {
-            var p = PopSlot();
-
-            if (p.Kind == SlotKind.Null)
-            {
-                PushSlot(p);
-                return;
-            }
-
-            if (p.Kind == SlotKind.ByRef)
-            {
-                PushSlot(p);
-                return;
-            }
-
-            if (p.Kind != SlotKind.Ptr)
-                throw new InvalidOperationException($"PtrToByRef expects ptr, got {p.Kind}.");
-
-            PushSlot(new Slot(SlotKind.ByRef, p.Payload, p.Aux));
+            int elemAbs = GetArrayElementAddress(arr, index, out _);
+            PushSlot(new Slot(SlotKind.ByRef, elemAbs, aux: GetStorageSizeAlign(elemType).size));
         }
 
-        private void ExecLdArrayDataRef()
-        {
-            var arr = PopSlot();
-            if (arr.Kind == SlotKind.Null)
-                throw new NullReferenceException();
-            if (arr.Kind != SlotKind.Ref)
-                throw new InvalidOperationException($"LdArrayDataRef expects array ref, got {arr.Kind}.");
-
-            var actualType = GetObjectTypeFromRef(arr);
-            if (actualType.Kind != RuntimeTypeKind.Array)
-                throw new InvalidOperationException($"LdArrayDataRef expects array instance, got '{actualType.Namespace}.{actualType.Name}'.");
-
-            int arrAbs = checked((int)arr.Payload);
-            int dataAbs = checked(arrAbs + ArrayDataOffset);
-
-            PushSlot(new Slot(SlotKind.ByRef, dataAbs));
-        }
-        private void ExecStaticData(BytecodeFunction fn, int pc, int blobOffset, int byteLength)
-        {
-            if (blobOffset < 0 || byteLength < 0 || blobOffset > fn.StaticDataBlob.Length || byteLength > fn.StaticDataBlob.Length - blobOffset)
-                throw new InvalidOperationException("Invalid static data blob range.");
-
-            var key = (fn, pc);
-            if (_staticDataByInstruction.TryGetValue(key, out int existing))
-            {
-                if (_staticDataHeapObjectByInstruction.TryGetValue(key, out int heapObject) && heapObject != 0)
-                    existing = checked(heapObject + ArrayDataOffset);
-                PushSlot(new Slot(SlotKind.Ptr, existing, aux: 1));
-                return;
-            }
-
-            if (byteLength == 0)
-            {
-                _staticDataByInstruction[key] = 0;
-                PushSlot(new Slot(SlotKind.Ptr, 0, aux: 1));
-                return;
-            }
-
-            int abs;
-            if (!TryAllocPersistentStaticDataBytes(byteLength, align: 8, out abs))
-            {
-                int heapObject = AllocStaticDataHeapArray(byteLength);
-                abs = checked(heapObject + ArrayDataOffset);
-                _staticDataHeapObjectByInstruction[key] = heapObject;
-            }
-            else
-            {
-                _staticDataRegionBytes = checked(_staticDataRegionBytes + byteLength);
-            }
-            fn.StaticDataBlob.AsSpan().Slice(blobOffset, byteLength).CopyTo(_mem.AsSpan(abs, byteLength));
-            _staticDataByInstruction[key] = abs;
-            PushSlot(new Slot(SlotKind.Ptr, abs, aux: 1));
-        }
         private bool TryAllocPersistentStaticDataBytes(int bytes, int align, out int abs)
         {
             if (bytes < 0) throw new InvalidOperationException("Negative persistent allocation size.");
@@ -3329,99 +3031,8 @@ namespace Cnidaria.Cs
                 throw new TypeLoadException(ns + "." + name);
             return _rts.ResolveType(core, typeDefToken);
         }
-        private void ExecStackAlloc(int elemSize)
-        {
-            if (elemSize <= 0) throw new InvalidOperationException("Bad element size.");
 
-            int count = PopSlot().AsI4Checked();
-            if (count < 0) throw new InvalidOperationException("Negative stackalloc size.");
 
-            ExecStackAllocBytes(checked(count * elemSize), elemSize);
-        }
-
-        private void ExecStackAllocConstant(long byteCount, int elemSize)
-        {
-            if (byteCount == 0)
-            {
-                if (elemSize <= 0) throw new InvalidOperationException("Bad element size.");
-                PushSlot(new Slot(SlotKind.Ptr, 0, aux: elemSize));
-                return;
-            }
-
-            if ((ulong)byteCount > int.MaxValue)
-                throw new InvalidOperationException("Stack overflow (stackalloc).");
-
-            ExecStackAllocBytes((int)byteCount, elemSize);
-        }
-
-        private void ExecStackAllocBytes(int bytes, int elemSize)
-        {
-            if (bytes < 0) throw new InvalidOperationException("Negative stackalloc size.");
-            if (elemSize <= 0) throw new InvalidOperationException("Bad element size.");
-
-            int align = AlignForSize(elemSize);
-
-            int baseAbs = ReadI32(_frameBase + 60);
-            int spBytes = ReadI32(_frameBase + 64);
-
-            int curAbs = baseAbs + spBytes;
-            int alignedAbs = AlignUp(curAbs, align);
-
-            int newSpBytes = checked((alignedAbs - baseAbs) + bytes);
-            int newEndAbs = checked(baseAbs + newSpBytes);
-
-            if (newEndAbs > _stackEnd)
-                throw new InvalidOperationException("Stack overflow (stackalloc).");
-
-            WriteI32(_frameBase + 64, newSpBytes);
-
-            int oldFrameEnd = ReadI32(_frameBase + 68);
-            if (newEndAbs > oldFrameEnd)
-            {
-                WriteI32(_frameBase + 68, newEndAbs);
-                _sp = newEndAbs;
-                if (_sp > _stackPeakAbs) _stackPeakAbs = _sp;
-            }
-
-            PushSlot(new Slot(SlotKind.Ptr, alignedAbs, aux: elemSize));
-        }
-        private void ExecPtrElemAddr(int elemSize)
-        {
-            var idxSlot = PopSlot();
-            long idx = idxSlot.Kind switch
-            {
-                SlotKind.I4 => idxSlot.AsI4Checked(),
-                SlotKind.I8 => idxSlot.AsI8Checked(),
-                _ => throw new InvalidOperationException($"Pointer index must be I4 or I8, got {idxSlot.Kind}.")
-            };
-
-            var a = PopSlot();
-            int baseAbs = GetAddressAbsOrThrow(a);
-
-            long delta = checked(idx * (long)elemSize);
-            int resAbs = checked(baseAbs + checked((int)delta));
-
-            PushSlot(new Slot(a.Kind, resAbs, aux: elemSize));
-        }
-        private void ExecPtrDiff(int elemSize)
-        {
-            if (elemSize <= 0) throw new InvalidOperationException("Bad element size.");
-
-            var b = PopSlot();
-            var a = PopSlot();
-
-            int aAbs = a.Kind == SlotKind.Null ? 0 : GetAddressAbsOrThrow(a);
-            int bAbs = b.Kind == SlotKind.Null ? 0 : GetAddressAbsOrThrow(b);
-
-            long diffBytes = (long)aAbs - (long)bAbs;
-            long diffElems = diffBytes / elemSize;
-
-            int PointerSize = _rts.Target.PointerSize;
-            if (PointerSize == 8)
-                PushSlot(new Slot(SlotKind.I8, diffElems));
-            else
-                PushSlot(new Slot(SlotKind.I4, unchecked((int)diffElems)));
-        }
 
         private void ExecLdobj(RuntimeModule mod, int typeToken)
         {
@@ -3446,20 +3057,51 @@ namespace Cnidaria.Cs
 
             StoreSlotAsValue(abs, 0, t, v);
         }
-        private void ExecNewobj(RuntimeModule callerModule, int ctorToken, int argCount, CancellationToken ct, ExecutionLimits limits)
+        private void ExecNewobj(RuntimeModule callerModule, int ctorToken, CancellationToken ct, ExecutionLimits limits)
+            => ExecNewobj(ResolveRuntimeMethodOrThrow(callerModule, ctorToken, _curMethod), ct, limits);
+        // Activator.CreateInstance<T>, which 'new T()' binds to, for the exact T of this instantiation
+        private void ExecCreateInstance(RuntimeType type, int resumePc, CancellationToken ct, ExecutionLimits limits)
         {
-            // Resolve ctor body
-            var (targetModuleOpt, targetFn) = _domain.ResolveCall(callerModule, ctorToken);
-            var targetModule = targetModuleOpt ?? callerModule;
-            var ctor = ResolveRuntimeMethodOrThrow(callerModule, ctorToken, _curLayout?.Method);
+            _rts.EnsureConstructedMembers(type);
+            RuntimeMethod? ctor = null;
+            foreach (var method in type.Methods)
+            {
+                if (!method.IsStatic && method.ParameterTypes.Length == 0 && StringComparer.Ordinal.Equals(method.Name, ".ctor"))
+                    ctor = method;
+            }
+            if (ctor is null)
+            {
+                if (!type.IsValueType)
+                    throw new MissingMethodException($"'{type.Namespace}.{type.Name}' has no parameterless constructor.");
+                PushDefaultValue(type);
+                return;
+            }
+            if (TryDeferTypeInitialization(type, resumePc, ct, limits))
+                return;
+            ExecNewobj(ctor, ct, limits);
+        }
+        private void ExecNewobj(RuntimeMethod ctor, CancellationToken ct, ExecutionLimits limits)
+        {
+            if (ctor.CilBody is null && IsDelegateLikeRuntimeType(ctor.DeclaringType))
+            {
+                var functionPointer = PopSlot();
+                var target = PopSlot();
+                if (functionPointer.Kind != SlotKind.FunctionPointer || functionPointer.Aux != 0)
+                    throw new InvalidOperationException($"Delegate construction requires a managed function pointer, got {functionPointer.Kind}.");
+
+                var targetMethod = _rts.GetMethodById(checked((int)functionPointer.Payload));
+                if (targetMethod.HasThis && target.Kind == SlotKind.Null)
+                    throw new NullReferenceException();
+                PushSlot(new Slot(SlotKind.Ref, AllocDelegateObject(ctor.DeclaringType, targetMethod, target)));
+                return;
+            }
 
             // Pop explicit args from caller eval stack
+            int argCount = ctor.ParameterTypes.Length;
             var args = new Slot[argCount];
             for (int i = argCount - 1; i >= 0; i--)
                 args[i] = PopSlot();
 
-            int callerMethodToken = ReadI32(_frameBase + 16);
-            int callerModuleId = ReadI32(_frameBase + 20);
             int returnPc = _curPc;
             if (IsSystemStringType(ctor.DeclaringType))
             {
@@ -3555,16 +3197,7 @@ namespace Cnidaria.Cs
                 var objRef = new Slot(SlotKind.Ref, objAbs);
 
                 // Resolve ctor body and run it
-                PushFrame(
-                    targetModule,
-                    targetFn,
-                    returnPc: returnPc,
-                    returnMethodToken: callerMethodToken,
-                    returnModuleId: callerModuleId,
-                    ct: ct,
-                    limits: limits,
-                    totalArgsOnCallerStack: 0,
-                    runtimeMethod: ctor);
+                PushFrame(ctor, returnPc, ct, limits);
 
                 var calleeLayout = _curLayout ?? throw new InvalidOperationException("Ctor frame layout not initialized.");
                 int calleeArgsAbs = _curArgsAbs;
@@ -3582,16 +3215,7 @@ namespace Cnidaria.Cs
                 int objAbs = AllocObject(ctor.DeclaringType);
                 var objRef = new Slot(SlotKind.Ref, objAbs);
 
-                PushFrame(
-                    targetModule,
-                    targetFn,
-                    returnPc: returnPc,
-                    returnMethodToken: callerMethodToken,
-                    returnModuleId: callerModuleId,
-                    ct: ct,
-                    limits: limits,
-                    totalArgsOnCallerStack: 0,
-                    runtimeMethod: ctor);
+                PushFrame(ctor, returnPc, ct, limits);
 
                 var calleeLayout = _curLayout ?? throw new InvalidOperationException("Ctor frame layout not initialized.");
                 int calleeArgsAbs = _curArgsAbs;
@@ -3612,16 +3236,7 @@ namespace Cnidaria.Cs
                 int tempAbs = AllocFrameScratch(sz, al);
                 Array.Clear(_mem, tempAbs, sz);
 
-                PushFrame(
-                    targetModule,
-                    targetFn,
-                    returnPc: returnPc,
-                    returnMethodToken: callerMethodToken,
-                    returnModuleId: callerModuleId,
-                    ct: ct,
-                    limits: limits,
-                    totalArgsOnCallerStack: 0,
-                    runtimeMethod: ctor);
+                PushFrame(ctor, returnPc, ct, limits);
 
                 var calleeLayoutVt = _curLayout ?? throw new InvalidOperationException("Ctor frame layout not initialized.");
                 int calleeArgsAbsVt = _curArgsAbs;
@@ -3641,8 +3256,8 @@ namespace Cnidaria.Cs
             if (align <= 0)
                 throw new InvalidOperationException($"Invalid frame scratch alignment: {align}.");
 
-            int baseAbs = ReadI32(_frameBase + 60);
-            int spBytes = ReadI32(_frameBase + 64);
+            int baseAbs = ReadI32(_frameBase + FrameScratchBase);
+            int spBytes = ReadI32(_frameBase + FrameScratchSp);
 
             int curAbs = baseAbs + spBytes;
             int alignedAbs = AlignUp(curAbs, align);
@@ -3653,12 +3268,12 @@ namespace Cnidaria.Cs
             if (newEndAbs > _stackEnd)
                 throw new InvalidOperationException("Stack overflow (frame scratch).");
 
-            WriteI32(_frameBase + 64, newSpBytes);
+            WriteI32(_frameBase + FrameScratchSp, newSpBytes);
 
-            int oldFrameEnd = ReadI32(_frameBase + 68);
+            int oldFrameEnd = ReadI32(_frameBase + FrameEnd);
             if (newEndAbs > oldFrameEnd)
             {
-                WriteI32(_frameBase + 68, newEndAbs);
+                WriteI32(_frameBase + FrameEnd, newEndAbs);
                 _sp = newEndAbs;
                 if (_sp > _stackPeakAbs) _stackPeakAbs = _sp;
             }
@@ -3770,6 +3385,12 @@ namespace Cnidaria.Cs
             if (!field.IsStatic)
                 throw new InvalidOperationException($"Field '{field.DeclaringType.Namespace}.{field.DeclaringType.Name}.{field.Name}' is not static.");
 
+            if (field.Rva != 0)
+            {
+                PushSlot(new Slot(SlotKind.Ptr, GetStaticDataAddress(field)));
+                return;
+            }
+
             int fieldAbs = GetStaticFieldAddress(field, writable: false);
             var (sz, _) = GetStorageSizeAlign(field.FieldType);
             PushSlot(new Slot(SlotKind.ByRef, fieldAbs, aux: sz));
@@ -3869,7 +3490,7 @@ namespace Cnidaria.Cs
             _ = EnsureStaticStorage(t);
 
             var cctor = FindTypeInitializer(t);
-            if (cctor is null || cctor.BodyModule is null || cctor.Body is null)
+            if (cctor is null || cctor.CilBody is null)
             {
                 _typeInitState[t.TypeId] = 2;
                 return false;
@@ -3878,49 +3499,26 @@ namespace Cnidaria.Cs
             if (_frameBase < 0)
                 throw new InvalidOperationException("Type initialization requires an active frame.");
 
-            int callerMethodToken = ReadI32(_frameBase + 16);
-            int callerModuleId = ReadI32(_frameBase + 20);
-
             _curPc = resumePc;
 
-            PushFrame(
-                module: cctor.BodyModule,
-                fn: cctor.Body,
-                returnPc: resumePc,
-                returnMethodToken: callerMethodToken,
-                returnModuleId: callerModuleId,
-                ct: ct,
-                limits: limits,
-                totalArgsOnCallerStack: 0,
-                runtimeMethod: cctor);
+            PushFrame(cctor, returnPc: resumePc, ct, limits);
 
             _pendingTypeInitFrames[_frameBase] = t.TypeId;
             return true;
         }
-        private static int AlignForSize(int size)
-        {
-            if (size <= 1) return 1;
-            if (size == 2) return 2;
-            if (size == 4) return 4;
-            return 8;
-        }
         private void PushFrame(
-            RuntimeModule module,
-            BytecodeFunction fn,
+            RuntimeMethod method,
             int returnPc,
-            int returnMethodToken,
-            int returnModuleId,
             CancellationToken ct,
             ExecutionLimits limits,
             int totalArgsOnCallerStack = 0,
-            RuntimeMethod? runtimeMethod = null,
             ReadOnlySpan<Slot> initialArgs = default)
         {
             if (++_callDepth > limits.MaxCallDepth)
-                throw new InvalidOperationException("Max call depth exceeded.");
+                throw new InvalidOperationException($"Max call depth exceeded calling {Describe(method)}.");
 
-            var layout = GetOrCreateMethodLayout(module, fn, runtimeMethod);
-            var rm = layout.Method;
+            var body = method.CilBody ?? throw new MissingMethodException($"No body for target: {Describe(method)}");
+            var layout = GetOrCreateMethodLayout(method);
 
             int argsCount = layout.ArgTypes.Length;
 
@@ -3942,12 +3540,12 @@ namespace Cnidaria.Cs
 
             cursor = AlignUp(cursor, 8);
             int evalBase = cursor;
-            int evalBytes = checked(fn.MaxStack * SlotSize);
+            int evalBytes = checked(body.MaxStack * SlotSize);
             cursor = checked(cursor + evalBytes);
 
             cursor = AlignUp(cursor, 8);
             int evalBlobBase = cursor;
-            int evalBlobCap = ComputeEvalBlobCapacity(module, fn, rm);
+            int evalBlobCap = layout.EvalBlobCapacity;
             cursor = checked(cursor + evalBlobCap);
 
             cursor = AlignUp(cursor, 8);
@@ -3966,25 +3564,21 @@ namespace Cnidaria.Cs
             if (initBytes > 0)
                 Array.Clear(_mem, newBase + argsBase, initBytes);
 
-            WriteI32(newBase + 0, _frameBase);
-            WriteI32(newBase + 4, returnPc);
-            WriteI32(newBase + 8, returnMethodToken);
-            WriteI32(newBase + 12, returnModuleId);
-            WriteI32(newBase + 16, fn.MethodToken);
-            WriteI32(newBase + 20, _moduleIdByName[module.Name]);
-            WriteI32(newBase + 24, 0);               // pc
-            WriteI32(newBase + 28, newBase + evalBase);
-            WriteI32(newBase + 32, 0);               // evalSp
-            WriteI32(newBase + 36, fn.MaxStack);
-            WriteI32(newBase + 40, newBase + argsBase);
-            WriteI32(newBase + 44, newBase + localsBase);
-            WriteI32(newBase + 48, newBase + evalBlobBase);
-            WriteI32(newBase + 52, 0);               // evalBlobSp
-            WriteI32(newBase + 56, evalBlobCap);     // evalBlobCap
-            WriteI32(newBase + 60, newBase + stackallocBase);
-            WriteI32(newBase + 64, 0);               // stackallocSp
-            WriteI32(newBase + 68, newBase + frameEnd);
-            WriteI32(newBase + 72, rm.MethodId);
+            WriteI32(newBase + FramePrevBase, _frameBase);
+            WriteI32(newBase + FrameReturnPc, returnPc);
+            WriteI32(newBase + FrameMethodId, method.MethodId);
+            WriteI32(newBase + FramePc, 0);
+            WriteI32(newBase + FrameEvalBase, newBase + evalBase);
+            WriteI32(newBase + FrameEvalSp, 0);
+            WriteI32(newBase + FrameEvalMax, body.MaxStack);
+            WriteI32(newBase + FrameArgsBase, newBase + argsBase);
+            WriteI32(newBase + FrameLocalsBase, newBase + localsBase);
+            WriteI32(newBase + FrameEvalBlobBase, newBase + evalBlobBase);
+            WriteI32(newBase + FrameEvalBlobSp, 0);
+            WriteI32(newBase + FrameEvalBlobCap, evalBlobCap);
+            WriteI32(newBase + FrameScratchBase, newBase + stackallocBase);
+            WriteI32(newBase + FrameScratchSp, 0);
+            WriteI32(newBase + FrameEnd, newBase + frameEnd);
 
             int calleeArgsAbs = newBase + argsBase;
 
@@ -4006,14 +3600,15 @@ namespace Cnidaria.Cs
             _frameBase = newBase;
             _sp = newSp;
             if (_sp > _stackPeakAbs) _stackPeakAbs = _sp;
-            _curModule = module;
-            _curFn = fn;
+            _curModule = method.BodyModule;
+            _curMethod = method;
+            _curBody = body;
             _curLayout = layout;
             _curArgsAbs = newBase + argsBase;
             _curLocalsAbs = newBase + localsBase;
             _curEvalBase = newBase + evalBase;
             _curEvalSp = 0;
-            _curEvalMax = fn.MaxStack;
+            _curEvalMax = body.MaxStack;
             EnsureHotEvalCapacity(_curEvalMax);
             _curPc = 0;
 
@@ -4021,8 +3616,7 @@ namespace Cnidaria.Cs
         }
         private void PopFrame()
         {
-            int prev = ReadI32(_frameBase + 0);
-            int frameEnd = ReadI32(_frameBase + 68);
+            int prev = ReadI32(_frameBase + FramePrevBase);
 
             // Release stack to frame base
             _sp = _frameBase;
@@ -4054,21 +3648,19 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException("No active catch context.");
             return _catchStack[_catchStack.Count - 1].Exception;
         }
-        private void ExecLeave(BytecodeFunction fn, int fromPc, int targetPc)
+        private void ExecLeave(int fromPc, int targetPc)
         {
             ResetEvalStackForExceptionHandler();
-            if (!TryBeginFinallyForJump(fn, fromPc: fromPc, targetPc: targetPc))
+            if (!TryBeginFinallyForJump(fromPc: fromPc, targetPc: targetPc))
                 _curPc = targetPc;
         }
-        private void ExecEndfinally(int pc, CancellationToken ct, ExecutionLimits limits)
+        private void ExecEndfinally(CancellationToken ct, ExecutionLimits limits)
         {
             if (_finallyStack.Count == 0 || _finallyStack[_finallyStack.Count - 1].FrameBase != _frameBase)
                 throw new InvalidOperationException("Endfinally without an active finally context.");
 
             var ctx = _finallyStack[_finallyStack.Count - 1];
             _finallyStack.RemoveAt(_finallyStack.Count - 1);
-
-            var fn = _curFn ?? throw new InvalidOperationException("No current function.");
 
             if (ctx.Kind == FinallyContinuationKind.Throw)
             {
@@ -4078,25 +3670,10 @@ namespace Cnidaria.Cs
                 return;
             }
 
-            if (ctx.Kind == FinallyContinuationKind.Jump)
-            {
-                if (TryBeginFinallyForJump(fn, fromPc: ctx.NextFromPc, targetPc: ctx.TargetPc))
-                    return;
-
-                _curPc = ctx.TargetPc;
+            if (TryBeginFinallyForJump(fromPc: ctx.NextFromPc, targetPc: ctx.TargetPc))
                 return;
-            }
 
-            if (ctx.Kind == FinallyContinuationKind.Return)
-            {
-                if (TryBeginFinallyForReturn(fn, fromPc: ctx.NextFromPc, hasRet: ctx.HasReturnValue, retVal: ctx.ReturnValue))
-                    return;
-
-                CompleteReturnFromCurrentFrame(ctx.HasReturnValue, ctx.ReturnValue, ct, limits);
-                return;
-            }
-
-            throw new InvalidOperationException("Unknown finally continuation kind.");
+            _curPc = ctx.TargetPc;
         }
         private void CompleteReturnFromCurrentFrame(bool hasRet, Slot retVal, CancellationToken ct, ExecutionLimits limits)
         {
@@ -4183,12 +3760,11 @@ namespace Cnidaria.Cs
             }
         }
 
-        private static int SpanOf(in ExceptionHandler h) => h.TryEndPc - h.TryStartPc;
 
-        private bool TryFindFinallyHandlerForPc(BytecodeFunction fn, int pcInFrame, out ExceptionHandler match)
+        private bool TryFindFinallyHandlerForPc(int pcInFrame, out CilExceptionClause match)
         {
             match = default;
-            var handlers = fn.ExceptionHandlers;
+            var handlers = (_curBody ?? throw new InvalidOperationException("No current method body.")).ExceptionClauses;
             if (handlers.IsDefaultOrEmpty || pcInFrame < 0)
                 return false;
 
@@ -4196,12 +3772,12 @@ namespace Cnidaria.Cs
             for (int i = 0; i < handlers.Length; i++)
             {
                 var h = handlers[i];
-                if (h.CatchTypeToken != FinallyCatchTypeToken)
+                if (h.Kind is not (CilExceptionClauseKind.Finally or CilExceptionClauseKind.Fault))
                     continue;
                 if (pcInFrame < h.TryStartPc || pcInFrame >= h.TryEndPc)
                     continue;
 
-                int span = SpanOf(h);
+                int span = h.TryEndPc - h.TryStartPc;
                 if (span < bestSpan)
                 {
                     bestSpan = span;
@@ -4212,10 +3788,10 @@ namespace Cnidaria.Cs
             return bestSpan != int.MaxValue;
         }
 
-        private bool TryFindFinallyHandlerForLeave(BytecodeFunction fn, int fromPc, int toPc, out ExceptionHandler match)
+        private bool TryFindFinallyHandlerForLeave(int fromPc, int toPc, out CilExceptionClause match)
         {
             match = default;
-            var handlers = fn.ExceptionHandlers;
+            var handlers = (_curBody ?? throw new InvalidOperationException("No current method body.")).ExceptionClauses;
             if (handlers.IsDefaultOrEmpty || fromPc < 0)
                 return false;
 
@@ -4223,14 +3799,14 @@ namespace Cnidaria.Cs
             for (int i = 0; i < handlers.Length; i++)
             {
                 var h = handlers[i];
-                if (h.CatchTypeToken != FinallyCatchTypeToken)
+                if (h.Kind != CilExceptionClauseKind.Finally)
                     continue;
                 if (fromPc < h.TryStartPc || fromPc >= h.TryEndPc)
                     continue;
                 if (toPc >= h.TryStartPc && toPc < h.TryEndPc)
                     continue;
 
-                int span = SpanOf(h);
+                int span = h.TryEndPc - h.TryStartPc;
                 if (span < bestSpan)
                 {
                     bestSpan = span;
@@ -4241,7 +3817,7 @@ namespace Cnidaria.Cs
             return bestSpan != int.MaxValue;
         }
 
-        private void BeginFinally(in ExceptionHandler h, in FinallyContext ctx)
+        private void BeginFinally(in CilExceptionClause h, in FinallyContext ctx)
         {
             PruneCatchContextsForPc(h.HandlerStartPc);
             ResetEvalStackForExceptionHandler();
@@ -4249,23 +3825,15 @@ namespace Cnidaria.Cs
             _curPc = h.HandlerStartPc;
         }
 
-        private bool TryBeginFinallyForJump(BytecodeFunction fn, int fromPc, int targetPc)
+        private bool TryBeginFinallyForJump(int fromPc, int targetPc)
         {
-            if (!TryFindFinallyHandlerForLeave(fn, fromPc, targetPc, out var h))
+            if (!TryFindFinallyHandlerForLeave(fromPc, targetPc, out var h))
                 return false;
 
             BeginFinally(h, FinallyContext.ForJump(_frameBase, h, targetPc));
             return true;
         }
 
-        private bool TryBeginFinallyForReturn(BytecodeFunction fn, int fromPc, bool hasRet, Slot retVal)
-        {
-            if (!TryFindFinallyHandlerForLeave(fn, fromPc, toPc: -1, out var h))
-                return false;
-
-            BeginFinally(h, FinallyContext.ForReturn(_frameBase, h, hasRet, retVal));
-            return true;
-        }
         private RuntimeModule FindCoreLibModuleOrThrow()
         {
             // Prefer the conventional name
@@ -4378,12 +3946,12 @@ namespace Cnidaria.Cs
         private void ResetEvalStackForExceptionHandler()
         {
             _curEvalSp = 0;
-            WriteI32(_frameBase + 52, 0);
+            WriteI32(_frameBase + FrameEvalBlobSp, 0);
         }
-        private bool TryFindCatchHandler(RuntimeModule mod, BytecodeFunction fn, int throwPc, Slot ex, out ExceptionHandler match)
+        private bool TryFindCatchHandler(RuntimeModule mod, CilMethodBody body, int throwPc, Slot ex, out CilExceptionClause match)
         {
             match = default;
-            var handlers = fn.ExceptionHandlers;
+            var handlers = body.ExceptionClauses;
             if (handlers.IsDefaultOrEmpty)
                 return false;
             if (throwPc < 0)
@@ -4395,7 +3963,9 @@ namespace Cnidaria.Cs
                 var h = handlers[i];
                 if (throwPc < h.TryStartPc || throwPc >= h.TryEndPc)
                     continue;
-                if (h.CatchTypeToken == FinallyCatchTypeToken)
+                if (h.Kind == CilExceptionClauseKind.Filter)
+                    throw new NotSupportedException("Exception filters are not supported by the stack VM.");
+                if (h.Kind != CilExceptionClauseKind.Catch)
                     continue;
                 bool seen = false;
                 for (int j = 0; j < regions.Count; j++)
@@ -4420,13 +3990,8 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < handlers.Length; i++)
                 {
                     var h = handlers[i];
-                    if (h.TryStartPc != reg.start || h.TryEndPc != reg.end)
+                    if (h.Kind != CilExceptionClauseKind.Catch || h.TryStartPc != reg.start || h.TryEndPc != reg.end)
                         continue;
-                    if (h.CatchTypeToken == 0)
-                    {
-                        match = h;
-                        return true;
-                    }
                     var catchType = ResolveTypeTokenInCurrentMethod(mod, h.CatchTypeToken);
                     if (IsAssignableTo(actualType, catchType))
                     {
@@ -4446,31 +4011,32 @@ namespace Cnidaria.Cs
                 AbandonActiveFinallyContextIfThrowingInsideFinally(pcInFrame);
                 PruneCatchContextsForPc(pcInFrame);
                 var mod = _curModule ?? throw new InvalidOperationException("No current module.");
-                var fn = _curFn ?? throw new InvalidOperationException("No current function.");
-                if (TryFindCatchHandler(mod, fn, pcInFrame, ex, out var handler))
+                var body = _curBody ?? throw new InvalidOperationException("No current method body.");
+                bool hasCatch = TryFindCatchHandler(mod, body, pcInFrame, ex, out var handler);
+                bool hasFinally = TryFindFinallyHandlerForPc(pcInFrame, out var fin);
+                // A finally nested inside the catching try runs first; its throw continuation resumes the search
+                if (hasCatch && (!hasFinally || fin.TryEndPc - fin.TryStartPc >= handler.TryEndPc - handler.TryStartPc))
                 {
                     PruneCatchContextsForPc(handler.HandlerStartPc);
                     ResetEvalStackForExceptionHandler();
                     _catchStack.Add(new CatchContext(_frameBase, handler.HandlerStartPc, handler.HandlerEndPc, ex));
                     _curPc = handler.HandlerStartPc;
+                    PushSlot(ex);
                     MaybeCollectGarbage(force: false);
                     return;
                 }
-                if (TryFindFinallyHandlerForPc(fn, pcInFrame, out var fin))
+                if (hasFinally)
                 {
                     BeginFinally(fin, FinallyContext.ForThrow(_frameBase, fin, ex));
                     MaybeCollectGarbage(force: false);
                     return;
                 }
-                int returnPc = ReadI32(_frameBase + 4);
+                int returnPc = ReadI32(_frameBase + FrameReturnPc);
                 if (returnPc < 0)
                 {
                     var t = GetObjectTypeFromRef(ex);
                     throw new VmUnhandledException($"Unhandled exception: {t.AssemblyName}:{t.Namespace}.{t.Name}");
                 }
-
-                int returnMethodToken = ReadI32(_frameBase + 8);
-                int returnModuleId = ReadI32(_frameBase + 12);
 
                 int curBase = _frameBase;
                 ClearCatchContextsForFrame(curBase);
@@ -4491,17 +4057,6 @@ namespace Cnidaria.Cs
                 pcInFrame = returnPc - 1;
                 if (pcInFrame < 0)
                     pcInFrame = 0;
-
-                if ((uint)returnModuleId >= (uint)_moduleById.Length)
-                    throw new InvalidOperationException("Return module id out of range.");
-
-                var callerModule = _moduleById[returnModuleId];
-                _curModule = callerModule;
-
-                if (!callerModule.MethodsByDefToken.TryGetValue(returnMethodToken, out var callerFn))
-                    throw new InvalidOperationException("Return method not found.");
-
-                _curFn = callerFn;
             }
         }
         private void PushSlot(Slot v)
@@ -4787,31 +4342,14 @@ namespace Cnidaria.Cs
                 return;
             }
 
-            if (t.Kind == RuntimeTypeKind.Pointer)
+            if (t.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.FunctionPointer)
             {
-                if (v.Kind is not (SlotKind.Ptr or SlotKind.ByRef or SlotKind.Null))
-                    throw new InvalidOperationException($"Storing {v.Kind} into pointer.");
-
-                long p = v.Kind == SlotKind.Null ? 0 : v.Payload;
-                WriteNativeInt(abs, p);
-                return;
-            }
-
-            if (t.Kind == RuntimeTypeKind.FunctionPointer)
-            {
-                if (v.Kind is not (SlotKind.FunctionPointer or SlotKind.Null))
-                    throw new InvalidOperationException($"Storing {v.Kind} into function pointer.");
-
-                WriteNativeInt(abs, v.Kind == SlotKind.Null ? 0 : GetFunctionPointerNativeValue(v));
-                return;
-            }
-
-            if (t.Kind == RuntimeTypeKind.ByRef)
-            {
-                if (v.Kind is not (SlotKind.ByRef or SlotKind.Null))
-                    throw new InvalidOperationException($"Storing {v.Kind} into byref.");
-
-                long p = v.Kind == SlotKind.Null ? 0 : v.Payload;
+                long p = v.Kind switch
+                {
+                    SlotKind.FunctionPointer => GetFunctionPointerNativeValue(v),
+                    SlotKind.Ptr or SlotKind.ByRef or SlotKind.Null or SlotKind.I4 or SlotKind.I8 => IntegerPayload(v),
+                    _ => throw new InvalidOperationException($"Storing {v.Kind} into {t.Kind}."),
+                };
                 WriteNativeInt(abs, p);
                 return;
             }
@@ -4876,16 +4414,16 @@ namespace Cnidaria.Cs
             switch (sz)
             {
                 case 1:
-                    _mem[abs] = unchecked((byte)v.AsI4Checked());
+                    _mem[abs] = unchecked((byte)IntegerPayload(v));
                     return;
                 case 2:
-                    BinaryPrimitives.WriteInt16LittleEndian(_mem.AsSpan(abs, 2), unchecked((short)v.AsI4Checked()));
+                    BinaryPrimitives.WriteInt16LittleEndian(_mem.AsSpan(abs, 2), unchecked((short)IntegerPayload(v)));
                     return;
                 case 4:
-                    BinaryPrimitives.WriteInt32LittleEndian(_mem.AsSpan(abs, 4), v.AsI4Checked());
+                    BinaryPrimitives.WriteInt32LittleEndian(_mem.AsSpan(abs, 4), unchecked((int)IntegerPayload(v)));
                     return;
                 case 8:
-                    BinaryPrimitives.WriteInt64LittleEndian(_mem.AsSpan(abs, 8), v.Kind == SlotKind.I8 ? v.Payload : v.AsI4Checked());
+                    BinaryPrimitives.WriteInt64LittleEndian(_mem.AsSpan(abs, 8), IntegerPayload(v));
                     return;
                 default:
                     throw new NotSupportedException($"Value type size {sz} store not supported.");
@@ -4907,10 +4445,10 @@ namespace Cnidaria.Cs
         }
         private int GetAddressAbsOrThrow(Slot a)
         {
-            if (a.Kind == SlotKind.Ptr || a.Kind == SlotKind.ByRef)
+            if (a.Kind is SlotKind.Ptr or SlotKind.ByRef or SlotKind.I4 or SlotKind.I8 && a.Payload != 0)
                 return checked((int)a.Payload);
 
-            if (a.Kind == SlotKind.Null)
+            if (a.Kind is SlotKind.Null or SlotKind.Ptr or SlotKind.ByRef or SlotKind.I4 or SlotKind.I8)
                 throw new NullReferenceException("Null pointer dereference.");
 
             throw new InvalidOperationException($"Expected address, got {a.Kind}.");
@@ -4961,7 +4499,7 @@ namespace Cnidaria.Cs
 
         private void ExecNeg()
         {
-            var v = PopSlot();
+            var v = AsArithmeticOperand(PopSlot());
 
             switch (v.Kind)
             {
@@ -4993,7 +4531,7 @@ namespace Cnidaria.Cs
         }
         private void ExecNot()
         {
-            var v = PopSlot();
+            var v = AsArithmeticOperand(PopSlot());
 
             switch (v.Kind)
             {
@@ -5011,8 +4549,7 @@ namespace Cnidaria.Cs
         }
         private void ExecUnsignedDivide()
         {
-            var b = PopSlot();
-            var a = PopSlot();
+            var (a, b) = PopOperands();
 
             if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
             {
@@ -5036,8 +4573,7 @@ namespace Cnidaria.Cs
         }
         private void ExecUnsignedRemeinder()
         {
-            var b = PopSlot();
-            var a = PopSlot();
+            var (a, b) = PopOperands();
 
             if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
             {
@@ -5061,8 +4597,9 @@ namespace Cnidaria.Cs
         }
         private void ExecAdd()
         {
-            var b = PopSlot();
-            var a = PopSlot();
+            if (TryExecAddressArithmetic(subtract: false))
+                return;
+            var (a, b) = PopOperands();
 
             if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
             {
@@ -5095,8 +4632,9 @@ namespace Cnidaria.Cs
         }
         private void ExecAddChecked(bool unsigned)
         {
-            var b = PopSlot();
-            var a = PopSlot();
+            if (TryExecAddressArithmetic(subtract: false))
+                return;
+            var (a, b) = PopOperands();
 
             if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
             {
@@ -5132,8 +4670,9 @@ namespace Cnidaria.Cs
         }
         private void ExecSubtract()
         {
-            var b = PopSlot();
-            var a = PopSlot();
+            if (TryExecAddressArithmetic(subtract: true))
+                return;
+            var (a, b) = PopOperands();
 
             if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
             {
@@ -5166,8 +4705,9 @@ namespace Cnidaria.Cs
         }
         private void ExecSubtractChecked(bool unsigned)
         {
-            var b = PopSlot();
-            var a = PopSlot();
+            if (TryExecAddressArithmetic(subtract: true))
+                return;
+            var (a, b) = PopOperands();
 
             if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
             {
@@ -5203,8 +4743,7 @@ namespace Cnidaria.Cs
         }
         private void ExecMultiply()
         {
-            var b = PopSlot();
-            var a = PopSlot();
+            var (a, b) = PopOperands();
 
             if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
             {
@@ -5237,8 +4776,7 @@ namespace Cnidaria.Cs
         }
         private void ExecMultiplyChecked(bool unsigned)
         {
-            var b = PopSlot();
-            var a = PopSlot();
+            var (a, b) = PopOperands();
 
             if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
             {
@@ -5274,8 +4812,7 @@ namespace Cnidaria.Cs
         }
         private void ExecDivide()
         {
-            var b = PopSlot();
-            var a = PopSlot();
+            var (a, b) = PopOperands();
             if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
             {
                 PushSlot(new Slot(SlotKind.I4, I4Unchecked(in a) / I4Unchecked(in b)));
@@ -5304,8 +4841,7 @@ namespace Cnidaria.Cs
         }
         private void ExecRemeinder()
         {
-            var b = PopSlot();
-            var a = PopSlot();
+            var (a, b) = PopOperands();
             if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
             {
                 PushSlot(new Slot(SlotKind.I4, I4Unchecked(in a) % I4Unchecked(in b)));
@@ -5354,8 +4890,7 @@ namespace Cnidaria.Cs
 
         private void ExecBitwiseAnd()
         {
-            var b = PopSlot();
-            var a = PopSlot();
+            var (a, b) = PopOperands();
 
             if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
             {
@@ -5374,8 +4909,7 @@ namespace Cnidaria.Cs
 
         private void ExecBitwiseOr()
         {
-            var b = PopSlot();
-            var a = PopSlot();
+            var (a, b) = PopOperands();
 
             if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
             {
@@ -5394,8 +4928,7 @@ namespace Cnidaria.Cs
 
         private void ExecBitwiseXor()
         {
-            var b = PopSlot();
-            var a = PopSlot();
+            var (a, b) = PopOperands();
 
             if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
             {
@@ -5415,7 +4948,7 @@ namespace Cnidaria.Cs
         private void ExecShiftLeft()
         {
             var shift = PopSlot();
-            var value = PopSlot();
+            var value = AsArithmeticOperand(PopSlot());
 
             if (value.Kind == SlotKind.I4)
             {
@@ -5437,7 +4970,7 @@ namespace Cnidaria.Cs
         private void ExecShiftRight()
         {
             var shift = PopSlot();
-            var value = PopSlot();
+            var value = AsArithmeticOperand(PopSlot());
 
             if (value.Kind == SlotKind.I4)
             {
@@ -5459,7 +4992,7 @@ namespace Cnidaria.Cs
         private void ExecUnsignedShiftRight()
         {
             var shift = PopSlot();
-            var value = PopSlot();
+            var value = AsArithmeticOperand(PopSlot());
 
             if (value.Kind == SlotKind.I4)
             {
@@ -5479,44 +5012,8 @@ namespace Cnidaria.Cs
 
             throw new InvalidOperationException($"Unsigned shift-right type not supported: {value.Kind}");
         }
-        private static int CompareLess(Slot a, Slot b)
-        {
-            if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4) return a.AsI4Checked() < b.AsI4Checked() ? 1 : 0;
-            if (a.Kind == SlotKind.I8 && b.Kind == SlotKind.I8) return a.AsI8Checked() < b.AsI8Checked() ? 1 : 0;
-            if (a.Kind == SlotKind.R4 && b.Kind == SlotKind.R4) return a.AsR4Checked() < b.AsR4Checked() ? 1 : 0;
-            if (a.Kind == SlotKind.R8 && b.Kind == SlotKind.R8) return a.AsR8Checked() < b.AsR8Checked() ? 1 : 0;
-            throw new InvalidOperationException($"Clt type mismatch: {a.Kind} vs {b.Kind}");
-        }
 
-        private static int CompareLessUnsigned(Slot a, Slot b)
-        {
-            if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
-                return unchecked((uint)a.AsI4Checked()) < unchecked((uint)b.AsI4Checked()) ? 1 : 0;
 
-            if (a.Kind == SlotKind.I8 && b.Kind == SlotKind.I8)
-                return unchecked((ulong)a.AsI8Checked()) < unchecked((ulong)b.AsI8Checked()) ? 1 : 0;
-
-            throw new InvalidOperationException($"Clt_Un type mismatch: {a.Kind} vs {b.Kind}");
-        }
-
-        private static int CompareGreaterUnsigned(Slot a, Slot b)
-        {
-            if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4)
-                return unchecked((uint)a.AsI4Checked()) > unchecked((uint)b.AsI4Checked()) ? 1 : 0;
-
-            if (a.Kind == SlotKind.I8 && b.Kind == SlotKind.I8)
-                return unchecked((ulong)a.AsI8Checked()) > unchecked((ulong)b.AsI8Checked()) ? 1 : 0;
-
-            throw new InvalidOperationException($"Cgt_Un type mismatch: {a.Kind} vs {b.Kind}");
-        }
-        private static int CompareGreater(Slot a, Slot b)
-        {
-            if (a.Kind == SlotKind.I4 && b.Kind == SlotKind.I4) return a.AsI4Checked() > b.AsI4Checked() ? 1 : 0;
-            if (a.Kind == SlotKind.I8 && b.Kind == SlotKind.I8) return a.AsI8Checked() > b.AsI8Checked() ? 1 : 0;
-            if (a.Kind == SlotKind.R4 && b.Kind == SlotKind.R4) return a.AsR4Checked() > b.AsR4Checked() ? 1 : 0;
-            if (a.Kind == SlotKind.R8 && b.Kind == SlotKind.R8) return a.AsR8Checked() > b.AsR8Checked() ? 1 : 0;
-            throw new InvalidOperationException($"Cgt type mismatch: {a.Kind} vs {b.Kind}");
-        }
 
         private int CompareEqual(Slot a, Slot b)
         {
@@ -5534,7 +5031,8 @@ namespace Cnidaria.Cs
                     _ => 0
                 };
             }
-            if (a.Kind != b.Kind) return 0;
+            if (a.Kind != b.Kind)
+                return IsIntegerLike(a.Kind) && IsIntegerLike(b.Kind) && IntegerPayload(a) == IntegerPayload(b) ? 1 : 0;
 
             switch (a.Kind)
             {
@@ -5587,6 +5085,8 @@ namespace Cnidaria.Cs
             }
         }
 
+        private static bool IsIntegerLike(SlotKind kind)
+            => kind is SlotKind.I4 or SlotKind.I8 or SlotKind.Ptr or SlotKind.ByRef or SlotKind.Ref or SlotKind.Null;
         private long GetFunctionPointerNativeValue(Slot functionPointer)
         {
             if (functionPointer.Kind != SlotKind.FunctionPointer)
@@ -5621,6 +5121,7 @@ namespace Cnidaria.Cs
         private static bool ToBool(Slot v)
         {
             if (v.Kind == SlotKind.I4) return v.AsI4Checked() != 0;
+            if (v.Kind == SlotKind.I8) return v.Payload != 0;
             if (v.Kind == SlotKind.Null) return false;
             if (v.Kind == SlotKind.Ref) return v.Payload != 0;
             if (v.Kind == SlotKind.Ptr || v.Kind == SlotKind.ByRef || v.Kind == SlotKind.FunctionPointer) return v.Payload != 0;
@@ -5745,14 +5246,14 @@ namespace Cnidaria.Cs
             static long AsSigned64(Slot s) => s.Kind switch
             {
                 SlotKind.I4 => s.AsI4Checked(),
-                SlotKind.I8 => s.AsI8Checked(),
+                SlotKind.I8 or SlotKind.Ptr or SlotKind.ByRef or SlotKind.Null => s.Payload,
                 _ => throw new InvalidOperationException($"Conv source must be numeric, got {s.Kind}")
             };
 
             static ulong AsUnsigned64(Slot s) => s.Kind switch
             {
                 SlotKind.I4 => unchecked((uint)s.AsI4Checked()),
-                SlotKind.I8 => unchecked((ulong)s.AsI8Checked()),
+                SlotKind.I8 or SlotKind.Ptr or SlotKind.ByRef or SlotKind.Null => unchecked((ulong)s.Payload),
                 _ => throw new InvalidOperationException($"Conv source must be numeric, got {s.Kind}")
             };
 
@@ -6094,22 +5595,16 @@ namespace Cnidaria.Cs
             switch (kind)
             {
                 case FastCellKind.I4:
-                    if (v.Kind != SlotKind.I4)
-                        throw new InvalidOperationException($"Cannot store {v.Kind} into Int32/UInt32 local/arg.");
-                    WriteI32(abs, unchecked((int)v.Payload));
+                    if (!IsIntegerLike(v.Kind) || v.Kind == SlotKind.Ref)
+                        throw new InvalidOperationException($"Cannot store {v.Kind} into a 32-bit integer local/arg.");
+                    WriteI32(abs, unchecked((int)IntegerPayload(v)));
                     return true;
 
                 case FastCellKind.I8:
-                    {
-                        long x = v.Kind switch
-                        {
-                            SlotKind.I8 => v.Payload,
-                            SlotKind.I4 => unchecked((int)v.Payload),
-                            _ => throw new InvalidOperationException($"Cannot store {v.Kind} into Int64/UInt64 local/arg.")
-                        };
-                        WriteI64(abs, x);
-                        return true;
-                    }
+                    if (!IsIntegerLike(v.Kind) || v.Kind == SlotKind.Ref)
+                        throw new InvalidOperationException($"Cannot store {v.Kind} into a 64-bit integer local/arg.");
+                    WriteI64(abs, IntegerPayload(v));
+                    return true;
 
                 case FastCellKind.R4:
                     {
@@ -6149,8 +5644,8 @@ namespace Cnidaria.Cs
             if (_frameBase < 0)
                 return;
 
-            WriteI32(_frameBase + 24, _curPc);
-            WriteI32(_frameBase + 32, _curEvalSp);
+            WriteI32(_frameBase + FramePc, _curPc);
+            WriteI32(_frameBase + FrameEvalSp, _curEvalSp);
 
             int dst = _curEvalBase;
             for (int i = 0; i < _curEvalSp; i++)
@@ -6164,32 +5659,24 @@ namespace Cnidaria.Cs
             if (_frameBase < 0)
             {
                 _curModule = null;
-                _curFn = null;
+                _curMethod = null;
+                _curBody = null;
                 _curLayout = null;
                 _curArgsAbs = _curLocalsAbs = _curEvalBase = _curEvalSp = _curEvalMax = 0;
                 return;
             }
 
-            int methodTok = ReadI32(_frameBase + 16);
-            int moduleId = ReadI32(_frameBase + 20);
-
-            if ((uint)moduleId >= (uint)_moduleById.Length)
-                throw new InvalidOperationException($"Bad moduleId in frame: {moduleId}");
-
-            var mod = _moduleById[moduleId];
-            if (!mod.MethodsByDefToken.TryGetValue(methodTok, out var fn))
-                throw new MissingMethodException($"Current frame method not found: {mod.Name} 0x{methodTok:X8}");
-            int runtimeMethodId = ReadI32(_frameBase + 72);
-            RuntimeMethod? rm = runtimeMethodId != 0 ? _rts.GetMethodById(runtimeMethodId) : null;
-            _curModule = mod;
-            _curFn = fn;
-            _curLayout = GetOrCreateMethodLayout(mod, fn, rm);
-            _curPc = ReadI32(_frameBase + 24);
-            _curArgsAbs = ReadI32(_frameBase + 40);
-            _curLocalsAbs = ReadI32(_frameBase + 44);
-            _curEvalBase = ReadI32(_frameBase + 28);
-            _curEvalSp = ReadI32(_frameBase + 32);
-            _curEvalMax = ReadI32(_frameBase + 36);
+            var method = _rts.GetMethodById(ReadI32(_frameBase + FrameMethodId));
+            _curModule = method.BodyModule;
+            _curMethod = method;
+            _curBody = method.CilBody;
+            _curLayout = GetOrCreateMethodLayout(method);
+            _curPc = ReadI32(_frameBase + FramePc);
+            _curArgsAbs = ReadI32(_frameBase + FrameArgsBase);
+            _curLocalsAbs = ReadI32(_frameBase + FrameLocalsBase);
+            _curEvalBase = ReadI32(_frameBase + FrameEvalBase);
+            _curEvalSp = ReadI32(_frameBase + FrameEvalSp);
+            _curEvalMax = ReadI32(_frameBase + FrameEvalMax);
 
             EnsureHotEvalCapacity(_curEvalMax);
 
@@ -6200,10 +5687,8 @@ namespace Cnidaria.Cs
                 src += SlotSize;
             }
         }
-        private MethodExecLayout GetOrCreateMethodLayout(RuntimeModule mod, BytecodeFunction fn, RuntimeMethod? runtimeMethod = null)
+        private MethodExecLayout GetOrCreateMethodLayout(RuntimeMethod rm)
         {
-            var rm = runtimeMethod ?? ResolveRuntimeMethodOrThrow(mod, fn.MethodToken);
-
             if (_methodLayouts.TryGetValue(rm.MethodId, out var cached))
                 return cached;
 
@@ -6232,7 +5717,11 @@ namespace Cnidaria.Cs
             }
             layout.ArgsAreaSize = cur;
 
-            int localCount = fn.LocalTypeTokens.Length;
+            var body = rm.CilBody ?? throw new MissingMethodException($"No body for target: {Describe(rm)}");
+            var localTypes = body.LocalSignatureToken == 0
+                ? Array.Empty<RuntimeType>()
+                : _rts.ResolveLocalSignatureInMethodContext(rm.BodyModule!, body.LocalSignatureToken, rm);
+            int localCount = localTypes.Length;
             layout.LocalTypes = new RuntimeType[localCount];
             layout.LocalOffsets = new int[localCount];
             layout.LocalSizes = new int[localCount];
@@ -6241,7 +5730,7 @@ namespace Cnidaria.Cs
             cur = 0;
             for (int i = 0; i < localCount; i++)
             {
-                var t = _rts.ResolveTypeInMethodContext(mod, fn.LocalTypeTokens[i], rm);
+                var t = localTypes[i];
                 var (sz, al) = GetStorageSizeAlign(t);
                 cur = AlignUp(cur, al);
 
@@ -6253,6 +5742,7 @@ namespace Cnidaria.Cs
                 cur = checked(cur + sz);
             }
             layout.LocalsAreaSize = cur;
+            layout.EvalBlobCapacity = ComputeEvalBlobCapacity(rm, body, layout);
 
             _methodLayouts.Add(rm.MethodId, layout);
             return layout;
@@ -6674,6 +6164,9 @@ namespace Cnidaria.Cs
                             PushSlot(original);
                             return true;
                         }
+                    case RuntimeIntrinsicId.VolatileRead:
+                    case RuntimeIntrinsicId.VolatileWrite:
+                        return false;
                     case RuntimeIntrinsicId.MemoryBarrier:
                         {
                             if (totalArgs != 0)
@@ -6764,6 +6257,46 @@ namespace Cnidaria.Cs
                 PopSlot();
                 return true;
             }
+            if (RuntimeTypeSystem.IsHardwareAccelerationQuery(rm))
+            {
+                PushSlot(new Slot(SlotKind.I4, 0));
+                return true;
+            }
+
+            if (rm.DeclaringType.Namespace == "System.Runtime" && rm.DeclaringType.Name == "RuntimeImports" && TryInvokeRuntimeTypeQuery(rm))
+                return true;
+
+            if (rm.DeclaringType.Namespace == "System.Runtime" && rm.DeclaringType.Name == "RuntimeImports" &&
+                rm.Name is "RhGetObjectHashCode" or "RhTryGetObjectHashCode")
+            {
+                var obj = PopSlot();
+                if (obj.Kind != SlotKind.Ref)
+                    throw new InvalidOperationException($"{rm.Name} expects an object reference.");
+                PushSlot(new Slot(SlotKind.I4, GetIdentityHash(checked((int)obj.Payload), assign: rm.Name == "RhGetObjectHashCode")));
+                return true;
+            }
+
+            if (IsSystemMethod(rm, "System", "Delegate", "Combine") || IsSystemMethod(rm, "System", "Delegate", "Remove"))
+            {
+                var value = PopSlot();
+                var source = PopSlot();
+                PushSlot(rm.Name == "Combine" ? ExecDelegateCombine(source, value) : ExecDelegateRemove(source, value));
+                return true;
+            }
+
+            if (IsSystemMethod(rm, "System.Runtime.CompilerServices", "RuntimeHelpers", "IsBitwiseEquatable") && rm.MethodGenericArguments.Length == 1)
+            {
+                PushSlot(new Slot(SlotKind.I4, RuntimeTypeSystem.IsBitwiseEquatable(rm.MethodGenericArguments[0]) ? 1 : 0));
+                return true;
+            }
+
+            if (IsSystemMethod(rm, "System.Runtime.InteropServices", "MemoryMarshal", "GetArrayDataReference"))
+            {
+                ValidateArrayRefAny(PopSlot(), out int arrayAbs, out _, out _);
+                PushSlot(new Slot(SlotKind.ByRef, checked(arrayAbs + ArrayDataOffset)));
+                return true;
+            }
+
             if (rm.DeclaringType.Namespace == "System" && rm.DeclaringType.Name == "Array")
             {
                 // instance int get_Length()

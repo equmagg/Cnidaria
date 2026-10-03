@@ -37,121 +37,37 @@ public sealed class RegisterBytecodeSyntheticRuntime
         EntryPc = entryPc;
     }
 }
-internal sealed class MinimalCRuntimeMetadataView : IMetadataView
+internal static class MinimalCRuntimeMetadata
 {
-    private static readonly string[] Strings =
+    private static readonly string[] PrimitiveNames =
     {
-        string.Empty,
-        "System",
-        "Object",
-        "ValueType",
-        "Enum",
-        "String",
-        "Array",
-        "Void",
-        "Boolean",
-        "Char",
-        "SByte",
-        "Byte",
-        "Int16",
-        "UInt16",
-        "Int32",
-        "UInt32",
-        "Single",
-        "Int64",
-        "UInt64",
-        "Double",
-        "Decimal",
-        "IntPtr",
-        "UIntPtr",
+        "Void", "Boolean", "Char", "SByte", "Byte", "Int16", "UInt16", "Int32", "UInt32",
+        "Single", "Int64", "UInt64", "Double", "Decimal", "IntPtr", "UIntPtr",
     };
 
-    private static readonly TypeDefRow[] TypeDefs = BuildTypeDefs();
+    public static EcmaMetadata Instance { get; } = new EcmaMetadata(Build());
 
-    public string ModuleName => "std";
-    public string DefaultExternalAssemblyName => "std";
-
-    public int GetRowCount(MetadataTableKind table)
-        => table == MetadataTableKind.TypeDef ? TypeDefs.Length : 0;
-
-    public string GetString(int index)
+    private static byte[] Build()
     {
-        if ((uint)index >= (uint)Strings.Length)
-            throw new ArgumentOutOfRangeException(nameof(index));
-        return Strings[index];
-    }
-
-    public string GetUserString(int index) => string.Empty;
-    public ReadOnlySpan<byte> GetBlob(int index) => ReadOnlySpan<byte>.Empty;
-    public int GetBlobLength(int index) => 0;
-
-    public bool TryCopyBlob(int index, Span<byte> destination, out int bytesWritten)
-    {
-        bytesWritten = 0;
-        return true;
-    }
-
-    public TypeDefRow GetTypeDef(int rid)
-    {
-        if (rid <= 0 || rid > TypeDefs.Length)
-            throw new ArgumentOutOfRangeException(nameof(rid));
-        return TypeDefs[rid - 1];
-    }
-
-    public AssemblyRefRow GetAssemblyRef(int rid) => throw EmptyTable(nameof(GetAssemblyRef), rid);
-    public TypeRefRow GetTypeRef(int rid) => throw EmptyTable(nameof(GetTypeRef), rid);
-    public NestedClassRow GetNestedClass(int rid) => throw EmptyTable(nameof(GetNestedClass), rid);
-    public InterfaceImplRow GetInterfaceImpl(int rid) => throw EmptyTable(nameof(GetInterfaceImpl), rid);
-    public MethodImplRow GetMethodImpl(int rid) => throw EmptyTable(nameof(GetMethodImpl), rid);
-    public FieldRow GetField(int rid) => throw EmptyTable(nameof(GetField), rid);
-    public MethodDefRow GetMethodDef(int rid) => throw EmptyTable(nameof(GetMethodDef), rid);
-    public ParamRow GetParam(int rid) => throw EmptyTable(nameof(GetParam), rid);
-    public MemberRefRow GetMemberRef(int rid) => throw EmptyTable(nameof(GetMemberRef), rid);
-    public TypeSpecRow GetTypeSpec(int rid) => throw EmptyTable(nameof(GetTypeSpec), rid);
-    public MethodSpecRow GetMethodSpec(int rid) => throw EmptyTable(nameof(GetMethodSpec), rid);
-    public ConstantRow GetConstant(int rid) => throw EmptyTable(nameof(GetConstant), rid);
-    public PropertyRow GetProperty(int rid) => throw EmptyTable(nameof(GetProperty), rid);
-    public CustomAttributeRow GetCustomAttribute(int rid) => throw EmptyTable(nameof(GetCustomAttribute), rid);
-    public PInvokeMapRow GetPInvokeMap(int rid) => throw EmptyTable(nameof(GetPInvokeMap), rid);
-
-    private static TypeDefRow[] BuildTypeDefs()
-    {
-        const int nsSystem = 1;
-        const int objectName = 2;
-        const int valueTypeName = 3;
-        const int enumName = 4;
-        const int stringName = 5;
-        const int arrayName = 6;
-
+        var image = new MetadataImage("std");
+        int system = image.Strings.Add("System");
         var classFlags = (int)(TypeAttributes.Public | TypeAttributes.Class);
         var sealedFlags = classFlags | (int)TypeAttributes.Sealed;
 
-        var rows = new List<TypeDefRow>
-        {
-            TypeDef(classFlags, objectName, nsSystem, extendsRid: 0),
-            TypeDef(classFlags, valueTypeName, nsSystem, extendsRid: 1),
-            TypeDef(classFlags, enumName, nsSystem, extendsRid: 2),
-            TypeDef(sealedFlags, stringName, nsSystem, extendsRid: 1),
-            TypeDef(classFlags, arrayName, nsSystem, extendsRid: 1),
-        };
+        void Add(int flags, string name, int ns, int extendsRid)
+            => image.TypeDefs.Add(new TypeDefRow(flags, image.Strings.Add(name), ns, extendsRid << 2, fieldList: 1, methodList: 1));
 
-        for (var nameIndex = 7; nameIndex < Strings.Length; nameIndex++)
-            rows.Add(TypeDef(sealedFlags, nameIndex, nsSystem, extendsRid: 2));
+        const int ObjectRid = 2;
+        const int ValueTypeRid = 3;
+        Add(0, "<Module>", 0, 0);
+        Add(classFlags, "Object", system, 0);
+        Add(classFlags, "ValueType", system, ObjectRid);
+        Add(classFlags, "Enum", system, ValueTypeRid);
+        Add(sealedFlags, "String", system, ObjectRid);
+        Add(classFlags, "Array", system, ObjectRid);
+        foreach (string name in PrimitiveNames)
+            Add(sealedFlags, name, system, ValueTypeRid);
 
-        return rows.ToArray();
+        return EcmaImageWriter.Write(image);
     }
-
-    private static TypeDefRow TypeDef(int flags, int name, int ns, int extendsRid)
-        => new TypeDefRow(
-            flags: flags,
-            name: name,
-            @namespace: ns,
-            extendsEncoded: extendsRid == 0 ? 0 : EncodeTypeDefOrRefTypeDef(extendsRid),
-            fieldList: 1,
-            methodList: 1);
-
-    private static int EncodeTypeDefOrRefTypeDef(int rid) => rid << 2;
-
-    private static Exception EmptyTable(string member, int rid)
-        => new ArgumentOutOfRangeException(nameof(rid), rid, $"{member} is empty in synthetic C runtime metadata.");
 }

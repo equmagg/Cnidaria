@@ -370,6 +370,19 @@ namespace Cnidaria.Cs
                 context.Recorder.RecordBound(exprSyntax, bad);
                 return bad;
             }
+            // Target-typed conditional
+            if (expr is BoundUnboundConditionalExpression unboundConditional)
+            {
+                var conditionalSyntax = (ConditionalExpressionSyntax)unboundConditional.Syntax;
+                var whenTrue = ApplyConversion(conditionalSyntax.WhenTrue, unboundConditional.WhenTrue, targetType, diagnosticNode, context, diagnostics, requireImplicit: true);
+                var whenFalse = ApplyConversion(conditionalSyntax.WhenFalse, unboundConditional.WhenFalse, targetType, diagnosticNode, context, diagnostics, requireImplicit: true);
+                BoundExpression bound = whenTrue.HasErrors || whenFalse.HasErrors
+                    ? new BoundBadExpression(conditionalSyntax)
+                    : new BoundConditionalExpression(conditionalSyntax, targetType, unboundConditional.Condition, whenTrue, whenFalse,
+                        FoldConditionalConstant(unboundConditional.Condition, whenTrue, whenFalse));
+                context.Recorder.RecordBound(exprSyntax, bound);
+                return bound;
+            }
             // Target-typed anonymous function
             if (expr is BoundUnboundLambdaExpression unboundLambda)
             {
@@ -516,7 +529,8 @@ namespace Cnidaria.Cs
                     exprSyntax,
                     receiverOpt: null,
                     userConv,
-                    ImmutableArray.Create(arg));
+                    ImmutableArray.Create(arg),
+                    constrainedToTypeOpt: FindOperatorConstraintOwner(userConv, expr.Type, targetType));
 
                 if (!ReferenceEquals(converted.Type, targetType))
                 {
@@ -607,7 +621,7 @@ namespace Cnidaria.Cs
                 isByRef: false,
                 isScoped: outVar.IsScoped);
 
-            _locals[outVar.Name] = local;
+            ExpressionVariableScope()._locals[outVar.Name] = local;
             context.Recorder.RecordDeclared(outVar.Designation, local);
 
             return new BoundRefExpression(

@@ -53,8 +53,8 @@ namespace Cnidaria.Cs
             var desiredBase = new Dictionary<SourceNamedTypeSymbol, BaseClassInfo>(
                 ReferenceEqualityComparer<SourceNamedTypeSymbol>.Instance);
 
-            var desiredInterfaces = new Dictionary<SourceNamedTypeSymbol, HashSet<NamedTypeSymbol>>(
-                ReferenceEqualityComparer<SourceNamedTypeSymbol>.Instance);
+            var desiredInterfaces = new Dictionary<NamedTypeSymbol, HashSet<NamedTypeSymbol>>(
+                ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
 
             for (int ti = 0; ti < trees.Length; ti++)
             {
@@ -71,8 +71,10 @@ namespace Cnidaria.Cs
                 {
                     if (kv.Key is not TypeDeclarationSyntax typeSyntax)
                         continue;
-                    if (kv.Value is not SourceNamedTypeSymbol typeSymbol)
+                    // Special types are declared in the core library too; their base class is fixed, their interfaces are not.
+                    if (kv.Value is not (SourceNamedTypeSymbol or SpecialNamedTypeSymbol))
                         continue;
+                    var typeSymbol = (NamedTypeSymbol)kv.Value;
 
                     var baseList = GetBaseList(typeSyntax);
                     if (baseList is null || baseList.Types.Count == 0)
@@ -100,18 +102,23 @@ namespace Cnidaria.Cs
                     }
 
                     // Only classes may declare a base class
-                    if (typeSymbol.TypeKind == TypeKind.Class)
+                    if (typeSymbol is SpecialNamedTypeSymbol)
                     {
-                        if (!TryResolveDeclaredBaseClass(typeSymbol, baseList, binder, ctx, diagnostics, out var baseClass))
+                        continue;
+                    }
+                    else if (typeSymbol.TypeKind == TypeKind.Class)
+                    {
+                        var sourceType = (SourceNamedTypeSymbol)typeSymbol;
+                        if (!TryResolveDeclaredBaseClass(sourceType, baseList, binder, ctx, diagnostics, out var baseClass))
                             continue;
 
                         if (baseClass is null)
                             continue;
 
                         var loc = new Location(tree, baseList.Span);
-                        if (!desiredBase.TryGetValue(typeSymbol, out var existing))
+                        if (!desiredBase.TryGetValue(sourceType, out var existing))
                         {
-                            desiredBase[typeSymbol] = new BaseClassInfo(baseClass, loc);
+                            desiredBase[sourceType] = new BaseClassInfo(baseClass, loc);
                         }
                         else if (!ReferenceEquals(existing.BaseType, baseClass))
                         {
@@ -157,15 +164,24 @@ namespace Cnidaria.Cs
                 foreach (var iface in kv.Value)
                     b.Add(iface);
 
-                kv.Key.SetDeclaredInterfaces(b.ToImmutable());
+                switch (kv.Key)
+                {
+                    case SourceNamedTypeSymbol source:
+                        source.SetDeclaredInterfaces(b.ToImmutable());
+                        break;
+                    case SpecialNamedTypeSymbol special:
+                        special.SetDeclaredInterfaces(b.ToImmutable());
+                        break;
+                }
             }
 
             BindOverrides(compilation, trees, diagnostics);
+            ValidateAbstractMemberImplementations(compilation, trees, diagnostics);
         }
 
         /// <summary>Reports non-interface entries after the selected base class</summary>
         private static void ValidateOnlyInterfacesInBaseList(
-            SourceNamedTypeSymbol declaringType,
+            NamedTypeSymbol declaringType,
             BaseListSyntax baseList,
             TypeBinder binder,
             BindingContext context,
@@ -220,6 +236,12 @@ namespace Cnidaria.Cs
                     continue;
                 foreach (var kv in declMap)
                 {
+                    if (kv.Key is PropertyDeclarationSyntax or IndexerDeclarationSyntax && kv.Value is PropertySymbol property)
+                    {
+                        BindAccessorOverride(tree, kv.Key, property.GetMethod, diagnostics);
+                        BindAccessorOverride(tree, kv.Key, property.SetMethod, diagnostics);
+                        continue;
+                    }
                     if (kv.Key is not MethodDeclarationSyntax md)
                         continue;
                     if (kv.Value is not SourceMethodSymbol m)
@@ -265,6 +287,81 @@ namespace Cnidaria.Cs
                     }
                     m.SetOverriddenMethod(overridden);
                 }
+            }
+        }
+        private static void ValidateAbstractMemberImplementations(Compilation compilation, ImmutableArray<SyntaxTree> trees, DiagnosticBag diagnostics)
+        {
+            var seenTypes = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
+            foreach (var tree in trees)
+            {
+                if (!compilation.DeclaredSymbolsByTree.TryGetValue(tree, out var declMap))
+                    continue;
+                foreach (var kv in declMap)
+                {
+                    if (kv.Key is not TypeDeclarationSyntax syntax ||
+                        kv.Value is not SourceNamedTypeSymbol { TypeKind: TypeKind.Class, IsAbstract: false } type ||
+                        !seenTypes.Add(type))
+                    {
+                        continue;
+                    }
+                    var overrides = new List<MethodSymbol>();
+                    for (NamedTypeSymbol? t = type; t is not null; t = t.BaseType as NamedTypeSymbol)
+                    {
+                        foreach (var member in t.GetMembers())
+                        {
+                            if (member is not MethodSymbol { IsStatic: false } method)
+                                continue;
+                            if (method.IsAbstract && !ReferenceEquals(t, type) && !IsOverriddenBy(overrides, method))
+                            {
+                                diagnostics.Add(new Diagnostic(
+                                    "CN_OVR004",
+                                    DiagnosticSeverity.Error,
+                                    $"'{type.Name}' does not implement inherited abstract member '{t.Name}.{method.Name}'.",
+                                    new Location(tree, syntax.Identifier.Span)));
+                            }
+                            if (method.IsOverride)
+                                overrides.Add(method);
+                        }
+                    }
+                }
+            }
+        }
+        private static bool IsOverriddenBy(List<MethodSymbol> overrides, MethodSymbol method)
+        {
+            for (int i = 0; i < overrides.Count; i++)
+            {
+                if (string.Equals(overrides[i].Name, method.Name, StringComparison.Ordinal) && SignatureEquals(overrides[i], method))
+                    return true;
+            }
+            return false;
+        }
+        private static void BindAccessorOverride(SyntaxTree tree, SyntaxNode syntax, MethodSymbol? accessor, DiagnosticBag diagnostics)
+        {
+            if (accessor is not SourceMethodSymbol { IsOverride: true } m ||
+                m.ContainingSymbol is not NamedTypeSymbol { BaseType: NamedTypeSymbol baseType })
+            {
+                return;
+            }
+            var overridden = FindOverridableInBaseChain(baseType, m, out var sealedCandidate);
+            if (sealedCandidate is not null)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_OVR_SEALED001",
+                    DiagnosticSeverity.Error,
+                    $"Cannot override inherited member '{sealedCandidate.Name}' because it is sealed.",
+                    new Location(tree, syntax.Span)));
+            }
+            else if (overridden is null)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_OVR003",
+                    DiagnosticSeverity.Error,
+                    $"No suitable virtual accessor found to override: '{m.Name}'.",
+                    new Location(tree, syntax.Span)));
+            }
+            else
+            {
+                m.SetOverriddenMethod(overridden);
             }
         }
         /// <summary>Finds the nearest matching virtual member and any sealed blocker</summary>
@@ -399,7 +496,7 @@ namespace Cnidaria.Cs
         }
         /// <summary>Resolves, validates, and deduplicates declared interfaces</summary>
         private static ImmutableArray<NamedTypeSymbol> ResolveDeclaredInterfaces(
-            SourceNamedTypeSymbol declaringType,
+            NamedTypeSymbol declaringType,
             BaseListSyntax? baseList,
             TypeBinder binder,
             BindingContext context,

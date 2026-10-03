@@ -54,10 +54,7 @@ public sealed class RegisterBytecodeProgram
         IReadOnlyCollection<int>? hostExternMethodIds = null)
     {
         var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
-        var stdModule = new RuntimeModule(
-            name: "std",
-            md: new MinimalCRuntimeMetadataView(),
-            methodsByDefToken: new Dictionary<int, BytecodeFunction>());
+        var stdModule = new RuntimeModule(name: "std", md: MinimalCRuntimeMetadata.Instance);
 
         modules.Add(stdModule.Name, stdModule);
 
@@ -436,6 +433,7 @@ public sealed class RegisterBytecodeCodeGenerator
     private static bool IsIntrinsicCallee(FunctionSymbol function)
         => function.IntrinsicKind == RuntimeIntrinsicKind.BuiltinVaStart
            || function.IntrinsicKind == RuntimeIntrinsicKind.CStringWrite
+           || function.IntrinsicKind is RuntimeIntrinsicKind.StackAllocate or RuntimeIntrinsicKind.StackSave or RuntimeIntrinsicKind.StackRestore
            || string.Equals(function.Name, StandardHeaders.PrintfIntrinsicName, StringComparison.Ordinal);
 
     private int ResolveEntryMethodId()
@@ -1234,6 +1232,29 @@ public sealed class RegisterBytecodeCodeGenerator
                 case LirInstructionKind.VaArg:
                     EmitVaArg(instruction);
                     break;
+
+                case LirInstructionKind.StackAllocate:
+                    {
+                        var destination = GetWritableRegister(instruction.Result!, GpScratch0, FpScratch0);
+                        var bytes = LoadOperand(instruction.Operands[0], GpScratch1);
+                        EmitI32Imm(Op.I32AddImm, GpScratch1, bytes, 15);
+                        EmitI32Imm(Op.U32ShrImm, GpScratch1, GpScratch1, 4);
+                        EmitRaw(Op.StackAlloc, destination, GpScratch1, mayThrow: true, imm: 16);
+                        StoreWritableRegisterIfSpilled(instruction.Result!, destination);
+                        break;
+                    }
+
+                case LirInstructionKind.StackSave:
+                    {
+                        var destination = GetWritableRegister(instruction.Result!, GpScratch0, FpScratch0);
+                        _asm.LiI32(GpScratch1, 0);
+                        EmitRaw(Op.StackAlloc, destination, GpScratch1, mayThrow: true, imm: 16);
+                        StoreWritableRegisterIfSpilled(instruction.Result!, destination);
+                        break;
+                    }
+
+                case LirInstructionKind.StackRestore:
+                    throw Unsupported(instruction, "The register bytecode machine cannot give stack space back before its frame returns.");
 
                 case LirInstructionKind.InlineAssembly:
                     throw Unsupported(instruction, "Inline assembly is not supported by the register bytecode backend.");

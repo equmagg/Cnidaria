@@ -29,6 +29,18 @@ internal sealed class Gimplifier
     private readonly List<GimpleNode> _hoistedStatics = new();
 
     private readonly TargetInfo _target;
+    private IReadOnlyDictionary<VariableArrayType, BoundExpression> _boundLengths = new Dictionary<VariableArrayType, BoundExpression>();
+
+    private readonly Dictionary<VariableArrayType, GimpleValue> _lengths = new(ReferenceEqualityComparer.Instance);
+    private readonly Dictionary<Symbol, GimpleValue> _variableArrays = new(ReferenceEqualityComparer.Instance);
+    private readonly List<StackRegion> _stackRegions = new();
+    private readonly Dictionary<LabelSymbol, ImmutableArray<BoundDeclaration>> _labelRegions = new();
+    private readonly Dictionary<GimpleLabel, int> _jumpTargetRegionDepths = new();
+    private readonly Dictionary<RuntimeIntrinsicKind, FunctionSymbol> _stackIntrinsics = new();
+    private bool _declaresVariableArrays;
+    private GimpleValue? _stackTop;
+
+    private readonly record struct StackRegion(BoundDeclaration Declaration, GimpleValue SavedStack);
 
     private Gimplifier(TargetInfo target)
     {
@@ -52,6 +64,7 @@ internal sealed class Gimplifier
             throw new ArgumentNullException(nameof(boundTree));
 
         var lowerer = new Gimplifier(boundTree.SemanticModel.Compilation.Options.Target);
+        lowerer._boundLengths = boundTree.VariableLengths;
         var members = ImmutableArray.CreateBuilder<GimpleNode>();
 
         foreach (var member in boundTree.Root.Members)
@@ -311,6 +324,14 @@ internal sealed class Gimplifier
 
         var entry = CreateGeneratedLabel("entry");
         StartBlock(entry);
+        CollectLabelRegions(function.Body, ImmutableArray<BoundDeclaration>.Empty);
+        if (_declaresVariableArrays && !CanMoveStackBack)
+            InitializeStackTop(function.Syntax);
+        if (function.Symbol?.FunctionType is { } functionType)
+        {
+            foreach (var parameter in functionType.Parameters)
+                EvaluateVariableLengths(parameter.Type, function.Syntax);
+        }
         LowerCompoundStatement(function.Body);
 
         if (!IsCurrentBlockTerminated())
@@ -348,6 +369,13 @@ internal sealed class Gimplifier
         _currentBlock = null;
         _labelOrdinal = 0;
         _temporaryOrdinal = 0;
+        _lengths.Clear();
+        _variableArrays.Clear();
+        _stackRegions.Clear();
+        _labelRegions.Clear();
+        _jumpTargetRegionDepths.Clear();
+        _declaresVariableArrays = false;
+        _stackTop = null;
     }
 
     private void LowerNode(BoundNode node)
@@ -401,14 +429,16 @@ internal sealed class Gimplifier
                 break;
 
             case BoundBreakStatement breakStatement:
-                Emit(new GimpleGotoStatement(GetBreakTarget(), breakStatement.Syntax));
+                EmitJump(GetBreakTarget(), breakStatement.Syntax);
                 break;
 
             case BoundContinueStatement continueStatement:
-                Emit(new GimpleGotoStatement(GetContinueTarget(), continueStatement.Syntax));
+                EmitJump(GetContinueTarget(), continueStatement.Syntax);
                 break;
 
             case BoundGotoStatement gotoStatement:
+                if (gotoStatement.Label is not null)
+                    RestoreStackForLabel(gotoStatement.Label, gotoStatement.Syntax);
                 Emit(new GimpleGotoStatement(GetLabel(gotoStatement.Label), gotoStatement.Syntax));
                 break;
 
@@ -501,19 +531,37 @@ internal sealed class Gimplifier
 
     private void LowerCompoundStatement(BoundCompoundStatement statement)
     {
+        var regionDepth = _stackRegions.Count;
         foreach (var member in statement.Members)
             LowerNode(member);
+        CloseStackRegions(regionDepth, statement.Syntax);
     }
 
     // Emit storage declarations before executable initialization
     private void LowerLocalDeclaration(BoundDeclaration declaration)
     {
+        if (DeclaresVariableArray(declaration))
+            _stackRegions.Add(new StackRegion(declaration, EmitStackSave(declaration.Syntax)));
+
         foreach (var declarator in declaration.Declarators)
         {
             if (declaration.StorageClass == StorageClass.Static && declarator.Symbol is VariableSymbol variable)
             {
                 HoistStaticLocal(declaration, declarator, variable);
                 continue;
+            }
+
+            if (ArrayType.IsVariablyModified(declarator.Type))
+            {
+                EvaluateVariableLengths(declarator.Type, declarator.Syntax);
+                if (declaration.StorageClass == StorageClass.Typedef)
+                    continue;
+                if (declarator.Symbol is VariableSymbol array && ArrayType.HasVariableSize(declarator.Type))
+                {
+                    var storage = EmitStackAllocate(VariableSize(declarator.Type, declarator.Syntax), declarator.Syntax);
+                    _variableArrays[array] = Materialize(EmitConvert(storage, ElementPointerType(declarator.Type), declarator.Syntax));
+                    continue;
+                }
             }
 
             Emit(new GimpleDeclarationStatement(
@@ -972,8 +1020,8 @@ internal sealed class Gimplifier
         EmitConditional(statement.Condition, bodyLabel, endLabel);
 
         StartBlock(bodyLabel);
-        _breakTargets.Push(endLabel);
-        _continueTargets.Push(testLabel);
+        _breakTargets.Push(AtCurrentRegionDepth(endLabel));
+        _continueTargets.Push(AtCurrentRegionDepth(testLabel));
         LowerStatement(statement.Statement);
         _continueTargets.Pop();
         _breakTargets.Pop();
@@ -992,8 +1040,8 @@ internal sealed class Gimplifier
         var endLabel = CreateGeneratedLabel("do_end");
 
         StartBlock(bodyLabel);
-        _breakTargets.Push(endLabel);
-        _continueTargets.Push(testLabel);
+        _breakTargets.Push(AtCurrentRegionDepth(endLabel));
+        _continueTargets.Push(AtCurrentRegionDepth(testLabel));
         LowerStatement(statement.Statement);
         _continueTargets.Pop();
         _breakTargets.Pop();
@@ -1014,6 +1062,7 @@ internal sealed class Gimplifier
         var incrementLabel = CreateGeneratedLabel("for_step");
         var endLabel = CreateGeneratedLabel("for_end");
 
+        var regionDepth = _stackRegions.Count;
         // An expression initializer is a bare BoundExpression, which LowerNode would drop as a nop
         if (statement.Initializer is BoundExpression initializer)
             LowerExpressionForSideEffects(initializer);
@@ -1029,8 +1078,8 @@ internal sealed class Gimplifier
             EmitConditional(statement.Condition, bodyLabel, endLabel);
 
         StartBlock(bodyLabel);
-        _breakTargets.Push(endLabel);
-        _continueTargets.Push(incrementLabel);
+        _breakTargets.Push(AtCurrentRegionDepth(endLabel));
+        _continueTargets.Push(AtCurrentRegionDepth(incrementLabel));
         LowerStatement(statement.Statement);
         _continueTargets.Pop();
         _breakTargets.Pop();
@@ -1045,6 +1094,7 @@ internal sealed class Gimplifier
             Emit(new GimpleGotoStatement(testLabel));
 
         StartBlock(endLabel);
+        CloseStackRegions(regionDepth, statement.Syntax);
     }
 
     // Collect labels before lowering the body so forward case edges are stable
@@ -1057,7 +1107,7 @@ internal sealed class Gimplifier
 
         Emit(new GimpleSwitchStatement(value, labels.Cases, defaultLabel, statement.Syntax));
 
-        _breakTargets.Push(endLabel);
+        _breakTargets.Push(AtCurrentRegionDepth(endLabel));
         _switches.Push(new SwitchContext(endLabel, labels.CaseLabels, defaultLabel));
         LowerStatement(statement.Statement);
         _switches.Pop();
@@ -1232,6 +1282,9 @@ internal sealed class Gimplifier
             case BoundSizeofExpression sizeofExpression:
                 return new GimpleConstantValue(sizeofExpression.ConstantValue, sizeofExpression.Type, sizeofExpression.Syntax);
 
+            case BoundOffsetofExpression offsetof:
+                return new GimpleConstantValue(offsetof.ConstantValue, offsetof.Type, offsetof.Syntax);
+
             case BoundGenericSelectionExpression generic:
                 return generic.SelectedExpression is null
                     ? new GimpleErrorValue(generic.Syntax)
@@ -1339,6 +1392,7 @@ internal sealed class Gimplifier
                 return LowerConversionExpression(conversion);
 
             case BoundCastExpression cast:
+                EvaluateVariableLengths(cast.Type, cast.Syntax);
                 return EmitConvert(
                     LowerExpression(cast.Expression),
                     cast.Type,
@@ -1359,8 +1413,15 @@ internal sealed class Gimplifier
             case BoundConditionalExpression conditional:
                 return LowerConditionalExpressionToValue(conditional);
 
+            case BoundSizeofExpression sizeofExpression when sizeofExpression.ConstantValue is null && sizeofExpression.OperandType is { } operandType &&
+                                                                ArrayType.HasVariableSize(operandType):
+                return LowerVariableSizeof(sizeofExpression, operandType);
+
             case BoundSizeofExpression sizeofExpression:
                 return new GimpleConstantValue(sizeofExpression.ConstantValue, sizeofExpression.Type, sizeofExpression.Syntax);
+
+            case BoundOffsetofExpression offsetof:
+                return new GimpleConstantValue(offsetof.ConstantValue, offsetof.Type, offsetof.Syntax);
 
             case BoundCompoundLiteralExpression compoundLiteral:
                 return LowerCompoundLiteralExpression(compoundLiteral);
@@ -1438,6 +1499,9 @@ internal sealed class Gimplifier
         if (expression.ConversionKind is BoundConversionKind.Identity or BoundConversionKind.LValueToRValue)
             return LowerExpression(expression.Expression);
 
+        if (expression.ConversionKind == BoundConversionKind.ArrayToPointer && ArrayType.HasVariableSize(expression.Expression.Type))
+            return EmitConvert(LowerVariableArrayAddress(expression.Expression), expression.Type, expression.Syntax);
+
         var operand = LowerExpression(expression.Expression);
 
         switch (expression.ConversionKind)
@@ -1471,6 +1535,10 @@ internal sealed class Gimplifier
     /// <summary>Emits the conversion that produces a value of the destination type</summary>
     private GimpleValue EmitConvert(GimpleValue operand, QualifiedType type, SyntaxNode? syntax)
     {
+        // _Bool takes whether the value compares unequal to zero, which truncating a floating value loses
+        if (type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Bool } && GimpleTypes.IsFloating(operand.Type))
+            return EmitBinary(GimpleTreeCode.NeExpr, operand, CreateIntegerZero(operand.Type, syntax), type, syntax);
+
         var code = GimpleOperators.ConversionCode(operand.Type, type);
         return EmitUnary(code, operand, type, syntax);
     }
@@ -1479,6 +1547,9 @@ internal sealed class Gimplifier
     {
         switch (expression.OperatorToken.Kind)
         {
+            case SyntaxKind.AmpersandToken when ArrayType.HasVariableSize(expression.Operand.Type):
+                return EmitConvert(LowerVariableArrayAddress(expression.Operand), expression.Type, expression.Syntax);
+
             case SyntaxKind.AmpersandToken:
                 {
                     var target = CreateTemporary(expression.Type, expression.Syntax);
@@ -1532,6 +1603,14 @@ internal sealed class Gimplifier
     private GimpleValue LowerIncrement(GimplePlace target, bool increment, bool returnUpdatedValue, SyntaxNode? syntax)
     {
         var place = GimplifyReference(target);
+        if (HasVariableSizePointee(place.Type))
+        {
+            var previous = Materialize(place);
+            var stepped = Materialize(EmitVariablePointerPlus(previous, CreateIntegerConstant(increment ? 1 : -1, PointerDifferenceType(), syntax), syntax));
+            EmitStore(place, stepped, syntax);
+            return returnUpdatedValue ? stepped : previous;
+        }
+
         var one = CreateIntegerOne(place.Type, syntax);
         var code = GimpleOperators.FromBinaryOperator(
             increment ? SyntaxKind.PlusToken : SyntaxKind.MinusToken,
@@ -1578,6 +1657,13 @@ internal sealed class Gimplifier
         var code = GimpleOperators.FromBinaryOperator(kind, left.Type, right.Type);
         if (GimpleOperators.NegatesPointerOffset(kind, left.Type, right.Type))
             right = NegateOffset(right, syntax);
+
+        if (code == GimpleTreeCode.PointerPlusExpr && HasVariableSizePointee(left.Type))
+            return EmitConvert(EmitVariablePointerPlus(left, right, syntax), type, syntax);
+        if (code == GimpleTreeCode.PointerPlusExpr && HasVariableSizePointee(right.Type))
+            return EmitConvert(EmitVariablePointerPlus(right, left, syntax), type, syntax);
+        if (code == GimpleTreeCode.PointerDiffExpr && HasVariableSizePointee(left.Type))
+            return EmitVariablePointerDifference(left, right, type, syntax);
 
         return EmitBinary(code, left, right, type, syntax);
     }
@@ -1647,6 +1733,13 @@ internal sealed class Gimplifier
                 operand.Type))
         {
             operand = NegateOffset(operand, expression.Syntax);
+        }
+
+        if (code == GimpleTreeCode.PointerPlusExpr && HasVariableSizePointee(target.Type))
+        {
+            var stepped = Materialize(EmitVariablePointerPlus(Materialize(target), operand, expression.Syntax));
+            EmitStore(target, stepped, expression.Syntax);
+            return stepped;
         }
 
         if (GimpleOperandRules.IsRegisterOperand(target))
@@ -1739,14 +1832,24 @@ internal sealed class Gimplifier
         if (members.Length == 0)
             return new GimpleConstantValue(null, expression.Type, expression.Syntax);
 
+        var regionDepth = _stackRegions.Count;
         for (var i = 0; i < members.Length - 1; i++)
             LowerNode(members[i]);
 
+        GimpleValue value;
         if (members[^1] is BoundExpressionStatement expressionStatement)
-            return LowerExpression(expressionStatement.Expression);
-
-        LowerNode(members[^1]);
-        return new GimpleConstantValue(null, expression.Type, expression.Syntax);
+        {
+            value = LowerExpression(expressionStatement.Expression);
+            if (_stackRegions.Count != regionDepth && !GimpleTypes.IsVoid(value.Type))
+                value = Materialize(value);
+        }
+        else
+        {
+            LowerNode(members[^1]);
+            value = new GimpleConstantValue(null, expression.Type, expression.Syntax);
+        }
+        CloseStackRegions(regionDepth, expression.Syntax);
+        return value;
     }
 
     /// <summary>Emits a call statement and yields the temporary that receives its result</summary>
@@ -2192,6 +2295,325 @@ internal sealed class Gimplifier
         return GimplifyValue(value);
     }
 
+    private static bool DeclaresVariableArray(BoundDeclaration declaration)
+        => declaration.StorageClass is not (StorageClass.Static or StorageClass.Extern or StorageClass.Typedef) &&
+           declaration.Declarators.Any(static declarator => declarator.Symbol is VariableSymbol && ArrayType.HasVariableSize(declarator.Type));
+
+    private void CollectLabelRegions(BoundStatement statement, ImmutableArray<BoundDeclaration> regions)
+    {
+        switch (statement)
+        {
+            case BoundCompoundStatement compound:
+                foreach (var member in compound.Members)
+                {
+                    if (member is BoundDeclaration declaration && DeclaresVariableArray(declaration))
+                    {
+                        regions = regions.Add(declaration);
+                        _declaresVariableArrays = true;
+                    }
+                    else if (member is BoundStatement nested)
+                        CollectLabelRegions(nested, regions);
+                }
+                break;
+            case BoundLabelStatement label:
+                if (label.Label is not null)
+                    _labelRegions[label.Label] = regions;
+                CollectLabelRegions(label.Statement, regions);
+                break;
+            case BoundIfStatement ifStatement:
+                CollectLabelRegions(ifStatement.ThenStatement, regions);
+                if (ifStatement.ElseStatement is not null)
+                    CollectLabelRegions(ifStatement.ElseStatement, regions);
+                break;
+            case BoundForStatement forStatement:
+                if (forStatement.Initializer is BoundDeclaration initializer && DeclaresVariableArray(initializer))
+                {
+                    regions = regions.Add(initializer);
+                    _declaresVariableArrays = true;
+                }
+                CollectLabelRegions(forStatement.Statement, regions);
+                break;
+            case BoundWhileStatement whileStatement:
+                CollectLabelRegions(whileStatement.Statement, regions);
+                break;
+            case BoundDoStatement doStatement:
+                CollectLabelRegions(doStatement.Statement, regions);
+                break;
+            case BoundSwitchStatement switchStatement:
+                CollectLabelRegions(switchStatement.Statement, regions);
+                break;
+            case BoundCaseStatement caseStatement:
+                CollectLabelRegions(caseStatement.Statement, regions);
+                break;
+            case BoundDefaultStatement defaultStatement:
+                CollectLabelRegions(defaultStatement.Statement, regions);
+                break;
+        }
+    }
+
+    private GimpleLabel AtCurrentRegionDepth(GimpleLabel label)
+    {
+        _jumpTargetRegionDepths[label] = _stackRegions.Count;
+        return label;
+    }
+
+    private void EmitJump(GimpleLabel target, SyntaxNode? syntax)
+    {
+        if (_jumpTargetRegionDepths.TryGetValue(target, out var depth) && depth < _stackRegions.Count)
+            EmitStackRestore(_stackRegions[depth].SavedStack, syntax);
+        Emit(new GimpleGotoStatement(target, syntax));
+    }
+
+    private void RestoreStackForLabel(LabelSymbol label, SyntaxNode? syntax)
+    {
+        var target = _labelRegions.TryGetValue(label, out var regions) ? regions : ImmutableArray<BoundDeclaration>.Empty;
+        var shared = 0;
+        while (shared < _stackRegions.Count && shared < target.Length && ReferenceEquals(target[shared], _stackRegions[shared].Declaration))
+            shared++;
+        if (shared < _stackRegions.Count)
+            EmitStackRestore(_stackRegions[shared].SavedStack, syntax);
+    }
+
+    private void CloseStackRegions(int depth, SyntaxNode? syntax)
+    {
+        if (_stackRegions.Count <= depth)
+            return;
+        if (!IsCurrentBlockTerminated())
+            EmitStackRestore(_stackRegions[depth].SavedStack, syntax);
+        _stackRegions.RemoveRange(depth, _stackRegions.Count - depth);
+    }
+
+    private void EvaluateVariableLengths(QualifiedType type, SyntaxNode? syntax)
+    {
+        for (var current = type.Type; current is not null;)
+        {
+            if (current is VariableArrayType variable && !_lengths.ContainsKey(variable))
+            {
+                var length = _boundLengths.TryGetValue(variable, out var bound)
+                    ? EmitConvert(LowerRValue(bound), SizeType(), syntax)
+                    : CreateIntegerZero(SizeType(), syntax);
+                var captured = CreateTemporary(SizeType(), syntax);
+                EmitStore(captured, length, syntax);
+                _lengths[variable] = captured;
+            }
+            current = current switch
+            {
+                ArrayType array => array.ElementType.Type,
+                PointerType pointer => pointer.PointeeType.Type,
+                _ => null,
+            };
+        }
+    }
+
+    private GimpleValue ElementCount(QualifiedType type, SyntaxNode? syntax)
+    {
+        if (type.Type is not ArrayType array)
+            return CreateIntegerConstant(1, SizeType(), syntax);
+
+        GimpleValue length;
+        if (array is VariableArrayType variable)
+        {
+            if (!_lengths.ContainsKey(variable))
+                EvaluateVariableLengths(type, syntax);
+            length = _lengths[variable];
+        }
+        else
+        {
+            length = CreateIntegerConstant(array.Length ?? 0, SizeType(), syntax);
+        }
+        return MultiplySizes(length, ElementCount(array.ElementType, syntax), syntax);
+    }
+
+    private GimpleValue VariableSize(QualifiedType type, SyntaxNode? syntax)
+        => MultiplySizes(ElementCount(type, syntax), CreateIntegerConstant(_target.SizeOf(InnermostElementType(type)), SizeType(), syntax), syntax);
+
+    private GimpleValue MultiplySizes(GimpleValue left, GimpleValue right, SyntaxNode? syntax)
+    {
+        var leftConstant = left is GimpleConstantValue { Value: var a } && TryConvertConstantToLong(a, out var leftValue) ? leftValue : (long?)null;
+        var rightConstant = right is GimpleConstantValue { Value: var b } && TryConvertConstantToLong(b, out var rightValue) ? rightValue : (long?)null;
+        if (leftConstant is { } l && rightConstant is { } r)
+            return CreateIntegerConstant(unchecked(l * r), SizeType(), syntax);
+        if (leftConstant == 1)
+            return right;
+        if (rightConstant == 1)
+            return left;
+        return EmitBinary(GimpleTreeCode.MultExpr, left, right, SizeType(), syntax);
+    }
+
+    private static QualifiedType InnermostElementType(QualifiedType type)
+    {
+        while (type.Type is ArrayType array)
+            type = array.ElementType;
+        return type;
+    }
+
+    private QualifiedType ElementPointerType(QualifiedType arrayType)
+        => new QualifiedType(_types.PointerTo(InnermostElementType(arrayType)));
+
+    private static bool HasVariableSizePointee(QualifiedType type)
+        => type.Type is PointerType pointer && ArrayType.HasVariableSize(pointer.PointeeType);
+
+    private GimpleValue LowerVariableArrayAddress(BoundExpression expression)
+    {
+        switch (expression)
+        {
+            case BoundParenthesizedExpression parenthesized:
+                return LowerVariableArrayAddress(parenthesized.Expression);
+
+            case BoundConversionExpression conversion when conversion.ConversionKind is BoundConversionKind.Identity or BoundConversionKind.LValueToRValue:
+                return LowerVariableArrayAddress(conversion.Expression);
+
+            case BoundNameExpression { Symbol: { } symbol } when _variableArrays.TryGetValue(symbol, out var address):
+                return address;
+
+            case BoundUnaryExpression unary when unary.OperatorToken.Kind == SyntaxKind.StarToken:
+                return EmitConvert(GimplifyValue(LowerExpression(unary.Operand)), ElementPointerType(expression.Type), expression.Syntax);
+
+            case BoundElementAccessExpression elementAccess when elementAccess.Index is not null:
+                {
+                    var pointer = GimplifyValue(LowerExpression(elementAccess.Expression));
+                    var index = GimplifyValue(LowerExpression(elementAccess.Index));
+                    return EmitConvert(EmitVariablePointerPlus(pointer, index, expression.Syntax), ElementPointerType(expression.Type), expression.Syntax);
+                }
+
+            default:
+                return new GimpleErrorValue(expression.Syntax);
+        }
+    }
+
+    private GimpleValue EmitVariablePointerPlus(GimpleValue pointer, GimpleValue offset, SyntaxNode? syntax)
+    {
+        var pointee = ((PointerType)pointer.Type.Type).PointeeType;
+        var stride = EmitConvert(ElementCount(pointee, syntax), PointerDifferenceType(), syntax);
+        var scaled = EmitBinary(GimpleTreeCode.MultExpr, EmitConvert(offset, PointerDifferenceType(), syntax), stride, PointerDifferenceType(), syntax);
+        var elementPointer = ElementPointerType(pointee);
+        var stepped = EmitBinary(GimpleTreeCode.PointerPlusExpr, EmitConvert(pointer, elementPointer, syntax), scaled, elementPointer, syntax);
+        return EmitConvert(stepped, pointer.Type, syntax);
+    }
+
+    private GimpleValue EmitVariablePointerDifference(GimpleValue left, GimpleValue right, QualifiedType type, SyntaxNode? syntax)
+    {
+        var pointee = ((PointerType)left.Type.Type).PointeeType;
+        var elementPointer = ElementPointerType(pointee);
+        var elements = EmitBinary(GimpleTreeCode.PointerDiffExpr, EmitConvert(left, elementPointer, syntax), EmitConvert(right, elementPointer, syntax),
+            PointerDifferenceType(), syntax);
+        var stride = EmitConvert(ElementCount(pointee, syntax), PointerDifferenceType(), syntax);
+        return EmitConvert(EmitBinary(GimpleTreeCode.TruncDivExpr, elements, stride, PointerDifferenceType(), syntax), type, syntax);
+    }
+
+    private GimpleValue LowerVariableSizeof(BoundSizeofExpression expression, QualifiedType operandType)
+    {
+        if (expression.Expression is not null)
+            _ = LowerVariableArrayAddress(expression.Expression);
+        else
+            EvaluateVariableLengths(operandType, expression.Syntax);
+        return EmitConvert(VariableSize(operandType, expression.Syntax), expression.Type, expression.Syntax);
+    }
+
+    private QualifiedType SizeType()
+        => IntegerTypeOfPointerSize(BuiltinTypeKind.UnsignedInt, BuiltinTypeKind.UnsignedLong, BuiltinTypeKind.UnsignedLongLong);
+
+    private QualifiedType PointerDifferenceType()
+        => IntegerTypeOfPointerSize(BuiltinTypeKind.Int, BuiltinTypeKind.Long, BuiltinTypeKind.LongLong);
+
+    private QualifiedType IntegerTypeOfPointerSize(params BuiltinTypeKind[] candidates)
+    {
+        foreach (var candidate in candidates)
+        {
+            var type = _types.Builtin(candidate);
+            if (_target.SizeOf(type) >= _target.PointerSize)
+                return type;
+        }
+        return _types.Builtin(candidates[^1]);
+    }
+
+    // The bytecode machine frees stack only when a frame returns, so a function keeps its own top and reuses space it gives back
+    private bool CanMoveStackBack => _target.Architecture != TargetArchitectureKind.RegisterBytecode;
+
+    private QualifiedType BytePointerType()
+        => new QualifiedType(_types.PointerTo(_types.Builtin(BuiltinTypeKind.Char)));
+
+    private void InitializeStackTop(SyntaxNode? syntax)
+    {
+        var top = CreateTemporary(BytePointerType(), syntax);
+        EmitStore(top, EmitConvert(EmitStackIntrinsic(RuntimeIntrinsicKind.StackSave, null, syntax), BytePointerType(), syntax), syntax);
+        _stackTop = top;
+    }
+
+    private GimpleValue EmitStackSave(SyntaxNode? syntax)
+    {
+        if (CanMoveStackBack)
+            return EmitStackIntrinsic(RuntimeIntrinsicKind.StackSave, null, syntax);
+        if (_stackTop is null)
+            InitializeStackTop(syntax);
+        return Materialize(EmitConvert(_stackTop!, BytePointerType(), syntax));
+    }
+
+    private void EmitStackRestore(GimpleValue saved, SyntaxNode? syntax)
+    {
+        if (CanMoveStackBack)
+            EmitStackIntrinsic(RuntimeIntrinsicKind.StackRestore, saved, syntax);
+        else
+            EmitStore((GimplePlace)_stackTop!, saved, syntax);
+    }
+
+    private GimpleValue EmitStackAllocate(GimpleValue bytes, SyntaxNode? syntax)
+    {
+        if (CanMoveStackBack)
+            return EmitStackIntrinsic(RuntimeIntrinsicKind.StackAllocate, bytes, syntax);
+        if (_stackTop is null)
+            InitializeStackTop(syntax);
+
+        var rounded = EmitBinary(GimpleTreeCode.BitAndExpr,
+            EmitBinary(GimpleTreeCode.PlusExpr, bytes, CreateIntegerConstant(15, SizeType(), syntax), SizeType(), syntax),
+            CreateIntegerConstant(-16, SizeType(), syntax), SizeType(), syntax);
+        var offset = EmitUnary(GimpleTreeCode.NegateExpr, EmitConvert(rounded, PointerDifferenceType(), syntax), PointerDifferenceType(), syntax);
+        var top = Materialize(EmitBinary(GimpleTreeCode.PointerPlusExpr, _stackTop!, offset, BytePointerType(), syntax));
+        var lowest = Materialize(EmitConvert(EmitStackIntrinsic(RuntimeIntrinsicKind.StackSave, null, syntax), BytePointerType(), syntax));
+
+        var grow = CreateGeneratedLabel("stack_grow");
+        var done = CreateGeneratedLabel("stack_ready");
+        Emit(new GimpleCondStatement(GimpleTreeCode.LtExpr, top, lowest, grow, done, syntax));
+        StartBlock(grow);
+        var shortfall = EmitConvert(EmitBinary(GimpleTreeCode.PointerDiffExpr, lowest, top, PointerDifferenceType(), syntax), SizeType(), syntax);
+        EmitStackIntrinsic(RuntimeIntrinsicKind.StackAllocate, shortfall, syntax);
+        Emit(new GimpleGotoStatement(done, syntax));
+        StartBlock(done);
+
+        EmitStore((GimplePlace)_stackTop!, top, syntax);
+        return top;
+    }
+
+    private GimpleValue EmitStackIntrinsic(RuntimeIntrinsicKind kind, GimpleValue? operand, SyntaxNode? syntax)
+    {
+        if (!_stackIntrinsics.TryGetValue(kind, out var function))
+        {
+            var voidPointer = new QualifiedType(_types.PointerTo(_types.Builtin(BuiltinTypeKind.Void)));
+            var (name, returnType, parameterType) = kind switch
+            {
+                RuntimeIntrinsicKind.StackAllocate => ("__builtin_alloca", voidPointer, SizeType()),
+                RuntimeIntrinsicKind.StackSave => ("__builtin_stack_save", voidPointer, (QualifiedType?)null),
+                _ => ("__builtin_stack_restore", _types.Builtin(BuiltinTypeKind.Void), voidPointer),
+            };
+            var parameters = parameterType is { } p
+                ? ImmutableArray.Create(new ParameterSymbol("value", p, declaringSyntax: null))
+                : ImmutableArray<ParameterSymbol>.Empty;
+            var functionType = _types.FunctionReturning(returnType, parameters, hasPrototype: true, isVariadic: false);
+            function = new FunctionSymbol(name, new QualifiedType(functionType), StorageClass.Extern, FunctionSpecifiers.None,
+                isDefinition: false, declaringSyntax: null, kind);
+            _stackIntrinsics.Add(kind, function);
+        }
+
+        var signature = function.FunctionType!;
+        var arguments = operand is null
+            ? ImmutableArray<GimpleValue>.Empty
+            : ImmutableArray.Create(GimplifyArgument(EmitConvert(operand, signature.Parameters[0].Type, syntax)));
+        var result = GimpleTypes.IsVoid(signature.ReturnType) ? null : CreateTemporary(signature.ReturnType, syntax);
+        Emit(new GimpleCallStatement(result, new GimpleSymbolValue(function, function.Type, syntax), arguments, signature,
+            signature.ReturnType, syntax));
+        return (GimpleValue?)result ?? new GimpleConstantValue(null, signature.ReturnType, syntax);
+    }
+
     private GimpleTemporaryValue CreateTemporary(QualifiedType type, SyntaxNode? syntax)
     {
         var temporary = new GimpleTemporaryValue(_temporaryOrdinal++, type, syntax);
@@ -2343,6 +2765,9 @@ internal sealed class Gimplifier
 
             case BoundSizeofExpression sizeofExpression:
                 return TryConvertConstantToLong(sizeofExpression.ConstantValue, out value);
+
+            case BoundOffsetofExpression offsetof:
+                return TryConvertConstantToLong(offsetof.ConstantValue, out value);
 
             case BoundLiteralExpression literal:
                 return TryConvertConstantToLong(literal.ConstantValue, out value);

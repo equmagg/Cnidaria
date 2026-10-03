@@ -26,6 +26,9 @@ public enum RuntimeIntrinsicKind : byte
     CStringWrite,
     Malloc,
     Free,
+    StackAllocate,
+    StackSave,
+    StackRestore,
 }
 
 /// <summary>Base class for named semantic entities</summary>

@@ -17,6 +17,11 @@ namespace Cnidaria.Cs
                 return CanBindTargetTypedObjectCreation(unbound, target, context)
                     ? new Conversion(ConversionKind.Identity)
                     : new Conversion(ConversionKind.None);
+            if (expr is BoundUnboundConditionalExpression unboundConditional)
+                return ClassifyConversion(unboundConditional.WhenTrue, target, context).IsImplicit &&
+                       ClassifyConversion(unboundConditional.WhenFalse, target, context).IsImplicit
+                    ? new Conversion(ConversionKind.Identity)
+                    : new Conversion(ConversionKind.None);
             if (expr is BoundUnboundCollectionExpression unboundCollection)
                 return CanBindTargetTypedCollectionExpression(unboundCollection, target, context)
                     ? new Conversion(ConversionKind.Identity)
@@ -39,6 +44,13 @@ namespace Cnidaria.Cs
                 ReferenceEquals(sa.ElementType, spanElemType))
             {
                 return new Conversion(ConversionKind.ImplicitStackAlloc);
+            }
+            if (expr.IsLValue &&
+                InlineArrayFacts.TryGetInfo(expr.Type, out var inlineArray) &&
+                TryGetSpanLikeElementType(target, out _, out var inlineSpanElementType) &&
+                AreSameType(inlineArray.ElementType, inlineSpanElementType))
+            {
+                return new Conversion(ConversionKind.ImplicitInlineArray);
             }
             var standard = ClassifyConversion(expr, target, context.Compilation.Target);
             if (standard.Exists)
@@ -343,6 +355,9 @@ namespace Cnidaria.Cs
                         return new Conversion(ConversionKind.None);
                     return new Conversion(underlyingConv.IsImplicit ? ConversionKind.ImplicitNullable : ConversionKind.ExplicitNullable);
                 }
+                // Unboxing to Nullable<T> yields an empty nullable for null rather than unwrapping a T.
+                if (HasExplicitUnboxingConversion(expr.Type, targetUnderlying))
+                    return new Conversion(ConversionKind.Unboxing);
                 // S to Nullable<T>
                 var underlyingConv2 = ClassifyConversion(expr, targetUnderlying);
                 if (!underlyingConv2.Exists)
@@ -467,6 +482,14 @@ namespace Cnidaria.Cs
 
             if (HasImplicitBoxingConversion(expr.Type, target))
                 return new Conversion(ConversionKind.Boxing);
+
+            // Type parameter conversions to the effective base class and interface set are implicit and box like Roslyn's
+            if (expr.Type is TypeParameterSymbol constrained && GenericConstraintFacts.SatisfiesTypeConstraint(constrained, target))
+                return new Conversion(ConversionKind.Boxing);
+
+            // A type parameter converts explicitly to any interface: boxed, then cast.
+            if (expr.Type is TypeParameterSymbol && IsInterfaceType(target))
+                return new Conversion(ConversionKind.ExplicitReference);
 
             if (HasExplicitUnboxingConversion(expr.Type, target))
                 return new Conversion(ConversionKind.Unboxing);
@@ -779,6 +802,10 @@ namespace Cnidaria.Cs
 
             if (AreSameType(source, destination))
                 return true;
+
+            // A reference-type type parameter converts to object and to what its constraints convert to (C# 10.2.12)
+            if (source is TypeParameterSymbol typeParameter)
+                return GenericConstraintFacts.SatisfiesTypeConstraint(typeParameter, destination);
 
             // Reference conversion to a base class
             if (IsBaseTypeOf(destination, source))

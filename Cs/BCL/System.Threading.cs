@@ -514,6 +514,50 @@ namespace System.Threading
         }
     }
     /// <summary>Provides atomic operations for variables that are shared by multiple threads.</summary>
+    public static class Volatile
+    {
+        [Intrinsic]
+        public static bool Read(ref readonly bool location) => location;
+
+        [Intrinsic]
+        public static int Read(ref readonly int location) => location;
+
+        [Intrinsic]
+        public static uint Read(ref readonly uint location) => location;
+
+        [Intrinsic]
+        public static long Read(ref readonly long location) => location;
+
+        [Intrinsic]
+        public static ulong Read(ref readonly ulong location) => location;
+
+        [Intrinsic]
+        public static nint Read(ref readonly nint location) => location;
+
+        [Intrinsic]
+        public static T Read<T>(ref readonly T location) where T : class? => location;
+
+        [Intrinsic]
+        public static void Write(ref bool location, bool value) => location = value;
+
+        [Intrinsic]
+        public static void Write(ref int location, int value) => location = value;
+
+        [Intrinsic]
+        public static void Write(ref uint location, uint value) => location = value;
+
+        [Intrinsic]
+        public static void Write(ref long location, long value) => location = value;
+
+        [Intrinsic]
+        public static void Write(ref ulong location, ulong value) => location = value;
+
+        [Intrinsic]
+        public static void Write(ref nint location, nint value) => location = value;
+
+        [Intrinsic]
+        public static void Write<T>(ref T location, T value) where T : class? => location = value;
+    }
     public static class Interlocked
     {
         #region Increment

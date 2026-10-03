@@ -66,6 +66,130 @@ internal sealed class DeclarationContext
     }
 }
 
+internal static class OffsetofEvaluator
+{
+    public static bool TryEvaluate(
+        QualifiedType type,
+        ImmutableArray<SyntaxToken> member,
+        Scope scope,
+        TargetInfo target,
+        DeclarationContext? context,
+        out long offset,
+        out string error)
+    {
+        offset = 0;
+        error = string.Empty;
+        var current = type;
+        var position = 0;
+        var expectMember = true;
+        try
+        {
+            while (expectMember || position < member.Length)
+            {
+                if (expectMember)
+                {
+                    if (position >= member.Length || member[position].Kind != SyntaxKind.IdentifierToken)
+                    {
+                        error = "Expected a member name in offsetof.";
+                        return false;
+                    }
+                    if (current.Type is not TagType { Symbol: { TagKind: TagKind.Struct or TagKind.Union, IsComplete: true } tag })
+                    {
+                        error = "offsetof requires a complete struct or union type.";
+                        return false;
+                    }
+                    var name = member[position].Text;
+                    if (!TryAddMemberOffset(tag, name, target, ref offset, out var field))
+                    {
+                        error = $"'{tag.TagKind.ToString().ToLowerInvariant()} {tag.Name}' has no member named '{name}'.";
+                        return false;
+                    }
+                    if (field.IsBitField)
+                    {
+                        error = "offsetof cannot name a bit-field.";
+                        return false;
+                    }
+                    current = field.Type;
+                    position++;
+                    expectMember = false;
+                    continue;
+                }
+
+                if (member[position].Kind == SyntaxKind.DotToken)
+                {
+                    position++;
+                    expectMember = true;
+                    continue;
+                }
+
+                var close = FindClosingBracket(member, position);
+                if (close < 0)
+                {
+                    error = "Expected '.' or '[' in the offsetof member designator.";
+                    return false;
+                }
+                if (current.Type is not ArrayType array)
+                {
+                    error = "Subscripted offsetof member is not an array.";
+                    return false;
+                }
+                if (!new DeclaratorParser.ArrayLengthExpressionEvaluator(member[(position + 1)..close], scope, context).TryEvaluate(out var index))
+                {
+                    error = "offsetof array index must be an integer constant expression.";
+                    return false;
+                }
+                offset = checked(offset + index * target.SizeOf(array.ElementType));
+                current = array.ElementType;
+                position = close + 1;
+            }
+        }
+        catch (OverflowException)
+        {
+            error = "offsetof result cannot be represented.";
+            return false;
+        }
+        return true;
+    }
+
+    private static int FindClosingBracket(ImmutableArray<SyntaxToken> tokens, int open)
+    {
+        if (tokens[open].Kind != SyntaxKind.OpenBracketToken)
+            return -1;
+        var depth = 0;
+        for (var i = open; i < tokens.Length; i++)
+        {
+            if (tokens[i].Kind == SyntaxKind.OpenBracketToken)
+                depth++;
+            else if (tokens[i].Kind == SyntaxKind.CloseBracketToken && --depth == 0)
+                return i;
+        }
+        return -1;
+    }
+
+    private static bool TryAddMemberOffset(TagSymbol tag, string name, TargetInfo target, ref long offset, out FieldSymbol field)
+    {
+        if (tag.TryGetField(name, out var direct) && direct is not null)
+        {
+            offset = checked(offset + target.GetFieldPlacement(direct).ByteOffset);
+            field = direct;
+            return true;
+        }
+        foreach (var anonymous in tag.Fields)
+        {
+            if (anonymous.Name.Length != 0 || anonymous.Type.Type is not TagType { Symbol: { TagKind: TagKind.Struct or TagKind.Union } inner })
+                continue;
+            var inside = checked(offset + target.GetFieldPlacement(anonymous).ByteOffset);
+            if (TryAddMemberOffset(inner, name, target, ref inside, out field))
+            {
+                offset = inside;
+                return true;
+            }
+        }
+        field = null!;
+        return false;
+    }
+}
+
 /// <summary>Resolves a type name such as the operand of a cast or of sizeof</summary>
 internal static class TypeNameParser
 {
@@ -451,7 +575,7 @@ internal sealed class DeclarationCollector
             }
 
             if (equalsIndex >= 0 &&
-                !TryEvaluateEnumeratorValue(enumeratorTokens, equalsIndex + 1, scope, out value))
+                !new DeclaratorParser.ArrayLengthExpressionEvaluator(enumeratorTokens[(equalsIndex + 1)..], scope, _context).TryEvaluate(out value))
             {
                 _diagnostics.Add(SemanticDiagnostic.Error(
                     "Enumerator value for '" + nameToken.Text + "' is not a supported integer constant expression.",
@@ -522,48 +646,6 @@ internal sealed class DeclarationCollector
 
         if (start < tokens.Length)
             yield return tokens[start..];
-    }
-
-    private static bool TryEvaluateEnumeratorValue(
-        ImmutableArray<SyntaxToken> tokens,
-        int startIndex,
-        Scope scope,
-        out long value)
-    {
-        var endIndex = tokens.Length;
-        while (startIndex < endIndex &&
-               tokens[startIndex].Kind == SyntaxKind.OpenParenToken &&
-               tokens[endIndex - 1].Kind == SyntaxKind.CloseParenToken)
-        {
-            startIndex++;
-            endIndex--;
-        }
-
-        if (endIndex - startIndex == 1)
-            return TryEvaluateEnumeratorAtom(tokens[startIndex], scope, out value);
-
-        if (endIndex - startIndex == 2 &&
-            TryEvaluateEnumeratorAtom(tokens[startIndex + 1], scope, out var operand))
-        {
-            switch (tokens[startIndex].Kind)
-            {
-                case SyntaxKind.PlusToken:
-                    value = operand;
-                    return true;
-                case SyntaxKind.MinusToken:
-                    value = unchecked(-operand);
-                    return true;
-                case SyntaxKind.TildeToken:
-                    value = ~operand;
-                    return true;
-                case SyntaxKind.BangToken:
-                    value = operand == 0 ? 1 : 0;
-                    return true;
-            }
-        }
-
-        value = 0;
-        return false;
     }
 
     internal static bool TryEvaluateEnumeratorAtom(
@@ -696,7 +778,7 @@ internal sealed class DeclarationCollector
 
     private QualifiedType CompleteArrayTypeFromInitializer(QualifiedType type, InitializerSyntax? initializer, Scope scope)
     {
-        if (initializer is null || type.Type is not ArrayType { Length: null } array)
+        if (initializer is null || type.Type is not ArrayType { Length: null } array || array is VariableArrayType)
             return type;
         if (!TryGetStringInitializerLength(array.ElementType, initializer, out var length) &&
             !TryGetInitializerListLength(array.ElementType, initializer, scope, out length))
@@ -1092,6 +1174,9 @@ internal sealed class DeclarationCollector
             case SizeofExpressionSyntax sizeofExpression:
                 if (sizeofExpression.Expression is not null)
                     VisitExpression(sizeofExpression.Expression, scope);
+                break;
+
+            case OffsetofExpressionSyntax:
                 break;
 
             case ParenthesizedExpressionSyntax parenthesized:
@@ -1714,6 +1799,8 @@ internal static class StructUnionFieldParser
                 types,
                 scope,
                 context);
+            if (ArrayType.IsVariablyModified(type))
+                context?.Diagnostics.Add(SemanticDiagnostic.Error("A struct or union member cannot have a variably modified type.", identifier.Value.Span));
 
             fields.Add(new FieldSymbol(
                 identifier.Value.Text,
@@ -2144,7 +2231,8 @@ internal sealed class DeclaratorParser
             if (Current.Kind == SyntaxKind.OpenBracketToken)
             {
                 var content = ReadBalancedContent(SyntaxKind.OpenBracketToken, SyntaxKind.CloseBracketToken);
-                node = new ArrayDeclaratorNode(node, TryReadArrayLength(content));
+                var length = TryReadArrayLength(content, out var variableLength);
+                node = new ArrayDeclaratorNode(node, length, variableLength, _scope);
                 continue;
             }
 
@@ -2195,14 +2283,33 @@ internal sealed class DeclaratorParser
         return _tokens[start..end];
     }
 
-    private long? TryReadArrayLength(ImmutableArray<SyntaxToken> tokens)
+    private long? TryReadArrayLength(ImmutableArray<SyntaxToken> tokens, out ExpressionSyntax? variableLength)
     {
-        if (tokens.IsDefaultOrEmpty)
+        variableLength = null;
+        var start = 0;
+        while (start < tokens.Length && tokens[start].Kind is SyntaxKind.StaticKeyword or SyntaxKind.ConstKeyword or
+            SyntaxKind.VolatileKeyword or SyntaxKind.RestrictKeyword or SyntaxKind.AtomicKeyword or SyntaxKind.UnderscoreAtomicKeyword or
+            SyntaxKind.ConstExtensionKeyword or SyntaxKind.VolatileExtensionKeyword or SyntaxKind.RestrictExtensionKeyword)
+        {
+            start++;
+        }
+        if (start == tokens.Length || start == tokens.Length - 1 && tokens[start].Kind == SyntaxKind.StarToken)
             return null;
+        tokens = tokens[start..];
 
         var evaluator = new ArrayLengthExpressionEvaluator(tokens, _scope, _context);
         if (!evaluator.TryEvaluate(out var value))
+        {
+            if (_scope.Parent is not null && Parser.ParseExpression(tokens) is { } expression)
+            {
+                variableLength = expression;
+                return null;
+            }
+            _context?.Diagnostics.Add(SemanticDiagnostic.Error(
+                _scope.Parent is null ? "Array size at file scope must be an integer constant expression." : "Array size is not an expression.",
+                tokens[0].Span));
             return null;
+        }
         if (value < 0)
         {
             _context?.Diagnostics.Add(SemanticDiagnostic.Error("Array size is negative.", tokens[0].Span));
@@ -2315,7 +2422,38 @@ internal sealed class DeclaratorParser
             if (Match(SyntaxKind.SizeofKeyword))
                 return TryParseSizeof(out value);
 
+            if (Match(SyntaxKind.BuiltinOffsetofKeyword))
+                return TryParseOffsetof(out value);
+
             return TryParsePrimary(out value);
+        }
+
+        private bool TryParseOffsetof(out long value)
+        {
+            value = 0;
+            if (_context is null || _position >= _tokens.Length || _tokens[_position].Kind != SyntaxKind.OpenParenToken)
+                return false;
+            var close = FindClosingParen(_position);
+            var comma = -1;
+            var depth = 0;
+            for (var i = _position + 1; i < close && comma < 0; i++)
+            {
+                var kind = _tokens[i].Kind;
+                if (kind is SyntaxKind.OpenParenToken or SyntaxKind.OpenBracketToken)
+                    depth++;
+                else if (kind is SyntaxKind.CloseParenToken or SyntaxKind.CloseBracketToken)
+                    depth--;
+                else if (kind == SyntaxKind.CommaToken && depth == 0)
+                    comma = i;
+            }
+            if (close < 0 || comma < 0 ||
+                TypeNameParser.Parse(_tokens[(_position + 1)..comma], _scope, TypeCatalog.Instance, _context) is not { IsError: false } type ||
+                !OffsetofEvaluator.TryEvaluate(type, _tokens[(comma + 1)..close], _scope, _context.Target, _context, out value, out _))
+            {
+                return false;
+            }
+            _position = close + 1;
+            return true;
         }
 
         private bool TryParseSizeof(out long value)
@@ -2590,6 +2728,7 @@ internal sealed class DeclaratorParser
             return ImmutableArray<ParameterSymbol>.Empty;
 
         var parameters = ImmutableArray.CreateBuilder<ParameterSymbol>();
+        var prototypeScope = new Scope(_scope, declaringSyntax: null);
         foreach (var parameterTokens in SplitTopLevel(tokens, SyntaxKind.CommaToken))
         {
             if (parameterTokens.Length == 0 || parameterTokens.Any(static t => t.Kind == SyntaxKind.EllipsisToken))
@@ -2606,16 +2745,19 @@ internal sealed class DeclaratorParser
                 continue;
             }
 
-            var specifiers = DeclarationTypeParser.ParseSpecifiers(specifierTokens, _scope, _types);
+            var specifiers = DeclarationTypeParser.ParseSpecifiers(specifierTokens, prototypeScope, _types);
             var declaratorTokens = parameterTokens[declaratorStart..];
             var identifier = FindDeclaratorIdentifier(declaratorTokens);
             var parameterDeclarator = new DeclaratorSyntax(declaratorTokens, identifier);
-            var type = DeclaratorTypeBuilder.Build(parameterDeclarator, specifiers.BaseType, _types, _scope);
+            var type = DeclaratorTypeBuilder.Build(parameterDeclarator, specifiers.BaseType, _types, prototypeScope);
 
-            parameters.Add(new ParameterSymbol(
+            var parameter = new ParameterSymbol(
                 identifier?.Text ?? string.Empty,
                 AdjustParameterType(type),
-                declaringSyntax: null));
+                declaringSyntax: null);
+            parameters.Add(parameter);
+            if (parameter.Name.Length != 0)
+                prototypeScope.TryDeclareOrdinary(parameter, out _);
         }
 
         return parameters.ToImmutable();
@@ -2902,16 +3044,22 @@ internal sealed class ArrayDeclaratorNode : DeclaratorNode
 {
     private readonly DeclaratorNode _inner;
     private readonly long? _length;
+    private readonly ExpressionSyntax? _variableLength;
+    private readonly Scope _scope;
 
-    public ArrayDeclaratorNode(DeclaratorNode inner, long? length)
+    public ArrayDeclaratorNode(DeclaratorNode inner, long? length, ExpressionSyntax? variableLength, Scope scope)
     {
         _inner = inner ?? new MissingDeclaratorNode();
         _length = length;
+        _variableLength = variableLength;
+        _scope = scope;
     }
 
     public override QualifiedType Apply(QualifiedType baseType, TypeCatalog types)
     {
-        var array = new QualifiedType(types.ArrayOf(baseType, _length));
+        var array = _variableLength is not null
+            ? new QualifiedType(new VariableArrayType(baseType, _variableLength, _scope))
+            : new QualifiedType(types.ArrayOf(baseType, _length));
         return _inner.Apply(array, types);
     }
 }

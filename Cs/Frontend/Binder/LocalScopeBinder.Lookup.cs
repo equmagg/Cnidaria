@@ -138,6 +138,26 @@ namespace Cnidaria.Cs
             local = null!;
             return false;
         }
+        // The innermost scope declaring the name wins, so a local function's parameter shadows an enclosing local.
+        private bool TryGetLocalOrParameterFromEnclosingScopes(string name, out LocalSymbol? local, out ParameterSymbol? param)
+        {
+            for (Binder? b = this; b is LocalScopeBinder ls; b = ls.Parent)
+            {
+                if (ls._locals.TryGetValue(name, out local))
+                {
+                    param = null;
+                    return true;
+                }
+                if (ls._parameters.TryGetValue(name, out param))
+                {
+                    local = null;
+                    return true;
+                }
+            }
+            local = null;
+            param = null;
+            return false;
+        }
         private bool TryGetParameterFromEnclosingScopes(string name, out ParameterSymbol? param)
         {
             for (Binder? b = this; b is LocalScopeBinder ls; b = ls.Parent)

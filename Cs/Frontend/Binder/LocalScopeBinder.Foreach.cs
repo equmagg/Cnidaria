@@ -226,6 +226,8 @@ namespace Cnidaria.Cs
                 return true;
             if (TryResolveSpanForEach(collection, out result))
                 return true;
+            if (TryResolveInlineArrayForEach(collection, out result))
+                return true;
 
             var patternStatus = TryResolvePatternForEach(node, collection, context, diagnostics, out result);
             if (patternStatus == ForEachResolutionStatus.Success)
@@ -320,6 +322,30 @@ namespace Cnidaria.Cs
                 collectionType: spanLikeType,
                 enumeratorType: spanLikeType,
                 elementType: elementType,
+                collectionConversion: new Conversion(ConversionKind.Identity),
+                getEnumeratorMethodOpt: null,
+                getEnumeratorIsExtensionMethod: false,
+                currentPropertyOpt: null,
+                moveNextMethodOpt: null);
+
+            return true;
+        }
+
+        private static bool TryResolveInlineArrayForEach(
+            BoundExpression collection,
+            out ForEachResolution result)
+        {
+            if (!InlineArrayFacts.TryGetInfo(collection.Type, out var inlineArray))
+            {
+                result = default;
+                return false;
+            }
+
+            result = new ForEachResolution(
+                kind: BoundForEachEnumeratorKind.InlineArray,
+                collectionType: collection.Type,
+                enumeratorType: collection.Type,
+                elementType: inlineArray.ElementType,
                 collectionConversion: new Conversion(ConversionKind.Identity),
                 getEnumeratorMethodOpt: null,
                 getEnumeratorIsExtensionMethod: false,
@@ -665,7 +691,7 @@ namespace Cnidaria.Cs
                     {
                         if (members[i] is PropertySymbol property &&
                             StringComparer.Ordinal.Equals(property.Name, "Current") &&
-                            property.ExplicitInterfaceImplementation is null &&
+                            !property.IsExplicitInterfaceImplementation &&
                             IsReadableInstanceProperty(property, context))
                         {
                             builder.Add(property);
@@ -885,6 +911,11 @@ namespace Cnidaria.Cs
                 return BindImplicitObjectCreation(ioc, context, diagnostics);
 
             var expr = BindExpression(node, context, diagnostics);
+            if (expr is BoundUnboundConditionalExpression unboundConditional)
+            {
+                diagnostics.Add(unboundConditional.NoNaturalType);
+                return new BoundBadExpression(node);
+            }
             if (expr is BoundUnboundCollectionExpression)
             {
                 diagnostics.Add(new Diagnostic(

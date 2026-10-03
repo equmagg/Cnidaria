@@ -970,7 +970,7 @@ namespace Cnidaria.Cs
                     _nextSyntheticTreeId++,
                     GenTreeKind.StoreTemp,
                     occurrence.Node.Pc,
-                    occurrence.Node.SourceOp,
+                    occurrence.Node.Operator,
                     temp.Type,
                     temp.StackKind,
                     (occurrence.Node.Flags & ~(GenTreeFlags.AssertionProperties | GenTreeFlags.ExplicitInit)) |
@@ -991,7 +991,7 @@ namespace Cnidaria.Cs
                     _nextSyntheticTreeId++,
                     GenTreeKind.Temp,
                     occurrence.Node.Pc,
-                    occurrence.Node.SourceOp,
+                    occurrence.Node.Operator,
                     temp.Type,
                     temp.StackKind,
                     GenTreeFlags.LocalUse,

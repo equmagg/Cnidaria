@@ -3381,11 +3381,13 @@ void* RhpNewStringFromCharArrayRange(
     return object;
 }
 
+// The span arrives as a struct whose second register segment leaves the bits above _length undefined.
 void* RhpNewStringFromReadOnlySpan(
     const RhMethodTable* type,
     const u16* source,
-    int length)
+    usize length_segment)
 {
+    int length = (int)length_segment;
     void* object;
     if (length < 0 || (source == (const u16*)0 && length != 0))
         RhpFallbackFailFast(147);
@@ -3393,6 +3395,16 @@ void* RhpNewStringFromReadOnlySpan(
     if (length != 0)
         rh_copy_utf16((u16*)((u8*)object + STRING_FIRST_CHAR_OFFSET), source, length);
     return object;
+}
+
+// The native GC never moves objects, so an address mix is a stable identity hash for the object's lifetime
+int RhpGetObjectHashCode(const RhObject* object)
+{
+    usize bits = (usize)object;
+    u32 hash = (u32)(bits >> 3) ^ (u32)((bits >> 3) >> 16);
+    hash = hash * 0x9E3779B1u;
+    hash = (hash ^ (hash >> 15)) & 0x7fffffffu;
+    return hash == 0u ? 1 : (int)hash;
 }
 
 void RhpGcPoll(void)

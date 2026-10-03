@@ -57,6 +57,8 @@ namespace Cnidaria.Cs
         private const int ObjectHeaderSize = 8;
         private const int GcFlagMark = 1 << 0;
         private const int GcFlagAllocated = 1 << 1;
+        private const int IdentityHashShift = 2;
+        private uint _identityHashState = 0x9E3779B9u;
         private const int ArrayLengthOffset = ObjectHeaderSize;
         private const int ArrayDataOffset = ObjectHeaderSize + 8;
         private const int StringLengthOffset = ObjectHeaderSize;
@@ -98,6 +100,7 @@ namespace Cnidaria.Cs
         private readonly Dictionary<int, int> _staticDataByPc = new Dictionary<int, int>();
         private readonly Dictionary<int, int> _staticDataHeapObjectByPc = new Dictionary<int, int>();
         private readonly Dictionary<string, int> _internPool = new Dictionary<string, int>(StringComparer.Ordinal);
+        private readonly Dictionary<int, string> _stringLiterals = new Dictionary<int, string>();
         private readonly Dictionary<int, byte> _typeInitState = new Dictionary<int, byte>();
         private readonly List<RegisterSnapshot?> _registerSnapshots = new List<RegisterSnapshot?>();
         private readonly Dictionary<int, HostOverride> _hostOverrides = new Dictionary<int, HostOverride>();
@@ -532,6 +535,14 @@ namespace Cnidaria.Cs
                     case Op.BrF64Le: if (F64(ins.Rs1) <= F64(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
                     case Op.BrF64Gt: if (F64(ins.Rs1) > F64(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
                     case Op.BrF64Ge: if (F64(ins.Rs1) >= F64(ins.Rs2)) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF32LtUn: if (!(F32(ins.Rs1) >= F32(ins.Rs2))) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF32LeUn: if (!(F32(ins.Rs1) > F32(ins.Rs2))) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF32GtUn: if (!(F32(ins.Rs1) <= F32(ins.Rs2))) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF32GeUn: if (!(F32(ins.Rs1) < F32(ins.Rs2))) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF64LtUn: if (!(F64(ins.Rs1) >= F64(ins.Rs2))) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF64LeUn: if (!(F64(ins.Rs1) > F64(ins.Rs2))) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF64GtUn: if (!(F64(ins.Rs1) <= F64(ins.Rs2))) _pc = unchecked((int)ins.Imm); break;
+                    case Op.BrF64GeUn: if (!(F64(ins.Rs1) < F64(ins.Rs2))) _pc = unchecked((int)ins.Imm); break;
 
                     case Op.MovI:
                     case Op.MovRef:
@@ -557,7 +568,7 @@ namespace Cnidaria.Cs
                         SetGpr(ins.Rd, 0);
                         break;
                     case Op.LiString:
-                        SetGpr(ins.Rd, InternString(CurrentModule().Md.GetUserString(checked((int)ins.Imm))));
+                        SetGpr(ins.Rd, InternString(ReadStringLiteral(checked((int)ins.Imm))));
                         break;
                     case Op.LiTypeHandle:
                     case Op.LiMethodHandle:
@@ -691,6 +702,8 @@ namespace Cnidaria.Cs
                     case Op.F32Le: SetBool(ins.Rd, F32(ins.Rs1) <= F32(ins.Rs2)); break;
                     case Op.F32Gt: SetBool(ins.Rd, F32(ins.Rs1) > F32(ins.Rs2)); break;
                     case Op.F32Ge: SetBool(ins.Rd, F32(ins.Rs1) >= F32(ins.Rs2)); break;
+                    case Op.F32LtUn: SetBool(ins.Rd, !(F32(ins.Rs1) >= F32(ins.Rs2))); break;
+                    case Op.F32GtUn: SetBool(ins.Rd, !(F32(ins.Rs1) <= F32(ins.Rs2))); break;
                     case Op.F32Min: SetF32(ins.Rd, MathF.Min(F32(ins.Rs1), F32(ins.Rs2))); break;
                     case Op.F32Max: SetF32(ins.Rd, MathF.Max(F32(ins.Rs1), F32(ins.Rs2))); break;
                     case Op.F32IsNaN: SetBool(ins.Rd, float.IsNaN(F32(ins.Rs1))); break;
@@ -708,6 +721,8 @@ namespace Cnidaria.Cs
                     case Op.F64Le: SetBool(ins.Rd, F64(ins.Rs1) <= F64(ins.Rs2)); break;
                     case Op.F64Gt: SetBool(ins.Rd, F64(ins.Rs1) > F64(ins.Rs2)); break;
                     case Op.F64Ge: SetBool(ins.Rd, F64(ins.Rs1) >= F64(ins.Rs2)); break;
+                    case Op.F64LtUn: SetBool(ins.Rd, !(F64(ins.Rs1) >= F64(ins.Rs2))); break;
+                    case Op.F64GtUn: SetBool(ins.Rd, !(F64(ins.Rs1) <= F64(ins.Rs2))); break;
                     case Op.F64Min: SetF64(ins.Rd, Math.Min(F64(ins.Rs1), F64(ins.Rs2))); break;
                     case Op.F64Max: SetF64(ins.Rd, Math.Max(F64(ins.Rs1), F64(ins.Rs2))); break;
                     case Op.F64IsNaN: SetBool(ins.Rd, double.IsNaN(F64(ins.Rs1))); break;
@@ -1019,7 +1034,13 @@ namespace Cnidaria.Cs
                         SetGpr(ins.Rd, AllocStringUninitialized((int)GetGpr(ins.Rs1)));
                         break;
                     case Op.Box:
-                        SetGpr(ins.Rd, BoxValue(TypeLayout(ins.Imm), ins.Rs1));
+                        SetGpr(ins.Rd, BoxValue(TypeLayout(ins.Imm), ins.Rs1, fromAddress: false));
+                        break;
+                    case Op.BoxAddr:
+                        SetGpr(ins.Rd, BoxValue(TypeLayout(ins.Imm), ins.Rs1, fromAddress: true));
+                        break;
+                    case Op.BoxSegments:
+                        SetGpr(ins.Rd, BoxSegments(TypeLayout(ins.Imm), ins.Rs1, ins.Rs2, ins.Rs3));
                         break;
                     case Op.UnboxAddr:
                         SetGpr(ins.Rd, UnboxAddress(GetGpr(ins.Rs1), TypeLayout(ins.Imm)));
@@ -3095,6 +3116,36 @@ namespace Cnidaria.Cs
                 return true;
             }
 
+            if (rm.DeclaringType.Namespace == "System.Runtime" && rm.DeclaringType.Name == "RuntimeImports" &&
+                rm.Name is "RhGetObjectHashCode" or "RhTryGetObjectHashCode")
+            {
+                SetReturnI4(GetIdentityHash(checked((int)ReadAbiScalarArgument(rm, 0)), assign: rm.Name == "RhGetObjectHashCode"));
+                return true;
+            }
+
+            // Type handles are type ids here; RuntimeImports.RhGetObjectTypeHandle is expanded by the importer.
+            if (rm.DeclaringType.Namespace == "System.Runtime" && rm.DeclaringType.Name == "RuntimeImports" &&
+                rm.Name.StartsWith("RhGetType", StringComparison.Ordinal))
+            {
+                RuntimeType type = _rts.GetTypeById(checked((int)ReadAbiScalarArgument(rm, 0)));
+                if (rm.Name == "RhGetTypeFlags")
+                {
+                    SetReturnI4((int)RuntimeTypeNames.Flags(type));
+                    return true;
+                }
+                string? text = rm.Name switch
+                {
+                    "RhGetTypeName" => RuntimeTypeNames.Name(type),
+                    "RhGetTypeNamespace" => RuntimeTypeNames.Namespace(type),
+                    "RhGetTypeFullName" => RuntimeTypeNames.FullName(type),
+                    "RhGetTypeDisplayName" => RuntimeTypeNames.DisplayName(type),
+                    "RhGetTypeAssemblyName" => type.AssemblyName,
+                    _ => throw new NotSupportedException($"Unknown runtime type query {rm.Name}."),
+                };
+                SetReturnRef(text is null ? 0 : AllocStringFromManaged(text));
+                return true;
+            }
+
             if (rm.HasInternalCall)
                 throw new NotSupportedException($"InternalCall is not implemented: {rm.DeclaringType.Namespace}.{rm.DeclaringType.Name}.{rm.Name}");
 
@@ -4117,32 +4168,124 @@ namespace Cnidaria.Cs
             return obj;
         }
 
-        private int BoxValue(TypeLayoutRecord type, byte sourceReg)
+        private int BoxValue(TypeLayoutRecord type, byte sourceReg, bool fromAddress)
         {
             if (type.IsReferenceType)
                 return checked((int)GetGpr(sourceReg));
+            if (TryGetNullableLayout(type.RuntimeTypeId, out var nullable))
+                return BoxNullable(type, sourceReg, fromAddress, nullable);
 
             int obj = AllocBoxedValueObject(type);
             int payload = obj + ObjectHeaderSize;
-            int size = type.Size;
 
-            if (RegisterVmIsa.IsFloatRegister(sourceReg))
+            if (fromAddress)
+                CopyTypedObject(payload, checked((int)GetGpr(sourceReg)), type);
+            else if (RegisterVmIsa.IsFloatRegister(sourceReg))
             {
-                if (size == 4) WriteI32(payload, unchecked((int)(uint)GetFpr(sourceReg)));
+                if (type.Size == 4) WriteI32(payload, unchecked((int)(uint)GetFpr(sourceReg)));
                 else WriteI64(payload, GetFpr(sourceReg));
-                return obj;
-            }
-
-            long raw = GetGpr(sourceReg);
-            if (size <= 8 && !type.ContainsGcPointers)
-            {
-                WriteSizedInteger(payload, type, raw);
             }
             else
-            {
-                CopyTypedObject(payload, checked((int)raw), type);
-            }
+                WriteSizedInteger(payload, type, GetGpr(sourceReg));
             return obj;
+        }
+
+        private readonly record struct NullableLayout(RuntimeType Underlying, int HasValueOffset, int ValueOffset, int ValueSize);
+        private readonly Dictionary<int, NullableLayout?> _nullableLayouts = new Dictionary<int, NullableLayout?>();
+
+        private bool TryGetNullableLayout(int runtimeTypeId, out NullableLayout layout)
+        {
+            if (!_nullableLayouts.TryGetValue(runtimeTypeId, out NullableLayout? cached))
+            {
+                RuntimeType type = _rts.GetTypeById(runtimeTypeId);
+                RuntimeType? definition = type.GenericTypeDefinition;
+                cached = null;
+                if (type.IsValueType && type.GenericTypeArguments.Length == 1 &&
+                    definition is { Namespace: "System" } && definition.Name.StartsWith("Nullable", StringComparison.Ordinal))
+                {
+                    int hasValueOffset = -1, valueOffset = -1;
+                    foreach (RuntimeField field in type.InstanceFields)
+                    {
+                        if (field.Name == "hasValue") hasValueOffset = field.Offset;
+                        else if (field.Name == "value") valueOffset = field.Offset;
+                    }
+                    RuntimeType underlying = type.GenericTypeArguments[0];
+                    cached = new NullableLayout(underlying, hasValueOffset, valueOffset, StorageSizeOf(underlying));
+                }
+                _nullableLayouts.Add(runtimeTypeId, cached);
+            }
+            layout = cached.GetValueOrDefault();
+            return cached is not null;
+        }
+
+        // A boxed Nullable<T> is a boxed T, or null when the nullable has no value.
+        private int BoxNullable(TypeLayoutRecord type, byte sourceReg, bool fromAddress, NullableLayout nullable)
+        {
+            Span<byte> packed = stackalloc byte[8];
+            int source = 0;
+            if (fromAddress)
+                source = checked((int)GetGpr(sourceReg));
+            else
+                BinaryPrimitives.WriteInt64LittleEndian(packed, GetGpr(sourceReg));
+            bool hasValue = (fromAddress ? _mem[source + nullable.HasValueOffset] : packed[nullable.HasValueOffset]) != 0;
+            if (!hasValue)
+                return 0;
+            int obj = AllocBoxedValueObject(nullable.Underlying);
+            Span<byte> value = fromAddress
+                ? _mem.AsSpan(source + nullable.ValueOffset, nullable.ValueSize)
+                : packed.Slice(nullable.ValueOffset, nullable.ValueSize);
+            value.CopyTo(_mem.AsSpan(obj + ObjectHeaderSize, nullable.ValueSize));
+            return obj;
+        }
+
+        // A value promoted into register segments is boxed from those registers, read after allocating so a moving collection is seen.
+        private int BoxSegments(TypeLayoutRecord type, byte rs1, byte rs2, byte rs3)
+        {
+            RuntimeType runtimeType = _rts.GetTypeById(type.RuntimeTypeId);
+            var segments = MachineAbi.GetRegisterSegments(MachineAbi.ClassifyStorageValue(runtimeType, MachineAbi.StackKindForType(runtimeType)));
+            Span<byte> bytes = stackalloc byte[Math.Max(type.Size, 1)];
+            bool nullable = TryGetNullableLayout(type.RuntimeTypeId, out var nullableLayout);
+            if (nullable)
+            {
+                ReadSegments(bytes, segments, rs1, rs2, rs3);
+                if (bytes[nullableLayout.HasValueOffset] == 0)
+                    return 0;
+            }
+            int obj = nullable ? AllocBoxedValueObject(nullableLayout.Underlying) : AllocBoxedValueObject(type);
+            ReadSegments(bytes, segments, rs1, rs2, rs3);
+            ReadOnlySpan<byte> payload = nullable ? bytes.Slice(nullableLayout.ValueOffset, nullableLayout.ValueSize) : bytes.Slice(0, type.Size);
+            payload.CopyTo(_mem.AsSpan(obj + ObjectHeaderSize, payload.Length));
+            return obj;
+        }
+
+        private void ReadSegments(Span<byte> bytes, ImmutableArray<AbiRegisterSegment> segments, byte rs1, byte rs2, byte rs3)
+        {
+            Span<byte> raw = stackalloc byte[8];
+            for (int i = 0; i < segments.Length; i++)
+            {
+                byte reg = i switch { 0 => rs1, 1 => rs2, _ => rs3 };
+                BinaryPrimitives.WriteInt64LittleEndian(raw, RegisterVmIsa.IsFloatRegister(reg) ? GetFpr(reg) : GetGpr(reg));
+                raw.Slice(0, segments[i].Size).CopyTo(bytes.Slice(segments[i].Offset, segments[i].Size));
+            }
+        }
+
+        // Unboxing to Nullable<T> accepts null or a boxed T and rebuilds the nullable in fresh storage.
+        private int UnboxNullable(long objRef, TypeLayoutRecord type, NullableLayout nullable)
+        {
+            var value = new byte[nullable.ValueSize];
+            if (objRef != 0)
+            {
+                if (GetObjectRuntimeTypeId(objRef) != nullable.Underlying.TypeId)
+                    throw new InvalidCastException();
+                _mem.AsSpan(checked((int)objRef + ObjectHeaderSize), nullable.ValueSize).CopyTo(value);
+            }
+            int payload = AllocBoxedValueObject(type) + ObjectHeaderSize;
+            if (objRef != 0)
+            {
+                _mem[payload + nullable.HasValueOffset] = 1;
+                value.CopyTo(_mem.AsSpan(payload + nullable.ValueOffset, nullable.ValueSize));
+            }
+            return payload;
         }
 
         private int BoxValue(RuntimeType type, byte sourceReg)
@@ -4176,6 +4319,8 @@ namespace Cnidaria.Cs
 
         private int UnboxAddress(long objRef, TypeLayoutRecord type)
         {
+            if (TryGetNullableLayout(type.RuntimeTypeId, out var nullable))
+                return UnboxNullable(objRef, type, nullable);
             if (objRef == 0) throw new NullReferenceException();
             int actualTypeId = GetObjectRuntimeTypeId(objRef);
             if (actualTypeId != type.RuntimeTypeId)
@@ -4328,6 +4473,20 @@ namespace Cnidaria.Cs
             for (int i = 0; i < value.Length; i++)
                 WriteU16(chars + i * 2, value[i]);
             return obj;
+        }
+
+        private string ReadStringLiteral(int blobOffset)
+        {
+            if (_stringLiterals.TryGetValue(blobOffset, out string? value))
+                return value;
+            var blob = _image.Blob.AsSpan();
+            int length = BinaryPrimitives.ReadInt32LittleEndian(blob.Slice(blobOffset));
+            var chars = new char[length];
+            for (int i = 0; i < length; i++)
+                chars[i] = (char)BinaryPrimitives.ReadUInt16LittleEndian(blob.Slice(blobOffset + 4 + i * 2));
+            value = new string(chars);
+            _stringLiterals.Add(blobOffset, value);
+            return value;
         }
 
         private int InternString(string value)
@@ -5078,10 +5237,10 @@ namespace Cnidaria.Cs
 
                 int fieldSize = StorageSizeOf(f.FieldType);
                 int rel = offset - f.Offset;
-                if ((uint)rel >= (uint)fieldSize)
+                if ((uint)rel >= (uint)(fieldSize * InlineArrayRepeat(type, f)))
                     continue;
 
-                return TryResolveGcCellTypeAtOffset(f.FieldType, rel, out cellType, depth + 1);
+                return TryResolveGcCellTypeAtOffset(f.FieldType, rel % fieldSize, out cellType, depth + 1);
             }
 
             return false;
@@ -5324,8 +5483,11 @@ namespace Cnidaria.Cs
             for (int i = 0; i < type.InstanceFields.Length; i++)
             {
                 RuntimeField f = type.InstanceFields[i];
-                if (!f.IsStatic)
-                    MarkManagedRefCellsInTypedStorage(abs + f.Offset, f.FieldType);
+                if (f.IsStatic)
+                    continue;
+                int fieldSize = StorageSizeOf(f.FieldType);
+                for (int e = InlineArrayRepeat(type, f) - 1; e >= 0; e--)
+                    MarkManagedRefCellsInTypedStorage(abs + f.Offset + e * fieldSize, f.FieldType);
             }
         }
 
@@ -5384,8 +5546,11 @@ namespace Cnidaria.Cs
             for (int i = 0; i < type.InstanceFields.Length; i++)
             {
                 RuntimeField f = type.InstanceFields[i];
-                if (!f.IsStatic)
-                    VisitManagedRefCellsInTypedStorage(abs + f.Offset, f.FieldType, visitor);
+                if (f.IsStatic)
+                    continue;
+                int fieldSize = StorageSizeOf(f.FieldType);
+                for (int e = InlineArrayRepeat(type, f) - 1; e >= 0; e--)
+                    VisitManagedRefCellsInTypedStorage(abs + f.Offset + e * fieldSize, f.FieldType, visitor);
             }
         }
 
@@ -5517,8 +5682,11 @@ namespace Cnidaria.Cs
             for (int i = 0; i < type.InstanceFields.Length; i++)
             {
                 RuntimeField f = type.InstanceFields[i];
-                if (!f.IsStatic)
-                    UpdateManagedRefCellsInTypedStorage(abs + f.Offset, f.FieldType);
+                if (f.IsStatic)
+                    continue;
+                int fieldSize = StorageSizeOf(f.FieldType);
+                for (int e = InlineArrayRepeat(type, f) - 1; e >= 0; e--)
+                    UpdateManagedRefCellsInTypedStorage(abs + f.Offset + e * fieldSize, f.FieldType);
             }
         }
 
@@ -6255,6 +6423,26 @@ namespace Cnidaria.Cs
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        // Identity hashes live above the two GC flag bits of the header, so they move with a compacted object
+        private int GetIdentityHash(int obj, bool assign)
+        {
+            int flags = ReadI32(obj + 4);
+            int hash = (int)((uint)flags >> IdentityHashShift);
+            if (hash == 0 && assign)
+            {
+                do
+                {
+                    _identityHashState ^= _identityHashState << 13;
+                    _identityHashState ^= _identityHashState >> 17;
+                    _identityHashState ^= _identityHashState << 5;
+                    hash = (int)(_identityHashState >> IdentityHashShift);
+                }
+                while (hash == 0);
+                WriteI32(obj + 4, flags | (hash << IdentityHashShift));
+            }
+            return hash;
+        }
+
         private void SetReturnI4(int value)
             => SetGpr(MachineRegisters.ReturnValue0, value);
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -6639,6 +6827,8 @@ namespace Cnidaria.Cs
         private bool IsAssignableTo(RuntimeType source, RuntimeType target)
         {
             if (ReferenceEquals(source, target) || source.TypeId == target.TypeId) return true;
+            if (TryGetNullableLayout(target.TypeId, out var nullable))
+                return source.TypeId == nullable.Underlying.TypeId;
 
             if (target.Namespace == "System" && target.Name == "Object")
                 return true;
@@ -6652,10 +6842,8 @@ namespace Cnidaria.Cs
                 if (cur.TypeId == target.TypeId) return true;
             }
 
-            for (int i = 0; i < source.Interfaces.Length; i++)
-            {
-                if (source.Interfaces[i].TypeId == target.TypeId) return true;
-            }
+            if (target.Kind == RuntimeTypeKind.Interface)
+                return _rts.IsAssignableTo(source, target);
 
             if (source.Kind == RuntimeTypeKind.Array && target.Kind == RuntimeTypeKind.Array)
             {
@@ -6677,6 +6865,9 @@ namespace Cnidaria.Cs
                 || type.Kind == RuntimeTypeKind.TypeParam
                 || type.ContainsGcPointers;
         }
+
+        private static int InlineArrayRepeat(RuntimeType type, RuntimeField field)
+            => type.InlineArrayLength > 0 && ReferenceEquals(field, type.InlineArrayElementField) ? type.InlineArrayLength : 1;
 
         private int StorageSizeOf(RuntimeType type)
             => type.IsReferenceType || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam

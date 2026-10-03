@@ -2,13 +2,16 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
+using System.Text;
 
 namespace Cnidaria.C;
 
 ///<summary>Builds a syntax tree from preprocessed tokens</summary>
 public sealed class Parser
 {
-    private readonly Lexer _lexer;
+    private readonly Lexer? _lexer;
+    private readonly ImmutableArray<SyntaxToken> _fixedTokens;
+    private int _fixedPosition;
     private readonly TypeNameTable _typeNames;
     private readonly List<SyntaxToken> _buffer = new();
     private readonly List<SyntaxDiagnostic> _diagnostics = new();
@@ -20,6 +23,19 @@ public sealed class Parser
     {
         _lexer = lexer ?? throw new ArgumentNullException(nameof(lexer));
         _typeNames = typeNames ?? throw new ArgumentNullException(nameof(typeNames));
+    }
+
+    private Parser(ImmutableArray<SyntaxToken> tokens)
+    {
+        _fixedTokens = tokens;
+        _typeNames = new TypeNameTable();
+    }
+
+    internal static ExpressionSyntax? ParseExpression(ImmutableArray<SyntaxToken> tokens)
+    {
+        var parser = new Parser(tokens);
+        var expression = parser.ParseExpression();
+        return parser.Diagnostics.Count == 0 && parser.Current.Kind == SyntaxKind.EndOfFileToken ? expression : null;
     }
 
     public IReadOnlyList<SyntaxDiagnostic> Diagnostics => _diagnostics;
@@ -769,6 +785,32 @@ public sealed class Parser
             semicolon);
     }
 
+    // Adjacent string literals are one literal, which takes the encoding prefix any of them has
+    private SyntaxToken ParseStringLiteral()
+    {
+        var first = NextToken();
+        if (!IsStringLiteral(Current.Kind))
+            return first;
+
+        var kind = first.Kind;
+        var value = new StringBuilder(first.Value as string);
+        var last = first;
+        while (IsStringLiteral(Current.Kind))
+        {
+            last = NextToken();
+            if (last.Kind != SyntaxKind.StringLiteralToken && last.Kind != kind)
+            {
+                if (kind == SyntaxKind.StringLiteralToken)
+                    kind = last.Kind;
+                else
+                    Report(last, "Adjacent string literals have different encoding prefixes.");
+            }
+            value.Append(last.Value as string);
+        }
+
+        return new SyntaxToken(kind, first.Position, first.Text, value.ToString(), first.LeadingTrivia, last.TrailingTrivia, first.Ordinal);
+    }
+
     private ImmutableArray<SyntaxToken> ParseStringLiteralSequence(string diagnostic)
     {
         var literals = ImmutableArray.CreateBuilder<SyntaxToken>();
@@ -1004,6 +1046,18 @@ public sealed class Parser
         return ParseUnaryExpression();
     }
 
+    private OffsetofExpressionSyntax ParseOffsetofExpression()
+    {
+        var keyword = NextToken();
+        var openParen = MatchToken(SyntaxKind.OpenParenToken);
+        var typeNameTokens = ReadTypeNameTokens(stopAtComma: true);
+        var comma = MatchToken(SyntaxKind.CommaToken);
+        var memberTokens = ReadTypeNameTokens();
+        var closeParen = MatchToken(SyntaxKind.CloseParenToken);
+
+        return new OffsetofExpressionSyntax(keyword, openParen, typeNameTokens, comma, memberTokens, closeParen);
+    }
+
     private SizeofExpressionSyntax ParseSizeofExpression()
     {
         var keyword = NextToken();
@@ -1125,9 +1179,19 @@ public sealed class Parser
             case SyntaxKind.UnderscoreGenericKeyword:
                 return ParseGenericSelectionExpression();
 
+            case SyntaxKind.BuiltinOffsetofKeyword:
+                return ParseOffsetofExpression();
+
             case SyntaxKind.IdentifierToken:
             case SyntaxKind.TypedefNameToken:
                 return new NameExpressionSyntax(NextToken());
+
+            case SyntaxKind.StringLiteralToken:
+            case SyntaxKind.WideStringLiteralToken:
+            case SyntaxKind.Utf8StringLiteralToken:
+            case SyntaxKind.Utf16StringLiteralToken:
+            case SyntaxKind.Utf32StringLiteralToken:
+                return new LiteralExpressionSyntax(ParseStringLiteral());
 
             case SyntaxKind.IntegerLiteralToken:
             case SyntaxKind.FloatingLiteralToken:
@@ -1136,11 +1200,6 @@ public sealed class Parser
             case SyntaxKind.Utf8CharacterLiteralToken:
             case SyntaxKind.Utf16CharacterLiteralToken:
             case SyntaxKind.Utf32CharacterLiteralToken:
-            case SyntaxKind.StringLiteralToken:
-            case SyntaxKind.WideStringLiteralToken:
-            case SyntaxKind.Utf8StringLiteralToken:
-            case SyntaxKind.Utf16StringLiteralToken:
-            case SyntaxKind.Utf32StringLiteralToken:
             case SyntaxKind.TrueKeyword:
             case SyntaxKind.FalseKeyword:
             case SyntaxKind.NullptrKeyword:
@@ -1235,7 +1294,7 @@ public sealed class Parser
         return new StatementExpressionSyntax(openParen, statement, closeParen);
     }
 
-    private ImmutableArray<SyntaxToken> ReadTypeNameTokens()
+    private ImmutableArray<SyntaxToken> ReadTypeNameTokens(bool stopAtComma = false)
     {
         var tokens = RentTokenList();
         var parenDepth = 0;
@@ -1247,7 +1306,7 @@ public sealed class Parser
             if (parenDepth == 0 &&
                 bracketDepth == 0 &&
                 braceDepth == 0 &&
-                Current.Kind == SyntaxKind.CloseParenToken)
+                (Current.Kind == SyntaxKind.CloseParenToken || stopAtComma && Current.Kind == SyntaxKind.CommaToken))
             {
                 break;
             }
@@ -1487,10 +1546,19 @@ public sealed class Parser
             }
 
             while (index >= _buffer.Count)
-                _buffer.Add(_lexer.NextToken());
+                _buffer.Add(_lexer is not null ? _lexer.NextToken() : NextFixedToken());
         }
 
         return _buffer[index];
+    }
+
+    private SyntaxToken NextFixedToken()
+    {
+        if (_fixedPosition < _fixedTokens.Length)
+            return _fixedTokens[_fixedPosition++];
+
+        var end = _fixedTokens.IsDefaultOrEmpty ? 0 : _fixedTokens[^1].Span.End;
+        return new SyntaxToken(SyntaxKind.EndOfFileToken, end, string.Empty, null, ImmutableArray<SyntaxTrivia>.Empty, ImmutableArray<SyntaxTrivia>.Empty);
     }
 
     private SyntaxToken NextToken()
@@ -1667,7 +1735,8 @@ public sealed class Parser
     private bool IsCastExpressionStart()
     {
         return Current.Kind == SyntaxKind.OpenParenToken &&
-               IsTypeNameStart(Peek(1));
+               IsTypeNameStart(Peek(1)) &&
+               !IsCompoundLiteralExpressionStart();
     }
 
     // The closing type parenthesis must be followed by an initializer brace

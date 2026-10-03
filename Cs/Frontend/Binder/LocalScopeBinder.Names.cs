@@ -146,15 +146,9 @@ namespace Cnidaria.Cs
         {
             var name = id.Identifier.ValueText ?? "";
 
-            if (TryGetLocalFromEnclosingScopes(name, out var local))
+            if (TryGetLocalOrParameterFromEnclosingScopes(name, out var local, out var param))
             {
-                value = new BoundLocalExpression(id, local!);
-                return true;
-            }
-
-            if (TryGetParameterFromEnclosingScopes(name, out var param))
-            {
-                value = new BoundParameterExpression(id, param!);
+                value = local is not null ? new BoundLocalExpression(id, local) : new BoundParameterExpression(id, param!);
                 return true;
             }
 
@@ -313,11 +307,8 @@ namespace Cnidaria.Cs
         {
             var name = id.Identifier.ValueText ?? "";
 
-            if (TryGetLocalFromEnclosingScopes(name, out var local))
-                return new BoundLocalExpression(id, local!);
-
-            if (TryGetParameterFromEnclosingScopes(name, out var param))
-                return new BoundParameterExpression(id, param!);
+            if (TryGetLocalOrParameterFromEnclosingScopes(name, out var local, out var param))
+                return local is not null ? new BoundLocalExpression(id, local) : new BoundParameterExpression(id, param!);
 
             if (TryBindUnqualifiedMember(id, name, BindValueKind.RValue, context, diagnostics, out var memberExpr))
                 return memberExpr;
@@ -416,6 +407,12 @@ namespace Cnidaria.Cs
             if (containingType is not null)
             {
                 var typeCandidates = LookupMethods(containingType, name);
+                // An enclosing type's static methods are in scope; its instance methods have no receiver here
+                for (var outer = containingType.ContainingSymbol as NamedTypeSymbol; typeCandidates.IsDefaultOrEmpty && outer is not null; outer = outer.ContainingSymbol as NamedTypeSymbol)
+                {
+                    typeCandidates = LookupMethods(outer, name).Where(m => m.IsStatic).ToImmutableArray();
+                    inStaticContext |= !typeCandidates.IsDefaultOrEmpty;
+                }
                 if (!typeCandidates.IsDefaultOrEmpty)
                 {
                     foundInContainingType = true;
@@ -529,24 +526,7 @@ namespace Cnidaria.Cs
             if (arityMatches.IsDefaultOrEmpty)
                 return ImmutableArray<MethodSymbol>.Empty;
 
-            var constructed = ImmutableArray.CreateBuilder<MethodSymbol>(arityMatches.Length);
-            for (int i = 0; i < arityMatches.Length; i++)
-            {
-                var def = arityMatches[i];
-                if (!GenericConstraintChecker.CheckMethodInstantiation(
-                    methodDefinition: def,
-                    typeArguments: explicitTypeArgs,
-                    getArgSpan: a => genericName.TypeArgumentList.Arguments[a].Span,
-                    context: context,
-                    diagnostics: diagnostics))
-                {
-                    continue;
-                }
-
-                constructed.Add(new ConstructedMethodSymbol(def, explicitTypeArgs, context.Compilation.TypeManager));
-            }
-
-            return constructed.Count == 0 ? ImmutableArray<MethodSymbol>.Empty : constructed.ToImmutable();
+            return ConstructWithExplicitTypeArguments(arityMatches, explicitTypeArgs, genericName.TypeArgumentList, context, diagnostics);
         }
 
         private bool TryBindUnqualifiedMember(
@@ -559,10 +539,17 @@ namespace Cnidaria.Cs
         {
             result = null!;
 
+            // Each enclosing type is searched in turn; an outer type's instance members have no receiver here
+            NamedTypeSymbol? innermostType = null;
             NamedTypeSymbol? containingType = null;
+            var members = ImmutableArray<Symbol>.Empty;
             for (Symbol? s = context.ContainingSymbol; s != null; s = s.ContainingSymbol)
             {
-                if (s is NamedTypeSymbol nt)
+                if (s is not NamedTypeSymbol nt)
+                    continue;
+                innermostType ??= nt;
+                members = LookupMembers(nt, name);
+                if (!members.IsDefaultOrEmpty)
                 {
                     containingType = nt;
                     break;
@@ -571,17 +558,13 @@ namespace Cnidaria.Cs
             if (containingType is null)
                 return false;
 
-            bool inStaticContext = context.ContainingSymbol switch
+            bool inStaticContext = !ReferenceEquals(containingType, innermostType) || context.ContainingSymbol switch
             {
                 MethodSymbol m => m.IsStatic,
                 FieldSymbol f => f.IsStatic,
                 PropertySymbol p => p.IsStatic,
                 _ => false
             };
-
-            var members = LookupMembers(containingType, name);
-            if (members.IsDefaultOrEmpty)
-                return false;
 
             var accessibleMembers = FilterAccessibleMembers(members, context);
             if (accessibleMembers.IsDefaultOrEmpty)
@@ -1634,24 +1617,7 @@ namespace Cnidaria.Cs
                         return new BoundBadExpression(invocation);
                     }
 
-                    var constructed = ImmutableArray.CreateBuilder<MethodSymbol>(arityMatches.Length);
-                    for (int i = 0; i < arityMatches.Length; i++)
-                    {
-                        var def = arityMatches[i];
-                        if (!GenericConstraintChecker.CheckMethodInstantiation(
-                            def,
-                            explicitTypeArgs,
-                            a => genericName.TypeArgumentList.Arguments[a].Span,
-                            context,
-                            diagnostics))
-                        {
-                            continue;
-                        }
-
-                        constructed.Add(new ConstructedMethodSymbol(def, explicitTypeArgs, context.Compilation.TypeManager));
-                    }
-
-                    candidates = constructed.ToImmutable();
+                    candidates = ConstructWithExplicitTypeArguments(arityMatches, explicitTypeArgs, genericName.TypeArgumentList, context, diagnostics);
                 }
 
                 if (TryResolveOverload(
@@ -2141,9 +2107,12 @@ namespace Cnidaria.Cs
                 return BindInlineArrayElementAccess(syntax, receiver, argumentList, valueKind, context, diagnostics, inlineArray);
 
             var receiverType = GetReceiverTypeForMemberLookup(receiver.Type);
-            if (receiverType is not null)
+            if (receiverType is not null || receiver.Type is TypeParameterSymbol)
             {
-                var indexers = FilterAccessibleIndexers(LookupIndexers(receiverType), context)
+                var indexerCandidates = receiver.Type is TypeParameterSymbol typeParameter
+                    ? LookupConstraintIndexers(typeParameter)
+                    : LookupIndexers(receiverType!);
+                var indexers = FilterAccessibleIndexers(indexerCandidates, context)
                     .Where(p => !p.IsStatic)
                     .ToImmutableArray();
 

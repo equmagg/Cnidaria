@@ -98,7 +98,7 @@ namespace Cnidaria.Cs
                 nextTreeId++,
                 GenTreeKind.Branch,
                 preheaderPc,
-                BytecodeOp.Br,
+                GenTreeOperator.None,
                 type: null,
                 stackKind: GenStackKind.Void,
                 flags: GenTreeFlags.ControlFlow | GenTreeFlags.Ordered,
@@ -194,7 +194,7 @@ namespace Cnidaria.Cs
                 nextTreeId++,
                 GenTreeKind.Branch,
                 latchPc,
-                BytecodeOp.Br,
+                GenTreeOperator.None,
                 type: null,
                 stackKind: GenStackKind.Void,
                 flags: GenTreeFlags.ControlFlow | GenTreeFlags.Ordered,
@@ -283,7 +283,7 @@ namespace Cnidaria.Cs
                 nextTreeId++,
                 GenTreeKind.Branch,
                 newExitPc,
-                BytecodeOp.Br,
+                GenTreeOperator.None,
                 type: null,
                 stackKind: GenStackKind.Void,
                 flags: GenTreeFlags.ControlFlow | GenTreeFlags.Ordered,
@@ -519,7 +519,7 @@ namespace Cnidaria.Cs
                         nextTreeId++,
                         GenTreeKind.Branch,
                         block.EndPcExclusive,
-                        BytecodeOp.Br,
+                        GenTreeOperator.None,
                         type: null,
                         stackKind: GenStackKind.Void,
                         flags: GenTreeFlags.ControlFlow | GenTreeFlags.Ordered,
@@ -570,7 +570,7 @@ namespace Cnidaria.Cs
                 if (conditional.TargetBlockId >= 0 &&
                     splitInfo.TryGetValue((block.Id, conditional.TargetBlockId), out var conditionalInfo))
                 {
-                    rewrittenConditional = CloneWithTarget(conditional, conditional.Kind, conditional.SourceOp, conditionalInfo.SplitPc, conditionalInfo.SplitBlockId);
+                    rewrittenConditional = CloneWithTarget(conditional, conditional.Kind, conditional.Operator, conditionalInfo.SplitPc, conditionalInfo.SplitBlockId);
                     changed = true;
                 }
 
@@ -579,7 +579,7 @@ namespace Cnidaria.Cs
                     if (appendedFallThrough.TargetBlockId >= 0 &&
                         splitInfo.TryGetValue((block.Id, appendedFallThrough.TargetBlockId), out var appendedInfo))
                     {
-                        rewrittenAppended = CloneWithTarget(appendedFallThrough, appendedFallThrough.Kind, appendedFallThrough.SourceOp, appendedInfo.SplitPc, appendedInfo.SplitBlockId);
+                        rewrittenAppended = CloneWithTarget(appendedFallThrough, appendedFallThrough.Kind, appendedFallThrough.Operator, appendedInfo.SplitPc, appendedInfo.SplitBlockId);
                         changed = true;
                     }
                 }
@@ -650,7 +650,7 @@ namespace Cnidaria.Cs
             if (terminator.TargetBlockId >= 0 &&
                 splitInfo.TryGetValue((block.Id, terminator.TargetBlockId), out var targetInfo))
             {
-                rewritten = CloneWithTarget(terminator, terminator.Kind, terminator.SourceOp, targetInfo.SplitPc, targetInfo.SplitBlockId);
+                rewritten = CloneWithTarget(terminator, terminator.Kind, terminator.Operator, targetInfo.SplitPc, targetInfo.SplitBlockId);
                 changed = true;
             }
 
@@ -679,7 +679,7 @@ namespace Cnidaria.Cs
                 nextTreeId++,
                 GenTreeKind.Branch,
                 source.Pc,
-                BytecodeOp.Br,
+                GenTreeOperator.None,
                 type: null,
                 stackKind: GenStackKind.Void,
                 flags: GenTreeFlags.ControlFlow | GenTreeFlags.Ordered,
@@ -697,7 +697,7 @@ namespace Cnidaria.Cs
                 nextTreeId++,
                 GenTreeKind.Branch,
                 info.SplitPc,
-                BytecodeOp.Br,
+                GenTreeOperator.None,
                 type: null,
                 stackKind: GenStackKind.Void,
                 flags: GenTreeFlags.ControlFlow | GenTreeFlags.Ordered,
@@ -727,12 +727,12 @@ namespace Cnidaria.Cs
             return flags;
         }
 
-        private static GenTree CloneWithTarget(GenTree source, GenTreeKind kind, BytecodeOp sourceOp, int targetPc, int targetBlockId)
+        private static GenTree CloneWithTarget(GenTree source, GenTreeKind kind, GenTreeOperator oper, int targetPc, int targetBlockId)
             => new GenTree(
                 source.Id,
                 kind,
                 source.Pc,
-                sourceOp,
+                oper,
                 source.Type,
                 source.StackKind,
                 source.Flags,
@@ -923,7 +923,7 @@ namespace Cnidaria.Cs
                 node.Id,
                 node.Kind,
                 node.Pc,
-                node.SourceOp,
+                node.Operator,
                 node.Type,
                 node.StackKind,
                 node.Flags,

@@ -10,6 +10,33 @@ namespace Cnidaria.Cs
     /// <summary>Converts bound method bodies into the reduced forms consumed by code generation</summary>
     internal static class IRLowering
     {
+        internal static BoundStatement? CreateImplicitBaseConstructorCall(MethodSymbol ctor, SyntaxNode syntax)
+        {
+            if (ctor.IsStatic ||
+                ctor.ContainingSymbol is not NamedTypeSymbol { TypeKind: TypeKind.Class } containingType ||
+                containingType.BaseType is not NamedTypeSymbol baseType ||
+                FindParameterlessInstanceConstructor(baseType) is not MethodSymbol baseCtor)
+            {
+                return null;
+            }
+            var thisExpr = new BoundThisExpression(new ThisExpressionSyntax(default), containingType);
+            return new BoundExpressionStatement(syntax, new BoundCallExpression(syntax, thisExpr, baseCtor, ImmutableArray<BoundExpression>.Empty));
+        }
+        private static MethodSymbol? FindParameterlessInstanceConstructor(NamedTypeSymbol type)
+        {
+            var members = type.GetMembers();
+            for (int i = 0; i < members.Length; i++)
+            {
+                if (members[i] is MethodSymbol m &&
+                     m.IsConstructor &&
+                     !m.IsStatic &&
+                     m.Parameters.Length == 0)
+                {
+                    return m;
+                }
+            }
+            return null;
+        }
         /// <summary>Converts bound method bodies into the reduced forms consumed by code generation</summary>
         public static BoundMethodBody Rewrite(Compilation compilation, BoundMethodBody methodBody)
         {
@@ -1274,7 +1301,7 @@ namespace Cnidaria.Cs
                     isConst: false,
                     isReadOnly: false,
                     isUnsafe: false,
-                    declaredAccessibility: Accessibility.Private,
+                    declaredAccessibility: Accessibility.Public,
                     location: new Location(tree, syntax.Span),
                     declarationRef: declRef,
                     attributeOwnerDeclarationRef: declRef);
@@ -1561,17 +1588,29 @@ namespace Cnidaria.Cs
                 backingField = null!;
                 return false;
             }
-            private static bool TryGetAutoPropertyBackingField(PropertySymbol prop, out FieldSymbol backingField)
+            private bool TryGetAutoPropertyBackingField(PropertySymbol prop, out FieldSymbol backingField)
             {
                 if (prop is SourcePropertySymbol sp &&
                     sp.BackingFieldOpt is FieldSymbol bf &&
-                    HasOnlySemicolonAccessors(sp))
+                    HasOnlySemicolonAccessors(sp) &&
+                    (sp.GetMethod ?? sp.SetMethod) is MethodSymbol { IsVirtual: false, IsAbstract: false, IsOverride: false } &&
+                    IsWithinType(sp.ContainingSymbol))
                 {
                     backingField = bf;
                     return true;
                 }
 
                 backingField = null!;
+                return false;
+            }
+            // Backing fields are private, so only the declaring type and its nested types may access them.
+            private bool IsWithinType(Symbol? type)
+            {
+                for (Symbol? scope = _method.ContainingSymbol; scope is not null; scope = scope.ContainingSymbol)
+                {
+                    if (ReferenceEquals(scope, type))
+                        return true;
+                }
                 return false;
             }
             private static bool HasOnlySemicolonAccessors(SourcePropertySymbol property)
@@ -1763,23 +1802,10 @@ namespace Cnidaria.Cs
                 try
                 {
                     var rewritten = base.RewriteMethodBody(node);
-                    if (!_method.IsConstructor || _method.IsStatic)
+                    if (!_method.IsConstructor || HasConstructorInitializer(rewritten.Body))
                         return rewritten;
-                    if (_method.ContainingSymbol is not NamedTypeSymbol containingType)
+                    if (CreateImplicitBaseConstructorCall(_method, node.Syntax) is not BoundStatement stmt)
                         return rewritten;
-                    if (containingType.TypeKind != TypeKind.Class)
-                        return rewritten;
-                    var baseType = containingType.BaseType as NamedTypeSymbol;
-                    if (baseType is null)
-                        return rewritten;
-                    if (BodyStartsWithConstructorInitializer(rewritten.Body))
-                        return rewritten;
-                    var baseCtor = FindParameterlessInstanceConstructor(baseType);
-                    if (baseCtor is null)
-                        return rewritten;
-                    var thisExpr = new BoundThisExpression(new ThisExpressionSyntax(default), containingType);
-                    var call = new BoundCallExpression(node.Syntax, thisExpr, baseCtor, ImmutableArray<BoundExpression>.Empty);
-                    var stmt = new BoundExpressionStatement(node.Syntax, call);
                     var newBody = PrependStatement(rewritten.Body, stmt);
                     if (!ReferenceEquals(newBody, rewritten.Body))
                         return new BoundMethodBody(rewritten.Syntax, rewritten.Method, newBody);
@@ -1802,34 +1828,21 @@ namespace Cnidaria.Cs
                 }
                 return new BoundBlockStatement(body.Syntax, ImmutableArray.Create(statement, body));
             }
-            private static bool BodyStartsWithConstructorInitializer(BoundStatement body)
+            // Field initializers may precede the initializer call, so every top-level statement is checked.
+            private static bool HasConstructorInitializer(BoundStatement body)
             {
-                if (body is BoundBlockStatement block && block.Statements.Length > 0)
+                if (body is not BoundBlockStatement block)
+                    return false;
+                foreach (var statement in block.Statements)
                 {
-                    if (block.Statements[0] is BoundExpressionStatement es &&
-                         es.Expression is BoundCallExpression call &&
-                         call.Method.IsConstructor &&
-                         call.ReceiverOpt is BoundThisExpression)
+                    if (statement is BoundExpressionStatement { Expression: BoundCallExpression call } &&
+                        call.Method.IsConstructor &&
+                        call.ReceiverOpt is BoundThisExpression or BoundBaseExpression)
                     {
                         return true;
                     }
                 }
                 return false;
-            }
-            private static MethodSymbol? FindParameterlessInstanceConstructor(NamedTypeSymbol type)
-            {
-                var members = type.GetMembers();
-                for (int i = 0; i < members.Length; i++)
-                {
-                    if (members[i] is MethodSymbol m &&
-                         m.IsConstructor &&
-                         !m.IsStatic &&
-                         m.Parameters.Length == 0)
-                    {
-                        return m;
-                    }
-                }
-                return null;
             }
             protected override BoundStatement RewriteBlockStatement(BoundBlockStatement node)
             {
@@ -2565,6 +2578,7 @@ namespace Cnidaria.Cs
                     BoundForEachEnumeratorKind.Array => LowerArrayForEach(node, collection, body),
                     BoundForEachEnumeratorKind.String => LowerStringForEach(node, collection, body),
                     BoundForEachEnumeratorKind.Span => LowerSpanForEach(node, collection, body),
+                    BoundForEachEnumeratorKind.InlineArray => LowerInlineArrayForEach(node, collection, body),
                     BoundForEachEnumeratorKind.Pattern or BoundForEachEnumeratorKind.Interface => LowerEnumeratorForEach(node, collection, body),
                     _ => throw new NotSupportedException($"Unexpected foreach enumerator kind: {node.EnumeratorKind}")
                 };
@@ -2750,6 +2764,71 @@ namespace Cnidaria.Cs
                 builder.Add(new BoundLabelStatement(node.Syntax, GenerateLabel("foreach_span_check")));
 
                 var checkLabel = ((BoundLabelStatement)builder[2]).Label;
+                var branch = MakeConditionalGoto(node.Syntax, condition, node.BreakLabel, jumpIfTrue: false);
+                if (branch is not BoundEmptyStatement)
+                    builder.Add(branch);
+
+                builder.Add(new BoundLocalDeclarationStatement(node.Syntax, node.IterationVariable, current));
+                builder.Add(body);
+                builder.Add(new BoundLabelStatement(node.Syntax, node.ContinueLabel));
+                builder.Add(new BoundExpressionStatement(node.Syntax, RewriteExpression(increment)));
+                builder.Add(new BoundGotoStatement(node.Syntax, checkLabel));
+                builder.Add(new BoundLabelStatement(node.Syntax, node.BreakLabel));
+
+                return new BoundBlockStatement(node.Syntax, builder.ToImmutable());
+            }
+
+            private BoundStatement LowerInlineArrayForEach(
+                BoundForEachStatement node,
+                BoundExpression collection,
+                BoundStatement body)
+            {
+                if (!InlineArrayFacts.TryGetInfo(collection.Type, out var inlineArray))
+                    throw new InvalidOperationException("Expected an inline array expression for foreach inline array lowering.");
+
+                var intType = _compilation.GetSpecialType(SpecialType.System_Int32);
+                var boolType = _compilation.GetSpecialType(SpecialType.System_Boolean);
+                var builder = ImmutableArray.CreateBuilder<BoundStatement>();
+
+                // Like Roslyn's span over the buffer, a variable is iterated in place; any other value is copied once.
+                BoundExpression buffer = collection;
+                if (collection is not (BoundLocalExpression or BoundParameterExpression))
+                {
+                    var bufferTemp = CreateTempLocal(collection.Type);
+                    builder.Add(new BoundLocalDeclarationStatement(node.Syntax, bufferTemp, collection));
+                    buffer = new BoundLocalExpression(node.Syntax, bufferTemp);
+                }
+
+                var indexTemp = CreateTempLocal(intType);
+                var indexExpr = new BoundLocalExpression(node.Syntax, indexTemp);
+                var condition = new BoundBinaryExpression(
+                    node.Syntax,
+                    BoundBinaryOperatorKind.LessThan,
+                    boolType,
+                    indexExpr,
+                    new BoundLiteralExpression(node.Syntax, intType, inlineArray.Length),
+                    Optional<object>.None);
+
+                BoundExpression current = new BoundInlineArrayElementAccessExpression(
+                    node.Syntax, buffer, inlineArray.ElementField, indexExpr, inlineArray.Length, isLValue: false);
+                current = ApplyConversionIfNeeded(node.Syntax, current, node.IterationVariable.Type, node.IterationConversion);
+                current = RewriteExpression(current);
+
+                var increment = new BoundAssignmentExpression(
+                    node.Syntax,
+                    indexExpr,
+                    new BoundBinaryExpression(
+                        node.Syntax,
+                        BoundBinaryOperatorKind.Add,
+                        intType,
+                        indexExpr,
+                        new BoundLiteralExpression(node.Syntax, intType, 1),
+                        Optional<object>.None,
+                        isChecked: GetEffectiveIsChecked(false)));
+
+                builder.Add(new BoundLocalDeclarationStatement(node.Syntax, indexTemp, new BoundLiteralExpression(node.Syntax, intType, 0)));
+                var checkLabel = GenerateLabel("foreach_inline_array_check");
+                builder.Add(new BoundLabelStatement(node.Syntax, checkLabel));
                 var branch = MakeConditionalGoto(node.Syntax, condition, node.BreakLabel, jumpIfTrue: false);
                 if (branch is not BoundEmptyStatement)
                     builder.Add(branch);
@@ -3624,6 +3703,9 @@ namespace Cnidaria.Cs
             {
                 var effectiveChecked = GetEffectiveIsChecked(node.IsChecked);
 
+                if (node.Conversion.Kind == ConversionKind.ImplicitInlineArray)
+                    return LowerInlineArrayToSpan(node);
+
                 // Lower tuple conversions
                 if ((node.Conversion.Kind == ConversionKind.ImplicitTuple || node.Conversion.Kind == ConversionKind.ExplicitTuple) &&
                     node.Type is TupleTypeSymbol toTuple &&
@@ -4488,7 +4570,7 @@ namespace Cnidaria.Cs
 
                     var kind =
                         e.Type is NullTypeSymbol ? ConversionKind.NullLiteral :
-                        e.Type.IsValueType ? ConversionKind.Boxing :
+                        e.Type.IsValueType || e.Type is TypeParameterSymbol ? ConversionKind.Boxing :
                         ConversionKind.ImplicitReference;
 
                     return new BoundConversionExpression(
@@ -4713,7 +4795,7 @@ namespace Cnidaria.Cs
                 if (node.Member is PropertySymbol p && p.GetMethod is MethodSymbol getMethod)
                 {
                     var receiver = node.ReceiverOpt is null ? null : RewriteExpression(node.ReceiverOpt);
-                    return new BoundCallExpression(node.Syntax, receiver, getMethod, ImmutableArray<BoundExpression>.Empty);
+                    return new BoundCallExpression(node.Syntax, receiver, getMethod, ImmutableArray<BoundExpression>.Empty, node.ConstrainedToTypeOpt);
                 }
 
                 return base.RewriteMemberAccessExpression(node);
@@ -4726,7 +4808,7 @@ namespace Cnidaria.Cs
                 var args = RewriteExpressions(node.Arguments, out var argsChanged);
                 if (ReferenceEquals(receiver, node.ReceiverOpt) && !argsChanged)
                     return node;
-                return new BoundCallExpression(node.Syntax, receiver, node.Method, args);
+                return new BoundCallExpression(node.Syntax, receiver, node.Method, args, node.ConstrainedToTypeOpt);
             }
             protected override BoundExpression RewriteInlineArrayElementAccessExpression(BoundInlineArrayElementAccessExpression node)
             {
@@ -4764,22 +4846,19 @@ namespace Cnidaria.Cs
                 FieldSymbol elementField,
                 BoundExpression index)
             {
-                var exprSyntax = syntax as ExpressionSyntax
-                    ?? receiver.Syntax as ExpressionSyntax
-                    ?? throw new InvalidOperationException("Expected expression syntax for inline array element access.");
-
-                var fieldAccess = new BoundMemberAccessExpression(
-                    exprSyntax,
-                    receiver,
-                    elementField,
-                    elementField.Type,
-                    isLValue: true,
-                    constantValueOpt: Optional<object>.None);
-
+                // The element field is private to the buffer type; its offset is zero, so the buffer reference is reinterpreted instead.
+                var bufferRef = new BoundRefExpression(
+                    syntax,
+                    _compilation.CreateByRefType(receiver.Type),
+                    receiver);
                 var refFirst = new BoundRefExpression(
                     syntax,
                     _compilation.CreateByRefType(elementField.Type),
-                    fieldAccess);
+                    new BoundCallExpression(
+                        syntax,
+                        receiverOpt: null,
+                        RequireUnsafeAs(receiver.Type, elementField.Type),
+                        ImmutableArray.Create<BoundExpression>(bufferRef)));
 
                 var addMethod = RequireUnsafeAddRefInt(elementField.Type);
                 return new BoundCallExpression(
@@ -4789,6 +4868,53 @@ namespace Cnidaria.Cs
                     ImmutableArray.Create<BoundExpression>(refFirst, index));
             }
 
+            private BoundExpression LowerInlineArrayToSpan(BoundConversionExpression node)
+            {
+                if (!InlineArrayFacts.TryGetInfo(node.Operand.Type, out var inlineArray))
+                    throw new InvalidOperationException("Expected an inline array operand for an inline array conversion.");
+
+                var buffer = RewriteExpression(node.Operand);
+                var elementType = inlineArray.ElementType;
+                var bufferRef = new BoundRefExpression(node.Syntax, _compilation.CreateByRefType(buffer.Type), buffer);
+                var firstElement = new BoundRefExpression(
+                    node.Syntax,
+                    _compilation.CreateByRefType(elementType),
+                    new BoundCallExpression(node.Syntax, receiverOpt: null, RequireUnsafeAs(buffer.Type, elementType), ImmutableArray.Create<BoundExpression>(bufferRef)));
+
+                string factoryName = ((NamedTypeSymbol)node.Type).OriginalDefinition.Name == "Span" ? "CreateSpan" : "CreateReadOnlySpan";
+                var marshal = LookupTypeByMetadataName(_compilation, "System.Runtime.InteropServices", "MemoryMarshal", 0)
+                    ?? throw new InvalidOperationException("System.Runtime.InteropServices.MemoryMarshal was not found.");
+                foreach (var member in marshal.GetMembers())
+                {
+                    if (member is MethodSymbol { IsStatic: true } method &&
+                        method.Name == factoryName &&
+                        method.TypeParameters.Length == 1 &&
+                        method.Parameters.Length == 2)
+                    {
+                        var factory = new ConstructedMethodSymbol(method, ImmutableArray.Create(elementType), _compilation.TypeManager);
+                        var length = new BoundLiteralExpression(node.Syntax, _compilation.GetSpecialType(SpecialType.System_Int32), inlineArray.Length);
+                        return new BoundCallExpression(node.Syntax, receiverOpt: null, factory, ImmutableArray.Create<BoundExpression>(firstElement, length));
+                    }
+                }
+                throw new MissingMethodException($"System.Runtime.InteropServices.MemoryMarshal.{factoryName}<T>(ref T, int) was not found.");
+            }
+
+            private MethodSymbol RequireUnsafeAs(TypeSymbol from, TypeSymbol to)
+            {
+                var unsafeType = LookupTypeByMetadataName(_compilation, "System.Runtime.CompilerServices", "Unsafe", 0)
+                    ?? throw new InvalidOperationException("System.Runtime.CompilerServices.Unsafe was not found.");
+                foreach (var member in unsafeType.GetMembers())
+                {
+                    if (member is MethodSymbol { IsStatic: true, Name: "As" } method &&
+                        method.TypeParameters.Length == 2 &&
+                        method.Parameters.Length == 1 &&
+                        method.Parameters[0].Type is ByRefTypeSymbol)
+                    {
+                        return new ConstructedMethodSymbol(method, ImmutableArray.Create(from, to), _compilation.TypeManager);
+                    }
+                }
+                throw new MissingMethodException("System.Runtime.CompilerServices.Unsafe.As<TFrom, TTo>(ref TFrom) was not found.");
+            }
             private MethodSymbol RequireUnsafeAddRefInt(TypeSymbol elementType)
             {
                 if (_unsafeAddRefIntCache.TryGetValue(elementType, out var cached))
@@ -6014,7 +6140,7 @@ namespace Cnidaria.Cs
                     args.Add(new BoundLocalExpression(syntax, temp));
                 }
 
-                return new BoundCallExpression(syntax, receiver, call.Method, args.ToImmutable());
+                return new BoundCallExpression(syntax, receiver, call.Method, args.ToImmutable(), call.ConstrainedToTypeOpt);
             }
 
             private BoundExpression SpillLValueOperand(

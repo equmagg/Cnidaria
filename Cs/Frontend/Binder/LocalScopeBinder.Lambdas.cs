@@ -152,6 +152,82 @@ namespace Cnidaria.Cs
             return true;
         }
 
+        // The type a lambda body produces once its parameters have these types, for output type inference (C# 12.6.3.7)
+        private TypeSymbol? InferLambdaReturnType(BoundUnboundLambdaExpression lambda, ImmutableArray<TypeSymbol> parameterTypes, BindingContext context)
+        {
+            var syntax = (ExpressionSyntax)lambda.Syntax;
+            if (!TryGetAnonymousFunctionParts(syntax, out var parameterSyntaxes, out var hasExplicitParameterList, out var bodySyntax, out var explicitReturnType, out _, out var isAsync) ||
+                isAsync || (hasExplicitParameterList && parameterSyntaxes.Length != parameterTypes.Length))
+            {
+                return null;
+            }
+
+            var diagnostics = new DiagnosticBag();
+            var probeContext = WithRecorder(context, NullBindingRecorder.Instance);
+            if (explicitReturnType is not null)
+                return IsVar(explicitReturnType) ? null : BindType(explicitReturnType, probeContext, diagnostics);
+
+            var lambdaMethod = new LambdaMethodSymbol(
+                name: "<lambda>",
+                containing: context.ContainingSymbol,
+                returnType: context.Compilation.GetSpecialType(SpecialType.System_Object),
+                parameters: ImmutableArray<ParameterSymbol>.Empty,
+                locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, syntax.Span)),
+                isStatic: true,
+                isAsync: false,
+                returnsByRefReadonly: false);
+            var parameters = ImmutableArray.CreateBuilder<ParameterSymbol>(parameterTypes.Length);
+            for (int i = 0; i < parameterTypes.Length; i++)
+            {
+                string name = hasExplicitParameterList ? parameterSyntaxes[i].Identifier.ValueText ?? "" : "arg" + i.ToString();
+                var refKind = hasExplicitParameterList ? DeclarationBuilder.GetParameterRefKind(parameterSyntaxes[i]) : ParameterRefKind.None;
+                parameters.Add(new ParameterSymbol(name, lambdaMethod, parameterTypes[i], ImmutableArray<Location>.Empty, refKind: refKind));
+            }
+            lambdaMethod.SetParameters(parameters.ToImmutable());
+
+            var bodyBinder = new LocalScopeBinder(parent: this, flags: Flags | BinderFlags.InLambda, containing: lambdaMethod, inheritFlowFromParent: false);
+            var bodyContext = new BindingContext(context.Compilation, context.SemanticModel, lambdaMethod, NullBindingRecorder.Instance);
+            TypeSymbol? result = null;
+            if (bodySyntax is ExpressionSyntax expressionBody)
+            {
+                result = bodyBinder.BindExpression(expressionBody, bodyContext, diagnostics).Type;
+            }
+            else if (bodySyntax is BlockSyntax block)
+            {
+                // Each return converts to the placeholder object return type; the types under those conversions are the candidates
+                var returns = new ReturnTypeCollector();
+                returns.RewriteNode(bodyBinder.BindStatement(block, bodyContext, diagnostics));
+                result = returns.Single;
+            }
+            return result is null or NullTypeSymbol or DefaultLiteralTypeSymbol or ErrorTypeSymbol || result.SpecialType == SpecialType.System_Void
+                ? null
+                : result;
+        }
+
+        private sealed class ReturnTypeCollector : BoundTreeRewriter
+        {
+            private bool _conflict;
+            public TypeSymbol? Single { get; private set; }
+
+            protected override BoundStatement RewriteReturnStatement(BoundReturnStatement node)
+            {
+                var value = node.Expression is BoundConversionExpression conversion ? conversion.Operand : node.Expression;
+                if (value?.Type is TypeSymbol type && !_conflict)
+                {
+                    if (Single is null)
+                        Single = type;
+                    else if (!AreSameType(Single, type))
+                    {
+                        _conflict = true;
+                        Single = null;
+                    }
+                }
+                return node;
+            }
+
+            protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node) => node;
+        }
+
         // Delegate parameter types establish the lambda signature before body binding
         private BoundExpression BindLambdaConversion(
             BoundUnboundLambdaExpression lambda,

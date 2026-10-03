@@ -518,7 +518,7 @@ namespace Cnidaria.Cs
                 if (original.Kind != GenTreeKind.Binary ||
                     original.Operands.Length != 2 ||
                     original.Source.StackKind != GenStackKind.I4 ||
-                    original.Source.SourceOp is not (BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un) ||
+                    original.Source.Operator is not (GenTreeOperator.Div or GenTreeOperator.DivUn or GenTreeOperator.Rem or GenTreeOperator.RemUn) ||
                     !GenTreeArithmeticSemantics.IsIntegralArithmeticType(original.Source.Type, original.Source.StackKind) ||
                     !TryGetNormalValueNumber(original.Operands[1].Source, out ValueNumber divisorValue))
                 {
@@ -541,7 +541,7 @@ namespace Cnidaria.Cs
 
                 if ((flags & GenTreeFlags.DivModNoOverflow) == 0)
                 {
-                    bool noOverflow = original.Source.SourceOp is BytecodeOp.Div_Un or BytecodeOp.Rem_Un || divisorNonNegative;
+                    bool noOverflow = original.Source.Operator is GenTreeOperator.DivUn or GenTreeOperator.RemUn || divisorNonNegative;
                     if (!noOverflow &&
                         TryGetNormalValueNumber(original.Operands[0].Source, out ValueNumber dividendValue) &&
                         TryGetProvenRange(dividendValue, active, default, out SsaRange dividendRange))
@@ -1528,7 +1528,7 @@ namespace Cnidaria.Cs
                     source.Id,
                     source.Kind,
                     source.Pc,
-                    source.SourceOp,
+                    source.Operator,
                     source.Type,
                     source.StackKind,
                     flags,

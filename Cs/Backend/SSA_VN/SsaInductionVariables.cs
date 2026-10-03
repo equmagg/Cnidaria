@@ -858,7 +858,7 @@ namespace Cnidaria.Cs
                     _nextTreeId++,
                     GenTreeKind.Binary,
                     _method.GenTreeMethod.Blocks[insertionBlock].EndPcExclusive,
-                    BytecodeOp.Add,
+                    GenTreeOperator.Add,
                     iv.RuntimeType,
                     iv.StackKind,
                     GenTreeFlags.None,
@@ -1134,7 +1134,7 @@ namespace Cnidaria.Cs
                                 _nextTreeId++,
                                 GenTreeKind.Conv,
                                 -1,
-                                BytecodeOp.Conv,
+                                GenTreeOperator.None,
                                 unary.RuntimeType,
                                 unary.StackKind,
                                 GenTreeFlags.None,
@@ -1159,11 +1159,11 @@ namespace Cnidaria.Cs
                             if (!CanMaterializeBinary(binary))
                                 return null;
 
-                            BytecodeOp op = binary.Oper switch
+                            GenTreeOperator op = binary.Oper switch
                             {
-                                ScevOper.Add => BytecodeOp.Add,
-                                ScevOper.Mul => BytecodeOp.Mul,
-                                ScevOper.Lsh => BytecodeOp.Shl,
+                                ScevOper.Add => GenTreeOperator.Add,
+                                ScevOper.Mul => GenTreeOperator.Mul,
+                                ScevOper.Lsh => GenTreeOperator.Shl,
                                 _ => throw new InvalidOperationException(),
                             };
                             var result = new GenTree(
@@ -1190,7 +1190,7 @@ namespace Cnidaria.Cs
                     _nextTreeId++,
                     GenTreeKind.Unary,
                     -1,
-                    BytecodeOp.Neg,
+                    GenTreeOperator.Neg,
                     binary.RuntimeType,
                     binary.StackKind,
                     GenTreeFlags.None,
@@ -1276,7 +1276,7 @@ namespace Cnidaria.Cs
                 }
 
                 bool useShift = scale > 0 && IsPowerOfTwo(unchecked((ulong)scale));
-                BytecodeOp op = useShift ? BytecodeOp.Shl : BytecodeOp.Mul;
+                GenTreeOperator op = useShift ? GenTreeOperator.Shl : GenTreeOperator.Mul;
                 long rhsValue = useShift ? Log2(unchecked((ulong)scale)) : scale;
                 var rhs = CreateIntegralConstant(iv.RuntimeType, iv.StackKind, rhsValue);
                 var result = new GenTree(
@@ -1398,7 +1398,7 @@ namespace Cnidaria.Cs
                     _nextTreeId++,
                     GenTreeKind.Temp,
                     pc,
-                    BytecodeOp.Nop,
+                    GenTreeOperator.None,
                     temp.Type,
                     temp.StackKind,
                     GenTreeFlags.LocalUse,
@@ -1414,7 +1414,7 @@ namespace Cnidaria.Cs
                     _nextTreeId++,
                     GenTreeKind.StoreTemp,
                     pc,
-                    BytecodeOp.Nop,
+                    GenTreeOperator.None,
                     temp.Type,
                     temp.StackKind,
                     GenTreeFlags.SideEffect | GenTreeFlags.LocalDef | GenTreeFlags.Ordered,
@@ -1434,12 +1434,11 @@ namespace Cnidaria.Cs
                     GenLocalKind.Temporary => GenTreeKind.Temp,
                     _ => throw new InvalidOperationException(),
                 };
-                BytecodeOp op = descriptor.Kind == GenLocalKind.Argument ? BytecodeOp.Ldarg : descriptor.Kind == GenLocalKind.Local ? BytecodeOp.Ldloc : BytecodeOp.Nop;
                 var use = new GenTree(
                     _nextTreeId++,
                     kind,
                     pc,
-                    op,
+                    GenTreeOperator.None,
                     type,
                     stackKind,
                     GenTreeFlags.LocalUse,
@@ -1481,7 +1480,7 @@ namespace Cnidaria.Cs
                         _nextTreeId++,
                         GenTreeKind.ConstI4,
                         -1,
-                        BytecodeOp.Ldc_I4,
+                        GenTreeOperator.None,
                         type,
                         stackKind,
                         GenTreeFlags.None,
@@ -1493,7 +1492,7 @@ namespace Cnidaria.Cs
                     _nextTreeId++,
                     GenTreeKind.ConstI8,
                     -1,
-                    BytecodeOp.Ldc_I8,
+                    GenTreeOperator.None,
                     type,
                     stackKind,
                     GenTreeFlags.None,

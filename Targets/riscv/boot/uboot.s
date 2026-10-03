@@ -97,6 +97,7 @@ fat_root_cluster_ok:
     mul t3, t2, s9
     add s5, s4, t3
     slli s8, s6, 9
+    li s9, -1
     mv a0, s7
     jal ra, find_kernel_in_directory
     bnez a0, kernel_file_found
@@ -130,6 +131,7 @@ find_dir_next_cluster_not_eoc:
     li a1, 0
     j find_dir_return
 find_dir_sector_read:
+    li s9, -1
     mv a0, s10
     mv a1, s11
     jal ra, cluster_sector_lba
@@ -181,7 +183,7 @@ find_dir_return:
     ret
 
 load_file_cluster_chain:
-    addi sp, sp, -32
+    addi sp, sp, -48
     sd ra, 0(sp)
     mv s10, a0
     mv s11, a1
@@ -201,7 +203,23 @@ load_file_cluster_min_ok:
     bltu s10, t0, load_file_cluster_not_eoc
     j uboot_panic
 load_file_cluster_not_eoc:
+    # Consecutive clusters are read with one request; s10 leaves the loop as the first cluster after the run.
+    sd s10, 24(sp)
     mv t0, s8
+load_file_run_loop:
+    bgeu t0, s11, load_file_run_ready
+    sd t0, 32(sp)
+    mv a0, s10
+    jal ra, next_fat_cluster
+    ld t0, 32(sp)
+    addi t1, s10, 1
+    mv s10, a0
+    bne a0, t1, load_file_run_ready
+    li t1, 0x0ffffff8
+    bgeu a0, t1, load_file_run_ready
+    add t0, t0, s8
+    j load_file_run_loop
+load_file_run_ready:
     bgeu s11, t0, load_file_read_size_ready
     mv t0, s11
 load_file_read_size_ready:
@@ -209,7 +227,7 @@ load_file_read_size_ready:
     srli t1, t1, 9
     slli t2, t1, 9
     sd t2, 16(sp)
-    mv a0, s10
+    ld a0, 24(sp)
     li a1, 0
     jal ra, cluster_sector_lba
     mv a1, a0
@@ -225,14 +243,10 @@ load_file_read_size_ready:
     j load_file_cluster_loop
 load_file_subtract_remaining:
     sub s11, s11, t2
-    beqz s11, load_file_done
-    mv a0, s10
-    jal ra, next_fat_cluster
-    mv s10, a0
     j load_file_cluster_loop
 load_file_done:
     ld ra, 0(sp)
-    addi sp, sp, 32
+    addi sp, sp, 48
     ret
 
 cluster_sector_lba:
@@ -243,24 +257,28 @@ cluster_sector_lba:
     ret
 
 next_fat_cluster:
-    addi sp, sp, -16
-    sd ra, 0(sp)
     slli t0, a0, 2
     srli t1, t0, 9
-    andi t2, t0, 511
-    sd t2, 8(sp)
-    add a1, s4, t1
+    add t1, s4, t1
+    beq t1, s9, next_fat_cluster_cached
+    addi sp, sp, -16
+    sd ra, 0(sp)
+    sd t0, 8(sp)
+    mv s9, t1
+    mv a1, t1
     li a0, ${ZBOOT_FS_SECTOR_BUFFER_ADDRESS}
     li a2, 512
     jal ra, disk_read_lba
-    ld t2, 8(sp)
+    ld t0, 8(sp)
+    ld ra, 0(sp)
+    addi sp, sp, 16
+next_fat_cluster_cached:
+    andi t0, t0, 511
     li t3, ${ZBOOT_FS_SECTOR_BUFFER_ADDRESS}
-    add t3, t3, t2
+    add t3, t3, t0
     lwu a0, 0(t3)
     li t0, 0x0fffffff
     and a0, a0, t0
-    ld ra, 0(sp)
-    addi sp, sp, 16
     ret
 
 disk_read_lba:

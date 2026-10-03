@@ -13,6 +13,15 @@ vuint8m8_t __riscv_vle8_v_u8m8(const u8* rs1, u64 vl);
 void __riscv_vse8_v_u8m8(u8* rs1, vuint8m8_t vs3, u64 vl);
 vuint8m8_t __riscv_vmv_v_i_u8m8(int simm5, u64 vl);
 u64 __riscv_vsetvlmax_e8m8(void);
+typedef __rvv_uint64m8_t vuint64m8_t;
+typedef __rvv_bool8_t vbool8_t;
+u64 __riscv_vsetvl_e64m8(u64 avl);
+vuint64m8_t __riscv_vle64_v_u64m8(const u64* rs1, u64 vl);
+vuint64m8_t __riscv_vand_vx_u64m8(vuint64m8_t vs2, u64 vs1, u64 vl);
+vbool8_t __riscv_vmseq_vx_u64m8_b8(vuint64m8_t vs2, u64 vs1, u64 vl);
+vbool8_t __riscv_vmsne_vx_u64m8_b8(vuint64m8_t vs2, u64 vs1, u64 vl);
+vbool8_t __riscv_vmor_mm_b8(vbool8_t vs2, vbool8_t vs1, u64 vl);
+long __riscv_vfirst_m_b8(vbool8_t vs2, u64 vl);
 #endif
 
 #define NULL ((void*)0)
@@ -577,6 +586,7 @@ static u16 virtq_avail[2 + VIRTIO_QUEUE_SIZE];
 static u16 virtq_used_raw[2 + VIRTIO_QUEUE_SIZE * 4];
 static struct virtio_block_request virtio_request;
 static u8 sector_buffer[SECTOR_SIZE];
+static u8 file_read_buffer[PAGE_SIZE];
 static u8 fat_buffer[SECTOR_SIZE];
 static u8 dir_buffer[SECTOR_SIZE];
 
@@ -1499,7 +1509,7 @@ static u32 sv39_index(u64 virtual_address, int level)
     return (u32)virtual_address;
 }
 
-static void map_leaf(u64 root, u64 virtual_address, u64 physical_address, u64 flags, int leaf_level)
+static u64* leaf_table(u64 root, u64 virtual_address, int leaf_level)
 {
     u64 table = root;
     int level = 2;
@@ -1522,7 +1532,12 @@ static void map_leaf(u64 root, u64 virtual_address, u64 physical_address, u64 fl
         }
         level = level - 1;
     }
-    ((u64*)table)[sv39_index(virtual_address, leaf_level)] = pte_make(physical_address, flags);
+    return (u64*)table;
+}
+
+static void map_leaf(u64 root, u64 virtual_address, u64 physical_address, u64 flags, int leaf_level)
+{
+    leaf_table(root, virtual_address, leaf_level)[sv39_index(virtual_address, leaf_level)] = pte_make(physical_address, flags);
 }
 
 static void map_page(u64 root, u64 virtual_address, u64 physical_address, u64 flags)
@@ -1532,48 +1547,37 @@ static void map_page(u64 root, u64 virtual_address, u64 physical_address, u64 fl
 
 static void map_noaccess_page(u64 root, u64 virtual_address, u64 physical_address)
 {
-    u64 table = root;
-    int level = 2;
-    while (level > 0)
+    leaf_table(root, virtual_address, 0)[sv39_index(virtual_address, 0)] = pte_make_noaccess(physical_address);
+}
+
+static void map_range(u64 root, u64 virtual_address, u64 physical_address, u64 size, u64 flags, int leaf_level)
+{
+    u64 leaf_size = 1ul << (12ul + (u64)leaf_level * 9ul);
+    u64 offset = 0ul;
+    while (offset < size)
     {
-        u32 index = sv39_index(virtual_address, level);
-        u64* entries = (u64*)table;
-        u64 pte = entries[index];
-        if ((pte & PTE_V) == 0ul)
+        u64* table = leaf_table(root, virtual_address + offset, leaf_level);
+        u32 index = sv39_index(virtual_address + offset, leaf_level);
+        u64 pte = pte_make(physical_address + offset, flags);
+        while (offset < size && index < 512u)
         {
-            u64 next = alloc_page();
-            entries[index] = pte_make(next, 0ul);
-            table = next;
+            table[index] = pte;
+            // The PPN starts at bit 10, so the next leaf's PTE is this one plus its size shifted right by 2
+            pte = pte + (leaf_size >> 2);
+            offset = offset + leaf_size;
+            index = index + 1u;
         }
-        else
-        {
-            if ((pte & (PTE_R | PTE_W | PTE_X)) != 0ul)
-                panic("page table leaf collision");
-            table = pte_physical(pte);
-        }
-        level = level - 1;
     }
-    ((u64*)table)[sv39_index(virtual_address, 0)] = pte_make_noaccess(physical_address);
 }
 
 static void map_range_2m(u64 root, u64 virtual_address, u64 physical_address, u64 size, u64 flags)
 {
-    u64 offset = 0ul;
-    while (offset < size)
-    {
-        map_leaf(root, virtual_address + offset, physical_address + offset, flags, 1);
-        offset = offset + 0x200000ul;
-    }
+    map_range(root, virtual_address, physical_address, size, flags, 1);
 }
 
 static void map_range_4k(u64 root, u64 virtual_address, u64 physical_address, u64 size, u64 flags)
 {
-    u64 offset = 0ul;
-    while (offset < size)
-    {
-        map_page(root, virtual_address + offset, physical_address + offset, flags);
-        offset = offset + PAGE_SIZE;
-    }
+    map_range(root, virtual_address, physical_address, size, flags, 0);
 }
 
 static int unmap_user_page(u64 root, u64 virtual_address)
@@ -2147,11 +2151,41 @@ static int copy_user_leaf_pages(u64 dst_root, u64 virtual_address, u64 pte, int 
     return 1;
 }
 
+// Holes and kernel leaves are never copied, so a vector scan skips to the next user leaf, no-access page or table
+static u32 next_copied_pte(const u64* entries, u32 index)
+{
+#if __riscv_vector
+    while (index < 512u)
+    {
+        u64 vl = __riscv_vsetvl_e64m8(512u - index);
+        vuint64m8_t ptes = __riscv_vle64_v_u64m8(entries + index, vl);
+        vbool8_t owned = __riscv_vmsne_vx_u64m8_b8(__riscv_vand_vx_u64m8(ptes, PTE_U | PTE_SOFT_NOACCESS, vl), 0ul, vl);
+        vbool8_t table = __riscv_vmseq_vx_u64m8_b8(__riscv_vand_vx_u64m8(ptes, PTE_V | PTE_R | PTE_X, vl), PTE_V, vl);
+        long first = __riscv_vfirst_m_b8(__riscv_vmor_mm_b8(owned, table, vl), vl);
+        if (first >= 0)
+            return index + (u32)first;
+        index = index + (u32)vl;
+    }
+#else
+    while (index < 512u)
+    {
+        u64 pte = entries[index];
+        if ((pte & (PTE_U | PTE_SOFT_NOACCESS)) != 0ul || (pte & (PTE_V | PTE_R | PTE_X)) == PTE_V)
+            return index;
+        index = index + 1u;
+    }
+#endif
+    return 512u;
+}
+
 static int copy_user_page_table_level(u64 dst_root, u64 src_table, int level, u64 virtual_prefix)
 {
     u32 index = 0u;
     while (index < 512u)
     {
+        index = next_copied_pte((const u64*)src_table, index);
+        if (index == 512u)
+            break;
         u64 pte = ((u64*)src_table)[index];
         if ((pte & PTE_V) != 0ul || (level == 0 && (pte & PTE_SOFT_NOACCESS) != 0ul))
         {
@@ -5568,11 +5602,39 @@ static int fat_read_at(struct vfs_node* node, u64 offset, void* destination, u32
         u32 sector_index = (u32)(inner_offset / (u64)SECTOR_SIZE);
         u32 sector_offset = (u32)(inner_offset & (u64)(SECTOR_SIZE - 1u));
         u32 chunk = SECTOR_SIZE - sector_offset;
+        u32 lba = fat_cluster_lba(cluster) + sector_index;
         if (chunk > count - done)
             chunk = count - done;
-        if (!disk_read_sector(fat_cluster_lba(cluster) + sector_index, sector_buffer))
-            return 0;
-        mem_copy(dst + done, sector_buffer + sector_offset, chunk);
+        if (chunk == SECTOR_SIZE)
+        {
+            u32 wanted = (count - done) / SECTOR_SIZE;
+            u32 sectors = boot_volume.sectors_per_cluster - sector_index;
+            u64 joined = 0ul;
+            while (sectors < wanted)
+            {
+                u32 next = fat_next_cluster(cluster);
+                if (next != cluster + 1u || next >= FAT_EOC)
+                    break;
+                cluster = next;
+                cluster_index = cluster_index + 1ul;
+                fat_walk_cluster = cluster;
+                fat_walk_index = cluster_index;
+                joined = joined + 1ul;
+                sectors = sectors + boot_volume.sectors_per_cluster;
+            }
+            if (sectors > wanted)
+                sectors = wanted;
+            chunk = sectors * SECTOR_SIZE;
+            if (!block_read((u64)lba, dst + done, chunk))
+                return 0;
+            inner_offset = inner_offset - joined * cluster_size;
+        }
+        else
+        {
+            if (!disk_read_sector(lba, sector_buffer))
+                return 0;
+            mem_copy(dst + done, sector_buffer + sector_offset, chunk);
+        }
         done = done + chunk;
         inner_offset = inner_offset + (u64)chunk;
         if (inner_offset >= cluster_size && done < count)
@@ -6411,13 +6473,13 @@ static s64 fat_file_read_to_user(struct file_descriptor* file, u64 buffer, u64 c
     u64 done = 0ul;
     while (done < count)
     {
-        u32 requested = (u32)(count - done > SECTOR_SIZE ? SECTOR_SIZE : count - done);
+        u32 requested = (u32)(count - done > PAGE_SIZE ? PAGE_SIZE : count - done);
         u32 actual = 0u;
-        if (!fat_read_at(&file->node, file->offset + done, sector_buffer, requested, &actual))
+        if (!fat_read_at(&file->node, file->offset + done, file_read_buffer, requested, &actual))
             return done == 0ul ? -5l : (s64)done;
         if (actual == 0u)
             break;
-        if (!user_copy_to_writable(current_user_root_page_table, buffer + done, sector_buffer, (u64)actual))
+        if (!user_copy_to_writable(current_user_root_page_table, buffer + done, file_read_buffer, (u64)actual))
             return -14l;
         done = done + (u64)actual;
     }

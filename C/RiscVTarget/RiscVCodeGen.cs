@@ -27,6 +27,7 @@ public sealed class RiscVCodeGenerator
     private const string BssSectionName = ".bss";
 
     private static readonly MachineRegister Sp = MachineRegister.X2;
+    private static readonly MachineRegister FramePointer = MachineRegister.X8;
     private static readonly MachineRegister Ra = MachineRegister.X1;
     private static readonly MachineRegister GpScratch0 = MachineRegister.X5;
     private static readonly MachineRegister GpScratch1 = MachineRegister.X6;
@@ -946,9 +947,16 @@ public sealed class RiscVCodeGenerator
             _riscVVarArgsSaveAreaOffset = _riscVVarArgsSaveAreaSize == 0 ? -1 : checked(_totalFrameSize - _riscVVarArgsSaveAreaSize);
         }
 
+        private MachineRegister FrameBase => _allocation.Frame.HasDynamicStack ? FramePointer : Sp;
+
         public void EmitPrologue()
         {
             AdjustStack(-_totalFrameSize);
+            if (_allocation.Frame.HasDynamicStack)
+            {
+                StoreRegister(FramePointer, Sp, _allocation.Frame.FrameBaseSaveOffset, _owner._target.PointerSize);
+                MoveRegister(FramePointer, Sp);
+            }
             SaveIncomingVarArgsPointer();
             foreach (var pair in _allocation.Frame.SavedRegisterOffsets.OrderBy(static p => p.Value))
                 StoreRegister(pair.Key, Sp, pair.Value, RegisterSaveSize(pair.Key));
@@ -1202,14 +1210,14 @@ public sealed class RiscVCodeGenerator
             {
                 var integerRegisters = TargetRegisterInfo.IntegerArgumentRegisters(_owner._target);
                 for (var register = cursor.Integer; register < integerRegisters.Length; register++)
-                    StoreRegister(integerRegisters[register], Sp, checked(_riscVVarArgsSaveAreaOffset + (register - cursor.Integer) * _allocationOptions.StackArgumentSlotSize), _owner._target.PointerSize);
-                AddImmediate(GpScratch0, Sp, _riscVVarArgsSaveAreaOffset);
+                    StoreRegister(integerRegisters[register], FrameBase, checked(_riscVVarArgsSaveAreaOffset + (register - cursor.Integer) * _allocationOptions.StackArgumentSlotSize), _owner._target.PointerSize);
+                AddImmediate(GpScratch0, FrameBase, _riscVVarArgsSaveAreaOffset);
             }
             else
             {
-                AddImmediate(GpScratch0, Sp, IncomingStackOffset(cursor.Stack * _allocationOptions.StackArgumentSlotSize));
+                AddImmediate(GpScratch0, FrameBase, IncomingStackOffset(cursor.Stack * _allocationOptions.StackArgumentSlotSize));
             }
-            StoreRegister(GpScratch0, Sp, _allocation.Frame.VarArgsPointerOffset, _owner._target.PointerSize);
+            StoreRegister(GpScratch0, FrameBase, _allocation.Frame.VarArgsPointerOffset, _owner._target.PointerSize);
         }
 
         private void SaveIncomingHiddenReturnBuffer()
@@ -1225,14 +1233,14 @@ public sealed class RiscVCodeGenerator
 
             if (location.Kind == AbiLocationKind.Register)
             {
-                StoreRegister(location.Register, Sp, _allocation.Frame.HiddenReturnBufferOffset, _owner._target.PointerSize);
+                StoreRegister(location.Register, FrameBase, _allocation.Frame.HiddenReturnBufferOffset, _owner._target.PointerSize);
                 return;
             }
 
             if (location.Kind == AbiLocationKind.Stack)
             {
-                LoadFromMemory(GpScratch0, Sp, IncomingStackOffset(location.StackByteOffset(_allocationOptions.StackArgumentSlotSize)), _owner._target.PointerSize, signed: false);
-                StoreRegister(GpScratch0, Sp, _allocation.Frame.HiddenReturnBufferOffset, _owner._target.PointerSize);
+                LoadFromMemory(GpScratch0, FrameBase, IncomingStackOffset(location.StackByteOffset(_allocationOptions.StackArgumentSlotSize)), _owner._target.PointerSize, signed: false);
+                StoreRegister(GpScratch0, FrameBase, _allocation.Frame.HiddenReturnBufferOffset, _owner._target.PointerSize);
             }
         }
 
@@ -1286,6 +1294,27 @@ public sealed class RiscVCodeGenerator
                     break;
                 case LirInstructionKind.VaArg:
                     EmitVaArg(instruction);
+                    break;
+                case LirInstructionKind.StackAllocate:
+                    {
+                        var bytes = LoadOperand(instruction.Operands[0], GpScratch0);
+                        EmitImm(RVInstrKind.Addi, GpScratch0, bytes, 15);
+                        EmitImm(RVInstrKind.Andi, GpScratch0, GpScratch0, -16);
+                        Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(Sp), ToRegister(Sp), ToRegister(GpScratch0)));
+                        var destination = GetWritableRegister(instruction.Result!, GpScratch0);
+                        AddImmediate(destination, Sp, _allocation.Frame.OutgoingArgumentAreaSize);
+                        StoreWritableRegisterIfSpilled(instruction.Result!, destination);
+                        break;
+                    }
+                case LirInstructionKind.StackSave:
+                    {
+                        var destination = GetWritableRegister(instruction.Result!, GpScratch0);
+                        MoveRegister(destination, Sp);
+                        StoreWritableRegisterIfSpilled(instruction.Result!, destination);
+                        break;
+                    }
+                case LirInstructionKind.StackRestore:
+                    MoveRegister(Sp, LoadOperand(instruction.Operands[0], GpScratch0));
                     break;
                 case LirInstructionKind.InlineAssembly:
                     EmitInlineAssembly(instruction);
@@ -1755,7 +1784,7 @@ public sealed class RiscVCodeGenerator
             LirInstruction instruction)
         {
             RequireRiscVAsmTemp(type, instruction);
-            StoreToMemory(source, Sp, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(type));
+            StoreToMemory(source, FrameBase, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(type));
             foreach (var move in moves)
             {
                 if (!move.HasRegisterSource || move.SourceRegister != source)
@@ -1769,7 +1798,7 @@ public sealed class RiscVCodeGenerator
         {
             if (move.UsesTemp)
             {
-                LoadFromMemory(move.Destination, Sp, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(move.Type), IsSignedIntegerType(move.Type));
+                LoadFromMemory(move.Destination, FrameBase, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(move.Type), IsSignedIntegerType(move.Type));
                 NormalizeScalarRegister(move.Destination, move.Type);
                 return;
             }
@@ -1825,7 +1854,7 @@ public sealed class RiscVCodeGenerator
                 var source = moves[0].Source;
                 var type = moves[0].Type;
                 RequireRiscVAsmTemp(type, instruction);
-                StoreToMemory(source, Sp, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(type));
+                StoreToMemory(source, FrameBase, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(type));
                 var tempConsumers = new List<RiscVAsmRegisterMove>();
                 for (var i = moves.Count - 1; i >= 0; i--)
                 {
@@ -1837,7 +1866,7 @@ public sealed class RiscVCodeGenerator
                 EmitRiscVAsmParallelRegisterMoves(moves, instruction);
                 foreach (var move in tempConsumers)
                 {
-                    LoadFromMemory(move.Destination, Sp, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(move.Type), IsSignedIntegerType(move.Type));
+                    LoadFromMemory(move.Destination, FrameBase, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(move.Type), IsSignedIntegerType(move.Type));
                     NormalizeScalarRegister(move.Destination, move.Type);
                 }
             }
@@ -1991,7 +2020,7 @@ public sealed class RiscVCodeGenerator
                 {
                     LoadFromMemory(
                         GpScratch1,
-                        Sp,
+                        FrameBase,
                         IncomingStackOffset(loc.StackByteOffset(_allocationOptions.StackArgumentSlotSize)),
                         _owner._target.PointerSize,
                         signed: false);
@@ -2017,7 +2046,7 @@ public sealed class RiscVCodeGenerator
                     }
                     else if (loc.Kind == AbiLocationKind.Stack)
                     {
-                        LoadRawBitsFromMemory(GpScratch1, Sp, IncomingStackOffset(loc.StackByteOffset(_allocationOptions.StackArgumentSlotSize)), segment.Size, _owner._target.RegisterSize);
+                        LoadRawBitsFromMemory(GpScratch1, FrameBase, IncomingStackOffset(loc.StackByteOffset(_allocationOptions.StackArgumentSlotSize)), segment.Size, _owner._target.RegisterSize);
                         StoreRawBitsToAddress(GpScratch1, destinationAddress, segment.Offset, segment.Size, BlockAlignment(type));
                     }
                     else
@@ -2032,7 +2061,7 @@ public sealed class RiscVCodeGenerator
             {
                 var loc = CAbi.AssignArgumentLocation(value, ref cursor, _allocationOptions.StackArgumentSlotSize);
                 var destinationAddress = MaterializeVirtualRegisterStorageAddress(instruction.Result, GpScratch0);
-                AddImmediate(GpScratch1, Sp, IncomingStackOffset(loc.StackByteOffset(_allocationOptions.StackArgumentSlotSize)));
+                AddImmediate(GpScratch1, FrameBase, IncomingStackOffset(loc.StackByteOffset(_allocationOptions.StackArgumentSlotSize)));
                 CopyMemory(destinationAddress, GpScratch1, value.Size, BlockAlignment(type));
                 return;
             }
@@ -2047,7 +2076,7 @@ public sealed class RiscVCodeGenerator
             }
             else if (scalarLocation.Kind == AbiLocationKind.Stack)
             {
-                LoadFromMemory(destination, Sp, IncomingStackOffset(
+                LoadFromMemory(destination, FrameBase, IncomingStackOffset(
                     scalarLocation.StackByteOffset(_allocationOptions.StackArgumentSlotSize)), SizeOfRegisterType(type), IsSignedIntegerType(type));
             }
             else
@@ -2242,9 +2271,9 @@ public sealed class RiscVCodeGenerator
                 case "-":
                     LoadWideIntegerOperand(instruction.Operands[0], GpScratch0, GpScratch1, instruction);
                     LoadWideIntegerOperand(instruction.Operands[1], GpScratch2, GpScratch3, instruction);
-                    StoreToMemory(GpScratch0, Sp, _allocation.Frame.FloatingImmediateTempOffset, 4);
+                    StoreToMemory(GpScratch0, FrameBase, _allocation.Frame.FloatingImmediateTempOffset, 4);
                     Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch0), ToRegister(GpScratch0), ToRegister(GpScratch2)));
-                    LoadFromMemory(GpScratch2, Sp, _allocation.Frame.FloatingImmediateTempOffset, 4, signed: false);
+                    LoadFromMemory(GpScratch2, FrameBase, _allocation.Frame.FloatingImmediateTempOffset, 4, signed: false);
                     Emit(RVInstruction.R(RVInstrKind.Sltu, ToRegister(GpScratch2), ToRegister(GpScratch2), ToRegister(GpScratch0)));
                     Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch1), ToRegister(GpScratch1), ToRegister(GpScratch3)));
                     Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch1), ToRegister(GpScratch1), ToRegister(GpScratch2)));
@@ -3624,7 +3653,7 @@ public sealed class RiscVCodeGenerator
                 }
 
                 var size = Math.Min(SizeOfRegisterType(preservation.Register.Type), SizeOf(preservation.Register.Type));
-                StoreToMemory(preservation.PhysicalRegister, Sp, preservation.StackOffset, size);
+                StoreToMemory(preservation.PhysicalRegister, FrameBase, preservation.StackOffset, size);
             }
         }
 
@@ -3639,7 +3668,7 @@ public sealed class RiscVCodeGenerator
                 }
 
                 var size = Math.Min(SizeOfRegisterType(preservation.Register.Type), SizeOf(preservation.Register.Type));
-                LoadFromMemory(preservation.PhysicalRegister, Sp, preservation.StackOffset, size, IsSignedIntegerType(preservation.Register.Type));
+                LoadFromMemory(preservation.PhysicalRegister, FrameBase, preservation.StackOffset, size, IsSignedIntegerType(preservation.Register.Type));
                 NormalizeScalarRegister(preservation.PhysicalRegister, preservation.Register.Type);
             }
         }
@@ -4795,8 +4824,8 @@ public sealed class RiscVCodeGenerator
 
             var offset = _allocation.Frame.FloatingImmediateTempOffset;
             var source = LoadOperand(operand, UsesHardwareFloating(operand.Type) ? FpScratch0 : GpScratch0);
-            StoreToMemory(source, Sp, offset, Math.Min(SizeOfRegisterType(operand.Type), SizeOf(operand.Type)));
-            AddImmediate(destination, Sp, offset);
+            StoreToMemory(source, FrameBase, offset, Math.Min(SizeOfRegisterType(operand.Type), SizeOf(operand.Type)));
+            AddImmediate(destination, FrameBase, offset);
             return destination;
         }
 
@@ -4920,7 +4949,7 @@ public sealed class RiscVCodeGenerator
             {
                 var ap = LoadOperand(instruction.Operands[0], GpScratch0);
                 if (_allocation.Frame.HasVarArgsPointer)
-                    LoadFromMemory(GpScratch1, Sp, _allocation.Frame.VarArgsPointerOffset, _owner._target.PointerSize, signed: false);
+                    LoadFromMemory(GpScratch1, FrameBase, _allocation.Frame.VarArgsPointerOffset, _owner._target.PointerSize, signed: false);
                 else
                     MoveRegister(GpScratch1, MachineRegister.X0);
                 StoreRegister(GpScratch1, ap, 0, _owner._target.PointerSize);
@@ -4931,7 +4960,7 @@ public sealed class RiscVCodeGenerator
                 return;
             var destination = GetWritableRegister(instruction.Result, GpScratch0);
             if (_allocation.Frame.HasVarArgsPointer)
-                LoadFromMemory(destination, Sp, _allocation.Frame.VarArgsPointerOffset, _owner._target.PointerSize, signed: false);
+                LoadFromMemory(destination, FrameBase, _allocation.Frame.VarArgsPointerOffset, _owner._target.PointerSize, signed: false);
             else
                 MoveRegister(destination, MachineRegister.X0);
             StoreWritableRegisterIfSpilled(instruction.Result, destination);
@@ -5379,10 +5408,14 @@ public sealed class RiscVCodeGenerator
 
         private void EmitEpilogue()
         {
+            if (_allocation.Frame.HasDynamicStack)
+                MoveRegister(Sp, FramePointer);
             if (_hasCalls)
                 LoadFromMemory(Ra, Sp, _raSaveOffset, _owner._target.PointerSize, signed: false);
             foreach (var pair in _allocation.Frame.SavedRegisterOffsets.OrderByDescending(static p => p.Value))
                 LoadFromMemory(pair.Key, Sp, pair.Value, RegisterSaveSize(pair.Key), signed: false);
+            if (_allocation.Frame.HasDynamicStack)
+                LoadFromMemory(FramePointer, Sp, _allocation.Frame.FrameBaseSaveOffset, _owner._target.PointerSize, signed: false);
             AdjustStack(_totalFrameSize);
         }
 
@@ -5430,14 +5463,14 @@ public sealed class RiscVCodeGenerator
                     var sourceAddress = IsAggregateType(copy.Destination.Type)
                         ? MaterializeAnyStorageAddress(copy.Source, GpScratch0, instruction)
                         : MaterializeScalarStorageAddress(copy.Source, GpScratch0, instruction);
-                    AddImmediate(GpScratch1, Sp, tempOffset + tempCursor);
+                    AddImmediate(GpScratch1, FrameBase, tempOffset + tempCursor);
                     CopyMemory(GpScratch1, sourceAddress, SizeOf(copy.Destination.Type), BlockAlignment(copy.Destination.Type));
                     tempCursor += AlignUp(SizeOf(copy.Destination.Type), _allocationOptions.SpillSlotAlignment);
                 }
                 else
                 {
                     var source = LoadOperand(copy.Source, PreferredScratch(copy.Source.Type, GpScratch0, FpScratch0, VecScratch0));
-                    StoreToMemory(source, Sp, tempOffset + tempCursor, SizeOfRegisterType(copy.Destination.Type));
+                    StoreToMemory(source, FrameBase, tempOffset + tempCursor, SizeOfRegisterType(copy.Destination.Type));
                     tempCursor += AlignUp(SizeOfRegisterType(copy.Destination.Type), _allocationOptions.SpillSlotAlignment);
                 }
             }
@@ -5448,14 +5481,14 @@ public sealed class RiscVCodeGenerator
                 if (RequiresBlockCopyStorage(copy.Destination.Type))
                 {
                     var dest = MaterializeVirtualRegisterStorageAddress(copy.Destination, GpScratch0);
-                    AddImmediate(GpScratch1, Sp, tempOffset + tempCursor);
+                    AddImmediate(GpScratch1, FrameBase, tempOffset + tempCursor);
                     CopyMemory(dest, GpScratch1, SizeOf(copy.Destination.Type), BlockAlignment(copy.Destination.Type));
                     tempCursor += AlignUp(SizeOf(copy.Destination.Type), _allocationOptions.SpillSlotAlignment);
                 }
                 else
                 {
                     var destination = GetWritableRegister(copy.Destination, PreferredScratch(copy.Destination.Type, GpScratch0, FpScratch0, VecScratch0));
-                    LoadFromMemory(destination, Sp, tempOffset + tempCursor, SizeOfRegisterType(copy.Destination.Type), IsSignedIntegerType(copy.Destination.Type));
+                    LoadFromMemory(destination, FrameBase, tempOffset + tempCursor, SizeOfRegisterType(copy.Destination.Type), IsSignedIntegerType(copy.Destination.Type));
                     NormalizeScalarRegister(destination, copy.Destination.Type);
                     StoreWritableRegisterIfSpilled(copy.Destination, destination);
                     tempCursor += AlignUp(SizeOfRegisterType(copy.Destination.Type), _allocationOptions.SpillSlotAlignment);
@@ -5657,7 +5690,7 @@ public sealed class RiscVCodeGenerator
                         preferred = VecScratch0;
                     else if (UsesHardwareFloating(operand.Type) && !IsFloatRegister(preferred))
                         preferred = FpScratch0;
-                    LoadFromMemory(preferred, Sp, offset, SizeOfRegisterType(operand.Type), IsSignedIntegerType(operand.Type));
+                    LoadFromMemory(preferred, FrameBase, offset, SizeOfRegisterType(operand.Type), IsSignedIntegerType(operand.Type));
                     NormalizeScalarRegister(preferred, operand.Type);
                     return preferred;
                 case LirOperandKind.Address:
@@ -5707,7 +5740,7 @@ public sealed class RiscVCodeGenerator
                     else if (UsesHardwareFloating(register.Type) && !IsFloatRegister(preferred))
                         preferred = FpScratch0;
                     var size = Math.Min(SizeOfRegisterType(register.Type), SizeOf(register.Type));
-                    LoadFromMemory(preferred, Sp, preservation.StackOffset, size, IsSignedIntegerType(register.Type));
+                    LoadFromMemory(preferred, FrameBase, preservation.StackOffset, size, IsSignedIntegerType(register.Type));
                     NormalizeScalarRegister(preferred, register.Type);
                     return preferred;
                 }
@@ -5718,7 +5751,7 @@ public sealed class RiscVCodeGenerator
                 preferred = VecScratch0;
             else if (UsesHardwareFloating(register.Type) && !IsFloatRegister(preferred))
                 preferred = FpScratch0;
-            LoadFromMemory(preferred, Sp, alloc.StackOffset, SizeOfRegisterType(register.Type), IsSignedIntegerType(register.Type));
+            LoadFromMemory(preferred, FrameBase, alloc.StackOffset, SizeOfRegisterType(register.Type), IsSignedIntegerType(register.Type));
             NormalizeScalarRegister(preferred, register.Type);
             return preferred;
         }
@@ -5742,21 +5775,21 @@ public sealed class RiscVCodeGenerator
             var alloc = _allocation[register];
             if (!alloc.IsSpilled)
                 return;
-            StoreToMemory(source, Sp, alloc.StackOffset, Math.Min(SizeOfRegisterType(register.Type), SizeOf(register.Type)));
+            StoreToMemory(source, FrameBase, alloc.StackOffset, Math.Min(SizeOfRegisterType(register.Type), SizeOf(register.Type)));
         }
 
         private MachineRegister MaterializeVirtualRegisterStorageAddress(LirVirtualRegister register, MachineRegister destination)
         {
             if (register.HomeSlot is { } home)
             {
-                AddImmediate(destination, Sp, _allocation.Frame.StackSlotOffsets[home]);
+                AddImmediate(destination, FrameBase, _allocation.Frame.StackSlotOffsets[home]);
                 return destination;
             }
 
             var alloc = _allocation[register];
             if (!alloc.IsSpilled)
                 throw new NotSupportedException($"Virtual register {register.Name} must be stack-backed.");
-            AddImmediate(destination, Sp, alloc.StackOffset);
+            AddImmediate(destination, FrameBase, alloc.StackOffset);
             return destination;
         }
 
@@ -5774,7 +5807,7 @@ public sealed class RiscVCodeGenerator
                         throw new InvalidOperationException("Stack-slot operand has no stack slot.");
                     if (!_allocation.Frame.StackSlotOffsets.TryGetValue(operand.StackSlot, out var offset))
                         throw new InvalidOperationException($"Missing stack slot offset for {operand.StackSlot.Name}.");
-                    AddImmediate(destination, Sp, offset);
+                    AddImmediate(destination, FrameBase, offset);
                     return;
                 case LirOperandKind.Address:
                     if (operand.Address is null)
@@ -5814,12 +5847,12 @@ public sealed class RiscVCodeGenerator
                         throw new InvalidOperationException("Stack-slot operand has no stack slot.");
                     if (!_allocation.Frame.StackSlotOffsets.TryGetValue(operand.StackSlot, out var stackOffset))
                         throw new InvalidOperationException($"Missing stack slot offset for {operand.StackSlot.Name}.");
-                    AddImmediate(destination, Sp, stackOffset);
+                    AddImmediate(destination, FrameBase, stackOffset);
                     return destination;
                 case LirOperandKind.Immediate:
                     if (size > _allocation.Frame.FloatingImmediateTempSize)
                         throw HelperRequired(instruction, SelectScalarMoveHelper(operand.Type), "Immediate scalar storage materialization requires a runtime helper.");
-                    AddImmediate(destination, Sp, _allocation.Frame.FloatingImmediateTempOffset);
+                    AddImmediate(destination, FrameBase, _allocation.Frame.FloatingImmediateTempOffset);
                     StoreImmediateScalarToMemory(operand, destination, 0, size, instruction);
                     return destination;
                 case LirOperandKind.Undefined:
@@ -5827,7 +5860,7 @@ public sealed class RiscVCodeGenerator
                 case LirOperandKind.None:
                     if (size > _allocation.Frame.FloatingImmediateTempSize)
                         throw HelperRequired(instruction, SelectScalarMoveHelper(operand.Type), "Undefined scalar storage materialization requires a runtime helper.");
-                    AddImmediate(destination, Sp, _allocation.Frame.FloatingImmediateTempOffset);
+                    AddImmediate(destination, FrameBase, _allocation.Frame.FloatingImmediateTempOffset);
                     ZeroMemory(destination, size, BlockAlignment(operand.Type));
                     return destination;
             }
@@ -5836,7 +5869,7 @@ public sealed class RiscVCodeGenerator
                 throw HelperRequired(instruction, SelectScalarMoveHelper(operand.Type), "Scalar storage materialization requires a runtime helper.");
 
             var source = LoadOperand(operand, UsesHardwareFloating(operand.Type) ? FpScratch0 : GpScratch2);
-            AddImmediate(destination, Sp, _allocation.Frame.FloatingImmediateTempOffset);
+            AddImmediate(destination, FrameBase, _allocation.Frame.FloatingImmediateTempOffset);
             StoreToMemory(source, destination, 0, Math.Min(SizeOfRegisterType(operand.Type), size));
             return destination;
         }
@@ -5929,7 +5962,7 @@ public sealed class RiscVCodeGenerator
         {
             if (_allocation.Frame.HasHiddenReturnBuffer)
             {
-                LoadFromMemory(destination, Sp, _allocation.Frame.HiddenReturnBufferOffset, _owner._target.PointerSize, signed: false);
+                LoadFromMemory(destination, FrameBase, _allocation.Frame.HiddenReturnBufferOffset, _owner._target.PointerSize, signed: false);
                 return;
             }
 
@@ -5945,7 +5978,7 @@ public sealed class RiscVCodeGenerator
             {
                 LoadFromMemory(
                     destination,
-                    Sp,
+                    FrameBase,
                     IncomingStackOffset(location.StackByteOffset(_allocationOptions.StackArgumentSlotSize)),
                     _owner._target.PointerSize,
                     signed: false);
@@ -5973,7 +6006,7 @@ public sealed class RiscVCodeGenerator
                         throw new InvalidOperationException("Stack slot address has no stack slot.");
                     if (!_allocation.Frame.StackSlotOffsets.TryGetValue(address.StackSlot, out var slotOffset))
                         throw new InvalidOperationException($"Missing stack slot offset for {address.StackSlot.Name}.");
-                    return new AddressParts(Sp, slotOffset);
+                    return new AddressParts(FrameBase, slotOffset);
                 case LirAddressKind.Symbol:
                     if (address.Symbol is null)
                         throw new InvalidOperationException("Symbol address has no symbol.");

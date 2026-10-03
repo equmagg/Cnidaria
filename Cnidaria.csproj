@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>Library</OutputType>
@@ -21,7 +21,7 @@
 
   <PropertyGroup>
     <PackageId>Cnidaria</PackageId>
-    <Version>3.4.4</Version>
+    <Version>3.5.1</Version>
     <Authors>equmag</Authors>
     <Description>Lightweight RCE safe compiler collection</Description>
 

@@ -469,11 +469,15 @@ namespace Cnidaria.Cs
         private readonly Symbol _containing;
         private readonly ControlFlowScope _flow;
         private readonly Dictionary<string, LocalSymbol> _locals = new(StringComparer.Ordinal);
+        // A scope that makes pattern locals visible to one operand of an expression declares no expression variables itself.
+        private bool _isExpressionFlowScope;
         private readonly Dictionary<string, ParameterSymbol> _parameters = new(StringComparer.Ordinal);
         private readonly Dictionary<string, LocalFunctionSymbol> _localFunctions = new(StringComparer.Ordinal);
         private readonly LocalScopeBinder? _nameConflictStop;
 
         private int _tempId;
+        // The first constraint violation that made an inferred candidate inapplicable in the current overload resolution
+        private string? _overloadConstraintFailure;
         /// <summary>Creates a lexical binder for an executable symbol</summary>
         /// <remarks>Flow state is inherited from a parent local binder unless explicitly isolated</remarks>
         public LocalScopeBinder(
@@ -490,7 +494,10 @@ namespace Cnidaria.Cs
                 ? ls._flow
                 : new ControlFlowScope(containing);
 
-            _nameConflictStop = (parent as LocalScopeBinder)?._nameConflictStop;
+            // A nested function body starts a new flow scope; its names may shadow those of the enclosing function.
+            _nameConflictStop = inheritFlowFromParent
+                ? (parent as LocalScopeBinder)?._nameConflictStop
+                : parent as LocalScopeBinder;
 
             if (containing is MethodSymbol m)
             {
@@ -507,6 +514,7 @@ namespace Cnidaria.Cs
             _parameters = template._parameters;
             _localFunctions = template._localFunctions;
             _nameConflictStop = template._nameConflictStop;
+            _isExpressionFlowScope = template._isExpressionFlowScope;
         }
         private LocalScopeBinder WithFlags(BinderFlags flags) => new LocalScopeBinder(this, flags);
         private bool IsCheckedOverflowContext
@@ -556,6 +564,14 @@ namespace Cnidaria.Cs
         }
         private void ImportFlowingLocal(LocalSymbol local)
             => _locals[local.Name] = local;
+        // Expression variables belong to the statement that contains the expression, not to a flow scope inside it.
+        private LocalScopeBinder ExpressionVariableScope()
+        {
+            var scope = this;
+            while (scope._isExpressionFlowScope)
+                scope = (LocalScopeBinder)scope.Parent!;
+            return scope;
+        }
         public override Symbol? GetDeclaredSymbol(SyntaxNode declaration)
             => Parent?.GetDeclaredSymbol(declaration);
 

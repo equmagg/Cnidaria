@@ -846,6 +846,15 @@ internal static class TargetRegisterInfo
         return ImmutableArray<MachineRegister>.Empty;
     }
 
+    public static MachineRegister FrameBaseRegister(TargetInfo target)
+        => target.Architecture switch
+        {
+            TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64 => MachineRegister.X8,
+            TargetArchitectureKind.Arm64 => MachineRegister.X29,
+            TargetArchitectureKind.Arm32 => MachineRegister.X6,
+            _ => MachineRegister.Invalid,
+        };
+
     public static bool IsCalleeSaved(TargetInfo target, MachineRegister register)
     {
         if (target is null)

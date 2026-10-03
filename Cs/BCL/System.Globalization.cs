@@ -1,3 +1,5 @@
+using System.Text;
+
 namespace System.Globalization
 {
     public enum UnicodeCategory
@@ -1308,92 +1310,6 @@ namespace System.Globalization
             return result;
         }
     }
-    internal static class UnicodeUtility
-    {
-        /// <summary>
-        /// The Unicode replacement character U+FFFD.
-        /// </summary>
-        public const uint ReplacementChar = 0xFFFD;
-
-        public static int GetPlane(uint codePoint)
-        {
-            return (int)(codePoint >> 16);
-        }
-
-        /// <summary>
-        /// Returns a Unicode scalar value from two code points representing a UTF-16 surrogate pair.
-        /// </summary>
-        public static uint GetScalarFromUtf16SurrogatePair(uint highSurrogateCodePoint, uint lowSurrogateCodePoint)
-        {
-            // This calculation comes from the Unicode specification, Table 3-5.
-            // Need to remove the D800 marker from the high surrogate and the DC00 marker from the low surrogate,
-            // then fix up the "wwww = uuuuu - 1" section of the bit distribution. The code is written as below
-            // to become just two instructions: shl, lea.
-
-            return (highSurrogateCodePoint << 10) + lowSurrogateCodePoint - ((0xD800U << 10) + 0xDC00U - (1 << 16));
-        }
-
-        public static int GetUtf16SequenceLength(uint value)
-        {
-            value -= 0x10000;   // if value < 0x10000, high byte = 0xFF; else high byte = 0x00
-            value += (2 << 24); // if value < 0x10000, high byte = 0x01; else high byte = 0x02
-            value >>= 24;       // shift high byte down
-            return (int)value;  // and return it
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static void GetUtf16SurrogatesFromSupplementaryPlaneScalar(uint value, out char highSurrogateCodePoint, out char lowSurrogateCodePoint)
-        {
-            // This calculation comes from the Unicode specification, Table 3-5.
-
-            highSurrogateCodePoint = (char)((value + ((0xD800u - 0x40u) << 10)) >> 10);
-            lowSurrogateCodePoint = (char)((value & 0x3FFu) + 0xDC00u);
-        }
-
-        public static int GetUtf8SequenceLength(uint value)
-        {
-            int a = ((int)value - 0x0800) >> 31;
-
-            value ^= 0xF800u;
-            value -= 0xF880u;   // if scalar is 1 or 3 code units, high byte = 0xFF; else high byte = 0x00
-            value += (4 << 24); // if scalar is 1 or 3 code units, high byte = 0x03; else high byte = 0x04
-            value >>= 24;       // shift high byte down
-
-            // Final return value:
-            // - U+0000..U+007F => 3 + (-1) * 2 = 1
-            // - U+0080..U+07FF => 4 + (-1) * 2 = 2
-            // - U+0800..U+FFFF => 3 + ( 0) * 2 = 3
-            // - U+10000+       => 4 + ( 0) * 2 = 4
-            return (int)value + (a * 2);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static bool IsAsciiCodePoint(uint value) => value <= 0x7Fu;
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static bool IsBmpCodePoint(uint value) => value <= 0xFFFFu;
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static bool IsHighSurrogateCodePoint(uint value) => IsInRangeInclusive(value, 0xD800U, 0xDBFFU);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static bool IsInRangeInclusive(uint value, uint lowerBound, uint upperBound) => (value - lowerBound) <= (upperBound - lowerBound);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static bool IsLowSurrogateCodePoint(uint value) => IsInRangeInclusive(value, 0xDC00U, 0xDFFFU);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static bool IsSurrogateCodePoint(uint value) => IsInRangeInclusive(value, 0xD800U, 0xDFFFU);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static bool IsValidCodePoint(uint codePoint) => codePoint <= 0x10FFFFU;
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static bool IsValidUnicodeScalar(uint value)
-        {
-            return ((value - 0x110000u) ^ 0xD800u) >= 0xFFEF0800u;
-        }
-    }
     public sealed class TextInfo
     {
         private enum Tristate : byte
@@ -1660,7 +1576,7 @@ namespace System.Globalization
             //allYearMonthPatterns = cultureData.YearMonths(calendarId);
         }
     }
-    public sealed class NumberFormatInfo
+    public sealed class NumberFormatInfo : IFormatProvider
     {
         internal static readonly string[] s_asciiDigits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
         internal static readonly int[] s_intArrayWithElement3 = [3];
@@ -1764,6 +1680,61 @@ namespace System.Globalization
             if (_isReadOnly)
             {
                 throw new InvalidOperationException();
+            }
+        }
+        public static NumberFormatInfo CurrentInfo
+        {
+            get
+            {
+                CultureInfo culture = CultureInfo.CurrentCulture;
+                if (!culture._isInherited)
+                {
+                    NumberFormatInfo? info = culture._numInfo;
+                    if (info != null)
+                    {
+                        return info;
+                    }
+                }
+                // returns non-nullable when passed typeof(NumberFormatInfo)
+                return (NumberFormatInfo)culture.GetFormat(typeof(NumberFormatInfo))!;
+            }
+        }
+
+        public object? GetFormat(Type? formatType)
+        {
+            return formatType == typeof(NumberFormatInfo) ? this : null;
+        }
+
+        public static NumberFormatInfo GetInstance(IFormatProvider? formatProvider)
+        {
+            return formatProvider == null ?
+                CurrentInfo : // Fast path for a null provider
+                GetProviderNonNull(formatProvider);
+
+            static NumberFormatInfo GetProviderNonNull(IFormatProvider provider)
+            {
+                // Fast path for a regular CultureInfo
+                if (provider.GetType() == typeof(CultureInfo) && ((CultureInfo)provider)._numInfo is { } info)
+                {
+                    return info;
+                }
+
+                return
+                    provider as NumberFormatInfo ?? // Fast path for an NFI
+                    provider.GetFormat(typeof(NumberFormatInfo)) as NumberFormatInfo ??
+                    CurrentInfo;
+            }
+        }
+
+        public string NumberGroupSeparator
+        {
+            get => _numberGroupSeparator;
+            set
+            {
+                VerifyWritable();
+                ArgumentNullException.ThrowIfNull(value);
+                _numberGroupSeparator = value;
+                _numberGroupSeparatorUtf8 = null;
             }
         }
     }
@@ -2011,6 +1982,29 @@ namespace System.Globalization
             }
 
             _type = type;
+        }
+
+        public override bool IsLeapYear(int year, int era)
+        {
+            if (era != CurrentEra && era != ADEra)
+            {
+                throw new ArgumentOutOfRangeException(nameof(era));
+            }
+            return DateTime.IsLeapYear(year);
+        }
+
+        /// <summary>
+        /// Returns the date and time converted to a DateTime value.
+        /// Throws an exception if the n-tuple is invalid.
+        /// </summary>
+        public override DateTime ToDateTime(int year, int month, int day, int hour, int minute, int second, int millisecond, int era)
+        {
+            if (era != CurrentEra && era != ADEra)
+            {
+                throw new ArgumentOutOfRangeException(nameof(era));
+            }
+
+            return new DateTime(year, month, day, hour, minute, second, millisecond);
         }
     }
 

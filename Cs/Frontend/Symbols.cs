@@ -156,41 +156,56 @@ namespace Cnidaria.Cs
             ThrowOnUnmappableCharacter = throwOnUnmappableCharacter;
         }
     }
-    /// <summary>Encodes native import metadata into serialized method flags</summary>
+    /// <summary>Encodes native import metadata as ECMA-335 PInvokeAttributes</summary>
     internal static class PInvokeMetadataFlags
     {
-        private const uint CharSetMask = 0x0000000F;
-        private const uint CallingConventionMask = 0x000000F0;
-        private const int CallingConventionShift = 4;
-        private const uint ExactSpelling = 1u << 8;
-        private const uint SetLastError = 1u << 9;
-        private const uint BestFitMapping = 1u << 10;
-        private const uint PreserveSig = 1u << 11;
-        private const uint ThrowOnUnmappableCharacter = 1u << 12;
+        private const ushort NoMangle = 0x0001;
+        private const ushort CharSetMask = 0x0006;
+        private const ushort BestFitEnabled = 0x0010;
+        private const ushort BestFitDisabled = 0x0020;
+        private const ushort SupportsLastError = 0x0040;
+        private const ushort CallConvMask = 0x0700;
+        private const ushort ThrowOnUnmappableEnabled = 0x1000;
+        private const ushort ThrowOnUnmappableDisabled = 0x2000;
 
-        public static uint Encode(DllImportData data)
+        public static ushort Encode(DllImportData data)
         {
-            uint flags = ((uint)data.CharacterSet & CharSetMask) |
-                         (((uint)data.CallingConvention << CallingConventionShift) & CallingConventionMask);
-            if (data.ExactSpelling) flags |= ExactSpelling;
-            if (data.SetLastError) flags |= SetLastError;
-            if (data.BestFitMapping) flags |= BestFitMapping;
-            if (data.PreserveSig) flags |= PreserveSig;
-            if (data.ThrowOnUnmappableCharacter) flags |= ThrowOnUnmappableCharacter;
-            return flags;
+            int flags = data.CharacterSet switch
+            {
+                System.Runtime.InteropServices.CharSet.Ansi => 0x0002,
+                System.Runtime.InteropServices.CharSet.Unicode => 0x0004,
+                System.Runtime.InteropServices.CharSet.Auto => 0x0006,
+                _ => 0,
+            };
+            flags |= ((int)data.CallingConvention << 8) & CallConvMask;
+            if (data.ExactSpelling) flags |= NoMangle;
+            if (data.SetLastError) flags |= SupportsLastError;
+            flags |= data.BestFitMapping ? BestFitEnabled : BestFitDisabled;
+            flags |= data.ThrowOnUnmappableCharacter ? ThrowOnUnmappableEnabled : ThrowOnUnmappableDisabled;
+            return (ushort)flags;
         }
 
-        public static DllImportData Decode(string moduleName, string entryPointName, uint flags)
-            => new DllImportData(
+        public static DllImportData Decode(string moduleName, string entryPointName, ushort flags, bool preserveSig)
+        {
+            var charSet = (flags & CharSetMask) switch
+            {
+                0x0002 => System.Runtime.InteropServices.CharSet.Ansi,
+                0x0004 => System.Runtime.InteropServices.CharSet.Unicode,
+                0x0006 => System.Runtime.InteropServices.CharSet.Auto,
+                _ => System.Runtime.InteropServices.CharSet.None,
+            };
+            int callingConvention = (flags & CallConvMask) >> 8;
+            return new DllImportData(
                 moduleName,
                 entryPointName,
-                (System.Runtime.InteropServices.CharSet)(flags & CharSetMask),
-                (System.Runtime.InteropServices.CallingConvention)((flags & CallingConventionMask) >> CallingConventionShift),
-                (flags & ExactSpelling) != 0,
-                (flags & SetLastError) != 0,
-                (flags & BestFitMapping) != 0,
-                (flags & PreserveSig) != 0,
-                (flags & ThrowOnUnmappableCharacter) != 0);
+                charSet,
+                callingConvention == 0 ? System.Runtime.InteropServices.CallingConvention.Winapi : (System.Runtime.InteropServices.CallingConvention)callingConvention,
+                (flags & NoMangle) != 0,
+                (flags & SupportsLastError) != 0,
+                (flags & BestFitDisabled) == 0,
+                preserveSig,
+                (flags & ThrowOnUnmappableEnabled) != 0);
+        }
     }
     /// <summary>Defines serialized metadata bits shared by symbol readers and writers</summary>
     internal static class MetadataFlagBits
@@ -198,12 +213,8 @@ namespace Cnidaria.Cs
         public const ushort NoInlining = 0x0008;
         public const ushort AggressiveInlining = 0x0100;
         public const ushort InternalCall = 0x1000;
-        public const ushort Extern = 0x8000;
-        public const ushort Extension = 0x8000;
-        public const int CustomAttribute = 0x0C000000;
-
-        /// <summary>ref struct; outside the range System.Reflection.TypeAttributes uses.</summary>
-        public const int TypeByRefLike = 0x4000_0000;
+        public const ushort PreserveSig = 0x0080;
+        public const ushort Extern = 0x0010;
     }
     /// <summary>Reads method behavior encoded by recognized attributes</summary>
     internal static class MethodAttributeFacts
@@ -315,7 +326,7 @@ namespace Cnidaria.Cs
         }
 
         public static bool HasIntrinsic(MethodSymbol method)
-            => HasAttribute(method, "System", "IntrinsicAttribute");
+            => HasAttribute(method, "System.Runtime.CompilerServices", "IntrinsicAttribute");
         public static bool HasAttribute(MethodSymbol method, string @namespace, string name)
         {
             if (method is null)
@@ -331,7 +342,7 @@ namespace Cnidaria.Cs
             return false;
         }
 
-        private static bool IsAttribute(AttributeData attr, string @namespace, string name)
+        internal static bool IsAttribute(AttributeData attr, string @namespace, string name)
         {
             var attrClass = attr.AttributeClass;
             if (!string.Equals(attrClass.Name, name, StringComparison.Ordinal))
@@ -648,8 +659,12 @@ namespace Cnidaria.Cs
     public abstract class NamedTypeSymbol : TypeSymbol
     {
         public abstract TypeKind TypeKind { get; }
+        internal virtual bool MayContainExtensionMembers => true;
+        internal virtual bool MayContainExtensionBlocks => true;
+        internal virtual IEnumerable<NamedTypeSymbol> GetNestedTypes() => GetMembers().OfType<NamedTypeSymbol>();
         public abstract int Arity { get; }
         public virtual bool IsSealed => false;
+        public virtual bool IsAbstract => false;
         public virtual bool IsReadOnlyStruct => false;
         public abstract ImmutableArray<TypeParameterSymbol> TypeParameters { get; }
         public virtual ImmutableArray<TypeSymbol> TypeArguments
@@ -685,6 +700,7 @@ namespace Cnidaria.Cs
         StructConstraint = 1 << 2,
         AllowsRefStruct = 1 << 3,
         ClassConstraint = 1 << 4,
+        ConstructorConstraint = 1 << 5,
     }
 
     /// <summary>Represents a type parameter declared by a type or method</summary>
@@ -1110,6 +1126,7 @@ namespace Cnidaria.Cs
         public abstract bool IsConst { get; }
         public virtual bool IsReadOnly => false;
         public abstract Optional<object> ConstantValueOpt { get; }
+        public virtual FieldSymbol OriginalDefinition => this;
     }
     /// <summary>Base abstraction for a property or indexer</summary>
     public abstract class PropertySymbol : Symbol
@@ -1123,11 +1140,76 @@ namespace Cnidaria.Cs
         public abstract MethodSymbol? SetMethod { get; }
         /// <summary>Interface member implemented explicitly by this property</summary>
         public virtual PropertySymbol? ExplicitInterfaceImplementation => null;
+        /// <summary>Declared with an interface-qualified name, so never found by member lookup</summary>
+        public virtual bool IsExplicitInterfaceImplementation => ExplicitInterfaceImplementation is not null;
         public virtual ImmutableArray<ParameterSymbol> Parameters => ImmutableArray<ParameterSymbol>.Empty;
+    }
+    internal enum ExtensionMemberKind : byte
+    {
+        Method,
+        Property,
+        Operator,
+    }
+    /// <summary>Describes a member of a C# 14 extension block through the static method that implements it</summary>
+    internal sealed class ExtensionMemberInfo
+    {
+        public ExtensionMemberKind Kind { get; }
+        /// <summary>The member name; for an accessor, the property name</summary>
+        public string Name { get; }
+        public bool IsStatic { get; }
+        public bool IsSetter { get; }
+        /// <summary>The block's type parameters lead the implementation method's own</summary>
+        public int BlockTypeParameterCount { get; }
+        public string GroupingTypeName { get; }
+        /// <summary>The extended type in terms of the implementation method's type parameters</summary>
+        public TypeSymbol? ExtendedType { get; internal set; }
+        internal SyntaxReference? BlockSyntax { get; }
+        public ExtensionMemberInfo(
+            ExtensionMemberKind kind,
+            string name,
+            bool isStatic,
+            bool isSetter,
+            int blockTypeParameterCount,
+            string groupingTypeName,
+            SyntaxReference? blockSyntax = null)
+        {
+            Kind = kind;
+            Name = name;
+            IsStatic = isStatic;
+            IsSetter = isSetter;
+            BlockTypeParameterCount = blockTypeParameterCount;
+            GroupingTypeName = groupingTypeName;
+            BlockSyntax = blockSyntax;
+        }
+    }
+    /// <summary>An extension property seen from one access, with accessors constructed for its receiver</summary>
+    internal sealed class ExtensionPropertySymbol : PropertySymbol
+    {
+        public override string Name { get; }
+        public override Symbol? ContainingSymbol { get; }
+        public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
+        public override TypeSymbol Type { get; }
+        public override bool IsStatic { get; }
+        public override bool HasGet => GetMethod is not null;
+        public override bool HasSet => SetMethod is not null;
+        public override MethodSymbol? GetMethod { get; }
+        public override MethodSymbol? SetMethod { get; }
+        public override Accessibility DeclaredAccessibility { get; }
+        public ExtensionPropertySymbol(string name, Symbol? containing, TypeSymbol type, bool isStatic, MethodSymbol? getMethod, MethodSymbol? setMethod)
+        {
+            Name = name;
+            ContainingSymbol = containing;
+            Type = type;
+            IsStatic = isStatic;
+            GetMethod = getMethod;
+            SetMethod = setMethod;
+            DeclaredAccessibility = (getMethod ?? setMethod)?.DeclaredAccessibility ?? Accessibility.Public;
+        }
     }
     /// <summary>Base abstraction for a method, constructor, operator, or accessor</summary>
     public abstract class MethodSymbol : Symbol
     {
+        internal virtual ExtensionMemberInfo? ExtensionMember => null;
         public sealed override SymbolKind Kind => SymbolKind.Method;
         public abstract TypeSymbol ReturnType { get; }
         public virtual bool ReturnsByRefReadonly => false;
@@ -1148,6 +1230,8 @@ namespace Cnidaria.Cs
         public virtual MethodSymbol OriginalDefinition => this;
         /// <summary>Interface member implemented explicitly by this method</summary>
         public virtual MethodSymbol? ExplicitInterfaceImplementation => null;
+        /// <summary>Declared with an interface-qualified name, so never found by member lookup</summary>
+        public virtual bool IsExplicitInterfaceImplementation => ExplicitInterfaceImplementation is not null;
         public virtual ImmutableArray<TypeSymbol> TypeArguments
         {
             get
@@ -1184,6 +1268,7 @@ namespace Cnidaria.Cs
         public override bool IsStatic { get; }
         public override bool IsConstructor => true;
         public override bool IsAsync => false;
+        public override Accessibility DeclaredAccessibility => IsStatic ? Accessibility.Private : Accessibility.Public;
         public SynthesizedConstructorSymbol(
             NamedTypeSymbol containing,
             TypeSymbol voidType,
@@ -1543,6 +1628,9 @@ namespace Cnidaria.Cs
         internal void SetType(TypeSymbol type) => _type = type;
         internal void SetExplicitInterfaceImplementation(PropertySymbol property)
             => _explicitInterfaceImplementation = property ?? throw new ArgumentNullException(nameof(property));
+        private bool _isExplicitDeclaration;
+        public override bool IsExplicitInterfaceImplementation => _isExplicitDeclaration || _explicitInterfaceImplementation is not null;
+        internal void MarkExplicitInterfaceDeclaration() => _isExplicitDeclaration = true;
         internal void SetParameters(ImmutableArray<ParameterSymbol> parameters)
             => _parameters = parameters.IsDefault ? ImmutableArray<ParameterSymbol>.Empty : parameters;
         internal void AddDeclaration(Location location, SyntaxReference declarationRef)
@@ -1588,6 +1676,7 @@ namespace Cnidaria.Cs
     internal sealed class SourceNamedTypeSymbol : NamedTypeSymbol
     {
         private bool _isSealed;
+        private bool _isAbstract;
         private bool _isUnsafe;
         private readonly bool _isReadOnlyStruct;
         private readonly bool _isRefLikeType;
@@ -1595,6 +1684,8 @@ namespace Cnidaria.Cs
         private readonly List<SyntaxReference> _declRefs = new();
         private readonly List<Location> _locations = new();
         private readonly List<Symbol> _members = new();
+        private ImmutableArray<Symbol> _memberSnapshot;
+        private Action? _memberLoader;
         private readonly Dictionary<(string name, int arity), List<NamedTypeSymbol>> _nestedTypesByName = new();
 
         private TypeSymbol? _defaultBaseType;
@@ -1612,12 +1703,22 @@ namespace Cnidaria.Cs
         private ImmutableArray<TypeParameterSymbol> _typeParameters;
         private readonly List<AttributeData> _attributes = new();
         public override bool IsSealed => _isSealed;
+        public override bool IsAbstract => _isAbstract;
         internal bool IsUnsafe => _isUnsafe;
         public override bool IsRefLikeType => _isRefLikeType;
         public override bool IsReadOnlyStruct => _isReadOnlyStruct;
         public override int Arity => _arity;
         public override Accessibility DeclaredAccessibility { get; }
         public override bool IsFromMetadata { get; }
+        private bool _mayContainExtensionMembers;
+        private bool _mayContainExtensionBlocks;
+        internal override bool MayContainExtensionMembers => !IsFromMetadata || _mayContainExtensionMembers;
+        internal override bool MayContainExtensionBlocks => !IsFromMetadata || _mayContainExtensionBlocks;
+        internal void MarkMayContainExtensionMembers(bool inBlock)
+        {
+            _mayContainExtensionMembers = true;
+            _mayContainExtensionBlocks |= inBlock;
+        }
         public override string Name { get; }
         public override Symbol? ContainingSymbol { get; }
         public override ImmutableArray<Location> Locations => _locations.ToImmutableArray();
@@ -1643,6 +1744,7 @@ namespace Cnidaria.Cs
 
         public override TypeSymbol? EnumUnderlyingType => _enumUnderlyingTypeSet ? _enumUnderlyingType : null;
         internal void MarkSealed() => _isSealed = true;
+        internal void MarkAbstract() => _isAbstract = true;
         internal void MarkUnsafe() => _isUnsafe = true;
         internal void SetEnumUnderlyingType(TypeSymbol underlyingType)
         {
@@ -1723,7 +1825,11 @@ namespace Cnidaria.Cs
 
         public override ImmutableArray<SyntaxReference> DeclaringSyntaxReferences => _declRefs.ToImmutableArray();
 
-        public void AddMember(Symbol member) => _members.Add(member);
+        public void AddMember(Symbol member)
+        {
+            _members.Add(member);
+            _memberSnapshot = default;
+        }
 
         public void AddNestedType(NamedTypeSymbol type)
         {
@@ -1732,9 +1838,22 @@ namespace Cnidaria.Cs
                 _nestedTypesByName[key] = list = new List<NamedTypeSymbol>();
             list.Add(type);
             _members.Add(type);
+            _memberSnapshot = default;
         }
 
-        public override ImmutableArray<Symbol> GetMembers() => _members.ToImmutableArray();
+        internal void SetMemberLoader(Action loader) => _memberLoader = loader;
+        internal override IEnumerable<NamedTypeSymbol> GetNestedTypes() => _nestedTypesByName.Values.SelectMany(static list => list);
+        public override ImmutableArray<Symbol> GetMembers()
+        {
+            if (_memberLoader is Action load)
+            {
+                _memberLoader = null;
+                load();
+            }
+            if (_memberSnapshot.IsDefault)
+                _memberSnapshot = _members.ToImmutableArray();
+            return _memberSnapshot;
+        }
 
         public override ImmutableArray<NamedTypeSymbol> GetTypeMembers(string name, int arity)
         {
@@ -1859,6 +1978,9 @@ namespace Cnidaria.Cs
         public override bool IsExtensionMethod => _isExtensionMethod;
         internal bool IsUnsafe { get; }
         internal SourcePropertySymbol? AssociatedProperty { get; private set; }
+        private ExtensionMemberInfo? _extensionMember;
+        internal override ExtensionMemberInfo? ExtensionMember => _extensionMember;
+        internal void SetExtensionMember(ExtensionMemberInfo info) => _extensionMember = info;
         public SourceMethodSymbol(
             string name,
             Symbol containing,
@@ -1899,7 +2021,18 @@ namespace Cnidaria.Cs
             _explicitInterfaceImplementation = method
                 ?? throw new ArgumentNullException(nameof(method));
         }
+        private bool _isExplicitDeclaration;
+        public override bool IsExplicitInterfaceImplementation => _isExplicitDeclaration || _explicitInterfaceImplementation is not null;
+        internal void MarkExplicitInterfaceDeclaration() => _isExplicitDeclaration = true;
         internal void SetOverriddenMethod(MethodSymbol overridden) => _overridden = overridden;
+        internal bool ImplementsInterfaceMethodImplicitly { get; private set; }
+        internal void MarkImplicitInterfaceImplementation() => ImplementsInterfaceMethodImplicitly = true;
+        private List<MethodSymbol>? _implicitStaticInterfaceImplementations;
+        /// <summary>Static abstract or virtual interface members this public static method implements by name</summary>
+        internal IReadOnlyList<MethodSymbol> ImplicitStaticInterfaceImplementations
+            => (IReadOnlyList<MethodSymbol>?)_implicitStaticInterfaceImplementations ?? Array.Empty<MethodSymbol>();
+        internal void AddImplicitStaticInterfaceImplementation(MethodSymbol interfaceMethod)
+            => (_implicitStaticInterfaceImplementations ??= new List<MethodSymbol>()).Add(interfaceMethod);
         internal void SetAssociatedProperty(SourcePropertySymbol property)
             => AssociatedProperty ??= property ?? throw new ArgumentNullException(nameof(property));
         internal void SetTypeParameters(ImmutableArray<TypeParameterSymbol> typeParameters)
@@ -2201,6 +2334,7 @@ namespace Cnidaria.Cs
         public override bool IsConst => _original.IsConst;
         public override bool IsReadOnly => _original.IsReadOnly;
         public override Optional<object> ConstantValueOpt => _original.ConstantValueOpt;
+        public override FieldSymbol OriginalDefinition => _original.OriginalDefinition;
 
         public override TypeSymbol Type => _type;
         public override Accessibility DeclaredAccessibility => _original.DeclaredAccessibility;
@@ -2228,6 +2362,7 @@ namespace Cnidaria.Cs
         public override Accessibility DeclaredAccessibility => _original.DeclaredAccessibility;
         public override bool IsFromMetadata => _original.IsFromMetadata;
         public override TypeSymbol Type => _type;
+        public override bool IsExplicitInterfaceImplementation => _original.IsExplicitInterfaceImplementation;
         public override bool IsStatic => _original.IsStatic;
         public override bool HasGet => _getMethod is not null;
         public override bool HasSet => _setMethod is not null;
@@ -2302,10 +2437,12 @@ namespace Cnidaria.Cs
         public override bool IsOverride => _original.IsOverride;
         public override bool IsSealed => _original.IsSealed;
         public override ImmutableArray<TypeParameterSymbol> TypeParameters => _original.TypeParameters;
+        internal override ExtensionMemberInfo? ExtensionMember => _original.ExtensionMember;
         public override TypeSymbol ReturnType => _returnType;
         public override bool ReturnsByRefReadonly => _original.ReturnsByRefReadonly;
         public override ImmutableArray<ParameterSymbol> Parameters => _parameters;
         public override MethodSymbol OriginalDefinition => _original.OriginalDefinition;
+        public override bool IsExplicitInterfaceImplementation => _original.IsExplicitInterfaceImplementation;
         public override MethodSymbol? ExplicitInterfaceImplementation
         {
             get
@@ -2402,6 +2539,7 @@ namespace Cnidaria.Cs
         public override bool IsExtern => _definition.IsExtern;
         public override bool IsExtensionMethod => _definition.IsExtensionMethod;
         public override ImmutableArray<TypeParameterSymbol> TypeParameters => _definition.TypeParameters;
+        internal override ExtensionMemberInfo? ExtensionMember => _definition.ExtensionMember;
 
         public override TypeSymbol ReturnType => _returnType;
         public override bool ReturnsByRefReadonly => _definition.ReturnsByRefReadonly;
@@ -2522,9 +2660,14 @@ namespace Cnidaria.Cs
         public override bool IsSealed => _isSealed;
         public override TypeSymbol? BaseType { get; }
         public override int Arity => 0;
+        private ImmutableArray<TypeSymbol> _interfaces = ImmutableArray<TypeSymbol>.Empty;
+        public override ImmutableArray<TypeSymbol> Interfaces => _interfaces;
         private readonly List<Symbol> _members = new();
+        private ImmutableArray<Symbol> _memberSnapshot;
+        private Action? _memberLoader;
         private readonly Dictionary<(string name, int arity), List<NamedTypeSymbol>> _nestedTypesByName = new();
-        public override Accessibility DeclaredAccessibility { get; }
+        private Accessibility _declaredAccessibility;
+        public override Accessibility DeclaredAccessibility => _declaredAccessibility;
         public override bool IsFromMetadata => true;
         public override ImmutableArray<TypeParameterSymbol> TypeParameters => ImmutableArray<TypeParameterSymbol>.Empty;
         public SpecialNamedTypeSymbol(
@@ -2545,7 +2688,13 @@ namespace Cnidaria.Cs
             BaseType = baseType;
         }
         internal void MarkSealed() => _isSealed = true;
-        internal void AddMember(Symbol member) => _members.Add(member);
+        internal void SetDeclaredInterfaces(ImmutableArray<TypeSymbol> interfaces) => _interfaces = interfaces;
+        internal void SetDeclaredAccessibility(Accessibility accessibility) => _declaredAccessibility = accessibility;
+        internal void AddMember(Symbol member)
+        {
+            _members.Add(member);
+            _memberSnapshot = default;
+        }
         internal void AddNestedType(NamedTypeSymbol type)
         {
             var key = (type.Name, type.Arity);
@@ -2553,8 +2702,21 @@ namespace Cnidaria.Cs
                 _nestedTypesByName[key] = list = new List<NamedTypeSymbol>();
             list.Add(type);
             _members.Add(type);
+            _memberSnapshot = default;
         }
-        public override ImmutableArray<Symbol> GetMembers() => _members.ToImmutableArray();
+        internal void SetMemberLoader(Action loader) => _memberLoader = loader;
+        internal override IEnumerable<NamedTypeSymbol> GetNestedTypes() => _nestedTypesByName.Values.SelectMany(static list => list);
+        public override ImmutableArray<Symbol> GetMembers()
+        {
+            if (_memberLoader is Action load)
+            {
+                _memberLoader = null;
+                load();
+            }
+            if (_memberSnapshot.IsDefault)
+                _memberSnapshot = _members.ToImmutableArray();
+            return _memberSnapshot;
+        }
         public override ImmutableArray<NamedTypeSymbol> GetTypeMembers(string name, int arity)
         {
             if (arity >= 0)
@@ -2680,6 +2842,9 @@ namespace Cnidaria.Cs
         public override bool IsAbstract => _isAbstract;
         public override bool IsOverride => _isOverride;
         public override bool IsSealed => _isSealed;
+        private ExtensionMemberInfo? _extensionMember;
+        internal override ExtensionMemberInfo? ExtensionMember => _extensionMember;
+        internal void SetExtensionMember(ExtensionMemberInfo info) => _extensionMember = info;
         public ExternalMethodSymbol(
             string name,
             Symbol containing,

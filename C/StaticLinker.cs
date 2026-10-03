@@ -925,7 +925,8 @@ public static class StaticLinker
         }
         if (unit.Linkage.IsInternal(symbol))
             return;
-        if (symbol is FunctionSymbol { IntrinsicKind: RuntimeIntrinsicKind.BuiltinVaStart or RuntimeIntrinsicKind.BuiltinVaArg or RuntimeIntrinsicKind.CStringWrite })
+        if (symbol is FunctionSymbol { IntrinsicKind: RuntimeIntrinsicKind.BuiltinVaStart or RuntimeIntrinsicKind.BuiltinVaArg or RuntimeIntrinsicKind.CStringWrite or
+            RuntimeIntrinsicKind.StackAllocate or RuntimeIntrinsicKind.StackSave or RuntimeIntrinsicKind.StackRestore })
             return;
         references.Add(symbol.Name);
     }

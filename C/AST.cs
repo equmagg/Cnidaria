@@ -953,6 +953,34 @@ public sealed class SizeofExpressionSyntax : ExpressionSyntax
     }
 }
 
+public sealed class OffsetofExpressionSyntax : ExpressionSyntax
+{
+    public override SyntaxKind Kind => SyntaxKind.OffsetofExpression;
+
+    public SyntaxToken Keyword { get; }
+    public SyntaxToken OpenParenToken { get; }
+    public ImmutableArray<SyntaxToken> TypeNameTokens { get; }
+    public SyntaxToken CommaToken { get; }
+    public ImmutableArray<SyntaxToken> MemberTokens { get; }
+    public SyntaxToken CloseParenToken { get; }
+
+    public OffsetofExpressionSyntax(
+        SyntaxToken keyword,
+        SyntaxToken openParenToken,
+        ImmutableArray<SyntaxToken> typeNameTokens,
+        SyntaxToken commaToken,
+        ImmutableArray<SyntaxToken> memberTokens,
+        SyntaxToken closeParenToken)
+    {
+        Keyword = keyword;
+        OpenParenToken = openParenToken;
+        TypeNameTokens = typeNameTokens;
+        CommaToken = commaToken;
+        MemberTokens = memberTokens;
+        CloseParenToken = closeParenToken;
+    }
+}
+
 ///<summary>Represents an expression enclosed in parentheses</summary>
 public sealed class ParenthesizedExpressionSyntax : ExpressionSyntax
 {

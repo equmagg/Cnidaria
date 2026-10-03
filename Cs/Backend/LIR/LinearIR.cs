@@ -622,28 +622,28 @@ namespace Cnidaria.Cs
                 GenTreeKind.Rethrow)
                 return true;
 
-            if (source.Kind == GenTreeKind.Branch && source.SourceOp == BytecodeOp.Leave)
+            if (source.Kind == GenTreeKind.Branch && source.Operator == GenTreeOperator.Leave)
                 return true;
 
             if (source.Kind == GenTreeKind.Binary)
             {
                 // No machine target has a floating remainder instruction, so it becomes a call
                 if (!target.IsRegisterBytecode &&
-                    source.SourceOp == BytecodeOp.Rem &&
+                    source.Operator == GenTreeOperator.Rem &&
                     source.StackKind is GenStackKind.R4 or GenStackKind.R8)
                 {
                     return true;
                 }
 
-                if (source.SourceOp is
-                    BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un or
-                    BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un or
-                    BytecodeOp.Mul_Ovf or BytecodeOp.Mul_Ovf_Un)
+                if (source.Operator is
+                    GenTreeOperator.AddOvf or GenTreeOperator.AddOvfUn or
+                    GenTreeOperator.SubOvf or GenTreeOperator.SubOvfUn or
+                    GenTreeOperator.MulOvf or GenTreeOperator.MulOvfUn)
                 {
                     return true;
                 }
 
-                if (source.SourceOp is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un)
+                if (source.Operator is GenTreeOperator.Div or GenTreeOperator.DivUn or GenTreeOperator.Rem or GenTreeOperator.RemUn)
                     return GenTreeArithmeticSemantics.DivRemCanThrow(source, target);
             }
 
@@ -710,6 +710,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.ConstR8Bits => false,
                 GenTreeKind.ConstNull => false,
                 GenTreeKind.ConstString => false,
+                GenTreeKind.TypeHandle => false,
                 GenTreeKind.DefaultValue => false,
                 GenTreeKind.SizeOf => false,
                 GenTreeKind.Local => false,
@@ -820,9 +821,9 @@ namespace Cnidaria.Cs
 
         internal static bool IsCheckedIntegerBinary(GenTree source)
             => source.Kind == GenTreeKind.Binary &&
-               source.SourceOp is BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un or
-                   BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un or
-                   BytecodeOp.Mul_Ovf or BytecodeOp.Mul_Ovf_Un;
+               source.Operator is GenTreeOperator.AddOvf or GenTreeOperator.AddOvfUn or
+                   GenTreeOperator.SubOvf or GenTreeOperator.SubOvfUn or
+                   GenTreeOperator.MulOvf or GenTreeOperator.MulOvfUn;
 
         internal static bool IsCheckedIntegerConversion(GenTree source)
             => source.Kind == GenTreeKind.Conv &&
@@ -832,7 +833,7 @@ namespace Cnidaria.Cs
         private static bool IsIntegerDivRem(GenTree source, GenTree? result, TargetInfo target)
         {
             if (source.Kind != GenTreeKind.Binary ||
-                source.SourceOp is not (BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un))
+                source.Operator is not (GenTreeOperator.Div or GenTreeOperator.DivUn or GenTreeOperator.Rem or GenTreeOperator.RemUn))
             {
                 return false;
             }

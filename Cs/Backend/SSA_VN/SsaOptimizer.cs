@@ -220,7 +220,7 @@ namespace Cnidaria.Cs
                     node.Id,
                     node.Kind,
                     node.Pc,
-                    node.SourceOp,
+                    node.Operator,
                     node.Type,
                     node.StackKind,
                     node.Flags & ~GenTreeFlags.MakeCse,
@@ -581,7 +581,7 @@ namespace Cnidaria.Cs
                         return false;
                     if (target != blockId + 1)
                         return false;
-                    if (branch.SourceOp != BytecodeOp.Br)
+                    if (branch.Operator != GenTreeOperator.None)
                         return false;
                     if (!SameEhRegion(blockId, target))
                         return false;
@@ -935,7 +935,7 @@ namespace Cnidaria.Cs
                         tree.Id,
                         tree.Kind,
                         tree.Pc,
-                        tree.SourceOp,
+                        tree.Operator,
                         tree.Type,
                         tree.StackKind,
                         tree.Flags,
@@ -1421,7 +1421,7 @@ namespace Cnidaria.Cs
                     else if (tree.Kind == GenTreeKind.Binary && tree.Operands.Length == 2)
                     {
                         if (!CanFoldComparisonOperands(tree.Operands[0].Source.StackKind, tree.Operands[1].Source.StackKind) &&
-                            IsComparisonOpcode(tree.Source.SourceOp))
+                            IsComparisonOpcode(tree.Source.Operator))
                         {
                             constant = default;
                             return false;
@@ -1498,7 +1498,7 @@ namespace Cnidaria.Cs
                     else if (tree.Kind == GenTreeKind.Binary && tree.Operands.Length == 2)
                     {
                         if (!CanFoldComparisonOperands(tree.Operands[0].StackKind, tree.Operands[1].StackKind) &&
-                            IsComparisonOpcode(tree.SourceOp))
+                            IsComparisonOpcode(tree.Operator))
                         {
                             constant = default;
                             return false;
@@ -1524,8 +1524,8 @@ namespace Cnidaria.Cs
                     return false;
                 }
 
-                private static bool IsComparisonOpcode(BytecodeOp op)
-                    => op is BytecodeOp.Ceq or BytecodeOp.Clt or BytecodeOp.Clt_Un or BytecodeOp.Cgt or BytecodeOp.Cgt_Un;
+                private static bool IsComparisonOpcode(GenTreeOperator op)
+                    => op is GenTreeOperator.Ceq or GenTreeOperator.Clt or GenTreeOperator.CltUn or GenTreeOperator.Cgt or GenTreeOperator.CgtUn;
 
                 private bool CanForwardSubstituteSlot(SsaSlot slot)
                 {
@@ -2118,7 +2118,7 @@ namespace Cnidaria.Cs
                     if (blocks.Length == 0)
                         return blocks;
 
-                    bool hasEh = _method.GenTreeMethod.Function.ExceptionHandlers.Length != 0 ||
+                    bool hasEh = _method.GenTreeMethod.ExceptionHandlers.Length != 0 ||
                                  _method.Cfg.ExceptionRegions.Length != 0;
                     var exceptionEdges = hasEh
                         ? EhFuncletLayout.BuildImplicitExceptionEdges(_method.Cfg)
@@ -2302,7 +2302,7 @@ namespace Cnidaria.Cs
                         tree.Id,
                         tree.Kind,
                         tree.Pc,
-                        tree.SourceOp,
+                        tree.Operator,
                         tree.Type,
                         tree.StackKind,
                         tree.Flags,
@@ -2339,7 +2339,7 @@ namespace Cnidaria.Cs
                         _nextTreeId++,
                         GenTreeKind.Branch,
                         pc,
-                        BytecodeOp.Br,
+                        GenTreeOperator.None,
                         null,
                         GenStackKind.Void,
                         GenTreeFlags.ControlFlow | GenTreeFlags.Ordered,
@@ -2352,7 +2352,7 @@ namespace Cnidaria.Cs
                         _nextTreeId++,
                         GenTreeKind.Eval,
                         pc,
-                        BytecodeOp.Pop,
+                        GenTreeOperator.None,
                         null,
                         GenStackKind.Void,
                         operand.Flags & ~(GenTreeFlags.AssertionProperties | GenTreeFlags.ExplicitInit),
@@ -2363,7 +2363,7 @@ namespace Cnidaria.Cs
                         tree.Id,
                         tree.Kind,
                         tree.Pc,
-                        tree.SourceOp,
+                        tree.Operator,
                         tree.Type,
                         tree.StackKind,
                         tree.Flags,
@@ -3079,7 +3079,7 @@ namespace Cnidaria.Cs
                     _nextSyntheticTreeId++,
                     kind,
                     template.Pc,
-                    template.SourceOp,
+                    template.Operator,
                     descriptor.Type,
                     descriptor.StackKind,
                     flags,

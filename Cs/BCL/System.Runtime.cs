@@ -66,5 +66,42 @@ namespace System.Runtime
     {
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static unsafe T[] RhAllocateNewArray<T>(int length, uint flags) => null!;
+
+        // The runtime handle of an object's type: its MethodTable on native targets, its type id on the VMs.
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static IntPtr RhGetObjectTypeHandle(object obj) => default;
+
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static string RhGetTypeName(IntPtr handle) => null!;
+
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static string? RhGetTypeNamespace(IntPtr handle) => null;
+
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static string? RhGetTypeFullName(IntPtr handle) => null;
+
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static string RhGetTypeDisplayName(IntPtr handle) => null!;
+
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static string RhGetTypeAssemblyName(IntPtr handle) => null!;
+
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static int RhGetTypeFlags(IntPtr handle) => 0;
+
+        // The object's identity hash, assigned on first request and stable for its lifetime
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static int RhGetObjectHashCode(object obj) => 0;
+
+        // The identity hash if one was already assigned, or 0
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static int RhTryGetObjectHashCode(object obj) => 0;
     }
 }

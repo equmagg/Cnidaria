@@ -9,6 +9,8 @@ namespace Cnidaria.Cs
         InterlockedExchangeAdd,
         InterlockedExchange,
         MemoryBarrier,
+        VolatileRead,
+        VolatileWrite,
     }
 
     [Flags]
@@ -176,6 +178,19 @@ namespace Cnidaria.Cs
                 return RuntimeIntrinsicId.MemoryBarrier;
             }
 
+            if (!method.HasThis &&
+                method.IsStatic &&
+                method.ParameterTypes.Length is 1 or 2 &&
+                method.ParameterTypes[0].Kind == RuntimeTypeKind.ByRef &&
+                StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Threading") &&
+                StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Volatile"))
+            {
+                if (method.ParameterTypes.Length == 1 && StringComparer.Ordinal.Equals(method.Name, "Read"))
+                    return RuntimeIntrinsicId.VolatileRead;
+                if (method.ParameterTypes.Length == 2 && StringComparer.Ordinal.Equals(method.Name, "Write"))
+                    return RuntimeIntrinsicId.VolatileWrite;
+            }
+
             return RuntimeIntrinsicId.None;
         }
 
@@ -185,7 +200,7 @@ namespace Cnidaria.Cs
                 RuntimeIntrinsicId.InterlockedCompareExchange => AtomicReadModifyWriteFlags,
                 RuntimeIntrinsicId.InterlockedExchangeAdd => AtomicReadModifyWriteFlags,
                 RuntimeIntrinsicId.InterlockedExchange => AtomicReadModifyWriteFlags,
-                RuntimeIntrinsicId.MemoryBarrier => MemoryBarrierFlags,
+                RuntimeIntrinsicId.MemoryBarrier or RuntimeIntrinsicId.VolatileRead or RuntimeIntrinsicId.VolatileWrite => MemoryBarrierFlags,
                 _ => RuntimeIntrinsicFlags.None,
             };
 
@@ -228,6 +243,8 @@ namespace Cnidaria.Cs
                     }
                     break;
                 case RuntimeIntrinsicId.MemoryBarrier:
+                case RuntimeIntrinsicId.VolatileRead:
+                case RuntimeIntrinsicId.VolatileWrite:
                     intrinsic = new RuntimeIntrinsicInfo(id, MemoryBarrierFlags);
                     return true;
             }
@@ -236,39 +253,16 @@ namespace Cnidaria.Cs
             return false;
         }
 
+        // Every backend with a code generator expands all of these; the bodies left in the BCL recurse
         public static bool Supports(RuntimeIntrinsicId id, TargetInfo target)
-            => id switch
-            {
-                RuntimeIntrinsicId.InterlockedCompareExchange => target.Architecture is
-                    Cnidaria.TargetArchitectureKind.RegisterBytecode or
-                    Cnidaria.TargetArchitectureKind.RegisterBytecode64 or
-                    Cnidaria.TargetArchitectureKind.I386 or
-                    Cnidaria.TargetArchitectureKind.X86_64 or
-                    Cnidaria.TargetArchitectureKind.RiscV32 or
-                    Cnidaria.TargetArchitectureKind.RiscV64,
-                RuntimeIntrinsicId.InterlockedExchangeAdd => target.Architecture is
-                    Cnidaria.TargetArchitectureKind.RegisterBytecode or
-                    Cnidaria.TargetArchitectureKind.RegisterBytecode64 or
-                    Cnidaria.TargetArchitectureKind.I386 or
-                    Cnidaria.TargetArchitectureKind.X86_64 or
-                    Cnidaria.TargetArchitectureKind.RiscV32 or
-                    Cnidaria.TargetArchitectureKind.RiscV64,
-                RuntimeIntrinsicId.InterlockedExchange => target.Architecture is
-                    Cnidaria.TargetArchitectureKind.RegisterBytecode or
-                    Cnidaria.TargetArchitectureKind.RegisterBytecode64 or
-                    Cnidaria.TargetArchitectureKind.I386 or
-                    Cnidaria.TargetArchitectureKind.X86_64 or
-                    Cnidaria.TargetArchitectureKind.RiscV32 or
-                    Cnidaria.TargetArchitectureKind.RiscV64,
-                RuntimeIntrinsicId.MemoryBarrier => target.Architecture is
-                    Cnidaria.TargetArchitectureKind.RegisterBytecode or
-                    Cnidaria.TargetArchitectureKind.RegisterBytecode64 or
-                    Cnidaria.TargetArchitectureKind.I386 or
-                    Cnidaria.TargetArchitectureKind.X86_64 or
-                    Cnidaria.TargetArchitectureKind.RiscV32 or
-                    Cnidaria.TargetArchitectureKind.RiscV64,
-                _ => false,
-            };
+            => id != RuntimeIntrinsicId.None && target.Architecture is
+                Cnidaria.TargetArchitectureKind.RegisterBytecode or
+                Cnidaria.TargetArchitectureKind.RegisterBytecode64 or
+                Cnidaria.TargetArchitectureKind.I386 or
+                Cnidaria.TargetArchitectureKind.X86_64 or
+                Cnidaria.TargetArchitectureKind.RiscV32 or
+                Cnidaria.TargetArchitectureKind.RiscV64 or
+                Cnidaria.TargetArchitectureKind.Arm64;
 
         private static bool TryGetInterlockedCompareExchange(
             RuntimeMethod method,

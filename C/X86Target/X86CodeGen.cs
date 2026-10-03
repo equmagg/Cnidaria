@@ -1127,6 +1127,8 @@ public sealed class X86CodeGenerator
             _frameSize = ComputeFrameSize();
         }
 
+        private X86Register FrameBase => _allocation.Frame.HasDynamicStack ? X86Register.Rbp : X86Register.Rsp;
+
         public void EmitPrologue()
         {
             foreach (var register in _savedGeneralRegisters)
@@ -1134,6 +1136,11 @@ public sealed class X86CodeGenerator
 
             if (_frameSize != 0)
                 Emit(X86Instruction.Binary(X86InstrKind.Sub, StackPointer(), Imm(_frameSize)));
+            if (_allocation.Frame.HasDynamicStack)
+            {
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, Mem(X86Register.Rsp, _allocation.Frame.FrameBaseSaveOffset, _wordSize), Reg(X86Register.Rbp, _wordSize)));
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rbp, _wordSize), StackPointer()));
+            }
 
             SaveCalleeSavedVectorRegisters();
             SaveIncomingSysVX64VarArgsRegisterArea();
@@ -1300,7 +1307,11 @@ public sealed class X86CodeGenerator
         public void EmitEpilogue()
         {
             _owner.DefineLabel(_epilogueLabel);
+            if (_allocation.Frame.HasDynamicStack)
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, StackPointer(), Reg(X86Register.Rbp, _wordSize)));
             RestoreCalleeSavedVectorRegisters();
+            if (_allocation.Frame.HasDynamicStack)
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rbp, _wordSize), Mem(X86Register.Rsp, _allocation.Frame.FrameBaseSaveOffset, _wordSize)));
             if (_frameSize != 0)
                 Emit(X86Instruction.Binary(X86InstrKind.Add, StackPointer(), Imm(_frameSize)));
             for (var i = _savedGeneralRegisters.Count - 1; i >= 0; i--)
@@ -1334,7 +1345,8 @@ public sealed class X86CodeGenerator
 
         private bool IsAlignmentFreeLeaf()
         {
-            if (_sysVX64RegisterSaveAreaOffset >= 0 ||
+            if (_allocation.Frame.HasDynamicStack ||
+                _sysVX64RegisterSaveAreaOffset >= 0 ||
                 _savedVectorRegisters.Count != 0 ||
                 _allocation.Frame.ParallelCopyTempSize != 0 ||
                 _allocation.Frame.FloatingImmediateTempSize != 0 ||
@@ -1385,7 +1397,7 @@ public sealed class X86CodeGenerator
             if (!_allocation.Frame.SavedRegisterOffsets.TryGetValue(register, out var offset))
                 throw new InvalidOperationException($"Missing saved-register stack slot for {register}.");
 
-            return Mem(X86Register.Rsp, offset, 16);
+            return Mem(FrameBase, offset, 16);
         }
 
         private static X86InstrKind VectorSaveMove(long stackOffset)
@@ -1406,13 +1418,13 @@ public sealed class X86CodeGenerator
             var gpRegisters = TargetRegisterInfo.IntegerArgumentRegisters(_owner._target);
             for (var i = 0; i < gpRegisters.Length; i++)
                 Emit(X86Instruction.Binary(X86InstrKind.Mov,
-                    Mem(X86Register.Rsp, _sysVX64RegisterSaveAreaOffset + i * 8, 8),
+                    Mem(FrameBase, _sysVX64RegisterSaveAreaOffset + i * 8, 8),
                     Reg(ToX86Register(gpRegisters[i], _owner._machineTarget), 8)));
 
             var vectorRegisters = TargetRegisterInfo.VectorArgumentRegisters(_owner._target);
             for (var i = 0; i < vectorRegisters.Length; i++)
                 Emit(X86Instruction.Binary(X86InstrKind.Movups,
-                    Mem(X86Register.Rsp, _sysVX64RegisterSaveAreaOffset + SysVX64FpSaveAreaOffset + i * 16, 16),
+                    Mem(FrameBase, _sysVX64RegisterSaveAreaOffset + SysVX64FpSaveAreaOffset + i * 16, 16),
                     Reg(ToX86Register(vectorRegisters[i], _owner._machineTarget), 16)));
         }
 
@@ -1423,7 +1435,7 @@ public sealed class X86CodeGenerator
 
             var registers = TargetRegisterInfo.IntegerArgumentRegisters(_owner._target);
             for (var i = 0; i < registers.Length; i++)
-                Emit(X86Instruction.Binary(X86InstrKind.Mov, Mem(X86Register.Rsp, IncomingStackOffset(i * _stackArgumentSlotSize), _wordSize),
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, Mem(FrameBase, IncomingStackOffset(i * _stackArgumentSlotSize), _wordSize),
                     Reg(ToX86Register(registers[i], _owner._machineTarget), _wordSize)));
         }
 
@@ -1450,10 +1462,10 @@ public sealed class X86CodeGenerator
 
             if (_owner._machineTarget.Is64Bit && TargetRegisterInfo.IsWindowsX64(_owner._target))
                 Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(Scratch0, _wordSize),
-                    Mem(X86Register.Rsp, IncomingStackOffset(cursor.Unified * _stackArgumentSlotSize), _wordSize)));
+                    Mem(FrameBase, IncomingStackOffset(cursor.Unified * _stackArgumentSlotSize), _wordSize)));
             else
                 Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(Scratch0, _wordSize),
-                    Mem(X86Register.Rsp, IncomingStackOffset(cursor.Stack * _stackArgumentSlotSize), _wordSize)));
+                    Mem(FrameBase, IncomingStackOffset(cursor.Stack * _stackArgumentSlotSize), _wordSize)));
             EmitStoreToStack(Scratch0, _allocation.Frame.VarArgsPointerOffset, _wordSize);
         }
 
@@ -1464,8 +1476,8 @@ public sealed class X86CodeGenerator
             if (location.Kind == AbiLocationKind.Register)
                 EmitStoreToStack(ToX86Register(location.Register, _owner._machineTarget), _allocation.Frame.HiddenReturnBufferOffset, _wordSize);
             else if (location.Kind == AbiLocationKind.Stack)
-                EmitMemoryCopy(Mem(X86Register.Rsp, IncomingStackOffset(location.StackByteOffset(_stackArgumentSlotSize)), _wordSize),
-                    Mem(X86Register.Rsp, _allocation.Frame.HiddenReturnBufferOffset, _wordSize), _wordSize);
+                EmitMemoryCopy(Mem(FrameBase, IncomingStackOffset(location.StackByteOffset(_stackArgumentSlotSize)), _wordSize),
+                    Mem(FrameBase, _allocation.Frame.HiddenReturnBufferOffset, _wordSize), _wordSize);
         }
 
         private void EmitInstruction(LirInstruction instruction)
@@ -1512,6 +1524,20 @@ public sealed class X86CodeGenerator
                     break;
                 case LirInstructionKind.Call:
                     EmitCall(instruction);
+                    break;
+                case LirInstructionKind.StackAllocate:
+                    EmitStackAllocate(instruction);
+                    break;
+                case LirInstructionKind.StackSave:
+                    {
+                        var destination = GetWritableRegister(instruction.Result!, Scratch0);
+                        Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(destination, _wordSize), StackPointer()));
+                        StoreWritableRegisterIfSpilled(instruction.Result!, destination);
+                        break;
+                    }
+                case LirInstructionKind.StackRestore:
+                    LoadOperandInto(instruction.Operands[0], Scratch0, instruction, _wordSize);
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, StackPointer(), Reg(Scratch0, _wordSize)));
                     break;
                 case LirInstructionKind.VaStart:
                     EmitVaStart(instruction);
@@ -2071,7 +2097,7 @@ public sealed class X86CodeGenerator
                 if (allocation.IsSpilled)
                 {
                     if (IsFloatType(output.Type))
-                        EmitFloatingStore(Mem(X86Register.Rsp, allocation.StackOffset, FloatingStorageSize(output.Type)), output.Register, output.Type);
+                        EmitFloatingStore(Mem(FrameBase, allocation.StackOffset, FloatingStorageSize(output.Type)), output.Register, output.Type);
                     else
                         EmitStoreToStack(output.Register, allocation.StackOffset, Math.Min(RegisterSize(output.Type), SizeOfStorage(output.Type)));
                     continue;
@@ -2167,7 +2193,7 @@ public sealed class X86CodeGenerator
 
         private void StoreX86AsmRegisterToTemp(X86Register source, QualifiedType type)
         {
-            var destination = Mem(X86Register.Rsp, _allocation.Frame.ParallelCopyTempOffset, RegisterSize(type));
+            var destination = Mem(FrameBase, _allocation.Frame.ParallelCopyTempOffset, RegisterSize(type));
             if (IsFloatType(type))
                 EmitFloatingStore(destination.WithSize(FloatingStorageSize(type)), source, type);
             else
@@ -2176,7 +2202,7 @@ public sealed class X86CodeGenerator
 
         private void LoadX86AsmTempInto(X86Register destination, QualifiedType type)
         {
-            var source = Mem(X86Register.Rsp, _allocation.Frame.ParallelCopyTempOffset, RegisterSize(type));
+            var source = Mem(FrameBase, _allocation.Frame.ParallelCopyTempOffset, RegisterSize(type));
             if (IsFloatType(type))
                 EmitFloatingLoad(destination, source.WithSize(FloatingStorageSize(type)), type);
             else
@@ -2255,7 +2281,7 @@ public sealed class X86CodeGenerator
 
         private string FormatX86AsmStackMemory(int offset)
         {
-            var stackPointer = X86Registers.Format(X86Register.Rsp, _wordSize);
+            var stackPointer = X86Registers.Format(FrameBase, _wordSize);
             if (offset == 0)
                 return $"[{stackPointer}]";
             return offset < 0
@@ -2458,7 +2484,7 @@ public sealed class X86CodeGenerator
                 if (location.Kind == AbiLocationKind.Register)
                     EmitFloatingMove(writable, ToX86Register(location.Register, _owner._machineTarget), destination.Type);
                 else if (location.Kind == AbiLocationKind.Stack)
-                    EmitFloatingLoad(writable, Mem(X86Register.Rsp, IncomingStackOffset(location.StackByteOffset(_stackArgumentSlotSize)),
+                    EmitFloatingLoad(writable, Mem(FrameBase, IncomingStackOffset(location.StackByteOffset(_stackArgumentSlotSize)),
                         FloatingStorageSize(destination.Type)), destination.Type);
                 else
                     throw Unsupported(instruction, "Unsupported floating-point parameter ABI location.");
@@ -2472,7 +2498,7 @@ public sealed class X86CodeGenerator
                 if (location.Kind == AbiLocationKind.Stack)
                 {
                     EmitMemoryCopy(
-                        Mem(X86Register.Rsp, IncomingStackOffset(location.StackByteOffset(_stackArgumentSlotSize)), size), RegMem(destinationAddress, size), size);
+                        Mem(FrameBase, IncomingStackOffset(location.StackByteOffset(_stackArgumentSlotSize)), size), RegMem(destinationAddress, size), size);
                     return;
                 }
                 if (location.Kind == AbiLocationKind.Register)
@@ -2502,7 +2528,7 @@ public sealed class X86CodeGenerator
                 }
                 else if (location.Kind == AbiLocationKind.Stack)
                 {
-                    EmitLoadFromMemory(writable, Mem(X86Register.Rsp, IncomingStackOffset(location.StackByteOffset(_stackArgumentSlotSize)),
+                    EmitLoadFromMemory(writable, Mem(FrameBase, IncomingStackOffset(location.StackByteOffset(_stackArgumentSlotSize)),
                         RegisterSize(destination.Type)), IsSignedIntegerType(destination.Type));
                 }
                 else
@@ -2528,7 +2554,7 @@ public sealed class X86CodeGenerator
                         EmitSegmentStore(segment.RegisterClass, ToX86Register(location.Register, _owner._machineTarget),
                             Mem(destinationAddress, segment.Offset, Math.Min(segment.Size, _wordSize)));
                     else if (location.Kind == AbiLocationKind.Stack)
-                        EmitMemoryCopy(Mem(X86Register.Rsp, IncomingStackOffset(location.StackByteOffset(_stackArgumentSlotSize)), segment.Size),
+                        EmitMemoryCopy(Mem(FrameBase, IncomingStackOffset(location.StackByteOffset(_stackArgumentSlotSize)), segment.Size),
                             Mem(destinationAddress, segment.Offset, segment.Size), segment.Size);
                     else
                         throw Unsupported(instruction, "Unsupported multi-register parameter segment location.");
@@ -2560,7 +2586,7 @@ public sealed class X86CodeGenerator
             }
             if (location.Kind == AbiLocationKind.Stack)
             {
-                EmitLoadFromMemory(Scratch1, Mem(X86Register.Rsp, IncomingStackOffset(location.StackByteOffset(_stackArgumentSlotSize)), _wordSize), false);
+                EmitLoadFromMemory(Scratch1, Mem(FrameBase, IncomingStackOffset(location.StackByteOffset(_stackArgumentSlotSize)), _wordSize), false);
                 EmitMemoryCopy(RegMem(Scratch1, 1), RegMem(destinationAddress, 1), SizeOfStorage(destination.Type));
                 return;
             }
@@ -2611,7 +2637,7 @@ public sealed class X86CodeGenerator
             foreach (var copy in copies)
             {
                 var size = Math.Max(SizeOfStorage(copy.Destination.Type), SizeOfStorage(copy.Source.Type));
-                var temp = Mem(X86Register.Rsp, tempOffset + cursor, size);
+                var temp = Mem(FrameBase, tempOffset + cursor, size);
                 EmitOperandToMemory(copy.Source, temp, size, instruction);
                 cursor += AlignUp(Math.Max(size, _owner._allocationOptions.SpillSlotSize), _owner._allocationOptions.SpillSlotAlignment);
             }
@@ -2620,7 +2646,7 @@ public sealed class X86CodeGenerator
             foreach (var copy in copies)
             {
                 var size = Math.Max(SizeOfStorage(copy.Destination.Type), SizeOfStorage(copy.Source.Type));
-                EmitMemoryToDestination(Mem(X86Register.Rsp, tempOffset + cursor, size), copy.Destination, size);
+                EmitMemoryToDestination(Mem(FrameBase, tempOffset + cursor, size), copy.Destination, size);
                 cursor += AlignUp(Math.Max(size, _owner._allocationOptions.SpillSlotSize), _owner._allocationOptions.SpillSlotAlignment);
             }
         }
@@ -3234,14 +3260,14 @@ public sealed class X86CodeGenerator
         }
 
         private X86Operand WideTempMemory(int index, int offset)
-            => Mem(X86Register.Rsp, checked(_allocation.Frame.FloatingImmediateTempOffset + index * 8 + offset), 4);
+            => Mem(FrameBase, checked(_allocation.Frame.FloatingImmediateTempOffset + index * 8 + offset), 4);
 
         private X86Operand WideResultMemory(LirVirtualRegister result, int offset)
         {
             var allocation = _allocation[result];
             if (!allocation.IsSpilled)
                 throw new NotSupportedException("64-bit integer result must be stack-backed on x86.");
-            return Mem(X86Register.Rsp, checked(allocation.StackOffset + offset), 4);
+            return Mem(FrameBase, checked(allocation.StackOffset + offset), 4);
         }
 
         private void LoadWideIntegerResult(LirVirtualRegister result, X86Register low, X86Register high)
@@ -3883,10 +3909,13 @@ public sealed class X86CodeGenerator
             }
             else
             {
-                // The count goes to cl first: the destination may be the register holding it
+                // The count goes to cl first; a destination in rcx would lose it, so the shift then runs in a scratch register
+                var work = dst == X86Register.Rcx ? Scratch0 : dst;
                 LoadOperandInto(instruction.Operands[1], X86Register.Rcx, instruction, 1);
-                LoadOperandInto(instruction.Operands[0], dst, instruction, size);
-                Emit(X86Instruction.Binary(opcode, Reg(dst, size), Reg(X86Register.Rcx, 1)));
+                LoadOperandInto(instruction.Operands[0], work, instruction, size);
+                Emit(X86Instruction.Binary(opcode, Reg(work, size), Reg(X86Register.Rcx, 1)));
+                if (work != dst)
+                    MoveIntoRegister(dst, Reg(work, size), size);
             }
             StoreWritableRegisterIfSpilled(instruction.Result!, dst);
         }
@@ -5105,8 +5134,8 @@ public sealed class X86CodeGenerator
 
             var size = FloatingStorageSize(operand.Type);
             var temp = _allocation.Frame.FloatingImmediateTempOffset;
-            EmitFloatingStore(Mem(X86Register.Rsp, temp, size), source, operand.Type);
-            EmitLoadFromMemory(ToX86Register(integerRegisters[slot], _owner._machineTarget), Mem(X86Register.Rsp, temp, Math.Min(_wordSize, size)), false);
+            EmitFloatingStore(Mem(FrameBase, temp, size), source, operand.Type);
+            EmitLoadFromMemory(ToX86Register(integerRegisters[slot], _owner._machineTarget), Mem(FrameBase, temp, Math.Min(_wordSize, size)), false);
         }
 
         private static MachineRegister ToMachineRegister(X86Register register)
@@ -5201,9 +5230,9 @@ public sealed class X86CodeGenerator
                 var cursor = ComputeNamedArgumentCursor();
                 Emit(X86Instruction.Binary(X86InstrKind.Mov, Mem(ap, 0, 4), Imm(cursor.Integer * 8)));
                 Emit(X86Instruction.Binary(X86InstrKind.Mov, Mem(ap, 4, 4), Imm(SysVX64FpSaveAreaOffset + cursor.Vector * 16)));
-                Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(Scratch1, _wordSize), Mem(X86Register.Rsp, IncomingStackOffset(cursor.Stack * _stackArgumentSlotSize), _wordSize)));
+                Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(Scratch1, _wordSize), Mem(FrameBase, IncomingStackOffset(cursor.Stack * _stackArgumentSlotSize), _wordSize)));
                 Emit(X86Instruction.Binary(X86InstrKind.Mov, Mem(ap, 8, _wordSize), Reg(Scratch1, _wordSize)));
-                Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(Scratch1, _wordSize), Mem(X86Register.Rsp, _sysVX64RegisterSaveAreaOffset, _wordSize)));
+                Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(Scratch1, _wordSize), Mem(FrameBase, _sysVX64RegisterSaveAreaOffset, _wordSize)));
                 Emit(X86Instruction.Binary(X86InstrKind.Mov, Mem(ap, 16, _wordSize), Reg(Scratch1, _wordSize)));
                 return;
             }
@@ -5784,7 +5813,7 @@ public sealed class X86CodeGenerator
                 return false;
 
             var storeSize = Math.Min(size, SizeOfStorage(destination.Type));
-            EmitOperandToMemory(source, Mem(X86Register.Rsp, allocation.StackOffset, storeSize), storeSize, instruction);
+            EmitOperandToMemory(source, Mem(FrameBase, allocation.StackOffset, storeSize), storeSize, instruction);
             return true;
         }
 
@@ -5877,14 +5906,14 @@ public sealed class X86CodeGenerator
             if (IsX86WideInteger(operand.Type) && operand.Kind is LirOperandKind.Immediate or LirOperandKind.Undefined or LirOperandKind.Void or LirOperandKind.None)
             {
                 StoreWideIntegerOperandToTemp(operand, 0, instruction);
-                Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(scratch, _wordSize), Mem(X86Register.Rsp, _allocation.Frame.FloatingImmediateTempOffset, _wordSize)));
+                Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(scratch, _wordSize), Mem(FrameBase, _allocation.Frame.FloatingImmediateTempOffset, _wordSize)));
                 return scratch;
             }
             if (operand.Kind == LirOperandKind.Register && operand.Register is not null)
                 return MaterializeVirtualRegisterStorageAddress(operand.Register, scratch);
             if (operand.Kind == LirOperandKind.StackSlot && operand.StackSlot is not null)
             {
-                Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(scratch, _wordSize), Mem(X86Register.Rsp, _allocation.Frame.StackSlotOffsets[operand.StackSlot], _wordSize)));
+                Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(scratch, _wordSize), Mem(FrameBase, _allocation.Frame.StackSlotOffsets[operand.StackSlot], _wordSize)));
                 return scratch;
             }
             if (operand.Kind == LirOperandKind.Symbol && operand.Symbol is not null)
@@ -5901,13 +5930,13 @@ public sealed class X86CodeGenerator
         {
             if (register.HomeSlot is { } home)
             {
-                Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(scratch, _wordSize), Mem(X86Register.Rsp, _allocation.Frame.StackSlotOffsets[home], _wordSize)));
+                Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(scratch, _wordSize), Mem(FrameBase, _allocation.Frame.StackSlotOffsets[home], _wordSize)));
                 return scratch;
             }
 
             var allocation = _allocation[register];
             if (allocation.IsSpilled)
-                Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(scratch, _wordSize), Mem(X86Register.Rsp, allocation.StackOffset, _wordSize)));
+                Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(scratch, _wordSize), Mem(FrameBase, allocation.StackOffset, _wordSize)));
             else
                 throw new NotSupportedException("Register-allocated aggregate storage is not addressable.");
             return scratch;
@@ -5955,7 +5984,7 @@ public sealed class X86CodeGenerator
                 case LirAddressKind.StackSlot:
                     if (root.StackSlot is null)
                         return false;
-                    baseRegister = X86Register.Rsp;
+                    baseRegister = FrameBase;
                     displacement = _allocation.Frame.StackSlotOffsets[root.StackSlot];
                     break;
                 case LirAddressKind.Symbol:
@@ -6059,7 +6088,7 @@ public sealed class X86CodeGenerator
                 case LirAddressKind.StackSlot:
                     if (address.StackSlot is null)
                         throw Unsupported(instruction, "Stack-slot address without stack slot.");
-                    Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(scratch, _wordSize), Mem(X86Register.Rsp, _allocation.Frame.StackSlotOffsets[address.StackSlot], _wordSize)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(scratch, _wordSize), Mem(FrameBase, _allocation.Frame.StackSlotOffsets[address.StackSlot], _wordSize)));
                     return scratch;
                 case LirAddressKind.Symbol:
                     if (address.Symbol is null)
@@ -6162,7 +6191,7 @@ public sealed class X86CodeGenerator
                 case LirOperandKind.StackSlot:
                     if (operand.StackSlot is null)
                         throw Unsupported(instruction, "Stack slot operand without slot.");
-                    return Mem(X86Register.Rsp, _allocation.Frame.StackSlotOffsets[operand.StackSlot], size);
+                    return Mem(FrameBase, _allocation.Frame.StackSlotOffsets[operand.StackSlot], size);
                 case LirOperandKind.Address:
                     if (operand.Address is null)
                         throw Unsupported(instruction, "Address operand without address.");
@@ -6230,11 +6259,11 @@ public sealed class X86CodeGenerator
                 {
                     if (preservation.UsesRegister)
                         return Reg(ToX86Register(preservation.PreservationRegister, _owner._machineTarget), size);
-                    return Mem(X86Register.Rsp, preservation.StackOffset, size);
+                    return Mem(FrameBase, preservation.StackOffset, size);
                 }
                 return Reg(ToX86Register(allocation.PhysicalRegister, _owner._machineTarget), size);
             }
-            return Mem(X86Register.Rsp, allocation.StackOffset, size);
+            return Mem(FrameBase, allocation.StackOffset, size);
         }
 
         // A load whose only reader is the very next instruction can become that reader's memory operand
@@ -6358,7 +6387,7 @@ public sealed class X86CodeGenerator
                 return;
             if (IsFloatType(register.Type))
             {
-                EmitFloatingStore(Mem(X86Register.Rsp, allocation.StackOffset, FloatingStorageSize(register.Type)), source, register.Type);
+                EmitFloatingStore(Mem(FrameBase, allocation.StackOffset, FloatingStorageSize(register.Type)), source, register.Type);
                 return;
             }
             EmitStoreToStack(source, allocation.StackOffset, Math.Min(RegisterSize(register.Type), SizeOfStorage(register.Type)));
@@ -6386,7 +6415,7 @@ public sealed class X86CodeGenerator
         }
 
         private void EmitLoadFromStack(X86Register destination, int offset, int size, bool signed)
-            => EmitLoadFromMemory(destination, Mem(X86Register.Rsp, offset, size), signed);
+            => EmitLoadFromMemory(destination, Mem(FrameBase, offset, size), signed);
 
         private void EmitLoadFromMemory(X86Register destination, X86Operand source, bool signed)
         {
@@ -6401,7 +6430,7 @@ public sealed class X86CodeGenerator
         }
 
         private void EmitStoreToStack(X86Register source, int offset, int size)
-            => Emit(X86Instruction.Binary(X86InstrKind.Mov, Mem(X86Register.Rsp, offset, size), Reg(source, size)));
+            => Emit(X86Instruction.Binary(X86InstrKind.Mov, Mem(FrameBase, offset, size), Reg(source, size)));
 
         private void EmitStoreToMemory(X86Register source, X86Register baseRegister, int offset, int size)
             => Emit(X86Instruction.Binary(X86InstrKind.Mov, Mem(baseRegister, offset, size), Reg(source, size)));
@@ -6643,6 +6672,33 @@ public sealed class X86CodeGenerator
 
         private X86Operand StackPointer()
             => Reg(X86Register.Rsp, _wordSize);
+
+        // Windows commits stack a guard page at a time, so deep allocations touch each page on the way down
+        private void EmitStackAllocate(LirInstruction instruction)
+        {
+            const int PageSize = 4096;
+            LoadOperandInto(instruction.Operands[0], Scratch0, instruction, _wordSize);
+            Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(Scratch0, _wordSize), Imm(15)));
+            Emit(X86Instruction.Binary(X86InstrKind.And, Reg(Scratch0, _wordSize), Imm(-16)));
+            if (_owner._machineTarget.Abi is X86AbiKind.WindowsX64)
+            {
+                var probe = _owner.CreateLocalLabel(_functionLabel + "_stack_probe");
+                var last = _owner.CreateLocalLabel(_functionLabel + "_stack_last");
+                _owner.DefineLabel(probe);
+                Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(Scratch0, _wordSize), Imm(PageSize)));
+                Emit(X86Instruction.ConditionalBranch(X86Condition.Be, X86Operand.SymbolOperand(last, 4, X86ObjectRelocationKind.Relative32)));
+                Emit(X86Instruction.Binary(X86InstrKind.Sub, StackPointer(), Imm(PageSize)));
+                Emit(X86Instruction.Binary(X86InstrKind.Or, Mem(X86Register.Rsp, 0, _wordSize), Imm(0)));
+                Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(Scratch0, _wordSize), Imm(PageSize)));
+                Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(probe, 4, X86ObjectRelocationKind.Relative32)));
+                _owner.DefineLabel(last);
+            }
+            Emit(X86Instruction.Binary(X86InstrKind.Sub, StackPointer(), Reg(Scratch0, _wordSize)));
+
+            var destination = GetWritableRegister(instruction.Result!, Scratch0);
+            Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(destination, _wordSize), Mem(X86Register.Rsp, _allocation.Frame.OutgoingArgumentAreaSize, _wordSize)));
+            StoreWritableRegisterIfSpilled(instruction.Result!, destination);
+        }
 
         private X86Register Scratch0
             => _owner._machineTarget.Is64Bit ? X86Register.R10 : X86Register.Rax;

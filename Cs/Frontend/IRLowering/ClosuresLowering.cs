@@ -12,6 +12,8 @@ namespace Cnidaria.Cs
     {
         private readonly Compilation _compilation;
         private readonly NamedTypeSymbol _objectType;
+        private readonly ArrayTypeSymbol _cellType;
+        private readonly ArrayTypeSymbol _closureType;
         private readonly Dictionary<Symbol, BoundExpression> _cellByCapturedSymbol = new(ReferenceEqualityComparer<Symbol>.Instance);
         private int _tempId;
 
@@ -25,16 +27,17 @@ namespace Cnidaria.Cs
             public override bool ReturnsByRefReadonly => _original.ReturnsByRefReadonly;
             private ImmutableArray<ParameterSymbol> _parameters;
             public override ImmutableArray<ParameterSymbol> Parameters => _parameters.IsDefault ? ImmutableArray<ParameterSymbol>.Empty : _parameters;
-            public override ImmutableArray<TypeParameterSymbol> TypeParameters => ImmutableArray<TypeParameterSymbol>.Empty;
+            public override ImmutableArray<TypeParameterSymbol> TypeParameters { get; }
             public override bool IsStatic => true;
             public override bool IsConstructor => false;
             public override bool IsAsync { get; }
             private readonly MethodSymbol _original;
             public override ImmutableArray<AttributeData> GetAttributes() => _original.GetAttributes();
 
-            public ClosureLambdaMethodSymbol(MethodSymbol original)
+            public ClosureLambdaMethodSymbol(MethodSymbol original, ImmutableArray<TypeParameterSymbol> typeParameters)
             {
                 _original = original;
+                TypeParameters = typeParameters.IsDefault ? ImmutableArray<TypeParameterSymbol>.Empty : typeParameters;
                 Name = original.Name;
                 ContainingSymbol = original.ContainingSymbol;
                 Locations = original.Locations;
@@ -149,6 +152,17 @@ namespace Cnidaria.Cs
         {
             _compilation = compilation ?? throw new ArgumentNullException(nameof(compilation));
             _objectType = (NamedTypeSymbol)_compilation.GetSpecialType(SpecialType.System_Object);
+            _cellType = _compilation.CreateArrayType(_objectType, rank: 1);
+            _closureType = _compilation.CreateArrayType(_cellType, rank: 1);
+        }
+        private static ImmutableArray<TypeParameterSymbol> GetEnclosingMethodTypeParameters(MethodSymbol lambda)
+        {
+            for (Symbol? containing = lambda.ContainingSymbol; containing is MethodSymbol method; containing = method.ContainingSymbol)
+            {
+                if (!method.TypeParameters.IsDefaultOrEmpty)
+                    return method.TypeParameters;
+            }
+            return ImmutableArray<TypeParameterSymbol>.Empty;
         }
 
         protected override BoundMethodBody RewriteMethodBody(BoundMethodBody node)
@@ -170,34 +184,36 @@ namespace Cnidaria.Cs
             ParameterSymbol? closureParameter = null;
             MethodSymbol targetMethod = node.Method;
             BoundExpression? target = node.TargetOpt;
+            var enclosingTypeParameters = GetEnclosingMethodTypeParameters(node.Method);
 
-            if (!externalCaptures.IsDefaultOrEmpty)
+            if (!externalCaptures.IsDefaultOrEmpty || !enclosingTypeParameters.IsDefaultOrEmpty)
             {
-                var closureMethod = new ClosureLambdaMethodSymbol(node.Method);
-                closureParameter = new ParameterSymbol(
-                    name: "<>closure",
-                    containing: closureMethod,
-                    type: _objectType,
-                    locations: ImmutableArray<Location>.Empty);
-
+                var closureMethod = new ClosureLambdaMethodSymbol(node.Method, enclosingTypeParameters);
                 var parameters = ImmutableArray.CreateBuilder<ParameterSymbol>(node.Method.Parameters.Length + 1);
-                parameters.Add(closureParameter);
+                if (!externalCaptures.IsDefaultOrEmpty)
+                {
+                    closureParameter = new ParameterSymbol(
+                        name: "<>closure",
+                        containing: closureMethod,
+                        type: _closureType,
+                        locations: ImmutableArray<Location>.Empty);
+                    parameters.Add(closureParameter);
+
+                    var cells = ImmutableArray.CreateBuilder<BoundExpression>(externalCaptures.Length);
+                    for (int i = 0; i < externalCaptures.Length; i++)
+                    {
+                        if (!_cellByCapturedSymbol.TryGetValue(externalCaptures[i], out var cell))
+                        {
+                            throw new NotSupportedException(
+                                $"Cannot build closure for captured symbol '{externalCaptures[i].Name}'. The defining scope has not been closure-lowered.");
+                        }
+                        cells.Add(cell);
+                    }
+                    target = new BoundClosureCreationExpression(node.Syntax, _closureType, cells.ToImmutable());
+                }
                 parameters.AddRange(node.Method.Parameters);
                 closureMethod.SetParameters(parameters.ToImmutable());
                 targetMethod = closureMethod;
-
-                var cells = ImmutableArray.CreateBuilder<BoundExpression>(externalCaptures.Length);
-                for (int i = 0; i < externalCaptures.Length; i++)
-                {
-                    if (!_cellByCapturedSymbol.TryGetValue(externalCaptures[i], out var cell))
-                    {
-                        throw new NotSupportedException(
-                            $"Cannot build closure for captured symbol '{externalCaptures[i].Name}'. The defining scope has not been closure-lowered.");
-                    }
-                    cells.Add(cell);
-                }
-
-                target = new BoundClosureCreationExpression(node.Syntax, _objectType, cells.ToImmutable());
             }
 
             var body = RewriteMethodLike(node.Syntax, node.Method, node.Body, closureParameter, externalCaptures, out _);
@@ -245,7 +261,7 @@ namespace Cnidaria.Cs
                     ? MakeDefaultValue(node.Syntax, node.Local.Type)
                     : RewriteExpression(node.Initializer);
 
-                var cellInit = new BoundClosureCellCreationExpression(node.Syntax, _objectType, node.Local.Type, init);
+                var cellInit = new BoundClosureCellCreationExpression(node.Syntax, _cellType, node.Local.Type, init);
                 return new BoundLocalDeclarationStatement(node.Syntax, cellLocal.Local, cellInit);
             }
 
@@ -298,7 +314,7 @@ namespace Cnidaria.Cs
                     {
                         PushCell(
                             externalCaptures[i],
-                            new BoundClosureSlotExpression(syntax, _objectType, closureExpr, i));
+                            new BoundClosureSlotExpression(syntax, _cellType, closureExpr, i));
                     }
                 }
 
@@ -309,7 +325,7 @@ namespace Cnidaria.Cs
                     var cellLocal = new LocalSymbol(
                         name: $"<>cell{_tempId++}_{symbol.Name}",
                         containing: method,
-                        type: _objectType,
+                        type: _cellType,
                         locations: ImmutableArray<Location>.Empty);
                     var cellExpr = new BoundLocalExpression(syntax, cellLocal);
                     PushCell(symbol, cellExpr);
@@ -317,7 +333,7 @@ namespace Cnidaria.Cs
                     if (symbol is ParameterSymbol parameter)
                     {
                         var init = new BoundParameterExpression(syntax, parameter);
-                        var cellInit = new BoundClosureCellCreationExpression(syntax, _objectType, parameter.Type, init);
+                        var cellInit = new BoundClosureCellCreationExpression(syntax, _cellType, parameter.Type, init);
                         prologue.Add(new BoundLocalDeclarationStatement(syntax, cellLocal, cellInit));
                     }
                 }
@@ -514,7 +530,16 @@ namespace Cnidaria.Cs
 
         protected override BoundStatement RewriteBlockStatement(BoundBlockStatement node)
         {
-            var statements = RewriteScopedStatements(node.Statements, out var changed);
+            bool changed;
+            ImmutableArray<BoundStatement> statements;
+            if (node.Syntax is SwitchSectionSyntax)
+            {
+                statements = RewriteStatements(node.Statements, out changed);
+            }
+            else
+            {
+                statements = RewriteScopedStatements(node.Statements, out changed);
+            }
             if (changed)
                 return new BoundBlockStatement(node.Syntax, statements);
 
@@ -629,14 +654,14 @@ namespace Cnidaria.Cs
                     !ReferenceEquals(targetMethod, node.Method) ||
                     rewrittenArguments.Length != node.Arguments.Length)
                 {
-                    return new BoundCallExpression(node.Syntax, receiver, targetMethod, rewrittenArguments);
+                    return new BoundCallExpression(node.Syntax, receiver, targetMethod, rewrittenArguments, node.ConstrainedToTypeOpt);
                 }
 
                 return node;
             }
 
             if (!ReferenceEquals(receiver, node.ReceiverOpt) || argsChanged)
-                return new BoundCallExpression(node.Syntax, receiver, node.Method, arguments);
+                return new BoundCallExpression(node.Syntax, receiver, node.Method, arguments, node.ConstrainedToTypeOpt);
 
             return node;
         }
@@ -701,10 +726,15 @@ namespace Cnidaria.Cs
 
             for (int i = 0; i < statements.Length; i++)
             {
-                if (statements[i] is not BoundLocalFunctionStatement localFunction)
-                    continue;
-
-                map[localFunction.LocalFunction] = CreateCaptureInfo(localFunction);
+                if (statements[i] is BoundLocalFunctionStatement localFunction)
+                {
+                    map[localFunction.LocalFunction] = CreateCaptureInfo(localFunction);
+                }
+                else if (statements[i] is BoundBlockStatement { Syntax: SwitchSectionSyntax } section)
+                {
+                    foreach (var (symbol, info) in CollectCaptureInfos(section.Statements))
+                        map[symbol] = info;
+                }
             }
 
             return map;

@@ -858,7 +858,7 @@ namespace Cnidaria.Cs
                     }
 
                     if (node.Kind == GenTreeKind.EndFinally ||
-                        (node.Kind == GenTreeKind.Branch && node.SourceOp == BytecodeOp.Leave && IsFuncletBlock(method, block.Id)))
+                        (node.Kind == GenTreeKind.Branch && node.Operator == GenTreeOperator.Leave && IsFuncletBlock(method, block.Id)))
                     {
                         if (!HasContiguousEpilogBefore(block.LinearNodes, i))
                             throw new InvalidOperationException("Funclet exit node is missing an immediately preceding epilog sequence.");
@@ -948,7 +948,7 @@ namespace Cnidaria.Cs
                 i++;
             return i < nodes.Length &&
                 (nodes[i].Kind is GenTreeKind.Return or GenTreeKind.EndFinally ||
-                    (nodes[i].Kind == GenTreeKind.Branch && nodes[i].SourceOp == BytecodeOp.Leave));
+                    (nodes[i].Kind == GenTreeKind.Branch && nodes[i].Operator == GenTreeOperator.Leave));
         }
         private static bool IsFuncletBlock(RegisterAllocatedMethod method, int blockId)
         {

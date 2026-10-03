@@ -127,7 +127,10 @@ internal sealed class LinearScanRegisterAllocator
                 allocations[interval.Register] = VirtualRegisterAllocation.Spilled(interval.Register, interval.Register.RegisterClass);
         }
 
-        AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, _options.GeneralRegisters, allocations, _copyPreferences, _abiPreferences, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
+        var generalRegisters = _options.GeneralRegisters;
+        if (HasDynamicStack(_function) && TargetRegisterInfo.FrameBaseRegister(_target) is var frameBase && frameBase != MachineRegister.Invalid)
+            generalRegisters = generalRegisters.Remove(frameBase);
+        AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, generalRegisters, allocations, _copyPreferences, _abiPreferences, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
         AllocateClasses(intervals, new[] { LirRegisterClass.Floating }, _options.FloatingRegisters, allocations, _copyPreferences, _abiPreferences, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
         AllocateClasses(intervals, new[] { LirRegisterClass.Vector }, _options.VectorRegisters, allocations, _copyPreferences, _abiPreferences, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
 
@@ -1681,16 +1684,32 @@ internal sealed class LinearScanRegisterAllocator
         return result;
     }
 
+    private static bool HasDynamicStack(LirFunction function)
+        => function.Blocks.Any(static block => block.Instructions.Any(static instruction =>
+            instruction.Kind is LirInstructionKind.StackAllocate or LirInstructionKind.StackRestore));
+
     private StackFrameMap LayoutStackFrame(
         Dictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
         ImmutableHashSet<MachineRegister> preservationRegisters)
     {
         var offset = 0;
 
+        // Run-time stack allocation addresses the frame from a base register and puts new space above an aligned outgoing area
+        var dynamicStack = HasDynamicStack(_function);
         var outgoingSize = ComputeOutgoingArgumentAreaSize();
+        if (dynamicStack)
+            outgoingSize = AlignUp(outgoingSize, _options.StackAlignment);
         offset = AlignUp(offset, _options.StackArgumentSlotSize);
         var outgoingOffset = offset;
         offset = checked(offset + outgoingSize);
+
+        var frameBaseSaveOffset = -1;
+        if (dynamicStack)
+        {
+            offset = AlignUp(offset, _target.PointerAlignment);
+            frameBaseSaveOffset = offset;
+            offset = checked(offset + _target.PointerSize);
+        }
 
         var varArgsPointerOffset = -1;
         if (_function.Symbol?.FunctionType?.IsVariadic == true)
@@ -1786,7 +1805,8 @@ internal sealed class LinearScanRegisterAllocator
             savedRegisterAreaSize,
             stackSlotOffsets,
             spillOffsets,
-            savedRegisterOffsets);
+            savedRegisterOffsets,
+            frameBaseSaveOffset);
     }
 
     private bool RequiresHiddenReturnBuffer()
@@ -2861,6 +2881,8 @@ internal sealed class StackFrameMap
     public int HiddenReturnBufferOffset { get; }
     public int HiddenReturnBufferSize { get; }
     public bool HasHiddenReturnBuffer => HiddenReturnBufferOffset >= 0;
+    public int FrameBaseSaveOffset { get; }
+    public bool HasDynamicStack => FrameBaseSaveOffset >= 0;
     public IReadOnlyDictionary<LirStackSlot, int> StackSlotOffsets { get; }
     public IReadOnlyDictionary<LirVirtualRegister, int> SpillOffsets { get; }
     public IReadOnlyDictionary<MachineRegister, int> SavedRegisterOffsets { get; }
@@ -2886,9 +2908,11 @@ internal sealed class StackFrameMap
         int savedRegisterAreaSize,
         IReadOnlyDictionary<LirStackSlot, int> stackSlotOffsets,
         IReadOnlyDictionary<LirVirtualRegister, int> spillOffsets,
-        IReadOnlyDictionary<MachineRegister, int> savedRegisterOffsets)
+        IReadOnlyDictionary<MachineRegister, int> savedRegisterOffsets,
+        int frameBaseSaveOffset = -1)
     {
         FrameSize = frameSize;
+        FrameBaseSaveOffset = frameBaseSaveOffset;
         FrameAlignment = frameAlignment <= 0 ? 1 : frameAlignment;
         OutgoingArgumentAreaOffset = outgoingArgumentAreaOffset;
         OutgoingArgumentAreaSize = outgoingArgumentAreaSize;

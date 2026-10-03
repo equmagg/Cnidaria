@@ -1,9 +1,44 @@
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+
 namespace System.Runtime.CompilerServices
 {
+    [CLSCompliant(false)]
+    [AttributeUsage(AttributeTargets.Field | AttributeTargets.Parameter | AttributeTargets.Property | AttributeTargets.ReturnValue | AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Event)]
+    public sealed class TupleElementNamesAttribute : Attribute
+    {
+        private readonly string?[] _transformNames;
+
+        public TupleElementNamesAttribute(string?[] transformNames)
+        {
+            ArgumentNullException.ThrowIfNull(transformNames);
+
+            _transformNames = transformNames;
+        }
+
+        public IList<string?> TransformNames => _transformNames;
+    }
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Method | AttributeTargets.Constructor | AttributeTargets.Field | AttributeTargets.Interface, Inherited = false)]
+    internal sealed class IntrinsicAttribute : Attribute
+    {
+    }
     public static class RuntimeHelpers
     {
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool IsBitwiseEquatable<T>()
+        {
+            return false;
+        }
+
         [MethodImpl(MethodImplOptions.InternalCall)]
         public static bool IsReferenceOrContainsReferences<T>() where T : allows ref struct => IsReferenceOrContainsReferences<T>();
+
+        [Intrinsic]
+        internal static bool EnumEquals<T>(T x, T y) where T : struct, Enum
+        {
+            return x.Equals(y);
+        }
 
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static bool IsKnownConstant(int value)
@@ -11,11 +46,21 @@ namespace System.Runtime.CompilerServices
             return false; // to do
         }
 
-        [MethodImpl(MethodImplOptions.NoInlining)]
-        public static int GetHashCode(object o)
-        {
-            return 0; // to do
-        }
+        public static int GetHashCode(object? o) => o is null ? 0 : System.Runtime.RuntimeImports.RhGetObjectHashCode(o);
+
+        // The identity hash if the object has one, so a lookup by a never-hashed key finds nothing without assigning one
+        internal static int TryGetHashCode(object? o) => o is null ? 0 : System.Runtime.RuntimeImports.RhTryGetObjectHashCode(o);
+        [Intrinsic]
+        internal static bool IsKnownConstant(Type? t) => false;
+
+        [Intrinsic]
+        internal static bool IsKnownConstant(string? t) => false;
+
+        [Intrinsic]
+        internal static bool IsKnownConstant(char t) => false;
+
+        [Intrinsic]
+        internal static bool IsKnownConstant<T>(T t) where T : struct => false;
     }
     public enum MethodImplOptions
     {
@@ -87,6 +132,50 @@ namespace System.Runtime.CompilerServices
         }
 
         public int Length { get; }
+    }
+    [AttributeUsage(AttributeTargets.Assembly | AttributeTargets.Class | AttributeTargets.Method)]
+    public sealed class ExtensionAttribute : Attribute
+    {
+        public ExtensionAttribute() { }
+    }
+    [AttributeUsage(AttributeTargets.Parameter, Inherited = false)]
+    public sealed class RequiresLocationAttribute : Attribute
+    {
+        public RequiresLocationAttribute() { }
+    }
+    [AttributeUsage(AttributeTargets.Parameter, AllowMultiple = false, Inherited = false)]
+    public sealed class CallerArgumentExpressionAttribute : Attribute
+    {
+        public CallerArgumentExpressionAttribute(string parameterName)
+        {
+            ParameterName = parameterName;
+        }
+
+        public string ParameterName { get; }
+    }
+    /// <summary>
+    /// Indicates that a method will allow a variable number of arguments in its invocation.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Parameter, Inherited = true, AllowMultiple = false)]
+    public sealed class ParamCollectionAttribute : Attribute
+    {
+    }
+    [AttributeUsage(AttributeTargets.Struct)]
+    public sealed class IsByRefLikeAttribute : Attribute
+    {
+        public IsByRefLikeAttribute() { }
+    }
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Enum | AttributeTargets.Method | AttributeTargets.Property | AttributeTargets.Field | AttributeTargets.Event | AttributeTargets.Interface | AttributeTargets.Delegate, Inherited = false)]
+    public sealed class ExtensionMarkerAttribute : Attribute
+    {
+        public ExtensionMarkerAttribute(string name) => Name = name;
+
+        public string Name { get; }
+    }
+    [AttributeUsage(AttributeTargets.All, AllowMultiple = false, Inherited = false)]
+    public sealed class IsUnmanagedAttribute : Attribute
+    {
+        public IsUnmanagedAttribute() { }
     }
     [InterpolatedStringHandler]
     public ref struct DefaultInterpolatedStringHandler
@@ -702,6 +791,20 @@ namespace System.Runtime.CompilerServices
             // ldobj !!T
             // ret
         }
+        [NonVersionable]
+        [CLSCompliant(false)]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void WriteUnaligned<T>(void* destination, T value)
+            where T : allows ref struct
+        {
+            *(T*)destination = value;
+
+            // ldarg .0
+            // ldarg .1
+            // unaligned. 0x01
+            // stobj !!T
+            // ret
+        }
         [Intrinsic]
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static void WriteUnaligned<T>(ref byte destination, T value)
@@ -913,6 +1016,57 @@ namespace System.Runtime.CompilerServices
             // ceq
             // ret
             return false;
+        }
+        [NonVersionable]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsAddressGreaterThan<T>([AllowNull] ref readonly T left, [AllowNull] ref readonly T right)
+            where T : allows ref struct
+        {
+            throw new PlatformNotSupportedException();
+
+            // ldarg.0
+            // ldarg.1
+            // cgt.un
+            // ret
+        }
+
+        [NonVersionable]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsAddressLessThan<T>([AllowNull] ref readonly T left, [AllowNull] ref readonly T right)
+            where T : allows ref struct
+        {
+            throw new PlatformNotSupportedException();
+
+            // ldarg.0
+            // ldarg.1
+            // clt.un
+            // ret
+        }
+
+        /// <summary>
+        /// Determines whether the memory address referenced by <paramref name="left"/> is less than
+        /// or equal to the memory address referenced by <paramref name="right"/>.
+        /// </summary>
+        /// <remarks>
+        /// This check is conceptually similar to "(void*)(&amp;left) &lt;= (void*)(&amp;right)".
+        /// </remarks>
+        [Intrinsic]
+        [NonVersionable]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsAddressLessThanOrEqualTo<T>([AllowNull] ref readonly T left, [AllowNull] ref readonly T right)
+            where T : allows ref struct
+        {
+            return !IsAddressGreaterThan(in left, in right);
+        }
+
+        [NonVersionable]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void SkipInit<T>(out T value)
+            where T : allows ref struct
+        {
+            throw new PlatformNotSupportedException();
+
+            // ret
         }
     }
 }

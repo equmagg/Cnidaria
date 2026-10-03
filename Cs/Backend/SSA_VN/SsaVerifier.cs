@@ -736,7 +736,7 @@ namespace Cnidaria.Cs
                 return;
 
             if (node.Kind != GenTreeKind.Binary ||
-                node.SourceOp is not (BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un) ||
+                node.Operator is not (GenTreeOperator.Div or GenTreeOperator.DivUn or GenTreeOperator.Rem or GenTreeOperator.RemUn) ||
                 node.Operands.Length != 2 ||
                 !GenTreeArithmeticSemantics.IsIntegralArithmeticType(node.Type, node.StackKind))
             {

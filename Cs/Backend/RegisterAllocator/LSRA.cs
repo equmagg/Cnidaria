@@ -6811,27 +6811,27 @@ namespace Cnidaria.Cs
                 if (!method.Target.IsX86 || node.Kind != GenTreeKind.Binary || node.RegisterUses.Length != 2)
                     return;
 
-                switch (node.SourceOp)
+                switch (node.Operator)
                 {
-                    case BytecodeOp.Add:
-                    case BytecodeOp.Mul:
-                    case BytecodeOp.And:
-                    case BytecodeOp.Or:
-                    case BytecodeOp.Xor:
+                    case GenTreeOperator.Add:
+                    case GenTreeOperator.Mul:
+                    case GenTreeOperator.And:
+                    case GenTreeOperator.Or:
+                    case GenTreeOperator.Xor:
                         AddDirectedClassCompatiblePreference(method, result, node.RegisterResult!, node.RegisterUses[0]);
                         AddDirectedClassCompatiblePreference(method, result, node.RegisterResult!, node.RegisterUses[1]);
                         return;
 
                     // The emitter can land Sub on the right operand, but pays with negate-and-add, or a
                     // stack slot for floats
-                    case BytecodeOp.Sub:
+                    case GenTreeOperator.Sub:
                         AddDirectedClassCompatiblePreference(method, result, node.RegisterResult!, node.RegisterUses[0]);
                         return;
 
                     // The count is pinned to rcx and the emitter rejects a destination colliding with it
-                    case BytecodeOp.Shl:
-                    case BytecodeOp.Shr:
-                    case BytecodeOp.Shr_Un:
+                    case GenTreeOperator.Shl:
+                    case GenTreeOperator.Shr:
+                    case GenTreeOperator.ShrUn:
                         AddDirectedClassCompatiblePreference(method, result, node.RegisterResult!, node.RegisterUses[0]);
                         return;
 

@@ -47,6 +47,7 @@ public enum BoundNodeKind : ushort
     ConversionExpression,
     CastExpression,
     SizeofExpression,
+    OffsetofExpression,
     ParenthesizedExpression,
     CompoundLiteralExpression,
     GenericSelectionExpression,
@@ -88,12 +89,15 @@ public sealed class BoundTree
     public BoundTranslationUnit Root { get; }
     /// <summary>Diagnostics produced before and during binding</summary>
     public ImmutableArray<SemanticDiagnostic> Diagnostics { get; }
+    public IReadOnlyDictionary<VariableArrayType, BoundExpression> VariableLengths { get; }
 
     public BoundTree(
         SemanticModel semanticModel,
         BoundTranslationUnit root,
-        ImmutableArray<SemanticDiagnostic> diagnostics)
+        ImmutableArray<SemanticDiagnostic> diagnostics,
+        IReadOnlyDictionary<VariableArrayType, BoundExpression>? variableLengths = null)
     {
+        VariableLengths = variableLengths ?? new Dictionary<VariableArrayType, BoundExpression>();
         SemanticModel = semanticModel ?? throw new ArgumentNullException(nameof(semanticModel));
         Root = root ?? throw new ArgumentNullException(nameof(root));
         Diagnostics = diagnostics.IsDefault
@@ -883,6 +887,16 @@ public sealed class BoundSizeofExpression : BoundExpression
     {
         Expression = expression;
         OperandType = operandType;
+    }
+}
+
+public sealed class BoundOffsetofExpression : BoundExpression
+{
+    public override BoundNodeKind Kind => BoundNodeKind.OffsetofExpression;
+
+    public BoundOffsetofExpression(OffsetofExpressionSyntax syntax, QualifiedType resultType, object? constantValue)
+        : base(syntax, resultType, BoundValueKind.RValue, constantValue)
+    {
     }
 }
 

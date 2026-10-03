@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.IO;
@@ -266,6 +267,14 @@ namespace Cnidaria.Cs
         BrF64Le = 69,
         BrF64Gt = 70,
         BrF64Ge = 71,
+        BrF32LtUn = 72,
+        BrF32LeUn = 73,
+        BrF32GtUn = 74,
+        BrF32GeUn = 75,
+        BrF64LtUn = 76,
+        BrF64LeUn = 77,
+        BrF64GtUn = 78,
+        BrF64GeUn = 79,
 
         MovI = 96,
         MovF = 97,
@@ -407,6 +416,8 @@ namespace Cnidaria.Cs
         F32Max = 270,
         F32IsNaN = 271,
         F32IsFinite = 272,
+        F32LtUn = 273,
+        F32GtUn = 274,
 
         F64Add = 288,
         F64Sub = 289,
@@ -425,6 +436,8 @@ namespace Cnidaria.Cs
         F64Max = 302,
         F64IsNaN = 303,
         F64IsFinite = 304,
+        F64LtUn = 305,
+        F64GtUn = 306,
 
         I32ToI64 = 320,
         U32ToI64 = 321,
@@ -574,6 +587,8 @@ namespace Cnidaria.Cs
         NewDelegateClosed = 657,
         DelegateCombine = 658,
         DelegateRemove = 659,
+        BoxAddr = 660,
+        BoxSegments = 661,
 
         CallVoid = 704,
         CallI = 705,
@@ -1458,7 +1473,7 @@ namespace Cnidaria.Cs
         }
 
         private static bool IsTypeLayoutInstruction(Op op)
-            => op is Op.LiStaticBase or Op.CpObj or Op.NewArr or Op.NewSZArray or Op.Box or Op.UnboxAny or Op.UnboxAddr
+            => op is Op.LiStaticBase or Op.CpObj or Op.NewArr or Op.NewSZArray or Op.Box or Op.BoxAddr or Op.BoxSegments or Op.UnboxAny or Op.UnboxAddr
                 or Op.SizeOf or Op.InitObj or Op.DefaultValue;
 
         private static bool IsArrayElementLayoutInstruction(Op op)
@@ -1782,6 +1797,7 @@ namespace Cnidaria.Cs
                 case Op.CastClass:
                 case Op.IsInst:
                 case Op.UnboxAddr:
+                case Op.BoxAddr:
                     RequireGpr(inst.Rd, pc, nameof(inst.Rd));
                     RequireGpr(inst.Rs1, pc, nameof(inst.Rs1));
                     return;
@@ -1789,6 +1805,12 @@ namespace Cnidaria.Cs
                 case Op.Box:
                     RequireGpr(inst.Rd, pc, nameof(inst.Rd));
                     RequireAnyRegister(inst.Rs1, pc, nameof(inst.Rs1));
+                    return;
+
+                case Op.BoxSegments:
+                    RequireGpr(inst.Rd, pc, nameof(inst.Rd));
+                    RequireAnyRegister(inst.Rs1, pc, nameof(inst.Rs1));
+                    RequireAnyRegister(inst.Rs2, pc, nameof(inst.Rs2));
                     return;
 
                 case Op.UnboxAny:
@@ -1928,7 +1950,9 @@ namespace Cnidaria.Cs
                 or Op.BrU64Lt or Op.BrU64Le or Op.BrU64Gt or Op.BrU64Ge
                 or Op.BrRefEq or Op.BrRefNe
                 or Op.BrF32Eq or Op.BrF32Ne or Op.BrF32Lt or Op.BrF32Le or Op.BrF32Gt or Op.BrF32Ge
-                or Op.BrF64Eq or Op.BrF64Ne or Op.BrF64Lt or Op.BrF64Le or Op.BrF64Gt or Op.BrF64Ge;
+                or Op.BrF64Eq or Op.BrF64Ne or Op.BrF64Lt or Op.BrF64Le or Op.BrF64Gt or Op.BrF64Ge
+                or Op.BrF32LtUn or Op.BrF32LeUn or Op.BrF32GtUn or Op.BrF32GeUn
+                or Op.BrF64LtUn or Op.BrF64LeUn or Op.BrF64GtUn or Op.BrF64GeUn;
 
         private static bool IsCallInstruction(Op op)
             => IsOpInRange(op, Op.CallVoid, Op.CallIndirectValue);
@@ -1978,7 +2002,8 @@ namespace Cnidaria.Cs
 
         private static bool IsFloatCompare(Op op)
             => op is Op.F32Eq or Op.F32Ne or Op.F32Lt or Op.F32Le or Op.F32Gt or Op.F32Ge
-                or Op.F64Eq or Op.F64Ne or Op.F64Lt or Op.F64Le or Op.F64Gt or Op.F64Ge;
+                or Op.F64Eq or Op.F64Ne or Op.F64Lt or Op.F64Le or Op.F64Gt or Op.F64Ge
+                or Op.F32LtUn or Op.F32GtUn or Op.F64LtUn or Op.F64GtUn;
 
         private static bool IsFloatPredicate(Op op)
             => op is Op.F32IsNaN or Op.F32IsFinite or Op.F64IsNaN or Op.F64IsFinite;
@@ -2013,7 +2038,9 @@ namespace Cnidaria.Cs
 
         private static bool IsFloatBranch(Op op)
             => op is Op.BrF32Eq or Op.BrF32Ne or Op.BrF32Lt or Op.BrF32Le or Op.BrF32Gt or Op.BrF32Ge
-                or Op.BrF64Eq or Op.BrF64Ne or Op.BrF64Lt or Op.BrF64Le or Op.BrF64Gt or Op.BrF64Ge;
+                or Op.BrF64Eq or Op.BrF64Ne or Op.BrF64Lt or Op.BrF64Le or Op.BrF64Gt or Op.BrF64Ge
+                or Op.BrF32LtUn or Op.BrF32LeUn or Op.BrF32GtUn or Op.BrF32GeUn
+                or Op.BrF64LtUn or Op.BrF64LeUn or Op.BrF64GtUn or Op.BrF64GeUn;
 
         private static bool IsTwoOperandBranch(Op op)
             => op is not (Op.BrTrueI32 or Op.BrFalseI32 or Op.BrTrueI64 or Op.BrFalseI64 or Op.BrTrueRef or Op.BrFalseRef);
@@ -2045,6 +2072,7 @@ namespace Cnidaria.Cs
         private readonly Dictionary<int, int> _typeLayoutByRuntimeTypeId = new Dictionary<int, int>();
         private readonly Dictionary<int, int> _interfaceDispatchSlotByMethodId = new Dictionary<int, int>();
         private readonly List<byte> _blob = new List<byte>();
+        private readonly Dictionary<string, int> _stringLiteralOffsets = new Dictionary<string, int>(StringComparer.Ordinal);
         private readonly List<int> _labelPc = new List<int>();
         private readonly List<Fixup> _fixups = new List<Fixup>();
         private MethodDraft? _currentMethod;
@@ -2053,6 +2081,10 @@ namespace Cnidaria.Cs
         public Assembler(RuntimeTypeSystem? rts)
         {
             _rts = rts;
+            // A function pointer of 0 is null, so a synthetic trap method takes pc 0
+            BeginMethod(-1);
+            Trap(0);
+            EndMethod();
         }
 
         public int Pc => _code.Count;
@@ -2446,6 +2478,20 @@ namespace Cnidaria.Cs
             return offset;
         }
 
+        // A literal is an int32 length followed by little-endian UTF-16 code units.
+        private int AddStringLiteral(string value)
+        {
+            if (_stringLiteralOffsets.TryGetValue(value, out int offset))
+                return offset;
+            var bytes = new byte[4 + value.Length * 2];
+            BinaryPrimitives.WriteInt32LittleEndian(bytes, value.Length);
+            for (int i = 0; i < value.Length; i++)
+                BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(4 + i * 2), value[i]);
+            offset = AddBlob(bytes);
+            _stringLiteralOffsets.Add(value, offset);
+            return offset;
+        }
+
         public int AddSwitchEntry(int key, Label target)
             => AddSwitchEntry((long)key, target);
 
@@ -2534,7 +2580,9 @@ namespace Cnidaria.Cs
                 or Op.BrU64Lt or Op.BrU64Le or Op.BrU64Gt or Op.BrU64Ge
                 or Op.BrRefEq or Op.BrRefNe
                 or Op.BrF32Eq or Op.BrF32Ne or Op.BrF32Lt or Op.BrF32Le or Op.BrF32Gt or Op.BrF32Ge
-                or Op.BrF64Eq or Op.BrF64Ne or Op.BrF64Lt or Op.BrF64Le or Op.BrF64Gt or Op.BrF64Ge;
+                or Op.BrF64Eq or Op.BrF64Ne or Op.BrF64Lt or Op.BrF64Le or Op.BrF64Gt or Op.BrF64Ge
+                or Op.BrF32LtUn or Op.BrF32LeUn or Op.BrF32GtUn or Op.BrF32GeUn
+                or Op.BrF64LtUn or Op.BrF64LeUn or Op.BrF64GtUn or Op.BrF64GeUn;
 
         public void MovI(MachineRegister rd, MachineRegister rs) => Emit(new InstrDesc(Op.MovI, RegisterVmIsa.EncodeRegister(rd), RegisterVmIsa.EncodeRegister(rs)));
         public void MovF(MachineRegister rd, MachineRegister rs) => Emit(new InstrDesc(Op.MovF, RegisterVmIsa.EncodeRegister(rd), RegisterVmIsa.EncodeRegister(rs)));
@@ -2547,7 +2595,7 @@ namespace Cnidaria.Cs
         public void LiF32Bits(MachineRegister rd, int bits) => Emit(InstrDesc.Li(Op.LiF32Bits, rd, bits));
         public void LiF64Bits(MachineRegister rd, long bits) => Emit(InstrDesc.Li(Op.LiF64Bits, rd, bits));
         public void LiNull(MachineRegister rd) => Emit(InstrDesc.Li(Op.LiNull, rd, 0));
-        public void LiString(MachineRegister rd, int userStringRid) => Emit(InstrDesc.Li(Op.LiString, rd, userStringRid, Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow)));
+        public void LiString(MachineRegister rd, string value) => Emit(InstrDesc.Li(Op.LiString, rd, AddStringLiteral(value), Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow)));
         public void LiTypeHandle(MachineRegister rd, int runtimeTypeId) => Emit(InstrDesc.Li(Op.LiTypeHandle, rd, runtimeTypeId));
 
         public void I32Add(MachineRegister rd, MachineRegister a, MachineRegister b) => Emit(InstrDesc.R(Op.I32Add, rd, a, b));
@@ -3532,8 +3580,10 @@ namespace Cnidaria.Cs
             if (inst.Op is Op.CastClass or Op.IsInst)
                 return $"{FormatRegister(inst.Rd)}, {FormatRegister(inst.Rs1)}, T{inst.Imm}";
 
-            if (inst.Op is Op.Box or Op.UnboxAny or Op.UnboxAddr or Op.InitObj or Op.DefaultValue or Op.SizeOf)
+            if (inst.Op is Op.Box or Op.BoxAddr or Op.UnboxAny or Op.UnboxAddr or Op.InitObj or Op.DefaultValue or Op.SizeOf)
                 return $"{FormatRegister(inst.Rd)}, {FormatRegister(inst.Rs1)}, TL{inst.Imm}";
+            if (inst.Op == Op.BoxSegments)
+                return $"{FormatRegister(inst.Rd)}, {FormatRegister(inst.Rs1)}, {FormatRegister(inst.Rs2)}, {FormatRegister(inst.Rs3)}, TL{inst.Imm}";
 
             if (inst.Op == Op.LdVTableEntry)
                 return $"{FormatRegister(inst.Rd)}, [{FormatRegister(inst.Rs1)}.vtable+{inst.Imm}]";
@@ -3818,7 +3868,9 @@ namespace Cnidaria.Cs
                 or Op.BrU64Lt or Op.BrU64Le or Op.BrU64Gt or Op.BrU64Ge
                 or Op.BrRefEq or Op.BrRefNe
                 or Op.BrF32Eq or Op.BrF32Ne or Op.BrF32Lt or Op.BrF32Le or Op.BrF32Gt or Op.BrF32Ge
-                or Op.BrF64Eq or Op.BrF64Ne or Op.BrF64Lt or Op.BrF64Le or Op.BrF64Gt or Op.BrF64Ge;
+                or Op.BrF64Eq or Op.BrF64Ne or Op.BrF64Lt or Op.BrF64Le or Op.BrF64Gt or Op.BrF64Ge
+                or Op.BrF32LtUn or Op.BrF32LeUn or Op.BrF32GtUn or Op.BrF32GeUn
+                or Op.BrF64LtUn or Op.BrF64LeUn or Op.BrF64GtUn or Op.BrF64GeUn;
 
         private static bool IsSwitchInstruction(Op op)
             => op is Op.SwitchI32 or Op.SwitchI64;
@@ -3846,7 +3898,8 @@ namespace Cnidaria.Cs
 
         private static bool IsFloatCompare(Op op)
             => op is Op.F32Eq or Op.F32Ne or Op.F32Lt or Op.F32Le or Op.F32Gt or Op.F32Ge
-                or Op.F64Eq or Op.F64Ne or Op.F64Lt or Op.F64Le or Op.F64Gt or Op.F64Ge;
+                or Op.F64Eq or Op.F64Ne or Op.F64Lt or Op.F64Le or Op.F64Gt or Op.F64Ge
+                or Op.F32LtUn or Op.F32GtUn or Op.F64LtUn or Op.F64GtUn;
 
         private static bool IsFloatPredicate(Op op)
             => op is Op.F32IsNaN or Op.F32IsFinite or Op.F64IsNaN or Op.F64IsFinite;

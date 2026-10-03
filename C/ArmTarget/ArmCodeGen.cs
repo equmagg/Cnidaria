@@ -916,6 +916,7 @@ public sealed class ArmCodeGenerator
         private readonly int _lrSaveOffset;
         private readonly int _scratchSaveOffset;
         private readonly int _backendTempOffset;
+        private readonly int _wideTempOffset;
         private readonly int _varArgsGpSaveAreaOffset;
         private readonly int _varArgsGpSaveAreaSize;
         private readonly int _varArgsVrSaveAreaOffset;
@@ -989,6 +990,18 @@ public sealed class ArmCodeGenerator
                 checked(maximumParallelCopies * temporarySlotSize));
             _backendTempOffset = AlignUp(frameSize, _owner._target.PointerAlignment);
             frameSize = checked(_backendTempOffset + backendTempSize);
+
+            _wideTempOffset = -1;
+            if (!_owner._machineTarget.Is64Bit && instructions.Any(InvolvesWideInteger))
+            {
+                var wideCopies = instructions
+                    .Where(static i => i.Kind == LirInstructionKind.ParallelCopy)
+                    .Select(i => i.ParallelCopies.Count(copy => IsWideInteger(copy.Destination.Type)))
+                    .DefaultIfEmpty(0)
+                    .Max();
+                _wideTempOffset = AlignUp(frameSize, 8);
+                frameSize = checked(_wideTempOffset + WideStashOffset + wideCopies * 8);
+            }
             ComputeArmVarArgsSaveAreaSizes(out _varArgsGpSaveAreaSize, out _varArgsVrSaveAreaSize);
             _totalFrameSize = AlignUp(
                 checked(frameSize + _varArgsGpSaveAreaSize + _varArgsVrSaveAreaSize),
@@ -1014,6 +1027,12 @@ public sealed class ArmCodeGenerator
         public void EmitPrologue()
         {
             AdjustStack(-_totalFrameSize);
+            if (_allocation.Frame.HasDynamicStack)
+            {
+                var frameBase = ToArmRegister(TargetRegisterInfo.FrameBaseRegister(_owner._target));
+                EmitMemoryStore(frameBase, StackPointerArm, _allocation.Frame.FrameBaseSaveOffset, _owner._target.PointerSize);
+                MoveStackPointer(frameBase, StackPointerArm);
+            }
             SaveIncomingHiddenReturnBuffer();
             SaveIncomingVarArgs();
             foreach (var pair in _allocation.Frame.SavedRegisterOffsets.OrderBy(static p => p.Value))
@@ -1101,7 +1120,7 @@ public sealed class ArmCodeGenerator
                     var armRegister = (ArmRegister)((int)ArmRegister.V0 + ((int)vectorRegisters[register] - (int)MachineRegister.V0));
                     EmitMemoryStore(
                         armRegister,
-                        StackPointerArm,
+                        FrameBaseArm,
                         checked(_varArgsVrSaveAreaOffset + register * 16),
                         16);
                 }
@@ -1111,9 +1130,9 @@ public sealed class ArmCodeGenerator
                 return;
 
             if (_varArgsGpSaveAreaOffset >= 0)
-                AddImmediate(Scratch0, StackPointer, _varArgsGpSaveAreaOffset);
+                AddImmediate(Scratch0, FrameBase, _varArgsGpSaveAreaOffset);
             else
-                AddImmediate(Scratch0, StackPointer, IncomingStackOffset(cursor.Stack * _owner._allocationOptions.StackArgumentSlotSize));
+                AddImmediate(Scratch0, FrameBase, IncomingStackOffset(cursor.Stack * _owner._allocationOptions.StackArgumentSlotSize));
             StoreRegister(Scratch0, _allocation.Frame.VarArgsPointerOffset, _owner._target.PointerSize);
         }
 
@@ -1164,6 +1183,9 @@ public sealed class ArmCodeGenerator
 
         private void EmitInstruction(LirInstruction instruction)
         {
+            if (TryEmitWideInteger(instruction))
+                return;
+
             switch (instruction.Kind)
             {
                 case LirInstructionKind.Nop:
@@ -1209,6 +1231,35 @@ public sealed class ArmCodeGenerator
                     break;
                 case LirInstructionKind.VaStart:
                     EmitVaStart(instruction);
+                    break;
+                case LirInstructionKind.StackAllocate:
+                    {
+                        var size = _owner._target.PointerSize;
+                        var bytes = LoadOperand(instruction.Operands[0], Scratch0);
+                        _owner.EmitAddImmediate(ToArm(Scratch0), ToArm(bytes), 15, size);
+                        LoadImmediate(Scratch1, -16, size);
+                        Emit(ArmInstruction.Ternary(ArmInstrKind.And, Reg(ToArm(Scratch0), size), Reg(ToArm(Scratch0), size), Reg(ToArm(Scratch1), size)));
+                        MoveStackPointer(ToArm(Scratch1), StackPointerArm);
+                        Emit(ArmInstruction.Ternary(ArmInstrKind.Sub, Reg(ToArm(Scratch1), size), Reg(ToArm(Scratch1), size), Reg(ToArm(Scratch0), size)));
+                        MoveStackPointer(StackPointerArm, ToArm(Scratch1));
+
+                        var destination = GetWritableRegister(instruction.Result!, Scratch0);
+                        MoveStackPointer(ToArm(destination), StackPointerArm);
+                        _owner.EmitAddImmediate(ToArm(destination), ToArm(destination), _allocation.Frame.OutgoingArgumentAreaSize, size);
+                        InvalidateIntegerRepresentation(destination);
+                        StoreWritableRegisterIfSpilled(instruction.Result!, destination);
+                        break;
+                    }
+                case LirInstructionKind.StackSave:
+                    {
+                        var destination = GetWritableRegister(instruction.Result!, Scratch0);
+                        MoveStackPointer(ToArm(destination), StackPointerArm);
+                        InvalidateIntegerRepresentation(destination);
+                        StoreWritableRegisterIfSpilled(instruction.Result!, destination);
+                        break;
+                    }
+                case LirInstructionKind.StackRestore:
+                    MoveStackPointer(StackPointerArm, ToArm(LoadOperand(instruction.Operands[0], Scratch0)));
                     break;
                 case LirInstructionKind.VaArg:
                     EmitVaArg(instruction);
@@ -1509,16 +1560,16 @@ public sealed class ArmCodeGenerator
 
             AddImmediate(
                 Scratch0,
-                StackPointer,
+                FrameBase,
                 IncomingStackOffset(cursor.Stack * _owner._allocationOptions.StackArgumentSlotSize));
             StoreToMemory(Scratch0, Scratch4, 0, 8);
 
             var gpTopOffset = checked(_varArgsGpSaveAreaOffset + _varArgsGpSaveAreaSize);
-            AddImmediate(Scratch0, StackPointer, gpTopOffset);
+            AddImmediate(Scratch0, FrameBase, gpTopOffset);
             StoreToMemory(Scratch0, Scratch4, 8, 8);
 
             var vrTopOffset = checked(_varArgsVrSaveAreaOffset + _varArgsVrSaveAreaSize);
-            AddImmediate(Scratch0, StackPointer, vrTopOffset);
+            AddImmediate(Scratch0, FrameBase, vrTopOffset);
             StoreToMemory(Scratch0, Scratch4, 16, 8);
 
             LoadImmediate(Scratch0, checked(cursor.Integer * 8 - _varArgsGpSaveAreaSize), 4);
@@ -1721,7 +1772,7 @@ public sealed class ArmCodeGenerator
             {
                 var stacked = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
                 var home = MaterializeVirtualRegisterStorageAddress(instruction.Result, Scratch0);
-                AddImmediate(Scratch1, StackPointer, IncomingStackOffset(stacked.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)));
+                AddImmediate(Scratch1, FrameBase, IncomingStackOffset(stacked.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)));
                 CopyMemory(home, Scratch1, value.Size);
                 return;
             }
@@ -2293,7 +2344,7 @@ public sealed class ArmCodeGenerator
         {
             if (!IsZeroSource(operand, asType))
                 return false;
-            EmitMemoryStore(ArmRegister.Xzr, StackPointerArm, offset, size);
+            EmitMemoryStore(ArmRegister.Xzr, FrameBaseArm, offset, size);
             return true;
         }
 
@@ -2824,6 +2875,7 @@ public sealed class ArmCodeGenerator
                 else if (item.Location.Kind == AbiLocationKind.Stack)
                     StoreToMemory(
                         staged,
+                        StackPointer,
                         _allocation.Frame.OutgoingArgumentAreaOffset + item.Location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize),
                         Math.Min(item.ValueSize, item.RegisterSize));
                 else
@@ -2837,7 +2889,7 @@ public sealed class ArmCodeGenerator
                 if (buffer.Kind == AbiLocationKind.Register)
                     MoveRegister(buffer.Register, address, _owner._target.PointerSize);
                 else if (buffer.Kind == AbiLocationKind.Stack)
-                    StoreToMemory(address, _allocation.Frame.OutgoingArgumentAreaOffset + buffer.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), _owner._target.PointerSize);
+                    StoreToMemory(address, StackPointer, _allocation.Frame.OutgoingArgumentAreaOffset + buffer.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), _owner._target.PointerSize);
                 else
                     throw Unsupported(instruction, "Invalid hidden return buffer ABI location.");
             }
@@ -2853,7 +2905,7 @@ public sealed class ArmCodeGenerator
                 if (location.Kind == AbiLocationKind.Register)
                     MoveRegister(location.Register, source, _owner._target.PointerSize);
                 else if (location.Kind == AbiLocationKind.Stack)
-                    StoreToMemory(source, _allocation.Frame.OutgoingArgumentAreaOffset + location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), _owner._target.PointerSize);
+                    StoreToMemory(source, StackPointer, _allocation.Frame.OutgoingArgumentAreaOffset + location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), _owner._target.PointerSize);
                 else
                     throw Unsupported(instruction, "Invalid indirect call argument ABI location.");
                 return true;
@@ -2874,7 +2926,7 @@ public sealed class ArmCodeGenerator
                     {
                         var staged = segment.RegisterClass == AbiRegisterClass.Vector ? FpScratch1 : Scratch1;
                         LoadFromMemory(staged, source, segment.Offset, width, false);
-                        StoreToMemory(staged, _allocation.Frame.OutgoingArgumentAreaOffset + location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), width);
+                        StoreToMemory(staged, StackPointer, _allocation.Frame.OutgoingArgumentAreaOffset + location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), width);
                     }
                     else
                     {
@@ -3220,6 +3272,8 @@ public sealed class ArmCodeGenerator
 
         private void EmitEpilogue()
         {
+            if (_allocation.Frame.HasDynamicStack)
+                MoveStackPointer(StackPointerArm, FrameBaseArm);
             if (!_owner._machineTarget.Is64Bit)
             {
                 LoadRegister(Scratch3, _scratchSaveOffset + 12, 4);
@@ -3231,12 +3285,19 @@ public sealed class ArmCodeGenerator
                 LoadArmRegister(_owner._machineTarget.Is64Bit ? ArmRegister.X30 : ArmRegister.Lr, _lrSaveOffset, _owner._target.PointerSize);
             foreach (var pair in _allocation.Frame.SavedRegisterOffsets.OrderByDescending(static p => p.Value))
                 LoadRegister(pair.Key, pair.Value, RegisterSaveSize(pair.Key));
+            if (_allocation.Frame.HasDynamicStack)
+            {
+                EmitMemoryLoad(ToArmRegister(TargetRegisterInfo.FrameBaseRegister(_owner._target)), StackPointerArm,
+                    _allocation.Frame.FrameBaseSaveOffset, _owner._target.PointerSize, false);
+            }
             AdjustStack(_totalFrameSize);
         }
 
         private void EmitParallelCopy(LirInstruction instruction)
         {
             var copies = instruction.ParallelCopies.Where(_allocation.RequiresPhysicalParallelCopy).ToArray();
+            if (_wideTempOffset >= 0)
+                copies = EmitWideParallelCopies(copies, instruction);
             if (copies.Length == 0)
                 return;
             foreach (var copy in copies)
@@ -3437,14 +3498,14 @@ public sealed class ArmCodeGenerator
         {
             if (register.HomeSlot is { } home)
             {
-                AddImmediate(destination, StackPointer, _allocation.Frame.StackSlotOffsets[home]);
+                AddImmediate(destination, FrameBase, _allocation.Frame.StackSlotOffsets[home]);
                 return destination;
             }
 
             var allocation = _allocation[register];
             if (!allocation.IsSpilled)
                 throw new NotSupportedException($"Virtual register {register.Name} must be stack-backed.");
-            AddImmediate(destination, StackPointer, allocation.StackOffset);
+            AddImmediate(destination, FrameBase, allocation.StackOffset);
             return destination;
         }
 
@@ -3459,13 +3520,23 @@ public sealed class ArmCodeGenerator
                 case LirOperandKind.StackSlot:
                     if (operand.StackSlot is null || !_allocation.Frame.StackSlotOffsets.TryGetValue(operand.StackSlot, out var slotOffset))
                         throw Unsupported(instruction, "Stack-slot operand has no offset.");
-                    AddImmediate(destination, StackPointer, slotOffset);
+                    AddImmediate(destination, FrameBase, slotOffset);
                     return destination;
                 case LirOperandKind.Address:
                     if (operand.Address is null)
                         throw Unsupported(instruction, "Address operand has no address.");
                     MaterializeAddress(operand.Address, destination);
                     return destination;
+                case LirOperandKind.Immediate when IsWideInteger(operand.Type):
+                    {
+                        var value = ConvertIntegerConstant(operand.Immediate);
+                        LoadImmediate(Scratch4, unchecked((uint)value), 4);
+                        StoreToMemory(Scratch4, _wideTempOffset + WideConstantOffset, 4);
+                        LoadImmediate(Scratch4, unchecked((uint)(value >> 32)), 4);
+                        StoreToMemory(Scratch4, _wideTempOffset + WideConstantOffset + 4, 4);
+                        AddImmediate(destination, FrameBase, _wideTempOffset + WideConstantOffset);
+                        return destination;
+                    }
                 default:
                     throw Unsupported(instruction, $"Cannot take the storage address of LIR operand kind {operand.Kind}.");
             }
@@ -3540,7 +3611,7 @@ public sealed class ArmCodeGenerator
                 case LirAddressKind.StackSlot:
                     if (address.StackSlot is null || !_allocation.Frame.StackSlotOffsets.TryGetValue(address.StackSlot, out var stackOffset))
                         throw new InvalidOperationException("Missing stack slot offset.");
-                    return new AddressParts(StackPointer, stackOffset);
+                    return new AddressParts(FrameBase, stackOffset);
                 case LirAddressKind.Symbol:
                     if (address.Symbol is null)
                         throw new InvalidOperationException("Symbol address has no symbol.");
@@ -3887,14 +3958,14 @@ public sealed class ArmCodeGenerator
             => LoadArmRegister(ToArmRegister(destination), offset, size);
 
         private void StoreArmRegister(ArmRegister source, int offset, int size)
-            => EmitMemoryStore(source, StackPointerArm, offset, size);
+            => EmitMemoryStore(source, FrameBaseArm, offset, size);
 
         private void LoadArmRegister(ArmRegister destination, int offset, int size)
-            => EmitMemoryLoad(destination, StackPointerArm, offset, size, false);
+            => EmitMemoryLoad(destination, FrameBaseArm, offset, size, false);
 
         private void LoadFromMemory(MachineRegister destination, int offset, int size, bool signed)
         {
-            EmitMemoryLoad(ToArmRegister(destination), StackPointerArm, offset, size, signed);
+            EmitMemoryLoad(ToArmRegister(destination), FrameBaseArm, offset, size, signed);
             if (!IsVectorRegister(destination))
                 SetIntegerRepresentation(destination, RepresentationForLoad(size, signed));
         }
@@ -3907,7 +3978,7 @@ public sealed class ArmCodeGenerator
         }
 
         private void StoreToMemory(MachineRegister source, int offset, int size)
-            => EmitMemoryStore(ToArmRegister(source), StackPointerArm, offset, size);
+            => EmitMemoryStore(ToArmRegister(source), FrameBaseArm, offset, size);
 
         private void StoreToMemory(MachineRegister source, MachineRegister baseRegister, int offset, int size)
             => EmitMemoryStore(ToArmRegister(source), ToArmRegister(baseRegister), offset, size);
@@ -4208,6 +4279,450 @@ public sealed class ArmCodeGenerator
             }
         }
 
+        // ARM32 64-bit integers live in frame slots and are computed in Scratch0:1 and Scratch2:3, with Scratch4 addressing memory
+        private const int WideDivisorOffset = 0;
+        private const int WideCountOffset = 8;
+        private const int WideQuotientSignOffset = 12;
+        private const int WideRemainderSignOffset = 16;
+        private const int WideConstantOffset = 24;
+        private const int WideStashOffset = 32;
+
+        private bool IsWideInteger(QualifiedType type)
+            => !_owner._machineTarget.Is64Bit && IsIntegerLike(type) && SizeOf(type) == 8;
+
+        private bool InvolvesWideInteger(LirInstruction instruction)
+            => instruction.Result is { } result && IsWideInteger(result.Type) ||
+               instruction.Operands.Any(operand => IsWideInteger(operand.Type)) ||
+               instruction.Address is { } address && IsWideInteger(address.ElementType) ||
+               instruction.ParallelCopies.Any(copy => IsWideInteger(copy.Destination.Type));
+
+        private bool TryEmitWideInteger(LirInstruction instruction)
+        {
+            if (_wideTempOffset < 0 || !InvolvesWideInteger(instruction))
+                return false;
+
+            switch (instruction.Kind)
+            {
+                case LirInstructionKind.Copy:
+                case LirInstructionKind.Constant:
+                case LirInstructionKind.Cast:
+                case LirInstructionKind.Convert:
+                    EmitWideConvert(instruction);
+                    return true;
+                case LirInstructionKind.Zero:
+                    LoadImmediate(Scratch0, 0, 4);
+                    StoreWideResult(instruction.Result!, Scratch0, Scratch0);
+                    return true;
+                case LirInstructionKind.Unary:
+                    EmitWideUnary(instruction);
+                    return true;
+                case LirInstructionKind.Binary:
+                    EmitWideBinary(instruction);
+                    return true;
+                case LirInstructionKind.Load when IsWideInteger(instruction.Result!.Type):
+                    MaterializeAddress(instruction.Address!, Scratch4);
+                    LoadFromMemory(Scratch0, Scratch4, 0, 4, false);
+                    LoadFromMemory(Scratch1, Scratch4, 4, 4, false);
+                    StoreWideResult(instruction.Result, Scratch0, Scratch1);
+                    return true;
+                case LirInstructionKind.Store when IsWideInteger(instruction.Address!.ElementType):
+                    LoadWide(instruction.Operands[0], Scratch0, Scratch1, instruction);
+                    MaterializeAddress(instruction.Address, Scratch4);
+                    StoreToMemory(Scratch0, Scratch4, 0, 4);
+                    StoreToMemory(Scratch1, Scratch4, 4, 4);
+                    return true;
+                case LirInstructionKind.Branch when instruction.Operands.Length == 2 && IsComparisonOperator(instruction.Operator):
+                    EmitWideRelation(instruction.Operator, instruction.Operands[0], instruction.Operands[1], Scratch0, instruction);
+                    EmitWideTruthBranch(instruction);
+                    return true;
+                case LirInstructionKind.Branch when instruction.Operands.Length == 1:
+                    LoadWide(instruction.Operands[0], Scratch0, Scratch1, instruction);
+                    Emit(ArmInstruction.Ternary(ArmInstrKind.Orr, Reg(ToArm(Scratch0), 4), Reg(ToArm(Scratch0), 4), Reg(ToArm(Scratch1), 4)));
+                    EmitWideTruthBranch(instruction);
+                    return true;
+                case LirInstructionKind.Switch:
+                    throw Unsupported(instruction, "A switch on a 64-bit value is not supported on ARM32.");
+                default:
+                    return false;
+            }
+        }
+
+        private void EmitWideTruthBranch(LirInstruction instruction)
+        {
+            Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch0), 4), ArmOperand.ImmediateOperand(0)));
+            if (IsFallthroughTarget(instruction.TrueTarget))
+            {
+                EmitConditionalJump(ArmCondition.Eq, LabelOf(instruction.FalseTarget));
+                return;
+            }
+            EmitConditionalJump(ArmCondition.Ne, LabelOf(instruction.TrueTarget));
+            if (!IsFallthroughTarget(instruction.FalseTarget))
+                EmitJump(LabelOf(instruction.FalseTarget));
+        }
+
+        private void LoadWide(LirOperand operand, MachineRegister low, MachineRegister high, LirInstruction instruction)
+        {
+            if (operand.Kind == LirOperandKind.Immediate)
+            {
+                var value = ConvertIntegerConstant(operand.Immediate);
+                if (!IsWideInteger(operand.Type) && IsSignedIntegerType(operand.Type))
+                    value = (int)value;
+                LoadImmediate(low, unchecked((uint)value), 4);
+                LoadImmediate(high, IsWideInteger(operand.Type) || IsSignedIntegerType(operand.Type) ? unchecked((uint)(value >> 32)) : 0, 4);
+                return;
+            }
+
+            if (!IsWideInteger(operand.Type))
+            {
+                var narrow = LoadOperand(operand, low);
+                if (narrow != low)
+                    MoveRegister(low, narrow, 4);
+                if (!IsPointerLike(operand.Type))
+                    NormalizeIntegerRegister(low, operand.Type);
+                if (IsSignedIntegerType(operand.Type) && !IsPointerLike(operand.Type))
+                    Emit(ArmInstruction.Ternary(ArmInstrKind.Asr, Reg(ToArm(high), 4), Reg(ToArm(low), 4), ArmOperand.ImmediateOperand(31)));
+                else
+                    LoadImmediate(high, 0, 4);
+                return;
+            }
+
+            var address = MaterializeOperandStorageAddress(operand, Scratch4, instruction);
+            LoadFromMemory(low, address, 0, 4, false);
+            LoadFromMemory(high, address, 4, 4, false);
+        }
+
+        private void StoreWideResult(LirVirtualRegister result, MachineRegister low, MachineRegister high)
+        {
+            var address = MaterializeVirtualRegisterStorageAddress(result, Scratch4);
+            StoreToMemory(low, address, 0, 4);
+            StoreToMemory(high, address, 4, 4);
+        }
+
+        private void StoreNarrowResult(LirVirtualRegister result, MachineRegister value)
+        {
+            var destination = GetWritableRegister(result, value);
+            if (destination != value)
+                MoveRegister(destination, value, 4);
+            if (!IsPointerLike(result.Type))
+                NormalizeIntegerRegister(destination, result.Type);
+            StoreWritableRegisterIfSpilled(result, destination);
+        }
+
+        private void EmitWideAlu(ArmInstrKind kind, MachineRegister destination, MachineRegister left, MachineRegister right)
+            => Emit(ArmInstruction.Ternary(kind, Reg(ToArm(destination), 4), Reg(ToArm(left), 4), Reg(ToArm(right), 4)));
+
+        private void EmitWideAluImmediate(ArmInstrKind kind, MachineRegister destination, MachineRegister left, long immediate)
+            => Emit(ArmInstruction.Ternary(kind, Reg(ToArm(destination), 4), Reg(ToArm(left), 4), ArmOperand.ImmediateOperand(immediate)));
+
+        private void EmitWideConvert(LirInstruction instruction)
+        {
+            var result = instruction.Result!;
+            var source = instruction.Operands[0];
+            if (IsFloatType(result.Type) || IsFloatType(source.Type))
+                throw Unsupported(instruction, "Converting between a 64-bit integer and a floating type is not supported on ARM32.");
+
+            LoadWide(source, Scratch0, Scratch1, instruction);
+            if (IsWideInteger(result.Type))
+            {
+                StoreWideResult(result, Scratch0, Scratch1);
+                return;
+            }
+
+            if (result.Type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Bool })
+            {
+                EmitWideAlu(ArmInstrKind.Orr, Scratch0, Scratch0, Scratch1);
+                EmitBooleanFromRegister(Scratch0, Scratch0, 4);
+            }
+            StoreNarrowResult(result, Scratch0);
+        }
+
+        private void EmitWideNegate(MachineRegister low, MachineRegister high)
+        {
+            Emit(ArmInstruction.Binary(ArmInstrKind.Mvn, Reg(ToArm(low), 4), Reg(ToArm(low), 4)));
+            Emit(ArmInstruction.Binary(ArmInstrKind.Mvn, Reg(ToArm(high), 4), Reg(ToArm(high), 4)));
+            EmitWideAluImmediate(ArmInstrKind.Adds, low, low, 1);
+            EmitWideAluImmediate(ArmInstrKind.Adc, high, high, 0);
+        }
+
+        private void EmitWideUnary(LirInstruction instruction)
+        {
+            var result = instruction.Result!;
+            LoadWide(instruction.Operands[0], Scratch0, Scratch1, instruction);
+            switch (instruction.Operator)
+            {
+                case "-":
+                    EmitWideNegate(Scratch0, Scratch1);
+                    break;
+                case "~":
+                    Emit(ArmInstruction.Binary(ArmInstrKind.Mvn, Reg(ToArm(Scratch0), 4), Reg(ToArm(Scratch0), 4)));
+                    Emit(ArmInstruction.Binary(ArmInstrKind.Mvn, Reg(ToArm(Scratch1), 4), Reg(ToArm(Scratch1), 4)));
+                    break;
+                case "!":
+                    EmitWideAlu(ArmInstrKind.Orr, Scratch0, Scratch0, Scratch1);
+                    EmitComparisonResult(Scratch0, Scratch0, Scratch4, ArmCondition.Eq, 4, rightIsZero: true);
+                    StoreNarrowResult(result, Scratch0);
+                    return;
+                case "+":
+                    break;
+                default:
+                    throw Unsupported(instruction, $"Unsupported 64-bit unary operator '{instruction.Operator}' on ARM32.");
+            }
+
+            if (IsWideInteger(result.Type))
+                StoreWideResult(result, Scratch0, Scratch1);
+            else
+                StoreNarrowResult(result, Scratch0);
+        }
+
+        private void EmitWideBinary(LirInstruction instruction)
+        {
+            var result = instruction.Result!;
+            var op = instruction.Operator;
+            if (IsComparisonOperator(op))
+            {
+                EmitWideRelation(op, instruction.Operands[0], instruction.Operands[1], Scratch0, instruction);
+                StoreNarrowResult(result, Scratch0);
+                return;
+            }
+
+            if (IsPointerLike(result.Type))
+            {
+                var pointerIsLeft = IsPointerLike(instruction.Operands[0].Type);
+                var pointer = LoadOperand(instruction.Operands[pointerIsLeft ? 0 : 1], Scratch0);
+                if (pointer != Scratch0)
+                    MoveRegister(Scratch0, pointer, 4);
+                LoadWide(instruction.Operands[pointerIsLeft ? 1 : 0], Scratch2, Scratch3, instruction);
+                LoadImmediate(Scratch4, PointerScale(result.Type), 4);
+                EmitWideAlu(ArmInstrKind.Mul, Scratch2, Scratch2, Scratch4);
+                EmitWideAlu(op == "-" ? ArmInstrKind.Sub : ArmInstrKind.Add, Scratch0, Scratch0, Scratch2);
+                StoreNarrowResult(result, Scratch0);
+                return;
+            }
+
+            if (op is "<<" or ">>")
+            {
+                EmitWideShift(instruction);
+                return;
+            }
+
+            LoadWide(instruction.Operands[0], Scratch0, Scratch1, instruction);
+            LoadWide(instruction.Operands[1], Scratch2, Scratch3, instruction);
+            switch (op)
+            {
+                case "+":
+                    EmitWideAlu(ArmInstrKind.Adds, Scratch0, Scratch0, Scratch2);
+                    EmitWideAlu(ArmInstrKind.Adc, Scratch1, Scratch1, Scratch3);
+                    break;
+                case "-":
+                    EmitWideAlu(ArmInstrKind.Subs, Scratch0, Scratch0, Scratch2);
+                    EmitWideAlu(ArmInstrKind.Sbc, Scratch1, Scratch1, Scratch3);
+                    break;
+                case "&":
+                    EmitWideAlu(ArmInstrKind.And, Scratch0, Scratch0, Scratch2);
+                    EmitWideAlu(ArmInstrKind.And, Scratch1, Scratch1, Scratch3);
+                    break;
+                case "|":
+                    EmitWideAlu(ArmInstrKind.Orr, Scratch0, Scratch0, Scratch2);
+                    EmitWideAlu(ArmInstrKind.Orr, Scratch1, Scratch1, Scratch3);
+                    break;
+                case "^":
+                    EmitWideAlu(ArmInstrKind.Eor, Scratch0, Scratch0, Scratch2);
+                    EmitWideAlu(ArmInstrKind.Eor, Scratch1, Scratch1, Scratch3);
+                    break;
+                case "*":
+                    EmitWideAlu(ArmInstrKind.Mul, Scratch4, Scratch0, Scratch3);
+                    Emit(ArmInstruction.Quaternary(ArmInstrKind.Mla, Reg(ToArm(Scratch4), 4), Reg(ToArm(Scratch1), 4), Reg(ToArm(Scratch2), 4), Reg(ToArm(Scratch4), 4)));
+                    Emit(ArmInstruction.Quaternary(ArmInstrKind.Umull, Reg(ToArm(Scratch3), 4), Reg(ToArm(Scratch1), 4), Reg(ToArm(Scratch0), 4), Reg(ToArm(Scratch2), 4)));
+                    EmitWideAlu(ArmInstrKind.Add, Scratch1, Scratch1, Scratch4);
+                    MoveRegister(Scratch0, Scratch3, 4);
+                    break;
+                case "/":
+                case "%":
+                    EmitWideDivide(instruction, IsSignedIntegerType(instruction.Operands[0].Type), op == "%");
+                    break;
+                default:
+                    throw Unsupported(instruction, $"Unsupported 64-bit binary operator '{op}' on ARM32.");
+            }
+
+            if (IsWideInteger(result.Type))
+                StoreWideResult(result, Scratch0, Scratch1);
+            else
+                StoreNarrowResult(result, Scratch0);
+        }
+
+        // Register shifts of 32 or more yield zero, so the word shares combine without a branch
+        private void EmitWideShift(LirInstruction instruction)
+        {
+            var result = instruction.Result!;
+            LoadWide(instruction.Operands[1], Scratch2, Scratch3, instruction);
+            LoadWide(instruction.Operands[0], Scratch0, Scratch1, instruction);
+            EmitWideAluImmediate(ArmInstrKind.And, Scratch2, Scratch2, 63);
+            EmitWideAluImmediate(ArmInstrKind.Rsb, Scratch3, Scratch2, 32);
+            if (instruction.Operator == "<<")
+            {
+                EmitWideAlu(ArmInstrKind.Lsl, Scratch1, Scratch1, Scratch2);
+                EmitWideAlu(ArmInstrKind.Lsr, Scratch4, Scratch0, Scratch3);
+                EmitWideAlu(ArmInstrKind.Orr, Scratch1, Scratch1, Scratch4);
+                EmitWideAluImmediate(ArmInstrKind.Sub, Scratch3, Scratch2, 32);
+                EmitWideAlu(ArmInstrKind.Lsl, Scratch4, Scratch0, Scratch3);
+                EmitWideAlu(ArmInstrKind.Orr, Scratch1, Scratch1, Scratch4);
+                EmitWideAlu(ArmInstrKind.Lsl, Scratch0, Scratch0, Scratch2);
+            }
+            else if (!IsSignedIntegerType(instruction.Operands[0].Type))
+            {
+                EmitWideAlu(ArmInstrKind.Lsr, Scratch0, Scratch0, Scratch2);
+                EmitWideAlu(ArmInstrKind.Lsl, Scratch4, Scratch1, Scratch3);
+                EmitWideAlu(ArmInstrKind.Orr, Scratch0, Scratch0, Scratch4);
+                EmitWideAluImmediate(ArmInstrKind.Sub, Scratch3, Scratch2, 32);
+                EmitWideAlu(ArmInstrKind.Lsr, Scratch4, Scratch1, Scratch3);
+                EmitWideAlu(ArmInstrKind.Orr, Scratch0, Scratch0, Scratch4);
+                EmitWideAlu(ArmInstrKind.Lsr, Scratch1, Scratch1, Scratch2);
+            }
+            else
+            {
+                var large = _owner.CreateLocalLabel(_functionLabel + "_i64_sar_large");
+                var done = _owner.CreateLocalLabel(_functionLabel + "_i64_sar_done");
+                Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch2), 4), ArmOperand.ImmediateOperand(32)));
+                EmitConditionalJump(ArmCondition.Hs, large);
+                EmitWideAlu(ArmInstrKind.Lsr, Scratch0, Scratch0, Scratch2);
+                EmitWideAlu(ArmInstrKind.Lsl, Scratch4, Scratch1, Scratch3);
+                EmitWideAlu(ArmInstrKind.Orr, Scratch0, Scratch0, Scratch4);
+                EmitWideAlu(ArmInstrKind.Asr, Scratch1, Scratch1, Scratch2);
+                EmitJump(done);
+                _owner._text.DefineLabel(large);
+                EmitWideAluImmediate(ArmInstrKind.Sub, Scratch3, Scratch2, 32);
+                EmitWideAlu(ArmInstrKind.Asr, Scratch0, Scratch1, Scratch3);
+                EmitWideAluImmediate(ArmInstrKind.Asr, Scratch1, Scratch1, 31);
+                _owner._text.DefineLabel(done);
+            }
+
+            if (IsWideInteger(result.Type))
+                StoreWideResult(result, Scratch0, Scratch1);
+            else
+                StoreNarrowResult(result, Scratch0);
+        }
+
+        private void EmitWideRelation(string op, LirOperand left, LirOperand right, MachineRegister destination, LirInstruction instruction)
+        {
+            var signed = IsSignedIntegerType(IsWideInteger(left.Type) ? left.Type : right.Type);
+            var swap = op is ">" or "<=";
+            LoadWide(swap ? right : left, Scratch0, Scratch1, instruction);
+            LoadWide(swap ? left : right, Scratch2, Scratch3, instruction);
+
+            if (op is "==" or "!=")
+            {
+                EmitWideAlu(ArmInstrKind.Eor, Scratch0, Scratch0, Scratch2);
+                EmitWideAlu(ArmInstrKind.Eor, Scratch1, Scratch1, Scratch3);
+                EmitWideAlu(ArmInstrKind.Orr, Scratch0, Scratch0, Scratch1);
+                EmitComparisonResult(destination, Scratch0, Scratch4, op == "==" ? ArmCondition.Eq : ArmCondition.Ne, 4, rightIsZero: true);
+                return;
+            }
+
+            Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch0), 4), Reg(ToArm(Scratch2), 4)));
+            EmitWideAlu(ArmInstrKind.Sbcs, Scratch4, Scratch1, Scratch3);
+            var condition = op is "<" or ">"
+                ? signed ? ArmCondition.Lt : ArmCondition.Lo
+                : signed ? ArmCondition.Ge : ArmCondition.Hs;
+            var trueLabel = _owner.CreateLocalLabel(_functionLabel + "_i64_cmp_true");
+            var doneLabel = _owner.CreateLocalLabel(_functionLabel + "_i64_cmp_done");
+            LoadImmediate(destination, 0, 4);
+            EmitConditionalJump(condition, trueLabel);
+            EmitJump(doneLabel);
+            _owner._text.DefineLabel(trueLabel);
+            LoadImmediate(destination, 1, 4);
+            _owner._text.DefineLabel(doneLabel);
+        }
+
+        private void EmitWideDivide(LirInstruction instruction, bool signed, bool wantRemainder)
+        {
+            var baseOffset = _wideTempOffset;
+            if (signed)
+            {
+                EmitWideAlu(ArmInstrKind.Eor, Scratch4, Scratch1, Scratch3);
+                EmitWideAluImmediate(ArmInstrKind.Asr, Scratch4, Scratch4, 31);
+                StoreToMemory(Scratch4, baseOffset + WideQuotientSignOffset, 4);
+                EmitWideAluImmediate(ArmInstrKind.Asr, Scratch4, Scratch1, 31);
+                StoreToMemory(Scratch4, baseOffset + WideRemainderSignOffset, 4);
+                EmitWideNegateIfNegative(Scratch0, Scratch1, "dividend");
+                EmitWideNegateIfNegative(Scratch2, Scratch3, "divisor");
+            }
+
+            StoreToMemory(Scratch2, baseOffset + WideDivisorOffset, 4);
+            StoreToMemory(Scratch3, baseOffset + WideDivisorOffset + 4, 4);
+            LoadImmediate(Scratch4, 64, 4);
+            StoreToMemory(Scratch4, baseOffset + WideCountOffset, 4);
+            LoadImmediate(Scratch2, 0, 4);
+            LoadImmediate(Scratch3, 0, 4);
+
+            var loop = _owner.CreateLocalLabel(_functionLabel + "_i64_div_loop");
+            var skip = _owner.CreateLocalLabel(_functionLabel + "_i64_div_skip");
+            _owner._text.DefineLabel(loop);
+            EmitWideAlu(ArmInstrKind.Adds, Scratch0, Scratch0, Scratch0);
+            EmitWideAlu(ArmInstrKind.Adcs, Scratch1, Scratch1, Scratch1);
+            EmitWideAlu(ArmInstrKind.Adcs, Scratch2, Scratch2, Scratch2);
+            EmitWideAlu(ArmInstrKind.Adc, Scratch3, Scratch3, Scratch3);
+            LoadFromMemory(Scratch4, baseOffset + WideDivisorOffset, 4, false);
+            Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch2), 4), Reg(ToArm(Scratch4), 4)));
+            LoadFromMemory(Scratch4, baseOffset + WideDivisorOffset + 4, 4, false);
+            EmitWideAlu(ArmInstrKind.Sbcs, Scratch4, Scratch3, Scratch4);
+            EmitConditionalJump(ArmCondition.Lo, skip);
+            LoadFromMemory(Scratch4, baseOffset + WideDivisorOffset, 4, false);
+            EmitWideAlu(ArmInstrKind.Subs, Scratch2, Scratch2, Scratch4);
+            LoadFromMemory(Scratch4, baseOffset + WideDivisorOffset + 4, 4, false);
+            EmitWideAlu(ArmInstrKind.Sbc, Scratch3, Scratch3, Scratch4);
+            EmitWideAluImmediate(ArmInstrKind.Orr, Scratch0, Scratch0, 1);
+            _owner._text.DefineLabel(skip);
+            LoadFromMemory(Scratch4, baseOffset + WideCountOffset, 4, false);
+            EmitWideAluImmediate(ArmInstrKind.Subs, Scratch4, Scratch4, 1);
+            StoreToMemory(Scratch4, baseOffset + WideCountOffset, 4);
+            EmitConditionalJump(ArmCondition.Ne, loop);
+
+            if (wantRemainder)
+            {
+                MoveRegister(Scratch0, Scratch2, 4);
+                MoveRegister(Scratch1, Scratch3, 4);
+            }
+            if (signed)
+            {
+                LoadFromMemory(Scratch4, baseOffset + (wantRemainder ? WideRemainderSignOffset : WideQuotientSignOffset), 4, false);
+                var positive = _owner.CreateLocalLabel(_functionLabel + "_i64_div_positive");
+                Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch4), 4), ArmOperand.ImmediateOperand(0)));
+                EmitConditionalJump(ArmCondition.Eq, positive);
+                EmitWideNegate(Scratch0, Scratch1);
+                _owner._text.DefineLabel(positive);
+            }
+        }
+
+        private void EmitWideNegateIfNegative(MachineRegister low, MachineRegister high, string name)
+        {
+            var positive = _owner.CreateLocalLabel(_functionLabel + "_i64_div_" + name + "_positive");
+            Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(high), 4), ArmOperand.ImmediateOperand(0)));
+            EmitConditionalJump(ArmCondition.Ge, positive);
+            EmitWideNegate(low, high);
+            _owner._text.DefineLabel(positive);
+        }
+
+        private LirParallelCopy[] EmitWideParallelCopies(LirParallelCopy[] copies, LirInstruction instruction)
+        {
+            var wide = copies.Where(copy => IsWideInteger(copy.Destination.Type)).ToArray();
+            if (wide.Length == 0)
+                return copies;
+
+            for (var i = 0; i < wide.Length; i++)
+            {
+                LoadWide(wide[i].Source, Scratch0, Scratch1, instruction);
+                StoreToMemory(Scratch0, _wideTempOffset + WideStashOffset + i * 8, 4);
+                StoreToMemory(Scratch1, _wideTempOffset + WideStashOffset + i * 8 + 4, 4);
+            }
+            for (var i = 0; i < wide.Length; i++)
+            {
+                LoadFromMemory(Scratch0, _wideTempOffset + WideStashOffset + i * 8, 4, false);
+                LoadFromMemory(Scratch1, _wideTempOffset + WideStashOffset + i * 8 + 4, 4, false);
+                StoreWideResult(wide[i].Destination, Scratch0, Scratch1);
+            }
+            return copies.Where(copy => !IsWideInteger(copy.Destination.Type)).ToArray();
+        }
+
         private void RecordIntegerRegisterWrite(MachineRegister register, int size)
         {
             if (GetIntegerRepresentation(register).IsKnown)
@@ -4441,6 +4956,15 @@ public sealed class ArmCodeGenerator
         }
 
         private MachineRegister StackPointer => _owner._machineTarget.Is64Bit ? MachineRegister.X31 : MachineRegister.X13;
+
+        private MachineRegister FrameBase => _allocation.Frame.HasDynamicStack ? TargetRegisterInfo.FrameBaseRegister(_owner._target) : StackPointer;
+
+        private ArmRegister FrameBaseArm => _allocation.Frame.HasDynamicStack ? ToArmRegister(TargetRegisterInfo.FrameBaseRegister(_owner._target)) : StackPointerArm;
+
+        // A move to or from the stack pointer has to be an addition, since the logical move would read the zero register
+        private void MoveStackPointer(ArmRegister destination, ArmRegister source)
+            => Emit(ArmInstruction.Ternary(ArmInstrKind.Add, Reg(destination, _owner._target.PointerSize), Reg(source, _owner._target.PointerSize),
+                ArmOperand.ImmediateOperand(0)));
 
         private ArmRegister StackPointerArm => _owner._machineTarget.Is64Bit ? ArmRegister.Sp : ArmRegister.Sp32;
 

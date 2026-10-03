@@ -1005,7 +1005,7 @@ namespace Cnidaria.Cs
                 constantValueOpt: Optional<object>.None,
                 isByRef: false);
 
-            _locals[name] = local;
+            ExpressionVariableScope()._locals[name] = local;
 
             context.Recorder.RecordDeclared(single, local);
 
@@ -1342,6 +1342,10 @@ namespace Cnidaria.Cs
 
             if (parts.Count == 0)
                 return new BoundLiteralExpression(node, stringType, string.Empty);
+
+            // A lone hole still yields a string, and never null.
+            if (parts.Count == 1)
+                parts.Insert(0, new BoundLiteralExpression(node, stringType, string.Empty));
 
             BoundExpression acc = parts[0];
             for (int i = 1; i < parts.Count; i++)
@@ -1908,14 +1912,9 @@ namespace Cnidaria.Cs
             else if (node is IdentifierNameSyntax id)
             {
                 var name = id.Identifier.ValueText ?? "";
-                if (TryGetLocalFromEnclosingScopes(name, out var local))
+                if (TryGetLocalOrParameterFromEnclosingScopes(name, out var local, out var param))
                 {
-                    expr = new BoundLocalExpression(id, local!);
-                    expr = Record(id, expr, context);
-                }
-                else if (TryGetParameterFromEnclosingScopes(name, out var param))
-                {
-                    expr = new BoundParameterExpression(id, param!);
+                    expr = local is not null ? new BoundLocalExpression(id, local) : new BoundParameterExpression(id, param!);
                     expr = Record(id, expr, context);
                 }
                 else if (TryBindUnqualifiedMember(id, name, BindValueKind.LValue, context, diagnostics, out var memberExpr))
@@ -1976,12 +1975,12 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(node);
             }
 
-            if (!method.IsConstructor || method.IsStatic)
+            if (method.IsStatic)
             {
                 diagnostics.Add(new Diagnostic(
-                    "CN_ASG_THIS001",
+                    "CN_THIS001",
                     DiagnosticSeverity.Error,
-                    "Cannot assign to 'this' outside an instance constructor.",
+                    "Cannot use 'this' in a static method.",
                     new Location(context.SemanticModel.SyntaxTree, node.Span)));
 
                 return new BoundBadExpression(node);
@@ -1998,12 +1997,13 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(node);
             }
 
-            if (!containingType.IsValueType)
+            // 'this' is a variable only in struct instance members, and read-only outside constructors of readonly structs.
+            if (!containingType.IsValueType || (!method.IsConstructor && containingType.IsReadOnlyStruct))
             {
                 diagnostics.Add(new Diagnostic(
-                    "CN_ASG_THIS002",
+                    "CN_ASG_THIS001",
                     DiagnosticSeverity.Error,
-                    "Cannot assign to 'this' in a reference type constructor.",
+                    "Cannot assign to 'this' because it is read-only.",
                     new Location(context.SemanticModel.SyntaxTree, node.Span)));
 
                 return new BoundBadExpression(node);
@@ -2092,7 +2092,7 @@ namespace Cnidaria.Cs
                 isByRef: false,
                 isScoped: isScoped);
 
-            _locals[name] = local;
+            ExpressionVariableScope()._locals[name] = local;
             context.Recorder.RecordDeclared(sv, local);
 
             var idSyntax = new IdentifierNameSyntax(sv.Identifier);

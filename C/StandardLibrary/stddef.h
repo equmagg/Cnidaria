@@ -12,6 +12,8 @@ typedef unsigned long size_t;
 typedef long ptrdiff_t;
 #endif
 
+#define offsetof(type, member) __builtin_offsetof(type, member)
+
 #ifndef NULL
 #define NULL ((void*)0)
 #endif

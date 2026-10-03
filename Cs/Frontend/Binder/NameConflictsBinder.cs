@@ -17,6 +17,15 @@ namespace Cnidaria.Cs
         {
             var visited = new HashSet<NamedTypeSymbol>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
             VisitNamespace(compilation.SourceGlobalNamespace, diagnostics, visited);
+            // The core library declares the special types too; they are not members of the source namespaces.
+            foreach (var declarations in compilation.DeclaredSymbolsByTree.Values)
+            {
+                foreach (var declared in declarations.Values)
+                {
+                    if (declared is SpecialNamedTypeSymbol special)
+                        VisitType(special, diagnostics, visited);
+                }
+            }
         }
         private static void VisitNamespace(NamespaceSymbol ns, DiagnosticBag diagnostics, HashSet<NamedTypeSymbol> visited)
         {

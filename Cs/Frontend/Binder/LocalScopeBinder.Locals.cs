@@ -332,6 +332,14 @@ namespace Cnidaria.Cs
                         localType = new ErrorTypeSymbol("var", containing: null, ImmutableArray<Location>.Empty);
                         init = rhs;
                     }
+                    else if (rhs is BoundUnboundConditionalExpression unboundConditional)
+                    {
+                        diagnostics.Add(unboundConditional.NoNaturalType);
+                        localType = new ErrorTypeSymbol("var", containing: null, ImmutableArray<Location>.Empty);
+                        var badInit = new BoundBadExpression(v.Initializer.Value);
+                        badInit.SetType(localType);
+                        init = badInit;
+                    }
                     else if (rhs is BoundUnboundCollectionExpression)
                     {
                         diagnostics.Add(new Diagnostic("CN_VAR004", DiagnosticSeverity.Error,
@@ -681,9 +689,11 @@ namespace Cnidaria.Cs
             }
 
             var receiverType = GetReceiverTypeForMemberLookup(expr.Type);
-            if (receiverType is not null)
+            if (receiverType is not null || expr.Type is TypeParameterSymbol)
             {
-                var allIndexers = LookupIndexers(receiverType);
+                var allIndexers = expr.Type is TypeParameterSymbol typeParameter
+                    ? LookupConstraintIndexers(typeParameter)
+                    : LookupIndexers(receiverType!);
                 if (!allIndexers.IsDefaultOrEmpty)
                 {
                     var accessibleIndexers = FilterAccessibleIndexers(allIndexers, context);
@@ -736,7 +746,9 @@ namespace Cnidaria.Cs
 
                         Symbol? lengthMember = null;
                         {
-                            var members = LookupMembers(receiverType, "Length");
+                            var members = receiverType is not null
+                                ? LookupMembers(receiverType, "Length")
+                                : LookupConstraintMembers((TypeParameterSymbol)expr.Type, "Length");
                             for (int i = 0; i < members.Length; i++)
                             {
                                 var m = members[i];
@@ -1763,7 +1775,7 @@ namespace Cnidaria.Cs
                     diagnostics,
                     requireImplicit: true);
 
-                var whenTrueBinder = CreateFlowScopeBinderForTrue(condition);
+                var whenTrueBinder = CreateFlowScopeBinderForTrue(condition, withinExpression: true);
                 var whenTrue = whenTrueBinder.BindExpressionWithTargetType(
                     conditionalSyntax.WhenTrue,
                     targetType,

@@ -635,7 +635,7 @@ namespace Cnidaria.Cs
                 }
 
                 if (tree.Kind == GenTreeKind.Binary &&
-                    tree.Source.SourceOp is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un &&
+                    tree.Source.Operator is GenTreeOperator.Div or GenTreeOperator.DivUn or GenTreeOperator.Rem or GenTreeOperator.RemUn &&
                     tree.Operands.Length == 2 &&
                     GenTreeArithmeticSemantics.IsIntegralArithmeticType(tree.Source.Type, tree.Source.StackKind) &&
                     TryGetAssertionValue(tree.Operands[1].Source, out var divisor) &&
@@ -820,19 +820,19 @@ namespace Cnidaria.Cs
 
                 if (condition.Kind == GenTreeKind.Binary && condition.Operands.Length == 2)
                 {
-                    BytecodeOp op = condition.Source.SourceOp;
-                    if (op == BytecodeOp.Ceq && TryGetBooleanConstant(condition.Operands[0].Source, out bool leftBoolean) && IsPredicateTree(condition.Operands[1]))
+                    GenTreeOperator op = condition.Source.Operator;
+                    if (op == GenTreeOperator.Ceq && TryGetBooleanConstant(condition.Operands[0].Source, out bool leftBoolean) && IsPredicateTree(condition.Operands[1]))
                         return TryCreatePredicateAssertion(condition.Operands[1], truth == leftBoolean, depth + 1, out assertion);
-                    if (op == BytecodeOp.Ceq && TryGetBooleanConstant(condition.Operands[1].Source, out bool rightBoolean) && IsPredicateTree(condition.Operands[0]))
+                    if (op == GenTreeOperator.Ceq && TryGetBooleanConstant(condition.Operands[1].Source, out bool rightBoolean) && IsPredicateTree(condition.Operands[0]))
                         return TryCreatePredicateAssertion(condition.Operands[0], truth == rightBoolean, depth + 1, out assertion);
 
                     SsaAssertionKind? relation = op switch
                     {
-                        BytecodeOp.Ceq => SsaAssertionKind.Equal,
-                        BytecodeOp.Clt => SsaAssertionKind.LessThan,
-                        BytecodeOp.Clt_Un => SsaAssertionKind.LessThanUnsigned,
-                        BytecodeOp.Cgt => SsaAssertionKind.GreaterThan,
-                        BytecodeOp.Cgt_Un => SsaAssertionKind.GreaterThanUnsigned,
+                        GenTreeOperator.Ceq => SsaAssertionKind.Equal,
+                        GenTreeOperator.Clt => SsaAssertionKind.LessThan,
+                        GenTreeOperator.CltUn => SsaAssertionKind.LessThanUnsigned,
+                        GenTreeOperator.Cgt => SsaAssertionKind.GreaterThan,
+                        GenTreeOperator.CgtUn => SsaAssertionKind.GreaterThanUnsigned,
                         _ => null,
                     };
 
@@ -864,8 +864,8 @@ namespace Cnidaria.Cs
             }
 
             private static bool IsPredicateTree(SsaTree tree)
-                => tree.Kind == GenTreeKind.Binary && tree.Source.SourceOp is
-                    BytecodeOp.Ceq or BytecodeOp.Clt or BytecodeOp.Clt_Un or BytecodeOp.Cgt or BytecodeOp.Cgt_Un;
+                => tree.Kind == GenTreeKind.Binary && tree.Source.Operator is
+                    GenTreeOperator.Ceq or GenTreeOperator.Clt or GenTreeOperator.CltUn or GenTreeOperator.Cgt or GenTreeOperator.CgtUn;
 
             private static bool SupportsOrderedAssertion(
                 SsaAssertionKind kind,
@@ -1340,7 +1340,7 @@ namespace Cnidaria.Cs
 
                 if (candidate.Kind == GenTreeKind.Binary &&
                     candidate.Operands.Length == 2 &&
-                    IsRelationalOperator(candidate.Source.SourceOp) &&
+                    IsRelationalOperator(candidate.Source.Operator) &&
                     IsPureTree(candidate) &&
                     TryEvaluateRelational(original, active, out bool relationValue))
                 {
@@ -1351,7 +1351,7 @@ namespace Cnidaria.Cs
                 }
 
                 GenTreeFlags flags = candidate.Source.Flags;
-                BytecodeOp sourceOp = candidate.Source.SourceOp;
+                GenTreeOperator oper = candidate.Source.Operator;
                 if (candidate.Kind is GenTreeKind.NullCheck or GenTreeKind.Field or GenTreeKind.FieldAddr or GenTreeKind.StoreField or GenTreeKind.VirtualCall or
                     GenTreeKind.DelegateInvoke or GenTreeKind.ArrayLength or GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or
                     GenTreeKind.StoreArrayElement or GenTreeKind.ArrayDataRef)
@@ -1388,7 +1388,7 @@ namespace Cnidaria.Cs
 
                 if (candidate.Kind == GenTreeKind.Binary &&
                     candidate.Operands.Length == 2 &&
-                    sourceOp is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un &&
+                    oper is GenTreeOperator.Div or GenTreeOperator.DivUn or GenTreeOperator.Rem or GenTreeOperator.RemUn &&
                     GenTreeArithmeticSemantics.IsIntegralArithmeticType(candidate.Source.Type, candidate.Source.StackKind))
                 {
                     if (TryGetNormalValueNumber(original.Operands[1].Source, out var divisor) &&
@@ -1403,20 +1403,20 @@ namespace Cnidaria.Cs
                     bool divisorNonNegative = TryGetAssertionValue(original.Operands[1].Source, out var divisorValue) &&
                                               IsKnownNonNegative(divisorValue, active);
 
-                    if (sourceOp is BytecodeOp.Div or BytecodeOp.Rem && dividendNonNegative && divisorNonNegative)
-                        sourceOp = sourceOp == BytecodeOp.Div ? BytecodeOp.Div_Un : BytecodeOp.Rem_Un;
+                    if (oper is GenTreeOperator.Div or GenTreeOperator.Rem && dividendNonNegative && divisorNonNegative)
+                        oper = oper == GenTreeOperator.Div ? GenTreeOperator.DivUn : GenTreeOperator.RemUn;
 
-                    if ((sourceOp is BytecodeOp.Div_Un or BytecodeOp.Rem_Un || dividendNonNegative || divisorNonNegative) &&
+                    if ((oper is GenTreeOperator.DivUn or GenTreeOperator.RemUn || dividendNonNegative || divisorNonNegative) &&
                         (flags & GenTreeFlags.DivModNoOverflow) == 0)
                     {
                         flags |= GenTreeFlags.DivModNoOverflow | GenTreeFlags.Ordered;
                     }
                 }
 
-                if (flags != candidate.Source.Flags || sourceOp != candidate.Source.SourceOp)
+                if (flags != candidate.Source.Flags || oper != candidate.Source.Operator)
                 {
                     changed = true;
-                    var source = CloneSource(candidate.Source, candidate.Operands, flags, sourceOp);
+                    var source = CloneSource(candidate.Source, candidate.Operands, flags, oper);
                     RecordInheritedTreeValue(source, candidate.Source);
                     return new SsaTree(
                         source,
@@ -2200,13 +2200,13 @@ namespace Cnidaria.Cs
                     return false;
                 }
 
-                SsaAssertionKind kind = tree.Source.SourceOp switch
+                SsaAssertionKind kind = tree.Source.Operator switch
                 {
-                    BytecodeOp.Ceq => SsaAssertionKind.Equal,
-                    BytecodeOp.Clt => SsaAssertionKind.LessThan,
-                    BytecodeOp.Clt_Un => SsaAssertionKind.LessThanUnsigned,
-                    BytecodeOp.Cgt => SsaAssertionKind.GreaterThan,
-                    BytecodeOp.Cgt_Un => SsaAssertionKind.GreaterThanUnsigned,
+                    GenTreeOperator.Ceq => SsaAssertionKind.Equal,
+                    GenTreeOperator.Clt => SsaAssertionKind.LessThan,
+                    GenTreeOperator.CltUn => SsaAssertionKind.LessThanUnsigned,
+                    GenTreeOperator.Cgt => SsaAssertionKind.GreaterThan,
+                    GenTreeOperator.CgtUn => SsaAssertionKind.GreaterThanUnsigned,
                     _ => throw new InvalidOperationException("Unsupported relational operator."),
                 };
 
@@ -3571,8 +3571,8 @@ namespace Cnidaria.Cs
             private static bool IsPureLocalSsaUse(SsaTree tree)
                 => tree.Value.HasValue && tree.Kind is GenTreeKind.Local or GenTreeKind.Arg or GenTreeKind.Temp;
 
-            private static bool IsRelationalOperator(BytecodeOp op)
-                => op is BytecodeOp.Ceq or BytecodeOp.Clt or BytecodeOp.Clt_Un or BytecodeOp.Cgt or BytecodeOp.Cgt_Un;
+            private static bool IsRelationalOperator(GenTreeOperator op)
+                => op is GenTreeOperator.Ceq or GenTreeOperator.Clt or GenTreeOperator.CltUn or GenTreeOperator.Cgt or GenTreeOperator.CgtUn;
 
             private static bool IsPureTree(SsaTree tree)
             {
@@ -3929,7 +3929,7 @@ namespace Cnidaria.Cs
                         _nextSyntheticTreeId++,
                         GenTreeKind.ConstNull,
                         template.Pc,
-                        BytecodeOp.Ldnull,
+                        GenTreeOperator.None,
                         type: template.Type,
                         stackKind: GenStackKind.Null,
                         flags: GenTreeFlags.None,
@@ -3950,7 +3950,7 @@ namespace Cnidaria.Cs
                         _nextSyntheticTreeId++,
                         GenTreeKind.ConstI8,
                         template.Pc,
-                        BytecodeOp.Ldc_I8,
+                        GenTreeOperator.None,
                         type: null,
                         stackKind: template.StackKind is GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr
                             ? template.StackKind
@@ -3966,7 +3966,7 @@ namespace Cnidaria.Cs
                     _nextSyntheticTreeId++,
                     GenTreeKind.ConstI4,
                     template.Pc,
-                    BytecodeOp.Ldc_I4,
+                    GenTreeOperator.None,
                     type: null,
                     stackKind: template.StackKind is GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr
                         ? template.StackKind
@@ -3981,7 +3981,7 @@ namespace Cnidaria.Cs
                     _nextSyntheticTreeId++,
                     GenTreeKind.ConstI4,
                     template.Pc,
-                    BytecodeOp.Ldc_I4,
+                    GenTreeOperator.None,
                     type: null,
                     stackKind: GenStackKind.I4,
                     flags: GenTreeFlags.None,
@@ -3989,9 +3989,9 @@ namespace Cnidaria.Cs
                     int32: value ? 1 : 0);
 
             private static GenTree CloneSource(GenTree source, ImmutableArray<SsaTree> operands, GenTreeFlags flags)
-                => CloneSource(source, operands, flags, source.SourceOp);
+                => CloneSource(source, operands, flags, source.Operator);
 
-            private static GenTree CloneSource(GenTree source, ImmutableArray<SsaTree> operands, GenTreeFlags flags, BytecodeOp sourceOp)
+            private static GenTree CloneSource(GenTree source, ImmutableArray<SsaTree> operands, GenTreeFlags flags, GenTreeOperator oper)
             {
                 var genOperands = ImmutableArray.CreateBuilder<GenTree>(operands.Length);
                 for (int i = 0; i < operands.Length; i++)
@@ -4001,7 +4001,7 @@ namespace Cnidaria.Cs
                     source.Id,
                     source.Kind,
                     source.Pc,
-                    sourceOp,
+                    oper,
                     source.Type,
                     source.StackKind,
                     flags,

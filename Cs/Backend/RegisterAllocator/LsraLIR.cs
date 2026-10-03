@@ -120,7 +120,7 @@ namespace Cnidaria.Cs
                 id,
                 kind,
                 pc: -1,
-                BytecodeOp.Nop,
+                GenTreeOperator.None,
                 type: type,
                 stackKind: stackKind,
                 flags: GenTreeFlags.SideEffect | GenTreeFlags.Ordered,

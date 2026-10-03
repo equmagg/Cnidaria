@@ -79,7 +79,7 @@ namespace Cnidaria.Cs
                             AppendEpilog(sourceBlock.Id, FuncletIndexForBlock(sourceBlock.Id), blockLinearNodes);
                         }
                         else if (node.Kind == GenTreeKind.Branch &&
-                            node.SourceOp == BytecodeOp.Leave &&
+                            node.Operator == GenTreeOperator.Leave &&
                             FuncletIndexForBlock(sourceBlock.Id) != 0)
                         {
                             AppendEpilog(sourceBlock.Id, FuncletIndexForBlock(sourceBlock.Id), blockLinearNodes);
@@ -137,7 +137,7 @@ namespace Cnidaria.Cs
                     id,
                     GenTreeKind.Return,
                     source.Pc,
-                    source.SourceOp,
+                    source.Operator,
                     type: null,
                     stackKind: GenStackKind.Void,
                     flags: GenTreeFlags.ControlFlow | GenTreeFlags.Ordered,
@@ -1614,7 +1614,7 @@ namespace Cnidaria.Cs
                     }
                     else if (block.LinearNodes[i].Kind == GenTreeKind.EndFinally ||
                         (block.LinearNodes[i].Kind == GenTreeKind.Branch &&
-                            block.LinearNodes[i].SourceOp == BytecodeOp.Leave &&
+                            block.LinearNodes[i].Operator == GenTreeOperator.Leave &&
                             FuncletIndexForBlock(block.Id) != 0))
                     {
                         result += perReturn;

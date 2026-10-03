@@ -437,9 +437,11 @@ namespace Cnidaria.Cs
                 return true;
             }
 
+            // C# defines pointer + int, uint, long and ulong; narrower offsets widen to int.
             var offsetType = right.Type.SpecialType switch
             {
-                SpecialType.System_IntPtr or SpecialType.System_UIntPtr => right.Type,
+                SpecialType.System_IntPtr or SpecialType.System_UIntPtr or SpecialType.System_Int32 or
+                SpecialType.System_UInt32 or SpecialType.System_Int64 or SpecialType.System_UInt64 => right.Type,
                 _ => ctx.Compilation.GetSpecialType(SpecialType.System_Int32)
             };
             var rightConv = ApplyConversion(rightSyntax, right, offsetType, diagnosticNode, ctx, diagnostics, requireImplicit: true);
@@ -724,6 +726,7 @@ namespace Cnidaria.Cs
                 or ConversionKind.ImplicitTuple
                 or ConversionKind.ExplicitTuple
                 or ConversionKind.ImplicitStackAlloc
+                or ConversionKind.ImplicitInlineArray
                 or ConversionKind.UserDefined)
             {
                 diagnostics.Add(new Diagnostic(
@@ -975,8 +978,8 @@ namespace Cnidaria.Cs
             var left = BindExpression(bin.Left, ctx, diagnostics);
             left = ApplyConversion(bin.Left, left, boolType, bin, ctx, diagnostics, requireImplicit: true);
             var rightBinder = op == BoundBinaryOperatorKind.LogicalAnd
-                ? CreateFlowScopeBinderForTrue(left)
-                : CreateFlowScopeBinderForFalse(left);
+                ? CreateFlowScopeBinderForTrue(left, withinExpression: true)
+                : CreateFlowScopeBinderForFalse(left, withinExpression: true);
 
             var right = rightBinder.BindExpression(bin.Right, ctx, diagnostics);
             right = rightBinder.ApplyConversion(bin.Right, right, boolType, bin, ctx, diagnostics, requireImplicit: true);
@@ -1290,6 +1293,12 @@ namespace Cnidaria.Cs
             {
                 var constValue = FoldBooleanBinaryConstant(op, left, right);
                 return new BoundBinaryExpression(bin, op, boolType, left, right, constValue);
+            }
+
+            if (left.Type is PointerTypeSymbol && right.Type is PointerTypeSymbol)
+            {
+                EnsureUnsafe(bin, ctx, diagnostics);
+                return new BoundBinaryExpression(bin, op, boolType, left, right, Optional<object>.None);
             }
 
             if (!IsNumeric(left.Type.SpecialType) || !IsNumeric(right.Type.SpecialType))
@@ -2045,24 +2054,24 @@ namespace Cnidaria.Cs
             return builder.ToImmutable();
         }
         // Pattern locals enter scope only on the control-flow branch where they are assigned
-        private LocalScopeBinder CreateFlowScopeBinderForTrue(BoundExpression condition)
+        private LocalScopeBinder CreateFlowScopeBinderForTrue(BoundExpression condition, bool withinExpression = false)
         {
             var locals = GetPatternLocalsWhenTrue(condition);
             if (locals.IsDefaultOrEmpty)
                 return this;
 
-            var scope = new LocalScopeBinder(parent: this, flags: Flags, containing: _containing);
+            var scope = new LocalScopeBinder(parent: this, flags: Flags, containing: _containing) { _isExpressionFlowScope = withinExpression };
             for (int i = 0; i < locals.Length; i++)
                 scope.ImportFlowingLocal(locals[i]);
             return scope;
         }
-        private LocalScopeBinder CreateFlowScopeBinderForFalse(BoundExpression condition)
+        private LocalScopeBinder CreateFlowScopeBinderForFalse(BoundExpression condition, bool withinExpression = false)
         {
             var locals = GetPatternLocalsWhenFalse(condition);
             if (locals.IsDefaultOrEmpty)
                 return this;
 
-            var scope = new LocalScopeBinder(parent: this, flags: Flags, containing: _containing);
+            var scope = new LocalScopeBinder(parent: this, flags: Flags, containing: _containing) { _isExpressionFlowScope = withinExpression };
             for (int i = 0; i < locals.Length; i++)
                 scope.ImportFlowingLocal(locals[i]);
             return scope;
@@ -2115,15 +2124,23 @@ namespace Cnidaria.Cs
             var condition = BindExpression(node.Condition, ctx, diagnostics);
             condition = ApplyConversion(node.Condition, condition, boolType, node, ctx, diagnostics, requireImplicit: true);
 
-            var whenTrueBinder = CreateFlowScopeBinderForTrue(condition);
+            var whenTrueBinder = CreateFlowScopeBinderForTrue(condition, withinExpression: true);
             var whenTrue = whenTrueBinder.BindExpression(node.WhenTrue, ctx, diagnostics);
             var whenFalse = BindExpression(node.WhenFalse, ctx, diagnostics);
 
             if (condition.HasErrors || whenTrue.HasErrors || whenFalse.HasErrors)
                 return new BoundBadExpression(node);
 
-            var resultType = ClassifyConditionalResultType(
-                ctx.Compilation, ctx.SemanticModel.SyntaxTree, whenTrue.Type, whenFalse.Type, node, diagnostics);
+            var naturalTypeDiagnostics = new DiagnosticBag();
+            var resultType = InferConditionalTypeFromOperands(whenTrue, whenFalse, ctx) ?? ClassifyConditionalResultType(
+                ctx.Compilation, ctx.SemanticModel.SyntaxTree, whenTrue.Type, whenFalse.Type, node, naturalTypeDiagnostics);
+            // Without a natural type the conditional takes the type it converts to (C# 9)
+            if (resultType is null && naturalTypeDiagnostics.ToImmutable() is [var noNaturalType] &&
+                whenTrue.Type.SpecialType != SpecialType.System_Void && whenFalse.Type.SpecialType != SpecialType.System_Void)
+            {
+                return new BoundUnboundConditionalExpression(node, condition, whenTrue, whenFalse, noNaturalType);
+            }
+            diagnostics.AddRange(naturalTypeDiagnostics);
             if (resultType is null || resultType is ErrorTypeSymbol || resultType.SpecialType == SpecialType.System_Void)
                 return new BoundBadExpression(node);
 
@@ -2135,6 +2152,25 @@ namespace Cnidaria.Cs
 
             var cv = FoldConditionalConstant(condition, whenTrue, whenFalse);
             return new BoundConditionalExpression(node, resultType, condition, whenTrue, whenFalse, cv);
+        }
+        // C# 12.18: when only one arm converts implicitly to the other's type (a constant counts by its value), that type wins.
+        private TypeSymbol? InferConditionalTypeFromOperands(BoundExpression whenTrue, BoundExpression whenFalse, BindingContext ctx)
+        {
+            TypeSymbol? t1 = whenTrue.Type;
+            TypeSymbol? t2 = whenFalse.Type;
+            if (t1 is null || t2 is null || ReferenceEquals(t1, t2) ||
+                t1 is ThrowTypeSymbol or NullTypeSymbol || t2 is ThrowTypeSymbol or NullTypeSymbol)
+            {
+                return null;
+            }
+
+            var trueToFalse = ClassifyConversion(whenTrue, t2, ctx);
+            var falseToTrue = ClassifyConversion(whenFalse, t1, ctx);
+            bool toT2 = trueToFalse.Exists && trueToFalse.IsImplicit;
+            bool toT1 = falseToTrue.Exists && falseToTrue.IsImplicit;
+            if (toT2 == toT1)
+                return null;
+            return toT2 ? t2 : t1;
         }
         private static TypeSymbol? ClassifyConditionalResultType(
             Compilation compilation,

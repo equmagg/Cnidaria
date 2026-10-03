@@ -31,19 +31,16 @@ public static class CSharp
             }
         }
     }
-    public readonly static (IMetadataView meta, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> funcs)
-        StandardLibrary32Bit = CompileCoreLibrary(GetCoreBCLSource(), TargetInfo.Default32Bit);
-    public readonly static (IMetadataView meta, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> funcs)
-        StandardLibrary64Bit = CompileCoreLibrary(GetCoreBCLSource(), TargetInfo.Default64Bit);
-
-    public readonly static (IMetadataView meta, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> funcs)
-        StandardLibrary = TargetInfo.Default.PointerSize == 4 ? StandardLibrary32Bit : StandardLibrary64Bit;
-    public readonly static (IMetadataView meta, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags)
-        ExtendedLibrary32Bit = CompileLibrary(GetExtendedBCLSource(), "extendedStd", TargetInfo.Default32Bit);
-    public readonly static (IMetadataView meta, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags)
-        ExtendedLibrary64Bit = CompileLibrary(GetExtendedBCLSource(), "extendedStd", TargetInfo.Default64Bit);
-    public readonly static (IMetadataView meta, IReadOnlyDictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags)
+    public readonly static EcmaMetadata StandardLibrary32Bit = CompileCoreLibrary(GetCoreBCLSources(), TargetInfo.Default32Bit);
+    public readonly static EcmaMetadata StandardLibrary64Bit = CompileCoreLibrary(GetCoreBCLSources(), TargetInfo.Default64Bit);
+    public readonly static EcmaMetadata StandardLibrary = TargetInfo.Default.PointerSize == 4 ? StandardLibrary32Bit : StandardLibrary64Bit;
+    public readonly static (EcmaMetadata meta, List<IDiagnostic> diags)
+        ExtendedLibrary32Bit = CompileLibrary(GetExtendedBCLSources(), "extendedStd", TargetInfo.Default32Bit);
+    public readonly static (EcmaMetadata meta, List<IDiagnostic> diags)
+        ExtendedLibrary64Bit = CompileLibrary(GetExtendedBCLSources(), "extendedStd", TargetInfo.Default64Bit);
+    public readonly static (EcmaMetadata meta, List<IDiagnostic> diags)
         ExtendedLibrary = TargetInfo.Default.PointerSize == 4 ? ExtendedLibrary32Bit : ExtendedLibrary64Bit;
+
     public readonly struct ExecutionContext
     {
         public readonly long InstructionsCount;
@@ -86,27 +83,21 @@ public static class CSharp
             if (HasErrors(diagnostics))
                 return (null, diagnostics);
 
-            IMetadataView? externalMeta = null;
-            if (externalLibImage != null)
-            {
-                var (_, meta, _) = BytecodeSerializer.DeserializeCompiledModule(externalLibImage);
-                externalMeta = meta;
-            }
+            EcmaMetadata? externalMeta = externalLibImage != null ? new EcmaMetadata(externalLibImage) : null;
 
-            var tree = new SyntaxTree(root, "app");
+            var tree = new SyntaxTree(root, "app", source);
             var trees = ImmutableArray.Create(tree);
             var refs = externalMeta != null
-                ? new MetadataReferenceSet(new[] { StandardLibrary.meta, ExtendedLibrary.meta, externalMeta })
-                : new MetadataReferenceSet(new[] { StandardLibrary.meta, ExtendedLibrary.meta });
+                ? new MetadataReferenceSet(new[] { StandardLibrary, ExtendedLibrary.meta, externalMeta })
+                : new MetadataReferenceSet(new[] { StandardLibrary, ExtendedLibrary.meta });
 
             var compilation = CompilationFactory.Create(trees, refs, new CompilationOptions(TargetInfo.Default), out var declDiag);
             AddDiagnostics(diagnostics, declDiag);
             if (HasErrors(diagnostics))
                 return (null, diagnostics);
 
-            var (md, builtFuncs, diags, ex) = compilation.BuildModule(
+            var (md, diags, ex) = compilation.BuildModule(
                 moduleName: "app",
-                tree: tree,
                 includeCoreTypesInTypeDefs: false,
                 defaultExternalAssemblyName: "std",
                 externalAssemblyResolver: refs.ResolveAssemblyName,
@@ -118,8 +109,8 @@ public static class CSharp
             if (HasErrors(diagnostics))
                 return (null, diagnostics);
 
-            byte[] flatMd = FlatMetadataBuilder.Build(md);
-            return (BytecodeSerializer.SerializeCompiledModule(flatMd, builtFuncs), diagnostics);
+            byte[] moduleImage = EcmaImageWriter.Write(md);
+            return (moduleImage, diagnostics);
         }
         catch (Exception ex)
         {
@@ -149,38 +140,31 @@ public static class CSharp
 
         try
         {
-            var (_, appMeta, appFuncs) = BytecodeSerializer.DeserializeCompiledModule(runnableAppImage);
-            (IMetadataView meta, Dictionary<int, BytecodeFunction> functions)? external = null;
-            if (externalLibImage != null)
-            {
-                var (_, meta, externalFuncs) = BytecodeSerializer.DeserializeCompiledModule(externalLibImage);
-                external = (meta, externalFuncs);
-            }
+            var appMeta = new EcmaMetadata(runnableAppImage);
+            EcmaMetadata? external = externalLibImage != null ? new EcmaMetadata(externalLibImage) : null;
 
-            var domain = new Domain();
-            var stdModule = new RuntimeModule(StandardLibrary.meta.ModuleName, StandardLibrary.meta, StandardLibrary.funcs);
-            var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta, ExtendedLibrary.funcs);
-            var appModule = new RuntimeModule(appMeta.ModuleName, appMeta, appFuncs);
+            var stdModule = new RuntimeModule(StandardLibrary.ModuleName, StandardLibrary);
+            var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta);
+            var appModule = new RuntimeModule(appMeta.ModuleName, appMeta);
             var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
 
             void AddUnique(RuntimeModule m)
             {
                 if (!modules.TryAdd(m.Name, m))
                     throw new InvalidOperationException($"Duplicate module loaded: '{m.Name}'");
-                domain.Add(m);
             }
 
             AddUnique(stdModule);
             AddUnique(extStdModule);
             if (external != null)
-                AddUnique(new RuntimeModule(external.Value.meta.ModuleName, external.Value.meta, external.Value.functions));
+                AddUnique(new RuntimeModule(external.ModuleName, external));
             AddUnique(appModule);
 
             int entryTok;
             object?[]? selectedValues = null;
             if (string.IsNullOrWhiteSpace(entryAttributeTypeName))
             {
-                entryTok = BytecodeBuilder.FindEntryPointMethodDef(appModule);
+                entryTok = appModule.Md.FindEntryPointMethodDef();
             }
             else
             {
@@ -213,12 +197,10 @@ public static class CSharp
                 memory: mem,
                 staticEnd: staticEnd,
                 stackEnd: stackEnd,
-                domain: domain,
                 rts: rts,
                 modules: modules,
                 textWriter: writer);
 
-            var entryFn = appModule.MethodsByDefToken[entryTok];
             Slot[]? initialArgs = null;
             if (selectedValues != null)
             {
@@ -231,10 +213,7 @@ public static class CSharp
             host?.Invoke(new HostInterface(stVm, rts, modules));
 
             var sw = Stopwatch.StartNew();
-            if (initialArgs != null)
-                stVm.Execute(appModule, entryFn, cts.Token, execLimits, initialArgs);
-            else
-                stVm.Execute(appModule, entryFn, cts.Token, execLimits);
+            stVm.Execute(rts.ResolveMethod(appModule, entryTok), cts.Token, execLimits, initialArgs);
             sw.Stop();
 
             return (
@@ -271,11 +250,11 @@ public static class CSharp
             if (HasErrors(diagnostics))
                 return (null, diagnostics);
 
-            var tree = new SyntaxTree(root, "app");
+            var tree = new SyntaxTree(root, "app", source);
             var trees = ImmutableArray.Create(tree);
             var references = new MetadataReferenceSet(new[]
             {
-                standardLib.meta,
+                standardLib,
                 extendedLib.meta,
             });
             Compilation compilation = CompilationFactory.Create(
@@ -287,9 +266,8 @@ public static class CSharp
             if (HasErrors(diagnostics))
                 return (null, diagnostics);
 
-            var (metadata, functions, buildDiagnostics, exception) = compilation.BuildModule(
+            var (metadata, buildDiagnostics, exception) = compilation.BuildModule(
                 moduleName: "app",
-                tree: tree,
                 includeCoreTypesInTypeDefs: false,
                 defaultExternalAssemblyName: "std",
                 externalAssemblyResolver: references.ResolveAssemblyName,
@@ -300,11 +278,11 @@ public static class CSharp
             if (HasErrors(diagnostics))
                 return (null, diagnostics);
 
-            byte[] flatMetadata = FlatMetadataBuilder.Build(metadata);
-            IMetadataView appMetadata = new FlatMetadataView(flatMetadata);
-            var standardModule = new RuntimeModule(standardLib.meta.ModuleName, standardLib.meta, standardLib.funcs);
-            var extendedModule = new RuntimeModule(extendedLib.meta.ModuleName, extendedLib.meta, extendedLib.funcs);
-            var appModule = new RuntimeModule(appMetadata.ModuleName, appMetadata, functions);
+            byte[] metadataImage = EcmaImageWriter.Write(metadata);
+            EcmaMetadata appMetadata = new EcmaMetadata(metadataImage);
+            var standardModule = new RuntimeModule(standardLib.ModuleName, standardLib);
+            var extendedModule = new RuntimeModule(extendedLib.meta.ModuleName, extendedLib.meta);
+            var appModule = new RuntimeModule(appMetadata.ModuleName, appMetadata);
             var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
             if (!modules.TryAdd(standardModule.Name, standardModule) ||
                 !modules.TryAdd(extendedModule.Name, extendedModule) ||
@@ -313,7 +291,7 @@ public static class CSharp
                 throw new InvalidOperationException("Duplicate runtime module name in the compilation.");
             }
 
-            int entryToken = BytecodeBuilder.FindEntryPointMethodDef(appModule);
+            int entryToken = appModule.Md.FindEntryPointMethodDef();
             var runtimeTypeSystem = new RuntimeTypeSystem(modules, target);
             GenTreeProgram program = GenTreeBuilder.BuildReachableProgram(modules, runtimeTypeSystem, appModule, entryToken);
             Cnidaria.X86.X86Program nativeProgram = BackendPipeline.CompileX86Program(
@@ -350,11 +328,11 @@ public static class CSharp
             if (HasErrors(diagnostics))
                 return (null, diagnostics);
 
-            var tree = new SyntaxTree(root, "app");
+            var tree = new SyntaxTree(root, "app", source);
             var trees = ImmutableArray.Create(tree);
             var references = new MetadataReferenceSet(new[]
             {
-                standardLib.meta,
+                standardLib,
                 extendedLib.meta,
             });
             Compilation compilation = CompilationFactory.Create(
@@ -366,9 +344,8 @@ public static class CSharp
             if (HasErrors(diagnostics))
                 return (null, diagnostics);
 
-            var (metadata, functions, buildDiagnostics, exception) = compilation.BuildModule(
+            var (metadata, buildDiagnostics, exception) = compilation.BuildModule(
                 moduleName: "app",
-                tree: tree,
                 includeCoreTypesInTypeDefs: false,
                 defaultExternalAssemblyName: "std",
                 externalAssemblyResolver: references.ResolveAssemblyName,
@@ -379,11 +356,11 @@ public static class CSharp
             if (HasErrors(diagnostics))
                 return (null, diagnostics);
 
-            byte[] flatMetadata = FlatMetadataBuilder.Build(metadata);
-            IMetadataView appMetadata = new FlatMetadataView(flatMetadata);
-            var standardModule = new RuntimeModule(standardLib.meta.ModuleName, standardLib.meta, standardLib.funcs);
-            var extendedModule = new RuntimeModule(extendedLib.meta.ModuleName, extendedLib.meta, extendedLib.funcs);
-            var appModule = new RuntimeModule(appMetadata.ModuleName, appMetadata, functions);
+            byte[] metadataImage = EcmaImageWriter.Write(metadata);
+            EcmaMetadata appMetadata = new EcmaMetadata(metadataImage);
+            var standardModule = new RuntimeModule(standardLib.ModuleName, standardLib);
+            var extendedModule = new RuntimeModule(extendedLib.meta.ModuleName, extendedLib.meta);
+            var appModule = new RuntimeModule(appMetadata.ModuleName, appMetadata);
             var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
             if (!modules.TryAdd(standardModule.Name, standardModule) ||
                 !modules.TryAdd(extendedModule.Name, extendedModule) ||
@@ -392,7 +369,7 @@ public static class CSharp
                 throw new InvalidOperationException("Duplicate runtime module name in the compilation.");
             }
 
-            int entryToken = BytecodeBuilder.FindEntryPointMethodDef(appModule);
+            int entryToken = appModule.Md.FindEntryPointMethodDef();
             var runtimeTypeSystem = new RuntimeTypeSystem(modules, target);
             GenTreeProgram program = GenTreeBuilder.BuildReachableProgram(modules, runtimeTypeSystem, appModule, entryToken);
             Cnidaria.Arm.ArmProgram nativeProgram = BackendPipeline.CompileArmProgram(program, codeGeneratorOptions: codeGeneratorOptions);
@@ -422,11 +399,11 @@ public static class CSharp
             if (HasErrors(diagnostics))
                 return (null, diagnostics);
 
-            var tree = new SyntaxTree(root, "app");
+            var tree = new SyntaxTree(root, "app", source);
             var trees = ImmutableArray.Create(tree);
             var references = new MetadataReferenceSet(new[]
             {
-                standardLib.meta,
+                standardLib,
                 extendedLib.meta,
             });
             Compilation compilation = CompilationFactory.Create(
@@ -438,9 +415,8 @@ public static class CSharp
             if (HasErrors(diagnostics))
                 return (null, diagnostics);
 
-            var (metadata, functions, buildDiagnostics, exception) = compilation.BuildModule(
+            var (metadata, buildDiagnostics, exception) = compilation.BuildModule(
                 moduleName: "app",
-                tree: tree,
                 includeCoreTypesInTypeDefs: false,
                 defaultExternalAssemblyName: "std",
                 externalAssemblyResolver: references.ResolveAssemblyName,
@@ -451,11 +427,11 @@ public static class CSharp
             if (HasErrors(diagnostics))
                 return (null, diagnostics);
 
-            byte[] flatMetadata = FlatMetadataBuilder.Build(metadata);
-            IMetadataView appMetadata = new FlatMetadataView(flatMetadata);
-            var standardModule = new RuntimeModule(standardLib.meta.ModuleName, standardLib.meta, standardLib.funcs);
-            var extendedModule = new RuntimeModule(extendedLib.meta.ModuleName, extendedLib.meta, extendedLib.funcs);
-            var appModule = new RuntimeModule(appMetadata.ModuleName, appMetadata, functions);
+            byte[] metadataImage = EcmaImageWriter.Write(metadata);
+            EcmaMetadata appMetadata = new EcmaMetadata(metadataImage);
+            var standardModule = new RuntimeModule(standardLib.ModuleName, standardLib);
+            var extendedModule = new RuntimeModule(extendedLib.meta.ModuleName, extendedLib.meta);
+            var appModule = new RuntimeModule(appMetadata.ModuleName, appMetadata);
             var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
             if (!modules.TryAdd(standardModule.Name, standardModule) ||
                 !modules.TryAdd(extendedModule.Name, extendedModule) ||
@@ -464,7 +440,7 @@ public static class CSharp
                 throw new InvalidOperationException("Duplicate runtime module name in the compilation.");
             }
 
-            int entryToken = BytecodeBuilder.FindEntryPointMethodDef(appModule);
+            int entryToken = appModule.Md.FindEntryPointMethodDef();
             var runtimeTypeSystem = new RuntimeTypeSystem(modules, target);
             GenTreeProgram program = GenTreeBuilder.BuildReachableProgram(modules, runtimeTypeSystem, appModule, entryToken);
             Cnidaria.RiscV.RiscVProgram nativeProgram = BackendPipeline.CompileRiscVProgram(
@@ -497,27 +473,25 @@ public static class CSharp
             if (HasErrors(diagnostics))
                 return (null, diagnostics);
 
-            (IMetadataView meta, Dictionary<int, BytecodeFunction> functions)? external = null;
+            EcmaMetadata? external = null;
             if (externalLibImage != null)
             {
-                var (_, meta, externalFuncs) = BytecodeSerializer.DeserializeCompiledModule(externalLibImage);
-                external = (meta, externalFuncs);
+                external = new EcmaMetadata(externalLibImage);
             }
 
-            var tree = new SyntaxTree(root, "app");
+            var tree = new SyntaxTree(root, "app", source);
             var trees = ImmutableArray.Create(tree);
             var refs = external != null
-                ? new MetadataReferenceSet(new[] { StandardLibrary.meta, ExtendedLibrary.meta, external.Value.meta })
-                : new MetadataReferenceSet(new[] { StandardLibrary.meta, ExtendedLibrary.meta });
+                ? new MetadataReferenceSet(new[] { StandardLibrary, ExtendedLibrary.meta, external })
+                : new MetadataReferenceSet(new[] { StandardLibrary, ExtendedLibrary.meta });
 
             var compilation = CompilationFactory.Create(trees, refs, out var declDiag);
             AddDiagnostics(diagnostics, declDiag);
             if (HasErrors(diagnostics))
                 return (null, diagnostics);
 
-            var (md, builtFuncs, diags, ex) = compilation.BuildModule(
+            var (md, diags, ex) = compilation.BuildModule(
                 moduleName: "app",
-                tree: tree,
                 includeCoreTypesInTypeDefs: false,
                 defaultExternalAssemblyName: "std",
                 externalAssemblyResolver: refs.ResolveAssemblyName,
@@ -529,12 +503,12 @@ public static class CSharp
             if (HasErrors(diagnostics))
                 return (null, diagnostics);
 
-            byte[] flatMd = FlatMetadataBuilder.Build(md);
-            IMetadataView appMeta = new FlatMetadataView(flatMd);
+            byte[] moduleImage = EcmaImageWriter.Write(md);
+            EcmaMetadata appMeta = new EcmaMetadata(moduleImage);
 
-            var stdModule = new RuntimeModule(StandardLibrary.meta.ModuleName, StandardLibrary.meta, StandardLibrary.funcs);
-            var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta, ExtendedLibrary.funcs);
-            var appModule = new RuntimeModule(appMeta.ModuleName, appMeta, builtFuncs);
+            var stdModule = new RuntimeModule(StandardLibrary.ModuleName, StandardLibrary);
+            var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta);
+            var appModule = new RuntimeModule(appMeta.ModuleName, appMeta);
             var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
 
             void AddUnique(RuntimeModule m)
@@ -546,18 +520,16 @@ public static class CSharp
             AddUnique(stdModule);
             AddUnique(extStdModule);
             if (external != null)
-                AddUnique(new RuntimeModule(external.Value.meta.ModuleName, external.Value.meta, external.Value.functions));
+                AddUnique(new RuntimeModule(external.ModuleName, external));
             AddUnique(appModule);
 
             var rts = new RuntimeTypeSystem(modules);
-            ImmutableArray<int> entryRoots = FindRunnableRegisterRoots(appMeta, builtFuncs);
-            //int entryTok = BytecodeBuilder.FindEntryPointMethodDef(appModule);
+            ImmutableArray<int> entryRoots = FindRunnableRegisterRoots(appMeta);
             var genTreeProgram = GenTreeBuilder.BuildReachableProgram(modules, rts, appModule, entryRoots);
             var backend = BackendPipeline.CompileProgram(genTreeProgram);
             byte[] registerImage = ImageSerializer.ToBytes(backend.Image);
-            byte[] stackFunctions = BytecodeSerializer.SerializeStackFunctions(builtFuncs);
 
-            return (SerializeRegisterRunnableApplication(flatMd, stackFunctions, registerImage), diagnostics);
+            return (SerializeRegisterRunnableApplication(moduleImage, registerImage), diagnostics);
         }
         catch (Exception ex)
         {
@@ -565,12 +537,10 @@ public static class CSharp
             return (null, diagnostics);
         }
     }
-    private static ImmutableArray<int> FindRunnableRegisterRoots(IMetadataView appMeta, IReadOnlyDictionary<int, BytecodeFunction> appFunctions)
+    private static ImmutableArray<int> FindRunnableRegisterRoots(EcmaMetadata appMeta)
     {
         if (appMeta is null)
             throw new ArgumentNullException(nameof(appMeta));
-        if (appFunctions is null)
-            throw new ArgumentNullException(nameof(appFunctions));
 
         var roots = ImmutableArray.CreateBuilder<int>();
         var seen = new HashSet<int>();
@@ -584,18 +554,20 @@ public static class CSharp
             if (rid <= 0 || rid > appMeta.GetRowCount(MetadataTableKind.MethodDef))
                 return;
 
-            if (!appFunctions.ContainsKey(methodToken))
+            if (appMeta.GetMethodDef(rid).Rva == 0)
                 return;
 
             if (seen.Add(methodToken))
                 roots.Add(methodToken);
         }
 
-        if (BytecodeBuilder.TryFindEntryPointMethodDef(appMeta, out int mainToken))
+        if (appMeta.TryFindEntryPointMethodDef(out int mainToken))
             Add(mainToken);
 
-        foreach (int methodToken in appFunctions.Keys.OrderBy(x => x))
+        int methodCount = appMeta.GetRowCount(MetadataTableKind.MethodDef);
+        for (int rid = 1; rid <= methodCount; rid++)
         {
+            int methodToken = MetadataToken.Make(MetadataToken.MethodDef, rid);
             if (!IsPotentialRegisterEntryRoot(appMeta, methodToken))
                 continue;
 
@@ -603,11 +575,11 @@ public static class CSharp
         }
 
         if (roots.Count == 0)
-            throw new InvalidOperationException("No runnable entry roots found in module bytecode.");
+            throw new InvalidOperationException("No runnable entry roots found in module metadata.");
 
         return roots.ToImmutable();
     }
-    private static bool IsPotentialRegisterEntryRoot(IMetadataView metadata, int methodToken)
+    private static bool IsPotentialRegisterEntryRoot(EcmaMetadata metadata, int methodToken)
     {
         if (MetadataToken.Table(methodToken) != MetadataToken.MethodDef)
             return false;
@@ -661,20 +633,18 @@ public static class CSharp
         {
             var swBuild = Stopwatch.StartNew();
             var app = DeserializeRegisterRunnableApplication(runnableAppImage);
-            var appMeta = new FlatMetadataView(app.flatMetadata);
-            var appFuncs = BytecodeSerializer.DeserializeFunctions(app.stackFunctions);
+            var appMeta = new EcmaMetadata(app.metadataImage);
             var image = ImageSerializer.FromBytes(app.registerImage);
 
-            (IMetadataView meta, Dictionary<int, BytecodeFunction> functions)? external = null;
+            EcmaMetadata? external = null;
             if (externalLibImage != null)
             {
-                var (_, meta, externalFuncs) = BytecodeSerializer.DeserializeCompiledModule(externalLibImage);
-                external = (meta, externalFuncs);
+                external = new EcmaMetadata(externalLibImage);
             }
 
-            var stdModule = new RuntimeModule(StandardLibrary.meta.ModuleName, StandardLibrary.meta, StandardLibrary.funcs);
-            var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta, ExtendedLibrary.funcs);
-            var appModule = new RuntimeModule(appMeta.ModuleName, appMeta, appFuncs);
+            var stdModule = new RuntimeModule(StandardLibrary.ModuleName, StandardLibrary);
+            var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta);
+            var appModule = new RuntimeModule(appMeta.ModuleName, appMeta);
             var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
 
             void AddUnique(RuntimeModule m)
@@ -686,14 +656,14 @@ public static class CSharp
             AddUnique(stdModule);
             AddUnique(extStdModule);
             if (external != null)
-                AddUnique(new RuntimeModule(external.Value.meta.ModuleName, external.Value.meta, external.Value.functions));
+                AddUnique(new RuntimeModule(external.ModuleName, external));
             AddUnique(appModule);
 
             int entryTok;
             object?[]? selectedValues = null;
             if (string.IsNullOrWhiteSpace(entryAttributeTypeName))
             {
-                entryTok = BytecodeBuilder.FindEntryPointMethodDef(appModule);
+                entryTok = appModule.Md.FindEntryPointMethodDef();
             }
             else
             {
@@ -708,7 +678,7 @@ public static class CSharp
                 }
             }
             var rts = new RuntimeTypeSystem(modules);
-            HydrateRegisterRuntimeIds(modules, rts, appModule, appMeta, appFuncs);
+            HydrateRegisterRuntimeIds(modules, rts, appModule, appMeta);
             var entryRuntimeMethod = rts.ResolveMethod(appModule, entryTok);
             swBuild.Stop();
 
@@ -763,45 +733,40 @@ public static class CSharp
         IReadOnlyDictionary<string, RuntimeModule> modules,
         RuntimeTypeSystem rts,
         RuntimeModule appModule,
-        IMetadataView appMeta,
-        IReadOnlyDictionary<int, BytecodeFunction> appFunctions)
+        EcmaMetadata appMeta)
     {
-        ImmutableArray<int> entryRoots = FindRunnableRegisterRoots(appMeta, appFunctions);
+        ImmutableArray<int> entryRoots = FindRunnableRegisterRoots(appMeta);
         _ = GenTreeBuilder.BuildReachableProgram(modules, rts, appModule, entryRoots);
     }
-    private static byte[] SerializeRegisterRunnableApplication(byte[] flatMetadata, byte[] stackFunctions, byte[] registerImage)
+    private static byte[] SerializeRegisterRunnableApplication(byte[] metadataImage, byte[] registerImage)
     {
-        using var ms = new MemoryStream(24 + flatMetadata.Length + stackFunctions.Length + registerImage.Length);
+        using var ms = new MemoryStream(16 + metadataImage.Length + registerImage.Length);
         using var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
         bw.Write((ushort)0);
-        bw.Write(flatMetadata.Length);
-        bw.Write(stackFunctions.Length);
+        bw.Write(metadataImage.Length);
         bw.Write(registerImage.Length);
-        bw.Write(flatMetadata);
-        bw.Write(stackFunctions);
+        bw.Write(metadataImage);
         bw.Write(registerImage);
         bw.Flush();
         return ms.ToArray();
     }
 
-    public static (byte[] flatMetadata, byte[] stackFunctions, byte[] registerImage) DeserializeRegisterRunnableApplication(byte[] image)
+    public static (byte[] metadataImage, byte[] registerImage) DeserializeRegisterRunnableApplication(byte[] image)
     {
         using var ms = new MemoryStream(image, writable: false);
         using var br = new BinaryReader(ms, Encoding.UTF8, leaveOpen: true);
         _ = br.ReadUInt16();
         int metadataSize = br.ReadInt32();
-        int stackFunctionsSize = br.ReadInt32();
         int registerImageSize = br.ReadInt32();
-        if (metadataSize < 0 || stackFunctionsSize < 0 || registerImageSize < 0)
+        if (metadataSize < 0 || registerImageSize < 0)
             throw new InvalidDataException("Negative register runnable section size.");
         byte[] metadata = br.ReadBytes(metadataSize);
-        byte[] stackFunctions = br.ReadBytes(stackFunctionsSize);
         byte[] registerImage = br.ReadBytes(registerImageSize);
-        if (metadata.Length != metadataSize || stackFunctions.Length != stackFunctionsSize || registerImage.Length != registerImageSize)
+        if (metadata.Length != metadataSize || registerImage.Length != registerImageSize)
             throw new EndOfStreamException("Truncated register runnable image.");
         if (ms.Position != ms.Length)
             throw new InvalidDataException("Trailing bytes found in register runnable image.");
-        return (metadata, stackFunctions, registerImage);
+        return (metadata, registerImage);
     }
 
     private readonly struct MetadataEntryParameterSpec
@@ -829,18 +794,12 @@ public static class CSharp
         public readonly string Namespace;
         public readonly string Name;
         public readonly string[] CtorArgs;
-        public readonly AttributeApplicationTarget Target;
 
-        public MetadataAttributeSpec(
-            string @namespace,
-            string name,
-            string[] ctorArgs,
-            AttributeApplicationTarget target)
+        public MetadataAttributeSpec(string @namespace, string name, string[] ctorArgs)
         {
             Namespace = @namespace ?? string.Empty;
             Name = name ?? string.Empty;
             CtorArgs = ctorArgs ?? Array.Empty<string>();
-            Target = target;
         }
     }
 
@@ -987,14 +946,14 @@ public static class CSharp
 
         try
         {
-            (IMetadataView meta, Dictionary<int, BytecodeFunction> functions)? external = null;
+            EcmaMetadata? external = null;
             if (externalLibSource != null)
             {
-                var (_, extMeta, extFuncs, extDiags) = CompileLibraryCore(externalLibSource, "external", target);
+                var (_, extMeta, extDiags) = CompileLibraryCore(externalLibSource, "external", target);
                 AddDiagnostics(diagnostics, extDiags);
-                if (HasErrors(diagnostics) || extMeta == null || extFuncs == null)
+                if (HasErrors(diagnostics) || extMeta == null)
                     return (string.Empty, diagnostics, ExecutionContext.Empty);
-                external = (extMeta, extFuncs);
+                external = extMeta;
             }
             var swBuild = Stopwatch.StartNew();
             var options = new LexerOptions { TargetPointerSize = (target ?? TargetInfo.Default).PointerSize };
@@ -1005,20 +964,19 @@ public static class CSharp
             if (HasErrors(diagnostics))
                 return (string.Empty, diagnostics, ExecutionContext.Empty);
 
-            var tree = new SyntaxTree(root, "app");
+            var tree = new SyntaxTree(root, "app", source);
             var trees = ImmutableArray.Create(tree);
             var refs = external != null
-                ? new MetadataReferenceSet(new[] { StandardLibrary.meta, ExtendedLibrary.meta, external.Value.meta })
-                : new MetadataReferenceSet(new[] { StandardLibrary.meta, ExtendedLibrary.meta });
+                ? new MetadataReferenceSet(new[] { StandardLibrary, ExtendedLibrary.meta, external })
+                : new MetadataReferenceSet(new[] { StandardLibrary, ExtendedLibrary.meta });
 
             var compilation = CompilationFactory.Create(trees, refs, new CompilationOptions(target ?? TargetInfo.Default), out var declDiag);
             AddDiagnostics(diagnostics, declDiag);
             if (HasErrors(diagnostics))
                 return (string.Empty, diagnostics, ExecutionContext.Empty);
 
-            var (md, builtFuncs, diags, ex) = compilation.BuildModule(
+            var (md, diags, ex) = compilation.BuildModule(
                 moduleName: "app",
-                tree: tree,
                 includeCoreTypesInTypeDefs: false,
                 defaultExternalAssemblyName: "std",
                 externalAssemblyResolver: refs.ResolveAssemblyName,
@@ -1030,12 +988,12 @@ public static class CSharp
             if (HasErrors(diagnostics))
                 return (string.Empty, diagnostics, ExecutionContext.Empty);
 
-            byte[] flatMd = FlatMetadataBuilder.Build(md);
-            IMetadataView appMeta = new FlatMetadataView(flatMd);
+            byte[] moduleImage = EcmaImageWriter.Write(md);
+            EcmaMetadata appMeta = new EcmaMetadata(moduleImage);
 
-            var stdModule = new RuntimeModule(StandardLibrary.meta.ModuleName, StandardLibrary.meta, StandardLibrary.funcs);
-            var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta, ExtendedLibrary.funcs);
-            var appModule = new RuntimeModule(appMeta.ModuleName, appMeta, builtFuncs);
+            var stdModule = new RuntimeModule(StandardLibrary.ModuleName, StandardLibrary);
+            var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta);
+            var appModule = new RuntimeModule(appMeta.ModuleName, appMeta);
             var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
 
             void AddUnique(RuntimeModule m)
@@ -1047,14 +1005,14 @@ public static class CSharp
             AddUnique(stdModule);
             AddUnique(extStdModule);
             if (external != null)
-                AddUnique(new RuntimeModule(external.Value.meta.ModuleName, external.Value.meta, external.Value.functions));
+                AddUnique(new RuntimeModule(external.ModuleName, external));
             AddUnique(appModule);
 
             int entryTok;
             object?[]? selectedValues = null;
             if (string.IsNullOrWhiteSpace(entryAttributeTypeName))
             {
-                entryTok = BytecodeBuilder.FindEntryPointMethodDef(appModule);
+                entryTok = appModule.Md.FindEntryPointMethodDef();
             }
             else
             {
@@ -1147,14 +1105,14 @@ public static class CSharp
 
         try
         {
-            (IMetadataView meta, Dictionary<int, BytecodeFunction> functions)? external = null;
+            EcmaMetadata? external = null;
             if (externalLibSource != null)
             {
-                var (_, extMeta, extFuncs, extDiags) = CompileLibraryCore(externalLibSource, "external", target);
+                var (_, extMeta, extDiags) = CompileLibraryCore(externalLibSource, "external", target);
                 AddDiagnostics(diagnostics, extDiags);
-                if (HasErrors(diagnostics) || extMeta == null || extFuncs == null)
+                if (HasErrors(diagnostics) || extMeta == null)
                     return (string.Empty, diagnostics, ExecutionContext.Empty);
-                external = (extMeta, extFuncs);
+                external = extMeta;
             }
             var options = new LexerOptions { TargetPointerSize = (target ?? TargetInfo.Default).PointerSize };
             var parser = new Parser(source, options);
@@ -1164,20 +1122,19 @@ public static class CSharp
             if (HasErrors(diagnostics))
                 return (string.Empty, diagnostics, ExecutionContext.Empty);
 
-            var tree = new SyntaxTree(root, "app");
+            var tree = new SyntaxTree(root, "app", source);
             var trees = ImmutableArray.Create(tree);
             var refs = external != null
-                ? new MetadataReferenceSet(new[] { StandardLibrary.meta, ExtendedLibrary.meta, external.Value.meta })
-                : new MetadataReferenceSet(new[] { StandardLibrary.meta, ExtendedLibrary.meta });
+                ? new MetadataReferenceSet(new[] { StandardLibrary, ExtendedLibrary.meta, external })
+                : new MetadataReferenceSet(new[] { StandardLibrary, ExtendedLibrary.meta });
 
             var compilation = CompilationFactory.Create(trees, refs, new CompilationOptions(target ?? TargetInfo.Default), out var declDiag);
             AddDiagnostics(diagnostics, declDiag);
             if (HasErrors(diagnostics))
                 return (string.Empty, diagnostics, ExecutionContext.Empty);
 
-            var (md, builtFuncs, diags, ex) = compilation.BuildModule(
+            var (md, diags, ex) = compilation.BuildModule(
                 moduleName: "app",
-                tree: tree,
                 includeCoreTypesInTypeDefs: false,
                 defaultExternalAssemblyName: "std",
                 externalAssemblyResolver: refs.ResolveAssemblyName,
@@ -1189,33 +1146,31 @@ public static class CSharp
             if (HasErrors(diagnostics))
                 return (string.Empty, diagnostics, ExecutionContext.Empty);
 
-            byte[] flatMd = FlatMetadataBuilder.Build(md);
-            IMetadataView appMeta = new FlatMetadataView(flatMd);
+            byte[] moduleImage = EcmaImageWriter.Write(md);
+            EcmaMetadata appMeta = new EcmaMetadata(moduleImage);
 
-            var domain = new Domain();
-            var stdModule = new RuntimeModule(StandardLibrary.meta.ModuleName, StandardLibrary.meta, StandardLibrary.funcs);
-            var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta, ExtendedLibrary.funcs);
-            var appModule = new RuntimeModule(appMeta.ModuleName, appMeta, builtFuncs);
+            var stdModule = new RuntimeModule(StandardLibrary.ModuleName, StandardLibrary);
+            var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta);
+            var appModule = new RuntimeModule(appMeta.ModuleName, appMeta);
             var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
 
             void AddUnique(RuntimeModule m)
             {
                 if (!modules.TryAdd(m.Name, m))
                     throw new InvalidOperationException($"Duplicate module loaded: '{m.Name}'");
-                domain.Add(m);
             }
 
             AddUnique(stdModule);
             AddUnique(extStdModule);
             if (external != null)
-                AddUnique(new RuntimeModule(external.Value.meta.ModuleName, external.Value.meta, external.Value.functions));
+                AddUnique(new RuntimeModule(external.ModuleName, external));
             AddUnique(appModule);
 
             int entryTok;
             object?[]? selectedValues = null;
             if (string.IsNullOrWhiteSpace(entryAttributeTypeName))
             {
-                entryTok = BytecodeBuilder.FindEntryPointMethodDef(appModule);
+                entryTok = appModule.Md.FindEntryPointMethodDef();
             }
             else
             {
@@ -1248,12 +1203,10 @@ public static class CSharp
                 memory: mem,
                 staticEnd: staticEnd,
                 stackEnd: stackEnd,
-                domain: domain,
                 rts: rts,
                 modules: modules,
                 textWriter: writer);
 
-            var entryFn = appModule.MethodsByDefToken[entryTok];
             Slot[]? initialArgs = null;
             if (selectedValues != null)
             {
@@ -1266,10 +1219,7 @@ public static class CSharp
             host?.Invoke(new HostInterface(stVm, rts, modules));
 
             var sw = Stopwatch.StartNew();
-            if (initialArgs != null)
-                stVm.Execute(appModule, entryFn, cts.Token, execLimits, initialArgs);
-            else
-                stVm.Execute(appModule, entryFn, cts.Token, execLimits);
+            stVm.Execute(rts.ResolveMethod(appModule, entryTok), cts.Token, execLimits, initialArgs);
             sw.Stop();
 
             return (
@@ -1285,58 +1235,60 @@ public static class CSharp
         }
     }
 
-    internal static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs) CompileCoreLibrary(string source, TargetInfo? target = null)
+    internal static EcmaMetadata CompileCoreLibrary(ImmutableArray<(string Path, string Text)> sources, TargetInfo? target = null)
     {
-        if (string.IsNullOrWhiteSpace(source)) throw new ArgumentException("standart library source code is empty");
-        var stdParser = new Cnidaria.Cs.Parser(source, new LexerOptions { TargetPointerSize = (target ?? TargetInfo.Default).PointerSize });
-        var stdRoot = stdParser.Parse();
-        foreach (var diag in stdParser.LexerDiagnostics)
-            throw new InvalidOperationException($"std lexer error: {diag.GetMessage(source)}");
-        foreach (var diag in stdParser.Diagnostics)
-            throw new InvalidOperationException($"std parser error: {diag.GetMessage(source)}");
-        var stdSyntaxTree = new SyntaxTree(stdRoot, "std");
-        var stdTrees = ImmutableArray.Create(new SyntaxTree[] { stdSyntaxTree });
+        var parseDiagnostics = new List<IDiagnostic>();
+        var stdTrees = ParseSyntaxTrees(sources, target, parseDiagnostics);
+        if (parseDiagnostics.Count != 0)
+            throw new InvalidOperationException("std parse errors:\n" + string.Join("\n", parseDiagnostics.Select(d => d.GetMessage())));
         var stdCompilation = CompilationFactory.CreateCoreLibrary(stdTrees, options: new CompilationOptions(target ?? TargetInfo.Default), out var stdDiagnostics);
-        foreach (var diag in stdDiagnostics)
-            throw new InvalidOperationException($"std declaration error: {diag.GetMessage(source)}");
-        var (stdMd, stdFuncs, stdDiags, stdEx) = stdCompilation.BuildModule(
+        if (stdDiagnostics.Length != 0)
+            throw new InvalidOperationException("std declaration errors:\n" + string.Join("\n", stdDiagnostics.Select(FormatLibraryDiagnostic)));
+        var (stdMd, stdDiags, stdEx) = stdCompilation.BuildModule(
             moduleName: "std",
-            tree: stdTrees[0],
             includeCoreTypesInTypeDefs: true,
             defaultExternalAssemblyName: "std",
             print: false);
         if (stdEx != null)
             throw new InvalidOperationException("std build internal error", stdEx);
-        foreach (var diag in stdDiags)
-        {
-            if (diag.Severity == DiagnosticSeverity.Error)
-                throw new InvalidOperationException($"std build error: {diag.GetMessage(source)}");
-        }
-        byte[] stdFlatMd = Cnidaria.Cs.FlatMetadataBuilder.Build(stdMd);
-        IMetadataView stdViewFlat = new FlatMetadataView(stdFlatMd);
-        return (stdViewFlat, stdFuncs);
+        var stdErrors = stdDiags.Where(d => d.Severity == DiagnosticSeverity.Error).ToArray();
+        if (stdErrors.Length != 0)
+            throw new InvalidOperationException("std build errors:\n" + string.Join("\n", stdErrors.Select(FormatLibraryDiagnostic)));
+        byte[] stdImage = EcmaImageWriter.Write(stdMd);
+        return new EcmaMetadata(stdImage);
     }
-    public static (IMetadataView meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, List<IDiagnostic> diags) CompileLibrary(
-        string source, string modulename, TargetInfo? target = null)
+    // One SyntaxTree per source file, as Roslyn compiles a project; parse errors carry the file they came from.
+    private static ImmutableArray<SyntaxTree> ParseSyntaxTrees(
+        ImmutableArray<(string Path, string Text)> sources, TargetInfo? target, List<IDiagnostic> diagnostics)
+    {
+        var options = new LexerOptions { TargetPointerSize = (target ?? TargetInfo.Default).PointerSize };
+        var trees = ImmutableArray.CreateBuilder<SyntaxTree>(sources.Length);
+        foreach (var (path, text) in sources)
+        {
+            var parser = new Cnidaria.Cs.Parser(text, options);
+            var root = parser.Parse();
+            foreach (var diag in parser.LexerDiagnostics)
+                diagnostics.Add(new Diagnostic("LEX", DiagnosticSeverity.Error, $"{path}: {diag.GetMessage(text)}", default));
+            foreach (var diag in parser.Diagnostics)
+                diagnostics.Add(new Diagnostic("PARSE", DiagnosticSeverity.Error, $"{path}: {diag.GetMessage(text)}", default));
+            trees.Add(new SyntaxTree(root, path, text));
+        }
+        return trees.MoveToImmutable();
+    }
+    private static string FormatLibraryDiagnostic(Diagnostic diagnostic)
+        => diagnostic.Location.SyntaxTree is SyntaxTree tree
+            ? $"{tree.FilePath}: {diagnostic.GetMessage(tree.Text)}"
+            : diagnostic.GetMessage();
+    public static (EcmaMetadata meta, List<IDiagnostic> diags) CompileLibrary(
+        ImmutableArray<(string Path, string Text)> sources, string modulename, TargetInfo? target = null)
     {
         var diagnostics = new List<IDiagnostic>();
-        var parser = new Cnidaria.Cs.Parser(source, new LexerOptions { TargetPointerSize = (target ?? TargetInfo.Default).PointerSize });
-        var root = parser.Parse();
-        foreach (var diag in parser.LexerDiagnostics)
-        {
-            diagnostics.Add(diag);
-        }
-        foreach (var diag in parser.Diagnostics)
-        {
-            diagnostics.Add(diag);
-        }
+        var trees = ParseSyntaxTrees(sources, target, diagnostics);
         if (diagnostics.Count > 0)
         {
-            return (null!, null!, diagnostics);
+            return (null!, diagnostics);
         }
-        var tree = new SyntaxTree(root, modulename);
-        var trees = ImmutableArray.Create(new[] { tree });
-        var refs = new Cnidaria.Cs.MetadataReferenceSet(new[] { StandardLibrary.meta });
+        var refs = new Cnidaria.Cs.MetadataReferenceSet(new[] { StandardLibrary });
         var compilation = CompilationFactory.Create(trees, refs, new CompilationOptions(target ?? TargetInfo.Default), out var declDiag);
 
         foreach (var diag in declDiag)
@@ -1345,11 +1297,10 @@ public static class CSharp
         }
         if (diagnostics.Any(x => x.GetSeverity() == DiagnosticSeverity.Error))
         {
-            return (null!, null!, diagnostics);
+            return (null!, diagnostics);
         }
-        var (md, builtFuncs, diags, ex) = compilation.BuildModule(
+        var (md, diags, ex) = compilation.BuildModule(
             moduleName: modulename,
-            tree: trees[0],
             includeCoreTypesInTypeDefs: false,
             defaultExternalAssemblyName: "std",
             print: false,
@@ -1365,13 +1316,13 @@ public static class CSharp
         }
         if (diagnostics.Any(x => x.GetSeverity() == DiagnosticSeverity.Error))
         {
-            return (null!, null!, diagnostics);
+            return (null!, diagnostics);
         }
-        byte[] flatMd = Cnidaria.Cs.FlatMetadataBuilder.Build(md);
-        IMetadataView viewFlat = new FlatMetadataView(flatMd);
-        return (viewFlat, builtFuncs, diagnostics);
+        byte[] moduleImage = EcmaImageWriter.Write(md);
+        EcmaMetadata moduleMetadata = new EcmaMetadata(moduleImage);
+        return (moduleMetadata, diagnostics);
     }
-    internal static (byte[]? flatMd, IMetadataView? meta, Dictionary<int, Cnidaria.Cs.BytecodeFunction>? funcs, List<IDiagnostic> diags)
+    internal static (byte[]? moduleImage, EcmaMetadata? meta, List<IDiagnostic> diags)
         CompileLibraryCore(string source, string moduleName, TargetInfo? target = null)
     {
         var diagnostics = new List<IDiagnostic>();
@@ -1384,21 +1335,20 @@ public static class CSharp
         foreach (var diag in parser.Diagnostics)
             diagnostics.Add(diag);
         if (HasErrors(diagnostics))
-            return (null, null, null, diagnostics);
+            return (null, null, diagnostics);
 
-        var tree = new SyntaxTree(root, moduleName);
+        var tree = new SyntaxTree(root, moduleName, source);
         var trees = ImmutableArray.Create(tree);
-        var refs = new MetadataReferenceSet(new[] { StandardLibrary.meta });
+        var refs = new MetadataReferenceSet(new[] { StandardLibrary });
         var compilation = CompilationFactory.Create(trees, refs, new CompilationOptions(target ?? TargetInfo.Default), out var declDiag);
 
         foreach (var diag in declDiag)
             diagnostics.Add(diag);
         if (HasErrors(diagnostics))
-            return (null, null, null, diagnostics);
+            return (null, null, diagnostics);
 
-        var (md, builtFuncs, diags, ex) = compilation.BuildModule(
+        var (md, diags, ex) = compilation.BuildModule(
             moduleName: moduleName,
-            tree: tree,
             includeCoreTypesInTypeDefs: false,
             defaultExternalAssemblyName: "std",
             print: false,
@@ -1410,48 +1360,51 @@ public static class CSharp
         foreach (var diag in diags)
             diagnostics.Add(diag);
         if (HasErrors(diagnostics))
-            return (null, null, null, diagnostics);
+            return (null, null, diagnostics);
 
-        byte[] flatMd = FlatMetadataBuilder.Build(md);
-        IMetadataView viewFlat = new FlatMetadataView(flatMd);
+        byte[] moduleImage = EcmaImageWriter.Write(md);
+        EcmaMetadata moduleMetadata = new EcmaMetadata(moduleImage);
 
-        return (flatMd, viewFlat, builtFuncs, diagnostics);
+        return (moduleImage, moduleMetadata, diagnostics);
     }
     public static (byte[]? image, List<IDiagnostic> diagnostics) CompileExternalLibraryToBytes(
         string source,
         string moduleName = "external",
         TargetInfo? target = null)
     {
-        var (flatMd, _, extFuncs, diags) = CompileLibraryCore(source, moduleName, target);
-        if (HasErrors(diags) || flatMd == null || extFuncs == null)
+        var (moduleImage, _, diags) = CompileLibraryCore(source, moduleName, target);
+        if (HasErrors(diags) || moduleImage == null)
             return (null, diags);
 
-        return (BytecodeSerializer.SerializeCompiledModule(flatMd, extFuncs), diags);
+        return (moduleImage, diags);
     }
     private const string BclPrefix = "Cnidaria.Cs.BCL.";
-    public static string GetCoreBCLSource()
+    public static ImmutableArray<(string Path, string Text)> GetCoreBCLSources() => ReadBclSources(
+        "System.cs",
+        "System.Runtime.cs",
+        "System.Runtime.InteropServices.cs",
+        "System.Runtime.CompilerServices.cs",
+        "System.Collections.cs",
+        "System.Buffers.cs",
+        "System.Threading.cs",
+        "System.Globalization.cs",
+        "System.Text.cs",
+        "System.Numerics.cs",
+        "System.Runtime.Intrinsics.cs",
+        "System.Runtime.Intrinsics.Arm.cs",
+        "System.Runtime.Intrinsics.Wasm.cs",
+        "System.Runtime.Intrinsics.X86.cs",
+        "System.Reflection.cs",
+        "System.Diagnostics.cs");
+    public static ImmutableArray<(string Path, string Text)> GetExtendedBCLSources() => ReadBclSources(
+        "System.Linq.cs",
+        "System.Drawing.cs");
+    private static ImmutableArray<(string Path, string Text)> ReadBclSources(params string[] files)
     {
-        StringBuilder sb = new();
-        sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.cs"));
-        sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Runtime.cs"));
-        sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Runtime.InteropServices.cs"));
-        sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Runtime.CompilerServices.cs"));
-        sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Collections.cs"));
-        sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Buffers.cs"));
-        sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Threading.cs"));
-        sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Globalization.cs"));
-        sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Text.cs"));
-        sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Numerics.cs"));
-        sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Reflection.cs"));
-        return sb.ToString();
-    }
-    public static string GetExtendedBCLSource()
-    {
-        StringBuilder sb = new();
-        sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Linq.cs"));
-        sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Drawing.cs"));
-        sb.AppendLine(ReadEmbeddedText($"{BclPrefix}System.Diagnostics.cs"));
-        return sb.ToString();
+        var sources = ImmutableArray.CreateBuilder<(string Path, string Text)>(files.Length);
+        foreach (var file in files)
+            sources.Add(($"BCL/{file}", ReadEmbeddedText(BclPrefix + file)));
+        return sources.MoveToImmutable();
     }
     private static string ReadEmbeddedText(string resourceName)
     {
@@ -1464,7 +1417,7 @@ public static class CSharp
     }
     private enum ArgLexKind { Other, Integer, Floating }
     private static bool TryResolveAttributedEntryPoint(
-        IMetadataView metadata,
+        EcmaMetadata metadata,
         string attributeTypeName,
         string[] attributeArgs,
         string[] callArgs,
@@ -1535,7 +1488,7 @@ public static class CSharp
         boundValues = candidates[0].values;
         return true;
     }
-    private static Dictionary<int, ConstantRow> BuildConstantMap(IMetadataView metadata)
+    private static Dictionary<int, ConstantRow> BuildConstantMap(EcmaMetadata metadata)
     {
         var result = new Dictionary<int, ConstantRow>();
         int count = metadata.GetRowCount(MetadataTableKind.Constant);
@@ -1549,7 +1502,7 @@ public static class CSharp
         return result;
     }
 
-    private static Dictionary<int, List<MetadataAttributeSpec>> BuildAttributeMap(IMetadataView metadata)
+    private static Dictionary<int, List<MetadataAttributeSpec>> BuildAttributeMap(EcmaMetadata metadata)
     {
         var result = new Dictionary<int, List<MetadataAttributeSpec>>();
         int count = metadata.GetRowCount(MetadataTableKind.CustomAttribute);
@@ -1572,7 +1525,7 @@ public static class CSharp
         return result;
     }
 
-    private static IEnumerable<int> EnumerateMethodDefTokens(IMetadataView metadata)
+    private static IEnumerable<int> EnumerateMethodDefTokens(EcmaMetadata metadata)
     {
         int count = metadata.GetRowCount(MetadataTableKind.MethodDef);
         for (int rid = 1; rid <= count; rid++)
@@ -1591,9 +1544,6 @@ public static class CSharp
         for (int i = 0; i < attrs.Count; i++)
         {
             var a = attrs[i];
-            if (a.Target != AttributeApplicationTarget.Method)
-                continue;
-
             if (!StringComparer.Ordinal.Equals(NormalizeAttrName(a.Name), wantAttrShort))
                 continue;
 
@@ -1618,7 +1568,7 @@ public static class CSharp
     }
 
     private static bool TryGetEntryParameterSpecs(
-        IMetadataView metadata,
+        EcmaMetadata metadata,
         int methodToken,
         Dictionary<int, ConstantRow> constantsByParent,
         Dictionary<int, List<MetadataAttributeSpec>> attributesByParent,
@@ -1654,16 +1604,11 @@ public static class CSharp
         if (!TryReadVoidReturnType(ref sig))
             return false;
 
-        int totalParamRows = metadata.GetRowCount(MetadataTableKind.Param);
-        int paramListRid = method.ParamList;
         if (paramCount == 0)
         {
             parameters = Array.Empty<MetadataEntryParameterSpec>();
             return true;
         }
-
-        if (paramListRid <= 0 || paramListRid > totalParamRows)
-            return false;
 
         var result = new MetadataEntryParameterSpec[checked((int)paramCount)];
 
@@ -1672,12 +1617,8 @@ public static class CSharp
             if (!TryReadSupportedEntryParameterType(ref sig, out var specialType, out var isStringArray))
                 return false;
 
-            int paramRid = paramListRid + i;
-            if (paramRid > totalParamRows)
-                return false;
-
-            var param = metadata.GetParam(paramRid);
-            if (param.Sequence != (ushort)(i + 1))
+            int paramRid = metadata.FindParamRid(methodRid, i + 1);
+            if (paramRid == 0)
                 return false;
 
             int paramToken = MetadataToken.Make(MetadataToken.ParamDef, paramRid);
@@ -1728,9 +1669,6 @@ public static class CSharp
         for (int i = 0; i < attrs.Count; i++)
         {
             var a = attrs[i];
-            if (a.Target != AttributeApplicationTarget.Parameter)
-                continue;
-
             if (!StringComparer.Ordinal.Equals(a.Namespace, "System"))
                 continue;
 
@@ -1742,175 +1680,78 @@ public static class CSharp
     }
 
     private static bool TryDecodeAttribute(
-        IMetadataView metadata,
+        EcmaMetadata metadata,
         CustomAttributeRow row,
         out MetadataAttributeSpec spec)
     {
         spec = default;
 
-        if (!TryGetTypeTokenName(metadata, row.AttributeTypeToken, out var @namespace, out var name))
+        if (!metadata.TryGetAttributeTypeName(row.ConstructorToken, out var @namespace, out var name))
             return false;
 
-        if (!TryReadAttributeCtorArgs(metadata, row.Value, out var ctorArgs))
+        if (!TryReadAttributeCtorArgs(metadata, row, out var ctorArgs))
             return false;
 
-        spec = new MetadataAttributeSpec(
-            @namespace: @namespace,
-            name: name,
-            ctorArgs: ctorArgs,
-            target: (AttributeApplicationTarget)row.Target);
-
+        spec = new MetadataAttributeSpec(@namespace, name, ctorArgs);
         return true;
     }
 
     private static bool TryReadAttributeCtorArgs(
-        IMetadataView metadata,
-        int blobIndex,
+        EcmaMetadata metadata,
+        CustomAttributeRow row,
         out string[] ctorArgs)
     {
         ctorArgs = Array.Empty<string>();
+        int ctorRid = MetadataToken.Rid(row.ConstructorToken);
+        int signature = MetadataToken.Table(row.ConstructorToken) == MetadataToken.MethodDef
+            ? metadata.GetMethodDef(ctorRid).Signature
+            : metadata.GetMemberRef(ctorRid).Signature;
 
-        try
-        {
-            var reader = new AttrBlobReader(metadata.GetBlob(blobIndex));
-
-            int ctorParamCount = reader.ReadInt32();
-            for (int i = 0; i < ctorParamCount; i++)
-                _ = reader.ReadInt32();
-
-            int ctorArgCount = reader.ReadInt32();
-            var args = new string[ctorArgCount];
-
-            for (int i = 0; i < ctorArgCount; i++)
-            {
-                if (!TryReadAttributeCtorArg(metadata, ref reader, out var value))
-                    return false;
-
-                args[i] = value is null
-                    ? "null"
-                    : Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty;
-            }
-
-            ctorArgs = args;
-            return true;
-        }
-        catch
-        {
+        var sig = new SigReader(metadata.GetBlob(signature));
+        _ = sig.ReadByte();
+        int paramCount = (int)sig.ReadCompressedUInt();
+        if ((SigElementType)sig.ReadByte() != SigElementType.VOID)
             return false;
-        }
-    }
 
-    private static bool TryReadAttributeCtorArg(
-        IMetadataView metadata,
-        ref AttrBlobReader reader,
-        out object? value)
-    {
-        value = null;
-
-        _ = reader.ReadInt32(); // type token
-        byte kind = reader.ReadByte();
-
-        switch (kind)
+        var reader = new CustomAttributeBlobReader(metadata.GetBlob(row.Value));
+        var args = new string[paramCount];
+        for (int i = 0; i < paramCount; i++)
         {
-            case 0:
-                value = null;
-                return true;
-            case 1:
-                value = reader.ReadByte() != 0;
-                return true;
-            case 2:
-                value = (char)reader.ReadUInt16();
-                return true;
-            case 3:
-                value = reader.ReadSByte();
-                return true;
-            case 4:
-                value = reader.ReadByte();
-                return true;
-            case 5:
-                value = reader.ReadInt16();
-                return true;
-            case 6:
-                value = reader.ReadUInt16();
-                return true;
-            case 7:
-                value = reader.ReadInt32();
-                return true;
-            case 8:
-                value = reader.ReadUInt32();
-                return true;
-            case 9:
-                value = reader.ReadInt64();
-                return true;
-            case 10:
-                value = reader.ReadUInt64();
-                return true;
-            case 11:
-                value = reader.ReadSingle();
-                return true;
-            case 12:
-                value = reader.ReadDouble();
-                return true;
-            case 13:
-                value = metadata.GetString(reader.ReadInt32());
-                return true;
-            case 14:
-                if (!TryGetTypeTokenName(metadata, reader.ReadInt32(), out var @namespace, out var name))
+            var element = (SigElementType)sig.ReadByte();
+            object? value;
+            switch (element)
+            {
+                case SigElementType.STRING:
+                    value = reader.ReadSerString();
+                    break;
+                case SigElementType.CLASS:
+                    _ = sig.ReadCompressedUInt();
+                    value = reader.ReadSerString();
+                    break;
+                case >= SigElementType.BOOLEAN and <= SigElementType.R8:
+                    value = reader.ReadPrimitive(element);
+                    break;
+                default:
                     return false;
-
-                value = string.IsNullOrEmpty(@namespace) ? name : @namespace + "." + name;
-                return true;
-            default:
-                return false;
+            }
+            args[i] = value is null
+                ? "null"
+                : Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty;
         }
-    }
 
-    private static bool TryGetTypeTokenName(
-        IMetadataView metadata,
-        int token,
-        out string @namespace,
-        out string name)
-    {
-        @namespace = string.Empty;
-        name = string.Empty;
-
-        int table = MetadataToken.Table(token);
-        int rid = MetadataToken.Rid(token);
-
-        switch (table)
-        {
-            case MetadataToken.TypeDef:
-                if (rid <= 0 || rid > metadata.GetRowCount(MetadataTableKind.TypeDef))
-                    return false;
-
-                var td = metadata.GetTypeDef(rid);
-                @namespace = metadata.GetString(td.Namespace);
-                name = metadata.GetString(td.Name);
-                return true;
-
-            case MetadataToken.TypeRef:
-                if (rid <= 0 || rid > metadata.GetRowCount(MetadataTableKind.TypeRef))
-                    return false;
-
-                var tr = metadata.GetTypeRef(rid);
-                @namespace = metadata.GetString(tr.Namespace);
-                name = metadata.GetString(tr.Name);
-                return true;
-
-            default:
-                return false;
-        }
+        ctorArgs = args;
+        return true;
     }
 
     private static bool TryDecodeConstant(
-        IMetadataView metadata,
+        EcmaMetadata metadata,
         ConstantRow row,
         out object? value)
     {
         value = null;
         var blob = metadata.GetBlob(row.Value);
 
-        if (row.TypeCode == 0 && blob.Length == 0)
+        if (row.TypeCode == (byte)SigElementType.CLASS)
         {
             value = null;
             return true;
@@ -1930,7 +1771,7 @@ public static class CSharp
             case 0x0B: value = BitConverter.ToUInt64(blob); return true;
             case 0x0C: value = BitConverter.ToSingle(blob); return true;
             case 0x0D: value = BitConverter.ToDouble(blob); return true;
-            case 0x0E: value = Encoding.UTF8.GetString(blob); return true;
+            case 0x0E: value = Encoding.Unicode.GetString(blob); return true;
             default: return false;
         }
     }

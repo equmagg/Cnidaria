@@ -365,7 +365,7 @@ namespace Cnidaria.Cs
             var terminator = block.Statements[block.Statements.Length - 1];
             return terminator.Kind == GenTreeKind.Branch &&
                    terminator.TargetBlockId == successor &&
-                   terminator.SourceOp != BytecodeOp.Leave;
+                   terminator.Operator != GenTreeOperator.Leave;
         }
 
         private static bool TryGetLogicalSuccessors(
@@ -730,7 +730,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.ArrayLength => 2,
                 GenTreeKind.Field or GenTreeKind.FieldAddr or GenTreeKind.StaticField or GenTreeKind.StaticFieldAddr => 3,
                 GenTreeKind.LoadIndirect or GenTreeKind.StoreIndirect => 3,
-                GenTreeKind.Binary => (node.SourceOp is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un) ? 6 : 2,
+                GenTreeKind.Binary => (node.Operator is GenTreeOperator.Div or GenTreeOperator.DivUn or GenTreeOperator.Rem or GenTreeOperator.RemUn) ? 6 : 2,
                 GenTreeKind.Conv => 2,
                 _ => 1,
             };
@@ -794,10 +794,10 @@ namespace Cnidaria.Cs
                 var value = node.Operands[0];
                 if (uses.Contains(slot) &&
                     value.Kind == GenTreeKind.Binary &&
-                    (value.SourceOp is BytecodeOp.Add or BytecodeOp.Sub) &&
+                    (value.Operator is GenTreeOperator.Add or GenTreeOperator.Sub) &&
                     value.Operands.Length == 2 &&
                     ((IsSameSlot(value.Operands[0], slot) && IsIntegerConstant(value.Operands[1])) ||
-                     (value.SourceOp == BytecodeOp.Add && IsIntegerConstant(value.Operands[0]) && IsSameSlot(value.Operands[1], slot))))
+                     (value.Operator == GenTreeOperator.Add && IsIntegerConstant(value.Operands[0]) && IsSameSlot(value.Operands[1], slot))))
                 {
                     return true;
                 }
@@ -942,7 +942,7 @@ namespace Cnidaria.Cs
                 nextTreeId++,
                 GenTreeKind.BranchTrue,
                 candidate.Conditional.Pc,
-                BranchTrueSourceOp(candidate.Conditional.SourceOp),
+                GenTreeOperator.None,
                 type: null,
                 stackKind: GenStackKind.Void,
                 flags: conditionalFlags,
@@ -1050,7 +1050,7 @@ namespace Cnidaria.Cs
                 nextTreeId++,
                 GenTreeKind.Branch,
                 pc,
-                BytecodeOp.Br,
+                GenTreeOperator.None,
                 type: null,
                 stackKind: GenStackKind.Void,
                 flags: GenTreeFlags.ControlFlow | GenTreeFlags.Ordered,
@@ -1073,7 +1073,7 @@ namespace Cnidaria.Cs
                 nextTreeId++,
                 node.Kind,
                 node.Pc,
-                node.SourceOp,
+                node.Operator,
                 node.Type,
                 node.StackKind,
                 ClearDuplicatedFlags(node.Flags),
@@ -1102,9 +1102,6 @@ namespace Cnidaria.Cs
                 GenTreeFlags.Prolog |
                 GenTreeFlags.MakeCse |
                 GenTreeFlags.ExplicitInit);
-
-        private static BytecodeOp BranchTrueSourceOp(BytecodeOp sourceOp)
-            => (sourceOp is BytecodeOp.Brtrue or BytecodeOp.Brfalse) ? BytecodeOp.Brtrue : sourceOp;
 
         private static bool SameEhRegion(CfgBlock left, CfgBlock right)
             => GenTreeCriticalEdgeSplitter.SameEhRegion(left, right);

@@ -84,6 +84,22 @@ namespace Cnidaria.Cs
                                 break;
                             }
 
+                        case OperatorDeclarationSyntax od
+                            when kv.Value is SourceMethodSymbol om && od.ExplicitInterfaceSpecifier is not null:
+                            {
+                                var binder = HasModifier(od.Modifiers, SyntaxKind.UnsafeKeyword) ? unsafeTypeBinder : safeTypeBinder;
+                                BindExplicitInterfaceMethodCore(compilation, tree, stubModel, binder, od, od.Modifiers, od.ExplicitInterfaceSpecifier, om.Name, om, diagnostics);
+                                break;
+                            }
+
+                        case ConversionOperatorDeclarationSyntax cod
+                            when kv.Value is SourceMethodSymbol cm && cod.ExplicitInterfaceSpecifier is not null:
+                            {
+                                var binder = HasModifier(cod.Modifiers, SyntaxKind.UnsafeKeyword) ? unsafeTypeBinder : safeTypeBinder;
+                                BindExplicitInterfaceMethodCore(compilation, tree, stubModel, binder, cod, cod.Modifiers, cod.ExplicitInterfaceSpecifier, cm.Name, cm, diagnostics);
+                                break;
+                            }
+
                         case PropertyDeclarationSyntax pd
                             when kv.Value is SourcePropertySymbol sp && pd.ExplicitInterfaceSpecifier is not null:
                             {
@@ -121,8 +137,9 @@ namespace Cnidaria.Cs
                     if (kv.Key is not TypeDeclarationSyntax typeSyntax)
                         continue;
 
-                    if (kv.Value is not SourceNamedTypeSymbol type)
+                    if (kv.Value is not (SourceNamedTypeSymbol or SpecialNamedTypeSymbol))
                         continue;
+                    var type = (NamedTypeSymbol)kv.Value;
 
                     if (!seenTypes.Add(type))
                         continue;
@@ -135,7 +152,7 @@ namespace Cnidaria.Cs
             }
         }
         private static void ValidateInterfaceImplementationsForType(
-            SourceNamedTypeSymbol type,
+            NamedTypeSymbol type,
             SyntaxTree tree,
             TextSpan diagnosticSpan,
             DiagnosticBag diagnostics)
@@ -159,10 +176,21 @@ namespace Cnidaria.Cs
 
                         seenMembers.Add(member);
 
+                        if (member is MethodSymbol dispatched &&
+                            !dispatched.IsStatic &&
+                            dispatched.DeclaredAccessibility != Accessibility.Private &&
+                            !dispatched.IsExplicitInterfaceImplementation &&
+                            FindExplicitMethodImplementation(type, dispatched) is null &&
+                            FindImplicitMethodImplementation(type, dispatched) is SourceMethodSymbol implicitImplementation)
+                        {
+                            implicitImplementation.MarkImplicitInterfaceImplementation();
+                        }
+                        RecordImplicitStaticImplementation(type, member);
+
                         switch (member)
                         {
                             case MethodSymbol method when ShouldValidateInterfaceMethod(method):
-                                if (!HasMethodImplementation(type, method))
+                                if (!HasMethodImplementation(type, method) && !HasInterfaceMethodOverride(interfaces, method))
                                 {
                                     diagnostics.Add(new Diagnostic(
                                         "CN_IFACEIMPL001",
@@ -172,8 +200,8 @@ namespace Cnidaria.Cs
                                 }
                                 break;
 
-                            case PropertySymbol property:
-                                if (!HasPropertyImplementation(type, property))
+                            case PropertySymbol property when !HasDefaultBody(property.GetMethod) && !HasDefaultBody(property.SetMethod):
+                                if (!HasPropertyImplementation(type, property) && !HasInterfacePropertyOverride(interfaces, property))
                                 {
                                     diagnostics.Add(new Diagnostic(
                                         "CN_IFACEIMPL002",
@@ -262,9 +290,40 @@ namespace Cnidaria.Cs
             };
         }
 
+        // Static abstract and virtual members dispatch only through MethodImpl rows, so implicit implementations are recorded too.
+        private static void RecordImplicitStaticImplementation(NamedTypeSymbol type, Symbol member)
+        {
+            switch (member)
+            {
+                case MethodSymbol { IsStatic: true } method when method.IsAbstract || method.IsVirtual:
+                    if (FindExplicitMethodImplementation(type, method) is null &&
+                        FindImplicitMethodImplementation(type, method) is SourceMethodSymbol implementation)
+                    {
+                        implementation.AddImplicitStaticInterfaceImplementation(method);
+                    }
+                    break;
+                case PropertySymbol { IsStatic: true } property:
+                    if (FindExplicitPropertyImplementation(type, property) is null &&
+                        FindImplicitPropertyImplementation(type, property) is PropertySymbol implementingProperty)
+                    {
+                        RecordImplicitStaticAccessor(implementingProperty.GetMethod, property.GetMethod);
+                        RecordImplicitStaticAccessor(implementingProperty.SetMethod, property.SetMethod);
+                    }
+                    break;
+            }
+        }
+        private static void RecordImplicitStaticAccessor(MethodSymbol? implementation, MethodSymbol? interfaceAccessor)
+        {
+            if (implementation is SourceMethodSymbol source && interfaceAccessor is not null &&
+                (interfaceAccessor.IsAbstract || interfaceAccessor.IsVirtual))
+            {
+                source.AddImplicitStaticInterfaceImplementation(interfaceAccessor);
+            }
+        }
         private static bool ShouldValidateInterfaceMethod(MethodSymbol method)
         {
-            if (method.IsConstructor || method.IsStatic)
+            if (method.IsConstructor || !method.IsAbstract || method.IsExplicitInterfaceImplementation ||
+                method.DeclaredAccessibility == Accessibility.Private)
                 return false;
 
             // Property accessors are validated via PropertySymbol
@@ -276,6 +335,53 @@ namespace Cnidaria.Cs
 
             return true;
         }
+        private static bool HasInterfaceMethodOverride(ImmutableArray<NamedTypeSymbol> interfaces, MethodSymbol ifaceMethod)
+        {
+            for (int i = 0; i < interfaces.Length; i++)
+            {
+                foreach (var iface in EnumerateInterfaceClosure(interfaces[i]))
+                {
+                    var members = iface.GetMembers();
+                    for (int m = 0; m < members.Length; m++)
+                    {
+                        if (members[m] is MethodSymbol candidate && SameInterfaceMethodIdentity(candidate.ExplicitInterfaceImplementation, ifaceMethod))
+                            return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        private static bool HasInterfacePropertyOverride(ImmutableArray<NamedTypeSymbol> interfaces, PropertySymbol ifaceProperty)
+        {
+            for (int i = 0; i < interfaces.Length; i++)
+            {
+                foreach (var iface in EnumerateInterfaceClosure(interfaces[i]))
+                {
+                    var members = iface.GetMembers();
+                    for (int m = 0; m < members.Length; m++)
+                    {
+                        if (members[m] is PropertySymbol candidate && SameInterfacePropertyIdentity(candidate.ExplicitInterfaceImplementation, ifaceProperty))
+                            return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        private static bool HasDefaultBody(MethodSymbol? accessor)
+        {
+            if (accessor is null)
+                return false;
+            foreach (var reference in accessor.DeclaringSyntaxReferences)
+            {
+                if (reference.Node is AccessorDeclarationSyntax { Body: not null } or AccessorDeclarationSyntax { ExpressionBody: not null } or
+                    PropertyDeclarationSyntax { ExpressionBody: not null } or IndexerDeclarationSyntax { ExpressionBody: not null })
+                    return true;
+            }
+            return false;
+        }
+
         private static bool HasMethodImplementation(NamedTypeSymbol type, MethodSymbol ifaceMethod)
         {
             return FindExplicitMethodImplementation(type, ifaceMethod) is not null
@@ -374,10 +480,10 @@ namespace Cnidaria.Cs
                     if (members[i] is not MethodSymbol candidate)
                         continue;
 
-                    if (candidate.IsStatic || candidate.IsConstructor)
+                    if (candidate.IsStatic != ifaceMethod.IsStatic || candidate.IsConstructor)
                         continue;
 
-                    if (candidate.ExplicitInterfaceImplementation is not null)
+                    if (candidate.IsExplicitInterfaceImplementation)
                         continue;
 
                     if (candidate.DeclaredAccessibility != Accessibility.Public)
@@ -434,10 +540,10 @@ namespace Cnidaria.Cs
                     if (members[i] is not PropertySymbol candidate)
                         continue;
 
-                    if (candidate.IsStatic)
+                    if (candidate.IsStatic != ifaceProperty.IsStatic)
                         continue;
 
-                    if (candidate.ExplicitInterfaceImplementation is not null)
+                    if (candidate.IsExplicitInterfaceImplementation)
                         continue;
 
                     if (candidate.DeclaredAccessibility != Accessibility.Public)
@@ -533,35 +639,40 @@ namespace Cnidaria.Cs
             MethodDeclarationSyntax syntax,
             SourceMethodSymbol method,
             DiagnosticBag diagnostics)
+            => BindExplicitInterfaceMethodCore(
+                compilation, tree, stubModel, typeBinder, syntax, syntax.Modifiers, syntax.ExplicitInterfaceSpecifier!,
+                syntax.Identifier.ValueText ?? string.Empty, method, diagnostics);
+
+        private static void BindExplicitInterfaceMethodCore(
+            Compilation compilation,
+            SyntaxTree tree,
+            SemanticModel stubModel,
+            TypeBinder typeBinder,
+            SyntaxNode syntax,
+            SyntaxTokenList modifiers,
+            ExplicitInterfaceSpecifierSyntax explicitInterfaceSpecifier,
+            string sourceName,
+            SourceMethodSymbol method,
+            DiagnosticBag diagnostics)
         {
             if (method.ContainingSymbol is not NamedTypeSymbol containingType)
                 return;
 
-            ValidateExplicitInterfaceMemberModifiers(tree, syntax.Modifiers, syntax, diagnostics);
+            ValidateExplicitInterfaceMemberModifiers(tree, modifiers, syntax, diagnostics);
 
-            if (containingType.TypeKind is not (TypeKind.Class or TypeKind.Struct))
+            if (containingType.TypeKind is not (TypeKind.Class or TypeKind.Struct or TypeKind.Interface))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_EXPLIFACE001",
                     DiagnosticSeverity.Error,
-                    "Explicit interface implementations are only valid in classes or structs.",
-                    new Location(tree, syntax.ExplicitInterfaceSpecifier!.Span)));
-                return;
-            }
-
-            if (method.IsStatic)
-            {
-                diagnostics.Add(new Diagnostic(
-                    "CN_EXPLIFACE002",
-                    DiagnosticSeverity.Error,
-                    "Explicit interface implementation cannot be static.",
-                    new Location(tree, syntax.Modifiers.Count > 0 ? syntax.Modifiers[0].Span : syntax.Span)));
+                    "Explicit interface implementations are only valid in classes, structs or interfaces.",
+                    new Location(tree, explicitInterfaceSpecifier.Span)));
                 return;
             }
 
             var iface = BindExplicitInterfaceType(
                 compilation, tree, stubModel, typeBinder, method,
-                syntax.ExplicitInterfaceSpecifier!.Name, diagnostics);
+                explicitInterfaceSpecifier.Name, diagnostics);
 
             if (iface is null)
                 return;
@@ -572,13 +683,12 @@ namespace Cnidaria.Cs
                     "CN_EXPLIFACE003",
                     DiagnosticSeverity.Error,
                     $"Type '{containingType.Name}' does not implement interface '{iface.Name}'.",
-                    new Location(tree, syntax.ExplicitInterfaceSpecifier.Span)));
+                    new Location(tree, explicitInterfaceSpecifier.Span)));
                 return;
             }
 
             MethodSymbol? match = null;
             bool ambiguous = false;
-            string sourceName = syntax.Identifier.ValueText ?? string.Empty;
 
             foreach (var curIface in EnumerateInterfaceClosure(iface))
             {
@@ -588,7 +698,7 @@ namespace Cnidaria.Cs
                     if (members[i] is not MethodSymbol candidate)
                         continue;
 
-                    if (candidate.IsConstructor)
+                    if (candidate.IsConstructor || candidate.IsStatic != method.IsStatic)
                         continue;
 
                     if (!StringComparer.Ordinal.Equals(candidate.Name, sourceName))
@@ -647,23 +757,13 @@ namespace Cnidaria.Cs
 
             ValidateExplicitInterfaceMemberModifiers(tree, syntax.Modifiers, syntax, diagnostics);
 
-            if (containingType.TypeKind is not (TypeKind.Class or TypeKind.Struct))
+            if (containingType.TypeKind is not (TypeKind.Class or TypeKind.Struct or TypeKind.Interface))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_EXPLIFACE001",
                     DiagnosticSeverity.Error,
-                    "Explicit interface implementations are only valid in classes or structs.",
+                    "Explicit interface implementations are only valid in classes, structs or interfaces.",
                     new Location(tree, syntax.ExplicitInterfaceSpecifier!.Span)));
-                return;
-            }
-
-            if (property.IsStatic)
-            {
-                diagnostics.Add(new Diagnostic(
-                    "CN_EXPLIFACE002",
-                    DiagnosticSeverity.Error,
-                    "Explicit interface implementation cannot be static.",
-                    new Location(tree, syntax.Modifiers.Count > 0 ? syntax.Modifiers[0].Span : syntax.Span)));
                 return;
             }
 
@@ -713,12 +813,12 @@ namespace Cnidaria.Cs
 
             ValidateExplicitInterfaceMemberModifiers(tree, syntax.Modifiers, syntax, diagnostics);
 
-            if (containingType.TypeKind is not (TypeKind.Class or TypeKind.Struct))
+            if (containingType.TypeKind is not (TypeKind.Class or TypeKind.Struct or TypeKind.Interface))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_EXPLIFACE001",
                     DiagnosticSeverity.Error,
-                    "Explicit interface implementations are only valid in classes or structs.",
+                    "Explicit interface implementations are only valid in classes, structs or interfaces.",
                     new Location(tree, syntax.ExplicitInterfaceSpecifier!.Span)));
                 return;
             }
@@ -804,7 +904,7 @@ namespace Cnidaria.Cs
                 var members = curIface.GetMembers();
                 for (int i = 0; i < members.Length; i++)
                 {
-                    if (members[i] is not PropertySymbol candidate)
+                    if (members[i] is not PropertySymbol candidate || candidate.IsStatic != property.IsStatic)
                         continue;
 
                     if (!StringComparer.Ordinal.Equals(candidate.Name, name))

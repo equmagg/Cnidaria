@@ -440,6 +440,7 @@ namespace Cnidaria.Cs
                     case GenTreeKind.ConstR8Bits:
                     case GenTreeKind.ConstNull:
                     case GenTreeKind.ConstString:
+                    case GenTreeKind.TypeHandle:
                     case GenTreeKind.DefaultValue:
                     case GenTreeKind.SizeOf:
                     case GenTreeKind.Local:
@@ -591,7 +592,7 @@ namespace Cnidaria.Cs
                     _nextSyntheticTreeId++,
                     kind,
                     pc: -1,
-                    BytecodeOp.Nop,
+                    GenTreeOperator.None,
                     info.Type,
                     info.StackKind,
                     GenTreeFlags.LocalUse | GenTreeFlags.Ordered,
@@ -610,7 +611,7 @@ namespace Cnidaria.Cs
                     _nextSyntheticTreeId++,
                     GenTreeKind.Nop,
                     pc: -1,
-                    BytecodeOp.Nop,
+                    GenTreeOperator.None,
                     info.Type,
                     info.StackKind,
                     GenTreeFlags.None,
@@ -994,7 +995,7 @@ namespace Cnidaria.Cs
             private readonly struct LoweredBranchCondition
             {
                 public readonly bool BranchWhenTrue;
-                public readonly BytecodeOp CompareOp;
+                public readonly GenTreeOperator CompareOp;
                 public readonly GenTree? GenTreeValue;
                 public readonly GenTree? GenTreeLeft;
                 public readonly GenTree? GenTreeRight;
@@ -1004,7 +1005,7 @@ namespace Cnidaria.Cs
 
                 private LoweredBranchCondition(
                     bool branchWhenTrue,
-                    BytecodeOp compareOp,
+                    GenTreeOperator compareOp,
                     GenTree? genTreeValue,
                     GenTree? genTreeLeft,
                     GenTree? genTreeRight,
@@ -1022,18 +1023,18 @@ namespace Cnidaria.Cs
                     SsaRight = ssaRight;
                 }
 
-                public bool IsCompare => CompareOp != BytecodeOp.Nop;
+                public bool IsCompare => CompareOp != GenTreeOperator.None;
 
                 public static LoweredBranchCondition Truth(GenTree value, bool branchWhenTrue)
-                    => new LoweredBranchCondition(branchWhenTrue, BytecodeOp.Nop, value, null, null, null, null, null);
+                    => new LoweredBranchCondition(branchWhenTrue, GenTreeOperator.None, value, null, null, null, null, null);
 
                 public static LoweredBranchCondition Truth(SsaTree value, bool branchWhenTrue)
-                    => new LoweredBranchCondition(branchWhenTrue, BytecodeOp.Nop, null, null, null, value, null, null);
+                    => new LoweredBranchCondition(branchWhenTrue, GenTreeOperator.None, null, null, null, value, null, null);
 
-                public static LoweredBranchCondition Compare(BytecodeOp compareOp, GenTree left, GenTree right, bool branchWhenTrue)
+                public static LoweredBranchCondition Compare(GenTreeOperator compareOp, GenTree left, GenTree right, bool branchWhenTrue)
                     => new LoweredBranchCondition(branchWhenTrue, compareOp, null, left, right, null, null, null);
 
-                public static LoweredBranchCondition Compare(BytecodeOp compareOp, SsaTree left, SsaTree right, bool branchWhenTrue)
+                public static LoweredBranchCondition Compare(GenTreeOperator compareOp, SsaTree left, SsaTree right, bool branchWhenTrue)
                     => new LoweredBranchCondition(branchWhenTrue, compareOp, null, null, null, null, left, right);
             }
 
@@ -1054,7 +1055,7 @@ namespace Cnidaria.Cs
                         return false;
 
                     branch.Kind = condition.BranchWhenTrue ? GenTreeKind.BranchTrue : GenTreeKind.BranchFalse;
-                    branch.SourceOp = condition.CompareOp;
+                    branch.Operator = condition.CompareOp;
                     left.RegisterResult = LowerValue(left);
 
                     var operandFlags = LowerCompareBranchRightOperand(branch, left, right);
@@ -1067,7 +1068,7 @@ namespace Cnidaria.Cs
                 var value = condition.GenTreeValue ?? throw new InvalidOperationException("Lowered truth branch is missing its operand.");
                 value.RegisterResult = LowerValue(value);
                 branch.Kind = condition.BranchWhenTrue ? GenTreeKind.BranchTrue : GenTreeKind.BranchFalse;
-                branch.SourceOp = condition.BranchWhenTrue ? BytecodeOp.Brtrue : BytecodeOp.Brfalse;
+                branch.Operator = GenTreeOperator.None;
                 branch.SetOperands(ImmutableArray.Create(value));
 
                 EmitTree(branch, ImmutableArray.Create(LirOperandFlags.None), result: null);
@@ -1092,7 +1093,7 @@ namespace Cnidaria.Cs
                         return false;
 
                     branch.Kind = condition.BranchWhenTrue ? GenTreeKind.BranchTrue : GenTreeKind.BranchFalse;
-                    branch.SourceOp = condition.CompareOp;
+                    branch.Operator = condition.CompareOp;
                     left.Source.RegisterResult = LowerValue(left);
 
                     ImmutableArray<LirOperandFlags> operandFlags;
@@ -1116,7 +1117,7 @@ namespace Cnidaria.Cs
                 var value = condition.SsaValue ?? throw new InvalidOperationException("Lowered SSA truth branch is missing its operand.");
                 value.Source.RegisterResult = LowerValue(value);
                 branch.Kind = condition.BranchWhenTrue ? GenTreeKind.BranchTrue : GenTreeKind.BranchFalse;
-                branch.SourceOp = condition.BranchWhenTrue ? BytecodeOp.Brtrue : BytecodeOp.Brfalse;
+                branch.Operator = GenTreeOperator.None;
                 branch.SetOperands(ImmutableArray.Create(value.Source));
 
                 EmitTree(branch, ImmutableArray.Create(LirOperandFlags.None), result: null);
@@ -1129,20 +1130,20 @@ namespace Cnidaria.Cs
                 bool allowTruthValue,
                 out LoweredBranchCondition lowered)
             {
-                if (condition.Kind == GenTreeKind.Binary && IsCompareOp(condition.SourceOp) && condition.Operands.Length == 2)
+                if (condition.Kind == GenTreeKind.Binary && IsCompareOp(condition.Operator) && condition.Operands.Length == 2)
                 {
                     var left = condition.Operands[0];
                     var right = condition.Operands[1];
-                    if (condition.SourceOp == BytecodeOp.Ceq && TryGetIntegralZeroCompareOperand(left, right, out var comparedWithZero))
+                    if (condition.Operator == GenTreeOperator.Ceq && TryGetIntegralZeroCompareOperand(left, right, out var comparedWithZero))
                         return TryReduceBooleanBranchCondition(comparedWithZero, !branchWhenTrue, allowTruthValue: true, out lowered);
 
-                    if (condition.SourceOp == BytecodeOp.Ceq && TryGetBooleanOneCompareOperand(left, right, out var comparedWithOne))
+                    if (condition.Operator == GenTreeOperator.Ceq && TryGetBooleanOneCompareOperand(left, right, out var comparedWithOne))
                         return TryReduceBooleanBranchCondition(comparedWithOne, branchWhenTrue, allowTruthValue: true, out lowered);
 
-                    if (IsUnsignedNonZeroTest(condition.SourceOp, left, right, out comparedWithZero))
+                    if (IsUnsignedNonZeroTest(condition.Operator, left, right, out comparedWithZero))
                         return TryReduceBooleanBranchCondition(comparedWithZero, branchWhenTrue, allowTruthValue: true, out lowered);
 
-                    lowered = LoweredBranchCondition.Compare(condition.SourceOp, left, right, branchWhenTrue);
+                    lowered = LoweredBranchCondition.Compare(condition.Operator, left, right, branchWhenTrue);
                     return true;
                 }
 
@@ -1162,29 +1163,29 @@ namespace Cnidaria.Cs
                 bool allowTruthValue,
                 out LoweredBranchCondition lowered)
             {
-                if (condition.Source.Kind == GenTreeKind.Binary && IsCompareOp(condition.Source.SourceOp) && condition.Operands.Length == 2)
+                if (condition.Source.Kind == GenTreeKind.Binary && IsCompareOp(condition.Source.Operator) && condition.Operands.Length == 2)
                 {
                     var left = condition.Operands[0];
                     var right = condition.Operands[1];
-                    if (condition.Source.SourceOp == BytecodeOp.Ceq && TryGetIntegralZeroCompareOperand(left.Source, right.Source, out var comparedWithZero))
+                    if (condition.Source.Operator == GenTreeOperator.Ceq && TryGetIntegralZeroCompareOperand(left.Source, right.Source, out var comparedWithZero))
                     {
                         SsaTree next = ReferenceEquals(comparedWithZero, left.Source) ? left : right;
                         return TryReduceBooleanBranchCondition(next, !branchWhenTrue, allowTruthValue: true, out lowered);
                     }
 
-                    if (condition.Source.SourceOp == BytecodeOp.Ceq && TryGetBooleanOneCompareOperand(left.Source, right.Source, out var comparedWithOne))
+                    if (condition.Source.Operator == GenTreeOperator.Ceq && TryGetBooleanOneCompareOperand(left.Source, right.Source, out var comparedWithOne))
                     {
                         SsaTree next = ReferenceEquals(comparedWithOne, left.Source) ? left : right;
                         return TryReduceBooleanBranchCondition(next, branchWhenTrue, allowTruthValue: true, out lowered);
                     }
 
-                    if (IsUnsignedNonZeroTest(condition.Source.SourceOp, left.Source, right.Source, out comparedWithZero))
+                    if (IsUnsignedNonZeroTest(condition.Source.Operator, left.Source, right.Source, out comparedWithZero))
                     {
                         SsaTree next = ReferenceEquals(comparedWithZero, left.Source) ? left : right;
                         return TryReduceBooleanBranchCondition(next, branchWhenTrue, allowTruthValue: true, out lowered);
                     }
 
-                    lowered = LoweredBranchCondition.Compare(condition.Source.SourceOp, left, right, branchWhenTrue);
+                    lowered = LoweredBranchCondition.Compare(condition.Source.Operator, left, right, branchWhenTrue);
                     return true;
                 }
 
@@ -1237,19 +1238,19 @@ namespace Cnidaria.Cs
             private static bool IsBooleanBranchValue(GenTree value)
             {
                 RuntimeType? type = value.LocalDescriptor?.Type ?? value.RuntimeType ?? value.Type;
-                return (value.Kind == GenTreeKind.Binary && IsCompareOp(value.SourceOp)) ||
+                return (value.Kind == GenTreeKind.Binary && IsCompareOp(value.Operator)) ||
                        type?.PrimitiveKind == RuntimePrimitiveKind.Boolean;
             }
 
-            private static bool IsUnsignedNonZeroTest(BytecodeOp op, GenTree left, GenTree right, out GenTree value)
+            private static bool IsUnsignedNonZeroTest(GenTreeOperator op, GenTree left, GenTree right, out GenTree value)
             {
-                if (op == BytecodeOp.Cgt_Un && IsIntegralZero(right) && CanUseTruthinessForUnsignedNonZero(left))
+                if (op == GenTreeOperator.CgtUn && IsIntegralZero(right) && CanUseTruthinessForUnsignedNonZero(left))
                 {
                     value = left;
                     return true;
                 }
 
-                if (op == BytecodeOp.Clt_Un && IsIntegralZero(left) && CanUseTruthinessForUnsignedNonZero(right))
+                if (op == GenTreeOperator.CltUn && IsIntegralZero(left) && CanUseTruthinessForUnsignedNonZero(right))
                 {
                     value = right;
                     return true;
@@ -1289,7 +1290,7 @@ namespace Cnidaria.Cs
                 };
             }
 
-            private static bool CanEmitDirectCompareBranch(BytecodeOp op, GenTree left, GenTree right, bool branchWhenTrue)
+            private static bool CanEmitDirectCompareBranch(GenTreeOperator op, GenTree left, GenTree right, bool branchWhenTrue)
             {
                 if (!IsCompareOp(op))
                     return false;
@@ -1299,20 +1300,20 @@ namespace Cnidaria.Cs
                 bool f32 = IsFloatLike(type, kind) && (kind == GenStackKind.R4 || type?.Name == "Single");
                 bool f64 = IsFloatLike(type, kind) && !f32;
                 if (f32 || f64)
-                    return op == BytecodeOp.Ceq || (branchWhenTrue && (op == BytecodeOp.Clt || op == BytecodeOp.Cgt));
+                    return op == GenTreeOperator.Ceq || (branchWhenTrue && (op == GenTreeOperator.Clt || op == GenTreeOperator.Cgt));
 
                 if (left.StackKind == GenStackKind.Value || right.StackKind == GenStackKind.Value)
                     return false;
 
                 if (left.StackKind is GenStackKind.Ref or GenStackKind.Null or GenStackKind.ByRef ||
                     right.StackKind is GenStackKind.Ref or GenStackKind.Null or GenStackKind.ByRef)
-                    return op == BytecodeOp.Ceq;
+                    return op == GenTreeOperator.Ceq;
 
                 return true;
             }
 
-            private static bool IsCompareOp(BytecodeOp op)
-                => op is BytecodeOp.Ceq or BytecodeOp.Clt or BytecodeOp.Clt_Un or BytecodeOp.Cgt or BytecodeOp.Cgt_Un;
+            private static bool IsCompareOp(GenTreeOperator op)
+                => op is GenTreeOperator.Ceq or GenTreeOperator.Clt or GenTreeOperator.CltUn or GenTreeOperator.Cgt or GenTreeOperator.CgtUn;
 
             private void LowerControlTransfer(SsaTree tree)
             {
@@ -1448,7 +1449,7 @@ namespace Cnidaria.Cs
                 if (tree.Kind != GenTreeKind.Binary || tree.Operands.Length != 2)
                     return false;
 
-                if (!IsCommutativeBinaryImmediateOp(tree.SourceOp))
+                if (!IsCommutativeBinaryImmediateOp(tree.Operator))
                     return false;
 
                 var left = tree.Operands[0];
@@ -1474,7 +1475,7 @@ namespace Cnidaria.Cs
                 if (tree.Source.Kind != GenTreeKind.Binary || tree.Operands.Length != 2)
                     return false;
 
-                if (!IsCommutativeBinaryImmediateOp(tree.Source.SourceOp))
+                if (!IsCommutativeBinaryImmediateOp(tree.Source.Operator))
                     return false;
 
                 var left = tree.Operands[0];
@@ -1551,7 +1552,7 @@ namespace Cnidaria.Cs
 
             private bool IsCompareBranchWithImmediate(GenTree parent)
                 => parent.Kind is GenTreeKind.BranchTrue or GenTreeKind.BranchFalse &&
-                   parent.SourceOp is BytecodeOp.Ceq or BytecodeOp.Clt or BytecodeOp.Clt_Un or BytecodeOp.Cgt or BytecodeOp.Cgt_Un &&
+                   parent.Operator is GenTreeOperator.Ceq or GenTreeOperator.Clt or GenTreeOperator.CltUn or GenTreeOperator.Cgt or GenTreeOperator.CgtUn &&
                    (_target.IsX86 || RegisterInfo.IsArm64(_target));
 
             private bool CanContainBinaryImmediate(GenTree parent, int operandIndex, GenTree operand)
@@ -1571,27 +1572,27 @@ namespace Cnidaria.Cs
                 if (IsFloatLike(parent.Type, parent.StackKind) || parent.StackKind is GenStackKind.Ref or GenStackKind.Null)
                     return false;
 
-                if (parent.SourceOp is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un)
+                if (parent.Operator is GenTreeOperator.Div or GenTreeOperator.DivUn or GenTreeOperator.Rem or GenTreeOperator.RemUn)
                     return false;
 
-                if (parent.SourceOp == BytecodeOp.Cgt_Un)
+                if (parent.Operator == GenTreeOperator.CgtUn)
                     return false;
 
                 if (_target.Architecture == TargetArchitectureKind.X86_64 &&
                     operand.Kind == GenTreeKind.ConstI8 &&
-                    parent.SourceOp is not (BytecodeOp.Shl or BytecodeOp.Shr or BytecodeOp.Shr_Un) &&
+                    parent.Operator is not (GenTreeOperator.Shl or GenTreeOperator.Shr or GenTreeOperator.ShrUn) &&
                     (operand.Int64 < int.MinValue || operand.Int64 > int.MaxValue))
                 {
                     return false;
                 }
 
-                if (!IsBinaryImmediateOp(parent.SourceOp))
+                if (!IsBinaryImmediateOp(parent.Operator))
                     return false;
 
                 if (RegisterInfo.IsArm64(_target))
                 {
                     long value = operand.Kind == GenTreeKind.ConstI8 ? operand.Int64 : operand.Int32;
-                    return IsArm64ContainableImmediate(parent.SourceOp, value, IsArm64WideOperation(parent, operand));
+                    return IsArm64ContainableImmediate(parent.Operator, value, IsArm64WideOperation(parent, operand));
                 }
 
                 return true;
@@ -1600,25 +1601,25 @@ namespace Cnidaria.Cs
             // A comparison reports the width of its result, not of what it compared
             private static bool IsArm64WideOperation(GenTree parent, GenTree operand)
             {
-                var stackKind = parent.SourceOp is BytecodeOp.Ceq or BytecodeOp.Clt or BytecodeOp.Clt_Un or BytecodeOp.Cgt or BytecodeOp.Cgt_Un
+                var stackKind = parent.Operator is GenTreeOperator.Ceq or GenTreeOperator.Clt or GenTreeOperator.CltUn or GenTreeOperator.Cgt or GenTreeOperator.CgtUn
                     ? operand.StackKind
                     : parent.StackKind;
 
                 return stackKind is GenStackKind.I8 or GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr or GenStackKind.ByRef;
             }
 
-            private static bool IsArm64ContainableImmediate(BytecodeOp op, long value, bool is64Bit)
+            private static bool IsArm64ContainableImmediate(GenTreeOperator op, long value, bool is64Bit)
             {
                 switch (op)
                 {
-                    case BytecodeOp.Shl:
-                    case BytecodeOp.Shr:
-                    case BytecodeOp.Shr_Un:
+                    case GenTreeOperator.Shl:
+                    case GenTreeOperator.Shr:
+                    case GenTreeOperator.ShrUn:
                         return value >= 0 && value < (is64Bit ? 64 : 32);
 
-                    case BytecodeOp.And:
-                    case BytecodeOp.Or:
-                    case BytecodeOp.Xor:
+                    case GenTreeOperator.And:
+                    case GenTreeOperator.Or:
+                    case GenTreeOperator.Xor:
                         return IsArm64LogicalImmediate(value, is64Bit);
 
                     // Subtracting the immediate is adding its negation, so either sign fits
@@ -1685,15 +1686,15 @@ namespace Cnidaria.Cs
                        (_target.Is64Bit && operand.Kind == GenTreeKind.ConstI8);
             }
 
-            private static bool IsBinaryImmediateOp(BytecodeOp op)
+            private static bool IsBinaryImmediateOp(GenTreeOperator op)
                 => op is
-                    BytecodeOp.Add or BytecodeOp.Sub or BytecodeOp.Mul or
-                    BytecodeOp.And or BytecodeOp.Or or BytecodeOp.Xor or
-                    BytecodeOp.Shl or BytecodeOp.Shr or BytecodeOp.Shr_Un or
-                    BytecodeOp.Ceq or BytecodeOp.Clt or BytecodeOp.Clt_Un or BytecodeOp.Cgt;
+                    GenTreeOperator.Add or GenTreeOperator.Sub or GenTreeOperator.Mul or
+                    GenTreeOperator.And or GenTreeOperator.Or or GenTreeOperator.Xor or
+                    GenTreeOperator.Shl or GenTreeOperator.Shr or GenTreeOperator.ShrUn or
+                    GenTreeOperator.Ceq or GenTreeOperator.Clt or GenTreeOperator.CltUn or GenTreeOperator.Cgt;
 
-            private static bool IsCommutativeBinaryImmediateOp(BytecodeOp op)
-                => op is BytecodeOp.Add or BytecodeOp.Mul or BytecodeOp.And or BytecodeOp.Or or BytecodeOp.Xor or BytecodeOp.Ceq;
+            private static bool IsCommutativeBinaryImmediateOp(GenTreeOperator op)
+                => op is GenTreeOperator.Add or GenTreeOperator.Mul or GenTreeOperator.And or GenTreeOperator.Or or GenTreeOperator.Xor or GenTreeOperator.Ceq;
 
             private static bool IsFloatLike(RuntimeType? type, GenStackKind stackKind)
                 => stackKind is GenStackKind.R4 or GenStackKind.R8 || type?.Name is "Single" or "Double";
@@ -1801,7 +1802,7 @@ namespace Cnidaria.Cs
                 out GenTree? result)
             {
                 result = null;
-                if (template.SourceOp != BytecodeOp.Mul)
+                if (template.Operator != GenTreeOperator.Mul)
                     return false;
 
                 int bits = GenTreeArithmeticSemantics.IntegralBits(template.Type, template.StackKind, _target);
@@ -1820,7 +1821,7 @@ namespace Cnidaria.Cs
                 if (multiplier == -1)
                 {
                     GenTree value = lowerOperand(valueIndex);
-                    result = EmitFinalUnaryLoweredTree(template, BytecodeOp.Neg, source, value, ssaTree);
+                    result = EmitFinalUnaryLoweredTree(template, GenTreeOperator.Neg, source, value, ssaTree);
                     return true;
                 }
 
@@ -1833,8 +1834,8 @@ namespace Cnidaria.Cs
                     GenTree value = lowerOperand(valueIndex);
                     GenTree operand = Use(source, value);
                     if (negate)
-                        operand = EmitSyntheticUnary(template, BytecodeOp.Neg, operand);
-                    result = EmitFinalBinaryImmediateLoweredTree(template, BytecodeOp.Shl, operand, operand.RegisterResult!, shift, ssaTree);
+                        operand = EmitSyntheticUnary(template, GenTreeOperator.Neg, operand);
+                    result = EmitFinalBinaryImmediateLoweredTree(template, GenTreeOperator.Shl, operand, operand.RegisterResult!, shift, ssaTree);
                     return true;
                 }
 
@@ -1848,9 +1849,9 @@ namespace Cnidaria.Cs
                     GenTree value = lowerOperand(valueIndex);
                     GenTree operand = Use(source, value);
                     if (multiplier < 0)
-                        operand = EmitSyntheticUnary(template, BytecodeOp.Neg, operand);
-                    GenTree scaled = EmitSyntheticBinaryImmediate(template, BytecodeOp.Mul, operand, factor);
-                    result = EmitFinalBinaryImmediateLoweredTree(template, BytecodeOp.Shl, scaled, scaled, Log2(lowestBit), ssaTree);
+                        operand = EmitSyntheticUnary(template, GenTreeOperator.Neg, operand);
+                    GenTree scaled = EmitSyntheticBinaryImmediate(template, GenTreeOperator.Mul, operand, factor);
+                    result = EmitFinalBinaryImmediateLoweredTree(template, GenTreeOperator.Shl, scaled, scaled, Log2(lowestBit), ssaTree);
                     return true;
                 }
 
@@ -1863,8 +1864,8 @@ namespace Cnidaria.Cs
                     return false;
 
                 GenTree multiplicand = lowerOperand(valueIndex);
-                GenTree shifted = EmitSyntheticBinaryImmediate(template, BytecodeOp.Shl, Use(source, multiplicand), (ulong)Log2(useSub ? positive + 1 : positive - 1));
-                result = EmitFinalBinaryLoweredTree(template, useSub ? BytecodeOp.Sub : BytecodeOp.Add, shifted, UseOf(multiplicand), ssaTree);
+                GenTree shifted = EmitSyntheticBinaryImmediate(template, GenTreeOperator.Shl, Use(source, multiplicand), (ulong)Log2(useSub ? positive + 1 : positive - 1));
+                result = EmitFinalBinaryLoweredTree(template, useSub ? GenTreeOperator.Sub : GenTreeOperator.Add, shifted, UseOf(multiplicand), ssaTree);
                 return true;
             }
 
@@ -1878,7 +1879,7 @@ namespace Cnidaria.Cs
                 out GenTree? result)
             {
                 result = null;
-                if (template.SourceOp is not (BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un))
+                if (template.Operator is not (GenTreeOperator.Div or GenTreeOperator.DivUn or GenTreeOperator.Rem or GenTreeOperator.RemUn))
                     return false;
 
                 int bits = GenTreeArithmeticSemantics.IntegralBits(template.Type, template.StackKind, _target);
@@ -1890,22 +1891,22 @@ namespace Cnidaria.Cs
                 if (unsignedDivisor == 0)
                     return false;
 
-                if (template.SourceOp is BytecodeOp.Div_Un or BytecodeOp.Rem_Un)
+                if (template.Operator is GenTreeOperator.DivUn or GenTreeOperator.RemUn)
                 {
                     if (GenTreeArithmeticSemantics.TryGetUnsignedPowerOfTwoDivisor(unsignedDivisor, bits, out int unsignedShift))
                     {
                         GenTree dividend = lowerOperand(0);
-                        result = template.SourceOp == BytecodeOp.Div_Un
-                            ? EmitFinalBinaryImmediateLoweredTree(template, BytecodeOp.Shr_Un, dividendSource, dividend, unsignedShift, ssaTree)
-                            : EmitFinalBinaryImmediateLoweredTree(template, BytecodeOp.And, dividendSource, dividend, unsignedDivisor - 1, ssaTree);
+                        result = template.Operator == GenTreeOperator.DivUn
+                            ? EmitFinalBinaryImmediateLoweredTree(template, GenTreeOperator.ShrUn, dividendSource, dividend, unsignedShift, ssaTree)
+                            : EmitFinalBinaryImmediateLoweredTree(template, GenTreeOperator.And, dividendSource, dividend, unsignedDivisor - 1, ssaTree);
                         return true;
                     }
 
-                    if (template.SourceOp == BytecodeOp.Div_Un && !_target.IsRegisterBytecode && unsignedDivisor > MaskToWidth(ulong.MaxValue, bits) / 2)
+                    if (template.Operator == GenTreeOperator.DivUn && !_target.IsRegisterBytecode && unsignedDivisor > MaskToWidth(ulong.MaxValue, bits) / 2)
                     {
                         GenTree dividend = lowerOperand(0);
                         GenTree limit = LowerConstant(template, unsignedDivisor - 1);
-                        result = EmitFinalBinaryLoweredTree(template, BytecodeOp.Cgt_Un, Use(dividendSource, dividend), limit, ssaTree);
+                        result = EmitFinalBinaryLoweredTree(template, GenTreeOperator.CgtUn, Use(dividendSource, dividend), limit, ssaTree);
                         return true;
                     }
 
@@ -1916,11 +1917,11 @@ namespace Cnidaria.Cs
                 if (_target.IsRegisterBytecode || signedDivisor == -1)
                     return false;
 
-                bool isDiv = template.SourceOp == BytecodeOp.Div;
+                bool isDiv = template.Operator == GenTreeOperator.Div;
                 if (isDiv && GenTreeArithmeticSemantics.IsSignedMinValue(signedDivisor, bits))
                 {
                     GenTree dividend = lowerOperand(0);
-                    result = EmitFinalBinaryLoweredTree(template, BytecodeOp.Ceq, Use(dividendSource, dividend), LowerConstant(template, unsignedDivisor), ssaTree);
+                    result = EmitFinalBinaryLoweredTree(template, GenTreeOperator.Ceq, Use(dividendSource, dividend), LowerConstant(template, unsignedDivisor), ssaTree);
                     return true;
                 }
 
@@ -1930,26 +1931,26 @@ namespace Cnidaria.Cs
 
                 GenTree value = lowerOperand(0);
                 GenTree adjustment = absDivisor == 2
-                    ? EmitSyntheticBinaryImmediate(template, BytecodeOp.Shr_Un, Use(dividendSource, value), (ulong)(bits - 1))
-                    : EmitSyntheticBinaryImmediate(template, BytecodeOp.And,
-                        EmitSyntheticBinaryImmediate(template, BytecodeOp.Shr, Use(dividendSource, value), (ulong)(bits - 1)), absDivisor - 1);
-                GenTree adjusted = EmitSyntheticBinary(template, BytecodeOp.Add, adjustment, UseOf(value));
+                    ? EmitSyntheticBinaryImmediate(template, GenTreeOperator.ShrUn, Use(dividendSource, value), (ulong)(bits - 1))
+                    : EmitSyntheticBinaryImmediate(template, GenTreeOperator.And,
+                        EmitSyntheticBinaryImmediate(template, GenTreeOperator.Shr, Use(dividendSource, value), (ulong)(bits - 1)), absDivisor - 1);
+                GenTree adjusted = EmitSyntheticBinary(template, GenTreeOperator.Add, adjustment, UseOf(value));
 
                 if (!isDiv)
                 {
-                    GenTree rounded = EmitSyntheticBinaryImmediate(template, BytecodeOp.And, adjusted, MaskToWidth(~(absDivisor - 1), bits));
-                    result = EmitFinalBinaryLoweredTree(template, BytecodeOp.Sub, UseOf(value), rounded, ssaTree);
+                    GenTree rounded = EmitSyntheticBinaryImmediate(template, GenTreeOperator.And, adjusted, MaskToWidth(~(absDivisor - 1), bits));
+                    result = EmitFinalBinaryLoweredTree(template, GenTreeOperator.Sub, UseOf(value), rounded, ssaTree);
                     return true;
                 }
 
                 if (signedDivisor > 0)
                 {
-                    result = EmitFinalBinaryImmediateLoweredTree(template, BytecodeOp.Shr, adjusted, adjusted, Log2(absDivisor), ssaTree);
+                    result = EmitFinalBinaryImmediateLoweredTree(template, GenTreeOperator.Shr, adjusted, adjusted, Log2(absDivisor), ssaTree);
                     return true;
                 }
 
-                GenTree quotient = EmitSyntheticBinaryImmediate(template, BytecodeOp.Shr, adjusted, (ulong)Log2(absDivisor));
-                result = EmitFinalUnaryLoweredTree(template, BytecodeOp.Neg, quotient, quotient, ssaTree);
+                GenTree quotient = EmitSyntheticBinaryImmediate(template, GenTreeOperator.Shr, adjusted, (ulong)Log2(absDivisor));
+                result = EmitFinalUnaryLoweredTree(template, GenTreeOperator.Neg, quotient, quotient, ssaTree);
                 return true;
             }
 
@@ -1976,7 +1977,7 @@ namespace Cnidaria.Cs
                     _nextSyntheticTreeId++,
                     GenTreeKind.Nop,
                     pc: -1,
-                    BytecodeOp.Nop,
+                    GenTreeOperator.None,
                     value.Type,
                     value.StackKind,
                     GenTreeFlags.None,
@@ -1985,7 +1986,7 @@ namespace Cnidaria.Cs
                 return use;
             }
 
-            private GenTree EmitSyntheticUnary(GenTree template, BytecodeOp op, GenTree operand)
+            private GenTree EmitSyntheticUnary(GenTree template, GenTreeOperator op, GenTree operand)
             {
                 var node = new GenTree(
                     _nextSyntheticTreeId++,
@@ -2000,7 +2001,7 @@ namespace Cnidaria.Cs
                 return node;
             }
 
-            private GenTree EmitSyntheticBinary(GenTree template, BytecodeOp op, GenTree left, GenTree right)
+            private GenTree EmitSyntheticBinary(GenTree template, GenTreeOperator op, GenTree left, GenTree right)
             {
                 var node = new GenTree(
                     _nextSyntheticTreeId++,
@@ -2015,7 +2016,7 @@ namespace Cnidaria.Cs
                 return node;
             }
 
-            private GenTree EmitSyntheticBinaryImmediate(GenTree template, BytecodeOp op, GenTree left, ulong immediate)
+            private GenTree EmitSyntheticBinaryImmediate(GenTree template, GenTreeOperator op, GenTree left, ulong immediate)
             {
                 var constant = CreateIntegerConstant(template, immediate);
                 var node = new GenTree(
@@ -2050,34 +2051,34 @@ namespace Cnidaria.Cs
                 return LirOperandFlags.None;
             }
 
-            private GenTree EmitFinalUnaryLoweredTree(GenTree template, BytecodeOp op, GenTree operandSource, GenTree operandValue, SsaTree? ssaTree)
+            private GenTree EmitFinalUnaryLoweredTree(GenTree template, GenTreeOperator op, GenTree operandSource, GenTree operandValue, SsaTree? ssaTree)
             {
                 operandSource.RegisterResult = operandValue;
                 template.Kind = GenTreeKind.Unary;
-                template.SourceOp = op;
+                template.Operator = op;
                 template.Flags = GenTreeFlags.None;
                 template.SetOperands(ImmutableArray.Create(operandSource));
                 return EmitFinalLoweredTree(template, ImmutableArray.Create(LirOperandFlags.None), ssaTree);
             }
 
-            private GenTree EmitFinalBinaryLoweredTree(GenTree template, BytecodeOp op, GenTree left, GenTree right, SsaTree? ssaTree)
+            private GenTree EmitFinalBinaryLoweredTree(GenTree template, GenTreeOperator op, GenTree left, GenTree right, SsaTree? ssaTree)
             {
                 template.Kind = GenTreeKind.Binary;
-                template.SourceOp = op;
+                template.Operator = op;
                 template.Flags = GenTreeFlags.None;
                 template.SetOperands(ImmutableArray.Create(left, right));
                 return EmitFinalLoweredTree(template, ImmutableArray.Create(LirOperandFlags.None, LirOperandFlags.None), ssaTree);
             }
 
-            private GenTree EmitFinalBinaryImmediateLoweredTree(GenTree template, BytecodeOp op, GenTree leftSource, GenTree leftValue, long immediate, SsaTree? ssaTree)
+            private GenTree EmitFinalBinaryImmediateLoweredTree(GenTree template, GenTreeOperator op, GenTree leftSource, GenTree leftValue, long immediate, SsaTree? ssaTree)
                 => EmitFinalBinaryImmediateLoweredTree(template, op, leftSource, leftValue, unchecked((ulong)immediate), ssaTree);
 
-            private GenTree EmitFinalBinaryImmediateLoweredTree(GenTree template, BytecodeOp op, GenTree leftSource, GenTree leftValue, ulong immediate, SsaTree? ssaTree)
+            private GenTree EmitFinalBinaryImmediateLoweredTree(GenTree template, GenTreeOperator op, GenTree leftSource, GenTree leftValue, ulong immediate, SsaTree? ssaTree)
             {
                 leftSource.RegisterResult = leftValue;
                 var constant = CreateIntegerConstant(template, immediate);
                 template.Kind = GenTreeKind.Binary;
-                template.SourceOp = op;
+                template.Operator = op;
                 template.Flags = GenTreeFlags.None;
                 template.SetOperands(ImmutableArray.Create(leftSource, constant));
                 return EmitFinalLoweredTree(template, ImmutableArray.Create(LirOperandFlags.None, ContainImmediateOrLower(template, constant)), ssaTree);
@@ -2112,7 +2113,7 @@ namespace Cnidaria.Cs
                         _nextSyntheticTreeId++,
                         GenTreeKind.ConstI4,
                         template.Pc,
-                        BytecodeOp.Ldc_I4,
+                        GenTreeOperator.None,
                         type: null,
                         stackKind: GenStackKind.I4,
                         flags: GenTreeFlags.None,
@@ -2122,7 +2123,7 @@ namespace Cnidaria.Cs
                         _nextSyntheticTreeId++,
                         GenTreeKind.ConstI8,
                         template.Pc,
-                        BytecodeOp.Ldc_I8,
+                        GenTreeOperator.None,
                         type: null,
                         stackKind: GenStackKind.I8,
                         flags: GenTreeFlags.None,
@@ -2225,7 +2226,7 @@ namespace Cnidaria.Cs
                     _nextSyntheticTreeId++,
                     GenTreeKind.Nop,
                     sourceTree?.Pc ?? -1,
-                    BytecodeOp.Nop,
+                    GenTreeOperator.None,
                     type: null,
                     stackKind: GenStackKind.Void,
                     flags: GenTreeFlags.SideEffect | GenTreeFlags.Ordered,
@@ -2292,7 +2293,7 @@ namespace Cnidaria.Cs
                     _nextSyntheticTreeId++,
                     GenTreeKind.Copy,
                     pc: -1,
-                    BytecodeOp.Nop,
+                    GenTreeOperator.None,
                     destination.Type ?? source.Type,
                     destination.StackKind != GenStackKind.Unknown ? destination.StackKind : source.StackKind,
                     GenTreeFlags.Ordered,

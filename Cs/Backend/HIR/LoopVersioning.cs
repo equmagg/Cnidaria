@@ -336,7 +336,7 @@ namespace Cnidaria.Cs
                 var branch = preheader.Statements[branchIndex];
                 return branch.Kind == GenTreeKind.Branch &&
                        branch.Operands.Length == 0 &&
-                       branch.SourceOp != BytecodeOp.Leave &&
+                       branch.Operator != GenTreeOperator.Leave &&
                        branch.TargetBlockId == targetBlockId &&
                        !ContainsControlTransfer(preheader.Statements, branchIndex);
             }
@@ -491,7 +491,7 @@ namespace Cnidaria.Cs
                 allocator.AllocateTreeId(),
                 GenTreeKind.BranchFalse,
                 pc,
-                BytecodeOp.Brfalse,
+                GenTreeOperator.None,
                 type: null,
                 stackKind: GenStackKind.Void,
                 flags: GenTreeFlags.ControlFlow | GenTreeFlags.Ordered,

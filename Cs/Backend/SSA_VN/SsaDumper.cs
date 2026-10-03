@@ -226,6 +226,9 @@ namespace Cnidaria.Cs
                 case GenTreeKind.ConstString:
                     sb.Append('"').Append(Escape(tree.Source.Text ?? string.Empty)).Append('"');
                     return;
+                case GenTreeKind.TypeHandle:
+                    sb.Append("typehandle ").Append(tree.Source.RuntimeType);
+                    return;
                 case GenTreeKind.Local:
                     sb.Append('l').Append(tree.Source.Int32);
                     return;
@@ -255,7 +258,7 @@ namespace Cnidaria.Cs
                     AppendOperandList(sb, tree);
                     return;
                 case GenTreeKind.Unary:
-                    sb.Append(tree.Source.SourceOp.ToString().ToLowerInvariant()).Append('(');
+                    sb.Append(tree.Source.Operator.ToString().ToLowerInvariant()).Append('(');
                     AppendOperandList(sb, tree);
                     sb.Append(')');
                     return;
@@ -264,7 +267,7 @@ namespace Cnidaria.Cs
                     {
                         sb.Append('(');
                         AppendTree(sb, tree.Operands[0]);
-                        sb.Append(' ').Append(tree.Source.SourceOp).Append(' ');
+                        sb.Append(' ').Append(tree.Source.Operator).Append(' ');
                         AppendTree(sb, tree.Operands[1]);
                         sb.Append(')');
                         return;

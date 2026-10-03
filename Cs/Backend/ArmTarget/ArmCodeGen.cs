@@ -94,6 +94,7 @@ namespace Cnidaria.Cs
             private readonly Dictionary<int, string> _virtualDispatchMethodLabels = new Dictionary<int, string>();
             private string? _virtualDispatchFailureStubLabel;
             private bool _virtualDispatchMetadataPrepared;
+            private RuntimeType? _runtimeTypeInfoStringType;
             private readonly Dictionary<int, EhMethodDraft> _ehMethodsByMethodId = new Dictionary<int, EhMethodDraft>();
             private readonly List<EhMethodDraft> _ehMethods = new List<EhMethodDraft>();
             private readonly Dictionary<DelegateTargetThunkKey, DelegateTargetThunkDraft> _delegateTargetThunksByKey =
@@ -1186,11 +1187,43 @@ namespace Cnidaria.Cs
 
             // A vtable slot that cannot be resolved to real code still needs an address, and the stub it
             // gets is the one that reports the hole instead of jumping into nothing
+            private bool UsesRuntimeTypeInfo()
+            {
+                foreach (var method in _program.Methods)
+                {
+                    if (method.RuntimeMethod.DeclaringType is { Namespace: "System", Name: "RuntimeType" })
+                        return true;
+                }
+                return false;
+            }
+
+            private string EmitRuntimeTypeInfo(RuntimeType type, RuntimeType stringType)
+            {
+                string? Text(string? text) => text is null ? null : GetStringLiteralLabel(stringType, text);
+
+                int pointerSize = _target.PointerSize;
+                string label = CreateLocalLabel($"type_{type.TypeId}_info");
+                AddDataSymbol(label, _rodata.Align(pointerSize), pointerSize * 6);
+                EmitPointer(Text(RuntimeTypeNames.Name(type)));
+                EmitPointer(Text(RuntimeTypeNames.Namespace(type)));
+                EmitPointer(Text(RuntimeTypeNames.FullName(type)));
+                EmitPointer(Text(RuntimeTypeNames.DisplayName(type)));
+                EmitPointer(Text(type.AssemblyName));
+                EmitNative((int)RuntimeTypeNames.Flags(type));
+                return label;
+            }
+
             private void PrepareVirtualDispatchMetadata()
             {
                 RuntimeTypeSystem? typeSystem = _program.TypeSystem;
                 if (_interfaceDispatchCells.Count != 0 && typeSystem is null)
                     throw new InvalidOperationException("Interface dispatch metadata requires a runtime type system.");
+
+                if (typeSystem is not null && UsesRuntimeTypeInfo())
+                {
+                    _runtimeTypeInfoStringType = typeSystem.SystemString;
+                    _ = GetTypeDescriptorLabel(_runtimeTypeInfoStringType);
+                }
 
                 for (int i = 0; i < _typeDescriptors.Count; i++)
                 {
@@ -2277,7 +2310,11 @@ namespace Cnidaria.Cs
                                                 descriptor.Type.SizeOf)
                                             : checked(_target.SyncBlockSize + descriptor.Type.InstanceSize));
 
-                    AddDataSymbol(descriptor.Label, _rodata.Align(pointerSize), checked(16 + pointerSize * 3));
+                    string? infoLabel = _runtimeTypeInfoStringType is null ? null : EmitRuntimeTypeInfo(descriptor.Type, _runtimeTypeInfoStringType);
+                    // RuntimeType reads names and flags through the pointer one slot before the MethodTable.
+                    _rodata.Align(pointerSize);
+                    EmitPointer(infoLabel);
+                    AddDataSymbol(descriptor.Label, _rodata.ByteLength, checked(16 + pointerSize * 3));
                     EmitUInt32(ComputeMethodTableFlags(descriptor, componentSize));
                     EmitUInt32(checked((uint)baseSize));
                     EmitPointer(descriptor.RelatedTypeLabel);
@@ -2718,6 +2755,11 @@ namespace Cnidaria.Cs
                                 _owner.GetStringLiteralLabel(RequireRuntimeType(node), node.Text ?? string.Empty),
                                 GeneralRegister(RequireResultRegister(node)));
                             return;
+                        case GenTreeKind.TypeHandle:
+                            _owner.EmitMaterializeAddress(
+                                _owner.GetTypeDescriptorLabel(RequireRuntimeType(node)),
+                                GeneralRegister(RequireResultRegister(node)));
+                            return;
                         case GenTreeKind.ConstR4Bits:
                             EmitFloatConstant(node, 4, BitConverter.GetBytes(node.Int32));
                             return;
@@ -2770,7 +2812,7 @@ namespace Cnidaria.Cs
                             EmitConversion(node);
                             return;
                         case GenTreeKind.Branch:
-                            if (node.SourceOp == BytecodeOp.Leave && _ehMethod is not null)
+                            if (node.Operator == GenTreeOperator.Leave && _ehMethod is not null)
                             {
                                 EmitLeave(node);
                                 return;
@@ -3156,7 +3198,7 @@ namespace Cnidaria.Cs
                         throw Unsupported(node, "Static data length does not fit a native image blob");
                     }
 
-                    ImmutableArray<byte> staticData = _method.Function.StaticDataBlob;
+                    ImmutableArray<byte> staticData = _method.StaticDataBlob;
                     if (sourceOffset < 0 || sourceLength < 0 || sourceOffset > staticData.Length ||
                         sourceLength > staticData.Length - sourceOffset)
                     {
@@ -3196,11 +3238,7 @@ namespace Cnidaria.Cs
                     if (TryGetContainedIntegerImmediate(node, 1, out long immediateIndex))
                     {
                         if (IsI4(indexType, indexKind))
-                        {
-                            immediateIndex = IsUnsigned(indexType)
-                                ? unchecked((uint)(int)immediateIndex)
-                                : unchecked((int)immediateIndex);
-                        }
+                            immediateIndex = unchecked((int)immediateIndex);
                         _owner.EmitAddImmediate(destination, baseRegister, unchecked(immediateIndex * scale), Scratch0);
                         return;
                     }
@@ -3209,7 +3247,7 @@ namespace Cnidaria.Cs
                     if (IsI4(indexType, indexKind))
                     {
                         // A narrow index reaches the address as its own width, not as whatever the register held
-                        EmitBitfieldMove(IsSigned(indexType, indexKind), Scratch0, index, 32);
+                        EmitBitfieldMove(true, Scratch0, index, 32);
                         index = Scratch0;
                     }
 
@@ -3377,8 +3415,8 @@ namespace Cnidaria.Cs
 
                     if (IsFloating(type, kind))
                     {
-                        if (node.SourceOp != BytecodeOp.Neg)
-                            throw Unsupported(node, $"Unsupported floating unary opcode {node.SourceOp}");
+                        if (node.Operator != GenTreeOperator.Neg)
+                            throw Unsupported(node, $"Unsupported floating unary opcode {node.Operator}");
                         int floatSize = StorageSize(type, kind);
                         _owner.Emit(ArmInstruction.Binary(
                             ArmInstrKind.Fneg, Reg(ToArm(destination), floatSize), Reg(ToArm(source), floatSize)));
@@ -3386,28 +3424,28 @@ namespace Cnidaria.Cs
                     }
 
                     int size = OperationSize(type, kind);
-                    switch (node.SourceOp)
+                    switch (node.Operator)
                     {
-                        case BytecodeOp.Neg:
+                        case GenTreeOperator.Neg:
                             _owner.Emit(ArmInstruction.Ternary(
                                 ArmInstrKind.Sub,
                                 Reg(GeneralRegister(destination), size),
                                 Reg(ArmRegister.Xzr, size),
                                 Reg(GeneralRegister(source), size)));
                             return;
-                        case BytecodeOp.Not:
+                        case GenTreeOperator.Not:
                             _owner.Emit(ArmInstruction.Binary(
                                 ArmInstrKind.Mvn,
                                 Reg(GeneralRegister(destination), size),
                                 Reg(GeneralRegister(source), size)));
                             return;
-                        case BytecodeOp.FnPtrToPtr:
-                        case BytecodeOp.PtrToFnPtr:
-                        case BytecodeOp.PtrToByRef:
+                        case GenTreeOperator.FnPtrToPtr:
+                        case GenTreeOperator.PtrToFnPtr:
+                        case GenTreeOperator.PtrToByRef:
                             _owner.EmitMove(GeneralRegister(destination), GeneralRegister(source), 8);
                             return;
                         default:
-                            throw Unsupported(node, $"Unsupported unary opcode {node.SourceOp}");
+                            throw Unsupported(node, $"Unsupported unary opcode {node.Operator}");
                     }
                 }
 
@@ -3453,21 +3491,21 @@ namespace Cnidaria.Cs
                     ArmRegister rd = GeneralRegister(destination);
                     ArmRegister rn = GeneralRegister(left);
 
-                    switch (node.SourceOp)
+                    switch (node.Operator)
                     {
-                        case BytecodeOp.Add when IsAddSubImmediate(immediate):
-                        case BytecodeOp.Sub when IsAddSubImmediate(-immediate):
+                        case GenTreeOperator.Add when IsAddSubImmediate(immediate):
+                        case GenTreeOperator.Sub when IsAddSubImmediate(-immediate):
                             _owner.Emit(ArmInstruction.Ternary(
-                                node.SourceOp == BytecodeOp.Add ? ArmInstrKind.Add : ArmInstrKind.Sub,
+                                node.Operator == GenTreeOperator.Add ? ArmInstrKind.Add : ArmInstrKind.Sub,
                                 Reg(rd, size), Reg(rn, size), ArmOperand.ImmediateOperand(immediate)));
                             return true;
-                        case BytecodeOp.Shl:
-                        case BytecodeOp.Shr:
-                        case BytecodeOp.Shr_Un:
+                        case GenTreeOperator.Shl:
+                        case GenTreeOperator.Shr:
+                        case GenTreeOperator.ShrUn:
                             {
                                 long amount = immediate & (size * 8 - 1);
-                                bool unsigned = IsUnsigned(type) || node.SourceOp == BytecodeOp.Shr_Un;
-                                ArmInstrKind opcode = node.SourceOp == BytecodeOp.Shl
+                                bool unsigned = node.Operator == GenTreeOperator.ShrUn;
+                                ArmInstrKind opcode = node.Operator == GenTreeOperator.Shl
                                     ? ArmInstrKind.Lsl
                                     : unsigned ? ArmInstrKind.Lsr : ArmInstrKind.Asr;
                                 _owner.Emit(ArmInstruction.Ternary(
@@ -3497,63 +3535,62 @@ namespace Cnidaria.Cs
                     GenStackKind kind)
                 {
                     int size = OperationSize(type, kind);
-                    bool unsigned = IsUnsigned(type) ||
-                        node.SourceOp is BytecodeOp.Div_Un or BytecodeOp.Rem_Un or BytecodeOp.Shr_Un or
-                            BytecodeOp.Clt_Un or BytecodeOp.Cgt_Un;
+                    bool unsigned = node.Operator is GenTreeOperator.DivUn or GenTreeOperator.RemUn or GenTreeOperator.ShrUn or
+                            GenTreeOperator.CltUn or GenTreeOperator.CgtUn;
 
-                    switch (node.SourceOp)
+                    switch (node.Operator)
                     {
-                        case BytecodeOp.Add:
+                        case GenTreeOperator.Add:
                             EmitThreeAddress(ArmInstrKind.Add, destination, left, right, size);
                             return;
-                        case BytecodeOp.Sub:
+                        case GenTreeOperator.Sub:
                             EmitThreeAddress(ArmInstrKind.Sub, destination, left, right, size);
                             return;
-                        case BytecodeOp.Mul:
+                        case GenTreeOperator.Mul:
                             EmitThreeAddress(ArmInstrKind.Mul, destination, left, right, size);
                             return;
-                        case BytecodeOp.And:
+                        case GenTreeOperator.And:
                             EmitThreeAddress(ArmInstrKind.And, destination, left, right, size);
                             return;
-                        case BytecodeOp.Or:
+                        case GenTreeOperator.Or:
                             EmitThreeAddress(ArmInstrKind.Orr, destination, left, right, size);
                             return;
-                        case BytecodeOp.Xor:
+                        case GenTreeOperator.Xor:
                             EmitThreeAddress(ArmInstrKind.Eor, destination, left, right, size);
                             return;
-                        case BytecodeOp.Shl:
+                        case GenTreeOperator.Shl:
                             EmitThreeAddress(ArmInstrKind.Lsl, destination, left, right, size);
                             return;
-                        case BytecodeOp.Shr:
-                        case BytecodeOp.Shr_Un:
+                        case GenTreeOperator.Shr:
+                        case GenTreeOperator.ShrUn:
                             EmitThreeAddress(unsigned ? ArmInstrKind.Lsr : ArmInstrKind.Asr, destination, left, right, size);
                             return;
-                        case BytecodeOp.Div:
-                        case BytecodeOp.Div_Un:
+                        case GenTreeOperator.Div:
+                        case GenTreeOperator.DivUn:
                             EmitDivide(node, destination, left, right, size, unsigned);
                             return;
-                        case BytecodeOp.Rem:
-                        case BytecodeOp.Rem_Un:
+                        case GenTreeOperator.Rem:
+                        case GenTreeOperator.RemUn:
                             EmitRemainder(node, destination, left, right, size, unsigned);
                             return;
-                        case BytecodeOp.Ceq:
-                        case BytecodeOp.Clt:
-                        case BytecodeOp.Clt_Un:
-                        case BytecodeOp.Cgt:
-                        case BytecodeOp.Cgt_Un:
+                        case GenTreeOperator.Ceq:
+                        case GenTreeOperator.Clt:
+                        case GenTreeOperator.CltUn:
+                        case GenTreeOperator.Cgt:
+                        case GenTreeOperator.CgtUn:
                             _owner.Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(left, size), Reg(right, size)));
-                            EmitConditionSet(destination, IntegerCondition(node.SourceOp, unsigned));
+                            EmitConditionSet(destination, IntegerCondition(node.Operator, unsigned));
                             return;
-                        case BytecodeOp.Add_Ovf:
-                        case BytecodeOp.Add_Ovf_Un:
-                        case BytecodeOp.Sub_Ovf:
-                        case BytecodeOp.Sub_Ovf_Un:
-                        case BytecodeOp.Mul_Ovf:
-                        case BytecodeOp.Mul_Ovf_Un:
+                        case GenTreeOperator.AddOvf:
+                        case GenTreeOperator.AddOvfUn:
+                        case GenTreeOperator.SubOvf:
+                        case GenTreeOperator.SubOvfUn:
+                        case GenTreeOperator.MulOvf:
+                        case GenTreeOperator.MulOvfUn:
                             EmitCheckedIntegerBinary(node, destination, left, right, size);
                             return;
                         default:
-                            throw Unsupported(node, $"Unsupported integer binary opcode {node.SourceOp}");
+                            throw Unsupported(node, $"Unsupported integer binary opcode {node.Operator}");
                     }
                 }
 
@@ -3566,18 +3603,18 @@ namespace Cnidaria.Cs
                     ArmRegister right,
                     int size)
                 {
-                    bool unsigned = node.SourceOp is BytecodeOp.Add_Ovf_Un or BytecodeOp.Sub_Ovf_Un or BytecodeOp.Mul_Ovf_Un;
+                    bool unsigned = node.Operator is GenTreeOperator.AddOvfUn or GenTreeOperator.SubOvfUn or GenTreeOperator.MulOvfUn;
                     string overflow = _owner.CreateLocalLabel($"{_methodLabel}_overflow_{node.LinearId}");
                     string done = _owner.CreateLocalLabel($"{_methodLabel}_checked_done_{node.LinearId}");
 
-                    switch (node.SourceOp)
+                    switch (node.Operator)
                     {
-                        case BytecodeOp.Add_Ovf:
-                        case BytecodeOp.Add_Ovf_Un:
-                        case BytecodeOp.Sub_Ovf:
-                        case BytecodeOp.Sub_Ovf_Un:
+                        case GenTreeOperator.AddOvf:
+                        case GenTreeOperator.AddOvfUn:
+                        case GenTreeOperator.SubOvf:
+                        case GenTreeOperator.SubOvfUn:
                         {
-                            bool subtract = node.SourceOp is BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un;
+                            bool subtract = node.Operator is GenTreeOperator.SubOvf or GenTreeOperator.SubOvfUn;
                             _owner.Emit(ArmInstruction.Ternary(
                                 subtract ? ArmInstrKind.Subs : ArmInstrKind.Adds,
                                 Reg(destination, size),
@@ -3703,38 +3740,33 @@ namespace Cnidaria.Cs
                     ArmRegister a = ToArm(left);
                     ArmRegister b = ToArm(right);
 
-                    switch (node.SourceOp)
+                    switch (node.Operator)
                     {
-                        case BytecodeOp.Add:
-                        case BytecodeOp.Sub:
-                        case BytecodeOp.Mul:
-                        case BytecodeOp.Div:
+                        case GenTreeOperator.Add:
+                        case GenTreeOperator.Sub:
+                        case GenTreeOperator.Mul:
+                        case GenTreeOperator.Div:
                             {
-                                ArmInstrKind opcode = node.SourceOp switch
+                                ArmInstrKind opcode = node.Operator switch
                                 {
-                                    BytecodeOp.Add => ArmInstrKind.Fadd,
-                                    BytecodeOp.Sub => ArmInstrKind.Fsub,
-                                    BytecodeOp.Mul => ArmInstrKind.Fmul,
+                                    GenTreeOperator.Add => ArmInstrKind.Fadd,
+                                    GenTreeOperator.Sub => ArmInstrKind.Fsub,
+                                    GenTreeOperator.Mul => ArmInstrKind.Fmul,
                                     _ => ArmInstrKind.Fdiv,
                                 };
                                 _owner.Emit(ArmInstruction.Ternary(
                                     opcode, Reg(ToArm(destination), size), Reg(a, size), Reg(b, size)));
                                 return;
                             }
-                        case BytecodeOp.Ceq:
-                        case BytecodeOp.Clt:
-                        case BytecodeOp.Cgt:
+                        case GenTreeOperator.Ceq:
+                        case GenTreeOperator.Clt:
+                        case GenTreeOperator.Cgt:
+                        case GenTreeOperator.CltUn:
+                        case GenTreeOperator.CgtUn:
                             _owner.Emit(ArmInstruction.Binary(ArmInstrKind.Fcmp, Reg(a, size), Reg(b, size)));
-                            EmitConditionSet(
-                                GeneralRegister(destination),
-                                node.SourceOp switch
-                                {
-                                    BytecodeOp.Ceq => ArmCondition.Eq,
-                                    BytecodeOp.Clt => ArmCondition.Mi,
-                                    _ => ArmCondition.Gt,
-                                });
+                            EmitConditionSet(GeneralRegister(destination), FloatCompareCondition(node));
                             return;
-                        case BytecodeOp.Rem:
+                        case GenTreeOperator.Rem:
                         {
                             ArmRegister argument0 = ToArm(RegisterInfo.GetFloatArgumentRegister(Target, 0));
                             ArmRegister argument1 = ToArm(RegisterInfo.GetFloatArgumentRegister(Target, 1));
@@ -3763,7 +3795,7 @@ namespace Cnidaria.Cs
                             return;
                         }
                         default:
-                            throw Unsupported(node, $"Unsupported floating binary opcode {node.SourceOp}");
+                            throw Unsupported(node, $"Unsupported floating binary opcode {node.Operator}");
                     }
                 }
 
@@ -3813,7 +3845,7 @@ namespace Cnidaria.Cs
                                     return;
                                 }
                                 _owner.Emit(ArmInstruction.Binary(
-                                    IsUnsigned(sourceType) ? ArmInstrKind.Ucvtf : ArmInstrKind.Scvtf,
+                                    (node.ConvFlags & NumericConvFlags.SourceUnsigned) != 0 ? ArmInstrKind.Ucvtf : ArmInstrKind.Scvtf,
                                     Reg(ToArm(destination), destinationSize),
                                     Reg(GeneralRegister(source), OperationSize(sourceType, sourceKind))));
                                 return;
@@ -3874,7 +3906,7 @@ namespace Cnidaria.Cs
                     if (targetBits == 0)
                         return;
 
-                    bool sourceUnsigned = IsUnsigned(sourceType) || (node.ConvFlags & NumericConvFlags.SourceUnsigned) != 0;
+                    bool sourceUnsigned = (node.ConvFlags & NumericConvFlags.SourceUnsigned) != 0;
                     bool negativeIsOverflow = !sourceUnsigned && targetUnsigned;
                     bool highBitIsOverflow = sourceUnsigned && !targetUnsigned && targetBits == 64;
                     bool checksWidth = targetBits < 64;
@@ -3955,14 +3987,14 @@ namespace Cnidaria.Cs
                     _owner.Emit(ArmInstruction.Raw(word));
                 }
 
-                private static ArmCondition IntegerCondition(BytecodeOp op, bool unsigned)
+                private static ArmCondition IntegerCondition(GenTreeOperator op, bool unsigned)
                     => op switch
                     {
-                        BytecodeOp.Ceq => ArmCondition.Eq,
-                        BytecodeOp.Clt => unsigned ? ArmCondition.Lo : ArmCondition.Lt,
-                        BytecodeOp.Clt_Un => ArmCondition.Lo,
-                        BytecodeOp.Cgt => unsigned ? ArmCondition.Hi : ArmCondition.Gt,
-                        BytecodeOp.Cgt_Un => ArmCondition.Hi,
+                        GenTreeOperator.Ceq => ArmCondition.Eq,
+                        GenTreeOperator.Clt => unsigned ? ArmCondition.Lo : ArmCondition.Lt,
+                        GenTreeOperator.CltUn => ArmCondition.Lo,
+                        GenTreeOperator.Cgt => unsigned ? ArmCondition.Hi : ArmCondition.Gt,
+                        GenTreeOperator.CgtUn => ArmCondition.Hi,
                         _ => throw new ArgumentOutOfRangeException(nameof(op)),
                     };
 
@@ -3971,7 +4003,7 @@ namespace Cnidaria.Cs
                     string target = LabelForTarget(node);
                     bool branchWhenTrue = node.TreeKind == GenTreeKind.BranchTrue;
 
-                    if (node.Operands.Length == 2 && IsCompareOp(node.SourceOp))
+                    if (node.Operands.Length == 2 && IsCompareOp(node.Operator))
                     {
                         MachineRegister left = RequireUseRegisterForOperand(node, 0, "compare left operand");
                         RuntimeType? type = OperandType(node, 0);
@@ -3983,18 +4015,12 @@ namespace Cnidaria.Cs
                             int floatSize = StorageSize(type, kind);
                             _owner.Emit(ArmInstruction.Binary(
                                 ArmInstrKind.Fcmp, Reg(ToArm(left), floatSize), Reg(ToArm(right), floatSize)));
-                            ArmCondition floatCondition = node.SourceOp switch
-                            {
-                                BytecodeOp.Ceq => ArmCondition.Eq,
-                                BytecodeOp.Clt => ArmCondition.Mi,
-                                BytecodeOp.Cgt => ArmCondition.Gt,
-                                _ => throw Unsupported(node, $"Unsupported floating compare branch opcode {node.SourceOp}"),
-                            };
+                            ArmCondition floatCondition = FloatCompareCondition(node);
                             _owner.EmitConditionalJump(branchWhenTrue ? floatCondition : Invert(floatCondition), target);
                             return;
                         }
 
-                        bool unsigned = IsUnsigned(type) || node.SourceOp is BytecodeOp.Clt_Un or BytecodeOp.Cgt_Un;
+                        bool unsigned = node.Operator is GenTreeOperator.CltUn or GenTreeOperator.CgtUn;
                         int size = OperationSize(type, kind);
                         if (TryGetContainedIntegerImmediate(node, 1, out long immediate) && IsAddSubImmediate(immediate))
                         {
@@ -4018,7 +4044,7 @@ namespace Cnidaria.Cs
                                 ArmInstrKind.Cmp, Reg(GeneralRegister(left), size), Reg(rightRegister, size)));
                         }
 
-                        ArmCondition condition = IntegerCondition(node.SourceOp, unsigned);
+                        ArmCondition condition = IntegerCondition(node.Operator, unsigned);
                         _owner.EmitConditionalJump(branchWhenTrue ? condition : Invert(condition), target);
                         return;
                     }
@@ -4420,7 +4446,12 @@ namespace Cnidaria.Cs
                             EmitInterlocked(node, intrinsic.Exchange.Size, InterlockedKind.Exchange);
                             return;
                         case RuntimeIntrinsicId.MemoryBarrier:
+                        case RuntimeIntrinsicId.VolatileWrite:
                             EmitDataMemoryBarrier();
+                            return;
+                        case RuntimeIntrinsicId.VolatileRead:
+                            // dmb ishld orders the load before every later access
+                            _owner.Emit(ArmInstruction.Unary(ArmInstrKind.Dmb, ArmOperand.ImmediateOperand(0x9)));
                             return;
                         default:
                             throw Unsupported(node, $"Unsupported runtime intrinsic {intrinsic.Id}");
@@ -5312,6 +5343,10 @@ namespace Cnidaria.Cs
                     {
                         runtimeSymbol = ArmRuntime.NewStringFromCharSymbol;
                     }
+                    else if (parameters.Length == 1 && IsCharPointerType(parameters[0]))
+                    {
+                        runtimeSymbol = ArmRuntime.NewStringFromUtf16Symbol;
+                    }
                     else if (parameters.Length == 1 && IsCharArrayType(parameters[0]))
                     {
                         runtimeSymbol = ArmRuntime.NewStringFromCharArraySymbol;
@@ -5322,6 +5357,10 @@ namespace Cnidaria.Cs
                              IsInt32Type(parameters[2]))
                     {
                         runtimeSymbol = ArmRuntime.NewStringFromCharArrayRangeSymbol;
+                    }
+                    else if (parameters.Length == 1 && IsReadOnlyCharSpanType(parameters[0]))
+                    {
+                        runtimeSymbol = ArmRuntime.NewStringFromReadOnlySpanSymbol;
                     }
                     else
                     {
@@ -5350,6 +5389,17 @@ namespace Cnidaria.Cs
                     => type.Kind == RuntimeTypeKind.Array &&
                        type.ElementType is not null &&
                        IsCharType(type.ElementType);
+
+                private static bool IsCharPointerType(RuntimeType type)
+                    => type.Kind == RuntimeTypeKind.Pointer &&
+                       type.ElementType is not null &&
+                       IsCharType(type.ElementType);
+
+                private static bool IsReadOnlyCharSpanType(RuntimeType type)
+                    => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
+                       type.Name.StartsWith("ReadOnlySpan", StringComparison.Ordinal) &&
+                       type.GenericTypeArguments.Length == 1 &&
+                       IsCharType(type.GenericTypeArguments[0]);
 
                 private void EmitNewArray(GenTree node)
                 {
@@ -6228,6 +6278,8 @@ namespace Cnidaria.Cs
 
                 private RuntimeType BoxSourceRuntimeType(GenTree node)
                 {
+                    if (node.RuntimeType is not null)
+                        return node.RuntimeType;
                     if (!node.RegisterUses.IsDefaultOrEmpty)
                     {
                         RuntimeType? type = _method.GetValueInfo(node.RegisterUses[0]).Type;
@@ -6770,8 +6822,8 @@ namespace Cnidaria.Cs
                 private string Describe()
                     => $"Method M{_method.RuntimeMethod.MethodId} '{_method.RuntimeMethod.Name}'";
 
-                private static bool IsCompareOp(BytecodeOp op)
-                    => op is BytecodeOp.Ceq or BytecodeOp.Clt or BytecodeOp.Clt_Un or BytecodeOp.Cgt or BytecodeOp.Cgt_Un;
+                private static bool IsCompareOp(GenTreeOperator op)
+                    => op is GenTreeOperator.Ceq or GenTreeOperator.Clt or GenTreeOperator.CltUn or GenTreeOperator.Cgt or GenTreeOperator.CgtUn;
 
                 private static bool IsUnsignedConversion(NumericConvKind kind)
                     => kind is NumericConvKind.U1 or NumericConvKind.U2 or NumericConvKind.U4 or NumericConvKind.U8 or
@@ -6862,6 +6914,17 @@ namespace Cnidaria.Cs
                         RuntimePrimitiveKind.Int8 or RuntimePrimitiveKind.UInt8 or
                         RuntimePrimitiveKind.Int16 or RuntimePrimitiveKind.UInt16 or
                         RuntimePrimitiveKind.Int32 or RuntimePrimitiveKind.UInt32;
+
+                // fcmp reports unordered as C and V set, so Lt and Hi also hold for NaN operands.
+                private ArmCondition FloatCompareCondition(GenTree node) => node.Operator switch
+                {
+                    GenTreeOperator.Ceq => ArmCondition.Eq,
+                    GenTreeOperator.Clt => ArmCondition.Mi,
+                    GenTreeOperator.Cgt => ArmCondition.Gt,
+                    GenTreeOperator.CltUn => ArmCondition.Lt,
+                    GenTreeOperator.CgtUn => ArmCondition.Hi,
+                    _ => throw Unsupported(node, $"Unsupported floating compare opcode {node.Operator}"),
+                };
 
                 private static bool IsUnsigned(RuntimeType? type)
                     => type?.PrimitiveKind is

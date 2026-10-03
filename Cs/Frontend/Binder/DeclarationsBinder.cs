@@ -29,6 +29,7 @@ namespace Cnidaria.Cs
         private readonly Dictionary<SyntaxTree, Dictionary<SyntaxNode, Symbol>> _declByTree = new();
 
         private readonly Dictionary<(Symbol container, string name, int arity), NamedTypeSymbol> _typeCache = new();
+        private readonly Dictionary<NamedTypeSymbol, int> _extensionBlockCounts = new();
 
         private SyntaxTree? _topLevelTree;
         private SourceNamedTypeSymbol? _topLevelProgram;
@@ -92,16 +93,14 @@ namespace Cnidaria.Cs
             bool needsCctor = false;
             for (int i = 0; i < members.Length; i++)
             {
-                if (members[i] is not SourceFieldSymbol fs)
-                    continue;
-                if (!fs.IsStatic || fs.IsConst)
+                if (members[i] is not (SourceFieldSymbol { IsStatic: true, IsConst: false } or SourcePropertySymbol { IsStatic: true }))
                     continue;
 
-                var declRefs = fs.DeclaringSyntaxReferences;
+                var declRefs = members[i].DeclaringSyntaxReferences;
                 if (declRefs.IsDefaultOrEmpty)
                     continue;
 
-                if (declRefs[0].Node is VariableDeclaratorSyntax vd && vd.Initializer is not null)
+                if (declRefs[0].Node is VariableDeclaratorSyntax { Initializer: not null } or PropertyDeclarationSyntax { Initializer: not null })
                 {
                     needsCctor = true;
                     break;
@@ -135,16 +134,11 @@ namespace Cnidaria.Cs
             if (type.TypeKind is not (TypeKind.Class or TypeKind.Struct))
                 return;
             bool hasAnyInstanceCtor = false;
-            bool hasParameterlessInstanceCtor = false;
             var members = type.GetMembers();
             for (int i = 0; i < members.Length; i++)
             {
-                if (members[i] is MethodSymbol ms && ms.IsConstructor && !ms.IsStatic)
-                {
+                if (members[i] is MethodSymbol { IsConstructor: true, IsStatic: false })
                     hasAnyInstanceCtor = true;
-                    if (ms.Parameters.Length == 0)
-                        hasParameterlessInstanceCtor = true;
-                }
             }
             var voidType = _types.GetSpecialType(SpecialType.System_Void);
             if (type.TypeKind == TypeKind.Class)
@@ -157,13 +151,24 @@ namespace Cnidaria.Cs
                         parameters: ImmutableArray<ParameterSymbol>.Empty));
                 return;
             }
-            // Structs require a parameterless instance constructor symbol
-            if (!hasParameterlessInstanceCtor)
-                type.AddMember(new SynthesizedConstructorSymbol(
-                    containing: type,
-                    voidType: voidType,
-                    isStatic: false,
-                    parameters: ImmutableArray<ParameterSymbol>.Empty));
+            if (hasAnyInstanceCtor)
+                return;
+            // A struct has no implicit constructor to run field initializers, so one must be declared (CS8983).
+            for (int i = 0; i < members.Length; i++)
+            {
+                if (members[i] is not (SourceFieldSymbol { IsStatic: false } or SourcePropertySymbol { IsStatic: false }))
+                    continue;
+                var declRefs = members[i].DeclaringSyntaxReferences;
+                if (!declRefs.IsDefaultOrEmpty &&
+                    declRefs[0].Node is VariableDeclaratorSyntax { Initializer: not null } or PropertyDeclarationSyntax { Initializer: not null })
+                {
+                    _diagnostics.Add(new Diagnostic(
+                        "CN_STRUCTINIT001",
+                        DiagnosticSeverity.Error,
+                        "A 'struct' with field initializers must include an explicitly declared constructor.",
+                        new Location(declRefs[0].SyntaxTree, declRefs[0].Node.Span)));
+                }
+            }
         }
 
         private static void AddMemberToType(NamedTypeSymbol containingType, Symbol member)
@@ -197,7 +202,7 @@ namespace Cnidaria.Cs
             return string.Join(".", parts);
         }
         // Reuse predefined symbols while declaring core library types
-        private bool TryMapSpecialType(Symbol container, string name, int arity, TypeKind declaredKind, out NamedTypeSymbol special)
+        private bool TryMapSpecialType(Symbol container, string name, int arity, TypeKind declaredKind, Location location, out NamedTypeSymbol special)
         {
             special = null!;
             if (!_isCoreLibrary) return false;
@@ -240,7 +245,7 @@ namespace Cnidaria.Cs
                     id: "CN_CORELIB_0001",
                     severity: DiagnosticSeverity.Error,
                     message: $"Special type System.{name} must be declared as {special.TypeKind}, not {declaredKind}.",
-                    location: new Location(_topLevelTree ?? new SyntaxTree(default!, ""), default)));
+                    location: location));
             }
             return true;
         }
@@ -465,7 +470,7 @@ namespace Cnidaria.Cs
             }
             if (!_typeCache.TryGetValue(key, out var type))
             {
-                if (TryMapSpecialType(container, name, arity, kind, out var special))
+                if (TryMapSpecialType(container, name, arity, kind, new Location(tree, syntax.Span), out var special))
                 {
                     type = special;
                     _typeCache.Add(key, type);
@@ -517,6 +522,8 @@ namespace Cnidaria.Cs
             }
             if (isUnsafe && type is SourceNamedTypeSymbol unsafeSourceType)
                 unsafeSourceType.MarkUnsafe();
+            if (type is SpecialNamedTypeSymbol declaredSpecial)
+                declaredSpecial.SetDeclaredAccessibility(declaredAcc);
             if (kind == TypeKind.Class && isSealed)
             {
                 switch (type)
@@ -530,6 +537,8 @@ namespace Cnidaria.Cs
                         break;
                 }
             }
+            if (kind == TypeKind.Class && isAbstract && type is SourceNamedTypeSymbol abstractType)
+                abstractType.MarkAbstract();
             if (type is SourceNamedTypeSymbol srcType)
                 srcType.AddDeclaration(tree, syntax);
             RecordDeclared(tree, syntax, type);
@@ -584,6 +593,9 @@ namespace Cnidaria.Cs
 
                     case ConversionOperatorDeclarationSyntax cods:
                         DeclareConversionOperatorDeclaration(tree, cods, type);
+                        break;
+                    case ExtensionBlockDeclarationSyntax extensionBlock when type is NamedTypeSymbol extendingType:
+                        DeclareExtensionBlock(tree, extensionBlock, syntax, extendingType);
                         break;
                     default:
 
@@ -1009,6 +1021,386 @@ namespace Cnidaria.Cs
                     new Location(tree, syntax.Span)));
             }
         }
+        // Accessors carry the property's dispatch modifiers; instance interface accessors without a body are abstract.
+        private void SetAccessorDispatchFlags(
+            SyntaxTree tree,
+            SyntaxNode syntax,
+            SyntaxTokenList modifiers,
+            NamedTypeSymbol container,
+            bool isStatic,
+            Accessibility declaredAcc,
+            bool hasExpressionBody,
+            SourceMethodSymbol? getMethod,
+            AccessorDeclarationSyntax? getSyntax,
+            SourceMethodSymbol? setMethod,
+            AccessorDeclarationSyntax? setSyntax)
+        {
+            var isOverride = HasModifier(modifiers, SyntaxKind.OverrideKeyword);
+            var isAbstract = HasModifier(modifiers, SyntaxKind.AbstractKeyword);
+            var isVirtualKeyword = HasModifier(modifiers, SyntaxKind.VirtualKeyword);
+            var isSealed = HasModifier(modifiers, SyntaxKind.SealedKeyword);
+            ValidateSealedMethodModifier(tree, syntax, isStatic, isOverride, isAbstract, isVirtualKeyword, isSealed, "property");
+
+            bool isVirtual = isVirtualKeyword || isOverride || isAbstract;
+            bool isInterfaceInstance = container.TypeKind == TypeKind.Interface && !isStatic;
+            bool nonVirtual = declaredAcc == Accessibility.Private || isSealed;
+            Apply(getMethod, hasExpressionBody || HasBody(getSyntax));
+            Apply(setMethod, HasBody(setSyntax));
+
+            void Apply(SourceMethodSymbol? accessor, bool hasBody)
+            {
+                if (accessor is null)
+                    return;
+                if (isInterfaceInstance)
+                    accessor.SetDispatchFlags(isVirtual: !hasBody || !nonVirtual, isAbstract: !hasBody, isOverride: false, isSealed: false);
+                else
+                    accessor.SetDispatchFlags(isVirtual, isAbstract, isOverride, isSealed);
+            }
+            static bool HasBody(AccessorDeclarationSyntax? accessor)
+                => accessor is not null && (accessor.Body is not null || accessor.ExpressionBody is not null);
+        }
+        // Extension block members compile to static methods of the enclosing class; the nested '<G>$N' type keeps the block for metadata readers
+        private void DeclareExtensionBlock(SyntaxTree tree, ExtensionBlockDeclarationSyntax syntax, TypeDeclarationSyntax ownerSyntax, NamedTypeSymbol container)
+        {
+            if (container.ContainingSymbol is not NamespaceSymbol || container.Arity != 0 ||
+                !HasModifier(ownerSyntax.Modifiers, SyntaxKind.StaticKeyword))
+            {
+                _diagnostics.Add(new Diagnostic(
+                    "CN_EXT001",
+                    DiagnosticSeverity.Error,
+                    "Extension blocks must be declared in a non-generic, non-nested static class.",
+                    new Location(tree, syntax.Span)));
+                return;
+            }
+            if (syntax.ParameterList is not { Parameters.Count: 1 } parameterList)
+                return;
+
+            int ordinal = _extensionBlockCounts.TryGetValue(container, out int count) ? count : 0;
+            _extensionBlockCounts[container] = ordinal + 1;
+            string groupingName = $"<G>${ordinal}";
+            var receiverSyntax = parameterList.Parameters[0];
+            string receiverName = receiverSyntax.Identifier.ValueText ?? "";
+            var location = new Location(tree, syntax.Span);
+            var placeholder = new ErrorTypeSymbol("unbound-receiver", containing: null, ImmutableArray<Location>.Empty);
+
+            var grouping = new SourceNamedTypeSymbol(
+                groupingName, container, TypeKind.Class, syntax.TypeParameterList?.Parameters.Count ?? 0, Accessibility.Public);
+            grouping.SetDefaultBaseType(GetDefaultBaseType(TypeKind.Class));
+            grouping.SetTypeParameters(DeclareTypeParameters(tree, grouping, syntax.TypeParameterList));
+            grouping.MarkAbstract();
+            grouping.AddDeclaration(tree, syntax);
+            AddNestedTypeToType(container, grouping);
+            RecordDeclared(tree, syntax, grouping);
+
+            var marker = new SourceMethodSymbol(
+                name: "<Extension>$",
+                containing: grouping,
+                returnType: _types.GetSpecialType(SpecialType.System_Void),
+                typeParameters: ImmutableArray<TypeParameterSymbol>.Empty,
+                isStatic: false,
+                isConstructor: false,
+                isAsync: false,
+                locations: ImmutableArray.Create(location),
+                declaredAccessibility: Accessibility.Public);
+            marker.SetDispatchFlags(isVirtual: true, isAbstract: true, isOverride: false, isSealed: false);
+            marker.SetParameters(ImmutableArray.Create(CreateExtensionReceiver(tree, receiverSyntax, marker, placeholder)));
+            AddMemberToType(grouping, marker);
+
+            var block = new ExtensionBlockDeclaration(syntax, receiverSyntax, receiverName.Length != 0, groupingName, new SyntaxReference(tree, syntax));
+            foreach (var member in syntax.Members)
+            {
+                switch (member)
+                {
+                    case MethodDeclarationSyntax method:
+                        DeclareExtensionMethod(tree, method, container, block);
+                        break;
+                    case PropertyDeclarationSyntax property:
+                        DeclareExtensionProperty(tree, property, container, block);
+                        break;
+                    case OperatorDeclarationSyntax op:
+                        DeclareExtensionOperator(tree, op, container, block);
+                        break;
+                    default:
+                        _diagnostics.Add(new Diagnostic(
+                            "CN_EXT002",
+                            DiagnosticSeverity.Error,
+                            "Extension blocks may only declare methods, properties, and operators.",
+                            new Location(tree, member.Span)));
+                        break;
+                }
+            }
+        }
+
+        private sealed record ExtensionBlockDeclaration(
+            ExtensionBlockDeclarationSyntax Syntax,
+            ParameterSyntax ReceiverSyntax,
+            bool HasReceiverName,
+            string GroupingName,
+            SyntaxReference Reference);
+
+        private static ParameterSymbol CreateExtensionReceiver(SyntaxTree tree, ParameterSyntax receiverSyntax, Symbol owner, TypeSymbol placeholder)
+            => new ParameterSymbol(
+                name: receiverSyntax.Identifier.ValueText ?? "",
+                containing: owner,
+                type: placeholder,
+                locations: ImmutableArray.Create(new Location(tree, receiverSyntax.Span)),
+                isReadOnlyRef: IsReadOnlyByRefParameter(receiverSyntax),
+                refKind: GetParameterRefKind(receiverSyntax),
+                isScoped: IsScopedParameter(receiverSyntax));
+
+        private bool CheckExtensionMemberModifiers(SyntaxTree tree, SyntaxNode member, SyntaxTokenList modifiers, ExtensionBlockDeclaration block, bool isStatic)
+        {
+            if (HasModifier(modifiers, SyntaxKind.VirtualKeyword) || HasModifier(modifiers, SyntaxKind.AbstractKeyword) ||
+                HasModifier(modifiers, SyntaxKind.OverrideKeyword) || HasModifier(modifiers, SyntaxKind.SealedKeyword) ||
+                HasModifier(modifiers, SyntaxKind.ProtectedKeyword))
+            {
+                _diagnostics.Add(new Diagnostic(
+                    "CN_EXT003",
+                    DiagnosticSeverity.Error,
+                    "Extension members cannot be virtual, abstract, override, sealed, or protected.",
+                    new Location(tree, member.Span)));
+                return false;
+            }
+            if (!isStatic && !block.HasReceiverName)
+            {
+                _diagnostics.Add(new Diagnostic(
+                    "CN_EXT004",
+                    DiagnosticSeverity.Error,
+                    "An instance extension member requires a named receiver parameter.",
+                    new Location(tree, member.Span)));
+                return false;
+            }
+            return true;
+        }
+
+        private ImmutableArray<TypeParameterSymbol> DeclareExtensionTypeParameters(
+            SyntaxTree tree, Symbol owner, ExtensionBlockDeclaration block, TypeParameterListSyntax? ownList)
+        {
+            var blockList = block.Syntax.TypeParameterList;
+            int blockCount = blockList?.Parameters.Count ?? 0;
+            int ownCount = ownList?.Parameters.Count ?? 0;
+            var builder = ImmutableArray.CreateBuilder<TypeParameterSymbol>(blockCount + ownCount);
+            for (int i = 0; i < blockCount; i++)
+            {
+                var p = blockList!.Parameters[i];
+                builder.Add(new TypeParameterSymbol(p.Identifier.ValueText ?? "", owner, i, ImmutableArray.Create(new Location(tree, p.Span))));
+            }
+            for (int i = 0; i < ownCount; i++)
+            {
+                var p = ownList!.Parameters[i];
+                var tp = new TypeParameterSymbol(p.Identifier.ValueText ?? "", owner, blockCount + i, ImmutableArray.Create(new Location(tree, p.Span)));
+                builder.Add(tp);
+                RecordDeclared(tree, p, tp);
+            }
+            return builder.ToImmutable();
+        }
+
+        private SourceMethodSymbol CreateExtensionImplementation(
+            SyntaxTree tree,
+            string name,
+            NamedTypeSymbol container,
+            ExtensionBlockDeclaration block,
+            ExtensionMemberInfo info,
+            TypeSymbol returnType,
+            Accessibility accessibility,
+            SyntaxNode declaration,
+            TypeParameterListSyntax? ownTypeParameters,
+            bool isAsync,
+            bool isUnsafe,
+            bool isExtern)
+        {
+            var method = new SourceMethodSymbol(
+                name: name,
+                containing: container,
+                returnType: returnType,
+                typeParameters: default,
+                isStatic: true,
+                isConstructor: false,
+                isAsync: isAsync,
+                locations: ImmutableArray.Create(new Location(tree, declaration.Span)),
+                declaredAccessibility: accessibility,
+                isExtensionMethod: info.Kind == ExtensionMemberKind.Method && !info.IsStatic,
+                isUnsafe: isUnsafe || Binder.IsUnsafeContext(container),
+                isExtern: isExtern);
+            method.SetTypeParameters(DeclareExtensionTypeParameters(tree, method, block, ownTypeParameters));
+            method.SetExtensionMember(info);
+            method.AddDeclaration(new SyntaxReference(tree, declaration));
+            AddMemberToType(container, method);
+            return method;
+        }
+
+        private void DeclareExtensionMethod(SyntaxTree tree, MethodDeclarationSyntax syntax, NamedTypeSymbol container, ExtensionBlockDeclaration block)
+        {
+            var name = syntax.Identifier.ValueText ?? "";
+            bool isStatic = HasModifier(syntax.Modifiers, SyntaxKind.StaticKeyword);
+            if (!CheckExtensionMemberModifiers(tree, syntax, syntax.Modifiers, block, isStatic))
+                return;
+
+            var accessibility = DecodeDeclaredAccessibility(
+                syntax.Modifiers, GetDefaultTypeMemberAccessibility(container), allowProtected: false, allowInternal: true, diagLocation: new Location(tree, syntax.Span));
+            var info = new ExtensionMemberInfo(
+                ExtensionMemberKind.Method, name, isStatic, isSetter: false, block.Syntax.TypeParameterList?.Parameters.Count ?? 0, block.GroupingName, block.Reference);
+            var method = CreateExtensionImplementation(
+                tree, name, container, block, info,
+                new ErrorTypeSymbol("unbound-return", containing: null, ImmutableArray<Location>.Empty),
+                accessibility, syntax, syntax.TypeParameterList,
+                isAsync: HasModifier(syntax.Modifiers, SyntaxKind.AsyncKeyword),
+                isUnsafe: HasModifier(syntax.Modifiers, SyntaxKind.UnsafeKeyword),
+                isExtern: HasModifier(syntax.Modifiers, SyntaxKind.ExternKeyword));
+
+            var placeholder = new ErrorTypeSymbol("unbound-param", containing: null, ImmutableArray<Location>.Empty);
+            var parameters = ImmutableArray.CreateBuilder<ParameterSymbol>(syntax.ParameterList.Parameters.Count + 1);
+            if (!isStatic)
+                parameters.Add(CreateExtensionReceiver(tree, block.ReceiverSyntax, method, placeholder));
+            foreach (var p in syntax.ParameterList.Parameters)
+            {
+                var parameter = new ParameterSymbol(
+                    name: p.Identifier.ValueText ?? "",
+                    containing: method,
+                    type: placeholder,
+                    locations: ImmutableArray.Create(new Location(tree, p.Span)),
+                    isReadOnlyRef: IsReadOnlyByRefParameter(p),
+                    refKind: GetParameterRefKind(p),
+                    isScoped: IsScopedParameter(p),
+                    isParams: IsParamsParameter(p));
+                parameters.Add(parameter);
+                RecordDeclared(tree, p, parameter);
+            }
+            method.SetParameters(parameters.ToImmutable());
+            RecordDeclared(tree, syntax, method);
+        }
+
+        private void DeclareExtensionProperty(SyntaxTree tree, PropertyDeclarationSyntax syntax, NamedTypeSymbol container, ExtensionBlockDeclaration block)
+        {
+            var name = syntax.Identifier.ValueText ?? "";
+            bool isStatic = HasModifier(syntax.Modifiers, SyntaxKind.StaticKeyword);
+            if (name.Length == 0 || !CheckExtensionMemberModifiers(tree, syntax, syntax.Modifiers, block, isStatic))
+                return;
+
+            var declaredAcc = DecodeDeclaredAccessibility(
+                syntax.Modifiers, GetDefaultTypeMemberAccessibility(container), allowProtected: false, allowInternal: true, diagLocation: new Location(tree, syntax.Span));
+            AccessorDeclarationSyntax? getSyntax = null, setSyntax = null;
+            bool hasGet = syntax.ExpressionBody is not null;
+            bool hasSet = false;
+            bool hasAutoAccessor = false;
+            if (syntax.AccessorList is not null)
+            {
+                foreach (var accessor in syntax.AccessorList.Accessors)
+                {
+                    if (accessor.Kind == SyntaxKind.GetAccessorDeclaration)
+                    {
+                        hasGet = true;
+                        getSyntax ??= accessor;
+                    }
+                    else if (accessor.Kind is SyntaxKind.SetAccessorDeclaration or SyntaxKind.InitAccessorDeclaration)
+                    {
+                        hasSet = true;
+                        setSyntax ??= accessor;
+                    }
+                    hasAutoAccessor |= accessor.Body is null && accessor.ExpressionBody is null;
+                }
+            }
+            if (hasAutoAccessor || (!hasGet && !hasSet))
+            {
+                _diagnostics.Add(new Diagnostic(
+                    "CN_EXT005",
+                    DiagnosticSeverity.Error,
+                    "Extension properties must declare accessors with bodies; they have no storage of their own.",
+                    new Location(tree, syntax.Span)));
+                return;
+            }
+
+            int blockArity = block.Syntax.TypeParameterList?.Parameters.Count ?? 0;
+            bool unused = false;
+            var placeholder = new ErrorTypeSymbol("unbound-property", containing: null, ImmutableArray<Location>.Empty);
+            SourceMethodSymbol? getMethod = null, setMethod = null;
+            if (hasGet)
+            {
+                var accessibility = getSyntax is null ? declaredAcc : DecodeAccessorAccessibility(tree, getSyntax, declaredAcc, hasGet && hasSet, ref unused);
+                var info = new ExtensionMemberInfo(ExtensionMemberKind.Property, name, isStatic, isSetter: false, blockArity, block.GroupingName, block.Reference);
+                getMethod = CreateExtensionImplementation(
+                    tree, $"get_{name}", container, block, info, placeholder, accessibility, (SyntaxNode?)getSyntax ?? syntax, null,
+                    isAsync: false, isUnsafe: HasModifier(syntax.Modifiers, SyntaxKind.UnsafeKeyword), isExtern: false);
+                getMethod.SetParameters(isStatic
+                    ? ImmutableArray<ParameterSymbol>.Empty
+                    : ImmutableArray.Create(CreateExtensionReceiver(tree, block.ReceiverSyntax, getMethod, placeholder)));
+                if (getSyntax is not null)
+                    RecordDeclared(tree, getSyntax, getMethod);
+            }
+            if (hasSet)
+            {
+                var accessibility = setSyntax is null ? declaredAcc : DecodeAccessorAccessibility(tree, setSyntax, declaredAcc, hasGet && hasSet, ref unused);
+                var info = new ExtensionMemberInfo(ExtensionMemberKind.Property, name, isStatic, isSetter: true, blockArity, block.GroupingName, block.Reference);
+                setMethod = CreateExtensionImplementation(
+                    tree, $"set_{name}", container, block, info, _types.GetSpecialType(SpecialType.System_Void), accessibility, setSyntax!, null,
+                    isAsync: false, isUnsafe: HasModifier(syntax.Modifiers, SyntaxKind.UnsafeKeyword), isExtern: false);
+                var value = new ParameterSymbol("value", setMethod, placeholder, ImmutableArray.Create(new Location(tree, setSyntax!.Span)));
+                setMethod.SetParameters(isStatic
+                    ? ImmutableArray.Create(value)
+                    : ImmutableArray.Create(CreateExtensionReceiver(tree, block.ReceiverSyntax, setMethod, placeholder), value));
+                RecordDeclared(tree, setSyntax, setMethod);
+            }
+
+            var property = new SourcePropertySymbol(
+                name: name,
+                containing: container,
+                declaredTypeSyntax: syntax.Type,
+                placeholderType: placeholder,
+                isStatic: isStatic,
+                declaredAccessibility: declaredAcc,
+                hasGet: hasGet,
+                hasSet: hasSet,
+                getMethod: getMethod,
+                setMethod: setMethod,
+                location: new Location(tree, syntax.Span),
+                declarationRef: new SyntaxReference(tree, syntax));
+            getMethod?.SetAssociatedProperty(property);
+            setMethod?.SetAssociatedProperty(property);
+            // Only the accessors are members; the property is found through them
+            RecordDeclared(tree, syntax, property);
+        }
+
+        private void DeclareExtensionOperator(SyntaxTree tree, OperatorDeclarationSyntax syntax, NamedTypeSymbol container, ExtensionBlockDeclaration block)
+        {
+            if (!TryGetOperatorMetadataName(syntax, out var metadataName) || !HasModifier(syntax.Modifiers, SyntaxKind.StaticKeyword))
+            {
+                _diagnostics.Add(new Diagnostic(
+                    "CN_EXT006",
+                    DiagnosticSeverity.Error,
+                    "An extension operator must be a static operator.",
+                    new Location(tree, syntax.Span)));
+                return;
+            }
+            if (!CheckExtensionMemberModifiers(tree, syntax, syntax.Modifiers, block, isStatic: true))
+                return;
+
+            var accessibility = DecodeDeclaredAccessibility(
+                syntax.Modifiers, GetDefaultTypeMemberAccessibility(container), allowProtected: false, allowInternal: true, diagLocation: new Location(tree, syntax.Span));
+            var info = new ExtensionMemberInfo(
+                ExtensionMemberKind.Operator, metadataName, isStatic: true, isSetter: false, block.Syntax.TypeParameterList?.Parameters.Count ?? 0, block.GroupingName, block.Reference);
+            var method = CreateExtensionImplementation(
+                tree, metadataName, container, block, info,
+                new ErrorTypeSymbol("unbound-return", containing: null, ImmutableArray<Location>.Empty),
+                accessibility, syntax, null, isAsync: false, isUnsafe: HasModifier(syntax.Modifiers, SyntaxKind.UnsafeKeyword), isExtern: false);
+
+            var parameters = ImmutableArray.CreateBuilder<ParameterSymbol>(syntax.ParameterList.Parameters.Count);
+            foreach (var p in syntax.ParameterList.Parameters)
+            {
+                var parameter = new ParameterSymbol(
+                    name: p.Identifier.ValueText ?? "",
+                    containing: method,
+                    type: new ErrorTypeSymbol("unbound-param", containing: null, ImmutableArray<Location>.Empty),
+                    locations: ImmutableArray.Create(new Location(tree, p.Span)),
+                    isReadOnlyRef: IsReadOnlyByRefParameter(p),
+                    refKind: GetParameterRefKind(p),
+                    isScoped: IsScopedParameter(p));
+                parameters.Add(parameter);
+                RecordDeclared(tree, p, parameter);
+            }
+            method.SetParameters(parameters.ToImmutable());
+            RecordDeclared(tree, syntax, method);
+        }
+
         private void DeclareMethodDeclaration(SyntaxTree tree, MethodDeclarationSyntax syntax, NamedTypeSymbol container)
         {
             var name = syntax.Identifier.ValueText ?? "";
@@ -1026,24 +1418,26 @@ namespace Cnidaria.Cs
             var declaredAcc = DecodeDeclaredAccessibility(
                 syntax.Modifiers,
                 typeDefaultAcc,
-                allowProtected: container.TypeKind != TypeKind.Interface,
+                allowProtected: true,
                 allowInternal: true,
                 diagLocation: new Location(tree, syntax.Span));
 
             bool isVirtual = isVirtualKeyword || isOverride || isAbstract;
             if (container.TypeKind == TypeKind.Interface && !isStatic)
             {
-                if (syntax.Body is not null || syntax.ExpressionBody is not null)
+                var hasBody = syntax.Body is not null || syntax.ExpressionBody is not null;
+                var nonVirtual = declaredAcc == Accessibility.Private || isSealed;
+                if (!hasBody && nonVirtual)
                 {
                     _diagnostics.Add(new Diagnostic(
                         "CN_IFACE_DEFAULT001",
                         DiagnosticSeverity.Error,
-                        "Default interface method implementations are not supported.",
+                        "A private or sealed interface method must have a body.",
                         new Location(tree, syntax.Span)));
                 }
 
-                isAbstract = true;
-                isVirtual = true;
+                isAbstract = !hasBody;
+                isVirtual = !hasBody || !nonVirtual;
                 isOverride = false;
                 isSealed = false;
             }
@@ -1065,6 +1459,8 @@ namespace Cnidaria.Cs
                 isUnsafe: HasModifier(syntax.Modifiers, SyntaxKind.UnsafeKeyword) || Binder.IsUnsafeContext(container),
                 isExtern: isExtern);
 
+            if (syntax.ExplicitInterfaceSpecifier is not null)
+                method.MarkExplicitInterfaceDeclaration();
             method.SetDispatchFlags(isVirtual, isAbstract, isOverride, isSealed);
             var tps = DeclareTypeParameters(tree, method, syntax.TypeParameterList);
             method.SetTypeParameters(tps);
@@ -1137,7 +1533,7 @@ namespace Cnidaria.Cs
             ValidateSealedMethodModifier(tree, syntax, isStatic, isOverride, isAbstract, isVirtualKeyword, isSealed, "operator");
             var declaredAcc = DecodeDeclaredAccessibility(
                 syntax.Modifiers,
-                Accessibility.Private,
+                GetDefaultTypeMemberAccessibility(container),
                 allowProtected: true,
                 allowInternal: true,
                 diagLocation: new Location(tree, syntax.Span));
@@ -1157,6 +1553,8 @@ namespace Cnidaria.Cs
                 locations: ImmutableArray.Create(new Location(tree, syntax.Span)),
                 declaredAccessibility: declaredAcc);
 
+            if (syntax.ExplicitInterfaceSpecifier is not null)
+                method.MarkExplicitInterfaceDeclaration();
             method.SetDispatchFlags(isVirtual, isAbstract, isOverride, isSealed);
             method.SetTypeParameters(ImmutableArray<TypeParameterSymbol>.Empty);
 
@@ -1210,7 +1608,7 @@ namespace Cnidaria.Cs
 
             var declaredAcc = DecodeDeclaredAccessibility(
                 syntax.Modifiers,
-                Accessibility.Private,
+                GetDefaultTypeMemberAccessibility(container),
                 allowProtected: true,
                 allowInternal: true,
                 diagLocation: new Location(tree, syntax.Span));
@@ -1228,7 +1626,11 @@ namespace Cnidaria.Cs
                 locations: ImmutableArray.Create(new Location(tree, syntax.Span)),
                 declaredAccessibility: declaredAcc);
 
-            method.SetDispatchFlags(isVirtual: false, isAbstract: false, isOverride: false, isSealed: false);
+            if (syntax.ExplicitInterfaceSpecifier is not null)
+                method.MarkExplicitInterfaceDeclaration();
+            bool isConversionAbstract = HasModifier(syntax.Modifiers, SyntaxKind.AbstractKeyword);
+            bool isConversionVirtual = isConversionAbstract || HasModifier(syntax.Modifiers, SyntaxKind.VirtualKeyword);
+            method.SetDispatchFlags(isVirtual: isConversionVirtual, isAbstract: isConversionAbstract, isOverride: false, isSealed: false);
             method.SetTypeParameters(ImmutableArray<TypeParameterSymbol>.Empty);
 
             var ps = ImmutableArray.CreateBuilder<ParameterSymbol>(syntax.ParameterList.Parameters.Count);
@@ -1514,7 +1916,7 @@ namespace Cnidaria.Cs
             var declaredAcc = DecodeDeclaredAccessibility(
                 syntax.Modifiers,
                 typeDefaultAcc,
-                allowProtected: container.TypeKind != TypeKind.Interface,
+                allowProtected: true,
                 allowInternal: true,
                 diagLocation: new Location(tree, syntax.Span));
 
@@ -1629,6 +2031,14 @@ namespace Cnidaria.Cs
                 location: new Location(tree, syntax.Span),
                 declarationRef: new SyntaxReference(tree, syntax));
 
+            if (syntax.ExplicitInterfaceSpecifier is not null)
+            {
+                prop.MarkExplicitInterfaceDeclaration();
+                getMethod?.MarkExplicitInterfaceDeclaration();
+                setMethod?.MarkExplicitInterfaceDeclaration();
+            }
+            SetAccessorDispatchFlags(tree, syntax, syntax.Modifiers, container, isStatic, declaredAcc, syntax.ExpressionBody is not null,
+                getMethod, getAccessorSyntax, setMethod, setAccessorSyntax);
             getMethod?.SetAssociatedProperty(prop);
             setMethod?.SetAssociatedProperty(prop);
 
@@ -1711,7 +2121,7 @@ namespace Cnidaria.Cs
             var declaredAcc = DecodeDeclaredAccessibility(
                 syntax.Modifiers,
                 typeDefaultAcc,
-                allowProtected: container.TypeKind != TypeKind.Interface,
+                allowProtected: true,
                 allowInternal: true,
                 diagLocation: new Location(tree, syntax.Span));
             bool hasGet = false;
@@ -1833,6 +2243,14 @@ namespace Cnidaria.Cs
                 location: new Location(tree, syntax.Span),
                 declarationRef: new SyntaxReference(tree, syntax));
 
+            if (syntax.ExplicitInterfaceSpecifier is not null)
+            {
+                prop.MarkExplicitInterfaceDeclaration();
+                getMethod?.MarkExplicitInterfaceDeclaration();
+                setMethod?.MarkExplicitInterfaceDeclaration();
+            }
+            SetAccessorDispatchFlags(tree, syntax, syntax.Modifiers, container, isStatic, declaredAcc, syntax.ExpressionBody is not null,
+                getMethod, getAccessorSyntax, setMethod, setAccessorSyntax);
             getMethod?.SetAssociatedProperty(prop);
             setMethod?.SetAssociatedProperty(prop);
 

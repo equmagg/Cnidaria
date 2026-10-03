@@ -26,6 +26,10 @@ namespace System.Collections
             get;
         }
 
+        DictionaryEntry Entry
+        {
+            get;
+        }
     }
 
     public interface ICollection : IEnumerable
@@ -202,6 +206,29 @@ namespace System.Collections
 }
 namespace System.Collections.Generic
 {
+    internal sealed class GenericEmptyEnumerator<T> : IEnumerator<T>
+    {
+        public static readonly GenericEmptyEnumerator<T> Instance = new GenericEmptyEnumerator<T>();
+
+        private GenericEmptyEnumerator() { }
+
+        public bool MoveNext() => false;
+
+        public T Current
+        {
+            get
+            {
+                ThrowHelper.ThrowInvalidOperationException_InvalidOperation_EnumOpCantHappen();
+                return default!;
+            }
+        }
+
+        object? IEnumerator.Current => Current;
+
+        public void Reset() { }
+
+        public void Dispose() { }
+    }
     public class KeyNotFoundException : SystemException
     {
         public KeyNotFoundException()
@@ -259,6 +286,31 @@ namespace System.Collections.Generic
         bool Contains(T item);
         void CopyTo(T[] array, int arrayIndex);
         bool Remove(T item);
+    }
+    // An IList is an ordered collection of objects.  The exact ordering
+    // is up to the implementation of the list, ranging from a sorted
+    // order to insertion order.
+    public interface IList<T> : ICollection<T>
+    {
+        // The Item property provides methods to read and edit entries in the List.
+        T this[int index]
+        {
+            get;
+            set;
+        }
+
+        // Returns the index of a particular item, if it is in the list.
+        // Returns -1 if the item isn't in the list.
+        int IndexOf(T item);
+
+        // Inserts value into the list at position index.
+        // index must be non-negative and less than or equal to the
+        // number of elements in the list.  If index equals the number
+        // of items in the list, then value is appended to the end.
+        void Insert(int index, T item);
+
+        // Removes the item at position index.
+        void RemoveAt(int index);
     }
 
     public class List<T> : IEnumerable<T>, IEnumerable, IReadOnlyList<T>
@@ -951,6 +1003,18 @@ namespace System.Collections.Generic
             string IAlternateEqualityComparer<ReadOnlySpan<char>, string?>.Create(ReadOnlySpan<char> span) =>
                 span.ToString();
 
+            public override bool Equals(string? x, string? y) => string.Equals(x, y, StringComparison.OrdinalIgnoreCase);
+
+            bool IAlternateEqualityComparer<ReadOnlySpan<char>, string?>.Equals(ReadOnlySpan<char> alternate, string? other)
+            {
+                if (alternate.IsEmpty && other is null)
+                {
+                    return false;
+                }
+
+                return alternate.EqualsOrdinalIgnoreCase(other);
+            }
+
             public override int GetHashCode(string? obj)
             {
                 if (obj is null)
@@ -991,12 +1055,20 @@ namespace System.Collections.Generic
             _underlyingComparer = underlyingComparer;
         }
 
-        public virtual bool Equals(string? x, string? y)
+        public override bool Equals(string? x, string? y)
         {
             // This instance may have been deserialized into a class that doesn't guarantee
             // these parameters are non-null. Can't short-circuit the null checks.
 
             return string.Equals(x, y);
+        }
+
+        public override int GetHashCode(string? obj)
+        {
+            // This instance may have been deserialized into a class that doesn't guarantee
+            // these parameters are non-null. Can't short-circuit the null checks.
+
+            return obj?.GetNonRandomizedHashCode() ?? 0;
         }
 
         internal virtual RandomizedStringEqualityComparer GetRandomizedEqualityComparer()
@@ -1024,6 +1096,16 @@ namespace System.Collections.Generic
             int IAlternateEqualityComparer<ReadOnlySpan<char>, string?>.GetHashCode(ReadOnlySpan<char> span) =>
                 string.GetNonRandomizedHashCode(span);
 
+            bool IAlternateEqualityComparer<ReadOnlySpan<char>, string?>.Equals(ReadOnlySpan<char> alternate, string? other)
+            {
+                if (alternate.IsEmpty && other is null)
+                {
+                    return false;
+                }
+
+                return alternate.SequenceEqual(other);
+            }
+
             string IAlternateEqualityComparer<ReadOnlySpan<char>, string?>.Create(ReadOnlySpan<char> span) =>
                 span.ToString();
         }
@@ -1035,6 +1117,21 @@ namespace System.Collections.Generic
             }
 
             public override bool Equals(string? x, string? y) => string.Equals(x, y, StringComparison.OrdinalIgnoreCase);
+
+            public override int GetHashCode(string? obj) => obj is null ? 0 : obj.GetHashCodeOrdinalIgnoreCase();
+
+            int IAlternateEqualityComparer<ReadOnlySpan<char>, string?>.GetHashCode(ReadOnlySpan<char> span) =>
+                string.GetHashCodeOrdinalIgnoreCase(span);
+
+            bool IAlternateEqualityComparer<ReadOnlySpan<char>, string?>.Equals(ReadOnlySpan<char> alternate, string? other)
+            {
+                if (alternate.IsEmpty && other is null)
+                {
+                    return false;
+                }
+
+                return alternate.EqualsOrdinalIgnoreCase(other);
+            }
 
             string IAlternateEqualityComparer<ReadOnlySpan<char>, string?>.Create(ReadOnlySpan<char> span) =>
                 span.ToString();
@@ -1113,6 +1210,17 @@ namespace System.Collections.Generic
     {
         public NullableEqualityComparer() { }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public override bool Equals(T? x, T? y)
+        {
+            if (x.HasValue)
+            {
+                if (y.HasValue) return EqualityComparer<T>.Default.Equals(x.value, y.value);
+                return false;
+            }
+            if (y.HasValue) return false;
+            return true;
+        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public override int GetHashCode(T? obj) =>
             obj.GetHashCode();
     }
@@ -1137,6 +1245,12 @@ namespace System.Collections.Generic
     public sealed class EnumEqualityComparer<T> : EqualityComparer<T> where T : struct, Enum
     {
         public EnumEqualityComparer() { }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public override bool Equals(T x, T y)
+        {
+            return RuntimeHelpers.EnumEquals(x, y);
+        }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public override int GetHashCode(T obj) =>

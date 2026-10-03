@@ -13,6 +13,8 @@ public sealed class Binder
     private readonly Compilation _compilation;
     private readonly TypeCatalog _types = TypeCatalog.Instance;
     private readonly List<SemanticDiagnostic> _diagnostics = new();
+    private readonly Dictionary<VariableArrayType, BoundExpression> _variableLengths = new(ReferenceEqualityComparer.Instance);
+    private Scope? _lengthScope;
 
     private FunctionSymbol? _currentFunction;
     private Dictionary<string, LabelSymbol>? _currentLabels;
@@ -36,7 +38,7 @@ public sealed class Binder
         diagnostics.AddRange(semanticModel.Compilation.SemanticDiagnostics);
         diagnostics.AddRange(binder._diagnostics);
 
-        return new BoundTree(semanticModel, root, diagnostics.ToImmutable());
+        return new BoundTree(semanticModel, root, diagnostics.ToImmutable(), binder._variableLengths);
     }
 
     // Top-level members
@@ -78,6 +80,11 @@ public sealed class Binder
         _currentFunction = symbol;
         // Labels are function scoped and may be referenced before declaration
         _currentLabels = BuildLabelMap(syntax.Body);
+        if (symbol?.FunctionType is { } functionType)
+        {
+            foreach (var parameter in functionType.Parameters)
+                BindVariableLengths(parameter.Type);
+        }
 
         var body = BindCompoundStatement(syntax.Body);
         AnalyzeFunctionControlFlow(symbol, body);
@@ -154,7 +161,7 @@ public sealed class Binder
 
     private BoundDeclaration BindDeclaration(DeclarationSyntax syntax)
     {
-        var scope = _semanticModel.GetScope(syntax) ?? _compilation.GlobalScope;
+        var scope = ScopeOf(syntax) ?? _compilation.GlobalScope;
         var specifiers = DeclarationTypeParser.ParseSpecifiers(syntax.Specifiers, scope, _types);
         var declarators = ImmutableArray.CreateBuilder<BoundDeclarator>();
 
@@ -164,6 +171,8 @@ public sealed class Binder
             var type = symbol is TypedSymbol typed
                 ? typed.Type
                 : DeclaratorTypeBuilder.Build(declarator.Declarator, specifiers.BaseType, _types, scope);
+            BindVariableLengths(type);
+            ValidateVariablyModifiedDeclarator(declarator, symbol, specifiers.StorageClass, type, scope);
 
             var initializer = declarator.Initializer is not null
                 ? BindInitializer(declarator.Initializer, type)
@@ -184,6 +193,18 @@ public sealed class Binder
             declarators.ToImmutable());
     }
 
+
+    private void ValidateVariablyModifiedDeclarator(InitDeclaratorSyntax declarator, Symbol? symbol, StorageClass storageClass, QualifiedType type, Scope scope)
+    {
+        if (!ArrayType.IsVariablyModified(type))
+            return;
+
+        var span = declarator.Declarator.Identifier?.Span ?? SpanOf(declarator);
+        if (symbol is VariableSymbol && (scope.Parent is null || storageClass is StorageClass.Static or StorageClass.Extern or StorageClass.ThreadLocal))
+            Report("An object with static storage duration or linkage cannot have a variably modified type.", span);
+        else if (declarator.Initializer is not null && ArrayType.HasVariableSize(type))
+            Report("A variable length array cannot be initialized.", span);
+    }
 
     private void ValidateExplicitRegisterDeclarator(InitDeclaratorSyntax declarator, Symbol? symbol, StorageClass storageClass, QualifiedType type, Scope scope)
     {
@@ -404,16 +425,24 @@ public sealed class Binder
     private BoundStaticAssertDeclaration BindStaticAssertDeclaration(StaticAssertDeclarationSyntax syntax)
     {
         var condition = ApplyDefaultConversions(BindExpression(syntax.Condition));
-        if (!IsIntegerType(condition.Type))
-        {
-            Report(
-                "Static assertion expression must have integer type.",
-                SpanOf(syntax.Condition));
-        }
-
         BoundExpression? message = null;
         if (syntax.Message is not null)
             message = ApplyDefaultConversions(BindExpression(syntax.Message));
+
+        if (!IsIntegerType(condition.Type))
+        {
+            if (!condition.Type.IsError)
+                Report("Static assertion expression must have integer type.", SpanOf(syntax.Condition));
+        }
+        else if (!TryEvaluateIntegerConstantValue(condition, out var value))
+        {
+            Report("Static assertion expression must be an integer constant expression.", SpanOf(syntax.Condition));
+        }
+        else if (value == 0)
+        {
+            var text = syntax.Message is LiteralExpressionSyntax { LiteralToken.Value: string literal } ? ": " + literal : ".";
+            Report("Static assertion failed" + text, syntax.StaticAssertKeyword.Span);
+        }
 
         return new BoundStaticAssertDeclaration(syntax, condition, message);
     }
@@ -915,6 +944,9 @@ public sealed class Binder
             case SizeofExpressionSyntax sizeofExpression:
                 return BindSizeofExpression(sizeofExpression);
 
+            case OffsetofExpressionSyntax offsetof:
+                return BindOffsetofExpression(offsetof);
+
             case ParenthesizedExpressionSyntax parenthesized:
                 return new BoundParenthesizedExpression(
                     parenthesized,
@@ -978,7 +1010,9 @@ public sealed class Binder
 
             case SyntaxKind.StringLiteralToken:
             case SyntaxKind.Utf8StringLiteralToken:
-                type = new QualifiedType(_types.ArrayOf(_types.Builtin(BuiltinTypeKind.Char), null));
+                type = new QualifiedType(_types.ArrayOf(
+                    _types.Builtin(BuiltinTypeKind.Char),
+                    token.Value is string text ? System.Text.Encoding.UTF8.GetByteCount(text) + 1L : null));
                 constantValue = token.Value;
                 break;
 
@@ -1010,7 +1044,7 @@ public sealed class Binder
     private BoundExpression BindNameExpression(NameExpressionSyntax syntax)
     {
         var symbol = _semanticModel.GetSymbolInfo(syntax);
-        symbol ??= _semanticModel.GetScope(syntax)?.LookupOrdinary(syntax.IdentifierToken.Text);
+        symbol ??= ScopeOf(syntax)?.LookupOrdinary(syntax.IdentifierToken.Text);
 
         if (symbol is null)
         {
@@ -1379,7 +1413,7 @@ public sealed class Binder
 
     private BoundExpression BindCastExpression(CastExpressionSyntax syntax)
     {
-        var scope = _semanticModel.GetScope(syntax) ?? _compilation.GlobalScope;
+        var scope = ScopeOf(syntax) ?? _compilation.GlobalScope;
         var targetType = BindTypeName(syntax.TypeNameTokens, scope);
         var expression = ApplyDefaultConversions(BindExpression(syntax.Expression));
 
@@ -1390,7 +1424,7 @@ public sealed class Binder
     {
         QualifiedType operandType;
         BoundExpression? expression = null;
-        var scope = _semanticModel.GetScope(syntax) ?? _compilation.GlobalScope;
+        var scope = ScopeOf(syntax) ?? _compilation.GlobalScope;
 
         if (syntax.Expression is not null)
         {
@@ -1404,7 +1438,7 @@ public sealed class Binder
 
         var resultType = SizeType();
         object? constantValue = null;
-        if (!operandType.IsError)
+        if (!operandType.IsError && !ArrayType.HasVariableSize(operandType))
         {
             try
             {
@@ -1426,6 +1460,22 @@ public sealed class Binder
             constantValue);
     }
 
+    private BoundExpression BindOffsetofExpression(OffsetofExpressionSyntax syntax)
+    {
+        var scope = ScopeOf(syntax) ?? _compilation.GlobalScope;
+        var type = BindTypeName(syntax.TypeNameTokens, scope);
+        object? constantValue = null;
+        if (!type.IsError)
+        {
+            if (OffsetofEvaluator.TryEvaluate(type, syntax.MemberTokens, scope, _compilation.Options.Target, null, out var offset, out var error))
+                constantValue = offset;
+            else
+                Report(error, syntax.Keyword.Span);
+        }
+
+        return new BoundOffsetofExpression(syntax, SizeType(), constantValue);
+    }
+
     /// <summary>size_t for the target: the unsigned type as wide as a pointer (C11 6.5.3.4)</summary>
     private QualifiedType SizeType()
     {
@@ -1442,8 +1492,10 @@ public sealed class Binder
 
     private BoundExpression BindCompoundLiteralExpression(CompoundLiteralExpressionSyntax syntax)
     {
-        var scope = _semanticModel.GetScope(syntax) ?? _compilation.GlobalScope;
+        var scope = ScopeOf(syntax) ?? _compilation.GlobalScope;
         var type = BindTypeName(syntax.TypeNameTokens, scope);
+        if (ArrayType.HasVariableSize(type))
+            Report("A compound literal cannot have a variable length array type.", syntax.OpenParenToken.Span);
 
         var initializerList = syntax.InitializerList is not null
             ? (BoundInitializerList)BindInitializer(syntax.InitializerList, type)
@@ -1810,7 +1862,37 @@ public sealed class Binder
     }
 
     private QualifiedType BindTypeName(ImmutableArray<SyntaxToken> tokens, Scope scope)
-        => TypeNameParser.Parse(tokens, scope, _types) ?? ErrorType;
+    {
+        var type = TypeNameParser.Parse(tokens, scope, _types) ?? ErrorType;
+        BindVariableLengths(type);
+        return type;
+    }
+
+    private Scope? ScopeOf(SyntaxNode syntax)
+        => _semanticModel.GetScope(syntax) ?? _lengthScope;
+
+    private void BindVariableLengths(QualifiedType type)
+    {
+        for (var current = type.Type; current is not null;)
+        {
+            if (current is VariableArrayType variable && !_variableLengths.ContainsKey(variable))
+            {
+                var previous = _lengthScope;
+                _lengthScope = variable.LengthScope;
+                var length = ApplyDefaultConversions(BindExpression(variable.LengthSyntax));
+                _lengthScope = previous;
+                if (!IsIntegerType(length.Type) && !length.Type.IsError)
+                    Report("Array size must have integer type.", SpanOf(variable.LengthSyntax));
+                _variableLengths.Add(variable, length);
+            }
+            current = current switch
+            {
+                ArrayType array => array.ElementType.Type,
+                PointerType pointer => pointer.PointeeType.Type,
+                _ => null,
+            };
+        }
+    }
 
     private FunctionType? GetFunctionType(QualifiedType type)
     {
@@ -2781,6 +2863,9 @@ public sealed class Binder
             case BoundSizeofExpression sizeofExpression:
                 return TryConvertConstantToLong(sizeofExpression.ConstantValue, out value);
 
+            case BoundOffsetofExpression offsetof:
+                return TryConvertConstantToLong(offsetof.ConstantValue, out value);
+
             case BoundLiteralExpression literal:
                 return TryConvertConstantToLong(literal.ConstantValue, out value);
 
@@ -3118,6 +3203,9 @@ public sealed class Binder
 
             case SizeofExpressionSyntax sizeofExpression:
                 return sizeofExpression.Keyword.Span;
+
+            case OffsetofExpressionSyntax offsetof:
+                return offsetof.Keyword.Span;
 
             case ParenthesizedExpressionSyntax parenthesized:
                 return parenthesized.OpenParenToken.Span;

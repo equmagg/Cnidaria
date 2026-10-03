@@ -1119,12 +1119,6 @@ namespace Cnidaria.Cs
                         throw Unsupported(instruction, "unsupported frame operation " + instruction.FrameOperation);
                 }
             }
-            private static int UserStringRid(int token)
-            {
-                if (MetadataToken.Table(token) != MetadataToken.UserString)
-                    throw new InvalidOperationException($"ConstString expects UserString token, got 0x{token:X8}.");
-                return MetadataToken.Rid(token);
-            }
             private void EmitTree(GenTree instruction)
             {
                 var source = instruction;
@@ -1147,7 +1141,10 @@ namespace Cnidaria.Cs
                         _asm.LiNull(RequireResultRegister(instruction));
                         return;
                     case GenTreeKind.ConstString:
-                        _asm.LiString(RequireResultRegister(instruction), UserStringRid(source.Int32));
+                        _asm.LiString(RequireResultRegister(instruction), source.Text ?? string.Empty);
+                        return;
+                    case GenTreeKind.TypeHandle:
+                        _asm.LiI64(RequireResultRegister(instruction), (source.RuntimeType ?? throw new InvalidOperationException("Type handle without a type.")).TypeId);
                         return;
                     case GenTreeKind.DefaultValue:
                         EmitDefaultValue(instruction, source);
@@ -1188,7 +1185,7 @@ namespace Cnidaria.Cs
                         EmitConversion(instruction, source);
                         return;
                     case GenTreeKind.Branch:
-                        if (source.SourceOp == BytecodeOp.Leave)
+                        if (source.Operator == GenTreeOperator.Leave)
                         {
                             _asm.Leave(LabelForTarget(source));
                         }
@@ -1313,7 +1310,7 @@ namespace Cnidaria.Cs
             {
                 int sourceOffset = source.Int32;
                 int sourceLength = checked((int)source.Int64);
-                var staticData = _method.Function.StaticDataBlob;
+                var staticData = _method.StaticDataBlob;
 
                 if (sourceOffset < 0 || sourceLength < 0 || sourceOffset > staticData.Length || sourceLength > staticData.Length - sourceOffset)
                     throw Unsupported(instruction, "invalid static data blob range");
@@ -1701,9 +1698,9 @@ namespace Cnidaria.Cs
                 var kind = OperandStackKind(instruction, source, operandIndex: 0);
                 var type = OperandType(instruction, source, operandIndex: 0);
 
-                switch (source.SourceOp)
+                switch (source.Operator)
                 {
-                    case BytecodeOp.Neg:
+                    case GenTreeOperator.Neg:
                         EmitR(source, IsFloat32(type, kind, RequireSingleResult(instruction).RegisterClass)
                             ? Op.F32Neg
                             : IsFloat64(type, kind, RequireSingleResult(instruction).RegisterClass)
@@ -1712,18 +1709,18 @@ namespace Cnidaria.Cs
                                     ? Op.I64Neg
                                     : Op.I32Neg, rd, rs, MachineRegister.Invalid);
                         return;
-                    case BytecodeOp.Not:
+                    case GenTreeOperator.Not:
                         EmitR(source, Is64BitInteger(type, kind) ? Op.I64Not : Op.I32Not, rd, rs, MachineRegister.Invalid);
                         return;
-                    case BytecodeOp.FnPtrToPtr:
-                    case BytecodeOp.PtrToFnPtr:
+                    case GenTreeOperator.FnPtrToPtr:
+                    case GenTreeOperator.PtrToFnPtr:
                         _asm.MovPtr(rd, rs);
                         return;
-                    case BytecodeOp.PtrToByRef:
+                    case GenTreeOperator.PtrToByRef:
                         _asm.Emit(new InstrDesc(Op.PtrToByRef, RegisterVmIsa.EncodeRegister(rd), RegisterVmIsa.EncodeRegister(rs)));
                         return;
                     default:
-                        throw Unsupported(instruction, "unsupported unary opcode " + source.SourceOp);
+                        throw Unsupported(instruction, "unsupported unary opcode " + source.Operator);
                 }
             }
 
@@ -1736,12 +1733,12 @@ namespace Cnidaria.Cs
                 bool f32 = IsFloat32Value(type, kind);
                 bool f64 = IsFloat64Value(type, kind);
                 bool i64 = Is64BitInteger(type, kind);
-                bool unsigned = IsUnsignedInteger(type, kind) || source.SourceOp is BytecodeOp.Clt_Un or BytecodeOp.Cgt_Un or BytecodeOp.Div_Un or BytecodeOp.Rem_Un or BytecodeOp.Shr_Un or BytecodeOp.Add_Ovf_Un or BytecodeOp.Sub_Ovf_Un or BytecodeOp.Mul_Ovf_Un;
+                bool unsigned = source.Operator is GenTreeOperator.CltUn or GenTreeOperator.CgtUn or GenTreeOperator.DivUn or GenTreeOperator.RemUn or GenTreeOperator.ShrUn or GenTreeOperator.AddOvfUn or GenTreeOperator.SubOvfUn or GenTreeOperator.MulOvfUn;
 
                 if (TryGetContainedIntegerImmediate(instruction, 1, out long immediate))
                 {
                     if (f32 || f64 || kind is GenStackKind.Ref or GenStackKind.Null)
-                        throw Unsupported(instruction, "invalid contained immediate for non-integer binary opcode " + source.SourceOp);
+                        throw Unsupported(instruction, "invalid contained immediate for non-integer binary opcode " + source.Operator);
 
                     EmitBinaryImmediate(instruction, source, rd, a, immediate, i64, unsigned);
                     return;
@@ -1751,94 +1748,100 @@ namespace Cnidaria.Cs
                 Op op;
 
                 if (f32)
-                    op = source.SourceOp switch
+                    op = source.Operator switch
                     {
-                        BytecodeOp.Add => Op.F32Add,
-                        BytecodeOp.Sub => Op.F32Sub,
-                        BytecodeOp.Mul => Op.F32Mul,
-                        BytecodeOp.Div => Op.F32Div,
-                        BytecodeOp.Rem => Op.F32Rem,
-                        BytecodeOp.Ceq => Op.F32Eq,
-                        BytecodeOp.Clt => Op.F32Lt,
-                        BytecodeOp.Cgt => Op.F32Gt,
-                        _ => throw Unsupported(instruction, "unsupported f32 binary opcode " + source.SourceOp),
+                        GenTreeOperator.Add => Op.F32Add,
+                        GenTreeOperator.Sub => Op.F32Sub,
+                        GenTreeOperator.Mul => Op.F32Mul,
+                        GenTreeOperator.Div => Op.F32Div,
+                        GenTreeOperator.Rem => Op.F32Rem,
+                        GenTreeOperator.Ceq => Op.F32Eq,
+                        GenTreeOperator.Clt => Op.F32Lt,
+                        GenTreeOperator.Cgt => Op.F32Gt,
+                        GenTreeOperator.CltUn => Op.F32LtUn,
+                        GenTreeOperator.CgtUn => Op.F32GtUn,
+                        _ => throw Unsupported(instruction, "unsupported f32 binary opcode " + source.Operator),
                     };
                 else if (f64)
-                    op = source.SourceOp switch
+                    op = source.Operator switch
                     {
-                        BytecodeOp.Add => Op.F64Add,
-                        BytecodeOp.Sub => Op.F64Sub,
-                        BytecodeOp.Mul => Op.F64Mul,
-                        BytecodeOp.Div => Op.F64Div,
-                        BytecodeOp.Rem => Op.F64Rem,
-                        BytecodeOp.Ceq => Op.F64Eq,
-                        BytecodeOp.Clt => Op.F64Lt,
-                        BytecodeOp.Cgt => Op.F64Gt,
-                        _ => throw Unsupported(instruction, "unsupported f64 binary opcode " + source.SourceOp),
+                        GenTreeOperator.Add => Op.F64Add,
+                        GenTreeOperator.Sub => Op.F64Sub,
+                        GenTreeOperator.Mul => Op.F64Mul,
+                        GenTreeOperator.Div => Op.F64Div,
+                        GenTreeOperator.Rem => Op.F64Rem,
+                        GenTreeOperator.Ceq => Op.F64Eq,
+                        GenTreeOperator.Clt => Op.F64Lt,
+                        GenTreeOperator.Cgt => Op.F64Gt,
+                        GenTreeOperator.CltUn => Op.F64LtUn,
+                        GenTreeOperator.CgtUn => Op.F64GtUn,
+                        _ => throw Unsupported(instruction, "unsupported f64 binary opcode " + source.Operator),
                     };
                 else if (kind is GenStackKind.Ref or GenStackKind.Null)
-                    op = source.SourceOp switch
+                    op = source.Operator switch
                     {
-                        BytecodeOp.Ceq => Op.RefEq,
-                        _ => throw Unsupported(instruction, "unsupported reference binary opcode " + source.SourceOp),
+                        GenTreeOperator.Ceq => Op.RefEq,
+                        GenTreeOperator.CltUn => Op.U64Lt,
+                        GenTreeOperator.CgtUn => Op.U64Gt,
+                        _ => throw Unsupported(instruction, "unsupported reference binary opcode " + source.Operator),
                     };
                 else if (i64)
-                    op = source.SourceOp switch
+                    op = source.Operator switch
                     {
-                        BytecodeOp.Add => Op.I64Add,
-                        BytecodeOp.Add_Ovf => Op.I64AddOvf,
-                        BytecodeOp.Add_Ovf_Un => Op.U64AddOvf,
-                        BytecodeOp.Sub => Op.I64Sub,
-                        BytecodeOp.Sub_Ovf => Op.I64SubOvf,
-                        BytecodeOp.Sub_Ovf_Un => Op.U64SubOvf,
-                        BytecodeOp.Mul => Op.I64Mul,
-                        BytecodeOp.Mul_Ovf => Op.I64MulOvf,
-                        BytecodeOp.Mul_Ovf_Un => Op.U64MulOvf,
-                        BytecodeOp.Div => unsigned ? Op.U64Div : Op.I64Div,
-                        BytecodeOp.Div_Un => Op.U64Div,
-                        BytecodeOp.Rem => unsigned ? Op.U64Rem : Op.I64Rem,
-                        BytecodeOp.Rem_Un => Op.U64Rem,
-                        BytecodeOp.And => Op.I64And,
-                        BytecodeOp.Or => Op.I64Or,
-                        BytecodeOp.Xor => Op.I64Xor,
-                        BytecodeOp.Shl => Op.I64Shl,
-                        BytecodeOp.Shr => unsigned ? Op.U64Shr : Op.I64Shr,
-                        BytecodeOp.Shr_Un => Op.U64Shr,
-                        BytecodeOp.Ceq => Op.I64Eq,
-                        BytecodeOp.Clt => unsigned ? Op.U64Lt : Op.I64Lt,
-                        BytecodeOp.Clt_Un => Op.U64Lt,
-                        BytecodeOp.Cgt => unsigned ? Op.U64Gt : Op.I64Gt,
-                        BytecodeOp.Cgt_Un => Op.U64Gt,
-                        _ => throw Unsupported(instruction, "unsupported i64 binary opcode " + source.SourceOp),
+                        GenTreeOperator.Add => Op.I64Add,
+                        GenTreeOperator.AddOvf => Op.I64AddOvf,
+                        GenTreeOperator.AddOvfUn => Op.U64AddOvf,
+                        GenTreeOperator.Sub => Op.I64Sub,
+                        GenTreeOperator.SubOvf => Op.I64SubOvf,
+                        GenTreeOperator.SubOvfUn => Op.U64SubOvf,
+                        GenTreeOperator.Mul => Op.I64Mul,
+                        GenTreeOperator.MulOvf => Op.I64MulOvf,
+                        GenTreeOperator.MulOvfUn => Op.U64MulOvf,
+                        GenTreeOperator.Div => unsigned ? Op.U64Div : Op.I64Div,
+                        GenTreeOperator.DivUn => Op.U64Div,
+                        GenTreeOperator.Rem => unsigned ? Op.U64Rem : Op.I64Rem,
+                        GenTreeOperator.RemUn => Op.U64Rem,
+                        GenTreeOperator.And => Op.I64And,
+                        GenTreeOperator.Or => Op.I64Or,
+                        GenTreeOperator.Xor => Op.I64Xor,
+                        GenTreeOperator.Shl => Op.I64Shl,
+                        GenTreeOperator.Shr => unsigned ? Op.U64Shr : Op.I64Shr,
+                        GenTreeOperator.ShrUn => Op.U64Shr,
+                        GenTreeOperator.Ceq => Op.I64Eq,
+                        GenTreeOperator.Clt => unsigned ? Op.U64Lt : Op.I64Lt,
+                        GenTreeOperator.CltUn => Op.U64Lt,
+                        GenTreeOperator.Cgt => unsigned ? Op.U64Gt : Op.I64Gt,
+                        GenTreeOperator.CgtUn => Op.U64Gt,
+                        _ => throw Unsupported(instruction, "unsupported i64 binary opcode " + source.Operator),
                     };
                 else
-                    op = source.SourceOp switch
+                    op = source.Operator switch
                     {
-                        BytecodeOp.Add => Op.I32Add,
-                        BytecodeOp.Add_Ovf => Op.I32AddOvf,
-                        BytecodeOp.Add_Ovf_Un => Op.U32AddOvf,
-                        BytecodeOp.Sub => Op.I32Sub,
-                        BytecodeOp.Sub_Ovf => Op.I32SubOvf,
-                        BytecodeOp.Sub_Ovf_Un => Op.U32SubOvf,
-                        BytecodeOp.Mul => Op.I32Mul,
-                        BytecodeOp.Mul_Ovf => Op.I32MulOvf,
-                        BytecodeOp.Mul_Ovf_Un => Op.U32MulOvf,
-                        BytecodeOp.Div => unsigned ? Op.U32Div : Op.I32Div,
-                        BytecodeOp.Div_Un => Op.U32Div,
-                        BytecodeOp.Rem => unsigned ? Op.U32Rem : Op.I32Rem,
-                        BytecodeOp.Rem_Un => Op.U32Rem,
-                        BytecodeOp.And => Op.I32And,
-                        BytecodeOp.Or => Op.I32Or,
-                        BytecodeOp.Xor => Op.I32Xor,
-                        BytecodeOp.Shl => Op.I32Shl,
-                        BytecodeOp.Shr => unsigned ? Op.U32Shr : Op.I32Shr,
-                        BytecodeOp.Shr_Un => Op.U32Shr,
-                        BytecodeOp.Ceq => Op.I32Eq,
-                        BytecodeOp.Clt => unsigned ? Op.U32Lt : Op.I32Lt,
-                        BytecodeOp.Clt_Un => Op.U32Lt,
-                        BytecodeOp.Cgt => unsigned ? Op.U32Gt : Op.I32Gt,
-                        BytecodeOp.Cgt_Un => Op.U32Gt,
-                        _ => throw Unsupported(instruction, "unsupported i32 binary opcode " + source.SourceOp),
+                        GenTreeOperator.Add => Op.I32Add,
+                        GenTreeOperator.AddOvf => Op.I32AddOvf,
+                        GenTreeOperator.AddOvfUn => Op.U32AddOvf,
+                        GenTreeOperator.Sub => Op.I32Sub,
+                        GenTreeOperator.SubOvf => Op.I32SubOvf,
+                        GenTreeOperator.SubOvfUn => Op.U32SubOvf,
+                        GenTreeOperator.Mul => Op.I32Mul,
+                        GenTreeOperator.MulOvf => Op.I32MulOvf,
+                        GenTreeOperator.MulOvfUn => Op.U32MulOvf,
+                        GenTreeOperator.Div => unsigned ? Op.U32Div : Op.I32Div,
+                        GenTreeOperator.DivUn => Op.U32Div,
+                        GenTreeOperator.Rem => unsigned ? Op.U32Rem : Op.I32Rem,
+                        GenTreeOperator.RemUn => Op.U32Rem,
+                        GenTreeOperator.And => Op.I32And,
+                        GenTreeOperator.Or => Op.I32Or,
+                        GenTreeOperator.Xor => Op.I32Xor,
+                        GenTreeOperator.Shl => Op.I32Shl,
+                        GenTreeOperator.Shr => unsigned ? Op.U32Shr : Op.I32Shr,
+                        GenTreeOperator.ShrUn => Op.U32Shr,
+                        GenTreeOperator.Ceq => Op.I32Eq,
+                        GenTreeOperator.Clt => unsigned ? Op.U32Lt : Op.I32Lt,
+                        GenTreeOperator.CltUn => Op.U32Lt,
+                        GenTreeOperator.Cgt => unsigned ? Op.U32Gt : Op.I32Gt,
+                        GenTreeOperator.CgtUn => Op.U32Gt,
+                        _ => throw Unsupported(instruction, "unsupported i32 binary opcode " + source.Operator),
                     };
 
                 EmitR(source, op, rd, a, b);
@@ -1881,25 +1884,25 @@ namespace Cnidaria.Cs
             {
                 if (i64)
                 {
-                    switch (source.SourceOp)
+                    switch (source.Operator)
                     {
-                        case BytecodeOp.Add: _asm.I64AddImm(rd, a, value); return;
-                        case BytecodeOp.Sub: _asm.I64SubImm(rd, a, value); return;
-                        case BytecodeOp.Mul: _asm.I64MulImm(rd, a, value); return;
-                        case BytecodeOp.And: _asm.I64AndImm(rd, a, value); return;
-                        case BytecodeOp.Or: _asm.I64OrImm(rd, a, value); return;
-                        case BytecodeOp.Xor: _asm.I64XorImm(rd, a, value); return;
-                        case BytecodeOp.Shl: _asm.I64ShlImm(rd, a, unchecked((int)value)); return;
-                        case BytecodeOp.Shr: _asm.I64ShrImm(rd, a, unchecked((int)value)); return;
-                        case BytecodeOp.Shr_Un: _asm.U64ShrImm(rd, a, unchecked((int)value)); return;
-                        case BytecodeOp.Ceq: _asm.I64EqImm(rd, a, value); return;
-                        case BytecodeOp.Clt:
+                        case GenTreeOperator.Add: _asm.I64AddImm(rd, a, value); return;
+                        case GenTreeOperator.Sub: _asm.I64SubImm(rd, a, value); return;
+                        case GenTreeOperator.Mul: _asm.I64MulImm(rd, a, value); return;
+                        case GenTreeOperator.And: _asm.I64AndImm(rd, a, value); return;
+                        case GenTreeOperator.Or: _asm.I64OrImm(rd, a, value); return;
+                        case GenTreeOperator.Xor: _asm.I64XorImm(rd, a, value); return;
+                        case GenTreeOperator.Shl: _asm.I64ShlImm(rd, a, unchecked((int)value)); return;
+                        case GenTreeOperator.Shr: _asm.I64ShrImm(rd, a, unchecked((int)value)); return;
+                        case GenTreeOperator.ShrUn: _asm.U64ShrImm(rd, a, unchecked((int)value)); return;
+                        case GenTreeOperator.Ceq: _asm.I64EqImm(rd, a, value); return;
+                        case GenTreeOperator.Clt:
                             if (unsigned) _asm.U64LtImm(rd, a, unchecked((ulong)value));
                             else _asm.I64LtImm(rd, a, value);
                             return;
-                        case BytecodeOp.Clt_Un: _asm.U64LtImm(rd, a, unchecked((ulong)value)); return;
-                        case BytecodeOp.Cgt:
-                            if (unsigned) throw Unsupported(instruction, "unsupported unsigned greater-than immediate opcode " + source.SourceOp);
+                        case GenTreeOperator.CltUn: _asm.U64LtImm(rd, a, unchecked((ulong)value)); return;
+                        case GenTreeOperator.Cgt:
+                            if (unsigned) throw Unsupported(instruction, "unsupported unsigned greater-than immediate opcode " + source.Operator);
                             _asm.I64GtImm(rd, a, value);
                             return;
                     }
@@ -1907,31 +1910,31 @@ namespace Cnidaria.Cs
                 else
                 {
                     int imm = unchecked((int)value);
-                    switch (source.SourceOp)
+                    switch (source.Operator)
                     {
-                        case BytecodeOp.Add: _asm.I32AddImm(rd, a, imm); return;
-                        case BytecodeOp.Sub: _asm.I32SubImm(rd, a, imm); return;
-                        case BytecodeOp.Mul: _asm.I32MulImm(rd, a, imm); return;
-                        case BytecodeOp.And: _asm.I32AndImm(rd, a, imm); return;
-                        case BytecodeOp.Or: _asm.I32OrImm(rd, a, imm); return;
-                        case BytecodeOp.Xor: _asm.I32XorImm(rd, a, imm); return;
-                        case BytecodeOp.Shl: _asm.I32ShlImm(rd, a, imm); return;
-                        case BytecodeOp.Shr: _asm.I32ShrImm(rd, a, imm); return;
-                        case BytecodeOp.Shr_Un: _asm.U32ShrImm(rd, a, imm); return;
-                        case BytecodeOp.Ceq: _asm.I32EqImm(rd, a, imm); return;
-                        case BytecodeOp.Clt:
+                        case GenTreeOperator.Add: _asm.I32AddImm(rd, a, imm); return;
+                        case GenTreeOperator.Sub: _asm.I32SubImm(rd, a, imm); return;
+                        case GenTreeOperator.Mul: _asm.I32MulImm(rd, a, imm); return;
+                        case GenTreeOperator.And: _asm.I32AndImm(rd, a, imm); return;
+                        case GenTreeOperator.Or: _asm.I32OrImm(rd, a, imm); return;
+                        case GenTreeOperator.Xor: _asm.I32XorImm(rd, a, imm); return;
+                        case GenTreeOperator.Shl: _asm.I32ShlImm(rd, a, imm); return;
+                        case GenTreeOperator.Shr: _asm.I32ShrImm(rd, a, imm); return;
+                        case GenTreeOperator.ShrUn: _asm.U32ShrImm(rd, a, imm); return;
+                        case GenTreeOperator.Ceq: _asm.I32EqImm(rd, a, imm); return;
+                        case GenTreeOperator.Clt:
                             if (unsigned) _asm.U32LtImm(rd, a, unchecked((uint)imm));
                             else _asm.I32LtImm(rd, a, imm);
                             return;
-                        case BytecodeOp.Clt_Un: _asm.U32LtImm(rd, a, unchecked((uint)imm)); return;
-                        case BytecodeOp.Cgt:
-                            if (unsigned) throw Unsupported(instruction, "unsupported unsigned greater-than immediate opcode " + source.SourceOp);
+                        case GenTreeOperator.CltUn: _asm.U32LtImm(rd, a, unchecked((uint)imm)); return;
+                        case GenTreeOperator.Cgt:
+                            if (unsigned) throw Unsupported(instruction, "unsupported unsigned greater-than immediate opcode " + source.Operator);
                             _asm.I32GtImm(rd, a, imm);
                             return;
                     }
                 }
 
-                throw Unsupported(instruction, "unsupported contained-immediate binary opcode " + source.SourceOp);
+                throw Unsupported(instruction, "unsupported contained-immediate binary opcode " + source.Operator);
             }
 
             private void EmitConversion(GenTree instruction, GenTree source)
@@ -1944,7 +1947,7 @@ namespace Cnidaria.Cs
                 bool fromF64 = IsFloat64Value(fromType, fromKind);
                 bool fromI64 = fromKind == GenStackKind.I8 || Is64BitInteger(fromType, fromKind);
                 bool fromI32 = fromKind == GenStackKind.I4 || fromKind is GenStackKind.NativeInt or GenStackKind.NativeUInt;
-                bool fromUnsigned = IsUnsignedInteger(fromType, fromKind) || (source.ConvFlags & NumericConvFlags.SourceUnsigned) != 0;
+                bool fromUnsigned = (source.ConvFlags & NumericConvFlags.SourceUnsigned) != 0;
                 bool checkedConversion = (source.ConvFlags & NumericConvFlags.Checked) != 0;
 
                 switch (source.ConvKind)
@@ -2125,7 +2128,7 @@ namespace Cnidaria.Cs
 
             private void EmitConditionalBranch(GenTree instruction, GenTree source)
             {
-                if (instruction.Uses.Length == 2 && IsCompareOp(source.SourceOp))
+                if (instruction.Uses.Length == 2 && IsCompareOp(source.Operator))
                 {
                     EmitCompareBranch(instruction, source);
                     return;
@@ -2164,28 +2167,29 @@ namespace Cnidaria.Cs
 
                 Op op;
                 if (IsFloat32Value(type, kind))
-                    op = CompareBranchOp(instruction, source.SourceOp, branchWhenTrue, is64: false, unsigned: false, floating: true);
+                    op = CompareBranchOp(instruction, source.Operator, branchWhenTrue, is64: false, unsigned: false, floating: true);
                 else if (IsFloat64Value(type, kind))
-                    op = CompareBranchOp(instruction, source.SourceOp, branchWhenTrue, is64: true, unsigned: false, floating: true);
+                    op = CompareBranchOp(instruction, source.Operator, branchWhenTrue, is64: true, unsigned: false, floating: true);
                 else if (kind is GenStackKind.Ref or GenStackKind.Null or GenStackKind.ByRef)
                 {
-                    op = source.SourceOp switch
+                    op = source.Operator switch
                     {
-                        BytecodeOp.Ceq => branchWhenTrue ? Op.BrRefEq : Op.BrRefNe,
-                        _ => throw Unsupported(instruction, "unsupported reference compare branch opcode " + source.SourceOp),
+                        GenTreeOperator.Ceq => branchWhenTrue ? Op.BrRefEq : Op.BrRefNe,
+                        GenTreeOperator.CltUn or GenTreeOperator.CgtUn => CompareBranchOp(instruction, source.Operator, branchWhenTrue, is64: true, unsigned: true, floating: false),
+                        _ => throw Unsupported(instruction, "unsupported reference compare branch opcode " + source.Operator),
                     };
                 }
                 else
                 {
                     bool is64 = Is64BitBranchInteger(type, kind);
-                    bool unsigned = IsUnsignedInteger(type, kind) || source.SourceOp is BytecodeOp.Clt_Un or BytecodeOp.Cgt_Un;
-                    op = CompareBranchOp(instruction, source.SourceOp, branchWhenTrue, is64, unsigned, floating: false);
+                    bool unsigned = source.Operator is GenTreeOperator.CltUn or GenTreeOperator.CgtUn;
+                    op = CompareBranchOp(instruction, source.Operator, branchWhenTrue, is64, unsigned, floating: false);
                 }
 
                 _asm.Branch(op, left, right, target);
             }
 
-            private Op CompareBranchOp(GenTree instruction, BytecodeOp compareOp, bool branchWhenTrue, bool is64, bool unsigned, bool floating)
+            private Op CompareBranchOp(GenTree instruction, GenTreeOperator compareOp, bool branchWhenTrue, bool is64, bool unsigned, bool floating)
             {
                 if (floating)
                 {
@@ -2193,18 +2197,22 @@ namespace Cnidaria.Cs
                     {
                         return compareOp switch
                         {
-                            BytecodeOp.Ceq => branchWhenTrue ? Op.BrF64Eq : Op.BrF64Ne,
-                            BytecodeOp.Clt when branchWhenTrue => Op.BrF64Lt,
-                            BytecodeOp.Cgt when branchWhenTrue => Op.BrF64Gt,
+                            GenTreeOperator.Ceq => branchWhenTrue ? Op.BrF64Eq : Op.BrF64Ne,
+                            GenTreeOperator.Clt => branchWhenTrue ? Op.BrF64Lt : Op.BrF64GeUn,
+                            GenTreeOperator.Cgt => branchWhenTrue ? Op.BrF64Gt : Op.BrF64LeUn,
+                            GenTreeOperator.CltUn => branchWhenTrue ? Op.BrF64LtUn : Op.BrF64Ge,
+                            GenTreeOperator.CgtUn => branchWhenTrue ? Op.BrF64GtUn : Op.BrF64Le,
                             _ => throw Unsupported(instruction, "unsupported f64 compare branch opcode " + compareOp),
                         };
                     }
 
                     return compareOp switch
                     {
-                        BytecodeOp.Ceq => branchWhenTrue ? Op.BrF32Eq : Op.BrF32Ne,
-                        BytecodeOp.Clt when branchWhenTrue => Op.BrF32Lt,
-                        BytecodeOp.Cgt when branchWhenTrue => Op.BrF32Gt,
+                        GenTreeOperator.Ceq => branchWhenTrue ? Op.BrF32Eq : Op.BrF32Ne,
+                        GenTreeOperator.Clt => branchWhenTrue ? Op.BrF32Lt : Op.BrF32GeUn,
+                        GenTreeOperator.Cgt => branchWhenTrue ? Op.BrF32Gt : Op.BrF32LeUn,
+                        GenTreeOperator.CltUn => branchWhenTrue ? Op.BrF32LtUn : Op.BrF32Ge,
+                        GenTreeOperator.CgtUn => branchWhenTrue ? Op.BrF32GtUn : Op.BrF32Le,
                         _ => throw Unsupported(instruction, "unsupported f32 compare branch opcode " + compareOp),
                     };
                 }
@@ -2213,28 +2221,28 @@ namespace Cnidaria.Cs
                 {
                     return compareOp switch
                     {
-                        BytecodeOp.Ceq => branchWhenTrue ? Op.BrI64Eq : Op.BrI64Ne,
-                        BytecodeOp.Clt => branchWhenTrue ? (unsigned ? Op.BrU64Lt : Op.BrI64Lt) : (unsigned ? Op.BrU64Ge : Op.BrI64Ge),
-                        BytecodeOp.Clt_Un => branchWhenTrue ? Op.BrU64Lt : Op.BrU64Ge,
-                        BytecodeOp.Cgt => branchWhenTrue ? (unsigned ? Op.BrU64Gt : Op.BrI64Gt) : (unsigned ? Op.BrU64Le : Op.BrI64Le),
-                        BytecodeOp.Cgt_Un => branchWhenTrue ? Op.BrU64Gt : Op.BrU64Le,
+                        GenTreeOperator.Ceq => branchWhenTrue ? Op.BrI64Eq : Op.BrI64Ne,
+                        GenTreeOperator.Clt => branchWhenTrue ? (unsigned ? Op.BrU64Lt : Op.BrI64Lt) : (unsigned ? Op.BrU64Ge : Op.BrI64Ge),
+                        GenTreeOperator.CltUn => branchWhenTrue ? Op.BrU64Lt : Op.BrU64Ge,
+                        GenTreeOperator.Cgt => branchWhenTrue ? (unsigned ? Op.BrU64Gt : Op.BrI64Gt) : (unsigned ? Op.BrU64Le : Op.BrI64Le),
+                        GenTreeOperator.CgtUn => branchWhenTrue ? Op.BrU64Gt : Op.BrU64Le,
                         _ => throw Unsupported(instruction, "unsupported i64 compare branch opcode " + compareOp),
                     };
                 }
 
                 return compareOp switch
                 {
-                    BytecodeOp.Ceq => branchWhenTrue ? Op.BrI32Eq : Op.BrI32Ne,
-                    BytecodeOp.Clt => branchWhenTrue ? (unsigned ? Op.BrU32Lt : Op.BrI32Lt) : (unsigned ? Op.BrU32Ge : Op.BrI32Ge),
-                    BytecodeOp.Clt_Un => branchWhenTrue ? Op.BrU32Lt : Op.BrU32Ge,
-                    BytecodeOp.Cgt => branchWhenTrue ? (unsigned ? Op.BrU32Gt : Op.BrI32Gt) : (unsigned ? Op.BrU32Le : Op.BrI32Le),
-                    BytecodeOp.Cgt_Un => branchWhenTrue ? Op.BrU32Gt : Op.BrU32Le,
+                    GenTreeOperator.Ceq => branchWhenTrue ? Op.BrI32Eq : Op.BrI32Ne,
+                    GenTreeOperator.Clt => branchWhenTrue ? (unsigned ? Op.BrU32Lt : Op.BrI32Lt) : (unsigned ? Op.BrU32Ge : Op.BrI32Ge),
+                    GenTreeOperator.CltUn => branchWhenTrue ? Op.BrU32Lt : Op.BrU32Ge,
+                    GenTreeOperator.Cgt => branchWhenTrue ? (unsigned ? Op.BrU32Gt : Op.BrI32Gt) : (unsigned ? Op.BrU32Le : Op.BrI32Le),
+                    GenTreeOperator.CgtUn => branchWhenTrue ? Op.BrU32Gt : Op.BrU32Le,
                     _ => throw Unsupported(instruction, "unsupported i32 compare branch opcode " + compareOp),
                 };
             }
 
-            private static bool IsCompareOp(BytecodeOp op)
-                => op is BytecodeOp.Ceq or BytecodeOp.Clt or BytecodeOp.Clt_Un or BytecodeOp.Cgt or BytecodeOp.Cgt_Un;
+            private static bool IsCompareOp(GenTreeOperator op)
+                => op is GenTreeOperator.Ceq or GenTreeOperator.Clt or GenTreeOperator.CltUn or GenTreeOperator.Cgt or GenTreeOperator.CgtUn;
 
             private void EmitReturn(GenTree instruction, GenTree source)
             {
@@ -2724,14 +2732,21 @@ namespace Cnidaria.Cs
                 }
 
                 var value = RequireCallUse(instruction, 0, "string(ReadOnlySpan<char>) value");
-                if (!value.IsFrameSlot)
-                    throw Unsupported(instruction, "ReadOnlySpan<char> aggregate has no addressable home");
+                MachineRegister spanAddress;
+                if (value.IsFrameSlot)
+                {
+                    spanAddress = MachineRegisters.ParallelCopyScratch0;
+                    EmitAddressOf(spanAddress, value);
+                }
+                else
+                {
+                    spanAddress = MaterializeScalarAggregateHome(instruction, 0, spanType, StackKindOf(spanType), "string(ReadOnlySpan<char>) value", length);
+                }
 
-                EmitAddressOf(MachineRegisters.ParallelCopyScratch0, value);
                 _asm.Emit(InstrDesc.Mem(
                     Op.LdI4,
                     length,
-                    MachineRegisters.ParallelCopyScratch0,
+                    spanAddress,
                     lengthField.Offset,
                     aux: Aux.Memory(0, 2, MemoryBase.Register, MemoryFlags.NoNullCheck)));
             }
@@ -2804,6 +2819,10 @@ namespace Cnidaria.Cs
                                 _asm.Emit(InstrDesc.Call(intrinsicOp, method.MethodId, intrinsicFlags));
                                 return;
                             }
+                        case RuntimeIntrinsicId.VolatileRead:
+                        case RuntimeIntrinsicId.VolatileWrite:
+                            // The register VM runs one instruction at a time, so the ordering needs no instruction
+                            return;
                         case RuntimeIntrinsicId.MemoryBarrier:
                             {
                                 Op intrinsicOp = Op.CallInternalVoid;
@@ -3028,24 +3047,46 @@ namespace Cnidaria.Cs
                 }
 
                 MachineRegister value;
+                Op op = Op.BoxAddr;
                 if (instruction.Uses.Length == 1 && !IsAggregateStorage(instruction.Uses[0], boxedType, boxedKind))
                 {
                     value = RequireUseRegister(instruction, 0);
+                    op = Op.Box;
                 }
                 else if (instruction.Uses.Length == 1)
                 {
                     value = MaterializeAggregateAddress(instruction, 0, boxedType, boxedKind, "box source value");
+                }
+                else if (instruction.Uses.Length <= 3 && AllUsesAreRegisters(instruction))
+                {
+                    _asm.Emit(new InstrDesc(Op.BoxSegments, RegisterVmIsa.EncodeRegister(RequireResultRegister(instruction)),
+                        RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 0)),
+                        RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 1)),
+                        instruction.Uses.Length == 3 ? RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 2)) : RegisterVmIsa.InvalidRegister,
+                        aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow), imm: _asm.InternTypeLayout(boxedType)));
+                    return;
                 }
                 else
                 {
                     value = MaterializeMultiRegisterAggregateHome(instruction, 0, boxedType, boxedKind, "box source value");
                 }
 
-                _asm.Emit(new InstrDesc(Op.Box, RegisterVmIsa.EncodeRegister(RequireResultRegister(instruction)),
+                _asm.Emit(new InstrDesc(op, RegisterVmIsa.EncodeRegister(RequireResultRegister(instruction)),
                     RegisterVmIsa.EncodeRegister(value), aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow), imm: _asm.InternTypeLayout(boxedType)));
+            }
+            private static bool AllUsesAreRegisters(GenTree instruction)
+            {
+                for (int i = 0; i < instruction.Uses.Length; i++)
+                {
+                    if (!instruction.Uses[i].IsRegister)
+                        return false;
+                }
+                return true;
             }
             private RuntimeType BoxSourceRuntimeType(GenTree instruction, GenTree source)
             {
+                if (source.RuntimeType is not null)
+                    return source.RuntimeType;
                 if (!instruction.RegisterUses.IsDefaultOrEmpty)
                 {
                     var valueType = _method.GetValueInfo(instruction.RegisterUses[0]).Type;
@@ -4268,7 +4309,7 @@ namespace Cnidaria.Cs
                 if (source.Kind != GenTreeKind.Binary)
                     return true;
 
-                if (source.SourceOp is not (BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un))
+                if (source.Operator is not (GenTreeOperator.Div or GenTreeOperator.DivUn or GenTreeOperator.Rem or GenTreeOperator.RemUn))
                     return true;
 
                 return GenTreeArithmeticSemantics.DivRemCanThrow(source, _method.Target);
@@ -4707,11 +4748,6 @@ namespace Cnidaria.Cs
                    (TargetArchitecture.PointerSize == 8 && (kind is GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr or GenStackKind.ByRef)) ||
                    (TargetArchitecture.PointerSize == 8 && (type?.PrimitiveKind is RuntimePrimitiveKind.NativeInt or RuntimePrimitiveKind.NativeUInt));
 
-            private static bool IsUnsignedInteger(RuntimeType? type, GenStackKind kind)
-                => kind == GenStackKind.NativeUInt ||
-                   (type?.PrimitiveKind is RuntimePrimitiveKind.Boolean or RuntimePrimitiveKind.Char or RuntimePrimitiveKind.UInt8 or RuntimePrimitiveKind.UInt16 or RuntimePrimitiveKind.UInt32 or RuntimePrimitiveKind.UInt64 or RuntimePrimitiveKind.NativeUInt) ||
-                   (type?.Name is "Byte" or "UInt16" or "UInt32" or "UInt64" or "UIntPtr" or "Char" or "Boolean");
-
             private static RegisterClass RegisterClassForStorage(RuntimeType? type, GenStackKind kind)
             {
                 var abi = MachineAbi.ClassifyStorageValue(type, kind);
@@ -4978,21 +5014,7 @@ namespace Cnidaria.Cs
                     : Aux.Instruction(InstructionFlags.MayThrow);
 
 
-            private static GenStackKind StackKindOf(RuntimeType type)
-            {
-                if (type.IsReferenceType) return GenStackKind.Ref;
-                if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer) return GenStackKind.Ptr;
-                if (type.Kind == RuntimeTypeKind.ByRef) return GenStackKind.ByRef;
-                return type.Name switch
-                {
-                    "Single" => GenStackKind.R4,
-                    "Double" => GenStackKind.R8,
-                    "Int64" or "UInt64" => GenStackKind.I8,
-                    "IntPtr" => GenStackKind.NativeInt,
-                    "UIntPtr" => GenStackKind.NativeUInt,
-                    _ => GenStackKind.I4,
-                };
-            }
+            private static GenStackKind StackKindOf(RuntimeType type) => MachineAbi.StackKindForType(type);
 
             private int ComputeStaticConstructorTypeLayoutIndex(RuntimeMethod method)
             {

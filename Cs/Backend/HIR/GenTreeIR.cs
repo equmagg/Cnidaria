@@ -8,6 +8,56 @@ using System.Xml.Linq;
 
 namespace Cnidaria.Cs
 {
+    /// <summary>Controls overflow and signedness semantics for numeric conversion</summary>
+    [Flags]
+    internal enum NumericConvFlags : byte
+    {
+        None = 0,
+        Checked = 1 << 0,
+        SourceUnsigned = 1 << 1,
+    }
+    /// <summary>Identifies the destination representation of a numeric conversion</summary>
+    internal enum NumericConvKind : byte
+    {
+        I1,
+        U1,
+        I2,
+        U2,
+        I4,
+        U4,
+        I8,
+        U8,
+        R4,
+        R8,
+        Char,
+        Bool,
+        NativeInt,
+        NativeUInt
+    }
+    /// <summary>Describes one protected region and its handler range</summary>
+    /// <remarks>A zero catch type token denotes catch-all and a negative token denotes finally</remarks>
+    public readonly struct ExceptionHandler
+    {
+        /// <summary>Inclusive start of the protected instruction range</summary>
+        public readonly int TryStartPc;
+        /// <summary>Exclusive end of the protected instruction range</summary>
+        public readonly int TryEndPc;
+        /// <summary>Inclusive start of the handler instruction range</summary>
+        public readonly int HandlerStartPc;
+        /// <summary>Exclusive end of the handler instruction range</summary>
+        public readonly int HandlerEndPc;
+        /// <summary>Catch type token or the sentinel identifying handler kind</summary>
+        public readonly int CatchTypeToken;
+        /// <summary>Creates an exception handler from protected and handler instruction ranges</summary>
+        public ExceptionHandler(int tryStartPc, int tryEndPc, int handlerStartPc, int handlerEndPc, int catchTypeToken)
+        {
+            TryStartPc = tryStartPc;
+            TryEndPc = tryEndPc;
+            HandlerStartPc = handlerStartPc;
+            HandlerEndPc = handlerEndPc;
+            CatchTypeToken = catchTypeToken;
+        }
+    }
     internal enum GenStackKind : byte
     {
         Unknown,
@@ -40,6 +90,7 @@ namespace Cnidaria.Cs
         ConstR8Bits,
         ConstNull,
         ConstString,
+        TypeHandle,
         DefaultValue,
         SizeOf,
 
@@ -105,6 +156,41 @@ namespace Cnidaria.Cs
         Throw,
         Rethrow,
         EndFinally,
+    }
+    // Operator of Unary and Binary trees; Leave marks a Branch that exits protected regions.
+    internal enum GenTreeOperator : byte
+    {
+        None,
+        Add,
+        AddOvf,
+        AddOvfUn,
+        Sub,
+        SubOvf,
+        SubOvfUn,
+        Mul,
+        MulOvf,
+        MulOvfUn,
+        Div,
+        DivUn,
+        Rem,
+        RemUn,
+        And,
+        Or,
+        Xor,
+        Shl,
+        Shr,
+        ShrUn,
+        Ceq,
+        Clt,
+        CltUn,
+        Cgt,
+        CgtUn,
+        Neg,
+        Not,
+        PtrToByRef,
+        FnPtrToPtr,
+        PtrToFnPtr,
+        Leave,
     }
     internal static class GenTreeLirKinds
     {
@@ -731,6 +817,7 @@ namespace Cnidaria.Cs
             return type is not null &&
                    type.IsValueType &&
                    type.Kind == RuntimeTypeKind.Struct &&
+                   type.InlineArrayLength == 0 &&
                    type.InstanceFields.Length != 0;
         }
 
@@ -911,7 +998,7 @@ namespace Cnidaria.Cs
         public int Id { get; }
         public GenTreeKind Kind { get; internal set; }
         public int Pc { get; }
-        public BytecodeOp SourceOp { get; internal set; }
+        public GenTreeOperator Operator { get; internal set; }
         public RuntimeType? Type { get; internal set; }
         public GenStackKind StackKind { get; internal set; }
         public GenTreeFlags Flags { get; internal set; }
@@ -1027,7 +1114,7 @@ namespace Cnidaria.Cs
             int id,
             GenTreeKind kind,
             int pc,
-            BytecodeOp sourceOp,
+            GenTreeOperator oper,
             RuntimeType? type,
             GenStackKind stackKind,
             GenTreeFlags flags,
@@ -1056,7 +1143,7 @@ namespace Cnidaria.Cs
             Id = id;
             Kind = kind;
             Pc = pc;
-            SourceOp = sourceOp;
+            Operator = oper;
             Type = type;
             StackKind = stackKind;
             Flags = flags;
@@ -1274,15 +1361,15 @@ namespace Cnidaria.Cs
     }
     internal static class GenTreeArithmeticSemantics
     {
-        public static bool BinaryOperationCanThrow(BytecodeOp sourceOp, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands, TargetInfo target)
+        public static bool BinaryOperationCanThrow(GenTreeOperator oper, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands, TargetInfo target)
         {
-            if (sourceOp is BytecodeOp.Add_Ovf or BytecodeOp.Add_Ovf_Un
-                or BytecodeOp.Sub_Ovf or BytecodeOp.Sub_Ovf_Un
-                or BytecodeOp.Mul_Ovf or BytecodeOp.Mul_Ovf_Un)
+            if (oper is GenTreeOperator.AddOvf or GenTreeOperator.AddOvfUn
+                or GenTreeOperator.SubOvf or GenTreeOperator.SubOvfUn
+                or GenTreeOperator.MulOvf or GenTreeOperator.MulOvfUn)
                 return true;
 
-            if (sourceOp is BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un)
-                return DivRemCanThrow(sourceOp, type, stackKind, operands, target);
+            if (oper is GenTreeOperator.Div or GenTreeOperator.DivUn or GenTreeOperator.Rem or GenTreeOperator.RemUn)
+                return DivRemCanThrow(oper, type, stackKind, operands, target);
 
             return false;
         }
@@ -1294,9 +1381,9 @@ namespace Cnidaria.Cs
             return DivRemCanDivideByZero(node, target) || DivRemCanOverflow(node, target);
         }
 
-        public static bool DivRemCanThrow(BytecodeOp sourceOp, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands, TargetInfo target)
-            => DivRemCanDivideByZero(sourceOp, type, stackKind, operands, target) ||
-               DivRemCanOverflow(sourceOp, type, stackKind, operands, target);
+        public static bool DivRemCanThrow(GenTreeOperator oper, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands, TargetInfo target)
+            => DivRemCanDivideByZero(oper, type, stackKind, operands, target) ||
+               DivRemCanOverflow(oper, type, stackKind, operands, target);
 
         public static bool DivRemCanDivideByZero(GenTree node, TargetInfo target)
         {
@@ -1304,7 +1391,7 @@ namespace Cnidaria.Cs
                 return false;
             if ((node.Flags & GenTreeFlags.DivModNoByZero) != 0)
                 return false;
-            return DivRemCanDivideByZero(node.SourceOp, node.Type, node.StackKind, node.Operands, target);
+            return DivRemCanDivideByZero(node.Operator, node.Type, node.StackKind, node.Operands, target);
         }
 
         public static bool DivRemCanOverflow(GenTree node, TargetInfo target)
@@ -1313,12 +1400,12 @@ namespace Cnidaria.Cs
                 return false;
             if ((node.Flags & GenTreeFlags.DivModNoOverflow) != 0)
                 return false;
-            return DivRemCanOverflow(node.SourceOp, node.Type, node.StackKind, node.Operands, target);
+            return DivRemCanOverflow(node.Operator, node.Type, node.StackKind, node.Operands, target);
         }
 
-        private static bool DivRemCanDivideByZero(BytecodeOp sourceOp, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands, TargetInfo target)
+        private static bool DivRemCanDivideByZero(GenTreeOperator oper, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands, TargetInfo target)
         {
-            if (sourceOp is not (BytecodeOp.Div or BytecodeOp.Div_Un or BytecodeOp.Rem or BytecodeOp.Rem_Un) ||
+            if (oper is not (GenTreeOperator.Div or GenTreeOperator.DivUn or GenTreeOperator.Rem or GenTreeOperator.RemUn) ||
                 !IsIntegralArithmeticType(type, stackKind))
             {
                 return false;
@@ -1331,10 +1418,10 @@ namespace Cnidaria.Cs
             return !TryGetIntegralConstant(operands[1], bits, out _, out ulong unsignedDivisor) || unsignedDivisor == 0;
         }
 
-        private static bool DivRemCanOverflow(BytecodeOp sourceOp, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands, TargetInfo target)
+        private static bool DivRemCanOverflow(GenTreeOperator oper, RuntimeType? type, GenStackKind stackKind, ImmutableArray<GenTree> operands, TargetInfo target)
         {
-            if (sourceOp is BytecodeOp.Div_Un or BytecodeOp.Rem_Un ||
-                sourceOp is not (BytecodeOp.Div or BytecodeOp.Rem) ||
+            if (oper is GenTreeOperator.DivUn or GenTreeOperator.RemUn ||
+                oper is not (GenTreeOperator.Div or GenTreeOperator.Rem) ||
                 !IsIntegralArithmeticType(type, stackKind))
             {
                 return false;
@@ -1625,7 +1712,8 @@ namespace Cnidaria.Cs
         public RuntimeModule Module { get; }
         public RuntimeMethod RuntimeMethod { get; }
         public TargetInfo Target { get; }
-        public BytecodeFunction Function { get; }
+        public ImmutableArray<ExceptionHandler> ExceptionHandlers { get; }
+        public ImmutableArray<byte> StaticDataBlob { get; }
         public ImmutableArray<RuntimeType> ArgTypes { get; }
         public ImmutableArray<RuntimeType> LocalTypes { get; }
         public ImmutableArray<GenTemp> Temps { get; private set; }
@@ -1673,9 +1761,12 @@ namespace Cnidaria.Cs
             RuntimeModule module,
             RuntimeMethod runtimeMethod,
             TargetInfo target,
-            BytecodeFunction function,
+            ImmutableArray<ExceptionHandler> exceptionHandlers,
+            ImmutableArray<byte> staticDataBlob,
             ImmutableArray<RuntimeType> argTypes,
             ImmutableArray<RuntimeType> localTypes,
+            ImmutableArray<bool> addressExposedArgs,
+            ImmutableArray<bool> addressExposedLocals,
             ImmutableArray<GenTemp> temps,
             ImmutableArray<GenTreeBlock> blocks,
             ImmutableArray<RuntimeMethod> directDependencies,
@@ -1684,13 +1775,15 @@ namespace Cnidaria.Cs
             Module = module;
             RuntimeMethod = runtimeMethod;
             Target = target ?? throw new ArgumentNullException(nameof(target));
-            Function = function;
+            ExceptionHandlers = exceptionHandlers.IsDefault ? ImmutableArray<ExceptionHandler>.Empty : exceptionHandlers;
+            StaticDataBlob = staticDataBlob.IsDefault ? ImmutableArray<byte>.Empty : staticDataBlob;
             ArgTypes = argTypes.IsDefault ? ImmutableArray<RuntimeType>.Empty : argTypes;
             LocalTypes = localTypes.IsDefault ? ImmutableArray<RuntimeType>.Empty : localTypes;
             Temps = temps.IsDefault ? ImmutableArray<GenTemp>.Empty : temps;
-            ArgDescriptors = BuildArgDescriptors(ArgTypes);
-            LocalDescriptors = BuildLocalDescriptors(LocalTypes, ArgDescriptors.Length);
-            MarkAddressExposedFromBytecode(Function, ArgDescriptors, LocalDescriptors);
+            ArgDescriptors = BuildArgDescriptors(ArgTypes, Target);
+            LocalDescriptors = BuildLocalDescriptors(LocalTypes, ArgDescriptors.Length, Target);
+            MarkAddressExposed(ArgDescriptors, addressExposedArgs);
+            MarkAddressExposed(LocalDescriptors, addressExposedLocals);
             TempDescriptors = BuildTempDescriptors(Temps, ArgDescriptors.Length + LocalDescriptors.Length);
             AllLocalDescriptors = BuildAllLocalDescriptors(ArgDescriptors, LocalDescriptors, TempDescriptors);
             AttachLocalDescriptorsToTrees(blocks.IsDefault ? ImmutableArray<GenTreeBlock>.Empty : blocks);
@@ -1708,9 +1801,12 @@ namespace Cnidaria.Cs
                 Module,
                 RuntimeMethod,
                 Target,
-                Function,
+                ExceptionHandlers,
+                StaticDataBlob,
                 ArgTypes,
                 LocalTypes,
+                ImmutableArray<bool>.Empty,
+                ImmutableArray<bool>.Empty,
                 Temps,
                 blocks,
                 DirectDependencies,
@@ -1747,6 +1843,7 @@ namespace Cnidaria.Cs
             AllLocalDescriptors = AllLocalDescriptors.Add(descriptor);
             return descriptor;
 
+            // Promoted fields of struct temps are temporaries with descriptors but no GenTemp entry.
             int NextTempIndex()
             {
                 int max = -1;
@@ -1755,50 +1852,42 @@ namespace Cnidaria.Cs
                     if (Temps[i].Index > max)
                         max = Temps[i].Index;
                 }
+                for (int i = 0; i < AllLocalDescriptors.Length; i++)
+                {
+                    if (AllLocalDescriptors[i].Kind == GenLocalKind.Temporary && AllLocalDescriptors[i].Index > max)
+                        max = AllLocalDescriptors[i].Index;
+                }
                 return max + 1;
             }
         }
 
-        private static void MarkAddressExposedFromBytecode(
-            BytecodeFunction function,
-            ImmutableArray<GenLocalDescriptor> args,
-            ImmutableArray<GenLocalDescriptor> locals)
+        private static void MarkAddressExposed(ImmutableArray<GenLocalDescriptor> descriptors, ImmutableArray<bool> exposed)
         {
-            var instructions = function.Instructions;
-            for (int i = 0; i < instructions.Length; i++)
+            for (int i = 0; i < exposed.Length && i < descriptors.Length; i++)
             {
-                var ins = instructions[i];
-                if (ins.Op == BytecodeOp.Ldarga)
-                {
-                    if ((uint)ins.Operand0 < (uint)args.Length && GenTreeMethodBuilder.AddressUseMayEscape(instructions, i))
-                        args[ins.Operand0].MarkAddressExposed();
-                }
-                else if (ins.Op == BytecodeOp.Ldloca)
-                {
-                    if ((uint)ins.Operand0 < (uint)locals.Length && GenTreeMethodBuilder.AddressUseMayEscape(instructions, i))
-                        locals[ins.Operand0].MarkAddressExposed();
-                }
+                if (exposed[i])
+                    descriptors[i].MarkAddressExposed();
             }
         }
 
 
-        private static ImmutableArray<GenLocalDescriptor> BuildArgDescriptors(ImmutableArray<RuntimeType> args)
+        private static ImmutableArray<GenLocalDescriptor> BuildArgDescriptors(ImmutableArray<RuntimeType> args, TargetInfo target)
         {
             var builder = ImmutableArray.CreateBuilder<GenLocalDescriptor>(args.Length);
             for (int i = 0; i < args.Length; i++)
             {
-                var stackKind = StackKindForDescriptor(args[i]);
+                var stackKind = MachineAbi.StorageStackKind(args[i], target);
                 builder.Add(new GenLocalDescriptor(i, GenLocalKind.Argument, i, args[i], stackKind, GenLocalCategory.Unclassified));
             }
             return builder.ToImmutable();
         }
 
-        private static ImmutableArray<GenLocalDescriptor> BuildLocalDescriptors(ImmutableArray<RuntimeType> locals, int lclNumBase)
+        private static ImmutableArray<GenLocalDescriptor> BuildLocalDescriptors(ImmutableArray<RuntimeType> locals, int lclNumBase, TargetInfo target)
         {
             var builder = ImmutableArray.CreateBuilder<GenLocalDescriptor>(locals.Length);
             for (int i = 0; i < locals.Length; i++)
             {
-                var stackKind = StackKindForDescriptor(locals[i]);
+                var stackKind = MachineAbi.StorageStackKind(locals[i], target);
                 builder.Add(new GenLocalDescriptor(lclNumBase + i, GenLocalKind.Local, i, locals[i], stackKind, GenLocalCategory.Unclassified));
             }
             return builder.ToImmutable();
@@ -1853,18 +1942,6 @@ namespace Cnidaria.Cs
                     throw new InvalidOperationException("LclVarDsc table must be dense by lclNum.");
             }
             return builder.ToImmutable();
-        }
-
-        private static GenStackKind StackKindForDescriptor(RuntimeType type)
-        {
-            if (type.IsReferenceType) return GenStackKind.Ref;
-            if (type.Kind == RuntimeTypeKind.ByRef) return GenStackKind.ByRef;
-            if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer) return GenStackKind.Ptr;
-            if (type.Name == "Single") return GenStackKind.R4;
-            if (type.Name == "Double") return GenStackKind.R8;
-            if (type.SizeOf <= 4) return GenStackKind.I4;
-            if (type.SizeOf <= 8) return GenStackKind.I8;
-            return GenStackKind.Value;
         }
 
         internal void EnsurePromotedStructFieldLocals()
@@ -1926,7 +2003,7 @@ namespace Cnidaria.Cs
 
                         if (!TryFindExistingPromotedFieldDescriptor(descriptors, parent, field, out var fieldDescriptor))
                         {
-                            var stackKind = StackKindForDescriptor(field.FieldType);
+                            var stackKind = MachineAbi.StorageStackKind(field.FieldType, target);
                             fieldDescriptor = new GenLocalDescriptor(
                                 nextLclNum++,
                                 kind,
@@ -1982,7 +2059,7 @@ namespace Cnidaria.Cs
             {
                 if (type is null || !type.IsValueType || type.Kind != RuntimeTypeKind.Struct)
                     return false;
-                if (type.InstanceFields.Length == 0)
+                if (type.InlineArrayLength > 0 || type.InstanceFields.Length == 0)
                     return false;
                 return true;
             }
@@ -1991,7 +2068,7 @@ namespace Cnidaria.Cs
             {
                 if (field.IsStatic)
                     return false;
-                var stackKind = StackKindForDescriptor(field.FieldType);
+                var stackKind = MachineAbi.StorageStackKind(field.FieldType, target);
                 if (stackKind is GenStackKind.Void or GenStackKind.Unknown or GenStackKind.Value)
                     return false;
                 if (field.FieldType.IsValueType && field.FieldType.ContainsGcPointers)

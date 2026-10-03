@@ -133,6 +133,20 @@ namespace Cnidaria.Cs
                 };
             }
 
+            // The call kills the value's register, so the stack copy the following segment names already holds it while the call runs
+            private int StartIncludingSuspendingCall(RegisterOperand location, int previousStart, int start)
+            {
+                if (!IsFrameBacked(location))
+                    return start;
+                for (int i = _callerFrameSuspendingCallPositions.Length - 1; i >= 0; i--)
+                {
+                    int callPosition = _callerFrameSuspendingCallPositions[i];
+                    if (callPosition < start)
+                        return callPosition >= previousStart ? callPosition : start;
+                }
+                return start;
+            }
+
             private bool IsCallerFrameSuspendingCallPosition(int position)
             {
                 for (int i = 0; i < _callerFrameSuspendingCallPositions.Length; i++)
@@ -179,9 +193,12 @@ namespace Cnidaria.Cs
                             continue;
 
                         var translated = TranslateAllocationRange(segment.Start, segment.End);
-                        if (translated.Start < translated.End)
+                        int start = s == 0 || allocation.Segments[s - 1].End != segment.Start
+                            ? translated.Start
+                            : StartIncludingSuspendingCall(segment.Location, TranslateAllocationPosition(allocation.Segments[s - 1].Start), translated.Start);
+                        if (start < translated.End)
                             AddLiveRangeSlices(
-                                ranges, new RegisterGcLiveRoot(allocation.Value, rootKind, segment.Location, info.Type), translated.Start, translated.End);
+                                ranges, new RegisterGcLiveRoot(allocation.Value, rootKind, segment.Location, info.Type), start, translated.End);
                     }
                 }
 
@@ -548,7 +565,7 @@ namespace Cnidaria.Cs
                     _syntheticGcOwnerId++,
                     kind,
                     pc: -1,
-                    BytecodeOp.Nop,
+                    GenTreeOperator.None,
                     descriptor.Type,
                     descriptor.StackKind,
                     GenTreeFlags.LocalUse | GenTreeFlags.Ordered,
@@ -656,6 +673,18 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < _method.LinearNodes.Length; i++)
                 {
                     var node = _method.LinearNodes[i];
+                    // Reference newobj keeps the allocated object only in its result home while the constructor runs.
+                    if (node.TreeKind == GenTreeKind.NewObject &&
+                        node.Method?.DeclaringType.IsValueType == false &&
+                        node.Results.Length == 1 &&
+                        IsFrameBacked(node.Results[0]) &&
+                        node.RegisterResults.Length == 1 &&
+                        TryGetLinearPosition(node, out int newObjectPosition) &&
+                        _method.GenTreeMethod.ValueInfoByNode.TryGetValue(node.RegisterResults[0].LinearValueKey, out var newObjectInfo))
+                    {
+                        AddSafepointOperandRootRange(ranges, node.RegisterResults[0], newObjectInfo, node.Results[0], newObjectPosition);
+                    }
+
                     if (!node.HasLoweringFlag(GenTreeLinearFlags.GcSafePoint))
                         continue;
 
@@ -751,6 +780,9 @@ namespace Cnidaria.Cs
                             {
                                 var rootKind = GetStructGcRootKind(info.Type, gcOffset);
                                 var translated = TranslateAllocationRange(range.Start, range.End);
+                                int start = s == 0 || fragment.Segments[s - 1].End != range.Start
+                                    ? translated.Start
+                                    : StartIncludingSuspendingCall(range.Location, TranslateAllocationPosition(fragment.Segments[s - 1].Start), translated.Start);
                                 AddLiveRangeSlices(
                                     ranges,
                                     new RegisterGcLiveRoot(
@@ -759,7 +791,7 @@ namespace Cnidaria.Cs
                                         range.Location,
                                         info.Type,
                                         gcOffset - segmentStart),
-                                    translated.Start,
+                                    start,
                                     translated.End);
                             }
                         }
@@ -842,6 +874,8 @@ namespace Cnidaria.Cs
                     var fieldType = field.FieldType;
                     int fieldSize = Math.Max(1, fieldType.SizeOf);
                     int fieldStart = field.Offset;
+                    if (type.InlineArrayLength > 0 && ReferenceEquals(field, type.InlineArrayElementField) && gcOffset >= fieldStart)
+                        fieldStart += Math.Min((gcOffset - fieldStart) / fieldSize, type.InlineArrayLength - 1) * fieldSize;
                     int fieldEnd = checked(fieldStart + fieldSize);
                     if (gcOffset < fieldStart || gcOffset >= fieldEnd)
                         continue;

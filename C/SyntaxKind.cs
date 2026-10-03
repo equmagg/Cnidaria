@@ -263,6 +263,7 @@ public enum SyntaxKind : ushort
     ConditionalExpression,
     CastExpression,
     SizeofExpression,
+    OffsetofExpression,
     ParenthesizedExpression,
     CompoundLiteralExpression,
     GenericSelectionExpression,

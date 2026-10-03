@@ -307,7 +307,7 @@ namespace Cnidaria.Cs
             return target.PointerSize == 4 &&
                    node.Kind == GenTreeKind.Binary &&
                    node.StackKind == GenStackKind.I8 &&
-                   node.SourceOp is BytecodeOp.Shl or BytecodeOp.Shr or BytecodeOp.Shr_Un &&
+                   node.Operator is GenTreeOperator.Shl or GenTreeOperator.Shr or GenTreeOperator.ShrUn &&
                    (node.Operands.Length < 2 || !TryGetInt32Constant(node.Operands[1], out _));
         }
 
@@ -352,7 +352,7 @@ namespace Cnidaria.Cs
 
                 case GenTreeKind.Binary:
                     return GenTreeArithmeticSemantics.BinaryOperationCanThrow(
-                        node.SourceOp,
+                        node.Operator,
                         node.Type,
                         node.StackKind,
                         node.Operands,

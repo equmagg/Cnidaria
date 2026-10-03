@@ -191,7 +191,7 @@ namespace Cnidaria.Cs
             }
 
             store.Kind = GenTreeKind.Eval;
-            store.SourceOp = BytecodeOp.Pop;
+            store.Operator = GenTreeOperator.None;
             store.Type = null;
             store.StackKind = GenStackKind.Void;
             store.Flags = data.Flags & ~(GenTreeFlags.AssertionProperties | GenTreeFlags.MakeCse | GenTreeFlags.ExplicitInit);

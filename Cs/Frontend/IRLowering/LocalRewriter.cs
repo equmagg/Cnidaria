@@ -199,6 +199,7 @@ namespace Cnidaria.Cs
                 BoundBinaryExpression e => RewriteBinaryExpression(e),
                 BoundConditionalExpression e => RewriteConditionalExpression(e),
                 BoundUnboundCollectionExpression e => e,
+                BoundUnboundConditionalExpression e => throw new InvalidOperationException(e.NoNaturalType.Message),
                 BoundSpanCollectionExpression e => RewriteSpanCollectionExpression(e),
                 BoundAssignmentExpression e => RewriteAssignmentExpression(e),
                 BoundCompoundAssignmentExpression e => RewriteCompoundAssignmentExpression(e),
@@ -332,7 +333,7 @@ namespace Cnidaria.Cs
             var recv = node.ReceiverOpt is null ? null : RewriteExpression(node.ReceiverOpt);
             if (!ReferenceEquals(recv, node.ReceiverOpt))
                 return new BoundMemberAccessExpression(
-                    (ExpressionSyntax)node.Syntax, recv, node.Member, node.Type, node.IsLValue, node.ConstantValueOpt, node.HasErrors);
+                    (ExpressionSyntax)node.Syntax, recv, node.Member, node.Type, node.IsLValue, node.ConstantValueOpt, node.HasErrors, node.ConstrainedToTypeOpt);
             return node;
         }
         protected virtual BoundStatement RewriteCheckedStatement(BoundCheckedStatement node)
@@ -802,7 +803,7 @@ namespace Cnidaria.Cs
         {
             var initial = RewriteExpression(node.InitialValue);
             if (!ReferenceEquals(initial, node.InitialValue))
-                return new BoundClosureCellCreationExpression(node.Syntax, (NamedTypeSymbol)node.Type, node.ValueType, initial);
+                return new BoundClosureCellCreationExpression(node.Syntax, node.Type, node.ValueType, initial);
 
             return node;
         }
@@ -811,7 +812,7 @@ namespace Cnidaria.Cs
         {
             var cells = RewriteExpressions(node.Cells, out var changed);
             if (changed)
-                return new BoundClosureCreationExpression(node.Syntax, (NamedTypeSymbol)node.Type, cells);
+                return new BoundClosureCreationExpression(node.Syntax, node.Type, cells);
 
             return node;
         }
@@ -820,7 +821,7 @@ namespace Cnidaria.Cs
         {
             var closure = RewriteExpression(node.Closure);
             if (!ReferenceEquals(closure, node.Closure))
-                return new BoundClosureSlotExpression(node.Syntax, (NamedTypeSymbol)node.Type, closure, node.SlotIndex);
+                return new BoundClosureSlotExpression(node.Syntax, node.Type, closure, node.SlotIndex);
 
             return node;
         }
@@ -948,7 +949,7 @@ namespace Cnidaria.Cs
             var args = RewriteExpressions(node.Arguments, out var argsChanged);
 
             if (!ReferenceEquals(receiver, node.ReceiverOpt) || argsChanged)
-                return new BoundCallExpression(node.Syntax, receiver, node.Method, args);
+                return new BoundCallExpression(node.Syntax, receiver, node.Method, args, node.ConstrainedToTypeOpt);
 
             return node;
         }

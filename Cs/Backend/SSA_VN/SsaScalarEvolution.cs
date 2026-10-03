@@ -396,21 +396,21 @@ namespace Cnidaria.Cs
 
             ExitComparison comparison;
             bool unsigned;
-            switch (condition.SourceOp)
+            switch (condition.Operator)
             {
-                case BytecodeOp.Clt:
+                case GenTreeOperator.Clt:
                     comparison = ExitComparison.LessThan;
                     unsigned = false;
                     break;
-                case BytecodeOp.Clt_Un:
+                case GenTreeOperator.CltUn:
                     comparison = ExitComparison.LessThan;
                     unsigned = true;
                     break;
-                case BytecodeOp.Cgt:
+                case GenTreeOperator.Cgt:
                     comparison = ExitComparison.GreaterThan;
                     unsigned = false;
                     break;
-                case BytecodeOp.Cgt_Un:
+                case GenTreeOperator.CgtUn:
                     comparison = ExitComparison.GreaterThan;
                     unsigned = true;
                     break;
@@ -754,7 +754,7 @@ namespace Cnidaria.Cs
                     {
                         if (tree.Operands.Length != 2)
                             return null;
-                        if (tree.SourceOp is not (BytecodeOp.Add or BytecodeOp.Sub or BytecodeOp.Mul or BytecodeOp.Shl))
+                        if (tree.Operator is not (GenTreeOperator.Add or GenTreeOperator.Sub or GenTreeOperator.Mul or GenTreeOperator.Shl))
                             return null;
 
                         var left = AnalyzeTree(blockId, tree.Operands[0], depth + 1);
@@ -762,7 +762,7 @@ namespace Cnidaria.Cs
                         if (left is null || right is null)
                             return null;
 
-                        if (tree.SourceOp == BytecodeOp.Sub)
+                        if (tree.Operator == GenTreeOperator.Sub)
                         {
                             if (right.StackKind == GenStackKind.ByRef)
                                 return null;
@@ -770,11 +770,11 @@ namespace Cnidaria.Cs
                             right = NewBinary(ScevOper.Mul, right, minusOne);
                         }
 
-                        var oper = tree.SourceOp switch
+                        var oper = tree.Operator switch
                         {
-                            BytecodeOp.Add or BytecodeOp.Sub => ScevOper.Add,
-                            BytecodeOp.Mul => ScevOper.Mul,
-                            BytecodeOp.Shl => ScevOper.Lsh,
+                            GenTreeOperator.Add or GenTreeOperator.Sub => ScevOper.Add,
+                            GenTreeOperator.Mul => ScevOper.Mul,
+                            GenTreeOperator.Shl => ScevOper.Lsh,
                             _ => throw new InvalidOperationException(),
                         };
                         return NewBinaryWithType(oper, left, right, tree.Type, tree.StackKind);
@@ -905,7 +905,7 @@ namespace Cnidaria.Cs
             var data = GetDefinitionData(backedgeDescriptor);
             if (data is null)
                 return null;
-            if (data.Kind != GenTreeKind.Binary || data.SourceOp != BytecodeOp.Add || data.Operands.Length != 2)
+            if (data.Kind != GenTreeKind.Binary || data.Operator != GenTreeOperator.Add || data.Operands.Length != 2)
                 return null;
 
             GenTree? stepTree = null;

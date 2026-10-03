@@ -44,6 +44,97 @@ namespace Cnidaria.Cs
                 return IsNonNullableValueType(t);
             return t.IsReferenceType;
         }
+        /// <summary>Returns whether a type argument satisfies a substituted type constraint (identity, implicit reference, boxing, or type parameter conversion)</summary>
+        public static bool SatisfiesTypeConstraint(TypeSymbol argument, TypeSymbol constraint)
+        {
+            if (LocalScopeBinder.AreSameType(argument, constraint) || constraint.SpecialType == SpecialType.System_Object)
+                return true;
+
+            if (argument is TypeParameterSymbol typeParameter)
+                return IsSatisfiedByTypeParameter(typeParameter, constraint, new HashSet<TypeParameterSymbol>(ReferenceEqualityComparer<TypeParameterSymbol>.Instance));
+
+            // Nullable<T> boxes to ValueType and object only; it satisfies no interface constraint
+            if (IsSystemNullableValueType(argument))
+                return constraint.SpecialType == SpecialType.System_ValueType;
+
+            return ConvertsByReferenceOrBoxing(argument, constraint);
+        }
+        private static bool IsSatisfiedByTypeParameter(TypeParameterSymbol typeParameter, TypeSymbol constraint, HashSet<TypeParameterSymbol> visited)
+        {
+            if (!visited.Add(typeParameter))
+                return false;
+
+            if (constraint.SpecialType == SpecialType.System_ValueType &&
+                (typeParameter.GenericConstraint & GenericConstraintsFlags.StructConstraint) != 0)
+            {
+                return true;
+            }
+
+            foreach (var bound in typeParameter.ConstraintTypes)
+            {
+                if (LocalScopeBinder.AreSameType(bound, constraint))
+                    return true;
+                if (bound is TypeParameterSymbol other
+                    ? IsSatisfiedByTypeParameter(other, constraint, visited)
+                    : ConvertsByReferenceOrBoxing(bound, constraint))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        private static bool ConvertsByReferenceOrBoxing(TypeSymbol source, TypeSymbol target)
+        {
+            if (target is NamedTypeSymbol { TypeKind: TypeKind.Interface })
+                return ImplementsInterface(source, target, new HashSet<TypeSymbol>(ReferenceEqualityComparer<TypeSymbol>.Instance));
+
+            for (var current = source.BaseType; current is not null; current = current.BaseType)
+            {
+                if (LocalScopeBinder.AreSameType(current, target))
+                    return true;
+            }
+
+            // Array covariance between reference element types
+            return source is ArrayTypeSymbol sourceArray &&
+                   target is ArrayTypeSymbol targetArray &&
+                   sourceArray.Rank == targetArray.Rank &&
+                   sourceArray.IsSZArray == targetArray.IsSZArray &&
+                   sourceArray.ElementType.IsReferenceType &&
+                   targetArray.ElementType.IsReferenceType &&
+                   SatisfiesTypeConstraint(sourceArray.ElementType, targetArray.ElementType);
+        }
+        private static bool ImplementsInterface(TypeSymbol type, TypeSymbol iface, HashSet<TypeSymbol> visited)
+        {
+            if (!visited.Add(type))
+                return false;
+
+            foreach (var implemented in type.Interfaces)
+            {
+                if (LocalScopeBinder.AreSameType(implemented, iface) || ImplementsInterface(implemented, iface, visited))
+                    return true;
+            }
+            return type.BaseType is TypeSymbol baseType && ImplementsInterface(baseType, iface, visited);
+        }
+        /// <summary>Returns whether 'new T()' can construct a type argument</summary>
+        public static bool HasPublicParameterlessConstructor(TypeSymbol type)
+        {
+            if (type is TypeParameterSymbol typeParameter)
+            {
+                return (typeParameter.GenericConstraint &
+                    (GenericConstraintsFlags.ConstructorConstraint | GenericConstraintsFlags.StructConstraint)) != 0;
+            }
+            if (type.IsValueType)
+                return true;
+            if (type is not NamedTypeSymbol { TypeKind: TypeKind.Class } named || named.OriginalDefinition.IsAbstract)
+                return false;
+
+            foreach (var member in named.GetMembers())
+            {
+                if (member is MethodSymbol { IsConstructor: true, IsStatic: false } constructor && constructor.Parameters.Length == 0)
+                    return constructor.DeclaredAccessibility == Accessibility.Public;
+            }
+            return false;
+        }
         /// <summary>Returns whether a type has recursively unmanaged storage</summary>
         public static bool IsUnmanagedType(TypeSymbol t)
         {
@@ -119,14 +210,11 @@ namespace Cnidaria.Cs
             BindingContext context,
             DiagnosticBag diagnostics)
         {
-            var tps = constructedType.TypeParameters;
-            return CheckCore(
-                ownerDisplayName: constructedType.OriginalDefinition.Name,
-                typeParameters: tps,
-                typeArguments: typeArguments,
-                getArgSpan: getArgSpan,
-                context: context,
-                diagnostics: diagnostics);
+            if (context.DefersGenericConstraintChecks)
+                return true;
+
+            var tree = context.SemanticModel.SyntaxTree;
+            return CheckNamedType(constructedType, typeArguments, i => new Location(tree, getArgSpan(i)), context.Compilation.TypeManager, diagnostics);
         }
         /// <summary>Checks type arguments for a constructed method</summary>
         public static bool CheckMethodInstantiation(
@@ -136,27 +224,162 @@ namespace Cnidaria.Cs
             BindingContext context,
             DiagnosticBag diagnostics)
         {
-            var tps = methodDefinition.TypeParameters;
+            if (context.DefersGenericConstraintChecks)
+                return true;
+
+            var typeParameters = methodDefinition.TypeParameters;
+            // A method of a constructed type sees that type's arguments in its constraints
+            var map = methodDefinition.ContainingSymbol is SubstitutedNamedTypeSymbol containing
+                ? containing.SubstitutionMap
+                : ImmutableDictionary<TypeParameterSymbol, TypeSymbol>.Empty;
+            var tree = context.SemanticModel.SyntaxTree;
             return CheckCore(
-                ownerDisplayName: methodDefinition.Name,
-                typeParameters: tps,
-                typeArguments: typeArguments,
-                getArgSpan: getArgSpan,
-                context: context,
-                diagnostics: diagnostics);
+                methodDefinition.Name,
+                typeParameters,
+                typeArguments,
+                AddArguments(map, typeParameters, typeArguments),
+                i => new Location(tree, getArgSpan(i)),
+                context.Compilation.TypeManager,
+                diagnostics);
+        }
+        /// <summary>Checks every constructed type that a declared signature mentions</summary>
+        public static void CheckDeclarations(Compilation compilation, ImmutableArray<SyntaxTree> trees, DiagnosticBag diagnostics)
+        {
+            var types = compilation.TypeManager;
+            var seen = new HashSet<Symbol>(ReferenceEqualityComparer<Symbol>.Instance);
+            foreach (var tree in trees)
+            {
+                if (!compilation.DeclaredSymbolsByTree.TryGetValue(tree, out var declMap))
+                    continue;
+
+                foreach (var kv in declMap)
+                {
+                    var symbol = kv.Value;
+                    if (!seen.Add(symbol))
+                        continue;
+
+                    var location = symbol.Locations.IsDefaultOrEmpty ? new Location(tree, kv.Key.Span) : symbol.Locations[0];
+                    switch (symbol)
+                    {
+                        case NamedTypeSymbol type:
+                            if (type.BaseType is TypeSymbol baseType)
+                                CheckTypeDeep(baseType, location, types, diagnostics);
+                            foreach (var iface in type.Interfaces)
+                                CheckTypeDeep(iface, location, types, diagnostics);
+                            CheckConstraintTypes(type.TypeParameters, location, types, diagnostics);
+                            break;
+                        case MethodSymbol method:
+                            CheckTypeDeep(method.ReturnType, location, types, diagnostics);
+                            foreach (var parameter in method.Parameters)
+                                CheckTypeDeep(parameter.Type, location, types, diagnostics);
+                            CheckConstraintTypes(method.TypeParameters, location, types, diagnostics);
+                            break;
+                        case FieldSymbol field:
+                            CheckTypeDeep(field.Type, location, types, diagnostics);
+                            break;
+                        case PropertySymbol property:
+                            CheckTypeDeep(property.Type, location, types, diagnostics);
+                            foreach (var parameter in property.Parameters)
+                                CheckTypeDeep(parameter.Type, location, types, diagnostics);
+                            break;
+                    }
+                }
+            }
+        }
+        internal static void CheckConstraintTypes(ImmutableArray<TypeParameterSymbol> typeParameters, Location location, TypeManager types, DiagnosticBag diagnostics)
+        {
+            foreach (var typeParameter in typeParameters)
+            {
+                foreach (var constraint in typeParameter.ConstraintTypes)
+                    CheckTypeDeep(constraint, location, types, diagnostics);
+            }
+        }
+        /// <summary>Checks a type and every constructed type nested in it</summary>
+        internal static void CheckTypeDeep(TypeSymbol type, Location location, TypeManager types, DiagnosticBag diagnostics)
+        {
+            switch (type)
+            {
+                case ArrayTypeSymbol array:
+                    CheckTypeDeep(array.ElementType, location, types, diagnostics);
+                    break;
+                case PointerTypeSymbol pointer:
+                    CheckTypeDeep(pointer.PointedAtType, location, types, diagnostics);
+                    break;
+                case ByRefTypeSymbol byRef:
+                    CheckTypeDeep(byRef.ElementType, location, types, diagnostics);
+                    break;
+                case TupleTypeSymbol tuple:
+                    foreach (var element in tuple.ElementTypes)
+                        CheckTypeDeep(element, location, types, diagnostics);
+                    break;
+                case FunctionPointerTypeSymbol functionPointer:
+                    CheckTypeDeep(functionPointer.ReturnType, location, types, diagnostics);
+                    foreach (var parameter in functionPointer.Parameters)
+                        CheckTypeDeep(parameter.Type, location, types, diagnostics);
+                    break;
+                case SubstitutedNamedTypeSymbol named:
+                    if (named.ContainingTypeOpt is NamedTypeSymbol containing)
+                        CheckTypeDeep(containing, location, types, diagnostics);
+                    foreach (var argument in named.TypeArguments)
+                        CheckTypeDeep(argument, location, types, diagnostics);
+                    CheckNamedType(named, named.TypeArguments, _ => location, types, diagnostics);
+                    break;
+            }
+        }
+        private static bool CheckNamedType(
+            NamedTypeSymbol constructedType,
+            ImmutableArray<TypeSymbol> typeArguments,
+            Func<int, Location> getArgLocation,
+            TypeManager types,
+            DiagnosticBag diagnostics)
+        {
+            var typeParameters = constructedType.TypeParameters;
+            var map = constructedType is SubstitutedNamedTypeSymbol substituted
+                ? substituted.SubstitutionMap
+                : ImmutableDictionary<TypeParameterSymbol, TypeSymbol>.Empty;
+            return CheckCore(
+                constructedType.OriginalDefinition.Name,
+                typeParameters,
+                typeArguments,
+                AddArguments(map, typeParameters, typeArguments),
+                getArgLocation,
+                types,
+                diagnostics);
+        }
+        private static ImmutableDictionary<TypeParameterSymbol, TypeSymbol> AddArguments(
+            ImmutableDictionary<TypeParameterSymbol, TypeSymbol> map,
+            ImmutableArray<TypeParameterSymbol> typeParameters,
+            ImmutableArray<TypeSymbol> typeArguments)
+        {
+            if (typeParameters.IsDefaultOrEmpty || typeArguments.IsDefaultOrEmpty)
+                return map;
+
+            var builder = map.ToBuilder();
+            int n = Math.Min(typeParameters.Length, typeArguments.Length);
+            for (int i = 0; i < n; i++)
+                builder[typeParameters[i]] = typeArguments[i];
+            return builder.ToImmutable();
         }
         private static bool CheckCore(
             string ownerDisplayName,
             ImmutableArray<TypeParameterSymbol> typeParameters,
             ImmutableArray<TypeSymbol> typeArguments,
-            Func<int, TextSpan> getArgSpan,
-            BindingContext context,
+            ImmutableDictionary<TypeParameterSymbol, TypeSymbol> map,
+            Func<int, Location> getArgLocation,
+            TypeManager types,
             DiagnosticBag diagnostics)
         {
             if (typeParameters.IsDefaultOrEmpty || typeArguments.IsDefaultOrEmpty)
                 return true;
             int n = Math.Min(typeParameters.Length, typeArguments.Length);
             bool ok = true;
+
+            void Report(string id, int index, string message, DiagnosticSeverity severity = DiagnosticSeverity.Error)
+            {
+                if (severity == DiagnosticSeverity.Error)
+                    ok = false;
+                diagnostics.Add(new Diagnostic(id, severity, message, getArgLocation(index)));
+            }
 
             for (int i = 0; i < n; i++)
             {
@@ -169,63 +392,63 @@ namespace Cnidaria.Cs
                 if ((constraints & GenericConstraintsFlags.AllowsRefStruct) == 0
                     && RefLikeRestrictionFacts.ContainsRefLike(arg))
                 {
-                    ok = false;
-                    diagnostics.Add(new Diagnostic(
-                        id: "CN_GENCONSTR_BYREFLIKE",
-                        severity: DiagnosticSeverity.Error,
-                        message: $"Ref-like type '{arg.Name}' cannot be used as a type argument for '{tp.Name}' " +
-                        $"in '{ownerDisplayName}' unless '{tp.Name}' has 'allows ref struct'.",
-                        location: new Location(context.SemanticModel.SyntaxTree, getArgSpan(i))));
+                    Report("CN_GENCONSTR_BYREFLIKE", i,
+                        $"Ref-like type '{arg.Name}' cannot be used as a type argument for '{tp.Name}' " +
+                        $"in '{ownerDisplayName}' unless '{tp.Name}' has 'allows ref struct'.");
                 }
                 // Requires unmanaged storage
                 if ((constraints & GenericConstraintsFlags.UnmanagedConstraint) != 0
                     && !GenericConstraintFacts.IsUnmanagedType(arg))
                 {
-                    ok = false;
-                    diagnostics.Add(new Diagnostic(
-                        id: "CN_GENCONSTR_UNMANAGED",
-                        severity: DiagnosticSeverity.Error,
-                        message: $"The type '{arg.Name}' must be unmanaged to satisfy " +
-                        $"the 'unmanaged' constraint on '{tp.Name}' in '{ownerDisplayName}'.",
-                        location: new Location(context.SemanticModel.SyntaxTree, getArgSpan(i))));
+                    Report("CN_GENCONSTR_UNMANAGED", i,
+                        $"The type '{arg.Name}' must be unmanaged to satisfy " +
+                        $"the 'unmanaged' constraint on '{tp.Name}' in '{ownerDisplayName}'.");
                 }
                 if ((constraints & GenericConstraintsFlags.ClassConstraint) != 0
                     && !arg.IsReferenceType)
                 {
-                    ok = false;
-                    diagnostics.Add(new Diagnostic(
-                        id: "CN_GENCONSTR_CLASS",
-                        severity: DiagnosticSeverity.Error,
-                        message: $"The type '{arg.Name}' must be a reference type to satisfy " +
-                        $"the 'class' constraint on '{tp.Name}' in '{ownerDisplayName}'.",
-                        location: new Location(context.SemanticModel.SyntaxTree, getArgSpan(i))));
+                    Report("CN_GENCONSTR_CLASS", i,
+                        $"The type '{arg.Name}' must be a reference type to satisfy " +
+                        $"the 'class' constraint on '{tp.Name}' in '{ownerDisplayName}'.");
                 }
                 // Requires a non-nullable value type
                 if ((constraints & GenericConstraintsFlags.UnmanagedConstraint) == 0
                     && (constraints & GenericConstraintsFlags.StructConstraint) != 0
                     && !GenericConstraintFacts.IsNonNullableValueType(arg))
                 {
-                    ok = false;
-                    diagnostics.Add(new Diagnostic(
-                        id: "CN_GENCONSTR_STRUCT",
-                        severity: DiagnosticSeverity.Error,
-                        message: $"The type '{arg.Name}' must be a non-nullable value type to satisfy " +
-                        $"the 'struct' constraint on '{tp.Name}' in '{ownerDisplayName}'.",
-                        location: new Location(context.SemanticModel.SyntaxTree, getArgSpan(i))));
+                    Report("CN_GENCONSTR_STRUCT", i,
+                        $"The type '{arg.Name}' must be a non-nullable value type to satisfy " +
+                        $"the 'struct' constraint on '{tp.Name}' in '{ownerDisplayName}'.");
                 }
-                // Requires a non-nullable type argument
+                // 'notnull' is a nullability contract, so a violation only warns
                 if ((constraints & (GenericConstraintsFlags.StructConstraint
                     | GenericConstraintsFlags.UnmanagedConstraint)) == 0
                     && (constraints & GenericConstraintsFlags.NotNullConstraint) != 0
                     && !GenericConstraintFacts.IsNotNullType(arg))
                 {
-                    ok = false;
-                    diagnostics.Add(new Diagnostic(
-                        id: "CN_GENCONSTR_NOTNULL",
-                        severity: DiagnosticSeverity.Error,
-                        message: $"The type '{arg.Name}' must be non-nullable to satisfy " +
+                    Report("CN_GENCONSTR_NOTNULL", i,
+                        $"The type '{arg.Name}' should be non-nullable to satisfy " +
                         $"the 'notnull' constraint on '{tp.Name}' in '{ownerDisplayName}'.",
-                        location: new Location(context.SemanticModel.SyntaxTree, getArgSpan(i))));
+                        DiagnosticSeverity.Warning);
+                }
+                if ((constraints & GenericConstraintsFlags.ConstructorConstraint) != 0
+                    && !GenericConstraintFacts.HasPublicParameterlessConstructor(arg))
+                {
+                    Report("CN_GENCONSTR_NEW", i,
+                        $"The type '{arg.Name}' must be a non-abstract type with a public parameterless constructor " +
+                        $"to satisfy the 'new()' constraint on '{tp.Name}' in '{ownerDisplayName}'.");
+                }
+                foreach (var constraintType in tp.ConstraintTypes)
+                {
+                    if (constraintType.Kind == SymbolKind.Error)
+                        continue;
+                    var required = TypeSubstituter.Substitute(constraintType, types, map);
+                    if (!GenericConstraintFacts.SatisfiesTypeConstraint(arg, required))
+                    {
+                        Report("CN_GENCONSTR_TYPE", i,
+                            $"The type '{arg.Name}' cannot be used as type argument '{tp.Name}' in '{ownerDisplayName}': " +
+                            $"there is no implicit reference, boxing, or type parameter conversion to '{required.Name}'.");
+                    }
                 }
             }
             return ok;
@@ -300,7 +523,36 @@ namespace Cnidaria.Cs
                         case MethodDeclarationSyntax md when kv.Value is MethodSymbol ms:
                             BindOwnerConstraintClauses(tree, md.ConstraintClauses, ms.TypeParameters, ms, diagnostics);
                             break;
+
+                        case ExtensionBlockDeclarationSyntax eb when kv.Value is NamedTypeSymbol grouping:
+                            BindOwnerConstraintClauses(tree, eb.ConstraintClauses, grouping.TypeParameters, grouping, diagnostics);
+                            break;
                     }
+                }
+                // Implementation methods repeat the block's clauses on their copies; the grouping type reports their errors
+                foreach (var implementation in EnumerateExtensionImplementations(declMap))
+                {
+                    if (implementation.ExtensionMember!.BlockSyntax?.Node is ExtensionBlockDeclarationSyntax blockSyntax)
+                        BindOwnerConstraintClauses(tree, blockSyntax.ConstraintClauses, implementation.TypeParameters, implementation, new DiagnosticBag());
+                }
+            }
+        }
+        internal static IEnumerable<SourceMethodSymbol> EnumerateExtensionImplementations(ImmutableDictionary<SyntaxNode, Symbol> declMap)
+        {
+            var seen = new HashSet<SourceMethodSymbol>(ReferenceEqualityComparer<SourceMethodSymbol>.Instance);
+            foreach (var symbol in declMap.Values)
+            {
+                if (symbol is SourceMethodSymbol { ExtensionMember: not null } method)
+                {
+                    if (seen.Add(method))
+                        yield return method;
+                }
+                else if (symbol is SourcePropertySymbol property)
+                {
+                    if (property.GetMethod is SourceMethodSymbol { ExtensionMember: not null } getter && seen.Add(getter))
+                        yield return getter;
+                    if (property.SetMethod is SourceMethodSymbol { ExtensionMember: not null } setter && seen.Add(setter))
+                        yield return setter;
                 }
             }
         }
@@ -316,6 +568,9 @@ namespace Cnidaria.Cs
             if (clauses.Count == 0 || typeParameters.IsDefaultOrEmpty)
                 return;
 
+            // A clause may name a type whose constraints mention these parameters, so check only once all are bound
+            bool checkAfterBinding = !context.DefersGenericConstraintChecks;
+            context.SuppressGenericConstraintChecks = true;
             for (int c = 0; c < clauses.Count; c++)
             {
                 var clause = clauses[c];
@@ -354,6 +609,9 @@ namespace Cnidaria.Cs
                         tp.AddConstraintType(type);
                 }
             }
+            context.SuppressGenericConstraintChecks = false;
+            if (checkAfterBinding)
+                GenericConstraintChecker.CheckConstraintTypes(typeParameters, new Location(tree, clauses[0].Span), context.Compilation.TypeManager, diagnostics);
         }
 
         /// <summary>Binds and validates constraint clauses for one generic owner</summary>
@@ -426,6 +684,16 @@ namespace Cnidaria.Cs
                                     severity: DiagnosticSeverity.Error,
                                     message: $"Duplicate 'class' constraint for type parameter '{tp.Name}'.",
                                     location: new Location(tree, s.Span)));
+                            }
+                            break;
+                        case ConstructorConstraintSyntax ctor:
+                            if (!tp.TrySetConstraint(GenericConstraintsFlags.ConstructorConstraint))
+                            {
+                                diagnostics.Add(new Diagnostic(
+                                    id: "CN_GENCONSTR_DUP006",
+                                    severity: DiagnosticSeverity.Error,
+                                    message: $"Duplicate 'new()' constraint for type parameter '{tp.Name}'.",
+                                    location: new Location(tree, ctor.Span)));
                             }
                             break;
                         case AllowsConstraintClauseSyntax allows:

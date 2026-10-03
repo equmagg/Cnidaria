@@ -172,6 +172,9 @@ namespace Cnidaria.Cs
                 case GenTreeKind.ConstString:
                     sb.Append('"').Append(Escape(source.Text ?? string.Empty)).Append('"');
                     return;
+                case GenTreeKind.TypeHandle:
+                    sb.Append("typehandle ").Append(source.RuntimeType);
+                    return;
                 case GenTreeKind.Local:
                     sb.Append("ldloc l").Append(source.Int32);
                     return;
@@ -203,11 +206,11 @@ namespace Cnidaria.Cs
                     sb.Append("classinit ").Append(TypeName(source.RuntimeType));
                     return;
                 case GenTreeKind.Unary:
-                    sb.Append(source.SourceOp.ToString().ToLowerInvariant()).Append(' ');
+                    sb.Append(source.Operator.ToString().ToLowerInvariant()).Append(' ');
                     AppendUses(sb, node);
                     return;
                 case GenTreeKind.Binary:
-                    sb.Append(source.SourceOp).Append(' ');
+                    sb.Append(source.Operator).Append(' ');
                     AppendUses(sb, node);
                     return;
                 case GenTreeKind.Conv:

@@ -1074,7 +1074,7 @@ namespace Cnidaria.Cs
 
                 for (int pi = 0; pi < ps.Length; pi++)
                 {
-                    if (!assignedParameters[pi] && !ps[pi].HasExplicitDefault && !ps[pi].IsParams)
+                    if (!assignedParameters[pi] && !ps[pi].HasExplicitDefault)
                         return false;
                 }
 

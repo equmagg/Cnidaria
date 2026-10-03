@@ -803,6 +803,9 @@ public sealed class TargetInfo
             case ArrayType array when array.Length.HasValue:
                 return checked(SizeOf(array.ElementType) * (int)array.Length.Value);
 
+            case VariableArrayType:
+                throw new InvalidOperationException("A variable length array has no size at compile time.");
+
             case ArrayType:
                 return 0;
 
@@ -1315,7 +1318,7 @@ public sealed class PointerType : CType
 
 /// <summary>Represents an array with an optional constant length</summary>
 /// <remarks>A null length denotes an incomplete array type</remarks>
-public sealed class ArrayType : CType
+public class ArrayType : CType
 {
     public QualifiedType ElementType { get; }
     public long? Length { get; }
@@ -1330,6 +1333,52 @@ public sealed class ArrayType : CType
 
     public override string ToDisplayString()
         => ElementType.ToDisplayString() + "[" + (Length.HasValue ? Length.Value.ToString() : string.Empty) + "]";
+
+    public static bool HasVariableSize(QualifiedType type)
+    {
+        for (var current = type.Type; current is ArrayType array; current = array.ElementType.Type)
+        {
+            if (array is VariableArrayType)
+                return true;
+        }
+        return false;
+    }
+
+    public static bool IsVariablyModified(QualifiedType type)
+    {
+        for (var current = type.Type; ;)
+        {
+            switch (current)
+            {
+                case VariableArrayType:
+                    return true;
+                case ArrayType array:
+                    current = array.ElementType.Type;
+                    break;
+                case PointerType pointer:
+                    current = pointer.PointeeType.Type;
+                    break;
+                default:
+                    return false;
+            }
+        }
+    }
+}
+
+public sealed class VariableArrayType : ArrayType
+{
+    public ExpressionSyntax LengthSyntax { get; }
+    public Scope LengthScope { get; }
+
+    public VariableArrayType(QualifiedType elementType, ExpressionSyntax lengthSyntax, Scope lengthScope)
+        : base(elementType, null)
+    {
+        LengthSyntax = lengthSyntax;
+        LengthScope = lengthScope;
+    }
+
+    public override string ToDisplayString()
+        => ElementType.ToDisplayString() + "[*]";
 }
 
 /// <summary>Represents a function signature</summary>

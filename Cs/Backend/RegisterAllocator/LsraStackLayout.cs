@@ -939,6 +939,15 @@ namespace Cnidaria.Cs
             {
                 for (int i = 0; i < _method.Allocations.Length; i++)
                     CollectCalleeSavedRegisters(_method.Allocations[i], used);
+
+                foreach (var registers in _method.InternalRegistersByNodeId.Values)
+                {
+                    foreach (var register in registers)
+                    {
+                        if (RegisterInfo.IsCalleeSaved(Target, register.Register))
+                            used.Add(register.Register);
+                    }
+                }
             }
 
             private bool AllocationUsesCalleeSavedRegister(RegisterAllocationInfo allocation)

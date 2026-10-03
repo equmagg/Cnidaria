@@ -52,6 +52,7 @@ namespace Cnidaria.Cs
         ImplicitNullable,
         ExplicitNullable,
         ImplicitStackAlloc,
+        ImplicitInlineArray,
     }
     /// <summary>Identifies the declaration form or semantic category of a type</summary>
     public enum TypeKind : byte { Class, Struct, Interface, Enum, Delegate, Error, Dynamic, Unknown, FunctionPointer }
@@ -136,6 +137,7 @@ namespace Cnidaria.Cs
             or ConversionKind.ImplicitTuple
             or ConversionKind.ImplicitNullable
             or ConversionKind.ImplicitStackAlloc
+            or ConversionKind.ImplicitInlineArray
             or ConversionKind.NullLiteral
             || (Kind == ConversionKind.UserDefined && UserDefinedIsImplicit);
 
@@ -215,6 +217,7 @@ namespace Cnidaria.Cs
     {
         private readonly List<Diagnostic> _items = new();
         public void Add(Diagnostic d) => _items.Add(d);
+        public void AddRange(DiagnosticBag other) => _items.AddRange(other._items);
         public ImmutableArray<Diagnostic> ToImmutable() => _items.ToImmutableArray();
         public bool IsEmpty => _items.Count == 0;
     }
@@ -223,11 +226,13 @@ namespace Cnidaria.Cs
     {
         public CompilationUnitSyntax Root { get; }
         public string FilePath { get; }
+        public string Text { get; }
 
-        public SyntaxTree(CompilationUnitSyntax root, string filePath)
+        public SyntaxTree(CompilationUnitSyntax root, string filePath, string text)
         {
             Root = root ?? throw new ArgumentNullException(nameof(root));
             FilePath = filePath ?? "";
+            Text = text ?? throw new ArgumentNullException(nameof(text));
         }
     }
     /// <summary>Interns and constructs type symbols for one compilation context</summary>
@@ -836,6 +841,8 @@ namespace Cnidaria.Cs
             ExplicitInterfaceImplementationBinder.BindAll(compilation, trees, bag);
             AttributeBinder.BindAll(compilation, trees, bag);
             PlatformInvokeBinder.ValidateAll(compilation, trees, bag);
+            compilation.DeclarationsBound = true;
+            GenericConstraintChecker.CheckDeclarations(compilation, trees, bag);
 
             diagnostics = bag.ToImmutable();
             return compilation;
@@ -860,8 +867,11 @@ namespace Cnidaria.Cs
             MemberSignatureBinder.BindAll(compilation, trees, bag);
             NameConflictBinder.BindAll(compilation, bag);
             BaseTypeBinder.BindAll(compilation, trees, bag);
+            ExplicitInterfaceImplementationBinder.BindAll(compilation, trees, bag);
             AttributeBinder.BindAll(compilation, trees, bag);
             PlatformInvokeBinder.ValidateAll(compilation, trees, bag);
+            compilation.DeclarationsBound = true;
+            GenericConstraintChecker.CheckDeclarations(compilation, trees, bag);
 
             diagnostics = bag.ToImmutable();
             return compilation;
@@ -878,6 +888,7 @@ namespace Cnidaria.Cs
         public ImmutableArray<SyntaxTree> SyntaxTrees => _syntaxTrees;
         public CompilationOptions Options { get; }
         public TargetInfo Target => Options.Target;
+        internal bool DeclarationsBound { get; set; }
         internal TypeManager TypeManager => _types;
         internal ImmutableDictionary<SyntaxTree, ImmutableDictionary<SyntaxNode, Symbol>> DeclaredSymbolsByTree { get; }
             = ImmutableDictionary<SyntaxTree, ImmutableDictionary<SyntaxNode, Symbol>>.Empty;
@@ -1029,36 +1040,38 @@ namespace Cnidaria.Cs
             }
         }
 
-        public (MetadataImage md, Dictionary<int, Cnidaria.Cs.BytecodeFunction> funcs, ImmutableArray<Diagnostic> diags, Exception? exception) BuildModule(
+        public (MetadataImage md, ImmutableArray<Diagnostic> diags, Exception? exception) BuildModule(
             string moduleName,
-            SyntaxTree tree,
             bool includeCoreTypesInTypeDefs,
             string defaultExternalAssemblyName,
             Func<NamedTypeSymbol, string?>? externalAssemblyResolver = null,
             bool print = false)
         {
             Compilation compilation = this;
-            var model = compilation.GetSemanticModel(tree);
             var rootNs = includeCoreTypesInTypeDefs
                 ? compilation.GlobalNamespace
                 : compilation.SourceGlobalNamespace;
             var systemObject = compilation.GetSpecialType(SpecialType.System_Object);
             MetadataTokenProvider? tokens = null;
 
-            MetadataTokenProvider CreateTokenProvider()
+            MetadataTokenProvider CreateTokenProvider(SynthesizedMemberCollector? synthesized)
                 => new MetadataTokenProvider(
                     moduleName,
                     rootNs,
                     systemObject,
                     defaultExternalAssemblyName,
-                    externalAssemblyResolver);
+                    externalAssemblyResolver,
+                    synthesizedMethods: synthesized?.MethodsByType,
+                    staticData: synthesized?.StaticData);
 
-            var functions = new Dictionary<int, Cnidaria.Cs.BytecodeFunction>();
             var diagnostics = ImmutableArray<Diagnostic>.Empty;
 
             try
             {
-                diagnostics = model.GetDiagnostics();
+                var allDiagnostics = ImmutableArray.CreateBuilder<Diagnostic>();
+                foreach (var tree in compilation.SyntaxTrees)
+                    allDiagnostics.AddRange(compilation.GetSemanticModel(tree).GetDiagnostics());
+                diagnostics = allDiagnostics.ToImmutable();
                 if (print && diagnostics.Length > 0)
                 {
                     foreach (var diagnostic in diagnostics)
@@ -1066,90 +1079,165 @@ namespace Cnidaria.Cs
                 }
                 if (diagnostics.Any(d => d.Severity == DiagnosticSeverity.Error))
                 {
-                    tokens = CreateTokenProvider();
-                    return (tokens.Image, functions, diagnostics, null);
+                    tokens = CreateTokenProvider(null);
+                    return (tokens.Image, diagnostics, null);
                 }
 
-                IRLowering.PrepareIteratorStateMachines(compilation, tree, model);
-                var tokenProvider = CreateTokenProvider();
-                tokens = tokenProvider;
-
-                void AddFn(Cnidaria.Cs.BytecodeFunction fn)
-                {
-                    if (!functions.TryAdd(fn.MethodToken, fn))
-                        throw new InvalidOperationException($"Duplicate bytecode for token 0x{fn.MethodToken:X8}");
-                }
-                void EmitBody(BoundMethodBody body)
+                var loweredBodies = new List<BoundMethodBody>();
+                var loweredMethods = new HashSet<MethodSymbol>(ReferenceEqualityComparer<MethodSymbol>.Instance);
+                void Lower(BoundMethodBody body)
                 {
                     if (print)
-                    {
-                        string printedFull = Cnidaria.Cs.BoundTreePrinter.Print(body);
-                        Console.WriteLine(printedFull);
-                    }
+                        Console.WriteLine(Cnidaria.Cs.BoundTreePrinter.Print(body));
+                    loweredBodies.Add(IRLowering.Rewrite(compilation, body));
+                    loweredMethods.Add(body.Method);
+                }
+                foreach (var tree in compilation.SyntaxTrees)
+                {
+                    var model = compilation.GetSemanticModel(tree);
+                    IRLowering.PrepareIteratorStateMachines(compilation, tree, model);
 
-                    var lowered = IRLowering.Rewrite(compilation, body);
-                    var emit = Cnidaria.Cs.BytecodeEmitter.Emit(lowered, tokenProvider, compilation.Target);
-
-                    AddFn(emit.Entry);
-                    foreach (var lf in emit.AdditionalMethods)
-                        AddFn(lf);
-                }
-                if (model.GetBoundNode(tree.Root) is BoundCompilationUnit cu &&
-                    cu.TopLevelMethodBodyOpt is BoundMethodBody topLevelBody)
-                {
-                    EmitBody(topLevelBody);
-                }
-                foreach (var owner in compilation.EnumerateMethodBodyOwners(tree))
-                {
-                    var body = (BoundMethodBody)model.GetBoundNode(owner);
-                    if (body.Method.IsStatic &&
-                        body.Method.Parameters.Length == 0 &&
-                        StringComparer.Ordinal.Equals(body.Method.Name, ".cctor"))
+                    if (model.GetBoundNode(tree.Root) is BoundCompilationUnit cu &&
+                        cu.TopLevelMethodBodyOpt is BoundMethodBody topLevelBody)
                     {
-                        body = PrependTypeInitializerStatements(compilation, tree, model, body);
+                        Lower(topLevelBody);
                     }
-                    else if (RunsInstanceFieldInitializers(body.Method, owner))
+                    foreach (var owner in compilation.EnumerateMethodBodyOwners(tree))
                     {
-                        body = PrependInstanceInitializerStatements(compilation, tree, model, body);
+                        var body = (BoundMethodBody)model.GetBoundNode(owner);
+                        if (body.Method.IsStatic &&
+                            body.Method.Parameters.Length == 0 &&
+                            StringComparer.Ordinal.Equals(body.Method.Name, ".cctor"))
+                        {
+                            body = PrependTypeInitializerStatements(compilation, tree, model, body);
+                        }
+                        else if (RunsInstanceFieldInitializers(body.Method, owner))
+                        {
+                            body = PrependInstanceInitializerStatements(compilation, tree, model, body,
+                                hasBaseInitializer: owner is ConstructorDeclarationSyntax { Initializer: not null });
+                        }
+                        Lower(body);
                     }
-                    EmitBody(body);
+                    foreach (var iteratorInfo in compilation.GetIteratorStateMachinesForTree(tree))
+                    {
+                        foreach (var body in IRLowering.GetIteratorStateMachineBodies(compilation, iteratorInfo))
+                            Lower(body);
+                    }
+                    foreach (var ctor in EnumerateSynthesizedInstanceCtorsInTree(rootNs, tree))
+                    {
+                        if (loweredMethods.Contains(ctor))
+                            continue;
+                        var stmts = ImmutableArray.CreateBuilder<BoundStatement>();
+                        stmts.AddRange(BuildInstanceInitializerStatements(compilation, tree, model, ctor));
+                        if (IRLowering.CreateImplicitBaseConstructorCall(ctor, tree.Root) is BoundStatement baseCall)
+                            stmts.Add(baseCall);
+                        stmts.Add(new BoundReturnStatement(tree.Root, expression: null));
+                        var block = new BoundBlockStatement(tree.Root, stmts.ToImmutable());
+                        Lower(new BoundMethodBody(tree.Root, ctor, block));
+                    }
+                    foreach (var cctor in EnumerateSynthesizedStaticCctorsInTree(rootNs, tree))
+                    {
+                        if (loweredMethods.Contains(cctor))
+                            continue;
+                        Lower(BuildSynthesizedTypeInitializerBody(compilation, tree, model, cctor));
+                    }
                 }
-                foreach (var iteratorInfo in compilation.GetIteratorStateMachinesForTree(tree))
-                {
-                    foreach (var body in IRLowering.GetIteratorStateMachineBodies(compilation, iteratorInfo))
-                        EmitBody(body);
-                }
-                foreach (var ctor in EnumerateSynthesizedInstanceCtorsInTree(rootNs, tree))
-                {
-                    int ctorTok = tokenProvider.GetMethodToken(ctor);
-                    if (functions.ContainsKey(ctorTok))
-                        continue;
-                    var stmts = ImmutableArray.CreateBuilder<BoundStatement>();
-                    stmts.AddRange(BuildInstanceInitializerStatements(compilation, tree, model, ctor));
-                    stmts.Add(new BoundReturnStatement(tree.Root, expression: null));
-                    var block = new BoundBlockStatement(tree.Root, stmts.ToImmutable());
-                    var body = new BoundMethodBody(tree.Root, ctor, block);
-                    EmitBody(body);
-                }
-                foreach (var cctor in EnumerateSynthesizedStaticCctorsInTree(rootNs, tree))
-                {
-                    int cctorTok = tokenProvider.GetMethodToken(cctor);
-                    if (functions.ContainsKey(cctorTok))
-                        continue;
 
-                    var body = BuildSynthesizedTypeInitializerBody(compilation, tree, model, cctor);
-                    EmitBody(body);
+                var synthesized = new SynthesizedMemberCollector();
+                foreach (var body in loweredBodies)
+                    synthesized.Collect(body);
+
+                var tokenProvider = CreateTokenProvider(synthesized);
+                tokens = tokenProvider;
+
+                void EmitIL(BoundMethodBody body)
+                {
+                    if (!HasMethodBody(body.Method))
+                        return;
+                    int rid = MetadataToken.Rid(tokenProvider.GetMethodDefinitionToken(body.Method));
+                    tokenProvider.Image.MethodBodies.Add(rid, ILEmitter.Emit(body, tokenProvider, compilation.Target));
                 }
-                return (tokenProvider.Image, functions, diagnostics, null);
+                foreach (var body in loweredBodies)
+                    EmitIL(body);
+                foreach (var body in synthesized.Bodies)
+                    EmitIL(body);
+
+                tokenProvider.Finish();
+                return (tokenProvider.Image, diagnostics, null);
             }
             catch (Exception ex)
             {
                 if (print)
                     Console.WriteLine(ex.Message);
-                tokens ??= CreateTokenProvider();
-                return (tokens.Image, functions, diagnostics, ex);
+                tokens ??= CreateTokenProvider(null);
+                return (tokens.Image, diagnostics, ex);
+            }
+        }
+        private static bool HasMethodBody(MethodSymbol method)
+        {
+            if (method.IsAbstract || method.IsExtern || method.GetDllImportData() is not null)
+                return false;
+            var implFlags = MethodAttributeFacts.GetMethodImplFlags(method);
+            return (implFlags & (MetadataFlagBits.InternalCall | (int)System.Reflection.MethodImplAttributes.CodeTypeMask)) == 0;
+        }
+        private sealed class SynthesizedMemberCollector : BoundTreeRewriterWithStackGuard
+        {
+            private readonly Dictionary<NamedTypeSymbol, List<MethodSymbol>> _methodsByType = new(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
+            private readonly HashSet<MethodSymbol> _seen = new(ReferenceEqualityComparer<MethodSymbol>.Instance);
+            private readonly HashSet<byte[]> _staticData = new(ByteArrayComparer.Instance);
+            private NamedTypeSymbol? _containingType;
+
+            public List<BoundMethodBody> Bodies { get; } = new();
+            public List<byte[]> StaticData { get; } = new();
+            public Dictionary<NamedTypeSymbol, IReadOnlyList<MethodSymbol>> MethodsByType
+            {
+                get
+                {
+                    var result = new Dictionary<NamedTypeSymbol, IReadOnlyList<MethodSymbol>>(ReferenceEqualityComparer<NamedTypeSymbol>.Instance);
+                    foreach (var (type, methods) in _methodsByType)
+                        result.Add(type, methods);
+                    return result;
+                }
             }
 
+            public void Collect(BoundMethodBody body)
+            {
+                Symbol? owner = body.Method.ContainingSymbol;
+                while (owner is MethodSymbol method)
+                    owner = method.ContainingSymbol;
+                _containingType = owner as NamedTypeSymbol
+                    ?? throw new InvalidOperationException($"Method '{body.Method.Name}' has no containing type.");
+                RewriteStatement(body.Body);
+            }
+            private void Add(SyntaxNode syntax, MethodSymbol method, BoundStatement body)
+            {
+                if (!_seen.Add(method))
+                    return;
+                if (!_methodsByType.TryGetValue(_containingType!, out var methods))
+                {
+                    methods = new List<MethodSymbol>();
+                    _methodsByType.Add(_containingType!, methods);
+                }
+                methods.Add(method);
+                Bodies.Add(new BoundMethodBody(syntax, method, body));
+            }
+            protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
+            {
+                Add(node.Syntax, node.Method, node.Body);
+                return base.RewriteLambdaExpression(node);
+            }
+            protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
+            {
+                Add(node.Syntax, node.LocalFunction, node.Body);
+                return base.RewriteLocalFunctionStatement(node);
+            }
+            protected override BoundExpression RewriteStaticDataExpression(BoundStaticDataExpression node)
+            {
+                var data = StaticDataEncoding.Encode(node);
+                if (_staticData.Add(data))
+                    StaticData.Add(data);
+                return node;
+            }
         }
 
         private static BoundMethodBody BuildSynthesizedTypeInitializerBody(
@@ -1176,8 +1264,18 @@ namespace Cnidaria.Cs
             Compilation compilation,
             SyntaxTree tree,
             SemanticModel model,
-            BoundMethodBody body)
-            => PrependInitializerStatements(body, BuildInstanceInitializerStatements(compilation, tree, model, body.Method));
+            BoundMethodBody body,
+            bool hasBaseInitializer)
+        {
+            var initializers = BuildInstanceInitializerStatements(compilation, tree, model, body.Method);
+            if (!hasBaseInitializer &&
+                !initializers.IsEmpty &&
+                IRLowering.CreateImplicitBaseConstructorCall(body.Method, body.Syntax) is BoundStatement baseCall)
+            {
+                initializers = initializers.Add(baseCall);
+            }
+            return PrependInitializerStatements(body, initializers);
+        }
 
         private static BoundMethodBody PrependInitializerStatements(
             BoundMethodBody body,
@@ -1248,25 +1346,14 @@ namespace Cnidaria.Cs
 
             for (int i = 0; i < members.Length; i++)
             {
-                if (members[i] is not SourceFieldSymbol fs)
-                    continue;
-                if (fs.IsStatic != staticFields || fs.IsConst)
+                if (!TryGetMemberInitializer(members[i], staticFields, out var fs, out var declaration, out var initializer))
                     continue;
 
-                var declRefs = fs.DeclaringSyntaxReferences;
-                if (declRefs.IsDefaultOrEmpty)
-                    continue;
-
-                if (declRefs[0].Node is not VariableDeclaratorSyntax vd)
-                    continue;
-                if (vd.Initializer is null)
-                    continue;
-
-                var rhsSyntax = vd.Initializer.Value;
+                var rhsSyntax = initializer.Value;
                 var rhsBound = exprBinder.BindExpressionWithTargetType(
                     exprSyntax: rhsSyntax,
                     targetType: fs.Type,
-                    diagnosticNode: vd.Initializer,
+                    diagnosticNode: initializer,
                     context: ctx,
                     diagnostics: bag,
                     requireImplicit: true);
@@ -1278,11 +1365,42 @@ namespace Cnidaria.Cs
                     type: fs.Type,
                     isLValue: true);
 
-                var ass = new BoundAssignmentExpression(vd, lhs, rhsBound);
-                stmts.Add(new BoundExpressionStatement(vd, ass));
+                var ass = new BoundAssignmentExpression(declaration, lhs, rhsBound);
+                stmts.Add(new BoundExpressionStatement(declaration, ass));
             }
 
             return stmts.ToImmutable();
+        }
+        // An auto-property initializer assigns the backing field directly, like a field initializer.
+        private static bool TryGetMemberInitializer(
+            Symbol member,
+            bool staticMembers,
+            out FieldSymbol field,
+            out SyntaxNode declaration,
+            out EqualsValueClauseSyntax initializer)
+        {
+            switch (member)
+            {
+                case SourceFieldSymbol { IsConst: false } sourceField when sourceField.IsStatic == staticMembers &&
+                    !sourceField.DeclaringSyntaxReferences.IsDefaultOrEmpty &&
+                    sourceField.DeclaringSyntaxReferences[0].Node is VariableDeclaratorSyntax { Initializer: EqualsValueClauseSyntax fieldInitializer } declarator:
+                    field = sourceField;
+                    declaration = declarator;
+                    initializer = fieldInitializer;
+                    return true;
+                case SourcePropertySymbol { BackingFieldOpt: FieldSymbol backingField } property when property.IsStatic == staticMembers &&
+                    !property.DeclaringSyntaxReferences.IsDefaultOrEmpty &&
+                    property.DeclaringSyntaxReferences[0].Node is PropertyDeclarationSyntax { Initializer: EqualsValueClauseSyntax propertyInitializer } propertyDeclaration:
+                    field = backingField;
+                    declaration = propertyDeclaration;
+                    initializer = propertyInitializer;
+                    return true;
+                default:
+                    field = null!;
+                    declaration = null!;
+                    initializer = null!;
+                    return false;
+            }
         }
         private static IEnumerable<SynthesizedConstructorSymbol> EnumerateSynthesizedInstanceCtorsInTree(NamespaceSymbol moduleGlobalNamespace, SyntaxTree tree)
         {
@@ -2705,6 +2823,7 @@ namespace Cnidaria.Cs
         Conditional,
         UnboundImplicitObjectCreation,
         UnboundCollectionExpression,
+        UnboundConditional,
         ObjectCreation,
         LabelExpression,
         ArrayInitializer,
@@ -2773,6 +2892,9 @@ namespace Cnidaria.Cs
         public SemanticModel SemanticModel { get; }
         public Symbol ContainingSymbol { get; }
         public IBindingRecorder Recorder { get; }
+        internal bool SuppressGenericConstraintChecks { get; set; }
+        // Constraints are only complete once every declaration has been bound
+        internal bool DefersGenericConstraintChecks => SuppressGenericConstraintChecks || !Compilation.DeclarationsBound;
         public BindingContext(
             Compilation compilation,
             SemanticModel semanticModel,

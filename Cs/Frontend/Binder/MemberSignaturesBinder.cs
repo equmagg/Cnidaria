@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Linq;
 using System.Threading;
 
 namespace Cnidaria.Cs
@@ -74,16 +75,27 @@ namespace Cnidaria.Cs
                         var rt = typeBinder.BindType(md.ReturnType, ctx, diagnostics);
                         sm.SetReturnType(rt, IsRefReadonlyReturnType(md.ReturnType));
 
+                        int receiverCount = BindExtensionReceiver(sm, typeBinder, ctx);
                         var pars = md.ParameterList.Parameters;
-                        for (int i = 0; i < pars.Count && i < sm.Parameters.Length; i++)
+                        for (int i = 0; i < pars.Count && i + receiverCount < sm.Parameters.Length; i++)
                         {
+                            var parameter = sm.Parameters[i + receiverCount];
                             var pt = BindParameterType(typeBinder, pars[i], ctx, diagnostics, out var isReadOnlyRef);
-                            sm.Parameters[i].Type = pt;
-                            sm.Parameters[i].IsReadOnlyRef = isReadOnlyRef;
+                            parameter.Type = pt;
+                            parameter.IsReadOnlyRef = isReadOnlyRef;
                             if (pars[i].Default is not null)
                                 pendingOptionalParameters.Add(
-                                    new PendingOptionalParameter(tree, pars[i], sm.Parameters[i], sm, typeBinder, stubModel));
+                                    new PendingOptionalParameter(tree, pars[i], parameter, sm, typeBinder, stubModel));
                         }
+                    }
+                    else if (kv.Key is ExtensionBlockDeclarationSyntax extensionBlock && kv.Value is SourceNamedTypeSymbol grouping &&
+                             grouping.GetMembers().OfType<SourceMethodSymbol>().FirstOrDefault() is SourceMethodSymbol marker &&
+                             extensionBlock.ParameterList is { Parameters.Count: 1 } receiverList)
+                    {
+                        var ctx = new BindingContext(compilation, stubModel, marker, NullRecorder.Instance);
+                        var receiverType = BindParameterType(safeTypeBinder, receiverList.Parameters[0], ctx, diagnostics, out var isReadOnlyRef);
+                        marker.Parameters[0].Type = receiverType;
+                        marker.Parameters[0].IsReadOnlyRef = isReadOnlyRef;
                     }
                     else if (kv.Key is ConstructorDeclarationSyntax cd && kv.Value is SourceMethodSymbol ctor)
                     {
@@ -109,6 +121,7 @@ namespace Cnidaria.Cs
                         var typeBinder = HasModifier(od.Modifiers, SyntaxKind.UnsafeKeyword) ? unsafeTypeBinder : safeTypeBinder;
                         var rt = typeBinder.BindType(od.ReturnType, ctx, diagnostics);
                         opMethod.SetReturnType(rt, IsRefReadonlyReturnType(od.ReturnType));
+                        BindExtensionReceiver(opMethod, typeBinder, ctx);
 
                         var pars = od.ParameterList.Parameters;
                         for (int i = 0; i < pars.Count && i < opMethod.Parameters.Length; i++)
@@ -164,6 +177,27 @@ namespace Cnidaria.Cs
                                      stubModel));
                             }
                         }
+                    }
+                    else if (kv.Key is PropertyDeclarationSyntax extensionPd && kv.Value is SourcePropertySymbol extensionProperty &&
+                             (extensionProperty.GetMethod ?? extensionProperty.SetMethod)?.ExtensionMember is not null)
+                    {
+                        // Each accessor has its own copies of the block's type parameters, so the type is bound once per accessor
+                        var typeBinder = HasModifier(extensionPd.Modifiers, SyntaxKind.UnsafeKeyword) ? unsafeTypeBinder : safeTypeBinder;
+                        TypeSymbol? propertyType = null;
+                        foreach (var accessor in new[] { extensionProperty.GetMethod, extensionProperty.SetMethod })
+                        {
+                            if (accessor is not SourceMethodSymbol implementation)
+                                continue;
+                            var ctx = new BindingContext(compilation, stubModel, implementation, NullRecorder.Instance);
+                            var accessorType = typeBinder.BindType(extensionPd.Type, ctx, propertyType is null ? diagnostics : new DiagnosticBag());
+                            propertyType ??= accessorType;
+                            if (implementation.ExtensionMember!.IsSetter)
+                                implementation.Parameters[^1].Type = accessorType;
+                            else
+                                implementation.SetReturnType(accessorType, IsRefReadonlyReturnType(extensionPd.Type));
+                            BindExtensionReceiver(implementation, typeBinder, ctx);
+                        }
+                        extensionProperty.SetType(propertyType!);
                     }
                     else if (kv.Key is PropertyDeclarationSyntax pd && kv.Value is SourcePropertySymbol prop)
                     {
@@ -619,6 +653,23 @@ namespace Cnidaria.Cs
             return ctx.Compilation.CreateByRefType(baseType);
         }
         // Enum underlying types must be known before member constants are converted
+        private static int BindExtensionReceiver(SourceMethodSymbol method, TypeBinder typeBinder, BindingContext ctx)
+        {
+            if (method.ExtensionMember is not { BlockSyntax: SyntaxReference block } info ||
+                block.Node is not ExtensionBlockDeclarationSyntax { ParameterList.Parameters.Count: 1 } blockSyntax)
+            {
+                return 0;
+            }
+
+            // The grouping type reports receiver errors once for the whole block
+            var receiverType = BindParameterType(typeBinder, blockSyntax.ParameterList!.Parameters[0], ctx, new DiagnosticBag(), out var isReadOnlyRef);
+            info.ExtendedType = receiverType is ByRefTypeSymbol byRef ? byRef.ElementType : receiverType;
+            if (info.IsStatic)
+                return 0;
+            method.Parameters[0].Type = receiverType;
+            method.Parameters[0].IsReadOnlyRef = isReadOnlyRef;
+            return 1;
+        }
         private static void BindTypeConstraintTypesForTree(
             SyntaxTree tree,
             ImmutableDictionary<SyntaxNode, Symbol> declMap,
@@ -627,6 +678,14 @@ namespace Cnidaria.Cs
             TypeBinder unsafeTypeBinder,
             DiagnosticBag diagnostics)
         {
+            foreach (var implementation in GenericConstraintBinder.EnumerateExtensionImplementations(declMap))
+            {
+                if (implementation.ExtensionMember!.BlockSyntax?.Node is not ExtensionBlockDeclarationSyntax { ConstraintClauses.Count: > 0 } blockSyntax)
+                    continue;
+                var context = new BindingContext(stubModel.Compilation, stubModel, implementation, NullRecorder.Instance);
+                GenericConstraintBinder.BindOwnerTypeConstraints(
+                    tree, blockSyntax.ConstraintClauses, implementation.TypeParameters, implementation, safeTypeBinder, context, new DiagnosticBag());
+            }
             foreach (var kv in declMap)
             {
                 SyntaxList<TypeParameterConstraintClauseSyntax> clauses;
@@ -655,6 +714,12 @@ namespace Cnidaria.Cs
                         owner = symbol;
                         break;
                     case DelegateDeclarationSyntax syntax when kv.Value is NamedTypeSymbol symbol:
+                        clauses = syntax.ConstraintClauses;
+                        modifiers = syntax.Modifiers;
+                        typeParameters = symbol.TypeParameters;
+                        owner = symbol;
+                        break;
+                    case ExtensionBlockDeclarationSyntax syntax when kv.Value is NamedTypeSymbol symbol:
                         clauses = syntax.ConstraintClauses;
                         modifiers = syntax.Modifiers;
                         typeParameters = symbol.TypeParameters;
@@ -837,7 +902,7 @@ namespace Cnidaria.Cs
             if (pd.UsesFieldKeyword)
                 return true;
 
-            if (!HasAutoAccessor(pd))
+            if (!HasAutoAccessor(pd) || HasModifier(pd.Modifiers, SyntaxKind.AbstractKeyword))
                 return false;
 
             if (property.ContainingSymbol is NamedTypeSymbol { TypeKind: TypeKind.Interface } &&
