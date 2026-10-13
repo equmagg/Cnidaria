@@ -53,13 +53,8 @@ namespace System.Runtime.InteropServices
             throw new NotSupportedException();
         }
 
-        [Intrinsic]
         public static unsafe ref byte GetArrayDataReference(Array array)
-        {
-            //return ref Unsafe.AddByteOffset(ref Unsafe.As<RawData>(array).Data, 
-            //    (nuint)RuntimeHelpers.GetMethodTable(array)->BaseSize - (nuint)(2 * sizeof(IntPtr)));
-            return ref *(byte*)0;
-        }
+            => ref Unsafe.AddByteOffset(ref Unsafe.As<RawData>(array).Data, (nuint)RuntimeHelpers.GetMethodTable(array)->BaseSize - (nuint)(2 * sizeof(IntPtr)));
 
         public static ref T GetReference<T>(Span<T> span) => ref span._reference;
         public static ref T GetReference<T>(ReadOnlySpan<T> span) => ref span._reference;

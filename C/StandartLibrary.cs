@@ -34,6 +34,15 @@ public static class StandardHeaders
     internal static string SysTypesH { get; } = ReadEmbeddedText("types.h");
     internal static string UnistdH { get; } = ReadEmbeddedText("unistd.h");
     internal static string RiscVVectorH { get; } = ReadEmbeddedText("riscv_vector.h");
+    internal static string DirentH { get; } = ReadEmbeddedText("dirent.h");
+    internal static string SysWaitH { get; } = ReadEmbeddedText("sys.wait.h");
+    internal static string SysMmanH { get; } = ReadEmbeddedText("sys.mman.h");
+    internal static string PollH { get; } = ReadEmbeddedText("poll.h");
+    internal static string SysUtsnameH { get; } = ReadEmbeddedText("sys.utsname.h");
+    internal static string SysSoundcardH { get; } = ReadEmbeddedText("sys.soundcard.h");
+    internal static string LinuxIoctlH { get; } = ReadEmbeddedText("linux.ioctl.h");
+    internal static string LinuxInputH { get; } = ReadEmbeddedText("linux.input.h");
+    internal static string LinuxInputEventCodesH { get; } = ReadEmbeddedText("linux.input-event-codes.h");
     internal static string ReadEmbeddedText(string fileName)
     {
         var assembly = typeof(StandardHeaders).Assembly;
@@ -76,7 +85,16 @@ public static class StandardHeaders
             new IncludeFile("termios.h", TermiosH),
             new IncludeFile("sys/types.h", SysTypesH),
             new IncludeFile("unistd.h", UnistdH),
-            new IncludeFile("riscv_vector.h", RiscVVectorH));
+            new IncludeFile("riscv_vector.h", RiscVVectorH),
+            new IncludeFile("dirent.h", DirentH),
+            new IncludeFile("sys/wait.h", SysWaitH),
+            new IncludeFile("sys/mman.h", SysMmanH),
+            new IncludeFile("poll.h", PollH),
+            new IncludeFile("sys/utsname.h", SysUtsnameH),
+            new IncludeFile("sys/soundcard.h", SysSoundcardH),
+            new IncludeFile("linux/ioctl.h", LinuxIoctlH),
+            new IncludeFile("linux/input.h", LinuxInputH),
+            new IncludeFile("linux/input-event-codes.h", LinuxInputEventCodesH));
     }
 
     public static IIncludeResolver CreateResolver()
@@ -118,6 +136,7 @@ public static class StandardLibrarySources
             new SourceFile("C/StandardLibrary/ctype.c", ReadEmbeddedText("ctype.c")),
             new SourceFile("C/StandardLibrary/io.c", ReadEmbeddedText("io.c")),
             new SourceFile("C/StandardLibrary/libc.c", ReadEmbeddedText("libc.c")),
+            new SourceFile("C/StandardLibrary/process.c", ReadEmbeddedText("process.c")),
             new SourceFile("C/StandardLibrary/signal.c", ReadEmbeddedText("signal.c")),
             new SourceFile("C/StandardLibrary/stdio.c", ReadEmbeddedText("stdio.c")),
             new SourceFile("C/StandardLibrary/stdlib.c", ReadEmbeddedText("stdlib.c")),

@@ -608,8 +608,11 @@ public sealed class ArmCodeGenerator
         var blockLabels = new Dictionary<LirBlock, string>();
         foreach (var block in function.Blocks)
             blockLabels.Add(block, CreateLocalLabel($"{label}_{block.Name}"));
+        var jumpOnlyBlocks = allocation.FindJumpOnlyBlocks();
+        foreach (var pair in jumpOnlyBlocks)
+            blockLabels[pair.Key] = blockLabels[pair.Value];
 
-        var context = new FunctionEmissionContext(this, function, allocation, label, blockLabels);
+        var context = new FunctionEmissionContext(this, function, allocation, label, blockLabels, jumpOnlyBlocks);
         var startOffset = _text.ByteLength;
         _text.DefineLabel(label);
         context.EmitPrologue();
@@ -856,18 +859,6 @@ public sealed class ArmCodeGenerator
         };
     }
 
-    private static bool IsSignedIntegerType(QualifiedType type)
-    {
-        if (type.Type is EnumType)
-            return true;
-        return type.Type is BuiltinType builtin && builtin.BuiltinKind is BuiltinTypeKind.SignedChar or BuiltinTypeKind.Short
-            or BuiltinTypeKind.Int or BuiltinTypeKind.Long or BuiltinTypeKind.LongLong;
-    }
-
-    private static bool IsUnsignedIntegerType(QualifiedType type)
-        => type.Type is BuiltinType builtin && builtin.BuiltinKind is BuiltinTypeKind.Bool or BuiltinTypeKind.Char or BuiltinTypeKind.UnsignedChar
-        or BuiltinTypeKind.UnsignedShort or BuiltinTypeKind.UnsignedInt or BuiltinTypeKind.UnsignedLong or BuiltinTypeKind.UnsignedLongLong;
-
     private static bool IsIntegerLike(QualifiedType type)
         => (type.Type.Kind is TypeKind.Builtin or TypeKind.Enum) && !IsFloatType(type) && !IsVoid(type);
 
@@ -912,6 +903,7 @@ public sealed class ArmCodeGenerator
         private readonly AllocationResult _allocation;
         private readonly string _functionLabel;
         private readonly IReadOnlyDictionary<LirBlock, string> _labels;
+        private readonly IReadOnlyDictionary<LirBlock, LirBlock> _jumpOnlyBlocks;
         private readonly bool _hasCalls;
         private readonly int _lrSaveOffset;
         private readonly int _scratchSaveOffset;
@@ -956,13 +948,15 @@ public sealed class ArmCodeGenerator
             LirFunction function,
             AllocationResult allocation,
             string functionLabel,
-            IReadOnlyDictionary<LirBlock, string> labels)
+            IReadOnlyDictionary<LirBlock, string> labels,
+            IReadOnlyDictionary<LirBlock, LirBlock> jumpOnlyBlocks)
         {
             _owner = owner ?? throw new ArgumentNullException(nameof(owner));
             _function = function ?? throw new ArgumentNullException(nameof(function));
             _allocation = allocation ?? throw new ArgumentNullException(nameof(allocation));
             _functionLabel = functionLabel ?? string.Empty;
             _labels = labels ?? throw new ArgumentNullException(nameof(labels));
+            _jumpOnlyBlocks = jumpOnlyBlocks;
             var instructions = function.Blocks.SelectMany(static b => b.Instructions).ToArray();
             _hasCalls = instructions.Any(static i => i.Kind is LirInstructionKind.Call or LirInstructionKind.InlineAssembly);
             _lrSaveOffset = _hasCalls ? AlignUp(_allocation.Frame.FrameSize, _owner._target.PointerAlignment) : -1;
@@ -1142,9 +1136,13 @@ public sealed class ArmCodeGenerator
             for (var blockIndex = 0; blockIndex < _function.Blocks.Length; blockIndex++)
             {
                 var block = _function.Blocks[blockIndex];
-                _fallthroughBlock = blockIndex + 1 < _function.Blocks.Length
-                    ? _function.Blocks[blockIndex + 1]
-                    : null;
+                if (_jumpOnlyBlocks.ContainsKey(block))
+                {
+                    _currentInstructionPosition += block.Instructions.Length * 2;
+                    continue;
+                }
+
+                _fallthroughBlock = NextEmittedBlock(blockIndex);
                 ClearIntegerRepresentationFacts();
                 _owner._text.DefineLabel(LabelOf(block));
                 foreach (var instruction in block.Instructions)
@@ -4232,7 +4230,18 @@ public sealed class ArmCodeGenerator
         }
 
         private bool IsFallthroughTarget(LirBlock? target)
-            => target is not null && ReferenceEquals(target, _fallthroughBlock);
+            => target is not null && ReferenceEquals(_jumpOnlyBlocks.TryGetValue(target, out var jumpTarget) ? jumpTarget : target, _fallthroughBlock);
+
+        private LirBlock? NextEmittedBlock(int blockIndex)
+        {
+            for (var index = blockIndex + 1; index < _function.Blocks.Length; index++)
+            {
+                if (!_jumpOnlyBlocks.ContainsKey(_function.Blocks[index]))
+                    return _function.Blocks[index];
+            }
+
+            return null;
+        }
 
         private int IncomingStackOffset(int abiStackOffset)
             => checked(_totalFrameSize + abiStackOffset);
@@ -5009,6 +5018,12 @@ public sealed class ArmCodeGenerator
             }
             throw new NotSupportedException("Unsupported ARM register mapping.");
         }
+
+        private bool IsSignedIntegerType(QualifiedType type)
+            => GimpleTypes.IsIntegerLike(type) && GimpleTypes.IsSigned(type, _owner._target);
+
+        private bool IsUnsignedIntegerType(QualifiedType type)
+            => GimpleTypes.IsIntegerLike(type) && !GimpleTypes.IsSigned(type, _owner._target);
 
         private NotSupportedException Unsupported(LirInstruction instruction, string message)
             => new NotSupportedException($"{message} Function '{_function.Symbol?.Name ?? _functionLabel}', LIR instruction #{instruction.Ordinal} [{instruction.Kind}/{instruction.TreeCode}].");

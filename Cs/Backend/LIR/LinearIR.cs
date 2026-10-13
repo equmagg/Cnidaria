@@ -281,10 +281,8 @@ namespace Cnidaria.Cs
                 flags |= GenTreeLinearFlags.AbiCall | GenTreeLinearFlags.CallerSavedKill;
             else if (EmitsReturningHelperCall(source))
                 flags |= GenTreeLinearFlags.CallerSavedKill;
-            else if (PreservesCallerSavedRegisters(source, _target, memoryAccess))
-                flags |= GenTreeLinearFlags.CallerSavedRegistersPreserved;
             else if (MayClobberCallerSaved(source, _target))
-                flags |= _nonCallOperationsClobberCallerSavedRegisters
+                flags |= _nonCallOperationsClobberCallerSavedRegisters && !ThrowsWithoutReturningCall(source)
                     ? GenTreeLinearFlags.CallerSavedKill
                     : GenTreeLinearFlags.CallerSavedRegistersPreserved;
 
@@ -594,16 +592,18 @@ namespace Cnidaria.Cs
                 GenTreeKind.DelegateRemove;
         }
 
-        private static bool PreservesCallerSavedRegisters(GenTree source, TargetInfo target, LinearMemoryAccess memoryAccess)
-        {
-            if ((!target.IsRiscV && !target.IsArm) || source.Kind is not (GenTreeKind.LoadIndirect or GenTreeKind.StoreIndirect))
-                return false;
-
-            if (memoryAccess.IsBlockCopy)
-                return false;
-
-            return (memoryAccess.Flags & LinearMemoryAccessFlags.RequiresWriteBarrier) == 0;
-        }
+        // These expand into reserved scratch and allocated internals, and the only call they make throws
+        private static bool ThrowsWithoutReturningCall(GenTree source)
+            => source.Kind switch
+            {
+                GenTreeKind.Field or GenTreeKind.FieldAddr or GenTreeKind.StoreField or
+                GenTreeKind.StaticField or GenTreeKind.StaticFieldAddr or GenTreeKind.StoreStaticField or
+                GenTreeKind.LoadIndirect or GenTreeKind.StoreIndirect or GenTreeKind.NullCheck or
+                GenTreeKind.ArrayLength or GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or
+                GenTreeKind.StoreArrayElement or GenTreeKind.ArrayDataRef or GenTreeKind.BoundsCheck or GenTreeKind.Conv => true,
+                GenTreeKind.Binary => source.StackKind is not (GenStackKind.R4 or GenStackKind.R8),
+                _ => false,
+            };
 
         public static bool MayClobberCallerSaved(GenTree source, TargetInfo target)
         {
@@ -655,7 +655,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.StaticField or GenTreeKind.StaticFieldAddr or GenTreeKind.StoreStaticField or
                 GenTreeKind.LoadIndirect or GenTreeKind.StoreIndirect or GenTreeKind.NullCheck or
                 GenTreeKind.ArrayLength or GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or
-                GenTreeKind.StoreArrayElement or GenTreeKind.ArrayDataRef)
+                GenTreeKind.StoreArrayElement or GenTreeKind.ArrayDataRef or GenTreeKind.BoundsCheck)
             {
                 return true;
             }

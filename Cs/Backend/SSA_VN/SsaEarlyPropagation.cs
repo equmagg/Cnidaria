@@ -321,6 +321,16 @@ namespace Cnidaria.Cs
                     flags |= GenTreeFlags.BoundsCheckEliminated;
                 }
 
+                if (node.Kind == GenTreeKind.BoundsCheck &&
+                    (flags & GenTreeFlags.BoundsCheckEliminated) == 0 &&
+                    TryGetArrayIndexConstant(actualOperands[0], out long checkedIndex) &&
+                    TryGetArrayIndexConstant(actualOperands[1], out long checkedLength) &&
+                    checkedIndex >= 0 &&
+                    checkedIndex < checkedLength)
+                {
+                    flags |= GenTreeFlags.BoundsCheckEliminated;
+                }
+
                 if (rewrittenOperands is null && flags == node.Flags)
                     return node;
 

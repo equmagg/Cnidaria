@@ -22,6 +22,15 @@ vbool8_t __riscv_vmseq_vx_u64m8_b8(vuint64m8_t vs2, u64 vs1, u64 vl);
 vbool8_t __riscv_vmsne_vx_u64m8_b8(vuint64m8_t vs2, u64 vs1, u64 vl);
 vbool8_t __riscv_vmor_mm_b8(vbool8_t vs2, vbool8_t vs1, u64 vl);
 long __riscv_vfirst_m_b8(vbool8_t vs2, u64 vl);
+typedef __rvv_uint32m8_t vuint32m8_t;
+typedef __rvv_bool4_t vbool4_t;
+u64 __riscv_vsetvl_e32m8(u64 avl);
+vuint32m8_t __riscv_vle32_v_u32m8(const u32* rs1, u64 vl);
+vuint32m8_t __riscv_vand_vx_u32m8(vuint32m8_t vs2, u32 vs1, u64 vl);
+vuint32m8_t __riscv_vadd_vx_u32m8(vuint32m8_t vs2, u32 vs1, u64 vl);
+vuint32m8_t __riscv_vid_v_u32m8(u64 vl);
+vbool4_t __riscv_vmsne_vv_u32m8_b4(vuint32m8_t vs2, vuint32m8_t vs1, u64 vl);
+long __riscv_vfirst_m_b4(vbool4_t vs2, u64 vl);
 #endif
 
 #define NULL ((void*)0)
@@ -44,6 +53,7 @@ long __riscv_vfirst_m_b8(vbool8_t vs2, u64 vl);
 #define USER_STACK_TOP 0x4000000000ul
 #define USER_STACK_SIZE 0x00100000ul
 #define USER_VA_LIMIT 0x4000000000ul
+#define GIGABYTE 0x40000000ul
 #define VIRTIO_MMIO_DEFAULT_BASE 0x10001000ul
 #define UART_MMIO_BASE 0x10000000ul
 #define CLINT_MMIO_BASE 0x02000000ul
@@ -56,6 +66,8 @@ long __riscv_vfirst_m_b8(vbool8_t vs2, u64 vl);
 #define PTE_A 0x040ul
 #define PTE_D 0x080ul
 #define PTE_SOFT_NOACCESS 0x100ul
+// A page a fork left shared that the space may write: the first store takes a copy, or the page itself once no one else maps it
+#define PTE_SOFT_COW 0x200ul
 #define SATP_MODE_SV39 0x8000000000000000ul
 #define ELF_PT_LOAD 1u
 #define ELF_PT_INTERP 3u
@@ -131,6 +143,17 @@ long __riscv_vfirst_m_b8(vbool8_t vs2, u64 vl);
 #define SYS_MPROTECT 226ul
 #define SYS_WAIT4 260ul
 #define SYS_PRLIMIT64 261ul
+#define SYS_PPOLL 73ul
+#define POLLIN 0x001u
+#define POLLOUT 0x004u
+#define POLLERR 0x008u
+#define POLLHUP 0x010u
+#define POLLNVAL 0x020u
+#define POLLRDNORM 0x040u
+#define POLLWRNORM 0x100u
+#define POLL_READABLE (POLLIN | POLLRDNORM)
+#define POLL_WRITABLE (POLLOUT | POLLWRNORM)
+#define MAX_POLL_FDS 64u
 #define AT_NULL 0ul
 #define AT_PAGESZ 6ul
 #define AT_ENTRY 9ul
@@ -152,6 +175,9 @@ long __riscv_vfirst_m_b8(vbool8_t vs2, u64 vl);
 #define VFS_NODE_DEV_DIR 6u
 #define VFS_NODE_FAT_DIR 7u
 #define VFS_NODE_CURRENT_TTY 8u
+#define VFS_NODE_INPUT_DIR 9u
+#define VFS_NODE_EVDEV 10u
+#define VFS_NODE_DSP 11u
 #define FAT_ATTRIBUTE_DIRECTORY 16u
 #define FAT_ATTRIBUTE_VOLUME 8u
 #define FAT_ATTRIBUTE_LONG_NAME 15u
@@ -270,6 +296,8 @@ long __riscv_vfirst_m_b8(vbool8_t vs2, u64 vl);
 #define SLEEP_TIMER 3u
 #define SLEEP_CONSOLE 4u
 #define SLEEP_SIGWAIT 5u
+#define SLEEP_DEVICE 6u
+#define SLEEP_POLL 7u
 #define STOP_REPORT_STOPPED 1u
 #define STOP_REPORT_CONTINUED 2u
 #define DEFAULT_TIME_SLICE 4u
@@ -454,6 +482,142 @@ struct virtio_block_request
     u8 status;
 };
 
+#define MAX_VIRTIO_DEVICES 16u
+#define VIRTIO_ID_BLOCK 2u
+#define VIRTIO_ID_INPUT 18u
+#define VIRTIO_ID_SOUND 25u
+#define VIRTQ_SIZE 64u
+#define VIRTQ_DESC_NEXT 1u
+#define VIRTQ_DESC_WRITE 2u
+#define VIRTIO_INPUT_ID_NAME 1u
+#define VIRTIO_INPUT_ID_SERIAL 2u
+#define VIRTIO_INPUT_ID_DEVIDS 3u
+#define VIRTIO_INPUT_PROP_BITS 0x10u
+#define VIRTIO_INPUT_EV_BITS 0x11u
+#define VIRTIO_INPUT_ABS_INFO 0x12u
+#define MAX_INPUT_DEVICES 4u
+#define INPUT_EVENT_BUFFERS 32u
+#define EVDEV_CLIENTS 16u
+#define EVDEV_CLIENT_EVENTS 64u
+#define EVDEV_EVENT_SIZE 24u
+#define EVDEV_KEY_BITS 768u
+#define EV_SYN 0u
+#define EV_KEY 1u
+#define SYN_REPORT 0u
+#define SYN_DROPPED 3u
+#define KEY_LEFTCTRL 29u
+#define KEY_A 30u
+#define KEY_LEFTSHIFT 42u
+#define KEY_RIGHTSHIFT 54u
+#define KEY_LEFTALT 56u
+#define KEY_CAPSLOCK 58u
+#define KEY_F1 59u
+#define KEY_F4 62u
+#define KEY_F5 63u
+#define KEY_F6 64u
+#define KEY_F10 68u
+#define KEY_KP7 71u
+#define KEY_KPDOT 83u
+#define KEY_F11 87u
+#define KEY_F12 88u
+#define KEY_KPENTER 96u
+#define KEY_RIGHTCTRL 97u
+#define KEY_KPSLASH 98u
+#define KEY_RIGHTALT 100u
+#define KEY_HOME 102u
+#define KEY_UP 103u
+#define KEY_PAGEUP 104u
+#define KEY_LEFT 105u
+#define KEY_RIGHT 106u
+#define KEY_END 107u
+#define KEY_DOWN 108u
+#define KEY_PAGEDOWN 109u
+#define KEY_INSERT 110u
+#define KEY_DELETE 111u
+#define SOUND_SLOTS 8u
+#define SOUND_SLOT_BYTES 4096u
+#define VIRTIO_SND_R_PCM_INFO 0x0100u
+#define VIRTIO_SND_R_PCM_SET_PARAMS 0x0101u
+#define VIRTIO_SND_R_PCM_PREPARE 0x0102u
+#define VIRTIO_SND_R_PCM_RELEASE 0x0103u
+#define VIRTIO_SND_R_PCM_START 0x0104u
+#define VIRTIO_SND_R_PCM_STOP 0x0105u
+#define VIRTIO_SND_S_OK 0x8000u
+#define AFMT_QUERY 0u
+#define AFMT_U8 0x00000008u
+#define AFMT_S16_LE 0x00000010u
+#define AFMT_S32_LE 0x00001000u
+#define AFMT_FLOAT 0x00004000u
+#define SNDCTL_DSP_RESET 0x00005000ul
+#define SNDCTL_DSP_SYNC 0x00005001ul
+#define SNDCTL_DSP_SPEED 0xc0045002ul
+#define SNDCTL_DSP_STEREO 0xc0045003ul
+#define SNDCTL_DSP_GETBLKSIZE 0xc0045004ul
+#define SNDCTL_DSP_SETFMT 0xc0045005ul
+#define SNDCTL_DSP_CHANNELS 0xc0045006ul
+#define SNDCTL_DSP_POST 0x00005008ul
+#define SNDCTL_DSP_SETFRAGMENT 0xc004500aul
+#define SNDCTL_DSP_GETFMTS 0x8004500bul
+#define SNDCTL_DSP_GETOSPACE 0x8010500cul
+#define SNDCTL_DSP_NONBLOCK 0x0000500eul
+#define SNDCTL_DSP_GETCAPS 0x8004500ful
+#define SNDCTL_DSP_GETODELAY 0x80045017ul
+#define OSS_GETVERSION 0x80044d76ul
+
+struct virtq
+{
+    u64 base;
+    u32 index;
+    u32 size;
+    struct virtq_descriptor* desc;
+    volatile u16* avail;
+    volatile u16* used;
+    u16 next_avail;
+    u16 seen_used;
+};
+
+struct input_device
+{
+    u64 base;
+    struct virtq events;
+    u8* buffers;
+    u32 keyboard;
+    // The client holding EVIOCGRAB, plus one; it alone hears the device, and the terminal does not
+    u32 grabbed;
+    u8 keys[EVDEV_KEY_BITS / 8u];
+};
+
+// One open of an event node: its own queue, of which only whole packets, up to a SYN_REPORT, can be read
+struct evdev_client
+{
+    u32 refs;
+    u32 device;
+    u32 head;
+    u32 count;
+    u32 ready;
+    u8 ring[EVDEV_CLIENT_EVENTS * EVDEV_EVENT_SIZE];
+};
+
+struct sound_card
+{
+    u64 base;
+    struct virtq control;
+    struct virtq transmit;
+    u8* control_page;
+    u8* headers;
+    u8* slot_data[SOUND_SLOTS];
+    u32 fill[SOUND_SLOTS];
+    u32 busy[SOUND_SLOTS];
+    u32 current;
+    u32 format;
+    u32 rate;
+    u32 channels;
+    u32 configured;
+    u32 running;
+    u32 open;
+    u32 draining;
+};
+
 struct vfs_node
 {
     u32 type;
@@ -472,6 +636,8 @@ struct file_descriptor
     u32 flags;
     u64 offset;
     struct vfs_node node;
+    // What the open created, shared by every descriptor a fork copies from it: an evdev client
+    u32 object;
 };
 
 struct path_result
@@ -490,7 +656,6 @@ struct vm_region
     u64 end;
     u64 prot;
     u64 flags;
-    u32 used;
 };
 
 struct signal_action
@@ -535,6 +700,7 @@ struct process
     u32 restart_pending;
     u32 ctty;
     u32 tty_timed_out;
+    u32 vm_region_count;
     u64 signal_blocked;
     u64 signal_pending;
     u64 signal_saved_blocked;
@@ -585,9 +751,27 @@ static struct virtq_descriptor virtq_desc[VIRTIO_QUEUE_SIZE];
 static u16 virtq_avail[2 + VIRTIO_QUEUE_SIZE];
 static u16 virtq_used_raw[2 + VIRTIO_QUEUE_SIZE * 4];
 static struct virtio_block_request virtio_request;
+static u64 virtio_bases[MAX_VIRTIO_DEVICES];
+static u32 virtio_count;
+static struct input_device input_devices[MAX_INPUT_DEVICES];
+static u32 input_device_count;
+static struct sound_card sound;
+static struct evdev_client evdev_clients[EVDEV_CLIENTS];
+// Clients in use; with none, fork and exit have no descriptor of theirs to account for
+static u32 evdev_clients_open;
+// Set whenever a device delivers something, so tasks sleeping on one try their call again
+static u32 device_activity;
+static void map_virtio_windows(u64 root);
+static int kernel_window_index(u32 index);
+static void input_poll(void);
+static void sound_init(void);
+static u32 sound_virtio_format(u32 format);
+static u32 sound_virtio_rate(u32 rate);
 static u8 sector_buffer[SECTOR_SIZE];
 static u8 file_read_buffer[PAGE_SIZE];
-static u8 fat_buffer[SECTOR_SIZE];
+// Words, so the FAT entries in it can be loaded as vectors of 32-bit elements
+static u64 fat_buffer_words[SECTOR_SIZE / 8u];
+#define fat_buffer ((u8*)fat_buffer_words)
 static u8 dir_buffer[SECTOR_SIZE];
 
 static u8 dirent_buffer[800];
@@ -680,6 +864,9 @@ static void sbi_system_reset(u64 reset_type, u64 reset_reason)
 }
 
 static void fbcon_putchar(int ch);
+static void fbcon_write(const u8* data, u64 count);
+static void fbcon_begin(void);
+static void fbcon_end(void);
 
 static int uart_can_read(void)
 {
@@ -730,12 +917,7 @@ static void uart_putchar(int ch)
 static void uart_write_buffer(const u8* data, u64 count)
 {
     u64 base = boot_device.uart_base;
-    u64 drawn = 0ul;
-    while (drawn < count)
-    {
-        fbcon_putchar((int)data[drawn]);
-        drawn = drawn + 1ul;
-    }
+    fbcon_write(data, count);
     __asm__ volatile(
         "beq %[count], zero, .Luart_write_done_%=\n"
         ".Luart_write_next_%=:\n"
@@ -912,6 +1094,20 @@ static void mem_copy(void* dst, const void* src, u64 count)
 #endif
 }
 
+static int mem_equal(const void* left, const void* right, u64 count)
+{
+    const u8* a = (const u8*)left;
+    const u8* b = (const u8*)right;
+    u64 index = 0ul;
+    while (index < count)
+    {
+        if (a[index] != b[index])
+            return 0;
+        index = index + 1ul;
+    }
+    return 1;
+}
+
 static void mem_zero(void* dst, u64 count)
 {
     u8* bytes = (u8*)dst;
@@ -1068,6 +1264,89 @@ static u64 fbcon_column;
 static u64 fbcon_row;
 static int fbcon_cursor_shown;
 
+// The console speaks enough of a VT100 with xterm colours for full-screen programs
+#define FBCON_STATE_NORMAL 0u
+#define FBCON_STATE_ESCAPE 1u
+#define FBCON_STATE_CSI 2u
+#define FBCON_STATE_STRING 3u
+#define FBCON_STATE_CHARSET 4u
+#define FBCON_MAX_PARAMS 8u
+#define FBCON_DEFAULT_FG 7u
+#define FBCON_DEFAULT_BG 0u
+
+static const u32 fbcon_palette[16] = {
+    0x00000000u, 0x00AA0000u, 0x0000AA00u, 0x00AA5500u, 0x000000AAu, 0x00AA00AAu, 0x0000AAAAu, FBCON_FOREGROUND,
+    0x00555555u, 0x00FF5555u, 0x0055FF55u, 0x00FFFF55u, 0x005555FFu, 0x00FF55FFu, 0x0055FFFFu, 0x00FFFFFFu,
+};
+
+static u32 fbcon_state;
+static u32 fbcon_params[FBCON_MAX_PARAMS];
+static u32 fbcon_param_count;
+static u32 fbcon_private;
+static u32 fbcon_fg;
+static u32 fbcon_bg;
+static u32 fbcon_bold;
+static u32 fbcon_reverse;
+static u64 fbcon_top;
+static u64 fbcon_bottom;
+static u64 fbcon_saved_column;
+static u64 fbcon_saved_row;
+static int fbcon_cursor_enabled;
+static u32 fbcon_utf8_pending;
+
+static void tty_receive(u8 ch);
+
+static void fbcon_reset_state(void)
+{
+    fbcon_state = FBCON_STATE_NORMAL;
+    fbcon_fg = FBCON_DEFAULT_FG;
+    fbcon_bg = FBCON_DEFAULT_BG;
+    fbcon_bold = 0u;
+    fbcon_reverse = 0u;
+    fbcon_top = 0ul;
+    fbcon_bottom = fbcon_rows;
+    fbcon_saved_column = 0ul;
+    fbcon_saved_row = 0ul;
+    fbcon_cursor_enabled = 1;
+    fbcon_utf8_pending = 0u;
+}
+
+static u32 fbcon_foreground_pixel(void)
+{
+    u32 colour = fbcon_reverse ? fbcon_bg : fbcon_fg;
+    if (fbcon_bold && colour < 8u && !fbcon_reverse)
+        colour = colour + 8u;
+    return fbcon_palette[colour];
+}
+
+static u32 fbcon_background_pixel(void)
+{
+    return fbcon_palette[fbcon_reverse ? fbcon_fg : fbcon_bg];
+}
+
+static void fbcon_fill_cells(u64 row, u64 first_column, u64 end_column, u32 pixel)
+{
+    u64 line = 0ul;
+    u32* target;
+    if (row >= fbcon_rows || first_column >= end_column)
+        return;
+    if (end_column > fbcon_columns)
+        end_column = fbcon_columns;
+    target = fbcon_pixels + row * FBCON_GLYPH_HEIGHT * fbcon_row_pixels + first_column * FBCON_GLYPH_WIDTH;
+    while (line < FBCON_GLYPH_HEIGHT)
+    {
+        u64 pixel_index = 0ul;
+        u64 count = (end_column - first_column) * FBCON_GLYPH_WIDTH;
+        while (pixel_index < count)
+        {
+            target[pixel_index] = pixel;
+            pixel_index = pixel_index + 1ul;
+        }
+        target = target + fbcon_row_pixels;
+        line = line + 1ul;
+    }
+}
+
 static void fbcon_init(void)
 {
     volatile u64* registers;
@@ -1086,8 +1365,7 @@ static void fbcon_init(void)
 
     mem_zero(fbcon_pixels, registers[6]);
     fbcon_registers = registers;
-    fbcon_draw_cursor(1);
-    fbcon_registers[8] = 1ul;
+    fbcon_reset_state();
 }
 
 static void fbcon_draw_glyph(u64 column, u64 row, u32 code)
@@ -1095,6 +1373,8 @@ static void fbcon_draw_glyph(u64 column, u64 row, u32 code)
     const u8* glyph;
     u32* target;
     u64 line = 0ul;
+    u32 foreground = fbcon_foreground_pixel();
+    u32 background = fbcon_background_pixel();
 
     if (code < FBCON_FIRST_GLYPH || code > FBCON_LAST_GLYPH)
         code = (u32)'?';
@@ -1107,7 +1387,7 @@ static void fbcon_draw_glyph(u64 column, u64 row, u32 code)
         u64 pixel = 0ul;
         while (pixel < FBCON_GLYPH_WIDTH)
         {
-            target[pixel] = (bits & (0x80u >> pixel)) != 0u ? FBCON_FOREGROUND : 0u;
+            target[pixel] = (bits & (0x80u >> pixel)) != 0u ? foreground : background;
             pixel = pixel + 1ul;
         }
         target = target + fbcon_row_pixels;
@@ -1115,20 +1395,21 @@ static void fbcon_draw_glyph(u64 column, u64 row, u32 code)
     }
 }
 
-// The mark that says where the next character will land
+// The mark under the cell the next character lands in; inverting it twice gives the cell back unchanged
 static void fbcon_draw_cursor(int shown)
 {
     u32* target;
     u64 line = FBCON_GLYPH_HEIGHT - 2ul;
-    if (fbcon_column >= fbcon_columns || fbcon_row >= fbcon_rows)
+    u64 column = fbcon_column < fbcon_columns ? fbcon_column : fbcon_columns - 1ul;
+    if (shown == fbcon_cursor_shown || fbcon_row >= fbcon_rows || (shown && !fbcon_cursor_enabled))
         return;
-    target = fbcon_pixels + fbcon_row * FBCON_GLYPH_HEIGHT * fbcon_row_pixels + fbcon_column * FBCON_GLYPH_WIDTH;
+    target = fbcon_pixels + fbcon_row * FBCON_GLYPH_HEIGHT * fbcon_row_pixels + column * FBCON_GLYPH_WIDTH;
     while (line < FBCON_GLYPH_HEIGHT)
     {
         u64 pixel = 0ul;
         while (pixel < FBCON_GLYPH_WIDTH)
         {
-            target[line * fbcon_row_pixels + pixel] = shown ? FBCON_FOREGROUND : 0u;
+            target[line * fbcon_row_pixels + pixel] = target[line * fbcon_row_pixels + pixel] ^ 0x00FFFFFFu;
             pixel = pixel + 1ul;
         }
         line = line + 1ul;
@@ -1136,69 +1417,544 @@ static void fbcon_draw_cursor(int shown)
     fbcon_cursor_shown = shown;
 }
 
-static void fbcon_newline(void)
+// Rows from top up to bottom move up by count, and the rows that open at the bottom take the background
+static void fbcon_scroll_up(u64 top, u64 bottom, u64 count)
 {
-    u64 kept;
-    u64 shift;
-    fbcon_column = 0ul;
-    fbcon_row = fbcon_row + 1ul;
-    if (fbcon_row < fbcon_rows)
+    u64 row_size = FBCON_GLYPH_HEIGHT * fbcon_row_pixels;
+    u64 row;
+    if (top >= bottom)
         return;
+    if (count > bottom - top)
+        count = bottom - top;
+    if (count < bottom - top)
+        mem_copy(fbcon_pixels + top * row_size, fbcon_pixels + (top + count) * row_size, (bottom - top - count) * row_size * 4ul);
+    row = bottom - count;
+    while (row < bottom)
+    {
+        fbcon_fill_cells(row, 0ul, fbcon_columns, fbcon_background_pixel());
+        row = row + 1ul;
+    }
+}
 
-    // The screen is full, so everything moves up by one row of glyphs
-    fbcon_row = fbcon_rows - 1ul;
-    kept = (fbcon_rows - 1ul) * FBCON_GLYPH_HEIGHT * fbcon_row_pixels;
-    shift = FBCON_GLYPH_HEIGHT * fbcon_row_pixels;
-    mem_copy(fbcon_pixels, fbcon_pixels + shift, kept * 4ul);
-    mem_zero(fbcon_pixels + kept, shift * 4ul);
+static void fbcon_scroll_down(u64 top, u64 bottom, u64 count)
+{
+    u64 row_size = FBCON_GLYPH_HEIGHT * fbcon_row_pixels;
+    u64 row;
+    if (top >= bottom)
+        return;
+    if (count > bottom - top)
+        count = bottom - top;
+    row = bottom;
+    // Overlapping rows move from the bottom so none is overwritten before it is copied
+    while (row > top + count)
+    {
+        row = row - 1ul;
+        mem_copy(fbcon_pixels + row * row_size, fbcon_pixels + (row - count) * row_size, row_size * 4ul);
+    }
+    row = top;
+    while (row < top + count)
+    {
+        fbcon_fill_cells(row, 0ul, fbcon_columns, fbcon_background_pixel());
+        row = row + 1ul;
+    }
+}
+
+static void fbcon_index(void)
+{
+    if (fbcon_row + 1ul == fbcon_bottom)
+        fbcon_scroll_up(fbcon_top, fbcon_bottom, 1ul);
+    else if (fbcon_row + 1ul < fbcon_rows)
+        fbcon_row = fbcon_row + 1ul;
+}
+
+static void fbcon_reverse_index(void)
+{
+    if (fbcon_row == fbcon_top)
+        fbcon_scroll_down(fbcon_top, fbcon_bottom, 1ul);
+    else if (fbcon_row != 0ul)
+        fbcon_row = fbcon_row - 1ul;
+}
+
+static u32 fbcon_param(u32 index, u32 fallback)
+{
+    if (index >= fbcon_param_count || fbcon_params[index] == 0u)
+        return fallback;
+    return fbcon_params[index];
+}
+
+static void fbcon_move_to(u64 row, u64 column)
+{
+    fbcon_row = row < fbcon_rows ? row : fbcon_rows - 1ul;
+    fbcon_column = column < fbcon_columns ? column : fbcon_columns - 1ul;
+}
+
+static void fbcon_reply(const char* text)
+{
+    while (*text != 0)
+    {
+        tty_receive((u8)*text);
+        text = text + 1;
+    }
+}
+
+static void fbcon_reply_number(u64 value)
+{
+    char digits[24];
+    u32 length = 0u;
+    do
+    {
+        digits[length] = (char)('0' + (int)(value % 10ul));
+        value = value / 10ul;
+        length = length + 1u;
+    } while (value != 0ul);
+    while (length != 0u)
+    {
+        length = length - 1u;
+        tty_receive((u8)digits[length]);
+    }
+}
+
+static void fbcon_select_graphic_rendition(void)
+{
+    u32 index = 0u;
+    if (fbcon_param_count == 0u)
+        fbcon_param_count = 1u;
+    while (index < fbcon_param_count)
+    {
+        u32 value = fbcon_params[index];
+        index = index + 1u;
+        if (value == 0u)
+        {
+            fbcon_fg = FBCON_DEFAULT_FG;
+            fbcon_bg = FBCON_DEFAULT_BG;
+            fbcon_bold = 0u;
+            fbcon_reverse = 0u;
+        }
+        else if (value == 1u)
+            fbcon_bold = 1u;
+        else if (value == 22u)
+            fbcon_bold = 0u;
+        else if (value == 7u)
+            fbcon_reverse = 1u;
+        else if (value == 27u)
+            fbcon_reverse = 0u;
+        else if (value >= 30u && value <= 37u)
+            fbcon_fg = value - 30u;
+        else if (value == 39u)
+            fbcon_fg = FBCON_DEFAULT_FG;
+        else if (value >= 40u && value <= 47u)
+            fbcon_bg = value - 40u;
+        else if (value == 49u)
+            fbcon_bg = FBCON_DEFAULT_BG;
+        else if (value >= 90u && value <= 97u)
+            fbcon_fg = value - 90u + 8u;
+        else if (value >= 100u && value <= 107u)
+            fbcon_bg = value - 100u + 8u;
+    }
+}
+
+// Characters at and after the cursor move right by count, or left over the ones deleted
+static void fbcon_shift_cells(u64 count, int insert)
+{
+    u64 line = 0ul;
+    u64 width = fbcon_columns - fbcon_column;
+    u64 cell_pixels = FBCON_GLYPH_WIDTH;
+    if (count > width)
+        count = width;
+    while (line < FBCON_GLYPH_HEIGHT)
+    {
+        u32* row = fbcon_pixels + (fbcon_row * FBCON_GLYPH_HEIGHT + line) * fbcon_row_pixels + fbcon_column * cell_pixels;
+        u64 moved = (width - count) * cell_pixels;
+        u64 index;
+        if (insert)
+        {
+            index = moved;
+            while (index != 0ul)
+            {
+                index = index - 1ul;
+                row[index + count * cell_pixels] = row[index];
+            }
+        }
+        else
+        {
+            index = 0ul;
+            while (index < moved)
+            {
+                row[index] = row[index + count * cell_pixels];
+                index = index + 1ul;
+            }
+        }
+        line = line + 1ul;
+    }
+    if (insert)
+        fbcon_fill_cells(fbcon_row, fbcon_column, fbcon_column + count, fbcon_background_pixel());
+    else
+        fbcon_fill_cells(fbcon_row, fbcon_columns - count, fbcon_columns, fbcon_background_pixel());
+}
+
+static void fbcon_erase_display(u32 mode)
+{
+    u64 row = 0ul;
+    u32 background = fbcon_background_pixel();
+    if (mode == 0u)
+    {
+        fbcon_fill_cells(fbcon_row, fbcon_column, fbcon_columns, background);
+        row = fbcon_row + 1ul;
+        while (row < fbcon_rows)
+        {
+            fbcon_fill_cells(row, 0ul, fbcon_columns, background);
+            row = row + 1ul;
+        }
+        return;
+    }
+    if (mode == 1u)
+    {
+        while (row < fbcon_row)
+        {
+            fbcon_fill_cells(row, 0ul, fbcon_columns, background);
+            row = row + 1ul;
+        }
+        fbcon_fill_cells(fbcon_row, 0ul, fbcon_column + 1ul, background);
+        return;
+    }
+    while (row < fbcon_rows)
+    {
+        fbcon_fill_cells(row, 0ul, fbcon_columns, background);
+        row = row + 1ul;
+    }
+}
+
+static void fbcon_erase_line(u32 mode)
+{
+    u32 background = fbcon_background_pixel();
+    if (mode == 0u)
+        fbcon_fill_cells(fbcon_row, fbcon_column, fbcon_columns, background);
+    else if (mode == 1u)
+        fbcon_fill_cells(fbcon_row, 0ul, fbcon_column + 1ul, background);
+    else
+        fbcon_fill_cells(fbcon_row, 0ul, fbcon_columns, background);
+}
+
+static void fbcon_private_mode(u32 mode, int enabled)
+{
+    if (mode == 25u)
+        fbcon_cursor_enabled = enabled;
+}
+
+static void fbcon_csi(u8 final)
+{
+    u32 count = fbcon_param(0u, 1u);
+    if (fbcon_private == (u32)'?')
+    {
+        u32 index = 0u;
+        if (final == 'h' || final == 'l')
+        {
+            while (index < fbcon_param_count)
+            {
+                fbcon_private_mode(fbcon_params[index], final == 'h');
+                index = index + 1u;
+            }
+        }
+        return;
+    }
+    if (fbcon_private != 0u)
+        return;
+    if (fbcon_column >= fbcon_columns)
+        fbcon_column = fbcon_columns - 1ul;
+    switch (final)
+    {
+    case 'A':
+        fbcon_row = fbcon_row >= (u64)count ? fbcon_row - (u64)count : 0ul;
+        break;
+    case 'B':
+        fbcon_move_to(fbcon_row + (u64)count, fbcon_column);
+        break;
+    case 'C':
+        fbcon_move_to(fbcon_row, fbcon_column + (u64)count);
+        break;
+    case 'D':
+        fbcon_column = fbcon_column >= (u64)count ? fbcon_column - (u64)count : 0ul;
+        break;
+    case 'E':
+        fbcon_move_to(fbcon_row + (u64)count, 0ul);
+        break;
+    case 'F':
+        fbcon_move_to(fbcon_row >= (u64)count ? fbcon_row - (u64)count : 0ul, 0ul);
+        break;
+    case 'G':
+    case '`':
+        fbcon_move_to(fbcon_row, (u64)count - 1ul);
+        break;
+    case 'd':
+        fbcon_move_to((u64)count - 1ul, fbcon_column);
+        break;
+    case 'H':
+    case 'f':
+        fbcon_move_to((u64)fbcon_param(0u, 1u) - 1ul, (u64)fbcon_param(1u, 1u) - 1ul);
+        break;
+    case 'J':
+        fbcon_erase_display(fbcon_param_count == 0u ? 0u : fbcon_params[0]);
+        break;
+    case 'K':
+        fbcon_erase_line(fbcon_param_count == 0u ? 0u : fbcon_params[0]);
+        break;
+    case 'L':
+        if (fbcon_row >= fbcon_top && fbcon_row < fbcon_bottom)
+            fbcon_scroll_down(fbcon_row, fbcon_bottom, (u64)count);
+        break;
+    case 'M':
+        if (fbcon_row >= fbcon_top && fbcon_row < fbcon_bottom)
+            fbcon_scroll_up(fbcon_row, fbcon_bottom, (u64)count);
+        break;
+    case '@':
+        fbcon_shift_cells((u64)count, 1);
+        break;
+    case 'P':
+        fbcon_shift_cells((u64)count, 0);
+        break;
+    case 'X':
+        fbcon_fill_cells(fbcon_row, fbcon_column, fbcon_column + (u64)count, fbcon_background_pixel());
+        break;
+    case 'S':
+        fbcon_scroll_up(fbcon_top, fbcon_bottom, (u64)count);
+        break;
+    case 'T':
+        fbcon_scroll_down(fbcon_top, fbcon_bottom, (u64)count);
+        break;
+    case 'm':
+        fbcon_select_graphic_rendition();
+        break;
+    case 'r':
+    {
+        u64 top = (u64)fbcon_param(0u, 1u) - 1ul;
+        u64 bottom = (u64)fbcon_param(1u, (u32)fbcon_rows);
+        if (bottom > fbcon_rows)
+            bottom = fbcon_rows;
+        if (top + 1ul < bottom)
+        {
+            fbcon_top = top;
+            fbcon_bottom = bottom;
+            fbcon_move_to(0ul, 0ul);
+        }
+        break;
+    }
+    case 's':
+        fbcon_saved_row = fbcon_row;
+        fbcon_saved_column = fbcon_column;
+        break;
+    case 'u':
+        fbcon_move_to(fbcon_saved_row, fbcon_saved_column);
+        break;
+    case 'n':
+        if (fbcon_param_count != 0u && fbcon_params[0] == 6u)
+        {
+            fbcon_reply("\x1b[");
+            fbcon_reply_number(fbcon_row + 1ul);
+            tty_receive((u8)';');
+            fbcon_reply_number(fbcon_column + 1ul);
+            tty_receive((u8)'R');
+        }
+        else if (fbcon_param_count != 0u && fbcon_params[0] == 5u)
+            fbcon_reply("\x1b[0n");
+        break;
+    case 'c':
+        fbcon_reply("\x1b[?6c");
+        break;
+    default:
+        break;
+    }
+}
+
+static void fbcon_escape(u8 ch)
+{
+    fbcon_state = FBCON_STATE_NORMAL;
+    switch (ch)
+    {
+    case '[':
+        fbcon_state = FBCON_STATE_CSI;
+        fbcon_param_count = 0u;
+        fbcon_params[0] = 0u;
+        fbcon_private = 0u;
+        break;
+    case ']':
+    case 'P':
+    case '_':
+    case '^':
+        fbcon_state = FBCON_STATE_STRING;
+        break;
+    case '(':
+    case ')':
+    case '*':
+    case '+':
+        fbcon_state = FBCON_STATE_CHARSET;
+        break;
+    case '7':
+        fbcon_saved_row = fbcon_row;
+        fbcon_saved_column = fbcon_column;
+        break;
+    case '8':
+        fbcon_move_to(fbcon_saved_row, fbcon_saved_column);
+        break;
+    case 'D':
+        fbcon_index();
+        break;
+    case 'E':
+        fbcon_column = 0ul;
+        fbcon_index();
+        break;
+    case 'M':
+        fbcon_reverse_index();
+        break;
+    case 'c':
+        fbcon_reset_state();
+        fbcon_move_to(0ul, 0ul);
+        fbcon_erase_display(2u);
+        break;
+    default:
+        break;
+    }
+}
+
+static void fbcon_csi_byte(u8 ch)
+{
+    if (ch >= '0' && ch <= '9')
+    {
+        if (fbcon_param_count == 0u)
+            fbcon_param_count = 1u;
+        if (fbcon_param_count <= FBCON_MAX_PARAMS && fbcon_params[fbcon_param_count - 1u] < 10000u)
+            fbcon_params[fbcon_param_count - 1u] = fbcon_params[fbcon_param_count - 1u] * 10u + (u32)(ch - '0');
+        return;
+    }
+    if (ch == ';')
+    {
+        if (fbcon_param_count == 0u)
+            fbcon_param_count = 1u;
+        if (fbcon_param_count < FBCON_MAX_PARAMS)
+        {
+            fbcon_params[fbcon_param_count] = 0u;
+            fbcon_param_count = fbcon_param_count + 1u;
+        }
+        return;
+    }
+    if (ch >= 0x3cu && ch <= 0x3fu)
+    {
+        fbcon_private = (u32)ch;
+        return;
+    }
+    if (ch >= 0x20u && ch <= 0x2fu)
+        return;
+    fbcon_state = FBCON_STATE_NORMAL;
+    if (ch >= 0x40u && ch <= 0x7eu)
+        fbcon_csi(ch);
+}
+
+static void fbcon_print(u32 code)
+{
+    if (fbcon_column >= fbcon_columns)
+    {
+        fbcon_column = 0ul;
+        fbcon_index();
+    }
+    fbcon_draw_glyph(fbcon_column, fbcon_row, code);
+    fbcon_column = fbcon_column + 1ul;
+}
+
+static u32 fbcon_batch;
+
+// Output in a batch is drawn without the cursor, which comes back and is presented once the batch ends
+static void fbcon_begin(void)
+{
+    if (fbcon_registers == (volatile u64*)0)
+        return;
+    if (fbcon_batch == 0u)
+        fbcon_draw_cursor(0);
+    fbcon_batch = fbcon_batch + 1u;
+}
+
+static void fbcon_end(void)
+{
+    if (fbcon_registers == (volatile u64*)0)
+        return;
+    fbcon_batch = fbcon_batch - 1u;
+    if (fbcon_batch != 0u)
+        return;
+    fbcon_draw_cursor(1);
+    fbcon_registers[8] = 1ul;
+}
+
+static void fbcon_byte(u8 byte)
+{
+    if (fbcon_state == FBCON_STATE_ESCAPE)
+        fbcon_escape(byte);
+    else if (fbcon_state == FBCON_STATE_CSI)
+        fbcon_csi_byte(byte);
+    else if (fbcon_state == FBCON_STATE_STRING)
+    {
+        if (byte == 7u || byte == 0x9cu)
+            fbcon_state = FBCON_STATE_NORMAL;
+        else if (byte == 27u)
+            fbcon_state = FBCON_STATE_ESCAPE;
+    }
+    else if (fbcon_state == FBCON_STATE_CHARSET)
+        fbcon_state = FBCON_STATE_NORMAL;
+    else if (fbcon_utf8_pending != 0u && (byte & 0xc0u) == 0x80u)
+    {
+        fbcon_utf8_pending = fbcon_utf8_pending - 1u;
+        if (fbcon_utf8_pending == 0u)
+            fbcon_print((u32)'?');
+    }
+    else if (byte == 27u)
+    {
+        fbcon_utf8_pending = 0u;
+        fbcon_state = FBCON_STATE_ESCAPE;
+    }
+    else if (byte == '\n' || byte == 11u || byte == 12u)
+        fbcon_index();
+    else if (byte == '\r')
+        fbcon_column = 0ul;
+    else if (byte == '\b')
+    {
+        if (fbcon_column >= fbcon_columns)
+            fbcon_column = fbcon_columns - 1ul;
+        if (fbcon_column != 0ul)
+            fbcon_column = fbcon_column - 1ul;
+    }
+    else if (byte == '\t')
+    {
+        u64 stop = (fbcon_column + 8ul) & ~7ul;
+        fbcon_column = stop < fbcon_columns ? stop : fbcon_columns - 1ul;
+    }
+    else if (byte >= 32u && byte < 127u)
+        fbcon_print((u32)byte);
+    else if (byte >= 0xc0u && byte < 0xf8u)
+        // A character outside the font shows as one mark however many bytes it takes
+        fbcon_utf8_pending = byte >= 0xf0u ? 3u : byte >= 0xe0u ? 2u : 1u;
 }
 
 static void fbcon_putchar(int ch)
 {
     if (fbcon_registers == (volatile u64*)0)
         return;
-    if (fbcon_cursor_shown)
-        fbcon_draw_cursor(0);
+    fbcon_begin();
+    fbcon_byte((u8)ch);
+    fbcon_end();
+}
 
-    if (ch == '\n')
-    {
-        fbcon_newline();
-    }
-    else if (ch == '\r')
-    {
-        fbcon_column = 0ul;
-    }
-    else if (ch == '\b')
-    {
-        if (fbcon_column != 0ul)
-            fbcon_column = fbcon_column - 1ul;
-    }
-    else if (ch == '\t')
-    {
-        u64 stop = (fbcon_column + 8ul) & ~7ul;
-        while (fbcon_column < stop && fbcon_column < fbcon_columns)
-        {
-            fbcon_draw_glyph(fbcon_column, fbcon_row, (u32)' ');
-            fbcon_column = fbcon_column + 1ul;
-        }
-        if (fbcon_column >= fbcon_columns)
-            fbcon_newline();
-    }
-    else if (ch >= 32 && ch < 127)
-    {
-        if (fbcon_column >= fbcon_columns)
-            fbcon_newline();
-        fbcon_draw_glyph(fbcon_column, fbcon_row, (u32)ch);
-        fbcon_column = fbcon_column + 1ul;
-    }
-    else
-    {
-        fbcon_draw_cursor(1);
+// Text the terminal's output processing would send with each newline as a carriage return and line feed
+static void fbcon_write(const u8* data, u64 count)
+{
+    u64 index = 0ul;
+    if (fbcon_registers == (volatile u64*)0)
         return;
+    fbcon_begin();
+    while (index < count)
+    {
+        if (data[index] == (u8)'\n')
+            fbcon_byte((u8)'\r');
+        fbcon_byte(data[index]);
+        index = index + 1ul;
     }
-
-    fbcon_draw_cursor(1);
-    fbcon_registers[8] = 1ul;
+    fbcon_end();
 }
 
 static u16 le16(const u8* p)
@@ -1417,13 +2173,38 @@ static u64 physical_reserved_limit(u64 address, u64 size)
     return address;
 }
 
+// How many spaces beyond the first map each page of RAM, which a fork raises instead of copying the page
+static u8* page_shares;
+
 static void memory_manager_init(void)
 {
+    u64 share_bytes;
     free_page_cursor = align_up(KERNEL_RESERVED_END, PAGE_SIZE);
     free_page_end = align_down(ram_end(), PAGE_SIZE);
     free_page_list = 0ul;
-    if (free_page_cursor >= free_page_end)
+    share_bytes = align_up((free_page_end - RAM_BASE) >> 12, PAGE_SIZE);
+    if (free_page_cursor + share_bytes >= free_page_end || physical_reserved_limit(free_page_cursor, share_bytes) != free_page_cursor)
         panic("no usable physical memory");
+    page_shares = (u8*)free_page_cursor;
+    free_page_cursor = free_page_cursor + share_bytes;
+    mem_zero(page_shares, share_bytes);
+}
+
+static u64 free_page_clear_end;
+
+static u64 clear_end_before(u64 end, u64 address, u64 reserved_start)
+{
+    return reserved_start > address && reserved_start < end ? reserved_start : end;
+}
+
+// How far the cursor can run from address before it reaches a reserved range or the end of memory
+static u64 physical_clear_end(u64 address)
+{
+    u64 end = free_page_end;
+    end = clear_end_before(end, address, KERNEL_LOAD_BASE);
+    end = clear_end_before(end, address, USER_ELF_BUFFER);
+    end = clear_end_before(end, address, USER_INTERP_BUFFER);
+    return clear_end_before(end, address, KERNEL_STACK_TOP - KERNEL_STACK_RESERVE_SIZE);
 }
 
 static u64 alloc_page_raw(void)
@@ -1436,6 +2217,12 @@ static u64 alloc_page_raw(void)
         free_page_list = *((u64*)page);
         return page;
     }
+    if (free_page_cursor < free_page_clear_end && free_page_clear_end - free_page_cursor >= PAGE_SIZE)
+    {
+        page = free_page_cursor;
+        free_page_cursor = free_page_cursor + PAGE_SIZE;
+        return page;
+    }
     for (;;)
     {
         if (free_page_cursor + PAGE_SIZE < free_page_cursor || free_page_cursor + PAGE_SIZE > free_page_end)
@@ -1446,6 +2233,7 @@ static u64 alloc_page_raw(void)
             free_page_cursor = align_up(reserved_limit, PAGE_SIZE);
             continue;
         }
+        free_page_clear_end = physical_clear_end(free_page_cursor);
         page = free_page_cursor;
         free_page_cursor = free_page_cursor + PAGE_SIZE;
         return page;
@@ -1463,6 +2251,21 @@ static u64 alloc_page(void)
     u64 page = alloc_page_raw();
     mem_zero((void*)page, PAGE_SIZE);
     return page;
+}
+
+static u8* page_share(u64 physical)
+{
+    return &page_shares[(physical - RAM_BASE) >> 12];
+}
+
+// A user page goes back to the free list only with the last space that maps it
+static void user_page_put(u64 physical)
+{
+    u8* shares = page_share(physical);
+    if (*shares != 0u)
+        *shares = (u8)(*shares - 1u);
+    else
+        free_page_raw(physical);
 }
 
 static u64 pte_make(u64 physical, u64 flags)
@@ -1605,14 +2408,14 @@ static int unmap_user_page(u64 root, u64 virtual_address)
                 return 1;
             physical = pte_physical(pte);
             entries[index] = 0ul;
-            free_page_raw(physical);
+            user_page_put(physical);
             return 1;
         }
         if ((pte & PTE_U) == 0ul || (pte & (PTE_R | PTE_W | PTE_X)) == 0ul)
             return 0;
         physical = pte_physical(pte);
         entries[index] = 0ul;
-        free_page_raw(physical);
+        user_page_put(physical);
     }
     return 1;
 }
@@ -1627,6 +2430,46 @@ static int unmap_user_pages(u64 root, u64 start, u64 end)
         page = page + PAGE_SIZE;
     }
     __asm__ volatile("sfence.vma zero, zero" : : : "memory");
+    return 1;
+}
+
+static u64* user_leaf_pte(u64 root, u64 virtual_address)
+{
+    u64 table = root;
+    int level = 2;
+    while (level > 0)
+    {
+        u64 pte = ((u64*)table)[sv39_index(virtual_address, level)];
+        if ((pte & PTE_V) == 0ul || (pte & (PTE_R | PTE_W | PTE_X)) != 0ul)
+            return NULL;
+        table = pte_physical(pte);
+        level = level - 1;
+    }
+    return &((u64*)table)[sv39_index(virtual_address, 0)];
+}
+
+// A store to a page a fork left shared gets the page to itself: a copy while another space still maps it, else the page as it is
+static int user_break_cow(u64 root, u64 address)
+{
+    u64* entry;
+    u64 physical;
+    u8* shares;
+    if (address >= USER_VA_LIMIT)
+        return 0;
+    entry = user_leaf_pte(root, address);
+    if (entry == NULL || (*entry & (PTE_V | PTE_SOFT_COW)) != (PTE_V | PTE_SOFT_COW))
+        return 0;
+    physical = pte_physical(*entry);
+    shares = page_share(physical);
+    if (*shares != 0u)
+    {
+        u64 copy = alloc_page_raw();
+        mem_copy((void*)copy, (const void*)physical, PAGE_SIZE);
+        *shares = (u8)(*shares - 1u);
+        physical = copy;
+    }
+    *entry = pte_make(physical, (*entry & (PTE_R | PTE_X | PTE_U | PTE_A | PTE_D)) | PTE_W);
+    __asm__ volatile("sfence.vma %[page], zero" : : [page] "{t0}"(address) : "memory");
     return 1;
 }
 
@@ -1650,7 +2493,10 @@ static int user_address_range_valid(u64 address, u64 size)
         return 0;
     if (address < PAGE_SIZE || end > USER_VA_LIMIT)
         return 0;
-    if (ranges_overlap(address, size, RAM_BASE, ram_end() - RAM_BASE))
+    if (ranges_overlap(address, size, align_down(RAM_BASE, GIGABYTE), GIGABYTE))
+        return 0;
+    if (boot_device.framebuffer_base != 0ul && kernel_window_index(sv39_index(boot_device.framebuffer_base, 2)) &&
+        ranges_overlap(address, size, align_down(boot_device.framebuffer_base, GIGABYTE), GIGABYTE))
         return 0;
     if (ranges_overlap(address, size, UART_MMIO_BASE, 0x00010000ul))
         return 0;
@@ -1798,15 +2644,21 @@ static int map_user_page(u64 root, u64 virtual_address, u64 flags)
     return 1;
 }
 
+// The range is checked once, and each leaf table found once for the up to 512 pages it holds
 static int map_user_range(u64 root, u64 start, u64 end, u64 flags)
 {
     u64 page = align_down(start, PAGE_SIZE);
     u64 limit = align_up(end, PAGE_SIZE);
+    if (page < limit && !user_mapping_range_valid(page, limit - page))
+        return 0;
     while (page < limit)
     {
-        if (!map_user_page(root, page, flags))
-            return 0;
-        page = page + PAGE_SIZE;
+        u64* table = leaf_table(root, page, 0);
+        do
+        {
+            table[sv39_index(page, 0)] = pte_make(alloc_page(), flags | PTE_U | PTE_A | PTE_D);
+            page = page + PAGE_SIZE;
+        } while (page < limit && sv39_index(page, 0) != 0u);
     }
     return 1;
 }
@@ -1861,6 +2713,9 @@ static int user_translate_with_brk_fault(u64 root, u64 address, u64 required, u6
 {
     if (user_translate(root, address, required, physical))
         return 1;
+    // The kernel storing into a page a fork shares takes the copy just as the program's own store would
+    if ((required & PTE_W) != 0ul && user_break_cow(root, address))
+        return user_translate(root, address, required, physical);
     if (root != current_user_root_page_table || (required & PTE_X) != 0ul)
         return 0;
     if (!map_user_brk_fault(root, address) && !map_user_stack_fault(root, address))
@@ -1873,7 +2728,7 @@ static void map_kernel_address_space(u64 root)
     u64 ram_size = align_down(ram_end() - RAM_BASE, 0x200000ul);
     map_range_2m(root, RAM_BASE, RAM_BASE, ram_size, PTE_R | PTE_W | PTE_X | PTE_A | PTE_D);
     map_range_4k(root, boot_device.uart_base, boot_device.uart_base, 0x00010000ul, PTE_R | PTE_W | PTE_A | PTE_D);
-    map_range_4k(root, boot_device.virtio_blk_base, boot_device.virtio_blk_base, 0x00001000ul, PTE_R | PTE_W | PTE_A | PTE_D);
+    map_virtio_windows(root);
     map_range_4k(root, CLINT_MMIO_BASE, CLINT_MMIO_BASE, 0x00010000ul, PTE_R | PTE_W | PTE_A | PTE_D);
     map_range_4k(root, PLIC_MMIO_BASE, PLIC_MMIO_BASE, 0x00400000ul, PTE_R | PTE_W | PTE_A | PTE_D);
     if (boot_device.framebuffer_base != 0ul)
@@ -1883,36 +2738,21 @@ static void map_kernel_address_space(u64 root)
     }
 }
 
-static void copy_4k_mapping_table(u64 destination_root, u64 source_root, u64 virtual_address)
+// A root entry a user space shares with the kernel: a whole gigabyte holding nothing of the program's, as RAM's does
+static u32 kernel_ram_window;
+static u32 kernel_framebuffer_window;
+
+static int kernel_window_index(u32 index)
 {
-    u32 root_index = sv39_index(virtual_address, 2);
-    u32 middle_index = sv39_index(virtual_address, 1);
-    u64 source_middle_pte = ((u64*)source_root)[root_index];
-    u64 source_middle;
-    u64 source_leaf_pte;
-    u64 destination_middle_pte = ((u64*)destination_root)[root_index];
-    u64 destination_middle;
-    u64 destination_leaf;
-    if ((source_middle_pte & PTE_V) == 0ul || (source_middle_pte & (PTE_R | PTE_W | PTE_X)) != 0ul)
-        panic("invalid source mapping root");
-    source_middle = pte_physical(source_middle_pte);
-    source_leaf_pte = ((u64*)source_middle)[middle_index];
-    if ((source_leaf_pte & PTE_V) == 0ul || (source_leaf_pte & (PTE_R | PTE_W | PTE_X)) != 0ul)
-        panic("invalid source mapping table");
-    if ((destination_middle_pte & PTE_V) == 0ul)
-    {
-        destination_middle = alloc_page();
-        ((u64*)destination_root)[root_index] = pte_make(destination_middle, 0ul);
-    }
-    else
-    {
-        if ((destination_middle_pte & (PTE_R | PTE_W | PTE_X)) != 0ul)
-            panic("destination mapping root collision");
-        destination_middle = pte_physical(destination_middle_pte);
-    }
-    destination_leaf = alloc_page();
-    mem_copy((void*)destination_leaf, (const void*)pte_physical(source_leaf_pte), PAGE_SIZE);
-    ((u64*)destination_middle)[middle_index] = pte_make(destination_leaf, 0ul);
+    return index != 0u && (index == kernel_ram_window || index == kernel_framebuffer_window);
+}
+
+static void kernel_windows_init(void)
+{
+    kernel_ram_window = sv39_index(RAM_BASE, 2);
+    if (boot_device.framebuffer_base != 0ul &&
+        sv39_index(boot_device.framebuffer_base + boot_device.framebuffer_window - 1ul, 2) == sv39_index(boot_device.framebuffer_base, 2))
+        kernel_framebuffer_window = sv39_index(boot_device.framebuffer_base, 2);
 }
 
 static void share_device_window(u64 root, u64 virtual_address)
@@ -1939,17 +2779,20 @@ static void device_mappings_init(void)
 static u64 create_user_address_space(void)
 {
     u64 root = alloc_page();
-    u64 ram_size = align_down(ram_end() - RAM_BASE, 0x200000ul);
-    map_range_2m(root, RAM_BASE, RAM_BASE, ram_size, PTE_R | PTE_W | PTE_X | PTE_A | PTE_D);
+    u32 ram_index = sv39_index(RAM_BASE, 2);
+    // RAM and the framebuffer sit in gigabytes of their own, so every space points at the kernel's tables for them
+    ((u64*)root)[ram_index] = ((u64*)kernel_root_page_table)[ram_index];
     map_range_4k(root, boot_device.uart_base, boot_device.uart_base, 0x00010000ul, PTE_R | PTE_W | PTE_A | PTE_D);
-    map_range_4k(root, boot_device.virtio_blk_base, boot_device.virtio_blk_base, 0x00001000ul, PTE_R | PTE_W | PTE_A | PTE_D);
+    map_virtio_windows(root);
     if (boot_device.framebuffer_base != 0ul)
     {
-        map_range_2m(root, boot_device.framebuffer_base, boot_device.framebuffer_base,
-            boot_device.framebuffer_window, PTE_R | PTE_W | PTE_A | PTE_D);
+        u32 framebuffer_index = sv39_index(boot_device.framebuffer_base, 2);
+        if (kernel_window_index(framebuffer_index))
+            ((u64*)root)[framebuffer_index] = ((u64*)kernel_root_page_table)[framebuffer_index];
+        else
+            map_range_2m(root, boot_device.framebuffer_base, boot_device.framebuffer_base,
+                boot_device.framebuffer_window, PTE_R | PTE_W | PTE_A | PTE_D);
     }
-    copy_4k_mapping_table(root, kernel_root_page_table, PLIC_MMIO_BASE);
-    copy_4k_mapping_table(root, kernel_root_page_table, PLIC_MMIO_BASE + 0x00200000ul);
     if (boot_device.host_bridge_base != 0ul)
         share_device_window(root, USER_HOST_BRIDGE_BASE);
     if (boot_device.framebuffer_base != 0ul)
@@ -1969,6 +2812,7 @@ static void sigreturn_page_init(void)
 
 static void kernel_mmu_init(void)
 {
+    kernel_windows_init();
     kernel_root_page_table = alloc_page();
     map_kernel_address_space(kernel_root_page_table);
     activate_page_table(kernel_root_page_table);
@@ -2152,12 +2996,19 @@ static int copy_user_leaf_pages(u64 dst_root, u64 virtual_address, u64 pte, int 
 }
 
 // Holes and kernel leaves are never copied, so a vector scan skips to the next user leaf, no-access page or table
-static u32 next_copied_pte(const u64* entries, u32 index)
+static u32 next_copied_pte(const u64* entries, u32 index, u32 limit)
 {
 #if __riscv_vector
-    while (index < 512u)
+    // User pages come in runs, so the entry right after the last one found is worth a look before a vector search
+    if (index < limit)
     {
-        u64 vl = __riscv_vsetvl_e64m8(512u - index);
+        u64 pte = entries[index];
+        if ((pte & (PTE_U | PTE_SOFT_NOACCESS)) != 0ul || (pte & (PTE_V | PTE_R | PTE_X)) == PTE_V)
+            return index;
+    }
+    while (index < limit)
+    {
+        u64 vl = __riscv_vsetvl_e64m8(limit - index);
         vuint64m8_t ptes = __riscv_vle64_v_u64m8(entries + index, vl);
         vbool8_t owned = __riscv_vmsne_vx_u64m8_b8(__riscv_vand_vx_u64m8(ptes, PTE_U | PTE_SOFT_NOACCESS, vl), 0ul, vl);
         vbool8_t table = __riscv_vmseq_vx_u64m8_b8(__riscv_vand_vx_u64m8(ptes, PTE_V | PTE_R | PTE_X, vl), PTE_V, vl);
@@ -2167,7 +3018,7 @@ static u32 next_copied_pte(const u64* entries, u32 index)
         index = index + (u32)vl;
     }
 #else
-    while (index < 512u)
+    while (index < limit)
     {
         u64 pte = entries[index];
         if ((pte & (PTE_U | PTE_SOFT_NOACCESS)) != 0ul || (pte & (PTE_V | PTE_R | PTE_X)) == PTE_V)
@@ -2178,51 +3029,127 @@ static u32 next_copied_pte(const u64* entries, u32 index)
     return 512u;
 }
 
+// The device windows and the kernel's gigabytes are root entries every address space shares, never copied or freed
+static int shared_root_entry(u32 index, u64 pte)
+{
+    return ((u64*)device_root_page_table)[index] == pte ||
+        (kernel_window_index(index) && ((u64*)kernel_root_page_table)[index] == pte);
+}
+
 static int copy_user_page_table_level(u64 dst_root, u64 src_table, int level, u64 virtual_prefix)
 {
     u32 index = 0u;
+    u64* dst_leaves = NULL;
     while (index < 512u)
     {
-        index = next_copied_pte((const u64*)src_table, index);
+        index = next_copied_pte((const u64*)src_table, index, level == 2 ? 256u : 512u);
         if (index == 512u)
             break;
         u64 pte = ((u64*)src_table)[index];
-        if ((pte & PTE_V) != 0ul || (level == 0 && (pte & PTE_SOFT_NOACCESS) != 0ul))
+        u64 virtual_address = virtual_prefix | ((u64)index << (12ul + (u64)level * 9ul));
+        if (virtual_address >= USER_VA_LIMIT || (level == 2 && shared_root_entry(index, pte)))
         {
-            u64 virtual_address = virtual_prefix | ((u64)index << (12ul + (u64)level * 9ul));
-            if (virtual_address < USER_VA_LIMIT)
-            {
-                if (level == 0 && (pte & PTE_SOFT_NOACCESS) != 0ul)
-                {
-                    u64 page = alloc_page_raw();
-                    mem_copy((void*)page, (const void*)pte_physical(pte), PAGE_SIZE);
-                    map_noaccess_page(dst_root, virtual_address, page);
-                }
-                else if ((pte & (PTE_R | PTE_X)) != 0ul)
-                {
-                    if ((pte & PTE_U) != 0ul && !user_device_window(virtual_address, PAGE_SIZE))
-                    {
-                        if (!copy_user_leaf_pages(dst_root, virtual_address, pte, level))
-                            return 0;
-                    }
-                }
-                else if (level > 0 && !user_device_window(virtual_address, PAGE_SIZE))
-                {
-                    if (!copy_user_page_table_level(dst_root, pte_physical(pte), level - 1, virtual_address))
-                        return 0;
-                }
-            }
+            index = index + 1u;
+            continue;
         }
+        if (level == 0)
+        {
+            // Both spaces map the page rather than each having a copy, and neither writes it until a store makes it its own
+            u8* shares;
+            if ((pte & PTE_V) != 0ul && ((pte & (PTE_R | PTE_X)) == 0ul || pte_physical(pte) == sigreturn_page))
+            {
+                index = index + 1u;
+                continue;
+            }
+            if ((pte & PTE_W) != 0ul)
+            {
+                pte = (pte & ~PTE_W) | PTE_SOFT_COW;
+                ((u64*)src_table)[index] = pte;
+            }
+            shares = page_share(pte_physical(pte));
+            *shares = (u8)(*shares + 1u);
+            // Every page of a leaf table lands in the same leaf table of the copy, found once
+            if (dst_leaves == NULL)
+                dst_leaves = leaf_table(dst_root, virtual_address, 0);
+            dst_leaves[index] = pte;
+        }
+        else if ((pte & (PTE_R | PTE_X)) != 0ul)
+        {
+            if ((pte & PTE_U) != 0ul && !copy_user_leaf_pages(dst_root, virtual_address, pte, level))
+                return 0;
+        }
+        else if (!copy_user_page_table_level(dst_root, pte_physical(pte), level - 1, virtual_address))
+            return 0;
         index = index + 1u;
     }
     return 1;
 }
 
+// Gives back the user pages and the tables of one level an address space made for itself
+static void free_page_table_level(u64 table, int level)
+{
+    const u64* entries = (const u64*)table;
+    u32 index = 0u;
+    while (index < 512u)
+    {
+        index = next_copied_pte(entries, index, 512u);
+        if (index == 512u)
+            break;
+        u64 pte = entries[index];
+        index = index + 1u;
+        if (level == 0)
+        {
+            if ((pte & PTE_V) == 0ul || ((pte & PTE_U) != 0ul && pte_physical(pte) != sigreturn_page))
+                user_page_put(pte_physical(pte));
+        }
+        else if ((pte & (PTE_V | PTE_R | PTE_W | PTE_X)) == PTE_V)
+            free_page_table_level(pte_physical(pte), level - 1);
+    }
+    free_page_raw(table);
+}
+
+// The kernel's mappings in a user space point at memory nobody allocated, so only user pages and tables go back
+static void free_user_address_space(u64 root)
+{
+    u32 index = 0u;
+    while (index < 512u)
+    {
+        index = next_copied_pte((const u64*)root, index, 256u);
+        if (index == 512u)
+            break;
+        u64 pte = ((u64*)root)[index];
+        if ((pte & (PTE_V | PTE_R | PTE_W | PTE_X)) == PTE_V && !shared_root_entry(index, pte))
+            free_page_table_level(pte_physical(pte), 1);
+        index = index + 1u;
+    }
+    free_page_raw(root);
+}
+
+// A vfork child lives in its parent's space until it execs or exits, so a space goes back only once nobody holds it
+static int address_space_held_by_another(u64 root, struct process* self)
+{
+    u32 index = 0u;
+    while (index < MAX_PROCESSES)
+    {
+        struct process* task = &processes[index];
+        index = index + 1u;
+        if (task != self && task->used != 0u && task->root_page_table == root)
+            return 1;
+    }
+    return 0;
+}
+
 static u64 copy_user_address_space(u64 source_root)
 {
     u64 root = create_user_address_space();
-    if (!copy_user_page_table_level(root, source_root, 2, 0ul))
+    int copied = copy_user_page_table_level(root, source_root, 2, 0ul);
+    // The source's writable pages lost W to copy-on-write, which its TLB has yet to learn
+    __asm__ volatile("sfence.vma zero, zero" : : : "memory");
+    if (!copied)
+    {
+        free_user_address_space(root);
         return 0ul;
+    }
     return root;
 }
 
@@ -2270,7 +3197,18 @@ static int process_clone(struct trap_frame* frame, u64 flags, u64 child_stack)
     child->cwd = current_task->cwd;
     mem_copy(child->cwd_path, current_task->cwd_path, (u64)PATH_BUFFER_SIZE);
     mem_copy(child->files, open_files, sizeof(struct file_descriptor) * (u64)MAX_OPEN_FILES);
-    mem_copy(child->vm_regions, current_task->vm_regions, sizeof(struct vm_region) * (u64)MAX_VM_REGIONS);
+    if (evdev_clients_open != 0u)
+    {
+        u32 index = 0u;
+        while (index < MAX_OPEN_FILES)
+        {
+            if (child->files[index].used != 0u && child->files[index].node.type == VFS_NODE_EVDEV)
+                evdev_clients[child->files[index].object].refs = evdev_clients[child->files[index].object].refs + 1u;
+            index = index + 1u;
+        }
+    }
+    mem_copy(child->vm_regions, current_task->vm_regions, sizeof(struct vm_region) * (u64)current_task->vm_region_count);
+    child->vm_region_count = current_task->vm_region_count;
     mem_copy(&child->frame, frame, sizeof(struct trap_frame));
     child->frame.x[10] = 0ul;
     if (child_stack != 0ul)
@@ -2655,6 +3593,8 @@ static void signal_wake(struct process* task, u64 sig)
     }
     else if (task->sleep_reason == SLEEP_SIGWAIT)
         task->frame.x[10] = (u64)-EINTR;
+    else if (task->sleep_reason == SLEEP_POLL && task->sleep_deadline != 0ul)
+        process_store_remaining(task, task->sleep_user_pointer, task->sleep_deadline);
     process_wake(task);
 }
 
@@ -2801,6 +3741,7 @@ static void process_exit_current(struct trap_frame* frame, u64 status, u64 sig)
     struct process* parent = process_find((u64)task->ppid);
     u32 pid = task->pid;
     u64 code = status & 255ul;
+    u64 root = current_user_root_page_table;
     u32 groups[MAX_PROCESSES];
     u32 group_count = 0u;
     u32 index = 0u;
@@ -2817,6 +3758,14 @@ static void process_exit_current(struct trap_frame* frame, u64 status, u64 sig)
         index = index + 1u;
     }
     process_reparent_children(pid);
+    index = 0u;
+    while (evdev_clients_open != 0u && index < MAX_OPEN_FILES)
+    {
+        fd_release(&task->files[index]);
+        task->files[index].used = 0u;
+        index = index + 1u;
+    }
+    index = 0u;
     task->exit_status = (u32)code;
     task->exit_signal = (u32)sig;
     task->state = PROC_ZOMBIE;
@@ -2840,6 +3789,14 @@ static void process_exit_current(struct trap_frame* frame, u64 status, u64 sig)
     }
     process_wake_vfork_parent(task);
     process_report_exit(task);
+    // A parent already waiting reaps the child right here, so what it ran in was taken before the report
+    if (!address_space_held_by_another(root, task))
+    {
+        activate_page_table(kernel_root_page_table);
+        free_user_address_space(root);
+        current_user_root_page_table = kernel_root_page_table;
+    }
+    task->root_page_table = 0ul;
     scheduler_switch(frame);
 }
 
@@ -3543,12 +4500,18 @@ static int tty_poll(void);
 static int tty_readable(void);
 static int tty_has_foreground(void);
 
+static void sound_poll(void);
+
 static void scheduler_poll(u64 now)
 {
     u32 index = 0u;
     int input;
+    u32 activity;
     tty_poll();
+    sound_poll();
     input = tty_readable();
+    activity = device_activity;
+    device_activity = 0u;
     while (index < MAX_PROCESSES)
     {
         struct process* task = &processes[index];
@@ -3569,6 +4532,29 @@ static void scheduler_poll(u64 now)
             if (input != 0 || (task->sleep_deadline != 0ul && now >= task->sleep_deadline))
             {
                 task->tty_timed_out = input == 0 ? 1u : 0u;
+                task->frame.x[10] = task->orig_a0;
+                task->frame.sepc = task->frame.sepc - 4ul;
+                process_wake(task);
+            }
+        }
+        else if (task->sleep_reason == SLEEP_POLL)
+        {
+            // Anything a device or the terminal delivered may be what the poll waits for, so it looks again
+            if (activity != 0u || input != 0)
+            {
+                if (task->sleep_deadline != 0ul)
+                    process_store_remaining(task, task->sleep_user_pointer, task->sleep_deadline);
+                task->frame.x[10] = task->orig_a0;
+                task->frame.sepc = task->frame.sepc - 4ul;
+                process_wake(task);
+            }
+            else if (task->sleep_deadline != 0ul && now >= task->sleep_deadline)
+                poll_time_out(task);
+        }
+        else if (task->sleep_reason == SLEEP_DEVICE)
+        {
+            if (activity != 0u || (task->sleep_deadline != 0ul && now >= task->sleep_deadline))
+            {
                 task->frame.x[10] = task->orig_a0;
                 task->frame.sepc = task->frame.sepc - 4ul;
                 process_wake(task);
@@ -3596,7 +4582,7 @@ static int scheduler_can_wake(void)
             continue;
         if (task->itimer_real_deadline != 0ul)
             return 1;
-        if (task->state == PROC_WAITING && (task->sleep_deadline != 0ul || task->sleep_reason == SLEEP_CONSOLE))
+        if (task->state == PROC_WAITING && (task->sleep_deadline != 0ul || task->sleep_reason == SLEEP_CONSOLE || task->sleep_reason == SLEEP_DEVICE || task->sleep_reason == SLEEP_POLL))
             return 1;
     }
     return 0;
@@ -3661,6 +4647,7 @@ static s64 sys_execve_impl(struct trap_frame* frame, u64 path_pointer, u64 argv,
         process_brk = old_brk;
         process_brk_min = old_brk_min;
         user_mmap_cursor = old_mmap_cursor;
+        free_user_address_space(new_root);
         return -8l;
     }
     if (!build_user_stack(new_root, &image, &arguments, &stack))
@@ -3669,10 +4656,11 @@ static s64 sys_execve_impl(struct trap_frame* frame, u64 path_pointer, u64 argv,
         process_brk = old_brk;
         process_brk_min = old_brk_min;
         user_mmap_cursor = old_mmap_cursor;
+        free_user_address_space(new_root);
         return -12l;
     }
     current_user_root_page_table = new_root;
-    mem_zero(current_task->vm_regions, sizeof(struct vm_region) * (u64)MAX_VM_REGIONS);
+    current_task->vm_region_count = 0u;
     {
         u32 index = 0u;
         while (index < (u32)SIGNAL_COUNT)
@@ -3701,6 +4689,8 @@ static s64 sys_execve_impl(struct trap_frame* frame, u64 path_pointer, u64 argv,
     current_task->mmap_cursor = user_mmap_cursor;
     process_wake_vfork_parent(current_task);
     activate_page_table(current_user_root_page_table);
+    if (!address_space_held_by_another(old_root, current_task))
+        free_user_address_space(old_root);
     return 0l;
 }
 
@@ -3880,7 +4870,13 @@ static void parse_fdt(void* fdt)
                         u64 reg_base = be_cell(data, parent_address_cells);
                         u64 reg_size = be_cell(data + parent_address_cells * 4u, parent_size_cells);
                         if (virtio_node[depth])
-                            boot_device.virtio_blk_base = reg_base;
+                        {
+                            if (virtio_count < MAX_VIRTIO_DEVICES)
+                            {
+                                virtio_bases[virtio_count] = reg_base;
+                                virtio_count = virtio_count + 1u;
+                            }
+                        }
                         else if (serial_node[depth])
                             boot_device.uart_base = reg_base;
                         else if (host_bridge_node[depth])
@@ -4074,6 +5070,1009 @@ static int disk_read_sector(u32 lba, void* buffer)
     return block_read_sector((u64)lba, buffer);
 }
 
+// Every virtio-mmio node the device tree names, sorted out by the device id each one reports
+static void virtio_discover(void)
+{
+    u32 index = 0u;
+    int block_found = 0;
+    if (virtio_count == 0u)
+    {
+        virtio_bases[0] = VIRTIO_MMIO_DEFAULT_BASE;
+        virtio_count = 1u;
+    }
+    while (index < virtio_count)
+    {
+        u64 base = virtio_bases[index];
+        u32 id;
+        index = index + 1u;
+        if (mmio_read32(base, 0x000u) != 0x74726976u || mmio_read32(base, 0x004u) != 2u)
+            continue;
+        id = mmio_read32(base, 0x008u);
+        if (id == VIRTIO_ID_BLOCK && !block_found)
+        {
+            boot_device.virtio_blk_base = base;
+            block_found = 1;
+        }
+        else if (id == VIRTIO_ID_INPUT && input_device_count < MAX_INPUT_DEVICES)
+        {
+            input_devices[input_device_count].base = base;
+            input_device_count = input_device_count + 1u;
+        }
+        else if (id == VIRTIO_ID_SOUND && sound.base == 0ul)
+            sound.base = base;
+    }
+}
+
+// A device inside the 64 KiB the serial port's mapping covers needs no page of its own
+static void map_virtio_window(u64 root, u64 base)
+{
+    if (base - boot_device.uart_base >= 0x00010000ul)
+        map_range_4k(root, base, base, 0x00001000ul, PTE_R | PTE_W | PTE_A | PTE_D);
+}
+
+static void map_virtio_windows(u64 root)
+{
+    u32 index = 0u;
+    map_virtio_window(root, boot_device.virtio_blk_base);
+    while (index < virtio_count)
+    {
+        map_virtio_window(root, virtio_bases[index]);
+        index = index + 1u;
+    }
+}
+
+// Resets the device and agrees on version 1 of the interface, which is all the drivers here need
+static int virtio_start(u64 base, u32 id)
+{
+    if (mmio_read32(base, 0x008u) != id)
+        return 0;
+    mmio_write32(base, 0x070u, 0u);
+    mmio_write32(base, 0x070u, 1u);
+    mmio_write32(base, 0x070u, 3u);
+    mmio_write32(base, 0x024u, 0u);
+    mmio_write32(base, 0x020u, 0u);
+    mmio_write32(base, 0x024u, 1u);
+    mmio_write32(base, 0x020u, 1u);
+    mmio_write32(base, 0x070u, 11u);
+    return (mmio_read32(base, 0x070u) & 8u) != 0u;
+}
+
+static void virtio_ready(u64 base)
+{
+    mmio_write32(base, 0x070u, 15u);
+}
+
+// A queue lives in one page: descriptors first, the driver ring after them, the device ring from the middle, and the last quarter free for buffers
+static int virtq_init(struct virtq* queue, u64 base, u32 index)
+{
+    u64 page;
+    mmio_write32(base, 0x030u, index);
+    if (mmio_read32(base, 0x034u) < VIRTQ_SIZE)
+        return 0;
+    page = alloc_page();
+    queue->base = base;
+    queue->index = index;
+    queue->size = VIRTQ_SIZE;
+    queue->desc = (struct virtq_descriptor*)page;
+    queue->avail = (volatile u16*)(page + 1024ul);
+    queue->used = (volatile u16*)(page + 2048ul);
+    queue->next_avail = 0u;
+    queue->seen_used = 0u;
+    mmio_write32(base, 0x038u, VIRTQ_SIZE);
+    mmio_write32(base, 0x080u, (u32)page);
+    mmio_write32(base, 0x084u, (u32)(page >> 32));
+    mmio_write32(base, 0x090u, (u32)(page + 1024ul));
+    mmio_write32(base, 0x094u, (u32)((page + 1024ul) >> 32));
+    mmio_write32(base, 0x0a0u, (u32)(page + 2048ul));
+    mmio_write32(base, 0x0a4u, (u32)((page + 2048ul) >> 32));
+    mmio_write32(base, 0x044u, 1u);
+    return 1;
+}
+
+static void virtq_set(struct virtq* queue, u32 index, u64 address, u32 length, u16 flags, u16 next)
+{
+    queue->desc[index].address = address;
+    queue->desc[index].length = length;
+    queue->desc[index].flags = flags;
+    queue->desc[index].next = next;
+}
+
+static void virtq_post(struct virtq* queue, u16 head)
+{
+    queue->avail[2u + (u32)(queue->next_avail % (u16)queue->size)] = head;
+    fence_rw();
+    queue->next_avail = (u16)(queue->next_avail + 1u);
+    queue->avail[1] = queue->next_avail;
+    fence_rw();
+}
+
+static void virtq_kick(struct virtq* queue)
+{
+    mmio_write32(queue->base, 0x050u, queue->index);
+}
+
+static int virtq_take(struct virtq* queue, u32* id, u32* length)
+{
+    volatile u32* element;
+    fence_rw();
+    if (queue->used[1] == queue->seen_used)
+        return 0;
+    element = (volatile u32*)(queue->used + 2) + 2u * (u32)(queue->seen_used % (u16)queue->size);
+    *id = element[0];
+    *length = element[1];
+    queue->seen_used = (u16)(queue->seen_used + 1u);
+    return 1;
+}
+
+// The configuration space answers one question at a time: what is asked is written, the answer read back
+static u32 input_config_query(u64 base, u8 select, u8 subselect, u8* out, u32 capacity)
+{
+    u32 size;
+    u32 index = 0u;
+    mmio_write8(base + 0x100ul, select);
+    mmio_write8(base + 0x101ul, subselect);
+    size = (u32)mmio_read8(base + 0x102ul);
+    while (index < size && index < capacity)
+    {
+        out[index] = mmio_read8(base + 0x108ul + (u64)index);
+        index = index + 1u;
+    }
+    return size;
+}
+
+static int input_has_bit(u64 base, u8 type, u32 bit)
+{
+    u8 bits[128];
+    u32 size = input_config_query(base, VIRTIO_INPUT_EV_BITS, type, bits, 128u);
+    return bit / 8u < size && (bits[bit / 8u] & (u8)(1u << (bit % 8u))) != 0u;
+}
+
+static void input_device_init(struct input_device* device)
+{
+    u32 index = 0u;
+    u64 page;
+    if (!virtio_start(device->base, VIRTIO_ID_INPUT) || !virtq_init(&device->events, device->base, 0u))
+    {
+        device->base = 0ul;
+        return;
+    }
+    page = (u64)device->events.desc + 3072ul;
+    device->buffers = (u8*)page;
+    // Every buffer goes on the ring before the index that hands them all over is published
+    while (index < INPUT_EVENT_BUFFERS)
+    {
+        virtq_set(&device->events, index, page + (u64)index * 8ul, 8u, VIRTQ_DESC_WRITE, 0u);
+        device->events.avail[2u + index] = (u16)index;
+        index = index + 1u;
+    }
+    fence_rw();
+    device->events.next_avail = (u16)INPUT_EVENT_BUFFERS;
+    device->events.avail[1] = (u16)INPUT_EVENT_BUFFERS;
+    fence_rw();
+    virtio_ready(device->base);
+    virtq_kick(&device->events);
+    device->keyboard = input_has_bit(device->base, (u8)EV_KEY, KEY_A) ? 1u : 0u;
+}
+
+static void devices_init(void)
+{
+    u32 index = 0u;
+    while (index < input_device_count)
+    {
+        input_device_init(&input_devices[index]);
+        index = index + 1u;
+    }
+    sound_init();
+}
+
+// Keys a terminal turns into characters, the way the Linux console's default US map does
+static const char keymap_plain[59] = "\0\x1b" "1234567890-=" "\x7f\t" "qwertyuiop[]" "\r\0" "asdfghjkl;'`" "\0\\" "zxcvbnm,./" "\0*\0 ";
+static const char keymap_shifted[59] = "\0\x1b" "!@#$%^&*()_+" "\x7f\t" "QWERTYUIOP{}" "\r\0" "ASDFGHJKL:\"~" "\0|" "ZXCVBNM<>?" "\0*\0 ";
+static const char keymap_keypad[14] = "789-456+1230.";
+
+#define KEYBOARD_SHIFT 3u
+#define KEYBOARD_CTRL 12u
+#define KEYBOARD_ALT 48u
+
+static u32 keyboard_modifiers;
+static u32 keyboard_caps_lock;
+
+static u32 keyboard_modifier_bit(u32 code)
+{
+    if (code == KEY_LEFTSHIFT)
+        return 1u;
+    if (code == KEY_RIGHTSHIFT)
+        return 2u;
+    if (code == KEY_LEFTCTRL)
+        return 4u;
+    if (code == KEY_RIGHTCTRL)
+        return 8u;
+    if (code == KEY_LEFTALT)
+        return 16u;
+    if (code == KEY_RIGHTALT)
+        return 32u;
+    return 0u;
+}
+
+// Cursor and editing keys send xterm's sequences, with the modifiers as the second parameter when any are held
+static int keyboard_send_sequence(u32 code)
+{
+    u8 final = 0u;
+    u32 number = 0u;
+    u32 modifier = 1u;
+    if (code == KEY_UP)
+        final = 'A';
+    else if (code == KEY_DOWN)
+        final = 'B';
+    else if (code == KEY_RIGHT)
+        final = 'C';
+    else if (code == KEY_LEFT)
+        final = 'D';
+    else if (code == KEY_HOME)
+        final = 'H';
+    else if (code == KEY_END)
+        final = 'F';
+    else if (code >= KEY_F1 && code <= KEY_F4)
+        final = (u8)('P' + (code - KEY_F1));
+    else if (code == KEY_INSERT)
+        number = 2u;
+    else if (code == KEY_DELETE)
+        number = 3u;
+    else if (code == KEY_PAGEUP)
+        number = 5u;
+    else if (code == KEY_PAGEDOWN)
+        number = 6u;
+    else if (code >= KEY_F5 && code <= KEY_F10)
+        number = code == KEY_F5 ? 15u : code - KEY_F6 + 17u;
+    else if (code == KEY_F11)
+        number = 23u;
+    else if (code == KEY_F12)
+        number = 24u;
+    else
+        return 0;
+
+    if ((keyboard_modifiers & KEYBOARD_SHIFT) != 0u)
+        modifier = modifier + 1u;
+    if ((keyboard_modifiers & KEYBOARD_ALT) != 0u)
+        modifier = modifier + 2u;
+    if ((keyboard_modifiers & KEYBOARD_CTRL) != 0u)
+        modifier = modifier + 4u;
+
+    tty_receive(27u);
+    if (final >= 'P' && final <= 'S' && modifier == 1u)
+    {
+        tty_receive((u8)'O');
+        tty_receive(final);
+        return 1;
+    }
+    tty_receive((u8)'[');
+    if (number != 0u)
+    {
+        if (number >= 10u)
+            tty_receive((u8)('0' + number / 10u));
+        tty_receive((u8)('0' + number % 10u));
+    }
+    else if (modifier != 1u)
+        tty_receive((u8)'1');
+    if (modifier != 1u)
+    {
+        tty_receive((u8)';');
+        tty_receive((u8)('0' + modifier));
+    }
+    tty_receive(number != 0u ? (u8)'~' : final);
+    return 1;
+}
+
+static void keyboard_key(u32 code, s32 value)
+{
+    u32 bit = keyboard_modifier_bit(code);
+    int shift;
+    u8 ch = 0u;
+    int produced = 0;
+    if (bit != 0u)
+    {
+        keyboard_modifiers = value != 0 ? keyboard_modifiers | bit : keyboard_modifiers & ~bit;
+        return;
+    }
+    if (value == 0)
+        return;
+    if (code == KEY_CAPSLOCK)
+    {
+        if (value == 1)
+            keyboard_caps_lock = keyboard_caps_lock ^ 1u;
+        return;
+    }
+    if (keyboard_send_sequence(code))
+        return;
+
+    shift = (keyboard_modifiers & KEYBOARD_SHIFT) != 0u;
+    if (code < 58u)
+    {
+        ch = (u8)(shift ? keymap_shifted[code] : keymap_plain[code]);
+        produced = ch != 0u;
+    }
+    else if (code >= KEY_KP7 && code <= KEY_KPDOT)
+    {
+        ch = (u8)keymap_keypad[code - KEY_KP7];
+        produced = 1;
+    }
+    else if (code == KEY_KPENTER)
+    {
+        ch = (u8)'\r';
+        produced = 1;
+    }
+    else if (code == KEY_KPSLASH)
+    {
+        ch = (u8)'/';
+        produced = 1;
+    }
+    if (!produced)
+        return;
+
+    if (keyboard_caps_lock != 0u && ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')))
+        ch = (u8)(ch ^ 0x20u);
+    if ((keyboard_modifiers & KEYBOARD_CTRL) != 0u)
+    {
+        if (ch >= 'a' && ch <= 'z')
+            ch = (u8)(ch - 96u);
+        else if (ch >= '@' && ch <= '_')
+            ch = (u8)(ch - 64u);
+        else if (ch == ' ' || ch == '2')
+            ch = 0u;
+        else if (ch == '/' || ch == '-' || ch == '7')
+            ch = 31u;
+        else if (ch == '6')
+            ch = 30u;
+        else if (ch == '?' || ch == '8')
+            ch = 127u;
+    }
+    if ((keyboard_modifiers & KEYBOARD_ALT) != 0u)
+        tty_receive(27u);
+    tty_receive(ch);
+}
+
+static void evdev_client_store(struct evdev_client* client, u64 seconds, u64 micros, u32 type, u32 code, s32 value)
+{
+    u8* slot = client->ring + (u64)((client->head + client->count) % EVDEV_CLIENT_EVENTS) * EVDEV_EVENT_SIZE;
+    store_le64(slot, seconds);
+    store_le64(slot + 8, micros);
+    store_le16(slot + 16, (u16)type);
+    store_le16(slot + 18, (u16)code);
+    store_le32(slot + 20, (u32)value);
+    client->count = client->count + 1u;
+}
+
+// A reader that fell behind loses what it had not read and finds SYN_DROPPED in its place, as on Linux
+static void evdev_client_push(struct evdev_client* client, u64 seconds, u64 micros, u32 type, u32 code, s32 value)
+{
+    if (client->count == EVDEV_CLIENT_EVENTS)
+    {
+        client->count = 0u;
+        evdev_client_store(client, seconds, micros, EV_SYN, SYN_DROPPED, 0);
+        client->ready = 1u;
+    }
+    evdev_client_store(client, seconds, micros, type, code, value);
+    if (type == EV_SYN && code == SYN_REPORT)
+        client->ready = client->count;
+}
+
+// What a device reported, in the layout of struct input_event, for every client of its node or the one that grabbed it
+static void evdev_push(u32 device_index, u32 type, u32 code, s32 value)
+{
+    u64 now = timer_now();
+    u64 seconds = now / boot_device.timebase;
+    u64 micros = (now % boot_device.timebase) * 1000000ul / boot_device.timebase;
+    u32 grabbed = input_devices[device_index].grabbed;
+    u32 index = 0u;
+    while (index < EVDEV_CLIENTS)
+    {
+        struct evdev_client* client = &evdev_clients[index];
+        index = index + 1u;
+        if (client->refs != 0u && client->device == device_index && (grabbed == 0u || grabbed == index))
+            evdev_client_push(client, seconds, micros, type, code, value);
+    }
+}
+
+static void input_event(u32 device_index, u32 type, u32 code, s32 value)
+{
+    struct input_device* device = &input_devices[device_index];
+    evdev_push(device_index, type, code, value);
+    device_activity = 1u;
+    if (type != EV_KEY)
+        return;
+    if (code < EVDEV_KEY_BITS)
+    {
+        if (value != 0)
+            device->keys[code / 8u] = (u8)(device->keys[code / 8u] | (u8)(1u << (code % 8u)));
+        else
+            device->keys[code / 8u] = (u8)(device->keys[code / 8u] & (u8)~(1u << (code % 8u)));
+    }
+    // A program that grabbed the keyboard has it to itself, so its keys stop reaching the terminal
+    if (device->keyboard != 0u && device->grabbed == 0u)
+        keyboard_key(code, value);
+}
+
+static void input_poll(void)
+{
+    u32 index = 0u;
+    while (index < input_device_count)
+    {
+        struct input_device* device = &input_devices[index];
+        u32 id;
+        u32 length;
+        int reposted = 0;
+        index = index + 1u;
+        if (device->base == 0ul)
+            continue;
+        while (virtq_take(&device->events, &id, &length))
+        {
+            const u8* event = device->buffers + (u64)(id % INPUT_EVENT_BUFFERS) * 8ul;
+            if (length >= 8u)
+                input_event(index - 1u, (u32)le16(event), (u32)le16(event + 2), (s32)le32(event + 4));
+            virtq_post(&device->events, (u16)(id % INPUT_EVENT_BUFFERS));
+            reposted = 1;
+        }
+        if (reposted)
+            virtq_kick(&device->events);
+    }
+}
+
+static int input_device_valid(u32 index)
+{
+    return index < input_device_count && input_devices[index].base != 0ul;
+}
+
+static s64 evdev_open(u32 device)
+{
+    u32 index = 0u;
+    input_poll();
+    while (index < EVDEV_CLIENTS)
+    {
+        struct evdev_client* client = &evdev_clients[index];
+        if (client->refs == 0u)
+        {
+            client->refs = 1u;
+            evdev_clients_open = evdev_clients_open + 1u;
+            client->device = device;
+            client->head = 0u;
+            client->count = 0u;
+            client->ready = 0u;
+            return (s64)index;
+        }
+        index = index + 1u;
+    }
+    return -23l;
+}
+
+static void evdev_client_put(u32 index)
+{
+    struct evdev_client* client = &evdev_clients[index];
+    client->refs = client->refs - 1u;
+    if (client->refs != 0u)
+        return;
+    evdev_clients_open = evdev_clients_open - 1u;
+    if (input_devices[client->device].grabbed == index + 1u)
+        input_devices[client->device].grabbed = 0u;
+}
+
+static s64 evdev_read(struct file_descriptor* file, u64 buffer, u64 count)
+{
+    struct evdev_client* client = &evdev_clients[file->object];
+    u64 done = 0ul;
+    input_poll();
+    if (count < (u64)EVDEV_EVENT_SIZE)
+        return -22l;
+    if (client->ready == 0u)
+        return (file->flags & O_NONBLOCK) != 0ul ? -EAGAIN : -ERESTARTSYS;
+    while (done + (u64)EVDEV_EVENT_SIZE <= count && client->ready != 0u)
+    {
+        if (!user_copy_to_writable(current_user_root_page_table, buffer + done, client->ring + (u64)client->head * EVDEV_EVENT_SIZE, (u64)EVDEV_EVENT_SIZE))
+            return done != 0ul ? (s64)done : -14l;
+        client->head = (client->head + 1u) % EVDEV_CLIENT_EVENTS;
+        client->count = client->count - 1u;
+        client->ready = client->ready - 1u;
+        done = done + (u64)EVDEV_EVENT_SIZE;
+    }
+    return (s64)done;
+}
+
+static s64 evdev_copy_out(u64 argument, const void* data, u32 available, u32 capacity)
+{
+    u32 count = available < capacity ? available : capacity;
+    if (count != 0u && !user_copy_to_writable(current_user_root_page_table, argument, data, (u64)count))
+        return -14l;
+    return (s64)count;
+}
+
+// The evdev requests encode a direction, a size and a number the way _IOC does: dir 31:30, size 29:16, type 15:8, nr 7:0
+static s64 evdev_ioctl(struct file_descriptor* file, u64 request, u64 argument)
+{
+    struct input_device* device = &input_devices[file->node.first_cluster];
+    u8 data[128];
+    u32 type = (u32)(request >> 8) & 0xffu;
+    u32 nr = (u32)request & 0xffu;
+    u32 size = (u32)(request >> 16) & 0x3fffu;
+    u32 length;
+    if (type != (u32)'E')
+        return -25l;
+    if (nr == 0x01u)
+    {
+        store_le32(data, 0x010001u);
+        return user_copy_to_writable(current_user_root_page_table, argument, data, 4ul) ? 0l : -14l;
+    }
+    if (nr == 0x02u)
+    {
+        mem_zero(data, 8ul);
+        input_config_query(device->base, VIRTIO_INPUT_ID_DEVIDS, 0u, data, 8u);
+        return user_copy_to_writable(current_user_root_page_table, argument, data, 8ul) ? 0l : -14l;
+    }
+    if (nr == 0x06u || nr == 0x08u)
+    {
+        length = input_config_query(device->base, nr == 0x06u ? VIRTIO_INPUT_ID_NAME : VIRTIO_INPUT_ID_SERIAL, 0u, data, 127u);
+        data[length < 127u ? length : 127u] = 0u;
+        return evdev_copy_out(argument, data, (length < 127u ? length : 127u) + 1u, size);
+    }
+    if (nr == 0x07u)
+    {
+        data[0] = 0u;
+        return evdev_copy_out(argument, data, 1u, size);
+    }
+    if (nr == 0x09u)
+    {
+        mem_zero(data, sizeof(data));
+        length = input_config_query(device->base, VIRTIO_INPUT_PROP_BITS, 0u, data, 128u);
+        return evdev_copy_out(argument, data, length, size);
+    }
+    if (nr == 0x18u)
+        return evdev_copy_out(argument, device->keys, EVDEV_KEY_BITS / 8u, size);
+    if (nr == 0x19u || nr == 0x1au || nr == 0x1bu)
+    {
+        mem_zero(data, 8ul);
+        return evdev_copy_out(argument, data, 8u, size);
+    }
+    if (nr == 0x20u)
+    {
+        // Which event types the device has at all is whether it reports any code of each
+        u32 kind = 1u;
+        mem_zero(data, 8ul);
+        data[0] = 1u;
+        while (kind < 0x20u)
+        {
+            u8 bits[128];
+            if (input_config_query(device->base, VIRTIO_INPUT_EV_BITS, (u8)kind, bits, 128u) != 0u)
+                data[kind / 8u] = (u8)(data[kind / 8u] | (u8)(1u << (kind % 8u)));
+            kind = kind + 1u;
+        }
+        return evdev_copy_out(argument, data, 4u, size);
+    }
+    if (nr > 0x20u && nr < 0x40u)
+    {
+        mem_zero(data, sizeof(data));
+        length = input_config_query(device->base, VIRTIO_INPUT_EV_BITS, (u8)(nr - 0x20u), data, 128u);
+        return evdev_copy_out(argument, data, length, size);
+    }
+    if (nr >= 0x40u && nr < 0x80u && (request >> 30) == 2ul)
+    {
+        u8 info[24];
+        u8 absolute[20];
+        mem_zero(info, 24ul);
+        mem_zero(absolute, 20ul);
+        if (input_config_query(device->base, VIRTIO_INPUT_ABS_INFO, (u8)(nr - 0x40u), absolute, 20u) < 20u)
+            return -22l;
+        mem_copy(info + 4, absolute, 20ul);
+        return evdev_copy_out(argument, info, 24u, size) < 0l ? -14l : 0l;
+    }
+    if (nr == 0x90u)
+    {
+        u32 client = file->object + 1u;
+        if (argument != 0ul)
+        {
+            if (device->grabbed != 0u)
+                return -16l;
+            device->grabbed = client;
+        }
+        else
+        {
+            if (device->grabbed != client)
+                return -22l;
+            device->grabbed = 0u;
+        }
+        return 0l;
+    }
+    if (nr == 0xa0u || nr == 0x03u || nr == 0x04u)
+        return 0l;
+    return -22l;
+}
+
+static u32 sound_control(u32 length, u32 reply_length)
+{
+    u32 id;
+    u32 used;
+    u8* page = sound.control_page;
+    store_le32(page + 256, 0u);
+    virtq_set(&sound.control, 0u, (u64)page, length, VIRTQ_DESC_NEXT, 1u);
+    virtq_set(&sound.control, 1u, (u64)(page + 256), reply_length, VIRTQ_DESC_WRITE, 0u);
+    virtq_post(&sound.control, 0u);
+    virtq_kick(&sound.control);
+    while (!virtq_take(&sound.control, &id, &used))
+    {
+    }
+    return le32(page + 256);
+}
+
+static u32 sound_stream_request(u32 code)
+{
+    store_le32(sound.control_page, code);
+    store_le32(sound.control_page + 4, 0u);
+    return sound_control(8u, 4u);
+}
+
+static void sound_init(void)
+{
+    u32 slot = 0u;
+    u8* page;
+    if (sound.base == 0ul)
+        return;
+    if (!virtio_start(sound.base, VIRTIO_ID_SOUND) || !virtq_init(&sound.control, sound.base, 0u) ||
+        !virtq_init(&sound.transmit, sound.base, 2u))
+    {
+        sound.base = 0ul;
+        return;
+    }
+    sound.control_page = (u8*)alloc_page();
+    sound.headers = sound.control_page + 1024;
+    while (slot < SOUND_SLOTS)
+    {
+        virtq_set(&sound.transmit, slot * 3u, (u64)(sound.headers + slot * 16u), 4u, VIRTQ_DESC_NEXT, (u16)(slot * 3u + 1u));
+        virtq_set(&sound.transmit, slot * 3u + 2u, (u64)(sound.headers + slot * 16u + 8u), 8u, VIRTQ_DESC_WRITE, 0u);
+        slot = slot + 1u;
+    }
+    virtio_ready(sound.base);
+    page = sound.control_page;
+    // The card has to offer a stream that plays, or there is nothing for /dev/dsp to drive
+    store_le32(page, VIRTIO_SND_R_PCM_INFO);
+    store_le32(page + 4, 0u);
+    store_le32(page + 8, 1u);
+    store_le32(page + 12, 32u);
+    if (sound_control(16u, 36u) != VIRTIO_SND_S_OK || page[256 + 4 + 24] != 0u)
+        sound.base = 0ul;
+    sound.current = SOUND_SLOTS;
+}
+
+static void sound_reap(void)
+{
+    u32 id;
+    u32 length;
+    if (sound.base == 0ul)
+        return;
+    while (virtq_take(&sound.transmit, &id, &length))
+    {
+        if (id / 3u < SOUND_SLOTS)
+            sound.busy[id / 3u] = 0u;
+        device_activity = 1u;
+    }
+}
+
+static int sound_busy(void)
+{
+    u32 slot = 0u;
+    while (slot < SOUND_SLOTS)
+    {
+        if (sound.busy[slot] != 0u)
+            return 1;
+        slot = slot + 1u;
+    }
+    return 0;
+}
+
+// The device forgets the stream and gives back every buffer it held, played or not
+static void sound_stop(void)
+{
+    if (sound.running)
+        sound_stream_request(VIRTIO_SND_R_PCM_STOP);
+    if (sound.configured)
+        sound_stream_request(VIRTIO_SND_R_PCM_RELEASE);
+    sound.running = 0u;
+    sound.configured = 0u;
+    sound.current = SOUND_SLOTS;
+    sound_reap();
+}
+
+static int sound_begin(void)
+{
+    u8* page = sound.control_page;
+    if (!sound.configured)
+    {
+        mem_zero(page, 24ul);
+        store_le32(page, VIRTIO_SND_R_PCM_SET_PARAMS);
+        store_le32(page + 4, 0u);
+        store_le32(page + 8, SOUND_SLOTS * SOUND_SLOT_BYTES);
+        store_le32(page + 12, SOUND_SLOT_BYTES);
+        page[20] = (u8)sound.channels;
+        page[21] = (u8)sound_virtio_format(sound.format);
+        page[22] = (u8)sound_virtio_rate(sound.rate);
+        if (sound_control(24u, 4u) != VIRTIO_SND_S_OK || sound_stream_request(VIRTIO_SND_R_PCM_PREPARE) != VIRTIO_SND_S_OK)
+            return 0;
+        sound.configured = 1u;
+    }
+    if (!sound.running)
+    {
+        if (sound_stream_request(VIRTIO_SND_R_PCM_START) != VIRTIO_SND_S_OK)
+            return 0;
+        sound.running = 1u;
+    }
+    return 1;
+}
+
+static void sound_submit_current(void)
+{
+    u32 slot = sound.current;
+    if (slot >= SOUND_SLOTS || sound.fill[slot] == 0u || !sound_begin())
+        return;
+    store_le32(sound.headers + slot * 16u, 0u);
+    sound.transmit.desc[slot * 3u + 1u].length = sound.fill[slot];
+    sound.busy[slot] = 1u;
+    sound.current = SOUND_SLOTS;
+    virtq_post(&sound.transmit, (u16)(slot * 3u));
+    virtq_kick(&sound.transmit);
+}
+
+static u32 sound_virtio_format(u32 format)
+{
+    if (format == AFMT_S16_LE)
+        return 5u;
+    if (format == AFMT_S32_LE)
+        return 17u;
+    if (format == AFMT_FLOAT)
+        return 19u;
+    return 4u;
+}
+
+static const u32 sound_rates[7] = { 8000u, 11025u, 16000u, 22050u, 32000u, 44100u, 48000u };
+
+static u32 sound_virtio_rate(u32 rate)
+{
+    u32 index = 0u;
+    while (index < 7u && sound_rates[index] != rate)
+        index = index + 1u;
+    return index + 1u;
+}
+
+static u32 sound_nearest_rate(u32 rate)
+{
+    u32 best = sound_rates[0];
+    u32 index = 1u;
+    while (index < 7u)
+    {
+        u32 candidate = sound_rates[index];
+        u32 distance = candidate > rate ? candidate - rate : rate - candidate;
+        u32 best_distance = best > rate ? best - rate : rate - best;
+        if (distance < best_distance)
+            best = candidate;
+        index = index + 1u;
+    }
+    return best;
+}
+
+static u32 sound_frame_bytes(void)
+{
+    u32 width = sound.format == AFMT_U8 ? 1u : sound.format == AFMT_S16_LE ? 2u : 4u;
+    return width * sound.channels;
+}
+
+static int dsp_referenced(void)
+{
+    u32 index = 0u;
+    while (index < MAX_PROCESSES)
+    {
+        struct process* task = &processes[index];
+        u32 fd = 0u;
+        index = index + 1u;
+        if (task->used == 0u || task->state == PROC_ZOMBIE)
+            continue;
+        while (fd < MAX_OPEN_FILES)
+        {
+            if (task->files[fd].used != 0u && task->files[fd].node.type == VFS_NODE_DSP)
+                return 1;
+            fd = fd + 1u;
+        }
+    }
+    return 0;
+}
+
+// Once nothing holds /dev/dsp open the last samples still play, and only then is the stream let go
+static void sound_poll(void)
+{
+    sound_reap();
+    if (sound.base == 0ul)
+        return;
+    if (sound.open != 0u && !dsp_referenced())
+    {
+        sound.open = 0u;
+        sound_submit_current();
+        sound.draining = 1u;
+    }
+    if (sound.draining != 0u && !sound_busy())
+    {
+        sound.draining = 0u;
+        sound_stop();
+    }
+}
+
+static s64 dsp_open(void)
+{
+    u32 slot = 0u;
+    if (sound.base == 0ul)
+        return -19l;
+    if (dsp_referenced())
+        return -16l;
+    sound_reap();
+    sound_stop();
+    // The sample buffers are only worth their pages once something plays
+    while (slot < SOUND_SLOTS && sound.slot_data[slot] == (u8*)0)
+    {
+        sound.slot_data[slot] = (u8*)alloc_page();
+        virtq_set(&sound.transmit, slot * 3u + 1u, (u64)sound.slot_data[slot], SOUND_SLOT_BYTES, VIRTQ_DESC_NEXT, (u16)(slot * 3u + 2u));
+        slot = slot + 1u;
+    }
+    sound.draining = 0u;
+    sound.open = 1u;
+    sound.format = AFMT_U8;
+    sound.rate = 8000u;
+    sound.channels = 1u;
+    return 0l;
+}
+
+static s64 dsp_write(struct file_descriptor* file, u64 buffer, u64 count)
+{
+    u64 done = 0ul;
+    sound_reap();
+    while (done < count)
+    {
+        u32 slot = sound.current;
+        u64 chunk;
+        if (slot >= SOUND_SLOTS)
+        {
+            slot = 0u;
+            while (slot < SOUND_SLOTS && sound.busy[slot] != 0u)
+                slot = slot + 1u;
+            if (slot == SOUND_SLOTS)
+                break;
+            sound.current = slot;
+            sound.fill[slot] = 0u;
+        }
+        chunk = (u64)(SOUND_SLOT_BYTES - sound.fill[slot]);
+        if (chunk > count - done)
+            chunk = count - done;
+        if (!user_copy_from_readable(current_user_root_page_table, sound.slot_data[slot] + sound.fill[slot], buffer + done, chunk))
+            return done != 0ul ? (s64)done : -14l;
+        sound.fill[slot] = sound.fill[slot] + (u32)chunk;
+        done = done + chunk;
+        if (sound.fill[slot] == SOUND_SLOT_BYTES)
+        {
+            sound_submit_current();
+            if (sound.current != SOUND_SLOTS)
+                return done != 0ul ? (s64)done : -5l;
+        }
+    }
+    if (done == 0ul && count != 0ul)
+        return (file->flags & O_NONBLOCK) != 0ul ? -EAGAIN : -ERESTARTSYS;
+    return (s64)done;
+}
+
+static int dsp_writable(void)
+{
+    u32 slot = 0u;
+    sound_reap();
+    if (sound.current < SOUND_SLOTS)
+        return 1;
+    while (slot < SOUND_SLOTS)
+    {
+        if (sound.busy[slot] == 0u)
+            return 1;
+        slot = slot + 1u;
+    }
+    return 0;
+}
+
+static s64 dsp_store_int(u64 argument, u32 value)
+{
+    u8 data[4];
+    store_le32(data, value);
+    return user_copy_to_writable(current_user_root_page_table, argument, data, 4ul) ? 0l : -14l;
+}
+
+static s64 dsp_ioctl(struct file_descriptor* file, u64 request, u64 argument)
+{
+    u8 data[16];
+    u32 value = 0u;
+    u32 slot;
+    u32 queued = 0u;
+    if ((request >> 30) == 3ul && !user_copy_from_readable(current_user_root_page_table, data, argument, 4ul))
+        return -14l;
+    if ((request >> 30) == 3ul)
+        value = le32(data);
+    if (request == SNDCTL_DSP_RESET)
+    {
+        sound_stop();
+        return 0l;
+    }
+    if (request == SNDCTL_DSP_SYNC)
+    {
+        sound_submit_current();
+        sound_reap();
+        return sound_busy() ? -ERESTARTSYS : 0l;
+    }
+    if (request == SNDCTL_DSP_POST)
+    {
+        sound_submit_current();
+        return 0l;
+    }
+    if (request == SNDCTL_DSP_SPEED || request == SNDCTL_DSP_SETFMT || request == SNDCTL_DSP_CHANNELS || request == SNDCTL_DSP_STEREO)
+    {
+        // A format asked for while samples are queued takes effect from a fresh stream
+        if (request == SNDCTL_DSP_SPEED && value != 0u)
+        {
+            sound_stop();
+            sound.rate = sound_nearest_rate(value);
+        }
+        else if (request == SNDCTL_DSP_SETFMT && value != AFMT_QUERY)
+        {
+            sound_stop();
+            sound.format = value == AFMT_S16_LE || value == AFMT_S32_LE || value == AFMT_FLOAT ? value : AFMT_U8;
+        }
+        else if (request == SNDCTL_DSP_CHANNELS && value != 0u)
+        {
+            sound_stop();
+            sound.channels = value >= 2u ? 2u : 1u;
+        }
+        else if (request == SNDCTL_DSP_STEREO)
+        {
+            sound_stop();
+            sound.channels = value != 0u ? 2u : 1u;
+            return dsp_store_int(argument, sound.channels - 1u);
+        }
+        return dsp_store_int(argument, request == SNDCTL_DSP_SPEED ? sound.rate : request == SNDCTL_DSP_SETFMT ? sound.format : sound.channels);
+    }
+    if (request == SNDCTL_DSP_GETBLKSIZE || request == SNDCTL_DSP_SETFRAGMENT)
+        return dsp_store_int(argument, SOUND_SLOT_BYTES);
+    if (request == SNDCTL_DSP_GETFMTS)
+        return dsp_store_int(argument, AFMT_U8 | AFMT_S16_LE | AFMT_S32_LE | AFMT_FLOAT);
+    if (request == SNDCTL_DSP_GETCAPS)
+        return dsp_store_int(argument, 0u);
+    if (request == OSS_GETVERSION)
+        return dsp_store_int(argument, 0x040100u);
+    if (request == SNDCTL_DSP_NONBLOCK)
+    {
+        file->flags = file->flags | (u32)O_NONBLOCK;
+        return 0l;
+    }
+    sound_reap();
+    slot = 0u;
+    while (slot < SOUND_SLOTS)
+    {
+        if (sound.busy[slot] != 0u)
+            queued = queued + sound.fill[slot];
+        else
+            value = value + 1u;
+        slot = slot + 1u;
+    }
+    if (sound.current < SOUND_SLOTS)
+        queued = queued + sound.fill[sound.current];
+    if (request == SNDCTL_DSP_GETODELAY)
+        return dsp_store_int(argument, queued - queued % sound_frame_bytes());
+    if (request == SNDCTL_DSP_GETOSPACE)
+    {
+        u32 free_bytes = value * SOUND_SLOT_BYTES - (sound.current < SOUND_SLOTS ? sound.fill[sound.current] : 0u);
+        store_le32(data, value);
+        store_le32(data + 4, SOUND_SLOTS);
+        store_le32(data + 8, SOUND_SLOT_BYTES);
+        store_le32(data + 12, free_bytes);
+        return user_copy_to_writable(current_user_root_page_table, argument, data, 16ul) ? 0l : -14l;
+    }
+    return -22l;
+}
+
 static int fat_mount(void)
 {
     u8* mbr = sector_buffer;
@@ -4167,9 +6166,28 @@ static u32 fat_next_cluster(u32 cluster)
     return le32(fat_buffer + sector_offset) & 0x0fffffffu;
 }
 
+#define DENTRY_CACHE_SIZE 16u
+#define DENTRY_NAME_LIMIT 32u
+
+// Names looked up again and again, as every exec does for its program and libraries, answered without reading the directory
+struct dentry_cache_entry
+{
+    u32 directory;
+    u32 length;
+    char name[DENTRY_NAME_LIMIT];
+    struct vfs_node node;
+};
+
+static struct dentry_cache_entry dentry_cache[DENTRY_CACHE_SIZE];
+static u32 dentry_cache_count;
+static u32 dentry_cache_next;
+
 // Writing a sector makes any cached copy of it stale
 static int disk_write_sector(u32 lba, void* buffer)
 {
+    // Anything written may be a directory entry, so a write forgets every name looked up
+    dentry_cache_count = 0u;
+    dentry_cache_next = 0u;
     if (fat_buffer_valid != 0ul && fat_buffer_lba == lba)
         fat_buffer_valid = 0ul;
     if (dir_buffer_valid != 0ul && dir_buffer_lba == lba)
@@ -4272,6 +6290,53 @@ static int fat_free_chain(u32 cluster)
         cluster = next;
     }
     return 1;
+}
+
+// How many entries from first on hold the number of the entry right after them, the way a file written in one go is laid out
+static u32 fat_match_sequence(const u32* entries, u32 expected, u32 count)
+{
+#if __riscv_vector
+    u32 index = 0u;
+    while (index < count)
+    {
+        u64 vl = __riscv_vsetvl_e32m8((u64)(count - index));
+        vuint32m8_t links = __riscv_vand_vx_u32m8(__riscv_vle32_v_u32m8(entries + index, vl), 0x0fffffffu, vl);
+        vuint32m8_t wanted = __riscv_vadd_vx_u32m8(__riscv_vid_v_u32m8(vl), expected + index, vl);
+        long miss = __riscv_vfirst_m_b4(__riscv_vmsne_vv_u32m8_b4(links, wanted, vl), vl);
+        if (miss >= 0)
+            return index + (u32)miss;
+        index = index + (u32)vl;
+    }
+    return count;
+#else
+    u32 index = 0u;
+    while (index < count && (entries[index] & 0x0fffffffu) == expected + index)
+        index = index + 1u;
+    return index;
+#endif
+}
+
+// How many links, up to limit, run straight on from cluster, read a FAT sector at a time instead of a link at a time
+static u32 fat_contiguous_links(u32 cluster, u32 limit)
+{
+    u32 count = 0u;
+    while (count < limit)
+    {
+        u32 current = cluster + count;
+        u64 fat_offset = (u64)current << 2ul;
+        u32 first = (u32)(fat_offset & (u64)(SECTOR_SIZE - 1u)) >> 2u;
+        u32 wanted = SECTOR_SIZE / 4u - first;
+        u32 matched;
+        if (wanted > limit - count)
+            wanted = limit - count;
+        if (!fat_sector_load(boot_volume.fat_lba + (u32)(fat_offset >> 9ul)))
+            break;
+        matched = fat_match_sequence((const u32*)fat_buffer + first, current + 1u, wanted);
+        count = count + matched;
+        if (matched < wanted)
+            break;
+    }
+    return count;
 }
 
 // Walks a chain to the cluster holding an offset, growing it when it does not reach that far
@@ -4658,12 +6723,34 @@ static int fat_find_in(u32 directory, const char* name, u32 length, struct vfs_n
 {
     struct fat_dir_cursor cursor;
     struct fat_dir_item item;
+    u32 index = 0u;
+    while (index < dentry_cache_count)
+    {
+        struct dentry_cache_entry* entry = &dentry_cache[index];
+        index = index + 1u;
+        if (entry->directory == directory && entry->length == length && mem_equal(entry->name, name, (u64)length))
+        {
+            *out = entry->node;
+            return 1;
+        }
+    }
     fat_dir_start(&cursor, directory);
     while (fat_dir_next_item(&cursor, &item))
     {
         if (fat_name_matches(name, length, item.name) || fat_name_matches(name, length, item.short_name))
         {
             fat_node_from_item(&item, out);
+            if (length <= DENTRY_NAME_LIMIT)
+            {
+                struct dentry_cache_entry* entry = &dentry_cache[dentry_cache_next];
+                dentry_cache_next = (dentry_cache_next + 1u) % DENTRY_CACHE_SIZE;
+                if (dentry_cache_count < DENTRY_CACHE_SIZE)
+                    dentry_cache_count = dentry_cache_count + 1u;
+                entry->directory = directory;
+                entry->length = length;
+                mem_copy(entry->name, name, (u64)length);
+                entry->node = *out;
+            }
             return 1;
         }
     }
@@ -5144,14 +7231,24 @@ static s64 capture_exec_vector(u64 vector, struct exec_arguments* arguments, u32
         offset = arguments->bytes_used;
         for (;;)
         {
-            u8 ch;
-            if (arguments->bytes_used >= MAX_EXEC_ARG_BYTES)
-                return -7l;
-            if (!user_load_u8(current_user_root_page_table, source + (u64)string_index, &ch))
+            // A string is copied a page at a time, with one translation for each page it touches
+            u64 physical;
+            u64 available;
+            u8 ch = 1u;
+            if (!user_translate(current_user_root_page_table, source + (u64)string_index, PTE_R, &physical))
                 return -14l;
-            arguments->bytes[arguments->bytes_used] = (char)ch;
-            arguments->bytes_used = arguments->bytes_used + 1u;
-            string_index = string_index + 1u;
+            available = PAGE_SIZE - (physical & PAGE_MASK);
+            while (available != 0ul && ch != 0u)
+            {
+                if (arguments->bytes_used >= MAX_EXEC_ARG_BYTES)
+                    return -7l;
+                ch = *((const u8*)physical);
+                arguments->bytes[arguments->bytes_used] = (char)ch;
+                arguments->bytes_used = arguments->bytes_used + 1u;
+                string_index = string_index + 1u;
+                physical = physical + 1ul;
+                available = available - 1ul;
+            }
             if (ch == 0u)
                 break;
         }
@@ -5246,7 +7343,7 @@ static void vfs_device_node(struct vfs_node* node, u32 type)
     node->type = type;
     node->first_cluster = 0u;
     node->size = 0u;
-    node->mode = type == VFS_NODE_DEV_DIR ? (S_IFDIR | 365u) : (S_IFCHR | 438u);
+    node->mode = type == VFS_NODE_DEV_DIR || type == VFS_NODE_INPUT_DIR ? (S_IFDIR | 365u) : (S_IFCHR | 438u);
     node->entry_lba = 0u;
     node->entry_offset = 0u;
 }
@@ -5361,7 +7458,35 @@ static int vfs_component_lookup(struct vfs_node* directory, const char* name, u3
             vfs_device_node(out, VFS_NODE_ZERO);
             return 1;
         }
+        if (component_equals(name, length, "input"))
+        {
+            vfs_device_node(out, VFS_NODE_INPUT_DIR);
+            return 1;
+        }
+        if (component_equals(name, length, "dsp") && sound.base != 0ul)
+        {
+            vfs_device_node(out, VFS_NODE_DSP);
+            return 1;
+        }
         return 0;
+    }
+
+    if (directory->type == VFS_NODE_INPUT_DIR)
+    {
+        u32 index;
+        if (component_equals(name, length, ".."))
+        {
+            vfs_device_node(out, VFS_NODE_DEV_DIR);
+            return 1;
+        }
+        if (length != 6u || !component_equals(name, 5u, "event") || name[5] < '0' || name[5] > '9')
+            return 0;
+        index = (u32)(name[5] - '0');
+        if (!input_device_valid(index))
+            return 0;
+        vfs_device_node(out, VFS_NODE_EVDEV);
+        out->first_cluster = index;
+        return 1;
     }
 
     if (directory->type != VFS_NODE_ROOT_DIR && directory->type != VFS_NODE_FAT_DIR)
@@ -5486,23 +7611,11 @@ static u32 fat_read_node_to_memory(struct vfs_node* node, void* destination, u32
     while (remaining >= cluster_bytes)
     {
         u32 run_start = cluster;
-        u32 run_last = cluster;
-        u32 run_clusters = 1u;
         u32 full_clusters = remaining / cluster_bytes;
+        u32 run_clusters = 1u + fat_contiguous_links(run_start, full_clusters - 1u);
+        u32 run_last = run_start + run_clusters - 1u;
         u32 next_cluster = 0u;
         u32 bytes;
-
-        while (run_clusters < full_clusters)
-        {
-            next_cluster = fat_next_cluster(run_last);
-            if (next_cluster == FAT_READ_ERROR || next_cluster < 2u || next_cluster >= FAT_EOC)
-                return 3u;
-            if (next_cluster != run_last + 1u)
-                break;
-            run_last = next_cluster;
-            run_clusters = run_clusters + 1u;
-            next_cluster = 0u;
-        }
 
         bytes = run_clusters * cluster_bytes;
         if (!block_read((u64)fat_cluster_lba(run_start), dst, bytes))
@@ -5583,6 +7696,11 @@ static int fat_read_at(struct vfs_node* node, u64 offset, void* destination, u32
         skip_clusters = cluster_index - fat_walk_index;
     }
 
+    {
+        u32 links = fat_contiguous_links(cluster, skip_clusters > 0xffffffffu ? 0xffffffffu : (u32)skip_clusters);
+        cluster = cluster + links;
+        skip_clusters = skip_clusters - (u64)links;
+    }
     while (skip_clusters != 0ul)
     {
         cluster = fat_next_cluster(cluster);
@@ -5610,17 +7728,16 @@ static int fat_read_at(struct vfs_node* node, u64 offset, void* destination, u32
             u32 wanted = (count - done) / SECTOR_SIZE;
             u32 sectors = boot_volume.sectors_per_cluster - sector_index;
             u64 joined = 0ul;
-            while (sectors < wanted)
+            if (sectors < wanted)
             {
-                u32 next = fat_next_cluster(cluster);
-                if (next != cluster + 1u || next >= FAT_EOC)
-                    break;
-                cluster = next;
-                cluster_index = cluster_index + 1ul;
+                u32 needed = (wanted - sectors + boot_volume.sectors_per_cluster - 1u) / boot_volume.sectors_per_cluster;
+                u32 links = fat_contiguous_links(cluster, needed);
+                cluster = cluster + links;
+                cluster_index = cluster_index + (u64)links;
                 fat_walk_cluster = cluster;
                 fat_walk_index = cluster_index;
-                joined = joined + 1ul;
-                sectors = sectors + boot_volume.sectors_per_cluster;
+                joined = (u64)links;
+                sectors = sectors + links * boot_volume.sectors_per_cluster;
             }
             if (sectors > wanted)
                 sectors = wanted;
@@ -5662,6 +7779,14 @@ static void fd_clear(u32 fd)
     open_files[fd].node.first_cluster = 0u;
     open_files[fd].node.size = 0u;
     open_files[fd].node.mode = 0u;
+    open_files[fd].object = 0u;
+}
+
+// What an open created goes away with the last descriptor that refers to it
+static void fd_release(struct file_descriptor* file)
+{
+    if (file->used != 0u && file->node.type == VFS_NODE_EVDEV)
+        evdev_client_put(file->object);
 }
 
 static int fd_valid(u64 fd)
@@ -5774,6 +7899,12 @@ static void tty_init(void)
     tty->cc[TTY_VLNEXT] = 22u;
     tty->rows = 25u;
     tty->columns = 80u;
+    // The screen's grid is the terminal's size, since that is where full-screen programs draw
+    if (fbcon_registers != (volatile u64*)0)
+    {
+        tty->rows = (u32)fbcon_rows;
+        tty->columns = (u32)fbcon_columns;
+    }
 }
 
 static u32 tty_advance_column(u32 column, u8 ch)
@@ -6085,6 +8216,7 @@ static int tty_readable(void)
 static int tty_poll(void)
 {
     int received = 0;
+    input_poll();
     while (uart_can_read())
     {
         tty_receive((u8)uart_try_read());
@@ -6209,11 +8341,13 @@ static s64 tty_write(u64 buffer, u64 count)
         else
         {
             u64 index = 0ul;
+            fbcon_begin();
             while (index < chunk)
             {
                 tty_output(((const u8*)physical)[index]);
                 index = index + 1ul;
             }
+            fbcon_end();
         }
         done = done + chunk;
     }
@@ -6468,18 +8602,23 @@ static s64 zero_read_to_user(u64 buffer, u64 count)
     return (s64)done;
 }
 
+// A page the program can write, once faulted in or made its own, is read into directly; an address it cannot write
+// goes through the kernel's buffer, so the read fails only when there is data for it
 static s64 fat_file_read_to_user(struct file_descriptor* file, u64 buffer, u64 count)
 {
     u64 done = 0ul;
     while (done < count)
     {
-        u32 requested = (u32)(count - done > PAGE_SIZE ? PAGE_SIZE : count - done);
+        u64 physical;
+        int direct = user_translate_with_brk_fault(current_user_root_page_table, buffer + done, PTE_W, &physical);
+        u64 room = direct ? PAGE_SIZE - (physical & PAGE_MASK) : PAGE_SIZE;
+        u32 requested = (u32)(count - done > room ? room : count - done);
         u32 actual = 0u;
-        if (!fat_read_at(&file->node, file->offset + done, file_read_buffer, requested, &actual))
+        if (!fat_read_at(&file->node, file->offset + done, direct ? (void*)physical : (void*)file_read_buffer, requested, &actual))
             return done == 0ul ? -5l : (s64)done;
         if (actual == 0u)
             break;
-        if (!user_copy_to_writable(current_user_root_page_table, buffer + done, file_read_buffer, (u64)actual))
+        if (!direct && !user_copy_to_writable(current_user_root_page_table, buffer + done, file_read_buffer, (u64)actual))
             return -14l;
         done = done + (u64)actual;
     }
@@ -6505,7 +8644,11 @@ static s64 vfs_read(u64 fd_value, u64 buffer, u64 count)
         return zero_read_to_user(buffer, count);
     if (type == VFS_NODE_FAT_FILE)
         return fat_file_read_to_user(file, buffer, count);
-    if (type == VFS_NODE_ROOT_DIR || type == VFS_NODE_DEV_DIR)
+    if (type == VFS_NODE_EVDEV)
+        return evdev_read(file, buffer, count);
+    if (type == VFS_NODE_DSP)
+        return -22l;
+    if (type == VFS_NODE_ROOT_DIR || type == VFS_NODE_DEV_DIR || type == VFS_NODE_INPUT_DIR)
         return -21l;
     return -9l;
 }
@@ -6551,7 +8694,11 @@ static s64 vfs_write(u64 fd_value, u64 buffer, u64 count)
         return (s64)count;
     if (type == VFS_NODE_FAT_FILE)
         return fat_write_from_user(file, buffer, count);
-    if (type == VFS_NODE_ROOT_DIR || type == VFS_NODE_DEV_DIR)
+    if (type == VFS_NODE_DSP)
+        return dsp_write(file, buffer, count);
+    if (type == VFS_NODE_EVDEV)
+        return -22l;
+    if (type == VFS_NODE_ROOT_DIR || type == VFS_NODE_DEV_DIR || type == VFS_NODE_INPUT_DIR)
         return -30l;
     return -9l;
 }
@@ -6598,10 +8745,19 @@ static s64 vfs_openat(u64 dirfd, u64 path_pointer, u64 flags, u64 mode)
     // A session leader without a terminal takes the first one it opens, as a login does
     if (node.type == VFS_NODE_CONSOLE && node.first_cluster == 0u && (flags & O_NOCTTY) == 0ul)
         tty_acquire(current_task, 0);
-    if ((node.type == VFS_NODE_ROOT_DIR || node.type == VFS_NODE_DEV_DIR || node.type == VFS_NODE_FAT_DIR) &&
-        ((flags & O_ACCMODE) != 0ul))
+    if ((node.type == VFS_NODE_ROOT_DIR || node.type == VFS_NODE_DEV_DIR || node.type == VFS_NODE_FAT_DIR ||
+        node.type == VFS_NODE_INPUT_DIR) && ((flags & O_ACCMODE) != 0ul))
     {
         return -21l;
+    }
+    if (node.type == VFS_NODE_DSP)
+    {
+        s64 opened;
+        if ((flags & O_ACCMODE) == O_RDONLY)
+            return -22l;
+        opened = dsp_open();
+        if (opened != 0l)
+            return opened;
     }
     // Opening for writing with a truncation gives back everything the file held
     if (node.type == VFS_NODE_FAT_FILE && (flags & O_TRUNC) != 0ul && (flags & O_ACCMODE) != O_RDONLY)
@@ -6617,6 +8773,17 @@ static s64 vfs_openat(u64 dirfd, u64 path_pointer, u64 flags, u64 mode)
     if (fd < 0)
         return -24l;
     fd_install((u32)fd, &node, flags);
+    // A reader that opens an event node gets a queue of its own, starting from what happens next
+    if (node.type == VFS_NODE_EVDEV)
+    {
+        s64 client = evdev_open(node.first_cluster);
+        if (client < 0l)
+        {
+            fd_clear((u32)fd);
+            return client;
+        }
+        open_files[fd].object = (u32)client;
+    }
     return (s64)fd;
 }
 
@@ -6796,6 +8963,7 @@ static s64 vfs_close(u64 fd)
 {
     if (!fd_valid(fd))
         return -9l;
+    fd_release(&open_files[(u32)fd]);
     fd_clear((u32)fd);
     return 0l;
 }
@@ -6893,16 +9061,36 @@ static const char* dev_dir_entry_name(u64 index)
         return "null";
     if (index == 6ul)
         return "zero";
+    if (index == 7ul)
+        return "input";
+    if (index == 8ul && sound.base != 0ul)
+        return "dsp";
     return NULL;
 }
 
 static u32 dev_dir_entry_type(u64 index)
 {
-    if (index == 0ul || index == 1ul)
+    if (index == 0ul || index == 1ul || index == 7ul)
         return DT_DIR;
-    if (index >= 2ul && index <= 6ul)
+    if (index >= 2ul && index <= 8ul)
         return DT_CHR;
     return 0u;
+}
+
+static char input_dir_name[8];
+
+static const char* input_dir_entry_name(u64 index)
+{
+    if (index == 0ul)
+        return ".";
+    if (index == 1ul)
+        return "..";
+    if (!input_device_valid((u32)(index - 2ul)))
+        return NULL;
+    mem_copy(input_dir_name, "event", 5ul);
+    input_dir_name[5] = (char)('0' + (int)(index - 2ul));
+    input_dir_name[6] = 0;
+    return input_dir_name;
 }
 
 static u32 string_length(const char* text)
@@ -6938,7 +9126,7 @@ static s64 vfs_getdents64(u64 fd_value, u64 user_buffer, u64 count)
         return -9l;
     file = &open_files[(u32)fd_value];
     if (file->node.type != VFS_NODE_ROOT_DIR && file->node.type != VFS_NODE_DEV_DIR &&
-        file->node.type != VFS_NODE_FAT_DIR)
+        file->node.type != VFS_NODE_FAT_DIR && file->node.type != VFS_NODE_INPUT_DIR)
     {
         return -20l;
     }
@@ -6966,6 +9154,11 @@ static s64 vfs_getdents64(u64 fd_value, u64 user_buffer, u64 count)
             if (!fat_entry_at(file->node.first_cluster, file->offset, fat_name, &type, &inode))
                 break;
             name = fat_name;
+        }
+        else if (file->node.type == VFS_NODE_INPUT_DIR)
+        {
+            name = input_dir_entry_name(file->offset);
+            type = file->offset < 2ul ? DT_DIR : DT_CHR;
         }
         else
         {
@@ -7026,10 +9219,13 @@ static void stat_store_node(u8* stat_buffer, struct vfs_node* node)
     store_le64(stat_buffer + 8, ((u64)node->type << 32) | (u64)node->first_cluster);
     store_le32(stat_buffer + 16, node->mode);
     store_le32(stat_buffer + 20, node->type == VFS_NODE_ROOT_DIR || node->type == VFS_NODE_DEV_DIR ||
-        node->type == VFS_NODE_FAT_DIR ? 2u : 1u);
+        node->type == VFS_NODE_FAT_DIR || node->type == VFS_NODE_INPUT_DIR ? 2u : 1u);
     store_le32(stat_buffer + 24, 0u);
     store_le32(stat_buffer + 28, 0u);
-    store_le64(stat_buffer + 32, node->type == VFS_NODE_CONSOLE ? 1ul : 0ul);
+    // Device numbers are Linux's: input is major 13 with event nodes from minor 64, sound is major 14 with dsp at minor 3
+    store_le64(stat_buffer + 32, node->type == VFS_NODE_CONSOLE ? 1ul :
+        node->type == VFS_NODE_EVDEV ? (13ul << 8) | (64ul + (u64)node->first_cluster) :
+        node->type == VFS_NODE_DSP ? (14ul << 8) | 3ul : 0ul);
     store_le64(stat_buffer + 48, (u64)node->size);
     store_le32(stat_buffer + 56, SECTOR_SIZE);
     store_le64(stat_buffer + 64, blocks);
@@ -7153,6 +9349,10 @@ static s64 sys_ioctl_impl(u64 fd_value, u64 request, u64 argument)
 {
     if (!fd_valid(fd_value))
         return -9l;
+    if (open_files[(u32)fd_value].node.type == VFS_NODE_EVDEV)
+        return evdev_ioctl(&open_files[(u32)fd_value], request, argument);
+    if (open_files[(u32)fd_value].node.type == VFS_NODE_DSP)
+        return dsp_ioctl(&open_files[(u32)fd_value], request, argument);
     if (open_files[(u32)fd_value].node.type != VFS_NODE_CONSOLE)
         return -25l;
     return tty_ioctl(&open_files[(u32)fd_value], request, argument);
@@ -7189,13 +9389,14 @@ static u64 vm_pte_flags(u64 prot)
     return flags;
 }
 
+// The regions in use are the first vm_region_count, in no particular order
 static struct vm_region* vm_find_region(u64 address)
 {
     u32 index = 0u;
-    while (index < MAX_VM_REGIONS)
+    while (index < current_task->vm_region_count)
     {
         struct vm_region* region = &current_task->vm_regions[index];
-        if (region->used != 0u && address >= region->start && address < region->end)
+        if (address >= region->start && address < region->end)
             return region;
         index = index + 1u;
     }
@@ -7220,137 +9421,93 @@ static int vm_range_covered(u64 start, u64 end)
 static int vm_range_overlaps(u64 start, u64 end)
 {
     u32 index = 0u;
-    while (index < MAX_VM_REGIONS)
+    while (index < current_task->vm_region_count)
     {
         struct vm_region* region = &current_task->vm_regions[index];
-        if (region->used != 0u && start < region->end && end > region->start)
+        if (start < region->end && end > region->start)
             return 1;
         index = index + 1u;
     }
     return 0;
 }
 
-static int vm_free_slot_count(void)
+static struct vm_region* vm_append_region(u64 start, u64 end, u64 prot, u64 flags)
 {
-    u32 index = 0u;
-    int count = 0;
-    while (index < MAX_VM_REGIONS)
-    {
-        if (current_task->vm_regions[index].used == 0u)
-            count = count + 1;
-        index = index + 1u;
-    }
-    return count;
-}
-
-static struct vm_region* vm_allocate_region(void)
-{
-    u32 index = 0u;
-    while (index < MAX_VM_REGIONS)
-    {
-        struct vm_region* region = &current_task->vm_regions[index];
-        if (region->used == 0u)
-        {
-            region->used = 1u;
-            return region;
-        }
-        index = index + 1u;
-    }
-    return NULL;
+    struct vm_region* region;
+    if (current_task->vm_region_count == MAX_VM_REGIONS)
+        return NULL;
+    region = &current_task->vm_regions[current_task->vm_region_count];
+    current_task->vm_region_count = current_task->vm_region_count + 1u;
+    region->start = start;
+    region->end = end;
+    region->prot = prot;
+    region->flags = flags;
+    return region;
 }
 
 static int vm_add_region(u64 start, u64 end, u64 prot, u64 flags)
 {
-    struct vm_region* region;
     u32 index = 0u;
-    while (index < MAX_VM_REGIONS)
+    while (index < current_task->vm_region_count)
     {
-        region = &current_task->vm_regions[index];
-        if (region->used != 0u && region->end == start && region->prot == prot && region->flags == flags)
+        struct vm_region* region = &current_task->vm_regions[index];
+        if (region->end == start && region->prot == prot && region->flags == flags)
         {
             region->end = end;
             return 1;
         }
-        if (region->used != 0u && region->start == end && region->prot == prot && region->flags == flags)
+        if (region->start == end && region->prot == prot && region->flags == flags)
         {
             region->start = start;
             return 1;
         }
         index = index + 1u;
     }
-    region = vm_allocate_region();
-    if (region == NULL)
-        return 0;
-    region->start = start;
-    region->end = end;
-    region->prot = prot;
-    region->flags = flags;
-    return 1;
+    return vm_append_region(start, end, prot, flags) != NULL;
 }
 
 static int vm_remove_range(u64 start, u64 end)
 {
     u32 index = 0u;
-    int splits = 0;
-    while (index < MAX_VM_REGIONS)
+    u32 splits = 0u;
+    while (index < current_task->vm_region_count)
     {
         struct vm_region* region = &current_task->vm_regions[index];
-        if (region->used != 0u && start > region->start && end < region->end)
-            splits = splits + 1;
+        if (start > region->start && end < region->end)
+            splits = splits + 1u;
         index = index + 1u;
     }
-    if (vm_free_slot_count() < splits)
+    if (current_task->vm_region_count + splits > MAX_VM_REGIONS)
         return 0;
     index = 0u;
-    while (index < MAX_VM_REGIONS)
+    while (index < current_task->vm_region_count)
     {
         struct vm_region* region = &current_task->vm_regions[index];
-        if (region->used == 0u || start >= region->end || end <= region->start)
+        if (start >= region->end || end <= region->start)
         {
             index = index + 1u;
             continue;
         }
         if (start <= region->start && end >= region->end)
         {
-            region->used = 0u;
+            // The last region takes the freed place, and is looked at next
+            current_task->vm_region_count = current_task->vm_region_count - 1u;
+            *region = current_task->vm_regions[current_task->vm_region_count];
+            continue;
         }
-        else if (start <= region->start)
-        {
+        if (start <= region->start)
             region->start = end;
-        }
         else if (end >= region->end)
-        {
             region->end = start;
-        }
         else
         {
-            struct vm_region* right = vm_allocate_region();
-            if (right == NULL)
-                return 0;
-            right->start = end;
-            right->end = region->end;
-            right->prot = region->prot;
-            right->flags = region->flags;
+            u64 right_end = region->end;
             region->end = start;
+            vm_append_region(end, right_end, region->prot, region->flags);
         }
         index = index + 1u;
     }
     return 1;
-}
-
-static u64* user_leaf_pte(u64 root, u64 virtual_address)
-{
-    u64 table = root;
-    int level = 2;
-    while (level > 0)
-    {
-        u64 pte = ((u64*)table)[sv39_index(virtual_address, level)];
-        if ((pte & PTE_V) == 0ul || (pte & (PTE_R | PTE_W | PTE_X)) != 0ul)
-            return NULL;
-        table = pte_physical(pte);
-        level = level - 1;
-    }
-    return &((u64*)table)[sv39_index(virtual_address, 0)];
 }
 
 static int vm_apply_protection(u64 start, u64 end, u64 prot)
@@ -7376,7 +9533,11 @@ static int vm_apply_protection(u64 start, u64 end, u64 prot)
         else
         {
             u64 physical = pte_physical(*entry);
-            *entry = pte_make(physical, pte_flags | PTE_U | PTE_A | PTE_D);
+            u64 flags = pte_flags;
+            // A page another space still maps cannot take W, only copy-on-write
+            if ((flags & PTE_W) != 0ul && *page_share(physical) != 0u)
+                flags = (flags & ~PTE_W) | PTE_SOFT_COW;
+            *entry = pte_make(physical, flags | PTE_U | PTE_A | PTE_D);
         }
         page = page + PAGE_SIZE;
     }
@@ -7693,6 +9854,127 @@ static int grow_user_brk(u64 requested)
     return 1;
 }
 
+// What a descriptor could do now without waiting, in poll's terms
+static u32 fd_poll_events(u64 fd)
+{
+    struct file_descriptor* file;
+    if (!fd_valid(fd))
+        return POLLNVAL;
+    file = &open_files[(u32)fd];
+    if (file->node.type == VFS_NODE_CONSOLE)
+    {
+        tty_poll();
+        return (tty_readable() ? POLL_READABLE : 0u) | POLL_WRITABLE;
+    }
+    if (file->node.type == VFS_NODE_EVDEV)
+    {
+        input_poll();
+        return evdev_clients[file->object].ready != 0u ? POLL_READABLE : 0u;
+    }
+    if (file->node.type == VFS_NODE_DSP)
+        return dsp_writable() ? POLL_WRITABLE : 0u;
+    return POLL_READABLE | POLL_WRITABLE;
+}
+
+// Fills in revents, returning how many descriptors have something; a negative descriptor is skipped
+static s64 poll_scan(u8* entries, u64 count)
+{
+    s64 ready = 0l;
+    u64 index = 0ul;
+    while (index < count)
+    {
+        u8* entry = entries + index * 8ul;
+        s32 fd = (s32)le32(entry);
+        u32 revents = 0u;
+        if (fd >= 0)
+            revents = fd_poll_events((u64)fd) & ((u32)le16(entry + 4) | POLLERR | POLLHUP | POLLNVAL);
+        store_le16(entry + 6, (u16)revents);
+        if (revents != 0u)
+            ready = ready + 1l;
+        index = index + 1ul;
+    }
+    return ready;
+}
+
+// ppoll as Linux has it: the timeout counts down in the caller's timespec across the waits, and a mask holds only while
+// the call waits, the way sigsuspend's does, with every restart putting it back in place
+static void sys_ppoll_dispatch(struct trap_frame* frame, u64 fds, u64 count, u64 timeout_pointer, u64 mask_pointer, u64 mask_size)
+{
+    u8 entries[MAX_POLL_FDS * 8u];
+    u64 timeout[2];
+    u64 mask;
+    u64 deadline = 0ul;
+    s64 ready;
+    if (count > (u64)MAX_POLL_FDS || (mask_pointer != 0ul && mask_size != 8ul))
+    {
+        frame->x[10] = (u64)-22l;
+        return;
+    }
+    if ((count != 0ul && !user_copy_from_readable(current_user_root_page_table, entries, fds, count * 8ul)) ||
+        (timeout_pointer != 0ul && !user_copy_from_readable(current_user_root_page_table, timeout, timeout_pointer, 16ul)) ||
+        (mask_pointer != 0ul && !user_copy_from_readable(current_user_root_page_table, &mask, mask_pointer, 8ul)))
+    {
+        frame->x[10] = (u64)-14l;
+        return;
+    }
+    if (timeout_pointer != 0ul)
+    {
+        if ((s64)timeout[0] < 0l || timeout[1] >= 1000000000ul)
+        {
+            frame->x[10] = (u64)-22l;
+            return;
+        }
+        deadline = timer_now() + time_to_ticks(timeout[0], timeout[1], 1000000000ul);
+    }
+    if (mask_pointer != 0ul)
+    {
+        current_task->signal_saved_blocked = current_task->signal_blocked;
+        current_task->signal_restore_mask = 1u;
+        current_task->signal_blocked = mask & ~SIGNAL_UNBLOCKABLE;
+    }
+    ready = poll_scan(entries, count);
+    if (ready != 0l || (timeout_pointer != 0ul && timeout[0] == 0ul && timeout[1] == 0ul))
+    {
+        if (count != 0ul && !user_copy_to_writable(current_user_root_page_table, fds, entries, count * 8ul))
+            ready = -14l;
+        if (mask_pointer != 0ul)
+        {
+            current_task->signal_blocked = current_task->signal_saved_blocked;
+            current_task->signal_restore_mask = 0u;
+        }
+        frame->x[10] = (u64)ready;
+        return;
+    }
+    current_task->sleep_user_pointer = timeout_pointer;
+    frame->x[10] = (u64)-ERESTARTNOHAND;
+    process_sleep(frame, SLEEP_POLL, timeout_pointer != 0ul ? deadline : 0ul);
+}
+
+// A poll whose time ran out reports nothing ready, with every revents cleared
+static void poll_time_out(struct process* task)
+{
+    u64 fds = task->orig_a0;
+    u64 count = task->frame.x[11];
+    u64 index = 0ul;
+    u8 none[2];
+    none[0] = 0u;
+    none[1] = 0u;
+    while (index < count && index < (u64)MAX_POLL_FDS)
+    {
+        user_copy_to_writable(task->root_page_table, fds + index * 8ul + 6ul, none, 2ul);
+        index = index + 1ul;
+    }
+    process_store_remaining(task, task->sleep_user_pointer, task->sleep_deadline);
+    task->frame.x[10] = 0ul;
+    process_wake(task);
+}
+
+// A call on one of these that cannot go on yet waits for the device rather than for the terminal
+static int fd_waits_on_device(u64 fd)
+{
+    return fd_valid(fd) && (open_files[(u32)fd].node.type == VFS_NODE_EVDEV || open_files[(u32)fd].node.type == VFS_NODE_DSP);
+}
+
 static void trap_dispatch(struct trap_frame* frame)
 {
     u64 cause = frame->scause;
@@ -7706,12 +9988,15 @@ static void trap_dispatch(struct trap_frame* frame)
             s64 result = vfs_read(frame->x[10], frame->x[11], frame->x[12]);
             frame->x[10] = (u64)result;
             if (result == -ERESTARTSYS)
-                process_sleep(frame, SLEEP_CONSOLE, current_task->sleep_deadline);
+                process_sleep(frame, fd_waits_on_device(current_task->orig_a0) ? SLEEP_DEVICE : SLEEP_CONSOLE, current_task->sleep_deadline);
             return;
         }
         if (nr == SYS_WRITE)
         {
-            frame->x[10] = (u64)vfs_write(frame->x[10], frame->x[11], frame->x[12]);
+            s64 result = vfs_write(frame->x[10], frame->x[11], frame->x[12]);
+            frame->x[10] = (u64)result;
+            if (result == -ERESTARTSYS && fd_waits_on_device(current_task->orig_a0))
+                process_sleep(frame, SLEEP_DEVICE, 0ul);
             return;
         }
         if (nr == SYS_OPENAT)
@@ -7751,7 +10036,10 @@ static void trap_dispatch(struct trap_frame* frame)
         }
         if (nr == SYS_IOCTL)
         {
-            frame->x[10] = (u64)sys_ioctl_impl(frame->x[10], frame->x[11], frame->x[12]);
+            s64 result = sys_ioctl_impl(frame->x[10], frame->x[11], frame->x[12]);
+            frame->x[10] = (u64)result;
+            if (result == -ERESTARTSYS && fd_waits_on_device(current_task->orig_a0))
+                process_sleep(frame, SLEEP_DEVICE, 0ul);
             return;
         }
         if (nr == SYS_CHDIR)
@@ -7946,6 +10234,11 @@ static void trap_dispatch(struct trap_frame* frame)
                 frame->x[10] = process_brk;
             return;
         }
+        if (nr == SYS_PPOLL)
+        {
+            sys_ppoll_dispatch(frame, frame->x[10], frame->x[11], frame->x[12], frame->x[13], frame->x[14]);
+            return;
+        }
         if (nr == SYS_REBOOT)
         {
             frame->x[10] = (u64)sys_reboot_impl(frame->x[10], frame->x[11], frame->x[12]);
@@ -7966,6 +10259,8 @@ static void trap_dispatch(struct trap_frame* frame)
     }
     if ((cause == 13ul || cause == 15ul) && (frame->sstatus & SSTATUS_SPP) == 0ul)
     {
+        if (cause == 15ul && user_break_cow(current_user_root_page_table, frame->stval))
+            return;
         if (map_user_stack_fault(current_user_root_page_table, frame->stval))
             return;
         if (map_user_brk_fault(current_user_root_page_table, frame->stval))
@@ -8020,6 +10315,7 @@ void kernel_main(u64 hartid, void* fdt)
     u64 stack;
 
     parse_fdt(fdt);
+    virtio_discover();
 #if __riscv_vector
     __asm__ volatile("csrrs zero, sstatus, %[vs]" : : [vs] "{t0}"(SSTATUS_VS) : "memory");
 #endif
@@ -8035,6 +10331,7 @@ void kernel_main(u64 hartid, void* fdt)
         panic("vector registers exceed the saved context");
     if (!block_subsystem_init())
         panic("block subsystem init failed");
+    devices_init();
     if (!fat_mount())
         panic("boot FAT32 mount failed");
     if (!vfs_lookup(init_path, &init_node) || init_node.type != VFS_NODE_FAT_FILE)

@@ -1,87 +1,81 @@
-#define CAT_BUFFER 512
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 
 static int cat_line;
 static int cat_at_start = 1;
 
-static void cat_write_numbered(const char* text, usize count)
+static void cat_write(const char* text, size_t count, int numbered)
 {
-    usize index = 0ul;
-    while (index < count)
+    size_t index;
+    if (!numbered)
+    {
+        fwrite(text, 1, count, stdout);
+        return;
+    }
+    for (index = 0; index < count; index++)
     {
         if (cat_at_start)
-        {
-            cat_line = cat_line + 1;
-            write_unsigned_to(1, (u64)cat_line, 6, ' ');
-            write_text("  ");
-            cat_at_start = 0;
-        }
-        write_all(1, text + index, 1ul);
+            printf("%6d  ", ++cat_line);
+        fputc(text[index], stdout);
         cat_at_start = text[index] == '\n';
-        index = index + 1ul;
     }
 }
 
 static int cat_stream(int fd, int numbered)
 {
-    char buffer[CAT_BUFFER];
+    char buffer[512];
     for (;;)
     {
-        s64 count = sys_read(fd, buffer, (usize)CAT_BUFFER);
-        if (count < 0l)
+        ssize_t count = read(fd, buffer, sizeof(buffer));
+        if (count < 0)
             return 1;
-        if (count == 0l)
+        if (count == 0)
             return 0;
-        if (numbered)
-            cat_write_numbered(buffer, (usize)count);
-        else
-            write_all(1, buffer, (usize)count);
+        cat_write(buffer, (size_t)count, numbered);
     }
 }
 
-int main(int argc, char** argv, char** envp)
+int main(int argc, char** argv)
 {
     int numbered = 0;
     int index = 1;
     int status = 0;
-    (void)envp;
 
     while (index < argc && argv[index][0] == '-' && argv[index][1] != 0)
     {
-        if (string_equal(argv[index], "-n"))
-            numbered = 1;
-        else
+        if (strcmp(argv[index], "-n") != 0)
         {
-            report("cat", (const char*)NULL, "usage: cat [-n] [file...]");
+            fputs("cat: usage: cat [-n] [file...]\n", stderr);
             return 2;
         }
-        index = index + 1;
+        numbered = 1;
+        index++;
     }
 
     // With nothing named, a filter reads what it is given
     if (index == argc)
         return cat_stream(0, numbered);
 
-    while (index < argc)
+    for (; index < argc; index++)
     {
         int fd;
-        if (string_equal(argv[index], "-"))
+        if (strcmp(argv[index], "-") == 0)
         {
-            if (cat_stream(0, numbered) != 0)
-                status = 1;
-            index = index + 1;
+            status |= cat_stream(0, numbered);
             continue;
         }
-        fd = open_for_reading("cat", argv[index]);
+        fd = open(argv[index], O_RDONLY);
         if (fd < 0)
         {
+            fprintf(stderr, "cat: %s: %s\n", argv[index], errno == ENOENT ? "no such file" : errno == EISDIR ? "is a directory" : "cannot be opened");
             status = 1;
-            index = index + 1;
             continue;
         }
-        if (cat_stream(fd, numbered) != 0)
-            status = 1;
-        sys_close(fd);
-        index = index + 1;
+        status |= cat_stream(fd, numbered);
+        close(fd);
     }
     return status;
 }

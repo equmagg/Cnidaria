@@ -16,29 +16,6 @@ public enum RVPrivilegeMode : byte { User = 0, Supervisor = 1, Machine = 3 }
 public enum RVStopReason : byte { None, InstructionLimit, WaitingForInterrupt, Stopped, MachineFatalTrap }
 public enum RVMemoryAccess : byte { Execute, Load, Store }
 
-public readonly struct RVKeyboardEvent
-{
-    public readonly ushort Usage;
-    public readonly ushort Flags;
-
-    public uint Encoded => (uint)Usage | ((uint)Flags << 16);
-
-    public RVKeyboardEvent(ushort usage, ushort flags)
-    {
-        Usage = usage;
-        Flags = flags;
-    }
-
-    public static RVKeyboardEvent KeyDown(ushort usage, bool repeat = false)
-        => new RVKeyboardEvent(usage, (ushort)(repeat ? 3 : 1));
-
-    public static RVKeyboardEvent KeyUp(ushort usage)
-        => new RVKeyboardEvent(usage, 0);
-
-    public static RVKeyboardEvent FromEncoded(uint encoded)
-        => new RVKeyboardEvent((ushort)encoded, (ushort)(encoded >> 16));
-}
-
 public readonly struct RVTrapInfo
 {
     public readonly ulong Cause;
@@ -112,7 +89,16 @@ public sealed class RVMachineConfig
     public int BlockDeviceSize { get; set; }
     public int BlockDeviceCount { get; set; } = 1;
     public ulong KeyboardBase { get; set; } = 0x10009000UL;
+    /// <summary>How many key events may wait for the guest; 0 leaves the machine without a keyboard</summary>
     public int KeyboardQueueCapacity { get; set; } = 256;
+    /// <summary>A mouse reports motion, a tablet reports where the pointer is; null leaves the machine without either</summary>
+    public RVInputDeviceKind? PointerKind { get; set; } = RVInputDeviceKind.Tablet;
+    public ulong PointerBase { get; set; } = 0x1000B000UL;
+    public int PointerQueueCapacity { get; set; } = 256;
+    public bool SoundEnabled { get; set; } = true;
+    public ulong SoundBase { get; set; } = 0x1000C000UL;
+    /// <summary>The rate the guest is told its clock runs at, which is what a device keeping real time measures against</summary>
+    public ulong TimebaseFrequency { get; set; } = 10_000_000UL;
     public ulong HostBridgeBase { get; set; } = 0x1000A000UL;
     public bool HostBridgeEnabled { get; set; } = true;
     public ulong FramebufferBase { get; set; } = 0x50000000UL;
@@ -200,7 +186,12 @@ public sealed class RiscVEmulator
     private readonly RVUart16550 _uart;
     private readonly RVClint _clint;
     private readonly RVPlic _plic;
-    private readonly RVMmioKeyboard? _keyboard;
+    private readonly RVVirtioInput? _keyboard;
+    private readonly RVVirtioInput? _pointer;
+    private readonly RVVirtioSound? _sound;
+    private readonly RVVirtioMmioDevice[] _virtioDevices;
+    private readonly RVVirtioMmioDevice[] _polledDevices;
+    private readonly ulong _timebaseFrequency;
     private readonly RVMmioHostBridge? _hostBridge;
     private readonly RVFramebuffer? _framebuffer;
     private readonly byte[] _framebufferPixels;
@@ -292,7 +283,10 @@ public sealed class RiscVEmulator
     public RVUart16550 Uart => _uart;
     public RVClint Clint => _clint;
     public RVPlic Plic => _plic;
-    public RVMmioKeyboard? Keyboard => _keyboard;
+    public RVVirtioInput? Keyboard => _keyboard;
+    public RVVirtioInput? Pointer => _pointer;
+    public RVVirtioSound? Sound => _sound;
+    public ulong TimebaseFrequency => _timebaseFrequency;
     public RVMmioHostBridge? HostBridge => _hostBridge;
     public RVFramebuffer? Framebuffer => _framebuffer;
     public RVMmioBlockDevice? BlockDevice => _blocks.Length == 0 ? null : _blocks[0];
@@ -324,8 +318,17 @@ public sealed class RiscVEmulator
             : null;
         _framebufferPixels = _framebuffer?.Pixels ?? Array.Empty<byte>();
         _framebufferPixelBase = _framebuffer?.PixelBaseAddress ?? 0;
+        if (config.TimebaseFrequency == 0)
+            throw new ArgumentOutOfRangeException(nameof(config));
+        _timebaseFrequency = config.TimebaseFrequency;
         _keyboard = config.KeyboardQueueCapacity > 0
-            ? new RVMmioKeyboard(config.KeyboardBase, config.KeyboardQueueCapacity, RVPlic.KeyboardSource)
+            ? new RVVirtioInput(config.KeyboardBase, RVInputDeviceKind.Keyboard, config.KeyboardQueueCapacity, RVPlic.KeyboardSource)
+            : null;
+        _pointer = config.PointerKind is RVInputDeviceKind pointerKind
+            ? new RVVirtioInput(config.PointerBase, pointerKind, config.PointerQueueCapacity, RVPlic.PointerSource)
+            : null;
+        _sound = config.SoundEnabled
+            ? new RVVirtioSound(config.SoundBase, config.TimebaseFrequency, RVPlic.SoundSource)
             : null;
         _blockDeviceStride = config.BlockDeviceStride;
         _hartId = config.InitialHartId;
@@ -349,6 +352,15 @@ public sealed class RiscVEmulator
         {
             _blocks = Array.Empty<RVMmioBlockDevice>();
         }
+        var polled = new List<RVVirtioMmioDevice>();
+        if (_keyboard != null)
+            polled.Add(_keyboard);
+        if (_pointer != null)
+            polled.Add(_pointer);
+        if (_sound != null)
+            polled.Add(_sound);
+        _polledDevices = polled.ToArray();
+        _virtioDevices = [.. _blocks, .. _polledDevices];
         RequireDisjointDevices();
         Reset(config.InitialStackPointer);
     }
@@ -362,14 +374,12 @@ public sealed class RiscVEmulator
             ("clint", _clint.BaseAddress, RVClint.RegisterWindowSize),
             ("plic", _plic.BaseAddress, RVPlic.RegisterWindowSize),
         };
-        if (_keyboard != null)
-            windows.Add(("keyboard", _keyboard.BaseAddress, RVMmioKeyboard.RegisterWindowSize));
+        foreach (var device in _virtioDevices)
+            windows.Add(("virtio device at 0x" + device.BaseAddress.ToString("x"), device.BaseAddress, RVVirtioMmioDevice.RegisterWindowSize));
         if (_hostBridge != null)
             windows.Add(("host bridge", _hostBridge.BaseAddress, RVMmioHostBridge.RegisterWindowSize));
         if (_framebuffer != null)
             windows.Add(("framebuffer", _framebuffer.BaseAddress, _framebuffer.WindowSize));
-        for (int i = 0; i < _blocks.Length; i++)
-            windows.Add(("block device " + i, _blocks[i].BaseAddress, RVMmioBlockDevice.RegisterWindowSize));
 
         for (int i = 0; i < windows.Count; i++)
         {
@@ -455,11 +465,11 @@ public sealed class RiscVEmulator
         _uart.Reset();
         _clint.Reset();
         _plic.Reset();
-        _keyboard?.Reset();
         _hostBridge?.Reset();
         _framebuffer?.Reset();
-        foreach (var block in _blocks)
-            block.Reset();
+        foreach (var device in _virtioDevices)
+            device.Reset();
+        RefreshDeviceInterrupts();
         _x[10] = _hartId;
         _x[11] = _initialDeviceTreePointer;
         if (initialStackPointer != 0)
@@ -508,6 +518,8 @@ public sealed class RiscVEmulator
             steps++;
             _cycle++;
             _clint.Tick();
+            if ((_cycle & (DevicePollInterval - 1)) == 0 && _polledDevices.Length != 0)
+                PollDevices();
             UpdatePendingInterrupts();
 
             ulong interrupt = SelectInterrupt();
@@ -2167,10 +2179,6 @@ public sealed class RiscVEmulator
                 mip &= ~(1UL << (int)SupervisorTimerInterrupt);
         }
 
-        foreach (var block in _blocks)
-            _plic.SetSourcePending(block.InterruptSource, block.InterruptPending);
-        if (_keyboard != null)
-            _plic.SetSourcePending(_keyboard.InterruptSource, _keyboard.InterruptPending);
         _plic.SetSourcePending(RVPlic.UartSource, _uart.InterruptPending);
         if (_plic.HasPendingInterrupt(RVPlic.MachineContext))
             mip |= 1UL << (int)MachineExternalInterrupt;
@@ -2180,6 +2188,23 @@ public sealed class RiscVEmulator
         _mip = mip;
     }
 
+
+    // Devices act on their own this often, in instructions, which at the default clock is every 0.1 ms of guest time
+    private const ulong DevicePollInterval = 1024;
+
+    private void PollDevices()
+    {
+        foreach (var device in _polledDevices)
+            device.Poll(_clint.MTime, _ram, _ramBase);
+        RefreshDeviceInterrupts();
+    }
+
+    // A virtio line only changes when the device is written, polled or completed at the PLIC, so it is not refreshed every step
+    private void RefreshDeviceInterrupts()
+    {
+        foreach (var device in _virtioDevices)
+            _plic.SetSourcePending(device.InterruptSource, device.InterruptPending);
+    }
 
     private ulong SelectInterrupt()
     {
@@ -3185,11 +3210,6 @@ public sealed class RiscVEmulator
             value = _plic.Read(address, size);
             return true;
         }
-        if (_keyboard != null && _keyboard.Contains(address))
-        {
-            value = _keyboard.Read(address, size);
-            return true;
-        }
         if (_hostBridge != null && _hostBridge.Contains(address))
         {
             value = _hostBridge.Read(address, size);
@@ -3200,11 +3220,11 @@ public sealed class RiscVEmulator
             value = _framebuffer.Read(address, size);
             return true;
         }
-        foreach (var block in _blocks)
+        foreach (var device in _virtioDevices)
         {
-            if (block.Contains(address))
+            if (device.Contains(address))
             {
-                value = block.Read(address, size);
+                value = device.Read(address, size);
                 return true;
             }
         }
@@ -3274,11 +3294,7 @@ public sealed class RiscVEmulator
         if (_plic.Contains(address))
         {
             _plic.Write(address, size, value);
-            return true;
-        }
-        if (_keyboard != null && _keyboard.Contains(address))
-        {
-            _keyboard.Write(address, size, value);
+            RefreshDeviceInterrupts();
             return true;
         }
         if (_hostBridge != null && _hostBridge.Contains(address))
@@ -3291,11 +3307,12 @@ public sealed class RiscVEmulator
             _framebuffer.Write(address, size, value);
             return true;
         }
-        foreach (var block in _blocks)
+        foreach (var device in _virtioDevices)
         {
-            if (block.Contains(address))
+            if (device.Contains(address))
             {
-                block.Write(address, size, value, _ram, _ramBase);
+                device.Write(address, size, value, _ram, _ramBase);
+                RefreshDeviceInterrupts();
                 return true;
             }
         }
@@ -6606,6 +6623,8 @@ public sealed class RVPlic
     public const int BlockDeviceSource = BlockDeviceFirstSource;
     public const int UartSource = 10;
     public const int KeyboardSource = 11;
+    public const int PointerSource = 12;
+    public const int SoundSource = 13;
 
     private const int SourceCount = 32;
     private const int ContextCount = 2;
@@ -6633,6 +6652,8 @@ public sealed class RVPlic
             _priority[source] = 1;
         _priority[UartSource] = 1;
         _priority[KeyboardSource] = 1;
+        _priority[PointerSource] = 1;
+        _priority[SoundSource] = 1;
     }
 
     public ulong BaseAddress => _base;
@@ -6800,691 +6821,4 @@ public sealed class RVPlic
         uint mask = bits >= 32 ? uint.MaxValue : (1U << bits) - 1;
         return (value >> (byteOffset * 8)) & mask;
     }
-}
-
-
-public sealed class RVMmioKeyboard
-{
-    public const ulong RegisterWindowSize = 0x100UL;
-    private const uint MagicValue = 0x44424b43U;
-    private const uint Version = 1;
-    private const uint StatusReady = 1;
-    private const uint StatusOverflow = 2;
-    private const uint ControlInterruptEnable = 1;
-    private const uint ControlClearQueue = 2;
-    private const uint ControlClearOverflow = 4;
-
-    private readonly ulong _base;
-    private readonly int _interruptSource;
-    private readonly uint[] _events;
-    private int _head;
-    private int _count;
-    private bool _interruptEnabled;
-    private bool _overflow;
-
-    public ulong BaseAddress => _base;
-    public int InterruptSource => _interruptSource;
-    public int Capacity => _events.Length;
-    public int Count => _count;
-    public bool Overflow => _overflow;
-    public bool InterruptPending => _interruptEnabled && _count != 0;
-
-    public RVMmioKeyboard(ulong baseAddress, int capacity, int interruptSource = RVPlic.KeyboardSource)
-    {
-        if (capacity <= 0)
-            throw new ArgumentOutOfRangeException(nameof(capacity));
-        _base = baseAddress;
-        _interruptSource = interruptSource;
-        _events = new uint[capacity];
-    }
-
-    public void Reset()
-    {
-        _head = 0;
-        _count = 0;
-        _interruptEnabled = false;
-        _overflow = false;
-    }
-
-    public bool Contains(ulong address)
-        => address - _base < RegisterWindowSize;
-
-    public bool Enqueue(RVKeyboardEvent value)
-        => EnqueueEncoded(value.Encoded);
-
-    public bool EnqueueKeyDown(ushort usage, bool repeat = false)
-        => Enqueue(RVKeyboardEvent.KeyDown(usage, repeat));
-
-    public bool EnqueueKeyUp(ushort usage)
-        => Enqueue(RVKeyboardEvent.KeyUp(usage));
-
-    public bool EnqueueEncoded(uint value)
-    {
-        if (_count == _events.Length)
-        {
-            _overflow = true;
-            return false;
-        }
-        int index = _head + _count;
-        if (index >= _events.Length)
-            index -= _events.Length;
-        _events[index] = value;
-        _count++;
-        return true;
-    }
-
-    public ulong Read(ulong address, int size)
-    {
-        ulong offset = address - _base;
-        uint value = offset switch
-        {
-            0x00 => MagicValue,
-            0x04 => Version,
-            0x08 => (uint)_events.Length,
-            0x0c => BuildStatus(),
-            0x10 => _interruptEnabled ? 1U : 0U,
-            0x14 => Dequeue(),
-            _ => 0,
-        };
-        return Slice(value, (int)(offset & 3), size);
-    }
-
-    public void Write(ulong address, int size, ulong value)
-    {
-        ulong offset = address - _base;
-        if ((offset & 3) != 0 || size != 4)
-            return;
-        if (offset != 0x10)
-            return;
-
-        uint control = (uint)value;
-        _interruptEnabled = (control & ControlInterruptEnable) != 0;
-        if ((control & ControlClearQueue) != 0)
-        {
-            _head = 0;
-            _count = 0;
-        }
-        if ((control & ControlClearOverflow) != 0)
-            _overflow = false;
-    }
-
-    private uint BuildStatus()
-    {
-        uint status = _count != 0 ? StatusReady : 0;
-        if (_overflow)
-            status |= StatusOverflow;
-        return status;
-    }
-
-    private uint Dequeue()
-    {
-        if (_count == 0)
-            return 0;
-        uint value = _events[_head++];
-        if (_head == _events.Length)
-            _head = 0;
-        _count--;
-        return value;
-    }
-
-    private static ulong Slice(uint value, int byteOffset, int size)
-    {
-        if (size == 4 && byteOffset == 0)
-            return value;
-        int bits = size * 8;
-        uint mask = bits >= 32 ? uint.MaxValue : (1U << bits) - 1;
-        return (value >> (byteOffset * 8)) & mask;
-    }
-}
-
-public sealed class RVMmioBlockDevice
-{
-    private const uint MagicValue = 0x74726976;
-    private const uint Version = 2;
-    private const uint DeviceIdBlock = 2;
-    private const uint VendorId = 0x434e4944;
-    private const uint QueueSize = 8;
-    private const ulong SupportedFeatures = (1UL << 6) | (1UL << 32);
-    private const uint DeviceFeaturesLow = 1u << 6;
-    private const uint DeviceFeaturesHigh = 1u;
-    private const uint InterruptUsedBuffer = 1;
-    private const uint StatusFeaturesOk = 8;
-    private const ushort VirtqAvailFNoInterrupt = 1;
-    private const uint VirtqDescFNext = 1;
-    private const uint VirtqDescFWrite = 2;
-    private const uint BlkTIn = 0;
-    private const uint BlkTOut = 1;
-    private const uint BlkTFlush = 4;
-    private const byte BlkSOk = 0;
-    private const byte BlkSIoErr = 1;
-    private const byte BlkSUnsupported = 2;
-
-    public const ulong RegisterWindowSize = 0x1000;
-    public const ulong SectorSize = 512;
-
-    private readonly ulong _base;
-    private readonly byte[] _storage;
-    private uint _deviceFeaturesSel;
-    private uint _driverFeaturesSel;
-    private ulong _driverFeatures;
-    private uint _queueSel;
-    private uint _queueNum;
-    private uint _queueReady;
-    private ulong _queueDesc;
-    private ulong _queueDriver;
-    private ulong _queueDevice;
-    private ushort _lastAvailableIndex;
-    private uint _interruptStatus;
-    private uint _status;
-    private uint _configGeneration;
-
-    public byte[] Storage => _storage;
-    public ulong BaseAddress => _base;
-    public int InterruptSource { get; }
-    public bool InterruptPending => _interruptStatus != 0;
-    public ulong CapacityBytes => (ulong)_storage.Length;
-    public ulong CapacitySectors => (ulong)_storage.Length / SectorSize;
-
-    public RVMmioBlockDevice(ulong baseAddress, int storageSize, int interruptSource = RVPlic.BlockDeviceSource)
-    {
-        if (storageSize <= 0)
-            throw new ArgumentOutOfRangeException(nameof(storageSize));
-        _base = baseAddress;
-        _storage = new byte[storageSize];
-        InterruptSource = interruptSource;
-    }
-
-    public void Reset()
-    {
-        _deviceFeaturesSel = 0;
-        _driverFeaturesSel = 0;
-        _driverFeatures = 0;
-        _queueSel = 0;
-        _queueNum = 0;
-        _queueReady = 0;
-        _queueDesc = 0;
-        _queueDriver = 0;
-        _queueDevice = 0;
-        _lastAvailableIndex = 0;
-        _interruptStatus = 0;
-        _status = 0;
-        _configGeneration++;
-    }
-
-    public bool Contains(ulong address)
-        => address - _base < RegisterWindowSize;
-
-    public void LoadImage(byte[] image, int offset = 0)
-    {
-        if (image is null)
-            throw new ArgumentNullException(nameof(image));
-        if (offset < 0 || offset > _storage.Length || image.Length > _storage.Length - offset)
-            throw new ArgumentOutOfRangeException(nameof(offset));
-        Buffer.BlockCopy(image, 0, _storage, offset, image.Length);
-    }
-
-    public void ClearStorage(int offset = 0, int length = -1)
-    {
-        if (length < 0)
-            length = _storage.Length - offset;
-        if (offset < 0 || length < 0 || offset > _storage.Length || length > _storage.Length - offset)
-            throw new ArgumentOutOfRangeException(nameof(offset));
-        Array.Clear(_storage, offset, length);
-    }
-
-    public ulong Read(ulong address, int size)
-    {
-        ulong offset = address - _base;
-        if (offset >= 0x100)
-            return ReadConfig(offset - 0x100, size);
-
-        ulong value = (offset & ~3UL) switch
-        {
-            0x000 => MagicValue,
-            0x004 => Version,
-            0x008 => DeviceIdBlock,
-            0x00c => VendorId,
-            0x010 => ReadDeviceFeatures(),
-            0x014 => _deviceFeaturesSel,
-            0x020 => ReadDriverFeatures(),
-            0x024 => _driverFeaturesSel,
-            0x030 => _queueSel,
-            0x034 => _queueSel == 0 ? QueueSize : 0,
-            0x038 => _queueSel == 0 ? _queueNum : 0,
-            0x044 => _queueSel == 0 ? _queueReady : 0,
-            0x050 => 0,
-            0x060 => _interruptStatus,
-            0x064 => 0,
-            0x070 => _status,
-            0x080 => (uint)_queueDesc,
-            0x084 => (uint)(_queueDesc >> 32),
-            0x090 => (uint)_queueDriver,
-            0x094 => (uint)(_queueDriver >> 32),
-            0x0a0 => (uint)_queueDevice,
-            0x0a4 => (uint)(_queueDevice >> 32),
-            0x0fc => _configGeneration,
-            _ => 0,
-        };
-        return ReadWindow(value, (int)(offset & 3), size);
-    }
-
-    public void Write(ulong address, int size, ulong value, byte[] ram, ulong ramBase)
-    {
-        ulong offset = address - _base;
-        if (offset >= 0x100)
-            return;
-
-        switch (offset & ~3UL)
-        {
-            case 0x014:
-                _deviceFeaturesSel = (uint)WriteWindow(_deviceFeaturesSel, (int)(offset & 3), size, value);
-                break;
-            case 0x020:
-                WriteDriverFeatures((uint)WriteWindow(ReadDriverFeatures(), (int)(offset & 3), size, value));
-                break;
-            case 0x024:
-                _driverFeaturesSel = (uint)WriteWindow(_driverFeaturesSel, (int)(offset & 3), size, value);
-                break;
-            case 0x030:
-                _queueSel = (uint)WriteWindow(_queueSel, (int)(offset & 3), size, value);
-                break;
-            case 0x038:
-                if (_queueSel == 0)
-                    _queueNum = Math.Min((uint)WriteWindow(_queueNum, (int)(offset & 3), size, value), QueueSize);
-                break;
-            case 0x044:
-                if (_queueSel == 0)
-                {
-                    _queueReady = (uint)WriteWindow(_queueReady, (int)(offset & 3), size, value) & 1;
-                    if (_queueReady == 0)
-                        _lastAvailableIndex = 0;
-                }
-                break;
-            case 0x050:
-                if ((uint)WriteWindow(0, (int)(offset & 3), size, value) == 0)
-                    ProcessQueue(ram, ramBase);
-                break;
-            case 0x064:
-                _interruptStatus &= ~(uint)WriteWindow(0, (int)(offset & 3), size, value);
-                break;
-            case 0x070:
-                uint newStatus = (uint)WriteWindow(_status, (int)(offset & 3), size, value);
-                if (newStatus == 0)
-                    Reset();
-                else
-                {
-                    _status = newStatus;
-                    if ((_status & StatusFeaturesOk) != 0 && (_driverFeatures & ~SupportedFeatures) != 0)
-                        _status &= ~StatusFeaturesOk;
-                }
-                break;
-            case 0x080:
-                if (_queueSel == 0)
-                    _queueDesc = WriteLow32(_queueDesc, (uint)WriteWindow((uint)_queueDesc, (int)(offset & 3), size, value));
-                break;
-            case 0x084:
-                if (_queueSel == 0)
-                    _queueDesc = WriteHigh32(_queueDesc, (uint)WriteWindow((uint)(_queueDesc >> 32), (int)(offset & 3), size, value));
-                break;
-            case 0x090:
-                if (_queueSel == 0)
-                    _queueDriver = WriteLow32(_queueDriver, (uint)WriteWindow((uint)_queueDriver, (int)(offset & 3), size, value));
-                break;
-            case 0x094:
-                if (_queueSel == 0)
-                    _queueDriver = WriteHigh32(_queueDriver, (uint)WriteWindow((uint)(_queueDriver >> 32), (int)(offset & 3), size, value));
-                break;
-            case 0x0a0:
-                if (_queueSel == 0)
-                    _queueDevice = WriteLow32(_queueDevice, (uint)WriteWindow((uint)_queueDevice, (int)(offset & 3), size, value));
-                break;
-            case 0x0a4:
-                if (_queueSel == 0)
-                    _queueDevice = WriteHigh32(_queueDevice, (uint)WriteWindow((uint)(_queueDevice >> 32), (int)(offset & 3), size, value));
-                break;
-        }
-    }
-
-    private uint ReadDeviceFeatures()
-        => _deviceFeaturesSel == 0 ? DeviceFeaturesLow : _deviceFeaturesSel == 1 ? DeviceFeaturesHigh : 0;
-
-    private uint ReadDriverFeatures()
-        => _driverFeaturesSel == 0 ? (uint)_driverFeatures : _driverFeaturesSel == 1 ? (uint)(_driverFeatures >> 32) : 0;
-
-    private void WriteDriverFeatures(uint value)
-    {
-        if (_driverFeaturesSel == 0)
-            _driverFeatures = (_driverFeatures & 0xffffffff00000000UL) | value;
-        else if (_driverFeaturesSel == 1)
-            _driverFeatures = (_driverFeatures & 0xffffffffUL) | ((ulong)value << 32);
-    }
-
-    private ulong ReadConfig(ulong offset, int size)
-    {
-        ulong value = (offset & ~7UL) switch
-        {
-            0x00 => CapacitySectors,
-            0x08 => 0,
-            0x10 => SectorSize << 32,
-            _ => 0,
-        };
-        return ReadWindow(value, (int)(offset & 7), size);
-    }
-
-    private void ProcessQueue(byte[] ram, ulong ramBase)
-    {
-        if (_queueSel != 0 || _queueReady == 0 || _queueNum == 0 || _queueNum > QueueSize)
-            return;
-        if (!TryReadU16(ram, ramBase, _queueDriver + 2, out ushort availableIndex))
-            return;
-
-        while (_lastAvailableIndex != availableIndex)
-        {
-            ulong ringEntryAddress = _queueDriver + 4 + 2UL * ((ulong)_lastAvailableIndex % _queueNum);
-            if (!TryReadU16(ram, ramBase, ringEntryAddress, out ushort head))
-                return;
-            byte status = ExecuteRequest(ram, ramBase, head, out uint bytesTransferred);
-            PublishUsedBuffer(ram, ramBase, head, bytesTransferred, status != BlkSOk);
-            _lastAvailableIndex++;
-        }
-    }
-
-    private byte ExecuteRequest(byte[] ram, ulong ramBase, ushort head, out uint bytesTransferred)
-    {
-        bytesTransferred = 0;
-        if (head >= _queueNum)
-            return BlkSIoErr;
-        if (!ReadDescriptor(ram, ramBase, head, out Descriptor header))
-            return BlkSIoErr;
-        if ((header.Flags & VirtqDescFNext) == 0 || header.Length < 16)
-            return BlkSIoErr;
-        if (!TryReadU32(ram, ramBase, header.Address, out uint type))
-            return BlkSIoErr;
-        if (!TryReadU64(ram, ramBase, header.Address + 8, out ulong sector))
-            return BlkSIoErr;
-
-        if (type == BlkTFlush)
-            return CompleteFlushRequest(ram, ramBase, header.Next);
-        if (type != BlkTIn && type != BlkTOut)
-            return CompleteUnsupportedRequest(ram, ramBase, header.Next);
-
-        ulong storageOffset;
-        try
-        {
-            storageOffset = checked(sector * SectorSize);
-        }
-        catch (OverflowException)
-        {
-            return CompleteDataRequest(ram, ramBase, header.Next, type, ulong.MaxValue, out bytesTransferred);
-        }
-
-        return CompleteDataRequest(ram, ramBase, header.Next, type, storageOffset, out bytesTransferred);
-    }
-
-    private byte CompleteDataRequest(byte[] ram, ulong ramBase, ushort firstDataDescriptor, uint type, ulong storageOffset, out uint bytesTransferred)
-    {
-        bytesTransferred = 0;
-        ushort descriptorIndex = firstDataDescriptor;
-        uint descriptorsLeft = _queueNum;
-        while (descriptorsLeft-- != 0)
-        {
-            if (!ReadDescriptor(ram, ramBase, descriptorIndex, out Descriptor descriptor))
-                return BlkSIoErr;
-            bool isLast = (descriptor.Flags & VirtqDescFNext) == 0;
-            if (isLast)
-                return WriteStatus(ram, ramBase, descriptor, BlkSOk) ? BlkSOk : BlkSIoErr;
-
-            if (descriptor.Length > int.MaxValue || storageOffset > (ulong)_storage.Length || descriptor.Length > (ulong)_storage.Length - storageOffset)
-            {
-                if (!SkipToStatusAndWrite(ram, ramBase, descriptor, BlkSIoErr))
-                    return BlkSIoErr;
-                return BlkSIoErr;
-            }
-
-            if (type == BlkTIn)
-            {
-                if ((descriptor.Flags & VirtqDescFWrite) == 0)
-                {
-                    if (!SkipToStatusAndWrite(ram, ramBase, descriptor, BlkSIoErr))
-                        return BlkSIoErr;
-                    return BlkSIoErr;
-                }
-                if (!TryWriteBytes(ram, ramBase, descriptor.Address, _storage, (int)storageOffset, (int)descriptor.Length))
-                {
-                    if (!SkipToStatusAndWrite(ram, ramBase, descriptor, BlkSIoErr))
-                        return BlkSIoErr;
-                    return BlkSIoErr;
-                }
-            }
-            else
-            {
-                if ((descriptor.Flags & VirtqDescFWrite) != 0)
-                {
-                    if (!SkipToStatusAndWrite(ram, ramBase, descriptor, BlkSIoErr))
-                        return BlkSIoErr;
-                    return BlkSIoErr;
-                }
-                if (!TryReadBytes(ram, ramBase, descriptor.Address, _storage, (int)storageOffset, (int)descriptor.Length))
-                {
-                    if (!SkipToStatusAndWrite(ram, ramBase, descriptor, BlkSIoErr))
-                        return BlkSIoErr;
-                    return BlkSIoErr;
-                }
-            }
-
-            bytesTransferred = checked(bytesTransferred + descriptor.Length);
-            storageOffset = checked(storageOffset + descriptor.Length);
-            descriptorIndex = descriptor.Next;
-        }
-        return BlkSIoErr;
-    }
-
-    private byte CompleteFlushRequest(byte[] ram, ulong ramBase, ushort statusDescriptor)
-    {
-        if (!ReadDescriptor(ram, ramBase, statusDescriptor, out Descriptor descriptor))
-            return BlkSIoErr;
-        return WriteStatus(ram, ramBase, descriptor, BlkSOk) ? BlkSOk : BlkSIoErr;
-    }
-
-    private byte CompleteUnsupportedRequest(byte[] ram, ulong ramBase, ushort firstDescriptor)
-    {
-        if (!ReadDescriptor(ram, ramBase, firstDescriptor, out Descriptor descriptor))
-            return BlkSUnsupported;
-        return SkipToStatusAndWrite(ram, ramBase, descriptor, BlkSUnsupported) ? BlkSUnsupported : BlkSIoErr;
-    }
-
-    private bool SkipToStatusAndWrite(byte[] ram, ulong ramBase, Descriptor descriptor, byte status)
-    {
-        uint descriptorsLeft = _queueNum;
-        while ((descriptor.Flags & VirtqDescFNext) != 0 && descriptorsLeft-- != 0)
-        {
-            if (!ReadDescriptor(ram, ramBase, descriptor.Next, out descriptor))
-                return false;
-        }
-        return WriteStatus(ram, ramBase, descriptor, status);
-    }
-
-    private bool WriteStatus(byte[] ram, ulong ramBase, Descriptor descriptor, byte status)
-    {
-        if (descriptor.Length < 1 || (descriptor.Flags & VirtqDescFWrite) == 0)
-            return false;
-        if (!TryWriteU8(ram, ramBase, descriptor.Address, status))
-            return false;
-        return true;
-    }
-
-    private void PublishUsedBuffer(byte[] ram, ulong ramBase, ushort head, uint bytesTransferred, bool forceInterrupt)
-    {
-        if (!TryReadU16(ram, ramBase, _queueDevice + 2, out ushort usedIndex))
-            return;
-        ulong elementAddress = _queueDevice + 4 + 8UL * ((ulong)usedIndex % _queueNum);
-        if (!TryWriteU32(ram, ramBase, elementAddress, head))
-            return;
-        if (!TryWriteU32(ram, ramBase, elementAddress + 4, bytesTransferred))
-            return;
-        if (!TryWriteU16(ram, ramBase, _queueDevice + 2, unchecked((ushort)(usedIndex + 1))))
-            return;
-        bool suppressInterrupt = false;
-        if (TryReadU16(ram, ramBase, _queueDriver, out ushort availableFlags))
-            suppressInterrupt = (availableFlags & VirtqAvailFNoInterrupt) != 0;
-        if (!suppressInterrupt || forceInterrupt)
-            _interruptStatus |= InterruptUsedBuffer;
-    }
-
-    private bool ReadDescriptor(byte[] ram, ulong ramBase, ushort index, out Descriptor descriptor)
-    {
-        descriptor = default;
-        if (index >= _queueNum)
-            return false;
-        ulong address = _queueDesc + 16UL * index;
-        if (!TryReadU64(ram, ramBase, address, out ulong guestAddress))
-            return false;
-        if (!TryReadU32(ram, ramBase, address + 8, out uint length))
-            return false;
-        if (!TryReadU16(ram, ramBase, address + 12, out ushort flags))
-            return false;
-        if (!TryReadU16(ram, ramBase, address + 14, out ushort next))
-            return false;
-        descriptor = new Descriptor(guestAddress, length, flags, next);
-        return true;
-    }
-
-    private readonly struct Descriptor
-    {
-        public readonly ulong Address;
-        public readonly uint Length;
-        public readonly ushort Flags;
-        public readonly ushort Next;
-
-        public Descriptor(ulong address, uint length, ushort flags, ushort next)
-        {
-            Address = address;
-            Length = length;
-            Flags = flags;
-            Next = next;
-        }
-    }
-
-    private static bool TryReadU8(byte[] ram, ulong ramBase, ulong address, out byte value)
-    {
-        value = 0;
-        if (!TryGetRamOffset(ram, ramBase, address, 1, out int offset))
-            return false;
-        value = ram[offset];
-        return true;
-    }
-
-    private static bool TryWriteU8(byte[] ram, ulong ramBase, ulong address, byte value)
-    {
-        if (!TryGetRamOffset(ram, ramBase, address, 1, out int offset))
-            return false;
-        ram[offset] = value;
-        return true;
-    }
-
-    private static bool TryReadU16(byte[] ram, ulong ramBase, ulong address, out ushort value)
-    {
-        value = 0;
-        if (!TryGetRamOffset(ram, ramBase, address, 2, out int offset))
-            return false;
-        value = (ushort)(ram[offset] | (ram[offset + 1] << 8));
-        return true;
-    }
-
-    private static bool TryWriteU16(byte[] ram, ulong ramBase, ulong address, ushort value)
-    {
-        if (!TryGetRamOffset(ram, ramBase, address, 2, out int offset))
-            return false;
-        ram[offset] = (byte)value;
-        ram[offset + 1] = (byte)(value >> 8);
-        return true;
-    }
-
-    private static bool TryReadU32(byte[] ram, ulong ramBase, ulong address, out uint value)
-    {
-        value = 0;
-        if (!TryGetRamOffset(ram, ramBase, address, 4, out int offset))
-            return false;
-        value = (uint)(ram[offset] | (ram[offset + 1] << 8) | (ram[offset + 2] << 16) | (ram[offset + 3] << 24));
-        return true;
-    }
-
-    private static bool TryWriteU32(byte[] ram, ulong ramBase, ulong address, uint value)
-    {
-        if (!TryGetRamOffset(ram, ramBase, address, 4, out int offset))
-            return false;
-        ram[offset] = (byte)value;
-        ram[offset + 1] = (byte)(value >> 8);
-        ram[offset + 2] = (byte)(value >> 16);
-        ram[offset + 3] = (byte)(value >> 24);
-        return true;
-    }
-
-    private static bool TryReadU64(byte[] ram, ulong ramBase, ulong address, out ulong value)
-    {
-        value = 0;
-        if (!TryGetRamOffset(ram, ramBase, address, 8, out int offset))
-            return false;
-        value = (ulong)ram[offset]
-            | ((ulong)ram[offset + 1] << 8)
-            | ((ulong)ram[offset + 2] << 16)
-            | ((ulong)ram[offset + 3] << 24)
-            | ((ulong)ram[offset + 4] << 32)
-            | ((ulong)ram[offset + 5] << 40)
-            | ((ulong)ram[offset + 6] << 48)
-            | ((ulong)ram[offset + 7] << 56);
-        return true;
-    }
-
-    private static bool TryWriteBytes(byte[] ram, ulong ramBase, ulong address, byte[] source, int sourceOffset, int count)
-    {
-        if (!TryGetRamOffset(ram, ramBase, address, count, out int offset))
-            return false;
-        Buffer.BlockCopy(source, sourceOffset, ram, offset, count);
-        return true;
-    }
-
-    private static bool TryReadBytes(byte[] ram, ulong ramBase, ulong address, byte[] target, int targetOffset, int count)
-    {
-        if (!TryGetRamOffset(ram, ramBase, address, count, out int offset))
-            return false;
-        Buffer.BlockCopy(ram, offset, target, targetOffset, count);
-        return true;
-    }
-
-    private static bool TryGetRamOffset(byte[] ram, ulong ramBase, ulong address, int length, out int offset)
-    {
-        offset = 0;
-        if (length < 0 || length > ram.Length)
-            return false;
-        ulong relative = address - ramBase;
-        if (address < ramBase || relative > (ulong)(ram.Length - length))
-            return false;
-        offset = (int)relative;
-        return true;
-    }
-
-    private static ulong ReadWindow(ulong value, int offset, int size)
-    {
-        if (size == 8 && offset == 0)
-            return value;
-        int bits = size * 8;
-        ulong mask = bits >= 64 ? ulong.MaxValue : (1UL << bits) - 1;
-        return (value >> (offset * 8)) & mask;
-    }
-
-    private static ulong WriteWindow(ulong old, int offset, int size, ulong value)
-    {
-        if (size == 8 && offset == 0)
-            return value;
-        int bits = size * 8;
-        ulong mask = bits >= 64 ? ulong.MaxValue : ((1UL << bits) - 1) << (offset * 8);
-        return (old & ~mask) | ((value << (offset * 8)) & mask);
-    }
-
-    private static ulong WriteLow32(ulong old, uint value)
-        => (old & 0xffffffff00000000UL) | value;
-
-    private static ulong WriteHigh32(ulong old, uint value)
-        => (old & 0xffffffffUL) | ((ulong)value << 32);
 }

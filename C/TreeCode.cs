@@ -567,8 +567,13 @@ public static class GimpleTypes
     public static bool IsVolatileOrAtomic(QualifiedType type)
         => (type.Qualifiers & (TypeQualifiers.Volatile | TypeQualifiers.Atomic)) != 0;
 
+    // Arithmetic on a type narrower than int is int arithmetic converted back, which wraps
+    public static bool HasUndefinedOverflow(QualifiedType type, TargetInfo target)
+        => IsIntegerLike(type) && IsSigned(type, target) &&
+           target.SizeOf(type) >= target.SizeOf(new QualifiedType(TypeCatalog.Instance.Int));
+
     /// <summary>Gets whether an arithmetic type carries a sign</summary>
-    public static bool IsSigned(QualifiedType type)
+    public static bool IsSigned(QualifiedType type, TargetInfo target)
     {
         if (type.Type.Kind == TypeKind.Enum)
             return true;
@@ -576,8 +581,10 @@ public static class GimpleTypes
         if (type.Type is not BuiltinType builtin)
             return false;
 
+        if (builtin.BuiltinKind == BuiltinTypeKind.Char)
+            return target.IsCharSigned;
+
         return builtin.BuiltinKind is
-            BuiltinTypeKind.Char or
             BuiltinTypeKind.SignedChar or
             BuiltinTypeKind.Short or
             BuiltinTypeKind.Int or

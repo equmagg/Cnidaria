@@ -1,25 +1,25 @@
-int main(int argc, char** argv, char** envp)
+#include <errno.h>
+#include <stdio.h>
+#include <sys/stat.h>
+
+int main(int argc, char** argv)
 {
-    int index = 1;
+    int index;
     int status = 0;
-    (void)envp;
 
     if (argc < 2)
     {
-        report("mkdir", (const char*)NULL, "usage: mkdir name...");
+        fputs("mkdir: usage: mkdir name...\n", stderr);
         return 2;
     }
 
-    while (index < argc)
+    for (index = 1; index < argc; index++)
     {
-        s64 result = sys_mkdirat((s64)AT_FDCWD, argv[index], 493ul);
-        if (result < 0l)
+        if (mkdir(argv[index], 0755) < 0)
         {
-            report("mkdir", argv[index],
-                result == -17l ? "already exists" : result == -2l ? "has no parent directory" : "cannot be created");
+            fprintf(stderr, "mkdir: %s: %s\n", argv[index], errno == EEXIST ? "already exists" : errno == ENOENT ? "has no parent directory" : "cannot be created");
             status = 1;
         }
-        index = index + 1;
     }
     return status;
 }

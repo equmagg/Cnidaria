@@ -498,6 +498,7 @@ public enum ArmInstrKind : ushort
     Fcvtzs,
     Fcvtzu,
     Fcvt,
+    Csel,
 }
 
 public enum ArmRegister : byte

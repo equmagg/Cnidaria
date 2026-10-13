@@ -1,5 +1,26 @@
 namespace System.Diagnostics
 {
+    // Attribute class used by the compiler to mark modules.
+    [AttributeUsage(AttributeTargets.Assembly | AttributeTargets.Module, AllowMultiple = false)]
+    public sealed class DebuggableAttribute : Attribute
+    {
+        [Flags]
+        public enum DebuggingModes
+        {
+            None = 0x0,
+            Default = 0x1,
+            DisableOptimizations = 0x100,
+            IgnoreSymbolStoreSequencePoints = 0x2,
+            EnableEditAndContinue = 0x4
+        }
+
+        public DebuggableAttribute(DebuggingModes modes)
+        {
+            DebuggingFlags = modes;
+        }
+
+        public DebuggingModes DebuggingFlags { get; }
+    }
     /// <summary>
     /// Exception thrown when the program executes an instruction that was thought to be unreachable.
     /// </summary>

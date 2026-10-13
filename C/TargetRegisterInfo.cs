@@ -24,6 +24,14 @@ internal static class TargetRegisterInfo
         => target.Architecture is TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64
             or TargetArchitectureKind.Arm32 or TargetArchitectureKind.Arm64;
 
+    // A target whose loops reload constants and addresses into registers every iteration gains from loading them once ahead
+    public static bool HoistsLoopValues(TargetInfo target)
+        => target.Architecture is TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64;
+
+    public static bool MaterializesConstant(TargetInfo target, LirInstructionKind kind, string? op, ImmutableArray<LirOperand> operands, int index)
+        => target.Architecture is TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64 &&
+           RiscVCodeGenerator.NeedsRegisterForConstant(target, kind, op, operands, index);
+
     private static bool IsSystemVX64(TargetInfo target)
         => target.Architecture == TargetArchitectureKind.X86_64 && !IsWindowsX64(target);
 

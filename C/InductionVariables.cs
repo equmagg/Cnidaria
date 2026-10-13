@@ -226,6 +226,19 @@ internal static class InductionVariables
                     shape.Loop.Blocks.Contains(block) && !shape.Loop.Blocks.Contains(use.Block))
                     return false;
             }
+            foreach (var block in _function.Blocks)
+            {
+                if (shape.Loop.Blocks.Contains(block.ControlFlowBlock))
+                    continue;
+                foreach (var phi in block.Phis)
+                {
+                    foreach (var operand in phi.Operands)
+                    {
+                        if (operand.Value.Definition?.Block is ControlFlowBlock definitionBlock && shape.Loop.Blocks.Contains(definitionBlock))
+                            return false;
+                    }
+                }
+            }
 
             var evolution = new ScalarEvolution(shape.Loop, shape.Preheader, shape.Latch, _target, _definitions, test, shape.ExitWhenTrue);
             var ivOnLeft = IsRecurrence(test.Lhs, evolution) && IsInvariantOperand(test.Rhs, evolution);
@@ -378,7 +391,7 @@ internal static class InductionVariables
             if (indexNode.Name is not { } indexName || evolution.Analyze(indexName) is not { Kind: ScevKind.AddRecurrence } recurrence)
                 return false;
             var indexBits = evolution.IntegerBits(indexName.Type);
-            if (indexBits > _pointerBits || Scev.Extend(recurrence, _pointerBits, GimpleTypes.IsSigned(indexName.Type)) is not { Kind: ScevKind.AddRecurrence } index)
+            if (indexBits > _pointerBits || Scev.Extend(recurrence, _pointerBits, GimpleTypes.IsSigned(indexName.Type, _target)) is not { Kind: ScevKind.AddRecurrence } index)
                 return false;
             if (index.Step.TryGetConstant(out var step) && step == 0)
                 return false;
@@ -558,11 +571,11 @@ internal static class InductionVariables
             if (evolution.IntegerBits(variable.Type) != 32 || evolution.IntegerBits(bound.Type) != 32 ||
                 evolution.Analyze(variable) is not { Kind: ScevKind.AddRecurrence } recurrence ||
                 !recurrence.Step.TryGetConstant(out var stride) ||
-                Scev.Extend(recurrence, 64, GimpleTypes.IsSigned(variable.Type)) is not { Kind: ScevKind.AddRecurrence } wide ||
+                Scev.Extend(recurrence, 64, GimpleTypes.IsSigned(variable.Type, _target)) is not { Kind: ScevKind.AddRecurrence } wide ||
                 !IsDeadAfterRewrite(variable, shape.ExitTest, rewritten, new HashSet<GimpleName>()))
                 return null;
 
-            var signed = GimpleTypes.IsSigned(variable.Type);
+            var signed = GimpleTypes.IsSigned(variable.Type, _target);
             var code = ivOnLeft ? test.Code : Swap(test.Code);
             var continueCode = shape.ExitWhenTrue ? ScalarEvolution.Invert(code) : code;
 
@@ -602,7 +615,7 @@ internal static class InductionVariables
             else
             {
                 var forward = continueCode == GimpleTreeCode.NeExpr ||
-                    stride == 1 && wide.Start.TryGetConstant(out first) && first <= 0 && !GimpleTypes.IsSigned(bound.Type) ||
+                    stride == 1 && wide.Start.TryGetConstant(out first) && first <= 0 && !GimpleTypes.IsSigned(bound.Type, _target) ||
                     IsKnownForward(shape, recurrence.Start, variable.Type, bound, stride);
                 var from = Materialize(wide.Start, shape.Preheader, preheader);
                 var to = Extend(bound, signed, shape.Preheader, preheader);
@@ -632,7 +645,7 @@ internal static class InductionVariables
             GimpleValue? first = start.Kind switch
             {
                 ScevKind.Invariant => start.Name,
-                ScevKind.Constant => new GimpleConstantValue(GimpleTypes.IsSigned(type) ? (object)(int)start.Value : (uint)start.Value, type),
+                ScevKind.Constant => new GimpleConstantValue(GimpleTypes.IsSigned(type, _target) ? (object)(int)start.Value : (uint)start.Value, type),
                 _ => null,
             };
             if (_assertions is null || first is null)
@@ -710,7 +723,7 @@ internal static class InductionVariables
                 case ScevKind.Extend:
                     {
                         var operand = Materialize(value.Left!, block, sink);
-                        if (GimpleTypes.IsSigned(operand.Type) != value.SignExtend)
+                        if (GimpleTypes.IsSigned(operand.Type, _target) != value.SignExtend)
                         {
                             var sameWidth = TypeCatalog.Instance.Builtin(value.SignExtend ? BuiltinTypeKind.Int : BuiltinTypeKind.UnsignedInt);
                             operand = Emit(block, sink, GimpleTreeCode.NopExpr, sameWidth, operand);

@@ -296,12 +296,22 @@ internal static class X86CodeEncoder
     private static void EncodeMov(X86Operand destination, X86Operand source, X86Target target, X86InstructionWriter writer, ulong nextIp, IReadOnlyDictionary<string, ulong>? symbols)
     {
         var size = CommonSize(destination, source, target);
-        if (destination.Kind == X86OperandKind.Register && (source.Kind == X86OperandKind.Immediate || source.Kind == X86OperandKind.Symbol))
+        // A 64-bit immediate inside 32 bits takes a short form: mov r32 zero-extends, mov r/m64 below sign-extends
+        var shortImmediate = size == 8 && source.Kind == X86OperandKind.Immediate && source.Immediate >= int.MinValue && source.Immediate <= uint.MaxValue;
+        if (destination.Kind == X86OperandKind.Register && (source.Kind == X86OperandKind.Immediate || source.Kind == X86OperandKind.Symbol) &&
+            !(shortImmediate && source.Immediate < 0))
         {
             if (!X86Registers.IsGeneral(destination.Register))
                 throw new NotSupportedException("mov immediate destination must be a general register");
-            EmitSizePrefix(writer, size);
             var reg = X86Registers.Index(destination.Register);
+            if (shortImmediate)
+            {
+                EmitRex(writer, target, w: false, b: reg >= 8, force: false);
+                writer.WriteByte((byte)(0xB8 + (reg & 7)));
+                WriteImmediate(writer, source.Immediate, 4);
+                return;
+            }
+            EmitSizePrefix(writer, size);
             var rexW = size == 8;
             EmitRex(writer, target, w: rexW, b: reg >= 8, force: RequiresByteRex(destination));
             writer.WriteByte((byte)((size == 1 ? 0xB0 : 0xB8) + (reg & 7)));
@@ -521,6 +531,12 @@ internal static class X86CodeEncoder
         var destination = instruction.Operand0;
         var source = instruction.Operand1;
         var immediate = instruction.Operand2;
+        if (source.Kind == X86OperandKind.None)
+        {
+            EncodeGroupUnary(destination, 5, target, writer, nextIp, symbols);
+            return;
+        }
+
         if (destination.Kind == X86OperandKind.Register && source.Kind != X86OperandKind.None && immediate.Kind == X86OperandKind.None)
         {
             var size = CommonSize(destination, source, target);

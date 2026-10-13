@@ -76,6 +76,7 @@ namespace Cnidaria.Cs
             private readonly Dictionary<int, string> _methodLabels = new Dictionary<int, string>();
             private readonly Dictionary<int, GenTreeMethod> _methodsById = new Dictionary<int, GenTreeMethod>();
             private readonly HashSet<string> _usedLabels = new HashSet<string>(StringComparer.Ordinal);
+            private readonly List<CodeRegionDraft> _regions = new List<CodeRegionDraft>();
             private readonly HashSet<string> _externalSymbols = new HashSet<string>(StringComparer.Ordinal);
             private readonly Dictionary<int, string> _typeDescriptorLabels = new Dictionary<int, string>();
             private readonly List<TypeDescriptorDraft> _typeDescriptors = new List<TypeDescriptorDraft>();
@@ -130,7 +131,7 @@ namespace Cnidaria.Cs
                 EmitTypeInitializationThunks();
                 EmitDelegateTargetThunks();
                 if (_options.EmbedRuntime)
-                    EmitEhTransferHelper();
+                    EmitExceptionHelpers();
 
                 PrepareVirtualDispatchMetadata();
                 EmitUnboxingStubs();
@@ -234,61 +235,81 @@ namespace Cnidaria.Cs
 
             private void PrepareEhMethod(GenTreeMethod method, string methodLabel)
             {
-                var regions = method.Cfg.ExceptionRegions;
-                var order = EhFuncletLayout.ComputeVmRegionOrder(method.Cfg);
-                var localIndexByRegion = new Dictionary<int, int>(order.Length);
-                for (int i = 0; i < order.Length; i++)
-                    localIndexByRegion[regions[order[i]].Index] = i;
-
-                var clauses = ImmutableArray.CreateBuilder<EhClauseDraft>(order.Length);
-                for (int i = 0; i < order.Length; i++)
+                FuncletPlan plan = FuncletPlan.Create(method) ??
+                    throw new InvalidOperationException($"Method M{method.RuntimeMethod.MethodId} has no exception regions.");
+                plan.PlanContinuationStubs();
+                var clauses = ImmutableArray.CreateBuilder<EhClauseDraft>(plan.Clauses.Length);
+                for (int i = 0; i < plan.Clauses.Length; i++)
                 {
-                    CfgExceptionRegion region = regions[order[i]];
+                    CfgExceptionRegion region = plan.Clauses[i];
                     string? catchTypeLabel = null;
-                    int kind;
-                    switch (region.Kind)
+                    if (plan.ClauseKinds[i] == RuntimeEhKind.Catch)
                     {
-                        case CfgExceptionRegionKind.Catch:
-                            if (region.CatchTypeToken == 0)
-                            {
-                                kind = 2;
-                            }
-                            else
-                            {
-                                kind = 1;
-                                if (_program.TypeSystem is null)
-                                    throw new InvalidOperationException("ARM code generation requires a runtime type system for exception metadata.");
-                                catchTypeLabel = GetTypeDescriptorLabel(_program.TypeSystem.ResolveTypeInMethodContext(
-                                    method.RuntimeMethod.BodyModule ?? method.Module,
-                                    region.CatchTypeToken,
-                                    method.RuntimeMethod));
-                            }
-                            break;
-                        case CfgExceptionRegionKind.Finally:
-                            kind = 3;
-                            break;
-                        case CfgExceptionRegionKind.Fault:
-                            kind = 4;
-                            break;
-                        default:
-                            throw new NotSupportedException(
-                                $"Exception region kind {region.Kind} is not supported in method M{method.RuntimeMethod.MethodId} '{method.RuntimeMethod.Name}'.");
+                        if (_program.TypeSystem is null)
+                            throw new InvalidOperationException("ARM code generation requires a runtime type system for exception metadata.");
+                        catchTypeLabel = GetTypeDescriptorLabel(_program.TypeSystem.ResolveTypeInMethodContext(
+                            method.RuntimeMethod.BodyModule ?? method.Module,
+                            region.CatchTypeToken,
+                            method.RuntimeMethod));
                     }
 
-                    int parentLocalIndex = -1;
-                    if (region.ParentIndex >= 0 && localIndexByRegion.TryGetValue(region.ParentIndex, out int mappedParent))
-                        parentLocalIndex = mappedParent;
-
-                    clauses.Add(new EhClauseDraft(region, kind, catchTypeLabel, parentLocalIndex));
+                    clauses.Add(new EhClauseDraft(region, plan.ClauseKinds[i], catchTypeLabel));
                 }
 
                 var draft = new EhMethodDraft(
-                    method,
+                    plan,
                     CreateLocalLabel(methodLabel + "_eh_info"),
                     CreateLocalLabel(methodLabel + "_eh_clauses"),
                     clauses.ToImmutable());
                 _ehMethodsByMethodId.Add(method.RuntimeMethod.MethodId, draft);
                 _ehMethods.Add(draft);
+            }
+
+            private void BeginRegion(CodeRegionDraft region, string startLabel)
+            {
+                region.StartLabel = startLabel;
+                _regions.Add(region);
+            }
+
+            private void EndRegion(CodeRegionDraft region)
+            {
+                string end = CreateLocalLabel(region.DescriptorLabel + "_end");
+                DefineLabel(end);
+                region.EndLabel = end;
+            }
+
+            private CodeRegionDraft BeginFrameRecordRegion(string startLabel, int frameSize, int framePointerOffset, int returnAddressOffset)
+            {
+                var region = new CodeRegionDraft(
+                    CreateLocalLabel(startLabel + "_region"),
+                    RuntimeRegionKind.Frame,
+                    frameSize,
+                    framePointerOffset,
+                    returnAddressOffset,
+                    linkOffset: 0,
+                    ImmutableArray<SavedRegisterDraft>.Empty,
+                    ehInfoLabel: null,
+                    clause: -1);
+                BeginRegion(region, startLabel);
+                return region;
+            }
+
+            public static int UnwindRegisterIndex(MachineRegister register)
+                => register switch
+                {
+                    >= MachineRegister.X19 and <= MachineRegister.X28 => register - MachineRegister.X19,
+                    >= MachineRegister.F8 and <= MachineRegister.F15 => 16 + (register - MachineRegister.F8),
+                    _ => throw new InvalidOperationException($"ARM64 register {register} is not preserved across calls."),
+                };
+
+            private static ImmutableArray<MachineRegister> UnwindRegisters()
+            {
+                var registers = ImmutableArray.CreateBuilder<MachineRegister>();
+                for (MachineRegister register = MachineRegister.X19; register <= MachineRegister.X28; register++)
+                    registers.Add(register);
+                for (MachineRegister register = MachineRegister.F8; register <= MachineRegister.F15; register++)
+                    registers.Add(register);
+                return registers.ToImmutable();
             }
 
             private GenTreeMethod SelectEntryMethod()
@@ -394,7 +415,12 @@ namespace Cnidaria.Cs
                     EmitLoadImmediate(ArmRegister.X4, metadata.TypeInfoCount, 8);
                     EmitMaterializeAddress(metadata.StaticRootTableLabel, ArmRegister.X5);
                     EmitLoadImmediate(ArmRegister.X6, metadata.StaticRootCount, 8);
+                    EmitMaterializeAddress(metadata.RegionTableLabel, ArmRegister.X7);
+                    EmitAdjustStack(-_target.CallFrameAlignment);
+                    EmitLoadImmediate(ArmRegister.X16, metadata.RegionCount, 8);
+                    EmitDelegateMemoryStore(MachineRegister.X16, ArmRegister.Sp, 0, _target.PointerSize);
                     EmitCall(ResolveExternalSymbol(ArmRuntime.InitializeSymbol));
+                    EmitAdjustStack(_target.CallFrameAlignment);
                     if (entryTypeInitializer is not null)
                         EmitCall(GetTypeInitializationThunkLabel(entryTypeInitializer.DeclaringType));
                 }
@@ -419,52 +445,111 @@ namespace Cnidaria.Cs
                 return label;
             }
 
-            // The runtime resumes a handler through this helper: it reloads the frame it unwound to
-            // and jumps, so it never returns
-            private void EmitEhTransferHelper()
+            private int UnwindContextRegisterOffset(int index)
+                => checked((3 + index) * _target.PointerSize);
+
+            private void EmitExceptionHelpers()
             {
-                string label = ArmRuntime.EhTransferSymbol;
-                if (!_usedLabels.Add(label))
-                    throw new InvalidOperationException($"Duplicate ARM EH transfer symbol: {label}.");
+                EmitThrowHelper(ArmRuntime.ThrowSymbol);
+                EmitThrowHelper(ArmRuntime.RethrowSymbol);
+                EmitCallFuncletHelper();
+                EmitResumeHelper();
+            }
 
-                int startOffset = _text.ByteLength;
-                _text.DefineLabel(label);
-                EmitMove(ArmRegister.X16, ArmRegister.X0, 8);
-                EmitMove(ArmRegister.X17, ArmRegister.X1, 8);
-
-                var generalRegisters = RegisterInfo.AllocatableGeneralRegisters(_target);
-                for (int i = 0; i < generalRegisters.Length; i++)
-                {
-                    ArmRegister register = ToArm(generalRegisters[i]);
-                    if (register == ArmRegister.X2)
-                        continue;
-                    Emit(ArmInstruction.Binary(
-                        ArmInstrKind.Ldr,
-                        Reg(register, 8),
-                        Mem(ArmRegister.X2, (byte)generalRegisters[i] * 8, 8)));
-                }
-
-                var floatRegisters = RegisterInfo.AllocatableFloatingRegisters(_target);
-                for (int i = 0; i < floatRegisters.Length; i++)
-                {
-                    int index = (byte)floatRegisters[i] - (byte)MachineRegister.F0;
-                    Emit(ArmInstruction.Binary(
-                        ArmInstrKind.Ldr,
-                        Reg(ToArm(floatRegisters[i]), 8),
-                        Mem(ArmRegister.X2, 256 + index * 8, 8)));
-                }
-
-                Emit(ArmInstruction.Binary(
-                    ArmInstrKind.Ldr,
-                    Reg(ArmRegister.X2, 8),
-                    Mem(ArmRegister.X2, (byte)MachineRegister.X2 * 8, 8)));
-                EmitMove(ArmRegister.Sp, ArmRegister.X16, 8);
-                EmitMove(ArmRegister.X29, ArmRegister.X16, 8);
-                Emit(ArmInstruction.Unary(ArmInstrKind.Br, Reg(ArmRegister.X17, 8)));
-
-                _symbols.Add(new ArmObjectSymbol(
+            private void AddHelperSymbol(string label, int startOffset)
+                => _symbols.Add(new ArmObjectSymbol(
                     label, TextSectionName, startOffset, _text.ByteLength - startOffset,
                     ArmObjectSymbolBinding.Global, ArmObjectSymbolKind.Function));
+
+            public string RuntimeHelperSymbol(string label)
+                => _options.EmbedRuntime ? label : ResolveExternalSymbol(label);
+
+            private void DefineHelperLabel(string label)
+            {
+                if (!_usedLabels.Add(label))
+                    throw new InvalidOperationException($"Duplicate ARM runtime helper symbol: {label}.");
+                _text.DefineLabel(label);
+            }
+
+            private void EmitThrowHelper(string label)
+            {
+                int pointerSize = _target.PointerSize;
+                int frameSize = AlignUp(UnwindContextRegisterOffset(64), _target.CallFrameAlignment);
+                int startOffset = _text.ByteLength;
+                DefineHelperLabel(label);
+                EmitAdjustStack(-frameSize);
+                EmitDelegateMemoryStore(MachineRegister.X30, ArmRegister.Sp, 0, pointerSize);
+                EmitAddImmediate(ArmRegister.X16, ArmRegister.Sp, frameSize, ArmRegister.X17);
+                EmitDelegateMemoryStore(MachineRegister.X16, ArmRegister.Sp, pointerSize, pointerSize);
+                EmitDelegateMemoryStore(MachineRegister.X29, ArmRegister.Sp, pointerSize * 2, pointerSize);
+                EmitUnwindRegisterTransfer(ArmRegister.Sp, store: true);
+                EmitMove(ArmRegister.X1, ArmRegister.Sp, 8);
+                EmitCall(ResolveExternalSymbol(ArmRuntime.DispatchExceptionSymbol));
+                Emit(ArmInstruction.Unary(ArmInstrKind.Brk, ArmOperand.ImmediateOperand(1)));
+                AddHelperSymbol(label, startOffset);
+            }
+
+            private void EmitUnwindRegisterTransfer(ArmRegister context, bool store)
+            {
+                foreach (MachineRegister register in UnwindRegisters())
+                {
+                    int offset = UnwindContextRegisterOffset(UnwindRegisterIndex(register));
+                    if (store)
+                        EmitDelegateMemoryStore(register, context, offset, 8);
+                    else
+                        EmitDelegateMemoryLoad(register, context, offset, 8, signed: false);
+                }
+            }
+
+            // The context pointer sits at the funclet's call frame address, where stack walkers look for it
+            private void EmitCallFuncletHelper()
+            {
+                int pointerSize = _target.PointerSize;
+                var saved = new List<(MachineRegister Register, int Offset)>
+                {
+                    (MachineRegister.X30, pointerSize),
+                    (MachineRegister.X29, pointerSize * 2),
+                };
+                int offset = pointerSize * 3;
+                foreach (MachineRegister register in UnwindRegisters())
+                {
+                    saved.Add((register, offset));
+                    offset += 8;
+                }
+                int frameSize = AlignUp(offset, _target.CallFrameAlignment);
+
+                int startOffset = _text.ByteLength;
+                DefineHelperLabel(ArmRuntime.CallFuncletSymbol);
+                EmitAdjustStack(-frameSize);
+                foreach (var slot in saved)
+                    EmitDelegateMemoryStore(slot.Register, ArmRegister.Sp, slot.Offset, 8);
+                EmitDelegateMemoryStore(MachineRegister.X1, ArmRegister.Sp, 0, pointerSize);
+                EmitMove(ArmRegister.X16, ArmRegister.X0, 8);
+                EmitMove(ArmRegister.X0, ArmRegister.X2, 8);
+                EmitDelegateMemoryLoad(MachineRegister.X29, ArmRegister.X1, pointerSize * 2, pointerSize, signed: false);
+                EmitUnwindRegisterTransfer(ArmRegister.X1, store: false);
+                Emit(ArmInstruction.Unary(ArmInstrKind.Blr, Reg(ArmRegister.X16, 8)));
+                int returnOffset = _text.ByteLength;
+                DefineHelperLabel(ArmRuntime.CallFuncletReturnSymbol);
+                foreach (var slot in saved)
+                    EmitDelegateMemoryLoad(slot.Register, ArmRegister.Sp, slot.Offset, 8, signed: false);
+                EmitAdjustStack(frameSize);
+                Emit(ArmInstruction.Unary(ArmInstrKind.Ret, Reg(ArmRegister.X30, 8)));
+                AddHelperSymbol(ArmRuntime.CallFuncletSymbol, startOffset);
+                AddHelperSymbol(ArmRuntime.CallFuncletReturnSymbol, returnOffset);
+            }
+
+            private void EmitResumeHelper()
+            {
+                int pointerSize = _target.PointerSize;
+                int startOffset = _text.ByteLength;
+                DefineHelperLabel(ArmRuntime.ResumeSymbol);
+                EmitUnwindRegisterTransfer(ArmRegister.X0, store: false);
+                EmitDelegateMemoryLoad(MachineRegister.X29, ArmRegister.X0, pointerSize * 2, pointerSize, signed: false);
+                EmitDelegateMemoryLoad(MachineRegister.X16, ArmRegister.X0, pointerSize, pointerSize, signed: false);
+                EmitMove(ArmRegister.Sp, ArmRegister.X16, 8);
+                Emit(ArmInstruction.Unary(ArmInstrKind.Br, Reg(ArmRegister.X1, 8)));
+                AddHelperSymbol(ArmRuntime.ResumeSymbol, startOffset);
             }
 
             public string ResolveMethodLabel(RuntimeMethod method)
@@ -761,6 +846,8 @@ namespace Cnidaria.Cs
                 public readonly int TypeInfoCount;
                 public readonly string StaticRootTableLabel;
                 public readonly int StaticRootCount;
+                public readonly string RegionTableLabel;
+                public readonly int RegionCount;
 
                 public RuntimeMetadataLabels(
                     string safePointTableLabel,
@@ -768,7 +855,9 @@ namespace Cnidaria.Cs
                     string typeInfoTableLabel,
                     int typeInfoCount,
                     string staticRootTableLabel,
-                    int staticRootCount)
+                    int staticRootCount,
+                    string regionTableLabel,
+                    int regionCount)
                 {
                     SafePointTableLabel = safePointTableLabel;
                     SafePointCount = safePointCount;
@@ -776,6 +865,8 @@ namespace Cnidaria.Cs
                     TypeInfoCount = typeInfoCount;
                     StaticRootTableLabel = staticRootTableLabel;
                     StaticRootCount = staticRootCount;
+                    RegionTableLabel = regionTableLabel;
+                    RegionCount = regionCount;
                 }
             }
 
@@ -1000,18 +1091,18 @@ namespace Cnidaria.Cs
 
             private sealed class EhMethodDraft
             {
-                public GenTreeMethod Method { get; }
+                public FuncletPlan Plan { get; }
                 public string InfoLabel { get; }
                 public string ClausesLabel { get; }
                 public ImmutableArray<EhClauseDraft> Clauses { get; }
 
                 public EhMethodDraft(
-                    GenTreeMethod method,
+                    FuncletPlan plan,
                     string infoLabel,
                     string clausesLabel,
                     ImmutableArray<EhClauseDraft> clauses)
                 {
-                    Method = method;
+                    Plan = plan;
                     InfoLabel = infoLabel;
                     ClausesLabel = clausesLabel;
                     Clauses = clauses;
@@ -1023,18 +1114,67 @@ namespace Cnidaria.Cs
                 public CfgExceptionRegion Region { get; }
                 public int Kind { get; }
                 public string? CatchTypeLabel { get; }
-                public int ParentLocalIndex { get; }
                 public string? TryStartLabel { get; set; }
                 public string? TryEndLabel { get; set; }
-                public string? HandlerStartLabel { get; set; }
-                public string? HandlerEndLabel { get; set; }
+                public string? HandlerLabel { get; set; }
 
-                public EhClauseDraft(CfgExceptionRegion region, int kind, string? catchTypeLabel, int parentLocalIndex)
+                public EhClauseDraft(CfgExceptionRegion region, int kind, string? catchTypeLabel)
                 {
                     Region = region;
                     Kind = kind;
                     CatchTypeLabel = catchTypeLabel;
-                    ParentLocalIndex = parentLocalIndex;
+                }
+            }
+
+            internal sealed class CodeRegionDraft
+            {
+                public string DescriptorLabel { get; }
+                public int Kind { get; }
+                public int FrameSize { get; }
+                public int FramePointerOffset { get; }
+                public int ReturnAddressOffset { get; }
+                public int LinkOffset { get; }
+                public ImmutableArray<SavedRegisterDraft> Saved { get; }
+                public string? EhInfoLabel { get; }
+                public int Clause { get; }
+                public string? StartLabel { get; set; }
+                public string? EndLabel { get; set; }
+                public string? SavedLabel { get; set; }
+
+                public CodeRegionDraft(
+                    string descriptorLabel,
+                    int kind,
+                    int frameSize,
+                    int framePointerOffset,
+                    int returnAddressOffset,
+                    int linkOffset,
+                    ImmutableArray<SavedRegisterDraft> saved,
+                    string? ehInfoLabel,
+                    int clause)
+                {
+                    DescriptorLabel = descriptorLabel;
+                    Kind = kind;
+                    FrameSize = frameSize;
+                    FramePointerOffset = framePointerOffset;
+                    ReturnAddressOffset = returnAddressOffset;
+                    LinkOffset = linkOffset;
+                    Saved = saved;
+                    EhInfoLabel = ehInfoLabel;
+                    Clause = clause;
+                }
+            }
+
+            internal readonly struct SavedRegisterDraft
+            {
+                public readonly int Index;
+                public readonly int Offset;
+                public readonly int Size;
+
+                public SavedRegisterDraft(int index, int offset, int size)
+                {
+                    Index = index;
+                    Offset = offset;
+                    Size = size;
                 }
             }
 
@@ -1095,22 +1235,19 @@ namespace Cnidaria.Cs
             {
                 public string DescriptorLabel { get; }
                 public string ReturnLabel { get; }
-                public int SavedFramePointerOffset { get; }
-                public int SavedReturnAddressOffset { get; }
+                public CodeRegionDraft Region { get; }
                 public ImmutableArray<SafePointRootDraft> Roots { get; }
                 public string? RootsLabel { get; set; }
 
                 public SafePointDraft(
                     string descriptorLabel,
                     string returnLabel,
-                    int savedFramePointerOffset,
-                    int savedReturnAddressOffset,
+                    CodeRegionDraft region,
                     ImmutableArray<SafePointRootDraft> roots)
                 {
                     DescriptorLabel = descriptorLabel;
                     ReturnLabel = returnLabel;
-                    SavedFramePointerOffset = savedFramePointerOffset;
-                    SavedReturnAddressOffset = savedReturnAddressOffset;
+                    Region = region;
                     Roots = roots;
                 }
             }
@@ -1118,15 +1255,13 @@ namespace Cnidaria.Cs
             public SafePointDraft AddSafePoint(
                 string methodLabel,
                 string returnLabel,
-                int savedFramePointerOffset,
-                int savedReturnAddressOffset,
+                CodeRegionDraft region,
                 ImmutableArray<SafePointRootDraft> roots)
             {
                 var draft = new SafePointDraft(
                     CreateLocalLabel(methodLabel + "_gc_safe_point"),
                     returnLabel,
-                    savedFramePointerOffset,
-                    savedReturnAddressOffset,
+                    region,
                     roots);
                 _safePoints.Add(draft);
                 return draft;
@@ -1617,6 +1752,7 @@ namespace Cnidaria.Cs
 
                 int startOffset = _text.ByteLength;
                 _text.DefineLabel(thunk.Label);
+                CodeRegionDraft region = BeginFrameRecordRegion(thunk.Label, frameSize, savedFramePointerOffset, savedReturnAddressOffset);
                 EmitAdjustStack(-frameSize);
                 EmitDelegateMemoryStore(MachineRegister.X29, ArmRegister.Sp, savedFramePointerOffset, _target.PointerSize);
                 EmitDelegateMemoryStore(MachineRegister.X30, ArmRegister.Sp, savedReturnAddressOffset, _target.PointerSize);
@@ -1643,8 +1779,7 @@ namespace Cnidaria.Cs
                 SafePointDraft safePoint = AddSafePoint(
                     thunk.Label,
                     CreateLocalLabel(thunk.Label + "_gc_return"),
-                    savedFramePointerOffset,
-                    savedReturnAddressOffset,
+                    region,
                     roots.ToImmutable());
                 EmitMaterializeAddress(ResolveExternalObjectSymbol(ArmRuntime.CurrentSafePointSymbol), ArmRegister.X16);
                 EmitMaterializeAddress(safePoint.DescriptorLabel, ArmRegister.X17);
@@ -1659,6 +1794,7 @@ namespace Cnidaria.Cs
                 EmitDelegateMemoryLoad(MachineRegister.X29, ArmRegister.Sp, savedFramePointerOffset, _target.PointerSize, signed: false);
                 EmitAdjustStack(frameSize);
                 Emit(ArmInstruction.Unary(ArmInstrKind.Ret, Reg(ArmRegister.X30, 8)));
+                EndRegion(region);
 
                 _symbols.Add(new ArmObjectSymbol(
                     thunk.Label, TextSectionName, startOffset, _text.ByteLength - startOffset,
@@ -2006,6 +2142,7 @@ namespace Cnidaria.Cs
                 int frameSize = AlignUp(checked(_target.PointerSize * 2), _target.CallFrameAlignment);
                 const int savedReturnAddressOffset = 0;
                 int savedFramePointerOffset = _target.PointerSize;
+                CodeRegionDraft region = BeginFrameRecordRegion(thunk.Label, frameSize, savedFramePointerOffset, savedReturnAddressOffset);
                 EmitAdjustStack(-frameSize);
                 Emit(ArmInstruction.Binary(
                     ArmInstrKind.Str, Reg(ArmRegister.X30, 8), Mem(ArmRegister.Sp, savedReturnAddressOffset, 8)));
@@ -2030,8 +2167,7 @@ namespace Cnidaria.Cs
                 AddSafePoint(
                     thunk.Label,
                     returnLabel,
-                    savedFramePointerOffset,
-                    savedReturnAddressOffset,
+                    region,
                     ImmutableArray<SafePointRootDraft>.Empty);
                 EmitCall(ResolveMethodLabel(thunk.Initializer));
                 DefineLabel(returnLabel);
@@ -2052,6 +2188,7 @@ namespace Cnidaria.Cs
                     ArmInstrKind.Ldr, Reg(ArmRegister.X29, 8), Mem(ArmRegister.Sp, savedFramePointerOffset, 8)));
                 EmitAdjustStack(frameSize);
                 Emit(ArmInstruction.Unary(ArmInstrKind.Ret, Reg(ArmRegister.X30, 8)));
+                EndRegion(region);
 
                 _symbols.Add(new ArmObjectSymbol(
                     thunk.Label, TextSectionName, startOffset, _text.ByteLength - startOffset,
@@ -2202,24 +2339,18 @@ namespace Cnidaria.Cs
                     AddDataSymbol(
                         method.ClausesLabel,
                         _rodata.Align(pointerSize),
-                        checked(method.Clauses.Length * pointerSize * 12));
+                        checked(method.Clauses.Length * pointerSize * 10));
                     for (int c = 0; c < method.Clauses.Length; c++)
                     {
                         EhClauseDraft clause = method.Clauses[c];
-                        if (clause.TryStartLabel is null || clause.TryEndLabel is null ||
-                            clause.HandlerStartLabel is null || clause.HandlerEndLabel is null)
-                        {
-                            throw new InvalidOperationException(
-                                $"ARM EH native ranges were not bound for method M{method.Method.RuntimeMethod.MethodId}.");
-                        }
+                        if (clause.TryStartLabel is null || clause.TryEndLabel is null || clause.HandlerLabel is null)
+                            throw new InvalidOperationException($"ARM EH native ranges were not bound for {method.InfoLabel}.");
 
                         EmitNative(clause.Kind);
                         EmitPointer(clause.TryStartLabel);
                         EmitPointer(clause.TryEndLabel);
-                        EmitPointer(clause.HandlerStartLabel);
-                        EmitPointer(clause.HandlerEndLabel);
+                        EmitPointer(clause.HandlerLabel);
                         EmitPointer(clause.CatchTypeLabel);
-                        EmitNative(clause.ParentLocalIndex);
                         EmitNative(clause.Region.TryStartPc);
                         EmitNative(clause.Region.TryEndPc);
                         EmitNative(clause.Region.HandlerStartPc);
@@ -2230,6 +2361,44 @@ namespace Cnidaria.Cs
                     AddDataSymbol(method.InfoLabel, _rodata.Align(pointerSize), pointerSize * 2);
                     EmitNative(method.Clauses.Length);
                     EmitPointer(method.ClausesLabel);
+                }
+
+                for (int i = 0; i < _regions.Count; i++)
+                {
+                    CodeRegionDraft region = _regions[i];
+                    if (region.Saved.Length == 0)
+                        continue;
+                    region.SavedLabel = CreateLocalLabel(region.DescriptorLabel + "_saved");
+                    AddDataSymbol(region.SavedLabel, _rodata.Align(pointerSize), checked(region.Saved.Length * pointerSize * 3));
+                    for (int r = 0; r < region.Saved.Length; r++)
+                    {
+                        EmitNative(region.Saved[r].Index);
+                        EmitNative(region.Saved[r].Offset);
+                        EmitNative(region.Saved[r].Size);
+                    }
+                }
+
+                string regionTableLabel = CreateLocalLabel("code_regions");
+                AddDataSymbol(regionTableLabel, _rodata.Align(pointerSize), Math.Max(pointerSize, checked(_regions.Count * pointerSize * 11)));
+                if (_regions.Count == 0)
+                    EmitNative(0);
+                for (int i = 0; i < _regions.Count; i++)
+                {
+                    CodeRegionDraft region = _regions[i];
+                    if (region.StartLabel is null || region.EndLabel is null)
+                        throw new InvalidOperationException($"ARM code region {region.DescriptorLabel} was not closed.");
+                    AddDataSymbol(region.DescriptorLabel, _rodata.ByteLength, pointerSize * 11);
+                    EmitPointer(region.StartLabel);
+                    EmitPointer(region.EndLabel);
+                    EmitNative(region.Kind);
+                    EmitNative(region.FrameSize);
+                    EmitNative(region.FramePointerOffset);
+                    EmitNative(region.ReturnAddressOffset);
+                    EmitNative(region.LinkOffset);
+                    EmitNative(region.Saved.Length);
+                    EmitPointer(region.SavedLabel);
+                    EmitPointer(region.EhInfoLabel);
+                    EmitNative(region.Clause);
                 }
 
                 for (int i = 0; i < _typeDescriptors.Count; i++)
@@ -2414,7 +2583,7 @@ namespace Cnidaria.Cs
                 AddDataSymbol(
                     safePointTableLabel,
                     _rodata.Align(pointerSize),
-                    _safePoints.Count == 0 ? pointerSize : checked(_safePoints.Count * pointerSize * 5));
+                    _safePoints.Count == 0 ? pointerSize : checked(_safePoints.Count * pointerSize * 4));
                 if (_safePoints.Count == 0)
                 {
                     EmitNative(0);
@@ -2424,10 +2593,9 @@ namespace Cnidaria.Cs
                     for (int i = 0; i < _safePoints.Count; i++)
                     {
                         SafePointDraft safePoint = _safePoints[i];
-                        AddDataSymbol(safePoint.DescriptorLabel, _rodata.ByteLength, pointerSize * 5);
+                        AddDataSymbol(safePoint.DescriptorLabel, _rodata.ByteLength, pointerSize * 4);
                         EmitPointer(safePoint.ReturnLabel);
-                        EmitNative(safePoint.SavedFramePointerOffset);
-                        EmitNative(safePoint.SavedReturnAddressOffset);
+                        EmitPointer(safePoint.Region.DescriptorLabel);
                         EmitNative(safePoint.Roots.Length);
                         EmitPointer(safePoint.RootsLabel);
                     }
@@ -2458,7 +2626,9 @@ namespace Cnidaria.Cs
                     typeInfoTableLabel,
                     _typeDescriptors.Count,
                     staticRootTableLabel,
-                    _staticRoots.Count);
+                    _staticRoots.Count,
+                    regionTableLabel,
+                    _regions.Count);
             }
 
             private static int GetRuntimeTypeInfoKind(RuntimeType type)
@@ -2606,9 +2776,10 @@ namespace Cnidaria.Cs
                 private readonly string[] _blockLabels;
                 private readonly string[] _blockEndLabels;
                 private readonly EhMethodDraft? _ehMethod;
-                private readonly string _returnThunkLabel;
-                private bool _ehFrameRegistered;
-                private bool _returnThunkNeeded;
+                private readonly FuncletPlan? _eh;
+                private readonly CodeRegionDraft?[] _regions;
+                private CodeRegionDraft? _openRegion;
+                private int _currentBlockId = -1;
                 private readonly Dictionary<int, int> _nodePositions;
                 private readonly List<GcPollStub> _gcPollStubs = new List<GcPollStub>();
                 private readonly Dictionary<(int Offset, int Length), string> _staticDataLabels =
@@ -2629,7 +2800,13 @@ namespace Cnidaria.Cs
                         _blockEndLabels[i] = owner.CreateLocalLabel($"{methodLabel}_B{i}_end");
                     }
                     owner._ehMethodsByMethodId.TryGetValue(method.RuntimeMethod.MethodId, out _ehMethod);
-                    _returnThunkLabel = owner.CreateLocalLabel(methodLabel + "_eh_return");
+                    _eh = _ehMethod?.Plan;
+                    _regions = new CodeRegionDraft?[(_eh?.FuncletCount ?? 0) + 1];
+                    if (_eh is not null)
+                    {
+                        foreach (CatchContinuation stub in _eh.ContinuationStubs)
+                            stub.Label = owner.CreateLocalLabel(methodLabel + "_catch_continuation");
+                    }
                 }
 
                 private const ArmRegister Scratch0 = ArmRegister.X16;
@@ -2654,10 +2831,23 @@ namespace Cnidaria.Cs
                 public void Emit()
                 {
                     var order = _method.LinearBlockOrder;
+                    int funclet = 0;
+                    BeginRegion(0, _methodLabel);
                     for (int i = 0; i < order.Length; i++)
                     {
                         int blockId = order[i];
+                        int blockFunclet = FuncletIndexForBlock(blockId);
+                        if (blockFunclet != funclet)
+                        {
+                            EndRegion(funclet);
+                            funclet = blockFunclet;
+                            string start = _owner.CreateLocalLabel(_methodLabel + "_funclet");
+                            _owner.DefineLabel(start);
+                            BeginRegion(funclet, start);
+                        }
+
                         _nextBlockId = i + 1 < order.Length ? order[i + 1] : -1;
+                        _currentBlockId = blockId;
                         var block = _method.Blocks[blockId];
                         int firstBodyNode = blockId == 0 ? GenTreeLirKinds.PrologPrefixLength(block.LinearNodes) : 0;
                         for (int n = 0; n < firstBodyNode; n++)
@@ -2669,12 +2859,167 @@ namespace Cnidaria.Cs
                         _owner.DefineLabel(_blockEndLabels[blockId]);
                     }
                     _nextBlockId = -1;
+                    _currentBlockId = -1;
+                    EndRegion(funclet);
                     EmitGcPollStubs();
                     BindEhNativeRanges();
-                    if (_returnThunkNeeded)
-                        EmitReturnThunk();
-                    if (_ehMethod is not null && !_ehFrameRegistered)
-                        throw Unsupported(_method.LinearNodes[0], "Method has EH metadata but no registered establisher frame");
+                }
+
+                // Every stretch of one funclet's code gets its own entry; safe points name the first one
+                private void BeginRegion(int funclet, string startLabel)
+                {
+                    StackFrameLayout frame = _method.StackFrame;
+                    string label = _owner.CreateLocalLabel(_methodLabel + "_region");
+                    CodeRegionDraft region;
+                    if (!frame.TryGetCalleeSavedSlot(RegisterInfo.ReturnAddress(Target), out StackFrameSlot savedReturnAddress))
+                    {
+                        if (funclet != 0)
+                            throw new InvalidOperationException($"Method M{_method.RuntimeMethod.MethodId} has funclets but no saved return-address slot.");
+                        return;
+                    }
+
+                    if (funclet != 0)
+                    {
+                        region = new CodeRegionDraft(
+                            label,
+                            RuntimeRegionKind.Funclet,
+                            FuncletFrameSize,
+                            framePointerOffset: 0,
+                            savedReturnAddress.Offset,
+                            frame.FuncletLinkSlotOffset(funclet, Target.PointerSize),
+                            SavedRegisters(),
+                            _ehMethod!.InfoLabel,
+                            _eh!.ClauseForFunclet(funclet));
+                    }
+                    else if (frame.UsesFramePointer)
+                    {
+                        if (!frame.TryGetCalleeSavedSlot(RegisterInfo.FramePointer(Target), out StackFrameSlot savedFramePointer))
+                            throw new InvalidOperationException($"Method M{_method.RuntimeMethod.MethodId} has no saved frame-pointer slot.");
+                        region = new CodeRegionDraft(
+                            label,
+                            RuntimeRegionKind.Frame,
+                            frame.FrameSize,
+                            savedFramePointer.Offset,
+                            savedReturnAddress.Offset,
+                            linkOffset: 0,
+                            SavedRegisters(),
+                            _ehMethod?.InfoLabel,
+                            clause: -1);
+                    }
+                    else
+                    {
+                        region = new CodeRegionDraft(
+                            label,
+                            RuntimeRegionKind.Frameless,
+                            frame.FrameSize,
+                            framePointerOffset: 0,
+                            savedReturnAddress.Offset,
+                            linkOffset: 0,
+                            SavedRegisters(),
+                            _ehMethod?.InfoLabel,
+                            clause: -1);
+                    }
+
+                    _regions[funclet] ??= region;
+                    _owner.BeginRegion(region, startLabel);
+                    _openRegion = region;
+                }
+
+                private void EndRegion(int funclet)
+                {
+                    EmitContinuationStubs(funclet);
+                    if (_openRegion is null)
+                        return;
+                    _owner.EndRegion(_openRegion);
+                    _openRegion = null;
+                }
+
+                private CodeRegionDraft RegionForFunclet(int funclet)
+                    => _regions[funclet] ?? throw new InvalidOperationException($"Funclet {funclet} of M{_method.RuntimeMethod.MethodId} has no code region.");
+
+                private ImmutableArray<SavedRegisterDraft> SavedRegisters()
+                {
+                    var saved = ImmutableArray.CreateBuilder<SavedRegisterDraft>();
+                    foreach (StackFrameSlot slot in FuncletSavedSlots())
+                    {
+                        if (slot.Kind == StackFrameSlotKind.ReturnAddress)
+                            continue;
+                        saved.Add(new SavedRegisterDraft(UnwindRegisterIndex(slot.SavedRegister), slot.Offset, slot.Size));
+                    }
+                    return saved.ToImmutable();
+                }
+
+                private IEnumerable<StackFrameSlot> FuncletSavedSlots()
+                {
+                    foreach (StackFrameSlot slot in _method.StackFrame.CalleeSavedSlots)
+                    {
+                        if (slot.SavedRegister != RegisterInfo.FramePointer(Target))
+                            yield return slot;
+                    }
+                }
+
+                // Funclets reuse the root frame's callee-save layout
+                private int FuncletFrameSize
+                    => AlignUp(
+                        checked(_method.StackFrame.CalleeSaveAreaOffset + _method.StackFrame.CalleeSaveAreaSize),
+                        Target.CallFrameAlignment);
+
+                // As a store source, register 31 is the zero register, not the stack pointer
+                private void EmitFuncletProlog(GenTree node)
+                {
+                    int funclet = FuncletOf(node);
+                    StackFrameLayout frame = _method.StackFrame;
+                    _owner.EmitAdjustStack(-FuncletFrameSize);
+                    foreach (StackFrameSlot slot in FuncletSavedSlots())
+                        EmitMemoryStore(ToArm(slot.SavedRegister), ArmRegister.Sp, slot.Offset, slot.Size);
+                    _owner.EmitMove(Scratch0, ArmRegister.Sp, 8);
+                    EmitMemoryStore(Scratch0, ArmRegister.X29, frame.FuncletLinkSlotOffset(funclet, Target.PointerSize), Target.PointerSize);
+                    if (_eh!.IsCatchFunclet(funclet))
+                        EmitMemoryStore(ArmRegister.X0, ArmRegister.X29, frame.FuncletExceptionSlotOffset(funclet, Target.PointerSize), Target.PointerSize);
+                }
+
+                private void EmitFuncletReturn()
+                {
+                    foreach (StackFrameSlot slot in FuncletSavedSlots())
+                        EmitMemoryLoad(ToArm(slot.SavedRegister), ArmRegister.Sp, slot.Offset, slot.Size, signed: false);
+                    _owner.EmitAdjustStack(FuncletFrameSize);
+                    _owner.Emit(ArmInstruction.Unary(ArmInstrKind.Ret, Reg(ArmRegister.X30, 8)));
+                }
+
+                private void EmitCallFinally(int position, int funclet, int clause)
+                {
+                    SafePointDraft safePoint = PrepareSafePointAt(position, funclet);
+                    _owner.EmitCall(_blockLabels[_eh!.Clauses[clause].HandlerStartBlockId]);
+                    _owner.DefineLabel(safePoint.ReturnLabel);
+                }
+
+                private void EmitContinuationStubs(int funclet)
+                {
+                    if (_eh is null)
+                        return;
+
+                    foreach (CatchContinuation stub in _eh.ContinuationStubs)
+                    {
+                        if (stub.Funclet != funclet)
+                            continue;
+                        _owner.DefineLabel(stub.Label!);
+                        int position = BlockEntryPosition(stub.TargetBlockId);
+                        foreach (int clause in stub.Finallys)
+                            EmitCallFinally(position, funclet, clause);
+                        _owner.EmitJump(_blockLabels[stub.TargetBlockId]);
+                    }
+                }
+
+                private int BlockEntryPosition(int blockId)
+                {
+                    ImmutableArray<int> order = _method.LinearBlockOrder;
+                    for (int i = order.IndexOf(blockId); i >= 0 && i < order.Length; i++)
+                    {
+                        ImmutableArray<GenTree> nodes = _method.Blocks[order[i]].LinearNodes;
+                        if (nodes.Length != 0 && _nodePositions.TryGetValue(nodes[0].LinearId, out int position))
+                            return position;
+                    }
+                    throw new InvalidOperationException($"Block B{blockId} of M{_method.RuntimeMethod.MethodId} has no positioned code.");
                 }
 
                 private static Dictionary<int, int> BuildNodePositions(GenTreeMethod method)
@@ -2866,6 +3211,9 @@ namespace Cnidaria.Cs
                         case GenTreeKind.NullCheck:
                             EmitNullCheck(node);
                             return;
+                        case GenTreeKind.BoundsCheck:
+                            EmitBoundsCheck(node);
+                            return;
                         case GenTreeKind.NewObject:
                             EmitNewObject(node);
                             return;
@@ -2925,8 +3273,6 @@ namespace Cnidaria.Cs
                             return;
                         case FrameOperation.EstablishFramePointer:
                             _owner.EmitMove(ArmRegister.X29, ArmRegister.Sp, 8);
-                            if (_ehMethod is not null && !_ehFrameRegistered)
-                                EmitEhFramePush(_blockLabels[node.BlockId]);
                             return;
                         case FrameOperation.RestoreStackPointerFromFramePointer:
                             _owner.EmitMove(ArmRegister.Sp, ArmRegister.X29, 8);
@@ -2941,6 +3287,8 @@ namespace Cnidaria.Cs
                             EmitStore(node.Results[0], node.Uses[0].Register, null, StackKindForRegister(node.Uses[0].Register));
                             return;
                         case FrameOperation.EnterFuncletFrame:
+                            EmitFuncletProlog(node);
+                            return;
                         case FrameOperation.LeaveFuncletFrame:
                             return;
                         case FrameOperation.RestoreReturnAddress:
@@ -3581,6 +3929,24 @@ namespace Cnidaria.Cs
                             _owner.Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(left, size), Reg(right, size)));
                             EmitConditionSet(destination, IntegerCondition(node.Operator, unsigned));
                             return;
+                        case GenTreeOperator.MulHi:
+                        case GenTreeOperator.MulHiUn:
+                            EmitMultiplyHigh(node, destination, left, right, size);
+                            return;
+                        case GenTreeOperator.Min:
+                        case GenTreeOperator.Max:
+                        case GenTreeOperator.MinUn:
+                        case GenTreeOperator.MaxUn:
+                            ArmCondition keepLeft = node.Operator switch
+                            {
+                                GenTreeOperator.Min => ArmCondition.Lt,
+                                GenTreeOperator.Max => ArmCondition.Gt,
+                                GenTreeOperator.MinUn => ArmCondition.Lo,
+                                _ => ArmCondition.Hi,
+                            };
+                            _owner.Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(left, size), Reg(right, size)));
+                            _owner.Emit(ArmInstruction.Ternary(ArmInstrKind.Csel, Reg(destination, size), Reg(left, size), Reg(right, size), keepLeft));
+                            return;
                         case GenTreeOperator.AddOvf:
                         case GenTreeOperator.AddOvfUn:
                         case GenTreeOperator.SubOvf:
@@ -3592,6 +3958,24 @@ namespace Cnidaria.Cs
                         default:
                             throw Unsupported(node, $"Unsupported integer binary opcode {node.Operator}");
                     }
+                }
+
+                // A word's high half is the high word of its exact 64-bit product
+                private void EmitMultiplyHigh(GenTree node, ArmRegister destination, ArmRegister left, ArmRegister right, int size)
+                {
+                    bool unsigned = node.Operator == GenTreeOperator.MulHiUn;
+                    if (size == 8)
+                    {
+                        _owner.Emit(ArmInstruction.Ternary(
+                            unsigned ? ArmInstrKind.Umulh : ArmInstrKind.Smulh, Reg(destination, 8), Reg(left, 8), Reg(right, 8)));
+                        return;
+                    }
+
+                    EmitBitfieldMove(!unsigned, Scratch0, left, 32);
+                    EmitBitfieldMove(!unsigned, Scratch1, right, 32);
+                    _owner.Emit(ArmInstruction.Ternary(ArmInstrKind.Mul, Reg(Scratch0, 8), Reg(Scratch0, 8), Reg(Scratch1, 8)));
+                    _owner.Emit(ArmInstruction.Ternary(
+                        unsigned ? ArmInstrKind.Lsr : ArmInstrKind.Asr, Reg(destination, 8), Reg(Scratch0, 8), ArmOperand.ImmediateOperand(32)));
                 }
 
                 // The flags an add or a subtract already sets are the overflow answer; a multiply has to
@@ -3786,7 +4170,6 @@ namespace Cnidaria.Cs
                                 EmitFloatRegisterMove(argument0, b, size);
                                 EmitFloatRegisterMove(argument1, ArmRegister.V31, size);
                             }
-                            MarkEhCallSite(node, "float_rem");
                             _owner.EmitCall(_owner.ResolveExternalSymbol(size == 4
                                 ? ArmRuntime.FloatingRemainderSingleSymbol
                                 : ArmRuntime.FloatingRemainderDoubleSymbol));
@@ -4072,14 +4455,9 @@ namespace Cnidaria.Cs
                         return;
                     }
 
-                    if (_ehMethod is not null &&
-                        (FuncletIndexForBlock(node.BlockId) != 0 || ReturnMustRunFinallyBeforeMethodExit(node.BlockId)))
-                    {
-                        EmitReturnThroughEh(node);
-                        return;
-                    }
+                    if (_eh is not null && (FuncletOf(node) != 0 || _eh.CrossedFinallys(_currentBlockId, -1).Length != 0))
+                        throw Unsupported(node, "Return from inside a protected region");
 
-                    EmitEhFramePop();
                     _owner.Emit(ArmInstruction.Unary(ArmInstrKind.Ret, Reg(ArmRegister.X30, 8)));
                 }
 
@@ -4105,69 +4483,14 @@ namespace Cnidaria.Cs
                     int size = StorageSize(returnType, MachineAbi.StackKindForType(returnType), node.Uses[0]);
                     _owner.EmitAddImmediate(Scratch0, FrameBase(node.Uses[0]), EffectiveFrameOffset(node.Uses[0]), Scratch0);
                     EmitBlockCopy(Scratch1, buffer, 0, Scratch0, 0, size);
-                    EmitEhFramePop();
                     _owner.Emit(ArmInstruction.Unary(ArmInstrKind.Ret, Reg(ArmRegister.X30, 8)));
                 }
 
                 private int FuncletIndexForBlock(int blockId)
-                {
-                    for (int i = 0; i < _method.Funclets.Length; i++)
-                    {
-                        RegisterFunclet funclet = _method.Funclets[i];
-                        for (int b = 0; b < funclet.BlockIds.Length; b++)
-                        {
-                            if (funclet.BlockIds[b] == blockId)
-                                return funclet.Index;
-                        }
-                    }
-                    return 0;
-                }
+                    => _eh?.FuncletForBlock(blockId) ?? 0;
 
-                private bool ReturnMustRunFinallyBeforeMethodExit(int blockId)
-                {
-                    var regions = _method.Cfg.ExceptionRegions;
-                    for (int i = 0; i < regions.Length; i++)
-                    {
-                        CfgExceptionRegion region = regions[i];
-                        if (region.Kind == CfgExceptionRegionKind.Finally &&
-                            blockId >= region.TryStartBlockId &&
-                            blockId < region.TryEndBlockIdExclusive)
-                        {
-                            return true;
-                        }
-                    }
-                    return false;
-                }
-
-                // A return that owes a finally leaves through the dispatcher, which comes back to a thunk
-                // that tears the frame down for real
-                private void EmitReturnThroughEh(GenTree node)
-                {
-                    _returnThunkNeeded = true;
-                    MarkEhCallSite(node, "return");
-                    _owner.EmitMaterializeAddress(_returnThunkLabel, ArmRegister.X0);
-                    _owner.EmitLoadImmediate(ArmRegister.X1, 2, 8);
-                    _owner.EmitCall(_owner.ResolveExternalSymbol(ArmRuntime.LeaveSymbol));
-                    EmitUnreachableTrap();
-                }
-
-                private void EmitReturnThunk()
-                {
-                    _owner.DefineLabel(_returnThunkLabel);
-                    EmitEhFramePop();
-                    if (_method.StackFrame.UsesFramePointer)
-                        _owner.EmitMove(ArmRegister.Sp, ArmRegister.X29, 8);
-
-                    for (int i = _method.StackFrame.CalleeSavedSlots.Length - 1; i >= 0; i--)
-                    {
-                        StackFrameSlot slot = _method.StackFrame.CalleeSavedSlots[i];
-                        EmitMemoryLoad(ToArm(slot.SavedRegister), ArmRegister.Sp, slot.Offset, slot.Size, signed: false);
-                    }
-
-                    if (_method.StackFrame.FrameSize > 0)
-                        _owner.EmitAdjustStack(_method.StackFrame.FrameSize);
-                    _owner.Emit(ArmInstruction.Unary(ArmInstrKind.Ret, Reg(ArmRegister.X30, 8)));
-                }
+                private int FuncletOf(GenTree node)
+                    => FuncletIndexForBlock(node.LinearBlockId);
 
                 private void BindEhNativeRanges()
                 {
@@ -4184,17 +4507,9 @@ namespace Cnidaria.Cs
                             "EH try",
                             out string tryStart,
                             out string tryEnd);
-                        BindEhNativeRange(
-                            EhFuncletLayout.BuildFuncletBlockIds(_method.Cfg, clause.Region),
-                            clause.Region.HandlerStartBlockId,
-                            clause.Region.HandlerEndBlockIdExclusive,
-                            "EH handler",
-                            out string handlerStart,
-                            out string handlerEnd);
                         clause.TryStartLabel = tryStart;
                         clause.TryEndLabel = tryEnd;
-                        clause.HandlerStartLabel = handlerStart;
-                        clause.HandlerEndLabel = handlerEnd;
+                        clause.HandlerLabel = BlockStartLabel(clause.Region.HandlerStartBlockId);
                     }
                 }
 
@@ -4266,161 +4581,91 @@ namespace Cnidaria.Cs
                     return _blockEndLabels[blockId];
                 }
 
-                // RhEhFrame is three pointers, and the dispatcher finds the active one by the frame count
-                private void EmitEhFrameAddress(ArmRegister countValue, ArmRegister destination)
-                {
-                    _owner.EmitLoadImmediate(Scratch0, checked(Target.PointerSize * 3), 8);
-                    _owner.Emit(ArmInstruction.Ternary(
-                        ArmInstrKind.Mul, Reg(Scratch0, 8), Reg(countValue, 8), Reg(Scratch0, 8)));
-                    _owner.EmitMaterializeAddress(
-                        _owner.ResolveExternalObjectSymbol(ArmRuntime.EhFramesSymbol), destination);
-                    _owner.Emit(ArmInstruction.Ternary(
-                        ArmInstrKind.Add, Reg(destination, 8), Reg(destination, 8), Reg(Scratch0, 8)));
-                }
-
-                private void EmitEhFramePush(string currentIpLabel)
-                {
-                    if (_ehMethod is null)
-                        return;
-
-                    string countSymbol = _owner.ResolveExternalObjectSymbol(ArmRuntime.EhFrameCountSymbol);
-                    string capacityAvailable = _owner.CreateLocalLabel(_methodLabel + "_eh_frame_capacity");
-
-                    _owner.EmitMaterializeAddress(countSymbol, Scratch0);
-                    EmitMemoryLoad(Scratch1, Scratch0, 0, Target.PointerSize, signed: false);
-                    _owner.EmitLoadImmediate(ArmRegister.X30, 4096, 8);
-                    _owner.Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(Scratch1, 8), Reg(ArmRegister.X30, 8)));
-                    _owner.EmitConditionalJump(ArmCondition.Lo, capacityAvailable);
-                    _owner.EmitLoadImmediate(ArmRegister.X0, 150, 8);
-                    _owner.EmitCall(_owner.ResolveExternalSymbol(ArmRuntime.FailFastSymbol));
-                    EmitUnreachableTrap();
-                    _owner.DefineLabel(capacityAvailable);
-
-                    EmitEhFrameAddress(Scratch1, ArmRegister.X30);
-                    _owner.EmitMaterializeAddress(_ehMethod.InfoLabel, Scratch0);
-                    EmitMemoryStore(Scratch0, ArmRegister.X30, 0, Target.PointerSize);
-                    EmitMemoryStore(ArmRegister.X29, ArmRegister.X30, Target.PointerSize, Target.PointerSize);
-                    _owner.EmitMaterializeAddress(currentIpLabel, Scratch0);
-                    EmitMemoryStore(Scratch0, ArmRegister.X30, checked(Target.PointerSize * 2), Target.PointerSize);
-                    _owner.EmitAddImmediate(Scratch1, Scratch1, 1, Scratch0);
-                    _owner.EmitMaterializeAddress(countSymbol, Scratch0);
-                    EmitMemoryStore(Scratch1, Scratch0, 0, Target.PointerSize);
-                    _ehFrameRegistered = true;
-                }
-
-                private void EmitEhSetCurrentIp(string currentIpLabel)
-                {
-                    if (_ehMethod is null)
-                        return;
-                    if (!_ehFrameRegistered)
-                        throw new InvalidOperationException(
-                            $"Method M{_method.RuntimeMethod.MethodId} updates EH state before establishing its frame.");
-
-                    _owner.EmitMaterializeAddress(
-                        _owner.ResolveExternalObjectSymbol(ArmRuntime.EhFrameCountSymbol), Scratch0);
-                    EmitMemoryLoad(Scratch1, Scratch0, 0, Target.PointerSize, signed: false);
-                    _owner.EmitAddImmediate(Scratch1, Scratch1, -1, Scratch0);
-                    EmitEhFrameAddress(Scratch1, ArmRegister.X30);
-                    _owner.EmitMaterializeAddress(currentIpLabel, Scratch0);
-                    EmitMemoryStore(Scratch0, ArmRegister.X30, checked(Target.PointerSize * 2), Target.PointerSize);
-                }
-
-                private void EmitEhFramePop()
-                {
-                    if (_ehMethod is null)
-                        return;
-
-                    _owner.EmitMaterializeAddress(
-                        _owner.ResolveExternalObjectSymbol(ArmRuntime.EhFrameCountSymbol), Scratch0);
-                    EmitMemoryLoad(Scratch1, Scratch0, 0, Target.PointerSize, signed: false);
-                    _owner.EmitAddImmediate(Scratch1, Scratch1, -1, Scratch1);
-                    EmitMemoryStore(Scratch1, Scratch0, 0, Target.PointerSize);
-                }
-
-                private void MarkEhCallSite(GenTree node, string suffix)
-                {
-                    if (_ehMethod is null)
-                        return;
-
-                    string label = _owner.CreateLocalLabel($"{_methodLabel}_eh_{suffix}_{node.LinearId}");
-                    _owner.DefineLabel(label);
-                    EmitEhSetCurrentIp(label);
-                    EmitEhSaveRegisterContext();
-                }
-
-                // The dispatcher resumes a handler with the registers the protected code was holding
-                private void EmitEhSaveRegisterContext()
-                {
-                    _owner.EmitMaterializeAddress(
-                        _owner.ResolveExternalObjectSymbol(ArmRuntime.EhFrameCountSymbol), Scratch0);
-                    EmitMemoryLoad(Scratch1, Scratch0, 0, Target.PointerSize, signed: false);
-                    _owner.EmitAddImmediate(Scratch1, Scratch1, -1, Scratch0);
-                    _owner.Emit(ArmInstruction.Ternary(
-                        ArmInstrKind.Lsl, Reg(Scratch1, 8), Reg(Scratch1, 8), ArmOperand.ImmediateOperand(9)));
-                    _owner.EmitMaterializeAddress(
-                        _owner.ResolveExternalObjectSymbol(ArmRuntime.EhRegisterContextsSymbol), Scratch0);
-                    _owner.Emit(ArmInstruction.Ternary(
-                        ArmInstrKind.Add, Reg(Scratch1, 8), Reg(Scratch1, 8), Reg(Scratch0, 8)));
-
-                    var generalRegisters = RegisterInfo.AllocatableGeneralRegisters(Target);
-                    for (int i = 0; i < generalRegisters.Length; i++)
-                    {
-                        EmitMemoryStore(
-                            ToArm(generalRegisters[i]), Scratch1, (byte)generalRegisters[i] * 8, Target.GeneralRegisterSize);
-                    }
-
-                    var floatRegisters = RegisterInfo.AllocatableFloatingRegisters(Target);
-                    for (int i = 0; i < floatRegisters.Length; i++)
-                    {
-                        int index = (byte)floatRegisters[i] - (byte)MachineRegister.F0;
-                        EmitMemoryStore(ToArm(floatRegisters[i]), Scratch1, 256 + index * 8, 8);
-                    }
-                }
-
                 private void EmitExceptionObject(GenTree node)
                 {
-                    _owner.EmitMaterializeAddress(
-                        _owner.ResolveExternalObjectSymbol(ArmRuntime.CurrentExceptionSymbol), Scratch0);
+                    int funclet = FuncletOf(node);
+                    if (_eh is null || !_eh.IsCatchFunclet(funclet))
+                        throw Unsupported(node, "Exception object outside a catch handler");
                     EmitMemoryLoad(
-                        GeneralRegister(RequireResultRegister(node)), Scratch0, 0, Target.PointerSize, signed: false);
+                        GeneralRegister(RequireResultRegister(node)),
+                        ArmRegister.X29,
+                        _method.StackFrame.FuncletExceptionSlotOffset(funclet, Target.PointerSize),
+                        Target.PointerSize,
+                        signed: false);
                 }
 
                 private void EmitThrow(GenTree node)
                 {
                     ArmRegister exception = GeneralRegister(RequireUseRegisterForOperand(node, 0, "exception object"));
-                    MarkEhCallSite(node, "throw");
                     _owner.EmitMove(ArmRegister.X0, exception, 8);
                     string nonNull = _owner.CreateLocalLabel($"{_methodLabel}_throw_non_null_{node.LinearId}");
                     EmitCompareBranch(ArmInstrKind.Cbnz, ArmRegister.X0, 8, nonNull);
                     _owner.EmitMaterializeAddress(
                         _owner.GetStaticExceptionObjectLabel("System", "NullReferenceException"), ArmRegister.X0);
                     _owner.DefineLabel(nonNull);
-                    _owner.EmitCall(_owner.ResolveExternalSymbol(ArmRuntime.ThrowSymbol));
-                    EmitUnreachableTrap();
+                    EmitThrowCall(node, ArmRuntime.ThrowSymbol);
                 }
 
                 private void EmitRethrow(GenTree node)
                 {
-                    MarkEhCallSite(node, "rethrow");
-                    _owner.EmitCall(_owner.ResolveExternalSymbol(ArmRuntime.RethrowSymbol));
+                    int funclet = FuncletOf(node);
+                    if (_eh is null || !_eh.IsCatchFunclet(funclet))
+                        throw Unsupported(node, "Rethrow outside a catch handler");
+                    EmitMemoryLoad(
+                        ArmRegister.X0,
+                        ArmRegister.X29,
+                        _method.StackFrame.FuncletExceptionSlotOffset(funclet, Target.PointerSize),
+                        Target.PointerSize,
+                        signed: false);
+                    EmitThrowCall(node, ArmRuntime.RethrowSymbol);
+                }
+
+                // Throw sites are safe points: dispatch walks the frame from there while its finallys run
+                private void EmitThrowCall(GenTree node, string symbol)
+                {
+                    string target = _owner.RuntimeHelperSymbol(symbol);
+                    if (_eh is null)
+                    {
+                        _owner.EmitCall(target);
+                    }
+                    else
+                    {
+                        SafePointDraft safePoint = PrepareSafePoint(node);
+                        _owner.EmitCall(target);
+                        _owner.DefineLabel(safePoint.ReturnLabel);
+                    }
                     EmitUnreachableTrap();
                 }
 
                 private void EmitLeave(GenTree node)
                 {
-                    MarkEhCallSite(node, "leave");
-                    _owner.EmitMaterializeAddress(LabelForTarget(node), ArmRegister.X0);
-                    _owner.EmitLoadImmediate(ArmRegister.X1, 1, 8);
-                    _owner.EmitCall(_owner.ResolveExternalSymbol(ArmRuntime.LeaveSymbol));
-                    EmitUnreachableTrap();
+                    int target = node.TargetBlockId;
+                    if ((uint)target >= (uint)_blockLabels.Length)
+                        throw Unsupported(node, $"Invalid branch target block {target}");
+                    FuncletLeave plan = _eh!.PlanLeave(_currentBlockId, target);
+                    if (!plan.ReturnsFromFunclet)
+                    {
+                        if (plan.Finallys.Length != 0)
+                        {
+                            if (!_nodePositions.TryGetValue(node.LinearId, out int position))
+                                throw Unsupported(node, "Leave has no final LIR position");
+                            foreach (int clause in plan.Finallys)
+                                EmitCallFinally(position, FuncletOf(node), clause);
+                        }
+                        if (target != _nextBlockId)
+                            _owner.EmitJump(_blockLabels[target]);
+                        return;
+                    }
+
+                    string continuation = plan.Finallys.Length == 0
+                        ? _blockLabels[target]
+                        : _eh.GetContinuationStub(plan.TargetFunclet, target, plan.Finallys).Label!;
+                    _owner.EmitMaterializeAddress(continuation, ArmRegister.X0);
+                    EmitFuncletReturn();
                 }
 
                 private void EmitEndFinally(GenTree node)
-                {
-                    MarkEhCallSite(node, "endfinally");
-                    _owner.EmitCall(_owner.ResolveExternalSymbol(ArmRuntime.EndFinallySymbol));
-                    EmitUnreachableTrap();
-                }
+                    => EmitFuncletReturn();
 
                 private void EmitUnreachableTrap()
                     => _owner.Emit(ArmInstruction.Unary(ArmInstrKind.Brk, ArmOperand.ImmediateOperand(1)));
@@ -4559,7 +4804,6 @@ namespace Cnidaria.Cs
                         }
                     }
 
-                    MarkEhCallSite(node, "call");
                     _owner.EmitCall(_owner.ResolveMethodLabel(method));
                 }
 
@@ -4585,7 +4829,6 @@ namespace Cnidaria.Cs
                     }
 
                     SafePointDraft safePoint = PrepareSafePoint(node);
-                    MarkEhCallSite(node, "virtual_call");
                     if (method.DeclaringType.Kind == RuntimeTypeKind.Interface)
                     {
                         EmitInterfaceVirtualCall(node, method, receiver, safePoint);
@@ -4684,7 +4927,6 @@ namespace Cnidaria.Cs
                     SafePointDraft safePoint = PrepareSafePoint(node);
                     PublishGcTransition(safePoint);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(delegateType), ArmRegister.X0);
-                    MarkEhCallSite(node, "new_delegate");
                     _owner.EmitCall(_owner.ResolveExternalSymbol(ArmRuntime.NewFastSymbol));
                     _owner.DefineLabel(safePoint.ReturnLabel);
 
@@ -4757,7 +4999,6 @@ namespace Cnidaria.Cs
 
                     RestoreDelegateInvokeAbi(abi, saveOffset);
                     SafePointDraft singleSafePoint = PrepareSafePoint(node);
-                    MarkEhCallSite(node, "delegate_single");
                     EmitMemoryLoad(Scratch0, ArmRegister.Sp, receiverSaveOffset, Target.PointerSize, signed: false);
                     EmitMemoryLoad(Scratch0, Scratch0, methodPtrOffset, Target.PointerSize, signed: false);
                     _owner.Emit(ArmInstruction.Unary(ArmInstrKind.Blr, Reg(Scratch0, 8)));
@@ -4798,7 +5039,6 @@ namespace Cnidaria.Cs
                     EmitMemoryLoad(Scratch0, ArmRegister.Sp, listOffset, Target.PointerSize, signed: false);
                     SafePointDraft multicastSafePoint = PrepareSafePoint(
                         node, RegisterOperand.ForRegister(MachineRegisterOf(Scratch0)));
-                    MarkEhCallSite(node, "delegate_multicast");
                     EmitMemoryLoad(Scratch0, ArmRegister.Sp, receiverSaveOffset, Target.PointerSize, signed: false);
                     EmitMemoryLoad(Scratch0, Scratch0, methodPtrOffset, Target.PointerSize, signed: false);
                     _owner.Emit(ArmInstruction.Unary(ArmInstrKind.Blr, Reg(Scratch0, 8)));
@@ -4928,7 +5168,6 @@ namespace Cnidaria.Cs
                     EmitMemoryStore(Scratch0, ArmRegister.Sp, checked(Target.PointerSize * 2), Target.PointerSize);
                     SafePointDraft safePoint = PrepareSafePoint(node);
                     PublishGcTransition(safePoint);
-                    MarkEhCallSite(node, remove ? "delegate_remove" : "delegate_combine");
                     EmitMemoryLoad(ArmRegister.X0, ArmRegister.Sp, 0, Target.PointerSize, signed: false);
                     EmitMemoryLoad(ArmRegister.X1, ArmRegister.Sp, Target.PointerSize, Target.PointerSize, signed: false);
                     EmitMemoryLoad(ArmRegister.X2, ArmRegister.Sp, checked(Target.PointerSize * 2), Target.PointerSize, signed: false);
@@ -4958,7 +5197,6 @@ namespace Cnidaria.Cs
                         throw Unsupported(node, "Indirect call target is not in a register");
 
                     ArmRegister target = GeneralRegister(node.Uses[^1].Register);
-                    MarkEhCallSite(node, "indirect_call");
                     _owner.Emit(ArmInstruction.Unary(ArmInstrKind.Blr, Reg(target, 8)));
                 }
 
@@ -4976,6 +5214,21 @@ namespace Cnidaria.Cs
                     AddRelocation(offset, ok, ArmObjectRelocationKind.AArch64CompareBranch19);
                     EmitTrap();
                     _owner.DefineLabel(ok);
+                }
+
+                private void EmitBoundsCheck(GenTree node)
+                {
+                    if (node.Uses.Length != 2 || node.Results.Length != 0 || !node.Uses[0].IsRegister || !node.Uses[1].IsRegister)
+                        throw Unsupported(node, "Bounds check requires index and length registers and no result");
+
+                    string inRange = _owner.CreateLocalLabel($"{_methodLabel}_index_in_range");
+                    _owner.Emit(ArmInstruction.Binary(
+                        ArmInstrKind.Cmp,
+                        Reg(GeneralRegister(node.Uses[0].Register), 4),
+                        Reg(GeneralRegister(node.Uses[1].Register), 4)));
+                    _owner.EmitConditionalJump(ArmCondition.Lo, inRange);
+                    EmitManagedExceptionThrow(node, "IndexOutOfRangeException");
+                    _owner.DefineLabel(inRange);
                 }
 
                 private void EmitGcPoll(GenTree node)
@@ -5015,7 +5268,6 @@ namespace Cnidaria.Cs
 
                         SafePointDraft safePoint = PrepareSafePoint(stub.Node);
                         PublishGcTransition(safePoint);
-                        MarkEhGcPollCallSite(stub.Node);
                         _owner.EmitCall(_owner.ResolveExternalSymbol(ArmRuntime.GcPollSymbol));
                         _owner.DefineLabel(safePoint.ReturnLabel);
 
@@ -5027,15 +5279,6 @@ namespace Cnidaria.Cs
                         _owner.EmitJump(stub.ContinuationLabel);
                     }
                     _owner.DefineLabel(endLabel);
-                }
-
-                private void MarkEhGcPollCallSite(GenTree node)
-                {
-                    if (_ehMethod is null)
-                        return;
-                    if ((uint)node.LinearBlockId >= (uint)_blockLabels.Length)
-                        throw Unsupported(node, "GC poll has no containing block for EH state publication");
-                    EmitEhSetCurrentIp(_blockLabels[node.LinearBlockId]);
                 }
 
                 private List<(MachineRegister Register, int Offset, int Size)> BuildGcPollSaveLocations(
@@ -5065,6 +5308,7 @@ namespace Cnidaria.Cs
 
                 private void ReloadGcRegisterRoots(GenTree node)
                 {
+                    int funclet = FuncletOf(node);
                     var liveRoots = CollectLiveGcRoots(node);
                     for (int i = 0; i < liveRoots.Count; i++)
                     {
@@ -5076,7 +5320,7 @@ namespace Cnidaria.Cs
                         EmitMemoryLoad(
                             GeneralRegister(root.Location.Register),
                             ArmRegister.X29,
-                            checked(_method.StackFrame.GcSpillAreaOffset + i * Target.PointerSize),
+                            _method.StackFrame.GcRootSpillSlotOffset(funclet, i, Target.PointerSize),
                             Target.PointerSize,
                             signed: false);
                     }
@@ -5086,12 +5330,16 @@ namespace Cnidaria.Cs
                 {
                     if (!_nodePositions.TryGetValue(node.LinearId, out int position))
                         throw Unsupported(node, "GC safe point has no final LIR position");
+                    return CollectLiveRoots(position);
+                }
 
+                private List<RegisterGcLiveRoot> CollectLiveRoots(int position)
+                {
                     var liveRoots = new List<RegisterGcLiveRoot>();
                     for (int i = 0; i < _method.GcLiveRanges.Length; i++)
                     {
                         RegisterGcLiveRange range = _method.GcLiveRanges[i];
-                        if (range.FuncletIndex != 0 || range.StartPosition > position || position >= range.EndPosition)
+                        if (range.StartPosition > position || position >= range.EndPosition)
                             continue;
                         if (!ContainsRootCell(liveRoots, range.Root))
                             liveRoots.Add(range.Root);
@@ -5115,63 +5363,71 @@ namespace Cnidaria.Cs
 
                 private SafePointDraft PrepareSafePoint(GenTree node, RegisterOperand additionalRoot = default)
                 {
-                    if (!_method.StackFrame.UsesFramePointer)
-                        throw Unsupported(node, "GC safe point requires a frame pointer");
-                    if (!_method.StackFrame.TryGetCalleeSavedSlot(RegisterInfo.FramePointer(Target), out StackFrameSlot savedFramePointer) ||
-                        !_method.StackFrame.TryGetCalleeSavedSlot(RegisterInfo.ReturnAddress(Target), out StackFrameSlot savedReturnAddress))
-                    {
-                        throw Unsupported(node, "GC safe point requires saved frame-pointer and return-address slots");
-                    }
+                    if (!_nodePositions.TryGetValue(node.LinearId, out int position))
+                        throw Unsupported(node, "GC safe point has no final LIR position");
+                    return PrepareSafePointAt(position, FuncletOf(node), additionalRoot);
+                }
 
-                    var liveRoots = CollectLiveGcRoots(node);
+                private SafePointDraft PrepareSafePointAt(int position, int funclet, RegisterOperand additionalRoot = default)
+                {
+                    StackFrameLayout frame = _method.StackFrame;
+                    if (!frame.UsesFramePointer)
+                        throw new InvalidOperationException($"GC safe point in M{_method.RuntimeMethod.MethodId} requires a frame pointer.");
+
+                    var liveRoots = CollectLiveRoots(position);
                     int rootCount = checked(liveRoots.Count + (additionalRoot.IsNone ? 0 : 1));
-                    if (rootCount > _method.StackFrame.GcRootSpillSlotCount)
+                    if (rootCount > frame.GcRootSpillSlotCount)
                     {
-                        throw Unsupported(
-                            node,
-                            $"GC spill area has {_method.StackFrame.GcRootSpillSlotCount} slots but {rootCount} roots are live");
+                        throw new InvalidOperationException(
+                            $"GC spill area of M{_method.RuntimeMethod.MethodId} has {frame.GcRootSpillSlotCount} slots but {rootCount} roots are live.");
                     }
 
-                    var roots = ImmutableArray.CreateBuilder<SafePointRootDraft>(rootCount);
+                    var roots = ImmutableArray.CreateBuilder<SafePointRootDraft>(rootCount + 1);
                     for (int i = 0; i < liveRoots.Count; i++)
                     {
-                        SpillGcRoot(node, liveRoots[i], i);
+                        SpillGcRoot(liveRoots[i], funclet, i);
                         roots.Add(new SafePointRootDraft(
-                            checked(_method.StackFrame.GcSpillAreaOffset + i * Target.PointerSize),
+                            frame.GcRootSpillSlotOffset(funclet, i, Target.PointerSize),
                             liveRoots[i].RootKind));
                     }
 
                     if (!additionalRoot.IsNone)
                     {
-                        SpillGcRootLocation(node, additionalRoot, RegisterGcRootKind.ObjectReference, 0, liveRoots.Count);
+                        SpillGcRootLocation(additionalRoot, RegisterGcRootKind.ObjectReference, 0, funclet, liveRoots.Count);
                         roots.Add(new SafePointRootDraft(
-                            checked(_method.StackFrame.GcSpillAreaOffset + liveRoots.Count * Target.PointerSize),
+                            frame.GcRootSpillSlotOffset(funclet, liveRoots.Count, Target.PointerSize),
+                            RegisterGcRootKind.ObjectReference));
+                    }
+
+                    if (_eh is not null && _eh.IsCatchFunclet(funclet))
+                    {
+                        roots.Add(new SafePointRootDraft(
+                            frame.FuncletExceptionSlotOffset(funclet, Target.PointerSize),
                             RegisterGcRootKind.ObjectReference));
                     }
 
                     return _owner.AddSafePoint(
                         _methodLabel,
                         _owner.CreateLocalLabel(_methodLabel + "_gc_return"),
-                        savedFramePointer.Offset,
-                        savedReturnAddress.Offset,
+                        RegionForFunclet(funclet),
                         roots.ToImmutable());
                 }
 
-                private void SpillGcRoot(GenTree node, RegisterGcLiveRoot root, int rootIndex)
-                    => SpillGcRootLocation(node, root.Location, root.RootKind, root.Offset, rootIndex);
+                private void SpillGcRoot(RegisterGcLiveRoot root, int funclet, int rootIndex)
+                    => SpillGcRootLocation(root.Location, root.RootKind, root.Offset, funclet, rootIndex);
 
                 private void SpillGcRootLocation(
-                    GenTree node,
                     RegisterOperand location,
                     RegisterGcRootKind rootKind,
                     int cellOffset,
+                    int funclet,
                     int rootIndex)
                 {
                     ArmRegister source;
                     if (location.IsRegister)
                     {
                         if (cellOffset != 0 || location.RegisterClass != RegisterClass.General)
-                            throw Unsupported(node, "Register GC root has an unsupported shape");
+                            throw new InvalidOperationException("A register GC root has an unsupported shape.");
                         source = GeneralRegister(location.Register);
                     }
                     else if (location.IsFrameSlot)
@@ -5186,13 +5442,13 @@ namespace Cnidaria.Cs
                     }
                     else
                     {
-                        throw Unsupported(node, "GC root location is not final");
+                        throw new InvalidOperationException("GC root location is not final: " + location);
                     }
 
                     EmitMemoryStore(
                         source,
                         ArmRegister.X29,
-                        checked(_method.StackFrame.GcSpillAreaOffset + rootIndex * Target.PointerSize),
+                        _method.StackFrame.GcRootSpillSlotOffset(funclet, rootIndex, Target.PointerSize),
                         Target.PointerSize);
                 }
 
@@ -5211,12 +5467,10 @@ namespace Cnidaria.Cs
 
                 private void EmitManagedExceptionThrow(GenTree node, string exceptionTypeName)
                 {
-                    MarkEhCallSite(node, "implicit_throw");
                     _owner.EmitMaterializeAddress(
                         _owner.GetStaticExceptionObjectLabel("System", exceptionTypeName),
                         ArmRegister.X0);
-                    _owner.EmitCall(_owner.ResolveExternalSymbol(ArmRuntime.ThrowSymbol));
-                    EmitTrap();
+                    EmitThrowCall(node, ArmRuntime.ThrowSymbol);
                 }
 
                 private int NewObjectArgumentSaveOffset
@@ -5271,7 +5525,6 @@ namespace Cnidaria.Cs
                     PublishGcTransition(safePoint);
                     _owner.EmitMove(ArmRegister.X1, ArmRegister.X0, 8);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(arrayType), ArmRegister.X0);
-                    MarkEhCallSite(node, "allocate_uninitialized_array");
                     _owner.EmitCall(_owner.ResolveExternalSymbol(ArmRuntime.NewUninitializedArraySymbol));
                     _owner.DefineLabel(safePoint.ReturnLabel);
                 }
@@ -5282,7 +5535,6 @@ namespace Cnidaria.Cs
                     PublishGcTransition(safePoint);
                     _owner.EmitMove(ArmRegister.X1, ArmRegister.X0, 8);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(method.DeclaringType), ArmRegister.X0);
-                    MarkEhCallSite(node, "string_alloc");
                     _owner.EmitCall(_owner.ResolveExternalSymbol(ArmRuntime.NewArraySymbol));
                     _owner.DefineLabel(safePoint.ReturnLabel);
                 }
@@ -5311,7 +5563,6 @@ namespace Cnidaria.Cs
                     EmitNewObjectArgumentSpills(save: true);
                     PublishGcTransition(allocationSafePoint);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(objectType), ArmRegister.X0);
-                    MarkEhCallSite(node, "new_object_alloc");
                     _owner.EmitCall(_owner.ResolveExternalSymbol(ArmRuntime.NewFastSymbol));
                     _owner.DefineLabel(allocationSafePoint.ReturnLabel);
                     EmitStore(objectHome, RegisterInfo.GetIntegerReturnRegister(Target, 0), objectType, GenStackKind.Ref);
@@ -5319,7 +5570,6 @@ namespace Cnidaria.Cs
                     EmitNewObjectArgumentSpills(save: false);
                     EmitLoad(RegisterInfo.GetIntegerArgumentRegister(Target, 0), objectHome, objectType, GenStackKind.Ref);
                     SafePointDraft constructorSafePoint = PrepareSafePoint(node, objectHome);
-                    MarkEhCallSite(node, "new_object_ctor");
                     _owner.EmitCall(_owner.ResolveMethodLabel(constructor));
                     _owner.DefineLabel(constructorSafePoint.ReturnLabel);
                 }
@@ -5367,7 +5617,6 @@ namespace Cnidaria.Cs
                         throw Unsupported(node, "Unsupported System.String constructor shape");
                     }
 
-                    MarkEhCallSite(node, "new_string");
                     _owner.EmitCall(_owner.ResolveExternalSymbol(runtimeSymbol));
                     _owner.DefineLabel(safePoint.ReturnLabel);
                     EmitStore(
@@ -5425,7 +5674,6 @@ namespace Cnidaria.Cs
 
                     _owner.EmitMove(ArmRegister.X1, length, 4);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(arrayType), ArmRegister.X0);
-                    MarkEhCallSite(node, "new_array");
                     _owner.EmitCall(_owner.ResolveExternalSymbol(ArmRuntime.NewArraySymbol));
                     _owner.DefineLabel(safePoint.ReturnLabel);
                     _owner.EmitMove(GeneralRegister(result), ArmRegister.X0, 8);
@@ -6067,7 +6315,6 @@ namespace Cnidaria.Cs
                     EmitMemoryLoad(Scratch1, Scratch0, 0, 4, signed: false);
                     EmitCompareBranch(ArmInstrKind.Cbz, Scratch1, 4, initialized);
                     SafePointDraft safePoint = PrepareSafePoint(node);
-                    MarkEhCallSite(node, "class_init");
                     _owner.EmitCall(_owner.GetTypeInitializationThunkLabel(type));
                     _owner.DefineLabel(safePoint.ReturnLabel);
                     _owner.DefineLabel(initialized);
@@ -6158,7 +6405,6 @@ namespace Cnidaria.Cs
                     SafePointDraft safePoint = PrepareSafePoint(node);
                     PublishGcTransition(safePoint);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(allocationType), ArmRegister.X0);
-                    MarkEhCallSite(node, "box");
                     _owner.EmitCall(_owner.ResolveExternalSymbol(ArmRuntime.NewFastSymbol));
                     _owner.DefineLabel(safePoint.ReturnLabel);
 
@@ -6340,10 +6586,7 @@ namespace Cnidaria.Cs
                 }
 
                 private int TypeOperationScratchOffset
-                    => AlignUp(
-                        checked(_method.StackFrame.GcSpillAreaOffset +
-                                _method.StackFrame.GcRootSpillSlotCount * Target.PointerSize),
-                        TypeOperationScratchAlignment);
+                    => AlignUp(_method.StackFrame.GcRootSpillAreaEnd(Target.PointerSize), TypeOperationScratchAlignment);
 
                 private int TypeOperationScratchSize
                 {

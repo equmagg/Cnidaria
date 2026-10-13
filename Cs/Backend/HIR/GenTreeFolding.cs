@@ -274,6 +274,18 @@ namespace Cnidaria.Cs
                     case GenTreeOperator.CgtUn:
                         result = GenTreeConstantValue.ForI4(leftUnsigned > rightUnsigned ? 1 : 0);
                         return true;
+                    case GenTreeOperator.Min:
+                        result = SignedResult(bits, Math.Min(leftSigned, rightSigned));
+                        return true;
+                    case GenTreeOperator.Max:
+                        result = SignedResult(bits, Math.Max(leftSigned, rightSigned));
+                        return true;
+                    case GenTreeOperator.MinUn:
+                        result = UnsignedResult(bits, Math.Min(leftUnsigned, rightUnsigned));
+                        return true;
+                    case GenTreeOperator.MaxUn:
+                        result = UnsignedResult(bits, Math.Max(leftUnsigned, rightUnsigned));
+                        return true;
                     default:
                         return false;
                 }
@@ -534,6 +546,11 @@ namespace Cnidaria.Cs
                     if (GenTreeArithmeticSemantics.IsIntegralArithmeticType(left.Type, left.StackKind))
                         return CreateConstant(tree, GenTreeConstantValue.ForI4(0));
                     break;
+                case GenTreeOperator.Min:
+                case GenTreeOperator.Max:
+                case GenTreeOperator.MinUn:
+                case GenTreeOperator.MaxUn:
+                    return left;
             }
 
             return tree;
@@ -642,7 +659,8 @@ namespace Cnidaria.Cs
         private static bool IsCommutative(GenTreeOperator op)
             => op is GenTreeOperator.Add or GenTreeOperator.AddOvf or GenTreeOperator.AddOvfUn or
                 GenTreeOperator.Mul or GenTreeOperator.MulOvf or GenTreeOperator.MulOvfUn or
-                GenTreeOperator.And or GenTreeOperator.Or or GenTreeOperator.Xor or GenTreeOperator.Ceq;
+                GenTreeOperator.And or GenTreeOperator.Or or GenTreeOperator.Xor or GenTreeOperator.Ceq or
+                GenTreeOperator.Min or GenTreeOperator.Max or GenTreeOperator.MinUn or GenTreeOperator.MaxUn;
 
         private static bool CanDiscard(GenTree tree, GenTreeFlags effects)
             => (tree.Flags & effects) == 0;

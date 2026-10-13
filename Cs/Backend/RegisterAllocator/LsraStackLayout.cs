@@ -530,6 +530,8 @@ namespace Cnidaria.Cs
                 int gcSpillSize = 0;
                 bool supportsGcTransitionArea = Target.IsRiscV || Target.IsX86 || Target.IsArm;
                 bool hasGcSafePoint = supportsGcTransitionArea && MethodHasGcSafePoint();
+                int funcletCount = supportsGcTransitionArea ? Math.Max(0, _method.Funclets.Length - 1) : 0;
+                int gcRootSpillAreaCount = 1 + funcletCount;
                 int typeOperationScratchSize = supportsGcTransitionArea ? ComputeTypeOperationScratchSize() : 0;
                 if (supportsGcTransitionArea && (hasGcSafePoint || typeOperationScratchSize != 0))
                 {
@@ -537,7 +539,7 @@ namespace Cnidaria.Cs
                     cursor = AlignUp(cursor, transitionAlignment);
                     gcSpillOffset = cursor;
                     gcRootSpillSlotCount = hasGcSafePoint ? ComputeGcRootSpillSlotCount() : 0;
-                    int gcRootSpillSize = checked(gcRootSpillSlotCount * Target.PointerSize);
+                    int gcRootSpillSize = checked(gcRootSpillSlotCount * Target.PointerSize * gcRootSpillAreaCount);
                     int gcSpillCursor = gcRootSpillSize;
                     if (typeOperationScratchSize != 0)
                     {
@@ -556,6 +558,10 @@ namespace Cnidaria.Cs
                     gcSpillSize = gcSpillCursor;
                     cursor = checked(cursor + gcSpillSize);
                 }
+
+                cursor = AlignUp(cursor, Target.PointerSize);
+                int funcletSlotAreaOffset = cursor;
+                cursor = checked(cursor + funcletCount * 2 * Target.PointerSize);
 
                 int frameSize = AlignFrameSize(cursor, frameAlignment);
 
@@ -584,7 +590,10 @@ namespace Cnidaria.Cs
                     SelectFrameModel(usesFramePointer, frameSize),
                     gcSpillOffset,
                     gcSpillSize,
-                    gcRootSpillSlotCount);
+                    gcRootSpillSlotCount,
+                    gcRootSpillAreaCount,
+                    funcletSlotAreaOffset,
+                    funcletCount);
             }
 
 
@@ -599,6 +608,8 @@ namespace Cnidaria.Cs
 
             private bool MethodHasGcSafePoint()
             {
+                if (_method.GenTreeMethod.Cfg.ExceptionRegions.Length != 0)
+                    return true;
                 for (int i = 0; i < _method.LinearNodes.Length; i++)
                 {
                     GenTree node = _method.LinearNodes[i];
@@ -766,8 +777,9 @@ namespace Cnidaria.Cs
                         if (!_method.GenTreeMethod.ValueInfoByNode.TryGetValue(allocation.ValueKey, out var info))
                             continue;
 
+                        // A call's frame-backed result is already reported while the call itself runs
                         int cells = GcCellCount(info.Type, info.StackKind);
-                        if (cells == 0 || !AllocationIsLiveAt(allocation, position))
+                        if (cells == 0 || !AllocationIsLiveAt(allocation, position) && !AllocationIsLiveAt(allocation, position + 1))
                             continue;
                         count = checked(count + cells);
                     }
@@ -892,6 +904,8 @@ namespace Cnidaria.Cs
 
             private bool MethodMayCall()
             {
+                if (_method.GenTreeMethod.Cfg.ExceptionRegions.Length != 0)
+                    return true;
                 for (int i = 0; i < _method.LinearNodes.Length; i++)
                 {
                     var node = _method.LinearNodes[i];

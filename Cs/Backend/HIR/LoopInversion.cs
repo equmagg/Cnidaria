@@ -705,7 +705,7 @@ namespace Cnidaria.Cs
 
         private static bool ContainsBoundsCheck(GenTree node)
         {
-            if ((node.Kind is GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or GenTreeKind.StoreArrayElement) &&
+            if ((node.Kind is GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or GenTreeKind.StoreArrayElement or GenTreeKind.BoundsCheck) &&
                 (node.Flags & GenTreeFlags.BoundsCheckEliminated) == 0)
             {
                 return true;

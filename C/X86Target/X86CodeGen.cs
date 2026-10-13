@@ -881,8 +881,11 @@ public sealed class X86CodeGenerator
         var blockLabels = new Dictionary<LirBlock, string>();
         foreach (var block in function.Blocks)
             blockLabels.Add(block, CreateLocalLabel($"{label}_{block.Name}"));
+        var jumpOnlyBlocks = allocation.FindJumpOnlyBlocks();
+        foreach (var pair in jumpOnlyBlocks)
+            blockLabels[pair.Key] = blockLabels[pair.Value];
 
-        var context = new FunctionEmissionContext(this, function, allocation, label, blockLabels);
+        var context = new FunctionEmissionContext(this, function, allocation, label, blockLabels, jumpOnlyBlocks);
         var startOffset = _text.ByteLength;
         DefineLabel(label);
         context.EmitPrologue();
@@ -1033,18 +1036,6 @@ public sealed class X86CodeGenerator
         };
     }
 
-    private static bool IsSignedIntegerType(QualifiedType type)
-    {
-        if (type.Type is EnumType)
-            return true;
-        return type.Type is BuiltinType builtin && builtin.BuiltinKind is BuiltinTypeKind.SignedChar or BuiltinTypeKind.Short or BuiltinTypeKind.Int
-            or BuiltinTypeKind.Long or BuiltinTypeKind.LongLong;
-    }
-
-    private static bool IsUnsignedIntegerType(QualifiedType type)
-        => type.Type is BuiltinType builtin && builtin.BuiltinKind is BuiltinTypeKind.Bool or BuiltinTypeKind.Char or BuiltinTypeKind.UnsignedChar
-        or BuiltinTypeKind.UnsignedShort or BuiltinTypeKind.UnsignedInt or BuiltinTypeKind.UnsignedLong or BuiltinTypeKind.UnsignedLongLong;
-
     private static bool IsIntegerLike(QualifiedType type)
         => (type.Type.Kind is TypeKind.Builtin or TypeKind.Enum) && !IsFloatType(type) && !IsVoid(type);
 
@@ -1076,6 +1067,7 @@ public sealed class X86CodeGenerator
         private readonly AllocationResult _allocation;
         private readonly string _functionLabel;
         private readonly IReadOnlyDictionary<LirBlock, string> _blockLabels;
+        private readonly IReadOnlyDictionary<LirBlock, LirBlock> _jumpOnlyBlocks;
         private readonly string _epilogueLabel;
         private readonly List<MachineRegister> _savedGeneralRegisters;
         private readonly List<MachineRegister> _savedVectorRegisters;
@@ -1100,13 +1092,15 @@ public sealed class X86CodeGenerator
             LirFunction function,
             AllocationResult allocation,
             string functionLabel,
-            IReadOnlyDictionary<LirBlock, string> blockLabels)
+            IReadOnlyDictionary<LirBlock, string> blockLabels,
+            IReadOnlyDictionary<LirBlock, LirBlock> jumpOnlyBlocks)
         {
             _owner = owner;
             _function = function;
             _allocation = allocation;
             _functionLabel = functionLabel;
             _blockLabels = blockLabels;
+            _jumpOnlyBlocks = jumpOnlyBlocks;
             _epilogueLabel = owner.CreateLocalLabel(functionLabel + "_epilogue");
             var savedRegisters = allocation.UsedPhysicalRegisters
                 .Where(r => TargetRegisterInfo.IsCalleeSaved(owner._target, r) && ToX86Register(r, owner._machineTarget) != X86Register.Rbp)
@@ -1160,9 +1154,13 @@ public sealed class X86CodeGenerator
             for (var blockIndex = 0; blockIndex < _function.Blocks.Length; blockIndex++)
             {
                 var block = _function.Blocks[blockIndex];
-                _fallthroughBlock = blockIndex + 1 < _function.Blocks.Length
-                    ? _function.Blocks[blockIndex + 1]
-                    : null;
+                if (_jumpOnlyBlocks.ContainsKey(block))
+                {
+                    _currentInstructionPosition += block.Instructions.Length * 2;
+                    continue;
+                }
+
+                _fallthroughBlock = NextEmittedBlock(blockIndex);
                 _currentBlock = block;
                 _currentBlockIndex = blockIndex;
                 DefineBlockLabel(block);
@@ -1272,17 +1270,32 @@ public sealed class X86CodeGenerator
         // The folded arms emit nothing, so the join is still reached by falling off the end of this block
         private bool FallsThroughToJoin(LirBlock join)
         {
+            join = JumpTarget(join);
             for (var index = _currentBlockIndex + 1; index < _function.Blocks.Length; index++)
             {
                 var block = _function.Blocks[index];
                 if (ReferenceEquals(block, join))
                     return true;
-                if (!_foldedSelectArms.Contains(block))
+                if (!_foldedSelectArms.Contains(block) && !_jumpOnlyBlocks.ContainsKey(block))
                     return false;
             }
 
             return false;
         }
+
+        private LirBlock? NextEmittedBlock(int blockIndex)
+        {
+            for (var index = blockIndex + 1; index < _function.Blocks.Length; index++)
+            {
+                if (!_jumpOnlyBlocks.ContainsKey(_function.Blocks[index]))
+                    return _function.Blocks[index];
+            }
+
+            return null;
+        }
+
+        private LirBlock JumpTarget(LirBlock block)
+            => _jumpOnlyBlocks.TryGetValue(block, out var target) ? target : block;
 
         // Leaves the flags the conditional move reads and reports the condition that selects the true value
         private X86Condition EmitSelectCondition(LirInstruction branch)
@@ -4624,7 +4637,7 @@ public sealed class X86CodeGenerator
                     destination = RegMem(MaterializeAddress(instruction.Address, Scratch0, instruction), scalarSize);
 
                 var source = LoadOperandForRead(value, Scratch1, instruction, scalarSize);
-                if (source.Kind == X86OperandKind.Memory || (scalarSize == 8 && (source.Kind == X86OperandKind.Immediate || source.Kind == X86OperandKind.Symbol)))
+                if (source.Kind == X86OperandKind.Memory || scalarSize == 8 && !CanStoreQwordDirectly(source))
                 {
                     Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(Scratch1, scalarSize), source));
                     source = Reg(Scratch1, scalarSize);
@@ -5664,7 +5677,12 @@ public sealed class X86CodeGenerator
         {
             if (instruction.Operands.Length != 0)
                 StoreReturnValue(instruction.Operands[0], instruction);
-            if (_fallthroughBlock is not null)
+            if (_fallthroughBlock is null)
+                return;
+            // An epilogue that is nothing but ret costs less in place than the jump to it
+            if (!_allocation.Frame.HasDynamicStack && _frameSize == 0 && _savedGeneralRegisters.Count == 0 && _savedVectorRegisters.Count == 0)
+                Emit(X86Instruction.Ret());
+            else
                 Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(_epilogueLabel, 4, X86ObjectRelocationKind.Relative32)));
         }
 
@@ -5767,7 +5785,7 @@ public sealed class X86CodeGenerator
         }
 
         private bool IsFallthroughTarget(LirBlock? target)
-            => target is not null && ReferenceEquals(target, _fallthroughBlock);
+            => target is not null && ReferenceEquals(JumpTarget(target), _fallthroughBlock);
 
         private void EmitValueCopy(LirVirtualRegister destination, LirOperand source, LirInstruction instruction)
         {
@@ -5869,7 +5887,7 @@ public sealed class X86CodeGenerator
 
             var storeSize = Math.Min(RegisterSize(source.Type), size);
             var integerValue = LoadOperandForRead(source, Scratch1, instruction, storeSize);
-            if (integerValue.Kind == X86OperandKind.Memory || (storeSize == 8 && (integerValue.Kind == X86OperandKind.Immediate || integerValue.Kind == X86OperandKind.Symbol)))
+            if (integerValue.Kind == X86OperandKind.Memory || storeSize == 8 && !CanStoreQwordDirectly(integerValue))
             {
                 Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(Scratch1, storeSize), integerValue));
                 integerValue = Reg(Scratch1, storeSize);
@@ -6371,6 +6389,12 @@ public sealed class X86CodeGenerator
             return false;
         }
 
+        private bool IsSignedIntegerType(QualifiedType type)
+            => GimpleTypes.IsIntegerLike(type) && GimpleTypes.IsSigned(type, _owner._target);
+
+        private bool IsUnsignedIntegerType(QualifiedType type)
+            => GimpleTypes.IsIntegerLike(type) && !GimpleTypes.IsSigned(type, _owner._target);
+
         private X86Register GetWritableRegister(LirVirtualRegister register, X86Register fallback)
         {
             var allocation = _allocation[register];
@@ -6766,6 +6790,11 @@ public sealed class X86CodeGenerator
 
         private static bool FitsSignedInt32(long value)
             => value >= int.MinValue && value <= int.MaxValue;
+
+        // An 8-byte store takes a register or an immediate sign-extended from 32 bits
+        private static bool CanStoreQwordDirectly(X86Operand operand)
+            => operand.Kind is not (X86OperandKind.Immediate or X86OperandKind.Symbol) ||
+               operand.Kind == X86OperandKind.Immediate && FitsSignedInt32(operand.Immediate);
 
         private NotSupportedException Unsupported(LirInstruction instruction, string message)
             => new NotSupportedException($"{message} Function '{_function.Symbol?.Name ?? _functionLabel}', LIR instruction #{instruction.Ordinal}.");

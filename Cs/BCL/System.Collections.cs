@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace System.Collections
 {
     public interface IEnumerable
@@ -313,24 +315,34 @@ namespace System.Collections.Generic
         void RemoveAt(int index);
     }
 
-    public class List<T> : IEnumerable<T>, IEnumerable, IReadOnlyList<T>
+    public class List<T> : IList<T>, IList, IEnumerable<T>, IEnumerable, IReadOnlyList<T>
     {
         private const int DefaultCapacity = 4;
 
-        internal T[] _items; // Do not rename
-        internal int _size; // Do not rename
-        internal int _version; // Do not rename
+        internal T[] _items; // Do not rename (binary serialization)
+        internal int _size; // Do not rename (binary serialization)
+        internal int _version; // Do not rename (binary serialization)
 
+        // avoid the extra generic instantiation for Array.Empty<T>()
         private static readonly T[] s_emptyArray = new T[0];
 
+        // Constructs a List. The list is initially empty and has a capacity
+        // of zero. Upon adding the first element to the list the capacity is
+        // increased to DefaultCapacity, and then increased in multiples of two
+        // as required.
         public List()
         {
             _items = s_emptyArray;
         }
+
+        // Constructs a List with a given initial capacity. The list is
+        // initially empty, but will have room for the given number of elements
+        // before any reallocations are required.
+        //
         public List(int capacity)
         {
             if (capacity < 0)
-                throw new ArgumentOutOfRangeException();
+                ThrowHelper.ThrowArgumentOutOfRangeException(ExceptionArgument.capacity, ExceptionResource.ArgumentOutOfRange_NeedNonNegNum);
 
             if (capacity == 0)
                 _items = s_emptyArray;
@@ -338,6 +350,46 @@ namespace System.Collections.Generic
                 _items = new T[capacity];
         }
 
+        // Constructs a List, copying the contents of the given collection. The
+        // size and capacity of the new list will both be equal to the size of the
+        // given collection.
+        //
+        public List(IEnumerable<T> collection)
+        {
+            if (collection == null)
+                ThrowHelper.ThrowArgumentNullException(ExceptionArgument.collection);
+
+            if (collection is ICollection<T> c)
+            {
+                int count = c.Count;
+                if (count == 0)
+                {
+                    _items = s_emptyArray;
+                }
+                else
+                {
+                    _items = new T[count];
+                    c.CopyTo(_items, 0);
+                    _size = count;
+                }
+            }
+            else
+            {
+                _items = s_emptyArray;
+                using (IEnumerator<T> en = collection!.GetEnumerator())
+                {
+                    while (en.MoveNext())
+                    {
+                        Add(en.Current);
+                    }
+                }
+            }
+        }
+
+        // Gets and sets the capacity of this list.  The capacity is the size of
+        // the internal array used to hold items.  When set, the internal
+        // array of the list is reallocated to the given capacity.
+        //
         public int Capacity
         {
             get => _items.Length;
@@ -345,7 +397,7 @@ namespace System.Collections.Generic
             {
                 if (value < _size)
                 {
-                    throw new ArgumentOutOfRangeException();
+                    ThrowHelper.ThrowArgumentOutOfRangeException(ExceptionArgument.value, ExceptionResource.ArgumentOutOfRange_SmallCapacity);
                 }
 
                 if (value != _items.Length)
@@ -366,15 +418,32 @@ namespace System.Collections.Generic
                 }
             }
         }
+        
+        // Read-only property describing how many elements are in the List.
         public int Count => _size;
 
+        bool IList.IsFixedSize => false;
+
+        // Is this List read-only?
+        bool ICollection<T>.IsReadOnly => false;
+
+        bool IList.IsReadOnly => false;
+
+        // Is this List synchronized (thread-safe)?
+        bool ICollection.IsSynchronized => false;
+
+        // Synchronization root for this object.
+        object ICollection.SyncRoot => this;
+
+        // Sets or Gets the element at the given index.
         public T this[int index]
         {
             get
             {
+                // Following trick can reduce the range check by one
                 if ((uint)index >= (uint)_size)
                 {
-                    throw new ArgumentOutOfRangeException();
+                    ThrowHelper.ThrowArgumentOutOfRange_IndexMustBeLessException();
                 }
                 return _items[index];
             }
@@ -383,11 +452,83 @@ namespace System.Collections.Generic
             {
                 if ((uint)index >= (uint)_size)
                 {
-                    throw new ArgumentOutOfRangeException();
+                    ThrowHelper.ThrowArgumentOutOfRange_IndexMustBeLessException();
                 }
                 _items[index] = value;
                 _version++;
             }
+        }
+
+        private static bool IsCompatibleObject(object? value)
+        {
+            // Non-null values are fine.  Only accept nulls if T is a class or Nullable<U>.
+            // Note that default(T) is not equal to null for value types except when T is Nullable<U>.
+            return (value is T) || (value == null && default(T) == null);
+        }
+
+        object? IList.this[int index]
+        {
+            get => this[index];
+            set
+            {
+                ThrowHelper.IfNullAndNullsAreIllegalThenThrow<T>(value, ExceptionArgument.value);
+
+                try
+                {
+                    this[index] = (T)value!;
+                }
+                catch (InvalidCastException)
+                {
+                    ThrowHelper.ThrowWrongValueTypeArgumentException(value, typeof(T));
+                }
+            }
+        }
+
+        // Adds the given object to the end of this list. The size of the list is
+        // increased by one. If required, the capacity of the list is doubled
+        // before adding the new element.
+        //
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Add(T item)
+        {
+            _version++;
+            T[] array = _items;
+            int size = _size;
+            if ((uint)size < (uint)array.Length)
+            {
+                _size = size + 1;
+                array[size] = item;
+            }
+            else
+            {
+                AddWithResize(item);
+            }
+        }
+
+        // Non-inline from List.Add to improve its code quality as uncommon path
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void AddWithResize(T item)
+        {
+            int size = _size;
+            Grow(size + 1);
+            _size = size + 1;
+            _items[size] = item;
+        }
+
+        int IList.Add(object? item)
+        {
+            ThrowHelper.IfNullAndNullsAreIllegalThenThrow<T>(item, ExceptionArgument.item);
+
+            try
+            {
+                Add((T)item!);
+            }
+            catch (InvalidCastException)
+            {
+                ThrowHelper.ThrowWrongValueTypeArgumentException(item, typeof(T));
+            }
+
+            return Count - 1;
         }
 
         public Enumerator GetEnumerator() => new Enumerator(this);
@@ -459,33 +600,6 @@ namespace System.Collections.Generic
                 _index = 0;
                 _current = default;
             }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void Add(T item)
-        {
-            _version++;
-            T[] array = _items;
-            int size = _size;
-            if ((uint)size < (uint)array.Length)
-            {
-                _size = size + 1;
-                array[size] = item;
-            }
-            else
-            {
-                AddWithResize(item);
-            }
-        }
-
-        // Non-inline from List.Add to improve its code quality as uncommon path
-        [MethodImpl(MethodImplOptions.NoInlining)]
-        private void AddWithResize(T item)
-        {
-            int size = _size;
-            Grow(size + 1);
-            _size = size + 1;
-            _items[size] = item;
         }
 
         internal void Grow(int capacity)
@@ -679,6 +793,10 @@ namespace System.Collections.Generic
                 throw new InvalidOperationException();
         }
 
+        // Inserts an element into this list at a given index. The size of the list
+        // is increased by one. If required, the capacity of the list is doubled
+        // before inserting the new element.
+        //
         public void Insert(int index, T item)
         {
             // Note that insertions at the end are legal.
@@ -699,16 +817,65 @@ namespace System.Collections.Generic
             _version++;
         }
 
+        void IList.Insert(int index, object? item)
+        {
+            ThrowHelper.IfNullAndNullsAreIllegalThenThrow<T>(item, ExceptionArgument.item);
+
+            try
+            {
+                Insert(index, (T)item!);
+            }
+            catch (InvalidCastException)
+            {
+                ThrowHelper.ThrowWrongValueTypeArgumentException(item, typeof(T));
+            }
+        }
+
         public int IndexOf(T item)
             => Array.IndexOf<T>(_items, item, 0, _size);
 
+        // Contains returns true if the specified element is in the List.
+        // It does a linear, O(n) search.  Equality is determined by calling
+        // EqualityComparer<T>.Default.Equals().
+        //
         public bool Contains(T item)
         {
             return _size != 0 && IndexOf(item) >= 0;
         }
 
+        bool IList.Contains(object? item)
+        {
+            if (IsCompatibleObject(item))
+            {
+                return Contains((T)item!);
+            }
+            return false;
+        }
+
+        // Copies this List into array, which must be of a
+        // compatible array type.
         public void CopyTo(T[] array)
             => CopyTo(array, 0);
+
+        // Copies this List into array, which must be of a
+        // compatible array type.
+        void ICollection.CopyTo(Array array, int arrayIndex)
+        {
+            if ((array != null) && (array.Rank != 1))
+            {
+                ThrowHelper.ThrowArgumentException(ExceptionResource.Arg_RankMultiDimNotSupported);
+            }
+
+            try
+            {
+                // Array.Copy will check for NULL.
+                Array.Copy(_items, 0, array!, arrayIndex, _size);
+            }
+            catch (ArrayTypeMismatchException)
+            {
+                ThrowHelper.ThrowArgumentException_Argument_IncompatibleArrayType();
+            }
+        }
 
         public void CopyTo(int index, T[] array, int arrayIndex, int count)
         {
@@ -747,6 +914,8 @@ namespace System.Collections.Generic
             }
         }
 
+        // Removes the first occurrence of the given element, if found.
+        // The size of the list is decreased by one if successful.
         public bool Remove(T item)
         {
             int index = IndexOf(item);
@@ -757,6 +926,14 @@ namespace System.Collections.Generic
             }
 
             return false;
+        }
+
+        void IList.Remove(object? item)
+        {
+            if (IsCompatibleObject(item))
+            {
+                Remove((T)item!);
+            }
         }
 
         public void RemoveAt(int index)

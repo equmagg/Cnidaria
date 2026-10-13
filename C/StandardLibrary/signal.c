@@ -149,7 +149,7 @@ char* strsignal(int sig)
 #define __NR_rt_sigtimedwait_time64 421
 #endif
 
-long __syscall(long number, long a, long b, long c, long d, long e);
+long __syscall(long number, long a, long b, long c, long d, long e, long f);
 
 static long __signal_result(long value)
 {
@@ -220,7 +220,7 @@ int sigaction(int sig, const struct sigaction* restrict action, struct sigaction
             action != (const struct sigaction*)0 ? (long)(uintptr_t)&next : 0,
             old != (struct sigaction*)0 ? (long)(uintptr_t)&previous : 0,
             8,
-            0)) < 0)
+            0, 0)) < 0)
         return -1;
     if (old != (struct sigaction*)0)
     {
@@ -263,12 +263,12 @@ int siginterrupt(int sig, int flag)
 
 int raise(int sig)
 {
-    return (int)__signal_result(__syscall(__NR_tkill, __syscall(__NR_gettid, 0, 0, 0, 0, 0), sig, 0, 0, 0));
+    return (int)__signal_result(__syscall(__NR_tkill, __syscall(__NR_gettid, 0, 0, 0, 0, 0, 0), sig, 0, 0, 0, 0));
 }
 
 int kill(pid_t pid, int sig)
 {
-    return (int)__signal_result(__syscall(__NR_kill, pid, sig, 0, 0, 0));
+    return (int)__signal_result(__syscall(__NR_kill, pid, sig, 0, 0, 0, 0));
 }
 
 int killpg(pid_t group, int sig)
@@ -283,17 +283,17 @@ int killpg(pid_t group, int sig)
 
 int sigprocmask(int how, const sigset_t* restrict set, sigset_t* restrict old)
 {
-    return (int)__signal_result(__syscall(__NR_rt_sigprocmask, how, (long)(uintptr_t)set, (long)(uintptr_t)old, 8, 0));
+    return (int)__signal_result(__syscall(__NR_rt_sigprocmask, how, (long)(uintptr_t)set, (long)(uintptr_t)old, 8, 0, 0));
 }
 
 int sigpending(sigset_t* set)
 {
-    return (int)__signal_result(__syscall(__NR_rt_sigpending, (long)(uintptr_t)set, 8, 0, 0, 0));
+    return (int)__signal_result(__syscall(__NR_rt_sigpending, (long)(uintptr_t)set, 8, 0, 0, 0, 0));
 }
 
 int sigsuspend(const sigset_t* mask)
 {
-    return (int)__signal_result(__syscall(__NR_rt_sigsuspend, (long)(uintptr_t)mask, 8, 0, 0, 0));
+    return (int)__signal_result(__syscall(__NR_rt_sigsuspend, (long)(uintptr_t)mask, 8, 0, 0, 0, 0));
 }
 
 int sigtimedwait(const sigset_t* restrict set, siginfo_t* restrict info, const struct timespec* restrict timeout)
@@ -312,9 +312,9 @@ int sigtimedwait(const sigset_t* restrict set, siginfo_t* restrict info, const s
         (long)(uintptr_t)info,
         timeout != (const struct timespec*)0 ? (long)(uintptr_t)span : 0,
         8,
-        0));
+        0, 0));
 #else
-    return (int)__signal_result(__syscall(__NR_rt_sigtimedwait, (long)(uintptr_t)set, (long)(uintptr_t)info, (long)(uintptr_t)timeout, 8, 0));
+    return (int)__signal_result(__syscall(__NR_rt_sigtimedwait, (long)(uintptr_t)set, (long)(uintptr_t)info, (long)(uintptr_t)timeout, 8, 0, 0));
 #endif
 }
 
@@ -345,12 +345,12 @@ int sigqueue(pid_t pid, int sig, const union sigval value)
     info.si_code = SI_QUEUE;
     info.si_pid = getpid();
     info.si_value = value;
-    return (int)__signal_result(__syscall(__NR_rt_sigqueueinfo, pid, sig, (long)(uintptr_t)&info, 0, 0));
+    return (int)__signal_result(__syscall(__NR_rt_sigqueueinfo, pid, sig, (long)(uintptr_t)&info, 0, 0, 0));
 }
 
 int sigaltstack(const stack_t* restrict stack, stack_t* restrict old)
 {
-    return (int)__signal_result(__syscall(__NR_sigaltstack, (long)(uintptr_t)stack, (long)(uintptr_t)old, 0, 0, 0));
+    return (int)__signal_result(__syscall(__NR_sigaltstack, (long)(uintptr_t)stack, (long)(uintptr_t)old, 0, 0, 0, 0));
 }
 
 void psignal(int sig, const char* message)
@@ -367,17 +367,17 @@ void psignal(int sig, const char* message)
 
 pid_t getpid(void)
 {
-    return (pid_t)__syscall(__NR_getpid, 0, 0, 0, 0, 0);
+    return (pid_t)__syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
 }
 
 pid_t getppid(void)
 {
-    return (pid_t)__syscall(__NR_getppid, 0, 0, 0, 0, 0);
+    return (pid_t)__syscall(__NR_getppid, 0, 0, 0, 0, 0, 0);
 }
 
 pid_t getpgid(pid_t pid)
 {
-    return (pid_t)__signal_result(__syscall(__NR_getpgid, pid, 0, 0, 0, 0));
+    return (pid_t)__signal_result(__syscall(__NR_getpgid, pid, 0, 0, 0, 0, 0));
 }
 
 pid_t getpgrp(void)
@@ -387,17 +387,17 @@ pid_t getpgrp(void)
 
 int setpgid(pid_t pid, pid_t group)
 {
-    return (int)__signal_result(__syscall(__NR_setpgid, pid, group, 0, 0, 0));
+    return (int)__signal_result(__syscall(__NR_setpgid, pid, group, 0, 0, 0, 0));
 }
 
 pid_t getsid(pid_t pid)
 {
-    return (pid_t)__signal_result(__syscall(__NR_getsid, pid, 0, 0, 0, 0));
+    return (pid_t)__signal_result(__syscall(__NR_getsid, pid, 0, 0, 0, 0, 0));
 }
 
 pid_t setsid(void)
 {
-    return (pid_t)__signal_result(__syscall(__NR_setsid, 0, 0, 0, 0, 0));
+    return (pid_t)__signal_result(__syscall(__NR_setsid, 0, 0, 0, 0, 0, 0));
 }
 
 int pause(void)
@@ -428,7 +428,7 @@ int setitimer(int which, const struct itimerval* restrict value, struct itimerva
             value != (const struct itimerval*)0 ? (long)(uintptr_t)next : 0,
             old != (struct itimerval*)0 ? (long)(uintptr_t)previous : 0,
             0,
-            0)) < 0)
+            0, 0)) < 0)
         return -1;
     if (old != (struct itimerval*)0)
     {
@@ -444,7 +444,7 @@ int getitimer(int which, struct itimerval* value)
 {
     long current[4];
 
-    if (__signal_result(__syscall(__NR_getitimer, which, (long)(uintptr_t)current, 0, 0, 0)) < 0)
+    if (__signal_result(__syscall(__NR_getitimer, which, (long)(uintptr_t)current, 0, 0, 0, 0)) < 0)
         return -1;
     value->it_interval.tv_sec = current[0];
     value->it_interval.tv_usec = current[1];
@@ -477,7 +477,7 @@ unsigned int sleep(unsigned int seconds)
 
     request[0] = seconds;
     request[1] = 0;
-    if (__syscall(__NR_clock_nanosleep_time64, 0, 0, (long)(uintptr_t)request, (long)(uintptr_t)remaining, 0) == -EINTR)
+    if (__syscall(__NR_clock_nanosleep_time64, 0, 0, (long)(uintptr_t)request, (long)(uintptr_t)remaining, 0, 0) == -EINTR)
         return (unsigned int)remaining[0];
 #else
     long request[2];
@@ -485,7 +485,7 @@ unsigned int sleep(unsigned int seconds)
 
     request[0] = (long)seconds;
     request[1] = 0;
-    if (__syscall(__NR_nanosleep, (long)(uintptr_t)request, (long)(uintptr_t)remaining, 0, 0, 0) == -EINTR)
+    if (__syscall(__NR_nanosleep, (long)(uintptr_t)request, (long)(uintptr_t)remaining, 0, 0, 0, 0) == -EINTR)
         return (unsigned int)remaining[0];
 #endif
     return 0;

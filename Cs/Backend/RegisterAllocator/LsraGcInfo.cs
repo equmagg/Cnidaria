@@ -388,7 +388,8 @@ namespace Cnidaria.Cs
                         slot.Offset,
                         slot.Size);
 
-                    if (ShouldReportDescriptorHomeForEntireMethod(descriptor))
+                    // Block liveness misses handler entry and finally runs, so EH methods report homes everywhere
+                    if (_method.GenTreeMethod.Cfg.ExceptionRegions.Length != 0 || ShouldReportDescriptorHomeForEntireMethod(descriptor))
                     {
                         AddHomeSlotRootRanges(ranges, owner, descriptor.Type, descriptor.StackKind, location, methodStart, methodEnd);
                         continue;

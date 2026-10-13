@@ -372,7 +372,7 @@ public sealed class Binder
             return -1;
 
         var index = BindExpression(arrayDesignator.Expression);
-        if (TryConvertConstantToLong(index.ConstantValue, out var value))
+        if (IntegerConstantEvaluator.TryConvertConstantToLong(index.ConstantValue, out var value))
             return value < 0 ? -1 : value;
 
         // Binding folds a literal but not arithmetic over one, so the declarator's evaluator finishes the job
@@ -434,7 +434,7 @@ public sealed class Binder
             if (!condition.Type.IsError)
                 Report("Static assertion expression must have integer type.", SpanOf(syntax.Condition));
         }
-        else if (!TryEvaluateIntegerConstantValue(condition, out var value))
+        else if (!IntegerConstantEvaluator.TryEvaluate(condition, _compilation.Options.Target, out var value))
         {
             Report("Static assertion expression must be an integer constant expression.", SpanOf(syntax.Condition));
         }
@@ -550,10 +550,12 @@ public sealed class Binder
         var expression = ApplyDefaultConversions(BindExpression(syntax.Expression));
         if (!IsIntegerType(expression.Type) && !expression.Type.IsError)
             Report("Switch expression must have integer type.", SpanOf(syntax.Expression));
+        else
+            expression = ConvertImplicitValue(expression, IntegerPromote(expression.Type));
 
         BoundStatement statement;
         _switchDepth++;
-        _switchContexts.Push(new SwitchContext());
+        _switchContexts.Push(new SwitchContext(expression.Type));
         try
         {
             statement = BindStatement(syntax.Statement);
@@ -676,7 +678,9 @@ public sealed class Binder
         }
         else if (!expression.Type.IsError)
         {
-            if (!TryEvaluateIntegerConstantValue(expression, out var value))
+            if (switchContext is not null)
+                expression = ConvertImplicitValue(expression, switchContext.Type);
+            if (!IntegerConstantEvaluator.TryEvaluate(expression, _compilation.Options.Target, out var value))
             {
                 Report("Case label expression must be an integer constant expression.", SpanOf(syntax.Expression));
             }
@@ -1307,7 +1311,7 @@ public sealed class Binder
                 if (IsPointerType(left.Type) && IsIntegerType(right.Type))
                     return left.Type;
                 if (IsPointerType(left.Type) && IsPointerType(right.Type))
-                    return _types.Builtin(BuiltinTypeKind.Long);
+                    return PointerDifferenceType();
                 if (!IsArithmeticType(left.Type) || !IsArithmeticType(right.Type))
                     Report("Binary operator '-' requires arithmetic operands or pointer operands.", operatorToken.Span);
                 return UsualArithmeticConversion(left.Type, right.Type);
@@ -1396,11 +1400,15 @@ public sealed class Binder
         var whenTrue = ApplyDefaultConversions(BindExpression(syntax.WhenTrue));
         var whenFalse = ApplyDefaultConversions(BindExpression(syntax.WhenFalse));
 
-        var resultType = CommonConditionalType(whenTrue.Type, whenFalse.Type);
+        var resultType = CommonConditionalType(whenTrue, whenFalse);
         if (!resultType.IsError)
         {
             whenTrue = ConvertImplicitValue(whenTrue, resultType);
             whenFalse = ConvertImplicitValue(whenFalse, resultType);
+        }
+        else if (!whenTrue.Type.IsError && !whenFalse.Type.IsError)
+        {
+            Report($"Conditional expression operands of types '{whenTrue.Type.ToDisplayString()}' and '{whenFalse.Type.ToDisplayString()}' are incompatible.", SpanOf(syntax));
         }
 
         return new BoundConditionalExpression(
@@ -1478,16 +1486,23 @@ public sealed class Binder
 
     /// <summary>size_t for the target: the unsigned type as wide as a pointer (C11 6.5.3.4)</summary>
     private QualifiedType SizeType()
+        => IntegerTypeOfPointerSize(BuiltinTypeKind.UnsignedInt, BuiltinTypeKind.UnsignedLong, BuiltinTypeKind.UnsignedLongLong);
+
+    /// <summary>ptrdiff_t for the target: the signed type as wide as a pointer (C11 6.5.6p9)</summary>
+    private QualifiedType PointerDifferenceType()
+        => IntegerTypeOfPointerSize(BuiltinTypeKind.Int, BuiltinTypeKind.Long, BuiltinTypeKind.LongLong);
+
+    private QualifiedType IntegerTypeOfPointerSize(params BuiltinTypeKind[] candidates)
     {
         var target = _compilation.Options.Target;
-        foreach (var candidate in new[] { BuiltinTypeKind.UnsignedInt, BuiltinTypeKind.UnsignedLong, BuiltinTypeKind.UnsignedLongLong })
+        foreach (var candidate in candidates)
         {
             var type = _types.Builtin(candidate);
             if (target.SizeOf(type) >= target.PointerSize)
                 return type;
         }
 
-        return _types.Builtin(BuiltinTypeKind.UnsignedLongLong);
+        return _types.Builtin(candidates[^1]);
     }
 
     private BoundExpression BindCompoundLiteralExpression(CompoundLiteralExpressionSyntax syntax)
@@ -1949,8 +1964,10 @@ public sealed class Binder
         return false;
     }
 
-    private QualifiedType CommonConditionalType(QualifiedType left, QualifiedType right)
+    private QualifiedType CommonConditionalType(BoundExpression whenTrue, BoundExpression whenFalse)
     {
+        var left = whenTrue.Type;
+        var right = whenFalse.Type;
         if (left.IsError || right.IsError)
             return ErrorType;
 
@@ -1960,11 +1977,41 @@ public sealed class Binder
         if (IsArithmeticType(left) && IsArithmeticType(right))
             return UsualArithmeticConversion(left, right);
 
-        if (IsPointerType(left) && IsPointerType(right))
+        // C11 6.5.15p6: a null pointer constant takes the other side's type, void* absorbs an object pointer, qualifiers merge
+        if (IsPointerType(left) && IsNullPointerConstant(whenFalse))
             return left;
+        if (IsPointerType(right) && IsNullPointerConstant(whenTrue))
+            return right;
+
+        if (left.Type is PointerType leftPointer && right.Type is PointerType rightPointer)
+        {
+            var pointee = IsVoidType(rightPointer.PointeeType) ? rightPointer.PointeeType : leftPointer.PointeeType;
+            var qualifiers = leftPointer.PointeeType.Qualifiers | rightPointer.PointeeType.Qualifiers;
+            return new QualifiedType(_types.PointerTo(new QualifiedType(pointee.Type, qualifiers)));
+        }
+
+        // gcc accepts a pointer beside a nonzero integer with a warning and keeps the pointer type
+        if (IsPointerType(left) && IsIntegerType(right))
+            return left;
+        if (IsIntegerType(left) && IsPointerType(right))
+            return right;
 
         return ErrorType;
     }
+
+    // C11 6.3.2.3p3
+    private bool IsNullPointerConstant(BoundExpression expression)
+    {
+        expression = StripLValueTransparency(expression);
+        if (expression is BoundCastExpression { Type.Type: PointerType pointer } cast && IsVoidType(pointer.PointeeType))
+            expression = cast.Expression;
+        return IsIntegerType(expression.Type) &&
+            IntegerConstantEvaluator.TryEvaluate(expression, _compilation.Options.Target, out var value) &&
+            value == 0;
+    }
+
+    private static bool IsVoidType(QualifiedType type)
+        => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Void };
 
     private QualifiedType UsualArithmeticConversion(QualifiedType left, QualifiedType right)
     {
@@ -2382,7 +2429,7 @@ public sealed class Binder
 
     private void AnalyzeFunctionControlFlow(FunctionSymbol? function, BoundCompoundStatement body)
     {
-        ControlFlowAnalyzer.Analyze(function, body, Report, ReportWarning);
+        ControlFlowAnalyzer.Analyze(function, body, _compilation.Options.Target, Report, ReportWarning);
     }
 
     /// <summary>Tracks case values and the default label for one switch</summary>
@@ -2390,6 +2437,13 @@ public sealed class Binder
     {
         private readonly Dictionary<long, CaseStatementSyntax> _caseLabels = new();
         private DefaultStatementSyntax? _defaultLabel;
+
+        public SwitchContext(QualifiedType type)
+        {
+            Type = type;
+        }
+
+        public QualifiedType Type { get; }
 
         public bool TryDeclareCase(long value, CaseStatementSyntax syntax, out CaseStatementSyntax? existing)
         {
@@ -2442,6 +2496,7 @@ public sealed class Binder
     {
         private readonly Action<string, TextSpan> _reportError;
         private readonly Action<string, TextSpan> _reportWarning;
+        private readonly TargetInfo _target;
         private readonly HashSet<LabelSymbol> _reachableGotoTargets = new();
         private readonly Stack<bool> _switchEntryReachable = new();
         private bool _collectGotoTargets;
@@ -2449,9 +2504,11 @@ public sealed class Binder
         private bool _gotoTargetSetChanged;
 
         private ControlFlowAnalyzer(
+            TargetInfo target,
             Action<string, TextSpan> reportError,
             Action<string, TextSpan> reportWarning)
         {
+            _target = target;
             _reportError = reportError ?? throw new ArgumentNullException(nameof(reportError));
             _reportWarning = reportWarning ?? throw new ArgumentNullException(nameof(reportWarning));
         }
@@ -2459,10 +2516,11 @@ public sealed class Binder
         public static void Analyze(
             FunctionSymbol? function,
             BoundCompoundStatement body,
+            TargetInfo target,
             Action<string, TextSpan> reportError,
             Action<string, TextSpan> reportWarning)
         {
-            new ControlFlowAnalyzer(reportError, reportWarning).AnalyzeFunction(function, body);
+            new ControlFlowAnalyzer(target, reportError, reportWarning).AnalyzeFunction(function, body);
         }
 
         private void AnalyzeFunction(FunctionSymbol? function, BoundCompoundStatement body)
@@ -2620,7 +2678,7 @@ public sealed class Binder
 
         private FlowResult AnalyzeIfStatement(BoundIfStatement ifStatement, bool isReachable)
         {
-            var condition = TryGetKnownBool(ifStatement.Condition);
+            var condition = IntegerConstantEvaluator.TryGetTruth(ifStatement.Condition, _target);
 
             var thenReachable = isReachable && condition != false;
             var thenResult = AnalyzeStatement(ifStatement.ThenStatement, thenReachable);
@@ -2666,7 +2724,7 @@ public sealed class Binder
 
         private FlowResult AnalyzeWhileStatement(BoundWhileStatement whileStatement, bool isReachable)
         {
-            var condition = TryGetKnownBool(whileStatement.Condition);
+            var condition = IntegerConstantEvaluator.TryGetTruth(whileStatement.Condition, _target);
             var bodyReachable = isReachable && condition != false;
             var bodyResult = AnalyzeStatement(whileStatement.Statement, bodyReachable);
             var canExitByCondition = isReachable && condition != true;
@@ -2680,7 +2738,7 @@ public sealed class Binder
         private FlowResult AnalyzeDoStatement(BoundDoStatement doStatement, bool isReachable)
         {
             var bodyResult = AnalyzeStatement(doStatement.Statement, isReachable);
-            var condition = TryGetKnownBool(doStatement.Condition);
+            var condition = IntegerConstantEvaluator.TryGetTruth(doStatement.Condition, _target);
             var canReachCondition = bodyResult.CanFallThrough || bodyResult.HasContinue;
             var canExitByCondition = canReachCondition && condition != true;
 
@@ -2697,7 +2755,7 @@ public sealed class Binder
 
             var condition = forStatement.Condition is null
                 ? true
-                : TryGetKnownBool(forStatement.Condition);
+                : IntegerConstantEvaluator.TryGetTruth(forStatement.Condition, _target);
 
             var bodyReachable = isReachable && condition != false;
             var bodyResult = AnalyzeStatement(forStatement.Statement, bodyReachable);
@@ -2819,262 +2877,6 @@ public sealed class Binder
         {
             if (_reportUnreachable)
                 _reportWarning("Unreachable code.", SpanOf(node.Syntax));
-        }
-    }
-
-    // Constant evaluation
-
-    private static bool? TryGetKnownBool(BoundExpression expression)
-    {
-        if (TryEvaluateIntegerConstantValue(expression, out var integerValue))
-            return integerValue != 0;
-
-        if (TryGetConstantValue(expression, out var value))
-        {
-            switch (value)
-            {
-                case bool boolean:
-                    return boolean;
-                case float single:
-                    return single != 0;
-                case double dbl:
-                    return dbl != 0;
-                case decimal dec:
-                    return dec != 0;
-            }
-        }
-
-        return null;
-    }
-
-    private static bool TryEvaluateIntegerConstantValue(BoundExpression expression, out long value)
-    {
-        switch (expression)
-        {
-            case BoundConversionExpression conversion:
-                return TryEvaluateIntegerConstantValue(conversion.Expression, out value);
-
-            case BoundParenthesizedExpression parenthesized:
-                return TryEvaluateIntegerConstantValue(parenthesized.Expression, out value);
-
-            case BoundCastExpression cast:
-                return TryEvaluateIntegerConstantValue(cast.Expression, out value);
-
-            case BoundSizeofExpression sizeofExpression:
-                return TryConvertConstantToLong(sizeofExpression.ConstantValue, out value);
-
-            case BoundOffsetofExpression offsetof:
-                return TryConvertConstantToLong(offsetof.ConstantValue, out value);
-
-            case BoundLiteralExpression literal:
-                return TryConvertConstantToLong(literal.ConstantValue, out value);
-
-            case BoundUnaryExpression unary:
-                return TryEvaluateUnaryIntegerConstant(unary, out value);
-
-            case BoundBinaryExpression binary:
-                return TryEvaluateBinaryIntegerConstant(binary, out value);
-
-            case BoundConditionalExpression conditional:
-                return TryEvaluateConditionalIntegerConstant(conditional, out value);
-
-            default:
-                return TryConvertConstantToLong(expression.ConstantValue, out value);
-        }
-    }
-
-    private static bool TryEvaluateUnaryIntegerConstant(BoundUnaryExpression expression, out long value)
-    {
-        value = 0;
-        if (!TryEvaluateIntegerConstantValue(expression.Operand, out var operand))
-            return false;
-
-        try
-        {
-            switch (expression.OperatorToken.Kind)
-            {
-                case SyntaxKind.PlusToken:
-                    value = operand;
-                    return true;
-                case SyntaxKind.MinusToken:
-                    value = checked(-operand);
-                    return true;
-                case SyntaxKind.TildeToken:
-                    value = ~operand;
-                    return true;
-                case SyntaxKind.BangToken:
-                    value = operand == 0 ? 1 : 0;
-                    return true;
-                default:
-                    return false;
-            }
-        }
-        catch (OverflowException)
-        {
-            value = 0;
-            return false;
-        }
-    }
-
-    private static bool TryEvaluateBinaryIntegerConstant(BoundBinaryExpression expression, out long value)
-    {
-        value = 0;
-
-        if (!TryEvaluateIntegerConstantValue(expression.Left, out var left))
-            return false;
-
-        if (!TryEvaluateIntegerConstantValue(expression.Right, out var right))
-            return false;
-
-        try
-        {
-            switch (expression.OperatorToken.Kind)
-            {
-                case SyntaxKind.StarToken:
-                    value = checked(left * right);
-                    return true;
-                case SyntaxKind.SlashToken:
-                    if (right == 0)
-                        return false;
-                    value = left / right;
-                    return true;
-                case SyntaxKind.PercentToken:
-                    if (right == 0)
-                        return false;
-                    value = left % right;
-                    return true;
-                case SyntaxKind.PlusToken:
-                    value = checked(left + right);
-                    return true;
-                case SyntaxKind.MinusToken:
-                    value = checked(left - right);
-                    return true;
-                case SyntaxKind.LessThanLessThanToken:
-                    if (right < 0 || right >= 64)
-                        return false;
-                    value = checked(left << (int)right);
-                    return true;
-                case SyntaxKind.GreaterThanGreaterThanToken:
-                    if (right < 0 || right >= 64)
-                        return false;
-                    value = left >> (int)right;
-                    return true;
-                case SyntaxKind.LessThanToken:
-                    value = left < right ? 1 : 0;
-                    return true;
-                case SyntaxKind.LessThanEqualsToken:
-                    value = left <= right ? 1 : 0;
-                    return true;
-                case SyntaxKind.GreaterThanToken:
-                    value = left > right ? 1 : 0;
-                    return true;
-                case SyntaxKind.GreaterThanEqualsToken:
-                    value = left >= right ? 1 : 0;
-                    return true;
-                case SyntaxKind.EqualsEqualsToken:
-                    value = left == right ? 1 : 0;
-                    return true;
-                case SyntaxKind.BangEqualsToken:
-                    value = left != right ? 1 : 0;
-                    return true;
-                case SyntaxKind.AmpersandToken:
-                    value = left & right;
-                    return true;
-                case SyntaxKind.PipeToken:
-                    value = left | right;
-                    return true;
-                case SyntaxKind.HatToken:
-                    value = left ^ right;
-                    return true;
-                case SyntaxKind.AmpersandAmpersandToken:
-                    value = left != 0 && right != 0 ? 1 : 0;
-                    return true;
-                case SyntaxKind.PipePipeToken:
-                    value = left != 0 || right != 0 ? 1 : 0;
-                    return true;
-                case SyntaxKind.CommaToken:
-                    value = right;
-                    return true;
-                default:
-                    return false;
-            }
-        }
-        catch (OverflowException)
-        {
-            value = 0;
-            return false;
-        }
-    }
-
-    private static bool TryEvaluateConditionalIntegerConstant(BoundConditionalExpression expression, out long value)
-    {
-        value = 0;
-
-        var condition = TryGetKnownBool(expression.Condition);
-        if (!condition.HasValue)
-            return false;
-
-        return condition.Value
-            ? TryEvaluateIntegerConstantValue(expression.WhenTrue, out value)
-            : TryEvaluateIntegerConstantValue(expression.WhenFalse, out value);
-    }
-
-    private static bool TryGetConstantValue(BoundExpression expression, out object? value)
-    {
-        switch (expression)
-        {
-            case BoundConversionExpression conversion:
-                return TryGetConstantValue(conversion.Expression, out value);
-
-            case BoundParenthesizedExpression parenthesized:
-                return TryGetConstantValue(parenthesized.Expression, out value);
-
-            case BoundCastExpression cast:
-                return TryGetConstantValue(cast.Expression, out value);
-
-            default:
-                value = expression.ConstantValue;
-                return value is not null;
-        }
-    }
-
-    private static bool TryConvertConstantToLong(object? constantValue, out long value)
-    {
-        switch (constantValue)
-        {
-            case byte byteValue:
-                value = byteValue;
-                return true;
-            case sbyte signedByteValue:
-                value = signedByteValue;
-                return true;
-            case short shortValue:
-                value = shortValue;
-                return true;
-            case ushort unsignedShortValue:
-                value = unsignedShortValue;
-                return true;
-            case int intValue:
-                value = intValue;
-                return true;
-            case uint unsignedIntValue:
-                value = unsignedIntValue;
-                return true;
-            case long longValue:
-                value = longValue;
-                return true;
-            case ulong unsignedLongValue when unsignedLongValue <= long.MaxValue:
-                value = (long)unsignedLongValue;
-                return true;
-            case char charValue:
-                value = charValue;
-                return true;
-            case bool boolValue:
-                value = boolValue ? 1 : 0;
-                return true;
-            default:
-                value = 0;
-                return false;
         }
     }
 

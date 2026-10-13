@@ -1906,9 +1906,35 @@ namespace Cnidaria.Cs
             AddMemberToType(container, ctor);
             RecordDeclared(tree, syntax, ctor);
         }
+        // Accessor names are fixed before attributes bind, so IndexerName is read from its syntax
+        private static string IndexerMetadataName(IndexerDeclarationSyntax syntax)
+        {
+            for (int l = 0; l < syntax.AttributeLists.Count; l++)
+            {
+                var attributes = syntax.AttributeLists[l].Attributes;
+                for (int a = 0; a < attributes.Count; a++)
+                {
+                    AttributeSyntax attribute = attributes[a];
+                    string? name = attribute.Name switch
+                    {
+                        IdentifierNameSyntax identifier => identifier.Identifier.ValueText,
+                        QualifiedNameSyntax { Right: IdentifierNameSyntax right } => right.Identifier.ValueText,
+                        _ => null,
+                    };
+                    if (name is "IndexerName" or "IndexerNameAttribute" &&
+                        attribute.ArgumentList is { Arguments.Count: 1 } arguments &&
+                        arguments.Arguments[0].Expression is LiteralExpressionSyntax { LiteralToken.Value: string value })
+                    {
+                        return value;
+                    }
+                }
+            }
+
+            return "Item";
+        }
         private void DeclareIndexerDeclaration(SyntaxTree tree, IndexerDeclarationSyntax syntax, NamedTypeSymbol container)
         {
-            const string metadataName = "Item";
+            string metadataName = IndexerMetadataName(syntax);
 
             bool isStatic = HasModifier(syntax.Modifiers, SyntaxKind.StaticKeyword);
             var typeDefaultAcc = GetDefaultTypeMemberAccessibility(container);

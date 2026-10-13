@@ -2696,6 +2696,52 @@ internal sealed class AllocationResult
         return !ReferencesSamePhysicalStorage(copy.Source, copy.Destination);
     }
 
+    // Blocks whose parallel copies all move nothing hold only a jump, so branches can go where their chain ends
+    public IReadOnlyDictionary<LirBlock, LirBlock> FindJumpOnlyBlocks()
+    {
+        var targets = new Dictionary<LirBlock, LirBlock>();
+        foreach (var block in Function.Blocks)
+        {
+            if (!ReferenceEquals(block, Function.Entry) && TryGetJumpOnlyTarget(block, out var target))
+                targets.Add(block, target);
+        }
+
+        var resolved = new Dictionary<LirBlock, LirBlock>(targets.Count);
+        foreach (var pair in targets)
+        {
+            var target = pair.Value;
+            for (var steps = 0; steps < targets.Count && targets.TryGetValue(target, out var next); steps++)
+                target = next;
+            // A loop made of nothing but such jumps is a real infinite loop, so its blocks stay
+            if (!targets.ContainsKey(target))
+                resolved.Add(pair.Key, target);
+        }
+
+        return resolved;
+    }
+
+    private bool TryGetJumpOnlyTarget(LirBlock block, out LirBlock target)
+    {
+        target = null!;
+        var instructions = block.Instructions;
+        if (instructions.Length == 0 || instructions[^1] is not { Kind: LirInstructionKind.Jump, Target: LirBlock jumpTarget })
+            return false;
+
+        for (var i = 0; i < instructions.Length - 1; i++)
+        {
+            if (instructions[i].Kind != LirInstructionKind.ParallelCopy)
+                return false;
+            foreach (var copy in instructions[i].ParallelCopies)
+            {
+                if (RequiresPhysicalParallelCopy(copy))
+                    return false;
+            }
+        }
+
+        target = jumpTarget;
+        return true;
+    }
+
     public bool TryOrderParallelCopies(IReadOnlyList<LirParallelCopy> copies, out ImmutableArray<LirParallelCopy> ordered)
     {
         ordered = ImmutableArray<LirParallelCopy>.Empty;

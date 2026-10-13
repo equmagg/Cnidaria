@@ -129,6 +129,7 @@ internal static class RiscVAssemblyParser
 
         var instructions = ImmutableArray.CreateBuilder<RVInstruction>();
         var labels = new Dictionary<string, int>(StringComparer.Ordinal);
+        var pcrel = new PcrelState(labels);
         var lines = text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
         var pc = 0;
 
@@ -156,8 +157,11 @@ internal static class RiscVAssemblyParser
             if (line.Length == 0)
                 continue;
 
-            foreach (var instruction in ParseInstruction(line, lineIndex + 1))
+            pcrel.Pc = pc;
+            foreach (var instruction in ParseInstruction(line, lineIndex + 1, pcrel))
             {
+                if (instruction.Opcode == RVInstrKind.Auipc && instruction.RelocationKind == RVRelocationKind.AbsoluteUpper20)
+                    pcrel.HighSymbols[pc] = instruction.Symbol!;
                 instructions.Add(instruction);
                 pc = checked(pc + RVInstructionTable.GetEncodedSize(instruction.Opcode));
             }
@@ -166,7 +170,19 @@ internal static class RiscVAssemblyParser
         return new RiscVProgram(target, instructions.ToImmutable(), labels);
     }
 
-    private static IEnumerable<RVInstruction> ParseInstruction(string line, int lineNumber)
+    private sealed class PcrelState
+    {
+        public PcrelState(Dictionary<string, int> labels)
+        {
+            Labels = labels;
+        }
+
+        public Dictionary<string, int> Labels { get; }
+        public Dictionary<int, string> HighSymbols { get; } = new Dictionary<int, string>();
+        public int Pc { get; set; }
+    }
+
+    private static IEnumerable<RVInstruction> ParseInstruction(string line, int lineNumber, PcrelState pcrel)
     {
         int split = FirstWhitespace(line);
         string mnemonic = split < 0 ? line.Trim().ToLowerInvariant() : line.Substring(0, split).Trim().ToLowerInvariant();
@@ -196,7 +212,7 @@ internal static class RiscVAssemblyParser
         var form = metadata.Form ?? throw new FormatException($"Instruction '{mnemonic}' has no encoding on line {lineNumber}");
         if (form.HasCustomSyntax)
             return One(ParseCustomSyntax(opcode, operands, lineNumber));
-        return One(ParseEncoded(opcode, form, operands, atomicFlags, lineNumber));
+        return One(ParseEncoded(opcode, form, operands, atomicFlags, lineNumber, pcrel));
     }
 
     private static IEnumerable<RVInstruction> One(RVInstruction instruction)
@@ -393,7 +409,7 @@ internal static class RiscVAssemblyParser
     }
 
     /// <summary>Reads the operands of a table-driven instruction straight off its pattern</summary>
-    private static RVInstruction ParseEncoded(RVInstrKind opcode, RVEncodedForm form, ImmutableArray<string> operands, RVInstructionFlags atomicFlags, int lineNumber)
+    private static RVInstruction ParseEncoded(RVInstrKind opcode, RVEncodedForm form, ImmutableArray<string> operands, RVInstructionFlags atomicFlags, int lineNumber, PcrelState pcrel)
     {
         var rd = RVRegister.Invalid;
         var rs1 = RVRegister.Invalid;
@@ -403,6 +419,7 @@ internal static class RiscVAssemblyParser
         var masked = false;
         var hasRounding = false;
         string? symbol = null;
+        RVRelocationKind? relocation = null;
         var index = 0;
 
         foreach (var slot in form.Syntax)
@@ -454,7 +471,7 @@ internal static class RiscVAssemblyParser
                     continue;
                 }
 
-                var (offset, baseRegister) = ParseMemoryOperand(text);
+                var (offsetText, baseRegister) = SplitMemoryOperand(text);
                 var inner = slot.Substring(open + 1, slot.Length - open - 2);
                 if (inner == "#sp")
                 {
@@ -468,7 +485,12 @@ internal static class RiscVAssemblyParser
 
                 var head = slot.Substring(0, open);
                 if (head.StartsWith("i:", StringComparison.Ordinal))
-                    immediate = offset;
+                {
+                    if (TryParsePcrelOperand(offsetText, pcrel, lineNumber, out var relocated, out var relocationKind))
+                        (symbol, relocation) = (relocated, relocationKind);
+                    else
+                        immediate = offsetText.Length == 0 ? 0 : ParseImmediate(offsetText);
+                }
                 else if (head.Length != 0)
                     throw new FormatException($"Unsupported operand '{slot}' on line {lineNumber}");
                 continue;
@@ -483,7 +505,9 @@ internal static class RiscVAssemblyParser
 
             if (slot.StartsWith("i:", StringComparison.Ordinal))
             {
-                if (LooksLikeSymbol(text))
+                if (TryParsePcrelOperand(text, pcrel, lineNumber, out var relocated, out var relocationKind))
+                    (symbol, relocation) = (relocated, relocationKind);
+                else if (LooksLikeSymbol(text))
                     symbol = text;
                 else
                     immediate = (int)ParseImmediate(text);
@@ -496,14 +520,49 @@ internal static class RiscVAssemblyParser
         if (index != operands.Length)
             throw new FormatException($"Too many operands on line {lineNumber}");
         if (form.Syntax.Contains("rm") && !hasRounding)
-            immediate = 7;
+            immediate = RiscVAssemblyWriter.DefaultRoundingMode(opcode);
 
         var flags = atomicFlags;
         if (form.Syntax.Contains("vm") && !masked)
             flags |= RVInstructionFlags.VectorUnmasked;
+        if (relocation == RVRelocationKind.AbsoluteUpper20 && opcode != RVInstrKind.Auipc)
+            throw new FormatException($"%pcrel_hi needs auipc on line {lineNumber}");
+        // c.lui spells a negative upper value as its 20-bit pattern
+        if (opcode == RVInstrKind.CLui && immediate >= 0xFFFE0 && immediate <= 0xFFFFF)
+            immediate -= 0x100000;
         if (symbol is not null)
-            return new RVInstruction(opcode, rd, rs1, rs2, 0, symbol, RelocationFor(form), flags, rs3);
+            return new RVInstruction(opcode, rd, rs1, rs2, 0, symbol, relocation ?? RelocationFor(form), flags, rs3);
         return new RVInstruction(opcode, rd, rs1, rs2, immediate, null, RVRelocationKind.None, flags, rs3);
+    }
+
+    private static bool TryParsePcrelOperand(string text, PcrelState pcrel, int lineNumber, out string symbol, out RVRelocationKind relocation)
+    {
+        if (TryUnwrapOperator(text, "%pcrel_hi", out symbol))
+        {
+            relocation = RVRelocationKind.AbsoluteUpper20;
+            return true;
+        }
+
+        relocation = RVRelocationKind.AbsoluteLow12;
+        if (!TryUnwrapOperator(text, "%pcrel_lo", out var label))
+            return false;
+        if (!pcrel.Labels.TryGetValue(label, out var highPc) || !pcrel.HighSymbols.TryGetValue(highPc, out var highSymbol))
+            throw new FormatException($"%pcrel_lo({label}) on line {lineNumber} does not name a preceding auipc with %pcrel_hi");
+        // The instruction model pairs a low half with the auipc directly before it
+        if (highPc != pcrel.Pc - 4)
+            throw new FormatException($"%pcrel_lo({label}) on line {lineNumber} must directly follow its auipc");
+
+        symbol = highSymbol;
+        return true;
+    }
+
+    private static bool TryUnwrapOperator(string text, string name, out string argument)
+    {
+        argument = string.Empty;
+        if (!text.StartsWith(name + "(", StringComparison.Ordinal) || !text.EndsWith(")", StringComparison.Ordinal))
+            return false;
+        argument = text.Substring(name.Length + 1, text.Length - name.Length - 2).Trim();
+        return argument.Length != 0;
     }
 
     private static RVRelocationKind RelocationFor(RVEncodedForm form)
@@ -602,14 +661,18 @@ internal static class RiscVAssemblyParser
 
     private static (int Offset, RVRegister Base) ParseMemoryOperand(string text)
     {
-        int open = text.IndexOf('(');
+        var (offsetText, baseRegister) = SplitMemoryOperand(text);
+        return (offsetText.Length == 0 ? 0 : ParseImmediate(offsetText), baseRegister);
+    }
+
+    // The base register is the last parenthesized group, since a %pcrel_lo offset has parentheses of its own
+    private static (string OffsetText, RVRegister Base) SplitMemoryOperand(string text)
+    {
+        int open = text.LastIndexOf('(');
         int close = text.LastIndexOf(')');
         if (open < 0 || close != text.Length - 1 || close <= open + 1)
             throw new FormatException($"Invalid memory operand: {text}");
-        string offsetText = text.Substring(0, open).Trim();
-        string baseText = text.Substring(open + 1, close - open - 1).Trim();
-        int offset = offsetText.Length == 0 ? 0 : ParseImmediate(offsetText);
-        return (offset, ParseGpr(baseText));
+        return (text.Substring(0, open).Trim(), ParseGpr(text.Substring(open + 1, close - open - 1).Trim()));
     }
 
     private static int ParseFenceImmediate(ImmutableArray<string> operands)
@@ -1052,7 +1115,8 @@ internal static class RiscVAssemblyWriter
                 foreach (var label in labels)
                     sb.Append(label).AppendLine(":");
             }
-            sb.Append("    ").AppendLine(WriteInstruction(text.Instructions[i], options));
+            WritePcrelLabel(sb, text.Instructions[i], pc);
+            sb.Append("    ").AppendLine(WriteInstruction(text.Instructions[i], options, pc));
             pc = checked(pc + RVInstructionTable.GetEncodedSize(text.Instructions[i].Opcode));
         }
         return sb.ToString();
@@ -1064,9 +1128,24 @@ internal static class RiscVAssemblyWriter
             throw new ArgumentNullException(nameof(instructions));
         options ??= RiscVAssemblyWriterOptions.Default;
         var sb = new StringBuilder();
+        var pc = 0;
         foreach (var instruction in instructions)
-            sb.AppendLine(WriteInstruction(instruction, options));
+        {
+            WritePcrelLabel(sb, instruction, pc);
+            sb.AppendLine(WriteInstruction(instruction, options, pc));
+            pc = checked(pc + RVInstructionTable.GetEncodedSize(instruction.Opcode));
+        }
         return sb.ToString();
+    }
+
+    // A low half pairs with the auipc right before it, so the label carries that auipc's pc
+    private static string PcrelLabel(int pc)
+        => ".Lpcrel_hi" + pc.ToString(CultureInfo.InvariantCulture);
+
+    private static void WritePcrelLabel(StringBuilder sb, RVInstruction instruction, int pc)
+    {
+        if (instruction.HasSymbol && instruction.RelocationKind == RVRelocationKind.AbsoluteUpper20)
+            sb.Append(PcrelLabel(pc)).AppendLine(":");
     }
     private static void WriteSymbolDeclarations(StringBuilder sb, ImmutableArray<RVObjectSymbol> symbols, RiscVAssemblyWriterOptions options)
     {
@@ -1119,7 +1198,8 @@ internal static class RiscVAssemblyWriter
         for (var i = 0; i < text.Instructions.Length; i++)
         {
             WriteLabels(sb, labelsByPc, pc);
-            sb.Append("    ").AppendLine(WriteInstruction(text.Instructions[i], options));
+            WritePcrelLabel(sb, text.Instructions[i], pc);
+            sb.Append("    ").AppendLine(WriteInstruction(text.Instructions[i], options, pc));
             pc = checked(pc + RVInstructionTable.GetEncodedSize(text.Instructions[i].Opcode));
         }
 
@@ -1297,10 +1377,10 @@ internal static class RiscVAssemblyWriter
             sb.Append(label).AppendLine(":");
     }
 
-    public static string WriteInstruction(RVInstruction instruction, RiscVAssemblyWriterOptions? options = null)
+    public static string WriteInstruction(RVInstruction instruction, RiscVAssemblyWriterOptions? options, int pc)
     {
         options ??= RiscVAssemblyWriterOptions.Default;
-        if (options.UsePseudoInstructions && TryWritePseudo(instruction, options, out var pseudo))
+        if (options.UsePseudoInstructions && TryWritePseudo(instruction, options, pc, out var pseudo))
             return pseudo;
 
         var metadata = RVInstructionTable.Get(instruction.Opcode);
@@ -1313,7 +1393,7 @@ internal static class RiscVAssemblyWriter
         var form = metadata.Form ?? throw new NotSupportedException($"Instruction {instruction.Opcode} has no encoding");
         if (form.HasCustomSyntax)
             return WriteCustomSyntax(mnemonic, instruction, options);
-        return WriteEncoded(mnemonic, form, instruction, options);
+        return WriteEncoded(mnemonic, form, instruction, options, pc);
     }
 
     private static string WriteCustomSyntax(string mnemonic, RVInstruction instruction, RiscVAssemblyWriterOptions options)
@@ -1331,7 +1411,7 @@ internal static class RiscVAssemblyWriter
         }
     }
 
-    private static bool TryWritePseudo(RVInstruction instruction, RiscVAssemblyWriterOptions options, out string text)
+    private static bool TryWritePseudo(RVInstruction instruction, RiscVAssemblyWriterOptions options, int pc, out string text)
     {
         if (instruction.Opcode == RVInstrKind.Addi && instruction.Rd == RVRegister.X0 && instruction.Rs1 == RVRegister.X0 && instruction.Immediate == 0)
         {
@@ -1350,7 +1430,7 @@ internal static class RiscVAssemblyWriter
         }
         if (instruction.Opcode == RVInstrKind.Jal && instruction.Rd == RVRegister.X0)
         {
-            text = "j " + ImmOrSymbol(instruction);
+            text = "j " + ImmOrSymbol(instruction, pc);
             return true;
         }
         text = string.Empty;
@@ -1366,7 +1446,7 @@ internal static class RiscVAssemblyWriter
         return $"{mnemonic} " + Reg(instruction.Rd, options) + ", " + Reg(instruction.Rs1, options) + ", " + Reg(instruction.Rs2, options);
     }
 
-    private static string WriteEncoded(string mnemonic, RVEncodedForm form, RVInstruction instruction, RiscVAssemblyWriterOptions options)
+    private static string WriteEncoded(string mnemonic, RVEncodedForm form, RVInstruction instruction, RiscVAssemblyWriterOptions options, int pc)
     {
         var parts = new List<string>();
         mnemonic += AtomicSuffix(instruction);
@@ -1381,7 +1461,7 @@ internal static class RiscVAssemblyWriter
 
             if (slot == "rm")
             {
-                if (instruction.Immediate != 7)
+                if (instruction.Immediate != DefaultRoundingMode(instruction.Opcode))
                     parts.Add(FormatRoundingMode(instruction.Immediate));
                 continue;
             }
@@ -1403,7 +1483,7 @@ internal static class RiscVAssemblyWriter
                 var baseName = inner == "#sp" ? Reg(RVRegister.X2, options) : Reg(EncodedRegister(inner, instruction), options);
                 parts.Add(head.Length == 0
                     ? "(" + baseName + ")"
-                    : ImmOrSymbol(instruction) + "(" + baseName + ")");
+                    : ImmOrSymbol(instruction, pc) + "(" + baseName + ")");
                 continue;
             }
 
@@ -1415,7 +1495,9 @@ internal static class RiscVAssemblyWriter
 
             if (slot.StartsWith("i:", StringComparison.Ordinal))
             {
-                parts.Add(ImmOrSymbol(instruction));
+                parts.Add(!instruction.HasSymbol && (slot == "i:imm20" || instruction.Opcode == RVInstrKind.CLui)
+                    ? "0x" + (instruction.Immediate & 0xFFFFF).ToString("x", CultureInfo.InvariantCulture)
+                    : ImmOrSymbol(instruction, pc));
                 continue;
             }
 
@@ -1434,6 +1516,10 @@ internal static class RiscVAssemblyWriter
         "f3" => instruction.Rs3,
         _ => throw new NotSupportedException("Unsupported RISC-V operand: " + slot),
     };
+
+    // Widening conversions are exact, so assemblers default their rounding mode to rne instead of dyn
+    internal static int DefaultRoundingMode(RVInstrKind opcode)
+        => opcode is RVInstrKind.FcvtDW or RVInstrKind.FcvtDWu or RVInstrKind.FcvtDS or RVInstrKind.FcvtSH or RVInstrKind.FcvtDH ? 0 : 7;
 
     private static string FormatRoundingMode(int mode) => mode switch
     {
@@ -1472,8 +1558,18 @@ internal static class RiscVAssemblyWriter
     private static string Reg(RVRegister register, RiscVAssemblyWriterOptions options)
         => RVRegisters.Format(register, options.UseAbiRegisterNames);
 
-    private static string ImmOrSymbol(RVInstruction instruction)
-        => instruction.HasSymbol ? instruction.Symbol! : instruction.Immediate.ToString();
+    private static string ImmOrSymbol(RVInstruction instruction, int pc)
+    {
+        if (!instruction.HasSymbol)
+            return instruction.Immediate.ToString();
+
+        return instruction.RelocationKind switch
+        {
+            RVRelocationKind.AbsoluteUpper20 => "%pcrel_hi(" + instruction.Symbol + ")",
+            RVRelocationKind.AbsoluteLow12 => "%pcrel_lo(" + PcrelLabel(pc - 4) + ")",
+            _ => instruction.Symbol!,
+        };
+    }
 
     private static string AtomicSuffix(RVInstruction instruction)
     {

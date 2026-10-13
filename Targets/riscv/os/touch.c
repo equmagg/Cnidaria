@@ -1,29 +1,29 @@
-int main(int argc, char** argv, char** envp)
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(int argc, char** argv)
 {
-    int index = 1;
+    int index;
     int status = 0;
-    (void)envp;
 
     if (argc < 2)
     {
-        report("touch", (const char*)NULL, "usage: touch file...");
+        fputs("touch: usage: touch file...\n", stderr);
         return 2;
     }
 
-    while (index < argc)
+    for (index = 1; index < argc; index++)
     {
         // A name that is already there is left as it is, which is what touch promises
-        s64 fd = sys_openat((s64)AT_FDCWD, argv[index], O_WRONLY | O_CREAT, 420ul);
-        if (fd < 0l)
+        int fd = open(argv[index], O_WRONLY | O_CREAT, 0644);
+        if (fd < 0)
         {
-            report("touch", argv[index], "cannot be created");
+            fprintf(stderr, "touch: %s: cannot be created\n", argv[index]);
             status = 1;
         }
         else
-        {
-            sys_close((int)fd);
-        }
-        index = index + 1;
+            close(fd);
     }
     return status;
 }

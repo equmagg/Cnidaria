@@ -984,11 +984,11 @@ namespace Cnidaria.Cs
     {
         public GenTreeMethod GenTreeMethod { get; }
         public ControlFlowGraph Cfg { get; }
-        public ImmutableArray<SsaSlotInfo> Slots { get; }
-        public ImmutableArray<SsaLocalDescriptor> SsaLocalDescriptors { get; }
+        public ImmutableArray<SsaSlotInfo> Slots { get; private set; }
+        public ImmutableArray<SsaLocalDescriptor> SsaLocalDescriptors { get; private set; }
         public ImmutableArray<SsaValueName> InitialValues { get; }
         public ImmutableArray<SsaMemoryValueName> InitialMemoryValues { get; }
-        public ImmutableArray<SsaValueDefinition> ValueDefinitions { get; }
+        public ImmutableArray<SsaValueDefinition> ValueDefinitions { get; private set; }
         public ImmutableArray<SsaMemoryDefinition> MemoryDefinitions { get; }
         public ImmutableArray<SsaBlock> Blocks { get; }
         public SsaValueNumberingResult? ValueNumbers { get; }
@@ -1015,6 +1015,43 @@ namespace Cnidaria.Cs
             MemoryDefinitions = memoryDefinitions.IsDefault ? ImmutableArray<SsaMemoryDefinition>.Empty : memoryDefinitions;
             Blocks = blocks.IsDefault ? ImmutableArray<SsaBlock>.Empty : blocks;
             ValueNumbers = valueNumbers;
+        }
+
+        // Lowering runs after SSA construction, so the temps it grabs enter SSA here with their only definition
+        internal SsaValueDefinition AddLoweringTemp(GenLocalDescriptor local, int defBlockId)
+        {
+            var slot = new SsaSlot(SsaSlotKind.Temp, local.Index, local.LclNum);
+            var descriptor = new SsaDescriptor(
+                slot,
+                SsaConfig.ReservedSsaNumber + 1,
+                SsaDefinitionKind.Store,
+                defBlockId,
+                defStatementIndex: -1,
+                defTreeId: -1,
+                defNode: null,
+                local.Type,
+                local.StackKind);
+            var definition = new SsaValueDefinition(descriptor);
+            Slots = Slots.Add(new SsaSlotInfo(
+                slot,
+                local.Type,
+                local.StackKind,
+                addressExposed: false,
+                category: GenLocalCategory.CompilerTemp,
+                lclNum: local.LclNum,
+                tracked: true,
+                inSsa: true,
+                localDescriptor: local));
+            SsaLocalDescriptors = SsaLocalDescriptors.Add(new SsaLocalDescriptor(
+                slot,
+                local.Type,
+                local.StackKind,
+                addressExposed: false,
+                isSsaPromoted: true,
+                local,
+                ImmutableArray.Create(descriptor)));
+            ValueDefinitions = ValueDefinitions.Add(definition);
+            return definition;
         }
 
         public bool TryGetSsaLocalDescriptor(SsaSlot slot, out SsaLocalDescriptor descriptor)

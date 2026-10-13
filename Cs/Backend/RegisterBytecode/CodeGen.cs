@@ -401,23 +401,19 @@ namespace Cnidaria.Cs
                     throw new PlatformNotSupportedException(
                         $"Extern method calls are not supported by the register-bytecode target: M{target.MethodId} '{target.Name}'.");
 
-                Op op = SelectCallOpForReturn(target, indirect: false, internalCall: target.HasInternalCall);
                 if (target.HasInternalCall)
                 {
-                    _asm.Emit(InstrDesc.Call(op, target.MethodId, flags | CallFlags.InternalCall));
+                    _asm.Emit(InstrDesc.Call(Op.CallInternal, target.MethodId, flags | CallFlags.InternalCall));
                     return;
                 }
 
                 if (!_methodEntryLabels.TryGetValue(target.MethodId, out Label label))
                     throw new InvalidOperationException($"Delegate target M{target.MethodId} is not present in the linked register image.");
-                _asm.CallDirect(op, label, flags);
+                _asm.CallDirect(label, flags);
             }
 
             private void EmitIndirectCallFor(RuntimeMethod invoke, MachineRegister target)
-            {
-                Op op = SelectCallOpForReturn(invoke, indirect: true, internalCall: false);
-                _asm.Emit(new InstrDesc(op, rs1: RegisterVmIsa.EncodeRegister(target), aux: Aux.Call(BuildCallFlagsForSignature(invoke))));
-            }
+                => _asm.Emit(new InstrDesc(Op.CallIndirect, rs1: RegisterVmIsa.EncodeRegister(target), aux: Aux.Call(BuildCallFlagsForSignature(invoke))));
 
             private void EmitReturnFor(RuntimeMethod method)
             {
@@ -446,39 +442,6 @@ namespace Cnidaria.Cs
                 }
 
                 _asm.RetValue(MachineRegisters.ReturnValue0, Math.Max(1, abi.Size));
-            }
-
-            private static Op SelectCallOpForReturn(RuntimeMethod method, bool indirect, bool internalCall)
-            {
-                var abi = MachineAbi.ClassifyValue(method.ReturnType, MachineAbi.StackKindForType(method.ReturnType), isReturn: true);
-                bool isVoid = abi.PassingKind == AbiValuePassingKind.Void || MachineAbi.RequiresHiddenReturnBuffer(method);
-                bool isValue = !isVoid && abi.PassingKind is AbiValuePassingKind.MultiRegister or AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect;
-                bool isFloat = !isVoid && !isValue && (abi.RegisterClass == RegisterClass.Float || method.ReturnType.Name is "Single" or "Double");
-                bool isRef = !isVoid && !isValue && (abi.ContainsGcPointers || method.ReturnType.IsReferenceType);
-
-                if (internalCall)
-                {
-                    if (isVoid) return Op.CallInternalVoid;
-                    if (isValue) return Op.CallInternalValue;
-                    if (isFloat) return Op.CallInternalF;
-                    if (isRef) return Op.CallInternalRef;
-                    return Op.CallInternalI;
-                }
-
-                if (indirect)
-                {
-                    if (isVoid) return Op.CallIndirectVoid;
-                    if (isValue) return Op.CallIndirectValue;
-                    if (isFloat) return Op.CallIndirectF;
-                    if (isRef) return Op.CallIndirectRef;
-                    return Op.CallIndirectI;
-                }
-
-                if (isVoid) return Op.CallVoid;
-                if (isValue) return Op.CallValue;
-                if (isFloat) return Op.CallF;
-                if (isRef) return Op.CallRef;
-                return Op.CallI;
             }
 
             private static CallFlags BuildCallFlagsForSignature(RuntimeMethod method)
@@ -1261,6 +1224,9 @@ namespace Cnidaria.Cs
                         return;
                     case GenTreeKind.NullCheck:
                         EmitExplicitNullCheck(instruction);
+                        return;
+                    case GenTreeKind.BoundsCheck:
+                        EmitBoundsCheck(instruction);
                         return;
                     case GenTreeKind.ArrayLength:
                     case GenTreeKind.ArrayElement:
@@ -2778,19 +2744,12 @@ namespace Cnidaria.Cs
                     EmitReferenceTypeNewObjectThisArgument(obj, method);
                     EmitKnownManagedCallPreamble(method);
                     EmitCallGcSafePoint(instruction);
-                    _asm.CallDirect(Op.CallVoid, ResolveDirectCallTarget(instruction, method), BuildCallFlags(method, Op.CallVoid));
+                    _asm.CallDirect(ResolveDirectCallTarget(instruction, method), BuildCallFlags(method, Op.Call));
                     return;
                 }
 
-                RegisterClass resultClass = RegisterClass.Invalid;
-                if (instruction.Results.Length == 1)
-                {
-                    resultClass = instruction.Results[0].RegisterClass;
-                }
-                else if (instruction.Results.Length > 1)
-                {
+                if (instruction.Results.Length > 1)
                     throw Unsupported(instruction, $"call-like instruction must have zero or one result, actual count: {instruction.Results.Length}");
-                }
                 if (instruction.TreeKind == GenTreeKind.Intrinsic)
                 {
                     if (!RuntimeIntrinsics.TryResolve(method, _method.Target, out RuntimeIntrinsicInfo intrinsic) || intrinsic.Id != source.IntrinsicId)
@@ -2799,43 +2758,24 @@ namespace Cnidaria.Cs
                     switch (intrinsic.Id)
                     {
                         case RuntimeIntrinsicId.InterlockedCompareExchange:
-                            {
-                                Op intrinsicOp = intrinsic.CompareExchange.IsReference ? Op.CallInternalRef : Op.CallInternalI;
-                                CallFlags intrinsicFlags = BuildCallFlags(method, intrinsicOp) & ~CallFlags.GcSafePoint;
-                                _asm.Emit(InstrDesc.Call(intrinsicOp, method.MethodId, intrinsicFlags));
-                                return;
-                            }
                         case RuntimeIntrinsicId.InterlockedExchangeAdd:
-                            {
-                                Op intrinsicOp = Op.CallInternalI;
-                                CallFlags intrinsicFlags = BuildCallFlags(method, intrinsicOp) & ~CallFlags.GcSafePoint;
-                                _asm.Emit(InstrDesc.Call(intrinsicOp, method.MethodId, intrinsicFlags));
-                                return;
-                            }
                         case RuntimeIntrinsicId.InterlockedExchange:
+                        case RuntimeIntrinsicId.MemoryBarrier:
                             {
-                                Op intrinsicOp = intrinsic.Exchange.IsReference ? Op.CallInternalRef : Op.CallInternalI;
-                                CallFlags intrinsicFlags = BuildCallFlags(method, intrinsicOp) & ~CallFlags.GcSafePoint;
-                                _asm.Emit(InstrDesc.Call(intrinsicOp, method.MethodId, intrinsicFlags));
+                                CallFlags intrinsicFlags = BuildCallFlags(method, Op.CallInternal) & ~CallFlags.GcSafePoint;
+                                _asm.Emit(InstrDesc.Call(Op.CallInternal, method.MethodId, intrinsicFlags));
                                 return;
                             }
                         case RuntimeIntrinsicId.VolatileRead:
                         case RuntimeIntrinsicId.VolatileWrite:
                             // The register VM runs one instruction at a time, so the ordering needs no instruction
                             return;
-                        case RuntimeIntrinsicId.MemoryBarrier:
-                            {
-                                Op intrinsicOp = Op.CallInternalVoid;
-                                CallFlags intrinsicFlags = BuildCallFlags(method, intrinsicOp) & ~CallFlags.GcSafePoint;
-                                _asm.Emit(InstrDesc.Call(intrinsicOp, method.MethodId, intrinsicFlags));
-                                return;
-                            }
                         default:
                             throw Unsupported(instruction, $"unsupported runtime intrinsic {intrinsic.Id}");
                     }
                 }
 
-                Op op = SelectCallOp(instruction.TreeKind, method, method.ReturnType, resultClass);
+                Op op = SelectCallOp(instruction.TreeKind, method);
                 CallFlags callFlags = BuildCallFlags(method, op);
                 if ((callFlags & CallFlags.HiddenReturnBuffer) != 0 && !hasHiddenReturnBufferOperand)
                     throw Unsupported(instruction, "hidden-return-buffer call has no materialized return buffer operand");
@@ -2859,14 +2799,14 @@ namespace Cnidaria.Cs
                                 aux: Aux.Instruction(InstructionFlags.MayThrow)));
                         }
 
-                        Op directOp = SelectCallOp(GenTreeKind.Call, method, method.ReturnType, resultClass);
+                        Op directOp = SelectCallOp(GenTreeKind.Call, method);
                         CallFlags directFlags = BuildCallFlags(method, directOp);
                         if ((directFlags & CallFlags.HiddenReturnBuffer) != 0 && !hasHiddenReturnBufferOperand)
                             throw Unsupported(instruction, "hidden-return-buffer call has no materialized return buffer operand");
                         if (hasHiddenReturnBufferOperand)
                             directFlags |= CallFlags.HiddenReturnBuffer;
 
-                        if (IsInternalCallOp(directOp))
+                        if (directOp == Op.CallInternal)
                         {
                             EmitKnownManagedCallPreamble(method);
                             EmitCallGcSafePoint(instruction);
@@ -2876,7 +2816,7 @@ namespace Cnidaria.Cs
 
                         EmitKnownManagedCallPreamble(method);
                         EmitCallGcSafePoint(instruction);
-                        _asm.CallDirect(directOp, ResolveDirectCallTarget(instruction, method), directFlags);
+                        _asm.CallDirect(ResolveDirectCallTarget(instruction, method), directFlags);
                         return;
                     }
 
@@ -2896,7 +2836,7 @@ namespace Cnidaria.Cs
                     return;
                 }
 
-                if (IsInternalCallOp(op))
+                if (op == Op.CallInternal)
                 {
                     EmitKnownManagedCallPreamble(method);
                     EmitCallGcSafePoint(instruction);
@@ -2909,13 +2849,13 @@ namespace Cnidaria.Cs
                     if (hasHiddenReturnBufferOperand)
                         callFlags |= CallFlags.HiddenReturnBuffer;
                     EmitCallGcSafePoint(instruction);
-                    _asm.CallDirect(op, _state.DelegateInvokeStubLabel(method), callFlags);
+                    _asm.CallDirect(_state.DelegateInvokeStubLabel(method), callFlags);
                     return;
                 }
 
                 EmitKnownManagedCallPreamble(method);
                 EmitCallGcSafePoint(instruction);
-                _asm.CallDirect(op, ResolveDirectCallTarget(instruction, method), (CallFlags)aux);
+                _asm.CallDirect(ResolveDirectCallTarget(instruction, method), (CallFlags)aux);
             }
 
             private void EmitIndirectFunctionPointerCall(GenTree instruction, GenTree source)
@@ -2937,27 +2877,10 @@ namespace Cnidaria.Cs
                 if (targetIndex < 0)
                     throw Unsupported(instruction, "indirect call has no target operand");
 
-                RegisterClass resultClass = instruction.Results.Length == 1
-                    ? instruction.Results[0].RegisterClass
-                    : RegisterClass.Invalid;
                 if (instruction.Results.Length > 1)
                     throw Unsupported(instruction, "indirect call has multiple result operands");
 
                 AbiValueInfo returnAbi = MachineAbi.ClassifyValue(source.Type, source.StackKind, isReturn: true, target: _method.Target);
-                bool isVoid = returnAbi.PassingKind == AbiValuePassingKind.Void;
-                bool isValue = returnAbi.PassingKind is AbiValuePassingKind.MultiRegister or AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect;
-                bool isFloat = !isValue && (returnAbi.RegisterClass == RegisterClass.Float || resultClass == RegisterClass.Float);
-                bool isRef = !isValue && (returnAbi.ContainsGcPointers || source.Type?.IsReferenceType == true);
-                Op op = isVoid
-                    ? Op.CallIndirectVoid
-                    : isValue
-                        ? Op.CallIndirectValue
-                        : isFloat
-                            ? Op.CallIndirectF
-                            : isRef
-                                ? Op.CallIndirectRef
-                                : Op.CallIndirectI;
-
                 CallFlags flags = CallFlags.GcSafePoint | CallFlags.MayThrow;
                 bool hasHiddenReturnBuffer = HasHiddenReturnBufferOperand(instruction);
                 if (returnAbi.PassingKind == AbiValuePassingKind.Indirect && !hasHiddenReturnBuffer)
@@ -2967,7 +2890,7 @@ namespace Cnidaria.Cs
 
                 EmitCallGcSafePoint(instruction);
                 _asm.Emit(new InstrDesc(
-                    op,
+                    Op.CallIndirect,
                     rs1: RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, targetIndex)),
                     aux: Aux.Call(flags)));
             }
@@ -3459,6 +3382,18 @@ namespace Cnidaria.Cs
                     Op.NullCheck,
                     rd: register,
                     rs1: register,
+                    aux: Aux.Instruction(InstructionFlags.MayThrow)));
+            }
+
+            private void EmitBoundsCheck(GenTree instruction)
+            {
+                if (instruction.Uses.Length != 2 || instruction.Results.Length != 0 || !instruction.Uses[0].IsRegister || !instruction.Uses[1].IsRegister)
+                    throw Unsupported(instruction, "Bounds check requires index and length registers and no result");
+
+                _asm.Emit(new InstrDesc(
+                    Op.BoundsCheck,
+                    rs1: RegisterVmIsa.EncodeRegister(instruction.Uses[0].Register),
+                    rs2: RegisterVmIsa.EncodeRegister(instruction.Uses[1].Register),
                     aux: Aux.Instruction(InstructionFlags.MayThrow)));
             }
 
@@ -5023,54 +4958,13 @@ namespace Cnidaria.Cs
                 return MethodRecord.NoStaticConstructorTypeLayout;
             }
 
-            private static bool IsInternalCallOp(Op op)
-                => op is Op.CallInternalVoid or Op.CallInternalI or Op.CallInternalF or Op.CallInternalRef or Op.CallInternalValue;
-
-            private static Op SelectCallOp(GenTreeKind treeKind, RuntimeMethod method, RuntimeType returnType, RegisterClass resultClass)
-            {
-                var returnKind = MachineAbi.StackKindForType(returnType);
-                var returnAbi = MachineAbi.ClassifyValue(returnType, returnKind, isReturn: true);
-                bool isVoid = returnAbi.PassingKind == AbiValuePassingKind.Void;
-                bool isValue = returnAbi.PassingKind is AbiValuePassingKind.MultiRegister or AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect;
-                bool isFloat = !isValue && (returnAbi.RegisterClass == RegisterClass.Float || resultClass == RegisterClass.Float || returnType.Name is "Single" or "Double");
-                bool isRef = !isValue && (returnAbi.ContainsGcPointers || returnType.IsReferenceType);
-                bool internalCall = method.HasInternalCall;
-                bool delegateInvoke = treeKind == GenTreeKind.DelegateInvoke;
-                bool virt = treeKind == GenTreeKind.VirtualCall;
-
-                if (delegateInvoke)
+            private static Op SelectCallOp(GenTreeKind treeKind, RuntimeMethod method)
+                => treeKind switch
                 {
-                    if (isVoid) return Op.CallVoid;
-                    if (isValue) return Op.CallValue;
-                    if (isFloat) return Op.CallF;
-                    if (isRef) return Op.CallRef;
-                    return Op.CallI;
-                }
-
-                if (virt)
-                {
-                    if (isVoid) return Op.CallIndirectVoid;
-                    if (isValue) return Op.CallIndirectValue;
-                    if (isFloat) return Op.CallIndirectF;
-                    if (isRef) return Op.CallIndirectRef;
-                    return Op.CallIndirectI;
-                }
-
-                if (internalCall)
-                {
-                    if (isVoid) return Op.CallInternalVoid;
-                    if (isValue) return Op.CallInternalValue;
-                    if (isFloat) return Op.CallInternalF;
-                    if (isRef) return Op.CallInternalRef;
-                    return Op.CallInternalI;
-                }
-
-                if (isVoid) return Op.CallVoid;
-                if (isValue) return Op.CallValue;
-                if (isFloat) return Op.CallF;
-                if (isRef) return Op.CallRef;
-                return Op.CallI;
-            }
+                    GenTreeKind.DelegateInvoke => Op.Call,
+                    GenTreeKind.VirtualCall => Op.CallIndirect,
+                    _ => method.HasInternalCall ? Op.CallInternal : Op.Call,
+                };
 
             private static bool IsScalarValueType(RuntimeType type)
             {
@@ -5099,10 +4993,9 @@ namespace Cnidaria.Cs
             private static CallFlags BuildCallFlags(RuntimeMethod method, Op op)
             {
                 var flags = CallFlags.GcSafePoint | CallFlags.MayThrow;
-                if (method.HasInternalCall || op is Op.CallInternalVoid or Op.CallInternalI or Op.CallInternalF or Op.CallInternalRef or Op.CallInternalValue)
+                if (method.HasInternalCall || op == Op.CallInternal)
                     flags |= CallFlags.InternalCall;
-                if ((op is Op.CallValue or Op.CallInternalValue or Op.CallIndirectValue) &&
-                    MachineAbi.RequiresHiddenReturnBuffer(method))
+                if (MachineAbi.RequiresHiddenReturnBuffer(method))
                     flags |= CallFlags.HiddenReturnBuffer;
                 return flags;
             }

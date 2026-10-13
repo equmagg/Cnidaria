@@ -16,6 +16,8 @@ public sealed class RiscVCodeGeneratorOptions
 
     public bool EmitStartup { get; set; } = true;
     public string EntryFunctionName { get; set; } = "main";
+    /// <summary>Starts the program through the C library's __libc_start_main, so returning from main runs exit</summary>
+    public bool CLibraryStartup { get; set; }
 }
 
 public sealed class RiscVCodeGenerator
@@ -254,8 +256,39 @@ public sealed class RiscVCodeGenerator
     private bool IsLinuxExecutableTarget
         => _target.OperatingSystem == OperatingSystemKind.Linux && _target.IsRiscV;
 
+    private const string LibcStartMain = "__libc_start_main";
+
     private string EmitLinuxRuntime(string userEntryLabel)
-        => EmitLinuxStart(userEntryLabel);
+        => _options.CLibraryStartup ? EmitLinuxCLibraryStart(userEntryLabel) : EmitLinuxStart(userEntryLabel);
+
+    // The sequence glibc's crt1 runs: __libc_start_main(main, argc, argv, init, fini, rtld_fini, stack_end)
+    private string EmitLinuxCLibraryStart(string userEntryLabel)
+    {
+        if (string.IsNullOrEmpty(userEntryLabel))
+            throw new InvalidOperationException("A C library entry sequence needs an entry function.");
+
+        var label = CreateUniqueGlobalLabel("_start");
+        var startOffset = _text.ByteLength;
+        _text.DefineLabel(label);
+        Emit(RVInstruction.I(_machineTarget.Is64Bit ? RVInstrKind.Ld : RVInstrKind.Lw, RVRegister.X11, RVRegister.X2, 0));
+        Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X12, RVRegister.X2, _target.PointerSize));
+        Emit(RVInstruction.I(RVInstrKind.Andi, RVRegister.X2, RVRegister.X2, -16));
+        var hiOffset = _text.ByteLength;
+        Emit(new RVInstruction(RVInstrKind.Auipc, RVRegister.X10, symbol: userEntryLabel, relocationKind: RVRelocationKind.AbsoluteUpper20));
+        _text.AddRelocation(hiOffset, userEntryLabel, 0, RVObjectRelocationKind.PcrelHi20);
+        var loOffset = _text.ByteLength;
+        Emit(new RVInstruction(RVInstrKind.Addi, RVRegister.X10, RVRegister.X10, RVRegister.Invalid, 0, userEntryLabel, RVRelocationKind.AbsoluteLow12));
+        _text.AddRelocation(loOffset, userEntryLabel, 0, RVObjectRelocationKind.PcrelLo12I);
+        Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X13, RVRegister.X0, 0));
+        Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X14, RVRegister.X0, 0));
+        Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X15, RVRegister.X0, 0));
+        Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X16, RVRegister.X2, 0));
+        EmitCall(LibcStartMain);
+        Emit(new RVInstruction(RVInstrKind.Ebreak));
+
+        _symbols.Add(new RVObjectSymbol(label, TextSectionName, startOffset, _text.ByteLength - startOffset, RVObjectSymbolBinding.Global, RVObjectSymbolKind.Function));
+        return label;
+    }
 
     private string EmitLinuxStart(string userEntryLabel)
     {
@@ -638,13 +671,17 @@ public sealed class RiscVCodeGenerator
         var blockLabels = new Dictionary<LirBlock, string>();
         foreach (var block in function.Blocks)
             blockLabels.Add(block, CreateLocalLabel($"{label}_{block.Name}"));
+        var jumpOnlyBlocks = allocation.FindJumpOnlyBlocks();
+        foreach (var pair in jumpOnlyBlocks)
+            blockLabels[pair.Key] = blockLabels[pair.Value];
 
-        var context = new FunctionEmissionContext(this, function, allocation, allocationOptions, label, blockLabels, scratchGroups);
+        var context = new FunctionEmissionContext(this, function, allocation, allocationOptions, label, blockLabels, jumpOnlyBlocks, scratchGroups);
         var startOffset = _text.ByteLength;
         _text.DefineLabel(label);
         context.EmitPrologue();
         context.EmitBlocks();
-        context.EmitTrap();
+        if (!_text.EndsWithoutFallthrough)
+            context.EmitTrap();
         var size = _text.ByteLength - startOffset;
         var binding = _fileScopeLinkage.IsInternal(function.Symbol) ? RVObjectSymbolBinding.Local : RVObjectSymbolBinding.Global;
         _symbols.Add(new RVObjectSymbol(label, TextSectionName, startOffset, size, binding, RVObjectSymbolKind.Function));
@@ -712,6 +749,54 @@ public sealed class RiscVCodeGenerator
         return sb.ToString();
     }
 
+    // Mirrors the immediate forms below: true when the emitter would load this constant into a register every time
+    internal static bool NeedsRegisterForConstant(TargetInfo target, LirInstructionKind kind, string? op, ImmutableArray<LirOperand> operands, int index)
+    {
+        var constant = operands[index];
+        if (constant.Kind != LirOperandKind.Immediate || constant.Immediate is string)
+            return false;
+        if (IsFloatType(constant.Type))
+        {
+            return CAbi.UsesHardwareFloatingRegister(target, constant.Type, isVariadicUnnamedArgument: false) &&
+                kind is LirInstructionKind.Binary or LirInstructionKind.Branch or LirInstructionKind.Store;
+        }
+
+        // A value wider than a register already lives in memory, where a hoisted copy saves nothing
+        if (!IsIntegerLike(constant.Type) && !IsPointerLike(constant.Type) || target.SizeOf(constant.Type) > target.PointerSize)
+            return false;
+
+        var value = ConvertIntegerConstant(constant.Immediate);
+        if (target.Is64Bit && target.SizeOf(constant.Type) == 4)
+            value = (int)value;
+        if (value == 0)
+            return false;
+
+        switch (kind)
+        {
+            case LirInstructionKind.Store:
+                return index == 0;
+            case LirInstructionKind.Branch:
+                return operands.Length == 2;
+            case LirInstructionKind.Binary:
+                return op switch
+                {
+                    "*" => index == 0 || (value & (value - 1)) != 0 || value < 0,
+                    "/" or "%" => false,
+                    "<<" or ">>" => index == 0,
+                    "-" => index == 0 || !FitsImmediate12(-value),
+                    "+" or "&" or "|" or "^" or "==" or "!=" => !FitsImmediate12(value),
+                    "<" or ">=" => !FitsImmediate12(index == 1 ? value : value + 1),
+                    "<=" or ">" => !FitsImmediate12(index == 1 ? value + 1 : value),
+                    _ => false,
+                };
+            default:
+                return false;
+        }
+
+        static bool FitsImmediate12(long value)
+            => value is >= -2048 and <= 2047;
+    }
+
     private static long ConvertIntegerConstant(object? value)
     {
         return value switch
@@ -730,20 +815,6 @@ public sealed class RiscVCodeGenerator
             char c => c,
             _ => Convert.ToInt64(value, CultureInfo.InvariantCulture),
         };
-    }
-
-    private static bool IsSignedIntegerType(QualifiedType type)
-    {
-        if (type.Type is EnumType)
-            return true;
-        return type.Type is BuiltinType builtin && builtin.BuiltinKind is BuiltinTypeKind.SignedChar or BuiltinTypeKind.Short
-            or BuiltinTypeKind.Int or BuiltinTypeKind.Long or BuiltinTypeKind.LongLong;
-    }
-
-    private static bool IsUnsignedIntegerType(QualifiedType type)
-    {
-        return type.Type is BuiltinType builtin && builtin.BuiltinKind is BuiltinTypeKind.Bool or BuiltinTypeKind.Char or BuiltinTypeKind.UnsignedChar
-            or BuiltinTypeKind.UnsignedShort or BuiltinTypeKind.UnsignedInt or BuiltinTypeKind.UnsignedLong or BuiltinTypeKind.UnsignedLongLong;
     }
 
     private static bool IsIntegerLike(QualifiedType type)
@@ -853,6 +924,7 @@ public sealed class RiscVCodeGenerator
         private readonly int _vectorScratchGroups;
         private readonly string _functionLabel;
         private readonly IReadOnlyDictionary<LirBlock, string> _labels;
+        private readonly IReadOnlyDictionary<LirBlock, LirBlock> _jumpOnlyBlocks;
         private readonly Dictionary<LirBlock, LirSelectDiamond> _selectDiamonds = new();
         private readonly HashSet<LirBlock> _foldedSelectArms = new();
         private readonly HashSet<LirVirtualRegister> _narrowStoreOnlyValues = new();
@@ -925,6 +997,7 @@ public sealed class RiscVCodeGenerator
             LSRAOptions allocationOptions,
             string functionLabel,
             IReadOnlyDictionary<LirBlock, string> labels,
+            IReadOnlyDictionary<LirBlock, LirBlock> jumpOnlyBlocks,
             int vectorScratchGroups)
         {
             _owner = owner ?? throw new ArgumentNullException(nameof(owner));
@@ -935,6 +1008,7 @@ public sealed class RiscVCodeGenerator
             _vectorScratchGroups = vectorScratchGroups;
             _functionLabel = functionLabel ?? string.Empty;
             _labels = labels ?? throw new ArgumentNullException(nameof(labels));
+            _jumpOnlyBlocks = jumpOnlyBlocks;
             _hasCalls = function.Blocks.SelectMany(static b => b.Instructions).Any(static i =>
                 i.Kind == LirInstructionKind.InlineAssembly ||
                 i.Kind == LirInstructionKind.Call && !IsRiscVVectorIntrinsicCall(i));
@@ -973,9 +1047,13 @@ public sealed class RiscVCodeGenerator
             for (var blockIndex = 0; blockIndex < _function.Blocks.Length; blockIndex++)
             {
                 var block = _function.Blocks[blockIndex];
-                _fallthroughBlock = blockIndex + 1 < _function.Blocks.Length
-                    ? _function.Blocks[blockIndex + 1]
-                    : null;
+                if (_jumpOnlyBlocks.ContainsKey(block))
+                {
+                    _currentInstructionPosition += block.Instructions.Length * 2;
+                    continue;
+                }
+
+                _fallthroughBlock = NextEmittedBlock(blockIndex);
                 ClearIntegerRepresentationFacts();
                 _currentBlock = block;
                 _currentBlockIndex = blockIndex;
@@ -1115,16 +1193,27 @@ public sealed class RiscVCodeGenerator
                 return false;
             }
 
-            var condition = EmitSelectCondition(instruction);
-            var destination = GetWritableRegister(diamond.Destination, GpScratch0);
+            MachineRegister destination;
+            if (TryGetMinMaxOpcode(instruction, diamond, out var minMax))
+            {
+                destination = GetWritableRegister(diamond.Destination, GpScratch0);
+                var left = LoadOperand(instruction.Operands[0], GpScratch1);
+                var right = LoadOperand(instruction.Operands[1], GpScratch2);
+                Emit(RVInstruction.R(minMax, ToRegister(destination), ToRegister(left), ToRegister(right)));
+            }
+            else
+            {
+                var condition = EmitSelectCondition(instruction);
+                destination = GetWritableRegister(diamond.Destination, GpScratch0);
 
-            var trueValue = LoadOperand(diamond.TrueValue, GpScratch1);
-            Emit(RVInstruction.R(RVInstrKind.CzeroEqz, ToRegister(GpScratch1), ToRegister(trueValue), ToRegister(condition)));
-            var falseValue = LoadOperand(diamond.FalseValue, GpScratch2);
-            Emit(RVInstruction.R(RVInstrKind.CzeroNez, ToRegister(GpScratch2), ToRegister(falseValue), ToRegister(condition)));
-            Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(destination), ToRegister(GpScratch1), ToRegister(GpScratch2)));
+                var trueValue = LoadOperand(diamond.TrueValue, GpScratch1);
+                Emit(RVInstruction.R(RVInstrKind.CzeroEqz, ToRegister(GpScratch1), ToRegister(trueValue), ToRegister(condition)));
+                var falseValue = LoadOperand(diamond.FalseValue, GpScratch2);
+                Emit(RVInstruction.R(RVInstrKind.CzeroNez, ToRegister(GpScratch2), ToRegister(falseValue), ToRegister(condition)));
+                Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(destination), ToRegister(GpScratch1), ToRegister(GpScratch2)));
+                SetIntegerRepresentation(destination, IntegerRepresentationFact.Unknown);
+            }
 
-            SetIntegerRepresentation(destination, IntegerRepresentationFact.Unknown);
             NormalizeIntegerRegister(destination, diamond.Destination.Type);
             StoreWritableRegisterIfSpilled(diamond.Destination, destination);
             if (!FallsThroughToJoin(diamond.Join))
@@ -1132,11 +1221,42 @@ public sealed class RiscVCodeGenerator
             return true;
         }
 
+        private bool TryGetMinMaxOpcode(LirInstruction branch, LirSelectDiamond diamond, out RVInstrKind opcode)
+        {
+            opcode = default;
+            if (!_owner._machineTarget.HasB || branch.Operands.Length != 2 || branch.Operator is not ("<" or "<=" or ">" or ">="))
+                return false;
+
+            var left = branch.Operands[0];
+            var right = branch.Operands[1];
+            if ((!IsIntegerLike(left.Type) && !IsPointerLike(left.Type)) || SizeOf(left.Type) > _owner._target.RegisterSize ||
+                (!IsIntegerLike(right.Type) && !IsPointerLike(right.Type)) || SizeOf(right.Type) > _owner._target.RegisterSize)
+                return false;
+
+            bool takesLeft;
+            if (SameOperand(diamond.TrueValue, left) && SameOperand(diamond.FalseValue, right))
+                takesLeft = true;
+            else if (SameOperand(diamond.TrueValue, right) && SameOperand(diamond.FalseValue, left))
+                takesLeft = false;
+            else
+                return false;
+
+            var minimum = (branch.Operator is "<" or "<=") == takesLeft;
+            var signed = IsSignedIntegerType(left.Type) || IsSignedIntegerType(right.Type);
+            opcode = minimum ? (signed ? RVInstrKind.Min : RVInstrKind.Minu) : (signed ? RVInstrKind.Max : RVInstrKind.Maxu);
+            return true;
+        }
+
+        private bool SameOperand(LirOperand left, LirOperand right)
+            => left.Kind == LirOperandKind.Register
+                ? right.Kind == LirOperandKind.Register && ReferenceEquals(left.Register, right.Register)
+                : IsIntegerImmediate(left) && IsIntegerImmediate(right) && CanonicalImmediate(left) == CanonicalImmediate(right);
+
         // czero reads the whole register, so the condition only has to be zero or non-zero
         private MachineRegister EmitSelectCondition(LirInstruction branch)
         {
             if (branch.Operands.Length == 1)
-                return LoadIntegerBranchOperand(branch.Operands[0], GpScratch3);
+                return LoadIntegerSourceOperand(branch.Operands[0], GpScratch3);
 
             var left = LoadOperand(branch.Operands[0], GpScratch1);
             var right = LoadOperand(branch.Operands[1], GpScratch2);
@@ -1157,17 +1277,32 @@ public sealed class RiscVCodeGenerator
         // The folded arms emit nothing, so the join is still reached by falling off the end of this block
         private bool FallsThroughToJoin(LirBlock join)
         {
+            join = JumpTarget(join);
             for (var index = _currentBlockIndex + 1; index < _function.Blocks.Length; index++)
             {
                 var block = _function.Blocks[index];
                 if (ReferenceEquals(block, join))
                     return true;
-                if (!_foldedSelectArms.Contains(block))
+                if (!_foldedSelectArms.Contains(block) && !_jumpOnlyBlocks.ContainsKey(block))
                     return false;
             }
 
             return false;
         }
+
+        private LirBlock? NextEmittedBlock(int blockIndex)
+        {
+            for (var index = blockIndex + 1; index < _function.Blocks.Length; index++)
+            {
+                if (!_jumpOnlyBlocks.ContainsKey(_function.Blocks[index]))
+                    return _function.Blocks[index];
+            }
+
+            return null;
+        }
+
+        private LirBlock JumpTarget(LirBlock block)
+            => _jumpOnlyBlocks.TryGetValue(block, out var target) ? target : block;
 
         public void EmitTrap()
             => Emit(new RVInstruction(RVInstrKind.Ebreak));
@@ -1798,7 +1933,7 @@ public sealed class RiscVCodeGenerator
         {
             if (move.UsesTemp)
             {
-                LoadFromMemory(move.Destination, FrameBase, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(move.Type), IsSignedIntegerType(move.Type));
+                LoadFromMemory(move.Destination, FrameBase, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(move.Type), IsCanonicallySignExtended(move.Type));
                 NormalizeScalarRegister(move.Destination, move.Type);
                 return;
             }
@@ -1866,7 +2001,7 @@ public sealed class RiscVCodeGenerator
                 EmitRiscVAsmParallelRegisterMoves(moves, instruction);
                 foreach (var move in tempConsumers)
                 {
-                    LoadFromMemory(move.Destination, FrameBase, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(move.Type), IsSignedIntegerType(move.Type));
+                    LoadFromMemory(move.Destination, FrameBase, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(move.Type), IsCanonicallySignExtended(move.Type));
                     NormalizeScalarRegister(move.Destination, move.Type);
                 }
             }
@@ -2071,13 +2206,13 @@ public sealed class RiscVCodeGenerator
             if (scalarLocation.Kind == AbiLocationKind.Register)
             {
                 if (!IsFloatRegister(scalarLocation.Register) && !IsVectorRegister(scalarLocation.Register))
-                    SetIntegerRepresentation(scalarLocation.Register, AbiScalarRepresentation(type));
+                    SetIntegerRepresentation(scalarLocation.Register, CanonicalIntegerRepresentation(type));
                 MoveRegister(destination, scalarLocation.Register, VectorGroupOf(type));
             }
             else if (scalarLocation.Kind == AbiLocationKind.Stack)
             {
                 LoadFromMemory(destination, FrameBase, IncomingStackOffset(
-                    scalarLocation.StackByteOffset(_allocationOptions.StackArgumentSlotSize)), SizeOfRegisterType(type), IsSignedIntegerType(type));
+                    scalarLocation.StackByteOffset(_allocationOptions.StackArgumentSlotSize)), SizeOfRegisterType(type), IsCanonicallySignExtended(type));
             }
             else
             {
@@ -2189,7 +2324,8 @@ public sealed class RiscVCodeGenerator
                     MoveRegister(dst, src);
                     break;
                 case "-":
-                    Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(dst), RVRegister.X0, ToRegister(src)));
+                    var wordOp = _owner._target.Is64Bit && SizeOf(instruction.Operands[0].Type) <= 4;
+                    Emit(RVInstruction.R(wordOp ? RVInstrKind.Subw : RVInstrKind.Sub, ToRegister(dst), RVRegister.X0, ToRegister(src)));
                     break;
                 case "~":
                     EmitImm(RVInstrKind.Xori, dst, src, -1);
@@ -2854,9 +2990,7 @@ public sealed class RiscVCodeGenerator
                 }
                 else
                 {
-                    var index = LoadOperand(instruction.Operands[1], GpScratch2);
-                    var scaled = ScaleIndex(GpScratch2, index, PointerScale(lhsType), GpScratch3);
-                    Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(dst), ToRegister(ptr), ToRegister(scaled)));
+                    EmitAddScaledIndex(dst, ptr, instruction.Operands[1], PointerScale(lhsType), GpScratch2, GpScratch3);
                 }
                 StoreWritableRegisterIfSpilled(instruction.Result, dst);
                 return true;
@@ -2872,9 +3006,7 @@ public sealed class RiscVCodeGenerator
                 }
                 else
                 {
-                    var index = LoadOperand(instruction.Operands[0], GpScratch2);
-                    var scaled = ScaleIndex(GpScratch2, index, PointerScale(rhsType), GpScratch3);
-                    Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(dst), ToRegister(ptr), ToRegister(scaled)));
+                    EmitAddScaledIndex(dst, ptr, instruction.Operands[0], PointerScale(rhsType), GpScratch2, GpScratch3);
                 }
                 StoreWritableRegisterIfSpilled(instruction.Result, dst);
                 return true;
@@ -2890,7 +3022,7 @@ public sealed class RiscVCodeGenerator
                 }
                 else
                 {
-                    var index = LoadOperand(instruction.Operands[1], GpScratch2);
+                    var index = LoadPointerIndex(instruction.Operands[1], GpScratch2);
                     var scaled = ScaleIndex(GpScratch2, index, PointerScale(lhsType), GpScratch3);
                     Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(dst), ToRegister(ptr), ToRegister(scaled)));
                 }
@@ -2964,8 +3096,8 @@ public sealed class RiscVCodeGenerator
             if (TryEmitIntegerBinaryImmediate(instruction, dst))
                 return;
 
-            var left = LoadOperand(instruction.Operands[0], GpScratch1);
-            var right = LoadOperand(instruction.Operands[1], GpScratch2);
+            var left = LoadIntegerSourceOperand(instruction.Operands[0], GpScratch1);
+            var right = LoadIntegerSourceOperand(instruction.Operands[1], GpScratch2);
             EmitIntegerBinaryRegisters(instruction, dst, left, right);
         }
 
@@ -3046,13 +3178,13 @@ public sealed class RiscVCodeGenerator
                     return true;
                 case "==":
                 case "!=":
-                    if (!TryGetSignedImmediate12(rightOperand, _owner._target.RegisterSize * 8, out var equalityImmediate))
+                    if (!TryGetCanonicalImmediate12(rightOperand, out var equalityImmediate))
                         return false;
                     EmitEqualityImmediate(dst, LoadOperand(leftOperand, GpScratch1), equalityImmediate, op == "==");
                     return true;
                 case "<":
                 case ">=":
-                    if (!TryGetSignedImmediate12(rightOperand, _owner._target.RegisterSize * 8, out var relationImmediate))
+                    if (!TryGetCanonicalImmediate12(rightOperand, out var relationImmediate))
                         return false;
                     EmitImm(signed ? RVInstrKind.Slti : RVInstrKind.Sltiu, dst, LoadOperand(leftOperand, GpScratch1), relationImmediate);
                     if (op == ">=")
@@ -3060,7 +3192,7 @@ public sealed class RiscVCodeGenerator
                     return true;
                 case "<=":
                 case ">":
-                    if (!TryGetSignedImmediate12(rightOperand, _owner._target.RegisterSize * 8, out var boundImmediate)
+                    if (!TryGetCanonicalImmediate12(rightOperand, out var boundImmediate)
                         || !TryGetComparisonSuccessorImmediate(boundImmediate, signed, out var successorImmediate))
                         return false;
                     EmitImm(signed ? RVInstrKind.Slti : RVInstrKind.Sltiu, dst, LoadOperand(leftOperand, GpScratch1), successorImmediate);
@@ -3086,6 +3218,8 @@ public sealed class RiscVCodeGenerator
             var bits = wordOp ? 32 : _owner._target.RegisterSize * 8;
 
             var dividend = LoadOperand(leftOperand, GpScratch1);
+            if (wordOp)
+                dividend = ExtendOperandToWidth(dividend, instruction.Operands[0].Type, 64, GpScratch1);
             if (dividend != GpScratch1)
             {
                 Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(GpScratch1), ToRegister(dividend), RVRegister.X0));
@@ -3096,7 +3230,7 @@ public sealed class RiscVCodeGenerator
             LoadImmediate(GpScratch3, magic.Multiplier);
             if (wordOp)
             {
-                // Both halves already sit widened in a full register, so one 64-bit multiply holds the product
+                // Both halves sit widened by their signedness in a full register, so one 64-bit multiply holds the product
                 Emit(RVInstruction.R(RVInstrKind.Mul, ToRegister(quotient), ToRegister(dividend), ToRegister(GpScratch3)));
                 EmitShiftImmediate(signed ? RVInstrKind.Srai : RVInstrKind.Srli, quotient, quotient, 32);
             }
@@ -3383,6 +3517,7 @@ public sealed class RiscVCodeGenerator
 
             var dst = GetWritableRegister(instruction.Result, GpScratch0);
             var src = LoadOperand(instruction.Operands[0], GpScratch1);
+            src = ExtendOperandToWidth(src, instruction.Operands[0].Type, SizeOfRegisterType(instruction.Result.Type) * 8, dst);
             MoveRegister(dst, src);
             NormalizeResultRegister(dst, instruction.Result);
             StoreWritableRegisterIfSpilled(instruction.Result, dst);
@@ -3532,7 +3667,7 @@ public sealed class RiscVCodeGenerator
 
             var dst = GetWritableRegister(instruction.Result, PreferredScratch(instruction.Result.Type, GpScratch0, FpScratch0, VecScratch0));
             var address = BuildAddress(instruction.Address, GpScratch1, GpScratch2);
-            LoadFromMemory(dst, address.BaseRegister, address.Offset, SizeOfRegisterType(instruction.Result.Type), IsSignedIntegerType(instruction.Result.Type));
+            LoadFromMemory(dst, address.BaseRegister, address.Offset, SizeOfRegisterType(instruction.Result.Type), IsCanonicallySignExtended(instruction.Result.Type));
             NormalizeScalarRegister(dst, instruction.Result.Type);
             StoreWritableRegisterIfSpilled(instruction.Result, dst);
         }
@@ -3571,9 +3706,11 @@ public sealed class RiscVCodeGenerator
 
             var storeSize = Math.Min(SizeOfRegisterType(storeType), SizeOf(storeType));
             var scratch = PreferredScratch(storeType, GpScratch0, FpScratch0, VecScratch0);
-            var src = TryLoadOperandForStore(instruction.Operands[0], storeType, storeSize, scratch, out var narrowed)
-                ? narrowed
-                : LoadOperandAs(instruction.Operands[0], storeType, scratch, instruction);
+            var src = IsZeroIntegerImmediate(instruction.Operands[0]) && !IsFloatType(storeType) && !IsRiscVVectorType(storeType)
+                ? MachineRegister.X0
+                : TryLoadOperandForStore(instruction.Operands[0], storeType, storeSize, scratch, out var narrowed)
+                    ? narrowed
+                    : LoadOperandAs(instruction.Operands[0], storeType, scratch, instruction);
             var address = BuildAddress(instruction.Address, GpScratch1, GpScratch2);
             StoreToMemory(src, address.BaseRegister, address.Offset, storeSize);
         }
@@ -3668,7 +3805,7 @@ public sealed class RiscVCodeGenerator
                 }
 
                 var size = Math.Min(SizeOfRegisterType(preservation.Register.Type), SizeOf(preservation.Register.Type));
-                LoadFromMemory(preservation.PhysicalRegister, FrameBase, preservation.StackOffset, size, IsSignedIntegerType(preservation.Register.Type));
+                LoadFromMemory(preservation.PhysicalRegister, FrameBase, preservation.StackOffset, size, IsCanonicallySignExtended(preservation.Register.Type));
                 NormalizeScalarRegister(preservation.PhysicalRegister, preservation.Register.Type);
             }
         }
@@ -4782,39 +4919,11 @@ public sealed class RiscVCodeGenerator
             var scalarLoc = CAbi.AssignArgumentLocation(value, ref cursor, _allocationOptions.StackArgumentSlotSize);
             var segmentClass = value.Segments.Length != 0 ? value.Segments[0].RegisterClass : AbiRegisterClass.General;
             var source = LoadOperandForArgument(operand, segmentClass, scalarLoc, instruction);
-            if (NeedsAbiSignExtension(operand.Type))
-            {
-                if (scalarLoc.Kind == AbiLocationKind.Register)
-                {
-                    MoveRegister(scalarLoc.Register, source);
-                    SignExtendForAbi(scalarLoc.Register);
-                    return;
-                }
-
-                if (source != GpScratch0)
-                    MoveRegister(GpScratch0, source);
-                SignExtendForAbi(GpScratch0);
-                StoreArgumentValue(GpScratch0, scalarLoc, _owner._target.RegisterSize);
-                return;
-            }
-
-            StoreArgumentValue(source, scalarLoc, Math.Min(SizeOfRegisterType(operand.Type), Math.Max(1, value.Size)));
-        }
-
-        // psABI: a 32-bit value is passed sign-extended to XLEN regardless of signedness
-        private bool NeedsAbiSignExtension(QualifiedType type)
-            => _owner._target.Is64Bit && IsIntegerLike(type) && !IsPointerLike(type) && SizeOf(type) == 4 && IsUnsignedIntegerType(type);
-
-        private void SignExtendForAbi(MachineRegister register)
-        {
-            var fact = GetIntegerRepresentation(register);
-            var alreadySigned = fact.Kind == IntegerRepresentationKind.SignExtended && fact.Bits <= 32 ||
-                fact.Kind == IntegerRepresentationKind.ZeroExtended && fact.Bits < 32;
-            if (alreadySigned)
-                return;
-
-            EmitImm(RVInstrKind.Addiw, register, register, 0);
-            SetIntegerRepresentation(register, IntegerRepresentationFact.SignExtended(32));
+            var size = Math.Min(SizeOfRegisterType(operand.Type), Math.Max(1, value.Size));
+            // A canonical integer is already widened the way the psABI wants its stack slot filled
+            if (IsIntegerLike(operand.Type) && !IsPointerLike(operand.Type))
+                size = Math.Max(size, _owner._target.RegisterSize);
+            StoreArgumentValue(source, scalarLoc, size);
         }
 
         private MachineRegister MaterializeScalarBitsAddress(LirOperand operand, MachineRegister destination, LirInstruction instruction)
@@ -4919,7 +5028,7 @@ public sealed class RiscVCodeGenerator
             var returnsFloating = value.Segments.Length != 0 && value.Segments[0].RegisterClass == AbiRegisterClass.Floating;
             var dst = GetWritableRegister(instruction.Result, returnsFloating ? FpScratch0 : GpScratch0);
             if (!returnsFloating)
-                SetIntegerRepresentation(MachineRegister.X10, AbiScalarRepresentation(instruction.Result.Type));
+                SetIntegerRepresentation(MachineRegister.X10, CanonicalIntegerRepresentation(instruction.Result.Type));
             MoveRegister(dst, returnsFloating ? MachineRegister.F10 : MachineRegister.X10);
             NormalizeScalarRegister(dst, instruction.Result.Type);
             StoreWritableRegisterIfSpilled(instruction.Result, dst);
@@ -5027,7 +5136,7 @@ public sealed class RiscVCodeGenerator
             }
             else
             {
-                cond = LoadIntegerBranchOperand(instruction.Operands[0], GpScratch0);
+                cond = LoadIntegerSourceOperand(instruction.Operands[0], GpScratch0);
             }
 
             if (trueFallsThrough && !falseFallsThrough)
@@ -5076,8 +5185,8 @@ public sealed class RiscVCodeGenerator
             if (RequiresStackBackedScalar(left.Type) || RequiresStackBackedScalar(right.Type))
                 throw HelperRequired(instruction, SelectScalarMoveHelper(left.Type), "Comparison branch on a scalar wider than one machine register is not implemented yet.");
 
-            var leftRegisterInteger = LoadIntegerBranchOperand(left, GpScratch1);
-            var rightRegisterInteger = LoadIntegerBranchOperand(right, GpScratch2);
+            var leftRegisterInteger = LoadIntegerSourceOperand(left, GpScratch1);
+            var rightRegisterInteger = LoadIntegerSourceOperand(right, GpScratch2);
             var signed = IsSignedIntegerType(left.Type) || IsSignedIntegerType(right.Type);
             var opcode = SelectIntegerBranchOpcode(instruction.Operator, signed, out var swapOperands);
             var first = swapOperands ? rightRegisterInteger : leftRegisterInteger;
@@ -5164,7 +5273,7 @@ public sealed class RiscVCodeGenerator
                 EmitJump(falseLabel);
         }
 
-        private MachineRegister LoadIntegerBranchOperand(LirOperand operand, MachineRegister preferred)
+        private MachineRegister LoadIntegerSourceOperand(LirOperand operand, MachineRegister preferred)
         {
             if (IsZeroIntegerImmediate(operand))
                 return MachineRegister.X0;
@@ -5271,10 +5380,10 @@ public sealed class RiscVCodeGenerator
             if (TryEmitSwitchTable(instruction, SizeOf(instruction.Operands[0].Type)))
                 return;
 
-            var key = LoadIntegerBranchOperand(instruction.Operands[0], GpScratch0);
+            var key = LoadIntegerSourceOperand(instruction.Operands[0], GpScratch0);
             foreach (var @case in instruction.SwitchCases)
             {
-                var caseValue = ImmediateToInt64(@case.Value);
+                var caseValue = CanonicalConstant(ImmediateToInt64(@case.Value), instruction.Operands[0].Type);
                 var caseRegister = caseValue == 0 ? MachineRegister.X0 : GpScratch1;
                 if (caseRegister != MachineRegister.X0)
                     LoadImmediate(caseRegister, caseValue);
@@ -5306,18 +5415,20 @@ public sealed class RiscVCodeGenerator
                 targetLabels[i] = targetLabel;
             }
 
-            var index = LoadIntegerBranchOperand(instruction.Operands[0], GpScratch0);
+            var index = LoadIntegerSourceOperand(instruction.Operands[0], GpScratch0);
             if (plan.Minimum != 0)
             {
+                // A 32-bit key is sign-extended whatever its signedness, so the bias wraps in 32 bits
+                var wordOp = _owner._target.Is64Bit && size == 4;
                 var bias = unchecked(-plan.Minimum);
                 if (FitsSignedImmediate(bias, 12))
                 {
-                    EmitImm(RVInstrKind.Addi, GpScratch0, index, (int)bias);
+                    EmitImm(wordOp ? RVInstrKind.Addiw : RVInstrKind.Addi, GpScratch0, index, (int)bias);
                 }
                 else
                 {
-                    LoadImmediate(GpScratch1, plan.Minimum);
-                    Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch0), ToRegister(index), ToRegister(GpScratch1)));
+                    LoadImmediate(GpScratch1, CanonicalConstant(plan.Minimum, instruction.Operands[0].Type));
+                    Emit(RVInstruction.R(wordOp ? RVInstrKind.Subw : RVInstrKind.Sub, ToRegister(GpScratch0), ToRegister(index), ToRegister(GpScratch1)));
                 }
                 index = GpScratch0;
                 SetIntegerRepresentation(GpScratch0, IntegerRepresentationFact.Unknown);
@@ -5328,8 +5439,15 @@ public sealed class RiscVCodeGenerator
 
             var entryShift = _owner._target.PointerSize == 8 ? 3 : 2;
             MaterializeSymbolAddress(_owner.CreateJumpTable(targetLabels), GpScratch1);
-            Emit(RVInstruction.I(RVInstrKind.Slli, ToRegister(GpScratch2), ToRegister(index), entryShift));
-            Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(GpScratch1), ToRegister(GpScratch1), ToRegister(GpScratch2)));
+            if (_owner._machineTarget.HasB)
+            {
+                Emit(RVInstruction.R(entryShift == 3 ? RVInstrKind.Sh3Add : RVInstrKind.Sh2Add, ToRegister(GpScratch1), ToRegister(index), ToRegister(GpScratch1)));
+            }
+            else
+            {
+                Emit(RVInstruction.I(RVInstrKind.Slli, ToRegister(GpScratch2), ToRegister(index), entryShift));
+                Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(GpScratch1), ToRegister(GpScratch1), ToRegister(GpScratch2)));
+            }
             Emit(RVInstruction.I(
                 _owner._target.PointerSize == 8 ? RVInstrKind.Ld : RVInstrKind.Lw,
                 ToRegister(GpScratch2),
@@ -5400,8 +5518,6 @@ public sealed class RiscVCodeGenerator
             }
             var returnRegister = returnAbi.Segments.Length != 0 && returnAbi.Segments[0].RegisterClass == AbiRegisterClass.Floating ? MachineRegister.F10 : MachineRegister.X10;
             LoadOperandIntoAs(operand, returnRegister, returnType, instruction);
-            if (returnRegister == MachineRegister.X10 && NeedsAbiSignExtension(returnType))
-                SignExtendForAbi(returnRegister);
             EmitEpilogue();
             EmitReturnInstruction();
         }
@@ -5488,7 +5604,7 @@ public sealed class RiscVCodeGenerator
                 else
                 {
                     var destination = GetWritableRegister(copy.Destination, PreferredScratch(copy.Destination.Type, GpScratch0, FpScratch0, VecScratch0));
-                    LoadFromMemory(destination, FrameBase, tempOffset + tempCursor, SizeOfRegisterType(copy.Destination.Type), IsSignedIntegerType(copy.Destination.Type));
+                    LoadFromMemory(destination, FrameBase, tempOffset + tempCursor, SizeOfRegisterType(copy.Destination.Type), IsCanonicallySignExtended(copy.Destination.Type));
                     NormalizeScalarRegister(destination, copy.Destination.Type);
                     StoreWritableRegisterIfSpilled(copy.Destination, destination);
                     tempCursor += AlignUp(SizeOfRegisterType(copy.Destination.Type), _allocationOptions.SpillSlotAlignment);
@@ -5638,7 +5754,7 @@ public sealed class RiscVCodeGenerator
             if (IsFloatType(operand.Type))
                 throw Unsupported(instruction, "Implicit floating-point to non-floating load is not supported.");
 
-            var source = LoadOperand(operand, scratch);
+            var source = ExtendOperandToWidth(LoadOperand(operand, scratch), operand.Type, SizeOfRegisterType(targetType) * 8, scratch);
             if (!TypesNeedIntegerConversion(operand.Type, targetType) || IntegerRepresentationSatisfies(GetIntegerRepresentation(source), targetType))
                 return source;
             if (source != scratch)
@@ -5678,7 +5794,7 @@ public sealed class RiscVCodeGenerator
                         LoadFloatingImmediate(destination, operand.Immediate, operand.Type);
                         return destination;
                     }
-                    LoadImmediate(preferred, ConvertIntegerConstant(operand.Immediate));
+                    LoadImmediate(preferred, CanonicalImmediate(operand));
                     NormalizeIntegerRegister(preferred, operand.Type);
                     return preferred;
                 case LirOperandKind.StackSlot:
@@ -5690,7 +5806,7 @@ public sealed class RiscVCodeGenerator
                         preferred = VecScratch0;
                     else if (UsesHardwareFloating(operand.Type) && !IsFloatRegister(preferred))
                         preferred = FpScratch0;
-                    LoadFromMemory(preferred, FrameBase, offset, SizeOfRegisterType(operand.Type), IsSignedIntegerType(operand.Type));
+                    LoadFromMemory(preferred, FrameBase, offset, SizeOfRegisterType(operand.Type), IsCanonicallySignExtended(operand.Type));
                     NormalizeScalarRegister(preferred, operand.Type);
                     return preferred;
                 case LirOperandKind.Address:
@@ -5740,18 +5856,21 @@ public sealed class RiscVCodeGenerator
                     else if (UsesHardwareFloating(register.Type) && !IsFloatRegister(preferred))
                         preferred = FpScratch0;
                     var size = Math.Min(SizeOfRegisterType(register.Type), SizeOf(register.Type));
-                    LoadFromMemory(preferred, FrameBase, preservation.StackOffset, size, IsSignedIntegerType(register.Type));
+                    LoadFromMemory(preferred, FrameBase, preservation.StackOffset, size, IsCanonicallySignExtended(register.Type));
                     NormalizeScalarRegister(preferred, register.Type);
                     return preferred;
                 }
 
+                var canonical = CanonicalIntegerRepresentation(register.Type);
+                if (canonical.IsKnown && !_narrowStoreOnlyValues.Contains(register) && !GetIntegerRepresentation(alloc.PhysicalRegister).IsKnown)
+                    SetIntegerRepresentation(alloc.PhysicalRegister, canonical);
                 return alloc.PhysicalRegister;
             }
             if (IsRiscVVectorType(register.Type) && !IsVectorRegister(preferred))
                 preferred = VecScratch0;
             else if (UsesHardwareFloating(register.Type) && !IsFloatRegister(preferred))
                 preferred = FpScratch0;
-            LoadFromMemory(preferred, FrameBase, alloc.StackOffset, SizeOfRegisterType(register.Type), IsSignedIntegerType(register.Type));
+            LoadFromMemory(preferred, FrameBase, alloc.StackOffset, SizeOfRegisterType(register.Type), IsCanonicallySignExtended(register.Type));
             NormalizeScalarRegister(preferred, register.Type);
             return preferred;
         }
@@ -6041,9 +6160,7 @@ public sealed class RiscVCodeGenerator
                     }
 
                     // The add reads both sources, so neither the base nor the index needs a copy
-                    var index = LoadOperand(address.Index, scratchIndex);
-                    var scaled = ScaleIndex(scratchIndex, index, address.Scale, scratchIndex == GpScratch3 ? GpScratch2 : GpScratch3);
-                    Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(scratchBase), ToRegister(elementBase), ToRegister(scaled)));
+                    EmitAddScaledIndex(scratchBase, elementBase, address.Index, address.Scale, scratchIndex, scratchIndex == GpScratch3 ? GpScratch2 : GpScratch3);
                     return new AddressParts(scratchBase, address.Displacement);
                 case LirAddressKind.Field:
                     if (address.BaseAddress is null)
@@ -6064,6 +6181,34 @@ public sealed class RiscVCodeGenerator
                 return false;
             offset = (int)scaled;
             return true;
+        }
+
+        private MachineRegister LoadPointerIndex(LirOperand index, MachineRegister scratch)
+            => ExtendOperandToWidth(LoadOperand(index, scratch), index.Type, _owner._target.PointerSize * 8, scratch);
+
+        private void EmitAddScaledIndex(MachineRegister destination, MachineRegister baseRegister, LirOperand indexOperand, int scale,
+            MachineRegister indexScratch, MachineRegister scratch)
+        {
+            var index = LoadOperand(indexOperand, indexScratch);
+            var widening = WideningRepresentation(indexOperand.Type, _owner._target.PointerSize * 8);
+            var widened = !widening.IsKnown || IntegerRepresentationSatisfies(KnownIntegerRepresentation(index, indexOperand.Type), widening);
+            var zeroExtendWord = !widened && widening.Kind == IntegerRepresentationKind.ZeroExtended && widening.Bits == 32;
+            if (_owner._machineTarget.HasB && (widened || zeroExtendWord) && (scale is 2 or 4 or 8 || scale <= 1 && zeroExtendWord))
+            {
+                var opcode = scale switch
+                {
+                    2 => zeroExtendWord ? RVInstrKind.Sh1AddUw : RVInstrKind.Sh1Add,
+                    4 => zeroExtendWord ? RVInstrKind.Sh2AddUw : RVInstrKind.Sh2Add,
+                    8 => zeroExtendWord ? RVInstrKind.Sh3AddUw : RVInstrKind.Sh3Add,
+                    _ => RVInstrKind.AddUw,
+                };
+                Emit(RVInstruction.R(opcode, ToRegister(destination), ToRegister(index), ToRegister(baseRegister)));
+                return;
+            }
+
+            index = ExtendOperandToWidth(index, indexOperand.Type, _owner._target.PointerSize * 8, indexScratch);
+            var scaled = ScaleIndex(indexScratch, index, scale, scratch);
+            Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(destination), ToRegister(baseRegister), ToRegister(scaled)));
         }
 
         // Reports where the scaled index landed, which is the index itself when nothing had to scale
@@ -6830,6 +6975,12 @@ public sealed class RiscVCodeGenerator
         private void EmitShiftImmediate(RVInstrKind opcode, MachineRegister destination, MachineRegister source, int amount)
             => Emit(new RVInstruction(opcode, ToRegister(destination), ToRegister(source), RVRegister.Invalid, amount));
 
+        private bool IsSignedIntegerType(QualifiedType type)
+            => GimpleTypes.IsIntegerLike(type) && GimpleTypes.IsSigned(type, _owner._target);
+
+        private bool IsUnsignedIntegerType(QualifiedType type)
+            => GimpleTypes.IsIntegerLike(type) && !GimpleTypes.IsSigned(type, _owner._target);
+
         private void NormalizeScalarRegister(MachineRegister register, QualifiedType type)
         {
             if (IsRiscVVectorType(type) || IsFloatType(type))
@@ -6856,40 +7007,38 @@ public sealed class RiscVCodeGenerator
             if (!required.IsKnown || IntegerRepresentationSatisfies(GetIntegerRepresentation(register), required))
                 return;
 
-            ExtendIntegerRegister(register, required);
+            ExtendIntegerRegister(register, register, required);
         }
 
-        private void ExtendIntegerRegister(MachineRegister register, IntegerRepresentationFact required)
+        private void ExtendIntegerRegister(MachineRegister destination, MachineRegister source, IntegerRepresentationFact required)
         {
             var unsigned = required.Kind == IntegerRepresentationKind.ZeroExtended;
-            if (_owner._target.Is64Bit)
+            var is64Bit = _owner._target.Is64Bit;
+            var hasB = _owner._machineTarget.HasB;
+            if (unsigned && required.Bits <= 11)
             {
-                if (required.Bits == 32)
-                {
-                    if (unsigned)
-                    {
-                        EmitShiftImmediate(RVInstrKind.Slli, register, register, 32);
-                        EmitShiftImmediate(RVInstrKind.Srli, register, register, 32);
-                    }
-                    else
-                    {
-                        EmitImm(RVInstrKind.Addiw, register, register, 0);
-                    }
-                    SetIntegerRepresentation(register, required);
-                    return;
-                }
-
-                var shift = 64 - required.Bits;
-                EmitShiftImmediate(RVInstrKind.Slli, register, register, shift);
-                EmitShiftImmediate(unsigned ? RVInstrKind.Srli : RVInstrKind.Srai, register, register, shift);
-                SetIntegerRepresentation(register, required);
-                return;
+                EmitImm(RVInstrKind.Andi, destination, source, (1 << required.Bits) - 1);
             }
-
-            var shift32 = 32 - required.Bits;
-            EmitShiftImmediate(RVInstrKind.Slli, register, register, shift32);
-            EmitShiftImmediate(unsigned ? RVInstrKind.Srli : RVInstrKind.Srai, register, register, shift32);
-            SetIntegerRepresentation(register, required);
+            else if (is64Bit && required.Bits == 32 && (!unsigned || hasB))
+            {
+                if (unsigned)
+                    Emit(RVInstruction.R(RVInstrKind.AddUw, ToRegister(destination), ToRegister(source), RVRegister.X0));
+                else
+                    EmitImm(RVInstrKind.Addiw, destination, source, 0);
+            }
+            // zext.h has an RV64-only encoding here
+            else if (hasB && (required.Bits == 8 || required.Bits == 16 && (!unsigned || is64Bit)))
+            {
+                var opcode = unsigned ? RVInstrKind.ZextH : required.Bits == 8 ? RVInstrKind.SextB : RVInstrKind.SextH;
+                Emit(RVInstruction.R(opcode, ToRegister(destination), ToRegister(source), RVRegister.X0));
+            }
+            else
+            {
+                var shift = _owner._target.RegisterSize * 8 - required.Bits;
+                EmitShiftImmediate(RVInstrKind.Slli, destination, source, shift);
+                EmitShiftImmediate(unsigned ? RVInstrKind.Srli : RVInstrKind.Srai, destination, destination, shift);
+            }
+            SetIntegerRepresentation(destination, required);
         }
 
         /// <summary>Reports what a value of this type has to look like to stand in for one that wide</summary>
@@ -6920,30 +7069,11 @@ public sealed class RiscVCodeGenerator
             if (!required.IsKnown || IntegerRepresentationSatisfies(KnownIntegerRepresentation(register, type), required))
                 return register;
 
-            if (register != scratch)
-            {
-                MoveRegister(scratch, register);
-                register = scratch;
-            }
-
-            ExtendIntegerRegister(register, required);
-            return register;
+            ExtendIntegerRegister(scratch, register, required);
+            return scratch;
         }
 
-        /// <summary>
-        /// Reports what a register carrying a scalar across the ABI is already known to hold, which
-        /// covers an incoming argument and a returned value alike. The psABI widens a narrower scalar
-        /// according to its own sign and then sign-extends to XLEN, which agrees with the canonical
-        /// form everywhere except a 32-bit unsigned value on a 64-bit target.
-        /// </summary>
-        private IntegerRepresentationFact AbiScalarRepresentation(QualifiedType type)
-        {
-            if (_owner._target.Is64Bit && SizeOf(type) == 4 && IsUnsignedIntegerType(type))
-                return IntegerRepresentationFact.Unknown;
-
-            return CanonicalIntegerRepresentation(type);
-        }
-
+        // Also the psABI form: RV64 keeps every 32-bit value sign-extended, as the *w instructions leave it
         private IntegerRepresentationFact CanonicalIntegerRepresentation(QualifiedType type)
         {
             if (!IsIntegerLike(type) || IsPointerLike(type))
@@ -6953,10 +7083,32 @@ public sealed class RiscVCodeGenerator
             var registerBits = checked(_owner._target.RegisterSize * 8);
             if (bits >= registerBits)
                 return IntegerRepresentationFact.Unknown;
+            if (bits == 32)
+                return IntegerRepresentationFact.SignExtended(32);
             return IsUnsignedIntegerType(type)
                 ? IntegerRepresentationFact.ZeroExtended(bits)
                 : IntegerRepresentationFact.SignExtended(bits);
         }
+
+        private bool IsCanonicallySignExtended(QualifiedType type)
+            => CanonicalIntegerRepresentation(type).Kind == IntegerRepresentationKind.SignExtended;
+
+        private long CanonicalConstant(long value, QualifiedType type)
+        {
+            var canonical = CanonicalIntegerRepresentation(type);
+            if (!canonical.IsKnown)
+                return value;
+            var shift = 64 - canonical.Bits;
+            return canonical.Kind == IntegerRepresentationKind.SignExtended
+                ? value << shift >> shift
+                : (long)((ulong)value << shift >> shift);
+        }
+
+        private long CanonicalImmediate(LirOperand operand)
+            => CanonicalConstant(ConvertIntegerConstant(operand.Immediate), operand.Type);
+
+        private bool TryGetCanonicalImmediate12(LirOperand operand, out int immediate)
+            => TryEncodeSignedImmediate12(unchecked((ulong)CanonicalImmediate(operand)), _owner._target.RegisterSize * 8, out immediate);
 
         private bool IntegerRepresentationSatisfies(IntegerRepresentationFact actual, QualifiedType type)
         {
@@ -7145,6 +7297,14 @@ public sealed class RiscVCodeGenerator
                 case RVInstrKind.Andi when instruction.Immediate >= 0:
                     fact = RepresentationForNonNegativeMask((uint)instruction.Immediate);
                     break;
+                case RVInstrKind.Andi when source.Kind == IntegerRepresentationKind.ZeroExtended:
+                    fact = source;
+                    break;
+                case RVInstrKind.Andi:
+                case RVInstrKind.Ori:
+                case RVInstrKind.Xori:
+                    fact = CommonSignExtension(source, RepresentationForConstant(instruction.Immediate));
+                    break;
                 case RVInstrKind.And:
                     {
                         var right = GetIntegerRepresentation(instruction.Rs2);
@@ -7154,16 +7314,36 @@ public sealed class RiscVCodeGenerator
                             fact = source;
                         else if (right.Kind == IntegerRepresentationKind.ZeroExtended)
                             fact = right;
+                        else
+                            fact = CommonSignExtension(source, right);
                         break;
                     }
                 case RVInstrKind.Or:
                 case RVInstrKind.Xor:
+                case RVInstrKind.Max:
+                case RVInstrKind.Maxu:
+                case RVInstrKind.Min:
+                case RVInstrKind.Minu:
                     {
                         var right = GetIntegerRepresentation(instruction.Rs2);
                         if (source.Kind == IntegerRepresentationKind.ZeroExtended && right.Kind == IntegerRepresentationKind.ZeroExtended)
                             fact = IntegerRepresentationFact.ZeroExtended(Math.Max(source.Bits, right.Bits));
+                        else
+                            fact = CommonSignExtension(source, right);
                         break;
                     }
+                case RVInstrKind.AddUw when instruction.Rs2 == RVRegister.X0:
+                    fact = IntegerRepresentationFact.ZeroExtended(32);
+                    break;
+                case RVInstrKind.SextB:
+                    fact = IntegerRepresentationFact.SignExtended(8);
+                    break;
+                case RVInstrKind.SextH:
+                    fact = IntegerRepresentationFact.SignExtended(16);
+                    break;
+                case RVInstrKind.ZextH:
+                    fact = IntegerRepresentationFact.ZeroExtended(16);
+                    break;
                 case RVInstrKind.Srli when instruction.Immediate > 0:
                     fact = IntegerRepresentationFact.ZeroExtended(Math.Max(1, _owner._target.RegisterSize * 8 - instruction.Immediate));
                     break;
@@ -7200,6 +7380,16 @@ public sealed class RiscVCodeGenerator
             if (value >= int.MinValue)
                 return IntegerRepresentationFact.SignExtended(32);
             return IntegerRepresentationFact.Unknown;
+        }
+
+        // Bitwise results and min/max keep the extension both sources share; zero-extended from n bits is sign-extended from n + 1
+        private static IntegerRepresentationFact CommonSignExtension(IntegerRepresentationFact left, IntegerRepresentationFact right)
+        {
+            if (!left.IsKnown || !right.IsKnown)
+                return IntegerRepresentationFact.Unknown;
+            static int SignedBits(IntegerRepresentationFact fact)
+                => fact.Kind == IntegerRepresentationKind.SignExtended ? fact.Bits : fact.Bits + 1;
+            return IntegerRepresentationFact.SignExtended(Math.Max(SignedBits(left), SignedBits(right)));
         }
 
         private static IntegerRepresentationFact RepresentationForNonNegativeMask(uint mask)
@@ -7251,7 +7441,7 @@ public sealed class RiscVCodeGenerator
         }
 
         private bool IsFallthroughTarget(LirBlock? target)
-            => target is not null && ReferenceEquals(target, _fallthroughBlock);
+            => target is not null && ReferenceEquals(JumpTarget(target), _fallthroughBlock);
 
         private int IncomingStackOffset(int abiStackOffset)
             => checked(_totalFrameSize + abiStackOffset);
@@ -7523,6 +7713,10 @@ public sealed class RiscVCodeGenerator
 
         public void Reference(string symbol)
             => _referenced.Add(symbol);
+
+        public bool EndsWithoutFallthrough
+            => CurrentLabel.Length == 0 && _instructions.Count != 0 &&
+               _instructions[^1] is { Opcode: RVInstrKind.Jal or RVInstrKind.Jalr, Rd: RVRegister.X0 };
 
         public void EmitAssembly(string text, string labelPrefix, RVTarget target)
         {

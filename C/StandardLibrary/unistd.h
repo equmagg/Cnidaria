@@ -36,6 +36,12 @@ int chdir(const char* path);
 char* getcwd(char* buffer, size_t size);
 
 #if defined(__linux__)
+extern char** environ;
+pid_t fork(void);
+int execve(const char* path, char* const argv[], char* const envp[]);
+int execv(const char* path, char* const argv[]);
+int execvp(const char* file, char* const argv[]);
+void _exit(int status);
 pid_t getpid(void);
 pid_t getppid(void);
 pid_t getpgrp(void);

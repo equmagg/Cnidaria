@@ -22,7 +22,7 @@ internal static class LoopInvariantCodeMotion
         public GimpleLabel ExitTarget = null!;
     }
 
-    private static GimpleFunctionDefinition Unroll(ControlFlowFunction flow, int budget)
+    private static GimpleFunctionDefinition Unroll(ControlFlowFunction flow, int budget, TargetInfo target)
     {
         var analysis = new NaturalLoopAnalysis(flow, budget);
         if (analysis.Remaining <= 0 || flow.Problems.Length != 0)
@@ -36,7 +36,7 @@ internal static class LoopInvariantCodeMotion
         var claimed = new HashSet<ControlFlowBlock>();
         foreach (var loop in analysis.Loops)
         {
-            if (!TryPlanUnroll(flow, analysis, loop, headers, out var plan))
+            if (!TryPlanUnroll(flow, analysis, loop, headers, target, out var plan))
                 continue;
             var overlaps = false;
             foreach (var block in loop.Blocks)
@@ -56,6 +56,7 @@ internal static class LoopInvariantCodeMotion
         NaturalLoopAnalysis analysis,
         NaturalLoop loop,
         HashSet<ControlFlowBlock> headers,
+        TargetInfo target,
         out UnrollPlan plan)
     {
         plan = null!;
@@ -97,16 +98,16 @@ internal static class LoopInvariantCodeMotion
         if (whenTrueInside == whenFalseInside)
             return false;
 
-        if (!TryDescribeInductionVariable(loop.Header.Statements, condition, out var variable, out var limit, out var comparison, out var variableOnLeft))
+        if (!TryDescribeInductionVariable(loop.Header.Statements, condition, target, out var variable, out var limit, out var comparison, out var variableOnLeft))
             return false;
-        if (!TryFindInductionStep(loop, variable, out var step))
+        if (!TryFindInductionStep(loop, variable, target, out var step))
             return false;
-        if (!TryFindInductionStart(flow, loop, variable, out var start))
+        if (!TryFindInductionStart(flow, loop, variable, target, out var start))
             return false;
         if (IsInductionVariableEscaped(flow, variable))
             return false;
 
-        if (!TrySimulateTripCount(variable, start, step, limit, comparison, variableOnLeft, out var trips))
+        if (!TrySimulateTripCount(variable, start, step, limit, comparison, variableOnLeft, target, out var trips))
             return false;
         if (checked(trips * statements) > MaxUnrollStatements)
             return false;
@@ -137,6 +138,7 @@ internal static class LoopInvariantCodeMotion
     private static bool TryDescribeInductionVariable(
         ImmutableArray<GimpleStatement> statements,
         GimpleCondStatement condition,
+        TargetInfo target,
         out VariableSymbol variable,
         out long limit,
         out GimpleTreeCode comparison,
@@ -150,14 +152,14 @@ internal static class LoopInvariantCodeMotion
             return false;
 
         var before = statements.Length == 0 ? 0 : statements.Length - 1;
-        if (TryResolveVariable(statements, before, condition.Lhs, out variable) &&
-            TryResolveConstant(statements, before, condition.Rhs, out limit))
+        if (TryResolveVariable(statements, before, condition.Lhs, target, out variable) &&
+            TryResolveConstant(statements, before, condition.Rhs, target, out limit))
         {
             return true;
         }
 
-        if (TryResolveVariable(statements, before, condition.Rhs, out variable) &&
-            TryResolveConstant(statements, before, condition.Lhs, out limit))
+        if (TryResolveVariable(statements, before, condition.Rhs, target, out variable) &&
+            TryResolveConstant(statements, before, condition.Lhs, target, out limit))
         {
             variableOnLeft = false;
             return true;
@@ -200,10 +202,10 @@ internal static class LoopInvariantCodeMotion
         return false;
     }
 
-    private static bool TryResolveConstant(ImmutableArray<GimpleStatement> statements, int before, GimpleValue value, out long constant)
-        => TryResolveConstant(statements, before, value, MaxResolveDepth, out constant);
+    private static bool TryResolveConstant(ImmutableArray<GimpleStatement> statements, int before, GimpleValue value, TargetInfo target, out long constant)
+        => TryResolveConstant(statements, before, value, MaxResolveDepth, target, out constant);
 
-    private static bool TryResolveConstant(ImmutableArray<GimpleStatement> statements, int before, GimpleValue value, int depth, out long constant)
+    private static bool TryResolveConstant(ImmutableArray<GimpleStatement> statements, int before, GimpleValue value, int depth, TargetInfo target, out long constant)
     {
         constant = 0;
         if (TryGetIntegerConstant(value, out constant))
@@ -212,31 +214,31 @@ internal static class LoopInvariantCodeMotion
             return false;
         if (!IsMove(definition))
             return false;
-        if (!TryResolveConstant(statements, before, definition.Operands[0], depth - 1, out constant))
+        if (!TryResolveConstant(statements, before, definition.Operands[0], depth - 1, target, out constant))
             return false;
 
         // A constant only survives the conversion when the target can still hold it
-        return TryGetIntegerRange(definition.Lhs.Type, out var minimum, out var maximum) &&
+        return TryGetIntegerRange(definition.Lhs.Type, target, out var minimum, out var maximum) &&
                constant >= minimum && constant <= maximum;
     }
 
-    private static bool TryResolveVariable(ImmutableArray<GimpleStatement> statements, int before, GimpleValue value, out VariableSymbol variable)
-        => TryResolveVariable(statements, before, value, MaxResolveDepth, out variable);
+    private static bool TryResolveVariable(ImmutableArray<GimpleStatement> statements, int before, GimpleValue value, TargetInfo target, out VariableSymbol variable)
+        => TryResolveVariable(statements, before, value, MaxResolveDepth, target, out variable);
 
-    private static bool TryResolveVariable(ImmutableArray<GimpleStatement> statements, int before, GimpleValue value, int depth, out VariableSymbol variable)
+    private static bool TryResolveVariable(ImmutableArray<GimpleStatement> statements, int before, GimpleValue value, int depth, TargetInfo target, out VariableSymbol variable)
     {
         if (TryGetLocalVariable(value, out variable))
             return true;
         variable = null!;
         if (depth == 0 || !TryFindDefinition(statements, before, value, out var definition))
             return false;
-        if (!IsValuePreservingMove(definition))
+        if (!IsValuePreservingMove(definition, target))
             return false;
-        if (!TryResolveVariable(statements, before, definition.Operands[0], depth - 1, out variable))
+        if (!TryResolveVariable(statements, before, definition.Operands[0], depth - 1, target, out variable))
             return false;
 
         // A widening that keeps every value of the source lets the trip count be counted in the source
-        return RangeContains(definition.Lhs.Type, variable.Type);
+        return RangeContains(definition.Lhs.Type, variable.Type, target);
     }
 
     // A copy or an integer conversion, which may or may not keep the value
@@ -246,13 +248,13 @@ internal static class LoopInvariantCodeMotion
             assign.Subcode is GimpleTreeCode.NopExpr or GimpleTreeCode.ConvertExpr);
 
     // A copy, or a conversion that cannot change the value it carries
-    private static bool IsValuePreservingMove(GimpleAssignStatement assign)
+    private static bool IsValuePreservingMove(GimpleAssignStatement assign, TargetInfo target)
         => IsMove(assign) &&
-           (assign.RhsClass == GimpleRhsClass.Single || RangeContains(assign.Lhs.Type, assign.Operands[0].Type));
+           (assign.RhsClass == GimpleRhsClass.Single || RangeContains(assign.Lhs.Type, assign.Operands[0].Type, target));
 
-    private static bool RangeContains(QualifiedType outer, QualifiedType inner)
-        => TryGetIntegerRange(outer, out var outerMinimum, out var outerMaximum) &&
-           TryGetIntegerRange(inner, out var innerMinimum, out var innerMaximum) &&
+    private static bool RangeContains(QualifiedType outer, QualifiedType inner, TargetInfo target)
+        => TryGetIntegerRange(outer, target, out var outerMinimum, out var outerMaximum) &&
+           TryGetIntegerRange(inner, target, out var innerMinimum, out var innerMaximum) &&
            outerMinimum <= innerMinimum && outerMaximum >= innerMaximum;
 
     private static bool IsCountedComparison(GimpleTreeCode code)
@@ -260,7 +262,7 @@ internal static class LoopInvariantCodeMotion
             or GimpleTreeCode.GeExpr or GimpleTreeCode.EqExpr or GimpleTreeCode.NeExpr;
 
     // The step has to be the one and only write to the variable inside the loop
-    private static bool TryFindInductionStep(NaturalLoop loop, VariableSymbol variable, out long step)
+    private static bool TryFindInductionStep(NaturalLoop loop, VariableSymbol variable, TargetInfo target, out long step)
     {
         step = 0;
         var found = false;
@@ -286,12 +288,12 @@ internal static class LoopInvariantCodeMotion
                     return false;
                 if (assign.Operands.Length != 2)
                     return false;
-                if (!TryResolveVariable(block.Statements, index, assign.Operands[0], out var operand) ||
+                if (!TryResolveVariable(block.Statements, index, assign.Operands[0], target, out var operand) ||
                     !ReferenceEquals(operand, variable))
                 {
                     return false;
                 }
-                if (!TryResolveConstant(block.Statements, index, assign.Operands[1], out var amount) || amount == 0)
+                if (!TryResolveConstant(block.Statements, index, assign.Operands[1], target, out var amount) || amount == 0)
                     return false;
 
                 step = assign.Subcode == GimpleTreeCode.PlusExpr ? amount : -amount;
@@ -303,7 +305,7 @@ internal static class LoopInvariantCodeMotion
     }
 
     // The single entry into the loop has to leave a known constant behind
-    private static bool TryFindInductionStart(ControlFlowFunction flow, NaturalLoop loop, VariableSymbol variable, out long start)
+    private static bool TryFindInductionStart(ControlFlowFunction flow, NaturalLoop loop, VariableSymbol variable, TargetInfo target, out long start)
     {
         start = 0;
         ControlFlowBlock? entry = null;
@@ -334,7 +336,7 @@ internal static class LoopInvariantCodeMotion
                 continue;
             if (!IsMove(assign))
                 return false;
-            if (!TryResolveConstant(entry.Statements, index, assign.Operands[0], out start))
+            if (!TryResolveConstant(entry.Statements, index, assign.Operands[0], target, out start))
                 return false;
             found = true;
         }
@@ -385,10 +387,11 @@ internal static class LoopInvariantCodeMotion
         long limit,
         GimpleTreeCode comparison,
         bool variableOnLeft,
+        TargetInfo target,
         out int trips)
     {
         trips = 0;
-        if (!TryGetIntegerRange(variable.Type, out var minimum, out var maximum))
+        if (!TryGetIntegerRange(variable.Type, target, out var minimum, out var maximum))
             return false;
         if (start < minimum || start > maximum)
             return false;
@@ -422,34 +425,25 @@ internal static class LoopInvariantCodeMotion
         }
     }
 
-    private static bool TryGetIntegerRange(QualifiedType type, out long minimum, out long maximum)
+    private static bool TryGetIntegerRange(QualifiedType type, TargetInfo target, out long minimum, out long maximum)
     {
         minimum = 0;
         maximum = 0;
-        if (type.Type is not BuiltinType builtin)
+        if (type.Type is not BuiltinType { BuiltinKind: not BuiltinTypeKind.Bool } || !GimpleTypes.IsIntegerLike(type))
             return false;
 
-        switch (builtin.BuiltinKind)
+        var bits = target.SizeOf(type) * 8;
+        if (GimpleTypes.IsSigned(type, target))
         {
-            case BuiltinTypeKind.Char:
-            case BuiltinTypeKind.SignedChar:
-                minimum = sbyte.MinValue; maximum = sbyte.MaxValue; return true;
-            case BuiltinTypeKind.UnsignedChar:
-                maximum = byte.MaxValue; return true;
-            case BuiltinTypeKind.Short:
-                minimum = short.MinValue; maximum = short.MaxValue; return true;
-            case BuiltinTypeKind.UnsignedShort:
-                maximum = ushort.MaxValue; return true;
-            case BuiltinTypeKind.Int:
-                minimum = int.MinValue; maximum = int.MaxValue; return true;
-            case BuiltinTypeKind.UnsignedInt:
-                maximum = uint.MaxValue; return true;
-            case BuiltinTypeKind.Long:
-            case BuiltinTypeKind.LongLong:
-                minimum = long.MinValue; maximum = long.MaxValue; return true;
-            default:
-                return false;
+            maximum = bits >= 64 ? long.MaxValue : (1L << (bits - 1)) - 1;
+            minimum = -maximum - 1;
+            return true;
         }
+
+        if (bits >= 64)
+            return false;
+        maximum = (1L << bits) - 1;
+        return true;
     }
 
     private static bool TryGetLocalVariable(GimpleValue value, out VariableSymbol variable)
@@ -638,7 +632,7 @@ internal static class LoopInvariantCodeMotion
         foreach (var flow in graph.Functions)
         {
             var current = flow;
-            var unrolled = Unroll(current, options.MaxLoopAnalysisWork);
+            var unrolled = Unroll(current, options.MaxLoopAnalysisWork, graph.SemanticModel.Compilation.Options.Target);
             if (!ReferenceEquals(unrolled, current.Function))
                 current = ControlFlowFunction.Build(unrolled);
             var rewritten = CreatePreheaders(current, options.MaxLoopAnalysisWork);

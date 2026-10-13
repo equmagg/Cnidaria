@@ -2,6 +2,7 @@ using Cnidaria.C;
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Xml.Linq;
@@ -954,6 +955,10 @@ namespace Cnidaria.Cs
                 if (calleeBody.ExceptionClauses.Length != 0)
                     return false;
 
+                // An intrinsic import leaves no inlinee behind the call to continue from
+                if (IsIndexerIntrinsic(callee, out _, out _, out _) || IsIntegerMinMaxIntrinsic(callee, out _))
+                    return false;
+
                 int argCount = callee.HasThis ? callee.ParameterTypes.Length + 1 : callee.ParameterTypes.Length;
                 if (!AnalyzeInlineCandidate(callee, calleeModule, calleeBody, argCount, out var info))
                     return false;
@@ -1003,6 +1008,7 @@ namespace Cnidaria.Cs
             return result;
         }
 
+        // A string keeps its length at the array length offset, so String.Length reads it as an array length
         internal static bool IsLengthGetter(RuntimeMethod? method)
         {
             return method is not null &&
@@ -1012,7 +1018,7 @@ namespace Cnidaria.Cs
                    method.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Int32 &&
                    StringComparer.Ordinal.Equals(method.Name, "get_Length") &&
                    StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System") &&
-                   StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Array");
+                   StringComparer.Ordinal.Equals(method.DeclaringType.Name, "String");
         }
         private RuntimeType GetArgType(RuntimeMethod method, int argIndex)
         {
@@ -1957,6 +1963,18 @@ namespace Cnidaria.Cs
                 operands: One(handle), int32: 1, method: fromHandle);
         }
 
+        private RuntimeMethod RuntimeImportsMethod(string name)
+        {
+            RuntimeType runtimeImports = _rts.GetRequiredNamedType("std", "System.Runtime", "RuntimeImports");
+            _rts.EnsureConstructedMembers(runtimeImports);
+            foreach (RuntimeMethod method in runtimeImports.Methods)
+            {
+                if (method.IsStatic && StringComparer.Ordinal.Equals(method.Name, name))
+                    return method;
+            }
+            throw new MissingMethodException($"System.Runtime.RuntimeImports.{name} is missing from the core library.");
+        }
+
         private RuntimeMethod RuntimeTypeFromHandle()
         {
             RuntimeType runtimeType = _rts.GetRequiredNamedType("std", "System", "RuntimeType");
@@ -2150,6 +2168,159 @@ namespace Cnidaria.Cs
         private static bool IsSystemMethod(RuntimeMethod method, string ns, string type, string name)
             => method.DeclaringType.Namespace == ns && method.DeclaringType.Name == type && StringComparer.Ordinal.Equals(method.Name, name);
 
+        private bool IsIndexerIntrinsic(RuntimeMethod method, out bool isString, [NotNullWhen(true)] out RuntimeField? data, out RuntimeField? length)
+        {
+            RuntimeType owner = method.DeclaringType;
+            isString = false;
+            data = null;
+            length = null;
+            if (!method.HasThis || method.IsStatic || method.ParameterTypes.Length != 1 ||
+                method.ParameterTypes[0].PrimitiveKind != RuntimePrimitiveKind.Int32 ||
+                owner.Namespace != "System")
+            {
+                return false;
+            }
+
+            isString = owner.Name == "String" && StringComparer.Ordinal.Equals(method.Name, "get_Chars");
+            bool isSpan = owner.GenericTypeDefinition?.Name is "Span`1" or "ReadOnlySpan`1" &&
+                owner.GenericTypeArguments.Length == 1 &&
+                StringComparer.Ordinal.Equals(method.Name, "get_Item");
+            if (!isString && !isSpan)
+                return false;
+
+            data = FindInstanceField(owner, isString ? "_firstChar" : "_reference");
+            length = isSpan ? FindInstanceField(owner, "_length") : null;
+            return data is not null && (!isSpan || length is not null) &&
+                !(RequiresTypeInitializationBeforeCall(method) && NeedsTypeInitialization(owner));
+        }
+
+        private bool TryImportIndexer(List<StackValue> stack, List<GenTree> statements, RuntimeMethod method, int pc, ILOpCode op)
+        {
+            if (!IsIndexerIntrinsic(method, out bool isString, out RuntimeField? data, out RuntimeField? length))
+                return false;
+
+            RuntimeType owner = method.DeclaringType;
+            GenTree indexOperand = Pop(stack, pc, op).Node;
+            GenTree receiver = MaterializeReusable(statements, Pop(stack, pc, op).Node, pc, op);
+            GenTree index = MaterializeReusable(statements, indexOperand, pc, op);
+            GenTree lengthValue = isString
+                ? Node(GenTreeKind.ArrayLength, pc, op, type: _rts.FindPrimitive(RuntimePrimitiveKind.Int32), stackKind: GenStackKind.I4, operands: One(receiver))
+                : Node(GenTreeKind.Field, pc, op, type: length!.FieldType, stackKind: GenStackKind.I4, operands: One(receiver), field: length);
+            statements.Add(Node(GenTreeKind.BoundsCheck, pc, op, operands: Two(index, lengthValue)));
+
+            if (isString)
+            {
+                // The array length read by the bounds check has already dereferenced the string
+                RuntimeType charType = method.ReturnType;
+                GenTree firstChar = MarkDereferenceProven(Node(GenTreeKind.FieldAddr, pc, op, type: _rts.GetByRefType(charType),
+                    stackKind: GenStackKind.ByRef, operands: One(CloneTree(receiver)), field: data));
+                GenTree charAddress = Node(GenTreeKind.PointerElementAddr, pc, op, stackKind: GenStackKind.Ptr,
+                    operands: Two(firstChar, CloneTree(index)), int32: 2);
+                PushImportedValue(stack, statements, MarkDereferenceProven(Node(GenTreeKind.LoadIndirect, pc, op, type: charType,
+                    stackKind: StackKindOf(charType), operands: One(charAddress), runtimeType: charType)));
+                return true;
+            }
+
+            RuntimeType elementType = owner.GenericTypeArguments[0];
+            GenTree reference = Node(GenTreeKind.Field, pc, op, type: data.FieldType, stackKind: StackKindOf(data.FieldType),
+                operands: One(CloneTree(receiver)), field: data);
+            GenTree elementAddress = Node(GenTreeKind.PointerElementAddr, pc, op, stackKind: GenStackKind.Ptr,
+                operands: Two(reference, CloneTree(index)), int32: elementType.IsValueType ? elementType.SizeOf : _rts.Target.PointerSize);
+            PushImportedValue(stack, statements, Node(GenTreeKind.Unary, pc, GenTreeOperator.PtrToByRef, type: method.ReturnType,
+                stackKind: GenStackKind.ByRef, operands: One(elementAddress), runtimeType: elementType));
+            return true;
+        }
+
+        private bool TryImportIntegerMinMax(List<StackValue> stack, List<GenTree> statements, RuntimeMethod method, int pc, ILOpCode op)
+        {
+            if (!IsIntegerMinMaxIntrinsic(method, out bool unsigned))
+                return false;
+
+            GenTree right = Pop(stack, pc, op).Node;
+            StackValue left = Pop(stack, pc, op);
+            GenTreeOperator oper = method.Name == "Min"
+                ? unsigned ? GenTreeOperator.MinUn : GenTreeOperator.Min
+                : unsigned ? GenTreeOperator.MaxUn : GenTreeOperator.Max;
+            PushImportedValue(stack, statements, Node(GenTreeKind.Binary, pc, oper, type: ActualType(left.StackKind) ?? left.Type,
+                stackKind: left.StackKind, operands: Two(left.Node, right)));
+            return true;
+        }
+
+        // Integral Math.Min and Max become one operator where the target selects without a branch
+        private bool IsIntegerMinMaxIntrinsic(RuntimeMethod method, out bool unsigned)
+        {
+            RuntimeType owner = method.DeclaringType;
+            unsigned = false;
+            if (!method.IsStatic || method.ParameterTypes.Length != 2 ||
+                owner.Namespace != "System" || owner.Name != "Math" || method.Name is not ("Min" or "Max") ||
+                method.ParameterTypes[0].PrimitiveKind != method.ParameterTypes[1].PrimitiveKind)
+            {
+                return false;
+            }
+
+            switch (method.ParameterTypes[0].PrimitiveKind)
+            {
+                case RuntimePrimitiveKind.Int8:
+                case RuntimePrimitiveKind.Int16:
+                case RuntimePrimitiveKind.Int32:
+                case RuntimePrimitiveKind.Int64:
+                case RuntimePrimitiveKind.NativeInt:
+                    break;
+                case RuntimePrimitiveKind.UInt8:
+                case RuntimePrimitiveKind.UInt16:
+                case RuntimePrimitiveKind.UInt32:
+                case RuntimePrimitiveKind.UInt64:
+                case RuntimePrimitiveKind.NativeUInt:
+                    unsigned = true;
+                    break;
+                default:
+                    return false;
+            }
+
+            return TargetSelectsWithoutBranch(method.ParameterTypes[0].SizeOf) &&
+                !(RequiresTypeInitializationBeforeCall(method) && NeedsTypeInitialization(owner));
+        }
+
+        private bool TargetSelectsWithoutBranch(int size)
+        {
+            TargetInfo target = _rts.Target;
+            if (size > target.PointerSize)
+                return false;
+
+            return target.IsX86 ||
+                target.Architecture == TargetArchitectureKind.Arm64 ||
+                (target.IsRiscV && (target.ArchitectureFeatures & TargetArchitectureFeatures.RiscVB) != 0);
+        }
+
+        private static RuntimeField? FindInstanceField(RuntimeType type, string name)
+        {
+            for (int i = 0; i < type.InstanceFields.Length; i++)
+            {
+                if (StringComparer.Ordinal.Equals(type.InstanceFields[i].Name, name))
+                    return type.InstanceFields[i];
+            }
+            return null;
+        }
+
+        private GenTree MaterializeReusable(List<GenTree> statements, GenTree value, int pc, ILOpCode op)
+        {
+            if (value.Kind is GenTreeKind.Local or GenTreeKind.Arg or GenTreeKind.Temp or
+                GenTreeKind.LocalAddr or GenTreeKind.ArgAddr or GenTreeKind.TempAddr or GenTreeKind.ConstI4)
+            {
+                return value;
+            }
+
+            GenTemp temp = CreateImporterSpillTemp(value.Type, value.StackKind);
+            statements.Add(Node(GenTreeKind.StoreTemp, pc, op, operands: One(value), int32: temp.Index));
+            return TempLoad(pc, op, temp).Node;
+        }
+
+        private static GenTree MarkDereferenceProven(GenTree node)
+        {
+            node.Flags = (node.Flags | GenTreeFlags.NullCheckEliminated | GenTreeFlags.Ordered) & ~GenTreeFlags.CanThrow;
+            return node;
+        }
+
         private void EmitDelegateInvoke(List<StackValue> stack, List<GenTree> statements, int pc, ILOpCode op, RuntimeMethod invoke, ImmutableArray<GenTree> args, int token)
         {
             SpillEvaluationStackForImportBarrier(statements, stack, pc, op);
@@ -2285,13 +2456,21 @@ namespace Cnidaria.Cs
                 return 1;
             }
 
+            // Native targets expand only the generic overload; the register VM, without MethodTables, expands both
             if (!isVirtual &&
-                IsSystemMethod(method, "System.Runtime.InteropServices", "MemoryMarshal", "GetArrayDataReference"))
+                IsSystemMethod(method, "System.Runtime.InteropServices", "MemoryMarshal", "GetArrayDataReference") &&
+                (method.MethodGenericArguments.Length == 1 || _rts.Target.IsRegisterBytecode))
             {
                 var array = Pop(stack, npc, op);
                 PushImportedValue(stack, statements, Node(GenTreeKind.ArrayDataRef, npc, op, stackKind: GenStackKind.ByRef, operands: One(array.Node)));
                 return 1;
             }
+
+            if ((ins.Prefixes & CilPrefix.Constrained) == 0 && TryImportIndexer(stack, statements, method, npc, op))
+                return 1;
+
+            if (TryImportIntegerMinMax(stack, statements, method, npc, op))
+                return 1;
 
             var args = PopMany(stack, total, npc, op);
 
@@ -2320,6 +2499,13 @@ namespace Cnidaria.Cs
             bool isArrayLength = args.Length == 1 && IsLengthGetter(method);
             bool requiresCallvirtNullCheck = false;
             DevirtualizationReceiverTransform receiverTransform = DevirtualizationReceiverTransform.None;
+
+            if (_rts.Target.IsRegisterBytecode && IsSystemMethod(method, "System", "Array", "get_Rank"))
+            {
+                method = RuntimeImportsMethod("RhGetArrayRank");
+                requiresCallvirtNullCheck = true;
+                isVirtual = false;
+            }
 
             if (isVirtual && !isArrayLength)
             {
@@ -5986,6 +6172,7 @@ namespace Cnidaria.Cs
                     break;
 
                 case GenTreeKind.NullCheck:
+                case GenTreeKind.BoundsCheck:
                     flags |= GenTreeFlags.CanThrow | GenTreeFlags.Ordered;
                     break;
 

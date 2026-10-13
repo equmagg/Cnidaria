@@ -1802,19 +1802,34 @@ internal static partial class SsaOptimizer
         private bool TryCastIntegerConstant(GimpleConstantValue constant, QualifiedType targetType, SyntaxNode? syntax, out GimpleConstantValue casted)
         {
             casted = null!;
-            if (!TryGetIntegerConstant(constant, out var value, out var sourceInfo))
+            if (!TryGetBitPatternInfo(constant.Type, out var sourceInfo) || !TryConvertIntegerObject(constant.Value, out var value) ||
+                !TryGetBitPatternInfo(targetType, out var targetInfo))
                 return false;
 
-            if (!TryGetIntegerInfo(targetType, out _))
-                return false;
-
+            value &= Mask(sourceInfo.Bits);
             var targetValue = sourceInfo.IsSigned
                 ? unchecked((ulong)ToSigned(value, sourceInfo.Bits))
                 : value;
 
-            casted = CreateIntegerConstant(targetValue, targetType, syntax);
+            casted = IsPointer(targetType)
+                ? new GimpleConstantValue(targetInfo.Bits <= 32 ? unchecked((uint)targetValue) : targetValue, targetType, syntax)
+                : CreateIntegerConstant(targetValue, targetType, syntax);
             return true;
         }
+
+        // A pointer converts to and from an integer keeping its bit pattern, so its constants fold like unsigned ones
+        private bool TryGetBitPatternInfo(QualifiedType type, out IntegerInfo info)
+        {
+            if (TryGetIntegerInfo(type, out info))
+                return true;
+            if (!IsPointer(type))
+                return false;
+            info = new IntegerInfo(_target.PointerSize * 8, isSigned: false);
+            return true;
+        }
+
+        private static bool IsPointer(QualifiedType type)
+            => GimpleTypeHelpers.Normalize(type).Type.Kind == TypeKind.Pointer;
 
         private bool TryCastInteger(ulong value, QualifiedType targetType, SyntaxNode? syntax, out GimpleConstantValue casted)
         {
@@ -1866,7 +1881,7 @@ internal static partial class SsaOptimizer
                     info = new IntegerInfo(bits, isSigned: false);
                     return true;
                 case BuiltinTypeKind.Char:
-                    info = new IntegerInfo(bits, _target.CharSignedness != CharSignedness.Unsigned);
+                    info = new IntegerInfo(bits, _target.IsCharSigned);
                     return true;
                 case BuiltinTypeKind.SignedChar:
                 case BuiltinTypeKind.Short:

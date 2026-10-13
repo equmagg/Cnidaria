@@ -1,72 +1,75 @@
-#define WC_BUFFER 512
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
 
-static u64 wc_total_lines;
-static u64 wc_total_words;
-static u64 wc_total_bytes;
+struct counts
+{
+    unsigned long lines;
+    unsigned long words;
+    unsigned long bytes;
+};
 
-static void wc_report(u64 lines, u64 words, u64 bytes, int wantLines, int wantWords, int wantBytes, const char* name)
+static void wc_report(const struct counts* counts, int wantLines, int wantWords, int wantBytes, const char* name)
 {
     if (wantLines)
-        write_unsigned_to(1, lines, 8, ' ');
+        printf("%8lu", counts->lines);
     if (wantWords)
-        write_unsigned_to(1, words, 8, ' ');
+        printf("%8lu", counts->words);
     if (wantBytes)
-        write_unsigned_to(1, bytes, 8, ' ');
-    if (name != (const char*)NULL)
-    {
-        write_text(" ");
-        write_text(name);
-    }
-    write_text("\n");
+        printf("%8lu", counts->bytes);
+    if (name != NULL)
+        printf(" %s", name);
+    fputc('\n', stdout);
 }
 
-static int wc_count(int fd, u64* lines, u64* words, u64* bytes)
+static int wc_count(int fd, struct counts* counts)
 {
-    char buffer[WC_BUFFER];
+    char buffer[512];
     int inWord = 0;
-    *lines = 0ul;
-    *words = 0ul;
-    *bytes = 0ul;
+    counts->lines = 0;
+    counts->words = 0;
+    counts->bytes = 0;
     for (;;)
     {
-        usize index = 0ul;
-        s64 count = sys_read(fd, buffer, (usize)WC_BUFFER);
-        if (count < 0l)
+        ssize_t index;
+        ssize_t count = read(fd, buffer, sizeof(buffer));
+        if (count < 0)
             return 1;
-        if (count == 0l)
+        if (count == 0)
             return 0;
-        *bytes = *bytes + (u64)count;
-        while (index < (usize)count)
+        counts->bytes += (unsigned long)count;
+        for (index = 0; index < count; index++)
         {
             char ch = buffer[index];
             if (ch == '\n')
-                *lines = *lines + 1ul;
+                counts->lines++;
             if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r')
                 inWord = 0;
             else if (!inWord)
             {
                 inWord = 1;
-                *words = *words + 1ul;
+                counts->words++;
             }
-            index = index + 1ul;
         }
     }
 }
 
-int main(int argc, char** argv, char** envp)
+int main(int argc, char** argv)
 {
+    struct counts counts;
+    struct counts total = { 0, 0, 0 };
     int wantLines = 0;
     int wantWords = 0;
     int wantBytes = 0;
     int index = 1;
     int status = 0;
     int files = 0;
-    (void)envp;
 
     while (index < argc && argv[index][0] == '-' && argv[index][1] != 0)
     {
         const char* flags = argv[index] + 1;
-        while (*flags != 0)
+        for (; *flags != 0; flags++)
         {
             if (*flags == 'l')
                 wantLines = 1;
@@ -76,12 +79,11 @@ int main(int argc, char** argv, char** envp)
                 wantBytes = 1;
             else
             {
-                report("wc", (const char*)NULL, "usage: wc [-l] [-w] [-c] [file...]");
+                fputs("wc: usage: wc [-l] [-w] [-c] [file...]\n", stderr);
                 return 2;
             }
-            flags = flags + 1;
         }
-        index = index + 1;
+        index++;
     }
     if (!wantLines && !wantWords && !wantBytes)
     {
@@ -93,39 +95,31 @@ int main(int argc, char** argv, char** envp)
     // With nothing named, a filter counts what it is given
     if (index == argc)
     {
-        u64 lines;
-        u64 words;
-        u64 bytes;
-        if (wc_count(0, &lines, &words, &bytes) != 0)
+        if (wc_count(0, &counts) != 0)
             return 1;
-        wc_report(lines, words, bytes, wantLines, wantWords, wantBytes, (const char*)NULL);
+        wc_report(&counts, wantLines, wantWords, wantBytes, NULL);
         return 0;
     }
 
-    while (index < argc)
+    for (; index < argc; index++)
     {
-        u64 lines;
-        u64 words;
-        u64 bytes;
-        int fd = open_for_reading("wc", argv[index]);
+        int fd = open(argv[index], O_RDONLY);
         if (fd < 0)
         {
+            fprintf(stderr, "wc: %s: %s\n", argv[index], errno == ENOENT ? "no such file" : errno == EISDIR ? "is a directory" : "cannot be opened");
             status = 1;
-            index = index + 1;
             continue;
         }
-        if (wc_count(fd, &lines, &words, &bytes) != 0)
-            status = 1;
-        sys_close(fd);
-        wc_report(lines, words, bytes, wantLines, wantWords, wantBytes, argv[index]);
-        wc_total_lines = wc_total_lines + lines;
-        wc_total_words = wc_total_words + words;
-        wc_total_bytes = wc_total_bytes + bytes;
-        files = files + 1;
-        index = index + 1;
+        status |= wc_count(fd, &counts);
+        close(fd);
+        wc_report(&counts, wantLines, wantWords, wantBytes, argv[index]);
+        total.lines += counts.lines;
+        total.words += counts.words;
+        total.bytes += counts.bytes;
+        files++;
     }
 
     if (files > 1)
-        wc_report(wc_total_lines, wc_total_words, wc_total_bytes, wantLines, wantWords, wantBytes, "total");
+        wc_report(&total, wantLines, wantWords, wantBytes, "total");
     return status;
 }

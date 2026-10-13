@@ -1,7 +1,4 @@
-int main(int argc, char** argv, char** envp)
+int main(void)
 {
-    (void)argc;
-    (void)argv;
-    (void)envp;
     return 0;
 }

@@ -279,7 +279,7 @@ internal sealed class ScalarEvolution
             !_definitions.TryGetValue(name, out var instruction) || (instruction.Flags & GimpleStatementFlags.ReadsMemory) != 0)
             return null;
 
-        var signed = GimpleTypes.IsSigned(name.Type);
+        var noSignedWrap = GimpleTypes.HasUndefinedOverflow(name.Type, _target);
         switch (assign.Subcode)
         {
             case GimpleTreeCode.SsaName:
@@ -292,13 +292,13 @@ internal sealed class ScalarEvolution
                 {
                     if (assign.Operands.Length != 2 || Analyze(assign.Operands[0]) is not { } left || Analyze(assign.Operands[1]) is not { } right)
                         return null;
-                    if (!signed)
+                    if (!noSignedWrap)
                         _unsignedStep = true;
                     return assign.Subcode switch
                     {
-                        GimpleTreeCode.PlusExpr => Scev.Add(left, right, signed),
-                        GimpleTreeCode.MinusExpr => Scev.Negate(right, signed) is { } negated ? Scev.Add(left, negated, signed) : null,
-                        _ => Scev.Multiply(left, right, signed),
+                        GimpleTreeCode.PlusExpr => Scev.Add(left, right, noSignedWrap),
+                        GimpleTreeCode.MinusExpr => Scev.Negate(right, noSignedWrap) is { } negated ? Scev.Add(left, negated, noSignedWrap) : null,
+                        _ => Scev.Multiply(left, right, noSignedWrap),
                     };
                 }
 
@@ -308,13 +308,13 @@ internal sealed class ScalarEvolution
                         assign.Operands[1] is not GimpleConstantValue { Value: var amount } || !TryGetInteger(amount, out var shift) ||
                         shift < 0 || shift >= bits - 1)
                         return null;
-                    if (!signed)
+                    if (!noSignedWrap)
                         _unsignedStep = true;
-                    return Scev.Multiply(left, Scev.Constant(1L << (int)shift, bits), signed);
+                    return Scev.Multiply(left, Scev.Constant(1L << (int)shift, bits), noSignedWrap);
                 }
 
             case GimpleTreeCode.NegateExpr:
-                return assign.Operands.Length == 1 && Analyze(assign.Operands[0]) is { } operandValue ? Scev.Negate(operandValue, signed) : null;
+                return assign.Operands.Length == 1 && Analyze(assign.Operands[0]) is { } operandValue ? Scev.Negate(operandValue, noSignedWrap) : null;
 
             case GimpleTreeCode.NopExpr:
             case GimpleTreeCode.ConvertExpr:
@@ -324,7 +324,7 @@ internal sealed class ScalarEvolution
                     var sourceBits = IntegerBits(assign.Operands[0].Type);
                     if (sourceBits == bits)
                         return operand;
-                    return sourceBits < bits ? Scev.Extend(operand, bits, GimpleTypes.IsSigned(assign.Operands[0].Type)) : null;
+                    return sourceBits < bits ? Scev.Extend(operand, bits, GimpleTypes.IsSigned(assign.Operands[0].Type, _target)) : null;
                 }
 
             default:
@@ -363,8 +363,8 @@ internal sealed class ScalarEvolution
         if (advanced is null || !TryExtractStep(advanced, name, out var step))
             return null;
 
-        var noSignedWrap = GimpleTypes.IsSigned(name.Type) && !unsignedStep;
-        var noUnsignedWrap = !GimpleTypes.IsSigned(name.Type) && step.TryGetConstant(out var stride) && stride == 1 && IsBoundedAbove(name);
+        var noSignedWrap = GimpleTypes.HasUndefinedOverflow(name.Type, _target) && !unsignedStep;
+        var noUnsignedWrap = !GimpleTypes.IsSigned(name.Type, _target) && step.TryGetConstant(out var stride) && stride == 1 && IsBoundedAbove(name);
         return Scev.AddRecurrence(start, step, noSignedWrap, noUnsignedWrap);
     }
 

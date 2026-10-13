@@ -1,94 +1,76 @@
-#define HEAD_BUFFER 512
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
-static int head_parse(const char* text, u64* value)
+static int head_stream(int fd, unsigned long wanted)
 {
-    u64 result = 0ul;
-    if (*text == 0)
-        return 0;
-    while (*text != 0)
-    {
-        if (*text < '0' || *text > '9')
-            return 0;
-        result = result * 10ul + (u64)(*text - '0');
-        text = text + 1;
-    }
-    *value = result;
-    return 1;
-}
-
-static int head_stream(int fd, u64 wanted)
-{
-    char buffer[HEAD_BUFFER];
-    u64 seen = 0ul;
+    char buffer[512];
+    unsigned long seen = 0;
     while (seen < wanted)
     {
-        usize index = 0ul;
-        s64 count = sys_read(fd, buffer, (usize)HEAD_BUFFER);
-        if (count < 0l)
+        ssize_t index;
+        ssize_t count = read(fd, buffer, sizeof(buffer));
+        if (count < 0)
             return 1;
-        if (count == 0l)
+        if (count == 0)
             return 0;
-        while (index < (usize)count && seen < wanted)
+        for (index = 0; index < count && seen < wanted; index++)
         {
-            write_all(1, buffer + index, 1ul);
+            fputc(buffer[index], stdout);
             if (buffer[index] == '\n')
-                seen = seen + 1ul;
-            index = index + 1ul;
+                seen++;
         }
     }
     return 0;
 }
 
-int main(int argc, char** argv, char** envp)
+int main(int argc, char** argv)
 {
-    u64 wanted = 10ul;
+    unsigned long wanted = 10;
     int index = 1;
     int status = 0;
     int files;
-    (void)envp;
 
     while (index < argc && argv[index][0] == '-' && argv[index][1] != 0)
     {
-        if (string_equal(argv[index], "-n") && index + 1 < argc)
+        char* end;
+        if (strcmp(argv[index], "-n") != 0 || index + 1 >= argc)
         {
-            if (!head_parse(argv[index + 1], &wanted))
-            {
-                report("head", argv[index + 1], "is not a count of lines");
-                return 2;
-            }
-            index = index + 2;
-            continue;
+            fputs("head: usage: head [-n count] [file...]\n", stderr);
+            return 2;
         }
-        report("head", (const char*)NULL, "usage: head [-n count] [file...]");
-        return 2;
+        wanted = strtoul(argv[index + 1], &end, 10);
+        if (argv[index + 1][0] < '0' || argv[index + 1][0] > '9' || *end != 0)
+        {
+            fprintf(stderr, "head: %s: is not a count of lines\n", argv[index + 1]);
+            return 2;
+        }
+        index += 2;
     }
 
     if (index == argc)
         return head_stream(0, wanted);
 
     files = argc - index;
-    while (index < argc)
+    for (; index < argc; index++)
     {
-        int fd = open_for_reading("head", argv[index]);
+        int fd = open(argv[index], O_RDONLY);
         if (fd < 0)
         {
+            fprintf(stderr, "head: %s: %s\n", argv[index], errno == ENOENT ? "no such file" : errno == EISDIR ? "is a directory" : "cannot be opened");
             status = 1;
-            index = index + 1;
             continue;
         }
         // Several files each say which one they are, the way head has always done it
         if (files > 1)
-        {
-            write_text("==> ");
-            write_text(argv[index]);
-            write_text(" <==\n");
-        }
-        if (head_stream(fd, wanted) != 0)
-            status = 1;
-        sys_close(fd);
-        index = index + 1;
-        if (files > 1 && index < argc)
-            write_text("\n");
+            printf("==> %s <==\n", argv[index]);
+        status |= head_stream(fd, wanted);
+        close(fd);
+        if (files > 1 && index + 1 < argc)
+            fputc('\n', stdout);
     }
     return status;
 }

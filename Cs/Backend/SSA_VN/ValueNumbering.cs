@@ -188,6 +188,10 @@ namespace Cnidaria.Cs
         CltUn,
         Cgt,
         CgtUn,
+        Min,
+        Max,
+        MinUn,
+        MaxUn,
         Conv,
         SizeOf,
         FieldAddr,
@@ -1416,6 +1420,14 @@ namespace Cnidaria.Cs
                         if (IsAllBitsSet(args[1])) { folded = args[1]; return true; }
                         if (args[0] == args[1]) { folded = args[0]; return true; }
                         break;
+                    case ValueNumberFunction.Min:
+                    case ValueNumberFunction.Max:
+                    case ValueNumberFunction.MinUn:
+                    case ValueNumberFunction.MaxUn:
+                        if (!integerLike)
+                            break;
+                        if (args[0] == args[1]) { folded = args[0]; return true; }
+                        break;
                     case ValueNumberFunction.Xor:
                         if (!integerLike)
                             break;
@@ -1527,6 +1539,10 @@ namespace Cnidaria.Cs
                         ValueNumberFunction.Cgt => VNForInt32(a > b ? 1 : 0),
                         ValueNumberFunction.CltUn => VNForInt32((ulong)a < (ulong)b ? 1 : 0),
                         ValueNumberFunction.CgtUn => VNForInt32((ulong)a > (ulong)b ? 1 : 0),
+                        ValueNumberFunction.Min => VNForInt64(Math.Min(a, b)),
+                        ValueNumberFunction.Max => VNForInt64(Math.Max(a, b)),
+                        ValueNumberFunction.MinUn => VNForInt64(unchecked((long)Math.Min((ulong)a, (ulong)b))),
+                        ValueNumberFunction.MaxUn => VNForInt64(unchecked((long)Math.Max((ulong)a, (ulong)b))),
                         ValueNumberFunction.Div when b != 0 && !(a == long.MinValue && b == -1) => VNForInt64(a / b),
                         ValueNumberFunction.DivUn when b != 0 => VNForInt64(unchecked((long)((ulong)a / (ulong)b))),
                         ValueNumberFunction.Rem when b != 0 && !(a == long.MinValue && b == -1) => VNForInt64(a % b),
@@ -1554,6 +1570,10 @@ namespace Cnidaria.Cs
                         ValueNumberFunction.Cgt => VNForInt32(x > y ? 1 : 0),
                         ValueNumberFunction.CltUn => VNForInt32((uint)x < (uint)y ? 1 : 0),
                         ValueNumberFunction.CgtUn => VNForInt32((uint)x > (uint)y ? 1 : 0),
+                        ValueNumberFunction.Min => VNForInt32(Math.Min(x, y)),
+                        ValueNumberFunction.Max => VNForInt32(Math.Max(x, y)),
+                        ValueNumberFunction.MinUn => VNForInt32(unchecked((int)Math.Min((uint)x, (uint)y))),
+                        ValueNumberFunction.MaxUn => VNForInt32(unchecked((int)Math.Max((uint)x, (uint)y))),
                         ValueNumberFunction.Div when y != 0 && !(x == int.MinValue && y == -1) => VNForInt32(x / y),
                         ValueNumberFunction.DivUn when y != 0 => VNForInt32(unchecked((int)((uint)x / (uint)y))),
                         ValueNumberFunction.Rem when y != 0 && !(x == int.MinValue && y == -1) => VNForInt32(x % y),
@@ -1851,7 +1871,8 @@ namespace Cnidaria.Cs
                function == ValueNumberFunction.And ||
                function == ValueNumberFunction.Or ||
                function == ValueNumberFunction.Xor ||
-               function == ValueNumberFunction.Ceq;
+               function == ValueNumberFunction.Ceq ||
+               function is ValueNumberFunction.Min or ValueNumberFunction.Max or ValueNumberFunction.MinUn or ValueNumberFunction.MaxUn;
 
         private static bool SameRuntimeType(RuntimeType? left, RuntimeType? right)
         {
@@ -3429,6 +3450,11 @@ namespace Cnidaria.Cs
                             result = AddException(result, ValueNumberFunction.NullPtrExc, OperandNormal(operands, 0));
                         break;
 
+                    case GenTreeKind.BoundsCheck:
+                        if (operands.Length == 2 && (node.Flags & GenTreeFlags.BoundsCheckEliminated) == 0)
+                            result = AddException(result, ValueNumberFunction.IndexOutOfRangeExc, OperandNormal(operands, 1), OperandNormal(operands, 0));
+                        break;
+
                     case GenTreeKind.ArrayDataRef:
                         if (operands.Length != 0)
                         {
@@ -3879,6 +3905,10 @@ namespace Cnidaria.Cs
                     GenTreeOperator.CltUn => ValueNumberFunction.CltUn,
                     GenTreeOperator.Cgt => ValueNumberFunction.Cgt,
                     GenTreeOperator.CgtUn => ValueNumberFunction.CgtUn,
+                    GenTreeOperator.Min => ValueNumberFunction.Min,
+                    GenTreeOperator.Max => ValueNumberFunction.Max,
+                    GenTreeOperator.MinUn => ValueNumberFunction.MinUn,
+                    GenTreeOperator.MaxUn => ValueNumberFunction.MaxUn,
                     _ => ValueNumberFunction.None,
                 };
             }

@@ -176,7 +176,7 @@ internal sealed class AssertionTable
                 range = Refine(range, Swap(known.Code), known.Left, scope, depth);
         }
 
-        if (depth > 0 && value is GimpleName derived && GimpleTypes.IsSigned(derived.Type) &&
+        if (depth > 0 && value is GimpleName derived && GimpleTypes.HasUndefinedOverflow(derived.Type, _target) &&
             derived.Definition?.Statement is GimpleAssignStatement { Subcode: GimpleTreeCode.PlusExpr or GimpleTreeCode.MinusExpr, Operands: [GimpleName source, GimpleConstantValue offset] } assign &&
             TryGetConstant(offset, out var amount) && RangeAt(source, scope, depth - 1) is { } sourceRange)
         {
@@ -273,7 +273,7 @@ internal sealed class AssertionTable
                         _ => Multiply(a, b),
                     };
                     // An unsigned result that leaves its type wrapped around; a signed one would have been undefined
-                    return typeRange.Contains(result) || GimpleTypes.IsSigned(name.Type) ? result : null;
+                    return typeRange.Contains(result) || GimpleTypes.HasUndefinedOverflow(name.Type, _target) ? result : null;
                 }
 
             case GimpleTreeCode.LtExpr:
@@ -292,7 +292,7 @@ internal sealed class AssertionTable
 
     private ValueRange? PhiRange(GimplePhi phi, ValueRange typeRange)
     {
-        if (phi.Operands.Length == 2 && GimpleTypes.IsSigned(phi.Result.Type))
+        if (phi.Operands.Length == 2 && GimpleTypes.HasUndefinedOverflow(phi.Result.Type, _target))
         {
             for (var i = 0; i < 2; i++)
             {
@@ -363,10 +363,7 @@ internal sealed class AssertionTable
         var bits = _target.SizeOf(type) * 8;
         if (bits is <= 0 or > 64)
             return false;
-        var signed = type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Char }
-            ? _target.CharSignedness != CharSignedness.Unsigned
-            : GimpleTypes.IsSigned(type);
-        range = signed
+        range = GimpleTypes.IsSigned(type, _target)
             ? new ValueRange(-(Int128.One << (bits - 1)), (Int128.One << (bits - 1)) - 1)
             : new ValueRange(0, (Int128.One << bits) - 1);
         return true;

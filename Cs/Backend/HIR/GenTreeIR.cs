@@ -137,6 +137,7 @@ namespace Cnidaria.Cs
         ArrayElementAddr,
         StoreArrayElement,
         ArrayDataRef,
+        BoundsCheck,
 
         StaticData,
         StackAlloc,
@@ -191,6 +192,12 @@ namespace Cnidaria.Cs
         FnPtrToPtr,
         PtrToFnPtr,
         Leave,
+        Min,
+        Max,
+        MinUn,
+        MaxUn,
+        MulHi,
+        MulHiUn,
     }
     internal static class GenTreeLirKinds
     {
@@ -320,6 +327,7 @@ namespace Cnidaria.Cs
         InlineReturn,
         StructMaterialization,
         CommonSubexpression,
+        Lowering,
     }
     internal readonly struct GenTemp
     {
@@ -1105,8 +1113,8 @@ namespace Cnidaria.Cs
         public RuntimeField? Field { get; }
         public RuntimeMethod? Method { get; }
         public RuntimeIntrinsicId IntrinsicId { get; }
-        public NumericConvKind ConvKind { get; }
-        public NumericConvFlags ConvFlags { get; }
+        public NumericConvKind ConvKind { get; internal set; }
+        public NumericConvFlags ConvFlags { get; internal set; }
         public int TargetPc { get; }
         public int TargetBlockId { get; }
 
@@ -1859,6 +1867,18 @@ namespace Cnidaria.Cs
                 }
                 return max + 1;
             }
+        }
+
+        // Lowering runs after SSA, so its temps are born as enregisterable single-def SSA locals
+        internal GenLocalDescriptor AppendLoweringTemp(RuntimeType? type, GenStackKind stackKind)
+        {
+            int varIndex = 0;
+            for (int i = 0; i < AllLocalDescriptors.Length; i++)
+                varIndex = Math.Max(varIndex, AllLocalDescriptors[i].VarIndex + 1);
+
+            GenLocalDescriptor descriptor = AppendCompilerTemp(GenTempKind.Lowering, type, stackKind);
+            descriptor.MarkRegularPromotedScalar(varIndex);
+            return descriptor;
         }
 
         private static void MarkAddressExposed(ImmutableArray<GenLocalDescriptor> descriptors, ImmutableArray<bool> exposed)

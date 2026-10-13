@@ -370,6 +370,7 @@ namespace Cnidaria.Cs
             private readonly int _maximumSearchDepth;
             private int _remainingBudget;
             private ValueNumber _preferredBound;
+            private int _preferredBoundMaximum;
             private IReadOnlyCollection<int> _activeAssertions = Array.Empty<int>();
             private bool _monotonicIncreasing;
             private readonly Dictionary<ValueNumber, SsaRange> _cache = new();
@@ -426,7 +427,7 @@ namespace Cnidaria.Cs
                             SsaTree candidate = Rebuild(original, rewritten);
 
                             if ((original.Source.Flags & GenTreeFlags.BoundsCheckEliminated) == 0 &&
-                                original.Kind is GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or GenTreeKind.StoreArrayElement &&
+                                original.Kind is GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or GenTreeKind.StoreArrayElement or GenTreeKind.BoundsCheck &&
                                 IsBoundsCheckRedundant(original, active))
                             {
                                 candidate = WithFlags(candidate, candidate.Source.Flags | GenTreeFlags.BoundsCheckEliminated | GenTreeFlags.Ordered);
@@ -474,8 +475,9 @@ namespace Cnidaria.Cs
 
             private bool IsBoundsCheckRedundant(SsaTree tree, IReadOnlyCollection<int> active)
             {
+                bool standalone = tree.Kind == GenTreeKind.BoundsCheck;
                 if (tree.Operands.Length < 2 ||
-                    !TryGetNormalValueNumber(tree.Operands[0].Source, out ValueNumber arrayValue))
+                    !TryGetNormalValueNumber(tree.Operands[standalone ? 1 : 0].Source, out ValueNumber lengthOrArray))
                 {
                     return false;
                 }
@@ -485,16 +487,14 @@ namespace Cnidaria.Cs
                 {
                     indexValue = _store.VNForInt32(tree.Source.BoundsCheckIndexOverride);
                 }
-                else if (!TryGetNormalValueNumber(tree.Operands[1].Source, out indexValue))
+                else if (!TryGetNormalValueNumber(tree.Operands[standalone ? 0 : 1].Source, out indexValue))
                 {
                     return false;
                 }
 
-                ValueNumber lengthValue = _store.VNForFunc(
-                    GenStackKind.I4,
-                    null,
-                    ValueNumberFunction.ArrayLength,
-                    arrayValue);
+                ValueNumber lengthValue = standalone
+                    ? NormalizeRangeValue(lengthOrArray)
+                    : _store.VNForFunc(GenStackKind.I4, null, ValueNumberFunction.ArrayLength, lengthOrArray);
 
                 if (!TryGetProvenRange(indexValue, active, lengthValue, out SsaRange indexRange))
                     return false;
@@ -574,6 +574,9 @@ namespace Cnidaria.Cs
                     return false;
 
                 _preferredBound = NormalizeRangeValue(preferredBound);
+                _preferredBoundMaximum = _store.TryGetEntry(_preferredBound, out var bound) && bound.Function == ValueNumberFunction.ArrayLength
+                    ? Array.MaxLength
+                    : int.MaxValue;
                 _activeAssertions = active;
                 _monotonicIncreasing = false;
                 _cache.Clear();
@@ -618,7 +621,7 @@ namespace Cnidaria.Cs
             private static bool IsRangeNonNegative(SsaRange range)
                 => TryGetLimitMinimum(range.Lower, out int minimum) && minimum >= 0;
 
-            private static bool RangeExcludes(SsaRange range, int value)
+            private bool RangeExcludes(SsaRange range, int value)
             {
                 if (TryGetLimitMinimum(range.Lower, out int minimum) && minimum > value)
                     return true;
@@ -866,7 +869,7 @@ namespace Cnidaria.Cs
                 return true;
             }
 
-            private static bool AddMayOverflow(SsaRange left, SsaRange right)
+            private bool AddMayOverflow(SsaRange left, SsaRange right)
             {
                 bool hasLeftUpper = TryGetLimitMaximum(left.Upper, out int leftUpper);
                 bool hasRightUpper = TryGetLimitMaximum(right.Upper, out int rightUpper);
@@ -883,7 +886,7 @@ namespace Cnidaria.Cs
                 return !upperSafe || !lowerSafe;
             }
 
-            private static bool SubtractMayOverflow(SsaRange left, SsaRange right)
+            private bool SubtractMayOverflow(SsaRange left, SsaRange right)
             {
                 bool hasLeftUpper = TryGetLimitMaximum(left.Upper, out int leftUpper);
                 bool hasRightLower = TryGetLimitMinimum(right.Lower, out int rightLower);
@@ -900,7 +903,7 @@ namespace Cnidaria.Cs
                 return !upperSafe || !lowerSafe;
             }
 
-            private static bool IsRangeSubset(SsaRange candidate, SsaRange container)
+            private bool IsRangeSubset(SsaRange candidate, SsaRange container)
             {
                 if (candidate.IsUnknown || !candidate.IsValid || container.IsUnknown || !container.IsValid)
                     return false;
@@ -908,7 +911,7 @@ namespace Cnidaria.Cs
                        IsUpperAtMost(candidate.Upper, container.Upper);
             }
 
-            private static bool IsLowerAtLeast(SsaRangeLimit candidate, SsaRangeLimit container)
+            private bool IsLowerAtLeast(SsaRangeLimit candidate, SsaRangeLimit container)
             {
                 if (candidate.Equals(container))
                     return true;
@@ -924,7 +927,7 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            private static bool IsUpperAtMost(SsaRangeLimit candidate, SsaRangeLimit container)
+            private bool IsUpperAtMost(SsaRangeLimit candidate, SsaRangeLimit container)
             {
                 if (candidate.Equals(container))
                     return true;
@@ -956,7 +959,7 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            private static bool TryGetLimitMaximum(SsaRangeLimit limit, out int maximum)
+            private bool TryGetLimitMaximum(SsaRangeLimit limit, out int maximum)
             {
                 if (limit.Kind == SsaRangeLimitKind.Constant)
                 {
@@ -965,7 +968,7 @@ namespace Cnidaria.Cs
                 }
                 if (limit.Kind == SsaRangeLimitKind.ArrayBound)
                 {
-                    long value = (long)Array.MaxLength + limit.Value;
+                    long value = (long)_preferredBoundMaximum + limit.Value;
                     if (value >= int.MinValue && value <= int.MaxValue)
                     {
                         maximum = (int)value;

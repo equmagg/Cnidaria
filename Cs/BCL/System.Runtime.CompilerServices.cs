@@ -1,5 +1,7 @@
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
+using System.Runtime.InteropServices;
+using Internal.Runtime;
 
 namespace System.Runtime.CompilerServices
 {
@@ -21,6 +23,13 @@ namespace System.Runtime.CompilerServices
     [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Method | AttributeTargets.Constructor | AttributeTargets.Field | AttributeTargets.Interface, Inherited = false)]
     internal sealed class IntrinsicAttribute : Attribute
     {
+    }
+    [AttributeUsage(AttributeTargets.Property, Inherited = true)]
+    public sealed class IndexerNameAttribute : Attribute
+    {
+        public IndexerNameAttribute(string indexerName)
+        {
+        }
     }
     public static class RuntimeHelpers
     {
@@ -61,6 +70,24 @@ namespace System.Runtime.CompilerServices
 
         [Intrinsic]
         internal static bool IsKnownConstant<T>(T t) where T : struct => false;
+
+        internal static unsafe MethodTable* GetMethodTable(object obj) => (MethodTable*)System.Runtime.RuntimeImports.RhGetObjectTypeHandle(obj);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal class RawArrayData
+    {
+        public uint Length; // Array._numComponents padded to IntPtr
+#if TARGET_64BIT
+        public uint Padding;
+#endif
+        public byte Data;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal class RawData
+    {
+        public byte Data;
     }
     public enum MethodImplOptions
     {

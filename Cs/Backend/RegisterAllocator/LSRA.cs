@@ -6818,6 +6818,10 @@ namespace Cnidaria.Cs
                     case GenTreeOperator.And:
                     case GenTreeOperator.Or:
                     case GenTreeOperator.Xor:
+                    case GenTreeOperator.Min:
+                    case GenTreeOperator.Max:
+                    case GenTreeOperator.MinUn:
+                    case GenTreeOperator.MaxUn:
                         AddDirectedClassCompatiblePreference(method, result, node.RegisterResult!, node.RegisterUses[0]);
                         AddDirectedClassCompatiblePreference(method, result, node.RegisterResult!, node.RegisterUses[1]);
                         return;

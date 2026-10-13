@@ -1,16 +1,13 @@
-int main(int argc, char** argv, char** envp)
-{
-    int index = 0;
-    (void)argc;
-    (void)argv;
+#include <stdio.h>
+#include <unistd.h>
 
-    if (envp == (char**)NULL)
-        return 0;
-    while (envp[index] != (char*)NULL)
+int main(void)
+{
+    char** entry = environ;
+    while (entry != NULL && *entry != NULL)
     {
-        write_text(envp[index]);
-        write_text("\n");
-        index = index + 1;
+        puts(*entry);
+        entry++;
     }
     return 0;
 }

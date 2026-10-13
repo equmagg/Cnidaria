@@ -1,240 +1,159 @@
-#define LS_MAX_ENTRIES 128
-#define LS_NAME_CAPACITY 768
-#define LS_PATH_CAPACITY 2048
+#include <dirent.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+
 #define LS_TERMINAL_COLUMNS 80
 
-static char ls_names[LS_MAX_ENTRIES][LS_NAME_CAPACITY];
-static u32 ls_kinds[LS_MAX_ENTRIES];
-static int ls_count;
-
-static void ls_remember(const char* name, u32 kind)
+struct entry
 {
-    int index = 0;
-    if (ls_count == LS_MAX_ENTRIES)
-        return;
-    while (index < LS_NAME_CAPACITY - 1 && name[index] != 0)
-    {
-        ls_names[ls_count][index] = name[index];
-        index = index + 1;
-    }
-    ls_names[ls_count][index] = 0;
-    ls_kinds[ls_count] = kind;
-    ls_count = ls_count + 1;
-}
+    char* name;
+    unsigned char type;
+};
 
-static int ls_before(const char* left, const char* right)
-{
-    usize index = 0ul;
-    while (left[index] != 0 && right[index] != 0)
-    {
-        if (left[index] != right[index])
-            return (u8)left[index] < (u8)right[index];
-        index = index + 1ul;
-    }
-    return right[index] != 0;
-}
+static struct entry* entries;
+static int entry_count;
+static int entry_capacity;
 
-// The names come out of the directory in the order it stores them, and a listing is sorted
-static void ls_sort(void)
+static void remember(const char* name, unsigned char type)
 {
-    int outer = 1;
-    while (outer < ls_count)
+    if (entry_count == entry_capacity)
     {
-        char name[LS_NAME_CAPACITY];
-        u32 kind = ls_kinds[outer];
-        int inner = outer - 1;
-        int index = 0;
-        while (index < LS_NAME_CAPACITY)
+        entry_capacity = entry_capacity < 32 ? 32 : entry_capacity * 2;
+        entries = (struct entry*)realloc(entries, (size_t)entry_capacity * sizeof(struct entry));
+        if (entries == NULL)
         {
-            name[index] = ls_names[outer][index];
-            index = index + 1;
+            fputs("ls: out of memory\n", stderr);
+            exit(1);
         }
-        while (inner >= 0 && ls_before(name, ls_names[inner]))
-        {
-            index = 0;
-            while (index < LS_NAME_CAPACITY)
-            {
-                ls_names[inner + 1][index] = ls_names[inner][index];
-                index = index + 1;
-            }
-            ls_kinds[inner + 1] = ls_kinds[inner];
-            inner = inner - 1;
-        }
-        index = 0;
-        while (index < LS_NAME_CAPACITY)
-        {
-            ls_names[inner + 1][index] = name[index];
-            index = index + 1;
-        }
-        ls_kinds[inner + 1] = kind;
-        outer = outer + 1;
     }
+    entries[entry_count].name = strdup(name);
+    entries[entry_count].type = type;
+    entry_count++;
 }
 
-static u16 ls_load_u16(const u8* bytes)
+static void forget_all(void)
 {
-    return (u16)((u16)bytes[0] | ((u16)bytes[1] << 8));
+    while (entry_count > 0)
+        free(entries[--entry_count].name);
 }
 
-static void ls_build_path(const char* directory, const char* name, char* path)
+static int by_name(const void* left, const void* right)
 {
-    int index = 0;
-    // A name in the working directory stands on its own; anywhere else it hangs off its directory
-    if (!(directory[0] == '.' && directory[1] == 0))
+    return strcmp(((const struct entry*)left)->name, ((const struct entry*)right)->name);
+}
+
+// A name in the working directory stands on its own; anywhere else it hangs off its directory
+static void build_path(const char* directory, const char* name, char* path, size_t capacity)
+{
+    if (strcmp(directory, ".") == 0 || directory[0] == 0)
+        snprintf(path, capacity, "%s", name);
+    else if (strcmp(directory, "/") == 0)
+        snprintf(path, capacity, "/%s", name);
+    else
+        snprintf(path, capacity, "%s/%s", directory, name);
+}
+
+static void write_long(const char* directory, const char* name, unsigned char type)
+{
+    char path[1024];
+    struct stat info;
+    unsigned int mode;
+    unsigned long size = 0;
+    int bit;
+    build_path(directory, name, path, sizeof(path));
+    if (stat(path, &info) == 0)
     {
-        if (!(directory[0] == '/' && directory[1] == 0))
-        {
-            while (directory[index] != 0 && index < LS_PATH_CAPACITY - LS_NAME_CAPACITY)
-            {
-                path[index] = directory[index];
-                index = index + 1;
-            }
-        }
-        path[index] = '/';
-        index = index + 1;
+        mode = (unsigned int)info.st_mode;
+        size = (unsigned long)info.st_size;
     }
-    while (*name != 0 && index < LS_PATH_CAPACITY - 1)
-    {
-        path[index] = *name;
-        index = index + 1;
-        name = name + 1;
-    }
-    path[index] = 0;
-}
+    else
+        mode = type == DT_DIR ? S_IFDIR : type == DT_CHR ? S_IFCHR : S_IFREG;
 
-// The nine bits every listing spells out as three groups of three
-static void ls_write_permissions(u32 mode)
-{
-    int bit = 8;
-    while (bit >= 0)
-    {
-        int set = (mode & (1u << bit)) != 0u;
-        write_text(!set ? "-" : bit % 3 == 2 ? "r" : bit % 3 == 1 ? "w" : "x");
-        bit = bit - 1;
-    }
-}
-
-static void ls_write_long(const char* directory, const char* name, u32 kind)
-{
-    char path[LS_PATH_CAPACITY];
-    u32 mode;
-    ls_build_path(directory, name, path);
-    mode = path_mode(path);
-    if (mode == 0u)
-        mode = kind == DT_DIR ? S_IFDIR : kind == DT_CHR ? S_IFCHR : S_IFREG;
-
-    write_text((mode & S_IFMT) == S_IFDIR ? "d" : (mode & S_IFMT) == S_IFCHR ? "c" : "-");
-    ls_write_permissions(mode);
-    write_text(" ");
-    write_unsigned_to(1, (mode & S_IFMT) == S_IFDIR ? 0ul : path_size(path), 8, ' ');
-    write_text(" ");
-    write_text(name);
-    write_text("\n");
+    // The nine bits every listing spells out as three groups of three
+    fputc(S_ISDIR(mode) ? 'd' : S_ISCHR(mode) ? 'c' : '-', stdout);
+    for (bit = 8; bit >= 0; bit--)
+        fputc((mode & (1u << bit)) == 0 ? '-' : bit % 3 == 2 ? 'r' : bit % 3 == 1 ? 'w' : 'x', stdout);
+    printf(" %8lu %s\n", S_ISDIR(mode) ? 0ul : size, name);
 }
 
 // Names go across the screen the way a terminal shows them, as many to a line as fit
-static void ls_write_columns(void)
+static void write_columns(void)
 {
     int widest = 0;
     int width;
     int columns;
-    int index = 0;
-    while (index < ls_count)
+    int index;
+    for (index = 0; index < entry_count; index++)
     {
-        int length = (int)string_length(ls_names[index]);
+        int length = (int)strlen(entries[index].name);
         if (length > widest)
             widest = length;
-        index = index + 1;
     }
     width = widest + 2;
     columns = LS_TERMINAL_COLUMNS / width;
     if (columns < 1)
         columns = 1;
 
-    index = 0;
-    while (index < ls_count)
+    for (index = 0; index < entry_count; index++)
     {
-        int column = index % columns;
-        int padding = width - (int)string_length(ls_names[index]);
-        write_text(ls_names[index]);
-        index = index + 1;
-        if (column == columns - 1 || index == ls_count)
-        {
-            write_text("\n");
-            continue;
-        }
-        while (padding > 0)
-        {
-            write_text(" ");
-            padding = padding - 1;
-        }
+        int last = index % columns == columns - 1 || index + 1 == entry_count;
+        if (last)
+            printf("%s\n", entries[index].name);
+        else
+            printf("%-*s", width, entries[index].name);
     }
 }
 
-static int ls_directory(const char* path, int all, int longFormat, int onePerLine)
+static int list_directory(const char* path, int all, int longFormat, int onePerLine)
 {
-    u8 buffer[2048];
-    s64 fd = sys_openat((s64)AT_FDCWD, path, O_RDONLY, 0ul);
+    struct dirent* item;
+    DIR* directory = opendir(path);
     int index;
-    if (fd < 0l)
+    if (directory == NULL)
     {
-        report("ls", path, fd == -2l ? "no such file or directory" : "cannot be opened");
+        fprintf(stderr, "ls: %s: %s\n", path, errno == ENOENT ? "no such file or directory" : "cannot be opened");
         return 1;
     }
-
-    ls_count = 0;
-    for (;;)
+    while ((item = readdir(directory)) != NULL)
     {
-        s64 count = sys_getdents64((int)fd, buffer, sizeof(buffer));
-        usize offset = 0ul;
-        if (count <= 0l)
-            break;
-        while (offset < (usize)count)
+        if (all || item->d_name[0] != '.')
+            remember(item->d_name, item->d_type);
+    }
+    closedir(directory);
+    qsort(entries, (size_t)entry_count, sizeof(struct entry), by_name);
+
+    if (longFormat || onePerLine)
+    {
+        for (index = 0; index < entry_count; index++)
         {
-            u16 record = ls_load_u16(buffer + offset + 16ul);
-            const char* name;
-            if (record < 20u || offset + (usize)record > (usize)count)
-                break;
-            name = (const char*)(buffer + offset + 19ul);
-            if (all || name[0] != '.')
-                ls_remember(name, (u32)buffer[offset + 18ul]);
-            offset = offset + (usize)record;
+            if (longFormat)
+                write_long(path, entries[index].name, entries[index].type);
+            else
+                puts(entries[index].name);
         }
     }
-    sys_close((int)fd);
-    ls_sort();
-
-    index = 0;
-    while (index < ls_count)
-    {
-        if (longFormat)
-            ls_write_long(path, ls_names[index], ls_kinds[index]);
-        else if (onePerLine)
-        {
-            write_text(ls_names[index]);
-            write_text("\n");
-        }
-        index = index + 1;
-    }
-    if (!longFormat && !onePerLine)
-        ls_write_columns();
+    else
+        write_columns();
+    forget_all();
     return 0;
 }
 
-int main(int argc, char** argv, char** envp)
+int main(int argc, char** argv)
 {
     int all = 0;
     int longFormat = 0;
     int onePerLine = 0;
     int index = 1;
-    int paths = 0;
+    int paths;
     int status = 0;
-    (void)envp;
 
     while (index < argc && argv[index][0] == '-' && argv[index][1] != 0)
     {
         const char* flags = argv[index] + 1;
-        while (*flags != 0)
+        for (; *flags != 0; flags++)
         {
             if (*flags == 'a')
                 all = 1;
@@ -244,44 +163,33 @@ int main(int argc, char** argv, char** envp)
                 onePerLine = 1;
             else
             {
-                report("ls", (const char*)NULL, "usage: ls [-a] [-l] [-1] [path...]");
+                fputs("ls: usage: ls [-a] [-l] [-1] [path...]\n", stderr);
                 return 2;
             }
-            flags = flags + 1;
         }
-        index = index + 1;
+        index++;
     }
 
     paths = argc - index;
     if (paths == 0)
-        return ls_directory(".", all, longFormat, onePerLine);
+        return list_directory(".", all, longFormat, onePerLine);
 
-    while (index < argc)
+    for (; index < argc; index++)
     {
-        u32 mode = path_mode(argv[index]);
-        if (mode != 0u && (mode & S_IFMT) != S_IFDIR)
+        struct stat info;
+        if (stat(argv[index], &info) == 0 && !S_ISDIR(info.st_mode))
         {
             if (longFormat)
-                ls_write_long("", argv[index], DT_REG);
+                write_long("", argv[index], DT_REG);
             else
-            {
-                write_text(argv[index]);
-                write_text("\n");
-            }
+                puts(argv[index]);
+            continue;
         }
-        else
-        {
-            if (paths > 1)
-            {
-                write_text(argv[index]);
-                write_text(":\n");
-            }
-            if (ls_directory(argv[index], all, longFormat, onePerLine) != 0)
-                status = 1;
-            if (paths > 1 && index + 1 < argc)
-                write_text("\n");
-        }
-        index = index + 1;
+        if (paths > 1)
+            printf("%s:\n", argv[index]);
+        status |= list_directory(argv[index], all, longFormat, onePerLine);
+        if (paths > 1 && index + 1 < argc)
+            fputc('\n', stdout);
     }
     return status;
 }

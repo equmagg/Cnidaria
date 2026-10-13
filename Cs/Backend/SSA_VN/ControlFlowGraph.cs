@@ -1658,4 +1658,173 @@ namespace Cnidaria.Cs
         }
     }
 
+    internal static class RuntimeEhKind
+    {
+        public const int Catch = 1;
+        public const int CatchAll = 2;
+        public const int Finally = 3;
+        public const int Fault = 4;
+    }
+
+    internal static class RuntimeRegionKind
+    {
+        public const int Frame = 0;
+        public const int Frameless = 1;
+        public const int Funclet = 2;
+    }
+
+    internal readonly struct FuncletLeave
+    {
+        public readonly ImmutableArray<int> Finallys;
+        public readonly bool ReturnsFromFunclet;
+        public readonly int TargetFunclet;
+
+        public FuncletLeave(ImmutableArray<int> finallys, bool returnsFromFunclet, int targetFunclet)
+        {
+            Finallys = finallys;
+            ReturnsFromFunclet = returnsFromFunclet;
+            TargetFunclet = targetFunclet;
+        }
+    }
+
+    internal sealed class CatchContinuation
+    {
+        public int Funclet { get; }
+        public int TargetBlockId { get; }
+        public ImmutableArray<int> Finallys { get; }
+        public string? Label { get; set; }
+
+        public CatchContinuation(int funclet, int targetBlockId, ImmutableArray<int> finallys)
+        {
+            Funclet = funclet;
+            TargetBlockId = targetBlockId;
+            Finallys = finallys;
+        }
+    }
+
+    internal sealed class FuncletPlan
+    {
+        private readonly GenTreeMethod _method;
+        private readonly int[] _funcletByBlock;
+        private readonly int[] _clauseByRegion;
+        private readonly int[] _clauseByFunclet;
+        private readonly Dictionary<(int Funclet, int Target, string Finallys), CatchContinuation> _stubs = new();
+
+        public ImmutableArray<CfgExceptionRegion> Clauses { get; }
+        public ImmutableArray<int> ClauseKinds { get; }
+        public List<CatchContinuation> ContinuationStubs { get; } = new();
+
+        private FuncletPlan(GenTreeMethod method)
+        {
+            _method = method;
+            ControlFlowGraph cfg = method.Cfg;
+            ImmutableArray<int> order = EhFuncletLayout.ComputeVmRegionOrder(cfg);
+            var clauses = ImmutableArray.CreateBuilder<CfgExceptionRegion>(order.Length);
+            var kinds = ImmutableArray.CreateBuilder<int>(order.Length);
+            _clauseByRegion = new int[cfg.ExceptionRegions.Length];
+            for (int i = 0; i < order.Length; i++)
+            {
+                CfgExceptionRegion region = cfg.ExceptionRegions[order[i]];
+                _clauseByRegion[region.Index] = i;
+                clauses.Add(region);
+                kinds.Add(region.Kind switch
+                {
+                    CfgExceptionRegionKind.Catch => region.CatchTypeToken == 0 ? RuntimeEhKind.CatchAll : RuntimeEhKind.Catch,
+                    CfgExceptionRegionKind.Finally => RuntimeEhKind.Finally,
+                    CfgExceptionRegionKind.Fault => RuntimeEhKind.Fault,
+                    _ => throw new NotSupportedException(
+                        $"Exception filters are not supported in method M{method.RuntimeMethod.MethodId} '{method.RuntimeMethod.Name}'."),
+                });
+            }
+
+            Clauses = clauses.ToImmutable();
+            ClauseKinds = kinds.ToImmutable();
+
+            _funcletByBlock = new int[method.Blocks.Length];
+            _clauseByFunclet = new int[Math.Max(1, method.Funclets.Length)];
+            _clauseByFunclet[0] = -1;
+            for (int f = 0; f < method.Funclets.Length; f++)
+            {
+                RegisterFunclet funclet = method.Funclets[f];
+                if (!funclet.IsRoot)
+                    _clauseByFunclet[funclet.Index] = _clauseByRegion[funclet.ExceptionRegionIndex];
+                for (int b = 0; b < funclet.BlockIds.Length; b++)
+                    _funcletByBlock[funclet.BlockIds[b]] = funclet.Index;
+            }
+        }
+
+        public static FuncletPlan? Create(GenTreeMethod method)
+            => method.Cfg.ExceptionRegions.Length == 0 ? null : new FuncletPlan(method);
+
+        public int FuncletCount => _method.Funclets.Length - 1;
+
+        public int FuncletForBlock(int blockId) => _funcletByBlock[blockId];
+
+        public int ClauseForFunclet(int funcletIndex) => _clauseByFunclet[funcletIndex];
+
+        public bool IsCatchFunclet(int funcletIndex)
+            => funcletIndex > 0 && ClauseKinds[_clauseByFunclet[funcletIndex]] is RuntimeEhKind.Catch or RuntimeEhKind.CatchAll;
+
+        public FuncletLeave PlanLeave(int sourceBlockId, int targetBlockId)
+        {
+            int sourceFunclet = FuncletForBlock(sourceBlockId);
+            int targetFunclet = FuncletForBlock(targetBlockId);
+            bool returnsFromFunclet = sourceFunclet != targetFunclet;
+            if (returnsFromFunclet && !IsCatchFunclet(sourceFunclet))
+                throw new NotSupportedException($"Leave from a non-catch handler in method M{_method.RuntimeMethod.MethodId}.");
+            return new FuncletLeave(CrossedFinallys(sourceBlockId, targetBlockId), returnsFromFunclet, targetFunclet);
+        }
+
+        public ImmutableArray<int> CrossedFinallys(int sourceBlockId, int targetBlockId)
+        {
+            ImmutableArray<int> sourceTrys = _method.Cfg.Blocks[sourceBlockId].TryRegionIndexes;
+            ImmutableArray<int> targetTrys = targetBlockId < 0 ? ImmutableArray<int>.Empty : _method.Cfg.Blocks[targetBlockId].TryRegionIndexes;
+            var result = new List<int>();
+            for (int i = 0; i < sourceTrys.Length; i++)
+            {
+                int clause = _clauseByRegion[sourceTrys[i]];
+                if (ClauseKinds[clause] != RuntimeEhKind.Finally || targetTrys.Contains(sourceTrys[i]))
+                    continue;
+                result.Add(clause);
+            }
+
+            result.Sort((left, right) =>
+            {
+                int c = Clauses[left].TrySpanPc.CompareTo(Clauses[right].TrySpanPc);
+                return c != 0 ? c : Clauses[left].SourceHandlerIndex.CompareTo(Clauses[right].SourceHandlerIndex);
+            });
+            return result.ToImmutableArray();
+        }
+
+        public CatchContinuation GetContinuationStub(int funclet, int targetBlockId, ImmutableArray<int> finallys)
+        {
+            var key = (funclet, targetBlockId, string.Join(",", finallys));
+            if (!_stubs.TryGetValue(key, out CatchContinuation? stub))
+            {
+                stub = new CatchContinuation(funclet, targetBlockId, finallys);
+                _stubs.Add(key, stub);
+                ContinuationStubs.Add(stub);
+            }
+
+            return stub;
+        }
+
+        // Catch returns name their continuation stubs before the region that holds the stubs is emitted
+        public void PlanContinuationStubs()
+        {
+            for (int b = 0; b < _method.Blocks.Length; b++)
+            {
+                if (!IsCatchFunclet(FuncletForBlock(b)))
+                    continue;
+                foreach (GenTree node in _method.Blocks[b].LinearNodes)
+                {
+                    if (node.TreeKind != GenTreeKind.Branch || node.Operator != GenTreeOperator.Leave)
+                        continue;
+                    FuncletLeave plan = PlanLeave(b, node.TargetBlockId);
+                    if (plan.ReturnsFromFunclet && plan.Finallys.Length != 0)
+                        GetContinuationStub(plan.TargetFunclet, node.TargetBlockId, plan.Finallys);
+                }
+            }
+        }
+    }
 }

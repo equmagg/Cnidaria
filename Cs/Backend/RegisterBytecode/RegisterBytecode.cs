@@ -590,21 +590,9 @@ namespace Cnidaria.Cs
         BoxAddr = 660,
         BoxSegments = 661,
 
-        CallVoid = 704,
-        CallI = 705,
-        CallF = 706,
-        CallRef = 707,
-        CallValue = 708,
-        CallInternalVoid = 719,
-        CallInternalI = 720,
-        CallInternalF = 721,
-        CallInternalRef = 722,
-        CallInternalValue = 723,
-        CallIndirectVoid = 724,
-        CallIndirectI = 725,
-        CallIndirectF = 726,
-        CallIndirectRef = 727,
-        CallIndirectValue = 728,
+        Call = 704,
+        CallInternal = 705,
+        CallIndirect = 706,
         StackAlloc = 768,
         PtrAddI32 = 769,
         PtrAddI64 = 770,
@@ -1427,7 +1415,7 @@ namespace Cnidaria.Cs
                 return;
             }
 
-            if (IsNonInternalDirectCallInstruction(inst.Op))
+            if (inst.Op == Op.Call)
             {
                 int targetPc = CheckedPc(inst.Imm, pc, "direct call target");
                 if (!MethodIndexByEntryPc.ContainsKey(targetPc))
@@ -1435,7 +1423,7 @@ namespace Cnidaria.Cs
                 return;
             }
 
-            if (IsInternalDirectCall(inst.Op))
+            if (inst.Op == Op.CallInternal)
             {
                 if (inst.Imm < 0 || inst.Imm > int.MaxValue)
                     throw new InvalidOperationException($"Invalid internal-call runtime method id at PC {pc}");
@@ -1478,12 +1466,6 @@ namespace Cnidaria.Cs
 
         private static bool IsArrayElementLayoutInstruction(Op op)
             => IsArrayInstruction(op) && op is not (Op.LdLen or Op.LdArrayDataAddr);
-
-        private static bool IsNonInternalDirectCallInstruction(Op op)
-            => op is Op.CallVoid or Op.CallI or Op.CallF or Op.CallRef or Op.CallValue;
-
-        private static bool IsInternalDirectCall(Op op)
-            => IsOpInRange(op, Op.CallInternalVoid, Op.CallInternalValue);
 
 
         private void ValidateMethodSideTables(int[] methodByPc)
@@ -1691,7 +1673,7 @@ namespace Cnidaria.Cs
             {
                 ValidatePointerInstruction(pc, inst);
             }
-            else if (IsIndirectCall(inst.Op))
+            else if (inst.Op == Op.CallIndirect)
             {
                 RequireGpr(inst.Rs1, pc, nameof(inst.Rs1));
             }
@@ -1954,9 +1936,6 @@ namespace Cnidaria.Cs
                 or Op.BrF32LtUn or Op.BrF32LeUn or Op.BrF32GtUn or Op.BrF32GeUn
                 or Op.BrF64LtUn or Op.BrF64LeUn or Op.BrF64GtUn or Op.BrF64GeUn;
 
-        private static bool IsCallInstruction(Op op)
-            => IsOpInRange(op, Op.CallVoid, Op.CallIndirectValue);
-
         private static bool IsSwitchInstruction(Op op)
             => op is Op.SwitchI32 or Op.SwitchI64;
 
@@ -1975,9 +1954,6 @@ namespace Cnidaria.Cs
 
         private static bool IsPointerInstruction(Op op)
             => IsOpInRange(op, Op.StackAlloc, Op.PtrToByRef);
-
-        private static bool IsIndirectCall(Op op)
-            => IsOpInRange(op, Op.CallIndirectVoid, Op.CallIndirectValue);
 
         private static bool IsIntegerImmediate(Op op)
             => op is Op.I32AddImm or Op.I32SubImm or Op.I32MulImm or Op.I32AndImm or Op.I32OrImm or Op.I32XorImm
@@ -2738,21 +2714,8 @@ namespace Cnidaria.Cs
         public void IsInst(MachineRegister rd, MachineRegister source, int runtimeTypeId)
             => Emit(new InstrDesc(Op.IsInst, RegisterVmIsa.EncodeRegister(rd), RegisterVmIsa.EncodeRegister(source), imm: runtimeTypeId));
 
-        public void CallDirect(Op op, Label target, CallFlags flags = CallFlags.None)
-        {
-            if (!IsDirectManagedCallOp(op))
-                throw new ArgumentOutOfRangeException(nameof(op));
-            EmitTarget(InstrDesc.Call(op, -1, flags), target);
-        }
-
-        public void CallVoid(Label target, CallFlags flags = CallFlags.None) => CallDirect(Op.CallVoid, target, flags);
-        public void CallI(Label target, CallFlags flags = CallFlags.None) => CallDirect(Op.CallI, target, flags);
-        public void CallF(Label target, CallFlags flags = CallFlags.None) => CallDirect(Op.CallF, target, flags);
-        public void CallRef(Label target, CallFlags flags = CallFlags.None) => CallDirect(Op.CallRef, target, flags);
-        public void CallValue(Label target, CallFlags flags = CallFlags.HiddenReturnBuffer) => CallDirect(Op.CallValue, target, flags);
-
-        private static bool IsDirectManagedCallOp(Op op)
-            => op is Op.CallVoid or Op.CallI or Op.CallF or Op.CallRef or Op.CallValue;
+        public void CallDirect(Label target, CallFlags flags = CallFlags.None)
+            => EmitTarget(InstrDesc.Call(Op.Call, -1, flags), target);
 
         private void EmitTarget(InstrDesc instruction, Label target)
         {
@@ -3591,13 +3554,13 @@ namespace Cnidaria.Cs
             if (inst.Op is Op.RefEq or Op.RefNe or Op.RuntimeTypeEquals)
                 return FormatRegister(inst.Rd) + ", " + FormatRegister(inst.Rs1) + ", " + FormatRegister(inst.Rs2);
 
-            if (IsNonInternalDirectCallInstruction(inst.Op))
+            if (inst.Op == Op.Call)
                 return FormatTarget(inst.Imm, labels, options) + FormatCallFlags(inst.Aux);
 
-            if (IsInternalDirectCall(inst.Op))
+            if (inst.Op == Op.CallInternal)
                 return $"internal M{inst.Imm}" + FormatCallFlags(inst.Aux);
 
-            if (IsIndirectCall(inst.Op))
+            if (inst.Op == Op.CallIndirect)
                 return "*" + FormatRegister(inst.Rs1) + FormatCallFlags(inst.Aux);
 
 
@@ -3625,7 +3588,7 @@ namespace Cnidaria.Cs
             if (IsAddressMemoryInstruction(inst.Op))
                 return FormatMemoryAux(inst.Aux);
 
-            if (IsDirectCall(inst.Op) || IsIndirectCall(inst.Op))
+            if (inst.Op is Op.Call or Op.CallInternal or Op.CallIndirect)
                 return string.Empty;
 
             var flags = (InstructionFlags)inst.Aux;
@@ -3916,18 +3879,6 @@ namespace Cnidaria.Cs
 
         private static bool IsArrayInstruction(Op op)
             => IsOpInRange(op, Op.LdLen, Op.LdArrayDataAddr);
-
-        private static bool IsDirectCall(Op op)
-            => IsNonInternalDirectCallInstruction(op) || IsInternalDirectCall(op);
-
-        private static bool IsNonInternalDirectCallInstruction(Op op)
-            => op is Op.CallVoid or Op.CallI or Op.CallF or Op.CallRef or Op.CallValue;
-
-        private static bool IsInternalDirectCall(Op op)
-            => IsOpInRange(op, Op.CallInternalVoid, Op.CallInternalValue);
-
-        private static bool IsIndirectCall(Op op)
-            => IsOpInRange(op, Op.CallIndirectVoid, Op.CallIndirectValue);
 
         private static bool IsPointerOp(Op op)
             => IsOpInRange(op, Op.StackAlloc, Op.StaticData);

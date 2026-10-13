@@ -1,44 +1,62 @@
-#define CP_BUFFER 512
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
 
-int main(int argc, char** argv, char** envp)
+int main(int argc, char** argv)
 {
-    char buffer[CP_BUFFER];
+    char buffer[512];
     int source;
     int target;
-    (void)envp;
 
     if (argc != 3)
     {
-        report("cp", (const char*)NULL, "usage: cp source target");
+        fputs("cp: usage: cp source target\n", stderr);
         return 2;
     }
 
-    source = open_for_reading("cp", argv[1]);
+    source = open(argv[1], O_RDONLY);
     if (source < 0)
+    {
+        fprintf(stderr, "cp: %s: %s\n", argv[1], errno == ENOENT ? "no such file" : errno == EISDIR ? "is a directory" : "cannot be opened");
         return 1;
-    target = open_for_writing("cp", argv[2], 0);
+    }
+    target = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (target < 0)
     {
-        sys_close(source);
+        fprintf(stderr, "cp: %s: %s\n", argv[2], errno == EISDIR ? "is a directory" : errno == ENOSPC ? "leaves no room" : "cannot be written");
+        close(source);
         return 1;
     }
 
     for (;;)
     {
-        s64 count = sys_read(source, buffer, (usize)CP_BUFFER);
-        if (count < 0l)
+        ssize_t count = read(source, buffer, sizeof(buffer));
+        ssize_t written = 0;
+        if (count < 0)
         {
-            report("cp", argv[1], "cannot be read");
-            sys_close(source);
-            sys_close(target);
+            fprintf(stderr, "cp: %s: cannot be read\n", argv[1]);
+            close(source);
+            close(target);
             return 1;
         }
-        if (count == 0l)
+        if (count == 0)
             break;
-        write_all(target, buffer, (usize)count);
+        while (written < count)
+        {
+            ssize_t step = write(target, buffer + written, (size_t)(count - written));
+            if (step <= 0)
+            {
+                fprintf(stderr, "cp: %s: cannot be written\n", argv[2]);
+                close(source);
+                close(target);
+                return 1;
+            }
+            written += step;
+        }
     }
 
-    sys_close(source);
-    sys_close(target);
+    close(source);
+    close(target);
     return 0;
 }

@@ -533,6 +533,7 @@ public sealed class TargetInfo
     public PrimitiveLayout BoolLayout { get; }
     public TargetEndianness Endianness { get; }
     public CharSignedness CharSignedness { get; }
+    public bool IsCharSigned => CharSignedness != CharSignedness.Unsigned;
     public bool Is32Bit => PointerSize == 4;
     public bool Is64Bit => PointerSize == 8;
     public bool IsRegisterBytecode => Architecture is TargetArchitectureKind.RegisterBytecode or TargetArchitectureKind.RegisterBytecode64;
@@ -645,7 +646,7 @@ public sealed class TargetInfo
             longDoubleLayout: new PrimitiveLayout(16, 16),
             boolLayout: new PrimitiveLayout(1, 1),
             endianness: TargetEndianness.Little,
-            charSignedness: CharSignedness.ImplementationDefined,
+            charSignedness: CharSignedness.Signed,
             architecture: TargetArchitectureKind.RegisterBytecode);
 
     private static TargetInfo CreateILP32(TargetArchitectureKind architecture, TargetArchitectureFeatures features, OperatingSystemKind operatingSystem)
@@ -664,7 +665,7 @@ public sealed class TargetInfo
             longDoubleLayout: new PrimitiveLayout(16, 16),
             boolLayout: new PrimitiveLayout(1, 1),
             endianness: TargetEndianness.Little,
-            charSignedness: CharSignedness.ImplementationDefined,
+            charSignedness: PlainCharSignedness(architecture),
             architecture: architecture,
             operatingSystem: operatingSystem,
             features: features);
@@ -685,10 +686,15 @@ public sealed class TargetInfo
             longDoubleLayout: new PrimitiveLayout(16, 16),
             boolLayout: new PrimitiveLayout(1, 1),
             endianness: TargetEndianness.Little,
-            charSignedness: CharSignedness.ImplementationDefined,
+            charSignedness: PlainCharSignedness(architecture),
             architecture: architecture,
             operatingSystem: operatingSystem,
             features: features);
+
+    private static CharSignedness PlainCharSignedness(TargetArchitectureKind architecture)
+        => architecture is TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64
+            ? CharSignedness.Unsigned
+            : CharSignedness.Signed;
 
     private static TargetInfo CreateArm32(TargetArchitectureFeatures features, OperatingSystemKind operatingSystem)
         => new TargetInfo(
@@ -769,7 +775,7 @@ public sealed class TargetInfo
             longDoubleLayout: new PrimitiveLayout(8, 8),
             boolLayout: new PrimitiveLayout(1, 1),
             endianness: TargetEndianness.Little,
-            charSignedness: CharSignedness.ImplementationDefined,
+            charSignedness: CharSignedness.Signed,
             architecture: TargetArchitectureKind.X86_64,
             operatingSystem: OperatingSystemKind.Windows,
              features: features);

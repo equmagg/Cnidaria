@@ -629,7 +629,7 @@ namespace Cnidaria.Cs
                 }
 
                 if ((tree.Source.Flags & GenTreeFlags.BoundsCheckEliminated) == 0 &&
-                    tree.Kind is GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or GenTreeKind.StoreArrayElement)
+                    tree.Kind is GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or GenTreeKind.StoreArrayElement or GenTreeKind.BoundsCheck)
                 {
                     AddBoundsAssertionAfter(tree);
                 }
@@ -691,17 +691,11 @@ namespace Cnidaria.Cs
             {
                 if (tree.Operands.Length < 2)
                     return;
-                if (!TryGetNormalValueNumber(tree.Operands[0].Source, out var arrayValue) ||
+                if (!TryGetBoundsCheckLengthValue(tree, out var lengthValue) ||
                     !TryGetBoundsCheckIndexValue(tree, out var indexValue))
                 {
                     return;
                 }
-
-                ValueNumber lengthValue = _store.VNForFunc(
-                    GenStackKind.I4,
-                    type: null,
-                    ValueNumberFunction.ArrayLength,
-                    arrayValue);
 
                 if (TryCreateRelation(
                     SsaAssertionKind.LessThanUnsigned,
@@ -1376,7 +1370,7 @@ namespace Cnidaria.Cs
                     }
                 }
 
-                if (candidate.Kind is GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or GenTreeKind.StoreArrayElement)
+                if (candidate.Kind is GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or GenTreeKind.StoreArrayElement or GenTreeKind.BoundsCheck)
                 {
                     if (original.Operands.Length >= 2 &&
                         IsBoundsCheckRedundant(original, active) &&
@@ -1577,17 +1571,12 @@ namespace Cnidaria.Cs
 
             private bool IsBoundsCheckRedundant(SsaTree tree, AssertionSet active)
             {
-                if (!TryGetNormalValueNumber(tree.Operands[0].Source, out var arrayValue) ||
+                if (!TryGetBoundsCheckLengthValue(tree, out var lengthValueNumber) ||
                     !TryGetBoundsCheckIndexValue(tree, out var indexValue))
                 {
                     return false;
                 }
 
-                ValueNumber lengthValueNumber = _store.VNForFunc(
-                    GenStackKind.I4,
-                    type: null,
-                    ValueNumberFunction.ArrayLength,
-                    arrayValue);
                 AssertionValue lengthValue = AssertionValue.ForValueNumber(lengthValueNumber);
 
                 if (IsRelationImplied(SsaAssertionKind.LessThanUnsigned, indexValue, lengthValue, active))
@@ -1614,10 +1603,23 @@ namespace Cnidaria.Cs
                 }
 
                 if (tree.Operands.Length >= 2)
-                    return TryGetAssertionValue(tree.Operands[1].Source, out value);
+                    return TryGetAssertionValue(tree.Operands[tree.Kind == GenTreeKind.BoundsCheck ? 0 : 1].Source, out value);
 
                 value = default;
                 return false;
+            }
+
+            private bool TryGetBoundsCheckLengthValue(SsaTree tree, out ValueNumber length)
+            {
+                if (tree.Kind == GenTreeKind.BoundsCheck)
+                    return TryGetNormalValueNumber(tree.Operands[1].Source, out length);
+
+                length = default;
+                if (!TryGetNormalValueNumber(tree.Operands[0].Source, out var array))
+                    return false;
+
+                length = _store.VNForFunc(GenStackKind.I4, type: null, ValueNumberFunction.ArrayLength, array);
+                return true;
             }
 
             private bool IsBoundsCheckRedundantByValueNumberShape(

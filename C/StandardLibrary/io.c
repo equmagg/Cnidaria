@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -29,6 +30,7 @@
 #define __NR_unlinkat 263
 #define __NR_renameat 264
 #define __NR_faccessat 269
+#define __NR_ppoll 271
 #elif defined(__i386__)
 #define __NR_read 3
 #define __NR_write 4
@@ -81,6 +83,7 @@
 #define __NR_openat 56
 #define __NR_close 57
 #define __NR_lseek 62
+#define __NR_ppoll 73
 #define __NR_read 63
 #define __NR_write 64
 #define __NR_fsync 82
@@ -88,8 +91,12 @@
 #define __NR_fstat 80
 #endif
 
+#if __SIZEOF_POINTER__ == 4
+#define __NR_ppoll_time64 414
+#endif
+
 // One entry point for every call into the kernel; a register the call ignores costs nothing
-static long __sys(long number, long a, long b, long c, long d, long e)
+static long __sys(long number, long a, long b, long c, long d, long e, long f)
 {
     long result;
 
@@ -98,38 +105,46 @@ static long __sys(long number, long a, long b, long c, long d, long e)
     __asm__ volatile(
         "syscall"
         : "+{rax}"(result)
-        : [a] "{rdi}"(a), [b] "{rsi}"(b), [c] "{rdx}"(c), [d] "{r10}"(d), [e] "{r8}"(e)
+        : [a] "{rdi}"(a), [b] "{rsi}"(b), [c] "{rdx}"(c), [d] "{r10}"(d), [e] "{r8}"(e), [f] "{r9}"(f)
         : "rcx", "r11", "memory");
 #elif defined(__i386__)
+    // ebx and ebp may be the compiler's, so the first and sixth arguments come in through memory
+    long outer[2];
+    outer[0] = a;
+    outer[1] = f;
     result = number;
     __asm__ volatile(
         "push ebx\n"
-        "mov ebx, %[a]\n"
+        "push ebp\n"
+        "push dword ptr [%[outer] + 4]\n"
+        "mov ebx, dword ptr [%[outer]]\n"
+        "pop ebp\n"
         ".byte 0xcd, 0x80\n"
+        "pop ebp\n"
         "pop ebx"
         : "+{eax}"(result)
-        : [a] "r"(a), [b] "{ecx}"(b), [c] "{edx}"(c), [d] "{esi}"(d), [e] "{edi}"(e)
+        : [outer] "r"(outer), [b] "{ecx}"(b), [c] "{edx}"(c), [d] "{esi}"(d), [e] "{edi}"(e)
         : "memory");
 #elif defined(__aarch64__)
     result = a;
     __asm__ volatile(
         "svc #0"
         : "+{x0}"(result)
-        : [number] "{x8}"(number), [b] "{x1}"(b), [c] "{x2}"(c), [d] "{x3}"(d), [e] "{x4}"(e)
+        : [number] "{x8}"(number), [b] "{x1}"(b), [c] "{x2}"(c), [d] "{x3}"(d), [e] "{x4}"(e), [f] "{x5}"(f)
         : "memory");
 #elif defined(__arm__)
     result = a;
     __asm__ volatile(
         "svc #0"
         : "+{r0}"(result)
-        : [number] "{r7}"(number), [b] "{r1}"(b), [c] "{r2}"(c), [d] "{r3}"(d), [e] "{r4}"(e)
+        : [number] "{r7}"(number), [b] "{r1}"(b), [c] "{r2}"(c), [d] "{r3}"(d), [e] "{r4}"(e), [f] "{r5}"(f)
         : "memory");
 #elif defined(__riscv)
     result = a;
     __asm__ volatile(
         "ecall"
         : "+{a0}"(result)
-        : [number] "{a7}"(number), [b] "{a1}"(b), [c] "{a2}"(c), [d] "{a3}"(d), [e] "{a4}"(e)
+        : [number] "{a7}"(number), [b] "{a1}"(b), [c] "{a2}"(c), [d] "{a3}"(d), [e] "{a4}"(e), [f] "{a5}"(f)
         : "memory");
 #else
     result = -38;
@@ -138,9 +153,9 @@ static long __sys(long number, long a, long b, long c, long d, long e)
     return result;
 }
 
-long __syscall(long number, long a, long b, long c, long d, long e)
+long __syscall(long number, long a, long b, long c, long d, long e, long f)
 {
-    return __sys(number, a, b, c, d, e);
+    return __sys(number, a, b, c, d, e, f);
 }
 
 // A failed call comes back as the negated error, which is where errno gets its value
@@ -156,53 +171,53 @@ static long __sys_result(long value)
 
 ssize_t read(int descriptor, void* buffer, size_t count)
 {
-    return (ssize_t)__sys_result(__sys(__NR_read, (long)descriptor, (long)(uintptr_t)buffer, (long)count, 0, 0));
+    return (ssize_t)__sys_result(__sys(__NR_read, (long)descriptor, (long)(uintptr_t)buffer, (long)count, 0, 0, 0));
 }
 
 ssize_t write(int descriptor, const void* buffer, size_t count)
 {
-    return (ssize_t)__sys_result(__sys(__NR_write, (long)descriptor, (long)(uintptr_t)buffer, (long)count, 0, 0));
+    return (ssize_t)__sys_result(__sys(__NR_write, (long)descriptor, (long)(uintptr_t)buffer, (long)count, 0, 0, 0));
 }
 
 int close(int descriptor)
 {
-    return (int)__sys_result(__sys(__NR_close, (long)descriptor, 0, 0, 0, 0));
+    return (int)__sys_result(__sys(__NR_close, (long)descriptor, 0, 0, 0, 0, 0));
 }
 
 off_t lseek(int descriptor, off_t offset, int whence)
 {
-    return (off_t)__sys_result(__sys(__NR_lseek, (long)descriptor, (long)offset, (long)whence, 0, 0));
+    return (off_t)__sys_result(__sys(__NR_lseek, (long)descriptor, (long)offset, (long)whence, 0, 0, 0));
 }
 
 int ftruncate(int descriptor, off_t length)
 {
-    return (int)__sys_result(__sys(__NR_ftruncate, (long)descriptor, (long)length, 0, 0, 0));
+    return (int)__sys_result(__sys(__NR_ftruncate, (long)descriptor, (long)length, 0, 0, 0, 0));
 }
 
 int fsync(int descriptor)
 {
-    return (int)__sys_result(__sys(__NR_fsync, (long)descriptor, 0, 0, 0, 0));
+    return (int)__sys_result(__sys(__NR_fsync, (long)descriptor, 0, 0, 0, 0, 0));
 }
 
 int dup(int descriptor)
 {
-    return (int)__sys_result(__sys(__NR_dup, (long)descriptor, 0, 0, 0, 0));
+    return (int)__sys_result(__sys(__NR_dup, (long)descriptor, 0, 0, 0, 0, 0));
 }
 
 int dup2(int descriptor, int replacement)
 {
 #if defined(__NR_dup2)
-    return (int)__sys_result(__sys(__NR_dup2, (long)descriptor, (long)replacement, 0, 0, 0));
+    return (int)__sys_result(__sys(__NR_dup2, (long)descriptor, (long)replacement, 0, 0, 0, 0));
 #else
     if (descriptor == replacement)
         return descriptor;
-    return (int)__sys_result(__sys(__NR_dup3, (long)descriptor, (long)replacement, 0, 0, 0));
+    return (int)__sys_result(__sys(__NR_dup3, (long)descriptor, (long)replacement, 0, 0, 0, 0));
 #endif
 }
 
 int openat(int directory, const char* path, int flags, ...)
 {
-    return (int)__sys_result(__sys(__NR_openat, (long)directory, (long)(uintptr_t)path, (long)flags, 0666, 0));
+    return (int)__sys_result(__sys(__NR_openat, (long)directory, (long)(uintptr_t)path, (long)flags, 0666, 0, 0));
 }
 
 int open(const char* path, int flags, ...)
@@ -212,39 +227,39 @@ int open(const char* path, int flags, ...)
 
 int unlink(const char* path)
 {
-    return (int)__sys_result(__sys(__NR_unlinkat, AT_FDCWD, (long)(uintptr_t)path, 0, 0, 0));
+    return (int)__sys_result(__sys(__NR_unlinkat, AT_FDCWD, (long)(uintptr_t)path, 0, 0, 0, 0));
 }
 
 int rmdir(const char* path)
 {
-    return (int)__sys_result(__sys(__NR_unlinkat, AT_FDCWD, (long)(uintptr_t)path, AT_REMOVEDIR, 0, 0));
+    return (int)__sys_result(__sys(__NR_unlinkat, AT_FDCWD, (long)(uintptr_t)path, AT_REMOVEDIR, 0, 0, 0));
 }
 
 int mkdir(const char* path, mode_t mode)
 {
-    return (int)__sys_result(__sys(__NR_mkdirat, AT_FDCWD, (long)(uintptr_t)path, (long)mode, 0, 0));
+    return (int)__sys_result(__sys(__NR_mkdirat, AT_FDCWD, (long)(uintptr_t)path, (long)mode, 0, 0, 0));
 }
 
 int access(const char* path, int mode)
 {
-    return (int)__sys_result(__sys(__NR_faccessat, AT_FDCWD, (long)(uintptr_t)path, (long)mode, 0, 0));
+    return (int)__sys_result(__sys(__NR_faccessat, AT_FDCWD, (long)(uintptr_t)path, (long)mode, 0, 0, 0));
 }
 
 int chdir(const char* path)
 {
-    return (int)__sys_result(__sys(__NR_chdir, (long)(uintptr_t)path, 0, 0, 0, 0));
+    return (int)__sys_result(__sys(__NR_chdir, (long)(uintptr_t)path, 0, 0, 0, 0, 0));
 }
 
 char* getcwd(char* buffer, size_t size)
 {
-    if (__sys_result(__sys(__NR_getcwd, (long)(uintptr_t)buffer, (long)size, 0, 0, 0)) < 0)
+    if (__sys_result(__sys(__NR_getcwd, (long)(uintptr_t)buffer, (long)size, 0, 0, 0, 0)) < 0)
         return (char*)0;
     return buffer;
 }
 
 int __io_rename(const char* from, const char* to)
 {
-    return (int)__sys_result(__sys(__NR_renameat, AT_FDCWD, (long)(uintptr_t)from, AT_FDCWD, (long)(uintptr_t)to, 0));
+    return (int)__sys_result(__sys(__NR_renameat, AT_FDCWD, (long)(uintptr_t)from, AT_FDCWD, (long)(uintptr_t)to, 0, 0));
 }
 
 int ioctl(int descriptor, unsigned long request, ...)
@@ -255,13 +270,13 @@ int ioctl(int descriptor, unsigned long request, ...)
     va_start(arguments, request);
     argument = va_arg(arguments, void*);
     va_end(arguments);
-    return (int)__sys_result(__sys(__NR_ioctl, (long)descriptor, (long)request, (long)(uintptr_t)argument, 0, 0));
+    return (int)__sys_result(__sys(__NR_ioctl, (long)descriptor, (long)request, (long)(uintptr_t)argument, 0, 0, 0));
 }
 
 int isatty(int descriptor)
 {
     unsigned char state[64];
-    if (__sys(__NR_ioctl, (long)descriptor, 0x5401, (long)(uintptr_t)state, 0, 0) < 0)
+    if (__sys(__NR_ioctl, (long)descriptor, 0x5401, (long)(uintptr_t)state, 0, 0, 0) < 0)
     {
         errno = ENOTTY;
         return 0;
@@ -310,7 +325,7 @@ int fstat(int descriptor, struct stat* out)
 {
     unsigned char raw[256];
     memset(raw, 0, sizeof(raw));
-    if (__sys_result(__sys(__NR_fstat, (long)descriptor, (long)(uintptr_t)raw, 0, 0, 0)) < 0)
+    if (__sys_result(__sys(__NR_fstat, (long)descriptor, (long)(uintptr_t)raw, 0, 0, 0, 0)) < 0)
         return -1;
     __stat_unpack(raw, out);
     return 0;
@@ -320,10 +335,47 @@ int stat(const char* path, struct stat* out)
 {
     unsigned char raw[256];
     memset(raw, 0, sizeof(raw));
-    if (__sys_result(__sys(__NR_newfstatat, AT_FDCWD, (long)(uintptr_t)path, (long)(uintptr_t)raw, 0, 0)) < 0)
+    if (__sys_result(__sys(__NR_newfstatat, AT_FDCWD, (long)(uintptr_t)path, (long)(uintptr_t)raw, 0, 0, 0)) < 0)
         return -1;
     __stat_unpack(raw, out);
     return 0;
+}
+
+// The kernel counts the timeout down in place, so it gets a copy; 32-bit targets pass it as two 64-bit fields
+int ppoll(struct pollfd* fds, nfds_t count, const struct timespec* timeout, const sigset_t* mask)
+{
+#if __SIZEOF_POINTER__ == 4
+    long long span[2];
+    long number = __NR_ppoll_time64;
+#else
+    long span[2];
+    long number = __NR_ppoll;
+#endif
+
+    if (timeout != (const struct timespec*)0)
+    {
+        span[0] = timeout->tv_sec;
+        span[1] = timeout->tv_nsec;
+    }
+    return (int)__sys_result(__sys(
+        number,
+        (long)(uintptr_t)fds,
+        (long)count,
+        timeout != (const struct timespec*)0 ? (long)(uintptr_t)span : 0,
+        (long)(uintptr_t)mask,
+        8,
+        0));
+}
+
+int poll(struct pollfd* fds, nfds_t count, int timeout)
+{
+    struct timespec span;
+
+    if (timeout < 0)
+        return ppoll(fds, count, (const struct timespec*)0, (const sigset_t*)0);
+    span.tv_sec = timeout / 1000;
+    span.tv_nsec = (long)(timeout % 1000) * 1000000l;
+    return ppoll(fds, count, &span, (const sigset_t*)0);
 }
 
 #elif defined(_WIN32) && defined(__x86_64__)

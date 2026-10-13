@@ -387,7 +387,7 @@ public static class StaticLinker
         var trimming = options.CompilationOptions.Trimming;
         if (!HasErrors(diagnostics) && trimming.Enabled && (libraryPrepared.Length != 0 || !trimming.PreserveExternallyVisibleSymbols))
         {
-            TrimPrepared(userPrepared, libraryPrepared, options.EntryFunctionName, trimming);
+            TrimPrepared(userPrepared, libraryPrepared, options.EntryFunctionName, trimming, options.CLibraryStartup);
         }
 
         var userUnits = CompleteUnits(userPrepared, diagnostics);
@@ -405,15 +405,17 @@ public static class StaticLinker
         ImmutableArray<PreparedUnit> userUnits,
         ImmutableArray<PreparedUnit> libraryUnits,
         string entry,
-        TrimmingOptions trimming)
+        TrimmingOptions trimming,
+        bool cLibraryStartup)
     {
         var trees = ImmutableArray.CreateBuilder<GimpleTree>();
         var unitOptions = ImmutableArray.CreateBuilder<TrimmingOptions>();
         var slots = new List<PreparedUnit>();
+        // The startup code calls into the library only after trimming, so what it calls is kept
         var libraryTrimming = new TrimmingOptions(
             enabled: true,
             preserveExternallyVisibleSymbols: false,
-            rootSymbols: trimming.RootSymbols);
+            rootSymbols: cLibraryStartup ? trimming.RootSymbols.Add("__libc_start_main") : trimming.RootSymbols);
 
         foreach (var unit in userUnits)
         {
@@ -668,6 +670,7 @@ public static class StaticLinker
                     {
                         EmitStartup = options.EmitStartup && i == primaryIndex,
                         EntryFunctionName = options.EntryFunctionName,
+                        CLibraryStartup = options.CLibraryStartup,
                     });
                 result.Add(new ObjectUnit<RiscVProgram>(units[i], program));
             }

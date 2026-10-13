@@ -1,64 +1,69 @@
-#define UNAME_FIELD 65ul
+#include <stdio.h>
+#include <sys/utsname.h>
 
-int main(int argc, char** argv, char** envp)
+int main(int argc, char** argv)
 {
-    char uts[390];
-    int all = 0;
+    struct utsname name;
+    const char* fields[5];
     int wanted = 0;
     int index = 1;
     int written = 0;
-    (void)envp;
 
     while (index < argc && argv[index][0] == '-' && argv[index][1] != 0)
     {
         const char* flags = argv[index] + 1;
-        while (*flags != 0)
+        for (; *flags != 0; flags++)
         {
-            if (*flags == 'a')
-                all = 1;
-            else if (*flags == 's')
-                wanted = wanted | 1;
-            else if (*flags == 'n')
-                wanted = wanted | 2;
-            else if (*flags == 'r')
-                wanted = wanted | 4;
-            else if (*flags == 'v')
-                wanted = wanted | 8;
-            else if (*flags == 'm')
-                wanted = wanted | 16;
-            else
+            switch (*flags)
             {
-                report("uname", (const char*)NULL, "usage: uname [-asnrvm]");
+            case 'a':
+                wanted = 31;
+                break;
+            case 's':
+                wanted |= 1;
+                break;
+            case 'n':
+                wanted |= 2;
+                break;
+            case 'r':
+                wanted |= 4;
+                break;
+            case 'v':
+                wanted |= 8;
+                break;
+            case 'm':
+                wanted |= 16;
+                break;
+            default:
+                fputs("uname: usage: uname [-asnrvm]\n", stderr);
                 return 2;
             }
-            flags = flags + 1;
         }
-        index = index + 1;
+        index++;
     }
 
-    if (sys_uname(uts) < 0l)
+    if (uname(&name) < 0)
     {
-        report("uname", (const char*)NULL, "the system name cannot be read");
+        fputs("uname: the system name cannot be read\n", stderr);
         return 1;
     }
-    if (all)
-        wanted = 31;
     if (wanted == 0)
         wanted = 1;
 
-    // The fields sit one after another, each as wide as the last
-    index = 0;
-    while (index < 5)
+    fields[0] = name.sysname;
+    fields[1] = name.nodename;
+    fields[2] = name.release;
+    fields[3] = name.version;
+    fields[4] = name.machine;
+    for (index = 0; index < 5; index++)
     {
-        if ((wanted & (1 << index)) != 0)
-        {
-            if (written)
-                write_text(" ");
-            write_text(uts + (usize)index * UNAME_FIELD);
-            written = 1;
-        }
-        index = index + 1;
+        if ((wanted & (1 << index)) == 0)
+            continue;
+        if (written)
+            fputc(' ', stdout);
+        fputs(fields[index], stdout);
+        written = 1;
     }
-    write_text("\n");
+    fputc('\n', stdout);
     return 0;
 }

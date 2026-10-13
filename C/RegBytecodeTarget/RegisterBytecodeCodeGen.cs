@@ -142,7 +142,10 @@ public sealed class RegisterBytecodeProgram
     private static RuntimeType MapRuntimeType(RuntimeTypeSystem runtimeTypes, QualifiedType type, TargetInfo target)
     {
         if (type.Type is BuiltinType builtin)
-            return GetRuntimePrimitive(runtimeTypes, builtin.BuiltinKind);
+        {
+            return GetRuntimePrimitive(runtimeTypes, builtin.BuiltinKind != BuiltinTypeKind.Char ? builtin.BuiltinKind
+                : target.IsCharSigned ? BuiltinTypeKind.SignedChar : BuiltinTypeKind.UnsignedChar);
+        }
 
         if (type.Type is PointerType pointer)
             return runtimeTypes.GetPointerType(MapRuntimeType(runtimeTypes, pointer.PointeeType, target));
@@ -908,8 +911,11 @@ public sealed class RegisterBytecodeCodeGenerator
         var labels = new Dictionary<LirBlock, Label>();
         foreach (var block in function.Blocks)
             labels.Add(block, _assembler.CreateLabel());
+        var jumpOnlyBlocks = allocation.FindJumpOnlyBlocks();
+        foreach (var pair in jumpOnlyBlocks)
+            labels[pair.Key] = labels[pair.Value];
 
-        var context = new FunctionEmissionContext(this, function, unitIndex, allocation, labels);
+        var context = new FunctionEmissionContext(this, function, unitIndex, allocation, labels, jumpOnlyBlocks);
         _assembler.BeginMethod(methodId, GetMethodEntryLabel(methodId), -1, ToStackFrameLayout(allocation.Frame));
         context.EmitPrologue();
         context.EmitBlocks();
@@ -1014,6 +1020,7 @@ public sealed class RegisterBytecodeCodeGenerator
         private readonly AllocationResult _allocation;
         private readonly IReadOnlyDictionary<LirBlock, Label> _labels;
         private readonly Dictionary<LirBlock, LirBlock?> _nextBlocks;
+        private readonly IReadOnlyDictionary<LirBlock, LirBlock> _jumpOnlyBlocks;
         private readonly Assembler _asm;
         private ParameterState _parameters = new ParameterState();
         private LirBlock? _currentBlock;
@@ -1023,15 +1030,17 @@ public sealed class RegisterBytecodeCodeGenerator
             LirFunction function,
             int unitIndex,
             AllocationResult allocation,
-            IReadOnlyDictionary<LirBlock, Label> labels)
+            IReadOnlyDictionary<LirBlock, Label> labels,
+            IReadOnlyDictionary<LirBlock, LirBlock> jumpOnlyBlocks)
         {
             _owner = owner;
             _function = function;
             _unitIndex = unitIndex;
             _allocation = allocation;
             _labels = labels;
+            _jumpOnlyBlocks = jumpOnlyBlocks;
             _asm = owner._assembler;
-            _nextBlocks = BuildNextBlockMap(function);
+            _nextBlocks = BuildNextBlockMap(function, jumpOnlyBlocks);
 
             var returnType = function.Symbol?.FunctionType?.ReturnType ?? TypeCatalog.Instance.Builtin(BuiltinTypeKind.Void);
             if (CAbi.RequiresHiddenReturnBuffer(owner._target, returnType))
@@ -1042,13 +1051,15 @@ public sealed class RegisterBytecodeCodeGenerator
             }
         }
 
-        private static Dictionary<LirBlock, LirBlock?> BuildNextBlockMap(LirFunction function)
+        private static Dictionary<LirBlock, LirBlock?> BuildNextBlockMap(LirFunction function, IReadOnlyDictionary<LirBlock, LirBlock> jumpOnlyBlocks)
         {
             var result = new Dictionary<LirBlock, LirBlock?>();
-            for (var i = 0; i < function.Blocks.Length; i++)
+            LirBlock? next = null;
+            for (var i = function.Blocks.Length - 1; i >= 0; i--)
             {
-                var next = i + 1 < function.Blocks.Length ? function.Blocks[i + 1] : null;
                 result.Add(function.Blocks[i], next);
+                if (!jumpOnlyBlocks.ContainsKey(function.Blocks[i]))
+                    next = function.Blocks[i];
             }
 
             return result;
@@ -1152,6 +1163,8 @@ public sealed class RegisterBytecodeCodeGenerator
         {
             foreach (var block in _function.Blocks)
             {
+                if (_jumpOnlyBlocks.ContainsKey(block))
+                    continue;
                 _currentBlock = block;
                 _asm.Bind(_labels[block]);
                 foreach (var instruction in block.Instructions)
@@ -1849,12 +1862,10 @@ public sealed class RegisterBytecodeCodeGenerator
                 var directCallFlags = BuildCallFlags(instruction);
                 MarshalCallArguments(instruction, startOperand: 1);
                 PrepareVariadicCall(instruction);
-                var returnType = instruction.CallSignature?.ReturnType ?? instruction.Result?.Type ?? TypeCatalog.Instance.Builtin(BuiltinTypeKind.Void);
-                var directCallOp = CallOpForReturn(returnType, isHostExtern);
                 if (isHostExtern)
-                    EmitInternalCall(directCallOp, methodId, directCallFlags);
+                    EmitInternalCall(methodId, directCallFlags);
                 else
-                    EmitManagedDirectCall(directCallOp, methodId, directCallFlags);
+                    EmitManagedDirectCall(methodId, directCallFlags);
                 EmitCallResult(instruction);
                 return;
             }
@@ -1863,9 +1874,7 @@ public sealed class RegisterBytecodeCodeGenerator
                 MarshalCallArguments(instruction, startOperand: 1);
                 PrepareVariadicCall(instruction);
                 var target = LoadOperand(callee, GpScratch0);
-                var returnType = instruction.CallSignature?.ReturnType ?? instruction.Result?.Type ?? TypeCatalog.Instance.Builtin(BuiltinTypeKind.Void);
-                var indirectCallOp = IndirectCallOpForReturn(returnType);
-                EmitRawIndirectCall(indirectCallOp, target, indirectCallFlags);
+                EmitRawIndirectCall(target, indirectCallFlags);
                 EmitCallResult(instruction);
             }
         }
@@ -1906,7 +1915,7 @@ public sealed class RegisterBytecodeCodeGenerator
             else
                 LoadOperandInto(arg, MachineRegister.X10);
 
-            EmitInternalCall(Op.CallInternalVoid, methodId, CallFlags.InternalCall);
+            EmitInternalCall(methodId, CallFlags.InternalCall);
 
             if (instruction.Result is not null)
             {
@@ -3407,42 +3416,6 @@ public sealed class RegisterBytecodeCodeGenerator
             };
         }
 
-        private Op CallOpForReturn(QualifiedType returnType, bool isInternal)
-        {
-            if (IsAggregateType(returnType))
-            {
-                var abi = CAbi.ClassifyValue(_owner._target, returnType, isReturn: true, isVariadicUnnamedArgument: false);
-                if (abi.PassingKind == AbiPassingKind.Indirect)
-                    return isInternal ? Op.CallInternalVoid : Op.CallVoid;
-                return isInternal ? Op.CallInternalValue : Op.CallValue;
-            }
-
-            return ClassifyValue(returnType) switch
-            {
-                ValueKind.Void => isInternal ? Op.CallInternalVoid : Op.CallVoid,
-                ValueKind.Float32 or ValueKind.Float64 => isInternal ? Op.CallInternalF : Op.CallF,
-                ValueKind.General32 or ValueKind.General64 or ValueKind.Pointer => isInternal ? Op.CallInternalI : Op.CallI,
-                _ => throw new NotSupportedException("Aggregate return values are not supported by this backend yet."),
-            };
-        }
-
-        private Op IndirectCallOpForReturn(QualifiedType returnType)
-        {
-            if (IsAggregateType(returnType))
-            {
-                var abi = CAbi.ClassifyValue(_owner._target, returnType, isReturn: true, isVariadicUnnamedArgument: false);
-                return abi.PassingKind == AbiPassingKind.Indirect ? Op.CallIndirectVoid : Op.CallIndirectValue;
-            }
-
-            return ClassifyValue(returnType) switch
-            {
-                ValueKind.Void => Op.CallIndirectVoid,
-                ValueKind.Float32 or ValueKind.Float64 => Op.CallIndirectF,
-                ValueKind.General32 or ValueKind.General64 or ValueKind.Pointer => Op.CallIndirectI,
-                _ => throw new NotSupportedException("Aggregate return values are not supported by this backend yet."),
-            };
-        }
-
         private void EmitMem(Op op, MachineRegister valueOrDestination, MachineRegister baseRegister, int offset, MachineRegister indexRegister, MemoryBase memoryBase, int alignment, int scaleLog2 = 0)
         {
             var aux = Aux.Memory((byte)Math.Max(0, scaleLog2), (byte)Log2PowerOfTwoOrZero(Math.Max(1, alignment)), memoryBase, MemoryFlags.None);
@@ -3470,14 +3443,14 @@ public sealed class RegisterBytecodeCodeGenerator
             _asm.Emit(new InstrDesc(op, RegisterVmIsa.EncodeRegister(rd), RegisterVmIsa.EncodeRegister(rs1), RegisterVmIsa.EncodeRegister(rs2), aux: aux, imm: imm));
         }
 
-        private void EmitManagedDirectCall(Op op, int methodId, CallFlags flags)
-            => _asm.CallDirect(op, _owner.GetMethodEntryLabel(methodId), flags);
+        private void EmitManagedDirectCall(int methodId, CallFlags flags)
+            => _asm.CallDirect(_owner.GetMethodEntryLabel(methodId), flags);
 
-        private void EmitInternalCall(Op op, int methodId, CallFlags flags)
-            => _asm.Emit(InstrDesc.Call(op, methodId, flags | CallFlags.InternalCall));
+        private void EmitInternalCall(int methodId, CallFlags flags)
+            => _asm.Emit(InstrDesc.Call(Op.CallInternal, methodId, flags | CallFlags.InternalCall));
 
-        private void EmitRawIndirectCall(Op op, MachineRegister targetMethodId, CallFlags flags)
-            => _asm.Emit(new InstrDesc(op, rs1: RegisterVmIsa.EncodeRegister(targetMethodId), aux: Aux.Call(flags)));
+        private void EmitRawIndirectCall(MachineRegister targetMethodId, CallFlags flags)
+            => _asm.Emit(new InstrDesc(Op.CallIndirect, rs1: RegisterVmIsa.EncodeRegister(targetMethodId), aux: Aux.Call(flags)));
 
         private void EmitI32Imm(Op op, MachineRegister rd, MachineRegister rs1, int imm)
             => _asm.Emit(InstrDesc.I(op, rd, rs1, imm));
@@ -3522,6 +3495,8 @@ public sealed class RegisterBytecodeCodeGenerator
             if (target is null || _currentBlock is null)
                 return false;
 
+            if (_jumpOnlyBlocks.TryGetValue(target, out var jumpTarget))
+                target = jumpTarget;
             return _nextBlocks.TryGetValue(_currentBlock, out var next) && ReferenceEquals(next, target);
         }
 
@@ -3582,14 +3557,8 @@ public sealed class RegisterBytecodeCodeGenerator
             return SizeOf(type) > 4;
         }
 
-        private static bool IsUnsignedInteger(QualifiedType type)
-        {
-            if (type.Type is not BuiltinType builtin)
-                return false;
-
-            return builtin.BuiltinKind is BuiltinTypeKind.Bool or BuiltinTypeKind.UnsignedChar or BuiltinTypeKind.UnsignedShort
-                or BuiltinTypeKind.UnsignedInt or BuiltinTypeKind.UnsignedLong or BuiltinTypeKind.UnsignedLongLong;
-        }
+        private bool IsUnsignedInteger(QualifiedType type)
+            => GimpleTypes.IsIntegerLike(type) && !GimpleTypes.IsSigned(type, _owner._target);
 
         private ValueKind ClassifyValue(QualifiedType type)
         {

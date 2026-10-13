@@ -76,7 +76,10 @@ public sealed class RiscVDeviceTreeLayout
     public int BlockDeviceCount { get; set; } = 1;
     public bool KeyboardEnabled { get; set; } = true;
     public ulong KeyboardBase { get; set; } = 0x10009000UL;
-    public ulong KeyboardSize { get; set; } = RVMmioKeyboard.RegisterWindowSize;
+    public bool PointerEnabled { get; set; } = true;
+    public ulong PointerBase { get; set; } = 0x1000B000UL;
+    public bool SoundEnabled { get; set; } = true;
+    public ulong SoundBase { get; set; } = 0x1000C000UL;
     public bool HostBridgeEnabled { get; set; } = true;
     public ulong HostBridgeBase { get; set; } = 0x1000A000UL;
     public ulong HostBridgeSize { get; set; } = RVMmioHostBridge.RegisterWindowSize;
@@ -186,6 +189,11 @@ public static class RiscVZBoot
             BlockDeviceCount = machine.BlockDevices.Length,
             KeyboardEnabled = machine.Keyboard != null,
             KeyboardBase = machine.Keyboard?.BaseAddress ?? 0x10009000UL,
+            PointerEnabled = machine.Pointer != null,
+            PointerBase = machine.Pointer?.BaseAddress ?? 0x1000B000UL,
+            SoundEnabled = machine.Sound != null,
+            SoundBase = machine.Sound?.BaseAddress ?? 0x1000C000UL,
+            TimebaseFrequency = checked((uint)machine.TimebaseFrequency),
             HostBridgeEnabled = machine.HostBridge != null,
             HostBridgeBase = machine.HostBridge?.BaseAddress ?? 0x1000A000UL,
             FramebufferEnabled = machine.Framebuffer != null,
@@ -350,8 +358,6 @@ public static class RiscVZBoot
         fdt.PropString("serial0", "/soc/serial@" + layout.UartBase.ToString("x", CultureInfo.InvariantCulture));
         if (layout.BlockDeviceCount > 0)
             fdt.PropString("virtio0", "/soc/virtio_mmio@" + layout.BlockDeviceBase.ToString("x", CultureInfo.InvariantCulture));
-        if (layout.KeyboardEnabled)
-            fdt.PropString("keyboard0", "/soc/keyboard@" + layout.KeyboardBase.ToString("x", CultureInfo.InvariantCulture));
         fdt.EndNode();
 
         fdt.BeginNode("chosen");
@@ -402,26 +408,14 @@ public static class RiscVZBoot
         if (layout.BlockDeviceCount < 0 || layout.BlockDeviceCount > RVPlic.BlockDeviceSourceCount)
             throw new ArgumentOutOfRangeException(nameof(layout));
         for (int i = 0; i < layout.BlockDeviceCount; i++)
-        {
-            ulong blockAddress = checked(layout.BlockDeviceBase + layout.BlockDeviceStride * (ulong)i);
-            fdt.BeginNode("virtio_mmio@" + blockAddress.ToString("x", CultureInfo.InvariantCulture));
-            fdt.PropString("compatible", "virtio,mmio");
-            fdt.PropReg(blockAddress, layout.BlockDeviceSize);
-            fdt.PropU32("interrupt-parent", 2);
-            fdt.PropU32("interrupts", checked((uint)(RVPlic.BlockDeviceFirstSource + i)));
-            fdt.PropEmpty("dma-coherent");
-            fdt.EndNode();
-        }
+            AddVirtioNode(fdt, checked(layout.BlockDeviceBase + layout.BlockDeviceStride * (ulong)i), RVPlic.BlockDeviceFirstSource + i, layout.BlockDeviceSize);
 
         if (layout.KeyboardEnabled)
-        {
-            fdt.BeginNode("keyboard@" + layout.KeyboardBase.ToString("x", CultureInfo.InvariantCulture));
-            fdt.PropString("compatible", "riscv-virtio,keyboard-mmio");
-            fdt.PropReg(layout.KeyboardBase, layout.KeyboardSize);
-            fdt.PropU32("interrupt-parent", 2);
-            fdt.PropU32("interrupts", RVPlic.KeyboardSource);
-            fdt.EndNode();
-        }
+            AddVirtioNode(fdt, layout.KeyboardBase, RVPlic.KeyboardSource);
+        if (layout.PointerEnabled)
+            AddVirtioNode(fdt, layout.PointerBase, RVPlic.PointerSource);
+        if (layout.SoundEnabled)
+            AddVirtioNode(fdt, layout.SoundBase, RVPlic.SoundSource);
 
         if (layout.HostBridgeEnabled)
         {
@@ -446,6 +440,18 @@ public static class RiscVZBoot
         fdt.EndNode();
         return fdt.Build();
     }
+
+    private static void AddVirtioNode(RiscVFlattenedDeviceTreeBuilder fdt, ulong address, int interrupt, ulong size = RVVirtioMmioDevice.RegisterWindowSize)
+    {
+        fdt.BeginNode("virtio_mmio@" + address.ToString("x", CultureInfo.InvariantCulture));
+        fdt.PropString("compatible", "virtio,mmio");
+        fdt.PropReg(address, size);
+        fdt.PropU32("interrupt-parent", 2);
+        fdt.PropU32("interrupts", checked((uint)interrupt));
+        fdt.PropEmpty("dma-coherent");
+        fdt.EndNode();
+    }
+
     private static void WriteKernelFat32Partition(byte[] storage, RiscVZBootLayout layout, byte[] kernelImage, IEnumerable<RiscVBootFile>? additionalBootFiles)
     {
         if (storage is null)
@@ -1019,7 +1025,12 @@ public struct RiscVUserlandLayout
 
 public static class RiscVUserland
 {
-    public static string RuntimeSource => ReadUserSource("runtime.c");
+    // Every program below links against libc.so, so the libraries are ready before the first of them is built
+    private static readonly Lazy<byte[]> LazyDynamicLoader = new(() => BuildDynamicLoader());
+    private static readonly Lazy<SharedObjectArtifact> LazyStandardLibrary = new(BuildSharedStandardLibrary);
+    private static readonly Lazy<SharedObjectArtifact> LazyHostLibrary = new(BuildHostLibrary);
+    private static readonly Lazy<SharedObjectArtifact> LazyFramebufferLibrary = new(BuildFramebufferLibrary);
+
     public static string DefaultInitSource => ReadUserSource("init.c");
     public static string DefaultShellSource => ReadUserSource("shell.c");
     public static string DefaultEchoSource => ReadUserSource("echo.c");
@@ -1035,11 +1046,13 @@ public static class RiscVUserland
     public static string DefaultMkdirSource => ReadUserSource("mkdir.c");
     public static string DefaultRmdirSource => ReadUserSource("rmdir.c");
     public static string DefaultEnvSource => ReadUserSource("env.c");
+    public static string DefaultNanoSource => ReadUserSource("nano.c");
     public static string DefaultAutorunSource => ReadUserSource("autorun.c");
     public static string DynamicLoaderSource => ReadUserSource("ldso.c");
     public static string HostLibrarySource => ReadUserSource("hostlib.c");
     public static string FramebufferLibrarySource => ReadUserSource("fblib.c");
-    public static readonly byte[] DefaultInit = BuildProgram(DefaultInitSource, "riscv/os/init.c");
+    // Init runs on every boot before anything else, so it carries the parts of libc it uses instead of loading libc.so
+    public static readonly byte[] DefaultInit = BuildStaticProgram(DefaultInitSource, "riscv/os/init.c");
     public static readonly byte[] DefaultShell = BuildProgram(DefaultShellSource, "riscv/os/shell.c");
     public static readonly byte[] DefaultEcho = BuildProgram(DefaultEchoSource, "riscv/os/echo.c");
     public static readonly byte[] DefaultLs = BuildProgram(DefaultLsSource, "riscv/os/ls.c");
@@ -1054,6 +1067,7 @@ public static class RiscVUserland
     public static readonly byte[] DefaultMkdir = BuildProgram(DefaultMkdirSource, "riscv/os/mkdir.c");
     public static readonly byte[] DefaultRmdir = BuildProgram(DefaultRmdirSource, "riscv/os/rmdir.c");
     public static readonly byte[] DefaultEnv = BuildProgram(DefaultEnvSource, "riscv/os/env.c");
+    public static readonly byte[] DefaultNano = BuildProgram(DefaultNanoSource, "riscv/os/nano.c");
     public static readonly byte[] DefaultAutorun = BuildProgram(DefaultAutorunSource, "riscv/os/autorun.c");
 
     public const string InterpreterPath = "/ld.so";
@@ -1064,11 +1078,6 @@ public static class RiscVUserland
     public const string HostLibraryFileName = "LIBHOST.SO";
     public const string FramebufferLibrarySoName = "libfb.so";
     public const string FramebufferLibraryFileName = "LIBFB.SO";
-
-    private static readonly Lazy<byte[]> LazyDynamicLoader = new(() => BuildDynamicLoader());
-    private static readonly Lazy<SharedObjectArtifact> LazyStandardLibrary = new(BuildSharedStandardLibrary);
-    private static readonly Lazy<SharedObjectArtifact> LazyHostLibrary = new(BuildHostLibrary);
-    private static readonly Lazy<SharedObjectArtifact> LazyFramebufferLibrary = new(BuildFramebufferLibrary);
 
     public static byte[] DefaultDynamicLoader => LazyDynamicLoader.Value;
     public static byte[] DefaultSharedStandardLibrary => LazyStandardLibrary.Value.Image;
@@ -1098,6 +1107,7 @@ public static class RiscVUserland
                 new RiscVBootFile("MKDIR", DefaultMkdir),
                 new RiscVBootFile("RMDIR", DefaultRmdir),
                 new RiscVBootFile("ENV", DefaultEnv),
+                new RiscVBootFile("NANO", DefaultNano),
                 new RiscVBootFile(InterpreterFileName, DefaultDynamicLoader),
                 new RiscVBootFile(StandardLibraryFileName, DefaultSharedStandardLibrary),
                 new RiscVBootFile(HostLibraryFileName, hostLibrary ?? DefaultHostLibrary),
@@ -1119,7 +1129,8 @@ public static class RiscVUserland
             target ?? Cnidaria.C.TargetInfo.RV64GLinux,
             includeFiles: Cnidaria.C.StandardHeaders.CreateFiles(),
             allowedUndefinedSymbols: ResolveImports(needed, additionalImports),
-            linkStandardLibrary: false);
+            linkStandardLibrary: false,
+            cLibraryStartup: ResolveDependencies(needed).Contains(StandardLibrarySoName, StringComparer.Ordinal));
         return Cnidaria.C.StaticLinker.LinkRiscV(sources, options);
     }
 
@@ -1283,8 +1294,25 @@ public static class RiscVUserland
             throw new ArgumentNullException(nameof(source));
         if (string.IsNullOrWhiteSpace(filePath))
             throw new ArgumentException("User program path is empty.", nameof(filePath));
+        return LinkDynamicProgram([new Cnidaria.C.SourceFile(filePath, source)], layout: layout);
+    }
+
+    /// <summary>Links a program with the parts of libc it uses, so it runs without ld.so or libc.so</summary>
+    public static byte[] BuildStaticProgram(
+        string source,
+        string filePath = "riscv/user/program.c",
+        RiscVUserlandLayout? layout = null)
+    {
+        if (source is null)
+            throw new ArgumentNullException(nameof(source));
+        if (string.IsNullOrWhiteSpace(filePath))
+            throw new ArgumentException("User program path is empty.", nameof(filePath));
         layout ??= new RiscVUserlandLayout();
-        var program = CompileProgram(RuntimeSource + "\n" + source, filePath);
+        var options = new Cnidaria.C.StaticLinkerOptions(
+            Cnidaria.C.TargetInfo.RV64GLinux,
+            includeFiles: Cnidaria.C.StandardHeaders.CreateFiles(),
+            cLibraryStartup: true);
+        var program = RequireProgram(Cnidaria.C.StaticLinker.LinkRiscV([new Cnidaria.C.SourceFile(filePath, source)], options), "static program");
         return program.ToLinuxExecutableBytes(layout.Value.ImageBase);
     }
 

@@ -1,25 +1,26 @@
-int main(int argc, char** argv, char** envp)
+#include <errno.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(int argc, char** argv)
 {
-    int index = 1;
+    int index;
     int status = 0;
-    (void)envp;
 
     if (argc < 2)
     {
-        report("rmdir", (const char*)NULL, "usage: rmdir name...");
+        fputs("rmdir: usage: rmdir name...\n", stderr);
         return 2;
     }
 
-    while (index < argc)
+    for (index = 1; index < argc; index++)
     {
-        s64 result = sys_unlinkat((s64)AT_FDCWD, argv[index], AT_REMOVEDIR);
-        if (result < 0l)
+        if (rmdir(argv[index]) < 0)
         {
-            report("rmdir", argv[index],
-                result == -39l ? "is not empty" : result == -20l ? "is not a directory" : result == -2l ? "no such directory" : "cannot be removed");
+            fprintf(stderr, "rmdir: %s: %s\n", argv[index],
+                errno == ENOTEMPTY ? "is not empty" : errno == ENOTDIR ? "is not a directory" : errno == ENOENT ? "no such directory" : "cannot be removed");
             status = 1;
         }
-        index = index + 1;
     }
     return status;
 }

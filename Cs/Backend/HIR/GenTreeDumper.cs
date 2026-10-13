@@ -180,6 +180,11 @@ namespace Cnidaria.Cs
                     AppendOperands(sb, node);
                     sb.Append(')');
                     return;
+                case GenTreeKind.BoundsCheck:
+                    sb.Append("boundscheck(");
+                    AppendOperands(sb, node);
+                    sb.Append(')');
+                    return;
                 case GenTreeKind.ArrayLength:
                     sb.Append("arrLength(");
                     AppendOperands(sb, node);

@@ -1,16 +1,14 @@
-int main(int argc, char** argv, char** envp)
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void)
 {
     char path[256];
-    (void)argc;
-    (void)argv;
-    (void)envp;
-
-    if (sys_getcwd(path, 256ul) < 0l)
+    if (getcwd(path, sizeof(path)) == NULL)
     {
-        report("pwd", (const char*)NULL, "the working directory cannot be read");
+        fputs("pwd: the working directory cannot be read\n", stderr);
         return 1;
     }
-    write_text(path);
-    write_text("\n");
+    puts(path);
     return 0;
 }

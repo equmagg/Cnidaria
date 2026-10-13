@@ -1,5 +1,40 @@
 namespace Internal.Runtime
 {
+    // The head of the MethodTable every native code generator emits
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    internal unsafe struct MethodTable
+    {
+        private uint _uFlags;
+        private uint _uBaseSize;
+        private MethodTable* _relatedType;
+        private ushort _usNumVtableSlots;
+        private ushort _usNumInterfaces;
+        private uint _uHashCode;
+
+#if TARGET_64BIT
+        internal const int SZARRAY_BASE_SIZE = 8 + 8 + 8;
+#else
+        internal const int SZARRAY_BASE_SIZE = 4 + 4 + 4;
+#endif
+
+        internal uint BaseSize => _uBaseSize;
+
+        internal int ArrayRank
+        {
+            get
+            {
+                int boundsSize = (int)BaseSize - SZARRAY_BASE_SIZE;
+                if (boundsSize > 0)
+                {
+                    // Multidim array case: Base size includes space for two Int32s
+                    // (upper and lower bound) per each dimension of the array.
+                    return boundsSize / (2 * sizeof(int));
+                }
+                return 1;
+            }
+        }
+    }
+
     internal static class GCStaticRegionConstants
     {
         /// <summary>
@@ -95,6 +130,10 @@ namespace System.Runtime
         [Intrinsic]
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static int RhGetTypeFlags(IntPtr handle) => 0;
+
+        // The register VM has no MethodTables; its importer sends Array.Rank here
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static int RhGetArrayRank(Array array) => 0;
 
         // The object's identity hash, assigned on first request and stable for its lifetime
         [MethodImpl(MethodImplOptions.InternalCall)]

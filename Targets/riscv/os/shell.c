@@ -1,3 +1,12 @@
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #define SHELL_LINE_CAPACITY 512
 #define SHELL_MAX_WORDS 32
 #define SHELL_WORD_CAPACITY 256
@@ -27,15 +36,30 @@ static char* shell_environment[SHELL_MAX_VARIABLES + 1];
 static int shell_variable_count;
 
 // A job is one process leading a group of its own, which is what the terminal hands itself to
-static s64 shell_job_pid[SHELL_MAX_JOBS];
+static pid_t shell_job_pid[SHELL_MAX_JOBS];
 static int shell_job_state[SHELL_MAX_JOBS];
 static int shell_job_signal[SHELL_MAX_JOBS];
 static char shell_job_text[SHELL_MAX_JOBS][SHELL_JOB_TEXT];
 static int shell_current_job = -1;
 static int shell_interactive;
-static s64 shell_pgid;
+static pid_t shell_pgid;
 static int shell_warned_stopped;
 static volatile int shell_interrupted;
+
+/// What the shell says when it cannot do what it was asked
+static void report(const char* program, const char* subject, const char* reason)
+{
+    if (subject != NULL)
+        fprintf(stderr, "%s: %s: %s\n", program, subject, reason);
+    else
+        fprintf(stderr, "%s: %s\n", program, reason);
+}
+
+static int shell_exists(const char* path)
+{
+    struct stat info;
+    return stat(path, &info) == 0;
+}
 
 static int shell_name_length(const char* entry)
 {
@@ -104,7 +128,7 @@ static void shell_track_directory(void)
         entry[index] = prefix[index];
         index = index + 1;
     }
-    if (sys_getcwd(entry + index, (usize)(SHELL_WORD_CAPACITY - index)) < 0l)
+    if (getcwd(entry + index, (size_t)(SHELL_WORD_CAPACITY - index)) == NULL)
         return;
     shell_set(entry);
 }
@@ -121,20 +145,20 @@ static int read_line(char* line, int capacity)
     int length = 0;
     for (;;)
     {
-        s64 result = sys_read(0, line + length, (usize)(capacity - 1 - length));
-        if (result == -4l)
+        ssize_t result = read(0, line + length, (size_t)(capacity - 1 - length));
+        if (result < 0 && errno == EINTR)
         {
             if (shell_interrupted)
             {
                 shell_interrupted = 0;
-                write_text("\n");
+                fputc('\n', stdout);
                 return -2;
             }
             continue;
         }
-        if (result < 0l)
+        if (result < 0)
             return -1;
-        if (result == 0l)
+        if (result == 0)
         {
             if (length == 0)
                 return -1;
@@ -232,7 +256,7 @@ static int shell_split(const char** cursor, int* count, int* separator, const ch
             text = text + 1;
         if (*text == '#' || *text == 0)
         {
-            *cursor = *text == 0 ? text : text + string_length(text);
+            *cursor = *text == 0 ? text : text + strlen(text);
             return 1;
         }
         if (*text == ';')
@@ -389,7 +413,7 @@ static int shell_locate(const char* command, char* path, int capacity)
             index = index + 1;
         }
         path[index] = 0;
-        return path_mode(path) != 0u;
+        return shell_exists(path);
     }
 
     search = shell_value("PATH", 4);
@@ -428,7 +452,7 @@ static int shell_locate(const char* command, char* path, int capacity)
             }
         }
         path[index] = 0;
-        if (path_mode(path) != 0u)
+        if (shell_exists(path))
             return 1;
         if (*search == 0)
             return 0;
@@ -458,44 +482,34 @@ static const char* shell_signal_name(int signal)
 
 static void shell_take_terminal(void)
 {
-    int group = (int)shell_pgid;
     if (shell_interactive)
-        sys_ioctl(0, TIOCSPGRP, (u64)&group);
+        tcsetpgrp(0, shell_pgid);
 }
 
 static void shell_write_padded(const char* text, int width)
 {
-    write_text(text);
-    width = width - (int)string_length(text);
-    while (width > 0)
-    {
-        write_text(" ");
-        width = width - 1;
-    }
+    printf("%-*s", width, text);
 }
 
 // Jobs are reported the way the shell everyone knows reports them
 static void shell_report_job(int job, const char* state, int running)
 {
-    write_text("[");
-    write_unsigned((u64)(job + 1));
-    write_text(job == shell_current_job ? "]+  " : "]   ");
+    printf("[%d]%s", job + 1, job == shell_current_job ? "+  " : "   ");
     shell_write_padded(state, 24);
-    write_text(shell_job_text[job]);
-    write_text(running ? " &\n" : "\n");
+    printf("%s%s", shell_job_text[job], running ? " &\n" : "\n");
 }
 
 static void shell_forget_job(int job)
 {
     int index = SHELL_MAX_JOBS;
-    shell_job_pid[job] = 0l;
+    shell_job_pid[job] = 0;
     if (shell_current_job != job)
         return;
     shell_current_job = -1;
     while (index != 0)
     {
         index = index - 1;
-        if (shell_job_pid[index] != 0l)
+        if (shell_job_pid[index] != 0)
         {
             shell_current_job = index;
             return;
@@ -503,7 +517,7 @@ static void shell_forget_job(int job)
     }
 }
 
-static int shell_job_of(s64 pid)
+static int shell_job_of(pid_t pid)
 {
     int index = 0;
     while (index < SHELL_MAX_JOBS)
@@ -515,9 +529,9 @@ static int shell_job_of(s64 pid)
     return -1;
 }
 
-static int shell_add_job(s64 pid, int count)
+static int shell_add_job(pid_t pid, int count)
 {
-    int job = shell_job_of(0l);
+    int job = shell_job_of(0);
     int length = 0;
     int word = 0;
     if (job < 0)
@@ -580,9 +594,9 @@ static void shell_reap_jobs(void)
     for (;;)
     {
         int status = 0;
-        s64 pid = sys_wait4(-1l, &status, WNOHANG | WUNTRACED | WCONTINUED);
+        pid_t pid = waitpid(-1, &status, WNOHANG | WUNTRACED | WCONTINUED);
         int job;
-        if (pid <= 0l)
+        if (pid <= 0)
             return;
         job = shell_job_of(pid);
         if (job >= 0)
@@ -593,21 +607,21 @@ static void shell_reap_jobs(void)
 // The foreground job has the terminal until it ends or stops, and then the shell takes it back
 static int shell_wait_foreground(int job)
 {
-    s64 pid = shell_job_pid[job];
+    pid_t pid = shell_job_pid[job];
     int status = 0;
-    s64 result;
+    pid_t result;
     do
-        result = sys_wait4(pid, &status, WUNTRACED);
-    while (result == -4l);
+        result = waitpid(pid, &status, WUNTRACED);
+    while (result < 0 && errno == EINTR);
     shell_take_terminal();
-    if (result < 0l)
+    if (result < 0)
     {
         shell_forget_job(job);
         return 1;
     }
     if ((status & 255) == 127)
     {
-        write_text("\n");
+        fputc('\n', stdout);
         shell_job_changed(job, status);
         return 128 + ((status >> 8) & 255);
     }
@@ -616,8 +630,8 @@ static int shell_wait_foreground(int job)
     {
         int signal = status & 127;
         if (signal != SIGINT)
-            write_text(shell_signal_name(signal));
-        write_text("\n");
+            fputs(shell_signal_name(signal), stdout);
+        fputc('\n', stdout);
         return 128 + signal;
     }
     return (status >> 8) & 255;
@@ -686,22 +700,22 @@ static int shell_take_redirections(int* count, const char** input, const char** 
 }
 
 // The child moves its own descriptors, since the lowest free one is what an open returns
-static int shell_redirect(const char* path, int fd, u64 flags)
+static int shell_redirect(const char* path, int fd, int flags)
 {
-    s64 opened;
-    sys_close(fd);
-    opened = sys_openat((s64)AT_FDCWD, path, flags, 0ul);
-    if (opened == (s64)fd)
+    int opened;
+    close(fd);
+    opened = open(path, flags, 0644);
+    if (opened == fd)
         return 1;
-    if (opened >= 0l)
-        sys_close((int)opened);
+    if (opened >= 0)
+        close(opened);
     return 0;
 }
 
 static int shell_run(int count, const char* input, const char* output, int append, int background)
 {
     char path[SHELL_PATH_CAPACITY];
-    s64 pid;
+    pid_t pid;
     int status = 0;
 
     if (!shell_locate(shell_argv[0], path, SHELL_PATH_CAPACITY))
@@ -709,66 +723,58 @@ static int shell_run(int count, const char* input, const char* output, int appen
         report("shell", shell_argv[0], "command not found");
         return 127;
     }
-    pid = sys_clone(SIGCHLD, 0ul);
-    if (pid < 0l)
+    pid = fork();
+    if (pid < 0)
     {
-        write_text("shell: a process could not be started\n");
+        fputs("shell: a process could not be started\n", stdout);
         return 1;
     }
-    if (pid == 0l)
+    if (pid == 0)
     {
         // The child joins its own group before either side can hand it the terminal
         if (shell_interactive)
         {
-            int group = (int)sys_getpid();
-            sys_setpgid(0l, 0l);
+            setpgid(0, 0);
             if (!background)
-                sys_ioctl(0, TIOCSPGRP, (u64)&group);
-            sys_signal(SIGINT, SIG_DFL);
-            sys_signal(SIGQUIT, SIG_DFL);
-            sys_signal(SIGTSTP, SIG_DFL);
-            sys_signal(SIGTTIN, SIG_DFL);
-            sys_signal(SIGTTOU, SIG_DFL);
+                tcsetpgrp(0, getpid());
+            signal(SIGINT, SIG_DFL);
+            signal(SIGQUIT, SIG_DFL);
+            signal(SIGTSTP, SIG_DFL);
+            signal(SIGTTIN, SIG_DFL);
+            signal(SIGTTOU, SIG_DFL);
         }
         if (input != (const char*)NULL && !shell_redirect(input, 0, O_RDONLY))
         {
             report("shell", input, "cannot be read");
-            sys_exit(1);
+            _exit(1);
         }
         if (output != (const char*)NULL &&
             !shell_redirect(output, 1, O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC)))
         {
             report("shell", output, "cannot be written");
-            sys_exit(1);
+            _exit(1);
         }
-        {
-            s64 result = sys_execve(path, shell_argv, shell_environment);
-            report("shell", shell_argv[0], result == -2l ? "command not found" : "cannot be run");
-            sys_exit(result == -2l ? 127 : 126);
-        }
+        execve(path, shell_argv, shell_environment);
+        report("shell", shell_argv[0], errno == ENOENT ? "command not found" : "cannot be run");
+        _exit(errno == ENOENT ? 127 : 126);
     }
     if (shell_interactive)
     {
-        int group = (int)pid;
-        sys_setpgid(pid, pid);
+        setpgid(pid, pid);
         if (!background)
-            sys_ioctl(0, TIOCSPGRP, (u64)&group);
+            tcsetpgrp(0, pid);
     }
     {
         int job = shell_add_job(pid, count);
         if (job < 0)
         {
-            sys_wait4(pid, &status, 0ul);
+            waitpid(pid, &status, 0);
             shell_take_terminal();
-            return (status >> 8) & 255;
+            return WEXITSTATUS(status);
         }
         if (!background)
             return shell_wait_foreground(job);
-        write_text("[");
-        write_unsigned((u64)(job + 1));
-        write_text("] ");
-        write_unsigned((u64)pid);
-        write_text("\n");
+        printf("[%d] %d\n", job + 1, (int)pid);
     }
     (void)status;
     return 0;
@@ -795,7 +801,7 @@ static int shell_job_argument(int count, const char* name)
         value = value * 10 + (*text - '0');
         text = text + 1;
     }
-    if (*text != 0 || value < 1 || value > SHELL_MAX_JOBS || shell_job_pid[value - 1] == 0l)
+    if (*text != 0 || value < 1 || value > SHELL_MAX_JOBS || shell_job_pid[value - 1] == 0)
     {
         report(name, shell_argv[1], "no such job");
         return -1;
@@ -825,7 +831,7 @@ static int shell_signal_number(const char* text)
     }
     while (index < 31)
     {
-        if (string_equal(text, names[index]))
+        if (strcmp(text, names[index]) == 0)
             return index + 1;
         index = index + 1;
     }
@@ -840,7 +846,7 @@ static int shell_kill(int count)
     if (count > 1 && shell_argv[1][0] == '-')
     {
         const char* name = shell_argv[1] + 1;
-        if (string_equal(name, "s") && count > 2)
+        if (strcmp(name, "s") == 0 && count > 2)
         {
             name = shell_argv[2];
             index = index + 1;
@@ -861,7 +867,7 @@ static int shell_kill(int count)
     while (index < count)
     {
         const char* text = shell_argv[index];
-        s64 target = 0l;
+        long target = 0;
         int negative = 0;
         if (*text == '%')
         {
@@ -872,7 +878,7 @@ static int shell_kill(int count)
                 value = value * 10 + (*text - '0');
                 text = text + 1;
             }
-            if (*text != 0 || value < 1 || value > SHELL_MAX_JOBS || shell_job_pid[value - 1] == 0l)
+            if (*text != 0 || value < 1 || value > SHELL_MAX_JOBS || shell_job_pid[value - 1] == 0)
             {
                 report("kill", shell_argv[index], "no such job");
                 status = 1;
@@ -890,13 +896,13 @@ static int shell_kill(int count)
             }
             while (*text >= '0' && *text <= '9')
             {
-                target = target * 10l + (s64)(*text - '0');
+                target = target * 10 + (long)(*text - '0');
                 text = text + 1;
             }
             if (negative)
                 target = -target;
         }
-        if (*text != 0 || sys_kill(target, signal) < 0l)
+        if (*text != 0 || kill((pid_t)target, signal) < 0)
         {
             report("kill", shell_argv[index], *text != 0 ? "arguments must be process or job IDs" : "no such process");
             status = 1;
@@ -911,14 +917,14 @@ static int shell_builtin(int count, int* exiting)
     *exiting = 0;
     if (count == 0)
         return -1;
-    if (string_equal(shell_argv[0], "exit"))
+    if (strcmp(shell_argv[0], "exit") == 0)
     {
         int index = 0;
         while (index < SHELL_MAX_JOBS && !shell_warned_stopped)
         {
-            if (shell_job_pid[index] != 0l && shell_job_state[index] == SHELL_JOB_STOPPED)
+            if (shell_job_pid[index] != 0 && shell_job_state[index] == SHELL_JOB_STOPPED)
             {
-                write_text("There are stopped jobs.\n");
+                fputs("There are stopped jobs.\n", stdout);
                 shell_warned_stopped = 1;
                 return 1;
             }
@@ -928,12 +934,12 @@ static int shell_builtin(int count, int* exiting)
         return count > 1 ? (int)shell_argv[1][0] - '0' : 0;
     }
     shell_warned_stopped = 0;
-    if (string_equal(shell_argv[0], "jobs"))
+    if (strcmp(shell_argv[0], "jobs") == 0)
     {
         int index = 0;
         while (index < SHELL_MAX_JOBS)
         {
-            if (shell_job_pid[index] != 0l)
+            if (shell_job_pid[index] != 0)
             {
                 int stopped = shell_job_state[index] == SHELL_JOB_STOPPED;
                 shell_report_job(index, stopped ? shell_signal_name(shell_job_signal[index]) : "Running", !stopped);
@@ -942,76 +948,67 @@ static int shell_builtin(int count, int* exiting)
         }
         return 0;
     }
-    if (string_equal(shell_argv[0], "fg"))
+    if (strcmp(shell_argv[0], "fg") == 0)
     {
         int job = shell_job_argument(count, "fg");
-        int group;
         if (job < 0)
             return 1;
-        group = (int)shell_job_pid[job];
-        write_text(shell_job_text[job]);
-        write_text("\n");
+        printf("%s\n", shell_job_text[job]);
         if (shell_interactive)
-            sys_ioctl(0, TIOCSPGRP, (u64)&group);
+            tcsetpgrp(0, shell_job_pid[job]);
         shell_job_state[job] = SHELL_JOB_RUNNING;
-        sys_kill(-shell_job_pid[job], SIGCONT);
+        kill(-shell_job_pid[job], SIGCONT);
         return shell_wait_foreground(job);
     }
-    if (string_equal(shell_argv[0], "bg"))
+    if (strcmp(shell_argv[0], "bg") == 0)
     {
         int job = shell_job_argument(count, "bg");
         if (job < 0)
             return 1;
         shell_job_state[job] = SHELL_JOB_RUNNING;
         shell_current_job = job;
-        write_text("[");
-        write_unsigned((u64)(job + 1));
-        write_text("]+ ");
-        write_text(shell_job_text[job]);
-        write_text(" &\n");
-        sys_kill(-shell_job_pid[job], SIGCONT);
+        printf("[%d]+ %s &\n", job + 1, shell_job_text[job]);
+        kill(-shell_job_pid[job], SIGCONT);
         return 0;
     }
-    if (string_equal(shell_argv[0], "kill"))
+    if (strcmp(shell_argv[0], "kill") == 0)
         return shell_kill(count);
-    if (string_equal(shell_argv[0], "wait"))
+    if (strcmp(shell_argv[0], "wait") == 0)
     {
         int index = 0;
         int status = 0;
         while (index < SHELL_MAX_JOBS)
         {
-            if (shell_job_pid[index] != 0l && shell_job_state[index] == SHELL_JOB_RUNNING)
+            if (shell_job_pid[index] != 0 && shell_job_state[index] == SHELL_JOB_RUNNING)
             {
-                sys_wait4(shell_job_pid[index], &status, 0ul);
+                waitpid(shell_job_pid[index], &status, 0);
                 shell_forget_job(index);
             }
             index = index + 1;
         }
         return (status >> 8) & 255;
     }
-    if (string_equal(shell_argv[0], "cd"))
+    if (strcmp(shell_argv[0], "cd") == 0)
     {
         const char* home = shell_value("HOME", 4);
         const char* target = count > 1 ? shell_argv[1] : home != (const char*)NULL ? home : "/";
-        s64 result = sys_chdir(target);
-        if (result >= 0l)
+        if (chdir(target) == 0)
         {
             shell_track_directory();
             return 0;
         }
-        report("cd", target, result == -20l ? "is not a directory" : "no such directory");
+        report("cd", target, errno == ENOTDIR ? "is not a directory" : "no such directory");
         return 1;
     }
-    if (string_equal(shell_argv[0], "pwd") && count == 1)
+    if (strcmp(shell_argv[0], "pwd") == 0 && count == 1)
     {
         char here[SHELL_LINE_CAPACITY];
-        if (sys_getcwd(here, SHELL_LINE_CAPACITY) < 0l)
+        if (getcwd(here, SHELL_LINE_CAPACITY) == NULL)
             return 1;
-        write_text(here);
-        write_text("\n");
+        printf("%s\n", here);
         return 0;
     }
-    if (string_equal(shell_argv[0], "export"))
+    if (strcmp(shell_argv[0], "export") == 0)
     {
         int index = 1;
         while (index < count)
@@ -1021,14 +1018,14 @@ static int shell_builtin(int count, int* exiting)
         }
         return 0;
     }
-    if (string_equal(shell_argv[0], "help"))
+    if (strcmp(shell_argv[0], "help") == 0)
     {
-        write_text("cnidaria shell\n");
-        write_text("  builtins: cd [path], pwd, export NAME=value, exit [status], help\n");
-        write_text("  jobs:     jobs, fg [%n], bg [%n], kill [-signal] pid|%n, wait; Ctrl-Z stops, Ctrl-C interrupts\n");
-        write_text("  programs: ls cat cp rm mkdir rmdir touch wc head echo uname\n");
-        write_text("  quoting:  'literal' \"escaped\" \\c, $NAME and $? expand\n");
-        write_text("  operators: ; && || & < > >>\n");
+        fputs("cnidaria shell\n"
+            "  builtins: cd [path], pwd, export NAME=value, exit [status], help\n"
+            "  jobs:     jobs, fg [%n], bg [%n], kill [-signal] pid|%n, wait; Ctrl-Z stops, Ctrl-C interrupts\n"
+            "  programs: ls cat cp rm mkdir rmdir touch wc head echo uname env pwd nano\n"
+            "  quoting:  'literal' \"escaped\" \\c, $NAME and $? expand\n"
+            "  operators: ; && || & < > >>\n", stdout);
         return 0;
     }
     return -1;
@@ -1056,23 +1053,28 @@ int main(int argc, char** argv, char** envp)
 
     // A shell on a terminal keeps a group of its own in the foreground and lets its jobs take the stops
     {
-        int group = 0;
-        shell_pgid = sys_getpid();
-        shell_interactive = sys_ioctl(0, TIOCGPGRP, (u64)&group) >= 0l;
+        pid_t group = tcgetpgrp(0);
+        shell_pgid = getpid();
+        shell_interactive = group >= 0;
         if (shell_interactive)
         {
-            if (group != (int)shell_pgid)
-                sys_setpgid(0l, 0l);
+            // Without SA_RESTART an interrupt ends the read it arrives during, which is how a typed line is thrown away
+            struct sigaction action;
+            memset(&action, 0, sizeof(action));
+            action.sa_handler = shell_on_interrupt;
+            sigemptyset(&action.sa_mask);
+            if (group != shell_pgid)
+                setpgid(0, 0);
             shell_take_terminal();
-            sys_signal(SIGINT, (u64)shell_on_interrupt);
-            sys_signal(SIGQUIT, SIG_IGN);
-            sys_signal(SIGTSTP, SIG_IGN);
-            sys_signal(SIGTTIN, SIG_IGN);
-            sys_signal(SIGTTOU, SIG_IGN);
+            sigaction(SIGINT, &action, NULL);
+            signal(SIGQUIT, SIG_IGN);
+            signal(SIGTSTP, SIG_IGN);
+            signal(SIGTTIN, SIG_IGN);
+            signal(SIGTTOU, SIG_IGN);
         }
     }
 
-    write_text("Cnidaria shell\n");
+    fputs("Cnidaria shell\n", stdout);
     for (;;)
     {
         const char* cursor;
@@ -1081,9 +1083,7 @@ int main(int argc, char** argv, char** envp)
 
         shell_reap_jobs();
         here = shell_value("PWD", 3);
-        write_text("cnidaria:");
-        write_text(here != (const char*)NULL ? here : "?");
-        write_text("$ ");
+        printf("cnidaria:%s$ ", here != (const char*)NULL ? here : "?");
         {
             int length = read_line(line, SHELL_LINE_CAPACITY);
             if (length == -2)
@@ -1093,7 +1093,7 @@ int main(int argc, char** argv, char** envp)
             }
             if (length < 0)
             {
-                write_text("exit\n");
+                fputs("exit\n", stdout);
                 return 0;
             }
         }
@@ -1112,9 +1112,7 @@ int main(int argc, char** argv, char** envp)
 
             if (!shell_split(&cursor, &count, &separator, &error))
             {
-                write_text("shell: ");
-                write_text(error);
-                write_text("\n");
+                fprintf(stdout, "shell: %s\n", error);
                 shell_status = 2;
                 break;
             }
@@ -1124,15 +1122,13 @@ int main(int argc, char** argv, char** envp)
             {
                 if (!shell_take_redirections(&count, &input, &output, &append, &error))
                 {
-                    write_text("shell: ");
-                    write_text(error);
-                    write_text("\n");
+                    fprintf(stdout, "shell: %s\n", error);
                     shell_status = 2;
                     break;
                 }
                 if (count == 0)
                 {
-                    write_text("shell: a redirection needs a command\n");
+                    fputs("shell: a redirection needs a command\n", stdout);
                     shell_status = 2;
                     break;
                 }

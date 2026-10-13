@@ -27,7 +27,6 @@ namespace Cnidaria.Cs
         public const string MonitorExitSymbol = "RhpMonitorExit";
         public const string DelegateCombineSymbol = "RhpDelegateCombine";
         public const string DelegateRemoveSymbol = "RhpDelegateRemove";
-        public const string ArrayGetLengthSymbol = "RhpArrayGetLength";
         public const string ArrayClearSymbol = "RhpArrayClear";
         public const string ArrayCopySymbol = "RhpArrayCopy";
         public const string FloatingRemainderSingleSymbol = "RhpFmodF";
@@ -37,15 +36,12 @@ namespace Cnidaria.Cs
         public const string NewStringFromCharArraySymbol = "RhpNewStringFromCharArray";
         public const string NewStringFromCharArrayRangeSymbol = "RhpNewStringFromCharArrayRange";
         public const string NewStringFromReadOnlySpanSymbol = "RhpNewStringFromReadOnlySpan";
-        public const string ThrowSymbol = "RhpThrowEx";
+        public const string ThrowSymbol = "RhpThrow";
         public const string RethrowSymbol = "RhpRethrow";
-        public const string LeaveSymbol = "RhpLeave";
-        public const string EndFinallySymbol = "RhpEndFinally";
-        public const string EhTransferSymbol = "RhpEhTransfer";
-        public const string EhFrameCountSymbol = "RhpEhFrameCount";
-        public const string EhFramesSymbol = "RhpEhFrames";
-        public const string EhRegisterContextsSymbol = "RhpEhRegisterContexts";
-        public const string CurrentExceptionSymbol = "RhpCurrentException";
+        public const string DispatchExceptionSymbol = "RhpDispatchException";
+        public const string CallFuncletSymbol = "RhpCallFunclet";
+        public const string CallFuncletReturnSymbol = "RhpCallFuncletReturn";
+        public const string ResumeSymbol = "RhpResume";
         public const string FailFastSymbol = "RhpFallbackFailFast";
         private const string ConsoleWriteUtf16Symbol = "RhpConsoleWriteUtf16";
         private const string ConsoleWriteUtf16ZSymbol = "RhpConsoleWriteUtf16Z";
@@ -269,15 +265,6 @@ namespace Cnidaria.Cs
 
             if (IsSystemType(method.DeclaringType, "Array"))
             {
-                if (method.HasThis &&
-                    !method.IsStatic &&
-                    method.ParameterTypes.Length == 0 &&
-                    method.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Int32 &&
-                    StringComparer.Ordinal.Equals(method.Name, "get_Length") &&
-                    StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System") &&
-                    StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Array"))
-                    return ArrayGetLengthSymbol;
-
                 if (method.IsStatic &&
                     StringComparer.Ordinal.Equals(method.Name, "ClearInternal") &&
                     method.ParameterTypes.Length == 3 &&

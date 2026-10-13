@@ -974,6 +974,12 @@ namespace Cnidaria.Cs
                     flags |= GenTreeFlags.Ordered;
                     break;
 
+                case GenTreeKind.BoundsCheck:
+                    if ((node.Flags & GenTreeFlags.BoundsCheckEliminated) == 0)
+                        flags |= GenTreeFlags.CanThrow;
+                    flags |= GenTreeFlags.Ordered;
+                    break;
+
                 case GenTreeKind.ArrayLength:
                     flags |= GenTreeFlags.MemoryRead;
                     if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
@@ -1441,6 +1447,16 @@ namespace Cnidaria.Cs
                     node.Operands[0].StackKind is not (GenStackKind.Ref or GenStackKind.Null))
                 {
                     throw new InvalidOperationException($"Malformed HIR array length in B{blockId}: {node}.");
+                }
+            }
+            else if (node.Kind == GenTreeKind.BoundsCheck)
+            {
+                if (node.Operands.Length != 2 ||
+                    node.StackKind != GenStackKind.Void ||
+                    node.Operands[0].StackKind != GenStackKind.I4 ||
+                    node.Operands[1].StackKind != GenStackKind.I4)
+                {
+                    throw new InvalidOperationException($"Malformed HIR bounds check in B{blockId}: {node}.");
                 }
             }
 

@@ -311,6 +311,10 @@ namespace Cnidaria.Cs
                     sb.Append("nullcheck ");
                     AppendUses(sb, node);
                     return;
+                case GenTreeKind.BoundsCheck:
+                    sb.Append("boundscheck ");
+                    AppendUses(sb, node);
+                    return;
                 case GenTreeKind.ArrayLength:
                     sb.Append("arr_length ");
                     AppendUses(sb, node);

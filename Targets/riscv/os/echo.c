@@ -1,24 +1,26 @@
-int main(int argc, char** argv, char** envp)
+#include <stdio.h>
+#include <string.h>
+
+int main(int argc, char** argv)
 {
     int index = 1;
     int newline = 1;
-    (void)envp;
 
-    if (index < argc && string_equal(argv[index], "-n"))
+    if (index < argc && strcmp(argv[index], "-n") == 0)
     {
         newline = 0;
-        index = index + 1;
+        index++;
     }
 
     while (index < argc)
     {
-        write_text(argv[index]);
-        index = index + 1;
+        fputs(argv[index], stdout);
+        index++;
         if (index < argc)
-            write_text(" ");
+            fputc(' ', stdout);
     }
 
     if (newline)
-        write_text("\n");
+        fputc('\n', stdout);
     return 0;
 }

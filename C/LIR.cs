@@ -1239,11 +1239,18 @@ public sealed class LirProblem
 internal sealed class LirFunctionBuilder
 {
     private const int MaxRotatedLoopHeaderInstructions = 8;
+    private const int MaxThreadedJumpHops = 4;
+    private const int MaxLoopValues = 4;
+    private const int MaxHoistingLoopAnalysisWork = 100_000;
     private const int MaxSharedSymbolBases = 4;
 
     private readonly Dictionary<LirVirtualRegister, LirVirtualRegister> _widenedIndices = new();
     private readonly Dictionary<Symbol, (LirVirtualRegister Register, ControlFlowBlock Block)> _symbolBases = new();
     private readonly HashSet<Symbol> _sharedSymbols = new();
+    private readonly Dictionary<ControlFlowBlock, NaturalLoop?> _hoistingLoops = new();
+    private readonly Dictionary<(NaturalLoop Loop, CType Type, object Value), LirVirtualRegister> _loopConstants = new();
+    private readonly Dictionary<NaturalLoop, int> _loopValueCounts = new();
+    private readonly HashSet<LirBlock> _preheadersWithValues = new();
     private readonly Dictionary<GimpleStatementAnnotations, GimpleStatementAnnotations> _divisionPartners = new();
     private readonly HashSet<GimpleStatementAnnotations> _answeredDivisions = new();
     private readonly HashSet<object> _sharedAddressKeys = new();
@@ -1412,7 +1419,7 @@ internal sealed class LirFunctionBuilder
         {
             case GimpleGotoStatement gotoStatement:
                 if (_controlFlowFunction.TryGetBlock(gotoStatement.Target, out var gotoTarget) && gotoTarget is not null)
-                    yield return gotoTarget;
+                    yield return ThreadJump(block.ControlFlowBlock, gotoTarget);
                 yield break;
 
             case GimpleCondStatement conditional:
@@ -1445,6 +1452,100 @@ internal sealed class LirFunctionBuilder
         }
     }
 
+    // A join that only branches on phis feeding nothing else is skipped when this edge's input decides the branch
+    private ControlFlowBlock ThreadJump(ControlFlowBlock source, ControlFlowBlock target)
+    {
+        if (!_gimpleBlocksByControlFlowBlock.TryGetValue(target, out var join))
+            return target;
+
+        var current = join;
+        for (var hops = 0; hops < MaxThreadedJumpHops; hops++)
+        {
+            // Past the join a block reached another way, such as a loop header, would read the bypassed phi again
+            if (hops != 0 && current.ControlFlowBlock.UniquePredecessors.Length != 1 || !TryGetSoleStatement(current, out var terminator))
+                return target;
+
+            if (terminator.Statement is GimpleGotoStatement next)
+            {
+                if (!_controlFlowFunction.TryGetBlock(next.Target, out var nextBlock) || nextBlock is null ||
+                    !_gimpleBlocksByControlFlowBlock.TryGetValue(nextBlock, out current))
+                    return target;
+                continue;
+            }
+
+            return terminator.Statement is GimpleCondStatement condition && TryDecideJoinBranch(source, join, terminator, condition, out var decided)
+                ? decided
+                : target;
+        }
+
+        return target;
+    }
+
+    private static bool TryGetSoleStatement(GimpleBlockAnnotations block, out GimpleStatementAnnotations terminator)
+    {
+        terminator = null!;
+        if (block.Statements.Length == 0)
+            return false;
+        for (var i = 0; i < block.Statements.Length - 1; i++)
+        {
+            if (block.Statements[i].Statement is not (GimpleDeclarationStatement or GimpleNopStatement))
+                return false;
+        }
+
+        terminator = block.Statements[^1];
+        return true;
+    }
+
+    private bool TryDecideJoinBranch(
+        ControlFlowBlock source,
+        GimpleBlockAnnotations join,
+        GimpleStatementAnnotations branch,
+        GimpleCondStatement condition,
+        out ControlFlowBlock decided)
+    {
+        decided = null!;
+        if (condition.Code is not (GimpleTreeCode.EqExpr or GimpleTreeCode.NeExpr) ||
+            !TryGetExpression(branch, 0, out var left) || left.Name is not GimpleName tested)
+            return false;
+        var rightValue = condition.Rhs is GimpleConstantValue constant ? constant.Value : null;
+        if (rightValue is null && (!TryGetExpression(branch, 1, out var right) || !_function.ValueNumbering.TryGetConstantValue(right, out rightValue)) ||
+            !ScalarEvolution.TryGetInteger(rightValue, out var rightNumber))
+            return false;
+
+        GimpleName? input = null;
+        foreach (var phi in join.Phis)
+        {
+            foreach (var use in _function.GetImmediateUses(phi.Result))
+            {
+                if (use.Kind == GimpleUseKind.Phi || !ReferenceEquals(use.Statement, condition))
+                    return false;
+            }
+
+            if (!ReferenceEquals(phi.Result, tested))
+                continue;
+            foreach (var operand in phi.Operands)
+            {
+                if (ReferenceEquals(operand.Predecessor, source))
+                    input = operand.Value;
+            }
+        }
+
+        if (input is null || !_function.ValueNumbering.TryGetConstantValue(input, out var inputValue) ||
+            !ScalarEvolution.TryGetInteger(inputValue, out var inputNumber))
+            return false;
+
+        var bits = Math.Min(64, Math.Max(1, _target.SizeOf(tested.Type)) * 8);
+        var mask = bits == 64 ? ulong.MaxValue : (1UL << bits) - 1;
+        var equal = ((ulong)(inputNumber ^ rightNumber) & mask) == 0;
+        var label = equal == (condition.Code == GimpleTreeCode.EqExpr) ? condition.WhenTrue : condition.WhenFalse;
+        if (!_controlFlowFunction.TryGetBlock(label, out var side) || side is null ||
+            !_gimpleBlocksByControlFlowBlock.TryGetValue(side, out var sideBlock) || sideBlock.Phis.Length != 0)
+            return false;
+
+        decided = side;
+        return true;
+    }
+
     private void CreateVirtualRegistersForGimpleNames()
     {
         foreach (var definition in _function.Definitions)
@@ -1475,7 +1576,8 @@ internal sealed class LirFunctionBuilder
             {
                 foreach (var operand in phi.Operands)
                 {
-                    if (!operand.Value.IsUndefined && operand.Value.Variable.Kind != GimpleVariableKind.Memory)
+                    if (!operand.Value.IsUndefined && operand.Value.Variable.Kind != GimpleVariableKind.Memory &&
+                        StillReaches(operand.Predecessor, phi.Block))
                         RecordGimpleUse(operand.Value);
                 }
             }
@@ -1636,6 +1738,7 @@ internal sealed class LirFunctionBuilder
     {
         CountSharedSymbols();
         FindDivisionPairs();
+        IndexHoistingLoops();
         _symbolBases.Clear();
         foreach (var gimpleBlock in _function.Blocks)
         {
@@ -1657,7 +1760,117 @@ internal sealed class LirFunctionBuilder
             _currentBlock = null;
             _currentGimpleBlock = null;
         }
+
+        // A preheader translated before its loop got the hoisted values after its jump
+        foreach (var preheader in _preheadersWithValues)
+        {
+            var instructions = _instructions[preheader];
+            var jump = instructions.FindLastIndex(static instruction => instruction.Kind == LirInstructionKind.Jump);
+            if (jump < 0 || jump == instructions.Count - 1)
+                continue;
+            var terminator = instructions[jump];
+            instructions.RemoveAt(jump);
+            instructions.Add(terminator);
+        }
     }
+
+    // A block takes values from the preheader of the smallest loop around it; a loop with a call keeps none
+    private void IndexHoistingLoops()
+    {
+        _hoistingLoops.Clear();
+        _loopConstants.Clear();
+        _loopValueCounts.Clear();
+        _preheadersWithValues.Clear();
+        if (!TargetRegisterInfo.HoistsLoopValues(_target))
+            return;
+
+        var analysis = new NaturalLoopAnalysis(_controlFlowFunction, MaxHoistingLoopAnalysisWork);
+        foreach (var loop in analysis.Loops)
+        {
+            var usable = loop.Preheader is not null && _blocksByControlFlowBlock.ContainsKey(loop.Preheader) && !ContainsCall(loop);
+            foreach (var block in loop.Blocks)
+                _hoistingLoops.TryAdd(block, usable ? loop : null);
+        }
+    }
+
+    private bool ContainsCall(NaturalLoop loop)
+    {
+        foreach (var block in loop.Blocks)
+        {
+            if (!_gimpleBlocksByControlFlowBlock.TryGetValue(block, out var gimpleBlock))
+                continue;
+            foreach (var instruction in gimpleBlock.Statements)
+            {
+                if ((instruction.Flags & GimpleStatementFlags.ContainsCall) != 0)
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryGetHoistingLoop(out NaturalLoop loop, out LirBlock preheader)
+    {
+        loop = null!;
+        preheader = null!;
+        if (_currentGimpleBlock is null || !_hoistingLoops.TryGetValue(_currentGimpleBlock, out var found) || found is null)
+            return false;
+
+        loop = found;
+        preheader = _blocksByControlFlowBlock[found.Preheader!];
+        return true;
+    }
+
+    private bool TryReserveLoopValue(NaturalLoop loop, LirBlock preheader)
+    {
+        _loopValueCounts.TryGetValue(loop, out var count);
+        if (count >= MaxLoopValues)
+            return false;
+
+        _loopValueCounts[loop] = count + 1;
+        _preheadersWithValues.Add(preheader);
+        return true;
+    }
+
+    private ImmutableArray<LirOperand> HoistLoopConstants(LirInstructionKind kind, string? op, ImmutableArray<LirOperand> operands)
+    {
+        if (!TryGetHoistingLoop(out var loop, out var preheader))
+            return operands;
+
+        ImmutableArray<LirOperand>.Builder? hoisted = null;
+        for (var i = 0; i < operands.Length; i++)
+        {
+            var constant = operands[i];
+            if (!TargetRegisterInfo.MaterializesConstant(_target, kind, op, operands, i))
+                continue;
+
+            var key = (loop, constant.Type.Type, LoopConstantKey(constant.Immediate!));
+            if (!_loopConstants.TryGetValue(key, out var register))
+            {
+                if (!TryReserveLoopValue(loop, preheader))
+                    continue;
+                register = NewVirtualRegister(constant.Type, sourceName: null, valueNumber: null);
+                Emit(preheader, LirInstructionKind.Constant, register, ImmutableArray.Create(constant), address: null, op: string.Empty,
+                    conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null,
+                    falseTarget: null, sourceStatement: null, sourceValue: null, sourceInstruction: null, valueNumber: null);
+                _loopConstants.Add(key, register);
+            }
+
+            hoisted ??= operands.ToBuilder();
+            hoisted[i] = LirOperand.ForRegister(register);
+        }
+
+        return hoisted?.ToImmutable() ?? operands;
+    }
+
+    // Equals would pool 0.0 with -0.0 and every NaN with every other, so floating constants pool by their bits
+    private static object LoopConstantKey(object value)
+        => value switch
+        {
+            double number => ValueTuple.Create(BitConverter.DoubleToInt64Bits(number)),
+            float number => ValueTuple.Create(BitConverter.SingleToInt32Bits(number)),
+            _ => value,
+        };
 
     private void EmitEntryParameters(LirBlock block)
     {
@@ -1735,7 +1948,10 @@ internal sealed class LirFunctionBuilder
                 break;
 
             case GimpleGotoStatement gotoStatement:
-                EmitJump(block, instruction.Block, gotoStatement.Target, gotoStatement);
+                if (_controlFlowFunction.TryGetBlock(gotoStatement.Target, out var gotoTarget) && gotoTarget is not null)
+                    EmitJumpToControlFlowTarget(block, instruction.Block, ThreadJump(instruction.Block, gotoTarget), gotoStatement, instruction);
+                else
+                    EmitJump(block, instruction.Block, gotoStatement.Target, gotoStatement);
                 break;
 
             case GimpleCondStatement conditional:
@@ -2785,11 +3001,23 @@ internal sealed class LirFunctionBuilder
         if (_symbolBases.TryGetValue(symbol, out var cached) && cached.Block.Dominates(_currentGimpleBlock))
             return LirAddress.Indirect(LirOperand.ForRegister(cached.Register), symbolValue.Type);
 
+        var pointerType = new QualifiedType(TypeCatalog.Instance.PointerTo(symbolValue.Type));
+        // Inside a loop the address would be recomputed every iteration, so one copy ahead of the loop serves them all
+        if (!IsFrameResident(symbol) && TryGetHoistingLoop(out var loop, out var preheader) && TryReserveLoopValue(loop, preheader))
+        {
+            var hoisted = NewVirtualRegister(pointerType, sourceName: null, valueNumber: null);
+            Emit(preheader, LirInstructionKind.AddressOf, hoisted, ImmutableArray<LirOperand>.Empty,
+                LirAddress.ForSymbol(symbol, symbolValue.Type), op: string.Empty, conversionKind: null,
+                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null,
+                falseTarget: null, sourceStatement: null, sourceValue: null, sourceInstruction: null, valueNumber: null);
+            _symbolBases[symbol] = (hoisted, loop.Preheader!);
+            return LirAddress.Indirect(LirOperand.ForRegister(hoisted), symbolValue.Type);
+        }
+
         // One address has to serve several accesses, or the emitter scratch is the cheaper way to get it
         if (!_sharedSymbols.Contains(symbol))
             return LirAddress.ForSymbol(symbol, symbolValue.Type);
 
-        var pointerType = new QualifiedType(TypeCatalog.Instance.PointerTo(symbolValue.Type));
         var result = NewVirtualRegister(pointerType, sourceName: null, valueNumber: null);
         Emit(block, LirInstructionKind.AddressOf, result, ImmutableArray<LirOperand>.Empty,
             LirAddress.ForSymbol(symbol, symbolValue.Type), op: string.Empty, conversionKind: null,
@@ -2934,7 +3162,7 @@ internal sealed class LirFunctionBuilder
 
     private bool TryGetPointerSizedIntegerType(QualifiedType source, int pointerSize, out QualifiedType type)
     {
-        var unsigned = IsUnsignedIntegerType(source);
+        var unsigned = !GimpleTypes.IsSigned(source, _target);
         foreach (var candidate in new[]
         {
             unsigned ? TypeCatalog.Instance.UnsignedLong : TypeCatalog.Instance.Long,
@@ -2949,11 +3177,6 @@ internal sealed class LirFunctionBuilder
         type = default;
         return false;
     }
-
-    private static bool IsUnsignedIntegerType(QualifiedType type)
-        => type.Type is BuiltinType builtin &&
-           builtin.BuiltinKind is BuiltinTypeKind.Bool or BuiltinTypeKind.UnsignedChar or BuiltinTypeKind.UnsignedShort
-               or BuiltinTypeKind.UnsignedInt or BuiltinTypeKind.UnsignedLong or BuiltinTypeKind.UnsignedLongLong;
 
     private LirOperand EmitPointerElementBaseValue(LirBlock block, GimpleValue originalBase, GimpleOperandInfo? rewrittenBase)
     {
@@ -3585,6 +3808,9 @@ internal sealed class LirFunctionBuilder
         ValueNumber? valueNumber,
         GimpleTreeCode treeCode = GimpleTreeCode.None)
     {
+        if (kind is LirInstructionKind.Binary or LirInstructionKind.Branch or LirInstructionKind.Store && _hoistingLoops.Count != 0)
+            operands = HoistLoopConstants(kind, op, operands);
+
         var instruction = new LirInstruction(
             _nextInstructionOrdinal++,
             kind,

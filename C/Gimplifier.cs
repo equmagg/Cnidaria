@@ -1131,7 +1131,7 @@ internal sealed class Gimplifier
     /// <summary>Lowers a static expression without emitting function statements</summary>
     private GimpleValue LowerStaticExpression(BoundExpression expression)
     {
-        if (TryEvaluateIntegerConstantValue(expression, out var integerValue))
+        if (IntegerConstantEvaluator.TryEvaluate(expression, _target, out var integerValue))
             return new GimpleConstantValue(integerValue, expression.Type, expression.Syntax);
 
         if (TryEvaluateFloatingConstantValue(expression, out var floatingValue))
@@ -1307,7 +1307,7 @@ internal sealed class Gimplifier
                     memberAccess.Syntax);
 
             default:
-                if (TryEvaluateIntegerConstantValue(expression, out var integerValue))
+                if (IntegerConstantEvaluator.TryEvaluate(expression, _target, out var integerValue))
                     return new GimpleConstantValue(integerValue, expression.Type, expression.Syntax);
 
                 return new GimpleErrorValue(expression.Syntax);
@@ -1673,7 +1673,7 @@ internal sealed class Gimplifier
     private GimpleValue NegateOffset(GimpleValue offset, SyntaxNode? syntax)
     {
         var type = PointerOffsetType(offset.Type);
-        if (offset is GimpleConstantValue constant && TryConvertConstantToLong(constant.Value, out var value))
+        if (offset is GimpleConstantValue constant && IntegerConstantEvaluator.TryConvertConstantToLong(constant.Value, out var value))
             return CreateIntegerConstant(-value, type, syntax);
 
         return EmitUnary(GimpleTreeCode.NegateExpr, EmitConvert(offset, type, syntax), type, syntax);
@@ -2095,7 +2095,7 @@ internal sealed class Gimplifier
         var syntax = member.Syntax;
         var unit = ReadBitFieldStorage(member);
 
-        if (!IsSignedStorageType(unitType))
+        if (!GimpleTypes.IsSigned(unitType, _target))
         {
             var shifted = placement.BitOffset == 0
                 ? unit
@@ -2167,13 +2167,6 @@ internal sealed class Gimplifier
 
     private int StorageBits(QualifiedType type)
         => Math.Max(1, _target.SizeOf(type)) * 8;
-
-    // Matches the back ends, which read a plain char without a sign
-    private static bool IsSignedStorageType(QualifiedType type)
-        => type.Type is EnumType ||
-           (type.Type is BuiltinType builtin && builtin.BuiltinKind is
-               BuiltinTypeKind.SignedChar or BuiltinTypeKind.Short or BuiltinTypeKind.Int or
-               BuiltinTypeKind.Long or BuiltinTypeKind.LongLong);
 
     /// <summary>Emits a unary computation into a fresh temporary</summary>
     private GimpleValue EmitUnary(GimpleTreeCode code, GimpleValue operand, QualifiedType type, SyntaxNode? syntax)
@@ -2429,8 +2422,8 @@ internal sealed class Gimplifier
 
     private GimpleValue MultiplySizes(GimpleValue left, GimpleValue right, SyntaxNode? syntax)
     {
-        var leftConstant = left is GimpleConstantValue { Value: var a } && TryConvertConstantToLong(a, out var leftValue) ? leftValue : (long?)null;
-        var rightConstant = right is GimpleConstantValue { Value: var b } && TryConvertConstantToLong(b, out var rightValue) ? rightValue : (long?)null;
+        var leftConstant = left is GimpleConstantValue { Value: var a } && IntegerConstantEvaluator.TryConvertConstantToLong(a, out var leftValue) ? leftValue : (long?)null;
+        var rightConstant = right is GimpleConstantValue { Value: var b } && IntegerConstantEvaluator.TryConvertConstantToLong(b, out var rightValue) ? rightValue : (long?)null;
         if (leftConstant is { } l && rightConstant is { } r)
             return CreateIntegerConstant(unchecked(l * r), SizeType(), syntax);
         if (leftConstant == 1)
@@ -2714,7 +2707,7 @@ internal sealed class Gimplifier
                     {
                         var label = CreateGeneratedLabel("case");
                         caseLabels.Add(caseStatement, label);
-                        var value = TryEvaluateIntegerConstantValue(caseStatement.Expression, out var constantValue)
+                        var value = IntegerConstantEvaluator.TryEvaluate(caseStatement.Expression, _target, out var constantValue)
                             ? new GimpleConstantValue(constantValue, caseStatement.Expression.Type, caseStatement.Expression.Syntax)
                             : new GimpleConstantValue(null, caseStatement.Expression.Type, caseStatement.Expression.Syntax);
 
@@ -2749,50 +2742,13 @@ internal sealed class Gimplifier
         return new SwitchLabels(cases.ToImmutable(), caseLabels, defaultLabel);
     }
 
-    /// <summary>Evaluates the supported bound integer constant expression subset</summary>
-    private static bool TryEvaluateIntegerConstantValue(BoundExpression expression, out long value)
-    {
-        switch (expression)
-        {
-            case BoundConversionExpression conversion:
-                return TryEvaluateIntegerConstantValue(conversion.Expression, out value);
-
-            case BoundParenthesizedExpression parenthesized:
-                return TryEvaluateIntegerConstantValue(parenthesized.Expression, out value);
-
-            case BoundCastExpression cast:
-                return TryEvaluateIntegerConstantValue(cast.Expression, out value);
-
-            case BoundSizeofExpression sizeofExpression:
-                return TryConvertConstantToLong(sizeofExpression.ConstantValue, out value);
-
-            case BoundOffsetofExpression offsetof:
-                return TryConvertConstantToLong(offsetof.ConstantValue, out value);
-
-            case BoundLiteralExpression literal:
-                return TryConvertConstantToLong(literal.ConstantValue, out value);
-
-            case BoundUnaryExpression unary:
-                return TryEvaluateUnaryIntegerConstant(unary.OperatorToken.Kind, unary.Operand, out value);
-
-            case BoundBinaryExpression binary:
-                return TryEvaluateBinaryIntegerConstant(binary.Left, binary.OperatorToken.Kind, binary.Right, out value);
-
-            case BoundConditionalExpression conditional:
-                return TryEvaluateConditionalIntegerConstant(conditional.Condition, conditional.WhenTrue, conditional.WhenFalse, out value);
-
-            default:
-                return TryConvertConstantToLong(expression.ConstantValue, out value);
-        }
-    }
-
     /// <summary>Evaluates the supported syntax-only integer constant expression subset</summary>
     private static bool TryEvaluateIntegerConstantExpression(ExpressionSyntax expression, out long value)
     {
         switch (expression)
         {
             case LiteralExpressionSyntax literal:
-                return TryConvertConstantToLong(literal.LiteralToken.Value, out value) ||
+                return IntegerConstantEvaluator.TryConvertConstantToLong(literal.LiteralToken.Value, out value) ||
                        TryParseIntegerLiteral(literal.LiteralToken.Text, out value);
 
             case ParenthesizedExpressionSyntax parenthesized:
@@ -2818,18 +2774,6 @@ internal sealed class Gimplifier
                 value = 0;
                 return false;
         }
-    }
-
-    private static bool TryEvaluateUnaryIntegerConstant(
-        SyntaxKind operatorKind,
-        BoundExpression operandExpression,
-        out long value)
-    {
-        value = 0;
-        if (!TryEvaluateIntegerConstantValue(operandExpression, out var operand))
-            return false;
-
-        return TryEvaluateUnaryIntegerConstant(operatorKind, operand, out value);
     }
 
     private static bool TryEvaluateUnaryIntegerConstant(
@@ -2874,23 +2818,6 @@ internal sealed class Gimplifier
             value = 0;
             return false;
         }
-    }
-
-    private static bool TryEvaluateBinaryIntegerConstant(
-        BoundExpression leftExpression,
-        SyntaxKind operatorKind,
-        BoundExpression rightExpression,
-        out long value)
-    {
-        value = 0;
-
-        if (!TryEvaluateIntegerConstantValue(leftExpression, out var left) ||
-            !TryEvaluateIntegerConstantValue(rightExpression, out var right))
-        {
-            return false;
-        }
-
-        return TryEvaluateBinaryIntegerConstant(left, operatorKind, right, out value);
     }
 
     private static bool TryEvaluateBinaryIntegerConstant(
@@ -3000,22 +2927,6 @@ internal sealed class Gimplifier
     }
 
     private static bool TryEvaluateConditionalIntegerConstant(
-        BoundExpression condition,
-        BoundExpression whenTrue,
-        BoundExpression whenFalse,
-        out long value)
-    {
-        value = 0;
-
-        if (!TryEvaluateIntegerConstantValue(condition, out var conditionValue))
-            return false;
-
-        return conditionValue != 0
-            ? TryEvaluateIntegerConstantValue(whenTrue, out value)
-            : TryEvaluateIntegerConstantValue(whenFalse, out value);
-    }
-
-    private static bool TryEvaluateConditionalIntegerConstant(
         ExpressionSyntax condition,
         ExpressionSyntax whenTrue,
         ExpressionSyntax whenFalse,
@@ -3029,46 +2940,6 @@ internal sealed class Gimplifier
         return conditionValue != 0
             ? TryEvaluateIntegerConstantExpression(whenTrue, out value)
             : TryEvaluateIntegerConstantExpression(whenFalse, out value);
-    }
-
-    private static bool TryConvertConstantToLong(object? constantValue, out long value)
-    {
-        switch (constantValue)
-        {
-            case byte byteValue:
-                value = byteValue;
-                return true;
-            case sbyte signedByteValue:
-                value = signedByteValue;
-                return true;
-            case short shortValue:
-                value = shortValue;
-                return true;
-            case ushort unsignedShortValue:
-                value = unsignedShortValue;
-                return true;
-            case int intValue:
-                value = intValue;
-                return true;
-            case uint unsignedIntValue:
-                value = unsignedIntValue;
-                return true;
-            case long longValue:
-                value = longValue;
-                return true;
-            case ulong unsignedLongValue when unsignedLongValue <= long.MaxValue:
-                value = (long)unsignedLongValue;
-                return true;
-            case char charValue:
-                value = charValue;
-                return true;
-            case bool boolValue:
-                value = boolValue ? 1 : 0;
-                return true;
-            default:
-                value = 0;
-                return false;
-        }
     }
 
     /// <summary>Parses decimal, hexadecimal, or octal integer spelling into a signed value</summary>

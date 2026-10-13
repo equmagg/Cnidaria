@@ -434,6 +434,9 @@ namespace Cnidaria.Cs
         public int GcSpillAreaOffset { get; }
         public int GcSpillAreaSize { get; }
         public int GcRootSpillSlotCount { get; }
+        public int GcRootSpillAreaCount { get; }
+        public int FuncletSlotAreaOffset { get; }
+        public int FuncletCount { get; }
         public ImmutableArray<StackFrameSlot> ArgumentSlots { get; }
         public ImmutableArray<StackFrameSlot> LocalSlots { get; }
         public ImmutableArray<StackFrameSlot> TempSlots { get; }
@@ -475,7 +478,10 @@ namespace Cnidaria.Cs
             RegisterStackFrameModel frameModel = RegisterStackFrameModel.Leaf,
             int gcSpillAreaOffset = 0,
             int gcSpillAreaSize = 0,
-            int gcRootSpillSlotCount = 0)
+            int gcRootSpillSlotCount = 0,
+            int gcRootSpillAreaCount = 1,
+            int funcletSlotAreaOffset = 0,
+            int funcletCount = 0)
         {
             if (frameSize < 0)
                 throw new ArgumentOutOfRangeException(nameof(frameSize));
@@ -489,6 +495,10 @@ namespace Cnidaria.Cs
                 throw new ArgumentOutOfRangeException(nameof(gcRootSpillSlotCount));
             if (checked(gcSpillAreaOffset + gcSpillAreaSize) > frameSize)
                 throw new ArgumentOutOfRangeException(nameof(gcSpillAreaSize));
+            if (gcRootSpillAreaCount < 1)
+                throw new ArgumentOutOfRangeException(nameof(gcRootSpillAreaCount));
+            if (funcletCount < 0 || funcletSlotAreaOffset < 0)
+                throw new ArgumentOutOfRangeException(nameof(funcletCount));
 
             FrameSize = frameSize;
             FrameAlignment = frameAlignment;
@@ -509,6 +519,9 @@ namespace Cnidaria.Cs
             GcSpillAreaOffset = gcSpillAreaOffset;
             GcSpillAreaSize = gcSpillAreaSize;
             GcRootSpillSlotCount = gcRootSpillSlotCount;
+            GcRootSpillAreaCount = gcRootSpillAreaCount;
+            FuncletSlotAreaOffset = funcletSlotAreaOffset;
+            FuncletCount = funcletCount;
             ArgumentSlots = argumentSlots.IsDefault ? ImmutableArray<StackFrameSlot>.Empty : argumentSlots;
             LocalSlots = localSlots.IsDefault ? ImmutableArray<StackFrameSlot>.Empty : localSlots;
             TempSlots = tempSlots.IsDefault ? ImmutableArray<StackFrameSlot>.Empty : tempSlots;
@@ -555,6 +568,30 @@ namespace Cnidaria.Cs
 
         public bool TryGetOutgoingArgumentSlot(int index, out StackFrameSlot slot)
             => TryGetIndexedSlot(OutgoingArgumentSlots, index, out slot);
+
+        // Each funclet spills its roots apart from the root body, whose safe point stays live while a funclet runs
+        public int GcRootSpillSlotOffset(int funcletIndex, int rootIndex, int pointerSize)
+        {
+            if ((uint)funcletIndex >= (uint)GcRootSpillAreaCount || (uint)rootIndex >= (uint)GcRootSpillSlotCount)
+                throw new ArgumentOutOfRangeException(nameof(rootIndex));
+            return checked(GcSpillAreaOffset + (funcletIndex * GcRootSpillSlotCount + rootIndex) * pointerSize);
+        }
+
+        public int GcRootSpillAreaEnd(int pointerSize)
+            => checked(GcSpillAreaOffset + GcRootSpillAreaCount * GcRootSpillSlotCount * pointerSize);
+
+        public int FuncletLinkSlotOffset(int funcletIndex, int pointerSize)
+            => FuncletSlotOffset(funcletIndex, 0, pointerSize);
+
+        public int FuncletExceptionSlotOffset(int funcletIndex, int pointerSize)
+            => FuncletSlotOffset(funcletIndex, 1, pointerSize);
+
+        private int FuncletSlotOffset(int funcletIndex, int slot, int pointerSize)
+        {
+            if (funcletIndex < 1 || funcletIndex > FuncletCount)
+                throw new ArgumentOutOfRangeException(nameof(funcletIndex));
+            return checked(FuncletSlotAreaOffset + ((funcletIndex - 1) * 2 + slot) * pointerSize);
+        }
 
         private static bool TryGetIndexedSlot(ImmutableArray<StackFrameSlot> slots, int index, out StackFrameSlot slot)
         {

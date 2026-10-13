@@ -2583,8 +2583,6 @@ namespace Cnidaria.Cs
         }
         private BoundStatement BindThrow(ThrowStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
-            _flow.ValidateMethodExitTransfer(node, context, diagnostics);
-
             if (node.Expression is null)
             {
                 if (!_flow.IsInsideCatchRegion)

@@ -102,15 +102,15 @@ rh_bytes __riscv_vmv_v_x_u8m8(u8 rs1, usize vl);
 #define RH_TYPE_MDARRAY 3ul
 #define RH_TYPE_PARAMETERIZED 4ul
 #define RH_MINIMUM_GC_OBJECT_SIZE MINIMUM_GC_OBJECT_SIZE
-#define RH_EH_MAX_FRAMES 4096ul
-#define RH_EH_MAX_CONTINUATIONS 256ul
-#define RH_EH_MAX_CATCH_CONTEXTS 256ul
 #define RH_EH_CATCH 1ul
 #define RH_EH_CATCH_ALL 2ul
 #define RH_EH_FINALLY 3ul
 #define RH_EH_FAULT 4ul
-#define RH_EH_CONTINUATION_LEAVE 1ul
-#define RH_EH_CONTINUATION_THROW 2ul
+#define RH_REGION_FRAME 0ul
+#define RH_REGION_FRAMELESS 1ul
+#define RH_REGION_FUNCLET 2ul
+#define RH_UNWIND_REGISTER_COUNT 64ul
+#define RH_UNWIND_DEPTH_LIMIT (1ul << 20)
 
 typedef struct RhGcField
 {
@@ -144,11 +144,61 @@ typedef struct RhRoot
     usize kind;
 } RhRoot;
 
+typedef struct RhSavedRegister
+{
+    usize index;
+    isize offset;
+    usize size;
+} RhSavedRegister;
+
+typedef struct RhEhClause
+{
+    usize kind;
+    const void* try_start;
+    const void* try_end;
+    const void* handler;
+    const RhMethodTable* catch_type;
+    isize source_try_start;
+    isize source_try_end;
+    isize source_handler_start;
+    isize source_handler_end;
+    isize source_handler_index;
+} RhEhClause;
+
+typedef struct RhEhInfo
+{
+    usize clause_count;
+    const RhEhClause* clauses;
+} RhEhInfo;
+
+// A funclet keeps its parent's frame pointer and parks its stack pointer at parent fp + link_offset
+typedef struct RhCodeRegion
+{
+    const void* start;
+    const void* end;
+    usize kind;
+    isize frame_size;
+    isize fp_offset;
+    isize ra_offset;
+    isize link_offset;
+    usize saved_count;
+    const RhSavedRegister* saved;
+    const RhEhInfo* eh;
+    isize clause;
+} RhCodeRegion;
+
+typedef struct RhUnwindContext
+{
+    const void* ip;
+    usize sp;
+    usize fp;
+    usize registers[RH_UNWIND_REGISTER_COUNT];
+} RhUnwindContext;
+
 typedef struct RhSafePoint
 {
     const void* return_address;
-    isize saved_frame_pointer_offset;
-    isize saved_return_address_offset;
+    const RhCodeRegion* region;
     usize root_count;
     const RhRoot* roots;
 } RhSafePoint;
@@ -161,40 +211,11 @@ typedef struct RhStaticRoot
 
 typedef struct RhObject RhObject;
 
-typedef struct RhEhClause
+typedef struct RhDispatchRecord
 {
-    usize kind;
-    const void* try_start;
-    const void* try_end;
-    const void* handler_start;
-    const void* handler_end;
-    const RhMethodTable* catch_type;
-    isize parent_index;
-    isize source_try_start;
-    isize source_try_end;
-    isize source_handler_start;
-    isize source_handler_end;
-    isize source_handler_index;
-} RhEhClause;
-
-typedef struct RhEhMethodInfo
-{
-    usize clause_count;
-    const RhEhClause* clauses;
-} RhEhMethodInfo;
-
-typedef struct RhEhFrame
-{
-    const RhEhMethodInfo* method;
-    void* frame_pointer;
-    const void* current_ip;
-} RhEhFrame;
-
-typedef union RhEhRegisterContext
-{
-    u8 data[512];
-    usize alignment;
-} RhEhRegisterContext;
+    RhObject* exception;
+    struct RhDispatchRecord* next;
+} RhDispatchRecord;
 
 #if (defined(__riscv_flen) && __riscv_flen >= 32) || defined(__i386__) || defined(__x86_64__) || defined(__aarch64__)
 typedef union RhFloatBits
@@ -211,24 +232,6 @@ typedef union RhDoubleBits
     usize bits;
 } RhDoubleBits;
 #endif
-
-typedef struct RhEhContinuation
-{
-    usize kind;
-    const void* target;
-    usize frame_index;
-    const void* source_ip;
-    isize clause_index;
-    RhObject* exception;
-} RhEhContinuation;
-
-typedef struct RhCatchContext
-{
-    RhObject* exception;
-    usize frame_index;
-    const RhEhMethodInfo* method;
-    isize clause_index;
-} RhCatchContext;
 
 typedef struct RhBlock
 {
@@ -248,6 +251,8 @@ static const RhSafePoint* rh_safe_points;
 static usize rh_safe_point_count;
 static const RhTypeInfo* rh_type_infos;
 static usize rh_type_info_count;
+static const RhTypeInfo** rh_type_index;
+static usize rh_type_index_mask;
 static const RhStaticRoot* rh_static_roots;
 static usize rh_static_root_count;
 static u8* rh_heap_base;
@@ -257,23 +262,20 @@ static u8* rh_heap_limit;
 static usize rh_allocation_debt;
 #define RH_GC_POLL_DEBT_LIMIT 262144ul
 static RhBlock* rh_mark_stack;
-static RhBlock* rh_free_list;
+#define RH_FREE_BUCKET_COUNT 24ul
+#define RH_INTERIOR_BATCH_SIZE 512ul
+static RhBlock* rh_free_buckets[RH_FREE_BUCKET_COUNT];
+static void* rh_interior_batch[RH_INTERIOR_BATCH_SIZE];
+static usize rh_interior_batch_count;
 static int rh_gc_running;
 static RhObject* rh_delegate_temporary_root;
-static RhObject* rh_active_exception;
-static RhEhContinuation rh_eh_continuations[RH_EH_MAX_CONTINUATIONS];
-static RhEhRegisterContext rh_eh_continuation_registers[RH_EH_MAX_CONTINUATIONS];
-static usize rh_eh_continuation_count;
-static RhCatchContext rh_catch_contexts[RH_EH_MAX_CATCH_CONTEXTS];
-static usize rh_catch_context_count;
+static RhDispatchRecord* rh_dispatches;
+static const RhCodeRegion* rh_regions;
+static usize rh_region_count;
 
 const RhSafePoint* RhpCurrentSafePoint;
 void* RhpCurrentFramePointer;
 volatile u32 RhpGcPollRequested;
-usize RhpEhFrameCount;
-RhEhFrame RhpEhFrames[RH_EH_MAX_FRAMES];
-RhEhRegisterContext RhpEhRegisterContexts[RH_EH_MAX_FRAMES];
-RhObject* RhpCurrentException;
 
 #if (defined(__riscv_flen) && __riscv_flen >= 32) || defined(__i386__) || defined(__x86_64__) || defined(__aarch64__)
 float RhpFmodF(float x, float y)
@@ -488,7 +490,9 @@ double RhpFmod(double x, double y)
 #endif
 
 void RhpFallbackFailFast(int code);
-void RhpEhTransfer(void* frame_pointer, const void* target, const void* register_context);
+usize RhpCallFunclet(const void* handler, const RhUnwindContext* context, RhObject* exception);
+void RhpCallFuncletReturn(void);
+void RhpResume(const RhUnwindContext* context, const void* target);
 
 #if defined(__linux__) && defined(__riscv)
 static isize rh_syscall1(usize number, usize arg0)
@@ -1015,73 +1019,53 @@ static int rh_is_assignable(const RhMethodTable* source, const RhMethodTable* ta
     }
 }
 
-static int rh_eh_ip_in_range(const void* ip, const void* start, const void* end)
+static const RhCodeRegion* rh_find_region(const void* ip)
 {
-    usize value = (usize)ip;
-    return value >= (usize)start && value < (usize)end;
+    usize key = (usize)ip - 1ul;
+    usize low = 0ul;
+    usize high = rh_region_count;
+    const RhCodeRegion* region;
+    while (low < high)
+    {
+        usize middle = low + (high - low) / 2ul;
+        if ((usize)rh_regions[middle].start <= key)
+            low = middle + 1ul;
+        else
+            high = middle;
+    }
+    if (low == 0ul)
+        return (const RhCodeRegion*)0;
+    region = &rh_regions[low - 1ul];
+    if (key >= (usize)region->end)
+        return (const RhCodeRegion*)0;
+    return region;
 }
 
-static isize rh_eh_find_innermost_handler(const RhEhMethodInfo* method, const void* ip)
+static int rh_unwind_frame(RhUnwindContext* context, const RhCodeRegion* region)
 {
-    isize best = -1;
-    usize best_span = (usize)-1;
+    usize base = region->kind == RH_REGION_FRAME ? context->fp : context->sp;
     usize i = 0ul;
-    while (i < method->clause_count)
+    while (i < region->saved_count)
     {
-        const RhEhClause* clause = &method->clauses[i];
-        if (rh_eh_ip_in_range(ip, clause->handler_start, clause->handler_end))
-        {
-            usize span = (usize)clause->handler_end - (usize)clause->handler_start;
-            if (span < best_span || (span == best_span && (isize)i > best))
-            {
-                best = (isize)i;
-                best_span = span;
-            }
-        }
+        const RhSavedRegister* saved = &region->saved[i];
+        const usize* source = (const usize*)(base + (usize)saved->offset);
+        if (saved->index + (saved->size > sizeof(usize) ? 1ul : 0ul) >= RH_UNWIND_REGISTER_COUNT)
+            RhpFallbackFailFast(151);
+        context->registers[saved->index] = source[0];
+        if (saved->size > sizeof(usize))
+            context->registers[saved->index + 1ul] = source[1];
         i = i + 1ul;
     }
-    return best;
-}
-
-static int rh_eh_source_range_contains(isize outer_start, isize outer_end, isize inner_start, isize inner_end)
-{
-    return inner_start >= outer_start && inner_end <= outer_end;
-}
-
-static int rh_eh_is_protected(const RhEhMethodInfo* method, const void* ip, usize clause_index)
-{
-    const RhEhClause* clause;
-    isize current;
-    if (clause_index >= method->clause_count)
-        return 0;
-    clause = &method->clauses[clause_index];
-    if (rh_eh_ip_in_range(ip, clause->try_start, clause->try_end))
+    context->ip = *(const void* const*)(base + (usize)region->ra_offset);
+    if (region->kind == RH_REGION_FRAME)
+        context->fp = *(const usize*)(base + (usize)region->fp_offset);
+    context->sp = base + (usize)region->frame_size;
+    if (context->ip == (const void*)RhpCallFuncletReturn)
+    {
+        *context = **(const RhUnwindContext* const*)context->sp;
         return 1;
-    current = rh_eh_find_innermost_handler(method, ip);
-    if (current < 0)
-        return 0;
-    return rh_eh_source_range_contains(
-        clause->source_try_start,
-        clause->source_try_end,
-        method->clauses[(usize)current].source_handler_start,
-        method->clauses[(usize)current].source_handler_end);
-}
-
-static int rh_eh_handler_contains(const RhEhMethodInfo* method, isize clause_index, const void* ip)
-{
-    isize current;
-    const RhEhClause* clause;
-    if (clause_index < 0 || (usize)clause_index >= method->clause_count)
-        return 0;
-    current = rh_eh_find_innermost_handler(method, ip);
-    if (current < 0)
-        return 0;
-    clause = &method->clauses[(usize)clause_index];
-    return rh_eh_source_range_contains(
-        clause->source_handler_start,
-        clause->source_handler_end,
-        method->clauses[(usize)current].source_handler_start,
-        method->clauses[(usize)current].source_handler_end);
+    }
+    return region->kind == RH_REGION_FUNCLET;
 }
 
 static int rh_eh_precedes(const RhEhClause* left, const RhEhClause* right)
@@ -1108,25 +1092,34 @@ static int rh_eh_matches_catch(const RhEhClause* clause, const RhObject* excepti
     return rh_is_assignable(exception->type, clause->catch_type);
 }
 
-static isize rh_eh_find_throw_handler(
-    const RhEhFrame* frame,
-    const RhObject* exception,
-    const void* source_ip,
-    isize after_clause_index)
+static int rh_eh_funclet_in_try(const RhCodeRegion* region, const RhEhClause* clause)
 {
-    const RhEhMethodInfo* method = frame->method;
-    const RhEhClause* after_clause = (const RhEhClause*)0;
+    const RhEhClause* owner;
+    if (region->kind != RH_REGION_FUNCLET || region->clause < 0)
+        return 0;
+    owner = &region->eh->clauses[(usize)region->clause];
+    return owner->source_handler_start >= clause->source_try_start &&
+        owner->source_handler_end <= clause->source_try_end;
+}
+
+// Code inside a funclet is protected by every try that encloses the funclet's handler, besides the trys nested in it
+static int rh_eh_protects(const RhCodeRegion* region, usize clause_index, usize ip)
+{
+    const RhEhClause* clause = &region->eh->clauses[clause_index];
+    return (ip >= (usize)clause->try_start && ip < (usize)clause->try_end) || rh_eh_funclet_in_try(region, clause);
+}
+
+static isize rh_eh_next_clause(const RhCodeRegion* region, usize ip, isize previous)
+{
+    const RhEhInfo* eh = region->eh;
     isize best = -1;
     usize i = 0ul;
-    if (after_clause_index >= 0 && (usize)after_clause_index < method->clause_count)
-        after_clause = &method->clauses[(usize)after_clause_index];
-    while (i < method->clause_count)
+    while (i < eh->clause_count)
     {
-        const RhEhClause* clause = &method->clauses[i];
-        if (rh_eh_is_protected(method, source_ip, i) &&
-            (after_clause == (const RhEhClause*)0 || rh_eh_precedes(after_clause, clause)) &&
-            (clause->kind == RH_EH_FINALLY || clause->kind == RH_EH_FAULT || rh_eh_matches_catch(clause, exception)) &&
-            (best < 0 || rh_eh_precedes(clause, &method->clauses[(usize)best])))
+        const RhEhClause* clause = &eh->clauses[i];
+        if (rh_eh_protects(region, i, ip) &&
+            (previous < 0 || rh_eh_precedes(&eh->clauses[(usize)previous], clause)) &&
+            (best < 0 || rh_eh_precedes(clause, &eh->clauses[(usize)best])))
         {
             best = (isize)i;
         }
@@ -1135,340 +1128,112 @@ static isize rh_eh_find_throw_handler(
     return best;
 }
 
-static isize rh_eh_find_leave_finally(
-    const RhEhFrame* frame,
-    const void* source_ip,
-    const void* target,
-    isize after_clause_index)
+static isize rh_eh_find_catch(const RhCodeRegion* region, usize ip, const RhObject* exception)
 {
-    const RhEhMethodInfo* method = frame->method;
-    const RhEhClause* after_clause = (const RhEhClause*)0;
-    isize best = -1;
-    usize i = 0ul;
-    if (after_clause_index >= 0 && (usize)after_clause_index < method->clause_count)
-        after_clause = &method->clauses[(usize)after_clause_index];
-    while (i < method->clause_count)
+    isize clause = rh_eh_next_clause(region, ip, -1);
+    while (clause >= 0)
     {
-        const RhEhClause* clause = &method->clauses[i];
-        if (clause->kind == RH_EH_FINALLY &&
-            rh_eh_is_protected(method, source_ip, i) &&
-            !rh_eh_is_protected(method, target, i) &&
-            (after_clause == (const RhEhClause*)0 || rh_eh_precedes(after_clause, clause)) &&
-            (best < 0 || rh_eh_precedes(clause, &method->clauses[(usize)best])))
-        {
-            best = (isize)i;
-        }
-        i = i + 1ul;
+        if (rh_eh_matches_catch(&region->eh->clauses[(usize)clause], exception))
+            return clause;
+        clause = rh_eh_next_clause(region, ip, clause);
     }
-    return best;
+    return -1;
 }
 
-static void rh_eh_copy_register_context(RhEhRegisterContext* destination, const RhEhRegisterContext* source)
+static void rh_eh_run_terminal_handlers(const RhCodeRegion* region, const RhUnwindContext* context, isize stop)
 {
-    usize i = 0ul;
-    while (i < 512ul)
+    usize ip = (usize)context->ip - 1ul;
+    isize clause = rh_eh_next_clause(region, ip, -1);
+    while (clause >= 0 && clause != stop)
     {
-        destination->data[i] = source->data[i];
-        i = i + 1ul;
+        const RhEhClause* current = &region->eh->clauses[(usize)clause];
+        if (current->kind == RH_EH_FINALLY || current->kind == RH_EH_FAULT)
+            (void)RhpCallFunclet(current->handler, context, (RhObject*)0);
+        clause = rh_eh_next_clause(region, ip, clause);
     }
 }
 
-static void rh_eh_push_continuation(
-    usize kind,
-    const void* target,
-    usize frame_index,
-    const void* source_ip,
-    isize clause_index,
-    RhObject* exception)
+// Pass one only locates the catch; an unhandled exception fails fast before any finally runs
+static void rh_eh_dispatch(RhObject* exception, const RhUnwindContext* thrower)
 {
-    RhEhContinuation* continuation;
-    if (rh_eh_continuation_count >= RH_EH_MAX_CONTINUATIONS)
-        RhpFallbackFailFast(150);
-    continuation = &rh_eh_continuations[rh_eh_continuation_count];
-    continuation->kind = kind;
-    continuation->target = target;
-    continuation->frame_index = frame_index;
-    continuation->source_ip = source_ip;
-    continuation->clause_index = clause_index;
-    continuation->exception = exception;
-    rh_eh_copy_register_context(
-        &rh_eh_continuation_registers[rh_eh_continuation_count],
-        &RhpEhRegisterContexts[frame_index]);
-    rh_eh_continuation_count = rh_eh_continuation_count + 1ul;
-}
+    RhUnwindContext context = *thrower;
+    const RhCodeRegion* region;
+    usize depth = 0ul;
+    usize target_depth;
+    isize target_clause = -1;
+    int skip = 0;
+    RhDispatchRecord record;
+    record.exception = exception;
+    record.next = rh_dispatches;
+    rh_dispatches = &record;
 
-static void rh_eh_prune_continuations(usize frame_index, const void* target)
-{
-    usize source = 0ul;
-    usize destination = 0ul;
-    while (source < rh_eh_continuation_count)
-    {
-        RhEhContinuation continuation = rh_eh_continuations[source];
-        int keep = continuation.frame_index < frame_index ||
-            (continuation.frame_index == frame_index &&
-                target != (const void*)0 &&
-                rh_eh_handler_contains(
-                    RhpEhFrames[frame_index].method,
-                    continuation.clause_index,
-                    target));
-        if (keep)
-        {
-            if (destination != source)
-            {
-                rh_eh_continuations[destination] = continuation;
-                rh_eh_copy_register_context(
-                    &rh_eh_continuation_registers[destination],
-                    &rh_eh_continuation_registers[source]);
-            }
-            destination = destination + 1ul;
-        }
-        source = source + 1ul;
-    }
-    rh_eh_continuation_count = destination;
-}
-
-static void rh_eh_refresh_current_exception(int preserve_active)
-{
-    if (rh_catch_context_count != 0ul)
-        RhpCurrentException = rh_catch_contexts[rh_catch_context_count - 1ul].exception;
-    else if (preserve_active)
-        RhpCurrentException = rh_active_exception;
-    else
-        RhpCurrentException = (RhObject*)0;
-}
-
-static void rh_eh_prune_catches(usize frame_index, const void* target, int preserve_active)
-{
-    usize source = 0ul;
-    usize destination = 0ul;
-    while (source < rh_catch_context_count)
-    {
-        RhCatchContext context = rh_catch_contexts[source];
-        int keep = context.frame_index < frame_index ||
-            (context.frame_index == frame_index && rh_eh_handler_contains(context.method, context.clause_index, target));
-        if (keep)
-        {
-            if (destination != source)
-                rh_catch_contexts[destination] = context;
-            destination = destination + 1ul;
-        }
-        source = source + 1ul;
-    }
-    rh_catch_context_count = destination;
-    rh_eh_refresh_current_exception(preserve_active);
-}
-
-static void rh_eh_push_catch(RhObject* exception, usize frame_index, const RhEhMethodInfo* method, isize clause_index)
-{
-    RhCatchContext* context;
-    if (rh_catch_context_count >= RH_EH_MAX_CATCH_CONTEXTS)
-        RhpFallbackFailFast(150);
-    context = &rh_catch_contexts[rh_catch_context_count];
-    context->exception = exception;
-    context->frame_index = frame_index;
-    context->method = method;
-    context->clause_index = clause_index;
-    rh_catch_context_count = rh_catch_context_count + 1ul;
-    RhpCurrentException = exception;
-}
-
-static void rh_eh_transfer(usize frame_index, const void* target)
-{
-    RhEhFrame* frame;
-    if (frame_index >= RhpEhFrameCount || target == (const void*)0)
-        RhpFallbackFailFast(150);
-    rh_eh_prune_continuations(frame_index, target);
-    RhpEhFrameCount = frame_index + 1ul;
-    frame = &RhpEhFrames[frame_index];
-    frame->current_ip = target;
-    RhpEhTransfer(frame->frame_pointer, target, &RhpEhRegisterContexts[frame_index]);
     for (;;)
     {
-    }
-}
-
-static void rh_eh_dispatch_from(
-    RhObject* exception,
-    usize frame_count,
-    const void* source_ip,
-    isize after_clause_index)
-{
-    while (frame_count != 0ul)
-    {
-        usize frame_index = frame_count - 1ul;
-        RhEhFrame* frame = &RhpEhFrames[frame_index];
-        const void* frame_source_ip = source_ip == (const void*)0 ? frame->current_ip : source_ip;
-        isize clause_index = rh_eh_find_throw_handler(frame, exception, frame_source_ip, after_clause_index);
-        if (clause_index >= 0)
+        region = rh_find_region(context.ip);
+        if (region == (const RhCodeRegion*)0 || depth >= RH_UNWIND_DEPTH_LIMIT)
+            RhpFallbackFailFast(134);
+        if (!skip && region->eh != (const RhEhInfo*)0)
         {
-            const RhEhClause* clause = &frame->method->clauses[(usize)clause_index];
-            rh_eh_prune_catches(frame_index, clause->handler_start, 1);
-            if (clause->kind == RH_EH_FINALLY || clause->kind == RH_EH_FAULT)
-            {
-                rh_eh_push_continuation(
-                    RH_EH_CONTINUATION_THROW,
-                    (const void*)0,
-                    frame_index,
-                    frame_source_ip,
-                    clause_index,
-                    exception);
-                rh_eh_transfer(frame_index, clause->handler_start);
-            }
-            rh_eh_push_catch(exception, frame_index, frame->method, clause_index);
-            rh_eh_transfer(frame_index, clause->handler_start);
+            target_clause = rh_eh_find_catch(region, (usize)context.ip - 1ul, exception);
+            if (target_clause >= 0)
+                break;
         }
-        frame_count = frame_index;
-        source_ip = (const void*)0;
-        after_clause_index = -1;
+        skip = rh_unwind_frame(&context, region);
+        depth = depth + 1ul;
     }
-    RhpEhFrameCount = 0ul;
-    rh_eh_continuation_count = 0ul;
-    RhpCurrentException = exception;
-    RhpFallbackFailFast(134);
-}
 
-static void rh_eh_dispatch(RhObject* exception)
-{
-    rh_eh_dispatch_from(exception, RhpEhFrameCount, (const void*)0, -1);
-}
-
-static void rh_eh_continue_leave(
-    const void* target,
-    const void* source_ip,
-    isize after_clause_index)
-{
-    usize frame_index;
-    RhEhFrame* frame;
-    isize clause_index;
-    if (RhpEhFrameCount == 0ul)
-        RhpFallbackFailFast(150);
-    frame_index = RhpEhFrameCount - 1ul;
-    frame = &RhpEhFrames[frame_index];
-    if (source_ip == (const void*)0)
-        source_ip = frame->current_ip;
-    clause_index = rh_eh_find_leave_finally(frame, source_ip, target, after_clause_index);
-    if (clause_index >= 0)
+    target_depth = depth;
+    context = *thrower;
+    depth = 0ul;
+    skip = 0;
+    for (;;)
     {
-        const RhEhClause* clause = &frame->method->clauses[(usize)clause_index];
-        rh_eh_prune_catches(frame_index, clause->handler_start, 0);
-        rh_eh_push_continuation(
-            RH_EH_CONTINUATION_LEAVE,
-            target,
-            frame_index,
-            source_ip,
-            clause_index,
-            (RhObject*)0);
-        rh_eh_transfer(frame_index, clause->handler_start);
-    }
-    rh_eh_prune_catches(frame_index, target, 0);
-    rh_eh_transfer(frame_index, target);
-}
-
-void RhpThrowEx(RhObject* exception)
-{
-    if (exception == (RhObject*)0)
-        RhpFallbackFailFast(134);
-    rh_active_exception = exception;
-    RhpCurrentException = exception;
-    rh_eh_dispatch(exception);
-}
-
-void RhpRethrow(void)
-{
-    usize frame_index;
-    isize i;
-    RhObject* exception = (RhObject*)0;
-    if (RhpEhFrameCount == 0ul)
-        RhpFallbackFailFast(150);
-    frame_index = RhpEhFrameCount - 1ul;
-    i = (isize)rh_catch_context_count - 1;
-    while (i >= 0)
-    {
-        RhCatchContext* context = &rh_catch_contexts[(usize)i];
-        if (context->frame_index == frame_index &&
-            rh_eh_handler_contains(context->method, context->clause_index, RhpEhFrames[frame_index].current_ip))
-        {
-            exception = context->exception;
+        region = rh_find_region(context.ip);
+        if (!skip && region->eh != (const RhEhInfo*)0)
+            rh_eh_run_terminal_handlers(region, &context, depth == target_depth ? target_clause : -1);
+        if (depth == target_depth)
             break;
+        skip = rh_unwind_frame(&context, region);
+        depth = depth + 1ul;
+    }
+
+    {
+        const RhEhClause* target = &region->eh->clauses[(usize)target_clause];
+        const void* continuation;
+        // A catch runs and resumes in the frame that holds its try, past the funclets nested in that try
+        while (rh_eh_funclet_in_try(region, target))
+        {
+            (void)rh_unwind_frame(&context, region);
+            region = rh_find_region(context.ip);
         }
-        i = i - 1;
+        continuation = (const void*)RhpCallFunclet(target->handler, &context, exception);
+        // Dispatches abandoned by an exception escaping their finally live below the resumed frame
+        while (rh_dispatches != (RhDispatchRecord*)0 && (usize)rh_dispatches < context.sp)
+            rh_dispatches = rh_dispatches->next;
+        RhpResume(&context, continuation);
     }
-    if (exception == (RhObject*)0)
-        RhpFallbackFailFast(150);
-    rh_active_exception = exception;
-    RhpCurrentException = exception;
-    rh_eh_dispatch(exception);
+    RhpFallbackFailFast(150);
 }
 
-void RhpLeave(const void* target, usize kind)
+void RhpDispatchException(RhObject* exception, const RhUnwindContext* thrower)
 {
-    if (kind == 0ul)
-        RhpFallbackFailFast(150);
-    rh_eh_continue_leave(target, (const void*)0, -1);
+    if (exception == (RhObject*)0 || thrower == (const RhUnwindContext*)0)
+        RhpFallbackFailFast(134);
+    rh_eh_dispatch(exception, thrower);
 }
 
-void RhpEndFinally(void)
+static int rh_type_info_is_valid(const RhTypeInfo* info)
 {
-    RhEhContinuation continuation;
-    usize continuation_index;
-    if (rh_eh_continuation_count == 0ul)
-        RhpFallbackFailFast(150);
-    rh_eh_continuation_count = rh_eh_continuation_count - 1ul;
-    continuation_index = rh_eh_continuation_count;
-    continuation = rh_eh_continuations[continuation_index];
-    if (continuation.frame_index >= RhpEhFrameCount)
-        RhpFallbackFailFast(150);
-    rh_eh_copy_register_context(
-        &RhpEhRegisterContexts[continuation.frame_index],
-        &rh_eh_continuation_registers[continuation_index]);
-    RhpEhFrames[continuation.frame_index].current_ip = continuation.source_ip;
-    if (continuation.kind == RH_EH_CONTINUATION_THROW)
-    {
-        if (continuation.exception == (RhObject*)0)
-            RhpFallbackFailFast(150);
-        rh_active_exception = continuation.exception;
-        RhpCurrentException = continuation.exception;
-        rh_eh_dispatch_from(
-            continuation.exception,
-            continuation.frame_index + 1ul,
-            continuation.source_ip,
-            continuation.clause_index);
-    }
-    if (continuation.kind != RH_EH_CONTINUATION_LEAVE)
-        RhpFallbackFailFast(150);
-    rh_eh_continue_leave(
-        continuation.target,
-        continuation.source_ip,
-        continuation.clause_index);
-}
-
-static const RhTypeInfo* rh_find_type_info(const RhMethodTable* type)
-{
-    usize i = 0ul;
-    while (i < rh_type_info_count)
-    {
-        if (rh_type_infos[i].type == type)
-            return &rh_type_infos[i];
-        i = i + 1ul;
-    }
-    return (const RhTypeInfo*)0;
-}
-
-static const RhTypeInfo* rh_require_method_table(const RhMethodTable* type, int code)
-{
-    const RhTypeInfo* info;
+    const RhMethodTable* type = info->type;
     usize component_size;
-    if (type == (const RhMethodTable*)0)
-        RhpFallbackFailFast(code);
-    info = rh_find_type_info(type);
-    if (info == (const RhTypeInfo*)0 ||
+    if (type == (const RhMethodTable*)0 ||
         info->runtime_kind > RH_TYPE_PARAMETERIZED ||
         (info->gc_field_count != 0ul && info->gc_fields == (const RhGcField*)0) ||
         (info->component_gc_field_count != 0ul && info->component_gc_fields == (const RhGcField*)0) ||
         (((type->flags & RH_EETYPE_HAS_POINTERS) != 0u) !=
             (info->gc_field_count != 0ul || info->component_gc_field_count != 0ul)))
     {
-        RhpFallbackFailFast(code);
+        return 0;
     }
 
     component_size = rh_component_size(type);
@@ -1479,9 +1244,9 @@ static const RhTypeInfo* rh_require_method_table(const RhMethodTable* type, int 
             type->base_size < RH_MINIMUM_GC_OBJECT_SIZE ||
             info->component_gc_field_count != 0ul)
         {
-            RhpFallbackFailFast(code);
+            return 0;
         }
-        return info;
+        return 1;
     }
 
     if (info->runtime_kind == RH_TYPE_PARAMETERIZED)
@@ -1496,13 +1261,13 @@ static const RhTypeInfo* rh_require_method_table(const RhMethodTable* type, int 
             info->gc_field_count != 0ul ||
             info->component_gc_field_count != 0ul)
         {
-            RhpFallbackFailFast(code);
+            return 0;
         }
-        return info;
+        return 1;
     }
 
     if (!rh_has_component_size(type) || component_size == 0ul)
-        RhpFallbackFailFast(code);
+        return 0;
 
     if (info->runtime_kind == RH_TYPE_STRING)
     {
@@ -1512,16 +1277,16 @@ static const RhTypeInfo* rh_require_method_table(const RhMethodTable* type, int 
             type->base_size < SYNC_BLOCK_SIZE + STRING_FIRST_CHAR_OFFSET + 2ul ||
             info->component_gc_field_count != 0ul)
         {
-            RhpFallbackFailFast(code);
+            return 0;
         }
-        return info;
+        return 1;
     }
 
     if (rh_method_table_kind(type) != RH_EETYPE_PARAMETERIZED_KIND ||
         type->related_type == (const void*)0 ||
         type->base_size < SYNC_BLOCK_SIZE + ARRAY_DATA_OFFSET)
     {
-        RhpFallbackFailFast(code);
+        return 0;
     }
 
     if (info->runtime_kind == RH_TYPE_SZARRAY)
@@ -1529,18 +1294,34 @@ static const RhTypeInfo* rh_require_method_table(const RhMethodTable* type, int 
         if (rh_element_type(type) != RH_EETYPE_ELEMENT_TYPE_SZARRAY ||
             type->base_size != SYNC_BLOCK_SIZE + ARRAY_DATA_OFFSET)
         {
-            RhpFallbackFailFast(code);
+            return 0;
         }
-        return info;
+        return 1;
     }
 
     if (rh_element_type(type) != RH_EETYPE_ELEMENT_TYPE_ARRAY ||
         type->base_size <= SYNC_BLOCK_SIZE + ARRAY_DATA_OFFSET ||
         ((type->base_size - (SYNC_BLOCK_SIZE + ARRAY_DATA_OFFSET)) & 7u) != 0u)
     {
-        RhpFallbackFailFast(code);
+        return 0;
     }
-    return info;
+    return 1;
+}
+
+static const RhTypeInfo* rh_require_method_table(const RhMethodTable* type, int code)
+{
+    usize slot;
+    if (type == (const RhMethodTable*)0)
+        RhpFallbackFailFast(code);
+    slot = ((usize)type >> 3) & rh_type_index_mask;
+    while (rh_type_index[slot] != (const RhTypeInfo*)0)
+    {
+        if (rh_type_index[slot]->type == type)
+            return rh_type_index[slot];
+        slot = (slot + 1ul) & rh_type_index_mask;
+    }
+    RhpFallbackFailFast(code);
+    return (const RhTypeInfo*)0;
 }
 
 static usize rh_variable_gc_size(const RhMethodTable* type, int length)
@@ -1634,24 +1415,118 @@ static void rh_memmove(void* destination, const void* source, usize size)
 {
     u8* destination_bytes = (u8*)destination;
     const u8* source_bytes = (const u8*)source;
+    int forward;
     if (destination_bytes == source_bytes || size == 0ul)
         return;
-    if ((usize)destination_bytes < (usize)source_bytes ||
-        (usize)destination_bytes >= (usize)source_bytes + size)
+    forward = (usize)destination_bytes < (usize)source_bytes ||
+        (usize)destination_bytes >= (usize)source_bytes + size;
+
+#ifdef __riscv_vector
+    if (forward)
     {
-        usize i = 0ul;
-        while (i < size)
+        while (size != 0ul)
         {
-            destination_bytes[i] = source_bytes[i];
-            i = i + 1ul;
+            usize step = __riscv_vsetvl_e8m8(size);
+            __riscv_vse8_v_u8m8(destination_bytes, __riscv_vle8_v_u8m8(source_bytes, step), step);
+            destination_bytes = destination_bytes + step;
+            source_bytes = source_bytes + step;
+            size = size - step;
         }
         return;
     }
+
+    destination_bytes = destination_bytes + size;
+    source_bytes = source_bytes + size;
     while (size != 0ul)
     {
-        size = size - 1ul;
-        destination_bytes[size] = source_bytes[size];
+        usize step = __riscv_vsetvl_e8m8(size);
+        destination_bytes = destination_bytes - step;
+        source_bytes = source_bytes - step;
+        __riscv_vse8_v_u8m8(destination_bytes, __riscv_vle8_v_u8m8(source_bytes, step), step);
+        size = size - step;
     }
+#else
+#if defined(__x86_64__)
+    if (forward)
+    {
+        usize destination_arg = (usize)destination_bytes;
+        usize source_arg = (usize)source_bytes;
+        usize length_arg = size;
+        __asm__ volatile(
+            ".byte 0xf3, 0xa4"
+            : [destination] "+{rdi}"(destination_arg), [source] "+{rsi}"(source_arg), [length] "+{rcx}"(length_arg)
+            :
+            : "memory");
+        return;
+    }
+#elif defined(__i386__)
+    if (forward)
+    {
+        usize destination_arg = (usize)destination_bytes;
+        usize source_arg = (usize)source_bytes;
+        usize length_arg = size;
+        __asm__ volatile(
+            ".byte 0xf3, 0xa4"
+            : [destination] "+{edi}"(destination_arg), [source] "+{esi}"(source_arg), [length] "+{ecx}"(length_arg)
+            :
+            : "memory");
+        return;
+    }
+#endif
+    {
+        // Word moves need both pointers equally misaligned
+        int words = (((usize)destination_bytes ^ (usize)source_bytes) & (__SIZEOF_POINTER__ - 1ul)) == 0ul;
+        if (forward)
+        {
+            while (words && size != 0ul && ((usize)destination_bytes & (__SIZEOF_POINTER__ - 1ul)) != 0ul)
+            {
+                *destination_bytes = *source_bytes;
+                destination_bytes = destination_bytes + 1;
+                source_bytes = source_bytes + 1;
+                size = size - 1ul;
+            }
+            while (words && size >= __SIZEOF_POINTER__)
+            {
+                *(usize*)destination_bytes = *(const usize*)source_bytes;
+                destination_bytes = destination_bytes + __SIZEOF_POINTER__;
+                source_bytes = source_bytes + __SIZEOF_POINTER__;
+                size = size - __SIZEOF_POINTER__;
+            }
+            while (size != 0ul)
+            {
+                *destination_bytes = *source_bytes;
+                destination_bytes = destination_bytes + 1;
+                source_bytes = source_bytes + 1;
+                size = size - 1ul;
+            }
+            return;
+        }
+
+        destination_bytes = destination_bytes + size;
+        source_bytes = source_bytes + size;
+        while (words && size != 0ul && ((usize)destination_bytes & (__SIZEOF_POINTER__ - 1ul)) != 0ul)
+        {
+            destination_bytes = destination_bytes - 1;
+            source_bytes = source_bytes - 1;
+            *destination_bytes = *source_bytes;
+            size = size - 1ul;
+        }
+        while (words && size >= __SIZEOF_POINTER__)
+        {
+            destination_bytes = destination_bytes - __SIZEOF_POINTER__;
+            source_bytes = source_bytes - __SIZEOF_POINTER__;
+            *(usize*)destination_bytes = *(const usize*)source_bytes;
+            size = size - __SIZEOF_POINTER__;
+        }
+        while (size != 0ul)
+        {
+            destination_bytes = destination_bytes - 1;
+            source_bytes = source_bytes - 1;
+            *destination_bytes = *source_bytes;
+            size = size - 1ul;
+        }
+    }
+#endif
 }
 
 static void rh_write_all(const u8* data, usize length)
@@ -1678,6 +1553,8 @@ static void rh_write_all(const u8* data, usize length)
     }
 #endif
 }
+
+#define RH_CONSOLE_BUFFER_SIZE 1024ul
 
 static usize rh_encode_utf8(u32 scalar, u8* buffer)
 {
@@ -2197,6 +2074,35 @@ static void rh_decommit_unused_tail(void)
     rh_heap_committed = rh_heap_base + keep_offset;
 }
 
+// Allocation and marking look a type up per object, so the table is indexed once and only valid types enter it
+static void rh_build_type_index(void)
+{
+    usize capacity = 16ul;
+    usize bytes;
+    usize i = 0ul;
+    while (capacity < rh_type_info_count * 2ul)
+        capacity = capacity * 2ul;
+    bytes = rh_align_up(capacity * sizeof(const RhTypeInfo*), RH_PAGE_SIZE);
+    rh_type_index = (const RhTypeInfo**)rh_os_reserve(bytes);
+    if (rh_type_index == (const RhTypeInfo**)0 || !rh_os_commit((void*)rh_type_index, bytes))
+        RhpFallbackFailFast(144);
+    rh_type_index_mask = capacity - 1ul;
+
+    while (i < rh_type_info_count)
+    {
+        const RhTypeInfo* info = &rh_type_infos[i];
+        usize slot;
+        i = i + 1ul;
+        if (!rh_type_info_is_valid(info))
+            continue;
+        slot = ((usize)info->type >> 3) & rh_type_index_mask;
+        while (rh_type_index[slot] != (const RhTypeInfo*)0 && rh_type_index[slot]->type != info->type)
+            slot = (slot + 1ul) & rh_type_index_mask;
+        if (rh_type_index[slot] == (const RhTypeInfo*)0)
+            rh_type_index[slot] = info;
+    }
+}
+
 static void rh_initialize_heap(void)
 {
     u8* base = (u8*)rh_os_reserve(RH_HEAP_RESERVE);
@@ -2212,7 +2118,6 @@ static void rh_initialize_heap(void)
     rh_heap_committed = base + RH_HEAP_INITIAL_COMMIT;
     rh_heap_limit = base + RH_HEAP_RESERVE;
     rh_mark_stack = (RhBlock*)0;
-    rh_free_list = (RhBlock*)0;
     rh_allocation_debt = 0ul;
     RhpGcPollRequested = 0u;
 }
@@ -2224,7 +2129,9 @@ void RhpInitialize(
     const RhTypeInfo* type_infos,
     usize type_info_count,
     const RhStaticRoot* static_roots,
-    usize static_root_count)
+    usize static_root_count,
+    const RhCodeRegion* regions,
+    usize region_count)
 {
     if (sizeof(usize) != __SIZEOF_POINTER__ ||
         RH_PAGE_SIZE == 0ul ||
@@ -2252,18 +2159,18 @@ void RhpInitialize(
         sizeof(RhMethodTable) != 16ul + __SIZEOF_POINTER__ ||
         sizeof(RhTypeInfo) != __SIZEOF_POINTER__ * 6ul ||
         sizeof(RhRoot) != __SIZEOF_POINTER__ * 2ul ||
-        sizeof(RhSafePoint) != __SIZEOF_POINTER__ * 5ul ||
+        sizeof(RhSafePoint) != __SIZEOF_POINTER__ * 4ul ||
         sizeof(RhStaticRoot) != __SIZEOF_POINTER__ * 2ul ||
-        sizeof(RhEhClause) != __SIZEOF_POINTER__ * 12ul ||
-        sizeof(RhEhMethodInfo) != __SIZEOF_POINTER__ * 2ul ||
-        sizeof(RhEhFrame) != __SIZEOF_POINTER__ * 3ul ||
-        sizeof(RhEhRegisterContext) != 512ul ||
-        sizeof(RhEhContinuation) != __SIZEOF_POINTER__ * 6ul ||
-        sizeof(RhCatchContext) != __SIZEOF_POINTER__ * 4ul ||
+        sizeof(RhSavedRegister) != __SIZEOF_POINTER__ * 3ul ||
+        sizeof(RhEhClause) != __SIZEOF_POINTER__ * 10ul ||
+        sizeof(RhEhInfo) != __SIZEOF_POINTER__ * 2ul ||
+        sizeof(RhCodeRegion) != __SIZEOF_POINTER__ * 11ul ||
+        sizeof(RhUnwindContext) != __SIZEOF_POINTER__ * (3ul + RH_UNWIND_REGISTER_COUNT) ||
         stack_base == (void*)0 ||
         (safe_point_count != 0ul && safe_points == (const RhSafePoint*)0) ||
         (type_info_count != 0ul && type_infos == (const RhTypeInfo*)0) ||
-        (static_root_count != 0ul && static_roots == (const RhStaticRoot*)0))
+        (static_root_count != 0ul && static_roots == (const RhStaticRoot*)0) ||
+        (region_count != 0ul && regions == (const RhCodeRegion*)0))
     {
         RhpFallbackFailFast(144);
     }
@@ -2274,13 +2181,12 @@ void RhpInitialize(
     rh_type_info_count = type_info_count;
     rh_static_roots = static_roots;
     rh_static_root_count = static_root_count;
+    rh_regions = regions;
+    rh_region_count = region_count;
     RhpCurrentSafePoint = (const RhSafePoint*)0;
     RhpCurrentFramePointer = (void*)0;
-    RhpEhFrameCount = 0ul;
-    RhpCurrentException = (RhObject*)0;
-    rh_active_exception = (RhObject*)0;
-    rh_eh_continuation_count = 0ul;
-    rh_catch_context_count = 0ul;
+    rh_dispatches = (RhDispatchRecord*)0;
+    rh_build_type_index();
     rh_initialize_heap();
 }
 
@@ -2389,36 +2295,65 @@ static int rh_mark_object(void* object)
     return 1;
 }
 
-static int rh_mark_interior(void* interior)
+static void rh_resolve_interior_batch(void);
+
+// An interior pointer finds its object by walking the heap, so they are gathered and resolved in one sorted walk
+static void rh_mark_interior(void* interior)
 {
-    u8* target;
-    u8* scan;
-    if (interior == (void*)0)
-        return 0;
-
-    target = (u8*)interior;
+    u8* target = (u8*)interior;
     if (target < rh_heap_base + RH_BLOCK_HEADER_SIZE + SYNC_BLOCK_SIZE || target >= rh_heap_used)
-        return 0;
+        return;
+    if (rh_interior_batch_count == RH_INTERIOR_BATCH_SIZE)
+        rh_resolve_interior_batch();
+    rh_interior_batch[rh_interior_batch_count] = interior;
+    rh_interior_batch_count = rh_interior_batch_count + 1ul;
+}
 
-    scan = rh_heap_base;
-    while (scan < rh_heap_used)
+static void rh_resolve_interior_batch(void)
+{
+    usize count = rh_interior_batch_count;
+    usize gap = count / 2ul;
+    usize i;
+    u8* scan = rh_heap_base;
+    rh_interior_batch_count = 0ul;
+
+    while (gap != 0ul)
+    {
+        for (i = gap; i < count; i = i + 1ul)
+        {
+            void* value = rh_interior_batch[i];
+            usize j = i;
+            while (j >= gap && (usize)rh_interior_batch[j - gap] > (usize)value)
+            {
+                rh_interior_batch[j] = rh_interior_batch[j - gap];
+                j = j - gap;
+            }
+            rh_interior_batch[j] = value;
+        }
+        gap = gap / 2ul;
+    }
+
+    i = 0ul;
+    while (i < count && scan < rh_heap_used)
     {
         RhBlock* block = (RhBlock*)scan;
+        u8* block_end;
         rh_validate_block(scan, block, 138);
-        if (block->kind == RH_BLOCK_OBJECT)
+        block_end = scan + block->size;
+        while (i < count && (u8*)rh_interior_batch[i] < block_end)
         {
-            RhObject* object = rh_object_from_block(block);
-            usize gc_size = rh_gc_object_size(object, block, 138);
-            u8* object_start = (u8*)object;
-            u8* object_end = (u8*)block + RH_BLOCK_HEADER_SIZE + gc_size;
-            if (target >= object_start && target < object_end)
-                return rh_mark_object((void*)object_start);
-            if (target < object_start)
-                return 0;
+            if (block->kind == RH_BLOCK_OBJECT)
+            {
+                RhObject* object = rh_object_from_block(block);
+                u8* object_end = (u8*)block + RH_BLOCK_HEADER_SIZE + rh_gc_object_size(object, block, 138);
+                u8* target = (u8*)rh_interior_batch[i];
+                if (target >= (u8*)object && target < object_end)
+                    rh_mark_object((void*)object);
+            }
+            i = i + 1ul;
         }
-        scan = scan + block->size;
+        scan = block_end;
     }
-    return 0;
 }
 
 static const RhSafePoint* rh_find_safe_point(const void* return_address)
@@ -2448,7 +2383,7 @@ static void rh_mark_frame_roots(const RhSafePoint* safe_point, usize frame_point
     if (current == (const RhSafePoint*)0 || fp == 0ul || fp > rh_stack_base)
         RhpFallbackFailFast(144);
 
-    while (depth < 4096ul)
+    while (depth < RH_UNWIND_DEPTH_LIMIT)
     {
         usize i = 0ul;
         if (current->root_count != 0ul && current->roots == (const RhRoot*)0)
@@ -2467,13 +2402,25 @@ static void rh_mark_frame_roots(const RhSafePoint* safe_point, usize frame_point
         }
 
         {
-            usize caller_fp = *(usize*)((u8*)fp + current->saved_frame_pointer_offset);
+            const RhCodeRegion* region = current->region;
+            usize base;
+            usize caller_fp;
             const void* caller_ra;
+            if (region == (const RhCodeRegion*)0 || region->kind == RH_REGION_FRAMELESS)
+                RhpFallbackFailFast(143);
+            base = region->kind == RH_REGION_FUNCLET ? *(const usize*)(fp + (usize)region->link_offset) : fp;
+            caller_ra = *(const void* const*)(base + (usize)region->ra_offset);
+            caller_fp = region->kind == RH_REGION_FRAME ? *(const usize*)(fp + (usize)region->fp_offset) : fp;
+            if (caller_ra == (const void*)RhpCallFuncletReturn)
+            {
+                const RhUnwindContext* parent = *(const RhUnwindContext* const*)(base + (usize)region->frame_size);
+                caller_ra = parent->ip;
+                caller_fp = parent->fp;
+            }
             if (caller_fp == 0ul)
                 return;
-            if (caller_fp <= fp || caller_fp > rh_stack_base)
+            if (caller_fp < fp || caller_fp > rh_stack_base)
                 RhpFallbackFailFast(142);
-            caller_ra = *(const void**)((u8*)fp + current->saved_return_address_offset);
             current = rh_find_safe_point(caller_ra);
             if (current == (const RhSafePoint*)0)
                 RhpFallbackFailFast(143);
@@ -2492,17 +2439,6 @@ static void rh_mark_field_value(void* value, usize kind)
         rh_mark_object(value);
     else
         RhpFallbackFailFast(139);
-}
-
-static void rh_mark_eh_register_context_roots(const RhEhRegisterContext* context)
-{
-    usize offset = 0ul;
-    while (offset < 256ul)
-    {
-        void* value = *(void* const*)(context->data + offset);
-        rh_mark_interior(value);
-        offset = offset + 8ul;
-    }
 }
 
 static void rh_mark_static_roots(void)
@@ -2581,81 +2517,72 @@ static void rh_drain_mark_stack(void)
     }
 }
 
-static void rh_rebuild_free_list(void)
+static usize rh_free_bucket(usize size)
 {
-    u8* scan = rh_heap_base;
-    RhBlock* tail = (RhBlock*)0;
-    rh_free_list = (RhBlock*)0;
-    while (scan < rh_heap_used)
+    usize units = size / RH_HEAP_ALIGNMENT;
+    usize bucket = 0ul;
+    while (units > 1ul && bucket + 1ul < RH_FREE_BUCKET_COUNT)
     {
-        RhBlock* block = (RhBlock*)scan;
-        rh_validate_block(scan, block, 145);
-        if (block->kind == RH_BLOCK_FREE)
-        {
-            block->mark_next = (RhBlock*)0;
-            block->flags = 0ul;
-            rh_set_free_next(block, (RhBlock*)0);
-            if (tail == (RhBlock*)0)
-                rh_free_list = block;
-            else
-                rh_set_free_next(tail, block);
-            tail = block;
-        }
-        scan = scan + block->size;
+        units = units >> 1;
+        bucket = bucket + 1ul;
     }
+    return bucket;
 }
 
+static void rh_free_list_insert(RhBlock* block)
+{
+    usize bucket = rh_free_bucket(block->size);
+    block->kind = RH_BLOCK_FREE;
+    block->mark_next = (RhBlock*)0;
+    block->flags = 0ul;
+    rh_set_free_next(block, rh_free_buckets[bucket]);
+    rh_free_buckets[bucket] = block;
+}
+
+// One walk sweeps, coalesces and refills the free lists; the run after the last live object returns to the bump region
 static void rh_sweep(void)
 {
     u8* scan = rh_heap_base;
     u8* last_live_end = rh_heap_base;
-    while (scan < rh_heap_used)
+    RhBlock* free_run = (RhBlock*)0;
+    usize bucket = 0ul;
+    while (bucket < RH_FREE_BUCKET_COUNT)
     {
-        RhBlock* block = (RhBlock*)scan;
-        rh_validate_block(scan, block, 145);
-        if (block->kind == RH_BLOCK_OBJECT)
-        {
-            if ((block->flags & RH_BLOCK_MARK) == 0ul)
-            {
-                rh_monitor_destroy_for_object(rh_object_from_block(block));
-                block->kind = RH_BLOCK_FREE;
-                block->mark_next = (RhBlock*)0;
-                block->flags = 0ul;
-            }
-            else
-            {
-                block->mark_next = (RhBlock*)0;
-                block->flags = 0ul;
-                last_live_end = scan + block->size;
-            }
-        }
-        scan = scan + block->size;
+        rh_free_buckets[bucket] = (RhBlock*)0;
+        bucket = bucket + 1ul;
     }
 
-    scan = rh_heap_base;
     while (scan < rh_heap_used)
     {
         RhBlock* block = (RhBlock*)scan;
+        usize size;
         rh_validate_block(scan, block, 145);
-        if (block->kind == RH_BLOCK_FREE)
+        size = block->size;
+        if (block->kind == RH_BLOCK_OBJECT && (block->flags & RH_BLOCK_MARK) != 0ul)
         {
-            u8* next = scan + block->size;
-            while (next < rh_heap_used)
+            block->mark_next = (RhBlock*)0;
+            block->flags = 0ul;
+            if (free_run != (RhBlock*)0)
             {
-                RhBlock* next_block = (RhBlock*)next;
-                rh_validate_block(next, next_block, 145);
-                if (next_block->kind != RH_BLOCK_FREE)
-                    break;
-                block->size = block->size + next_block->size;
-                next = scan + block->size;
+                rh_free_list_insert(free_run);
+                free_run = (RhBlock*)0;
             }
+            last_live_end = scan + size;
         }
-        scan = scan + block->size;
+        else
+        {
+            if (block->kind == RH_BLOCK_OBJECT)
+                rh_monitor_destroy_for_object(rh_object_from_block(block));
+            if (free_run == (RhBlock*)0)
+                free_run = block;
+            else
+                free_run->size = free_run->size + size;
+        }
+        scan = scan + size;
     }
 
     rh_heap_used = last_live_end;
     rh_decommit_unused_tail();
-    rh_rebuild_free_list();
     rh_allocation_debt = 0ul;
     RhpGcPollRequested = 0u;
 }
@@ -2669,29 +2596,19 @@ static void rh_collect(const RhSafePoint* safe_point, void* frame_pointer)
     rh_mark_frame_roots(safe_point, (usize)frame_pointer);
     rh_mark_static_roots();
     rh_mark_object(rh_delegate_temporary_root);
-    rh_mark_object(rh_active_exception);
     {
-        usize i = 0ul;
-        while (i < RhpEhFrameCount)
+        const RhDispatchRecord* dispatch = rh_dispatches;
+        while (dispatch != (const RhDispatchRecord*)0)
         {
-            rh_mark_eh_register_context_roots(&RhpEhRegisterContexts[i]);
-            i = i + 1ul;
-        }
-        i = 0ul;
-        while (i < rh_eh_continuation_count)
-        {
-            rh_mark_object(rh_eh_continuations[i].exception);
-            rh_mark_eh_register_context_roots(&rh_eh_continuation_registers[i]);
-            i = i + 1ul;
-        }
-        i = 0ul;
-        while (i < rh_catch_context_count)
-        {
-            rh_mark_object(rh_catch_contexts[i].exception);
-            i = i + 1ul;
+            rh_mark_object(dispatch->exception);
+            dispatch = dispatch->next;
         }
     }
-    rh_drain_mark_stack();
+    do
+    {
+        rh_resolve_interior_batch();
+        rh_drain_mark_stack();
+    } while (rh_interior_batch_count != 0ul);
     rh_sweep();
     rh_gc_running = 0;
 }
@@ -2705,51 +2622,54 @@ static void rh_collect_current(void)
     rh_collect(safe_point, frame_pointer);
 }
 
+// A block in a larger bucket always fits; the request's own bucket is searched only a few blocks deep
 static void* rh_try_allocate_from_free_list(usize total)
 {
+    usize bucket = rh_free_bucket(total);
+    usize probes = 0ul;
     RhBlock* previous = (RhBlock*)0;
-    RhBlock* block = rh_free_list;
-    while (block != (RhBlock*)0)
+    RhBlock* block = rh_free_buckets[bucket];
+    RhBlock* next;
+    u8* address;
+
+    while (block != (RhBlock*)0 && block->size < total && probes < 16ul)
     {
-        RhBlock* next;
-        u8* address = (u8*)block;
-        rh_validate_block(address, block, 146);
-        if (block->kind != RH_BLOCK_FREE)
-            RhpFallbackFailFast(146);
-        next = rh_free_next(block);
-        if (block->size >= total)
-        {
-            usize remainder = block->size - total;
-            if (remainder >= rh_minimum_block_size())
-            {
-                RhBlock* tail = (RhBlock*)(address + total);
-                tail->size = remainder;
-                tail->kind = RH_BLOCK_FREE;
-                tail->mark_next = (RhBlock*)0;
-                tail->flags = 0ul;
-                rh_set_free_next(tail, next);
-                if (previous == (RhBlock*)0)
-                    rh_free_list = tail;
-                else
-                    rh_set_free_next(previous, tail);
-                block->size = total;
-            }
-            else
-            {
-                if (previous == (RhBlock*)0)
-                    rh_free_list = next;
-                else
-                    rh_set_free_next(previous, next);
-            }
-            block->kind = RH_BLOCK_OBJECT;
-            block->mark_next = (RhBlock*)0;
-            block->flags = 0ul;
-            return (void*)(address + RH_BLOCK_HEADER_SIZE);
-        }
         previous = block;
-        block = next;
+        block = rh_free_next(block);
+        probes = probes + 1ul;
     }
-    return (void*)0;
+    if (block == (RhBlock*)0 || block->size < total)
+    {
+        previous = (RhBlock*)0;
+        bucket = bucket + 1ul;
+        while (bucket < RH_FREE_BUCKET_COUNT && rh_free_buckets[bucket] == (RhBlock*)0)
+            bucket = bucket + 1ul;
+        if (bucket == RH_FREE_BUCKET_COUNT)
+            return (void*)0;
+        block = rh_free_buckets[bucket];
+    }
+
+    address = (u8*)block;
+    rh_validate_block(address, block, 146);
+    if (block->kind != RH_BLOCK_FREE)
+        RhpFallbackFailFast(146);
+    next = rh_free_next(block);
+    if (previous == (RhBlock*)0)
+        rh_free_buckets[bucket] = next;
+    else
+        rh_set_free_next(previous, next);
+
+    if (block->size - total >= rh_minimum_block_size())
+    {
+        RhBlock* tail = (RhBlock*)(address + total);
+        tail->size = block->size - total;
+        rh_free_list_insert(tail);
+        block->size = total;
+    }
+    block->kind = RH_BLOCK_OBJECT;
+    block->mark_next = (RhBlock*)0;
+    block->flags = 0ul;
+    return (void*)(address + RH_BLOCK_HEADER_SIZE);
 }
 
 static void* rh_try_bump_allocate(usize total)
@@ -3142,12 +3062,7 @@ void* RhpDelegateRemove(
 
 static void rh_copy_utf16(u16* destination, const u16* source, int length)
 {
-    int i = 0;
-    while (i < length)
-    {
-        destination[i] = source[i];
-        i = i + 1;
-    }
+    rh_memmove(destination, source, (usize)length * 2ul);
 }
 
 void* RhpNewStringFromChar(
@@ -3207,11 +3122,6 @@ static int rh_array_length(const void* array)
     return *(const int*)((const u8*)array + ARRAY_LENGTH_OFFSET);
 }
 
-int RhpArrayGetLength(const void* array)
-{
-    return rh_array_length(array);
-}
-
 void RhpArrayClear(void* array, int index, int length)
 {
     const RhMethodTable* type = rh_require_array(array);
@@ -3225,20 +3135,6 @@ void RhpArrayClear(void* array, int index, int length)
     byte_offset = (usize)index * component_size;
     byte_count = (usize)length * component_size;
     destination = (u8*)array + ARRAY_DATA_OFFSET + byte_offset;
-#ifdef __riscv_vector
-    if (byte_count >= 16ul)
-    {
-        rh_bytes zeros = __riscv_vmv_v_x_u8m8(0u, __riscv_vsetvlmax_e8m8());
-        while (byte_count != 0ul)
-        {
-            usize step = __riscv_vsetvl_e8m8(byte_count);
-            __riscv_vse8_v_u8m8(destination, zeros, step);
-            destination = destination + step;
-            byte_count = byte_count - step;
-        }
-        return;
-    }
-#endif
     rh_zero(destination, byte_count);
 }
 
@@ -3305,39 +3201,6 @@ int RhpArrayCopy(
         }
         byte_count = (usize)length * __SIZEOF_POINTER__;
     }
-
-#ifdef __riscv_vector
-    if (byte_count >= 16ul)
-    {
-        if (destination == source)
-            return 1;
-        if ((usize)destination < (usize)source ||
-            (usize)destination >= (usize)source + byte_count)
-        {
-            while (byte_count != 0ul)
-            {
-                usize step = __riscv_vsetvl_e8m8(byte_count);
-                __riscv_vse8_v_u8m8(destination, __riscv_vle8_v_u8m8(source, step), step);
-                source = source + step;
-                destination = destination + step;
-                byte_count = byte_count - step;
-            }
-            return 1;
-        }
-
-        source = source + byte_count;
-        destination = destination + byte_count;
-        while (byte_count != 0ul)
-        {
-            usize step = __riscv_vsetvl_e8m8(byte_count);
-            source = source - step;
-            destination = destination - step;
-            __riscv_vse8_v_u8m8(destination, __riscv_vle8_v_u8m8(source, step), step);
-            byte_count = byte_count - step;
-        }
-        return 1;
-    }
-#endif
 
     rh_memmove(destination, source, byte_count);
     return 1;
@@ -3429,18 +3292,32 @@ static const RhMethodTable* rh_require_string(const void* value)
     return type;
 }
 
+// Each call reaches the stream as one write, or one per buffer when the text does not fit
 void RhpConsoleWriteUtf16(const u16* text, int length)
 {
+    u8 buffer[RH_CONSOLE_BUFFER_SIZE];
+    usize used = 0ul;
     int index = 0;
     if (text == (const u16*)0 || length <= 0)
         return;
 
     while (index < length)
     {
-        u32 scalar = (u32)text[index];
-        u8 encoded[4];
-        usize encoded_length;
+        u32 scalar;
+        if (used > RH_CONSOLE_BUFFER_SIZE - 4ul)
+        {
+            rh_write_all(buffer, used);
+            used = 0ul;
+        }
+
+        scalar = (u32)text[index];
         index = index + 1;
+        if (scalar < 0x80u)
+        {
+            buffer[used] = (u8)scalar;
+            used = used + 1ul;
+            continue;
+        }
 
         if (scalar >= 0xd800u && scalar <= 0xdbffu)
         {
@@ -3467,9 +3344,10 @@ void RhpConsoleWriteUtf16(const u16* text, int length)
             scalar = 0xfffdu;
         }
 
-        encoded_length = rh_encode_utf8(scalar, encoded);
-        rh_write_all(encoded, encoded_length);
+        used = used + rh_encode_utf8(scalar, buffer + used);
     }
+
+    rh_write_all(buffer, used);
 }
 
 void RhpConsoleWriteUtf16Z(const u16* text)

@@ -153,6 +153,8 @@ internal static class ArmCodeEncoder
             case ArmInstrKind.Udiv:
             case ArmInstrKind.Sdiv:
                 return EncodeA64Divide(instruction);
+            case ArmInstrKind.Csel:
+                return EncodeA64ConditionalSelect(instruction);
             case ArmInstrKind.Clz:
             case ArmInstrKind.Rbit:
             case ArmInstrKind.Rev:
@@ -510,6 +512,13 @@ internal static class ArmCodeEncoder
         var sf = size == 8 ? 1u : 0u;
         var baseWord = instruction.Opcode == ArmInstrKind.Sdiv ? 0x1AC00C00u : 0x1AC00800u;
         return baseWord | (sf << 31) | ((uint)A64Register(instruction.Operand2.Register) << 16) |
+            ((uint)A64Register(instruction.Operand1.Register) << 5) | (uint)A64Register(instruction.Operand0.Register);
+    }
+
+    private static uint EncodeA64ConditionalSelect(ArmInstruction instruction)
+    {
+        var sf = RegisterSize(instruction.Operand0, 8) == 8 ? 1u : 0u;
+        return 0x1A800000u | (sf << 31) | ((uint)A64Register(instruction.Operand2.Register) << 16) | ((uint)instruction.Condition << 12) |
             ((uint)A64Register(instruction.Operand1.Register) << 5) | (uint)A64Register(instruction.Operand0.Register);
     }
 
@@ -1726,6 +1735,8 @@ internal static class ArmCodeDecoder
             return DecodeA64Bitfield(word);
         if ((word & 0x7FE0FC00u) is 0x1AC00800u or 0x1AC00C00u)
             return DecodeA64Divide(word);
+        if ((word & 0x7FE00C00u) == 0x1A800000u)
+            return DecodeA64ConditionalSelect(word);
         if ((word & 0x7FE0FC00u) is 0x1AC02000u or 0x1AC02400u or 0x1AC02800u or 0x1AC02C00u)
             return DecodeA64VariableShift(word);
         if ((word & 0x7FE0E000u) == 0x5AC00000u)
@@ -1897,6 +1908,13 @@ internal static class ArmCodeDecoder
         var size = (word & 0x80000000u) != 0 ? 8 : 4;
         return ArmInstruction.Ternary((word & 0x400u) != 0 ? ArmInstrKind.Sdiv : ArmInstrKind.Udiv,
             A64Gpr(word & 31, size, false), A64Gpr((word >> 5) & 31, size, false), A64Gpr((word >> 16) & 31, size, false));
+    }
+
+    private static ArmInstruction DecodeA64ConditionalSelect(uint word)
+    {
+        var size = (word & 0x80000000u) != 0 ? 8 : 4;
+        return ArmInstruction.Ternary(ArmInstrKind.Csel, A64Gpr(word & 31, size, false), A64Gpr((word >> 5) & 31, size, false),
+            A64Gpr((word >> 16) & 31, size, false), (ArmCondition)((word >> 12) & 15));
     }
 
     private static ArmInstruction DecodeA64VariableShift(uint word)

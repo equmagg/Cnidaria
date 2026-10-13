@@ -81,7 +81,7 @@ namespace Cnidaria.Cs
                 {
                     AddRegisterKillMask(result, node, usePosition, MachineRegisters.MaskOf(RegisterInfo.CallerSavedScalarRegisters(target)));
                 }
-                else if (X86IntegerDivRem(node, target) || X86UnsignedCheckedMultiply(node, target))
+                else if (X86IntegerDivRem(node, target) || X86UnsignedCheckedMultiply(node, target) || X86MultiplyHigh(node, target))
                 {
                     AddRegisterKillMask(
                         result,
@@ -466,7 +466,7 @@ namespace Cnidaria.Cs
             if (operandIndex == 1 && node.Operator is GenTreeOperator.Shl or GenTreeOperator.Shr or GenTreeOperator.ShrUn)
                 return RegisterInfo.CountRegister(target);
 
-            if (operandIndex == 0 && (X86IntegerDivRem(node, target) || X86UnsignedCheckedMultiply(node, target)))
+            if (operandIndex == 0 && (X86IntegerDivRem(node, target) || X86UnsignedCheckedMultiply(node, target) || X86MultiplyHigh(node, target)))
                 return RegisterInfo.AccumulatorRegister(target);
 
             return MachineRegister.Invalid;
@@ -512,7 +512,13 @@ namespace Cnidaria.Cs
             GenTree node,
             RegisterClass registerClass)
         {
-            if (!target.IsX86 || registerClass != RegisterClass.General || !X86IntegerDivRem(node, target))
+            if (!target.IsX86 || registerClass != RegisterClass.General)
+                return MachineRegister.Invalid;
+
+            if (X86MultiplyHigh(node, target))
+                return RegisterInfo.DataRegister(target);
+
+            if (!X86IntegerDivRem(node, target))
                 return MachineRegister.Invalid;
 
             return node.Operator is GenTreeOperator.Rem or GenTreeOperator.RemUn
@@ -580,6 +586,9 @@ namespace Cnidaria.Cs
                 return false;
             return node.StackKind is not (GenStackKind.R4 or GenStackKind.R8);
         }
+
+        private static bool X86MultiplyHigh(GenTree node, TargetInfo target)
+            => target.IsX86 && node.Kind == GenTreeKind.Binary && node.Operator is GenTreeOperator.MulHi or GenTreeOperator.MulHiUn;
 
         private static bool X86IntegerDivRem(GenTree node, TargetInfo target)
         {

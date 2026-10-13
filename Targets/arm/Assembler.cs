@@ -313,6 +313,12 @@ internal static class ArmAssemblyParser
                 RequireCount(operands, 3, mnemonic);
                 return ArmInstruction.Ternary(opcode, ParseRegister(operands[0], target, precision), ParseRegister(operands[1], target, precision), ParseRegister(operands[2], target, precision), condition).WithSetFlags(setFlags);
 
+            case ArmInstrKind.Csel:
+                RequireCount(operands, 4, mnemonic);
+                if (!ArmConditions.TryParse(operands[3], out var selectCondition))
+                    throw new FormatException("Invalid csel condition.");
+                return ArmInstruction.Ternary(opcode, ParseRegister(operands[0], target, precision), ParseRegister(operands[1], target, precision), ParseRegister(operands[2], target, precision), selectCondition);
+
             case ArmInstrKind.Mla:
             case ArmInstrKind.Mls:
             case ArmInstrKind.Madd:
@@ -1004,6 +1010,8 @@ internal static class ArmAssemblyWriter
         if (instruction.Opcode is not ArmInstrKind.Ldm and not ArmInstrKind.Stm)
             AddOperand(operands, instruction.Operand2, instruction, target, options);
         AddOperand(operands, instruction.Operand3, instruction, target, options);
+        if (instruction.Opcode == ArmInstrKind.Csel)
+            operands.Add(ArmConditions.Format(instruction.Condition));
 
         if (instruction.Opcode is (ArmInstrKind.Movz or ArmInstrKind.Movn or ArmInstrKind.Movk) && operands.Count > 2)
             operands[2] = "lsl " + operands[2];
