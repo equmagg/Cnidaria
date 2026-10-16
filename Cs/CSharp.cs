@@ -1385,6 +1385,7 @@ public static class CSharp
         "System.Runtime.InteropServices.cs",
         "System.Runtime.CompilerServices.cs",
         "System.Collections.cs",
+        "System.Collections.Generic.cs",
         "System.Buffers.cs",
         "System.Threading.cs",
         "System.Globalization.cs",

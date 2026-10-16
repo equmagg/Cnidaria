@@ -16,7 +16,8 @@ namespace Cnidaria.Cs
         public const string InitializeSymbol = "RhpInitialize";
         public const string GcPollSymbol = "RhpGcPoll";
         public const string GcPollRequestedSymbol = "RhpGcPollRequested";
-        public const string CurrentSafePointSymbol = "RhpCurrentSafePoint";
+        public const string CurrentReturnAddressSymbol = "RhpCurrentReturnAddress";
+        public const string CurrentStackPointerSymbol = "RhpCurrentStackPointer";
         public const string CurrentFramePointerSymbol = "RhpCurrentFramePointer";
         public const string NewFastSymbol = "RhpNewFast";
         public const string NewArraySymbol = "RhpNewArray";
@@ -41,6 +42,7 @@ namespace Cnidaria.Cs
         public const string DispatchExceptionSymbol = "RhpDispatchException";
         public const string CallFuncletSymbol = "RhpCallFunclet";
         public const string CallFuncletReturnSymbol = "RhpCallFuncletReturn";
+        public const string CallFuncletReturnFalseSymbol = "RhpCallFuncletReturnFalse";
         public const string ResumeSymbol = "RhpResume";
         public const string FailFastSymbol = "RhpFallbackFailFast";
         private const string ConsoleWriteUtf16Symbol = "RhpConsoleWriteUtf16";

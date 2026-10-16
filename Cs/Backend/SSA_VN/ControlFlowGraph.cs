@@ -143,6 +143,8 @@ namespace Cnidaria.Cs
         public readonly int TryEndBlockIdExclusive;
         public readonly int HandlerStartBlockId;
         public readonly int HandlerEndBlockIdExclusive;
+        public readonly int FilterEndPc;
+        public readonly int FilterEndBlockIdExclusive;
         public readonly int CatchTypeToken;
         public readonly int SourceHandlerIndex;
         public readonly int EnclosingTryIndex;
@@ -164,7 +166,9 @@ namespace Cnidaria.Cs
             int sourceHandlerIndex,
             int enclosingTryIndex,
             int enclosingHandlerIndex,
-            int parentIndex)
+            int parentIndex,
+            int filterEndPc = -1,
+            int filterEndBlockIdExclusive = -1)
         {
             if (index < 0) throw new ArgumentOutOfRangeException(nameof(index));
             if (tryStartPc < 0 || tryEndPc < tryStartPc) throw new ArgumentOutOfRangeException(nameof(tryEndPc));
@@ -173,6 +177,8 @@ namespace Cnidaria.Cs
             if (tryEndBlockIdExclusive < tryStartBlockId) throw new ArgumentOutOfRangeException(nameof(tryEndBlockIdExclusive));
             if (handlerStartBlockId < 0) throw new ArgumentOutOfRangeException(nameof(handlerStartBlockId));
             if (handlerEndBlockIdExclusive < handlerStartBlockId) throw new ArgumentOutOfRangeException(nameof(handlerEndBlockIdExclusive));
+            if (filterEndBlockIdExclusive >= 0 && (filterEndBlockIdExclusive <= handlerStartBlockId || filterEndBlockIdExclusive >= handlerEndBlockIdExclusive))
+                throw new ArgumentOutOfRangeException(nameof(filterEndBlockIdExclusive));
 
             Index = index;
             Kind = kind;
@@ -184,6 +190,8 @@ namespace Cnidaria.Cs
             TryEndBlockIdExclusive = tryEndBlockIdExclusive;
             HandlerStartBlockId = handlerStartBlockId;
             HandlerEndBlockIdExclusive = handlerEndBlockIdExclusive;
+            FilterEndPc = filterEndPc;
+            FilterEndBlockIdExclusive = filterEndBlockIdExclusive;
             CatchTypeToken = catchTypeToken;
             SourceHandlerIndex = sourceHandlerIndex;
             EnclosingTryIndex = enclosingTryIndex;
@@ -192,6 +200,8 @@ namespace Cnidaria.Cs
         }
 
         public bool HasParent => ParentIndex >= 0;
+        public bool HasFilter => FilterEndBlockIdExclusive >= 0;
+        public int HandlerBodyStartBlockId => HasFilter ? FilterEndBlockIdExclusive : HandlerStartBlockId;
         public int TrySpanPc => TryEndPc - TryStartPc;
         public int HandlerSpanPc => HandlerEndPc - HandlerStartPc;
 
@@ -204,8 +214,11 @@ namespace Cnidaria.Cs
         public bool ContainsHandlerBlock(int blockId)
             => HandlerStartBlockId <= blockId && blockId < HandlerEndBlockIdExclusive;
 
+        public bool ContainsFilterBlock(int blockId)
+            => HandlerStartBlockId <= blockId && blockId < FilterEndBlockIdExclusive;
+
         public override string ToString()
-            => $"EH{Index}:{Kind} try=B{TryStartBlockId}..B{TryEndBlockIdExclusive - 1} handler=B{HandlerStartBlockId}..B{HandlerEndBlockIdExclusive - 1} parent={ParentIndex}";
+            => $"EH{Index}:{Kind} try=B{TryStartBlockId}..B{TryEndBlockIdExclusive - 1} handler=B{HandlerStartBlockId}..B{HandlerEndBlockIdExclusive - 1}{(HasFilter ? $" body=B{FilterEndBlockIdExclusive}" : "")} parent={ParentIndex}";
     }
     internal sealed class CfgBlock
     {
@@ -348,6 +361,8 @@ namespace Cnidaria.Cs
             public readonly int HandlerStartBlockId;
             public readonly int HandlerEndBlockIdExclusive;
             public readonly int CatchTypeToken;
+            public readonly int FilterEndPc;
+            public readonly int FilterEndBlockIdExclusive;
 
             public RawExceptionRegion(
                 int sourceHandlerIndex,
@@ -360,7 +375,9 @@ namespace Cnidaria.Cs
                 int tryEndBlockIdExclusive,
                 int handlerStartBlockId,
                 int handlerEndBlockIdExclusive,
-                int catchTypeToken)
+                int catchTypeToken,
+                int filterEndPc,
+                int filterEndBlockIdExclusive)
             {
                 SourceHandlerIndex = sourceHandlerIndex;
                 Kind = kind;
@@ -373,6 +390,8 @@ namespace Cnidaria.Cs
                 HandlerStartBlockId = handlerStartBlockId;
                 HandlerEndBlockIdExclusive = handlerEndBlockIdExclusive;
                 CatchTypeToken = catchTypeToken;
+                FilterEndPc = filterEndPc;
+                FilterEndBlockIdExclusive = filterEndBlockIdExclusive;
             }
         }
 
@@ -385,18 +404,14 @@ namespace Cnidaria.Cs
             for (int i = 0; i < method.ExceptionHandlers.Length; i++)
             {
                 var eh = method.ExceptionHandlers[i];
-                int tryStartBlock = FindBlockStart(method, eh.TryStartPc);
-                if (tryStartBlock < 0)
+                if (!TryFindMemberBlocks(method, i, tryRegion: true, out int tryStartBlock, out int tryEndBlock))
                     continue;
-                int handlerStartBlock = FindBlockStart(method, eh.HandlerStartPc);
-                if (handlerStartBlock < 0)
+                if (!TryFindMemberBlocks(method, i, tryRegion: false, out int handlerStartBlock, out int handlerEndBlock))
                     continue;
-
-                int tryEndBlock = FindBlockEndExclusive(method, eh.TryEndPc);
-                int handlerEndBlock = FindBlockEndExclusive(method, eh.HandlerEndPc);
-                var kind = eh.CatchTypeToken < 0
-                    ? CfgExceptionRegionKind.Finally
+                var kind = eh.CatchTypeToken < 0 ? CfgExceptionRegionKind.Finally
+                    : eh.HasFilter ? CfgExceptionRegionKind.Filter
                     : CfgExceptionRegionKind.Catch;
+                int filterEndBlock = eh.HasFilter ? FindHandlerBodyStart(method, i, handlerStartBlock, handlerEndBlock) : -1;
 
                 raw.Add(new RawExceptionRegion(
                     i,
@@ -409,7 +424,9 @@ namespace Cnidaria.Cs
                     tryEndBlock,
                     handlerStartBlock,
                     handlerEndBlock,
-                    eh.CatchTypeToken));
+                    eh.CatchTypeToken,
+                    eh.FilterEndPc,
+                    filterEndBlock));
             }
 
             if (raw.Count == 0)
@@ -450,7 +467,9 @@ namespace Cnidaria.Cs
                     region.SourceHandlerIndex,
                     enclosingTryIndexes[i],
                     enclosingHandlerIndexes[i],
-                    parentIndexes[i]));
+                    parentIndexes[i],
+                    region.FilterEndPc,
+                    region.FilterEndBlockIdExclusive));
             }
 
             return regions.ToImmutable();
@@ -629,36 +648,50 @@ namespace Cnidaria.Cs
         {
             for (int i = 0; i < regions.Length; i++)
             {
-                if (regions[i].HandlerStartBlockId == blockId)
+                if (regions[i].HandlerStartBlockId == blockId || regions[i].HandlerBodyStartBlockId == blockId)
                     return true;
             }
             return false;
         }
 
-        private static int FindBlockStart(GenTreeMethod method, int startPc)
+        private static int FindHandlerBodyStart(GenTreeMethod method, int clause, int handlerStartBlock, int handlerEndBlock)
         {
-            int exactStart = -1;
-            for (int i = 0; i < method.Blocks.Length; i++)
+            int pc = method.ExceptionHandlers[clause].FilterEndPc;
+            for (int b = handlerStartBlock + 1; b < handlerEndBlock; b++)
             {
-                var block = method.Blocks[i];
-                if (block.RegionPc == startPc)
-                    return block.Id;
-                if (exactStart < 0 && block.StartPc == startPc)
-                    exactStart = block.Id;
+                if (method.Blocks[b].StartPc == pc)
+                    return b;
             }
-            return exactStart;
+            throw new InvalidOperationException($"The handler after the filter of EH clause {clause} in M{method.RuntimeMethod.MethodId} has no block.");
         }
 
-        private static int FindBlockEndExclusive(GenTreeMethod method, int endPc)
+        // A block belongs to every try that encloses its innermost try, and to every handler that encloses its innermost handler
+        private static bool TryFindMemberBlocks(GenTreeMethod method, int clause, bool tryRegion, out int start, out int endExclusive)
         {
-            int endExclusive = 0;
-            for (int i = 0; i < method.Blocks.Length; i++)
+            ImmutableArray<ExceptionHandler> handlers = method.ExceptionHandlers;
+            ExceptionHandler eh = handlers[clause];
+            start = -1;
+            endExclusive = -1;
+            for (int b = 0; b < method.Blocks.Length; b++)
             {
-                var block = method.Blocks[i];
-                if (block.RegionPc >= 0 && block.RegionPc < endPc)
-                    endExclusive = block.Id + 1;
+                GenTreeEhRegion region = method.Blocks[b].Region;
+                bool member = tryRegion
+                    ? region.TryIndex >= 0 && ContainsRange(eh.TryStartPc, eh.TryEndPc, handlers[region.TryIndex].TryStartPc, handlers[region.TryIndex].TryEndPc)
+                    : region.HandlerIndex >= 0 && ContainsRange(eh.HandlerStartPc, eh.HandlerEndPc, handlers[region.HandlerIndex].HandlerStartPc, handlers[region.HandlerIndex].HandlerEndPc);
+                if (!member)
+                {
+                    if (start >= 0 && endExclusive < 0)
+                        endExclusive = b;
+                    continue;
+                }
+                if (start < 0)
+                    start = b;
+                else if (endExclusive >= 0)
+                    throw new InvalidOperationException($"{(tryRegion ? "Try" : "Handler")} of EH clause {clause} in M{method.RuntimeMethod.MethodId} resumes at B{b} after ending at B{endExclusive}.");
             }
-            return endExclusive;
+            if (start >= 0 && endExclusive < 0)
+                endExclusive = method.Blocks.Length;
+            return start >= 0;
         }
 
         private static int CompareEdges(CfgEdge x, CfgEdge y)
@@ -698,6 +731,9 @@ namespace Cnidaria.Cs
                     var edge = new CfgEdge(block.Id, region.HandlerStartBlockId, CfgEdgeKind.Exception, region.Index);
                     if (seen.Add(edge))
                         result.Add(edge);
+                    var body = new CfgEdge(block.Id, region.HandlerBodyStartBlockId, CfgEdgeKind.Exception, region.Index);
+                    if (region.HasFilter && seen.Add(body))
+                        result.Add(body);
                 }
             }
 
@@ -755,7 +791,9 @@ namespace Cnidaria.Cs
             }
 
             var last = block.Statements[block.Statements.Length - 1];
-            return last.Kind == GenTreeKind.Branch ? CfgEdgeKind.Branch : CfgEdgeKind.FallThrough;
+            return last.Kind is GenTreeKind.Branch or GenTreeKind.CallFinally or GenTreeKind.CatchReturn or GenTreeKind.EndFinally
+                ? CfgEdgeKind.Branch
+                : CfgEdgeKind.FallThrough;
         }
 
         private static bool TryGetConditionalTransfer(
@@ -799,6 +837,7 @@ namespace Cnidaria.Cs
                 int handler = exceptionRegions[i].HandlerStartBlockId;
                 if ((uint)handler < (uint)blocks.Length)
                     roots.Add(handler);
+                roots.Add(exceptionRegions[i].HandlerBodyStartBlockId);
             }
             for (int i = 0; i < blocks.Length; i++)
             {
@@ -1495,6 +1534,14 @@ namespace Cnidaria.Cs
             return ControlFlowGraph.BuildImplicitExceptionEdges(blocks.ToImmutable(), cfg.ExceptionRegions);
         }
 
+        public static int EndFilterSuccessor(ControlFlowGraph cfg, int blockId)
+        {
+            CfgBlock block = cfg.Blocks[blockId];
+            if (block.SourceBlock.JumpKind != GenTreeBlockJumpKind.EndFilter)
+                return -1;
+            return cfg.ExceptionRegions[block.HandlerRegionIndexes[0]].HandlerBodyStartBlockId;
+        }
+
         public static bool HasPotentialExceptionEdgeToHandler(ControlFlowGraph cfg, CfgExceptionRegion region)
         {
             if (cfg is null)
@@ -1602,6 +1649,15 @@ namespace Cnidaria.Cs
         }
 
         public static ImmutableArray<int> BuildFuncletBlockIds(ControlFlowGraph cfg, CfgExceptionRegion region)
+            => BuildFuncletBlockIds(cfg, region, region.HandlerStartBlockId, region.HandlerEndBlockIdExclusive);
+
+        public static ImmutableArray<int> BuildFilterBlockIds(ControlFlowGraph cfg, CfgExceptionRegion region)
+            => BuildFuncletBlockIds(cfg, region, region.HandlerStartBlockId, region.FilterEndBlockIdExclusive);
+
+        public static ImmutableArray<int> BuildHandlerBodyBlockIds(ControlFlowGraph cfg, CfgExceptionRegion region)
+            => BuildFuncletBlockIds(cfg, region, region.HandlerBodyStartBlockId, region.HandlerEndBlockIdExclusive);
+
+        private static ImmutableArray<int> BuildFuncletBlockIds(ControlFlowGraph cfg, CfgExceptionRegion region, int start, int endExclusive)
         {
             if (cfg is null)
                 throw new ArgumentNullException(nameof(cfg));
@@ -1611,7 +1667,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < order.Length; i++)
             {
                 int blockId = order[i];
-                if (blockId < region.HandlerStartBlockId || blockId >= region.HandlerEndBlockIdExclusive)
+                if (blockId < start || blockId >= endExclusive)
                     continue;
                 if (GetHandlerOwnerRegionIndex(cfg.ExceptionRegions, blockId) == region.Index)
                     result.Add(blockId);
@@ -1664,6 +1720,7 @@ namespace Cnidaria.Cs
         public const int CatchAll = 2;
         public const int Finally = 3;
         public const int Fault = 4;
+        public const int Filter = 5;
     }
 
     internal static class RuntimeRegionKind
@@ -1671,48 +1728,17 @@ namespace Cnidaria.Cs
         public const int Frame = 0;
         public const int Frameless = 1;
         public const int Funclet = 2;
-    }
-
-    internal readonly struct FuncletLeave
-    {
-        public readonly ImmutableArray<int> Finallys;
-        public readonly bool ReturnsFromFunclet;
-        public readonly int TargetFunclet;
-
-        public FuncletLeave(ImmutableArray<int> finallys, bool returnsFromFunclet, int targetFunclet)
-        {
-            Finallys = finallys;
-            ReturnsFromFunclet = returnsFromFunclet;
-            TargetFunclet = targetFunclet;
-        }
-    }
-
-    internal sealed class CatchContinuation
-    {
-        public int Funclet { get; }
-        public int TargetBlockId { get; }
-        public ImmutableArray<int> Finallys { get; }
-        public string? Label { get; set; }
-
-        public CatchContinuation(int funclet, int targetBlockId, ImmutableArray<int> finallys)
-        {
-            Funclet = funclet;
-            TargetBlockId = targetBlockId;
-            Finallys = finallys;
-        }
+        public const int Filter = 3;
     }
 
     internal sealed class FuncletPlan
     {
         private readonly GenTreeMethod _method;
         private readonly int[] _funcletByBlock;
-        private readonly int[] _clauseByRegion;
         private readonly int[] _clauseByFunclet;
-        private readonly Dictionary<(int Funclet, int Target, string Finallys), CatchContinuation> _stubs = new();
 
         public ImmutableArray<CfgExceptionRegion> Clauses { get; }
         public ImmutableArray<int> ClauseKinds { get; }
-        public List<CatchContinuation> ContinuationStubs { get; } = new();
 
         private FuncletPlan(GenTreeMethod method)
         {
@@ -1721,19 +1747,19 @@ namespace Cnidaria.Cs
             ImmutableArray<int> order = EhFuncletLayout.ComputeVmRegionOrder(cfg);
             var clauses = ImmutableArray.CreateBuilder<CfgExceptionRegion>(order.Length);
             var kinds = ImmutableArray.CreateBuilder<int>(order.Length);
-            _clauseByRegion = new int[cfg.ExceptionRegions.Length];
+            var clauseByRegion = new int[cfg.ExceptionRegions.Length];
             for (int i = 0; i < order.Length; i++)
             {
                 CfgExceptionRegion region = cfg.ExceptionRegions[order[i]];
-                _clauseByRegion[region.Index] = i;
+                clauseByRegion[region.Index] = i;
                 clauses.Add(region);
                 kinds.Add(region.Kind switch
                 {
                     CfgExceptionRegionKind.Catch => region.CatchTypeToken == 0 ? RuntimeEhKind.CatchAll : RuntimeEhKind.Catch,
                     CfgExceptionRegionKind.Finally => RuntimeEhKind.Finally,
                     CfgExceptionRegionKind.Fault => RuntimeEhKind.Fault,
-                    _ => throw new NotSupportedException(
-                        $"Exception filters are not supported in method M{method.RuntimeMethod.MethodId} '{method.RuntimeMethod.Name}'."),
+                    CfgExceptionRegionKind.Filter => RuntimeEhKind.Filter,
+                    _ => throw new InvalidOperationException($"Unknown exception region kind {region.Kind}."),
                 });
             }
 
@@ -1747,7 +1773,7 @@ namespace Cnidaria.Cs
             {
                 RegisterFunclet funclet = method.Funclets[f];
                 if (!funclet.IsRoot)
-                    _clauseByFunclet[funclet.Index] = _clauseByRegion[funclet.ExceptionRegionIndex];
+                    _clauseByFunclet[funclet.Index] = clauseByRegion[funclet.ExceptionRegionIndex];
                 for (int b = 0; b < funclet.BlockIds.Length; b++)
                     _funcletByBlock[funclet.BlockIds[b]] = funclet.Index;
             }
@@ -1763,68 +1789,19 @@ namespace Cnidaria.Cs
         public int ClauseForFunclet(int funcletIndex) => _clauseByFunclet[funcletIndex];
 
         public bool IsCatchFunclet(int funcletIndex)
-            => funcletIndex > 0 && ClauseKinds[_clauseByFunclet[funcletIndex]] is RuntimeEhKind.Catch or RuntimeEhKind.CatchAll;
+            => funcletIndex > 0 && ClauseKinds[_clauseByFunclet[funcletIndex]] is RuntimeEhKind.Catch or RuntimeEhKind.CatchAll or RuntimeEhKind.Filter;
 
-        public FuncletLeave PlanLeave(int sourceBlockId, int targetBlockId)
-        {
-            int sourceFunclet = FuncletForBlock(sourceBlockId);
-            int targetFunclet = FuncletForBlock(targetBlockId);
-            bool returnsFromFunclet = sourceFunclet != targetFunclet;
-            if (returnsFromFunclet && !IsCatchFunclet(sourceFunclet))
-                throw new NotSupportedException($"Leave from a non-catch handler in method M{_method.RuntimeMethod.MethodId}.");
-            return new FuncletLeave(CrossedFinallys(sourceBlockId, targetBlockId), returnsFromFunclet, targetFunclet);
-        }
+        public bool IsFilterFunclet(int funcletIndex)
+            => _method.Funclets[funcletIndex].Kind == RegisterFuncletKind.Filter;
 
-        public ImmutableArray<int> CrossedFinallys(int sourceBlockId, int targetBlockId)
+        public int FilterFuncletForClause(int clause)
         {
-            ImmutableArray<int> sourceTrys = _method.Cfg.Blocks[sourceBlockId].TryRegionIndexes;
-            ImmutableArray<int> targetTrys = targetBlockId < 0 ? ImmutableArray<int>.Empty : _method.Cfg.Blocks[targetBlockId].TryRegionIndexes;
-            var result = new List<int>();
-            for (int i = 0; i < sourceTrys.Length; i++)
+            for (int f = 1; f < _method.Funclets.Length; f++)
             {
-                int clause = _clauseByRegion[sourceTrys[i]];
-                if (ClauseKinds[clause] != RuntimeEhKind.Finally || targetTrys.Contains(sourceTrys[i]))
-                    continue;
-                result.Add(clause);
+                if (_clauseByFunclet[f] == clause && IsFilterFunclet(f))
+                    return f;
             }
-
-            result.Sort((left, right) =>
-            {
-                int c = Clauses[left].TrySpanPc.CompareTo(Clauses[right].TrySpanPc);
-                return c != 0 ? c : Clauses[left].SourceHandlerIndex.CompareTo(Clauses[right].SourceHandlerIndex);
-            });
-            return result.ToImmutableArray();
-        }
-
-        public CatchContinuation GetContinuationStub(int funclet, int targetBlockId, ImmutableArray<int> finallys)
-        {
-            var key = (funclet, targetBlockId, string.Join(",", finallys));
-            if (!_stubs.TryGetValue(key, out CatchContinuation? stub))
-            {
-                stub = new CatchContinuation(funclet, targetBlockId, finallys);
-                _stubs.Add(key, stub);
-                ContinuationStubs.Add(stub);
-            }
-
-            return stub;
-        }
-
-        // Catch returns name their continuation stubs before the region that holds the stubs is emitted
-        public void PlanContinuationStubs()
-        {
-            for (int b = 0; b < _method.Blocks.Length; b++)
-            {
-                if (!IsCatchFunclet(FuncletForBlock(b)))
-                    continue;
-                foreach (GenTree node in _method.Blocks[b].LinearNodes)
-                {
-                    if (node.TreeKind != GenTreeKind.Branch || node.Operator != GenTreeOperator.Leave)
-                        continue;
-                    FuncletLeave plan = PlanLeave(b, node.TargetBlockId);
-                    if (plan.ReturnsFromFunclet && plan.Finallys.Length != 0)
-                        GetContinuationStub(plan.TargetFunclet, node.TargetBlockId, plan.Finallys);
-                }
-            }
+            return -1;
         }
     }
 }

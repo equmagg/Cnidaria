@@ -244,7 +244,7 @@ namespace Cnidaria.Cs
 
         private static bool IsVerifierBlockTerminatorNode(GenTree node)
             => node.Kind is GenTreeKind.Branch or GenTreeKind.BranchTrue or GenTreeKind.BranchFalse or
-               GenTreeKind.Return or GenTreeKind.Throw or GenTreeKind.Rethrow or GenTreeKind.EndFinally;
+               GenTreeKind.Return or GenTreeKind.Throw or GenTreeKind.Rethrow or GenTreeKind.EndFinally or GenTreeKind.CallFinally or GenTreeKind.CatchReturn or GenTreeKind.EndFilter;
 
         private static bool IsBlockEntrySplitMove(GenTree node)
             => GenTreeLirKinds.IsCopyKind(node.Kind) &&
@@ -857,8 +857,7 @@ namespace Cnidaria.Cs
                         }
                     }
 
-                    if (node.Kind == GenTreeKind.EndFinally ||
-                        (node.Kind == GenTreeKind.Branch && node.Operator == GenTreeOperator.Leave && IsFuncletBlock(method, block.Id)))
+                    if (node.Kind is GenTreeKind.EndFinally or GenTreeKind.CatchReturn or GenTreeKind.EndFilter)
                     {
                         if (!HasContiguousEpilogBefore(block.LinearNodes, i))
                             throw new InvalidOperationException("Funclet exit node is missing an immediately preceding epilog sequence.");
@@ -947,8 +946,7 @@ namespace Cnidaria.Cs
             while (i < nodes.Length && IsEpilogFrameNode(nodes[i]))
                 i++;
             return i < nodes.Length &&
-                (nodes[i].Kind is GenTreeKind.Return or GenTreeKind.EndFinally ||
-                    (nodes[i].Kind == GenTreeKind.Branch && nodes[i].Operator == GenTreeOperator.Leave));
+                nodes[i].Kind is GenTreeKind.Return or GenTreeKind.EndFinally or GenTreeKind.CatchReturn or GenTreeKind.EndFilter;
         }
         private static bool IsFuncletBlock(RegisterAllocatedMethod method, int blockId)
         {
@@ -1132,7 +1130,7 @@ namespace Cnidaria.Cs
                 for (int j = i + 1; j < segments.Count; j++)
                 {
                     var right = segments[j];
-                    if (left.Segment.Location.Register != right.Segment.Location.Register)
+                    if ((left.Segment.Location.RegisterMask & right.Segment.Location.RegisterMask) == 0)
                         continue;
                     if (left.Segment.Start >= right.Segment.End || right.Segment.Start >= left.Segment.End)
                         continue;
@@ -1243,7 +1241,7 @@ namespace Cnidaria.Cs
                 var located = segments[i];
                 var segment = located.Segment;
                 var allocation = located.Allocation;
-                ulong registerMask = MachineRegisters.MaskOf(segment.Location.Register);
+                UInt128 registerMask = segment.Location.RegisterMask;
 
                 for (int k = 0; k < kills.Count; k++)
                 {
@@ -1410,7 +1408,7 @@ namespace Cnidaria.Cs
 
                 VerifyOperandStorage(method, operand, isUse: false);
 
-                if (i < node.RegisterResults.Length && !IsAbiRepresentationMove(node))
+                if (i < node.RegisterResults.Length && !IsAbiRepresentationMove(node) && !IsCallLike(node.TreeKind))
                     VerifyOperandClass(method, operand, node.RegisterResults[i], "result");
             }
 
@@ -1425,7 +1423,7 @@ namespace Cnidaria.Cs
                 if (i < node.RegisterUses.Length &&
                     node.UseRoles[i] != OperandRole.HiddenReturnBuffer &&
                     !IsAbiRepresentationMove(node) &&
-                    !(GenTreeLirKinds.IsRealTree(node) && IsCallLike(node.TreeKind)))
+                    !(GenTreeLirKinds.IsRealTree(node) && (IsCallLike(node.TreeKind) || node.TreeKind == GenTreeKind.Return)))
                 {
                     VerifyOperandClass(method, operand, node.RegisterUses[i], "use");
                 }
@@ -1449,6 +1447,22 @@ namespace Cnidaria.Cs
                     $"Move must not be memory-to-memory after copy resolution: {node.Uses[0]} -> {node.Results[0]}.");
             }
 
+            UInt128 internalVectors = 0;
+            foreach (GenTreeInternalRegister temporary in node.InternalRegisters)
+            {
+                if (temporary.RegisterClass != RegisterClass.Vector)
+                    continue;
+                RegisterOperand group = RegisterOperand.ForRegister(temporary.Register, temporary.RegisterCount);
+                if ((internalVectors & group.RegisterMask) != 0)
+                    throw new InvalidOperationException($"Overlapping internal vector groups on {node}.");
+                internalVectors |= group.RegisterMask;
+                foreach (RegisterOperand use in node.Uses)
+                {
+                    if ((use.RegisterMask & group.RegisterMask) != 0)
+                        throw new InvalidOperationException($"Internal vector group {group} overlaps operand {use} on {node}.");
+                }
+            }
+
             if (GenTreeLirKinds.IsRealTree(node))
             {
                 if (IsCallLike(node.TreeKind))
@@ -1466,18 +1480,19 @@ namespace Cnidaria.Cs
         {
             for (int i = 0; i < node.RegisterResults.Length; i++)
             {
-                if (IsBlockCopyValue(method, node.RegisterResults[i]))
+                if (RequiresAggregateMemoryCopy(method, node.RegisterResults[i]))
                     return true;
             }
-            if (node.RegisterUses.Length != 0 && IsBlockCopyValue(method, node.RegisterUses[0]))
+            if (node.RegisterUses.Length != 0 && RequiresAggregateMemoryCopy(method, node.RegisterUses[0]))
                 return true;
             return false;
         }
 
-        private static bool IsBlockCopyValue(RegisterAllocatedMethod method, GenTree value)
+        private static bool RequiresAggregateMemoryCopy(RegisterAllocatedMethod method, GenTree value)
         {
             var valueInfo = method.GenTreeMethod.GetValueInfo(value);
-            return MachineAbi.IsBlockCopyValue(valueInfo.Type, valueInfo.StackKind, method.GenTreeMethod.Target);
+            var abi = MachineAbi.ClassifyStorageValue(valueInfo.Type, valueInfo.StackKind, method.GenTreeMethod.Target);
+            return abi.PassingKind is AbiValuePassingKind.MultiRegister or AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect;
         }
 
         private static bool IsCallLike(GenTreeKind kind)
@@ -1528,7 +1543,7 @@ namespace Cnidaria.Cs
         }
 
         private static bool IsAbiRepresentationMove(GenTree node)
-            => GenTreeLirKinds.IsCopyKind(node.Kind) && (node.MoveFlags & MoveFlags.AbiArgument) != 0;
+            => GenTreeLirKinds.IsCopyKind(node.Kind) && (node.MoveFlags & (MoveFlags.AbiArgument | MoveFlags.AbiReturn)) != 0;
 
         private static void VerifyCallLikeAbiShape(RegisterAllocatedMethod method, GenTree node)
         {

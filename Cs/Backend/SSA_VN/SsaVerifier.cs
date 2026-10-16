@@ -1299,7 +1299,17 @@ namespace Cnidaria.Cs
             if (!DefinitionDominatesUsePoint(method, definition, useBlockId, useStatementIndex, useTreeId))
                 throw new InvalidOperationException($"SSA definition {use} in B{definition.DefBlockId} does not dominate use at node {useTreeId} in B{useBlockId}.");
 
+            VerifySameFunclet(method, definition, useBlockId, $"node {useTreeId}");
+
             VerifyNoInterveningSameSlotDefinition(method, definitionsBySlot, definition, useBlockId, useStatementIndex, useTreeId, $"node {useTreeId}");
+        }
+
+        private static void VerifySameFunclet(SsaMethod method, SsaValueDefinition definition, int useBlockId, string use)
+        {
+            if (method.Cfg.ExceptionRegions.Length == 0)
+                return;
+            if (!GenTreeCriticalEdgeSplitter.SameFunclet(method.Cfg.Blocks[Math.Max(definition.DefBlockId, 0)], method.Cfg.Blocks[useBlockId]))
+                throw new InvalidOperationException($"SSA value {definition.Name} defined in B{definition.DefBlockId} is used by {use} in B{useBlockId}, which runs in another funclet.");
         }
 
         private static void VerifyEdgeUse(
@@ -1315,6 +1325,9 @@ namespace Cnidaria.Cs
 
             if (!DefinitionDominatesBlockEnd(method, definition, predecessorBlockId))
                 throw new InvalidOperationException($"Phi {phiTarget} input {use} from B{predecessorBlockId} is not dominated by its definition in B{definition.DefBlockId}.");
+
+            if (definitions.TryGetValue(phiTarget, out var phiDefinition))
+                VerifySameFunclet(method, definition, phiDefinition.DefBlockId, $"phi {phiTarget}");
 
             VerifyNoInterveningSameSlotDefinition(method, definitionsBySlot, definition, predecessorBlockId, int.MaxValue, -1, $"phi edge B{predecessorBlockId} -> {phiTarget}");
         }

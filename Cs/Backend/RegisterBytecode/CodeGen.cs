@@ -635,7 +635,7 @@ namespace Cnidaria.Cs
                     aux: Aux.Memory(AlignLog2(PtrSize), AlignLog2(PtrSize), MemoryBase.Register)));
             }
 
-            private static int ArrayDataOffsetForEmitter() => 16;
+            private static int ArrayDataOffsetForEmitter() => TargetInfo.Default32Bit.ArrayDataOffset;
 
             private void CopyMemory(MachineRegister srcBase, int srcOffset, MachineRegister dstBase, int dstOffset, int size)
             {
@@ -818,6 +818,7 @@ namespace Cnidaria.Cs
             private readonly Dictionary<int, int> _blockEndPositions = new Dictionary<int, int>();
             private readonly HashSet<int> _emittedGcSafePointPcs = new HashSet<int>();
             private int _currentEmitNextBlockId = -1;
+            private int _currentEmitBlockId = -1;
 
             public MethodEmitter(Assembler asm, BuildState state, GenTreeMethod method, IReadOnlyDictionary<int, Label> methodEntryLabels, CodeGeneratorOptions options)
             {
@@ -858,6 +859,7 @@ namespace Cnidaria.Cs
                     int nextBlockId = i + 1 < order.Length ? order[i + 1] : -1;
                     var block = _method.Blocks[blockId];
                     _currentEmitNextBlockId = nextBlockId;
+                    _currentEmitBlockId = blockId;
                     int firstBodyNode = blockId == 0
                         ? GenTreeLirKinds.PrologPrefixLength(block.LinearNodes)
                         : 0;
@@ -871,7 +873,7 @@ namespace Cnidaria.Cs
                     EmitBlockLayoutFixup(blockId, nextBlockId);
                     _currentEmitNextBlockId = -1;
 
-                    if (_asm.Pc == _blockStartPc[blockId])
+                    if (nextBlockId < 0 && _asm.Pc == _blockStartPc[blockId])
                         _asm.Nop();
 
                     _blockEndPc[blockId] = _asm.Pc;
@@ -1064,7 +1066,6 @@ namespace Cnidaria.Cs
                         return;
                     case FrameOperation.EnterFuncletFrame:
                     case FrameOperation.LeaveFuncletFrame:
-                        _asm.Nop();
                         return;
                     case FrameOperation.SaveReturnAddress:
                     case FrameOperation.SaveCalleeSavedRegister:
@@ -1147,12 +1148,16 @@ namespace Cnidaria.Cs
                     case GenTreeKind.Conv:
                         EmitConversion(instruction, source);
                         return;
+                    case GenTreeKind.CallFinally:
+                        _asm.CallFinally(LabelForTarget(source));
+                        if (_currentEmitBlockId + 1 != _currentEmitNextBlockId)
+                            _asm.J(_blockLabels[_currentEmitBlockId + 1]);
+                        return;
+                    case GenTreeKind.CatchReturn:
+                        _asm.Leave(LabelForTarget(source));
+                        return;
                     case GenTreeKind.Branch:
-                        if (source.Operator == GenTreeOperator.Leave)
-                        {
-                            _asm.Leave(LabelForTarget(source));
-                        }
-                        else if (source.TargetBlockId != _currentEmitNextBlockId)
+                        if (source.TargetBlockId != _currentEmitNextBlockId)
                         {
                             _asm.J(LabelForTarget(source));
                         }
@@ -1175,6 +1180,9 @@ namespace Cnidaria.Cs
                         return;
                     case GenTreeKind.EndFinally:
                         _asm.Emit(InstrDesc.Op0(Op.EndFinally));
+                        return;
+                    case GenTreeKind.EndFilter:
+                        _asm.Emit(new InstrDesc(Op.EndFilter, rs1: RegisterVmIsa.EncodeRegister(RequireUseRegister(instruction, 0))));
                         return;
                     case GenTreeKind.Intrinsic:
                     case GenTreeKind.Call:
@@ -1477,10 +1485,7 @@ namespace Cnidaria.Cs
                 }
 
                 if (instruction.Results.Length == 0 && instruction.Uses.Length <= 1)
-                {
-                    _asm.Nop();
                     return;
-                }
 
                 throw Unsupported(instruction, "unsupported local/argument/temp operand shape");
             }
@@ -3977,10 +3982,7 @@ namespace Cnidaria.Cs
                     return false;
 
                 if (instruction.Results.Length == 0 && instruction.Uses.Length == 0)
-                {
-                    _asm.Nop();
                     return true;
-                }
 
                 if (instruction.Uses.Length == 0 && TryEmitSsaPromotedFieldDefaultDefinition(instruction, source))
                     return true;
@@ -5193,8 +5195,11 @@ namespace Cnidaria.Cs
                 {
                     var region = regions[regionOrder[i]];
                     GetTryNativeRange(region, out int tryStart, out int tryEnd);
-                    GetFuncletNativeRange(region, out int handlerStart, out int handlerEnd);
-                    int filterStart = region.Kind == CfgExceptionRegionKind.Filter ? handlerStart : -1;
+                    int filterStart = -1;
+                    if (region.HasFilter)
+                        GetFuncletNativeRange(EhFuncletLayout.BuildFilterBlockIds(_method.Cfg, region), region.HandlerStartBlockId, region.FilterEndBlockIdExclusive, out filterStart, out _);
+                    GetFuncletNativeRange(EhFuncletLayout.BuildHandlerBodyBlockIds(_method.Cfg, region), region.HandlerBodyStartBlockId, region.HandlerEndBlockIdExclusive,
+                        out int handlerStart, out int handlerEnd);
                     int catchTypeId = region.Kind == CfgExceptionRegionKind.Catch && region.CatchTypeToken != 0 ? region.CatchTypeToken : -1;
                     int parentLocalIndex = -1;
                     if (region.ParentIndex >= 0 && localEhIndexByCfgRegionIndex.TryGetValue(region.ParentIndex, out int mappedParent))
@@ -5239,13 +5244,12 @@ namespace Cnidaria.Cs
                 tryEnd = BlockEndPc(blocks[blocks.Length - 1]);
             }
 
-            private void GetFuncletNativeRange(CfgExceptionRegion region, out int handlerStart, out int handlerEnd)
+            private void GetFuncletNativeRange(ImmutableArray<int> blocks, int startBlockId, int endBlockIdExclusive, out int handlerStart, out int handlerEnd)
             {
-                var blocks = EhFuncletLayout.BuildFuncletBlockIds(_method.Cfg, region);
                 if (blocks.Length == 0)
                 {
-                    handlerStart = BlockStartPc(region.HandlerStartBlockId);
-                    handlerEnd = BlockRangeEndPc(region.HandlerEndBlockIdExclusive);
+                    handlerStart = BlockStartPc(startBlockId);
+                    handlerEnd = BlockRangeEndPc(endBlockIdExclusive);
                     return;
                 }
 

@@ -174,7 +174,11 @@ internal static class X86AssemblyParser
             yield break;
         }
 
-        var opcode = X86InstructionTable.GetOpcode(mnemonic);
+        if (!X86InstructionTable.TryGetOpcode(mnemonic, out var opcode) &&
+            !(mnemonic.StartsWith("v", StringComparison.Ordinal) && X86InstructionTable.TryGetOpcode(mnemonic.Substring(1), out opcode)))
+        {
+            throw new FormatException($"Unknown mnemonic: {mnemonic}");
+        }
         switch (opcode)
         {
             case X86InstrKind.Nop:
@@ -233,34 +237,65 @@ internal static class X86AssemblyParser
                 }
                 break;
             default:
-                if (X86InstructionTable.Get(opcode).Format == X86InstructionFormat.Ternary)
                 {
-                    ValidateOperandCount(mnemonic, operands, 3, lineNumber);
-                    var dst = ParseOperand(operands[0], target);
-                    var src0 = ParseOperand(operands[1], target, dst.Size);
-                    var src1DefaultSize = dst.Size != 0 ? dst.Size : src0.Size;
-                    var src1 = ParseOperand(operands[2], target, src1DefaultSize);
-                    if (dst.Size == 0 && src0.Size != 0)
-                        dst = dst.WithSize(src0.Size);
-                    if (src0.Size == 0 && dst.Size != 0)
-                        src0 = src0.WithSize(dst.Size);
-                    if (src1.Size == 0 && dst.Size != 0 && src1.Kind != X86OperandKind.Immediate && src1.Kind != X86OperandKind.Symbol)
-                        src1 = src1.WithSize(dst.Size);
-                    yield return X86Instruction.Ternary(opcode, dst, src0, src1);
+                    if (operands.Length > 4)
+                        throw new FormatException($"Invalid {mnemonic} operand count on line {lineNumber}");
+                    if (operands.Length == 0)
+                    {
+                        yield return new X86Instruction(opcode);
+                        break;
+                    }
+                    int opMask = 0;
+                    bool zeroing = false;
+                    var rounding = X86RoundingMode.None;
+                    if (operands.Length > 2 && TryParseRounding(operands[^1], out rounding))
+                        operands = operands.RemoveAt(operands.Length - 1);
+                    var first = StripDecorations(operands[0], ref opMask, ref zeroing);
+                    var parsed = new X86Operand[operands.Length];
+                    parsed[0] = ParseOperand(first, target);
+                    for (int i = 1; i < operands.Length; i++)
+                    {
+                        int defaultSize = parsed[0].Kind is X86OperandKind.Register or X86OperandKind.Memory ? parsed[0].Size : 0;
+                        parsed[i] = ParseOperand(operands[i], target, defaultSize);
+                    }
+                    if (parsed.Length > 1 && parsed[0].Size == 0 && parsed[1].Size != 0)
+                        parsed[0] = parsed[0].WithSize(parsed[1].Size);
+                    X86Operand At(int i) => i < parsed.Length ? parsed[i] : X86Operand.None;
+                    yield return new X86Instruction(opcode, At(0), At(1), At(2), operand3: At(3), opMask: opMask, zeroing: zeroing, rounding: rounding);
+                    break;
                 }
-                else
-                {
-                    ValidateOperandCount(mnemonic, operands, 2, lineNumber);
-                    var dst = ParseOperand(operands[0], target);
-                    var srcDefaultSize = dst.Kind is X86OperandKind.Register or X86OperandKind.Memory ? dst.Size : 0;
-                    var src = ParseOperand(operands[1], target, srcDefaultSize);
-                    if (dst.Size == 0 && src.Size != 0)
-                        dst = dst.WithSize(src.Size);
-                    if (src.Size == 0 && dst.Size != 0 && src.Kind != X86OperandKind.Immediate && src.Kind != X86OperandKind.Symbol)
-                        src = src.WithSize(dst.Size);
-                    yield return X86Instruction.Binary(opcode, dst, src);
-                }
-                break;
+        }
+    }
+
+    private static bool TryParseRounding(string text, out X86RoundingMode rounding)
+    {
+        rounding = text.Trim().ToLowerInvariant() switch
+        {
+            "{rn-sae}" => X86RoundingMode.Nearest,
+            "{rd-sae}" => X86RoundingMode.Down,
+            "{ru-sae}" => X86RoundingMode.Up,
+            "{rz-sae}" => X86RoundingMode.Zero,
+            _ => X86RoundingMode.None,
+        };
+        return rounding != X86RoundingMode.None;
+    }
+
+    private static string StripDecorations(string text, ref int opMask, ref bool zeroing)
+    {
+        while (true)
+        {
+            text = text.Trim();
+            int open = text.LastIndexOf('{');
+            if (open < 0 || !text.EndsWith("}", StringComparison.Ordinal))
+                return text;
+            string decoration = text.Substring(open + 1, text.Length - open - 2).Trim().ToLowerInvariant();
+            if (decoration == "z")
+                zeroing = true;
+            else if (decoration.StartsWith("k", StringComparison.Ordinal))
+                opMask = int.Parse(decoration.Substring(1), CultureInfo.InvariantCulture);
+            else
+                throw new FormatException($"Unsupported operand decoration {{{decoration}}}");
+            text = text.Substring(0, open);
         }
     }
 
@@ -287,6 +322,12 @@ internal static class X86AssemblyParser
 
         if (text.StartsWith("[", StringComparison.Ordinal) && text.EndsWith("]", StringComparison.Ordinal))
             return ParseMemory(text.Substring(1, text.Length - 2), size);
+        int broadcast = text.LastIndexOf("{1to", StringComparison.OrdinalIgnoreCase);
+        if (broadcast > 0 && text.StartsWith("[", StringComparison.Ordinal) && text.EndsWith("}", StringComparison.Ordinal) && text[broadcast - 1] == ']')
+        {
+            int count = int.Parse(text.AsSpan(broadcast + 4, text.Length - broadcast - 5), NumberStyles.None, CultureInfo.InvariantCulture);
+            return ParseMemory(text.Substring(1, broadcast - 2), size * count).WithBroadcast(true);
+        }
 
         if (X86Registers.TryParse(text, out var register, out var registerSize))
             return X86Operand.RegisterOperand(register, registerSize);
@@ -323,8 +364,8 @@ internal static class X86AssemblyParser
                 var regText = text.Substring(0, star).Trim();
                 var scaleText = text.Substring(star + 1).Trim();
                 var reg = X86Registers.Parse(regText, out _);
-                if (!X86Registers.IsGeneral(reg))
-                    throw new FormatException("x86 memory index must be a general register");
+                if (!X86Registers.IsGeneral(reg) && !X86Registers.IsVector(reg))
+                    throw new FormatException("x86 memory index must be a general or vector register");
                 if (sign < 0)
                     throw new FormatException("Negative x86 memory index is not encodable");
                 indexRegister = reg;
@@ -384,12 +425,14 @@ internal static class X86AssemblyParser
             new SizePrefix("qword ptr", 8),
             new SizePrefix("xmmword ptr", 16),
             new SizePrefix("ymmword ptr", 32),
+            new SizePrefix("zmmword ptr", 64),
             new SizePrefix("byte", 1),
             new SizePrefix("word", 2),
             new SizePrefix("dword", 4),
             new SizePrefix("qword", 8),
             new SizePrefix("xmmword", 16),
             new SizePrefix("ymmword", 32),
+            new SizePrefix("zmmword", 64),
         };
 
         foreach (var prefix in prefixes)
@@ -668,16 +711,103 @@ internal static class X86AssemblyWriter
             X86InstrKind.Cmovcc => "cmov" + X86Conditions.Format(instruction.Condition),
             _ => X86InstructionTable.GetMnemonic(instruction.Opcode),
         };
+        if (EvexMnemonic(instruction) is string evex)
+            mnemonic = evex;
+        else if (UsesVexMnemonic(instruction) && !mnemonic.StartsWith("v", StringComparison.Ordinal))
+            mnemonic = "v" + mnemonic;
 
         var operands = new List<string>();
-        if (instruction.Operand0.Kind != X86OperandKind.None)
-            operands.Add(WriteOperand(instruction.Operand0, options, addressSize));
-        if (instruction.Operand1.Kind != X86OperandKind.None)
-            operands.Add(WriteOperand(instruction.Operand1, options, addressSize));
-        if (instruction.Operand2.Kind != X86OperandKind.None)
-            operands.Add(WriteOperand(instruction.Operand2, options, addressSize));
+        for (int i = 0; i < instruction.OperandCount; i++)
+        {
+            var operand = instruction.GetOperand(i);
+            int element = operand.IsBroadcast ? BroadcastElementSize(instruction.Opcode, operand.Size) : 0;
+            string text = WriteOperand(element != 0 ? operand.WithSize(element) : operand, options, addressSize);
+            if (element != 0)
+                text += $"{{1to{operand.Size / element}}}";
+            if (i == 0 && instruction.OpMask != 0)
+                text += $"{{k{instruction.OpMask}}}" + (instruction.Zeroing ? "{z}" : "");
+            operands.Add(text);
+        }
+        if (instruction.Rounding != X86RoundingMode.None)
+            operands.Add(instruction.Rounding switch { X86RoundingMode.Nearest => "{rn-sae}", X86RoundingMode.Down => "{rd-sae}", X86RoundingMode.Up => "{ru-sae}", _ => "{rz-sae}" });
 
         return operands.Count == 0 ? mnemonic : mnemonic + " " + string.Join(", ", operands);
+    }
+
+    private static int BroadcastElementSize(X86InstrKind kind, int size)
+    {
+        foreach (var form in X86Forms.ForKind(kind))
+        {
+            if (form.Space != X86EncodingSpace.Evex)
+                continue;
+            foreach (var spec in form.Operands)
+            {
+                if (spec.Role == X86OperandRole.Rm && spec.Broadcast != 0 && spec.MemorySize == size)
+                    return spec.Broadcast;
+            }
+        }
+        return 0;
+    }
+
+    private static string? EvexMnemonic(X86Instruction instruction)
+    {
+        for (int i = 0; i < instruction.OperandCount; i++)
+        {
+            var operand = instruction.GetOperand(i);
+            if (operand.Kind != X86OperandKind.Register || !X86Registers.IsZmm(operand.Register))
+                continue;
+            foreach (var form in X86Forms.ForKind(instruction.Opcode))
+            {
+                if (form.Space == X86EncodingSpace.Evex && form.Mnemonic is not null)
+                    return form.Mnemonic;
+            }
+            return null;
+        }
+        return null;
+    }
+
+    // Vector instructions spelled with more operands than their SSE form, or on ymm, zmm or mask registers, are the VEX and EVEX encodings
+    private static bool UsesVexMnemonic(X86Instruction instruction)
+    {
+        var forms = X86Forms.ForKind(instruction.Opcode);
+        if (forms.Count == 0 || forms[0].Space != X86EncodingSpace.Legacy || !Array.Exists(forms[0].Operands, o => o.IsVector))
+            return false;
+        if (instruction.OperandCount > forms[0].ExplicitOperandCount || instruction.OpMask != 0)
+            return true;
+        for (int i = 0; i < instruction.OperandCount; i++)
+        {
+            var operand = instruction.GetOperand(i);
+            if (operand.Kind == X86OperandKind.Register && (X86Registers.IsYmm(operand.Register) || X86Registers.IsZmm(operand.Register) || X86Registers.IsMask(operand.Register)))
+                return true;
+        }
+        foreach (var form in forms)
+        {
+            if (form.Space == X86EncodingSpace.Legacy && LegacyFormTakes(form, instruction))
+                return false;
+        }
+        return true;
+    }
+
+    private static bool LegacyFormTakes(X86Form form, X86Instruction instruction)
+    {
+        if (form.ExplicitOperandCount != instruction.OperandCount)
+            return false;
+        int next = 0;
+        foreach (var spec in form.Operands)
+        {
+            if (spec.Role == X86OperandRole.Implicit && !spec.One && spec.Fixed != X86Register.Rcx)
+                continue;
+            var operand = instruction.GetOperand(next++);
+            bool takes = operand.Kind switch
+            {
+                X86OperandKind.Register => spec.AllowsRegister && (X86Registers.IsVector(operand.Register) ? spec.IsVector : spec.Class == X86OperandClass.Gpr),
+                X86OperandKind.Memory => spec.AllowsMemory,
+                _ => spec.Class is X86OperandClass.Immediate or X86OperandClass.Relative,
+            };
+            if (!takes)
+                return false;
+        }
+        return true;
     }
 
     private static string WriteOperand(X86Operand operand, X86AssemblyWriterOptions options, int addressSize)
@@ -713,9 +843,11 @@ internal static class X86AssemblyWriter
         else if (X86Registers.IsGeneral(operand.BaseRegister))
             Add(X86Registers.Format(operand.BaseRegister, addressSize));
 
-        if (X86Registers.IsGeneral(operand.IndexRegister))
+        if (X86Registers.IsGeneral(operand.IndexRegister) || X86Registers.IsVector(operand.IndexRegister))
         {
-            var text = X86Registers.Format(operand.IndexRegister, addressSize);
+            var text = X86Registers.IsVector(operand.IndexRegister)
+                ? X86Registers.Format(operand.IndexRegister, X86Registers.IsXmm(operand.IndexRegister) ? 16 : X86Registers.IsYmm(operand.IndexRegister) ? 32 : 64)
+                : X86Registers.Format(operand.IndexRegister, addressSize);
             if (operand.Scale != 1)
                 text += "*" + operand.Scale.ToString(CultureInfo.InvariantCulture);
             Add(text);
@@ -754,6 +886,7 @@ internal static class X86AssemblyWriter
             8 => "qword",
             16 => "xmmword",
             32 => "ymmword",
+            64 => "zmmword",
             _ => size.ToString(CultureInfo.InvariantCulture),
         };
     }

@@ -4277,7 +4277,7 @@ namespace Cnidaria.Cs
 
                 if (op.Kind == SyntaxKind.IsKeyword)
                 {
-                    var pattern = ParsePatternCore();
+                    var pattern = ParsePatternCore(SyntaxFacts.GetBinaryOperatorPrecedence(SyntaxKind.IsKeyword));
                     left = new IsPatternExpressionSyntax(left, op, pattern);
                     continue;
                 }
@@ -5747,48 +5747,49 @@ namespace Cnidaria.Cs
             return new ParenthesizedVariableDesignationSyntax(open, new SeparatedSyntaxList<VariableDesignationSyntax>(list.ToArray()), close);
         }
         // Patterns
-        private PatternSyntax ParsePatternCore()
+        // An is-pattern operand stops at relational and lower-precedence expression operators.
+        private PatternSyntax ParsePatternCore(int constantPrecedence = 0)
         {
-            return ParseDisjunctivePattern();
+            return ParseDisjunctivePattern(constantPrecedence);
         }
-        private PatternSyntax ParseDisjunctivePattern()
+        private PatternSyntax ParseDisjunctivePattern(int constantPrecedence)
         {
-            var left = ParseConjunctivePattern();
+            var left = ParseConjunctivePattern(constantPrecedence);
 
             while (IsCurrentContextual(SyntaxKind.OrKeyword))
             {
                 var op = _tokens.EatToken();
-                var right = ParseConjunctivePattern();
+                var right = ParseConjunctivePattern(constantPrecedence);
                 left = new BinaryPatternSyntax(SyntaxKind.OrPattern, left, op, right);
             }
 
             return left;
         }
-        private PatternSyntax ParseConjunctivePattern()
+        private PatternSyntax ParseConjunctivePattern(int constantPrecedence)
         {
-            var left = ParseNegatedPattern();
+            var left = ParseNegatedPattern(constantPrecedence);
 
             while (IsCurrentContextual(SyntaxKind.AndKeyword))
             {
                 var op = _tokens.EatToken();
-                var right = ParseNegatedPattern();
+                var right = ParseNegatedPattern(constantPrecedence);
                 left = new BinaryPatternSyntax(SyntaxKind.AndPattern, left, op, right);
             }
 
             return left;
         }
-        private PatternSyntax ParseNegatedPattern()
+        private PatternSyntax ParseNegatedPattern(int constantPrecedence)
         {
             if (IsCurrentContextual(SyntaxKind.NotKeyword))
             {
                 var op = _tokens.EatToken();
-                var pattern = ParseNegatedPattern();
+                var pattern = ParseNegatedPattern(constantPrecedence);
                 return new UnaryPatternSyntax(SyntaxKind.NotPattern, op, pattern);
             }
 
-            return ParsePrimaryPattern();
+            return ParsePrimaryPattern(constantPrecedence);
         }
-        private PatternSyntax ParsePrimaryPattern()
+        private PatternSyntax ParsePrimaryPattern(int constantPrecedence)
         {
             if (_tokens.CurrentKind == SyntaxKind.OpenBracketToken)
                 return ParseListPattern();
@@ -5805,7 +5806,7 @@ namespace Cnidaria.Cs
             if (_tokens.CurrentKind == SyntaxKind.OpenParenToken)
             {
                 if (LooksLikeCastExpressionInPattern())
-                    return new ConstantPatternSyntax(ParseExpression());
+                    return new ConstantPatternSyntax(constantPrecedence == 0 ? ParseExpression() : ParseBinaryExpression(constantPrecedence));
 
                 return ParseParenthesizedOrPositionalPattern();
             }
@@ -5836,7 +5837,7 @@ namespace Cnidaria.Cs
             if (IsRelationalPatternOperator(_tokens.CurrentKind))
             {
                 var op = _tokens.EatToken();
-                var expr = ParseExpression();
+                var expr = ParseBinaryExpression(SyntaxFacts.GetBinaryOperatorPrecedence(SyntaxKind.LessThanToken));
                 return new RelationalPatternSyntax(op, expr);
             }
 
@@ -5882,13 +5883,13 @@ namespace Cnidaria.Cs
                     return new DeclarationPatternSyntax(parsedType, designation);
                 }
 
-                if (IsDefiniteTypePattern(parsedType) && IsPatternTerminatorOrOperator())
+                if (IsDefiniteTypePattern(parsedType) && (IsPatternTerminatorOrOperator() || EndsPatternOperand(constantPrecedence)))
                     return new TypePatternSyntax(parsedType);
 
                 Reset(resetPoint);
             }
 
-            var expr2 = ParseBinaryExpression();
+            var expr2 = ParseBinaryExpression(constantPrecedence);
             return new ConstantPatternSyntax(expr2);
         }
         private ListPatternSyntax ParseListPattern()
@@ -6243,6 +6244,8 @@ namespace Cnidaria.Cs
                    IsCurrentContextual(SyntaxKind.AndKeyword) ||
                    IsCurrentContextual(SyntaxKind.OrKeyword);
         }
+        private bool EndsPatternOperand(int constantPrecedence)
+            => constantPrecedence > 0 && SyntaxFacts.GetBinaryOperatorPrecedence(_tokens.CurrentKind) is > 0 and var precedence && precedence <= constantPrecedence;
         private bool IsDefiniteTypePattern(TypeSyntax type)
         {
             if (TypeDefinitelyNotExpression(type))

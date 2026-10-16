@@ -364,8 +364,7 @@ namespace Cnidaria.Cs
 
             var terminator = block.Statements[block.Statements.Length - 1];
             return terminator.Kind == GenTreeKind.Branch &&
-                   terminator.TargetBlockId == successor &&
-                   terminator.Operator != GenTreeOperator.Leave;
+                   terminator.TargetBlockId == successor;
         }
 
         private static bool TryGetLogicalSuccessors(
@@ -488,7 +487,7 @@ namespace Cnidaria.Cs
         {
             if ((node.Flags & (GenTreeFlags.ControlFlow | GenTreeFlags.ExceptionFlow)) != 0 ||
                 node.Kind is GenTreeKind.Branch or GenTreeKind.BranchTrue or GenTreeKind.BranchFalse or
-                    GenTreeKind.Return or GenTreeKind.Throw or GenTreeKind.Rethrow or GenTreeKind.EndFinally)
+                    GenTreeKind.Return or GenTreeKind.Throw or GenTreeKind.Rethrow or GenTreeKind.EndFinally or GenTreeKind.CallFinally or GenTreeKind.CatchReturn or GenTreeKind.EndFilter)
             {
                 return true;
             }
@@ -966,7 +965,7 @@ namespace Cnidaria.Cs
                 statements.ToImmutable(),
                 ImmutableArray.Create(trueDestination, falseDestination),
                 ImmutableArray.Create(truePc, falsePc),
-                oldPreheader.RegionPc);
+                oldPreheader.Region);
         }
 
         private static int PreheaderPayloadEnd(GenTreeBlock preheader, int header)
@@ -1006,7 +1005,7 @@ namespace Cnidaria.Cs
                 ImmutableArray.Create(branch),
                 ImmutableArray.Create(stay.Id),
                 ImmutableArray.Create(stay.StartPc),
-                oldPreheader.RegionPc);
+                oldPreheader.Region);
         }
 
         private static GenTreeBlock CreateLoopExit(
@@ -1029,7 +1028,7 @@ namespace Cnidaria.Cs
                 ImmutableArray.Create(branch),
                 ImmutableArray.Create(exit.Id),
                 ImmutableArray.Create(exit.StartPc),
-                exit.RegionPc);
+                exit.Region);
         }
 
         private static GenTreeBlockFlags SyntheticBlockFlags(GenTreeBlock regionSource, int stackDepth)

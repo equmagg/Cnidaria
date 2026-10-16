@@ -130,7 +130,7 @@ namespace Cnidaria.Cs
                 ImmutableArray.Create(branch),
                 ImmutableArray.Create(header.Id),
                 ImmutableArray.Create(header.StartPc),
-                header.RegionPc);
+                header.Region);
 
             var blocks = ImmutableArray.CreateBuilder<GenTreeBlock>(method.Blocks.Length + 1);
             for (int i = 0; i < method.Blocks.Length; i++)
@@ -213,7 +213,7 @@ namespace Cnidaria.Cs
                 ImmutableArray.Create(branch),
                 ImmutableArray.Create(header.Id),
                 ImmutableArray.Create(header.StartPc),
-                header.RegionPc);
+                header.Region);
 
             var blocks = ImmutableArray.CreateBuilder<GenTreeBlock>(method.Blocks.Length + 1);
             for (int i = 0; i < method.Blocks.Length; i++)
@@ -305,7 +305,7 @@ namespace Cnidaria.Cs
                 ImmutableArray.Create(branch),
                 ImmutableArray.Create(exit.Id),
                 ImmutableArray.Create(exit.StartPc),
-                exit.RegionPc);
+                exit.Region);
 
             var blocks = ImmutableArray.CreateBuilder<GenTreeBlock>(method.Blocks.Length + 1);
             for (int i = 0; i < method.Blocks.Length; i++)
@@ -317,7 +317,7 @@ namespace Cnidaria.Cs
             return RenumberBlocks(method, blocks.ToImmutable());
         }
 
-        public static GenTreeMethod SplitCriticalEdges(GenTreeMethod method, Func<CfgEdge, bool>? canSplitEdge)
+        public static GenTreeMethod SplitCriticalEdges(GenTreeMethod method, Func<CfgEdge, bool>? canSplitEdge, ControlFlowGraph? ehCfg = null)
         {
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
@@ -341,13 +341,17 @@ namespace Cnidaria.Cs
             }
 
             var splitEdgesByDestination = new Dictionary<int, List<CfgEdge>>();
+            var splitEdgesBySource = new Dictionary<int, List<CfgEdge>>();
             for (int i = 0; i < splitEdges.Count; i++)
             {
                 var edge = splitEdges[i];
-                if (!splitEdgesByDestination.TryGetValue(edge.ToBlockId, out var edges))
+                bool afterSource = ehCfg is not null && IsExceptionRegionEntry(ehCfg, edge.ToBlockId);
+                var byBlock = afterSource ? splitEdgesBySource : splitEdgesByDestination;
+                int key = afterSource ? edge.FromBlockId : edge.ToBlockId;
+                if (!byBlock.TryGetValue(key, out var edges))
                 {
                     edges = new List<CfgEdge>();
-                    splitEdgesByDestination.Add(edge.ToBlockId, edges);
+                    byBlock.Add(key, edges);
                 }
                 edges.Add(edge);
             }
@@ -357,19 +361,17 @@ namespace Cnidaria.Cs
             {
                 if (splitEdgesByDestination.TryGetValue(i, out var incomingEdges))
                 {
-                    for (int e = 0; e < incomingEdges.Count; e++)
-                    {
-                        var edge = incomingEdges[e];
-                        var info = splitInfo[(edge.FromBlockId, edge.ToBlockId)];
-                        blocks.Add(CreateSplitBlock(
-                            info,
-                            method.Blocks[edge.FromBlockId],
-                            method.Blocks[edge.ToBlockId],
-                            ref nextTreeId));
-                    }
+                    foreach (var edge in incomingEdges)
+                        blocks.Add(CreateSplitBlock(splitInfo[(edge.FromBlockId, edge.ToBlockId)], method.Blocks[edge.FromBlockId], method.Blocks[i], method.Blocks[i].Region, ref nextTreeId));
                 }
 
                 blocks.Add(RewriteOriginalBlock(method.Blocks[i], splitInfo, ref nextTreeId));
+
+                if (splitEdgesBySource.TryGetValue(i, out var outgoingEdges))
+                {
+                    foreach (var edge in outgoingEdges)
+                        blocks.Add(CreateSplitBlock(splitInfo[(edge.FromBlockId, edge.ToBlockId)], method.Blocks[i], method.Blocks[edge.ToBlockId], method.Blocks[i].Region, ref nextTreeId));
+                }
             }
 
             return RenumberBlocks(method, blocks.ToImmutable());
@@ -546,7 +548,7 @@ namespace Cnidaria.Cs
                 statements,
                 successors.ToImmutable(),
                 successorPcs.ToImmutable(),
-                block.RegionPc);
+                block.Region);
         }
 
         private static bool TryRewriteBlockStatements(
@@ -691,6 +693,7 @@ namespace Cnidaria.Cs
             SplitEdgeInfo info,
             GenTreeBlock from,
             GenTreeBlock to,
+            GenTreeEhRegion region,
             ref int nextTreeId)
         {
             var branch = new GenTree(
@@ -705,6 +708,9 @@ namespace Cnidaria.Cs
                 targetPc: to.StartPc,
                 targetBlockId: to.Id);
 
+            GenTreeBlockFlags flags = from.ExitStackDepth != 0 ? GenTreeBlockFlags.HasStackEntry | GenTreeBlockFlags.HasStackExit : GenTreeBlockFlags.None;
+            if (region.TryIndex >= 0) flags |= GenTreeBlockFlags.InTryRegion;
+            if (region.HandlerIndex >= 0) flags |= GenTreeBlockFlags.InHandlerRegion;
             return new GenTreeBlock(
                 info.SplitBlockId,
                 info.SplitPc,
@@ -712,11 +718,11 @@ namespace Cnidaria.Cs
                 from.ExitStackDepth,
                 from.ExitStackDepth,
                 GenTreeBlockJumpKind.Always,
-                ComputeSplitBlockFlags(from, to, from.ExitStackDepth),
+                flags,
                 ImmutableArray.Create(branch),
                 ImmutableArray.Create(to.Id),
                 ImmutableArray.Create(to.StartPc),
-                to.RegionPc);
+                region);
         }
 
         private static GenTreeBlockFlags ComputeSplitBlockFlags(GenTreeBlock predecessor, GenTreeBlock successor, int stackDepth)
@@ -765,11 +771,14 @@ namespace Cnidaria.Cs
         {
             for (int i = 0; i < cfg.ExceptionRegions.Length; i++)
             {
-                if (cfg.ExceptionRegions[i].HandlerStartBlockId == blockId)
+                if (cfg.ExceptionRegions[i].HandlerStartBlockId == blockId || cfg.ExceptionRegions[i].HandlerBodyStartBlockId == blockId)
                     return true;
             }
             return false;
         }
+
+        internal static bool SameFunclet(CfgBlock left, CfgBlock right)
+            => SequenceEqual(left.HandlerRegionIndexes, right.HandlerRegionIndexes);
 
         internal static bool SameEhRegion(CfgBlock left, CfgBlock right)
             => SequenceEqual(left.TryRegionIndexes, right.TryRegionIndexes) &&
@@ -799,7 +808,7 @@ namespace Cnidaria.Cs
                 block.Statements,
                 block.SuccessorBlockIds,
                 block.SuccessorPcs,
-                block.RegionPc);
+                block.Region);
 
         private static void VerifyLoopPreheader(
             GenTreeMethod method,
@@ -847,7 +856,10 @@ namespace Cnidaria.Cs
             return result;
         }
 
-        internal static GenTreeMethod RenumberBlocks(GenTreeMethod method, ImmutableArray<GenTreeBlock> provisionalBlocks)
+        internal static GenTreeMethod RenumberBlocks(
+            GenTreeMethod method,
+            ImmutableArray<GenTreeBlock> provisionalBlocks,
+            ImmutableArray<ExceptionHandler> exceptionHandlers = default)
         {
             var idMap = new Dictionary<int, int>(provisionalBlocks.Length);
             for (int i = 0; i < provisionalBlocks.Length; i++)
@@ -883,10 +895,10 @@ namespace Cnidaria.Cs
                     statements.ToImmutable(),
                     successors.ToImmutable(),
                     block.SuccessorPcs,
-                    block.RegionPc));
+                    block.Region));
             }
 
-            return method.CloneWithBlocks(blocks.ToImmutable());
+            return method.CloneWithBlocks(blocks.ToImmutable(), exceptionHandlers);
         }
 
         private static GenTree RemapTreeTargets(GenTree node, IReadOnlyDictionary<int, int> idMap)

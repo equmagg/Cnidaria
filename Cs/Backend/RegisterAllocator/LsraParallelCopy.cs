@@ -13,13 +13,15 @@ namespace Cnidaria.Cs
         public readonly GenTree? SourceValue;
         public readonly GenTree? DestinationValue;
         public readonly MoveFlags MoveFlags;
+        public readonly AbiRegisterSegment? Fragment;
 
         public RegisterResolvedMove(
             RegisterOperand source,
             RegisterOperand destination,
             GenTree? sourceValue,
             GenTree? destinationValue,
-            MoveFlags moveFlags = MoveFlags.None)
+            MoveFlags moveFlags = MoveFlags.None,
+            AbiRegisterSegment? fragment = null)
         {
             if (!source.IsNone &&
                 !destination.IsNone &&
@@ -34,10 +36,11 @@ namespace Cnidaria.Cs
             SourceValue = sourceValue;
             DestinationValue = destinationValue;
             MoveFlags = moveFlags;
+            Fragment = fragment;
         }
 
         public RegisterResolvedMove WithSource(RegisterOperand source, GenTree? sourceValue)
-            => new RegisterResolvedMove(source, Destination, sourceValue, DestinationValue, MoveFlags);
+            => new RegisterResolvedMove(source, Destination, sourceValue, DestinationValue, MoveFlags, Fragment);
     }
     internal static class RegisterParallelCopyResolver
     {
@@ -109,17 +112,40 @@ namespace Cnidaria.Cs
                 if (scratchSlot < 0)
                     scratchSlot = getScratchSpillSlot();
 
-                var cycleBreak = moves[0];
+                // Overlapping groups can need several cycle spills before any move becomes acyclic.
+                int offset = 0;
+                foreach (RegisterResolvedMove pending in moves)
+                {
+                    if (pending.Source.IsSpillSlot && pending.Source.SpillSlot == scratchSlot)
+                        offset = Math.Max(offset, pending.Source.FrameOffset + pending.Source.FrameSlotSize);
+                }
+                int cycleIndex = moves.FindIndex(move =>
+                    (!move.Source.IsSpillSlot || move.Source.SpillSlot != scratchSlot) &&
+                    (offset == 0 || move.Source.RegisterClass == RegisterClass.Vector));
+                var cycleBreak = moves[cycleIndex];
+                RegisterOperand cycleSpill = RegisterOperand.ForSpillSlot(cycleBreak.Source.RegisterClass, scratchSlot);
+                if (cycleBreak.Fragment is AbiRegisterSegment fragment)
+                {
+                    cycleSpill = RegisterOperand.ForSpillSlot(cycleBreak.Source.RegisterClass, scratchSlot, offset, fragment.Size);
+                }
+                else if (cycleBreak.Source.RegisterClass == RegisterClass.Vector)
+                {
+                    int size = SimdTypes.SizeOf(cycleBreak.SourceValue?.StackKind ?? GenStackKind.Unknown);
+                    if (size == 0)
+                        size = cycleBreak.Source.RegisterCount * 16;
+                    cycleSpill = RegisterOperand.ForSpillSlot(RegisterClass.Vector, scratchSlot, offset, size);
+                }
                 EmitMove(
                     result,
                     ref nextNodeId,
                     fromBlockId,
                     new RegisterResolvedMove(
                         cycleBreak.Source,
-                        RegisterOperand.ForSpillSlot(cycleBreak.Source.RegisterClass, scratchSlot),
+                        cycleSpill,
                         cycleBreak.SourceValue,
                         cycleBreak.SourceValue,
-                        cycleBreak.MoveFlags | MoveFlags.ParallelCopy | MoveFlags.Spill | MoveFlags.Internal),
+                        cycleBreak.MoveFlags | MoveFlags.ParallelCopy | MoveFlags.Spill | MoveFlags.Internal,
+                        cycleBreak.Fragment),
                     generalScratchRegister,
                     floatScratchRegister,
                     canEmitDirectMemoryMove,
@@ -132,7 +158,7 @@ namespace Cnidaria.Cs
                     if (moves[i].Source.Equals(cycleBreak.Source))
                     {
                         moves[i] = moves[i].WithSource(
-                            RegisterOperand.ForSpillSlot(cycleBreak.Source.RegisterClass, scratchSlot),
+                            cycleSpill,
                             cycleBreak.SourceValue);
                     }
                 }
@@ -151,7 +177,7 @@ namespace Cnidaria.Cs
                 {
                     if (i == j)
                         continue;
-                    if (moves[j].Source.Equals(destination))
+                    if (moves[j].Source.Equals(destination) || (moves[j].Source.RegisterMask & destination.RegisterMask) != 0)
                     {
                         destinationIsStillSource = true;
                         break;
@@ -195,14 +221,15 @@ namespace Cnidaria.Cs
                 return;
             }
 
-            var moveClass = move.Destination.RegisterClass is RegisterClass.General or RegisterClass.Float
+            var moveClass = move.Destination.RegisterClass is RegisterClass.General or RegisterClass.Float or RegisterClass.Vector
                 ? move.Destination.RegisterClass
                 : move.Source.RegisterClass;
-            if (moveClass is not (RegisterClass.General or RegisterClass.Float))
+            if (moveClass is not (RegisterClass.General or RegisterClass.Float or RegisterClass.Vector))
                 throw new InvalidOperationException($"Invalid parallel-copy move without a concrete register class: {move.Source} -> {move.Destination}.");
 
             var scratch = RegisterOperand.ForRegister(
-                moveClass == RegisterClass.Float ? floatScratchRegister : generalScratchRegister);
+                moveClass == RegisterClass.Vector ? MachineRegister.V28 : moveClass == RegisterClass.Float ? floatScratchRegister : generalScratchRegister,
+                moveClass == RegisterClass.Vector ? 4 : 1);
 
             result.Add(GenTreeLirFactory.Move(
                 nextNodeId++,

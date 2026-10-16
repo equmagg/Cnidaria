@@ -35,7 +35,7 @@ namespace Cnidaria.Cs
         NativeUInt
     }
     /// <summary>Describes one protected region and its handler range</summary>
-    /// <remarks>A zero catch type token denotes catch-all and a negative token denotes finally</remarks>
+    /// <remarks>A zero catch type token denotes catch-all and a negative token denotes finally; a filter opens the handler range</remarks>
     public readonly struct ExceptionHandler
     {
         /// <summary>Inclusive start of the protected instruction range</summary>
@@ -48,15 +48,19 @@ namespace Cnidaria.Cs
         public readonly int HandlerEndPc;
         /// <summary>Catch type token or the sentinel identifying handler kind</summary>
         public readonly int CatchTypeToken;
+        /// <summary>Exclusive end of the filter, where the handler it guards begins, or -1 without a filter</summary>
+        public readonly int FilterEndPc;
         /// <summary>Creates an exception handler from protected and handler instruction ranges</summary>
-        public ExceptionHandler(int tryStartPc, int tryEndPc, int handlerStartPc, int handlerEndPc, int catchTypeToken)
+        public ExceptionHandler(int tryStartPc, int tryEndPc, int handlerStartPc, int handlerEndPc, int catchTypeToken, int filterEndPc = -1)
         {
             TryStartPc = tryStartPc;
             TryEndPc = tryEndPc;
             HandlerStartPc = handlerStartPc;
             HandlerEndPc = handlerEndPc;
             CatchTypeToken = catchTypeToken;
+            FilterEndPc = filterEndPc;
         }
+        public bool HasFilter => FilterEndPc >= 0;
     }
     internal enum GenStackKind : byte
     {
@@ -73,6 +77,11 @@ namespace Cnidaria.Cs
         ByRef,
         Value,
         Null,
+        Simd8,
+        Simd12,
+        Simd16,
+        Simd32,
+        Simd64,
     }
     internal enum GenTreeKind : ushort
     {
@@ -109,6 +118,7 @@ namespace Cnidaria.Cs
 
         Call,
         Intrinsic,
+        HWIntrinsic,
         IndirectCall,
         VirtualCall,
         NewObject,
@@ -157,8 +167,13 @@ namespace Cnidaria.Cs
         Throw,
         Rethrow,
         EndFinally,
+        // Runs a finally handler, which returns to the next block
+        CallFinally,
+        // Leaves a catch handler for a block outside it
+        CatchReturn,
+        EndFilter,
     }
-    // Operator of Unary and Binary trees; Leave marks a Branch that exits protected regions.
+    // Operator of Unary and Binary trees.
     internal enum GenTreeOperator : byte
     {
         None,
@@ -191,7 +206,6 @@ namespace Cnidaria.Cs
         PtrToByRef,
         FnPtrToPtr,
         PtrToFnPtr,
-        Leave,
         Min,
         Max,
         MinUn,
@@ -284,6 +298,9 @@ namespace Cnidaria.Cs
         Throw,
         Rethrow,
         EndFinally,
+        CallFinally,
+        CatchReturn,
+        EndFilter,
     }
     internal enum GenTreeBlockFlags : ushort
     {
@@ -643,7 +660,7 @@ namespace Cnidaria.Cs
 
             if (Kind == GenLocalKind.Temporary && !wasPromotedField && !wasPromotedParent)
             {
-                if (wasStructMaterializationTemp && IsPromotableStructMaterializationType(Type))
+                if (wasStructMaterializationTemp && IsPromotableStructMaterializationType(Type, StackKind))
                 {
                     MarkPromotedStructParent();
                 }
@@ -820,9 +837,10 @@ namespace Cnidaria.Cs
             LocalFlags = value ? (LocalFlags | flag) : (LocalFlags & ~flag);
         }
 
-        internal static bool IsPromotableStructMaterializationType(RuntimeType? type)
+        internal static bool IsPromotableStructMaterializationType(RuntimeType? type, GenStackKind stackKind)
         {
-            return type is not null &&
+            return !SimdTypes.IsSimdKind(stackKind) &&
+                   type is not null &&
                    type.IsValueType &&
                    type.Kind == RuntimeTypeKind.Struct &&
                    type.InlineArrayLength == 0 &&
@@ -964,13 +982,15 @@ namespace Cnidaria.Cs
     internal readonly struct GenTreeInternalRegister
     {
         public readonly MachineRegister Register;
+        public readonly int RegisterCount;
         public readonly RegisterClass RegisterClass;
         public readonly int RefPosition;
         public readonly GenTreeValueKey Owner;
 
-        public GenTreeInternalRegister(MachineRegister register, RegisterClass registerClass, int refPosition, GenTreeValueKey owner)
+        public GenTreeInternalRegister(MachineRegister register, RegisterClass registerClass, int refPosition, GenTreeValueKey owner, int registerCount = 1)
         {
             Register = register;
+            RegisterCount = registerCount;
             RegisterClass = registerClass;
             RefPosition = refPosition;
             Owner = owner;
@@ -1623,12 +1643,18 @@ namespace Cnidaria.Cs
             }
         }
     }
+    // The innermost try and handler holding a block, as indices into the method's exception handlers
+    internal readonly record struct GenTreeEhRegion(int TryIndex, int HandlerIndex)
+    {
+        public static GenTreeEhRegion None => new GenTreeEhRegion(-1, -1);
+    }
+
     internal sealed class GenTreeBlock
     {
         public int Id { get; }
         public int StartPc { get; }
         public int EndPcExclusive { get; }
-        public int RegionPc { get; }
+        public GenTreeEhRegion Region { get; }
         public int EntryStackDepth { get; }
         public int ExitStackDepth { get; }
         public GenTreeBlockJumpKind JumpKind { get; }
@@ -1652,12 +1678,12 @@ namespace Cnidaria.Cs
             ImmutableArray<GenTree> statements,
             ImmutableArray<int> successorBlockIds,
             ImmutableArray<int> successorPcs,
-            int regionPc = -1)
+            GenTreeEhRegion region)
         {
             Id = id;
             StartPc = startPc;
             EndPcExclusive = endPcExclusive;
-            RegionPc = regionPc >= 0 ? regionPc : startPc;
+            Region = region;
             EntryStackDepth = entryStackDepth;
             ExitStackDepth = exitStackDepth;
             JumpKind = jumpKind;
@@ -1801,7 +1827,7 @@ namespace Cnidaria.Cs
         }
 
 
-        internal GenTreeMethod CloneWithBlocks(ImmutableArray<GenTreeBlock> blocks)
+        internal GenTreeMethod CloneWithBlocks(ImmutableArray<GenTreeBlock> blocks, ImmutableArray<ExceptionHandler> exceptionHandlers = default)
         {
             blocks = blocks.IsDefault ? ImmutableArray<GenTreeBlock>.Empty : blocks;
 
@@ -1809,7 +1835,7 @@ namespace Cnidaria.Cs
                 Module,
                 RuntimeMethod,
                 Target,
-                ExceptionHandlers,
+                exceptionHandlers.IsDefault ? ExceptionHandlers : exceptionHandlers,
                 StaticDataBlob,
                 ArgTypes,
                 LocalTypes,
@@ -1923,7 +1949,7 @@ namespace Cnidaria.Cs
                 bool isCommonSubexpression = temp.Kind == GenTempKind.CommonSubexpression;
                 bool canPromoteTemp = temp.Kind is GenTempKind.StructMaterialization or GenTempKind.InlineArg or GenTempKind.InlineLocal or GenTempKind.InlineReturn;
                 bool promoteParent = canPromoteTemp &&
-                    LclVarDsc.IsPromotableStructMaterializationType(temp.Type);
+                    LclVarDsc.IsPromotableStructMaterializationType(temp.Type, temp.StackKind);
                 var category = promoteParent ? GenLocalCategory.PromotedStruct : GenLocalCategory.CompilerTemp;
                 var descriptor = new GenLocalDescriptor(lclNumBase + i, GenLocalKind.Temporary, temp.Index, temp.Type, temp.StackKind, category);
 

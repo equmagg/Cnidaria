@@ -1756,6 +1756,7 @@ namespace Cnidaria.Cs
         public override BoundNodeKind Kind => BoundNodeKind.CompoundAssignment;
         public bool IsChecked { get; }
         public BoundExpression Left { get; }
+        public BoundExpression Read { get; }
         public BoundBinaryOperatorKind OperatorKind { get; }
         public BoundExpression Value { get; }
         public MethodSymbol? OperatorMethodOpt { get; }
@@ -1763,6 +1764,7 @@ namespace Cnidaria.Cs
         public BoundCompoundAssignmentExpression(
             SyntaxNode syntax,
             BoundExpression left,
+            BoundExpression read,
             BoundBinaryOperatorKind operatorKind,
             BoundExpression value,
             MethodSymbol? operatorMethodOpt = null,
@@ -1771,6 +1773,7 @@ namespace Cnidaria.Cs
             : base(syntax)
         {
             Left = left;
+            Read = read;
             OperatorKind = operatorKind;
             Value = value;
 

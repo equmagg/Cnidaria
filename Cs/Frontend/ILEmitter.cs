@@ -331,12 +331,6 @@ namespace Cnidaria.Cs
                 bool hasFinally = t.FinallyBlockOpt is not null;
                 if (!hasCatches && !hasFinally)
                     throw new NotSupportedException("try statement must have at least one catch or a finally.");
-                for (int i = 0; i < t.CatchBlocks.Length; i++)
-                {
-                    if (t.CatchBlocks[i].FilterOpt is not null)
-                        throw new NotSupportedException("catch filters are not supported.");
-                }
-
                 var tryStart = _il.DefineLabel();
                 var after = _il.DefineLabel();
                 var afterCatches = hasCatches && hasFinally ? _il.DefineLabel() : after;
@@ -350,26 +344,33 @@ namespace Cnidaria.Cs
                     _il.MarkLabel(tryEnd);
                     int n = t.CatchBlocks.Length;
                     var handlerStarts = new ILLabel[n];
+                    var regionStarts = new ILLabel[n];
                     for (int i = 0; i < n; i++)
+                    {
                         handlerStarts[i] = _il.DefineLabel();
+                        regionStarts[i] = t.CatchBlocks[i].FilterOpt is null ? handlerStarts[i] : _il.DefineLabel();
+                    }
 
                     for (int i = 0; i < n; i++)
                     {
                         var c = t.CatchBlocks[i];
+                        if (c.FilterOpt is not null)
+                        {
+                            _il.MarkLabel(regionStarts[i]);
+                            EmitCatchFilter(c);
+                        }
                         _il.MarkLabel(handlerStarts[i]);
-                        if (c.ExceptionLocalOpt is not null)
+                        if (c.ExceptionLocalOpt is not null && c.FilterOpt is null)
                             _il.EmitLocal(ILOpCode.Stloc, GetOrCreateLocal(c.ExceptionLocalOpt));
                         else
                             _il.Emit(ILOpCode.Pop, 1, 0);
                         EmitRegion(c.Body);
                         _il.EmitBranch(ILOpCode.Leave, afterCatches, 0);
-                        _il.AddExceptionClause(
-                            ILExceptionClauseKind.Catch,
-                            tryStart,
-                            tryEnd,
-                            handlerStarts[i],
-                            i + 1 < n ? handlerStarts[i + 1] : afterCatches,
-                            _tokens.GetTypeToken(c.ExceptionType));
+                        var handlerEnd = i + 1 < n ? regionStarts[i + 1] : afterCatches;
+                        if (c.FilterOpt is not null)
+                            _il.AddFilterClause(tryStart, tryEnd, regionStarts[i], handlerStarts[i], handlerEnd);
+                        else
+                            _il.AddExceptionClause(ILExceptionClauseKind.Catch, tryStart, tryEnd, handlerStarts[i], handlerEnd, _tokens.GetTypeToken(c.ExceptionType));
                     }
                     if (hasFinally)
                     {
@@ -389,6 +390,37 @@ namespace Cnidaria.Cs
                     return;
                 }
                 _il.MarkLabel(after);
+            }
+            private void EmitCatchFilter(BoundCatchBlock c)
+            {
+                bool typed = c.ExceptionType.SpecialType != SpecialType.System_Object;
+                var decide = _il.DefineLabel();
+                var declined = typed ? _il.DefineLabel() : default;
+                if (typed)
+                {
+                    var matched = _il.DefineLabel();
+                    _il.EmitToken(ILOpCode.Isinst, _tokens.GetTypeToken(c.ExceptionType), 1, 1);
+                    _il.Emit(ILOpCode.Dup, 1, 2);
+                    _il.EmitBranch(ILOpCode.Brtrue, matched, 1);
+                    _il.Emit(ILOpCode.Pop, 1, 0);
+                    _il.EmitBranch(ILOpCode.Br, declined, 0);
+                    _il.MarkLabel(matched);
+                }
+                if (c.ExceptionLocalOpt is not null)
+                    _il.EmitLocal(ILOpCode.Stloc, GetOrCreateLocal(c.ExceptionLocalOpt));
+                else
+                    _il.Emit(ILOpCode.Pop, 1, 0);
+                EmitExpression(c.FilterOpt!, EmitMode.Value);
+                _il.EmitI4(0);
+                _il.Emit(ILOpCode.Cgt_Un, 2, 1);
+                _il.EmitBranch(ILOpCode.Br, decide, 0);
+                if (typed)
+                {
+                    _il.MarkLabel(declined);
+                    _il.EmitI4(0);
+                }
+                _il.MarkLabel(decide);
+                _il.Emit(ILOpCode.Endfilter, 1, 0);
             }
             private void EmitLocalDeclaration(BoundLocalDeclarationStatement ld)
             {
@@ -1967,6 +1999,26 @@ namespace Cnidaria.Cs
                         _il.Emit(ILOpCode.Ceq, 2, 1);
                         break;
 
+                    case "IsAddressGreaterThan" when ps.Length == 2 && ps[0].Type is ByRefTypeSymbol && ps[1].Type is ByRefTypeSymbol:
+                        EmitExpression(args[0], EmitMode.Value);
+                        EmitExpression(args[1], EmitMode.Value);
+                        _il.Emit(ILOpCode.Cgt_Un, 2, 1);
+                        break;
+
+                    case "IsAddressLessThan" when ps.Length == 2 && ps[0].Type is ByRefTypeSymbol && ps[1].Type is ByRefTypeSymbol:
+                        EmitExpression(args[0], EmitMode.Value);
+                        EmitExpression(args[1], EmitMode.Value);
+                        _il.Emit(ILOpCode.Clt_Un, 2, 1);
+                        break;
+
+                    case "SkipInit" when ps.Length == 1 && ps[0].Type is ByRefTypeSymbol:
+                        if (args[0] is not BoundRefExpression { Operand: BoundLocalExpression or BoundParameterExpression })
+                        {
+                            EmitExpression(args[0], EmitMode.Value);
+                            _il.Emit(ILOpCode.Pop, 1, 0);
+                        }
+                        return true;
+
                     default:
                         return false;
                 }
@@ -2172,6 +2224,15 @@ namespace Cnidaria.Cs
                     EmitExpression(conv.Operand, EmitMode.Discard);
                     if (mode == EmitMode.Value)
                         EmitConstantValue(conv.Type, null);
+                    return;
+                }
+                if (conv.ConstantValueOpt.HasValue &&
+                    conv.Conversion.Kind is ConversionKind.ImplicitNumeric or ConversionKind.ExplicitNumeric or ConversionKind.ImplicitConstant &&
+                    conv.Operand.ConstantValueOpt.Value is sbyte or byte or short or ushort or int or uint or long or ulong or char &&
+                    conv.ConstantValueOpt.Value is sbyte or byte or short or ushort or int or uint or long or ulong or char or float or double)
+                {
+                    if (mode == EmitMode.Value)
+                        EmitConstantValue(conv.Type, conv.ConstantValueOpt.Value);
                     return;
                 }
                 EmitExpression(conv.Operand, mode);

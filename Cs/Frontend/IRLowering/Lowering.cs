@@ -222,7 +222,7 @@ namespace Cnidaria.Cs
             protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
                 => node;
 
-            protected override BoundExpression RewriteExpression(BoundExpression node)
+            protected override BoundExpression RewriteExpressionCore(BoundExpression node)
             {
                 switch (node)
                 {
@@ -235,7 +235,7 @@ namespace Cnidaria.Cs
                         return node;
 
                     default:
-                        return base.RewriteExpression(node);
+                        return base.RewriteExpressionCore(node);
                 }
             }
 
@@ -1167,7 +1167,7 @@ namespace Cnidaria.Cs
                         RewriteExpression(node.Initializer));
                 }
 
-                protected override BoundExpression RewriteExpression(BoundExpression node)
+                protected override BoundExpression RewriteExpressionCore(BoundExpression node)
                 {
                     if (node is BoundLocalExpression local)
                     {
@@ -1190,7 +1190,7 @@ namespace Cnidaria.Cs
                         return Field(node.Syntax, This(node.Syntax, _info), _info.ThisField);
                     }
 
-                    return base.RewriteExpression(node);
+                    return base.RewriteExpressionCore(node);
                 }
 
                 protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
@@ -5360,7 +5360,7 @@ namespace Cnidaria.Cs
                 {
                     var rewrittenTarget = RewriteExpression(node.Target);
 
-                    if (rewrittenTarget is BoundLocalExpression || rewrittenTarget is BoundParameterExpression)
+                    if (rewrittenTarget is BoundLocalExpression or BoundParameterExpression or BoundClosureAccessExpression)
                         return LowerSimpleIncrementDecrement(node, rewrittenTarget);
 
                     return LowerIncrementDecrementWithSpill(node, rewrittenTarget);
@@ -5520,9 +5520,9 @@ namespace Cnidaria.Cs
 
                 var rewrittenLeft2 = RewriteExpression(node.Left);
 
-                if (rewrittenLeft2 is BoundLocalExpression || rewrittenLeft2 is BoundParameterExpression)
+                if (rewrittenLeft2 is BoundLocalExpression or BoundParameterExpression or BoundClosureAccessExpression)
                 {
-                    var valueWithRewrittenLeft = ReplaceExpressionByReference(node.Value, node.Left, rewrittenLeft2);
+                    var valueWithRewrittenLeft = ReplaceExpressionByReference(node.Value, node.Read, rewrittenLeft2);
                     var rewrittenValue = RewriteExpression(valueWithRewrittenLeft);
                     return new BoundAssignmentExpression(node.Syntax, rewrittenLeft2, rewrittenValue);
                 }
@@ -5678,7 +5678,7 @@ namespace Cnidaria.Cs
 
                 var rewrittenLeft = RewriteExpression(node.Left);
 
-                if (rewrittenLeft is BoundLocalExpression || rewrittenLeft is BoundParameterExpression)
+                if (rewrittenLeft is BoundLocalExpression or BoundParameterExpression or BoundClosureAccessExpression)
                 {
                     var locals = ImmutableArray.CreateBuilder<LocalSymbol>();
                     var sideEffects = ImmutableArray.CreateBuilder<BoundStatement>();
@@ -5936,7 +5936,7 @@ namespace Cnidaria.Cs
 
                 var getCall = new BoundCallExpression(node.Syntax, receiver, getMethod, ImmutableArray<BoundExpression>.Empty);
 
-                var valueWithGet = ReplaceExpressionByReference(node.Value, node.Left, getCall);
+                var valueWithGet = ReplaceExpressionByReference(node.Value, node.Read, getCall);
                 var rewrittenValue = RewriteExpression(valueWithGet);
 
                 var valueTemp = CreateTempLocal(node.Type);
@@ -6076,7 +6076,7 @@ namespace Cnidaria.Cs
                             $"Compound assignment lowering for lvalue '{rewrittenLeft.GetType().Name}' is not implemented.");
                 }
 
-                var valueWithSpilledLValue = ReplaceExpressionByReference(node.Value, node.Left, lvalue);
+                var valueWithSpilledLValue = ReplaceExpressionByReference(node.Value, node.Read, lvalue);
                 var rewrittenValueWithSpilledLValue = RewriteExpression(valueWithSpilledLValue);
 
                 var assignment = new BoundAssignmentExpression(node.Syntax, lvalue, rewrittenValueWithSpilledLValue);
@@ -6299,7 +6299,7 @@ namespace Cnidaria.Cs
 
                 var getCall = new BoundCallExpression(node.Syntax, receiver, getMethod, indexArgs);
 
-                var valueWithGet = ReplaceExpressionByReference(node.Value, node.Left, getCall);
+                var valueWithGet = ReplaceExpressionByReference(node.Value, node.Read, getCall);
                 var rewrittenValue = RewriteExpression(valueWithGet);
 
                 var valueTemp = CreateTempLocal(node.Type);
@@ -6484,12 +6484,12 @@ namespace Cnidaria.Cs
                     _from = from;
                     _to = to;
                 }
-                protected override BoundExpression RewriteExpression(BoundExpression node)
+                protected override BoundExpression RewriteExpressionCore(BoundExpression node)
                 {
                     if (ReferenceEquals(node, _from))
                         return _to;
 
-                    return base.RewriteExpression(node);
+                    return base.RewriteExpressionCore(node);
                 }
             }
         }

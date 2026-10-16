@@ -517,8 +517,7 @@ namespace Cnidaria.Cs
 
             uint paramCount = r.ReadCompressedUInt();
 
-            // Return type must be void
-            if ((SigElementType)r.ReadByte() != SigElementType.VOID)
+            if ((SigElementType)r.ReadByte() is not (SigElementType.VOID or SigElementType.I4))
                 return false;
 
             if (paramCount == 0)

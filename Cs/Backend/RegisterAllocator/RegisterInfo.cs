@@ -199,6 +199,46 @@ namespace Cnidaria.Cs
             return target.Architecture == TargetArchitectureKind.Arm64;
         }
 
+        public static UInt128 MaskOf(MachineRegister register)
+            => register == MachineRegister.Invalid ? 0 : (UInt128)1 << (int)register;
+
+        public static UInt128 MaskOf(ImmutableArray<MachineRegister> registers)
+        {
+            UInt128 mask = 0;
+            foreach (MachineRegister register in registers)
+                mask |= MaskOf(register);
+            return mask;
+        }
+
+        public static UInt128 GroupMask(MachineRegister register, int count)
+            => register == MachineRegister.Invalid ? 0 : (((UInt128)1 << count) - 1) << (int)register;
+
+        public static UInt128 DefaultMaskForClass(RegisterClass registerClass)
+            => registerClass == RegisterClass.Vector ? (UInt128)uint.MaxValue << 64 : MachineRegisters.DefaultMaskForClass(registerClass);
+
+        public static string FormatMask(UInt128 mask)
+        {
+            var names = new System.Collections.Generic.List<string>();
+            for (int i = 0; i < 96; i++)
+            {
+                if ((mask & ((UInt128)1 << i)) != 0)
+                    names.Add(MachineRegisters.Format((MachineRegister)i));
+            }
+            return "{" + string.Join(",", names) + "}";
+        }
+
+        public static int VectorRegisterCount(int size) => Math.Max(1, (size + 15) / 16);
+
+        public static ImmutableArray<MachineRegister> AllocatableVectorRegisters(TargetInfo target)
+        {
+            if (!target.IsRiscV || !HWIntrinsics.HasFeature(target, TargetArchitectureFeatures.RiscVV))
+                return ImmutableArray<MachineRegister>.Empty;
+            var registers = ImmutableArray.CreateBuilder<MachineRegister>(27);
+            for (int i = 1; i < 28; i++)
+                registers.Add((MachineRegister)((int)MachineRegister.V0 + i));
+            return registers.MoveToImmutable();
+        }
+
         public static int AbiFloatingRegisterSize(TargetInfo target)
         {
             ValidateTarget(target);
@@ -321,7 +361,8 @@ namespace Cnidaria.Cs
                 return (int)register >= (int)MachineRegister.F8 && (int)register <= (int)MachineRegister.F15;
             }
 
-            return MachineRegisters.IsCalleeSaved(register);
+            return target.IsRiscV && MachineRegisters.GetClass(register) == RegisterClass.Vector
+                ? false : MachineRegisters.IsCalleeSaved(register);
         }
 
         public static bool IsCallerSaved(TargetInfo target, MachineRegister register)
@@ -337,6 +378,8 @@ namespace Cnidaria.Cs
             ValidateTarget(target);
             if (!IsAvailable(target, register))
                 return true;
+            if (target.IsRiscV && MachineRegisters.GetClass(register) == RegisterClass.Vector)
+                return register == MachineRegister.V0 || register >= MachineRegister.V28;
             if (target.Architecture == TargetArchitectureKind.I386)
                 return register is MachineRegister.Esp or MachineRegister.Ebp;
             if (target.Architecture == TargetArchitectureKind.X86_64)
@@ -373,6 +416,26 @@ namespace Cnidaria.Cs
                 RegisterClass.Vector => TargetArchitecture.VectorRegisterSize,
                 _ => target.GeneralRegisterSize,
             };
+        }
+
+        // A live vector value can be as wide as the target's vectors, beyond what the callee-saved slots keep
+        public static int LiveRegisterSaveSize(TargetInfo target, MachineRegister register)
+            => target.IsX86 && MachineRegisters.GetClass(register) == RegisterClass.Float
+                ? SimdTypes.MaxSize(target)
+                : RegisterSaveSize(target, register);
+
+        // Callee-saved xmm registers keep only their low 128 bits across a call
+        public static UInt128 CallClobberedVectorUpperMask(TargetInfo target)
+        {
+            if (!target.IsX86 || SimdTypes.MaxSize(target) <= 16)
+                return 0;
+            UInt128 mask = 0;
+            foreach (MachineRegister register in AllocatableFloatingRegisters(target))
+            {
+                if (IsCalleeSaved(target, register))
+                    mask |= RegisterInfo.MaskOf(register);
+            }
+            return mask;
         }
 
         public static int RegisterSaveAlignment(TargetInfo target, MachineRegister register)
@@ -547,15 +610,25 @@ namespace Cnidaria.Cs
             return MachineRegister.Invalid;
         }
 
-        public static ulong ByteAddressableRegisterMask(TargetInfo target)
+        public static MachineRegister DestinationIndexRegister(TargetInfo target)
+        {
+            ValidateTarget(target);
+            if (target.Architecture == TargetArchitectureKind.I386)
+                return MachineRegister.Edi;
+            if (target.Architecture == TargetArchitectureKind.X86_64)
+                return IsWindowsX64(target) ? MachineRegister.X9 : MachineRegister.X1;
+            return MachineRegister.Invalid;
+        }
+
+        public static UInt128 ByteAddressableRegisterMask(TargetInfo target)
         {
             ValidateTarget(target);
             if (target.Architecture != TargetArchitectureKind.I386)
                 return 0;
-            return MachineRegisters.MaskOf(MachineRegister.X0) |
-                   MachineRegisters.MaskOf(MachineRegister.X1) |
-                   MachineRegisters.MaskOf(MachineRegister.X2) |
-                   MachineRegisters.MaskOf(MachineRegister.X3);
+            return RegisterInfo.MaskOf(MachineRegister.X0) |
+                   RegisterInfo.MaskOf(MachineRegister.X1) |
+                   RegisterInfo.MaskOf(MachineRegister.X2) |
+                   RegisterInfo.MaskOf(MachineRegister.X3);
         }
 
         public static MachineRegister StackPointer(TargetInfo target)
@@ -622,8 +695,8 @@ namespace Cnidaria.Cs
             return ImmutableArray<MachineRegister>.Empty;
         }
 
-        public static ulong CodegenScratchMask(TargetInfo target)
-            => MachineRegisters.MaskOf(CodegenScratchRegisters(target));
+        public static UInt128 CodegenScratchMask(TargetInfo target)
+            => RegisterInfo.MaskOf(CodegenScratchRegisters(target));
 
         public static MachineRegister ParallelCopyScratch(TargetInfo target, RegisterClass registerClass)
         {
@@ -655,6 +728,8 @@ namespace Cnidaria.Cs
                     _ => MachineRegister.Invalid,
                 };
             }
+            if (target.IsRiscV && registerClass == RegisterClass.Vector)
+                return MachineRegister.V28;
             return MachineRegisters.GetParallelCopyScratch(registerClass);
         }
 
@@ -679,7 +754,7 @@ namespace Cnidaria.Cs
             {
                 RegisterClass.General => MachineRegisters.TreeScratchGprs,
                 RegisterClass.Float => MachineRegisters.TreeScratchFprs,
-                RegisterClass.Vector => MachineRegisters.TreeScratchVprs,
+                RegisterClass.Vector => ImmutableArray.Create(MachineRegister.V28),
                 _ => ImmutableArray<MachineRegister>.Empty,
             };
         }

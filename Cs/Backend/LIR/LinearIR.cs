@@ -1,3 +1,4 @@
+using Cnidaria.X86;
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
@@ -210,19 +211,21 @@ namespace Cnidaria.Cs
         public readonly GenTreeLinearFlags Flags;
         public readonly byte InternalGeneralRegisters;
         public readonly byte InternalFloatRegisters;
+        public readonly byte InternalVectorRegisters;
 
-        public GenTreeLinearLoweringInfo(GenTreeLinearFlags flags, byte internalGeneralRegisters, byte internalFloatRegisters)
+        public GenTreeLinearLoweringInfo(GenTreeLinearFlags flags, byte internalGeneralRegisters, byte internalFloatRegisters, byte internalVectorRegisters = 0)
         {
             Flags = flags;
             InternalGeneralRegisters = internalGeneralRegisters;
             InternalFloatRegisters = internalFloatRegisters;
+            InternalVectorRegisters = internalVectorRegisters;
         }
 
         public bool HasFlag(GenTreeLinearFlags flag) => (Flags & flag) != 0;
 
         public override string ToString()
         {
-            if (Flags == GenTreeLinearFlags.None && InternalGeneralRegisters == 0 && InternalFloatRegisters == 0)
+            if (Flags == GenTreeLinearFlags.None && InternalGeneralRegisters == 0 && InternalFloatRegisters == 0 && InternalVectorRegisters == 0)
                 return string.Empty;
 
             var sb = new StringBuilder();
@@ -237,6 +240,11 @@ namespace Cnidaria.Cs
             {
                 if (sb.Length != 0) sb.Append(' ');
                 sb.Append("floatTmp=").Append(InternalFloatRegisters);
+            }
+            if (InternalVectorRegisters != 0)
+            {
+                if (sb.Length != 0) sb.Append(' ');
+                sb.Append("vectorTmp=").Append(InternalVectorRegisters);
             }
             return sb.ToString();
         }
@@ -292,7 +300,8 @@ namespace Cnidaria.Cs
             byte internalGeneral = InternalGeneralRegisterCount(source, result, memoryAccess);
             byte internalFloat = InternalFloatRegisterCount(source, result);
 
-            return new GenTreeLinearLoweringInfo(flags, internalGeneral, internalFloat);
+            return new GenTreeLinearLoweringInfo(flags, internalGeneral, internalFloat,
+                _target.IsRiscV && source.Kind == GenTreeKind.HWIntrinsic ? RiscVHWIntrinsicVectorTemps(source) : (byte)0);
         }
         public LinearMemoryAccess ClassifyMemoryAccess(GenTree source) => ClassifyMemoryAccess(source, _target);
         internal static LinearMemoryAccess ClassifyMemoryAccess(GenTree source, TargetInfo target)
@@ -345,6 +354,11 @@ namespace Cnidaria.Cs
                     GenStackKind.Ptr => pointerSize,
                     GenStackKind.ByRef => pointerSize,
                     GenStackKind.Null => pointerSize,
+                    GenStackKind.Simd8 => 8,
+                    GenStackKind.Simd12 => 12,
+                    GenStackKind.Simd16 => 16,
+                    GenStackKind.Simd32 => 32,
+                    GenStackKind.Simd64 => 64,
                     GenStackKind.Void => 0,
                     _ => pointerSize,
                 };
@@ -367,6 +381,11 @@ namespace Cnidaria.Cs
                     GenStackKind.Ptr => pointerSize,
                     GenStackKind.ByRef => pointerSize,
                     GenStackKind.Null => pointerSize,
+                    GenStackKind.Simd8 => 8,
+                    GenStackKind.Simd12 => 16,
+                    GenStackKind.Simd16 => 16,
+                    GenStackKind.Simd32 => 32,
+                    GenStackKind.Simd64 => 64,
                     GenStackKind.Void => 1,
                     _ => pointerSize,
                 };
@@ -381,18 +400,18 @@ namespace Cnidaria.Cs
             static RuntimeType? LocalLikeStorageType(GenTree source, int operandIndex)
                 => source.LocalDescriptor?.Type ?? OperandType(source, operandIndex) ?? source.RuntimeType ?? source.Type;
 
-            static GenStackKind LocalLikeStorageKind(GenTree source, RuntimeType? storageType, int operandIndex)
+            GenStackKind LocalLikeStorageKind(GenTree source, RuntimeType? storageType, int operandIndex)
                 => source.LocalDescriptor is not null
                     ? source.LocalDescriptor.StackKind
                     : storageType is not null
-                        ? MachineAbi.StackKindForType(storageType)
+                        ? MachineAbi.StackKindForType(storageType, target)
                         : OperandStackKind(source, operandIndex);
 
             static RuntimeType? StoreTargetType(GenTree source, int operandIndex)
                 => source.Field?.FieldType ?? source.RuntimeType ?? source.Type ?? OperandType(source, operandIndex);
 
-            static GenStackKind StoreTargetKind(GenTree source, RuntimeType? storageType, int operandIndex)
-                => storageType is not null ? MachineAbi.StackKindForType(storageType) : OperandStackKind(source, operandIndex);
+            GenStackKind StoreTargetKind(GenTree source, RuntimeType? storageType, int operandIndex)
+                => storageType is not null ? MachineAbi.StackKindForType(storageType, target) : OperandStackKind(source, operandIndex);
 
             static LinearMemoryAccessFlags NullCheckFlag(GenTree source)
                 => (source.Flags & GenTreeFlags.NullCheckEliminated) == 0
@@ -581,6 +600,8 @@ namespace Cnidaria.Cs
         // where the remaining non-call operations are register preserving.
         private bool EmitsReturningHelperCall(GenTree source)
         {
+            if (IsCallFinally(source))
+                return true;
             if (_target.IsRegisterBytecode)
                 return false;
 
@@ -622,7 +643,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.Rethrow)
                 return true;
 
-            if (source.Kind == GenTreeKind.Branch && source.Operator == GenTreeOperator.Leave)
+            if (IsCallFinally(source))
                 return true;
 
             if (source.Kind == GenTreeKind.Binary)
@@ -663,8 +684,13 @@ namespace Cnidaria.Cs
             return false;
         }
 
+        private static bool IsCallFinally(GenTree source)
+            => source.Kind == GenTreeKind.CallFinally;
+
         public bool IsGcSafePoint(GenTree source, int blockId = -1)
         {
+            if (IsCallFinally(source))
+                return true;
             if (IsAbiCall(source))
             {
                 if (source.Kind == GenTreeKind.Intrinsic && RuntimeIntrinsics.IsNoGcSafePoint(source.IntrinsicId))
@@ -723,6 +749,8 @@ namespace Cnidaria.Cs
                 GenTreeKind.Return => false,
                 GenTreeKind.Rethrow => false,
                 GenTreeKind.EndFinally => false,
+                GenTreeKind.CallFinally => false,
+                GenTreeKind.CatchReturn => false,
                 _ => true,
             };
         }
@@ -738,11 +766,12 @@ namespace Cnidaria.Cs
                 GenTreeKind.PointerDiff => 1,
                 GenTreeKind.UnboxAny => MultiRegisterLoadGeneralScratchCount(result, needsAddressScratch: true),
                 GenTreeKind.Field => MultiRegisterLoadGeneralScratchCount(result, needsAddressScratch: true),
-                GenTreeKind.StaticField => MultiRegisterLoadGeneralScratchCount(result, needsAddressScratch: true),
+                GenTreeKind.StaticField => MultiRegisterLoadGeneralScratchCount(result, needsAddressScratch: true) + BlockCopyScratchCount(result),
                 GenTreeKind.LoadIndirect => MultiRegisterLoadGeneralScratchCount(result, needsAddressScratch: true),
                 GenTreeKind.StoreIndirect => MultiRegisterStoreGeneralScratchCount(MultiRegisterOperandValue(source, 1), needsAddressScratch: true),
                 GenTreeKind.StoreField => MultiRegisterStoreGeneralScratchCount(MultiRegisterOperandValue(source, 1), needsAddressScratch: true),
-                GenTreeKind.StoreStaticField => MultiRegisterStoreGeneralScratchCount(MultiRegisterOperandValue(source, 0), needsAddressScratch: true),
+                GenTreeKind.StoreStaticField => MultiRegisterStoreGeneralScratchCount(MultiRegisterOperandValue(source, 0), needsAddressScratch: true) +
+                    BlockCopyScratchCount(source.Operands.Length == 0 ? null : source.Operands[0].RegisterResult ?? source.Operands[0]),
 
                 GenTreeKind.Box => MultiRegisterStoreGeneralScratchCount(MultiRegisterOperandValue(source, 0), needsAddressScratch: true),
 
@@ -772,6 +801,9 @@ namespace Cnidaria.Cs
 
             if ((memoryAccess.Flags & LinearMemoryAccessFlags.RequiresWriteBarrier) != 0)
                 count++;
+
+            if (_target.IsX86 && source.Kind == GenTreeKind.HWIntrinsic && X86Intrinsics.IsX86(source))
+                count += X86IntrinsicGeneralTemps(source);
 
             if (count > byte.MaxValue)
                 throw new InvalidOperationException($"Node {source.Id} requires too many internal general registers.");
@@ -819,6 +851,197 @@ namespace Cnidaria.Cs
             }
         }
 
+        internal static byte RiscVHWIntrinsicVectorTemps(GenTree node)
+            => HWIntrinsics.Id(node) switch
+            {
+                HWIntrinsicId.CreateElements when !HWIntrinsics.HasConstantElements(node) => 2,
+                HWIntrinsicId.WithElement or HWIntrinsicId.Combine or HWIntrinsicId.ZeroExtend or
+                HWIntrinsicId.WithLower or HWIntrinsicId.WithUpper or HWIntrinsicId.Sum => 2,
+                HWIntrinsicId.GetElement or HWIntrinsicId.GetUpper or HWIntrinsicId.AndNot or HWIntrinsicId.ConditionalSelect => 1,
+                HWIntrinsicId.Abs when !HWIntrinsics.IsFloating(HWIntrinsics.BaseKind(node)) => 1,
+                _ => 0,
+            };
+
+        internal static int X86HWIntrinsicFloatTemps(GenTree node, TargetInfo target)
+        {
+            if (X86Intrinsics.IsX86(node))
+                return X86IntrinsicFloatTemps(node);
+
+            RuntimePrimitiveKind kind = HWIntrinsics.BaseKind(node);
+            int elementSize = HWIntrinsics.ElementSize(kind);
+            bool floating = HWIntrinsics.IsFloating(kind);
+            bool unsigned = HWIntrinsics.IsUnsigned(kind);
+            bool ssse3 = HWIntrinsics.HasFeature(target, TargetArchitectureFeatures.X86Ssse3);
+            bool sse41 = HWIntrinsics.HasFeature(target, TargetArchitectureFeatures.X86Sse41);
+            int size = HWIntrinsics.SimdSize(node);
+            bool maskCompare = size == 64;
+            switch (HWIntrinsics.Id(node))
+            {
+                case HWIntrinsicId.CreateElements:
+                    if (HWIntrinsics.HasConstantElements(node))
+                        return 0;
+                    if (floating)
+                        return kind == RuntimePrimitiveKind.Single && node.Operands.Length >= 3 ? 2 : 1;
+                    if (elementSize == 2 || sse41)
+                        return 0;
+                    return elementSize == 8 ? 2 : 3;
+                case HWIntrinsicId.CreateScalar:
+                    return kind == RuntimePrimitiveKind.Single && !sse41 ? 1 : 0;
+                case HWIntrinsicId.GetElement:
+                    if (node.Operands[1].Int32 >= 16 / elementSize)
+                        return 1;
+                    return !floating && elementSize >= 4 && !sse41 && node.Operands[1].Int32 != 0 ? 1 : 0;
+                case HWIntrinsicId.WithElement:
+                    if (size > 16)
+                        return 1;
+                    return !floating && elementSize == 8 && !sse41 ? 2 : 0;
+                case HWIntrinsicId.Multiply:
+                    return !floating && elementSize == 4 && !sse41 ? 3 : 0;
+                case HWIntrinsicId.Abs:
+                    if (floating || ssse3 && elementSize <= 4 || maskCompare)
+                        return 0;
+                    return elementSize <= 2 ? 1 : 2;
+                case HWIntrinsicId.Min:
+                case HWIntrinsicId.Max:
+                    if (maskCompare || kind is RuntimePrimitiveKind.UInt8 or RuntimePrimitiveKind.Int16 ||
+                        sse41 && kind is RuntimePrimitiveKind.Int8 or RuntimePrimitiveKind.UInt16 or RuntimePrimitiveKind.Int32 or RuntimePrimitiveKind.UInt32)
+                    {
+                        return 0;
+                    }
+                    return kind == RuntimePrimitiveKind.UInt16 || !unsigned ? 2 : 3;
+                case HWIntrinsicId.ConditionalSelect:
+                    return 1;
+                case HWIntrinsicId.EqualsAll:
+                    return maskCompare ? 0 : 1;
+                case HWIntrinsicId.CompareEqual:
+                    return !maskCompare && !floating && elementSize == 8 && !sse41 ? 2 : 0;
+                case HWIntrinsicId.EqualsAny:
+                    if (maskCompare)
+                        return 0;
+                    return !floating && elementSize == 8 && !sse41 ? 2 : 1;
+                case HWIntrinsicId.CompareGreaterThan:
+                case HWIntrinsicId.CompareGreaterThanOrEqual:
+                case HWIntrinsicId.CompareLessThan:
+                case HWIntrinsicId.CompareLessThanOrEqual:
+                    return !maskCompare && !floating && unsigned ? 2 : 0;
+                case HWIntrinsicId.ShiftLeft:
+                case HWIntrinsicId.ShiftRightArithmetic:
+                case HWIntrinsicId.ShiftRightLogical:
+                    return node.Operands[1].Kind == GenTreeKind.ConstI4 ? 0 : 2;
+                case HWIntrinsicId.ExtractMostSignificantBits:
+                    return !maskCompare && elementSize == 2 ? 1 : 0;
+                case HWIntrinsicId.Sum:
+                    {
+                        if (elementSize == 1 || size > 16)
+                            return 2;
+                        int lanes = size / elementSize;
+                        return lanes >= 3 ? 2 : lanes == 2 ? 1 : 0;
+                    }
+                default:
+                    return 0;
+            }
+        }
+
+        // A temp that must differ from the result is requested twice, as the allocator may hand one out as the result
+        private static int X86IntrinsicFloatTemps(GenTree node)
+        {
+            switch (X86Intrinsics.Info(node).Form)
+            {
+                case X86IntrinsicForm.Gather:
+                case X86IntrinsicForm.GatherMask:
+                    return 2;
+                case X86IntrinsicForm.Compare:
+                    return X86Intrinsics.IsCompareSwap(node, out bool scalar) && scalar ? 2 : 0;
+                case X86IntrinsicForm.Shift:
+                    return X86Intrinsics.ImmediateOperandIndex(node) == 1 && node.Operands[1].Kind != GenTreeKind.ConstI4 &&
+                        X86ShiftHasRegisterCount(X86Intrinsics.Info(node).Instruction(HWIntrinsics.BaseKind(node))) ? 2 : 0;
+                default:
+                    return 0;
+            }
+        }
+
+        private static int X86IntrinsicGeneralTemps(GenTree node)
+        {
+            var info = X86Intrinsics.Info(node);
+            if (info.Form == X86IntrinsicForm.CompareFlags)
+                return X86Intrinsics.CompareFlagsNeedParity(node) ? 2 : 0;
+            if (info.Form == X86IntrinsicForm.DivRem)
+                return HWIntrinsics.BaseKind(node) == RuntimePrimitiveKind.Int64 ? 3 : 1;
+            if (info.Form == X86IntrinsicForm.BitFieldExtract)
+                return node.Operands.Length == 3 ? 1 : 0;
+            if (info.Form == X86IntrinsicForm.MultiplyNoFlags)
+                return node.Operands.Length == 3 ? 2 : 0;
+            int rounding = X86Intrinsics.RoundingOperandIndex(node);
+            if (rounding >= 0)
+                return node.Operands[rounding].Kind == GenTreeKind.ConstI4 ? 0 : 2;
+            int immediate = X86Intrinsics.ImmediateOperandIndex(node);
+            if (immediate < 0 || node.Operands[immediate].Kind == GenTreeKind.ConstI4)
+                return 0;
+            if (X86Intrinsics.IsVex(info))
+                return 2;
+            return info.Form == X86IntrinsicForm.Shift && X86ShiftHasRegisterCount(info.Instruction(HWIntrinsics.BaseKind(node))) ? 0 : 2;
+        }
+
+        internal static bool X86ShiftHasRegisterCount(X86InstrKind instruction)
+            => instruction is not (X86InstrKind.Pslldq or X86InstrKind.Psrldq);
+
+        private static bool X86IntrinsicDelaysFree(GenTree node, int operandIndex)
+        {
+            var info = X86Intrinsics.Info(node);
+            switch (info.Form)
+            {
+                case X86IntrinsicForm.Simple:
+                    {
+                        int values = node.Operands.Length - (X86Intrinsics.ImmediateOperandIndex(node) >= 0 ? 1 : 0);
+                        return values == 2 && operandIndex == 1 && !X86Intrinsics.IsCommutative(node);
+                    }
+                case X86IntrinsicForm.Scalar:
+                case X86IntrinsicForm.BlendVariable:
+                case X86IntrinsicForm.Crc32:
+                    return operandIndex == 1;
+                case X86IntrinsicForm.Shift:
+                    return operandIndex == 1 && SimdTypes.IsSimdKind(node.Operands[1].StackKind);
+                case X86IntrinsicForm.Compare:
+                    if (X86Intrinsics.IsCompareSwap(node, out bool scalar))
+                        return !scalar && operandIndex == 0;
+                    return operandIndex == 1 && !X86Intrinsics.IsCommutative(node);
+                case X86IntrinsicForm.Tied:
+                case X86IntrinsicForm.GatherMask:
+                    return operandIndex != 0;
+                case X86IntrinsicForm.Gather:
+                    return operandIndex == 1;
+                case X86IntrinsicForm.MultiplyNoFlags:
+                case X86IntrinsicForm.MaskedMerge:
+                    return operandIndex == 2;
+                default:
+                    return false;
+            }
+        }
+
+        // Operands still read after the result register has been written
+        internal static bool X86HWIntrinsicDelaysFree(GenTree node, int operandIndex)
+        {
+            if (X86Intrinsics.IsX86(node))
+                return X86IntrinsicDelaysFree(node, operandIndex);
+
+            RuntimePrimitiveKind kind = HWIntrinsics.BaseKind(node);
+            bool floating = HWIntrinsics.IsFloating(kind);
+            bool signedInteger = !floating && !HWIntrinsics.IsUnsigned(kind);
+            return HWIntrinsics.Id(node) switch
+            {
+                HWIntrinsicId.Subtract or HWIntrinsicId.Divide or HWIntrinsicId.SubtractSaturate or
+                HWIntrinsicId.Combine or HWIntrinsicId.WithLower or HWIntrinsicId.WithUpper => operandIndex == 1,
+                HWIntrinsicId.AndNot => operandIndex == 0,
+                HWIntrinsicId.Negate => !floating && operandIndex == 0,
+                HWIntrinsicId.WithElement => floating && operandIndex == 2,
+                HWIntrinsicId.CompareGreaterThan => floating ? operandIndex == 0 : signedInteger && operandIndex == 1,
+                HWIntrinsicId.CompareGreaterThanOrEqual => (floating || signedInteger) && operandIndex == 0,
+                HWIntrinsicId.CompareLessThan => floating ? operandIndex == 1 : signedInteger && operandIndex == 0,
+                HWIntrinsicId.CompareLessThanOrEqual => (floating || signedInteger) && operandIndex == 1,
+                _ => false,
+            };
+        }
+
         internal static bool IsCheckedIntegerBinary(GenTree source)
             => source.Kind == GenTreeKind.Binary &&
                source.Operator is GenTreeOperator.AddOvf or GenTreeOperator.AddOvfUn or
@@ -848,6 +1071,7 @@ namespace Cnidaria.Cs
         {
             int count = source.Kind switch
             {
+                GenTreeKind.HWIntrinsic when _target.IsX86 => X86HWIntrinsicFloatTemps(source, _target),
                 GenTreeKind.ArrayElement => MultiRegisterLoadFloatScratchCount(result),
                 GenTreeKind.UnboxAny => MultiRegisterLoadFloatScratchCount(result),
                 GenTreeKind.Field => MultiRegisterLoadFloatScratchCount(result),
@@ -916,6 +1140,15 @@ namespace Cnidaria.Cs
             var operand = node.Operands[operandIndex];
             var value = operand.RegisterResult ?? operand;
             return IsMultiRegisterValue(value) ? value : null;
+        }
+
+        // A value homed on the stack is copied through a general register, besides the static field's address
+        private int BlockCopyScratchCount(GenTree? value)
+        {
+            if (value is null)
+                return 0;
+            var abi = MachineAbi.ClassifyStorageValue(value.Type, value.StackKind, _target);
+            return abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect ? 1 : 0;
         }
 
         private bool IsMultiRegisterValue(GenTree? value)
@@ -1114,7 +1347,7 @@ namespace Cnidaria.Cs
         public readonly RegisterClass RegisterClass;
         public readonly MachineRegister FixedRegister;
         public readonly LinearRefPositionFlags Flags;
-        public readonly ulong RegisterMask;
+        public readonly UInt128 RegisterMask;
         public readonly byte MinimumRegisterCount;
 
         public LinearRefPosition(
@@ -1126,7 +1359,7 @@ namespace Cnidaria.Cs
             RegisterClass registerClass,
             MachineRegister fixedRegister,
             LinearRefPositionFlags flags,
-            ulong registerMask = 0,
+            UInt128 registerMask = default,
             byte minimumRegisterCount = 1)
             : this(
                 nodeId,
@@ -1157,7 +1390,7 @@ namespace Cnidaria.Cs
             RegisterClass registerClass,
             MachineRegister fixedRegister,
             LinearRefPositionFlags flags,
-            ulong registerMask = 0,
+            UInt128 registerMask = default,
             byte minimumRegisterCount = 1)
         {
             if (abiSegmentIndex < -1)
@@ -1183,15 +1416,15 @@ namespace Cnidaria.Cs
             RegisterMask = registerMask != 0
                 ? registerMask
                 : fixedRegister != MachineRegister.Invalid
-                    ? MachineRegisters.MaskOf(fixedRegister)
-                    : MachineRegisters.DefaultMaskForClass(registerClass);
+                    ? RegisterInfo.MaskOf(fixedRegister)
+                    : RegisterInfo.DefaultMaskForClass(registerClass);
             MinimumRegisterCount = minimumRegisterCount;
         }
 
         public bool HasFlag(LinearRefPositionFlags flag) => (Flags & flag) != 0;
         public bool IsAbiSegment => AbiSegmentIndex >= 0;
 
-        public ulong KillRegisterMask => Kind == LinearRefPositionKind.Kill
+        public UInt128 KillRegisterMask => Kind == LinearRefPositionKind.Kill
             ? RegisterMask
             : 0;
 
@@ -1201,7 +1434,7 @@ namespace Cnidaria.Cs
             string reg = FixedRegister == MachineRegister.Invalid ? "" : " @" + MachineRegisters.Format(FixedRegister);
             string abi = AbiSegmentIndex < 0 ? "" : $" seg{AbiSegmentIndex}+{AbiSegmentOffset}:{AbiSegmentSize}";
             string min = MinimumRegisterCount == 1 ? "" : $" minReg={MinimumRegisterCount}";
-            string mask = RegisterMask == 0 ? "" : $" mask={MachineRegisters.FormatMask(RegisterMask)}";
+            string mask = RegisterMask == 0 ? "" : $" mask={RegisterInfo.FormatMask(RegisterMask)}";
             return $"#{NodeId}@{Position} {Kind}[{OperandIndex}]{value}{abi}{reg}{min}{mask} {Flags}";
         }
     }

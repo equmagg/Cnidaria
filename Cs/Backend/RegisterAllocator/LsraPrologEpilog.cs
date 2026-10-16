@@ -74,13 +74,7 @@ namespace Cnidaria.Cs
                             if (appendEpilog)
                                 AppendEpilog(sourceBlock.Id, funcletIndex, blockLinearNodes);
                         }
-                        else if (node.Kind == GenTreeKind.EndFinally)
-                        {
-                            AppendEpilog(sourceBlock.Id, FuncletIndexForBlock(sourceBlock.Id), blockLinearNodes);
-                        }
-                        else if (node.Kind == GenTreeKind.Branch &&
-                            node.Operator == GenTreeOperator.Leave &&
-                            FuncletIndexForBlock(sourceBlock.Id) != 0)
+                        else if (node.Kind is GenTreeKind.EndFinally or GenTreeKind.CatchReturn or GenTreeKind.EndFilter)
                         {
                             AppendEpilog(sourceBlock.Id, FuncletIndexForBlock(sourceBlock.Id), blockLinearNodes);
                         }
@@ -495,7 +489,7 @@ namespace Cnidaria.Cs
                         EmitIncomingHiddenReturnBufferHomeStore(blockId, nodes, argTypes.Length, ref generalArgumentIndex, ref floatArgumentIndex, ref incomingStackArgumentIndex);
 
                     RuntimeType argType = argTypes[i];
-                    var argAbi = MachineAbi.ClassifyValue(argType, MachineAbi.StackKindForType(argType), isReturn: false, target: Target);
+                    var argAbi = MachineAbi.ClassifyValue(argType, MachineAbi.StackKindForType(argType, Target), isReturn: false, target: Target);
                     argAbi = MachineAbi.AdjustArgumentAbiForRegisterAvailability(argAbi, generalArgumentIndex, floatArgumentIndex, Target);
                     if (argAbi.PassingKind == AbiValuePassingKind.Void)
                         continue;
@@ -588,10 +582,10 @@ namespace Cnidaria.Cs
                     {
                         argumentType = valueInfo.Type ?? argTypes[argumentIndex];
                         argumentStackKind = valueInfo.StackKind == GenStackKind.Unknown
-                            ? MachineAbi.StackKindForType(argumentType)
+                            ? MachineAbi.StackKindForType(argumentType, Target)
                             : valueInfo.StackKind;
 
-                        argumentAbi = MachineAbi.ClassifyValue(argumentType, argumentStackKind, isReturn: false, target: Target);
+                        argumentAbi = MachineAbi.ClassifyStorageValue(argumentType, argumentStackKind, Target);
                         if (argumentAbi.PassingKind == AbiValuePassingKind.Void)
                             continue;
 
@@ -614,7 +608,7 @@ namespace Cnidaria.Cs
                             continue;
                         }
 
-                        argumentAbi = MachineAbi.ClassifyValue(argumentType, argumentStackKind, isReturn: false, target: Target);
+                        argumentAbi = MachineAbi.ClassifyStorageValue(argumentType, argumentStackKind, Target);
                         if (argumentAbi.PassingKind == AbiValuePassingKind.Void)
                             continue;
 
@@ -694,7 +688,8 @@ namespace Cnidaria.Cs
                         return;
                     }
 
-                    var scratch = RegisterOperand.ForRegister(SelectInitialSsaArgumentCopyScratch(destination, source));
+                    MachineRegister scratchRegister = SelectInitialSsaArgumentCopyScratch(destination, source);
+                    var scratch = RegisterOperand.ForRegister(scratchRegister, MachineRegisters.GetClass(scratchRegister) == RegisterClass.Vector ? 4 : 1);
                     nodes.Add(GenTreeLirFactory.Move(
                         _nextNodeId++,
                         blockId,
@@ -733,6 +728,8 @@ namespace Cnidaria.Cs
 
             private MachineRegister SelectInitialSsaArgumentCopyScratch(RegisterOperand destination, RegisterOperand source)
             {
+                if (destination.RegisterClass == RegisterClass.Vector || source.RegisterClass == RegisterClass.Vector)
+                    return RegisterInfo.ParallelCopyScratch(Target, RegisterClass.Vector);
                 if (destination.RegisterClass == RegisterClass.Float || source.RegisterClass == RegisterClass.Float)
                     return RegisterInfo.ParallelCopyScratch(Target, RegisterClass.Float);
                 return RegisterInfo.ParallelCopyScratch(Target, RegisterClass.General);
@@ -806,7 +803,7 @@ namespace Cnidaria.Cs
                         ConsumeIncomingHiddenReturnBuffer(ref generalArgumentIndex, ref floatArgumentIndex, ref incomingStackArgumentIndex);
 
                     RuntimeType currentType = _method.GenTreeMethod.ArgTypes[i];
-                    GenStackKind currentStackKind = i == parentArgumentIndex ? parentStackKind : MachineAbi.StackKindForType(currentType);
+                    GenStackKind currentStackKind = i == parentArgumentIndex ? parentStackKind : MachineAbi.StackKindForType(currentType, Target);
                     var valueAbi = i == parentArgumentIndex
                         ? MachineAbi.ClassifyValue(parentArgumentType, currentStackKind, isReturn: false, target: Target)
                         : MachineAbi.ClassifyValue(currentType, currentStackKind, isReturn: false, target: Target);
@@ -997,17 +994,17 @@ namespace Cnidaria.Cs
                         ConsumeIncomingHiddenReturnBuffer(ref generalArgumentIndex, ref floatArgumentIndex, ref incomingStackArgumentIndex);
 
                     RuntimeType currentType = _method.GenTreeMethod.ArgTypes[i];
-                    GenStackKind currentStackKind = i == argumentIndex ? stackKind : MachineAbi.StackKindForType(currentType);
+                    GenStackKind currentStackKind = i == argumentIndex ? stackKind : MachineAbi.StackKindForType(currentType, Target);
                     var valueAbi = i == argumentIndex
                         ? argumentAbi
                         : MachineAbi.ClassifyValue(currentType, currentStackKind, isReturn: false, target: Target);
                     var abi = MachineAbi.AdjustArgumentAbiForRegisterAvailability(
-                        valueAbi,
+                        MachineAbi.ClassifyValue(currentType, currentStackKind, isReturn: false, target: Target),
                         generalArgumentIndex,
                         floatArgumentIndex,
                         Target);
 
-                    if (i == argumentIndex && !MachineAbi.HaveMatchingArgumentValueLayout(valueAbi, abi, Target))
+                    if (i == argumentIndex && !MachineAbi.HaveMatchingArgumentValueLayout(valueAbi, abi, Target, requireMatchingRegisterClasses: true))
                         return GetIncomingArgumentHomeOperands(argumentIndex, valueAbi);
 
                     if (abi.PassingKind == AbiValuePassingKind.Void)
@@ -1138,7 +1135,8 @@ namespace Cnidaria.Cs
                         EmitIncomingArgumentHomeBlockStore(blockId, nodes, destination, source, actualSize);
                         return;
                     }
-                    var scratch = RegisterOperand.ForRegister(SelectInitialSsaArgumentCopyScratch(destination, source));
+                    MachineRegister scratchRegister = SelectInitialSsaArgumentCopyScratch(destination, source);
+                    var scratch = RegisterOperand.ForRegister(scratchRegister, MachineRegisters.GetClass(scratchRegister) == RegisterClass.Vector ? 4 : 1);
                     nodes.Add(GenTreeLirFactory.Move(
                         _nextNodeId++,
                         blockId,
@@ -1612,10 +1610,7 @@ namespace Cnidaria.Cs
                         if (block.LinearNodes[i].Uses.Length != 0)
                             result += 1;
                     }
-                    else if (block.LinearNodes[i].Kind == GenTreeKind.EndFinally ||
-                        (block.LinearNodes[i].Kind == GenTreeKind.Branch &&
-                            block.LinearNodes[i].Operator == GenTreeOperator.Leave &&
-                            FuncletIndexForBlock(block.Id) != 0))
+                    else if (block.LinearNodes[i].Kind is GenTreeKind.EndFinally or GenTreeKind.CatchReturn or GenTreeKind.EndFilter)
                     {
                         result += perReturn;
                     }

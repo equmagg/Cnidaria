@@ -949,7 +949,7 @@ namespace Cnidaria.Cs
                         if (method is null)
                             return true;
                         returnType = method.ReturnType;
-                        returnKind = MachineAbi.StackKindForType(returnType);
+                        returnKind = MachineAbi.StackKindForType(returnType, _target);
                     }
 
                     var returnAbi = MachineAbi.ClassifyValue(returnType, returnKind, isReturn: true, target: _target);
@@ -987,7 +987,7 @@ namespace Cnidaria.Cs
                     GenTreeKind.StoreArrayElement or
                     GenTreeKind.Throw or
                     GenTreeKind.Rethrow or
-                    GenTreeKind.EndFinally;
+                    GenTreeKind.EndFinally or GenTreeKind.CallFinally or GenTreeKind.CatchReturn or GenTreeKind.EndFilter;
             }
 
             private void LowerControlTransfer(GenTree tree)
@@ -1511,7 +1511,8 @@ namespace Cnidaria.Cs
             {
                 if (CanContainBinaryImmediate(parent, operandIndex, operand) ||
                     CanContainPointerElementImmediate(parent, operandIndex, operand) ||
-                    CanContainDefaultStoreValue(parent, operandIndex, operand))
+                    CanContainDefaultStoreValue(parent, operandIndex, operand) ||
+                    parent.Kind == GenTreeKind.HWIntrinsic && HWIntrinsics.IsContainableOperand(parent, operandIndex, operand))
                 {
                     operand.IsContainedInLinear = true;
                     result = LirOperandFlags.Contained;
@@ -2746,7 +2747,7 @@ namespace Cnidaria.Cs
 
             private static bool IsControlTransfer(GenTree source)
                 => source.Kind is GenTreeKind.Branch or GenTreeKind.BranchTrue or GenTreeKind.BranchFalse or
-                   GenTreeKind.Return or GenTreeKind.Throw or GenTreeKind.Rethrow or GenTreeKind.EndFinally;
+                   GenTreeKind.Return or GenTreeKind.Throw or GenTreeKind.Rethrow or GenTreeKind.EndFinally or GenTreeKind.CallFinally or GenTreeKind.CatchReturn or GenTreeKind.EndFilter;
 
             private GenTreeMethod Freeze()
             {
@@ -2808,6 +2809,9 @@ namespace Cnidaria.Cs
                     GenTreeKind.Throw => false,
                     GenTreeKind.Rethrow => false,
                     GenTreeKind.EndFinally => false,
+                    GenTreeKind.CallFinally => false,
+                    GenTreeKind.CatchReturn => false,
+                    GenTreeKind.EndFilter => false,
                     _ => true,
                 };
             }

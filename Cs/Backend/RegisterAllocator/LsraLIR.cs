@@ -322,7 +322,8 @@ namespace Cnidaria.Cs
                 GenTreeLinearFlags.IsStandaloneLoweredNode |
                 GenTreeLinearFlags.GcSafePoint,
                 sourceLowering.InternalGeneralRegisters,
-                sourceLowering.InternalFloatRegisters);
+                sourceLowering.InternalFloatRegisters,
+                sourceLowering.InternalVectorRegisters);
             node.SafePointLiveRegisters = source?.SafePointLiveRegisters ?? 0;
             return Attach(
                 node,

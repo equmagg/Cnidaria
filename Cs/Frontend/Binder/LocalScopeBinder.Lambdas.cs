@@ -678,7 +678,31 @@ namespace Cnidaria.Cs
                 isAsync: false,
                 returnsByRefReadonly: invoke.ReturnsByRefReadonly);
 
-            var parameterBuilder = ImmutableArray.CreateBuilder<ParameterSymbol>(invoke.Parameters.Length);
+            BoundExpression? receiver = chosen!.IsStatic ? null : methodGroup.ReceiverOpt;
+            BoundExpression? target = receiver;
+            var parameterBuilder = ImmutableArray.CreateBuilder<ParameterSymbol>(invoke.Parameters.Length + (receiver is null ? 0 : 1));
+            if (receiver is not null)
+            {
+                bool valueReceiver = receiver.Type.IsValueType || receiver.Type is TypeParameterSymbol;
+                TypeSymbol receiverType = valueReceiver
+                    ? context.Compilation.CreateArrayType(receiver.Type, rank: 1)
+                    : receiver.Type;
+                var receiverParameter = new ParameterSymbol("<>receiver", lambdaMethod, receiverType, ImmutableArray<Location>.Empty);
+                parameterBuilder.Add(receiverParameter);
+                BoundExpression receiverValue = new BoundParameterExpression(syntax, receiverParameter);
+                if (valueReceiver)
+                {
+                    // A private element preserves the captured struct and mutations without aliasing the source variable.
+                    TypeSymbol intType = context.Compilation.GetSpecialType(SpecialType.System_Int32);
+                    target = new BoundArrayCreationExpression(syntax, (ArrayTypeSymbol)receiverType, receiver.Type,
+                        new BoundLiteralExpression(syntax, intType, 1),
+                        new BoundArrayInitializerExpression(syntax, receiver.Type, ImmutableArray.Create(receiver)));
+                    receiverValue = new BoundArrayElementAccessExpression(syntax, receiver.Type, receiverValue,
+                        new BoundLiteralExpression(syntax, intType, 0));
+                }
+                receiver = receiverValue;
+            }
+            int receiverCount = parameterBuilder.Count;
             for (int i = 0; i < invoke.Parameters.Length; i++)
             {
                 var delegateParameter = invoke.Parameters[i];
@@ -700,10 +724,10 @@ namespace Cnidaria.Cs
 
             lambdaMethod.SetParameters(parameterBuilder.ToImmutable());
 
-            var callArgsBuilder = ImmutableArray.CreateBuilder<BoundExpression>(lambdaMethod.Parameters.Length);
-            for (int i = 0; i < lambdaMethod.Parameters.Length; i++)
+            var callArgsBuilder = ImmutableArray.CreateBuilder<BoundExpression>(invoke.Parameters.Length);
+            for (int i = 0; i < invoke.Parameters.Length; i++)
             {
-                BoundExpression arg = new BoundParameterExpression(syntax, lambdaMethod.Parameters[i]);
+                BoundExpression arg = new BoundParameterExpression(syntax, lambdaMethod.Parameters[i + receiverCount]);
                 var targetParameter = chosen!.Parameters[i];
                 var refKind = targetParameter.RefKind;
                 if (refKind == ParameterRefKind.None && targetParameter.Type is ByRefTypeSymbol)
@@ -720,7 +744,6 @@ namespace Cnidaria.Cs
                 callArgsBuilder.Add(arg);
             }
 
-            BoundExpression? receiver = chosen!.IsStatic ? null : methodGroup.ReceiverOpt;
             var call = new BoundCallExpression(syntax, receiver, chosen, callArgsBuilder.ToImmutable());
 
             BoundStatement body;
@@ -757,7 +780,8 @@ namespace Cnidaria.Cs
                 invoke,
                 body,
                 isStatic: true,
-                isAsync: false);
+                isAsync: false,
+                targetOpt: target);
         }
 
         private BoundExpression BindDefaultExpression(

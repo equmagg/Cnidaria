@@ -226,6 +226,8 @@ namespace Cnidaria.Cs
         LdExceptionRef = 26,
         SwitchI32 = 27,
         SwitchI64 = 28,
+        CallFinally = 29,
+        EndFilter = 30,
 
         BrTrueI32 = 32,
         BrFalseI32 = 33,
@@ -1595,6 +1597,7 @@ namespace Cnidaria.Cs
                 case Op.RetValue:
                 case Op.SwitchI32:
                 case Op.SwitchI64:
+                case Op.EndFilter:
                     RequireGpr(inst.Rs1, pc, nameof(inst.Rs1));
                     break;
             }
@@ -1925,7 +1928,7 @@ namespace Cnidaria.Cs
         }
 
         private static bool IsPcTargetInstruction(Op op)
-            => op is Op.J or Op.Leave or Op.BrTrueI32 or Op.BrFalseI32 or Op.BrTrueI64 or Op.BrFalseI64 or Op.BrTrueRef or Op.BrFalseRef
+            => op is Op.J or Op.Leave or Op.CallFinally or Op.BrTrueI32 or Op.BrFalseI32 or Op.BrTrueI64 or Op.BrFalseI64 or Op.BrTrueRef or Op.BrFalseRef
                 or Op.BrI32Eq or Op.BrI32Ne or Op.BrI32Lt or Op.BrI32Le or Op.BrI32Gt or Op.BrI32Ge
                 or Op.BrU32Lt or Op.BrU32Le or Op.BrU32Gt or Op.BrU32Ge
                 or Op.BrI64Eq or Op.BrI64Ne or Op.BrI64Lt or Op.BrI64Le or Op.BrI64Gt or Op.BrI64Ge
@@ -2123,7 +2126,12 @@ namespace Cnidaria.Cs
 
             int elementIndex = -1;
             if (type.ElementType is not null)
+            {
                 elementIndex = InternTypeLayout(type.ElementType);
+                // A delegate element interns its invocation-list array recursively.
+                if (_typeLayoutByRuntimeTypeId.TryGetValue(type.TypeId, out existing))
+                    return existing;
+            }
 
             TypeLayoutFlags flags = TypeLayoutFlags.None;
             if (type.IsValueType) flags |= TypeLayoutFlags.ValueType;
@@ -2511,6 +2519,7 @@ namespace Cnidaria.Cs
 
         public void J(Label target) => Branch(Op.J, target);
         public void Leave(Label target) => Branch(Op.Leave, target);
+        public void CallFinally(Label handler) => Branch(Op.CallFinally, handler);
         public void BrTrueI32(MachineRegister rs, Label target) => Branch(Op.BrTrueI32, rs, target);
         public void BrFalseI32(MachineRegister rs, Label target) => Branch(Op.BrFalseI32, rs, target);
         public void BrTrueI64(MachineRegister rs, Label target) => Branch(Op.BrTrueI64, rs, target);
@@ -2530,7 +2539,7 @@ namespace Cnidaria.Cs
 
         public void Branch(Op op, Label target)
         {
-            if (op is not (Op.J or Op.Leave))
+            if (op is not (Op.J or Op.Leave or Op.CallFinally))
                 throw new ArgumentOutOfRangeException(nameof(op));
             EmitTarget(InstrDesc.Op0(op), target);
         }
@@ -3468,7 +3477,7 @@ namespace Cnidaria.Cs
             if (inst.Op == Op.RetValue)
                 return $"{FormatRegister(inst.Rs1)}, size={inst.Imm}";
 
-            if (inst.Op == Op.Throw)
+            if (inst.Op is Op.Throw or Op.EndFilter)
                 return FormatRegister(inst.Rs1);
 
             if (inst.Op == Op.LdExceptionRef)
@@ -3476,7 +3485,7 @@ namespace Cnidaria.Cs
 
             if (IsPcTargetInstruction(inst.Op))
             {
-                if (inst.Op is Op.J or Op.Leave)
+                if (inst.Op is Op.J or Op.Leave or Op.CallFinally)
                     return FormatTarget(inst.Imm, labels, options);
                 if (IsTwoOperandBranch(inst.Op))
                     return FormatRegister(inst.Rs1) + ", " + FormatRegister(inst.Rs2) + ", " + FormatTarget(inst.Imm, labels, options);
@@ -3824,7 +3833,7 @@ namespace Cnidaria.Cs
                 or Op.LiTypeHandle or Op.LiMethodHandle or Op.LiFieldHandle or Op.LiStaticBase;
 
         private static bool IsPcTargetInstruction(Op op)
-            => op is Op.J or Op.Leave or Op.BrTrueI32 or Op.BrFalseI32 or Op.BrTrueI64 or Op.BrFalseI64 or Op.BrTrueRef or Op.BrFalseRef
+            => op is Op.J or Op.Leave or Op.CallFinally or Op.BrTrueI32 or Op.BrFalseI32 or Op.BrTrueI64 or Op.BrFalseI64 or Op.BrTrueRef or Op.BrFalseRef
                 or Op.BrI32Eq or Op.BrI32Ne or Op.BrI32Lt or Op.BrI32Le or Op.BrI32Gt or Op.BrI32Ge
                 or Op.BrU32Lt or Op.BrU32Le or Op.BrU32Gt or Op.BrU32Ge
                 or Op.BrI64Eq or Op.BrI64Ne or Op.BrI64Lt or Op.BrI64Le or Op.BrI64Gt or Op.BrI64Ge

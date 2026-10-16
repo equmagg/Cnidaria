@@ -177,6 +177,7 @@ namespace Cnidaria.Cs
                     successPc,
                     slowPreheaderBlockId,
                     slowPreheaderPc,
+                    method.Blocks[loop.Header].Region,
                     allocator));
             }
 
@@ -186,6 +187,7 @@ namespace Cnidaria.Cs
                 loop.Header,
                 method.Blocks[loop.Header].StartPc,
                 GenTreeBlockFlags.LoopCloneFastPreheader,
+                method.Blocks[loop.Header].Region,
                 allocator));
             blocks.Add(CreatePreheader(
                 slowPreheaderBlockId,
@@ -193,6 +195,7 @@ namespace Cnidaria.Cs
                 slowLoop.GetBlock(loop.Header),
                 slowLoop.GetPc(loop.Header),
                 GenTreeBlockFlags.LoopCloneSlowPreheader,
+                method.Blocks[loop.Header].Region,
                 allocator));
             blocks.AddRange(slowLoop.Blocks);
 
@@ -244,7 +247,7 @@ namespace Cnidaria.Cs
                 if (rewritten.Id != blockId ||
                     rewritten.StartPc != original.StartPc ||
                     rewritten.EndPcExclusive != original.EndPcExclusive ||
-                    rewritten.RegionPc != original.RegionPc ||
+                    rewritten.Region != original.Region ||
                     rewritten.EntryStackDepth != original.EntryStackDepth ||
                     rewritten.ExitStackDepth != original.ExitStackDepth ||
                     rewritten.JumpKind != original.JumpKind ||
@@ -317,7 +320,7 @@ namespace Cnidaria.Cs
                         GenTreeKind.Return or
                         GenTreeKind.Throw or
                         GenTreeKind.Rethrow or
-                        GenTreeKind.EndFinally)
+                        GenTreeKind.EndFinally or GenTreeKind.CallFinally or GenTreeKind.CatchReturn or GenTreeKind.EndFilter)
                 {
                     throw new InvalidOperationException("Loop versioning condition is not a pure guard.");
                 }
@@ -336,7 +339,6 @@ namespace Cnidaria.Cs
                 var branch = preheader.Statements[branchIndex];
                 return branch.Kind == GenTreeKind.Branch &&
                        branch.Operands.Length == 0 &&
-                       branch.Operator != GenTreeOperator.Leave &&
                        branch.TargetBlockId == targetBlockId &&
                        !ContainsControlTransfer(preheader.Statements, branchIndex);
             }
@@ -364,7 +366,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.Return or
                 GenTreeKind.Throw or
                 GenTreeKind.Rethrow or
-                GenTreeKind.EndFinally)
+                GenTreeKind.EndFinally or GenTreeKind.CallFinally or GenTreeKind.CatchReturn or GenTreeKind.EndFilter)
             {
                 return true;
             }
@@ -430,7 +432,7 @@ namespace Cnidaria.Cs
                 statements.ToImmutable(),
                 ImmutableArray.Create(targetBlockId),
                 ImmutableArray.Create(targetPc),
-                preheader.RegionPc);
+                preheader.Region);
         }
 
         private static GenTreeLoopDuplicationResult MarkSlowLoop(GenTreeLoopDuplicationResult slowLoop)
@@ -450,7 +452,7 @@ namespace Cnidaria.Cs
                     block.Statements,
                     block.SuccessorBlockIds,
                     block.SuccessorPcs,
-                    block.RegionPc));
+                    block.Region));
             }
 
             return new GenTreeLoopDuplicationResult(
@@ -472,7 +474,7 @@ namespace Cnidaria.Cs
                 block.Statements,
                 block.SuccessorBlockIds,
                 block.SuccessorPcs,
-                block.RegionPc);
+                block.Region);
 
         private static GenTreeBlock CreateConditionBlock(
             int blockId,
@@ -482,6 +484,7 @@ namespace Cnidaria.Cs
             int successPc,
             int slowBlockId,
             int slowPc,
+            GenTreeEhRegion region,
             GenTreeSyntheticAllocator allocator)
         {
             if (condition.StackKind != GenStackKind.I4)
@@ -515,7 +518,7 @@ namespace Cnidaria.Cs
                 ImmutableArray.Create(branchFalse, successBranch),
                 ImmutableArray.Create(slowBlockId, successBlockId),
                 ImmutableArray.Create(slowPc, successPc),
-                pc);
+                region);
         }
 
         private static GenTreeBlock CreatePreheader(
@@ -524,6 +527,7 @@ namespace Cnidaria.Cs
             int targetBlockId,
             int targetPc,
             GenTreeBlockFlags flag,
+            GenTreeEhRegion region,
             GenTreeSyntheticAllocator allocator)
             => new GenTreeBlock(
                 blockId,
@@ -540,7 +544,7 @@ namespace Cnidaria.Cs
                     targetBlockId)),
                 ImmutableArray.Create(targetBlockId),
                 ImmutableArray.Create(targetPc),
-                pc);
+                region);
 
         private static void Verify(
             GenTreeMethod method,
@@ -654,5 +658,266 @@ namespace Cnidaria.Cs
                     VerifyTree(node.Operands[i], block);
             }
         }
+    }
+
+    public sealed class LoopCloningOptions
+    {
+        public static LoopCloningOptions Default { get; } = new LoopCloningOptions();
+
+        public int MaxLoopNodes { get; set; } = 400;
+        public int AnalysisBudget { get; set; } = 100;
+    }
+
+    // Guards before an innermost counted loop select a copy whose accesses at the induction variable skip their checks
+    internal static class GenTreeLoopCloner
+    {
+        private sealed class ClonePlan
+        {
+            public LoopPredicate Predicate;
+            public GenTree InductionRead = null!;
+            public bool HasEntryGuard;
+            public bool InitialValueKnownNonNegative;
+            public readonly List<ScalarSlot> Arrays = new();
+            public readonly List<GenTree> ArrayReads = new();
+            public readonly List<GenTree> Accesses = new();
+        }
+
+        public static GenTreeMethod CloneLoops(GenTreeMethod method, LoopCloningOptions? options = null)
+        {
+            if (method is null)
+                throw new ArgumentNullException(nameof(method));
+            options ??= LoopCloningOptions.Default;
+            if (method.Blocks.IsDefaultOrEmpty || !HasCheckedArrayAccess(method))
+                return method;
+
+            method = GenTreeLoopInverter.CanonicalizeLoops(method);
+            var rejectedHeaders = new HashSet<int>();
+            bool changed = false;
+            while (TryCloneLoop(method, ControlFlowGraph.Build(method), options, rejectedHeaders, out var rewritten))
+            {
+                method = rewritten;
+                changed = true;
+            }
+            return changed ? GenTreeMorpher.MorphMethod(method, GenTreeMethodPhase.GlobalMorphedHir) : method;
+        }
+
+        private static bool TryCloneLoop(
+            GenTreeMethod method,
+            ControlFlowGraph cfg,
+            LoopCloningOptions options,
+            HashSet<int> rejectedHeaders,
+            out GenTreeMethod rewritten)
+        {
+            rewritten = method;
+            foreach (CfgLoop loop in cfg.NaturalLoops)
+            {
+                GenTreeBlock header = method.Blocks[loop.Header];
+                if (rejectedHeaders.Contains(header.StartPc) ||
+                    (header.Flags & (GenTreeBlockFlags.LoopCloneFastPath | GenTreeBlockFlags.LoopCloneSlowPath)) != 0 ||
+                    !IsInnermost(cfg, loop))
+                {
+                    continue;
+                }
+                if (!TryPlan(method, cfg, loop, options, out var plan))
+                {
+                    rejectedHeaders.Add(header.StartPc);
+                    continue;
+                }
+
+                var allocator = GenTreeSyntheticAllocator.Create(method);
+                var fastBlocks = new Dictionary<int, GenTreeBlock>(loop.Blocks.Length);
+                foreach (int blockId in loop.Blocks)
+                    fastBlocks.Add(blockId, method.Blocks[blockId]);
+                var result = GenTreeLoopVersioner.Version(method, cfg, loop, BuildConditions(plan, allocator), fastBlocks, allocator);
+                foreach (GenTree access in plan.Accesses)
+                    access.Flags |= GenTreeFlags.BoundsCheckEliminated | GenTreeFlags.NullCheckEliminated;
+                rewritten = result.Method;
+                return true;
+            }
+            return false;
+        }
+
+        private static bool IsInnermost(ControlFlowGraph cfg, CfgLoop loop)
+        {
+            foreach (CfgLoop other in cfg.NaturalLoops)
+            {
+                if (other.Parent == loop.Index)
+                    return false;
+            }
+            return true;
+        }
+
+        private static bool TryPlan(GenTreeMethod method, ControlFlowGraph cfg, CfgLoop loop, LoopCloningOptions options, out ClonePlan plan)
+        {
+            plan = new ClonePlan();
+            if (!GenTreeLoopVersioner.CanVersion(method, cfg, loop))
+                return false;
+
+            int nodes = 0;
+            foreach (int blockId in loop.Blocks)
+                nodes += method.Blocks[blockId].LinearNodes.Length;
+            if (nodes > options.MaxLoopNodes)
+                return false;
+
+            foreach (int exit in loop.Exits)
+            {
+                if (!GenTreeLoopIteration.TryAnalyzeLoopTest(method, cfg, loop, exit, out var test) ||
+                    test.Predicate.Unsigned ||
+                    test.Predicate.Relop is not (LoopRelop.LessThan or LoopRelop.LessThanOrEqual) ||
+                    !GenTreeLoopIteration.TryFindIncrement(method, cfg, loop, test, options.AnalysisBudget, out var increment) ||
+                    !increment.Slot.Equals(test.Predicate.Slot) ||
+                    increment.Operation != IterationOperation.Add ||
+                    increment.Delta != 1 ||
+                    increment.Domain.Bits != 32 ||
+                    increment.Domain.Unsigned ||
+                    !GenTreeLoopIteration.HasSingleLoopDefinition(method, loop, increment) ||
+                    !IsInvariantLimit(method, loop, test.Predicate))
+                {
+                    continue;
+                }
+
+                plan.Predicate = test.Predicate;
+                plan.HasEntryGuard = GenTreeLoopIteration.ValidateEntryGuard(method, cfg, loop, test.Predicate);
+                if (GenTreeLoopIteration.TryFindConstantInitializer(method, cfg, loop, increment, out int initialValue))
+                {
+                    if (initialValue < 0)
+                        return false;
+                    plan.InitialValueKnownNonNegative = true;
+                }
+
+                foreach (int blockId in loop.Blocks)
+                {
+                    foreach (GenTree statement in method.Blocks[blockId].Statements)
+                        CollectAccesses(method, loop, statement, plan);
+                }
+                return plan.Accesses.Count != 0;
+            }
+            return false;
+        }
+
+        private static bool IsInvariantLimit(GenTreeMethod method, CfgLoop loop, LoopPredicate predicate)
+            => predicate.Limit.Kind switch
+            {
+                LoopLimitKind.Constant => true,
+                LoopLimitKind.Local => !predicate.Limit.Slot.Equals(predicate.Slot) && IsInvariantLocal(method, loop, predicate.Limit.Slot),
+                _ => IsInvariantLocal(method, loop, predicate.Limit.Slot),
+            };
+
+        private static bool IsInvariantLocal(GenTreeMethod method, CfgLoop loop, ScalarSlot slot)
+        {
+            if (slot.Descriptor.HasMemoryAlias)
+                return false;
+            foreach (int blockId in loop.Blocks)
+            {
+                foreach (GenTree statement in method.Blocks[blockId].Statements)
+                {
+                    if (GenTreeLoopIteration.TreeContainsSlotDefinition(statement, slot))
+                        return false;
+                }
+            }
+            return true;
+        }
+
+        private static void CollectAccesses(GenTreeMethod method, CfgLoop loop, GenTree node, ClonePlan plan)
+        {
+            foreach (GenTree operand in node.Operands)
+                CollectAccesses(method, loop, operand, plan);
+
+            if (!IsCheckedArrayAccess(node) ||
+                !GenTreeLoopIteration.IsSlotRead(node.Operands[1], plan.Predicate.Slot) ||
+                !GenTreeLoopIteration.TryGetScalarUse(node.Operands[0], out var array) ||
+                array.Equals(plan.Predicate.Slot) ||
+                (plan.Predicate.Limit.Kind == LoopLimitKind.ArrayLength && array.Equals(plan.Predicate.Limit.Slot)))
+            {
+                return;
+            }
+
+            int index = plan.Arrays.IndexOf(array);
+            if (index < 0)
+            {
+                if (!IsInvariantLocal(method, loop, array))
+                    return;
+                plan.Arrays.Add(array);
+                plan.ArrayReads.Add(node.Operands[0]);
+            }
+            plan.InductionRead = node.Operands[1];
+            plan.Accesses.Add(node);
+        }
+
+        private static bool IsCheckedArrayAccess(GenTree node)
+            => node.Kind is GenTreeKind.ArrayElement or GenTreeKind.ArrayElementAddr or GenTreeKind.StoreArrayElement &&
+               node.Operands.Length >= 2 &&
+               !node.HasBoundsCheckIndexOverride &&
+               (node.Flags & GenTreeFlags.BoundsCheckEliminated) == 0;
+
+        private static bool HasCheckedArrayAccess(GenTreeMethod method)
+        {
+            foreach (GenTreeBlock block in method.Blocks)
+            {
+                foreach (GenTree node in block.LinearNodes)
+                {
+                    if (IsCheckedArrayAccess(node))
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        // Non-null arrays, a non-negative first index and a limit within every array keep each unit-step index in range
+        private static ImmutableArray<GenTree> BuildConditions(ClonePlan plan, GenTreeSyntheticAllocator allocator)
+        {
+            var conditions = ImmutableArray.CreateBuilder<GenTree>();
+            LoopPredicate predicate = plan.Predicate;
+            if (predicate.Limit.Kind == LoopLimitKind.ArrayLength)
+                conditions.Add(NotNull(predicate.LimitNode.Operands[0], allocator));
+            foreach (GenTree array in plan.ArrayReads)
+                conditions.Add(NotNull(array, allocator));
+            if (!plan.InitialValueKnownNonNegative)
+                conditions.Add(Not(Compare(GenTreeOperator.Clt, Copy(plan.InductionRead, allocator), Constant(0, plan.InductionRead, allocator), allocator), allocator));
+            if (!plan.HasEntryGuard)
+            {
+                foreach (GenTree array in plan.ArrayReads)
+                    conditions.Add(Compare(GenTreeOperator.Clt, Copy(plan.InductionRead, allocator), Length(array, plan.InductionRead, allocator), allocator));
+            }
+            foreach (GenTree array in plan.ArrayReads)
+            {
+                GenTree limit = Copy(predicate.LimitNode, allocator);
+                GenTree length = Length(array, plan.InductionRead, allocator);
+                conditions.Add(predicate.Relop == LoopRelop.LessThan
+                    ? Not(Compare(GenTreeOperator.Cgt, limit, length, allocator), allocator)
+                    : Compare(GenTreeOperator.Clt, limit, length, allocator));
+            }
+            return conditions.ToImmutable();
+        }
+
+        private static GenTree Copy(GenTree node, GenTreeSyntheticAllocator allocator)
+        {
+            var operands = ImmutableArray.CreateBuilder<GenTree>(node.Operands.Length);
+            foreach (GenTree operand in node.Operands)
+                operands.Add(Copy(operand, allocator));
+            return GenTreeLoopDuplicator.CloneTree(node, allocator.AllocateTreeId(), operands.MoveToImmutable(),
+                GenTreeLoopDuplicator.PrepareDuplicatedFlags(node.Flags), node.TargetBlockId, node.TargetPc);
+        }
+
+        private static GenTree NotNull(GenTree array, GenTreeSyntheticAllocator allocator)
+            => Compare(GenTreeOperator.CgtUn, Copy(array, allocator),
+                new GenTree(allocator.AllocateTreeId(), GenTreeKind.ConstNull, array.Pc, GenTreeOperator.None, null, GenStackKind.Null,
+                    GenTreeFlags.None, ImmutableArray<GenTree>.Empty), allocator);
+
+        private static GenTree Length(GenTree array, GenTree index, GenTreeSyntheticAllocator allocator)
+            => new GenTree(allocator.AllocateTreeId(), GenTreeKind.ArrayLength, array.Pc, GenTreeOperator.None, index.LocalDescriptor?.Type,
+                GenStackKind.I4, GenTreeFlags.MemoryRead | GenTreeFlags.CanThrow, ImmutableArray.Create(Copy(array, allocator)));
+
+        private static GenTree Constant(int value, GenTree template, GenTreeSyntheticAllocator allocator)
+            => new GenTree(allocator.AllocateTreeId(), GenTreeKind.ConstI4, template.Pc, GenTreeOperator.None, null, GenStackKind.I4,
+                GenTreeFlags.None, ImmutableArray<GenTree>.Empty, int32: value);
+
+        private static GenTree Not(GenTree condition, GenTreeSyntheticAllocator allocator)
+            => Compare(GenTreeOperator.Ceq, condition, Constant(0, condition, allocator), allocator);
+
+        private static GenTree Compare(GenTreeOperator oper, GenTree left, GenTree right, GenTreeSyntheticAllocator allocator)
+            => new GenTree(allocator.AllocateTreeId(), GenTreeKind.Binary, left.Pc, oper, null, GenStackKind.I4,
+                (left.Flags | right.Flags) & (GenTreeFlags.MemoryRead | GenTreeFlags.CanThrow | GenTreeFlags.LocalUse),
+                ImmutableArray.Create(left, right));
     }
 }

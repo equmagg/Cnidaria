@@ -186,7 +186,7 @@ namespace Cnidaria.Cs
                         statements.ToImmutable(),
                         oldBlock.SuccessorBlockIds,
                         oldBlock.SuccessorPcs,
-                        oldBlock.RegionPc));
+                        oldBlock.Region));
                 }
 
                 var rewritten = method.GenTreeMethod.CloneWithBlocks(blocks.ToImmutable());
@@ -1906,13 +1906,11 @@ namespace Cnidaria.Cs
 
                 private bool WouldHaveCriticalEdges(int fromBlockId, ImmutableArray<int> rewrittenSuccessors)
                 {
-                    if (rewrittenSuccessors.Length <= 1)
-                        return false;
-
                     for (int s = 0; s < rewrittenSuccessors.Length; s++)
                     {
                         int successor = rewrittenSuccessors[s];
                         int predecessorCount = 0;
+                        bool branchingPredecessor = false;
 
                         for (int blockId = 0; blockId < _method.Blocks.Length; blockId++)
                         {
@@ -1923,7 +1921,8 @@ namespace Cnidaria.Cs
                             if (Contains(blockSuccessors, successor))
                             {
                                 predecessorCount++;
-                                if (predecessorCount > 1)
+                                branchingPredecessor |= blockSuccessors.Length > 1;
+                                if (predecessorCount > 1 && branchingPredecessor)
                                     return true;
                             }
                         }
@@ -2105,7 +2104,7 @@ namespace Cnidaria.Cs
                             edit.Statements,
                             edit.Successors,
                             edit.SuccessorPcs,
-                            edit.Original.RegionPc));
+                            edit.Original.Region));
                     }
 
                     return builder.ToImmutable();
@@ -2118,24 +2117,10 @@ namespace Cnidaria.Cs
                     if (blocks.Length == 0)
                         return blocks;
 
-                    bool hasEh = _method.GenTreeMethod.ExceptionHandlers.Length != 0 ||
-                                 _method.Cfg.ExceptionRegions.Length != 0;
-                    var exceptionEdges = hasEh
-                        ? EhFuncletLayout.BuildImplicitExceptionEdges(_method.Cfg)
-                        : ImmutableArray<CfgEdge>.Empty;
-
+                    ImmutableArray<CfgExceptionRegion> regions = _method.Cfg.ExceptionRegions;
                     var reachable = new bool[blocks.Length];
                     var stack = new Stack<int>();
                     MarkReachable(0, reachable, stack);
-
-                    if (hasEh)
-                    {
-                        for (int i = 0; i < blocks.Length; i++)
-                        {
-                            if (IsProtectedEhBlock(i))
-                                MarkReachable(i, reachable, stack);
-                        }
-                    }
 
                     while (stack.Count != 0)
                     {
@@ -2144,11 +2129,14 @@ namespace Cnidaria.Cs
                         for (int i = 0; i < successors.Length; i++)
                             MarkReachable(successors[i], reachable, stack);
 
-                        for (int i = 0; i < exceptionEdges.Length; i++)
+                        // A handler lives as long as any block of its try does
+                        for (int r = 0; r < regions.Length; r++)
                         {
-                            var edge = exceptionEdges[i];
-                            if (edge.FromBlockId == blockId)
-                                MarkReachable(edge.ToBlockId, reachable, stack);
+                            if (regions[r].ContainsTryBlock(blockId))
+                            {
+                                MarkReachable(regions[r].HandlerStartBlockId, reachable, stack);
+                                MarkReachable(regions[r].HandlerBodyStartBlockId, reachable, stack);
+                            }
                         }
                     }
 
@@ -2196,7 +2184,7 @@ namespace Cnidaria.Cs
                             statements,
                             successors,
                             SuccessorPcsFor(successors, blocks, map),
-                            old.RegionPc));
+                            old.Region));
                     }
 
                     return builder.ToImmutable();
@@ -2209,15 +2197,6 @@ namespace Cnidaria.Cs
 
                     reachable[blockId] = true;
                     stack.Push(blockId);
-                }
-
-                private bool IsProtectedEhBlock(int blockId)
-                {
-                    if ((uint)blockId >= (uint)_method.Cfg.Blocks.Length)
-                        return true;
-
-                    var cfgBlock = _method.Cfg.Blocks[blockId];
-                    return cfgBlock.IsInTryRegion || cfgBlock.IsInHandlerRegion || cfgBlock.IsHandlerEntry;
                 }
 
                 private ImmutableArray<int> RemapSuccessors(ImmutableArray<int> successors, int[] map)
@@ -3391,7 +3370,7 @@ namespace Cnidaria.Cs
                     statements.ToImmutable(),
                     original.SuccessorBlockIds,
                     original.SuccessorPcs,
-                    original.RegionPc));
+                    original.Region));
             }
 
             return result.ToImmutable();
@@ -3536,6 +3515,9 @@ namespace Cnidaria.Cs
                 GenTreeKind.Throw => false,
                 GenTreeKind.Rethrow => false,
                 GenTreeKind.EndFinally => false,
+                GenTreeKind.CallFinally => false,
+                GenTreeKind.CatchReturn => false,
+                GenTreeKind.EndFilter => false,
                 _ => true,
             };
         }

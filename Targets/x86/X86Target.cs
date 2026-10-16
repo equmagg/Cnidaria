@@ -270,6 +270,30 @@ public enum X86IsaFlags : ulong
     Sse2 = 1UL << 1,
     Avx = 1UL << 2,
     Avx2 = 1UL << 3,
+    Sse3 = 1UL << 4,
+    Ssse3 = 1UL << 5,
+    Sse41 = 1UL << 6,
+    Sse42 = 1UL << 7,
+    Lzcnt = 1UL << 8,
+    Avx512F = 1UL << 9,
+    Avx512BW = 1UL << 10,
+    Avx512DQ = 1UL << 11,
+    Avx512CD = 1UL << 12,
+    Avx512Vbmi = 1UL << 13,
+    Avx512Vbmi2 = 1UL << 14,
+    Avx10v2 = 1UL << 15,
+    Popcnt = 1UL << 16,
+    Bmi1 = 1UL << 17,
+    Bmi2 = 1UL << 18,
+    Fma = 1UL << 19,
+    Aes = 1UL << 20,
+    Pclmulqdq = 1UL << 21,
+    Vpclmulqdq = 1UL << 22,
+    Gfni = 1UL << 23,
+    AvxVnni = 1UL << 24,
+    AvxVnniInt8 = 1UL << 25,
+    AvxVnniInt16 = 1UL << 26,
+    Serialize = 1UL << 27,
 }
 
 public enum X86AbiKind : byte
@@ -434,71 +458,579 @@ public enum X86InstrKind : ushort
     Xorps,
     Xorpd,
     Pxor,
+    Movhlps,
+    Movlhps,
+    Unpcklps,
+    Unpckhps,
+    Unpcklpd,
+    Unpckhpd,
+    Shufps,
+    Shufpd,
+    Andnps,
+    Andnpd,
+    Minps,
+    Minpd,
+    Maxps,
+    Maxpd,
+    Cmpps,
+    Cmppd,
+    Movmskps,
+    Movmskpd,
+    Cvtdq2ps,
+    Cvttps2dq,
+    Cvtps2pd,
+    Cvtpd2ps,
+    Cvtdq2pd,
+    Cvttpd2dq,
+    Movd,
+    Movq,
+    Paddb,
+    Paddw,
+    Paddd,
+    Paddq,
+    Psubb,
+    Psubw,
+    Psubd,
+    Psubq,
+    Paddsb,
+    Paddsw,
+    Paddusb,
+    Paddusw,
+    Psubsb,
+    Psubsw,
+    Psubusb,
+    Psubusw,
+    Pmullw,
+    Pmulhw,
+    Pmulhuw,
+    Pmuludq,
+    Pand,
+    Pandn,
+    Por,
+    Pcmpeqb,
+    Pcmpeqw,
+    Pcmpeqd,
+    Pcmpgtb,
+    Pcmpgtw,
+    Pcmpgtd,
+    Pminub,
+    Pmaxub,
+    Pminsw,
+    Pmaxsw,
+    Psadbw,
+    Pmovmskb,
+    Packsswb,
+    Packssdw,
+    Packuswb,
+    Punpcklbw,
+    Punpcklwd,
+    Punpckldq,
+    Punpcklqdq,
+    Punpckhbw,
+    Punpckhwd,
+    Punpckhdq,
+    Punpckhqdq,
+    Pshufd,
+    Pshuflw,
+    Pshufhw,
+    Pinsrw,
+    Pextrw,
+    Psllw,
+    Pslld,
+    Psllq,
+    Psrlw,
+    Psrld,
+    Psrlq,
+    Psraw,
+    Psrad,
+    Pslldq,
+    Psrldq,
+    Haddps,
+    Haddpd,
+    Movddup,
+    Movshdup,
+    Movsldup,
+    Pshufb,
+    Phaddw,
+    Phaddd,
+    Pabsb,
+    Pabsw,
+    Pabsd,
+    Palignr,
+    Pmulld,
+    Pmuldq,
+    Pminsb,
+    Pminsd,
+    Pminuw,
+    Pminud,
+    Pmaxsb,
+    Pmaxsd,
+    Pmaxuw,
+    Pmaxud,
+    Pcmpeqq,
+    Packusdw,
+    Ptest,
+    Pmovsxbw,
+    Pmovsxwd,
+    Pmovsxdq,
+    Pmovzxbw,
+    Pmovzxwd,
+    Pmovzxdq,
+    Roundps,
+    Roundpd,
+    Blendps,
+    Blendpd,
+    Pblendw,
+    Pextrb,
+    Pextrd,
+    Pextrq,
+    Extractps,
+    Pinsrb,
+    Insertps,
+    Pinsrd,
+    Pinsrq,
+    Pcmpgtq,
+    Rcpps,
+    Rcpss,
+    Rsqrtps,
+    Rsqrtss,
+    Minss,
+    Minsd,
+    Maxss,
+    Maxsd,
+    Cmpss,
+    Cmpsd,
+    Comiss,
+    Comisd,
+    Cvtss2si,
+    Cvtsd2si,
+    Cvtps2dq,
+    Cvtpd2dq,
+    Movlps,
+    Movhps,
+    Movlpd,
+    Movhpd,
+    Movntps,
+    Movntpd,
+    Movntdq,
+    Movntdqa,
+    Movnti,
+    Maskmovdqu,
+    Lddqu,
+    Pavgb,
+    Pavgw,
+    Pmaddwd,
+    Addsubps,
+    Addsubpd,
+    Hsubps,
+    Hsubpd,
+    Phaddsw,
+    Phsubw,
+    Phsubd,
+    Phsubsw,
+    Pmaddubsw,
+    Pmulhrsw,
+    Psignb,
+    Psignw,
+    Psignd,
+    Blendvps,
+    Blendvpd,
+    Pblendvb,
+    Dpps,
+    Dppd,
+    Mpsadbw,
+    Phminposuw,
+    Roundss,
+    Roundsd,
+    Pmovsxbd,
+    Pmovsxbq,
+    Pmovsxwq,
+    Pmovzxbd,
+    Pmovzxbq,
+    Pmovzxwq,
+    Crc32,
+    Lzcnt,
+    Bsf,
+    Bsr,
+    Prefetchnta,
+    Prefetcht0,
+    Prefetcht1,
+    Prefetcht2,
+    Sfence,
+    Lfence,
+    Pause,
     Vzeroupper,
     Vzeroall,
-    Vmovaps,
-    Vmovups,
-    Vmovapd,
-    Vmovupd,
-    Vmovdqa,
-    Vmovdqu,
-    Vaddss,
-    Vaddsd,
-    Vsubss,
-    Vsubsd,
-    Vmulss,
-    Vmulsd,
-    Vdivss,
-    Vdivsd,
-    Vsqrtss,
-    Vsqrtsd,
-    Vucomiss,
-    Vucomisd,
-    Vcvtsi2ss,
-    Vcvtsi2sd,
-    Vcvttss2si,
-    Vcvttsd2si,
-    Vaddps,
-    Vaddpd,
-    Vsubps,
-    Vsubpd,
-    Vmulps,
-    Vmulpd,
-    Vdivps,
-    Vdivpd,
-    Vsqrtps,
-    Vsqrtpd,
-    Vandps,
-    Vandpd,
-    Vorps,
-    Vorpd,
-    Vxorps,
-    Vxorpd,
-    Vpaddb,
-    Vpaddw,
-    Vpaddd,
-    Vpaddq,
-    Vpsubb,
-    Vpsubw,
-    Vpsubd,
-    Vpsubq,
-    Vpmulld,
-    Vpand,
-    Vpor,
-    Vpxor,
-    Vpcmpeqb,
-    Vpcmpeqw,
-    Vpcmpeqd,
-    Vpcmpeqq,
-    Vpcmpgtb,
-    Vpcmpgtw,
-    Vpcmpgtd,
-    Vpcmpgtq,
-    Vpslld,
-    Vpsllq,
-    Vpsrld,
-    Vpsrlq,
-    Vpsrad,
+    Vbroadcastss,
+    Vbroadcastsd,
+    Vpbroadcastb,
+    Vpbroadcastw,
+    Vpbroadcastd,
+    Vpbroadcastq,
+    Vbroadcasti128,
+    Vinsertf128,
+    Vinserti128,
+    Vextractf128,
+    Vextracti128,
+    Vperm2i128,
+    Vpermq,
+    Vpermd,
+    Vpblendd,
+    Vpsllvd,
+    Vpsllvq,
+    Vpsrlvd,
+    Vpsrlvq,
+    Vpsravd,
+    Vpsravq,
+    Vpsllvw,
+    Vpsrlvw,
+    Vpsravw,
+    Vpternlogd,
+    Vpternlogq,
+    Vpcmpb,
+    Vpcmpub,
+    Vpcmpw,
+    Vpcmpuw,
+    Vpcmpd,
+    Vpcmpud,
+    Vpcmpq,
+    Vpcmpuq,
+    Vpmovm2b,
+    Vpmovm2w,
+    Vpmovm2d,
+    Vpmovm2q,
+    Vpmovb2m,
+    Vpmovw2m,
+    Vpmovd2m,
+    Vpmovq2m,
+    Kmovb,
+    Kmovw,
+    Kmovd,
+    Kmovq,
+    Kortestb,
+    Kortestw,
+    Kortestd,
+    Kortestq,
+    Vpabsq,
+    Vpmaxsq,
+    Vpminsq,
+    Vpmaxuq,
+    Vpminuq,
+    Vpsraq,
+    Vpmullq,
+    Vrndscaleps,
+    Vrndscalepd,
+    Vinserti32x4,
+    Vextracti32x4,
+    Vinserti64x4,
+    Vextracti64x4,
+    Vshufi64x2,
+    Serialize,
+    Popcnt,
+    Tzcnt,
+    Andn,
+    Bextr,
+    Blsr,
+    Blsmsk,
+    Blsi,
+    Bzhi,
+    Pdep,
+    Pext,
+    Mulx,
+    Aesenc,
+    Aesenclast,
+    Aesdec,
+    Aesdeclast,
+    Aesimc,
+    Aeskeygenassist,
+    Pclmulqdq,
+    Gf2p8mulb,
+    Gf2p8affineqb,
+    Gf2p8affineinvqb,
+    Vbroadcastf128,
+    Vbroadcastf32x2,
+    Vbroadcasti32x2,
+    Vbroadcastf32x4,
+    Vbroadcasti32x4,
+    Vbroadcastf64x2,
+    Vbroadcasti64x2,
+    Vbroadcastf32x8,
+    Vbroadcasti32x8,
+    Vbroadcastf64x4,
+    Vbroadcasti64x4,
+    Vinsertf32x4,
+    Vextractf32x4,
+    Vinsertf64x2,
+    Vextractf64x2,
+    Vinserti64x2,
+    Vextracti64x2,
+    Vinsertf32x8,
+    Vextractf32x8,
+    Vinserti32x8,
+    Vextracti32x8,
+    Vinsertf64x4,
+    Vextractf64x4,
+    Vperm2f128,
+    Vpermilps,
+    Vpermilpd,
+    Vpermpd,
+    Vpermps,
+    Vpermb,
+    Vpermw,
+    Vpermt2b,
+    Vpermi2b,
+    Vpermt2w,
+    Vpermi2w,
+    Vpermt2d,
+    Vpermi2d,
+    Vpermt2q,
+    Vpermi2q,
+    Vpermt2ps,
+    Vpermi2ps,
+    Vpermt2pd,
+    Vpermi2pd,
+    Vshuff32x4,
+    Vshuff64x2,
+    Vshufi32x4,
+    Valignd,
+    Valignq,
+    Vdbpsadbw,
+    Vpmultishiftqb,
+    Vpblendmb,
+    Vpblendmw,
+    Vpblendmd,
+    Vpblendmq,
+    Vblendmps,
+    Vblendmpd,
+    Vmaskmovps,
+    Vmaskmovpd,
+    Vpmaskmovd,
+    Vpmaskmovq,
+    Vmovdqa32,
+    Vmovdqa64,
+    Vmovdqu8,
+    Vmovdqu16,
+    Vmovdqu32,
+    Vmovdqu64,
+    Vcompressps,
+    Vexpandps,
+    Vcompresspd,
+    Vexpandpd,
+    Vpcompressd,
+    Vpexpandd,
+    Vpcompressq,
+    Vpexpandq,
+    Vpcompressb,
+    Vpexpandb,
+    Vpcompressw,
+    Vpexpandw,
+    Vpgatherdd,
+    Vpgatherdq,
+    Vpgatherqd,
+    Vpgatherqq,
+    Vgatherdps,
+    Vgatherdpd,
+    Vgatherqps,
+    Vgatherqpd,
+    Vprold,
+    Vprolq,
+    Vprord,
+    Vprorq,
+    Vprolvd,
+    Vprolvq,
+    Vprorvd,
+    Vprorvq,
+    Vptestmb,
+    Vptestnmb,
+    Vptestmw,
+    Vptestnmw,
+    Vptestmd,
+    Vptestnmd,
+    Vptestmq,
+    Vptestnmq,
+    Vpmovwb,
+    Vpmovswb,
+    Vpmovuswb,
+    Vpmovdb,
+    Vpmovsdb,
+    Vpmovusdb,
+    Vpmovqb,
+    Vpmovsqb,
+    Vpmovusqb,
+    Vpmovdw,
+    Vpmovsdw,
+    Vpmovusdw,
+    Vpmovqw,
+    Vpmovsqw,
+    Vpmovusqw,
+    Vpmovqd,
+    Vpmovsqd,
+    Vpmovusqd,
+    Vpandq,
+    Vpandnq,
+    Vporq,
+    Vpxorq,
+    Vpconflictd,
+    Vpconflictq,
+    Vplzcntd,
+    Vplzcntq,
+    Vgetexpps,
+    Vgetexppd,
+    Vgetexpss,
+    Vgetexpsd,
+    Vrcp14ps,
+    Vrcp14pd,
+    Vrcp14ss,
+    Vrcp14sd,
+    Vrsqrt14ps,
+    Vrsqrt14pd,
+    Vrsqrt14ss,
+    Vrsqrt14sd,
+    Vscalefps,
+    Vscalefpd,
+    Vscalefss,
+    Vscalefsd,
+    Vgetmantps,
+    Vgetmantpd,
+    Vgetmantss,
+    Vgetmantsd,
+    Vreduceps,
+    Vreducepd,
+    Vreducess,
+    Vreducesd,
+    Vrangeps,
+    Vrangepd,
+    Vrangess,
+    Vrangesd,
+    Vfixupimmps,
+    Vfixupimmpd,
+    Vfixupimmss,
+    Vfixupimmsd,
+    Vrndscaless,
+    Vrndscalesd,
+    Vfpclassps,
+    Vfpclasspd,
+    Vfpclassss,
+    Vfpclasssd,
+    Vcvtps2udq,
+    Vcvttps2udq,
+    Vcvtudq2ps,
+    Vcvtpd2udq,
+    Vcvttpd2udq,
+    Vcvtudq2pd,
+    Vcvtpd2qq,
+    Vcvttpd2qq,
+    Vcvtpd2uqq,
+    Vcvttpd2uqq,
+    Vcvtps2qq,
+    Vcvttps2qq,
+    Vcvtps2uqq,
+    Vcvttps2uqq,
+    Vcvtqq2pd,
+    Vcvtuqq2pd,
+    Vcvtqq2ps,
+    Vcvtuqq2ps,
+    Vcvtss2usi,
+    Vcvtsd2usi,
+    Vcvttss2usi,
+    Vcvttsd2usi,
+    Vcvtusi2ss,
+    Vcvtusi2sd,
+    Vtestps,
+    Vtestpd,
+    Vpdpbusd,
+    Vpdpbusds,
+    Vpdpwssd,
+    Vpdpwssds,
+    Vpdpbssd,
+    Vpdpbssds,
+    Vpdpbsud,
+    Vpdpbsuds,
+    Vpdpbuud,
+    Vpdpbuuds,
+    Vpdpwsud,
+    Vpdpwsuds,
+    Vpdpwusd,
+    Vpdpwusds,
+    Vpdpwuud,
+    Vpdpwuuds,
+    Vminmaxps,
+    Vminmaxpd,
+    Vminmaxss,
+    Vminmaxsd,
+    Vcvttps2dqs,
+    Vcvttps2udqs,
+    Vcvttpd2dqs,
+    Vcvttpd2udqs,
+    Vcvttps2qqs,
+    Vcvttps2uqqs,
+    Vcvttpd2qqs,
+    Vcvttpd2uqqs,
+    Vcvtps2ibs,
+    Vcvtps2iubs,
+    Vcvttps2ibs,
+    Vcvttps2iubs,
+    Vmovw,
+    Vfmadd132ps,
+    Vfmadd132pd,
+    Vfmadd132ss,
+    Vfmadd132sd,
+    Vfmadd213ps,
+    Vfmadd213pd,
+    Vfmadd213ss,
+    Vfmadd213sd,
+    Vfmadd231ps,
+    Vfmadd231pd,
+    Vfmadd231ss,
+    Vfmadd231sd,
+    Vfmsub132ps,
+    Vfmsub132pd,
+    Vfmsub132ss,
+    Vfmsub132sd,
+    Vfmsub213ps,
+    Vfmsub213pd,
+    Vfmsub213ss,
+    Vfmsub213sd,
+    Vfmsub231ps,
+    Vfmsub231pd,
+    Vfmsub231ss,
+    Vfmsub231sd,
+    Vfnmadd132ps,
+    Vfnmadd132pd,
+    Vfnmadd132ss,
+    Vfnmadd132sd,
+    Vfnmadd213ps,
+    Vfnmadd213pd,
+    Vfnmadd213ss,
+    Vfnmadd213sd,
+    Vfnmadd231ps,
+    Vfnmadd231pd,
+    Vfnmadd231ss,
+    Vfnmadd231sd,
+    Vfnmsub132ps,
+    Vfnmsub132pd,
+    Vfnmsub132ss,
+    Vfnmsub132sd,
+    Vfnmsub213ps,
+    Vfnmsub213pd,
+    Vfnmsub213ss,
+    Vfnmsub213sd,
+    Vfnmsub231ps,
+    Vfnmsub231pd,
+    Vfnmsub231ss,
+    Vfnmsub231sd,
+    Vfmaddsub132ps,
+    Vfmaddsub132pd,
+    Vfmaddsub213ps,
+    Vfmaddsub213pd,
+    Vfmaddsub231ps,
+    Vfmaddsub231pd,
+    Vfmsubadd132ps,
+    Vfmsubadd132pd,
+    Vfmsubadd213ps,
+    Vfmsubadd213pd,
+    Vfmsubadd231ps,
+    Vfmsubadd231pd,
     Cmpxchg,
     Xadd,
     Xchg,
@@ -540,6 +1072,22 @@ public enum X86Register : byte
     Xmm13 = 45,
     Xmm14 = 46,
     Xmm15 = 47,
+    Xmm16 = 48,
+    Xmm17 = 49,
+    Xmm18 = 50,
+    Xmm19 = 51,
+    Xmm20 = 52,
+    Xmm21 = 53,
+    Xmm22 = 54,
+    Xmm23 = 55,
+    Xmm24 = 56,
+    Xmm25 = 57,
+    Xmm26 = 58,
+    Xmm27 = 59,
+    Xmm28 = 60,
+    Xmm29 = 61,
+    Xmm30 = 62,
+    Xmm31 = 63,
     Ymm0 = 64,
     Ymm1 = 65,
     Ymm2 = 66,
@@ -556,6 +1104,62 @@ public enum X86Register : byte
     Ymm13 = 77,
     Ymm14 = 78,
     Ymm15 = 79,
+    Ymm16 = 80,
+    Ymm17 = 81,
+    Ymm18 = 82,
+    Ymm19 = 83,
+    Ymm20 = 84,
+    Ymm21 = 85,
+    Ymm22 = 86,
+    Ymm23 = 87,
+    Ymm24 = 88,
+    Ymm25 = 89,
+    Ymm26 = 90,
+    Ymm27 = 91,
+    Ymm28 = 92,
+    Ymm29 = 93,
+    Ymm30 = 94,
+    Ymm31 = 95,
+    Zmm0 = 96,
+    Zmm1 = 97,
+    Zmm2 = 98,
+    Zmm3 = 99,
+    Zmm4 = 100,
+    Zmm5 = 101,
+    Zmm6 = 102,
+    Zmm7 = 103,
+    Zmm8 = 104,
+    Zmm9 = 105,
+    Zmm10 = 106,
+    Zmm11 = 107,
+    Zmm12 = 108,
+    Zmm13 = 109,
+    Zmm14 = 110,
+    Zmm15 = 111,
+    Zmm16 = 112,
+    Zmm17 = 113,
+    Zmm18 = 114,
+    Zmm19 = 115,
+    Zmm20 = 116,
+    Zmm21 = 117,
+    Zmm22 = 118,
+    Zmm23 = 119,
+    Zmm24 = 120,
+    Zmm25 = 121,
+    Zmm26 = 122,
+    Zmm27 = 123,
+    Zmm28 = 124,
+    Zmm29 = 125,
+    Zmm30 = 126,
+    Zmm31 = 127,
+    K0 = 128,
+    K1 = 129,
+    K2 = 130,
+    K3 = 131,
+    K4 = 132,
+    K5 = 133,
+    K6 = 134,
+    K7 = 135,
     Invalid = 255,
 }
 
@@ -573,6 +1177,8 @@ public readonly struct X86Operand
     public long Addend { get; }
     public X86ObjectRelocationKind RelocationKind { get; }
     public bool IsRipRelative { get; }
+    // A broadcast memory operand has the size of the whole operand it replaces
+    public bool IsBroadcast { get; }
     public bool HasSymbol => !string.IsNullOrEmpty(Symbol);
 
     private X86Operand(
@@ -587,7 +1193,8 @@ public readonly struct X86Operand
         string? symbol,
         long addend,
         X86ObjectRelocationKind relocationKind,
-        bool isRipRelative)
+        bool isRipRelative,
+        bool isBroadcast = false)
     {
         Kind = kind;
         Size = Math.Max(0, size);
@@ -601,6 +1208,7 @@ public readonly struct X86Operand
         Addend = addend;
         RelocationKind = relocationKind;
         IsRipRelative = isRipRelative;
+        IsBroadcast = isBroadcast;
     }
 
     public static X86Operand None => default;
@@ -630,7 +1238,10 @@ public readonly struct X86Operand
         => Memory(X86Register.Rip, 0, size, X86Register.Invalid, 1, symbol, X86ObjectRelocationKind.RipRelative32, addend, true);
 
     public X86Operand WithSize(int size)
-        => new X86Operand(Kind, size, Register, BaseRegister, IndexRegister, Scale, Displacement, Immediate, Symbol, Addend, RelocationKind, IsRipRelative);
+        => new X86Operand(Kind, size, Register, BaseRegister, IndexRegister, Scale, Displacement, Immediate, Symbol, Addend, RelocationKind, IsRipRelative, IsBroadcast);
+
+    public X86Operand WithBroadcast(bool broadcast)
+        => new X86Operand(Kind, Size, Register, BaseRegister, IndexRegister, Scale, Displacement, Immediate, Symbol, Addend, RelocationKind, IsRipRelative, broadcast);
 
     public X86Operand WithImmediate(long immediate)
         => new X86Operand(Kind, Size, Register, BaseRegister, IndexRegister, Scale, Displacement, immediate, Symbol, Addend, RelocationKind, IsRipRelative);
@@ -656,14 +1267,27 @@ internal readonly struct X86InstructionMetadata
     }
 }
 
+public enum X86RoundingMode : byte
+{
+    None,
+    Nearest,
+    Down,
+    Up,
+    Zero,
+}
+
 public readonly struct X86Instruction
 {
     public X86InstrKind Opcode { get; }
     public X86Operand Operand0 { get; }
     public X86Operand Operand1 { get; }
     public X86Operand Operand2 { get; }
+    public X86Operand Operand3 { get; }
     public X86Condition Condition { get; }
     public ImmutableArray<byte> RawBytes { get; }
+    public int OpMask { get; }
+    public bool Zeroing { get; }
+    public X86RoundingMode Rounding { get; }
 
     public X86Instruction(
         X86InstrKind opcode,
@@ -671,24 +1295,47 @@ public readonly struct X86Instruction
         X86Operand operand1 = default,
         X86Operand operand2 = default,
         X86Condition condition = X86Condition.E,
-        ImmutableArray<byte> rawBytes = default)
+        ImmutableArray<byte> rawBytes = default,
+        X86Operand operand3 = default,
+        int opMask = 0,
+        bool zeroing = false,
+        X86RoundingMode rounding = X86RoundingMode.None)
     {
         Opcode = opcode;
         Operand0 = operand0;
         Operand1 = operand1;
         Operand2 = operand2;
+        Operand3 = operand3;
         Condition = condition;
         RawBytes = rawBytes.IsDefault ? ImmutableArray<byte>.Empty : rawBytes;
+        OpMask = opMask;
+        Zeroing = zeroing;
+        Rounding = rounding;
     }
 
+    public int OperandCount
+        => Operand0.Kind == X86OperandKind.None ? 0 : Operand1.Kind == X86OperandKind.None ? 1 : Operand2.Kind == X86OperandKind.None ? 2 : Operand3.Kind == X86OperandKind.None ? 3 : 4;
+
+    public X86Operand GetOperand(int index)
+        => index switch { 0 => Operand0, 1 => Operand1, 2 => Operand2, 3 => Operand3, _ => throw new ArgumentOutOfRangeException(nameof(index)) };
+
     public X86Instruction WithOperand0(X86Operand operand)
-        => new X86Instruction(Opcode, operand, Operand1, Operand2, Condition, RawBytes);
+        => new X86Instruction(Opcode, operand, Operand1, Operand2, Condition, RawBytes, Operand3, OpMask, Zeroing, Rounding);
 
     public X86Instruction WithOperand1(X86Operand operand)
-        => new X86Instruction(Opcode, Operand0, operand, Operand2, Condition, RawBytes);
+        => new X86Instruction(Opcode, Operand0, operand, Operand2, Condition, RawBytes, Operand3, OpMask, Zeroing, Rounding);
 
     public X86Instruction WithOperand2(X86Operand operand)
-        => new X86Instruction(Opcode, Operand0, Operand1, operand, Condition, RawBytes);
+        => new X86Instruction(Opcode, Operand0, Operand1, operand, Condition, RawBytes, Operand3, OpMask, Zeroing, Rounding);
+
+    public X86Instruction WithMask(int opMask, bool zeroing)
+        => new X86Instruction(Opcode, Operand0, Operand1, Operand2, Condition, RawBytes, Operand3, opMask, zeroing, Rounding);
+
+    public X86Instruction WithRounding(X86RoundingMode rounding)
+        => new X86Instruction(Opcode, Operand0, Operand1, Operand2, Condition, RawBytes, Operand3, OpMask, Zeroing, rounding);
+
+    public static X86Instruction Quaternary(X86InstrKind opcode, X86Operand destination, X86Operand source1, X86Operand source2, X86Operand source3)
+        => new X86Instruction(opcode, destination, source1, source2, operand3: source3);
 
     public static X86Instruction Raw(IEnumerable<byte> bytes)
         => new X86Instruction(X86InstrKind.Raw, rawBytes: bytes is null ? ImmutableArray<byte>.Empty : bytes.ToImmutableArray());
@@ -804,10 +1451,42 @@ public sealed class X86Target
         var isa = X86IsaFlags.None;
         if ((features & TargetArchitectureFeatures.X86Sse2) != 0)
             isa |= X86IsaFlags.Sse | X86IsaFlags.Sse2;
+        if ((features & TargetArchitectureFeatures.X86Sse3) != 0)
+            isa |= X86IsaFlags.Sse3;
+        if ((features & TargetArchitectureFeatures.X86Ssse3) != 0)
+            isa |= X86IsaFlags.Ssse3;
+        if ((features & TargetArchitectureFeatures.X86Sse41) != 0)
+            isa |= X86IsaFlags.Sse41;
+        if ((features & TargetArchitectureFeatures.X86Sse42) != 0)
+            isa |= X86IsaFlags.Sse42 | X86IsaFlags.Popcnt;
+        if ((features & TargetArchitectureFeatures.X86Lzcnt) != 0)
+            isa |= X86IsaFlags.Lzcnt;
         if ((features & TargetArchitectureFeatures.X86Avx) != 0)
             isa |= X86IsaFlags.Avx;
         if ((features & TargetArchitectureFeatures.X86Avx2) != 0)
-            isa |= X86IsaFlags.Avx | X86IsaFlags.Avx2;
+            isa |= X86IsaFlags.Avx | X86IsaFlags.Avx2 | X86IsaFlags.Bmi1 | X86IsaFlags.Bmi2 | X86IsaFlags.Fma;
+        if ((features & TargetArchitectureFeatures.X86Avx512) != 0)
+            isa |= X86IsaFlags.Avx512F | X86IsaFlags.Avx512BW | X86IsaFlags.Avx512DQ | X86IsaFlags.Avx512CD;
+        if ((features & TargetArchitectureFeatures.X86Avx512Vbmi) != 0)
+            isa |= X86IsaFlags.Avx512Vbmi;
+        if ((features & TargetArchitectureFeatures.X86Avx512Vbmi2) != 0)
+            isa |= X86IsaFlags.Avx512Vbmi2;
+        if ((features & TargetArchitectureFeatures.X86Avx10v1) != 0)
+            isa |= X86IsaFlags.Avx512F | X86IsaFlags.Avx512BW | X86IsaFlags.Avx512DQ | X86IsaFlags.Avx512CD | X86IsaFlags.Avx512Vbmi | X86IsaFlags.Avx512Vbmi2;
+        if ((features & TargetArchitectureFeatures.X86Avx10v2) != 0)
+            isa |= X86IsaFlags.Avx10v2;
+        if ((features & TargetArchitectureFeatures.X86AvxVnni) != 0)
+            isa |= X86IsaFlags.AvxVnni;
+        if ((features & TargetArchitectureFeatures.X86AvxVnniInt) != 0)
+            isa |= X86IsaFlags.AvxVnniInt8 | X86IsaFlags.AvxVnniInt16;
+        if ((features & TargetArchitectureFeatures.X86Aes) != 0)
+            isa |= X86IsaFlags.Aes | X86IsaFlags.Pclmulqdq;
+        if ((features & TargetArchitectureFeatures.X86Vpclmulqdq) != 0)
+            isa |= X86IsaFlags.Vpclmulqdq;
+        if ((features & TargetArchitectureFeatures.X86Gfni) != 0)
+            isa |= X86IsaFlags.Gfni;
+        if ((features & TargetArchitectureFeatures.X86Serialize) != 0)
+            isa |= X86IsaFlags.Serialize;
 
         if (architecture == TargetArchitectureKind.I386)
             return new X86Target(32, X86AbiKind.Cdecl, isa, endianness, operatingSystem);
@@ -914,13 +1593,22 @@ internal static class X86Registers
         => register >= X86Register.Rax && register <= X86Register.R15;
 
     public static bool IsXmm(X86Register register)
-        => register >= X86Register.Xmm0 && register <= X86Register.Xmm15;
+        => register >= X86Register.Xmm0 && register <= X86Register.Xmm31;
 
     public static bool IsYmm(X86Register register)
-        => register >= X86Register.Ymm0 && register <= X86Register.Ymm15;
+        => register >= X86Register.Ymm0 && register <= X86Register.Ymm31;
+
+    public static bool IsZmm(X86Register register)
+        => register >= X86Register.Zmm0 && register <= X86Register.Zmm31;
+
+    public static bool IsMask(X86Register register)
+        => register >= X86Register.K0 && register <= X86Register.K7;
 
     public static bool IsVector(X86Register register)
-        => IsXmm(register) || IsYmm(register);
+        => IsXmm(register) || IsYmm(register) || IsZmm(register);
+
+    public static X86Register Vector(int index, int size)
+        => (X86Register)(index + size switch { 16 => (int)X86Register.Xmm0, 32 => (int)X86Register.Ymm0, _ => (int)X86Register.Zmm0 });
 
     public static bool IsInstructionPointer(X86Register register)
         => register == X86Register.Rip;
@@ -933,6 +1621,10 @@ internal static class X86Registers
             return (int)register - (int)X86Register.Xmm0;
         if (IsYmm(register))
             return (int)register - (int)X86Register.Ymm0;
+        if (IsZmm(register))
+            return (int)register - (int)X86Register.Zmm0;
+        if (IsMask(register))
+            return (int)register - (int)X86Register.K0;
         throw new ArgumentOutOfRangeException(nameof(register));
     }
 
@@ -955,6 +1647,10 @@ internal static class X86Registers
             return $"xmm{Index(register)}";
         if (IsYmm(register))
             return $"ymm{Index(register)}";
+        if (IsZmm(register))
+            return $"zmm{Index(register)}";
+        if (IsMask(register))
+            return $"k{Index(register)}";
         if (!IsGeneral(register))
             throw new ArgumentOutOfRangeException(nameof(register));
 
@@ -1007,11 +1703,14 @@ internal static class X86Registers
             Add(map, Gpr32[i], (X86Register)i, 4);
             Add(map, Gpr64[i], (X86Register)i, 8);
         }
-        for (var i = 0; i < 16; i++)
+        for (var i = 0; i < 32; i++)
         {
             Add(map, $"xmm{i}", (X86Register)((int)X86Register.Xmm0 + i), 16);
             Add(map, $"ymm{i}", (X86Register)((int)X86Register.Ymm0 + i), 32);
+            Add(map, $"zmm{i}", (X86Register)((int)X86Register.Zmm0 + i), 64);
         }
+        for (var i = 0; i < 8; i++)
+            Add(map, $"k{i}", (X86Register)((int)X86Register.K0 + i), 8);
         Add(map, "rip", X86Register.Rip, 8);
         return map;
     }
@@ -1043,14 +1742,31 @@ internal static class X86Registers
 
 internal static class X86InstructionTable
 {
-    private static readonly Dictionary<X86InstrKind, X86InstructionMetadata> ByOpcode = CreateOpcodeMap();
+    private static readonly string[] Mnemonics = CreateMnemonics();
     private static readonly Dictionary<string, X86InstrKind> ByMnemonic = CreateMnemonicMap();
 
     public static X86InstructionMetadata Get(X86InstrKind opcode)
     {
-        if (ByOpcode.TryGetValue(opcode, out var metadata))
-            return metadata;
-        throw new ArgumentOutOfRangeException(nameof(opcode));
+        if (opcode == X86InstrKind.Raw)
+            return new X86InstructionMetadata(X86InstructionFormat.Raw);
+        var forms = X86Forms.ForKind(opcode);
+        if (forms.Count == 0)
+            throw new ArgumentOutOfRangeException(nameof(opcode));
+        var form = forms[0];
+        var format = opcode switch
+        {
+            X86InstrKind.Call or X86InstrKind.Jmp or X86InstrKind.Jcc => X86InstructionFormat.Branch,
+            X86InstrKind.Setcc => X86InstructionFormat.ConditionUnary,
+            X86InstrKind.Cmovcc => X86InstructionFormat.ConditionBinary,
+            _ => form.ExplicitOperandCount switch
+            {
+                0 => X86InstructionFormat.NoOperands,
+                1 => X86InstructionFormat.Unary,
+                2 => X86InstructionFormat.Binary,
+                _ => X86InstructionFormat.Ternary,
+            },
+        };
+        return new X86InstructionMetadata(format, form.Isa, form.Has(X86FormFlags.Mode64));
     }
 
     public static X86InstrKind GetOpcode(string mnemonic)
@@ -1069,378 +1785,46 @@ internal static class X86InstructionTable
     }
 
     public static string GetMnemonic(X86InstrKind opcode)
+        => (uint)opcode < (uint)Mnemonics.Length ? Mnemonics[(int)opcode] : "invalid";
+
+    private static string[] CreateMnemonics()
     {
-        return opcode switch
+        var kinds = Enum.GetValues<X86InstrKind>();
+        var mnemonics = new string[kinds.Max(k => (int)k) + 1];
+        foreach (var kind in kinds)
         {
-            X86InstrKind.Raw => ".byte",
-            X86InstrKind.Nop => "nop",
-            X86InstrKind.Ret => "ret",
-            X86InstrKind.Push => "push",
-            X86InstrKind.Pop => "pop",
-            X86InstrKind.Mov => "mov",
-            X86InstrKind.Lea => "lea",
-            X86InstrKind.Movsx => "movsx",
-            X86InstrKind.Movsxd => "movsxd",
-            X86InstrKind.Movzx => "movzx",
-            X86InstrKind.Add => "add",
-            X86InstrKind.Or => "or",
-            X86InstrKind.Adc => "adc",
-            X86InstrKind.Sbb => "sbb",
-            X86InstrKind.And => "and",
-            X86InstrKind.Sub => "sub",
-            X86InstrKind.Xor => "xor",
-            X86InstrKind.Cmp => "cmp",
-            X86InstrKind.Cmpxchg => "cmpxchg",
-            X86InstrKind.Xadd => "xadd",
-            X86InstrKind.Xchg => "xchg",
-            X86InstrKind.Mfence => "mfence",
-            X86InstrKind.Test => "test",
-            X86InstrKind.Inc => "inc",
-            X86InstrKind.Dec => "dec",
-            X86InstrKind.Neg => "neg",
-            X86InstrKind.Not => "not",
-            X86InstrKind.Imul => "imul",
-            X86InstrKind.Mul => "mul",
-            X86InstrKind.Idiv => "idiv",
-            X86InstrKind.Div => "div",
-            X86InstrKind.Shl => "shl",
-            X86InstrKind.Shr => "shr",
-            X86InstrKind.Sar => "sar",
-            X86InstrKind.Rol => "rol",
-            X86InstrKind.Ror => "ror",
-            X86InstrKind.Call => "call",
-            X86InstrKind.Jmp => "jmp",
-            X86InstrKind.Jcc => "j" + X86Conditions.Format(X86Condition.E),
-            X86InstrKind.Setcc => "set" + X86Conditions.Format(X86Condition.E),
-            X86InstrKind.Cmovcc => "cmov" + X86Conditions.Format(X86Condition.E),
-            X86InstrKind.Cdq => "cdq",
-            X86InstrKind.Cqo => "cqo",
-            X86InstrKind.Cbw => "cbw",
-            X86InstrKind.Cwde => "cwde",
-            X86InstrKind.Cdqe => "cdqe",
-            X86InstrKind.Leave => "leave",
-            X86InstrKind.Int3 => "int3",
-            X86InstrKind.Ud2 => "ud2",
-            X86InstrKind.Syscall => "syscall",
-            X86InstrKind.Movss => "movss",
-            X86InstrKind.Movsd => "movsd",
-            X86InstrKind.Addss => "addss",
-            X86InstrKind.Addsd => "addsd",
-            X86InstrKind.Subss => "subss",
-            X86InstrKind.Subsd => "subsd",
-            X86InstrKind.Mulss => "mulss",
-            X86InstrKind.Mulsd => "mulsd",
-            X86InstrKind.Divss => "divss",
-            X86InstrKind.Divsd => "divsd",
-            X86InstrKind.Ucomiss => "ucomiss",
-            X86InstrKind.Ucomisd => "ucomisd",
-            X86InstrKind.Cvtsi2ss => "cvtsi2ss",
-            X86InstrKind.Cvtsi2sd => "cvtsi2sd",
-            X86InstrKind.Cvtss2sd => "cvtss2sd",
-            X86InstrKind.Cvtsd2ss => "cvtsd2ss",
-            X86InstrKind.Cvttss2si => "cvttss2si",
-            X86InstrKind.Cvttsd2si => "cvttsd2si",
-            X86InstrKind.Sqrtss => "sqrtss",
-            X86InstrKind.Sqrtsd => "sqrtsd",
-            X86InstrKind.Movaps => "movaps",
-            X86InstrKind.Movups => "movups",
-            X86InstrKind.Movapd => "movapd",
-            X86InstrKind.Movupd => "movupd",
-            X86InstrKind.Movdqa => "movdqa",
-            X86InstrKind.Movdqu => "movdqu",
-            X86InstrKind.Addps => "addps",
-            X86InstrKind.Addpd => "addpd",
-            X86InstrKind.Subps => "subps",
-            X86InstrKind.Subpd => "subpd",
-            X86InstrKind.Mulps => "mulps",
-            X86InstrKind.Mulpd => "mulpd",
-            X86InstrKind.Divps => "divps",
-            X86InstrKind.Divpd => "divpd",
-            X86InstrKind.Sqrtps => "sqrtps",
-            X86InstrKind.Sqrtpd => "sqrtpd",
-            X86InstrKind.Andps => "andps",
-            X86InstrKind.Andpd => "andpd",
-            X86InstrKind.Orps => "orps",
-            X86InstrKind.Orpd => "orpd",
-            X86InstrKind.Xorps => "xorps",
-            X86InstrKind.Xorpd => "xorpd",
-            X86InstrKind.Pxor => "pxor",
-            X86InstrKind.Vzeroupper => "vzeroupper",
-            X86InstrKind.Vzeroall => "vzeroall",
-            X86InstrKind.Vmovaps => "vmovaps",
-            X86InstrKind.Vmovups => "vmovups",
-            X86InstrKind.Vmovapd => "vmovapd",
-            X86InstrKind.Vmovupd => "vmovupd",
-            X86InstrKind.Vmovdqa => "vmovdqa",
-            X86InstrKind.Vmovdqu => "vmovdqu",
-            X86InstrKind.Vaddss => "vaddss",
-            X86InstrKind.Vaddsd => "vaddsd",
-            X86InstrKind.Vsubss => "vsubss",
-            X86InstrKind.Vsubsd => "vsubsd",
-            X86InstrKind.Vmulss => "vmulss",
-            X86InstrKind.Vmulsd => "vmulsd",
-            X86InstrKind.Vdivss => "vdivss",
-            X86InstrKind.Vdivsd => "vdivsd",
-            X86InstrKind.Vsqrtss => "vsqrtss",
-            X86InstrKind.Vsqrtsd => "vsqrtsd",
-            X86InstrKind.Vucomiss => "vucomiss",
-            X86InstrKind.Vucomisd => "vucomisd",
-            X86InstrKind.Vcvtsi2ss => "vcvtsi2ss",
-            X86InstrKind.Vcvtsi2sd => "vcvtsi2sd",
-            X86InstrKind.Vcvttss2si => "vcvttss2si",
-            X86InstrKind.Vcvttsd2si => "vcvttsd2si",
-            X86InstrKind.Vaddps => "vaddps",
-            X86InstrKind.Vaddpd => "vaddpd",
-            X86InstrKind.Vsubps => "vsubps",
-            X86InstrKind.Vsubpd => "vsubpd",
-            X86InstrKind.Vmulps => "vmulps",
-            X86InstrKind.Vmulpd => "vmulpd",
-            X86InstrKind.Vdivps => "vdivps",
-            X86InstrKind.Vdivpd => "vdivpd",
-            X86InstrKind.Vsqrtps => "vsqrtps",
-            X86InstrKind.Vsqrtpd => "vsqrtpd",
-            X86InstrKind.Vandps => "vandps",
-            X86InstrKind.Vandpd => "vandpd",
-            X86InstrKind.Vorps => "vorps",
-            X86InstrKind.Vorpd => "vorpd",
-            X86InstrKind.Vxorps => "vxorps",
-            X86InstrKind.Vxorpd => "vxorpd",
-            X86InstrKind.Vpaddb => "vpaddb",
-            X86InstrKind.Vpaddw => "vpaddw",
-            X86InstrKind.Vpaddd => "vpaddd",
-            X86InstrKind.Vpaddq => "vpaddq",
-            X86InstrKind.Vpsubb => "vpsubb",
-            X86InstrKind.Vpsubw => "vpsubw",
-            X86InstrKind.Vpsubd => "vpsubd",
-            X86InstrKind.Vpsubq => "vpsubq",
-            X86InstrKind.Vpmulld => "vpmulld",
-            X86InstrKind.Vpand => "vpand",
-            X86InstrKind.Vpor => "vpor",
-            X86InstrKind.Vpxor => "vpxor",
-            X86InstrKind.Vpcmpeqb => "vpcmpeqb",
-            X86InstrKind.Vpcmpeqw => "vpcmpeqw",
-            X86InstrKind.Vpcmpeqd => "vpcmpeqd",
-            X86InstrKind.Vpcmpeqq => "vpcmpeqq",
-            X86InstrKind.Vpcmpgtb => "vpcmpgtb",
-            X86InstrKind.Vpcmpgtw => "vpcmpgtw",
-            X86InstrKind.Vpcmpgtd => "vpcmpgtd",
-            X86InstrKind.Vpcmpgtq => "vpcmpgtq",
-            X86InstrKind.Vpslld => "vpslld",
-            X86InstrKind.Vpsllq => "vpsllq",
-            X86InstrKind.Vpsrld => "vpsrld",
-            X86InstrKind.Vpsrlq => "vpsrlq",
-            X86InstrKind.Vpsrad => "vpsrad",
-            _ => "invalid",
-        };
-    }
-
-    private static Dictionary<X86InstrKind, X86InstructionMetadata> CreateOpcodeMap()
-    {
-        var map = new Dictionary<X86InstrKind, X86InstructionMetadata>();
-        Add(map, X86InstrKind.Raw, X86InstructionFormat.Raw);
-        Add(map, X86InstrKind.Nop, X86InstructionFormat.NoOperands);
-        Add(map, X86InstrKind.Ret, X86InstructionFormat.NoOperands);
-        Add(map, X86InstrKind.Push, X86InstructionFormat.Unary);
-        Add(map, X86InstrKind.Pop, X86InstructionFormat.Unary);
-        Add(map, X86InstrKind.Mov, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Lea, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Movsx, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Movsxd, X86InstructionFormat.Binary, requires64Bit: true);
-        Add(map, X86InstrKind.Movzx, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Add, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Or, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Adc, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Sbb, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.And, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Sub, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Xor, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Cmp, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Cmpxchg, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Xadd, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Xchg, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Mfence, X86InstructionFormat.NoOperands);
-        Add(map, X86InstrKind.Test, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Inc, X86InstructionFormat.Unary);
-        Add(map, X86InstrKind.Dec, X86InstructionFormat.Unary);
-        Add(map, X86InstrKind.Neg, X86InstructionFormat.Unary);
-        Add(map, X86InstrKind.Not, X86InstructionFormat.Unary);
-        Add(map, X86InstrKind.Imul, X86InstructionFormat.Ternary);
-        Add(map, X86InstrKind.Mul, X86InstructionFormat.Unary);
-        Add(map, X86InstrKind.Idiv, X86InstructionFormat.Unary);
-        Add(map, X86InstrKind.Div, X86InstructionFormat.Unary);
-        Add(map, X86InstrKind.Shl, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Shr, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Sar, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Rol, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Ror, X86InstructionFormat.Binary);
-        Add(map, X86InstrKind.Call, X86InstructionFormat.Branch);
-        Add(map, X86InstrKind.Jmp, X86InstructionFormat.Branch);
-        Add(map, X86InstrKind.Jcc, X86InstructionFormat.Branch);
-        Add(map, X86InstrKind.Setcc, X86InstructionFormat.ConditionUnary);
-        Add(map, X86InstrKind.Cmovcc, X86InstructionFormat.ConditionBinary);
-        Add(map, X86InstrKind.Cdq, X86InstructionFormat.NoOperands);
-        Add(map, X86InstrKind.Cqo, X86InstructionFormat.NoOperands, requires64Bit: true);
-        Add(map, X86InstrKind.Cbw, X86InstructionFormat.NoOperands);
-        Add(map, X86InstrKind.Cwde, X86InstructionFormat.NoOperands);
-        Add(map, X86InstrKind.Cdqe, X86InstructionFormat.NoOperands, requires64Bit: true);
-        Add(map, X86InstrKind.Leave, X86InstructionFormat.NoOperands);
-        Add(map, X86InstrKind.Int3, X86InstructionFormat.NoOperands);
-        Add(map, X86InstrKind.Ud2, X86InstructionFormat.NoOperands);
-        Add(map, X86InstrKind.Syscall, X86InstructionFormat.NoOperands, requires64Bit: true);
-        Add(map, X86InstrKind.Movss, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Movsd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Addss, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Addsd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Subss, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Subsd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Mulss, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Mulsd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Divss, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Divsd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Ucomiss, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Ucomisd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Cvtsi2ss, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Cvtsi2sd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Cvtss2sd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Cvtsd2ss, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Cvttss2si, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Cvttsd2si, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Sqrtss, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Sqrtsd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Movaps, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Movups, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Movapd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Movupd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Movdqa, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Movdqu, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Addps, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Addpd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Subps, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Subpd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Mulps, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Mulpd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Divps, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Divpd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Sqrtps, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Sqrtpd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Andps, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Andpd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Orps, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Orpd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Xorps, X86InstructionFormat.Binary, X86IsaFlags.Sse);
-        Add(map, X86InstrKind.Xorpd, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Pxor, X86InstructionFormat.Binary, X86IsaFlags.Sse2);
-        Add(map, X86InstrKind.Vzeroupper, X86InstructionFormat.NoOperands, X86IsaFlags.Avx);
-        Add(map, X86InstrKind.Vzeroall, X86InstructionFormat.NoOperands, X86IsaFlags.Avx);
-        foreach (var op in AvxOpcodes())
-            Add(map, op, AvxBinaryOpcodes().Contains(op) ? X86InstructionFormat.Binary : X86InstructionFormat.Ternary, X86IsaFlags.Avx);
-        foreach (var op in Avx2Opcodes())
-            Add(map, op, X86InstructionFormat.Ternary, X86IsaFlags.Avx | X86IsaFlags.Avx2);
-        return map;
-    }
-
-    private static IEnumerable<X86InstrKind> AvxBinaryOpcodes()
-    {
-        yield return X86InstrKind.Vmovaps;
-        yield return X86InstrKind.Vmovups;
-        yield return X86InstrKind.Vmovapd;
-        yield return X86InstrKind.Vmovupd;
-        yield return X86InstrKind.Vmovdqa;
-        yield return X86InstrKind.Vmovdqu;
-        yield return X86InstrKind.Vucomiss;
-        yield return X86InstrKind.Vucomisd;
-        yield return X86InstrKind.Vcvttss2si;
-        yield return X86InstrKind.Vcvttsd2si;
-        yield return X86InstrKind.Vsqrtps;
-        yield return X86InstrKind.Vsqrtpd;
-    }
-
-    private static IEnumerable<X86InstrKind> AvxOpcodes()
-    {
-        yield return X86InstrKind.Vmovaps;
-        yield return X86InstrKind.Vmovups;
-        yield return X86InstrKind.Vmovapd;
-        yield return X86InstrKind.Vmovupd;
-        yield return X86InstrKind.Vmovdqa;
-        yield return X86InstrKind.Vmovdqu;
-        yield return X86InstrKind.Vaddss;
-        yield return X86InstrKind.Vaddsd;
-        yield return X86InstrKind.Vsubss;
-        yield return X86InstrKind.Vsubsd;
-        yield return X86InstrKind.Vmulss;
-        yield return X86InstrKind.Vmulsd;
-        yield return X86InstrKind.Vdivss;
-        yield return X86InstrKind.Vdivsd;
-        yield return X86InstrKind.Vsqrtss;
-        yield return X86InstrKind.Vsqrtsd;
-        yield return X86InstrKind.Vucomiss;
-        yield return X86InstrKind.Vucomisd;
-        yield return X86InstrKind.Vcvtsi2ss;
-        yield return X86InstrKind.Vcvtsi2sd;
-        yield return X86InstrKind.Vcvttss2si;
-        yield return X86InstrKind.Vcvttsd2si;
-        yield return X86InstrKind.Vaddps;
-        yield return X86InstrKind.Vaddpd;
-        yield return X86InstrKind.Vsubps;
-        yield return X86InstrKind.Vsubpd;
-        yield return X86InstrKind.Vmulps;
-        yield return X86InstrKind.Vmulpd;
-        yield return X86InstrKind.Vdivps;
-        yield return X86InstrKind.Vdivpd;
-        yield return X86InstrKind.Vsqrtps;
-        yield return X86InstrKind.Vsqrtpd;
-        yield return X86InstrKind.Vandps;
-        yield return X86InstrKind.Vandpd;
-        yield return X86InstrKind.Vorps;
-        yield return X86InstrKind.Vorpd;
-        yield return X86InstrKind.Vxorps;
-        yield return X86InstrKind.Vxorpd;
-    }
-
-    private static IEnumerable<X86InstrKind> Avx2Opcodes()
-    {
-        yield return X86InstrKind.Vpaddb;
-        yield return X86InstrKind.Vpaddw;
-        yield return X86InstrKind.Vpaddd;
-        yield return X86InstrKind.Vpaddq;
-        yield return X86InstrKind.Vpsubb;
-        yield return X86InstrKind.Vpsubw;
-        yield return X86InstrKind.Vpsubd;
-        yield return X86InstrKind.Vpsubq;
-        yield return X86InstrKind.Vpmulld;
-        yield return X86InstrKind.Vpand;
-        yield return X86InstrKind.Vpor;
-        yield return X86InstrKind.Vpxor;
-        yield return X86InstrKind.Vpcmpeqb;
-        yield return X86InstrKind.Vpcmpeqw;
-        yield return X86InstrKind.Vpcmpeqd;
-        yield return X86InstrKind.Vpcmpeqq;
-        yield return X86InstrKind.Vpcmpgtb;
-        yield return X86InstrKind.Vpcmpgtw;
-        yield return X86InstrKind.Vpcmpgtd;
-        yield return X86InstrKind.Vpcmpgtq;
-        yield return X86InstrKind.Vpslld;
-        yield return X86InstrKind.Vpsllq;
-        yield return X86InstrKind.Vpsrld;
-        yield return X86InstrKind.Vpsrlq;
-        yield return X86InstrKind.Vpsrad;
+            mnemonics[(int)kind] = kind switch
+            {
+                X86InstrKind.Raw => ".byte",
+                X86InstrKind.Jcc => "j",
+                X86InstrKind.Setcc => "set",
+                X86InstrKind.Cmovcc => "cmov",
+                _ => kind.ToString().ToLowerInvariant(),
+            };
+        }
+        return mnemonics;
     }
 
     private static Dictionary<string, X86InstrKind> CreateMnemonicMap()
     {
         var map = new Dictionary<string, X86InstrKind>(StringComparer.OrdinalIgnoreCase);
-        foreach (var pair in ByOpcode)
+        foreach (var kind in Enum.GetValues<X86InstrKind>())
         {
-            var mnemonic = GetMnemonic(pair.Key);
+            if (kind is X86InstrKind.Invalid || X86Forms.ForKind(kind).Count == 0 && kind != X86InstrKind.Raw)
+                continue;
+            var mnemonic = GetMnemonic(kind);
             if (mnemonic != "invalid" && !mnemonic.StartsWith("j", StringComparison.Ordinal) && !mnemonic.StartsWith("set", StringComparison.Ordinal) && !mnemonic.StartsWith("cmov", StringComparison.Ordinal))
-                map[mnemonic] = pair.Key;
+                map[mnemonic] = kind;
         }
         map["sal"] = X86InstrKind.Shl;
+        foreach (var form in X86Forms.Every)
+        {
+            if (form.Mnemonic is not null)
+                map[form.Mnemonic] = form.Kind;
+        }
         return map;
     }
 
-    private static void Add(Dictionary<X86InstrKind, X86InstructionMetadata> map, X86InstrKind opcode, X86InstructionFormat format, X86IsaFlags requiredIsa = X86IsaFlags.None, bool requires64Bit = false)
-        => map.Add(opcode, new X86InstructionMetadata(format, requiredIsa, requires64Bit));
 }
 
 internal static class X86Conditions

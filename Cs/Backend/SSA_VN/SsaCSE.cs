@@ -957,7 +957,8 @@ namespace Cnidaria.Cs
                         oldBlock.Flags,
                         statementsByBlock[b],
                         oldBlock.SuccessorBlockIds,
-                        oldBlock.SuccessorPcs));
+                        oldBlock.SuccessorPcs,
+                        oldBlock.Region));
                 }
                 return blocks.ToImmutable();
             }

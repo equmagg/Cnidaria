@@ -142,6 +142,7 @@ namespace Cnidaria.Cs
         MapSelect,
         MapStore,
         MapPhysicalStore,
+        HWIntrinsic,
         BitCast,
         ZeroObj,
         PtrToLoc,
@@ -2504,6 +2505,8 @@ namespace Cnidaria.Cs
                         return NumberUnpromotedLocalLoad(node, byrefExposed, blockId, statementIndex);
                     case GenTreeKind.Unary:
                         return Unary(node, operands, blockId);
+                    case GenTreeKind.HWIntrinsic:
+                        return HWIntrinsics.TouchesMemory(node) ? Call(node, operands, ref heap, ref byrefExposed, blockId) : HWIntrinsic(node, operands);
                     case GenTreeKind.Binary:
                         return Binary(node, operands, blockId);
                     case GenTreeKind.Conv:
@@ -2673,6 +2676,23 @@ namespace Cnidaria.Cs
                 ValueNumber conservative = liberalArg == conservativeArg
                     ? liberal
                     : _store.VNForFunc(node.StackKind, node.Type, func, conservativeArg);
+                return new ValueNumberPair(liberal, conservative);
+            }
+
+            private ValueNumberPair HWIntrinsic(GenTree node, ImmutableArray<ValueNumberPair> operands)
+            {
+                ValueNumber key = _store.VNForInt64(HWIntrinsics.ValueNumberKey(node.Int32, node.Int64));
+                var liberalArgs = ImmutableArray.CreateBuilder<ValueNumber>(operands.Length + 1);
+                var conservativeArgs = ImmutableArray.CreateBuilder<ValueNumber>(operands.Length + 1);
+                for (int i = 0; i < operands.Length; i++)
+                {
+                    liberalArgs.Add(OperandNormal(operands, i, ValueNumberCategory.Liberal));
+                    conservativeArgs.Add(OperandNormal(operands, i, ValueNumberCategory.Conservative));
+                }
+                liberalArgs.Add(key);
+                conservativeArgs.Add(key);
+                ValueNumber liberal = _store.VNForFunc(node.StackKind, node.Type, ValueNumberFunction.HWIntrinsic, liberalArgs.MoveToImmutable());
+                ValueNumber conservative = _store.VNForFunc(node.StackKind, node.Type, ValueNumberFunction.HWIntrinsic, conservativeArgs.MoveToImmutable());
                 return new ValueNumberPair(liberal, conservative);
             }
 
@@ -3497,6 +3517,10 @@ namespace Cnidaria.Cs
                         result = AddHelperOpaqueException(result, node);
                         break;
 
+                    case GenTreeKind.HWIntrinsic when node.CanThrow:
+                        result = AddHelperOpaqueException(result, node);
+                        break;
+
                     case GenTreeKind.ClassInit:
                     case GenTreeKind.NewObject:
                     case GenTreeKind.NewDelegate:
@@ -3775,6 +3799,11 @@ namespace Cnidaria.Cs
 
             private ValueNumber DefaultValue(RuntimeType? type, GenStackKind stackKind)
             {
+                if (SimdTypes.IsSimdKind(stackKind) && type is not null)
+                {
+                    long key = HWIntrinsics.Encode(SimdTypes.ElementType(type).PrimitiveKind, SimdTypes.SizeOf(stackKind));
+                    return _store.VNForFunc(stackKind, type, ValueNumberFunction.HWIntrinsic, _store.VNForInt64(HWIntrinsics.ValueNumberKey((int)HWIntrinsicId.Zero, key)));
+                }
                 if (stackKind == GenStackKind.Ref || stackKind == GenStackKind.ByRef || stackKind == GenStackKind.Null)
                     return _store.VNForNull(type);
                 if (stackKind == GenStackKind.I8)
@@ -4234,6 +4263,9 @@ namespace Cnidaria.Cs
                     GenTreeKind.Throw => false,
                     GenTreeKind.Rethrow => false,
                     GenTreeKind.EndFinally => false,
+                    GenTreeKind.CallFinally => false,
+                    GenTreeKind.CatchReturn => false,
+                    GenTreeKind.EndFilter => false,
                     _ => true,
                 };
             }

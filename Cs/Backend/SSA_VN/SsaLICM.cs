@@ -764,7 +764,7 @@ namespace Cnidaria.Cs
                         statements.ToImmutable(),
                         oldBlock.SuccessorBlockIds,
                         oldBlock.SuccessorPcs,
-                        oldBlock.RegionPc));
+                        oldBlock.Region));
                 }
 
                 return _method.GenTreeMethod.CloneWithBlocks(blocks.ToImmutable());
@@ -947,7 +947,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.Return or
                 GenTreeKind.Throw or
                 GenTreeKind.Rethrow or
-                GenTreeKind.EndFinally
+                GenTreeKind.EndFinally or GenTreeKind.CallFinally or GenTreeKind.CatchReturn or GenTreeKind.EndFilter
                     ? lastIndex
                     : statements.Length;
         }

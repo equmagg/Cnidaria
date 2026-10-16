@@ -363,14 +363,16 @@ namespace Cnidaria.Cs
         private MethodSymbol GetOrCreateTopLevelMain(
             SyntaxTree tree, SourceNamedTypeSymbol programType, SyntaxNode locationNode)
         {
-            var voidType = _types.GetSpecialType(SpecialType.System_Void);
+            bool returnsValue = false;
+            foreach (var member in tree.Root.Members)
+                returnsValue |= member is GlobalStatementSyntax global && ReturnsValue(global.Statement);
+            var returnType = _types.GetSpecialType(returnsValue ? SpecialType.System_Int32 : SpecialType.System_Void);
             var stringType = _types.GetSpecialType(SpecialType.System_String);
-
 
             var main = new SourceMethodSymbol(
                 name: "<Main>$",
                 containing: programType,
-                returnType: voidType,
+                returnType: returnType,
                 typeParameters: default,
                 isStatic: true,
                 isConstructor: false,
@@ -389,6 +391,68 @@ namespace Cnidaria.Cs
             main.SetParameters(ImmutableArray.Create(argsParam));
             programType.AddMember(main);
             return main;
+        }
+
+        // A return with a value among the top-level statements, outside lambdas and local functions, makes the entry point return int
+        private static bool ReturnsValue(StatementSyntax statement)
+        {
+            static bool Any(IEnumerable<StatementSyntax> statements)
+            {
+                foreach (var statement in statements)
+                {
+                    if (ReturnsValue(statement))
+                        return true;
+                }
+                return false;
+            }
+
+            switch (statement)
+            {
+                case ReturnStatementSyntax r:
+                    return r.Expression is not null;
+                case BlockSyntax b:
+                    return Any(b.Statements);
+                case IfStatementSyntax i:
+                    return ReturnsValue(i.Statement) || i.Else is not null && ReturnsValue(i.Else.Statement);
+                case SwitchStatementSyntax s:
+                    foreach (var section in s.Sections)
+                    {
+                        if (Any(section.Statements))
+                            return true;
+                    }
+                    return false;
+                case TryStatementSyntax t:
+                    foreach (var c in t.Catches)
+                    {
+                        if (ReturnsValue(c.Block))
+                            return true;
+                    }
+                    return ReturnsValue(t.Block) || t.Finally is not null && ReturnsValue(t.Finally.Block);
+                case LabeledStatementSyntax l:
+                    return ReturnsValue(l.Statement);
+                case DoStatementSyntax d:
+                    return ReturnsValue(d.Statement);
+                case WhileStatementSyntax w:
+                    return ReturnsValue(w.Statement);
+                case ForStatementSyntax f:
+                    return ReturnsValue(f.Statement);
+                case ForEachStatementSyntax f:
+                    return ReturnsValue(f.Statement);
+                case ForEachVariableStatementSyntax f:
+                    return ReturnsValue(f.Statement);
+                case UsingStatementSyntax u:
+                    return ReturnsValue(u.Statement);
+                case FixedStatementSyntax f:
+                    return ReturnsValue(f.Statement);
+                case LockStatementSyntax l:
+                    return ReturnsValue(l.Statement);
+                case UnsafeStatementSyntax u:
+                    return ReturnsValue(u.Block);
+                case CheckedStatementSyntax c:
+                    return ReturnsValue(c.Block);
+                default:
+                    return false;
+            }
         }
         private void DeclareNamespaceDeclaration(SyntaxTree tree, BaseNamespaceDeclarationSyntax syntax, SourceNamespaceSymbol container)
         {

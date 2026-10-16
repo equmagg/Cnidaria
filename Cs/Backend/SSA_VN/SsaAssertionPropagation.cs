@@ -1024,7 +1024,7 @@ namespace Cnidaria.Cs
                             for (int regionIndex = 0; regionIndex < _method.Cfg.ExceptionRegions.Length; regionIndex++)
                             {
                                 var region = _method.Cfg.ExceptionRegions[regionIndex];
-                                if (region.HandlerStartBlockId != blockId)
+                                if (region.HandlerStartBlockId != blockId && region.HandlerBodyStartBlockId != blockId)
                                     continue;
                                 if ((uint)region.TryStartBlockId >= (uint)_blockIn.Length)
                                     continue;

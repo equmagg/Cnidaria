@@ -66,6 +66,8 @@ namespace Cnidaria.Cs
             CatchTypeToken = catchTypeToken;
             FilterStartPc = filterStartPc;
         }
+
+        public int HandlerRegionStartPc => Kind == CilExceptionClauseKind.Filter ? FilterStartPc : HandlerStartPc;
     }
     // Branch and clause operands are instruction indexes. Short and macro opcode forms are expanded,
     // and prefixes are folded into the instruction they apply to.

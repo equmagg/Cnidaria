@@ -69,7 +69,7 @@ namespace Cnidaria.Cs
                 return c._captures.ToImmutable();
             }
 
-            protected override BoundExpression RewriteExpression(BoundExpression node)
+            protected override BoundExpression RewriteExpressionCore(BoundExpression node)
             {
                 switch (node)
                 {
@@ -86,7 +86,7 @@ namespace Cnidaria.Cs
                         throw new NotSupportedException("Capturing 'this' in lambdas is not implemented by this closure lowering pass yet.");
 
                     default:
-                        return base.RewriteExpression(node);
+                        return base.RewriteExpressionCore(node);
                 }
             }
 
@@ -183,7 +183,7 @@ namespace Cnidaria.Cs
 
             ParameterSymbol? closureParameter = null;
             MethodSymbol targetMethod = node.Method;
-            BoundExpression? target = node.TargetOpt;
+            BoundExpression? target = node.TargetOpt is null ? null : RewriteExpression(node.TargetOpt);
             var enclosingTypeParameters = GetEnclosingMethodTypeParameters(node.Method);
 
             if (!externalCaptures.IsDefaultOrEmpty || !enclosingTypeParameters.IsDefaultOrEmpty)
@@ -253,6 +253,36 @@ namespace Cnidaria.Cs
 
             return node;
         }
+        protected override BoundCatchBlock RewriteCatchBlock(BoundCatchBlock node)
+        {
+            var rewritten = base.RewriteCatchBlock(node);
+            if (node.ExceptionLocalOpt is not LocalSymbol exceptionLocal ||
+                !_cellByCapturedSymbol.TryGetValue(exceptionLocal, out var cell) || cell is not BoundLocalExpression cellLocal)
+            {
+                return rewritten;
+            }
+
+            var cellInit = new BoundClosureCellCreationExpression(
+                node.Syntax, _cellType, exceptionLocal.Type, new BoundLocalExpression(node.Syntax, exceptionLocal));
+            var declaration = new BoundLocalDeclarationStatement(node.Syntax, cellLocal.Local, cellInit);
+            BoundExpression? filter = rewritten.FilterOpt;
+            BoundBlockStatement body = rewritten.Body;
+            if (filter is not null)
+            {
+                filter = new BoundSequenceExpression(
+                    filter.Syntax,
+                    ImmutableArray.Create(cellLocal.Local),
+                    ImmutableArray.Create<BoundStatement>(declaration),
+                    filter);
+            }
+            else
+            {
+                body = new BoundBlockStatement(body.Syntax, body.Statements.Insert(0, declaration));
+            }
+
+            return new BoundCatchBlock((CatchClauseSyntax)node.Syntax, node.ExceptionType, exceptionLocal, filter, body);
+        }
+
         protected override BoundStatement RewriteLocalDeclarationStatement(BoundLocalDeclarationStatement node)
         {
             if (_cellByCapturedSymbol.TryGetValue(node.Local, out var cell) && cell is BoundLocalExpression cellLocal)
@@ -268,7 +298,7 @@ namespace Cnidaria.Cs
             return base.RewriteLocalDeclarationStatement(node);
         }
 
-        protected override BoundExpression RewriteExpression(BoundExpression node)
+        protected override BoundExpression RewriteExpressionCore(BoundExpression node)
         {
             switch (node)
             {
@@ -279,7 +309,7 @@ namespace Cnidaria.Cs
                     return new BoundClosureAccessExpression(parameter.Syntax, parameter.Parameter.Type, parameterCell);
 
                 default:
-                    return base.RewriteExpression(node);
+                    return base.RewriteExpressionCore(node);
             }
         }
 
@@ -475,7 +505,7 @@ namespace Cnidaria.Cs
                 return node;
             }
 
-            protected override BoundExpression RewriteExpression(BoundExpression node)
+            protected override BoundExpression RewriteExpressionCore(BoundExpression node)
             {
                 switch (node)
                 {
@@ -488,7 +518,7 @@ namespace Cnidaria.Cs
                         return node;
 
                     default:
-                        return base.RewriteExpression(node);
+                        return base.RewriteExpressionCore(node);
                 }
             }
 
@@ -580,7 +610,7 @@ namespace Cnidaria.Cs
             }
         }
 
-        protected override BoundExpression RewriteExpression(BoundExpression node)
+        protected override BoundExpression RewriteExpressionCore(BoundExpression node)
         {
             switch (node)
             {
@@ -597,7 +627,7 @@ namespace Cnidaria.Cs
                     return RewriteClosedLambdaExpression(lambda);
 
                 default:
-                    return base.RewriteExpression(node);
+                    return base.RewriteExpressionCore(node);
             }
         }
 

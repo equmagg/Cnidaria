@@ -469,8 +469,8 @@ namespace Cnidaria.Cs
         public static TargetInfo RVA23Linux { get; } = ForArchitecture(TargetArchitectureKind.RiscV64, OperatingSystemKind.Linux, TargetArchitectureFeatures.RVA23);
         public static TargetInfo X86 { get; } = ForArchitecture(TargetArchitectureKind.I386);
         public static TargetInfo X64 { get; } = ForArchitecture(TargetArchitectureKind.X86_64);
-        public static TargetInfo X64Linux { get; } = ForArchitecture(TargetArchitectureKind.X86_64, OperatingSystemKind.Linux);
-        public static TargetInfo X64Windows { get; } = ForArchitecture(TargetArchitectureKind.X86_64, OperatingSystemKind.Windows);
+        public static TargetInfo X64Linux { get; } = ForArchitecture(TargetArchitectureKind.X86_64, OperatingSystemKind.Linux, TargetArchitectureFeatures.X86V2);
+        public static TargetInfo X64Windows { get; } = ForArchitecture(TargetArchitectureKind.X86_64, OperatingSystemKind.Windows, TargetArchitectureFeatures.X86V2);
         public static TargetInfo Arm32 { get; } = ForArchitecture(TargetArchitectureKind.Arm32);
         public static TargetInfo Arm64 { get; } = ForArchitecture(TargetArchitectureKind.Arm64);
 
@@ -521,7 +521,8 @@ namespace Cnidaria.Cs
         public int StringLengthOffset => ManagedObjectHeaderSize;
         public int StringFirstCharOffset => StringLengthOffset + 4;
         public int ArrayLengthOffset => ManagedObjectHeaderSize;
-        public int ArrayDataOffset => ArrayLengthOffset + (ManagedObjectHeaderSize == PointerSize ? (Is64Bit ? 8 : 4) : 8);
+        // The length is padded to a pointer, as RawArrayData lays it out on every target sharing a BCL build
+        public int ArrayDataOffset => ArrayLengthOffset + PointerSize;
         public bool Is32Bit => PointerSize == 4;
         public bool Is64Bit => PointerSize == 8;
         public bool IsRegisterBytecode => Architecture is TargetArchitectureKind.RegisterBytecode or TargetArchitectureKind.RegisterBytecode64;
@@ -939,7 +940,9 @@ namespace Cnidaria.Cs
                 var ctxOwnerArgs = methodContext.DeclaringType.GenericTypeArguments;
                 var ctxMethodArgs = methodContext.MethodGenericArguments;
 
-                resolved = BindMethodToReceiver(resolved, methodContext.DeclaringType);
+                // A closed instantiation such as S<int> referenced from inside S<T> names its own members
+                if (resolved.DeclaringType.GenericTypeDefinition is null || RuntimeTypeNames.ContainsGenericParameters(resolved.DeclaringType))
+                    resolved = BindMethodToReceiver(resolved, methodContext.DeclaringType);
 
                 RuntimeType substitutedOwner = SubstituteRuntimeType(resolved.DeclaringType, ctxOwnerArgs, ctxMethodArgs);
                 if (!ReferenceEquals(substitutedOwner, resolved.DeclaringType))
@@ -1366,6 +1369,13 @@ namespace Cnidaria.Cs
 
         internal RuntimeType GetRequiredNamedType(string asm, string ns, string name)
             => FindRequired(asm, ns, name);
+
+        internal RuntimeType GetGenericInstanceType(RuntimeType genericDefinition, params RuntimeType[] arguments)
+        {
+            var t = GetOrCreateGenericInstanceType(genericDefinition, arguments);
+            EnsureLayout(t);
+            return t;
+        }
 
         internal RuntimeType GetPointerType(RuntimeType elementType)
         {
@@ -4062,7 +4072,7 @@ namespace Cnidaria.Cs
             return sb.Append(']').ToString();
         }
 
-        private static bool ContainsGenericParameters(RuntimeType type)
+        internal static bool ContainsGenericParameters(RuntimeType type)
         {
             if (type.Kind == RuntimeTypeKind.TypeParam)
                 return true;

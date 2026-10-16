@@ -29,12 +29,15 @@ namespace Cnidaria.Cs
         public bool OptimizeSsa { get; set; } = true;
         public bool ValidateHir { get; set; } = true;
         public bool ValidateSsa { get; set; } = true;
+        public bool EnableFinallyOptimization { get; set; } = true;
         public bool EnablePhysicalPromotion { get; set; } = true;
         public bool EnableLoopInversion { get; set; } = true;
+        public bool EnableLoopCloning { get; set; } = true;
         public bool EnableLoopUnrolling { get; set; } = true;
 
         public PhysicalPromotionOptions PhysicalPromotionOptions { get; set; } = PhysicalPromotionOptions.Default;
         public LoopInversionOptions LoopInversionOptions { get; set; } = LoopInversionOptions.Default;
+        public LoopCloningOptions LoopCloningOptions { get; set; } = LoopCloningOptions.Default;
         public LoopUnrollingOptions LoopUnrollingOptions { get; set; } = LoopUnrollingOptions.Default;
         public SsaOptimizationOptions SsaOptimizationOptions { get; set; } = SsaOptimizationOptions.DefaultWithoutValidation;
         public LinearRationalizationOptions RationalizationOptions { get; set; } = LinearRationalizationOptions.Default;
@@ -414,6 +417,9 @@ namespace Cnidaria.Cs
 
         private static GenTreeMethod PrepareHir(GenTreeMethod method, BackendOptions options)
         {
+            if (options.EnableFinallyOptimization)
+                method = GenTreeFinallyOptimizer.OptimizeMethod(method);
+
             method = GenTreeClassInitializationEntryInserter.Insert(method);
 
             method = GenTreeMorpher.MorphMethod(method);
@@ -432,6 +438,9 @@ namespace Cnidaria.Cs
             if (options.EnableLoopInversion)
                 method = GenTreeLoopInverter.InvertLoops(method, options.LoopInversionOptions);
 
+            if (options.EnableLoopCloning)
+                method = GenTreeLoopCloner.CloneLoops(method, options.LoopCloningOptions);
+
             if (options.EnableLoopUnrolling)
                 method = GenTreeLoopUnroller.UnrollLoops(method, options.LoopUnrollingOptions);
 
@@ -447,7 +456,8 @@ namespace Cnidaria.Cs
                     var preSplitCfg = ControlFlowGraph.Build(method);
                     split = GenTreeCriticalEdgeSplitter.SplitCriticalEdges(
                         method,
-                        edge => CanSplitCriticalEdgeWithEh(preSplitCfg, edge));
+                        edge => CanSplitCriticalEdgeWithEh(preSplitCfg, edge),
+                        preSplitCfg);
                 }
 
                 if (!ReferenceEquals(split, method))
@@ -479,18 +489,8 @@ namespace Cnidaria.Cs
                 return false;
 
             var from = cfg.Blocks[edge.FromBlockId];
-            var to = cfg.Blocks[edge.ToBlockId];
-
-            if (from.IsInHandlerRegion || to.IsInHandlerRegion || to.IsHandlerEntry)
-                return false;
-
-            if (!to.IsInTryRegion)
-                return true;
-
-            if (GenTreeCriticalEdgeSplitter.IsTryRegionEntry(cfg, edge.ToBlockId))
-                return false;
-
-            return GenTreeCriticalEdgeSplitter.SameEhRegion(from, to);
+            return from.SourceBlock.JumpKind is not (GenTreeBlockJumpKind.EndFinally or GenTreeBlockJumpKind.CatchReturn or GenTreeBlockJumpKind.EndFilter) &&
+                GenTreeCriticalEdgeSplitter.SameFunclet(from, cfg.Blocks[edge.ToBlockId]);
         }
 
         private static LinearRationalizationOptions CreateLirOptions(
@@ -561,7 +561,7 @@ namespace Cnidaria.Cs
                 statements.ToImmutable(),
                 entry.SuccessorBlockIds,
                 entry.SuccessorPcs,
-                entry.RegionPc);
+                entry.Region);
             return method.CloneWithBlocks(blocks.ToImmutableArray());
         }
     }
@@ -646,7 +646,7 @@ namespace Cnidaria.Cs
                         rewritten.ToImmutable(),
                         block.SuccessorBlockIds,
                         block.SuccessorPcs,
-                        block.RegionPc);
+                        block.Region);
                 }
 
                 var children = cfg.DominatorTreeChildren[blockId];
@@ -705,7 +705,7 @@ namespace Cnidaria.Cs
                         statements.ToImmutable(),
                         block.SuccessorBlockIds,
                         block.SuccessorPcs,
-                        block.RegionPc));
+                        block.Region));
                 }
                 else
                 {
@@ -922,6 +922,10 @@ namespace Cnidaria.Cs
                     flags |= GenTreeIntrinsicSemantics.Flags(node.IntrinsicId);
                     break;
 
+                case GenTreeKind.HWIntrinsic:
+                    flags |= HWIntrinsics.EffectFlags(node);
+                    break;
+
                 case GenTreeKind.ClassInit:
                 case GenTreeKind.Call:
                 case GenTreeKind.IndirectCall:
@@ -1032,6 +1036,9 @@ namespace Cnidaria.Cs
                 case GenTreeKind.BranchFalse:
                 case GenTreeKind.Return:
                 case GenTreeKind.EndFinally:
+                case GenTreeKind.CallFinally:
+                case GenTreeKind.CatchReturn:
+                case GenTreeKind.EndFilter:
                     flags |= GenTreeFlags.ControlFlow | GenTreeFlags.Ordered;
                     break;
 
@@ -1169,7 +1176,7 @@ namespace Cnidaria.Cs
                     statements.ToImmutable(),
                     block.SuccessorBlockIds,
                     block.SuccessorPcs,
-                    block.RegionPc));
+                    block.Region));
             }
 
             if (!changed)
@@ -1361,7 +1368,8 @@ namespace Cnidaria.Cs
                 if (parent is not null && SsaSlotHelpers.IsContainedLocalFieldAddressUse(parent, operandIndex))
                 {
                     node.Flags &= ~GenTreeFlags.AddressExposed;
-                    node.LocalDescriptor?.MarkPromotedStructParent();
+                    if (node.LocalDescriptor is not null)
+                        MarkFieldAccessedLocal(node.LocalDescriptor);
                 }
                 else if (node.LocalDescriptor is not null)
                 {
@@ -1377,10 +1385,18 @@ namespace Cnidaria.Cs
             {
                 var descriptor = localFieldAccess.Receiver?.LocalDescriptor ?? node.LocalDescriptor;
                 if (descriptor is not null)
-                    descriptor.MarkPromotedStructParent();
+                    MarkFieldAccessedLocal(descriptor);
 
                 GenTreeMorpher.NormalizeLocalFieldFlags(node, localFieldAccess);
             }
+        }
+
+        private static void MarkFieldAccessedLocal(GenLocalDescriptor descriptor)
+        {
+            if (SimdTypes.IsSimdKind(descriptor.StackKind))
+                descriptor.MarkMemoryAliased();
+            else
+                descriptor.MarkPromotedStructParent();
         }
     }
     internal static class GenTreeHirVerifier

@@ -67,7 +67,7 @@ namespace Cnidaria.Cs
             return base.RewriteStatement(node);
         }
 
-        protected override BoundExpression RewriteExpression(BoundExpression node)
+        protected override BoundExpression RewriteExpressionCore(BoundExpression node)
         {
             try
             {
@@ -75,10 +75,10 @@ namespace Cnidaria.Cs
             }
             catch (InsufficientExecutionStackException)
             {
-                return _stackGuard.RunOnEmptyStack(() => base.RewriteExpression(node));
+                return _stackGuard.RunOnEmptyStack(() => base.RewriteExpressionCore(node));
             }
 
-            return base.RewriteExpression(node);
+            return base.RewriteExpressionCore(node);
         }
     }
     /// <summary>Recursively rewrites bound trees</summary>
@@ -152,7 +152,39 @@ namespace Cnidaria.Cs
             };
         }
 
-        protected virtual BoundExpression RewriteExpression(BoundExpression node)
+        private Dictionary<BoundExpression, BoundExpression>? _expressionReplacements;
+
+        protected BoundExpression RewriteExpression(BoundExpression node)
+        {
+            if (_expressionReplacements is not null && _expressionReplacements.TryGetValue(node, out var replacement))
+                return replacement;
+
+            return RewriteExpressionCore(node);
+        }
+
+        // Mutation nodes share their lvalue with the read inside Value; lowering replaces that read by identity.
+        private BoundExpression RewriteWithSharedExpression(BoundExpression value, BoundExpression original, BoundExpression rewritten)
+        {
+            if (ReferenceEquals(original, rewritten))
+                return RewriteExpression(value);
+
+            _expressionReplacements ??= new Dictionary<BoundExpression, BoundExpression>(ReferenceEqualityComparer<BoundExpression>.Instance);
+            _expressionReplacements.TryGetValue(original, out var previous);
+            _expressionReplacements[original] = rewritten;
+            try
+            {
+                return RewriteExpression(value);
+            }
+            finally
+            {
+                if (previous is not null)
+                    _expressionReplacements[original] = previous;
+                else
+                    _expressionReplacements.Remove(original);
+            }
+        }
+
+        protected virtual BoundExpression RewriteExpressionCore(BoundExpression node)
         {
             if (node is null) throw new ArgumentNullException(nameof(node));
 
@@ -901,10 +933,13 @@ namespace Cnidaria.Cs
         protected virtual BoundExpression RewriteCompoundAssignmentExpression(BoundCompoundAssignmentExpression node)
         {
             var left = RewriteExpression(node.Left);
-            var value = RewriteExpression(node.Value);
+            var read = ReferenceEquals(node.Read, node.Left) ? left : RewriteExpression(node.Read);
+            var value = node.UsesDirectOperator
+                ? RewriteWithSharedExpression(node.Value, node.Left, left)
+                : RewriteWithSharedExpression(node.Value, node.Read, read);
 
-            if (!ReferenceEquals(left, node.Left) || !ReferenceEquals(value, node.Value))
-                return new BoundCompoundAssignmentExpression(node.Syntax, left, node.OperatorKind, value,
+            if (!ReferenceEquals(left, node.Left) || !ReferenceEquals(read, node.Read) || !ReferenceEquals(value, node.Value))
+                return new BoundCompoundAssignmentExpression(node.Syntax, left, read, node.OperatorKind, value,
                     node.OperatorMethodOpt, node.UsesDirectOperator, node.IsChecked);
 
             return node;
@@ -922,8 +957,10 @@ namespace Cnidaria.Cs
         protected virtual BoundExpression RewriteIncrementDecrementExpression(BoundIncrementDecrementExpression node)
         {
             var target = RewriteExpression(node.Target);
-            var read = RewriteExpression(node.Read);
-            var value = RewriteExpression(node.Value);
+            var read = ReferenceEquals(node.Read, node.Target) ? target : RewriteExpression(node.Read);
+            var value = node.UsesDirectOperator
+                ? RewriteWithSharedExpression(node.Value, node.Target, target)
+                : RewriteWithSharedExpression(node.Value, node.Read, read);
 
             if (!ReferenceEquals(target, node.Target) ||
                 !ReferenceEquals(read, node.Read) ||

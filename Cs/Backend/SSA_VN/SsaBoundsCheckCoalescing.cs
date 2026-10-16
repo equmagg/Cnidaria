@@ -319,7 +319,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.Return or
                 GenTreeKind.Throw or
                 GenTreeKind.Rethrow or
-                GenTreeKind.EndFinally;
+                GenTreeKind.EndFinally or GenTreeKind.CallFinally or GenTreeKind.CatchReturn or GenTreeKind.EndFilter;
 
         private static bool HasNodeOwnedNonRangeException(GenTree node, TargetInfo target)
         {

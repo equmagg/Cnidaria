@@ -103,7 +103,7 @@ namespace Cnidaria.Cs
                             statements.ToImmutable(),
                             block.SuccessorBlockIds,
                             block.SuccessorPcs,
-                            block.RegionPc));
+                            block.Region));
                     }
                     else
                     {

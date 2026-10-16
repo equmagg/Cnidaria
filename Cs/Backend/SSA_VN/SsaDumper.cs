@@ -289,6 +289,11 @@ namespace Cnidaria.Cs
                     AppendOperandList(sb, tree);
                     sb.Append(')');
                     return;
+                case GenTreeKind.HWIntrinsic:
+                    sb.Append("hwintrinsic ").Append(HWIntrinsics.Format(tree.Source)).Append('(');
+                    AppendOperandList(sb, tree);
+                    sb.Append(')');
+                    return;
                 case GenTreeKind.Intrinsic:
                 case GenTreeKind.Call:
                 case GenTreeKind.VirtualCall:
@@ -312,8 +317,10 @@ namespace Cnidaria.Cs
                     sb.Append("eval ");
                     AppendOperandList(sb, tree);
                     return;
+                case GenTreeKind.CallFinally:
+                case GenTreeKind.CatchReturn:
                 case GenTreeKind.Branch:
-                    sb.Append("br B").Append(tree.Source.TargetBlockId);
+                    sb.Append(tree.Source.Kind switch { GenTreeKind.CallFinally => "callfinally B", GenTreeKind.CatchReturn => "catchret B", _ => "br B" }).Append(tree.Source.TargetBlockId);
                     return;
                 case GenTreeKind.BranchTrue:
                 case GenTreeKind.BranchFalse:

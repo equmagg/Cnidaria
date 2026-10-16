@@ -41,6 +41,8 @@ namespace Cnidaria.Cs
         public readonly RegisterOperandKind Kind;
         public readonly RegisterClass RegisterClass;
         public readonly MachineRegister Register;
+        public readonly int RegisterCount;
+        public UInt128 RegisterMask => IsRegister ? RegisterInfo.GroupMask(Register, RegisterCount) : 0;
         public readonly int SpillSlot;
         public readonly StackFrameSlotKind FrameSlotKind;
         public readonly RegisterFrameBase FrameBase;
@@ -59,8 +61,10 @@ namespace Cnidaria.Cs
             int frameSlotIndex,
             int frameOffset,
             int frameSlotSize,
-            bool isAddress)
+            bool isAddress,
+            int registerCount = 1)
         {
+            RegisterCount = registerCount;
             Kind = kind;
             RegisterClass = registerClass;
             Register = register;
@@ -85,11 +89,14 @@ namespace Cnidaria.Cs
             0,
             isAddress: false);
 
-        public static RegisterOperand ForRegister(MachineRegister register)
+        public static RegisterOperand ForRegister(MachineRegister register, int registerCount = 1)
         {
             var registerClass = MachineRegisters.GetClass(register);
             if (registerClass == RegisterClass.Invalid)
                 throw new ArgumentOutOfRangeException(nameof(register));
+            if (registerCount is not (1 or 2 or 4 or 8) ||
+                (registerCount > 1 && (registerClass != RegisterClass.Vector || ((int)register - (int)MachineRegister.V0) % registerCount != 0)))
+                throw new ArgumentOutOfRangeException(nameof(registerCount));
             return new RegisterOperand(
                 RegisterOperandKind.Register,
                 registerClass,
@@ -100,7 +107,7 @@ namespace Cnidaria.Cs
                 -1,
                 0,
                 0,
-                isAddress: false);
+                isAddress: false, registerCount);
         }
 
         public static RegisterOperand ForSpillSlot(RegisterClass registerClass, int slot)
@@ -268,6 +275,7 @@ namespace Cnidaria.Cs
             => Kind == other.Kind &&
                RegisterClass == other.RegisterClass &&
                Register == other.Register &&
+               RegisterCount == other.RegisterCount &&
                SpillSlot == other.SpillSlot &&
                FrameSlotKind == other.FrameSlotKind &&
                FrameBase == other.FrameBase &&
@@ -285,6 +293,7 @@ namespace Cnidaria.Cs
                 int hash = (int)Kind;
                 hash = (hash * 397) ^ (int)RegisterClass;
                 hash = (hash * 397) ^ (int)Register;
+                hash = (hash * 397) ^ RegisterCount;
                 hash = (hash * 397) ^ SpillSlot;
                 hash = (hash * 397) ^ (int)FrameSlotKind;
                 hash = (hash * 397) ^ (int)FrameBase;
@@ -301,7 +310,7 @@ namespace Cnidaria.Cs
             string text = Kind switch
             {
                 RegisterOperandKind.None => "_",
-                RegisterOperandKind.Register => MachineRegisters.Format(Register),
+                RegisterOperandKind.Register => MachineRegisters.Format(Register) + (RegisterCount > 1 ? $":m{RegisterCount}" : string.Empty),
                 RegisterOperandKind.SpillSlot => $"spill.{MachineRegisters.ClassSuffix(RegisterClass)}[{SpillSlot}]" +
                 (FrameOffset != 0 || FrameSlotSize != 0 ? "+" + FrameOffset.ToString() + ":" + FrameSlotSize.ToString() : string.Empty),
                 RegisterOperandKind.IncomingArgumentSlot => FormatUnresolvedFrameSlot("inarg"),
@@ -435,6 +444,7 @@ namespace Cnidaria.Cs
         public int GcSpillAreaSize { get; }
         public int GcRootSpillSlotCount { get; }
         public int GcRootSpillAreaCount { get; }
+        public ImmutableArray<int> GcRootSpillAreaByFunclet { get; }
         public int FuncletSlotAreaOffset { get; }
         public int FuncletCount { get; }
         public ImmutableArray<StackFrameSlot> ArgumentSlots { get; }
@@ -481,7 +491,8 @@ namespace Cnidaria.Cs
             int gcRootSpillSlotCount = 0,
             int gcRootSpillAreaCount = 1,
             int funcletSlotAreaOffset = 0,
-            int funcletCount = 0)
+            int funcletCount = 0,
+            ImmutableArray<int> gcRootSpillAreaByFunclet = default)
         {
             if (frameSize < 0)
                 throw new ArgumentOutOfRangeException(nameof(frameSize));
@@ -520,6 +531,7 @@ namespace Cnidaria.Cs
             GcSpillAreaSize = gcSpillAreaSize;
             GcRootSpillSlotCount = gcRootSpillSlotCount;
             GcRootSpillAreaCount = gcRootSpillAreaCount;
+            GcRootSpillAreaByFunclet = gcRootSpillAreaByFunclet.IsDefault ? ImmutableArray<int>.Empty : gcRootSpillAreaByFunclet;
             FuncletSlotAreaOffset = funcletSlotAreaOffset;
             FuncletCount = funcletCount;
             ArgumentSlots = argumentSlots.IsDefault ? ImmutableArray<StackFrameSlot>.Empty : argumentSlots;
@@ -569,28 +581,22 @@ namespace Cnidaria.Cs
         public bool TryGetOutgoingArgumentSlot(int index, out StackFrameSlot slot)
             => TryGetIndexedSlot(OutgoingArgumentSlots, index, out slot);
 
-        // Each funclet spills its roots apart from the root body, whose safe point stays live while a funclet runs
         public int GcRootSpillSlotOffset(int funcletIndex, int rootIndex, int pointerSize)
         {
-            if ((uint)funcletIndex >= (uint)GcRootSpillAreaCount || (uint)rootIndex >= (uint)GcRootSpillSlotCount)
+            int area = GcRootSpillAreaByFunclet.IsEmpty ? funcletIndex : GcRootSpillAreaByFunclet[funcletIndex];
+            if ((uint)area >= (uint)GcRootSpillAreaCount || (uint)rootIndex >= (uint)GcRootSpillSlotCount)
                 throw new ArgumentOutOfRangeException(nameof(rootIndex));
-            return checked(GcSpillAreaOffset + (funcletIndex * GcRootSpillSlotCount + rootIndex) * pointerSize);
+            return checked(GcSpillAreaOffset + (area * GcRootSpillSlotCount + rootIndex) * pointerSize);
         }
 
         public int GcRootSpillAreaEnd(int pointerSize)
             => checked(GcSpillAreaOffset + GcRootSpillAreaCount * GcRootSpillSlotCount * pointerSize);
 
-        public int FuncletLinkSlotOffset(int funcletIndex, int pointerSize)
-            => FuncletSlotOffset(funcletIndex, 0, pointerSize);
-
         public int FuncletExceptionSlotOffset(int funcletIndex, int pointerSize)
-            => FuncletSlotOffset(funcletIndex, 1, pointerSize);
-
-        private int FuncletSlotOffset(int funcletIndex, int slot, int pointerSize)
         {
             if (funcletIndex < 1 || funcletIndex > FuncletCount)
                 throw new ArgumentOutOfRangeException(nameof(funcletIndex));
-            return checked(FuncletSlotAreaOffset + ((funcletIndex - 1) * 2 + slot) * pointerSize);
+            return checked(FuncletSlotAreaOffset + (funcletIndex - 1) * pointerSize);
         }
 
         private static bool TryGetIndexedSlot(ImmutableArray<StackFrameSlot> slots, int index, out StackFrameSlot slot)

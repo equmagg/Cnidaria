@@ -77,6 +77,7 @@ public enum RVTrapCause : ulong
 
 public sealed class RVMachineConfig
 {
+    public int VectorLengthBits { get; set; } = RVVector.LengthBits;
     public ulong RamBase { get; set; } = 0x80000000UL;
     public int RamSize { get; set; } = 128 * 1024 * 1024;
     public ulong ResetVector { get; set; } = 0x80000000UL;
@@ -149,12 +150,11 @@ public sealed class RiscVEmulator
     private const ulong MstatusSxlMask = 3UL << 34;
     private const ulong SstatusMask = MstatusSie | MstatusSpie | MstatusSpp | MstatusVsMask | MstatusFsMask | MstatusXsMask | MstatusSum | MstatusMxr | MstatusUxlMask;
     private const int VectorRegisterCount = 32;
-    private const int VectorRegisterBytes = 64;
+    private readonly int VectorRegisterBytes;
     private const int CacheBlockSize = 64;
     private const ulong VectorTypeTailAgnostic = 1UL << 6;
     private const ulong VectorTypeMaskAgnostic = 1UL << 7;
-    private const int VectorLengthBits = RVVector.LengthBits;
-    private const int VectorLengthBytes = VectorLengthBits / 8;
+    private int VectorLengthBytes => VectorRegisterBytes;
     private const int VectorElementLengthBits = 64;
     private const ulong VectorTypeIllegal = 1UL << 63;
     private const ulong SupervisorInterruptMask = (1UL << 1) | (1UL << 5) | (1UL << 9);
@@ -302,6 +302,9 @@ public sealed class RiscVEmulator
     public RiscVEmulator(RVMachineConfig? config = null)
     {
         config ??= new RVMachineConfig();
+        if (config.VectorLengthBits is not (128 or 256 or 512))
+            throw new ArgumentOutOfRangeException(nameof(config), "Vector length must be 128, 256 or 512 bits.");
+        VectorRegisterBytes = config.VectorLengthBits / 8;
         if (config.RamSize <= 0)
             throw new ArgumentOutOfRangeException(nameof(config));
         _ramBase = config.RamBase;
@@ -2478,7 +2481,7 @@ public sealed class RiscVEmulator
             case RVCsr.InstRet: value = _instret; return CheckCounterAccess(2);
             case RVCsr.VL: value = _vl; return true;
             case RVCsr.VType: value = _vtype; return true;
-            case RVCsr.VLenB: value = VectorLengthBytes; return true;
+            case RVCsr.VLenB: value = (ulong)VectorLengthBytes; return true;
             case RVCsr.SStatus: value = _mstatus & SstatusMask; return true;
             case RVCsr.SIe: value = _mie & SupervisorInterruptMask; return true;
             case RVCsr.STVec: value = _stvec; return true;
@@ -3638,7 +3641,7 @@ public sealed class RiscVEmulator
         return true;
     }
 
-    private static bool TryDecodeVectorType(ulong type, out int sewBytes, out int groupBytes, out int groupRegisters, out int vlmax)
+    private bool TryDecodeVectorType(ulong type, out int sewBytes, out int groupBytes, out int groupRegisters, out int vlmax)
     {
         sewBytes = 0;
         groupBytes = 0;
@@ -3706,7 +3709,7 @@ public sealed class RiscVEmulator
             default: return 0;
         }
     }
-    private static bool TryGetVectorGroupRegisters(int groupBytes, out int groupRegisters)
+    private bool TryGetVectorGroupRegisters(int groupBytes, out int groupRegisters)
     {
         groupRegisters = 0;
         if (groupBytes <= 0 || groupBytes > VectorLengthBytes * 8)
@@ -3790,7 +3793,7 @@ public sealed class RiscVEmulator
         => (Unsafe.Add(ref vectorBytes, element >> 3) & (1 << (element & 7))) != 0;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void WriteVectorMaskBit(ref byte vectorBytes, int register, int element, bool value)
+    private void WriteVectorMaskBit(ref byte vectorBytes, int register, int element, bool value)
     {
         ref byte destination = ref Unsafe.Add(ref vectorBytes, register * VectorRegisterBytes + (element >> 3));
         byte mask = (byte)(1 << (element & 7));
@@ -5249,7 +5252,7 @@ public sealed class RiscVEmulator
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool ReadVectorMaskBitOf(ref byte vectorBytes, int register, int element)
+    private bool ReadVectorMaskBitOf(ref byte vectorBytes, int register, int element)
         => (Unsafe.Add(ref vectorBytes, register * VectorRegisterBytes + (element >> 3)) & (1 << (element & 7))) != 0;
 
     private bool TryEvaluateVectorIntegerOperation(int funct6, int funct3, ulong a, ulong b, int sewBits, ulong mask, out ulong result)

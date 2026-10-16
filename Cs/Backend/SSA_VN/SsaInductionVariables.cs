@@ -1346,7 +1346,7 @@ namespace Cnidaria.Cs
                         ImmutableArray.CreateRange(statements),
                         oldBlock.SuccessorBlockIds,
                         oldBlock.SuccessorPcs,
-                        oldBlock.RegionPc));
+                        oldBlock.Region));
                 }
 
                 return _method.GenTreeMethod.CloneWithBlocks(blocks.ToImmutable());
@@ -1578,7 +1578,7 @@ namespace Cnidaria.Cs
                     GenTreeKind.Return or
                     GenTreeKind.Throw or
                     GenTreeKind.Rethrow or
-                    GenTreeKind.EndFinally ||
+                    GenTreeKind.EndFinally or GenTreeKind.CallFinally or GenTreeKind.CatchReturn or GenTreeKind.EndFilter ||
                    (statement.Flags & GenTreeFlags.ControlFlow) != 0;
 
             private static bool IsPowerOfTwo(ulong value)
@@ -1716,6 +1716,8 @@ namespace Cnidaria.Cs
                 int handler = method.Cfg.ExceptionRegions[i].HandlerStartBlockId;
                 if ((uint)handler < (uint)method.Blocks.Length && liveness.IsLiveIn(handler, slot))
                     return true;
+                if (liveness.IsLiveIn(method.Cfg.ExceptionRegions[i].HandlerBodyStartBlockId, slot))
+                    return true;
             }
 
             for (int i = 0; i < loop.ExitEdges.Length; i++)
@@ -1790,7 +1792,7 @@ namespace Cnidaria.Cs
                     statements.ToImmutable(),
                     oldBlock.SuccessorBlockIds,
                     oldBlock.SuccessorPcs,
-                    oldBlock.RegionPc));
+                    oldBlock.Region));
             }
 
             return method.CloneWithBlocks(blocks.ToImmutable());

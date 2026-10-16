@@ -28,7 +28,8 @@ namespace Cnidaria.Cs
         private enum PendingContinuationKind : byte
         {
             None,
-            Leave,
+            Filter,
+            CallFinally,
             Throw,
             ReturnVoid,
             ReturnInteger,
@@ -60,7 +61,7 @@ namespace Cnidaria.Cs
         private const int IdentityHashShift = 2;
         private uint _identityHashState = 0x9E3779B9u;
         private const int ArrayLengthOffset = ObjectHeaderSize;
-        private const int ArrayDataOffset = ObjectHeaderSize + 8;
+        private const int ArrayDataOffset = ArrayLengthOffset + TargetArchitecture.PointerSize;
         private const int StringLengthOffset = ObjectHeaderSize;
         private const int StringFirstCharOffset = ObjectHeaderSize + 4;
         private const int MaxCallFramesHard = 4096;
@@ -76,6 +77,7 @@ namespace Cnidaria.Cs
         private const int ShadowFrameRegisterSnapshotIndex = 44;
         private const int ShadowFrameSafePointPc = 48;
         private const int ShadowFrameCallFlagsMask = 0x0000FFFF;
+        private const int ShadowFrameFilterFlag = 0x00010000;
 
         private readonly byte[] _mem;
         private readonly int _staticEnd;
@@ -120,6 +122,9 @@ namespace Cnidaria.Cs
         private int _staticDataRegionBytes;
         private int _currentExceptionRef;
         private readonly List<ActiveHandler> _activeHandlers = new List<ActiveHandler>();
+        private readonly List<FilterSearch> _filterSearches = new List<FilterSearch>();
+        // References host code holds across an allocation; the collector marks them and rewrites them when it compacts
+        private readonly List<int> _hostRoots = new List<int>();
         private int _currentExceptionThrowMethodIndex = -1;
         private int _currentExceptionThrowPc = -1;
         private CallFlags _activeCallFlags;
@@ -136,6 +141,36 @@ namespace Cnidaria.Cs
             public PendingContinuationKind Continuation;
             public int TargetPc;
             public long Payload;
+            public DispatchTarget Dispatch;
+        }
+
+        // A frame with region -1 is the boundary of an escaping filter exception.
+        private readonly record struct DispatchTarget(int Frame, int Region)
+        {
+            public static DispatchTarget None => new DispatchTarget(-1, -1);
+        }
+
+        private sealed class FilterSearch
+        {
+            public int ExceptionRef;
+            public readonly int ThrowPc;
+            public readonly int ThrowMethodIndex;
+            public readonly int ThrowSitePc;
+            public int Frame;
+            public int Pc;
+            public int Next;
+            public int Region;
+            public int FilterFrame;
+
+            public FilterSearch(int exceptionRef, int throwPc, int frame, int throwMethodIndex, int throwSitePc)
+            {
+                ExceptionRef = exceptionRef;
+                ThrowPc = throwPc;
+                Frame = frame;
+                Pc = throwPc;
+                ThrowMethodIndex = throwMethodIndex;
+                ThrowSitePc = throwSitePc;
+            }
         }
 
         private readonly struct RegisterSnapshot
@@ -237,6 +272,8 @@ namespace Cnidaria.Cs
             _heapPeakAbs = _heapPtr;
             _currentExceptionRef = 0;
             _activeHandlers.Clear();
+            _filterSearches.Clear();
+            _hostRoots.Clear();
             _currentExceptionThrowMethodIndex = -1;
             _currentExceptionThrowPc = -1;
             _currentSafePointPc = -1;
@@ -454,10 +491,16 @@ namespace Cnidaria.Cs
                         _pc = unchecked((int)ins.Imm);
                         break;
                     case Op.Leave:
-                        Leave(executingPc, unchecked((int)ins.Imm));
+                        Leave(unchecked((int)ins.Imm));
+                        break;
+                    case Op.CallFinally:
+                        CallFinally(unchecked((int)ins.Imm), executingPc + 1);
                         break;
                     case Op.EndFinally:
                         EndFinally();
+                        break;
+                    case Op.EndFilter:
+                        FinishFilter(GetGpr(ins.Rs1) != 0);
                         break;
                     case Op.Throw:
                         ThrowManaged(GetGpr(ins.Rs1), executingPc, preserveExistingThrowSite: false);
@@ -1555,7 +1598,11 @@ namespace Cnidaria.Cs
         private RuntimeModule CurrentModule()
         {
             if (_frameCount == 0) throw new InvalidOperationException("No current frame.");
-            RuntimeMethod method = CurrentFrameMethod();
+            return ModuleOf(CurrentFrameMethod());
+        }
+
+        private RuntimeModule ModuleOf(RuntimeMethod method)
+        {
             if (method.BodyModule != null) return method.BodyModule;
             if (_modules.TryGetValue(method.DeclaringType.AssemblyName, out RuntimeModule? module)) return module;
             throw new InvalidOperationException($"Unable to resolve current runtime module for method M{method.MethodId}");
@@ -1616,7 +1663,17 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException("NewDelegate expects a delegate layout.");
 
             EnsureDelegateLayout(delegateLayout);
-            int obj = AllocObject(delegateLayout);
+            int obj;
+            _hostRoots.Add(checked((int)targetRef));
+            try
+            {
+                obj = AllocObject(delegateLayout);
+                targetRef = _hostRoots[^1];
+            }
+            finally
+            {
+                _hostRoots.RemoveAt(_hostRoots.Count - 1);
+            }
             WriteDelegateSlot(obj, delegateLayout.DelegateTargetOffset, targetRef);
             WriteDelegateSlot(obj, delegateLayout.DelegateMethodPtrOffset, targetCodePointer);
             WriteDelegateSlot(obj, delegateLayout.DelegateInvocationListOffset, 0);
@@ -1709,17 +1766,28 @@ namespace Cnidaria.Cs
             if (delegateLayout.DelegateArrayTypeLayoutIndex < 0)
                 throw new TypeLoadException($"Delegate layout T{delegateLayout.RuntimeTypeId} has no invocation-list array layout.");
 
-            int obj = AllocObject(delegateLayout);
-            int list = AllocArray(TypeLayout(delegateLayout.DelegateArrayTypeLayoutIndex), targets.Length);
+            int rootBase = _hostRoots.Count;
+            try
+            {
+                for (int i = 0; i < targets.Length; i++)
+                    _hostRoots.Add(targets[i]);
+                _hostRoots.Add(AllocArray(TypeLayout(delegateLayout.DelegateArrayTypeLayoutIndex), targets.Length));
+                int obj = AllocObject(delegateLayout);
+                int list = _hostRoots[rootBase + targets.Length];
 
-            for (int i = 0; i < targets.Length; i++)
-                WriteDelegateArrayEntry(list, i, targets[i]);
+                for (int i = 0; i < targets.Length; i++)
+                    WriteDelegateArrayEntry(list, i, _hostRoots[rootBase + i]);
 
-            WriteDelegateSlot(obj, delegateLayout.DelegateTargetOffset, 0);
-            WriteDelegateSlot(obj, delegateLayout.DelegateMethodPtrOffset, 0);
-            WriteDelegateSlot(obj, delegateLayout.DelegateInvocationListOffset, list);
-            WriteDelegateSlot(obj, delegateLayout.DelegateInvocationCountOffset, targets.Length);
-            return obj;
+                WriteDelegateSlot(obj, delegateLayout.DelegateTargetOffset, 0);
+                WriteDelegateSlot(obj, delegateLayout.DelegateMethodPtrOffset, 0);
+                WriteDelegateSlot(obj, delegateLayout.DelegateInvocationListOffset, list);
+                WriteDelegateSlot(obj, delegateLayout.DelegateInvocationCountOffset, targets.Length);
+                return obj;
+            }
+            finally
+            {
+                _hostRoots.RemoveRange(rootBase, _hostRoots.Count - rootBase);
+            }
         }
 
         private int[] FlattenDelegate(long delegateRef)
@@ -2032,7 +2100,7 @@ namespace Cnidaria.Cs
             return true;
         }
 
-        private void Leave(int fromPc, int targetPc)
+        private void Leave(int targetPc)
         {
             int count = _activeHandlers.Count;
             int frame = TopFrameOffset();
@@ -2043,11 +2111,25 @@ namespace Cnidaria.Cs
                 count--;
             }
             _activeHandlers.RemoveRange(count, _activeHandlers.Count - count);
-
-            ContinueLeaveAfterFinally(fromPc, targetPc);
+            _pc = targetPc;
         }
 
-        private void EnterHandler(EhRegionRecord region, PendingContinuationKind continuation, int targetPc, long payload)
+        private void CallFinally(int handlerStartPc, int returnPc)
+        {
+            var method = _image.Methods[_currentMethodIndex];
+            for (int i = 0; i < method.EhCount; i++)
+            {
+                var region = _image.EhRegions[method.EhStartIndex + i];
+                if (region.HandlerStartPc == handlerStartPc && (EhRegionKind)region.Kind == EhRegionKind.Finally)
+                {
+                    EnterHandler(region, PendingContinuationKind.CallFinally, returnPc, 0);
+                    return;
+                }
+            }
+            throw new InvalidOperationException($"CallFinally at PC {returnPc - 1} names no finally handler.");
+        }
+
+        private void EnterHandler(EhRegionRecord region, PendingContinuationKind continuation, int targetPc, long payload, DispatchTarget dispatch = default)
         {
             _activeHandlers.Add(new ActiveHandler
             {
@@ -2057,6 +2139,7 @@ namespace Cnidaria.Cs
                 Continuation = continuation,
                 TargetPc = targetPc,
                 Payload = payload,
+                Dispatch = dispatch,
             });
             _pc = region.HandlerStartPc;
         }
@@ -2066,7 +2149,7 @@ namespace Cnidaria.Cs
             int frame = TopFrameOffset();
             for (int i = _activeHandlers.Count - 1; i >= 0 && _activeHandlers[i].Frame == frame; i--)
             {
-                if (_activeHandlers[i].Continuation == PendingContinuationKind.None)
+                if (_activeHandlers[i].Continuation is PendingContinuationKind.None or PendingContinuationKind.Filter)
                     return (int)_activeHandlers[i].Payload;
             }
             throw new InvalidOperationException("No catch handler is running in the current frame.");
@@ -2082,11 +2165,11 @@ namespace Cnidaria.Cs
 
             switch (handler.Continuation)
             {
-                case PendingContinuationKind.Leave:
-                    ContinueLeaveAfterFinally(_pc - 1, handler.TargetPc);
+                case PendingContinuationKind.CallFinally:
+                    _pc = handler.TargetPc;
                     return;
                 case PendingContinuationKind.Throw:
-                    ThrowManaged(handler.Payload, _pc - 1, preserveExistingThrowSite: true);
+                    ThrowManaged(handler.Payload, _pc - 1, preserveExistingThrowSite: true, handler.Dispatch);
                     return;
                 case PendingContinuationKind.ReturnVoid:
                 case PendingContinuationKind.ReturnInteger:
@@ -2101,17 +2184,6 @@ namespace Cnidaria.Cs
                 default:
                     throw new InvalidOperationException("EndFinally outside a running finally handler.");
             }
-        }
-
-        private void ContinueLeaveAfterFinally(int fromPc, int targetPc)
-        {
-            if (TryFindEnclosingFinally(fromPc, targetPc, out var nextFinally))
-            {
-                EnterHandler(nextFinally, PendingContinuationKind.Leave, targetPc, 0);
-                return;
-            }
-
-            _pc = targetPc;
         }
 
         private void ContinueReturnAfterFinally(int fromPc, ReturnPayloadKind payloadKind, long i0)
@@ -2131,7 +2203,7 @@ namespace Cnidaria.Cs
             ReturnFromCurrentFrame(payloadKind);
         }
 
-        private void ThrowManaged(long exceptionRef, int throwPc, bool preserveExistingThrowSite)
+        private void ThrowManaged(long exceptionRef, int throwPc, bool preserveExistingThrowSite, DispatchTarget? target = null)
         {
             if (exceptionRef == 0)
             {
@@ -2148,18 +2220,149 @@ namespace Cnidaria.Cs
                 _currentExceptionThrowPc = throwPc;
             }
             _currentExceptionRef = exceptionRef32;
+            if (target is DispatchTarget known)
+                Unwind(throwPc, known);
+            else
+                SearchHandler(new FilterSearch(exceptionRef32, throwPc, TopFrameOffset(), _currentExceptionThrowMethodIndex, _currentExceptionThrowPc));
+        }
+
+        private void SearchHandler(FilterSearch search)
+        {
+            RuntimeType? exceptionType = GetObjectTypeFromRef(search.ExceptionRef);
+            while (true)
+            {
+                int frame = search.Frame;
+                if (IsFilterFrame(frame))
+                {
+                    Unwind(search.ThrowPc, new DispatchTarget(frame, -1));
+                    return;
+                }
+
+                int methodIndex = MethodIndexForFrame(frame);
+                MethodRecord method = _image.Methods[methodIndex];
+                List<int> candidates = ProtectingRegions(method, search.Pc);
+                for (; search.Next < candidates.Count; search.Next++)
+                {
+                    int local = candidates[search.Next];
+                    EhRegionRecord region = _image.EhRegions[method.EhStartIndex + local];
+                    if ((EhRegionKind)region.Kind == EhRegionKind.Filter)
+                    {
+                        search.Region = local;
+                        search.Next++;
+                        RunFilter(search, methodIndex, region);
+                        return;
+                    }
+                    if (IsMatchingCatch(region, exceptionType, methodIndex))
+                    {
+                        Unwind(search.ThrowPc, new DispatchTarget(frame, local));
+                        return;
+                    }
+                }
+
+                int returnPc = ReadI32(frame + ShadowFrameReturnPc);
+                if (frame == _stackBase || returnPc < 0)
+                {
+                    Unwind(search.ThrowPc, DispatchTarget.None);
+                    return;
+                }
+                search.Frame = frame - ShadowFrameSize;
+                search.Pc = returnPc - 1;
+                search.Next = 0;
+            }
+        }
+
+        private bool IsFilterFrame(int frame)
+            => (ReadI32(frame + ShadowFramePackedFlags) & ShadowFrameFilterFlag) != 0;
+
+        private void RunFilter(FilterSearch search, int methodIndex, EhRegionRecord region)
+        {
+            int frame = search.Frame;
+            long framePointer = FramePointer(frame);
+            long incomingStackArgBase = FrameIncomingArgumentBase(frame);
+            int flags = ReadI32(frame + ShadowFramePackedFlags) & ShadowFrameCallFlagsMask;
+            long callerSp = X(MachineRegisters.StackPointer);
+            long filterSp = AlignDown(checked(CurrentFrameStackLow() - _image.Methods[methodIndex].FrameSize), 16);
+            if (filterSp < _frameStackTop + 2 * ShadowFrameSize)
+                throw new StackOverflowException();
+
+            SetFrameSafePointPc(TopFrameOffset(), search.ThrowPc);
+            int snapshotIndex = SaveRegisterSnapshot();
+            PushFrame(methodIndex, -1, callerSp, X(MachineRegisters.FramePointer), (CallFlags)flags, incomingStackArgBase);
+            SetTopRegisterSnapshotIndex(snapshotIndex);
+            SetTopPackedFlags(TopPackedFlags() | ShadowFrameFilterFlag);
+            search.FilterFrame = TopFrameOffset();
+            _filterSearches.Add(search);
+            _activeHandlers.Add(new ActiveHandler
+            {
+                Frame = search.FilterFrame,
+                HandlerStartPc = region.FilterStartPc,
+                HandlerEndPc = region.HandlerStartPc,
+                Continuation = PendingContinuationKind.Filter,
+                TargetPc = -1,
+                Payload = search.ExceptionRef,
+            });
+
+            _currentMethodIndex = methodIndex;
+            _pc = region.FilterStartPc;
+            X(MachineRegisters.StackPointer, filterSp);
+            X(MachineRegisters.FramePointer, framePointer);
+            X(MachineRegisters.ThreadPointer, incomingStackArgBase);
+            TrackStackPeak(filterSp);
+        }
+
+        private void FinishFilter(bool accepted)
+        {
+            int frame = TopFrameOffset();
+            FilterSearch search = _filterSearches.Count != 0 ? _filterSearches[^1] : throw new InvalidOperationException("EndFilter outside a running filter.");
+            if (search.FilterFrame != frame)
+                throw new InvalidOperationException("EndFilter outside a running filter.");
+            _filterSearches.RemoveAt(_filterSearches.Count - 1);
+
+            int snapshotIndex = TopRegisterSnapshotIndex();
+            long callerSp = TopCallerSp();
+            long callerFp = TopCallerFp();
+            PopFrame();
+            if ((uint)snapshotIndex >= (uint)_registerSnapshots.Count || _registerSnapshots[snapshotIndex] is not RegisterSnapshot snapshot)
+                throw new InvalidOperationException("Invalid register snapshot index.");
+            Array.Copy(snapshot.General, _x, GprCount);
+            Array.Copy(snapshot.Float, _f, FprCount);
+            ReleaseRegisterSnapshot(snapshotIndex);
+            X(MachineRegisters.StackPointer, callerSp);
+            X(MachineRegisters.FramePointer, callerFp);
+            X(MachineRegisters.ThreadPointer, TopIncomingStackArgBase());
+
+            _currentMethodIndex = MethodIndexForFrame(TopFrameOffset());
+            _pc = search.ThrowPc + 1;
+            _currentSafePointPc = search.ThrowPc;
+            _currentExceptionRef = search.ExceptionRef;
+            _currentExceptionThrowMethodIndex = search.ThrowMethodIndex;
+            _currentExceptionThrowPc = search.ThrowSitePc;
+            if (accepted)
+                Unwind(search.ThrowPc, new DispatchTarget(search.Frame, search.Region));
+            else
+                SearchHandler(search);
+        }
+
+        private void Unwind(int throwPc, DispatchTarget target)
+        {
             List<ManagedStackFrameInfo>? unhandledTrace = null;
 
             while (_frameCount != 0)
             {
+                if (TopFrameOffset() == target.Frame && target.Region < 0)
+                {
+                    FinishFilter(accepted: false);
+                    return;
+                }
+
                 unhandledTrace ??= new List<ManagedStackFrameInfo>(Math.Min(_frameCount, 64));
                 unhandledTrace.Add(CaptureManagedStackFrame(throwPc));
 
-                if (TryFindHandler(throwPc, _currentExceptionRef, out var h))
+                if (TryFindHandler(throwPc, _currentExceptionRef, target, out var h))
                 {
                     LeaveHandlersEscapedBy(h);
                     bool terminal = (EhRegionKind)h.Kind == EhRegionKind.Finally || (EhRegionKind)h.Kind == EhRegionKind.Fault;
-                    EnterHandler(h, terminal ? PendingContinuationKind.Throw : PendingContinuationKind.None, -1, _currentExceptionRef);
+                    EnterHandler(h, terminal ? PendingContinuationKind.Throw : PendingContinuationKind.None, -1, _currentExceptionRef, target);
                     return;
                 }
 
@@ -2330,7 +2533,7 @@ namespace Cnidaria.Cs
                 return type.Name;
             return ns + "." + type.Name;
         }
-        private bool TryFindHandler(int pc, int exceptionRef, out EhRegionRecord handler)
+        private bool TryFindHandler(int pc, int exceptionRef, DispatchTarget target, out EhRegionRecord handler)
         {
             var method = _image.Methods[_currentMethodIndex];
             handler = default;
@@ -2338,22 +2541,16 @@ namespace Cnidaria.Cs
                 return false;
 
             RuntimeType? exceptionType = exceptionRef != 0 ? GetObjectTypeFromRef(exceptionRef) : null;
-            var activeRegions = new List<int>();
-            for (int i = 0; i < method.EhCount; i++)
-            {
-                if (IsPcProtectedByRegion(method, pc, i))
-                    activeRegions.Add(i);
-            }
-
-            if (activeRegions.Count == 0)
-                return false;
-
-            activeRegions.Sort((left, right) => CompareEhDispatchOrder(method, left, right));
+            List<int> activeRegions = ProtectingRegions(method, pc);
+            int frame = TopFrameOffset();
             for (int i = 0; i < activeRegions.Count; i++)
             {
                 var candidate = _image.EhRegions[method.EhStartIndex + activeRegions[i]];
                 var kind = (EhRegionKind)candidate.Kind;
-                if (kind == EhRegionKind.Finally || kind == EhRegionKind.Fault || IsMatchingCatch(candidate, exceptionType))
+                bool caught = target.Frame >= 0
+                    ? frame == target.Frame && activeRegions[i] == target.Region
+                    : IsMatchingCatch(candidate, exceptionType, MethodIndexForFrame(frame));
+                if (kind == EhRegionKind.Finally || kind == EhRegionKind.Fault || caught)
                 {
                     handler = candidate;
                     return true;
@@ -2361,6 +2558,20 @@ namespace Cnidaria.Cs
             }
 
             return false;
+        }
+
+        private List<int> ProtectingRegions(MethodRecord method, int pc)
+        {
+            var regions = new List<int>();
+            if (pc < 0)
+                return regions;
+            for (int i = 0; i < method.EhCount; i++)
+            {
+                if (IsPcProtectedByRegion(method, pc, i))
+                    regions.Add(i);
+            }
+            regions.Sort((left, right) => CompareEhDispatchOrder(method, left, right));
+            return regions;
         }
 
         private int CompareEhDispatchOrder(MethodRecord method, int leftLocalIndex, int rightLocalIndex)
@@ -2389,7 +2600,7 @@ namespace Cnidaria.Cs
         private static int SourceTrySpan(EhRegionRecord region)
             => region.SourceTryEndPc - region.SourceTryStartPc;
 
-        private bool IsMatchingCatch(EhRegionRecord region, RuntimeType? exceptionType)
+        private bool IsMatchingCatch(EhRegionRecord region, RuntimeType? exceptionType, int methodIndex)
         {
             var kind = (EhRegionKind)region.Kind;
             if (kind == EhRegionKind.CatchAll)
@@ -2398,18 +2609,17 @@ namespace Cnidaria.Cs
             if (kind != EhRegionKind.Catch || exceptionType is null)
                 return false;
 
-            var catchType = ResolveCatchType(region.CatchTypeId);
+            var catchType = ResolveCatchType(region.CatchTypeId, methodIndex);
             return IsAssignableTo(exceptionType, catchType);
         }
 
-        private RuntimeType ResolveCatchType(int catchTypeTokenOrId)
+        private RuntimeType ResolveCatchType(int catchTypeTokenOrId, int methodIndex)
         {
             int table = MetadataToken.Table(catchTypeTokenOrId);
             if (table is MetadataToken.TypeDef or MetadataToken.TypeRef or MetadataToken.TypeSpec)
             {
-                RuntimeMethod method = CurrentFrameMethod();
-                RuntimeModule module = method.BodyModule ?? CurrentModule();
-                return _rts.ResolveTypeInMethodContext(module, catchTypeTokenOrId, method);
+                RuntimeMethod method = MethodForIndex(methodIndex);
+                return _rts.ResolveTypeInMethodContext(ModuleOf(method), catchTypeTokenOrId, method);
             }
             return _rts.GetTypeById(catchTypeTokenOrId);
         }
@@ -5182,6 +5392,15 @@ namespace Cnidaria.Cs
             if (_currentExceptionRef != 0)
                 TryMarkObject(_currentExceptionRef);
 
+            foreach (FilterSearch search in _filterSearches)
+                TryMarkObject(search.ExceptionRef);
+
+            foreach (int root in _hostRoots)
+            {
+                if (root != 0)
+                    TryMarkObject(root);
+            }
+
             MarkPendingContinuationRoots();
         }
 
@@ -5202,6 +5421,9 @@ namespace Cnidaria.Cs
 
             if (_currentExceptionRef != 0)
                 _currentExceptionRef = TranslateObjectRef(_currentExceptionRef);
+
+            foreach (FilterSearch search in _filterSearches)
+                search.ExceptionRef = TranslateObjectRef(search.ExceptionRef);
 
             if (_staticBaseByTypeId.Count != 0)
             {
@@ -5234,6 +5456,12 @@ namespace Cnidaria.Cs
                     _internPool[kv.Key] = TranslateObjectRef(kv.Value);
             }
 
+            for (int i = 0; i < _hostRoots.Count; i++)
+            {
+                if (_hostRoots[i] != 0)
+                    _hostRoots[i] = TranslateObjectRef(_hostRoots[i]);
+            }
+
             UpdatePendingContinuationRootsAfterCompaction();
         }
 
@@ -5242,6 +5470,8 @@ namespace Cnidaria.Cs
             if (_frameCount == 0)
                 return;
 
+            // A filter frame reports the slots of the frame it shares a frame pointer with
+            HashSet<int>? updatedCells = update && _filterSearches.Count != 0 ? new HashSet<int>() : null;
             int top = TopFrameOffset();
             for (int frame = _stackBase; frame <= top; frame += ShadowFrameSize)
             {
@@ -5255,11 +5485,16 @@ namespace Cnidaria.Cs
                 for (int r = 0; r < sp.RootCount; r++)
                 {
                     GcRootRecord root = _image.GcRoots[sp.RootStartIndex + r];
-                    if (update) UpdateRoot(frame, root);
-                    else MarkRoot(frame, root);
+                    if (!update)
+                        MarkRoot(frame, root);
+                    else if (updatedCells is null || IsRegisterRoot(root) || updatedCells.Add(FrameRootCellAddress(frame, root)))
+                        UpdateRoot(frame, root);
                 }
             }
         }
+
+        private static bool IsRegisterRoot(GcRootRecord root)
+            => (GcRootKind)root.Kind is GcRootKind.RegisterRef or GcRootKind.RegisterByRef or GcRootKind.InteriorRegister;
 
         private bool TryGetSafePoint(int methodIndex, int pc, out GcSafePointRecord safePoint)
         {
@@ -5452,7 +5687,7 @@ namespace Cnidaria.Cs
                 if (handler.Payload == 0)
                     continue;
 
-                if (handler.Continuation is PendingContinuationKind.None or PendingContinuationKind.Throw or PendingContinuationKind.ReturnReference)
+                if (handler.Continuation is PendingContinuationKind.None or PendingContinuationKind.Filter or PendingContinuationKind.Throw or PendingContinuationKind.ReturnReference)
                     TryMarkObject(checked((int)handler.Payload));
                 else if (handler.Continuation == PendingContinuationKind.ReturnValueAddress)
                     TryMarkObjectFromInteriorPointer(checked((int)handler.Payload));
@@ -5467,7 +5702,7 @@ namespace Cnidaria.Cs
                 if (handler.Payload == 0)
                     continue;
 
-                if (handler.Continuation is PendingContinuationKind.None or PendingContinuationKind.Throw or PendingContinuationKind.ReturnReference)
+                if (handler.Continuation is PendingContinuationKind.None or PendingContinuationKind.Filter or PendingContinuationKind.Throw or PendingContinuationKind.ReturnReference)
                     handler.Payload = TranslateObjectRef(checked((int)handler.Payload));
                 else if (handler.Continuation == PendingContinuationKind.ReturnValueAddress)
                     handler.Payload = TranslateInteriorPointer(checked((int)handler.Payload));
@@ -5551,34 +5786,29 @@ namespace Cnidaria.Cs
                 return new GprStorageLocation(GprStorageLocation.CurrentRegister);
 
             int directChild = checked(frameOffset + ShadowFrameSize);
-            if (directChild <= top)
-            {
-                int snapshotIndex = ReadI32(directChild + ShadowFrameRegisterSnapshotIndex);
-                if (snapshotIndex >= 0)
-                    return new GprStorageLocation(GprStorageLocation.Snapshot, snapshotIndex: snapshotIndex);
-            }
-
-            MachineRegister register = (MachineRegister)encodedRegister;
-            bool found = false;
-            GprStorageLocation location = new GprStorageLocation(GprStorageLocation.CurrentRegister);
-            for (int child = top; child > frameOffset; child -= ShadowFrameSize)
-            {
-                if (TryGetSavedRegisterSlot(child, register, out int slotAddress))
-                {
-                    location = new GprStorageLocation(GprStorageLocation.StackSlot, address: slotAddress);
-                    found = true;
-                }
-            }
+            int directSnapshot = ReadI32(directChild + ShadowFrameRegisterSnapshotIndex);
+            if (directSnapshot >= 0)
+                return new GprStorageLocation(GprStorageLocation.Snapshot, snapshotIndex: directSnapshot);
 
             // A suspended frame records the program counter of the call it is inside, and that safe
             // point still lists the outgoing arguments. Those sit in caller-saved registers that the
             // callee is free to reuse, so the live register no longer holds the caller's value and
             // there is nothing to recover it from. Whatever is still needed is reported by the frame
             // that owns it now, so the root is simply not this frame's to report
-            if (!found && !MachineRegisters.IsCalleeSaved(register))
+            MachineRegister register = (MachineRegister)encodedRegister;
+            if (!MachineRegisters.IsCalleeSaved(register))
                 return new GprStorageLocation(GprStorageLocation.Unavailable);
 
-            return location;
+            // The nearest frame above that saved the register holds its value, unless a frame pushed over a snapshot comes first
+            for (int child = directChild; child <= top; child += ShadowFrameSize)
+            {
+                int snapshotIndex = ReadI32(child + ShadowFrameRegisterSnapshotIndex);
+                if (child != directChild && snapshotIndex >= 0)
+                    return new GprStorageLocation(GprStorageLocation.Snapshot, snapshotIndex: snapshotIndex);
+                if (TryGetSavedRegisterSlot(child, register, out int slotAddress))
+                    return new GprStorageLocation(GprStorageLocation.StackSlot, address: slotAddress);
+            }
+            return new GprStorageLocation(GprStorageLocation.CurrentRegister);
         }
 
         private bool TryGetSavedRegisterSlot(int frameOffset, MachineRegister register, out int slotAddress)
@@ -7136,7 +7366,17 @@ namespace Cnidaria.Cs
             }
             if (messageField != null)
             {
-                int s = InternString(message);
+                int s;
+                _hostRoots.Add(obj);
+                try
+                {
+                    s = InternString(message);
+                    obj = _hostRoots[^1];
+                }
+                finally
+                {
+                    _hostRoots.RemoveAt(_hostRoots.Count - 1);
+                }
                 WriteNative(obj + messageField.Offset, s);
             }
             return obj;

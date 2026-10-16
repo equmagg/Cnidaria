@@ -118,7 +118,7 @@ namespace Cnidaria.Cs
                         statements.ToImmutable(),
                         block.SuccessorBlockIds,
                         block.SuccessorPcs,
-                        block.RegionPc));
+                        block.Region));
                 }
 
                 if (!changed)
@@ -169,6 +169,9 @@ namespace Cnidaria.Cs
                 fields = ImmutableArray<RuntimeField>.Empty;
 
                 if (descriptor.AddressExposed || descriptor.MemoryAliased || descriptor.IsImplicitByRef || descriptor.Pinned)
+                    return false;
+
+                if (SimdTypes.IsSimdKind(descriptor.StackKind))
                     return false;
 
                 var type = descriptor.Type;

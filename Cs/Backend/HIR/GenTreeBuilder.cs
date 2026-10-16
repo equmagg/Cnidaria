@@ -388,7 +388,7 @@ namespace Cnidaria.Cs
             }
         }
     }
-    internal sealed class GenTreeMethodBuilder
+    internal sealed partial class GenTreeMethodBuilder
     {
         private readonly RuntimeTypeSystem _rts;
         private readonly RuntimeModule _module;
@@ -413,6 +413,9 @@ namespace Cnidaria.Cs
         private readonly Dictionary<int, RuntimeType> _instantiatedTypes = new();
         private readonly HashSet<int> _activeInlineMethods = new();
         private readonly List<GenTreeBlock> _deferredInlineBlocks = new();
+        private readonly Dictionary<int, (int Host, bool Step)> _syntheticBlockHosts = new();
+        private readonly Dictionary<(int Clause, int Next), (int Block, int Pc)> _leaveSteps = new();
+        private int _currentRootBlockId = -1;
 
         private bool[] _addressExposedArgs = Array.Empty<bool>();
         private bool[] _addressExposedLocals = Array.Empty<bool>();
@@ -459,10 +462,18 @@ namespace Cnidaria.Cs
             _catchEntryPcs = new HashSet<int>();
             foreach (var clause in _body.ExceptionClauses)
             {
-                if (clause.Kind is not (CilExceptionClauseKind.Catch or CilExceptionClauseKind.Finally))
+                if (clause.Kind is not (CilExceptionClauseKind.Catch or CilExceptionClauseKind.Filter or CilExceptionClauseKind.Finally))
                     throw Fail(clause.HandlerStartPc, ILOpCode.Nop, $"Unsupported exception clause kind {clause.Kind}.");
-                if (clause.Kind == CilExceptionClauseKind.Catch)
+                if (clause.Kind is CilExceptionClauseKind.Catch or CilExceptionClauseKind.Filter)
                     _catchEntryPcs.Add(clause.HandlerStartPc);
+                if (clause.Kind != CilExceptionClauseKind.Filter)
+                    continue;
+                _catchEntryPcs.Add(clause.FilterStartPc);
+                foreach (var nested in _body.ExceptionClauses)
+                {
+                    if (InRange(nested.TryStartPc, clause.FilterStartPc, clause.HandlerStartPc))
+                        throw Fail(nested.TryStartPc, ILOpCode.Nop, "A protected region inside a filter is not supported.");
+                }
             }
             ComputeImportAddressExposure();
             _stackDepthAtPc = ComputeStackDepths(_body, _pops, _pushes, _module, _method);
@@ -470,16 +481,21 @@ namespace Cnidaria.Cs
             var leaders = ComputeLeaders(_body, _stackDepthAtPc, splitAfterCalls: true, _module, _method);
             _rootFrame = new ImportFrame(_module, _method, _body, inlineDepth: 0, callPc: -1, _localTypes, null, null, null,
                 DefaultValueLocalsOf(_body), pc => _pcToBlockId.ContainsKey(pc));
-            var blocks = BuildBlocks(leaders);
+            var blocks = LinkFinallyReturns(SeparateFinallyEntries(BuildBlocks(leaders)));
+            ImmutableArray<GenTreeBlock> layout = LayOutSyntheticBlocks(blocks, leaders.Count);
 
             var handlers = ImmutableArray.CreateBuilder<ExceptionHandler>(_body.ExceptionClauses.Length);
             foreach (var clause in _body.ExceptionClauses)
             {
-                handlers.Add(new ExceptionHandler(clause.TryStartPc, clause.TryEndPc, clause.HandlerStartPc, clause.HandlerEndPc,
-                    clause.Kind == CilExceptionClauseKind.Catch ? clause.CatchTypeToken : -1));
+                handlers.Add(new ExceptionHandler(clause.TryStartPc, clause.TryEndPc, clause.HandlerRegionStartPc, clause.HandlerEndPc, clause.Kind switch
+                {
+                    CilExceptionClauseKind.Catch => clause.CatchTypeToken,
+                    CilExceptionClauseKind.Filter => 0,
+                    _ => -1,
+                }, clause.Kind == CilExceptionClauseKind.Filter ? clause.HandlerStartPc : -1));
             }
 
-            return new GenTreeMethod(
+            var imported = new GenTreeMethod(
                 _module,
                 _method,
                 _rts.Target,
@@ -493,7 +509,228 @@ namespace Cnidaria.Cs
                 blocks,
                 _directDependencies.ToImmutableArray(),
                 _virtualDependencies.ToImmutableArray());
+            return layout.IsDefault ? imported : GenTreeCriticalEdgeSplitter.RenumberBlocks(imported, layout);
         }
+
+        // Inlinee blocks follow their caller and leave steps the try they exit, so every EH region stays contiguous
+        private ImmutableArray<GenTreeBlock> LayOutSyntheticBlocks(ImmutableArray<GenTreeBlock> blocks, int rootBlockCount)
+        {
+            if (blocks.Length == rootBlockCount)
+                return default;
+
+            var inlinedByHost = new List<GenTreeBlock>?[rootBlockCount];
+            var stepsByHost = new List<GenTreeBlock>?[rootBlockCount];
+            for (int i = rootBlockCount; i < blocks.Length; i++)
+            {
+                (int host, bool step) = _syntheticBlockHosts[blocks[i].Id];
+                ((step ? stepsByHost : inlinedByHost)[host] ??= new List<GenTreeBlock>()).Add(blocks[i]);
+            }
+
+            var layout = ImmutableArray.CreateBuilder<GenTreeBlock>(blocks.Length);
+            for (int i = 0; i < rootBlockCount; i++)
+            {
+                layout.Add(blocks[i]);
+                if (inlinedByHost[i] is List<GenTreeBlock> inlined)
+                    layout.AddRange(inlined);
+                if (stepsByHost[i] is List<GenTreeBlock> steps)
+                    layout.AddRange(steps);
+            }
+            return layout.MoveToImmutable();
+        }
+
+        // No branch may target the first block of a finally, which holds the funclet prolog
+        private ImmutableArray<GenTreeBlock> SeparateFinallyEntries(ImmutableArray<GenTreeBlock> blocks)
+        {
+            List<GenTreeBlock>? rewritten = null;
+            foreach (var clause in _body.ExceptionClauses)
+            {
+                if (clause.Kind is not (CilExceptionClauseKind.Finally or CilExceptionClauseKind.Fault))
+                    continue;
+                int entry = BlockIdForPc(clause.HandlerStartPc);
+                var current = (IReadOnlyList<GenTreeBlock>?)rewritten ?? blocks;
+                bool branchedTo = false;
+                foreach (GenTreeBlock block in current)
+                    branchedTo |= block.JumpKind != GenTreeBlockJumpKind.CallFinally && block.SuccessorBlockIds.Contains(entry);
+                if (!branchedTo)
+                    continue;
+
+                rewritten ??= new List<GenTreeBlock>(blocks);
+                GenTreeBlock old = rewritten[entry];
+                int pc = _nextSyntheticPc++;
+                int id = _nextDynamicBlockId++;
+                _pcToBlockId.Add(pc, id);
+                var branch = Node(GenTreeKind.Branch, pc, ILOpCode.Br, targetPc: old.StartPc, targetBlockId: entry);
+                rewritten.Add(new GenTreeBlock(id, pc, pc + 1, 0, 0, GenTreeBlockJumpKind.Always, old.Flags,
+                    ImmutableArray.Create(branch), ImmutableArray.Create(entry), ImmutableArray.Create(old.StartPc), old.Region));
+                _syntheticBlockHosts.Add(id, (entry - 1, true));
+                rewritten[entry] = WithTerminator(old, old.Flags & ~GenTreeBlockFlags.HandlerEntry, null);
+
+                for (int b = 0; b < rewritten.Count; b++)
+                {
+                    GenTreeBlock call = rewritten[b];
+                    if (call.JumpKind != GenTreeBlockJumpKind.CallFinally || call.Statements[^1].TargetBlockId != entry)
+                        continue;
+                    GenTree terminator = call.Statements[^1];
+                    rewritten[b] = WithTerminator(call, call.Flags,
+                        Node(GenTreeKind.CallFinally, terminator.Pc, ILOpCode.Leave, targetPc: pc, targetBlockId: id));
+                }
+            }
+            return rewritten?.ToImmutableArray() ?? blocks;
+        }
+
+        private static GenTreeBlock WithTerminator(GenTreeBlock block, GenTreeBlockFlags flags, GenTree? terminator)
+            => new GenTreeBlock(
+                block.Id,
+                block.StartPc,
+                block.EndPcExclusive,
+                block.EntryStackDepth,
+                block.ExitStackDepth,
+                block.JumpKind,
+                flags,
+                terminator is null ? block.Statements : block.Statements.SetItem(block.Statements.Length - 1, terminator),
+                terminator is null ? block.SuccessorBlockIds : ImmutableArray.Create(terminator.TargetBlockId),
+                terminator is null ? block.SuccessorPcs : ImmutableArray.Create(terminator.TargetPc),
+                block.Region);
+
+        // An endfinally continues at the block after each callfinally block that runs its handler
+        private ImmutableArray<GenTreeBlock> LinkFinallyReturns(ImmutableArray<GenTreeBlock> blocks)
+        {
+            Dictionary<int, List<int>>? returnsByHandler = null;
+            foreach (GenTreeBlock block in blocks)
+            {
+                if (block.JumpKind != GenTreeBlockJumpKind.CallFinally)
+                    continue;
+                returnsByHandler ??= new Dictionary<int, List<int>>();
+                int handler = blocks[block.Statements[^1].TargetBlockId].Region.HandlerIndex;
+                if (!returnsByHandler.TryGetValue(handler, out var returns))
+                    returnsByHandler.Add(handler, returns = new List<int>());
+                returns.Add(block.Id + 1);
+            }
+            if (returnsByHandler is null)
+                return blocks;
+
+            var linked = blocks.ToBuilder();
+            foreach (GenTreeBlock block in blocks)
+            {
+                if (block.JumpKind != GenTreeBlockJumpKind.EndFinally || block.Region.HandlerIndex < 0)
+                    continue;
+                if (!returnsByHandler.TryGetValue(block.Region.HandlerIndex, out var returns))
+                    continue;
+                var returnPcs = ImmutableArray.CreateBuilder<int>(returns.Count);
+                foreach (int target in returns)
+                    returnPcs.Add(blocks[target].StartPc);
+                linked[block.Id] = new GenTreeBlock(
+                    block.Id,
+                    block.StartPc,
+                    block.EndPcExclusive,
+                    block.EntryStackDepth,
+                    block.ExitStackDepth,
+                    block.JumpKind,
+                    block.Flags,
+                    block.Statements,
+                    returns.ToImmutableArray(),
+                    returnPcs.MoveToImmutable(),
+                    block.Region);
+            }
+            return linked.MoveToImmutable();
+        }
+
+        // A leave becomes a chain of steps, a callfinally for each finally it exits and a catchret for each catch
+        private GenTree ImportLeave(int pc, int targetPc, List<int> successorPcs)
+        {
+            var clauses = _body.ExceptionClauses;
+            var exits = new List<(int Clause, bool FromHandler)>();
+            for (int i = 0; i < clauses.Length; i++)
+            {
+                var clause = clauses[i];
+                if (InRange(pc, clause.HandlerRegionStartPc, clause.HandlerEndPc) && !InRange(targetPc, clause.HandlerRegionStartPc, clause.HandlerEndPc))
+                    exits.Add((i, true));
+                else if (clause.Kind == CilExceptionClauseKind.Finally &&
+                    InRange(pc, clause.TryStartPc, clause.TryEndPc) && !InRange(targetPc, clause.TryStartPc, clause.TryEndPc))
+                    exits.Add((i, false));
+            }
+
+            bool leavesCatch = exits.Count != 0 && exits[0].FromHandler;
+            (int Block, int Pc) next = (BlockIdForPc(targetPc), targetPc);
+            for (int k = exits.Count - 1; k >= (leavesCatch ? 1 : 0); k--)
+            {
+                next = exits[k].FromHandler
+                    ? CatchReturnStep(exits[k - 1].Clause, next)
+                    : CallFinally(exits[k].Clause, next);
+            }
+
+            AddSuccessor(successorPcs, next.Pc);
+            return Node(leavesCatch ? GenTreeKind.CatchReturn : GenTreeKind.Branch, pc, ILOpCode.Leave,
+                targetPc: next.Pc, targetBlockId: next.Block);
+        }
+
+        private (int Block, int Pc) CallFinally(int clause, (int Block, int Pc) next)
+        {
+            var handler = _body.ExceptionClauses[clause];
+            if (_leaveSteps.TryGetValue((clause, next.Block), out var existing))
+                return existing;
+
+            var call = AddLeaveStep(clause, GenTreeKind.CallFinally, (BlockIdForPc(handler.HandlerStartPc), handler.HandlerStartPc));
+            AddLeaveStep(clause, GenTreeKind.Branch, next);
+            _leaveSteps[(clause, next.Block)] = call;
+            return call;
+        }
+
+        private (int Block, int Pc) CatchReturnStep(int clause, (int Block, int Pc) next)
+        {
+            if (_leaveSteps.TryGetValue((~clause, next.Block), out var existing))
+                return existing;
+            var step = AddLeaveStep(clause, GenTreeKind.CatchReturn, next);
+            _leaveSteps[(~clause, next.Block)] = step;
+            return step;
+        }
+
+        // Steps run around the clause they follow: outside its try and handler, inside everything enclosing it
+        private (int Block, int Pc) AddLeaveStep(int clause, GenTreeKind kind, (int Block, int Pc) target)
+        {
+            var clauses = _body.ExceptionClauses;
+            var around = clauses[clause];
+            int tryIndex = -1;
+            int handlerIndex = -1;
+            for (int i = 0; i < clauses.Length; i++)
+            {
+                var c = clauses[i];
+                bool enclosesTry = c.TryStartPc <= around.TryStartPc && around.TryEndPc <= c.TryEndPc &&
+                    (c.TryStartPc != around.TryStartPc || c.TryEndPc != around.TryEndPc);
+                if (enclosesTry && (tryIndex < 0 || c.TryEndPc - c.TryStartPc < clauses[tryIndex].TryEndPc - clauses[tryIndex].TryStartPc))
+                    tryIndex = i;
+                bool handlerHoldsTry = c.HandlerRegionStartPc <= around.TryStartPc && around.TryEndPc <= c.HandlerEndPc;
+                if (handlerHoldsTry && (handlerIndex < 0 || c.HandlerEndPc - c.HandlerRegionStartPc < clauses[handlerIndex].HandlerEndPc - clauses[handlerIndex].HandlerRegionStartPc))
+                    handlerIndex = i;
+            }
+
+            var region = new GenTreeEhRegion(tryIndex, handlerIndex);
+            GenTreeBlockFlags flags = GenTreeBlockFlags.None;
+            if (region.TryIndex >= 0) flags |= GenTreeBlockFlags.InTryRegion;
+            if (region.HandlerIndex >= 0) flags |= GenTreeBlockFlags.InHandlerRegion;
+
+            int pc = _nextSyntheticPc++;
+            int blockId = _nextDynamicBlockId++;
+            _pcToBlockId.Add(pc, blockId);
+            var transfer = Node(kind, pc, ILOpCode.Leave, targetPc: target.Pc, targetBlockId: target.Block);
+            _deferredInlineBlocks.Add(new GenTreeBlock(
+                blockId,
+                pc,
+                pc + 1,
+                0,
+                0,
+                ClassifyBlockJump(new List<GenTree> { transfer }, new List<int> { target.Pc }),
+                flags,
+                ImmutableArray.Create(transfer),
+                ImmutableArray.Create(target.Block),
+                ImmutableArray.Create(target.Pc),
+                region));
+            _syntheticBlockHosts.Add(blockId, (BlockIdForPc(around.TryEndPc) - 1, true));
+            return (blockId, pc);
+        }
+
+        private static bool InRange(int pc, int start, int end)
+            => (uint)(pc - start) < (uint)(end - start);
 
         private void ComputeImportAddressExposure()
         {
@@ -564,9 +801,8 @@ namespace Cnidaria.Cs
                         return CreateBlock(blockId, startPc, pc + 1, statements, successorPcs, stack.Count);
 
                     case ILOpCode.Leave:
-                        AddSuccessor(successorPcs, ins.TargetPc);
                         DiscardStackForLeave(statements, stack, pc, ins.Op);
-                        statements.Add(Node(GenTreeKind.Branch, pc, GenTreeOperator.Leave, targetPc: ins.TargetPc, targetBlockId: BlockIdForPc(ins.TargetPc)));
+                        statements.Add(ImportLeave(pc, ins.TargetPc, successorPcs));
                         return CreateBlock(blockId, startPc, pc + 1, statements, successorPcs, stack.Count);
 
                     case ILOpCode.Brtrue:
@@ -598,6 +834,8 @@ namespace Cnidaria.Cs
                         }
 
                     case ILOpCode.Ret:
+                        if (RegionForPc(pc) != GenTreeEhRegion.None)
+                            throw new GenTreeBuildException($"ret inside a protected region or handler at pc {pc}.");
                         if (IsVoid(_method.ReturnType))
                         {
                             statements.Add(Node(GenTreeKind.Return, pc, ins.Op));
@@ -624,9 +862,15 @@ namespace Cnidaria.Cs
                         statements.Add(Node(GenTreeKind.EndFinally, pc, ins.Op));
                         return CreateBlock(blockId, startPc, pc + 1, statements, successorPcs, stack.Count);
 
+                    case ILOpCode.Endfilter:
+                        {
+                            var value = Pop(stack, pc, ins.Op);
+                            statements.Add(Node(GenTreeKind.EndFilter, pc, ins.Op, operands: One(value.Node)));
+                            return CreateBlock(blockId, startPc, pc + 1, statements, successorPcs, stack.Count);
+                        }
+
                     case ILOpCode.Switch:
                     case ILOpCode.Jmp:
-                    case ILOpCode.Endfilter:
                         throw Fail(pc, ins.Op, $"Unsupported control-flow opcode '{ins.Op}'.");
 
                     default:
@@ -714,7 +958,7 @@ namespace Cnidaria.Cs
             foreach (var clause in _body.ExceptionClauses)
             {
                 if ((uint)(pc - clause.TryStartPc) < (uint)(clause.TryEndPc - clause.TryStartPc) ||
-                    (uint)(pc - clause.HandlerStartPc) < (uint)(clause.HandlerEndPc - clause.HandlerStartPc))
+                    (uint)(pc - clause.HandlerRegionStartPc) < (uint)(clause.HandlerEndPc - clause.HandlerRegionStartPc))
                 {
                     return true;
                 }
@@ -722,12 +966,15 @@ namespace Cnidaria.Cs
             return false;
         }
 
-        private bool PcInExceptionHandlerRegion(int pc)
+        private bool PcInCatchHandler(int pc)
         {
             foreach (var clause in _body.ExceptionClauses)
             {
-                if ((uint)(pc - clause.HandlerStartPc) < (uint)(clause.HandlerEndPc - clause.HandlerStartPc))
+                if (clause.Kind is CilExceptionClauseKind.Catch or CilExceptionClauseKind.Filter &&
+                    (uint)(pc - clause.HandlerRegionStartPc) < (uint)(clause.HandlerEndPc - clause.HandlerRegionStartPc))
+                {
                     return true;
+                }
             }
             return false;
         }
@@ -742,9 +989,9 @@ namespace Cnidaria.Cs
             foreach (var clause in _body.ExceptionClauses)
             {
                 if (clause.TryStartPc == startPc) flags |= GenTreeBlockFlags.TryEntry;
-                if (clause.HandlerStartPc == startPc) flags |= GenTreeBlockFlags.HandlerEntry;
+                if (clause.HandlerStartPc == startPc || clause.HandlerRegionStartPc == startPc) flags |= GenTreeBlockFlags.HandlerEntry;
                 if (RangesIntersect(startPc, endPc, clause.TryStartPc, clause.TryEndPc)) flags |= GenTreeBlockFlags.InTryRegion;
-                if (RangesIntersect(startPc, endPc, clause.HandlerStartPc, clause.HandlerEndPc)) flags |= GenTreeBlockFlags.InHandlerRegion;
+                if (RangesIntersect(startPc, endPc, clause.HandlerRegionStartPc, clause.HandlerEndPc)) flags |= GenTreeBlockFlags.InHandlerRegion;
             }
 
             return flags;
@@ -786,7 +1033,11 @@ namespace Cnidaria.Cs
 
             AddEntry(0, 0);
             foreach (var clause in body.ExceptionClauses)
+            {
                 AddEntry(clause.HandlerStartPc, clause.Kind is CilExceptionClauseKind.Catch or CilExceptionClauseKind.Filter ? 1 : 0);
+                if (clause.Kind == CilExceptionClauseKind.Filter)
+                    AddEntry(clause.FilterStartPc, 1);
+            }
 
             while (queue.Count != 0)
             {
@@ -907,6 +1158,7 @@ namespace Cnidaria.Cs
             {
                 AddReachableLeader(clause.TryStartPc);
                 AddReachableLeader(clause.TryEndPc);
+                AddReachableLeader(clause.HandlerRegionStartPc);
                 AddReachableLeader(clause.HandlerStartPc);
                 AddReachableLeader(clause.HandlerEndPc);
             }
@@ -1039,6 +1291,8 @@ namespace Cnidaria.Cs
         {
             _pcToBlockId = new Dictionary<int, int>(leaders.Count);
             _deferredInlineBlocks.Clear();
+            _syntheticBlockHosts.Clear();
+            _leaveSteps.Clear();
 
             for (int i = 0; i < leaders.Count; i++)
                 _pcToBlockId[leaders[i]] = i;
@@ -1054,6 +1308,8 @@ namespace Cnidaria.Cs
             {
                 if (_pcToBlockId.TryGetValue(clause.HandlerStartPc, out int handlerBlock))
                     pending.Add(handlerBlock);
+                if (_pcToBlockId.TryGetValue(clause.HandlerRegionStartPc, out int filterBlock))
+                    pending.Add(filterBlock);
             }
             int scannedInlineBlocks = 0;
             while (pending.Count != 0)
@@ -1065,6 +1321,7 @@ namespace Cnidaria.Cs
 
                 int startPc = leaders[i];
                 int hardEndPc = (i + 1 < leaders.Count) ? leaders[i + 1] : _body.Instructions.Length;
+                _currentRootBlockId = i;
                 var block = BuildBlock(i, startPc, hardEndPc);
                 blocks[i] = block;
                 AddPendingRootSuccessors(block, blocks, pending);
@@ -2443,9 +2700,13 @@ namespace Cnidaria.Cs
 
             if (!isVirtual && RuntimeTypeSystem.IsHardwareAccelerationQuery(method))
             {
-                Push(stack, Node(GenTreeKind.ConstI4, npc, op, stackKind: GenStackKind.I4, int32: 0));
+                Push(stack, Node(GenTreeKind.ConstI4, npc, op, stackKind: GenStackKind.I4,
+                    int32: IsHardwareAcceleratedVectorApi(method.DeclaringType) ? 1 : 0));
                 return 1;
             }
+
+            if (!isVirtual && (ins.Prefixes & CilPrefix.Constrained) == 0 && TryImportHWIntrinsic(frame, stack, statements, method, npc, op))
+                return 1;
 
             if (!isVirtual &&
                 IsSystemMethod(method, "System.Runtime.CompilerServices", "RuntimeHelpers", "IsBitwiseEquatable") &&
@@ -2794,7 +3055,7 @@ namespace Cnidaria.Cs
             if (body is null || bodyModule is null)
                 return false;
 
-            if (PcInExceptionHandlerRegion(callPc))
+            if (PcInCatchHandler(callPc))
                 return false;
 
             if (!CanInline(callee, bodyModule, body, args, inlineDepth, out var inlineInfo))
@@ -2804,10 +3065,8 @@ namespace Cnidaria.Cs
             if (calleeArgTypes.Length != args.Length)
                 return false;
 
-            // Exception regions span contiguous block ids, and inlinee blocks are appended after all of them.
             if (inlineInfo.HasControlFlow &&
-                (successorPcs is null || callerContinuationStack is null || inlineDepth > 1 || !_pcToBlockId.ContainsKey(callPc + 1) ||
-                 PcInExceptionRegion(callPc)))
+                (successorPcs is null || callerContinuationStack is null || inlineDepth > 1 || !_pcToBlockId.ContainsKey(callPc + 1)))
             {
                 return false;
             }
@@ -2837,6 +3096,8 @@ namespace Cnidaria.Cs
                         argSubstitutions[i] = new StackValue(args[i], args[i].Type, args[i].StackKind);
                         continue;
                     }
+                    if (inlineInfo.CanDropArgument(i, args[i]))
+                        continue;
 
                     var temp = CreateInlineTemp(GenTempKind.InlineArg, t, StackKindOf(t));
                     argTemps[i] = temp;
@@ -2931,6 +3192,8 @@ namespace Cnidaria.Cs
                     argSubstitutions[i] = new StackValue(args[i], args[i].Type, args[i].StackKind);
                     continue;
                 }
+                if (inlineInfo.CanDropArgument(i, args[i]))
+                    continue;
 
                 var temp = CreateInlineGraphTemp(t, StackKindOf(t));
                 argTemps[i] = temp;
@@ -2971,7 +3234,9 @@ namespace Cnidaria.Cs
             {
                 int calleeStartPc = plan.Leaders[i];
                 int calleeEndPc = i + 1 < plan.Leaders.Length ? plan.Leaders[i + 1] : body.Instructions.Length;
-                _deferredInlineBlocks.Add(BuildInlineGraphBlock(context, calleeStartPc, calleeEndPc));
+                GenTreeBlock inlined = BuildInlineGraphBlock(context, calleeStartPc, calleeEndPc);
+                _syntheticBlockHosts.Add(inlined.Id, (_currentRootBlockId, false));
+                _deferredInlineBlocks.Add(inlined);
             }
         }
 
@@ -3022,7 +3287,7 @@ namespace Cnidaria.Cs
                             AddSuccessor(successorPcs, targetPc);
                             SpillStackForBoundaries(statements, stack, successorPcs, context.CallPc, ins.Op);
                             statements.Add(Node(GenTreeKind.Branch, context.CallPc, ins.Op, targetPc: targetPc, targetBlockId: BlockIdForPc(targetPc)));
-                            return CreateInlineGraphBlock(blockId, syntheticStartPc, statements, successorPcs, entryDepth, stack.Count);
+                            return CreateInlineGraphBlock(context, blockId, syntheticStartPc, statements, successorPcs, entryDepth, stack.Count);
                         }
 
                     case ILOpCode.Brtrue:
@@ -3036,7 +3301,7 @@ namespace Cnidaria.Cs
                             SpillStackForBoundaries(statements, stack, successorPcs, context.CallPc, ins.Op);
                             statements.Add(Node(ins.Op == ILOpCode.Brtrue ? GenTreeKind.BranchTrue : GenTreeKind.BranchFalse,
                                 context.CallPc, ins.Op, operands: One(cond.Node), targetPc: targetPc, targetBlockId: BlockIdForPc(targetPc)));
-                            return CreateInlineGraphBlock(blockId, syntheticStartPc, statements, successorPcs, entryDepth, stack.Count);
+                            return CreateInlineGraphBlock(context, blockId, syntheticStartPc, statements, successorPcs, entryDepth, stack.Count);
                         }
 
                     case ILOpCode.Ret:
@@ -3057,7 +3322,7 @@ namespace Cnidaria.Cs
                             SpillStackForBoundary(statements, continuationStack, context.ContinuationPc, context.CallPc, ins.Op);
                             statements.Add(Node(GenTreeKind.Branch, context.CallPc, ins.Op, targetPc: context.ContinuationPc, targetBlockId: BlockIdForPc(context.ContinuationPc)));
                             stack.Clear();
-                            return CreateInlineGraphBlock(blockId, syntheticStartPc, statements, successorPcs, entryDepth, exitStackDepth: 0);
+                            return CreateInlineGraphBlock(context, blockId, syntheticStartPc, statements, successorPcs, entryDepth, exitStackDepth: 0);
                         }
 
                     case ILOpCode.Throw:
@@ -3065,7 +3330,7 @@ namespace Cnidaria.Cs
                             var value = Pop(stack, context.CallPc, ins.Op);
                             statements.Add(Node(GenTreeKind.Throw, context.CallPc, ins.Op, operands: One(value.Node)));
                             stack.Clear();
-                            return CreateInlineGraphBlock(blockId, syntheticStartPc, statements, successorPcs, entryDepth, exitStackDepth: 0);
+                            return CreateInlineGraphBlock(context, blockId, syntheticStartPc, statements, successorPcs, entryDepth, exitStackDepth: 0);
                         }
 
                     default:
@@ -3073,7 +3338,7 @@ namespace Cnidaria.Cs
                         if (terminatedBlock)
                         {
                             stack.Clear();
-                            return CreateInlineGraphBlock(blockId, syntheticStartPc, statements, successorPcs, entryDepth, exitStackDepth: 0);
+                            return CreateInlineGraphBlock(context, blockId, syntheticStartPc, statements, successorPcs, entryDepth, exitStackDepth: 0);
                         }
                         continue;
                 }
@@ -3086,7 +3351,7 @@ namespace Cnidaria.Cs
                 SpillStackForBoundary(statements, stack, successorPc, context.CallPc, ILOpCode.Nop);
             }
 
-            return CreateInlineGraphBlock(blockId, syntheticStartPc, statements, successorPcs, entryDepth, stack.Count);
+            return CreateInlineGraphBlock(context, blockId, syntheticStartPc, statements, successorPcs, entryDepth, stack.Count);
         }
 
         private bool CanInline(
@@ -3401,7 +3666,31 @@ namespace Cnidaria.Cs
                 flags,
                 statements.ToImmutableArray(),
                 succBlockIds.ToImmutableArray(),
-                successorPcs.ToImmutableArray());
+                successorPcs.ToImmutableArray(),
+                RegionForPc(startPc));
+        }
+
+        // Clauses that share a try keep the first one as the innermost, as their metadata order nests them
+        private GenTreeEhRegion RegionForPc(int pc)
+        {
+            int tryIndex = -1;
+            int handlerIndex = -1;
+            var clauses = _body.ExceptionClauses;
+            for (int i = 0; i < clauses.Length; i++)
+            {
+                var clause = clauses[i];
+                if ((uint)(pc - clause.TryStartPc) < (uint)(clause.TryEndPc - clause.TryStartPc) &&
+                    (tryIndex < 0 || clause.TryEndPc - clause.TryStartPc < clauses[tryIndex].TryEndPc - clauses[tryIndex].TryStartPc))
+                {
+                    tryIndex = i;
+                }
+                if ((uint)(pc - clause.HandlerRegionStartPc) < (uint)(clause.HandlerEndPc - clause.HandlerRegionStartPc) &&
+                    (handlerIndex < 0 || clause.HandlerEndPc - clause.HandlerRegionStartPc < clauses[handlerIndex].HandlerEndPc - clauses[handlerIndex].HandlerRegionStartPc))
+                {
+                    handlerIndex = i;
+                }
+            }
+            return new GenTreeEhRegion(tryIndex, handlerIndex);
         }
 
         private GenTreeBlockJumpKind ClassifyBlockJump(List<GenTree> statements, List<int> successorPcs)
@@ -3417,6 +3706,9 @@ namespace Cnidaria.Cs
                 GenTreeKind.Throw => GenTreeBlockJumpKind.Throw,
                 GenTreeKind.Rethrow => GenTreeBlockJumpKind.Rethrow,
                 GenTreeKind.EndFinally => GenTreeBlockJumpKind.EndFinally,
+                GenTreeKind.CallFinally => GenTreeBlockJumpKind.CallFinally,
+                GenTreeKind.CatchReturn => GenTreeBlockJumpKind.CatchReturn,
+                GenTreeKind.EndFilter => GenTreeBlockJumpKind.EndFilter,
                 _ => successorPcs.Count == 0 ? GenTreeBlockJumpKind.None : GenTreeBlockJumpKind.FallThrough,
             };
         }
@@ -3675,7 +3967,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.Return or
                 GenTreeKind.Throw or
                 GenTreeKind.Rethrow or
-                GenTreeKind.EndFinally;
+                GenTreeKind.EndFinally or GenTreeKind.CallFinally or GenTreeKind.CatchReturn or GenTreeKind.EndFilter;
         }
 
         private static bool RequiresImmediateMaterialization(GenTree value)
@@ -4734,7 +5026,7 @@ namespace Cnidaria.Cs
             return Node(address.Kind, address.Pc, address.Operator, type: address.Type, stackKind: address.StackKind, int32: address.Int32);
         }
 
-        private static bool CanExpandStructFieldWise(RuntimeType? type)
+        private bool CanExpandStructFieldWise(RuntimeType? type)
         {
             if (type is null || !type.IsValueType || type.Kind != RuntimeTypeKind.Struct || type.InstanceFields.Length == 0)
                 return false;
@@ -5361,6 +5653,7 @@ namespace Cnidaria.Cs
         }
 
         private GenTreeBlock CreateInlineGraphBlock(
+            InlineGraphContext context,
             int blockId,
             int syntheticStartPc,
             List<GenTree> statements,
@@ -5373,9 +5666,12 @@ namespace Cnidaria.Cs
                 succBlockIds.Add(BlockIdForPc(successorPcs[i]));
 
             var jumpKind = ClassifyBlockJump(statements, successorPcs);
+            GenTreeEhRegion region = RegionForPc(context.CallPc);
             GenTreeBlockFlags flags = GenTreeBlockFlags.None;
             if (entryStackDepth != 0) flags |= GenTreeBlockFlags.HasStackEntry;
             if (successorPcs.Count != 0 && exitStackDepth != 0) flags |= GenTreeBlockFlags.HasStackExit;
+            if (region.TryIndex >= 0) flags |= GenTreeBlockFlags.InTryRegion;
+            if (region.HandlerIndex >= 0) flags |= GenTreeBlockFlags.InHandlerRegion;
 
             return new GenTreeBlock(
                 blockId,
@@ -5387,7 +5683,8 @@ namespace Cnidaria.Cs
                 flags,
                 statements.ToImmutableArray(),
                 succBlockIds.ToImmutableArray(),
-                successorPcs.ToImmutableArray());
+                successorPcs.ToImmutableArray(),
+                region);
         }
 
         private List<StackValue> CreateInlineGraphEntryStack(InlineGraphContext context, int calleeStartPc)
@@ -5656,6 +5953,16 @@ namespace Cnidaria.Cs
                     _argLoadCounts[index] == 1 &&
                     IsPureInlineArgument(arg);
             }
+
+            public bool CanDropArgument(int index, GenTree arg)
+                => (uint)index < (uint)_argLoadCounts.Length &&
+                    (uint)index < (uint)_argStoreCounts.Length &&
+                    (uint)index < (uint)_argAddressCounts.Length &&
+                    _argLoadCounts[index] == 0 &&
+                    _argStoreCounts[index] == 0 &&
+                    _argAddressCounts[index] == 0 &&
+                    (arg.Flags & (GenTreeFlags.ContainsCall | GenTreeFlags.CanThrow | GenTreeFlags.SideEffect | GenTreeFlags.MemoryWrite |
+                        GenTreeFlags.Allocation | GenTreeFlags.ControlFlow | GenTreeFlags.ExceptionFlow | GenTreeFlags.Ordered)) == 0;
 
             public bool LocalNeedsInit(int index)
                 => (uint)index < (uint)_localNeedsInit.Length && _localNeedsInit[index];
@@ -6227,6 +6534,9 @@ namespace Cnidaria.Cs
                 case GenTreeKind.BranchFalse:
                 case GenTreeKind.Return:
                 case GenTreeKind.EndFinally:
+                case GenTreeKind.CallFinally:
+                case GenTreeKind.CatchReturn:
+                case GenTreeKind.EndFilter:
                     flags |= GenTreeFlags.ControlFlow | GenTreeFlags.Ordered;
                     break;
 
@@ -6289,13 +6599,17 @@ namespace Cnidaria.Cs
             };
         }
 
-        private static GenStackKind StackKindOf(RuntimeType? type)
+        private GenStackKind StackKindOf(RuntimeType? type)
         {
             if (type is null)
                 return GenStackKind.Unknown;
 
             if (IsVoid(type))
                 return GenStackKind.Void;
+
+            GenStackKind simdKind = SimdTypes.KindOf(type, _rts.Target);
+            if (simdKind != GenStackKind.Unknown)
+                return simdKind;
 
             if (type.IsReferenceType)
                 return GenStackKind.Ref;

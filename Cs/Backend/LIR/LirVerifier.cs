@@ -230,8 +230,10 @@ namespace Cnidaria.Cs
         {
             byte expectedGeneral = node.LinearLowering.InternalGeneralRegisters;
             byte expectedFloat = node.LinearLowering.InternalFloatRegisters;
+            byte expectedVector = node.LinearLowering.InternalVectorRegisters;
             byte actualGeneral = 0;
             byte actualFloat = 0;
+            byte actualVector = 0;
 
             if (internalRefs is not null)
             {
@@ -248,16 +250,18 @@ namespace Cnidaria.Cs
                         actualGeneral += rp.MinimumRegisterCount;
                     else if (rp.RegisterClass == RegisterClass.Float)
                         actualFloat += rp.MinimumRegisterCount;
+                    else if (rp.RegisterClass == RegisterClass.Vector)
+                        actualVector += rp.MinimumRegisterCount;
                     else
                         throw new InvalidOperationException($"pre-LSRA lowering invariant failed: node {node.LinearId} has invalid internal register class {rp.RegisterClass}.");
                 }
             }
 
-            if (actualGeneral != expectedGeneral || actualFloat != expectedFloat)
+            if (actualGeneral != expectedGeneral || actualFloat != expectedFloat || actualVector != expectedVector)
             {
                 throw new InvalidOperationException(
-                    $"pre-LSRA lowering invariant failed: node {node.LinearId} internal register refs are gen={actualGeneral}, float={actualFloat}; " +
-                    $"lowering requested gen={expectedGeneral}, float={expectedFloat}.");
+                    $"pre-LSRA lowering invariant failed: node {node.LinearId} internal register refs are gen={actualGeneral}, float={actualFloat}, vector={actualVector}; " +
+                    $"lowering requested gen={expectedGeneral}, float={expectedFloat}, vector={expectedVector}.");
             }
         }
 
@@ -673,7 +677,7 @@ namespace Cnidaria.Cs
                         throw new InvalidOperationException($"linear IR kill ref-position must not carry a value: {rp}.");
                     if (rp.RegisterMask == 0)
                         throw new InvalidOperationException($"linear IR kill ref-position must carry a non-empty kill register mask: {rp}.");
-                    if (rp.FixedRegister != MachineRegister.Invalid && (rp.RegisterMask & MachineRegisters.MaskOf(rp.FixedRegister)) == 0)
+                    if (rp.FixedRegister != MachineRegister.Invalid && (rp.RegisterMask & RegisterInfo.MaskOf(rp.FixedRegister)) == 0)
                         throw new InvalidOperationException($"linear IR kill ref-position fixed register is not present in its kill mask: {rp}.");
                     if (rp.FixedRegister != MachineRegister.Invalid &&
                         rp.RegisterClass != RegisterClass.Invalid &&

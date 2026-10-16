@@ -234,7 +234,11 @@ namespace Cnidaria.Cs
                     continue;
 
                 target.UnionWith(liveIn[handlerBlockId]);
+                target.UnionWith(liveIn[cfg.ExceptionRegions[regionIndex].HandlerBodyStartBlockId]);
             }
+            int guarded = EhFuncletLayout.EndFilterSuccessor(cfg, blockId);
+            if (guarded >= 0)
+                target.UnionWith(liveIn[guarded]);
         }
 
         private static void CollectStatementEvents(
@@ -412,11 +416,51 @@ namespace Cnidaria.Cs
             return new GenTreeLocalLiveness(
                 cfg,
                 trackedLocals,
-                tracking.SsaCandidateSlots,
+                DemoteHandlerBoundaryLocals(method, cfg, trackedLocals, liveIn, tracking.SsaCandidateSlots),
                 uses,
                 defs,
                 liveIn,
                 liveOut);
+        }
+
+        // A local live into or out of a handler stays in its stack home
+        private static ImmutableArray<SsaSlot> DemoteHandlerBoundaryLocals(
+            GenTreeMethod method,
+            ControlFlowGraph cfg,
+            TrackedLocalTable trackedLocals,
+            TrackedLocalSet[] liveIn,
+            ImmutableArray<SsaSlot> ssaCandidates)
+        {
+            if (cfg.ExceptionRegions.Length == 0 || ssaCandidates.IsDefaultOrEmpty)
+                return ssaCandidates;
+
+            var crossing = trackedLocals.NewEmptySet();
+            for (int r = 0; r < cfg.ExceptionRegions.Length; r++)
+            {
+                crossing.UnionWith(liveIn[cfg.ExceptionRegions[r].HandlerStartBlockId]);
+                crossing.UnionWith(liveIn[cfg.ExceptionRegions[r].HandlerBodyStartBlockId]);
+            }
+            for (int b = 0; b < cfg.Blocks.Length; b++)
+            {
+                if (cfg.Blocks[b].SourceBlock.JumpKind is not (GenTreeBlockJumpKind.EndFinally or GenTreeBlockJumpKind.CatchReturn))
+                    continue;
+                var successors = cfg.Blocks[b].Successors;
+                for (int i = 0; i < successors.Length; i++)
+                    crossing.UnionWith(liveIn[successors[i].ToBlockId]);
+            }
+
+            var kept = ImmutableArray.CreateBuilder<SsaSlot>(ssaCandidates.Length);
+            foreach (SsaSlot slot in ssaCandidates)
+            {
+                if (!crossing.Contains(slot))
+                {
+                    kept.Add(slot);
+                    continue;
+                }
+                GenLocalDescriptor descriptor = method.AllLocalDescriptors[slot.LclNum];
+                descriptor.MarkTrackedButNotSsa(descriptor.VarIndex, descriptor.IsStructField ? descriptor.Category : GenLocalCategory.TrackedNonSsaLocal);
+            }
+            return kept.Count == ssaCandidates.Length ? ssaCandidates : kept.ToImmutable();
         }
 
         private static void AddImplicitExceptionHandlerLiveOut(
@@ -438,7 +482,11 @@ namespace Cnidaria.Cs
                     continue;
 
                 target.UnionWith(liveIn[handlerBlockId]);
+                target.UnionWith(liveIn[cfg.ExceptionRegions[regionIndex].HandlerBodyStartBlockId]);
             }
+            int guarded = EhFuncletLayout.EndFilterSuccessor(cfg, blockId);
+            if (guarded >= 0)
+                target.UnionWith(liveIn[guarded]);
         }
 
         private static void MarkLastUses(ControlFlowGraph cfg, TrackedLocalTable trackedLocals, TrackedLocalSet[] liveOut)

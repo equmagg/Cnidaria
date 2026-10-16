@@ -407,7 +407,7 @@ namespace Cnidaria.Cs
         {
             var operand = BindExpression(node.Expression, context, diagnostics);
 
-            if (node.Pattern is TypePatternSyntax typePattern)
+            if (node.Pattern is TypePatternSyntax typePattern && !TryConvertTypePatternToConstant(typePattern, context, out _))
             {
                 var patternType = BindType(typePattern.Type, context, diagnostics);
                 return BindIsTypePattern(
@@ -492,6 +492,8 @@ namespace Cnidaria.Cs
 
                 case TypePatternSyntax typePattern:
                     {
+                        if (TryConvertTypePatternToConstant(typePattern, context, out var constantPattern))
+                            return BindConstantPatternInIs(wholeSyntax, operand, constantPattern, context, diagnostics);
                         var patternType = BindType(typePattern.Type, context, diagnostics);
                         return BindIsTypePattern(
                             wholeSyntax,
@@ -802,6 +804,18 @@ namespace Cnidaria.Cs
             var binary = new BinaryExpressionSyntax(kind, leftSyntax, pattern.OperatorToken, pattern.Expression);
             return BindRelationalBinary(binary, operand, constant, context, diagnostics);
         }
+        private bool TryConvertTypePatternToConstant(TypePatternSyntax pattern, BindingContext context, out ConstantPatternSyntax constant)
+        {
+            var probeType = BindType(pattern.Type, WithRecorder(context, NullBindingRecorder.Instance), new DiagnosticBag());
+            if (probeType is ErrorTypeSymbol && TryConvertPatternTypeToExpression(pattern.Type, out var expression))
+            {
+                constant = new ConstantPatternSyntax(expression);
+                return true;
+            }
+            constant = null!;
+            return false;
+        }
+
         private BoundExpression BindConstantPatternInIs(
             SyntaxNode wholeSyntax,
             BoundExpression operand,

@@ -7673,6 +7673,9 @@ namespace System
         private static bool TryParseDecimalFormat(string? format, out int precision)
         {
             precision = 0;
+            // An integer's general format without a precision is its decimal one
+            if (format is "G" or "g" or "G0" or "g0")
+                return true;
             if (string.IsNullOrEmpty(format) || (format[0] != 'D' && format[0] != 'd'))
                 return false;
 

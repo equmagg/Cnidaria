@@ -18,6 +18,8 @@ namespace Cnidaria.Cs
         public bool GeneratePrologEpilog { get; set; } = true;
         public bool BuildGcInfo { get; set; } = true;
 
+        public ImmutableArray<MachineRegister> AllocatableVectorRegisters { get; set; } = ImmutableArray<MachineRegister>.Empty;
+
         public bool Validate { get; set; } = true;
         public RegisterStackLayoutOptions StackLayoutOptions { get; set; } = RegisterStackLayoutOptions.Default;
 
@@ -33,6 +35,7 @@ namespace Cnidaria.Cs
             {
                 AllocatableGeneralRegisters = RegisterInfo.AllocatableGeneralRegisters(target),
                 AllocatableFloatRegisters = RegisterInfo.AllocatableFloatingRegisters(target),
+                AllocatableVectorRegisters = RegisterInfo.AllocatableVectorRegisters(target),
                 ParallelCopyScratchRegister0 = RegisterInfo.ParallelCopyScratch(target, RegisterClass.General),
                 ParallelCopyScratchRegister1 = RegisterInfo.ParallelCopyScratch(target, RegisterClass.General),
                 ParallelCopyFloatScratchRegister0 = RegisterInfo.ParallelCopyScratch(target, RegisterClass.Float),
@@ -52,6 +55,7 @@ namespace Cnidaria.Cs
             {
                 RegisterClass.General => AllocatableGeneralRegisters,
                 RegisterClass.Float => AllocatableFloatRegisters,
+                RegisterClass.Vector => AllocatableVectorRegisters,
                 _ => ImmutableArray<MachineRegister>.Empty,
             };
         }
@@ -283,16 +287,26 @@ namespace Cnidaria.Cs
             for (int r = 0; r < regionOrder.Length; r++)
             {
                 var region = cfg.ExceptionRegions[regionOrder[r]];
+                if (region.HasFilter)
+                {
+                    result.Add(new RegisterFunclet(
+                        result.Count,
+                        RegisterFuncletKind.Filter,
+                        region.Index,
+                        parentFuncletIndex: 0,
+                        entryBlockId: region.HandlerStartBlockId,
+                        blockIds: EhFuncletLayout.BuildFilterBlockIds(cfg, region)));
+                }
                 int index = result.Count;
                 regionToFunclet[region.Index] = index;
-                var blocks = EhFuncletLayout.BuildFuncletBlockIds(cfg, region);
+                var blocks = region.HasFilter ? EhFuncletLayout.BuildHandlerBodyBlockIds(cfg, region) : EhFuncletLayout.BuildFuncletBlockIds(cfg, region);
 
                 result.Add(new RegisterFunclet(
                     index,
                     ToFuncletKind(region.Kind),
                     region.Index,
                     parentFuncletIndex: 0,
-                    entryBlockId: region.HandlerStartBlockId,
+                    entryBlockId: region.HandlerBodyStartBlockId,
                     blockIds: blocks));
             }
 
@@ -328,7 +342,6 @@ namespace Cnidaria.Cs
                 CfgExceptionRegionKind.Catch => RegisterFuncletKind.Catch,
                 CfgExceptionRegionKind.Finally => RegisterFuncletKind.Finally,
                 CfgExceptionRegionKind.Fault => RegisterFuncletKind.Fault,
-                CfgExceptionRegionKind.Filter => RegisterFuncletKind.Filter,
                 _ => RegisterFuncletKind.Catch,
             };
         }
@@ -725,6 +738,33 @@ namespace Cnidaria.Cs
         public RegisterValueLocation ValueLocationAtDefinition(AbiValueInfo abi)
             => ValueLocationAt(DefinitionPosition, abi);
 
+        // Unlike LocationAt, a value no longer holds the register it ended in once it is past its last reference
+        public bool HoldsRegisterAt(MachineRegister register, int position)
+        {
+            if (HoldsRegisterAt(Segments, register, position))
+                return true;
+            for (int i = 0; i < Fragments.Length; i++)
+            {
+                if (HoldsRegisterAt(Fragments[i].Segments, register, position))
+                    return true;
+            }
+            return false;
+        }
+
+        private static bool HoldsRegisterAt(ImmutableArray<RegisterAllocationSegment> segments, MachineRegister register, int position)
+        {
+            for (int i = 0; i < segments.Length; i++)
+            {
+                var segment = segments[i];
+                if (segment.Location.IsRegister && (segment.Location.RegisterMask & RegisterInfo.MaskOf(register)) != 0 &&
+                    segment.Start <= position && position <= segment.End)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         private bool TryGetAllocatedFragment(int segmentIndex, out RegisterAllocationFragment fragment)
         {
             for (int i = 0; i < Fragments.Length; i++)
@@ -978,6 +1018,7 @@ namespace Cnidaria.Cs
 
             RegisterInfo.ValidateTarget(method.Target);
             options ??= RegisterAllocatorOptions.ForTarget(method.Target);
+            ValidateRegisterSet(options.AllocatableVectorRegisters, RegisterClass.Vector, allowEmpty: true, method.Target);
             ValidateRegisterSet(options.AllocatableGeneralRegisters, RegisterClass.General, allowEmpty: false, method.Target);
             ValidateRegisterSet(options.AllocatableFloatRegisters, RegisterClass.Float, allowEmpty: RegisterInfo.AbiFloatingRegisterSize(method.Target) == 0, method.Target);
 
@@ -1602,7 +1643,7 @@ namespace Cnidaria.Cs
                         continue;
                     }
 
-                    ulong mask = 0;
+                    UInt128 mask = 0;
                     foreach (var allocation in _allocations.Values)
                     {
                         mask |= LiveRegisterMask(allocation.Segments, position);
@@ -1610,18 +1651,18 @@ namespace Cnidaria.Cs
                             mask |= LiveRegisterMask(allocation.Fragments[f].Segments, position);
                     }
 
-                    node.SafePointLiveRegisters = mask;
+                    node.SafePointLiveRegisters = (ulong)mask;
                 }
             }
 
-            private static ulong LiveRegisterMask(ImmutableArray<RegisterAllocationSegment> segments, int position)
+            private static UInt128 LiveRegisterMask(ImmutableArray<RegisterAllocationSegment> segments, int position)
             {
-                ulong mask = 0;
+                UInt128 mask = 0;
                 for (int i = 0; i < segments.Length; i++)
                 {
                     RegisterAllocationSegment segment = segments[i];
                     if (segment.Contains(position) && segment.Location.Kind == RegisterOperandKind.Register)
-                        mask |= MachineRegisters.MaskOf(segment.Location.Register);
+                        mask |= RegisterInfo.MaskOf(segment.Location.Register);
                 }
                 return mask;
             }
@@ -1800,7 +1841,7 @@ namespace Cnidaria.Cs
                 if (count <= 0)
                     throw new InvalidOperationException($"Invalid internal register count for node {internalRef.NodeId}.");
 
-                ulong alreadySelected = 0;
+                UInt128 alreadySelected = 0;
                 for (int i = 0; i < count; i++)
                 {
                     var selected = TrySelectFreeInternalRegister(internalRef, alreadySelected);
@@ -1813,76 +1854,82 @@ namespace Cnidaria.Cs
                             $"Unable to allocate internal {internalRef.RegisterClass} register {i + 1}/{count} for node {internalRef.NodeId}.");
                     }
 
-                    alreadySelected |= MachineRegisters.MaskOf(selected);
+                    alreadySelected |= RegisterInfo.GroupMask(selected, InternalRegisterGroupCount(internalRef));
                     RecordInternalRegister(internalRef, selected);
                 }
             }
 
-            private MachineRegister TrySelectFreeInternalRegister(LinearRefPosition internalRef, ulong alreadySelected)
+            private int InternalRegisterGroupCount(LinearRefPosition internalRef)
+                => internalRef.RegisterClass == RegisterClass.Vector
+                    ? RegisterInfo.VectorRegisterCount(Math.Max(HWIntrinsics.SimdSize(NodeForLinearId(internalRef.NodeId)),
+                        SimdTypes.SizeOf(NodeForLinearId(internalRef.NodeId).StackKind))) : 1;
+
+            private bool IsAllocatableGroup(MachineRegister register, int count)
             {
-                ulong forbidden = alreadySelected | HardUseRegisterMaskAt(internalRef.NodeId, internalRef.Position, internalRef.RegisterClass);
-                var registers = _options.GetAllocatableRegisters(internalRef.RegisterClass);
-
-                for (int i = 0; i < registers.Length; i++)
+                if (count > 1 && ((int)register - (int)MachineRegister.V0) % count != 0)
+                    return false;
+                for (int i = 0; i < count; i++)
                 {
-                    var register = registers[i];
-                    ulong bit = MachineRegisters.MaskOf(register);
-                    if ((internalRef.RegisterMask & bit) == 0)
-                        continue;
-                    if ((forbidden & bit) != 0)
-                        continue;
-                    if (FindRegisterOwnerAt(register, internalRef.Position) is not null)
-                        continue;
-                    return register;
+                    if (!IsAllocatable((MachineRegister)((int)register + i)))
+                        return false;
                 }
-
-                return MachineRegister.Invalid;
+                return true;
             }
 
-            private MachineRegister SelectInternalRegisterBySpilling(LinearRefPosition internalRef, ulong alreadySelected)
+            private MachineRegister TrySelectFreeInternalRegister(LinearRefPosition internalRef, UInt128 alreadySelected)
+                => SelectInternalRegister(internalRef, alreadySelected, spill: false);
+
+            private MachineRegister SelectInternalRegisterBySpilling(LinearRefPosition internalRef, UInt128 alreadySelected)
+                => SelectInternalRegister(internalRef, alreadySelected, spill: true);
+
+            private MachineRegister SelectInternalRegister(LinearRefPosition internalRef, UInt128 alreadySelected, bool spill)
             {
-                ulong forbidden = alreadySelected | HardUseRegisterMaskAt(internalRef.NodeId, internalRef.Position, internalRef.RegisterClass);
-                var registers = _options.GetAllocatableRegisters(internalRef.RegisterClass);
-
-                MachineRegister bestRegister = MachineRegister.Invalid;
-                AllocationInterval? bestOwner = null;
+                UInt128 forbidden = alreadySelected | HardUseRegisterMaskAt(internalRef.NodeId, internalRef.Position, internalRef.RegisterClass);
+                int count = InternalRegisterGroupCount(internalRef);
+                MachineRegister best = MachineRegister.Invalid;
                 int bestNextUse = -1;
-
-                for (int i = 0; i < registers.Length; i++)
+                foreach (MachineRegister register in _options.GetAllocatableRegisters(internalRef.RegisterClass))
                 {
-                    var register = registers[i];
-                    ulong bit = MachineRegisters.MaskOf(register);
-                    if ((internalRef.RegisterMask & bit) == 0)
+                    UInt128 mask = RegisterInfo.GroupMask(register, count);
+                    if (!IsAllocatableGroup(register, count) || (internalRef.RegisterMask & mask) != mask || (forbidden & mask) != 0)
                         continue;
-                    if ((forbidden & bit) != 0)
-                        continue;
-
-                    var owner = FindRegisterOwnerAt(register, internalRef.Position);
-                    if (owner is null)
-                        return register;
-
-                    int nextUse = owner.NextUseAfterOrAt(internalRef.Position);
-                    if (nextUse > bestNextUse)
+                    int nextUse = int.MaxValue;
+                    bool occupied = false;
+                    for (int i = 0; i < count; i++)
                     {
-                        bestRegister = register;
-                        bestOwner = owner;
+                        AllocationInterval? owner = FindRegisterOwnerAt((MachineRegister)((int)register + i), internalRef.Position);
+                        if (owner is not null)
+                        {
+                            occupied = true;
+                            nextUse = Math.Min(nextUse, owner.NextUseAfterOrAt(internalRef.Position));
+                        }
+                    }
+                    if (!occupied)
+                        return register;
+                    if (spill && nextUse > bestNextUse)
+                    {
+                        best = register;
                         bestNextUse = nextUse;
                     }
                 }
-
-                if (bestRegister == MachineRegister.Invalid || bestOwner is null)
-                    return MachineRegister.Invalid;
-
-                SpillRegisterOwnerAt(bestOwner, internalRef.Position);
-                return bestRegister;
+                if (best != MachineRegister.Invalid)
+                {
+                    for (int i = 0; i < count; i++)
+                    {
+                        AllocationInterval? owner = FindRegisterOwnerAt((MachineRegister)((int)best + i), internalRef.Position);
+                        if (owner is not null)
+                            SpillRegisterOwnerAt(owner, internalRef.Position);
+                    }
+                }
+                return best;
             }
 
-            private ulong HardUseRegisterMaskAt(int nodeId, int position, RegisterClass registerClass)
+            private UInt128 HardUseRegisterMaskAt(int nodeId, int position, RegisterClass registerClass)
             {
                 if (!_hardUseRefPositions.TryGetValue((nodeId, position, registerClass), out var uses))
                     return 0;
 
-                ulong mask = 0;
+                UInt128 mask = 0;
                 for (int i = 0; i < uses.Length; i++)
                 {
                     var use = uses[i];
@@ -1898,7 +1945,7 @@ namespace Cnidaria.Cs
                         ? allocation.FragmentLocationAt(position, use.AbiSegmentIndex)
                         : allocation.LocationAt(position);
                     if (location.IsRegister)
-                        mask |= MachineRegisters.MaskOf(location.Register);
+                        mask |= location.RegisterMask;
                 }
 
                 return mask;
@@ -1931,7 +1978,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < _active.Count; i++)
                 {
                     var active = _active[i];
-                    if (active.AssignedRegister == register && active.Covers(position))
+                    if (OverlapsRegisterGroup(active, register, 1) && active.Covers(position))
                         return active;
                 }
 
@@ -1965,7 +2012,7 @@ namespace Cnidaria.Cs
                     register,
                     internalRef.RegisterClass,
                     internalRef.Position,
-                    GenTreeValueKey.ForTree(NodeForLinearId(internalRef.NodeId))));
+                    GenTreeValueKey.ForTree(NodeForLinearId(internalRef.NodeId)), InternalRegisterGroupCount(internalRef)));
             }
 
             private GenTree NodeForLinearId(int nodeId)
@@ -2511,7 +2558,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < intervals.Count; i++)
                 {
                     var interval = intervals[i];
-                    if (interval.AssignedRegister != register)
+                    if (!OverlapsRegisterGroup(interval, register, current.RegisterCount))
                         continue;
 
                     int split = interval.FirstRegisterIntersection(current, position, int.MaxValue);
@@ -2519,7 +2566,7 @@ namespace Cnidaria.Cs
                         continue;
                     if (interval.MustStayInMemory)
                         return false;
-                    if (interval.NextRequiredRefPositionAtOrAfter(split) <= position)
+                    if (interval.IsReferencedInRegisterBetween(split, position))
                         return false;
                 }
 
@@ -2577,7 +2624,7 @@ namespace Cnidaria.Cs
                 if (kill.Kind != LinearRefPositionKind.Kill)
                     return;
 
-                ulong killedRegisters = GetKillRegisterMask(kill);
+                UInt128 killedRegisters = GetKillRegisterMask(kill);
                 if (killedRegisters == 0)
                     return;
 
@@ -2588,7 +2635,7 @@ namespace Cnidaria.Cs
             private void ProcessKillRefPositionInList(
                 List<AllocationInterval> intervals,
                 int killPosition,
-                ulong killedRegisters,
+                UInt128 killedRegisters,
                 List<AllocationStreamItem> stream,
                 ref int streamIndex)
             {
@@ -2598,7 +2645,7 @@ namespace Cnidaria.Cs
                     var register = interval.AssignedRegister;
                     if (register == MachineRegister.Invalid)
                         continue;
-                    if ((killedRegisters & MachineRegisters.MaskOf(register)) == 0)
+                    if ((killedRegisters & RegisterInfo.GroupMask(register, interval.RegisterCount)) == 0)
                         continue;
                     if (!interval.CrossesPosition(killPosition))
                         continue;
@@ -2664,21 +2711,34 @@ namespace Cnidaria.Cs
                 return conflict;
             }
 
+            private static bool OverlapsRegisterGroup(AllocationInterval interval, MachineRegister register, int count)
+                => (RegisterInfo.GroupMask(interval.AssignedRegister, interval.RegisterCount) & RegisterInfo.GroupMask(register, count)) != 0;
+
             private bool RegisterAllowedAtRefPosition(AllocationInterval interval, MachineRegister register, int position)
             {
+                if (interval.RegisterCount > 1)
+                {
+                    if (((int)register - (int)MachineRegister.V0) % interval.RegisterCount != 0)
+                        return false;
+                    for (int i = 0; i < interval.RegisterCount; i++)
+                    {
+                        if (!IsAllocatable((MachineRegister)((int)register + i)))
+                            return false;
+                    }
+                }
                 if (register == MachineRegister.Invalid)
                     return false;
 
                 if (!MachineRegisters.IsRegisterInClass(register, interval.RegisterClass))
                     return false;
 
-                ulong requiredMask = RequiredRegisterMaskAt(interval, position);
-                return requiredMask == 0 || (requiredMask & MachineRegisters.MaskOf(register)) != 0;
+                UInt128 requiredMask = RequiredRegisterMaskAt(interval, position);
+                return requiredMask == 0 || (requiredMask & RegisterInfo.MaskOf(register)) != 0;
             }
 
-            private static ulong RequiredRegisterMaskAt(AllocationInterval interval, int position)
+            private static UInt128 RequiredRegisterMaskAt(AllocationInterval interval, int position)
             {
-                ulong requiredMask = 0;
+                UInt128 requiredMask = 0;
                 bool hasRequiredMask = false;
 
                 for (int i = 0; i < interval.RefPositions.Length; i++)
@@ -2689,7 +2749,7 @@ namespace Cnidaria.Cs
                     if (rp.Position > position)
                         break;
 
-                    ulong mask = RefPositionRegisterMask(rp);
+                    UInt128 mask = RefPositionRegisterMask(rp);
                     if (!hasRequiredMask)
                     {
                         requiredMask = mask;
@@ -2704,15 +2764,15 @@ namespace Cnidaria.Cs
                 return hasRequiredMask ? requiredMask : 0;
             }
 
-            private static ulong RefPositionRegisterMask(LinearRefPosition refPosition)
+            private static UInt128 RefPositionRegisterMask(LinearRefPosition refPosition)
             {
                 if (refPosition.FixedRegister != MachineRegister.Invalid)
-                    return MachineRegisters.MaskOf(refPosition.FixedRegister);
+                    return RegisterInfo.MaskOf(refPosition.FixedRegister);
 
                 if (refPosition.RegisterMask != 0)
                     return refPosition.RegisterMask;
 
-                return MachineRegisters.DefaultMaskForClass(refPosition.RegisterClass);
+                return RegisterInfo.DefaultMaskForClass(refPosition.RegisterClass);
             }
 
             private int FirstConflictingFixedRegisterReservation(AllocationInterval interval, MachineRegister register, int start, int end)
@@ -2727,7 +2787,7 @@ namespace Cnidaria.Cs
                         continue;
                     if (rp.Position >= end)
                         break;
-                    if (rp.FixedRegister != register)
+                    if ((RegisterInfo.MaskOf(rp.FixedRegister) & RegisterInfo.GroupMask(register, interval.RegisterCount)) == 0)
                         continue;
                     if (rp.Kind is not (LinearRefPositionKind.Use or LinearRefPositionKind.Def))
                         continue;
@@ -2880,20 +2940,20 @@ namespace Cnidaria.Cs
                 return CoalesceKillRefPositions(kills);
             }
 
-            private static ulong GetKillRegisterMask(LinearRefPosition kill)
+            private static UInt128 GetKillRegisterMask(LinearRefPosition kill)
             {
                 if (kill.Kind != LinearRefPositionKind.Kill)
                     return 0;
 
-                ulong mask = kill.RegisterMask;
+                UInt128 mask = kill.RegisterMask;
                 if (kill.FixedRegister != MachineRegister.Invalid)
-                    mask |= MachineRegisters.MaskOf(kill.FixedRegister);
+                    mask |= RegisterInfo.MaskOf(kill.FixedRegister);
                 return mask;
             }
 
             private static LinearRefPosition NormalizeKillRefPosition(LinearRefPosition kill)
             {
-                ulong mask = GetKillRegisterMask(kill);
+                UInt128 mask = GetKillRegisterMask(kill);
                 if (mask == 0)
                     throw new InvalidOperationException("Kill ref position has an empty register mask.");
 
@@ -2925,7 +2985,7 @@ namespace Cnidaria.Cs
 
                 var result = ImmutableArray.CreateBuilder<LinearRefPosition>();
                 LinearRefPosition current = kills[0];
-                ulong currentMask = GetKillRegisterMask(current);
+                UInt128 currentMask = GetKillRegisterMask(current);
 
                 for (int i = 1; i < kills.Count; i++)
                 {
@@ -2974,7 +3034,7 @@ namespace Cnidaria.Cs
                 if (!_options.RespectCallClobbers || _killRefPositions.Length == 0)
                     return int.MaxValue;
 
-                ulong registerMask = MachineRegisters.MaskOf(register);
+                UInt128 registerMask = RegisterInfo.GroupMask(register, interval.RegisterCount);
                 for (int i = 0; i < _killRefPositions.Length; i++)
                 {
                     var kill = _killRefPositions[i];
@@ -3010,7 +3070,7 @@ namespace Cnidaria.Cs
                 if (!_options.RespectCallClobbers || _killRefPositions.Length == 0)
                     return false;
 
-                ulong registerMask = MachineRegisters.MaskOf(register);
+                UInt128 registerMask = RegisterInfo.GroupMask(register, interval.RegisterCount);
                 for (int i = 0; i < _killRefPositions.Length; i++)
                 {
                     var kill = _killRefPositions[i];
@@ -3082,7 +3142,7 @@ namespace Cnidaria.Cs
                 if (!_options.RespectCallClobbers || _killRefPositions.Length == 0)
                     return false;
 
-                ulong registerMask = MachineRegisters.MaskOf(register);
+                UInt128 registerMask = RegisterInfo.MaskOf(register);
                 for (int i = 0; i < _killRefPositions.Length; i++)
                 {
                     var kill = _killRefPositions[i];
@@ -3103,6 +3163,14 @@ namespace Cnidaria.Cs
             private static int NextRequiredRefPositionAtOrAfter(AllocationInterval interval, int position)
                 => interval.NextRequiredRefPositionAtOrAfter(position);
 
+            private static int NextReferenceAfterSplit(AllocationInterval interval, int splitPosition)
+            {
+                int next = NextRequiredRefPositionAtOrAfter(interval, splitPosition);
+                return next == splitPosition && !interval.IsReferencedInRegisterBetween(splitPosition, splitPosition)
+                    ? interval.NextRequiredRefPositionAfter(splitPosition)
+                    : next;
+            }
+
             private static bool IsAbiCall(GenTree node)
                 => node.HasLoweringFlag(GenTreeLinearFlags.AbiCall);
 
@@ -3113,7 +3181,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < _active.Count; i++)
                 {
                     var active = _active[i];
-                    if (active.AssignedRegister == register)
+                    if (OverlapsRegisterGroup(active, register, current.RegisterCount))
                     {
                         int p = active.FirstRegisterIntersection(current, start, int.MaxValue);
                         if (p < conflict)
@@ -3124,7 +3192,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < _inactive.Count; i++)
                 {
                     var inactive = _inactive[i];
-                    if (inactive.AssignedRegister == register)
+                    if (OverlapsRegisterGroup(inactive, register, current.RegisterCount))
                     {
                         int p = inactive.FirstRegisterIntersection(current, start, int.MaxValue);
                         if (p < conflict)
@@ -3142,7 +3210,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < _active.Count; i++)
                 {
                     var active = _active[i];
-                    if (active.AssignedRegister == register && active.FirstRegisterIntersection(current, start, int.MaxValue) != int.MaxValue)
+                    if (OverlapsRegisterGroup(active, register, current.RegisterCount) && active.FirstRegisterIntersection(current, start, int.MaxValue) != int.MaxValue)
                     {
                         int use = active.NextUseAfterOrAt(start);
                         if (use < nextUse)
@@ -3153,7 +3221,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < _inactive.Count; i++)
                 {
                     var inactive = _inactive[i];
-                    if (inactive.AssignedRegister == register && inactive.FirstRegisterIntersection(current, start, int.MaxValue) != int.MaxValue)
+                    if (OverlapsRegisterGroup(inactive, register, current.RegisterCount) && inactive.FirstRegisterIntersection(current, start, int.MaxValue) != int.MaxValue)
                     {
                         int use = inactive.NextUseAfterOrAt(start);
                         if (use < nextUse)
@@ -3175,7 +3243,7 @@ namespace Cnidaria.Cs
                 for (int i = _active.Count - 1; i >= 0; i--)
                 {
                     var active = _active[i];
-                    if (active.AssignedRegister == register)
+                    if (OverlapsRegisterGroup(active, register, current.RegisterCount))
                     {
                         int split = active.FirstRegisterIntersection(current, currentStart, currentRegisterEnd);
                         if (split != int.MaxValue)
@@ -3190,7 +3258,7 @@ namespace Cnidaria.Cs
                 for (int i = _inactive.Count - 1; i >= 0; i--)
                 {
                     var inactive = _inactive[i];
-                    if (inactive.AssignedRegister == register)
+                    if (OverlapsRegisterGroup(inactive, register, current.RegisterCount))
                     {
                         int split = inactive.FirstRegisterIntersection(current, currentStart, currentRegisterEnd);
                         if (split != int.MaxValue)
@@ -3222,7 +3290,7 @@ namespace Cnidaria.Cs
                     segmentEnd < interval.End &&
                     TryGetKillPositionEndingRegisterSegment(interval, register, segmentEnd, out killPosition);
 
-                var registerHome = RegisterOperand.ForRegister(register);
+                var registerHome = RegisterOperand.ForRegister(register, interval.RegisterCount);
                 interval.AssignedRegister = register;
                 interval.AssignedRegisterEnd = segmentEnd;
                 interval.AddSegment(start, segmentEnd, registerHome);
@@ -3261,7 +3329,7 @@ namespace Cnidaria.Cs
                 List<AllocationStreamItem> stream,
                 ref int streamIndex)
             {
-                int nextRefPosition = NextRequiredRefPositionAtOrAfter(interval, splitPosition);
+                int nextRefPosition = NextReferenceAfterSplit(interval, splitPosition);
                 int spillEnd = nextRefPosition == int.MaxValue ? interval.End : nextRefPosition;
                 if (spillEnd < splitPosition)
                     spillEnd = splitPosition;
@@ -3317,7 +3385,7 @@ namespace Cnidaria.Cs
                 List<AllocationStreamItem> stream,
                 ref int streamIndex)
             {
-                int nextRefPosition = NextRequiredRefPositionAtOrAfter(interval, splitPosition);
+                int nextRefPosition = NextReferenceAfterSplit(interval, splitPosition);
                 int spillEnd = nextRefPosition == int.MaxValue ? interval.End : nextRefPosition;
                 if (spillEnd < splitPosition)
                     spillEnd = splitPosition;
@@ -3632,8 +3700,8 @@ namespace Cnidaria.Cs
 
                     for (int f = 0; f < allocation.Fragments.Length; f++)
                     {
-                        AddSplitTransitionMoves(plan, allocation.Value, allocation.Fragments[f].Segments);
-                        AddCfgEdgeResolutionMoves(plan, allocation.Value, allocation.Ranges, allocation.Fragments[f].Segments);
+                        AddSplitTransitionMoves(plan, allocation.Value, allocation.Fragments[f].Segments, allocation.Fragments[f].AbiSegment);
+                        AddCfgEdgeResolutionMoves(plan, allocation.Value, allocation.Ranges, allocation.Fragments[f].Segments, allocation.Fragments[f].AbiSegment);
                     }
                 }
 
@@ -3643,7 +3711,8 @@ namespace Cnidaria.Cs
             private void AddSplitTransitionMoves(
                 SplitResolutionPlan plan,
                 GenTree value,
-                ImmutableArray<RegisterAllocationSegment> segments)
+                ImmutableArray<RegisterAllocationSegment> segments,
+                AbiRegisterSegment? fragment = null)
             {
                 for (int i = 1; i < segments.Length; i++)
                 {
@@ -3657,7 +3726,8 @@ namespace Cnidaria.Cs
                         current.Location,
                         value,
                         value,
-                        MoveFlags.Split);
+                        MoveFlags.Split,
+                        fragment);
 
                     int movePosition = SplitTransitionMovePosition(previous, current);
                     if (movePosition == current.Start && TryGetBlockStartingAtPosition(current.Start, out _))
@@ -3667,13 +3737,14 @@ namespace Cnidaria.Cs
                 }
             }
 
+            // A spill at a definition position must be stored before the defining node
             private int SplitTransitionMovePosition(RegisterAllocationSegment previous, RegisterAllocationSegment current)
             {
                 if (previous.Location.IsRegister &&
                     current.Location.IsMemoryOperand &&
                     current.Start == previous.End &&
                     current.Start > previous.Start &&
-                    IsRegisterKilledAtPosition(previous.Location.Register, current.Start - 1))
+                    ((current.Start & 1) != 0 || IsRegisterKilledAtPosition(previous.Location.Register, current.Start - 1)))
                 {
                     return current.Start - 1;
                 }
@@ -3685,7 +3756,8 @@ namespace Cnidaria.Cs
                 SplitResolutionPlan plan,
                 GenTree value,
                 ImmutableArray<LinearLiveRange> ranges,
-                ImmutableArray<RegisterAllocationSegment> segments)
+                ImmutableArray<RegisterAllocationSegment> segments,
+                AbiRegisterSegment? fragment = null)
             {
                 if (segments.IsDefaultOrEmpty || ranges.IsDefaultOrEmpty)
                     return;
@@ -3724,7 +3796,7 @@ namespace Cnidaria.Cs
                         AddNormalEdgeMove(
                             plan,
                             edge,
-                            new RegisterResolvedMove(source, destination, value, value, MoveFlags.Split));
+                            new RegisterResolvedMove(source, destination, value, value, MoveFlags.Split, fragment));
                     }
                 }
             }
@@ -4109,7 +4181,8 @@ namespace Cnidaria.Cs
                 {
                     var existing = moves[i];
                     if (!existing.Source.Equals(move.Source) ||
-                        !existing.Destination.Equals(move.Destination))
+                        !existing.Destination.Equals(move.Destination) ||
+                        !Nullable.Equals(existing.Fragment, move.Fragment))
                     {
                         continue;
                     }
@@ -4125,7 +4198,8 @@ namespace Cnidaria.Cs
                         existing.Destination,
                         sourceValue,
                         destinationValue,
-                        existing.MoveFlags | move.MoveFlags);
+                        existing.MoveFlags | move.MoveFlags,
+                        existing.Fragment);
                     return;
                 }
 
@@ -4565,7 +4639,7 @@ namespace Cnidaria.Cs
                     var source = move.Source;
                     var sourceValue = move.SourceValue;
                     var seen = new HashSet<RegisterOperand>();
-                    while (TryFindSameValueProducer(result, i, source, sourceValue, out var producer))
+                    while (TryFindSameValueProducer(result, i, source, sourceValue, move.Fragment, out var producer))
                     {
                         if (!seen.Add(source))
                             break;
@@ -4586,6 +4660,7 @@ namespace Cnidaria.Cs
                 int consumerIndex,
                 RegisterOperand source,
                 GenTree? sourceValue,
+                AbiRegisterSegment? fragment,
                 out RegisterResolvedMove producer)
             {
                 for (int i = 0; i < moves.Count; i++)
@@ -4594,7 +4669,7 @@ namespace Cnidaria.Cs
                         continue;
 
                     var candidate = moves[i];
-                    if (!candidate.Destination.Equals(source))
+                    if (!candidate.Destination.Equals(source) || !Nullable.Equals(candidate.Fragment, fragment))
                         continue;
                     if (!SameValue(candidate.DestinationValue, sourceValue))
                         continue;
@@ -4620,7 +4695,8 @@ namespace Cnidaria.Cs
                    move.SourceValue.LinearValueKey.Equals(move.DestinationValue.LinearValueKey);
 
             private static bool IsRedundantRoundTripStore(RegisterResolvedMove reload, RegisterResolvedMove spill)
-                => spill.Source.Equals(reload.Destination) &&
+                => Nullable.Equals(reload.Fragment, spill.Fragment) &&
+                   spill.Source.Equals(reload.Destination) &&
                    spill.Destination.Equals(reload.Source) &&
                    spill.SourceValue is not null &&
                    spill.DestinationValue is not null &&
@@ -4649,7 +4725,7 @@ namespace Cnidaria.Cs
 
             private static bool IsBlockTerminatorNode(GenTree node)
                 => node.Kind is GenTreeKind.Branch or GenTreeKind.BranchTrue or GenTreeKind.BranchFalse or
-                   GenTreeKind.Return or GenTreeKind.Throw or GenTreeKind.Rethrow or GenTreeKind.EndFinally;
+                   GenTreeKind.Return or GenTreeKind.Throw or GenTreeKind.Rethrow or GenTreeKind.EndFinally or GenTreeKind.CallFinally or GenTreeKind.CatchReturn or GenTreeKind.EndFilter;
 
             private MachineRegister GetMaybeArgumentRegister(RegisterClass registerClass, ref int generalIndex, ref int floatIndex)
                 => MachineAbi.ConsumeArgumentRegister(_method.Target, registerClass, ref generalIndex, ref floatIndex);
@@ -4869,6 +4945,7 @@ namespace Cnidaria.Cs
                             $"Cannot lower multi-register phi copy with different ABI segment counts: {sourceValue} -> {destinationValue}.");
                     }
 
+                    var fragments = MachineAbi.GetRegisterSegments(destinationAbi, _method.Target);
                     for (int i = 0; i < destinationLocation.Count; i++)
                     {
                         var destination = destinationLocation[i];
@@ -4886,7 +4963,8 @@ namespace Cnidaria.Cs
                             destination,
                             sourceValue,
                             destinationValue,
-                            MoveFlags.ParallelCopy));
+                            MoveFlags.ParallelCopy,
+                            fragments[i]));
                     }
 
                     aggregateHomeStores.Add(new PendingAggregateHomeStore(
@@ -4984,6 +5062,7 @@ namespace Cnidaria.Cs
                             $"Cannot copy multi-register values with different ABI segment counts: {sourceValue} -> {destinationValue}.");
 
                     var moves = new List<RegisterResolvedMove>();
+                    var fragments = MachineAbi.GetRegisterSegments(destinationAbi, _method.Target);
                     for (int i = 0; i < destinationLocation.Count; i++)
                     {
                         var destination = destinationLocation[i];
@@ -4996,7 +5075,8 @@ namespace Cnidaria.Cs
                             destination,
                             sourceValue,
                             destinationValue,
-                            MoveFlags.ParallelCopy));
+                            MoveFlags.ParallelCopy,
+                            fragments[i]));
                     }
 
                     EmitResolvedCopyMoves(blockId, moves, getCopyScratchSlot, blockLinearNodes, allNodes);
@@ -5063,7 +5143,7 @@ namespace Cnidaria.Cs
                 }
 
                 var scratchClass = RegisterClassForMove(source, destination);
-                var scratch = RegisterOperand.ForRegister(GetScratchRegisterForClass(scratchClass));
+                var scratch = RegisterOperand.ForRegister(GetScratchRegisterForClass(scratchClass), scratchClass == RegisterClass.Vector ? 4 : 1);
                 var load = GenTreeLirFactory.Move(
                     _nextNodeId++,
                     blockId,
@@ -5179,9 +5259,9 @@ namespace Cnidaria.Cs
                 if (!IsWideMemoryOperand(destination) && !IsWideMemoryOperand(source))
                     return false;
 
-                if (destinationValue is not null && IsBlockCopyValue(destinationValue))
+                if (destinationValue is not null && RequiresAggregateMemoryCopy(destinationValue))
                     return true;
-                if (sourceValue is not null && IsBlockCopyValue(sourceValue))
+                if (sourceValue is not null && RequiresAggregateMemoryCopy(sourceValue))
                     return true;
                 return false;
             }
@@ -5189,18 +5269,19 @@ namespace Cnidaria.Cs
             private bool IsWideMemoryOperand(RegisterOperand operand)
                 => operand.IsMemoryOperand && operand.FrameSlotSize > _method.Target.GeneralRegisterSize;
 
-            private bool IsBlockCopyValue(GenTree value)
+            private bool RequiresAggregateMemoryCopy(GenTree value)
             {
                 var valueInfo = _method.GetValueInfo(value);
-                return MachineAbi.IsBlockCopyValue(valueInfo.Type, valueInfo.StackKind, _method.Target);
+                var abi = MachineAbi.ClassifyStorageValue(valueInfo.Type, valueInfo.StackKind, _method.Target);
+                return abi.PassingKind is AbiValuePassingKind.MultiRegister or AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect;
             }
 
             private MachineRegister GetScratchRegisterForClass(RegisterClass registerClass)
             {
-                if (registerClass is not (RegisterClass.General or RegisterClass.Float))
+                if (registerClass is not (RegisterClass.General or RegisterClass.Float or RegisterClass.Vector))
                     throw new InvalidOperationException($"Cannot select a scratch register for {registerClass} move.");
 
-                var scratch = registerClass == RegisterClass.Float
+                var scratch = registerClass == RegisterClass.Vector ? MachineRegister.V28 : registerClass == RegisterClass.Float
                     ? _options.ParallelCopyFloatScratchRegister0
                     : _options.ParallelCopyScratchRegister0;
 
@@ -5208,9 +5289,12 @@ namespace Cnidaria.Cs
                 return scratch;
             }
 
+            private RegisterOperand GetTreeScratchOperand(GenTree node, RegisterClass registerClass, int index, int position)
+                => RegisterOperand.ForRegister(GetTreeScratchRegister(node, registerClass, index, position), registerClass == RegisterClass.Vector ? 4 : 1);
+
             private MachineRegister GetTreeScratchRegister(GenTree node, RegisterClass registerClass, int index, int position)
             {
-                if (registerClass is not (RegisterClass.General or RegisterClass.Float))
+                if (registerClass is not (RegisterClass.General or RegisterClass.Float or RegisterClass.Vector))
                     throw new InvalidOperationException($"Cannot select a scratch register for {registerClass} tree node.");
 
                 int availableIndex = 0;
@@ -5223,10 +5307,15 @@ namespace Cnidaria.Cs
                         return false;
                     if (!MachineRegisters.IsRegisterInClass(candidate, registerClass))
                         return false;
-                    if (IsInternalRegisterForNode(node, candidate))
+                    int count = registerClass == RegisterClass.Vector ? 4 : 1;
+                    if (count > 1 && ((int)candidate - (int)MachineRegister.V0) % count != 0)
                         return false;
-                    if (IsRegisterAllocatedAt(candidate, position) || IsRegisterAllocatedAt(candidate, position + 1))
-                        return false;
+                    for (int i = 0; i < count; i++)
+                    {
+                        MachineRegister member = (MachineRegister)((int)candidate + i);
+                        if (IsInternalRegisterForNode(node, member) || IsRegisterAllocatedAt(member, position) || IsRegisterAllocatedAt(member, position + 1))
+                            return false;
+                    }
                     if (availableIndex++ != index)
                         return false;
                     scratch = candidate;
@@ -5260,7 +5349,7 @@ namespace Cnidaria.Cs
                 }
 
                 for (int i = 0; i < registers.Count; i++)
-                    if (registers[i].Register == register)
+                    if ((RegisterInfo.GroupMask(registers[i].Register, registers[i].RegisterCount) & RegisterInfo.MaskOf(register)) != 0)
                         return true;
                 return false;
             }
@@ -5269,12 +5358,8 @@ namespace Cnidaria.Cs
             {
                 foreach (var allocation in _allocations.Values)
                 {
-                    var info = _method.GetValueInfo(allocation.Value);
-                    var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind, _method.Target);
-                    var location = allocation.ValueLocationAt(position, abi);
-                    for (int i = 0; i < location.Count; i++)
-                        if (location[i].IsRegister && location[i].Register == register)
-                            return true;
+                    if (allocation.HoldsRegisterAt(register, position))
+                        return true;
                 }
                 return false;
             }
@@ -5289,9 +5374,9 @@ namespace Cnidaria.Cs
 
             private static RegisterClass RegisterClassForMove(RegisterOperand source, RegisterOperand destination)
             {
-                if (destination.RegisterClass is RegisterClass.General or RegisterClass.Float)
+                if (destination.RegisterClass is RegisterClass.General or RegisterClass.Float or RegisterClass.Vector)
                     return destination.RegisterClass;
-                if (source.RegisterClass is RegisterClass.General or RegisterClass.Float)
+                if (source.RegisterClass is RegisterClass.General or RegisterClass.Float or RegisterClass.Vector)
                     return source.RegisterClass;
 
                 throw new InvalidOperationException($"Invalid move without a concrete register class: {source} -> {destination}.");
@@ -5386,6 +5471,8 @@ namespace Cnidaria.Cs
                 if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
                 {
                     var returnOperand = RegisterOperand.ForRegister(GetReturnRegister(abi.RegisterClass));
+                    if (sourceOperand.RegisterClass != abi.RegisterClass && sourceOperand.IsMemoryOperand)
+                        sourceOperand = OperandAtOffset(sourceOperand, new AbiRegisterSegment(abi.RegisterClass, 0, abi.Size, abi.ContainsGcPointers));
 
                     if (!sourceOperand.Equals(returnOperand))
                     {
@@ -5397,7 +5484,7 @@ namespace Cnidaria.Cs
                             sourceValue: value,
                             comment: "return value to ABI register",
                             blockLinearNodes,
-                            allNodes);
+                            allNodes, MoveFlags.AbiReturn);
                     }
 
                     var returnNode = GenTreeLirFactory.Tree(
@@ -5440,7 +5527,7 @@ namespace Cnidaria.Cs
                                 sourceValue: value,
                                 comment: "return struct fragment to ABI register",
                                 blockLinearNodes,
-                                allNodes);
+                                allNodes, MoveFlags.AbiReturn);
                         }
 
                         returnOperands.Add(target);
@@ -5516,7 +5603,7 @@ namespace Cnidaria.Cs
                             }
 
                             int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
-                            var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(node, segments[s].RegisterClass, scratchIndex, position));
+                            var scratch = GetTreeScratchOperand(node, segments[s].RegisterClass, scratchIndex, position);
                             EmitMoveSequence(
                                 node.LinearBlockId,
                                 scratch,
@@ -5541,7 +5628,7 @@ namespace Cnidaria.Cs
                     }
 
                     int scalarScratchIndex = NextScratchIndex(scratchUseCounts, scalarHome.RegisterClass);
-                    var scalarScratch = RegisterOperand.ForRegister(GetTreeScratchRegister(node, scalarHome.RegisterClass, scalarScratchIndex, position));
+                    var scalarScratch = GetTreeScratchOperand(node, scalarHome.RegisterClass, scalarScratchIndex, position);
                     EmitMoveSequence(
                         node.LinearBlockId,
                         scalarScratch,
@@ -5570,7 +5657,7 @@ namespace Cnidaria.Cs
                             for (int s = 0; s < segments.Length; s++)
                             {
                                 int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
-                                var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(node, segments[s].RegisterClass, scratchIndex, position));
+                                var scratch = GetTreeScratchOperand(node, segments[s].RegisterClass, scratchIndex, position);
                                 resultOperands.Add(scratch);
                                 resultGenTrees.Add(resultValue);
                             }
@@ -5592,7 +5679,7 @@ namespace Cnidaria.Cs
                                 }
 
                                 int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
-                                var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(node, segments[s].RegisterClass, scratchIndex, position));
+                                var scratch = GetTreeScratchOperand(node, segments[s].RegisterClass, scratchIndex, position);
                                 resultOperands.Add(scratch);
                                 resultGenTrees.Add(resultValue);
                                 if (!finalFragment.IsNone)
@@ -5614,7 +5701,7 @@ namespace Cnidaria.Cs
                             {
                                 var resultClass = RegisterClassForReload(resultInfo, resultAbi, finalResult);
                                 int scratchIndex = NextScratchIndex(scratchUseCounts, resultClass);
-                                nodeResult = RegisterOperand.ForRegister(GetTreeScratchRegister(node, resultClass, scratchIndex, position));
+                                nodeResult = GetTreeScratchOperand(node, resultClass, scratchIndex, position);
                             }
                             else
                             {
@@ -5624,7 +5711,7 @@ namespace Cnidaria.Cs
                         else
                         {
                             int scratchIndex = NextScratchIndex(scratchUseCounts, finalResult.RegisterClass);
-                            nodeResult = RegisterOperand.ForRegister(GetTreeScratchRegister(node, finalResult.RegisterClass, scratchIndex, position));
+                            nodeResult = GetTreeScratchOperand(node, finalResult.RegisterClass, scratchIndex, position);
                             postTreeStores.Add(new RegisterResolvedMove(nodeResult, finalResult, resultValue, resultValue));
                         }
 
@@ -5799,8 +5886,8 @@ namespace Cnidaria.Cs
                     else
                     {
                         var valueInfo = _method.GetValueInfo(segment.Value);
-                        var valueAbi = MachineAbi.ClassifyValue(valueInfo.Type, valueInfo.StackKind, isReturn: false, target: _method.Target);
-                        if (MachineAbi.HaveMatchingArgumentValueLayout(valueAbi, segment.ValueAbi, _method.Target))
+                        var valueAbi = MachineAbi.ClassifyStorageValue(valueInfo.Type, valueInfo.StackKind, _method.Target);
+                        if (MachineAbi.HaveMatchingArgumentValueLayout(valueAbi, segment.ValueAbi, _method.Target, requireMatchingRegisterClasses: true))
                         {
                             var sourceLocation = ValueLocationForUse(segment.Value, position, valueAbi);
                             source = GetSourceOperandForCallSegment(sourceLocation, segment);
@@ -5840,7 +5927,8 @@ namespace Cnidaria.Cs
                         target,
                         moveSourceValue,
                         moveDestinationValue,
-                        moveFlags);
+                        moveFlags,
+                        segment.IsAbiSegment ? segment.ToRegisterSegment() : null);
                     if (target.IsOutgoingArgumentSlot)
                         stackMoves.Add(move);
                     else
@@ -5932,15 +6020,17 @@ namespace Cnidaria.Cs
                     var resultValue = resultValueOpt;
                     if (resultAbi.PassingKind == AbiValuePassingKind.ScalarRegister && !finalResult.Equals(callResult))
                     {
+                        RegisterOperand destination = finalResult.RegisterClass != resultAbi.RegisterClass && finalResult.IsMemoryOperand
+                            ? OperandAtOffset(finalResult, new AbiRegisterSegment(resultAbi.RegisterClass, 0, resultAbi.Size, resultAbi.ContainsGcPointers)) : finalResult;
                         EmitMoveSequence(
                             node.LinearBlockId,
-                            finalResult,
+                            destination,
                             callResult,
                             resultValue,
                             sourceValue: null,
                             "call result from ABI register",
                             blockLinearNodes,
-                            allNodes);
+                            allNodes, MoveFlags.AbiReturn);
                     }
                     else if (resultAbi.PassingKind == AbiValuePassingKind.MultiRegister)
                     {
@@ -5948,21 +6038,15 @@ namespace Cnidaria.Cs
                         var destinationLocation = ValueLocationForDefinition(resultValue, definitionPosition, resultAbi);
                         int generalReturnIndex = 0;
                         int floatReturnIndex = 0;
+                        var resultMoves = new List<RegisterResolvedMove>(segments.Length);
                         for (int i = 0; i < segments.Length; i++)
                         {
                             var segment = segments[i];
                             var source = RegisterOperand.ForRegister(GetReturnRegister(segment.RegisterClass, ref generalReturnIndex, ref floatReturnIndex));
                             var destination = destinationLocation.IsFragmented ? destinationLocation[i] : OperandAtOffset(finalResult, segment);
-                            EmitMoveSequence(
-                                node.LinearBlockId,
-                                destination,
-                                source,
-                                destinationValue: resultValue,
-                                sourceValue: null,
-                                comment: "call struct result from ABI register",
-                                blockLinearNodes,
-                                allNodes);
+                            resultMoves.Add(new RegisterResolvedMove(source, destination, null, resultValue, MoveFlags.AbiReturn, segment));
                         }
+                        EmitResolvedCopyMoves(node.LinearBlockId, resultMoves, GetScratchSlot, blockLinearNodes, allNodes);
 
                         EmitAggregateHomeStores(
                             node.LinearBlockId,
@@ -6163,7 +6247,7 @@ namespace Cnidaria.Cs
                             if (requiresRegister && !home.IsRegister)
                             {
                                 int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
-                                var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(node, segments[s].RegisterClass, scratchIndex, position));
+                                var scratch = GetTreeScratchOperand(node, segments[s].RegisterClass, scratchIndex, position);
                                 EmitMoveSequence(
                                     node.LinearBlockId,
                                     scratch,
@@ -6187,7 +6271,7 @@ namespace Cnidaria.Cs
                     {
                         var reloadClass = RegisterClassForReload(valueInfo, abi, scalarHome);
                         int scratchIndex = NextScratchIndex(scratchUseCounts, reloadClass);
-                        var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(node, reloadClass, scratchIndex, position));
+                        var scratch = GetTreeScratchOperand(node, reloadClass, scratchIndex, position);
                         EmitMoveSequence(
                             node.LinearBlockId,
                             scratch,
@@ -6218,7 +6302,7 @@ namespace Cnidaria.Cs
                             for (int s = 0; s < segments.Length; s++)
                             {
                                 int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
-                                var scratch = RegisterOperand.ForRegister(GetTreeScratchRegister(node, segments[s].RegisterClass, scratchIndex, position));
+                                var scratch = GetTreeScratchOperand(node, segments[s].RegisterClass, scratchIndex, position);
                                 resultOperands.Add(scratch);
                                 resultGenTrees.Add(resultValue);
                             }
@@ -6237,13 +6321,13 @@ namespace Cnidaria.Cs
                                     if (RequiresCodegenResultOperand(node, resultAbi))
                                     {
                                         int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
-                                        nodeFragment = RegisterOperand.ForRegister(GetTreeScratchRegister(node, segments[s].RegisterClass, scratchIndex, position));
+                                        nodeFragment = GetTreeScratchOperand(node, segments[s].RegisterClass, scratchIndex, position);
                                     }
                                 }
                                 else if (RequiresCodegenRegisterDefinition(node, resultAbi) && !finalFragment.IsRegister)
                                 {
                                     int scratchIndex = NextScratchIndex(scratchUseCounts, segments[s].RegisterClass);
-                                    nodeFragment = RegisterOperand.ForRegister(GetTreeScratchRegister(node, segments[s].RegisterClass, scratchIndex, position));
+                                    nodeFragment = GetTreeScratchOperand(node, segments[s].RegisterClass, scratchIndex, position);
                                     postTreeStores.Add(new RegisterResolvedMove(nodeFragment, finalFragment, resultValue, resultValue));
                                 }
 
@@ -6265,14 +6349,14 @@ namespace Cnidaria.Cs
                             {
                                 var resultClass = RegisterClassForReload(resultInfo, resultAbi, finalResult);
                                 int scratchIndex = NextScratchIndex(scratchUseCounts, resultClass);
-                                nodeResult = RegisterOperand.ForRegister(GetTreeScratchRegister(node, resultClass, scratchIndex, position));
+                                nodeResult = GetTreeScratchOperand(node, resultClass, scratchIndex, position);
                             }
                         }
                         else if (RequiresCodegenRegisterDefinition(node, resultAbi) && !finalResult.IsRegister)
                         {
                             var resultClass = RegisterClassForReload(resultInfo, resultAbi, finalResult);
                             int scratchIndex = NextScratchIndex(scratchUseCounts, resultClass);
-                            nodeResult = RegisterOperand.ForRegister(GetTreeScratchRegister(node, resultClass, scratchIndex, position));
+                            nodeResult = GetTreeScratchOperand(node, resultClass, scratchIndex, position);
                             postTreeStores.Add(new RegisterResolvedMove(nodeResult, finalResult, resultValue, resultValue));
                         }
 
@@ -6419,6 +6503,9 @@ namespace Cnidaria.Cs
                     GenTreeKind.Throw => false,
                     GenTreeKind.Rethrow => false,
                     GenTreeKind.EndFinally => false,
+                    GenTreeKind.CallFinally => false,
+                    GenTreeKind.CatchReturn => false,
+                    GenTreeKind.EndFilter => false,
 
                     _ => true,
                 };
@@ -6430,9 +6517,7 @@ namespace Cnidaria.Cs
                 if (abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect or AbiValuePassingKind.MultiRegister)
                     return false;
 
-                if (node.RegisterResult is not null && node.RegisterResult.LinearValueKey.IsSsaValue)
-                    return true;
-
+                // Local-like nodes copy memory to memory when their value lives in a stack home
                 return node.Kind switch
                 {
                     GenTreeKind.Local => false,
@@ -6449,13 +6534,13 @@ namespace Cnidaria.Cs
 
             private static RegisterClass RegisterClassForReload(GenTreeValueInfo info, AbiValueInfo abi, RegisterOperand home)
             {
-                if (home.RegisterClass is RegisterClass.General or RegisterClass.Float)
+                if (home.RegisterClass is RegisterClass.General or RegisterClass.Float or RegisterClass.Vector)
                     return home.RegisterClass;
 
-                if (info.RegisterClass is RegisterClass.General or RegisterClass.Float)
+                if (info.RegisterClass is RegisterClass.General or RegisterClass.Float or RegisterClass.Vector)
                     return info.RegisterClass;
 
-                if (abi.RegisterClass is RegisterClass.General or RegisterClass.Float)
+                if (abi.RegisterClass is RegisterClass.General or RegisterClass.Float or RegisterClass.Vector)
                     return abi.RegisterClass;
 
                 return RegisterClass.General;
@@ -6677,7 +6762,7 @@ namespace Cnidaria.Cs
                         _ = MachineAbi.ConsumeHiddenReturnBufferRegister(method.Target, ref general, ref floating);
 
                     RuntimeType currentType = method.ArgTypes[i];
-                    GenStackKind currentStackKind = i == argumentIndex ? info.StackKind : MachineAbi.StackKindForType(currentType);
+                    GenStackKind currentStackKind = i == argumentIndex ? info.StackKind : MachineAbi.StackKindForType(currentType, method.Target);
                     var valueAbi = i == argumentIndex
                         ? MachineAbi.ClassifyValue(info.Type, currentStackKind, isReturn: false, target: method.Target)
                         : MachineAbi.ClassifyValue(currentType, currentStackKind, isReturn: false, target: method.Target);
@@ -6921,6 +7006,7 @@ namespace Cnidaria.Cs
 
             public GenTree Value { get; }
             public RegisterClass RegisterClass { get; }
+            public int RegisterCount { get; }
             public ImmutableArray<LinearLiveRange> Ranges { get; }
             public ImmutableArray<int> UsePositions { get; }
             public ImmutableArray<LinearRefPosition> RefPositions { get; }
@@ -7009,6 +7095,7 @@ namespace Cnidaria.Cs
                 RequiresSingleLocation = requiresSingleLocation;
                 RequiresStackHome = requiresStackHome;
                 MustStayInMemory = mustStayInMemory;
+                RegisterCount = registerClass == RegisterClass.Vector ? RegisterInfo.VectorRegisterCount(stackHomeSize) : 1;
                 StackHomeSize = stackHomeSize;
                 StackHomeAlignment = stackHomeAlignment;
                 AbiSegmentIndex = abiSegmentIndex;
@@ -7178,6 +7265,33 @@ namespace Cnidaria.Cs
                 }
 
                 return int.MaxValue;
+            }
+
+            // A definition that may be placed in memory is not a register reference
+            public bool IsReferencedInRegisterBetween(int start, int end)
+            {
+                for (int i = 0; i < RefPositions.Length; i++)
+                {
+                    var refPosition = RefPositions[i];
+                    if (refPosition.Position < start || refPosition.Position > end)
+                        continue;
+                    if (refPosition.Kind != LinearRefPositionKind.Def ||
+                        (refPosition.Flags & (LinearRefPositionFlags.RequiresRegister | LinearRefPositionFlags.FixedRegister)) != 0)
+                    {
+                        return true;
+                    }
+                }
+
+                if (RefPositions.Length != 0)
+                    return false;
+
+                for (int i = 0; i < UsePositions.Length; i++)
+                {
+                    if (UsePositions[i] >= start && UsePositions[i] <= end)
+                        return true;
+                }
+
+                return false;
             }
 
             public int NextRequiredRefPositionAtOrAfter(int position)

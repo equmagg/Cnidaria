@@ -482,11 +482,12 @@ namespace Cnidaria.Cs
                     requireImplicit: true);
             }
 
+            var bodyScope = filterOpt is null ? scope : scope.CreateFlowScopeBinderForTrue(filterOpt);
             _flow.PushCatchRegion();
             BoundStatement bodyStmt;
             try
             {
-                bodyStmt = scope.BindStatement(node.Block, context, diagnostics);
+                bodyStmt = bodyScope.BindStatement(node.Block, context, diagnostics);
             }
             finally
             {

@@ -1167,7 +1167,6 @@ namespace System.Globalization
 
         public virtual object? GetFormat(Type? formatType)
         {
-            /*
             if (formatType == typeof(NumberFormatInfo))
             {
                 return NumberFormat;
@@ -1176,7 +1175,6 @@ namespace System.Globalization
             {
                 return DateTimeFormat;
             }
-            */
 
             return null;
         }
@@ -1383,7 +1381,7 @@ namespace System.Globalization
             for (int i = 0; i < str.Length; i++)
             {
                 System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) =
-                    Char.ToLowerInvariant(System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i));
+                    Char.ToUpperInvariant(System.Runtime.CompilerServices.Unsafe.Add<char>(ref src, i));
             }
             return dstStr;
         }

@@ -277,12 +277,15 @@ namespace Cnidaria.Cs
         public static AbiValueInfo AddressValue(TargetInfo? target = null)
             => Scalar(RegisterClass.General, PointerSizeFor(target), PointerSizeFor(target), containsGcPointers: false);
 
-        public static GenStackKind StackKindForType(RuntimeType? type)
+        public static GenStackKind StackKindForType(RuntimeType? type, TargetInfo? target = null)
         {
             if (type is null)
                 return GenStackKind.Unknown;
             if (IsVoid(type))
                 return GenStackKind.Void;
+            GenStackKind simdKind = SimdTypes.KindOf(type, target);
+            if (simdKind != GenStackKind.Unknown)
+                return simdKind;
             if (type.IsReferenceType)
                 return GenStackKind.Ref;
             if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer)
@@ -327,7 +330,7 @@ namespace Cnidaria.Cs
             if (method is null)
                 return false;
 
-            var returnStackKind = StackKindForType(method.ReturnType);
+            var returnStackKind = StackKindForType(method.ReturnType, target);
             return ClassifyValue(method.ReturnType, returnStackKind, isReturn: true, target: target).PassingKind == AbiValuePassingKind.Indirect;
         }
 
@@ -344,6 +347,9 @@ namespace Cnidaria.Cs
                 return GenStackKind.R4;
             if (type.Name == "Double")
                 return GenStackKind.R8;
+            GenStackKind simdKind = SimdTypes.KindOf(type, target);
+            if (simdKind != GenStackKind.Unknown)
+                return simdKind;
             if (type.SizeOf > 8)
                 return GenStackKind.Value;
 
@@ -357,8 +363,13 @@ namespace Cnidaria.Cs
 
         public static AbiValueInfo ClassifyStorageValue(RuntimeType? type, GenStackKind stackKind, TargetInfo? target = null)
         {
+            if (target is not null && target.IsRiscV && IsSimdValue(type, stackKind, target))
+            {
+                int size = SimdTypes.SizeOf(SimdTypes.IsSimdKind(stackKind) ? stackKind : SimdTypes.KindOf(type, target));
+                return Scalar(RegisterClass.Vector, size, size == 12 ? 16 : Math.Min(size, 16), containsGcPointers: false);
+            }
             var abi = ClassifyValue(type, stackKind, isReturn: false, target: target);
-            if (abi.PassingKind == AbiValuePassingKind.Void)
+            if (abi.PassingKind == AbiValuePassingKind.Void || IsSimdValue(type, stackKind, target))
                 return abi;
 
             if (abi.PassingKind == AbiValuePassingKind.Indirect)
@@ -398,6 +409,12 @@ namespace Cnidaria.Cs
         {
             if (stackKind == GenStackKind.Void || (type is not null && IsVoid(type)))
                 return new AbiValueInfo(AbiValuePassingKind.Void, RegisterClass.Invalid, 0, 1, containsGcPointers: false);
+
+            if ((target is null || !target.IsRiscV) && IsSimdValue(type, stackKind, target))
+            {
+                int vectorSize = SimdTypes.SizeOf(SimdTypes.IsSimdKind(stackKind) ? stackKind : SimdTypes.KindOf(type, target));
+                return Scalar(RegisterClass.Float, vectorSize, vectorSize == 12 ? 16 : vectorSize, containsGcPointers: false);
+            }
 
             if (stackKind is GenStackKind.Ref or GenStackKind.Null)
                 return Scalar(RegisterClass.General, PointerSizeFor(target), PointerSizeFor(target), containsGcPointers: true);
@@ -517,6 +534,8 @@ namespace Cnidaria.Cs
         {
             if (stackKind is GenStackKind.Void or GenStackKind.Unknown)
                 return false;
+            if (IsSimdValue(type, stackKind, target))
+                return true;
 
             var abi = ClassifyStorageValue(type, stackKind, target);
             if (!abi.IsRegisterPassed)
@@ -1487,6 +1506,9 @@ namespace Cnidaria.Cs
                 "IntPtr" or "UIntPtr" or
                 "Half" or "Single" or "Double";
         }
+
+        private static bool IsSimdValue(RuntimeType? type, GenStackKind stackKind, TargetInfo? target)
+            => SimdTypes.IsSimdKind(stackKind) || SimdTypes.IsSimdType(type, target);
 
         private static bool IsScalarStorageValue(RuntimeType type)
             => IsPrimitiveWrapper(type) || type.Kind == RuntimeTypeKind.Enum || type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef;

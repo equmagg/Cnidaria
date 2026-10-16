@@ -410,18 +410,23 @@ namespace Cnidaria.Cs
                 for (int r = 0; r < cfg.ExceptionRegions.Length; r++)
                 {
                     var region = cfg.ExceptionRegions[r];
-                    int handler = region.HandlerStartBlockId;
-                    if ((uint)handler >= (uint)n)
-                        continue;
-
                     if (!HasPotentialExceptionEdgeToHandler(cfg, region))
                         continue;
 
-                    if (liveness.LiveIn[handler].Contains(slot) && AddPhi(slot, handler) && !liveness.Defs[handler].Contains(slot) && inWork.Add(handler))
-                        work.Enqueue(handler);
+                    AddHandlerPhi(region.HandlerStartBlockId);
+                    AddHandlerPhi(region.HandlerBodyStartBlockId);
                 }
 
                 ProcessWorklist();
+
+                void AddHandlerPhi(int handler)
+                {
+                    if ((uint)handler < (uint)n && liveness.LiveIn[handler].Contains(slot) && AddPhi(slot, handler) &&
+                        !liveness.Defs[handler].Contains(slot) && inWork.Add(handler))
+                    {
+                        work.Enqueue(handler);
+                    }
+                }
 
                 void ProcessWorklist()
                 {
@@ -490,18 +495,23 @@ namespace Cnidaria.Cs
                 for (int r = 0; r < cfg.ExceptionRegions.Length; r++)
                 {
                     var region = cfg.ExceptionRegions[r];
-                    int handler = region.HandlerStartBlockId;
-                    if ((uint)handler >= (uint)n)
-                        continue;
-
                     if (!HasPotentialExceptionEdgeToHandler(cfg, region))
                         continue;
 
-                    if (liveness.LiveIn[handler].Contains(kind) && AddPhi(kind, handler) && !liveness.Defs[handler].Contains(kind) && inWork.Add(handler))
-                        work.Enqueue(handler);
+                    AddHandlerPhi(region.HandlerStartBlockId);
+                    AddHandlerPhi(region.HandlerBodyStartBlockId);
                 }
 
                 ProcessWorklist();
+
+                void AddHandlerPhi(int handler)
+                {
+                    if ((uint)handler < (uint)n && liveness.LiveIn[handler].Contains(kind) && AddPhi(kind, handler) &&
+                        !liveness.Defs[handler].Contains(kind) && inWork.Add(handler))
+                    {
+                        work.Enqueue(handler);
+                    }
+                }
 
                 void ProcessWorklist()
                 {
@@ -673,6 +683,9 @@ namespace Cnidaria.Cs
                 {
                     if (stackKind is GenStackKind.Void or GenStackKind.Unknown or GenStackKind.Value)
                         return false;
+
+                    if (SimdTypes.IsSimdKind(stackKind))
+                        return true;
 
                     if (stackKind is GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Null)
                         return true;
@@ -989,6 +1002,12 @@ namespace Cnidaria.Cs
                     defs = SsaMemoryKindSet.All;
                     break;
 
+                case GenTreeKind.HWIntrinsic when HWIntrinsics.TouchesMemory(node):
+                    uses = SsaMemoryKindSet.All;
+                    if (node.WritesMemory)
+                        defs = SsaMemoryKindSet.All;
+                    break;
+
                 case GenTreeKind.NewObject:
                 case GenTreeKind.NewDelegate:
                 case GenTreeKind.NewArray:
@@ -1294,23 +1313,26 @@ namespace Cnidaria.Cs
                     if (region.ContainsTryBlock(predBlockId))
                         continue;
 
-                    int handler = region.HandlerStartBlockId;
-                    if ((uint)handler >= (uint)_cfg.Blocks.Length)
-                        continue;
+                    AddPhiArgsToEnteredHandler(predBlockId, enterBlockId, region.HandlerStartBlockId);
+                    if (region.HasFilter)
+                        AddPhiArgsToEnteredHandler(predBlockId, enterBlockId, region.HandlerBodyStartBlockId);
+                }
+            }
 
-                    for (int p = 0; p < _phis[handler].Length; p++)
-                    {
-                        var phi = _phis[handler][p];
-                        if (_localLiveness.LiveOut[predBlockId].Contains(phi.Slot))
-                            phi.AddInput(enterBlockId, Top(phi.Slot), allowMultipleForPred: true);
-                    }
+            private void AddPhiArgsToEnteredHandler(int predBlockId, int enterBlockId, int handler)
+            {
+                for (int p = 0; p < _phis[handler].Length; p++)
+                {
+                    var phi = _phis[handler][p];
+                    if (_localLiveness.LiveOut[predBlockId].Contains(phi.Slot))
+                        phi.AddInput(enterBlockId, Top(phi.Slot), allowMultipleForPred: true);
+                }
 
-                    for (int p = 0; p < _memoryPhis[handler].Length; p++)
-                    {
-                        var phi = _memoryPhis[handler][p];
-                        if (_memoryLiveness.LiveOut[predBlockId].Contains(phi.Kind))
-                            phi.AddInput(enterBlockId, _memoryOut[predBlockId].IsDefaultOrEmpty ? TopMemory(phi.Kind) : GetMemoryOut(predBlockId, phi.Kind), allowMultipleForPred: true);
-                    }
+                for (int p = 0; p < _memoryPhis[handler].Length; p++)
+                {
+                    var phi = _memoryPhis[handler][p];
+                    if (_memoryLiveness.LiveOut[predBlockId].Contains(phi.Kind))
+                        phi.AddInput(enterBlockId, _memoryOut[predBlockId].IsDefaultOrEmpty ? TopMemory(phi.Kind) : GetMemoryOut(predBlockId, phi.Kind), allowMultipleForPred: true);
                 }
             }
 
@@ -1363,6 +1385,9 @@ namespace Cnidaria.Cs
                     int handler = _cfg.ExceptionRegions[regionIndex].HandlerStartBlockId;
                     if ((uint)handler < (uint)_cfg.Blocks.Length && seen.Add(handler))
                         visitor(handler);
+                    int body = _cfg.ExceptionRegions[regionIndex].HandlerBodyStartBlockId;
+                    if (seen.Add(body))
+                        visitor(body);
                 }
             }
 

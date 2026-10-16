@@ -531,7 +531,7 @@ namespace Cnidaria.Cs
                 bool supportsGcTransitionArea = Target.IsRiscV || Target.IsX86 || Target.IsArm;
                 bool hasGcSafePoint = supportsGcTransitionArea && MethodHasGcSafePoint();
                 int funcletCount = supportsGcTransitionArea ? Math.Max(0, _method.Funclets.Length - 1) : 0;
-                int gcRootSpillAreaCount = 1 + funcletCount;
+                ImmutableArray<int> gcRootSpillAreaByFunclet = ComputeGcRootSpillAreas(out int gcRootSpillAreaCount);
                 int typeOperationScratchSize = supportsGcTransitionArea ? ComputeTypeOperationScratchSize() : 0;
                 if (supportsGcTransitionArea && (hasGcSafePoint || typeOperationScratchSize != 0))
                 {
@@ -561,7 +561,7 @@ namespace Cnidaria.Cs
 
                 cursor = AlignUp(cursor, Target.PointerSize);
                 int funcletSlotAreaOffset = cursor;
-                cursor = checked(cursor + funcletCount * 2 * Target.PointerSize);
+                cursor = checked(cursor + funcletCount * Target.PointerSize);
 
                 int frameSize = AlignFrameSize(cursor, frameAlignment);
 
@@ -593,7 +593,33 @@ namespace Cnidaria.Cs
                     gcRootSpillSlotCount,
                     gcRootSpillAreaCount,
                     funcletSlotAreaOffset,
-                    funcletCount);
+                    funcletCount,
+                    gcRootSpillAreaByFunclet);
+            }
+
+            // A funclet runs while another is suspended only if its try encloses that one's code, so one EH depth shares an area
+            private ImmutableArray<int> ComputeGcRootSpillAreas(out int areaCount)
+            {
+                var regions = _method.GenTreeMethod.Cfg.ExceptionRegions;
+                var depths = new int[regions.Length];
+                int Depth(int region)
+                {
+                    if (region < 0)
+                        return 0;
+                    if (depths[region] == 0)
+                        depths[region] = 1 + Math.Max(Depth(regions[region].EnclosingTryIndex), Depth(regions[region].EnclosingHandlerIndex));
+                    return depths[region];
+                }
+
+                var areas = ImmutableArray.CreateBuilder<int>(_method.Funclets.Length);
+                areaCount = 1;
+                foreach (RegisterFunclet funclet in _method.Funclets)
+                {
+                    int area = funclet.Index == 0 ? 0 : Depth(funclet.ExceptionRegionIndex);
+                    areas.Add(area);
+                    areaCount = Math.Max(areaCount, area + 1);
+                }
+                return areas.MoveToImmutable();
             }
 
 
@@ -721,7 +747,7 @@ namespace Cnidaria.Cs
                     if (register == MachineRegister.Invalid)
                         break;
                     int alignment = RegisterInfo.RegisterSaveAlignment(Target, register);
-                    int size = RegisterInfo.RegisterSaveSize(Target, register);
+                    int size = RegisterInfo.LiveRegisterSaveSize(Target, register);
                     cursor = AlignUp(cursor, alignment);
                     cursor = checked(cursor + size);
                 }
@@ -731,7 +757,7 @@ namespace Cnidaria.Cs
                     if (register == MachineRegister.Invalid)
                         break;
                     int alignment = RegisterInfo.RegisterSaveAlignment(Target, register);
-                    int size = RegisterInfo.RegisterSaveSize(Target, register);
+                    int size = RegisterInfo.LiveRegisterSaveSize(Target, register);
                     cursor = AlignUp(cursor, alignment);
                     cursor = checked(cursor + size);
                 }
@@ -752,9 +778,6 @@ namespace Cnidaria.Cs
             private int ComputeGcRootSpillSlotCount()
             {
                 int count = ComputeMaximumLiveAllocationGcCellCount();
-                count = checked(count + GcCellCount(_method.GenTreeMethod.ArgDescriptors));
-                count = checked(count + GcCellCount(_method.GenTreeMethod.LocalDescriptors));
-                count = checked(count + GcCellCount(_method.GenTreeMethod.TempDescriptors));
                 count = checked(count + GcSafePointOperandCellCount());
                 return checked(count + 1);
             }
@@ -833,19 +856,6 @@ namespace Cnidaria.Cs
                     maximum = Math.Max(maximum, count);
                 }
                 return maximum;
-            }
-
-            private static int GcCellCount(ImmutableArray<GenLocalDescriptor> descriptors)
-            {
-                int count = 0;
-                for (int i = 0; i < descriptors.Length; i++)
-                {
-                    var descriptor = descriptors[i];
-                    if (descriptor.IsStructField)
-                        continue;
-                    count = checked(count + GcCellCount(descriptor.Type, descriptor.StackKind));
-                }
-                return count;
             }
 
             private static int GcCellCount(RuntimeType? type, GenStackKind stackKind)
@@ -1202,9 +1212,10 @@ namespace Cnidaria.Cs
             private bool RequiresIncomingArgumentHome(int index)
             {
                 RuntimeType argType = _method.GenTreeMethod.ArgTypes[index];
-                var argAbi = MachineAbi.ClassifyValue(argType, MachineAbi.StackKindForType(argType), isReturn: false, target: Target);
+                var argAbi = MachineAbi.ClassifyValue(argType, MachineAbi.StackKindForType(argType, Target), isReturn: false, target: Target);
                 var effectiveArgAbi = GetEffectiveIncomingArgumentAbi(index, argAbi);
-                if (!MachineAbi.HaveMatchingArgumentValueLayout(argAbi, effectiveArgAbi, Target))
+                var storageAbi = MachineAbi.ClassifyStorageValue(argType, MachineAbi.StackKindForType(argType, Target), Target);
+                if (!MachineAbi.HaveMatchingArgumentValueLayout(storageAbi, effectiveArgAbi, Target, requireMatchingRegisterClasses: true))
                     return true;
                 if (effectiveArgAbi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect)
                     return true;
@@ -1256,7 +1267,7 @@ namespace Cnidaria.Cs
                         ? requestedArgumentAbi
                         : MachineAbi.ClassifyValue(
                             currentType,
-                            MachineAbi.StackKindForType(currentType),
+                            MachineAbi.StackKindForType(currentType, Target),
                             isReturn: false,
                             target: Target);
                     var effectiveAbi = MachineAbi.AdjustArgumentAbiForRegisterAvailability(
@@ -1371,7 +1382,7 @@ namespace Cnidaria.Cs
 
                 RuntimeType? parentType = parentDescriptor.Type;
                 GenStackKind parentStackKind = parentDescriptor.StackKind == GenStackKind.Unknown
-                    ? MachineAbi.StackKindForType(parentType)
+                    ? MachineAbi.StackKindForType(parentType, Target)
                     : parentDescriptor.StackKind;
                 var parentAbi = MachineAbi.ClassifyValue(parentType, parentStackKind, isReturn: false, target: Target);
                 var effectiveParentAbi = GetEffectiveIncomingArgumentAbi(parentArgumentIndex, parentAbi);
@@ -1440,7 +1451,7 @@ namespace Cnidaria.Cs
                             Target);
 
                     RuntimeType currentType = _method.GenTreeMethod.ArgTypes[i];
-                    GenStackKind currentStackKind = MachineAbi.StackKindForType(currentType);
+                    GenStackKind currentStackKind = MachineAbi.StackKindForType(currentType, Target);
                     var valueAbi = i == argumentIndex
                         ? argumentAbi
                         : MachineAbi.ClassifyValue(currentType, currentStackKind, isReturn: false, target: Target);

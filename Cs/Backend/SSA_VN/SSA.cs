@@ -1623,14 +1623,12 @@ namespace Cnidaria.Cs
             var trackedList = new List<SsaSlot>(tracked);
             trackedList.Sort();
 
-            bool suppressScalarSsaForEh = cfg.ExceptionRegions.Length != 0 || method.ExceptionHandlers.Length != 0;
-
             for (int i = 0; i < trackedList.Count; i++)
             {
                 var slot = trackedList[i];
                 var descriptor = descriptors[slot];
 
-                if (!suppressScalarSsaForEh && CanTrackAsScalar(slot, descriptor))
+                if (CanTrackAsScalar(slot, descriptor))
                 {
                     descriptor.MarkRegularPromotedScalar(i);
                 }
@@ -2023,6 +2021,9 @@ namespace Cnidaria.Cs
         {
             if (stackKind is GenStackKind.Void or GenStackKind.Unknown or GenStackKind.Value)
                 return false;
+
+            if (SimdTypes.IsSimdKind(stackKind))
+                return true;
 
             if (stackKind is GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.Null)
                 return true;

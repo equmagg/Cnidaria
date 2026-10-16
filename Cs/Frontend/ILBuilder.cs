@@ -11,6 +11,7 @@ namespace Cnidaria.Cs
     internal enum ILExceptionClauseKind : byte
     {
         Catch = 0,
+        Filter = 1,
         Finally = 2,
     }
     internal sealed class ILBuilder
@@ -32,7 +33,9 @@ namespace Cnidaria.Cs
             public readonly ILLabel HandlerStart;
             public readonly ILLabel HandlerEnd;
             public readonly int CatchTypeToken;
-            public Clause(ILExceptionClauseKind kind, ILLabel tryStart, ILLabel tryEnd, ILLabel handlerStart, ILLabel handlerEnd, int catchTypeToken)
+            public readonly ILLabel FilterStart;
+            public Clause(ILExceptionClauseKind kind, ILLabel tryStart, ILLabel tryEnd, ILLabel handlerStart, ILLabel handlerEnd, int catchTypeToken,
+                ILLabel filterStart)
             {
                 Kind = kind;
                 TryStart = tryStart;
@@ -40,6 +43,7 @@ namespace Cnidaria.Cs
                 HandlerStart = handlerStart;
                 HandlerEnd = handlerEnd;
                 CatchTypeToken = catchTypeToken;
+                FilterStart = filterStart;
             }
         }
 
@@ -134,7 +138,10 @@ namespace Cnidaria.Cs
             Add(ILOpCodes.ToShortBranch(op), 0, pop, 0, target.Id);
         }
         public void AddExceptionClause(ILExceptionClauseKind kind, ILLabel tryStart, ILLabel tryEnd, ILLabel handlerStart, ILLabel handlerEnd, int catchTypeToken)
-            => _clauses.Add(new Clause(kind, tryStart, tryEnd, handlerStart, handlerEnd, catchTypeToken));
+            => _clauses.Add(new Clause(kind, tryStart, tryEnd, handlerStart, handlerEnd, catchTypeToken, default));
+
+        public void AddFilterClause(ILLabel tryStart, ILLabel tryEnd, ILLabel filterStart, ILLabel handlerStart, ILLabel handlerEnd)
+            => _clauses.Add(new Clause(ILExceptionClauseKind.Filter, tryStart, tryEnd, handlerStart, handlerEnd, 0, filterStart));
 
         public byte[] Bake(int localSignatureToken, bool initLocals)
         {
@@ -268,7 +275,12 @@ namespace Cnidaria.Cs
 
             Enter(0, 0);
             foreach (var clause in _clauses)
-                Enter(_labels[clause.HandlerStart.Id], clause.Kind == ILExceptionClauseKind.Catch ? 1 : 0);
+            {
+                bool catches = clause.Kind is ILExceptionClauseKind.Catch or ILExceptionClauseKind.Filter;
+                Enter(_labels[clause.HandlerStart.Id], catches ? 1 : 0);
+                if (clause.Kind == ILExceptionClauseKind.Filter)
+                    Enter(_labels[clause.FilterStart.Id], 1);
+            }
 
             int max = 0;
             while (work.Count != 0)
@@ -303,7 +315,7 @@ namespace Cnidaria.Cs
                         if (op is ILOpCode.Br or ILOpCode.Leave)
                             break;
                     }
-                    if (op is ILOpCode.Ret or ILOpCode.Throw or ILOpCode.Rethrow or ILOpCode.Endfinally or ILOpCode.Jmp)
+                    if (op is ILOpCode.Ret or ILOpCode.Throw or ILOpCode.Rethrow or ILOpCode.Endfinally or ILOpCode.Endfilter or ILOpCode.Jmp)
                         break;
                 }
             }
@@ -320,8 +332,12 @@ namespace Cnidaria.Cs
                 int tryEnd = offsets[_labels[c.TryEnd.Id]];
                 int handlerStart = offsets[_labels[c.HandlerStart.Id]];
                 int handlerEnd = offsets[_labels[c.HandlerEnd.Id]];
-                rows[i] = ((uint)c.Kind, tryStart, tryEnd - tryStart, handlerStart, handlerEnd - handlerStart,
-                    c.Kind == ILExceptionClauseKind.Catch ? c.CatchTypeToken : 0);
+                rows[i] = ((uint)c.Kind, tryStart, tryEnd - tryStart, handlerStart, handlerEnd - handlerStart, c.Kind switch
+                {
+                    ILExceptionClauseKind.Catch => c.CatchTypeToken,
+                    ILExceptionClauseKind.Filter => offsets[_labels[c.FilterStart.Id]],
+                    _ => 0,
+                });
                 if (tryStart > ushort.MaxValue || handlerStart > ushort.MaxValue ||
                     rows[i].TryLength > byte.MaxValue || rows[i].HandlerLength > byte.MaxValue)
                 {

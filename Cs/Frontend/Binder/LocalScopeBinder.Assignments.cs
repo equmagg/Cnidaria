@@ -221,6 +221,7 @@ namespace Cnidaria.Cs
                 return new BoundCompoundAssignmentExpression(
                     node,
                     leftTarget,
+                    leftRead,
                     opKind,
                     directCall,
                     operatorMethodOpt: directMethod,
@@ -245,6 +246,7 @@ namespace Cnidaria.Cs
             return new BoundCompoundAssignmentExpression(
                 node,
                 leftTarget,
+                leftRead,
                 opKind,
                 valueToAssign,
                 operatorMethodOpt: null,

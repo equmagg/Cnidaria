@@ -106,6 +106,7 @@ namespace Cnidaria.Cs
             var seenBlocks = new HashSet<int>();
             var seenNodes = new HashSet<GenTree>(ReferenceEqualityComparer<GenTree>.Instance);
             var seenTreeIds = new HashSet<int>();
+            CfgBlock headerCfg = cfg.Blocks[loop.Header];
             for (int i = 0; i < loop.Blocks.Length; i++)
             {
                 int blockId = loop.Blocks[i];
@@ -122,10 +123,11 @@ namespace Cnidaria.Cs
                 {
                     return false;
                 }
-                if (!IsOutsideExceptionRegions(block, cfgBlock))
+                if (!GenTreeCriticalEdgeSplitter.SameEhRegion(cfgBlock, headerCfg) ||
+                    GenTreeCriticalEdgeSplitter.IsExceptionRegionEntry(cfg, blockId))
+                {
                     return false;
-                if (GenTreeCriticalEdgeSplitter.IsExceptionRegionEntry(cfg, blockId))
-                    return false;
+                }
                 if (!HasCloneableFlowShape(method, cfg, block))
                     return false;
                 for (int s = 0; s < block.Statements.Length; s++)
@@ -145,7 +147,7 @@ namespace Cnidaria.Cs
                     var successorBlock = method.Blocks[successor];
                     if (successorBlock.EntryStackDepth != 0 ||
                         (successorBlock.Flags & GenTreeBlockFlags.HasStackEntry) != 0 ||
-                        !IsOutsideExceptionRegions(successorBlock, cfg.Blocks[successor]) ||
+                        !GenTreeCriticalEdgeSplitter.SameFunclet(cfg.Blocks[successor], headerCfg) ||
                         GenTreeCriticalEdgeSplitter.IsExceptionRegionEntry(cfg, successor))
                     {
                         return false;
@@ -189,20 +191,32 @@ namespace Cnidaria.Cs
             if (!seenBlocks.Contains(loop.Header))
                 throw new InvalidOperationException("Loop duplication received a loop without its header.");
 
-            var blockMap = new Dictionary<int, int>(loop.Blocks.Length);
-            var pcMap = new Dictionary<int, int>(loop.Blocks.Length);
-            for (int i = 0; i < loop.Blocks.Length; i++)
+            var result = DuplicateBlocks(method, loop.Blocks, firstBlockId, allocator);
+            Verify(method, loop, result);
+            return result;
+        }
+
+        // Edges between duplicated blocks lead to the copies, every other edge keeps its original target
+        internal static GenTreeLoopDuplicationResult DuplicateBlocks(
+            GenTreeMethod method,
+            ImmutableArray<int> blockIds,
+            int firstBlockId,
+            GenTreeSyntheticAllocator allocator)
+        {
+            var blockMap = new Dictionary<int, int>(blockIds.Length);
+            var pcMap = new Dictionary<int, int>(blockIds.Length);
+            for (int i = 0; i < blockIds.Length; i++)
             {
-                int originalBlockId = loop.Blocks[i];
+                int originalBlockId = blockIds[i];
                 blockMap.Add(originalBlockId, checked(firstBlockId + i));
                 pcMap.Add(originalBlockId, allocator.AllocatePc());
             }
 
             var treeMap = new Dictionary<int, int>();
-            var blocks = ImmutableArray.CreateBuilder<GenTreeBlock>(loop.Blocks.Length);
-            for (int i = 0; i < loop.Blocks.Length; i++)
+            var blocks = ImmutableArray.CreateBuilder<GenTreeBlock>(blockIds.Length);
+            for (int i = 0; i < blockIds.Length; i++)
             {
-                int originalBlockId = loop.Blocks[i];
+                int originalBlockId = blockIds[i];
                 blocks.Add(CloneBlock(
                     method,
                     method.Blocks[originalBlockId],
@@ -214,13 +228,11 @@ namespace Cnidaria.Cs
                     allocator));
             }
 
-            var result = new GenTreeLoopDuplicationResult(
+            return new GenTreeLoopDuplicationResult(
                 blocks.ToImmutable(),
                 blockMap,
                 pcMap,
                 treeMap);
-            Verify(method, loop, result);
-            return result;
         }
 
         internal static GenTree CloneTreeWithExistingId(
@@ -263,7 +275,7 @@ namespace Cnidaria.Cs
             return clone;
         }
 
-        private static GenTreeFlags PrepareDuplicatedFlags(GenTreeFlags flags)
+        internal static GenTreeFlags PrepareDuplicatedFlags(GenTreeFlags flags)
             => flags & ~(
                 GenTreeFlags.AssertionProperties |
                 GenTreeFlags.VarDef |
@@ -411,16 +423,6 @@ namespace Cnidaria.Cs
             return true;
         }
 
-        private static bool IsOutsideExceptionRegions(GenTreeBlock block, CfgBlock cfgBlock)
-            => !cfgBlock.IsInTryRegion &&
-               !cfgBlock.IsInHandlerRegion &&
-               !cfgBlock.IsHandlerEntry &&
-               (block.Flags &
-                (GenTreeBlockFlags.TryEntry |
-                 GenTreeBlockFlags.HandlerEntry |
-                 GenTreeBlockFlags.InTryRegion |
-                 GenTreeBlockFlags.InHandlerRegion)) == 0;
-
         private static bool HasCloneableFlowShape(GenTreeMethod method, ControlFlowGraph cfg, GenTreeBlock block)
         {
             if (block.SuccessorBlockIds.Length != block.SuccessorPcs.Length)
@@ -456,7 +458,6 @@ namespace Cnidaria.Cs
                         var branch = block.Statements[branchIndex];
                         return branch.Kind == GenTreeKind.Branch &&
                                branch.Operands.Length == 0 &&
-                               branch.Operator != GenTreeOperator.Leave &&
                                distinctSuccessors.Contains(branch.TargetBlockId) &&
                                !ContainsControlTransfer(block.Statements, branchIndex);
                     }
@@ -476,7 +477,6 @@ namespace Cnidaria.Cs
 
                         return appended is null ||
                                (appended.Operands.Length == 0 &&
-                                appended.Operator != GenTreeOperator.Leave &&
                                 distinctSuccessors.Contains(appended.TargetBlockId));
                     }
 
@@ -518,7 +518,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.Return or
                 GenTreeKind.Throw or
                 GenTreeKind.Rethrow or
-                GenTreeKind.EndFinally)
+                GenTreeKind.EndFinally or GenTreeKind.CallFinally or GenTreeKind.CatchReturn or GenTreeKind.EndFilter)
             {
                 return true;
             }
@@ -585,7 +585,7 @@ namespace Cnidaria.Cs
                 statements.ToImmutable(),
                 successors.ToImmutable(),
                 successorPcs.ToImmutable(),
-                clonePc);
+                original.Region);
         }
 
         private static GenTree CloneTreeRecursive(
@@ -706,7 +706,7 @@ namespace Cnidaria.Cs
 
                 if (result.GetBlock(originalBlockId) != clone.Id ||
                     result.GetPc(originalBlockId) != clone.StartPc ||
-                    clone.RegionPc != clone.StartPc ||
+                    clone.Region != original.Region ||
                     !cloneIds.Add(clone.Id) ||
                     !clonePcs.Add(clone.StartPc) ||
                     clone.Id < method.Blocks.Length)
