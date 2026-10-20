@@ -1697,8 +1697,9 @@ namespace Cnidaria.Cs
                         _il.EmitI4(negate ? 0 : 1);
                         return true;
                     }
-                    if (!ContainsTypeParameter(leftTypeOf.OperandType) && !ContainsTypeParameter(rightTypeOf.OperandType) &&
-                        leftTypeOf.OperandType is not TupleTypeSymbol && rightTypeOf.OperandType is not TupleTypeSymbol)
+                    if (CannotHaveSameRuntimeTypeIdentity(leftTypeOf.OperandType, rightTypeOf.OperandType) ||
+                        (!ContainsTypeParameter(leftTypeOf.OperandType) && !ContainsTypeParameter(rightTypeOf.OperandType) &&
+                        leftTypeOf.OperandType is not TupleTypeSymbol && rightTypeOf.OperandType is not TupleTypeSymbol))
                     {
                         _il.EmitI4(negate ? 1 : 0);
                         return true;
@@ -1832,6 +1833,51 @@ namespace Cnidaria.Cs
                         return false;
                 }
             }
+            private static bool CannotHaveSameRuntimeTypeIdentity(TypeSymbol left, TypeSymbol right)
+            {
+                if ((left.IsValueType && right.IsReferenceType) ||
+                    (left.IsReferenceType && right.IsValueType))
+                {
+                    return true;
+                }
+
+                if (left is NamedTypeSymbol a && right is NamedTypeSymbol b)
+                {
+                    if (!ReferenceEquals(a.OriginalDefinition, b.OriginalDefinition))
+                        return true;
+
+                    if (a.ContainingSymbol is NamedTypeSymbol aOwner &&
+                        b.ContainingSymbol is NamedTypeSymbol bOwner &&
+                        CannotHaveSameRuntimeTypeIdentity(aOwner, bOwner))
+                        return true;
+
+                    var aArguments = a.TypeArguments;
+                    var bArguments = b.TypeArguments;
+                    if (aArguments.Length == bArguments.Length)
+                    {
+                        for (int i = 0; i < aArguments.Length; i++)
+                        {
+                            if (CannotHaveSameRuntimeTypeIdentity(aArguments[i], bArguments[i]))
+                                return true;
+                        }
+                    }
+                }
+                else if (left is ArrayTypeSymbol aArray && right is ArrayTypeSymbol bArray)
+                {
+                    return aArray.Rank != bArray.Rank || aArray.IsSZArray != bArray.IsSZArray ||
+                        CannotHaveSameRuntimeTypeIdentity(aArray.ElementType, bArray.ElementType);
+                }
+                else if (left is PointerTypeSymbol aPointer && right is PointerTypeSymbol bPointer)
+                {
+                    return CannotHaveSameRuntimeTypeIdentity(aPointer.PointedAtType, bPointer.PointedAtType);
+                }
+                else if (left is ByRefTypeSymbol aByRef && right is ByRefTypeSymbol bByRef)
+                {
+                    return CannotHaveSameRuntimeTypeIdentity(aByRef.ElementType, bByRef.ElementType);
+                }
+
+                return false;
+            }
             private static bool AreSameRuntimeTypeIdentity(TypeSymbol left, TypeSymbol right)
             {
                 if (ReferenceEquals(left, right))
@@ -1938,7 +1984,8 @@ namespace Cnidaria.Cs
                         break;
 
                     case "WriteUnaligned" when ps.Length == 2 &&
-                        ps[0].Type is ByRefTypeSymbol { ElementType.SpecialType: SpecialType.System_UInt8 } &&
+                        (ps[0].Type is ByRefTypeSymbol { ElementType.SpecialType: SpecialType.System_UInt8 } ||
+                         ps[0].Type is PointerTypeSymbol { PointedAtType.SpecialType: SpecialType.System_Void }) &&
                         call.Method.TypeArguments.Length == 1:
                         EmitExpression(args[0], EmitMode.Value);
                         EmitExpression(args[1], EmitMode.Value);

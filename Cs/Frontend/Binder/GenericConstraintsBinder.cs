@@ -508,6 +508,10 @@ namespace Cnidaria.Cs
                             BindOwnerConstraintClauses(tree, cd.ConstraintClauses, nt.TypeParameters, nt, diagnostics);
                             break;
 
+                        case RecordDeclarationSyntax rd when kv.Value is NamedTypeSymbol nt:
+                            BindOwnerConstraintClauses(tree, rd.ConstraintClauses, nt.TypeParameters, nt, diagnostics);
+                            break;
+
                         case StructDeclarationSyntax sd when kv.Value is NamedTypeSymbol nt:
                             BindOwnerConstraintClauses(tree, sd.ConstraintClauses, nt.TypeParameters, nt, diagnostics);
                             break;

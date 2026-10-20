@@ -1182,7 +1182,7 @@ namespace Cnidaria.Cs
         public bool IsDelegateLike => (LayoutFlags & TypeLayoutFlags.DelegateLike) != 0;
     }
 
-    public sealed class CodeImage
+    public sealed class CodeImage : IProgram
     {
         internal ImageFlags Flags { get; }
         internal ImmutableArray<InstrDesc> Code { get; }
@@ -1256,6 +1256,10 @@ namespace Cnidaria.Cs
             if (validate)
                 Validate();
         }
+
+        public byte[] ToExecutableBytes(ulong imageBase = 0, IReadOnlyDictionary<string, ulong>? externalSymbols = null) =>
+            ImageSerializer.ToBytes(this);
+        public string Disassemble() => ImagePrinter.Print(this);
 
         internal MethodRecord GetMethod(int runtimeMethodId)
         {

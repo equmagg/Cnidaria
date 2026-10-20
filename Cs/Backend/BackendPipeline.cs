@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Xml.Linq;
 
@@ -45,31 +46,6 @@ namespace Cnidaria.Cs
         public CodeGeneratorOptions CodeGeneratorOptions { get; set; } = CodeGeneratorOptions.Default;
         public TargetInfo? Target { get; set; }
     }
-    public sealed class BackendResult
-    {
-        internal GenTreeProgram HirProgram { get; }
-        internal SsaProgram? SsaProgram { get; }
-        internal GenTreeProgram RationalizedProgram { get; }
-        internal GenTreeProgram LoweredProgram { get; }
-        internal GenTreeProgram RegisterAllocatedProgram { get; }
-        public CodeImage Image { get; }
-
-        internal BackendResult(
-            GenTreeProgram hirProgram,
-            SsaProgram? ssaProgram,
-            GenTreeProgram rationalizedProgram,
-            GenTreeProgram loweredProgram,
-            GenTreeProgram registerAllocatedProgram,
-            CodeImage image)
-        {
-            HirProgram = hirProgram ?? throw new ArgumentNullException(nameof(hirProgram));
-            SsaProgram = ssaProgram;
-            RationalizedProgram = rationalizedProgram ?? throw new ArgumentNullException(nameof(rationalizedProgram));
-            LoweredProgram = loweredProgram ?? throw new ArgumentNullException(nameof(loweredProgram));
-            RegisterAllocatedProgram = registerAllocatedProgram ?? throw new ArgumentNullException(nameof(registerAllocatedProgram));
-            Image = image ?? throw new ArgumentNullException(nameof(image));
-        }
-    }
     internal sealed class GenTreeBackendPipelineResult
     {
         public GenTreeProgram HirProgram { get; }
@@ -94,7 +70,7 @@ namespace Cnidaria.Cs
     }
     public static class BackendPipeline
     {
-        public static BackendResult CompileProgram(GenTreeProgram program, BackendOptions? options = null)
+        public static CodeImage CompileRbcProgram(GenTreeProgram program, BackendOptions? options = null)
         {
             if (program is null)
                 throw new ArgumentNullException(nameof(program));
@@ -107,16 +83,10 @@ namespace Cnidaria.Cs
                 nonCallOperationsClobberCallerSavedRegisters: false);
             var image = RegisterBytecodeGenerator.Build(lowered.RegisterAllocatedProgram, options.CodeGeneratorOptions, program.Target);
             swCompile.Stop();
-            return new BackendResult(
-                lowered.HirProgram,
-                lowered.SsaProgram,
-                lowered.RationalizedProgram,
-                lowered.LoweredProgram,
-                lowered.RegisterAllocatedProgram,
-                image);
+            return image;
         }
 
-        internal static BackendResult CompileMethod(GenTreeMethod method, BackendOptions? options = null)
+        internal static CodeImage CompileMethod(GenTreeMethod method, BackendOptions? options = null)
         {
             if (method is null)
                 throw new ArgumentNullException(nameof(method));
@@ -127,13 +97,49 @@ namespace Cnidaria.Cs
                 options,
                 nonCallOperationsClobberCallerSavedRegisters: false);
             var image = RegisterBytecodeGenerator.Build(lowered.RegisterAllocatedProgram, options.CodeGeneratorOptions, method.Target);
-            return new BackendResult(
-                lowered.HirProgram,
-                lowered.SsaProgram,
-                lowered.RationalizedProgram,
-                lowered.LoweredProgram,
-                lowered.RegisterAllocatedProgram,
-                image);
+            return image;
+        }
+
+        public static bool TryCompileProgram(GenTreeProgram program, TargetInfo target, [NotNullWhen(true)] out IProgram? output)
+        {
+            ArgumentNullException.ThrowIfNull(program);
+            ArgumentNullException.ThrowIfNull(target);
+            if (program.Target.Architecture != target.Architecture ||
+                program.Target.PointerSize != target.PointerSize ||
+                program.Target.OperatingSystem != target.OperatingSystem ||
+                program.Target.ArchitectureFeatures != target.ArchitectureFeatures ||
+                program.Target.Endianness != target.Endianness)
+                throw new ArgumentException("The target must match the imported program.", nameof(target));
+
+            output = default;
+            if (target.IsX86)
+            {
+                output = CompileX86Program(program);
+                return true;
+            }
+            if (target.IsArm)
+            {
+                output = CompileArmProgram(program);
+                return true;
+            }
+            if (target.IsRiscV)
+            {
+                output = CompileRiscVProgram(program);
+                return true;
+            }
+            if(target.IsRegisterBytecode)
+            {
+                output = CompileRbcProgram(program);
+                return true;
+            }
+            return false;
+        }
+
+        public static IProgram CompileProgram(GenTreeProgram program, TargetInfo target)
+        {
+            if (TryCompileProgram(program, target, out var output)) return output;
+
+            throw new PlatformNotSupportedException("native build target unrecognised");
         }
 
         public static X86Program CompileX86Program(
@@ -1075,12 +1081,12 @@ namespace Cnidaria.Cs
         internal static GenTreeFlags NormalizeLocalFieldFlags(GenTree node, SsaLocalAccess localFieldAccess)
         {
             GenTreeFlags flags =
-                (node.Flags & (GenTreeFlags.ExplicitInit | GenTreeFlags.PromotionSync)) |
+                (node.Flags & (GenTreeFlags.ExplicitInit | GenTreeFlags.PromotionSync | GenTreeFlags.Unaligned)) |
                 GenTreeFlags.NullCheckEliminated;
             for (int i = 0; i < node.Operands.Length; i++)
             {
                 flags |= node.Operands[i].Flags
-                    & ~(GenTreeFlags.AssertionProperties | GenTreeFlags.ExplicitInit);
+                    & ~(GenTreeFlags.AssertionProperties | GenTreeFlags.ExplicitInit | GenTreeFlags.Unaligned);
             }
 
             flags |= GenTreeFlags.Indirect;

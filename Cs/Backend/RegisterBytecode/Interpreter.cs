@@ -3330,6 +3330,24 @@ namespace Cnidaria.Cs
                 }
             }
 
+            if (!rm.HasThis && rm.IsStatic && rm.HasInternalCall && rm.ParameterTypes.Length == 3 &&
+                rm.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Void &&
+                ((rm.DeclaringType.Namespace == "System" && rm.DeclaringType.Name == "SpanHelpers" && rm.Name == "memmove") ||
+                 (rm.DeclaringType.Namespace == "System.Runtime" && rm.DeclaringType.Name == "RuntimeImports" && rm.Name == "RhBulkMoveWithWriteBarrier")))
+            {
+                long rawLength = ReadAbiScalarArgument(rm, 2);
+                int size = checked((int)(_rts.Target.PointerSize == 8 ? unchecked((ulong)rawLength) : unchecked((uint)rawLength)));
+                if (size != 0)
+                {
+                    int destination = checked((int)ReadAbiScalarArgument(rm, 0));
+                    int source = checked((int)ReadAbiScalarArgument(rm, 1));
+                    CheckIndirectAccess(destination, size, writable: true);
+                    CheckIndirectAccess(source, size, writable: false);
+                    _mem.AsSpan(source, size).CopyTo(_mem.AsSpan(destination, size));
+                }
+                return true;
+            }
+
             if (rm.DeclaringType.Namespace == "System" &&
                 rm.DeclaringType.Name == "SpanHelpers" &&
                 rm.Name == "memset" &&
@@ -3352,6 +3370,16 @@ namespace Cnidaria.Cs
                     CheckIndirectAccess(abs, size, writable: true);
                     _mem.AsSpan(abs, size).Fill(unchecked((byte)value));
                 }
+                return true;
+            }
+
+            if (rm.DeclaringType.Namespace == "System.Threading" &&
+                rm.DeclaringType.Name == "Thread" && rm.Name == "FastPollGC" &&
+                !rm.HasThis && rm.IsStatic && rm.HasInternalCall &&
+                rm.ParameterTypes.Length == 0 &&
+                rm.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Void)
+            {
+                MaybeCollectGarbage();
                 return true;
             }
 
@@ -3477,6 +3505,30 @@ namespace Cnidaria.Cs
             {
                 RuntimeType arrayType = GetObjectTypeFromRef(ReadAbiScalarArgument(rm, 0));
                 SetReturnI4(arrayType.IsSzArray ? 1 : arrayType.ArrayRank);
+                return true;
+            }
+
+            if (rm.DeclaringType.Namespace == "System" && rm.DeclaringType.Name == "Object" && rm.Name == "MemberwiseClone")
+            {
+                int source = checked((int)ReadAbiScalarArgument(rm, 0));
+                RuntimeType type = GetObjectTypeFromRef(source);
+                if (!TryGetBlockFromObjectRef(source, out int block))
+                    throw new AccessViolationException("Invalid object reference.");
+                int size = ReadBlockSize(block) - BlockHeaderSize;
+                _hostRoots.Add(source);
+                try
+                {
+                    int clone = AllocHeapBytes(size, Math.Max(8, type.AlignOf));
+                    source = _hostRoots[^1];
+                    WriteI32(clone, type.TypeId);
+                    WriteI32(clone + 4, GcFlagAllocated);
+                    _mem.AsSpan(source + ObjectHeaderSize, size - ObjectHeaderSize).CopyTo(_mem.AsSpan(clone + ObjectHeaderSize));
+                    SetReturnRef(clone);
+                }
+                finally
+                {
+                    _hostRoots.RemoveAt(_hostRoots.Count - 1);
+                }
                 return true;
             }
 

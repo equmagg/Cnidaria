@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
@@ -613,6 +614,8 @@ namespace Cnidaria.Cs
 
             var text = targetSyntax.Identifier.ValueText ?? "";
             var parsed = ParseTarget(text, defaultTarget);
+            if (parsed == AttributeApplicationTarget.Method && ownerSymbol is SourceNamedTypeSymbol { RecordInfo.PrimaryConstructor: not null })
+                parsed = AttributeApplicationTarget.Constructor;
 
             if (parsed == AttributeApplicationTarget.Unknown)
             {
@@ -672,6 +675,8 @@ namespace Cnidaria.Cs
             switch (owner)
             {
                 case NamedTypeSymbol nt:
+                    if (target == AttributeApplicationTarget.Constructor && nt is SourceNamedTypeSymbol { RecordInfo.PrimaryConstructor: not null })
+                        return true;
                     return nt.TypeKind switch
                     {
                         TypeKind.Class => target == AttributeApplicationTarget.Class,
@@ -698,8 +703,9 @@ namespace Cnidaria.Cs
                 case FieldSymbol:
                     return target == AttributeApplicationTarget.Field;
 
-                case ParameterSymbol:
-                    return target == AttributeApplicationTarget.Parameter;
+                case ParameterSymbol parameter:
+                    return target == AttributeApplicationTarget.Parameter ||
+                        (target is AttributeApplicationTarget.Property or AttributeApplicationTarget.Field && GetRecordParameterProperty(parameter) is not null);
 
                 case TypeParameterSymbol:
                     return target == AttributeApplicationTarget.GenericParameter;
@@ -710,6 +716,11 @@ namespace Cnidaria.Cs
         }
         private static Symbol? GetTargetOwner(Symbol owner, AttributeApplicationTarget target)
         {
+            if (owner is ParameterSymbol parameter && target is AttributeApplicationTarget.Property or AttributeApplicationTarget.Field &&
+                GetRecordParameterProperty(parameter) is SourcePropertySymbol positionalProperty)
+                owner = positionalProperty;
+            if (target == AttributeApplicationTarget.Constructor && owner is SourceNamedTypeSymbol { RecordInfo.PrimaryConstructor: MethodSymbol constructor })
+                return constructor;
             if (target == AttributeApplicationTarget.Field &&
                 owner is SourcePropertySymbol property &&
                 property.BackingFieldOpt is FieldSymbol backingField)
@@ -718,6 +729,14 @@ namespace Cnidaria.Cs
             }
 
             return owner;
+        }
+        private static SourcePropertySymbol? GetRecordParameterProperty(ParameterSymbol parameter)
+        {
+            if (parameter.ContainingSymbol is not MethodSymbol { ContainingSymbol: SourceNamedTypeSymbol { RecordInfo: RecordTypeInfo record } } method ||
+                !ReferenceEquals(method, record.PrimaryConstructor))
+                return null;
+            return record.PositionalMembers.OfType<SourcePropertySymbol>().FirstOrDefault(p => p.Name == parameter.Name &&
+                p.DeclaringSyntaxReferences[0].Node is ParameterSyntax);
         }
         private static AttributeApplicationTarget GetDefaultTarget(Symbol owner)
         {

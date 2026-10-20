@@ -7,7 +7,7 @@ using System.Linq;
 namespace Cnidaria.RiscV;
 
 
-public sealed class RiscVProgram
+public sealed class RiscVProgram : IProgram
 {
     public RVTarget Target { get; }
     public RVTextSection Text { get; }
@@ -42,8 +42,9 @@ public sealed class RiscVProgram
             entrySymbol)
     {
     }
-
-    public string FormatText(RiscVAssemblyWriterOptions? options = null)
+    public string Disassemble()
+        => RiscVDisassembler.Disassemble(this, null);
+    public string Disassemble(RiscVAssemblyWriterOptions? options)
         => RiscVDisassembler.Disassemble(this, options);
 
     public RiscVProgram Link(params RiscVProgram[] objects)

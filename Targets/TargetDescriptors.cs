@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Text;
 
@@ -85,6 +86,12 @@ public enum TargetArchitectureFeatures : ulong
     ArmVfpD32 = 1UL << 57,
     ArmNeon = 1UL << 58,
     ArmHardFloat = 1UL << 59,
+}
+
+public interface IProgram
+{
+    byte[] ToExecutableBytes(ulong imageBase = 0, IReadOnlyDictionary<string, ulong>? externalSymbols = null);
+    string Disassemble();
 }
 
 internal enum RegisterClass : byte

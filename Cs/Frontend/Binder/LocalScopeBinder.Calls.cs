@@ -1117,11 +1117,11 @@ namespace Cnidaria.Cs
                     ? LookupMethods(receiverTypeParameter, name)
                     : LookupInstanceMethods(receiverTypeParameter, name, context)
                 : LookupMethods(receiverType!, name);
-            if (candidates.IsDefaultOrEmpty && receiverTypeParameter is null && receiverValue is not null && receiverType!.TypeKind == TypeKind.Interface)
+            if (receiverTypeParameter is null && receiverValue is not null && receiverType!.TypeKind == TypeKind.Interface)
             {
-                var objectType = context.Compilation.GetSpecialType(SpecialType.System_Object) as NamedTypeSymbol;
-                if (objectType is not null)
-                    candidates = LookupMethods(objectType, name);
+                var builder = candidates.ToBuilder();
+                AddObjectInstanceMethods(builder, name, context);
+                candidates = builder.ToImmutable();
             }
             if (receiverValue is null)
             {
@@ -1751,6 +1751,9 @@ namespace Cnidaria.Cs
                         }
                     }
 
+                    if (receiverValue is not null && receiverType.TypeKind == TypeKind.Interface)
+                        AddObjectInstanceMethods(methodBuilder, name, context);
+
                     var methods = ApplyExplicitTypeArgumentsToMethodGroup(
                         ma.Name,
                         methodBuilder.ToImmutable(),
@@ -1873,7 +1876,8 @@ namespace Cnidaria.Cs
 
             bool canWriteProperty =
                 prop.SetMethod is not null &&
-                AccessibilityHelper.IsAccessible(prop.SetMethod, context);
+                AccessibilityHelper.IsAccessible(prop.SetMethod, context) &&
+                (!prop.SetMethod.IsInitOnly || CanAssignInitOnlyProperty(receiverValue, context));
             if (valueKind == BindValueKind.RValue && !canReadProperty)
             {
                 diagnostics.Add(new Diagnostic("CN_MEMACC020", DiagnosticSeverity.Error,
@@ -2204,32 +2208,37 @@ namespace Cnidaria.Cs
                     builder.Add(method);
             }
 
-            if ((typeParameter.GenericConstraint & GenericConstraintsFlags.AllowsRefStruct) == 0 &&
-                context.Compilation.GetSpecialType(SpecialType.System_Object) is NamedTypeSymbol objectType)
-            {
-                var objectMethods = LookupMethods(objectType, name);
-                for (int i = 0; i < objectMethods.Length; i++)
-                {
-                    var method = objectMethods[i];
-                    if (method.IsStatic)
-                        continue;
-
-                    bool duplicate = false;
-                    for (int j = 0; j < builder.Count; j++)
-                    {
-                        if (SameSignature(builder[j], method))
-                        {
-                            duplicate = true;
-                            break;
-                        }
-                    }
-
-                    if (!duplicate)
-                        builder.Add(method);
-                }
-            }
+            if ((typeParameter.GenericConstraint & GenericConstraintsFlags.AllowsRefStruct) == 0)
+                AddObjectInstanceMethods(builder, name, context);
 
             return builder.ToImmutable();
+        }
+        private static void AddObjectInstanceMethods(
+            ImmutableArray<MethodSymbol>.Builder builder,
+            string name,
+            BindingContext context)
+        {
+            if (context.Compilation.GetSpecialType(SpecialType.System_Object) is not NamedTypeSymbol objectType)
+                return;
+
+            foreach (MethodSymbol method in LookupMethods(objectType, name))
+            {
+                if (method.IsStatic || !AccessibilityHelper.IsAccessible(method, context))
+                    continue;
+
+                bool duplicate = false;
+                for (int i = 0; i < builder.Count; i++)
+                {
+                    if (SameSignature(builder[i], method))
+                    {
+                        duplicate = true;
+                        break;
+                    }
+                }
+
+                if (!duplicate)
+                    builder.Add(method);
+            }
         }
         private static ImmutableArray<MethodSymbol> LookupMethods(TypeParameterSymbol typeParameter, string name)
         {
@@ -2715,6 +2724,7 @@ namespace Cnidaria.Cs
             switch (initializer.Kind)
             {
                 case SyntaxKind.ObjectInitializerExpression:
+                case SyntaxKind.WithInitializerExpression:
                     AppendObjectInitializerEffects(
                         initializer,
                         tempExpr,
@@ -2768,6 +2778,7 @@ namespace Cnidaria.Cs
             if (stableReceiver is null)
                 return;
 
+            var initializedMembers = new HashSet<string>(StringComparer.Ordinal);
             for (int i = 0; i < initializer.Expressions.Count; i++)
             {
                 var element = initializer.Expressions[i];
@@ -2789,6 +2800,12 @@ namespace Cnidaria.Cs
                         DiagnosticSeverity.Error,
                         "Object initializer member must be a simple identifier.",
                         new Location(context.SemanticModel.SyntaxTree, assign.Left.Span)));
+                    continue;
+                }
+                if (!initializedMembers.Add(memberName))
+                {
+                    diagnostics.Add(new Diagnostic("CS1912", DiagnosticSeverity.Error,
+                        $"Duplicate initialization of member '{memberName}'.", new Location(context.SemanticModel.SyntaxTree, assign.Left.Span)));
                     continue;
                 }
                 // Nested object initializer
@@ -3052,7 +3069,7 @@ namespace Cnidaria.Cs
             BindingContext context,
             DiagnosticBag diagnostics)
         {
-            var receiverType = GetReceiverTypeForMemberLookup(receiver.Type);
+            var receiverType = GetReceiverTypeForMemberLookup(receiver.Type, context);
             if (receiverType is null)
             {
                 diagnostics.Add(new Diagnostic(
@@ -3064,6 +3081,8 @@ namespace Cnidaria.Cs
             }
 
             var members = LookupMembers(receiverType, memberName);
+            if (members.IsDefaultOrEmpty && receiver.Type is TypeParameterSymbol parameter)
+                members = LookupConstraintMembers(parameter, memberName);
             if (members.IsDefaultOrEmpty)
             {
                 diagnostics.Add(new Diagnostic(

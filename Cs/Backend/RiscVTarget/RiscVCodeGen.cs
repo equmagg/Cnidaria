@@ -6782,14 +6782,17 @@ namespace Cnidaria.Cs
                             EmitAllocateNewArray(node, method);
                             return;
                         }
-                        if (RiscVRuntime.IsGcSafePointInternalCall(method))
+                        if (RiscVRuntime.IsFastAllocateStringInternalCall(method))
                         {
                             EmitFastAllocateString(node, method);
                             return;
                         }
 
-                        _owner.EmitPcrelTransfer(_owner.ResolveMethodLabel(method), link: true);
-                        return;
+                        if (!RiscVRuntime.IsGcSafePointInternalCall(method))
+                        {
+                            _owner.EmitPcrelTransfer(_owner.ResolveMethodLabel(method), link: true);
+                            return;
+                        }
                     }
                     if (Target.OperatingSystem == OperatingSystemKind.Linux &&
                         string.Equals(method.DeclaringType.Namespace, "System.Runtime.InteropServices", StringComparison.Ordinal) &&
@@ -7803,7 +7806,7 @@ namespace Cnidaria.Cs
                     address = PreserveLoadAddress(
                         node,
                         address,
-                        singleLoad: abi.PassingKind == AbiValuePassingKind.ScalarRegister && !IsAggregate(type, kind));
+                        singleLoad: abi.PassingKind == AbiValuePassingKind.ScalarRegister && !IsAggregate(type, kind) && (node.Flags & GenTreeFlags.Unaligned) == 0);
 
                     if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
                     {
@@ -7839,9 +7842,9 @@ namespace Cnidaria.Cs
                     if (result.IsRegister)
                     {
                         if (IsAggregate(type, kind) && segments.Length == 1)
-                            EmitAggregateSegmentLoad(result.Register, address, checked(offset + segments[0].Offset), segments[0]);
+                            EmitAggregateSegmentLoad(result.Register, address, checked(offset + segments[0].Offset), segments[0], unaligned: (node.Flags & GenTreeFlags.Unaligned) != 0);
                         else
-                            EmitMemoryLoad(result.Register, address, offset, size, signed);
+                            EmitMemoryLoad(result.Register, address, offset, size, signed, unaligned: (node.Flags & GenTreeFlags.Unaligned) != 0);
                         return;
                     }
 
@@ -7854,9 +7857,9 @@ namespace Cnidaria.Cs
                             _ => MachineRegister.X30,
                         };
                         if (IsAggregate(type, kind) && segments.Length == 1)
-                            EmitAggregateSegmentLoad(scratch, address, checked(offset + segments[0].Offset), segments[0]);
+                            EmitAggregateSegmentLoad(scratch, address, checked(offset + segments[0].Offset), segments[0], unaligned: (node.Flags & GenTreeFlags.Unaligned) != 0);
                         else
-                            EmitMemoryLoad(scratch, address, offset, size, signed);
+                            EmitMemoryLoad(scratch, address, offset, size, signed, unaligned: (node.Flags & GenTreeFlags.Unaligned) != 0);
                         EmitStore(result, scratch, accessType, accessKind);
                         return;
                     }
@@ -7995,9 +7998,9 @@ namespace Cnidaria.Cs
                     if (source.IsRegister)
                     {
                         if (IsAggregate(type, kind) && segments.Length == 1)
-                            EmitAggregateSegmentStore(source.Register, address, checked(offset + segments[0].Offset), segments[0]);
+                            EmitAggregateSegmentStore(source.Register, address, checked(offset + segments[0].Offset), segments[0], unaligned: (node.Flags & GenTreeFlags.Unaligned) != 0);
                         else
-                            EmitMemoryStore(source.Register, address, offset, size);
+                            EmitMemoryStore(source.Register, address, offset, size, unaligned: (node.Flags & GenTreeFlags.Unaligned) != 0);
                         return;
                     }
 
@@ -8010,7 +8013,7 @@ namespace Cnidaria.Cs
                             _ => MachineRegister.X30,
                         };
                         EmitLoad(scratch, source, accessType, accessKind);
-                        EmitMemoryStore(scratch, address, offset, size);
+                        EmitMemoryStore(scratch, address, offset, size, unaligned: (node.Flags & GenTreeFlags.Unaligned) != 0);
                         return;
                     }
 
@@ -8033,7 +8036,7 @@ namespace Cnidaria.Cs
                         RegisterOperand destination = node.Results[i];
                         if (destination.IsRegister)
                         {
-                            EmitAggregateSegmentLoad(destination.Register, address, segment);
+                            EmitAggregateSegmentLoad(destination.Register, address, segment, unaligned: (node.Flags & GenTreeFlags.Unaligned) != 0);
                             continue;
                         }
 
@@ -8042,7 +8045,7 @@ namespace Cnidaria.Cs
                             MachineRegister scratch = segment.RegisterClass == RegisterClass.Float
                                 ? MachineRegister.F28
                                 : MachineRegister.X30;
-                            EmitAggregateSegmentLoad(scratch, address, segment);
+                            EmitAggregateSegmentLoad(scratch, address, segment, unaligned: (node.Flags & GenTreeFlags.Unaligned) != 0);
                             EmitAggregateSegmentStore(
                                 scratch,
                                 FrameBase(destination),
@@ -8091,30 +8094,32 @@ namespace Cnidaria.Cs
                             throw Unsupported(node, "Multi-register store fragment has no source");
                         }
 
-                        EmitAggregateSegmentStore(value, address, segment);
+                        EmitAggregateSegmentStore(value, address, segment, unaligned: (node.Flags & GenTreeFlags.Unaligned) != 0);
                     }
                 }
 
                 private void EmitAggregateSegmentLoad(
                     MachineRegister destination,
                     RVRegister baseRegister,
-                    AbiRegisterSegment segment)
+                    AbiRegisterSegment segment,
+                    bool unaligned = false)
                 {
-                    EmitAggregateSegmentLoad(destination, baseRegister, segment.Offset, segment);
+                    EmitAggregateSegmentLoad(destination, baseRegister, segment.Offset, segment, unaligned);
                 }
 
                 private void EmitAggregateSegmentLoad(
                     MachineRegister destination,
                     RVRegister baseRegister,
                     int offset,
-                    AbiRegisterSegment segment)
+                    AbiRegisterSegment segment,
+                    bool unaligned = false)
                 {
                     if (MachineRegisters.GetClass(destination) != segment.RegisterClass)
                         throw new InvalidOperationException("Aggregate load destination register class does not match its ABI segment.");
 
                     if (segment.RegisterClass == RegisterClass.Float)
                     {
-                        EmitMemoryLoad(destination, baseRegister, offset, segment.Size, signed: false);
+                        EmitMemoryLoad(destination, baseRegister, offset, segment.Size, signed: false, unaligned: unaligned);
                         return;
                     }
 
@@ -8124,23 +8129,25 @@ namespace Cnidaria.Cs
                 private void EmitAggregateSegmentStore(
                     MachineRegister source,
                     RVRegister baseRegister,
-                    AbiRegisterSegment segment)
+                    AbiRegisterSegment segment,
+                    bool unaligned = false)
                 {
-                    EmitAggregateSegmentStore(source, baseRegister, segment.Offset, segment);
+                    EmitAggregateSegmentStore(source, baseRegister, segment.Offset, segment, unaligned);
                 }
 
                 private void EmitAggregateSegmentStore(
                     MachineRegister source,
                     RVRegister baseRegister,
                     int offset,
-                    AbiRegisterSegment segment)
+                    AbiRegisterSegment segment,
+                    bool unaligned = false)
                 {
                     if (MachineRegisters.GetClass(source) != segment.RegisterClass)
                         throw new InvalidOperationException("Aggregate store source register class does not match its ABI segment.");
 
                     if (segment.RegisterClass == RegisterClass.Float)
                     {
-                        EmitMemoryStore(source, baseRegister, offset, segment.Size);
+                        EmitMemoryStore(source, baseRegister, offset, segment.Size, unaligned: unaligned);
                         return;
                     }
 
@@ -9039,11 +9046,30 @@ namespace Cnidaria.Cs
                 private bool UseSignedScalarLoad(RuntimeType? type, GenStackKind kind, int size)
                     => IsSigned(type, kind) || (MachineTarget.Is64Bit && size == 4 && IsI4(type, kind));
 
-                private void EmitMemoryLoad(MachineRegister destination, RVRegister baseRegister, int offset, int size, bool signed, RVRegister preserve = RVRegister.Invalid)
+                private void EmitMemoryLoad(MachineRegister destination, RVRegister baseRegister, int offset, int size, bool signed, RVRegister preserve = RVRegister.Invalid, bool unaligned = false)
                 {
                     if (MachineRegisters.GetClass(destination) == RegisterClass.Vector)
                     {
                         EmitVectorMemory(ToRegister(destination), baseRegister, offset, size, load: true);
+                        return;
+                    }
+                    if (unaligned && size > 1)
+                    {
+                        if (MachineRegisters.GetClass(destination) == RegisterClass.Float)
+                        {
+                            EmitUnalignedFloatMemory(destination, baseRegister, offset, size, load: true);
+                        }
+                        else
+                        {
+                            EmitIntegerFragmentLoad(destination, baseRegister, offset, size);
+                            int shift = (Target.GeneralRegisterSize - size) * 8;
+                            if (signed && shift != 0)
+                            {
+                                RVRegister result = ToIntegerRegister(destination);
+                                _owner.Emit(RVInstruction.I(RVInstrKind.Slli, result, result, shift));
+                                _owner.Emit(RVInstruction.I(RVInstrKind.Srai, result, result, shift));
+                            }
+                        }
                         return;
                     }
                     if (!FitsSignedImmediate(offset, 12))
@@ -9080,11 +9106,19 @@ namespace Cnidaria.Cs
                     _owner.Emit(RVInstruction.I(opcode, ToRegister(destination), baseRegister, offset));
                 }
 
-                private void EmitMemoryStore(MachineRegister source, RVRegister baseRegister, int offset, int size, RVRegister preserve = RVRegister.Invalid)
+                private void EmitMemoryStore(MachineRegister source, RVRegister baseRegister, int offset, int size, RVRegister preserve = RVRegister.Invalid, bool unaligned = false)
                 {
                     if (MachineRegisters.GetClass(source) == RegisterClass.Vector)
                     {
                         EmitVectorMemory(ToRegister(source), baseRegister, offset, size, load: false);
+                        return;
+                    }
+                    if (unaligned && size > 1)
+                    {
+                        if (MachineRegisters.GetClass(source) == RegisterClass.Float)
+                            EmitUnalignedFloatMemory(source, baseRegister, offset, size, load: false);
+                        else
+                            EmitIntegerFragmentStore(source, baseRegister, offset, size);
                         return;
                     }
                     if (!FitsSignedImmediate(offset, 12))
@@ -9118,6 +9152,37 @@ namespace Cnidaria.Cs
                     }
 
                     _owner.Emit(RVInstruction.S(opcode, ToRegister(source), baseRegister, offset));
+                }
+
+                private void EmitUnalignedFloatMemory(MachineRegister value, RVRegister address, int offset, int size, bool load)
+                {
+                    GenStackKind kind = size == 4 ? GenStackKind.R4 : GenStackKind.R8;
+                    if (size <= Target.GeneralRegisterSize)
+                    {
+                        if (load)
+                        {
+                            EmitIntegerFragmentLoad(MachineRegister.X30, address, offset, size);
+                            EmitRegisterMove(value, MachineRegister.X30, null, kind);
+                        }
+                        else
+                        {
+                            EmitRegisterMove(MachineRegister.X30, value, null, kind);
+                            EmitIntegerFragmentStore(MachineRegister.X30, address, offset, size);
+                        }
+                        return;
+                    }
+
+                    _owner.EmitAdjustStack(-Target.CallFrameAlignment);
+                    if (!load)
+                        EmitMemoryStore(value, RVRegister.X2, 0, size);
+                    for (int i = 0; i < size; i++)
+                    {
+                        EmitMemoryLoad(MachineRegister.X30, load ? address : RVRegister.X2, load ? checked(offset + i) : i, 1, signed: false);
+                        EmitMemoryStore(MachineRegister.X30, load ? RVRegister.X2 : address, load ? i : checked(offset + i), 1);
+                    }
+                    if (load)
+                        EmitMemoryLoad(value, RVRegister.X2, 0, size, signed: false);
+                    _owner.EmitAdjustStack(Target.CallFrameAlignment);
                 }
 
                 private RegisterOperand FrameSlotForLocalLike(GenTree node, RuntimeType? type, GenStackKind kind, RegisterClass registerClass)

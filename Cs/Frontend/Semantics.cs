@@ -56,8 +56,7 @@ namespace Cnidaria.Cs
     }
     /// <summary>Identifies the declaration form or semantic category of a type</summary>
     public enum TypeKind : byte { Class, Struct, Interface, Enum, Delegate, Error, Dynamic, Unknown, FunctionPointer }
-    /// <summary>Specifies the severity of a diagnostic</summary>
-    public enum DiagnosticSeverity : byte { Hidden, Info, Warning, Error }
+
     /// <summary>Identifies the semantic category of a symbol</summary>
     public enum SymbolKind : byte
     {
@@ -168,20 +167,14 @@ namespace Cnidaria.Cs
         public override string ToString() => $"{Span}";
         public string ToString(string sorce) => Span.ToString(sorce);
     }
-    /// <summary>Provides formatted diagnostic text and severity</summary>
-    public interface IDiagnostic
-    {
-        public string GetMessage();
-        public string GetMessage(string source);
-        public DiagnosticSeverity GetSeverity();
-    }
     /// <summary>Represents one diagnostic associated with a source location</summary>
     public readonly struct Diagnostic : IDiagnostic
     {
         public readonly string Id;
-        public readonly DiagnosticSeverity Severity;
-        public readonly string Message;
+        public readonly DiagnosticSeverity Severity { get; }
+        public readonly string Message { get; }
         public readonly Location Location;
+        public readonly TextSpan Position => Location.Span;
 
         public Diagnostic(string id, DiagnosticSeverity severity, string message, Location location)
         {
@@ -1123,6 +1116,9 @@ namespace Cnidaria.Cs
                         foreach (var body in IRLowering.GetIteratorStateMachineBodies(compilation, iteratorInfo))
                             Lower(body);
                     }
+                    foreach (var record in RecordBinder.GetRecords(compilation).Where(r => ReferenceEquals(r.Tree, tree)))
+                        foreach (var body in record.Bodies)
+                            Lower(body);
                     foreach (var ctor in EnumerateSynthesizedInstanceCtorsInTree(rootNs, tree))
                     {
                         if (loweredMethods.Contains(ctor))
@@ -1299,7 +1295,7 @@ namespace Cnidaria.Cs
         // that does not chain to this(...), which runs them instead.
         private static bool RunsInstanceFieldInitializers(MethodSymbol method, SyntaxNode ownerSyntax)
         {
-            if (method.IsStatic || !method.IsConstructor)
+            if (method.IsStatic || !method.IsConstructor || RecordBinder.IsCopyConstructor(method))
                 return false;
 
             return ownerSyntax is not ConstructorDeclarationSyntax ctorSyntax ||
@@ -1321,14 +1317,15 @@ namespace Cnidaria.Cs
             MethodSymbol ctor)
             => BuildFieldInitializerStatements(compilation, tree, model, ctor, staticFields: false);
 
-        private static ImmutableArray<BoundStatement> BuildFieldInitializerStatements(
+        internal static ImmutableArray<BoundStatement> BuildFieldInitializerStatements(
             Compilation compilation,
             SyntaxTree tree,
             SemanticModel model,
             MethodSymbol initializerOwner,
-            bool staticFields)
+            bool staticFields,
+            DiagnosticBag? diagnostics = null)
         {
-            var bag = new DiagnosticBag();
+            var bag = diagnostics ?? new DiagnosticBag();
 
             IBindingRecorder recorder =
                 model is IBindingRecorder r ? r : NullRecorder.Instance;
@@ -1349,6 +1346,17 @@ namespace Cnidaria.Cs
                 if (!TryGetMemberInitializer(members[i], staticFields, out var fs, out var declaration, out var initializer))
                     continue;
 
+                var initializerTree = members[i].DeclaringSyntaxReferences[0].SyntaxTree;
+                if (!ReferenceEquals(tree, initializerTree))
+                {
+                    tree = initializerTree;
+                    model = compilation.GetSemanticModel(tree);
+                    recorder = model is IBindingRecorder initializerRecorder ? initializerRecorder : NullRecorder.Instance;
+                    importScopeMap = ImportsBuilder.BuildImportScopeMap(compilation, tree, recorder, bag);
+                    typeBinder = new TypeBinder(parent: null, flags: BinderFlags.None, compilation: compilation, importScopeMap: importScopeMap);
+                    exprBinder = new LocalScopeBinder(parent: typeBinder, flags: binderFlags, containing: initializerOwner);
+                    ctx = new BindingContext(compilation, model, initializerOwner, recorder);
+                }
                 var rhsSyntax = initializer.Value;
                 var rhsBound = exprBinder.BindExpressionWithTargetType(
                     exprSyntax: rhsSyntax,
@@ -1929,6 +1937,8 @@ namespace Cnidaria.Cs
                     }
                 }
             }
+            foreach (var record in RecordBinder.GetRecords(Compilation).Where(r => ReferenceEquals(r.Tree, SyntaxTree)))
+                RecordBinder.BindBodies(Compilation, record, this, typeBinder, recorder, bag);
             _diagnosticsCache = bag.ToImmutable();
         }
         private static bool HasModifier(SyntaxTokenList modifiers, SyntaxKind kind)
@@ -2073,38 +2083,6 @@ namespace Cnidaria.Cs
             if (isGetter)
             {
                 var stmts = ImmutableArray.CreateBuilder<BoundStatement>(initialCapacity: 4);
-                if (propertySyntax.Initializer is not null && backingField.Type.IsReferenceType)
-                {
-                    // Skip initialization when the backing field is already set
-                    var boolType = Compilation.GetSpecialType(SpecialType.System_Boolean);
-                    var fieldRead1 = FieldAccess(isLValue: false);
-                    var nullLit = new BoundLiteralExpression(ownerSyntax, backingField.Type, null);
-                    var notNull = new BoundBinaryExpression(
-                        ownerSyntax,
-                        BoundBinaryOperatorKind.NotEquals,
-                        boolType,
-                        fieldRead1,
-                        nullLit,
-                        Optional<object>.None);
-                    var done = LabelSymbol.CreateGenerated("<auto_prop_get_done>", method);
-                    stmts.Add(new BoundConditionalGotoStatement(ownerSyntax, notNull, done, jumpIfTrue: true));
-
-                    // Initialize the backing field on first access
-                    var initExpr = binder.BindExpression(propertySyntax.Initializer.Value, ctx, diagnostics);
-                    initExpr = binder.ApplyConversion(
-                        exprSyntax: propertySyntax.Initializer.Value,
-                        expr: initExpr,
-                        targetType: backingField.Type,
-                        diagnosticNode: propertySyntax.Initializer,
-                        context: ctx,
-                        diagnostics: diagnostics,
-                        requireImplicit: true);
-
-                    stmts.Add(new BoundExpressionStatement(
-                        ownerSyntax,
-                        new BoundAssignmentExpression(ownerSyntax, FieldAccess(isLValue: true), initExpr)));
-                    stmts.Add(new BoundLabelStatement(ownerSyntax, done));
-                }
                 var fieldRead2 = FieldAccess(isLValue: false);
                 stmts.Add(new BoundReturnStatement(ownerSyntax, fieldRead2));
 
@@ -2263,7 +2241,10 @@ namespace Cnidaria.Cs
             var binder = new LocalScopeBinder(parent: typeBinder, flags: flags, containing: method);
             BoundStatement? ctorInitializerStmt = null;
             if (ownerSyntax is ConstructorDeclarationSyntax ctorSyntax)
+            {
                 ctorInitializerStmt = binder.BindConstructorInitializer(ctorSyntax, ctx, diagnostics);
+                RecordBinder.ValidateConstructor(ctorSyntax, method, ctorInitializerStmt, SyntaxTree, diagnostics);
+            }
             BoundStatement boundBody;
 
             if (body != null)

@@ -1714,7 +1714,7 @@ namespace Cnidaria.Cs
                     return EmitField(frame, stack, statements, pc, npc);
 
                 case ILOpCode.Ldobj:
-                    EmitLoadIndirect(stack, statements, npc, op, ResolveTypeIn(frame, ins.Token));
+                    EmitLoadIndirect(stack, statements, npc, op, ResolveTypeIn(frame, ins.Token), ins.Prefixes);
                     return 1;
 
                 case ILOpCode.Ldind_I1:
@@ -1728,11 +1728,11 @@ namespace Cnidaria.Cs
                 case ILOpCode.Ldind_R4:
                 case ILOpCode.Ldind_R8:
                 case ILOpCode.Ldind_Ref:
-                    EmitLoadIndirect(stack, statements, npc, op, null);
+                    EmitLoadIndirect(stack, statements, npc, op, null, ins.Prefixes);
                     return 1;
 
                 case ILOpCode.Stobj:
-                    EmitStoreIndirect(stack, statements, npc, op, ResolveTypeIn(frame, ins.Token));
+                    EmitStoreIndirect(stack, statements, npc, op, ResolveTypeIn(frame, ins.Token), ins.Prefixes);
                     return 1;
 
                 case ILOpCode.Stind_I1:
@@ -1743,7 +1743,7 @@ namespace Cnidaria.Cs
                 case ILOpCode.Stind_R4:
                 case ILOpCode.Stind_R8:
                 case ILOpCode.Stind_Ref:
-                    EmitStoreIndirect(stack, statements, npc, op, null);
+                    EmitStoreIndirect(stack, statements, npc, op, null, ins.Prefixes);
                     return 1;
 
                 case ILOpCode.Initobj:
@@ -1890,20 +1890,29 @@ namespace Cnidaria.Cs
             return opcodeType;
         }
 
-        private void EmitLoadIndirect(List<StackValue> stack, List<GenTree> statements, int pc, ILOpCode op, RuntimeType? type)
+        private void EmitLoadIndirect(List<StackValue> stack, List<GenTree> statements, int pc, ILOpCode op, RuntimeType? type, CilPrefix prefixes = CilPrefix.None)
         {
             var address = Pop(stack, pc, op);
             var t = type ?? IndirectionType(op, address.Node)!;
-            PushImportedValue(stack, statements, Node(GenTreeKind.LoadIndirect, pc, op, type: t, stackKind: StackKindOf(t), operands: One(address.Node), runtimeType: t));
+            GenTree load = Node(GenTreeKind.LoadIndirect, pc, op, type: t, stackKind: StackKindOf(t), operands: One(address.Node), runtimeType: t);
+            if ((prefixes & CilPrefix.Unaligned) != 0)
+                load.Flags |= GenTreeFlags.Unaligned;
+            PushImportedValue(stack, statements, load);
         }
 
-        private void EmitStoreIndirect(List<StackValue> stack, List<GenTree> statements, int pc, ILOpCode op, RuntimeType? type)
+        private void EmitStoreIndirect(List<StackValue> stack, List<GenTree> statements, int pc, ILOpCode op, RuntimeType? type, CilPrefix prefixes = CilPrefix.None)
         {
             var value = Pop(stack, pc, op);
             var address = Pop(stack, pc, op);
             var t = type ?? IndirectionType(op, address.Node)!;
-            if (!TryRetargetStructMaterializationToAddress(statements, pc, op, address.Node, t, value.Node))
-                AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreIndirect, pc, op, operands: Two(address.Node, CoerceToStorage(value.Node, t, pc)), runtimeType: t));
+            bool unaligned = (prefixes & CilPrefix.Unaligned) != 0;
+            if (!unaligned && TryRetargetStructMaterializationToAddress(statements, pc, op, address.Node, t, value.Node))
+                return;
+
+            GenTree store = Node(GenTreeKind.StoreIndirect, pc, op, operands: Two(address.Node, CoerceToStorage(value.Node, t, pc)), runtimeType: t);
+            if (unaligned)
+                store.Flags |= GenTreeFlags.Unaligned;
+            AppendImporterStatement(statements, stack, store);
         }
 
         private void EmitInitobj(List<StackValue> stack, List<GenTree> statements, int pc, RuntimeType type)
@@ -2705,8 +2714,28 @@ namespace Cnidaria.Cs
                 return 1;
             }
 
+            if (!isVirtual && TryImportVectorElementTypeIsSupported(stack, method, npc, op))
+                return 1;
+
             if (!isVirtual && (ins.Prefixes & CilPrefix.Constrained) == 0 && TryImportHWIntrinsic(frame, stack, statements, method, npc, op))
                 return 1;
+
+            if (!isVirtual &&
+                method.HasInternalCall &&
+                method.IsStatic &&
+                !method.HasThis &&
+                method.ParameterTypes.Length == 0 &&
+                method.MethodGenericArguments.Length == 1 &&
+                IsSystemMethod(method, "System.Runtime.CompilerServices", "RuntimeHelpers", "IsReferenceOrContainsReferences"))
+            {
+                RuntimeType queriedType = method.MethodGenericArguments[0];
+                _rts.EnsureRuntimeTypeReady(queriedType);
+                bool containsReferences = queriedType.IsReferenceType ||
+                    queriedType.Kind == RuntimeTypeKind.ByRef ||
+                    queriedType.ContainsGcPointers;
+                Push(stack, ConstI4(npc, op, containsReferences ? 1 : 0));
+                return 1;
+            }
 
             if (!isVirtual &&
                 IsSystemMethod(method, "System.Runtime.CompilerServices", "RuntimeHelpers", "IsBitwiseEquatable") &&
@@ -2714,6 +2743,20 @@ namespace Cnidaria.Cs
             {
                 Push(stack, Node(GenTreeKind.ConstI4, npc, op, stackKind: GenStackKind.I4,
                     int32: RuntimeTypeSystem.IsBitwiseEquatable(method.MethodGenericArguments[0]) ? 1 : 0));
+                return 1;
+            }
+
+            // Only fold to true when the argument is provably constant already
+            if (!isVirtual &&
+                method.IsStatic &&
+                !method.HasThis &&
+                method.ParameterTypes.Length == 1 &&
+                method.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Boolean &&
+                IsSystemMethod(method, "System.Runtime.CompilerServices", "RuntimeHelpers", "IsKnownConstant") &&
+                stack.Count != 0 && TryGetImportConstant(stack[^1].Node, out _))
+            {
+                Pop(stack, npc, op);
+                Push(stack, ConstI4(npc, op, 1));
                 return 1;
             }
 
@@ -2988,6 +3031,18 @@ namespace Cnidaria.Cs
                 case ILOpCode.Ldsfld:
                     AddTypeInitializerDependency(field.DeclaringType);
                     AppendTypeInitialization(stack, statements, npc, op, field.DeclaringType);
+                    // BitConverter.IsLittleEndian is a runtime constant on little-endian targets
+                    if (
+                        field.FieldType.PrimitiveKind == RuntimePrimitiveKind.Boolean &&
+                        field.IsStatic &&
+                        _rts.Target.Endianness == TargetEndianness.Little &&
+                        field.DeclaringType.Name == "BitConverter" &&
+                        field.DeclaringType.Namespace == "System" &&
+                        field.Name == "IsLittleEndian")
+                    {
+                        Push(stack, ConstI4(npc, op, 1));
+                        return 1;
+                    }
                     PushImportedValue(stack, statements, Node(GenTreeKind.StaticField, npc, op, type: field.FieldType, stackKind: StackKindOf(field.FieldType),
                         field: field, int64: ins.Token));
                     return 1;
@@ -6421,7 +6476,7 @@ namespace Cnidaria.Cs
         {
             GenTreeFlags flags = GenTreeFlags.None;
             for (int i = 0; i < operands.Length; i++)
-                flags |= operands[i].Flags & ~(GenTreeFlags.AssertionProperties | GenTreeFlags.ExplicitInit);
+                flags |= operands[i].Flags & ~(GenTreeFlags.AssertionProperties | GenTreeFlags.ExplicitInit | GenTreeFlags.Unaligned);
 
             switch (kind)
             {

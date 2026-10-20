@@ -2122,8 +2122,8 @@ namespace Cnidaria.Cs
             if (context.ContainingSymbol is not MethodSymbol method)
                 return false;
 
-            // Constructors are exempt and static members have no this receiver
-            if (method.IsConstructor || method.IsStatic)
+            // Constructors and init accessors can mutate this; static members have no receiver
+            if (method.IsConstructor || method.IsInitOnly || method.IsStatic)
                 return false;
 
             return method.ContainingSymbol is NamedTypeSymbol nt && nt.IsReadOnlyStruct;
@@ -2186,8 +2186,8 @@ namespace Cnidaria.Cs
             if (!field.IsReadOnly)
                 return false;
 
-            // The constructor must belong to the containing type
-            if (context.ContainingSymbol is not MethodSymbol method || !method.IsConstructor)
+            // Only a constructor or init accessor of the declaring type can write its readonly fields
+            if (context.ContainingSymbol is not MethodSymbol method || (!method.IsConstructor && !method.IsInitOnly))
                 return false;
 
             if (!ReferenceEquals(method.ContainingSymbol, field.ContainingSymbol))

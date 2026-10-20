@@ -4779,9 +4779,16 @@ namespace Cnidaria.Cs
                             EmitAllocateNewArray(node, method);
                             return;
                         }
-                        if (ArmRuntime.IsGcSafePointInternalCall(method))
+                        if (ArmRuntime.IsFastAllocateStringInternalCall(method))
                         {
                             EmitFastAllocateString(node, method);
+                            return;
+                        }
+                        if (ArmRuntime.IsGcSafePointInternalCall(method))
+                        {
+                            SafePointDraft safePoint = PrepareSafePoint(node);
+                            _owner.EmitCall(_owner.ResolveMethodLabel(method));
+                            _owner.DefineLabel(safePoint.ReturnLabel);
                             return;
                         }
                     }

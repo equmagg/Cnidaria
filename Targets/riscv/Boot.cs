@@ -1265,7 +1265,7 @@ public static class RiscVUserland
     private static RiscVProgram RequireProgram(Cnidaria.C.StaticLinkResult<RiscVProgram> linked, string what)
     {
         var errors = linked.Diagnostics
-            .Where(static diagnostic => diagnostic.Severity == Cnidaria.C.DiagnosticSeverity.Error)
+            .Where(static diagnostic => diagnostic.Severity == DiagnosticSeverity.Error)
             .Select(static diagnostic => diagnostic.ToString())
             .ToArray();
         if (errors.Length != 0 || linked.Program is null)
@@ -1336,7 +1336,7 @@ public static class RiscVUserland
             includeStandardHeaders: true,
             options: options);
         var diagnostics = compilation.GetDiagnostics()
-            .Where(static d => d.Severity == Cnidaria.C.DiagnosticSeverity.Error)
+            .Where(static d => d.Severity == DiagnosticSeverity.Error)
             .Select(d => d.Message)
             .ToArray();
         if (diagnostics.Length != 0)
@@ -1428,7 +1428,7 @@ public static class RiscVKernel
             includeStandardHeaders: false,
             options: options);
         var diagnostics = compilation.GetDiagnostics()
-            .Where(static d => d.Severity == Cnidaria.C.DiagnosticSeverity.Error)
+            .Where(static d => d.Severity == DiagnosticSeverity.Error)
             .Select(d => d.Message)
             .ToArray();
         if (diagnostics.Length != 0)

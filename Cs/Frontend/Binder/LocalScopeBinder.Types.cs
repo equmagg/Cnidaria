@@ -152,8 +152,13 @@ namespace Cnidaria.Cs
             ConstructorDeclarationSyntax ctorSyntax,
             BindingContext context,
             DiagnosticBag diagnostics)
+            => BindConstructorInitializer(ctorSyntax.Initializer, context, diagnostics);
+
+        internal BoundStatement? BindConstructorInitializer(
+            ConstructorInitializerSyntax? initSyntax,
+            BindingContext context,
+            DiagnosticBag diagnostics)
         {
-            var initSyntax = ctorSyntax.Initializer;
             if (initSyntax is null)
                 return null;
             if (context.ContainingSymbol is not MethodSymbol method || !method.IsConstructor)

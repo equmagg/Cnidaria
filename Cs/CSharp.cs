@@ -14,7 +14,7 @@ namespace Cnidaria.Cs;
 public static class CSharp
 {
     private static bool HasErrors(List<IDiagnostic> diags)
-        => diags.Any(x => x.GetSeverity() == DiagnosticSeverity.Error);
+        => diags.Any(x => x.Severity == DiagnosticSeverity.Error);
 
     private static void AddDiagnostics<TDiagnostic>(List<IDiagnostic> target, IEnumerable<TDiagnostic> source)
     {
@@ -458,14 +458,16 @@ public static class CSharp
     /// Compiles source code to register based bytecode image as a byte array
     /// </summary>
     public static (byte[]? image, List<IDiagnostic> diagnostics) CompileApplicationToRunnableBytes(
-        string source,
-        byte[]? externalLibImage = null)
+        string source, byte[]? externalLibImage = null, TargetInfo? target = null)
     {
-        var diagnostics = new List<IDiagnostic>(ExtendedLibrary.diags);
+        target ??= TargetInfo.Default;
+        var stdLibrary = target.PointerSize == 4 ? StandardLibrary32Bit : StandardLibrary64Bit;
+        var extLibrary = target.PointerSize == 4 ? ExtendedLibrary32Bit : ExtendedLibrary64Bit;
+        var diagnostics = new List<IDiagnostic>(extLibrary.diags);
 
         try
         {
-            var options = new LexerOptions { TargetPointerSize = TargetArchitecture.PointerSize };
+            var options = new LexerOptions { TargetPointerSize = target.PointerSize };
             var parser = new Parser(source, options);
             var root = parser.Parse();
             AddDiagnostics(diagnostics, parser.LexerDiagnostics);
@@ -482,10 +484,10 @@ public static class CSharp
             var tree = new SyntaxTree(root, "app", source);
             var trees = ImmutableArray.Create(tree);
             var refs = external != null
-                ? new MetadataReferenceSet(new[] { StandardLibrary, ExtendedLibrary.meta, external })
-                : new MetadataReferenceSet(new[] { StandardLibrary, ExtendedLibrary.meta });
+                ? new MetadataReferenceSet(new[] { stdLibrary, extLibrary.meta, external })
+                : new MetadataReferenceSet(new[] { stdLibrary, extLibrary.meta });
 
-            var compilation = CompilationFactory.Create(trees, refs, out var declDiag);
+            var compilation = CompilationFactory.Create(trees, refs, new CompilationOptions(target), out var declDiag);
             AddDiagnostics(diagnostics, declDiag);
             if (HasErrors(diagnostics))
                 return (null, diagnostics);
@@ -506,8 +508,8 @@ public static class CSharp
             byte[] moduleImage = EcmaImageWriter.Write(md);
             EcmaMetadata appMeta = new EcmaMetadata(moduleImage);
 
-            var stdModule = new RuntimeModule(StandardLibrary.ModuleName, StandardLibrary);
-            var extStdModule = new RuntimeModule(ExtendedLibrary.meta.ModuleName, ExtendedLibrary.meta);
+            var stdModule = new RuntimeModule(stdLibrary.ModuleName, stdLibrary);
+            var extStdModule = new RuntimeModule(extLibrary.meta.ModuleName, extLibrary.meta);
             var appModule = new RuntimeModule(appMeta.ModuleName, appMeta);
             var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal);
 
@@ -523,11 +525,11 @@ public static class CSharp
                 AddUnique(new RuntimeModule(external.ModuleName, external));
             AddUnique(appModule);
 
-            var rts = new RuntimeTypeSystem(modules);
+            var rts = new RuntimeTypeSystem(modules, target);
             ImmutableArray<int> entryRoots = FindRunnableRegisterRoots(appMeta);
             var genTreeProgram = GenTreeBuilder.BuildReachableProgram(modules, rts, appModule, entryRoots);
-            var backend = BackendPipeline.CompileProgram(genTreeProgram);
-            byte[] registerImage = ImageSerializer.ToBytes(backend.Image);
+            var image = BackendPipeline.CompileRbcProgram(genTreeProgram);
+            byte[] registerImage = ImageSerializer.ToBytes(image);
 
             return (SerializeRegisterRunnableApplication(moduleImage, registerImage), diagnostics);
         }
@@ -1032,7 +1034,7 @@ public static class CSharp
             var swCompile = Stopwatch.StartNew();
             var entryRuntimeMethod = rts.ResolveMethod(appModule, entryTok);
             var genTreeProgram = GenTreeBuilder.BuildReachableProgram(modules, rts, appModule, entryTok);
-            var backend = BackendPipeline.CompileProgram(genTreeProgram, new BackendOptions { Target = target });
+            var image = BackendPipeline.CompileRbcProgram(genTreeProgram, new BackendOptions { Target = target });
             swCompile.Stop();
             byte[] mem = GC.AllocateUninitializedArray<byte>(stackSize + heapSize + metaSize);
             int staticEnd = metaSize;
@@ -1053,7 +1055,7 @@ public static class CSharp
                 stackEnd: stackEnd,
                 rts: rts,
                 modules: modules,
-                image: backend.Image,
+                image: image,
                 textWriter: writer);
 
             VmValue[]? initialArgs = null;
@@ -1062,7 +1064,7 @@ public static class CSharp
 
             host?.Invoke(new HostInterface(regVm, rts, modules));
 
-            int entryPc = backend.Image.GetMethod(entryRuntimeMethod.MethodId).EntryPc;
+            int entryPc = image.GetMethod(entryRuntimeMethod.MethodId).EntryPc;
             var sw = Stopwatch.StartNew();
             if (initialArgs != null)
                 regVm.Execute(entryPc, cts.Token, execLimits, initialArgs);
@@ -1240,7 +1242,7 @@ public static class CSharp
         var parseDiagnostics = new List<IDiagnostic>();
         var stdTrees = ParseSyntaxTrees(sources, target, parseDiagnostics);
         if (parseDiagnostics.Count != 0)
-            throw new InvalidOperationException("std parse errors:\n" + string.Join("\n", parseDiagnostics.Select(d => d.GetMessage())));
+            throw new InvalidOperationException("std parse errors:\n" + string.Join("\n", parseDiagnostics.Select(d => d.Message)));
         var stdCompilation = CompilationFactory.CreateCoreLibrary(stdTrees, options: new CompilationOptions(target ?? TargetInfo.Default), out var stdDiagnostics);
         if (stdDiagnostics.Length != 0)
             throw new InvalidOperationException("std declaration errors:\n" + string.Join("\n", stdDiagnostics.Select(FormatLibraryDiagnostic)));
@@ -1295,7 +1297,7 @@ public static class CSharp
         {
             diagnostics.Add(diag);
         }
-        if (diagnostics.Any(x => x.GetSeverity() == DiagnosticSeverity.Error))
+        if (diagnostics.Any(x => x.Severity == DiagnosticSeverity.Error))
         {
             return (null!, diagnostics);
         }
@@ -1314,7 +1316,7 @@ public static class CSharp
         {
             diagnostics.Add(diag);
         }
-        if (diagnostics.Any(x => x.GetSeverity() == DiagnosticSeverity.Error))
+        if (diagnostics.Any(x => x.Severity == DiagnosticSeverity.Error))
         {
             return (null!, diagnostics);
         }
@@ -1339,7 +1341,8 @@ public static class CSharp
 
         var tree = new SyntaxTree(root, moduleName, source);
         var trees = ImmutableArray.Create(tree);
-        var refs = new MetadataReferenceSet(new[] { StandardLibrary });
+        var core = (target ?? TargetInfo.Default).PointerSize == 4 ? StandardLibrary32Bit : StandardLibrary64Bit;
+        var refs = new MetadataReferenceSet([core]);
         var compilation = CompilationFactory.Create(trees, refs, new CompilationOptions(target ?? TargetInfo.Default), out var declDiag);
 
         foreach (var diag in declDiag)
@@ -1367,10 +1370,93 @@ public static class CSharp
 
         return (moduleImage, moduleMetadata, diagnostics);
     }
+    public static (byte[]? image, List<IDiagnostic> diagnostics) CompileProjectSources(
+        ImmutableArray<(string Path, string Text)> sources,
+        TargetInfo target,
+        bool library = false,
+        string moduleName = "app",
+        IReadOnlyList<string>? neededLibraries = null)
+    {
+        if (target is null) throw new ArgumentNullException(nameof(target));
+        var diagnostics = new List<IDiagnostic>();
+        try
+        {
+            if (sources.IsDefaultOrEmpty)
+                throw new ArgumentException("Project requires at least one managed source.", nameof(sources));
+            var standard = target.Is32Bit ? StandardLibrary32Bit : StandardLibrary64Bit;
+            var extended = target.Is32Bit ? ExtendedLibrary32Bit : ExtendedLibrary64Bit;
+            AddDiagnostics(diagnostics, extended.diags);
+            if (HasErrors(diagnostics)) return (null, diagnostics);
+            var trees = ParseSyntaxTrees(sources, target, diagnostics);
+            if (HasErrors(diagnostics)) return (null, diagnostics);
+            var refs = new MetadataReferenceSet(new[] { standard, extended.meta });
+            var compilation = CompilationFactory.Create(trees, refs, new CompilationOptions(target), out var declarations);
+            AddDiagnostics(diagnostics, declarations);
+            if (HasErrors(diagnostics)) return (null, diagnostics);
+            var (metadata, buildDiagnostics, error) = compilation.BuildModule(
+                moduleName: moduleName,
+                includeCoreTypesInTypeDefs: false,
+                defaultExternalAssemblyName: "std",
+                externalAssemblyResolver: refs.ResolveAssemblyName,
+                print: false);
+            if (error is not null)
+                diagnostics.Add(new Diagnostic("BUILD", DiagnosticSeverity.Error, error.ToString(), default));
+            AddDiagnostics(diagnostics, buildDiagnostics);
+            if (HasErrors(diagnostics)) return (null, diagnostics);
+            var module = EcmaImageWriter.Write(metadata);
+            if (library) return (module, diagnostics);
+
+            var appMetadata = new EcmaMetadata(module);
+            var stdModule = new RuntimeModule(standard.ModuleName, standard);
+            var extendedModule = new RuntimeModule(extended.meta.ModuleName, extended.meta);
+            var appModule = new RuntimeModule(appMetadata.ModuleName, appMetadata);
+            var modules = new Dictionary<string, RuntimeModule>(StringComparer.Ordinal)
+            {
+                [stdModule.Name] = stdModule,
+                [extendedModule.Name] = extendedModule,
+                [appModule.Name] = appModule
+            };
+            if (modules.Count != 3) throw new InvalidOperationException("Duplicate runtime module name.");
+            var rts = new RuntimeTypeSystem(modules, target);
+            var program = GenTreeBuilder.BuildReachableProgram(modules, rts, appModule,
+                target.IsRegisterBytecode ? FindRunnableRegisterRoots(appMetadata) : [appModule.Md.FindEntryPointMethodDef()]);
+            if (BackendPipeline.TryCompileProgram(program, target, out var output))
+            {
+                byte[] executable;
+                if (neededLibraries is { Count: > 0 })
+                {
+                    if (target.OperatingSystem != OperatingSystemKind.Linux)
+                        throw new NotSupportedException("NativeReference executable linking not supported by the target.");
+                    executable = output switch
+                    {
+                        Cnidaria.X86.X86Program x86 => x86.ToLinuxDynamicExecutableBytes(
+                            new[] { Cnidaria.X86.X86ElfWriter.DefaultStandardLibrarySoName }.Concat(neededLibraries)),
+                        Cnidaria.RiscV.RiscVProgram rv => rv.ToLinuxDynamicExecutableBytes(
+                            new[] { Cnidaria.RiscV.RiscVElfWriter.DefaultStandardLibrarySoName }.Concat(neededLibraries)),
+                        Cnidaria.Arm.ArmProgram arm => arm.ToLinuxDynamicExecutableBytes(
+                            new[] { Cnidaria.Arm.ArmElfWriter.DefaultStandardLibrarySoName }.Concat(neededLibraries)),
+                        _ => throw new NotSupportedException("NativeReference linking is not supported by this backend.")
+                    };
+                }
+                else
+                    executable = target.IsRegisterBytecode
+                        ? SerializeRegisterRunnableApplication(module, output.ToExecutableBytes())
+                        : output.ToExecutableBytes();
+                return (executable, diagnostics);
+            }
+            diagnostics.Add(new Diagnostic("TARGET", DiagnosticSeverity.Error,
+                $"Managed code generation for {target.Architecture} is not implemented.", default));
+            return (null, diagnostics);
+        }
+        catch (Exception ex)
+        {
+            diagnostics.Add(new Diagnostic("INTERNAL", DiagnosticSeverity.Error, ex.ToString(), default));
+            return (null, diagnostics);
+        }
+    }
+
     public static (byte[]? image, List<IDiagnostic> diagnostics) CompileExternalLibraryToBytes(
-        string source,
-        string moduleName = "external",
-        TargetInfo? target = null)
+        string source, string moduleName = "external", TargetInfo? target = null)
     {
         var (moduleImage, _, diags) = CompileLibraryCore(source, moduleName, target);
         if (HasErrors(diags) || moduleImage == null)
@@ -1386,6 +1472,7 @@ public static class CSharp
         "System.Runtime.CompilerServices.cs",
         "System.Collections.cs",
         "System.Collections.Generic.cs",
+        "System.Collections.Immutable.cs",
         "System.Buffers.cs",
         "System.Threading.cs",
         "System.Globalization.cs",

@@ -6,7 +6,7 @@ using System.Text;
 
 namespace Cnidaria.X86;
 
-public sealed class X86Program
+public sealed class X86Program : IProgram
 {
     public X86Target Target { get; }
     public X86TextSection Text { get; }
@@ -42,7 +42,9 @@ public sealed class X86Program
     {
     }
 
-    public string FormatText(X86AssemblyWriterOptions? options = null)
+    public string Disassemble()
+        => X86Disassembler.Disassemble(this, null);
+    public string Disassemble(X86AssemblyWriterOptions? options)
         => X86Disassembler.Disassemble(this, options);
 
     public X86Program Link(params X86Program[] objects)

@@ -830,6 +830,9 @@ namespace Cnidaria.Cs
                 case SwitchExpressionSyntax sw:
                     result = BindSwitchExpression(sw, context, diagnostics);
                     break;
+                case WithExpressionSyntax with:
+                    result = BindWithExpression(with, context, diagnostics);
+                    break;
                 case RefExpressionSyntax re:
                     result = BindRefExpression(re, context, diagnostics);
                     break;

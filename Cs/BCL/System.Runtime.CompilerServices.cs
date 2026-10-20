@@ -5,6 +5,9 @@ using Internal.Runtime;
 
 namespace System.Runtime.CompilerServices
 {
+    public static class IsExternalInit
+    {
+    }
     [CLSCompliant(false)]
     [AttributeUsage(AttributeTargets.Field | AttributeTargets.Parameter | AttributeTargets.Property | AttributeTargets.ReturnValue | AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Event)]
     public sealed class TupleElementNamesAttribute : Attribute

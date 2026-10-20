@@ -263,6 +263,7 @@ namespace Cnidaria.Cs
         ExplicitInit = 1u << 23,
         /// <summary>Field access that addresses the parent struct's storage even though the parent is promoted.</summary>
         PromotionSync = 1u << 24,
+        Unaligned = 1u << 25,
         AssertionProperties = NullCheckEliminated | BoundsCheckEliminated | DivModNoByZero | DivModNoOverflow,
     }
     internal static class GenTreeIntrinsicSemantics

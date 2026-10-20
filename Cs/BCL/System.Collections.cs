@@ -133,8 +133,21 @@ namespace System.Collections
         public const int MaxPrimeArrayLength = 0x7FFFFFC3;
 
         public const int HashPrime = 101;
+        private const int MinPrime = 3;
 
         // Table of prime numbers to use as hash table sizes.
+        // A typical resize algorithm would pick the smallest prime number in this array
+        // that is larger than twice the previous capacity.
+        // Suppose our Hashtable currently has capacity x and enough elements are added
+        // such that a resize needs to occur. Resizing first computes 2x then finds the
+        // first prime in the table greater than 2x, i.e. if primes are ordered
+        // p_1, p_2, ..., p_i, ..., it finds p_n such that p_n-1 < 2x < p_n.
+        // Doubling is important for preserving the asymptotic complexity of the
+        // hashtable operations such as add.  Having a prime guarantees that double
+        // hashing does not lead to infinite loops.  IE, your hash function will be
+        // h1(key) + i*h2(key), 0 <= i < size.  h2 and the size must be relatively prime.
+        // We prefer the low computation costs of higher prime numbers over the increased
+        // memory allocation of a fixed prime number i.e. when right sizing a HashSet.
         internal static ReadOnlySpan<int> Primes =>
         [
             3, 7, 11, 17, 23, 29, 37, 47, 59, 71, 89, 107, 131, 163, 197, 239, 293, 353, 431, 521, 631, 761, 919,
@@ -146,38 +159,112 @@ namespace System.Collections
 
         public static bool IsPrime(int candidate)
         {
-            if ((candidate & 1) != 0)
+            if (candidate <= MinPrime)
             {
-                int limit = (int)Math.Sqrt(candidate);
-                for (int divisor = 3; divisor <= limit; divisor += 2)
-                {
-                    if ((candidate % divisor) == 0)
-                        return false;
-                }
-                return true;
+                return candidate >= 2;
             }
-            return candidate == 2;
+            if ((candidate & 1) == 0 || candidate % MinPrime == 0)
+            {
+                return false;
+            }
+
+            return HasNoPrimeDivisors(candidate, (int)Math.Sqrt(candidate));
+        }
+
+        private static bool HasNoPrimeDivisors(int candidate, int limit)
+        {
+            // Every prime greater than 3 is 6k - 1 or 6k + 1, so test both candidates in each group.
+            for (int divisor = 5; divisor <= limit; divisor += 6)
+            {
+                if (candidate % divisor == 0 || candidate % (divisor + 2) == 0)
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         public static int GetPrime(int min)
         {
             if (min < 0)
-                throw new ArgumentException();
-
-            foreach (int prime in Primes)
             {
-                if (prime >= min)
-                    return prime;
+                throw new ArgumentException(SR.Arg_HTCapacityOverflow);
             }
 
-            // Outside of our predefined table. Compute the hard way.
-            for (int i = (min | 1); i < int.MaxValue; i += 2)
+            if (min <= MinPrime)
             {
-                if (IsPrime(i) && ((i - 1) % HashPrime != 0))
-                    return i;
+                return MinPrime;
             }
-            return min;
+
+            // A short linear scan is faster for the common small capacities.
+            const int LinearSearchCount = 16;
+
+            ReadOnlySpan<int> primes = Primes;
+            if (min <= primes[LinearSearchCount - 1])
+            {
+                for (int i = 1; i < LinearSearchCount; i++)
+                {
+                    if (primes[i] >= min)
+                    {
+                        return primes[i];
+                    }
+                }
+            }
+            else
+            {
+                int index = primes.Slice(LinearSearchCount).BinarySearch(min);
+                index = index < 0 ? ~index : index;
+                index += LinearSearchCount;
+                if ((uint)index < (uint)primes.Length)
+                {
+                    return primes[index];
+                }
+            }
+
+            return GetPrimeAtLeastCore(min);
         }
+
+        public static int GetPrimeAtLeast(int min)
+        {
+            if (min < 0)
+            {
+                throw new ArgumentException(SR.Arg_HTCapacityOverflow);
+            }
+
+            return min <= MinPrime ? MinPrime : GetPrimeAtLeastCore(min);
+        }
+
+        private static int GetPrimeAtLeastCore(int min)
+        {
+            int candidate = min | 1;
+            uint remainder = (uint)candidate % 6;
+            if (remainder == 3)
+            {
+                candidate += 2;
+            }
+
+            int increment = remainder == 1 ? 4 : 2;
+            int limit = (int)Math.Sqrt(candidate);
+            long nextLimitSquared = (long)(limit + 1) * (limit + 1);
+            while (true)
+            {
+                while (nextLimitSquared <= candidate)
+                {
+                    limit++;
+                    nextLimitSquared = (long)(limit + 1) * (limit + 1);
+                }
+
+                if ((uint)(candidate - 1) % HashPrime != 0 && HasNoPrimeDivisors(candidate, limit))
+                {
+                    return candidate;
+                }
+
+                candidate += increment;
+                increment = 6 - increment;
+            }
+        }
+
         // Returns size of hashtable to grow to.
         public static int ExpandPrime(int oldSize)
         {
@@ -198,6 +285,9 @@ namespace System.Collections
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static uint FastMod(uint value, uint divisor, ulong multiplier)
         {
+            // We use modified Daniel Lemire's fastmod algorithm (https://github.com/dotnet/runtime/pull/406),
+            // which allows to avoid the long multiplication if the divisor is less than 2**31.
+
             // This is equivalent of (uint)Math.BigMul(multiplier * value, divisor, out _).
             // This version is faster than BigMul because we only need the high bits.
             uint highbits = (uint)(((((multiplier * value) >> 32) + 1) * divisor) >> 32);

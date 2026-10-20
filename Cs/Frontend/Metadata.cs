@@ -1457,6 +1457,11 @@ namespace Cnidaria.Cs
                         int declarationMethodToken = GetMethodToken(m.ExplicitInterfaceImplementation);
                         Image.MethodImpls.Add(new MethodImplRow(typeDefRid, methodToken, declarationMethodToken));
                     }
+                    if (m.OverriddenMethod is MethodSymbol overridden && !LocalScopeBinder.AreSameType(m.ReturnType, overridden.ReturnType))
+                    {
+                        for (MethodSymbol? declaration = overridden; declaration is not null; declaration = declaration.OverriddenMethod)
+                            Image.MethodImpls.Add(new MethodImplRow(typeDefRid, methodToken, GetMethodToken(declaration)));
+                    }
                     if (m is SourceMethodSymbol source)
                     {
                         foreach (var interfaceMethod in source.ImplicitStaticInterfaceImplementations)
@@ -1609,7 +1614,7 @@ namespace Cnidaria.Cs
                     flags |= System.Reflection.MethodAttributes.Virtual;
                     if (m.IsAbstract)
                         flags |= System.Reflection.MethodAttributes.Abstract;
-                    if (!m.IsOverride)
+                    if (!m.IsOverride || m.OverriddenMethod is MethodSymbol overridden && !LocalScopeBinder.AreSameType(m.ReturnType, overridden.ReturnType))
                         flags |= System.Reflection.MethodAttributes.NewSlot;
                     if (m.IsOverride && m.IsSealed)
                         flags |= System.Reflection.MethodAttributes.Final;
@@ -1993,6 +1998,8 @@ namespace Cnidaria.Cs
         }
         private void WriteMethodReturnType(SigWriter writer, MethodSymbol method)
         {
+            if (method.IsInitOnly)
+                WriteCustomModifier(writer, true, "System.Runtime.CompilerServices", "IsExternalInit");
             if (method.ReturnsByRefReadonly && method.ReturnType is ByRefTypeSymbol byRef)
             {
                 writer.Byte((byte)SigElementType.BYREF);

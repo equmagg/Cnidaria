@@ -674,7 +674,8 @@ namespace Cnidaria.Cs
 
             bool canWriteProperty =
                 prop.SetMethod is not null &&
-                AccessibilityHelper.IsAccessible(prop.SetMethod, context);
+                AccessibilityHelper.IsAccessible(prop.SetMethod, context) &&
+                (!prop.SetMethod.IsInitOnly || CanAssignInitOnlyProperty(propReceiver, context));
             if (valueKind == BindValueKind.LValue &&
                 !prop.IsStatic &&
                 IsReadOnlyStructThisReceiver(propReceiver, context))
@@ -1831,7 +1832,8 @@ namespace Cnidaria.Cs
             }
 
             bool canReadProperty = prop!.GetMethod is not null && AccessibilityHelper.IsAccessible(prop.GetMethod, context);
-            bool canWriteProperty = prop.SetMethod is not null && AccessibilityHelper.IsAccessible(prop.SetMethod, context);
+            bool canWriteProperty = prop.SetMethod is not null && AccessibilityHelper.IsAccessible(prop.SetMethod, context) &&
+                (!prop.SetMethod.IsInitOnly || CanAssignInitOnlyProperty(receiver, context));
 
             if (valueKind == BindValueKind.RValue && !canReadProperty)
             {

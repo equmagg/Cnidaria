@@ -843,7 +843,7 @@ namespace Cnidaria.Cs
                             throw new NotSupportedException($"Opcode not supported: {ins.Op}");
                     }
                 }
-                catch (Exception hostEx) when (hostEx is DivideByZeroException || hostEx is OverflowException)
+                catch (Exception hostEx) when (hostEx is DivideByZeroException || hostEx is OverflowException || hostEx is NullReferenceException)
                 {
                     if (_exceptionTranslationDepth != 0)
                         throw;
@@ -3941,6 +3941,9 @@ namespace Cnidaria.Cs
                     || TryCreateCoreException("System", "ArithmeticException", msg, out vmEx)
                     || TryCreateCoreException("System", "Exception", msg, out vmEx);
 
+            if (hostEx is NullReferenceException)
+                return TryCreateCoreException("System", "NullReferenceException", msg, out vmEx);
+
             return false;
         }
         private void ResetEvalStackForExceptionHandler()
@@ -6204,6 +6207,31 @@ namespace Cnidaria.Cs
                         return false;
                 }
             }
+            if (rm.IsStatic && !rm.HasThis && rm.HasInternalCall &&
+                rm.ParameterTypes.Length == 3 && totalArgs == 3 && IsVoidReturn(rm.ReturnType) &&
+                ((rm.DeclaringType.Namespace == "System" &&
+                  rm.DeclaringType.Name == "SpanHelpers" && rm.Name == "memmove") ||
+                 (rm.DeclaringType.Namespace == "System.Runtime" &&
+                  rm.DeclaringType.Name == "RuntimeImports" && rm.Name == "RhBulkMoveWithWriteBarrier")))
+            {
+                Slot lengthSlot = PopSlot();
+                Slot sourceSlot = PopSlot();
+                Slot destinationSlot = PopSlot();
+                ulong length = _rts.Target.PointerSize == 8
+                    ? unchecked((ulong)lengthSlot.AsI8Checked())
+                    : unchecked((uint)lengthSlot.AsI4Checked());
+                int size = checked((int)length);
+                if (size != 0)
+                {
+                    int destination = GetAddressAbsOrThrow(destinationSlot);
+                    int source = GetAddressAbsOrThrow(sourceSlot);
+                    CheckIndirectAccess(destination, size, writable: true);
+                    CheckIndirectAccess(source, size, writable: false);
+                    _mem.AsSpan(source, size).CopyTo(_mem.AsSpan(destination, size));
+                }
+                return true;
+            }
+
             if (rm.DeclaringType.Namespace == "System" &&
                 rm.DeclaringType.Name == "SpanHelpers" &&
                 rm.Name == "memset" &&
@@ -6246,6 +6274,15 @@ namespace Cnidaria.Cs
             }
 
             if (rm.DeclaringType.Namespace == "System.Threading" &&
+                rm.DeclaringType.Name == "Thread" && rm.Name == "FastPollGC" &&
+                rm.IsStatic && !rm.HasThis && rm.HasInternalCall &&
+                rm.ParameterTypes.Length == 0 && totalArgs == 0 && IsVoidReturn(rm.ReturnType))
+            {
+                MaybeCollectGarbage(force: false);
+                return true;
+            }
+
+            if (rm.DeclaringType.Namespace == "System.Threading" &&
                 rm.DeclaringType.Name == "ObjectHeader" &&
                 !rm.HasThis &&
                 rm.IsStatic &&
@@ -6265,6 +6302,21 @@ namespace Cnidaria.Cs
 
             if (rm.DeclaringType.Namespace == "System.Runtime" && rm.DeclaringType.Name == "RuntimeImports" && TryInvokeRuntimeTypeQuery(rm))
                 return true;
+
+            if (IsSystemMethod(rm, "System", "Object", "MemberwiseClone"))
+            {
+                Slot source = PeekSlot();
+                RuntimeType type = GetObjectTypeFromRef(source);
+                int size = GetHeapObjectSize(checked((int)source.Payload), type);
+                int clone = AllocHeapBytes(size, Math.Max(8, type.AlignOf));
+                source = PopSlot();
+                WriteI32(clone, type.TypeId);
+                WriteI32(clone + 4, GcFlagAllocated);
+                _mem.AsSpan(checked((int)source.Payload) + ObjectHeaderSize, size - ObjectHeaderSize).CopyTo(_mem.AsSpan(clone + ObjectHeaderSize));
+                _heapObjects.Add(clone);
+                PushSlot(new Slot(SlotKind.Ref, clone));
+                return true;
+            }
 
             if (rm.DeclaringType.Namespace == "System.Runtime" && rm.DeclaringType.Name == "RuntimeImports" &&
                 rm.Name is "RhGetObjectHashCode" or "RhTryGetObjectHashCode")

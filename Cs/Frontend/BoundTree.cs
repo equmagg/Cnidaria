@@ -905,7 +905,7 @@ namespace Cnidaria.Cs
     {
         public override BoundNodeKind Kind => BoundNodeKind.TypeOfExpression;
         public TypeSymbol OperandType { get; }
-        public BoundTypeOfExpression(TypeOfExpressionSyntax syntax, TypeSymbol resultType, TypeSymbol operandType)
+        public BoundTypeOfExpression(SyntaxNode syntax, TypeSymbol resultType, TypeSymbol operandType)
             : base(syntax)
         {
             Type = resultType;

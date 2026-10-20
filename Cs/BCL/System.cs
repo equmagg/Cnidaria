@@ -1,7 +1,9 @@
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Numerics;
+using System.Runtime;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
@@ -9,6 +11,7 @@ using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.Wasm;
 using System.Runtime.Intrinsics.X86;
 using System.Text;
+using System.Threading;
 
 namespace System
 {
@@ -950,6 +953,10 @@ namespace System
         // Returns a Type object which represent this object instance.
         [Intrinsic]
         public Type GetType() => RuntimeType.FromHandle(System.Runtime.RuntimeImports.RhGetObjectTypeHandle(this));
+
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        protected internal extern object MemberwiseClone();
     }
 
     public class ValueType
@@ -969,7 +976,11 @@ namespace System
     {
         private Array() { }
 
-        public new IEnumerator<T> GetEnumerator() => new SZGenericArrayEnumerator<T>(Unsafe.As<T[]>(this));
+        public new IEnumerator<T> GetEnumerator()
+        {
+            T[] array = Unsafe.As<T[]>(this);
+            return array.Length == 0 ? SZGenericArrayEnumerator<T>.Empty : new SZGenericArrayEnumerator<T>(array, array.Length);
+        }
 
         System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
 
@@ -1011,42 +1022,77 @@ namespace System
 
         public void RemoveAt(int index) => ThrowHelper.ThrowNotSupportedException();
     }
-    internal sealed class SZGenericArrayEnumerator<T> : IEnumerator<T>
+    internal abstract class SZGenericArrayEnumeratorBase : IDisposable
     {
-        private readonly T[] _array;
-        private int _index = -1;
+        protected int _index;
+        protected readonly int _endIndex;
 
-        internal SZGenericArrayEnumerator(T[] array) => _array = array;
+        protected SZGenericArrayEnumeratorBase(int endIndex)
+        {
+            _index = -1;
+            _endIndex = endIndex;
+        }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public bool MoveNext()
         {
-            if (_index < _array.Length - 1)
+            int index = _index + 1;
+            if ((uint)index < (uint)_endIndex)
             {
-                _index++;
+                _index = index;
                 return true;
             }
-            _index = _array.Length;
+            _index = _endIndex;
             return false;
+        }
+
+        public void Reset() => _index = -1;
+
+        public void Dispose()
+        {
+        }
+    }
+    internal sealed class SZGenericArrayEnumerator<T> : SZGenericArrayEnumeratorBase, IEnumerator<T>
+    {
+        private readonly T[]? _array;
+
+        /// <summary>Provides an empty enumerator singleton.</summary>
+        /// <remarks>
+        /// If the consumer is using SZGenericArrayEnumerator elsewhere or is otherwise likely
+        /// to be using T[] elsewhere, this singleton should be used.  Otherwise, GenericEmptyEnumerator's
+        /// singleton should be used instead, as it doesn't reference T[] in order to reduce footprint.
+        /// </remarks>
+        internal static readonly SZGenericArrayEnumerator<T> Empty = new SZGenericArrayEnumerator<T>(null, 0);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal SZGenericArrayEnumerator(T[]? array, int endIndex)
+            : base(endIndex)
+        {
+            _array = array;
         }
 
         public T Current
         {
             get
             {
-                if ((uint)_index >= (uint)_array.Length)
-                    ThrowHelper.ThrowInvalidOperationException_InvalidOperation_EnumOpCantHappen();
-                return _array[_index];
+                if ((uint)_index >= (uint)_endIndex)
+                    ThrowHelper.ThrowInvalidOperationException_EnumCurrent(_index);
+                return _array![_index];
             }
         }
 
-        object? System.Collections.IEnumerator.Current => Current;
-
-        public void Reset() => _index = -1;
-
-        public void Dispose() { }
+        object? IEnumerator.Current => Current;
     }
     public class Array
     {
+        // This is the threshold where Introspective sort switches to Insertion sort.
+        // Empirically, 16 seems to speed up most cases without slowing down others, at least for integers.
+        // Large value types may benefit from a smaller number.
+        internal const int IntrosortSizeThreshold = 16;
+
+        // This ctor exists solely to prevent C# from generating a protected .ctor that violates the surface area.
+        private protected Array() { }
+
         private static class EmptyArray<T>
         {
             internal static readonly T[] Value = new T[0];
@@ -1236,6 +1282,28 @@ namespace System
         [MethodImpl(MethodImplOptions.InternalCall)]
         private static bool CopyInternal(Array sourceArray, int sourceIndex, Array destinationArray, int destinationIndex, int length)
             => false;
+
+
+
+        private enum ArrayAssignType
+        {
+            SimpleCopy,
+            WrongType,
+            MustCast,
+            BoxValueClassOrPrimitive,
+            UnboxValueClass,
+            PrimitiveWiden,
+        }
+
+        // Make a new array which is a shallow copy of the original array.
+        //
+        [Intrinsic]
+        public object Clone()
+        {
+            return MemberwiseClone();
+        }
+
+
     }
 
     public abstract unsafe class Delegate
@@ -10653,44 +10721,146 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
     }
     public readonly ref struct ReadOnlySpan<T>
     {
+        /// <summary>A byref or a native ptr.</summary>
         internal readonly ref T _reference;
+        /// <summary>The number of elements this ReadOnlySpan contains.</summary>
         private readonly int _length;
-        public int Length => _length;
-        public bool IsEmpty => _length == 0;
+
+        /// <summary>
+        /// Creates a new read-only span over the entirety of the target array.
+        /// </summary>
+        /// <param name="array">The target array.</param>
+        /// <remarks>Returns default when <paramref name="array"/> is null.</remarks>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public ReadOnlySpan(T[] array)
+        public ReadOnlySpan(T[]? array)
         {
             if (array == null)
-                return;
-            _reference = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference<T>(array);
+            {
+                this = default;
+                return; // returns default
+            }
+
+            _reference = ref MemoryMarshal.GetArrayDataReference(array);
             _length = array.Length;
         }
 
+        /// <summary>
+        /// Creates a new read-only span over the portion of the target array beginning
+        /// at 'start' index and ending at 'end' index (exclusive).
+        /// </summary>
+        /// <param name="array">The target array.</param>
+        /// <param name="start">The zero-based index at which to begin the read-only span.</param>
+        /// <param name="length">The number of items in the read-only span.</param>
+        /// <remarks>Returns default when <paramref name="array"/> is null.</remarks>
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// Thrown when the specified <paramref name="start"/> or end index is not in the range (&lt;0 or &gt;Length).
+        /// </exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public ReadOnlySpan(T[]? array, int start, int length)
+        {
+            if (array == null)
+            {
+                if (start != 0 || length != 0)
+                    ThrowHelper.ThrowArgumentOutOfRangeException();
+                this = default;
+                return; // returns default
+            }
+#if TARGET_64BIT
+            // See comment in Span<T>.Slice for how this works.
+            if ((ulong)(uint)start + (ulong)(uint)length > (ulong)(uint)array.Length)
+                ThrowHelper.ThrowArgumentOutOfRangeException();
+#else
+            if ((uint)start > (uint)array.Length || (uint)length > (uint)(array.Length - start))
+                ThrowHelper.ThrowArgumentOutOfRangeException();
+#endif
+
+            _reference = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(array), (nint)(uint)start /* force zero-extension */);
+            _length = length;
+        }
+
+        /// <summary>
+        /// Creates a new read-only span over the target unmanaged buffer.  Clearly this
+        /// is quite dangerous, because we are creating arbitrarily typed T's
+        /// out of a void*-typed block of memory.  And the length is not checked.
+        /// But if this creation is correct, then all subsequent uses are correct.
+        /// </summary>
+        /// <param name="pointer">An unmanaged pointer to memory.</param>
+        /// <param name="length">The number of <typeparamref name="T"/> elements the memory contains.</param>
+        /// <exception cref="ArgumentException">
+        /// Thrown when <typeparamref name="T"/> is reference type or contains pointers and hence cannot be stored in unmanaged memory.
+        /// </exception>
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// Thrown when the specified <paramref name="length"/> is negative.
+        /// </exception>
+        [CLSCompliant(false)]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public unsafe ReadOnlySpan(void* pointer, int length)
         {
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                ThrowHelper.ThrowArgument_TypeContainsReferences(typeof(T));
+            if (length < 0)
+                ThrowHelper.ThrowArgumentOutOfRangeException();
+
             _reference = ref *(T*)pointer;
             _length = length;
         }
+
+        /// <summary>Creates a new <see cref="ReadOnlySpan{T}"/> of length 1 around the specified reference.</summary>
+        /// <param name="reference">A reference to data.</param>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ReadOnlySpan(ref readonly T reference)
         {
-            _reference = ref System.Runtime.CompilerServices.Unsafe.AsRef<T>(in reference);
+            _reference = ref Unsafe.AsRef(in reference);
             _length = 1;
         }
+
+        // Constructor for internal use only. It is not safe to expose publicly, and is instead exposed via the unsafe MemoryMarshal.CreateReadOnlySpan.
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal ReadOnlySpan(ref T reference, int length)
         {
             _reference = ref reference;
             _length = length;
         }
+
+        /// <summary>
+        /// Returns the specified element of the read-only span.
+        /// </summary>
+        /// <param name="index">The zero-based index.</param>
+        /// <returns></returns>
+        /// <exception cref="IndexOutOfRangeException">
+        /// Thrown when index less than 0 or index greater than or equal to Length
+        /// </exception>
         public ref readonly T this[int index]
         {
+            [Intrinsic]
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            [NonVersionable]
             get
             {
                 if ((uint)index >= (uint)_length)
-                    throw new IndexOutOfRangeException();
-                return ref System.Runtime.CompilerServices.Unsafe.Add<T>(ref _reference, (nint)(uint)index /* force zero-extension */);
+                    ThrowHelper.ThrowIndexOutOfRangeException();
+                return ref Unsafe.Add(ref _reference, (nint)(uint)index /* force zero-extension */);
             }
+        }
+
+        /// <summary>
+        /// The number of items in the read-only span.
+        /// </summary>
+        public int Length
+        {
+            [Intrinsic]
+            [NonVersionable]
+            get => _length;
+        }
+
+        /// <summary>
+        /// Gets a value indicating whether this <see cref="ReadOnlySpan{T}"/> is empty.
+        /// </summary>
+        /// <value><see langword="true"/> if this span is empty; otherwise, <see langword="false"/>.</value>
+        public bool IsEmpty
+        {
+            [NonVersionable]
+            get => _length == 0;
         }
 
         /// <summary>
@@ -10705,13 +10875,17 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void CopyTo(Span<T> destination)
         {
+            // Using "if (!TryCopyTo(...))" results in two branches: one for the length
+            // check, and one for the result of TryCopyTo. Since these checks are equivalent,
+            // we can optimize by performing the check once ourselves then calling Memmove directly.
+
             if ((uint)_length <= (uint)destination.Length)
             {
                 Buffer.Memmove(ref destination._reference, ref _reference, (uint)_length);
             }
             else
             {
-                throw new ArgumentException();
+                ThrowHelper.ThrowArgumentException_DestinationTooShort();
             }
         }
 
@@ -10782,7 +10956,7 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 #endif
             return new ReadOnlySpan<T>(ref System.Runtime.CompilerServices.Unsafe.Add<T>(ref _reference, (nint)(uint)start), length);
         }
-    
+
 
         /// <summary>
         /// Copies the contents of this read-only span into a new array.  This heap
@@ -10791,11 +10965,13 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         /// </summary>
         public T[] ToArray()
         {
-            if (_length == 0)
-                return Array.Empty<T>();
+            if (IsEmpty)
+            {
+                return [];
+            }
 
-            var destination = new T[_length];
-            Buffer.Memmove(ref MemoryMarshal.GetArrayDataReference(destination), ref _reference, (uint)_length);
+            var destination = new T[Length];
+            CopyTo(destination);
             return destination;
         }
 
@@ -10838,6 +11014,72 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 
     internal static class SpanHelpers
     {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int BinarySearch<T, TComparable>(
+            ReadOnlySpan<T> span, TComparable comparable)
+            where TComparable : IComparable<T>, allows ref struct
+        {
+            if (comparable is null)
+                ThrowHelper.ThrowArgumentNullException(ExceptionArgument.comparable);
+
+            return BinarySearch(ref MemoryMarshal.GetReference(span), span.Length, comparable);
+        }
+
+        public static int BinarySearch<T, TComparable>(
+            ref T spanStart, int length, TComparable comparable)
+            where TComparable : IComparable<T>, allows ref struct
+        {
+            int lo = 0;
+            int hi = length - 1;
+            // If length == 0, hi == -1, and loop will not be entered
+            while (lo <= hi)
+            {
+                // PERF: `lo` or `hi` will never be negative inside the loop,
+                //       so computing median using uints is safe since we know
+                //       `length <= int.MaxValue`, and indices are >= 0
+                //       and thus cannot overflow an uint.
+                //       Saves one subtraction per loop compared to
+                //       `int i = lo + ((hi - lo) >> 1);`
+                int i = (int)(((uint)hi + (uint)lo) >> 1);
+
+                int c = comparable.CompareTo(Unsafe.Add(ref spanStart, i));
+                if (c == 0)
+                {
+                    return i;
+                }
+                else if (c > 0)
+                {
+                    lo = i + 1;
+                }
+                else
+                {
+                    hi = i - 1;
+                }
+            }
+            // If none found, then a negative number that is the bitwise complement
+            // of the index of the next element that is larger than or, if there is
+            // no larger element, the bitwise complement of `length`, which
+            // is `lo` at this point.
+            return ~lo;
+        }
+
+        // Helper to allow sharing all code via IComparable<T> inlineable
+        internal readonly ref struct ComparerComparable<T, TComparer> : IComparable<T>
+            where TComparer : IComparer<T>, allows ref struct
+        {
+            private readonly T _value;
+            private readonly TComparer _comparer;
+
+            public ComparerComparable(T value, TComparer comparer)
+            {
+                _value = value;
+                _comparer = comparer;
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public int CompareTo(T? other) => _comparer.Compare(_value, other);
+        }
+
         public static int IndexOfAny<T>(ref T searchSpace, T value0, T value1, int length) where T : IEquatable<T>?
         {
             T lookUp;
@@ -11240,6 +11482,222 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         [StructLayout(LayoutKind.Sequential, Size = 64)]
         private struct Block64 {}
 #endif // HAS_CUSTOM_BLOCKS
+
+        [Intrinsic] // Unrolled for small constant lengths
+        internal static void Memmove(ref byte dest, ref byte src, nuint len)
+        {
+            // P/Invoke into the native version when the buffers are overlapping.
+            if ((nuint)Unsafe.ByteOffset(ref src, ref dest) < len ||
+                (nuint)Unsafe.ByteOffset(ref dest, ref src) < len)
+            {
+                goto BuffersOverlap;
+            }
+
+            ref byte srcEnd = ref Unsafe.Add(ref src, len);
+            ref byte destEnd = ref Unsafe.Add(ref dest, len);
+
+            if (len <= 16)
+                goto MCPY02;
+            if (len > 64)
+                goto MCPY05;
+
+        MCPY00:
+            // Copy bytes which are multiples of 16 and leave the remainder for MCPY01 to handle.
+#if HAS_CUSTOM_BLOCKS
+            Unsafe.WriteUnaligned(ref dest, Unsafe.ReadUnaligned<Block16>(ref src));
+#elif TARGET_64BIT
+            Unsafe.WriteUnaligned(ref dest, Unsafe.ReadUnaligned<long>(ref src));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 8), Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref src, 8)));
+#else
+            Unsafe.WriteUnaligned(ref dest, Unsafe.ReadUnaligned<int>(ref src));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 4), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 4)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 8), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 8)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 12), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 12)));
+#endif
+            if (len <= 32)
+                goto MCPY01;
+#if HAS_CUSTOM_BLOCKS
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 16), Unsafe.ReadUnaligned<Block16>(ref Unsafe.Add(ref src, 16)));
+#elif TARGET_64BIT
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 16), Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref src, 16)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 24), Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref src, 24)));
+#else
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 16), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 16)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 20), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 20)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 24), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 24)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 28), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 28)));
+#endif
+            if (len <= 48)
+                goto MCPY01;
+#if HAS_CUSTOM_BLOCKS
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 32), Unsafe.ReadUnaligned<Block16>(ref Unsafe.Add(ref src, 32)));
+#elif TARGET_64BIT
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 32), Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref src, 32)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 40), Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref src, 40)));
+#else
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 32), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 32)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 36), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 36)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 40), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 40)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 44), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 44)));
+#endif
+
+        MCPY01:
+            // Unconditionally copy the last 16 bytes using destEnd and srcEnd and return.
+#if HAS_CUSTOM_BLOCKS
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -16), Unsafe.ReadUnaligned<Block16>(ref Unsafe.Add(ref srcEnd, -16)));
+#elif TARGET_64BIT
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -16), Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref srcEnd, -16)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -8), Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref srcEnd, -8)));
+#else
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -16), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref srcEnd, -16)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -12), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref srcEnd, -12)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -8), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref srcEnd, -8)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -4), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref srcEnd, -4)));
+#endif
+            return;
+
+        MCPY02:
+            // Copy the first 8 bytes and then unconditionally copy the last 8 bytes and return.
+            if ((len & 24) == 0)
+                goto MCPY03;
+#if TARGET_64BIT
+            Unsafe.WriteUnaligned(ref dest, Unsafe.ReadUnaligned<long>(ref src));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -8), Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref srcEnd, -8)));
+#else
+            Unsafe.WriteUnaligned(ref dest, Unsafe.ReadUnaligned<int>(ref src));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 4), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 4)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -8), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref srcEnd, -8)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -4), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref srcEnd, -4)));
+#endif
+            return;
+
+        MCPY03:
+            // Copy the first 4 bytes and then unconditionally copy the last 4 bytes and return.
+            if ((len & 4) == 0)
+                goto MCPY04;
+            Unsafe.WriteUnaligned(ref dest, Unsafe.ReadUnaligned<int>(ref src));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -4), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref srcEnd, -4)));
+            return;
+
+        MCPY04:
+            // Copy the first byte. For pending bytes, do an unconditionally copy of the last 2 bytes and return.
+            if (len == 0)
+                return;
+            dest = src;
+            if ((len & 2) == 0)
+                return;
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -2), Unsafe.ReadUnaligned<short>(ref Unsafe.Add(ref srcEnd, -2)));
+            return;
+
+        MCPY05:
+            // PInvoke to the native version when the copy length exceeds the threshold.
+            if (len > MemmoveNativeThreshold)
+            {
+                goto PInvoke;
+            }
+
+#if HAS_CUSTOM_BLOCKS
+            if (len >= 256)
+            {
+                // Try to opportunistically align the destination below. The input isn't pinned, so the GC
+                // is free to move the references. We're therefore assuming that reads may still be unaligned.
+                //
+                // dest is more important to align than src because an unaligned store is more expensive
+                // than an unaligned load.
+                nuint misalignedElements = 64 - Unsafe.OpportunisticMisalignment(ref dest, 64);
+                Unsafe.WriteUnaligned(ref dest, Unsafe.ReadUnaligned<Block64>(ref src));
+                src = ref Unsafe.Add(ref src, misalignedElements);
+                dest = ref Unsafe.Add(ref dest, misalignedElements);
+                len -= misalignedElements;
+            }
+#endif
+
+            // Copy 64-bytes at a time until the remainder is less than 64.
+            // If remainder is greater than 16 bytes, then jump to MCPY00. Otherwise, unconditionally copy the last 16 bytes and return.
+            nuint n = len >> 6;
+
+        MCPY06:
+#if HAS_CUSTOM_BLOCKS
+            Unsafe.WriteUnaligned(ref dest, Unsafe.ReadUnaligned<Block64>(ref src));
+#elif TARGET_64BIT
+            Unsafe.WriteUnaligned(ref dest, Unsafe.ReadUnaligned<long>(ref src));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 8), Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref src, 8)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 16), Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref src, 16)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 24), Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref src, 24)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 32), Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref src, 32)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 40), Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref src, 40)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 48), Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref src, 48)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 56), Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref src, 56)));
+#else
+            Unsafe.WriteUnaligned(ref dest, Unsafe.ReadUnaligned<int>(ref src));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 4), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 4)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 8), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 8)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 12), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 12)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 16), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 16)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 20), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 20)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 24), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 24)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 28), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 28)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 32), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 32)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 36), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 36)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 40), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 40)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 44), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 44)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 48), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 48)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 52), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 52)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 56), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 56)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dest, 60), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref src, 60)));
+#endif
+            dest = ref Unsafe.Add(ref dest, 64);
+            src = ref Unsafe.Add(ref src, 64);
+            n--;
+            if (n != 0)
+                goto MCPY06;
+
+            len %= 64;
+            if (len > 16)
+                goto MCPY00;
+#if HAS_CUSTOM_BLOCKS
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -16), Unsafe.ReadUnaligned<Block16>(ref Unsafe.Add(ref srcEnd, -16)));
+#elif TARGET_64BIT
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -16), Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref srcEnd, -16)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -8), Unsafe.ReadUnaligned<long>(ref Unsafe.Add(ref srcEnd, -8)));
+#else
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -16), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref srcEnd, -16)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -12), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref srcEnd, -12)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -8), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref srcEnd, -8)));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref destEnd, -4), Unsafe.ReadUnaligned<int>(ref Unsafe.Add(ref srcEnd, -4)));
+#endif
+            return;
+
+        BuffersOverlap:
+            // If the buffers overlap perfectly, there's no point to copying the data.
+            if (Unsafe.AreSame(ref dest, ref src))
+            {
+                // Both could be null with a non-zero length, perform an implicit null check.
+                _ = Unsafe.ReadUnaligned<byte>(ref dest);
+                return;
+            }
+
+        PInvoke:
+            // Implicit nullchecks
+            _ = Unsafe.ReadUnaligned<byte>(ref dest);
+            _ = Unsafe.ReadUnaligned<byte>(ref src);
+            MemmoveNative(ref dest, ref src, len);
+        }
+
+        // Non-inlinable wrapper around the QCall that avoids polluting the fast path
+        // with P/Invoke prolog/epilog.
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static unsafe void MemmoveNative(ref byte dest, ref byte src, nuint len)
+        {
+            fixed (byte* pDest = &dest)
+            fixed (byte* pSrc = &src)
+            {
+                memmove(pDest, pSrc, len);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern unsafe void memmove(void* dest, void* src, nuint len);
 
         public static unsafe void ClearWithReferences(ref IntPtr ip, nuint pointerSizeLength)
         {
@@ -12023,7 +12481,7 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
                 (nuint)byteOffset > (nuint)(-((nint)other.Length * sizeof(T))))
             {
                 if (byteOffset % sizeof(T) != 0)
-                    throw new ArgumentException();
+                    ThrowHelper.ThrowArgumentException_OverlapAlignmentMismatch();
 
                 elementOffset = (int)(byteOffset / sizeof(T));
                 return true;
@@ -12033,6 +12491,153 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
                 elementOffset = 0;
                 return false;
             }
+        }
+
+        /// <summary>
+        /// Searches an entire sorted <see cref="Span{T}"/> for a value
+        /// using the specified <see cref="IComparable{T}"/> generic interface.
+        /// </summary>
+        /// <typeparam name="T">The element type of the span.</typeparam>
+        /// <param name="span">The sorted <see cref="Span{T}"/> to search.</param>
+        /// <param name="comparable">The <see cref="IComparable{T}"/> to use when comparing.</param>
+        /// <returns>
+        /// The zero-based index of <paramref name="comparable"/> in the sorted <paramref name="span"/>,
+        /// if <paramref name="comparable"/> is found; otherwise, a negative number that is the bitwise complement
+        /// of the index of the next element that is larger than <paramref name="comparable"/> or, if there is
+        /// no larger element, the bitwise complement of <see cref="Span{T}.Length"/>.
+        /// </returns>
+        /// <exception cref="ArgumentNullException">
+        /// <paramref name = "comparable" /> is <see langword="null"/> .
+        /// </exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [OverloadResolutionPriority(-1)]
+        public static int BinarySearch<T>(this Span<T> span, IComparable<T> comparable) =>
+            BinarySearch((ReadOnlySpan<T>)span, comparable);
+
+        /// <summary>
+        /// Searches an entire sorted <see cref="Span{T}"/> for a value
+        /// using the specified <typeparamref name="TComparable"/> generic type.
+        /// </summary>
+        /// <typeparam name="T">The element type of the span.</typeparam>
+        /// <typeparam name="TComparable">The specific type of <see cref="IComparable{T}"/>.</typeparam>
+        /// <param name="span">The sorted <see cref="Span{T}"/> to search.</param>
+        /// <param name="comparable">The <typeparamref name="TComparable"/> to use when comparing.</param>
+        /// <returns>
+        /// The zero-based index of <paramref name="comparable"/> in the sorted <paramref name="span"/>,
+        /// if <paramref name="comparable"/> is found; otherwise, a negative number that is the bitwise complement
+        /// of the index of the next element that is larger than <paramref name="comparable"/> or, if there is
+        /// no larger element, the bitwise complement of <see cref="Span{T}.Length"/>.
+        /// </returns>
+        /// <exception cref="ArgumentNullException">
+        /// <paramref name = "comparable" /> is <see langword="null"/> .
+        /// </exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [OverloadResolutionPriority(-1)]
+        public static int BinarySearch<T, TComparable>(
+            this Span<T> span, TComparable comparable)
+            where TComparable : IComparable<T>, allows ref struct =>
+            BinarySearch((ReadOnlySpan<T>)span, comparable);
+
+        /// <summary>
+        /// Searches an entire sorted <see cref="Span{T}"/> for the specified <paramref name="value"/>
+        /// using the specified <typeparamref name="TComparer"/> generic type.
+        /// </summary>
+        /// <typeparam name="T">The element type of the span.</typeparam>
+        /// <typeparam name="TComparer">The specific type of <see cref="IComparer{T}"/>.</typeparam>
+        /// <param name="span">The sorted <see cref="Span{T}"/> to search.</param>
+        /// <param name="value">The object to locate. The value can be null for reference types.</param>
+        /// <param name="comparer">The <typeparamref name="TComparer"/> to use when comparing.</param>
+        /// <returns>
+        /// The zero-based index of <paramref name="value"/> in the sorted <paramref name="span"/>,
+        /// if <paramref name="value"/> is found; otherwise, a negative number that is the bitwise complement
+        /// of the index of the next element that is larger than <paramref name="value"/> or, if there is
+        /// no larger element, the bitwise complement of <see cref="Span{T}.Length"/>.
+        /// </returns>
+        /// <exception cref="ArgumentNullException">
+        /// <paramref name = "comparer" /> is <see langword="null"/> .
+        /// </exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [OverloadResolutionPriority(-1)]
+        public static int BinarySearch<T, TComparer>(
+            this Span<T> span, T value, TComparer comparer)
+            where TComparer : IComparer<T>, allows ref struct =>
+            BinarySearch((ReadOnlySpan<T>)span, value, comparer);
+
+        /// <summary>
+        /// Searches an entire sorted <see cref="ReadOnlySpan{T}"/> for a value
+        /// using the specified <see cref="IComparable{T}"/> generic interface.
+        /// </summary>
+        /// <typeparam name="T">The element type of the span.</typeparam>
+        /// <param name="span">The sorted <see cref="ReadOnlySpan{T}"/> to search.</param>
+        /// <param name="comparable">The <see cref="IComparable{T}"/> to use when comparing.</param>
+        /// <returns>
+        /// The zero-based index of <paramref name="comparable"/> in the sorted <paramref name="span"/>,
+        /// if <paramref name="comparable"/> is found; otherwise, a negative number that is the bitwise complement
+        /// of the index of the next element that is larger than <paramref name="comparable"/> or, if there is
+        /// no larger element, the bitwise complement of <see cref="ReadOnlySpan{T}.Length"/>.
+        /// </returns>
+        /// <exception cref="ArgumentNullException">
+        /// <paramref name = "comparable" /> is <see langword="null"/> .
+        /// </exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int BinarySearch<T>(
+            this ReadOnlySpan<T> span, IComparable<T> comparable) =>
+            BinarySearch<T, IComparable<T>>(span, comparable);
+
+        /// <summary>
+        /// Searches an entire sorted <see cref="ReadOnlySpan{T}"/> for a value
+        /// using the specified <typeparamref name="TComparable"/> generic type.
+        /// </summary>
+        /// <typeparam name="T">The element type of the span.</typeparam>
+        /// <typeparam name="TComparable">The specific type of <see cref="IComparable{T}"/>.</typeparam>
+        /// <param name="span">The sorted <see cref="ReadOnlySpan{T}"/> to search.</param>
+        /// <param name="comparable">The <typeparamref name="TComparable"/> to use when comparing.</param>
+        /// <returns>
+        /// The zero-based index of <paramref name="comparable"/> in the sorted <paramref name="span"/>,
+        /// if <paramref name="comparable"/> is found; otherwise, a negative number that is the bitwise complement
+        /// of the index of the next element that is larger than <paramref name="comparable"/> or, if there is
+        /// no larger element, the bitwise complement of <see cref="ReadOnlySpan{T}.Length"/>.
+        /// </returns>
+        /// <exception cref="ArgumentNullException">
+        /// <paramref name = "comparable" /> is <see langword="null"/> .
+        /// </exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int BinarySearch<T, TComparable>(
+            this ReadOnlySpan<T> span, TComparable comparable)
+            where TComparable : IComparable<T>, allows ref struct
+        {
+            return SpanHelpers.BinarySearch(span, comparable);
+        }
+
+        /// <summary>
+        /// Searches an entire sorted <see cref="ReadOnlySpan{T}"/> for the specified <paramref name="value"/>
+        /// using the specified <typeparamref name="TComparer"/> generic type.
+        /// </summary>
+        /// <typeparam name="T">The element type of the span.</typeparam>
+        /// <typeparam name="TComparer">The specific type of <see cref="IComparer{T}"/>.</typeparam>
+        /// <param name="span">The sorted <see cref="ReadOnlySpan{T}"/> to search.</param>
+        /// <param name="value">The object to locate. The value can be null for reference types.</param>
+        /// <param name="comparer">The <typeparamref name="TComparer"/> to use when comparing.</param>
+        /// <returns>
+        /// The zero-based index of <paramref name="value"/> in the sorted <paramref name="span"/>,
+        /// if <paramref name="value"/> is found; otherwise, a negative number that is the bitwise complement
+        /// of the index of the next element that is larger than <paramref name="value"/> or, if there is
+        /// no larger element, the bitwise complement of <see cref="ReadOnlySpan{T}.Length"/>.
+        /// </returns>
+        /// <exception cref="ArgumentNullException">
+        /// <paramref name = "comparer" /> is <see langword="null"/> .
+        /// </exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int BinarySearch<T, TComparer>(
+            this ReadOnlySpan<T> span, T value, TComparer comparer)
+            where TComparer : IComparer<T>, allows ref struct
+        {
+            if (comparer is null)
+                ThrowHelper.ThrowArgumentNullException(ExceptionArgument.comparer);
+
+            var comparable = new SpanHelpers.ComparerComparable<T, TComparer>(
+                value, comparer);
+            return BinarySearch(span, comparable);
         }
 
         /// <summary>
@@ -15201,7 +15806,13 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
     }
     public static class BitConverter
     {
+#if BIGENDIAN
+        [Intrinsic]
+        public static readonly bool IsLittleEndian /* = false */;
+#else
+        [Intrinsic]
         public static readonly bool IsLittleEndian = true;
+#endif
 
         public static byte[] GetBytes(bool value) => new byte[] { (value ? (byte)1 : (byte)0) };
 
@@ -19295,6 +19906,30 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
             : base(message, innerException)
         { }
     }
+    public class ObjectDisposedException : InvalidOperationException
+    {
+        private readonly string? _objectName;
+
+        private ObjectDisposedException() :
+            this(null, SR.ObjectDisposed_Generic)
+        { }
+
+        public ObjectDisposedException(string? objectName) :
+            this(objectName, SR.ObjectDisposed_Generic)
+        { }
+
+        public ObjectDisposedException(string? objectName, string? message) : base(message ?? SR.ObjectDisposed_Generic)
+        {
+            _objectName = objectName;
+        }
+
+        public ObjectDisposedException(string? message, Exception? innerException)
+            : base(message ?? SR.ObjectDisposed_Generic, innerException)
+        {
+        }
+
+        public string ObjectName => _objectName ?? string.Empty;
+    }
     public class NotImplementedException : SystemException
     {
         public NotImplementedException()
@@ -19998,40 +20633,80 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 
     public unsafe class Buffer
     {
-        [MethodImpl(MethodImplOptions.NoInlining)]
-        internal static void Memmove<T>(ref T dest, ref T src, nuint len)
+        private const uint BulkMoveWithWriteBarrierChunk = 0x4000;
+
+        internal static void BulkMoveWithWriteBarrier(ref byte destination, ref byte source, nuint byteCount)
         {
-            if (len == (nuint)0)
-                return;
-
-            if (System.Runtime.CompilerServices.Unsafe.AreSame<T>(ref dest, ref src))
-                return;
-
-            int n = (int)len;
-            if ((nuint)n != len)
-                throw new ArgumentOutOfRangeException("len");
-
-            nuint elemSize = (nuint)System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
-            nuint byteLen = elemSize * len;
-
-            nint byteOffset = System.Runtime.CompilerServices.Unsafe.ByteOffset<T>(ref src, ref dest); // dest - src
-            bool copyBackwards = (byteOffset > 0) && ((nuint)byteOffset < byteLen);
-
-            if (!copyBackwards)
+            if (byteCount <= BulkMoveWithWriteBarrierChunk)
             {
-                for (int i = 0; i < n; i++)
-                {
-                    System.Runtime.CompilerServices.Unsafe.Add<T>(ref dest, i) =
-                        System.Runtime.CompilerServices.Unsafe.Add<T>(ref src, i);
-                }
+                BulkMoveWithWriteBarrierInternal(ref destination, ref source, byteCount);
+                Thread.FastPollGC();
             }
             else
             {
-                for (int i = n - 1; i >= 0; i--)
+                BulkMoveWithWriteBarrierBatch(ref destination, ref source, byteCount);
+            }
+        }
+
+        // Non-inlinable wrapper around the loop for copying large blocks in chunks
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void BulkMoveWithWriteBarrierBatch(ref byte destination, ref byte source, nuint byteCount)
+        {
+            if (Unsafe.AreSame(ref source, ref destination))
+                return;
+
+            // This is equivalent to: (destination - source) >= byteCount || (destination - source) < 0
+            if ((nuint)(nint)Unsafe.ByteOffset(ref source, ref destination) >= byteCount)
+            {
+                // Copy forwards
+                do
                 {
-                    System.Runtime.CompilerServices.Unsafe.Add<T>(ref dest, i) =
-                        System.Runtime.CompilerServices.Unsafe.Add<T>(ref src, i);
+                    byteCount -= BulkMoveWithWriteBarrierChunk;
+                    BulkMoveWithWriteBarrierInternal(ref destination, ref source, BulkMoveWithWriteBarrierChunk);
+                    Thread.FastPollGC();
+                    destination = ref Unsafe.AddByteOffset(ref destination, BulkMoveWithWriteBarrierChunk);
+                    source = ref Unsafe.AddByteOffset(ref source, BulkMoveWithWriteBarrierChunk);
                 }
+                while (byteCount > BulkMoveWithWriteBarrierChunk);
+            }
+            else
+            {
+                // Copy backwards
+                do
+                {
+                    byteCount -= BulkMoveWithWriteBarrierChunk;
+                    BulkMoveWithWriteBarrierInternal(ref Unsafe.AddByteOffset(ref destination, byteCount), ref Unsafe.AddByteOffset(ref source, byteCount), BulkMoveWithWriteBarrierChunk);
+                    Thread.FastPollGC();
+                }
+                while (byteCount > BulkMoveWithWriteBarrierChunk);
+            }
+            BulkMoveWithWriteBarrierInternal(ref destination, ref source, byteCount);
+            Thread.FastPollGC();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void BulkMoveWithWriteBarrierInternal(ref byte destination, ref byte source, nuint byteCount) =>
+            RuntimeImports.RhBulkMoveWithWriteBarrier(ref destination, ref source, byteCount);
+
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static unsafe void Memmove<T>(ref T destination, ref T source, nuint elementCount)
+        {
+            if (!RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                // Blittable memmove
+                SpanHelpers.Memmove(
+                    ref Unsafe.As<T, byte>(ref destination),
+                    ref Unsafe.As<T, byte>(ref source),
+                    elementCount * (nuint)sizeof(T));
+            }
+            else
+            {
+                // Non-blittable memmove
+                BulkMoveWithWriteBarrier(
+                    ref Unsafe.As<T, byte>(ref destination),
+                    ref Unsafe.As<T, byte>(ref source),
+                    elementCount * (nuint)sizeof(T));
             }
         }
     }
@@ -20074,15 +20749,33 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         }
 
         [DoesNotReturn]
-        internal static void ThrowArgumentException_DestinationTooShort()
+        internal static void ThrowArgument_TypeContainsReferences(Type targetType)
         {
-            throw new ArgumentException(SR.Argument_DestinationTooShort, "destination");
+            throw new ArgumentException(SR.Argument_TypeContainsReferences);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowIndexOutOfRangeException()
+        {
+            throw new IndexOutOfRangeException();
         }
 
         [DoesNotReturn]
         internal static void ThrowArgumentOutOfRangeException()
         {
             throw new ArgumentOutOfRangeException();
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowArgumentException_DestinationTooShort()
+        {
+            throw new ArgumentException(SR.Argument_DestinationTooShort, "destination");
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowArgumentException_OverlapAlignmentMismatch()
+        {
+            throw new ArgumentException(SR.Argument_OverlapAlignmentMismatch);
         }
 
         [DoesNotReturn]
@@ -20128,6 +20821,60 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         internal static void ThrowNotSupportedException()
         {
             throw new NotSupportedException();
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowOutOfMemoryException()
+        {
+            throw new OutOfMemoryException();
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowDivideByZeroException()
+        {
+            throw new DivideByZeroException();
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowInvalidOperationException_InvalidOperation_EnumNotStarted()
+        {
+            throw new InvalidOperationException(SR.InvalidOperation_EnumNotStarted);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowInvalidOperationException_InvalidOperation_EnumEnded()
+        {
+            throw new InvalidOperationException(SR.InvalidOperation_EnumEnded);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowInvalidOperationException_EnumCurrent(int index)
+        {
+            throw GetInvalidOperationException_EnumCurrent(index);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowInvalidOperationException_InvalidOperation_EnumFailedVersion()
+        {
+            throw new InvalidOperationException(SR.InvalidOperation_EnumFailedVersion);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowInvalidOperationException_InvalidOperation_EnumOpCantHappen()
+        {
+            throw new InvalidOperationException(SR.InvalidOperation_EnumOpCantHappen);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowInvalidOperationException_InvalidOperation_NoValue()
+        {
+            throw new InvalidOperationException(SR.InvalidOperation_NoValue);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowInvalidOperationException_ConcurrentOperationsNotSupported()
+        {
+            throw new InvalidOperationException(SR.InvalidOperation_ConcurrentOperationsNotSupported);
         }
 
         [DoesNotReturn]
@@ -20183,6 +20930,19 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
             return new ArgumentException(GetResourceString(resource));
         }
 
+        private static ArgumentOutOfRangeException GetArgumentOutOfRangeException(ExceptionArgument argument, int paramNumber, ExceptionResource resource)
+        {
+            return new ArgumentOutOfRangeException(GetArgumentName(argument) + "[" + paramNumber.ToString() + "]", GetResourceString(resource));
+        }
+
+        private static InvalidOperationException GetInvalidOperationException_EnumCurrent(int index)
+        {
+            return new InvalidOperationException(
+                index < 0 ?
+                SR.InvalidOperation_EnumNotStarted :
+                SR.InvalidOperation_EnumEnded);
+        }
+
         private static InvalidOperationException GetInvalidOperationException(ExceptionResource resource)
         {
             return new InvalidOperationException(GetResourceString(resource));
@@ -20209,20 +20969,9 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
                 ThrowArgumentNullException(argName);
         }
 
-        [DoesNotReturn]
-        internal static void ThrowInvalidOperationException_InvalidOperation_EnumOpCantHappen()
-        {
-            throw new InvalidOperationException(SR.InvalidOperation_EnumOpCantHappen);
-        }
-
         private static ArgumentOutOfRangeException GetArgumentOutOfRangeException(ExceptionArgument argument, ExceptionResource resource)
         {
             return new ArgumentOutOfRangeException(GetArgumentName(argument), GetResourceString(resource));
-        }
-
-        private static ArgumentOutOfRangeException GetArgumentOutOfRangeException(ExceptionArgument argument, int paramNumber, ExceptionResource resource)
-        {
-            return new ArgumentOutOfRangeException(GetArgumentName(argument) + "[" + paramNumber.ToString() + "]", GetResourceString(resource));
         }
 
         [DoesNotReturn]
@@ -20769,7 +21518,8 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
     internal static partial class SR
     {
         internal const string Arg_ArgumentOutOfRangeException = "Specified argument was out of the range of valid values.";
-        internal const string Arg_InvalidHexBinaryStyle = "With the AllowHexSpecifier or AllowBinarySpecifier bit set in the enum bit field, the only other valid bits that can be combined into the enum value must be AllowLeadingWhite and AllowTrailingWhite.";
+        internal const string Arg_InvalidHexBinaryStyle = "With the AllowHexSpecifier or AllowBinarySpecifier bit set in the enum bit field, " +
+                                                          "the only other valid bits that can be combined into the enum value must be AllowLeadingWhite and AllowTrailingWhite.";
         internal const string Arg_MustBeByte = "Object must be of type Byte.";
         internal const string Arg_MustBeChar = "Object must be of type Char.";
         internal const string Arg_MustBeDouble = "Object must be of type Double.";
@@ -20787,6 +21537,7 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         internal const string Arg_UnreachableException = "The program executed an instruction that was thought to be unreachable.";
         internal const string Arg_WrongType = "The value '{0}' is not of type '{1}' and cannot be used in this generic collection.";
         internal const string Arg_RankMultiDimNotSupported = "Rank is not supported for multi-dimensional arrays.";
+        internal const string Arg_HTCapacityOverflow = "Hashtable's capacity overflowed and went negative. Check load factor, capacity and the current size of the table.";
         internal const string ArgumentNull_Generic = "Value cannot be null.";
         internal const string ArgumentOutOfRange_ActualValue = "Actual value was {0}.";
         internal const string ArgumentOutOfRange_Generic_MustBeEqual = "{0} ('{1}') must be equal to '{2}'.";
@@ -20812,7 +21563,11 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         internal const string Argument_InvalidEnumValue = "The value '{0}' is not valid for this usage of the type {1}.";
         internal const string Argument_InvalidNumberStyles = "An undefined NumberStyles value is being used.";
         internal const string Argument_IncompatibleArrayType = "Target array type is not compatible with the type of items in the collection.";
+        internal const string Argument_OverlapAlignmentMismatch = "Overlapping spans have mismatching alignment.";
+        internal const string Argument_TypeContainsReferences = "The Type must be a primitive type or a struct containing only primitive types.";
         internal const string Arithmetic_NaN = "Function does not accept floating point Not-a-Number values.";
+        internal const string CapacityMustBeGreaterThanOrEqualToCount = "Capacity must be greater than or equal to Count.";
+        internal const string CapacityMustEqualCountOnMove = "Capacity must equal count on move.";
         internal const string Format_ExpectedAsciiDigit = "Expected an ASCII digit.";
         internal const string Format_IndexOutOfRange = "Index (zero based) must be greater than or equal to zero and less than the size of the argument list.";
         internal const string Format_InvalidString = "Input string was not in a correct format.";
@@ -20820,11 +21575,21 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         internal const string Format_NeedSingleChar = "String must be exactly one character long.";
         internal const string Format_UnclosedFormatItem = "Format item ends prematurely.";
         internal const string Format_UnexpectedClosingBrace = "Unexpected closing brace without a corresponding opening brace.";
+        internal const string InvalidOperationOnDefaultArray = "This operation cannot be performed on a default instance of ImmutableArray. " +
+                                                               "Consider initializing the array, or checking the ImmutableArray.IsDefault property.";
         internal const string InvalidOperation_CollectionCorrupted = "A prior operation on this collection was interrupted by an exception. Collection's state is no longer trusted.";
+        internal const string InvalidOperation_EnumNotStarted = "Enumeration has not started. Call MoveNext.";
+        internal const string InvalidOperation_EnumEnded = "The enumeration has already completed.";
+        internal const string InvalidOperation_EnumFailedVersion = "Collection was modified; enumeration operation may not execute.";
         internal const string InvalidOperation_EnumOpCantHappen = "Enumeration has either not started or has already finished.";
+        internal const string InvalidOperation_NoValue = "Nullable object must have a value.";
+        internal const string InvalidOperation_ConcurrentOperationsNotSupported = "Operations that change non-concurrent collections must have exclusive access. " +
+                                                                                  "A concurrent update was performed on this collection and corrupted its state. " +
+                                                                                  "The collection's state is no longer correct.";
         internal const string InvalidOperation_InvalidUtf8 = "Formatted string contains characters not representable as valid UTF-8.";
         internal const string InvalidOperation_ReadOnly = "Instance is read-only.";
         internal const string NotSupported_Type = "Type is not supported.";
+        internal const string ObjectDisposed_Generic = "Cannot access a disposed object.";
     }
     internal static partial class SR
     {

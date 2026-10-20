@@ -1077,13 +1077,13 @@ namespace Cnidaria.Cs
                         throw new InvalidOperationException("Compile-time InternalCall has no external symbol.");
                     if (X86Runtime.IsAllocateNewArrayInternalCall(method))
                         return ResolveGcEntry(X86Runtime.NewUninitializedArraySymbol);
-                    if (X86Runtime.IsGcSafePointInternalCall(method))
+                    if (X86Runtime.IsFastAllocateStringInternalCall(method))
                         return ResolveGcEntry(X86Runtime.NewArraySymbol);
 
                     string? label = _options.InternalCallSymbolResolver?.Invoke(method);
                     if (string.IsNullOrWhiteSpace(label))
                         label = X86Runtime.ResolveInternalCall(method);
-                    return ResolveExternalFunction(label);
+                    return X86Runtime.IsGcSafePointInternalCall(method) ? ResolveGcEntry(label) : ResolveExternalFunction(label);
                 }
 
                 if (method.IsExtern)
@@ -5409,14 +5409,17 @@ namespace Cnidaria.Cs
                             EmitAllocateNewArray(node, method);
                             return;
                         }
-                        if (X86Runtime.IsGcSafePointInternalCall(method))
+                        if (X86Runtime.IsFastAllocateStringInternalCall(method))
                         {
                             EmitFastAllocateString(node, method);
                             return;
                         }
 
-                        _owner.EmitCall(_owner.ResolveMethodLabel(method));
-                        return;
+                        if (!X86Runtime.IsGcSafePointInternalCall(method))
+                        {
+                            _owner.EmitCall(_owner.ResolveMethodLabel(method));
+                            return;
+                        }
                     }
 
                     SafePointDraft safePoint = PrepareSafePoint(node);

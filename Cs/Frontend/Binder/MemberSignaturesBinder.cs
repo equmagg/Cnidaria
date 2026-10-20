@@ -63,7 +63,21 @@ namespace Cnidaria.Cs
                     compilation, tree, declMap, stubModel, safeTypeBinder, diagnostics);
                 foreach (var kv in declMap)
                 {
-                    if (kv.Key is DelegateDeclarationSyntax dd && kv.Value is SourceNamedTypeSymbol delegateType)
+                    if (kv.Key is ParameterListSyntax recordParameters && kv.Value is SourceMethodSymbol recordConstructor)
+                    {
+                        var ctx = new BindingContext(compilation, stubModel, recordConstructor, NullRecorder.Instance);
+                        var typeBinder = Binder.IsUnsafeContext(recordConstructor) ? unsafeTypeBinder : safeTypeBinder;
+                        for (int i = 0; i < recordParameters.Parameters.Count; i++)
+                        {
+                            var syntax = recordParameters.Parameters[i];
+                            var parameter = recordConstructor.Parameters[i];
+                            parameter.Type = BindParameterType(typeBinder, syntax, ctx, diagnostics, out var isReadOnlyRef);
+                            parameter.IsReadOnlyRef = isReadOnlyRef;
+                            if (syntax.Default is not null)
+                                pendingOptionalParameters.Add(new PendingOptionalParameter(tree, syntax, parameter, recordConstructor, typeBinder, stubModel));
+                        }
+                    }
+                    else if (kv.Key is DelegateDeclarationSyntax dd && kv.Value is SourceNamedTypeSymbol delegateType)
                     {
                         BindDelegateSignature(compilation, tree, dd, delegateType, stubModel, safeTypeBinder, unsafeTypeBinder, diagnostics, pendingOptionalParameters);
                     }
@@ -695,7 +709,7 @@ namespace Cnidaria.Cs
 
                 switch (kv.Key)
                 {
-                    case ClassDeclarationSyntax syntax when kv.Value is NamedTypeSymbol symbol:
+                    case TypeDeclarationSyntax syntax when syntax is ClassDeclarationSyntax or RecordDeclarationSyntax && kv.Value is NamedTypeSymbol symbol:
                         clauses = syntax.ConstraintClauses;
                         modifiers = syntax.Modifiers;
                         typeParameters = symbol.TypeParameters;
@@ -923,7 +937,7 @@ namespace Cnidaria.Cs
                 return true;
             }
 
-            return !property.HasSet && IsAutoProperty(pd);
+            return (!property.HasSet || property.SetMethod?.IsInitOnly == true) && IsAutoProperty(pd);
         }
         private static bool IsAutoProperty(PropertyDeclarationSyntax pd)
         {

@@ -30,6 +30,36 @@ namespace Cnidaria.Cs
             => (type.Namespace != "System.Numerics" || SimdTypes.NumericsSize(type) != 0 || _rts.Target.IsRiscV) &&
                SimdTypes.TargetSupports(_rts.Target, VectorApiSize(type));
 
+        private bool TryImportVectorElementTypeIsSupported(List<StackValue> stack, RuntimeMethod method, int pc, ILOpCode op)
+        {
+            RuntimeType owner = method.DeclaringType;
+            if (!method.IsStatic || method.HasThis || method.ParameterTypes.Length != 0 ||
+                method.MethodGenericArguments.Length != 0 ||
+                !StringComparer.Ordinal.Equals(method.Name, "get_IsSupported") ||
+                method.ReturnType.PrimitiveKind != RuntimePrimitiveKind.Boolean ||
+                owner.GenericTypeArguments.Length != 1)
+                return false;
+
+            string name = owner.GenericTypeDefinition?.Name ?? owner.Name;
+            bool isVector = owner.Namespace switch
+            {
+                "System.Runtime.Intrinsics" => name is "Vector64" or "Vector64`1" or
+                    "Vector128" or "Vector128`1" or "Vector256" or "Vector256`1" or
+                    "Vector512" or "Vector512`1",
+                "System.Numerics" => name is "Vector" or "Vector`1",
+                _ => false,
+            };
+            if (!isVector)
+                return false;
+
+            RuntimeType elementType = owner.GenericTypeArguments[0];
+            if (elementType.Kind == RuntimeTypeKind.TypeParam)
+                return false;
+
+            Push(stack, ConstI4(pc, op, SimdTypes.IsSupportedElement(elementType) ? 1 : 0));
+            return true;
+        }
+
         private bool TryImportHWIntrinsic(ImportFrame frame, List<StackValue> stack, List<GenTree> statements, RuntimeMethod method, int pc, ILOpCode op)
         {
             bool x86 = StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, X86Intrinsics.Namespace);

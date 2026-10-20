@@ -8,7 +8,7 @@ using System.Text;
 
 namespace Cnidaria.Arm;
 
-public sealed class ArmProgram
+public sealed class ArmProgram: IProgram
 {
     public ArmTarget Target { get; }
     public ArmTextSection Text { get; }
@@ -71,6 +71,12 @@ public sealed class ArmProgram
 
     public byte[] ToLinuxExecutableBytes(ulong imageBase = 0, IReadOnlyDictionary<string, ulong>? externalSymbols = null)
         => ArmElfWriter.WriteExecutable(this, imageBase == 0 ? ArmElfWriter.DefaultImageBase(Target) : imageBase, externalSymbols);
+
+
+    public string Disassemble()
+        => ArmDisassembler.Disassemble(this, null);
+    public string Disassemble(ArmAssemblyWriterOptions? options)
+        => ArmDisassembler.Disassemble(this, options);
 }
 
 public sealed class ArmTextSection

@@ -1749,6 +1749,18 @@ void RhpFreeHGlobal(void* pointer)
         RhpFallbackFailFast(153);
 }
 
+// Write barriers are unnecessary for the current GC
+// No collection can occur during this copy; callers poll between large chunks
+void RhpBulkMoveWithWriteBarrier(void* destination, const void* source, usize length)
+{
+    rh_memmove(destination, source, length);
+}
+
+void RhpMemmove(void* destination, const void* source, usize length)
+{
+    rh_memmove(destination, source, length);
+}
+
 void RhpMemset(void* destination, int value, usize length)
 {
 #if defined(__x86_64__)
@@ -2838,6 +2850,33 @@ void* RhpNewArray(const RhMethodTable* type, int length)
     else
         *(int*)((u8*)object + ARRAY_LENGTH_OFFSET) = length;
     return object;
+}
+
+void* RhpMemberwiseClone(RhObject* source)
+{
+    const RhMethodTable* type = source->type;
+    const RhTypeInfo* info = rh_require_method_table(type, 140);
+    usize gc_size;
+    void* clone;
+    if (info->runtime_kind == RH_TYPE_FIXED)
+    {
+        gc_size = (usize)type->base_size;
+    }
+    else
+    {
+        usize length_offset;
+        if (info->runtime_kind != RH_TYPE_SZARRAY && info->runtime_kind != RH_TYPE_STRING)
+            RhpFallbackFailFast(140);
+        length_offset = info->runtime_kind == RH_TYPE_STRING ? STRING_LENGTH_OFFSET : ARRAY_LENGTH_OFFSET;
+        gc_size = rh_variable_gc_size(type, *(int*)((u8*)source + length_offset));
+    }
+    if (gc_size < SYNC_BLOCK_SIZE + MANAGED_OBJECT_HEADER_SIZE || rh_total_block_size(gc_size) == 0ul)
+        RhpFallbackFailFast(140);
+    clone = rh_allocate_object(type, gc_size);
+    rh_memmove((u8*)clone + MANAGED_OBJECT_HEADER_SIZE,
+        (u8*)source + MANAGED_OBJECT_HEADER_SIZE,
+        gc_size - SYNC_BLOCK_SIZE - MANAGED_OBJECT_HEADER_SIZE);
+    return clone;
 }
 
 void* RhpNewArrayUninitialized(const RhMethodTable* type, int length)

@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace System.Threading
 {
     public class SynchronizationLockException : SystemException
@@ -16,6 +18,9 @@ namespace System.Threading
     }
     public sealed class Thread
     {
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static extern void FastPollGC();
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int GetCurrentProcessorId()
         {

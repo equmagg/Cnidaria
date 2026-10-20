@@ -134,16 +134,11 @@ namespace Cnidaria.Cs
             }
 
             // The call kills the value's register, so the stack copy the following segment names already holds it while the call runs
-            private int StartIncludingSuspendingCall(RegisterOperand location, int previousStart, int start)
+            private int StartIncludingSuspendingCall(RegisterOperand location, int start)
             {
-                if (!IsFrameBacked(location))
-                    return start;
-                for (int i = _callerFrameSuspendingCallPositions.Length - 1; i >= 0; i--)
-                {
-                    int callPosition = _callerFrameSuspendingCallPositions[i];
-                    if (callPosition < start)
-                        return callPosition >= previousStart ? callPosition : start;
-                }
+                if (IsFrameBacked(location) && IsCallerFrameSuspendingCallPosition(start - 1))
+                    return start - 1;
+
                 return start;
             }
 
@@ -195,7 +190,7 @@ namespace Cnidaria.Cs
                         var translated = TranslateAllocationRange(segment.Start, segment.End);
                         int start = s == 0 || allocation.Segments[s - 1].End != segment.Start
                             ? translated.Start
-                            : StartIncludingSuspendingCall(segment.Location, TranslateAllocationPosition(allocation.Segments[s - 1].Start), translated.Start);
+                            : StartIncludingSuspendingCall(segment.Location, translated.Start);
                         if (start < translated.End)
                             AddLiveRangeSlices(
                                 ranges, new RegisterGcLiveRoot(allocation.Value, rootKind, segment.Location, info.Type), start, translated.End);
@@ -783,7 +778,7 @@ namespace Cnidaria.Cs
                                 var translated = TranslateAllocationRange(range.Start, range.End);
                                 int start = s == 0 || fragment.Segments[s - 1].End != range.Start
                                     ? translated.Start
-                                    : StartIncludingSuspendingCall(range.Location, TranslateAllocationPosition(fragment.Segments[s - 1].Start), translated.Start);
+                                    : StartIncludingSuspendingCall(range.Location, translated.Start);
                                 AddLiveRangeSlices(
                                     ranges,
                                     new RegisterGcLiveRoot(

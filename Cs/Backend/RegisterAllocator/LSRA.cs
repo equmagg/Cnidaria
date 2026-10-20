@@ -5393,6 +5393,16 @@ namespace Cnidaria.Cs
                 if (false)
                     throw new InvalidOperationException("GenTree LIR tree node has no GenTree source.");
 
+                // Lowering can eliminate the last use of an SSA local after its defining store was retained
+                if (IsPromotedStoreDef(node) && node.SsaStoreTargetName.HasValue)
+                {
+                    var value = node.RegisterResult!;
+                    var info = _method.GetValueInfo(value);
+                    var abi = MachineAbi.ClassifyStorageValue(info.Type, info.StackKind, _method.Target);
+                    if (ValueLocationForDefinition(value, GetNodePosition(node) + 1, abi).Count == 0)
+                        return;
+                }
+
                 if (IsAbiCall(node))
                 {
                     EmitCallLikeTreeNode(node, () => _nextSpillSlot++, blockLinearNodes, allNodes);

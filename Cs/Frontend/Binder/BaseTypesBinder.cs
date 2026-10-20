@@ -175,6 +175,7 @@ namespace Cnidaria.Cs
                 }
             }
 
+            RecordBinder.DeclareMembers(compilation, diagnostics);
             BindOverrides(compilation, trees, diagnostics);
             ValidateAbstractMemberImplementations(compilation, trees, diagnostics);
         }
@@ -213,6 +214,7 @@ namespace Cnidaria.Cs
             ClassDeclarationSyntax c => c.BaseList,
             StructDeclarationSyntax s => s.BaseList,
             InterfaceDeclarationSyntax i => i.BaseList,
+            RecordDeclarationSyntax r => r.BaseList,
             _ => null
         };
         private static bool HasModifier(SyntaxTokenList mods, SyntaxKind kind)
@@ -330,6 +332,12 @@ namespace Cnidaria.Cs
         {
             for (int i = 0; i < overrides.Count; i++)
             {
+                for (var overridden = overrides[i].OverriddenMethod; overridden is not null; overridden = overridden.OverriddenMethod)
+                {
+                    if (ReferenceEquals(overridden.OriginalDefinition, method.OriginalDefinition) &&
+                        LocalScopeBinder.AreSameType(overridden.ContainingSymbol as TypeSymbol, method.ContainingSymbol as TypeSymbol))
+                        return true;
+                }
                 if (string.Equals(overrides[i].Name, method.Name, StringComparison.Ordinal) && SignatureEquals(overrides[i], method))
                     return true;
             }
@@ -429,10 +437,7 @@ namespace Cnidaria.Cs
 
             for (int i = 0; i < baseList.Types.Count; i++)
             {
-                var bt = baseList.Types[i];
-                if (bt is not SimpleBaseTypeSyntax sbt)
-                    continue;
-
+                var sbt = baseList.Types[i];
                 var t = binder.BindType(sbt.Type, context, diagnostics);
                 if (t is not NamedTypeSymbol nt)
                 {
@@ -545,7 +550,7 @@ namespace Cnidaria.Cs
             var seen = new HashSet<SourceNamedTypeSymbol>();
 
             NamedTypeSymbol? cur = baseCandidate;
-            while (cur is SourceNamedTypeSymbol curSource)
+            while (cur?.OriginalDefinition is SourceNamedTypeSymbol curSource)
             {
                 if (ReferenceEquals(curSource, start))
                     return true;

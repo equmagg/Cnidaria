@@ -19,7 +19,7 @@ namespace Cnidaria.Cs
         }
     }
     /// <summary>Builds source declarations and required synthesized members</summary>
-    internal sealed class DeclarationBuilder
+    internal sealed partial class DeclarationBuilder
     {
         private const string OpetatorPrefix = "op_";
         private readonly DiagnosticBag _diagnostics;
@@ -55,6 +55,7 @@ namespace Cnidaria.Cs
                 DeclareCompilationUnit(tree, tree.Root, _global);
             }
             CompleteDelegateBaseTypes();
+            DeclareRecordConstructors();
             SynthesizeDefaultConstructors();
             SynthesizeTypeInitializers();
             var immutable = _declByTree.ToImmutableDictionary(
@@ -131,6 +132,8 @@ namespace Cnidaria.Cs
         // Constructor synthesis depends on type kind and existing instance constructors
         private void EnsureDefaultConstructor(SourceNamedTypeSymbol type)
         {
+            if (type.IsRecord)
+                return;
             if (type.TypeKind is not (TypeKind.Class or TypeKind.Struct))
                 return;
             bool hasAnyInstanceCtor = false;
@@ -277,6 +280,10 @@ namespace Cnidaria.Cs
 
                 case ClassDeclarationSyntax c:
                     DeclareTypeDeclaration(tree, c, container, TypeKind.Class, c.TypeParameterList);
+                    return;
+
+                case RecordDeclarationSyntax r:
+                    DeclareTypeDeclaration(tree, r, container, r.Kind == SyntaxKind.RecordStructDeclaration ? TypeKind.Struct : TypeKind.Class, r.TypeParameterList);
                     return;
 
                 case StructDeclarationSyntax s:
@@ -563,7 +570,7 @@ namespace Cnidaria.Cs
             }
             else
             {
-                if (type.TypeKind != kind)
+                if (type.TypeKind != kind || type.IsRecord != (syntax is RecordDeclarationSyntax))
                 {
                     _diagnostics.Add(new Diagnostic(
                         id: "CN0001",
@@ -604,7 +611,14 @@ namespace Cnidaria.Cs
             if (kind == TypeKind.Class && isAbstract && type is SourceNamedTypeSymbol abstractType)
                 abstractType.MarkAbstract();
             if (type is SourceNamedTypeSymbol srcType)
+            {
                 srcType.AddDeclaration(tree, syntax);
+                if (syntax is RecordDeclarationSyntax record)
+                {
+                    srcType.RecordInfo ??= new RecordTypeInfo(srcType, tree, record);
+                    srcType.RecordInfo.AddDeclaration(tree, record, _diagnostics);
+                }
+            }
             RecordDeclared(tree, syntax, type);
 
             // Type parameters participate in declaration lookup
@@ -621,6 +635,9 @@ namespace Cnidaria.Cs
             {
                 switch (m)
                 {
+                    case RecordDeclarationSyntax r:
+                        DeclareTypeDeclaration(tree, r, type, r.Kind == SyntaxKind.RecordStructDeclaration ? TypeKind.Struct : TypeKind.Class, r.TypeParameterList);
+                        break;
                     case ClassDeclarationSyntax c:
                         DeclareTypeDeclaration(tree, c, type, TypeKind.Class, c.TypeParameterList);
                         break;

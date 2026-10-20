@@ -1,5 +1,8 @@
+using System.Runtime.CompilerServices;
+
 namespace Internal.Runtime
 {
+
     // The head of the MethodTable every native code generator emits
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     internal unsafe struct MethodTable
@@ -97,12 +100,40 @@ namespace Internal.Runtime
 }
 namespace System.Runtime
 {
+    // Exposed in Internal.CompilerServices only
+    [AttributeUsage(AttributeTargets.Method | AttributeTargets.Constructor, Inherited = false)]
+    internal sealed class RuntimeImportAttribute : Attribute
+    {
+        public string DllName { get; }
+        public string EntryPoint { get; }
+
+        public RuntimeImportAttribute(string entry)
+        {
+            EntryPoint = entry;
+        }
+
+        public RuntimeImportAttribute(string dllName, string entry)
+        {
+            EntryPoint = entry;
+            DllName = dllName;
+        }
+    }
+
     internal static class RuntimeImports
     {
+        internal const string RuntimeLibrary = "*";
+
+        // Moves memory from smem to dmem. Size must be a positive value.
+        // This copy uses an intrinsic to be safe for copying arbitrary bits of
+        // heap memory
+        [MethodImplAttribute(MethodImplOptions.InternalCall)]
+        [RuntimeImport(RuntimeLibrary, "RhBulkMoveWithWriteBarrier")]
+        internal static extern unsafe void RhBulkMoveWithWriteBarrier(ref byte dmem, ref byte smem, nuint size);
+
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static unsafe T[] RhAllocateNewArray<T>(int length, uint flags) => null!;
 
-        // The runtime handle of an object's type: its MethodTable on native targets, its type id on the VMs.
+        // Those are not standard:
         [Intrinsic]
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static IntPtr RhGetObjectTypeHandle(object obj) => default;

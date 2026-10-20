@@ -1051,7 +1051,7 @@ namespace Cnidaria.Cs
                     ? node.Flags & (GenTreeFlags.Prolog | GenTreeFlags.AssertionProperties | GenTreeFlags.MakeCse)
                     : node.Flags;
                 for (int i = 0; i < node.Operands.Length; i++)
-                    flags |= node.Operands[i].Flags & ~(GenTreeFlags.AssertionProperties | GenTreeFlags.ExplicitInit);
+                    flags |= node.Operands[i].Flags & ~(GenTreeFlags.AssertionProperties | GenTreeFlags.ExplicitInit | GenTreeFlags.Unaligned);
                 node.Flags = flags;
             }
 

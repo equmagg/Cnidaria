@@ -391,7 +391,8 @@ namespace Cnidaria.Cs
             bool isExtensionMethod,
             ImmutableArray<TypeParameterSymbol> typeParameters,
             bool isExtern = false,
-            bool returnsByRefReadonly = false)
+            bool returnsByRefReadonly = false,
+            bool isInitOnly = false)
         {
             var m = new ExternalMethodSymbol(
                 name: name,
@@ -407,7 +408,8 @@ namespace Cnidaria.Cs
                 isSealed: isSealed,
                 isExtensionMethod: isExtensionMethod,
                 isExtern: isExtern,
-                returnsByRefReadonly: returnsByRefReadonly);
+                returnsByRefReadonly: returnsByRefReadonly,
+                isInitOnly: isInitOnly);
 
             if (!typeParameters.IsDefaultOrEmpty && m is ExternalMethodSymbol em)
                 em.SetTypeParameters(typeParameters);
@@ -911,6 +913,14 @@ namespace Cnidaria.Cs
 
                 if (body is null || decl is null)
                     continue;
+                if (decl.ContainingSymbol is NamedTypeSymbol { TypeKind: not TypeKind.Interface })
+                {
+                    if (body is ExternalMethodSymbol external)
+                        external.SetOverriddenMethod(decl);
+                    else if (body is SourceMethodSymbol source)
+                        source.SetOverriddenMethod(decl);
+                    continue;
+                }
                 // A static member implementing a static abstract or virtual member by name keeps its name; only explicit implementations are renamed.
                 if (body.IsStatic && StringComparer.Ordinal.Equals(body.Name, decl.Name))
                     continue;
@@ -1713,7 +1723,8 @@ namespace Cnidaria.Cs
                     ref reader,
                     declaringType,
                     mtps,
-                    out bool returnsByRefReadonly);
+                    out bool returnsByRefReadonly,
+                    out bool isInitOnly);
                 int returnParamRid = _md.FindParamRid(mrid, 0);
                 if (returnParamRid != 0)
                     retType = ApplyTupleElementNames(core, retType, MetadataToken.Make(MetadataToken.ParamDef, returnParamRid));
@@ -1765,7 +1776,8 @@ namespace Cnidaria.Cs
                     typeParameters: mtps,
                     isExtern: (mdRow.ImplFlags & MetadataFlagBits.Extern) != 0 ||
                               (mdRow.Flags & (ushort)System.Reflection.MethodAttributes.PinvokeImpl) != 0,
-                    returnsByRefReadonly: returnsByRefReadonly);
+                    returnsByRefReadonly: returnsByRefReadonly,
+                    isInitOnly: isInitOnly);
 
                 ApplyParamRefKinds(ms, mrid);
                 ApplyParamDefaultValues(ms, mrid, constByParent);
@@ -2210,9 +2222,18 @@ namespace Cnidaria.Cs
             ref SigReader reader,
             NamedTypeSymbol? declaringType,
             ImmutableArray<TypeParameterSymbol> methodTypeParameters,
-            out bool returnsByRefReadonly)
+            out bool returnsByRefReadonly,
+            out bool isInitOnly)
         {
             returnsByRefReadonly = false;
+            isInitOnly = false;
+            while (reader.PeekByte() == (byte)SigElementType.CMOD_REQD || reader.PeekByte() == (byte)SigElementType.CMOD_OPT)
+            {
+                var modifierKind = (SigElementType)reader.ReadByte();
+                uint modifierType = reader.ReadCompressedUInt();
+                isInitOnly |= modifierKind == SigElementType.CMOD_REQD &&
+                    GetModifierTypeName(modifierType, typeByRid) == ("System.Runtime.CompilerServices", "IsExternalInit");
+            }
             if (reader.PeekByte() != (byte)SigElementType.BYREF)
                 return ReadType(core, typeByRid, ref reader, declaringType, methodTypeParameters);
 

@@ -21,6 +21,69 @@ namespace System.Diagnostics
 
         public DebuggingModes DebuggingFlags { get; }
     }
+
+    public enum DebuggerBrowsableState
+    {
+        Never = 0,
+        // Expanded is not supported in this release
+        // Expanded = 1,
+        Collapsed = 2,
+        RootHidden = 3
+    }
+
+    [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property, AllowMultiple = false)]
+    public sealed class DebuggerBrowsableAttribute : Attribute
+    {
+        public DebuggerBrowsableAttribute(DebuggerBrowsableState state)
+        {
+            if (state < DebuggerBrowsableState.Never || state > DebuggerBrowsableState.RootHidden)
+                throw new ArgumentOutOfRangeException(nameof(state));
+
+            State = state;
+        }
+        public DebuggerBrowsableState State { get; }
+    }
+
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Delegate | AttributeTargets.Enum |
+        AttributeTargets.Field | AttributeTargets.Property | AttributeTargets.Assembly, AllowMultiple = true)]
+    public sealed class DebuggerDisplayAttribute : Attribute
+    {
+        private Type? _target;
+
+        public DebuggerDisplayAttribute(string? value)
+        {
+            Value = value ?? "";
+            Name = "";
+            Type = "";
+        }
+
+        public string Value { get; }
+
+        public string? Name { get; set; }
+
+        public string? Type { get; set; }
+
+        public Type? Target
+        {
+            get => _target;
+            set
+            {
+                ArgumentNullException.ThrowIfNull(value);
+
+                TargetTypeName = value.AssemblyQualifiedName;
+                _target = value;
+            }
+        }
+
+        public string? TargetTypeName { get; set; }
+    }
+
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Method | AttributeTargets.Constructor, Inherited = false)]
+    public sealed class DebuggerStepThroughAttribute : Attribute
+    {
+        public DebuggerStepThroughAttribute() { }
+    }
+
     /// <summary>
     /// Exception thrown when the program executes an instruction that was thought to be unreachable.
     /// </summary>

@@ -659,6 +659,7 @@ namespace Cnidaria.Cs
     public abstract class NamedTypeSymbol : TypeSymbol
     {
         public abstract TypeKind TypeKind { get; }
+        public virtual bool IsRecord => TypeKind == TypeKind.Class && GetMembers().OfType<MethodSymbol>().Any(m => m.Name == "<Clone>$");
         internal virtual bool MayContainExtensionMembers => true;
         internal virtual bool MayContainExtensionBlocks => true;
         internal virtual IEnumerable<NamedTypeSymbol> GetNestedTypes() => GetMembers().OfType<NamedTypeSymbol>();
@@ -1213,6 +1214,7 @@ namespace Cnidaria.Cs
         public sealed override SymbolKind Kind => SymbolKind.Method;
         public abstract TypeSymbol ReturnType { get; }
         public virtual bool ReturnsByRefReadonly => false;
+        public virtual bool IsInitOnly => DeclaringSyntaxReferences.Any(r => r.Node.Kind == SyntaxKind.InitAccessorDeclaration);
         public abstract ImmutableArray<ParameterSymbol> Parameters { get; }
         public abstract ImmutableArray<TypeParameterSymbol> TypeParameters { get; }
         public abstract bool IsStatic { get; }
@@ -1675,6 +1677,8 @@ namespace Cnidaria.Cs
     /// <summary>Represents a named type declared in source</summary>
     internal sealed class SourceNamedTypeSymbol : NamedTypeSymbol
     {
+        internal RecordTypeInfo? RecordInfo { get; set; }
+        public override bool IsRecord => RecordInfo is not null || (IsFromMetadata && base.IsRecord);
         private bool _isSealed;
         private bool _isAbstract;
         private bool _isUnsafe;
@@ -1779,6 +1783,14 @@ namespace Cnidaria.Cs
                 ? ImmutableArray<TypeSymbol>.Empty
                 : interfaces;
         }
+        internal void AddSynthesizedInterface(TypeSymbol type)
+        {
+            if (!Interfaces.Any(i => LocalScopeBinder.AreSameType(i, type)))
+            {
+                _declaredInterfaces = Interfaces.Add(type);
+                _declaredInterfacesSet = true;
+            }
+        }
         public void SetTypeParameters(ImmutableArray<TypeParameterSymbol> tps)
         {
             if (!_typeParameters.IsDefault) throw new InvalidOperationException("TypeParameters already set.");
@@ -1828,6 +1840,13 @@ namespace Cnidaria.Cs
         public void AddMember(Symbol member)
         {
             _members.Add(member);
+            _memberSnapshot = default;
+        }
+
+        internal void MoveMember(Symbol member, int index)
+        {
+            _members.Remove(member);
+            _members.Insert(index, member);
             _memberSnapshot = default;
         }
 
@@ -1941,6 +1960,9 @@ namespace Cnidaria.Cs
     /// <summary>Represents a method-like declaration from source</summary>
     internal sealed class SourceMethodSymbol : MethodSymbol
     {
+        private bool _isInitOnly;
+        public override bool IsInitOnly => _isInitOnly || base.IsInitOnly;
+        internal void MarkInitOnly() => _isInitOnly = true;
         public override string Name { get; }
         public override Symbol? ContainingSymbol { get; }
         public override ImmutableArray<Location> Locations { get; }
@@ -2172,6 +2194,7 @@ namespace Cnidaria.Cs
 
         private bool _membersInitialized;
         private ImmutableArray<Symbol> _members;
+        private ImmutableArray<Symbol> _originalMembers;
 
         private bool _baseInitialized;
         private TypeSymbol? _baseType;
@@ -2183,6 +2206,8 @@ namespace Cnidaria.Cs
         public override bool IsSealed => _originalDefinition.IsSealed;
         public override bool IsRefLikeType => _originalDefinition.IsRefLikeType;
         public override bool IsReadOnlyStruct => _originalDefinition.IsReadOnlyStruct;
+        public override bool IsRecord => _originalDefinition.IsRecord;
+        public override bool IsAbstract => _originalDefinition.IsAbstract;
         public SubstitutedNamedTypeSymbol(
             TypeManager types,
             NamedTypeSymbol originalDefinition,
@@ -2228,12 +2253,12 @@ namespace Cnidaria.Cs
         {
             get
             {
-                if (_lazyInterfacesInitialized)
+                var src = _originalDefinition.Interfaces;
+                if (_lazyInterfacesInitialized && _lazyInterfaces.Length == src.Length)
                     return _lazyInterfaces;
 
                 _lazyInterfacesInitialized = true;
 
-                var src = _originalDefinition.Interfaces;
                 if (src.IsDefaultOrEmpty)
                     return _lazyInterfaces = ImmutableArray<TypeSymbol>.Empty;
 
@@ -2270,10 +2295,10 @@ namespace Cnidaria.Cs
 
         public override ImmutableArray<Symbol> GetMembers()
         {
-            if (_membersInitialized) return _members;
-            _membersInitialized = true;
-
             var orig = _originalDefinition.GetMembers();
+            if (_membersInitialized && _originalMembers == orig) return _members;
+            _membersInitialized = true;
+            _originalMembers = orig;
             var b = ImmutableArray.CreateBuilder<Symbol>(orig.Length);
 
             for (int i = 0; i < orig.Length; i++)
@@ -2440,6 +2465,7 @@ namespace Cnidaria.Cs
         internal override ExtensionMemberInfo? ExtensionMember => _original.ExtensionMember;
         public override TypeSymbol ReturnType => _returnType;
         public override bool ReturnsByRefReadonly => _original.ReturnsByRefReadonly;
+        public override bool IsInitOnly => _original.IsInitOnly;
         public override ImmutableArray<ParameterSymbol> Parameters => _parameters;
         public override MethodSymbol OriginalDefinition => _original.OriginalDefinition;
         public override bool IsExplicitInterfaceImplementation => _original.IsExplicitInterfaceImplementation;
@@ -2543,6 +2569,7 @@ namespace Cnidaria.Cs
 
         public override TypeSymbol ReturnType => _returnType;
         public override bool ReturnsByRefReadonly => _definition.ReturnsByRefReadonly;
+        public override bool IsInitOnly => _definition.IsInitOnly;
         public override ImmutableArray<ParameterSymbol> Parameters => _parameters;
         public override ImmutableArray<AttributeData> GetAttributes() => _definition.GetAttributes();
         public ConstructedMethodSymbol(MethodSymbol definition, ImmutableArray<TypeSymbol> typeArguments, TypeManager types)
@@ -2814,6 +2841,9 @@ namespace Cnidaria.Cs
     /// <summary>Represents a method loaded from external metadata</summary>
     internal sealed class ExternalMethodSymbol : MethodSymbol
     {
+        private MethodSymbol? _overriddenMethod;
+        public override MethodSymbol? OverriddenMethod => _overriddenMethod;
+        internal void SetOverriddenMethod(MethodSymbol method) => _overriddenMethod ??= method;
         private readonly bool _isVirtual;
         private readonly bool _isAbstract;
         private readonly bool _isOverride;
@@ -2828,6 +2858,7 @@ namespace Cnidaria.Cs
         public override MethodSymbol? ExplicitInterfaceImplementation => _explicitInterfaceImplementation;
         public override TypeSymbol ReturnType { get; }
         public override bool ReturnsByRefReadonly { get; }
+        public override bool IsInitOnly { get; }
         public override ImmutableArray<ParameterSymbol> Parameters { get; }
         public override ImmutableArray<TypeParameterSymbol> TypeParameters
          => _typeParameters.IsDefault ? ImmutableArray<TypeParameterSymbol>.Empty : _typeParameters;
@@ -2840,7 +2871,7 @@ namespace Cnidaria.Cs
         public override bool IsExtensionMethod => _isExtensionMethod;
         public override bool IsVirtual => _isVirtual;
         public override bool IsAbstract => _isAbstract;
-        public override bool IsOverride => _isOverride;
+        public override bool IsOverride => _isOverride || _overriddenMethod is not null;
         public override bool IsSealed => _isSealed;
         private ExtensionMemberInfo? _extensionMember;
         internal override ExtensionMemberInfo? ExtensionMember => _extensionMember;
@@ -2859,12 +2890,14 @@ namespace Cnidaria.Cs
             bool isSealed,
             bool isExtensionMethod,
             bool isExtern = false,
-            bool returnsByRefReadonly = false)
+            bool returnsByRefReadonly = false,
+            bool isInitOnly = false)
         {
             Name = name;
             ContainingSymbol = containing;
             ReturnType = returnType;
             ReturnsByRefReadonly = returnsByRefReadonly;
+            IsInitOnly = isInitOnly;
             IsStatic = isStatic;
             IsConstructor = isConstructor;
             IsExtern = isExtern;
