@@ -28,6 +28,15 @@ namespace Cnidaria.Cs
                     throw new InvalidOperationException($"Duplicate method in register code generation input: M{method.RuntimeMethod.MethodId}");
             }
 
+            var imports = ImmutableArray.CreateBuilder<RegisterBytecodeImport>();
+            foreach (var method in program.Methods)
+                foreach (GenTree node in method.LinearNodes)
+                    if (node.Method is RuntimeMethod foreign && foreign.IsExtern && !foreign.HasInternalCall && !methodEntryLabels.ContainsKey(foreign.MethodId))
+                    {
+                        imports.Add(RegisterBytecodeLinker.Import(foreign, target));
+                        methodEntryLabels.Add(foreign.MethodId, asm.CreateLabel());
+                    }
+
             for (int i = 0; i < program.Methods.Length; i++)
             {
                 var method = program.Methods[i];
@@ -41,7 +50,14 @@ namespace Cnidaria.Cs
 
             new DelegateStubEmitter(asm, state, methodEntryLabels, target).EmitAll();
 
-            return asm.Build(flags, validate: options.VerifyImage);
+            foreach (var import in imports)
+            {
+                asm.BeginMethod(import.MethodId, methodEntryLabels[import.MethodId], -1, default);
+                asm.Trap(0);
+                asm.EndMethod();
+            }
+
+            return asm.Build(flags, validate: options.VerifyImage, imports: imports.ToImmutable());
         }
 
         private static void InternMethodSignatureLayouts(Assembler asm, GenTreeProgram program)
@@ -397,10 +413,6 @@ namespace Cnidaria.Cs
 
             private void EmitCallForTarget(RuntimeMethod target, CallFlags flags)
             {
-                if (target.IsExtern)
-                    throw new PlatformNotSupportedException(
-                        $"Extern method calls are not supported by the register-bytecode target: M{target.MethodId} '{target.Name}'.");
-
                 if (target.HasInternalCall)
                 {
                     _asm.Emit(InstrDesc.Call(Op.CallInternal, target.MethodId, flags | CallFlags.InternalCall));
@@ -1921,6 +1933,15 @@ namespace Cnidaria.Cs
                 bool fromUnsigned = (source.ConvFlags & NumericConvFlags.SourceUnsigned) != 0;
                 bool checkedConversion = (source.ConvFlags & NumericConvFlags.Checked) != 0;
 
+                if (checkedConversion && fromI32 &&
+                    (fromUnsigned && source.ConvKind is NumericConvKind.I4 or NumericConvKind.NativeInt ||
+                     !fromUnsigned && source.ConvKind is NumericConvKind.U4 or NumericConvKind.NativeUInt))
+                {
+                    EmitR(source, fromUnsigned ? Op.U32ToI64 : Op.I32ToI64, rd, rs, MachineRegister.Invalid);
+                    EmitR(source, fromUnsigned ? Op.I64ToI32Ovf : Op.I64ToU32Ovf, rd, rd, MachineRegister.Invalid);
+                    return;
+                }
+
                 switch (source.ConvKind)
                 {
                     case NumericConvKind.Bool:
@@ -2902,10 +2923,6 @@ namespace Cnidaria.Cs
 
             private Label ResolveMethodEntryLabel(RuntimeMethod method)
             {
-                if (method.IsExtern)
-                    throw new PlatformNotSupportedException(
-                        $"Extern methods are not supported by the register-bytecode target: M{method.MethodId} '{method.Name}'.");
-
                 if (!_methodEntryLabels.TryGetValue(method.MethodId, out Label label))
                     throw new InvalidOperationException($"Method is not present in the linked register image: M{method.MethodId}");
                 return label;
@@ -2913,10 +2930,6 @@ namespace Cnidaria.Cs
 
             private Label ResolveDirectCallTarget(GenTree instruction, RuntimeMethod method)
             {
-                if (method.IsExtern)
-                    throw Unsupported(instruction,
-                        $"extern calls are not supported by the register-bytecode target: M{method.MethodId} '{method.Name}'");
-
                 if (!_methodEntryLabels.TryGetValue(method.MethodId, out Label label))
                     throw Unsupported(instruction, $"direct managed call target is not present in the linked register image: M{method.MethodId}");
                 return label;

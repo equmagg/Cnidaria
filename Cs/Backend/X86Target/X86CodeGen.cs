@@ -4724,9 +4724,6 @@ namespace Cnidaria.Cs
 
                     RuntimeType elementType = node.RuntimeType ?? node.Type ??
                         throw Unsupported(node, "Typed array operation has no element runtime type");
-                    RuntimeType? arrayType = OperandType(node, 0);
-                    if (arrayType is not null && arrayType.Kind == RuntimeTypeKind.Array && !arrayType.IsSzArray)
-                        throw Unsupported(node, "Only single-dimensional zero-based arrays are implemented");
 
                     switch (node.TreeKind)
                     {
@@ -4935,7 +4932,7 @@ namespace Cnidaria.Cs
                     _owner.Emit(X86Instruction.Binary(
                         X86InstrKind.Lea,
                         Reg(destination, Target.PointerSize),
-                        X86Operand.Memory(array, Target.ArrayDataOffset, Target.PointerSize, scaledIndex, 1)));
+                        X86Operand.Memory(array, (Target.ArrayDataOffset + node.Int32), Target.PointerSize, scaledIndex, 1)));
                 }
 
                 private X86Operand ArrayElementMemory(
@@ -4966,7 +4963,7 @@ namespace Cnidaria.Cs
                         throw Unsupported(node, "x86 indexed array addressing requires a 1, 2, 4, or 8 byte element");
                     return X86Operand.Memory(
                         array,
-                        Target.ArrayDataOffset,
+                        (Target.ArrayDataOffset + node.Int32),
                         size == 0 ? elementSize : size,
                         index,
                         elementSize);
@@ -5034,7 +5031,7 @@ namespace Cnidaria.Cs
                         Reg(X86Register.R10, 8),
                         Mem(X86Register.R10, 0, 8)));
                     EmitMethodTableElementType(X86Register.R11, X86Register.R10);
-                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.R11, 4), Imm(0x18)));
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.R11, 4), Imm(node.Int32 == 0 ? 0x18 : 0x17)));
                     _owner.Emit(X86Instruction.ConditionalBranch(
                         X86Condition.Ne,
                         X86Operand.SymbolOperand(cleanupFail, 4, X86ObjectRelocationKind.Relative32)));
@@ -5130,6 +5127,8 @@ namespace Cnidaria.Cs
                     string targetInterface = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_target_interface");
                     string targetSystemArray = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_target_system_array");
                     string targetSzArray = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_target_szarray");
+                    string targetMdArray = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_target_mdarray");
+                    string arrayElements = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_array_elements");
                     string sourceBase = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_source_base");
                     string interfaceLoop = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_interface_loop");
 
@@ -5158,6 +5157,9 @@ namespace Cnidaria.Cs
                     _owner.Emit(X86Instruction.ConditionalBranch(
                         X86Condition.E,
                         X86Operand.SymbolOperand(targetSzArray, 4, X86ObjectRelocationKind.Relative32)));
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.R11, 4), Imm(elementTypeArray)));
+                    _owner.Emit(X86Instruction.ConditionalBranch(X86Condition.E,
+                        X86Operand.SymbolOperand(targetMdArray, 4, X86ObjectRelocationKind.Relative32)));
                     EmitJump(failure);
 
                     _owner.DefineLabel(targetClass);
@@ -5192,12 +5194,23 @@ namespace Cnidaria.Cs
                         X86Operand.SymbolOperand(success, 4, X86ObjectRelocationKind.Relative32)));
                     EmitJump(failure);
 
+                    _owner.DefineLabel(targetMdArray);
+                    EmitMethodTableElementType(X86Register.R11, X86Register.R10);
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.R11, 4), Imm(elementTypeArray)));
+                    _owner.Emit(X86Instruction.ConditionalBranch(X86Condition.Ne,
+                        X86Operand.SymbolOperand(failure, 4, X86ObjectRelocationKind.Relative32)));
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.R11, 4), Mem(X86Register.Rax, 4, 4)));
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.R11, 4), Mem(X86Register.R10, 4, 4)));
+                    _owner.Emit(X86Instruction.ConditionalBranch(X86Condition.Ne,
+                        X86Operand.SymbolOperand(failure, 4, X86ObjectRelocationKind.Relative32)));
+                    EmitJump(arrayElements);
                     _owner.DefineLabel(targetSzArray);
                     EmitMethodTableElementType(X86Register.R11, X86Register.R10);
                     _owner.Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.R11, 4), Imm(elementTypeSzArray)));
                     _owner.Emit(X86Instruction.ConditionalBranch(
                         X86Condition.Ne,
                         X86Operand.SymbolOperand(failure, 4, X86ObjectRelocationKind.Relative32)));
+                    _owner.DefineLabel(arrayElements);
                     _owner.Emit(X86Instruction.Binary(
                         X86InstrKind.Mov,
                         Reg(X86Register.Rax, 8),
@@ -5778,8 +5791,6 @@ namespace Cnidaria.Cs
                     RuntimeType arrayType = node.Type ?? node.RuntimeType ?? throw Unsupported(node, "NewArray node has no array runtime type");
                     if (arrayType.Kind != RuntimeTypeKind.Array)
                         throw Unsupported(node, "NewArray node has a non-array runtime type");
-                    if (!arrayType.IsSzArray)
-                        throw Unsupported(node, "Multidimensional array allocation is not implemented");
                     if (node.Uses.Length != 1 || node.Results.Length != 1 || !node.Results[0].IsRegister)
                         throw Unsupported(node, "NewArray must have one register length operand and one register result");
 

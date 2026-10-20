@@ -982,7 +982,9 @@ namespace System
             return array.Length == 0 ? SZGenericArrayEnumerator<T>.Empty : new SZGenericArrayEnumerator<T>(array, array.Length);
         }
 
-        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => base.GetEnumerator();
+
+        internal override System.Collections.IEnumerator GetArrayEnumerator() => new ArrayEnumerator<T>(this);
 
         public int Count => Unsafe.As<T[]>(this).Length;
 
@@ -1083,7 +1085,27 @@ namespace System
 
         object? IEnumerator.Current => Current;
     }
-    public class Array
+    internal sealed class ArrayEnumerator<T> : SZGenericArrayEnumeratorBase, System.Collections.IEnumerator
+    {
+        private readonly Array _array;
+
+        internal ArrayEnumerator(Array array) : base(array.Length)
+        {
+            _array = array;
+        }
+
+        public object? Current
+        {
+            get
+            {
+                if ((uint)_index >= (uint)_endIndex)
+                    ThrowHelper.ThrowInvalidOperationException_EnumCurrent(_index);
+                ref byte data = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(_array);
+                return Unsafe.Add(ref Unsafe.As<byte, T>(ref data), _index);
+            }
+        }
+    }
+    public class Array : System.Collections.IEnumerable
     {
         // This is the threshold where Introspective sort switches to Insertion sort.
         // Empirically, 16 seems to speed up most cases without slowing down others, at least for integers.
@@ -1102,8 +1124,34 @@ namespace System
 
         public unsafe int Rank => RuntimeHelpers.GetMethodTable(this)->ArrayRank;
 
-        // SZ arrays enumerate through Array<T>; other arrays have no enumerator yet and fail the cast
-        public System.Collections.IEnumerator GetEnumerator() => ((System.Collections.IEnumerable)this).GetEnumerator();
+        public long LongLength => Length;
+
+        public unsafe int GetLength(int dimension)
+        {
+            if ((uint)dimension >= (uint)Rank)
+                throw new IndexOutOfRangeException();
+            if (RuntimeHelpers.GetMethodTable(this)->BaseSize == Internal.Runtime.MethodTable.SZARRAY_BASE_SIZE)
+                return Length;
+            return Unsafe.Add(ref Unsafe.As<byte, int>(ref Unsafe.As<RawArrayData>(this).Data), dimension);
+        }
+
+        public long GetLongLength(int dimension) => GetLength(dimension);
+
+        public unsafe int GetLowerBound(int dimension)
+        {
+            int rank = Rank;
+            if ((uint)dimension >= (uint)rank)
+                throw new IndexOutOfRangeException();
+            if (RuntimeHelpers.GetMethodTable(this)->BaseSize == Internal.Runtime.MethodTable.SZARRAY_BASE_SIZE)
+                return 0;
+            return Unsafe.Add(ref Unsafe.As<byte, int>(ref Unsafe.As<RawArrayData>(this).Data), rank + dimension);
+        }
+
+        public int GetUpperBound(int dimension) => unchecked(GetLowerBound(dimension) + GetLength(dimension) - 1);
+
+        public System.Collections.IEnumerator GetEnumerator() => GetArrayEnumerator();
+
+        internal virtual System.Collections.IEnumerator GetArrayEnumerator() => throw new NotSupportedException();
 
         public static T[] Empty<T>()
         {
@@ -1160,20 +1208,18 @@ namespace System
         public static void Clear(Array array)
         {
             if ((object)array == null) throw new ArgumentNullException("array");
-            Clear(array, 0, array.Length);
+            ClearInternal(array, 0, array.Length);
         }
 
         public static void Clear(Array array, int index, int length)
         {
             if ((object)array == null) throw new ArgumentNullException("array");
-            if (index < 0) throw new ArgumentOutOfRangeException("index");
-            if (length < 0) throw new ArgumentOutOfRangeException("length");
-
-            int alen = array.Length;
-            if (alen - index < length) throw new IndexOutOfRangeException();
+            long offset = (long)index - array.GetLowerBound(0);
+            if (offset < 0 || length < 0 || offset + length > array.Length)
+                throw new IndexOutOfRangeException();
             if (length == 0) return;
 
-            ClearInternal(array, index, length);
+            ClearInternal(array, (int)offset, length);
         }
 
         [MethodImpl(MethodImplOptions.InternalCall)]
@@ -1254,29 +1300,29 @@ namespace System
             if ((object)destinationArray == null) throw new ArgumentNullException("destinationArray");
             if (length < 0) throw new ArgumentOutOfRangeException("length");
 
-            Copy(sourceArray, 0, destinationArray, 0, length);
+            Copy(sourceArray, sourceArray.GetLowerBound(0), destinationArray, destinationArray.GetLowerBound(0), length);
         }
         public static unsafe void Copy(Array sourceArray, int sourceIndex, Array destinationArray, int destinationIndex, int length)
         {
             if ((object)sourceArray == null) throw new ArgumentNullException("sourceArray");
             if ((object)destinationArray == null) throw new ArgumentNullException("destinationArray");
 
-            if (sourceIndex < 0) throw new ArgumentOutOfRangeException("sourceIndex");
-            if (destinationIndex < 0) throw new ArgumentOutOfRangeException("destinationIndex");
+            if (sourceArray.Rank != destinationArray.Rank) throw new RankException();
+            long sourceOffset = (long)sourceIndex - sourceArray.GetLowerBound(0);
+            long destinationOffset = (long)destinationIndex - destinationArray.GetLowerBound(0);
+            if (sourceOffset < 0) throw new ArgumentOutOfRangeException("sourceIndex");
+            if (destinationOffset < 0) throw new ArgumentOutOfRangeException("destinationIndex");
             if (length < 0) throw new ArgumentOutOfRangeException("length");
 
             int srcLen = sourceArray.Length;
             int dstLen = destinationArray.Length;
 
-            if ((uint)sourceIndex > (uint)srcLen) throw new ArgumentOutOfRangeException("sourceIndex");
-            if ((uint)destinationIndex > (uint)dstLen) throw new ArgumentOutOfRangeException("destinationIndex");
-
-            if (srcLen - sourceIndex < length) throw new ArgumentException();
-            if (dstLen - destinationIndex < length) throw new ArgumentException();
+            if (sourceOffset + length > srcLen) throw new ArgumentException();
+            if (destinationOffset + length > dstLen) throw new ArgumentException();
 
             if (length == 0) return;
 
-            if (!CopyInternal(sourceArray, sourceIndex, destinationArray, destinationIndex, length))
+            if (!CopyInternal(sourceArray, (int)sourceOffset, destinationArray, (int)destinationOffset, length))
                 throw new ArrayTypeMismatchException();
         }
         [MethodImpl(MethodImplOptions.InternalCall)]
@@ -19848,6 +19894,12 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         public ArrayTypeMismatchException() : base() { }
         public ArrayTypeMismatchException(string message) : base(message) { }
         public ArrayTypeMismatchException(string message, Exception innerException) : base(message, innerException) { }
+    }
+    public class RankException : SystemException
+    {
+        public RankException() : base() { }
+        public RankException(string message) : base(message) { }
+        public RankException(string message, Exception innerException) : base(message, innerException) { }
     }
     public class AccessViolationException : SystemException
     {

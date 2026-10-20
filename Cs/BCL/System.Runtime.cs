@@ -166,6 +166,31 @@ namespace System.Runtime
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static int RhGetArrayRank(Array array) => 0;
 
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static int RhGetArrayLength(Array array, int dimension) => 0;
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static int RhGetArrayLowerBound(Array array, int dimension) => 0;
+
+        internal static int RhMultiplyArrayLengths(int total, int length, int lowerBound)
+        {
+            if (length < 0)
+                throw new OverflowException();
+            if ((long)lowerBound + length > (long)int.MaxValue + 1)
+                throw new ArgumentOutOfRangeException(nameof(lowerBound));
+            ulong product = (ulong)(uint)total * (uint)length;
+            if (product > uint.MaxValue)
+                throw new OutOfMemoryException();
+            return unchecked((int)product);
+        }
+
+        internal static int RhValidateArrayLength(int total, bool dimensionTooLong)
+        {
+            if (total < 0 || dimensionTooLong)
+                throw new OutOfMemoryException();
+            return total;
+        }
+
         // The object's identity hash, assigned on first request and stable for its lifetime
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static int RhGetObjectHashCode(object obj) => 0;

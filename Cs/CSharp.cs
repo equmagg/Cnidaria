@@ -1375,7 +1375,8 @@ public static class CSharp
         TargetInfo target,
         bool library = false,
         string moduleName = "app",
-        IReadOnlyList<string>? neededLibraries = null)
+        IReadOnlyList<string>? neededLibraries = null,
+        IReadOnlyList<RegisterBytecodeLibrary>? bytecodeLibraries = null)
     {
         if (target is null) throw new ArgumentNullException(nameof(target));
         var diagnostics = new List<IDiagnostic>();
@@ -1383,6 +1384,8 @@ public static class CSharp
         {
             if (sources.IsDefaultOrEmpty)
                 throw new ArgumentException("Project requires at least one managed source.", nameof(sources));
+            if (bytecodeLibraries is not null && bytecodeLibraries.Count > 0 && (library || !target.IsRegisterBytecode))
+                throw new ArgumentException("RBC libraries require an RBC executable target.", nameof(bytecodeLibraries));
             var standard = target.Is32Bit ? StandardLibrary32Bit : StandardLibrary64Bit;
             var extended = target.Is32Bit ? ExtendedLibrary32Bit : ExtendedLibrary64Bit;
             AddDiagnostics(diagnostics, extended.diags);
@@ -1423,6 +1426,12 @@ public static class CSharp
             if (BackendPipeline.TryCompileProgram(program, target, out var output))
             {
                 byte[] executable;
+                if (output is CodeImage register)
+                {
+                    if (neededLibraries is not null && neededLibraries.Count > 0) throw new NotSupportedException("RBC linking requires bytecode libraries, not ELF dependencies.");
+                    CodeImage linked = RegisterBytecodeLinker.Link(register, bytecodeLibraries ?? Array.Empty<RegisterBytecodeLibrary>());
+                    return (SerializeRegisterRunnableApplication(module, linked.ToExecutableBytes()), diagnostics);
+                }
                 if (neededLibraries is { Count: > 0 })
                 {
                     if (target.OperatingSystem != OperatingSystemKind.Linux)

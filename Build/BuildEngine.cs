@@ -478,17 +478,18 @@ internal sealed class BuildEngine
             }
             if (dependencies.Length > 0 && backend != BuildBackend.Managed)
                 throw new BuildException("NativeReference can only be attached to a managed module.");
-            var nativeLibraries = new List<string>();
+            var arch = ParseArchitecture(GetProperty("TargetArchitecture"));
+            bool bytecode = arch is TargetArchitectureKind.RegisterBytecode or TargetArchitectureKind.RegisterBytecode64;
+            var nativeLibraries = new List<BuildSource>();
             foreach (var dep in dependencies)
             {
                 var artifact = _artifacts.SingleOrDefault(a => a.Module.Equals(dep, StringComparison.OrdinalIgnoreCase));
                 if (artifact.Backend != BuildBackend.Unmanaged || artifact.Kind != BuildOutputKind.SharedLibrary)
                     throw new BuildException($"NativeReference '{dep}' must point to a built unmanaged shared library.");
-                nativeLibraries.Add(artifact.Path.Substring(artifact.Path.LastIndexOf('/') + 1));
+                nativeLibraries.Add(new BuildSource(artifact.Path, bytecode ? Read(artifact.Path, _limits.MaxFileBytes) : Array.Empty<byte>()));
             }
             var sources = new List<BuildSource>(items.Length);
             foreach (var item in items) sources.Add(new BuildSource(item.Path, Read(item.Path, _limits.MaxFileBytes)));
-            var arch = ParseArchitecture(GetProperty("TargetArchitecture"));
             var os = ParseEnum<OperatingSystemKind>(GetProperty("TargetOS"), "TargetOS");
             var features = ParseEnum<TargetArchitectureFeatures>(GetProperty("TargetFeatures"), "TargetFeatures");
             var config = GetProperty("Configuration");
@@ -509,7 +510,7 @@ internal sealed class BuildEngine
                 throw new BuildException($"Compilation of '{module}' failed.");
             }
             var filename = module + Extension(first.Kind, arch, os);
-            if (first.Kind == BuildOutputKind.SharedLibrary && os == OperatingSystemKind.Linux)
+            if (first.Kind == BuildOutputKind.SharedLibrary && os == OperatingSystemKind.Linux && arch is not (TargetArchitectureKind.RegisterBytecode or TargetArchitectureKind.RegisterBytecode64))
                 filename = "lib" + filename;
             var outputDirectory = BuildPath.Normalize(GetProperty("OutputPath"), GetProperty("ProjectDir"));
             var path = BuildPath.Normalize(filename, outputDirectory);
@@ -523,6 +524,8 @@ internal sealed class BuildEngine
     private static string Extension(BuildOutputKind kind, TargetArchitectureKind architecture, OperatingSystemKind os)
     {
         if (kind == BuildOutputKind.Library) return ".dll";
+        if (architecture is TargetArchitectureKind.RegisterBytecode or TargetArchitectureKind.RegisterBytecode64)
+            return kind == BuildOutputKind.SharedLibrary ? Cs.RegisterBytecodeLibrary.Extension : ".rbc";
         if (kind == BuildOutputKind.SharedLibrary) return os switch
         {
             OperatingSystemKind.Linux => ".so",
@@ -530,7 +533,6 @@ internal sealed class BuildEngine
             OperatingSystemKind.MacOs => ".dylib",
             _ => ".so"
         };
-        if (architecture is TargetArchitectureKind.RegisterBytecode or TargetArchitectureKind.RegisterBytecode64) return ".rbc";
         return os == OperatingSystemKind.Windows ? ".exe" : ".elf";
     }
 

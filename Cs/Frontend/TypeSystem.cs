@@ -1771,6 +1771,15 @@ namespace Cnidaria.Cs
             if (method is null) throw new ArgumentNullException(nameof(method));
             if (receiverType is null) throw new ArgumentNullException(nameof(receiverType));
 
+            if (method.DeclaringType.Kind == RuntimeTypeKind.Array && receiverType.Kind == RuntimeTypeKind.Array)
+            {
+                foreach (RuntimeMethod candidate in receiverType.Methods)
+                {
+                    if (candidate.Name == method.Name && candidate.ParameterTypes.Length == method.ParameterTypes.Length)
+                        return candidate;
+                }
+            }
+
             for (RuntimeType? cur = receiverType; cur is not null; cur = cur.BaseType)
             {
                 if (ReferenceEquals(method.DeclaringType, cur))
@@ -3463,7 +3472,7 @@ namespace Cnidaria.Cs
 
         private RuntimeType GetOrCreateArrayType(RuntimeType elem, int rank, bool isSzArray)
         {
-            if (rank <= 0) throw new ArgumentOutOfRangeException(nameof(rank));
+            if (rank <= 0 || rank > 32) throw new ArgumentOutOfRangeException(nameof(rank));
             if (isSzArray && rank != 1) throw new ArgumentException("SZARRAY must have rank 1.", nameof(rank));
 
             string key = $"arr:{(isSzArray ? "sz:" : "md:")}{rank}:{elem.TypeId}";
@@ -3489,10 +3498,36 @@ namespace Cnidaria.Cs
             _constructedTypes[key] = t;
             _typeById[t.TypeId] = t;
             // The instantiation may name T[] again, which is cached now
-            if (isSzArray && elem.Kind is not (RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef) &&
+            if (elem.Kind is not (RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef) &&
                 !elem.IsByRefLike && _namedTypes.TryGetValue((SystemArray.AssemblyName, "System", "Array`1"), out var arrayOfT))
             {
                 t.ArrayOfT = GetOrCreateGenericInstanceType(arrayOfT, new[] { elem });
+            }
+            if (!isSzArray)
+            {
+                RuntimeType intType = FindPrimitive(RuntimePrimitiveKind.Int32);
+                RuntimeType voidType = FindPrimitive(RuntimePrimitiveKind.Void);
+                t.Methods = new[]
+                {
+                    ArrayMethod(".ctor", voidType, rank),
+                    ArrayMethod(".ctor", voidType, rank * 2),
+                    ArrayMethod("Get", elem, rank),
+                    ArrayMethod("Set", voidType, rank + 1),
+                    ArrayMethod("Address", GetByRefType(elem), rank)
+                };
+
+                RuntimeMethod ArrayMethod(string name, RuntimeType result, int parameterCount)
+                {
+                    var parameters = new RuntimeType[parameterCount];
+                    Array.Fill(parameters, intType);
+                    if (name == "Set")
+                        parameters[^1] = elem;
+                    var method = new RuntimeMethod(_nextMethodId++, t, name, result, parameters,
+                        hasThis: true, isVirtual: false, isStatic: false, isNewSlot: false, isFinal: false,
+                        flags: (ushort)System.Reflection.MethodAttributes.Public, implFlags: MetadataFlagBits.InternalCall);
+                    _methodById[method.MethodId] = method;
+                    return method;
+                }
             }
             return t;
         }
@@ -3572,7 +3607,7 @@ namespace Cnidaria.Cs
             if (t.ArrayOfT is RuntimeType arrayOfT)
             {
                 EnsureConstructedMembers(arrayOfT);
-                t.Interfaces = arrayOfT.Interfaces;
+                t.Interfaces = t.IsSzArray ? arrayOfT.Interfaces : Array.FindAll(arrayOfT.Interfaces, type => type.GenericTypeDefinition is null);
                 return;
             }
 

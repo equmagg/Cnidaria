@@ -1608,15 +1608,6 @@ namespace Cnidaria.Cs
                     location));
             }
 
-            if (method.IsExtern && !MethodAttributeFacts.HasInternalCall(method) && !compilation.Target.IsRiscV && !compilation.Target.IsX86)
-            {
-                diagnostics.Add(new Diagnostic(
-                    "CN_EXTERN005",
-                    DiagnosticSeverity.Error,
-                    $"Extern methods are not supported for target '{compilation.Target.Architecture}'.",
-                    location));
-            }
-
             if (method.IsExtern && !MethodAttributeFacts.HasInternalCall(method))
             {
                 if (IsGenericExternContext(method))

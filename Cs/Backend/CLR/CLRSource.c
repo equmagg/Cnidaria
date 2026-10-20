@@ -1000,11 +1000,11 @@ static int rh_is_assignable(const RhMethodTable* source, const RhMethodTable* ta
                 source_element_type == RH_EETYPE_ELEMENT_TYPE_SZARRAY;
         }
 
-        if (target_element_type == RH_EETYPE_ELEMENT_TYPE_SZARRAY)
+        if (target_element_type == RH_EETYPE_ELEMENT_TYPE_SZARRAY || target_element_type == RH_EETYPE_ELEMENT_TYPE_ARRAY)
         {
             const RhMethodTable* source_element;
             const RhMethodTable* target_element;
-            if (rh_element_type(source) != RH_EETYPE_ELEMENT_TYPE_SZARRAY)
+            if (rh_element_type(source) != target_element_type || source->base_size != target->base_size)
                 return 0;
             source_element = (const RhMethodTable*)source->related_type;
             target_element = (const RhMethodTable*)target->related_type;
@@ -2299,7 +2299,7 @@ static usize rh_gc_object_size(const RhObject* object, const RhBlock* block, int
     {
         int length;
         usize length_offset;
-        if (info->runtime_kind == RH_TYPE_MDARRAY || info->runtime_kind == RH_TYPE_PARAMETERIZED)
+        if (info->runtime_kind == RH_TYPE_PARAMETERIZED)
             RhpFallbackFailFast(code);
         length_offset = info->runtime_kind == RH_TYPE_STRING
             ? STRING_LENGTH_OFFSET
@@ -2551,7 +2551,7 @@ static void rh_drain_mark_stack(void)
             i = i + 1ul;
         }
 
-        if (info->runtime_kind == RH_TYPE_SZARRAY && info->component_gc_field_count != 0ul)
+        if ((info->runtime_kind == RH_TYPE_SZARRAY || info->runtime_kind == RH_TYPE_MDARRAY) && info->component_gc_field_count != 0ul)
         {
             int length = *(const int*)((const u8*)object + ARRAY_LENGTH_OFFSET);
             usize component_size = rh_component_size(type);
@@ -2560,7 +2560,7 @@ static void rh_drain_mark_stack(void)
                 RhpFallbackFailFast(139);
             while (element_index < (usize)length)
             {
-                u8* element = (u8*)object + ARRAY_DATA_OFFSET + element_index * component_size;
+                u8* element = (u8*)object + type->base_size - SYNC_BLOCK_SIZE + element_index * component_size;
                 usize field_index = 0ul;
                 while (field_index < info->component_gc_field_count)
                 {
@@ -2838,7 +2838,7 @@ void* RhpNewArray(const RhMethodTable* type, int length)
     usize gc_size;
     void* object;
     info = rh_require_method_table(type, 140);
-    if (info->runtime_kind != RH_TYPE_SZARRAY && info->runtime_kind != RH_TYPE_STRING)
+    if (info->runtime_kind != RH_TYPE_SZARRAY && info->runtime_kind != RH_TYPE_MDARRAY && info->runtime_kind != RH_TYPE_STRING)
         RhpFallbackFailFast(140);
     gc_size = rh_variable_gc_size(type, length);
     if (gc_size == 0ul || rh_total_block_size(gc_size) == 0ul)
@@ -2865,7 +2865,7 @@ void* RhpMemberwiseClone(RhObject* source)
     else
     {
         usize length_offset;
-        if (info->runtime_kind != RH_TYPE_SZARRAY && info->runtime_kind != RH_TYPE_STRING)
+        if (info->runtime_kind != RH_TYPE_SZARRAY && info->runtime_kind != RH_TYPE_MDARRAY && info->runtime_kind != RH_TYPE_STRING)
             RhpFallbackFailFast(140);
         length_offset = info->runtime_kind == RH_TYPE_STRING ? STRING_LENGTH_OFFSET : ARRAY_LENGTH_OFFSET;
         gc_size = rh_variable_gc_size(type, *(int*)((u8*)source + length_offset));
@@ -3202,11 +3202,13 @@ static const RhMethodTable* rh_require_array(const void* array)
 {
     const RhObject* object;
     const RhMethodTable* type;
+    const RhTypeInfo* info;
     if (array == (const void*)0)
         RhpFallbackFailFast(147);
     object = (const RhObject*)array;
     type = object->type;
-    if (rh_require_method_table(type, 147)->runtime_kind != RH_TYPE_SZARRAY ||
+    info = rh_require_method_table(type, 147);
+    if ((info->runtime_kind != RH_TYPE_SZARRAY && info->runtime_kind != RH_TYPE_MDARRAY) ||
         *(const int*)((const u8*)array + ARRAY_LENGTH_OFFSET) < 0)
     {
         RhpFallbackFailFast(147);
@@ -3232,7 +3234,7 @@ void RhpArrayClear(void* array, int index, int length)
         RhpFallbackFailFast(148);
     byte_offset = (usize)index * component_size;
     byte_count = (usize)length * component_size;
-    destination = (u8*)array + ARRAY_DATA_OFFSET + byte_offset;
+    destination = (u8*)array + type->base_size - SYNC_BLOCK_SIZE + byte_offset;
     rh_zero(destination, byte_count);
 }
 
@@ -3272,8 +3274,8 @@ int RhpArrayCopy(
         if (source_component_size != destination_component_size)
             RhpFallbackFailFast(149);
         byte_count = (usize)length * source_component_size;
-        source = (const u8*)source_array + ARRAY_DATA_OFFSET + (usize)source_index * source_component_size;
-        destination = (u8*)destination_array + ARRAY_DATA_OFFSET + (usize)destination_index * destination_component_size;
+        source = (const u8*)source_array + source_type->base_size - SYNC_BLOCK_SIZE + (usize)source_index * source_component_size;
+        destination = (u8*)destination_array + destination_type->base_size - SYNC_BLOCK_SIZE + (usize)destination_index * destination_component_size;
     }
     else
     {
@@ -3284,8 +3286,8 @@ int RhpArrayCopy(
             return 0;
         }
 
-        source = (const u8*)source_array + ARRAY_DATA_OFFSET + (usize)source_index * __SIZEOF_POINTER__;
-        destination = (u8*)destination_array + ARRAY_DATA_OFFSET + (usize)destination_index * __SIZEOF_POINTER__;
+        source = (const u8*)source_array + source_type->base_size - SYNC_BLOCK_SIZE + (usize)source_index * __SIZEOF_POINTER__;
+        destination = (u8*)destination_array + destination_type->base_size - SYNC_BLOCK_SIZE + (usize)destination_index * __SIZEOF_POINTER__;
         if (!rh_is_assignable(source_element, destination_element))
         {
             usize i = 0ul;

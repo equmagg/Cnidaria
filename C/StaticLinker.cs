@@ -9,19 +9,33 @@ using Cnidaria.X86;
 
 namespace Cnidaria.C;
 
-public sealed class SourceFile
+public abstract class TranslationUnit
 {
     public string FilePath { get; }
-    public string Text { get; }
 
-    public SourceFile(string filePath, string text)
+    private protected TranslationUnit(string filePath)
     {
         if (string.IsNullOrWhiteSpace(filePath))
             throw new ArgumentException("A translation unit must have a file path.", nameof(filePath));
 
         FilePath = filePath;
-        Text = text ?? throw new ArgumentNullException(nameof(text));
     }
+}
+
+public sealed class SourceFile : TranslationUnit
+{
+    public string Text { get; }
+
+    public SourceFile(string filePath, string text) : base(filePath)
+        => Text = text ?? throw new ArgumentNullException(nameof(text));
+}
+
+public sealed class GimpleTranslationUnit : TranslationUnit
+{
+    public GimpleTree Tree { get; }
+
+    public GimpleTranslationUnit(string filePath, GimpleTree tree) : base(filePath)
+        => Tree = tree ?? throw new ArgumentNullException(nameof(tree));
 }
 
 public enum LinkerStage : byte
@@ -68,7 +82,7 @@ public sealed class StaticLinkerOptions
     public IIncludeResolver? IncludeResolver { get; }
     public ImmutableDictionary<string, string> PredefinedMacros { get; }
     public ImmutableHashSet<string> AllowedUndefinedSymbols { get; }
-    public ImmutableArray<SourceFile> LibraryTranslationUnits { get; }
+    public ImmutableArray<TranslationUnit> LibraryTranslationUnits { get; }
     public bool IncludeStandardHeaders { get; }
     public bool LinkStandardLibrary { get; }
     public bool EmitStartup { get; }
@@ -96,7 +110,7 @@ public sealed class StaticLinkerOptions
         InliningOptions? inlining = null,
         TrimmingOptions? trimming = null,
         GimplePipelineOptions? gimple = null,
-        IEnumerable<SourceFile>? libraryTranslationUnits = null)
+        IEnumerable<TranslationUnit>? libraryTranslationUnits = null)
     {
         CompilationOptions = new CompilationOptions(
             target ?? throw new ArgumentNullException(nameof(target)),
@@ -112,7 +126,7 @@ public sealed class StaticLinkerOptions
         AllowedUndefinedSymbols = allowedUndefinedSymbols is null
             ? ImmutableHashSet<string>.Empty.WithComparer(StringComparer.Ordinal)
             : allowedUndefinedSymbols.ToImmutableHashSet(StringComparer.Ordinal);
-        LibraryTranslationUnits = libraryTranslationUnits?.ToImmutableArray() ?? ImmutableArray<SourceFile>.Empty;
+        LibraryTranslationUnits = libraryTranslationUnits?.ToImmutableArray() ?? ImmutableArray<TranslationUnit>.Empty;
         if (LibraryTranslationUnits.Any(static source => source is null))
             throw new ArgumentException("A library translation unit cannot be null.", nameof(libraryTranslationUnits));
         IncludeStandardHeaders = includeStandardHeaders;
@@ -149,10 +163,10 @@ public sealed class StaticLinkResult<TProgram>
 
 public static class StaticLinker
 {
-    public static StaticLinkResult<RegisterBytecodeProgram> LinkRegisterBytecode(IEnumerable<SourceFile> translationUnits, TargetInfo target)
+    public static StaticLinkResult<RegisterBytecodeProgram> LinkRegisterBytecode(IEnumerable<TranslationUnit> translationUnits, TargetInfo target)
         => LinkRegisterBytecode(translationUnits, new StaticLinkerOptions(target));
 
-    public static StaticLinkResult<RegisterBytecodeProgram> LinkRegisterBytecode(IEnumerable<SourceFile> translationUnits, StaticLinkerOptions options)
+    public static StaticLinkResult<RegisterBytecodeProgram> LinkRegisterBytecode(IEnumerable<TranslationUnit> translationUnits, StaticLinkerOptions options)
     {
         if (options is null)
             throw new ArgumentNullException(nameof(options));
@@ -183,7 +197,7 @@ public static class StaticLinker
             var units = selected
                 .Select(static unit => new RegisterBytecodeCompilationUnit(unit.Lir, unit.Linkage))
                 .ToImmutableArray();
-            var program = RegisterBytecodeCodeGenerator.Generate(units, options.EntryFunctionName);
+            var program = RegisterBytecodeCodeGenerator.Generate(units, options.EmitStartup ? options.EntryFunctionName : null);
             return Success(program, selected, diagnostics);
         }
         catch (Exception exception)
@@ -193,9 +207,9 @@ public static class StaticLinker
         }
     }
 
-    public static StaticLinkResult<X86Program> LinkX86(IEnumerable<SourceFile> translationUnits, TargetInfo target)
+    public static StaticLinkResult<X86Program> LinkX86(IEnumerable<TranslationUnit> translationUnits, TargetInfo target)
         => LinkX86(translationUnits, new StaticLinkerOptions(target));
-    public static StaticLinkResult<X86Program> LinkX86(IEnumerable<SourceFile> translationUnits, StaticLinkerOptions options)
+    public static StaticLinkResult<X86Program> LinkX86(IEnumerable<TranslationUnit> translationUnits, StaticLinkerOptions options)
     {
         if (options is null)
             throw new ArgumentNullException(nameof(options));
@@ -245,9 +259,9 @@ public static class StaticLinker
         }
     }
 
-    public static StaticLinkResult<RiscVProgram> LinkRiscV(IEnumerable<SourceFile> translationUnits, TargetInfo target)
+    public static StaticLinkResult<RiscVProgram> LinkRiscV(IEnumerable<TranslationUnit> translationUnits, TargetInfo target)
         => LinkRiscV(translationUnits, new StaticLinkerOptions(target));
-    public static StaticLinkResult<RiscVProgram> LinkRiscV(IEnumerable<SourceFile> translationUnits, StaticLinkerOptions options)
+    public static StaticLinkResult<RiscVProgram> LinkRiscV(IEnumerable<TranslationUnit> translationUnits, StaticLinkerOptions options)
     {
         if (options is null)
             throw new ArgumentNullException(nameof(options));
@@ -297,9 +311,9 @@ public static class StaticLinker
         }
     }
 
-    public static StaticLinkResult<ArmProgram> LinkArm(IEnumerable<SourceFile> translationUnits, TargetInfo target)
+    public static StaticLinkResult<ArmProgram> LinkArm(IEnumerable<TranslationUnit> translationUnits, TargetInfo target)
         => LinkArm(translationUnits, new StaticLinkerOptions(target));
-    public static StaticLinkResult<ArmProgram> LinkArm(IEnumerable<SourceFile> translationUnits, StaticLinkerOptions options)
+    public static StaticLinkResult<ArmProgram> LinkArm(IEnumerable<TranslationUnit> translationUnits, StaticLinkerOptions options)
     {
         if (options is null)
             throw new ArgumentNullException(nameof(options));
@@ -350,7 +364,7 @@ public static class StaticLinker
     }
 
     private static CompiledInputs CompileInputs(
-        IEnumerable<SourceFile> translationUnits,
+        IEnumerable<TranslationUnit> translationUnits,
         StaticLinkerOptions options,
         ImmutableArray<LinkerDiagnostic>.Builder diagnostics)
     {
@@ -441,7 +455,7 @@ public static class StaticLinker
     }
 
     private static ImmutableArray<PreparedUnit> GimplifyUnits(
-        ImmutableArray<SourceFile> sources,
+        ImmutableArray<TranslationUnit> sources,
         StaticLinkerOptions options,
         ImmutableArray<LinkerDiagnostic>.Builder diagnostics)
     {
@@ -455,12 +469,38 @@ public static class StaticLinker
         }
         foreach (var source in sources)
         {
+            if (source is GimpleTranslationUnit lowered)
+            {
+                GimpleTree prepared = lowered.Tree;
+
+                try
+                {
+                    TargetInfo inputTarget = prepared.SemanticModel.Compilation.Options.Target;
+                    TargetInfo target = compilationOptions.Target;
+                    if (inputTarget.Architecture != target.Architecture || inputTarget.OperatingSystem != target.OperatingSystem ||
+                        inputTarget.ArchitectureFeatures != target.ArchitectureFeatures || inputTarget.PointerSize != target.PointerSize)
+                        throw new ArgumentException("The prepared GIMPLE target does not match the linker target.");
+                    foreach (SemanticDiagnostic diagnostic in prepared.Diagnostics)
+                        diagnostics.Add(new LinkerDiagnostic(diagnostic.Severity, LinkerStage.Lowering, diagnostic.Message, source.FilePath, diagnostic.Position));
+                    if (prepared.Diagnostics.Any(d => d.Severity == DiagnosticSeverity.Error)) continue;
+                    // Prepared trees own their symbols; the context supplies the link's pipeline options
+                    Compilation context = Compilation.Create(string.Empty, source.FilePath, compilationOptions);
+                    SemanticModel model = context.GetSemanticModel(context.SyntaxTrees[0]);
+                    var gimple = new GimpleTree(model, prepared.Members, prepared.Diagnostics, prepared.HasInliningApplied);
+                    units.Add(new PreparedUnit(source, model, FileScopeLinkageMap.Create(gimple), gimple));
+                }
+                catch (Exception exception)
+                {
+                    diagnostics.Add(new LinkerDiagnostic(DiagnosticSeverity.Error, LinkerStage.Lowering, exception.Message, source.FilePath));
+                }
+                continue;
+            }
             SyntaxTree tree;
             Compilation compilation;
             try
             {
                 tree = SyntaxTree.ParseSource(
-                    source.Text,
+                    ((SourceFile)source).Text,
                     source.FilePath,
                     options.IncludeFiles,
                     options.IncludeSearchPaths,
@@ -1394,13 +1434,13 @@ public static class StaticLinker
 
     private sealed class PreparedUnit
     {
-        public SourceFile Source { get; }
+        public TranslationUnit Source { get; }
         public SemanticModel SemanticModel { get; }
         public FileScopeLinkageMap Linkage { get; }
         public GimpleTree Gimple { get; set; }
 
         public PreparedUnit(
-            SourceFile source,
+            TranslationUnit source,
             SemanticModel semanticModel,
             FileScopeLinkageMap linkage,
             GimpleTree gimple)
@@ -1415,14 +1455,14 @@ public static class StaticLinker
     private sealed class CompiledUnit
     {
         private LirModule? _lir;
-        public SourceFile Source { get; }
+        public TranslationUnit Source { get; }
         public SemanticModel SemanticModel { get; }
         public FileScopeLinkageMap Linkage { get; }
         public GimplePipelineResult Gimple { get; }
         public LirModule Lir => _lir ??= LirModule.Lower(Gimple);
 
         public CompiledUnit(
-            SourceFile source,
+            TranslationUnit source,
             SemanticModel semanticModel,
             FileScopeLinkageMap linkage,
             GimplePipelineResult gimple)
@@ -1576,6 +1616,23 @@ internal sealed class FileScopeLinkageMap
             }
         }
 
+        return new FileScopeLinkageMap(internalBySymbol, declarations.ToImmutable());
+    }
+
+    public static FileScopeLinkageMap Create(GimpleTree tree)
+    {
+        var states = new Dictionary<string, LinkageState>(StringComparer.Ordinal);
+        var internalBySymbol = new Dictionary<Symbol, bool>();
+        var declarations = ImmutableArray.CreateBuilder<FileScopeSymbolDeclaration>();
+        foreach (GimpleNode member in tree.Members)
+        {
+            if (member is GimpleFunctionDefinition { Symbol: FunctionSymbol function })
+                AddDeclaration(function, function.StorageClass, default, true, states, internalBySymbol, declarations);
+            else if (member is GimpleGlobalDeclaration global)
+                foreach (GimpleVariableDeclaration variable in global.Declarators)
+                    if (variable.Symbol is Symbol symbol)
+                        AddDeclaration(symbol, variable.StorageClass, default, variable.Initializer is not null, states, internalBySymbol, declarations);
+        }
         return new FileScopeLinkageMap(internalBySymbol, declarations.ToImmutable());
     }
 

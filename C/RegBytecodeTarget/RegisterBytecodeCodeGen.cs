@@ -19,9 +19,12 @@ public sealed class RegisterBytecodeProgram
     public int PrintfMethodId { get; }
     public IReadOnlyDictionary<FunctionSymbol, int> MethodIds { get; }
     public IReadOnlyDictionary<int, FunctionType?> SignaturesByMethodId { get; }
-    /// <summary>Gets the ids of declared but undefined functions, which only a host handler can implement</summary>
+    /// <summary>Gets the ids of undefined functions resolved by a library or host handler</summary>
     public IReadOnlyCollection<int> HostExternMethodIds { get; }
     public TargetInfo Target { get; }
+    internal ImmutableArray<RegisterBytecodeExport> Exports { get; init; } = [];
+    internal ImmutableArray<RegisterBytecodeImport> Imports { get; init; } = [];
+    public RegisterBytecodeLibrary ToLibrary(string name) => new(name, Image, Exports, Imports, Image.CodeAddressRelocations);
 
     public RegisterBytecodeProgram(
         CodeImage image,
@@ -250,7 +253,7 @@ internal sealed class RegisterBytecodeCompilationUnit
 public sealed class RegisterBytecodeCodeGenerator
 {
     public const int FirstCMethodId = 10_000_000;
-    public const int PrintfMethodId = 10_999_999;
+    public const int PrintfMethodId = RegisterBytecodeLinker.CStringWriteMethodId;
 
     private static readonly MachineRegister Sp = MachineRegister.X2;
     private static readonly MachineRegister GpScratch0 = MachineRegister.X5;
@@ -264,7 +267,7 @@ public sealed class RegisterBytecodeCodeGenerator
     private readonly ImmutableArray<RegisterBytecodeCompilationUnit> _units;
     private readonly TargetInfo _target;
     private readonly LSRAOptions _allocationOptions;
-    private readonly string _entryFunctionName;
+    private readonly string? _entryFunctionName;
     private Assembler _assembler = null!;
     private RuntimeTypeSystem _runtimeTypes = null!;
     private RegisterBytecodeSyntheticRuntime _syntheticRuntime = null!;
@@ -289,7 +292,7 @@ public sealed class RegisterBytecodeCodeGenerator
 
     private RegisterBytecodeCodeGenerator(
         ImmutableArray<RegisterBytecodeCompilationUnit> units,
-        string entryFunctionName,
+        string? entryFunctionName,
         LSRAOptions? allocationOptions)
     {
         if (units.IsDefaultOrEmpty)
@@ -297,7 +300,7 @@ public sealed class RegisterBytecodeCodeGenerator
 
         _units = units;
         _target = units[0].Module.SemanticModel.Compilation.Options.Target;
-        _entryFunctionName = string.IsNullOrWhiteSpace(entryFunctionName)
+        _entryFunctionName = entryFunctionName is not null && string.IsNullOrWhiteSpace(entryFunctionName)
             ? throw new ArgumentException("The entry function name cannot be empty.", nameof(entryFunctionName))
             : entryFunctionName;
         _allocationOptions = allocationOptions ?? LSRAOptions.ForTarget(_target);
@@ -328,7 +331,7 @@ public sealed class RegisterBytecodeCodeGenerator
 
     internal static RegisterBytecodeProgram Generate(
         ImmutableArray<RegisterBytecodeCompilationUnit> units,
-        string entryFunctionName,
+        string? entryFunctionName,
         LSRAOptions? allocationOptions = null)
         => new RegisterBytecodeCodeGenerator(units, entryFunctionName, allocationOptions).Generate();
 
@@ -342,7 +345,7 @@ public sealed class RegisterBytecodeCodeGenerator
 
         IndexMethods();
         IndexHostExternMethods();
-        _entryMethodId = ResolveEntryMethodId();
+        _entryMethodId = _entryFunctionName is string entryName ? ResolveEntryMethodId(entryName) : -1;
         CreateSyntheticRuntimeForEmission();
         _assembler = new Assembler(_runtimeTypes);
         IndexGlobals();
@@ -365,8 +368,26 @@ public sealed class RegisterBytecodeCodeGenerator
 
         var image = _assembler.Build(flags, validate: true);
         image = PatchFunctionPointerFixups(image);
-        var entryPc = ResolveMethodEntryPc(image, _entryMethodId);
-        return new RegisterBytecodeProgram(image, entryPc, PrintfMethodId, _methodIds, _signatures, _target, _hostExternMethodIds);
+        var entryPc = _entryMethodId < 0 ? 0 : ResolveMethodEntryPc(image, _entryMethodId);
+        return new RegisterBytecodeProgram(image, entryPc, PrintfMethodId, _methodIds, _signatures, _target, _hostExternMethodIds)
+        {
+            Exports = _externalMethodIdsByName.Select(p => new RegisterBytecodeExport(p.Key, ResolveMethodEntryPc(image, p.Value), DescribeSignature(_signatures[p.Value]))).ToImmutableArray(),
+            Imports = _hostExternMethodIdsByName.Select(p => new RegisterBytecodeImport(p.Value, "", p.Key, DescribeSignature(_signatures[p.Value]))).ToImmutableArray()
+        };
+    }
+
+    private string DescribeSignature(FunctionType? signature)
+    {
+        if (signature is null) return "unprototyped";
+        string Value(QualifiedType type, bool result)
+        {
+            if (GimpleTypes.IsVoid(type)) return RegisterBytecodeLinker.AbiValue(0, 0, 1, []);
+            AbiValue abi = CAbi.ClassifyValue(_target, type, result, false);
+            int kind = abi.PassingKind switch { AbiPassingKind.Void => 0, AbiPassingKind.Scalar => 1, AbiPassingKind.MultiRegister => 2, AbiPassingKind.Stack => 3, AbiPassingKind.Indirect => 4, _ => 5 };
+            var segments = kind is 1 or 2 ? abi.Segments.Select(s => (s.RegisterClass == AbiRegisterClass.Floating ? 1 : 0, s.Offset, s.Size)) : [];
+            return RegisterBytecodeLinker.AbiValue(kind, kind == 4 ? abi.IndirectSize : abi.Size, abi.Alignment, segments);
+        }
+        return Value(signature.ReturnType, true) + "(" + string.Join(";", signature.Parameters.Select(p => Value(p.Type, false))) + ")" + (signature.IsVariadic ? "..." : "");
     }
 
     private void IndexMethods()
@@ -439,14 +460,14 @@ public sealed class RegisterBytecodeCodeGenerator
            || function.IntrinsicKind is RuntimeIntrinsicKind.StackAllocate or RuntimeIntrinsicKind.StackSave or RuntimeIntrinsicKind.StackRestore
            || string.Equals(function.Name, StandardHeaders.PrintfIntrinsicName, StringComparison.Ordinal);
 
-    private int ResolveEntryMethodId()
+    private int ResolveEntryMethodId(string entryFunctionName)
     {
-        if (_externalMethodIdsByName.TryGetValue(_entryFunctionName, out var externalEntry))
+        if (_externalMethodIdsByName.TryGetValue(entryFunctionName, out var externalEntry))
             return externalEntry;
 
         for (var unitIndex = 0; unitIndex < _units.Length; unitIndex++)
         {
-            if (_internalMethodIdsByName.TryGetValue((unitIndex, _entryFunctionName), out var internalEntry))
+            if (_internalMethodIdsByName.TryGetValue((unitIndex, entryFunctionName), out var internalEntry))
                 return internalEntry;
         }
 
@@ -522,7 +543,8 @@ public sealed class RegisterBytecodeCodeGenerator
             image.TypeLayouts,
             ImmutableArray<VTableSlotRecord>.Empty,
             image.Blob,
-            validate: true);
+            validate: true,
+            codeAddressRelocations: image.CodeAddressRelocations.AddRange(_functionPointerFixups.Select(f => f.Pc)));
     }
 
     private RuntimeMethod GetRuntimeMethod(int methodId)
@@ -1084,9 +1106,9 @@ public sealed class RegisterBytecodeCodeGenerator
                 EmitMem(op, pair.Key, MachineRegister.Invalid, pair.Value, MachineRegister.Invalid, MemoryBase.StackPointer, alignment: 8);
             }
 
-            if (_function.Symbol is not null &&
+            if (_owner._entryFunctionName is null || (_function.Symbol is not null &&
                 _owner._methodIds.TryGetValue(_function.Symbol, out var methodId) &&
-                methodId == _owner._entryMethodId)
+                methodId == _owner._entryMethodId))
             {
                 EmitWritableGlobalStorageInitialization();
             }
@@ -1100,6 +1122,15 @@ public sealed class RegisterBytecodeCodeGenerator
                 throw new InvalidOperationException("Writable global data template is missing.");
 
             var initialized = _asm.CreateLabel();
+            if (_owner._entryFunctionName is null)
+            {
+                long template = ((long)_owner._writableGlobalDataBlobOffset << 32) | (uint)_owner._writableGlobalDataSize;
+                EmitRaw(Op.GlobalData, MachineRegisters.GlobalPointer, GpScratch0, imm: template);
+                _asm.BrTrueI32(GpScratch0, initialized);
+                EmitGlobalPointerFixups();
+                _asm.Bind(initialized);
+                return;
+            }
             EmitI64Imm(Op.I64NeImm, GpScratch0, MachineRegisters.GlobalPointer, 0);
             _asm.BrTrueI32(GpScratch0, initialized);
 
@@ -3042,7 +3073,7 @@ public sealed class RegisterBytecodeCodeGenerator
         private void LoadStaticBlob(int offset, int length, MachineRegister destination)
         {
             var packed = ((long)(uint)offset << 32) | (uint)length;
-            EmitRaw(Op.StaticData, destination, MachineRegister.Invalid, MachineRegister.Invalid, imm: packed);
+            EmitRaw(_owner._entryFunctionName is null ? Op.GlobalData : Op.StaticData, destination, MachineRegister.Invalid, MachineRegister.Invalid, imm: packed);
         }
 
         private bool TryMaterializeStaticSymbolAddress(Symbol symbol, MachineRegister destination)

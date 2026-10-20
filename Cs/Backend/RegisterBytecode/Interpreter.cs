@@ -66,7 +66,7 @@ namespace Cnidaria.Cs
         private const int StringFirstCharOffset = ObjectHeaderSize + 4;
         private const int MaxCallFramesHard = 4096;
 
-        private const int ShadowFrameSize = 56;
+        private const int ShadowFrameSize = 64;
         private const int ShadowFrameCallerSp = 0;
         private const int ShadowFrameCallerFp = 8;
         private const int ShadowFrameAllocaSp = 16;
@@ -76,6 +76,7 @@ namespace Cnidaria.Cs
         private const int ShadowFramePackedFlags = 40;
         private const int ShadowFrameRegisterSnapshotIndex = 44;
         private const int ShadowFrameSafePointPc = 48;
+        private const int ShadowFrameCallerGp = 56;
         private const int ShadowFrameCallFlagsMask = 0x0000FFFF;
         private const int ShadowFrameFilterFlag = 0x00010000;
 
@@ -97,6 +98,8 @@ namespace Cnidaria.Cs
         private readonly Dictionary<int, RuntimeField> _fieldById;
         private readonly Dictionary<int, int> _staticBaseByTypeId = new Dictionary<int, int>();
         private readonly Dictionary<int, int> _staticDataByPc = new Dictionary<int, int>();
+        private readonly Dictionary<long, int> _globalData = new Dictionary<long, int>();
+        private readonly HashSet<long> _initializedGlobalData = new HashSet<long>();
         private readonly Dictionary<int, int> _staticDataHeapObjectByPc = new Dictionary<int, int>();
         private readonly Dictionary<string, int> _internPool = new Dictionary<string, int>(StringComparer.Ordinal);
         private readonly Dictionary<int, string> _stringLiterals = new Dictionary<int, string>();
@@ -205,7 +208,7 @@ namespace Cnidaria.Cs
         }
 
         public long InstructionsElapsed => _instructionsElapsed;
-        public int StackPeakBytes => (_stackEnd - _stackLowWatermark) + (_frameStackPeakTop - _stackBase);
+        public int StackPeakBytes => (_stackEnd - _stackLowWatermark) + (_frameStackPeakTop - _staticEnd);
         public int HeapPeakBytes => _heapPeakAbs - _heapBase;
         public int StaticDataRegionBytes => _staticDataRegionBytes;
         public RegisterBasedVm(
@@ -224,11 +227,14 @@ namespace Cnidaria.Cs
             _rts = rts ?? throw new ArgumentNullException(nameof(rts));
             _modules = modules ?? throw new ArgumentNullException(nameof(modules));
             _image = image ?? throw new ArgumentNullException(nameof(image));
+            RegisterBytecodeLinker.RegisterRuntimeImports(_image, _rts);
             _textWriter = textWriter ?? TextWriter.Null;
             _hostCtx = new VmCallContext(this);
 
             if (!(0 <= staticEnd && staticEnd <= _stackBase && _stackBase < stackEnd && stackEnd <= memory.Length))
                 throw new ArgumentOutOfRangeException(nameof(stackEnd), "Bad VM memory layout.");
+
+            _stackBase = InitializeGlobalData();
 
             _heapBase = AlignBlockStart(stackEnd);
             _heapEnd = memory.Length;
@@ -1023,7 +1029,7 @@ namespace Cnidaria.Cs
                     case Op.LdArrayDataAddr:
                         if (!TryValidateArrayRefForExecution(GetGpr(ins.Rs1), executingPc, out int dataArrAbs))
                             break;
-                        SetGpr(ins.Rd, dataArrAbs + ArrayDataOffset);
+                        SetGpr(ins.Rd, dataArrAbs + GetArrayDataOffset(dataArrAbs));
                         break;
                     case Op.LdElemAddr:
                         {
@@ -1347,6 +1353,11 @@ namespace Cnidaria.Cs
                             EnterManagedFrame(targetMethodIndex, _pc, (CallFlags)ins.Aux);
                         }
                         break;
+                    case Op.GlobalData:
+                        SetGpr(ins.Rd, _globalData[ins.Imm]);
+                        if (ins.Rs1 != RegisterVmIsa.InvalidRegister)
+                            SetI32(ins.Rs1, _initializedGlobalData.Add(ins.Imm) ? 0 : 1);
+                        break;
                     case Op.StaticData:
                         SetGpr(ins.Rd, StaticData(executingPc, ins));
                         break;
@@ -1518,6 +1529,7 @@ namespace Cnidaria.Cs
             WriteI32(frame + ShadowFrameReturnPc, returnPc);
             WriteI64(frame + ShadowFrameCallerSp, callerSp);
             WriteI64(frame + ShadowFrameCallerFp, callerFp);
+            WriteI64(frame + ShadowFrameCallerGp, X(MachineRegisters.GlobalPointer));
             WriteI32(frame + ShadowFramePackedFlags, (int)incomingCallFlags & ShadowFrameCallFlagsMask);
             WriteI64(frame + ShadowFrameIncomingStackArgBase, incomingStackArgBase);
             WriteI32(frame + ShadowFrameRegisterSnapshotIndex, -1);
@@ -1532,6 +1544,7 @@ namespace Cnidaria.Cs
         {
             if (_frameCount == 0) throw new InvalidOperationException("No current frame.");
             _frameStackTop -= ShadowFrameSize;
+            X(MachineRegisters.GlobalPointer, ReadI64(_frameStackTop + ShadowFrameCallerGp));
             Array.Clear(_mem, _frameStackTop, ShadowFrameSize);
             _frameCount--;
             if (_activeHandlers.Count != 0)
@@ -2741,7 +2754,7 @@ namespace Cnidaria.Cs
             RuntimeType elemType = arrayType.ElementType
                 ?? throw new InvalidOperationException("Array type has no element type.");
             int elemSize = StorageSizeOf(elemType);
-            int elemAbs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
+            int elemAbs = checked(arrAbs + GetArrayDataOffset(arrAbs) + checked(index * elemSize));
             CheckHeapAccess(elemAbs, elemSize);
             return LoadHostValue(elemAbs, elemType);
         }
@@ -2756,7 +2769,7 @@ namespace Cnidaria.Cs
             RuntimeType elemType = arrayType.ElementType
                 ?? throw new InvalidOperationException("Array type has no element type.");
             int elemSize = StorageSizeOf(elemType);
-            int elemAbs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
+            int elemAbs = checked(arrAbs + GetArrayDataOffset(arrAbs) + checked(index * elemSize));
             CheckHeapAccess(elemAbs, elemSize);
             CheckWritableRange(elemAbs, elemSize);
             StoreHostValue(elemAbs, elemType, value);
@@ -3501,10 +3514,20 @@ namespace Cnidaria.Cs
             }
 
             if (rm.DeclaringType.Namespace == "System.Runtime" && rm.DeclaringType.Name == "RuntimeImports" &&
-                rm.Name == "RhGetArrayRank")
+                rm.Name is "RhGetArrayRank" or "RhGetArrayLength" or "RhGetArrayLowerBound")
             {
-                RuntimeType arrayType = GetObjectTypeFromRef(ReadAbiScalarArgument(rm, 0));
-                SetReturnI4(arrayType.IsSzArray ? 1 : arrayType.ArrayRank);
+                long arrayRef = ReadAbiScalarArgument(rm, 0);
+                RuntimeType arrayType = GetObjectTypeFromRef(arrayRef);
+                int dimension = rm.Name == "RhGetArrayRank" ? 0 : (int)ReadAbiScalarArgument(rm, 1);
+                if ((uint)dimension >= (uint)arrayType.ArrayRank)
+                {
+                    ThrowIndexOutOfRange(_pc - 1);
+                    return true;
+                }
+                int result = rm.Name == "RhGetArrayRank" ? arrayType.ArrayRank : arrayType.IsSzArray
+                    ? rm.Name == "RhGetArrayLength" ? ReadI32((int)arrayRef + ArrayLengthOffset) : 0
+                    : ReadI32((int)arrayRef + ArrayDataOffset + (dimension + (rm.Name == "RhGetArrayLength" ? 0 : arrayType.ArrayRank)) * 4);
+                SetReturnI4(result);
                 return true;
             }
 
@@ -3733,7 +3756,7 @@ namespace Cnidaria.Cs
             {
                 long arr = ReadAbiScalarArgument(rm, 0);
                 ValidateArrayRef(arr, out int arrAbs, out _);
-                SetReturnRef(arrAbs + ArrayDataOffset);
+                SetReturnRef(arrAbs + GetArrayDataOffset(arrAbs));
                 return true;
             }
             if (rm.Name == "GetReference" && rm.ParameterTypes.Length == 1)
@@ -4803,6 +4826,13 @@ namespace Cnidaria.Cs
         }
 
 
+        private int GetArrayDataOffset(RuntimeType type)
+            => ArrayDataOffset + (type.IsSzArray ? 0 : type.ArrayRank * 8);
+
+        private int GetArrayDataOffset(int arrayAbs) => GetArrayDataOffset(_rts.GetTypeById(ReadI32(arrayAbs)));
+
+        private int GetArrayDataOffset(TypeLayoutRecord type) => GetArrayDataOffset(_rts.GetTypeById(type.RuntimeTypeId));
+
         private int AllocArray(TypeLayoutRecord arrayType, int length)
         {
             if (length < 0) throw new OverflowException();
@@ -4812,13 +4842,13 @@ namespace Cnidaria.Cs
             TypeLayoutRecord elemType = TypeLayout(arrayType.ElementTypeLayoutIndex);
             int elemSize = elemType.Size;
             int dataBytes = checked(length * elemSize);
-            int size = AlignUp(ArrayDataOffset + dataBytes, 8);
+            int size = AlignUp(checked(GetArrayDataOffset(arrayType) + dataBytes), 8);
             int obj = AllocHeapBytes(size, 8);
             WriteI32(obj, arrayType.RuntimeTypeId);
             WriteI32(obj + 4, GcFlagAllocated);
             WriteI32(obj + ArrayLengthOffset, length);
             WriteI32(obj + ArrayLengthOffset + 4, 0);
-            if (dataBytes != 0) _mem.AsSpan(obj + ArrayDataOffset, dataBytes).Clear();
+            _mem.AsSpan(obj + ArrayDataOffset, size - ArrayDataOffset).Clear();
             return obj;
         }
 
@@ -4829,13 +4859,13 @@ namespace Cnidaria.Cs
             RuntimeType elemType = arrayType.ElementType ?? throw new InvalidOperationException("Array type has no element type.");
             int elemSize = StorageSizeOf(elemType);
             int dataBytes = checked(length * elemSize);
-            int size = AlignUp(ArrayDataOffset + dataBytes, 8);
+            int size = AlignUp(checked(GetArrayDataOffset(arrayType) + dataBytes), 8);
             int obj = AllocHeapBytes(size, 8);
             WriteI32(obj, arrayType.TypeId);
             WriteI32(obj + 4, GcFlagAllocated);
             WriteI32(obj + ArrayLengthOffset, length);
             WriteI32(obj + ArrayLengthOffset + 4, 0);
-            if (dataBytes != 0) _mem.AsSpan(obj + ArrayDataOffset, dataBytes).Clear();
+            _mem.AsSpan(obj + ArrayDataOffset, size - ArrayDataOffset).Clear();
             return obj;
         }
 
@@ -4873,7 +4903,7 @@ namespace Cnidaria.Cs
                 return false;
             }
             int elemSize = elemType.Size;
-            abs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
+            abs = checked(arrAbs + GetArrayDataOffset(arrAbs) + checked(index * elemSize));
             return true;
         }
 
@@ -4893,7 +4923,7 @@ namespace Cnidaria.Cs
                 throw new IndexOutOfRangeException();
 
             int elemSize = elemType.Size;
-            int abs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
+            int abs = checked(arrAbs + GetArrayDataOffset(arrAbs) + checked(index * elemSize));
 
             CheckHeapAccess(abs, elemSize);
             CheckWritableRange(abs, elemSize);
@@ -4907,7 +4937,7 @@ namespace Cnidaria.Cs
             if ((uint)index >= (uint)len) throw new IndexOutOfRangeException();
             RuntimeType actualElem = arrType.ElementType ?? elemType;
             int elemSize = StorageSizeOf(actualElem);
-            int abs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
+            int abs = checked(arrAbs + GetArrayDataOffset(arrAbs) + checked(index * elemSize));
             CheckHeapAccess(abs, elemSize);
             CheckWritableRange(abs, elemSize);
             return abs;
@@ -4992,6 +5022,26 @@ namespace Cnidaria.Cs
             ThrowIndexOutOfRange(pc);
             return false;
         }
+        private int InitializeGlobalData()
+        {
+            // Unmanaged addresses must survive calls and compacting GC, so reserve their storage below the shadow stack
+            int end = _staticEnd;
+            foreach (InstrDesc instruction in _image.Code)
+            {
+                if (instruction.Op != Op.GlobalData || _globalData.ContainsKey(instruction.Imm)) continue;
+                int offset = checked((int)(instruction.Imm >> 32));
+                int length = unchecked((int)(uint)instruction.Imm);
+                if (offset < 0 || length <= 0 || offset > _image.Blob.Length || length > _image.Blob.Length - offset)
+                    throw new InvalidOperationException("Invalid global data blob range.");
+                int address = AlignUp(Math.Max(end, 16), 16);
+                end = AlignUp(checked(address + length), 16);
+                if (end > _stackEnd - ShadowFrameSize) throw new StackOverflowException("Unmanaged globals exceed the VM stack region.");
+                _image.Blob.AsSpan(offset, length).CopyTo(_mem.AsSpan(address, length));
+                _globalData.Add(instruction.Imm, address);
+            }
+            return end;
+        }
+
         private int StaticData(int pc, InstrDesc instruction)
         {
             if (_staticDataByPc.TryGetValue(pc, out int existing))
@@ -5578,7 +5628,7 @@ namespace Cnidaria.Cs
                 if (!TypeIsReferenceOrContainsReferences(elem)) return;
                 int len = ReadI32(obj + ArrayLengthOffset);
                 int elemSize = StorageSizeOf(elem);
-                int baseAbs = obj + ArrayDataOffset;
+                int baseAbs = obj + GetArrayDataOffset(t);
                 for (int i = 0; i < len; i++)
                     UpdateManagedRefCellsInTypedStorage(baseAbs + i * elemSize, elem);
                 return;
@@ -5919,7 +5969,7 @@ namespace Cnidaria.Cs
 
                 int len = ReadI32(obj + ArrayLengthOffset);
                 int elemSize = StorageSizeOf(elem);
-                int data = obj + ArrayDataOffset;
+                int data = obj + GetArrayDataOffset(type);
                 for (int i = 0; i < len; i++)
                     MarkManagedRefCellsInTypedStorage(data + i * elemSize, elem);
                 return;
@@ -5982,7 +6032,7 @@ namespace Cnidaria.Cs
 
                 int len = ReadI32(obj + ArrayLengthOffset);
                 int elemSize = StorageSizeOf(elem);
-                int data = obj + ArrayDataOffset;
+                int data = obj + GetArrayDataOffset(type);
                 for (int i = 0; i < len; i++)
                     VisitManagedRefCellsInTypedStorage(data + i * elemSize, elem, visitor);
                 return;
@@ -7337,6 +7387,8 @@ namespace Cnidaria.Cs
 
             if (source.Kind == RuntimeTypeKind.Array && target.Kind == RuntimeTypeKind.Array)
             {
+                if (source.ArrayRank != target.ArrayRank || source.IsSzArray != target.IsSzArray)
+                    return false;
                 RuntimeType? se = source.ElementType;
                 RuntimeType? te = target.ElementType;
                 if (se == null || te == null) return false;
@@ -7466,7 +7518,7 @@ namespace Cnidaria.Cs
             if (index < 0 || length < 0 || index > len - length) throw new IndexOutOfRangeException();
             RuntimeType elem = arrayType.ElementType ?? throw new InvalidOperationException("Array has no element type.");
             int elemSize = StorageSizeOf(elem);
-            int abs = arr + ArrayDataOffset + checked(index * elemSize);
+            int abs = arr + GetArrayDataOffset(arr) + checked(index * elemSize);
             Array.Clear(_mem, abs, checked(length * elemSize));
         }
 
@@ -7491,8 +7543,8 @@ namespace Cnidaria.Cs
             int dstSize = StorageSizeOf(dstElem);
             if (srcSize != dstSize) return false;
             int bytes = checked(length * srcSize);
-            int srcAbs = src + ArrayDataOffset + checked(sourceIndex * srcSize);
-            int dstAbs = dst + ArrayDataOffset + checked(destinationIndex * dstSize);
+            int srcAbs = src + GetArrayDataOffset(src) + checked(sourceIndex * srcSize);
+            int dstAbs = dst + GetArrayDataOffset(dst) + checked(destinationIndex * dstSize);
             Buffer.BlockCopy(_mem, srcAbs, _mem, dstAbs, bytes);
             return true;
         }

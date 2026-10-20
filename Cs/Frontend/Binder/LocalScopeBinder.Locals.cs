@@ -1568,6 +1568,9 @@ namespace Cnidaria.Cs
                         diagnostics: diagnostics,
                         requireImplicit: true);
                     dimensionSizes.Add(sizeExpr);
+                    if (TryGetInt32Constant(sizeExpr, out int size) && size < 0)
+                        diagnostics.Add(new Diagnostic("CN_ARRNEW006", DiagnosticSeverity.Error,
+                            "Array dimensions cannot have negative sizes.", new Location(context.SemanticModel.SyntaxTree, sizeExprSyntax.Span)));
                     continue;
                 }
 
@@ -1592,6 +1595,10 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < dimensionSizes.Count && i < inferredInitShape.Length; i++)
                 {
                     var dimExpr = dimensionSizes[i];
+                    if (!dimExpr.HasErrors && !dimExpr.ConstantValueOpt.HasValue)
+                        diagnostics.Add(new Diagnostic("CN_ARRNEW007", DiagnosticSeverity.Error,
+                            "An array size must be constant when an initializer is specified.",
+                            new Location(context.SemanticModel.SyntaxTree, outerRank.Sizes[i].Span)));
                     if (dimExpr.ConstantValueOpt.HasValue &&
                         dimExpr.ConstantValueOpt.Value is int n &&
                         n != inferredInitShape[i])
@@ -1610,6 +1617,12 @@ namespace Cnidaria.Cs
         private BoundExpression BindImplicitArrayCreation(ImplicitArrayCreationExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
             int rank = checked(node.Commas.Count + 1);
+            if (rank > 32)
+            {
+                diagnostics.Add(new Diagnostic("CN_ARRAY_RANK001", DiagnosticSeverity.Error,
+                    "Arrays cannot have more than 32 dimensions.", new Location(context.SemanticModel.SyntaxTree, node.Span)));
+                return new BoundBadExpression(node);
+            }
             var rawLeaves = ImmutableArray.CreateBuilder<(ExpressionSyntax Syntax, BoundExpression Expression)>();
             bool validShape = true;
 

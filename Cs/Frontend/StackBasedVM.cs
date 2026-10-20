@@ -843,7 +843,8 @@ namespace Cnidaria.Cs
                             throw new NotSupportedException($"Opcode not supported: {ins.Op}");
                     }
                 }
-                catch (Exception hostEx) when (hostEx is DivideByZeroException || hostEx is OverflowException || hostEx is NullReferenceException)
+                catch (Exception hostEx) when (hostEx is DivideByZeroException or OverflowException or NullReferenceException or
+                    IndexOutOfRangeException or ArrayTypeMismatchException or OutOfMemoryException or ArgumentOutOfRangeException)
                 {
                     if (_exceptionTranslationDepth != 0)
                         throw;
@@ -867,6 +868,11 @@ namespace Cnidaria.Cs
         private void ExecCall(RuntimeModule mod, in CilInstruction ins, int pc, CancellationToken ct, ExecutionLimits limits)
         {
             var method = ResolveRuntimeMethodOrThrow(mod, ins.Token, _curMethod);
+            if (method.DeclaringType.Kind == RuntimeTypeKind.Array)
+            {
+                ExecMdArrayAccess(method, ins.Prefixes);
+                return;
+            }
             int total = method.ParameterTypes.Length + (method.HasThis ? 1 : 0);
             bool isVirtual = ins.Op == ILOpCode.Callvirt;
 
@@ -888,6 +894,43 @@ namespace Cnidaria.Cs
 
             InvokeMethod(method, total, resumePc: pc, ct, limits);
         }
+        private void ExecMdArrayAccess(RuntimeMethod method, CilPrefix prefixes)
+        {
+            RuntimeType declaredElement = method.DeclaringType.ElementType!;
+            Slot value = method.Name == "Set" ? PopSlot() : default;
+            int rank = method.DeclaringType.ArrayRank;
+            var indices = new int[rank];
+            for (int i = rank - 1; i >= 0; i--)
+                indices[i] = PopSlot().AsI4Checked();
+            Slot array = PopSlot();
+            ValidateArrayRefAny(array, out int arrayAbs, out _, out RuntimeType arrayType);
+            RuntimeType elementType = arrayType.ElementType!;
+            int offset = 0;
+            for (int i = 0; i < rank; i++)
+            {
+                int length = ReadI32(arrayAbs + ArrayDataOffset + i * 4);
+                int index = unchecked(indices[i] - ReadI32(arrayAbs + ArrayDataOffset + (rank + i) * 4));
+                if ((uint)index >= (uint)length)
+                    throw new IndexOutOfRangeException();
+                offset = checked(offset * length + index);
+            }
+            int address = checked(arrayAbs + GetArrayDataOffset(arrayType) + offset * GetStorageSizeAlign(elementType).size);
+            if (method.Name == "Address")
+            {
+                if ((prefixes & CilPrefix.Readonly) == 0 && elementType != declaredElement)
+                    throw new ArrayTypeMismatchException();
+                PushSlot(new Slot(SlotKind.ByRef, address));
+            }
+            else if (method.Name == "Set")
+            {
+                if (elementType.IsReferenceType && value.Kind == SlotKind.Ref && !IsAssignableTo(GetObjectTypeFromRef(value), elementType))
+                    throw new ArrayTypeMismatchException();
+                StoreSlotAsValue(address, 0, declaredElement, value);
+            }
+            else
+                PushSlot(LoadValueAsSlot(address, 0, declaredElement));
+        }
+
         private void ResolveConstrainedCall(RuntimeModule mod, int constrainedToken, int total, ref RuntimeMethod method, ref bool isVirtual)
         {
             var constrainedType = ResolveTypeTokenInCurrentMethod(mod, constrainedToken);
@@ -1158,7 +1201,7 @@ namespace Cnidaria.Cs
                 throw new IndexOutOfRangeException();
 
             int elementSize = GetStorageSizeAlign(elementType).size;
-            int elementAbs = checked(arrayAbs + ArrayDataOffset + (int)i * elementSize);
+            int elementAbs = checked(arrayAbs + GetArrayDataOffset(arrayAbs) + (int)i * elementSize);
             CheckHeapAccess(elementAbs, elementSize, writable: false);
             return elementAbs;
         }
@@ -1932,6 +1975,11 @@ namespace Cnidaria.Cs
                 }
             }
         }
+        private int GetArrayDataOffset(RuntimeType type)
+            => ArrayDataOffset + (type.IsSzArray ? 0 : type.ArrayRank * 8);
+
+        private int GetArrayDataOffset(int arrayAbs) => GetArrayDataOffset(_rts.GetTypeById(ReadI32(arrayAbs)));
+
         private int AllocArrayObject(RuntimeType arrayType, int length)
         {
             if (arrayType.Kind != RuntimeTypeKind.Array)
@@ -1945,7 +1993,7 @@ namespace Cnidaria.Cs
 
             var (elemSize, _) = GetStorageSizeAlign(arrayType.ElementType);
             int payloadBytes = checked(length * elemSize);
-            int totalSize = AlignUp(checked(ArrayDataOffset + payloadBytes), 8);
+            int totalSize = AlignUp(checked(GetArrayDataOffset(arrayType) + payloadBytes), 8);
 
             int abs = AllocHeapBytes(totalSize, align: 8);
             Array.Clear(_mem, abs, totalSize);
@@ -2257,7 +2305,7 @@ namespace Cnidaria.Cs
                 var (elemSize, _) = GetStorageSizeAlign(t.ElementType);
 
                 int bytes = checked(len * elemSize);
-                return AlignUp(checked(ArrayDataOffset + bytes), 8);
+                return AlignUp(checked(GetArrayDataOffset(t) + bytes), 8);
             }
 
             if (IsSystemStringType(t))
@@ -2337,7 +2385,7 @@ namespace Cnidaria.Cs
 
             int length = GetArrayLengthFromObject(objAbs);
             var (elemSize, _) = GetStorageSizeAlign(arrayType.ElementType);
-            int dataAbs = checked(objAbs + ArrayDataOffset);
+            int dataAbs = checked(objAbs + GetArrayDataOffset(arrayType));
 
             for (int i = 0; i < length; i++)
             {
@@ -3101,6 +3149,39 @@ namespace Cnidaria.Cs
             var args = new Slot[argCount];
             for (int i = argCount - 1; i >= 0; i--)
                 args[i] = PopSlot();
+
+            if (ctor.DeclaringType.Kind == RuntimeTypeKind.Array)
+            {
+                RuntimeType arrayType = ctor.DeclaringType;
+                int rank = arrayType.ArrayRank;
+                var lengths = new int[rank];
+                var lowerBounds = new int[rank];
+                ulong total = 1;
+                bool dimensionTooLong = false;
+                for (int i = 0; i < rank; i++)
+                {
+                    lengths[i] = args[argCount == rank ? i : i * 2 + 1].AsI4Checked();
+                    lowerBounds[i] = argCount == rank ? 0 : args[i * 2].AsI4Checked();
+                    if (lengths[i] < 0)
+                        throw new OverflowException();
+                    if ((long)lowerBounds[i] + lengths[i] > (long)int.MaxValue + 1)
+                        throw new ArgumentOutOfRangeException();
+                    dimensionTooLong |= lengths[i] > Array.MaxLength;
+                    total *= (uint)lengths[i];
+                    if (total > uint.MaxValue)
+                        throw new OutOfMemoryException();
+                }
+                if (total > int.MaxValue || dimensionTooLong)
+                    throw new OutOfMemoryException();
+                int arrayAbs = AllocArrayObject(arrayType, (int)total);
+                for (int i = 0; i < rank; i++)
+                {
+                    WriteI32(arrayAbs + ArrayDataOffset + i * 4, lengths[i]);
+                    WriteI32(arrayAbs + ArrayDataOffset + (rank + i) * 4, lowerBounds[i]);
+                }
+                PushSlot(new Slot(SlotKind.Ref, arrayAbs));
+                return;
+            }
 
             int returnPc = _curPc;
             if (IsSystemStringType(ctor.DeclaringType))
@@ -3943,6 +4024,9 @@ namespace Cnidaria.Cs
 
             if (hostEx is NullReferenceException)
                 return TryCreateCoreException("System", "NullReferenceException", msg, out vmEx);
+
+            if (hostEx is IndexOutOfRangeException or ArrayTypeMismatchException or OutOfMemoryException or ArgumentOutOfRangeException)
+                return TryCreateCoreException("System", hostEx.GetType().Name, msg, out vmEx);
 
             return false;
         }
@@ -6013,7 +6097,7 @@ namespace Cnidaria.Cs
                 ?? throw new InvalidOperationException("Array type has no element type.");
 
             var (elemSize, _) = GetStorageSizeAlign(elemType);
-            int elemAbs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
+            int elemAbs = checked(arrAbs + GetArrayDataOffset(arrAbs) + checked(index * elemSize));
 
             return new VmValue(LoadValueAsSlot(elemAbs, 0, elemType));
         }
@@ -6029,7 +6113,7 @@ namespace Cnidaria.Cs
                 ?? throw new InvalidOperationException("Array type has no element type.");
 
             var (elemSize, _) = GetStorageSizeAlign(elemType);
-            int elemAbs = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
+            int elemAbs = checked(arrAbs + GetArrayDataOffset(arrAbs) + checked(index * elemSize));
 
             StoreSlotAsValue(elemAbs, 0, elemType, value.ToSlot());
         }
@@ -6345,12 +6429,24 @@ namespace Cnidaria.Cs
             if (IsSystemMethod(rm, "System.Runtime.InteropServices", "MemoryMarshal", "GetArrayDataReference"))
             {
                 ValidateArrayRefAny(PopSlot(), out int arrayAbs, out _, out _);
-                PushSlot(new Slot(SlotKind.ByRef, checked(arrayAbs + ArrayDataOffset)));
+                PushSlot(new Slot(SlotKind.ByRef, checked(arrayAbs + GetArrayDataOffset(arrayAbs))));
                 return true;
             }
 
             if (rm.DeclaringType.Namespace == "System" && rm.DeclaringType.Name == "Array")
             {
+                if (rm.HasThis && rm.Name is "get_Rank" or "GetLength" or "GetLowerBound")
+                {
+                    int dimension = rm.Name == "get_Rank" ? 0 : PopSlot().AsI4Checked();
+                    ValidateArrayRefAny(PopSlot(), out int arrayAbs, out int length, out RuntimeType arrayType);
+                    if ((uint)dimension >= (uint)arrayType.ArrayRank)
+                        throw new IndexOutOfRangeException();
+                    int result = rm.Name == "get_Rank" ? arrayType.ArrayRank : arrayType.IsSzArray
+                        ? rm.Name == "GetLength" ? length : 0
+                        : ReadI32(arrayAbs + ArrayDataOffset + (dimension + (rm.Name == "GetLength" ? 0 : arrayType.ArrayRank)) * 4);
+                    PushSlot(new Slot(SlotKind.I4, result));
+                    return true;
+                }
                 // instance int get_Length()
                 if (rm.HasThis &&
                     rm.Name == "get_Length" &&
@@ -6390,9 +6486,6 @@ namespace Cnidaria.Cs
                     if (arrType.Kind != RuntimeTypeKind.Array)
                         throw new InvalidOperationException("System.Array._ClearImpl expects array.");
 
-                    if (arrType.ArrayRank != 1)
-                        throw new NotSupportedException("Only single dimensional arrays are supported.");
-
                     if (length <= 0)
                         return true;
 
@@ -6401,7 +6494,7 @@ namespace Cnidaria.Cs
                     var (elemSize, _) = GetStorageSizeAlign(elem);
 
                     int bytes = checked(length * elemSize);
-                    int start = checked(arrAbs + ArrayDataOffset + checked(index * elemSize));
+                    int start = checked(arrAbs + GetArrayDataOffset(arrAbs) + checked(index * elemSize));
 
                     CheckRange(start, bytes);
                     CheckWritableRange(start, bytes);
@@ -6442,7 +6535,7 @@ namespace Cnidaria.Cs
                         return true;
                     }
 
-                    if (srcArrType.ArrayRank != 1 || dstArrType.ArrayRank != 1)
+                    if (srcArrType.ArrayRank != dstArrType.ArrayRank)
                     {
                         PushSlot(new Slot(SlotKind.I4, 0));
                         return true;
@@ -6482,8 +6575,8 @@ namespace Cnidaria.Cs
                         var (elemSize, _) = GetStorageSizeAlign(srcElem);
                         int bytes = checked(length * elemSize);
 
-                        int srcStart = checked(srcAbs + ArrayDataOffset + checked(srcIndex * elemSize));
-                        int dstStart = checked(dstAbs + ArrayDataOffset + checked(dstIndex * elemSize));
+                        int srcStart = checked(srcAbs + GetArrayDataOffset(srcAbs) + checked(srcIndex * elemSize));
+                        int dstStart = checked(dstAbs + GetArrayDataOffset(dstAbs) + checked(dstIndex * elemSize));
 
                         CheckRange(srcStart, bytes);
                         CheckWritableRange(dstStart, bytes);
@@ -6501,8 +6594,8 @@ namespace Cnidaria.Cs
                             int ptrSize = _rts.Target.PointerSize;
                             int bytes = checked(length * ptrSize);
 
-                            int srcStart = checked(srcAbs + ArrayDataOffset + checked(srcIndex * ptrSize));
-                            int dstStart = checked(dstAbs + ArrayDataOffset + checked(dstIndex * ptrSize));
+                            int srcStart = checked(srcAbs + GetArrayDataOffset(srcAbs) + checked(srcIndex * ptrSize));
+                            int dstStart = checked(dstAbs + GetArrayDataOffset(dstAbs) + checked(dstIndex * ptrSize));
 
                             CheckRange(srcStart, bytes);
                             CheckWritableRange(dstStart, bytes);
@@ -6515,7 +6608,7 @@ namespace Cnidaria.Cs
                         else if (IsAssignableTo(dstElem, srcElem))
                         {
                             int ptrSize = _rts.Target.PointerSize;
-                            int srcStart = checked(srcAbs + ArrayDataOffset + checked(srcIndex * ptrSize));
+                            int srcStart = checked(srcAbs + GetArrayDataOffset(srcAbs) + checked(srcIndex * ptrSize));
 
                             for (int i = 0; i < length; i++)
                             {
@@ -6537,7 +6630,7 @@ namespace Cnidaria.Cs
                             // memmove refs
                             {
                                 int bytes = checked(length * ptrSize);
-                                int dstStart = checked(dstAbs + ArrayDataOffset + checked(dstIndex * ptrSize));
+                                int dstStart = checked(dstAbs + GetArrayDataOffset(dstAbs) + checked(dstIndex * ptrSize));
 
                                 CheckRange(srcStart, bytes);
                                 CheckWritableRange(dstStart, bytes);
@@ -6558,8 +6651,8 @@ namespace Cnidaria.Cs
                         var (srcElemSize, _) = GetStorageSizeAlign(srcElem);
                         int ptrSize = _rts.Target.PointerSize;
 
-                        int srcBase = checked(srcAbs + ArrayDataOffset + checked(srcIndex * srcElemSize));
-                        int dstBase = checked(dstAbs + ArrayDataOffset + checked(dstIndex * ptrSize));
+                        int srcBase = checked(srcAbs + GetArrayDataOffset(srcAbs) + checked(srcIndex * srcElemSize));
+                        int dstBase = checked(dstAbs + GetArrayDataOffset(dstAbs) + checked(dstIndex * ptrSize));
 
                         for (int i = 0; i < length; i++)
                         {

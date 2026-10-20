@@ -575,6 +575,9 @@ namespace Cnidaria.Cs
                 var rs = a.RankSpecifiers[i];
 
                 int rank = Math.Max(1, rs.Sizes.SeparatorCount + 1);
+                if (rank > 32)
+                    diagnostics.Add(new Diagnostic("CN_ARRAY_RANK001", DiagnosticSeverity.Error,
+                        "Arrays cannot have more than 32 dimensions.", new Location(context.SemanticModel.SyntaxTree, rs.Span)));
                 t = _compilation.CreateArrayType(t, rank);
             }
 

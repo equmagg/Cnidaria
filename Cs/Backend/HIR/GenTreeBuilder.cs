@@ -2776,6 +2776,12 @@ namespace Cnidaria.Cs
             if (TryImportIntegerMinMax(stack, statements, method, npc, op))
                 return 1;
 
+            if (method.DeclaringType.Kind == RuntimeTypeKind.Array)
+            {
+                EmitMdArrayAccess(stack, statements, method, npc, op);
+                return 1;
+            }
+
             var args = PopMany(stack, total, npc, op);
 
             if ((ins.Prefixes & CilPrefix.Constrained) != 0)
@@ -2807,6 +2813,14 @@ namespace Cnidaria.Cs
             if (_rts.Target.IsRegisterBytecode && IsSystemMethod(method, "System", "Array", "get_Rank"))
             {
                 method = RuntimeImportsMethod("RhGetArrayRank");
+                requiresCallvirtNullCheck = true;
+                isVirtual = false;
+            }
+
+            if (_rts.Target.IsRegisterBytecode && method.DeclaringType.Namespace == "System" &&
+                method.DeclaringType.Name == "Array" && method.Name is "GetLength" or "GetLowerBound")
+            {
+                method = RuntimeImportsMethod(method.Name == "GetLength" ? "RhGetArrayLength" : "RhGetArrayLowerBound");
                 requiresCallvirtNullCheck = true;
                 isVirtual = false;
             }
@@ -2975,7 +2989,10 @@ namespace Cnidaria.Cs
 
             var t = ctor.DeclaringType;
             if (t.Kind == RuntimeTypeKind.Array)
-                throw Fail(pc, op, "Multi-dimensional array construction is not supported by the backend.");
+            {
+                EmitMdArrayCreation(stack, statements, t, args, pc, op);
+                return;
+            }
             if (RequiresTypeInitializationBeforeNewObject(t) && NeedsTypeInitialization(t))
             {
                 SpillEvaluationStackForImportBarrier(statements, stack, pc, op);
@@ -2993,6 +3010,90 @@ namespace Cnidaria.Cs
             AddDirectDependency(ctor);
             PushImportedValue(stack, statements, Node(GenTreeKind.NewObject, pc, op, type: t, stackKind: StackKindOf(t), operands: args,
                 int32: argCount, int64: token, method: ctor, runtimeType: t));
+        }
+
+        private GenTree ArrayBoundAddress(GenTree array, int index, int pc)
+            => Node(GenTreeKind.PointerElementAddr, pc, GenTreeOperator.None, stackKind: GenStackKind.ByRef,
+                operands: Two(CloneTree(array), ConstI4(pc, ILOpCode.Ldc_I4, _rts.Target.ArrayDataOffset + index * 4)), int32: 1);
+
+        private void EmitMdArrayCreation(List<StackValue> stack, List<GenTree> statements, RuntimeType type,
+            ImmutableArray<GenTree> args, int pc, ILOpCode op)
+        {
+            SpillEvaluationStackForImportBarrier(statements, stack, pc, op);
+            var lengths = new GenTree[type.ArrayRank];
+            var lowerBounds = new GenTree[type.ArrayRank];
+            RuntimeType intType = _rts.FindPrimitive(RuntimePrimitiveKind.Int32);
+            for (int i = 0; i < args.Length; i++)
+                args = args.SetItem(i, MaterializeReusable(statements, args[i], pc, op));
+            for (int i = 0; i < type.ArrayRank; i++)
+            {
+                lengths[i] = args[args.Length == type.ArrayRank ? i : i * 2 + 1];
+                lowerBounds[i] = args.Length == type.ArrayRank ? ConstI4(pc, op, 0) : args[i * 2];
+            }
+            GenTree total = ConstI4(pc, op, 1);
+            GenTree dimensionTooLong = ConstI4(pc, op, 0);
+            RuntimeMethod multiply = RuntimeImportsMethod("RhMultiplyArrayLengths");
+            AddDirectDependency(multiply);
+            for (int i = 0; i < lengths.Length; i++)
+            {
+                total = MaterializeReusable(statements, Node(GenTreeKind.Call, pc, op, type: intType,
+                    stackKind: GenStackKind.I4, operands: ImmutableArray.Create(total, CloneTree(lengths[i]), CloneTree(lowerBounds[i])),
+                    method: multiply, int32: 3), pc, op);
+                // The per-dimension limit matches Array.MaxLength, even when another dimension is empty
+                dimensionTooLong = Node(GenTreeKind.Binary, pc, ILOpCode.Or, stackKind: GenStackKind.I4,
+                    operands: Two(dimensionTooLong, Node(GenTreeKind.Binary, pc, ILOpCode.Cgt_Un, stackKind: GenStackKind.I4,
+                        operands: Two(CloneTree(lengths[i]), ConstI4(pc, op, 0x7FFFFFC7)))));
+            }
+            RuntimeMethod validate = RuntimeImportsMethod("RhValidateArrayLength");
+            AddDirectDependency(validate);
+            total = Node(GenTreeKind.Call, pc, op, type: intType, stackKind: GenStackKind.I4,
+                operands: Two(total, dimensionTooLong), method: validate, int32: 2);
+            MarkInstantiatedType(type);
+            GenTree array = MaterializeReusable(statements, Node(GenTreeKind.NewArray, pc, op, type: type,
+                stackKind: GenStackKind.Ref, operands: One(total), runtimeType: type.ElementType), pc, op);
+            for (int i = 0; i < lengths.Length; i++)
+            {
+                statements.Add(Node(GenTreeKind.StoreIndirect, pc, ILOpCode.Stind_I4,
+                    operands: Two(ArrayBoundAddress(array, i, pc), CloneTree(lengths[i])), runtimeType: intType));
+                statements.Add(Node(GenTreeKind.StoreIndirect, pc, ILOpCode.Stind_I4,
+                    operands: Two(ArrayBoundAddress(array, i + lengths.Length, pc), CloneTree(lowerBounds[i])), runtimeType: intType));
+            }
+            Push(stack, CloneTree(array));
+        }
+
+        private void EmitMdArrayAccess(List<StackValue> stack, List<GenTree> statements, RuntimeMethod method, int pc, ILOpCode op)
+        {
+            RuntimeType arrayType = method.DeclaringType;
+            RuntimeType elementType = arrayType.ElementType!;
+            RuntimeType intType = _rts.FindPrimitive(RuntimePrimitiveKind.Int32);
+            var args = PopMany(stack, method.ParameterTypes.Length + 1, pc, op);
+            SpillEvaluationStackForImportBarrier(statements, stack, pc, op);
+            for (int i = 0; i < args.Length; i++)
+                args = args.SetItem(i, MaterializeReusable(statements, args[i], pc, op));
+            statements.Add(Node(GenTreeKind.NullCheck, pc, op, operands: One(CloneTree(args[0]))));
+            GenTree offset = ConstI4(pc, op, 0);
+            for (int i = 0; i < arrayType.ArrayRank; i++)
+            {
+                GenTree length = MaterializeReusable(statements, Node(GenTreeKind.LoadIndirect, pc, ILOpCode.Ldind_I4,
+                    type: intType, stackKind: GenStackKind.I4, operands: One(ArrayBoundAddress(args[0], i, pc)), runtimeType: intType), pc, op);
+                GenTree lowerBound = Node(GenTreeKind.LoadIndirect, pc, ILOpCode.Ldind_I4, type: intType,
+                    stackKind: GenStackKind.I4, operands: One(ArrayBoundAddress(args[0], i + arrayType.ArrayRank, pc)), runtimeType: intType);
+                GenTree index = MaterializeReusable(statements, Node(GenTreeKind.Binary, pc, ILOpCode.Sub, type: intType,
+                    stackKind: GenStackKind.I4, operands: Two(CloneTree(args[i + 1]), lowerBound)), pc, op);
+                statements.Add(Node(GenTreeKind.BoundsCheck, pc, op, operands: Two(CloneTree(index), CloneTree(length))));
+                offset = Node(GenTreeKind.Binary, pc, ILOpCode.Add, type: intType, stackKind: GenStackKind.I4,
+                    operands: Two(Node(GenTreeKind.Binary, pc, ILOpCode.Mul, type: intType, stackKind: GenStackKind.I4,
+                        operands: Two(offset, CloneTree(length))), CloneTree(index)));
+            }
+            // Array operations carry the size of the bounds header in Int32; SZ arrays keep its default of zero
+            int boundsSize = arrayType.ArrayRank * 8;
+            if (method.Name == "Set")
+                AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreArrayElement, pc, op,
+                    operands: ImmutableArray.Create(CloneTree(args[0]), offset, CloneTree(args[^1])), runtimeType: elementType, int32: boundsSize));
+            else
+                PushImportedValue(stack, statements, Node(method.Name == "Address" ? GenTreeKind.ArrayElementAddr : GenTreeKind.ArrayElement,
+                    pc, op, type: method.ReturnType, stackKind: StackKindOf(method.ReturnType),
+                    operands: Two(CloneTree(args[0]), offset), runtimeType: elementType, int32: boundsSize));
         }
 
         private int EmitField(ImportFrame frame, List<StackValue> stack, List<GenTree> statements, int pc, int npc)

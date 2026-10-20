@@ -605,6 +605,7 @@ namespace Cnidaria.Cs
         ByRefToPtr = 775,
         PtrToByRef = 776,
         StaticData = 777,
+        GlobalData = 778,
     }
 
     [StructLayout(LayoutKind.Sequential, Pack = 1, Size = RegisterVmIsa.InstructionSize)]
@@ -1195,6 +1196,8 @@ namespace Cnidaria.Cs
         internal ImmutableArray<TypeLayoutRecord> TypeLayouts { get; }
         internal ImmutableArray<VTableSlotRecord> VTables { get; }
         internal ImmutableArray<byte> Blob { get; }
+        internal ImmutableArray<RegisterBytecodeImport> Imports { get; }
+        internal ImmutableArray<int> CodeAddressRelocations { get; }
         internal IReadOnlyDictionary<int, int> MethodIndexByRuntimeMethodId { get; }
         internal IReadOnlyDictionary<int, int> MethodIndexByEntryPc { get; }
         internal IReadOnlyDictionary<int, int> TypeLayoutIndexByRuntimeTypeId { get; }
@@ -1211,7 +1214,9 @@ namespace Cnidaria.Cs
             ImmutableArray<TypeLayoutRecord> typeLayouts = default,
             ImmutableArray<VTableSlotRecord> vTables = default,
             ImmutableArray<byte> blob = default,
-            bool validate = true)
+            bool validate = true,
+            ImmutableArray<RegisterBytecodeImport> imports = default,
+            ImmutableArray<int> codeAddressRelocations = default)
         {
             Flags = flags;
             Code = code.IsDefault ? ImmutableArray<InstrDesc>.Empty : code;
@@ -1224,6 +1229,8 @@ namespace Cnidaria.Cs
             TypeLayouts = typeLayouts.IsDefault ? ImmutableArray<TypeLayoutRecord>.Empty : typeLayouts;
             VTables = vTables.IsDefault ? ImmutableArray<VTableSlotRecord>.Empty : vTables;
             Blob = blob.IsDefault ? ImmutableArray<byte>.Empty : blob;
+            Imports = imports.IsDefault ? [] : imports;
+            CodeAddressRelocations = codeAddressRelocations.IsDefault ? [] : codeAddressRelocations;
 
             var typeMap = new Dictionary<int, int>(TypeLayouts.Length);
             for (int i = 0; i < TypeLayouts.Length; i++)
@@ -1828,6 +1835,13 @@ namespace Cnidaria.Cs
         {
             switch (inst.Op)
             {
+                case Op.GlobalData:
+                    if (inst.Rs1 != RegisterVmIsa.InvalidRegister)
+                    {
+                        RequireGpr(inst.Rs1, pc, nameof(inst.Rs1));
+                        if (inst.Rs1 == inst.Rd) throw new InvalidOperationException($"Global data results overlap at PC {pc}");
+                    }
+                    goto case Op.StaticData;
                 case Op.StaticData:
                     RequireGpr(inst.Rd, pc, nameof(inst.Rd));
                     return;
@@ -1931,7 +1945,7 @@ namespace Cnidaria.Cs
                 throw new InvalidOperationException($"Expected register for {operand} at PC {pc}");
         }
 
-        private static bool IsPcTargetInstruction(Op op)
+        internal static bool IsPcTargetInstruction(Op op)
             => op is Op.J or Op.Leave or Op.CallFinally or Op.BrTrueI32 or Op.BrFalseI32 or Op.BrTrueI64 or Op.BrFalseI64 or Op.BrTrueRef or Op.BrFalseRef
                 or Op.BrI32Eq or Op.BrI32Ne or Op.BrI32Lt or Op.BrI32Le or Op.BrI32Gt or Op.BrI32Ge
                 or Op.BrU32Lt or Op.BrU32Le or Op.BrU32Gt or Op.BrU32Ge
@@ -1960,7 +1974,7 @@ namespace Cnidaria.Cs
             => IsOpInRange(op, Op.AllocObj, Op.DelegateRemove);
 
         private static bool IsPointerInstruction(Op op)
-            => IsOpInRange(op, Op.StackAlloc, Op.PtrToByRef);
+            => IsOpInRange(op, Op.StackAlloc, Op.GlobalData);
 
         private static bool IsIntegerImmediate(Op op)
             => op is Op.I32AddImm or Op.I32SubImm or Op.I32MulImm or Op.I32AndImm or Op.I32OrImm or Op.I32XorImm
@@ -2737,7 +2751,7 @@ namespace Cnidaria.Cs
             _fixups.Add(new Fixup(pc, target.Id, FixupKind.InstructionImmediate, -1));
         }
 
-        public CodeImage Build(ImageFlags flags, bool validate = true)
+        public CodeImage Build(ImageFlags flags, bool validate = true, ImmutableArray<RegisterBytecodeImport> imports = default)
         {
             if (_currentMethod is not null)
                 throw new InvalidOperationException("Active RVM method is not ended.");
@@ -2781,7 +2795,10 @@ namespace Cnidaria.Cs
                 _typeLayouts.ToImmutableArray(),
                 _vTables.ToImmutableArray(),
                 _blob.ToImmutableArray(),
-                validate: validate);
+                validate: validate,
+                imports: imports,
+                codeAddressRelocations: _fixups.FindAll(f => f.Kind == FixupKind.InstructionImmediate && _code[f.Pc].Op is Op.LiI32 or Op.LiI64)
+                    .ConvertAll(f => f.Pc).ToImmutableArray());
         }
 
         private void PatchImmediate(int pc, long immediate)
@@ -2897,6 +2914,7 @@ namespace Cnidaria.Cs
         public static byte[] ToBytes(CodeImage image)
         {
             if (image is null) throw new ArgumentNullException(nameof(image));
+            if (!image.Imports.IsEmpty) throw new InvalidOperationException("The RBC image has unresolved imports; link its libraries before serialization.");
             if (!BitConverter.IsLittleEndian)
                 throw new PlatformNotSupportedException("Image serialization is little-endian only.");
             EnsureStructSizes();
@@ -3577,8 +3595,9 @@ namespace Cnidaria.Cs
                 return "*" + FormatRegister(inst.Rs1) + FormatCallFlags(inst.Aux);
 
 
-            if (inst.Op == Op.StaticData)
-                return $"{FormatRegister(inst.Rd)}, blobOffset={(int)(inst.Imm >> 32)}, length={unchecked((int)(uint)inst.Imm)}";
+            if (inst.Op is Op.StaticData or Op.GlobalData)
+                return $"{FormatRegister(inst.Rd)}, blobOffset={(int)(inst.Imm >> 32)}, length={unchecked((int)(uint)inst.Imm)}" +
+                    (inst.Rs1 == RegisterVmIsa.InvalidRegister ? "" : $", initialized={FormatRegister(inst.Rs1)}");
 
             if (inst.Op == Op.StackAlloc)
             {
@@ -3894,7 +3913,7 @@ namespace Cnidaria.Cs
             => IsOpInRange(op, Op.LdLen, Op.LdArrayDataAddr);
 
         private static bool IsPointerOp(Op op)
-            => IsOpInRange(op, Op.StackAlloc, Op.StaticData);
+            => IsOpInRange(op, Op.StackAlloc, Op.GlobalData);
 
         private static bool IsTwoOperandBranch(Op op)
             => op is not (Op.BrTrueI32 or Op.BrFalseI32 or Op.BrTrueI64 or Op.BrFalseI64 or Op.BrTrueRef or Op.BrFalseRef);

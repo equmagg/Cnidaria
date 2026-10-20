@@ -7280,8 +7280,6 @@ namespace Cnidaria.Cs
                 {
                     if (node.Type is null || node.Type.Kind != RuntimeTypeKind.Array)
                         throw Unsupported(node, "NewArray node has no array runtime type");
-                    if (!node.Type.IsSzArray)
-                        throw Unsupported(node, "Multidimensional array allocation is not implemented");
                     if (node.Uses.Length != 1 || node.Results.Length != 1)
                         throw Unsupported(node, "NewArray must have one length operand and one result");
 
@@ -7351,9 +7349,6 @@ namespace Cnidaria.Cs
 
                     RuntimeType elementType = node.RuntimeType ?? node.Type ??
                         throw Unsupported(node, "Typed array operation has no element runtime type");
-                    RuntimeType? arrayType = OperandType(node, 0);
-                    if (arrayType is not null && arrayType.Kind == RuntimeTypeKind.Array && !arrayType.IsSzArray)
-                        throw Unsupported(node, "Only single-dimensional zero-based arrays are implemented");
 
                     switch (node.TreeKind)
                     {
@@ -7422,7 +7417,7 @@ namespace Cnidaria.Cs
                         nullChecked: true,
                         arrayOverride: array,
                         indexOverride: index);
-                    _owner.EmitAddImmediate(ToIntegerRegister(node.Results[0].Register), RVRegister.X28, Target.ArrayDataOffset);
+                    _owner.EmitAddImmediate(ToIntegerRegister(node.Results[0].Register), RVRegister.X28, (Target.ArrayDataOffset + node.Int32));
                 }
 
                 private void EmitArrayElementLoad(GenTree node, RuntimeType elementType)
@@ -7440,7 +7435,7 @@ namespace Cnidaria.Cs
                         nullChecked: true,
                         arrayOverride: array,
                         indexOverride: index);
-                    EmitValueFromAddress(node, elementType, node.StackKind, RVRegister.X28, Target.ArrayDataOffset);
+                    EmitValueFromAddress(node, elementType, node.StackKind, RVRegister.X28, (Target.ArrayDataOffset + node.Int32));
                 }
 
                 private void PreserveArrayElementOperands(
@@ -7519,12 +7514,12 @@ namespace Cnidaria.Cs
                         EmitMemoryStore(
                             preservedValueRegister,
                             RVRegister.X28,
-                            Target.ArrayDataOffset,
+                            (Target.ArrayDataOffset + node.Int32),
                             StorageSize(elementType, kind, value));
                         return;
                     }
 
-                    EmitValueToAddress(node, valueUseIndex, elementType, kind, RVRegister.X28, Target.ArrayDataOffset);
+                    EmitValueToAddress(node, valueUseIndex, elementType, kind, RVRegister.X28, (Target.ArrayDataOffset + node.Int32));
                 }
 
                 private void EmitArrayElementAddress(
@@ -7661,7 +7656,7 @@ namespace Cnidaria.Cs
                     string fail = _owner.CreateLocalLabel(_methodLabel + "_array_element_type_fail");
                     EmitMemoryLoad(MachineRegister.X30, array, 0, Target.PointerSize, signed: false);
                     EmitMethodTableElementType(RVRegister.X31, RVRegister.X30);
-                    _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, -0x18));
+                    _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, node.Int32 == 0 ? -0x18 : -0x17));
                     EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, fail);
                     EmitMemoryLoad(MachineRegister.X30, RVRegister.X30, 8, Target.PointerSize, signed: false);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(elementType), RVRegister.X29);
@@ -7716,6 +7711,8 @@ namespace Cnidaria.Cs
                     string targetInterface = _owner.CreateLocalLabel(_methodLabel + "_type_assignability_target_interface");
                     string targetSystemArray = _owner.CreateLocalLabel(_methodLabel + "_type_assignability_target_system_array");
                     string targetSzArray = _owner.CreateLocalLabel(_methodLabel + "_type_assignability_target_szarray");
+                    string targetMdArray = _owner.CreateLocalLabel(_methodLabel + "_type_assignability_target_mdarray");
+                    string arrayElements = _owner.CreateLocalLabel(_methodLabel + "_type_assignability_array_elements");
                     string sourceBase = _owner.CreateLocalLabel(_methodLabel + "_type_assignability_source_base");
                     string interfaceLoop = _owner.CreateLocalLabel(_methodLabel + "_type_assignability_interface_loop");
 
@@ -7730,6 +7727,8 @@ namespace Cnidaria.Cs
                     EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, targetSystemArray);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, elementTypeSystemArray - elementTypeSzArray));
                     EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, targetSzArray);
+                    _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, elementTypeSzArray - elementTypeArray));
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, targetMdArray);
                     EmitJump(failure);
 
                     _owner.DefineLabel(targetClass);
@@ -7750,10 +7749,24 @@ namespace Cnidaria.Cs
                     EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, success);
                     EmitJump(failure);
 
+                    _owner.DefineLabel(targetMdArray);
+                    EmitMethodTableElementType(RVRegister.X31, RVRegister.X30);
+                    _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, -elementTypeArray));
+                    EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, failure);
+                    _owner.EmitAddImmediate(RVRegister.X2, RVRegister.X2, -16);
+                    EmitMemoryStore(MachineRegister.X30, RVRegister.X2, 0, 8);
+                    EmitMemoryLoad(MachineRegister.X31, RVRegister.X29, 4, 4, signed: false);
+                    EmitMemoryLoad(MachineRegister.X30, RVRegister.X30, 4, 4, signed: false);
+                    _owner.Emit(RVInstruction.R(RVInstrKind.Xor, RVRegister.X31, RVRegister.X31, RVRegister.X30));
+                    EmitMemoryLoad(MachineRegister.X30, RVRegister.X2, 0, 8, signed: false);
+                    _owner.EmitAddImmediate(RVRegister.X2, RVRegister.X2, 16);
+                    EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, failure);
+                    EmitJump(arrayElements);
                     _owner.DefineLabel(targetSzArray);
                     EmitMethodTableElementType(RVRegister.X31, RVRegister.X30);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, -elementTypeSzArray));
                     EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, failure);
+                    _owner.DefineLabel(arrayElements);
                     EmitMemoryLoad(MachineRegister.X29, RVRegister.X29, methodTableRelatedTypeOffset, Target.PointerSize, signed: false);
                     EmitMemoryLoad(MachineRegister.X30, RVRegister.X30, methodTableRelatedTypeOffset, Target.PointerSize, signed: false);
                     EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X29, success);

@@ -5638,8 +5638,6 @@ namespace Cnidaria.Cs
                     RuntimeType arrayType = node.Type ?? throw Unsupported(node, "NewArray node has no array runtime type");
                     if (arrayType.Kind != RuntimeTypeKind.Array)
                         throw Unsupported(node, "NewArray node has no array runtime type");
-                    if (!arrayType.IsSzArray)
-                        throw Unsupported(node, "Multidimensional array allocation is not implemented");
                     if (node.Uses.Length != 1 || node.Results.Length != 1)
                         throw Unsupported(node, "NewArray must have one length operand and one result");
 
@@ -5676,9 +5674,6 @@ namespace Cnidaria.Cs
 
                     RuntimeType elementType = node.RuntimeType ?? node.Type ??
                         throw Unsupported(node, "Typed array operation has no element runtime type");
-                    RuntimeType? arrayType = OperandType(node, 0);
-                    if (arrayType is not null && arrayType.Kind == RuntimeTypeKind.Array && !arrayType.IsSzArray)
-                        throw Unsupported(node, "Only single-dimensional zero-based arrays are implemented");
 
                     switch (node.TreeKind)
                     {
@@ -5837,7 +5832,7 @@ namespace Cnidaria.Cs
 
                     _owner.Emit(ArmInstruction.Ternary(
                         ArmInstrKind.Add, Reg(destination, 8), Reg(array, 8), Reg(Scratch1, 8)));
-                    _owner.EmitAddImmediate(destination, destination, Target.ArrayDataOffset, Scratch1);
+                    _owner.EmitAddImmediate(destination, destination, (Target.ArrayDataOffset + node.Int32), Scratch1);
                 }
 
                 /// <summary>Emits the null check every array access owes, and the element type check only where covariance can break it</summary>
@@ -5855,7 +5850,7 @@ namespace Cnidaria.Cs
 
                     EmitMemoryLoad(Scratch0, array, 0, Target.PointerSize, signed: false);
                     EmitMethodTableElementType(Scratch1, Scratch0);
-                    _owner.Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(Scratch1, 4), ArmOperand.ImmediateOperand(ElementTypeSzArray)));
+                    _owner.Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(Scratch1, 4), ArmOperand.ImmediateOperand(node.Int32 == 0 ? ElementTypeSzArray : ElementTypeArray)));
                     _owner.EmitConditionalJump(ArmCondition.Ne, fail);
                     EmitMemoryLoad(Scratch0, Scratch0, MethodTableRelatedTypeOffset, Target.PointerSize, signed: false);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(elementType), target);
@@ -5919,6 +5914,8 @@ namespace Cnidaria.Cs
                     string targetInterface = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_target_interface");
                     string targetSystemArray = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_target_system_array");
                     string targetSzArray = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_target_szarray");
+                    string targetMdArray = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_target_mdarray");
+                    string arrayElements = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_array_elements");
                     string sourceBase = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_source_base");
                     string interfaceLoop = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_interface_loop");
 
@@ -5941,6 +5938,8 @@ namespace Cnidaria.Cs
                     _owner.EmitConditionalJump(ArmCondition.Eq, targetSystemArray);
                     _owner.Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(temp, 4), ArmOperand.ImmediateOperand(ElementTypeSzArray)));
                     _owner.EmitConditionalJump(ArmCondition.Eq, targetSzArray);
+                    _owner.Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(temp, 4), ArmOperand.ImmediateOperand(ElementTypeArray)));
+                    _owner.EmitConditionalJump(ArmCondition.Eq, targetMdArray);
                     _owner.EmitJump(failure);
 
                     _owner.DefineLabel(targetClass);
@@ -5955,8 +5954,20 @@ namespace Cnidaria.Cs
                     CompareElementType(source, ElementTypeSzArray, ArmCondition.Eq, success);
                     _owner.EmitJump(failure);
 
+                    _owner.DefineLabel(targetMdArray);
+                    CompareElementType(source, ElementTypeArray, ArmCondition.Ne, failure);
+                    _owner.EmitAdjustStack(-16);
+                    EmitMemoryStore(source, ArmRegister.Sp, 0, 8);
+                    EmitMemoryLoad(temp, target, 4, 4, signed: false);
+                    EmitMemoryLoad(source, source, 4, 4, signed: false);
+                    _owner.Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(source, 4), Reg(temp, 4)));
+                    EmitMemoryLoad(source, ArmRegister.Sp, 0, 8, signed: false);
+                    _owner.EmitAdjustStack(16);
+                    _owner.EmitConditionalJump(ArmCondition.Ne, failure);
+                    _owner.EmitJump(arrayElements);
                     _owner.DefineLabel(targetSzArray);
                     CompareElementType(source, ElementTypeSzArray, ArmCondition.Ne, failure);
+                    _owner.DefineLabel(arrayElements);
                     EmitMemoryLoad(target, target, MethodTableRelatedTypeOffset, Target.PointerSize, signed: false);
                     EmitMemoryLoad(source, source, MethodTableRelatedTypeOffset, Target.PointerSize, signed: false);
                     _owner.Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(source, 8), Reg(target, 8)));

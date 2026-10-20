@@ -290,9 +290,14 @@ namespace Cnidaria.Cs
             else if (EmitsReturningHelperCall(source))
                 flags |= GenTreeLinearFlags.CallerSavedKill;
             else if (MayClobberCallerSaved(source, _target))
+            {
                 flags |= _nonCallOperationsClobberCallerSavedRegisters && !ThrowsWithoutReturningCall(source)
                     ? GenTreeLinearFlags.CallerSavedKill
                     : GenTreeLinearFlags.CallerSavedRegistersPreserved;
+                // A throw helper still needs an unwindable caller frame even though its normal path preserves registers
+                if (!_target.IsRegisterBytecode && source.CanThrow && ThrowsWithoutReturningCall(source))
+                    flags |= GenTreeLinearFlags.MayCall;
+            }
 
             if (IsGcSafePoint(source, blockId))
                 flags |= GenTreeLinearFlags.GcSafePoint;

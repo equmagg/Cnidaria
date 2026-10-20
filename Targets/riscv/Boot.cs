@@ -1118,7 +1118,7 @@ public static class RiscVUserland
     }
 
     public static Cnidaria.C.StaticLinkResult<RiscVProgram> LinkDynamicObject(
-        IEnumerable<Cnidaria.C.SourceFile> sources,
+        IEnumerable<Cnidaria.C.TranslationUnit> sources,
         IEnumerable<string>? needed = null,
         IEnumerable<string>? additionalImports = null,
         Cnidaria.C.TargetInfo? target = null)
@@ -1150,7 +1150,7 @@ public static class RiscVUserland
     }
 
     public static byte[] LinkDynamicProgram(
-        IEnumerable<Cnidaria.C.SourceFile> sources,
+        IEnumerable<Cnidaria.C.TranslationUnit> sources,
         IEnumerable<string>? needed = null,
         RiscVUserlandLayout? layout = null,
         IEnumerable<string>? additionalImports = null,
@@ -1161,7 +1161,7 @@ public static class RiscVUserland
     }
 
     public static byte[] LinkSharedLibrary(
-        IEnumerable<Cnidaria.C.SourceFile> sources,
+        IEnumerable<Cnidaria.C.TranslationUnit> sources,
         string soName,
         IEnumerable<string>? needed = null,
         string? initSymbol = null,
@@ -1198,7 +1198,7 @@ public static class RiscVUserland
     }
 
     private static RiscVProgram LinkLibraryObject(
-        IEnumerable<Cnidaria.C.SourceFile> sources,
+        IEnumerable<Cnidaria.C.TranslationUnit> sources,
         ImmutableArray<string> allowedUndefinedSymbols,
         string what,
         Cnidaria.C.TargetInfo? target = null)
