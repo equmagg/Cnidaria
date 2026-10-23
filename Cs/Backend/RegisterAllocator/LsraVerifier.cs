@@ -1501,8 +1501,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.Call or
                 GenTreeKind.IndirectCall or
                 GenTreeKind.VirtualCall or
-                GenTreeKind.DelegateInvoke or
-                GenTreeKind.NewObject;
+                GenTreeKind.DelegateInvoke;
 
         private static bool RequiresRegisterOnlyTreeShape(GenTree node, TargetInfo target)
         {
@@ -1610,24 +1609,16 @@ namespace Cnidaria.Cs
                         if (node.Results.Length != 1)
                             throw new InvalidOperationException("Scalar call-like result must have exactly one result operand.");
 
-                        if (node.Kind == GenTreeKind.NewObject)
-                        {
-                            if (!node.Results[0].IsFrameSlot)
-                                throw new InvalidOperationException("Reference newobj result must be a frame home that preserves the object across the constructor call.");
-                        }
-                        else
-                        {
-                            var expectedReturn = RegisterOperand.ForRegister(
-                                abi.RegisterClass == RegisterClass.Float
-                                    ? RegisterInfo.GetFloatReturnRegister(method.GenTreeMethod.Target, 0)
-                                    : RegisterInfo.GetIntegerReturnRegister(method.GenTreeMethod.Target, 0));
+                        var expectedReturn = RegisterOperand.ForRegister(
+                            abi.RegisterClass == RegisterClass.Float
+                                ? RegisterInfo.GetFloatReturnRegister(method.GenTreeMethod.Target, 0)
+                                : RegisterInfo.GetIntegerReturnRegister(method.GenTreeMethod.Target, 0));
 
-                            if (!node.Results[0].Equals(expectedReturn))
-                            {
-                                throw new InvalidOperationException(
-                                    "Call-like node result is not in the ABI return register. Actual: " +
-                                    node.Results[0] + ", expected: " + expectedReturn + ".");
-                            }
+                        if (!node.Results[0].Equals(expectedReturn))
+                        {
+                            throw new InvalidOperationException(
+                                "Call-like node result is not in the ABI return register. Actual: " +
+                                node.Results[0] + ", expected: " + expectedReturn + ".");
                         }
                     }
                 }
@@ -1665,7 +1656,7 @@ namespace Cnidaria.Cs
             var explicitArguments = ImmutableArray.CreateBuilder<GenTree>();
             GenTree? hiddenReturnBufferValue = null;
 
-            int generalArgumentIndex = node.Kind == GenTreeKind.NewObject && node.Method?.HasThis == true ? 1 : 0;
+            int generalArgumentIndex = 0;
             int floatArgumentIndex = 0;
             int index = 0;
             int argumentOperandCount = node.Kind == GenTreeKind.IndirectCall
@@ -1704,7 +1695,6 @@ namespace Cnidaria.Cs
                 method.GenTreeMethod.GetValueInfo,
                 hiddenReturnBufferValue ?? node.RegisterResult,
                 node.Method,
-                node.Kind == GenTreeKind.NewObject,
                 method.GenTreeMethod.Target);
         }
 

@@ -3158,46 +3158,6 @@ void* RhpDelegateRemove(
     return result;
 }
 
-static void rh_copy_utf16(u16* destination, const u16* source, int length)
-{
-    rh_memmove(destination, source, (usize)length * 2ul);
-}
-
-void* RhpNewStringFromChar(
-    const RhMethodTable* type,
-    u16 value,
-    int length)
-{
-    void* object = RhpNewArray(type, length);
-    u16* destination = (u16*)((u8*)object + STRING_FIRST_CHAR_OFFSET);
-    int i = 0;
-    while (i < length)
-    {
-        destination[i] = value;
-        i = i + 1;
-    }
-    return object;
-}
-
-void* RhpNewStringFromUtf16(
-    const RhMethodTable* type,
-    const u16* source)
-{
-    int length = 0;
-    void* object;
-    if (source == (const u16*)0)
-        RhpFallbackFailFast(147);
-    while (source[length] != 0u)
-    {
-        if (length == 0x7fffffff)
-            RhpFallbackFailFast(140);
-        length = length + 1;
-    }
-    object = RhpNewArray(type, length);
-    rh_copy_utf16((u16*)((u8*)object + STRING_FIRST_CHAR_OFFSET), source, length);
-    return object;
-}
-
 static const RhMethodTable* rh_require_array(const void* array)
 {
     const RhObject* object;
@@ -3304,60 +3264,6 @@ int RhpArrayCopy(
 
     rh_memmove(destination, source, byte_count);
     return 1;
-}
-
-void* RhpNewStringFromCharArray(
-    const RhMethodTable* type,
-    const void* array)
-{
-    const RhMethodTable* array_type = rh_require_array(array);
-    int length;
-    const u16* source;
-    void* object;
-    if (rh_component_size(array_type) != 2ul)
-        RhpFallbackFailFast(147);
-    length = rh_array_length(array);
-    source = (const u16*)((const u8*)array + ARRAY_DATA_OFFSET);
-    object = RhpNewArray(type, length);
-    rh_copy_utf16((u16*)((u8*)object + STRING_FIRST_CHAR_OFFSET), source, length);
-    return object;
-}
-
-void* RhpNewStringFromCharArrayRange(
-    const RhMethodTable* type,
-    const void* array,
-    int start_index,
-    int length)
-{
-    const RhMethodTable* array_type = rh_require_array(array);
-    int array_length;
-    const u16* source;
-    void* object;
-    if (rh_component_size(array_type) != 2ul)
-        RhpFallbackFailFast(147);
-    array_length = rh_array_length(array);
-    if (start_index < 0 || length < 0 || start_index > array_length || length > array_length - start_index)
-        RhpFallbackFailFast(147);
-    source = (const u16*)((const u8*)array + ARRAY_DATA_OFFSET) + start_index;
-    object = RhpNewArray(type, length);
-    rh_copy_utf16((u16*)((u8*)object + STRING_FIRST_CHAR_OFFSET), source, length);
-    return object;
-}
-
-// The span arrives as a struct whose second register segment leaves the bits above _length undefined.
-void* RhpNewStringFromReadOnlySpan(
-    const RhMethodTable* type,
-    const u16* source,
-    usize length_segment)
-{
-    int length = (int)length_segment;
-    void* object;
-    if (length < 0 || (source == (const u16*)0 && length != 0))
-        RhpFallbackFailFast(147);
-    object = RhpNewArray(type, length);
-    if (length != 0)
-        rh_copy_utf16((u16*)((u8*)object + STRING_FIRST_CHAR_OFFSET), source, length);
-    return object;
 }
 
 // The native GC never moves objects, so an address mix is a stable identity hash for the object's lifetime

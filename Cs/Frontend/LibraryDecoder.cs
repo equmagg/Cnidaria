@@ -211,7 +211,7 @@ namespace Cnidaria.Cs
             var namespaces = global.GetNamespaceMembers();
             for (int i = 0; i < namespaces.Length; i++)
             {
-                if (StringComparer.Ordinal.Equals(namespaces[i].Name, "System"))
+                if (namespaces[i].Name == "System")
                 {
                     systemNs = namespaces[i];
                     break;
@@ -711,7 +711,7 @@ namespace Cnidaria.Cs
                 NamedTypeSymbol? grouping = null;
                 foreach (var member in container.GetMembers())
                 {
-                    if (member is NamedTypeSymbol nested && StringComparer.Ordinal.Equals(nested.Name, groupingName))
+                    if (member is NamedTypeSymbol nested && nested.Name == groupingName)
                         grouping = nested;
                 }
                 if (grouping is null)
@@ -922,7 +922,7 @@ namespace Cnidaria.Cs
                     continue;
                 }
                 // A static member implementing a static abstract or virtual member by name keeps its name; only explicit implementations are renamed.
-                if (body.IsStatic && StringComparer.Ordinal.Equals(body.Name, decl.Name))
+                if (body.IsStatic && body.Name == decl.Name)
                     continue;
                 switch (body)
                 {
@@ -1081,7 +1081,7 @@ namespace Cnidaria.Cs
                     if (members[i] is not MethodSymbol m)
                         continue;
 
-                    if (!StringComparer.Ordinal.Equals(m.Name, name))
+                    if (m.Name != name)
                         continue;
 
                     if (m.IsStatic != isStatic)
@@ -1528,7 +1528,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < members.Length; i++)
                 {
                     var m = members[i];
-                    if (!StringComparer.Ordinal.Equals(m.Name, name))
+                    if (m.Name != name)
                         continue;
 
                     if (memberKind == 1 && m is FieldSymbol f && !f.IsStatic && !f.IsConst)

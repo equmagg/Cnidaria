@@ -534,14 +534,14 @@ namespace Cnidaria.Cs
                 var named = a.NamedArguments;
                 for (int ni = 0; ni < named.Length; ni++)
                 {
-                    if (StringComparer.Ordinal.Equals(named[ni].Name, "AllowMultiple") &&
+                    if (named[ni].Name == "AllowMultiple" &&
                         named[ni].Value.Value is bool am)
                     {
                         allowMultiple = am;
                         continue;
                     }
 
-                    if (StringComparer.Ordinal.Equals(named[ni].Name, "Inherited") &&
+                    if (named[ni].Name == "Inherited" &&
                         named[ni].Value.Value is bool inh)
                     {
                         inherited = inh;
@@ -558,7 +558,7 @@ namespace Cnidaria.Cs
         private static bool IsSystemAttributeUsageAttribute(NamedTypeSymbol t)
         {
             var def = t.OriginalDefinition;
-            return StringComparer.Ordinal.Equals(def.Name, "AttributeUsageAttribute")
+            return def.Name == "AttributeUsageAttribute"
                 && IsNamespace(def.ContainingSymbol, "System");
         }
         private static bool TryConvertToUInt64(object? value, out ulong result)
@@ -1205,7 +1205,7 @@ namespace Cnidaria.Cs
             static int IndexOfParameter(ImmutableArray<ParameterSymbol> ps, string name)
             {
                 for (int i = 0; i < ps.Length; i++)
-                    if (StringComparer.Ordinal.Equals(ps[i].Name, name))
+                    if (ps[i].Name == name)
                         return i;
                 return -1;
             }
@@ -1284,7 +1284,7 @@ namespace Cnidaria.Cs
                 var members = t.GetMembers();
                 for (int i = 0; i < members.Length; i++)
                 {
-                    if (!StringComparer.Ordinal.Equals(members[i].Name, name))
+                    if (members[i].Name != name)
                         continue;
 
                     if (members[i] is FieldSymbol f)
@@ -1496,7 +1496,7 @@ namespace Cnidaria.Cs
                 first = false;
             }
 
-            return StringComparer.Ordinal.Equals(sb.ToString(), fullName);
+            return sb.ToString() == fullName;
         }
         private static void AddAttribute(Symbol owner, AttributeData data)
         {

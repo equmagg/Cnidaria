@@ -173,7 +173,7 @@ namespace Cnidaria.Cs
         {
             isa = default;
             variant = X86IsaVariant.None;
-            if (!StringComparer.Ordinal.Equals(type.Namespace, Namespace))
+            if (type.Namespace != Namespace)
                 return false;
             string name = type.Name;
             int nested = name.IndexOf('+');

@@ -3343,10 +3343,17 @@ namespace Cnidaria.Cs
                 }
             }
 
+            if (rm.HasInternalCall && rm.IsStatic && rm.DeclaringType.Namespace == "System.Runtime" &&
+                rm.DeclaringType.Name == "InternalCalls" && rm.Name == "RhpNewFast")
+            {
+                SetReturnRef(AllocObject(_rts.GetTypeById(checked((int)ReadAbiScalarArgument(rm, 0)))));
+                return true;
+            }
+
             if (!rm.HasThis && rm.IsStatic && rm.HasInternalCall && rm.ParameterTypes.Length == 3 &&
                 rm.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Void &&
                 ((rm.DeclaringType.Namespace == "System" && rm.DeclaringType.Name == "SpanHelpers" && rm.Name == "memmove") ||
-                 (rm.DeclaringType.Namespace == "System.Runtime" && rm.DeclaringType.Name == "RuntimeImports" && rm.Name == "RhBulkMoveWithWriteBarrier")))
+                 (rm.DeclaringType.Namespace == "System.Runtime" && rm.DeclaringType.Name is "RuntimeImports" or "InternalCalls" && rm.Name == "RhBulkMoveWithWriteBarrier")))
             {
                 long rawLength = ReadAbiScalarArgument(rm, 2);
                 int size = checked((int)(_rts.Target.PointerSize == 8 ? unchecked((ulong)rawLength) : unchecked((uint)rawLength)));
@@ -3562,7 +3569,7 @@ namespace Cnidaria.Cs
                 return true;
             }
 
-            // Type handles are type ids here; RuntimeImports.RhGetObjectTypeHandle is expanded by the importer.
+            // Type handles are type ids here; RuntimeHelpers.GetMethodTable is expanded by the importer.
             if (rm.DeclaringType.Namespace == "System.Runtime" && rm.DeclaringType.Name == "RuntimeImports" &&
                 rm.Name.StartsWith("RhGetType", StringComparison.Ordinal))
             {
@@ -3571,6 +3578,29 @@ namespace Cnidaria.Cs
                 {
                     SetReturnI4((int)RuntimeTypeNames.Flags(type));
                     return true;
+                }
+                if (rm.Name == "RhGetTypeCorElementType")
+                {
+                    SetReturnI4(RuntimeTypeNames.CorElementType(type));
+                    return true;
+                }
+                switch (rm.Name)
+                {
+                    case "RhGetTypeElementType":
+                        SetReturnI4((int)RuntimeMethodTables.ElementType(type));
+                        return true;
+                    case "RhGetTypeValueTypeSize":
+                        SetReturnI4(type.SizeOf);
+                        return true;
+                    case "RhGetTypeContainsGCPointers":
+                        SetReturnI4(type.ContainsGcPointers ? 1 : 0);
+                        return true;
+                    case "RhGetTypeNullableType":
+                        SetReturnRef(type.GenericTypeArguments[0].TypeId);
+                        return true;
+                    case "RhGetTypeNullableValueOffset":
+                        SetReturnI4(RuntimeMethodTables.NullableValueOffset(type));
+                        return true;
                 }
                 string? text = rm.Name switch
                 {

@@ -10,7 +10,7 @@ public enum BoundNodeKind : byte
     CompilationUnit, Function, Global, Error, Literal, Variable, FunctionReference, Tuple, Array, RepeatArray,
     Unary, Binary, Conversion, Assignment, Call, FieldAccess, Index, Construction, Block, If, Loop, For, Match,
     Return, Break, Continue, Range, Let, ExpressionStatement, ItemStatement, Pattern, MatchArm,
-    LabelStatement, GotoStatement, ConditionalGotoStatement, Panic
+    LabelStatement, GotoStatement, ConditionalGotoStatement, Panic, Discriminant
 }
 public enum ConversionKind : byte { None, Identity, Never, MutableToSharedReference, ArrayToSliceReference, ReferenceToPointer, MutableToConstPointer, FunctionToPointer, NumericCast, PointerCast }
 public enum ValueCategory : byte { Value, Place, MutablePlace }
@@ -171,6 +171,7 @@ public sealed class BoundFieldExpression : BoundExpression
     public BoundExpression Receiver { get; }
     public FieldSymbol? Field { get; }
     public int TupleIndex { get; }
+    public string Name => Field?.Name ?? TupleIndex.ToString(System.Globalization.CultureInfo.InvariantCulture);
     internal BoundFieldExpression(SyntaxNode syntax, TypeSymbol type, BoundExpression receiver, FieldSymbol? field, int index, ValueCategory category)
         : base(BoundNodeKind.FieldAccess, syntax, type, new[] { receiver }, category) { Receiver = receiver; Field = field; TupleIndex = index; }
 }
@@ -291,6 +292,13 @@ public sealed class BoundGotoStatement : BoundStatement
 public sealed class BoundPanicExpression : BoundExpression
 {
     internal BoundPanicExpression(SyntaxNode syntax, TypeSymbol never) : base(BoundNodeKind.Panic, syntax, never) { }
+}
+
+public sealed class BoundDiscriminantExpression : BoundExpression
+{
+    public BoundExpression Operand { get; }
+    internal BoundDiscriminantExpression(SyntaxNode syntax, TypeSymbol type, BoundExpression operand)
+        : base(BoundNodeKind.Discriminant, syntax, type, new[] { operand }) => Operand = operand;
 }
 
 public sealed class BoundPattern : BoundNode

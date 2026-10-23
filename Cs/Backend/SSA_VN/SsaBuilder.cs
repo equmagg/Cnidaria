@@ -1008,8 +1008,8 @@ namespace Cnidaria.Cs
                         defs = SsaMemoryKindSet.All;
                     break;
 
-                case GenTreeKind.NewObject:
                 case GenTreeKind.NewDelegate:
+                case GenTreeKind.AllocObject:
                 case GenTreeKind.NewArray:
                 case GenTreeKind.Box:
                     defs = defs.Add(SsaMemoryKind.GcHeap);

@@ -1641,7 +1641,7 @@ public static class CSharp
         for (int i = 0; i < attrs.Count; i++)
         {
             var a = attrs[i];
-            if (!StringComparer.Ordinal.Equals(NormalizeAttrName(a.Name), wantAttrShort))
+            if (NormalizeAttrName(a.Name) != wantAttrShort)
                 continue;
 
             if (a.CtorArgs.Length != wantCtorArgs.Length)
@@ -1650,7 +1650,7 @@ public static class CSharp
             bool same = true;
             for (int j = 0; j < wantCtorArgs.Length; j++)
             {
-                if (!StringComparer.Ordinal.Equals(a.CtorArgs[j], wantCtorArgs[j]))
+                if (a.CtorArgs[j] != wantCtorArgs[j])
                 {
                     same = false;
                     break;
@@ -1766,10 +1766,10 @@ public static class CSharp
         for (int i = 0; i < attrs.Count; i++)
         {
             var a = attrs[i];
-            if (!StringComparer.Ordinal.Equals(a.Namespace, "System"))
+            if (a.Namespace != "System")
                 continue;
 
-            if (StringComparer.Ordinal.Equals(a.Name, "ParamArrayAttribute"))
+            if (a.Name == "ParamArrayAttribute")
                 return true;
         }
 
@@ -1975,7 +1975,7 @@ public static class CSharp
                 continue;
 
             string got = NormalizeAttrName(a.AttributeClass.Name);
-            if (!StringComparer.Ordinal.Equals(got, wantAttrShort))
+            if (got != wantAttrShort)
                 continue;
 
             if (!CtorArgsMatch(a.ConstructorArguments, wantCtorArgs))
@@ -1993,7 +1993,7 @@ public static class CSharp
         {
             object? v = got[i].Value;
             string s = v is null ? "null" : Convert.ToString(v, CultureInfo.InvariantCulture) ?? string.Empty;
-            if (!StringComparer.Ordinal.Equals(s, want[i]))
+            if (s != want[i])
                 return false;
         }
         return true;

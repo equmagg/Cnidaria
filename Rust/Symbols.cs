@@ -1,13 +1,14 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Globalization;
 using System.Linq;
 
 namespace Cnidaria.Rust;
 
-public enum SymbolKind : byte { Module, NamedType, TypeParameter, TypeAlias, Function, Field, Variant, Parameter, Local, Constant, Static, Lifetime, Label, Import }
-public enum SymbolNamespace : byte { Type, Value, Lifetime, Label }
-public enum TypeKind : byte { Error, Never, Unit, Boolean, Character, Integer, Float, String, Tuple, Array, Slice, Reference, Pointer, Function, Struct, Enum, TypeParameter, Inference, Range }
+public enum SymbolKind : byte { Module, NamedType, TypeParameter, TypeAlias, Function, Field, Variant, Parameter, Local, Constant, Static, Lifetime, Label, Import, Macro, Trait, AssociatedType, Impl }
+public enum SymbolNamespace : byte { Type, Value, Lifetime, Label, Macro }
+public enum TypeKind : byte { Error, Never, Unit, Boolean, Character, Integer, Float, String, Tuple, Array, Slice, Reference, Pointer, Function, Struct, Enum, TypeParameter, Inference, Range, Projection }
 public enum AggregateShape : byte { Unit, Tuple, Named }
 public enum RangeKind : byte { Exclusive, Inclusive, From, To, ToInclusive, Full }
 
@@ -34,8 +35,8 @@ public sealed class ModuleSymbol : Symbol
     public ModuleSymbol? Parent => ContainingSymbol as ModuleSymbol;
     public ImmutableArray<Symbol> Members => _members.ToImmutableArray();
     internal BindingScope Scope { get; }
-    internal ModuleSymbol(string name, ModuleSymbol? parent, SyntaxNode syntax, SyntaxTree tree)
-        : base(SymbolKind.Module, name, parent, syntax, tree) => Scope = new BindingScope(null, this, tree, syntax.Span);
+    internal ModuleSymbol(string name, ModuleSymbol? parent, SyntaxNode syntax, SyntaxTree tree, BindingScope? prelude)
+        : base(SymbolKind.Module, name, parent, syntax, tree) => Scope = new BindingScope(prelude, this, tree, syntax.Span);
     internal void Add(Symbol symbol) => _members.Add(symbol);
     public bool Contains(ModuleSymbol module)
     {
@@ -69,11 +70,12 @@ public sealed class PrimitiveTypeSymbol : TypeSymbol
 
 public sealed class TypeParameterSymbol : Symbol
 {
-    public new GenericParameterSyntax Declaration { get; }
+    public new GenericParameterSyntax? Declaration { get; }
     public int Ordinal { get; }
     public TypeSymbol Type { get; }
     public TypeSymbol? DefaultType { get; internal set; }
-    internal TypeParameterSymbol(string name, Symbol owner, GenericParameterSyntax syntax, SyntaxTree tree, int ordinal)
+    public bool IsMaybeSized { get; internal set; }
+    internal TypeParameterSymbol(string name, Symbol owner, GenericParameterSyntax? syntax, SyntaxTree tree, int ordinal)
         : base(SymbolKind.TypeParameter, name, owner, syntax, tree) { Declaration = syntax; Ordinal = ordinal; Type = new ParameterTypeSymbol(this); }
 }
 
@@ -94,27 +96,77 @@ public sealed class LifetimeSymbol : Symbol
 
 public sealed class AggregateSymbol : Symbol
 {
+    public new ItemSyntax Declaration { get; }
     public TypeKind TypeKind { get; }
     public AggregateShape Shape { get; }
     public ImmutableArray<TypeParameterSymbol> TypeParameters { get; internal set; } = [];
+    public ImmutableArray<LifetimeSymbol> LifetimeParameters { get; internal set; } = [];
     public ImmutableArray<FieldSymbol> Fields { get; internal set; } = [];
     public ImmutableArray<VariantSymbol> Variants { get; internal set; } = [];
-    public ImmutableArray<FunctionSymbol> Methods { get; internal set; } = [];
+    public ImmutableArray<ImplSymbol> InherentImpls { get; internal set; } = [];
     public NamedTypeSymbol Type { get; internal set; }
+    internal ImmutableArray<Predicate> Predicates { get; set; } = [];
     internal BindingScope Scope { get; }
     internal int SignatureState;
     internal AggregateSymbol(string name, TypeKind kind, AggregateShape shape, ModuleSymbol module, ItemSyntax syntax, SyntaxTree tree)
         : base(SymbolKind.NamedType, name, module, syntax, tree)
-    { TypeKind = kind; Shape = shape; Type = new NamedTypeSymbol(this, []); Scope = new BindingScope(module.Scope, this, tree, syntax.Span); }
+    { Declaration = syntax; TypeKind = kind; Shape = shape; Type = new NamedTypeSymbol(this, []); Scope = new BindingScope(module.Scope, this, tree, syntax.Span); }
+}
+
+///<summary>A trait with its implicit Self parameter, generics, supertrait and where-clause predicates, and associated items</summary>
+public sealed class TraitSymbol : Symbol
+{
+    public TypeParameterSymbol SelfParameter { get; }
+    public ImmutableArray<TypeParameterSymbol> TypeParameters { get; internal set; } = [];
+    public ImmutableArray<LifetimeSymbol> LifetimeParameters { get; internal set; } = [];
+    public ImmutableArray<FunctionSymbol> Methods { get; internal set; } = [];
+    public ImmutableArray<AssociatedTypeSymbol> AssociatedTypes { get; internal set; } = [];
+    internal ImmutableArray<Predicate> Predicates { get; set; } = [];
+    internal BindingScope Scope { get; }
+    internal int SignatureState;
+    internal TraitSymbol(string name, ModuleSymbol module, TraitItemSyntax syntax, SyntaxTree tree)
+        : base(SymbolKind.Trait, name, module, syntax, tree)
+    {
+        SelfParameter = new TypeParameterSymbol("Self", this, null, tree, -1) { IsMaybeSized = true };
+        Scope = new BindingScope(module.Scope, this, tree, syntax.Span);
+    }
+    internal TraitReference Identity => new(this, SelfParameter.Type, TypeParameters.Select(p => p.Type).ToImmutableArray());
+    internal ImmutableArray<TypeParameterSymbol> Generics => TypeParameters.Insert(0, SelfParameter);
+}
+
+public sealed class AssociatedTypeSymbol : Symbol
+{
+    public TraitSymbol Trait => (TraitSymbol)ContainingSymbol!;
+    internal ImmutableArray<Predicate> Bounds { get; set; } = [];
+    internal AssociatedTypeSymbol(string name, TraitSymbol trait, TypeAliasItemSyntax syntax, SyntaxTree tree)
+        : base(SymbolKind.AssociatedType, name, trait, syntax, tree) { }
+}
+
+///<summary>An inherent or trait impl block; trait impls are found by the trait solver, inherent ones through their self type</summary>
+public sealed class ImplSymbol : Symbol
+{
+    public ImmutableArray<TypeParameterSymbol> TypeParameters { get; internal set; } = [];
+    public ImmutableArray<LifetimeSymbol> LifetimeParameters { get; internal set; } = [];
+    public TypeSymbol SelfType { get; internal set; }
+    public ImmutableArray<FunctionSymbol> Methods { get; internal set; } = [];
+    internal TraitReference? Trait { get; set; }
+    internal ImmutableArray<Predicate> Predicates { get; set; } = [];
+    internal Dictionary<AssociatedTypeSymbol, TypeSymbol> AssociatedTypes { get; } = new();
+    internal BindingScope Scope { get; }
+    internal ImplSymbol(int ordinal, ModuleSymbol module, ImplItemSyntax syntax, SyntaxTree tree, TypeSymbol error)
+        : base(SymbolKind.Impl, "{impl#" + ordinal.ToString(CultureInfo.InvariantCulture) + "}", module, syntax, tree)
+    { SelfType = error; Scope = new BindingScope(module.Scope, this, tree, syntax.Span); }
 }
 
 public sealed class NamedTypeSymbol : TypeSymbol
 {
     public AggregateSymbol Definition { get; }
     public ImmutableArray<TypeSymbol> TypeArguments { get; }
+    public ImmutableArray<LifetimeSymbol> LifetimeArguments { get; }
     public override TypeKind Kind => Definition.TypeKind;
     public override string Name => Definition.QualifiedName + (TypeArguments.IsEmpty ? "" : "<" + string.Join(", ", TypeArguments) + ">");
-    internal NamedTypeSymbol(AggregateSymbol definition, ImmutableArray<TypeSymbol> arguments) { Definition = definition; TypeArguments = arguments; }
+    internal NamedTypeSymbol(AggregateSymbol definition, ImmutableArray<TypeSymbol> arguments, ImmutableArray<LifetimeSymbol> lifetimes = default)
+    { Definition = definition; TypeArguments = arguments; LifetimeArguments = lifetimes.IsDefault ? [] : lifetimes; }
 }
 
 public sealed class TupleTypeSymbol : TypeSymbol
@@ -160,6 +212,18 @@ public sealed class FunctionTypeSymbol : TypeSymbol
     { ParameterTypes = parameters; ReturnType = result; IsUnsafe = isUnsafe; Abi = abi; }
 }
 
+///<summary>An associated type of a trait applied to a self type, such as &lt;T as Iterator&gt;::Item, that normalization could not replace</summary>
+public sealed class ProjectionTypeSymbol : TypeSymbol
+{
+    public AssociatedTypeSymbol Item { get; }
+    public TypeSymbol SelfType { get; }
+    public ImmutableArray<TypeSymbol> TraitArguments { get; }
+    public override TypeKind Kind => TypeKind.Projection;
+    public override string Name => "<" + SelfType + " as " + Item.Trait.QualifiedName + (TraitArguments.IsEmpty ? "" : "<" + string.Join(", ", TraitArguments) + ">") + ">::" + Item.Name;
+    internal ProjectionTypeSymbol(AssociatedTypeSymbol item, TypeSymbol self, ImmutableArray<TypeSymbol> arguments) { Item = item; SelfType = self; TraitArguments = arguments; }
+    internal TraitReference Trait => new(Item.Trait, SelfType, TraitArguments);
+}
+
 public sealed class TypeAliasSymbol : Symbol
 {
     public TypeSymbol Target { get; internal set; }
@@ -179,10 +243,17 @@ public sealed class FunctionSymbol : Symbol
     public bool IsUnsafe { get; internal set; }
     public bool IsExtern { get; internal set; }
     public bool IsForeign { get; internal set; }
+    public bool IsIntrinsic { get; internal set; }
     public string? ExternalName { get; internal set; }
     public string Abi { get; internal set; } = "Rust";
     public bool HasSelfParameter => !Parameters.IsEmpty && Parameters[0].IsSelf;
-    public NamedTypeSymbol? SelfType { get; internal set; }
+    public TypeSymbol? SelfType { get; internal set; }
+    // Generics of the enclosing impl, or Self and the parameters of the enclosing trait, precede the function's own
+    internal ImmutableArray<TypeParameterSymbol> ParentTypeParameters { get; set; } = [];
+    public ImmutableArray<TypeParameterSymbol> AllTypeParameters => ParentTypeParameters.IsEmpty ? TypeParameters : ParentTypeParameters.AddRange(TypeParameters);
+    internal ImmutableArray<Predicate> Predicates { get; set; } = [];
+    public TraitSymbol? Trait => ContainingSymbol as TraitSymbol;
+    public ImplSymbol? Impl => ContainingSymbol as ImplSymbol;
     internal BindingScope Scope { get; }
     internal int SignatureState;
     internal FunctionSymbol(string name, Symbol owner, FunctionItemSyntax syntax, SyntaxTree tree, BindingScope parent, TypeSymbol error)
@@ -252,8 +323,44 @@ public sealed class ImportSymbol : Symbol
     public Symbol Target { get; }
     public SymbolNamespace Namespace { get; }
     public bool IsGlob { get; }
-    internal ImportSymbol(string name, Symbol target, ModuleSymbol module, UseTreeSyntax syntax, SyntaxTree tree, SymbolNamespace space, bool glob)
+    internal ImportSymbol(string name, Symbol target, ModuleSymbol module, SyntaxNode syntax, SyntaxTree tree, SymbolNamespace space, bool glob)
         : base(SymbolKind.Import, name, module, syntax, tree) { Target = target; Namespace = space; IsGlob = glob; }
+}
+
+internal sealed record TraitReference(TraitSymbol Trait, TypeSymbol Self, ImmutableArray<TypeSymbol> Arguments)
+{
+    public override string ToString() => Self + ": " + Trait.QualifiedName + (Arguments.IsEmpty ? "" : "<" + string.Join(", ", Arguments) + ">");
+}
+
+internal abstract record Predicate;
+internal sealed record TraitPredicate(TraitReference Trait) : Predicate
+{
+    public override string ToString() => Trait.ToString();
+}
+internal sealed record ProjectionPredicate(ProjectionTypeSymbol Projection, TypeSymbol Type) : Predicate
+{
+    public override string ToString() => Projection + " == " + Type;
+}
+internal sealed record OutlivesPredicate(LifetimeSymbol Longer, LifetimeSymbol Shorter) : Predicate
+{
+    public override string ToString() => Longer.Name + ": " + Shorter.Name;
+}
+
+///<summary>The elaborated where-clauses an item may assume</summary>
+internal sealed class ParamEnv(ImmutableArray<Predicate> predicates)
+{
+    internal static readonly ParamEnv Empty = new([]);
+    internal ImmutableArray<Predicate> Predicates { get; } = predicates;
+}
+
+internal sealed record Obligation(Predicate Predicate, ParamEnv Env, SyntaxNode Syntax, SyntaxTree Tree, int Depth);
+internal enum Evaluation : byte { Holds, Ambiguous, Fails }
+
+public sealed class MacroSymbol : Symbol
+{
+    internal MacroDefinition Definition { get; }
+    internal MacroSymbol(MacroDefinition definition, ModuleSymbol module, MacroDefinitionItemSyntax syntax, SyntaxTree tree)
+        : base(SymbolKind.Macro, definition.Name, module, syntax, tree) => Definition = definition;
 }
 
 internal enum InferenceKind : byte { Any, Integer, Float }
@@ -267,31 +374,45 @@ internal sealed class InferenceTypeSymbol : TypeSymbol
     internal InferenceTypeSymbol(InferenceKind constraint, SyntaxNode origin) { Constraint = constraint; Origin = origin; }
     public override TypeKind Kind => Binding?.Resolve().Kind ?? TypeKind.Inference;
     public override string Name => Binding?.Resolve().Name ?? (Constraint == InferenceKind.Any ? "_" : "{" + Constraint.ToString().ToLowerInvariant() + "}");
-    public override TypeSymbol Resolve() { if (Binding is null) return this; return Binding = Binding.Resolve(); }
+    // No path compression: trait selection probes roll bindings back
+    public override TypeSymbol Resolve() => Binding is null ? this : Binding.Resolve();
 }
 
 internal readonly record struct ScopeEntry(string Name, SymbolNamespace Namespace, Symbol Symbol, int VisibleFrom);
 internal sealed class BindingScope
 {
-    internal readonly BindingScope? Parent;
+    internal BindingScope? Parent;
     internal readonly Symbol Owner;
     internal readonly SyntaxTree Tree;
     internal readonly TextSpan Span;
     internal readonly List<ScopeEntry> Entries = new();
+    private readonly Dictionary<string, List<ScopeEntry>> _named = new(StringComparer.Ordinal);
     internal BindingScope(BindingScope? parent, Symbol owner, SyntaxTree tree, TextSpan span) { Parent = parent; Owner = owner; Tree = tree; Span = span; }
-    internal void Add(string name, SymbolNamespace space, Symbol symbol, int visibleFrom = 0) => Entries.Add(new ScopeEntry(name, space, symbol, visibleFrom));
-    internal ImmutableArray<Symbol> Find(string name, SymbolNamespace space, int position = int.MaxValue)
+    internal void Add(string name, SymbolNamespace space, Symbol symbol, int visibleFrom = 0) => Add(new ScopeEntry(name, space, symbol, visibleFrom));
+    internal void AddRange(IEnumerable<ScopeEntry> entries) { foreach (ScopeEntry entry in entries) Add(entry); }
+    private void Add(ScopeEntry entry)
     {
-        var matches = Entries.Where(e => e.Name == name && e.Namespace == space && e.VisibleFrom <= position).Select(e => e.Symbol).ToArray();
+        Entries.Add(entry);
+        if (!_named.TryGetValue(entry.Name, out List<ScopeEntry>? named)) _named.Add(entry.Name, named = new());
+        named.Add(entry);
+    }
+    // Entries with this name in insertion order
+    internal IReadOnlyList<ScopeEntry> Named(string name) => _named.TryGetValue(name, out List<ScopeEntry>? named) ? named : [];
+    internal ImmutableArray<Symbol> Find(string name, SymbolNamespace space, int position = int.MaxValue, bool skipLocals = false)
+    {
+        var matches = Named(name).Where(e => e.Namespace == space && e.VisibleFrom <= position && !(skipLocals && e.Symbol is LocalSymbol or ParameterSymbol))
+            .Select(e => e.Symbol).ToArray();
         var explicitMatches = matches.Where(s => s is not ImportSymbol { IsGlob: true }).ToArray();
         if (explicitMatches.Length != 0) return [explicitMatches[^1]];
         if (matches.Length != 0) return matches.DistinctBy(s => s is ImportSymbol import ? import.Target : s).ToImmutableArray();
-        return Parent?.Find(name, space, position) ?? [];
+        return Parent?.Find(name, space, position, skipLocals) ?? [];
     }
 }
 
 internal sealed class TypeSystem
 {
+    private static readonly TypeSystem Width32 = new(32), Width64 = new(64);
+    internal static TypeSystem For(int pointerWidth) => pointerWidth == 32 ? Width32 : Width64;
     internal readonly Dictionary<string, PrimitiveTypeSymbol> Primitives = new(StringComparer.Ordinal);
     internal readonly PrimitiveTypeSymbol Error = new("<error>", TypeKind.Error);
     internal readonly PrimitiveTypeSymbol Never = new("!", TypeKind.Never);
@@ -301,7 +422,7 @@ internal sealed class TypeSystem
     internal PrimitiveTypeSymbol I32 => Primitives["i32"];
     internal PrimitiveTypeSymbol Usize => Primitives["usize"];
     internal PrimitiveTypeSymbol F64 => Primitives["f64"];
-    internal TypeSystem(int pointerWidth)
+    private TypeSystem(int pointerWidth)
     {
         foreach (int bits in new[] { 8, 16, 32, 64, 128 })
         {
@@ -320,14 +441,23 @@ internal sealed class TypeSystem
         return type switch
         {
             ParameterTypeSymbol p when substitution.TryGetValue(p.Parameter, out TypeSymbol? value) => value,
-            NamedTypeSymbol n => new NamedTypeSymbol(n.Definition, n.TypeArguments.Select(t => Substitute(t, substitution)).ToImmutableArray()),
+            NamedTypeSymbol n => new NamedTypeSymbol(n.Definition, n.TypeArguments.Select(t => Substitute(t, substitution)).ToImmutableArray(), n.LifetimeArguments),
             TupleTypeSymbol t => new TupleTypeSymbol(t.Elements.Select(e => Substitute(e, substitution)).ToImmutableArray()),
             SequenceTypeSymbol s => new SequenceTypeSymbol(s.Kind, Substitute(s.ElementType, substitution), s.Length, s.RangeForm),
             IndirectTypeSymbol r => new IndirectTypeSymbol(r.Kind, Substitute(r.ElementType, substitution), r.IsMutable, r.Lifetime),
             FunctionTypeSymbol f => new FunctionTypeSymbol(f.ParameterTypes.Select(t => Substitute(t, substitution)).ToImmutableArray(), Substitute(f.ReturnType, substitution), f.IsUnsafe, f.Abi),
+            ProjectionTypeSymbol p => new ProjectionTypeSymbol(p.Item, Substitute(p.SelfType, substitution), p.TraitArguments.Select(t => Substitute(t, substitution)).ToImmutableArray()),
             _ => type
         };
     }
+    internal TraitReference Substitute(TraitReference reference, IReadOnlyDictionary<TypeParameterSymbol, TypeSymbol> substitution)
+        => new(reference.Trait, Substitute(reference.Self, substitution), reference.Arguments.Select(t => Substitute(t, substitution)).ToImmutableArray());
+    internal Predicate Substitute(Predicate predicate, IReadOnlyDictionary<TypeParameterSymbol, TypeSymbol> substitution) => predicate switch
+    {
+        TraitPredicate p => new TraitPredicate(Substitute(p.Trait, substitution)),
+        ProjectionPredicate p => new ProjectionPredicate((ProjectionTypeSymbol)Substitute(p.Projection, substitution), Substitute(p.Type, substitution)),
+        _ => predicate
+    };
     internal TypeSymbol FieldType(FieldSymbol field, NamedTypeSymbol receiver)
         => Substitute(field.Type, receiver.Definition.TypeParameters.Zip(receiver.TypeArguments).ToDictionary(p => p.First, p => p.Second));
 
@@ -343,9 +473,10 @@ internal sealed class TypeSystem
             (SequenceTypeSymbol a, SequenceTypeSymbol b) => a.Length == b.Length && a.RangeForm == b.RangeForm && Same(a.ElementType, b.ElementType),
             (IndirectTypeSymbol a, IndirectTypeSymbol b) => a.IsMutable == b.IsMutable && Same(a.ElementType, b.ElementType),
             (FunctionTypeSymbol a, FunctionTypeSymbol b) => a.IsUnsafe == b.IsUnsafe && a.Abi == b.Abi && SameList(a.ParameterTypes, b.ParameterTypes) && Same(a.ReturnType, b.ReturnType),
+            (ProjectionTypeSymbol a, ProjectionTypeSymbol b) => ReferenceEquals(a.Item, b.Item) && Same(a.SelfType, b.SelfType) && SameList(a.TraitArguments, b.TraitArguments),
             _ => false
         };
     }
-    private static bool SameList(ImmutableArray<TypeSymbol> left, ImmutableArray<TypeSymbol> right)
+    internal static bool SameList(ImmutableArray<TypeSymbol> left, ImmutableArray<TypeSymbol> right)
         => left.Length == right.Length && left.Zip(right).All(p => Same(p.First, p.Second));
 }

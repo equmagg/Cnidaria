@@ -121,7 +121,7 @@ namespace Cnidaria.Cs
         HWIntrinsic,
         IndirectCall,
         VirtualCall,
-        NewObject,
+        AllocObject,
         NewDelegate,
         DelegateCombine,
         DelegateRemove,
@@ -167,9 +167,7 @@ namespace Cnidaria.Cs
         Throw,
         Rethrow,
         EndFinally,
-        // Runs a finally handler, which returns to the next block
         CallFinally,
-        // Leaves a catch handler for a block outside it
         CatchReturn,
         EndFilter,
     }

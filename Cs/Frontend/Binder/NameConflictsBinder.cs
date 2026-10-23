@@ -119,7 +119,7 @@ namespace Cnidaria.Cs
         }
         private static bool HasSameMemberSignature(MethodSymbol left, MethodSymbol right)
         {
-            if (!StringComparer.Ordinal.Equals(left.Name, right.Name))
+            if (left.Name != right.Name)
                 return false;
 
             if (left.TypeParameters.Length != right.TypeParameters.Length)

@@ -20,15 +20,450 @@ internal sealed class Binder
     private readonly List<InferenceTypeSymbol> _inferences = new();
     private readonly List<Action> _checks = new();
     private readonly Dictionary<GlobalSymbol, BoundGlobal> _globals = new();
+    private readonly Dictionary<AggregateSymbol, bool> _discriminants = new();
     private readonly List<BoundFunction> _functions = new();
+    private readonly MacroExpander _expander = new(RustEdition.Rust2024);
+    private readonly Dictionary<SyntaxNode, MacroScope?> _itemMacros = new();
+    private readonly List<ModuleSymbol> _expansionCrates = new();
+    private readonly Dictionary<string, ModuleSymbol> _externCrates = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _features = new(StringComparer.Ordinal);
+    // Searched after the module: the extern and macro_use preludes, then the standard library prelude
+    private readonly BindingScope _externPrelude, _stdPrelude;
+    internal readonly Dictionary<string, Symbol> LangItems = new(StringComparer.Ordinal);
+    internal readonly List<ImplSymbol> LocalImpls = new();
+    private readonly Dictionary<ImplSymbol, (ImplItemSyntax Syntax, ImmutableArray<ItemSyntax> Items)> _implItems = new();
+    private readonly Dictionary<Symbol, ParamEnv> _environments = new();
+    private List<(InferenceTypeSymbol Variable, TypeSymbol? Binding, InferenceKind Constraint, bool Never, TypeSymbol? Default)>? _undo;
+    private MacroScope? _macroScope;
+    internal int ExpansionDepth;
     private int _typeDepth;
+    private int _implOrdinal;
 
     internal Binder(Compilation compilation)
     {
         _compilation = compilation;
-        Types = new TypeSystem(compilation.Options.PointerWidth);
-        Crate = new ModuleSymbol(compilation.Options.CrateName, null, compilation.RootSyntaxTree.Root, compilation.RootSyntaxTree) { IsPublic = true };
+        Types = TypeSystem.For(compilation.Options.PointerWidth);
+        SyntaxTree root = compilation.RootSyntaxTree;
+        Crate = new ModuleSymbol(compilation.Options.CrateName, null, root.Root, root, null) { IsPublic = true };
+        _stdPrelude = new BindingScope(null, Crate, root, root.Root.Span);
+        _externPrelude = new BindingScope(_stdPrelude, Crate, root, root.Root.Span);
+        Crate.Scope.Parent = _externPrelude;
+        foreach (Compilation reference in compilation.References) Inject(reference.Binding);
     }
+    // The implicit #[macro_use] extern crate and #[prelude_import] use of the injected library crate
+    private void Inject(Binder library)
+    {
+        ModuleSymbol crate = library.Crate;
+        foreach (ImplSymbol impl in library.LocalImpls) AddImpl(impl);
+        _externCrates.Add(crate.Name, crate);
+        _externPrelude.Add(crate.Name, SymbolNamespace.Type, crate);
+        foreach (ScopeEntry entry in crate.Scope.Entries)
+            if (entry.Namespace == SymbolNamespace.Macro && entry.Symbol is MacroSymbol { IsPublic: true }) _externPrelude.Add(entry.Name, entry.Namespace, entry.Symbol);
+        ModuleSymbol? prelude = Submodule(Submodule(crate, "prelude"), "rust_2024");
+        foreach (ScopeEntry entry in prelude?.Scope.Entries ?? [])
+            if (IsAccessible(entry.Symbol, Crate)) _stdPrelude.Add(entry.Name, entry.Namespace, entry.Symbol);
+    }
+    private static ModuleSymbol? Submodule(ModuleSymbol? module, string name)
+        => module?.Scope.Named(name).Select(e => e.Namespace == SymbolNamespace.Type ? Unwrap(e.Symbol) : null).OfType<ModuleSymbol>().FirstOrDefault();
+    private static ModuleSymbol? CrateOf(Symbol symbol)
+    {
+        Symbol current = symbol;
+        while (current.ContainingSymbol is Symbol containing) current = containing;
+        return current as ModuleSymbol;
+    }
+    internal bool IsLocal(Symbol symbol) => ReferenceEquals(CrateOf(symbol), Crate);
+    internal Symbol? FindLangItem(string name)
+        => LangItems.GetValueOrDefault(name) ?? _compilation.References.Select(r => r.Binding.FindLangItem(name)).FirstOrDefault(s => s is not null);
+
+    // Runs a speculative unification; every inference binding it makes is undone afterwards
+    internal T Probe<T>(Func<T> action)
+    {
+        var outer = _undo;
+        _undo = new();
+        try { return action(); }
+        finally
+        {
+            for (int i = _undo.Count - 1; i >= 0; i--)
+            {
+                var (variable, binding, constraint, never, fallback) = _undo[i];
+                variable.Binding = binding; variable.Constraint = constraint; variable.HasNeverConstraint = never; variable.DefaultType = fallback;
+            }
+            _undo = outer;
+        }
+    }
+    private void Change(InferenceTypeSymbol variable) => _undo?.Add((variable, variable.Binding, variable.Constraint, variable.HasNeverConstraint, variable.DefaultType));
+    internal TypeSymbol Zonk(TypeSymbol type) => type.Resolve() switch
+    {
+        NamedTypeSymbol n when !n.TypeArguments.IsEmpty => new NamedTypeSymbol(n.Definition, n.TypeArguments.Select(Zonk).ToImmutableArray(), n.LifetimeArguments),
+        TupleTypeSymbol t => new TupleTypeSymbol(t.Elements.Select(Zonk).ToImmutableArray()),
+        SequenceTypeSymbol s => new SequenceTypeSymbol(s.Kind, Zonk(s.ElementType), s.Length, s.RangeForm),
+        IndirectTypeSymbol r => new IndirectTypeSymbol(r.Kind, Zonk(r.ElementType), r.IsMutable, r.Lifetime),
+        FunctionTypeSymbol f => new FunctionTypeSymbol(f.ParameterTypes.Select(Zonk).ToImmutableArray(), Zonk(f.ReturnType), f.IsUnsafe, f.Abi),
+        ProjectionTypeSymbol p => new ProjectionTypeSymbol(p.Item, Zonk(p.SelfType), p.TraitArguments.Select(Zonk).ToImmutableArray()),
+        var resolved => resolved
+    };
+
+    // Trait solving: trait and projection predicates are proved against where-clauses, the impls of every linked crate and builtin rules
+    private abstract record Candidate;
+    private sealed record EnvironmentCandidate(TraitReference Bound) : Candidate;
+    private sealed record ImplCandidate(ImplSymbol Impl) : Candidate;
+    private sealed record BuiltinCandidate(ImmutableArray<TraitReference> Nested) : Candidate;
+    // Impls of one trait, grouped by the head of their self type; blanket impls match every head
+    private sealed class ImplIndex
+    {
+        internal readonly Dictionary<ImplSymbol, int> Order = new();
+        internal readonly Dictionary<object, List<ImplSymbol>> ByHead = new();
+        internal readonly List<ImplSymbol> Blanket = new();
+    }
+    private const int ObligationDepthLimit = 64;
+    private static readonly object ReferenceHead = new(), MutableReferenceHead = new(), PointerHead = new(), MutablePointerHead = new(), FunctionHead = new();
+    private readonly Dictionary<TraitSymbol, ImplIndex> _traitImpls = new();
+    private readonly List<Obligation> _obligations = new();
+    internal TraitSymbol? SizedTrait, CopyTrait, CloneTrait;
+
+    private void AddImpl(ImplSymbol impl)
+    {
+        if (impl.Trait is not TraitReference reference) return;
+        if (!_traitImpls.TryGetValue(reference.Trait, out ImplIndex? index)) _traitImpls.Add(reference.Trait, index = new());
+        index.Order.Add(impl, index.Order.Count);
+        if (TypeHead(reference.Self) is not object head) index.Blanket.Add(impl);
+        else if (index.ByHead.TryGetValue(head, out List<ImplSymbol>? list)) list.Add(impl);
+        else index.ByHead.Add(head, [impl]);
+    }
+    private IEnumerable<ImplSymbol> ImplCandidates(TraitSymbol trait, object? head)
+    {
+        if (!_traitImpls.TryGetValue(trait, out ImplIndex? index)) return [];
+        if (head is null) return index.Order.Keys;
+        return index.ByHead.TryGetValue(head, out List<ImplSymbol>? list) ? list.Concat(index.Blanket) : index.Blanket;
+    }
+    // Impls registered before this one that could share a self type with it
+    private IEnumerable<ImplSymbol> EarlierImpls(ImplSymbol impl)
+    {
+        if (impl.Trait is not TraitReference reference || !_traitImpls.TryGetValue(reference.Trait, out ImplIndex? index)) return [];
+        int order = index.Order[impl];
+        return ImplCandidates(reference.Trait, TypeHead(reference.Self)).Where(other => index.Order[other] < order);
+    }
+    // Fast rejection by the outermost type constructor; null matches every type
+    private static object? TypeHead(TypeSymbol type) => type.Resolve() switch
+    {
+        NamedTypeSymbol named => named.Definition,
+        PrimitiveTypeSymbol primitive => primitive,
+        IndirectTypeSymbol { Kind: TypeKind.Reference } reference => reference.IsMutable ? MutableReferenceHead : ReferenceHead,
+        IndirectTypeSymbol pointer => pointer.IsMutable ? MutablePointerHead : PointerHead,
+        TupleTypeSymbol tuple => tuple.Elements.Length,
+        SequenceTypeSymbol sequence => sequence.Kind,
+        FunctionTypeSymbol => FunctionHead,
+        _ => null
+    };
+
+    internal static Dictionary<TypeParameterSymbol, TypeSymbol> Instantiate(ImplSymbol impl, Func<TypeParameterSymbol, TypeSymbol> fresh)
+        => impl.TypeParameters.ToDictionary(p => p, fresh);
+    internal static Dictionary<TypeParameterSymbol, TypeSymbol> Substitution(TraitReference reference)
+    {
+        var substitution = new Dictionary<TypeParameterSymbol, TypeSymbol> { [reference.Trait.SelfParameter] = reference.Self };
+        for (int i = 0; i < reference.Trait.TypeParameters.Length && i < reference.Arguments.Length; i++) substitution[reference.Trait.TypeParameters[i]] = reference.Arguments[i];
+        return substitution;
+    }
+    private bool Unify(TraitReference left, TraitReference right)
+        => ReferenceEquals(left.Trait, right.Trait) && left.Arguments.Length == right.Arguments.Length && Unify(left.Self, right.Self) && left.Arguments.Zip(right.Arguments).All(p => Unify(p.First, p.Second));
+    // A variable for speculative instantiation; it is never defaulted or reported
+    internal TypeSymbol Probing(TypeParameterSymbol parameter) => new InferenceTypeSymbol(InferenceKind.Any, parameter.Declaration ?? (SyntaxNode?)parameter.ContainingSymbol?.Declaration ?? Crate.Declaration!);
+
+    internal ImmutableArray<Predicate> Elaborate(IEnumerable<Predicate> predicates)
+    {
+        var result = ImmutableArray.CreateBuilder<Predicate>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var queue = new Queue<Predicate>(predicates);
+        while (queue.Count != 0 && result.Count < 4096)
+        {
+            Predicate predicate = queue.Dequeue();
+            if (!seen.Add(predicate.ToString()!)) continue;
+            result.Add(predicate);
+            if (predicate is not TraitPredicate { Trait: TraitReference reference }) continue;
+            Dictionary<TypeParameterSymbol, TypeSymbol> substitution = Substitution(reference);
+            foreach (Predicate inherited in reference.Trait.Predicates)
+                if (IsSuper(inherited, reference.Trait)) queue.Enqueue(Types.Substitute(inherited, substitution));
+            foreach (AssociatedTypeSymbol item in reference.Trait.AssociatedTypes)
+                foreach (Predicate bound in item.Bounds) queue.Enqueue(Types.Substitute(bound, substitution));
+        }
+        return result.ToImmutable();
+    }
+    private static bool IsSuper(Predicate predicate, TraitSymbol trait) => predicate switch
+    {
+        TraitPredicate p => p.Trait.Self is ParameterTypeSymbol { Parameter: var self } && ReferenceEquals(self, trait.SelfParameter),
+        ProjectionPredicate p => p.Projection.SelfType is ParameterTypeSymbol { Parameter: var self } && ReferenceEquals(self, trait.SelfParameter),
+        _ => false
+    };
+
+    private List<Candidate> AssembleCandidates(TraitReference goal, ParamEnv env, out bool ambiguous)
+    {
+        var candidates = new List<Candidate>();
+        TypeSymbol self = goal.Self.Resolve();
+        ambiguous = self is InferenceTypeSymbol { Constraint: InferenceKind.Any };
+        if (ambiguous) return candidates;
+        foreach (Predicate predicate in env.Predicates)
+        {
+            if (predicate is not TraitPredicate { Trait: TraitReference bound } || !ReferenceEquals(bound.Trait, goal.Trait)) continue;
+            if (!Probe(() => Unify(goal, bound))) continue;
+            if (candidates.OfType<EnvironmentCandidate>().Any(c => TypeSystem.Same(c.Bound.Self, bound.Self) && TypeSystem.SameList(c.Bound.Arguments, bound.Arguments))) continue;
+            candidates.Add(new EnvironmentCandidate(bound));
+        }
+        if (candidates.Count != 0) return candidates;
+        if (Builtin(goal, self, out BuiltinCandidate? builtin))
+        {
+            if (builtin is not null) candidates.Add(builtin);
+            return candidates;
+        }
+        foreach (ImplSymbol impl in ImplCandidates(goal.Trait, TypeHead(self)))
+            if (Probe(() => Unify(goal, Types.Substitute(impl.Trait!, Instantiate(impl, Probing))))) candidates.Add(new ImplCandidate(impl));
+        return candidates;
+    }
+    // Sized has no impls; Copy and Clone of tuples, arrays, function pointers and ! are structural as in rustc
+    private bool Builtin(TraitReference goal, TypeSymbol self, out BuiltinCandidate? candidate)
+    {
+        candidate = null;
+        if (ReferenceEquals(goal.Trait, SizedTrait))
+        {
+            if (IsSized(self) && self is not ParameterTypeSymbol { Parameter.IsMaybeSized: true }) candidate = new BuiltinCandidate([]);
+            return true;
+        }
+        if (!ReferenceEquals(goal.Trait, CopyTrait) && !ReferenceEquals(goal.Trait, CloneTrait)) return false;
+        switch (self)
+        {
+            case TupleTypeSymbol tuple: candidate = new BuiltinCandidate(tuple.Elements.Select(e => goal with { Self = e }).ToImmutableArray()); return true;
+            case SequenceTypeSymbol { Kind: TypeKind.Array } array: candidate = new BuiltinCandidate([goal with { Self = array.ElementType }]); return true;
+            case FunctionTypeSymbol or PrimitiveTypeSymbol { Kind: TypeKind.Never }: candidate = new BuiltinCandidate([]); return true;
+        }
+        return false;
+    }
+
+    private List<Predicate>? ConfirmCandidate(Candidate candidate, TraitReference goal, Func<TypeParameterSymbol, TypeSymbol> fresh)
+    {
+        switch (candidate)
+        {
+            case EnvironmentCandidate environment: return Unify(goal, environment.Bound) ? [] : null;
+            case BuiltinCandidate builtin: return builtin.Nested.Select(r => (Predicate)new TraitPredicate(r)).ToList();
+            case ImplCandidate { Impl: var impl }:
+            {
+                Dictionary<TypeParameterSymbol, TypeSymbol> substitution = Instantiate(impl, fresh);
+                if (!Unify(goal, Types.Substitute(impl.Trait!, substitution))) return null;
+                var nested = impl.Predicates.Select(p => Types.Substitute(p, substitution)).ToList();
+                if (SizedTrait is not null)
+                    foreach (TypeParameterSymbol parameter in impl.TypeParameters)
+                        if (!parameter.IsMaybeSized) nested.Add(new TraitPredicate(new TraitReference(SizedTrait, substitution[parameter], [])));
+                return nested;
+            }
+        }
+        return null;
+    }
+    private Candidate? ChooseCandidate(List<Candidate> candidates, TraitReference goal, ParamEnv env, int depth, out Evaluation result)
+    {
+        result = Evaluation.Holds;
+        if (candidates.Count == 1) return candidates[0];
+        if (candidates.Count == 0) { result = Evaluation.Fails; return null; }
+        var viable = candidates.Where(c => Probe(() => EvaluateCandidate(c, goal, env, depth)) != Evaluation.Fails).ToList();
+        if (viable.Count == 1) return viable[0];
+        result = viable.Count == 0 ? Evaluation.Fails : Evaluation.Ambiguous;
+        return null;
+    }
+
+    internal Evaluation Evaluate(Predicate predicate, ParamEnv env) => Probe(() => EvaluateInner(predicate, env, 0));
+    private Evaluation EvaluateInner(Predicate predicate, ParamEnv env, int depth)
+    {
+        if (depth > ObligationDepthLimit) return Evaluation.Ambiguous;
+        switch (predicate)
+        {
+            case TraitPredicate { Trait: var goal }:
+            {
+                if (Contains(goal, t => t.IsError)) return Evaluation.Holds;
+                List<Candidate> candidates = AssembleCandidates(goal, env, out bool ambiguous);
+                if (ambiguous) return Evaluation.Ambiguous;
+                Candidate? chosen = ChooseCandidate(candidates, goal, env, depth, out Evaluation result);
+                return chosen is null ? result : EvaluateCandidate(chosen, goal, env, depth);
+            }
+            case ProjectionPredicate projection:
+            {
+                var nested = new List<Predicate>();
+                TypeSymbol? value = Project(projection.Projection, env, nested, Probing, depth);
+                if (value is null) return Evaluation.Ambiguous;
+                if (!Unify(value, projection.Type)) return Evaluation.Fails;
+                return EvaluateNested(nested, env, depth);
+            }
+        }
+        return Evaluation.Holds;
+    }
+    private Evaluation EvaluateCandidate(Candidate candidate, TraitReference goal, ParamEnv env, int depth)
+        => ConfirmCandidate(candidate, goal, Probing) is List<Predicate> nested ? EvaluateNested(nested, env, depth) : Evaluation.Fails;
+    private Evaluation EvaluateNested(List<Predicate> nested, ParamEnv env, int depth)
+    {
+        Evaluation result = Evaluation.Holds;
+        foreach (Predicate predicate in nested)
+        {
+            Evaluation evaluation = EvaluateInner(predicate, env, depth + 1);
+            if (evaluation == Evaluation.Fails) return Evaluation.Fails;
+            if (evaluation == Evaluation.Ambiguous) result = Evaluation.Ambiguous;
+        }
+        return result;
+    }
+
+    // The value of a projection, or null while selecting its impl must wait for inference
+    internal TypeSymbol? Project(ProjectionTypeSymbol projection, ParamEnv env, List<Predicate> nested, Func<TypeParameterSymbol, TypeSymbol> fresh, int depth = 0)
+    {
+        TraitReference goal = projection.Trait;
+        if (Contains(goal, t => t.IsError)) return Types.Error;
+        List<Candidate> candidates = AssembleCandidates(goal, env, out bool ambiguous);
+        if (ambiguous) return null;
+        Candidate? chosen = ChooseCandidate(candidates, goal, env, depth, out Evaluation result);
+        if (chosen is null)
+        {
+            if (result == Evaluation.Ambiguous) return null;
+            nested.Add(new TraitPredicate(goal));
+            return Types.Error;
+        }
+        switch (chosen)
+        {
+            case ImplCandidate { Impl: var impl }:
+            {
+                Dictionary<TypeParameterSymbol, TypeSymbol> substitution = Instantiate(impl, fresh);
+                if (!Unify(goal, Types.Substitute(impl.Trait!, substitution))) return Types.Error;
+                nested.AddRange(impl.Predicates.Select(p => Types.Substitute(p, substitution)));
+                return impl.AssociatedTypes.TryGetValue(projection.Item, out TypeSymbol? value) ? Types.Substitute(value, substitution) : Types.Error;
+            }
+            case EnvironmentCandidate environment:
+                Unify(goal, environment.Bound);
+                foreach (ProjectionPredicate equality in env.Predicates.OfType<ProjectionPredicate>())
+                {
+                    if (!ReferenceEquals(equality.Projection.Item, projection.Item) || !Probe(() => Unify(equality.Projection, projection))) continue;
+                    Unify(equality.Projection, projection);
+                    return equality.Type;
+                }
+                return projection;
+        }
+        return projection;
+    }
+
+    internal void RegisterObligation(Predicate predicate, ParamEnv env, SyntaxNode syntax, SyntaxTree tree) => _obligations.Add(new Obligation(predicate, env, syntax, tree, 0));
+    internal void SelectWherePossible()
+    {
+        bool progress;
+        do
+        {
+            progress = false;
+            for (int i = 0; i < _obligations.Count; i++)
+            {
+                Obligation obligation = _obligations[i];
+                Evaluation result = ProcessObligation(obligation, out List<Predicate>? nested);
+                if (result == Evaluation.Ambiguous) continue;
+                _obligations.RemoveAt(i--);
+                progress = true;
+                if (result == Evaluation.Fails) { ReportUnsatisfied(obligation); continue; }
+                foreach (Predicate predicate in nested!)
+                {
+                    if (obligation.Depth >= ObligationDepthLimit)
+                    {
+                        Error(obligation.Tree, obligation.Syntax, $"Overflow evaluating the requirement '{predicate}'.", "RTRA0275");
+                        break;
+                    }
+                    _obligations.Add(obligation with { Predicate = predicate, Depth = obligation.Depth + 1 });
+                }
+            }
+        } while (progress);
+    }
+    private Evaluation ProcessObligation(Obligation obligation, out List<Predicate>? nested)
+    {
+        nested = null;
+        TypeSymbol Fill(TypeParameterSymbol _) => Fresh(obligation.Syntax);
+        switch (obligation.Predicate)
+        {
+            case TraitPredicate { Trait: var goal }:
+            {
+                if (Contains(goal, t => t.IsError)) { nested = []; return Evaluation.Holds; }
+                List<Candidate> candidates = AssembleCandidates(goal, obligation.Env, out bool ambiguous);
+                if (ambiguous) return Evaluation.Ambiguous;
+                Candidate? chosen = ChooseCandidate(candidates, goal, obligation.Env, obligation.Depth, out Evaluation result);
+                if (chosen is null) return result;
+                nested = ConfirmCandidate(chosen, goal, Fill);
+                return nested is null ? Evaluation.Fails : Evaluation.Holds;
+            }
+            case ProjectionPredicate projection:
+            {
+                nested = new List<Predicate>();
+                TypeSymbol? value = Project(projection.Projection, obligation.Env, nested, Fill, obligation.Depth);
+                if (value is null) return Evaluation.Ambiguous;
+                return Unify(value, projection.Type) ? Evaluation.Holds : Evaluation.Fails;
+            }
+        }
+        nested = [];
+        return Evaluation.Holds;
+    }
+    private void ReportUnsatisfied(Obligation obligation)
+    {
+        if (obligation.Predicate is TraitPredicate { Trait: var goal })
+            Error(obligation.Tree, obligation.Syntax, $"The trait bound '{Zonk(goal)}' is not satisfied.", "RTRA0277");
+        else if (obligation.Predicate is ProjectionPredicate projection)
+            Error(obligation.Tree, obligation.Syntax, $"Type mismatch resolving '{Zonk(projection.Projection)} == {Zonk(projection.Type)}'.", "RTRA0271");
+    }
+    private void ReportAmbiguities()
+    {
+        foreach (Obligation obligation in _obligations)
+        {
+            bool erroneous = obligation.Predicate switch
+            {
+                TraitPredicate p => Contains(p.Trait, t => t.IsError),
+                ProjectionPredicate p => Contains(p.Projection, t => t.IsError) || Contains(p.Type, t => t.IsError),
+                _ => true
+            };
+            if (!erroneous) Error(obligation.Tree, obligation.Syntax, $"Type annotations needed: cannot satisfy '{obligation.Predicate}'.", "RTRA0283");
+        }
+        _obligations.Clear();
+    }
+    private TraitReference Zonk(TraitReference reference) => new(reference.Trait, Zonk(reference.Self), reference.Arguments.Select(Zonk).ToImmutableArray());
+    private static bool Contains(TraitReference reference, Func<TypeSymbol, bool> predicate)
+        => Contains(reference.Self, predicate) || reference.Arguments.Any(a => Contains(a, predicate));
+
+    internal bool Holds(TraitSymbol? trait, TypeSymbol type, ParamEnv env)
+        => trait is not null && Evaluate(new TraitPredicate(new TraitReference(trait, type, [])), env) == Evaluation.Holds;
+    // Primitive, shared reference and raw pointer Copy comes from core's impls; this mirrors them without selection
+    internal bool IsCopy(TypeSymbol type, ParamEnv env)
+    {
+        type = type.Resolve();
+        switch (type)
+        {
+            case PrimitiveTypeSymbol primitive: return primitive.Kind != TypeKind.String;
+            case IndirectTypeSymbol indirect: return indirect.Kind == TypeKind.Pointer || !indirect.IsMutable;
+            case FunctionTypeSymbol or InferenceTypeSymbol: return true;
+            case TupleTypeSymbol tuple when CopyTrait is null: return tuple.Elements.All(e => IsCopy(e, env));
+            case SequenceTypeSymbol { Kind: TypeKind.Array } array when CopyTrait is null: return IsCopy(array.ElementType, env);
+        }
+        return Holds(CopyTrait, type, env);
+    }
+
+    // Resolves a trait method applied to concrete types to the impl method that codegen calls
+    internal (FunctionSymbol Function, ImmutableArray<TypeSymbol> Arguments) ResolveInstance(FunctionSymbol function, ImmutableArray<TypeSymbol> arguments)
+    {
+        if (function.Trait is not TraitSymbol trait || arguments.Length <= trait.TypeParameters.Length) return (function, arguments);
+        int parents = trait.TypeParameters.Length + 1;
+        var goal = new TraitReference(trait, arguments[0], arguments[1..parents]);
+        return Probe(() =>
+        {
+            List<Candidate> candidates = AssembleCandidates(goal, ParamEnv.Empty, out _);
+            if (candidates is not [ImplCandidate { Impl: var impl }]) return (function, arguments);
+            Dictionary<TypeParameterSymbol, TypeSymbol> substitution = Instantiate(impl, Probing);
+            if (!Unify(goal, Types.Substitute(impl.Trait!, substitution)) || impl.Methods.FirstOrDefault(m => m.Name == function.Name) is not FunctionSymbol method)
+                return (function, arguments);
+            return (method, impl.TypeParameters.Select(p => Zonk(substitution[p])).Concat(arguments[parents..]).ToImmutableArray());
+        });
+    }
+
+    private bool Overlap(ImplSymbol first, ImplSymbol second) => Probe(() =>
+    {
+        Dictionary<TypeParameterSymbol, TypeSymbol> left = Instantiate(first, Probing), right = Instantiate(second, Probing);
+        if (!Unify(Types.Substitute(first.Trait!, left), Types.Substitute(second.Trait!, right))) return false;
+        return first.Predicates.Select(p => Types.Substitute(p, left)).Concat(second.Predicates.Select(p => Types.Substitute(p, right)))
+            .All(p => EvaluateInner(p, ParamEnv.Empty, 0) != Evaluation.Fails);
+    });
+    private bool SameInherentSelf(ImplSymbol first, ImplSymbol second)
+        => Probe(() => Unify(Types.Substitute(first.SelfType, Instantiate(first, Probing)), Types.Substitute(second.SelfType, Instantiate(second, Probing))));
     internal SemanticData Data(SyntaxTree tree) => _compilation.GetSemanticModel(tree).Data;
     internal void Error(SyntaxTree tree, SyntaxNode syntax, string message, string code = "RSEM0001")
     {
@@ -38,6 +473,130 @@ internal sealed class Binder
     }
     internal void Unsupported(SyntaxTree tree, SyntaxNode syntax, string feature)
         => Error(tree, syntax, $"{feature} is not supported by semantic binding yet.", "RSEM0002");
+    private static string AttributeName(AttributeSyntax attribute) => attribute.Path?.Segments.FirstOrDefault()?.Identifier.ValueText ?? "";
+
+    internal MacroScope? MacrosFor(SyntaxNode? item) => item is null ? _macroScope : _itemMacros.TryGetValue(item, out MacroScope? scope) ? scope : _macroScope;
+    internal MacroScope? DefineMacro(MacroDefinitionItemSyntax syntax, SyntaxTree tree, MacroScope? scope)
+    {
+        if (syntax.Body is not TokenTreeSyntax body) return scope;
+        string name = Name(syntax.Identifier);
+        BuiltinMacro builtin = BuiltinMacro.None;
+        if (syntax.Attributes.FirstOrDefault(a => AttributeName(a) == "rustc_builtin_macro") is AttributeSyntax marker)
+        {
+            string expander = marker.Input?.ChildTokens().Where(t => t.Kind == SyntaxKind.IdentifierToken).Select(Name).FirstOrDefault() ?? name;
+            if (!MacroExpander.Builtins.TryGetValue(expander, out builtin)) { Error(tree, marker, $"Cannot find a built-in macro with name '{expander}'.", "RMAC0001"); return scope; }
+        }
+        MacroDefinition definition;
+        try { definition = new MacroDefinition(name, MacroExpander.ParseRules(body, tree.Text), Crate, builtin); }
+        catch (MacroException exception) { Error(tree, syntax, exception.Message, "RMAC0001"); return scope; }
+        if (syntax.Attributes.Any(a => AttributeName(a) == "macro_export"))
+        {
+            var exported = new MacroSymbol(definition, Crate, syntax, tree) { IsPublic = true };
+            AddMember(Crate, exported, SymbolNamespace.Macro);
+            Data(tree).Declarations[syntax] = exported;
+        }
+        return new MacroScope(definition, scope);
+    }
+    private MacroDefinition? ResolveMacro(MacroExpressionSyntax invocation, MacroScope? scope, SyntaxTree tree, ModuleSymbol module)
+    {
+        PathSegmentSyntax[] segments = invocation.Path?.Segments.ToArray() ?? [];
+        Symbol? symbol = null;
+        if (segments.Length == 1 && !IsGlobal(invocation.Path!))
+        {
+            string name = Name(segments[0].Identifier);
+            if (MacroScope.Find(scope, name) is MacroDefinition local) return local;
+            ImmutableArray<Symbol> found = module.Scope.Find(name, SymbolNamespace.Macro);
+            if (found.Length == 1) symbol = Unwrap(found[0]);
+        }
+        else if (segments.Length > 1 && ResolvePath(invocation.Path, module.Scope, tree, SymbolNamespace.Macro, diagnose: false) is not null)
+            symbol = ResolvePath(invocation.Path, module.Scope, tree, SymbolNamespace.Macro);
+        if (symbol is MacroSymbol macro)
+        {
+            RecordSymbol(tree, invocation, macro);
+            return macro.Definition;
+        }
+        Error(tree, invocation, $"Cannot find macro '{string.Join("::", segments.Select(s => Name(s.Identifier)))}' in this scope.", "RMAC0002");
+        return null;
+    }
+    private static bool IsGlobal(PathSyntax path) => path.Children.FirstOrDefault().IsToken && path.Children[0].Token.Kind == SyntaxKind.ColonColonToken;
+    // Expansion marks index the crate of the macro that produced the tokens, which is where their $crate refers
+    private const string DollarCrate = "$crate\u0001";
+    private ModuleSymbol? CrateOfMark(int mark) => mark > 0 && mark <= _expansionCrates.Count ? _expansionCrates[mark - 1] : null;
+    internal MacroExpansion? Expand(MacroExpressionSyntax invocation, MacroScope? scope, SyntaxTree tree, ModuleSymbol module)
+    {
+        MacroDefinition? definition = ResolveMacro(invocation, scope, tree, module);
+        if (definition is null || invocation.Body is not TokenTreeSyntax body) return null;
+        if (ExpansionDepth >= 128) { Error(tree, invocation, $"Recursion limit reached while expanding '{definition.Name}!'.", "RMAC0003"); return null; }
+        var input = new MacroInput(MacroExpander.Tokens(body, tree.Text, false).ToImmutableArray());
+        _expansionCrates.Add(definition.Crate);
+        int mark = _expansionCrates.Count;
+        try
+        {
+            if (definition.Builtin != BuiltinMacro.None)
+                return new MacroExpansion(definition, _expander.ExpandBuiltin(definition.Builtin, input, new BuiltinContext(tree, invocation.Span, mark, module.QualifiedName, _compilation.Options.PointerWidth)));
+            var match = _expander.Match(definition, input);
+            if (match is null) { Error(tree, invocation, $"No rules of macro '{definition.Name}!' match this invocation.", "RMAC0004"); return null; }
+            return new MacroExpansion(definition, MacroExpander.Transcribe(match.Value.Rule, match.Value.Bindings, invocation.Span, mark));
+        }
+        catch (MacroException exception) { Error(tree, invocation, exception.Message, "RMAC0001"); return null; }
+    }
+    private Parser? Parsed(Parser parser, SyntaxNode? result, SyntaxNode invocation, SyntaxTree tree, bool complete = true)
+    {
+        foreach (SyntaxDiagnostic diagnostic in parser.Diagnostics) Error(tree, invocation, "Invalid macro expansion: " + diagnostic.Message, "RMAC0005");
+        if (parser.Diagnostics.Count == 0 && complete && !parser.AtEnd) Error(tree, invocation, "The macro expansion has trailing tokens.", "RMAC0005");
+        if (parser.Diagnostics.Count != 0 || complete && !parser.AtEnd) return null;
+        if (result is not null) Register(result, invocation, tree);
+        return parser;
+    }
+    private void Register(SyntaxNode expansion, SyntaxNode invocation, SyntaxTree tree)
+    {
+        SemanticData data = Data(tree);
+        data.Parents[expansion] = invocation;
+        foreach (SyntaxNode node in expansion.DescendantNodes().Prepend(expansion))
+            foreach (SyntaxNode child in node.ChildNodes()) data.Parents[child] = node;
+    }
+    internal ExpressionSyntax? ExpandExpression(MacroExpressionSyntax invocation, MacroScope? scope, SyntaxTree tree, ModuleSymbol module)
+    {
+        if (Expand(invocation, scope, tree, module) is not MacroExpansion value) return null;
+        var parser = new Parser(value.Tokens, RustEdition.Rust2024);
+        ExpressionSyntax expression = parser.ParseExpression();
+        return Parsed(parser, expression, invocation, tree) is null ? null : expression;
+    }
+    internal BlockExpressionSyntax? ExpandStatements(MacroExpressionSyntax invocation, MacroScope? scope, SyntaxTree tree, ModuleSymbol module)
+    {
+        if (Expand(invocation, scope, tree, module) is not MacroExpansion value) return null;
+        ImmutableArray<SyntaxToken> tokens = value.Tokens.Insert(0, MacroExpander.Punctuation(SyntaxKind.OpenBraceToken, "{", invocation.Span, 0))
+            .Add(MacroExpander.Punctuation(SyntaxKind.CloseBraceToken, "}", invocation.Span, 0));
+        var parser = new Parser(tokens, RustEdition.Rust2024);
+        BlockExpressionSyntax block = parser.ParseBlockExpression();
+        return Parsed(parser, block, invocation, tree) is null ? null : block;
+    }
+    private ImmutableArray<ItemSyntax> ExpandItems(MacroExpressionSyntax invocation, MacroScope? scope, SyntaxTree tree, ModuleSymbol module)
+    {
+        if (Expand(invocation, scope, tree, module) is not MacroExpansion expansion) return [];
+        var (definition, tokens) = expansion;
+        if (definition.Builtin != BuiltinMacro.None) { Error(tree, invocation, $"Macro '{definition.Name}!' cannot be used in item position.", "RMAC0006"); return []; }
+        var parser = new Parser(tokens, RustEdition.Rust2024);
+        ImmutableArray<ItemSyntax> items = parser.ParseItems();
+        if (Parsed(parser, null, invocation, tree) is null) return [];
+        foreach (ItemSyntax item in items) Register(item, invocation, tree);
+        return items;
+    }
+    internal TypeSyntax? ExpandType(MacroExpressionSyntax invocation, MacroScope? scope, SyntaxTree tree, ModuleSymbol module)
+    {
+        if (Expand(invocation, scope, tree, module) is not MacroExpansion expansion) return null;
+        var parser = new Parser(expansion.Tokens, RustEdition.Rust2024);
+        TypeSyntax type = parser.ParseType();
+        return Parsed(parser, type, invocation, tree) is null ? null : type;
+    }
+    internal PatternSyntax? ExpandPattern(MacroExpressionSyntax invocation, MacroScope? scope, SyntaxTree tree, ModuleSymbol module)
+    {
+        if (Expand(invocation, scope, tree, module) is not MacroExpansion expansion) return null;
+        var parser = new Parser(expansion.Tokens, RustEdition.Rust2024);
+        PatternSyntax pattern = parser.ParsePatternFragment(true);
+        return Parsed(parser, pattern, invocation, tree) is null ? null : pattern;
+    }
+    internal SyntaxTree TreeOf(SyntaxNode node) => _compilation.FindTree(node) ?? throw new InvalidOperationException("Syntax node belongs to no compilation.");
     private void Declare(Symbol symbol, SyntaxNode syntax, SyntaxTree tree)
     {
         _declarations.Add(symbol);
@@ -54,17 +613,27 @@ internal sealed class Binder
     internal void Bind()
     {
         _usedTrees.Add(_compilation.RootSyntaxTree);
+        BindCrateAttributes(_compilation.RootSyntaxTree);
         Declare(Crate, _compilation.RootSyntaxTree.Root, _compilation.RootSyntaxTree);
         AddScope(Crate.Scope);
         DeclareItems(_compilation.RootSyntaxTree.Root.Items, Crate, _compilation.RootSyntaxTree, "");
         foreach (var entry in _visibility.ToArray()) BindVisibility(entry.Symbol, entry.Visibility);
+        foreach (TraitSymbol trait in _declarations.OfType<TraitSymbol>())
+            foreach (Symbol item in trait.Methods.Cast<Symbol>().Concat(trait.AssociatedTypes)) { item.IsPublic = trait.IsPublic; item.AccessibleWithin = trait.AccessibleWithin; }
         BindImports();
+        SizedTrait = FindLangItem("sized") as TraitSymbol;
+        CopyTrait = FindLangItem("copy") as TraitSymbol;
+        CloneTrait = FindLangItem("clone") as TraitSymbol;
+        foreach (var entry in _impls) BindImplHeader(entry.Syntax, entry.Module, entry.Tree);
         foreach (Symbol symbol in _declarations.ToArray()) BindSignature(symbol);
-        foreach (var entry in _impls) BindImpl(entry.Syntax, entry.Module, entry.Tree);
+        foreach (ImplSymbol impl in _implItems.Keys.ToArray()) BindImplItems(impl);
+        CheckImpls();
         foreach (GlobalSymbol global in _declarations.OfType<GlobalSymbol>().ToArray()) BindGlobal(global);
         BindDiscriminants();
         foreach (FunctionSymbol function in _declarations.OfType<FunctionSymbol>().ToArray())
             _functions.Add(new BodyBinder(this, function.Scope, function).BindFunction());
+        // Integer and float variables fall back to their defaults only after the obligations had their chance to constrain them
+        SelectWherePossible();
         foreach (InferenceTypeSymbol inference in _inferences)
         {
             if (inference.Resolve() is not InferenceTypeSymbol unresolved) continue;
@@ -72,13 +641,16 @@ internal sealed class Binder
             else if (unresolved.Constraint == InferenceKind.Integer) unresolved.Binding = Types.I32;
             else if (unresolved.Constraint == InferenceKind.Float) unresolved.Binding = Types.F64;
             else if (unresolved.HasNeverConstraint) unresolved.Binding = Types.Never;
-            else
-            {
-                SyntaxTree tree = _compilation.SyntaxTrees.First(t => Data(t).Types.ContainsKey(unresolved.Origin) || t.Root.DescendantNodes().Contains(unresolved.Origin));
-                Error(tree, unresolved.Origin, "Type cannot be inferred; add a type annotation.");
-                unresolved.Binding = Types.Error;
-            }
         }
+        SelectWherePossible();
+        foreach (InferenceTypeSymbol inference in _inferences)
+        {
+            if (inference.Resolve() is not InferenceTypeSymbol unresolved) continue;
+            Error(TreeOf(unresolved.Origin), unresolved.Origin, "Type cannot be inferred; add a type annotation.");
+            unresolved.Binding = Types.Error;
+        }
+        SelectWherePossible();
+        ReportAmbiguities();
         foreach (Action check in _checks) check();
         CheckLayouts();
         CheckSizedTypes();
@@ -92,6 +664,11 @@ internal sealed class Binder
                 for (SyntaxNode? current = error; current is not null; current = data.Parents.GetValueOrDefault(current))
                     if (data.BoundNodes.TryGetValue(current, out BoundNode? bound)) { bound.OwnErrors = true; break; }
             }
+        }
+        BorrowChecker.Check(this, _functions);
+        foreach (SyntaxTree tree in _compilation.SyntaxTrees)
+        {
+            SemanticData data = Data(tree);
             data.BoundNodes[tree.Root] = new BoundCompilationUnit(tree.Root, Crate,
                 _functions.Where(f => ReferenceEquals(f.Symbol.SyntaxTree, tree)).ToImmutableArray(),
                 _globals.Values.Where(g => ReferenceEquals(g.Symbol.SyntaxTree, tree)).ToImmutableArray(),
@@ -103,17 +680,33 @@ internal sealed class Binder
     {
         foreach (ItemSyntax item in items)
         {
-            CheckAttributes(item.Attributes, tree, item is FunctionItemSyntax);
+            CheckAttributes(item.Attributes, tree, item is FunctionItemSyntax, item is FunctionItemSyntax or TraitItemSyntax);
+            _itemMacros[item] = _macroScope;
             string name = Name(item.Identifier);
             Symbol? symbol = null;
             switch (item)
             {
+                case TraitItemSyntax syntax:
+                {
+                    if (Has(syntax, SyntaxKind.UnsafeKeyword)) Unsupported(tree, syntax, "Unsafe traits");
+                    if (Has(syntax, SyntaxKind.EqualsToken)) { Unsupported(tree, syntax, "Trait aliases"); break; }
+                    var trait = new TraitSymbol(name, module, syntax, tree);
+                    symbol = trait;
+                    AddMember(module, trait, SymbolNamespace.Type);
+                    if (syntax.Attributes.FirstOrDefault(a => AttributeName(a) == "lang") is AttributeSyntax traitLang && LangItem(traitLang, tree) is string traitItem && !LangItems.TryAdd(traitItem, trait))
+                        Error(tree, traitLang, $"Duplicate lang item '{traitItem}'.");
+                    trait.TypeParameters = DeclareGenerics(syntax, trait, trait.Scope, tree, out ImmutableArray<LifetimeSymbol> traitLifetimes);
+                    trait.LifetimeParameters = traitLifetimes;
+                    DeclareTraitItems(trait, syntax, module, tree);
+                    break;
+                }
                 case ModuleItemSyntax syntax:
                 {
-                    var nested = new ModuleSymbol(name, module, syntax, tree);
+                    var nested = new ModuleSymbol(name, module, syntax, tree, _externPrelude);
                     symbol = nested;
                     AddMember(module, nested, SymbolNamespace.Type);
                     string path = modulePath.Length == 0 ? name : modulePath + "::" + name;
+                    MacroScope? macros = _macroScope;
                     if (syntax.Body is ItemListSyntax body)
                     {
                         AddScope(nested.Scope);
@@ -121,19 +714,37 @@ internal sealed class Binder
                     }
                     else if (_compilation.ModuleSources.TryGetValue(path, out SyntaxTree? source) && _usedTrees.Add(source))
                     {
-                        var sourceScope = new BindingScope(null, nested, source, source.Root.Span);
+                        var sourceScope = new BindingScope(_externPrelude, nested, source, source.Root.Span);
                         // Both files declare the same module; entries are copied after imports are resolved.
                         AddScope(sourceScope);
                         DeclareItems(source.Root.Items, nested, source, path);
                         Data(source).Declarations[source.Root] = nested;
                     }
                     else Error(tree, syntax, $"No unique source supplied for module '{path}'.");
+                    if (!syntax.Attributes.Any(a => AttributeName(a) == "macro_use")) _macroScope = macros;
                     break;
                 }
                 case FunctionItemSyntax syntax:
-                    symbol = new FunctionSymbol(name, module, syntax, tree, module.Scope, Types.Error);
+                    symbol = new FunctionSymbol(name, module, syntax, tree, module.Scope, Types.Error) { IsIntrinsic = syntax.Attributes.Any(a => AttributeName(a) == "rustc_intrinsic") };
                     AddMember(module, symbol, SymbolNamespace.Value);
+                    if (syntax.Attributes.FirstOrDefault(a => AttributeName(a) == "lang") is AttributeSyntax lang && LangItem(lang, tree) is string langItem && !LangItems.TryAdd(langItem, (FunctionSymbol)symbol))
+                        Error(tree, lang, $"Duplicate lang item '{langItem}'.");
                     break;
+                case ExternCrateItemSyntax external:
+                {
+                    string crateName = Name(external.Identifier);
+                    ModuleSymbol? target = crateName == "self" ? Crate : _externCrates.GetValueOrDefault(crateName);
+                    string alias = external.Alias.Kind == SyntaxKind.None ? crateName : Name(external.Alias);
+                    if (target is null) Error(tree, external, $"Cannot find crate '{crateName}'.");
+                    else if (alias == "self") Error(tree, external, "'extern crate self' requires an alias.");
+                    else if (alias != "_")
+                    {
+                        symbol = new ImportSymbol(alias, target, module, external, tree, SymbolNamespace.Type, false);
+                        AddUnique(module.Scope, alias, SymbolNamespace.Type, symbol, external);
+                        module.Add(symbol); RecordSymbol(tree, external, target);
+                    }
+                    break;
+                }
                 case ExternBlockItemSyntax foreign:
                     if (!Has(foreign, SyntaxKind.UnsafeKeyword)) Error(tree, foreign, "Extern blocks must be unsafe in Rust 2024.");
                     string abi = foreign.ChildTokens().FirstOrDefault(t => t.Kind == SyntaxKind.StringLiteralToken).Value as string ?? "C";
@@ -183,6 +794,15 @@ internal sealed class Binder
                     break;
                 case UseItemSyntax use: _uses.Add((use, module, tree)); break;
                 case ImplItemSyntax impl: _impls.Add((impl, module, tree)); break;
+                case MacroDefinitionItemSyntax definition: _macroScope = DefineMacro(definition, tree, _macroScope); break;
+                case MacroInvocationItemSyntax { Invocation: MacroExpressionSyntax invocation }:
+                {
+                    ImmutableArray<ItemSyntax> expanded = ExpandItems(invocation, _macroScope, tree, module);
+                    ExpansionDepth++;
+                    DeclareItems(expanded, module, tree, modulePath);
+                    ExpansionDepth--;
+                    break;
+                }
                 case MissingItemSyntax: break;
                 default: Unsupported(tree, item, item.Kind.ToString()); break;
             }
@@ -192,11 +812,64 @@ internal sealed class Binder
             _visibility.Add((symbol, item.Visibility));
             switch (symbol)
             {
-                case AggregateSymbol a: a.TypeParameters = DeclareGenerics(item, a, a.Scope, tree); a.Type = new NamedTypeSymbol(a, a.TypeParameters.Select(p => p.Type).ToImmutableArray()); break;
-                case FunctionSymbol f: f.TypeParameters = DeclareGenerics(item, f, f.Scope, tree); break;
-                case TypeAliasSymbol a: a.TypeParameters = DeclareGenerics(item, a, a.Scope, tree); break;
+                case AggregateSymbol a:
+                    a.TypeParameters = DeclareGenerics(item, a, a.Scope, tree, out ImmutableArray<LifetimeSymbol> lifetimes);
+                    a.LifetimeParameters = lifetimes;
+                    a.Type = new NamedTypeSymbol(a, a.TypeParameters.Select(p => p.Type).ToImmutableArray(), lifetimes);
+                    break;
+                case FunctionSymbol f: f.TypeParameters = DeclareGenerics(item, f, f.Scope, tree, out _); break;
+                case TypeAliasSymbol a: a.TypeParameters = DeclareGenerics(item, a, a.Scope, tree, out _); break;
             }
         }
+    }
+    private IEnumerable<ItemSyntax> ExpandMembers(IEnumerable<ItemSyntax> items, MacroScope? macros, ModuleSymbol module, SyntaxTree tree)
+    {
+        foreach (ItemSyntax item in items)
+        {
+            if (item is not MacroInvocationItemSyntax { Invocation: MacroExpressionSyntax invocation }) { yield return item; continue; }
+            ImmutableArray<ItemSyntax> expanded = ExpandItems(invocation, macros, tree, module);
+            ExpansionDepth++;
+            foreach (ItemSyntax member in ExpandMembers(expanded, macros, module, tree)) yield return member;
+            ExpansionDepth--;
+        }
+    }
+    private void DeclareTraitItems(TraitSymbol trait, TraitItemSyntax syntax, ModuleSymbol module, SyntaxTree tree)
+    {
+        var methods = ImmutableArray.CreateBuilder<FunctionSymbol>();
+        var types = ImmutableArray.CreateBuilder<AssociatedTypeSymbol>();
+        foreach (ItemSyntax item in ExpandMembers(syntax.Body?.Items ?? [], _macroScope, module, tree).ToArray())
+        {
+            CheckAttributes(item.Attributes, tree, item is FunctionItemSyntax);
+            if (item.Visibility is not null) Error(tree, item.Visibility, "Visibility qualifiers are not permitted on trait items.");
+            string name = Name(item.Identifier);
+            switch (item)
+            {
+                case FunctionItemSyntax method:
+                {
+                    _itemMacros[method] = _macroScope;
+                    var function = new FunctionSymbol(name, trait, method, tree, trait.Scope, Types.Error)
+                    { SelfType = trait.SelfParameter.Type, AccessibleWithin = module, ParentTypeParameters = trait.Generics };
+                    if (methods.Any(m => m.Name == name)) Error(tree, method, $"'{name}' is already defined in this trait.");
+                    Declare(function, method, tree);
+                    function.TypeParameters = DeclareGenerics(method, function, function.Scope, tree, out _);
+                    methods.Add(function);
+                    break;
+                }
+                case TypeAliasItemSyntax alias:
+                    if (alias.GenericParameters is not null || alias.WhereClause is not null) Unsupported(tree, alias, "Generic associated types");
+                    if (alias.Value is not null) Unsupported(tree, alias.Value, "Associated type defaults");
+                    if (types.Any(t => t.Name == name)) Error(tree, alias, $"'{name}' is already defined in this trait.");
+                    var associated = new AssociatedTypeSymbol(name, trait, alias, tree) { AccessibleWithin = module };
+                    Declare(associated, alias, tree);
+                    types.Add(associated);
+                    break;
+                case ConstItemSyntax: Unsupported(tree, item, "Associated constants"); break;
+                case MissingItemSyntax: break;
+                default: Unsupported(tree, item, item.Kind.ToString()); break;
+            }
+        }
+        trait.Methods = methods.ToImmutable();
+        trait.AssociatedTypes = types.ToImmutable();
     }
     private static AggregateShape Shape(FieldListSyntax? fields) => fields is null ? AggregateShape.Unit
         : Has(fields, SyntaxKind.OpenParenToken) ? AggregateShape.Tuple : AggregateShape.Named;
@@ -207,11 +880,11 @@ internal sealed class Binder
     }
     private void AddUnique(BindingScope scope, string name, SymbolNamespace space, Symbol symbol, SyntaxNode syntax)
     {
-        if (scope.Entries.Any(e => e.Name == name && e.Namespace == space && e.Symbol is not ImportSymbol { IsGlob: true }))
+        if (scope.Named(name).Any(e => e.Namespace == space && e.Symbol is not ImportSymbol { IsGlob: true }))
             Error(symbol.SyntaxTree ?? scope.Tree, syntax, $"'{name}' is already defined in the {space.ToString().ToLowerInvariant()} namespace.");
         scope.Add(name, space, symbol);
     }
-    internal void CheckAttributes(IEnumerable<AttributeSyntax> attributes, SyntaxTree tree, bool function = false)
+    internal void CheckAttributes(IEnumerable<AttributeSyntax> attributes, SyntaxTree tree, bool function = false, bool lang = false)
     {
         foreach (AttributeSyntax attribute in attributes)
         {
@@ -228,14 +901,46 @@ internal sealed class Binder
                     Error(tree, attribute, $"Attribute '{name}' requires a nonempty string without NUL.");
                 continue;
             }
-            if (name is not ("doc" or "allow" or "warn" or "deny" or "forbid" or "inline" or "cold" or "must_use"))
+            if (GatedAttributes.TryGetValue(name, out string? feature))
+            {
+                if (!_features.Contains(feature)) Error(tree, attribute, $"The '{name}' attribute requires #![feature({feature})].");
+                if (name == "rustc_intrinsic" && !function || name == "lang" && !lang) Unsupported(tree, attribute, $"Attribute '{name}' here");
+                continue;
+            }
+            if (name is not ("doc" or "allow" or "warn" or "deny" or "forbid" or "inline" or "cold" or "must_use" or "macro_export" or "macro_use"))
                 Unsupported(tree, attribute, $"Attribute '{name}'");
         }
     }
-    private ImmutableArray<TypeParameterSymbol> DeclareGenerics(ItemSyntax syntax, Symbol symbol, BindingScope scope, SyntaxTree tree)
+    private static readonly ImmutableDictionary<string, string> GatedAttributes = new Dictionary<string, string>
+    {
+        ["lang"] = "lang_items", ["prelude_import"] = "prelude_import", ["rustc_builtin_macro"] = "rustc_attrs", ["rustc_intrinsic"] = "intrinsics"
+    }.ToImmutableDictionary(StringComparer.Ordinal);
+    private static readonly ImmutableHashSet<string> KnownFeatures = ImmutableHashSet.Create(StringComparer.Ordinal, "intrinsics", "lang_items", "no_core", "prelude_import", "rustc_attrs");
+    private void BindCrateAttributes(SyntaxTree tree)
+    {
+        AttributeSyntax[] attributes = tree.Root.Attributes.ToArray();
+        foreach (AttributeSyntax attribute in attributes.Where(a => AttributeName(a) == "feature"))
+            foreach (SyntaxToken token in attribute.Input?.ChildTokens().Where(t => t.Kind == SyntaxKind.IdentifierToken) ?? [])
+                if (KnownFeatures.Contains(Name(token))) _features.Add(Name(token));
+                else Unsupported(tree, attribute, $"Feature '{Name(token)}'");
+        foreach (AttributeSyntax attribute in attributes)
+        {
+            string name = AttributeName(attribute);
+            if (name == "no_core" && !_features.Contains(name)) Error(tree, attribute, "The 'no_core' attribute requires #![feature(no_core)].");
+            else if (name is not ("feature" or "no_core" or "no_std" or "doc" or "allow" or "warn" or "deny" or "forbid")) Unsupported(tree, attribute, $"Crate attribute '{name}'");
+        }
+    }
+    private string? LangItem(AttributeSyntax attribute, SyntaxTree tree)
+    {
+        if (attribute.Input is null && (attribute.Value?.Value as LiteralExpressionSyntax)?.Literal.Value is string { Length: > 0 } item) return item;
+        Error(tree, attribute, "The lang attribute requires a string value.");
+        return null;
+    }
+    private ImmutableArray<TypeParameterSymbol> DeclareGenerics(ItemSyntax syntax, Symbol symbol, BindingScope scope, SyntaxTree tree, out ImmutableArray<LifetimeSymbol> lifetimes)
     {
         AddScope(scope);
         var parameters = ImmutableArray.CreateBuilder<TypeParameterSymbol>();
+        var declared = ImmutableArray.CreateBuilder<LifetimeSymbol>();
         foreach (GenericParameterSyntax parameter in syntax.GenericParameters?.Parameters ?? [])
         {
             string name = Name(parameter.Identifier);
@@ -243,7 +948,7 @@ internal sealed class Binder
             if (parameter.Identifier.Kind is SyntaxKind.LifetimeToken or SyntaxKind.RawLifetimeToken)
             {
                 var lifetime = new LifetimeSymbol(name, symbol, parameter, tree);
-                Declare(lifetime, parameter, tree);
+                Declare(lifetime, parameter, tree); declared.Add(lifetime);
                 AddUnique(scope, name, SymbolNamespace.Lifetime, lifetime, parameter);
             }
             else
@@ -252,10 +957,134 @@ internal sealed class Binder
                 parameters.Add(type); Declare(type, parameter, tree);
                 AddUnique(scope, name, SymbolNamespace.Type, type, parameter);
             }
-            if (parameter.Bounds is not null) Unsupported(tree, parameter.Bounds, "Generic bounds");
         }
-        if (syntax.WhereClause is not null) Unsupported(tree, syntax.WhereClause, "Where clauses");
+        lifetimes = declared.ToImmutable();
         return parameters.ToImmutable();
+    }
+    // Bounds on parameters and supertraits come first so that where-clauses over T::Assoc can find the trait declaring Assoc
+    private ImmutableArray<Predicate> BindPredicates(ItemSyntax syntax, BindingScope scope, SyntaxTree tree, TypeSymbol? traitSelf, Action<ImmutableArray<Predicate>> publish)
+    {
+        var predicates = new List<Predicate>();
+        foreach (GenericParameterSyntax parameter in syntax.GenericParameters?.Parameters ?? [])
+        {
+            if (parameter.Bounds is not TypeBoundListSyntax bounds) continue;
+            switch (Data(tree).Declarations.GetValueOrDefault(parameter))
+            {
+                case LifetimeSymbol lifetime: BindLifetimeBounds(lifetime, bounds, scope, tree, predicates); break;
+                case TypeParameterSymbol type: BindBounds(type.Type, bounds, scope, tree, predicates, type); break;
+            }
+        }
+        if (traitSelf is not null && syntax is TraitItemSyntax { Bounds: TypeBoundListSyntax supertraits }) BindBounds(traitSelf, supertraits, scope, tree, predicates, null);
+        WherePredicateSyntax[] clauses = syntax.WhereClause?.Predicates.ToArray() ?? [];
+        bool Simple(WherePredicateSyntax clause) => clause.Type is null || clause.Type is PathTypeSyntax { Path: PathSyntax { Qualification: null } path } && path.Segments.Count() == 1;
+        foreach (WherePredicateSyntax clause in clauses.Where(Simple)) BindWhere(clause, scope, tree, predicates);
+        publish(predicates.ToImmutableArray());
+        foreach (WherePredicateSyntax clause in clauses.Where(c => !Simple(c))) BindWhere(clause, scope, tree, predicates);
+        ImmutableArray<Predicate> result = predicates.ToImmutableArray();
+        publish(result);
+        return result;
+    }
+    private void BindWhere(WherePredicateSyntax clause, BindingScope scope, SyntaxTree tree, List<Predicate> output)
+    {
+        if (clause.Binder is not null) { Unsupported(tree, clause.Binder, "Higher-ranked where clauses"); return; }
+        if (clause.Type is null)
+        {
+            SyntaxToken token = clause.ChildTokens().FirstOrDefault(t => t.Kind is SyntaxKind.LifetimeToken or SyntaxKind.RawLifetimeToken);
+            if (BindLifetime(token, clause, scope, tree) is LifetimeSymbol longer && clause.Bounds is TypeBoundListSyntax lifetimeBounds)
+                BindLifetimeBounds(longer, lifetimeBounds, scope, tree, output);
+            return;
+        }
+        TypeSymbol type = BindType(clause.Type, scope, tree);
+        TypeParameterSymbol? parameter = type is ParameterTypeSymbol { Parameter: var declared } && ReferenceEquals(declared.ContainingSymbol, scope.Owner) ? declared : null;
+        if (clause.Bounds is TypeBoundListSyntax bounds) BindBounds(type, bounds, scope, tree, output, parameter);
+    }
+    private void BindLifetimeBounds(LifetimeSymbol longer, TypeBoundListSyntax bounds, BindingScope scope, SyntaxTree tree, List<Predicate> output)
+    {
+        foreach (TypeBoundSyntax bound in bounds.Bounds)
+        {
+            if (bound.Lifetime.Kind == SyntaxKind.None) Error(tree, bound, "A lifetime can only be bounded by lifetimes.");
+            else if (BindLifetime(bound.Lifetime, bound, scope, tree) is LifetimeSymbol shorter) output.Add(new OutlivesPredicate(longer, shorter));
+        }
+    }
+    private void BindBounds(TypeSymbol bounded, TypeBoundListSyntax bounds, BindingScope scope, SyntaxTree tree, List<Predicate> output, TypeParameterSymbol? parameter)
+    {
+        foreach (TypeBoundSyntax syntax in bounds.Bounds)
+        {
+            TypeBoundSyntax bound = syntax;
+            while (bound.Path is null && bound.Inner is TypeBoundSyntax inner) bound = inner;
+            if (bound.Lifetime.Kind != SyntaxKind.None) continue;
+            if (bound.Binder is not null) { Unsupported(tree, bound, "Higher-ranked trait bounds"); continue; }
+            if (bound.Path is not PathSyntax path || Has(bound, SyntaxKind.TildeToken) || Has(bound, SyntaxKind.UseKeyword)) { Unsupported(tree, bound, "This kind of bound"); continue; }
+            if (BindTraitReference(path, bounded, scope, tree, output) is not TraitReference reference) continue;
+            if (!Has(bound, SyntaxKind.QuestionToken)) { output.Add(new TraitPredicate(reference)); continue; }
+            if (!ReferenceEquals(reference.Trait, SizedTrait)) Error(tree, bound, "Only 'Sized' can be relaxed with '?'.");
+            else if (parameter is null) Error(tree, bound, "'?Sized' is only allowed on type parameters declared by this item.");
+            else parameter.IsMaybeSized = true;
+        }
+    }
+    internal TraitReference? BindTraitReference(PathSyntax path, TypeSymbol self, BindingScope scope, SyntaxTree tree, List<Predicate>? projections)
+    {
+        Symbol? symbol = ResolvePath(path, scope, tree, SymbolNamespace.Type);
+        if (symbol is null) return null;
+        if (symbol is not TraitSymbol trait) { Error(tree, path, $"'{symbol.Name}' is not a trait."); return null; }
+        BindSignature(trait);
+        PathSegmentSyntax last = path.Segments.Last();
+        if (last.FunctionParameters is not null) Unsupported(tree, last, "Parenthesized trait arguments");
+        var substitution = new Dictionary<TypeParameterSymbol, TypeSymbol> { [trait.SelfParameter] = self };
+        var arguments = new List<TypeSymbol>();
+        var bindings = new List<(GenericArgumentSyntax Syntax, string Name, TypeSyntax Value)>();
+        int supplied = 0;
+        foreach (GenericArgumentSyntax argument in last.Arguments?.Arguments ?? [])
+        {
+            if (argument.Binding is EqualsValueClauseSyntax { Value: TypeSyntax value } && argument.Value is PathTypeSyntax { Path: PathSyntax name } && name.Segments.Count() == 1)
+                bindings.Add((argument, Name(name.Segments.First().Identifier), value));
+            else if (argument.Bounds is not null || argument.Binding is not null) Unsupported(tree, argument, "Associated type constraints");
+            else if (argument.Value is TypeSyntax type)
+            {
+                TypeSymbol bound = BindType(type, scope, tree);
+                if (supplied < trait.TypeParameters.Length) { arguments.Add(bound); substitution[trait.TypeParameters[supplied]] = bound; }
+                supplied++;
+            }
+            else if (argument.Value is not null) Unsupported(tree, argument, "Const generic arguments");
+        }
+        if (supplied > trait.TypeParameters.Length) Error(tree, last, $"Expected {trait.TypeParameters.Length} type arguments, got {supplied}.");
+        for (int i = arguments.Count; i < trait.TypeParameters.Length; i++)
+        {
+            TypeParameterSymbol parameter = trait.TypeParameters[i];
+            TypeSymbol value = parameter.DefaultType is TypeSymbol fallback ? Types.Substitute(fallback, substitution) : Types.Error;
+            if (parameter.DefaultType is null) Error(tree, last, $"Missing type argument '{parameter.Name}' for trait '{trait.Name}'.");
+            arguments.Add(value); substitution[parameter] = value;
+        }
+        var reference = new TraitReference(trait, self, arguments.ToImmutableArray());
+        foreach (var (syntax, name, value) in bindings)
+        {
+            if (trait.AssociatedTypes.FirstOrDefault(a => a.Name == name) is not AssociatedTypeSymbol item) { Error(tree, syntax, $"Trait '{trait.Name}' has no associated type '{name}'.", "RTRA0220"); continue; }
+            if (projections is null) { Error(tree, syntax, "Associated type bindings are not allowed here."); continue; }
+            projections.Add(new ProjectionPredicate(new ProjectionTypeSymbol(item, self, reference.Arguments), BindType(value, scope, tree)));
+        }
+        RecordSymbol(tree, path, trait);
+        return reference;
+    }
+    internal ParamEnv EnvironmentOf(Symbol owner)
+    {
+        if (_environments.TryGetValue(owner, out ParamEnv? environment)) return environment;
+        environment = new ParamEnv(Elaborate(PredicatesOf(owner)));
+        _environments[owner] = environment;
+        return environment;
+    }
+    private static IEnumerable<Predicate> PredicatesOf(Symbol? owner) => owner switch
+    {
+        FunctionSymbol function => function.Predicates.Concat(PredicatesOf(function.ContainingSymbol)),
+        ImplSymbol impl => impl.Predicates,
+        TraitSymbol trait => trait.Predicates.Prepend(new TraitPredicate(trait.Identity)),
+        AggregateSymbol aggregate => aggregate.Predicates,
+        _ => []
+    };
+    private IEnumerable<Predicate> PredicatesInScope(BindingScope scope)
+    {
+        for (BindingScope? current = scope; current is not null; current = current.Parent)
+            if (current.Owner is FunctionSymbol or ImplSymbol or TraitSymbol or AggregateSymbol) return Elaborate(PredicatesOf(current.Owner));
+        return [];
     }
     private void BindVisibility(Symbol symbol, VisibilitySyntax? visibility)
     {
@@ -274,20 +1103,22 @@ internal sealed class Binder
 
     private void BindImports()
     {
-        var pending = new List<(UseTreeSyntax Syntax, ModuleSymbol Module, SyntaxTree Tree, ImmutableArray<string> Path, bool Public)>();
-        void Flatten(UseTreeSyntax use, ModuleSymbol module, SyntaxTree tree, ImmutableArray<string> prefix, bool isPublic)
+        var pending = new List<(UseTreeSyntax Syntax, ModuleSymbol Module, SyntaxTree Tree, ImmutableArray<string> Path, bool Public, bool Prelude)>();
+        void Flatten(UseTreeSyntax use, ModuleSymbol module, SyntaxTree tree, ImmutableArray<string> prefix, bool isPublic, bool prelude)
         {
-            ImmutableArray<string> path = prefix.AddRange(use.Path?.Segments.Select(s => Name(s.Identifier)) ?? []);
+            ImmutableArray<string> path = prefix.AddRange(use.Path?.Segments.Select(s => s.Identifier.Text == "$crate" ? DollarCrate + s.Identifier.Context.ToString(CultureInfo.InvariantCulture) : Name(s.Identifier)) ?? []);
             if (use.ChildrenTrees.Any())
-                foreach (UseTreeSyntax child in use.ChildrenTrees) Flatten(child, module, tree, path, isPublic);
-            else pending.Add((use, module, tree, path, isPublic));
+                foreach (UseTreeSyntax child in use.ChildrenTrees) Flatten(child, module, tree, path, isPublic, prelude);
+            else pending.Add((use, module, tree, path, isPublic, prelude));
         }
         foreach (var use in _uses)
         {
             if (use.Syntax.Tree is UseTreeSyntax syntax)
             {
                 if (use.Syntax.Visibility?.Restriction is not null) Unsupported(use.Tree, use.Syntax.Visibility, "Restricted visibility on imports");
-                Flatten(syntax, use.Module, use.Tree, [], use.Syntax.Visibility is { Restriction: null });
+                bool prelude = use.Syntax.Attributes.Any(a => AttributeName(a) == "prelude_import");
+                if (prelude && (!syntax.IsGlob || !ReferenceEquals(use.Module, Crate))) { Error(use.Tree, use.Syntax, "A prelude import must be a glob import in the crate root."); continue; }
+                Flatten(syntax, use.Module, use.Tree, [], use.Syntax.Visibility is { Restriction: null }, prelude);
             }
         }
         bool progress;
@@ -300,7 +1131,7 @@ internal sealed class Binder
                 bool self = path.Length > 1 && path[^1] == "self";
                 if (self) path = path.RemoveAt(path.Length - 1);
                 var targets = new List<(Symbol Symbol, SymbolNamespace Space)>();
-                foreach (SymbolNamespace space in new[] { SymbolNamespace.Type, SymbolNamespace.Value })
+                foreach (SymbolNamespace space in new[] { SymbolNamespace.Type, SymbolNamespace.Value, SymbolNamespace.Macro })
                 {
                     Symbol? target = ResolveNames(path, use.Module.Scope, space);
                     if (target is not null) targets.Add((target, space));
@@ -316,7 +1147,7 @@ internal sealed class Binder
                     {
                         if (source is AggregateSymbol && Unwrap(member.Symbol) is not VariantSymbol) continue;
                         if (!IsAccessible(member.Symbol, use.Module)) continue;
-                        progress |= AddImport(use.Syntax, use.Module, use.Tree, member.Name, member.Symbol, member.Namespace, true, use.Public);
+                        progress |= AddImport(use.Syntax, use.Module, use.Tree, member.Name, member.Symbol, member.Namespace, true, use.Public, use.Prelude);
                     }
                     continue;
                 }
@@ -335,19 +1166,21 @@ internal sealed class Binder
         foreach (SyntaxTree tree in _compilation.SyntaxTrees)
             foreach (BindingScope scope in Data(tree).Scopes)
                 if (scope.Owner is ModuleSymbol module && !ReferenceEquals(scope, module.Scope))
-                    scope.Entries.AddRange(module.Scope.Entries);
+                    scope.AddRange(module.Scope.Entries);
     }
-    private bool AddImport(UseTreeSyntax syntax, ModuleSymbol module, SyntaxTree tree, string name, Symbol target, SymbolNamespace space, bool glob, bool isPublic)
+    private bool AddImport(UseTreeSyntax syntax, ModuleSymbol module, SyntaxTree tree, string name, Symbol target, SymbolNamespace space, bool glob, bool isPublic, bool prelude = false)
     {
         Symbol original = Unwrap(target);
+        BindingScope scope = prelude ? _stdPrelude : module.Scope;
         if (name == "_") return false;
-        if (glob && module.Scope.Entries.Any(e => e.Name == name && e.Namespace == space && e.Symbol is ImportSymbol { IsGlob: true } i && ReferenceEquals(Unwrap(i), original))) return false;
+        if (glob && scope.Named(name).Any(e => e.Namespace == space && e.Symbol is ImportSymbol { IsGlob: true } i && ReferenceEquals(Unwrap(i), original))) return false;
         if (!IsAccessible(target, module)) { Error(tree, syntax, $"'{target.Name}' is private."); return false; }
         if (isPublic && !original.IsPublic) Error(tree, syntax, $"Cannot publicly re-export private '{target.Name}'.");
         var import = new ImportSymbol(name, original, module, syntax, tree, space, glob) { IsPublic = isPublic, AccessibleWithin = isPublic ? null : module };
-        if (glob) module.Scope.Add(name, space, import);
-        else AddUnique(module.Scope, name, space, import, syntax);
-        module.Add(import); Data(tree).Declarations.TryAdd(syntax, import); RecordSymbol(tree, syntax, original);
+        if (glob) scope.Add(name, space, import);
+        else AddUnique(scope, name, space, import, syntax);
+        if (!prelude) module.Add(import);
+        Data(tree).Declarations.TryAdd(syntax, import); RecordSymbol(tree, syntax, original);
         return true;
     }
 
@@ -359,6 +1192,7 @@ internal sealed class Binder
         int index = 1;
         string first = names[0];
         if (first == "crate") current = Crate;
+        else if (first.StartsWith(DollarCrate, StringComparison.Ordinal)) current = CrateOfMark(int.Parse(first.AsSpan(DollarCrate.Length), CultureInfo.InvariantCulture));
         else if (first == "self") current = module;
         else if (first == "super") current = module.Parent;
         else
@@ -373,19 +1207,19 @@ internal sealed class Binder
             string name = names[index++];
             if (name == "super" && current is ModuleSymbol parent) { current = parent.Parent; continue; }
             BindingScope? members = current switch { ModuleSymbol m => m.Scope, AggregateSymbol a => a.Scope, _ => null };
-            ImmutableArray<Symbol> matches = members?.Entries.Where(e => e.Name == name && e.Namespace == (index == names.Length ? space : SymbolNamespace.Type)).Select(e => e.Symbol).ToImmutableArray() ?? [];
+            ImmutableArray<Symbol> matches = members?.Named(name).Where(e => e.Namespace == (index == names.Length ? space : SymbolNamespace.Type)).Select(e => e.Symbol).ToImmutableArray() ?? [];
             Symbol[] explicitMatches = matches.Where(s => s is not ImportSymbol { IsGlob: true }).ToArray();
             current = explicitMatches.Length == 1 ? explicitMatches[0] : matches.DistinctBy(Unwrap).Count() == 1 ? matches[0] : null;
         }
         return current is not null && IsAccessible(current, module) && !(space == SymbolNamespace.Value && Unwrap(current) is ModuleSymbol) ? current : null;
     }
-    internal Symbol? ResolvePath(PathSyntax? path, BindingScope scope, SyntaxTree tree, SymbolNamespace space, bool diagnose = true, int position = int.MaxValue)
+    internal Symbol? ResolvePath(PathSyntax? path, BindingScope scope, SyntaxTree tree, SymbolNamespace space, bool diagnose = true, int position = int.MaxValue, bool hygienic = false, int length = -1)
     {
         if (path is null) return null;
-        if (path.Qualification is not null) { if (diagnose) Unsupported(tree, path, "Qualified associated paths"); return null; }
-        if (path.Children.FirstOrDefault().IsToken && path.Children[0].Token.Kind == SyntaxKind.ColonColonToken)
-        { if (diagnose) Unsupported(tree, path, "External crate paths"); return null; }
+        if (path.Qualification is not null) { if (diagnose) Error(tree, path, "A qualified path names an associated item, not a module item."); return null; }
+        bool global = IsGlobal(path);
         PathSegmentSyntax[] segments = path.Segments.ToArray();
+        if (length >= 0 && length < segments.Length) segments = segments[..length];
         if (segments.Length == 0) return null;
         Symbol? result = null;
         for (int i = 0; i < segments.Length; i++)
@@ -395,13 +1229,15 @@ internal sealed class Binder
             ImmutableArray<Symbol> matches = [];
             if (i == 0)
             {
-                if (name == "crate") result = Crate;
+                if (global) result = _externCrates.GetValueOrDefault(name);
+                else if (name == "crate") result = Crate;
+                else if (name == "$crate") result = CrateOfMark(segments[i].Identifier.Context);
                 else if (name == "self" && (segments.Length > 1 || space == SymbolNamespace.Type)) result = ModuleOf(scope);
                 else if (name == "super") result = ModuleOf(scope).Parent;
-                else if (name == "Self") result = FindSelf(scope)?.Definition;
+                else if (name == "Self") result = (FindSelf(scope) as NamedTypeSymbol)?.Definition;
                 else
                 {
-                    matches = scope.Find(name, ns, position);
+                    matches = scope.Find(name, ns, position, hygienic);
                     result = matches.Length == 1 ? matches[0] : null;
                 }
             }
@@ -428,23 +1264,62 @@ internal sealed class Binder
             if (diagnose && result is ModuleSymbol && segments[i].Arguments is not null) Error(tree, segments[i], "Modules do not take generic arguments.");
             RecordSymbol(tree, segments[i], result);
         }
-        if (result is not null) RecordSymbol(tree, path, result);
+        if (result is not null && segments.Length == path.Segments.Count()) RecordSymbol(tree, path, result);
         return result;
     }
     private static ImmutableArray<Symbol> FindMember(BindingScope scope, string name, SymbolNamespace space)
     {
-        var all = scope.Entries.Where(e => e.Name == name && e.Namespace == space).Select(e => e.Symbol).ToArray();
+        var all = scope.Named(name).Where(e => e.Namespace == space).Select(e => e.Symbol).ToArray();
         var explicitMatches = all.Where(s => s is not ImportSymbol { IsGlob: true }).ToArray();
         return (explicitMatches.Length == 0 ? all.DistinctBy(Unwrap) : explicitMatches).ToImmutableArray();
     }
-    private static NamedTypeSymbol? FindSelf(BindingScope scope)
+    private static TypeSymbol? FindSelf(BindingScope scope)
     {
         for (BindingScope? current = scope; current is not null; current = current.Parent)
         {
-            if (current.Owner is FunctionSymbol { SelfType: NamedTypeSymbol self }) return self;
-            if (current.Owner is AggregateSymbol aggregate) return aggregate.Type;
+            switch (current.Owner)
+            {
+                case FunctionSymbol { SelfType: TypeSymbol self }: return self;
+                case ImplSymbol impl: return impl.SelfType;
+                case TraitSymbol trait: return trait.SelfParameter.Type;
+                case AggregateSymbol aggregate: return aggregate.Type;
+            }
         }
         return null;
+    }
+    private static ImplSymbol? FindImpl(BindingScope scope)
+    {
+        for (BindingScope? current = scope; current is not null; current = current.Parent)
+            if (current.Owner is ImplSymbol impl) return impl;
+        return null;
+    }
+    // T::Name or Self::Name resolves through the bounds in scope; inside a trait impl, Self::Name is the impl's definition
+    private TypeSymbol AssociatedType(TypeSymbol self, TraitReference? qualified, PathSegmentSyntax segment, BindingScope scope, SyntaxTree tree)
+    {
+        string name = Name(segment.Identifier);
+        if (self.IsError) return Types.Error;
+        if (segment.Arguments is not null) Unsupported(tree, segment, "Generic associated types");
+        if (qualified is not null)
+        {
+            if (qualified.Trait.AssociatedTypes.FirstOrDefault(a => a.Name == name) is AssociatedTypeSymbol direct)
+                return new ProjectionTypeSymbol(direct, self, qualified.Arguments);
+            Error(tree, segment, $"Trait '{qualified.Trait.Name}' has no associated type '{name}'.", "RTRA0220");
+            return Types.Error;
+        }
+        if (FindImpl(scope) is ImplSymbol { Trait: TraitReference implemented } impl && TypeSystem.Same(self, impl.SelfType) &&
+            implemented.Trait.AssociatedTypes.FirstOrDefault(a => a.Name == name) is AssociatedTypeSymbol own)
+            return impl.AssociatedTypes.TryGetValue(own, out TypeSymbol? value) ? value : new ProjectionTypeSymbol(own, self, implemented.Arguments);
+        var matches = new List<(AssociatedTypeSymbol Item, TraitReference Trait)>();
+        foreach (TraitPredicate bound in PredicatesInScope(scope).OfType<TraitPredicate>())
+        {
+            if (!TypeSystem.Same(bound.Trait.Self, self) || bound.Trait.Trait.AssociatedTypes.FirstOrDefault(a => a.Name == name) is not AssociatedTypeSymbol item) continue;
+            if (!matches.Any(m => ReferenceEquals(m.Item, item) && TypeSystem.SameList(m.Trait.Arguments, bound.Trait.Arguments))) matches.Add((item, bound.Trait));
+        }
+        if (matches.Count == 1) return new ProjectionTypeSymbol(matches[0].Item, self, matches[0].Trait.Arguments);
+        if (matches.Count > 1) Error(tree, segment, $"Ambiguous associated type '{name}' in bounds of '{self}'.", "RTRA0221");
+        else if (self is ParameterTypeSymbol) Error(tree, segment, $"Associated type '{name}' not found for '{self}'.", "RTRA0220");
+        else Error(tree, segment, $"Ambiguous associated type '{name}' on '{self}'; use a fully qualified path such as <{self} as Trait>::{name}.", "RTRA0223");
+        return Types.Error;
     }
 
     private void BindSignature(Symbol symbol)
@@ -456,6 +1331,7 @@ internal sealed class Binder
                 aggregate.SignatureState = 1;
                 var tree = aggregate.Scope.Tree;
                 BindDefaults(aggregate.TypeParameters, aggregate.Scope, tree);
+                if (aggregate.Declaration is ItemSyntax item) aggregate.Predicates = BindPredicates(item, aggregate.Scope, tree, null, p => aggregate.Predicates = p);
                 if (aggregate.Declaration is StructItemSyntax structure) aggregate.Fields = BindFields(structure.Fields, aggregate, aggregate.Scope, tree);
                 foreach (VariantSymbol variant in aggregate.Variants)
                     if (variant.Declaration is EnumVariantSyntax syntax) variant.Fields = BindFields(syntax.Fields, variant, aggregate.Scope, tree);
@@ -472,11 +1348,29 @@ internal sealed class Binder
                 alias.SignatureState = 2;
                 break;
             }
+            case TraitSymbol trait when trait.SignatureState == 0:
+            {
+                trait.SignatureState = 1;
+                SyntaxTree tree = trait.Scope.Tree;
+                BindDefaults(trait.TypeParameters, trait.Scope, tree);
+                trait.Predicates = BindPredicates((TraitItemSyntax)trait.Declaration!, trait.Scope, tree, trait.SelfParameter.Type, p => trait.Predicates = p);
+                foreach (AssociatedTypeSymbol item in trait.AssociatedTypes)
+                {
+                    if (item.Declaration is not TypeAliasItemSyntax { Bounds: TypeBoundListSyntax bounds }) continue;
+                    var predicates = new List<Predicate>();
+                    BindBounds(new ProjectionTypeSymbol(item, trait.SelfParameter.Type, trait.TypeParameters.Select(p => p.Type).ToImmutableArray()), bounds, trait.Scope, tree, predicates, null);
+                    item.Bounds = predicates.ToImmutableArray();
+                }
+                trait.SignatureState = 2;
+                break;
+            }
             case FunctionSymbol function when function.SignatureState == 0:
             {
                 function.SignatureState = 1;
                 FunctionItemSyntax syntax = function.Declaration;
                 SyntaxTree tree = function.Scope.Tree;
+                if (function.ContainingSymbol is TraitSymbol owner) BindSignature(owner);
+                function.Predicates = BindPredicates(syntax, function.Scope, tree, null, p => function.Predicates = p);
                 if (!function.IsForeign)
                 {
                     function.IsUnsafe = Has(syntax, SyntaxKind.UnsafeKeyword);
@@ -498,8 +1392,9 @@ internal sealed class Binder
                     else if ((attribute.Value?.Value as LiteralExpressionSyntax)?.Literal.Value is string value)
                         function.ExternalName = value;
                 }
-                if (function.ExternalName is not null && !function.TypeParameters.IsEmpty)
+                if (function.ExternalName is not null && !function.AllTypeParameters.IsEmpty)
                     Error(tree, syntax, "A function with a fixed external name cannot have type parameters.");
+                ParamEnv environment = EnvironmentOf(function);
                 if (Has(syntax, SyntaxKind.AsyncKeyword)) Unsupported(tree, syntax, "Async functions");
                 if (Has(syntax, SyntaxKind.ConstKeyword)) Unsupported(tree, syntax, "Const functions");
                 BindDefaults(function.TypeParameters, function.Scope, tree, true);
@@ -512,21 +1407,25 @@ internal sealed class Binder
                     {
                         type = function.SelfType ?? (TypeSymbol)Types.Error;
                         if (function.SelfType is null || parameters.Count != 0) Error(tree, parameter, "'self' must be the first parameter of an associated function.");
-                        if (parameter.Type is not null) type = BindType(parameter.Type, function.Scope, tree);
+                        if (parameter.Type is not null)
+                        {
+                            type = BindType(parameter.Type, function.Scope, tree);
+                            TypeSymbol receiverType = type is IndirectTypeSymbol { Kind: TypeKind.Reference } selfReference ? selfReference.ElementType : type;
+                            if (function.SelfType is not null && !TypeSystem.Same(type, function.SelfType) && !TypeSystem.Same(receiverType, function.SelfType))
+                                Unsupported(tree, parameter, "Arbitrary self parameter types");
+                        }
                         else if (Has(parameter, SyntaxKind.AmpersandToken)) type = new IndirectTypeSymbol(TypeKind.Reference, type, Has(parameter, SyntaxKind.MutKeyword),
                             BindLifetime(parameter.ChildTokens().FirstOrDefault(t => t.Kind is SyntaxKind.LifetimeToken or SyntaxKind.RawLifetimeToken), parameter, function.Scope, tree));
-                        TypeSymbol receiverType = type is IndirectTypeSymbol { Kind: TypeKind.Reference } selfReference ? selfReference.ElementType : type;
-                        if (function.SelfType is not null && !TypeSystem.Same(receiverType, function.SelfType))
-                            Unsupported(tree, parameter, "Arbitrary self parameter types");
                     }
                     else type = BindType(parameter.Type, function.Scope, tree);
+                    type = NormalizeIn(type, environment);
                     string name = parameter.IsSelf ? "self" : parameter.Pattern is IdentifierPatternSyntax id ? Name(id.Identifier) : "$" + parameters.Count;
                     var p = new ParameterSymbol(name, function, parameter, tree, type, parameters.Count,
                         parameter.IsSelf ? !Has(parameter, SyntaxKind.AmpersandToken) && Has(parameter, SyntaxKind.MutKeyword) : parameter.Pattern is IdentifierPatternSyntax binding && Has(binding, SyntaxKind.MutKeyword));
                     Declare(p, parameter, tree); RecordType(tree, parameter, type); parameters.Add(p);
                 }
                 function.Parameters = parameters.ToImmutable();
-                function.ReturnType = syntax.ReturnType is null ? Types.Unit : BindType(syntax.ReturnType.Type, function.Scope, tree);
+                function.ReturnType = syntax.ReturnType is null ? Types.Unit : NormalizeIn(BindType(syntax.ReturnType.Type, function.Scope, tree), environment);
                 var inputLifetimes = function.Parameters.SelectMany(p => Lifetimes(p.Type)).Distinct().ToArray();
                 LifetimeSymbol? outputLifetime = function.Parameters.FirstOrDefault(p => p.IsSelf)?.Type is IndirectTypeSymbol { Kind: TypeKind.Reference } receiver
                     ? receiver.Lifetime : inputLifetimes.Length == 1 ? inputLifetimes[0] : null;
@@ -549,7 +1448,7 @@ internal sealed class Binder
         bool optional = false;
         foreach (TypeParameterSymbol parameter in parameters)
         {
-            GenericParameterSyntax syntax = parameter.Declaration;
+            if (parameter.Declaration is not GenericParameterSyntax syntax) continue;
             if (syntax.Default?.Value is TypeSyntax type)
             {
                 if (function) Error(tree, syntax, "Function type parameters cannot have defaults.");
@@ -576,26 +1475,205 @@ internal sealed class Binder
         }
         return result.ToImmutable();
     }
-    private void BindImpl(ImplItemSyntax syntax, ModuleSymbol module, SyntaxTree tree)
+    // Headers and associated types of every impl are bound before signatures, so projections in signatures can normalize
+    private void BindImplHeader(ImplItemSyntax syntax, ModuleSymbol module, SyntaxTree tree)
     {
-        if (syntax.Trait is not null || syntax.GenericParameters is not null || syntax.WhereClause is not null)
-        { Unsupported(tree, syntax, "Trait or generic impl blocks"); return; }
-        if (BindType(syntax.SelfType, module.Scope, tree) is not NamedTypeSymbol self)
-        { Error(tree, syntax, "An inherent impl requires a named type."); return; }
-        if (!self.TypeArguments.IsEmpty) { Unsupported(tree, syntax, "Generic inherent impls"); return; }
-        foreach (ItemSyntax item in syntax.Body?.Items ?? [])
+        if (Has(syntax, SyntaxKind.BangToken) || Has(syntax, SyntaxKind.UnsafeKeyword)) { Unsupported(tree, syntax, "Negative or unsafe impls"); return; }
+        var impl = new ImplSymbol(_implOrdinal++, module, syntax, tree, Types.Error) { AccessibleWithin = module, IsPublic = true };
+        Declare(impl, syntax, tree);
+        impl.TypeParameters = DeclareGenerics(syntax, impl, impl.Scope, tree, out ImmutableArray<LifetimeSymbol> lifetimes);
+        impl.LifetimeParameters = lifetimes;
+        foreach (TypeParameterSymbol parameter in impl.TypeParameters)
+            if (parameter.Declaration?.Default is not null) Error(tree, parameter.Declaration, "Impl type parameters cannot have defaults.");
+        impl.SelfType = BindType(syntax.SelfType, impl.Scope, tree);
+        impl.Predicates = BindPredicates(syntax, impl.Scope, tree, null, p => impl.Predicates = p);
+        ImmutableArray<ItemSyntax> items = ExpandMembers(syntax.Body?.Items ?? [], MacrosFor(syntax), module, tree).ToImmutableArray();
+        _implItems[impl] = (syntax, items);
+        if (syntax.Trait is TypeSyntax traitSyntax)
         {
-            if (item is not FunctionItemSyntax method) { Unsupported(tree, item, "Non-function associated items"); continue; }
-            CheckAttributes(method.Attributes, tree, function: true);
-            var function = new FunctionSymbol(Name(method.Identifier), self.Definition, method, tree, module.Scope, Types.Error)
-            { SelfType = self, AccessibleWithin = module };
-            Declare(function, method, tree);
-            function.TypeParameters = DeclareGenerics(method, function, function.Scope, tree);
-            BindVisibility(function, method.Visibility);
-            AddUnique(self.Definition.Scope, function.Name, SymbolNamespace.Value, function, method);
-            self.Definition.Methods = self.Definition.Methods.Add(function);
-            BindSignature(function);
+            if (traitSyntax is not PathTypeSyntax { Path: PathSyntax path }) { Error(tree, traitSyntax, "Expected a trait path."); return; }
+            var projections = new List<Predicate>();
+            impl.Trait = BindTraitReference(path, impl.SelfType, impl.Scope, tree, projections);
+            if (projections.Count != 0) Error(tree, traitSyntax, "Associated type bindings are not allowed in impl headers.");
+            if (impl.Trait is not TraitReference reference) return;
+            foreach (TypeAliasItemSyntax alias in items.OfType<TypeAliasItemSyntax>())
+            {
+                string name = Name(alias.Identifier);
+                if (reference.Trait.AssociatedTypes.FirstOrDefault(a => a.Name == name) is not AssociatedTypeSymbol item)
+                { Error(tree, alias, $"Type '{name}' is not a member of trait '{reference.Trait.Name}'.", "RTRA0437"); continue; }
+                if (alias.GenericParameters is not null || alias.WhereClause is not null || alias.Bounds is not null) Unsupported(tree, alias, "Generics or bounds on associated type definitions");
+                if (impl.AssociatedTypes.ContainsKey(item)) { Error(tree, alias, $"Duplicate definition of associated type '{name}'.", "RTRA0201"); continue; }
+                if (alias.Value?.Value is not TypeSyntax value) { Error(tree, alias, "An associated type in an impl requires a definition."); continue; }
+                impl.AssociatedTypes[item] = BindType(value, impl.Scope, tree);
+            }
+            AddImpl(impl);
+            LocalImpls.Add(impl);
         }
+        else if (impl.SelfType is NamedTypeSymbol self)
+        {
+            if (!IsLocal(self.Definition)) Error(tree, syntax, $"Cannot define an inherent impl for '{self}' outside the crate that defines it.", "RTRA0116");
+            else self.Definition.InherentImpls = self.Definition.InherentImpls.Add(impl);
+        }
+        else if (!impl.SelfType.IsError) Error(tree, syntax, $"An inherent impl requires a nominal type defined in this crate, not '{impl.SelfType}'.", "RTRA0118");
+    }
+    private void BindImplItems(ImplSymbol impl)
+    {
+        var (syntax, items) = _implItems[impl];
+        SyntaxTree tree = impl.SyntaxTree!;
+        var module = (ModuleSymbol)impl.ContainingSymbol!;
+        MacroScope? macros = MacrosFor(syntax);
+        var methods = ImmutableArray.CreateBuilder<FunctionSymbol>();
+        foreach (ItemSyntax item in items)
+        {
+            switch (item)
+            {
+                case FunctionItemSyntax method:
+                {
+                    CheckAttributes(method.Attributes, tree, function: true);
+                    _itemMacros[method] = macros;
+                    string name = Name(method.Identifier);
+                    var function = new FunctionSymbol(name, impl, method, tree, impl.Scope, Types.Error)
+                    {
+                        SelfType = impl.SelfType, AccessibleWithin = module, ParentTypeParameters = impl.TypeParameters,
+                        IsIntrinsic = method.Attributes.Any(a => AttributeName(a) == "rustc_intrinsic")
+                    };
+                    if (methods.Any(m => m.Name == name)) Error(tree, method, $"Duplicate definition of '{name}'.", "RTRA0201");
+                    Declare(function, method, tree);
+                    function.TypeParameters = DeclareGenerics(method, function, function.Scope, tree, out _);
+                    if (impl.Trait is null) BindVisibility(function, method.Visibility);
+                    else
+                    {
+                        if (method.Visibility is not null) Error(tree, method.Visibility, "Visibility qualifiers are not permitted on trait impl items.");
+                        function.IsPublic = true; function.AccessibleWithin = null;
+                    }
+                    methods.Add(function);
+                    break;
+                }
+                case TypeAliasItemSyntax alias when impl.Trait is null && !impl.SelfType.IsError: Unsupported(tree, alias, "Inherent associated types"); break;
+                case TypeAliasItemSyntax or MissingItemSyntax: break;
+                case ConstItemSyntax: Unsupported(tree, item, "Associated constants"); break;
+                default: Unsupported(tree, item, item.Kind.ToString()); break;
+            }
+        }
+        impl.Methods = methods.ToImmutable();
+        foreach (FunctionSymbol method in impl.Methods) BindSignature(method);
+    }
+    private void CheckImpls()
+    {
+        foreach (ImplSymbol impl in _implItems.Keys)
+        {
+            SyntaxTree tree = impl.SyntaxTree!;
+            var syntax = (ImplItemSyntax)impl.Declaration!;
+            foreach (TypeParameterSymbol parameter in impl.TypeParameters)
+            {
+                bool Mentions(TypeSymbol type) => Contains(type, t => t is ParameterTypeSymbol p && ReferenceEquals(p.Parameter, parameter));
+                if (!Mentions(impl.SelfType) && impl.Trait?.Arguments.Any(Mentions) != true)
+                    Error(tree, parameter.Declaration!, $"The type parameter '{parameter.Name}' is not constrained by the impl trait or self type.", "RTRA0207");
+            }
+            if (impl.Trait is not TraitReference reference)
+            {
+                if (impl.SelfType is not NamedTypeSymbol self) continue;
+                foreach (ImplSymbol other in self.Definition.InherentImpls.TakeWhile(i => !ReferenceEquals(i, impl)))
+                {
+                    if (!SameInherentSelf(impl, other)) continue;
+                    foreach (FunctionSymbol method in impl.Methods.Where(m => other.Methods.Any(o => o.Name == m.Name)))
+                        Error(tree, method.Declaration, $"Duplicate definitions with name '{method.Name}'.", "RTRA0592");
+                }
+                continue;
+            }
+            TraitSymbol trait = reference.Trait;
+            ParamEnv environment = EnvironmentOf(impl);
+            if (CheckOrphan(reference, syntax, tree) && EarlierImpls(impl).Any(other => Overlap(impl, other)))
+                Error(tree, syntax, $"Conflicting implementations of trait '{trait.Name}' for type '{impl.SelfType}'.", "RTRA0119");
+            Dictionary<TypeParameterSymbol, TypeSymbol> substitution = Substitution(reference);
+            foreach (TraitPredicate required in trait.Predicates.OfType<TraitPredicate>())
+                if (Evaluate(Types.Substitute(required, substitution), environment) == Evaluation.Fails)
+                    Error(tree, syntax, $"The trait bound '{Types.Substitute(required.Trait, substitution)}' is not satisfied.", "RTRA0277");
+            var missing = new List<string>();
+            foreach (AssociatedTypeSymbol item in trait.AssociatedTypes)
+            {
+                if (!impl.AssociatedTypes.ContainsKey(item)) { missing.Add(item.Name); continue; }
+                foreach (TraitPredicate bound in item.Bounds.OfType<TraitPredicate>())
+                {
+                    TraitReference expected = Types.Substitute(bound.Trait, substitution);
+                    expected = expected with { Self = NormalizeIn(expected.Self, environment) };
+                    if (Evaluate(new TraitPredicate(expected), environment) == Evaluation.Fails)
+                        Error(tree, syntax, $"The trait bound '{expected}' required by associated type '{item.Name}' is not satisfied.", "RTRA0277");
+                }
+            }
+            foreach (FunctionSymbol required in trait.Methods)
+            {
+                if (impl.Methods.FirstOrDefault(m => m.Name == required.Name) is FunctionSymbol method) CompareSignatures(reference, required, method, tree);
+                else if (required.Declaration.Body is null) missing.Add(required.Name);
+            }
+            if (missing.Count != 0) Error(tree, syntax, $"Not all trait items are implemented; missing: {string.Join(", ", missing.Select(m => "'" + m + "'"))}.", "RTRA0046");
+            foreach (FunctionSymbol method in impl.Methods.Where(m => !trait.Methods.Any(t => t.Name == m.Name)))
+                Error(tree, method.Declaration, $"Method '{method.Name}' is not a member of trait '{trait.Name}'.", "RTRA0407");
+            if (ReferenceEquals(trait, CopyTrait))
+            {
+                if (impl.SelfType is not NamedTypeSymbol copied) { if (!impl.SelfType.IsError && !IsLocal(trait)) Error(tree, syntax, $"The trait 'Copy' cannot be implemented for '{impl.SelfType}'.", "RTRA0206"); continue; }
+                FieldSymbol? field = copied.Definition.Fields.Concat(copied.Definition.Variants.SelectMany(v => v.Fields))
+                    .FirstOrDefault(f => !IsCopy(NormalizeIn(Types.FieldType(f, copied), environment), environment));
+                if (field is not null) Error(tree, syntax, $"The trait 'Copy' cannot be implemented for '{copied}': field '{field.Name}' does not implement 'Copy'.", "RTRA0204");
+            }
+        }
+    }
+    private void CompareSignatures(TraitReference reference, FunctionSymbol required, FunctionSymbol method, SyntaxTree tree)
+    {
+        if (required.TypeParameters.Length != method.TypeParameters.Length)
+        { Error(tree, method.Declaration, $"Method '{method.Name}' has {method.TypeParameters.Length} type parameters but its trait declaration has {required.TypeParameters.Length}.", "RTRA0049"); return; }
+        if (required.HasSelfParameter != method.HasSelfParameter)
+        { Error(tree, method.Declaration, $"Method '{method.Name}' must {(required.HasSelfParameter ? "" : "not ")}take 'self' like its trait declaration.", "RTRA0185"); return; }
+        if (required.Parameters.Length != method.Parameters.Length)
+        { Error(tree, method.Declaration, $"Method '{method.Name}' has {method.Parameters.Length} parameters but its trait declaration has {required.Parameters.Length}.", "RTRA0050"); return; }
+        Dictionary<TypeParameterSymbol, TypeSymbol> substitution = Substitution(reference);
+        for (int i = 0; i < required.TypeParameters.Length; i++) substitution[required.TypeParameters[i]] = method.TypeParameters[i].Type;
+        ParamEnv environment = EnvironmentOf(method);
+        void Compare(TypeSymbol declared, TypeSymbol actual, SyntaxNode syntax)
+        {
+            TypeSymbol expected = NormalizeIn(Types.Substitute(declared, substitution), environment);
+            if (!TypeSystem.Same(expected, actual) && !expected.IsError && !actual.IsError)
+                Error(tree, syntax, $"Method '{method.Name}' has an incompatible type for its trait: expected '{expected}', found '{actual}'.", "RTRA0053");
+        }
+        for (int i = 0; i < method.Parameters.Length; i++) Compare(required.Parameters[i].Type, method.Parameters[i].Type, method.Parameters[i].Declaration);
+        Compare(required.ReturnType, method.ReturnType, method.Declaration.ReturnType ?? (SyntaxNode)method.Declaration);
+    }
+    private bool CheckOrphan(TraitReference reference, SyntaxNode syntax, SyntaxTree tree)
+    {
+        if (IsLocal(reference.Trait)) return true;
+        foreach (TypeSymbol type in reference.Arguments.Prepend(reference.Self))
+        {
+            TypeSymbol inner = type.Resolve() is IndirectTypeSymbol { Kind: TypeKind.Reference } fundamental ? fundamental.ElementType.Resolve() : type.Resolve();
+            if (inner is NamedTypeSymbol named && IsLocal(named.Definition)) return true;
+            if (inner is ParameterTypeSymbol)
+            {
+                Error(tree, syntax, $"Type parameter '{inner}' must be covered by a local type when implementing the foreign trait '{reference.Trait.Name}'.", "RTRA0210");
+                return false;
+            }
+        }
+        Error(tree, syntax, $"Only traits defined in this crate can be implemented for types defined outside it ('{reference}').", "RTRA0117");
+        return false;
+    }
+    internal TypeSymbol NormalizeIn(TypeSymbol type, ParamEnv environment)
+    {
+        if (!Contains(type, t => t is ProjectionTypeSymbol)) return type;
+        return type.Resolve() switch
+        {
+            ProjectionTypeSymbol p => NormalizedProjection(p, environment),
+            NamedTypeSymbol n => new NamedTypeSymbol(n.Definition, n.TypeArguments.Select(t => NormalizeIn(t, environment)).ToImmutableArray(), n.LifetimeArguments),
+            TupleTypeSymbol t => new TupleTypeSymbol(t.Elements.Select(e => NormalizeIn(e, environment)).ToImmutableArray()),
+            SequenceTypeSymbol s => new SequenceTypeSymbol(s.Kind, NormalizeIn(s.ElementType, environment), s.Length, s.RangeForm),
+            IndirectTypeSymbol r => new IndirectTypeSymbol(r.Kind, NormalizeIn(r.ElementType, environment), r.IsMutable, r.Lifetime),
+            FunctionTypeSymbol f => new FunctionTypeSymbol(f.ParameterTypes.Select(t => NormalizeIn(t, environment)).ToImmutableArray(), NormalizeIn(f.ReturnType, environment), f.IsUnsafe, f.Abi),
+            var other => other
+        };
+    }
+    private TypeSymbol NormalizedProjection(ProjectionTypeSymbol projection, ParamEnv environment)
+    {
+        var inner = new ProjectionTypeSymbol(projection.Item, NormalizeIn(projection.SelfType, environment), projection.TraitArguments.Select(t => NormalizeIn(t, environment)).ToImmutableArray());
+        TypeSymbol? value = Probe(() => Project(inner, environment, new List<Predicate>(), Probing) is TypeSymbol result ? Zonk(result) : null);
+        if (value is null || value is ProjectionTypeSymbol rigid && TypeSystem.Same(rigid, inner)) return inner;
+        return NormalizeIn(value, environment);
     }
 
     internal TypeSymbol BindType(TypeSyntax? syntax, BindingScope scope, SyntaxTree tree, bool infer = false)
@@ -618,6 +1696,7 @@ internal sealed class Binder
                 InferredTypeSyntax when infer => Fresh(syntax),
                 MissingTypeSyntax => Types.Error,
                 FunctionPointerTypeSyntax f => BindFunctionType(f, scope, tree),
+                MacroTypeSyntax macro => BindMacroType(macro, scope, tree, infer),
                 _ => UnsupportedType(syntax, tree)
             };
         }
@@ -632,11 +1711,20 @@ internal sealed class Binder
                 SequenceTypeSymbol s => new[] { s.ElementType }, TupleTypeSymbol t => t.Elements,
                 NamedTypeSymbol n => n.TypeArguments, FunctionTypeSymbol f => f.ParameterTypes.Append(f.ReturnType), _ => []
             };
-            if (sized.Any(t => !IsSized(t))) Error(tree, syntax, "This type requires sized element or generic argument types.");
+            if (sized.Any(t => !IsSized(t)) && sized.Any(t => !IsSized(t, new ParamEnv(PredicatesInScope(scope).ToImmutableArray()))))
+                Error(tree, syntax, "This type requires sized element or generic argument types.");
         });
         return type;
     }
     private TypeSymbol UnsupportedType(TypeSyntax syntax, SyntaxTree tree) { Unsupported(tree, syntax, syntax.Kind.ToString()); return Types.Error; }
+    private TypeSymbol BindMacroType(MacroTypeSyntax syntax, BindingScope scope, SyntaxTree tree, bool infer)
+    {
+        if (syntax.Invocation is not MacroExpressionSyntax invocation || ExpandType(invocation, MacrosFor(scope.Owner.Declaration), tree, ModuleOf(scope)) is not TypeSyntax type)
+            return Types.Error;
+        ExpansionDepth++;
+        try { return BindType(type, scope, tree, infer); }
+        finally { ExpansionDepth--; }
+    }
     private TypeSymbol BindFunctionType(FunctionPointerTypeSyntax syntax, BindingScope scope, SyntaxTree tree)
     {
         if (syntax.Binder is not null) Unsupported(tree, syntax.Binder, "Higher-ranked function types");
@@ -655,16 +1743,29 @@ internal sealed class Binder
         Error(tree, syntax, $"Undeclared lifetime '{name}'.");
         return null;
     }
-    internal TypeSymbol BindPathType(PathSyntax? path, BindingScope scope, SyntaxTree tree, bool infer)
+    internal TypeSymbol BindPathType(PathSyntax? path, BindingScope scope, SyntaxTree tree, bool infer, int count = -1)
     {
         if (path is null) return Types.Error;
         PathSegmentSyntax[] segments = path.Segments.ToArray();
-        if (segments.Length == 1)
+        if (count < 0) count = segments.Length;
+        if (count == 0) return Types.Error;
+        TypeSymbol type;
+        if (path.Qualification is QualifiedPathSyntax qualification)
+        {
+            type = BindType(qualification.Type, scope, tree, infer);
+            TraitReference? trait = qualification.Trait is PathSyntax traitPath ? BindTraitReference(traitPath, type, scope, tree, null) : null;
+            if (qualification.Trait is not null && trait is null) return Types.Error;
+            for (int i = 0; i < count; i++) type = AssociatedType(type, i == 0 ? trait : null, segments[i], scope, tree);
+            if (count == segments.Length) RecordType(tree, path, type);
+            return type;
+        }
+        if (count == 1)
         {
             string name = Name(segments[0].Identifier);
-            if (name == "Self" && FindSelf(scope) is NamedTypeSymbol self)
+            if (name == "Self" && FindSelf(scope) is TypeSymbol self)
             {
-                RecordSymbol(tree, path, self.Definition); RecordType(tree, path, self);
+                if (self is NamedTypeSymbol named) RecordSymbol(tree, path, named.Definition);
+                RecordType(tree, path, self);
                 return self;
             }
             if (scope.Find(name, SymbolNamespace.Type).IsEmpty && Types.Primitives.TryGetValue(name, out PrimitiveTypeSymbol? primitive))
@@ -673,32 +1774,47 @@ internal sealed class Binder
                 RecordType(tree, path, primitive); return primitive;
             }
         }
-        Symbol? symbol = ResolvePath(path, scope, tree, SymbolNamespace.Type);
-        TypeSymbol type;
+        else if (ResolvePath(path, scope, tree, SymbolNamespace.Type, diagnose: false, length: count) is null)
+        {
+            type = AssociatedType(BindPathType(path, scope, tree, infer, count - 1), null, segments[count - 1], scope, tree);
+            if (count == segments.Length) RecordType(tree, path, type);
+            return type;
+        }
+        Symbol? symbol = ResolvePath(path, scope, tree, SymbolNamespace.Type, length: count);
+        PathSegmentSyntax last = segments[count - 1];
         switch (symbol)
         {
             case TypeParameterSymbol parameter:
-                if (segments.LastOrDefault()?.Arguments is not null) Error(tree, path, "Type parameters do not take generic arguments.");
+                if (last.Arguments is not null) Error(tree, path, "Type parameters do not take generic arguments.");
                 type = parameter.Type; break;
             case AggregateSymbol aggregate:
+            {
                 BindSignature(aggregate);
-                type = new NamedTypeSymbol(aggregate, BindArguments(aggregate.TypeParameters, segments.LastOrDefault()?.Arguments, path, scope, tree, infer)); break;
+                ImmutableArray<TypeSymbol> typeArguments = BindArguments(aggregate.TypeParameters, last.Arguments, path, scope, tree, infer, out ImmutableArray<LifetimeSymbol?> lifetimes);
+                if (!lifetimes.IsEmpty && lifetimes.Length != aggregate.LifetimeParameters.Length)
+                    Error(tree, path, $"Expected {aggregate.LifetimeParameters.Length} lifetime arguments, got {lifetimes.Length}.");
+                type = new NamedTypeSymbol(aggregate, typeArguments, aggregate.LifetimeParameters
+                    .Select((_, i) => (i < lifetimes.Length ? lifetimes[i] : null) ?? new LifetimeSymbol("'_", elided: true)).ToImmutableArray());
+                break;
+            }
             case TypeAliasSymbol alias:
                 BindSignature(alias);
-                ImmutableArray<TypeSymbol> arguments = BindArguments(alias.TypeParameters, segments.LastOrDefault()?.Arguments, path, scope, tree, infer);
+                ImmutableArray<TypeSymbol> arguments = BindArguments(alias.TypeParameters, last.Arguments, path, scope, tree, infer);
                 type = Types.Substitute(alias.Target, alias.TypeParameters.Zip(arguments).ToDictionary(p => p.First, p => p.Second)); break;
             default:
                 if (symbol is not null) Error(tree, path, $"'{symbol.Name}' is not a type.");
                 type = Types.Error; break;
         }
-        RecordType(tree, path, type);
+        if (count == segments.Length) RecordType(tree, path, type);
         return type;
     }
     internal ImmutableArray<TypeSymbol> BindArguments(ImmutableArray<TypeParameterSymbol> parameters, GenericArgumentListSyntax? syntax, SyntaxNode origin, BindingScope scope, SyntaxTree tree, bool infer)
+        => BindArguments(parameters, syntax, origin, scope, tree, infer, out _);
+    private ImmutableArray<TypeSymbol> BindArguments(ImmutableArray<TypeParameterSymbol> parameters, GenericArgumentListSyntax? syntax, SyntaxNode origin, BindingScope scope, SyntaxTree tree, bool infer,
+        out ImmutableArray<LifetimeSymbol?> lifetimes)
     {
         var supplied = (syntax?.Arguments ?? []).Where(a => a.Value is not null || !a.ChildTokens().Any(t => t.Kind is SyntaxKind.LifetimeToken or SyntaxKind.RawLifetimeToken)).ToArray();
-        foreach (GenericArgumentSyntax lifetime in (syntax?.Arguments ?? []).Except(supplied))
-            BindLifetime(lifetime.ChildTokens().First(), lifetime, scope, tree);
+        lifetimes = (syntax?.Arguments ?? []).Except(supplied).Select(l => BindLifetime(l.ChildTokens().First(), l, scope, tree)).ToImmutableArray();
         if (supplied.Length > parameters.Length) Error(tree, syntax ?? origin, $"Expected {parameters.Length} type arguments, got {supplied.Length}.");
         var result = ImmutableArray.CreateBuilder<TypeSymbol>();
         var substitution = new Dictionary<TypeParameterSymbol, TypeSymbol>();
@@ -741,37 +1857,84 @@ internal sealed class Binder
         global.BindingState = 1;
         BindSignature(global);
         ExpressionSyntax? initializer = (syntax switch { ConstItemSyntax c => c.Value, StaticItemSyntax s => s.Value, _ => null })?.Value as ExpressionSyntax;
-        BoundExpression? value = initializer is null ? null : new BodyBinder(this, global.Scope, null, tree).Expression(initializer, global.Type);
+        BoundExpression? value = initializer is null ? null : new BodyBinder(this, global.Scope, null, tree, syntax).Expression(initializer, global.Type);
         if (value is null) Error(tree, syntax, "An initializer is required.");
-        else if (!value.ConstantValue.HasValue && !value.HasErrors) Unsupported(tree, initializer ?? (SyntaxNode)syntax, "This constant initializer");
+        else if (!IsConstant(value, initializer: true) && !value.HasErrors) Unsupported(tree, initializer ?? (SyntaxNode)syntax, "This constant initializer");
         if (global.Kind == SymbolKind.Constant) global.ConstantValue = value?.ConstantValue ?? default;
         bound = new BoundGlobal(syntax, global, value);
         _globals.Add(global, bound); global.BindingState = 2; Data(tree).BoundNodes[syntax] = bound;
         return bound;
     }
 
+    // Consts and statics hold constant expressions, and shared borrows of them get the static lifetime; initializers may also borrow statics
+    internal static bool IsConstant(BoundExpression expression, bool initializer = false) => expression switch
+    {
+        _ when expression.ConstantValue.HasValue => true,
+        BoundFunctionReference or BoundVariableExpression { Variable: GlobalSymbol { Kind: SymbolKind.Constant } } => true,
+        BoundTupleExpression tuple => tuple.Elements.All(e => IsConstant(e, initializer)),
+        BoundArrayExpression array => array.Elements.All(e => IsConstant(e, initializer)),
+        BoundConstructionExpression construction => construction.Fields.All(f => IsConstant(f.Value, initializer)) && (construction.Base is null || IsConstant(construction.Base, initializer)),
+        BoundConversionExpression { Conversion: not (ConversionKind.NumericCast or ConversionKind.PointerCast) } conversion => IsConstant(conversion.Operand, initializer),
+        BoundUnaryExpression { Operator: SyntaxKind.AmpersandToken, IsRawBorrow: false, Type: IndirectTypeSymbol { IsMutable: false } } borrow =>
+            IsConstant(borrow.Operand, initializer) || initializer && borrow.Operand is BoundVariableExpression { Variable: GlobalSymbol { Kind: SymbolKind.Static } },
+        BoundFieldExpression field => IsConstant(field.Receiver, initializer),
+        BoundIndexExpression { Index.ConstantValue.HasValue: true } element => initializer && IsConstant(element.Receiver, initializer),
+        _ => false
+    };
+    internal BoundExpression? Initializer(GlobalSymbol global) => (IsLocal(global) ? BindGlobal(global) : _compilation.BoundGlobal(global)).Initializer;
+    // A constant reduces to the expression that built it, through other constants and the fields and elements of constants
+    internal BoundExpression? Reduce(BoundExpression expression) => expression switch
+    {
+        BoundVariableExpression { Variable: GlobalSymbol { Kind: SymbolKind.Constant } constant } => Initializer(constant) is BoundExpression value ? Reduce(value) : null,
+        BoundConversionExpression { Conversion: ConversionKind.Identity } conversion => Reduce(conversion.Operand),
+        BoundFieldExpression field => Reduce(field.Receiver) is BoundExpression receiver && Field(receiver, field.Name) is BoundExpression value ? Reduce(value) : null,
+        BoundIndexExpression { Index.ConstantValue.Value: BigInteger index } element => Reduce(element.Receiver) is BoundArrayExpression array && index >= 0 &&
+            index < (array.RepeatCount is null ? array.Elements.Length : ((SequenceTypeSymbol)array.Type).Length ?? 0) ? Reduce(array.Elements[array.RepeatCount is null ? (int)index : 0]) : null,
+        BoundIndexExpression => null,
+        _ => expression
+    };
+    internal BoundExpression? Field(BoundExpression aggregate, string name) => aggregate switch
+    {
+        BoundTupleExpression tuple => int.TryParse(name, NumberStyles.None, CultureInfo.InvariantCulture, out int index) && index < tuple.Elements.Length ? tuple.Elements[index] : null,
+        BoundConstructionExpression construction when construction.Fields.FirstOrDefault(f => f.Field.Name == name) is { Value: BoundExpression given } => given,
+        BoundConstructionExpression { Base: BoundExpression baseValue } => Reduce(baseValue) is BoundExpression reduced ? Field(reduced, name) : null,
+        _ => null
+    };
     private void BindDiscriminants()
     {
-        foreach (AggregateSymbol aggregate in _declarations.OfType<AggregateSymbol>().Where(a => a.TypeKind == TypeKind.Enum))
+        foreach (AggregateSymbol aggregate in _declarations.OfType<AggregateSymbol>().Where(a => a.TypeKind == TypeKind.Enum)) BindDiscriminants(aggregate);
+    }
+    // Discriminants bind on demand, since constants may name unit variants and discriminants may name constants
+    internal BigInteger Discriminant(VariantSymbol variant)
+    {
+        if (IsLocal(variant)) BindDiscriminants(variant.Enum);
+        return variant.Discriminant;
+    }
+    private void BindDiscriminants(AggregateSymbol aggregate)
+    {
+        if (!_discriminants.TryAdd(aggregate, false))
         {
-            BigInteger next = BigInteger.Zero;
-            var used = new HashSet<BigInteger>();
-            foreach (VariantSymbol variant in aggregate.Variants)
-            {
-                if (variant.Declaration is not EnumVariantSyntax syntax) continue;
-                if (syntax.Discriminant?.Value is ExpressionSyntax expression)
-                {
-                    if (aggregate.Variants.Any(v => !v.Fields.IsEmpty)) Error(aggregate.Scope.Tree, syntax, "Explicit discriminants on data-carrying enums require an integer repr.");
-                    BoundExpression value = new BodyBinder(this, aggregate.Scope, null).Expression(expression, Types.Primitives["isize"]);
-                    if (value.ConstantValue.Value is BigInteger integer) next = integer;
-                    else Error(aggregate.Scope.Tree, expression, "Enum discriminant must be an integer constant.");
-                }
-                BigInteger limit = BigInteger.One << (_compilation.Options.PointerWidth - 1);
-                if (next < -limit || next >= limit) Error(aggregate.Scope.Tree, syntax, "Enum discriminant overflows isize.");
-                if (!used.Add(next)) Error(aggregate.Scope.Tree, syntax, $"Discriminant '{next}' is assigned more than once.");
-                variant.Discriminant = next++;
-            }
+            if (!_discriminants[aggregate]) Error(aggregate.Scope.Tree, aggregate.Declaration, $"Cyclic discriminant of '{aggregate.Name}'.");
+            return;
         }
+        BigInteger next = BigInteger.Zero;
+        var used = new HashSet<BigInteger>();
+        foreach (VariantSymbol variant in aggregate.Variants)
+        {
+            if (variant.Declaration is not EnumVariantSyntax syntax) continue;
+            if (syntax.Discriminant?.Value is ExpressionSyntax expression)
+            {
+                if (aggregate.Variants.Any(v => !v.Fields.IsEmpty)) Error(aggregate.Scope.Tree, syntax, "Explicit discriminants on data-carrying enums require an integer repr.");
+                BoundExpression value = new BodyBinder(this, aggregate.Scope, null).Expression(expression, Types.Primitives["isize"]);
+                if (value.ConstantValue.Value is BigInteger integer) next = integer;
+                else Error(aggregate.Scope.Tree, expression, "Enum discriminant must be an integer constant.");
+            }
+            BigInteger limit = BigInteger.One << (_compilation.Options.PointerWidth - 1);
+            if (next < -limit || next >= limit) Error(aggregate.Scope.Tree, syntax, "Enum discriminant overflows isize.");
+            if (!used.Add(next)) Error(aggregate.Scope.Tree, syntax, $"Discriminant '{next}' is assigned more than once.");
+            variant.Discriminant = next++;
+        }
+        _discriminants[aggregate] = true;
     }
 
     internal InferenceTypeSymbol Fresh(SyntaxNode origin, InferenceKind constraint = InferenceKind.Any)
@@ -783,7 +1946,13 @@ internal sealed class Binder
     internal bool Unify(TypeSymbol left, TypeSymbol right)
     {
         left = left.Resolve(); right = right.Resolve();
-        if (left.IsError || right.IsError || TypeSystem.Same(left, right)) return true;
+        if (left.IsError || right.IsError)
+        {
+            if (left is InferenceTypeSymbol leftError) { Change(leftError); leftError.Binding = Types.Error; }
+            if (right is InferenceTypeSymbol rightError) { Change(rightError); rightError.Binding = Types.Error; }
+            return true;
+        }
+        if (TypeSystem.Same(left, right)) return true;
         if (left is InferenceTypeSymbol leftInference) return BindInference(leftInference, right);
         if (right is InferenceTypeSymbol rightInference) return BindInference(rightInference, left);
         if (left.Kind != right.Kind) return false;
@@ -794,6 +1963,7 @@ internal sealed class Binder
             (SequenceTypeSymbol a, SequenceTypeSymbol b) => a.Length == b.Length && a.RangeForm == b.RangeForm && Unify(a.ElementType, b.ElementType),
             (IndirectTypeSymbol a, IndirectTypeSymbol b) => a.IsMutable == b.IsMutable && Unify(a.ElementType, b.ElementType),
             (FunctionTypeSymbol a, FunctionTypeSymbol b) => a.Abi == b.Abi && a.IsUnsafe == b.IsUnsafe && UnifyList(a.ParameterTypes, b.ParameterTypes) && Unify(a.ReturnType, b.ReturnType),
+            (ProjectionTypeSymbol a, ProjectionTypeSymbol b) => ReferenceEquals(a.Item, b.Item) && Unify(a.SelfType, b.SelfType) && UnifyList(a.TraitArguments, b.TraitArguments),
             _ => false
         };
     }
@@ -804,17 +1974,19 @@ internal sealed class Binder
         if (value is InferenceTypeSymbol other)
         {
             if (inference.Constraint != InferenceKind.Any && other.Constraint != InferenceKind.Any && inference.Constraint != other.Constraint) return false;
+            Change(other);
             if (other.Constraint == InferenceKind.Any) other.Constraint = inference.Constraint;
             other.HasNeverConstraint |= inference.HasNeverConstraint;
             other.DefaultType ??= inference.DefaultType;
         }
         else if (inference.Constraint == InferenceKind.Integer && value.Kind != TypeKind.Integer || inference.Constraint == InferenceKind.Float && value.Kind != TypeKind.Float) return false;
         if (Contains(value, t => ReferenceEquals(t, inference))) return false;
+        Change(inference);
         inference.Binding = value;
         return true;
     }
     private static bool ContainsParameter(TypeSymbol type, Func<TypeParameterSymbol, bool> predicate) => Contains(type, t => t is ParameterTypeSymbol p && predicate(p.Parameter));
-    private static bool Contains(TypeSymbol type, Func<TypeSymbol, bool> predicate)
+    internal static bool Contains(TypeSymbol type, Func<TypeSymbol, bool> predicate)
     {
         type = type.Resolve();
         if (predicate(type)) return true;
@@ -825,6 +1997,7 @@ internal sealed class Binder
             SequenceTypeSymbol s => Contains(s.ElementType, predicate),
             IndirectTypeSymbol r => Contains(r.ElementType, predicate),
             FunctionTypeSymbol f => Contains(f.ReturnType, predicate) || f.ParameterTypes.Any(t => Contains(t, predicate)),
+            ProjectionTypeSymbol p => Contains(p.SelfType, predicate) || p.TraitArguments.Any(t => Contains(t, predicate)),
             _ => false
         };
     }
@@ -865,7 +2038,7 @@ internal sealed class Binder
             };
         }
         foreach (AggregateSymbol type in _declarations.OfType<AggregateSymbol>())
-            if (!Visit(type.Type, new List<NamedTypeSymbol>())) Error(type.Scope.Tree, type.Declaration ?? type.Scope.Tree.Root, $"'{type.Name}' has infinite size or exceeds the layout nesting limit; introduce indirection.");
+            if (!Visit(type.Type, new List<NamedTypeSymbol>())) Error(type.Scope.Tree, type.Declaration, $"'{type.Name}' has infinite size or exceeds the layout nesting limit; introduce indirection.");
     }
 
     private static IEnumerable<LifetimeSymbol> Lifetimes(TypeSymbol type) => type.Resolve() switch
@@ -873,7 +2046,7 @@ internal sealed class Binder
         IndirectTypeSymbol { Kind: TypeKind.Reference, Lifetime: LifetimeSymbol lifetime } r => Lifetimes(r.ElementType).Prepend(lifetime),
         TupleTypeSymbol t => t.Elements.SelectMany(Lifetimes),
         SequenceTypeSymbol s => Lifetimes(s.ElementType),
-        NamedTypeSymbol n => n.TypeArguments.SelectMany(Lifetimes),
+        NamedTypeSymbol n => n.LifetimeArguments.Concat(n.TypeArguments.SelectMany(Lifetimes)),
         _ => []
     };
     private static TypeSymbol ReplaceElidedLifetimes(TypeSymbol type, LifetimeSymbol lifetime) => type.Resolve() switch
@@ -881,20 +2054,23 @@ internal sealed class Binder
         IndirectTypeSymbol r => new IndirectTypeSymbol(r.Kind, ReplaceElidedLifetimes(r.ElementType, lifetime), r.IsMutable, r.Lifetime is { IsElided: true } ? lifetime : r.Lifetime),
         TupleTypeSymbol t => new TupleTypeSymbol(t.Elements.Select(e => ReplaceElidedLifetimes(e, lifetime)).ToImmutableArray()),
         SequenceTypeSymbol s => new SequenceTypeSymbol(s.Kind, ReplaceElidedLifetimes(s.ElementType, lifetime), s.Length, s.RangeForm),
-        NamedTypeSymbol n => new NamedTypeSymbol(n.Definition, n.TypeArguments.Select(t => ReplaceElidedLifetimes(t, lifetime)).ToImmutableArray()),
+        NamedTypeSymbol n => new NamedTypeSymbol(n.Definition, n.TypeArguments.Select(t => ReplaceElidedLifetimes(t, lifetime)).ToImmutableArray(),
+            n.LifetimeArguments.Select(l => l.IsElided ? lifetime : l).ToImmutableArray()),
         _ => type
     };
-    internal bool IsSized(TypeSymbol type, HashSet<AggregateSymbol>? active = null)
+    internal bool IsSized(TypeSymbol type, ParamEnv? environment = null, HashSet<AggregateSymbol>? active = null)
     {
         type = type.Resolve();
         if (type.Kind is TypeKind.String or TypeKind.Slice) return false;
-        if (type is TupleTypeSymbol tuple) return tuple.Elements.All(t => IsSized(t, active));
-        if (type is SequenceTypeSymbol { Kind: TypeKind.Array } array) return IsSized(array.ElementType, active);
+        if (type is ParameterTypeSymbol { Parameter.IsMaybeSized: true })
+            return environment?.Predicates.Any(p => p is TraitPredicate { Trait: var bound } && ReferenceEquals(bound.Trait, SizedTrait) && TypeSystem.Same(bound.Self, type)) == true;
+        if (type is TupleTypeSymbol tuple) return tuple.Elements.All(t => IsSized(t, environment, active));
+        if (type is SequenceTypeSymbol { Kind: TypeKind.Array } array) return IsSized(array.ElementType, environment, active);
         if (type is NamedTypeSymbol named)
         {
             active ??= new HashSet<AggregateSymbol>();
             if (!active.Add(named.Definition)) return true;
-            bool result = named.Definition.Fields.Concat(named.Definition.Variants.SelectMany(v => v.Fields)).All(f => IsSized(Types.FieldType(f, named), active));
+            bool result = named.Definition.Fields.Concat(named.Definition.Variants.SelectMany(v => v.Fields)).All(f => IsSized(Types.FieldType(f, named), environment, active));
             active.Remove(named.Definition);
             return result;
         }
@@ -906,9 +2082,19 @@ internal sealed class Binder
         {
             if (symbol.SyntaxTree is not SyntaxTree tree || symbol.Declaration is not SyntaxNode syntax) continue;
             bool unsizedTail = symbol is FieldSymbol { ContainingSymbol: AggregateSymbol { TypeKind: TypeKind.Struct } owner } tail && ReferenceEquals(owner.Fields.LastOrDefault(), tail);
-            if (symbol is VariableSymbol variable && !unsizedTail && !IsSized(variable.Type)) Error(tree, syntax, $"'{variable.Type}' cannot be used by value in this declaration.");
+            // Bodiless trait methods are never called by value, so only definitions need sized parameters
+            if (symbol is ParameterSymbol { ContainingSymbol: FunctionSymbol { Declaration.Body: null, Trait: not null } }) continue;
+            ParamEnv? environment = symbol.ContainingSymbol switch
+            {
+                FunctionSymbol function => EnvironmentOf(function),
+                AggregateSymbol aggregate => EnvironmentOf(aggregate),
+                VariantSymbol variant => EnvironmentOf(variant.Enum),
+                _ => null
+            };
+            if (symbol is VariableSymbol variable && !unsizedTail && !IsSized(variable.Type, environment)) Error(tree, syntax, $"'{variable.Type}' cannot be used by value in this declaration.");
             if (symbol is FieldSymbol field && Lifetimes(field.Type).Any(l => l.IsElided)) Error(tree, syntax, "References in fields require an explicit lifetime.");
-            if (symbol is FunctionSymbol function && !IsSized(function.ReturnType)) Error(tree, syntax, $"Function return type '{function.ReturnType}' must be sized.");
+            if (symbol is FunctionSymbol returning && !(returning.Trait is not null && returning.Declaration.Body is null) && !IsSized(returning.ReturnType, EnvironmentOf(returning)))
+                Error(tree, syntax, $"Function return type '{returning.ReturnType}' must be sized.");
         }
     }
 }
@@ -927,9 +2113,11 @@ internal sealed class BodyBinder
     private bool _unsafe;
     private int _depth;
     private readonly List<LoopContext> _loops = new();
-    private sealed class LoopContext(LabelSymbol label, TypeSymbol type, bool values, HashSet<VariableSymbol> outer)
+    private MacroScope? _macros;
+    private sealed class LoopContext(LabelSymbol label, string key, TypeSymbol type, bool values, HashSet<VariableSymbol> outer)
     {
         internal readonly LabelSymbol Label = label;
+        internal readonly string Key = key;
         internal readonly TypeSymbol Type = type;
         internal readonly bool AllowsValue = values;
         internal readonly HashSet<VariableSymbol> Outer = outer;
@@ -946,9 +2134,48 @@ internal sealed class BodyBinder
         Restore(reachable[0]);
         foreach (FlowState state in reachable.Skip(1)) { _initialized.IntersectWith(state.Initialized); _assigned.UnionWith(state.Assigned); }
     }
-    internal BodyBinder(Binder binder, BindingScope scope, FunctionSymbol? function, SyntaxTree? tree = null)
-    { _binder = binder; _scope = scope; _function = function; _tree = tree ?? scope.Tree; }
-    private void Error(SyntaxNode syntax, string message) => _binder.Error(_tree, syntax, message);
+    private readonly ParamEnv _environment;
+    internal BodyBinder(Binder binder, BindingScope scope, FunctionSymbol? function, SyntaxTree? tree = null, SyntaxNode? item = null)
+    {
+        _binder = binder; _scope = scope; _function = function; _tree = tree ?? scope.Tree;
+        _macros = binder.MacrosFor(item ?? function?.Declaration ?? scope.Owner.Declaration);
+        _environment = function is not null ? binder.EnvironmentOf(function) : ParamEnv.Empty;
+    }
+    private void Error(SyntaxNode syntax, string message, string code = "RSEM0001") => _binder.Error(_tree, syntax, message, code);
+    private void Require(Predicate predicate, SyntaxNode syntax) => _binder.RegisterObligation(predicate, _environment, syntax, _tree);
+    private void RequireAll(IEnumerable<Predicate> predicates, SyntaxNode syntax)
+    {
+        foreach (Predicate predicate in predicates) if (predicate is not OutlivesPredicate) Require(predicate, syntax);
+    }
+    private TypeSymbol Normalize(TypeSymbol type, SyntaxNode syntax)
+    {
+        if (!Binder.Contains(type, t => t is ProjectionTypeSymbol)) return type;
+        return type.Resolve() switch
+        {
+            ProjectionTypeSymbol projection => NormalizeProjection(projection, syntax),
+            NamedTypeSymbol n => new NamedTypeSymbol(n.Definition, n.TypeArguments.Select(t => Normalize(t, syntax)).ToImmutableArray(), n.LifetimeArguments),
+            TupleTypeSymbol t => new TupleTypeSymbol(t.Elements.Select(e => Normalize(e, syntax)).ToImmutableArray()),
+            SequenceTypeSymbol s => new SequenceTypeSymbol(s.Kind, Normalize(s.ElementType, syntax), s.Length, s.RangeForm),
+            IndirectTypeSymbol r => new IndirectTypeSymbol(r.Kind, Normalize(r.ElementType, syntax), r.IsMutable, r.Lifetime),
+            FunctionTypeSymbol f => new FunctionTypeSymbol(f.ParameterTypes.Select(t => Normalize(t, syntax)).ToImmutableArray(), Normalize(f.ReturnType, syntax), f.IsUnsafe, f.Abi),
+            var other => other
+        };
+    }
+    // A projection whose impl cannot be selected yet becomes a fresh variable that a deferred obligation will bind
+    private TypeSymbol NormalizeProjection(ProjectionTypeSymbol projection, SyntaxNode syntax)
+    {
+        var inner = new ProjectionTypeSymbol(projection.Item, Normalize(projection.SelfType, syntax), projection.TraitArguments.Select(t => Normalize(t, syntax)).ToImmutableArray());
+        var nested = new List<Predicate>();
+        TypeSymbol? value = _binder.Project(inner, _environment, nested, _ => _binder.Fresh(syntax));
+        if (value is null)
+        {
+            InferenceTypeSymbol variable = _binder.Fresh(syntax);
+            Require(new ProjectionPredicate(inner, variable), syntax);
+            return variable;
+        }
+        RequireAll(nested, syntax);
+        return value is ProjectionTypeSymbol rigid && TypeSystem.Same(rigid, inner) ? value : Normalize(value, syntax);
+    }
     private BoundErrorExpression Bad(SyntaxNode syntax, string? message = null, IEnumerable<BoundNode>? children = null)
     {
         if (message is not null) Error(syntax, message);
@@ -981,7 +2208,7 @@ internal sealed class BodyBinder
             ParameterSyntax declaration = parameter.Declaration;
             if (parameter.IsSelf)
             {
-                AddVariable(parameter, declaration.Span.Start, names, declaration);
+                AddVariable(parameter, declaration.Span.Start, names, declaration, declaration.ChildTokens().First(t => t.Kind == SyntaxKind.SelfValueKeyword));
                 patterns.Add(new BoundPattern(declaration, parameter.Type, BoundPatternKind.Binding, variable: parameter, irrefutable: true));
             }
             else
@@ -993,7 +2220,8 @@ internal sealed class BodyBinder
         }
         _unsafe = function.IsUnsafe;
         BoundBlockExpression? body = syntax.Body is null ? null : Block(syntax.Body, function.ReturnType);
-        if (body is null && !function.IsForeign) Error(syntax, "A function declaration requires a body outside an extern block.");
+        if (body is null && !function.IsForeign && !function.IsIntrinsic && function.Trait is null) Error(syntax, "A function declaration requires a body outside an extern block.");
+        _binder.SelectWherePossible();
         var bound = new BoundFunction(syntax, function, patterns.ToImmutable(), body) { OwnErrors = Data.Diagnostics.Count > errors };
         return Record(syntax, bound);
     }
@@ -1029,6 +2257,7 @@ internal sealed class BodyBinder
                 MatchExpressionSyntax match => Match(match, expected),
                 RangeExpressionSyntax range => Range(range),
                 AttributedExpressionSyntax attributed => Attributed(attributed, expected, place),
+                MacroExpressionSyntax macro => MacroExpression(macro, expected, place),
                 MissingExpressionSyntax => Bad(syntax),
                 _ => Unsupported(syntax)
             };
@@ -1139,10 +2368,23 @@ internal sealed class BodyBinder
 
     private BoundExpression Path(PathExpressionSyntax syntax, bool place)
     {
-        Symbol? symbol = _binder.ResolvePath(syntax.Path, _scope, _tree, SymbolNamespace.Value, position: syntax.Span.Start);
+        Symbol? symbol;
+        if (syntax.Path is PathSyntax relative && IsTypeRelative(relative, syntax.Span.Start)) return AssociatedValue(relative, syntax);
+        if (syntax.Path is { Qualification: null } path && path.Segments.ToArray() is [{ Arguments: null } segment] && segment.Identifier.Context != 0)
+        {
+            ImmutableArray<Symbol> local = _scope.Find(MacroExpander.Key(segment.Identifier), SymbolNamespace.Value, syntax.Span.Start);
+            symbol = local.Length == 1 ? local[0] : _binder.ResolvePath(path, _scope, _tree, SymbolNamespace.Value, position: syntax.Span.Start, hygienic: true);
+        }
+        else symbol = _binder.ResolvePath(syntax.Path, _scope, _tree, SymbolNamespace.Value, position: syntax.Span.Start);
         if (symbol is null) return Bad(syntax);
         _binder.RecordSymbol(_tree, syntax, symbol);
         return Value(symbol, syntax, syntax.Path, place);
+    }
+    private ImmutableArray<Symbol> FindValue(SyntaxToken name, int position)
+    {
+        if (name.Context == 0) return _scope.Find(Binder.Name(name), SymbolNamespace.Value, position);
+        ImmutableArray<Symbol> local = _scope.Find(MacroExpander.Key(name), SymbolNamespace.Value, position);
+        return local.IsEmpty ? _scope.Find(Binder.Name(name), SymbolNamespace.Value, position, skipLocals: true) : local;
     }
     private BoundExpression Value(Symbol symbol, SyntaxNode syntax, PathSyntax? path = null, bool place = false)
     {
@@ -1154,36 +2396,138 @@ internal sealed class BodyBinder
                     Error(syntax, $"'{variable.Name}' may be uninitialized.");
                 if (variable is GlobalSymbol global)
                 {
-                    _binder.BindGlobal(global);
+                    if (_binder.IsLocal(global)) _binder.BindGlobal(global);
                     if (global.Kind == SymbolKind.Static && global.IsMutable && !_unsafe) Error(syntax, "Access to a mutable static requires an unsafe block.");
                 }
                 var bound = new BoundVariableExpression(syntax, variable);
                 if (variable is GlobalSymbol { Kind: SymbolKind.Constant } constant) bound.ConstantValue = constant.ConstantValue;
                 return bound;
             }
-            case FunctionSymbol function: return FunctionReference(function, syntax, path?.Segments.LastOrDefault()?.Arguments);
+            case FunctionSymbol function: return FunctionReference(function, syntax, [], path?.Segments.LastOrDefault()?.Arguments);
             case AggregateSymbol { Shape: AggregateShape.Unit } aggregate:
                 return new BoundConstructionExpression(syntax, Instantiate(aggregate, path, syntax), null, []);
             case VariantSymbol { Shape: AggregateShape.Unit } variant:
-                return new BoundConstructionExpression(syntax, Instantiate(variant.Enum, path, syntax), variant, []);
+                return UnitVariant(syntax, Instantiate(variant.Enum, path, syntax), variant);
             default: return Bad(syntax, $"'{symbol.Name}' cannot be used as a value here.");
         }
     }
+    // A unit variant of an enum without fields is a constant: its discriminant
+    private BoundConstructionExpression UnitVariant(SyntaxNode syntax, NamedTypeSymbol type, VariantSymbol variant) => new(syntax, type, variant, [])
+    {
+        ConstantValue = variant.Enum.Variants.All(v => v.Fields.IsEmpty) ? ConstantValue.From(_binder.Discriminant(variant)) : default
+    };
     private NamedTypeSymbol Instantiate(AggregateSymbol aggregate, PathSyntax? path, SyntaxNode syntax)
     {
         if (path?.Segments.Count(s => s.Arguments is not null) > 1) Error(syntax, "Generic arguments may only be supplied once for a constructor.");
         GenericArgumentListSyntax? arguments = path?.Segments.FirstOrDefault(s => Binder.Name(s.Identifier) == aggregate.Name)?.Arguments;
         arguments ??= path?.Segments.LastOrDefault()?.Arguments;
-        return new NamedTypeSymbol(aggregate, _binder.BindArguments(aggregate.TypeParameters, arguments, syntax, _scope, _tree, true));
+        var type = new NamedTypeSymbol(aggregate, _binder.BindArguments(aggregate.TypeParameters, arguments, syntax, _scope, _tree, true));
+        if (!aggregate.Predicates.IsEmpty)
+            RequireAll(aggregate.Predicates.Select(p => Types.Substitute(p, aggregate.TypeParameters.Zip(type.TypeArguments).ToDictionary(x => x.First, x => x.Second))), syntax);
+        return type;
     }
-    private BoundFunctionReference FunctionReference(FunctionSymbol function, SyntaxNode syntax, GenericArgumentListSyntax? supplied)
+    // Instantiates the function's own and enclosing generics and requires its where-clauses for those arguments
+    private BoundFunctionReference FunctionReference(FunctionSymbol function, SyntaxNode syntax, ImmutableArray<TypeSymbol> parents, GenericArgumentListSyntax? supplied)
     {
-        ImmutableArray<TypeSymbol> arguments = _binder.BindArguments(function.TypeParameters, supplied, syntax, _scope, _tree, true);
-        var substitution = function.TypeParameters.Zip(arguments).ToDictionary(p => p.First, p => p.Second);
-        var type = new FunctionTypeSymbol(function.Parameters.Select(p => Types.Substitute(p.Type, substitution)).ToImmutableArray(),
-            Types.Substitute(function.ReturnType, substitution), function.IsUnsafe, function.Abi);
+        if (parents.Length != function.ParentTypeParameters.Length) parents = function.ParentTypeParameters.Select(_ => (TypeSymbol)_binder.Fresh(syntax)).ToImmutableArray();
+        ImmutableArray<TypeSymbol> arguments = parents.AddRange(_binder.BindArguments(function.TypeParameters, supplied, syntax, _scope, _tree, true));
+        Dictionary<TypeParameterSymbol, TypeSymbol> substitution = function.AllTypeParameters.Zip(arguments).ToDictionary(p => p.First, p => p.Second);
+        IEnumerable<Predicate> predicates = function.Predicates.Concat(function.ContainingSymbol switch { ImplSymbol impl => impl.Predicates, TraitSymbol trait => trait.Predicates, _ => [] });
+        RequireAll(predicates.Select(p => Types.Substitute(p, substitution)), syntax);
+        if (_binder.SizedTrait is TraitSymbol sized)
+            foreach (var (parameter, argument) in function.AllTypeParameters.Zip(arguments))
+                if (!parameter.IsMaybeSized) Require(new TraitPredicate(new TraitReference(sized, argument, [])), syntax);
+        var type = new FunctionTypeSymbol(function.Parameters.Select(p => Normalize(Types.Substitute(p.Type, substitution), syntax)).ToImmutableArray(),
+            Normalize(Types.Substitute(function.ReturnType, substitution), syntax), function.IsUnsafe, function.Abi);
         _binder.RecordSymbol(_tree, syntax, function);
         return new BoundFunctionReference(syntax, function, type, arguments);
+    }
+    private BoundFunctionReference TraitMethodReference(FunctionSymbol method, TypeSymbol self, ImmutableArray<TypeSymbol>? traitArguments, GenericArgumentListSyntax? supplied, SyntaxNode syntax)
+    {
+        TraitSymbol trait = method.Trait!;
+        ImmutableArray<TypeSymbol> arguments = traitArguments ?? trait.TypeParameters.Select(_ => (TypeSymbol)_binder.Fresh(syntax)).ToImmutableArray();
+        Require(new TraitPredicate(new TraitReference(trait, self, arguments)), syntax);
+        return FunctionReference(method, syntax, arguments.Insert(0, self), supplied);
+    }
+    private ImmutableArray<TraitSymbol> _traitsInScope;
+    // Imported and prelude traits, plus the traits bounding generics in scope, contribute methods and associated functions
+    private ImmutableArray<TraitSymbol> TraitsInScope()
+    {
+        if (!_traitsInScope.IsDefault) return _traitsInScope;
+        var traits = new List<TraitSymbol>();
+        for (BindingScope? scope = _scope; scope is not null; scope = scope.Parent)
+            foreach (ScopeEntry entry in scope.Entries)
+                if (entry.Namespace == SymbolNamespace.Type && Binder.Unwrap(entry.Symbol) is TraitSymbol trait && !traits.Contains(trait)) traits.Add(trait);
+        foreach (TraitPredicate bound in _environment.Predicates.OfType<TraitPredicate>())
+            if (!traits.Contains(bound.Trait.Trait)) traits.Add(bound.Trait.Trait);
+        return _traitsInScope = traits.ToImmutableArray();
+    }
+    private bool IsTypeRelative(PathSyntax path, int position)
+    {
+        if (path.Qualification is not null) return true;
+        int count = path.Segments.Count();
+        if (count < 2 || _binder.ResolvePath(path, _scope, _tree, SymbolNamespace.Value, false, position) is not null) return false;
+        string first = Binder.Name(path.Segments.First().Identifier);
+        if (count == 2 && (first == "Self" || _scope.Find(first, SymbolNamespace.Type).IsEmpty && Types.Primitives.ContainsKey(first))) return true;
+        return _binder.ResolvePath(path, _scope, _tree, SymbolNamespace.Type, false, position, length: count - 1) is TypeParameterSymbol or AggregateSymbol or TypeAliasSymbol or TraitSymbol;
+    }
+    // Type::item, Trait::item and <T as Trait>::item: inherent impls first, then traits the type may implement
+    private BoundExpression AssociatedValue(PathSyntax path, SyntaxNode syntax)
+    {
+        PathSegmentSyntax[] segments = path.Segments.ToArray();
+        PathSegmentSyntax last = segments[^1];
+        string name = Binder.Name(last.Identifier);
+        TypeSymbol self;
+        if (path.Qualification is QualifiedPathSyntax qualification && segments.Length == 1)
+        {
+            self = Normalize(_binder.BindType(qualification.Type, _scope, _tree, true), syntax);
+            if (qualification.Trait is PathSyntax traitPath)
+            {
+                if (_binder.BindTraitReference(traitPath, self, _scope, _tree, null) is not TraitReference qualified) return Bad(syntax);
+                if (qualified.Trait.Methods.FirstOrDefault(m => m.Name == name) is FunctionSymbol qualifiedMethod)
+                    return TraitMethodReference(qualifiedMethod, self, qualified.Arguments, last.Arguments, syntax);
+                return Bad(syntax, $"Trait '{qualified.Trait.Name}' has no associated function '{name}'.");
+            }
+        }
+        else if (path.Qualification is null && _binder.ResolvePath(path, _scope, _tree, SymbolNamespace.Type, false, length: segments.Length - 1) is TraitSymbol trait)
+        {
+            if (trait.Methods.FirstOrDefault(m => m.Name == name) is not FunctionSymbol traitMethod) return Bad(syntax, $"Trait '{trait.Name}' has no associated function '{name}'.");
+            ImmutableArray<TypeSymbol>? supplied = segments[^2].Arguments is GenericArgumentListSyntax traitArguments
+                ? _binder.BindArguments(trait.TypeParameters, traitArguments, syntax, _scope, _tree, true) : null;
+            return TraitMethodReference(traitMethod, _binder.Fresh(syntax), supplied, last.Arguments, syntax);
+        }
+        else self = Normalize(_binder.BindPathType(path, _scope, _tree, true, segments.Length - 1), syntax);
+        if (self.IsError) return Bad(syntax);
+        _binder.SelectWherePossible();
+        if (self.Resolve() is NamedTypeSymbol named)
+        {
+            if (named.Definition.Variants.FirstOrDefault(v => v.Name == name) is VariantSymbol variant)
+                return variant.Shape == AggregateShape.Unit ? UnitVariant(syntax, named, variant) : Bad(syntax, $"Variant '{name}' requires constructor arguments.");
+            foreach (ImplSymbol impl in named.Definition.InherentImpls)
+            {
+                if (impl.Methods.FirstOrDefault(m => m.Name == name) is not FunctionSymbol method) continue;
+                if (!_binder.Probe(() => _binder.Unify(Types.Substitute(impl.SelfType, Binder.Instantiate(impl, _binder.Probing)), self))) continue;
+                ImmutableArray<TypeSymbol> arguments = impl.TypeParameters.Select(_ => (TypeSymbol)_binder.Fresh(syntax)).ToImmutableArray();
+                _binder.Unify(Types.Substitute(impl.SelfType, impl.TypeParameters.Zip(arguments).ToDictionary(p => p.First, p => p.Second)), self);
+                if (!_binder.IsAccessible(method, Binder.ModuleOf(_scope))) Error(syntax, $"Associated function '{name}' is private.");
+                return FunctionReference(method, syntax, arguments, last.Arguments);
+            }
+        }
+        var candidates = new List<FunctionSymbol>();
+        foreach (TraitSymbol candidate in TraitsInScope())
+        {
+            if (candidate.Methods.FirstOrDefault(m => m.Name == name) is not FunctionSymbol method) continue;
+            var goal = new TraitPredicate(new TraitReference(candidate, self, candidate.TypeParameters.Select(_binder.Probing).ToImmutableArray()));
+            if (_binder.Evaluate(goal, _environment) != Evaluation.Fails) candidates.Add(method);
+        }
+        if (candidates.Count == 1) return TraitMethodReference(candidates[0], self, null, last.Arguments, syntax);
+        if (candidates.Count > 1) return Fail(syntax, $"Multiple applicable items named '{name}' for '{self}': {string.Join(", ", candidates.Select(c => c.Trait!.Name))}.", "RTRA0034");
+        return Fail(syntax, $"No function or associated item named '{name}' found for '{_binder.Zonk(self)}' in the current scope.", "RTRA0599");
+    }
+    private BoundErrorExpression Fail(SyntaxNode syntax, string message, string code, IEnumerable<BoundNode>? children = null)
+    {
+        Error(syntax, message, code);
+        return Bad(syntax, children: children);
     }
     private BoundExpression Tuple(TupleExpressionSyntax syntax, TypeSymbol? expected)
     {
@@ -1204,12 +2548,14 @@ internal sealed class BodyBinder
         BoundExpression count = Expression(syntax.Length, Types.Usize);
         ulong? length = count.ConstantValue.Value is BigInteger value && value >= 0 && value <= ulong.MaxValue ? (ulong)value : null;
         if (length is null) Error(syntax, "Array repeat count must be a constant usize.");
-        _binder.CheckLater(() =>
+        if (length > 1 && element is not BoundVariableExpression { Variable: GlobalSymbol { Kind: SymbolKind.Constant } })
         {
-            if (length > 1 && element.Type.Kind is not (TypeKind.Boolean or TypeKind.Integer or TypeKind.Float or TypeKind.Character or TypeKind.Pointer or TypeKind.Unit) &&
-                element.Type is not IndirectTypeSymbol { Kind: TypeKind.Reference, IsMutable: false } && !element.HasErrors)
-                _binder.Unsupported(_tree, syntax, "Copy checking for this array repeat element");
-        });
+            if (_binder.CopyTrait is TraitSymbol copy) Require(new TraitPredicate(new TraitReference(copy, element.Type, [])), syntax.Element ?? (SyntaxNode)syntax);
+            else _binder.CheckLater(() =>
+            {
+                if (!_binder.IsCopy(element.Type, _environment) && !element.HasErrors) Error(syntax, $"The repeated array element '{element.Type}' must be Copy.");
+            });
+        }
         return new BoundArrayExpression(syntax, new SequenceTypeSymbol(TypeKind.Array, element.Type, length), [element], count);
     }
 
@@ -1240,6 +2586,14 @@ internal sealed class BodyBinder
             if (bound.Type is not IndirectTypeSymbol reference) return Bad(syntax, $"Cannot dereference '{bound.Type}'.", [bound]);
             if (reference.Kind == TypeKind.Pointer && !_unsafe) Error(syntax, "Dereferencing a raw pointer requires an unsafe block.");
             return new BoundUnaryExpression(syntax, reference.ElementType, op, bound, reference.IsMutable ? ValueCategory.MutablePlace : ValueCategory.Place);
+        }
+        if (!IsBuiltinOperand(bound.Type) && !bound.Type.IsError && op is SyntaxKind.MinusToken or SyntaxKind.BangToken &&
+            _binder.FindLangItem(op == SyntaxKind.MinusToken ? "neg" : "not") is TraitSymbol { TypeParameters.IsEmpty: true } trait &&
+            trait.Methods.FirstOrDefault(m => m.Name == (op == SyntaxKind.MinusToken ? "neg" : "not")) is FunctionSymbol method)
+        {
+            BoundFunctionReference target = TraitMethodReference(method, bound.Type, [], null, syntax);
+            var signature = (FunctionTypeSymbol)target.Type;
+            return new BoundCallExpression(syntax, signature.ReturnType, target, [Coerce(bound, signature.ParameterTypes[0], syntax.Operand ?? (SyntaxNode)syntax)]);
         }
         var unary = new BoundUnaryExpression(syntax, bound.Type, op, bound);
         unary.ConstantValue = bound.ConstantValue.Value switch
@@ -1282,8 +2636,39 @@ internal sealed class BodyBinder
         if (logical) Merge(new[] { beforeRight, Save() });
         return BinaryOperation(syntax, op, left, right);
     }
+    // Scalars keep the builtin operators; everything else goes through the operator traits like rustc's lookup_op_method
+    private static bool IsBuiltinOperand(TypeSymbol type) => type.Resolve() is PrimitiveTypeSymbol { Kind: not TypeKind.String } or InferenceTypeSymbol or IndirectTypeSymbol { Kind: TypeKind.Pointer };
+    private static (string Item, string Method)? OperatorTrait(SyntaxKind op) => op switch
+    {
+        SyntaxKind.PlusToken => ("add", "add"), SyntaxKind.MinusToken => ("sub", "sub"), SyntaxKind.StarToken => ("mul", "mul"),
+        SyntaxKind.SlashToken => ("div", "div"), SyntaxKind.PercentToken => ("rem", "rem"), SyntaxKind.AmpersandToken => ("bitand", "bitand"),
+        SyntaxKind.PipeToken => ("bitor", "bitor"), SyntaxKind.CaretToken => ("bitxor", "bitxor"),
+        SyntaxKind.LessThanLessThanToken => ("shl", "shl"), SyntaxKind.GreaterThanGreaterThanToken => ("shr", "shr"),
+        SyntaxKind.EqualsEqualsToken => ("eq", "eq"), SyntaxKind.BangEqualsToken => ("eq", "ne"),
+        SyntaxKind.LessThanToken => ("partial_ord", "lt"), SyntaxKind.LessThanEqualsToken => ("partial_ord", "le"),
+        SyntaxKind.GreaterThanToken => ("partial_ord", "gt"), SyntaxKind.GreaterThanEqualsToken => ("partial_ord", "ge"),
+        _ => null
+    };
+    private BoundExpression? OverloadedOperator(SyntaxNode syntax, SyntaxKind op, BoundExpression left, BoundExpression right, bool assignment)
+    {
+        if (OperatorTrait(op) is not var (item, name)) return null;
+        bool comparison = Comparison(op);
+        if (assignment) { item += "_assign"; name += "_assign"; }
+        if (_binder.FindLangItem(item) is not TraitSymbol trait || trait.TypeParameters.Length != 1 || trait.Methods.FirstOrDefault(m => m.Name == name) is not FunctionSymbol method) return null;
+        BoundFunctionReference target = TraitMethodReference(method, left.Type, [right.Type], null, syntax);
+        var signature = (FunctionTypeSymbol)target.Type;
+        if (signature.ParameterTypes.Length != 2) return Bad(syntax);
+        BoundExpression first = comparison || assignment ? AutoRef(left, assignment) : left, second = comparison ? AutoRef(right, false) : right;
+        if (assignment && left.ValueCategory != ValueCategory.MutablePlace) Error(syntax, "Assignment requires a mutable place.");
+        return new BoundCallExpression(syntax, signature.ReturnType, target, [Coerce(first, signature.ParameterTypes[0], left.Syntax), Coerce(second, signature.ParameterTypes[1], right.Syntax)]);
+    }
+    private static BoundExpression AutoRef(BoundExpression operand, bool mutable)
+        => new BoundUnaryExpression(operand.Syntax, new IndirectTypeSymbol(TypeKind.Reference, operand.Type, mutable), SyntaxKind.AmpersandToken, operand);
     private BoundExpression BinaryOperation(SyntaxNode syntax, SyntaxKind op, BoundExpression left, BoundExpression right)
     {
+        if (op is not (SyntaxKind.AmpersandAmpersandToken or SyntaxKind.PipePipeToken) && (!IsBuiltinOperand(left.Type) || !IsBuiltinOperand(right.Type)) &&
+            !left.Type.IsError && !right.Type.IsError && OverloadedOperator(syntax, op, left, right, false) is BoundExpression overloaded)
+            return overloaded;
         if (left.Type.Kind == TypeKind.Never && right.Type.Kind != TypeKind.Never) left = Coerce(left, right.Type, left.Syntax);
         if (right.Type.Kind == TypeKind.Never && left.Type.Kind != TypeKind.Never) right = Coerce(right, left.Type, right.Syntax);
         bool shift = op is SyntaxKind.LessThanLessThanToken or SyntaxKind.GreaterThanGreaterThanToken;
@@ -1390,7 +2775,14 @@ internal sealed class BodyBinder
     {
         bool compound = syntax.OperatorToken.Kind != SyntaxKind.EqualsToken;
         BoundExpression target = Expression(syntax.Left, place: !compound);
-        BoundExpression value = Expression(syntax.Right, target.Type);
+        if (compound && !IsBuiltinOperand(target.Type) && !target.Type.IsError)
+        {
+            BoundExpression operand = Expression(syntax.Right);
+            if (OverloadedOperator(syntax, CompoundOperator(syntax.OperatorToken.Kind), target, operand, true) is BoundExpression call) return call;
+            return Bad(syntax, $"Compound assignment is not defined for '{target.Type}'.", [target, operand]);
+        }
+        bool shift = syntax.OperatorToken.Kind is SyntaxKind.LessThanLessThanEqualsToken or SyntaxKind.GreaterThanGreaterThanEqualsToken;
+        BoundExpression value = Expression(syntax.Right, shift ? null : target.Type);
         if (target is BoundVariableExpression { Variable: LocalSymbol or ParameterSymbol } variable)
         {
             if (!variable.Variable.IsMutable && _assigned.Contains(variable.Variable))
@@ -1398,29 +2790,28 @@ internal sealed class BodyBinder
             _initialized.Add(variable.Variable); _assigned.Add(variable.Variable);
         }
         else if (target.ValueCategory != ValueCategory.MutablePlace) Error(syntax, "Assignment requires a mutable place.");
-        if (compound)
-        {
-            SyntaxKind op = syntax.OperatorToken.Kind switch
-            {
-                SyntaxKind.PlusEqualsToken => SyntaxKind.PlusToken, SyntaxKind.MinusEqualsToken => SyntaxKind.MinusToken,
-                SyntaxKind.StarEqualsToken => SyntaxKind.StarToken, SyntaxKind.SlashEqualsToken => SyntaxKind.SlashToken,
-                SyntaxKind.PercentEqualsToken => SyntaxKind.PercentToken, SyntaxKind.CaretEqualsToken => SyntaxKind.CaretToken,
-                SyntaxKind.PipeEqualsToken => SyntaxKind.PipeToken, SyntaxKind.AmpersandEqualsToken => SyntaxKind.AmpersandToken,
-                SyntaxKind.LessThanLessThanEqualsToken => SyntaxKind.LessThanLessThanToken, _ => SyntaxKind.GreaterThanGreaterThanToken
-            };
-            _ = BinaryOperation(syntax, op, target, value);
-        }
+        if (compound) _ = BinaryOperation(syntax, CompoundOperator(syntax.OperatorToken.Kind), target, value);
         return new BoundAssignmentExpression(syntax, Types.Unit, syntax.OperatorToken.Kind, target, value);
     }
+    private static SyntaxKind CompoundOperator(SyntaxKind kind) => kind switch
+    {
+        SyntaxKind.PlusEqualsToken => SyntaxKind.PlusToken, SyntaxKind.MinusEqualsToken => SyntaxKind.MinusToken,
+        SyntaxKind.StarEqualsToken => SyntaxKind.StarToken, SyntaxKind.SlashEqualsToken => SyntaxKind.SlashToken,
+        SyntaxKind.PercentEqualsToken => SyntaxKind.PercentToken, SyntaxKind.CaretEqualsToken => SyntaxKind.CaretToken,
+        SyntaxKind.PipeEqualsToken => SyntaxKind.PipeToken, SyntaxKind.AmpersandEqualsToken => SyntaxKind.AmpersandToken,
+        SyntaxKind.LessThanLessThanEqualsToken => SyntaxKind.LessThanLessThanToken, _ => SyntaxKind.GreaterThanGreaterThanToken
+    };
     private BoundExpression Cast(CastExpressionSyntax syntax)
     {
         BoundExpression operand = Expression(syntax.Expression);
-        TypeSymbol type = _binder.BindType(syntax.Type, _scope, _tree);
-        var cast = new BoundConversionExpression(syntax, type, type.Kind == TypeKind.Pointer ? ConversionKind.PointerCast : ConversionKind.NumericCast, operand);
+        TypeSymbol type = Normalize(_binder.BindType(syntax.Type, _scope, _tree), syntax);
+        ConversionKind kind = TypeSystem.Same(operand.Type, type) ? ConversionKind.Identity : type.Kind == TypeKind.Pointer ? ConversionKind.PointerCast : ConversionKind.NumericCast;
+        var cast = new BoundConversionExpression(syntax, type, kind, operand);
         _binder.CheckLater(() =>
         {
             TypeSymbol source = operand.Type;
-            bool valid = source.IsNumeric && type.IsNumeric || source.Kind is TypeKind.Boolean or TypeKind.Character && type.IsInteger ||
+            bool valid = TypeSystem.Same(source, type) || source.IsNumeric && type.IsNumeric || source.Kind is TypeKind.Boolean or TypeKind.Character && type.IsInteger ||
+                source is NamedTypeSymbol { Kind: TypeKind.Enum } fieldless && fieldless.Definition.Variants.All(v => v.Fields.IsEmpty) && type.IsInteger ||
                 source is PrimitiveTypeSymbol { Name: "u8" } && type.Kind == TypeKind.Character ||
                 source is IndirectTypeSymbol { Kind: TypeKind.Pointer } pointer && (type is IndirectTypeSymbol { Kind: TypeKind.Pointer } destinationPointer && (_binder.IsSized(destinationPointer.ElementType) || !_binder.IsSized(pointer.ElementType)) || type.IsInteger && _binder.IsSized(pointer.ElementType)) ||
                 source.IsInteger && type is IndirectTypeSymbol { Kind: TypeKind.Pointer } fromInteger && _binder.IsSized(fromInteger.ElementType) ||
@@ -1455,36 +2846,14 @@ internal sealed class BodyBinder
                 foreach (FieldSymbol field in fields)
                     if (!_binder.IsAccessible(field, Binder.ModuleOf(_scope))) Error(syntax, $"Constructor field '{field.Name}' is private.");
                 if (arguments.Length != fields.Length) Error(syntax, $"Expected {fields.Length} constructor arguments, got {arguments.Length}.");
-                var values = arguments.Select((a, i) => Expression(a, i < fields.Length ? Types.FieldType(fields[i], type) : null)).ToArray();
+                var values = arguments.Select((a, i) => Expression(a, i < fields.Length ? Normalize(Types.FieldType(fields[i], type), syntax) : null)).ToArray();
                 _binder.RecordSymbol(_tree, path, symbol);
                 return new BoundConstructionExpression(syntax, type, symbol as VariantSymbol, fields.Zip(values).Select(p => new BoundFieldInitializer(p.First, p.Second)).ToImmutableArray());
             }
         }
         BoundExpression target;
         BoundExpression? receiverArgument = null;
-        if (syntax.Target is MemberAccessExpressionSyntax member)
-        {
-            BoundExpression receiver = AutoDeref(Expression(member.Receiver));
-            if (receiver.Type is NamedTypeSymbol named && named.Definition.Methods.FirstOrDefault(f => f.Name == Binder.Name(member.Member) && f.HasSelfParameter) is FunctionSymbol method)
-            {
-                if (!_binder.IsAccessible(method, Binder.ModuleOf(_scope))) Error(member, $"Method '{method.Name}' is private.");
-                TypeSymbol parameter = method.Parameters[0].Type;
-                BoundExpression self = receiver;
-                if (parameter is IndirectTypeSymbol reference)
-                {
-                    if (reference.IsMutable && receiver.ValueCategory == ValueCategory.Place) Error(member, "Method requires a mutable receiver.");
-                    self = new BoundUnaryExpression(member.Receiver ?? member, new IndirectTypeSymbol(TypeKind.Reference, receiver.Type, reference.IsMutable), SyntaxKind.AmpersandToken, receiver);
-                }
-                self = Coerce(self, parameter, member.Receiver ?? member);
-                receiverArgument = self;
-                target = Record(member, FunctionReference(method, member, member.GenericArguments));
-            }
-            else
-            {
-                Error(member, $"No inherent method '{Binder.Name(member.Member)}' on '{receiver.Type}'.");
-                target = Bad(member, children: [receiver]);
-            }
-        }
+        if (syntax.Target is MemberAccessExpressionSyntax member) target = Method(member, out receiverArgument);
         else target = Expression(syntax.Target);
         if (target.Type is not FunctionTypeSymbol signature)
         {
@@ -1501,6 +2870,96 @@ internal sealed class BodyBinder
             boundArguments.Add(Expression(arguments[i], i + offset < signature.ParameterTypes.Length ? signature.ParameterTypes[i + offset] : null));
         return new BoundCallExpression(syntax, signature.ReturnType, target, boundArguments.ToImmutable());
     }
+    private enum Adjustment : byte { None, Shared, Mutable }
+    private sealed record MethodPick(FunctionSymbol Method, ImplSymbol? Impl, int Step, Adjustment Adjustment);
+    // Probes like rustc: for each autoderef step try the receiver by value, then &, then &mut; inherent methods win over trait methods at each one
+    private BoundExpression Method(MemberAccessExpressionSyntax member, out BoundExpression? receiverArgument)
+    {
+        receiverArgument = null;
+        BoundExpression receiver = Expression(member.Receiver);
+        SyntaxNode receiverSyntax = member.Receiver ?? (SyntaxNode)member;
+        string name = Binder.Name(member.Member);
+        _binder.SelectWherePossible();
+        if (receiver.Type is InferenceTypeSymbol { Constraint: InferenceKind.Any })
+            return Fail(member, $"Type annotations needed before calling method '{name}'.", "RTRA0282", [receiver]);
+        if (receiver.Type.IsError) return Bad(member, children: [receiver]);
+        var steps = new List<TypeSymbol> { receiver.Type };
+        while (steps.Count < 32 && steps[^1] is IndirectTypeSymbol { Kind: TypeKind.Reference } reference) steps.Add(reference.ElementType.Resolve());
+        var inherent = new List<(FunctionSymbol Method, ImplSymbol Impl)>();
+        foreach (TypeSymbol step in steps)
+            if (step is NamedTypeSymbol named)
+                foreach (ImplSymbol impl in named.Definition.InherentImpls)
+                    if (impl.Methods.FirstOrDefault(m => m.Name == name && m.HasSelfParameter) is FunctionSymbol method && !inherent.Contains((method, impl))) inherent.Add((method, impl));
+        var traits = TraitsInScope().Select(t => t.Methods.FirstOrDefault(m => m.Name == name && m.HasSelfParameter)).OfType<FunctionSymbol>().ToList();
+        MethodPick? pick = null;
+        for (int i = 0; i < steps.Count && pick is null; i++)
+        {
+            foreach (Adjustment adjustment in new[] { Adjustment.None, Adjustment.Shared, Adjustment.Mutable })
+            {
+                TypeSymbol adjusted = adjustment == Adjustment.None ? steps[i] : new IndirectTypeSymbol(TypeKind.Reference, steps[i], adjustment == Adjustment.Mutable);
+                var applicable = inherent.Where(c => _binder.Probe(() => InherentApplies(c.Method, c.Impl, adjusted))).ToList();
+                if (applicable.Count == 0)
+                {
+                    var traitApplicable = traits.Where(m => _binder.Probe(() => TraitApplies(m, adjusted))).ToList();
+                    if (traitApplicable.Count > 1) return Fail(member, $"Multiple applicable methods named '{name}' for '{adjusted}': {string.Join(", ", traitApplicable.Select(m => m.Trait!.Name))}.", "RTRA0034", [receiver]);
+                    if (traitApplicable.Count == 1) pick = new MethodPick(traitApplicable[0], null, i, adjustment);
+                }
+                else if (applicable.Count > 1) return Fail(member, $"Multiple applicable methods named '{name}' for '{adjusted}'.", "RTRA0034", [receiver]);
+                else pick = new MethodPick(applicable[0].Method, applicable[0].Impl, i, adjustment);
+                if (pick is not null) break;
+            }
+        }
+        if (pick is null)
+            return Fail(member, $"No method named '{name}' found for '{_binder.Zonk(receiver.Type)}' in the current scope.", "RTRA0599", [receiver]);
+        // A reference picked by value is reborrowed rather than moved
+        if (pick.Adjustment == Adjustment.None && steps[pick.Step] is IndirectTypeSymbol { Kind: TypeKind.Reference } picked)
+            pick = pick with { Step = pick.Step + 1, Adjustment = picked.IsMutable ? Adjustment.Mutable : Adjustment.Shared };
+        BoundExpression self = receiver;
+        for (int i = 0; i < pick.Step; i++)
+        {
+            var reference = (IndirectTypeSymbol)self.Type;
+            self = new BoundUnaryExpression(receiverSyntax, reference.ElementType, SyntaxKind.StarToken, self, reference.IsMutable ? ValueCategory.MutablePlace : ValueCategory.Place);
+        }
+        if (pick.Adjustment != Adjustment.None)
+        {
+            if (pick.Adjustment == Adjustment.Mutable && self.ValueCategory == ValueCategory.Place) Error(member, "Method requires a mutable receiver.");
+            self = new BoundUnaryExpression(receiverSyntax, new IndirectTypeSymbol(TypeKind.Reference, self.Type, pick.Adjustment == Adjustment.Mutable), SyntaxKind.AmpersandToken, self);
+        }
+        BoundFunctionReference target;
+        if (pick.Impl is ImplSymbol owner)
+        {
+            if (!_binder.IsAccessible(pick.Method, Binder.ModuleOf(_scope))) Error(member, $"Method '{name}' is private.");
+            ImmutableArray<TypeSymbol> arguments = owner.TypeParameters.Select(_ => (TypeSymbol)_binder.Fresh(member)).ToImmutableArray();
+            _binder.Unify(Types.Substitute(pick.Method.Parameters[0].Type, owner.TypeParameters.Zip(arguments).ToDictionary(p => p.First, p => p.Second)), self.Type);
+            target = FunctionReference(pick.Method, member, arguments, member.GenericArguments);
+        }
+        else
+        {
+            TraitSymbol trait = pick.Method.Trait!;
+            InferenceTypeSymbol selfType = _binder.Fresh(member);
+            ImmutableArray<TypeSymbol> arguments = trait.TypeParameters.Select(_ => (TypeSymbol)_binder.Fresh(member)).ToImmutableArray();
+            Dictionary<TypeParameterSymbol, TypeSymbol> substitution = Binder.Substitution(new TraitReference(trait, selfType, arguments));
+            _binder.Unify(Types.Substitute(pick.Method.Parameters[0].Type, substitution), self.Type);
+            target = TraitMethodReference(pick.Method, selfType, arguments, member.GenericArguments, member);
+        }
+        Record(member, target);
+        var signature = (FunctionTypeSymbol)target.Type;
+        receiverArgument = Coerce(self, signature.ParameterTypes[0], receiverSyntax);
+        return target;
+    }
+    private bool InherentApplies(FunctionSymbol method, ImplSymbol impl, TypeSymbol adjusted)
+    {
+        Dictionary<TypeParameterSymbol, TypeSymbol> substitution = Binder.Instantiate(impl, _binder.Probing);
+        if (!_binder.Unify(Types.Substitute(method.Parameters[0].Type, substitution), adjusted)) return false;
+        return impl.Predicates.All(p => _binder.Evaluate(Types.Substitute(p, substitution), _environment) != Evaluation.Fails);
+    }
+    private bool TraitApplies(FunctionSymbol method, TypeSymbol adjusted)
+    {
+        TraitSymbol trait = method.Trait!;
+        var reference = new TraitReference(trait, new InferenceTypeSymbol(InferenceKind.Any, method.Declaration), trait.TypeParameters.Select(_binder.Probing).ToImmutableArray());
+        if (!_binder.Unify(Types.Substitute(method.Parameters[0].Type, Binder.Substitution(reference)), adjusted)) return false;
+        return _binder.Evaluate(new TraitPredicate(reference), _environment) != Evaluation.Fails;
+    }
     private BoundExpression AutoDeref(BoundExpression expression)
     {
         while (expression.Type is IndirectTypeSymbol { Kind: TypeKind.Reference } reference)
@@ -1514,14 +2973,20 @@ internal sealed class BodyBinder
         string name = Binder.Name(syntax.Member);
         if (syntax.GenericArguments is not null) Error(syntax, "Field access cannot take generic arguments.");
         if (receiver.Type is TupleTypeSymbol tuple && int.TryParse(name, NumberStyles.None, CultureInfo.InvariantCulture, out int index) && index < tuple.Elements.Length)
-            return new BoundFieldExpression(syntax, tuple.Elements[index], receiver, null, index, receiver.ValueCategory);
+            return Folded(new BoundFieldExpression(syntax, tuple.Elements[index], receiver, null, index, receiver.ValueCategory), receiver);
         if (receiver.Type is NamedTypeSymbol { Kind: TypeKind.Struct } named && named.Definition.Fields.FirstOrDefault(f => f.Name == name) is FieldSymbol field)
         {
             if (!_binder.IsAccessible(field, Binder.ModuleOf(_scope))) Error(syntax, $"Field '{name}' is private.");
             _binder.RecordSymbol(_tree, syntax, field);
-            return new BoundFieldExpression(syntax, Types.FieldType(field, named), receiver, field, field.Ordinal, receiver.ValueCategory);
+            return Folded(new BoundFieldExpression(syntax, Normalize(Types.FieldType(field, named), syntax), receiver, field, field.Ordinal, receiver.ValueCategory), receiver);
         }
         return Bad(syntax, receiver.Type.IsError ? null : $"No field '{name}' on '{receiver.Type}'.", [receiver]);
+    }
+    // Fields and constant elements of constants fold to the value that initialized them
+    private BoundExpression Folded(BoundExpression access, BoundExpression receiver)
+    {
+        if (Binder.IsConstant(receiver, initializer: true)) access.ConstantValue = _binder.Reduce(access)?.ConstantValue ?? default;
+        return access;
     }
     private BoundExpression Index(IndexExpressionSyntax syntax, bool place)
     {
@@ -1530,7 +2995,7 @@ internal sealed class BodyBinder
         if (receiver.Type is not SequenceTypeSymbol { Kind: TypeKind.Array or TypeKind.Slice } sequence)
             return Bad(syntax, receiver.Type.IsError ? null : $"Cannot index '{receiver.Type}' without trait resolution.", [receiver, index]);
         if (sequence.Length is ulong length && index.ConstantValue.Value is BigInteger n && (n < 0 || n >= length)) Error(syntax, "Constant index is outside the array.");
-        return new BoundIndexExpression(syntax, sequence.ElementType, receiver, index, receiver.ValueCategory);
+        return Folded(new BoundIndexExpression(syntax, sequence.ElementType, receiver, index, receiver.ValueCategory), receiver);
     }
     private BoundExpression Construct(StructExpressionSyntax syntax, TypeSymbol? expected)
     {
@@ -1550,12 +3015,12 @@ internal sealed class BodyBinder
             FieldSymbol? field = fields.FirstOrDefault(f => f.Name == name);
             if (field is null) { Error(fieldSyntax, $"Unknown field '{name}'."); if (fieldSyntax.Value is not null) Expression(fieldSyntax.Value); continue; }
             if (!_binder.IsAccessible(field, Binder.ModuleOf(_scope))) Error(fieldSyntax, $"Field '{name}' is private.");
-            TypeSymbol fieldType = Types.FieldType(field, type);
+            TypeSymbol fieldType = Normalize(Types.FieldType(field, type), fieldSyntax);
             BoundExpression value;
             if (fieldSyntax.Value is not null) value = Expression(fieldSyntax.Value, fieldType);
             else
             {
-                ImmutableArray<Symbol> candidates = _scope.Find(name, SymbolNamespace.Value, fieldSyntax.Span.Start);
+                ImmutableArray<Symbol> candidates = FindValue(fieldSyntax.Identifier, fieldSyntax.Span.Start);
                 value = candidates.Length == 1 ? Coerce(Value(Binder.Unwrap(candidates[0]), fieldSyntax), fieldType, fieldSyntax)
                     : Bad(fieldSyntax, $"Cannot resolve shorthand field value '{name}'.");
             }
@@ -1586,51 +3051,13 @@ internal sealed class BodyBinder
         if (labelToken.Kind != SyntaxKind.None)
         {
             var label = new LabelSymbol(Binder.Name(labelToken), _scope.Owner, syntax, _tree, false);
-            context = new LoopContext(label, expected ?? _binder.Fresh(syntax), true, VariablesInScope());
+            context = new LoopContext(label, MacroExpander.Key(labelToken), expected ?? _binder.Fresh(syntax), true, VariablesInScope());
             _loops.Add(context); Data.Declarations[syntax] = label; _scope.Add(label.Name, SymbolNamespace.Label, label);
         }
         var statements = ImmutableArray.CreateBuilder<BoundStatement>();
-        foreach (StatementSyntax statement in syntax.Statements)
-        {
-            BoundStatement bound;
-            switch (statement)
-            {
-                case LetStatementSyntax let:
-                {
-                    TypeSymbol type = let.Type is null ? _binder.Fresh(let.Pattern ?? (SyntaxNode)let) : _binder.BindType(let.Type, _scope, _tree, true);
-                    BoundExpression? initializer = let.Initializer?.Value is ExpressionSyntax value ? Expression(value, type) : null;
-                    FlowState afterInitializer = Save();
-                    BoundBlockExpression? otherwise = let.Else is null ? null : Block(let.Else);
-                    if (otherwise is not null && otherwise.Type.Kind != TypeKind.Never && !otherwise.HasErrors) Error(let.Else ?? (SyntaxNode)let, "The else branch of let must diverge.");
-                    Restore(afterInitializer);
-                    var names = new HashSet<string>(StringComparer.Ordinal);
-                    BoundPattern pattern = Pattern(let.Pattern, type, let, let.Span.End, names);
-                    if (!pattern.IsIrrefutable && otherwise is null) Error(let, "Refutable pattern requires let-else, if-let or match.");
-                    if (initializer is null)
-                    {
-                        if (otherwise is not null) Error(let, "Let-else requires an initializer.");
-                        foreach (VariableSymbol variable in PatternVariables(pattern)) { _initialized.Remove(variable); _assigned.Remove(variable); }
-                    }
-                    CheckMutablePattern(pattern, initializer);
-                    bound = new BoundLetStatement(let, pattern, initializer, otherwise);
-                    break;
-                }
-                case ExpressionStatementSyntax expression:
-                {
-                    BoundExpression value = Expression(expression.Expression);
-                    if (expression.Semicolon.Kind == SyntaxKind.None && value.Type.Kind != TypeKind.Never) value = Coerce(value, Types.Unit, expression.Expression ?? (SyntaxNode)expression);
-                    bound = new BoundExpressionStatement(statement, value);
-                    break;
-                }
-                case EmptyStatementSyntax: bound = new BoundExpressionStatement(statement, null); break;
-                default:
-                    _binder.Unsupported(_tree, statement, "Block-local items");
-                    bound = new BoundExpressionStatement(statement, Bad(statement));
-                    break;
-            }
-            statements.Add(Record(statement, bound));
-        }
-        BoundExpression? tail = syntax.TailExpression is null ? null : Expression(syntax.TailExpression, expected ?? context?.Type);
+        MacroScope? macros = _macros;
+        foreach (StatementSyntax statement in syntax.Statements) Statement(statement, statements);
+        BoundExpression? tail = syntax.TailExpression is null ? null : Tail(syntax.TailExpression, statements, expected ?? context?.Type);
         TypeSymbol result = !_reachable ? Types.Never : tail?.Type ?? Types.Unit;
         if (expected is not null && tail is null && _reachable && !_binder.Unify(Types.Unit, expected)) Error(syntax, $"Expected '{expected}', found '()'.");
         if (context is not null)
@@ -1645,8 +3072,90 @@ internal sealed class BodyBinder
             result = context.Breaks.Count == 0 ? Types.Never : context.Type;
         }
         ImmutableArray<LocalSymbol> locals = _scope.Entries.Select(e => e.Symbol).OfType<LocalSymbol>().Distinct().ToImmutableArray();
-        _scope = previous; _unsafe = wasUnsafe;
+        _scope = previous; _unsafe = wasUnsafe; _macros = macros;
         return Record(syntax, new BoundBlockExpression(syntax, result, statements.ToImmutable(), tail, locals, context?.Label));
+    }
+    private void Statement(StatementSyntax statement, ImmutableArray<BoundStatement>.Builder statements)
+    {
+        BoundStatement bound;
+        switch (statement)
+        {
+            case LetStatementSyntax let:
+            {
+                TypeSymbol type = let.Type is null ? _binder.Fresh(let.Pattern ?? (SyntaxNode)let) : Normalize(_binder.BindType(let.Type, _scope, _tree, true), let.Type);
+                BoundExpression? initializer = let.Initializer?.Value is ExpressionSyntax value ? Expression(value, type) : null;
+                FlowState afterInitializer = Save();
+                BoundBlockExpression? otherwise = let.Else is null ? null : Block(let.Else);
+                if (otherwise is not null && otherwise.Type.Kind != TypeKind.Never && !otherwise.HasErrors) Error(let.Else ?? (SyntaxNode)let, "The else branch of let must diverge.");
+                Restore(afterInitializer);
+                var names = new HashSet<string>(StringComparer.Ordinal);
+                BoundPattern pattern = Pattern(let.Pattern, type, let, let.Span.End, names);
+                if (!pattern.IsIrrefutable && otherwise is null) Error(let, "Refutable pattern requires let-else, if-let or match.");
+                if (initializer is null)
+                {
+                    if (otherwise is not null) Error(let, "Let-else requires an initializer.");
+                    foreach (VariableSymbol variable in PatternVariables(pattern)) { _initialized.Remove(variable); _assigned.Remove(variable); }
+                }
+                CheckMutablePattern(pattern, initializer);
+                bound = new BoundLetStatement(let, pattern, initializer, otherwise);
+                break;
+            }
+            case ExpressionStatementSyntax expression:
+            {
+                if (expression.Expression is MacroExpressionSyntax macro)
+                {
+                    if (ExpandStatements(macro) is BlockExpressionSyntax expansion) MacroStatements(expansion, statements, expression.Semicolon.Kind != SyntaxKind.None);
+                    else statements.Add(Record(statement, new BoundExpressionStatement(statement, Bad(macro))));
+                    return;
+                }
+                BoundExpression value = Expression(expression.Expression);
+                if (expression.Semicolon.Kind == SyntaxKind.None && value.Type.Kind != TypeKind.Never) value = Coerce(value, Types.Unit, expression.Expression ?? (SyntaxNode)expression);
+                bound = new BoundExpressionStatement(statement, value);
+                break;
+            }
+            case EmptyStatementSyntax: bound = new BoundExpressionStatement(statement, null); break;
+            case ItemStatementSyntax { Item: MacroDefinitionItemSyntax definition }:
+                _macros = _binder.DefineMacro(definition, _tree, _macros);
+                return;
+            default:
+                _binder.Unsupported(_tree, statement, "Block-local items");
+                bound = new BoundExpressionStatement(statement, Bad(statement));
+                break;
+        }
+        statements.Add(Record(statement, bound));
+    }
+    private BlockExpressionSyntax? ExpandStatements(MacroExpressionSyntax macro) => _binder.ExpandStatements(macro, _macros, _tree, Binder.ModuleOf(_scope));
+    private void MacroStatements(BlockExpressionSyntax expansion, ImmutableArray<BoundStatement>.Builder statements, bool semicolon)
+    {
+        _binder.ExpansionDepth++;
+        try
+        {
+            foreach (StatementSyntax statement in expansion.Statements) Statement(statement, statements);
+            if (expansion.TailExpression is not ExpressionSyntax tail) return;
+            BoundExpression value = Expression(tail);
+            if (!semicolon && value.Type.Kind != TypeKind.Never) value = Coerce(value, Types.Unit, tail);
+            statements.Add(new BoundExpressionStatement(tail, value));
+        }
+        finally { _binder.ExpansionDepth--; }
+    }
+    private BoundExpression? Tail(ExpressionSyntax syntax, ImmutableArray<BoundStatement>.Builder statements, TypeSymbol? expected)
+    {
+        if (syntax is not MacroExpressionSyntax macro) return Expression(syntax, expected);
+        if (ExpandStatements(macro) is not BlockExpressionSyntax expansion) return Bad(macro);
+        _binder.ExpansionDepth++;
+        try
+        {
+            foreach (StatementSyntax statement in expansion.Statements) Statement(statement, statements);
+            return expansion.TailExpression is null ? null : Tail(expansion.TailExpression, statements, expected);
+        }
+        finally { _binder.ExpansionDepth--; }
+    }
+    private BoundExpression MacroExpression(MacroExpressionSyntax syntax, TypeSymbol? expected, bool place)
+    {
+        if (_binder.ExpandExpression(syntax, _macros, _tree, Binder.ModuleOf(_scope)) is not ExpressionSyntax expansion) return Bad(syntax);
+        _binder.ExpansionDepth++;
+        try { return Expression(expansion, expected, place); }
+        finally { _binder.ExpansionDepth--; }
     }
     private BoundExpression Condition(ExpressionSyntax? syntax, out FlowState whenFalse)
     {
@@ -1707,7 +3216,8 @@ internal sealed class BodyBinder
         bool isWhile = Binder.Has(syntax, SyntaxKind.WhileKeyword);
         string name = Binder.Name(syntax.Label);
         var label = new LabelSymbol(name, _scope.Owner, syntax, _tree, true);
-        var context = new LoopContext(label, isFor || isWhile ? Types.Unit : expected ?? _binder.Fresh(syntax), !isFor && !isWhile, VariablesInScope());
+        string key = name.Length == 0 ? "" : MacroExpander.Key(syntax.Label);
+        var context = new LoopContext(label, key, isFor || isWhile ? Types.Unit : expected ?? _binder.Fresh(syntax), !isFor && !isWhile, VariablesInScope());
         FlowState before = Save();
         BindingScope previous = Enter(syntax);
         if (name.Length != 0) _scope.Add(name, SymbolNamespace.Label, label);
@@ -1767,7 +3277,8 @@ internal sealed class BodyBinder
         bool isContinue = keyword == SyntaxKind.ContinueKeyword;
         if (!isContinue && keyword != SyntaxKind.BreakKeyword) return Unsupported(syntax);
         string name = Binder.Name(syntax.Label);
-        LoopContext? context = name.Length == 0 ? _loops.LastOrDefault(l => l.Label.IsLoop) : _loops.LastOrDefault(l => l.Label.Name == name);
+        string key = name.Length == 0 ? "" : MacroExpander.Key(syntax.Label);
+        LoopContext? context = name.Length == 0 ? _loops.LastOrDefault(l => l.Label.IsLoop) : _loops.LastOrDefault(l => l.Key == key);
         if (context is null) return Bad(syntax, name.Length == 0 ? "No enclosing loop." : $"Unknown label '{name}'.");
         if (isContinue && !context.Label.IsLoop) Error(syntax, "Continue must target a loop.");
         if (name.Length != 0) _binder.RecordSymbol(_tree, syntax, context.Label);
@@ -1792,10 +3303,13 @@ internal sealed class BodyBinder
         return new BoundRangeExpression(syntax, new SequenceTypeSymbol(TypeKind.Range, element, rangeForm: form), start, end, inclusive);
     }
 
-    private void AddVariable(VariableSymbol symbol, int visibleFrom, HashSet<string> names, SyntaxNode syntax)
+    private void AddVariable(VariableSymbol symbol, int visibleFrom, HashSet<string> names, SyntaxNode syntax, SyntaxToken name)
     {
-        if (!names.Add(symbol.Name)) Error(syntax, $"'{symbol.Name}' is bound more than once in the pattern.");
-        _scope.Add(symbol.Name, SymbolNamespace.Value, symbol, visibleFrom);
+        // Expanded tokens share the invocation span, so their bindings become visible in binding order
+        if (name.Text is not null) visibleFrom = 0;
+        string key = MacroExpander.Key(name);
+        if (!names.Add(key)) Error(syntax, $"'{symbol.Name}' is bound more than once in the pattern.");
+        _scope.Add(key, SymbolNamespace.Value, symbol, visibleFrom);
         _initialized.Add(symbol); _assigned.Add(symbol);
         Data.Declarations[syntax] = symbol;
         if (symbol is LocalSymbol) _binder.CheckLater(() =>
@@ -1822,6 +3336,14 @@ internal sealed class BodyBinder
     }
     private BoundPattern BindPattern(PatternSyntax syntax, TypeSymbol input, int visibleFrom, HashSet<string> names, ParameterSymbol? parameter, BindingMode mode)
     {
+        if (syntax is MacroPatternSyntax macro)
+        {
+            PatternSyntax? expansion = macro.Invocation is MacroExpressionSyntax invocation ? _binder.ExpandPattern(invocation, _macros, _tree, Binder.ModuleOf(_scope)) : null;
+            if (expansion is null) return new BoundPattern(syntax, input, BoundPatternKind.Error);
+            _binder.ExpansionDepth++;
+            try { return Pattern(expansion, input, syntax, visibleFrom, names, parameter, mode); }
+            finally { _binder.ExpansionDepth--; }
+        }
         if (syntax is not (IdentifierPatternSyntax or ReferencePatternSyntax or WildcardPatternSyntax) && input is IndirectTypeSymbol { Kind: TypeKind.Reference } reference)
         {
             BindingMode inherited = mode == BindingMode.Reference || !reference.IsMutable ? BindingMode.Reference : BindingMode.MutableReference;
@@ -1849,7 +3371,7 @@ internal sealed class BodyBinder
                 VariableSymbol variable = parameter is not null && bindingMode == BindingMode.Value ? parameter
                     : new LocalSymbol(name, _scope.Owner, syntax, _tree, type, !byRef && mutable);
                 if (variable is ParameterSymbol) variable.IsMutable = mutable;
-                AddVariable(variable, visibleFrom, names, syntax);
+                AddVariable(variable, visibleFrom, names, syntax, identifier.Identifier);
                 BoundPattern? subpattern = identifier.Subpattern is null ? null : Pattern(identifier.Subpattern, input, syntax, visibleFrom, names, mode: mode);
                 return new BoundPattern(syntax, input, BoundPatternKind.Binding, subpattern is null ? [] : [subpattern], variable, mode: bindingMode, irrefutable: subpattern?.IsIrrefutable ?? true);
             }
@@ -1984,9 +3506,10 @@ internal sealed class BodyBinder
     {
         if (symbol is GlobalSymbol { Kind: SymbolKind.Constant } constant)
         {
-            _binder.BindGlobal(constant);
+            BoundExpression? initializer = _binder.Initializer(constant);
             BoundExpression value = Coerce(Value(constant, syntax), input, syntax);
             _binder.RecordSymbol(_tree, syntax, constant);
+            if (!value.ConstantValue.HasValue && !value.HasErrors && initializer is not null) return Destructure(initializer, input, syntax);
             return new BoundPattern(syntax, input, BoundPatternKind.Literal, matched: constant, value: value);
         }
         AggregateSymbol? aggregate = symbol switch { AggregateSymbol { Shape: AggregateShape.Unit } a => a, VariantSymbol { Shape: AggregateShape.Unit } v => v.Enum, _ => null };
@@ -1995,6 +3518,31 @@ internal sealed class BodyBinder
         if (!_binder.Unify(input, type)) Error(syntax, $"Pattern type '{type}' does not match '{input}'.");
         _binder.RecordSymbol(_tree, syntax, symbol);
         return new BoundPattern(syntax, input, BoundPatternKind.Aggregate, matched: symbol, irrefutable: aggregate.TypeKind == TypeKind.Struct || aggregate.Variants.Length == 1);
+    }
+    // Constants without a scalar value match by their structure, as rustc turns them into patterns
+    private BoundPattern Destructure(BoundExpression value, TypeSymbol input, SyntaxNode syntax)
+    {
+        switch (value)
+        {
+            case BoundExpression { ConstantValue.HasValue: true }: return new BoundPattern(syntax, input, BoundPatternKind.Literal, value: value);
+            case BoundVariableExpression { Variable: GlobalSymbol { Kind: SymbolKind.Constant } constant } when _binder.Initializer(constant) is BoundExpression initializer:
+                return Destructure(initializer, input, syntax);
+            case BoundConversionExpression { Conversion: ConversionKind.Identity } conversion: return Destructure(conversion.Operand, input, syntax);
+            case BoundTupleExpression tuple:
+                ImmutableArray<BoundPattern> elements = tuple.Elements.Select(e => Destructure(e, e.Type, syntax)).ToImmutableArray();
+                return new BoundPattern(syntax, input, BoundPatternKind.Tuple, elements, irrefutable: elements.All(p => p.IsIrrefutable));
+            case BoundConstructionExpression { Base: null } construction:
+                ImmutableArray<BoundPattern> fields = construction.Fields.Select(f => Destructure(f.Value, f.Value.Type, syntax)).ToImmutableArray();
+                AggregateSymbol definition = ((NamedTypeSymbol)construction.Type).Definition;
+                return new BoundPattern(syntax, input, BoundPatternKind.Aggregate, fields, matched: (Symbol?)construction.Variant ?? definition, fields: construction.Fields.Select(f => f.Field).ToImmutableArray(),
+                    irrefutable: (definition.TypeKind == TypeKind.Struct || definition.Variants.Length == 1) && fields.All(p => p.IsIrrefutable));
+            case BoundUnaryExpression { Operator: SyntaxKind.AmpersandToken } borrow:
+                BoundPattern referenced = Destructure(borrow.Operand, borrow.Operand.Type, syntax);
+                return new BoundPattern(syntax, input, BoundPatternKind.Reference, [referenced], irrefutable: referenced.IsIrrefutable);
+            default:
+                _binder.Unsupported(_tree, syntax, "Constant patterns of this type");
+                return new BoundPattern(syntax, input, BoundPatternKind.Error);
+        }
     }
     private BoundPattern AggregatePattern(PathSyntax? path, PatternSyntax syntax, TypeSymbol input, PatternSyntax[]? elements, StructPatternFieldSyntax[]? namedFields,
         int visibleFrom, HashSet<string> names, BindingMode mode)
@@ -2064,18 +3612,93 @@ internal sealed class BodyBinder
         var match = new BoundMatchExpression(syntax, result ?? Types.Never, scrutinee, arms.ToImmutable());
         _binder.CheckLater(() =>
         {
-            IEnumerable<BoundPattern> alternatives = arms.Where(a => a.Guard is null).SelectMany(a => Alternatives(a.Pattern)).ToArray();
-            TypeSymbol type = scrutinee.Type;
-            while (type is IndirectTypeSymbol { Kind: TypeKind.Reference } reference) type = reference.ElementType.Resolve();
-            bool exhaustive = alternatives.Any(p => p.IsIrrefutable);
-            if (!exhaustive && type.Kind == TypeKind.Boolean)
-                exhaustive = alternatives.Any(p => p.Value?.ConstantValue.Value is true) && alternatives.Any(p => p.Value?.ConstantValue.Value is false);
-            if (!exhaustive && type is NamedTypeSymbol { Kind: TypeKind.Enum } named)
-                exhaustive = named.Definition.Variants.All(v => alternatives.Any(p => ReferenceEquals(p.MatchedSymbol, v) && p.Subpatterns.All(s => s.IsIrrefutable)));
-            if (!exhaustive && !type.IsError) { Error(syntax, "Match is not exhaustive; add the missing cases or a wildcard arm."); match.OwnErrors = true; }
+            List<BoundPattern?[]> rows = arms.Where(a => a.Guard is null).Select(a => new BoundPattern?[] { a.Pattern }).ToList();
+            if (!scrutinee.Type.IsError && Useful(rows, [scrutinee.Type]))
+            { Error(syntax, "Match is not exhaustive; add the missing cases or a wildcard arm."); match.OwnErrors = true; }
         });
         return match;
     }
-    private static IEnumerable<BoundPattern> Alternatives(BoundPattern pattern)
-        => pattern.PatternKind is BoundPatternKind.Or or BoundPatternKind.Reference ? pattern.Subpatterns.SelectMany(Alternatives) : new[] { pattern };
+    // A match is exhaustive when a wildcard is useless after its unguarded arms (Maranget, "Warnings for pattern matching", 2007)
+    private bool Useful(List<BoundPattern?[]> rows, TypeSymbol[] types)
+    {
+        while (types.Length != 0)
+        {
+            rows = rows.SelectMany(Expand).ToList();
+            TypeSymbol type = types[0].Resolve();
+            TypeSymbol[] rest = types[1..];
+            BoundPattern[] heads = rows.Select(r => r[0]).OfType<BoundPattern>().ToArray();
+            if (Constructors(type, heads) is List<(object Key, TypeSymbol[] Fields)> constructors && constructors.All(c => heads.Any(h => Covers(h, c.Key, type))))
+                return constructors.Any(c => Useful(Specialize(rows, c.Key, type, c.Fields.Length), [.. c.Fields, .. rest]));
+            rows = rows.Where(r => r[0] is null).Select(r => r[1..]).ToList();
+            types = rest;
+        }
+        return rows.Count == 0;
+    }
+    private static IEnumerable<BoundPattern?[]> Expand(BoundPattern?[] row)
+    {
+        BoundPattern? head = row[0];
+        while (head is BoundPattern { PatternKind: BoundPatternKind.Binding } binding) head = binding.Subpatterns.FirstOrDefault();
+        if (head?.PatternKind is BoundPatternKind.Wildcard or BoundPatternKind.Rest or BoundPatternKind.Error) head = null;
+        if (head?.PatternKind != BoundPatternKind.Or) return [[head, .. row[1..]]];
+        return head.Subpatterns.SelectMany(alternative => Expand([alternative, .. row[1..]]));
+    }
+    private static readonly object SingleConstructor = new();
+    // Slices longer than every fixed pattern and every prefix plus suffix match alike, and arrays need columns only for the elements patterns name
+    private List<(object Key, TypeSymbol[] Fields)>? Constructors(TypeSymbol type, BoundPattern[] heads)
+    {
+        BoundPattern[] slices = heads.Where(h => h.PatternKind == BoundPatternKind.Slice).ToArray();
+        int longest = slices.Where(h => Rest(h) < 0).Select(h => h.Subpatterns.Length).DefaultIfEmpty(-1).Max();
+        int ends = slices.Select(Rest).Where(r => r >= 0).DefaultIfEmpty(0).Max() + slices.Where(h => Rest(h) >= 0).Select(h => h.Subpatterns.Length - 1 - Rest(h)).DefaultIfEmpty(0).Max();
+        return type switch
+        {
+            { Kind: TypeKind.Boolean } => [(true, []), (false, [])],
+            { Kind: TypeKind.Never } => [],
+            NamedTypeSymbol { Kind: TypeKind.Enum } named => named.Definition.Variants.Select(v => ((object)v, v.Fields.Select(f => Types.FieldType(f, named)).ToArray())).ToList(),
+            NamedTypeSymbol { Kind: TypeKind.Struct } named => [(SingleConstructor, named.Definition.Fields.Select(f => Types.FieldType(f, named)).ToArray())],
+            TupleTypeSymbol tuple => [(SingleConstructor, tuple.Elements.ToArray())],
+            IndirectTypeSymbol { Kind: TypeKind.Reference } reference => [(SingleConstructor, [reference.ElementType])],
+            SequenceTypeSymbol { Kind: TypeKind.Array, Length: ulong length } array =>
+                [(SingleConstructor, Enumerable.Repeat(array.ElementType, (int)Math.Min(length, (ulong)Math.Max(longest, ends))).ToArray())],
+            SequenceTypeSymbol { Kind: TypeKind.Slice } slice => Enumerable.Range(0, Math.Max(longest + 1, ends) + 1).Select(n => ((object)n, Enumerable.Repeat(slice.ElementType, n).ToArray())).ToList(),
+            _ => null
+        };
+    }
+    private static int Rest(BoundPattern slice) => slice.Subpatterns.Select((s, i) => s.PatternKind == BoundPatternKind.Rest ? i : -1).DefaultIfEmpty(-1).Max();
+    private static bool Covers(BoundPattern head, object constructor, TypeSymbol type)
+    {
+        if (constructor == SingleConstructor) return true;
+        if (constructor is int length) return head.PatternKind == BoundPatternKind.Slice && (Rest(head) >= 0 ? head.Subpatterns.Length - 1 <= length : head.Subpatterns.Length == length);
+        object? key = head.MatchedSymbol as VariantSymbol ?? head.Value?.ConstantValue.Value switch
+        {
+            BigInteger discriminant when type is NamedTypeSymbol { Kind: TypeKind.Enum } named => named.Definition.Variants.FirstOrDefault(v => v.Discriminant == discriminant),
+            var value => value
+        };
+        return constructor.Equals(key);
+    }
+    private static List<BoundPattern?[]> Specialize(List<BoundPattern?[]> rows, object constructor, TypeSymbol type, int arity)
+    {
+        var result = new List<BoundPattern?[]>();
+        foreach (BoundPattern?[] row in rows)
+        {
+            if (row[0] is not BoundPattern head) result.Add([.. new BoundPattern?[arity], .. row[1..]]);
+            else if (Covers(head, constructor, type)) result.Add([.. Fields(head, type, arity), .. row[1..]]);
+        }
+        return result;
+    }
+    // A reference column also takes patterns that match through the reference, as slice patterns on slice references do
+    private static BoundPattern?[] Fields(BoundPattern head, TypeSymbol type, int arity)
+    {
+        var fields = new BoundPattern?[arity];
+        void Set(int index, BoundPattern pattern) { if ((uint)index < (uint)arity) fields[index] = pattern; }
+        if (type is IndirectTypeSymbol) Set(0, head.PatternKind == BoundPatternKind.Reference ? head.Subpatterns[0] : head);
+        else if (head.PatternKind == BoundPatternKind.Aggregate)
+            foreach (var (field, pattern) in head.Fields.Zip(head.Subpatterns)) Set(field.Ordinal, pattern);
+        else if (head.PatternKind == BoundPatternKind.Tuple)
+            for (int i = 0; i < head.Subpatterns.Length; i++) Set(head.Subpatterns[i].InputIndex >= 0 ? head.Subpatterns[i].InputIndex : i, head.Subpatterns[i]);
+        else if (head.PatternKind == BoundPatternKind.Slice)
+            for (int i = 0, index = 0; i < head.Subpatterns.Length; i++)
+                if (head.Subpatterns[i].PatternKind == BoundPatternKind.Rest) index = arity - (head.Subpatterns.Length - i - 1);
+                else Set(index++, head.Subpatterns[i]);
+        return fields;
+    }
 }

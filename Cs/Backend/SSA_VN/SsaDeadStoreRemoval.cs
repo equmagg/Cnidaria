@@ -161,7 +161,7 @@ namespace Cnidaria.Cs
 
         private static bool IsAsyncStateMachineMoveNext(RuntimeMethod method)
         {
-            if (!StringComparer.Ordinal.Equals(method.Name, "MoveNext"))
+            if (method.Name != "MoveNext")
                 return false;
 
             for (RuntimeType? type = method.DeclaringType; type is not null; type = type.BaseType)
@@ -170,8 +170,8 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < interfaces.Length; i++)
                 {
                     var candidate = interfaces[i];
-                    if (StringComparer.Ordinal.Equals(candidate.Namespace, "System.Runtime.CompilerServices") &&
-                        StringComparer.Ordinal.Equals(candidate.Name, "IAsyncStateMachine"))
+                    if (candidate.Namespace == "System.Runtime.CompilerServices" &&
+                        candidate.Name == "IAsyncStateMachine")
                     {
                         return true;
                     }

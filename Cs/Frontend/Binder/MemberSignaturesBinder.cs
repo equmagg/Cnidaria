@@ -357,7 +357,7 @@ namespace Cnidaria.Cs
             var members = type.GetMembers();
             for (int i = 0; i < members.Length; i++)
             {
-                if (members[i] is SourceMethodSymbol m && StringComparer.Ordinal.Equals(m.Name, name))
+                if (members[i] is SourceMethodSymbol m && m.Name == name)
                     return m;
             }
 

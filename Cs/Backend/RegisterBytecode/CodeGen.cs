@@ -80,8 +80,8 @@ namespace Cnidaria.Cs
             }
 
             static bool IsVoidType(RuntimeType type)
-                => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
-                   StringComparer.Ordinal.Equals(type.Name, "Void");
+                => type.Namespace == "System" &&
+                   type.Name == "Void";
         }
 
         private readonly struct DelegateTargetThunkKey : IEquatable<DelegateTargetThunkKey>
@@ -213,7 +213,7 @@ namespace Cnidaria.Cs
                     for (int i = 0; i < methods.Length; i++)
                     {
                         RuntimeMethod method = methods[i];
-                        if (StringComparer.Ordinal.Equals(method.Name, "Invoke"))
+                        if (method.Name == "Invoke")
                             return method;
                     }
                 }
@@ -722,11 +722,11 @@ namespace Cnidaria.Cs
 
             private static bool RequiresTypeInitializationBeforeCall(RuntimeMethod target)
             {
-                if (StringComparer.Ordinal.Equals(target.Name, ".cctor"))
+                if (target.Name == ".cctor")
                     return false;
                 if (target.IsStatic)
                     return true;
-                return target.DeclaringType.IsValueType && StringComparer.Ordinal.Equals(target.Name, ".ctor");
+                return target.DeclaringType.IsValueType && target.Name == ".ctor";
             }
 
             private static RuntimeType GetLogicalArgumentType(RuntimeMethod method, int logicalIndex)
@@ -1008,8 +1008,10 @@ namespace Cnidaria.Cs
                         break;
                 }
 
+                // Operands may be set up before the safepoint instruction, and the runtime finds a safepoint by its exact pc
                 if (_options.EmitGcInfo && ShouldEmitGcReportPoint(instruction))
-                    EmitGcSafePoint(pc, instruction);
+                    for (int at = pc; at < Math.Max(_asm.Pc, pc + 1); at++)
+                        EmitGcSafePoint(at, instruction);
 
             }
 
@@ -1201,7 +1203,6 @@ namespace Cnidaria.Cs
                     case GenTreeKind.IndirectCall:
                     case GenTreeKind.VirtualCall:
                     case GenTreeKind.DelegateInvoke:
-                    case GenTreeKind.NewObject:
                         EmitCallLike(instruction, source);
                         return;
                     case GenTreeKind.NewDelegate:
@@ -1212,6 +1213,9 @@ namespace Cnidaria.Cs
                         return;
                     case GenTreeKind.DelegateRemove:
                         EmitDelegateBinary(instruction, Op.DelegateRemove);
+                        return;
+                    case GenTreeKind.AllocObject:
+                        _asm.AllocObj(RequireResultRegister(instruction), source.RuntimeType ?? throw Unsupported(instruction, "object allocation node without runtime type"));
                         return;
                     case GenTreeKind.NewArray:
                         _asm.NewSZArray(RequireResultRegister(instruction), RequireUseRegister(instruction, 0), _asm.InternTypeLayout(source.Type ?? throw Unsupported(instruction, "new array node without array runtime type")));
@@ -2533,127 +2537,13 @@ namespace Cnidaria.Cs
 
             private static bool RequiresTypeInitializationBeforeCall(RuntimeMethod target)
             {
-                if (StringComparer.Ordinal.Equals(target.Name, ".cctor"))
+                if (target.Name == ".cctor")
                     return false;
 
                 if (target.IsStatic)
                     return true;
 
-                return target.DeclaringType.IsValueType && StringComparer.Ordinal.Equals(target.Name, ".ctor");
-            }
-
-            private void EmitReferenceTypeNewObjectThisArgument(MachineRegister obj, RuntimeMethod constructor)
-            {
-                int generalIndex = 0;
-                int floatIndex = 0;
-                int outgoingIndex = 0;
-                var location = MachineAbi.AssignScalarArgumentLocation(RegisterClass.General, TargetArchitecture.PointerSize, ref generalIndex, ref floatIndex, ref outgoingIndex);
-                if (location.IsRegister)
-                {
-                    _asm.MovRef(location.Register, obj);
-                    return;
-                }
-
-                if (!_method.StackFrame.TryGetOutgoingArgumentSlot(location.StackSlotIndex, out var slot))
-                    throw new InvalidOperationException($"Reference newobj requires outgoing stack slot {location.StackSlotIndex} for this pointer, but the slot was not allocated.");
-
-                var destination = RegisterOperand.ForFrameSlot(
-                    RegisterClass.General,
-                    StackFrameSlotKind.OutgoingArgument,
-                    RegisterFrameBase.StackPointer,
-                    slot.Index,
-                    checked(slot.Offset + location.StackOffset),
-                    TargetArchitecture.PointerSize);
-                EmitStore(destination, obj, constructor.DeclaringType, GenStackKind.Ref);
-            }
-
-            private void EmitReferenceNewObjectAllocation(GenTree instruction, RuntimeMethod constructor, MachineRegister obj)
-            {
-                if (!IsSystemStringType(constructor.DeclaringType))
-                {
-                    _asm.AllocObj(obj, constructor.DeclaringType);
-                    return;
-                }
-
-                var length = MachineRegisters.ParallelCopyScratch1;
-                EmitStringConstructorLength(instruction, constructor, length);
-                _asm.Emit(new InstrDesc(
-                    Op.FastAllocateString,
-                    RegisterVmIsa.EncodeRegister(obj),
-                    RegisterVmIsa.EncodeRegister(length),
-                    aux: Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow | InstructionFlags.WriteBarrier)));
-            }
-
-            private void EmitStringConstructorLength(GenTree instruction, RuntimeMethod constructor, MachineRegister length)
-            {
-                RuntimeType[] parameters = constructor.ParameterTypes;
-
-                if (parameters.Length == 0)
-                {
-                    _asm.LiI32(length, 0);
-                    return;
-                }
-
-                if (parameters.Length == 1)
-                {
-                    RuntimeType p0 = parameters[0];
-                    if (IsReadOnlyCharSpanType(p0))
-                    {
-                        EmitReadOnlyCharSpanLength(instruction, p0, length);
-                        return;
-                    }
-
-                    if (IsCharArrayType(p0))
-                    {
-                        var value = RequireCallUse(instruction, 0, "string(char[]) value");
-                        var arrayRef = MachineRegisters.ParallelCopyScratch0;
-                        EmitLoadOperand(arrayRef, value, p0, GenStackKind.Ref);
-                        _asm.LdLen(length, arrayRef);
-                        return;
-                    }
-
-                    if (IsCharPointerType(p0))
-                    {
-                        var value = RequireCallUse(instruction, 0, "string(char*) value");
-                        var p = MachineRegisters.ParallelCopyScratch0;
-                        EmitLoadOperand(p, value, p0, GenStackKind.Ptr);
-                        EmitNullTerminatedCharPointerLength(length, p);
-                        return;
-                    }
-                }
-
-                if (parameters.Length == 2 && IsCharType(parameters[0]) && IsInt32Type(parameters[1]))
-                {
-                    var value = RequireCallUse(instruction, 1, "string(char,int) length");
-                    EmitLoadOperand(length, value, parameters[1], GenStackKind.I4);
-                    return;
-                }
-
-                if (parameters.Length == 3 && IsCharArrayType(parameters[0]) && IsInt32Type(parameters[1]) && IsInt32Type(parameters[2]))
-                {
-                    var value = RequireCallUse(instruction, 2, "string(char[],int,int) length");
-                    EmitLoadOperand(length, value, parameters[2], GenStackKind.I4);
-                    return;
-                }
-
-                _asm.LiI32(length, 0);
-            }
-
-            private void EmitNullTerminatedCharPointerLength(MachineRegister length, MachineRegister pointer)
-            {
-                var loop = _asm.CreateLabel();
-                var done = _asm.CreateLabel();
-                var ch = MachineRegisters.BackendScratch;
-
-                _asm.LiI32(length, 0);
-                _asm.Branch(Op.BrFalseRef, pointer, done);
-                _asm.Bind(loop);
-                _asm.Emit(InstrDesc.Mem(Op.LdU2, ch, pointer, 0, aux: Aux.Memory(1, 1)));
-                _asm.BrFalseI32(ch, done);
-                _asm.I32AddImm(length, length, 1);
-                _asm.I64AddImm(pointer, pointer, 2);
-                _asm.J(loop);
-                _asm.Bind(done);
+                return target.DeclaringType.IsValueType && target.Name == ".ctor";
             }
 
             private RegisterOperand RequireCallUse(GenTree instruction, int index, string context)
@@ -2661,86 +2551,6 @@ namespace Cnidaria.Cs
                 if ((uint)index >= (uint)instruction.Uses.Length)
                     throw Unsupported(instruction, context + " is missing from call operands");
                 return instruction.Uses[index];
-            }
-
-            private static bool IsSystemStringType(RuntimeType type)
-                => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
-                   StringComparer.Ordinal.Equals(type.Name, "String");
-
-            private static bool IsCharType(RuntimeType type)
-                => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
-                   StringComparer.Ordinal.Equals(type.Name, "Char");
-
-            private static bool IsInt32Type(RuntimeType type)
-                => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
-                   StringComparer.Ordinal.Equals(type.Name, "Int32");
-
-            private static bool IsCharArrayType(RuntimeType type)
-                => type.Kind == RuntimeTypeKind.Array && type.ElementType is not null && IsCharType(type.ElementType);
-
-            private static bool IsCharPointerType(RuntimeType type)
-                => type.Kind == RuntimeTypeKind.Pointer && type.ElementType is not null && IsCharType(type.ElementType);
-
-            private static bool IsReadOnlyCharSpanType(RuntimeType type)
-            {
-                if (!StringComparer.Ordinal.Equals(type.Namespace, "System") ||
-                    !type.Name.StartsWith("ReadOnlySpan", StringComparison.Ordinal))
-                {
-                    return false;
-                }
-
-                var arguments = type.GenericTypeArguments;
-                return arguments.Length == 1 && IsCharType(arguments[0]);
-            }
-
-            private void EmitReadOnlyCharSpanLength(GenTree instruction, RuntimeType spanType, MachineRegister length)
-            {
-                RuntimeField? lengthField = null;
-                for (int i = 0; i < spanType.InstanceFields.Length; i++)
-                {
-                    if (StringComparer.Ordinal.Equals(spanType.InstanceFields[i].Name, "_length"))
-                    {
-                        lengthField = spanType.InstanceFields[i];
-                        break;
-                    }
-                }
-
-                if (lengthField is null)
-                    throw Unsupported(instruction, "ReadOnlySpan<char> has no _length field");
-
-                var abi = MachineAbi.ClassifyStorageValue(spanType, StackKindOf(spanType));
-                if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
-                {
-                    var segments = MachineAbi.GetRegisterSegments(abi);
-                    for (int i = 0; i < segments.Length; i++)
-                    {
-                        if (segments[i].Offset != lengthField.Offset)
-                            continue;
-
-                        var source = RequireCallUse(instruction, i, "string(ReadOnlySpan<char>) length");
-                        EmitLoadOperand(length, source, lengthField.FieldType, GenStackKind.I4);
-                        return;
-                    }
-                }
-
-                var value = RequireCallUse(instruction, 0, "string(ReadOnlySpan<char>) value");
-                MachineRegister spanAddress;
-                if (value.IsFrameSlot)
-                {
-                    spanAddress = MachineRegisters.ParallelCopyScratch0;
-                    EmitAddressOf(spanAddress, value);
-                }
-                else
-                {
-                    spanAddress = MaterializeScalarAggregateHome(instruction, 0, spanType, StackKindOf(spanType), "string(ReadOnlySpan<char>) value", length);
-                }
-
-                _asm.Emit(InstrDesc.Mem(
-                    Op.LdI4,
-                    length,
-                    spanAddress,
-                    lengthField.Offset,
-                    aux: Aux.Memory(0, 2, MemoryBase.Register, MemoryFlags.NoNullCheck)));
             }
 
             private void EmitCallLike(GenTree instruction, GenTree source)
@@ -2754,25 +2564,6 @@ namespace Cnidaria.Cs
                 RuntimeMethod method = source.Method ?? throw Unsupported(instruction, "call-like node has no runtime method");
 
                 bool hasHiddenReturnBufferOperand = HasHiddenReturnBufferOperand(instruction);
-
-                if (instruction.TreeKind == GenTreeKind.NewObject)
-                {
-                    if (method.DeclaringType.IsValueType)
-                        throw Unsupported(instruction, "value-type newobj must not reach codegen as an opaque NewObject node");
-
-                    var objectHome = RequireSingleResult(instruction);
-                    if (!objectHome.IsFrameSlot)
-                        throw Unsupported(instruction, "reference newobj result must be a frame home so the allocated object survives the constructor call");
-
-                    var obj = MachineRegisters.BackendScratch;
-                    EmitReferenceNewObjectAllocation(instruction, method, obj);
-                    EmitStore(objectHome, obj, method.DeclaringType, GenStackKind.Ref);
-                    EmitReferenceTypeNewObjectThisArgument(obj, method);
-                    EmitKnownManagedCallPreamble(method);
-                    EmitCallGcSafePoint(instruction);
-                    _asm.CallDirect(ResolveDirectCallTarget(instruction, method), BuildCallFlags(method, Op.Call));
-                    return;
-                }
 
                 if (instruction.Results.Length > 1)
                     throw Unsupported(instruction, $"call-like instruction must have zero or one result, actual count: {instruction.Results.Length}");
@@ -4968,7 +4759,7 @@ namespace Cnidaria.Cs
 
             private int ComputeStaticConstructorTypeLayoutIndex(RuntimeMethod method)
             {
-                if (StringComparer.Ordinal.Equals(method.Name, ".cctor"))
+                if (method.Name == ".cctor")
                     return _asm.InternTypeLayout(method.DeclaringType);
                 return MethodRecord.NoStaticConstructorTypeLayout;
             }
@@ -5050,13 +4841,13 @@ namespace Cnidaria.Cs
                     GenTreeKind.IndirectCall or
                     GenTreeKind.VirtualCall or
                     GenTreeKind.DelegateInvoke or
-                    GenTreeKind.NewObject or
                     GenTreeKind.NewDelegate or
                     GenTreeKind.DelegateCombine or
                     GenTreeKind.DelegateRemove or
                     GenTreeKind.StaticField or
                     GenTreeKind.StaticFieldAddr or
                     GenTreeKind.StoreStaticField or
+                    GenTreeKind.AllocObject or
                     GenTreeKind.NewArray or
                     GenTreeKind.Box or
                     GenTreeKind.UnboxAny or

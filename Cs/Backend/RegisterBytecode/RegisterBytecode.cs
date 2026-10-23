@@ -2393,8 +2393,8 @@ namespace Cnidaria.Cs
 
 
         private static bool IsSystemMulticastDelegateBase(RuntimeType type)
-            => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
-               StringComparer.Ordinal.Equals(type.Name, "MulticastDelegate");
+            => type.Namespace == "System" &&
+               type.Name == "MulticastDelegate";
 
         private static bool IsDelegateLikeRuntimeType(RuntimeType type)
         {
@@ -2413,7 +2413,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < cur.InstanceFields.Length; i++)
                 {
                     RuntimeField field = cur.InstanceFields[i];
-                    if (!field.IsStatic && StringComparer.Ordinal.Equals(field.Name, name))
+                    if (!field.IsStatic && field.Name == name)
                         return field.Offset;
                 }
             }

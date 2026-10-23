@@ -644,7 +644,7 @@ namespace Cnidaria.Cs
                     AddGeneratedAfter(tree.Source, nonZero);
                 }
 
-                if (tree.Kind is GenTreeKind.NewObject or GenTreeKind.NewArray or GenTreeKind.NewDelegate)
+                if (tree.Kind is GenTreeKind.AllocObject or GenTreeKind.NewArray or GenTreeKind.NewDelegate)
                 {
                     if (TryGetAssertionValue(tree.Source, out var result) &&
                         TryCreateRelation(SsaAssertionKind.NotEqual, result, AssertionValue.Null, out var nonNull))

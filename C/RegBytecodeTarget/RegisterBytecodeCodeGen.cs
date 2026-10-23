@@ -790,7 +790,7 @@ public sealed class RegisterBytecodeCodeGenerator
             {
                 if (list.Items.Length != 0 && tagType.Symbol.Fields.Length != 0)
                 {
-                    var field = tagType.Symbol.Fields[0];
+                    var field = tagType.Symbol.Fields[list.Items[0].ElementIndex >= 0 ? (int)list.Items[0].ElementIndex : 0];
                     WriteGlobalInitializer(destination, destinationOffset, field.Type, list.Items[0].Initializer, Math.Min(availableSize, Math.Max(1, _target.SizeOf(field.Type))));
                 }
                 return;
@@ -1149,7 +1149,8 @@ public sealed class RegisterBytecodeCodeGenerator
             {
                 if (fixup.Text is not null)
                     LoadCStringLiteral(fixup.Text, GpScratch0);
-                else if (fixup.Target is null || !TryMaterializeStaticSymbolAddress(fixup.Target, GpScratch0))
+                else if (fixup.Target is null || !TryMaterializeStaticSymbolAddress(fixup.Target, GpScratch0) &&
+                         !(fixup.Target is FunctionSymbol function && TryMaterializeFunctionPointer(function, GpScratch0)))
                     throw new NotSupportedException($"Global initializer refers to '{fixup.Target?.Name}', which has no static address.");
 
                 if (fixup.Addend != 0)

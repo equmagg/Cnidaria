@@ -521,7 +521,7 @@ namespace Cnidaria.Cs
                 return method;
 
             RuntimeType type = method.RuntimeMethod.DeclaringType;
-            if (type.IsBeforeFieldInit || StringComparer.Ordinal.Equals(method.RuntimeMethod.Name, ".cctor"))
+            if (type.IsBeforeFieldInit || method.RuntimeMethod.Name == ".cctor")
                 return method;
 
             GenTreeBlock entry = method.Blocks[0];
@@ -603,10 +603,10 @@ namespace Cnidaria.Cs
             var initial = new HashSet<int>();
             RuntimeMethod runtimeMethod = method.RuntimeMethod;
             RuntimeType declaringType = runtimeMethod.DeclaringType;
-            if (StringComparer.Ordinal.Equals(runtimeMethod.Name, ".cctor") ||
+            if (runtimeMethod.Name == ".cctor" ||
                 (!runtimeMethod.RequiresClassInitializationEntryCheck &&
                  !declaringType.IsBeforeFieldInit &&
-                 (runtimeMethod.IsStatic || declaringType.IsValueType || StringComparer.Ordinal.Equals(runtimeMethod.Name, ".ctor"))))
+                 (runtimeMethod.IsStatic || declaringType.IsValueType || runtimeMethod.Name == ".ctor")))
             {
                 initial.Add(declaringType.TypeId);
             }
@@ -940,13 +940,10 @@ namespace Cnidaria.Cs
                     flags |= GenTreeFlags.ContainsCall | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.GlobalRef | GenTreeFlags.Ordered;
                     break;
 
-                case GenTreeKind.NewObject:
-                    flags |= GenTreeFlags.ContainsCall | GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.GlobalRef | GenTreeFlags.Ordered;
-                    break;
-
                 case GenTreeKind.NewDelegate:
                 case GenTreeKind.DelegateCombine:
                 case GenTreeKind.DelegateRemove:
+                case GenTreeKind.AllocObject:
                 case GenTreeKind.NewArray:
                 case GenTreeKind.Box:
                     flags |= GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.Ordered;

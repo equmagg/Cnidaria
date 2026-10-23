@@ -1064,7 +1064,7 @@ namespace Cnidaria.Cs
                 b.Add(new TupleElementFieldSymbol(itemName, this, i, ElementTypes[i]));
 
                 var n = ElementNames.IsDefault ? null : ElementNames[i];
-                if (!string.IsNullOrEmpty(n) && !StringComparer.Ordinal.Equals(n, itemName))
+                if (!string.IsNullOrEmpty(n) && n != itemName)
                     b.Add(new TupleElementFieldSymbol(n!, this, i, ElementTypes[i]));
             }
 
@@ -1489,7 +1489,7 @@ namespace Cnidaria.Cs
 
             // An arity of -1 matches any arity
             return _typesByName
-                .Where(kv => StringComparer.Ordinal.Equals(kv.Key.name, name))
+                .Where(kv => kv.Key.name == name)
                 .SelectMany(kv => kv.Value)
                 .ToImmutableArray();
         }
@@ -1882,7 +1882,7 @@ namespace Cnidaria.Cs
                     : ImmutableArray<NamedTypeSymbol>.Empty;
 
             return _nestedTypesByName
-                .Where(kv => StringComparer.Ordinal.Equals(kv.Key.name, name))
+                .Where(kv => kv.Key.name == name)
                 .SelectMany(kv => kv.Value)
                 .ToImmutableArray();
         }
@@ -2655,7 +2655,7 @@ namespace Cnidaria.Cs
                     : ImmutableArray<NamedTypeSymbol>.Empty;
 
             return _types
-                .Where(kv => StringComparer.Ordinal.Equals(kv.Key.name, name))
+                .Where(kv => kv.Key.name == name)
                 .SelectMany(kv => kv.Value)
                 .ToImmutableArray();
         }
@@ -2751,7 +2751,7 @@ namespace Cnidaria.Cs
                     ? list.ToImmutableArray()
                     : ImmutableArray<NamedTypeSymbol>.Empty;
             return _nestedTypesByName
-                .Where(kv => StringComparer.Ordinal.Equals(kv.Key.name, name))
+                .Where(kv => kv.Key.name == name)
                 .SelectMany(kv => kv.Value)
                 .ToImmutableArray();
         }
@@ -2762,6 +2762,7 @@ namespace Cnidaria.Cs
     {
         private readonly NamespaceSymbol _a;
         private readonly NamespaceSymbol _b;
+        private readonly Dictionary<(NamespaceSymbol, NamespaceSymbol), MergedNamespaceSymbol> _mergedMembers = new();
 
         public MergedNamespaceSymbol(NamespaceSymbol a, NamespaceSymbol b)
         {
@@ -2784,10 +2785,21 @@ namespace Cnidaria.Cs
                 {
                     NamespaceSymbol merged = g.First();
                     foreach (var next in g.Skip(1))
-                        merged = new MergedNamespaceSymbol(merged, next);
+                        merged = Merge(merged, next);
                     return merged;
                 })
                 .ToImmutableArray();
+        }
+
+        // Lookups dedupe namespaces by reference, so the same pair must always merge into the same symbol
+        private MergedNamespaceSymbol Merge(NamespaceSymbol a, NamespaceSymbol b)
+        {
+            if (!_mergedMembers.TryGetValue((a, b), out var merged))
+            {
+                merged = new MergedNamespaceSymbol(a, b);
+                _mergedMembers.Add((a, b), merged);
+            }
+            return merged;
         }
         public override ImmutableArray<NamedTypeSymbol> GetTypeMembers(string name, int arity)
             => _a.GetTypeMembers(name, arity).AddRange(_b.GetTypeMembers(name, arity));

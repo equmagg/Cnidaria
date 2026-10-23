@@ -311,7 +311,7 @@ namespace Cnidaria.Cs
                         return false;
 
                 for (int i = 0; i < Names.Length; i++)
-                    if (!StringComparer.Ordinal.Equals(Names[i], other.Names[i]))
+                    if (Names[i] != other.Names[i])
                         return false;
 
                 return true;
@@ -766,7 +766,7 @@ namespace Cnidaria.Cs
 
                 for (int j = 0; j < members.Length; j++)
                 {
-                    if (StringComparer.Ordinal.Equals(members[j].Name, parts[i]))
+                    if (members[j].Name == parts[i])
                     {
                         next = members[j];
                         break;
@@ -1100,7 +1100,7 @@ namespace Cnidaria.Cs
                         var body = (BoundMethodBody)model.GetBoundNode(owner);
                         if (body.Method.IsStatic &&
                             body.Method.Parameters.Length == 0 &&
-                            StringComparer.Ordinal.Equals(body.Method.Name, ".cctor"))
+                            body.Method.Name == ".cctor")
                         {
                             body = PrependTypeInitializerStatements(compilation, tree, model, body);
                         }
@@ -1508,7 +1508,7 @@ namespace Cnidaria.Cs
                     if (members[i] is MethodSymbol ms &&
                         ms.IsStatic &&
                         ms.Parameters.Length == 0 &&
-                        StringComparer.Ordinal.Equals(ms.Name, ".cctor") &&
+                        ms.Name == ".cctor" &&
                         (ms.DeclaringSyntaxReferences.IsDefaultOrEmpty))
                     {
                         yield return ms;
@@ -2627,7 +2627,7 @@ namespace Cnidaria.Cs
                     if (c is NamespaceSymbol ns)
                     {
                         foreach (var childNs in ns.GetNamespaceMembers())
-                            if (StringComparer.Ordinal.Equals(childNs.Name, part.Name))
+                            if (childNs.Name == part.Name)
                                 next.Add(childNs);
 
                         foreach (var t in ns.GetTypeMembers(part.Name, part.Arity))
@@ -2684,7 +2684,7 @@ namespace Cnidaria.Cs
                 NamespaceSymbol? next = null;
                 foreach (var ns in cur!.GetNamespaceMembers())
                 {
-                    if (StringComparer.Ordinal.Equals(ns.Name, part))
+                    if (ns.Name == part)
                     {
                         next = ns;
                         break;

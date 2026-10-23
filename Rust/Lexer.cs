@@ -76,6 +76,9 @@ public readonly struct SyntaxToken
     public SyntaxTrivia[] LeadingTrivia { get; }
     public SyntaxTrivia[] TrailingTrivia { get; }
     public bool IsMissing { get; }
+    /// <summary>Hygiene mark of the macro expansion that produced the token, zero for source tokens.</summary>
+    public int Context { get; }
+    internal string? Text { get; }
 
     public TextSpan FullSpan
     {
@@ -96,7 +99,9 @@ public readonly struct SyntaxToken
         SyntaxKind contextualKind,
         SyntaxTrivia[] leadingTrivia,
         SyntaxTrivia[] trailingTrivia,
-        bool isMissing = false)
+        bool isMissing = false,
+        int context = 0,
+        string? text = null)
     {
         Kind = kind;
         Span = span;
@@ -107,12 +112,20 @@ public readonly struct SyntaxToken
         LeadingTrivia = leadingTrivia;
         TrailingTrivia = trailingTrivia;
         IsMissing = isMissing;
+        Context = context;
+        Text = text;
     }
 
-    public string GetText(string source) => source.Substring(Span.Start, Span.Length);
+    // Expanded tokens carry their own text because their spans index the invocation, not the text they were written in
+    public string GetText(string source) => Text ?? source.Substring(Span.Start, Span.Length);
 
     public ReadOnlySpan<char> GetSuffix(string source)
-        => source.AsSpan(Span.End - SuffixLength, SuffixLength);
+        => Text is not null ? Text.AsSpan(Text.Length - SuffixLength) : source.AsSpan(Span.End - SuffixLength, SuffixLength);
+
+    internal SyntaxToken Relocate(TextSpan span, string text, int context)
+        => new(Kind, span, ValueText, Value, SuffixLength, ContextualKind, [], [], IsMissing, context, text);
+    internal SyntaxToken WithKind(SyntaxKind kind, TextSpan span, string? valueText, string? text, SyntaxTrivia[] leading, SyntaxTrivia[] trailing, object? value = null, int suffix = 0)
+        => new(kind, span, valueText, value, suffix, SyntaxKind.None, leading, trailing, false, Context, Text is null ? null : text);
 
     public override string ToString() => $"{Kind} {Span}";
 }

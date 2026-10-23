@@ -597,8 +597,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.Call or
                 GenTreeKind.IndirectCall or
                 GenTreeKind.VirtualCall or
-                GenTreeKind.DelegateInvoke or
-                GenTreeKind.NewObject;
+                GenTreeKind.DelegateInvoke;
         }
 
         // Helper sequences that return to their caller clobber the caller-saved set even on targets
@@ -611,6 +610,7 @@ namespace Cnidaria.Cs
                 return false;
 
             return source.Kind is
+                GenTreeKind.AllocObject or
                 GenTreeKind.NewArray or
                 GenTreeKind.Box or
                 GenTreeKind.NewDelegate or
@@ -637,6 +637,7 @@ namespace Cnidaria.Cs
                 return true;
 
             if (source.Kind is
+                GenTreeKind.AllocObject or
                 GenTreeKind.NewArray or
                 GenTreeKind.NewDelegate or
                 GenTreeKind.DelegateCombine or
@@ -704,6 +705,7 @@ namespace Cnidaria.Cs
             }
 
             if (source.Kind is
+                GenTreeKind.AllocObject or
                 GenTreeKind.NewArray or
                 GenTreeKind.NewDelegate or
                 GenTreeKind.DelegateCombine or

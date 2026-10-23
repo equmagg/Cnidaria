@@ -858,7 +858,7 @@ namespace Cnidaria.Cs
                 string capturedName = parameter.Name.Substring(separator + 1);
                 foreach (var kv in info.CaptureFields)
                 {
-                    if (StringComparer.Ordinal.Equals(kv.Key.Name, capturedName))
+                    if (kv.Key.Name == capturedName)
                     {
                         field = kv.Value;
                         return true;
@@ -1325,7 +1325,7 @@ namespace Cnidaria.Cs
                     returnType: returnType,
                     typeParameters: ImmutableArray<TypeParameterSymbol>.Empty,
                     isStatic: false,
-                    isConstructor: isConstructor || StringComparer.Ordinal.Equals(name, ".ctor"),
+                    isConstructor: isConstructor || name == ".ctor",
                     isAsync: false,
                     locations: ImmutableArray.Create(new Location(tree, syntax.Span)),
                     declaredAccessibility: accessibility);
@@ -1348,7 +1348,7 @@ namespace Cnidaria.Cs
                     NamespaceSymbol? next = null;
                     foreach (var n in current.GetNamespaceMembers())
                     {
-                        if (StringComparer.Ordinal.Equals(n.Name, part))
+                        if (n.Name == part)
                         {
                             next = n;
                             break;
@@ -1370,7 +1370,7 @@ namespace Cnidaria.Cs
                 foreach (var member in type.GetMembers())
                 {
                     if (member is MethodSymbol m &&
-                        StringComparer.Ordinal.Equals(m.Name, name) &&
+                        m.Name == name &&
                         m.Parameters.Length == parameterCount)
                     {
                         return m;
@@ -1385,7 +1385,7 @@ namespace Cnidaria.Cs
                 foreach (var member in type.GetMembers())
                 {
                     if (member is PropertySymbol p &&
-                        StringComparer.Ordinal.Equals(p.Name, name))
+                        p.Name == name)
                     {
                         return p;
                     }
@@ -1980,7 +1980,7 @@ namespace Cnidaria.Cs
                 {
                     if (members[i] is MethodSymbol method &&
                         method.IsStatic &&
-                        StringComparer.Ordinal.Equals(method.Name, name) &&
+                        method.Name == name &&
                         method.TypeParameters.Length == 0 &&
                         method.Parameters.Length == 1 &&
                         ReferenceEquals(method.Parameters[0].Type, objectType) &&
@@ -1999,15 +1999,15 @@ namespace Cnidaria.Cs
                     return false;
 
                 var definition = named.OriginalDefinition;
-                if (definition.Arity != 0 || !StringComparer.Ordinal.Equals(definition.Name, "Lock"))
+                if (definition.Arity != 0 || definition.Name != "Lock")
                     return false;
                 if (definition.ContainingSymbol is not NamespaceSymbol threading ||
-                    !StringComparer.Ordinal.Equals(threading.Name, "Threading"))
+                    threading.Name != "Threading")
                 {
                     return false;
                 }
                 return threading.ContainingSymbol is NamespaceSymbol system &&
-                       StringComparer.Ordinal.Equals(system.Name, "System") &&
+                       system.Name == "System" &&
                        system.ContainingSymbol is NamespaceSymbol root &&
                        root.IsGlobalNamespace;
             }

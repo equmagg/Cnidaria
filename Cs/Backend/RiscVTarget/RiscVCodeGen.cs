@@ -119,11 +119,11 @@ namespace Cnidaria.Cs
 
                 RuntimeMethod? entryTypeInitializer = null;
                 if (_options.EmitStartup &&
-                    !StringComparer.Ordinal.Equals(entryMethod.RuntimeMethod.Name, ".cctor") &&
+                    entryMethod.RuntimeMethod.Name != ".cctor" &&
                     !entryMethod.RuntimeMethod.DeclaringType.IsBeforeFieldInit &&
                     (entryMethod.RuntimeMethod.IsStatic ||
                      entryMethod.RuntimeMethod.DeclaringType.IsValueType ||
-                     StringComparer.Ordinal.Equals(entryMethod.RuntimeMethod.Name, ".ctor")))
+                     entryMethod.RuntimeMethod.Name == ".ctor"))
                 {
                     entryTypeInitializer = FindTypeInitializer(entryMethod.RuntimeMethod.DeclaringType);
                     if (entryTypeInitializer is not null)
@@ -370,7 +370,7 @@ namespace Cnidaria.Cs
                     if (runtimeMethod.IsStatic && runtimeMethod.ParameterTypes.Length == 0 && firstStaticParameterless is null)
                         firstStaticParameterless = method;
 
-                    if (StringComparer.Ordinal.Equals(runtimeMethod.Name, "<Main>$") &&
+                    if (runtimeMethod.Name == "<Main>$" &&
                         runtimeMethod.IsStatic &&
                         (runtimeMethod.ParameterTypes.Length == 0 ||
                         (runtimeMethod.ParameterTypes.Length == 1 && IsStringArray(runtimeMethod.ParameterTypes[0]))))
@@ -378,7 +378,7 @@ namespace Cnidaria.Cs
                         return method;
                     }
 
-                    if (!StringComparer.Ordinal.Equals(runtimeMethod.Name, "Main"))
+                    if (runtimeMethod.Name != "Main")
                         continue;
 
                     firstMain ??= method;
@@ -895,16 +895,12 @@ namespace Cnidaria.Cs
 
             private static bool IsVoid(RuntimeType type)
                 => type.PrimitiveKind == RuntimePrimitiveKind.Void ||
-                   (StringComparer.Ordinal.Equals(type.Namespace, "System") &&
-                    StringComparer.Ordinal.Equals(type.Name, "Void"));
+                   (type.Namespace == "System" &&
+                    type.Name == "Void");
 
             private static bool IsSystemStringType(RuntimeType type)
-                => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
-                   StringComparer.Ordinal.Equals(type.Name, "String");
-
-            private static bool IsSystemArrayType(RuntimeType type)
-                => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
-                   StringComparer.Ordinal.Equals(type.Name, "Array");
+                => type.Namespace == "System" &&
+                   type.Name == "String";
 
             private readonly struct RuntimeMetadataLabels
             {
@@ -1640,7 +1636,7 @@ namespace Cnidaria.Cs
                     for (int i = 0; i < current.InstanceFields.Length; i++)
                     {
                         RuntimeField field = current.InstanceFields[i];
-                        if (!field.IsStatic && StringComparer.Ordinal.Equals(field.Name, fieldName))
+                        if (!field.IsStatic && field.Name == fieldName)
                             return field.Offset;
                     }
                 }
@@ -1656,8 +1652,8 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < knownTypes.Length; i++)
                 {
                     RuntimeType candidate = knownTypes[i];
-                    if (StringComparer.Ordinal.Equals(candidate.Namespace, "System") &&
-                        StringComparer.Ordinal.Equals(candidate.Name, name))
+                    if (candidate.Namespace == "System" &&
+                        candidate.Name == name)
                     {
                         return candidate;
                     }
@@ -1680,7 +1676,7 @@ namespace Cnidaria.Cs
                     for (int i = 0; i < current.Methods.Length; i++)
                     {
                         RuntimeMethod method = current.Methods[i];
-                        if (StringComparer.Ordinal.Equals(method.Name, "Invoke"))
+                        if (method.Name == "Invoke")
                             return method;
                     }
                 }
@@ -2306,7 +2302,7 @@ namespace Cnidaria.Cs
                     RuntimeMethod method = type.Methods[i];
                     if (method.IsStatic &&
                         method.ParameterTypes.Length == 0 &&
-                        StringComparer.Ordinal.Equals(method.Name, ".cctor"))
+                        method.Name == ".cctor")
                     {
                         return method;
                     }
@@ -2778,8 +2774,8 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < knownTypes.Length; i++)
                 {
                     RuntimeType candidate = knownTypes[i];
-                    if (StringComparer.Ordinal.Equals(candidate.Namespace, @namespace) &&
-                        StringComparer.Ordinal.Equals(candidate.Name, name))
+                    if (candidate.Namespace == @namespace &&
+                        candidate.Name == name)
                     {
                         type = candidate;
                         break;
@@ -3180,7 +3176,6 @@ namespace Cnidaria.Cs
                         : isArray
                             ? GetArrayComponentSize(descriptor.Type)
                             : 0;
-                    uint flags = ComputeMethodTableFlags(descriptor, componentSize);
                     int baseSize = isString
                         ? checked(_target.SyncBlockSize + _target.StringFirstCharOffset + 2)
                         : isArray
@@ -3200,6 +3195,8 @@ namespace Cnidaria.Cs
                                                 _target.ManagedObjectHeaderSize +
                                                 descriptor.Type.SizeOf)
                                             : checked(_target.SyncBlockSize + descriptor.Type.InstanceSize));
+                    uint flags = ComputeMethodTableFlags(descriptor, componentSize) |
+                        RuntimeMethodTables.ValueTypeExtendedFlags(descriptor.Type, baseSize, _target);
                     string? infoLabel = _runtimeTypeInfoStringType is null ? null : EmitRuntimeTypeInfo(descriptor.Type, _runtimeTypeInfoStringType);
                     // RuntimeType reads names and flags through the pointer one slot before the MethodTable.
                     _rodata.Align(pointerSize);
@@ -3370,7 +3367,7 @@ namespace Cnidaria.Cs
                 const uint elementTypeShift = 26u;
                 const uint hasComponentSize = 0x80000000u;
 
-                uint flags = GetMethodTableElementType(descriptor.Type) << (int)elementTypeShift;
+                uint flags = RuntimeMethodTables.ElementType(descriptor.Type) << (int)elementTypeShift;
                 if (descriptor.Type.Kind is RuntimeTypeKind.Array or RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef)
                     flags |= parameterizedKind;
                 if (descriptor.Fields.Length != 0 || descriptor.ComponentFields.Length != 0)
@@ -3379,65 +3376,6 @@ namespace Cnidaria.Cs
                     flags |= hasComponentSize | checked((uint)(ushort)componentSize);
                 return flags;
             }
-
-            private static uint GetMethodTableElementType(RuntimeType type)
-            {
-                RuntimePrimitiveKind primitiveKind = type.PrimitiveKind;
-                if (type.Kind == RuntimeTypeKind.Enum && primitiveKind == RuntimePrimitiveKind.None)
-                {
-                    for (int i = 0; i < type.InstanceFields.Length; i++)
-                    {
-                        RuntimeField field = type.InstanceFields[i];
-                        if (!field.IsStatic)
-                        {
-                            primitiveKind = field.FieldType.PrimitiveKind;
-                            break;
-                        }
-                    }
-                }
-
-                uint primitiveElementType = primitiveKind switch
-                {
-                    RuntimePrimitiveKind.Void => 0x01u,
-                    RuntimePrimitiveKind.Boolean => 0x02u,
-                    RuntimePrimitiveKind.Char => 0x03u,
-                    RuntimePrimitiveKind.Int8 => 0x04u,
-                    RuntimePrimitiveKind.UInt8 => 0x05u,
-                    RuntimePrimitiveKind.Int16 => 0x06u,
-                    RuntimePrimitiveKind.UInt16 => 0x07u,
-                    RuntimePrimitiveKind.Int32 => 0x08u,
-                    RuntimePrimitiveKind.UInt32 => 0x09u,
-                    RuntimePrimitiveKind.Int64 => 0x0au,
-                    RuntimePrimitiveKind.UInt64 => 0x0bu,
-                    RuntimePrimitiveKind.NativeInt => 0x0cu,
-                    RuntimePrimitiveKind.NativeUInt => 0x0du,
-                    RuntimePrimitiveKind.Single => 0x0eu,
-                    RuntimePrimitiveKind.Double => 0x0fu,
-                    _ => 0u,
-                };
-                if (primitiveElementType != 0u)
-                    return primitiveElementType;
-
-                if (IsSystemArrayType(type))
-                    return 0x16u;
-
-                return type.Kind switch
-                {
-                    RuntimeTypeKind.Struct => IsNullableType(type) ? 0x12u : 0x10u,
-                    RuntimeTypeKind.Enum => 0x10u,
-                    RuntimeTypeKind.Interface => 0x15u,
-                    RuntimeTypeKind.Array => type.IsSzArray ? 0x18u : 0x17u,
-                    RuntimeTypeKind.ByRef => 0x19u,
-                    RuntimeTypeKind.Pointer => 0x1au,
-                    RuntimeTypeKind.FunctionPointer => 0x1bu,
-                    RuntimeTypeKind.Class => 0x14u,
-                    _ => 0u,
-                };
-            }
-
-            private static bool IsNullableType(RuntimeType type)
-                => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
-                   type.Name.StartsWith("Nullable", StringComparison.Ordinal);
 
             private void AddDataSymbol(string label, int offset, int size)
             {
@@ -3754,7 +3692,7 @@ namespace Cnidaria.Cs
                         if (node.TreeKind is
                             GenTreeKind.ClassInit or
                             GenTreeKind.GcPoll or
-                            GenTreeKind.NewObject or
+                            GenTreeKind.AllocObject or
                             GenTreeKind.NewArray or
                             GenTreeKind.NewDelegate or
                             GenTreeKind.DelegateCombine or
@@ -3986,60 +3924,6 @@ namespace Cnidaria.Cs
                         return _method.GetValueInfo(node.RegisterUses[0]).Type ?? node.RuntimeType ?? node.Type;
 
                     return node.RuntimeType ?? node.Type;
-                }
-
-                private int NewObjectArgumentSaveOffset
-                    => AlignUp(
-                        checked(TypeOperationScratchOffset + TypeOperationScratchSize),
-                        Math.Max(Target.PointerSize, RegisterInfo.AbiFloatingRegisterSize(Target)));
-
-                private void SaveNewObjectArguments()
-                {
-                    int offset = NewObjectArgumentSaveOffset;
-                    for (int i = 1; i < 8; i++)
-                    {
-                        MachineRegister register = MachineRegisters.GetIntegerArgumentRegister(i);
-                        EmitMemoryStore(register, RVRegister.X8, offset, Target.GeneralRegisterSize);
-                        offset = checked(offset + Target.GeneralRegisterSize);
-                    }
-
-                    int floatingSize = RegisterInfo.AbiFloatingRegisterSize(Target);
-                    if (floatingSize != 0)
-                    {
-                        offset = AlignUp(offset, floatingSize);
-                        for (int i = 0; i < 8; i++)
-                        {
-                            MachineRegister register = MachineRegisters.GetFloatArgumentRegister(i);
-                            EmitMemoryStore(register, RVRegister.X8, offset, floatingSize);
-                            offset = checked(offset + floatingSize);
-                        }
-                    }
-
-                    if (offset > _method.StackFrame.GcSpillAreaOffset + _method.StackFrame.GcSpillAreaSize)
-                        throw new InvalidOperationException("GC transition area is smaller than the RISC-V argument register save set.");
-                }
-
-                private void RestoreNewObjectArguments()
-                {
-                    int offset = NewObjectArgumentSaveOffset;
-                    for (int i = 1; i < 8; i++)
-                    {
-                        MachineRegister register = MachineRegisters.GetIntegerArgumentRegister(i);
-                        EmitMemoryLoad(register, RVRegister.X8, offset, Target.GeneralRegisterSize, signed: false);
-                        offset = checked(offset + Target.GeneralRegisterSize);
-                    }
-
-                    int floatingSize = RegisterInfo.AbiFloatingRegisterSize(Target);
-                    if (floatingSize != 0)
-                    {
-                        offset = AlignUp(offset, floatingSize);
-                        for (int i = 0; i < 8; i++)
-                        {
-                            MachineRegister register = MachineRegisters.GetFloatArgumentRegister(i);
-                            EmitMemoryLoad(register, RVRegister.X8, offset, floatingSize, signed: false);
-                            offset = checked(offset + floatingSize);
-                        }
-                    }
                 }
 
                 private static int AlignUp(int value, int alignment)
@@ -4400,8 +4284,8 @@ namespace Cnidaria.Cs
                         case GenTreeKind.CatchReturn:
                             EmitCatchReturn(node);
                             return;
-                        case GenTreeKind.NewObject:
-                            EmitNewObject(node);
+                        case GenTreeKind.AllocObject:
+                            EmitAllocObject(node);
                             return;
                         case GenTreeKind.NewArray:
                             EmitNewArray(node);
@@ -4780,7 +4664,7 @@ namespace Cnidaria.Cs
                         return false;
 
                     RuntimeType definition = type.GenericTypeDefinition ?? type;
-                    if (!StringComparer.Ordinal.Equals(definition.Namespace, "System") ||
+                    if (definition.Namespace != "System" ||
                         !definition.Name.StartsWith("Nullable", StringComparison.Ordinal) ||
                         type.GenericTypeArguments.Length != 1)
                     {
@@ -4792,9 +4676,9 @@ namespace Cnidaria.Cs
                     for (int i = 0; i < type.InstanceFields.Length; i++)
                     {
                         RuntimeField field = type.InstanceFields[i];
-                        if (StringComparer.Ordinal.Equals(field.Name, "hasValue"))
+                        if (field.Name == "hasValue")
                             hasValue = field;
-                        else if (StringComparer.Ordinal.Equals(field.Name, "value"))
+                        else if (field.Name == "value")
                             value = field;
                     }
 
@@ -5186,8 +5070,14 @@ namespace Cnidaria.Cs
 
                     RVRegister baseRegister = FrameBase(destination);
                     int baseOffset = EffectiveFrameOffset(destination);
-                    for (int offset = 0; offset < size; offset++)
-                        EmitMemoryStore(MachineRegister.X0, baseRegister, checked(baseOffset + offset), 1);
+                    for (int offset = 0; offset < size;)
+                    {
+                        int chunk = Target.PointerSize;
+                        while (chunk > size - offset || (baseOffset + offset) % chunk != 0)
+                            chunk /= 2;
+                        EmitMemoryStore(MachineRegister.X0, baseRegister, checked(baseOffset + offset), chunk);
+                        offset += chunk;
+                    }
                 }
 
                 private void EmitLocalLike(GenTree node)
@@ -7276,6 +7166,20 @@ namespace Cnidaria.Cs
                     _owner.DefineLabel(safePoint.ReturnLabel);
                 }
 
+                private void EmitAllocObject(GenTree node)
+                {
+                    RuntimeType objectType = node.RuntimeType ?? throw Unsupported(node, "AllocObject node has no runtime type");
+                    if (node.Results.Length != 1)
+                        throw Unsupported(node, "AllocObject must have one result");
+
+                    MachineRegister result = RequireResultRegister(node);
+                    SafePointDraft safePoint = PrepareSafePoint(node);
+                    _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(objectType), RVRegister.X10);
+                    _owner.EmitPcrelTransfer(_owner.ResolveGcEntry(RiscVRuntime.NewFastSymbol), link: true);
+                    _owner.DefineLabel(safePoint.ReturnLabel);
+                    _owner.EmitMove(ToIntegerRegister(result), RVRegister.X10);
+                }
+
                 private void EmitNewArray(GenTree node)
                 {
                     if (node.Type is null || node.Type.Kind != RuntimeTypeKind.Array)
@@ -8310,119 +8214,9 @@ namespace Cnidaria.Cs
                     return size;
                 }
 
-                private void EmitNewObject(GenTree node)
-                {
-                    RuntimeMethod constructor = node.Method ?? throw Unsupported(node, "NewObject node has no constructor");
-                    RuntimeType objectType = constructor.DeclaringType;
-                    if (!constructor.HasThis)
-                        throw Unsupported(node, "NewObject constructor has no implicit this parameter");
-                    if (objectType.IsValueType)
-                        throw Unsupported(node, "Value-type newobj must be lowered before RISC-V code generation");
-                    if (node.Results.Length != 1 || !node.Results[0].IsFrameSlot)
-                        throw Unsupported(node, "Reference newobj result must have a frame home");
-
-                    RegisterOperand objectHome = node.Results[0];
-                    if (IsSystemStringType(objectType))
-                    {
-                        EmitNewStringObject(node, constructor, objectHome);
-                        return;
-                    }
-                    if (objectType.InstanceSize < Target.ManagedObjectHeaderSize)
-                        throw Unsupported(node, "Allocated object layout is smaller than the runtime object header");
-
-                    SafePointDraft allocationSafePoint = PrepareSafePoint(node);
-                    SaveNewObjectArguments();
-                    _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(objectType), RVRegister.X10);
-                    _owner.EmitPcrelTransfer(_owner.ResolveGcEntry(RiscVRuntime.NewFastSymbol), link: true);
-                    _owner.DefineLabel(allocationSafePoint.ReturnLabel);
-                    EmitStore(objectHome, MachineRegister.X10, objectType, GenStackKind.Ref);
-
-                    RestoreNewObjectArguments();
-                    EmitLoad(MachineRegister.X10, objectHome, objectType, GenStackKind.Ref);
-                    SafePointDraft constructorSafePoint = PrepareSafePoint(node, objectHome);
-                    _owner.EmitPcrelTransfer(_owner.ResolveMethodLabel(constructor), link: true);
-                    _owner.DefineLabel(constructorSafePoint.ReturnLabel);
-                }
-
-                private void EmitNewStringObject(GenTree node, RuntimeMethod constructor, RegisterOperand objectHome)
-                {
-                    SafePointDraft safePoint = PrepareSafePoint(node);
-                    RuntimeType[] parameters = constructor.ParameterTypes;
-                    string runtimeSymbol;
-
-                    _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(constructor.DeclaringType), RVRegister.X10);
-
-                    if (parameters.Length == 0)
-                    {
-                        _owner.EmitLoadImmediate(RVRegister.X11, 0);
-                        runtimeSymbol = RiscVRuntime.NewArraySymbol;
-                    }
-                    else if (parameters.Length == 2 && IsCharType(parameters[0]) && IsInt32Type(parameters[1]))
-                    {
-                        runtimeSymbol = RiscVRuntime.NewStringFromCharSymbol;
-                    }
-                    else if (parameters.Length == 1 && IsCharPointerType(parameters[0]))
-                    {
-                        runtimeSymbol = RiscVRuntime.NewStringFromUtf16Symbol;
-                    }
-                    else if (parameters.Length == 1 && IsCharArrayType(parameters[0]))
-                    {
-                        runtimeSymbol = RiscVRuntime.NewStringFromCharArraySymbol;
-                    }
-                    else if (parameters.Length == 3 &&
-                             IsCharArrayType(parameters[0]) &&
-                             IsInt32Type(parameters[1]) &&
-                             IsInt32Type(parameters[2]))
-                    {
-                        runtimeSymbol = RiscVRuntime.NewStringFromCharArrayRangeSymbol;
-                    }
-                    else if (parameters.Length == 1 && IsReadOnlyCharSpanType(parameters[0]))
-                    {
-                        runtimeSymbol = RiscVRuntime.NewStringFromReadOnlySpanSymbol;
-                    }
-                    else
-                    {
-                        throw Unsupported(node, "Unsupported System.String constructor shape");
-                    }
-
-                    _owner.EmitPcrelTransfer(_owner.ResolveGcEntry(runtimeSymbol), link: true);
-                    _owner.DefineLabel(safePoint.ReturnLabel);
-                    EmitStore(objectHome, MachineRegister.X10, constructor.DeclaringType, GenStackKind.Ref);
-                }
-
-                private static bool IsCharType(RuntimeType type)
-                    => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
-                       StringComparer.Ordinal.Equals(type.Name, "Char");
-
-                private static bool IsInt32Type(RuntimeType type)
-                    => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
-                       StringComparer.Ordinal.Equals(type.Name, "Int32");
-
-                private static bool IsCharArrayType(RuntimeType type)
-                    => type.Kind == RuntimeTypeKind.Array &&
-                       type.ElementType is not null &&
-                       IsCharType(type.ElementType);
-
-                private static bool IsCharPointerType(RuntimeType type)
-                    => type.Kind == RuntimeTypeKind.Pointer &&
-                       type.ElementType is not null &&
-                       IsCharType(type.ElementType);
-
-                private static bool IsReadOnlyCharSpanType(RuntimeType type)
-                {
-                    if (!StringComparer.Ordinal.Equals(type.Namespace, "System") ||
-                        !type.Name.StartsWith("ReadOnlySpan", StringComparison.Ordinal))
-                    {
-                        return false;
-                    }
-
-                    var arguments = type.GenericTypeArguments;
-                    return arguments.Length == 1 && IsCharType(arguments[0]);
-                }
-
                 private static bool IsSystemStringType(RuntimeType type)
-                    => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
-                       StringComparer.Ordinal.Equals(type.Name, "String");
+                    => type.Namespace == "System" &&
+                       type.Name == "String";
 
                 private void EmitNullCheck(GenTree node, RVRegister value, string suffix)
                 {
@@ -9411,12 +9205,16 @@ namespace Cnidaria.Cs
                     if (TryGetCodegenUseIndexForOperand(node, operandIndex, out int useIndex) &&
                         (uint)useIndex < (uint)node.RegisterUses.Length)
                     {
-                        return node.RegisterUses[useIndex].RuntimeType ?? node.RegisterUses[useIndex].Type;
+                        return OperandValueType(node.RegisterUses[useIndex]);
                     }
                     if ((uint)operandIndex < (uint)node.Operands.Length)
-                        return node.Operands[operandIndex].RuntimeType ?? node.Operands[operandIndex].Type;
+                        return OperandValueType(node.Operands[operandIndex]);
                     return node.RuntimeType ?? node.Type;
                 }
+
+                // A type handle's RuntimeType is the type it identifies, not the type of the handle
+                private static RuntimeType? OperandValueType(GenTree value)
+                    => value.Kind == GenTreeKind.TypeHandle ? value.Type : value.RuntimeType ?? value.Type;
 
                 private GenStackKind OperandStackKind(GenTree node, int operandIndex)
                 {

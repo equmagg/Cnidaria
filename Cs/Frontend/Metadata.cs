@@ -654,6 +654,7 @@ namespace Cnidaria.Cs
             _offset += count;
             return span;
         }
+        public int Remaining => _data.Length - _offset;
         public byte ReadByte() => Take(1)[0];
         public ushort ReadUInt16() => BinaryPrimitives.ReadUInt16LittleEndian(Take(2));
         public uint ReadUInt32() => BinaryPrimitives.ReadUInt32LittleEndian(Take(4));
@@ -1541,7 +1542,7 @@ namespace Cnidaria.Cs
                 if (members[i] is MethodSymbol method &&
                     method.IsStatic &&
                     method.Parameters.Length == 0 &&
-                    StringComparer.Ordinal.Equals(method.Name, ".cctor") &&
+                    method.Name == ".cctor" &&
                     !method.DeclaringSyntaxReferences.IsDefaultOrEmpty)
                 {
                     hasExplicitStaticConstructor = true;
@@ -2290,7 +2291,7 @@ namespace Cnidaria.Cs
                     var children = current.GetNamespaceMembers();
                     for (int i = 0; i < children.Length; i++)
                     {
-                        if (StringComparer.Ordinal.Equals(children[i].Name, part))
+                        if (children[i].Name == part)
                         {
                             next = children[i];
                             break;

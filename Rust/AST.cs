@@ -826,7 +826,8 @@ public sealed class StructPatternSyntax : PatternSyntax
 public sealed class StructPatternFieldSyntax : SyntaxNode
 {
     internal StructPatternFieldSyntax(ImmutableArray<SyntaxNodeOrToken> children) : base(SyntaxKind.StructPatternField, children) { }
-    public SyntaxToken Identifier => Child<IdentifierPatternSyntax>()?.Identifier ?? Token(SyntaxKind.IdentifierToken, SyntaxKind.RawIdentifierToken, SyntaxKind.IntegerLiteralToken);
+    public SyntaxToken Identifier => ChildTokens().All(t => t.Kind != SyntaxKind.ColonToken) && Child<IdentifierPatternSyntax>() is IdentifierPatternSyntax shorthand
+        ? shorthand.Identifier : Token(SyntaxKind.IdentifierToken, SyntaxKind.RawIdentifierToken, SyntaxKind.IntegerLiteralToken);
     public PatternSyntax? Pattern => Child<PatternSyntax>();
 }
 

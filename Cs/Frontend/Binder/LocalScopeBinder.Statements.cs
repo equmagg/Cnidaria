@@ -137,7 +137,7 @@ namespace Cnidaria.Cs
 
             var definition = named.OriginalDefinition;
             return definition.Arity == 0 &&
-                   StringComparer.Ordinal.Equals(definition.Name, "Lock") &&
+                   definition.Name == "Lock" &&
                    IsNamespaceFullName(definition.ContainingSymbol, "System.Threading");
         }
 
@@ -151,7 +151,7 @@ namespace Cnidaria.Cs
             if (enterScope is null ||
                 enterScope.ReturnType is not NamedTypeSymbol scopeType ||
                 scopeType.Arity != 0 ||
-                !StringComparer.Ordinal.Equals(scopeType.Name, "Scope") ||
+                scopeType.Name != "Scope" ||
                 scopeType.TypeKind != TypeKind.Struct ||
                 !scopeType.IsRefLikeType ||
                 scopeType.DeclaredAccessibility != Accessibility.Public ||
@@ -186,7 +186,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < members.Length; i++)
             {
                 if (members[i] is not MethodSymbol method ||
-                    !StringComparer.Ordinal.Equals(method.Name, name) ||
+                    method.Name != name ||
                     method.IsStatic ||
                     method.IsConstructor ||
                     method.DeclaredAccessibility != Accessibility.Public ||

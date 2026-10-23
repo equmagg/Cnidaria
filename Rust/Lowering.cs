@@ -24,28 +24,29 @@ internal sealed class Lowerer
     {
         var lowerer = new Lowerer(compilation);
         BoundCompilationUnit[] units = compilation.SyntaxTrees.Select(t => compilation.GetSemanticModel(t).GetBoundTree()).ToArray();
-        var functions = ImmutableArray.CreateBuilder<BoundFunction>();
-        foreach (BoundFunction function in units.SelectMany(u => u.Functions))
-        {
-            lowerer._function = function.Symbol;
-            lowerer._ordinal = 0;
-            lowerer._targets.Clear();
-            if (function.Body is null) { functions.Add(function); continue; }
-            if (!function.Symbol.TypeParameters.IsEmpty)
-                throw new LoweringException(function.Syntax, "Generic function instantiation is not supported by lowering yet.");
-            var prologue = new List<BoundStatement>();
-            for (int i = 0; i < function.Parameters.Length; i++)
-            {
-                BoundPattern pattern = function.Parameters[i];
-                if (pattern.Variable == function.Symbol.Parameters[i] && pattern.Subpatterns.IsEmpty) continue;
-                lowerer.BindPattern(pattern, lowerer.Read(function.Symbol.Parameters[i]), null, prologue);
-            }
-            BoundBlockExpression body = lowerer.Block(function.Body);
-            functions.Add(new BoundFunction(function.Symbol.Declaration, function.Symbol, [],
-                new BoundBlockExpression(body.Syntax, body.Type, prologue.Concat(body.Statements).ToImmutableArray(), body.Tail, body.Locals)));
-        }
-        return new BoundCompilationUnit(compilation.RootSyntaxTree.Root, compilation.Crate, functions.ToImmutable(),
+        // Generic functions are lowered only when code generation instantiates them
+        return new BoundCompilationUnit(compilation.RootSyntaxTree.Root, compilation.Crate,
+            units.SelectMany(u => u.Functions).Where(f => f.Symbol.AllTypeParameters.IsEmpty).Select(lowerer.Function).ToImmutableArray(),
             units.SelectMany(u => u.Globals).ToImmutableArray(), false);
+    }
+    internal static BoundFunction Lower(Compilation compilation, BoundFunction function) => new Lowerer(compilation).Function(function);
+
+    private BoundFunction Function(BoundFunction function)
+    {
+        _function = function.Symbol;
+        _ordinal = 0;
+        _targets.Clear();
+        if (function.Body is null) return function;
+        var prologue = new List<BoundStatement>();
+        for (int i = 0; i < function.Parameters.Length; i++)
+        {
+            BoundPattern pattern = function.Parameters[i];
+            if (pattern.Variable == function.Symbol.Parameters[i] && pattern.Subpatterns.IsEmpty) continue;
+            BindPattern(pattern, Read(function.Symbol.Parameters[i]), null, prologue);
+        }
+        BoundBlockExpression body = Block(function.Body);
+        return new BoundFunction(function.Symbol.Declaration, function.Symbol, [],
+            new BoundBlockExpression(body.Syntax, body.Type, prologue.Concat(body.Statements).ToImmutableArray(), body.Tail, body.Locals));
     }
 
     private LocalSymbol Temp(SyntaxNode syntax, TypeSymbol type) => new("$temp" + _ordinal++, _function, syntax, _function.SyntaxTree!, type, true);
@@ -84,7 +85,9 @@ internal sealed class Lowerer
 
     private BoundExpression Rewrite(BoundExpression expression) => expression switch
     {
-        BoundLiteralExpression or BoundVariableExpression or BoundFunctionReference => expression,
+        BoundLiteralExpression or BoundVariableExpression or BoundFunctionReference or BoundPanicExpression => expression,
+        // Folded expressions become literals, so constant expressions keep their shape for promotion after lowering
+        _ when expression.ConstantValue.HasValue => new BoundLiteralExpression(expression.Syntax, expression.Type, expression.ConstantValue.Value),
         BoundBlockExpression block => Block(block),
         BoundIfExpression conditional => Conditional(conditional),
         BoundLoopExpression loop => Loop(loop),
@@ -326,7 +329,12 @@ internal sealed class Lowerer
                 BindPattern(referenced, value, fail, statements);
                 return;
             case BoundPatternKind.Tuple: case BoundPatternKind.Aggregate:
-                if (pattern.MatchedSymbol is VariantSymbol) throw new LoweringException(pattern.Syntax, "Enum pattern lowering is not implemented yet.");
+                if (pattern.MatchedSymbol is VariantSymbol { Enum.Variants.Length: > 1 } variant)
+                {
+                    TypeSymbol isize = _types.Primitives["isize"];
+                    Check(new BoundBinaryExpression(pattern.Syntax, _types.Bool, SyntaxKind.EqualsEqualsToken,
+                        new BoundDiscriminantExpression(pattern.Syntax, isize, value), Literal(pattern.Syntax, isize, variant.Discriminant)));
+                }
                 for (int i = 0; i < pattern.Subpatterns.Length; i++)
                 {
                     BoundPattern child = pattern.Subpatterns[i];

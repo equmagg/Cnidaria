@@ -58,6 +58,9 @@ namespace System.Runtime.CompilerServices
             return false; // to do
         }
 
+        internal static ref byte GetRawData(this object obj) =>
+            ref Unsafe.As<RawData>(obj).Data;
+
         public static int GetHashCode(object? o) => o is null ? 0 : System.Runtime.RuntimeImports.RhGetObjectHashCode(o);
 
         // The identity hash if the object has one, so a lookup by a never-hashed key finds nothing without assigning one
@@ -74,7 +77,8 @@ namespace System.Runtime.CompilerServices
         [Intrinsic]
         internal static bool IsKnownConstant<T>(T t) where T : struct => false;
 
-        internal static unsafe MethodTable* GetMethodTable(object obj) => (MethodTable*)System.Runtime.RuntimeImports.RhGetObjectTypeHandle(obj);
+        [Intrinsic]
+        internal static unsafe MethodTable* GetMethodTable(this object obj) => obj.GetMethodTable();
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -845,6 +849,30 @@ namespace System.Runtime.CompilerServices
             // ldarg .1
             // unaligned. 0x01
             // stobj !!T
+            // ret
+        }
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void CopyBlock(void* destination, void* source, uint byteCount)
+        {
+            throw new PlatformNotSupportedException();
+
+            // ldarg .0
+            // ldarg .1
+            // ldarg .2
+            // cpblk
+            // ret
+        }
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void CopyBlock(ref byte destination, ref readonly byte source, uint byteCount)
+        {
+            throw new PlatformNotSupportedException();
+
+            // ldarg .0
+            // ldarg .1
+            // ldarg .2
+            // cpblk
             // ret
         }
         [Intrinsic]

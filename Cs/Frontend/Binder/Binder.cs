@@ -591,14 +591,14 @@ namespace Cnidaria.Cs
                 {
                     var tps = ms.TypeParameters;
                     for (int i = 0; i < tps.Length; i++)
-                        if (StringComparer.Ordinal.Equals(tps[i].Name, name))
+                        if (tps[i].Name == name)
                             return tps[i];
                 }
                 else if (s is NamedTypeSymbol nt)
                 {
                     var tps = nt.TypeParameters;
                     for (int i = 0; i < tps.Length; i++)
-                        if (StringComparer.Ordinal.Equals(tps[i].Name, name))
+                        if (tps[i].Name == name)
                             return tps[i];
                 }
             }
@@ -641,9 +641,9 @@ namespace Cnidaria.Cs
 
             if (parts.Count == 1 && parts[0].Arity == 0 && parts[0].TypeArgListOpt is null)
             {
-                if (StringComparer.Ordinal.Equals(parts[0].Name, "nint"))
+                if (parts[0].Name == "nint")
                     return _compilation.GetSpecialType(SpecialType.System_IntPtr);
-                if (StringComparer.Ordinal.Equals(parts[0].Name, "nuint"))
+                if (parts[0].Name == "nuint")
                     return _compilation.GetSpecialType(SpecialType.System_UIntPtr);
             }
 
@@ -1004,7 +1004,7 @@ namespace Cnidaria.Cs
                 NamespaceSymbol? next = null;
                 foreach (var child in cur.GetNamespaceMembers())
                 {
-                    if (StringComparer.Ordinal.Equals(child.Name, parts[i]))
+                    if (child.Name == parts[i])
                     {
                         next = child;
                         break;
@@ -1065,7 +1065,7 @@ namespace Cnidaria.Cs
                     if (!hasTypeArgs)
                     {
                         foreach (var childNs in ns.GetNamespaceMembers())
-                            if (StringComparer.Ordinal.Equals(childNs.Name, name))
+                            if (childNs.Name == name)
                                 next.Add(childNs);
                     }
 

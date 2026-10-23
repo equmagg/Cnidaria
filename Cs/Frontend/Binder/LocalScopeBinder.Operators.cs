@@ -120,6 +120,12 @@ namespace Cnidaria.Cs
                         new Location(context.SemanticModel.SyntaxTree, node.Span)));
                     return new BoundBadExpression(node);
             }
+            if (TryBindLifted(node, ImmutableArray.Create(operand), LiftedKind.Value, (o, d) => BindUnaryOperator(node, opKind, o[0], context, d), context, diagnostics, out var lifted))
+                return lifted;
+            return BindUnaryOperator(node, opKind, operand, context, diagnostics);
+        }
+        private BoundExpression BindUnaryOperator(PrefixUnaryExpressionSyntax node, BoundUnaryOperatorKind opKind, BoundExpression operand, BindingContext context, DiagnosticBag diagnostics)
+        {
             if (TryBindUserDefinedUnaryOperator(
                 operatorSyntax: node,
                 operandSyntax: node.Operand,
@@ -276,13 +282,9 @@ namespace Cnidaria.Cs
 
             var opKind = isIncrement ? BoundBinaryOperatorKind.Add : BoundBinaryOperatorKind.Subtract;
 
-            var opResult = BindIncrementDecrementOperatorBinary(
-                operatorSyntax,
-                operandSyntax,
-                lv.Read,
-                opKind,
-                context,
-                diagnostics);
+            if (!TryBindLifted(operatorSyntax, ImmutableArray.Create(lv.Read), LiftedKind.Value,
+                (o, d) => BindIncrementDecrementOperatorBinary(operatorSyntax, operandSyntax, o[0], opKind, context, d), context, diagnostics, out var opResult))
+                opResult = BindIncrementDecrementOperatorBinary(operatorSyntax, operandSyntax, lv.Read, opKind, context, diagnostics);
 
             if (opResult.HasErrors)
                 return new BoundBadExpression(operatorSyntax);
@@ -804,6 +806,8 @@ namespace Cnidaria.Cs
                 SyntaxKind.ModuloExpression => BoundBinaryOperatorKind.Modulo,
                 _ => throw new InvalidOperationException()
             };
+            if (TryBindLifted(bin, ImmutableArray.Create(left, right), LiftedKind.Value, (o, d) => BindNumericBinary(bin, o[0], o[1], ctx, d), ctx, diagnostics, out var lifted))
+                return lifted;
             if (op == BoundBinaryOperatorKind.Add &&
                 left is BoundSpanCollectionExpression leftUtf8 && leftUtf8.IsUtf8Encoded &&
                 right is BoundSpanCollectionExpression rightUtf8 && rightUtf8.IsUtf8Encoded)
@@ -911,6 +915,9 @@ namespace Cnidaria.Cs
                 SyntaxKind.ExclusiveOrExpression => BoundBinaryOperatorKind.ExclusiveOr,
                 _ => throw new InvalidOperationException()
             };
+            var lifting = op switch { BoundBinaryOperatorKind.BitwiseAnd => LiftedKind.And, BoundBinaryOperatorKind.BitwiseOr => LiftedKind.Or, _ => LiftedKind.Value };
+            if (TryBindLifted(bin, ImmutableArray.Create(left, right), lifting, (o, d) => BindBitwiseBinary(bin, o[0], o[1], ctx, d), ctx, diagnostics, out var lifted))
+                return lifted;
             if (TryBindUserDefinedBinaryOperator(
                 operatorSyntax: bin,
                 leftSyntax: bin.Left,
@@ -999,6 +1006,9 @@ namespace Cnidaria.Cs
                 SyntaxKind.NotEqualsExpression => BoundBinaryOperatorKind.NotEquals,
                 _ => throw new InvalidOperationException()
             };
+            var lifting = op == BoundBinaryOperatorKind.Equals ? LiftedKind.Equality : LiftedKind.Inequality;
+            if (TryBindLifted(bin, ImmutableArray.Create(left, right), lifting, (o, d) => BindEqualityBinary(bin, o[0], o[1], ctx, d), ctx, diagnostics, out var lifted))
+                return lifted;
             if (TryBindUserDefinedBinaryOperator(
                 operatorSyntax: bin,
                 leftSyntax: bin.Left,
@@ -1273,6 +1283,8 @@ namespace Cnidaria.Cs
                 SyntaxKind.GreaterThanOrEqualExpression => BoundBinaryOperatorKind.GreaterThanOrEqual,
                 _ => throw new InvalidOperationException()
             };
+            if (TryBindLifted(bin, ImmutableArray.Create(left, right), LiftedKind.Comparison, (o, d) => BindRelationalBinary(bin, o[0], o[1], ctx, d), ctx, diagnostics, out var lifted))
+                return lifted;
             if (TryBindUserDefinedBinaryOperator(
                 operatorSyntax: bin,
                 leftSyntax: bin.Left,
@@ -1333,6 +1345,8 @@ namespace Cnidaria.Cs
                 SyntaxKind.UnsignedRightShiftExpression => BoundBinaryOperatorKind.UnsignedRightShift,
                 _ => throw new InvalidOperationException()
             };
+            if (TryBindLifted(bin, ImmutableArray.Create(left, right), LiftedKind.Value, (o, d) => BindShiftBinary(bin, o[0], o[1], ctx, d), ctx, diagnostics, out var lifted))
+                return lifted;
             if (TryBindUserDefinedBinaryOperator(
                 operatorSyntax: bin,
                 leftSyntax: bin.Left,
@@ -1980,6 +1994,148 @@ namespace Cnidaria.Cs
         {
             var name = $"{prefix}{_tempId++}";
             return new LocalSymbol(name, _containing, type, ImmutableArray<Location>.Empty);
+        }
+        private enum LiftedKind : byte { Value, Equality, Inequality, Comparison, And, Or }
+        private static bool IsNullLiteral(BoundExpression e) => e.Type is NullTypeSymbol || (e.ConstantValueOpt.HasValue && e.ConstantValueOpt.Value is null);
+        private bool TryBindLifted(
+            SyntaxNode syntax,
+            ImmutableArray<BoundExpression> operands,
+            LiftedKind kind,
+            Func<ImmutableArray<BoundExpression>, DiagnosticBag, BoundExpression> bindUnderlying,
+            BindingContext ctx,
+            DiagnosticBag diagnostics,
+            out BoundExpression result)
+        {
+            result = new BoundBadExpression(syntax);
+            NamedTypeSymbol? nullable = null;
+            foreach (var operand in operands)
+            {
+                if (TryGetSystemNullableInfo(operand.Type, out var operandNullable, out _))
+                    nullable ??= operandNullable;
+                else if (!IsNullLiteral(operand) && (!operand.Type.IsValueType || operand.Type is PointerTypeSymbol))
+                    return false;
+            }
+            if (nullable is null)
+                return false;
+
+            var boolType = ctx.Compilation.GetSpecialType(SpecialType.System_Boolean);
+            var locals = ImmutableArray.CreateBuilder<LocalSymbol>(operands.Length);
+            var sideEffects = ImmutableArray.CreateBuilder<BoundStatement>(operands.Length);
+            var temps = new LocalSymbol?[operands.Length];
+            var hasValues = new MethodSymbol?[operands.Length];
+            var getValues = new MethodSymbol?[operands.Length];
+            var types = new TypeSymbol[operands.Length];
+            bool comparesWithNull = false;
+            if (kind is LiftedKind.Equality or LiftedKind.Inequality)
+                foreach (var operand in operands)
+                    comparesWithNull |= IsNullLiteral(operand);
+            for (int i = 0; i < operands.Length; i++)
+            {
+                BoundExpression operand = operands[i];
+                if (IsNullLiteral(operand))
+                {
+                    if (comparesWithNull)
+                        continue;
+                    operand = ApplyConversion((ExpressionSyntax)operand.Syntax, operand, nullable, syntax, ctx, diagnostics, requireImplicit: true);
+                    if (operand.HasErrors)
+                        return false;
+                }
+                var temp = NewTemp("$lifted_tmp", operand.Type);
+                temps[i] = temp;
+                locals.Add(temp);
+                sideEffects.Add(new BoundLocalDeclarationStatement(syntax, temp, operand));
+                types[i] = operand.Type;
+                if (TryGetSystemNullableInfo(operand.Type, out var operandNullable, out var underlying))
+                {
+                    hasValues[i] = FindNullableHasValueGetter(operandNullable);
+                    getValues[i] = FindNullableGetValueOrDefault(operandNullable, underlying);
+                    if (hasValues[i] is null || getValues[i] is null)
+                        return false;
+                    types[i] = underlying;
+                }
+            }
+
+            BoundExpression Read(int i) => new BoundLocalExpression(syntax, temps[i]!);
+            BoundExpression? HasValue(int i) => hasValues[i] is MethodSymbol getter ? new BoundCallExpression(syntax, Read(i), getter, ImmutableArray<BoundExpression>.Empty) : null;
+            BoundExpression Value(int i) => getValues[i] is MethodSymbol getter ? new BoundCallExpression(syntax, Read(i), getter, ImmutableArray<BoundExpression>.Empty) : Read(i);
+            BoundExpression Logical(BoundBinaryOperatorKind op, BoundExpression left, BoundExpression right) => new BoundBinaryExpression(syntax, op, boolType, left, right, Optional<object>.None);
+            BoundExpression Literal(bool value) => new BoundLiteralExpression(syntax, boolType, value);
+            BoundExpression Conditional(TypeSymbol type, BoundExpression condition, BoundExpression whenTrue, BoundExpression whenFalse)
+                => new BoundConditionalExpression(syntax, type, condition, whenTrue, whenFalse, Optional<object>.None);
+            BoundExpression AllHaveValues()
+            {
+                BoundExpression? all = null;
+                for (int i = 0; i < operands.Length; i++)
+                    if (HasValue(i) is BoundExpression present)
+                        all = all is null ? present : Logical(BoundBinaryOperatorKind.LogicalAnd, all, present);
+                return all ?? Literal(true);
+            }
+            BoundExpression Sequence(BoundExpression value) => new BoundSequenceExpression(syntax, locals.ToImmutable(), sideEffects.ToImmutable(), value);
+
+            if (comparesWithNull)
+            {
+                int tested = Array.FindIndex(temps, t => t is not null);
+                if (tested < 0 || HasValue(tested) is not BoundExpression present)
+                    return false;
+                result = Sequence(kind == LiftedKind.Equality ? new BoundUnaryExpression(syntax, BoundUnaryOperatorKind.LogicalNot, boolType, present, Optional<object>.None) : present);
+                return true;
+            }
+
+            var underlyingDiagnostics = new DiagnosticBag();
+            var values = ImmutableArray.CreateBuilder<BoundExpression>(operands.Length);
+            for (int i = 0; i < operands.Length; i++)
+                values.Add(Value(i));
+            BoundExpression operation = bindUnderlying(values.MoveToImmutable(), underlyingDiagnostics);
+            if (operation.HasErrors)
+                return false;
+            foreach (var diagnostic in underlyingDiagnostics.ToImmutable())
+                if (diagnostic.Severity == DiagnosticSeverity.Error)
+                    return false;
+            AddDiagnostics(diagnostics, underlyingDiagnostics);
+
+            NamedTypeSymbol NullableOf(TypeSymbol type) => ctx.Compilation.ConstructNamedType(nullable.OriginalDefinition, ImmutableArray.Create(type));
+            bool booleans = Array.TrueForAll(types, t => t.SpecialType == SpecialType.System_Boolean);
+            switch (kind)
+            {
+                case LiftedKind.Equality or LiftedKind.Inequality:
+                {
+                    if (operation.Type.SpecialType != SpecialType.System_Boolean)
+                        return false;
+                    bool equal = kind == LiftedKind.Equality;
+                    BoundExpression otherwise = HasValue(0) is BoundExpression left && HasValue(1) is BoundExpression right
+                        ? Logical(equal ? BoundBinaryOperatorKind.Equals : BoundBinaryOperatorKind.NotEquals, left, right)
+                        : Literal(!equal);
+                    result = Sequence(Conditional(boolType, AllHaveValues(), operation, otherwise));
+                    return true;
+                }
+                case LiftedKind.Comparison:
+                    if (operation.Type.SpecialType != SpecialType.System_Boolean)
+                        return false;
+                    result = Sequence(Conditional(boolType, AllHaveValues(), operation, Literal(false)));
+                    return true;
+                case LiftedKind.And or LiftedKind.Or when booleans:
+                {
+                    bool decisive = kind == LiftedKind.Or;
+                    BoundExpression Decides(int i)
+                    {
+                        BoundExpression value = decisive ? Value(i) : new BoundUnaryExpression(syntax, BoundUnaryOperatorKind.LogicalNot, boolType, Value(i), Optional<object>.None);
+                        return HasValue(i) is BoundExpression present ? Logical(BoundBinaryOperatorKind.LogicalAnd, present, value) : value;
+                    }
+                    var nullableBool = NullableOf(boolType);
+                    BoundExpression Wrap(bool value) => WrapIntoNullable(syntax, nullableBool, boolType, Literal(value));
+                    result = Sequence(Conditional(nullableBool, Logical(BoundBinaryOperatorKind.LogicalOr, Decides(0), Decides(1)), Wrap(decisive),
+                        Conditional(nullableBool, AllHaveValues(), Wrap(!decisive), MakeDefaultValue(syntax, nullableBool))));
+                    return true;
+                }
+                default:
+                {
+                    if (!operation.Type.IsValueType || operation.Type is PointerTypeSymbol || TryGetSystemNullableInfo(operation.Type, out _, out _))
+                        return false;
+                    var resultType = NullableOf(operation.Type);
+                    result = Sequence(Conditional(resultType, AllHaveValues(), WrapIntoNullable(syntax, resultType, operation.Type, operation), MakeDefaultValue(syntax, resultType)));
+                    return true;
+                }
+            }
         }
         private void CollectPatternLocalsWhenTrue(BoundExpression condition, ImmutableArray<LocalSymbol>.Builder builder)
         {

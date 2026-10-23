@@ -690,7 +690,7 @@ namespace Cnidaria.Cs
                     for (int i = 0; i < members.Length; i++)
                     {
                         if (members[i] is PropertySymbol property &&
-                            StringComparer.Ordinal.Equals(property.Name, "Current") &&
+                            property.Name == "Current" &&
                             !property.IsExplicitInterfaceImplementation &&
                             IsReadableInstanceProperty(property, context))
                         {

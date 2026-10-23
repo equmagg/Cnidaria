@@ -2541,7 +2541,7 @@ namespace Cnidaria.Cs
                         return NewArray(node, operands, ref heap, blockId);
                     case GenTreeKind.FunctionPointer:
                         return Func(node, ValueNumberFunction.FunctionPointer, operands, _store.VNForMethod(node.Method ?? throw new InvalidOperationException("Function pointer node has no target method.")));
-                    case GenTreeKind.NewObject:
+                    case GenTreeKind.AllocObject:
                     case GenTreeKind.NewDelegate:
                     case GenTreeKind.DelegateCombine:
                     case GenTreeKind.DelegateRemove:
@@ -3522,7 +3522,7 @@ namespace Cnidaria.Cs
                         break;
 
                     case GenTreeKind.ClassInit:
-                    case GenTreeKind.NewObject:
+                    case GenTreeKind.AllocObject:
                     case GenTreeKind.NewDelegate:
                     case GenTreeKind.DelegateCombine:
                     case GenTreeKind.DelegateRemove:
@@ -3658,7 +3658,8 @@ namespace Cnidaria.Cs
 
                 if (!_store.TryGetEntry(normal, out var entry))
                     return normal;
-                if (entry.StackKind == stackKind && SameRuntimeType(entry.Type, type))
+                // An object reference is the same value whatever static type its location declares
+                if (entry.StackKind == stackKind && (SameRuntimeType(entry.Type, type) || stackKind == GenStackKind.Ref))
                     return normal;
 
                 return _store.VNForFunc(stackKind, type, ValueNumberFunction.SsaNormalize, normal, _store.VNForCanonicalType(type));
@@ -3679,7 +3680,7 @@ namespace Cnidaria.Cs
                 {
                     return normal;
                 }
-                if (entry.StackKind == stackKind && SameRuntimeType(entry.Type, type))
+                if (entry.StackKind == stackKind && (SameRuntimeType(entry.Type, type) || stackKind == GenStackKind.Ref))
                 {
                     return normal;
                 }

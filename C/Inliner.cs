@@ -812,7 +812,7 @@ public static class Inliner
         }
 
         private GimpleInitializerListItem CloneInitializerItem(GimpleInitializerListItem item)
-            => new GimpleInitializerListItem(item.Syntax, item.Designators, CloneInitializer(item.Initializer));
+            => new GimpleInitializerListItem(item.Syntax, item.Designators, CloneInitializer(item.Initializer), item.ElementIndex);
 
         private GimpleLabel CloneLabel(GimpleLabel label)
         {

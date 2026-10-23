@@ -254,8 +254,8 @@ namespace Cnidaria.Cs
         }
         public bool IsAttribute(int constructorToken, string @namespace, string name)
             => TryGetAttributeTypeName(constructorToken, out var ns, out var n) &&
-               StringComparer.Ordinal.Equals(ns, @namespace) &&
-               StringComparer.Ordinal.Equals(n, name);
+               ns == @namespace &&
+               n == name;
         private void IndexStrings()
         {
             var heap = _image.AsSpan(_stringsOffset, _stringsSize);
@@ -465,7 +465,7 @@ namespace Cnidaria.Cs
             {
                 var row = metadata.GetMethodDef(rid);
 
-                if (!StringComparer.Ordinal.Equals(metadata.GetString(row.Name), name))
+                if (metadata.GetString(row.Name) != name)
                     continue;
 
                 methodDefToken = MetadataToken.Make(MetadataToken.MethodDef, rid);
@@ -484,7 +484,7 @@ namespace Cnidaria.Cs
             {
                 var row = metadata.GetMethodDef(rid);
 
-                if (!StringComparer.Ordinal.Equals(metadata.GetString(row.Name), "Main"))
+                if (metadata.GetString(row.Name) != "Main")
                     continue;
 
                 if (!IsStaticMainSignature(metadata.GetBlob(row.Signature)))

@@ -32,11 +32,6 @@ namespace Cnidaria.Cs
         public const string ArrayCopySymbol = "RhpArrayCopy";
         public const string FloatingRemainderSingleSymbol = "RhpFmodF";
         public const string FloatingRemainderDoubleSymbol = "RhpFmod";
-        public const string NewStringFromCharSymbol = "RhpNewStringFromChar";
-        public const string NewStringFromUtf16Symbol = "RhpNewStringFromUtf16";
-        public const string NewStringFromCharArraySymbol = "RhpNewStringFromCharArray";
-        public const string NewStringFromCharArrayRangeSymbol = "RhpNewStringFromCharArrayRange";
-        public const string NewStringFromReadOnlySpanSymbol = "RhpNewStringFromReadOnlySpan";
         public const string ThrowSymbol = "RhpThrow";
         public const string RethrowSymbol = "RhpRethrow";
         public const string DispatchExceptionSymbol = "RhpDispatchException";
@@ -251,11 +246,11 @@ namespace Cnidaria.Cs
 
         private static int SectionOriginalSize(RiscVProgram runtime, string sectionName)
         {
-            if (StringComparer.Ordinal.Equals(sectionName, TextSectionName))
+            if (sectionName == TextSectionName)
                 return checked(runtime.Text.Instructions.Length * 4);
             foreach (var section in runtime.DataSections)
             {
-                if (StringComparer.Ordinal.Equals(section.Name, sectionName))
+                if (section.Name == sectionName)
                     return checked(section.Data.Length + section.BssSize);
             }
             return 0;
@@ -316,7 +311,7 @@ namespace Cnidaria.Cs
             }
 
             if (method.DeclaringType.Namespace == "System.Runtime" &&
-                method.DeclaringType.Name == "RuntimeImports" &&
+                method.DeclaringType.Name is "RuntimeImports" or "InternalCalls" &&
                 method.Name == "RhBulkMoveWithWriteBarrier" &&
                 method.IsStatic && !method.HasThis && method.ParameterTypes.Length == 3 &&
                 method.ParameterTypes[0].Kind == RuntimeTypeKind.ByRef &&
@@ -329,6 +324,11 @@ namespace Cnidaria.Cs
             if (IsFastPollGcInternalCall(method))
             {
                 return GcPollSymbol;
+            }
+
+            if (IsNewFastInternalCall(method))
+            {
+                return NewFastSymbol;
             }
 
             if (IsSystemType(method.DeclaringType, "SpanHelpers") &&
@@ -354,9 +354,9 @@ namespace Cnidaria.Cs
                 return MemsetSymbol;
             }
 
-            if (StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Threading") &&
-                StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Thread") &&
-                StringComparer.Ordinal.Equals(method.Name, "GetCurrentProcessorNumber") &&
+            if (method.DeclaringType.Namespace == "System.Threading" &&
+                method.DeclaringType.Name == "Thread" &&
+                method.Name == "GetCurrentProcessorNumber" &&
                 method.IsStatic &&
                 !method.HasThis &&
                 method.ParameterTypes.Length == 0 &&
@@ -366,41 +366,41 @@ namespace Cnidaria.Cs
             }
 
             // An address-derived hash exists for every object, so trying to get one always succeeds
-            if (StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Runtime") &&
-                StringComparer.Ordinal.Equals(method.DeclaringType.Name, "RuntimeImports") &&
+            if (method.DeclaringType.Namespace == "System.Runtime" &&
+                method.DeclaringType.Name == "RuntimeImports" &&
                 method.Name is "RhGetObjectHashCode" or "RhTryGetObjectHashCode")
             {
                 return GetObjectHashCodeSymbol;
             }
 
-            if (StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Threading") &&
-                StringComparer.Ordinal.Equals(method.DeclaringType.Name, "ObjectHeader") &&
+            if (method.DeclaringType.Namespace == "System.Threading" &&
+                method.DeclaringType.Name == "ObjectHeader" &&
                 method.IsStatic &&
                 !method.HasThis &&
                 method.ParameterTypes.Length == 1 &&
                 IsSystemType(method.ParameterTypes[0], "Object") &&
                 IsVoid(method.ReturnType))
             {
-                if (StringComparer.Ordinal.Equals(method.Name, "AcquireThinLock"))
+                if (method.Name == "AcquireThinLock")
                     return MonitorEnterSymbol;
-                if (StringComparer.Ordinal.Equals(method.Name, "Release"))
+                if (method.Name == "Release")
                     return MonitorExitSymbol;
             }
 
-            if (StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Runtime.InteropServices") &&
-                StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Marshal") &&
+            if (method.DeclaringType.Namespace == "System.Runtime.InteropServices" &&
+                method.DeclaringType.Name == "Marshal" &&
                 method.IsStatic &&
                 !method.HasThis &&
                 method.ParameterTypes.Length == 1 &&
                 IsSystemType(method.ParameterTypes[0], "IntPtr"))
             {
-                if (StringComparer.Ordinal.Equals(method.Name, "AllocHGlobal") &&
+                if (method.Name == "AllocHGlobal" &&
                     IsSystemType(method.ReturnType, "IntPtr"))
                 {
                     return AllocHGlobalSymbol;
                 }
 
-                if (StringComparer.Ordinal.Equals(method.Name, "FreeHGlobal") &&
+                if (method.Name == "FreeHGlobal" &&
                     IsVoid(method.ReturnType))
                 {
                     return FreeHGlobalSymbol;
@@ -421,9 +421,9 @@ namespace Cnidaria.Cs
                 !method.HasInternalCall ||
                 !method.IsStatic ||
                 method.HasThis ||
-                !StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Runtime.CompilerServices") ||
-                !StringComparer.Ordinal.Equals(method.DeclaringType.Name, "RuntimeHelpers") ||
-                !StringComparer.Ordinal.Equals(method.Name, "IsReferenceOrContainsReferences") ||
+                method.DeclaringType.Namespace != "System.Runtime.CompilerServices" ||
+                method.DeclaringType.Name != "RuntimeHelpers" ||
+                method.Name != "IsReferenceOrContainsReferences" ||
                 method.ParameterTypes.Length != 0 ||
                 method.MethodGenericArguments.Length != 1 ||
                 !IsSystemType(method.ReturnType, "Boolean"))
@@ -451,9 +451,9 @@ namespace Cnidaria.Cs
             return method.HasInternalCall &&
                    method.IsStatic &&
                    !method.HasThis &&
-                   StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Runtime") &&
-                   StringComparer.Ordinal.Equals(method.DeclaringType.Name, "RuntimeImports") &&
-                   StringComparer.Ordinal.Equals(method.Name, "RhAllocateNewArray") &&
+                   method.DeclaringType.Namespace == "System.Runtime" &&
+                   method.DeclaringType.Name == "RuntimeImports" &&
+                   method.Name == "RhAllocateNewArray" &&
                    method.ParameterTypes.Length == 2 &&
                    IsSystemType(method.ParameterTypes[0], "Int32") &&
                    IsSystemType(method.ParameterTypes[1], "UInt32") &&
@@ -467,8 +467,16 @@ namespace Cnidaria.Cs
                 throw new ArgumentNullException(nameof(method));
 
             return IsAllocateNewArrayInternalCall(method) || IsMemberwiseCloneInternalCall(method) ||
-                IsFastAllocateStringInternalCall(method) || IsFastPollGcInternalCall(method);
+                IsFastAllocateStringInternalCall(method) || IsFastPollGcInternalCall(method) || IsNewFastInternalCall(method);
         }
+
+        // Allocates a fixed-size object of the MethodTable it is passed
+        public static bool IsNewFastInternalCall(RuntimeMethod method)
+            => method.HasInternalCall && method.IsStatic && !method.HasThis &&
+               method.DeclaringType.Namespace == "System.Runtime" &&
+               method.DeclaringType.Name == "InternalCalls" &&
+               method.Name == "RhpNewFast" &&
+               method.ParameterTypes.Length == 1 && method.ParameterTypes[0].Kind == RuntimeTypeKind.Pointer;
 
         public static bool IsFastPollGcInternalCall(RuntimeMethod method)
         {
@@ -485,14 +493,14 @@ namespace Cnidaria.Cs
                    method.IsStatic &&
                    IsSystemType(method.DeclaringType, "String") &&
                    IsSystemType(method.ReturnType, "String") &&
-                   StringComparer.Ordinal.Equals(method.Name, "FastAllocateString") &&
+                   method.Name == "FastAllocateString" &&
                    method.ParameterTypes.Length == 1 &&
                    IsSystemType(method.ParameterTypes[0], "Int32");
         }
 
         private static bool IsReadOnlyCharSpan(RuntimeType type)
         {
-            if (!StringComparer.Ordinal.Equals(type.Namespace, "System") ||
+            if (type.Namespace != "System" ||
                 !type.Name.StartsWith("ReadOnlySpan", StringComparison.Ordinal))
             {
                 return false;
@@ -510,8 +518,8 @@ namespace Cnidaria.Cs
             => type.PrimitiveKind == RuntimePrimitiveKind.Void || IsSystemType(type, "Void");
 
         private static bool IsSystemType(RuntimeType type, string name)
-            => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
-               StringComparer.Ordinal.Equals(type.Name, name);
+            => type.Namespace == "System" &&
+               type.Name == name;
 
         private static RiscVProgram Compile(TargetInfo target)
         {

@@ -16,7 +16,7 @@ namespace Cnidaria.Cs
                 foreach (var member in container.GetMembers())
                 {
                     if (member is MethodSymbol { ExtensionMember: { } info } method &&
-                        info.Kind == kind && info.IsStatic == isStatic && StringComparer.Ordinal.Equals(info.Name, name))
+                        info.Kind == kind && info.IsStatic == isStatic && info.Name == name)
                     {
                         yield return method;
                     }

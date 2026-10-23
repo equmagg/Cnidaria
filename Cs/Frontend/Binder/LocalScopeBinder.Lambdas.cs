@@ -80,7 +80,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < methods.Length; i++)
                 {
                     var m = methods[i];
-                    if (!m.IsStatic && StringComparer.Ordinal.Equals(m.Name, "Invoke"))
+                    if (!m.IsStatic && m.Name == "Invoke")
                     {
                         delegateType = named;
                         invoke = m;

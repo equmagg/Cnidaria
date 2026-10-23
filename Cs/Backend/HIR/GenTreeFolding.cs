@@ -612,7 +612,7 @@ namespace Cnidaria.Cs
                 left.StackKind != right.StackKind ||
                 left.Int32 != right.Int32 ||
                 left.Int64 != right.Int64 ||
-                !StringComparer.Ordinal.Equals(left.Text, right.Text) ||
+                left.Text != right.Text ||
                 !ReferenceEquals(left.RuntimeType, right.RuntimeType) ||
                 !ReferenceEquals(left.Field, right.Field) ||
                 !ReferenceEquals(left.Method, right.Method) ||

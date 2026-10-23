@@ -968,6 +968,8 @@ namespace Cnidaria.Cs
         }
         private void InvokeMethod(RuntimeMethod method, int total, int resumePc, CancellationToken ct, ExecutionLimits limits)
         {
+            if (_rts.GetRuntimeExport(method) is RuntimeMethod export)
+                method = export;
             if (method.IsStatic && !IsTypeInitializer(method) && TryDeferTypeInitialization(method.DeclaringType, resumePc, ct, limits))
                 return;
 
@@ -1028,15 +1030,15 @@ namespace Cnidaria.Cs
             InvokeMethod(target, argumentCount, resumePc: pc, ct, limits);
         }
         private static bool IsTypeInitializer(RuntimeMethod method)
-            => StringComparer.Ordinal.Equals(method.Name, ".cctor");
+            => method.Name == ".cctor";
         private static bool IsSystemMethod(RuntimeMethod method, string ns, string typeName, string name)
-            => StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, ns) &&
-               StringComparer.Ordinal.Equals(method.DeclaringType.Name, typeName) &&
-               StringComparer.Ordinal.Equals(method.Name, name);
+            => method.DeclaringType.Namespace == ns &&
+               method.DeclaringType.Name == typeName &&
+               method.Name == name;
         private static string Describe(RuntimeMethod method)
             => $"{method.DeclaringType.Namespace}.{method.DeclaringType.Name}.{method.Name}";
         private bool IsDelegateInvoke(RuntimeMethod method)
-            => method.HasThis && method.CilBody is null && StringComparer.Ordinal.Equals(method.Name, "Invoke") &&
+            => method.HasThis && method.CilBody is null && method.Name == "Invoke" &&
                IsDelegateLikeRuntimeType(method.DeclaringType);
 
         // A type token yields the RuntimeTypeHandle of its type id, the handle object headers carry too.
@@ -1053,13 +1055,33 @@ namespace Cnidaria.Cs
             PushSlot(new Slot(SlotKind.Value, abs, handleType.TypeId));
         }
         private RuntimeType RuntimeTypeHandleType => _runtimeTypeHandleType ??= ResolveCoreTypeOrThrow("System", "RuntimeTypeHandle");
+        private bool TryReadMethodTable(string getter, RuntimeType type, out Slot value)
+        {
+            switch (getter)
+            {
+                case "get_ElementType":
+                    value = new Slot(SlotKind.I4, (int)RuntimeMethodTables.ElementType(type));
+                    return true;
+                case "get_ValueTypeSize":
+                    value = new Slot(SlotKind.I4, type.SizeOf);
+                    return true;
+                case "get_ContainsGCPointers":
+                    value = new Slot(SlotKind.I4, type.ContainsGcPointers ? 1 : 0);
+                    return true;
+                case "get_NullableType":
+                    value = NativeIntSlot(type.GenericTypeArguments[0].TypeId);
+                    return true;
+                case "get_NullableValueOffset":
+                    value = new Slot(SlotKind.I4, RuntimeMethodTables.NullableValueOffset(type));
+                    return true;
+                default:
+                    value = default;
+                    return false;
+            }
+        }
+
         private bool TryInvokeRuntimeTypeQuery(RuntimeMethod rm)
         {
-            if (rm.Name == "RhGetObjectTypeHandle")
-            {
-                PushSlot(NativeIntSlot(GetObjectTypeFromRef(PopSlot()).TypeId));
-                return true;
-            }
             if (!rm.Name.StartsWith("RhGetType", StringComparison.Ordinal))
                 return false;
 
@@ -1067,6 +1089,11 @@ namespace Cnidaria.Cs
             if (rm.Name == "RhGetTypeFlags")
             {
                 PushSlot(new Slot(SlotKind.I4, (int)RuntimeTypeNames.Flags(type)));
+                return true;
+            }
+            if (rm.Name == "RhGetTypeCorElementType")
+            {
+                PushSlot(new Slot(SlotKind.I4, RuntimeTypeNames.CorElementType(type)));
                 return true;
             }
             string? text = rm.Name switch
@@ -1907,19 +1934,6 @@ namespace Cnidaria.Cs
         }
         private bool IsSystemStringType(RuntimeType t)
             => t.Namespace == "System" && t.Name == "String";
-        private static bool IsReadOnlyCharSpanType(RuntimeType type)
-        {
-            if (!StringComparer.Ordinal.Equals(type.Namespace, "System") ||
-                !type.Name.StartsWith("ReadOnlySpan", StringComparison.Ordinal))
-            {
-                return false;
-            }
-
-            var arguments = type.GenericTypeArguments;
-            return arguments.Length == 1 &&
-                   StringComparer.Ordinal.Equals(arguments[0].Namespace, "System") &&
-                   StringComparer.Ordinal.Equals(arguments[0].Name, "Char");
-        }
         private bool IsSystemBooleanType(RuntimeType t)
             => t.Namespace == "System" && t.Name == "Boolean";
         private int GetStringLengthFromObject(int strObjAbs)
@@ -2007,9 +2021,9 @@ namespace Cnidaria.Cs
         }
 
         private static bool IsSystemDelegateBase(RuntimeType type)
-            => StringComparer.Ordinal.Equals(type.Namespace, "System") &&
-               (StringComparer.Ordinal.Equals(type.Name, "Delegate") ||
-                StringComparer.Ordinal.Equals(type.Name, "MulticastDelegate"));
+            => type.Namespace == "System" &&
+               (type.Name == "Delegate" ||
+                type.Name == "MulticastDelegate");
 
         private bool IsDelegateLikeRuntimeType(RuntimeType type)
         {
@@ -3114,7 +3128,7 @@ namespace Cnidaria.Cs
             RuntimeMethod? ctor = null;
             foreach (var method in type.Methods)
             {
-                if (!method.IsStatic && method.ParameterTypes.Length == 0 && StringComparer.Ordinal.Equals(method.Name, ".ctor"))
+                if (!method.IsStatic && method.ParameterTypes.Length == 0 && method.Name == ".ctor")
                     ctor = method;
             }
             if (ctor is null)
@@ -3186,109 +3200,12 @@ namespace Cnidaria.Cs
             int returnPc = _curPc;
             if (IsSystemStringType(ctor.DeclaringType))
             {
-                int length = 0;
-                if (args.Length == 0)
-                {
-                    length = 0;
-                }
-                else if (args.Length == 2 &&
-                         ctor.ParameterTypes[0].Namespace == "System" && ctor.ParameterTypes[0].Name == "Char" &&
-                         ctor.ParameterTypes[1].Namespace == "System" && ctor.ParameterTypes[1].Name == "Int32")
-                {
-                    length = args[1].AsI4Checked();
-                    if (length < 0) throw new InvalidOperationException("Negative string length.");
-                }
-                else if (args.Length == 1 && ctor.ParameterTypes[0].Kind == RuntimeTypeKind.Array &&
-                         ctor.ParameterTypes[0].ElementType is { Namespace: "System", Name: "Char" })
-                {
-                    // If value is null, ctor body should throw
-                    if (args[0].Kind == SlotKind.Null) length = 0;
-                    else
-                    {
-                        ValidateArrayRefExact(args[0], ctor.ParameterTypes[0].ElementType!, out _, out int arrLen, out _);
-                        length = arrLen;
-                    }
-                }
-                else if (args.Length == 3 && ctor.ParameterTypes[0].Kind == RuntimeTypeKind.Array &&
-                         ctor.ParameterTypes[0].ElementType is { Namespace: "System", Name: "Char" } &&
-                         ctor.ParameterTypes[1].Namespace == "System" && ctor.ParameterTypes[1].Name == "Int32" &&
-                         ctor.ParameterTypes[2].Namespace == "System" && ctor.ParameterTypes[2].Name == "Int32")
-                {
-                    length = args[2].AsI4Checked();
-                    if (length < 0) throw new InvalidOperationException("Negative string length.");
-                }
-                else if (args.Length == 1 && IsReadOnlyCharSpanType(ctor.ParameterTypes[0]))
-                {
-                    if (args[0].Kind != SlotKind.Value)
-                        throw new NotSupportedException("System.String(ReadOnlySpan<char>) expects a value type slot.");
+                PushFrame(_rts.GetStringFactory(ctor), returnPc, ct, limits);
 
-                    var spanType = GetValueSlotType(args[0]);
-                    int spanAbs = checked((int)args[0].Payload);
-                    RuntimeField? lengthField = null;
-                    for (int i = 0; i < spanType.InstanceFields.Length; i++)
-                    {
-                        if (StringComparer.Ordinal.Equals(spanType.InstanceFields[i].Name, "_length"))
-                        {
-                            lengthField = spanType.InstanceFields[i];
-                            break;
-                        }
-                    }
-                    if (lengthField is null)
-                        throw new NotSupportedException("System.String(ReadOnlySpan<char>) cannot locate the span length field.");
-
-                    length = LoadValueAsSlot(spanAbs, lengthField.Offset, lengthField.FieldType).AsI4Checked();
-                    if (length < 0)
-                        throw new InvalidOperationException("Negative string length.");
-                }
-                else if (args.Length == 1 && ctor.ParameterTypes[0].Kind == RuntimeTypeKind.Pointer &&
-                         ctor.ParameterTypes[0].ElementType is { Namespace: "System", Name: "Char" })
-                {
-                    if (args[0].Kind == SlotKind.Null) length = 0;
-                    else
-                    {
-                        int abs = GetAddressAbsOrThrow(args[0]);
-
-                        const int MaxChars = 1 * 1024 * 1024; // hard safety cap
-                        int n = 0;
-                        for (; n < MaxChars; n++)
-                        {
-                            int pos = abs + (n * 2);
-                            if (pos >= _heapBase && pos + 2 <= _heapPtr)
-                            {
-                                CheckHeapAccess(pos, 2, writable: false);
-                            }
-                            else
-                            {
-                                CheckActiveStackAccess(pos, 2, writable: false);
-                            }
-
-                            ushort ch = BinaryPrimitives.ReadUInt16LittleEndian(_mem.AsSpan(pos, 2));
-                            if (ch == 0) break;
-                        }
-                        length = n;
-                    }
-                }
-                else
-                {
-                    throw new NotSupportedException(
-                        $"System.String constructor not supported (arity={args.Length}).");
-                }
-
-                int objAbs = AllocStringUninitialized(length);
-                var objRef = new Slot(SlotKind.Ref, objAbs);
-
-                // Resolve ctor body and run it
-                PushFrame(ctor, returnPc, ct, limits);
-
-                var calleeLayout = _curLayout ?? throw new InvalidOperationException("Ctor frame layout not initialized.");
-                int calleeArgsAbs = _curArgsAbs;
-
-                // arg0 = this
-                StoreArgRawAt(calleeLayout, 0, calleeArgsAbs, objRef);
+                var factoryLayout = _curLayout ?? throw new InvalidOperationException("String factory frame layout not initialized.");
+                int factoryArgsAbs = _curArgsAbs;
                 for (int i = 0; i < args.Length; i++)
-                    StoreArgRawAt(calleeLayout, i + 1, calleeArgsAbs, args[i]);
-
-                _pendingCtorResults[_frameBase] = PendingCtorResult.ForRef(objAbs);
+                    StoreArgRawAt(factoryLayout, i, factoryArgsAbs, args[i]);
                 return;
             }
             if (ctor.DeclaringType.IsReferenceType)
@@ -3556,7 +3473,7 @@ namespace Cnidaria.Cs
                 var m = t.Methods[i];
                 if (!m.IsStatic) continue;
                 if (m.ParameterTypes.Length != 0) continue;
-                if (!StringComparer.Ordinal.Equals(m.Name, ".cctor")) continue;
+                if (m.Name != ".cctor") continue;
                 return m;
             }
             return null;
@@ -3995,7 +3912,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < t.InstanceFields.Length; i++)
                 {
                     var f = t.InstanceFields[i];
-                    if (!StringComparer.Ordinal.Equals(f.Name, "_message"))
+                    if (f.Name != "_message")
                         continue;
 
                     int fieldAbs = checked(exObjAbs + f.Offset);
@@ -6291,12 +6208,19 @@ namespace Cnidaria.Cs
                         return false;
                 }
             }
+            if (rm.HasInternalCall && rm.IsStatic && rm.DeclaringType.Namespace == "System.Runtime" &&
+                rm.DeclaringType.Name == "InternalCalls" && rm.Name == "RhpNewFast")
+            {
+                RuntimeType type = _rts.GetTypeById(checked((int)IntegerPayload(PopSlot())));
+                PushSlot(new Slot(SlotKind.Ref, type.IsValueType ? AllocBoxedValueObject(type) : AllocObject(type)));
+                return true;
+            }
             if (rm.IsStatic && !rm.HasThis && rm.HasInternalCall &&
                 rm.ParameterTypes.Length == 3 && totalArgs == 3 && IsVoidReturn(rm.ReturnType) &&
                 ((rm.DeclaringType.Namespace == "System" &&
                   rm.DeclaringType.Name == "SpanHelpers" && rm.Name == "memmove") ||
                  (rm.DeclaringType.Namespace == "System.Runtime" &&
-                  rm.DeclaringType.Name == "RuntimeImports" && rm.Name == "RhBulkMoveWithWriteBarrier")))
+                  rm.DeclaringType.Name is "RuntimeImports" or "InternalCalls" && rm.Name == "RhBulkMoveWithWriteBarrier")))
             {
                 Slot lengthSlot = PopSlot();
                 Slot sourceSlot = PopSlot();
@@ -6381,6 +6305,43 @@ namespace Cnidaria.Cs
             if (RuntimeTypeSystem.IsHardwareAccelerationQuery(rm))
             {
                 PushSlot(new Slot(SlotKind.I4, 0));
+                return true;
+            }
+
+            // Type handles are type ids here, with no MethodTable to read an enum's element type from
+            if (IsSystemMethod(rm, "System", "Enum", "InternalGetCorElementType"))
+            {
+                PushSlot(new Slot(SlotKind.I4, RuntimeTypeNames.CorElementType(GetObjectTypeFromRef(PopSlot()))));
+                return true;
+            }
+
+            if (rm.IsStatic && rm.MethodGenericArguments.Length == 1 && rm.Name == "Of" &&
+                rm.DeclaringType.Namespace == "Internal.Runtime" && rm.DeclaringType.Name == "MethodTable")
+            {
+                PushSlot(NativeIntSlot(rm.MethodGenericArguments[0].TypeId));
+                return true;
+            }
+
+            if (rm.HasThis && rm.DeclaringType.Namespace == "Internal.Runtime" && rm.DeclaringType.Name == "MethodTable" &&
+                TryReadMethodTable(rm.Name, _rts.GetTypeById(checked((int)IntegerPayload(PeekSlot()))), out Slot answer))
+            {
+                PopSlot();
+                PushSlot(answer);
+                return true;
+            }
+
+            if (IsSystemMethod(rm, "System.Runtime.CompilerServices", "RuntimeHelpers", "GetRawData") && rm.ParameterTypes.Length == 1)
+            {
+                Slot obj = PopSlot();
+                int objAbs = checked((int)obj.Payload);
+                int size = GetHeapObjectSize(objAbs, GetObjectTypeFromRef(obj)) - ObjectHeaderSize;
+                PushSlot(new Slot(SlotKind.ByRef, GetBoxedValuePayloadAbs(objAbs), aux: size));
+                return true;
+            }
+
+            if (IsSystemMethod(rm, "System.Runtime.CompilerServices", "RuntimeHelpers", "GetMethodTable") && rm.ParameterTypes.Length == 1)
+            {
+                PushSlot(NativeIntSlot(GetObjectTypeFromRef(PopSlot()).TypeId));
                 return true;
             }
 
@@ -6711,14 +6672,14 @@ namespace Cnidaria.Cs
             }
             static bool IsCoreLibRandomLike(RuntimeType t)
             {
-                if (!StringComparer.Ordinal.Equals(t.AssemblyName, "std"))
+                if (t.AssemblyName != "std")
                     return false;
 
                 for (var cur = t; cur != null; cur = cur.BaseType)
                 {
-                    if (StringComparer.Ordinal.Equals(cur.AssemblyName, "std") &&
-                        StringComparer.Ordinal.Equals(cur.Namespace, "System") &&
-                        StringComparer.Ordinal.Equals(cur.Name, "Random"))
+                    if (cur.AssemblyName == "std" &&
+                        cur.Namespace == "System" &&
+                        cur.Name == "Random")
                         return true;
                 }
                 return false;
@@ -6851,8 +6812,8 @@ namespace Cnidaria.Cs
                     for (int i = 0; i < spanType.InstanceFields.Length; i++)
                     {
                         var f = spanType.InstanceFields[i];
-                        if (StringComparer.Ordinal.Equals(f.Name, "_reference")) refField = f;
-                        else if (StringComparer.Ordinal.Equals(f.Name, "_length")) lenField = f;
+                        if (f.Name == "_reference") refField = f;
+                        else if (f.Name == "_length") lenField = f;
                     }
                     if (refField is null || lenField is null)
                     {

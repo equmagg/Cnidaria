@@ -5787,12 +5787,6 @@ namespace Cnidaria.Cs
                 ImmutableArray<GenTree>.Builder blockLinearNodes,
                 ImmutableArray<GenTree>.Builder allNodes)
             {
-                if (node.Kind == GenTreeKind.NewObject && node.Method?.DeclaringType.IsValueType == true)
-                {
-                    throw new InvalidOperationException(
-                        "Value-type newobj must be lowered into a struct materialization temp and a void constructor call before register allocation.");
-                }
-
                 int position = GetNodePosition(node);
                 int definitionPosition = position + 1;
                 var targets = ImmutableArray.CreateBuilder<RegisterOperand>();
@@ -5801,7 +5795,6 @@ namespace Cnidaria.Cs
                 var registerMoves = new List<RegisterResolvedMove>();
                 var stackMoves = new List<RegisterResolvedMove>();
                 var argumentPackingHomes = new Dictionary<GenTree, RegisterOperand>();
-                bool referenceTypeNewObject = node.Kind == GenTreeKind.NewObject;
                 GenTree? indirectCallTarget = null;
                 ImmutableArray<GenTree> callArguments = node.RegisterUses;
                 if (node.Kind == GenTreeKind.IndirectCall)
@@ -5814,7 +5807,7 @@ namespace Cnidaria.Cs
                         argumentBuilder.Add(node.RegisterUses[i]);
                     callArguments = argumentBuilder.ToImmutable();
                 }
-                var descriptor = MachineAbi.BuildCallDescriptor(callArguments, _method.GetValueInfo, node.RegisterResult, node.Method, referenceTypeNewObject, _method.Target);
+                var descriptor = MachineAbi.BuildCallDescriptor(callArguments, _method.GetValueInfo, node.RegisterResult, node.Method, _method.Target);
 
                 RegisterOperand finalResult = RegisterOperand.None;
                 RegisterOperand callResult = RegisterOperand.None;
@@ -5827,12 +5820,9 @@ namespace Cnidaria.Cs
                     var resultValue = node.RegisterResult;
                     resultValueOpt = resultValue;
                     finalResult = HomeForDefinition(resultValue, definitionPosition);
-                    if (finalResult.IsNone &&
-                        (resultAbi.PassingKind == AbiValuePassingKind.Indirect || referenceTypeNewObject))
+                    if (finalResult.IsNone && resultAbi.PassingKind == AbiValuePassingKind.Indirect)
                     {
-                        int homeSize = referenceTypeNewObject
-                            ? _method.Target.PointerSize
-                            : Math.Max(_method.Target.StackSlotSize, Math.Max(1, resultAbi.Size));
+                        int homeSize = Math.Max(_method.Target.StackSlotSize, Math.Max(1, resultAbi.Size));
                         finalResult = RegisterOperand.ForSpillSlot(
                             RegisterClass.General,
                             _nextSpillSlot++,
@@ -5842,14 +5832,7 @@ namespace Cnidaria.Cs
 
                     if (!finalResult.IsNone)
                     {
-                        if (referenceTypeNewObject)
-                        {
-                            callResult = finalResult.IsFrameSlot
-                                ? finalResult
-                                : RegisterOperand.ForSpillSlot(RegisterClass.General, _nextSpillSlot++, 0, _method.Target.PointerSize);
-                            nodeResultValue = resultValue;
-                        }
-                        else if (resultAbi.PassingKind == AbiValuePassingKind.ScalarRegister)
+                        if (resultAbi.PassingKind == AbiValuePassingKind.ScalarRegister)
                         {
                             callResult = RegisterOperand.ForRegister(GetReturnRegister(resultAbi.RegisterClass));
                             nodeResultValue = resultValue;
@@ -6704,7 +6687,7 @@ namespace Cnidaria.Cs
                             callArguments = arguments.ToImmutable();
                         }
 
-                        var descriptor = MachineAbi.BuildCallDescriptor(callArguments, method.GetValueInfo, node.RegisterResult, node.Method, node.Kind == GenTreeKind.NewObject, method.Target);
+                        var descriptor = MachineAbi.BuildCallDescriptor(callArguments, method.GetValueInfo, node.RegisterResult, node.Method, method.Target);
                         for (int i = 0; i < descriptor.ArgumentSegments.Length; i++)
                         {
                             var segment = descriptor.ArgumentSegments[i];

@@ -2121,7 +2121,7 @@ namespace Cnidaria.Cs
                     for (int i = 0; i < all.Length; i++)
                     {
                         var m = all[i];
-                        if (!StringComparer.Ordinal.Equals(m.Name, name))
+                        if (m.Name != name)
                             continue;
 
                         if (m is MethodSymbol { IsExplicitInterfaceImplementation: true })
@@ -2142,7 +2142,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < all.Length; i++)
                 {
                     var m = all[i];
-                    if (!StringComparer.Ordinal.Equals(m.Name, name))
+                    if (m.Name != name)
                         continue;
 
                     if (m is MethodSymbol { IsExplicitInterfaceImplementation: true })
@@ -2306,7 +2306,7 @@ namespace Cnidaria.Cs
                         if (members[i] is MethodSymbol ms &&
                             !ms.IsConstructor &&
                             !ms.IsExplicitInterfaceImplementation &&
-                            StringComparer.Ordinal.Equals(ms.Name, name))
+                            ms.Name == name)
                         {
                             bool dup = false;
                             for (int j = 0; j < inheritedStart; j++)
@@ -2337,7 +2337,7 @@ namespace Cnidaria.Cs
                     if (members[i] is MethodSymbol ms &&
                         !ms.IsConstructor &&
                         !ms.IsExplicitInterfaceImplementation &&
-                        StringComparer.Ordinal.Equals(ms.Name, name))
+                        ms.Name == name)
                     {
                         bool dup = false;
                         for (int j = 0; j < inheritedStart; j++)

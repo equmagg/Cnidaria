@@ -85,7 +85,7 @@ namespace Cnidaria.Cs
                 if (members[i] is MethodSymbol ms &&
                     ms.IsStatic &&
                     ms.Parameters.Length == 0 &&
-                    StringComparer.Ordinal.Equals(ms.Name, ".cctor"))
+                    ms.Name == ".cctor")
                 {
                     return;
                 }
@@ -211,7 +211,7 @@ namespace Cnidaria.Cs
             if (!_isCoreLibrary) return false;
             if (arity != 0) return false;
             if (container is not SourceNamespaceSymbol ns) return false;
-            if (!StringComparer.Ordinal.Equals(GetFullNamespaceName(ns), "System")) return false;
+            if (GetFullNamespaceName(ns) != "System") return false;
 
             var st = name switch
             {
@@ -728,7 +728,7 @@ namespace Cnidaria.Cs
             var namespaces = global.GetNamespaceMembers();
             for (int i = 0; i < namespaces.Length; i++)
             {
-                if (StringComparer.Ordinal.Equals(namespaces[i].Name, "System"))
+                if (namespaces[i].Name == "System")
                 {
                     systemNs = namespaces[i];
                     break;
@@ -815,7 +815,7 @@ namespace Cnidaria.Cs
             var members = type.GetMembers();
             for (int i = 0; i < members.Length; i++)
             {
-                if (members[i] is MethodSymbol m && StringComparer.Ordinal.Equals(m.Name, "Invoke"))
+                if (members[i] is MethodSymbol m && m.Name == "Invoke")
                     return true;
             }
 

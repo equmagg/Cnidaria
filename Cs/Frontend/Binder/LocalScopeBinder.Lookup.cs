@@ -206,7 +206,7 @@ namespace Cnidaria.Cs
         private static bool IsVar(TypeSyntax typeSyntax)
         {
             return typeSyntax is IdentifierNameSyntax id &&
-                   StringComparer.Ordinal.Equals(id.Identifier.ValueText, "var");
+                   id.Identifier.ValueText == "var";
         }
         private BoundExpression Record(ExpressionSyntax s, BoundExpression b, BindingContext ctx)
         {

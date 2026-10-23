@@ -116,10 +116,10 @@ namespace Cnidaria.Cs
                 Enqueue(entryMethod);
 
                 if (!entryMethod.DeclaringType.IsBeforeFieldInit &&
-                    !StringComparer.Ordinal.Equals(entryMethod.Name, ".cctor") &&
+                    entryMethod.Name != ".cctor" &&
                     (entryMethod.IsStatic ||
                      entryMethod.DeclaringType.IsValueType ||
-                     StringComparer.Ordinal.Equals(entryMethod.Name, ".ctor")))
+                     entryMethod.Name == ".ctor"))
                 {
                     _rts.EnsureConstructedMembers(entryMethod.DeclaringType);
                     RuntimeMethod? cctor = GenTreeMethodBuilder.FindTypeInitializer(entryMethod.DeclaringType);
@@ -264,7 +264,7 @@ namespace Cnidaria.Cs
         {
             if (_rts.Target.IsRegisterBytecode ||
                 target.DeclaringType.IsBeforeFieldInit ||
-                StringComparer.Ordinal.Equals(target.Name, ".cctor") ||
+                target.Name == ".cctor" ||
                 (!target.IsStatic && !target.DeclaringType.IsValueType))
             {
                 return null;
@@ -424,7 +424,7 @@ namespace Cnidaria.Cs
         private const int InlineDiscretionaryBudget = 48;
         private const int InlineForceBudget = 128;
         private const int InlineSmallOverBudgetSize = 12;
-        private const int InlineMaxDepth = 4;
+        private const int InlineMaxDepth = 20;
         private const int InlineMaxForceDepth = 1;
         private const int InlineTotalBudget = 512;
         private const int InlineMaxBasicBlocks = 24;
@@ -478,9 +478,10 @@ namespace Cnidaria.Cs
             ComputeImportAddressExposure();
             _stackDepthAtPc = ComputeStackDepths(_body, _pops, _pushes, _module, _method);
 
-            var leaders = ComputeLeaders(_body, _stackDepthAtPc, splitAfterCalls: true, _module, _method);
+            bool[] noReturnRegion = ComputeNoReturnRegion(_body, _stackDepthAtPc, _module, _method);
+            var leaders = ComputeLeaders(_body, _stackDepthAtPc, noReturnRegion, _module, _method);
             _rootFrame = new ImportFrame(_module, _method, _body, inlineDepth: 0, callPc: -1, _localTypes, null, null, null,
-                DefaultValueLocalsOf(_body), pc => _pcToBlockId.ContainsKey(pc));
+                DefaultValueLocalsOf(_body), pc => _pcToBlockId.ContainsKey(pc), pc => noReturnRegion[pc], pc => _pcToBlockId.ContainsKey(pc + 1) ? pc + 1 : -1);
             var blocks = LinkFinallyReturns(SeparateFinallyEntries(BuildBlocks(leaders)));
             ImmutableArray<GenTreeBlock> layout = LayOutSyntheticBlocks(blocks, leaders.Count);
 
@@ -1109,7 +1110,7 @@ namespace Cnidaria.Cs
             }
         }
 
-        private List<int> ComputeLeaders(CilMethodBody body, int[] stackDepthAtPc, bool splitAfterCalls, RuntimeModule module, RuntimeMethod method)
+        private List<int> ComputeLeaders(CilMethodBody body, int[] stackDepthAtPc, bool[] noReturnRegion, RuntimeModule module, RuntimeMethod method)
         {
             var instructions = body.Instructions;
             int instructionCount = instructions.Length;
@@ -1147,7 +1148,7 @@ namespace Cnidaria.Cs
                         break;
                 }
 
-                if (splitAfterCalls && IsInlineContinuationBoundary(body, module, method, pc, ins))
+                if (IsInlineContinuationBoundary(body, module, method, pc, ins, noReturnRegion[pc]))
                     AddReachableLeader(pc + 1);
 
                 if (IsBlockTerminator(ins.Op) || IsNoReturnCall(module, method, ins))
@@ -1179,9 +1180,57 @@ namespace Cnidaria.Cs
             }
         }
 
-        private bool IsInlineContinuationBoundary(CilMethodBody body, RuntimeModule module, RuntimeMethod method, int pc, in CilInstruction instruction)
+        // The pcs RyuJIT would find in a block that ends in a throw: no branch or branch target separates them from a throw
+        // or from a [DoesNotReturn] call
+        private bool[] ComputeNoReturnRegion(CilMethodBody body, int[] stackDepthAtPc, RuntimeModule module, RuntimeMethod method)
         {
-            if (instruction.Op is not (ILOpCode.Call or ILOpCode.Callvirt) || (instruction.Prefixes & CilPrefix.Constrained) != 0)
+            var instructions = body.Instructions;
+            var isTarget = new bool[instructions.Length + 1];
+            for (int pc = 0; pc < instructions.Length; pc++)
+            {
+                var ins = instructions[pc];
+                if (ins.Op is ILOpCode.Br or ILOpCode.Leave or ILOpCode.Brtrue or ILOpCode.Brfalse or (>= ILOpCode.Beq and <= ILOpCode.Blt_Un))
+                {
+                    isTarget[ins.TargetPc] = true;
+                }
+                else if (ins.Op == ILOpCode.Switch)
+                {
+                    foreach (int target in body.GetSwitchTargets(ins))
+                        isTarget[target] = true;
+                }
+            }
+            foreach (var clause in body.ExceptionClauses)
+            {
+                isTarget[clause.TryStartPc] = true;
+                isTarget[clause.TryEndPc] = true;
+                isTarget[clause.HandlerRegionStartPc] = true;
+                isTarget[clause.HandlerStartPc] = true;
+                isTarget[clause.HandlerEndPc] = true;
+            }
+
+            var region = new bool[instructions.Length];
+            bool noReturn = false;
+            for (int pc = instructions.Length - 1; pc >= 0; pc--)
+            {
+                var ins = instructions[pc];
+                if (stackDepthAtPc[pc] != UnreachableStackDepth)
+                {
+                    if (ins.Op == ILOpCode.Throw || IsNoReturnCall(module, method, ins))
+                        noReturn = true;
+                    else if (IsBlockTerminator(ins.Op))
+                        noReturn = false;
+                }
+                region[pc] = noReturn;
+                if (isTarget[pc])
+                    noReturn = false;
+            }
+            return region;
+        }
+
+        private bool IsInlineContinuationBoundary(CilMethodBody body, RuntimeModule module, RuntimeMethod method, int pc, in CilInstruction instruction,
+            bool coldCallSite)
+        {
+            if (instruction.Op is not (ILOpCode.Call or ILOpCode.Callvirt or ILOpCode.Newobj))
                 return false;
 
             if (pc + 1 >= body.Instructions.Length)
@@ -1189,7 +1238,9 @@ namespace Cnidaria.Cs
 
             try
             {
-                var callee = _rts.ResolveMethodInMethodContext(module, instruction.Token, method);
+                var callee = ResolveInlineContinuationTarget(module, method, instruction);
+                if (callee is null)
+                    return false;
                 var calleeBody = callee.CilBody;
                 var calleeModule = callee.BodyModule;
                 if (calleeBody is null || calleeModule is null)
@@ -1198,7 +1249,7 @@ namespace Cnidaria.Cs
                 if (callee.MethodId == _method.MethodId || callee.HasInternalCall || callee.HasNoInlining || callee.DoesNotReturn)
                     return false;
 
-                if (StringComparer.Ordinal.Equals(callee.Name, ".cctor"))
+                if (callee.Name == ".cctor")
                     return false;
 
                 if (RequiresTypeInitializationBeforeCall(callee) && FindTypeInitializer(callee.DeclaringType) is not null)
@@ -1215,10 +1266,9 @@ namespace Cnidaria.Cs
                 if (!AnalyzeInlineCandidate(callee, calleeModule, calleeBody, argCount, out var info))
                     return false;
 
-                if (info.HasControlFlow && info.HasCall)
-                    return false;
-
                 if (info.HasBackwardBranch && !callee.HasAggressiveInlining)
+                    return false;
+                if (coldCallSite && !InlinesAtColdCallSite(callee, info))
                     return false;
 
                 return info.HasControlFlow;
@@ -1231,6 +1281,36 @@ namespace Cnidaria.Cs
             {
                 return false;
             }
+        }
+
+        // The method the importer will try to inline at a call, as far as the call alone determines it
+        private RuntimeMethod? ResolveInlineContinuationTarget(RuntimeModule module, RuntimeMethod method, in CilInstruction instruction)
+        {
+            var callee = _rts.ResolveMethodInMethodContext(module, instruction.Token, method);
+            if (instruction.Op == ILOpCode.Newobj)
+            {
+                if (callee.DeclaringType.Kind == RuntimeTypeKind.Array)
+                    return null;
+                return ReferenceEquals(callee.DeclaringType, _rts.SystemString) ? _rts.GetStringFactory(callee) : callee;
+            }
+
+            if ((instruction.Prefixes & CilPrefix.Constrained) != 0)
+            {
+                RuntimeType constrainedType = _rts.ResolveTypeInMethodContext(module, instruction.ConstrainedToken, method);
+                if (!constrainedType.IsValueType)
+                    return callee;
+                RuntimeMethod? implementation = _rts.ResolveVirtualMethod(callee, constrainedType);
+                return implementation is not null && implementation.DeclaringType.IsValueType ? implementation : null;
+            }
+
+            if (instruction.Op == ILOpCode.Callvirt && callee.IsVirtual &&
+                IsEqualityComparerType(callee.DeclaringType, out RuntimeType? comparedType) &&
+                TryGetDefaultEqualityComparerType(comparedType, out RuntimeType? comparerType))
+            {
+                return _rts.ResolveVirtualMethod(callee, comparerType);
+            }
+
+            return callee;
         }
 
         // A call to a [DoesNotReturn] method ends its block like throw; through a virtual slot an override might return.
@@ -1268,9 +1348,9 @@ namespace Cnidaria.Cs
                    !method.IsStatic &&
                    method.ParameterTypes.Length == 0 &&
                    method.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Int32 &&
-                   StringComparer.Ordinal.Equals(method.Name, "get_Length") &&
-                   StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System") &&
-                   StringComparer.Ordinal.Equals(method.DeclaringType.Name, "String");
+                   method.Name == "get_Length" &&
+                   method.DeclaringType.Namespace == "System" &&
+                   method.DeclaringType.Name is "String" or "Array";
         }
         private RuntimeType GetArgType(RuntimeMethod method, int argIndex)
         {
@@ -1372,6 +1452,10 @@ namespace Cnidaria.Cs
             public GenTemp[]? LocalTemps { get; }
             public HashSet<int> DefaultValueLocals { get; }
             public Func<int, bool> IsLeader { get; }
+            // Whether a call at a pc runs only on the way to a throw, here or at the site this frame inlines into
+            public Func<int, bool> IsColdCallSite { get; }
+            // The block that starts after the instruction at a pc, or -1 when the instruction ends no block
+            public Func<int, int>? ContinuationPcAfter { get; }
 
             public ImportFrame(
                 RuntimeModule module,
@@ -1384,7 +1468,9 @@ namespace Cnidaria.Cs
                 StackValue?[]? argSubstitutions,
                 GenTemp[]? localTemps,
                 HashSet<int> defaultValueLocals,
-                Func<int, bool> isLeader)
+                Func<int, bool> isLeader,
+                Func<int, bool> isColdCallSite,
+                Func<int, int>? continuationPcAfter = null)
             {
                 Module = module;
                 Method = method;
@@ -1397,6 +1483,8 @@ namespace Cnidaria.Cs
                 LocalTemps = localTemps;
                 DefaultValueLocals = defaultValueLocals;
                 IsLeader = isLeader;
+                IsColdCallSite = isColdCallSite;
+                ContinuationPcAfter = continuationPcAfter;
             }
 
             public bool IsInline => CallPc >= 0;
@@ -1618,6 +1706,9 @@ namespace Cnidaria.Cs
                         return 1;
                     }
 
+                case ILOpCode.Box when TryImportBoxIdiom(frame, stack, statements, pc, npc, ins, out int boxIdiomLength):
+                    return boxIdiomLength;
+
                 case ILOpCode.Castclass:
                 case ILOpCode.Isinst:
                 case ILOpCode.Box:
@@ -1692,8 +1783,13 @@ namespace Cnidaria.Cs
                     return EmitCall(frame, stack, statements, successorPcs, pc, out terminatedBlock);
 
                 case ILOpCode.Newobj:
-                    EmitNewObject(frame, stack, statements, npc, ins);
-                    return 1;
+                    {
+                        RuntimeMethod ctor = ResolveMethodIn(frame, ins.Token);
+                        int continuationPc = successorPcs is null ? -1 : frame.ContinuationPcAfter?.Invoke(pc) ?? -1;
+                        terminatedBlock = EmitNewObject(frame, stack, statements, npc, op, ins.Token, ctor, frame.IsColdCallSite(pc),
+                            continuationPc >= 0 ? successorPcs : null, continuationPc);
+                        return 1;
+                    }
 
                 case ILOpCode.Ldftn:
                     return EmitFunctionPointerOrDelegate(frame, stack, statements, pc, npc);
@@ -1935,6 +2031,85 @@ namespace Cnidaria.Cs
                 return;
             }
             AppendImporterStatement(statements, stack, MarkExplicitInit(Node(GenTreeKind.StoreIndirect, pc, ILOpCode.Initobj, operands: Two(target, init), runtimeType: type)));
+        }
+
+        // A boxed value type is never null and has exactly its own type, so a box that is only tested or unboxed is never allocated
+        private bool TryImportBoxIdiom(ImportFrame frame, List<StackValue> stack, List<GenTree> statements, int pc, int npc, in CilInstruction ins, out int length)
+        {
+            length = 0;
+            RuntimeType boxedType = ResolveTypeIn(frame, ins.Token);
+            if (!boxedType.IsValueType || stack.Count == 0)
+                return false;
+
+            if (frame.HasInstruction(pc + 1, ILOpCode.Unbox_Any) &&
+                ReferenceEquals(ResolveTypeIn(frame, frame.Body.Instructions[pc + 1].Token), boxedType))
+            {
+                length = 2;
+                return true;
+            }
+
+            bool nullable = IsSystemNullableRuntimeType(boxedType);
+            bool isInstance = true;
+            int next = pc + 1;
+            if (frame.HasInstruction(next, ILOpCode.Isinst))
+            {
+                RuntimeType targetType = ResolveTypeIn(frame, frame.Body.Instructions[next].Token);
+                if (nullable || targetType.Kind == RuntimeTypeKind.TypeParam || IsSystemNullableRuntimeType(targetType))
+                    return false;
+                isInstance = targetType.IsValueType
+                    ? ReferenceEquals(boxedType, targetType)
+                    : _rts.IsAssignableTo(boxedType, targetType);
+                next++;
+            }
+
+            bool comparesEqualToNull;
+            int testLength;
+            if (frame.HasInstruction(next, ILOpCode.Ldnull) &&
+                (frame.HasInstruction(next + 1, ILOpCode.Ceq) || frame.HasInstruction(next + 1, ILOpCode.Cgt_Un)))
+            {
+                comparesEqualToNull = frame.Body.Instructions[next + 1].Op == ILOpCode.Ceq;
+                testLength = 2;
+            }
+            else if (frame.HasInstruction(next, ILOpCode.Brtrue) || frame.HasInstruction(next, ILOpCode.Brtrue_S) ||
+                     frame.HasInstruction(next, ILOpCode.Brfalse) || frame.HasInstruction(next, ILOpCode.Brfalse_S))
+            {
+                comparesEqualToNull = false;
+                testLength = 0;
+            }
+            else
+            {
+                return false;
+            }
+
+            GenTree result;
+            if (nullable)
+            {
+                _rts.EnsureRuntimeTypeReady(boxedType);
+                RuntimeField? hasValue = Array.Find(boxedType.InstanceFields, static field => field.Name == "hasValue");
+                if (hasValue is null)
+                    return false;
+                var value = Pop(stack, npc, ins.Op);
+                GenTemp nullableTemp = CreateImporterSpillTemp(boxedType, value.StackKind);
+                AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreTemp, npc, ins.Op, operands: One(value.Node), int32: nullableTemp.Index));
+                result = Node(GenTreeKind.Field, npc, ILOpCode.Ldfld, type: hasValue.FieldType, stackKind: StackKindOf(hasValue.FieldType),
+                    operands: One(TempAddress(npc, ins.Op, nullableTemp).Node), field: hasValue);
+                if (comparesEqualToNull)
+                {
+                    result = Node(GenTreeKind.Binary, npc, ILOpCode.Ceq, stackKind: GenStackKind.I4,
+                        operands: Two(result, ConstI4(npc, ins.Op, 0)));
+                }
+            }
+            else
+            {
+                var value = Pop(stack, npc, ins.Op);
+                if ((value.Node.Flags & (GenTreeFlags.ContainsCall | GenTreeFlags.CanThrow | GenTreeFlags.SideEffect | GenTreeFlags.MemoryWrite)) != 0)
+                    AppendImporterStatement(statements, stack, CreateDiscardStatement(value.Node, npc, ins.Op));
+                result = ConstI4(npc, ins.Op, isInstance != comparesEqualToNull ? 1 : 0);
+            }
+
+            PushImportedValue(stack, statements, result);
+            length = next + testLength - pc;
+            return true;
         }
 
         private void EmitTypeOperation(ImportFrame frame, List<StackValue> stack, List<GenTree> statements, int pc, in CilInstruction ins)
@@ -2229,13 +2404,23 @@ namespace Cnidaria.Cs
                 operands: One(handle), int32: 1, method: fromHandle);
         }
 
+        private static string? MethodTableQuery(string getter) => getter switch
+        {
+            "get_ElementType" => "RhGetTypeElementType",
+            "get_ValueTypeSize" => "RhGetTypeValueTypeSize",
+            "get_ContainsGCPointers" => "RhGetTypeContainsGCPointers",
+            "get_NullableType" => "RhGetTypeNullableType",
+            "get_NullableValueOffset" => "RhGetTypeNullableValueOffset",
+            _ => null,
+        };
+
         private RuntimeMethod RuntimeImportsMethod(string name)
         {
             RuntimeType runtimeImports = _rts.GetRequiredNamedType("std", "System.Runtime", "RuntimeImports");
             _rts.EnsureConstructedMembers(runtimeImports);
             foreach (RuntimeMethod method in runtimeImports.Methods)
             {
-                if (method.IsStatic && StringComparer.Ordinal.Equals(method.Name, name))
+                if (method.IsStatic && method.Name == name)
                     return method;
             }
             throw new MissingMethodException($"System.Runtime.RuntimeImports.{name} is missing from the core library.");
@@ -2247,7 +2432,7 @@ namespace Cnidaria.Cs
             _rts.EnsureConstructedMembers(runtimeType);
             foreach (RuntimeMethod method in runtimeType.Methods)
             {
-                if (method.IsStatic && StringComparer.Ordinal.Equals(method.Name, "FromHandle"))
+                if (method.IsStatic && method.Name == "FromHandle")
                     return method;
             }
             throw new MissingMethodException("System.RuntimeType.FromHandle is missing from the core library.");
@@ -2257,12 +2442,6 @@ namespace Cnidaria.Cs
         // the MethodTable; the register VM answers these queries from its type system.
         private bool TryImportRuntimeTypeQuery(List<StackValue> stack, List<GenTree> statements, RuntimeMethod method, int pc, ILOpCode op)
         {
-            if (method.Name == "RhGetObjectTypeHandle")
-            {
-                var obj = Pop(stack, pc, op);
-                PushImportedValue(stack, statements, LoadObjectTypeHandle(obj.Node, pc));
-                return true;
-            }
             if (_rts.Target.IsRegisterBytecode)
                 return false;
 
@@ -2308,7 +2487,7 @@ namespace Cnidaria.Cs
 
         private static bool IsWellKnownTypeMethod(RuntimeMethod method, string name)
             => method.DeclaringType.Namespace == "System" && method.DeclaringType.Name == "Type" &&
-               StringComparer.Ordinal.Equals(method.Name, name);
+               method.Name == name;
 
         private int EmitFunctionPointerOrDelegate(ImportFrame frame, List<StackValue> stack, List<GenTree> statements, int pc, int npc)
         {
@@ -2429,10 +2608,10 @@ namespace Cnidaria.Cs
         }
 
         private bool IsDelegateInvoke(RuntimeMethod method)
-            => !method.IsStatic && StringComparer.Ordinal.Equals(method.Name, "Invoke") && IsDelegateType(method.DeclaringType);
+            => !method.IsStatic && method.Name == "Invoke" && IsDelegateType(method.DeclaringType);
 
         private static bool IsSystemMethod(RuntimeMethod method, string ns, string type, string name)
-            => method.DeclaringType.Namespace == ns && method.DeclaringType.Name == type && StringComparer.Ordinal.Equals(method.Name, name);
+            => method.DeclaringType.Namespace == ns && method.DeclaringType.Name == type && method.Name == name;
 
         private bool IsIndexerIntrinsic(RuntimeMethod method, out bool isString, [NotNullWhen(true)] out RuntimeField? data, out RuntimeField? length)
         {
@@ -2447,10 +2626,10 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            isString = owner.Name == "String" && StringComparer.Ordinal.Equals(method.Name, "get_Chars");
+            isString = owner.Name == "String" && method.Name == "get_Chars";
             bool isSpan = owner.GenericTypeDefinition?.Name is "Span`1" or "ReadOnlySpan`1" &&
                 owner.GenericTypeArguments.Length == 1 &&
-                StringComparer.Ordinal.Equals(method.Name, "get_Item");
+                method.Name == "get_Item";
             if (!isString && !isSpan)
                 return false;
 
@@ -2562,7 +2741,7 @@ namespace Cnidaria.Cs
         {
             for (int i = 0; i < type.InstanceFields.Length; i++)
             {
-                if (StringComparer.Ordinal.Equals(type.InstanceFields[i].Name, name))
+                if (type.InstanceFields[i].Name == name)
                     return type.InstanceFields[i];
             }
             return null;
@@ -2657,8 +2836,11 @@ namespace Cnidaria.Cs
             var op = ins.Op;
             bool isVirtual = op == ILOpCode.Callvirt;
             var method = ResolveMethodIn(frame, ins.Token);
+            if (_rts.GetRuntimeExport(method) is RuntimeMethod export)
+                method = export;
             int total = method.ParameterTypes.Length + (method.HasThis ? 1 : 0);
             bool doesNotReturn = IsNoReturnCallee(method, op);
+            bool coldCallSite = frame.IsColdCallSite(pc);
 
             if (isVirtual &&
                 IsSystemMethod(method, "System", "Object", "GetType") &&
@@ -2698,7 +2880,7 @@ namespace Cnidaria.Cs
             if (!isVirtual && method.DeclaringType.Namespace == "System" && method.DeclaringType.Name == "Activator" &&
                 method.Name == "CreateInstance" && method.MethodGenericArguments.Length == 1)
             {
-                EmitCreateInstance(frame, stack, statements, npc, op, method.MethodGenericArguments[0]);
+                EmitCreateInstance(frame, stack, statements, npc, op, method.MethodGenericArguments[0], coldCallSite);
                 return 1;
             }
             if (!isVirtual && method.DeclaringType.Namespace == "System.Runtime" && method.DeclaringType.Name == "RuntimeImports" &&
@@ -2743,6 +2925,67 @@ namespace Cnidaria.Cs
             {
                 Push(stack, Node(GenTreeKind.ConstI4, npc, op, stackKind: GenStackKind.I4,
                     int32: RuntimeTypeSystem.IsBitwiseEquatable(method.MethodGenericArguments[0]) ? 1 : 0));
+                return 1;
+            }
+
+            if (!isVirtual &&
+                IsSystemMethod(method, "System.Runtime.CompilerServices", "RuntimeHelpers", "GetMethodTable") &&
+                method.ParameterTypes.Length == 1)
+            {
+                var obj = Pop(stack, npc, op);
+                PushImportedValue(stack, statements, LoadObjectTypeHandle(obj.Node, npc));
+                return 1;
+            }
+
+            if (!isVirtual && method.IsStatic && method.MethodGenericArguments.Length == 1 && method.Name == "Of" &&
+                method.DeclaringType.Namespace == "Internal.Runtime" && method.DeclaringType.Name == "MethodTable")
+            {
+                Push(stack, Node(GenTreeKind.TypeHandle, npc, op, stackKind: GenStackKind.NativeInt, runtimeType: method.MethodGenericArguments[0]));
+                return 1;
+            }
+
+            // Nor any MethodTable to read, so its reads become queries on the type id that stands for one
+            if (_rts.Target.IsRegisterBytecode && method.HasThis &&
+                method.DeclaringType.Namespace == "Internal.Runtime" && method.DeclaringType.Name == "MethodTable" &&
+                MethodTableQuery(method.Name) is string queryName)
+            {
+                var methodTable = Pop(stack, npc, op);
+                RuntimeMethod query = RuntimeImportsMethod(queryName);
+                AddDirectDependency(query);
+                PushImportedValue(stack, statements, Node(GenTreeKind.Call, npc, op, type: method.ReturnType, stackKind: StackKindOf(method.ReturnType),
+                    operands: One(methodTable.Node), method: query, int32: 1));
+                return 1;
+            }
+
+            // The register VM has no MethodTable to read an enum's element type from
+            if (_rts.Target.IsRegisterBytecode && IsSystemMethod(method, "System", "Enum", "InternalGetCorElementType"))
+            {
+                var receiver = Pop(stack, npc, op);
+                RuntimeMethod query = RuntimeImportsMethod("RhGetTypeCorElementType");
+                AddDirectDependency(query);
+                PushImportedValue(stack, statements, Node(GenTreeKind.Call, npc, op, type: query.ReturnType, stackKind: GenStackKind.I4,
+                    operands: One(LoadObjectTypeHandle(receiver.Node, npc)), method: query, int32: 1));
+                return 1;
+            }
+
+            if (!isVirtual &&
+                IsSystemMethod(method, "System.Runtime.CompilerServices", "RuntimeHelpers", "EnumEquals") &&
+                method.MethodGenericArguments.Length == 1 &&
+                method.MethodGenericArguments[0].Kind == RuntimeTypeKind.Enum)
+            {
+                PushImportedValue(stack, statements, Node(GenTreeKind.Binary, npc, ILOpCode.Ceq, stackKind: GenStackKind.I4,
+                    operands: PopMany(stack, 2, npc, op)));
+                return 1;
+            }
+
+            if (!isVirtual &&
+                method.IsStatic &&
+                method.ParameterTypes.Length == 0 &&
+                method.Name == "Create" &&
+                IsEqualityComparerType(method.DeclaringType, out RuntimeType? comparedType) &&
+                TryGetDefaultEqualityComparerConstructor(comparedType, out RuntimeMethod? comparerConstructor))
+            {
+                EmitNewObject(frame, stack, statements, npc, op, token: 0, comparerConstructor, coldCallSite);
                 return 1;
             }
 
@@ -2879,15 +3122,18 @@ namespace Cnidaria.Cs
 
             if (!isVirtual && !isRuntimeIntrinsic && !suppressIntrinsicInline)
             {
-                bool rootCall = !frame.IsInline;
+                int continuationPc = successorPcs is null ? -1 : frame.ContinuationPcAfter?.Invoke(pc) ?? -1;
+                bool continues = continuationPc >= 0;
                 if (TryInlineCall(
                     method,
                     args,
                     statements,
-                    rootCall ? successorPcs : null,
-                    rootCall ? stack : null,
+                    continues ? successorPcs : null,
+                    continues ? stack : null,
+                    continuationPc,
                     npc,
                     op,
+                    coldCallSite,
                     out var inlineResult,
                     out bool inlinedGraph,
                     frame.InlineDepth + 1))
@@ -2960,18 +3206,16 @@ namespace Cnidaria.Cs
             }
         }
 
-        private void EmitNewObject(ImportFrame frame, List<StackValue> stack, List<GenTree> statements, int pc, in CilInstruction ins)
-            => EmitNewObject(frame, stack, statements, pc, ins.Op, ins.Token, ResolveMethodIn(frame, ins.Token));
-
         // Activator.CreateInstance<T>, which 'new T()' binds to, for the exact T of this instantiation
-        private void EmitCreateInstance(ImportFrame frame, List<StackValue> stack, List<GenTree> statements, int pc, ILOpCode op, RuntimeType type)
+        private void EmitCreateInstance(ImportFrame frame, List<StackValue> stack, List<GenTree> statements, int pc, ILOpCode op, RuntimeType type,
+            bool coldCallSite)
         {
             _rts.EnsureConstructedMembers(type);
             foreach (var method in type.Methods)
             {
-                if (!method.IsStatic && method.ParameterTypes.Length == 0 && StringComparer.Ordinal.Equals(method.Name, ".ctor"))
+                if (!method.IsStatic && method.ParameterTypes.Length == 0 && method.Name == ".ctor")
                 {
-                    EmitNewObject(frame, stack, statements, pc, op, token: 0, method);
+                    EmitNewObject(frame, stack, statements, pc, op, token: 0, method, coldCallSite);
                     return;
                 }
             }
@@ -2980,7 +3224,9 @@ namespace Cnidaria.Cs
             PushImportedValue(stack, statements, Node(GenTreeKind.DefaultValue, pc, GenTreeOperator.None, type: type, stackKind: StackKindOf(type), runtimeType: type));
         }
 
-        private void EmitNewObject(ImportFrame frame, List<StackValue> stack, List<GenTree> statements, int pc, ILOpCode op, int token, RuntimeMethod ctor)
+        // Returns whether the constructor was inlined as a graph, which ends the block
+        private bool EmitNewObject(ImportFrame frame, List<StackValue> stack, List<GenTree> statements, int pc, ILOpCode op, int token, RuntimeMethod ctor,
+            bool coldCallSite, List<int>? successorPcs = null, int continuationPc = -1)
         {
             int argCount = ctor.ParameterTypes.Length;
             var args = PopMany(stack, argCount, pc, op);
@@ -2991,7 +3237,7 @@ namespace Cnidaria.Cs
             if (t.Kind == RuntimeTypeKind.Array)
             {
                 EmitMdArrayCreation(stack, statements, t, args, pc, op);
-                return;
+                return false;
             }
             if (RequiresTypeInitializationBeforeNewObject(t) && NeedsTypeInitialization(t))
             {
@@ -3002,14 +3248,36 @@ namespace Cnidaria.Cs
             MarkInstantiatedType(t);
 
             if (t.IsValueType)
+                return EmitValueTypeNewObject(frame, stack, statements, pc, op, token, args, ctor, t, coldCallSite, successorPcs, continuationPc);
+
+            if (ReferenceEquals(t, _rts.SystemString))
+                return EmitStringConstruction(frame, stack, statements, pc, op, args, _rts.GetStringFactory(ctor), coldCallSite, successorPcs, continuationPc);
+
+            // The constructor runs on the allocated object as an ordinary call, so it can inline like any other
+            SpillEvaluationStackForImportBarrier(statements, stack, pc, op);
+            var temp = CreateImporterSpillTemp(t, GenStackKind.Ref);
+            statements.Add(Node(GenTreeKind.StoreTemp, pc, op,
+                operands: One(Node(GenTreeKind.AllocObject, pc, op, type: t, stackKind: GenStackKind.Ref, runtimeType: t)), int32: temp.Index));
+            return EmitConstructorCall(frame, stack, statements, pc, op, token, args, ctor, temp, TempLoad(pc, op, temp).Node, coldCallSite,
+                successorPcs, continuationPc);
+        }
+
+        // A string allocates itself, so its constructor parameters go to the static factory that returns it
+        private bool EmitStringConstruction(ImportFrame frame, List<StackValue> stack, List<GenTree> statements, int pc, ILOpCode op,
+            ImmutableArray<GenTree> args, RuntimeMethod factory, bool coldCallSite, List<int>? successorPcs, int continuationPc)
+        {
+            if (TryInlineCall(factory, args, statements, successorPcs, successorPcs is null ? null : stack, continuationPc, pc, op, coldCallSite,
+                    out var inlineResult, out bool inlinedGraph, frame.InlineDepth + 1))
             {
-                EmitValueTypeNewObject(frame, stack, statements, pc, op, token, argCount, args, ctor, t);
-                return;
+                if (!inlinedGraph)
+                    Push(stack, inlineResult!);
+                return inlinedGraph;
             }
 
-            AddDirectDependency(ctor);
-            PushImportedValue(stack, statements, Node(GenTreeKind.NewObject, pc, op, type: t, stackKind: StackKindOf(t), operands: args,
-                int32: argCount, int64: token, method: ctor, runtimeType: t));
+            AddDirectDependency(factory);
+            PushImportedValue(stack, statements, Node(GenTreeKind.Call, pc, op, type: factory.ReturnType, stackKind: GenStackKind.Ref, operands: args,
+                int32: args.Length, method: factory));
+            return false;
         }
 
         private GenTree ArrayBoundAddress(GenTree array, int index, int pc)
@@ -3197,8 +3465,10 @@ namespace Cnidaria.Cs
             List<GenTree> statements,
             List<int>? successorPcs,
             List<StackValue>? callerContinuationStack,
+            int continuationPc,
             int callPc,
             ILOpCode callOp,
+            bool coldCallSite,
             out GenTree? result,
             out bool terminatedBlock,
             int inlineDepth)
@@ -3214,18 +3484,15 @@ namespace Cnidaria.Cs
             if (PcInCatchHandler(callPc))
                 return false;
 
-            if (!CanInline(callee, bodyModule, body, args, inlineDepth, out var inlineInfo))
+            if (!CanInline(callee, bodyModule, body, args, inlineDepth, coldCallSite, out var inlineInfo))
                 return false;
 
             var calleeArgTypes = BuildArgTypes(callee);
             if (calleeArgTypes.Length != args.Length)
                 return false;
 
-            if (inlineInfo.HasControlFlow &&
-                (successorPcs is null || callerContinuationStack is null || inlineDepth > 1 || !_pcToBlockId.ContainsKey(callPc + 1)))
-            {
+            if (inlineInfo.HasControlFlow && (successorPcs is null || callerContinuationStack is null || !_pcToBlockId.ContainsKey(continuationPc)))
                 return false;
-            }
 
             if (!_activeInlineMethods.Add(callee.MethodId))
                 return false;
@@ -3237,7 +3504,8 @@ namespace Cnidaria.Cs
                 MarkInstantiatedMethodContext(callee);
                 if (inlineInfo.HasControlFlow)
                 {
-                    TryImportInlineGraph(callee, bodyModule, body, args, statements, successorPcs!, callerContinuationStack!, callPc, callOp, inlineInfo);
+                    TryImportInlineGraph(callee, bodyModule, body, args, statements, successorPcs!, callerContinuationStack!, continuationPc, callPc, callOp,
+                        coldCallSite, inlineInfo, inlineDepth);
                     terminatedBlock = true;
                     return true;
                 }
@@ -3276,7 +3544,7 @@ namespace Cnidaria.Cs
                 }
 
                 var frame = new ImportFrame(bodyModule, callee, body, inlineDepth, callPc, localTypes, argTemps, argSubstitutions, localTemps,
-                    DefaultValueLocalsOf(body), static pc => pc == 0);
+                    DefaultValueLocalsOf(body), static pc => pc == 0, coldCallSite ? static _ => true : inlineInfo.InNoReturnRegion);
                 var inlineStack = new List<StackValue>(Math.Max(body.MaxStack, 4));
                 var instructions = body.Instructions;
                 for (int pc = 0; pc < instructions.Length;)
@@ -3324,14 +3592,16 @@ namespace Cnidaria.Cs
             List<GenTree> callStatements,
             List<int> callSuccessorPcs,
             List<StackValue> callerContinuationStack,
+            int continuationPc,
             int callPc,
             ILOpCode callOp,
-            InlineCandidateInfo inlineInfo)
+            bool coldCallSite,
+            InlineCandidateInfo inlineInfo,
+            int inlineDepth)
         {
             if (inlineInfo.Plan is null)
                 throw Fail(callPc, callOp, "Missing inline graph plan.");
 
-            int continuationPc = callPc + 1;
             if (!_pcToBlockId.ContainsKey(continuationPc))
                 throw Fail(callPc, callOp, $"Missing continuation block for inlined call at pc {callPc}.");
 
@@ -3377,22 +3647,56 @@ namespace Cnidaria.Cs
 
             var plan = inlineInfo.Plan;
             var leaders = new HashSet<int>(plan.Leaders);
-            var frame = new ImportFrame(bodyModule, callee, body, inlineDepth: 1, callPc, localTypes, argTemps, argSubstitutions, localTemps,
-                DefaultValueLocalsOf(body), leaders.Contains);
-            var context = CreateInlineGraphContext(frame, plan, callPc, continuationPc, returnTemp, continuationPrefix);
+            InlineGraphContext? context = null;
+            var frame = new ImportFrame(bodyModule, callee, body, inlineDepth, callPc, localTypes, argTemps, argSubstitutions, localTemps,
+                DefaultValueLocalsOf(body), leaders.Contains, coldCallSite ? static _ => true : inlineInfo.InNoReturnRegion,
+                pc => leaders.Contains(pc + 1) ? context!.SyntheticPcForCalleePc(pc + 1) : -1);
+            context = CreateInlineGraphContext(frame, plan, callPc, continuationPc, returnTemp, continuationPrefix);
             int entrySyntheticPc = context.SyntheticPcForCalleePc(plan.Leaders[0]);
 
             AddSuccessor(callSuccessorPcs, entrySyntheticPc);
             callStatements.Add(Node(GenTreeKind.Branch, callPc, callOp, targetPc: entrySyntheticPc, targetBlockId: BlockIdForPc(entrySyntheticPc)));
             callerContinuationStack.Clear();
 
+            // As in the root, only blocks reached along edges left after constant branches fold are imported,
+            // counting edges back from graphs inlined inside this one
+            var leaderBySyntheticPc = new Dictionary<int, int>(plan.Leaders.Length);
+            for (int i = 0; i < plan.Leaders.Length; i++)
+                leaderBySyntheticPc.Add(context.SyntheticPcForCalleePc(plan.Leaders[i]), i);
+
+            var inlined = new GenTreeBlock?[plan.Leaders.Length];
+            var pending = new SortedSet<int> { 0 };
+            int scannedNested = _deferredInlineBlocks.Count;
+            while (pending.Count != 0)
+            {
+                int i = pending.Min;
+                pending.Remove(i);
+                if (inlined[i] is not null)
+                    continue;
+
+                int calleeEndPc = i + 1 < plan.Leaders.Length ? plan.Leaders[i + 1] : body.Instructions.Length;
+                GenTreeBlock block = BuildInlineGraphBlock(context, plan.Leaders[i], calleeEndPc);
+                inlined[i] = block;
+                AddPendingLeaders(block);
+                for (; scannedNested < _deferredInlineBlocks.Count; scannedNested++)
+                    AddPendingLeaders(_deferredInlineBlocks[scannedNested]);
+            }
+
             for (int i = 0; i < plan.Leaders.Length; i++)
             {
-                int calleeStartPc = plan.Leaders[i];
-                int calleeEndPc = i + 1 < plan.Leaders.Length ? plan.Leaders[i + 1] : body.Instructions.Length;
-                GenTreeBlock inlined = BuildInlineGraphBlock(context, calleeStartPc, calleeEndPc);
-                _syntheticBlockHosts.Add(inlined.Id, (_currentRootBlockId, false));
-                _deferredInlineBlocks.Add(inlined);
+                GenTreeBlock block = inlined[i] ?? CreateInlineGraphBlock(context, context.BlockIdForCalleePc(plan.Leaders[i]),
+                    context.SyntheticPcForCalleePc(plan.Leaders[i]), new List<GenTree>(), new List<int>(), entryStackDepth: 0, exitStackDepth: 0);
+                _syntheticBlockHosts.Add(block.Id, (_currentRootBlockId, false));
+                _deferredInlineBlocks.Add(block);
+            }
+
+            void AddPendingLeaders(GenTreeBlock block)
+            {
+                foreach (int successorPc in block.SuccessorPcs)
+                {
+                    if (leaderBySyntheticPc.TryGetValue(successorPc, out int leader) && inlined[leader] is null)
+                        pending.Add(leader);
+                }
             }
         }
 
@@ -3450,6 +3754,16 @@ namespace Cnidaria.Cs
                     case ILOpCode.Brfalse:
                         {
                             var cond = Pop(stack, context.CallPc, ins.Op);
+                            if (TryGetImportConstant(cond.Node, out var constant) && constant.Kind != GenTreeConstantKind.I8 &&
+                                ((constant.I4 != 0) == (ins.Op == ILOpCode.Brtrue) || pc + 1 < instructions.Length))
+                            {
+                                int takenPc = context.SyntheticPcForCalleePc((constant.I4 != 0) == (ins.Op == ILOpCode.Brtrue) ? ins.TargetPc : pc + 1);
+                                AddSuccessor(successorPcs, takenPc);
+                                SpillStackForBoundaries(statements, stack, successorPcs, context.CallPc, ins.Op);
+                                statements.Add(Node(GenTreeKind.Branch, context.CallPc, ILOpCode.Br, targetPc: takenPc, targetBlockId: BlockIdForPc(takenPc)));
+                                return CreateInlineGraphBlock(context, blockId, syntheticStartPc, statements, successorPcs, entryDepth, stack.Count);
+                            }
+
                             int targetPc = context.SyntheticPcForCalleePc(ins.TargetPc);
                             AddSuccessor(successorPcs, targetPc);
                             if (pc + 1 < instructions.Length)
@@ -3490,7 +3804,7 @@ namespace Cnidaria.Cs
                         }
 
                     default:
-                        pc += ImportInstruction(frame, stack, statements, null, pc, out bool terminatedBlock);
+                        pc += ImportInstruction(frame, stack, statements, successorPcs, pc, out bool terminatedBlock);
                         if (terminatedBlock)
                         {
                             stack.Clear();
@@ -3516,6 +3830,7 @@ namespace Cnidaria.Cs
             CilMethodBody body,
             ImmutableArray<GenTree> args,
             int inlineDepth,
+            bool coldCallSite,
             out InlineCandidateInfo info)
         {
             info = null!;
@@ -3526,7 +3841,7 @@ namespace Cnidaria.Cs
                 return false;
             if (callee.HasInternalCall || callee.HasNoInlining || callee.DoesNotReturn)
                 return false;
-            if (StringComparer.Ordinal.Equals(callee.Name, ".cctor"))
+            if (callee.Name == ".cctor")
                 return false;
             if (RequiresTypeInitializationBeforeCall(callee) && FindTypeInitializer(callee.DeclaringType) is not null)
                 return false;
@@ -3544,13 +3859,11 @@ namespace Cnidaria.Cs
             if (!AnalyzeInlineCandidate(callee, bodyModule, body, args.Length, out var candidate))
                 return false;
 
-            if (candidate.HasControlFlow && inlineDepth > 1)
-                return false;
-            if (candidate.HasControlFlow && candidate.HasCall)
-                return false;
             if (candidate.HasBackwardBranch && !callee.HasAggressiveInlining)
                 return false;
             if (!callee.HasAggressiveInlining && candidate.BasicBlockCount > InlineMaxBasicBlocks)
+                return false;
+            if (coldCallSite && !InlinesAtColdCallSite(callee, candidate))
                 return false;
 
             int budget = DetermineInlineBudget(callee, candidate, args, inlineDepth);
@@ -3569,7 +3882,44 @@ namespace Cnidaria.Cs
             return true;
         }
 
+        // As in RyuJIT, code on its way to a throw inlines only what it is forced to or what is too small to cost anything
+        private static bool InlinesAtColdCallSite(RuntimeMethod callee, InlineCandidateInfo candidate)
+            => callee.HasAggressiveInlining || candidate.CodeSize <= InlineSmallOverBudgetSize;
+
+        private readonly Dictionary<int, InlineCandidateInfo?> _inlineCandidateInfos = new();
+        private readonly HashSet<int> _inlineCandidatesInAnalysis = new();
+
+        // A callee's blocks split after the calls it could inline with control flow, which analyzes those callees in turn
         private bool AnalyzeInlineCandidate(
+            RuntimeMethod callee,
+            RuntimeModule bodyModule,
+            CilMethodBody body,
+            int argCount,
+            out InlineCandidateInfo info)
+        {
+            if (_inlineCandidateInfos.TryGetValue(callee.MethodId, out InlineCandidateInfo? known))
+            {
+                info = known!;
+                return known is not null;
+            }
+
+            info = null!;
+            if (!_inlineCandidatesInAnalysis.Add(callee.MethodId))
+                return false;
+
+            try
+            {
+                bool analyzed = AnalyzeInlineCandidateBody(callee, bodyModule, body, argCount, out info);
+                _inlineCandidateInfos.Add(callee.MethodId, analyzed ? info : null);
+                return analyzed;
+            }
+            finally
+            {
+                _inlineCandidatesInAnalysis.Remove(callee.MethodId);
+            }
+        }
+
+        private bool AnalyzeInlineCandidateBody(
             RuntimeMethod callee,
             RuntimeModule bodyModule,
             CilMethodBody body,
@@ -3579,11 +3929,13 @@ namespace Cnidaria.Cs
             info = null!;
 
             InlineGraphPlan plan;
+            bool[] noReturnRegion;
             try
             {
                 var (pops, pushes) = body.GetStackEffects(bodyModule.Md, !IsVoid(callee.ReturnType));
                 var stackDepths = ComputeStackDepths(body, pops, pushes, bodyModule, callee);
-                var leaders = ComputeLeaders(body, stackDepths, splitAfterCalls: false, bodyModule, callee);
+                noReturnRegion = ComputeNoReturnRegion(body, stackDepths, bodyModule, callee);
+                var leaders = ComputeLeaders(body, stackDepths, noReturnRegion, bodyModule, callee);
                 if (leaders.Count == 0)
                     return false;
                 plan = new InlineGraphPlan(stackDepths, leaders.ToImmutableArray());
@@ -3685,6 +4037,7 @@ namespace Cnidaria.Cs
                 hasControlFlow: hasControlFlow,
                 hasBackwardBranch: hasBackwardBranch,
                 hasThrow: hasThrow,
+                noReturnRegion: noReturnRegion,
                 plan: hasControlFlow ? plan : null);
             return true;
         }
@@ -4034,6 +4387,9 @@ namespace Cnidaria.Cs
             if (right == GenStackKind.Unknown) return left;
             if (left == GenStackKind.Null && right == GenStackKind.Ref) return GenStackKind.Ref;
             if (left == GenStackKind.Ref && right == GenStackKind.Null) return GenStackKind.Ref;
+            // An unmanaged pointer is a native int on the evaluation stack (ECMA-335 III.1.8.1.2.3)
+            if (left == GenStackKind.Ptr && right is GenStackKind.NativeInt or GenStackKind.NativeUInt) return GenStackKind.Ptr;
+            if (right == GenStackKind.Ptr && left is GenStackKind.NativeInt or GenStackKind.NativeUInt) return GenStackKind.Ptr;
             return GenStackKind.Unknown;
         }
 
@@ -4155,7 +4511,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.Call or
                 GenTreeKind.IndirectCall or
                 GenTreeKind.VirtualCall or
-                GenTreeKind.NewObject or
+                GenTreeKind.AllocObject or
                 GenTreeKind.NewArray or
                 GenTreeKind.ArrayElement or
                 GenTreeKind.ArrayElementAddr or
@@ -5438,9 +5794,7 @@ namespace Cnidaria.Cs
 
             switch (node.Kind)
             {
-                case GenTreeKind.NewObject:
-                    return ExactNonNullReference(node.RuntimeType ?? node.Type);
-
+                case GenTreeKind.AllocObject:
                 case GenTreeKind.NewArray:
                 case GenTreeKind.NewDelegate:
                     return ExactNonNullReference(node.Type ?? node.RuntimeType);
@@ -5568,6 +5922,9 @@ namespace Cnidaria.Cs
                     return StaticReference(
                         node.Type,
                         _method.HasThis && node.Int32 == 0 && node.StackKind == GenStackKind.Ref);
+
+                case GenTreeKind.StaticField or GenTreeKind.Call when TryGetDefaultEqualityComparerInstanceType(node, out RuntimeType? comparerType):
+                    return ExactNonNullReference(comparerType);
 
                 case GenTreeKind.Local:
                 case GenTreeKind.Field:
@@ -5731,17 +6088,19 @@ namespace Cnidaria.Cs
             return materialized.ToImmutable();
         }
 
-        private void EmitValueTypeNewObject(
+        private bool EmitValueTypeNewObject(
             ImportFrame frame,
             List<StackValue> stack,
             List<GenTree> statements,
             int pc,
             ILOpCode sourceOp,
             int methodToken,
-            int userArgCount,
             ImmutableArray<GenTree> userArgs,
             RuntimeMethod ctor,
-            RuntimeType valueType)
+            RuntimeType valueType,
+            bool coldCallSite,
+            List<int>? successorPcs,
+            int continuationPc)
         {
             if (!valueType.IsValueType)
                 throw Fail(pc, sourceOp, "Value-type materialization requires a value-type constructor.");
@@ -5750,27 +6109,58 @@ namespace Cnidaria.Cs
 
             var temp = CreateStructMaterializationTemp(valueType);
             EmitStructDefaultInitialization(statements, stack, pc, sourceOp, temp, valueType);
+            return EmitConstructorCall(frame, stack, statements, pc, sourceOp, methodToken, userArgs, ctor, temp, TempAddress(pc, sourceOp, temp).Node,
+                coldCallSite, successorPcs, continuationPc);
+        }
 
-            var ctorArgsBuilder = ImmutableArray.CreateBuilder<GenTree>(userArgCount + 1);
-            ctorArgsBuilder.Add(TempAddress(pc, sourceOp, temp).Node);
+        // Runs a constructor on the object or value in a temp and pushes that temp
+        private bool EmitConstructorCall(
+            ImportFrame frame,
+            List<StackValue> stack,
+            List<GenTree> statements,
+            int pc,
+            ILOpCode sourceOp,
+            int methodToken,
+            ImmutableArray<GenTree> userArgs,
+            RuntimeMethod ctor,
+            GenTemp temp,
+            GenTree thisArg,
+            bool coldCallSite,
+            List<int>? successorPcs,
+            int continuationPc)
+        {
+            var ctorArgsBuilder = ImmutableArray.CreateBuilder<GenTree>(userArgs.Length + 1);
+            ctorArgsBuilder.Add(thisArg);
             ctorArgsBuilder.AddRange(userArgs);
             var ctorArgs = ctorArgsBuilder.ToImmutable();
 
-            if (TryInlineCall(ctor, ctorArgs, statements, null, null, pc, sourceOp, out var inlineResult, out bool terminatedBlock, frame.InlineDepth + 1) &&
-                !terminatedBlock)
+            // A constructor inlined as a graph leaves the constructed value to the block it continues in
+            List<StackValue>? continuationStack = null;
+            if (successorPcs is not null)
+                continuationStack = new List<StackValue>(stack) { TempLoad(pc, sourceOp, temp) };
+
+            if (TryInlineCall(ctor, ctorArgs, statements, successorPcs, continuationStack, continuationPc, pc, sourceOp, coldCallSite,
+                    out var inlineResult, out bool inlinedGraph, frame.InlineDepth + 1))
             {
+                if (inlinedGraph)
+                {
+                    stack.Clear();
+                    return true;
+                }
+
                 if (inlineResult is not null)
                     AppendImporterStatement(statements, stack, Node(GenTreeKind.Eval, pc, sourceOp, operands: One(inlineResult)));
 
                 Push(stack, TempLoad(pc, sourceOp, temp));
-                return;
+                return false;
             }
 
             AddDirectDependency(ctor);
             var call = Node(GenTreeKind.Call, pc, sourceOp, stackKind: GenStackKind.Void, operands: ctorArgs,
-                int32: userArgCount + 1, int64: methodToken, method: ctor);
+                int32: ctorArgs.Length, int64: methodToken, method: ctor);
             AppendImporterStatement(statements, stack, Node(GenTreeKind.Eval, pc, sourceOp, operands: One(call)));
             Push(stack, TempLoad(pc, sourceOp, temp));
+            return false;
         }
 
         private void EmitStructDefaultInitialization(List<GenTree> statements, List<StackValue> stack, int pc, ILOpCode sourceOp, GenTemp temp, RuntimeType valueType)
@@ -6043,6 +6433,7 @@ namespace Cnidaria.Cs
             private readonly int[] _argAddressCounts;
             private readonly int[] _localAddressCounts;
             private readonly bool[] _localNeedsInit;
+            private readonly bool[] _noReturnRegion;
 
             public int Cost { get; }
             public int CodeSize { get; }
@@ -6072,6 +6463,7 @@ namespace Cnidaria.Cs
                 bool hasControlFlow,
                 bool hasBackwardBranch,
                 bool hasThrow,
+                bool[] noReturnRegion,
                 InlineGraphPlan? plan)
             {
                 Cost = cost;
@@ -6089,6 +6481,7 @@ namespace Cnidaria.Cs
                 HasControlFlow = hasControlFlow;
                 HasBackwardBranch = hasBackwardBranch;
                 HasThrow = hasThrow;
+                _noReturnRegion = noReturnRegion;
                 Plan = plan;
             }
 
@@ -6122,6 +6515,8 @@ namespace Cnidaria.Cs
 
             public bool LocalNeedsInit(int index)
                 => (uint)index < (uint)_localNeedsInit.Length && _localNeedsInit[index];
+
+            public bool InNoReturnRegion(int pc) => _noReturnRegion[pc];
         }
 
         private GenTemp CreateInlineGraphTemp(RuntimeType? type, GenStackKind stackKind)
@@ -6157,12 +6552,12 @@ namespace Cnidaria.Cs
 
         private static bool RequiresTypeInitializationBeforeCall(RuntimeMethod target)
         {
-            if (StringComparer.Ordinal.Equals(target.Name, ".cctor") || target.DeclaringType.IsBeforeFieldInit)
+            if (target.Name == ".cctor" || target.DeclaringType.IsBeforeFieldInit)
                 return false;
 
             return target.IsStatic ||
                 target.DeclaringType.IsValueType ||
-                StringComparer.Ordinal.Equals(target.Name, ".ctor");
+                target.Name == ".ctor";
         }
 
         private static bool RequiresTypeInitializationBeforeNewObject(RuntimeType type)
@@ -6206,7 +6601,7 @@ namespace Cnidaria.Cs
             _rts.EnsureConstructedMembers(type);
             if (FindTypeInitializer(type) is null)
                 return false;
-            return !(StringComparer.Ordinal.Equals(_method.Name, ".cctor") && ReferenceEquals(_method.DeclaringType, type));
+            return !(_method.Name == ".cctor" && ReferenceEquals(_method.DeclaringType, type));
         }
 
         private bool AppendTypeInitialization(
@@ -6239,7 +6634,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < type.Methods.Length; i++)
             {
                 RuntimeMethod method = type.Methods[i];
-                if (method.IsStatic && method.ParameterTypes.Length == 0 && StringComparer.Ordinal.Equals(method.Name, ".cctor"))
+                if (method.IsStatic && method.ParameterTypes.Length == 0 && method.Name == ".cctor")
                     return method;
             }
             return null;
@@ -6385,6 +6780,75 @@ namespace Cnidaria.Cs
                 ILOpCode.Ceq,
                 stackKind: GenStackKind.I4,
                 operands: Two(actualTypeId, targetTypeId)));
+        }
+
+        private static bool IsEqualityComparerType(RuntimeType type, [NotNullWhen(true)] out RuntimeType? comparedType)
+        {
+            comparedType = null;
+            if (type.GenericTypeDefinition is not { Namespace: "System.Collections.Generic", Name: "EqualityComparer`1" } ||
+                type.GenericTypeArguments.Length != 1)
+            {
+                return false;
+            }
+
+            comparedType = type.GenericTypeArguments[0];
+            return comparedType.Kind != RuntimeTypeKind.TypeParam && !RuntimeTypeNames.ContainsGenericParameters(comparedType);
+        }
+
+        // The comparer EqualityComparer<T>.Create picks for a type, which is also the exact type of EqualityComparer<T>.Default
+        private bool TryGetDefaultEqualityComparerType(RuntimeType comparedType, [NotNullWhen(true)] out RuntimeType? comparerType)
+        {
+            RuntimeType Instantiate(string ns, string name, RuntimeType argument)
+                => _rts.GetGenericInstanceType(_rts.GetRequiredNamedType("std", ns, name), argument);
+
+            comparerType = null;
+            if (comparedType.IsByRefLike || comparedType.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.ByRef)
+                return false;
+
+            if (ReferenceEquals(comparedType, _rts.SystemString))
+                comparerType = _rts.GetRequiredNamedType("std", "System.Collections.Generic", "StringEqualityComparer");
+            else if (IsSystemNullableRuntimeType(comparedType))
+                comparerType = Instantiate("System.Collections.Generic", "NullableEqualityComparer`1", comparedType.GenericTypeArguments[0]);
+            else if (comparedType.Kind == RuntimeTypeKind.Enum)
+                comparerType = Instantiate("System.Collections.Generic", "EnumEqualityComparer`1", comparedType);
+            else if (_rts.IsAssignableTo(comparedType, Instantiate("System", "IEquatable`1", comparedType)))
+                comparerType = Instantiate("System.Collections.Generic", "GenericEqualityComparer`1", comparedType);
+            else
+                comparerType = Instantiate("System.Collections.Generic", "ObjectEqualityComparer`1", comparedType);
+            return true;
+        }
+
+        private bool TryGetDefaultEqualityComparerConstructor(RuntimeType comparedType, [NotNullWhen(true)] out RuntimeMethod? constructor)
+        {
+            constructor = null;
+            if (!TryGetDefaultEqualityComparerType(comparedType, out RuntimeType? comparerType))
+                return false;
+
+            _rts.EnsureConstructedMembers(comparerType);
+            foreach (RuntimeMethod method in comparerType.Methods)
+            {
+                if (!method.IsStatic && method.ParameterTypes.Length == 0 && method.Name == ".ctor")
+                {
+                    constructor = method;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Only EqualityComparer<T>.Create stores to the backing field of Default
+        private bool TryGetDefaultEqualityComparerInstanceType(GenTree node, [NotNullWhen(true)] out RuntimeType? comparerType)
+        {
+            comparerType = null;
+            RuntimeType? owner = node.Kind switch
+            {
+                GenTreeKind.StaticField when node.Field is { Name: "<Default>k__BackingField" } field => field.DeclaringType,
+                GenTreeKind.Call when node.Method is { IsStatic: true, Name: "get_Default" } getter => getter.DeclaringType,
+                _ => null,
+            };
+            return owner is not null &&
+                IsEqualityComparerType(owner, out RuntimeType? comparedType) &&
+                TryGetDefaultEqualityComparerType(comparedType, out comparerType);
         }
 
         private static bool IsSystemNullableRuntimeType(RuntimeType type)
@@ -6622,13 +7086,10 @@ namespace Cnidaria.Cs
                     flags |= GenTreeFlags.SideEffect | GenTreeFlags.MemoryWrite | GenTreeFlags.GlobalRef | GenTreeFlags.CanThrow | GenTreeFlags.Ordered;
                     break;
 
-                case GenTreeKind.NewObject:
-                    flags |= GenTreeFlags.ContainsCall | GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.GlobalRef | GenTreeFlags.Ordered;
-                    break;
-
                 case GenTreeKind.NewDelegate:
                 case GenTreeKind.DelegateCombine:
                 case GenTreeKind.DelegateRemove:
+                case GenTreeKind.AllocObject:
                 case GenTreeKind.NewArray:
                 case GenTreeKind.Box:
                     flags |= GenTreeFlags.Allocation | GenTreeFlags.SideEffect | GenTreeFlags.CanThrow | GenTreeFlags.Ordered;

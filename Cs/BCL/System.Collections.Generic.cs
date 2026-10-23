@@ -120,6 +120,32 @@ namespace System.Collections.Generic
         // Removes the item at position index.
         void RemoveAt(int index);
     }
+    public abstract class Comparer<T> : IComparer, IComparer<T>
+    {
+        public static Comparer<T> Default { get; } = new ObjectComparer<T>();
+
+        public abstract int Compare(T? x, T? y);
+
+        int IComparer.Compare(object? x, object? y)
+        {
+            if (x == null) return y == null ? 0 : -1;
+            if (y == null) return 1;
+            if (x is T && y is T) return Compare((T)x, (T)y);
+            ThrowHelper.ThrowArgumentException(ExceptionResource.Argument_InvalidArgumentForComparison);
+            return 0;
+        }
+    }
+    public sealed class ObjectComparer<T> : Comparer<T>
+    {
+        public override int Compare(T? x, T? y)
+        {
+            if (x == null) return y == null ? 0 : -1;
+            if (y == null) return 1;
+            if (x is IComparable<T> generic) return generic.CompareTo(y);
+            if (x is IComparable comparable) return comparable.CompareTo(y);
+            throw new ArgumentException();
+        }
+    }
 
     public class List<T> : IList<T>, IList, IEnumerable<T>, IEnumerable, IReadOnlyList<T>
     {
@@ -964,10 +990,23 @@ namespace System.Collections.Generic
     }
     public abstract class EqualityComparer<T> : IEqualityComparer, IEqualityComparer<T>
     {
-        public static EqualityComparer<T> Default { get; } = CreateDefaultEqualityComparer();
+        public static EqualityComparer<T> Default { [Intrinsic] get; } = Create();
 
-        private static EqualityComparer<T> CreateDefaultEqualityComparer()
+        [Intrinsic]
+        private static EqualityComparer<T> Create()
         {
+            // The compiler will overwrite the Create method with optimized
+            // instantiation-specific implementation.
+            // This body serves as a fallback when instantiation-specific implementation is unavailable.
+            // If that happens, the compiler ensures we generate data structures to make the fallback work
+            // when this method is compiled.
+
+            if (typeof(T) == typeof(string))
+            {
+                return Unsafe.As<EqualityComparer<T>>(new StringEqualityComparer());
+            }
+
+            //return Unsafe.As<EqualityComparer<T>>(EqualityComparerHelpers.GetComparer(typeof(T).TypeHandle));
             return new ObjectEqualityComparer<T>();
         }
 

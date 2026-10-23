@@ -122,11 +122,6 @@ namespace Cnidaria.Cs
                     AppendOperands(sb, node);
                     sb.Append(')');
                     return;
-                case GenTreeKind.NewObject:
-                    sb.Append("newobj ").Append(MethodName(node.Method)).Append('(');
-                    AppendOperands(sb, node);
-                    sb.Append(')');
-                    return;
                 case GenTreeKind.NewDelegate:
                     sb.Append("newdelegate ").Append(TypeName(node.RuntimeType)).Append(" -> ").Append(MethodName(node.Method)).Append('(');
                     AppendOperands(sb, node);
@@ -174,6 +169,9 @@ namespace Cnidaria.Cs
                 case GenTreeKind.StoreStaticField:
                     sb.Append(FieldName(node.Field)).Append(" = ");
                     TryAppendOperand(sb, node, 0);
+                    return;
+                case GenTreeKind.AllocObject:
+                    sb.Append("allocobj ").Append(TypeName(node.RuntimeType));
                     return;
                 case GenTreeKind.NewArray:
                     sb.Append("newarr ").Append(TypeName(node.RuntimeType)).Append('[');

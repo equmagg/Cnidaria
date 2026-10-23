@@ -582,7 +582,7 @@ namespace Cnidaria.Cs
                 TypeParameterSymbol? tp = null;
                 for (int i = 0; i < typeParameters.Length; i++)
                 {
-                    if (StringComparer.Ordinal.Equals(typeParameters[i].Name, tpName))
+                    if (typeParameters[i].Name == tpName)
                     {
                         tp = typeParameters[i];
                         break;
@@ -648,7 +648,7 @@ namespace Cnidaria.Cs
                 TypeParameterSymbol? tp = null;
                 for (int i = 0; i < typeParameters.Length; i++)
                 {
-                    if (StringComparer.Ordinal.Equals(typeParameters[i].Name, tpName))
+                    if (typeParameters[i].Name == tpName)
                     {
                         tp = typeParameters[i];
                         break;

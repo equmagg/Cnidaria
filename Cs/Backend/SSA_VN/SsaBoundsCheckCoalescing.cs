@@ -292,10 +292,10 @@ namespace Cnidaria.Cs
                 GenTreeKind.IndirectCall or
                 GenTreeKind.VirtualCall or
                 GenTreeKind.DelegateInvoke or
-                GenTreeKind.NewObject or
                 GenTreeKind.NewDelegate or
                 GenTreeKind.DelegateCombine or
                 GenTreeKind.DelegateRemove or
+                GenTreeKind.AllocObject or
                 GenTreeKind.NewArray or
                 GenTreeKind.Box or
                 GenTreeKind.StaticData or
@@ -336,10 +336,10 @@ namespace Cnidaria.Cs
 
                 case GenTreeKind.ArrayDataRef:
                 case GenTreeKind.StoreStaticField:
-                case GenTreeKind.NewObject:
                 case GenTreeKind.NewDelegate:
                 case GenTreeKind.DelegateCombine:
                 case GenTreeKind.DelegateRemove:
+                case GenTreeKind.AllocObject:
                 case GenTreeKind.NewArray:
                 case GenTreeKind.Box:
                 case GenTreeKind.StaticData:

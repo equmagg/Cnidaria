@@ -764,7 +764,6 @@ namespace Cnidaria.Cs
             Func<GenTree, GenTreeValueInfo> getValueInfo,
             GenTree? resultValue = null,
             RuntimeMethod? callee = null,
-            bool isNewObject = false,
             TargetInfo? target = null)
         {
             if (getValueInfo is null)
@@ -780,22 +779,6 @@ namespace Cnidaria.Cs
             bool needsHiddenReturnBuffer = false;
             bool hiddenReturnBufferInserted = false;
             GenTree? hiddenReturnBufferValue = default;
-            if (isNewObject && callee?.DeclaringType.IsValueType == true)
-                throw new InvalidOperationException("Value-type newobj must be lowered into a struct materialization temp and a void constructor call before ABI classification.");
-
-            bool referenceTypeNewObject = isNewObject && callee?.HasThis == true;
-
-            if (referenceTypeNewObject)
-            {
-                _ = AssignScalarArgumentLocation(
-                    RegisterClass.General,
-                    PointerSizeFor(target),
-                    ref generalArg,
-                    ref floatArg,
-                    ref outgoingArg,
-                    target);
-            }
-
             if (resultValue is not null)
             {
                 var resultInfo = getValueInfo(resultValue);

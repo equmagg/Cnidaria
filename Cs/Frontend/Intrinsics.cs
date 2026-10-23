@@ -139,9 +139,9 @@ namespace Cnidaria.Cs
             if (!method.HasThis &&
                 method.IsStatic &&
                 method.ParameterTypes.Length == 3 &&
-                StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Threading") &&
-                StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Interlocked") &&
-                StringComparer.Ordinal.Equals(method.Name, "CompareExchange"))
+                method.DeclaringType.Namespace == "System.Threading" &&
+                method.DeclaringType.Name == "Interlocked" &&
+                method.Name == "CompareExchange")
             {
                 return RuntimeIntrinsicId.InterlockedCompareExchange;
             }
@@ -149,9 +149,9 @@ namespace Cnidaria.Cs
             if (!method.HasThis &&
                 method.IsStatic &&
                 method.ParameterTypes.Length == 2 &&
-                StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Threading") &&
-                StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Interlocked") &&
-                StringComparer.Ordinal.Equals(method.Name, "ExchangeAdd"))
+                method.DeclaringType.Namespace == "System.Threading" &&
+                method.DeclaringType.Name == "Interlocked" &&
+                method.Name == "ExchangeAdd")
             {
                 return RuntimeIntrinsicId.InterlockedExchangeAdd;
             }
@@ -159,9 +159,9 @@ namespace Cnidaria.Cs
             if (!method.HasThis &&
                 method.IsStatic &&
                 method.ParameterTypes.Length == 2 &&
-                StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Threading") &&
-                StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Interlocked") &&
-                StringComparer.Ordinal.Equals(method.Name, "Exchange"))
+                method.DeclaringType.Namespace == "System.Threading" &&
+                method.DeclaringType.Name == "Interlocked" &&
+                method.Name == "Exchange")
             {
                 return RuntimeIntrinsicId.InterlockedExchange;
             }
@@ -170,10 +170,10 @@ namespace Cnidaria.Cs
                 method.IsStatic &&
                 method.ParameterTypes.Length == 0 &&
                 method.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Void &&
-                StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Threading") &&
-                StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Interlocked") &&
-                (StringComparer.Ordinal.Equals(method.Name, "MemoryBarrier") ||
-                 StringComparer.Ordinal.Equals(method.Name, "ReadMemoryBarrier")))
+                method.DeclaringType.Namespace == "System.Threading" &&
+                method.DeclaringType.Name == "Interlocked" &&
+                (method.Name == "MemoryBarrier" ||
+                 method.Name == "ReadMemoryBarrier"))
             {
                 return RuntimeIntrinsicId.MemoryBarrier;
             }
@@ -182,12 +182,12 @@ namespace Cnidaria.Cs
                 method.IsStatic &&
                 method.ParameterTypes.Length is 1 or 2 &&
                 method.ParameterTypes[0].Kind == RuntimeTypeKind.ByRef &&
-                StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, "System.Threading") &&
-                StringComparer.Ordinal.Equals(method.DeclaringType.Name, "Volatile"))
+                method.DeclaringType.Namespace == "System.Threading" &&
+                method.DeclaringType.Name == "Volatile")
             {
-                if (method.ParameterTypes.Length == 1 && StringComparer.Ordinal.Equals(method.Name, "Read"))
+                if (method.ParameterTypes.Length == 1 && method.Name == "Read")
                     return RuntimeIntrinsicId.VolatileRead;
-                if (method.ParameterTypes.Length == 2 && StringComparer.Ordinal.Equals(method.Name, "Write"))
+                if (method.ParameterTypes.Length == 2 && method.Name == "Write")
                     return RuntimeIntrinsicId.VolatileWrite;
             }
 

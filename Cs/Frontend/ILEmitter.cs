@@ -1477,7 +1477,7 @@ namespace Cnidaria.Cs
             }
             private static bool IsDelegateInvokeCall(BoundCallExpression call)
                 => !call.Method.IsStatic &&
-                   StringComparer.Ordinal.Equals(call.Method.Name, "Invoke") &&
+                   call.Method.Name == "Invoke" &&
                    call.Method.ContainingSymbol is NamedTypeSymbol { TypeKind: TypeKind.Delegate };
 
             private void EmitCall(BoundCallExpression call, EmitMode mode)
@@ -1993,7 +1993,7 @@ namespace Cnidaria.Cs
                         _il.EmitToken(ILOpCode.Stobj, _tokens.GetTypeToken(call.Method.TypeArguments[0]), 2, 0);
                         return true;
 
-                    case "CopyBlockUnaligned" when ps.Length == 3 && ps[2].Type.SpecialType == SpecialType.System_UInt32 && IsVoid(def.ReturnType):
+                    case "CopyBlock" or "CopyBlockUnaligned" when ps.Length == 3 && ps[2].Type.SpecialType == SpecialType.System_UInt32 && IsVoid(def.ReturnType):
                         return TryEmitCopyBlock(call);
 
                     case "Add" when ps.Length == 2 &&

@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Numerics;
+using Internal.Runtime;
 using System.Runtime;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -10,6 +11,7 @@ using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.Wasm;
 using System.Runtime.Intrinsics.X86;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 
@@ -952,24 +954,256 @@ namespace System
         public virtual int GetHashCode() { return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(this); }
         // Returns a Type object which represent this object instance.
         [Intrinsic]
-        public Type GetType() => RuntimeType.FromHandle(System.Runtime.RuntimeImports.RhGetObjectTypeHandle(this));
+        public unsafe Type GetType() => RuntimeType.FromHandle((IntPtr)RuntimeHelpers.GetMethodTable(this));
 
         [Intrinsic]
         [MethodImpl(MethodImplOptions.InternalCall)]
         protected internal extern object MemberwiseClone();
     }
 
-    public class ValueType
+    public abstract class ValueType
     {
-        protected ValueType() { }
+        public override string? ToString()
+        {
+            return this.GetType().ToString();
+        }
+
+        private const int GetNumFields = -1;
+
+        // An override of this method will be injected by the compiler into all valuetypes that cannot be compared
+        // using a simple memory comparison until the last byte as reported by sizeof.
+        // This API is a bit awkward because we want to avoid burning more than one vtable slot on this.
+        // The method returns the offset and type handle of the index-th field on this type.
+        // When index == GetNumFields, this method is expected to return the number of fields of this
+        // valuetype or a negative value. If the value is negative, the struct can be memcompared until
+        // the byte specified by the negated return value.
+        internal virtual unsafe int __GetFieldHelper(int index, out MethodTable* mt)
+        {
+            // Value types that don't override this method will use the fast path that looks at bytes, not fields.
+            mt = default;
+            return -(int)this.GetMethodTable()->ValueTypeSize;
+        }
+
+        private unsafe int GetValueTypeSize(int numFields)
+        {
+            // Debug.Assert(numFields < 0);
+            int valueTypeSize = -numFields;
+            // Debug.Assert(valueTypeSize <= (int)this.GetMethodTable()->ValueTypeSize);
+
+            return valueTypeSize;
+        }
+
+        public override unsafe bool Equals([NotNullWhen(true)] object? obj)
+        {
+            if (obj == null || obj.GetMethodTable() != this.GetMethodTable())
+                return false;
+
+            int numFields = __GetFieldHelper(GetNumFields, out _);
+
+            ref byte thisRawData = ref this.GetRawData();
+            ref byte thatRawData = ref obj.GetRawData();
+
+            if (numFields < 0)
+            {
+                // Compare the memory
+                return SpanHelpers.SequenceEqual(ref thisRawData, ref thatRawData, GetValueTypeSize(numFields));
+            }
+            else
+            {
+                // Foreach field, box and call the Equals method.
+                for (int i = 0; i < numFields; i++)
+                {
+                    int fieldOffset = __GetFieldHelper(i, out MethodTable* fieldType);
+
+                    // Fetch the value of the field on both types
+                    object thisField = RuntimeImports.RhBoxAny(ref Unsafe.Add(ref thisRawData, fieldOffset), fieldType);
+                    object thatField = RuntimeImports.RhBoxAny(ref Unsafe.Add(ref thatRawData, fieldOffset), fieldType);
+
+                    // Compare the fields
+                    if (thisField == null)
+                    {
+                        if (thatField != null)
+                            return false;
+                    }
+                    else if (!thisField.Equals(thatField))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        public override unsafe int GetHashCode()
+        {
+            HashCode hashCode = default;
+            hashCode.Add((IntPtr)this.GetMethodTable());
+
+            int numFields = __GetFieldHelper(GetNumFields, out _);
+
+            if (numFields < 0)
+            {
+                hashCode.AddBytes(new ReadOnlySpan<byte>(ref this.GetRawData(), GetValueTypeSize(numFields)));
+            }
+            else
+            {
+                RegularGetValueTypeHashCode(ref hashCode, ref this.GetRawData(), numFields);
+            }
+
+            return hashCode.ToHashCode();
+        }
+
+        private static unsafe ReadOnlySpan<byte> GetSpanForField(MethodTable* type, ref byte data)
+        {
+            return new ReadOnlySpan<byte>(ref data, (int)type->ValueTypeSize);
+        }
+
+        private unsafe void RegularGetValueTypeHashCode(ref HashCode hashCode, ref byte data, int numFields)
+        {
+            // We only take the hashcode for the first non-null field. That's what the CLR does.
+            for (int i = 0; i < numFields; i++)
+            {
+                int fieldOffset = __GetFieldHelper(i, out MethodTable* fieldType);
+                ref byte fieldData = ref Unsafe.Add(ref data, fieldOffset);
+
+                if (fieldType->ElementType == EETypeElementType.Single)
+                {
+                    hashCode.Add(Unsafe.As<byte, float>(ref fieldData));
+                }
+                else if (fieldType->ElementType == EETypeElementType.Double)
+                {
+                    hashCode.Add(Unsafe.As<byte, double>(ref fieldData));
+                }
+                else if (fieldType->IsPrimitive)
+                {
+                    hashCode.AddBytes(GetSpanForField(fieldType, ref fieldData));
+                }
+                else if (fieldType->IsValueType)
+                {
+                    // We have no option but to box since this value type could have
+                    // GC pointers (we could find out if we want though), or fields of type Double/Single (we can't
+                    // really find out). Double/Single have weird requirements around -0.0 and +0.0.
+                    // If this boxing becomes a problem, we could build a piece of infrastructure that determines the slot
+                    // of __GetFieldHelper, decodes the unboxing stub pointed to by the slot to the real target
+                    // (we already have that part), and calls the entrypoint that expects a byref `this`, and use the
+                    // data to decide between calling fast or regular hashcode helper.
+                    var fieldValue = (ValueType)RuntimeExports.RhBox(fieldType, ref fieldData);
+                    if (fieldValue != null)
+                    {
+                        hashCode.Add(fieldValue);
+                    }
+                    else
+                    {
+                        // nullable type with no value, try next
+                        continue;
+                    }
+                }
+                else
+                {
+                    object fieldValue = Unsafe.As<byte, object>(ref fieldData);
+                    if (fieldValue != null)
+                    {
+                        hashCode.Add(fieldValue);
+                    }
+                    else
+                    {
+                        // null object reference, try next
+                        continue;
+                    }
+                }
+                break;
+            }
+        }
     }
     public abstract class Enum : ValueType
     {
-        protected Enum() { }
         public bool HasFlag(Enum flag)
         {
             return false;
         }
+
+        private unsafe System.Reflection.CorElementType InternalGetCorElementType()
+        {
+            return new EETypePtr(this.GetMethodTable()).CorElementType;
+        }
+
+        public override unsafe bool Equals([NotNullWhen(true)] object? obj)
+        {
+            if (obj == null)
+                return false;
+
+            if (this == obj)
+                return true;
+
+            if (this.GetMethodTable() != obj.GetMethodTable())
+                return false;
+
+            ref byte pThisValue = ref this.GetRawData();
+            ref byte pOtherValue = ref obj.GetRawData();
+
+            switch (InternalGetCorElementType())
+            {
+                case CorElementType.ELEMENT_TYPE_I1:
+                case CorElementType.ELEMENT_TYPE_U1:
+#if RARE_ENUMS
+                case CorElementType.ELEMENT_TYPE_BOOLEAN:
+#endif
+                    return pThisValue == pOtherValue;
+                case CorElementType.ELEMENT_TYPE_I2:
+                case CorElementType.ELEMENT_TYPE_U2:
+#if RARE_ENUMS
+                case CorElementType.ELEMENT_TYPE_CHAR:
+#endif
+                    return Unsafe.As<byte, ushort>(ref pThisValue) == Unsafe.As<byte, ushort>(ref pOtherValue);
+                case CorElementType.ELEMENT_TYPE_I4:
+                case CorElementType.ELEMENT_TYPE_U4:
+#if RARE_ENUMS
+                case CorElementType.ELEMENT_TYPE_R4:
+#endif
+                    return Unsafe.As<byte, uint>(ref pThisValue) == Unsafe.As<byte, uint>(ref pOtherValue);
+                case CorElementType.ELEMENT_TYPE_I8:
+                case CorElementType.ELEMENT_TYPE_U8:
+#if RARE_ENUMS
+                case CorElementType.ELEMENT_TYPE_R8:
+#endif
+                    return Unsafe.As<byte, ulong>(ref pThisValue) == Unsafe.As<byte, ulong>(ref pOtherValue);
+                default:
+                    return false;
+            }
+        }
+
+        public override int GetHashCode()
+        {
+            // CONTRACT with the runtime: GetHashCode of enum types is implemented as GetHashCode of the underlying type.
+            // The runtime can bypass calls to Enum::GetHashCode and call the underlying type's GetHashCode directly
+            // to avoid boxing the enum.
+            ref byte data = ref this.GetRawData();
+            return InternalGetCorElementType() switch
+            {
+                CorElementType.ELEMENT_TYPE_I1 => Unsafe.As<byte, sbyte>(ref data).GetHashCode(),
+                CorElementType.ELEMENT_TYPE_U1 => data.GetHashCode(),
+                CorElementType.ELEMENT_TYPE_I2 => Unsafe.As<byte, short>(ref data).GetHashCode(),
+                CorElementType.ELEMENT_TYPE_U2 => Unsafe.As<byte, ushort>(ref data).GetHashCode(),
+                CorElementType.ELEMENT_TYPE_I4 => Unsafe.As<byte, int>(ref data).GetHashCode(),
+                CorElementType.ELEMENT_TYPE_U4 => Unsafe.As<byte, uint>(ref data).GetHashCode(),
+                CorElementType.ELEMENT_TYPE_I8 => Unsafe.As<byte, long>(ref data).GetHashCode(),
+                CorElementType.ELEMENT_TYPE_U8 => Unsafe.As<byte, ulong>(ref data).GetHashCode(),
+#if RARE_ENUMS
+                CorElementType.ELEMENT_TYPE_R4 => Unsafe.As<byte, float>(ref data).GetHashCode(),
+                CorElementType.ELEMENT_TYPE_R8 => Unsafe.As<byte, double>(ref data).GetHashCode(),
+                CorElementType.ELEMENT_TYPE_I => Unsafe.As<byte, IntPtr>(ref data).GetHashCode(),
+                CorElementType.ELEMENT_TYPE_U => Unsafe.As<byte, UIntPtr>(ref data).GetHashCode(),
+                CorElementType.ELEMENT_TYPE_CHAR => Unsafe.As<byte, char>(ref data).GetHashCode(),
+                CorElementType.ELEMENT_TYPE_BOOLEAN => Unsafe.As<byte, bool>(ref data).GetHashCode(),
+#endif
+                _ => throw CreateUnknownEnumTypeException(),
+            };
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static InvalidOperationException CreateUnknownEnumTypeException() =>
+            new InvalidOperationException(SR.InvalidOperation_UnknownEnumType);
     }
     // NativeAOT's template for SZ arrays: T[] takes its vtable and generic collection interfaces from Array<T> but keeps System.Array as its base
     internal class Array<T> : Array, IEnumerable<T>, ICollection<T>, IList<T>, IReadOnlyList<T>
@@ -1502,45 +1736,87 @@ namespace System
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static string FastAllocateString(int length) { return null; }
         internal String() { }
-        public String(char ch, int length)
-        {
-            if (length < 0) throw new ArgumentOutOfRangeException("length");
-            ref char dst = ref GetRawStringData();
-            for (int i = 0; i < length; i++)
-                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) = ch;
-        }
-        public String(char[] value)
-        {
-            if (value == null) throw new ArgumentNullException("length");
-            int n = value.Length;
-            ref char dst = ref GetRawStringData();
-            for (int i = 0; i < n; i++)
-                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) = value[i];
-        }
-        public String(char[] value, int startIndex, int length)
-        {
-            if (value == null) throw new ArgumentNullException("length");
-            if ((uint)startIndex > (uint)value.Length) throw new ArgumentOutOfRangeException("startIndex");
-            if (length < 0) throw new ArgumentOutOfRangeException("length");
-            if (startIndex + length > value.Length) throw new ArgumentOutOfRangeException("length");
 
-            ref char dst = ref GetRawStringData();
-            for (int i = 0; i < length; i++)
-                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) = value[startIndex + i];
-        }
-        public String(ReadOnlySpan<char> value)
-        {
-            ref char dst = ref GetRawStringData();
-            for (int i = 0; i < value.Length; i++)
-                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) = value[i];
-        }
-        public unsafe String(char* value)
-        {
-            if (value == null) throw new ArgumentNullException("value");
+        // The runtime constructs strings through the static Ctor with the same parameters
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public String(char c, int count) { }
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public String(char[]? value) { }
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public String(char[] value, int startIndex, int length) { }
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public String(ReadOnlySpan<char> value) { }
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public unsafe String(char* value) { }
 
-            ref char dst = ref GetRawStringData();
-            for (int i = 0; i < Length; i++)
-                System.Runtime.CompilerServices.Unsafe.Add<char>(ref dst, i) = value[i];
+        private static string Ctor(char c, int count)
+        {
+            if (count > 0)
+            {
+                string result = FastAllocateString(count);
+                ref char dst = ref result._firstChar;
+                for (int i = 0; i < count; i++)
+                    Unsafe.Add(ref dst, i) = c;
+                return result;
+            }
+            if (count == 0)
+                return Empty;
+            throw new ArgumentOutOfRangeException(nameof(count));
+        }
+
+        private static string Ctor(char[]? value)
+        {
+            if (value == null || value.Length == 0)
+                return Empty;
+
+            string result = FastAllocateString(value.Length);
+            Buffer.Memmove(ref result._firstChar, ref MemoryMarshal.GetArrayDataReference(value), (uint)result.Length);
+            return result;
+        }
+
+        private static string Ctor(char[] value, int startIndex, int length)
+        {
+            ArgumentNullException.ThrowIfNull(value);
+            if (startIndex < 0)
+                throw new ArgumentOutOfRangeException(nameof(startIndex));
+            if (length < 0)
+                throw new ArgumentOutOfRangeException(nameof(length));
+            if (startIndex > value.Length - length)
+                throw new ArgumentOutOfRangeException(nameof(startIndex));
+            if (length == 0)
+                return Empty;
+
+            string result = FastAllocateString(length);
+            Buffer.Memmove(ref result._firstChar, ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(value), startIndex), (uint)length);
+            return result;
+        }
+
+        private static string Ctor(ReadOnlySpan<char> value)
+        {
+            if (value.Length == 0)
+                return Empty;
+
+            string result = FastAllocateString(value.Length);
+            Buffer.Memmove(ref result._firstChar, ref value._reference, (uint)value.Length);
+            return result;
+        }
+
+        private static unsafe string Ctor(char* ptr)
+        {
+            if (ptr == null)
+                return Empty;
+
+            int count = 0;
+            while (ptr[count] != '\0')
+                count++;
+            if (count == 0)
+                return Empty;
+
+            string result = FastAllocateString(count);
+            ref char dst = ref result._firstChar;
+            for (int i = 0; i < count; i++)
+                Unsafe.Add(ref dst, i) = ptr[i];
+            return result;
         }
 
         [IndexerName("Chars")]
@@ -9477,7 +9753,7 @@ namespace System
             {
                 if (!hasValue)
                 {
-                    throw new InvalidOperationException("no value");
+                    ThrowHelper.ThrowInvalidOperationException_InvalidOperation_NoValue();
                 }
                 return value;
             }
@@ -9511,6 +9787,17 @@ namespace System
 
     public static class Nullable
     {
+        public static int Compare<T>(T? n1, T? n2) where T : struct
+        {
+            if (n1.HasValue)
+            {
+                if (n2.HasValue) return Comparer<T>.Default.Compare(n1.value, n2.value);
+                return 1;
+            }
+            if (n2.HasValue) return -1;
+            return 0;
+        }
+
         public static bool Equals<T>(T? n1, T? n2) where T : struct
         {
             if (n1.HasValue)
@@ -9520,6 +9807,15 @@ namespace System
             }
             if (n2.HasValue) return false;
             return true;
+        }
+
+        // If the type provided is not a Nullable Type, return null.
+        // Otherwise, return the underlying type of the Nullable type
+        public static Type? GetUnderlyingType(Type nullableType)
+        {
+            ArgumentNullException.ThrowIfNull(nullableType);
+
+            throw new NotSupportedException();
         }
 
         /// <summary>
@@ -12984,6 +13280,72 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
             Add(value is null ? 0 : (comparer?.GetHashCode(value) ?? value.GetHashCode()));
         }
 
+        /// <summary>Adds a span of bytes to the hash code.</summary>
+        /// <param name="value">The span.</param>
+        /// <remarks>
+        /// This method does not guarantee that the result of adding a span of bytes will match
+        /// the result of adding the same bytes individually.
+        /// </remarks>
+        public void AddBytes(ReadOnlySpan<byte> value)
+        {
+            if (value.Length < (sizeof(int) * 4))
+            {
+                goto Small;
+            }
+
+            // Usually Add calls Initialize but if we haven't used HashCode before it won't have been called.
+            if (_length == 0)
+            {
+                Initialize(out _v1, out _v2, out _v3, out _v4);
+            }
+            else
+            {
+                // If we have at least 16 bytes to hash, we can add them in 16-byte batches,
+                // but we first have to add enough data to flush any queued values.
+                switch (_length % 4)
+                {
+                    case 1:
+                        Add(BitConverter.ToInt32(value));
+                        value = value.Slice(sizeof(int));
+                        goto case 2;
+                    case 2:
+                        Add(BitConverter.ToInt32(value));
+                        value = value.Slice(sizeof(int));
+                        goto case 3;
+                    case 3:
+                        Add(BitConverter.ToInt32(value));
+                        value = value.Slice(sizeof(int));
+                        break;
+                }
+            }
+
+            // With the queue clear, we add sixteen bytes at a time until the input has fewer than sixteen bytes remaining.
+            while (value.Length >= sizeof(int) * 4)
+            {
+                _v1 = Round(_v1, BitConverter.ToUInt32(value));
+                _v2 = Round(_v2, BitConverter.ToUInt32(value.Slice(sizeof(int) * 1)));
+                _v3 = Round(_v3, BitConverter.ToUInt32(value.Slice(sizeof(int) * 2)));
+                _v4 = Round(_v4, BitConverter.ToUInt32(value.Slice(sizeof(int) * 3)));
+
+                _length += 4;
+                value = value.Slice(sizeof(int) * 4);
+            }
+
+        Small:
+            // Add four bytes at a time until the input has fewer than four bytes remaining.
+            while (value.Length >= sizeof(int))
+            {
+                Add(BitConverter.ToInt32(value));
+                value = value.Slice(sizeof(int));
+            }
+
+            // Add the remaining bytes a single byte at a time.
+            foreach (byte b in value)
+            {
+                Add((int)b);
+            }
+        }
+
         private void Add(int value)
         {
             uint val = (uint)value;
@@ -16034,6 +16396,16 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
             return Unsafe.ReadUnaligned<short>(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(value));
         }
 
+        public static ushort ToUInt16(byte[] value, int startIndex) => unchecked((ushort)ToInt16(value, startIndex));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static ushort ToUInt16(ReadOnlySpan<byte> value)
+        {
+            if (value.Length < sizeof(ushort))
+                ThrowHelper.ThrowArgumentOutOfRangeException(ExceptionArgument.value);
+            return Unsafe.ReadUnaligned<ushort>(ref MemoryMarshal.GetReference(value));
+        }
+
         public static int ToInt32(byte[] value, int startIndex)
         {
             if (value == null)
@@ -16053,6 +16425,16 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
             return Unsafe.ReadUnaligned<int>(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(value));
         }
 
+        public static uint ToUInt32(byte[] value, int startIndex) => unchecked((uint)ToInt32(value, startIndex));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static uint ToUInt32(ReadOnlySpan<byte> value)
+        {
+            if (value.Length < sizeof(uint))
+                ThrowHelper.ThrowArgumentOutOfRangeException(ExceptionArgument.value);
+            return Unsafe.ReadUnaligned<uint>(ref MemoryMarshal.GetReference(value));
+        }
+
         public static long ToInt64(byte[] value, int startIndex)
         {
             if (value == null)
@@ -16064,12 +16446,23 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 
             return Unsafe.ReadUnaligned<long>(ref value[startIndex]);
         }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static long ToInt64(ReadOnlySpan<byte> value)
         {
             if (value.Length < sizeof(long))
                 throw new ArgumentOutOfRangeException();
             return Unsafe.ReadUnaligned<long>(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(value));
+        }
+
+        public static ulong ToUInt64(byte[] value, int startIndex) => unchecked((ulong)ToInt64(value, startIndex));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static ulong ToUInt64(ReadOnlySpan<byte> value)
+        {
+            if (value.Length < sizeof(ulong))
+                ThrowHelper.ThrowArgumentOutOfRangeException(ExceptionArgument.value);
+            return Unsafe.ReadUnaligned<ulong>(ref MemoryMarshal.GetReference(value));
         }
 
         public static long DoubleToInt64Bits(double value) => Unsafe.BitCast<double, long>(value);
@@ -19656,6 +20049,70 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         String = 18,        // Unicode character string
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    internal unsafe struct EETypePtr
+    {
+        private MethodTable* _value;
+
+        internal EETypePtr(MethodTable* value)
+        {
+            _value = value;
+        }
+
+        internal CorElementType CorElementType
+        {
+            get
+            {
+                ReadOnlySpan<byte> map =
+                [
+                    default,
+                    (byte)CorElementType.ELEMENT_TYPE_VOID,      // EETypeElementType.Void
+                    (byte)CorElementType.ELEMENT_TYPE_BOOLEAN,   // EETypeElementType.Boolean
+                    (byte)CorElementType.ELEMENT_TYPE_CHAR,      // EETypeElementType.Char
+                    (byte)CorElementType.ELEMENT_TYPE_I1,        // EETypeElementType.SByte
+                    (byte)CorElementType.ELEMENT_TYPE_U1,        // EETypeElementType.Byte
+                    (byte)CorElementType.ELEMENT_TYPE_I2,        // EETypeElementType.Int16
+                    (byte)CorElementType.ELEMENT_TYPE_U2,        // EETypeElementType.UInt16
+                    (byte)CorElementType.ELEMENT_TYPE_I4,        // EETypeElementType.Int32
+                    (byte)CorElementType.ELEMENT_TYPE_U4,        // EETypeElementType.UInt32
+                    (byte)CorElementType.ELEMENT_TYPE_I8,        // EETypeElementType.Int64
+                    (byte)CorElementType.ELEMENT_TYPE_U8,        // EETypeElementType.UInt64
+                    (byte)CorElementType.ELEMENT_TYPE_I,         // EETypeElementType.IntPtr
+                    (byte)CorElementType.ELEMENT_TYPE_U,         // EETypeElementType.UIntPtr
+                    (byte)CorElementType.ELEMENT_TYPE_R4,        // EETypeElementType.Single
+                    (byte)CorElementType.ELEMENT_TYPE_R8,        // EETypeElementType.Double
+
+                    (byte)CorElementType.ELEMENT_TYPE_VALUETYPE, // EETypeElementType.ValueType
+                    (byte)CorElementType.ELEMENT_TYPE_VALUETYPE,
+                    (byte)CorElementType.ELEMENT_TYPE_VALUETYPE, // EETypeElementType.Nullable
+                    (byte)CorElementType.ELEMENT_TYPE_VALUETYPE,
+                    (byte)CorElementType.ELEMENT_TYPE_CLASS,     // EETypeElementType.Class
+                    (byte)CorElementType.ELEMENT_TYPE_CLASS,     // EETypeElementType.Interface
+                    (byte)CorElementType.ELEMENT_TYPE_CLASS,     // EETypeElementType.SystemArray
+                    (byte)CorElementType.ELEMENT_TYPE_ARRAY,     // EETypeElementType.Array
+                    (byte)CorElementType.ELEMENT_TYPE_SZARRAY,   // EETypeElementType.SzArray
+                    (byte)CorElementType.ELEMENT_TYPE_BYREF,     // EETypeElementType.ByRef
+                    (byte)CorElementType.ELEMENT_TYPE_PTR,       // EETypeElementType.Pointer
+                    (byte)CorElementType.ELEMENT_TYPE_FNPTR,     // EETypeElementType.FunctionPointer
+                    default, // Pad the map to 32 elements to enable range check elimination
+                    default,
+                    default,
+                    default
+                ];
+
+                return (CorElementType)map[(int)ElementType];
+            }
+        }
+
+        private EETypeElementType ElementType
+        {
+            get
+            {
+                return _value->ElementType;
+            }
+        }
+    }
+
     public abstract class Type : System.Reflection.MemberInfo, System.Reflection.IReflect
     {
         protected Type() { }
@@ -21640,6 +22097,7 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
                                                                                   "The collection's state is no longer correct.";
         internal const string InvalidOperation_InvalidUtf8 = "Formatted string contains characters not representable as valid UTF-8.";
         internal const string InvalidOperation_ReadOnly = "Instance is read-only.";
+        internal const string InvalidOperation_UnknownEnumType = "Unknown enum type.";
         internal const string NotSupported_Type = "Type is not supported.";
         internal const string ObjectDisposed_Generic = "Cannot access a disposed object.";
     }

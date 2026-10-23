@@ -721,7 +721,6 @@ namespace Cnidaria.Cs
                     GenTreeKind.Call or
                     GenTreeKind.IndirectCall or
                     GenTreeKind.VirtualCall or
-                    GenTreeKind.NewObject or
                     GenTreeKind.NewDelegate or
                     GenTreeKind.DelegateCombine or
                     GenTreeKind.DelegateRemove or

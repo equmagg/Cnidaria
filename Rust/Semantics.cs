@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Threading;
 using IR = Cnidaria.C;
 
@@ -34,7 +36,9 @@ public sealed class Compilation
 {
     private readonly Lazy<Binder> _binding;
     private readonly ImmutableDictionary<SyntaxTree, SemanticModel> _models;
+    private readonly Dictionary<FunctionSymbol, BoundFunction> _lowered = new();
     internal ImmutableDictionary<string, SyntaxTree> ModuleSources { get; }
+    internal ImmutableArray<Compilation> References { get; }
     public SyntaxTree RootSyntaxTree { get; }
     public ImmutableArray<SyntaxTree> SyntaxTrees { get; }
     public CompilationOptions Options { get; }
@@ -55,6 +59,8 @@ public sealed class Compilation
         if (SyntaxTrees.Length != ModuleSources.Count + 1)
             throw new ArgumentException("Each module must have its own syntax tree.", nameof(modules));
         _models = SyntaxTrees.ToImmutableDictionary(t => t, t => new SemanticModel(this, t));
+        bool noCore = root.Root.Attributes.Any(a => a.IsInner && a.Path?.Segments.SingleOrDefault()?.Identifier.ValueText == "no_core");
+        References = noCore ? [] : [CoreLibrary.For(Options.PointerWidth)];
         _binding = new Lazy<Binder>(() =>
         {
             var binder = new Binder(this);
@@ -71,6 +77,29 @@ public sealed class Compilation
     {
         _ = Binding;
         return SyntaxTrees.SelectMany(t => GetSemanticModel(t).GetDiagnostics()).ToImmutableArray();
+    }
+
+    internal SyntaxTree? FindTree(SyntaxNode node)
+        => SyntaxTrees.FirstOrDefault(t => ReferenceEquals(t.Root, node) || GetSemanticModel(t).Data.Parents.ContainsKey(node)) ?? References.Select(r => r.FindTree(node)).FirstOrDefault(t => t is not null);
+    private Compilation? Owner(Symbol symbol)
+        => symbol.SyntaxTree is SyntaxTree tree && _models.ContainsKey(tree) ? this : References.Select(r => r.Owner(symbol)).FirstOrDefault(c => c is not null);
+    internal FunctionSymbol? LangItem(string name) => Binding.FindLangItem(name) as FunctionSymbol;
+    // Bodies of upstream functions are lowered once and emitted into every downstream crate that calls them
+    internal BoundFunction LoweredFunction(FunctionSymbol function)
+    {
+        Compilation owner = Owner(function) ?? throw new ArgumentException("The function belongs to no referenced crate.", nameof(function));
+        if (owner != this) return owner.LoweredFunction(function);
+        lock (_lowered)
+        {
+            if (!_lowered.TryGetValue(function, out BoundFunction? lowered))
+                _lowered.Add(function, lowered = Lowerer.Lower(this, (BoundFunction)GetSemanticModel(function.SyntaxTree!).Data.BoundNodes[function.Declaration]));
+            return lowered;
+        }
+    }
+    internal BoundGlobal BoundGlobal(GlobalSymbol global)
+    {
+        Compilation owner = Owner(global) ?? throw new ArgumentException("The global belongs to no referenced crate.", nameof(global));
+        return owner == this ? Binding.BindGlobal(global) : owner.BoundGlobal(global);
     }
 
     public (BoundCompilationUnit? Tree, ImmutableArray<IDiagnostic> Diagnostics) GetLoweredTree()
@@ -126,7 +155,7 @@ public sealed class Compilation
 
     private SemanticDiagnostic LoweringDiagnostic(LoweringException exception)
     {
-        SyntaxTree tree = SyntaxTrees.First(t => t.Root == exception.Syntax || t.Root.DescendantNodes().Contains(exception.Syntax));
+        SyntaxTree tree = Binding.TreeOf(exception.Syntax);
         return new SemanticDiagnostic("RLOW0001", exception.Message, tree, exception.Syntax.Span);
     }
 
@@ -137,6 +166,46 @@ public sealed class Compilation
         public TextSpan Position => Diagnostic.Position;
         public string GetMessage(string source) => Diagnostic.ToString();
         public override string ToString() => Diagnostic.ToString();
+    }
+}
+
+///<summary>Compiles the embedded core crate once per pointer width for every crate that does not opt out with #![no_core]</summary>
+internal static class CoreLibrary
+{
+    private static readonly Lazy<Compilation> Core32 = new(() => Create(32)), Core64 = new(() => Create(64));
+    internal static Compilation For(int pointerWidth) => pointerWidth == 32 ? Core32.Value : Core64.Value;
+
+    private static Compilation Create(int pointerWidth)
+    {
+        SyntaxTree root = Parse("lib");
+        var modules = new Dictionary<string, SyntaxTree>(StringComparer.Ordinal);
+        void Modules(IEnumerable<ItemSyntax> items, string prefix)
+        {
+            foreach (ModuleItemSyntax module in items.OfType<ModuleItemSyntax>())
+            {
+                string name = prefix.Length == 0 ? Binder.Name(module.Identifier) : prefix + "::" + Binder.Name(module.Identifier);
+                if (module.Body is not null) { Modules(module.Body.Items, name); continue; }
+                SyntaxTree tree = Parse(name.Replace("::", "/"));
+                modules.Add(name, tree);
+                Modules(tree.Root.Items, name);
+            }
+        }
+        Modules(root.Root.Items, "");
+        var compilation = Compilation.Create(root, new CompilationOptions { CrateName = "core", PointerWidth = pointerWidth, IsLibrary = true }, modules);
+        ImmutableArray<IDiagnostic> diagnostics = compilation.GetDiagnostics();
+        if (!diagnostics.IsEmpty) throw new InvalidOperationException("The Rust core library does not compile:" + Environment.NewLine + string.Join(Environment.NewLine, diagnostics));
+        return compilation;
+    }
+
+    private static SyntaxTree Parse(string module)
+    {
+        Assembly assembly = typeof(CoreLibrary).Assembly;
+        string resource = module.Replace('/', '.');
+        string[] candidates = [".Rust.Library.core." + resource + ".rs", ".Rust.Library.core." + resource + ".mod.rs"];
+        string name = assembly.GetManifestResourceNames().Single(n => candidates.Any(c => n.EndsWith(c, StringComparison.Ordinal)));
+        using Stream stream = assembly.GetManifestResourceStream(name)!;
+        using var reader = new StreamReader(stream);
+        return SyntaxTree.ParseText(reader.ReadToEnd(), filePath: "core/src/" + module + (name.EndsWith(".mod.rs", StringComparison.Ordinal) ? "/mod.rs" : ".rs"));
     }
 }
 

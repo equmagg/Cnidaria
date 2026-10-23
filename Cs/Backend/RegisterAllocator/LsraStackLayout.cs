@@ -535,8 +535,7 @@ namespace Cnidaria.Cs
                 int typeOperationScratchSize = supportsGcTransitionArea ? ComputeTypeOperationScratchSize() : 0;
                 if (supportsGcTransitionArea && (hasGcSafePoint || typeOperationScratchSize != 0))
                 {
-                    int transitionAlignment = Math.Max(Target.PointerSize, ComputeNewObjectArgumentSaveAlignment());
-                    cursor = AlignUp(cursor, transitionAlignment);
+                    cursor = AlignUp(cursor, Target.PointerSize);
                     gcSpillOffset = cursor;
                     gcRootSpillSlotCount = hasGcSafePoint ? ComputeGcRootSpillSlotCount() : 0;
                     int gcRootSpillSize = checked(gcRootSpillSlotCount * Target.PointerSize * gcRootSpillAreaCount);
@@ -547,12 +546,6 @@ namespace Cnidaria.Cs
                             checked(gcSpillOffset + gcSpillCursor),
                             ComputeTypeOperationScratchAlignment());
                         gcSpillCursor = checked(typeOperationScratchOffset - gcSpillOffset + typeOperationScratchSize);
-                    }
-
-                    if (MethodHasReferenceNewObject())
-                    {
-                        gcSpillCursor = AlignUp(gcSpillCursor, ComputeNewObjectArgumentSaveAlignment());
-                        gcSpillCursor = checked(gcSpillCursor + ComputeNewObjectArgumentSaveSize());
                     }
 
                     gcSpillSize = gcSpillCursor;
@@ -642,7 +635,7 @@ namespace Cnidaria.Cs
                     if (node.TreeKind is
                         GenTreeKind.ClassInit or
                         GenTreeKind.GcPoll or
-                        GenTreeKind.NewObject or
+                        GenTreeKind.AllocObject or
                         GenTreeKind.NewArray or
                         GenTreeKind.NewDelegate or
                         GenTreeKind.DelegateCombine or
@@ -716,63 +709,6 @@ namespace Cnidaria.Cs
                     return _method.GenTreeMethod.GetValueInfo(node.RegisterUses[0]).Type ?? node.RuntimeType ?? node.Type;
 
                 return node.RuntimeType ?? node.Type;
-            }
-
-            private int ComputeNewObjectArgumentSaveAlignment()
-            {
-                int alignment = Target.PointerSize;
-                for (int i = 1; i < 32; i++)
-                {
-                    MachineRegister register = RegisterInfo.GetIntegerArgumentRegister(Target, i);
-                    if (register == MachineRegister.Invalid)
-                        break;
-                    alignment = Math.Max(alignment, RegisterInfo.RegisterSaveAlignment(Target, register));
-                }
-                for (int i = 0; i < 32; i++)
-                {
-                    MachineRegister register = RegisterInfo.GetFloatArgumentRegister(Target, i);
-                    if (register == MachineRegister.Invalid)
-                        break;
-                    alignment = Math.Max(alignment, RegisterInfo.RegisterSaveAlignment(Target, register));
-                }
-                return Math.Max(1, alignment);
-            }
-
-            private int ComputeNewObjectArgumentSaveSize()
-            {
-                int cursor = 0;
-                for (int i = 1; i < 32; i++)
-                {
-                    MachineRegister register = RegisterInfo.GetIntegerArgumentRegister(Target, i);
-                    if (register == MachineRegister.Invalid)
-                        break;
-                    int alignment = RegisterInfo.RegisterSaveAlignment(Target, register);
-                    int size = RegisterInfo.LiveRegisterSaveSize(Target, register);
-                    cursor = AlignUp(cursor, alignment);
-                    cursor = checked(cursor + size);
-                }
-                for (int i = 0; i < 32; i++)
-                {
-                    MachineRegister register = RegisterInfo.GetFloatArgumentRegister(Target, i);
-                    if (register == MachineRegister.Invalid)
-                        break;
-                    int alignment = RegisterInfo.RegisterSaveAlignment(Target, register);
-                    int size = RegisterInfo.LiveRegisterSaveSize(Target, register);
-                    cursor = AlignUp(cursor, alignment);
-                    cursor = checked(cursor + size);
-                }
-                return cursor;
-            }
-
-            private bool MethodHasReferenceNewObject()
-            {
-                for (int i = 0; i < _method.LinearNodes.Length; i++)
-                {
-                    GenTree node = _method.LinearNodes[i];
-                    if (node.TreeKind == GenTreeKind.NewObject && node.Method?.DeclaringType.IsValueType == false)
-                        return true;
-                }
-                return false;
             }
 
             private int ComputeGcRootSpillSlotCount()

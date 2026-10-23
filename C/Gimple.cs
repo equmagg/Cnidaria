@@ -442,7 +442,7 @@ public readonly struct GimpleInitializerListItem
     public SyntaxNode? Syntax { get; }
     public ImmutableArray<DesignatorSyntax> Designators { get; }
     public GimpleInitializer Initializer { get; }
-    /// <summary>The array element this item initializes, or -1 when the list does not target an array</summary>
+    /// <summary>The array element or union member this item initializes, or -1 for an item placed by position</summary>
     public long ElementIndex { get; }
 
     public GimpleInitializerListItem(

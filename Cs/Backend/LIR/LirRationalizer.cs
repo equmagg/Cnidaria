@@ -973,10 +973,10 @@ namespace Cnidaria.Cs
                     GenTreeKind.IndirectCall or
                     GenTreeKind.VirtualCall or
                     GenTreeKind.DelegateInvoke or
-                    GenTreeKind.NewObject or
                     GenTreeKind.NewDelegate or
                     GenTreeKind.DelegateCombine or
                     GenTreeKind.DelegateRemove or
+                    GenTreeKind.AllocObject or
                     GenTreeKind.NewArray or
                     GenTreeKind.StoreIndirect or
                     GenTreeKind.StoreLocal or

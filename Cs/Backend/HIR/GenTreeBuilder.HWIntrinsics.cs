@@ -14,7 +14,7 @@ namespace Cnidaria.Cs
                 return numericsSize;
             if (type.Namespace == "System.Numerics" && (type.GenericTypeDefinition?.Name ?? type.Name) is "Vector" or "Vector`1")
                 return 16;
-            if (!StringComparer.Ordinal.Equals(type.Namespace, "System.Runtime.Intrinsics"))
+            if (type.Namespace != "System.Runtime.Intrinsics")
                 return 0;
             return (type.GenericTypeDefinition?.Name ?? type.Name) switch
             {
@@ -35,7 +35,7 @@ namespace Cnidaria.Cs
             RuntimeType owner = method.DeclaringType;
             if (!method.IsStatic || method.HasThis || method.ParameterTypes.Length != 0 ||
                 method.MethodGenericArguments.Length != 0 ||
-                !StringComparer.Ordinal.Equals(method.Name, "get_IsSupported") ||
+                method.Name != "get_IsSupported" ||
                 method.ReturnType.PrimitiveKind != RuntimePrimitiveKind.Boolean ||
                 owner.GenericTypeArguments.Length != 1)
                 return false;
@@ -62,7 +62,7 @@ namespace Cnidaria.Cs
 
         private bool TryImportHWIntrinsic(ImportFrame frame, List<StackValue> stack, List<GenTree> statements, RuntimeMethod method, int pc, ILOpCode op)
         {
-            bool x86 = StringComparer.Ordinal.Equals(method.DeclaringType.Namespace, X86Intrinsics.Namespace);
+            bool x86 = method.DeclaringType.Namespace == X86Intrinsics.Namespace;
             if (!x86 && !SimdTypes.TargetSupports(_rts.Target, VectorApiSize(method.DeclaringType)))
                 return false;
 
@@ -146,7 +146,7 @@ namespace Cnidaria.Cs
         }
 
         private static bool IsX86IntrinsicEnum(RuntimeType type, string name)
-            => StringComparer.Ordinal.Equals(type.Namespace, X86Intrinsics.Namespace) && StringComparer.Ordinal.Equals(type.Name, name);
+            => type.Namespace == X86Intrinsics.Namespace && type.Name == name;
 
         // Gathers with 64-bit indices and VNNI-INT multiplies of mixed signedness have rows of their own
         private static string X86RowName(RuntimeMethod method)
@@ -201,9 +201,9 @@ namespace Cnidaria.Cs
             _rts.EnsureConstructedMembers(tuple);
             foreach (RuntimeMethod ctor in tuple.Methods)
             {
-                if (!ctor.IsStatic && ctor.ParameterTypes.Length == 2 && StringComparer.Ordinal.Equals(ctor.Name, ".ctor"))
+                if (!ctor.IsStatic && ctor.ParameterTypes.Length == 2 && ctor.Name == ".ctor")
                 {
-                    EmitNewObject(frame, stack, statements, pc, op, token: 0, ctor);
+                    EmitNewObject(frame, stack, statements, pc, op, token: 0, ctor, coldCallSite: false);
                     return;
                 }
             }

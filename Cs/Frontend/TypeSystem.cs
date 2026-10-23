@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Text;
 
@@ -687,7 +688,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < ownerDefinition.Methods.Length; i++)
                 {
                     var definition = ownerDefinition.Methods[i];
-                    if (!StringComparer.Ordinal.Equals(definition.Name, methodName) ||
+                    if (definition.Name != methodName ||
                         definition.HasThis != hasThis ||
                         definition.GenericArity != genericArity ||
                         !ReferenceEquals(definition.ReturnType, ret) ||
@@ -717,7 +718,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < owner.Methods.Length; i++)
             {
                 var m = owner.Methods[i];
-                if (!StringComparer.Ordinal.Equals(m.Name, methodName))
+                if (m.Name != methodName)
                     continue;
                 if (m.HasThis != hasThis)
                     continue;
@@ -893,7 +894,7 @@ namespace Cnidaria.Cs
                     for (int i = 0; i < constructedOwner.Methods.Length; i++)
                     {
                         var cand = constructedOwner.Methods[i];
-                        if (!StringComparer.Ordinal.Equals(cand.Name, genericMethod.Name))
+                        if (cand.Name != genericMethod.Name)
                             continue;
                         if (cand.HasThis != genericMethod.HasThis) continue;
                         if (cand.IsStatic != genericMethod.IsStatic) continue;
@@ -1031,14 +1032,14 @@ namespace Cnidaria.Cs
             if (!TypeUsesOwnerTypeParameters(targetOwnerDef))
                 return method;
 
-            if (!StringComparer.Ordinal.Equals(targetOwnerDef.AssemblyName, ctxOwnerDef.AssemblyName) ||
-                !StringComparer.Ordinal.Equals(targetOwnerDef.Namespace, ctxOwnerDef.Namespace))
+            if (targetOwnerDef.AssemblyName != ctxOwnerDef.AssemblyName ||
+                targetOwnerDef.Namespace != ctxOwnerDef.Namespace)
             {
                 return method;
             }
 
             bool sameOrNested =
-                StringComparer.Ordinal.Equals(targetOwnerDef.Name, ctxOwnerDef.Name) ||
+                targetOwnerDef.Name == ctxOwnerDef.Name ||
                 targetOwnerDef.Name.StartsWith(ctxOwnerDef.Name + "+", StringComparison.Ordinal);
 
             if (!sameOrNested)
@@ -1064,7 +1065,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < constructedOwner.Methods.Length; i++)
             {
                 var cand = constructedOwner.Methods[i];
-                if (!StringComparer.Ordinal.Equals(cand.Name, method.Name))
+                if (cand.Name != method.Name)
                     continue;
                 if (cand.HasThis != method.HasThis) continue;
                 if (cand.IsStatic != method.IsStatic) continue;
@@ -1124,6 +1125,25 @@ namespace Cnidaria.Cs
                 return m;
             throw new MissingMethodException($"RuntimeMethod id not found: {methodId}");
         }
+
+        internal RuntimeMethod GetStringFactory(RuntimeMethod constructor)
+        {
+            foreach (RuntimeMethod method in SystemString.Methods)
+            {
+                if (!method.IsStatic || method.Name != "Ctor" ||
+                    method.ParameterTypes.Length != constructor.ParameterTypes.Length)
+                {
+                    continue;
+                }
+
+                bool matches = true;
+                for (int i = 0; i < method.ParameterTypes.Length && matches; i++)
+                    matches = method.ParameterTypes[i].TypeId == constructor.ParameterTypes[i].TypeId;
+                if (matches)
+                    return method;
+            }
+            throw new MissingMethodException($"System.String has no Ctor factory for constructor {constructor.Name} with {constructor.ParameterTypes.Length} parameters.");
+        }
         private RuntimeMethod ResolveMethodSpec(RuntimeModule module, int methodSpecRid)
         {
             var ms = module.Md.GetMethodSpec(methodSpecRid);
@@ -1159,7 +1179,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < constructedOwner.Methods.Length; i++)
                 {
                     var cand = constructedOwner.Methods[i];
-                    if (!StringComparer.Ordinal.Equals(cand.Name, genericMethod.Name))
+                    if (cand.Name != genericMethod.Name)
                         continue;
                     if (cand.HasThis != genericMethod.HasThis) continue;
                     if (cand.IsStatic != genericMethod.IsStatic) continue;
@@ -1753,7 +1773,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < actualFields.Length; i++)
                 {
                     var af = actualFields[i];
-                    if (!StringComparer.Ordinal.Equals(af.Name, field.Name))
+                    if (af.Name != field.Name)
                         continue;
                     if (!ReferenceEquals(af.FieldType, expectedFieldType))
                         continue;
@@ -1823,7 +1843,7 @@ namespace Cnidaria.Cs
                 {
                     var cand = actualMethods[i];
 
-                    if (!StringComparer.Ordinal.Equals(cand.Name, method.Name)) continue;
+                    if (cand.Name != method.Name) continue;
                     if (cand.HasThis != method.HasThis) continue;
                     if (cand.IsStatic != method.IsStatic) continue;
                     if (cand.IsVirtual != method.IsVirtual) continue;
@@ -2168,7 +2188,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < methods.Length; i++)
             {
                 RuntimeMethod candidate = methods[i];
-                if (!StringComparer.Ordinal.Equals(candidate.Name, methodDefinition.Name) ||
+                if (candidate.Name != methodDefinition.Name ||
                     candidate.GenericArity != methodDefinition.GenericArity ||
                     candidate.IsStatic != methodDefinition.IsStatic)
                 {
@@ -2198,7 +2218,7 @@ namespace Cnidaria.Cs
                     RuntimeMethod candidate = methods[i];
                     if (candidate.IsStatic ||
                         !candidate.IsPublic ||
-                        !StringComparer.Ordinal.Equals(candidate.Name, declaredMethod.Name) ||
+                        candidate.Name != declaredMethod.Name ||
                         !SameRuntimeSignature(candidate, declaredMethod))
                     {
                         continue;
@@ -2264,7 +2284,7 @@ namespace Cnidaria.Cs
             RuntimeMethod interfaceDefinition = interfaceMethod.GenericMethodDefinition ?? interfaceMethod;
             RuntimeMethod declaredDefinition = declaredMethod.GenericMethodDefinition ?? declaredMethod;
 
-            if (!StringComparer.Ordinal.Equals(interfaceDefinition.Name, declaredDefinition.Name) ||
+            if (interfaceDefinition.Name != declaredDefinition.Name ||
                 interfaceDefinition.GenericArity != declaredDefinition.GenericArity ||
                 !SameRuntimeTypeDefinitionOrExact(interfaceDefinition.DeclaringType, declaredDefinition.DeclaringType) ||
                 !SameRuntimeSignature(interfaceDefinition, declaredDefinition))
@@ -2502,7 +2522,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < actualFields.Length; i++)
                 {
                     var cand = actualFields[i];
-                    if (!StringComparer.Ordinal.Equals(cand.Name, field.Name))
+                    if (cand.Name != field.Name)
                         continue;
                     if (!ReferenceEquals(cand.FieldType, expectedFieldType))
                         continue;
@@ -2544,7 +2564,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < owner.InstanceFields.Length; i++)
             {
                 var f = owner.InstanceFields[i];
-                if (StringComparer.Ordinal.Equals(f.Name, fieldName) &&
+                if (f.Name == fieldName &&
                     ReferenceEquals(f.FieldType, fieldType))
                 {
                     _fieldInMethodContextCache[key] = f;
@@ -2555,7 +2575,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < owner.StaticFields.Length; i++)
             {
                 var f = owner.StaticFields[i];
-                if (StringComparer.Ordinal.Equals(f.Name, fieldName) &&
+                if (f.Name == fieldName &&
                     ReferenceEquals(f.FieldType, fieldType))
                 {
                     _fieldInMethodContextCache[key] = f;
@@ -2663,8 +2683,12 @@ namespace Cnidaria.Cs
 
             var (asm, ns, name) = ResolveTypeDefOrRefName(m, td.ExtendsEncoded);
 
-            if (ns == "System" && name == "ValueType")
+            // System.Enum derives from System.ValueType but is itself a reference type
+            if (ns == "System" && name == "ValueType" &&
+                !(m.Md.GetString(td.Namespace) == "System" && m.Md.GetString(td.Name) == "Enum"))
+            {
                 return RuntimeTypeKind.Struct;
+            }
             if (ns == "System" && name == "Enum")
                 return RuntimeTypeKind.Enum;
 
@@ -2945,8 +2969,58 @@ namespace Cnidaria.Cs
 
         // Vector*.IsHardwareAccelerated recurse into themselves for the JIT to replace; no backend vectorizes.
         internal static bool IsHardwareAccelerationQuery(RuntimeMethod method)
-            => method.IsStatic && StringComparer.Ordinal.Equals(method.Name, "get_IsHardwareAccelerated") &&
+            => method.IsStatic && method.Name == "get_IsHardwareAccelerated" &&
                method.DeclaringType.Namespace is "System.Numerics" or "System.Runtime.Intrinsics";
+        private Dictionary<string, RuntimeMethod>? _runtimeExports;
+
+        // As in NativeAOT, an InternalCall importing an entry point of the "*" library binds to the managed method exporting it
+        internal RuntimeMethod? GetRuntimeExport(RuntimeMethod import)
+        {
+            if (!import.HasInternalCall || import.BodyModule is null || import.MethodDefToken == 0 ||
+                !TryGetRuntimeEntryPoint(import.BodyModule, import.MethodDefToken, "RuntimeImportAttribute", out string? entryPoint))
+            {
+                return null;
+            }
+
+            if (_runtimeExports is null)
+            {
+                var exports = new Dictionary<string, RuntimeMethod>(StringComparer.Ordinal);
+                foreach (RuntimeModule module in _modules.Values)
+                {
+                    int methodCount = module.Md.GetRowCount(MetadataTableKind.MethodDef);
+                    for (int rid = 1; rid <= methodCount; rid++)
+                    {
+                        int token = MetadataToken.MethodDef | rid;
+                        if (TryGetRuntimeEntryPoint(module, token, "RuntimeExportAttribute", out string? exported))
+                            exports[exported] = ResolveMethodInMethodContext(module, token, methodContext: null);
+                    }
+                }
+                _runtimeExports = exports;
+            }
+            return _runtimeExports.GetValueOrDefault(entryPoint);
+        }
+
+        // The entry point is the last string argument, after the library name when there is one
+        private static bool TryGetRuntimeEntryPoint(RuntimeModule module, int token, string attributeName, [NotNullWhen(true)] out string? entryPoint)
+        {
+            var (start, end) = module.Md.GetCustomAttributeRange(token);
+            for (int rid = start; rid < end; rid++)
+            {
+                var row = module.Md.GetCustomAttribute(rid);
+                if (!module.Md.IsAttribute(row.ConstructorToken, "System.Runtime", attributeName))
+                    continue;
+
+                var reader = new CustomAttributeBlobReader(module.Md.GetBlob(row.Value));
+                entryPoint = null;
+                while (reader.Remaining > 2)
+                    entryPoint = reader.ReadSerString();
+                return entryPoint is not null;
+            }
+
+            entryPoint = null;
+            return false;
+        }
+
         internal static bool HasCustomAttribute(RuntimeModule module, int token, string @namespace, string name)
         {
             var (start, end) = module.Md.GetCustomAttributeRange(token);
@@ -3138,7 +3212,7 @@ namespace Cnidaria.Cs
                 {
                     RuntimeMethod candidate = methods[i];
                     if (candidate.IsStatic || !candidate.IsVirtual || candidate.IsPrivate ||
-                        !StringComparer.Ordinal.Equals(candidate.Name, method.Name) ||
+                        candidate.Name != method.Name ||
                         !SameRuntimeSignature(candidate, method))
                     {
                         continue;
@@ -4020,9 +4094,133 @@ namespace Cnidaria.Cs
         Interface = 1 << 6,
         GenericParameter = 1 << 7,
     }
+    // What a NativeAOT MethodTable records for a type, for the backends that lay one out and the VMs that answer in its place
+    internal static class RuntimeMethodTables
+    {
+        public static uint ElementType(RuntimeType type)
+        {
+            RuntimePrimitiveKind primitiveKind = type.PrimitiveKind;
+            if (type.Kind == RuntimeTypeKind.Enum && primitiveKind == RuntimePrimitiveKind.None)
+            {
+                foreach (RuntimeField field in type.InstanceFields)
+                {
+                    if (!field.IsStatic)
+                    {
+                        primitiveKind = field.FieldType.PrimitiveKind;
+                        break;
+                    }
+                }
+            }
+
+            uint primitiveElementType = primitiveKind switch
+            {
+                RuntimePrimitiveKind.Void => 0x01u,
+                RuntimePrimitiveKind.Boolean => 0x02u,
+                RuntimePrimitiveKind.Char => 0x03u,
+                RuntimePrimitiveKind.Int8 => 0x04u,
+                RuntimePrimitiveKind.UInt8 => 0x05u,
+                RuntimePrimitiveKind.Int16 => 0x06u,
+                RuntimePrimitiveKind.UInt16 => 0x07u,
+                RuntimePrimitiveKind.Int32 => 0x08u,
+                RuntimePrimitiveKind.UInt32 => 0x09u,
+                RuntimePrimitiveKind.Int64 => 0x0au,
+                RuntimePrimitiveKind.UInt64 => 0x0bu,
+                RuntimePrimitiveKind.NativeInt => 0x0cu,
+                RuntimePrimitiveKind.NativeUInt => 0x0du,
+                RuntimePrimitiveKind.Single => 0x0eu,
+                RuntimePrimitiveKind.Double => 0x0fu,
+                _ => 0u,
+            };
+            if (primitiveElementType != 0u)
+                return primitiveElementType;
+
+            if (type.Namespace == "System" && type.Name == "Array")
+                return 0x16u;
+
+            return type.Kind switch
+            {
+                RuntimeTypeKind.Struct => IsNullable(type) ? 0x12u : 0x10u,
+                RuntimeTypeKind.Enum => 0x10u,
+                RuntimeTypeKind.Interface => 0x15u,
+                RuntimeTypeKind.Array => type.IsSzArray ? 0x18u : 0x17u,
+                RuntimeTypeKind.ByRef => 0x19u,
+                RuntimeTypeKind.Pointer => 0x1au,
+                RuntimeTypeKind.FunctionPointer => 0x1bu,
+                RuntimeTypeKind.Class => 0x14u,
+                _ => 0u,
+            };
+        }
+
+        // EETypeFlagsEx bits of a value type: the padding its boxed size adds to the value and, for Nullable<T>, log2 of the value offset
+        public static uint ValueTypeExtendedFlags(RuntimeType type, int baseSize, TargetInfo target)
+        {
+            if (!type.IsValueType)
+                return 0u;
+
+            int padding = baseSize - (target.SyncBlockSize + target.ManagedObjectHeaderSize + type.SizeOf);
+            if ((uint)padding > 7u)
+                throw new InvalidOperationException($"Boxed '{type.Namespace}.{type.Name}' pads its value by {padding} bytes, more than a MethodTable records.");
+
+            uint flags = (uint)padding << 5;
+            if (IsNullable(type))
+                flags |= (uint)System.Numerics.BitOperations.Log2((uint)NullableValueOffset(type)) << 8;
+            return flags;
+        }
+
+        public static int NullableValueOffset(RuntimeType nullable)
+        {
+            foreach (RuntimeField field in nullable.InstanceFields)
+            {
+                if (!field.IsStatic && field.Name == "value")
+                    return field.Offset;
+            }
+            throw new InvalidOperationException($"'{nullable.Namespace}.{nullable.Name}' has no value field.");
+        }
+
+        public static bool IsNullable(RuntimeType type)
+            => type.Kind == RuntimeTypeKind.Struct &&
+               type.Namespace == "System" &&
+               type.Name.StartsWith("Nullable", StringComparison.Ordinal);
+    }
+
     // What System.Type reports for a runtime type; every backend hands these to the BCL's RuntimeType.
     internal static class RuntimeTypeNames
     {
+        // ECMA-335 CorElementType of a primitive or of an enum's underlying type, as Enum reads it from a MethodTable
+        public static int CorElementType(RuntimeType type)
+        {
+            RuntimePrimitiveKind kind = type.PrimitiveKind;
+            if (type.Kind == RuntimeTypeKind.Enum && kind == RuntimePrimitiveKind.None)
+            {
+                foreach (RuntimeField field in type.InstanceFields)
+                {
+                    if (!field.IsStatic)
+                    {
+                        kind = field.FieldType.PrimitiveKind;
+                        break;
+                    }
+                }
+            }
+            return kind switch
+            {
+                RuntimePrimitiveKind.Boolean => 0x02,
+                RuntimePrimitiveKind.Char => 0x03,
+                RuntimePrimitiveKind.Int8 => 0x04,
+                RuntimePrimitiveKind.UInt8 => 0x05,
+                RuntimePrimitiveKind.Int16 => 0x06,
+                RuntimePrimitiveKind.UInt16 => 0x07,
+                RuntimePrimitiveKind.Int32 => 0x08,
+                RuntimePrimitiveKind.UInt32 => 0x09,
+                RuntimePrimitiveKind.Int64 => 0x0a,
+                RuntimePrimitiveKind.UInt64 => 0x0b,
+                RuntimePrimitiveKind.Single => 0x0c,
+                RuntimePrimitiveKind.Double => 0x0d,
+                RuntimePrimitiveKind.NativeInt => 0x18,
+                RuntimePrimitiveKind.NativeUInt => 0x19,
+                _ => 0,
+            };
+        }
+
         public static string Name(RuntimeType type) => type.Kind switch
         {
             RuntimeTypeKind.Array => Name(type.ElementType!) + ArraySuffix(type),

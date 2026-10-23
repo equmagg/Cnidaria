@@ -276,7 +276,7 @@ namespace Cnidaria.Cs
         private static int DefinitionSize(RuntimeType type)
         {
             if (type.GenericTypeDefinition is not RuntimeType definition ||
-                !StringComparer.Ordinal.Equals(definition.Namespace, "System.Runtime.Intrinsics"))
+                definition.Namespace != "System.Runtime.Intrinsics")
                 return 0;
             return definition.Name switch
             {

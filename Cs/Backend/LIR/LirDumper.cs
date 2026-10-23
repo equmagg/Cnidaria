@@ -263,10 +263,6 @@ namespace Cnidaria.Cs
                     sb.Append("delegate_remove ");
                     AppendUses(sb, node);
                     return;
-                case GenTreeKind.NewObject:
-                    sb.Append("newobj ").Append(MethodName(source.Method)).Append(' ');
-                    AppendUses(sb, node);
-                    return;
                 case GenTreeKind.Field:
                 case GenTreeKind.FieldAddr:
                     sb.Append(source.Kind == GenTreeKind.FieldAddr ? "fieldaddr " : "field ")
@@ -306,6 +302,9 @@ namespace Cnidaria.Cs
                 case GenTreeKind.StoreStaticField:
                     sb.Append("stsfld ").Append(FieldName(source.Field)).Append(' ');
                     AppendUses(sb, node);
+                    return;
+                case GenTreeKind.AllocObject:
+                    sb.Append("allocobj ").Append(TypeName(source.RuntimeType));
                     return;
                 case GenTreeKind.NewArray:
                     sb.Append("newarr ").Append(TypeName(source.RuntimeType)).Append(' ');

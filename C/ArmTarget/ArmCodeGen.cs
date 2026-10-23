@@ -462,6 +462,8 @@ public sealed class ArmCodeGenerator
             {
                 if (section.ByteLength - start >= availableSize)
                     break;
+                if (tag.Symbol.TagKind == TagKind.Union && item.ElementIndex >= 0)
+                    index = (int)item.ElementIndex;
                 // An unnamed bit-field takes no initializer
                 while (index < fields.Length && fields[index].IsBitField && fields[index].Name.Length == 0)
                     index++;

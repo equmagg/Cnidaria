@@ -428,7 +428,7 @@ namespace Cnidaria.Cs
             if (ReferenceEquals(a.OriginalDefinition, b.OriginalDefinition))
                 return true;
 
-            if (!StringComparer.Ordinal.Equals(a.Name, b.Name))
+            if (a.Name != b.Name)
                 return false;
 
             if (!LocalScopeBinder.AreSameType(a.ReturnType, b.ReturnType) ||
@@ -445,7 +445,7 @@ namespace Cnidaria.Cs
             if (ReferenceEquals(a, b))
                 return true;
 
-            if (!StringComparer.Ordinal.Equals(a.Name, b.Name))
+            if (a.Name != b.Name)
                 return false;
 
             if (a.ContainingSymbol is TypeSymbol at && b.ContainingSymbol is TypeSymbol bt)
@@ -489,7 +489,7 @@ namespace Cnidaria.Cs
                     if (candidate.DeclaredAccessibility != Accessibility.Public)
                         continue;
 
-                    if (!StringComparer.Ordinal.Equals(candidate.Name, ifaceMethod.Name))
+                    if (candidate.Name != ifaceMethod.Name)
                         continue;
 
                     if (!SameExplicitMethodSignature(candidate, ifaceMethod))
@@ -549,7 +549,7 @@ namespace Cnidaria.Cs
                     if (candidate.DeclaredAccessibility != Accessibility.Public)
                         continue;
 
-                    if (!StringComparer.Ordinal.Equals(candidate.Name, ifaceProperty.Name))
+                    if (candidate.Name != ifaceProperty.Name)
                         continue;
 
                     if (!SameExplicitPropertySignature(candidate, ifaceProperty))
@@ -701,7 +701,7 @@ namespace Cnidaria.Cs
                     if (candidate.IsConstructor || candidate.IsStatic != method.IsStatic)
                         continue;
 
-                    if (!StringComparer.Ordinal.Equals(candidate.Name, sourceName))
+                    if (candidate.Name != sourceName)
                         continue;
 
                     if (!SameExplicitMethodSignature(method, candidate))
@@ -907,7 +907,7 @@ namespace Cnidaria.Cs
                     if (members[i] is not PropertySymbol candidate || candidate.IsStatic != property.IsStatic)
                         continue;
 
-                    if (!StringComparer.Ordinal.Equals(candidate.Name, name))
+                    if (candidate.Name != name)
                         continue;
 
                     if (!SameExplicitPropertySignature(property, candidate))

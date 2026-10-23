@@ -17,6 +17,8 @@ public sealed class Parser
 {
     private readonly string _source;
     private readonly ImmutableArray<SyntaxToken> _tokens;
+    private readonly int _start, _end;
+    private readonly SyntaxToken _endOfFile;
     private readonly List<SyntaxDiagnostic> _diagnostics = new();
     private readonly int _maxDiagnostics;
     private readonly int _maxDepth;
@@ -41,7 +43,53 @@ public sealed class Parser
         var tokens = ImmutableArray.CreateBuilder<SyntaxToken>();
         do { tokens.Add(lexer.NextToken()); } while (tokens[^1].Kind != SyntaxKind.EndOfFileToken);
         _tokens = tokens.ToImmutable();
+        _end = _tokens.Length - 1;
+        _endOfFile = _tokens[^1];
         LexerDiagnostics = lexer.Diagnostics.ToImmutableArray();
+    }
+
+    internal Parser(ImmutableArray<SyntaxToken> tokens, RustEdition edition) : this(tokens, 0, tokens.Length, edition) { }
+    internal Parser(ImmutableArray<SyntaxToken> tokens, int start, int end, RustEdition edition)
+    {
+        _source = "";
+        Edition = edition;
+        _maxDiagnostics = 512;
+        _maxDepth = 256;
+        _tokens = tokens;
+        _position = _start = start;
+        _end = end;
+        _endOfFile = new SyntaxToken(SyntaxKind.EndOfFileToken, new TextSpan(end > start ? tokens[end - 1].Span.End : 0, 0), null, null, 0, SyntaxKind.None, [], [], text: "");
+        LexerDiagnostics = [];
+    }
+    internal bool AtEnd => !_splitToken.HasValue && At(SyntaxKind.EndOfFileToken);
+    internal int Consumed => _splitToken.HasValue ? -1 : _position - _start;
+    internal ImmutableArray<ItemSyntax> ParseItems()
+    {
+        var items = ImmutableArray.CreateBuilder<ItemSyntax>();
+        while (!At(SyntaxKind.EndOfFileToken))
+        {
+            int start = Mark;
+            items.Add(ParseItem());
+            if (Mark == start) { Report("Unexpected token."); Take(); }
+        }
+        return items.ToImmutable();
+    }
+    internal BlockExpressionSyntax ParseBlockExpression() => ParseBlock();
+    internal ItemSyntax ParseItemFragment() => ParseItem();
+    internal VisibilitySyntax? ParseVisibilityFragment() => ParseVisibility();
+    internal PathSyntax ParsePathFragment() => ParsePath();
+    internal PatternSyntax ParsePatternFragment(bool allowOr) => ParsePatternCore(allowOr);
+    internal SyntaxNode ParseStatementFragment()
+    {
+        var parts = ParseAttributes();
+        if (ItemStart) return ParseItem(parts);
+        if (!At(SyntaxKind.LetKeyword)) return ParseExpressionCore(statement: true);
+        parts.Add(Take());
+        parts.Add(ParsePatternCore(allowOr: false));
+        if (At(SyntaxKind.ColonToken)) parts.Add(ParseTypeAnnotation());
+        if (At(SyntaxKind.EqualsToken)) parts.Add(Make<EqualsValueClauseSyntax>(SyntaxKind.EqualsValueClause, Take(), ParseExpressionCore()));
+        if (Optional(SyntaxKind.ElseKeyword, parts)) parts.Add(ParseBlock());
+        return Make<LetStatementSyntax>(SyntaxKind.LetStatement, parts);
     }
 
     ///<summary>Parses the complete source text</summary>
@@ -52,7 +100,7 @@ public sealed class Parser
         parts.AddRange(ParseAttributes(innerAllowed: true));
         while (!At(SyntaxKind.EndOfFileToken))
         {
-            int start = Current.Span.Start;
+            int start = Mark;
             parts.Add(ParseItem());
             EnsureProgress(start, parts);
         }
@@ -66,11 +114,12 @@ public sealed class Parser
     public PatternSyntax ParsePattern() => ParsePatternCore();
 
     // Token matching and recovery
-    private SyntaxToken Current => _splitToken ?? _tokens[Math.Min(_position, _tokens.Length - 1)];
+    private SyntaxToken Token(int index) => index < _end ? _tokens[index] : _endOfFile;
+    private SyntaxToken Current => _splitToken ?? Token(_position);
     private SyntaxToken Peek(int offset = 1)
     {
         if (offset == 0) return Current;
-        return _tokens[Math.Min(_position + offset - (_splitToken.HasValue ? 1 : 0), _tokens.Length - 1)];
+        return Token(_position + offset - (_splitToken.HasValue ? 1 : 0));
     }
     private bool At(SyntaxKind kind) => Current.Kind == kind;
     private bool Contextual(SyntaxKind kind) => Current.ContextualKind == kind;
@@ -115,10 +164,9 @@ public sealed class Parser
         if (whole is null || first is null || whole.Length <= first.Length || !whole.StartsWith(first, StringComparison.Ordinal) ||
             !SyntaxFacts.TryGetPunctuation(whole.AsSpan(first.Length), out var remainderKind)) return false;
         var token = Current;
-        head = new SyntaxToken(kind, new TextSpan(token.Span.Start, first.Length), first, null, 0, SyntaxKind.None,
-            token.LeadingTrivia, Array.Empty<SyntaxTrivia>());
-        var tail = new SyntaxToken(remainderKind, new TextSpan(token.Span.Start + first.Length, token.Span.Length - first.Length),
-            whole.Substring(first.Length), null, 0, SyntaxKind.None, Array.Empty<SyntaxTrivia>(), token.TrailingTrivia);
+        head = token.WithKind(kind, new TextSpan(token.Span.Start, first.Length), first, first, token.LeadingTrivia, Array.Empty<SyntaxTrivia>());
+        var tail = token.WithKind(remainderKind, new TextSpan(token.Span.Start + first.Length, token.Span.Length - first.Length),
+            whole.Substring(first.Length), whole.Substring(first.Length), Array.Empty<SyntaxTrivia>(), token.TrailingTrivia);
         Take();
         _splitToken = tail;
         return true;
@@ -132,7 +180,8 @@ public sealed class Parser
     private SyntaxToken ContextualKeyword(SyntaxKind kind)
     {
         SyntaxToken token = Take();
-        return new SyntaxToken(kind, token.Span, token.ValueText, token.Value, token.SuffixLength, token.ContextualKind, token.LeadingTrivia, token.TrailingTrivia);
+        return new SyntaxToken(kind, token.Span, token.ValueText, token.Value, token.SuffixLength, token.ContextualKind, token.LeadingTrivia, token.TrailingTrivia,
+            token.IsMissing, token.Context, token.Text);
     }
     private bool Optional(SyntaxKind kind, List<SyntaxNodeOrToken> parts)
     {
@@ -143,9 +192,10 @@ public sealed class Parser
     private static T Make<T>(SyntaxKind kind, IEnumerable<SyntaxNodeOrToken> parts) where T : SyntaxNode
         => (T)SyntaxFactory.Create(kind, parts.ToImmutableArray());
     private static T Make<T>(SyntaxKind kind, params SyntaxNodeOrToken[] parts) where T : SyntaxNode => Make<T>(kind, (IEnumerable<SyntaxNodeOrToken>)parts);
+    private int Mark => _position * 2 + (_splitToken.HasValue ? 1 : 0);
     private void EnsureProgress(int start, List<SyntaxNodeOrToken> parts)
     {
-        if (Current.Span.Start == start && !At(SyntaxKind.EndOfFileToken))
+        if (Mark == start && !At(SyntaxKind.EndOfFileToken))
         {
             Report("Unexpected token.");
             parts.Add(Make<SyntaxNode>(SyntaxKind.SkippedSyntax, Take()));
@@ -318,7 +368,7 @@ public sealed class Parser
                 parts.Add(Eat(SyntaxKind.OpenBraceToken));
                 while (!EndList(SyntaxKind.CloseBraceToken))
                 {
-                    int start = Current.Span.Start;
+                    int start = Mark;
                     var variant = ParseAttributes();
                     variant.Add(Name());
                     if (At(SyntaxKind.OpenParenToken) || At(SyntaxKind.OpenBraceToken)) variant.Add(ParseFields(At(SyntaxKind.OpenParenToken)));
@@ -404,7 +454,7 @@ public sealed class Parser
         parts.AddRange(ParseAttributes(innerAllowed: true));
         while (!EndList(SyntaxKind.CloseBraceToken))
         {
-            int start = Current.Span.Start;
+            int start = Mark;
             parts.Add(ParseItem(allowUnnamedParameters: allowUnnamedParameters));
             EnsureProgress(start, parts);
         }
@@ -418,7 +468,7 @@ public sealed class Parser
         SyntaxKind close = tuple ? SyntaxKind.CloseParenToken : SyntaxKind.CloseBraceToken;
         while (!EndList(close))
         {
-            int start = Current.Span.Start;
+            int start = Mark;
             var field = ParseAttributes();
             if (ParseVisibility() is VisibilitySyntax visibility) field.Add(visibility);
             if (tuple) field.Add(ParseTypeCore());
@@ -437,7 +487,7 @@ public sealed class Parser
         SyntaxKind close = closure ? SyntaxKind.PipeToken : SyntaxKind.CloseParenToken;
         while (!EndList(close) && !(closure && At(SyntaxKind.PipePipeToken)))
         {
-            int start = Current.Span.Start;
+            int start = Mark;
             var parameter = ParseAttributes();
             bool receiver = !closure && (At(SyntaxKind.SelfValueKeyword) || At(SyntaxKind.MutKeyword) && Peek().Kind == SyntaxKind.SelfValueKeyword);
             if (!closure && Ampersand)
@@ -505,7 +555,7 @@ public sealed class Parser
             {
                 while (!EndList(SyntaxKind.CloseBraceToken))
                 {
-                    int start = Current.Span.Start;
+                    int start = Mark;
                     parts.Add(ParseUseTree());
                     EnsureProgress(start, parts);
                     if (!Optional(SyntaxKind.CommaToken, parts)) break;
@@ -590,7 +640,7 @@ public sealed class Parser
                 bool comma = false;
                 while (!EndList(SyntaxKind.CloseParenToken))
                 {
-                    int start = Current.Span.Start;
+                    int start = Mark;
                     parts.Add(ParseTypeCore());
                     count++;
                     EnsureProgress(start, parts);
@@ -692,7 +742,7 @@ public sealed class Parser
         var parts = new List<SyntaxNodeOrToken> { Eat(SyntaxKind.LessThanToken) };
         while (!Greater && !EndList(SyntaxKind.GreaterThanToken))
         {
-            int start = Current.Span.Start;
+            int start = Mark;
             var parameter = ParseAttributes();
             bool lifetime = IsLifetime(Current.Kind);
             bool constant = Optional(SyntaxKind.ConstKeyword, parameter);
@@ -717,7 +767,7 @@ public sealed class Parser
         var parts = new List<SyntaxNodeOrToken> { Eat(SyntaxKind.LessThanToken) };
         while (!Greater && !EndList(SyntaxKind.GreaterThanToken))
         {
-            int start = Current.Span.Start;
+            int start = Mark;
             var argument = new List<SyntaxNodeOrToken>();
             if (IsLifetime(Current.Kind)) argument.Add(Take());
             else if (At(SyntaxKind.OpenBraceToken) || At(SyntaxKind.MinusToken) || IsLiteral(Current.Kind)) argument.Add(ParseConstArgument());
@@ -783,7 +833,7 @@ public sealed class Parser
                 parts.Add(Eat(SyntaxKind.LessThanToken));
                 while (!Greater && !EndList(SyntaxKind.GreaterThanToken))
                 {
-                    int start = Current.Span.Start;
+                    int start = Mark;
                     parts.Add(IsLifetime(Current.Kind) || At(SyntaxKind.SelfTypeKeyword) ? Take() : Name());
                     EnsureProgress(start, parts);
                     if (!Optional(SyntaxKind.CommaToken, parts)) break;
@@ -807,7 +857,7 @@ public sealed class Parser
         var parts = new List<SyntaxNodeOrToken> { Eat(SyntaxKind.WhereKeyword) };
         while (Current.Kind is not (SyntaxKind.OpenBraceToken or SyntaxKind.SemicolonToken or SyntaxKind.EqualsToken or SyntaxKind.EndOfFileToken) && !IsClose(Current.Kind))
         {
-            int start = Current.Span.Start;
+            int start = Mark;
             var predicate = new List<SyntaxNodeOrToken>();
             if (At(SyntaxKind.ForKeyword)) predicate.Add(ParseLifetimeBinder());
             if (IsLifetime(Current.Kind)) predicate.Add(Take());
@@ -826,7 +876,7 @@ public sealed class Parser
         var parts = new List<SyntaxNodeOrToken> { Eat(SyntaxKind.OpenParenToken) };
         while (!EndList(SyntaxKind.CloseParenToken))
         {
-            int start = Current.Span.Start;
+            int start = Mark;
             var parameter = ParseAttributes();
             if ((IsName || At(SyntaxKind.UnderscoreKeyword)) && Peek().Kind == SyntaxKind.ColonToken)
             {
@@ -912,7 +962,7 @@ public sealed class Parser
             bool comma = false;
             while (!EndList(close))
             {
-                int start = Current.Span.Start;
+                int start = Mark;
                 parts.Add(ParsePatternCore()); count++;
                 EnsureProgress(start, parts);
                 if (!Optional(SyntaxKind.CommaToken, parts)) break;
@@ -938,7 +988,7 @@ public sealed class Parser
             {
                 while (!EndList(SyntaxKind.CloseParenToken))
                 {
-                    int start = Current.Span.Start;
+                    int start = Mark;
                     parts.Add(ParsePatternCore());
                     EnsureProgress(start, parts);
                     if (!Optional(SyntaxKind.CommaToken, parts)) break;
@@ -950,7 +1000,7 @@ public sealed class Parser
             {
                 while (!EndList(SyntaxKind.CloseBraceToken))
                 {
-                    int start = Current.Span.Start;
+                    int start = Mark;
                     var field = ParseAttributes();
                     if (Optional(SyntaxKind.DotDotToken, field))
                     {
@@ -1163,7 +1213,7 @@ public sealed class Parser
                 SyntaxToken number = Take();
                 SyntaxToken first = TupleIndex(number, 0, point, number.LeadingTrivia, Array.Empty<SyntaxTrivia>());
                 receiver = Make<ExpressionSyntax>(SyntaxKind.MemberAccessExpression, receiver, dot, first);
-                var innerDot = new SyntaxToken(SyntaxKind.DotToken, new TextSpan(number.Span.Start + point, 1), null, null, 0, SyntaxKind.None,
+                var innerDot = number.WithKind(SyntaxKind.DotToken, new TextSpan(number.Span.Start + point, 1), null, ".",
                     Array.Empty<SyntaxTrivia>(), point == text.Length - 1 ? number.TrailingTrivia : Array.Empty<SyntaxTrivia>());
                 if (point == text.Length - 1) _splitToken = innerDot;
                 else receiver = Make<ExpressionSyntax>(SyntaxKind.MemberAccessExpression, receiver, innerDot,
@@ -1186,10 +1236,10 @@ public sealed class Parser
     private SyntaxToken TupleIndex(SyntaxToken original, int offset, int length, SyntaxTrivia[] leading, SyntaxTrivia[] trailing)
     {
         var span = new TextSpan(original.Span.Start + offset, length);
-        string text = _source.Substring(span.Start, span.Length);
+        string text = original.GetText(_source).Substring(offset, length);
         ValidateTupleIndex(text, span);
         ulong.TryParse(text, out ulong value);
-        return new SyntaxToken(SyntaxKind.IntegerLiteralToken, span, null, value, 0, SyntaxKind.None, leading, trailing);
+        return original.WithKind(SyntaxKind.IntegerLiteralToken, span, null, text, leading, trailing, value);
     }
 
     private void ValidateTupleIndex(string text, TextSpan span)
@@ -1203,7 +1253,7 @@ public sealed class Parser
         var parts = new List<SyntaxNodeOrToken> { Eat(SyntaxKind.OpenParenToken) };
         while (!EndList(SyntaxKind.CloseParenToken))
         {
-            int start = Current.Span.Start;
+            int start = Mark;
             parts.Add(ParseExpressionCore());
             EnsureProgress(start, parts);
             if (!Optional(SyntaxKind.CommaToken, parts)) break;
@@ -1220,7 +1270,7 @@ public sealed class Parser
         bool comma = false;
         while (!EndList(SyntaxKind.CloseParenToken))
         {
-            int start = Current.Span.Start;
+            int start = Mark;
             parts.Add(ParseExpressionCore()); count++;
             EnsureProgress(start, parts);
             if (!Optional(SyntaxKind.CommaToken, parts)) break;
@@ -1246,7 +1296,7 @@ public sealed class Parser
             {
                 while (Optional(SyntaxKind.CommaToken, parts) && !EndList(SyntaxKind.CloseBracketToken))
                 {
-                    int start = Current.Span.Start;
+                    int start = Mark;
                     parts.Add(ParseExpressionCore());
                     EnsureProgress(start, parts);
                 }
@@ -1262,7 +1312,7 @@ public sealed class Parser
         parts.AddRange(ParseAttributes(innerAllowed: true));
         while (!EndList(SyntaxKind.CloseBraceToken))
         {
-            int start = Current.Span.Start;
+            int start = Mark;
             if (Optional(SyntaxKind.DotDotToken, parts))
             {
                 parts.Add(ParseExpressionCore());
@@ -1293,7 +1343,7 @@ public sealed class Parser
             parts.AddRange(ParseAttributes(innerAllowed: true));
             while (!EndList(SyntaxKind.CloseBraceToken))
             {
-                int start = Current.Span.Start;
+                int start = Mark;
                 if (At(SyntaxKind.SemicolonToken)) parts.Add(Make<StatementSyntax>(SyntaxKind.EmptyStatement, Take()));
                 else
                 {
@@ -1365,7 +1415,7 @@ public sealed class Parser
         parts.AddRange(ParseAttributes(innerAllowed: true));
         while (!EndList(SyntaxKind.CloseBraceToken))
         {
-            int start = Current.Span.Start;
+            int start = Mark;
             var arm = ParseAttributes();
             arm.Add(ParsePatternCore());
             if (Optional(SyntaxKind.IfKeyword, arm)) arm.Add(ParseExpressionCore());

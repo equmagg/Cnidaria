@@ -748,7 +748,6 @@ namespace Cnidaria.Cs
                 GenTreeKind.Local => false,
                 GenTreeKind.Arg => false,
                 GenTreeKind.Temp => false,
-                GenTreeKind.TempAddr => false,
                 GenTreeKind.StoreLocal => false,
                 GenTreeKind.StoreArg => false,
                 GenTreeKind.StoreTemp => false,
@@ -846,7 +845,6 @@ namespace Cnidaria.Cs
                 method.GetValueInfo,
                 node.RegisterResult,
                 node.Method,
-                node.Kind == GenTreeKind.NewObject,
                 target);
 
             for (int argumentIndex = 0; argumentIndex < callArguments.Length; argumentIndex++)

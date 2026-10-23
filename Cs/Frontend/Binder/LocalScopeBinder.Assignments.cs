@@ -798,7 +798,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < candidates.Length; i++)
             {
                 var candidate = candidates[i];
-                if (!StringComparer.Ordinal.Equals(candidate.Name, "Deconstruct"))
+                if (candidate.Name != "Deconstruct")
                     continue;
 
                 sawNameMatch = true;
@@ -1090,7 +1090,7 @@ namespace Cnidaria.Cs
                 return IsDeconstructionDiscardTarget(paren.Expression);
 
             return targetSyntax is IdentifierNameSyntax id &&
-                StringComparer.Ordinal.Equals(id.Identifier.ValueText, "_") &&
+                id.Identifier.ValueText == "_" &&
                 !IsNameDeclaredInEnclosingScopes("_");
         }
         private BoundExpression MakeTupleElementRead(
@@ -1182,7 +1182,7 @@ namespace Cnidaria.Cs
         private static bool IsSystemValueTupleType(NamedTypeSymbol named)
         {
             var def = named.OriginalDefinition;
-            return StringComparer.Ordinal.Equals(def.Name, "ValueTuple") &&
+            return def.Name == "ValueTuple" &&
                    IsNamespaceFullName(def.ContainingSymbol, "System");
         }
         private static bool IsNamespaceFullName(Symbol? symbol, string fullName)
@@ -1207,7 +1207,7 @@ namespace Cnidaria.Cs
                 first = false;
             }
 
-            return StringComparer.Ordinal.Equals(sb.ToString(), fullName);
+            return sb.ToString() == fullName;
         }
         private static FieldSymbol? FindInstanceField(NamedTypeSymbol type, string name)
         {
@@ -1216,7 +1216,7 @@ namespace Cnidaria.Cs
             {
                 if (members[i] is FieldSymbol field &&
                     !field.IsStatic &&
-                    StringComparer.Ordinal.Equals(field.Name, name))
+                    field.Name == name)
                 {
                     return field;
                 }
@@ -1559,6 +1559,9 @@ namespace Cnidaria.Cs
             {
                 return userDefined;
             }
+            var lifting = op switch { BoundBinaryOperatorKind.BitwiseAnd => LiftedKind.And, BoundBinaryOperatorKind.BitwiseOr => LiftedKind.Or, _ => LiftedKind.Value };
+            if (TryBindLifted(node, ImmutableArray.Create(left, right), lifting, (o, d) => BindCompoundOperatorBinary(node, op, o[0], o[1], ctx, d), ctx, diagnostics, out var lifted))
+                return lifted;
             switch (op)
             {
                 case BoundBinaryOperatorKind.Add:
@@ -1659,7 +1662,7 @@ namespace Cnidaria.Cs
                     continue;
                 if (m.Parameters.Length != 2)
                     continue;
-                if (!StringComparer.Ordinal.Equals(m.Name, name))
+                if (m.Name != name)
                     continue;
                 if (ReferenceEquals(m.Parameters[0].Type, delegateType) &&
                     ReferenceEquals(m.Parameters[1].Type, delegateType))

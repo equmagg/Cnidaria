@@ -303,11 +303,6 @@ namespace Cnidaria.Cs
                     AppendOperandList(sb, tree);
                     sb.Append(')');
                     return;
-                case GenTreeKind.NewObject:
-                    sb.Append("newobj ").Append(MethodName(tree.Source.Method)).Append('(');
-                    AppendOperandList(sb, tree);
-                    sb.Append(')');
-                    return;
                 case GenTreeKind.NewDelegate:
                     sb.Append("newdelegate ").Append(TypeName(tree.Source.RuntimeType)).Append(" -> ").Append(MethodName(tree.Source.Method)).Append('(');
                     AppendOperandList(sb, tree);

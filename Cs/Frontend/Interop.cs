@@ -277,7 +277,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < owner.Methods.Length; i++)
             {
                 var m = owner.Methods[i];
-                if (!m.IsStatic || m.HasThis || !StringComparer.Ordinal.Equals(m.Name, functionName)) continue;
+                if (!m.IsStatic || m.HasThis || m.Name != functionName) continue;
                 if (match != null) throw new MissingMethodException($"Function '{functionName}' is ambiguous in '{typeFullName}'.");
                 match = m;
             }
@@ -552,7 +552,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < owner.Methods.Length; i++)
             {
                 var m = owner.Methods[i];
-                if (!m.IsStatic || m.HasThis || (requireInternalCall && !m.HasInternalCall) || !StringComparer.Ordinal.Equals(m.Name, methodName) || m.ParameterTypes.Length != ps.Length) continue;
+                if (!m.IsStatic || m.HasThis || (requireInternalCall && !m.HasInternalCall) || m.Name != methodName || m.ParameterTypes.Length != ps.Length) continue;
                 if (!TryGetHostTypeMatchCostStack(m.ReturnType, ret, out int score)) continue;
                 bool ok = true;
                 for (int p = 0; p < ps.Length; p++)

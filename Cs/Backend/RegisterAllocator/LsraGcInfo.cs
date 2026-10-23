@@ -128,7 +128,6 @@ namespace Cnidaria.Cs
                     GenTreeKind.Call => true,
                     GenTreeKind.VirtualCall => true,
                     GenTreeKind.DelegateInvoke => true,
-                    GenTreeKind.NewObject => true,
                     _ => false,
                 };
             }
@@ -187,13 +186,22 @@ namespace Cnidaria.Cs
                         if (segment.Location.IsNone || segment.Start == segment.End)
                             continue;
 
-                        var translated = TranslateAllocationRange(segment.Start, segment.End);
-                        int start = s == 0 || allocation.Segments[s - 1].End != segment.Start
-                            ? translated.Start
-                            : StartIncludingSuspendingCall(segment.Location, translated.Start);
-                        if (start < translated.End)
-                            AddLiveRangeSlices(
-                                ranges, new RegisterGcLiveRoot(allocation.Value, rootKind, segment.Location, info.Type), start, translated.End);
+                        bool continuesPrevious = s != 0 && allocation.Segments[s - 1].End == segment.Start;
+                        var root = new RegisterGcLiveRoot(allocation.Value, rootKind, segment.Location, info.Type);
+                        if (!segment.Location.IsRegister)
+                        {
+                            AddSegmentLiveRange(ranges, root, segment.Start, segment.End, continuesPrevious);
+                            continue;
+                        }
+
+                        // A register holds other values in the lifetime holes of its segment
+                        for (int r = 0; r < allocation.Ranges.Length; r++)
+                        {
+                            int liveStart = Math.Max(segment.Start, allocation.Ranges[r].Start);
+                            int liveEnd = Math.Min(segment.End, allocation.Ranges[r].End);
+                            if (liveStart < liveEnd)
+                                AddSegmentLiveRange(ranges, root, liveStart, liveEnd, continuesPrevious && liveStart == segment.Start);
+                        }
                     }
                 }
 
@@ -201,6 +209,21 @@ namespace Cnidaria.Cs
                 AddSafepointOperandRootRanges(ranges);
 
                 return NormalizeLiveRanges(ranges.ToImmutable());
+            }
+
+            private void AddSegmentLiveRange(
+                ImmutableArray<RegisterGcLiveRange>.Builder ranges,
+                RegisterGcLiveRoot root,
+                int segmentStart,
+                int segmentEnd,
+                bool continuesPrevious)
+            {
+                var translated = TranslateAllocationRange(segmentStart, segmentEnd);
+                int start = continuesPrevious
+                    ? StartIncludingSuspendingCall(root.Location, translated.Start)
+                    : translated.Start;
+                if (start < translated.End)
+                    AddLiveRangeSlices(ranges, root, start, translated.End);
             }
 
             private void AddHomeSlotRootRanges(ImmutableArray<RegisterGcLiveRange>.Builder ranges)
@@ -669,18 +692,6 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < _method.LinearNodes.Length; i++)
                 {
                     var node = _method.LinearNodes[i];
-                    // Reference newobj keeps the allocated object only in its result home while the constructor runs.
-                    if (node.TreeKind == GenTreeKind.NewObject &&
-                        node.Method?.DeclaringType.IsValueType == false &&
-                        node.Results.Length == 1 &&
-                        IsFrameBacked(node.Results[0]) &&
-                        node.RegisterResults.Length == 1 &&
-                        TryGetLinearPosition(node, out int newObjectPosition) &&
-                        _method.GenTreeMethod.ValueInfoByNode.TryGetValue(node.RegisterResults[0].LinearValueKey, out var newObjectInfo))
-                    {
-                        AddSafepointOperandRootRange(ranges, node.RegisterResults[0], newObjectInfo, node.Results[0], newObjectPosition);
-                    }
-
                     if (!node.HasLoweringFlag(GenTreeLinearFlags.GcSafePoint))
                         continue;
 
@@ -1209,7 +1220,7 @@ namespace Cnidaria.Cs
 
                 if (GenTreeLirKinds.IsRealTree(node) && node.Source is not null)
                 {
-                    if (node.TreeKind is GenTreeKind.Call or GenTreeKind.IndirectCall or GenTreeKind.VirtualCall or GenTreeKind.DelegateInvoke or GenTreeKind.NewObject or GenTreeKind.Throw or GenTreeKind.Rethrow)
+                    if (node.TreeKind is GenTreeKind.Call or GenTreeKind.IndirectCall or GenTreeKind.VirtualCall or GenTreeKind.DelegateInvoke or GenTreeKind.Throw or GenTreeKind.Rethrow)
                     {
                         kind = RegisterGcInterruptibleRangeKind.Call;
                         return true;
