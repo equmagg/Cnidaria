@@ -67,6 +67,11 @@ public static class ScalarReplacement
         public int LeafCount;
         public int Size;
         public int Alignment;
+        public bool HasBitFields;
+        // A union whose members all fill it is one leaf held as its first member, and each member is a view of it
+        public FieldSymbol? FirstMember;
+        public Dictionary<FieldSymbol, Layout>? Views;
+        public QualifiedType? ViewOf;
 
         public Layout(QualifiedType type) => Type = type;
     }
@@ -84,6 +89,7 @@ public static class ScalarReplacement
         public bool Rejected;
         public bool Selected;
         public bool NeedsMemory;
+        public bool Synchronized;
 
         public Candidate(GimplePlace root, Layout layout)
         {
@@ -114,6 +120,7 @@ public static class ScalarReplacement
         public readonly List<Access> Reads = new();
         public readonly List<Access> Writes = new();
         public Access? Zero;
+        public bool Copy;
     }
 
     private sealed record ArrayAddress(GimpleAssignStatement Definition, Access Access, int Block, int Statement);
@@ -130,6 +137,8 @@ public static class ScalarReplacement
         private readonly Dictionary<GimpleStatement, StatementAccesses> _statements = new();
         private readonly Dictionary<GimpleTemporaryValue, ArrayAddress> _arrayAddresses = new();
         private readonly Dictionary<GimpleTemporaryValue, int> _temporaryUses = new();
+        private readonly Dictionary<Candidate, List<Candidate>> _copyPartners = new();
+        private readonly List<GimpleTemporaryValue> _addressTemporaries = new();
         private readonly HashSet<GimpleTemporaryValue> _singleDefinitions = new();
         private int _work;
         private bool _exhausted;
@@ -189,10 +198,12 @@ public static class ScalarReplacement
                     Analyze(_function.Blocks[_blockIndex].Statements[_statementIndex], weights[_blockIndex]);
             if (_exhausted) return _function;
 
-            var selected = new List<Candidate>();
+            var eligible = new HashSet<Candidate>();
             foreach (var candidate in _candidates.Values)
                 if (!candidate.Rejected && candidate.Benefit > candidate.Cost + candidate.Layout.LeafCount)
-                    selected.Add(candidate);
+                    eligible.Add(candidate);
+            AddRelays(eligible);
+            var selected = new List<Candidate>(eligible);
             selected.Sort((a, b) => (b.Benefit - b.Cost).CompareTo(a.Benefit - a.Cost));
             var fieldBudget = _options.MaxPromotedFields;
             long growthBudget = _options.MaxStatementGrowth;
@@ -215,6 +226,7 @@ public static class ScalarReplacement
             }
             foreach (var pair in _statements)
             {
+                if (pair.Value.Copy) continue;
                 if (CanDecomposeCopy(pair.Key, pair.Value))
                 {
                     var source = pair.Value.Reads[0].Candidate;
@@ -251,7 +263,7 @@ public static class ScalarReplacement
                 if (candidate.Selected)
                 {
                     changed = true;
-                    CreateFields(candidate, candidate.Root, candidate.Layout);
+                    CreateFields(candidate);
                 }
             if (!changed) return _function;
 
@@ -274,6 +286,7 @@ public static class ScalarReplacement
                 foreach (var statement in block.Statements) Rewrite(statement, statements);
                 blocks.Add(new GimpleBasicBlock(block.Label, statements.ToImmutable()));
             }
+            temporaries.AddRange(_addressTemporaries);
             return new GimpleFunctionDefinition(_function.Syntax, _function.Symbol, temporaries.ToImmutable(), blocks.ToImmutable(), _function.EntryLabel,
                 hasScalarReplacementApplied: true);
         }
@@ -299,7 +312,10 @@ public static class ScalarReplacement
             var candidate = new Candidate(root, layout);
             if (candidate.NeedsMemory)
             {
-                candidate.Cost = 2L * layout.LeafCount;
+                var abi = CAbi.ClassifyValue(_target, root.Type, isReturn: false, isVariadicUnnamedArgument: false);
+                candidate.NeedsMemory = abi.PassingKind is not (AbiPassingKind.Scalar or AbiPassingKind.MultiRegister) ||
+                    _target.Architecture == TargetArchitectureKind.Arm32;
+                candidate.Cost = (candidate.NeedsMemory ? 2L : 1L) * layout.LeafCount;
                 candidate.Growth = layout.LeafCount;
             }
             _candidates.Add(key, candidate);
@@ -325,7 +341,24 @@ public static class ScalarReplacement
                 {
                     var child = BuildLayout(field.Type, depth + 1, ref leaves);
                     if (child is null || !Append(layout, field, child)) return null;
+                    layout.HasBitFields |= field.IsBitField;
                 }
+            }
+            else if (type.Type is TagType { Symbol.TagKind: TagKind.Union } union)
+            {
+                if (!union.Symbol.IsComplete || union.Symbol.Fields.Length == 0 || union.Symbol.Fields.Length > _options.MaxFieldsPerAggregate ||
+                    ++leaves > _options.MaxFieldsPerAggregate) return null;
+                var unionSize = _target.SizeOf(type);
+                layout.Views = new();
+                foreach (var field in union.Symbol.Fields)
+                {
+                    if (field.IsBitField || !IsViewable(field.Type) || _target.SizeOf(field.Type) != unionSize) return null;
+                    layout.Views.Add(field, new Layout(field.Type) { ViewOf = union.Symbol.Fields[0].Type, LeafCount = 1, Size = unionSize, Alignment = _target.AlignOf(field.Type) });
+                }
+                layout.FirstMember = union.Symbol.Fields[0];
+                layout.Size = unionSize;
+                layout.Alignment = _target.AlignOf(type);
+                layout.LeafCount = 1;
             }
             else
             {
@@ -342,6 +375,10 @@ public static class ScalarReplacement
             return layout;
         }
 
+        private static bool IsViewable(QualifiedType type)
+            => !IsObservable(type) && (type.Type.Kind is TypeKind.Enum or TypeKind.Pointer ||
+               type.Type is BuiltinType { BuiltinKind: not (BuiltinTypeKind.Void or BuiltinTypeKind.LongDouble or BuiltinTypeKind.Bool) });
+
         private bool Append(Layout parent, FieldSymbol? field, Layout child)
         {
             var size = ((long)parent.Size + child.Alignment - 1) / child.Alignment * child.Alignment + child.Size;
@@ -349,6 +386,7 @@ public static class ScalarReplacement
             parent.Size = (int)size;
             parent.Alignment = Math.Max(parent.Alignment, child.Alignment);
             parent.LeafCount += child.LeafCount;
+            parent.HasBitFields |= child.HasBitFields;
             parent.Children.Add((field, child));
             return true;
         }
@@ -441,8 +479,11 @@ public static class ScalarReplacement
             switch (statement)
             {
                 case GimpleAssignStatement assign:
-                    Visit(assign.Lhs, assign.IsConstructor ? AccessKind.Zero : AccessKind.Write, accesses, weight);
-                    foreach (var operand in assign.Operands) Visit(operand, AccessKind.Read, accesses, weight);
+                    var copy = assign is { IsCopy: true, IsConstructor: false, Op1: GimplePlace } && IsAggregate(assign.Lhs.Type);
+                    var view = assign is { IsCopy: true, IsConstructor: false };
+                    Visit(assign.Lhs, assign.IsConstructor ? AccessKind.Zero : AccessKind.Write, accesses, weight, copy: copy, view: view);
+                    foreach (var operand in assign.Operands) Visit(operand, AccessKind.Read, accesses, weight, copy: copy, view: view);
+                    if (copy) ChargeCopy(assign, accesses, weight);
                     break;
                 case GimpleCallStatement call:
                     if (call.Lhs is not null) Visit(call.Lhs, AccessKind.Write, accesses, weight);
@@ -454,7 +495,11 @@ public static class ScalarReplacement
                     Visit(cond.Rhs, AccessKind.Read, accesses, weight);
                     break;
                 case GimpleSwitchStatement sw: Visit(sw.Expression, AccessKind.Read, accesses, weight); break;
-                case GimpleReturnStatement ret when ret.Expression is not null: Visit(ret.Expression, AccessKind.Read, accesses, weight); break;
+                case GimpleReturnStatement ret:
+                    // Lowering returns the fields stored just before the return without a trip through memory
+                    if (ret.Expression is not null) Visit(ret.Expression, AccessKind.Read, accesses, weight, copy: true);
+                    foreach (var read in accesses.Reads) read.Candidate.Synchronized = true;
+                    break;
                 case GimpleAsmStatement asm:
                     foreach (var operand in asm.Outputs)
                     {
@@ -474,7 +519,7 @@ public static class ScalarReplacement
                 _statements.Add(statement, accesses);
         }
 
-        private void Visit(GimpleValue value, AccessKind kind, StatementAccesses accesses, int weight, int depth = 0)
+        private void Visit(GimpleValue value, AccessKind kind, StatementAccesses accesses, int weight, int depth = 0, bool copy = false, bool view = false)
         {
             if (!Spend(depth)) return;
             if (value is GimpleTemporaryValue used && kind is AccessKind.Read or AccessKind.Reject)
@@ -492,6 +537,12 @@ public static class ScalarReplacement
             {
                 var candidate = access.Candidate;
                 if (kind == AccessKind.Reject || IsObservable(value.Type)) { candidate.Rejected = true; return; }
+                if (access.Layout.Views is not null && kind != AccessKind.Zero ||
+                    access.Layout.ViewOf is { } viewed && !view && !SameType(access.Layout.Type, viewed))
+                {
+                    candidate.Rejected = true;
+                    return;
+                }
                 if (access.IsScalar)
                 {
                     candidate.Benefit += 2L * weight;
@@ -508,7 +559,7 @@ public static class ScalarReplacement
                 else
                 {
                     (kind == AccessKind.Write ? accesses.Writes : accesses.Reads).Add(access);
-                    candidate.Cost += 2L * weight * access.Layout.LeafCount;
+                    if (!copy) ChargeSynchronization(access, weight);
                     candidate.Growth += access.Layout.LeafCount;
                 }
                 return;
@@ -537,6 +588,109 @@ public static class ScalarReplacement
             }
         }
 
+        private void ChargeCopy(GimpleAssignStatement assign, StatementAccesses accesses, int weight)
+        {
+            var write = accesses.Writes.Count == 1 ? accesses.Writes[0] : null;
+            var read = accesses.Reads.Count == 1 ? accesses.Reads[0] : null;
+            if (write is not null && read is not null)
+            {
+                if (write.Layout.HasBitFields || !SameShape(write.Layout.Type.Type, read.Layout.Type.Type))
+                {
+                    ChargeSynchronization(write, weight);
+                    ChargeSynchronization(read, weight);
+                    return;
+                }
+                accesses.Copy = true;
+                write.Candidate.Benefit += (long)weight * Words(write.Layout);
+                read.Candidate.Benefit += (long)weight * Words(read.Layout);
+                AddCopyPartner(write.Candidate, read.Candidate);
+                AddCopyPartner(read.Candidate, write.Candidate);
+                return;
+            }
+            var access = write ?? read;
+            if (access is null) return;
+            if (!CanCopyFields(write is not null ? assign.Op1! : assign.Lhs, access.Layout))
+            {
+                ChargeSynchronization(access, weight);
+                return;
+            }
+            accesses.Copy = true;
+            access.Candidate.Cost += (long)weight * Math.Max(0, access.Layout.LeafCount - 2 * Words(access.Layout));
+        }
+
+        // A candidate that only relays whole copies between scalarized ones turns into register moves
+        private void AddRelays(HashSet<Candidate> eligible)
+        {
+            var relays = new HashSet<Candidate>();
+            foreach (var candidate in _copyPartners.Keys)
+                if (!candidate.Rejected && !candidate.NeedsMemory && !candidate.Synchronized && !eligible.Contains(candidate))
+                    relays.Add(candidate);
+            for (var shrunk = true; shrunk;)
+            {
+                shrunk = false;
+                foreach (var relay in relays)
+                    if (!_copyPartners[relay].TrueForAll(partner => eligible.Contains(partner) || relays.Contains(partner)))
+                    {
+                        relays.Remove(relay);
+                        shrunk = true;
+                        break;
+                    }
+            }
+            var pending = new Queue<Candidate>(eligible);
+            while (pending.TryDequeue(out var candidate))
+                if (_copyPartners.TryGetValue(candidate, out var partners))
+                    foreach (var partner in partners)
+                        if (relays.Remove(partner))
+                        {
+                            eligible.Add(partner);
+                            pending.Enqueue(partner);
+                        }
+        }
+
+        private static void ChargeSynchronization(Access access, int weight)
+        {
+            access.Candidate.Cost += 2L * weight * access.Layout.LeafCount;
+            access.Candidate.Synchronized = true;
+        }
+
+        private void AddCopyPartner(Candidate candidate, Candidate partner)
+        {
+            if (ReferenceEquals(candidate, partner)) return;
+            if (!_copyPartners.TryGetValue(candidate, out var partners)) _copyPartners.Add(candidate, partners = new());
+            partners.Add(partner);
+        }
+
+        private int Words(Layout layout) => (layout.Size + _target.PointerSize - 1) / _target.PointerSize;
+
+        private static bool CanCopyFields(GimpleValue value, Layout layout)
+            => value is GimplePlace && !layout.HasBitFields && SameShape(value.Type.Type, layout.Type.Type) && !IsObservablePlace(value);
+
+        // Every mention of a tag builds its own type object, so identity goes through the tag
+        private static bool SameShape(CType left, CType right) => (left, right) switch
+        {
+            (TagType l, TagType r) => ReferenceEquals(l.Symbol, r.Symbol),
+            (EnumType l, EnumType r) => ReferenceEquals(l.Symbol, r.Symbol),
+            (BuiltinType l, BuiltinType r) => l.BuiltinKind == r.BuiltinKind,
+            (PointerType l, PointerType r) => l.PointeeType.Qualifiers == r.PointeeType.Qualifiers && SameShape(l.PointeeType.Type, r.PointeeType.Type),
+            (ArrayType l, ArrayType r) => l.Length == r.Length && l.ElementType.Qualifiers == r.ElementType.Qualifiers &&
+                SameShape(l.ElementType.Type, r.ElementType.Type),
+            _ => ReferenceEquals(left, right),
+        };
+
+        private static bool SameType(QualifiedType left, QualifiedType right)
+            => left.Qualifiers == right.Qualifiers && SameShape(left.Type, right.Type);
+
+        private static bool IsObservablePlace(GimpleValue value) => IsObservable(value.Type) || value switch
+        {
+            GimpleMemberAccessExpression member => member.ThroughPointer ? IsObservablePointee(member.Expression.Type) : IsObservablePlace(member.Expression),
+            GimpleElementAccessExpression element => element.Expression.Type.Type is ArrayType
+                ? IsObservablePlace(element.Expression) : IsObservablePointee(element.Expression.Type),
+            GimpleIndirectExpression indirect => IsObservablePointee(indirect.Address.Type),
+            _ => false,
+        };
+
+        private static bool IsObservablePointee(QualifiedType type) => type.Type is PointerType pointer && IsObservable(pointer.PointeeType);
+
         private Access? Resolve(GimpleValue value, int depth = 0)
         {
             if (_accesses.TryGetValue(value, out var cached)) return cached;
@@ -546,7 +700,11 @@ public static class ScalarReplacement
             else if (value is GimpleMemberAccessExpression { ThroughPointer: false, Field: not null } member)
             {
                 var parent = Resolve(member.Expression, depth + 1);
-                if (parent is not null)
+                if (parent?.Layout.Views is { } views)
+                {
+                    if (views.TryGetValue(member.Field, out var memberView)) result = new Access(parent.Candidate, memberView, parent.FirstField);
+                }
+                else if (parent is not null)
                 {
                     var first = parent.FirstField;
                     foreach (var child in parent.Layout.Children)
@@ -570,7 +728,7 @@ public static class ScalarReplacement
                     result = new Access(parent.Candidate, child, parent.FirstField + (int)index * child.LeafCount);
                 }
             }
-            if (result is not null && !result.Layout.Type.Equals(value.Type))
+            if (result is not null && !SameType(result.Layout.Type, value.Type))
             {
                 result.Candidate.Rejected = true;
                 result = null;
@@ -579,12 +737,20 @@ public static class ScalarReplacement
             return result;
         }
 
-        private void CreateFields(Candidate candidate, GimplePlace place, Layout layout)
+        private void CreateFields(Candidate candidate)
+        {
+            AddLeafPlaces(candidate.Root, candidate.Layout, candidate.Fields);
+            foreach (var field in candidate.Fields)
+                candidate.Replacements.Add(new GimpleTemporaryValue(_nextTemporary++, field.Type, field.Syntax));
+        }
+
+        private static void AddLeafPlaces(GimplePlace place, Layout layout, List<GimplePlace> output)
         {
             if (layout.Children.Count == 0)
             {
-                candidate.Fields.Add(place);
-                candidate.Replacements.Add(new GimpleTemporaryValue(_nextTemporary++, layout.Type, place.Syntax));
+                output.Add(layout.FirstMember is { } member
+                    ? new GimpleMemberAccessExpression(place, false, default, member, member.Type, place.Syntax)
+                    : place);
                 return;
             }
             for (var i = 0; i < layout.Children.Count; i++)
@@ -593,14 +759,14 @@ public static class ScalarReplacement
                 GimplePlace field = child.Field is not null
                     ? new GimpleMemberAccessExpression(place, false, default, child.Field, child.Layout.Type, place.Syntax)
                     : new GimpleElementAccessExpression(place, new GimpleConstantValue(i, new QualifiedType(TypeCatalog.Instance.Int)), child.Layout.Type, place.Syntax);
-                CreateFields(candidate, field, child.Layout);
+                AddLeafPlaces(field, child.Layout, output);
             }
         }
 
         private static bool CanDecomposeCopy(GimpleStatement statement, StatementAccesses accesses)
             => statement is GimpleAssignStatement { IsCopy: true } && accesses.Reads.Count == 1 && accesses.Writes.Count == 1 &&
                accesses.Reads[0].Candidate.Selected && accesses.Writes[0].Candidate.Selected &&
-               accesses.Reads[0].Layout.Type.Equals(accesses.Writes[0].Layout.Type);
+               SameType(accesses.Reads[0].Layout.Type, accesses.Writes[0].Layout.Type);
 
         private void Rewrite(GimpleStatement statement, ImmutableArray<GimpleStatement>.Builder output)
         {
@@ -614,6 +780,7 @@ public static class ScalarReplacement
             _statements.TryGetValue(statement, out var accesses);
             if (accesses is not null)
             {
+                if (accesses.Copy && TryRewriteCopy((GimpleAssignStatement)statement, accesses, output)) return;
                 if (CanDecomposeCopy(statement, accesses))
                 {
                     var source = accesses.Reads[0];
@@ -631,6 +798,7 @@ public static class ScalarReplacement
                 }
                 foreach (var read in accesses.Reads) Synchronize(read, output, writeBack: true);
             }
+            if (statement is GimpleAssignStatement { IsCopy: true, IsConstructor: false } viewCopy && TryRewriteView(viewCopy, output)) return;
             AppendRewritten(output, statement switch
             {
                 GimpleAssignStatement assign => assign.WithOperands((GimplePlace)Map(assign.Lhs), Map(assign.Operands)),
@@ -643,6 +811,58 @@ public static class ScalarReplacement
             if (accesses is not null)
                 foreach (var write in accesses.Writes) Synchronize(write, output, writeBack: false);
         }
+
+        private bool TryRewriteView(GimpleAssignStatement copy, ImmutableArray<GimpleStatement>.Builder output)
+        {
+            var target = Map(copy.Lhs);
+            var value = Map(copy.Op1!);
+            if (IsAggregate(copy.Lhs.Type) || ReferenceEquals(target, copy.Lhs) && ReferenceEquals(value, copy.Op1) || SameType(target.Type, value.Type))
+                return false;
+            var code = GimpleTypes.IsFloating(target.Type) != GimpleTypes.IsFloating(value.Type)
+                ? GimpleTreeCode.ViewConvertExpr
+                : GimpleTreeCode.NopExpr;
+            output.Add(GimpleAssignStatement.Unary((GimplePlace)target, code, value, copy.Syntax));
+            return true;
+        }
+
+        private bool TryRewriteCopy(GimpleAssignStatement assign, StatementAccesses accesses, ImmutableArray<GimpleStatement>.Builder output)
+        {
+            var write = accesses.Writes.Count == 1 ? accesses.Writes[0] : null;
+            var read = accesses.Reads.Count == 1 ? accesses.Reads[0] : null;
+            var intoFields = write is { Candidate.Selected: true };
+            var fromFields = read is { Candidate.Selected: true };
+            if (!intoFields && !fromFields) return false;
+
+            var layout = (write ?? read)!.Layout;
+            var destinations = new List<GimplePlace>();
+            var sources = new List<GimplePlace>();
+            if (!intoFields) AddLeafPlaces(AddressOnce((GimplePlace)Map(assign.Lhs), output), layout, destinations);
+            if (!fromFields) AddLeafPlaces(AddressOnce((GimplePlace)Map(assign.Op1!), output), layout, sources);
+            for (var i = 0; i < layout.LeafCount; i++)
+                output.Add(GimpleAssignStatement.Single(
+                    intoFields ? write!.Candidate.Replacements[write.FirstField + i] : destinations[i],
+                    fromFields ? read!.Candidate.Replacements[read.FirstField + i] : sources[i],
+                    assign.Syntax));
+            return true;
+        }
+
+        // A computed index would otherwise be scaled again for every leaf
+        private GimplePlace AddressOnce(GimplePlace place, ImmutableArray<GimpleStatement>.Builder output)
+        {
+            if (!HasVariableIndex(place)) return place;
+            var pointerType = new QualifiedType(TypeCatalog.Instance.PointerTo(place.Type));
+            var address = new GimpleTemporaryValue(_nextTemporary++, pointerType, place.Syntax);
+            _addressTemporaries.Add(address);
+            output.Add(GimpleAssignStatement.Single(address, new GimpleAddressOfExpression(place, pointerType, place.Syntax), place.Syntax));
+            return new GimpleIndirectExpression(address, place.Type, place.Syntax);
+        }
+
+        private static bool HasVariableIndex(GimpleValue value) => value switch
+        {
+            GimpleElementAccessExpression element => element.Index is not (null or GimpleConstantValue) || HasVariableIndex(element.Expression),
+            GimpleMemberAccessExpression { ThroughPointer: false } member => HasVariableIndex(member.Expression),
+            _ => false,
+        };
 
         private void AppendRewritten(ImmutableArray<GimpleStatement>.Builder output, GimpleStatement statement)
         {
@@ -703,7 +923,7 @@ public static class ScalarReplacement
         private static GimpleVariableKey Key(GimpleValue value) => value is GimpleSymbolValue symbol
             ? GimpleVariableKey.FromSymbol(symbol.Symbol) : GimpleVariableKey.FromTemporary((GimpleTemporaryValue)value);
 
-        private static bool IsAggregate(QualifiedType type) => type.Type.Kind is TypeKind.Struct or TypeKind.Array;
+        private static bool IsAggregate(QualifiedType type) => type.Type.Kind is TypeKind.Struct or TypeKind.Union or TypeKind.Array;
         private static bool IsObservable(QualifiedType type) => (type.Qualifiers & (TypeQualifiers.Volatile | TypeQualifiers.Atomic)) != 0;
 
         private static bool TryIndex(object? value, out long index)

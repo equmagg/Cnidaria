@@ -232,6 +232,7 @@ namespace Cnidaria.Cs
                 BoundConditionalExpression e => RewriteConditionalExpression(e),
                 BoundUnboundCollectionExpression e => e,
                 BoundUnboundConditionalExpression e => throw new InvalidOperationException(e.NoNaturalType.Message),
+                BoundUnboundSwitchExpression e => throw new InvalidOperationException(e.NoNaturalType.Message),
                 BoundSpanCollectionExpression e => RewriteSpanCollectionExpression(e),
                 BoundAssignmentExpression e => RewriteAssignmentExpression(e),
                 BoundCompoundAssignmentExpression e => RewriteCompoundAssignmentExpression(e),

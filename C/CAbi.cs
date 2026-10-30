@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.Immutable;
 using Cnidaria.Cs;
 
@@ -157,10 +158,21 @@ internal static class CAbi
 
         var fpClass = HardwareFloatingAbiRegisterClass(target, type, isVariadicUnnamedArgument, isVariadicFunction: false);
         if (fpClass.HasValue)
-            return ScalarForTarget(target, type, fpClass.Value, size, alignment);
+        {
+            // A real that finds no floating register left is passed the integer way
+            var real = ScalarForTarget(target, type, fpClass.Value, size, alignment);
+            return isReturn
+                ? real
+                : real.WithFallback(ClassifyIntegerConventionScalar(target, type, size, alignment, isReturn, isVariadicUnnamedArgument).Segments);
+        }
 
         if (IsAggregate(type))
-            return ClassifySmallRegisterAggregate(target, type, isReturn, passLargeByReference: true);
+        {
+            var integer = ClassifySmallRegisterAggregate(target, type, isReturn, passLargeByReference: true);
+            return !isVariadicUnnamedArgument && TryClassifyRiscVFloatingAggregate(target, type, size, alignment, isReturn, integer, out var floating)
+                ? floating
+                : integer;
+        }
 
         if (IsPointerLike(type))
             return ScalarForTarget(target, type, AbiRegisterClass.General, size: target.PointerSize, alignment: target.PointerAlignment);
@@ -169,6 +181,88 @@ internal static class CAbi
             return ClassifyIntegerConventionScalar(target, type, size, alignment, isReturn, isVariadicUnnamedArgument);
 
         return AbiValue.Unsupported(type);
+    }
+
+    /// <summary>Puts a struct of one or two reals, or a real and an integer, in floating and integer registers (hardware floating-point convention)</summary>
+    private static bool TryClassifyRiscVFloatingAggregate(
+        TargetInfo target,
+        QualifiedType type,
+        int size,
+        int alignment,
+        bool isReturn,
+        AbiValue integer,
+        out AbiValue value)
+    {
+        value = default;
+        var flen = RiscVAbiFloatingRegisterSize(target);
+        var members = new List<(int Offset, QualifiedType Type)>(2);
+        if (flen == 0 || type.Type is not TagType { Symbol.TagKind: TagKind.Struct } || integer.PassingKind != AbiPassingKind.MultiRegister ||
+            !TryFlattenRiscVMembers(target, type, 0, members) || members.Count == 0)
+        {
+            return false;
+        }
+
+        var reals = 0;
+        foreach (var (_, memberType) in members)
+        {
+            var memberSize = Math.Max(1, target.SizeOf(memberType));
+            if (IsFloating(memberType) ? memberSize > flen : memberSize > target.RegisterSize)
+                return false;
+            if (IsFloating(memberType))
+                reals++;
+        }
+        if (reals == 0 || members.Count == 1 && reals != 1)
+            return false;
+
+        var segments = ImmutableArray.CreateBuilder<AbiSegment>(members.Count);
+        foreach (var (offset, memberType) in members)
+        {
+            segments.Add(CreateSegment(target, offset, Math.Max(1, target.SizeOf(memberType)),
+                IsFloating(memberType) ? AbiRegisterClass.Floating : AbiRegisterClass.General));
+        }
+        value = new AbiValue(type, AbiPassingKind.MultiRegister, size, alignment, segments.MoveToImmutable(),
+            requiresAllRegisters: !isReturn, fallbackSegments: isReturn ? default : integer.Segments);
+        return true;
+    }
+
+    // A bit-field is an integer of its declared type at the byte of its first bit, and one of zero width is no member
+    private static bool TryFlattenRiscVMembers(TargetInfo target, QualifiedType type, int offset, List<(int Offset, QualifiedType Type)> members)
+    {
+        switch (type.Type)
+        {
+            case TagType { Symbol: { TagKind: TagKind.Struct, IsComplete: true } tag }:
+                foreach (var field in tag.Fields)
+                {
+                    if (field.BitWidth is int width)
+                    {
+                        if (width == 0)
+                            continue;
+                        var placement = target.GetFieldPlacement(field);
+                        members.Add((checked(offset + placement.ByteOffset + placement.BitOffset / 8), field.Type));
+                        if (members.Count > 2)
+                            return false;
+                        continue;
+                    }
+                    if (!TryFlattenRiscVMembers(target, field.Type, checked(offset + FieldOffset(target, field)), members))
+                        return false;
+                }
+                return true;
+
+            case ArrayType { Length: long length } array:
+                var elementSize = Math.Max(1, target.SizeOf(array.ElementType));
+                for (var i = 0L; i < length; i++)
+                {
+                    if (members.Count > 2 || !TryFlattenRiscVMembers(target, array.ElementType, checked(offset + (int)(i * elementSize)), members))
+                        return false;
+                }
+                return true;
+
+            default:
+                if (!IsFloating(type) && !IsIntegerLike(type) && !IsPointerLike(type))
+                    return false;
+                members.Add((offset, type));
+                return members.Count <= 2;
+        }
     }
 
 
@@ -425,7 +519,10 @@ internal static class CAbi
         }
 
         if (size <= checked(target.RegisterSize * MaxRegisterAggregateRegisters) && !ContainsLongDouble(type))
-            return AbiValue.MultiRegister(type, size, alignment, CreateSystemVSegments(target, type, size));
+        {
+            return new AbiValue(type, AbiPassingKind.MultiRegister, size, alignment, CreateSystemVSegments(target, type, size),
+                requiresAllRegisters: !isReturn, keepsRegistersWhenStacked: true);
+        }
 
         return isReturn ? IndirectForTarget(target, type, size, alignment) : AbiValue.Stack(type, size, alignment);
     }
@@ -624,43 +721,77 @@ internal static class CAbi
     }
 
     public static ImmutableArray<AbiLocation> AssignArgumentLocations(AbiValue value, ref AbiCursor cursor, int stackSlotSize)
+        => PlaceArgument(value, ref cursor, stackSlotSize).Locations;
+
+    /// <summary>Places an argument, giving the value as it travels: as classified, in its fallback convention, or whole on the stack</summary>
+    public static AbiPlacement PlaceArgument(AbiValue value, ref AbiCursor cursor, int stackSlotSize)
     {
-        if (value.PassingKind == AbiPassingKind.Void)
-            return ImmutableArray<AbiLocation>.Empty;
-        if (value.PassingKind == AbiPassingKind.Unsupported)
-            throw new NotSupportedException("Unsupported ABI value: " + value.Type.ToDisplayString() + ".");
-
-        if (value.PassingKind == AbiPassingKind.Indirect)
+        switch (value.PassingKind)
         {
-            var segment = value.Segments.Length != 0 ? value.Segments[0] : new AbiSegment(0, value.IndirectSize, AbiRegisterClass.General);
-            return ImmutableArray.Create(AssignSegmentArgumentLocation(segment, ref cursor, stackSlotSize));
+            case AbiPassingKind.Void:
+                return new AbiPlacement(value, ImmutableArray<AbiLocation>.Empty);
+
+            case AbiPassingKind.Unsupported:
+                throw new NotSupportedException("Unsupported ABI value: " + value.Type.ToDisplayString() + ".");
+
+            case AbiPassingKind.Indirect:
+                var pointer = value.Segments.Length != 0 ? value.Segments[0] : new AbiSegment(0, value.IndirectSize, AbiRegisterClass.General);
+                return new AbiPlacement(value, ImmutableArray.Create(AssignSegmentArgumentLocation(pointer, ref cursor, stackSlotSize)));
+
+            case AbiPassingKind.Scalar when value.Segments.Length == 0:
+                return new AbiPlacement(value, ImmutableArray.Create(AssignSegmentArgumentLocation(new AbiSegment(0, value.Size, AbiRegisterClass.General), ref cursor, stackSlotSize)));
+
+            case AbiPassingKind.Scalar or AbiPassingKind.MultiRegister when value.Segments.Length != 0:
+                if (!value.RequiresAllRegisters && value.FallbackSegments.IsEmpty)
+                {
+                    var builder = ImmutableArray.CreateBuilder<AbiLocation>(value.Segments.Length);
+                    foreach (var segment in value.Segments)
+                        builder.Add(AssignSegmentArgumentLocation(segment, ref cursor, stackSlotSize));
+                    return new AbiPlacement(value, builder.MoveToImmutable());
+                }
+                if (TryAssignAllRegisters(value, ref cursor, out var locations))
+                    return new AbiPlacement(value, locations);
+                if (!value.FallbackSegments.IsEmpty)
+                {
+                    var fallbackKind = value.FallbackSegments.Length == 1 && !IsAggregate(value.Type) ? AbiPassingKind.Scalar : AbiPassingKind.MultiRegister;
+                    return PlaceArgument(new AbiValue(value.Type, fallbackKind, value.Size, value.Alignment, value.FallbackSegments), ref cursor, stackSlotSize);
+                }
+                if (!value.KeepsRegistersWhenStacked)
+                {
+                    foreach (var segment in value.Segments)
+                        ExhaustRegisters(ref cursor, segment);
+                }
+                var stacked = AbiValue.Stack(value.Type, value.Size, value.Alignment);
+                return new AbiPlacement(stacked, AssignWholeValueToStack(value, ref cursor, stackSlotSize));
+
+            default:
+                return new AbiPlacement(value, AssignWholeValueToStack(value, ref cursor, stackSlotSize));
         }
-
-        if (value.PassingKind == AbiPassingKind.Scalar)
-        {
-            var segment = value.Segments.Length != 0 ? value.Segments[0] : new AbiSegment(0, value.Size, AbiRegisterClass.General);
-            return ImmutableArray.Create(AssignSegmentArgumentLocation(segment, ref cursor, stackSlotSize));
-        }
-
-        if (value.PassingKind == AbiPassingKind.MultiRegister)
-        {
-            if (value.RequiresAllRegisters)
-                return AssignAllOrStackArgumentLocations(value, ref cursor, stackSlotSize);
-
-            var builder = ImmutableArray.CreateBuilder<AbiLocation>(value.Segments.Length);
-            foreach (var segment in value.Segments)
-                builder.Add(AssignSegmentArgumentLocation(segment, ref cursor, stackSlotSize));
-            return builder.ToImmutable();
-        }
-
-        return AssignWholeValueToStack(value, ref cursor, stackSlotSize);
     }
 
-    private static ImmutableArray<AbiLocation> AssignAllOrStackArgumentLocations(AbiValue value, ref AbiCursor cursor, int stackSlotSize)
-    {
-        if (value.Segments.Length == 0)
-            return AssignWholeValueToStack(value, ref cursor, stackSlotSize);
+    public static AbiLocation AssignParameterSegmentLocation(AbiValue value, int index, ref AbiCursor cursor, int stackSlotSize)
+        => PlaceArgument(value, ref cursor, stackSlotSize).Locations[index];
 
+    private static void ExhaustRegisters(ref AbiCursor cursor, AbiSegment segment)
+    {
+        switch (segment.RegisterClass)
+        {
+            case AbiRegisterClass.Floating:
+                cursor.Float = Math.Max(cursor.Float, segment.ArgumentRegisters.Length);
+                break;
+            case AbiRegisterClass.Vector:
+                cursor.Vector = Math.Max(cursor.Vector, segment.ArgumentRegisters.Length);
+                break;
+            default:
+                cursor.Integer = Math.Max(cursor.Integer, segment.ArgumentRegisters.Length);
+                break;
+        }
+    }
+
+    // Every segment takes the next register of its own class, and the cursor moves only when all of them fit
+    private static bool TryAssignAllRegisters(AbiValue value, ref AbiCursor cursor, out ImmutableArray<AbiLocation> locations)
+    {
+        locations = default;
         var first = value.Segments[0];
         var registers = first.ArgumentRegisters;
         if (first.UsesArm32VfpSlots)
@@ -689,70 +820,36 @@ internal static class CAbi
                         Arm32VfpRegisterByteOffset(slot, segment.Size)));
                     registerOffset = checked(registerOffset + segment.RegisterSlotsConsumed);
                 }
-                return builder.ToImmutable();
+                locations = builder.ToImmutable();
+                return true;
             }
 
             cursor.Arm32VfpUnavailable = true;
-            return AssignWholeValueToStack(value, ref cursor, stackSlotSize);
+            return false;
         }
 
-        var requiredRegisters = 0;
+        var integer = cursor.Integer;
+        var floating = cursor.Float;
+        var vector = cursor.Vector;
+        var placed = ImmutableArray.CreateBuilder<AbiLocation>(value.Segments.Length);
         foreach (var segment in value.Segments)
-            requiredRegisters = checked(requiredRegisters + segment.RegisterSlotsConsumed);
-
-        var registerCursor = first.RegisterClass switch
         {
-            AbiRegisterClass.Floating => cursor.Float,
-            AbiRegisterClass.Vector => cursor.Vector,
-            _ => cursor.Integer,
-        };
-        registerCursor = AlignRegisterCursor(registerCursor, first.RegisterSlotAlignment);
-        var forceStack = first.RegisterClass == AbiRegisterClass.General && cursor.ForceStack;
-
-        if (!forceStack && registers.Length != 0 && registerCursor + requiredRegisters <= registers.Length)
-        {
-            var builder = ImmutableArray.CreateBuilder<AbiLocation>(value.Segments.Length);
-            var registerOffset = 0;
-            foreach (var segment in value.Segments)
-            {
-                builder.Add(AbiLocation.FromRegister(
-                    registers[registerCursor + registerOffset],
-                    segment.Size,
-                    segment.RegisterClass,
-                    segment.Offset));
-                registerOffset = checked(registerOffset + segment.RegisterSlotsConsumed);
-            }
-
-            switch (first.RegisterClass)
-            {
-                case AbiRegisterClass.Floating:
-                    cursor.Float = registerCursor + requiredRegisters;
-                    break;
-                case AbiRegisterClass.Vector:
-                    cursor.Vector = registerCursor + requiredRegisters;
-                    break;
-                default:
-                    cursor.Integer = registerCursor + requiredRegisters;
-                    break;
-            }
-
-            return builder.ToImmutable();
+            ref var classCursor = ref segment.RegisterClass == AbiRegisterClass.Floating ? ref floating
+                : ref segment.RegisterClass == AbiRegisterClass.Vector ? ref vector
+                : ref integer;
+            var at = AlignRegisterCursor(classCursor, segment.RegisterSlotAlignment);
+            var slots = Math.Max(1, segment.RegisterSlotsConsumed);
+            if (segment.RegisterClass == AbiRegisterClass.General && cursor.ForceStack || at + slots > segment.ArgumentRegisters.Length)
+                return false;
+            placed.Add(AbiLocation.FromRegister(segment.ArgumentRegisters[at], segment.Size, segment.RegisterClass, segment.Offset));
+            classCursor = at + slots;
         }
 
-        switch (first.RegisterClass)
-        {
-            case AbiRegisterClass.Floating:
-                cursor.Float = registers.Length;
-                break;
-            case AbiRegisterClass.Vector:
-                cursor.Vector = registers.Length;
-                break;
-            default:
-                cursor.Integer = registers.Length;
-                break;
-        }
-
-        return AssignWholeValueToStack(value, ref cursor, stackSlotSize);
+        cursor.Integer = integer;
+        cursor.Float = floating;
+        cursor.Vector = vector;
+        locations = placed.MoveToImmutable();
+        return true;
     }
 
     private static ImmutableArray<AbiLocation> AssignWholeValueToStack(AbiValue value, ref AbiCursor cursor, int stackSlotSize)
@@ -922,6 +1019,18 @@ internal static class CAbi
         return (MachineRegister)((int)MachineRegister.X10 + ordinal);
     }
 
+    // Each register class draws its return registers in order, whatever the segments of other classes take
+    public static MachineRegister SegmentReturnRegister(AbiValue value, int index)
+    {
+        var ordinal = 0;
+        for (var i = 0; i < index; i++)
+        {
+            if (value.Segments[i].RegisterClass == value.Segments[index].RegisterClass)
+                ordinal++;
+        }
+        return ReturnRegister(value.Segments[index], ordinal);
+    }
+
     public static bool RequiresHiddenReturnBuffer(TargetInfo target, QualifiedType returnType)
         => ClassifyValue(target, returnType, isReturn: true, isVariadicUnnamedArgument: false).PassingKind == AbiPassingKind.Indirect;
 
@@ -1067,6 +1176,21 @@ internal static class CAbi
         => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.LongDouble };
 }
 
+internal readonly struct AbiPlacement
+{
+    public AbiValue Value { get; }
+    public ImmutableArray<AbiLocation> Locations { get; }
+
+    public AbiPlacement(AbiValue value, ImmutableArray<AbiLocation> locations)
+    {
+        Value = value;
+        Locations = locations;
+    }
+
+    public bool KeepsClassification(AbiValue classified)
+        => Value.PassingKind == classified.PassingKind && Value.Segments == classified.Segments;
+}
+
 internal enum AbiPassingKind
 {
     Void,
@@ -1157,6 +1281,10 @@ internal readonly struct AbiValue
     public ImmutableArray<AbiSegment> Segments { get; }
     public int IndirectSize { get; }
     public bool RequiresAllRegisters { get; }
+    /// <summary>Gets the segments of the integer convention used when the registers of these segments run out</summary>
+    public ImmutableArray<AbiSegment> FallbackSegments { get; }
+    /// <summary>Gets whether a value that goes to the stack for want of registers leaves them to later arguments</summary>
+    public bool KeepsRegistersWhenStacked { get; }
 
     public AbiValue(
         QualifiedType type,
@@ -1165,7 +1293,9 @@ internal readonly struct AbiValue
         int alignment,
         ImmutableArray<AbiSegment> segments,
         int indirectSize = 0,
-        bool requiresAllRegisters = false)
+        bool requiresAllRegisters = false,
+        ImmutableArray<AbiSegment> fallbackSegments = default,
+        bool keepsRegistersWhenStacked = false)
     {
         Type = type;
         PassingKind = passingKind;
@@ -1174,7 +1304,12 @@ internal readonly struct AbiValue
         Segments = segments.IsDefault ? ImmutableArray<AbiSegment>.Empty : segments;
         IndirectSize = indirectSize <= 0 ? Math.Max(1, Size) : indirectSize;
         RequiresAllRegisters = requiresAllRegisters;
+        FallbackSegments = fallbackSegments.IsDefault ? ImmutableArray<AbiSegment>.Empty : fallbackSegments;
+        KeepsRegistersWhenStacked = keepsRegistersWhenStacked;
     }
+
+    public AbiValue WithFallback(ImmutableArray<AbiSegment> fallbackSegments)
+        => new(Type, PassingKind, Size, Alignment, Segments, IndirectSize, RequiresAllRegisters, fallbackSegments, KeepsRegistersWhenStacked);
 
     public static AbiValue Void(QualifiedType type)
         => new AbiValue(type, AbiPassingKind.Void, 0, 1, ImmutableArray<AbiSegment>.Empty);

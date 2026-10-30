@@ -1395,6 +1395,19 @@ namespace System.Runtime
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static int RhGetTypeFlags(IntPtr handle) => 0;
 
+        // An enum's literals sorted by their value, zero-extended from the enum's storage
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static int RhGetTypeEnumCount(IntPtr handle) => 0;
+
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static ulong RhGetTypeEnumValue(IntPtr handle, int index) => 0;
+
+        [Intrinsic]
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static string RhGetTypeEnumName(IntPtr handle, int index) => null!;
+
         // The register VM has no MethodTables; its importer sends Array.Rank here
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static int RhGetArrayRank(Array array) => 0;
@@ -1450,5 +1463,52 @@ namespace System.Runtime
         // The identity hash if one was already assigned, or 0
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static int RhTryGetObjectHashCode(object obj) => 0;
+    }
+}
+
+namespace Internal.Reflection.Augments
+{
+    using System.Numerics;
+    using System.Reflection;
+
+    internal static class ReflectionAugments
+    {
+        // The compiler emits an enum's names and values already sorted by unsigned storage value
+        internal static unsafe EnumInfo CreateAndCacheEnumInfo(RuntimeType runtimeTypeInfo)
+        {
+            Debug.Assert(runtimeTypeInfo.IsEnum);
+
+            MethodTable* methodTable = (MethodTable*)runtimeTypeInfo.Handle;
+            EnumInfo enumInfo = methodTable->ElementType switch
+            {
+                EETypeElementType.SByte => CreateEnumInfoTyped<byte>(runtimeTypeInfo, typeof(sbyte)),
+                EETypeElementType.Byte => CreateEnumInfoTyped<byte>(runtimeTypeInfo, typeof(byte)),
+                EETypeElementType.Int16 => CreateEnumInfoTyped<ushort>(runtimeTypeInfo, typeof(short)),
+                EETypeElementType.UInt16 => CreateEnumInfoTyped<ushort>(runtimeTypeInfo, typeof(ushort)),
+                EETypeElementType.Int32 => CreateEnumInfoTyped<uint>(runtimeTypeInfo, typeof(int)),
+                EETypeElementType.UInt32 => CreateEnumInfoTyped<uint>(runtimeTypeInfo, typeof(uint)),
+                EETypeElementType.Int64 => CreateEnumInfoTyped<ulong>(runtimeTypeInfo, typeof(long)),
+                EETypeElementType.UInt64 => CreateEnumInfoTyped<ulong>(runtimeTypeInfo, typeof(ulong)),
+                _ => throw new NotSupportedException()
+            };
+
+            runtimeTypeInfo.GenericCache = enumInfo;
+            return enumInfo;
+        }
+
+        private static EnumInfo<TStorage> CreateEnumInfoTyped<TStorage>(RuntimeType enumType, Type underlyingType)
+            where TStorage : struct, INumber<TStorage>
+        {
+            IntPtr handle = enumType.Handle;
+            int count = System.Runtime.RuntimeImports.RhGetTypeEnumCount(handle);
+            var names = new string[count];
+            var values = new TStorage[count];
+            for (int i = 0; i < count; i++)
+            {
+                names[i] = System.Runtime.RuntimeImports.RhGetTypeEnumName(handle, i);
+                values[i] = TStorage.CreateTruncating(System.Runtime.RuntimeImports.RhGetTypeEnumValue(handle, i));
+            }
+            return new EnumInfo<TStorage>(underlyingType, values, names, enumType.IsFlagsEnum);
+        }
     }
 }

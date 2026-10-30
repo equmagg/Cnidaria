@@ -1013,6 +1013,8 @@ namespace Cnidaria.Cs
                 case GenTreeKind.NewArray:
                 case GenTreeKind.Box:
                     defs = defs.Add(SsaMemoryKind.GcHeap);
+                    if (node.IsNewDelegateInPlace)
+                        defs = defs.Add(SsaMemoryKind.ByrefExposed);
                     break;
             }
 

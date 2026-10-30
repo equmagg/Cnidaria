@@ -76,6 +76,13 @@ void clearerr(FILE* stream);
 int fprintf(FILE* stream, const char* format, ...);
 int vfprintf(FILE* stream, const char* format, va_list arguments);
 
+int scanf(const char* format, ...);
+int fscanf(FILE* stream, const char* format, ...);
+int sscanf(const char* text, const char* format, ...);
+int vscanf(const char* format, va_list arguments);
+int vfscanf(FILE* stream, const char* format, va_list arguments);
+int vsscanf(const char* text, const char* format, va_list arguments);
+
 int remove(const char* path);
 int rename(const char* from, const char* to);
 void perror(const char* text);

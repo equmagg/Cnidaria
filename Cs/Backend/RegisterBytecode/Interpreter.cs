@@ -812,6 +812,10 @@ namespace Cnidaria.Cs
                     case Op.F32ToI64Ovf: ConvertF32ToI64Ovf(ins.Rd, F32(ins.Rs1), executingPc); break;
                     case Op.F64ToI32Ovf: ConvertF64ToI32Ovf(ins.Rd, F64(ins.Rs1), executingPc); break;
                     case Op.F64ToI64Ovf: ConvertF64ToI64Ovf(ins.Rd, F64(ins.Rs1), executingPc); break;
+                    case Op.F32ToU32Ovf: ConvertF64ToU32Ovf(ins.Rd, F32(ins.Rs1), executingPc); break;
+                    case Op.F32ToU64Ovf: ConvertF64ToU64Ovf(ins.Rd, F32(ins.Rs1), executingPc); break;
+                    case Op.F64ToU32Ovf: ConvertF64ToU32Ovf(ins.Rd, F64(ins.Rs1), executingPc); break;
+                    case Op.F64ToU64Ovf: ConvertF64ToU64Ovf(ins.Rd, F64(ins.Rs1), executingPc); break;
                     case Op.BitcastI32F32: SetFpr(ins.Rd, (uint)(int)GetGpr(ins.Rs1)); break;
                     case Op.BitcastF32I32: SetI32(ins.Rd, unchecked((int)(uint)GetFpr(ins.Rs1))); break;
                     case Op.BitcastI64F64: SetFpr(ins.Rd, GetGpr(ins.Rs1)); break;
@@ -3586,6 +3590,15 @@ namespace Cnidaria.Cs
                 }
                 switch (rm.Name)
                 {
+                    case "RhGetTypeEnumCount":
+                        SetReturnI4(RuntimeTypeNames.EnumLiterals(type).Length);
+                        return true;
+                    case "RhGetTypeEnumValue":
+                        SetGpr(MachineRegisters.ReturnValue0, unchecked((long)RuntimeTypeNames.EnumLiterals(type)[checked((int)ReadAbiScalarArgument(rm, 1))].Value));
+                        return true;
+                    case "RhGetTypeEnumName":
+                        SetReturnRef(AllocStringFromManaged(RuntimeTypeNames.EnumLiterals(type)[checked((int)ReadAbiScalarArgument(rm, 1))].Name));
+                        return true;
                     case "RhGetTypeElementType":
                         SetReturnI4((int)RuntimeMethodTables.ElementType(type));
                         return true;
@@ -4551,7 +4564,10 @@ namespace Cnidaria.Cs
                 return abs;
             }
 
-            CheckHeapAccess(abs, size);
+            if (receiverAbs < _heapBase)
+                CheckStackRange(abs, size);
+            else
+                CheckHeapAccess(abs, size);
             if (writable) CheckWritableRange(abs, size);
             return abs;
         }
@@ -6140,7 +6156,12 @@ namespace Cnidaria.Cs
         {
             if (oldObj == 0) return 0;
             if (!TryGetBlockFromObjectRef(oldObj, out int block))
+            {
+                // Objects the compiler placed in a frame never move
+                if (oldObj >= _stackBase && oldObj < _stackEnd)
+                    return oldObj;
                 throw new AccessViolationException("Dangling object reference during GC compaction.");
+            }
             int target = ReadI32(block + BlockMetaOffset);
             if (target <= 0)
                 throw new AccessViolationException("Unmarked object reference during GC compaction.");
@@ -6869,7 +6890,7 @@ namespace Cnidaria.Cs
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void ConvertF64ToI32Ovf(byte rd, double value, int pc)
         {
-            if (!(value >= int.MinValue && value < 2147483648.0))
+            if (!(value > -2147483649.0 && value < 2147483648.0))
             {
                 ThrowOverflow(pc);
                 return;
@@ -6888,6 +6909,31 @@ namespace Cnidaria.Cs
             }
 
             SetGpr(rd, (long)value);
+        }
+
+        // A float source widens to double exactly, so the double bounds serve both
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ConvertF64ToU32Ovf(byte rd, double value, int pc)
+        {
+            if (!(value > -1.0 && value < 4294967296.0))
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetI32(rd, unchecked((int)(uint)value));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ConvertF64ToU64Ovf(byte rd, double value, int pc)
+        {
+            if (!(value > -1.0 && value < 18446744073709551616.0))
+            {
+                ThrowOverflow(pc);
+                return;
+            }
+
+            SetGpr(rd, unchecked((long)(ulong)value));
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -7285,11 +7331,31 @@ namespace Cnidaria.Cs
                 throw new AccessViolationException("Array reference is outside VM address space.");
             abs = checked((int)objRef);
             if (!TryGetBlockFromObjectRef(abs, out _))
-                throw new AccessViolationException("Could not get block from object ref");
+            {
+                if (!IsStackAllocatedArray(abs))
+                    throw new AccessViolationException("Could not get block from object ref");
+                return true;
+            }
             int flags = ReadI32(abs + 4);
             if ((flags & GcFlagAllocated) == 0)
                 throw new AccessViolationException("No allocation flag found");
             return true;
+        }
+
+        // An object the compiler placed in a frame has a header but no heap block
+        private bool IsStackObject(int obj)
+            => obj >= CurrentFrameStackLow() && obj <= _stackEnd - ObjectHeaderSize && _rts.TryGetTypeById(ReadI32(obj), out _);
+
+        // An array the compiler placed in a frame lies wholly inside the active stack
+        private bool IsStackAllocatedArray(int abs)
+        {
+            if (!IsStackObject(abs) || abs > _stackEnd - ArrayDataOffset ||
+                !_rts.TryGetTypeById(ReadI32(abs), out RuntimeType? type) || !type.IsSzArray ||
+                type.ElementType is not RuntimeType elementType)
+                return false;
+
+            long end = (long)abs + GetArrayDataOffset(type) + (long)ReadI32(abs + ArrayLengthOffset) * StorageSizeOf(elementType);
+            return end <= _stackEnd;
         }
 
         private RuntimeType ValidateArrayRef(long objRef)
@@ -7331,7 +7397,11 @@ namespace Cnidaria.Cs
         private int GetObjectRuntimeTypeId(long objRef)
         {
             int obj = checked((int)objRef);
-            if (!TryGetBlockFromObjectRef(obj, out _)) throw new AccessViolationException();
+            if (!TryGetBlockFromObjectRef(obj, out _))
+            {
+                if (!IsStackObject(obj)) throw new AccessViolationException();
+                return ReadI32(obj);
+            }
             int flags = ReadI32(obj + 4);
             if ((flags & GcFlagAllocated) == 0) throw new AccessViolationException();
             return ReadI32(obj);
@@ -7352,7 +7422,11 @@ namespace Cnidaria.Cs
         private RuntimeType GetObjectTypeFromRef(long objRef)
         {
             int obj = checked((int)objRef);
-            if (!TryGetBlockFromObjectRef(obj, out _)) throw new AccessViolationException();
+            if (!TryGetBlockFromObjectRef(obj, out _))
+            {
+                if (!IsStackObject(obj)) throw new AccessViolationException();
+                return _rts.GetTypeById(ReadI32(obj));
+            }
             int flags = ReadI32(obj + 4);
             if ((flags & GcFlagAllocated) == 0) throw new AccessViolationException();
             return _rts.GetTypeById(ReadI32(obj));

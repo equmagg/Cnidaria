@@ -22,6 +22,16 @@ namespace Cnidaria.Cs
                        ClassifyConversion(unboundConditional.WhenFalse, target, context).IsImplicit
                     ? new Conversion(ConversionKind.Identity)
                     : new Conversion(ConversionKind.None);
+            if (expr is BoundUnboundSwitchExpression unboundSwitch)
+            {
+                var switchSyntax = (SwitchExpressionSyntax)unboundSwitch.Syntax;
+                for (int i = 0; i < unboundSwitch.Arms.Length; i++)
+                {
+                    if (switchSyntax.Arms[i].Expression is not ThrowExpressionSyntax && !ClassifyConversion(unboundSwitch.Arms[i], target, context).IsImplicit)
+                        return new Conversion(ConversionKind.None);
+                }
+                return new Conversion(ConversionKind.Identity);
+            }
             if (expr is BoundUnboundCollectionExpression unboundCollection)
                 return CanBindTargetTypedCollectionExpression(unboundCollection, target, context)
                     ? new Conversion(ConversionKind.Identity)

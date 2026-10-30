@@ -1321,6 +1321,10 @@ public sealed class RegisterBytecodeCodeGenerator
                     EmitReturn(instruction);
                     break;
 
+                case LirInstructionKind.ReturnBuffer:
+                    EmitReturnBuffer(instruction);
+                    break;
+
                 case LirInstructionKind.Unreachable:
                     _asm.Trap(1);
                     break;
@@ -1335,9 +1339,17 @@ public sealed class RegisterBytecodeCodeGenerator
             if (instruction.Result is null)
                 return;
 
+            if (instruction.Operands.Length == 1 && instruction.Operands[0].Immediate is int segmentIndex)
+            {
+                EmitParameterSegment(instruction, segmentIndex);
+                return;
+            }
+
             var type = instruction.Result.Type;
             var value = CAbi.ClassifyValue(_owner._target, type, isReturn: false, isVariadicUnnamedArgument: false);
             var cursor = ToAbiCursor(_parameters);
+            var placement = CAbi.PlaceArgument(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+            value = placement.Value;
 
             if (value.PassingKind == AbiPassingKind.MultiRegister)
             {
@@ -1345,7 +1357,7 @@ public sealed class RegisterBytecodeCodeGenerator
                 for (var i = 0; i < value.Segments.Length; i++)
                 {
                     var segment = value.Segments[i];
-                    var loc = CAbi.AssignSegmentArgumentLocation(segment, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                    var loc = placement.Locations[i];
                     if (loc.Kind == AbiLocationKind.Register)
                     {
                         EmitStoreRawBitsToAddress(loc.Register, destinationAddress, segment.Offset, segment.Size);
@@ -1367,7 +1379,7 @@ public sealed class RegisterBytecodeCodeGenerator
 
             if (value.PassingKind == AbiPassingKind.Stack && IsAggregateType(type))
             {
-                var loc = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                var loc = placement.Locations[0];
                 var destinationAddress = MaterializeVirtualRegisterStorageAddress(instruction.Result, GpScratch0);
                 MaterializeIncomingStackAddress(loc.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), GpScratch1);
                 EmitRaw(Op.CpBlk, destinationAddress, GpScratch1, MachineRegister.Invalid, imm: value.Size);
@@ -1375,7 +1387,7 @@ public sealed class RegisterBytecodeCodeGenerator
                 return;
             }
 
-            var scalarLocation = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+            var scalarLocation = placement.Locations[0];
             var destination = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
             if (scalarLocation.Kind == AbiLocationKind.Register)
             {
@@ -1391,6 +1403,27 @@ public sealed class RegisterBytecodeCodeGenerator
             }
 
             SyncParameterState(cursor);
+            StoreWritableRegisterIfSpilled(instruction.Result, destination);
+        }
+
+        // Every segment starts from the cursor before the parameter, and the last one moves it past
+        private void EmitParameterSegment(LirInstruction instruction, int segment)
+        {
+            var parameter = _function.Symbol!.FunctionType!.Parameters.First(parameter => parameter.Name == instruction.Operator);
+            var value = CAbi.ClassifyValue(_owner._target, parameter.Type, isReturn: false, isVariadicUnnamedArgument: false);
+            var cursor = ToAbiCursor(_parameters);
+            var location = CAbi.AssignParameterSegmentLocation(value, segment, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+            var partType = instruction.Result!.Type;
+            var destination = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
+            if (location.Kind == AbiLocationKind.Register)
+                MoveRegister(destination, location.Register);
+            else if (location.Kind == AbiLocationKind.Stack)
+                EmitMem(LoadOpForType(partType), destination, MachineRegister.Invalid, location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize),
+                    MachineRegister.Invalid, MemoryBase.ThreadPointer, AlignmentOf(partType));
+            else
+                throw Unsupported(instruction, "Invalid parameter segment ABI location.");
+            if (value.PassingKind != AbiPassingKind.MultiRegister || segment == value.Segments.Length - 1)
+                SyncParameterState(cursor);
             StoreWritableRegisterIfSpilled(instruction.Result, destination);
         }
 
@@ -1810,7 +1843,18 @@ public sealed class RegisterBytecodeCodeGenerator
             var dstType = instruction.Result.Type;
             var dst = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
             var src = LoadOperand(instruction.Operands[0], IsFloatType(srcType) ? FpScratch1 : GpScratch1);
-            EmitConversion(dst, src, srcType, dstType, instruction);
+            if (instruction.Kind == LirInstructionKind.Cast && IsFloatType(srcType) != IsFloatType(dstType) &&
+                SizeOf(srcType) == SizeOf(dstType) && SizeOf(dstType) is 4 or 8)
+            {
+                var op = IsFloatType(dstType)
+                    ? SizeOf(dstType) == 4 ? Op.BitcastI32F32 : Op.BitcastI64F64
+                    : SizeOf(dstType) == 4 ? Op.BitcastF32I32 : Op.BitcastF64I64;
+                EmitRaw(op, dst, src);
+            }
+            else
+            {
+                EmitConversion(dst, src, srcType, dstType, instruction);
+            }
             StoreWritableRegisterIfSpilled(instruction.Result, dst);
         }
 
@@ -2281,6 +2325,13 @@ public sealed class RegisterBytecodeCodeGenerator
 
             if (!IsFallthroughTarget(instruction.Target))
                 _asm.J(LabelOf(instruction.Target));
+        }
+
+        private void EmitReturnBuffer(LirInstruction instruction)
+        {
+            var destination = GetWritableRegister(instruction.Result!, GpScratch0, FpScratch0);
+            MaterializeIncomingHiddenReturnBufferAddress(destination);
+            StoreWritableRegisterIfSpilled(instruction.Result!, destination);
         }
 
         private void EmitReturn(LirInstruction instruction)
@@ -2955,13 +3006,43 @@ public sealed class RegisterBytecodeCodeGenerator
 
         private void MarshalCallArgument(LirInstruction instruction, LirOperand operand, ref AbiCursor cursor)
         {
-            var value = CAbi.ClassifyValue(_owner._target, operand.Type, isReturn: false, isVariadicUnnamedArgument: false);
+            var classified = CAbi.ClassifyValue(_owner._target, operand.Type, isReturn: false, isVariadicUnnamedArgument: false);
+            var placement = CAbi.PlaceArgument(classified, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+            var value = placement.Value;
+            if (operand.Kind == LirOperandKind.Segments)
+            {
+                if (!placement.KeepsClassification(classified))
+                    throw Unsupported(instruction, "Aggregate argument segments do not match where the argument travels.");
+                for (var i = 0; i < value.Segments.Length; i++)
+                {
+                    var part = operand.Parts[i];
+                    var partLocation = placement.Locations[i];
+                    if (partLocation.Kind == AbiLocationKind.Register)
+                    {
+                        LoadOperandInto(part, partLocation.Register);
+                    }
+                    else if (partLocation.Kind == AbiLocationKind.Stack)
+                    {
+                        var partSource = LoadOperand(part, IsFloatType(part.Type) ? FpScratch0 : GpScratch0);
+                        EmitMem(StoreOpForType(part.Type), partSource, MachineRegister.Invalid,
+                            checked(_allocation.Frame.OutgoingArgumentAreaOffset + partLocation.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize)),
+                            MachineRegister.Invalid, MemoryBase.StackPointer, AlignmentOf(part.Type));
+                    }
+                    else
+                    {
+                        throw Unsupported(instruction, "Invalid aggregate argument ABI location.");
+                    }
+                }
+                return;
+            }
+
             if (value.PassingKind == AbiPassingKind.MultiRegister)
             {
                 MaterializeOperandStorageAddress(operand, GpScratch1, instruction);
-                foreach (var segment in value.Segments)
+                for (var i = 0; i < value.Segments.Length; i++)
                 {
-                    var loc = CAbi.AssignSegmentArgumentLocation(segment, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                    var segment = value.Segments[i];
+                    var loc = placement.Locations[i];
                     if (loc.Kind == AbiLocationKind.Register)
                     {
                         EmitLoadRawBitsFromAddress(GpScratch1, segment.Offset, loc.Register, segment.Size);
@@ -2981,14 +3062,14 @@ public sealed class RegisterBytecodeCodeGenerator
 
             if (value.PassingKind == AbiPassingKind.Stack && IsAggregateType(operand.Type))
             {
-                var loc = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                var loc = placement.Locations[0];
                 MaterializeOperandStorageAddress(operand, GpScratch1, instruction);
                 MaterializeOutgoingStackAddress(loc.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), GpScratch0);
                 EmitRaw(Op.CpBlk, GpScratch0, GpScratch1, MachineRegister.Invalid, imm: value.Size);
                 return;
             }
 
-            var scalar = CAbi.AssignArgumentLocation(value, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+            var scalar = placement.Locations[0];
             if (scalar.Kind == AbiLocationKind.Register)
             {
                 LoadOperandInto(operand, scalar.Register);
@@ -3265,6 +3346,16 @@ public sealed class RegisterBytecodeCodeGenerator
                     return;
                 }
 
+                // A narrow value is held extended by its own signedness, so a change of sign extends it again
+                if (dstSize < 4 && IsUnsignedInteger(dstType) != IsUnsignedInteger(srcType) &&
+                    dstType.Type is not BuiltinType { BuiltinKind: BuiltinTypeKind.Bool })
+                {
+                    EmitRaw(dstSize == 2
+                        ? IsUnsignedInteger(dstType) ? Op.TruncI32ToI16 : Op.SignExtendI16ToI32
+                        : IsUnsignedInteger(dstType) ? Op.TruncI32ToI8 : Op.SignExtendI8ToI32, dst, src);
+                    return;
+                }
+
                 MoveRegister(dst, src);
                 return;
             }
@@ -3350,6 +3441,15 @@ public sealed class RegisterBytecodeCodeGenerator
             var float64 = IsFloat64(leftType) || IsFloat64(rightType) || IsFloat64(resultType);
             if (float32 || float64)
                 return SelectFloatBinaryOp(text, float32 && !float64);
+
+            // A shift count is promoted on its own, so only the shifted value decides width and signedness
+            if (text is "<<" or ">>")
+            {
+                var wide = Is64BitInteger(leftType);
+                return text == "<<"
+                    ? wide ? Op.I64Shl : Op.I32Shl
+                    : wide ? (IsUnsignedInteger(leftType) ? Op.U64Shr : Op.I64Shr) : (IsUnsignedInteger(leftType) ? Op.U32Shr : Op.I32Shr);
+            }
 
             var is64 = Is64BitInteger(leftType) || Is64BitInteger(rightType) || (Is64BitInteger(resultType) && text is not "==" and not "!=" and not "<" and not "<=" and not ">" and not ">=");
             var unsigned = IsUnsignedInteger(leftType) || IsUnsignedInteger(rightType);

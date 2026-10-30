@@ -86,7 +86,6 @@ char* strsignal(int sig)
 #if defined(__x86_64__)
 #define __NR_rt_sigaction 13
 #define __NR_rt_sigprocmask 14
-#define __NR_nanosleep 35
 #define __NR_getitimer 36
 #define __NR_setitimer 38
 #define __NR_getpid 39
@@ -122,7 +121,6 @@ char* strsignal(int sig)
 #define __NR_gettid 224
 #define __NR_tkill 238
 #else
-#define __NR_nanosleep 101
 #define __NR_getitimer 102
 #define __NR_setitimer 103
 #define __NR_kill 129
@@ -145,7 +143,6 @@ char* strsignal(int sig)
 
 // A 32-bit kernel takes 64-bit time only through the calls that were added for it
 #if __SIZEOF_POINTER__ == 4
-#define __NR_clock_nanosleep_time64 407
 #define __NR_rt_sigtimedwait_time64 421
 #endif
 
@@ -467,28 +464,6 @@ unsigned int alarm(unsigned int seconds)
     if (old.it_value.tv_usec >= 500000 || (remaining == 0 && old.it_value.tv_usec > 0))
         remaining = remaining + 1;
     return remaining;
-}
-
-unsigned int sleep(unsigned int seconds)
-{
-#if __SIZEOF_POINTER__ == 4
-    long long request[2];
-    long long remaining[2];
-
-    request[0] = seconds;
-    request[1] = 0;
-    if (__syscall(__NR_clock_nanosleep_time64, 0, 0, (long)(uintptr_t)request, (long)(uintptr_t)remaining, 0, 0) == -EINTR)
-        return (unsigned int)remaining[0];
-#else
-    long request[2];
-    long remaining[2];
-
-    request[0] = (long)seconds;
-    request[1] = 0;
-    if (__syscall(__NR_nanosleep, (long)(uintptr_t)request, (long)(uintptr_t)remaining, 0, 0, 0, 0) == -EINTR)
-        return (unsigned int)remaining[0];
-#endif
-    return 0;
 }
 
 #else

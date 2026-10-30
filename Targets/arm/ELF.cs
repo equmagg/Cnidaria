@@ -80,7 +80,7 @@ public static class ArmElfWriter
 
         var target = program.Target;
         var imports = options.Dynamic ? CollectImports(program) : ElfImportSet.Empty;
-        var rewritten = RedirectDataImports(program, imports.Data);
+        var rewritten = ArmObjectLinker.RedirectDataImports(program, imports.Data);
 
         var descriptor = new ElfTarget
         {
@@ -319,47 +319,6 @@ public static class ArmElfWriter
 
     private static void WriteWord(byte[] data, int offset, uint word, ArmTarget target)
         => ArmCodeEncoder.WriteWord(data, offset, word, target.Endianness);
-
-    /// <summary>Turns the add of an address pair into a load, so an imported object is read from its table slot.</summary>
-    private static ArmProgram RedirectDataImports(ArmProgram program, ImmutableArray<string> dataImports)
-    {
-        if (dataImports.Length == 0)
-            return program;
-
-        var imports = dataImports.ToImmutableHashSet(StringComparer.Ordinal);
-        var instructions = program.Text.Instructions.ToBuilder();
-        var relocations = ImmutableArray.CreateBuilder<ArmObjectRelocation>(program.Text.Relocations.Length);
-        foreach (var relocation in program.Text.Relocations)
-        {
-            if (relocation.Kind != ArmObjectRelocationKind.AArch64AddLow12 || !imports.Contains(relocation.SymbolName))
-            {
-                relocations.Add(relocation);
-                continue;
-            }
-
-            var index = relocation.Offset / 4;
-            var instruction = instructions[index];
-            if (instruction.Opcode != ArmInstrKind.Add)
-                throw new NotSupportedException($"An imported data object is not addressed through an address pair: {relocation.SymbolName}");
-            instructions[index] = ArmInstruction.Binary(
-                ArmInstrKind.Ldr,
-                instruction.Operand0,
-                ArmOperand.Memory(instruction.Operand1.Register, 0, 8));
-            relocations.Add(new ArmObjectRelocation(
-                relocation.SectionName,
-                relocation.Offset,
-                relocation.SymbolName,
-                relocation.Addend,
-                ArmObjectRelocationKind.AArch64LoadLow12));
-        }
-
-        return new ArmProgram(
-            program.Target,
-            new ArmTextSection(instructions.ToImmutable(), program.Text.Labels, relocations.ToImmutable()),
-            program.DataSections,
-            program.Symbols,
-            program.EntrySymbol);
-    }
 
     private static ulong ResolveSymbol(IReadOnlyDictionary<string, ulong> symbols, string symbol)
     {

@@ -1946,6 +1946,35 @@ namespace Cnidaria.Cs
             ConstantValueOpt = Optional<object>.None;
         }
     }
+    /// <summary>A switch expression without a natural type, awaiting a target type</summary>
+    internal sealed class BoundUnboundSwitchExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.UnboundSwitch;
+        public LocalSymbol Governing { get; }
+        public BoundStatement GoverningDeclaration { get; }
+        public ImmutableArray<BoundExpression> Conditions { get; }
+        public ImmutableArray<BoundExpression> Arms { get; }
+        /// <summary>Reported when no conversion supplies a target type</summary>
+        public Diagnostic NoNaturalType { get; }
+
+        public BoundUnboundSwitchExpression(
+            SwitchExpressionSyntax syntax,
+            LocalSymbol governing,
+            BoundStatement governingDeclaration,
+            ImmutableArray<BoundExpression> conditions,
+            ImmutableArray<BoundExpression> arms,
+            Diagnostic noNaturalType)
+            : base(syntax)
+        {
+            Governing = governing;
+            GoverningDeclaration = governingDeclaration;
+            Conditions = conditions;
+            Arms = arms;
+            NoNaturalType = noNaturalType;
+            Type = new ErrorTypeSymbol("<unbound switch>", containing: null, ImmutableArray<Location>.Empty);
+            ConstantValueOpt = Optional<object>.None;
+        }
+    }
     /// <summary>Collection elements awaiting a target collection type</summary>
     internal sealed class BoundUnboundCollectionExpression : BoundExpression
     {

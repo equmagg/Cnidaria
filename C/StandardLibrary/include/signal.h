@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <sys/types.h>
+#include <time.h>
 
 typedef int sig_atomic_t;
 typedef struct
@@ -123,15 +124,6 @@ int sigismember(const sigset_t* set, int sig);
 #define CLD_TRAPPED 4
 #define CLD_STOPPED 5
 #define CLD_CONTINUED 6
-
-#ifndef __STRUCT_TIMESPEC
-#define __STRUCT_TIMESPEC
-struct timespec
-{
-    time_t tv_sec;
-    long tv_nsec;
-};
-#endif
 
 union sigval
 {

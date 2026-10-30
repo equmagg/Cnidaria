@@ -191,6 +191,8 @@ public sealed class FieldSymbol : TypedSymbol
     public int? BitWidth { get; }
 
     public bool IsBitField => BitWidth.HasValue;
+    /// <summary>Gets whether the field is padding that initializer lists skip</summary>
+    public bool IsUnnamedBitField => BitWidth.HasValue && Name.Length == 0;
 
     public FieldSymbol(
         string name,

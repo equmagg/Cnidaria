@@ -7,6 +7,48 @@ namespace Cnidaria.Arm;
 
 internal static class ArmObjectLinker
 {
+    // Imported data addresses come from the table slot
+    internal static ArmProgram RedirectDataImports(ArmProgram program, ImmutableArray<string> dataImports)
+    {
+        if (dataImports.Length == 0)
+            return program;
+
+        var imports = dataImports.ToImmutableHashSet(StringComparer.Ordinal);
+        var instructions = program.Text.Instructions.ToBuilder();
+        var relocations = ImmutableArray.CreateBuilder<ArmObjectRelocation>(program.Text.Relocations.Length);
+        foreach (var relocation in program.Text.Relocations)
+        {
+            if (relocation.Kind != ArmObjectRelocationKind.AArch64AddLow12 || !imports.Contains(relocation.SymbolName))
+            {
+                relocations.Add(relocation);
+                continue;
+            }
+
+            var index = relocation.Offset / 4;
+            var instruction = instructions[index];
+            if (instruction.Opcode != ArmInstrKind.Add)
+                throw new NotSupportedException($"An imported data object is not addressed through an address pair: {relocation.SymbolName}");
+            instructions[index] = ArmInstruction.Binary(
+                ArmInstrKind.Ldr,
+                instruction.Operand0,
+                ArmOperand.Memory(instruction.Operand1.Register, 0, 8));
+            relocations.Add(new ArmObjectRelocation(
+                relocation.SectionName,
+                relocation.Offset,
+                relocation.SymbolName,
+                relocation.Addend,
+                ArmObjectRelocationKind.AArch64LoadLow12));
+        }
+
+        return new ArmProgram(
+            program.Target,
+            new ArmTextSection(instructions.ToImmutable(), program.Text.Labels, relocations.ToImmutable()),
+            program.DataSections,
+            program.Symbols,
+            program.EntrySymbol,
+            program.Imports);
+    }
+
     public static ArmLinkedImage LinkFlat(
         ArmProgram obj,
         ulong imageBase = 0,
@@ -351,7 +393,8 @@ public static class ArmObjectComposer
             new ArmTextSection(instructions.ToImmutable(), labels, textRelocations.ToImmutable()),
             dataSections.ToImmutable(),
             symbols.ToImmutable(),
-            Rename(renames[0], primary.EntrySymbol));
+            Rename(renames[0], primary.EntrySymbol),
+            PeImport.Merge(inputs.SelectMany(static input => input.Imports)));
     }
 
     private static ArmInstruction RewriteInstruction(ArmInstruction instruction, IReadOnlyDictionary<string, string> renames)

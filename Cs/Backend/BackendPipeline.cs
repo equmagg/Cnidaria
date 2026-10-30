@@ -31,6 +31,7 @@ namespace Cnidaria.Cs
         public bool ValidateHir { get; set; } = true;
         public bool ValidateSsa { get; set; } = true;
         public bool EnableFinallyOptimization { get; set; } = true;
+        public bool EnableObjectStackAllocation { get; set; } = true;
         public bool EnablePhysicalPromotion { get; set; } = true;
         public bool EnableLoopInversion { get; set; } = true;
         public bool EnableLoopCloning { get; set; } = true;
@@ -280,6 +281,7 @@ namespace Cnidaria.Cs
             {
                 var method = CompileMethodThroughLsra(
                     program.Methods[i],
+                    program.TypeSystem,
                     options,
                     nonCallOperationsClobberCallerSavedRegisters,
                     out var hir,
@@ -314,6 +316,7 @@ namespace Cnidaria.Cs
 
             var allocated = CompileMethodThroughLsra(
                 method,
+                typeSystem: null,
                 options,
                 nonCallOperationsClobberCallerSavedRegisters,
                 out var hir,
@@ -330,6 +333,7 @@ namespace Cnidaria.Cs
 
         private static GenTreeMethod CompileMethodThroughLsra(
             GenTreeMethod importedMethod,
+            RuntimeTypeSystem? typeSystem,
             BackendOptions options,
             bool nonCallOperationsClobberCallerSavedRegisters,
             out GenTreeMethod hirMethod,
@@ -337,7 +341,7 @@ namespace Cnidaria.Cs
             out GenTreeMethod rationalizedMethod,
             out GenTreeMethod loweredMethod)
         {
-            hirMethod = PrepareHir(importedMethod, options);
+            hirMethod = PrepareHir(importedMethod, typeSystem, options);
             ssaMethod = null;
 
             if (options.BuildSsa)
@@ -421,12 +425,15 @@ namespace Cnidaria.Cs
             return false;
         }
 
-        private static GenTreeMethod PrepareHir(GenTreeMethod method, BackendOptions options)
+        private static GenTreeMethod PrepareHir(GenTreeMethod method, RuntimeTypeSystem? typeSystem, BackendOptions options)
         {
             if (options.EnableFinallyOptimization)
                 method = GenTreeFinallyOptimizer.OptimizeMethod(method);
 
             method = GenTreeClassInitializationEntryInserter.Insert(method);
+
+            if (options.EnableObjectStackAllocation && typeSystem is not null)
+                method = GenTreeObjectAllocator.AllocateObjects(method, typeSystem);
 
             method = GenTreeMorpher.MorphMethod(method);
             method = GenTreeLocalRewriter.RewriteMethod(method);
@@ -1454,7 +1461,7 @@ namespace Cnidaria.Cs
             {
                 if (node.Operands.Length != 1 ||
                     node.StackKind != GenStackKind.Void ||
-                    node.Operands[0].StackKind is not (GenStackKind.Ref or GenStackKind.Null))
+                    node.Operands[0].StackKind is not (GenStackKind.Ref or GenStackKind.Null or GenStackKind.ByRef or GenStackKind.NativeInt))
                 {
                     throw new InvalidOperationException($"Malformed HIR null check in B{blockId}: {node}.");
                 }
@@ -1463,7 +1470,7 @@ namespace Cnidaria.Cs
             {
                 if (node.Operands.Length != 1 ||
                     node.StackKind != GenStackKind.I4 ||
-                    node.Operands[0].StackKind is not (GenStackKind.Ref or GenStackKind.Null))
+                    node.Operands[0].StackKind is not (GenStackKind.Ref or GenStackKind.Null or GenStackKind.ByRef or GenStackKind.NativeInt))
                 {
                     throw new InvalidOperationException($"Malformed HIR array length in B{blockId}: {node}.");
                 }

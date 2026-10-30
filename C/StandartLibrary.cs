@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.IO;
-using System.Linq;
 using System.Text;
 
 namespace Cnidaria.C;
@@ -15,47 +14,43 @@ public static class StandardHeaders
     public const string MallocIntrinsicName = "malloc"; // classified as intrinsic for Register Bytecode only
     public const string FreeIntrinsicName = "free"; // classified as intrinsic for Register Bytecode only
 
-    internal static string CtypeH { get; } = ReadEmbeddedText("ctype.h");
-    internal static string ErrnoH { get; } = ReadEmbeddedText("errno.h");
-    internal static string FcntlH { get; } = ReadEmbeddedText("fcntl.h");
-    internal static string LimitsH { get; } = ReadEmbeddedText("limits.h");
-    internal static string StdargH { get; } = ReadEmbeddedText("stdarg.h");
-    internal static string StdboolH { get; } = ReadEmbeddedText("stdbool.h");
-    internal static string StddefH { get; } = ReadEmbeddedText("stddef.h");
-    internal static string StdintH { get; } = ReadEmbeddedText("stdint.h");
-    internal static string StdioH { get; } = ReadEmbeddedText("stdio.h");
-    internal static string StdlibH { get; } = ReadEmbeddedText("stdlib.h");
-    internal static string SignalH { get; } = ReadEmbeddedText("signal.h");
-    internal static string StringH { get; } = ReadEmbeddedText("string.h");
-    internal static string SysStatH { get; } = ReadEmbeddedText("stat.h");
-    internal static string SysTimeH { get; } = ReadEmbeddedText("sys.time.h");
-    internal static string SysIoctlH { get; } = ReadEmbeddedText("sys.ioctl.h");
-    internal static string TermiosH { get; } = ReadEmbeddedText("termios.h");
-    internal static string SysTypesH { get; } = ReadEmbeddedText("types.h");
-    internal static string UnistdH { get; } = ReadEmbeddedText("unistd.h");
-    internal static string RiscVVectorH { get; } = ReadEmbeddedText("riscv_vector.h");
-    internal static string DirentH { get; } = ReadEmbeddedText("dirent.h");
-    internal static string SysWaitH { get; } = ReadEmbeddedText("sys.wait.h");
-    internal static string SysMmanH { get; } = ReadEmbeddedText("sys.mman.h");
-    internal static string PollH { get; } = ReadEmbeddedText("poll.h");
-    internal static string SysUtsnameH { get; } = ReadEmbeddedText("sys.utsname.h");
-    internal static string SysSoundcardH { get; } = ReadEmbeddedText("sys.soundcard.h");
-    internal static string LinuxIoctlH { get; } = ReadEmbeddedText("linux.ioctl.h");
-    internal static string LinuxInputH { get; } = ReadEmbeddedText("linux.input.h");
-    internal static string LinuxInputEventCodesH { get; } = ReadEmbeddedText("linux.input-event-codes.h");
+    internal static string CtypeH { get; } = ReadEmbeddedText("include/ctype.h");
+    internal static string ErrnoH { get; } = ReadEmbeddedText("include/errno.h");
+    internal static string FcntlH { get; } = ReadEmbeddedText("include/fcntl.h");
+    internal static string LimitsH { get; } = ReadEmbeddedText("include/limits.h");
+    internal static string StdargH { get; } = ReadEmbeddedText("include/stdarg.h");
+    internal static string StdboolH { get; } = ReadEmbeddedText("include/stdbool.h");
+    internal static string StddefH { get; } = ReadEmbeddedText("include/stddef.h");
+    internal static string StdintH { get; } = ReadEmbeddedText("include/stdint.h");
+    internal static string StdioH { get; } = ReadEmbeddedText("include/stdio.h");
+    internal static string ScanfInternalH { get; } = ReadEmbeddedText("src/stdio/scanf-internal.h");
+    internal static string StdlibH { get; } = ReadEmbeddedText("include/stdlib.h");
+    internal static string TimeH { get; } = ReadEmbeddedText("include/time.h");
+    internal static string SignalH { get; } = ReadEmbeddedText("include/signal.h");
+    internal static string StringH { get; } = ReadEmbeddedText("include/string.h");
+    internal static string SysStatH { get; } = ReadEmbeddedText("include/sys/stat.h");
+    internal static string SysTimeH { get; } = ReadEmbeddedText("include/sys/time.h");
+    internal static string SysIoctlH { get; } = ReadEmbeddedText("include/sys/ioctl.h");
+    internal static string TermiosH { get; } = ReadEmbeddedText("include/termios.h");
+    internal static string SysTypesH { get; } = ReadEmbeddedText("include/sys/types.h");
+    internal static string UnistdH { get; } = ReadEmbeddedText("include/unistd.h");
+    internal static string RiscVVectorH { get; } = ReadEmbeddedText("include/riscv_vector.h");
+    internal static string DirentH { get; } = ReadEmbeddedText("include/dirent.h");
+    internal static string SysWaitH { get; } = ReadEmbeddedText("include/sys/wait.h");
+    internal static string SysUioH { get; } = ReadEmbeddedText("include/sys/uio.h");
+    internal static string SysMmanH { get; } = ReadEmbeddedText("include/sys/mman.h");
+    internal static string PollH { get; } = ReadEmbeddedText("include/poll.h");
+    internal static string SysUtsnameH { get; } = ReadEmbeddedText("include/sys/utsname.h");
+    internal static string SysSoundcardH { get; } = ReadEmbeddedText("include/sys/soundcard.h");
+    internal static string LinuxFbH { get; } = ReadEmbeddedText("include/linux/fb.h");
+    internal static string LinuxKdH { get; } = ReadEmbeddedText("include/linux/kd.h");
+    internal static string LinuxIoctlH { get; } = ReadEmbeddedText("include/linux/ioctl.h");
+    internal static string LinuxInputH { get; } = ReadEmbeddedText("include/linux/input.h");
+    internal static string LinuxInputEventCodesH { get; } = ReadEmbeddedText("include/linux/input-event-codes.h");
     internal static string ReadEmbeddedText(string fileName)
     {
         var assembly = typeof(StandardHeaders).Assembly;
-        var suffix = "." + fileName;
-        var resourceName = assembly
-            .GetManifestResourceNames()
-            .Where(name => name.EndsWith(suffix, StringComparison.Ordinal))
-            .OrderByDescending(name => name.Contains(".StandardLibrary.", StringComparison.Ordinal))
-            .ThenBy(static name => name, StringComparer.Ordinal)
-            .FirstOrDefault();
-
-        if (resourceName is null)
-            throw new FileNotFoundException($"Embedded standard header not found: {fileName}");
+        string resourceName = "Cnidaria.C.StandardLibrary." + fileName.Replace('/', '.');
 
         using var stream = assembly.GetManifestResourceStream(resourceName);
         if (stream is null)
@@ -72,6 +67,7 @@ public static class StandardHeaders
             new IncludeFile("fcntl.h", FcntlH),
             new IncludeFile("limits.h", LimitsH),
             new IncludeFile("signal.h", SignalH),
+            new IncludeFile("time.h", TimeH),
             new IncludeFile("stdarg.h", StdargH),
             new IncludeFile("stdbool.h", StdboolH),
             new IncludeFile("stddef.h", StddefH),
@@ -89,16 +85,19 @@ public static class StandardHeaders
             new IncludeFile("dirent.h", DirentH),
             new IncludeFile("sys/wait.h", SysWaitH),
             new IncludeFile("sys/mman.h", SysMmanH),
+            new IncludeFile("sys/uio.h", SysUioH),
             new IncludeFile("poll.h", PollH),
             new IncludeFile("sys/utsname.h", SysUtsnameH),
             new IncludeFile("sys/soundcard.h", SysSoundcardH),
+            new IncludeFile("linux/fb.h", LinuxFbH),
+            new IncludeFile("linux/kd.h", LinuxKdH),
             new IncludeFile("linux/ioctl.h", LinuxIoctlH),
             new IncludeFile("linux/input.h", LinuxInputH),
             new IncludeFile("linux/input-event-codes.h", LinuxInputEventCodesH));
     }
 
     public static IIncludeResolver CreateResolver()
-        => new InMemoryIncludeResolver(CreateFiles());
+        => new InMemoryIncludeResolver(CreateFiles().Add(new IncludeFile("C/StandardLibrary/src/stdio/scanf-internal.h", ScanfInternalH)));
 
     public static IReadOnlyDictionary<string, string> CreateFileMap()
     {
@@ -118,7 +117,7 @@ internal static class RiscVVectorIntrinsics
     private static Dictionary<string, string> Load()
     {
         var declarations = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var line in StandardHeaders.ReadEmbeddedText("riscv_vector.def").Split('\n'))
+        foreach (var line in StandardHeaders.ReadEmbeddedText("intrinsics/riscv_vector.def").Split('\n'))
         {
             var text = line.TrimEnd('\r');
             var open = text.IndexOf('(');
@@ -133,35 +132,24 @@ public static class StandardLibrarySources
 {
     public static ImmutableArray<SourceFile> CreateFiles()
         => ImmutableArray.Create(
-            new SourceFile("C/StandardLibrary/ctype.c", ReadEmbeddedText("ctype.c")),
-            new SourceFile("C/StandardLibrary/io.c", ReadEmbeddedText("io.c")),
-            new SourceFile("C/StandardLibrary/libc.c", ReadEmbeddedText("libc.c")),
-            new SourceFile("C/StandardLibrary/process.c", ReadEmbeddedText("process.c")),
-            new SourceFile("C/StandardLibrary/signal.c", ReadEmbeddedText("signal.c")),
-            new SourceFile("C/StandardLibrary/stdio.c", ReadEmbeddedText("stdio.c")),
-            new SourceFile("C/StandardLibrary/stdlib.c", ReadEmbeddedText("stdlib.c")),
-            new SourceFile("C/StandardLibrary/string.c", ReadEmbeddedText("string.c")),
-            new SourceFile("C/StandardLibrary/termios.c", ReadEmbeddedText("termios.c")));
+            CreateFile("src/ctype/ctype.c"),
+            CreateFile("src/io/io.c"),
+            CreateFile("src/startup/libc.c"),
+            CreateFile("src/process/process.c"),
+            CreateFile("src/signal/signal.c"),
+            CreateFile("src/stdio/stdio.c"),
+            CreateFile("src/stdio/vfscanf-internal.c"),
+            CreateFile("src/stdio/scanf.c"),
+            CreateFile("src/stdio/fscanf.c"),
+            CreateFile("src/stdio/sscanf.c"),
+            CreateFile("src/stdio/vscanf.c"),
+            CreateFile("src/stdio/vfscanf.c"),
+            CreateFile("src/stdio/vsscanf.c"),
+            CreateFile("src/stdlib/stdlib.c"),
+            CreateFile("src/string/string.c"),
+            CreateFile("src/termios/termios.c"),
+            CreateFile("src/time/time.c"));
 
-    private static string ReadEmbeddedText(string fileName)
-    {
-        var assembly = typeof(StandardLibrarySources).Assembly;
-        var suffix = "." + fileName;
-        var resourceName = assembly
-            .GetManifestResourceNames()
-            .Where(name => name.EndsWith(suffix, StringComparison.Ordinal))
-            .OrderByDescending(name => name.Contains(".StandardLibrary.", StringComparison.Ordinal))
-            .ThenBy(static name => name, StringComparer.Ordinal)
-            .FirstOrDefault();
-
-        if (resourceName is null)
-            throw new FileNotFoundException($"Embedded standard library source not found: {fileName}");
-
-        using var stream = assembly.GetManifestResourceStream(resourceName);
-        if (stream is null)
-            throw new FileNotFoundException($"Embedded resource not found: {resourceName}");
-
-        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-        return reader.ReadToEnd();
-    }
+    private static SourceFile CreateFile(string path)
+        => new SourceFile("C/StandardLibrary/" + path, StandardHeaders.ReadEmbeddedText(path));
 }

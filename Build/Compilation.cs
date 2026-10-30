@@ -90,13 +90,23 @@ internal static class BuildCompilation
         _ => throw new ArgumentOutOfRangeException(nameof(language))
     };
 
-    internal static BuildCompilerOutput Compile(Language language, BuildCompileRequest request) => language switch
+    internal static BuildCompilerOutput Compile(Language language, BuildCompileRequest request)
     {
-        Language.C => CompileC(request),
-        Language.Rust => CompileRust(request),
-        Language.Cs => CompileCSharp(request),
-        _ => throw new ArgumentOutOfRangeException(nameof(language))
-    };
+        try
+        {
+            return language switch
+            {
+                Language.C => CompileC(request),
+                Language.Rust => CompileRust(request),
+                Language.Cs => CompileCSharp(request),
+                _ => throw new ArgumentOutOfRangeException(nameof(language))
+            };
+        }
+        catch (Exception exception) when (exception is NotSupportedException or InvalidOperationException or KeyNotFoundException or OverflowException or ArgumentException)
+        {
+            return BuildCompilerOutput.Failure(exception.Message);
+        }
+    }
 
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
@@ -129,7 +139,8 @@ internal static class BuildCompilation
         var resolver = new VirtualIncludeResolver(request, search);
         return new C.StaticLinkerOptions(target,
             includeSearchPaths: search, includeResolver: resolver,
-            linkStandardLibrary: !shared || target.IsRegisterBytecode, emitStartup: !shared, allowUndefinedSymbols: shared,
+            linkStandardLibrary: !shared || target.IsRegisterBytecode || request.OperatingSystem == OperatingSystemKind.Windows,
+            emitStartup: !shared, allowUndefinedSymbols: shared,
             positionIndependentCode: shared && !target.IsRegisterBytecode,
             inlining: new C.InliningOptions(enabled: release),
             gimple: new C.GimplePipelineOptions(optimization: optimizer),
@@ -140,20 +151,26 @@ internal static class BuildCompilation
     {
         var target = options.CompilationOptions.Target;
         bool shared = request.OutputKind == BuildOutputKind.SharedLibrary;
-        if (shared && !target.IsRegisterBytecode && request.OperatingSystem != OperatingSystemKind.Linux)
-            return BuildCompilerOutput.Failure("Native shared libraries require Linux ELF; bytecode libraries require an RBC target.");
+        if (shared && !target.IsRegisterBytecode && request.OperatingSystem is not (OperatingSystemKind.Linux or OperatingSystemKind.Windows))
+            return BuildCompilerOutput.Failure("Native shared libraries require Linux ELF or Windows PE; bytecode libraries require an RBC target.");
         request.CancellationToken.ThrowIfCancellationRequested();
         if (target.IsX86)
         {
             var result = C.StaticLinker.LinkX86(sources, options);
             return Emit(result.Diagnostics.Select(x => x.ToString()), result.Program is null ? null :
-                shared ? result.Program.ToSharedObjectBytes("lib" + request.Module + ".so") : result.Program.ToExecutableBytes());
+                shared ? request.OperatingSystem == OperatingSystemKind.Windows
+                    ? result.Program.ToWindowsDynamicLibraryBytes(request.Module + ".dll")
+                    : result.Program.ToSharedObjectBytes("lib" + request.Module + ".so")
+                    : result.Program.ToExecutableBytes());
         }
         if (target.IsArm)
         {
             var result = C.StaticLinker.LinkArm(sources, options);
             return Emit(result.Diagnostics.Select(x => x.ToString()), result.Program is null ? null :
-                shared ? result.Program.ToSharedObjectBytes("lib" + request.Module + ".so") : result.Program.ToExecutableBytes());
+                shared ? request.OperatingSystem == OperatingSystemKind.Windows
+                    ? result.Program.ToWindowsDynamicLibraryBytes(request.Module + ".dll")
+                    : result.Program.ToSharedObjectBytes("lib" + request.Module + ".so")
+                    : result.Program.ToExecutableBytes());
         }
         if (target.IsRiscV)
         {

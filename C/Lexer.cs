@@ -1175,6 +1175,11 @@ public sealed class Lexer
     private readonly bool _keepTrivia;
     private int _macroExpansionDepth;
     private int _macroExpansionTokenCount;
+    private int _invocationLine;
+
+    // The two stand for the line and the file of where they are used, so their text is made on each use
+    private static readonly MacroInfo LineMacro = new("__LINE__", false, ImmutableArray<string>.Empty, false, null, string.Empty);
+    private static readonly MacroInfo FileMacro = new("__FILE__", false, ImmutableArray<string>.Empty, false, null, string.Empty);
 
     private int _position;
     private bool _atStartOfLine = true;
@@ -1203,6 +1208,8 @@ public sealed class Lexer
         _ordinals = new TokenOrdinals();
         _diagnostics = new List<SyntaxDiagnostic>();
 
+        _macros[LineMacro.Name] = LineMacro;
+        _macros[FileMacro.Name] = FileMacro;
         foreach (var pair in _options.PredefinedMacros)
             DefineObjectMacro(pair.Key, pair.Value);
     }
@@ -1221,6 +1228,7 @@ public sealed class Lexer
         _diagnostics = parent._diagnostics;
         _macroExpansionDepth = parent._macroExpansionDepth + 1;
         _macroExpansionTokenCount = parent._macroExpansionTokenCount;
+        _invocationLine = parent.LineAt(parent._position);
         _isExpansion = true;
         _keepTrivia = keepTrivia;
     }
@@ -1417,8 +1425,16 @@ public sealed class Lexer
 
     private void ExpandObjectLikeMacro(SyntaxToken sourceToken, MacroInfo macro)
     {
-        EnqueueMacroExpansionText(sourceToken, macro, macro.ReplacementText);
+        var replacementText = ReferenceEquals(macro, LineMacro)
+            ? LineAt(sourceToken.Position).ToString(CultureInfo.InvariantCulture)
+            : ReferenceEquals(macro, FileMacro)
+                ? "\"" + (_filePath ?? string.Empty).Replace("\\", "\\\\").Replace("\"", "\\\"") + "\""
+                : macro.ReplacementText;
+        EnqueueMacroExpansionText(sourceToken, macro, replacementText);
     }
+
+    private int LineAt(int position)
+        => _isExpansion ? _invocationLine : 1 + _text.AsSpan(0, Math.Clamp(position, 0, _text.Length)).Count('\n');
 
     private bool TryExpandFunctionLikeMacro(SyntaxToken sourceToken, MacroInfo macro)
     {
@@ -1700,6 +1716,7 @@ public sealed class Lexer
         }
 
         var nested = new Lexer(this, replacementText, _keepTrivia);
+        nested._invocationLine = LineAt(sourceToken.Position);
         var disabled = _disabledMacroNames.Add(macro.Name);
         _macroExpansionDepth++;
         SyntaxToken? last = null;

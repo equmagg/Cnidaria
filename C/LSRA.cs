@@ -7,6 +7,27 @@ using Cnidaria.Cs;
 
 namespace Cnidaria.C;
 
+[Flags]
+internal enum ScratchClass : byte
+{
+    None = 0,
+    General = 1,
+    Floating = 2,
+    All = General | Floating,
+}
+
+/// <summary>What a code generator's emission routines need of the scratch registers the allocator also hands out</summary>
+internal interface IScratchNeeds
+{
+    int BorrowAreaSize { get; }
+    ScratchClass Needs(LirInstruction instruction, LirInstruction? previous);
+    ImmutableHashSet<MachineRegister> Registers(ScratchClass classes);
+    int SpareCount(ScratchClass scratchClass);
+    bool MayFoldLoad(LirInstruction? previous, LirInstruction instruction);
+    bool ReadsRightAfterWrite(LirInstruction instruction);
+    int StackAccessScratch(int spillAreaEnd, bool dynamicStack);
+}
+
 public sealed class LSRAOptions
 {
     public ImmutableArray<MachineRegister> GeneralRegisters { get; }
@@ -91,30 +112,40 @@ internal sealed class LinearScanRegisterAllocator
     private readonly Dictionary<LirVirtualRegister, List<LirVirtualRegister>> _copyPreferences = new();
     private readonly List<int> _callPositions = new();
     private readonly Dictionary<int, Dictionary<LirVirtualRegister, MachineRegister>> _callArgumentTargets = new();
-    private readonly Dictionary<int, ImmutableHashSet<MachineRegister>> _instructionClobbers = new();
+    private readonly ClobberTable _instructionClobbers = new();
+    private readonly Dictionary<int, ScratchClass> _scratchKills = new();
+    private readonly Dictionary<int, LirAddress> _foldableLoadAddresses = new();
     private readonly List<InlineAssemblySite> _inlineAssemblySites = new();
     private readonly Dictionary<MachineRegister, int> _incomingRegisterReleasePositions = new();
     private readonly Dictionary<string, ImmutableArray<MachineRegister>> _incomingParameterRegisters = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, ImmutableArray<AbiLocation>> _incomingParameterLocations = new(StringComparer.Ordinal);
     private readonly Dictionary<LirVirtualRegister, List<MachineRegister>> _abiPreferences = new();
+    private readonly Dictionary<LirVirtualRegister, List<LirVirtualRegister>> _phiWebs = new();
+    private readonly IScratchNeeds? _scratchNeeds;
 
-    private LinearScanRegisterAllocator(LirFunction function, TargetInfo target, LSRAOptions? options)
+    private LinearScanRegisterAllocator(LirFunction function, TargetInfo target, LSRAOptions? options, IScratchNeeds? scratchNeeds)
     {
         _function = function ?? throw new ArgumentNullException(nameof(function));
         _target = target ?? TargetInfo.Default;
         _options = options ?? LSRAOptions.ForTarget(_target);
+        _scratchNeeds = scratchNeeds;
     }
 
-    public static AllocationResult Allocate(LirFunction function, TargetInfo? target = null, LSRAOptions? options = null)
-         => new LinearScanRegisterAllocator(function, target ?? TargetInfo.Default, options).Allocate();
+    public static AllocationResult Allocate(LirFunction function, TargetInfo? target = null, LSRAOptions? options = null,
+        IScratchNeeds? scratchNeeds = null)
+         => new LinearScanRegisterAllocator(function, target ?? TargetInfo.Default, options, scratchNeeds).Allocate();
 
     private AllocationResult Allocate()
     {
         _callPositions.Clear();
         _callArgumentTargets.Clear();
         _instructionClobbers.Clear();
+        _scratchKills.Clear();
+        _foldableLoadAddresses.Clear();
         _inlineAssemblySites.Clear();
         _incomingRegisterReleasePositions.Clear();
         _abiPreferences.Clear();
+        _phiWebs.Clear();
         BuildIncomingParameterRegisters();
         var intervals = BuildIntervals();
         foreach (var interval in intervals.Values)
@@ -130,14 +161,27 @@ internal sealed class LinearScanRegisterAllocator
         var generalRegisters = _options.GeneralRegisters;
         if (HasDynamicStack(_function) && TargetRegisterInfo.FrameBaseRegister(_target) is var frameBase && frameBase != MachineRegister.Invalid)
             generalRegisters = generalRegisters.Remove(frameBase);
-        AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, generalRegisters, allocations, _copyPreferences, _abiPreferences, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
-        AllocateClasses(intervals, new[] { LirRegisterClass.Floating }, _options.FloatingRegisters, allocations, _copyPreferences, _abiPreferences, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
-        AllocateClasses(intervals, new[] { LirRegisterClass.Vector }, _options.VectorRegisters, allocations, _copyPreferences, _abiPreferences, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
+        AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, generalRegisters, allocations, _copyPreferences, _abiPreferences, _phiWebs, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
+        AllocateClasses(intervals, new[] { LirRegisterClass.Floating }, _options.FloatingRegisters, allocations, _copyPreferences, _abiPreferences, _phiWebs, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
+        AllocateClasses(intervals, new[] { LirRegisterClass.Vector }, _options.VectorRegisters, allocations, _copyPreferences, _abiPreferences, _phiWebs, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
 
+        var scratchOccupants = new Dictionary<MachineRegister, List<(int Start, int End, LiveInterval Interval)>>();
+        var managedScratch = _scratchNeeds?.Registers(ScratchClass.All);
         foreach (var interval in intervals.Values.OrderBy(static i => i.Register.Ordinal))
         {
-            if (allocations.ContainsKey(interval.Register))
+            if (allocations.TryGetValue(interval.Register, out var assigned))
+            {
+                if (managedScratch is not null && !assigned.IsSpilled && managedScratch.Contains(assigned.PhysicalRegister))
+                {
+                    if (!scratchOccupants.TryGetValue(assigned.PhysicalRegister, out var occupants))
+                        scratchOccupants.Add(assigned.PhysicalRegister, occupants = new List<(int Start, int End, LiveInterval Interval)>());
+                    foreach (var range in interval.Ranges)
+                        occupants.Add((range.Start, range.End, interval));
+                    if (interval.Ranges.Count == 0)
+                        occupants.Add((interval.Start, interval.Start, interval));
+                }
                 continue;
+            }
 
             if (interval.Register.RegisterClass is LirRegisterClass.Void or LirRegisterClass.Memory)
                 continue;
@@ -149,7 +193,11 @@ internal sealed class LinearScanRegisterAllocator
         foreach (var register in stackPreservedRegisters)
             allocations[register] = allocations[register].WithCallPreservation();
 
-        var frame = LayoutStackFrame(allocations, preservationRegisters);
+        foreach (var occupants in scratchOccupants.Values)
+            occupants.Sort(static (left, right) => left.Start.CompareTo(right.Start));
+        Func<MachineRegister, int, bool> isScratchFree = (register, position) => IsScratchFree(scratchOccupants, register, position);
+
+        var frame = LayoutStackFrame(allocations, preservationRegisters, isScratchFree);
         foreach (var pair in allocations.ToArray())
         {
             if (!pair.Value.NeedsStackSlot || pair.Key.HomeSlot is not null)
@@ -162,7 +210,34 @@ internal sealed class LinearScanRegisterAllocator
         }
 
         callPreservations = BindCallPreservationStackOffsets(callPreservations, allocations);
-        return new AllocationResult(_function, allocations, frame, callPreservations);
+        return new AllocationResult(_function, allocations, frame, callPreservations, _scratchKills, isScratchFree);
+    }
+
+    // Values sharing a register never overlap, so their live ranges there are disjoint and end in the order they start;
+    // one value can live inside another's lifetime hole, which is why the search runs over ranges, not intervals
+    private bool IsScratchFree(Dictionary<MachineRegister, List<(int Start, int End, LiveInterval Interval)>> occupants, MachineRegister register, int position)
+    {
+        if (_instructionClobbers.Clobbers(position, register))
+            return false;
+        if (!occupants.TryGetValue(register, out var ranges))
+            return true;
+        var low = 0;
+        var high = ranges.Count - 1;
+        while (low <= high)
+        {
+            var middle = (low + high) / 2;
+            if (ranges[middle].Start <= position + 1)
+                low = middle + 1;
+            else
+                high = middle - 1;
+        }
+        for (var index = high; index >= 0 && ranges[index].End >= position; index--)
+        {
+            var interval = ranges[index].Interval;
+            if (interval.IsLiveBefore(position) || interval.HasDefinitionAtPosition(position) || interval.HasDefinitionAtPosition(position + 1))
+                return false;
+        }
+        return true;
     }
 
     private Dictionary<LirVirtualRegister, LiveInterval> BuildIntervals()
@@ -187,11 +262,12 @@ internal sealed class LinearScanRegisterAllocator
             var lastUses = new Dictionary<LirVirtualRegister, int>();
             var firstDefs = new Dictionary<LirVirtualRegister, int>();
 
+            LirInstruction? previous = null;
             foreach (var instruction in block.Instructions)
             {
                 var pos = position;
                 position += 2;
-                RecordInstructionClobbers(instruction, pos);
+                RecordInstructionClobbers(instruction, previous, pos);
                 if (instruction.Kind == LirInstructionKind.Call && !IsRiscVVectorIntrinsicCall(instruction))
                 {
                     _callPositions.Add(pos);
@@ -203,18 +279,31 @@ internal sealed class LinearScanRegisterAllocator
                     RecordIncomingRegisterRelease(instruction, pos);
                 RecordCopyPreferences(instruction);
                 RecordAbiPreferences(instruction);
-                VisitInstructionUses(
-                    instruction,
-                    pos,
-                    intervals,
-                    register =>
-                    {
-                        if (!firstUses.ContainsKey(register))
-                            firstUses.Add(register, pos);
-                        lastUses[register] = pos;
-                        if (!defs.Contains(register))
-                            uses.Add(register);
-                    });
+                void OnUse(LirVirtualRegister register)
+                {
+                    if (!firstUses.ContainsKey(register))
+                        firstUses.Add(register, pos);
+                    lastUses[register] = pos;
+                    if (!defs.Contains(register))
+                        uses.Add(register);
+                }
+                VisitInstructionUses(instruction, pos, intervals, OnUse);
+
+                // The x86 emitter may build a load's address where the load's one reader stands
+                if (_scratchNeeds is not null && _scratchNeeds.MayFoldLoad(previous, instruction))
+                {
+                    VisitAddress(previous!.Address!, pos, intervals, OnUse);
+                    _foldableLoadAddresses[pos] = previous!.Address!;
+                }
+
+                // The result is written before the right operand is read, so the two cannot share a register
+                if (_scratchNeeds is not null && UpdatesFirstOperandInPlace(instruction) &&
+                    _scratchNeeds.ReadsRightAfterWrite(instruction) &&
+                    instruction.Operands[1] is { Kind: LirOperandKind.Register, Register: { } right } && ShouldTrack(right))
+                {
+                    Touch(intervals, right, pos + 1, isUse: true);
+                    lastUses[right] = pos + 1;
+                }
 
                 var definitionPosition = DefinitionPosition(instruction, pos);
                 VisitInstructionDefinitions(
@@ -227,6 +316,7 @@ internal sealed class LinearScanRegisterAllocator
                         if (!firstDefs.ContainsKey(register))
                             firstDefs.Add(register, definitionPosition);
                     });
+                previous = instruction;
             }
 
             blockRanges.Add(block, new BlockRange(start, position));
@@ -351,6 +441,7 @@ internal sealed class LinearScanRegisterAllocator
     private void BuildIncomingParameterRegisters()
     {
         _incomingParameterRegisters.Clear();
+        _incomingParameterLocations.Clear();
         var functionType = _function.Symbol?.FunctionType;
         if (functionType is null)
             return;
@@ -371,10 +462,11 @@ internal sealed class LinearScanRegisterAllocator
             }
 
             _incomingParameterRegisters[parameter.Name] = registers.ToImmutable();
+            _incomingParameterLocations[parameter.Name] = locations;
         }
     }
 
-    private void RecordInstructionClobbers(LirInstruction instruction, int position)
+    private void RecordInstructionClobbers(LirInstruction instruction, LirInstruction? previous, int position)
     {
         var clobbers = ImmutableHashSet.CreateBuilder<MachineRegister>();
 
@@ -399,6 +491,7 @@ internal sealed class LinearScanRegisterAllocator
             clobbers.Add(MachineRegister.X13);
         }
 
+        var early = ImmutableHashSet<MachineRegister>.Empty;
         if (TargetRegisterInfo.IsX86(_target) &&
             instruction.Kind == LirInstructionKind.Binary &&
             instruction.Result is not null &&
@@ -417,8 +510,9 @@ internal sealed class LinearScanRegisterAllocator
                      instruction.Operands.Length == 2 &&
                      instruction.Operands[1].Kind != LirOperandKind.Immediate)
             {
-                // A variable shift count has to be in cl
+                // A variable shift count has to be in cl, which goes there before the result is written
                 clobbers.Add(TargetRegisterInfo.X86CounterRegister(_target));
+                early = early.Add(TargetRegisterInfo.X86CounterRegister(_target));
             }
         }
 
@@ -426,8 +520,15 @@ internal sealed class LinearScanRegisterAllocator
         if (TargetRegisterInfo.IsX86(_target) && NeedsX86BlockCopyScratch(instruction))
             clobbers.Add(TargetRegisterInfo.X86AccumulatorRegister(_target));
 
+        if (_scratchNeeds is not null && _scratchNeeds.Needs(instruction, previous) is var needs && needs != ScratchClass.None)
+        {
+            early = early.Union(_scratchNeeds.Registers(needs));
+            clobbers.UnionWith(early);
+            _scratchKills[position] = needs;
+        }
+
         if (clobbers.Count != 0)
-            _instructionClobbers[position] = clobbers.ToImmutable();
+            _instructionClobbers.Add(position, clobbers.ToImmutable(), early);
     }
 
     private bool NeedsX86BlockCopyScratch(LirInstruction instruction)
@@ -476,24 +577,41 @@ internal sealed class LinearScanRegisterAllocator
             var isVariadicUnnamed = signature is not null && signature.IsVariadic && i - 1 >= signature.Parameters.Length;
             var value = CAbi.ClassifyValue(_target, operand.Type, isReturn: false, isVariadicUnnamed);
             var locations = CAbi.AssignArgumentLocations(value, ref cursor, _options.StackArgumentSlotSize);
+            if (operand.Kind == LirOperandKind.Segments)
+            {
+                for (var j = 0; j < operand.Parts.Length; j++)
+                {
+                    if (operand.Parts[j].Register is { } part && ShouldTrack(part))
+                    {
+                        RecordCallArgumentTarget(targets, part, j < locations.Length
+                            ? SingleCompatibleArgumentRegister(ImmutableArray.Create(locations[j]), part.RegisterClass)
+                            : MachineRegister.Invalid);
+                    }
+                }
+                continue;
+            }
             if (operand.Kind != LirOperandKind.Register || operand.Register is null || !ShouldTrack(operand.Register))
                 continue;
 
-            var target = SingleCompatibleArgumentRegister(locations, operand.Register.RegisterClass);
-            if (target == MachineRegister.Invalid)
-            {
-                targets[operand.Register] = MachineRegister.Invalid;
-                continue;
-            }
-
-            if (targets.TryGetValue(operand.Register, out var existing) && existing != target)
-                targets[operand.Register] = MachineRegister.Invalid;
-            else
-                targets[operand.Register] = target;
-            AddAbiPreference(operand.Register, target);
+            RecordCallArgumentTarget(targets, operand.Register, SingleCompatibleArgumentRegister(locations, operand.Register.RegisterClass));
         }
 
         _callArgumentTargets[position] = targets;
+    }
+
+    private void RecordCallArgumentTarget(Dictionary<LirVirtualRegister, MachineRegister> targets, LirVirtualRegister register, MachineRegister target)
+    {
+        if (target == MachineRegister.Invalid)
+        {
+            targets[register] = MachineRegister.Invalid;
+            return;
+        }
+
+        if (targets.TryGetValue(register, out var existing) && existing != target)
+            targets[register] = MachineRegister.Invalid;
+        else
+            targets[register] = target;
+        AddAbiPreference(register, target);
     }
 
     private static MachineRegister SingleCompatibleArgumentRegister(ImmutableArray<AbiLocation> locations, LirRegisterClass registerClass)
@@ -517,8 +635,19 @@ internal sealed class LinearScanRegisterAllocator
         if (instruction.Kind == LirInstructionKind.Parameter && instruction.Result is not null &&
             _incomingParameterRegisters.TryGetValue(instruction.Operator, out var incomingRegisters))
         {
-            foreach (var register in incomingRegisters)
-                AddAbiPreference(instruction.Result, register);
+            if (instruction.Operands.Length == 1 && instruction.Operands[0].Immediate is int segment)
+            {
+                if (_incomingParameterLocations.TryGetValue(instruction.Operator, out var locations) && segment < locations.Length &&
+                    locations[segment].Kind == AbiLocationKind.Register)
+                {
+                    AddAbiPreference(instruction.Result, locations[segment].Register);
+                }
+            }
+            else
+            {
+                foreach (var register in incomingRegisters)
+                    AddAbiPreference(instruction.Result, register);
+            }
         }
 
         if (instruction.Kind == LirInstructionKind.Call && !IsRiscVVectorIntrinsicCall(instruction) && instruction.Result is not null)
@@ -532,11 +661,20 @@ internal sealed class LinearScanRegisterAllocator
             return;
 
         var operand = instruction.Operands[0];
+        var returnType = _function.Symbol?.FunctionType?.ReturnType ?? operand.Type;
+        var returnValue = CAbi.ClassifyValue(_target, returnType, isReturn: true, isVariadicUnnamedArgument: false);
+        if (operand.Kind == LirOperandKind.Segments)
+        {
+            for (var i = 0; i < operand.Parts.Length && i < returnValue.Segments.Length; i++)
+            {
+                if (operand.Parts[i].Register is { } part)
+                    AddAbiPreference(part, CAbi.SegmentReturnRegister(returnValue, i));
+            }
+            return;
+        }
         if (operand.Kind != LirOperandKind.Register || operand.Register is null)
             return;
 
-        var returnType = _function.Symbol?.FunctionType?.ReturnType ?? operand.Type;
-        var returnValue = CAbi.ClassifyValue(_target, returnType, isReturn: true, isVariadicUnnamedArgument: false);
         if (returnValue.PassingKind != AbiPassingKind.Indirect && returnValue.Segments.Length != 0)
             AddAbiPreference(operand.Register, CAbi.ReturnRegister(returnValue.Segments[0], 0));
     }
@@ -857,8 +995,39 @@ internal sealed class LinearScanRegisterAllocator
         foreach (var copy in instruction.ParallelCopies)
         {
             if (copy.Source.Kind == LirOperandKind.Register && copy.Source.Register is not null)
+            {
                 AddCopyPreference(copy.Destination, copy.Source.Register);
+                JoinPhiWeb(copy.Destination, copy.Source.Register);
+            }
         }
+    }
+
+    private void JoinPhiWeb(LirVirtualRegister destination, LirVirtualRegister source)
+    {
+        if (!ShouldTrack(destination) || !ShouldTrack(source) || !AreCoalescableClasses(destination.RegisterClass, source.RegisterClass))
+            return;
+
+        var web = PhiWebOf(destination);
+        var other = PhiWebOf(source);
+        if (ReferenceEquals(web, other))
+            return;
+        if (web.Count < other.Count)
+            (web, other) = (other, web);
+        foreach (var member in other)
+        {
+            web.Add(member);
+            _phiWebs[member] = web;
+        }
+    }
+
+    private List<LirVirtualRegister> PhiWebOf(LirVirtualRegister register)
+    {
+        if (!_phiWebs.TryGetValue(register, out var web))
+        {
+            web = new List<LirVirtualRegister> { register };
+            _phiWebs.Add(register, web);
+        }
+        return web;
     }
 
     // Collapses the move into a two-address operation on x86, and elsewhere keeps a recurrence in
@@ -993,6 +1162,11 @@ internal sealed class LinearScanRegisterAllocator
                 if (operand.Address is not null)
                     VisitAddress(operand.Address, position, intervals, onUse);
                 break;
+
+            case LirOperandKind.Segments:
+                foreach (var part in operand.Parts)
+                    VisitOperand(part, position, intervals, onUse);
+                break;
         }
     }
 
@@ -1064,11 +1238,12 @@ internal sealed class LinearScanRegisterAllocator
         Dictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
         IReadOnlyDictionary<LirVirtualRegister, List<LirVirtualRegister>> copyPreferences,
         IReadOnlyDictionary<LirVirtualRegister, List<MachineRegister>> abiPreferences,
+        IReadOnlyDictionary<LirVirtualRegister, List<LirVirtualRegister>> phiWebs,
         TargetInfo target,
         ImmutableArray<LirRegisterClass> callBoundarySplitClasses,
         IReadOnlyList<int> callPositions,
         IReadOnlyDictionary<int, Dictionary<LirVirtualRegister, MachineRegister>> callArgumentTargets,
-        IReadOnlyDictionary<int, ImmutableHashSet<MachineRegister>> instructionClobbers,
+        ClobberTable instructionClobbers,
         IReadOnlyList<InlineAssemblySite> inlineAssemblySites,
         IReadOnlyDictionary<MachineRegister, int> incomingRegisterReleasePositions)
     {
@@ -1084,6 +1259,9 @@ internal sealed class LinearScanRegisterAllocator
         var active = new List<LiveInterval>();
         var valueNumberPreferredRegisters = new Dictionary<ValueNumber, MachineRegister>();
         var callArgumentRegisters = CallArgumentRegisters(target, registerClasses);
+        bool CrossesCalls(LirVirtualRegister register)
+            => callBoundarySplitClasses.Contains(register.RegisterClass) &&
+               allIntervals.TryGetValue(register, out var other) && IntervalSpansPosition(other, callPositions);
 
         foreach (var interval in intervals)
         {
@@ -1096,7 +1274,7 @@ internal sealed class LinearScanRegisterAllocator
                 continue;
             }
 
-            var reg = PreferredFreeRegister(interval, allowedRegisters, active, allocations, copyPreferences, abiPreferences, valueNumberPreferredRegisters, target, callBoundarySplitClasses.Contains(interval.Register.RegisterClass) && IntervalSpansPosition(interval, callPositions));
+            var reg = PreferredFreeRegister(interval, allowedRegisters, active, allocations, copyPreferences, abiPreferences, phiWebs, valueNumberPreferredRegisters, target, CrossesCalls(interval.Register), CrossesCalls);
             if (reg == MachineRegister.Invalid)
             {
                 SpillAtInterval(interval, active, allocations, valueNumberPreferredRegisters, allowedRegisters);
@@ -1120,7 +1298,7 @@ internal sealed class LinearScanRegisterAllocator
         ImmutableArray<LirRegisterClass> callBoundarySplitClasses,
         IReadOnlyList<int> callPositions,
         IReadOnlyDictionary<int, Dictionary<LirVirtualRegister, MachineRegister>> callArgumentTargets,
-        IReadOnlyDictionary<int, ImmutableHashSet<MachineRegister>> instructionClobbers,
+        ClobberTable instructionClobbers,
         IReadOnlyList<InlineAssemblySite> inlineAssemblySites,
         IReadOnlyDictionary<MachineRegister, int> incomingRegisterReleasePositions)
     {
@@ -1129,6 +1307,7 @@ internal sealed class LinearScanRegisterAllocator
 
         var spansCall = IntervalSpansPosition(interval, callPositions);
         var safeCallArgumentRegister = SafeCallArgumentRegister(interval, callPositions, callArgumentTargets, out var liveBeforeCall);
+        var clobbered = instructionClobbers.Clobbered(interval);
         var canSplitAcrossCalls = callBoundarySplitClasses.Contains(interval.Register.RegisterClass);
         var preferCalleeSaved = canSplitAcrossCalls && spansCall;
         var orderedRegisters = preferCalleeSaved
@@ -1155,7 +1334,7 @@ internal sealed class LinearScanRegisterAllocator
                     continue;
                 }
             }
-            if (IsClobberedAtInstruction(interval, register, instructionClobbers))
+            if (clobbered is not null && clobbered.Contains(register))
                 continue;
 
             var reserved = false;
@@ -1189,22 +1368,50 @@ internal sealed class LinearScanRegisterAllocator
         return builder.ToImmutable();
     }
 
-    private static bool IsClobberedAtInstruction(
-        LiveInterval interval,
-        MachineRegister register,
-        IReadOnlyDictionary<int, ImmutableHashSet<MachineRegister>> instructionClobbers)
+    private sealed class ClobberTable
     {
-        foreach (var pair in instructionClobbers)
+        private readonly List<int> _positions = new();
+        private readonly List<ImmutableHashSet<MachineRegister>> _registers = new();
+        private readonly List<ImmutableHashSet<MachineRegister>> _early = new();
+
+        public void Clear()
         {
-            if (pair.Key < interval.Start)
-                continue;
-            if (pair.Key >= interval.End)
-                continue;
-            if (interval.IsLiveBefore(pair.Key) && pair.Value.Contains(register))
-                return true;
+            _positions.Clear();
+            _registers.Clear();
+            _early.Clear();
         }
 
-        return false;
+        public void Add(int position, ImmutableHashSet<MachineRegister> registers, ImmutableHashSet<MachineRegister> early)
+        {
+            _positions.Add(position);
+            _registers.Add(registers);
+            _early.Add(early);
+        }
+
+        public HashSet<MachineRegister>? Clobbered(LiveInterval interval)
+        {
+            var index = _positions.BinarySearch(Math.Max(0, interval.Start - 1));
+            if (index < 0)
+                index = ~index;
+
+            HashSet<MachineRegister>? clobbered = null;
+            for (; index < _positions.Count && _positions[index] < interval.End; index++)
+            {
+                var position = _positions[index];
+                if (interval.IsLiveBefore(position))
+                    (clobbered ??= new HashSet<MachineRegister>()).UnionWith(_registers[index]);
+                else if (!_early[index].IsEmpty && (interval.HasDefinitionAtPosition(position) || interval.HasDefinitionAtPosition(position + 1)))
+                    (clobbered ??= new HashSet<MachineRegister>()).UnionWith(_early[index]);
+            }
+
+            return clobbered;
+        }
+
+        public bool Clobbers(int position, MachineRegister register)
+        {
+            var index = _positions.BinarySearch(position);
+            return index >= 0 && _registers[index].Contains(register);
+        }
     }
 
     private static bool HasRegisterPreference(
@@ -1364,21 +1571,81 @@ internal sealed class LinearScanRegisterAllocator
         IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
         IReadOnlyDictionary<LirVirtualRegister, List<LirVirtualRegister>> copyPreferences,
         IReadOnlyDictionary<LirVirtualRegister, List<MachineRegister>> abiPreferences,
+        IReadOnlyDictionary<LirVirtualRegister, List<LirVirtualRegister>> phiWebs,
         IReadOnlyDictionary<ValueNumber, MachineRegister> valueNumberPreferredRegisters,
         TargetInfo target,
-        bool preferCalleeSaved)
+        bool preferCalleeSaved,
+        Func<LirVirtualRegister, bool> crossesCalls)
     {
         if (interval.Register.HasFixedRegister && IsFreeRegister(interval, interval.Register.FixedRegister, physicalRegisters, active))
             return interval.Register.FixedRegister;
 
-        if (abiPreferences.TryGetValue(interval.Register, out var preferredRegisters))
+        abiPreferences.TryGetValue(interval.Register, out var preferredRegisters);
+        phiWebs.TryGetValue(interval.Register, out var web);
+
+        // A web shares one register: each member placed in one saves its copy, the ABI register the one at the use
+        var webPlaced = false;
+        if (web is not null)
         {
-            foreach (var preferred in preferredRegisters)
+            Span<int> placed = stackalloc int[256];
+            foreach (var member in web)
             {
-                if (preferCalleeSaved && !TargetRegisterInfo.IsCalleeSaved(target, preferred))
+                if (allocations.TryGetValue(member, out var memberAllocation) && !memberAllocation.IsSpilled)
+                {
+                    placed[(int)memberAllocation.PhysicalRegister]++;
+                    webPlaced = true;
+                }
+            }
+
+            if (webPlaced)
+            {
+                var joined = MachineRegister.Invalid;
+                var joinedScore = 0;
+                foreach (var member in web)
+                {
+                    if (!allocations.TryGetValue(member, out var memberAllocation) || memberAllocation.IsSpilled)
+                        continue;
+                    var candidate = memberAllocation.PhysicalRegister;
+                    var score = placed[(int)candidate] + (preferredRegisters is not null && preferredRegisters.Contains(candidate) ? 1 : 0);
+                    if (score <= joinedScore ||
+                        preferCalleeSaved && !TargetRegisterInfo.IsCalleeSaved(target, candidate) ||
+                        !IsFreeRegister(interval, candidate, physicalRegisters, active))
+                        continue;
+                    joined = candidate;
+                    joinedScore = score;
+                }
+                if (joined != MachineRegister.Invalid)
+                    return joined;
+            }
+            else if (!preferCalleeSaved)
+            {
+                foreach (var member in web)
+                {
+                    if (crossesCalls(member))
+                    {
+                        preferCalleeSaved = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (FreeAbiRegister() is var abiRegister && abiRegister != MachineRegister.Invalid)
+            return abiRegister;
+
+        if (web is not null && !webPlaced)
+        {
+            foreach (var member in web)
+            {
+                if (member == interval.Register || !abiPreferences.TryGetValue(member, out var memberRegisters))
                     continue;
-                if (IsFreeRegister(interval, preferred, physicalRegisters, active))
-                    return preferred;
+                foreach (var preferred in memberRegisters)
+                {
+                    if (preferCalleeSaved && !TargetRegisterInfo.IsCalleeSaved(target, preferred))
+                        continue;
+                    if (IsFreeRegister(interval, preferred, physicalRegisters, active))
+                        return preferred;
+                }
             }
         }
 
@@ -1396,6 +1663,21 @@ internal sealed class LinearScanRegisterAllocator
                 if (IsFreeRegister(interval, preferred, physicalRegisters, active))
                     return preferred;
             }
+
+            for (var i = preferredSources.Count - 1; i >= 0; i--)
+            {
+                var source = preferredSources[i];
+                if (allocations.ContainsKey(source) || !abiPreferences.TryGetValue(source, out var sourceRegisters))
+                    continue;
+                var sourceCrossesCalls = preferCalleeSaved || crossesCalls(source);
+                foreach (var preferred in sourceRegisters)
+                {
+                    if (sourceCrossesCalls && !TargetRegisterInfo.IsCalleeSaved(target, preferred))
+                        continue;
+                    if (IsFreeRegister(interval, preferred, physicalRegisters, active))
+                        return preferred;
+                }
+            }
         }
 
         var valueNumber = interval.Register.ValueNumber;
@@ -1409,7 +1691,30 @@ internal sealed class LinearScanRegisterAllocator
             return valueNumberRegister;
         }
 
+        if (web is not null && !webPlaced && preferCalleeSaved)
+        {
+            foreach (var register in physicalRegisters)
+            {
+                if (TargetRegisterInfo.IsCalleeSaved(target, register) && IsFreeRegister(interval, register, physicalRegisters, active))
+                    return register;
+            }
+        }
+
         return FirstFreeRegister(interval, physicalRegisters, active);
+
+        MachineRegister FreeAbiRegister()
+        {
+            if (preferredRegisters is null)
+                return MachineRegister.Invalid;
+            foreach (var preferred in preferredRegisters)
+            {
+                if (preferCalleeSaved && !TargetRegisterInfo.IsCalleeSaved(target, preferred))
+                    continue;
+                if (IsFreeRegister(interval, preferred, physicalRegisters, active))
+                    return preferred;
+            }
+            return MachineRegister.Invalid;
+        }
     }
 
     private static void RememberValueNumberRegister(
@@ -1690,7 +1995,8 @@ internal sealed class LinearScanRegisterAllocator
 
     private StackFrameMap LayoutStackFrame(
         Dictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
-        ImmutableHashSet<MachineRegister> preservationRegisters)
+        ImmutableHashSet<MachineRegister> preservationRegisters,
+        Func<MachineRegister, int, bool> isScratchFree)
     {
         var offset = 0;
 
@@ -1752,7 +2058,8 @@ internal sealed class LinearScanRegisterAllocator
         }
         var spillAreaSize = checked(offset - spillAreaOffset);
 
-        var parallelCopyTempSize = ComputeParallelCopyTempSize(allocations, spillOffsets);
+        var stackAccessScratch = _scratchNeeds?.StackAccessScratch(offset, dynamicStack) ?? 0;
+        var parallelCopyTempSize = ComputeParallelCopyTempSize(allocations, spillOffsets, isScratchFree, stackAccessScratch, out var mayBorrow);
         offset = AlignUp(offset, _options.StackAlignment);
         var parallelCopyTempOffset = offset;
         offset = checked(offset + parallelCopyTempSize);
@@ -1761,6 +2068,12 @@ internal sealed class LinearScanRegisterAllocator
             offset = AlignUp(offset, _options.SpillSlotAlignment);
         var floatingImmediateTempOffset = offset;
         offset = checked(offset + floatingImmediateTempSize);
+
+        var scratchBorrowSize = mayBorrow ? _scratchNeeds!.BorrowAreaSize : 0;
+        if (scratchBorrowSize != 0)
+            offset = AlignUp(offset, 16);
+        var scratchBorrowOffset = scratchBorrowSize != 0 ? offset : -1;
+        offset = checked(offset + scratchBorrowSize);
 
         var usedRegisters = allocations.Values
             .Where(static a => !a.IsSpilled && a.PhysicalRegister != MachineRegister.Invalid)
@@ -1806,7 +2119,9 @@ internal sealed class LinearScanRegisterAllocator
             stackSlotOffsets,
             spillOffsets,
             savedRegisterOffsets,
-            frameBaseSaveOffset);
+            frameBaseSaveOffset,
+            scratchBorrowOffset,
+            scratchBorrowSize);
     }
 
     private bool RequiresHiddenReturnBuffer()
@@ -1975,20 +2290,11 @@ internal sealed class LinearScanRegisterAllocator
                 var operand = instruction.Operands[i];
                 var isVariadicUnnamed = i - 1 >= signature.Parameters.Length;
                 var value = CAbi.ClassifyValue(_target, operand.Type, isReturn: false, isVariadicUnnamed);
-                if (value.PassingKind == AbiPassingKind.MultiRegister)
+                foreach (var location in CAbi.AssignArgumentLocations(value, ref cursor, _options.StackArgumentSlotSize))
                 {
-                    foreach (var segment in value.Segments)
-                    {
-                        var location = CAbi.AssignSegmentArgumentLocation(segment, ref cursor, _options.StackArgumentSlotSize);
-                        if (isVariadicUnnamed && CAbi.IsFloating(operand.Type) && location.Kind == AbiLocationKind.Register)
-                            return true;
-                    }
-                    continue;
+                    if (isVariadicUnnamed && CAbi.IsFloating(operand.Type) && location.Kind == AbiLocationKind.Register)
+                        return true;
                 }
-
-                var scalarLocation = CAbi.AssignArgumentLocation(value, ref cursor, _options.StackArgumentSlotSize);
-                if (isVariadicUnnamed && CAbi.IsFloating(operand.Type) && scalarLocation.Kind == AbiLocationKind.Register)
-                    return true;
             }
         }
 
@@ -1997,16 +2303,27 @@ internal sealed class LinearScanRegisterAllocator
 
     private int ComputeParallelCopyTempSize(
         IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
-        IReadOnlyDictionary<LirVirtualRegister, int> spillOffsets)
+        IReadOnlyDictionary<LirVirtualRegister, int> spillOffsets,
+        Func<MachineRegister, int, bool> isScratchFree,
+        int stackAccessScratch,
+        out bool mayBorrow)
     {
         var maxSize = 0;
+        var position = 0;
+        mayBorrow = false;
         foreach (var instruction in _function.Blocks.SelectMany(static b => b.Instructions))
         {
+            var instructionPosition = position;
+            position += 2;
+
             if (instruction.Kind == LirInstructionKind.InlineAssembly)
                 maxSize = Math.Max(maxSize, ComputeInlineAssemblyTempSize(instruction));
 
             if (instruction.Kind != LirInstructionKind.ParallelCopy)
+            {
+                mayBorrow = mayBorrow || _scratchNeeds is not null && MayBorrowScratch(instruction, instructionPosition, allocations, isScratchFree, int.MaxValue, stackAccessScratch);
                 continue;
+            }
 
             var physicalCopies = ImmutableArray.CreateBuilder<LirParallelCopy>(instruction.ParallelCopies.Length);
             foreach (var copy in instruction.ParallelCopies)
@@ -2022,6 +2339,9 @@ internal sealed class LinearScanRegisterAllocator
             if (!HasBlockCopyParallelCopy(copies) && CanOrderParallelCopies(copies, allocations, spillOffsets))
                 continue;
 
+            // Through the frame temporaries the copies read into one general scratch register and write out of another
+            mayBorrow = mayBorrow || _scratchNeeds is not null && MayBorrowScratch(instruction, instructionPosition, allocations, isScratchFree, 2, 0);
+
             var size = 0;
             foreach (var copy in copies)
                 size = checked(size + ParallelCopyTempSlotSize(copy));
@@ -2029,6 +2349,78 @@ internal sealed class LinearScanRegisterAllocator
         }
 
         return maxSize;
+    }
+
+    // The emitter borrows only past the spares and every free home of a class, a spilled value needing at most one
+    private bool MayBorrowScratch(
+        LirInstruction instruction,
+        int position,
+        IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
+        Func<MachineRegister, int, bool> isScratchFree,
+        int roleLimit,
+        int stackAccessScratch)
+    {
+        var general = 0;
+        var vector = 0;
+        void Count(LirVirtualRegister? register)
+        {
+            if (register is null || !allocations.TryGetValue(register, out var allocation) || !allocation.IsSpilled)
+                return;
+            if (register.RegisterClass is LirRegisterClass.Floating or LirRegisterClass.Vector)
+                vector++;
+            else
+                general++;
+        }
+        void CountOperand(LirOperand operand)
+        {
+            Count(operand.Register);
+            if (operand.Address is not null)
+                CountAddress(operand.Address);
+            foreach (var part in operand.Parts)
+                CountOperand(part);
+        }
+        void CountAddress(LirAddress address)
+        {
+            if (address.BaseOperand is not null)
+                CountOperand(address.BaseOperand);
+            if (address.Index is not null)
+                CountOperand(address.Index);
+            if (address.BaseAddress is not null)
+                CountAddress(address.BaseAddress);
+        }
+
+        Count(instruction.Result);
+        foreach (var operand in instruction.Operands)
+            CountOperand(operand);
+        if (instruction.Address is not null)
+            CountAddress(instruction.Address);
+        foreach (var copy in instruction.ParallelCopies)
+        {
+            Count(copy.Destination);
+            CountOperand(copy.Source);
+        }
+
+        general = Math.Min(general, roleLimit);
+        vector = Math.Min(vector, roleLimit);
+        if (_foldableLoadAddresses.TryGetValue(position, out var foldedAddress))
+            CountAddress(foldedAddress);
+        if (general + vector != 0)
+            general += stackAccessScratch;
+        var needs = _scratchNeeds!;
+        var kills = _scratchKills.TryGetValue(position, out var killed) ? killed : ScratchClass.None;
+        return (kills & ScratchClass.General) == 0 && general > needs.SpareCount(ScratchClass.General) + FreeScratch(ScratchClass.General) ||
+            (kills & ScratchClass.Floating) == 0 && vector > needs.SpareCount(ScratchClass.Floating) + FreeScratch(ScratchClass.Floating);
+
+        int FreeScratch(ScratchClass scratchClass)
+        {
+            var free = 0;
+            foreach (var register in needs.Registers(scratchClass))
+            {
+                if (isScratchFree(register, position))
+                    free++;
+            }
+            return free;
+        }
     }
 
     private int ComputeInlineAssemblyTempSize(LirInstruction instruction)
@@ -2327,6 +2719,7 @@ internal sealed class LinearScanRegisterAllocator
         public int End { get; set; }
         public MachineRegister PhysicalRegister { get; set; }
         public int RegisterCount { get; set; } = 1;
+        public IReadOnlyList<LiveRange> Ranges => _ranges;
 
         /// <summary>Tests whether the assignment of this interval covers a physical register</summary>
         public bool Occupies(MachineRegister register)
@@ -2512,6 +2905,54 @@ internal readonly struct PhysicalStorageKey : IEquatable<PhysicalStorageKey>
     public override int GetHashCode() => HashCode.Combine(_registerPlusOne, _stackOffsetPlusOne);
 }
 
+/// <summary>Orders moves into distinct registers; a step with no move index breaks a cycle through a scratch</summary>
+internal static class RegisterMoveSequencer
+{
+    public static ImmutableArray<(int Move, MachineRegister From, MachineRegister To)> Order(
+        IReadOnlyList<MachineRegister> destinations,
+        IReadOnlyList<MachineRegister> sources,
+        Func<MachineRegister, MachineRegister> scratchFor)
+    {
+        var current = sources.ToArray();
+        var pending = new List<int>();
+        for (var i = 0; i < destinations.Count; i++)
+        {
+            if (current[i] != MachineRegister.Invalid && current[i] != destinations[i])
+                pending.Add(i);
+        }
+
+        var steps = ImmutableArray.CreateBuilder<(int Move, MachineRegister From, MachineRegister To)>();
+        while (pending.Count != 0)
+        {
+            var ready = pending.FindIndex(i => !pending.Exists(j => j != i && current[j] == destinations[i]));
+            if (ready >= 0)
+            {
+                var move = pending[ready];
+                steps.Add((move, current[move], destinations[move]));
+                pending.RemoveAt(ready);
+                continue;
+            }
+
+            var blocked = destinations[pending[0]];
+            var scratch = scratchFor(blocked);
+            steps.Add((-1, blocked, scratch));
+            foreach (var move in pending)
+            {
+                if (current[move] == blocked)
+                    current[move] = scratch;
+            }
+        }
+
+        for (var i = 0; i < destinations.Count; i++)
+        {
+            if (sources[i] == MachineRegister.Invalid)
+                steps.Add((i, MachineRegister.Invalid, destinations[i]));
+        }
+
+        return steps.ToImmutable();
+    }
+}
+
 internal static class ParallelCopySequencer
 {
     /// <summary>Orders the copies so each one runs before whichever copy overwrites the storage it reads</summary>
@@ -2591,6 +3032,8 @@ internal sealed class AllocationResult
 {
     private readonly IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> _allocations;
     private readonly IReadOnlyDictionary<int, ImmutableArray<CallPreservation>> _callPreservations;
+    private readonly IReadOnlyDictionary<int, ScratchClass> _scratchKills;
+    private readonly Func<MachineRegister, int, bool>? _isScratchFree;
 
     public LirFunction Function { get; }
     public StackFrameMap Frame { get; }
@@ -2602,11 +3045,15 @@ internal sealed class AllocationResult
         LirFunction function,
         IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
         StackFrameMap frame,
-        IReadOnlyDictionary<int, ImmutableArray<CallPreservation>>? callPreservations = null)
+        IReadOnlyDictionary<int, ImmutableArray<CallPreservation>>? callPreservations = null,
+        IReadOnlyDictionary<int, ScratchClass>? scratchKills = null,
+        Func<MachineRegister, int, bool>? isScratchFree = null)
     {
+        _isScratchFree = isScratchFree;
         Function = function ?? throw new ArgumentNullException(nameof(function));
         _allocations = allocations ?? throw new ArgumentNullException(nameof(allocations));
         _callPreservations = callPreservations ?? ImmutableDictionary<int, ImmutableArray<CallPreservation>>.Empty;
+        _scratchKills = scratchKills ?? ImmutableDictionary<int, ScratchClass>.Empty;
         Frame = frame ?? throw new ArgumentNullException(nameof(frame));
         UsedPhysicalRegisters = allocations.Values
             .Where(static a => !a.IsSpilled && a.PhysicalRegister != MachineRegister.Invalid)
@@ -2621,6 +3068,12 @@ internal sealed class AllocationResult
         => _allocations.TryGetValue(register, out var allocation)
             ? allocation
             : throw new KeyNotFoundException("No physical allocation for " + register.Name + ".");
+
+    public ScratchClass GetScratchKills(int position)
+        => _scratchKills.TryGetValue(position, out var kills) ? kills : ScratchClass.None;
+
+    public bool IsScratchFree(MachineRegister register, int position)
+        => _isScratchFree?.Invoke(register, position) ?? false;
 
     public bool TryGetAllocation(LirVirtualRegister register, out VirtualRegisterAllocation allocation)
         => _allocations.TryGetValue(register, out allocation!);
@@ -2929,6 +3382,8 @@ internal sealed class StackFrameMap
     public bool HasHiddenReturnBuffer => HiddenReturnBufferOffset >= 0;
     public int FrameBaseSaveOffset { get; }
     public bool HasDynamicStack => FrameBaseSaveOffset >= 0;
+    public int ScratchBorrowOffset { get; }
+    public int ScratchBorrowSize { get; }
     public IReadOnlyDictionary<LirStackSlot, int> StackSlotOffsets { get; }
     public IReadOnlyDictionary<LirVirtualRegister, int> SpillOffsets { get; }
     public IReadOnlyDictionary<MachineRegister, int> SavedRegisterOffsets { get; }
@@ -2955,10 +3410,14 @@ internal sealed class StackFrameMap
         IReadOnlyDictionary<LirStackSlot, int> stackSlotOffsets,
         IReadOnlyDictionary<LirVirtualRegister, int> spillOffsets,
         IReadOnlyDictionary<MachineRegister, int> savedRegisterOffsets,
-        int frameBaseSaveOffset = -1)
+        int frameBaseSaveOffset = -1,
+        int scratchBorrowOffset = -1,
+        int scratchBorrowSize = 0)
     {
         FrameSize = frameSize;
         FrameBaseSaveOffset = frameBaseSaveOffset;
+        ScratchBorrowOffset = scratchBorrowOffset;
+        ScratchBorrowSize = scratchBorrowSize;
         FrameAlignment = frameAlignment <= 0 ? 1 : frameAlignment;
         OutgoingArgumentAreaOffset = outgoingArgumentAreaOffset;
         OutgoingArgumentAreaSize = outgoingArgumentAreaSize;
@@ -2981,3 +3440,10 @@ internal sealed class StackFrameMap
         SavedRegisterOffsets = savedRegisterOffsets ?? throw new ArgumentNullException(nameof(savedRegisterOffsets));
     }
 }
+
+internal readonly record struct NativeUnwindInfo(
+    string Symbol,
+    int FrameSize,
+    int ReturnAddressOffset,
+    int FramePointerOffset,
+    ImmutableArray<(MachineRegister Register, int Offset, int Size)> SavedRegisters);

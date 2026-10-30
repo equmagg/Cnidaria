@@ -174,8 +174,10 @@ public sealed class Binder
             BindVariableLengths(type);
             ValidateVariablyModifiedDeclarator(declarator, symbol, specifiers.StorageClass, type, scope);
 
+            var lengthFromItems = declarator.Initializer is InitializerListSyntax && type.Type is ArrayType &&
+                DeclaratorTypeBuilder.Build(declarator.Declarator, specifiers.BaseType, _types, scope).Type is ArrayType { Length: null };
             var initializer = declarator.Initializer is not null
-                ? BindInitializer(declarator.Initializer, type)
+                ? BindInitializer(declarator.Initializer, type, lengthFromItems)
                 : null;
 
             ValidateExplicitRegisterDeclarator(declarator, symbol, specifiers.StorageClass, type, scope);
@@ -232,31 +234,12 @@ public sealed class Binder
             Report("Invalid or unsupported explicit register name '" + declarator.ExplicitRegisterName + "'.", span);
     }
 
-    private BoundInitializer BindInitializer(InitializerSyntax syntax, QualifiedType targetType)
+    private BoundInitializer BindInitializer(InitializerSyntax syntax, QualifiedType targetType, bool lengthFromItems = false)
     {
         switch (syntax)
         {
             case ExpressionInitializerSyntax expressionInitializer:
-                {
-                    var expression = BindExpression(expressionInitializer.Expression);
-                    if (IsNarrowStringArrayInitializer(targetType, expression))
-                        return new BoundExpressionInitializer(expressionInitializer, targetType, expression);
-
-                    expression = ApplyDefaultConversions(expression);
-
-                    if (!targetType.IsError && !expression.Type.IsError && !CanConvert(expression.Type, targetType))
-                    {
-                        Report(
-                            $"Cannot initialize object of type '{targetType.ToDisplayString()}' with expression of type '{expression.Type.ToDisplayString()}'.",
-                            SpanOf(expressionInitializer.Expression));
-                    }
-                    else
-                    {
-                        expression = ConvertImplicitValue(expression, targetType);
-                    }
-
-                    return new BoundExpressionInitializer(expressionInitializer, targetType, expression);
-                }
+                return BindExpressionInitializer(expressionInitializer, BindExpression(expressionInitializer.Expression), targetType);
 
             case InitializerListSyntax initializerList:
                 {
@@ -264,26 +247,8 @@ public sealed class Binder
                     if (TryGetBracedNarrowStringInitializer(targetType, initializerList, out var bracedString))
                         return BindInitializer(bracedString, targetType);
 
-                    var items = ImmutableArray.CreateBuilder<BoundInitializerListItem>();
-                    int nextField = 0;
-                    // The scope is only in reach here, so the element a designator names is resolved now
-                    long nextElement = targetType.Type is ArrayType ? 0 : -1;
-
-                    foreach (var item in initializerList.Items)
-                    {
-                        if (nextElement >= 0 && item.Designators.Length != 0)
-                            nextElement = BindArrayDesignatorIndex(item.Designators);
-
-                        var elementIndex = nextElement;
-                        if (nextElement >= 0)
-                            nextElement++;
-
-                        var itemTargetType = GetInitializerItemTargetType(targetType, item, ref nextField);
-                        var boundItemInitializer = BindInitializer(item.Initializer, itemTargetType);
-                        items.Add(new BoundInitializerListItem(item, boundItemInitializer, elementIndex));
-                    }
-
-                    return new BoundInitializerList(initializerList, targetType, items.ToImmutable());
+                    var index = 0;
+                    return BindInitializerItems(initializerList, targetType, ref index, braced: true, lengthFromItems, firstExpression: null);
                 }
 
             default:
@@ -291,30 +256,129 @@ public sealed class Binder
         }
     }
 
+    private BoundExpressionInitializer BindExpressionInitializer(ExpressionInitializerSyntax syntax, BoundExpression expression, QualifiedType targetType)
+    {
+        if (IsNarrowStringArrayInitializer(targetType, expression))
+            return new BoundExpressionInitializer(syntax, targetType, expression);
+
+        expression = ApplyDefaultConversions(expression);
+
+        if (!targetType.IsError && !expression.Type.IsError && !CanConvert(expression.Type, targetType))
+        {
+            Report(
+                $"Cannot initialize object of type '{targetType.ToDisplayString()}' with expression of type '{expression.Type.ToDisplayString()}'.",
+                SpanOf(syntax.Expression));
+        }
+        else
+        {
+            expression = ConvertImplicitValue(expression, targetType);
+        }
+
+        return new BoundExpressionInitializer(syntax, targetType, expression);
+    }
+
+    /// <summary>Binds items from the cursor on; without braces of its own an aggregate takes only as many as it has members</summary>
+    private BoundInitializerList BindInitializerItems(
+        InitializerListSyntax syntax,
+        QualifiedType targetType,
+        ref int index,
+        bool braced,
+        bool lengthFromItems,
+        BoundExpression? firstExpression)
+    {
+        var items = ImmutableArray.CreateBuilder<BoundInitializerListItem>();
+        var start = index;
+        int nextField = 0;
+        // The scope is only in reach here, so the element a designator names is resolved now
+        long nextElement = targetType.Type is ArrayType ? 0 : -1;
+
+        while (index < syntax.Items.Length)
+        {
+            var item = syntax.Items[index];
+            // The designators of the item that opened an elided aggregate named that aggregate, not a member of it
+            var designated = item.Designators.Length != 0 && (braced || index != start);
+            if (!braced && (designated || IsInitializerFilled(targetType, nextField, nextElement, items.Count)))
+                break;
+
+            if (nextElement >= 0 && designated)
+                nextElement = BindArrayDesignatorIndex(item.Designators);
+
+            var elementIndex = nextElement;
+            if (nextElement >= 0)
+                nextElement++;
+
+            var itemTargetType = designated
+                ? GetInitializerItemTargetType(targetType, item, ref nextField)
+                : GetPositionalItemTargetType(targetType, ref nextField);
+            var designators = designated ? default : ImmutableArray<DesignatorSyntax>.Empty;
+
+            if (item.Initializer is ExpressionInitializerSyntax expressionSyntax)
+            {
+                var expression = index == start && firstExpression is not null ? firstExpression : BindExpression(expressionSyntax.Expression);
+                if (IsElidedAggregate(itemTargetType, expression))
+                {
+                    var opened = index;
+                    var elided = BindInitializerItems(syntax, itemTargetType, ref index, braced: false, lengthFromItems: false, expression);
+                    if (index != opened)
+                    {
+                        if (braced && lengthFromItems)
+                        {
+                            Report("Brace elision is not supported in an array whose size comes from its initializer.", SpanOf(expressionSyntax.Expression));
+                            lengthFromItems = false;
+                        }
+                        items.Add(new BoundInitializerListItem(item, elided, elementIndex, designators));
+                        continue;
+                    }
+                }
+
+                items.Add(new BoundInitializerListItem(item, BindExpressionInitializer(expressionSyntax, expression, itemTargetType), elementIndex, designators));
+            }
+            else
+            {
+                items.Add(new BoundInitializerListItem(item, BindInitializer(item.Initializer, itemTargetType), elementIndex, designators));
+            }
+            index++;
+        }
+
+        return new BoundInitializerList(syntax, targetType, items.ToImmutable());
+    }
+
+    private bool IsElidedAggregate(QualifiedType targetType, BoundExpression expression)
+    {
+        if (expression.Type.IsError)
+            return false;
+
+        return targetType.Type switch
+        {
+            ArrayType => !IsNarrowStringArrayInitializer(targetType, expression),
+            TagType { Symbol.TagKind: TagKind.Struct or TagKind.Union } tag =>
+                expression.Type.Type is not TagType source || !ReferenceEquals(source.Symbol, tag.Symbol),
+            _ => false,
+        };
+    }
+
+    private static bool IsInitializerFilled(QualifiedType targetType, int nextField, long nextElement, int count)
+    {
+        switch (targetType.Type)
+        {
+            case ArrayType arrayType:
+                return arrayType.Length is long length && nextElement >= length;
+
+            case TagType { Symbol.TagKind: TagKind.Struct } structTagType:
+                var fields = structTagType.Symbol.Fields;
+                while (nextField < fields.Length && fields[nextField].IsUnnamedBitField)
+                    nextField++;
+                return nextField >= fields.Length;
+
+            default:
+                return count != 0;
+        }
+    }
+
     private QualifiedType GetInitializerItemTargetType(QualifiedType targetType, InitializerListItemSyntax item, ref int nextField)
     {
         if (item.Designators.IsDefaultOrEmpty)
-        {
-            switch (targetType.Type)
-            {
-                case ArrayType arrayType:
-                    return arrayType.ElementType;
-
-                case TagType structTagType when structTagType.Symbol.TagKind == TagKind.Struct:
-                    if (nextField < structTagType.Symbol.Fields.Length)
-                        return structTagType.Symbol.Fields[nextField++].Type;
-
-                    return ErrorType;
-
-                case TagType unionTagType when unionTagType.Symbol.TagKind == TagKind.Union:
-                    return unionTagType.Symbol.Fields.Length != 0
-                        ? unionTagType.Symbol.Fields[0].Type
-                        : ErrorType;
-
-                default:
-                    return targetType;
-            }
-        }
+            return GetPositionalItemTargetType(targetType, ref nextField);
 
         if (targetType.Type is TagType rootTagType &&
             rootTagType.Symbol.TagKind == TagKind.Struct &&
@@ -363,6 +427,30 @@ public sealed class Binder
         }
 
         return itemTargetType;
+    }
+
+    private QualifiedType GetPositionalItemTargetType(QualifiedType targetType, ref int nextField)
+    {
+        switch (targetType.Type)
+        {
+            case ArrayType arrayType:
+                return arrayType.ElementType;
+
+            case TagType structTagType when structTagType.Symbol.TagKind == TagKind.Struct:
+                var fields = structTagType.Symbol.Fields;
+                while (nextField < fields.Length && fields[nextField].IsUnnamedBitField)
+                    nextField++;
+                if (nextField < fields.Length)
+                    return fields[nextField++].Type;
+
+                return ErrorType;
+
+            case TagType unionTagType when unionTagType.Symbol.TagKind == TagKind.Union:
+                return unionTagType.Symbol.Fields.FirstOrDefault(static field => !field.IsUnnamedBitField)?.Type ?? ErrorType;
+
+            default:
+                return targetType;
+        }
     }
 
     /// <summary>Returns the designated element, or -1 when the index is not a constant that folds</summary>
@@ -1339,11 +1427,16 @@ public sealed class Binder
             case SyntaxKind.AmpersandToken:
             case SyntaxKind.PipeToken:
             case SyntaxKind.HatToken:
+                if (!IsIntegerType(left.Type) || !IsIntegerType(right.Type))
+                    Report($"Bitwise operator '{operatorToken.Text}' requires integer operands.", operatorToken.Span);
+                return UsualArithmeticConversion(left.Type, right.Type);
+
+            // A shift has the promoted type of its left operand alone (C11 6.5.7p3)
             case SyntaxKind.LessThanLessThanToken:
             case SyntaxKind.GreaterThanGreaterThanToken:
                 if (!IsIntegerType(left.Type) || !IsIntegerType(right.Type))
                     Report($"Bitwise operator '{operatorToken.Text}' requires integer operands.", operatorToken.Span);
-                return UsualArithmeticConversion(left.Type, right.Type);
+                return IsIntegerType(left.Type) ? IntegerPromote(left.Type) : UsualArithmeticConversion(left.Type, right.Type);
 
             case SyntaxKind.CommaToken:
                 return right.Type;
@@ -1513,7 +1606,7 @@ public sealed class Binder
             Report("A compound literal cannot have a variable length array type.", syntax.OpenParenToken.Span);
 
         var initializerList = syntax.InitializerList is not null
-            ? (BoundInitializerList)BindInitializer(syntax.InitializerList, type)
+            ? (BoundInitializerList)BindInitializer(syntax.InitializerList, type, lengthFromItems: type.Type is ArrayType { Length: null })
             : null;
 
         return new BoundCompoundLiteralExpression(

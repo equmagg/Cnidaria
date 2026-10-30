@@ -1528,10 +1528,17 @@ namespace Cnidaria.Cs
                 if (operand.Kind != GenTreeKind.DefaultValue || operand.Operands.Length != 0)
                     return false;
 
+                // An aggregate is zeroed where it lives rather than through a zeroed copy
                 return parent.Kind switch
                 {
                     GenTreeKind.StoreField => operandIndex == 1,
                     GenTreeKind.StoreStaticField => operandIndex == 0,
+                    GenTreeKind.StoreIndirect => operandIndex == 1 && operand.StackKind == GenStackKind.Value,
+                    GenTreeKind.StoreLocal or GenTreeKind.StoreArg or GenTreeKind.StoreTemp =>
+                        operandIndex == 0 &&
+                        operand.StackKind == GenStackKind.Value &&
+                        parent.LocalDescriptor is GenLocalDescriptor local &&
+                        local.HasMemoryAlias,
                     _ => false,
                 };
             }

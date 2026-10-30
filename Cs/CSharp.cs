@@ -1432,7 +1432,11 @@ public static class CSharp
                     CodeImage linked = RegisterBytecodeLinker.Link(register, bytecodeLibraries ?? Array.Empty<RegisterBytecodeLibrary>());
                     return (SerializeRegisterRunnableApplication(module, linked.ToExecutableBytes()), diagnostics);
                 }
-                if (neededLibraries is { Count: > 0 })
+                if (neededLibraries is { Count: > 0 } && target.OperatingSystem == OperatingSystemKind.Windows)
+                {
+                    executable = output.ToExecutableBytes();
+                }
+                else if (neededLibraries is { Count: > 0 })
                 {
                     if (target.OperatingSystem != OperatingSystemKind.Linux)
                         throw new NotSupportedException("NativeReference executable linking not supported by the target.");

@@ -3770,13 +3770,17 @@ namespace Cnidaria.Cs
 
             return new[] { first, second, third };
         }
-        private TypeSyntax ParseType()
+        private TypeSyntax ParseType() => ParseType(mayEndExpression: false);
+        private TypeSyntax ParseTypeAtExpressionEnd() => ParseType(mayEndExpression: true);
+        // After 'is' and 'as' a '?' followed by an expression belongs to a conditional
+        private TypeSyntax ParseType(bool mayEndExpression)
         {
             using var __ = _ctx.Push(ParseContext.Type);
             TypeSyntax t = ParseTypeCore();
             while (true)
             {
-                if (_tokens.CurrentKind == SyntaxKind.QuestionToken)
+                if (_tokens.CurrentKind == SyntaxKind.QuestionToken &&
+                    !(mayEndExpression && CanStartExpression(_tokens.Peek(1))))
                 {
                     var q = _tokens.EatToken();
                     t = new NullableTypeSyntax(t, q);
@@ -4285,7 +4289,7 @@ namespace Cnidaria.Cs
                 ExpressionSyntax right;
                 if (op.Kind == SyntaxKind.AsKeyword)
                 {
-                    right = ParseType();
+                    right = ParseTypeAtExpressionEnd();
                 }
                 else
                 {
@@ -5849,7 +5853,7 @@ namespace Cnidaria.Cs
 
             var resetPoint = GetResetPoint();
             if (TryParse(
-                parse: ParseType,
+                parse: ParseTypeAtExpressionEnd,
                 out TypeSyntax parsedType,
                 tempContext: ParseContext.Type,
                 requireProgress: true,
@@ -6245,7 +6249,9 @@ namespace Cnidaria.Cs
                    IsCurrentContextual(SyntaxKind.OrKeyword);
         }
         private bool EndsPatternOperand(int constantPrecedence)
-            => constantPrecedence > 0 && SyntaxFacts.GetBinaryOperatorPrecedence(_tokens.CurrentKind) is > 0 and var precedence && precedence <= constantPrecedence;
+            => constantPrecedence > 0 &&
+               (_tokens.CurrentKind == SyntaxKind.QuestionToken ||
+                SyntaxFacts.GetBinaryOperatorPrecedence(_tokens.CurrentKind) is > 0 and var precedence && precedence <= constantPrecedence);
         private bool IsDefiniteTypePattern(TypeSyntax type)
         {
             if (TypeDefinitelyNotExpression(type))
@@ -6606,6 +6612,10 @@ namespace Cnidaria.Cs
 
             return true;
         }
+        private static bool CanStartExpression(SyntaxToken t) =>
+            IsStartOfUnaryExpression(t) ||
+            IsPredefinedTypeKeyword(t.Kind) ||
+            t.Kind is SyntaxKind.DefaultKeyword or SyntaxKind.CheckedKeyword or SyntaxKind.UncheckedKeyword or SyntaxKind.OpenBracketToken;
         private static bool IsStartOfUnaryExpression(SyntaxToken t)
         {
             if (t.Kind == SyntaxKind.EndOfFileToken)

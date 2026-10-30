@@ -1118,9 +1118,191 @@ namespace System
     }
     public abstract class Enum : ValueType
     {
+        /// <summary>Character used to separate flag enum values when formatted in a list.</summary>
+        private const char EnumSeparatorChar = ',';
+
+        internal static EnumInfo GetEnumInfo(RuntimeType enumType, bool getNames = true)
+        {
+            var runtimeTypeInfo = enumType.GetRuntimeTypeInfo();
+            if (runtimeTypeInfo.GenericCache is EnumInfo info)
+                return info;
+            return Internal.Reflection.Augments.ReflectionAugments.CreateAndCacheEnumInfo(runtimeTypeInfo);
+        }
+
+        internal static EnumInfo<TStorage> GetEnumInfo<TStorage>(RuntimeType enumType, bool getNames = true)
+            where TStorage : struct, INumber<TStorage>
+        {
+            var runtimeTypeInfo = enumType.GetRuntimeTypeInfo();
+            if (runtimeTypeInfo.GenericCache is EnumInfo<TStorage> info)
+                return info;
+            return (EnumInfo<TStorage>)Internal.Reflection.Augments.ReflectionAugments.CreateAndCacheEnumInfo(runtimeTypeInfo);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe string? GetNameInlined<TStorage>(EnumInfo<TStorage> enumInfo, TStorage value)
+            where TStorage : struct, INumber<TStorage>
+        {
+            string[] names = enumInfo.Names;
+
+            // If the values are known to be sequential starting from 0, then we can simply compare the value
+            // against the length of the array.  The value matches iff it's in-bounds, and if it is, the value
+            // in the array is where the corresponding name is stored.
+            if (enumInfo.ValuesAreSequentialFromZero)
+            {
+                if (sizeof(TStorage) <= sizeof(uint))
+                {
+                    // Special-case types types that are <= sizeof(int), as we can then eliminate a bounds check on the array.
+                    uint uint32Value = uint.CreateTruncating(value);
+                    if (uint32Value < (uint)names.Length)
+                    {
+                        return names[uint32Value];
+                    }
+                }
+                else
+                {
+                    // Handle the remaining types.
+                    if (ulong.CreateTruncating(value) < (ulong)names.Length)
+                    {
+                        return names[uint.CreateTruncating(value)];
+                    }
+                }
+            }
+            else
+            {
+                // Search for the value in the array of values. If we find a non-negative index,
+                // that's the location of the corresponding name in the names array.
+                int index = FindDefinedIndex(enumInfo.Values, value);
+                if ((uint)index < (uint)names.Length)
+                {
+                    return names[index];
+                }
+            }
+
+            // Return null so the caller knows no individual named value could be found.
+            return null;
+        }
+
         public bool HasFlag(Enum flag)
         {
-            return false;
+            ArgumentNullException.ThrowIfNull(flag);
+
+            if (GetType() != flag.GetType() && !GetType().IsEquivalentTo(flag.GetType()))
+                throw new ArgumentException(SR.Format(SR.Argument_EnumTypeDoesNotMatch, flag.GetType(), GetType()));
+
+            ref byte pThisValue = ref this.GetRawData();
+            ref byte pFlagsValue = ref flag.GetRawData();
+
+            switch (InternalGetCorElementType())
+            {
+                case CorElementType.ELEMENT_TYPE_I1:
+                case CorElementType.ELEMENT_TYPE_U1:
+                    {
+                        byte flagsValue = pFlagsValue;
+                        return (pThisValue & flagsValue) == flagsValue;
+                    }
+
+                case CorElementType.ELEMENT_TYPE_I2:
+                case CorElementType.ELEMENT_TYPE_U2:
+                    {
+                        ushort flagsValue = Unsafe.As<byte, ushort>(ref pFlagsValue);
+                        return (Unsafe.As<byte, ushort>(ref pThisValue) & flagsValue) == flagsValue;
+                    }
+
+                case CorElementType.ELEMENT_TYPE_I4:
+                case CorElementType.ELEMENT_TYPE_U4:
+                    {
+                        uint flagsValue = Unsafe.As<byte, uint>(ref pFlagsValue);
+                        return (Unsafe.As<byte, uint>(ref pThisValue) & flagsValue) == flagsValue;
+                    }
+
+                case CorElementType.ELEMENT_TYPE_I8:
+                case CorElementType.ELEMENT_TYPE_U8:
+                    {
+                        ulong flagsValue = Unsafe.As<byte, ulong>(ref pFlagsValue);
+                        return (Unsafe.As<byte, ulong>(ref pThisValue) & flagsValue) == flagsValue;
+                    }
+
+#if RARE_ENUMS
+                case CorElementType.ELEMENT_TYPE_BOOLEAN:
+                    goto case CorElementType.ELEMENT_TYPE_U1;
+
+                case CorElementType.ELEMENT_TYPE_CHAR:
+                    goto case CorElementType.ELEMENT_TYPE_U2;
+
+                case CorElementType.ELEMENT_TYPE_R4:
+                    goto case CorElementType.ELEMENT_TYPE_U4;
+
+                case CorElementType.ELEMENT_TYPE_R8:
+                    goto case CorElementType.ELEMENT_TYPE_U8;
+
+                case CorElementType.ELEMENT_TYPE_I:
+                case CorElementType.ELEMENT_TYPE_U:
+#if TARGET_32BIT
+                    goto case CorElementType.ELEMENT_TYPE_U4;
+#else
+                    goto case CorElementType.ELEMENT_TYPE_U8;
+#endif
+#endif
+
+                default:
+                    return false;
+            }
+        }
+
+        /// <summary>Returns a <see cref="bool"/> telling whether a given integral value exists in a specified enumeration.</summary>
+        /// <typeparam name="TEnum">The type of the enumeration.</typeparam>
+        /// <param name="value">The value in <typeparamref name="TEnum"/>.</param>
+        /// <returns><see langword="true"/> if a given integral value exists in a specified enumeration; <see langword="false"/>, otherwise.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe bool IsDefined<TEnum>(TEnum value) where TEnum : struct, Enum
+        {
+            RuntimeType rt = (RuntimeType)typeof(TEnum);
+            Type underlyingType = typeof(TEnum).GetEnumUnderlyingType();
+
+            if (underlyingType == typeof(sbyte) || underlyingType == typeof(byte)) return IsDefinedPrimitive(rt, *(byte*)&value);
+            if (underlyingType == typeof(short) || underlyingType == typeof(ushort)) return IsDefinedPrimitive(rt, *(ushort*)&value);
+            if (underlyingType == typeof(int) || underlyingType == typeof(uint)) return IsDefinedPrimitive(rt, *(uint*)&value);
+            if (underlyingType == typeof(long) || underlyingType == typeof(ulong)) return IsDefinedPrimitive(rt, *(ulong*)&value);
+#if RARE_ENUMS
+            if (underlyingType == typeof(nint) || underlyingType == typeof(nuint)) return IsDefinedPrimitive(rt, *(nuint*)&value);
+            if (underlyingType == typeof(float)) return IsDefinedPrimitive(rt, *(float*)&value);
+            if (underlyingType == typeof(double)) return IsDefinedPrimitive(rt, *(double*)&value);
+            if (underlyingType == typeof(char)) return IsDefinedPrimitive(rt, *(char*)&value);
+#endif
+
+            throw CreateUnknownEnumTypeException();
+        }
+
+        /// <summary>Gets whether the specified individual value is defined in the specified enum.</summary>
+        internal static bool IsDefinedPrimitive<TStorage>(RuntimeType enumType, TStorage value)
+            where TStorage : struct, INumber<TStorage>
+        {
+            EnumInfo<TStorage> enumInfo = GetEnumInfo<TStorage>(enumType, getNames: false);
+            TStorage[] values = enumInfo.Values;
+
+            // If the enum's values are all sequentially numbered starting from 0, then we can
+            // just return if the requested index is in range.
+            if (enumInfo.ValuesAreSequentialFromZero)
+            {
+                return ulong.CreateTruncating(value) < (ulong)values.Length;
+            }
+
+            // Otherwise, search for the value.
+            return FindDefinedIndex(values, value) >= 0;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int FindDefinedIndex<TStorage>(TStorage[] values, TStorage value)
+            where TStorage : struct, IEquatable<TStorage>, IComparable<TStorage>
+        {
+            // Binary searching has a higher constant overhead than linear searching.
+            // For smaller enums, use IndexOf.
+            // For larger enums, use BinarySearch.
+            const int NumberOfValuesThreshold = 32; // This threshold can be tweaked over time as optimizations evolve.
+            ReadOnlySpan<TStorage> span = values;
+            return values.Length <= NumberOfValuesThreshold ?
+                span.IndexOf(value) :
+                SpanHelpers.BinarySearch(span, value);
         }
 
         private unsafe System.Reflection.CorElementType InternalGetCorElementType()
@@ -1201,9 +1383,285 @@ namespace System
             };
         }
 
+        /// <summary>Converts the value of this instance to its equivalent string representation.</summary>
+        /// <remarks>The string representation of the value of this instance.</remarks>
+        public override string ToString()
+        {
+            RuntimeType enumType = (RuntimeType)GetType();
+            ref byte rawData = ref this.GetRawData();
+            return InternalGetCorElementType() switch
+            {
+                // Inlined for the most common base types
+                CorElementType.ELEMENT_TYPE_I1 => ToString<sbyte, byte>(enumType, ref rawData),
+                CorElementType.ELEMENT_TYPE_U1 => ToStringInlined<byte, byte>(enumType, ref rawData),
+                CorElementType.ELEMENT_TYPE_I2 => ToString<short, ushort>(enumType, ref rawData),
+                CorElementType.ELEMENT_TYPE_U2 => ToString<ushort, ushort>(enumType, ref rawData),
+                CorElementType.ELEMENT_TYPE_I4 => ToStringInlined<int, uint>(enumType, ref rawData),
+                CorElementType.ELEMENT_TYPE_U4 => ToString<uint, uint>(enumType, ref rawData),
+                CorElementType.ELEMENT_TYPE_I8 => ToString<long, ulong>(enumType, ref rawData),
+                CorElementType.ELEMENT_TYPE_U8 => ToString<ulong, ulong>(enumType, ref rawData),
+                _ => HandleRareTypes(enumType, ref rawData)
+            };
+
+            [MethodImpl(MethodImplOptions.NoInlining)]
+            static string HandleRareTypes(RuntimeType enumType, ref byte rawData) =>
+#if RARE_ENUMS
+                InternalGetCorElementType(enumType) switch
+                {
+                    CorElementType.ELEMENT_TYPE_R4 => ToString<float, float>(enumType, ref rawData),
+                    CorElementType.ELEMENT_TYPE_R8 => ToString<double, double>(enumType, ref rawData),
+                    CorElementType.ELEMENT_TYPE_I => ToString<nint, nuint>(enumType, ref rawData),
+                    CorElementType.ELEMENT_TYPE_U => ToString<nuint, nuint>(enumType, ref rawData),
+                    CorElementType.ELEMENT_TYPE_CHAR => ToString<char, char>(enumType, ref rawData),
+                    _ => throw CreateUnknownEnumTypeException(),
+                };
+#else
+                throw CreateUnknownEnumTypeException();
+#endif
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)] // avoid bloating call sites for underlying types and/or call sites that aren't perf critical
+        private static string ToString<TUnderlying, TStorage>(RuntimeType enumType, ref byte rawData)
+            where TUnderlying : struct, INumber<TUnderlying>, IBitwiseOperators<TUnderlying, TUnderlying, TUnderlying>
+            where TStorage : struct, INumber<TStorage>, IBitwiseOperators<TStorage, TStorage, TStorage> =>
+            ToStringInlined<TUnderlying, TStorage>(enumType, ref rawData);
+
+        /// <summary>Converts the value of an enum to its equivalent string representation using the default format.</summary>
+        /// <typeparam name="TUnderlying">The underlying type for this enum.</typeparam>
+        /// <typeparam name="TStorage">The type stored in the EnumInfo.  
+        /// This will either be the same as <typeparamref name="TUnderlying"/> or its unsigned counterpart 
+        /// if <typeparamref name="TUnderlying"/> is a signed integer.</typeparam>
+        /// <param name="enumType">The enum type.</param>
+        /// <param name="rawData">A reference to the enum's value.</param>
+        /// <returns>The string representation of the value of this instance.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)] // used for most important types at most important call sites
+        private static string ToStringInlined<TUnderlying, TStorage>(RuntimeType enumType, ref byte rawData)
+            where TUnderlying : struct, INumber<TUnderlying>, IBitwiseOperators<TUnderlying, TUnderlying, TUnderlying>
+            where TStorage : struct, INumber<TStorage>, IBitwiseOperators<TStorage, TStorage, TStorage>
+        {
+            TStorage value = Unsafe.As<byte, TStorage>(ref rawData);
+
+            EnumInfo<TStorage> enumInfo = GetEnumInfo<TStorage>(enumType);
+            string? result = enumInfo.HasFlagsAttribute ?
+                FormatFlagNames(enumInfo, value) :
+                GetNameInlined(enumInfo, value);
+
+            return result ?? Unsafe.BitCast<TStorage, TUnderlying>(value).ToString()!;
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)] // avoid bloating call sites for underlying types and/or call sites that aren't perf critical
+        private static string ToString<TUnderlying, TStorage>(RuntimeType enumType, char format, ref byte rawData)
+            where TUnderlying : struct, INumber<TUnderlying>, IBitwiseOperators<TUnderlying, TUnderlying, TUnderlying>, IMinMaxValue<TUnderlying>
+            where TStorage : struct, INumber<TStorage>, IBitwiseOperators<TStorage, TStorage, TStorage>, IMinMaxValue<TStorage> =>
+            ToStringInlined<TUnderlying, TStorage>(enumType, format, ref rawData);
+
+        /// <summary>Converts the value of an enum to its equivalent string representation using the default format.</summary>
+        /// <typeparam name="TUnderlying">The underlying type for this enum.</typeparam>
+        /// <typeparam name="TStorage">The type stored in the EnumInfo.  This will either be the same as <typeparamref name="TUnderlying"/> or its unsigned counterpart if <typeparamref name="TUnderlying"/> is a signed integer.</typeparam>
+        /// <param name="enumType">The enum type.</param>
+        /// <param name="format">A format string.</param>
+        /// <param name="rawData">A reference to the enum's value.</param>
+        /// <returns>The string representation of the value of this instance as specified by <paramref name="format"/>.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)] // used for most important types at most important call sites
+        private static string ToStringInlined<TUnderlying, TStorage>(RuntimeType enumType, char format, ref byte rawData)
+            where TUnderlying : struct, INumber<TUnderlying>, IBitwiseOperators<TUnderlying, TUnderlying, TUnderlying>, IMinMaxValue<TUnderlying>
+            where TStorage : struct, INumber<TStorage>, IBitwiseOperators<TStorage, TStorage, TStorage>, IMinMaxValue<TStorage>
+        {
+            TStorage value = Unsafe.As<byte, TStorage>(ref rawData);
+
+            string? result;
+            switch (format | 0x20)
+            {
+                case 'g':
+                    EnumInfo<TStorage> enumInfo = GetEnumInfo<TStorage>(enumType);
+                    result = enumInfo.HasFlagsAttribute ? FormatFlagNames(enumInfo, value) : GetNameInlined(enumInfo, value);
+                    if (result is null)
+                    {
+                        goto case 'd';
+                    }
+                    break;
+
+                case 'd':
+                    result = Unsafe.BitCast<TStorage, TUnderlying>(value).ToString()!;
+                    break;
+                default:
+                    throw CreateInvalidFormatSpecifierException();
+            };
+
+            return result;
+        }
+
+        /// <summary>Tries to create a string representation of an enum as either a single constant name or multiple delimited constant names.</summary>
+        /// <returns>The formatted string if the value could be fully represented by enum constants, or else null.</returns>
+        private static unsafe string? FormatFlagNames<TStorage>(EnumInfo<TStorage> enumInfo, TStorage resultValue)
+            where TStorage : struct, INumber<TStorage>, IBitwiseOperators<TStorage, TStorage, TStorage>
+        {
+            string[] names = enumInfo.Names;
+            TStorage[] values = enumInfo.Values;
+
+            string? result = GetSingleFlagsEnumNameForValue(resultValue, names, values, out int index);
+            if (result is null)
+            {
+                // With a ulong result value, regardless of the enum's base type, the maximum
+                // possible number of consistent name/values we could have is 64, since every
+                // value is made up of one or more bits, and when we see values and incorporate
+                // their names, we effectively switch off those bits.
+                Span<int> foundItems = stackalloc int[64];
+                if (TryFindFlagsNames(resultValue, names, values, index, foundItems, out int resultLength, out int foundItemsCount))
+                {
+                    foundItems = foundItems.Slice(0, foundItemsCount);
+                    int length = GetMultipleEnumsFlagsFormatResultLength(resultLength, foundItemsCount);
+
+                    result = string.FastAllocateString(length);
+                    WriteMultipleFoundFlagsNames(names, foundItems, new Span<char>(ref result.GetRawStringData(), result.Length));
+                }
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Calculates how many characters will be in a formatted value, where there are <paramref name="foundItemsCount"/>
+        /// names whose lengths all sum to <paramref name="resultLength"/>.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)] // used twice, once from string-based and once from span-based code path
+        private static int GetMultipleEnumsFlagsFormatResultLength(int resultLength, int foundItemsCount)
+        {
+            const int SeparatorStringLength = 2; // ", "
+            int allSeparatorsLength = SeparatorStringLength * (foundItemsCount - 1); // this can't overflow
+            return checked(resultLength + allSeparatorsLength);
+        }
+
+        /// <summary>Tries to find the single named constant for the specified value, or else the index where we left off searching after not finding it.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)] // used twice, once from string-based and once from span-based code path
+        private static string? GetSingleFlagsEnumNameForValue<TStorage>(TStorage resultValue, string[] names, TStorage[] values, out int index)
+            where TStorage : struct, INumber<TStorage>
+        {
+            // Values are sorted, so if the incoming value is 0, we can check to see whether
+            // the first entry matches it, in which case we can return its name; otherwise,
+            // we can just return "0".
+            if (resultValue == TStorage.Zero)
+            {
+                index = 0;
+                return values.Length > 0 && values[0] == TStorage.Zero ?
+                    names[0] :
+                    "0";
+            }
+
+            // Walk from largest to smallest. It's common to have a flags enum with a single
+            // value that matches a single entry, in which case we can just return the existing
+            // name string.
+            int i;
+            for (i = values.Length - 1; (uint)i < (uint)values.Length; i--)
+            {
+                if (values[i] <= resultValue)
+                {
+                    if (values[i] == resultValue)
+                    {
+                        index = i;
+                        return names[i];
+                    }
+
+                    break;
+                }
+            }
+
+            index = i;
+            return null;
+        }
+
+        /// <summary>Tries to compute the indices of all named constants that or together to equal the specified value.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)] // used twice, once from string-based and once from span-based code path
+        private static bool TryFindFlagsNames<TStorage>(TStorage resultValue, string[] names, TStorage[] values, 
+            int index, Span<int> foundItems, out int resultLength, out int foundItemsCount)
+            where TStorage : struct, INumber<TStorage>, IBitwiseOperators<TStorage, TStorage, TStorage>
+        {
+            // Now look for multiple matches, storing the indices of the values
+            // into our span.
+            resultLength = 0;
+            foundItemsCount = 0;
+
+            while (true)
+            {
+                if ((uint)index >= (uint)values.Length)
+                {
+                    break;
+                }
+
+                TStorage currentValue = values[index];
+                if (index == 0 && currentValue == TStorage.Zero)
+                {
+                    break;
+                }
+
+                if ((resultValue & currentValue) == currentValue)
+                {
+                    resultValue &= ~currentValue;
+                    foundItems[foundItemsCount] = index;
+                    foundItemsCount++;
+                    resultLength = checked(resultLength + names[index].Length);
+                    if (resultValue == TStorage.Zero)
+                    {
+                        break;
+                    }
+                }
+
+                index--;
+            }
+
+            // If we exhausted looking through all the values and we still have
+            // a non-zero result, we couldn't match the result to only named values.
+            // In that case, we return null and let the call site just generate
+            // a string for the integral value if it desires.
+            return resultValue == TStorage.Zero;
+        }
+
+        /// <summary>Concatenates the names of the found items into the destination span.</summary>
+        /// <remarks>The destination must have already been verified long enough to store the resulting data.</remarks>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)] // used twice, once from string-based and once from span-based code path
+        private static void WriteMultipleFoundFlagsNames(string[] names, ReadOnlySpan<int> foundItems, Span<char> destination)
+        {
+            for (int i = foundItems.Length - 1; i != 0; i--)
+            {
+                string name = names[foundItems[i]];
+                name.CopyTo(destination);
+                destination = destination.Slice(name.Length);
+                Span<char> afterSeparator = destination.Slice(2); // done before copying ", " to eliminate those two bounds checks
+                destination[0] = EnumSeparatorChar;
+                destination[1] = ' ';
+                destination = afterSeparator;
+            }
+
+            names[foundItems[0]].CopyTo(destination);
+        }
+
+        [DoesNotReturn]
+        private static void ThrowInvalidRuntimeType(Type enumType) =>
+            throw new ArgumentException(enumType is not RuntimeType ? SR.Arg_MustBeType : SR.Arg_MustBeEnum, nameof(enumType));
+
+        private static void ThrowInvalidEmptyParseArgument() =>
+            throw new ArgumentException(SR.Arg_MustContainEnumInfo, "value");
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static FormatException CreateInvalidFormatSpecifierException() =>
+            new FormatException(SR.Format_InvalidEnumFormatSpecification);
+
         [MethodImpl(MethodImplOptions.NoInlining)]
         private static InvalidOperationException CreateUnknownEnumTypeException() =>
             new InvalidOperationException(SR.InvalidOperation_UnknownEnumType);
+
+        internal static bool AreSequentialFromZero<TStorage>(TStorage[] values) where TStorage : struct, INumber<TStorage>
+        {
+            for (int i = 0; i < values.Length; i++)
+            {
+                if (ulong.CreateTruncating(values[i]) != (ulong)i)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
     }
     // NativeAOT's template for SZ arrays: T[] takes its vtable and generic collection interfaces from Array<T> but keeps System.Array as its base
     internal class Array<T> : Array, IEnumerable<T>, ICollection<T>, IList<T>, IReadOnlyList<T>
@@ -11422,6 +11880,28 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
             public int CompareTo(T? other) => _comparer.Compare(_value, other);
         }
 
+        public static int IndexOf<T>(ref T searchSpace, T value, int length) where T : IEquatable<T>?
+        {
+            if (default(T) != null || (object?)value != null)
+            {
+                for (int index = 0; index < length; index++)
+                {
+                    if (value.Equals(Unsafe.Add(ref searchSpace, index)))
+                        return index;
+                }
+            }
+            else
+            {
+                for (int index = 0; index < length; index++)
+                {
+                    if ((object?)Unsafe.Add(ref searchSpace, index) is null)
+                        return index;
+                }
+            }
+
+            return -1;
+        }
+
         public static int IndexOfAny<T>(ref T searchSpace, T value0, T value1, int length) where T : IEquatable<T>?
         {
             T lookUp;
@@ -12658,6 +13138,10 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         /// <param name="span">The span to search.</param>
         /// <param name="value0">One of the values to search for.</param>
         /// <param name="value1">One of the values to search for.</param>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int IndexOf<T>(this ReadOnlySpan<T> span, T value) where T : IEquatable<T>?
+            => SpanHelpers.IndexOf(ref MemoryMarshal.GetReference(span), value, span.Length);
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static unsafe int IndexOfAny<T>(this ReadOnlySpan<T> span, T value0, T value1) where T : IEquatable<T>?
         {
@@ -20127,6 +20611,8 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         public abstract Type UnderlyingSystemType { get; }
 
         public virtual bool IsEnum { [Intrinsic] get => throw new NotImplementedException(); }
+        public virtual Type GetEnumUnderlyingType() => throw new NotImplementedException();
+        public virtual bool IsEquivalentTo([NotNullWhen(true)] Type? other) => this == other;
         public bool IsPrimitive
         {
             [Intrinsic]
@@ -20157,6 +20643,7 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         private const int ArrayFlag = 1 << 3;
         private const int PointerFlag = 1 << 4;
         private const int ByRefFlag = 1 << 5;
+        private const int FlagsEnumFlag = 1 << 8;
 
         private static readonly object s_lock = new object();
         private static RuntimeType?[] s_types = new RuntimeType?[64];
@@ -20222,6 +20709,32 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         public override string ToString() => System.Runtime.RuntimeImports.RhGetTypeDisplayName(_handle);
 
         private int Flags => System.Runtime.RuntimeImports.RhGetTypeFlags(_handle);
+
+        internal IntPtr Handle => _handle;
+        internal bool IsFlagsEnum => (Flags & FlagsEnumFlag) != 0;
+        internal object? GenericCache { get; set; }
+
+        // The type object also serves as its reflection info
+        internal RuntimeType GetRuntimeTypeInfo() => this;
+
+        public override unsafe Type GetEnumUnderlyingType()
+        {
+            if (!IsEnum)
+                throw new ArgumentException(SR.Arg_MustBeEnum, "enumType");
+
+            return ((MethodTable*)_handle)->ElementType switch
+            {
+                EETypeElementType.SByte => typeof(sbyte),
+                EETypeElementType.Byte => typeof(byte),
+                EETypeElementType.Int16 => typeof(short),
+                EETypeElementType.UInt16 => typeof(ushort),
+                EETypeElementType.Int32 => typeof(int),
+                EETypeElementType.UInt32 => typeof(uint),
+                EETypeElementType.Int64 => typeof(long),
+                EETypeElementType.UInt64 => typeof(ulong),
+                _ => throw new NotSupportedException(),
+            };
+        }
     }
 
     public enum AttributeTargets
@@ -21295,6 +21808,41 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         }
 
         [DoesNotReturn]
+        internal static void ThrowArgumentOutOfRange_IndexMustBeLessOrEqualException()
+        {
+            throw GetArgumentOutOfRangeException(ExceptionArgument.index,
+                                                    ExceptionResource.ArgumentOutOfRange_IndexMustBeLessOrEqual);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowIndexArgumentOutOfRange_NeedNonNegNumException()
+        {
+            throw GetArgumentOutOfRangeException(ExceptionArgument.index,
+                                                    ExceptionResource.ArgumentOutOfRange_NeedNonNegNum);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowValueArgumentOutOfRange_NeedNonNegNumException()
+        {
+            throw GetArgumentOutOfRangeException(ExceptionArgument.value,
+                                                    ExceptionResource.ArgumentOutOfRange_NeedNonNegNum);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowLengthArgumentOutOfRange_ArgumentOutOfRange_NeedNonNegNum()
+        {
+            throw GetArgumentOutOfRangeException(ExceptionArgument.length,
+                                                    ExceptionResource.ArgumentOutOfRange_NeedNonNegNum);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowStartIndexArgumentOutOfRange_ArgumentOutOfRange_IndexMustBeLessOrEqual()
+        {
+            throw GetArgumentOutOfRangeException(ExceptionArgument.startIndex,
+                                                    ExceptionResource.ArgumentOutOfRange_IndexMustBeLessOrEqual);
+        }
+
+        [DoesNotReturn]
         internal static void ThrowOverflowException()
         {
             throw new OverflowException();
@@ -21318,6 +21866,18 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         internal static void ThrowInvalidOperationException()
         {
             throw new InvalidOperationException();
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowInvalidOperationException(ExceptionResource resource)
+        {
+            throw GetInvalidOperationException(resource);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowInvalidOperationException(ExceptionResource resource, Exception e)
+        {
+            throw new InvalidOperationException(GetResourceString(resource), e);
         }
 
         [DoesNotReturn]
@@ -21429,6 +21989,13 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         }
 
         [DoesNotReturn]
+        internal static void ThrowKeyNotFoundException<T>(T key)
+        {
+            // Generic key to move the boxing to the right hand side of throw
+            throw GetKeyNotFoundException((object?)key);
+        }
+
+        [DoesNotReturn]
         internal static void ThrowArgumentException(ExceptionResource resource)
         {
             throw GetArgumentException(resource);
@@ -21437,6 +22004,11 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         private static ArgumentException GetArgumentException(ExceptionResource resource)
         {
             return new ArgumentException(GetResourceString(resource));
+        }
+
+        private static KeyNotFoundException GetKeyNotFoundException(object? key)
+        {
+            return new KeyNotFoundException(SR.Format(SR.Arg_KeyNotFoundWithKey, key));
         }
 
         private static ArgumentOutOfRangeException GetArgumentOutOfRangeException(ExceptionArgument argument, int paramNumber, ExceptionResource resource)
@@ -21511,13 +22083,6 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         internal static void ThrowArgumentOutOfRangeException(ExceptionArgument argument, int paramNumber, ExceptionResource resource)
         {
             throw GetArgumentOutOfRangeException(argument, paramNumber, resource);
-        }
-
-        [DoesNotReturn]
-        internal static void ThrowArgumentOutOfRange_IndexMustBeLessOrEqualException()
-        {
-            throw GetArgumentOutOfRangeException(ExceptionArgument.index,
-                                                    ExceptionResource.ArgumentOutOfRange_IndexMustBeLessOrEqual);
         }
 
         [DoesNotReturn]
@@ -22042,11 +22607,15 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         internal const string Arg_MustBeUInt32 = "Object must be of type UInt32.";
         internal const string Arg_MustBeUInt64 = "Object must be of type UInt64.";
         internal const string Arg_MustBeUIntPtr = "Object must be of type UIntPtr.";
+        internal const string Arg_MustBeType = "Type must be a type provided by the runtime.";
+        internal const string Arg_MustBeEnum = "The value passed in must be an enum base or an underlying type for an enum, such as an Int32.";
         internal const string Arg_TypeNotSupported = "Specified type is not supported";
         internal const string Arg_UnreachableException = "The program executed an instruction that was thought to be unreachable.";
         internal const string Arg_WrongType = "The value '{0}' is not of type '{1}' and cannot be used in this generic collection.";
         internal const string Arg_RankMultiDimNotSupported = "Rank is not supported for multi-dimensional arrays.";
         internal const string Arg_HTCapacityOverflow = "Hashtable's capacity overflowed and went negative. Check load factor, capacity and the current size of the table.";
+        internal const string Arg_KeyNotFoundWithKey = "The given key '{0}' was not present in the dictionary.";
+        internal const string Arg_MustContainEnumInfo = "Must specify valid information for parsing in the string.";
         internal const string ArgumentNull_Generic = "Value cannot be null.";
         internal const string ArgumentOutOfRange_ActualValue = "Actual value was {0}.";
         internal const string ArgumentOutOfRange_Generic_MustBeEqual = "{0} ('{1}') must be equal to '{2}'.";
@@ -22074,6 +22643,7 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         internal const string Argument_IncompatibleArrayType = "Target array type is not compatible with the type of items in the collection.";
         internal const string Argument_OverlapAlignmentMismatch = "Overlapping spans have mismatching alignment.";
         internal const string Argument_TypeContainsReferences = "The Type must be a primitive type or a struct containing only primitive types.";
+        internal const string Argument_EnumTypeDoesNotMatch = "The argument type, '{0}', is not the same as the enum type '{1}'.";
         internal const string Arithmetic_NaN = "Function does not accept floating point Not-a-Number values.";
         internal const string CapacityMustBeGreaterThanOrEqualToCount = "Capacity must be greater than or equal to Count.";
         internal const string CapacityMustEqualCountOnMove = "Capacity must equal count on move.";
@@ -22084,6 +22654,7 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         internal const string Format_NeedSingleChar = "String must be exactly one character long.";
         internal const string Format_UnclosedFormatItem = "Format item ends prematurely.";
         internal const string Format_UnexpectedClosingBrace = "Unexpected closing brace without a corresponding opening brace.";
+        internal const string Format_InvalidEnumFormatSpecification = "Format String can be only 'G', 'g', 'X', 'x', 'F', 'f', 'D' or 'd'.";
         internal const string InvalidOperationOnDefaultArray = "This operation cannot be performed on a default instance of ImmutableArray. " +
                                                                "Consider initializing the array, or checking the ImmutableArray.IsDefault property.";
         internal const string InvalidOperation_CollectionCorrupted = "A prior operation on this collection was interrupted by an exception. Collection's state is no longer trusted.";

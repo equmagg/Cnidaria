@@ -1103,22 +1103,27 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(node);
             }
 
-            var boundArmExprs = new BoundExpression[armCount];
-            var armIsThrow = new bool[armCount];
+            var boundArmExprs = ImmutableArray.CreateBuilder<BoundExpression>(armCount);
             for (int i = 0; i < armCount; i++)
-            {
-                armIsThrow[i] = arms[i].Expression is ThrowExpressionSyntax;
-                boundArmExprs[i] = BindExpression(arms[i].Expression, ctx, diagnostics);
-            }
+                boundArmExprs.Add(BindExpression(arms[i].Expression, ctx, diagnostics));
+            var conditions = ImmutableArray.CreateBuilder<BoundExpression>(armCount);
+            for (int i = 0; i < armCount; i++)
+                conditions.Add(BindSwitchExpressionArmCondition(arms[i], tmpSyntax, tmpExpr, governing.Type, ctx, diagnostics));
 
+            var unbound = new BoundUnboundSwitchExpression(node, tmp, tmpDecl, conditions.MoveToImmutable(), boundArmExprs.MoveToImmutable(),
+                new Diagnostic("CN_SWITCHEXPR004", DiagnosticSeverity.Error,
+                    "Cannot determine a common type for switch expression arms.",
+                    new Location(ctx.SemanticModel.SyntaxTree, node.Span)));
             TypeSymbol? resultType = null;
+            bool hasVoidArm = false;
             for (int i = 0; i < armCount; i++)
             {
-                if (armIsThrow[i])
+                if (arms[i].Expression is ThrowExpressionSyntax)
                     continue;
-                var t = boundArmExprs[i].Type;
+                var t = unbound.Arms[i].Type;
                 if (t is ErrorTypeSymbol)
                     continue;
+                hasVoidArm |= t.SpecialType == SpecialType.System_Void;
                 if (resultType is null)
                 {
                     resultType = t;
@@ -1139,35 +1144,22 @@ namespace Cnidaria.Cs
                 }
                 resultType = merged;
             }
-            if (resultType is null || resultType is ErrorTypeSymbol)
-            {
-                var objType = ctx.Compilation.GetSpecialType(SpecialType.System_Object);
-                bool ok = true;
-                for (int i = 0; i < armCount; i++)
-                {
-                    if (armIsThrow[i])
-                        continue;
-                    var e = boundArmExprs[i];
-                    if (e.HasErrors)
-                        continue;
-                    var conv = ClassifyConversion(e, objType, ctx);
-                    if (!conv.Exists || !conv.IsImplicit)
-                    {
-                        ok = false;
-                        break;
-                    }
-                }
-                if (ok)
-                    resultType = objType;
-            }
+            // Without a natural type the switch expression takes the type it converts to (C# 8)
+            if ((resultType is null || resultType is ErrorTypeSymbol) && !hasVoidArm)
+                return unbound;
             if (resultType is null || resultType is ErrorTypeSymbol || resultType.SpecialType == SpecialType.System_Void)
             {
-                diagnostics.Add(new Diagnostic("CN_SWITCHEXPR004", DiagnosticSeverity.Error,
-                    "Cannot determine a common type for switch expression arms.",
-                    new Location(ctx.SemanticModel.SyntaxTree, node.Span)));
+                diagnostics.Add(unbound.NoNaturalType);
                 return new BoundBadExpression(node);
             }
 
+            return BindSwitchExpressionWithType(unbound, resultType, ctx, diagnostics);
+        }
+        private BoundExpression BindSwitchExpressionWithType(BoundUnboundSwitchExpression unbound, TypeSymbol resultType, BindingContext ctx, DiagnosticBag diagnostics)
+        {
+            var node = (SwitchExpressionSyntax)unbound.Syntax;
+            var arms = node.Arms;
+            int armCount = arms.Count;
             var resultLocal = NewTemp("$switch_expr_result", resultType);
             var resultSyntax = MakeIdentifierName(resultLocal.Name, node.SwitchKeyword.Span);
             var resultLocalExpr = new BoundLocalExpression(resultSyntax, resultLocal);
@@ -1179,13 +1171,13 @@ namespace Cnidaria.Cs
                 armLabels[i] = _flow.NewGeneratedLabel("switch_expr_arm");
 
             var sideEffects = ImmutableArray.CreateBuilder<BoundStatement>();
-            sideEffects.Add(tmpDecl);
+            sideEffects.Add(unbound.GoverningDeclaration);
             sideEffects.Add(resultDecl);
 
             for (int i = 0; i < armCount; i++)
             {
                 var arm = arms[i];
-                var cond = BindSwitchExpressionArmCondition(arm, tmpSyntax, tmpExpr, governing.Type, ctx, diagnostics);
+                var cond = unbound.Conditions[i];
                 if (TryGetBoolConstant(cond, out var bc) && bc == false) continue;
                 if (TryGetBoolConstant(cond, out bc) && bc == true)
                 {
@@ -1201,8 +1193,8 @@ namespace Cnidaria.Cs
             {
                 var arm = arms[i];
                 sideEffects.Add(new BoundLabelStatement(arm, armLabels[i]));
-                var armValue = boundArmExprs[i];
-                if (!armIsThrow[i] && !armValue.HasErrors)
+                var armValue = unbound.Arms[i];
+                if (arm.Expression is not ThrowExpressionSyntax && !armValue.HasErrors)
                 {
                     armValue = ApplyConversion(arm.Expression, armValue, resultType, arm, ctx, diagnostics, requireImplicit: true);
                 }
@@ -1219,7 +1211,7 @@ namespace Cnidaria.Cs
 
             return new BoundSequenceExpression(
                 node,
-                locals: ImmutableArray.Create(tmp, resultLocal),
+                locals: ImmutableArray.Create(unbound.Governing, resultLocal),
                 sideEffects: sideEffects.ToImmutable(),
                 value: resultLocalExpr);
         }

@@ -69,11 +69,12 @@ public static class X86ElfWriter
         if (options.Dynamic && !program.Target.Is64Bit)
             throw new NotSupportedException("A 32-bit x86 dynamic image needs REL-format relocations, which are not implemented.");
         ElfImageBuilder.Validate(options);
+        program = X86ObjectLinker.RelaxBranches(program, options.ExternalSymbols?.Keys);
         if (options.Shared)
             RequirePositionIndependentText(program);
 
         var imports = options.Dynamic ? CollectImports(program) : ElfImportSet.Empty;
-        var rewritten = RedirectDataImports(program, imports.Data);
+        var rewritten = X86ObjectLinker.RedirectDataImports(program, imports.Data);
 
         var descriptor = new ElfTarget
         {
@@ -321,42 +322,6 @@ public static class X86ElfWriter
             data[offset + 2 + i] = (byte)((uint)displacement >> (i * 8));
         for (var i = 6; i < PltEntrySize; i++)
             data[offset + i] = 0x90;
-    }
-
-    /// <summary>Turns the lea of an address into a load, so an imported object is read from its table slot.</summary>
-    private static X86Program RedirectDataImports(X86Program program, ImmutableArray<string> dataImports)
-    {
-        if (dataImports.Length == 0)
-            return program;
-
-        var imports = dataImports.ToImmutableHashSet(StringComparer.Ordinal);
-        var instructions = program.Text.Instructions.ToBuilder();
-        for (var i = 0; i < instructions.Count; i++)
-        {
-            var instruction = instructions[i];
-            if (!Operands(instruction).Any(operand => operand.IsRipRelative && operand.Symbol is { } name && imports.Contains(name)))
-                continue;
-
-            var source = instruction.Operand1;
-            if (instruction.Opcode != X86InstrKind.Lea ||
-                !source.IsRipRelative ||
-                source.Symbol is null ||
-                !imports.Contains(source.Symbol) ||
-                source.Addend != 0)
-            {
-                throw new NotSupportedException(
-                    $"An imported data object is addressed in place rather than through its address: {source.Symbol ?? "?"}");
-            }
-
-            instructions[i] = X86Instruction.Binary(X86InstrKind.Mov, instruction.Operand0, source);
-        }
-
-        return new X86Program(
-            program.Target,
-            new X86TextSection(instructions.ToImmutable(), program.Text.Labels, program.Text.Relocations),
-            program.DataSections,
-            program.Symbols,
-            program.EntrySymbol);
     }
 
     private static ulong ResolveSymbol(IReadOnlyDictionary<string, ulong> symbols, string symbol)

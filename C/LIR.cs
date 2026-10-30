@@ -51,6 +51,7 @@ public enum LirOperandKind : byte
     Label,
     Undefined,
     Void,
+    Segments,
 }
 
 public enum LirAddressKind : byte
@@ -90,6 +91,7 @@ public enum LirInstructionKind : ushort
     Switch,
     Return,
     Unreachable,
+    ReturnBuffer,
 }
 
 public enum LirProblemKind : byte
@@ -434,6 +436,7 @@ public sealed class LirOperand
     public LirAddress? Address { get; }
     public LirBlock? Label { get; }
     public GimpleName? UndefinedName { get; }
+    public ImmutableArray<LirOperand> Parts { get; }
 
     private LirOperand(
         LirOperandKind kind,
@@ -444,7 +447,8 @@ public sealed class LirOperand
         LirStackSlot? stackSlot,
         LirAddress? address,
         LirBlock? label,
-        GimpleName? undefinedName)
+        GimpleName? undefinedName,
+        ImmutableArray<LirOperand> parts = default)
     {
         Kind = kind;
         Type = GimpleTypeHelpers.Normalize(type);
@@ -455,7 +459,11 @@ public sealed class LirOperand
         Address = address;
         Label = label;
         UndefinedName = undefinedName;
+        Parts = parts.IsDefault ? ImmutableArray<LirOperand>.Empty : parts;
     }
+
+    public static LirOperand ForSegments(QualifiedType type, ImmutableArray<LirOperand> parts)
+        => new LirOperand(LirOperandKind.Segments, type, null, null, null, null, null, null, null, parts);
 
     public static LirOperand ForRegister(LirVirtualRegister register)
     {
@@ -573,6 +581,29 @@ public readonly struct LirSelectDiamond
 /// <summary>Finds the conditional expressions a backend can turn into a conditional move</summary>
 public static class LirSelect
 {
+    /// <summary>A superset of the diamonds FindDiamonds reports, read from the branch's two arms alone</summary>
+    public static bool MayBeDiamond(LirInstruction branch)
+    {
+        if (branch.TrueTarget is not { } trueArm || branch.FalseTarget is not { } falseArm || ReferenceEquals(trueArm, falseArm))
+            return false;
+        return IsCopyArm(trueArm, out var trueJoin, out var trueDestination) &&
+            IsCopyArm(falseArm, out var falseJoin, out var falseDestination) &&
+            ReferenceEquals(trueJoin, falseJoin) && ReferenceEquals(trueDestination, falseDestination);
+    }
+
+    private static bool IsCopyArm(LirBlock arm, out LirBlock? join, out LirVirtualRegister? destination)
+    {
+        join = null;
+        destination = null;
+        var instructions = arm.Instructions;
+        if (instructions.Length != 2 || instructions[0].Kind != LirInstructionKind.ParallelCopy ||
+            instructions[0].ParallelCopies.Length != 1 || instructions[1].Kind != LirInstructionKind.Jump)
+            return false;
+        join = instructions[1].Target;
+        destination = instructions[0].ParallelCopies[0].Destination;
+        return join is not null;
+    }
+
     /// <summary>Maps each head block whose branch only picks between two values for one register</summary>
     public static Dictionary<LirBlock, LirSelectDiamond> FindDiamonds(LirFunction function, TargetInfo target)
     {
@@ -1212,6 +1243,9 @@ public sealed class LirInstruction
         ValueNumber = valueNumber;
     }
 
+    /// <summary>Marks an aggregate return whose value is already stored through the return buffer</summary>
+    public const string BufferReturn = "buffer";
+
     internal LirInstruction WithResult(LirVirtualRegister result)
         => new LirInstruction(Ordinal, Kind, result, Operands, Address, Operator, ConversionKind, CallSignature,
             ParallelCopies, SwitchCases, Target, TrueTarget, FalseTarget, SourceStatement, SourceValue,
@@ -1243,6 +1277,7 @@ internal sealed class LirFunctionBuilder
     private const int MaxLoopValues = 4;
     private const int MaxHoistingLoopAnalysisWork = 100_000;
     private const int MaxSharedSymbolBases = 4;
+    private const int MaxComposedLeaves = 16;
 
     private readonly Dictionary<LirVirtualRegister, LirVirtualRegister> _widenedIndices = new();
     private readonly Dictionary<Symbol, (LirVirtualRegister Register, ControlFlowBlock Block)> _symbolBases = new();
@@ -1254,6 +1289,13 @@ internal sealed class LirFunctionBuilder
     private readonly Dictionary<GimpleStatementAnnotations, GimpleStatementAnnotations> _divisionPartners = new();
     private readonly HashSet<GimpleStatementAnnotations> _answeredDivisions = new();
     private readonly HashSet<object> _sharedAddressKeys = new();
+    private readonly Dictionary<GimpleVariableKey, ComposedAggregate> _composedAggregates = new();
+    private readonly Dictionary<GimpleStatement, (ComposedAggregate Aggregate, int Leaf)> _composedStores = new();
+    private readonly Dictionary<GimpleStatement, ComposedAggregate> _composedZeros = new();
+    private readonly HashSet<GimpleVariableKey> _inPlaceArguments = new();
+    private readonly Dictionary<Symbol, LirVirtualRegister> _indirectParameters = new();
+    private readonly Dictionary<Symbol, ImmutableArray<LirVirtualRegister>> _parameterParts = new();
+    private readonly Dictionary<GimpleStatement, (ComposedAggregate Parameter, ImmutableArray<LirVirtualRegister> Parts, int Leaf)> _parameterLeafReads = new();
 
     private readonly GimpleFunctionAnnotations _function;
     private readonly ControlFlowFunction _controlFlowFunction;
@@ -1301,6 +1343,8 @@ internal sealed class LirFunctionBuilder
     {
         IndexPromotedVariables();
         IndexReachableControlFlowBlocks();
+        FindComposedAggregates();
+        FindDecomposedParameters();
         ScanLocalDeclarations();
         IndexUsedGimpleNames();
         CreateVirtualRegistersForGimpleNames();
@@ -1358,7 +1402,8 @@ internal sealed class LirFunctionBuilder
                 }
 
                 _localDeclarationsBySymbol[declarationStatement.Symbol] = declarationStatement.Declaration;
-                if (!_promotedSymbols.ContainsKey(declarationStatement.Symbol) && IsStackAllocatedLocal(declarationStatement.Declaration))
+                if (!_promotedSymbols.ContainsKey(declarationStatement.Symbol) && IsStackAllocatedLocal(declarationStatement.Declaration) &&
+                    !_composedAggregates.ContainsKey(GimpleVariableKey.FromSymbol(declarationStatement.Symbol)))
                     _ = GetOrCreateStackSlot(declarationStatement.Declaration);
             }
         }
@@ -1629,7 +1674,7 @@ internal sealed class LirFunctionBuilder
 
         foreach (var parameter in functionType.Parameters)
         {
-            if (_promotedSymbols.ContainsKey(parameter))
+            if (_promotedSymbols.ContainsKey(parameter) || _indirectParameters.ContainsKey(parameter) || _parameterParts.ContainsKey(parameter))
                 continue;
 
             _ = GetOrCreateStackSlot(parameter, parameter.Type, isParameter: true, storageClass: StorageClass.Auto);
@@ -1881,6 +1926,18 @@ internal sealed class LirFunctionBuilder
         for (var i = 0; i < functionType.Parameters.Length; i++)
         {
             var parameter = functionType.Parameters[i];
+            if (_indirectParameters.TryGetValue(parameter, out var pointer))
+            {
+                EmitParameterPart(block, parameter, pointer, 0);
+                continue;
+            }
+            if (_parameterParts.TryGetValue(parameter, out var parts))
+            {
+                for (var segment = 0; segment < parts.Length; segment++)
+                    EmitParameterPart(block, parameter, parts[segment], segment);
+                continue;
+            }
+
             var definition = _function.Definitions.FirstOrDefault(d =>
                 d.Kind == GimpleDefinitionKind.Entry &&
                 ReferenceEquals(d.Parameter, parameter) &&
@@ -1911,6 +1968,12 @@ internal sealed class LirFunctionBuilder
         }
     }
 
+    // The operand picks the ABI segment, or for a parameter passed by reference the pointer to it
+    private void EmitParameterPart(LirBlock block, ParameterSymbol parameter, LirVirtualRegister part, int segment)
+        => Emit(block, LirInstructionKind.Parameter, part, ImmutableArray.Create(LirOperand.ImmediateValue(segment, new QualifiedType(TypeCatalog.Instance.Int))),
+            address: null, op: parameter.Name, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default,
+            target: null, trueTarget: null, falseTarget: null, sourceStatement: null, sourceValue: null, sourceInstruction: null, valueNumber: null);
+
     private void TranslateEdgeSplitBlocks()
     {
         foreach (var pair in _edgeSplitBlocks)
@@ -1931,6 +1994,20 @@ internal sealed class LirFunctionBuilder
     private void TranslateInstruction(LirBlock block, GimpleStatementAnnotations instruction)
     {
         _currentInstruction = instruction;
+        if (_composedStores.TryGetValue(instruction.Statement, out var composed))
+        {
+            RecordComposedLeaf(block, instruction, composed.Aggregate, composed.Leaf);
+            _currentInstruction = null;
+            return;
+        }
+        if (_composedZeros.TryGetValue(instruction.Statement, out var zeroed))
+        {
+            BeginComposedBlock(zeroed);
+            for (var i = 0; i < zeroed.Leaves.Length; i++)
+                zeroed.Values[i] = LirOperand.ImmediateValue(GimpleTypes.IsFloating(zeroed.Leaves[i].Type) ? 0.0 : 0L, zeroed.Leaves[i].Type);
+            _currentInstruction = null;
+            return;
+        }
 
         switch (instruction.Statement)
         {
@@ -2012,7 +2089,9 @@ internal sealed class LirFunctionBuilder
             return;
         }
 
-        var value = EmitRhs(block, instruction, assign, operandStart, destination);
+        var value = _parameterLeafReads.TryGetValue(assign, out var read)
+            ? EmitParameterLeaf(block, read.Parameter, read.Parts, read.Leaf)
+            : EmitRhs(block, instruction, assign, operandStart, destination);
 
         if (IsVoid(assign.Lhs.Type) || value.Kind == LirOperandKind.Void || IsVoid(value.Type))
             return;
@@ -2380,6 +2459,23 @@ internal sealed class LirFunctionBuilder
 
     private void TranslateReturn(LirBlock block, GimpleStatementAnnotations instruction, GimpleReturnStatement returnStatement)
     {
+        if (returnStatement.Expression is not null && TryGetLocalAggregateKey(returnStatement.Expression, out var composedKey))
+        {
+            if (_composedAggregates.TryGetValue(composedKey, out var composed))
+            {
+                EmitComposedReturn(block, returnStatement, composed);
+                return;
+            }
+            if (composedKey.Symbol is not null && _parameterParts.TryGetValue(composedKey.Symbol, out var parts))
+            {
+                Emit(block, LirInstructionKind.Return, null, ImmutableArray.Create(ParameterSegments(returnStatement.Expression.Type, parts)), address: null,
+                    op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null,
+                    trueTarget: null, falseTarget: null, sourceStatement: returnStatement, sourceValue: returnStatement.Expression,
+                    sourceInstruction: instruction, valueNumber: null);
+                return;
+            }
+        }
+
         var operands = ImmutableArray<LirOperand>.Empty;
         if (returnStatement.Expression is not null)
         {
@@ -2392,6 +2488,784 @@ internal sealed class LirFunctionBuilder
         }
 
         Emit(block, LirInstructionKind.Return, null, operands, address: null, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: returnStatement, sourceValue: returnStatement.Expression, sourceInstruction: instruction, valueNumber: null);
+    }
+
+    private sealed class ComposedAggregate
+    {
+        public readonly QualifiedType Type;
+        public readonly ImmutableArray<(int Offset, QualifiedType Type)> Leaves;
+        public readonly LirOperand?[] Values;
+        public ControlFlowBlock? Block;
+        public bool Returned;
+        public AbiValue? Argument;
+
+        public ComposedAggregate(QualifiedType type, ImmutableArray<(int Offset, QualifiedType Type)> leaves)
+        {
+            Type = type;
+            Leaves = leaves;
+            Values = new LirOperand?[leaves.Length];
+        }
+
+        public bool ArgumentInMemory => Argument is { PassingKind: AbiPassingKind.Indirect or AbiPassingKind.Stack };
+    }
+
+    /// <summary>Finds locals a return or a call takes whole right after their block stores every leaf, so the value skips the local</summary>
+    private void FindComposedAggregates()
+    {
+        var locals = new HashSet<Symbol>();
+        foreach (var block in _function.Blocks)
+        {
+            foreach (var instruction in block.Statements)
+            {
+                if (instruction.Statement is GimpleDeclarationStatement { Symbol: VariableSymbol { ExplicitRegisterName: null } variable } declaration &&
+                    declaration.StorageClass is StorageClass.None or StorageClass.Auto or StorageClass.Register &&
+                    !GimpleTypes.IsVolatileOrAtomic(variable.Type) &&
+                    variable.StorageClass is StorageClass.None or StorageClass.Auto or StorageClass.Register)
+                {
+                    locals.Add(variable);
+                }
+            }
+        }
+
+        var returnType = _function.Symbol?.FunctionType?.ReturnType;
+        var candidates = new Dictionary<GimpleVariableKey, ComposedAggregate>();
+        foreach (var block in _function.Blocks)
+        {
+            foreach (var instruction in block.Statements)
+            {
+                switch (instruction.Statement)
+                {
+                    case GimpleReturnStatement { Expression: GimpleValue returned } when
+                        returned.Type.Type is TagType returnedTag && returnType?.Type is TagType returnTag &&
+                        ReferenceEquals(returnedTag.Symbol, returnTag.Symbol):
+                        if (TryAddComposedCandidate(candidates, locals, returned, out var returnedCandidate))
+                            returnedCandidate.Returned = true;
+                        break;
+
+                    case GimpleCallStatement call:
+                        for (var i = 0; i < call.Arguments.Length; i++)
+                        {
+                            if (IsComposableArgument(call, i) && TryAddComposedCandidate(candidates, locals, call.Arguments[i], out var passed))
+                                passed.Argument = CAbi.ClassifyValue(_target, passed.Type, isReturn: false, isVariadicUnnamedArgument: false);
+                        }
+                        break;
+                }
+            }
+        }
+        if (candidates.Count == 0)
+            return;
+
+        var stores = new Dictionary<GimpleStatement, (GimpleVariableKey Key, int Leaf)>();
+        var zeros = new Dictionary<GimpleStatement, GimpleVariableKey>();
+        var rejected = new HashSet<GimpleVariableKey>();
+        var stored = new Dictionary<GimpleVariableKey, HashSet<int>>();
+        var passedKeys = new HashSet<GimpleVariableKey>();
+        foreach (var block in _function.Blocks)
+        {
+            if (_reachableControlFlowBlocks.Count != 0 && !_reachableControlFlowBlocks.Contains(block.ControlFlowBlock))
+                continue;
+
+            stored.Clear();
+            foreach (var instruction in block.Statements)
+            {
+                switch (instruction.Statement)
+                {
+                    case GimpleDeclarationStatement:
+                        continue;
+
+                    case GimpleAssignStatement { IsConstructor: true } zero when TryGetLocalAggregateKey(zero.Lhs, out var zeroKey) && candidates.ContainsKey(zeroKey):
+                        zeros.Add(zero, zeroKey);
+                        stored[zeroKey] = Enumerable.Range(0, candidates[zeroKey].Leaves.Length).ToHashSet();
+                        continue;
+
+                    case GimpleAssignStatement { IsCopy: true } store when
+                        TryResolveComposedLeaf(store.Lhs, candidates, out var storeKey, out var leaf) &&
+                        TryGetExpression(instruction, 1, out var value) && (value.Name is not null || value.Original is GimpleConstantValue):
+                        stores.Add(store, (storeKey, leaf));
+                        if (!stored.TryGetValue(storeKey, out var storedLeaves))
+                            stored.Add(storeKey, storedLeaves = new HashSet<int>());
+                        storedLeaves.Add(leaf);
+                        continue;
+
+                    case GimpleReturnStatement { Expression: GimpleValue returned } when
+                        TryGetLocalAggregateKey(returned, out var returnKey) && candidates.TryGetValue(returnKey, out var candidate) && candidate.Returned:
+                        RequireComposedLeaves(stored, returnKey, candidate, rejected);
+                        continue;
+
+                    case GimpleCallStatement call:
+                        passedKeys.Clear();
+                        var keptSegments = KeptArgumentSegments(call);
+                        for (var i = 0; i < call.Arguments.Length; i++)
+                        {
+                            if (IsComposableArgument(call, i) && TryGetLocalAggregateKey(call.Arguments[i], out var argumentKey) &&
+                                candidates.TryGetValue(argumentKey, out var argument) && argument.Argument is not null)
+                            {
+                                if (!passedKeys.Add(argumentKey) || !argument.ArgumentInMemory && !keptSegments[i])
+                                    rejected.Add(argumentKey);
+                                RequireComposedLeaves(stored, argumentKey, argument, rejected);
+                            }
+                            else
+                            {
+                                RejectComposedReferences(call.Arguments[i], candidates, rejected);
+                            }
+                        }
+                        if (call.Lhs is not null)
+                            RejectComposedReferences(call.Lhs, candidates, rejected);
+                        RejectComposedReferences(call.Function, candidates, rejected);
+
+                        // A callee may change the object it gets in memory, so the local holds nothing afterwards
+                        foreach (var key in passedKeys)
+                        {
+                            if (candidates[key].ArgumentInMemory)
+                                stored.Remove(key);
+                        }
+                        continue;
+                }
+
+                foreach (var operand in StatementValues(instruction.Statement))
+                    RejectComposedReferences(operand, candidates, rejected);
+            }
+        }
+
+        var returnAbi = returnType is QualifiedType type
+            ? CAbi.ClassifyValue(_target, type, isReturn: true, isVariadicUnnamedArgument: false)
+            : default;
+        foreach (var pair in candidates)
+        {
+            var candidate = pair.Value;
+            if (rejected.Contains(pair.Key))
+                continue;
+            if (candidate.ArgumentInMemory)
+                _inPlaceArguments.Add(pair.Key);
+            else if ((!candidate.Returned || FitsSegments(candidate, returnAbi)) &&
+                (candidate.Argument is not AbiValue argument || argument.PassingKind != AbiPassingKind.Indirect && FitsSegments(candidate, argument)))
+            {
+                _composedAggregates.Add(pair.Key, candidate);
+            }
+        }
+        foreach (var pair in stores)
+        {
+            if (_composedAggregates.TryGetValue(pair.Value.Key, out var aggregate))
+                _composedStores.Add(pair.Key, (aggregate, pair.Value.Leaf));
+        }
+        foreach (var pair in zeros)
+        {
+            if (_composedAggregates.TryGetValue(pair.Value, out var aggregate))
+                _composedZeros.Add(pair.Key, aggregate);
+        }
+    }
+
+    private static void RequireComposedLeaves(
+        Dictionary<GimpleVariableKey, HashSet<int>> stored,
+        GimpleVariableKey key,
+        ComposedAggregate candidate,
+        HashSet<GimpleVariableKey> rejected)
+    {
+        if (!stored.TryGetValue(key, out var covered) || covered.Count != candidate.Leaves.Length)
+            rejected.Add(key);
+    }
+
+    /// <summary>Reads register parameters from their segments and reaches by-reference ones through the caller's copy</summary>
+    private void FindDecomposedParameters()
+    {
+        if (_function.Symbol?.FunctionType is not { IsVariadic: false } functionType)
+            return;
+
+        var candidates = new Dictionary<GimpleVariableKey, ComposedAggregate>();
+        var cursor = new AbiCursor();
+        if (CAbi.RequiresHiddenReturnBuffer(_target, functionType.ReturnType))
+            _ = CAbi.AssignHiddenReturnBufferLocation(_target, ref cursor, _target.PointerSize);
+        foreach (var parameter in functionType.Parameters)
+        {
+            var abi = CAbi.ClassifyValue(_target, parameter.Type, isReturn: false, isVariadicUnnamedArgument: false);
+            var placement = CAbi.PlaceArgument(abi, ref cursor, _target.PointerSize);
+            if (_promotedSymbols.ContainsKey(parameter) || !GimpleTypes.IsAggregate(parameter.Type) || !placement.KeepsClassification(abi))
+                continue;
+            if (abi.PassingKind == AbiPassingKind.Indirect)
+            {
+                _indirectParameters.Add(parameter, NewVirtualRegister(new QualifiedType(TypeCatalog.Instance.PointerTo(parameter.Type)), sourceName: null, valueNumber: null));
+                continue;
+            }
+
+            var leaves = ImmutableArray.CreateBuilder<(int Offset, QualifiedType Type)>();
+            if (abi.PassingKind is not (AbiPassingKind.Scalar or AbiPassingKind.MultiRegister) ||
+                parameter.Type.Type is not TagType { Symbol.TagKind: TagKind.Struct } || GimpleTypes.IsVolatileOrAtomic(parameter.Type) ||
+                !AddComposableLeaves(parameter.Type, 0, leaves) || leaves.Count == 0 || leaves.Count > MaxComposedLeaves)
+            {
+                continue;
+            }
+            var candidate = new ComposedAggregate(parameter.Type, leaves.ToImmutable()) { Argument = abi };
+            if (FitsSegments(candidate, abi))
+                candidates.Add(GimpleVariableKey.FromSymbol(parameter), candidate);
+        }
+        if (candidates.Count == 0)
+            return;
+
+        var returnAbi = CAbi.ClassifyValue(_target, functionType.ReturnType, isReturn: true, isVariadicUnnamedArgument: false);
+        var reads = new Dictionary<GimpleStatement, (GimpleVariableKey Key, int Leaf)>();
+        var rejected = new HashSet<GimpleVariableKey>();
+        foreach (var block in _function.Blocks)
+        {
+            foreach (var instruction in block.Statements)
+            {
+                switch (instruction.Statement)
+                {
+                    case GimpleAssignStatement { IsCopy: true, Op1: GimpleValue source } read when TryResolveComposedLeaf(source, candidates, out var key, out var leaf):
+                        reads.Add(read, (key, leaf));
+                        RejectComposedReferences(read.Lhs, candidates, rejected);
+                        continue;
+
+                    case GimpleCallStatement call:
+                        var keptSegments = KeptArgumentSegments(call);
+                        for (var i = 0; i < call.Arguments.Length; i++)
+                        {
+                            if (!IsComposableArgument(call, i) || !TryGetLocalAggregateKey(call.Arguments[i], out var argumentKey) || !candidates.ContainsKey(argumentKey))
+                                RejectComposedReferences(call.Arguments[i], candidates, rejected);
+                            else if (!keptSegments[i])
+                                rejected.Add(argumentKey);
+                        }
+                        if (call.Lhs is not null)
+                            RejectComposedReferences(call.Lhs, candidates, rejected);
+                        RejectComposedReferences(call.Function, candidates, rejected);
+                        continue;
+
+                    case GimpleReturnStatement { Expression: GimpleValue returned } when
+                        TryGetLocalAggregateKey(returned, out var returnKey) && candidates.TryGetValue(returnKey, out var returnedParameter):
+                        if (!SameSegments(returnedParameter.Argument!.Value, returnAbi))
+                            rejected.Add(returnKey);
+                        continue;
+                }
+
+                foreach (var operand in StatementValues(instruction.Statement))
+                    RejectComposedReferences(operand, candidates, rejected);
+            }
+        }
+
+        foreach (var pair in candidates)
+        {
+            if (rejected.Contains(pair.Key))
+                continue;
+            var segments = pair.Value.Argument!.Value.Segments;
+            var parts = ImmutableArray.CreateBuilder<LirVirtualRegister>(segments.Length);
+            foreach (var segment in segments)
+            {
+                var partType = segment.RegisterClass == AbiRegisterClass.General
+                    ? UnsignedOfSize(Math.Min(_target.RegisterSize, 8))
+                    : TypeCatalog.Instance.Builtin(segment.Size == 4 ? BuiltinTypeKind.Float : BuiltinTypeKind.Double);
+                parts.Add(NewVirtualRegister(partType, sourceName: null, valueNumber: null));
+            }
+            _parameterParts.Add(pair.Key.Symbol!, parts.MoveToImmutable());
+        }
+        foreach (var pair in reads)
+        {
+            if (_parameterParts.TryGetValue(pair.Value.Key.Symbol!, out var parts))
+                _parameterLeafReads.Add(pair.Key, (candidates[pair.Value.Key], parts, pair.Value.Leaf));
+        }
+    }
+
+    private static bool SameSegments(AbiValue left, AbiValue right)
+    {
+        if (right.PassingKind is not (AbiPassingKind.Scalar or AbiPassingKind.MultiRegister) || left.Segments.Length != right.Segments.Length)
+            return false;
+        for (var i = 0; i < left.Segments.Length; i++)
+        {
+            if (left.Segments[i].Offset != right.Segments[i].Offset || left.Segments[i].Size != right.Segments[i].Size ||
+                left.Segments[i].RegisterClass != right.Segments[i].RegisterClass)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static LirOperand ParameterSegments(QualifiedType type, ImmutableArray<LirVirtualRegister> parts)
+        => LirOperand.ForSegments(type, parts.Select(LirOperand.ForRegister).ToImmutableArray());
+
+    private LirOperand EmitParameterLeaf(LirBlock block, ComposedAggregate parameter, ImmutableArray<LirVirtualRegister> parts, int leaf)
+    {
+        var (offset, type) = parameter.Leaves[leaf];
+        var size = _target.SizeOf(type);
+        var segments = parameter.Argument!.Value.Segments;
+        var index = 0;
+        while (offset >= segments[index].Offset + segments[index].Size)
+            index++;
+
+        var part = LirOperand.ForRegister(parts[index]);
+        var partSize = _target.SizeOf(part.Type);
+        if (GimpleTypes.IsFloating(part.Type) && offset == segments[index].Offset && size == partSize)
+            return part;
+
+        var bits = GimpleTypes.IsFloating(part.Type)
+            ? EmitComposedInstruction(block, LirInstructionKind.Cast, UnsignedOfSize(partSize), ImmutableArray.Create(part), GimpleTreeCode.ViewConvertExpr)
+            : part;
+        var shift = (offset - segments[index].Offset) * 8;
+        if (shift != 0)
+        {
+            bits = EmitComposedInstruction(block, LirInstructionKind.Binary, UnsignedOfSize(partSize),
+                ImmutableArray.Create(bits, LirOperand.ImmediateValue(shift, new QualifiedType(TypeCatalog.Instance.Int))), GimpleTreeCode.RshiftExpr);
+        }
+        if (size < partSize)
+            bits = EmitComposedInstruction(block, LirInstructionKind.Convert, UnsignedOfSize(size), ImmutableArray.Create(bits), GimpleTreeCode.NopExpr);
+        return GimpleTypes.IsFloating(type)
+            ? EmitComposedInstruction(block, LirInstructionKind.Cast, type, ImmutableArray.Create(bits), GimpleTreeCode.ViewConvertExpr)
+            : EmitComposedInstruction(block, LirInstructionKind.Convert, type, ImmutableArray.Create(bits), GimpleOperators.ConversionCode(bits.Type, type));
+    }
+
+    // Walks the arguments the way the code generators place them; a composed one must travel as it was classified
+    private bool[] KeptArgumentSegments(GimpleCallStatement call)
+    {
+        var kept = new bool[call.Arguments.Length];
+        if (call.FunctionType is not { IsVariadic: false } || TryGetRuntimeIntrinsic(call.Function, out _))
+            return kept;
+
+        var cursor = new AbiCursor();
+        if (CAbi.RequiresHiddenReturnBuffer(_target, call.Type))
+            _ = CAbi.AssignHiddenReturnBufferLocation(_target, ref cursor, _target.PointerSize);
+        for (var i = 0; i < kept.Length; i++)
+        {
+            var classified = CAbi.ClassifyValue(_target, call.Arguments[i].Type, isReturn: false, isVariadicUnnamedArgument: false);
+            kept[i] = CAbi.PlaceArgument(classified, ref cursor, _target.PointerSize).KeepsClassification(classified);
+        }
+        return kept;
+    }
+
+    private bool IsComposableArgument(GimpleCallStatement call, int index)
+        => call.FunctionType is { IsVariadic: false } signature && index < signature.Parameters.Length && !TryGetRuntimeIntrinsic(call.Function, out _);
+
+    private bool TryAddComposedCandidate(
+        Dictionary<GimpleVariableKey, ComposedAggregate> candidates,
+        HashSet<Symbol> locals,
+        GimpleValue value,
+        out ComposedAggregate candidate)
+    {
+        candidate = null!;
+        if (!TryGetLocalAggregateKey(value, out var key) || key.Symbol is not null && !locals.Contains(key.Symbol) ||
+            value.Type.Type is not TagType { Symbol.TagKind: TagKind.Struct })
+        {
+            return false;
+        }
+        if (candidates.TryGetValue(key, out candidate!))
+            return true;
+
+        var leaves = ImmutableArray.CreateBuilder<(int Offset, QualifiedType Type)>();
+        if (!AddComposableLeaves(value.Type, 0, leaves) || leaves.Count == 0 || leaves.Count > MaxComposedLeaves)
+            return false;
+        candidates.Add(key, candidate = new ComposedAggregate(value.Type, leaves.ToImmutable()));
+        return true;
+    }
+
+    // An indirect return stores the leaves through the buffer; registers take them only where a segment holds them whole
+    private bool FitsSegments(ComposedAggregate aggregate, AbiValue abi)
+    {
+        var leaves = aggregate.Leaves;
+        if (abi.PassingKind == AbiPassingKind.Indirect)
+            return true;
+        if (abi.PassingKind is not (AbiPassingKind.Scalar or AbiPassingKind.MultiRegister) || _target.Architecture == TargetArchitectureKind.Arm32)
+            return false;
+
+        var placed = 0;
+        foreach (var segment in abi.Segments)
+        {
+            var width = ComposedSegmentWidth(segment);
+            var parts = leaves.Where(leaf => leaf.Offset >= segment.Offset && leaf.Offset < segment.Offset + segment.Size).ToArray();
+            placed += parts.Length;
+            if (width == 0 || parts.Any(leaf => leaf.Offset + _target.SizeOf(leaf.Type) > segment.Offset + segment.Size))
+                return false;
+            if (segment.RegisterClass == AbiRegisterClass.General
+                ? parts.Any(leaf => _target.SizeOf(leaf.Type) > width)
+                : !parts.All(leaf => GimpleTypes.IsFloating(leaf.Type)) ||
+                  !(parts.Length == 1 && parts[0].Offset == segment.Offset && _target.SizeOf(parts[0].Type) == segment.Size) &&
+                  !(segment.Size == width && parts.All(leaf => _target.SizeOf(leaf.Type) == 4)))
+            {
+                return false;
+            }
+        }
+
+        return placed == leaves.Length;
+    }
+
+    private int ComposedSegmentWidth(AbiSegment segment)
+        => segment.Size <= 4 ? 4 : segment.Size <= 8 && _target.RegisterSize >= 8 ? 8 : 0;
+
+    private bool AddComposableLeaves(QualifiedType type, int offset, ImmutableArray<(int Offset, QualifiedType Type)>.Builder leaves)
+    {
+        switch (type.Type)
+        {
+            case TagType { Symbol: { TagKind: TagKind.Struct, IsComplete: true } tag }:
+                foreach (var field in tag.Fields)
+                {
+                    if (field.IsBitField || !AddComposableLeaves(field.Type, checked(offset + _target.GetFieldPlacement(field).ByteOffset), leaves))
+                        return false;
+                }
+                return true;
+
+            case ArrayType { Length: long length } array when length <= MaxComposedLeaves:
+                var elementSize = _target.SizeOf(array.ElementType);
+                for (var i = 0; i < length; i++)
+                {
+                    if (!AddComposableLeaves(array.ElementType, checked(offset + i * elementSize), leaves))
+                        return false;
+                }
+                return true;
+
+            case BuiltinType { BuiltinKind: BuiltinTypeKind.Float or BuiltinTypeKind.Double }:
+            case PointerType:
+            case EnumType:
+                leaves.Add((offset, type));
+                return leaves.Count <= MaxComposedLeaves;
+
+            default:
+                if (!GimpleTypes.IsIntegerLike(type))
+                    return false;
+                leaves.Add((offset, type));
+                return leaves.Count <= MaxComposedLeaves;
+        }
+    }
+
+    private bool TryResolveComposedLeaf(
+        GimpleValue place,
+        Dictionary<GimpleVariableKey, ComposedAggregate> candidates,
+        out GimpleVariableKey key,
+        out int leaf)
+    {
+        key = default;
+        leaf = -1;
+        var offset = 0;
+        var current = place;
+        while (true)
+        {
+            if (current is GimpleMemberAccessExpression { ThroughPointer: false, Field: { IsBitField: false } field } member)
+            {
+                offset = checked(offset + _target.GetFieldPlacement(field).ByteOffset);
+                current = member.Expression;
+            }
+            else if (current is GimpleElementAccessExpression { Index: GimpleConstantValue index } element &&
+                element.Expression.Type.Type is ArrayType { Length: long length } array &&
+                index.Value is not null && !GimpleTypes.IsFloating(index.Type) &&
+                Convert.ToInt64(index.Value, CultureInfo.InvariantCulture) is var position && position >= 0 && position < length)
+            {
+                offset = checked(offset + (int)position * _target.SizeOf(array.ElementType));
+                current = element.Expression;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        if (ReferenceEquals(current, place) || !TryGetLocalAggregateKey(current, out key) || !candidates.TryGetValue(key, out var aggregate))
+            return false;
+        for (var i = 0; i < aggregate.Leaves.Length; i++)
+        {
+            var (leafOffset, leafType) = aggregate.Leaves[i];
+            if (leafOffset == offset && _target.SizeOf(leafType) == _target.SizeOf(place.Type) &&
+                GimpleTypes.IsFloating(leafType) == GimpleTypes.IsFloating(place.Type))
+            {
+                leaf = i;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private bool TryGetLocalAggregateKey(GimpleValue value, out GimpleVariableKey key)
+    {
+        switch (value)
+        {
+            case GimpleTemporaryValue temporary when !_promotedTemporaries.ContainsKey(temporary):
+                key = GimpleVariableKey.FromTemporary(temporary);
+                return true;
+            case GimpleSymbolValue { Symbol: VariableSymbol or ParameterSymbol } symbol when !_promotedSymbols.ContainsKey(symbol.Symbol):
+                key = GimpleVariableKey.FromSymbol(symbol.Symbol);
+                return true;
+            default:
+                key = default;
+                return false;
+        }
+    }
+
+    private static IEnumerable<GimpleValue> StatementValues(GimpleStatement statement)
+    {
+        switch (statement)
+        {
+            case GimpleAssignStatement assign:
+                yield return assign.Lhs;
+                foreach (var operand in assign.Operands)
+                    yield return operand;
+                break;
+            case GimpleCallStatement call:
+                if (call.Lhs is not null)
+                    yield return call.Lhs;
+                yield return call.Function;
+                foreach (var argument in call.Arguments)
+                    yield return argument;
+                break;
+            case GimpleCondStatement condition:
+                yield return condition.Lhs;
+                yield return condition.Rhs;
+                break;
+            case GimpleSwitchStatement switchStatement:
+                yield return switchStatement.Expression;
+                break;
+            case GimpleReturnStatement { Expression: GimpleValue returned }:
+                yield return returned;
+                break;
+            case GimpleAsmStatement asm:
+                foreach (var operand in asm.Outputs.Concat(asm.Inputs))
+                {
+                    if (operand.Target is not null)
+                        yield return operand.Target;
+                    if (operand.Value is not null)
+                        yield return operand.Value;
+                }
+                break;
+        }
+    }
+
+    private static void RejectComposedReferences(
+        GimpleValue? value,
+        Dictionary<GimpleVariableKey, ComposedAggregate> candidates,
+        HashSet<GimpleVariableKey> rejected)
+    {
+        switch (value)
+        {
+            case GimpleSymbolValue symbol when candidates.ContainsKey(GimpleVariableKey.FromSymbol(symbol.Symbol)):
+                rejected.Add(GimpleVariableKey.FromSymbol(symbol.Symbol));
+                break;
+            case GimpleTemporaryValue temporary when candidates.ContainsKey(GimpleVariableKey.FromTemporary(temporary)):
+                rejected.Add(GimpleVariableKey.FromTemporary(temporary));
+                break;
+            case GimpleMemberAccessExpression member:
+                RejectComposedReferences(member.Expression, candidates, rejected);
+                break;
+            case GimpleElementAccessExpression element:
+                RejectComposedReferences(element.Expression, candidates, rejected);
+                RejectComposedReferences(element.Index, candidates, rejected);
+                break;
+            case GimpleIndirectExpression indirect:
+                RejectComposedReferences(indirect.Address, candidates, rejected);
+                break;
+            case GimpleAddressOfExpression address:
+                RejectComposedReferences(address.Target, candidates, rejected);
+                break;
+            case GimpleConversionExpression conversion:
+                RejectComposedReferences(conversion.Operand, candidates, rejected);
+                break;
+            case GimpleCastExpression cast:
+                RejectComposedReferences(cast.Operand, candidates, rejected);
+                break;
+            case GimpleUnaryExpression unary:
+                RejectComposedReferences(unary.Operand, candidates, rejected);
+                break;
+            case GimpleBinaryExpression binary:
+                RejectComposedReferences(binary.Left, candidates, rejected);
+                RejectComposedReferences(binary.Right, candidates, rejected);
+                break;
+        }
+    }
+
+    private void RecordComposedLeaf(LirBlock block, GimpleStatementAnnotations instruction, ComposedAggregate aggregate, int leaf)
+    {
+        var value = TryGetExpression(instruction, 1, out var expression)
+            ? EmitValue(block, expression)
+            : EmitValue(block, ((GimpleAssignStatement)instruction.Statement).Operands[0], expression: null);
+        BeginComposedBlock(aggregate);
+        aggregate.Values[leaf] = value;
+    }
+
+    private void BeginComposedBlock(ComposedAggregate aggregate)
+    {
+        if (ReferenceEquals(aggregate.Block, _currentGimpleBlock))
+            return;
+        Array.Clear(aggregate.Values);
+        aggregate.Block = _currentGimpleBlock;
+    }
+
+    private void EmitComposedReturn(LirBlock block, GimpleReturnStatement returnStatement, ComposedAggregate aggregate)
+    {
+        var returnType = _function.Symbol!.FunctionType!.ReturnType;
+        var abi = CAbi.ClassifyValue(_target, returnType, isReturn: true, isVariadicUnnamedArgument: false);
+        if (abi.PassingKind == AbiPassingKind.Indirect)
+        {
+            var buffer = NewVirtualRegister(new QualifiedType(TypeCatalog.Instance.PointerTo(returnType)), sourceName: null, valueNumber: null);
+            Emit(block, LirInstructionKind.ReturnBuffer, buffer, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null,
+                callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
+                sourceStatement: returnStatement, sourceValue: null, sourceInstruction: null, valueNumber: null);
+            var target = LirAddress.Indirect(LirOperand.ForRegister(buffer), returnType);
+            for (var i = 0; i < aggregate.Leaves.Length; i++)
+            {
+                var (offset, type) = aggregate.Leaves[i];
+                Emit(block, LirInstructionKind.Store, null, ImmutableArray.Create(aggregate.Values[i]!), LirAddress.ForField(target, null, type, offset),
+                    op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null,
+                    trueTarget: null, falseTarget: null, sourceStatement: returnStatement, sourceValue: null, sourceInstruction: null, valueNumber: null);
+            }
+            Emit(block, LirInstructionKind.Return, null, ImmutableArray<LirOperand>.Empty, address: null, op: LirInstruction.BufferReturn,
+                conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null,
+                falseTarget: null, sourceStatement: returnStatement, sourceValue: returnStatement.Expression, sourceInstruction: null, valueNumber: null);
+            return;
+        }
+
+        Emit(block, LirInstructionKind.Return, null, ImmutableArray.Create(ComposeSegments(block, abi, aggregate)), address: null, op: string.Empty,
+            conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null,
+            falseTarget: null, sourceStatement: returnStatement, sourceValue: returnStatement.Expression, sourceInstruction: null, valueNumber: null);
+    }
+
+    private LirOperand ComposeSegments(LirBlock block, AbiValue abi, ComposedAggregate aggregate)
+    {
+        var parts = ImmutableArray.CreateBuilder<LirOperand>(abi.Segments.Length);
+        foreach (var segment in abi.Segments)
+            parts.Add(ComposeSegment(block, segment, aggregate));
+        return LirOperand.ForSegments(aggregate.Type, parts.MoveToImmutable());
+    }
+
+    private LirOperand? TryEmitComposedArgument(LirBlock block, GimpleCallStatement call, int index)
+    {
+        var argument = call.Arguments[index];
+        if (!GimpleTypes.IsAggregate(argument.Type) || !IsComposableArgument(call, index) || !TryGetLocalAggregateKey(argument, out var key))
+            return null;
+        if (_composedAggregates.TryGetValue(key, out var aggregate))
+            return aggregate.Argument is AbiValue abi ? ComposeSegments(block, abi, aggregate) : null;
+        if (key.Symbol is not null && _parameterParts.TryGetValue(key.Symbol, out var parts))
+            return ParameterSegments(argument.Type, parts);
+
+        // A callee may own a local stored again before any read; registers and the stack copy straight from it
+        if (!_inPlaceArguments.Contains(key) &&
+            CAbi.ClassifyValue(_target, argument.Type, isReturn: false, isVariadicUnnamedArgument: false).PassingKind is not
+                (AbiPassingKind.Scalar or AbiPassingKind.MultiRegister or AbiPassingKind.Stack))
+        {
+            return null;
+        }
+        var slot = key.Symbol is not null
+            ? _stackSlotsBySymbol.GetValueOrDefault(key.Symbol)
+            : _stackSlotsByTemporary.GetValueOrDefault(key.Temporary!);
+        if (slot is null)
+            return null;
+        var register = NewVirtualRegister(argument.Type, sourceName: null, valueNumber: null);
+        register.HomeSlot = slot;
+        return LirOperand.ForRegister(register);
+    }
+
+    private LirOperand ComposeSegment(LirBlock block, AbiSegment segment, ComposedAggregate aggregate)
+    {
+        var parts = new List<int>();
+        for (var i = 0; i < aggregate.Leaves.Length; i++)
+        {
+            if (aggregate.Leaves[i].Offset >= segment.Offset && aggregate.Leaves[i].Offset < segment.Offset + segment.Size)
+                parts.Add(i);
+        }
+
+        if (segment.RegisterClass != AbiRegisterClass.General && parts.Count == 1 && _target.SizeOf(aggregate.Leaves[parts[0]].Type) == segment.Size)
+            return InRegister(block, aggregate.Values[parts[0]]!, aggregate.Leaves[parts[0]].Type);
+
+        var width = ComposedSegmentWidth(segment);
+        var bitsType = UnsignedOfSize(width);
+        ulong constant = 0;
+        LirOperand? bits = null;
+        foreach (var part in parts)
+        {
+            var (offset, type) = aggregate.Leaves[part];
+            var value = aggregate.Values[part]!;
+            var size = _target.SizeOf(type);
+            var shift = (offset - segment.Offset) * 8;
+            if (value.Kind == LirOperandKind.Immediate && TryGetImmediateBits(value.Immediate, type, out var immediate))
+            {
+                constant |= (size >= 8 ? immediate : immediate & ((1UL << (size * 8)) - 1)) << shift;
+                continue;
+            }
+
+            var piece = InRegister(block, value, type);
+            var raw = UnsignedOfSize(size);
+            piece = GimpleTypes.IsFloating(type)
+                ? EmitComposedInstruction(block, LirInstructionKind.Cast, raw, ImmutableArray.Create(piece), GimpleTreeCode.ViewConvertExpr)
+                : EmitComposedInstruction(block, LirInstructionKind.Convert, raw, ImmutableArray.Create(piece), GimpleTreeCode.NopExpr);
+            if (size < width)
+                piece = EmitComposedInstruction(block, LirInstructionKind.Convert, bitsType, ImmutableArray.Create(piece), GimpleTreeCode.ConvertExpr);
+            if (shift != 0)
+            {
+                piece = EmitComposedInstruction(block, LirInstructionKind.Binary, bitsType,
+                    ImmutableArray.Create(piece, LirOperand.ImmediateValue(shift, new QualifiedType(TypeCatalog.Instance.Int))), GimpleTreeCode.LshiftExpr);
+            }
+            bits = bits is null
+                ? piece
+                : EmitComposedInstruction(block, LirInstructionKind.Binary, bitsType, ImmutableArray.Create(bits, piece), GimpleTreeCode.BitIorExpr);
+        }
+
+        var constantOperand = LirOperand.ImmediateValue(width == 8 ? constant : (object)(uint)constant, bitsType);
+        if (bits is null)
+            bits = InRegister(block, constantOperand, bitsType);
+        else if (constant != 0)
+            bits = EmitComposedInstruction(block, LirInstructionKind.Binary, bitsType, ImmutableArray.Create(bits, constantOperand), GimpleTreeCode.BitIorExpr);
+
+        if (segment.RegisterClass == AbiRegisterClass.General)
+            return bits;
+        var floating = TypeCatalog.Instance.Builtin(width == 8 ? BuiltinTypeKind.Double : BuiltinTypeKind.Float);
+        return EmitComposedInstruction(block, LirInstructionKind.Cast, floating, ImmutableArray.Create(bits), GimpleTreeCode.ViewConvertExpr);
+    }
+
+    private LirOperand InRegister(LirBlock block, LirOperand value, QualifiedType type)
+    {
+        if (value.Kind == LirOperandKind.Register)
+            return value;
+        var register = NewVirtualRegister(type, sourceName: null, valueNumber: null);
+        Emit(block, LirInstructionKind.Constant, register, ImmutableArray.Create(value), address: null, op: string.Empty, conversionKind: null,
+            callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
+            sourceStatement: null, sourceValue: null, sourceInstruction: null, valueNumber: null);
+        return LirOperand.ForRegister(register);
+    }
+
+    private LirOperand EmitComposedInstruction(LirBlock block, LirInstructionKind kind, QualifiedType type, ImmutableArray<LirOperand> operands, GimpleTreeCode code)
+    {
+        var result = NewVirtualRegister(type, sourceName: null, valueNumber: null);
+        Emit(block, kind, result, operands, address: null,
+            op: kind == LirInstructionKind.Binary ? GimpleOperators.Spelling(code) : GimpleOperators.Name(code),
+            conversionKind: kind == LirInstructionKind.Binary ? null : ConversionKindOf(code), callSignature: null, parallelCopies: default,
+            switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: null, sourceValue: null,
+            sourceInstruction: null, valueNumber: null, treeCode: code);
+        return LirOperand.ForRegister(result);
+    }
+
+    private static QualifiedType UnsignedOfSize(int size)
+        => TypeCatalog.Instance.Builtin(size switch
+        {
+            1 => BuiltinTypeKind.UnsignedChar,
+            2 => BuiltinTypeKind.UnsignedShort,
+            4 => BuiltinTypeKind.UnsignedInt,
+            _ => BuiltinTypeKind.UnsignedLongLong,
+        });
+
+    private static bool TryGetImmediateBits(object? value, QualifiedType type, out ulong bits)
+    {
+        bits = 0;
+        if (GimpleTypes.IsFloating(type))
+        {
+            if (value is null or string)
+                return false;
+            var number = Convert.ToDouble(value, CultureInfo.InvariantCulture);
+            bits = type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Float }
+                ? (uint)BitConverter.SingleToInt32Bits((float)number)
+                : (ulong)BitConverter.DoubleToInt64Bits(number);
+            return true;
+        }
+
+        switch (value)
+        {
+            case null:
+                return true;
+            case bool flag:
+                bits = flag ? 1UL : 0UL;
+                return true;
+            case char character:
+                bits = character;
+                return true;
+            case ulong unsignedValue:
+                bits = unsignedValue;
+                return true;
+            case sbyte or byte or short or ushort or int or uint or long:
+                bits = unchecked((ulong)Convert.ToInt64(value, CultureInfo.InvariantCulture));
+                return true;
+            default:
+                return false;
+        }
     }
 
     private void TranslateAsm(LirBlock block, GimpleStatementAnnotations instruction, GimpleAsmStatement asmStatement)
@@ -2712,7 +3586,7 @@ internal sealed class LirFunctionBuilder
         var operands = ImmutableArray.CreateBuilder<LirOperand>(call.Arguments.Length + 1);
         operands.Add(EmitCallOperand(block, instruction, functionIndex, call.Function));
         for (var i = 0; i < call.Arguments.Length; i++)
-            operands.Add(EmitCallOperand(block, instruction, functionIndex + 1 + i, call.Arguments[i]));
+            operands.Add(TryEmitComposedArgument(block, call, i) ?? EmitCallOperand(block, instruction, functionIndex + 1 + i, call.Arguments[i]));
 
         // A destination the renamer left in memory still needs the result materialized before it is stored
         var storesToMemory = call.Lhs is not null && GetPrimaryDefinition(instruction) is null;
@@ -2889,6 +3763,8 @@ internal sealed class LirFunctionBuilder
             case GimpleSymbolValue symbolValue:
                 if (_stackSlotsBySymbol.TryGetValue(symbolValue.Symbol, out var slot))
                     return LirAddress.ForStackSlot(slot);
+                if (_indirectParameters.TryGetValue(symbolValue.Symbol, out var incoming))
+                    return LirAddress.Indirect(LirOperand.ForRegister(incoming), symbolValue.Type);
 
                 if (_localDeclarationsBySymbol.TryGetValue(symbolValue.Symbol, out var declaration) && IsStackAllocatedLocal(declaration))
                     return LirAddress.ForStackSlot(GetOrCreateStackSlot(declaration));
@@ -3067,7 +3943,7 @@ internal sealed class LirFunctionBuilder
 
     // A symbol the frame holds is reached through the stack pointer, not through an address of its own
     private bool IsFrameResident(Symbol symbol)
-        => _stackSlotsBySymbol.ContainsKey(symbol) ||
+        => _stackSlotsBySymbol.ContainsKey(symbol) || _indirectParameters.ContainsKey(symbol) || _parameterParts.ContainsKey(symbol) ||
             (_localDeclarationsBySymbol.TryGetValue(symbol, out var declaration) && IsStackAllocatedLocal(declaration));
 
     // One widened value has to replace several, or the emitter temporary is the cheaper way to get it
@@ -3454,6 +4330,11 @@ internal sealed class LirFunctionBuilder
             case LirOperandKind.Address:
                 if (operand.Address is not null)
                     CountAddressUses(operand.Address, uses);
+                break;
+
+            case LirOperandKind.Segments:
+                foreach (var part in operand.Parts)
+                    CountOperandUses(part, uses);
                 break;
         }
     }
@@ -4360,7 +5241,13 @@ public sealed class LirPrinter
                 break;
 
             case LirInstructionKind.Return:
-                line += instruction.Operands.Length == 0 ? "return" : "return " + FormatOperand(instruction.Operands[0]);
+                line += instruction.Operands.Length == 0 ? "return" : "return " + string.Join(", ", instruction.Operands.Select(FormatOperand));
+                if (instruction.Operator.Length != 0)
+                    line += " ; " + instruction.Operator;
+                break;
+
+            case LirInstructionKind.ReturnBuffer:
+                line += FormatResult(instruction) + " = returnbuffer";
                 break;
 
             case LirInstructionKind.Unreachable:
@@ -4401,6 +5288,8 @@ public sealed class LirPrinter
                 return operand.UndefinedName is null ? "undef" : "undef(" + operand.UndefinedName + ")";
             case LirOperandKind.Void:
                 return "void";
+            case LirOperandKind.Segments:
+                return "segments(" + string.Join(", ", operand.Parts.Select(FormatOperand)) + ")";
             default:
                 return "<none>";
         }

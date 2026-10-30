@@ -262,6 +262,8 @@ namespace Cnidaria.Cs
         /// <summary>Field access that addresses the parent struct's storage even though the parent is promoted.</summary>
         PromotionSync = 1u << 24,
         Unaligned = 1u << 25,
+        /// <summary>Store whose destination is never on the GC heap, so it needs no write barrier.</summary>
+        TargetNotOnHeap = 1u << 26,
         AssertionProperties = NullCheckEliminated | BoundsCheckEliminated | DivModNoByZero | DivModNoOverflow,
     }
     internal static class GenTreeIntrinsicSemantics
@@ -344,6 +346,7 @@ namespace Cnidaria.Cs
         StructMaterialization,
         CommonSubexpression,
         Lowering,
+        StackAllocatedObject,
     }
     internal readonly struct GenTemp
     {
@@ -531,8 +534,8 @@ namespace Cnidaria.Cs
         public int LclNum { get; }
         public GenLocalKind Kind { get; }
         public int Index { get; }
-        public RuntimeType? Type { get; }
-        public GenStackKind StackKind { get; }
+        public RuntimeType? Type { get; internal set; }
+        public GenStackKind StackKind { get; internal set; }
         public GenLocalCategory Category { get; internal set; }
         public GenLocalFlags LocalFlags { get; private set; }
         public int ParentLclNum { get; internal set; } = -1;
@@ -540,6 +543,7 @@ namespace Cnidaria.Cs
         public int FieldOffset { get; internal set; } = -1;
         public int FieldSize { get; internal set; } = -1;
         public RuntimeField? PromotedField { get; internal set; }
+        public int StackAllocatedArrayLength { get; internal set; } = -1;
         private readonly Dictionary<int, GenLocalDescriptor> _promotedFieldsByFieldId = new Dictionary<int, GenLocalDescriptor>();
         private readonly Dictionary<int, GenLocalDescriptor> _promotedFieldsByOffset = new Dictionary<int, GenLocalDescriptor>();
         public bool Tracked { get => (LocalFlags & GenLocalFlags.Tracked) != 0; internal set => SetLocalFlag(GenLocalFlags.Tracked, value); }
@@ -1191,6 +1195,11 @@ namespace Cnidaria.Cs
         }
 
         public bool HasBoundsCheckIndexOverride => BoundsCheckIndexOverride >= 0;
+
+        // Initializes the frame block its last operand addresses instead of allocating
+        public bool IsNewDelegateInPlace => Kind == GenTreeKind.NewDelegate && Int32 != 0;
+
+        public bool IsClosedNewDelegate => Kind == GenTreeKind.NewDelegate && Operands.Length > (Int32 != 0 ? 1 : 0);
 
         /// <summary>Reports whether array covariance can still invalidate the access, which only a store or an element address on a reference element type can</summary>
         public static bool RequiresArrayElementTypeCheck(GenTreeKind kind, RuntimeType? elementType)

@@ -15,10 +15,8 @@ namespace Cnidaria.Cs
     {
         public const string InitializeSymbol = "RhpInitialize";
         public const string GcPollSymbol = "RhpGcPoll";
+        public const string CollectSymbol = "RhpCollect";
         public const string GcPollRequestedSymbol = "RhpGcPollRequested";
-        public const string CurrentReturnAddressSymbol = "RhpCurrentReturnAddress";
-        public const string CurrentStackPointerSymbol = "RhpCurrentStackPointer";
-        public const string CurrentFramePointerSymbol = "RhpCurrentFramePointer";
         public const string NewFastSymbol = "RhpNewFast";
         public const string NewArraySymbol = "RhpNewArray";
         public const string NewUninitializedArraySymbol = "RhpNewArrayUninitialized";
@@ -51,6 +49,12 @@ namespace Cnidaria.Cs
         private const string MemberwiseCloneSymbol = "RhpMemberwiseClone";
 
         private const string TextSectionName = ".text";
+        private static readonly ConditionalWeakTable<ArmProgram, Dictionary<string, C.NativeUnwindInfo>> UnwindInfos = new();
+
+        public static IReadOnlyDictionary<string, C.NativeUnwindInfo> GetUnwindInfo(ArmProgram runtime)
+            => UnwindInfos.TryGetValue(runtime, out var info)
+                ? info
+                : throw new InvalidOperationException("Runtime unwind information is unavailable");
 
         private sealed class TrimAnalysis
         {
@@ -245,7 +249,8 @@ namespace Cnidaria.Cs
                 new ArmTextSection(instructions.ToImmutable(), labels, textRelocations.ToImmutable()),
                 dataSections.ToImmutable(),
                 symbols.ToImmutable(),
-                runtime.EntrySymbol);
+                runtime.EntrySymbol,
+                runtime.Imports);
             analysis.Results.TryAdd(layout.LiveKey, trimmed);
             return trimmed;
         }
@@ -554,13 +559,23 @@ namespace Cnidaria.Cs
             var semanticModel = compilation.GetSemanticModel(compilation.SyntaxTrees[0]);
             var gimple = Cnidaria.C.GimplePipeline.Run(semanticModel);
             var lir = Cnidaria.C.LirModule.Lower(gimple);
-            return Cnidaria.C.ArmCodeGenerator.Generate(
+            var unwind = new Dictionary<string, C.NativeUnwindInfo>(StringComparer.Ordinal);
+            ArmProgram result = Cnidaria.C.ArmCodeGenerator.Generate(
                 lir,
                 options: new Cnidaria.C.ArmCodeGeneratorOptions
                 {
                     EmitStartup = false,
                     EntryFunctionName = InitializeSymbol,
+                    RecordUnwindInfo = info => unwind.Add(info.Symbol, info),
                 });
+            HashSet<string> collecting = TrimAnalyses.GetValue(result, Analyze).Trimmer.FindReferencingDefinitions(CollectSymbol);
+            foreach (string symbol in unwind.Keys.ToArray())
+            {
+                if (!collecting.Contains(symbol))
+                    unwind.Remove(symbol);
+            }
+            UnwindInfos.Add(result, unwind);
+            return result;
         }
         private static string ReadRuntimeSource(string fileName)
         {

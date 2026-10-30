@@ -27,67 +27,169 @@ internal static class X86PortableExecutableWriter
     private const uint SectionWrite = 0x80000000;
     private const uint SectionExecute = 0x20000000;
     private const int ImportDirectoryIndex = 1;
-    private static readonly ImmutableArray<WindowsImportDll> Kernel32Imports = ImmutableArray.Create(
-        new WindowsImportDll("KERNEL32.dll", ImmutableArray.Create(
-            "GetStdHandle", "WriteFile", "ExitProcess", "GetCurrentThreadId", "GetCurrentProcessorNumber", "GetProcessHeap", 
-            "HeapAlloc", "HeapReAlloc", "HeapFree", "VirtualAlloc", "VirtualFree",
-            "CreateFileA", "ReadFile", "CloseHandle", "SetFilePointerEx", "SetEndOfFile", "FlushFileBuffers",
-            "GetFileSizeEx", "GetFileAttributesA", "DeleteFileA", "MoveFileExA", "CreateDirectoryA", "RemoveDirectoryA",
-            "GetFileType", "GetCurrentDirectoryA", "SetCurrentDirectoryA")));
-
     public static ulong DefaultImageBase(X86Target target)
         => target is not null && target.Is64Bit ? 0x0000000140000000UL : 0x00400000UL;
 
-    public static byte[] WriteExecutable(X86Program obj, ulong imageBase)
-    {
-        if (obj is null)
-            throw new ArgumentNullException(nameof(obj));
-        if (obj.Target is null || !obj.Target.Is32Bit && !obj.Target.Is64Bit)
-            throw new NotSupportedException("PE emission requires an x86 or x64 target.");
+    public static byte[] WriteExecutable(X86Program obj, ulong imageBase, IEnumerable<PeImport>? imports = null)
+        => Write(obj, imageBase, imports, null, obj.EntrySymbol);
 
-        var importSize = WindowsImportTable.ComputeSize(obj.Target.XLen / 8, Kernel32Imports);
-        var sections = CreateSectionLayouts(obj, importSize);
+    public static byte[] WriteDynamicLibrary(X86Program obj, string libraryName, IEnumerable<PeImport>? imports = null, string? entrySymbol = null, ulong imageBase = 0)
+    {
+        if (!obj.Target.Is64Bit)
+            throw new NotSupportedException("PE dynamic libraries require a 64-bit target");
+        return Write(obj, imageBase == 0 ? 0x180000000UL : imageBase, imports, libraryName, entrySymbol ?? string.Empty);
+    }
+
+    private static byte[] Write(X86Program obj, ulong imageBase, IEnumerable<PeImport>? additionalImports, string? libraryName, string entrySymbol)
+    {
+        ArgumentNullException.ThrowIfNull(obj);
+        if (obj.Target.OperatingSystem != OperatingSystemKind.Windows)
+            throw new ArgumentException("PE emission requires a Windows target", nameof(obj));
+        if (obj.Target.Endianness != TargetEndianness.Little)
+            throw new NotSupportedException("PE emission requires a little-endian target");
+        if ((imageBase & 65535) != 0 || obj.Target.Is32Bit && imageBase > uint.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(imageBase));
+
+        var imports = PeImport.Merge(PeImportTable.Kernel32Imports.Concat(obj.Imports).Concat(additionalImports ?? Array.Empty<PeImport>()));
+        var dataImports = imports.Where(static import => import.IsData).Select(static import => import.SymbolName).ToHashSet(StringComparer.Ordinal);
+        foreach (var relocation in obj.DataSections.SelectMany(static section => section.Relocations))
+        {
+            if (dataImports.Contains(relocation.SymbolName))
+                throw new NotSupportedException($"A PE data initializer cannot contain the address of imported data: {relocation.SymbolName}");
+        }
+        obj = X86ObjectLinker.RedirectDataImports(obj, dataImports.ToImmutableArray());
+        var defined = obj.Text.Labels.Keys.Concat(obj.Symbols.Where(static symbol => symbol.Binding != X86ObjectSymbolBinding.External).Select(static symbol => symbol.Name)).ToHashSet(StringComparer.Ordinal);
+        var references = obj.Symbols.Where(static symbol => symbol.Binding == X86ObjectSymbolBinding.External).Select(static symbol => symbol.Name).ToHashSet(StringComparer.Ordinal);
+        foreach (var instruction in obj.Text.Instructions)
+        {
+            foreach (var operand in new[] { instruction.Operand0, instruction.Operand1, instruction.Operand2, instruction.Operand3 })
+            {
+                if (operand.Symbol is string name)
+                    references.Add(name);
+            }
+        }
+        foreach (var relocation in obj.Text.Relocations.Concat(obj.DataSections.SelectMany(static section => section.Relocations)))
+            references.Add(relocation.SymbolName);
+        var thunks = imports.Where(import => !import.IsData && references.Contains(import.SymbolName) && !defined.Contains(import.SymbolName)).ToArray();
+        obj = X86ObjectLinker.RelaxBranches(obj, imports.SelectMany(static import => new[] { import.SymbolName, import.AddressSymbol }));
+        var importTable = PeImportTable.Build(obj.Target.XLen / 8, imports, 0);
+        var sections = CreateSectionLayouts(obj, importTable.Bytes.Length);
+        PeSectionLayout? thunkSection = null;
+        if (thunks.Length != 0)
+        {
+            thunkSection = new PeSectionLayout(".thunks", X86ObjectSectionKind.Text, 16, new byte[thunks.Length * 6], thunks.Length * 6, SectionCode | SectionRead | SectionExecute);
+            sections.Add(thunkSection);
+        }
+        PeSectionLayout? exportsSection = null;
+        PeSectionLayout? relocationsSection = null;
+        var exports = new Dictionary<string, uint>(StringComparer.Ordinal);
+        if (libraryName is not null)
+        {
+            foreach (var symbol in obj.Symbols)
+            {
+                if (symbol.Binding == X86ObjectSymbolBinding.Global && symbol.Kind != X86ObjectSymbolKind.Section && !string.IsNullOrEmpty(symbol.SectionName))
+                    exports.Add(symbol.Name, 0);
+            }
+            byte[] data = PeTables.Exports(libraryName, exports, 0);
+            exportsSection = new PeSectionLayout(".edata", X86ObjectSectionKind.Rodata, 4, data, data.Length, SectionInitializedData | SectionRead);
+            relocationsSection = new PeSectionLayout(".reloc", X86ObjectSectionKind.Rodata, 4, Array.Empty<byte>(), 0, SectionInitializedData | SectionRead | 0x02000000);
+            sections.Add(exportsSection);
+            sections.Add(relocationsSection);
+        }
+        if (sections.Select(static section => section.Name).Distinct(StringComparer.Ordinal).Count() != sections.Count)
+            throw new InvalidOperationException("Duplicate PE section name");
         var optionalHeaderSize = obj.Target.Is64Bit ? 240 : 224;
         var headersSize = AlignUp(DosHeaderOffset + 4 + 20 + optionalHeaderSize + sections.Count * 40, FileAlignment);
         LayoutSections(sections, headersSize);
-
-        var idata = sections.First(static s => s.Name == ".idata");
-        var importTable = WindowsImportTable.Build(obj.Target.XLen / 8, Kernel32Imports, idata.Rva);
+        var idata = sections.First(static section => section.Name == ".idata");
+        importTable = PeImportTable.Build(obj.Target.XLen / 8, imports, idata.Rva);
         idata.RawData = importTable.Bytes;
-        idata.VirtualSize = importTable.Bytes.Length;
-        idata.RawSize = AlignUp(idata.RawData.Length, FileAlignment);
-
-        var linkedSections = sections.ToDictionary(
-            static s => s.Name,
-            s => new X86LinkedSection(s.Name, s.Kind, s.RawPointer, s.VirtualSize, s.Alignment, checked(imageBase + (ulong)s.Rva)),
-            StringComparer.Ordinal);
-        var symbols = BuildSymbolAddressMap(obj, linkedSections, imageBase, idata.Rva, importTable.IatOffsets);
-
-        EncodeText(obj, sections.First(static s => s.Name == ".text"), symbols, imageBase);
-        ApplyTextRelocations(obj, sections.First(static s => s.Name == ".text"), symbols, imageBase);
+        var linkedSections = sections.ToDictionary(static section => section.Name,
+            section => new X86LinkedSection(section.Name, section.Kind, section.RawPointer, section.VirtualSize, section.Alignment, checked(imageBase + (ulong)section.Rva)), StringComparer.Ordinal);
+        var symbols = BuildSymbolAddressMap(obj, linkedSections, imageBase, idata.Rva, importTable.AddressOffsets);
+        var baseRelocations = libraryName is null ? null : new List<(int Rva, int Size)>();
+        if (thunkSection is not null)
+        {
+            for (int i = 0; i < thunks.Length; i++)
+            {
+                int offset = i * 6;
+                ulong address = checked(imageBase + (ulong)(thunkSection.Rva + offset));
+                ulong slot = symbols[thunks[i].AddressSymbol];
+                symbols.Add(thunks[i].SymbolName, address);
+                thunkSection.RawData[offset] = 0xff;
+                thunkSection.RawData[offset + 1] = 0x25;
+                if (obj.Target.Is64Bit)
+                    WriteSigned(thunkSection.RawData, offset + 2, checked((long)slot - (long)(address + 6)), 4);
+                else
+                    WriteUInt32(thunkSection.RawData, offset + 2, checked((uint)slot));
+            }
+        }
+        var text = sections.First(static section => section.Name == ".text");
+        EncodeText(obj, text, symbols, imageBase, baseRelocations);
+        ApplyTextRelocations(obj, text, symbols, imageBase);
         CopyAndRelocateData(obj, sections, symbols, imageBase);
+        if (libraryName is not null)
+        {
+            foreach (string name in exports.Keys.ToArray())
+                exports[name] = checked((uint)(symbols[name] - imageBase));
+            exportsSection!.RawData = PeTables.Exports(libraryName, exports, exportsSection.Rva);
+            foreach (var section in obj.DataSections)
+            {
+                var layout = sections.FirstOrDefault(layout => layout.Name == section.Name);
+                if (layout is null)
+                    continue;
+                foreach (var relocation in section.Relocations)
+                    RecordBaseRelocation(baseRelocations!, layout.Rva, relocation, obj.Target.XLen / 8);
+            }
+            foreach (var relocation in obj.Text.Relocations)
+                RecordBaseRelocation(baseRelocations!, text.Rva, relocation, obj.Target.XLen / 8);
+            relocationsSection!.RawData = PeTables.BaseRelocations(baseRelocations!);
+            relocationsSection.VirtualSize = relocationsSection.RawData.Length;
+            relocationsSection.RawSize = AlignUp(relocationsSection.RawData.Length, FileAlignment);
+        }
+        uint entryRva = 0;
+        if (!string.IsNullOrEmpty(entrySymbol))
+            entryRva = checked((uint)(symbols.TryGetValue(entrySymbol, out ulong entryAddress) ? entryAddress - imageBase : throw new InvalidOperationException("PE entry symbol is not defined: " + entrySymbol)));
+        else if (libraryName is null)
+            throw new InvalidOperationException("PE executable entry symbol is empty");
 
-        if (string.IsNullOrEmpty(obj.EntrySymbol) || !symbols.TryGetValue(obj.EntrySymbol, out var entryAddress))
-            throw new InvalidOperationException($"PE entry symbol is not defined: {obj.EntrySymbol}");
-
-        var sizeOfImage = AlignUp(sections.Max(static s => s.Rva + Math.Max(1, s.VirtualSize)), SectionAlignment);
-        var sizeOfCode = sections.Where(static s => s.Kind == X86ObjectSectionKind.Text).Sum(static s => s.RawSize);
-        var sizeOfInitializedData = sections
-            .Where(static s => s.Kind != X86ObjectSectionKind.Text && s.Kind != X86ObjectSectionKind.Bss).Sum(static s => s.RawSize);
-        var sizeOfUninitializedData = sections
-            .Where(static s => s.Kind == X86ObjectSectionKind.Bss).Sum(static s => AlignUp(s.VirtualSize, SectionAlignment));
-        var image = new byte[sections.Max(static s => s.RawPointer + s.RawSize)];
-        WriteHeaders(image, obj.Target, imageBase, sections, headersSize, sizeOfImage, checked((uint)(entryAddress - imageBase)),
-            sizeOfCode, sizeOfInitializedData, sizeOfUninitializedData, idata.Rva, importTable.Bytes.Length);
-
+        int sizeOfImage = AlignUp(sections.Max(static section => section.Rva + Math.Max(1, section.VirtualSize)), SectionAlignment);
+        int sizeOfCode = sections.Where(static section => section.Kind == X86ObjectSectionKind.Text).Sum(static section => section.RawSize);
+        int sizeOfInitializedData = sections.Where(static section => section.Kind is not (X86ObjectSectionKind.Text or X86ObjectSectionKind.Bss)).Sum(static section => section.RawSize);
+        int sizeOfUninitializedData = sections.Where(static section => section.Kind == X86ObjectSectionKind.Bss).Sum(static section => AlignUp(section.VirtualSize, SectionAlignment));
+        var image = new byte[Math.Max(headersSize, sections.Max(static section => section.RawPointer + section.RawSize))];
+        WriteHeaders(image, obj.Target, imageBase, sections, headersSize, sizeOfImage, entryRva,
+            sizeOfCode, sizeOfInitializedData, sizeOfUninitializedData, idata.Rva, importTable.DirectorySize);
+        if (libraryName is not null)
+        {
+            int coff = DosHeaderOffset + 4;
+            WriteUInt16(image, coff + 18, (ushort)(CharacteristicsExecutableImage | CharacteristicsLargeAddressAware | 0x2000));
+            WriteUInt16(image, coff + 20 + 70, 0x0160);
+            int directories = coff + 20 + 112;
+            WriteUInt32(image, directories, checked((uint)exportsSection!.Rva));
+            WriteUInt32(image, directories + 4, checked((uint)exportsSection.RawData.Length));
+            WriteUInt32(image, directories + 5 * 8, checked((uint)relocationsSection!.Rva));
+            WriteUInt32(image, directories + 5 * 8 + 4, checked((uint)relocationsSection.RawData.Length));
+        }
         foreach (var section in sections)
         {
-            if (section.RawSize == 0)
-                continue;
-            Array.Copy(section.RawData, 0, image, section.RawPointer, section.RawData.Length);
+            if (section.RawSize != 0)
+                Array.Copy(section.RawData, 0, image, section.RawPointer, section.RawData.Length);
         }
-
         return image;
+    }
+
+    private static void RecordBaseRelocation(List<(int Rva, int Size)> relocations, int sectionRva, X86ObjectRelocation relocation, int pointerSize)
+    {
+        int size = relocation.Kind switch
+        {
+            X86ObjectRelocationKind.AbsolutePointer => pointerSize,
+            X86ObjectRelocationKind.Absolute32 => 4,
+            X86ObjectRelocationKind.Absolute64 => 8,
+            _ => 0,
+        };
+        if (size != 0)
+            relocations.Add((checked(sectionRva + relocation.Offset), size));
     }
 
     private static List<PeSectionLayout> CreateSectionLayouts(X86Program obj, int importSize)
@@ -179,12 +281,19 @@ internal static class X86PortableExecutableWriter
         return result;
     }
 
-    private static void EncodeText(X86Program obj, PeSectionLayout text, IReadOnlyDictionary<string, ulong> symbols, ulong imageBase)
+    private static void EncodeText(X86Program obj, PeSectionLayout text, IReadOnlyDictionary<string, ulong> symbols, ulong imageBase, List<(int Rva, int Size)>? baseRelocations)
     {
         var offset = 0;
+        var instructionRelocations = baseRelocations is null ? null : new List<(int Offset, int Size)>();
         foreach (var instruction in obj.Text.Instructions)
         {
-            var encoded = X86CodeEncoder.Encode(instruction, obj.Target, checked(imageBase + (ulong)text.Rva + (ulong)offset), symbols);
+            instructionRelocations?.Clear();
+            var encoded = X86CodeEncoder.Encode(instruction, obj.Target, checked(imageBase + (ulong)text.Rva + (ulong)offset), symbols, instructionRelocations);
+            if (instructionRelocations is not null)
+            {
+                foreach (var relocation in instructionRelocations)
+                    baseRelocations!.Add((checked(text.Rva + offset + relocation.Offset), relocation.Size));
+            }
             Array.Copy(encoded, 0, text.RawData, offset, encoded.Length);
             offset = checked(offset + encoded.Length);
         }
@@ -426,115 +535,4 @@ internal static class X86PortableExecutableWriter
         }
     }
 
-    private readonly struct WindowsImportDll
-    {
-        public string Name { get; }
-        public ImmutableArray<string> Functions { get; }
-
-        public WindowsImportDll(string name, ImmutableArray<string> functions)
-        {
-            Name = name;
-            Functions = functions.IsDefault ? ImmutableArray<string>.Empty : functions;
-        }
-    }
-
-    private sealed class WindowsImportTable
-    {
-        public byte[] Bytes { get; }
-        public IReadOnlyDictionary<string, int> IatOffsets { get; }
-
-        private WindowsImportTable(byte[] bytes, IReadOnlyDictionary<string, int> iatOffsets)
-        {
-            Bytes = bytes;
-            IatOffsets = iatOffsets;
-        }
-
-        public static int ComputeSize(int pointerSize, ImmutableArray<WindowsImportDll> dlls)
-            => Build(pointerSize, dlls, 0).Bytes.Length;
-
-        public static WindowsImportTable Build(int pointerSize, ImmutableArray<WindowsImportDll> dlls, int sectionRva)
-        {
-            var layouts = new List<DllLayout>();
-            var offset = checked((dlls.Length + 1) * 20);
-            offset = AlignUp(offset, pointerSize);
-
-            foreach (var dll in dlls)
-            {
-                var layout = new DllLayout(dll.Name, dll.Functions, layouts.Count * 20);
-                layout.IltOffset = offset;
-                offset = checked(offset + (dll.Functions.Length + 1) * pointerSize);
-                layout.IatOffset = offset;
-                offset = checked(offset + (dll.Functions.Length + 1) * pointerSize);
-                layouts.Add(layout);
-            }
-
-            foreach (var layout in layouts)
-            {
-                offset = AlignUp(offset, 2);
-                layout.NameOffset = offset;
-                offset = checked(offset + Encoding.ASCII.GetByteCount(layout.Name) + 1);
-                foreach (var function in layout.Functions)
-                {
-                    offset = AlignUp(offset, 2);
-                    layout.HintNameOffsets[function] = offset;
-                    offset = checked(offset + 2 + Encoding.ASCII.GetByteCount(function) + 1);
-                }
-            }
-
-            var bytes = new byte[offset];
-            var iatOffsets = new Dictionary<string, int>(StringComparer.Ordinal);
-            foreach (var layout in layouts)
-            {
-                WriteUInt32(bytes, layout.DescriptorOffset + 0, checked((uint)(sectionRva + layout.IltOffset)));
-                WriteUInt32(bytes, layout.DescriptorOffset + 12, checked((uint)(sectionRva + layout.NameOffset)));
-                WriteUInt32(bytes, layout.DescriptorOffset + 16, checked((uint)(sectionRva + layout.IatOffset)));
-                WriteAsciiNull(bytes, layout.NameOffset, layout.Name);
-
-                for (var i = 0; i < layout.Functions.Length; i++)
-                {
-                    var function = layout.Functions[i];
-                    var hintNameRva = checked((ulong)(sectionRva + layout.HintNameOffsets[function]));
-                    WriteThunk(bytes, layout.IltOffset + i * pointerSize, hintNameRva, pointerSize);
-                    WriteThunk(bytes, layout.IatOffset + i * pointerSize, hintNameRva, pointerSize);
-                    WriteAsciiNull(bytes, layout.HintNameOffsets[function] + 2, function);
-                    iatOffsets["__imp_" + function] = layout.IatOffset + i * pointerSize;
-                }
-            }
-
-            return new WindowsImportTable(bytes, iatOffsets);
-        }
-
-        private static void WriteThunk(byte[] bytes, int offset, ulong value, int pointerSize)
-        {
-            if (pointerSize == 8)
-                WriteUInt64(bytes, offset, value);
-            else
-                WriteUInt32(bytes, offset, checked((uint)value));
-        }
-
-        private static void WriteAsciiNull(byte[] bytes, int offset, string value)
-        {
-            var raw = Encoding.ASCII.GetBytes(value);
-            Array.Copy(raw, 0, bytes, offset, raw.Length);
-            bytes[offset + raw.Length] = 0;
-        }
-
-        private sealed class DllLayout
-        {
-            public string Name { get; }
-            public ImmutableArray<string> Functions { get; }
-            public int DescriptorOffset { get; }
-            public int IltOffset { get; set; }
-            public int IatOffset { get; set; }
-            public int NameOffset { get; set; }
-            public Dictionary<string, int> HintNameOffsets { get; } = new Dictionary<string, int>(StringComparer.Ordinal);
-
-            public DllLayout(string name, ImmutableArray<string> functions, int descriptorOffset)
-            {
-                Name = name;
-                Functions = functions;
-                DescriptorOffset = descriptorOffset;
-            }
-        }
-    }
 }

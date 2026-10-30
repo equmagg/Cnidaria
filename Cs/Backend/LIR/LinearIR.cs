@@ -337,7 +337,7 @@ namespace Cnidaria.Cs
             LinearMemoryAccessFlags StoreTypeFlags(RuntimeType? type, GenStackKind stackKind)
             {
                 var flags = TypeFlags(type, stackKind);
-                if ((flags & LinearMemoryAccessFlags.ContainsGcPointers) != 0)
+                if ((flags & LinearMemoryAccessFlags.ContainsGcPointers) != 0 && (source.Flags & GenTreeFlags.TargetNotOnHeap) == 0)
                     flags |= LinearMemoryAccessFlags.RequiresWriteBarrier;
                 return flags;
             }

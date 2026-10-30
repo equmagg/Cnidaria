@@ -78,6 +78,40 @@ namespace Cnidaria.Cs
                 _unownedReferences.Add(targetName);
         }
 
+        public HashSet<string> FindReferencingDefinitions(string targetName)
+        {
+            var incoming = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+            for (int d = 0; d < _definitions.Count; d++)
+            {
+                foreach (int reference in _referencesByDefinition[d])
+                {
+                    string target = _targetNames[reference];
+                    if (!incoming.TryGetValue(target, out var sources))
+                    {
+                        sources = new List<int>();
+                        incoming.Add(target, sources);
+                    }
+                    sources.Add(d);
+                }
+            }
+
+            var result = new HashSet<string>(StringComparer.Ordinal);
+            var pending = new Queue<string>();
+            pending.Enqueue(targetName);
+            while (pending.Count != 0)
+            {
+                if (!incoming.TryGetValue(pending.Dequeue(), out var sources))
+                    continue;
+                foreach (int source in sources)
+                {
+                    string name = _definitions[source].Name;
+                    if (result.Add(name))
+                        pending.Enqueue(name);
+                }
+            }
+            return result;
+        }
+
         public ObjectTrimLayout Trim(IEnumerable<string> rootNames)
         {
             if (rootNames is null)

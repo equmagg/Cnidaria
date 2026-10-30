@@ -484,6 +484,10 @@ namespace Cnidaria.Cs
         U32ToU16Ovf = 360,
         I64ToU32Ovf = 361,
         U64ToU32Ovf = 362,
+        F32ToU32Ovf = 363,
+        F32ToU64Ovf = 364,
+        F64ToU32Ovf = 365,
+        F64ToU64Ovf = 366,
 
         LdI1 = 384,
         LdU1 = 385,
@@ -1746,6 +1750,10 @@ namespace Cnidaria.Cs
                 case Op.F32ToI64Ovf:
                 case Op.F64ToI32Ovf:
                 case Op.F64ToI64Ovf:
+                case Op.F32ToU32Ovf:
+                case Op.F32ToU64Ovf:
+                case Op.F64ToU32Ovf:
+                case Op.F64ToU64Ovf:
                 case Op.BitcastF32I32:
                 case Op.BitcastF64I64:
                     RequireGpr(inst.Rd, pc, nameof(inst.Rd));
@@ -1968,7 +1976,7 @@ namespace Cnidaria.Cs
                 or Op.LiTypeHandle or Op.LiMethodHandle or Op.LiFieldHandle or Op.LiStaticBase;
 
         private static bool IsConversionInstruction(Op op)
-            => IsOpInRange(op, Op.I32ToI64, Op.U64ToU32Ovf);
+            => IsOpInRange(op, Op.I32ToI64, Op.F64ToU64Ovf);
 
         private static bool IsRuntimeObjectInstruction(Op op)
             => IsOpInRange(op, Op.AllocObj, Op.DelegateRemove);
@@ -3900,7 +3908,7 @@ namespace Cnidaria.Cs
             => op is Op.F32IsNaN or Op.F32IsFinite or Op.F64IsNaN or Op.F64IsFinite;
 
         private static bool IsConversion(Op op)
-            => IsOpInRange(op, Op.I32ToI64, Op.U64ToU32Ovf);
+            => IsOpInRange(op, Op.I32ToI64, Op.F64ToU64Ovf);
 
         private static bool IsAddressMemoryInstruction(Op op)
             => IsOpInRange(op, Op.LdI1, Op.WriteBarrier);

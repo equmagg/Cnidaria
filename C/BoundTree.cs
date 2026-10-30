@@ -263,13 +263,19 @@ public sealed class BoundInitializerListItem : BoundNode
     /// <summary>The array element this item initializes, or -1 when the enclosing initializer is not an array</summary>
     public long ElementIndex { get; }
 
-    public BoundInitializerListItem(InitializerListItemSyntax syntax, BoundInitializer initializer, long elementIndex = -1)
+    public BoundInitializerListItem(
+        InitializerListItemSyntax syntax,
+        BoundInitializer initializer,
+        long elementIndex = -1,
+        ImmutableArray<DesignatorSyntax> designators = default)
         : base(syntax)
     {
         ElementIndex = elementIndex;
-        Designators = syntax.Designators.IsDefault
-            ? ImmutableArray<DesignatorSyntax>.Empty
-            : syntax.Designators;
+        Designators = !designators.IsDefault
+            ? designators
+            : syntax.Designators.IsDefault
+                ? ImmutableArray<DesignatorSyntax>.Empty
+                : syntax.Designators;
         Initializer = initializer ?? throw new ArgumentNullException(nameof(initializer));
     }
 }

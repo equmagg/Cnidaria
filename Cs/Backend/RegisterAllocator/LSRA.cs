@@ -2414,6 +2414,11 @@ namespace Cnidaria.Cs
                 if (segmentEnd <= allocationStart)
                     return false;
 
+                // A preference that a call kill cuts short loses to a register covering the interval
+                int coverEnd = freeUntil < current.End ? freeUntil : current.End;
+                if (FirstKillLimitForRegister(current, register, allocationStart, coverEnd) < coverEnd)
+                    return false;
+
                 AssignRegisterSegment(current, allocationStart, register, segmentEnd, stream, ref streamIndex);
                 return true;
             }

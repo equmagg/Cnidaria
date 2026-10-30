@@ -1207,6 +1207,12 @@ internal sealed class ValueNumberingBuilder
                 return true;
             }
 
+            if (code is GimpleTreeCode.LshiftExpr or GimpleTreeCode.RshiftExpr && hasLeftInteger && leftValue == 0)
+            {
+                folded = NumberConstantValue(0, resultType);
+                return true;
+            }
+
             if (code == GimpleTreeCode.BitAndExpr && ((hasRightInteger && rightValue == 0) || (hasLeftInteger && leftValue == 0)))
             {
                 folded = NumberConstantValue(0, resultType);

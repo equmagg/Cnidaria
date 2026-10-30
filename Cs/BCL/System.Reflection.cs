@@ -155,4 +155,30 @@ namespace System.Reflection
         public abstract string Name { get; }
         internal virtual bool CacheEquals(object? o) { throw new NotImplementedException(); }
     }
+    public abstract class EnumInfo
+    {
+        private protected EnumInfo(Type underlyingType, string[] names, bool isFlags)
+        {
+            UnderlyingType = underlyingType;
+            Names = names;
+            HasFlagsAttribute = isFlags;
+        }
+
+        internal Type UnderlyingType { get; }
+        internal string[] Names { get; }
+        internal bool HasFlagsAttribute { get; }
+    }
+    public sealed class EnumInfo<TStorage> : EnumInfo
+        where TStorage : struct, INumber<TStorage>
+    {
+        public EnumInfo(Type underlyingType, TStorage[] values, string[] names, bool isFlags) :
+            base(underlyingType, names, isFlags)
+        {
+            Values = values;
+            ValuesAreSequentialFromZero = Enum.AreSequentialFromZero(values);
+        }
+
+        internal TStorage[] Values { get; }
+        internal bool ValuesAreSequentialFromZero { get; }
+    }
 }

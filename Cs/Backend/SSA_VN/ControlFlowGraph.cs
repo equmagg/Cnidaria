@@ -1632,6 +1632,31 @@ namespace Cnidaria.Cs
             return result.ToImmutable();
         }
 
+        // A try's native range runs from its first to its last try block in layout order, or across the region bounds when none is left
+        public static HashSet<int> BuildTryRangeBlockSet(ControlFlowGraph cfg, ImmutableArray<CfgExceptionRegion> clauses, ImmutableArray<int> layoutOrder)
+        {
+            var result = new HashSet<int>();
+            foreach (CfgExceptionRegion region in clauses)
+            {
+                ImmutableArray<int> blocks = BuildTryBlockIds(cfg, region);
+                if (blocks.Length != 0)
+                {
+                    foreach (int block in blocks)
+                        result.Add(block);
+                    continue;
+                }
+
+                int first = layoutOrder.IndexOf(region.TryStartBlockId);
+                int last = layoutOrder.IndexOf(Math.Max(region.TryStartBlockId, region.TryEndBlockIdExclusive - 1));
+                if (first < 0 || last < 0)
+                    continue;
+                for (int i = Math.Min(first, last); i <= Math.Max(first, last); i++)
+                    result.Add(layoutOrder[i]);
+            }
+
+            return result;
+        }
+
         public static ImmutableArray<int> BuildRootBlockIds(ControlFlowGraph cfg)
         {
             if (cfg is null)

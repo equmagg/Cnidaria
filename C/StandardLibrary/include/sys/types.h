@@ -14,6 +14,7 @@ typedef long long blksize_t;
 typedef long long blkcnt_t;
 typedef long long time_t;
 typedef int pid_t;
+typedef unsigned int useconds_t;
 
 #if defined(_WIN64) || (defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8)
 typedef long long ssize_t;

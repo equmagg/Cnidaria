@@ -590,7 +590,7 @@ internal sealed class Gimplifier
         => _staticLocals.TryGetValue(symbol, out var hoisted) ? hoisted : symbol;
 
     /// <summary>Emits executable initialization for a local place</summary>
-    private void LowerInitializer(GimplePlace target, BoundInitializer initializer)
+    private void LowerInitializer(GimplePlace target, BoundInitializer initializer, bool zeroed = false)
     {
         switch (initializer)
         {
@@ -604,7 +604,7 @@ internal sealed class Gimplifier
                 break;
 
             case BoundInitializerList initializerList:
-                LowerInitializerList(target, initializerList);
+                LowerInitializerList(target, initializerList, zeroed);
                 break;
 
             default:
@@ -630,10 +630,11 @@ internal sealed class Gimplifier
         }
     }
 
-    /// <summary>Zero-fills the destination then applies initializer items in source order</summary>
-    private void LowerInitializerList(GimplePlace target, BoundInitializerList initializer)
+    /// <summary>Zero-fills the destination unless the items cover it, then applies them in source order</summary>
+    private void LowerInitializerList(GimplePlace target, BoundInitializerList initializer, bool zeroed)
     {
-        EmitZeroInitialize(target, initializer.Syntax);
+        if (!zeroed && !InitializesEveryMember(target.Type, initializer))
+            EmitZeroInitialize(target, initializer.Syntax);
 
         switch (target.Type.Type)
         {
@@ -655,6 +656,57 @@ internal sealed class Gimplifier
         }
     }
 
+    // Padding and unnamed members stay indeterminate, so a list that writes every named leaf needs no zero fill
+    private static bool InitializesEveryMember(QualifiedType type, BoundInitializer initializer)
+    {
+        if (initializer is BoundExpressionInitializer expression)
+        {
+            return type.Type switch
+            {
+                ArrayType => expression.Expression.ConstantValue is string,
+                TagType tag => expression.Expression.Type.Type is TagType source && ReferenceEquals(tag.Symbol, source.Symbol),
+                _ => true,
+            };
+        }
+        if (initializer is not BoundInitializerList list)
+            return false;
+        foreach (var item in list.Items)
+        {
+            if (item.Designators.Length != 0)
+                return false;
+        }
+
+        switch (type.Type)
+        {
+            case ArrayType { Length: long length } array:
+                if (list.Items.Length < length)
+                    return false;
+                for (var i = 0; i < length; i++)
+                {
+                    if (!InitializesEveryMember(array.ElementType, list.Items[i].Initializer))
+                        return false;
+                }
+                return true;
+
+            case TagType { Symbol: { TagKind: TagKind.Struct, IsComplete: true } tag }:
+                if (list.Items.Length < tag.Fields.Length)
+                    return false;
+                for (var i = 0; i < tag.Fields.Length; i++)
+                {
+                    if (tag.Fields[i].Name.Length == 0 || !InitializesEveryMember(tag.Fields[i].Type, list.Items[i].Initializer))
+                        return false;
+                }
+                return true;
+
+            case ArrayType:
+            case TagType:
+                return false;
+
+            default:
+                return list.Items.Length != 0 && InitializesEveryMember(type, list.Items[0].Initializer);
+        }
+    }
+
     private void LowerScalarInitializerList(GimplePlace target, BoundInitializerList initializer)
     {
         if (initializer.Items.Length == 0)
@@ -664,12 +716,12 @@ internal sealed class Gimplifier
         if (first.Designators.Length != 0)
         {
             if (TryApplyDesignators(target, target.Type, first.Designators, out var designatedTarget, out _))
-                LowerInitializer(designatedTarget, first.Initializer);
+                LowerInitializer(designatedTarget, first.Initializer, zeroed: true);
 
             return;
         }
 
-        LowerInitializer(target, first.Initializer);
+        LowerInitializer(target, first.Initializer, zeroed: true);
     }
 
     private void LowerArrayInitializerList(GimplePlace target, ArrayType arrayType, BoundInitializerList initializer)
@@ -685,14 +737,14 @@ internal sealed class Gimplifier
                 {
                     LowerInitializer(
                         CreateElementAccess(target, item.ElementIndex, arrayType.ElementType, item.Syntax),
-                        item.Initializer);
+                        item.Initializer, zeroed: true);
                     nextIndex = item.ElementIndex + 1;
                     continue;
                 }
 
                 if (TryApplyDesignators(target, target.Type, item.Designators, out var designatedTarget, out _))
                 {
-                    LowerInitializer(designatedTarget, item.Initializer);
+                    LowerInitializer(designatedTarget, item.Initializer, zeroed: true);
 
                     if (TryGetFirstArrayDesignatorIndex(item.Designators, out var index))
                         nextIndex = index + 1;
@@ -705,7 +757,7 @@ internal sealed class Gimplifier
                 continue;
 
             var elementTarget = CreateElementAccess(target, nextIndex, arrayType.ElementType, item.Syntax);
-            LowerInitializer(elementTarget, item.Initializer);
+            LowerInitializer(elementTarget, item.Initializer, zeroed: true);
             nextIndex++;
         }
     }
@@ -721,7 +773,7 @@ internal sealed class Gimplifier
             {
                 if (TryApplyDesignators(target, target.Type, item.Designators, out var designatedTarget, out _))
                 {
-                    LowerInitializer(designatedTarget, item.Initializer);
+                    LowerInitializer(designatedTarget, item.Initializer, zeroed: true);
 
                     if (TryGetFirstFieldDesignator(tag, item.Designators, out var firstField))
                         nextField = Math.Min(firstField.Ordinal + 1, fields.Length);
@@ -730,12 +782,14 @@ internal sealed class Gimplifier
                 continue;
             }
 
+            while (nextField < fields.Length && fields[nextField].IsUnnamedBitField)
+                nextField++;
             if (nextField >= fields.Length)
                 continue;
 
             var field = fields[nextField++];
             var fieldTarget = CreateMemberAccess(target, field, item.Syntax);
-            LowerInitializer(fieldTarget, item.Initializer);
+            LowerInitializer(fieldTarget, item.Initializer, zeroed: true);
         }
     }
 
@@ -749,16 +803,17 @@ internal sealed class Gimplifier
             if (item.Designators.Length != 0)
             {
                 if (TryApplyDesignators(target, target.Type, item.Designators, out var designatedTarget, out _))
-                    LowerInitializer(designatedTarget, item.Initializer);
+                    LowerInitializer(designatedTarget, item.Initializer, zeroed: true);
 
                 continue;
             }
 
-            if (tag.Fields.Length == 0)
+            var first = tag.Fields.FirstOrDefault(static field => !field.IsUnnamedBitField);
+            if (first is null)
                 continue;
 
-            var fieldTarget = CreateMemberAccess(target, tag.Fields[0], item.Syntax);
-            LowerInitializer(fieldTarget, item.Initializer);
+            var fieldTarget = CreateMemberAccess(target, first, item.Syntax);
+            LowerInitializer(fieldTarget, item.Initializer, zeroed: true);
         }
     }
 
@@ -1917,9 +1972,23 @@ internal sealed class Gimplifier
     {
         var throughPointer = expression.OperatorToken.Kind == SyntaxKind.ArrowToken;
         var target = LowerExpression(expression.Expression);
+        var current = throughPointer ? GimplifyValue(target) : GimplifyReferenceBase(target);
+
+        // A member of an anonymous aggregate lies at that aggregate's offset, so the unnamed hops are spelled out
+        var aggregate = throughPointer && expression.Expression.Type.Type is PointerType pointer ? pointer.PointeeType : expression.Expression.Type;
+        if (expression.Field is FieldSymbol field && aggregate.Type is TagType tag && !ReferenceEquals(field.ContainingTag, tag.Symbol) &&
+            TryFindFieldPath(aggregate, field.Name, out var path))
+        {
+            for (var i = 0; i < path.Length - 1; i++)
+            {
+                current = new GimpleMemberAccessExpression(current, throughPointer, CreateSyntheticToken(SyntaxKind.IdentifierToken, path[i].Name),
+                    path[i], new QualifiedType(path[i].Type.Type, path[i].Type.Qualifiers | aggregate.Qualifiers), expression.Syntax);
+                throughPointer = false;
+            }
+        }
 
         return new GimpleMemberAccessExpression(
-            throughPointer ? GimplifyValue(target) : GimplifyReferenceBase(target),
+            current,
             throughPointer,
             expression.NameToken,
             expression.Field,

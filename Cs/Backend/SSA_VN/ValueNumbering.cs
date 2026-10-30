@@ -642,10 +642,12 @@ namespace Cnidaria.Cs
         private readonly Dictionary<int, ValueNumberEntry> _entries = new();
         private readonly Dictionary<ValueNumberFuncKey, MapSelectWorkCacheEntry> _mapSelectCache = new();
         private readonly TargetInfo _target;
+        private readonly ImmutableArray<GenLocalDescriptor> _locals;
         private int _nextId = 1;
-        public ValueNumberStore(TargetInfo target)
+        public ValueNumberStore(TargetInfo target, ImmutableArray<GenLocalDescriptor> locals = default)
         {
             _target = target ?? throw new ArgumentNullException(nameof(target));
+            _locals = locals.IsDefault ? ImmutableArray<GenLocalDescriptor>.Empty : locals;
         }
         public ValueNumber InitialHeap(RuntimeMethod method)
             => VNForConstant(ValueNumberConstantKey.Heap(method));
@@ -1339,6 +1341,27 @@ namespace Cnidaria.Cs
                 _mapSelectCache.Clear();
         }
 
+        // An array allocated in the frame has the length its frame block was laid out for
+        private bool TryGetStackArrayLength(ValueNumber array, out int length)
+        {
+            length = 0;
+            if (!TryGetEntry(array, out ValueNumberEntry entry) ||
+                entry.Function != ValueNumberFunction.PtrToLoc ||
+                entry.Args.Length != 2 ||
+                !TryGetConstant(entry.Args[0], out ValueNumberConstantKey slot) ||
+                slot.Kind != ValueNumberConstantKind.SsaSlot ||
+                !TryGetConstant(entry.Args[1], out ValueNumberConstantKey offset) ||
+                offset.A != 0 ||
+                (ulong)slot.A >= (ulong)_locals.Length ||
+                _locals[(int)slot.A].StackAllocatedArrayLength < 0)
+            {
+                return false;
+            }
+
+            length = _locals[(int)slot.A].StackAllocatedArrayLength;
+            return true;
+        }
+
         private bool TryFold(ValueNumberFunction function, GenStackKind stackKind, RuntimeType? type, ImmutableArray<ValueNumber> args, out ValueNumber folded)
         {
             folded = NoVN;
@@ -1355,6 +1378,12 @@ namespace Cnidaria.Cs
                     lengthEntry.StackKind == GenStackKind.I4)
                 {
                     folded = arrayEntry.Args[0];
+                    return true;
+                }
+
+                if (function == ValueNumberFunction.ArrayLength && TryGetStackArrayLength(args[0], out int stackArrayLength))
+                {
+                    folded = VNForInt32(stackArrayLength);
                     return true;
                 }
 
@@ -2054,7 +2083,7 @@ namespace Cnidaria.Cs
             {
                 _method = method;
                 _target = method.GenTreeMethod.Target;
-                _store = new ValueNumberStore(_target);
+                _store = new ValueNumberStore(_target, method.GenTreeMethod.AllLocalDescriptors);
                 for (int i = 0; i < method.Slots.Length; i++)
                     _slotInfos[method.Slots[i].Slot] = method.Slots[i];
                 for (int i = 0; i < method.ValueDefinitions.Length; i++)

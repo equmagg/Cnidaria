@@ -13,6 +13,7 @@ public sealed class X86CodeGeneratorOptions
     public static X86CodeGeneratorOptions Default => new X86CodeGeneratorOptions();
 
     public bool EmitStartup { get; set; } = true;
+    internal Action<NativeUnwindInfo>? RecordUnwindInfo { get; set; }
     public string EntryFunctionName { get; set; } = "main";
 
     /// <summary>Keeps an undefined symbol out of a memory operand, so a dynamic image can route it through the global offset table</summary>
@@ -39,6 +40,7 @@ public sealed class X86CodeGenerator
     private readonly X86Target _machineTarget;
     private readonly LSRAOptions _allocationOptions;
     private readonly X86CodeGeneratorOptions _options;
+    private readonly ScratchNeeds _scratchNeeds;
     private readonly Dictionary<FunctionSymbol, string> _functionLabels = new Dictionary<FunctionSymbol, string>();
     private readonly Dictionary<string, string> _functionLabelsByName = new Dictionary<string, string>(StringComparer.Ordinal);
     private readonly Dictionary<Symbol, string> _dataLabels = new Dictionary<Symbol, string>();
@@ -66,37 +68,497 @@ public sealed class X86CodeGenerator
         _machineTarget = X86Target.FromTargetInfo(_target);
         _allocationOptions = ReserveCodeGenScratchRegisters(_target, allocationOptions ?? LSRAOptions.ForTarget(_target));
         _options = options ?? X86CodeGeneratorOptions.Default;
+        _scratchNeeds = new ScratchNeeds(_target, _options.IndirectExternalData);
     }
 
+    // LSRA kills scratch registers where an instruction needs them; one per class stays out for spilled values
     private static LSRAOptions ReserveCodeGenScratchRegisters(TargetInfo target, LSRAOptions options)
     {
-        // LSRA kills the accumulator and the counter at the few instructions that need them
-        var reservedGeneral = target.Architecture switch
-        {
-            TargetArchitectureKind.I386 => ImmutableHashSet.Create(MachineRegister.X0, MachineRegister.X1, MachineRegister.X2),
-            TargetArchitectureKind.X86_64 when TargetRegisterInfo.IsWindowsX64(target) => ImmutableHashSet.Create(MachineRegister.X5, MachineRegister.X6),
-            TargetArchitectureKind.X86_64 => ImmutableHashSet.Create(MachineRegister.X7, MachineRegister.X8),
-            _ => ImmutableHashSet<MachineRegister>.Empty,
-        };
+        var spareGeneral = SpareGeneralRegister(target);
+        var spareVector = SpareVectorRegister(target);
 
-        var blockCopyScratch = target.Architecture switch
-        {
-            TargetArchitectureKind.I386 => MachineRegister.V7,
-            TargetArchitectureKind.X86_64 when TargetRegisterInfo.IsWindowsX64(target) => MachineRegister.V4,
-            TargetArchitectureKind.X86_64 => MachineRegister.V15,
-            _ => throw new NotSupportedException("x86 block copy scratch register is unavailable for the selected target."),
-        };
-        var reservedVector = ImmutableHashSet.Create(MachineRegister.V0, MachineRegister.V1, blockCopyScratch);
+        // First-free allocation takes the earliest register, so the emitter's ones and xmm0/xmm1 go last
+        var general = options.GeneralRegisters.Where(r => r != spareGeneral).ToList();
+        if (target.Architecture == TargetArchitectureKind.I386)
+            general = general.OrderBy(r => ManagedGeneralRegisters(target).Contains(r)).ToList();
+        var vector = options.VectorRegisters.Where(r => r != spareVector).ToList();
+        var abiVector = new[] { MachineRegister.V0, MachineRegister.V1 };
+        vector.RemoveAll(abiVector.Contains);
+        var firstCalleeSaved = vector.FindIndex(r => TargetRegisterInfo.IsCalleeSaved(target, r));
+        vector.InsertRange(firstCalleeSaved < 0 ? vector.Count : firstCalleeSaved, abiVector.Where(options.VectorRegisters.Contains));
 
         return new LSRAOptions(
-            generalRegisters: options.GeneralRegisters.Where(r => !reservedGeneral.Contains(r)).ToImmutableArray(),
+            generalRegisters: general.ToImmutableArray(),
             floatingRegisters: options.FloatingRegisters,
-            vectorRegisters: options.VectorRegisters.Where(r => !reservedVector.Contains(r)).ToImmutableArray(),
+            vectorRegisters: vector.ToImmutableArray(),
             callBoundarySplitClasses: ImmutableArray.Create(LirRegisterClass.General, LirRegisterClass.Address),
             stackAlignment: options.StackAlignment,
             spillSlotSize: options.SpillSlotSize,
             spillSlotAlignment: options.SpillSlotAlignment,
             stackArgumentSlotSize: options.StackArgumentSlotSize);
+    }
+
+    private static MachineRegister SpareGeneralRegister(TargetInfo target)
+        => target.Architecture == TargetArchitectureKind.I386 ? MachineRegister.X2
+            : TargetRegisterInfo.IsWindowsX64(target) ? MachineRegister.X6 : MachineRegister.X8;
+
+    private static MachineRegister SpareVectorRegister(TargetInfo target)
+        => target.Architecture == TargetArchitectureKind.I386 ? MachineRegister.V6
+            : TargetRegisterInfo.IsWindowsX64(target) ? MachineRegister.V5 : MachineRegister.V14;
+
+    private static ImmutableArray<MachineRegister> ManagedGeneralRegisters(TargetInfo target)
+        => target.Architecture == TargetArchitectureKind.I386 ? ImmutableArray.Create(MachineRegister.X0, MachineRegister.X1)
+            : ImmutableArray.Create(TargetRegisterInfo.IsWindowsX64(target) ? MachineRegister.X5 : MachineRegister.X7);
+
+    private static ImmutableArray<MachineRegister> ManagedVectorRegisters(TargetInfo target)
+        => ImmutableArray.Create(MachineRegister.V0, MachineRegister.V1,
+            target.Architecture == TargetArchitectureKind.I386 ? MachineRegister.V7
+                : TargetRegisterInfo.IsWindowsX64(target) ? MachineRegister.V4 : MachineRegister.V15);
+
+    /// <summary>Says from its shape alone which scratch registers an instruction's code works in, following the emission routines</summary>
+    internal sealed class ScratchNeeds : IScratchNeeds
+    {
+        // Room to park two general and two vector registers, one 16-byte slot each
+        public int BorrowAreaSize => 64;
+
+        private readonly TargetInfo _target;
+        private readonly bool _is64Bit;
+        private readonly bool _indirectExternalData;
+        private readonly ImmutableHashSet<MachineRegister> _general;
+        private readonly ImmutableHashSet<MachineRegister> _vector;
+        private readonly ImmutableHashSet<MachineRegister> _all;
+
+        internal ScratchNeeds(TargetInfo target, bool indirectExternalData)
+        {
+            _target = target;
+            _is64Bit = target.Architecture == TargetArchitectureKind.X86_64;
+            _indirectExternalData = indirectExternalData;
+            _general = ManagedGeneralRegisters(target).ToImmutableHashSet();
+            _vector = ManagedVectorRegisters(target).ToImmutableHashSet();
+            _all = _general.Union(_vector);
+        }
+
+        public ImmutableHashSet<MachineRegister> Registers(ScratchClass classes)
+            => classes switch
+            {
+                ScratchClass.General => _general,
+                ScratchClass.Floating => _vector,
+                _ => _all,
+            };
+
+        // A superset of IsFoldableLoad, which also wants the one use and no spill
+        public bool MayFoldLoad(LirInstruction? previous, LirInstruction instruction)
+            => previous is { Kind: LirInstructionKind.Load, Result: not null, Address: not null } &&
+               instruction.Kind == LirInstructionKind.Binary && instruction.Operands.Length == 2 &&
+               instruction.Operands[1].Kind == LirOperandKind.Register &&
+               ReferenceEquals(instruction.Operands[1].Register, previous.Result);
+
+        public bool ReadsRightAfterWrite(LirInstruction instruction)
+        {
+            var target = _target;
+            if (instruction.Kind != LirInstructionKind.Binary || instruction.Result is null || instruction.Operands.Length != 2)
+                return false;
+            var left = instruction.Operands[0];
+            var right = instruction.Operands[1];
+            if (IsFloatType(instruction.Result.Type) || IsFloatType(left.Type) || IsFloatType(right.Type))
+                return !IsSameValue(left, right);
+            if (instruction.Operator is not ("+" or "*" or "&" or "|" or "^"))
+                return instruction.Operator == "-";
+            var size = RegisterWidth(target, instruction.Result.Type);
+            var exact = left.Register is not null && RegisterWidth(target, left.Register.Type) == size &&
+                right.Register is not null && RegisterWidth(target, right.Register.Type) == size;
+            if (!exact)
+                return true;
+            if (instruction.Operator == "+" && size is 4 or 8)
+            {
+                var scale = IsPointerLike(left.Type) && IsIntegerLike(right.Type) && left.Type.Type is PointerType pointer
+                    ? Math.Max(1, target.SizeOf(pointer.PointeeType))
+                    : IsPointerLike(right.Type) && right.Type.Type is PointerType rightPointer ? Math.Max(1, target.SizeOf(rightPointer.PointeeType)) : 1;
+                return scale is not (1 or 2 or 4 or 8);
+            }
+            return instruction.Operator == "*" && (IsPointerLike(left.Type) || IsPointerLike(right.Type));
+        }
+
+        public int SpareCount(ScratchClass scratchClass)
+            => 1;
+
+        public int StackAccessScratch(int spillAreaEnd, bool dynamicStack)
+            => 0;
+
+        public static bool IsSameValue(LirOperand left, LirOperand right)
+            => left.Kind == LirOperandKind.Register && right.Kind == LirOperandKind.Register &&
+               left.Register is not null && ReferenceEquals(left.Register, right.Register);
+
+        public ScratchClass Needs(LirInstruction instruction, LirInstruction? previous)
+        {
+            var needs = MayFoldLoad(previous, instruction) ? AddressNeeds(previous!.Address!) : ScratchClass.None;
+            var result = instruction.Result;
+            var operands = instruction.Operands;
+            if (result is not null && IsUnhandled(result.Type))
+                return ScratchClass.All;
+            foreach (var operand in operands)
+            {
+                if (operand.Kind is LirOperandKind.Segments || HasValueType(operand) && IsUnhandled(operand.Type))
+                    return ScratchClass.All;
+            }
+
+            switch (instruction.Kind)
+            {
+                case LirInstructionKind.Nop:
+                case LirInstructionKind.Jump:
+                case LirInstructionKind.Unreachable:
+                case LirInstructionKind.Parameter:
+                case LirInstructionKind.Zero:
+                    return needs;
+                case LirInstructionKind.Copy:
+                case LirInstructionKind.Constant:
+                    return result is null || operands.Length == 0 ? needs : needs | CopyNeeds(result, operands[0]);
+                case LirInstructionKind.ParallelCopy:
+                    return needs | ParallelCopyNeeds(instruction);
+                case LirInstructionKind.Unary:
+                    return result is null || operands.Length != 1 ? ScratchClass.All : needs | UnaryNeeds(instruction);
+                case LirInstructionKind.Binary:
+                    if (result is null || operands.Length != 2)
+                        return ScratchClass.All;
+                    return needs | (IsFloatType(result.Type) || IsFloatType(operands[0].Type) || IsFloatType(operands[1].Type)
+                        ? FloatingBinaryNeeds(instruction)
+                        : IntegerBinaryNeeds(instruction));
+                case LirInstructionKind.Convert:
+                case LirInstructionKind.Cast:
+                    return result is null || operands.Length == 0 ? needs : needs | ConvertNeeds(instruction);
+                case LirInstructionKind.AddressOf:
+                case LirInstructionKind.Load:
+                    return instruction.Address is null ? ScratchClass.All : needs | AddressNeeds(instruction.Address);
+                case LirInstructionKind.Store:
+                    return instruction.Address is null || operands.Length == 0
+                        ? ScratchClass.All
+                        : needs | AddressNeeds(instruction.Address) | StoredValueNeeds(operands[0]);
+                case LirInstructionKind.Branch:
+                    return needs | BranchNeeds(instruction);
+                case LirInstructionKind.Return:
+                    return needs | ReturnNeeds(instruction);
+                case LirInstructionKind.Switch:
+                    return needs | ScratchClass.General;
+                default:
+                    return ScratchClass.All;
+            }
+        }
+
+        private static bool HasValueType(LirOperand operand)
+            => operand.Kind is not (LirOperandKind.Void or LirOperandKind.None or LirOperandKind.Undefined);
+
+        private bool IsUnhandled(QualifiedType type)
+            => IsLongDouble(type) || NeedsBlockCopy(_target, type) || IsWideInteger(_target, type);
+
+        private int RegisterSize(QualifiedType type)
+            => RegisterWidth(_target, type);
+
+        private static bool FitsInt32(long value)
+            => value is >= int.MinValue and <= int.MaxValue;
+
+        // i386 has no rip-relative form and reaches the constant pool through Scratch1
+        private ScratchClass Literal(LirOperand operand)
+            => !_is64Bit && operand.Kind == LirOperandKind.Immediate && IsFloatType(operand.Type) ? ScratchClass.General : ScratchClass.None;
+
+        private static bool InFloatingRegister(LirOperand operand, bool asDouble)
+            => operand.Kind == LirOperandKind.Register && IsFloatType(operand.Type) && IsFloat64(operand.Type) == asDouble;
+
+        private static ScratchClass IntoRegister(LirOperand operand)
+            => operand.Kind == LirOperandKind.Address ? ScratchClass.General : ScratchClass.None;
+
+        private static ScratchClass IntegerRead(LirOperand operand, int size)
+            => operand.Kind switch
+            {
+                LirOperandKind.Immediate when operand.Immediate is string || size == 8 && !FitsInt32(ConvertIntegerConstant(operand.Immediate)) => ScratchClass.General,
+                LirOperandKind.Symbol or LirOperandKind.Address => ScratchClass.General,
+                _ => ScratchClass.None,
+            };
+
+        private ScratchClass CopyNeeds(LirVirtualRegister destination, LirOperand source)
+        {
+            if (!IsFloatType(destination.Type) && !IsFloatType(source.Type))
+                return IntoRegister(source);
+            if (!IsFloatType(destination.Type) || !IsFloatType(source.Type) || source.Kind == LirOperandKind.Address)
+                return ScratchClass.All;
+            return Literal(source);
+        }
+
+        private ScratchClass ParallelCopyNeeds(LirInstruction instruction)
+        {
+            var needs = ScratchClass.None;
+            foreach (var copy in instruction.ParallelCopies)
+            {
+                var source = copy.Source;
+                if (IsUnhandled(copy.Destination.Type) || HasValueType(source) && IsUnhandled(source.Type) ||
+                    source.Kind is LirOperandKind.Address or LirOperandKind.Segments)
+                    return ScratchClass.All;
+                if (IsFloatType(copy.Destination.Type) || IsFloatType(source.Type))
+                    needs |= source.Kind == LirOperandKind.Register ? ScratchClass.None : ScratchClass.Floating | Literal(source);
+                else if (source.Kind is LirOperandKind.Immediate or LirOperandKind.Symbol)
+                    needs |= IntegerRead(source, 8);
+            }
+            return needs;
+        }
+
+        private ScratchClass UnaryNeeds(LirInstruction instruction)
+        {
+            var operand = instruction.Operands[0];
+            if (!IsFloatType(instruction.Result!.Type) && !IsFloatType(operand.Type))
+                return IntoRegister(operand);
+            if (!IsFloatType(instruction.Result.Type) || !IsFloatType(operand.Type))
+                return ScratchClass.All;
+            return instruction.Operator switch
+            {
+                "+" => Literal(operand),
+                "-" => ScratchClass.Floating | (_is64Bit ? ScratchClass.None : ScratchClass.General),
+                _ => ScratchClass.All,
+            };
+        }
+
+        private ScratchClass FloatingBinaryNeeds(LirInstruction instruction)
+        {
+            var result = instruction.Result!;
+            var left = instruction.Operands[0];
+            var right = instruction.Operands[1];
+            if (!IsFloatType(left.Type) || !IsFloatType(right.Type))
+                return ScratchClass.All;
+            var literals = Literal(left) | Literal(right);
+            switch (instruction.Operator)
+            {
+                case "+":
+                case "-":
+                case "*":
+                case "/":
+                {
+                    if (!IsFloatType(result.Type))
+                        return ScratchClass.All;
+                    var asDouble = IsFloat64(left.Type) || IsFloat64(right.Type) || IsFloat64(result.Type);
+                    return literals | (InFloatingRegister(right, asDouble) ? ScratchClass.None : ScratchClass.Floating);
+                }
+                case "==":
+                case "!=":
+                case "<":
+                case "<=":
+                case ">":
+                case ">=":
+                {
+                    var asDouble = IsFloat64(left.Type) || IsFloat64(right.Type) || IsFloat64(IsFloatType(result.Type) ? left.Type : result.Type);
+                    var needs = instruction.Operator is ">" or ">=" ? ScratchClass.None : ScratchClass.General;
+                    if (!InFloatingRegister(left, asDouble) || !InFloatingRegister(right, asDouble))
+                        needs |= ScratchClass.Floating;
+                    return needs | literals;
+                }
+                default:
+                    return ScratchClass.All;
+            }
+        }
+
+        private ScratchClass IntegerBinaryNeeds(LirInstruction instruction)
+        {
+            var result = instruction.Result!;
+            var left = instruction.Operands[0];
+            var right = instruction.Operands[1];
+            var size = RegisterSize(result.Type);
+            switch (instruction.Operator)
+            {
+                case "+":
+                case "-":
+                case "&":
+                case "|":
+                case "^":
+                case "*":
+                {
+                    var needs = IntoRegister(left) | IntoRegister(right);
+                    var scale = IsPointerLike(left.Type) && IsIntegerLike(right.Type) ? PointerScale(left.Type) : 1;
+                    if (instruction.Operator is "+" or "-" && scale != 1 && !IsLeaShape(instruction.Operator, left, right, size, scale))
+                        needs |= ScratchClass.General;
+                    if (instruction.Operator == "-" && IsPointerLike(left.Type) && IsPointerLike(right.Type) && !IsPowerOfTwo(PointerScale(left.Type)))
+                        needs |= ScratchClass.General;
+                    if (instruction.Operator == "*" && right.Kind == LirOperandKind.Immediate && right.Immediate is not string &&
+                        !FitsInt32(ConvertIntegerConstant(right.Immediate)))
+                        needs |= ScratchClass.General;
+                    return needs | IntegerRead(right, size);
+                }
+                case "/":
+                case "%":
+                    if (LirStrengthReduction.TryGetPowerOfTwoDivisor(instruction, _target, out _, out _))
+                        return IntoRegister(left) | (IsSigned(left.Type) ? ScratchClass.General : ScratchClass.None);
+                    // Every other divide works in eax, ecx and edx, which on x64 are not scratch registers
+                    return _is64Bit ? IntoRegister(left) | IntoRegister(right) : ScratchClass.General;
+                case "<<":
+                case ">>":
+                    return IntoRegister(left);
+                case "==":
+                case "!=":
+                case "<":
+                case "<=":
+                case ">":
+                case ">=":
+                    return ComparisonNeeds(left, right);
+                default:
+                    return ScratchClass.All;
+            }
+        }
+
+        private bool IsLeaShape(string op, LirOperand left, LirOperand right, int size, int scale)
+        {
+            if (size is not (4 or 8) || !IsExactRegister(left, size))
+                return false;
+            if (right.Kind == LirOperandKind.Immediate && right.Immediate is not string && !IsFloatType(right.Type))
+            {
+                var value = ConvertIntegerConstant(right.Immediate);
+                return size == 4 || FitsInt32(value) && FitsInt32(value * (op == "-" ? -scale : scale));
+            }
+            return op == "+" && scale is 1 or 2 or 4 or 8 && IsExactRegister(right, size);
+        }
+
+        private bool IsExactRegister(LirOperand operand, int size)
+            => operand.Kind == LirOperandKind.Register && operand.Register is not null && RegisterSize(operand.Register.Type) == size;
+
+        private static bool IsPowerOfTwo(int value)
+            => (value & (value - 1)) == 0;
+
+        private ScratchClass ComparisonNeeds(LirOperand left, LirOperand right)
+        {
+            var size = Math.Max(RegisterSize(left.Type), RegisterSize(right.Type));
+            var needs = left.Kind == LirOperandKind.Register && RegisterSize(left.Type) == size ? ScratchClass.None : ScratchClass.General;
+            return needs | IntegerRead(right, size);
+        }
+
+        private int PointerScale(QualifiedType pointerType)
+            => pointerType.Type switch
+            {
+                PointerType pointer => Math.Max(1, _target.SizeOf(pointer.PointeeType)),
+                ArrayType array => Math.Max(1, _target.SizeOf(array.ElementType)),
+                _ => 1,
+            };
+
+        private bool IsSigned(QualifiedType type)
+            => GimpleTypes.IsIntegerLike(type) && GimpleTypes.IsSigned(type, _target);
+
+        private ScratchClass ConvertNeeds(LirInstruction instruction)
+        {
+            var result = instruction.Result!;
+            var source = instruction.Operands[0];
+            var resultFloat = IsFloatType(result.Type);
+            var sourceFloat = IsFloatType(source.Type);
+            if (!resultFloat && !sourceFloat)
+                return CopyNeeds(result, source);
+            if (source.Kind == LirOperandKind.Address)
+                return ScratchClass.All;
+
+            var size = StorageSize(_target, result.Type);
+            if (instruction.Kind == LirInstructionKind.Cast && resultFloat != sourceFloat && size == StorageSize(_target, source.Type) && size is 4 or 8)
+            {
+                if (source.Kind == LirOperandKind.Register)
+                    return ScratchClass.None;
+                return sourceFloat ? ScratchClass.Floating | Literal(source) : ScratchClass.General;
+            }
+            if (resultFloat && sourceFloat)
+                return Literal(source);
+            if (resultFloat)
+            {
+                if (!IsIntegerLike(source.Type) && !IsPointerLike(source.Type))
+                    return ScratchClass.All;
+                var unsigned = !IsSigned(source.Type) || IsPointerLike(source.Type);
+                return unsigned && (RegisterSize(source.Type) >= 8 || !_is64Bit) ? ScratchClass.All : ScratchClass.General;
+            }
+            if (result.Type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Bool } || (!IsSigned(result.Type) || IsPointerLike(result.Type)) && size >= 4)
+                return ScratchClass.All;
+            return source.Kind == LirOperandKind.Register ? ScratchClass.None : ScratchClass.Floating | Literal(source);
+        }
+
+        private ScratchClass AddressNeeds(LirAddress address)
+        {
+            long displacement = 0;
+            var indexed = false;
+            var root = address;
+            while (root.Kind is LirAddressKind.Field or LirAddressKind.Element)
+            {
+                if (root.BaseAddress is null)
+                    return ScratchClass.General;
+                displacement += root.Displacement;
+                if (root.Kind == LirAddressKind.Element && root.Index is { } index)
+                {
+                    if (index.Kind == LirOperandKind.Immediate && index.Immediate is not string)
+                    {
+                        displacement += ConvertIntegerConstant(index.Immediate) * root.Scale;
+                    }
+                    else
+                    {
+                        if (indexed || root.Scale is not (1 or 2 or 4 or 8) || index.Kind != LirOperandKind.Register || index.Register is null ||
+                            RegisterSize(index.Register.Type) != _target.PointerSize)
+                            return ScratchClass.General;
+                        indexed = true;
+                    }
+                }
+                root = root.BaseAddress;
+            }
+
+            var formed = root.Kind switch
+            {
+                LirAddressKind.StackSlot => root.StackSlot is not null,
+                LirAddressKind.Symbol => root.Symbol is not null && !indexed && _is64Bit && !_indirectExternalData,
+                LirAddressKind.Indirect => root.BaseOperand is { Kind: LirOperandKind.Register, Register: not null },
+                _ => false,
+            };
+            return formed && FitsInt32(displacement) ? ScratchClass.None : ScratchClass.General;
+        }
+
+        private ScratchClass StoredValueNeeds(LirOperand value)
+        {
+            if (IsFloatType(value.Type))
+            {
+                return value.Kind switch
+                {
+                    LirOperandKind.Register => ScratchClass.None,
+                    LirOperandKind.Address => ScratchClass.All,
+                    _ => ScratchClass.Floating | Literal(value),
+                };
+            }
+            return value.Kind == LirOperandKind.StackSlot ? ScratchClass.General : IntegerRead(value, RegisterSize(value.Type));
+        }
+
+        private ScratchClass BranchNeeds(LirInstruction instruction)
+        {
+            if (LirSelect.MayBeDiamond(instruction))
+                return ScratchClass.General;
+            var operands = instruction.Operands;
+            if (operands.Length == 2 && instruction.Operator is "==" or "!=" or "<" or "<=" or ">" or ">=")
+            {
+                var left = operands[0];
+                var right = operands[1];
+                if (!IsFloatType(left.Type) && !IsFloatType(right.Type))
+                    return ComparisonNeeds(left, right);
+                if (!IsFloatType(left.Type) || !IsFloatType(right.Type))
+                    return ScratchClass.All;
+                var asDouble = IsFloat64(left.Type) || IsFloat64(right.Type);
+                return (InFloatingRegister(left, asDouble) && InFloatingRegister(right, asDouble) ? ScratchClass.None : ScratchClass.Floating) |
+                    Literal(left) | Literal(right);
+            }
+
+            if (operands.Length != 1)
+                return ScratchClass.All;
+            var condition = operands[0];
+            if (IsFloatType(condition.Type))
+                return ScratchClass.Floating | Literal(condition);
+            return condition.Kind == LirOperandKind.Register ? ScratchClass.None : ScratchClass.General;
+        }
+
+        private ScratchClass ReturnNeeds(LirInstruction instruction)
+        {
+            if (instruction.Operator == LirInstruction.BufferReturn || instruction.Operands.Length == 0)
+                return ScratchClass.None;
+            var value = instruction.Operands[0];
+            var abi = CAbi.ClassifyValue(_target, value.Type, isReturn: true, isVariadicUnnamedArgument: false);
+            if (abi.PassingKind == AbiPassingKind.Void)
+                return ScratchClass.None;
+            if (abi.PassingKind != AbiPassingKind.Scalar || GimpleTypes.IsAggregate(value.Type))
+                return ScratchClass.All;
+            if (IsFloatType(value.Type))
+                return value.Kind == LirOperandKind.Register ? ScratchClass.None : ScratchClass.Floating | Literal(value);
+            return IntoRegister(value);
+        }
     }
 
     public static X86Program Generate(
@@ -384,9 +846,13 @@ public sealed class X86CodeGenerator
     /// <summary>Defines a label, which is also where control may arrive holding anything at all</summary>
     internal void DefineLabel(string label)
     {
+        if (_scratchBorrowed)
+            throw new InvalidOperationException($"Label '{label}' is defined while a scratch register is borrowed.");
         ForgetZeroExtensions();
         _text.DefineLabel(label);
     }
+
+    private bool _scratchBorrowed;
 
     /// <summary>How far up a general register is known to be zero, in bits, or zero for nothing known</summary>
     private readonly int[] _zeroExtendedBits = new int[16];
@@ -879,7 +1345,7 @@ public sealed class X86CodeGenerator
         if (function.Symbol is null || !_functionLabels.TryGetValue(function.Symbol, out var label))
             throw new NotSupportedException("Cannot emit anonymous functions to x86 object code.");
 
-        var allocation = LinearScanRegisterAllocator.Allocate(function, _target, _allocationOptions);
+        var allocation = LinearScanRegisterAllocator.Allocate(function, _target, _allocationOptions, _scratchNeeds);
         var blockLabels = new Dictionary<LirBlock, string>();
         foreach (var block in function.Blocks)
             blockLabels.Add(block, CreateLocalLabel($"{label}_{block.Name}"));
@@ -1062,6 +1528,24 @@ public sealed class X86CodeGenerator
     private static bool IsLongDouble(QualifiedType type)
         => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.LongDouble };
 
+    private static int StorageSize(TargetInfo target, QualifiedType type)
+        => Math.Max(1, target.SizeOf(type));
+
+    private static int RegisterWidth(TargetInfo target, QualifiedType type)
+    {
+        if (IsPointerLike(type))
+            return target.PointerSize;
+        if (IsFloatType(type))
+            return StorageSize(target, type);
+        return Math.Min(StorageSize(target, type), target.PointerSize);
+    }
+
+    private static bool NeedsBlockCopy(TargetInfo target, QualifiedType type)
+        => IsAggregateType(type) || (!IsPointerLike(type) && !(IsFloatType(type) && !IsLongDouble(type)) && StorageSize(target, type) > target.PointerSize);
+
+    private static bool IsWideInteger(TargetInfo target, QualifiedType type)
+        => target.Architecture == TargetArchitectureKind.I386 && IsIntegerLike(type) && StorageSize(target, type) == 8;
+
     private sealed class FunctionEmissionContext
     {
         private readonly X86CodeGenerator _owner;
@@ -1082,6 +1566,13 @@ public sealed class X86CodeGenerator
         private readonly HashSet<LirInstruction> _fusedDivRem = new();
         private readonly Dictionary<LirVirtualRegister, X86Operand> _foldedAddresses = new();
         private int _currentInstructionPosition;
+        private LirInstruction? _currentInstruction;
+        private readonly X86Register[] _scratchRoles = new X86Register[6];
+        private readonly HashSet<X86Register> _managedScratch = new();
+        private readonly X86Register _spareGeneralScratch;
+        private readonly X86Register _spareVectorScratch;
+        private readonly List<(X86Register Register, X86Operand Parking, bool Saved)> _borrowedScratch = new();
+        private bool _placeholdersIssued;
         private LirBlock? _fallthroughBlock;
         private LirBlock? _currentBlock;
         private int _currentBlockIndex;
@@ -1116,6 +1607,11 @@ public sealed class X86CodeGenerator
                 .Where(r => MachineRegisters.GetClass(r) == RegisterClass.Vector)
                 .ToList();
             _wordSize = owner._target.PointerSize;
+            foreach (var register in ManagedGeneralRegisters(owner._target).AddRange(ManagedVectorRegisters(owner._target)))
+                _managedScratch.Add(ToX86Register(register, owner._machineTarget));
+            _spareGeneralScratch = ToX86Register(SpareGeneralRegister(owner._target), owner._machineTarget);
+            _spareVectorScratch = ToX86Register(SpareVectorRegister(owner._target), owner._machineTarget);
+            Array.Fill(_scratchRoles, X86Register.Invalid);
             _stackArgumentSlotSize = owner._allocationOptions.StackArgumentSlotSize;
             _sysVX64RegisterSaveAreaOffset = NeedsSysVX64RegisterSaveArea()
                 ? AlignUp(allocation.Frame.FrameSize, 16)
@@ -1125,8 +1621,25 @@ public sealed class X86CodeGenerator
 
         private X86Register FrameBase => _allocation.Frame.HasDynamicStack ? X86Register.Rbp : X86Register.Rsp;
 
+        private void RecordUnwindInfo()
+        {
+            if (_owner._options.RecordUnwindInfo is null)
+                return;
+            var saved = ImmutableArray.CreateBuilder<(MachineRegister Register, int Offset, int Size)>();
+            for (int i = 0; i < _savedGeneralRegisters.Count; i++)
+                saved.Add((_savedGeneralRegisters[i], _frameSize + (_savedGeneralRegisters.Count - i - 1) * _wordSize, _wordSize));
+            foreach (MachineRegister register in _savedVectorRegisters)
+                saved.Add((register, _allocation.Frame.SavedRegisterOffsets[register], 16));
+            int returnOffset = checked(_frameSize + _savedGeneralRegisters.Count * _wordSize);
+            _owner._options.RecordUnwindInfo(new NativeUnwindInfo(
+                _functionLabel, returnOffset + _wordSize, returnOffset,
+                _allocation.Frame.HasDynamicStack ? _allocation.Frame.FrameBaseSaveOffset : -1,
+                saved.ToImmutable()));
+        }
+
         public void EmitPrologue()
         {
+            RecordUnwindInfo();
             foreach (var register in _savedGeneralRegisters)
                 Emit(X86Instruction.Unary(X86InstrKind.Push, Reg(ToX86Register(register, _owner._machineTarget), _wordSize)));
 
@@ -1180,7 +1693,18 @@ public sealed class X86CodeGenerator
                         continue;
                     }
                     if (instruction.Result is null || !_foldableLoads.ContainsKey(instruction.Result))
+                    {
+                        _currentInstruction = instruction;
                         EmitInstruction(instruction);
+                        if (_placeholdersIssued)
+                        {
+                            RestoreBorrowedScratch();
+                            _borrowedScratch.Clear();
+                            Array.Fill(_scratchRoles, X86Register.Invalid);
+                            _placeholdersIssued = false;
+                        }
+                        _currentInstruction = null;
+                    }
                     _currentInstructionPosition += 2;
                 }
             }
@@ -1574,6 +2098,9 @@ public sealed class X86CodeGenerator
                     break;
                 case LirInstructionKind.Return:
                     EmitReturn(instruction);
+                    break;
+                case LirInstructionKind.ReturnBuffer:
+                    EmitReturnBuffer(instruction);
                     break;
                 case LirInstructionKind.Unreachable:
                     Emit(new X86Instruction(X86InstrKind.Ud2));
@@ -2464,16 +2991,19 @@ public sealed class X86CodeGenerator
                 var value = CAbi.ClassifyValue(_owner._target, parameter.Type, isReturn: false, isVariadicUnnamedArgument: false);
                 if (i == parameterIndex)
                 {
-                    if (value.PassingKind == AbiPassingKind.MultiRegister)
-                        LoadParameterMultiRegisterValue(instruction.Result, value, ref cursor, instruction);
-                    else
+                    if (instruction.Operands.Length == 1 && instruction.Operands[0].Immediate is int segment)
                     {
-                        var location = CAbi.AssignArgumentLocation(value, ref cursor, _stackArgumentSlotSize);
-                        if (value.PassingKind == AbiPassingKind.Indirect)
-                            LoadParameterIndirectValue(instruction.Result, location, instruction);
-                        else
-                            LoadParameterValue(instruction.Result, location, instruction);
+                        LoadParameterValue(instruction.Result, CAbi.AssignParameterSegmentLocation(value, segment, ref cursor, _stackArgumentSlotSize), instruction);
+                        return;
                     }
+
+                    var placement = CAbi.PlaceArgument(value, ref cursor, _stackArgumentSlotSize);
+                    if (placement.Value.PassingKind == AbiPassingKind.MultiRegister)
+                        LoadParameterMultiRegisterValue(instruction.Result, placement, instruction);
+                    else if (placement.Value.PassingKind == AbiPassingKind.Indirect)
+                        LoadParameterIndirectValue(instruction.Result, placement.Locations[0], instruction);
+                    else
+                        LoadParameterValue(instruction.Result, placement.Locations[0], instruction);
                     return;
                 }
                 _ = CAbi.AssignArgumentLocation(value, ref cursor, _stackArgumentSlotSize);
@@ -2554,15 +3084,16 @@ public sealed class X86CodeGenerator
             }
         }
 
-        private void LoadParameterMultiRegisterValue(LirVirtualRegister destination, AbiValue value, ref AbiCursor cursor, LirInstruction instruction)
+        private void LoadParameterMultiRegisterValue(LirVirtualRegister destination, AbiPlacement placement, LirInstruction instruction)
         {
             var destinationAddress = RequiresBlockCopyStorage(destination.Type)
                 ? MaterializeVirtualRegisterStorageAddress(destination, Scratch0)
                 : X86Register.Invalid;
 
-            foreach (var segment in value.Segments)
+            for (var i = 0; i < placement.Locations.Length; i++)
             {
-                var location = CAbi.AssignSegmentArgumentLocation(segment, ref cursor, _stackArgumentSlotSize);
+                var segment = placement.Value.Segments[i];
+                var location = placement.Locations[i];
                 if (RequiresBlockCopyStorage(destination.Type))
                 {
                     if (location.Kind == AbiLocationKind.Register)
@@ -3339,7 +3870,7 @@ public sealed class X86CodeGenerator
         }
 
         private bool IsX86WideInteger(QualifiedType type)
-            => _owner._target.Architecture == TargetArchitectureKind.I386 && IsIntegerLike(type) && SizeOfStorage(type) == 8;
+            => IsWideInteger(_owner._target, type);
 
         private void EmitBinary(LirInstruction instruction)
         {
@@ -4017,16 +4548,17 @@ public sealed class X86CodeGenerator
                     var writable = GetWritableRegister(result, FpScratch0);
 
                     // Same collision as the integer path: resolve the right operand before the left
-                    // one overwrites the register it lives in
-                    var stagedRight = OccupiesRegister(right, writable)
+                    // one overwrites the register it lives in, unless both are one value
+                    var sameValue = ScratchNeeds.IsSameValue(left, right);
+                    var stagedRight = !sameValue && OccupiesRegister(right, writable)
                         ? LoadOperandAsFloating(right, operationType, FpScratch1, instruction)
                         : X86Register.Invalid;
 
                     var leftReg = LoadOperandAsFloating(left, operationType, writable, instruction);
                     if (writable != leftReg)
                         EmitFloatingMove(writable, leftReg, operationType);
-                    var rightReg = stagedRight != X86Register.Invalid
-                        ? stagedRight
+                    var rightReg = sameValue ? writable
+                        : stagedRight != X86Register.Invalid ? stagedRight
                         : LoadOperandAsFloatingForRead(right, operationType, FpScratch1, instruction);
                     Emit(X86Instruction.Binary(FloatingArithmeticOpcode(instruction.Operator, operationType),
                         Reg(writable, FloatingStorageSize(operationType)), Reg(rightReg, FloatingStorageSize(operationType))));
@@ -4537,6 +5069,8 @@ public sealed class X86CodeGenerator
         {
             if (instruction.Result is null || instruction.Operands.Length == 0)
                 return;
+            if (TryEmitBitcast(instruction))
+                return;
             if (IsFloatType(instruction.Result.Type) || IsFloatType(instruction.Operands[0].Type))
             {
                 EmitFloatingOrMixedConvert(instruction);
@@ -4545,6 +5079,37 @@ public sealed class X86CodeGenerator
             if (TryEmitSoftwareIntegerConvert(instruction))
                 return;
             EmitValueCopy(instruction.Result, instruction.Operands[0], instruction);
+        }
+
+        // A view conversion between a floating and an integer type of one size keeps the bits
+        private bool TryEmitBitcast(LirInstruction instruction)
+        {
+            var result = instruction.Result!;
+            var operand = instruction.Operands[0];
+            if (instruction.Kind != LirInstructionKind.Cast || IsFloatType(result.Type) == IsFloatType(operand.Type) ||
+                SizeOfStorage(result.Type) != SizeOfStorage(operand.Type) || SizeOfStorage(result.Type) is not (4 or 8) ||
+                SizeOfStorage(result.Type) == 8 && !_owner._machineTarget.Is64Bit)
+            {
+                return false;
+            }
+
+            var size = SizeOfStorage(result.Type);
+            var opcode = size == 8 ? X86InstrKind.Movq : X86InstrKind.Movd;
+            if (IsFloatType(operand.Type))
+            {
+                var source = LoadFloatingOperand(operand, FpScratch0, instruction);
+                var destination = GetWritableRegister(result, Scratch0);
+                Emit(X86Instruction.Binary(opcode, Reg(destination, size), Reg(source, size)));
+                StoreWritableRegisterIfSpilled(result, destination);
+            }
+            else
+            {
+                var source = LoadOperand(operand, Scratch0, instruction, size);
+                var destination = GetWritableRegister(result, FpScratch0);
+                Emit(X86Instruction.Binary(opcode, Reg(destination, size), Reg(source, size)));
+                StoreWritableRegisterIfSpilled(result, destination);
+            }
+            return true;
         }
 
         private void EmitAddressOf(LirInstruction instruction)
@@ -4791,15 +5356,7 @@ public sealed class X86CodeGenerator
             {
                 var isVariadicUnnamed = signature.IsVariadic && i - 1 >= signature.Parameters.Length;
                 var value = CAbi.ClassifyValue(_owner._target, instruction.Operands[i].Type, isReturn: false, isVariadicUnnamed);
-                if (value.PassingKind == AbiPassingKind.MultiRegister)
-                {
-                    foreach (var segment in value.Segments)
-                        _ = CAbi.AssignSegmentArgumentLocation(segment, ref cursor, _stackArgumentSlotSize);
-                }
-                else
-                {
-                    _ = CAbi.AssignArgumentLocation(value, ref cursor, _stackArgumentSlotSize);
-                }
+                _ = CAbi.PlaceArgument(value, ref cursor, _stackArgumentSlotSize);
             }
 
             Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 1), Imm(Math.Min(8, cursor.Vector))));
@@ -4974,26 +5531,39 @@ public sealed class X86CodeGenerator
             if (value.PassingKind == AbiPassingKind.Unsupported)
                 throw Unsupported(instruction, $"Unsupported ABI argument: {operand.Type.ToDisplayString()}.");
 
+            var placement = CAbi.PlaceArgument(value, ref cursor, _stackArgumentSlotSize);
+            var placed = placement.Value;
+
             // An indirect argument is the callee's own object, so the caller hands over its address
-            if (value.PassingKind == AbiPassingKind.Indirect)
+            if (placed.PassingKind == AbiPassingKind.Indirect)
             {
-                var indirectLocation = CAbi.AssignArgumentLocation(value, ref cursor, _stackArgumentSlotSize);
-                AddPendingCallArgumentSegment(stackArguments, registerArguments, operand, indirectLocation, 0, _wordSize, isVariadicUnnamed, AbiRegisterClass.General, passesAddress: true);
+                AddPendingCallArgumentSegment(stackArguments, registerArguments, operand, placement.Locations[0], 0, _wordSize, isVariadicUnnamed, AbiRegisterClass.General, passesAddress: true);
                 return;
             }
 
-            if (value.PassingKind == AbiPassingKind.MultiRegister)
+            if (operand.Kind == LirOperandKind.Segments)
             {
-                foreach (var segment in value.Segments)
+                if (!placement.KeepsClassification(value))
+                    throw Unsupported(instruction, "Aggregate argument segments do not match where the argument travels.");
+                for (var i = 0; i < placed.Segments.Length; i++)
                 {
-                    var loc = CAbi.AssignSegmentArgumentLocation(segment, ref cursor, _stackArgumentSlotSize);
-                    AddPendingCallArgumentSegment(stackArguments, registerArguments, operand, loc, segment.Offset, segment.Size, isVariadicUnnamed, segment.RegisterClass);
+                    var part = operand.Parts[i];
+                    AddPendingCallArgumentSegment(stackArguments, registerArguments, part, placement.Locations[i], 0, SizeOfStorage(part.Type), isVariadicUnnamed, placed.Segments[i].RegisterClass);
                 }
                 return;
             }
 
-            var location = CAbi.AssignArgumentLocation(value, ref cursor, _stackArgumentSlotSize);
-            AddPendingCallArgumentSegment(stackArguments, registerArguments, operand, location, 0, Math.Min(SizeOfStorage(operand.Type), Math.Max(1, value.Size)), isVariadicUnnamed, AbiRegisterClass.General);
+            if (placed.PassingKind == AbiPassingKind.MultiRegister)
+            {
+                for (var i = 0; i < placed.Segments.Length; i++)
+                {
+                    var segment = placed.Segments[i];
+                    AddPendingCallArgumentSegment(stackArguments, registerArguments, operand, placement.Locations[i], segment.Offset, segment.Size, isVariadicUnnamed, segment.RegisterClass);
+                }
+                return;
+            }
+
+            AddPendingCallArgumentSegment(stackArguments, registerArguments, operand, placement.Locations[0], 0, Math.Min(SizeOfStorage(operand.Type), Math.Max(1, placed.Size)), isVariadicUnnamed, AbiRegisterClass.General);
         }
 
         private static void AddPendingCallArgumentSegment(
@@ -5023,34 +5593,6 @@ public sealed class X86CodeGenerator
                 else
                     StoreArgumentSegment(segment.Operand, segment.Location, segment.SourceOffset, segment.Size, instruction, segment.IsVariadicUnnamed, segment.RegisterClass);
             }
-        }
-
-        private void StoreArgument(LirOperand operand, AbiValue value, ref AbiCursor cursor, LirInstruction instruction, bool isVariadicUnnamed)
-        {
-            if (IsLongDouble(operand.Type))
-                throw Unsupported(instruction, "x86 backend does not support long double code generation.");
-            if (value.PassingKind == AbiPassingKind.Void)
-                return;
-            if (value.PassingKind == AbiPassingKind.Unsupported)
-                throw Unsupported(instruction, $"Unsupported ABI argument: {operand.Type.ToDisplayString()}.");
-            if (value.PassingKind == AbiPassingKind.Indirect)
-            {
-                StoreArgumentAddress(operand, CAbi.AssignArgumentLocation(value, ref cursor, _stackArgumentSlotSize), instruction);
-                return;
-            }
-
-            if (value.PassingKind == AbiPassingKind.MultiRegister)
-            {
-                foreach (var segment in value.Segments)
-                {
-                    var loc = CAbi.AssignSegmentArgumentLocation(segment, ref cursor, _stackArgumentSlotSize);
-                    StoreArgumentSegment(operand, loc, segment.Offset, segment.Size, instruction, isVariadicUnnamed, segment.RegisterClass);
-                }
-                return;
-            }
-
-            var location = CAbi.AssignArgumentLocation(value, ref cursor, _stackArgumentSlotSize);
-            StoreArgumentSegment(operand, location, 0, Math.Min(SizeOfStorage(operand.Type), Math.Max(1, value.Size)), instruction, isVariadicUnnamed, AbiRegisterClass.General);
         }
 
         private void StoreArgumentAddress(LirOperand operand, AbiLocation location, LirInstruction instruction)
@@ -5677,7 +6219,11 @@ public sealed class X86CodeGenerator
 
         private void EmitReturn(LirInstruction instruction)
         {
-            if (instruction.Operands.Length != 0)
+            if (instruction.Operands.Length == 1 && instruction.Operands[0].Kind == LirOperandKind.Segments)
+                MoveReturnSegments(instruction);
+            else if (instruction.Operator == LirInstruction.BufferReturn)
+                EmitLoadFromStack(X86Register.Rax, _allocation.Frame.HiddenReturnBufferOffset, _wordSize, false);
+            else if (instruction.Operands.Length != 0)
                 StoreReturnValue(instruction.Operands[0], instruction);
             if (_fallthroughBlock is null)
                 return;
@@ -5687,6 +6233,55 @@ public sealed class X86CodeGenerator
             else
                 Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(_epilogueLabel, 4, X86ObjectRelocationKind.Relative32)));
         }
+
+        private void MoveReturnSegments(LirInstruction instruction)
+        {
+            var value = CAbi.ClassifyValue(_owner._target, _function.Symbol!.FunctionType!.ReturnType, isReturn: true, isVariadicUnnamedArgument: false);
+            var parts = instruction.Operands[0].Parts;
+            var destinations = new MachineRegister[parts.Length];
+            var sources = new MachineRegister[parts.Length];
+            for (var i = 0; i < destinations.Length; i++)
+            {
+                destinations[i] = CAbi.SegmentReturnRegister(value, i);
+                sources[i] = _allocation.TryGetPhysicalRegister(parts[i], out var register) ? register : MachineRegister.Invalid;
+            }
+
+            var generalScratch = !_owner._machineTarget.Is64Bit ? MachineRegister.X1
+                : TargetRegisterInfo.IsWindowsX64(_owner._target) ? MachineRegister.X6 : MachineRegister.X8;
+            var vectorScratch = ToMachineRegister(BlockCopyScratch);
+            foreach (var (move, from, to) in RegisterMoveSequencer.Order(destinations, sources,
+                register => register >= MachineRegister.V0 && register <= MachineRegister.V31 ? vectorScratch : generalScratch))
+            {
+                var destination = ToX86Register(to, _owner._machineTarget);
+                var type = move < 0 ? null : (QualifiedType?)parts[move].Type;
+                if (from != MachineRegister.Invalid)
+                {
+                    var source = ToX86Register(from, _owner._machineTarget);
+                    if (IsXmmRegister(destination))
+                        EmitFloatingMove(destination, source, type ?? new QualifiedType(TypeCatalog.Instance.Double));
+                    else
+                        MoveRegister(destination, source, _wordSize);
+                }
+                else if (IsXmmRegister(destination))
+                {
+                    EmitFloatingMove(destination, LoadFloatingOperand(parts[move], destination, instruction), type!.Value);
+                }
+                else
+                {
+                    LoadOperandInto(parts[move], destination, instruction, RegisterSize(type!.Value));
+                }
+            }
+        }
+
+        private void EmitReturnBuffer(LirInstruction instruction)
+        {
+            var destination = GetWritableRegister(instruction.Result!, Scratch0);
+            EmitLoadFromStack(destination, _allocation.Frame.HiddenReturnBufferOffset, _wordSize, false);
+            StoreWritableRegisterIfSpilled(instruction.Result!, destination);
+        }
+
+        private static bool IsXmmRegister(X86Register register)
+            => register >= X86Register.Xmm0 && register <= X86Register.Xmm15;
 
         private void StoreReturnValue(LirOperand operand, LirInstruction instruction)
         {
@@ -6404,7 +6999,7 @@ public sealed class X86CodeGenerator
         }
 
         private X86Register PreferredScratch(QualifiedType type)
-            => IsFloatType(type) ? X86Register.Xmm0 : Scratch0;
+            => IsFloatType(type) ? FpScratch0 : Scratch0;
 
         private void StoreWritableRegisterIfSpilled(LirVirtualRegister register, X86Register source)
         {
@@ -6658,22 +7253,22 @@ public sealed class X86CodeGenerator
         }
 
         private void Emit(X86Instruction instruction)
-            => _owner.Emit(instruction);
+        {
+            if (_placeholdersIssued)
+                instruction = BindScratchPlaceholders(instruction);
+            if (_owner._scratchBorrowed && instruction.Opcode is X86InstrKind.Jmp or X86InstrKind.Jcc or X86InstrKind.Ret or X86InstrKind.Call)
+                RestoreBorrowedScratch();
+            _owner.Emit(instruction);
+        }
 
         private int IncomingStackOffset(int abiStackOffset)
             => checked(_frameSize + _savedGeneralRegisters.Count * _wordSize + abiStackOffset + _wordSize);
 
         private int SizeOfStorage(QualifiedType type)
-            => Math.Max(1, _owner._target.SizeOf(type));
+            => StorageSize(_owner._target, type);
 
         private int RegisterSize(QualifiedType type)
-        {
-            if (IsPointerLike(type))
-                return _wordSize;
-            if (IsFloatType(type))
-                return Math.Max(1, SizeOfStorage(type));
-            return Math.Min(Math.Max(1, SizeOfStorage(type)), _wordSize);
-        }
+            => RegisterWidth(_owner._target, type);
 
         private int PointerScale(QualifiedType pointerType)
         {
@@ -6685,7 +7280,7 @@ public sealed class X86CodeGenerator
         }
 
         private bool RequiresBlockCopyStorage(QualifiedType type)
-            => IsAggregateType(type) || (!IsPointerLike(type) && !(IsFloatType(type) && !IsLongDouble(type)) && SizeOfStorage(type) > _wordSize);
+            => NeedsBlockCopy(_owner._target, type);
 
         private static X86Operand Reg(X86Register register, int size)
             => X86Operand.RegisterOperand(register, Math.Max(1, size));
@@ -6727,34 +7322,269 @@ public sealed class X86CodeGenerator
         }
 
         private X86Register Scratch0
-            => _owner._machineTarget.Is64Bit ? X86Register.R10 : X86Register.Rax;
+            => ResolveScratch(ScratchRole.General0);
 
         private X86Register Scratch1
-            => _owner._machineTarget.Is64Bit ? X86Register.R11 : X86Register.Rdx;
+            => ResolveScratch(ScratchRole.General1);
 
         private X86Register Scratch2
-            => _owner._machineTarget.Is64Bit ? X86Register.Rax : X86Register.Rcx;
+            => ResolveScratch(ScratchRole.General2);
 
         // Scratch2 is a return register on x64, so it cannot carry the address
         private X86Register AggregateReturnAddressScratch
             => _owner._machineTarget.Is64Bit ? Scratch0 : X86Register.Rcx;
 
         private X86Register BlockCopyScratch
-            => !_owner._machineTarget.Is64Bit
-                ? X86Register.Xmm7
-                : TargetRegisterInfo.IsWindowsX64(_owner._target) ? X86Register.Xmm4 : X86Register.Xmm15;
+            => ResolveScratch(ScratchRole.VectorCopy);
 
         private X86Register VarArgsRegister
             => _owner._machineTarget.Is64Bit ? X86Register.R11 : X86Register.Rax;
 
-        private static X86Register FpScratch0
-            => X86Register.Xmm0;
+        private X86Register FpScratch0
+            => ResolveScratch(ScratchRole.Vector0);
 
-        private static X86Register FpScratch1
-            => X86Register.Xmm1;
+        private X86Register FpScratch1
+            => ResolveScratch(ScratchRole.Vector1);
 
-        private static X86Register OtherFloatingScratch(X86Register busy)
+        private X86Register OtherFloatingScratch(X86Register busy)
             => busy != FpScratch0 ? FpScratch0 : FpScratch1;
+
+        private enum ScratchRole
+        {
+            General0,
+            General1,
+            General2,
+            Vector0,
+            Vector1,
+            VectorCopy,
+        }
+
+        private X86Register ScratchHome(ScratchRole role)
+        {
+            var is64Bit = _owner._machineTarget.Is64Bit;
+            return role switch
+            {
+                ScratchRole.General0 => is64Bit ? X86Register.R10 : X86Register.Rax,
+                ScratchRole.General1 => is64Bit ? X86Register.R11 : X86Register.Rdx,
+                ScratchRole.General2 => is64Bit ? X86Register.Rax : X86Register.Rcx,
+                ScratchRole.Vector0 => X86Register.Xmm0,
+                ScratchRole.Vector1 => X86Register.Xmm1,
+                _ => !is64Bit ? X86Register.Xmm7 : TargetRegisterInfo.IsWindowsX64(_owner._target) ? X86Register.Xmm4 : X86Register.Xmm15,
+            };
+        }
+
+        // Homes are free where their class was killed; elsewhere a role is a placeholder bound at its first use
+        private X86Register ResolveScratch(ScratchRole role)
+        {
+            var home = ScratchHome(role);
+            if (_currentInstruction is null || !_managedScratch.Contains(home) && home != _spareGeneralScratch && home != _spareVectorScratch)
+                return home;
+            var vector = role >= ScratchRole.Vector0;
+            if ((_allocation.GetScratchKills(_currentInstructionPosition) & (vector ? ScratchClass.Floating : ScratchClass.General)) != 0)
+                return home;
+            _placeholdersIssued = true;
+            return ScratchPlaceholder(role);
+        }
+
+        // The encoding leaves 17 to 31 unused, so nothing else can carry these values
+        private static X86Register ScratchPlaceholder(ScratchRole role)
+            => (X86Register)(17 + (int)role);
+
+        private static bool IsScratchPlaceholder(X86Register register, out int role)
+        {
+            role = (int)register - 17;
+            return role is >= 0 and <= (int)ScratchRole.VectorCopy;
+        }
+
+        private X86Instruction BindScratchPlaceholders(X86Instruction instruction)
+        {
+            return new X86Instruction(
+                instruction.Opcode,
+                BindScratchPlaceholders(instruction.Operand0),
+                BindScratchPlaceholders(instruction.Operand1),
+                BindScratchPlaceholders(instruction.Operand2),
+                instruction.Condition,
+                instruction.RawBytes,
+                BindScratchPlaceholders(instruction.Operand3),
+                instruction.OpMask,
+                instruction.Zeroing,
+                instruction.Rounding);
+        }
+
+        private X86Operand BindScratchPlaceholders(X86Operand operand)
+        {
+            foreach (var register in new[] { operand.Register, operand.BaseRegister, operand.IndexRegister })
+            {
+                if (IsScratchPlaceholder(register, out var role))
+                    operand = Rename(operand, register, BindScratch((ScratchRole)role));
+            }
+            return operand;
+        }
+
+        private X86Register BindScratch(ScratchRole role)
+        {
+            ref var bound = ref _scratchRoles[(int)role];
+            if (bound == X86Register.Invalid)
+                bound = FindFreeScratch(role);
+
+            var register = bound;
+            var borrow = _borrowedScratch.FindIndex(entry => entry.Register == register);
+            if (borrow >= 0 && !_borrowedScratch[borrow].Saved)
+            {
+                var parking = _borrowedScratch[borrow].Parking;
+                _owner.Emit(IsXmmRegister(register)
+                    ? X86Instruction.Binary(X86InstrKind.Movdqu, parking, Reg(register, 16))
+                    : X86Instruction.Binary(X86InstrKind.Mov, parking, Reg(register, _wordSize)));
+                _borrowedScratch[borrow] = (register, parking, true);
+                _owner._scratchBorrowed = true;
+            }
+            return bound;
+        }
+
+        private X86Register FindFreeScratch(ScratchRole role)
+        {
+            var vector = role >= ScratchRole.Vector0;
+            var home = ScratchHome(role);
+            if (IsUnboundAndFree(home))
+                return home;
+            var spare = vector ? _spareVectorScratch : _spareGeneralScratch;
+            if (Array.IndexOf(_scratchRoles, spare) < 0)
+                return spare;
+            foreach (var register in vector ? ManagedVectorRegisters(_owner._target) : ManagedGeneralRegisters(_owner._target))
+            {
+                var candidate = ToX86Register(register, _owner._machineTarget);
+                if (IsUnboundAndFree(candidate))
+                    return candidate;
+            }
+            return BorrowScratch(vector);
+        }
+
+        private bool IsUnboundAndFree(X86Register register)
+        {
+            if (!_managedScratch.Contains(register) || Array.IndexOf(_scratchRoles, register) >= 0)
+                return false;
+            var machine = register >= X86Register.Xmm0 ? ToMachineRegister(register) : ToManagedGeneralRegister(register);
+            return _allocation.IsScratchFree(machine, _currentInstructionPosition);
+        }
+
+        private MachineRegister ToManagedGeneralRegister(X86Register register)
+        {
+            foreach (var candidate in ManagedGeneralRegisters(_owner._target))
+            {
+                if (ToX86Register(candidate, _owner._machineTarget) == register)
+                    return candidate;
+            }
+            return MachineRegister.Invalid;
+        }
+
+        private X86Register BorrowScratch(bool vector)
+        {
+            var frame = _allocation.Frame;
+            var slot = _borrowedScratch.Count * 16;
+            if (slot + 16 > frame.ScratchBorrowSize)
+                throw new InvalidOperationException(
+                    $"'{_functionLabel}' runs out of scratch registers at LIR position {_currentInstructionPosition}.");
+
+            var referenced = new List<X86Register>();
+            CollectInstructionRegisters(_currentInstruction!, referenced);
+            foreach (var candidate in BorrowCandidates(vector))
+            {
+                if (candidate == FrameBase || Array.IndexOf(_scratchRoles, candidate) >= 0 || referenced.Contains(candidate))
+                    continue;
+                _borrowedScratch.Add((candidate, Mem(FrameBase, frame.ScratchBorrowOffset + slot, vector ? 16 : _wordSize), false));
+                return candidate;
+            }
+
+            throw new InvalidOperationException(
+                $"'{_functionLabel}' has no register to borrow at LIR position {_currentInstructionPosition}.");
+        }
+
+        // rax, rcx and rdx have fixed parts in division, shifts and returns, and xmm0 and xmm1 in returns
+        private IEnumerable<X86Register> BorrowCandidates(bool vector)
+        {
+            if (vector)
+            {
+                var last = _owner._machineTarget.Is64Bit ? 15 : 7;
+                for (var index = 2; index <= last; index++)
+                    yield return (X86Register)((int)X86Register.Xmm0 + index);
+                yield break;
+            }
+
+            yield return X86Register.Rbx;
+            yield return X86Register.Rsi;
+            yield return X86Register.Rdi;
+            if (!_owner._machineTarget.Is64Bit)
+                yield break;
+            yield return X86Register.R12;
+            yield return X86Register.R13;
+            yield return X86Register.R14;
+            yield return X86Register.R15;
+            yield return X86Register.R8;
+            yield return X86Register.R9;
+            yield return X86Register.R10;
+        }
+
+        private void RestoreBorrowedScratch()
+        {
+            for (var i = _borrowedScratch.Count - 1; i >= 0; i--)
+            {
+                var (register, parking, saved) = _borrowedScratch[i];
+                if (!saved)
+                    continue;
+                _owner.Emit(IsXmmRegister(register)
+                    ? X86Instruction.Binary(X86InstrKind.Movdqu, Reg(register, 16), parking)
+                    : X86Instruction.Binary(X86InstrKind.Mov, Reg(register, _wordSize), parking));
+                _borrowedScratch[i] = (register, parking, false);
+            }
+            _owner._scratchBorrowed = false;
+        }
+
+        private void CollectInstructionRegisters(LirInstruction instruction, List<X86Register> registers)
+        {
+            void Add(LirVirtualRegister? register)
+            {
+                if (register is not null && _allocation.TryGetPhysicalRegister(register, out var physical))
+                    registers.Add(ToX86Register(physical, _owner._machineTarget));
+            }
+            void AddOperand(LirOperand operand)
+            {
+                Add(operand.Register);
+                if (operand.Address is not null)
+                    AddAddress(operand.Address);
+                foreach (var part in operand.Parts)
+                    AddOperand(part);
+            }
+            void AddAddress(LirAddress address)
+            {
+                if (address.BaseOperand is not null)
+                    AddOperand(address.BaseOperand);
+                if (address.Index is not null)
+                    AddOperand(address.Index);
+                if (address.BaseAddress is not null)
+                    AddAddress(address.BaseAddress);
+            }
+
+            Add(instruction.Result);
+            foreach (var operand in instruction.Operands)
+            {
+                AddOperand(operand);
+                if (operand.Register is not null && _foldableLoads.TryGetValue(operand.Register, out var load))
+                    AddAddress(load.Address!);
+            }
+            if (instruction.Address is not null)
+                AddAddress(instruction.Address);
+            foreach (var copy in instruction.ParallelCopies)
+            {
+                Add(copy.Destination);
+                AddOperand(copy.Source);
+            }
+            if (_currentBlock is not null && _selectDiamonds.TryGetValue(_currentBlock, out var diamond) && ReferenceEquals(diamond.Branch, instruction))
+            {
+                Add(diamond.Destination);
+                AddOperand(diamond.TrueValue);
+                AddOperand(diamond.FalseValue);
+            }
+        }
 
         private static X86Operand Imm(long value)
             => X86Operand.ImmediateOperand(value);
@@ -6802,7 +7632,7 @@ public sealed class X86CodeGenerator
             => new NotSupportedException($"{message} Function '{_function.Symbol?.Name ?? _functionLabel}', LIR instruction #{instruction.Ordinal}.");
     }
 
-    private static X86Register ToX86Register(MachineRegister register, X86Target target)
+    internal static X86Register ToX86Register(MachineRegister register, X86Target target)
     {
         if (register >= MachineRegister.V0 && register <= MachineRegister.V31)
         {

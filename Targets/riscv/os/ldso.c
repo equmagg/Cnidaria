@@ -28,9 +28,11 @@ typedef unsigned long usize;
 #define AT_PHDR 3ul
 #define AT_PHNUM 5ul
 #define AT_ENTRY 9ul
+#define AT_EXECFN 31ul
 
 #define PT_LOAD 1u
 #define PT_DYNAMIC 2u
+#define PT_PHDR 6u
 #define PF_W 2u
 #define PF_X 1u
 
@@ -494,6 +496,37 @@ static u64 auxiliary_value(u64* auxv, u64 key)
     return 0ul;
 }
 
+static u64 program_base(u64 phdr, u64 phnum, u64* auxv)
+{
+    struct elf_header header;
+    u64 index;
+    u64 path;
+    s64 descriptor;
+    for (index = 0ul; index < phnum; index = index + 1ul)
+    {
+        struct elf_phdr* segment = ((struct elf_phdr*)phdr) + index;
+        if (segment->type == PT_PHDR)
+            return phdr - segment->vaddr;
+    }
+    path = auxiliary_value(auxv, AT_EXECFN);
+    if (path == 0ul)
+        fail("the kernel did not provide the executable path");
+    descriptor = syscall3(SYS_OPENAT, AT_FDCWD, path, O_RDONLY);
+    if (descriptor < 0l)
+        fail("cannot open the program header");
+    if (!read_exact((int)descriptor, 0ul, &header, sizeof(header)))
+        fail("truncated program header");
+    syscall1(SYS_CLOSE, (u64)descriptor);
+    for (index = 0ul; index < phnum; index = index + 1ul)
+    {
+        struct elf_phdr* segment = ((struct elf_phdr*)phdr) + index;
+        if (segment->type == PT_LOAD && header.phoff >= segment->offset && header.phoff - segment->offset < segment->filesz)
+            return phdr - segment->vaddr - (header.phoff - segment->offset);
+    }
+    fail("program headers are not mapped");
+    return 0ul;
+}
+
 static void enter_program(u64 entry, u64 stack)
 {
     __asm__ volatile(
@@ -528,7 +561,7 @@ int main(int argc, char** argv, char** envp)
 
     program = &objects[0];
     object_count = 1u;
-    program->base = 0ul;
+    program->base = program_base(phdr, phnum, auxv);
     program->loaded = 1u;
     program->name[0] = 0;
     index = 0u;
@@ -537,7 +570,7 @@ int main(int argc, char** argv, char** envp)
         struct elf_phdr* segment = ((struct elf_phdr*)phdr) + index;
         index = index + 1u;
         if (segment->type == PT_DYNAMIC)
-            program->dynamic = segment->vaddr;
+            program->dynamic = program->base + segment->vaddr;
     }
     if (program->dynamic == 0ul)
         fail("the program is not dynamically linked");

@@ -1426,6 +1426,13 @@ internal static partial class SsaOptimizer
                 return true;
             }
 
+            if (code == GimpleTreeCode.ViewConvertExpr && TryGetConstant(operand, out var viewed) &&
+                TryReinterpretConstant(viewed, type, syntax, out var reinterpreted))
+            {
+                folded = CreateConstantExpression(reinterpreted);
+                return true;
+            }
+
             if (TryGetConstant(operand, out var constant) &&
                 (TryCastIntegerConstant(constant, type, syntax, out var casted) ||
                  code is GimpleTreeCode.FloatExpr or GimpleTreeCode.ConvertExpr or GimpleTreeCode.NopExpr &&
@@ -1436,6 +1443,36 @@ internal static partial class SsaOptimizer
             }
 
             folded = null!;
+            return false;
+        }
+
+        // A view conversion keeps the bits; a NaN or a negative zero stays unfolded since a double constant may not keep it
+        private bool TryReinterpretConstant(GimpleConstantValue constant, QualifiedType type, SyntaxNode? syntax, out GimpleConstantValue reinterpreted)
+        {
+            reinterpreted = null!;
+            if (constant.Value is double or float && TryGetFloatOrDouble(constant.Type, out var fromSingle) &&
+                TryGetIntegerInfo(type, out var integer) && integer.Bits == (fromSingle ? 32 : 64))
+            {
+                var source = Convert.ToDouble(constant.Value, CultureInfo.InvariantCulture);
+                var bits = fromSingle
+                    ? (ulong)(uint)BitConverter.SingleToInt32Bits((float)source)
+                    : unchecked((ulong)BitConverter.DoubleToInt64Bits(source));
+                reinterpreted = CreateIntegerConstant(bits, type, syntax);
+                return true;
+            }
+
+            if (TryGetFloatOrDouble(type, out var toSingle) && TryGetIntegerInfo(constant.Type, out var raw) &&
+                raw.Bits == (toSingle ? 32 : 64) && TryConvertIntegerObject(constant.Value, out var pattern))
+            {
+                var value = toSingle
+                    ? BitConverter.Int32BitsToSingle(unchecked((int)(uint)pattern))
+                    : BitConverter.Int64BitsToDouble(unchecked((long)pattern));
+                if (double.IsNaN(value) || double.IsNegative(value) && value == 0)
+                    return false;
+                reinterpreted = new GimpleConstantValue(value, type, syntax);
+                return true;
+            }
+
             return false;
         }
 
@@ -1518,9 +1555,22 @@ internal static partial class SsaOptimizer
             }
 
             if (!TryGetIntegerConstant(leftConstant, out var leftValue, out var leftInfo) ||
-                !TryGetIntegerConstant(rightConstant, out var rightValue, out _))
+                !TryGetIntegerConstant(rightConstant, out var rightValue, out var rightInfo))
             {
                 return false;
+            }
+
+            // The count of a shift is promoted on its own, so only the shifted value has the result's representation
+            if (code is GimpleTreeCode.LshiftExpr or GimpleTreeCode.RshiftExpr)
+            {
+                var count = rightInfo.IsSigned ? ToSigned(rightValue, rightInfo.Bits) : unchecked((long)rightValue);
+                if (!TryGetIntegerInfo(type, out var resultInfo) || resultInfo.Bits != leftInfo.Bits || resultInfo.IsSigned != leftInfo.IsSigned ||
+                    !TryEvaluateShift(leftValue, count, leftInfo, code, type, syntax, out var shifted))
+                {
+                    return false;
+                }
+                folded = CreateConstantExpression(shifted);
+                return true;
             }
 
             if (!SameType(leftConstant.Type, rightConstant.Type))
@@ -1602,6 +1652,12 @@ internal static partial class SsaOptimizer
             if (IsOne(left) && SameType(right.Original.Type, type) && code == GimpleTreeCode.MultExpr)
             {
                 folded = right;
+                return true;
+            }
+
+            if (IsZero(left) && SameType(left.Original.Type, type) && code is GimpleTreeCode.LshiftExpr or GimpleTreeCode.RshiftExpr)
+            {
+                folded = left;
                 return true;
             }
 
@@ -1743,6 +1799,34 @@ internal static partial class SsaOptimizer
             }
 
             result = CreateIntegerConstant(unsignedResult, resultType, syntax);
+            return true;
+        }
+
+        // A count outside the width, a negative shifted value and a left shift past the largest signed value are
+        // undefined (C11 6.5.7) and stay as they are; a negative value shifts right arithmetically, as every target does
+        private bool TryEvaluateShift(ulong value, long count, IntegerInfo info, GimpleTreeCode code, QualifiedType resultType, SyntaxNode? syntax, out GimpleConstantValue result)
+        {
+            result = null!;
+            var bits = info.Bits;
+            if (count < 0 || count >= bits)
+                return false;
+
+            var mask = Mask(bits);
+            var amount = (int)count;
+            value &= mask;
+            ulong shifted;
+            if (code == GimpleTreeCode.LshiftExpr)
+            {
+                if (info.IsSigned && (ToSigned(value, bits) < 0 || ToSigned(value, bits) > MaxSigned(bits) >> amount))
+                    return false;
+                shifted = (value << amount) & mask;
+            }
+            else
+            {
+                shifted = info.IsSigned ? unchecked((ulong)(ToSigned(value, bits) >> amount)) & mask : value >> amount;
+            }
+
+            result = CreateIntegerConstant(shifted, resultType, syntax);
             return true;
         }
 

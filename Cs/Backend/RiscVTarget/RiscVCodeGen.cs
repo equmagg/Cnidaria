@@ -2,6 +2,7 @@ using Cnidaria.RiscV;
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Linq;
 using System.Numerics;
 using System.Text;
 
@@ -115,7 +116,7 @@ namespace Cnidaria.Cs
 
                 EmitDelegateTargetThunks();
                 EmitExceptionHelpers();
-                EmitGcEntryStubs();
+                EmitCollectHelper();
 
                 RuntimeMethod? entryTypeInitializer = null;
                 if (_options.EmitStartup &&
@@ -198,8 +199,10 @@ namespace Cnidaria.Cs
                 if (_options.EmbedRuntime && _target.OperatingSystem == OperatingSystemKind.Linux)
                 {
                     RiscVProgram runtime = RiscVRuntime.GetObject(_target);
+                    var unwind = RiscVRuntime.GetUnwindInfo(runtime);
                     if (_options.TrimRuntime)
                         runtime = RiscVRuntime.Trim(runtime, CollectUndefinedSymbols(result));
+                    runtime = AppendRuntimeUnwindInfo(runtime, unwind);
                     result = RiscVObjectComposer.Compose(result, runtime);
                 }
 
@@ -240,6 +243,75 @@ namespace Cnidaria.Cs
                 }
 
                 return undefined;
+            }
+
+            public RiscVProgram AppendRuntimeUnwindInfo(
+                RiscVProgram runtime,
+                IReadOnlyDictionary<string, C.NativeUnwindInfo> unwind)
+            {
+                const string sectionName = ".rodata.unwind";
+                var data = new DataSectionBuilder(sectionName, RVObjectSectionKind.Rodata);
+                data.Align(_target.PointerSize);
+                void EmitValue(long value)
+                    => data.EmitBytes(_target.PointerSize == 8 ? BitConverter.GetBytes(value) : BitConverter.GetBytes(checked((int)value)));
+                void EmitAddress(string symbol, int addend)
+                {
+                    data.AddRelocation(data.ByteLength, symbol, addend, RVObjectRelocationKind.AbsolutePointer);
+                    EmitValue(0);
+                }
+                var symbols = ImmutableArray.CreateBuilder<RVObjectSymbol>();
+                foreach (var symbol in runtime.Symbols)
+                {
+                    if (symbol.Binding != RVObjectSymbolBinding.External ||
+                        symbol.Name is not ("RhpRuntimeRegions" or "RhpRuntimeRegionCount"))
+                        symbols.Add(symbol);
+                }
+                var regions = new List<(RVObjectSymbol Symbol, C.NativeUnwindInfo Frame, string Saved, int Count)>();
+                foreach (var symbol in runtime.Symbols.OrderBy(static symbol => symbol.Offset))
+                {
+                    if (symbol.Kind != RVObjectSymbolKind.Function || !unwind.TryGetValue(symbol.Name, out var frame))
+                        continue;
+                    string savedLabel = ".Lruntime_unwind_saved_" + regions.Count;
+                    int savedOffset = data.ByteLength;
+                    int savedCount = 0;
+                    foreach (var saved in frame.SavedRegisters)
+                    {
+                        if (MachineRegisters.GetClass(saved.Register) != RegisterClass.General || saved.Register == MachineRegister.X8)
+                            continue;
+                        EmitValue(UnwindRegisterIndex(saved.Register));
+                        EmitValue(saved.Offset);
+                        EmitValue(_target.PointerSize);
+                        savedCount++;
+                    }
+                    if (savedCount != 0)
+                        symbols.Add(new RVObjectSymbol(savedLabel, sectionName, savedOffset, data.ByteLength - savedOffset,
+                            RVObjectSymbolBinding.Local, RVObjectSymbolKind.Object));
+                    regions.Add((symbol, frame, savedLabel, savedCount));
+                }
+                int tableOffset = data.ByteLength;
+                foreach (var region in regions)
+                {
+                    EmitAddress(region.Symbol.Name, 0);
+                    EmitAddress(region.Symbol.Name, region.Symbol.Size);
+                    EmitValue(region.Frame.FramePointerOffset < 0 ? RuntimeRegionKind.Frameless : RuntimeRegionKind.Frame);
+                    EmitValue(region.Frame.FrameSize);
+                    EmitValue(region.Frame.FramePointerOffset);
+                    EmitValue(region.Frame.ReturnAddressOffset);
+                    EmitValue(region.Count);
+                    if (region.Count == 0)
+                        EmitValue(0);
+                    else
+                        EmitAddress(region.Saved, 0);
+                    EmitValue(0);
+                    EmitValue(-1);
+                }
+                symbols.Add(new RVObjectSymbol("RhpRuntimeRegions", sectionName, tableOffset, data.ByteLength - tableOffset,
+                    RVObjectSymbolBinding.Global, RVObjectSymbolKind.Object));
+                int countOffset = data.ByteLength;
+                EmitValue(regions.Count);
+                symbols.Add(new RVObjectSymbol("RhpRuntimeRegionCount", sectionName, countOffset, _target.PointerSize,
+                    RVObjectSymbolBinding.Global, RVObjectSymbolKind.Object));
+                return new RiscVProgram(runtime.Target, runtime.Text, runtime.DataSections.Add(data.ToSection()), symbols.ToImmutable(), runtime.EntrySymbol);
             }
 
             private void IndexMethods()
@@ -568,7 +640,7 @@ namespace Cnidaria.Cs
                     }
                     if (string.IsNullOrWhiteSpace(internalCallLabel))
                         throw new MissingMethodException($"RISC-V InternalCall implementation is missing for M{method.MethodId} '{method.Name}'.");
-                    return RiscVRuntime.IsGcSafePointInternalCall(method) ? ResolveGcEntry(internalCallLabel) : ResolveExternalSymbol(internalCallLabel);
+                    return ResolveExternalSymbol(internalCallLabel);
                 }
 
                 if (method.IsExtern)
@@ -1284,6 +1356,22 @@ namespace Cnidaria.Cs
                 }
             }
 
+            private readonly struct ThrowStub
+            {
+                public readonly string Label;
+                public readonly string ExceptionTypeName;
+                public readonly int Funclet;
+                public readonly GenTree? SafePointNode;
+
+                public ThrowStub(string label, string exceptionTypeName, int funclet, GenTree? safePointNode)
+                {
+                    Label = label;
+                    ExceptionTypeName = exceptionTypeName;
+                    Funclet = funclet;
+                    SafePointNode = safePointNode;
+                }
+            }
+
             private sealed class SafePointDraft
             {
                 public string DescriptorLabel { get; }
@@ -1310,13 +1398,17 @@ namespace Cnidaria.Cs
 
             private readonly struct SafePointRootDraft
             {
-                public readonly int FrameOffset;
+                public const int RegisterFlag = 2;
+                public const int StackPointerFlag = 4;
+                public readonly int Offset;
                 public readonly RegisterGcRootKind Kind;
+                public readonly int Flags;
 
-                public SafePointRootDraft(int frameOffset, RegisterGcRootKind kind)
+                public SafePointRootDraft(int offset, RegisterGcRootKind kind, int flags = 0)
                 {
-                    FrameOffset = frameOffset;
+                    Offset = offset;
                     Kind = kind;
+                    Flags = flags;
                 }
             }
 
@@ -1405,14 +1497,43 @@ namespace Cnidaria.Cs
                 string? Text(string? text) => text is null ? null : GetStringLiteralLabel(stringType, text);
 
                 int pointerSize = _target.PointerSize;
+                string? enumLabel = type.Kind == RuntimeTypeKind.Enum ? EmitRuntimeEnumInfo(type, stringType) : null;
                 string label = CreateLocalLabel($"type_{type.TypeId}_info");
-                AddDataSymbol(label, _rodata.Align(pointerSize), pointerSize * 6);
+                AddDataSymbol(label, _rodata.Align(pointerSize), pointerSize * 7);
                 EmitPointer(Text(RuntimeTypeNames.Name(type)));
                 EmitPointer(Text(RuntimeTypeNames.Namespace(type)));
                 EmitPointer(Text(RuntimeTypeNames.FullName(type)));
                 EmitPointer(Text(RuntimeTypeNames.DisplayName(type)));
                 EmitPointer(Text(type.AssemblyName));
                 EmitNative((int)RuntimeTypeNames.Flags(type));
+                EmitPointer(enumLabel);
+                return label;
+            }
+
+            // Values, names and count of the enum's literals, sorted by value
+            private string EmitRuntimeEnumInfo(RuntimeType type, RuntimeType stringType)
+            {
+                RuntimeEnumLiteral[] literals = RuntimeTypeNames.EnumLiterals(type);
+                int pointerSize = _target.PointerSize;
+                string? values = null;
+                string? names = null;
+                if (literals.Length != 0)
+                {
+                    values = CreateLocalLabel($"type_{type.TypeId}_enum_values");
+                    AddDataSymbol(values, _rodata.Align(8), literals.Length * 8);
+                    foreach (RuntimeEnumLiteral literal in literals)
+                        EmitUInt64(literal.Value);
+                    names = CreateLocalLabel($"type_{type.TypeId}_enum_names");
+                    AddDataSymbol(names, _rodata.Align(pointerSize), literals.Length * pointerSize);
+                    foreach (RuntimeEnumLiteral literal in literals)
+                        EmitPointer(GetStringLiteralLabel(stringType, literal.Name));
+                }
+
+                string label = CreateLocalLabel($"type_{type.TypeId}_enum");
+                AddDataSymbol(label, _rodata.Align(pointerSize), pointerSize * 3);
+                EmitPointer(values);
+                EmitPointer(names);
+                EmitNative(literals.Length);
                 return label;
             }
 
@@ -2903,33 +3024,30 @@ namespace Cnidaria.Cs
                 EmitResumeHelper();
             }
 
-            private readonly List<string> _gcEntryHelpers = new();
-
-            // A runtime helper that may collect is entered through a stub that records where the stack walk starts
-            public string ResolveGcEntry(string helper)
+            private void EmitCollectHelper()
             {
-                if (!_gcEntryHelpers.Contains(helper))
-                    _gcEntryHelpers.Add(helper);
-                return helper + "FromManaged";
-            }
-
-            private void EmitGcEntryStubs()
-            {
+                const string label = RiscVRuntime.CollectSymbol;
                 int pointerSize = _target.PointerSize;
-                foreach (string helper in _gcEntryHelpers)
+                int frameSize = AlignValueUp(UnwindContextRegisterOffset(64) + pointerSize, _target.CallFrameAlignment);
+                int start = _text.ByteLength;
+                DefineHelperLabel(label);
+                EmitAdjustStack(-frameSize);
+                EmitDelegateMemoryStore(MachineRegister.X1, RVRegister.X2, frameSize - pointerSize, pointerSize);
+                EmitDelegateMemoryStore(MachineRegister.X1, RVRegister.X2, 0, pointerSize);
+                EmitAddImmediate(RVRegister.X31, RVRegister.X2, frameSize);
+                EmitDelegateMemoryStore(MachineRegister.X31, RVRegister.X2, pointerSize, pointerSize);
+                EmitDelegateMemoryStore(MachineRegister.X8, RVRegister.X2, pointerSize * 2, pointerSize);
+                foreach (MachineRegister register in UnwindRegisters())
                 {
-                    string label = helper + "FromManaged";
-                    int startOffset = _text.ByteLength;
-                    DefineHelperLabel(label);
-                    EmitMaterializeAddress(ResolveExternalObjectSymbol(RiscVRuntime.CurrentReturnAddressSymbol), RVRegister.X31);
-                    EmitDelegateMemoryStore(MachineRegister.X1, RVRegister.X31, 0, pointerSize);
-                    EmitMaterializeAddress(ResolveExternalObjectSymbol(RiscVRuntime.CurrentStackPointerSymbol), RVRegister.X31);
-                    EmitDelegateMemoryStore(MachineRegister.X2, RVRegister.X31, 0, pointerSize);
-                    EmitMaterializeAddress(ResolveExternalObjectSymbol(RiscVRuntime.CurrentFramePointerSymbol), RVRegister.X31);
-                    EmitDelegateMemoryStore(MachineRegister.X8, RVRegister.X31, 0, pointerSize);
-                    EmitPcrelTransfer(ResolveExternalSymbol(helper), link: false);
-                    AddHelperSymbol(label, startOffset);
+                    if (MachineRegisters.GetClass(register) == RegisterClass.General)
+                        EmitDelegateMemoryStore(register, RVRegister.X2, UnwindContextRegisterOffset(UnwindRegisterIndex(register)), pointerSize);
                 }
+                EmitMove(RVRegister.X10, RVRegister.X2);
+                EmitPcrelTransfer(ResolveExternalSymbol("RhpCollectFromContext"), link: true);
+                EmitDelegateMemoryLoad(MachineRegister.X1, RVRegister.X2, frameSize - pointerSize, pointerSize, signed: false);
+                EmitAdjustStack(frameSize);
+                Emit(new RVInstruction(RVInstrKind.Jalr, RVRegister.X0, RVRegister.X1));
+                AddHelperSymbol(label, start);
             }
 
             private void AddHelperSymbol(string label, int startOffset)
@@ -3288,8 +3406,8 @@ namespace Cnidaria.Cs
                     AddDataSymbol(safePoint.RootsLabel, offset, checked(safePoint.Roots.Length * pointerSize * 2));
                     for (int r = 0; r < safePoint.Roots.Length; r++)
                     {
-                        EmitNative(safePoint.Roots[r].FrameOffset);
-                        EmitNative(ToRuntimeRootKind(safePoint.Roots[r].Kind));
+                        EmitNative(safePoint.Roots[r].Offset);
+                        EmitNative(ToRuntimeRootKind(safePoint.Roots[r].Kind) | safePoint.Roots[r].Flags);
                     }
                 }
 
@@ -3414,6 +3532,14 @@ namespace Cnidaria.Cs
                 _rodata.EmitBytes(bytes);
             }
 
+            private void EmitUInt64(ulong value)
+            {
+                byte[] bytes = BitConverter.GetBytes(value);
+                if (_target.Endianness == TargetEndianness.Big)
+                    Array.Reverse(bytes);
+                _rodata.EmitBytes(bytes);
+            }
+
             private void EmitUInt32(uint value)
             {
                 byte[] bytes = BitConverter.GetBytes(value);
@@ -3447,6 +3573,9 @@ namespace Cnidaria.Cs
                 private readonly CodeRegionDraft?[] _regions;
                 private CodeRegionDraft? _openRegion;
                 private readonly List<GcPollStub> _gcPollStubs = new List<GcPollStub>();
+                private readonly List<ThrowStub> _throwStubs = new List<ThrowStub>();
+                private readonly Dictionary<string, string> _sharedThrowStubs = new Dictionary<string, string>(StringComparer.Ordinal);
+                private HashSet<int>? _tryRangeBlocks;
                 private int _nextBlockId = -1;
                 private int _currentBlockId = -1;
 
@@ -3526,6 +3655,7 @@ namespace Cnidaria.Cs
                     _currentBlockId = -1;
                     EndRegion(funclet);
                     EmitGcPollStubs();
+                    EmitThrowStubs();
                     BindEhNativeRanges();
                     _nextBlockId = -1;
                 }
@@ -3761,7 +3891,11 @@ namespace Cnidaria.Cs
                        left.LinearPhiCopyFromBlockId == right.LinearPhiCopyFromBlockId &&
                        left.LinearPhiCopyToBlockId == right.LinearPhiCopyToBlockId;
 
-                private SafePointDraft PrepareSafePoint(GenTree node, RegisterOperand additionalRoot = default, int stackAdjustment = 0)
+                private SafePointDraft PrepareSafePoint(
+                    GenTree node,
+                    RegisterOperand additionalRoot = default,
+                    int stackAdjustment = 0,
+                    IReadOnlyList<(MachineRegister Register, int Offset, int Size)>? savedRegisters = null)
                 {
                     if (!_nodePositions.TryGetValue(node.LinearId, out int position))
                         throw Unsupported(node, "GC safe point has no final LIR position");
@@ -3771,9 +3905,9 @@ namespace Cnidaria.Cs
                         throw new InvalidOperationException($"GC safe point in M{_method.RuntimeMethod.MethodId} requires a frame pointer.");
 
                     List<RegisterGcLiveRoot> liveRoots = CollectLiveRoots(position);
-                    int spilled = additionalRoot.IsNone || TryGetHomeRootOffset(additionalRoot, 0, out _) ? 0 : 1;
+                    int spilled = additionalRoot.IsNone || TryGetRootLocation(additionalRoot, 0, stackAdjustment, savedRegisters, out _, out _) ? 0 : 1;
                     foreach (RegisterGcLiveRoot root in liveRoots)
-                        spilled += TryGetHomeRootOffset(root.Location, root.Offset, out _) ? 0 : 1;
+                        spilled += TryGetRootLocation(root.Location, root.Offset, stackAdjustment, savedRegisters, out _, out _) ? 0 : 1;
                     if (spilled > frame.GcRootSpillSlotCount)
                     {
                         throw new InvalidOperationException(
@@ -3784,12 +3918,12 @@ namespace Cnidaria.Cs
                     int rootIndex = 0;
                     void Report(RegisterOperand location, RegisterGcRootKind rootKind, int cellOffset)
                     {
-                        if (TryGetHomeRootOffset(location, cellOffset, out int home))
+                        if (TryGetRootLocation(location, cellOffset, stackAdjustment, savedRegisters, out int offset, out int flags))
                         {
-                            roots.Add(new SafePointRootDraft(home, rootKind));
+                            roots.Add(new SafePointRootDraft(offset, rootKind, flags));
                             return;
                         }
-                        SpillGcRoot(location, rootKind, cellOffset, funclet, rootIndex);
+                        SpillGcRoot(location, funclet, rootIndex);
                         roots.Add(new SafePointRootDraft(frame.GcRootSpillSlotOffset(funclet, rootIndex, Target.PointerSize), rootKind));
                         rootIndex++;
                     }
@@ -3839,44 +3973,56 @@ namespace Cnidaria.Cs
                     return false;
                 }
 
-                // A variable's home holds nothing else, so it is reported where it is and stays current under writes through byrefs
-                private bool TryGetHomeRootOffset(RegisterOperand location, int cellOffset, out int offset)
+                private bool TryGetRootLocation(
+                    RegisterOperand location,
+                    int cellOffset,
+                    int stackAdjustment,
+                    IReadOnlyList<(MachineRegister Register, int Offset, int Size)>? savedRegisters,
+                    out int offset,
+                    out int flags)
                 {
+                    flags = 0;
                     offset = 0;
-                    if (!location.IsFrameSlot ||
-                        location.FrameSlotKind is not (StackFrameSlotKind.Argument or StackFrameSlotKind.Local or StackFrameSlotKind.Temp) ||
-                        FrameBase(location) != RVRegister.X8)
+                    if (location.IsRegister)
                     {
-                        return false;
+                        if (cellOffset != 0 || location.RegisterClass != RegisterClass.General)
+                            throw new InvalidOperationException("A register GC root has an unsupported shape");
+                        if (!RegisterInfo.IsCalleeSaved(Target, location.Register))
+                        {
+                            if (savedRegisters is null)
+                                return false;
+                            foreach (var saved in savedRegisters)
+                            {
+                                if (saved.Register == location.Register)
+                                {
+                                    flags = SafePointRootDraft.StackPointerFlag;
+                                    offset = saved.Offset;
+                                    return true;
+                                }
+                            }
+                            throw new InvalidOperationException("A volatile GC root is missing from the poll save area");
+                        }
+                        flags = SafePointRootDraft.RegisterFlag;
+                        offset = UnwindRegisterIndex(location.Register);
+                        return true;
                     }
+                    if (!location.IsFrameSlot)
+                        return false;
                     offset = checked(EffectiveFrameOffset(location) + cellOffset);
+                    if (FrameBase(location) == RVRegister.X2)
+                    {
+                        flags = SafePointRootDraft.StackPointerFlag;
+                        offset = checked(offset + stackAdjustment);
+                    }
                     return true;
                 }
 
-                private void SpillGcRoot(RegisterOperand location, RegisterGcRootKind rootKind, int cellOffset, int funclet, int rootIndex)
+                private void SpillGcRoot(RegisterOperand location, int funclet, int rootIndex)
                 {
-                    MachineRegister source;
-                    if (location.IsRegister)
-                    {
-                        if (cellOffset != 0)
-                            throw new InvalidOperationException("A register GC root cannot have a non-zero cell offset.");
-                        if (location.RegisterClass != RegisterClass.General)
-                            throw new InvalidOperationException("A GC root cannot reside in a floating-point register.");
-                        source = location.Register;
-                    }
-                    else if (location.IsFrameSlot)
-                    {
-                        int offset = checked(EffectiveFrameOffset(location) + cellOffset);
-                        EmitMemoryLoad(MachineRegister.X31, FrameBase(location), offset, Target.PointerSize, signed: false);
-                        source = MachineRegister.X31;
-                    }
-                    else
-                    {
+                    if (!location.IsRegister)
                         throw new InvalidOperationException("GC root location is not final: " + location);
-                    }
-
                     int spillOffset = _method.StackFrame.GcRootSpillSlotOffset(funclet, rootIndex, Target.PointerSize);
-                    EmitMemoryStore(source, RVRegister.X8, spillOffset, Target.PointerSize);
+                    EmitMemoryStore(location.Register, RVRegister.X8, spillOffset, Target.PointerSize);
                 }
 
                 private int TypeOperationScratchOffset
@@ -4124,10 +4270,141 @@ namespace Cnidaria.Cs
 
                 private void EmitManagedExceptionThrow(GenTree node, string exceptionTypeName)
                 {
+                    if (TryGetThrowStub(node, exceptionTypeName, out string stub))
+                    {
+                        EmitJump(stub);
+                        return;
+                    }
+
+                    EmitInlineManagedExceptionThrow(node, exceptionTypeName);
+                }
+
+                private void EmitThrowIf(
+                    GenTree node,
+                    RVInstrKind failure,
+                    RVRegister left,
+                    RVRegister right,
+                    string exceptionTypeName,
+                    string passLabelName)
+                {
+                    if (TryGetThrowStub(node, exceptionTypeName, out string stub))
+                    {
+                        EmitConditionalBranch(failure, left, right, stub);
+                        return;
+                    }
+
+                    string pass = _owner.CreateLocalLabel($"{_methodLabel}_{passLabelName}_{node.LinearId}");
+                    EmitConditionalBranch(NegateBranch(failure), left, right, pass);
+                    EmitInlineManagedExceptionThrow(node, exceptionTypeName);
+                    _owner.DefineLabel(pass);
+                }
+
+                private static RVInstrKind NegateBranch(RVInstrKind branch)
+                    => branch switch
+                    {
+                        RVInstrKind.Beq => RVInstrKind.Bne,
+                        RVInstrKind.Bne => RVInstrKind.Beq,
+                        RVInstrKind.Blt => RVInstrKind.Bge,
+                        RVInstrKind.Bge => RVInstrKind.Blt,
+                        RVInstrKind.Bltu => RVInstrKind.Bgeu,
+                        RVInstrKind.Bgeu => RVInstrKind.Bltu,
+                        _ => throw new ArgumentOutOfRangeException(nameof(branch)),
+                    };
+
+                // Only explicit branches may reach the returned label: with a stub it is the stub itself
+                private string BeginThrowTarget(GenTree node, string exceptionTypeName, string labelName, out bool inlineThrow)
+                {
+                    inlineThrow = !TryGetThrowStub(node, exceptionTypeName, out string stub);
+                    return inlineThrow ? _owner.CreateLocalLabel($"{_methodLabel}_{labelName}_{node.LinearId}") : stub;
+                }
+
+                private void EndThrowTarget(GenTree node, string exceptionTypeName, string target, bool inlineThrow)
+                {
+                    if (!inlineThrow)
+                        return;
+
+                    string valid = _owner.CreateLocalLabel($"{target}_skip");
+                    EmitJump(valid);
+                    _owner.DefineLabel(target);
+                    EmitInlineManagedExceptionThrow(node, exceptionTypeName);
+                    _owner.DefineLabel(valid);
+                }
+
+                private void EmitInlineManagedExceptionThrow(GenTree node, string exceptionTypeName)
+                {
                     _owner.EmitMaterializeAddress(
                         _owner.GetStaticExceptionObjectLabel("System", exceptionTypeName),
                         RVRegister.X10);
                     EmitThrowCall(node, RiscVRuntime.ThrowSymbol);
+                }
+
+                // Dispatch finds the protecting clause by the throw call's address: a site in a try range must throw in place
+                private bool TryGetThrowStub(GenTree node, string exceptionTypeName, out string label)
+                {
+                    label = string.Empty;
+                    if (IsInTryRange(node.LinearBlockId))
+                        return false;
+
+                    int funclet = FuncletOf(node);
+                    if (funclet != 0)
+                    {
+                        label = _owner.CreateLocalLabel($"{_methodLabel}_throw_{exceptionTypeName}_{node.LinearId}");
+                        _throwStubs.Add(new ThrowStub(label, exceptionTypeName, funclet, node));
+                        return true;
+                    }
+
+                    // No handler of this frame runs after an unprotected main-body throw, hence no roots
+                    if (!_sharedThrowStubs.TryGetValue(exceptionTypeName, out string? shared))
+                    {
+                        shared = _owner.CreateLocalLabel($"{_methodLabel}_throw_{exceptionTypeName}");
+                        _sharedThrowStubs.Add(exceptionTypeName, shared);
+                        _throwStubs.Add(new ThrowStub(shared, exceptionTypeName, funclet: 0, safePointNode: null));
+                    }
+
+                    label = shared;
+                    return true;
+                }
+
+                private bool IsInTryRange(int blockId)
+                {
+                    if (_eh is null)
+                        return false;
+
+                    _tryRangeBlocks ??= EhFuncletLayout.BuildTryRangeBlockSet(_method.Cfg, _eh.Clauses, _method.LinearBlockOrder);
+                    return _tryRangeBlocks.Contains(blockId);
+                }
+
+                private void EmitThrowStubs()
+                {
+                    var emitted = new bool[_throwStubs.Count];
+                    for (int first = 0; first < _throwStubs.Count; first++)
+                    {
+                        if (emitted[first])
+                            continue;
+
+                        int funclet = _throwStubs[first].Funclet;
+                        string start = _owner.CreateLocalLabel(_methodLabel + "_throw_stubs");
+                        _owner.DefineLabel(start);
+                        BeginRegion(funclet, start);
+                        for (int i = first; i < _throwStubs.Count; i++)
+                        {
+                            ThrowStub stub = _throwStubs[i];
+                            if (emitted[i] || stub.Funclet != funclet)
+                                continue;
+
+                            emitted[i] = true;
+                            _owner.DefineLabel(stub.Label);
+                            SafePointDraft? safePoint = stub.SafePointNode is null ? null : PrepareSafePoint(stub.SafePointNode);
+                            _owner.EmitMaterializeAddress(
+                                _owner.GetStaticExceptionObjectLabel("System", stub.ExceptionTypeName),
+                                RVRegister.X10);
+                            _owner.EmitPcrelTransfer(RiscVRuntime.ThrowSymbol, link: true);
+                            if (safePoint is not null)
+                                _owner.DefineLabel(safePoint.ReturnLabel);
+                            EmitUnreachableTrap();
+                        }
+                        EndRegion(funclet);
+                    }
                 }
 
                 private void EmitNode(GenTree node)
@@ -4360,11 +4637,10 @@ namespace Cnidaria.Cs
                         _owner.DefineLabel(stub.SlowLabel);
                         var saveLocations = BuildGcPollSaveLocations(stub.Node, out int saveAreaSize);
                         EmitSaveCallerSavedRegistersForGcPoll(saveLocations, saveAreaSize);
-                        SafePointDraft safePoint = PrepareSafePoint(stub.Node, stackAdjustment: saveAreaSize);
-                        _owner.EmitPcrelTransfer(_owner.ResolveGcEntry(RiscVRuntime.GcPollSymbol), link: true);
+                        SafePointDraft safePoint = PrepareSafePoint(stub.Node, stackAdjustment: saveAreaSize, savedRegisters: saveLocations);
+                        _owner.EmitPcrelTransfer(RiscVRuntime.CollectSymbol, link: true);
                         _owner.DefineLabel(safePoint.ReturnLabel);
                         EmitRestoreCallerSavedRegistersForGcPoll(saveLocations, saveAreaSize);
-                        ReloadGcRegisterRoots(stub.Node);
                         _owner.EmitPcrelTransfer(stub.ContinuationLabel, link: false);
                     }
                     _owner.DefineLabel(endLabel);
@@ -4422,27 +4698,6 @@ namespace Cnidaria.Cs
                     }
                     if (saveAreaSize != 0)
                         _owner.EmitAddImmediate(RVRegister.X2, RVRegister.X2, saveAreaSize);
-                }
-
-                private void ReloadGcRegisterRoots(GenTree node)
-                {
-                    if (!_nodePositions.TryGetValue(node.LinearId, out int position))
-                        throw Unsupported(node, "GC poll has no final LIR position");
-
-                    int funclet = FuncletOf(node);
-                    int rootIndex = 0;
-                    foreach (RegisterGcLiveRoot root in CollectLiveRoots(position))
-                    {
-                        if (TryGetHomeRootOffset(root.Location, root.Offset, out _))
-                            continue;
-                        int index = rootIndex++;
-                        if (!root.Location.IsRegister)
-                            continue;
-                        if (root.Offset != 0 || root.Location.RegisterClass != RegisterClass.General)
-                            throw Unsupported(node, "register GC root has an unsupported shape");
-                        int spillOffset = _method.StackFrame.GcRootSpillSlotOffset(funclet, index, Target.PointerSize);
-                        EmitMemoryLoad(root.Location.Register, RVRegister.X8, spillOffset, Target.PointerSize, signed: false);
-                    }
                 }
 
                 private void EmitRuntimeTypeCheck(GenTree node, bool throwOnFailure)
@@ -4523,7 +4778,7 @@ namespace Cnidaria.Cs
 
                     SafePointDraft safePoint = PrepareSafePoint(node);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(allocationType), RVRegister.X10);
-                    _owner.EmitPcrelTransfer(_owner.ResolveGcEntry(RiscVRuntime.NewFastSymbol), link: true);
+                    _owner.EmitPcrelTransfer(_owner.ResolveExternalSymbol(RiscVRuntime.NewFastSymbol), link: true);
                     _owner.DefineLabel(safePoint.ReturnLabel);
 
                     _owner.EmitAddImmediate(RVRegister.X29, RVRegister.X10, Target.ManagedObjectHeaderSize);
@@ -4575,18 +4830,10 @@ namespace Cnidaria.Cs
                         return;
                     }
 
-                    string nonNull = _owner.CreateLocalLabel(_methodLabel + "_unbox_non_null");
-                    string typeMatch = _owner.CreateLocalLabel(_methodLabel + "_unbox_type_match");
-                    EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X28, RVRegister.X0, nonNull);
-                    EmitManagedExceptionThrow(node, "NullReferenceException");
-
-                    _owner.DefineLabel(nonNull);
+                    EmitThrowIf(node, RVInstrKind.Beq, RVRegister.X28, RVRegister.X0, "NullReferenceException", "unbox_non_null");
                     EmitMemoryLoad(MachineRegister.X30, RVRegister.X28, 0, Target.PointerSize, signed: false);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(targetType), RVRegister.X29);
-                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X30, RVRegister.X29, typeMatch);
-                    EmitManagedExceptionThrow(node, "InvalidCastException");
-
-                    _owner.DefineLabel(typeMatch);
+                    EmitThrowIf(node, RVInstrKind.Bne, RVRegister.X30, RVRegister.X29, "InvalidCastException", "unbox_type_match");
                     _owner.EmitAddImmediate(RVRegister.X28, RVRegister.X28, Target.ManagedObjectHeaderSize);
                     EmitValueFromAddress(node, targetType, node.StackKind, RVRegister.X28);
                 }
@@ -5087,6 +5334,12 @@ namespace Cnidaria.Cs
                     RuntimeType? type = node.LocalDescriptor?.Type ?? node.RuntimeType ?? node.Type;
                     GenStackKind kind = node.LocalDescriptor?.StackKind ?? node.StackKind;
 
+                    if (isStore && IsContainedDefaultValue(node, 0))
+                    {
+                        EmitZeroFrame(FrameSlotForLocalLike(node, type, kind, RegisterClass.General), StorageSize(type, kind));
+                        return;
+                    }
+
                     if (node.Results.Length > 1 || node.Uses.Length > 1)
                     {
                         if (isLoad && node.Uses.Length == 0)
@@ -5539,10 +5792,7 @@ namespace Cnidaria.Cs
 
                     if (checkDivideByZero)
                     {
-                        string nonZero = _owner.CreateLocalLabel($"{_methodLabel}_div_nonzero_{node.LinearId}");
-                        EmitConditionalBranch(RVInstrKind.Bne, right, RVRegister.X0, nonZero);
-                        EmitManagedExceptionThrow(node, "DivideByZeroException");
-                        _owner.DefineLabel(nonZero);
+                        EmitThrowIf(node, RVInstrKind.Beq, right, RVRegister.X0, "DivideByZeroException", "div_nonzero");
                     }
 
                     if (checkOverflow)
@@ -5551,8 +5801,7 @@ namespace Cnidaria.Cs
                         _owner.EmitLoadImmediate(RVRegister.X30, -1);
                         EmitConditionalBranch(RVInstrKind.Bne, right, RVRegister.X30, perform);
                         _owner.EmitLoadImmediate(RVRegister.X30, i4 ? int.MinValue : long.MinValue);
-                        EmitConditionalBranch(RVInstrKind.Bne, left, RVRegister.X30, perform);
-                        EmitManagedExceptionThrow(node, "OverflowException");
+                        EmitThrowIf(node, RVInstrKind.Beq, left, RVRegister.X30, "OverflowException", "div_no_overflow");
                         _owner.DefineLabel(perform);
                     }
 
@@ -5574,8 +5823,7 @@ namespace Cnidaria.Cs
                     _owner.EmitMove(RVRegister.X28, left);
                     _owner.EmitMove(RVRegister.X29, right);
 
-                    string overflow = _owner.CreateLocalLabel($"{_methodLabel}_overflow_{node.LinearId}");
-                    string done = _owner.CreateLocalLabel($"{_methodLabel}_checked_done_{node.LinearId}");
+                    string overflow = BeginThrowTarget(node, "OverflowException", "overflow", out bool inlineThrow);
 
                     switch (node.Operator)
                     {
@@ -5654,10 +5902,7 @@ namespace Cnidaria.Cs
                             throw Unsupported(node, $"Unsupported checked arithmetic opcode {node.Operator}");
                     }
 
-                    EmitJump(done);
-                    _owner.DefineLabel(overflow);
-                    EmitManagedExceptionThrow(node, "OverflowException");
-                    _owner.DefineLabel(done);
+                    EndThrowTarget(node, "OverflowException", overflow, inlineThrow);
                 }
 
                 private void RequireMForCheckedMultiply(GenTree node)
@@ -5737,8 +5982,9 @@ namespace Cnidaria.Cs
                     if (checkedConversion && node.ConvKind is not (NumericConvKind.Bool or NumericConvKind.R4 or NumericConvKind.R8))
                     {
                         if (sourceFloat)
-                            throw Unsupported(node, "Checked floating-point to integer conversions are not implemented");
-                        EmitCheckedIntegerConversionGuard(node, source, sourceType, sourceKind, sourceUnsigned);
+                            EmitCheckedFloatingConversionGuard(node, source, sourceType, sourceKind);
+                        else
+                            EmitCheckedIntegerConversionGuard(node, source, sourceType, sourceKind, sourceUnsigned);
                     }
 
                     switch (node.ConvKind)
@@ -5824,6 +6070,67 @@ namespace Cnidaria.Cs
                     }
                 }
 
+                private void EmitCheckedFloatingConversionGuard(
+                    GenTree node,
+                    MachineRegister source,
+                    RuntimeType? sourceType,
+                    GenStackKind sourceKind)
+                {
+                    int bits;
+                    bool unsigned;
+                    switch (node.ConvKind)
+                    {
+                        case NumericConvKind.I1: bits = 8; unsigned = false; break;
+                        case NumericConvKind.U1: bits = 8; unsigned = true; break;
+                        case NumericConvKind.I2: bits = 16; unsigned = false; break;
+                        case NumericConvKind.U2:
+                        case NumericConvKind.Char: bits = 16; unsigned = true; break;
+                        case NumericConvKind.I4: bits = 32; unsigned = false; break;
+                        case NumericConvKind.U4: bits = 32; unsigned = true; break;
+                        case NumericConvKind.I8: bits = 64; unsigned = false; break;
+                        case NumericConvKind.U8: bits = 64; unsigned = true; break;
+                        case NumericConvKind.NativeInt: bits = MachineTarget.XLen; unsigned = false; break;
+                        case NumericConvKind.NativeUInt: bits = MachineTarget.XLen; unsigned = true; break;
+                        default: return;
+                    }
+
+                    int size = StorageSize(sourceType, sourceKind);
+                    RequireFloatingExtension(size);
+                    bool single = size <= 4;
+                    if (!single && !MachineTarget.Is64Bit)
+                        throw Unsupported(node, "checked double conversions on RV32 require a 64-bit floating constant move");
+
+                    // The integer minimum is itself the bound where the value one below it has no exact encoding
+                    double minimum = -Math.Pow(2.0, bits - 1);
+                    bool boundIsMinimum = !unsigned && (bits == 64 || (bits == 32 && single));
+                    double lowerBound = unsigned ? -1.0 : boundIsMinimum ? minimum : minimum - 1.0;
+                    double upperBound = Math.Pow(2.0, unsigned ? bits : bits - 1);
+
+                    RVRegister value = ToRegister(source);
+                    string overflow = BeginThrowTarget(node, "OverflowException", "conv_overflow", out bool inlineThrow);
+                    _owner.Emit(RVInstruction.R(single ? RVInstrKind.FeqS : RVInstrKind.FeqD, RVRegister.X31, value, value));
+                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, overflow);
+                    EmitLoadFloatingScratch(lowerBound, single);
+                    _owner.Emit(RVInstruction.R(
+                        boundIsMinimum ? single ? RVInstrKind.FltS : RVInstrKind.FltD : single ? RVInstrKind.FleS : RVInstrKind.FleD,
+                        RVRegister.X31,
+                        value,
+                        RVRegister.F29));
+                    EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, overflow);
+                    EmitLoadFloatingScratch(upperBound, single);
+                    _owner.Emit(RVInstruction.R(single ? RVInstrKind.FleS : RVInstrKind.FleD, RVRegister.X31, RVRegister.F29, value));
+                    EmitConditionalBranch(RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, overflow);
+                    EndThrowTarget(node, "OverflowException", overflow, inlineThrow);
+                }
+
+                private void EmitLoadFloatingScratch(double value, bool single)
+                {
+                    _owner.EmitLoadImmediate(
+                        RVRegister.X30,
+                        single ? BitConverter.SingleToInt32Bits((float)value) : BitConverter.DoubleToInt64Bits(value));
+                    _owner.Emit(RVInstruction.R(single ? RVInstrKind.FmvWX : RVInstrKind.FmvDX, RVRegister.F29, RVRegister.X30, RVRegister.X0));
+                }
+
                 private void EmitCheckedIntegerConversionGuard(
                     GenTree node,
                     MachineRegister source,
@@ -5888,9 +6195,9 @@ namespace Cnidaria.Cs
                     if (MachineTarget.Is64Bit && !sourceWidth64 && sourceUnsigned)
                         EmitZeroExtend32(RVRegister.X28, RVRegister.X28);
 
-                    string overflow = _owner.CreateLocalLabel($"{_methodLabel}_conv_overflow_{node.LinearId}");
-                    string valid = _owner.CreateLocalLabel($"{_methodLabel}_conv_valid_{node.LinearId}");
-                    bool emittedCheck = false;
+                    bool inlineThrow = false;
+                    string? overflowLabel = null;
+                    string Overflow() => overflowLabel ??= BeginThrowTarget(node, "OverflowException", "conv_overflow", out inlineThrow);
 
                     if (sourceUnsigned)
                     {
@@ -5898,28 +6205,25 @@ namespace Cnidaria.Cs
                         {
                             long maximum = targetBits == 64 ? long.MaxValue : (1L << (targetBits - 1)) - 1L;
                             _owner.EmitLoadImmediate(RVRegister.X29, maximum);
-                            EmitConditionalBranch(RVInstrKind.Bltu, RVRegister.X29, RVRegister.X28, overflow);
-                            emittedCheck = true;
+                            EmitConditionalBranch(RVInstrKind.Bltu, RVRegister.X29, RVRegister.X28, Overflow());
                         }
                         else if (targetBits < MachineTarget.XLen || (MachineTarget.Is64Bit && !sourceWidth64 && targetBits < 32))
                         {
                             long maximum = targetBits == 32 ? uint.MaxValue : (1L << targetBits) - 1L;
                             _owner.EmitLoadImmediate(RVRegister.X29, maximum);
-                            EmitConditionalBranch(RVInstrKind.Bltu, RVRegister.X29, RVRegister.X28, overflow);
-                            emittedCheck = true;
+                            EmitConditionalBranch(RVInstrKind.Bltu, RVRegister.X29, RVRegister.X28, Overflow());
                         }
                     }
                     else
                     {
                         if (targetUnsigned)
                         {
-                            EmitConditionalBranch(RVInstrKind.Blt, RVRegister.X28, RVRegister.X0, overflow);
-                            emittedCheck = true;
+                            EmitConditionalBranch(RVInstrKind.Blt, RVRegister.X28, RVRegister.X0, Overflow());
                             if (targetBits < MachineTarget.XLen)
                             {
                                 long maximum = targetBits == 32 ? uint.MaxValue : (1L << targetBits) - 1L;
                                 _owner.EmitLoadImmediate(RVRegister.X29, maximum);
-                                EmitConditionalBranch(RVInstrKind.Bltu, RVRegister.X29, RVRegister.X28, overflow);
+                                EmitConditionalBranch(RVInstrKind.Bltu, RVRegister.X29, RVRegister.X28, Overflow());
                             }
                         }
                         else if (targetBits < MachineTarget.XLen)
@@ -5927,19 +6231,14 @@ namespace Cnidaria.Cs
                             long minimum = -(1L << (targetBits - 1));
                             long maximum = (1L << (targetBits - 1)) - 1L;
                             _owner.EmitLoadImmediate(RVRegister.X29, minimum);
-                            EmitConditionalBranch(RVInstrKind.Blt, RVRegister.X28, RVRegister.X29, overflow);
+                            EmitConditionalBranch(RVInstrKind.Blt, RVRegister.X28, RVRegister.X29, Overflow());
                             _owner.EmitLoadImmediate(RVRegister.X29, maximum);
-                            EmitConditionalBranch(RVInstrKind.Blt, RVRegister.X29, RVRegister.X28, overflow);
-                            emittedCheck = true;
+                            EmitConditionalBranch(RVInstrKind.Blt, RVRegister.X29, RVRegister.X28, Overflow());
                         }
                     }
 
-                    if (!emittedCheck)
-                        return;
-                    EmitJump(valid);
-                    _owner.DefineLabel(overflow);
-                    EmitManagedExceptionThrow(node, "OverflowException");
-                    _owner.DefineLabel(valid);
+                    if (overflowLabel is not null)
+                        EndThrowTarget(node, "OverflowException", overflowLabel, inlineThrow);
                 }
 
                 private void EmitBoolConversion(MachineRegister destination, MachineRegister source, RuntimeType? sourceType, GenStackKind sourceKind)
@@ -6324,8 +6623,28 @@ namespace Cnidaria.Cs
                     int methodPtrOffset = _owner.FindDelegateFieldOffset(delegateType, "_methodPtr");
                     int invocationListOffset = _owner.FindDelegateFieldOffset(delegateType, "_invocationList");
                     int invocationCountOffset = _owner.FindDelegateFieldOffset(delegateType, "_invocationCount");
-                    bool closed = node.Uses.Length != 0;
+                    bool closed = node.IsClosedNewDelegate;
                     string thunkLabel = _owner.GetDelegateTargetThunkLabel(delegateType, targetMethod, closed);
+                    if (node.IsNewDelegateInPlace)
+                    {
+                        if (node.Uses.Length != (closed ? 2 : 1))
+                            throw Unsupported(node, "In-place NewDelegate has an unexpected operand count");
+                        RVRegister instance = ToIntegerRegister(RequireUseRegister(node, node.Uses.Length - 1));
+                        MachineRegister target = closed ? RequireUseRegister(node, 0) : MachineRegister.X0;
+                        if (closed)
+                            EmitNullCheck(node, ToIntegerRegister(target), "new_delegate_target");
+                        _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(delegateType), RVRegister.X30);
+                        EmitMemoryStore(MachineRegister.X30, instance, 0, Target.PointerSize);
+                        EmitMemoryStore(target, instance, targetOffset, Target.PointerSize);
+                        _owner.EmitMaterializeAddress(thunkLabel, RVRegister.X30);
+                        EmitMemoryStore(MachineRegister.X30, instance, methodPtrOffset, Target.PointerSize);
+                        EmitMemoryStore(MachineRegister.X0, instance, invocationListOffset, Target.PointerSize);
+                        _owner.EmitLoadImmediate(RVRegister.X31, 1);
+                        EmitMemoryStore(MachineRegister.X31, instance, invocationCountOffset, Target.PointerSize);
+                        _owner.EmitMove(ToIntegerRegister(node.Results[0].Register), instance);
+                        return;
+                    }
+
                     int temporarySize = closed ? AlignUp(Target.PointerSize, Target.CallFrameAlignment) : 0;
 
                     if (closed)
@@ -6340,7 +6659,7 @@ namespace Cnidaria.Cs
 
                     SafePointDraft safePoint = PrepareSafePoint(node, stackAdjustment: temporarySize);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(delegateType), RVRegister.X10);
-                    _owner.EmitPcrelTransfer(_owner.ResolveGcEntry(RiscVRuntime.NewFastSymbol), link: true);
+                    _owner.EmitPcrelTransfer(_owner.ResolveExternalSymbol(RiscVRuntime.NewFastSymbol), link: true);
                     _owner.DefineLabel(safePoint.ReturnLabel);
 
                     if (closed)
@@ -6406,7 +6725,7 @@ namespace Cnidaria.Cs
                     _owner.EmitAdjustStack(-frameSize);
                     EmitMemoryStore(MachineRegister.X28, RVRegister.X2, oldStackPointerOffset, Target.PointerSize);
                     for (int i = 0; i < node.Uses.Length; i++)
-                        SaveDelegateInvokeOperand(node.Uses[i], abi.OrderedSlices[i], saveOffset);
+                        SaveDelegateInvokeOperand(node.Uses[i], abi.OrderedSlices[i], saveOffset, frameSize);
 
                     EmitMemoryLoad(MachineRegister.X28, RVRegister.X2, receiverSaveOffset, Target.PointerSize, signed: false);
                     EmitMemoryLoad(MachineRegister.X29, RVRegister.X28, invocationCountOffset, Target.PointerSize, signed: false);
@@ -6473,7 +6792,8 @@ namespace Cnidaria.Cs
                 private void SaveDelegateInvokeOperand(
                     RegisterOperand operand,
                     DelegateAbiSlice slice,
-                    int saveBase)
+                    int saveBase,
+                    int frameSize)
                 {
                     int destinationOffset = checked(saveBase + slice.SaveOffset);
                     if (operand.IsRegister)
@@ -6484,7 +6804,11 @@ namespace Cnidaria.Cs
                     if (!operand.IsFrameSlot)
                         throw new InvalidOperationException($"Delegate ABI operand is not finalized: {operand}.");
 
-                    _owner.EmitAddImmediate(RVRegister.X29, FrameBase(operand), EffectiveFrameOffset(operand));
+                    RVRegister frameBase = FrameBase(operand);
+                    int sourceOffset = EffectiveFrameOffset(operand);
+                    if (frameBase == RVRegister.X2)
+                        sourceOffset = checked(sourceOffset + frameSize);
+                    _owner.EmitAddImmediate(RVRegister.X29, frameBase, sourceOffset);
                     _owner.EmitAddImmediate(RVRegister.X30, RVRegister.X2, destinationOffset, RVRegister.X29);
                     EmitBlockCopy(null, RVRegister.X30, RVRegister.X29, slice.Size);
                 }
@@ -6575,7 +6899,7 @@ namespace Cnidaria.Cs
                     _owner.EmitLoadImmediate(RVRegister.X16, _owner.FindDelegateFieldOffset(delegateLayoutType, "_invocationList"));
                     _owner.EmitLoadImmediate(RVRegister.X17, _owner.FindDelegateFieldOffset(delegateLayoutType, "_invocationCount"));
                     _owner.EmitPcrelTransfer(
-                        _owner.ResolveGcEntry(remove ? RiscVRuntime.DelegateRemoveSymbol : RiscVRuntime.DelegateCombineSymbol),
+                        _owner.ResolveExternalSymbol(remove ? RiscVRuntime.DelegateRemoveSymbol : RiscVRuntime.DelegateCombineSymbol),
                         link: true);
                     _owner.DefineLabel(safePoint.ReturnLabel);
                     _owner.EmitMove(result, RVRegister.X10);
@@ -7153,7 +7477,7 @@ namespace Cnidaria.Cs
                     SafePointDraft safePoint = PrepareSafePoint(node);
                     _owner.EmitMove(RVRegister.X11, RVRegister.X10);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(arrayType), RVRegister.X10);
-                    _owner.EmitPcrelTransfer(_owner.ResolveGcEntry(RiscVRuntime.NewUninitializedArraySymbol), link: true);
+                    _owner.EmitPcrelTransfer(_owner.ResolveExternalSymbol(RiscVRuntime.NewUninitializedArraySymbol), link: true);
                     _owner.DefineLabel(safePoint.ReturnLabel);
                 }
 
@@ -7162,7 +7486,7 @@ namespace Cnidaria.Cs
                     SafePointDraft safePoint = PrepareSafePoint(node);
                     _owner.EmitMove(RVRegister.X11, RVRegister.X10);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(method.DeclaringType), RVRegister.X10);
-                    _owner.EmitPcrelTransfer(_owner.ResolveGcEntry(RiscVRuntime.NewArraySymbol), link: true);
+                    _owner.EmitPcrelTransfer(_owner.ResolveExternalSymbol(RiscVRuntime.NewArraySymbol), link: true);
                     _owner.DefineLabel(safePoint.ReturnLabel);
                 }
 
@@ -7175,7 +7499,7 @@ namespace Cnidaria.Cs
                     MachineRegister result = RequireResultRegister(node);
                     SafePointDraft safePoint = PrepareSafePoint(node);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(objectType), RVRegister.X10);
-                    _owner.EmitPcrelTransfer(_owner.ResolveGcEntry(RiscVRuntime.NewFastSymbol), link: true);
+                    _owner.EmitPcrelTransfer(_owner.ResolveExternalSymbol(RiscVRuntime.NewFastSymbol), link: true);
                     _owner.DefineLabel(safePoint.ReturnLabel);
                     _owner.EmitMove(ToIntegerRegister(result), RVRegister.X10);
                 }
@@ -7195,19 +7519,12 @@ namespace Cnidaria.Cs
                         _owner.Emit(RVInstruction.I(RVInstrKind.Addiw, RVRegister.X28, checkedLength, 0));
                         checkedLength = RVRegister.X28;
                     }
-                    string nonNegative = _owner.CreateLocalLabel($"{_methodLabel}_array_length_non_negative_{node.LinearId}");
-                    EmitConditionalBranch(
-                        RVInstrKind.Bge,
-                        checkedLength,
-                        RVRegister.X0,
-                        nonNegative);
-                    EmitManagedExceptionThrow(node, "OverflowException");
-                    _owner.DefineLabel(nonNegative);
+                    EmitThrowIf(node, RVInstrKind.Blt, checkedLength, RVRegister.X0, "OverflowException", "array_length_non_negative");
                     SafePointDraft safePoint = PrepareSafePoint(node);
 
                     _owner.EmitMove(RVRegister.X11, checkedLength);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(node.Type), RVRegister.X10);
-                    _owner.EmitPcrelTransfer(_owner.ResolveGcEntry(RiscVRuntime.NewArraySymbol), link: true);
+                    _owner.EmitPcrelTransfer(_owner.ResolveExternalSymbol(RiscVRuntime.NewArraySymbol), link: true);
                     _owner.DefineLabel(safePoint.ReturnLabel);
                     _owner.EmitMove(ToIntegerRegister(result), RVRegister.X10);
                 }
@@ -7227,14 +7544,13 @@ namespace Cnidaria.Cs
                     if (node.Uses.Length != 2 || node.Results.Length != 0 || !node.Uses[0].IsRegister || !node.Uses[1].IsRegister)
                         throw Unsupported(node, "Bounds check requires index and length registers and no result");
 
-                    string inRange = _owner.CreateLocalLabel(_methodLabel + "_index_in_range");
-                    EmitConditionalBranch(
-                        RVInstrKind.Bltu,
+                    EmitThrowIf(
+                        node,
+                        RVInstrKind.Bgeu,
                         ToIntegerRegister(node.Uses[0].Register),
                         ToIntegerRegister(node.Uses[1].Register),
-                        inRange);
-                    EmitManagedExceptionThrow(node, "IndexOutOfRangeException");
-                    _owner.DefineLabel(inRange);
+                        "IndexOutOfRangeException",
+                        "index_in_range");
                 }
 
                 private void EmitArray(GenTree node)
@@ -7293,10 +7609,7 @@ namespace Cnidaria.Cs
                     EmitMemoryLoad(MachineRegister.X30, array, 0, Target.PointerSize, signed: false);
                     EmitMethodTableElementType(RVRegister.X31, RVRegister.X30);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X31, RVRegister.X31, -0x18));
-                    string valid = _owner.CreateLocalLabel(_methodLabel + "_array_data_valid");
-                    EmitConditionalBranch(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, valid);
-                    EmitManagedExceptionThrow(node, "ArrayTypeMismatchException");
-                    _owner.DefineLabel(valid);
+                    EmitThrowIf(node, RVInstrKind.Bne, RVRegister.X31, RVRegister.X0, "ArrayTypeMismatchException", "array_data_valid");
                     _owner.EmitAddImmediate(
                         ToIntegerRegister(node.Results[0].Register),
                         array,
@@ -7470,18 +7783,13 @@ namespace Cnidaria.Cs
                     if ((node.Flags & GenTreeFlags.BoundsCheckEliminated) == 0)
                     {
                         EmitMemoryLoad(MachineRegister.X30, array, Target.ArrayLengthOffset, 4, signed: true);
-                        string inRange = _owner.CreateLocalLabel(_methodLabel + "_array_index_in_range");
+                        RVRegister checkedIndex = index;
                         if (node.HasBoundsCheckIndexOverride)
                         {
                             _owner.EmitLoadImmediate(RVRegister.X31, node.BoundsCheckIndexOverride);
-                            EmitConditionalBranch(RVInstrKind.Bltu, RVRegister.X31, RVRegister.X30, inRange);
+                            checkedIndex = RVRegister.X31;
                         }
-                        else
-                        {
-                            EmitConditionalBranch(RVInstrKind.Bltu, index, RVRegister.X30, inRange);
-                        }
-                        EmitManagedExceptionThrow(node, "IndexOutOfRangeException");
-                        _owner.DefineLabel(inRange);
+                        EmitThrowIf(node, RVInstrKind.Bgeu, checkedIndex, RVRegister.X30, "IndexOutOfRangeException", "array_index_in_range");
                     }
 
                     EmitScaledIndexAdd(node, destination, array, index, ArrayElementSize(elementType));
@@ -7522,10 +7830,7 @@ namespace Cnidaria.Cs
 
                 private void EmitArrayNullCheck(GenTree node, RVRegister array)
                 {
-                    string nonNull = _owner.CreateLocalLabel(_methodLabel + "_array_non_null");
-                    EmitConditionalBranch(RVInstrKind.Bne, array, RVRegister.X0, nonNull);
-                    EmitManagedExceptionThrow(node, "NullReferenceException");
-                    _owner.DefineLabel(nonNull);
+                    EmitThrowIf(node, RVInstrKind.Beq, array, RVRegister.X0, "NullReferenceException", "array_non_null");
                 }
 
                 /// <summary>Emits the null check every array access owes, and the element type check only where covariance can break it</summary>
@@ -8220,10 +8525,7 @@ namespace Cnidaria.Cs
 
                 private void EmitNullCheck(GenTree node, RVRegister value, string suffix)
                 {
-                    string nonNull = _owner.CreateLocalLabel($"{_methodLabel}_{suffix}_non_null_{node.LinearId}");
-                    EmitConditionalBranch(RVInstrKind.Bne, value, RVRegister.X0, nonNull);
-                    EmitManagedExceptionThrow(node, "NullReferenceException");
-                    _owner.DefineLabel(nonNull);
+                    EmitThrowIf(node, RVInstrKind.Beq, value, RVRegister.X0, "NullReferenceException", suffix + "_non_null");
                 }
 
                 private void EmitField(GenTree node)
@@ -8394,7 +8696,7 @@ namespace Cnidaria.Cs
                             if (IsContainedDefaultValue(node, 0))
                             {
                                 if (IsAggregate(fieldType, kind))
-                                    EmitZeroAddress(node, OffsetAddress(RVRegister.X28, field.Offset), StorageSize(fieldType, kind));
+                                    EmitZeroAddress(node, OffsetAddress(RVRegister.X28, field.Offset), StorageSize(fieldType, kind), StoreAlignment(node, fieldType));
                                 else
                                     EmitStoreDefaultToAddress(MachineRegister.X28, field.Offset, fieldType, kind);
                                 return;
@@ -8414,13 +8716,29 @@ namespace Cnidaria.Cs
                     }
                 }
 
-                private void EmitZeroAddress(GenTree node, RVRegister address, int size)
+                private void EmitZeroAddress(GenTree node, RVRegister address, int size, int alignment)
                 {
                     if (size < 0)
-                        throw Unsupported(node, "Static field storage size is negative");
-                    for (int offset = 0; offset < size; offset++)
-                        EmitMemoryStore(MachineRegister.X0, address, offset, 1);
+                        throw Unsupported(node, "Zeroed storage size is negative");
+                    EmitZeroMemory(address, 0, size, alignment);
                 }
+
+                // Chunks never exceed the alignment the address is known to have
+                private void EmitZeroMemory(RVRegister address, int offset, int size, int alignment)
+                {
+                    int widest = Math.Min(Target.PointerSize, Math.Max(1, alignment));
+                    for (int written = 0; written < size;)
+                    {
+                        int chunk = widest;
+                        while (chunk > size - written)
+                            chunk /= 2;
+                        EmitMemoryStore(MachineRegister.X0, address, checked(offset + written), chunk);
+                        written += chunk;
+                    }
+                }
+
+                private static int StoreAlignment(GenTree node, RuntimeType type)
+                    => (node.Flags & GenTreeFlags.Unaligned) != 0 ? 1 : Math.Max(1, type.AlignOf);
 
                 private void EmitIndirect(GenTree node)
                 {
@@ -8439,6 +8757,11 @@ namespace Cnidaria.Cs
                     RVRegister destination = ToIntegerRegister(RequireUseRegisterForOperand(node, 0, "indirect store address"));
                     if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
                         EmitNullCheck(node, destination, "indirect_store");
+                    if (IsContainedDefaultValue(node, 1))
+                    {
+                        EmitZeroAddress(node, destination, StorageSize(storeType, OperandStackKind(node, 1)), StoreAlignment(node, storeType));
+                        return;
+                    }
                     EmitValueToAddress(
                         node,
                         RequireCodegenUseIndexForOperand(node, 1, "indirect store value"),
@@ -8829,9 +9152,7 @@ namespace Cnidaria.Cs
                     int size = StorageSize(type, kind);
                     if (IsAggregate(type, kind) || SimdTypes.IsSimdKind(kind) || SimdTypes.IsSimdType(type, Target))
                     {
-                        RVRegister baseRegister = ToIntegerRegister(address);
-                        for (int i = 0; i < size; i++)
-                            EmitMemoryStore(MachineRegister.X0, baseRegister, checked(offset + i), 1);
+                        EmitZeroMemory(ToIntegerRegister(address), offset, size, type?.AlignOf ?? 1);
                         return;
                     }
                     if (!IsFloating(type, kind))

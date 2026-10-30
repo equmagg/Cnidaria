@@ -15,19 +15,22 @@ public sealed class ArmProgram: IProgram
     public ImmutableArray<ArmDataSection> DataSections { get; }
     public ImmutableArray<ArmObjectSymbol> Symbols { get; }
     public string EntrySymbol { get; }
+    public ImmutableArray<PeImport> Imports { get; }
 
     public ArmProgram(
         ArmTarget target,
         ArmTextSection text,
         ImmutableArray<ArmDataSection> dataSections,
         ImmutableArray<ArmObjectSymbol> symbols,
-        string entrySymbol)
+        string entrySymbol,
+        ImmutableArray<PeImport> imports = default)
     {
         Target = target ?? throw new ArgumentNullException(nameof(target));
         Text = text ?? throw new ArgumentNullException(nameof(text));
         DataSections = dataSections.IsDefault ? ImmutableArray<ArmDataSection>.Empty : dataSections;
         Symbols = symbols.IsDefault ? ImmutableArray<ArmObjectSymbol>.Empty : symbols;
         EntrySymbol = entrySymbol ?? string.Empty;
+        Imports = imports.IsDefault ? ImmutableArray<PeImport>.Empty : PeImport.Merge(imports);
     }
 
     public ArmProgram(
@@ -57,8 +60,11 @@ public sealed class ArmProgram: IProgram
             _ => LinkFlat(imageBase, externalSymbols).Bytes.ToArray(),
         };
 
-    public byte[] ToWindowsExecutableBytes(ulong imageBase = 0)
-        => ArmPortableExecutableWriter.WriteExecutable(this, imageBase == 0 ? ArmPortableExecutableWriter.DefaultImageBase(Target) : imageBase);
+    public byte[] ToWindowsExecutableBytes(ulong imageBase = 0, IEnumerable<PeImport>? imports = null)
+        => ArmPortableExecutableWriter.WriteExecutable(this, imageBase == 0 ? ArmPortableExecutableWriter.DefaultImageBase(Target) : imageBase, imports);
+
+    public byte[] ToWindowsDynamicLibraryBytes(string libraryName, IEnumerable<PeImport>? imports = null, string? entrySymbol = null, ulong imageBase = 0)
+        => ArmPortableExecutableWriter.WriteDynamicLibrary(this, libraryName, imports, entrySymbol, imageBase);
 
     public byte[] ToLinuxDynamicExecutableBytes(
         IEnumerable<string>? needed = null,

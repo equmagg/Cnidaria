@@ -52,6 +52,7 @@ pid_t setsid(void);
 int pause(void);
 unsigned int alarm(unsigned int seconds);
 unsigned int sleep(unsigned int seconds);
+int usleep(useconds_t microseconds);
 pid_t tcgetpgrp(int descriptor);
 int tcsetpgrp(int descriptor, pid_t group);
 #endif

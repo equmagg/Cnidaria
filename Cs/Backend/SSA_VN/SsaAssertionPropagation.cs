@@ -488,6 +488,7 @@ namespace Cnidaria.Cs
             private readonly Dictionary<CfgEdge, List<int>> _generatedOnEdge = new();
             private readonly Dictionary<ValueNumber, SsaPhi> _phiByValueNumber = new();
             private readonly Dictionary<ValueNumber, SsaPhi> _stackAllocationPhiByValueNumber = new();
+            private readonly ValueNumber _thisValue;
             private readonly Dictionary<GenTree, ValueNumberPair> _treeValueUpdates = new(ReferenceEqualityComparer<GenTree>.Instance);
             private AssertionSet[] _blockIn = Array.Empty<AssertionSet>();
             private Dictionary<CfgEdge, AssertionSet> _edgeOut = new();
@@ -507,6 +508,21 @@ namespace Cnidaria.Cs
                 int maximumAssertions = Math.Max(64, Math.Min(256, (trackedLocalCount + 3 * method.Blocks.Length + 48) >> 2));
                 _table = new AssertionTable(maximumAssertions);
                 _nextSyntheticTreeId = nextSyntheticTreeId;
+
+                // Every instance call checks its receiver, so a reference type's incoming this is never null
+                RuntimeMethod runtimeMethod = method.GenTreeMethod.RuntimeMethod;
+                if (runtimeMethod.HasThis && !runtimeMethod.DeclaringType.IsValueType)
+                {
+                    for (int i = 0; i < method.InitialValues.Length; i++)
+                    {
+                        SsaValueName initial = method.InitialValues[i];
+                        if (initial.Slot.Kind == SsaSlotKind.Arg && initial.Slot.Index == 0 &&
+                            _valueNumbers.TryGetSsaValue(initial, out var thisValue))
+                        {
+                            _thisValue = _store.VNNormalValue(thisValue.Conservative);
+                        }
+                    }
+                }
 
                 for (int i = 0; i < method.ValueDefinitions.Length; i++)
                 {
@@ -1698,9 +1714,14 @@ namespace Cnidaria.Cs
             }
 
             private bool IsKnownNonZero(ValueNumber value, GenTree template, AssertionSet active)
+                => IsKnownNonZero(value, template.StackKind, active, depth: 0);
+
+            private bool IsKnownNonZero(ValueNumber value, GenStackKind kind, AssertionSet active, int depth)
             {
-                if (IsValueNumberKnownNonZero(value, template.StackKind) ||
-                    IsKnownStackAllocationAddress(value, active))
+                if (IsValueNumberKnownNonZero(value, kind) ||
+                    IsKnownStackAllocationAddress(value, active) ||
+                    IsNonNullDerivedAddress(value, active, depth) ||
+                    IsNonNullPhi(value, kind, depth))
                 {
                     return true;
                 }
@@ -1719,7 +1740,7 @@ namespace Cnidaria.Cs
                 if (IsRelationImplied(
                     SsaAssertionKind.NotEqual,
                     AssertionValue.ForValueNumber(value),
-                    ZeroFor(template),
+                    ZeroFor(kind),
                     active))
                 {
                     return true;
@@ -1727,6 +1748,30 @@ namespace Cnidaria.Cs
 
                 return TryGetIntegralRange(value, active, out var range) &&
                        (range.Lower > 0 || range.Upper < 0);
+            }
+
+            // An interior address of a managed object or local is null only when its base is
+            private bool IsNonNullDerivedAddress(ValueNumber value, AssertionSet active, int depth)
+            {
+                if (depth > 4 || !_store.TryGetEntry(value, out var entry))
+                    return false;
+
+                if (entry.Function is ValueNumberFunction.FieldAddr or ValueNumberFunction.PtrToArrElem or ValueNumberFunction.LdElemA)
+                    return true;
+
+                if (entry.Function is not (ValueNumberFunction.PointerElementAddr or ValueNumberFunction.PointerToByRef) || entry.Args.Length == 0)
+                    return false;
+
+                ValueNumber source = _store.VNNormalValue(entry.Args[0]);
+                if (!_store.TryGetEntry(source, out var sourceEntry))
+                    return false;
+
+                return sourceEntry.StackKind switch
+                {
+                    GenStackKind.Ref => IsKnownNonNull(source, GenStackKind.Ref, active, depth + 1),
+                    GenStackKind.ByRef => IsKnownNonZero(source, GenStackKind.ByRef, active, depth + 1),
+                    _ => entry.Function == ValueNumberFunction.PointerToByRef && IsNonNullDerivedAddress(source, active, depth + 1),
+                };
             }
 
             private bool IsKnownNonNullOrNonZero(ValueNumber value, GenTree template, AssertionSet active)
@@ -1741,8 +1786,11 @@ namespace Cnidaria.Cs
             }
 
             private bool IsKnownNonNull(ValueNumber value, GenTree template, AssertionSet active)
+                => IsKnownNonNull(value, template.StackKind, active, depth: 0);
+
+            private bool IsKnownNonNull(ValueNumber value, GenStackKind kind, AssertionSet active, int depth)
             {
-                if (template.StackKind is not (GenStackKind.Ref or GenStackKind.Null) ||
+                if (kind is not (GenStackKind.Ref or GenStackKind.Null) ||
                     !_store.TryGetEntry(value, out var entry) ||
                     !IsObjectReferenceStackKind(entry.StackKind))
                 {
@@ -1751,7 +1799,8 @@ namespace Cnidaria.Cs
 
                 if (entry.Function is ValueNumberFunction.NewObject or
                     ValueNumberFunction.NewArray or
-                    ValueNumberFunction.ExceptionObject)
+                    ValueNumberFunction.ExceptionObject ||
+                    (_thisValue.IsValid && value == _thisValue))
                 {
                     return true;
                 }
@@ -1770,7 +1819,40 @@ namespace Cnidaria.Cs
                     SsaAssertionKind.NotEqual,
                     AssertionValue.ForValueNumber(value),
                     AssertionValue.Null,
-                    active);
+                    active) ||
+                    IsNonNullPhi(value, kind, depth);
+            }
+
+            // A phi is non-null when every input that is not the phi itself is non-null on its incoming edge
+            private bool IsNonNullPhi(ValueNumber value, GenStackKind kind, int depth)
+            {
+                if (depth > 4 ||
+                    !_store.TryGetEntry(value, out var entry) ||
+                    entry.Function != ValueNumberFunction.PhiDef ||
+                    !_phiByValueNumber.TryGetValue(value, out var phi))
+                {
+                    return false;
+                }
+
+                bool sawInput = false;
+                foreach (SsaPhiInput input in phi.Inputs)
+                {
+                    if (!_valueNumbers.TryGetSsaValue(input.Value, out var pair))
+                        return false;
+                    ValueNumber inputValue = _store.VNNormalValue(pair.Conservative);
+                    if (inputValue == value)
+                        continue;
+
+                    AssertionSet edge = GetPhiInputAssertions(phi, input.PredecessorBlockId);
+                    bool nonNull = kind is GenStackKind.Ref or GenStackKind.Null
+                        ? IsKnownNonNull(inputValue, kind, edge, depth + 1)
+                        : IsKnownNonZero(inputValue, kind, edge, depth + 1);
+                    if (!nonNull)
+                        return false;
+                    sawInput = true;
+                }
+
+                return sawInput;
             }
 
             private bool IsKnownStackAllocationAddress(ValueNumber value, AssertionSet active)
@@ -3723,9 +3805,12 @@ namespace Cnidaria.Cs
             }
 
             private AssertionValue ZeroFor(GenTree tree)
+                => ZeroFor(tree.StackKind);
+
+            private AssertionValue ZeroFor(GenStackKind kind)
             {
-                bool use64 = tree.StackKind == GenStackKind.I8 ||
-                             ((tree.StackKind is GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr or GenStackKind.ByRef) &&
+                bool use64 = kind == GenStackKind.I8 ||
+                             ((kind is GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr or GenStackKind.ByRef) &&
                               _method.GenTreeMethod.Target.PointerSize == 8);
                 return use64 ? AssertionValue.ForInt64(0) : AssertionValue.ForInt32(0);
             }

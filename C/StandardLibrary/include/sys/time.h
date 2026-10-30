@@ -23,6 +23,7 @@ struct itimerval
     struct timeval it_value;
 };
 
+int gettimeofday(struct timeval* restrict value, void* restrict timezone);
 int getitimer(int which, struct itimerval* value);
 int setitimer(int which, const struct itimerval* restrict value, struct itimerval* restrict old);
 

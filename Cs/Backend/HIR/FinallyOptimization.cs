@@ -32,15 +32,14 @@ namespace Cnidaria.Cs
                 flow = new FinallyFlow(method);
             }
 
+            // Cloning an inner finally creates the leave path along which the enclosing one is cloned
             for (int clause = 0; clause < flow.ClauseCount; clause++)
             {
-                if (flow.IsFinally(clause))
-                    flow.TryCloneFinally(clause);
-            }
-            if (flow.Changed)
-            {
-                method = flow.Build();
-                flow = new FinallyFlow(method);
+                if (flow.IsFinally(clause) && flow.TryCloneFinally(clause))
+                {
+                    method = flow.Build();
+                    flow = new FinallyFlow(method);
+                }
             }
 
             for (int clause = 0; clause < flow.ClauseCount;)

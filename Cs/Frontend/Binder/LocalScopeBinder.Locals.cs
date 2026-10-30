@@ -332,9 +332,11 @@ namespace Cnidaria.Cs
                         localType = new ErrorTypeSymbol("var", containing: null, ImmutableArray<Location>.Empty);
                         init = rhs;
                     }
-                    else if (rhs is BoundUnboundConditionalExpression unboundConditional)
+                    else if (rhs is BoundUnboundConditionalExpression or BoundUnboundSwitchExpression)
                     {
-                        diagnostics.Add(unboundConditional.NoNaturalType);
+                        diagnostics.Add(rhs is BoundUnboundConditionalExpression unboundConditional
+                            ? unboundConditional.NoNaturalType
+                            : ((BoundUnboundSwitchExpression)rhs).NoNaturalType);
                         localType = new ErrorTypeSymbol("var", containing: null, ImmutableArray<Location>.Empty);
                         var badInit = new BoundBadExpression(v.Initializer.Value);
                         badInit.SetType(localType);

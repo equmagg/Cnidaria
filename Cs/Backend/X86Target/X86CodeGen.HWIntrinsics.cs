@@ -1563,12 +1563,9 @@ namespace Cnidaria.Cs
                 private void EmitImmediateRangeCheck(GenTree node, int operandIndex, int last)
                 {
                     X86Register value = GeneralTemp(node, 1);
-                    string inRange = _owner.CreateLocalLabel($"{_methodLabel}_imm_in_range");
                     _owner.Emit(X86Instruction.Binary(X86InstrKind.Movzx, Reg(value, 4), Reg(SimdUse(node, operandIndex), 1)));
                     _owner.Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(value, 4), Imm(last)));
-                    EmitConditionalJump(X86Condition.Be, inRange);
-                    EmitManagedExceptionThrow(node, "ArgumentOutOfRangeException");
-                    _owner.DefineLabel(inRange);
+                    EmitThrowIf(node, X86Condition.A, "ArgumentOutOfRangeException", "imm_in_range");
                 }
 
                 private void EmitX86Gather(GenTree node, X86IntrinsicInfo info, X86InstrKind instruction)
@@ -1783,11 +1780,8 @@ namespace Cnidaria.Cs
                     _owner.Emit(X86Instruction.Binary(signed && size == 4 ? X86InstrKind.Movsxd : X86InstrKind.Mov,
                         Reg(divisor, divisorSize), Reg(SimdUse(node, 2), size)));
 
-                    string nonZero = _owner.CreateLocalLabel($"{_methodLabel}_divrem_nonzero");
                     _owner.Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(divisor, divisorSize), Reg(divisor, divisorSize)));
-                    EmitConditionalJump(X86Condition.Ne, nonZero);
-                    EmitManagedExceptionThrow(node, "DivideByZeroException");
-                    _owner.DefineLabel(nonZero);
+                    EmitThrowIf(node, X86Condition.E, "DivideByZeroException", "divrem_nonzero");
 
                     if (!signed)
                     {
@@ -1862,7 +1856,7 @@ namespace Cnidaria.Cs
                     _owner.DefineLabel(done);
                 }
 
-                // Indexes equally sized copies of the instruction, one per value, each followed by a jump past the table
+                // Jump-table entries have a fixed stride, including the rel32 exit branch
                 private void EmitImmediateJumpTable(GenTree node, int immediateIndex, Func<int, X86Instruction> entry, int count = 256)
                 {
                     X86Register index = SimdUse(node, immediateIndex);
@@ -1870,7 +1864,6 @@ namespace Cnidaria.Cs
                     X86Register offset = GeneralTemp(node, 1);
                     int entrySize = X86CodeEncoder.Encode(entry(0), _owner._machineTarget).Length + 5;
                     string tableLabel = _owner.CreateLocalLabel($"{_methodLabel}_imm_table");
-                    string doneLabel = _owner.CreateLocalLabel($"{_methodLabel}_imm_done");
                     _owner.EmitLea(table, tableLabel);
                     _owner.Emit(X86Instruction.Binary(X86InstrKind.Movzx, Reg(offset, 4), Reg(index, 1)));
                     if (count != 256)
@@ -1882,9 +1875,8 @@ namespace Cnidaria.Cs
                     for (int value = 0; value < count; value++)
                     {
                         _owner.Emit(entry(value));
-                        EmitJump(doneLabel);
+                        _owner.Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.ImmediateOperand((count - value - 1) * entrySize, 4)));
                     }
-                    _owner.DefineLabel(doneLabel);
                 }
 
                 private X86Register GeneralTemp(GenTree node, int index, X86Register avoid = X86Register.Invalid)

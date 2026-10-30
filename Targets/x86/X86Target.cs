@@ -13,19 +13,22 @@ public sealed class X86Program : IProgram
     public ImmutableArray<X86DataSection> DataSections { get; }
     public ImmutableArray<X86ObjectSymbol> Symbols { get; }
     public string EntrySymbol { get; }
+    public ImmutableArray<PeImport> Imports { get; }
 
     public X86Program(
         X86Target target,
         X86TextSection text,
         ImmutableArray<X86DataSection> dataSections,
         ImmutableArray<X86ObjectSymbol> symbols,
-        string entrySymbol)
+        string entrySymbol,
+        ImmutableArray<PeImport> imports = default)
     {
         Target = target ?? throw new ArgumentNullException(nameof(target));
         Text = text ?? throw new ArgumentNullException(nameof(text));
         DataSections = dataSections.IsDefault ? ImmutableArray<X86DataSection>.Empty : dataSections;
         Symbols = symbols.IsDefault ? ImmutableArray<X86ObjectSymbol>.Empty : symbols;
         EntrySymbol = entrySymbol ?? string.Empty;
+        Imports = imports.IsDefault ? ImmutableArray<PeImport>.Empty : PeImport.Merge(imports);
     }
 
     public X86Program(
@@ -61,8 +64,11 @@ public sealed class X86Program : IProgram
             _ => LinkFlat(imageBase, externalSymbols).Bytes.ToArray(),
         };
 
-    public byte[] ToWindowsExecutableBytes(ulong imageBase = 0)
-        => X86PortableExecutableWriter.WriteExecutable(this, imageBase == 0 ? X86PortableExecutableWriter.DefaultImageBase(Target) : imageBase);
+    public byte[] ToWindowsExecutableBytes(ulong imageBase = 0, IEnumerable<PeImport>? imports = null)
+        => X86PortableExecutableWriter.WriteExecutable(this, imageBase == 0 ? X86PortableExecutableWriter.DefaultImageBase(Target) : imageBase, imports);
+
+    public byte[] ToWindowsDynamicLibraryBytes(string libraryName, IEnumerable<PeImport>? imports = null, string? entrySymbol = null, ulong imageBase = 0)
+        => X86PortableExecutableWriter.WriteDynamicLibrary(this, libraryName, imports, entrySymbol, imageBase);
 
     public byte[] ToLinuxDynamicExecutableBytes(
         IEnumerable<string>? needed = null,
@@ -99,7 +105,7 @@ public sealed class X86TextSection
     }
 
     public byte[] Encode(X86Target target)
-        => X86CodeEncoder.Encode(Instructions, target, Labels);
+        => X86CodeEncoder.Encode(new X86Program(target, this, default, default, string.Empty));
 
     public string Format(X86AssemblyWriterOptions? options = null)
         => X86Disassembler.Disassemble(this, options);

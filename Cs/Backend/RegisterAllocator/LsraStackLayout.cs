@@ -679,7 +679,7 @@ namespace Cnidaria.Cs
                     if (type?.IsValueType == true)
                         size = Math.Max(size, Math.Max(1, type.SizeOf));
 
-                    if (node.TreeKind == GenTreeKind.NewDelegate && node.Uses.Length != 0)
+                    if (node.IsClosedNewDelegate)
                         size = Math.Max(size, Target.PointerSize);
                     else if (node.TreeKind is GenTreeKind.DelegateCombine or GenTreeKind.DelegateRemove)
                         size = Math.Max(size, checked(Target.PointerSize * 3));
@@ -715,7 +715,12 @@ namespace Cnidaria.Cs
             {
                 int count = ComputeMaximumLiveAllocationGcCellCount();
                 count = checked(count + GcSafePointOperandCellCount());
-                return checked(count + 1);
+                foreach (GenTree node in _method.LinearNodes)
+                {
+                    if (node.TreeKind == GenTreeKind.DelegateInvoke)
+                        return checked(count + 1);
+                }
+                return count;
             }
 
             private int ComputeMaximumLiveAllocationGcCellCount()
@@ -724,7 +729,9 @@ namespace Cnidaria.Cs
                 for (int n = 0; n < _method.LinearNodes.Length; n++)
                 {
                     GenTree node = _method.LinearNodes[n];
-                    if (!node.HasLoweringFlag(GenTreeLinearFlags.GcSafePoint))
+                    // Throw sites in EH methods also suspend the frame while filters and finallys run
+                    if (node.TreeKind == GenTreeKind.GcPoll ||
+                        !node.HasLoweringFlag(GenTreeLinearFlags.GcSafePoint) && _method.GenTreeMethod.Cfg.ExceptionRegions.IsDefaultOrEmpty)
                         continue;
                     if (!_method.LsraNodePositions.TryGetValue(node.LinearId, out int position))
                         continue;
@@ -736,9 +743,8 @@ namespace Cnidaria.Cs
                         if (!_method.GenTreeMethod.ValueInfoByNode.TryGetValue(allocation.ValueKey, out var info))
                             continue;
 
-                        // A call's frame-backed result is already reported while the call itself runs
                         int cells = GcCellCount(info.Type, info.StackKind);
-                        if (cells == 0 || !AllocationIsLiveAt(allocation, position) && !AllocationIsLiveAt(allocation, position + 1))
+                        if (cells == 0 || !AllocationNeedsGcSpillAt(allocation, position) && !AllocationNeedsGcSpillAt(allocation, position + 1))
                             continue;
                         count = checked(count + cells);
                     }
@@ -747,12 +753,12 @@ namespace Cnidaria.Cs
                 return maximum;
             }
 
-            private static bool AllocationIsLiveAt(RegisterAllocationInfo allocation, int position)
+            private bool AllocationNeedsGcSpillAt(RegisterAllocationInfo allocation, int position)
             {
                 for (int i = 0; i < allocation.Segments.Length; i++)
                 {
                     RegisterAllocationSegment segment = allocation.Segments[i];
-                    if (!segment.Location.IsNone && segment.Start <= position && position < segment.End)
+                    if (NeedsGcSpill(segment.Location) && segment.Start <= position && position < segment.End)
                         return true;
                 }
 
@@ -762,12 +768,15 @@ namespace Cnidaria.Cs
                     for (int s = 0; s < fragment.Segments.Length; s++)
                     {
                         RegisterAllocationSegment segment = fragment.Segments[s];
-                        if (!segment.Location.IsNone && segment.Start <= position && position < segment.End)
+                        if (NeedsGcSpill(segment.Location) && segment.Start <= position && position < segment.End)
                             return true;
                     }
                 }
                 return false;
             }
+
+            private bool NeedsGcSpill(RegisterOperand location)
+                => location.IsRegister && !RegisterInfo.IsCalleeSaved(Target, location.Register);
 
             private int GcSafePointOperandCellCount()
             {
@@ -775,7 +784,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < _method.LinearNodes.Length; i++)
                 {
                     GenTree node = _method.LinearNodes[i];
-                    if (!node.HasLoweringFlag(GenTreeLinearFlags.GcSafePoint))
+                    if (node.TreeKind == GenTreeKind.GcPoll || !node.HasLoweringFlag(GenTreeLinearFlags.GcSafePoint))
                         continue;
 
                     int count = 0;
@@ -783,6 +792,8 @@ namespace Cnidaria.Cs
                     for (int u = 0; u < operandCount; u++)
                     {
                         if (u < node.UseRoles.Length && node.UseRoles[u] == OperandRole.HiddenReturnBuffer)
+                            continue;
+                        if (!NeedsGcSpill(node.Uses[u]))
                             continue;
                         GenTree value = node.RegisterUses[u];
                         if (!_method.GenTreeMethod.ValueInfoByNode.TryGetValue(value.LinearValueKey, out var info))

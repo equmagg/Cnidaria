@@ -82,6 +82,8 @@ rh_bytes __riscv_vmv_v_x_u8m8(u8 rs1, usize vl);
 #define RH_BLOCK_SCANNED 2ul
 #define RH_ROOT_OBJECT 0ul
 #define RH_ROOT_INTERIOR 1ul
+#define RH_ROOT_REGISTER 2ul
+#define RH_ROOT_STACK_POINTER 4ul
 #define RH_EETYPE_KIND_MASK 0x00030000u
 #define RH_EETYPE_PARAMETERIZED_KIND 0x00020000u
 #define RH_EETYPE_HAS_POINTERS 0x01000000u
@@ -275,12 +277,13 @@ static usize rh_interior_batch_count;
 static int rh_gc_running;
 static RhObject* rh_delegate_temporary_root;
 static RhDispatchRecord* rh_dispatches;
+extern const RhCodeRegion RhpRuntimeRegions[];
+extern const usize RhpRuntimeRegionCount;
+void RhpCollect(void);
+
 static const RhCodeRegion* rh_regions;
 static usize rh_region_count;
 
-const void* RhpCurrentReturnAddress;
-usize RhpCurrentStackPointer;
-void* RhpCurrentFramePointer;
 volatile u32 RhpGcPollRequested;
 
 #if (defined(__riscv_flen) && __riscv_flen >= 32) || defined(__i386__) || defined(__x86_64__) || defined(__aarch64__)
@@ -1026,23 +1029,24 @@ static int rh_is_assignable(const RhMethodTable* source, const RhMethodTable* ta
     }
 }
 
-static const RhCodeRegion* rh_find_region(const void* ip)
+static const RhCodeRegion* rh_find_region(const void* ip, int native)
 {
     usize key = (usize)ip - 1ul;
     usize low = 0ul;
-    usize high = rh_region_count;
+    const RhCodeRegion* regions = native != 0 ? RhpRuntimeRegions : rh_regions;
+    usize high = native != 0 ? RhpRuntimeRegionCount : rh_region_count;
     const RhCodeRegion* region;
     while (low < high)
     {
         usize middle = low + (high - low) / 2ul;
-        if ((usize)rh_regions[middle].start <= key)
+        if ((usize)regions[middle].start <= key)
             low = middle + 1ul;
         else
             high = middle;
     }
     if (low == 0ul)
         return (const RhCodeRegion*)0;
-    region = &rh_regions[low - 1ul];
+    region = &regions[low - 1ul];
     if (key >= (usize)region->end)
         return (const RhCodeRegion*)0;
     return region;
@@ -1158,7 +1162,7 @@ static int rh_eh_accepts(const RhCodeRegion* region, const RhEhClause* clause, c
     while (rh_eh_funclet_in_try(region, clause))
     {
         (void)rh_unwind_frame(&frame, region);
-        region = rh_find_region(frame.ip);
+        region = rh_find_region(frame.ip, 0);
     }
     return RhpCallFunclet((const void*)clause->catch_type, &frame, exception) != 0ul;
 }
@@ -1206,7 +1210,7 @@ static void rh_eh_dispatch(RhObject* exception, const RhUnwindContext* thrower)
 
     for (;;)
     {
-        region = rh_find_region(context.ip);
+        region = rh_find_region(context.ip, 0);
         if (region == (const RhCodeRegion*)0 || depth >= RH_UNWIND_DEPTH_LIMIT)
             RhpFallbackFailFast(134);
         if (region->kind == RH_REGION_FILTER)
@@ -1228,7 +1232,7 @@ static void rh_eh_dispatch(RhObject* exception, const RhUnwindContext* thrower)
     skip = 0;
     for (;;)
     {
-        region = rh_find_region(context.ip);
+        region = rh_find_region(context.ip, 0);
         if (depth == target_depth && target_clause < 0)
             break;
         if (!skip && region->eh != (const RhEhInfo*)0)
@@ -1254,7 +1258,7 @@ static void rh_eh_dispatch(RhObject* exception, const RhUnwindContext* thrower)
         while (rh_eh_funclet_in_try(region, target))
         {
             (void)rh_unwind_frame(&context, region);
-            region = rh_find_region(context.ip);
+            region = rh_find_region(context.ip, 0);
         }
         continuation = (const void*)RhpCallFunclet(target->handler, &context, exception);
         // Dispatches abandoned by an exception escaping their finally live below the resumed frame
@@ -2245,9 +2249,6 @@ void RhpInitialize(
     rh_static_root_count = static_root_count;
     rh_regions = regions;
     rh_region_count = region_count;
-    RhpCurrentReturnAddress = (const void*)0;
-    RhpCurrentStackPointer = 0ul;
-    RhpCurrentFramePointer = (void*)0;
     rh_dispatches = (RhDispatchRecord*)0;
     rh_build_type_index();
     rh_initialize_heap();
@@ -2446,17 +2447,41 @@ static void rh_mark_frame_roots(RhUnwindContext* context)
         const RhSafePoint* safe_point = rh_find_safe_point(context->ip);
         usize fp = context->fp;
         usize i = 0ul;
-        if (safe_point == (const RhSafePoint*)0 || fp == 0ul || fp > rh_stack_base)
+        if (safe_point == (const RhSafePoint*)0)
+        {
+            const RhCodeRegion* region = rh_find_region(context->ip, 1);
+            usize sp = context->sp;
+            if (region == (const RhCodeRegion*)0)
+                RhpFallbackFailFast(143);
+            rh_unwind_step(context, region);
+            if (context->sp <= sp || context->sp > rh_stack_base)
+                RhpFallbackFailFast(144);
+            depth = depth + 1ul;
+            continue;
+        }
+        if (fp == 0ul || fp > rh_stack_base)
             RhpFallbackFailFast(143);
         if (safe_point->root_count != 0ul && safe_point->roots == (const RhRoot*)0)
             RhpFallbackFailFast(144);
         while (i < safe_point->root_count)
         {
             const RhRoot* root = &safe_point->roots[i];
-            void* value = *(void**)((u8*)fp + root->frame_offset);
-            if (root->kind == RH_ROOT_INTERIOR)
+            void* value;
+            usize kind = root->kind & ~(RH_ROOT_REGISTER | RH_ROOT_STACK_POINTER);
+            if ((root->kind & RH_ROOT_REGISTER) != 0ul)
+            {
+                if ((usize)root->frame_offset >= RH_UNWIND_REGISTER_COUNT)
+                    RhpFallbackFailFast(144);
+                value = (void*)context->registers[(usize)root->frame_offset];
+            }
+            else
+            {
+                usize base = (root->kind & RH_ROOT_STACK_POINTER) != 0ul ? context->sp : fp;
+                value = *(void**)(base + (usize)root->frame_offset);
+            }
+            if (kind == RH_ROOT_INTERIOR)
                 rh_mark_interior(value);
-            else if (root->kind == RH_ROOT_OBJECT)
+            else if (kind == RH_ROOT_OBJECT)
                 rh_mark_object(value);
             else
                 RhpFallbackFailFast(144);
@@ -2482,7 +2507,7 @@ static void rh_mark_thrower_roots(const RhUnwindContext* thrower)
     const RhCodeRegion* region;
     if (rh_find_safe_point(context.ip) == (const RhSafePoint*)0)
     {
-        region = rh_find_region(context.ip);
+        region = rh_find_region(context.ip, 0);
         if (region == (const RhCodeRegion*)0)
             RhpFallbackFailFast(143);
         (void)rh_unwind_frame(&context, region);
@@ -2648,7 +2673,7 @@ static void rh_sweep(void)
     RhpGcPollRequested = 0u;
 }
 
-static void rh_collect(RhUnwindContext* context)
+void RhpCollectFromContext(RhUnwindContext* context)
 {
     if (rh_gc_running != 0)
         return;
@@ -2674,23 +2699,6 @@ static void rh_collect(RhUnwindContext* context)
     } while (rh_interior_batch_count != 0ul);
     rh_sweep();
     rh_gc_running = 0;
-}
-
-static void rh_collect_current(void)
-{
-    RhUnwindContext context;
-    usize i = 0ul;
-    if (RhpCurrentReturnAddress == (const void*)0 || RhpCurrentFramePointer == (void*)0)
-        RhpFallbackFailFast(144);
-    context.ip = RhpCurrentReturnAddress;
-    context.sp = RhpCurrentStackPointer;
-    context.fp = (usize)RhpCurrentFramePointer;
-    while (i < RH_UNWIND_REGISTER_COUNT)
-    {
-        context.registers[i] = 0ul;
-        i = i + 1ul;
-    }
-    rh_collect(&context);
 }
 
 // A block in a larger bucket always fits; the request's own bucket is searched only a few blocks deep
@@ -2780,12 +2788,12 @@ static void* rh_allocate_object_with_zeroing(const RhMethodTable* type, usize gc
     usize maximum = (usize)-1;
 
     if (rh_allocation_debt >= RH_GC_POLL_DEBT_LIMIT)
-        rh_collect_current();
+        RhpCollect();
 
     storage = rh_try_allocate(gc_size);
     if (storage == (void*)0)
     {
-        rh_collect_current();
+        RhpCollect();
         storage = rh_try_allocate(gc_size);
         if (storage == (void*)0)
             RhpFallbackFailFast(141);
@@ -3279,7 +3287,7 @@ int RhpGetObjectHashCode(const RhObject* object)
 void RhpGcPoll(void)
 {
     if (RhpGcPollRequested != 0u)
-        rh_collect_current();
+        RhpCollect();
 }
 
 static const RhMethodTable* rh_require_string(const void* value)

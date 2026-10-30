@@ -226,8 +226,12 @@ namespace Cnidaria.Cs
 
             for (int i = 0; i < node.Operands.Length; i++)
             {
-                if (SsaSlotHelpers.IsContainedLocalFieldAddressUse(node, i))
+                // an object reference in that position is a use
+                if (SsaSlotHelpers.IsContainedLocalFieldAddressUse(node, i) &&
+                    SsaSlotHelpers.TryGetAddressExposedSlot(node.Operands[i], out _))
+                {
                     continue;
+                }
                 CollectOccurrences(info, blockId, statement, node.Operands[i]);
             }
         }

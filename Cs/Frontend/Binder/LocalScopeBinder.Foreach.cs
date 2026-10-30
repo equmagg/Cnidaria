@@ -916,6 +916,11 @@ namespace Cnidaria.Cs
                 diagnostics.Add(unboundConditional.NoNaturalType);
                 return new BoundBadExpression(node);
             }
+            if (expr is BoundUnboundSwitchExpression unboundSwitch)
+            {
+                diagnostics.Add(unboundSwitch.NoNaturalType);
+                return new BoundBadExpression(node);
+            }
             if (expr is BoundUnboundCollectionExpression)
             {
                 diagnostics.Add(new Diagnostic(

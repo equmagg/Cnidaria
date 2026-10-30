@@ -6,24 +6,18 @@ typedef unsigned long usize;
 
 #include <riscv_vector.h>
 
-#define AT_NULL 0ul
-#define AT_FRAMEBUFFER 0x1001ul
-
-#define FB_MAGIC 0x465542454D415246ul
-#define FB_REGISTER_MAGIC 0u
-#define FB_REGISTER_WIDTH 2u
-#define FB_REGISTER_HEIGHT 3u
-#define FB_REGISTER_STRIDE 4u
-#define FB_REGISTER_PIXEL_OFFSET 5u
-#define FB_REGISTER_PIXEL_BYTES 6u
-#define FB_REGISTER_PRESENT 8u
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <linux/fb.h>
 
 #define FB_GLYPH_WIDTH 8u
 #define FB_GLYPH_HEIGHT 8u
 #define FB_FIRST_GLYPH 32u
 #define FB_LAST_GLYPH 126u
 
-static volatile u64* fb_registers;
+static u64 fb_pixel_bytes;
 static u32* fb_pixel_base;
 static u64 fb_pixel_width;
 static u64 fb_pixel_height;
@@ -134,44 +128,40 @@ static const u8 fb_font[(FB_LAST_GLYPH - FB_FIRST_GLYPH + 1u) * FB_GLYPH_HEIGHT]
 
 void __fb_init(int argc, char** argv, char** envp)
 {
-    u64* auxv;
-    u64 window;
-
+    struct fb_fix_screeninfo fixed;
+    struct fb_var_screeninfo mode;
+    void* pixels;
+    int fd;
     (void)argc;
     (void)argv;
-    if (fb_registers != (volatile u64*)0)
+    (void)envp;
+    if (fb_pixel_base != (u32*)0)
         return;
-
-    auxv = (u64*)envp;
-    while (*auxv != 0ul)
-        auxv = auxv + 1;
-    auxv = auxv + 1;
-
-    window = 0ul;
-    while (auxv[0] != AT_NULL)
-    {
-        if (auxv[0] == AT_FRAMEBUFFER)
-            window = auxv[1];
-        auxv = auxv + 2;
-    }
-    if (window == 0ul)
+    fd = open("/dev/fb0", O_RDWR);
+    if (fd < 0)
         return;
-
-    fb_registers = (volatile u64*)window;
-    if (fb_registers[FB_REGISTER_MAGIC] != FB_MAGIC)
+    if (ioctl(fd, FBIOGET_FSCREENINFO, &fixed) < 0 || ioctl(fd, FBIOGET_VSCREENINFO, &mode) < 0 ||
+        fixed.type != FB_TYPE_PACKED_PIXELS || fixed.visual != FB_VISUAL_TRUECOLOR || mode.bits_per_pixel != 32u ||
+        mode.red.offset != 16u || mode.red.length != 8u || mode.green.offset != 8u || mode.green.length != 8u ||
+        mode.blue.offset != 0u || mode.blue.length != 8u || (fixed.line_length & 3u) != 0u)
     {
-        fb_registers = (volatile u64*)0;
+        close(fd);
         return;
     }
-    fb_pixel_base = (u32*)(window + fb_registers[FB_REGISTER_PIXEL_OFFSET]);
-    fb_pixel_width = fb_registers[FB_REGISTER_WIDTH];
-    fb_pixel_height = fb_registers[FB_REGISTER_HEIGHT];
-    fb_row_pixels = fb_registers[FB_REGISTER_STRIDE] / 4ul;
+    pixels = mmap((void*)0, fixed.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (pixels == MAP_FAILED)
+        return;
+    fb_pixel_base = (u32*)pixels;
+    fb_pixel_width = mode.xres;
+    fb_pixel_height = mode.yres;
+    fb_row_pixels = fixed.line_length / 4u;
+    fb_pixel_bytes = fixed.smem_len;
 }
 
 int fb_available(void)
 {
-    return fb_registers != (volatile u64*)0;
+    return fb_pixel_base != (u32*)0;
 }
 
 u64 fb_width(void)
@@ -196,8 +186,8 @@ u32* fb_pixels(void)
 
 void fb_present(void)
 {
-    if (fb_registers != (volatile u64*)0)
-        fb_registers[FB_REGISTER_PRESENT] = 1ul;
+    if (fb_pixel_base != (u32*)0)
+        msync(fb_pixel_base, fb_pixel_bytes, MS_SYNC);
 }
 
 // Eight registers at a time: one store covers the widest group the hardware offers
@@ -227,7 +217,7 @@ static void fb_copy_run(u32* destination, const u32* source, u64 count)
 
 void fb_clear(u32 color)
 {
-    if (fb_registers == (volatile u64*)0)
+    if (fb_pixel_base == (u32*)0)
         return;
     fb_fill_run(fb_pixel_base, fb_row_pixels * fb_pixel_height, color);
 }
@@ -235,7 +225,7 @@ void fb_clear(u32 color)
 void fb_fill_rect(s64 x, s64 y, s64 width, s64 height, u32 color)
 {
     u64 row;
-    if (fb_registers == (volatile u64*)0)
+    if (fb_pixel_base == (u32*)0)
         return;
     if (x < 0l)
     {
@@ -329,7 +319,7 @@ static void fb_console_newline(void)
 
 void fb_console_putc(int character)
 {
-    if (fb_registers == (volatile u64*)0)
+    if (fb_pixel_base == (u32*)0)
         return;
     if (character == 10)
     {

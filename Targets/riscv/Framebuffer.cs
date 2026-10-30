@@ -34,6 +34,7 @@ public sealed class RVFramebuffer
     public int Height { get; }
     public int Stride { get; }
     public byte[] Pixels => _pixels;
+    public int PixelByteLength { get; }
     public ulong WindowSize => checked(RegisterWindowSize + (ulong)_pixels.Length);
 
     /// <summary>Counts the frames the guest has finished, so a host knows when the pixels are worth reading.</summary>
@@ -49,7 +50,9 @@ public sealed class RVFramebuffer
         Width = width;
         Height = height;
         Stride = checked(width * BytesPerPixel);
-        _pixels = new byte[checked(Stride * height)];
+        PixelByteLength = checked(Stride * height);
+        // Device mappings include the complete final page
+        _pixels = new byte[checked((PixelByteLength + 4095) & ~4095)];
     }
 
     public void Reset()
@@ -80,7 +83,7 @@ public sealed class RVFramebuffer
             OffsetHeight => (ulong)Height,
             OffsetStride => (ulong)Stride,
             OffsetPixelOffset => RegisterWindowSize,
-            OffsetPixelBytes => (ulong)_pixels.Length,
+            OffsetPixelBytes => (ulong)PixelByteLength,
             OffsetFrameCount => _frameCount,
             _ => 0UL,
         };

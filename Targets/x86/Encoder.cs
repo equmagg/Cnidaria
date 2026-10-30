@@ -20,38 +20,31 @@ internal static class X86CodeEncoder
         if (target is null)
             throw new ArgumentNullException(nameof(target));
 
-        var symbols = labels?.ToDictionary(kv => kv.Key, kv => (ulong)Math.Max(0, kv.Value), StringComparer.Ordinal);
-        var output = new List<byte>();
-        foreach (var instruction in instructions)
-        {
-            var pc = (ulong)output.Count;
-            output.AddRange(Encode(instruction, target, pc, symbols));
-        }
-        return output.ToArray();
+        return Encode(new X86Program(target, instructions, labels));
     }
 
     public static byte[] Encode(X86Instruction instruction, X86Target target)
         => Encode(instruction, target, 0, null);
 
-    public static byte[] Encode(X86Instruction instruction, X86Target target, ulong pc, IReadOnlyDictionary<string, ulong>? symbols)
+    public static byte[] Encode(X86Instruction instruction, X86Target target, ulong pc, IReadOnlyDictionary<string, ulong>? symbols, List<(int Offset, int Size)>? absoluteRelocations = null)
     {
         if (target is null)
             throw new ArgumentNullException(nameof(target));
 
-        var firstPass = EncodeCore(instruction, target, pc, symbols);
-        return EncodeCore(instruction, target, checked(pc + (ulong)firstPass.Length), symbols);
+        int length = GetEncodedLength(instruction, target);
+        return EncodeCore(instruction, target, checked(pc + (ulong)length), symbols, absoluteRelocations);
     }
 
     public static int GetEncodedLength(X86Instruction instruction, X86Target target)
-        => Encode(instruction, target).Length;
+        => EncodeCore(instruction, target, 0, null).Length;
 
-    private static byte[] EncodeCore(X86Instruction instruction, X86Target target, ulong nextIp, IReadOnlyDictionary<string, ulong>? symbols)
+    private static byte[] EncodeCore(X86Instruction instruction, X86Target target, ulong nextIp, IReadOnlyDictionary<string, ulong>? symbols, List<(int Offset, int Size)>? absoluteRelocations = null)
     {
         if (instruction.Opcode == X86InstrKind.Raw)
             return instruction.RawBytes.ToArray();
 
         var selection = Select(instruction, target);
-        var writer = new X86InstructionWriter();
+        var writer = new X86InstructionWriter(absoluteRelocations);
         switch (selection.Form.Space)
         {
             case X86EncodingSpace.Legacy:
@@ -224,7 +217,7 @@ internal static class X86CodeEncoder
             {
                 if (operand.Kind is not (X86OperandKind.Immediate or X86OperandKind.Symbol))
                     return false;
-                if (spec.Size == 1 ? operand.Size != 1 || operand.Kind != X86OperandKind.Immediate : operand.Size == 1)
+                if (spec.Size == 1 ? operand.Size != 1 : operand.Size == 1)
                     return false;
             }
         }
@@ -503,6 +496,8 @@ internal static class X86CodeEncoder
                     {
                         int width = ImmediateWidth(spec, selection.OperandSize);
                         bool signExtended = spec.SignedByte || spec.Size == X86OperandSpec.SizeZ && selection.OperandSize == 8;
+                        if (operand.Kind == X86OperandKind.Symbol && operand.RelocationKind is not (X86ObjectRelocationKind.Relative8 or X86ObjectRelocationKind.Relative32))
+                            writer.RecordAbsoluteRelocation(width);
                         WriteImmediate(writer, ResolveImmediate(operand, symbols, nextIp), width, signExtended);
                         break;
                     }
@@ -567,6 +562,8 @@ internal static class X86CodeEncoder
             {
                 writer.WriteByte((byte)(((regField & 7) << 3) | 0x05));
             }
+            if (rmOperand.HasSymbol)
+                writer.RecordAbsoluteRelocation(4);
             writer.WriteInt32(checked((int)displacement));
             return;
         }
@@ -582,6 +579,8 @@ internal static class X86CodeEncoder
         var forceDisp8Zero = hasBase && displacement == 0 && baseLow == 5;
         if (!hasBase)
             mod = 0;
+        else if (rmOperand.HasSymbol)
+            mod = 2;
         else if (displacement == 0 && baseLow != 5)
             mod = 0;
         else if (compressed || forceDisp8Zero)
@@ -601,7 +600,11 @@ internal static class X86CodeEncoder
         if (mod == 1)
             writer.WriteInt8((sbyte)(displacement / disp8Scale));
         else if (mod == 2 || !hasBase)
+        {
+            if (rmOperand.HasSymbol)
+                writer.RecordAbsoluteRelocation(4);
             writer.WriteInt32(checked((int)displacement));
+        }
     }
 
     private static void EmitRex(X86InstructionWriter writer, X86Target target, bool w = false, bool r = false, bool x = false, bool b = false, bool force = false)
@@ -631,6 +634,8 @@ internal static class X86CodeEncoder
             return operand.Immediate;
         if (operand.Kind != X86OperandKind.Symbol)
             throw new InvalidOperationException("Operand is not immediate or symbolic");
+        if (symbols is null)
+            return 0;
         var value = checked((long)ResolveSymbol(symbols, operand.Symbol!) + operand.Addend);
         if (operand.RelocationKind is X86ObjectRelocationKind.Relative8 or X86ObjectRelocationKind.Relative32)
             return checked(value - (long)nextIp);
@@ -642,7 +647,7 @@ internal static class X86CodeEncoder
         if (operand.Kind == X86OperandKind.Immediate)
             return operand.Immediate;
         if (operand.Kind == X86OperandKind.Symbol)
-            return checked((long)ResolveSymbol(symbols, operand.Symbol!) + operand.Addend - (long)nextIp);
+            return symbols is null ? 0 : checked((long)ResolveSymbol(symbols, operand.Symbol!) + operand.Addend - (long)nextIp);
         throw new InvalidOperationException("Operand is not a relative branch target");
     }
 
@@ -651,6 +656,8 @@ internal static class X86CodeEncoder
         var value = operand.Displacement;
         if (!operand.HasSymbol)
             return value;
+        if (symbols is null)
+            return 0;
 
         var symbolValue = checked((long)ResolveSymbol(symbols, operand.Symbol!) + operand.Addend);
         if (operand.RelocationKind == X86ObjectRelocationKind.RipRelative32 || operand.IsRipRelative)
@@ -658,10 +665,8 @@ internal static class X86CodeEncoder
         return checked(symbolValue + value);
     }
 
-    private static ulong ResolveSymbol(IReadOnlyDictionary<string, ulong>? symbols, string symbol)
+    private static ulong ResolveSymbol(IReadOnlyDictionary<string, ulong> symbols, string symbol)
     {
-        if (symbols is null)
-            return 0;
         if (symbols.TryGetValue(symbol, out var value))
             return value;
         throw new KeyNotFoundException($"Undefined x86 symbol: {symbol}");
@@ -723,6 +728,14 @@ internal static class X86CodeEncoder
 
     private sealed class X86InstructionWriter
     {
+        private readonly List<(int Offset, int Size)>? _absoluteRelocations;
+
+        public X86InstructionWriter(List<(int Offset, int Size)>? absoluteRelocations = null)
+            => _absoluteRelocations = absoluteRelocations;
+
+        public void RecordAbsoluteRelocation(int size)
+            => _absoluteRelocations?.Add((_bytes.Count, size));
+
         private readonly List<byte> _bytes = new List<byte>();
 
         public void WriteByte(byte value)

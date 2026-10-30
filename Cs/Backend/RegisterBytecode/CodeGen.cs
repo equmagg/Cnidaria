@@ -161,7 +161,7 @@ namespace Cnidaria.Cs
                             RuntimeType delegateType = node.RuntimeType ?? node.Type ?? throw new InvalidOperationException("NewDelegate node has no delegate type.");
                             RuntimeMethod target = node.Method ?? throw new InvalidOperationException("NewDelegate node has no target method.");
                             RuntimeMethod invoke = ResolveDelegateInvoke(delegateType);
-                            bool closed = node.Uses.Length != 0;
+                            bool closed = node.IsClosedNewDelegate;
                             state.EnsureDelegateTargetThunk(asm, delegateType, invoke, target, closed);
                         }
                         else if (node.TreeKind == GenTreeKind.DelegateInvoke)
@@ -306,6 +306,7 @@ namespace Cnidaria.Cs
                 LoadSavedAbiSliceToRegister(incoming.LogicalArguments[0].Slices[0], saveOffset, Scratch0);
                 _asm.Emit(InstrDesc.Mem(Op.LdPtr, Scratch1, Scratch0, layout.DelegateMethodPtrOffset,
                     aux: Aux.Memory(0, AlignLog2(PtrSize), MemoryBase.Register)));
+                EmitGcSafePoint(incoming, saveOffset);
                 EmitIndirectCallFor(incoming.Method, Scratch1);
             }
 
@@ -332,6 +333,7 @@ namespace Cnidaria.Cs
                     aux: Aux.Memory(0, AlignLog2(PtrSize), MemoryBase.Register)));
                 StoreRegisterToSavedEntity(Scratch0, incoming.LogicalArguments[0], saveOffset);
                 RestoreAbiBundle(incoming, saveOffset);
+                EmitGcSafePoint(incoming, saveOffset, listOffset);
                 EmitIndirectCallFor(incoming.Method, Scratch2);
                 LoadFrameToRegister(Scratch3, RegisterClass.General, indexOffset, 4);
                 _asm.I32AddImm(Scratch3, Scratch3, 1);
@@ -363,15 +365,18 @@ namespace Cnidaria.Cs
 
                 SaveAbiBundle(incoming, incomingSaveOffset);
                 MaterializeTargetArguments(info, delegateLayout, incoming, incomingSaveOffset, targetAbi, targetSaveOffset);
-                RestoreAbiBundle(targetAbi, targetSaveOffset);
 
                 if (RequiresTypeInitializationBeforeCall(target))
                 {
                     int declaringLayout = _asm.InternTypeLayout(target.DeclaringType);
+                    EmitGcSafePoint(targetAbi, targetSaveOffset);
                     _asm.Emit(InstrDesc.Li(Op.LiStaticBase, Scratch0, declaringLayout,
                         Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow)));
                 }
 
+                // Type initialization can relocate the roots in the saved argument area
+                RestoreAbiBundle(targetAbi, targetSaveOffset);
+                EmitGcSafePoint(targetAbi, targetSaveOffset);
                 EmitCallForTarget(target, targetAbi.CallFlags);
                 EmitReturnFor(target);
 
@@ -426,6 +431,48 @@ namespace Cnidaria.Cs
 
             private void EmitIndirectCallFor(RuntimeMethod invoke, MachineRegister target)
                 => _asm.Emit(new InstrDesc(Op.CallIndirect, rs1: RegisterVmIsa.EncodeRegister(target), aux: Aux.Call(BuildCallFlagsForSignature(invoke))));
+
+            private void EmitGcSafePoint(AbiBundle bundle, int saveOffset, int listOffset = -1)
+            {
+                int rootStart = _state.GcRootCount;
+                if (bundle.HiddenReturnBuffer is AbiEntity returnBuffer)
+                    EmitSavedEntityRoots(returnBuffer, saveOffset);
+                foreach (AbiEntity argument in bundle.LogicalArguments)
+                    EmitSavedEntityRoots(argument, saveOffset);
+
+                // The current leaf delegate does not keep the invocation list alive
+                if (listOffset >= 0)
+                    EmitFrameRoot(GcRootKind.FrameRef, listOffset, -1, 0);
+
+                _asm.AddGcSafePoint(new GcSafePointRecord(_asm.Pc, rootStart, _state.GcRootCount - rootStart));
+            }
+
+            private void EmitSavedEntityRoots(AbiEntity entity, int saveOffset)
+            {
+                RuntimeType? type = entity.Type;
+                if (type is not null && !type.IsReferenceType &&
+                    type.Kind is not (RuntimeTypeKind.ByRef or RuntimeTypeKind.TypeParam) && !type.ContainsGcPointers)
+                    return;
+
+                AbiSlice first = entity.Slices[0];
+                int frameOffset = checked(saveOffset + first.SaveOffset - first.Offset);
+                if (type is null || type.Kind == RuntimeTypeKind.ByRef)
+                    EmitFrameRoot(GcRootKind.FrameByRef, frameOffset, type?.TypeId ?? -1, 0);
+                else if (type.IsReferenceType || type.Kind == RuntimeTypeKind.TypeParam)
+                    EmitFrameRoot(GcRootKind.FrameRef, frameOffset, type.TypeId, 0);
+                else
+                {
+                    foreach (int offset in type.GcPointerOffsets)
+                        EmitFrameRoot(GcRootKind.FrameRef, frameOffset, type.TypeId, offset);
+                }
+            }
+
+            private void EmitFrameRoot(GcRootKind kind, int frameOffset, int runtimeTypeId, int cellOffset)
+            {
+                _asm.AddGcRoot(new GcRootRecord(kind, MachineRegister.Invalid, frameOffset, PtrSize,
+                    runtimeTypeId, cellOffset, GcRootFlags.None, RegisterFrameBase.StackPointer));
+                _state.GcRootCount++;
+            }
 
             private void EmitReturnFor(RuntimeMethod method)
             {
@@ -1417,6 +1464,17 @@ namespace Cnidaria.Cs
             {
                 var source = instruction;
 
+                if (instruction.TreeKind is GenTreeKind.StoreLocal or GenTreeKind.StoreArg or GenTreeKind.StoreTemp &&
+                    IsContainedDefaultValue(instruction, 0))
+                {
+                    RuntimeType? localType = source.LocalDescriptor?.Type ?? source.RuntimeType ?? source.Type;
+                    GenStackKind localKind = source.LocalDescriptor?.StackKind ?? source.StackKind;
+                    RegisterOperand home = FrameSlotOperandForLocalLike(source, localType, localKind, RegisterClass.General);
+                    EmitAddressOf(MachineRegisters.ParallelCopyScratch1, home);
+                    EmitInitAggregateAddress(MachineRegisters.ParallelCopyScratch1, localType, localKind, StorageSizeOf(localType, localKind, home));
+                    return;
+                }
+
                 if (instruction.Results.Length > 1 || instruction.Uses.Length > 1)
                 {
                     if (instruction.Uses.Length == 0 &&
@@ -1983,8 +2041,8 @@ namespace Cnidaria.Cs
                     case NumericConvKind.U4:
                     case NumericConvKind.NativeUInt:
                         if (fromI64) op = CheckedI64ToU32Op(checkedConversion, fromUnsigned);
-                        else if (fromF32) op = checkedConversion ? Op.F32ToI32Ovf : Op.F32ToI32;
-                        else if (fromF64) op = checkedConversion ? Op.F64ToI32Ovf : Op.F64ToI32;
+                        else if (fromF32) op = checkedConversion ? Op.F32ToU32Ovf : Op.F32ToI32;
+                        else if (fromF64) op = checkedConversion ? Op.F64ToU32Ovf : Op.F64ToI32;
                         break;
                     case NumericConvKind.I8:
                         if (fromI32) op = fromUnsigned ? Op.U32ToI64 : Op.I32ToI64;
@@ -1993,8 +2051,8 @@ namespace Cnidaria.Cs
                         break;
                     case NumericConvKind.U8:
                         if (fromI32) op = fromUnsigned ? Op.U32ToI64 : Op.I32ToI64;
-                        else if (fromF32) op = checkedConversion ? Op.F32ToI64Ovf : Op.F32ToI64;
-                        else if (fromF64) op = checkedConversion ? Op.F64ToI64Ovf : Op.F64ToI64;
+                        else if (fromF32) op = checkedConversion ? Op.F32ToU64Ovf : Op.F32ToI64;
+                        else if (fromF64) op = checkedConversion ? Op.F64ToU64Ovf : Op.F64ToI64;
                         break;
                     case NumericConvKind.R4:
                         if (fromI64)
@@ -2491,6 +2549,12 @@ namespace Cnidaria.Cs
                 int delegateTypeLayoutIndex = _asm.InternTypeLayout(delegateType);
                 var result = RequireResultRegister(instruction);
 
+                if (source.IsNewDelegateInPlace)
+                {
+                    EmitNewDelegateInPlace(instruction, source, delegateType, targetMethod, delegateTypeLayoutIndex, result);
+                    return;
+                }
+
                 if (instruction.Uses.Length == 0)
                 {
                     _asm.NewDelegate(result, delegateTypeLayoutIndex, _state.DelegateTargetThunkLabel(delegateType, targetMethod, closed: false));
@@ -2502,6 +2566,31 @@ namespace Cnidaria.Cs
 
                 MachineRegister target = RequireUseRegister(instruction, 0);
                 _asm.NewDelegateClosed(result, target, delegateTypeLayoutIndex, _state.DelegateTargetThunkLabel(delegateType, targetMethod, closed: true));
+            }
+
+            private void EmitNewDelegateInPlace(GenTree instruction, GenTree source, RuntimeType delegateType, RuntimeMethod targetMethod, int delegateTypeLayoutIndex, MachineRegister result)
+            {
+                bool closed = source.IsClosedNewDelegate;
+                if (instruction.Uses.Length != (closed ? 2 : 1))
+                    throw Unsupported(instruction, "in-place delegate construction has an unexpected operand count");
+
+                TypeLayoutRecord layout = _asm.GetTypeLayoutRecord(delegateTypeLayoutIndex);
+                int pointerSize = TargetArchitecture.PointerSize;
+                Op storePointer = SelectStoreOpForStorage(null, GenStackKind.NativeInt, RegisterClass.General, pointerSize);
+                MachineRegister instance = RequireUseRegister(instruction, instruction.Uses.Length - 1);
+                MachineRegister target = closed ? RequireUseRegister(instruction, 0) : MachineRegister.X0;
+                MachineRegister scratch = PickScratchRegister(instruction, RegisterClass.General, instance, target);
+
+                _asm.LiI32(scratch, delegateType.TypeId);
+                _asm.Emit(InstrDesc.Mem(SelectStoreOpForStorage(null, GenStackKind.I4, RegisterClass.General, 4), scratch, instance, 0));
+                _asm.Emit(InstrDesc.Mem(storePointer, target, instance, layout.DelegateTargetOffset));
+                _asm.LoadLabelAddress(scratch, _state.DelegateTargetThunkLabel(delegateType, targetMethod, closed));
+                _asm.Emit(InstrDesc.Mem(storePointer, scratch, instance, layout.DelegateMethodPtrOffset));
+                _asm.Emit(InstrDesc.Mem(storePointer, MachineRegister.X0, instance, layout.DelegateInvocationListOffset));
+                _asm.LiI32(scratch, 1);
+                _asm.Emit(InstrDesc.Mem(storePointer, scratch, instance, layout.DelegateInvocationCountOffset));
+                if (result != instance)
+                    _asm.MovPtr(result, instance);
             }
 
             private void EmitDelegateBinary(GenTree instruction, Op op)
@@ -2991,7 +3080,7 @@ namespace Cnidaria.Cs
                 if (instruction.TreeKind == GenTreeKind.StoreStaticField)
                 {
                     ushort aux = MemoryAuxForRegisterBase(field.FieldType, StaticFieldStoreInstructionFlags(field.FieldType));
-                    MachineRegister address = PickScratchRegister(instruction, RegisterClass.General);
+                    MachineRegister address = PickScratchRegister(instruction, RegisterClass.General, MachineRegisters.BackendScratch);
                     EmitStaticBase(address, declaringTypeLayout);
 
                     if (TryEmitDefaultStaticFieldStore(instruction, source, field, declaringTypeLayout, address, fieldOffset, fieldSize, aux))
@@ -3008,7 +3097,8 @@ namespace Cnidaria.Cs
                                 valueUseIndex,
                                 field.FieldType,
                                 valueKind,
-                                "static-field store value");
+                                "static-field store value",
+                                address);
                             EmitCopyAddressToAddress(field.FieldType, valueKind, address, valueAddress, fieldSize, StaticFieldStoreInstructionFlags(field.FieldType), fieldOffset);
                             return;
                         }
@@ -3036,7 +3126,8 @@ namespace Cnidaria.Cs
                             valueUseIndex,
                             field.FieldType,
                             singleValueKind,
-                            "static-field store value");
+                            "static-field store value",
+                            address);
                         EmitCopyAddressToAddress(field.FieldType, singleValueKind, address, valueAddress, fieldSize, StaticFieldStoreInstructionFlags(field.FieldType), fieldOffset);
                         return;
                     }
@@ -3115,6 +3206,15 @@ namespace Cnidaria.Cs
 
                     _asm.Emit(InstrDesc.Mem(SelectLoadOpForStorage(type, source.StackKind, RequireSingleResult(instruction).RegisterClass, 0), RequireResultRegister(instruction),
                         addressRegister, 0, aux: MemoryAuxForRegisterBase(type, nullCheckFlags)));
+                    return;
+                }
+
+                if (IsContainedDefaultValue(instruction, 1))
+                {
+                    var zeroedType = StoreTargetType(instruction, source, 1) ?? type;
+                    var zeroedKind = StoreTargetKind(instruction, source, zeroedType, 1);
+                    MachineRegister zeroedAddress = RequireUseRegister(instruction, RequireCodegenUseIndexForOperand(instruction, source, 0, "indirect store address"));
+                    EmitInitAggregateAddress(zeroedAddress, zeroedType, zeroedKind, StorageSizeOf(zeroedType, zeroedKind));
                     return;
                 }
 
@@ -4038,7 +4138,9 @@ namespace Cnidaria.Cs
                     Op.I32ToI8Ovf or Op.U32ToI8Ovf or Op.I32ToU8Ovf or Op.U32ToU8Ovf or
                     Op.I32ToI16Ovf or Op.U32ToI16Ovf or Op.I32ToU16Ovf or Op.U32ToU16Ovf or
                     Op.F32ToI32Ovf or Op.F32ToI64Ovf or
-                    Op.F64ToI32Ovf or Op.F64ToI64Ovf)
+                    Op.F64ToI32Ovf or Op.F64ToI64Ovf or
+                    Op.F32ToU32Ovf or Op.F32ToU64Ovf or
+                    Op.F64ToU32Ovf or Op.F64ToU64Ovf)
                     return true;
 
                 return source.Kind is GenTreeKind.Conv or GenTreeKind.CastClass or GenTreeKind.UnboxAny
@@ -4734,6 +4836,12 @@ namespace Cnidaria.Cs
                     ? InstructionFlags.NoNullCheck
                     : InstructionFlags.None;
 
+            private static bool IsContainedDefaultValue(GenTree instruction, int operandIndex)
+                => (uint)operandIndex < (uint)instruction.Operands.Length &&
+                   operandIndex < instruction.OperandFlags.Length &&
+                   (instruction.OperandFlags[operandIndex] & LirOperandFlags.Contained) != 0 &&
+                   instruction.Operands[operandIndex].Kind == GenTreeKind.DefaultValue;
+
             private static ushort WithAssertionFlags(GenTree node, ushort aux)
             {
                 InstructionFlags flags = InstructionFlags.None;
@@ -4741,6 +4849,8 @@ namespace Cnidaria.Cs
                     flags |= InstructionFlags.NoNullCheck;
                 if ((node.Flags & GenTreeFlags.BoundsCheckEliminated) != 0)
                     flags |= InstructionFlags.NoBoundsCheck;
+                if ((node.Flags & GenTreeFlags.TargetNotOnHeap) != 0)
+                    aux = (ushort)(aux & ~(ushort)InstructionFlags.WriteBarrier);
                 return (ushort)(aux | (ushort)flags);
             }
 

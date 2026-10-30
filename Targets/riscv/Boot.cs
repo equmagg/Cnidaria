@@ -4,6 +4,7 @@ using System.Collections.Immutable;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace Cnidaria.RiscV;
@@ -89,6 +90,7 @@ public sealed class RiscVDeviceTreeLayout
     public uint FramebufferWidth { get; set; } = 640;
     public uint FramebufferHeight { get; set; } = 480;
     public uint TimebaseFrequency { get; set; } = 10000000;
+    public DateTimeOffset? RealtimeEpoch { get; set; }
     public uint BootHartId { get; set; } = 0;
 }
 
@@ -361,6 +363,13 @@ public static class RiscVZBoot
         fdt.EndNode();
 
         fdt.BeginNode("chosen");
+        fdt.Prop("rng-seed", RandomNumberGenerator.GetBytes(32));
+        DateTimeOffset epoch = layout.RealtimeEpoch ?? DateTimeOffset.UtcNow;
+        if (epoch < DateTimeOffset.UnixEpoch)
+            throw new ArgumentOutOfRangeException(nameof(layout.RealtimeEpoch));
+        ulong seconds = (ulong)epoch.ToUnixTimeSeconds();
+        uint nanoseconds = (uint)((epoch.UtcTicks - DateTimeOffset.UnixEpoch.UtcTicks) % TimeSpan.TicksPerSecond * 100);
+        fdt.PropU32("cnidaria,unix-time", (uint)(seconds >> 32), (uint)seconds, nanoseconds);
         fdt.PropString("stdout-path", "serial0:115200n8");
         fdt.PropString("bootargs", "console=ttyS0");
         fdt.PropU32("boot-hartid", layout.BootHartId);
@@ -432,7 +441,7 @@ public static class RiscVZBoot
             fdt.PropReg(layout.FramebufferBase, layout.FramebufferSize);
             fdt.PropU32("width", layout.FramebufferWidth);
             fdt.PropU32("height", layout.FramebufferHeight);
-            fdt.PropString("format", "a8r8g8b8");
+            fdt.PropString("format", "x8r8g8b8");
             fdt.EndNode();
         }
 
@@ -955,7 +964,7 @@ internal sealed class RiscVFlattenedDeviceTreeBuilder
         return result.ToArray();
     }
 
-    private void Prop(string name, byte[] data)
+    public void Prop(string name, byte[] data)
     {
         var nameOffset = GetStringOffset(name);
         WriteU32(_structure, FdtProp);
@@ -1223,11 +1232,11 @@ public static class RiscVUserland
     {
         var program = LinkLibraryObject(
             new[] { new Cnidaria.C.SourceFile("riscv/os/fblib.c", FramebufferLibrarySource) },
-            ImmutableArray<string>.Empty,
+            SharedStandardLibraryExports,
             FramebufferLibrarySoName,
             Cnidaria.C.TargetInfo.RVA32Linux);
         return new SharedObjectArtifact(
-            RiscVElfWriter.WriteSharedObject(program, FramebufferLibrarySoName, initSymbol: "__fb_init"),
+            RiscVElfWriter.WriteSharedObject(program, FramebufferLibrarySoName, [StandardLibrarySoName], initSymbol: "__fb_init"),
             ExportedNames(program));
     }
 

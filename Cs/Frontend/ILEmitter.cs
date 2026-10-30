@@ -1570,7 +1570,11 @@ namespace Cnidaria.Cs
                 }
                 else
                 {
-                    ILOpCode op = thisIsManagedByRef || isBaseReceiver || !requiresVirtualDispatch ? ILOpCode.Call : ILOpCode.Callvirt;
+                    // callvirt carries the null check an instance call owes even when it dispatches statically
+                    bool receiverNeverNull = call.ReceiverOpt is null or BoundThisExpression or BoundObjectCreationExpression;
+                    ILOpCode op = method.IsStatic || thisIsManagedByRef || isBaseReceiver || (!requiresVirtualDispatch && receiverNeverNull)
+                        ? ILOpCode.Call
+                        : ILOpCode.Callvirt;
                     _il.EmitToken(op, _tokens.GetMethodToken(method), pop, push);
                 }
 

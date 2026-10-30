@@ -2805,6 +2805,7 @@ namespace Cnidaria.Cs
         UnboundImplicitObjectCreation,
         UnboundCollectionExpression,
         UnboundConditional,
+        UnboundSwitch,
         ObjectCreation,
         LabelExpression,
         ArrayInitializer,

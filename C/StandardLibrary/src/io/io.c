@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #if defined(__linux__)
@@ -14,6 +15,8 @@
 #if defined(__x86_64__)
 #define __NR_read 0
 #define __NR_write 1
+#define __NR_readv 19
+#define __NR_writev 20
 #define __NR_close 3
 #define __NR_fstat 5
 #define __NR_lseek 8
@@ -34,6 +37,8 @@
 #elif defined(__i386__)
 #define __NR_read 3
 #define __NR_write 4
+#define __NR_readv 145
+#define __NR_writev 146
 #define __NR_close 6
 #define __NR_chdir 12
 #define __NR_lseek 19
@@ -53,6 +58,8 @@
 #elif defined(__arm__)
 #define __NR_read 3
 #define __NR_write 4
+#define __NR_readv 145
+#define __NR_writev 146
 #define __NR_close 6
 #define __NR_chdir 12
 #define __NR_lseek 19
@@ -86,6 +93,8 @@
 #define __NR_ppoll 73
 #define __NR_read 63
 #define __NR_write 64
+#define __NR_readv 65
+#define __NR_writev 66
 #define __NR_fsync 82
 #define __NR_newfstatat 79
 #define __NR_fstat 80
@@ -177,6 +186,16 @@ ssize_t read(int descriptor, void* buffer, size_t count)
 ssize_t write(int descriptor, const void* buffer, size_t count)
 {
     return (ssize_t)__sys_result(__sys(__NR_write, (long)descriptor, (long)(uintptr_t)buffer, (long)count, 0, 0, 0));
+}
+
+ssize_t readv(int descriptor, const struct iovec* vectors, int count)
+{
+    return (ssize_t)__sys_result(__sys(__NR_readv, (long)descriptor, (long)(uintptr_t)vectors, count, 0, 0, 0));
+}
+
+ssize_t writev(int descriptor, const struct iovec* vectors, int count)
+{
+    return (ssize_t)__sys_result(__sys(__NR_writev, (long)descriptor, (long)(uintptr_t)vectors, count, 0, 0, 0));
 }
 
 int close(int descriptor)

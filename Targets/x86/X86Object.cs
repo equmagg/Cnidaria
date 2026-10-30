@@ -7,6 +7,42 @@ namespace Cnidaria.X86;
 
 internal static class X86ObjectLinker
 {
+    internal static X86Program RedirectDataImports(X86Program program, ImmutableArray<string> dataImports)
+    {
+        if (dataImports.Length == 0)
+            return program;
+
+        var imports = dataImports.ToImmutableHashSet(StringComparer.Ordinal);
+        var instructions = program.Text.Instructions.ToBuilder();
+        for (var i = 0; i < instructions.Count; i++)
+        {
+            var instruction = instructions[i];
+            if (!new[] { instruction.Operand0, instruction.Operand1, instruction.Operand2, instruction.Operand3 }.Any(operand => operand.IsRipRelative && operand.Symbol is string name && imports.Contains(name)))
+                continue;
+
+            var source = instruction.Operand1;
+            if (instruction.Opcode != X86InstrKind.Lea ||
+                !source.IsRipRelative ||
+                source.Symbol is null ||
+                !imports.Contains(source.Symbol) ||
+                source.Addend != 0)
+            {
+                throw new NotSupportedException(
+                    $"An imported data object is addressed in place rather than through its address: {source.Symbol ?? "?"}");
+            }
+
+            instructions[i] = X86Instruction.Binary(X86InstrKind.Mov, instruction.Operand0, source);
+        }
+
+        return new X86Program(
+            program.Target,
+            new X86TextSection(instructions.ToImmutable(), program.Text.Labels, program.Text.Relocations),
+            program.DataSections,
+            program.Symbols,
+            program.EntrySymbol,
+            program.Imports);
+    }
+
     public static X86LinkedImage LinkFlat(
         X86Program obj,
         ulong imageBase = 0,
@@ -15,6 +51,7 @@ internal static class X86ObjectLinker
         if (obj is null)
             throw new ArgumentNullException(nameof(obj));
 
+        obj = RelaxBranches(obj, externalSymbols?.Keys);
         var textSize = ComputeTextSize(obj.Text, obj.Target);
         var sections = LayoutSections(obj, textSize, imageBase);
         var symbols = BuildSymbolAddressMap(obj, sections, externalSymbols);
@@ -29,6 +66,146 @@ internal static class X86ObjectLinker
         var entryAddress = string.IsNullOrEmpty(obj.EntrySymbol) ? imageBase : ResolveSymbol(symbols, obj.EntrySymbol);
         var entryOffset = checked((int)(entryAddress - imageBase));
         return new X86LinkedImage(obj, imageBase, entryAddress, entryOffset, sections, symbols, image);
+    }
+
+    internal static X86Program RelaxBranches(X86Program obj, IEnumerable<string>? fixedSymbols = null)
+    {
+        var instructions = obj.Text.Instructions;
+        var offsets = new int[instructions.Length + 1];
+        for (int i = 0; i < instructions.Length; i++)
+            offsets[i + 1] = checked(offsets[i] + X86CodeEncoder.GetEncodedLength(instructions[i], obj.Target));
+
+        var targets = new Dictionary<string, int>(obj.Text.Labels, StringComparer.Ordinal);
+        foreach (var symbol in obj.Symbols)
+        {
+            if (symbol.Binding == X86ObjectSymbolBinding.External || string.IsNullOrEmpty(symbol.SectionName))
+                continue;
+            if (symbol.SectionName == ".text")
+                targets[symbol.Name] = symbol.Offset;
+            else
+                targets.Remove(symbol.Name);
+        }
+        if (fixedSymbols is not null)
+        {
+            foreach (string name in fixedSymbols)
+                targets.Remove(name);
+        }
+
+        var candidates = new List<(int Index, int Target)>();
+        for (int i = 0; i < instructions.Length; i++)
+        {
+            var instruction = instructions[i];
+            var operand = instruction.Operand0;
+            if (instruction.Opcode is X86InstrKind.Jmp or X86InstrKind.Jcc &&
+                operand.Kind == X86OperandKind.Symbol && operand.Size != 1 &&
+                operand.RelocationKind == X86ObjectRelocationKind.Relative32 && operand.Addend == 0 &&
+                targets.TryGetValue(operand.Symbol!, out int target) && target >= 0 && target <= offsets[^1])
+                candidates.Add((i, target));
+        }
+        if (candidates.Count == 0)
+            return obj;
+
+        var protectedInstructions = new bool[instructions.Length];
+        foreach (int offset in obj.Text.Labels.Values)
+            ProtectAnchor(offset);
+        foreach (var symbol in obj.Symbols)
+        {
+            if (symbol.Binding == X86ObjectSymbolBinding.External || symbol.SectionName != ".text")
+                continue;
+            ProtectAnchor(symbol.Offset);
+            ProtectAnchor(checked(symbol.Offset + symbol.Size));
+        }
+        foreach (var relocation in obj.Text.Relocations)
+        {
+            int width = relocation.Kind switch
+            {
+                X86ObjectRelocationKind.Relative8 => 1,
+                X86ObjectRelocationKind.Absolute64 => 8,
+                X86ObjectRelocationKind.AbsolutePointer => obj.Target.XLen / 8,
+                _ => 4,
+            };
+            int end = checked(relocation.Offset + width);
+            for (int i = FindInstruction(relocation.Offset); i < instructions.Length && offsets[i] < end; i++)
+                protectedInstructions[i] = true;
+        }
+
+        var shortBranches = new bool[instructions.Length];
+        var currentOffsets = (int[])offsets.Clone();
+        bool changed;
+        bool relaxed = false;
+        do
+        {
+            changed = false;
+            foreach (var candidate in candidates)
+            {
+                int index = candidate.Index;
+                if (protectedInstructions[index] || shortBranches[index])
+                    continue;
+                int displacement = MapOffset(candidate.Target) - currentOffsets[index] - 2;
+                // A forward target moves by the branch's own size reduction
+                if (candidate.Target >= offsets[index + 1])
+                    displacement -= offsets[index + 1] - offsets[index] - 2;
+                if (displacement < sbyte.MinValue || displacement > sbyte.MaxValue)
+                    continue;
+                shortBranches[index] = true;
+                changed = true;
+            }
+            if (changed)
+            {
+                relaxed = true;
+                for (int i = 0; i < instructions.Length; i++)
+                    currentOffsets[i + 1] = checked(currentOffsets[i] + (shortBranches[i] ? 2 : offsets[i + 1] - offsets[i]));
+            }
+        }
+        while (changed);
+        if (!relaxed)
+            return obj;
+
+        var rewritten = instructions.ToBuilder();
+        foreach (var candidate in candidates)
+        {
+            int index = candidate.Index;
+            if (!shortBranches[index])
+                continue;
+            var operand = instructions[index].Operand0;
+            rewritten[index] = instructions[index].WithOperand0(operand.WithSize(1).WithSymbol(operand.Symbol!, X86ObjectRelocationKind.Relative8, 0));
+        }
+        var labels = obj.Text.Labels.ToDictionary(static label => label.Key, label => MapOffset(label.Value), StringComparer.Ordinal);
+        var relocations = obj.Text.Relocations.Select(relocation => new X86ObjectRelocation(
+            relocation.SectionName, MapOffset(relocation.Offset), relocation.SymbolName, relocation.Addend, relocation.Kind)).ToImmutableArray();
+        var symbols = obj.Symbols.Select(symbol => symbol.Binding != X86ObjectSymbolBinding.External && symbol.SectionName == ".text"
+            ? new X86ObjectSymbol(symbol.Name, symbol.SectionName, MapOffset(symbol.Offset),
+                MapOffset(checked(symbol.Offset + symbol.Size)) - MapOffset(symbol.Offset), symbol.Binding, symbol.Kind, symbol.IsTentative)
+            : symbol).ToImmutableArray();
+        return new X86Program(obj.Target, new X86TextSection(rewritten, labels, relocations), obj.DataSections, symbols, obj.EntrySymbol, obj.Imports);
+
+        int FindInstruction(int offset)
+        {
+            int low = 0;
+            int high = offsets.Length;
+            while (low < high)
+            {
+                int middle = low + (high - low) / 2;
+                if (offsets[middle] <= offset)
+                    low = middle + 1;
+                else
+                    high = middle;
+            }
+            return Math.Max(0, low - 1);
+        }
+
+        void ProtectAnchor(int offset)
+        {
+            int index = FindInstruction(offset);
+            if (index < instructions.Length && offset != offsets[index])
+                protectedInstructions[index] = true;
+        }
+
+        int MapOffset(int offset)
+        {
+            int index = FindInstruction(offset);
+            return checked(currentOffsets[index] + offset - offsets[index]);
+        }
     }
 
     private static int ComputeTextSize(X86TextSection text, X86Target target)
@@ -402,7 +579,8 @@ public static class X86ObjectComposer
             new X86TextSection(instructions.ToImmutable(), labels, textRelocations.ToImmutable()),
             dataSections.ToImmutable(),
             symbols.ToImmutable(),
-            Rename(renames[0], primary.EntrySymbol));
+            Rename(renames[0], primary.EntrySymbol),
+            PeImport.Merge(inputs.SelectMany(static input => input.Imports)));
     }
 
     private static int ComputeTextSize(X86Program program)

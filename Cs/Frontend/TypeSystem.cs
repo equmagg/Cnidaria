@@ -17,6 +17,7 @@ namespace Cnidaria.Cs
         private readonly Dictionary<int, string> _sigKeyCache = new();
         private readonly Dictionary<int, CilMethodBody?> _cilBodies = new();
         private Dictionary<int, int>? _fieldRvaByRid;
+        private Dictionary<int, int>? _constantRidByParent;
         private readonly Dictionary<int, int> _enclosingByNestedRid = new();
         private readonly Dictionary<int, (string ns, string name)> _fullTypeNameCache = new();
         public RuntimeModule(string name, EcmaMetadata md)
@@ -41,6 +42,18 @@ namespace Cnidaria.Cs
                 }
             }
             return _fieldRvaByRid.TryGetValue(fieldRid, out int rva) ? rva : 0;
+        }
+
+        internal ReadOnlySpan<byte> GetConstantValue(int parentToken)
+        {
+            if (_constantRidByParent is null)
+            {
+                _constantRidByParent = new Dictionary<int, int>();
+                int count = Md.GetRowCount(MetadataTableKind.Constant);
+                for (int rid = 1; rid <= count; rid++)
+                    _constantRidByParent[Md.GetConstant(rid).ParentToken] = rid;
+            }
+            return Md.GetBlob(Md.GetConstant(_constantRidByParent[parentToken]).Value);
         }
 
         // ECMA-335 II.22.8 keeps ClassLayout sorted by Parent.
@@ -1357,6 +1370,8 @@ namespace Cnidaria.Cs
                 throw new TypeLoadException($"RuntimeType id {typeId} not found.");
             return t;
         }
+        internal bool TryGetTypeById(int typeId, [NotNullWhen(true)] out RuntimeType? type)
+            => _typeById.TryGetValue(typeId, out type);
         internal RuntimeType[] SnapshotKnownTypes()
         {
             var result = new RuntimeType[_typeById.Count];
@@ -1367,6 +1382,122 @@ namespace Cnidaria.Cs
         }
         internal RuntimeType GetByRefType(RuntimeType elementType)
             => GetOrCreateByRefType(elementType);
+        // Frame storage of an array allocated on the stack: header and elements as one opaque block
+        internal RuntimeType GetArrayLayoutType(RuntimeType arrayType, int length)
+        {
+            if (arrayType is null) throw new ArgumentNullException(nameof(arrayType));
+            RuntimeType elementType = arrayType.ElementType ?? throw new ArgumentException("Array type has no element type.", nameof(arrayType));
+            if (!arrayType.IsSzArray || !(elementType.IsValueType || elementType.IsReferenceType) || length < 0)
+                throw new ArgumentException("Only single-dimensional arrays of values or references have a frame layout.", nameof(arrayType));
+
+            string key = $"arrlayout:{arrayType.TypeId}:{length}";
+            if (_constructedTypes.TryGetValue(key, out RuntimeType? t))
+                return t;
+
+            EnsureLayout(elementType);
+            int align = Math.Max(Target.PointerSize, elementType.AlignOf);
+            int stride = elementType.IsReferenceType ? Target.PointerSize : Math.Max(1, elementType.SizeOf);
+            int size = AlignUp(checked(Target.ArrayDataOffset + length * stride), align);
+            int[] elementGcOffsets = elementType.IsReferenceType ? new[] { 0 } : elementType.GcPointerOffsets;
+            int[] gcOffsets = new int[checked(length * elementGcOffsets.Length)];
+            for (int i = 0; i < length; i++)
+            {
+                for (int g = 0; g < elementGcOffsets.Length; g++)
+                    gcOffsets[i * elementGcOffsets.Length + g] = Target.ArrayDataOffset + i * stride + elementGcOffsets[g];
+            }
+            t = new RuntimeType(_nextTypeId++, RuntimeTypeKind.Struct, arrayType.AssemblyName, arrayType.Namespace, $"{elementType.Name}[{length}]")
+            {
+                BaseType = SystemValueType,
+                IsFinal = true,
+                SizeOf = size,
+                AlignOf = align,
+                InstanceSize = size,
+                ClassSize = size,
+                GcPointerOffsets = gcOffsets,
+                ContainsGcPointers = gcOffsets.Length != 0,
+            };
+
+            _constructedTypes[key] = t;
+            _typeById[t.TypeId] = t;
+            _layoutDone.Add(t.TypeId);
+            return t;
+        }
+        // Frame storage of a boxed value allocated on the stack
+        internal RuntimeType GetBoxLayoutType(RuntimeType valueType)
+        {
+            if (valueType is null) throw new ArgumentNullException(nameof(valueType));
+            if (!valueType.IsValueType)
+                throw new ArgumentException("Only value types are boxed.", nameof(valueType));
+
+            string key = $"boxlayout:{valueType.TypeId}";
+            if (_constructedTypes.TryGetValue(key, out RuntimeType? t))
+                return t;
+
+            EnsureLayout(valueType);
+            int header = Target.ManagedObjectHeaderSize;
+            int[] gcOffsets = new int[valueType.GcPointerOffsets.Length];
+            for (int i = 0; i < gcOffsets.Length; i++)
+                gcOffsets[i] = header + valueType.GcPointerOffsets[i];
+
+            int size = AlignUp(checked(header + Math.Max(1, valueType.SizeOf)), 8);
+            t = new RuntimeType(_nextTypeId++, RuntimeTypeKind.Struct, valueType.AssemblyName, valueType.Namespace, $"{valueType.Name}[box]")
+            {
+                BaseType = SystemValueType,
+                IsFinal = true,
+                SizeOf = size,
+                AlignOf = 8,
+                InstanceSize = size,
+                ClassSize = size,
+                GcPointerOffsets = gcOffsets,
+                ContainsGcPointers = gcOffsets.Length != 0,
+            };
+
+            _constructedTypes[key] = t;
+            _typeById[t.TypeId] = t;
+            _layoutDone.Add(t.TypeId);
+            return t;
+        }
+        // Frame storage of a class instance allocated on the stack, reporting the instance's GC fields
+        internal RuntimeType GetObjectLayoutType(RuntimeType objectType)
+        {
+            if (objectType is null) throw new ArgumentNullException(nameof(objectType));
+            if (objectType.Kind != RuntimeTypeKind.Class)
+                throw new ArgumentException("Only class instances have a frame layout.", nameof(objectType));
+
+            string key = $"objlayout:{objectType.TypeId}";
+            if (_constructedTypes.TryGetValue(key, out RuntimeType? t))
+                return t;
+
+            EnsureLayout(objectType);
+            var gcOffsets = new List<int>();
+            for (RuntimeType? current = objectType; current is not null; current = current.BaseType)
+            {
+                foreach (RuntimeField field in current.InstanceFields)
+                {
+                    if (!field.IsStatic)
+                        AppendGcPointerOffsets(gcOffsets, field.Offset, field.FieldType);
+                }
+            }
+            gcOffsets.Sort();
+
+            int size = AlignUp(objectType.InstanceSize, 8);
+            t = new RuntimeType(_nextTypeId++, RuntimeTypeKind.Struct, objectType.AssemblyName, objectType.Namespace, $"{objectType.Name}[stack]")
+            {
+                BaseType = SystemValueType,
+                IsFinal = true,
+                SizeOf = size,
+                AlignOf = 8,
+                InstanceSize = size,
+                ClassSize = size,
+                GcPointerOffsets = gcOffsets.ToArray(),
+                ContainsGcPointers = gcOffsets.Count != 0,
+            };
+
+            _constructedTypes[key] = t;
+            _typeById[t.TypeId] = t;
+            _layoutDone.Add(t.TypeId);
+            return t;
+        }
         internal RuntimeType GetArrayType(RuntimeType elementType)
         {
             if (elementType is null) throw new ArgumentNullException(nameof(elementType));
@@ -2883,6 +3014,7 @@ namespace Cnidaria.Cs
 
             var inst = new List<RuntimeField>();
             var stat = new List<RuntimeField>();
+            var enumLiterals = new List<RuntimeEnumLiteral>();
 
             for (int rid = startRid; rid < endRid; rid++)
             {
@@ -2896,7 +3028,17 @@ namespace Cnidaria.Cs
                 bool isLiteral = (attrs & System.Reflection.FieldAttributes.Literal) != 0;
 
                 if (isLiteral)
+                {
+                    if (declaringType.Kind == RuntimeTypeKind.Enum && isStatic)
+                    {
+                        ulong bits = 0;
+                        ReadOnlySpan<byte> value = m.GetConstantValue(fieldTok);
+                        for (int i = 0; i < value.Length; i++)
+                            bits |= (ulong)value[i] << (i * 8);
+                        enumLiterals.Add(new RuntimeEnumLiteral(name, bits));
+                    }
                     continue;
+                }
 
                 var sig = m.Md.GetBlob(fr.Signature);
                 var r = new SigReader(sig);
@@ -2924,6 +3066,12 @@ namespace Cnidaria.Cs
             declaringType.StaticFields = stat.ToArray();
 
             int typeTok = MetadataToken.Make(MetadataToken.TypeDef, tdIndex + 1);
+            if (declaringType.Kind == RuntimeTypeKind.Enum)
+            {
+                // Sorted by the unsigned storage value, which Enum searches and formats flags by; ties keep declaration order
+                declaringType.EnumLiterals = enumLiterals.OrderBy(literal => literal.Value).ToArray();
+                declaringType.IsFlagsEnum = HasCustomAttribute(m, typeTok, "System", "FlagsAttribute");
+            }
             if (m.TryGetClassLayout(tdIndex + 1, out var classLayout))
             {
                 declaringType.PackingSize = classLayout.PackingSize;
@@ -4093,7 +4241,10 @@ namespace Cnidaria.Cs
         ByRef = 1 << 5,
         Interface = 1 << 6,
         GenericParameter = 1 << 7,
+        FlagsEnum = 1 << 8,
     }
+    // A named constant of an enum, with its value zero-extended from the enum's storage
+    internal readonly record struct RuntimeEnumLiteral(string Name, ulong Value);
     // What a NativeAOT MethodTable records for a type, for the backends that lay one out and the VMs that answer in its place
     internal static class RuntimeMethodTables
     {
@@ -4242,13 +4393,15 @@ namespace Cnidaria.Cs
 
         public static string DisplayName(RuntimeType type) => Format(type, fullName: false);
 
+        public static RuntimeEnumLiteral[] EnumLiterals(RuntimeType type) => (type.GenericTypeDefinition ?? type).EnumLiterals;
+
         public static RuntimeTypeInfoFlags Flags(RuntimeType type)
         {
             var flags = RuntimeTypeInfoFlags.None;
             if (type.Kind is RuntimeTypeKind.Struct or RuntimeTypeKind.Enum)
                 flags |= RuntimeTypeInfoFlags.ValueType;
             if (type.Kind == RuntimeTypeKind.Enum)
-                flags |= RuntimeTypeInfoFlags.Enum;
+                flags |= (type.GenericTypeDefinition ?? type).IsFlagsEnum ? RuntimeTypeInfoFlags.Enum | RuntimeTypeInfoFlags.FlagsEnum : RuntimeTypeInfoFlags.Enum;
             else if (type.PrimitiveKind is not (RuntimePrimitiveKind.None or RuntimePrimitiveKind.Void or RuntimePrimitiveKind.Decimal))
                 flags |= RuntimeTypeInfoFlags.Primitive;
             flags |= type.Kind switch
@@ -4352,6 +4505,8 @@ namespace Cnidaria.Cs
         public bool IsBeforeFieldInit { get; internal set; }
         public bool IsFinal { get; internal set; }
         public bool IsByRefLike { get; internal set; }
+        internal bool IsFlagsEnum { get; set; }
+        internal RuntimeEnumLiteral[] EnumLiterals { get; set; } = Array.Empty<RuntimeEnumLiteral>();
 
         public bool IsValueType => Kind is RuntimeTypeKind.Struct or RuntimeTypeKind.Enum or RuntimeTypeKind.FunctionPointer;
         public bool IsReferenceType => !IsValueType && Kind is not (RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.FunctionPointer);

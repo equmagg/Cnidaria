@@ -1085,11 +1085,24 @@ namespace Cnidaria.Cs
             if (!rm.Name.StartsWith("RhGetType", StringComparison.Ordinal))
                 return false;
 
+            int index = rm.Name is "RhGetTypeEnumValue" or "RhGetTypeEnumName" ? checked((int)IntegerPayload(PopSlot())) : 0;
             var type = _rts.GetTypeById(checked((int)IntegerPayload(PopSlot())));
             if (rm.Name == "RhGetTypeFlags")
             {
                 PushSlot(new Slot(SlotKind.I4, (int)RuntimeTypeNames.Flags(type)));
                 return true;
+            }
+            switch (rm.Name)
+            {
+                case "RhGetTypeEnumCount":
+                    PushSlot(new Slot(SlotKind.I4, RuntimeTypeNames.EnumLiterals(type).Length));
+                    return true;
+                case "RhGetTypeEnumValue":
+                    PushSlot(new Slot(SlotKind.I8, unchecked((long)RuntimeTypeNames.EnumLiterals(type)[index].Value)));
+                    return true;
+                case "RhGetTypeEnumName":
+                    PushSlot(new Slot(SlotKind.Ref, AllocStringFromManaged(RuntimeTypeNames.EnumLiterals(type)[index].Name)));
+                    return true;
             }
             if (rm.Name == "RhGetTypeCorElementType")
             {

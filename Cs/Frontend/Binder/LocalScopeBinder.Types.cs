@@ -388,6 +388,13 @@ namespace Cnidaria.Cs
                 context.Recorder.RecordBound(exprSyntax, bound);
                 return bound;
             }
+            // Target-typed switch expression
+            if (expr is BoundUnboundSwitchExpression unboundSwitch)
+            {
+                var bound = BindSwitchExpressionWithType(unboundSwitch, targetType, context, diagnostics);
+                context.Recorder.RecordBound(exprSyntax, bound);
+                return bound;
+            }
             // Target-typed anonymous function
             if (expr is BoundUnboundLambdaExpression unboundLambda)
             {

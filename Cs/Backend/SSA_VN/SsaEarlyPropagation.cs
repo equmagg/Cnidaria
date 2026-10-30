@@ -378,6 +378,14 @@ namespace Cnidaria.Cs
                 if (TryGetSsaLocalUse(storedValue, out SsaValueName sourceValue))
                     return TryResolveConstantArrayLength(sourceValue, depth + 1, visited, out length);
 
+                if (storedValue.Kind is GenTreeKind.TempAddr or GenTreeKind.LocalAddr &&
+                    storedValue.LocalDescriptor is GenLocalDescriptor stackArray &&
+                    stackArray.StackAllocatedArrayLength >= 0)
+                {
+                    length = stackArray.StackAllocatedArrayLength;
+                    return true;
+                }
+
                 if (storedValue.Kind != GenTreeKind.NewArray || storedValue.Operands.Length != 1)
                     return false;
 

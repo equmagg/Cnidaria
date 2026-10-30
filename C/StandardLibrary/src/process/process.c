@@ -16,6 +16,7 @@
 #if defined(__x86_64__)
 #define __NR_mmap 9
 #define __NR_mprotect 10
+#define __NR_msync 26
 #define __NR_munmap 11
 #define __NR_fork 57
 #define __NR_execve 59
@@ -31,6 +32,7 @@
 #define __NR_wait4 114
 #define __NR_uname 122
 #define __NR_mprotect 125
+#define __NR_msync 144
 #define __NR_mmap2 192
 #if defined(__i386__)
 #define __NR_getdents64 220
@@ -46,6 +48,7 @@
 #define __NR_execve 221
 #define __NR_mmap 222
 #define __NR_mprotect 226
+#define __NR_msync 227
 #define __NR_wait4 260
 #endif
 
@@ -174,6 +177,11 @@ int munmap(void* address, size_t length)
 int mprotect(void* address, size_t length, int protection)
 {
     return (int)__process_result(__syscall(__NR_mprotect, (long)(uintptr_t)address, (long)length, protection, 0, 0, 0));
+}
+
+int msync(void* address, size_t length, int flags)
+{
+    return (int)__process_result(__syscall(__NR_msync, (long)(uintptr_t)address, (long)length, flags, 0, 0, 0));
 }
 
 struct __dirstream

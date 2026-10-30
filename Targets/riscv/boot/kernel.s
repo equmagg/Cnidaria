@@ -4,18 +4,23 @@ _start:
 kernel_enter_user:
     mv t0, a0
     mv t1, a1
-    li t2, ${ZKERNEL_TRAP_STACK_TOP}
-    csrrw zero, sscratch, t2
-    csrrs t3, sstatus, zero
-    li t4, 256
-    not t4, t4
-    and t3, t3, t4
-    li t4, 32
-    or t3, t3, t4
-    csrrw zero, sstatus, t3
-    csrrw zero, sepc, t0
-    mv sp, t1
-    sret
+    li sp, ${ZKERNEL_TRAP_STACK_TOP}
+    addi sp, sp, -1320
+    addi sp, sp, -1320
+    mv t2, sp
+    li t3, 330
+.Linitial_frame:
+    sd zero, 0(t2)
+    addi t2, t2, 8
+    addi t3, t3, -1
+    bnez t3, .Linitial_frame
+    sd t0, 256(sp)
+    sd t1, 16(sp)
+    li t0, 0x2220
+    sd t0, 264(sp)
+    li t0, 0x8000000000000000
+    sd t0, 288(sp)
+    j kernel_return_user
 
 kernel_boot_start:
     li sp, ${ZKERNEL_STACK_TOP}
@@ -134,6 +139,7 @@ supervisor_trap_vector:
     mv a0, sp
     li t0, ${ZKERNEL_TRAP_DISPATCH_ADDRESS}
     jalr ra, t0, 0
+kernel_return_user:
     ld t0, 256(sp)
     csrrw zero, sepc, t0
     ld t0, 264(sp)

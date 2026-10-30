@@ -8,6 +8,7 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 namespace Cnidaria.RiscV;
 
@@ -15,6 +16,7 @@ public enum RVPrivilegeMode : byte { User = 0, Supervisor = 1, Machine = 3 }
 
 public enum RVStopReason : byte { None, InstructionLimit, WaitingForInterrupt, Stopped, MachineFatalTrap }
 public enum RVMemoryAccess : byte { Execute, Load, Store }
+public enum RVExecutionMode : byte { Interpreter, X64Jit }
 
 public readonly struct RVTrapInfo
 {
@@ -77,6 +79,7 @@ public enum RVTrapCause : ulong
 
 public sealed class RVMachineConfig
 {
+    public RVExecutionMode ExecutionMode { get; set; }
     public int VectorLengthBits { get; set; } = RVVector.LengthBits;
     public ulong RamBase { get; set; } = 0x80000000UL;
     public int RamSize { get; set; } = 128 * 1024 * 1024;
@@ -113,13 +116,13 @@ internal struct RegisterArray
 {
     private ulong _element;
 }
-/// <summary>The vector file as one flat run of words, which is how every access reaches it</summary>
+
 [InlineArray(32 * 8)]
 internal struct VectorRegisterArray
 {
     private ulong _element;
 }
-public sealed class RiscVEmulator
+public sealed partial class RiscVEmulator : IDisposable
 {
     private const ulong InterruptBit = 1UL << 63;
     private const ulong PageSize = 4096;
@@ -203,7 +206,7 @@ public sealed class RiscVEmulator
 
     private ulong _pc;
     private RVPrivilegeMode _mode;
-    private bool _stopped;
+    private volatile bool _stopped;
     private bool _machineFatalTrap;
     private bool _waiting;
     private bool _hasTrap;
@@ -270,6 +273,7 @@ public sealed class RiscVEmulator
     private ulong _stval;
     private ulong _satp;
 
+    public RVExecutionMode ExecutionMode { get; set; }
     public Span<byte> Ram => _ram;
     public ulong RamBase => _ramBase;
     public ulong ProgramCounter { get => _pc; set => _pc = value; }
@@ -302,6 +306,7 @@ public sealed class RiscVEmulator
     public RiscVEmulator(RVMachineConfig? config = null)
     {
         config ??= new RVMachineConfig();
+        ExecutionMode = config.ExecutionMode;
         if (config.VectorLengthBits is not (128 or 256 or 512))
             throw new ArgumentOutOfRangeException(nameof(config), "Vector length must be 128, 256 or 512 bits.");
         VectorRegisterBytes = config.VectorLengthBits / 8;
@@ -509,7 +514,28 @@ public sealed class RiscVEmulator
         _waiting = false;
     }
 
+    /// <summary>Only Stop may be called concurrently with Run</summary>
     public RVRunResult Run(ulong instructionLimit)
+    {
+        if (Interlocked.CompareExchange(ref _running, 1, 0) != 0)
+            throw new InvalidOperationException("The machine is already running.");
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return ExecutionMode switch
+            {
+                RVExecutionMode.Interpreter => RunInterpreter(instructionLimit),
+                RVExecutionMode.X64Jit => RunJit(instructionLimit),
+                _ => throw new ArgumentOutOfRangeException(nameof(ExecutionMode)),
+            };
+        }
+        finally
+        {
+            Volatile.Write(ref _running, 0);
+        }
+    }
+
+    private RVRunResult RunInterpreter(ulong instructionLimit)
     {
         ulong retired = 0;
         ulong steps = 0;
@@ -2923,7 +2949,8 @@ public sealed class RiscVEmulator
                 if ((pte & required) != required)
                 {
                     ulong updated = pte | required;
-                    if (!TryWritePhysical(pteAddress, 8, updated, out _, out _))
+                    // Speculative TLB fills must not update guest page tables
+                    if ((_jit is JitState jit && jit.TrackingPageTables) || !TryWritePhysical(pteAddress, 8, updated, out _, out _))
                     {
                         trapCause = PageFaultCause(access);
                         return false;
@@ -3172,6 +3199,8 @@ public sealed class RiscVEmulator
         ulong offset = address - _ramBase;
         if (address >= _ramBase && offset <= (ulong)(_ram.Length - size))
         {
+            if (_jit is JitState jit && jit.TrackingPageTables)
+                jit.ProtectPage((int)(offset >> 12));
             value = size switch
             {
                 1 => _ram[(int)offset],
@@ -3182,6 +3211,13 @@ public sealed class RiscVEmulator
                 _ => (ulong)_ram[(int)offset] | ((ulong)_ram[(int)offset + 1] << 8) | ((ulong)_ram[(int)offset + 2] << 16) | ((ulong)_ram[(int)offset + 3] << 24) | ((ulong)_ram[(int)offset + 4] << 32) | ((ulong)_ram[(int)offset + 5] << 40) | ((ulong)_ram[(int)offset + 6] << 48) | ((ulong)_ram[(int)offset + 7] << 56),
             };
             return true;
+        }
+
+        if (_jit is JitState tracking && tracking.TrackingPageTables)
+        {
+            value = 0;
+            trapCause = AccessFaultCause(access);
+            return false;
         }
 
         offset = address - _framebufferPixelBase;
@@ -6575,6 +6611,9 @@ public sealed class RVClint
 
     public void Tick()
         => _mtime++;
+
+    internal void Advance(ulong ticks)
+        => _mtime += ticks;
 
     public const ulong RegisterWindowSize = 0x10000UL;
 

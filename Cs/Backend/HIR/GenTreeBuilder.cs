@@ -2440,6 +2440,7 @@ namespace Cnidaria.Cs
 
         // Native type handles are MethodTables, with the type's names and flags in an info block one pointer before
         // the MethodTable; the register VM answers these queries from its type system.
+        // The info block's last slot points to an enum's {values, names, count}.
         private bool TryImportRuntimeTypeQuery(List<StackValue> stack, List<GenTree> statements, RuntimeMethod method, int pc, ILOpCode op)
         {
             if (_rts.Target.IsRegisterBytecode)
@@ -2453,20 +2454,40 @@ namespace Cnidaria.Cs
                 "RhGetTypeDisplayName" => 3,
                 "RhGetTypeAssemblyName" => 4,
                 "RhGetTypeFlags" => 5,
+                "RhGetTypeEnumValue" or "RhGetTypeEnumName" or "RhGetTypeEnumCount" => 6,
                 _ => -1,
             };
             if (slot < 0)
                 return false;
 
-            var handle = Pop(stack, pc, op);
             int pointerSize = _rts.Target.PointerSize;
-            GenTree infoSlot = Node(GenTreeKind.PointerElementAddr, pc, GenTreeOperator.None, stackKind: GenStackKind.Ptr,
-                operands: Two(handle.Node, ConstI4(pc, op, -1)), int32: pointerSize);
-            GenTree info = Node(GenTreeKind.LoadIndirect, pc, ILOpCode.Ldind_I, stackKind: GenStackKind.Ptr, operands: One(infoSlot));
-            GenTree field = Node(GenTreeKind.PointerElementAddr, pc, GenTreeOperator.None, stackKind: GenStackKind.Ptr,
-                operands: Two(info, ConstI4(pc, op, slot)), int32: pointerSize);
+            GenTree ElementAddr(GenTree address, GenTree element, int scale)
+                => Node(GenTreeKind.PointerElementAddr, pc, GenTreeOperator.None, stackKind: GenStackKind.Ptr,
+                    operands: Two(address, element), int32: scale);
+            GenTree LoadPointer(GenTree address, int element)
+                => Node(GenTreeKind.LoadIndirect, pc, ILOpCode.Ldind_I, stackKind: GenStackKind.Ptr,
+                    operands: One(ElementAddr(address, ConstI4(pc, op, element), pointerSize)));
+
+            GenTree? index = method.Name is "RhGetTypeEnumValue" or "RhGetTypeEnumName" ? Pop(stack, pc, op).Node : null;
+            GenTree info = LoadPointer(Pop(stack, pc, op).Node, -1);
+            GenTree field;
+            if (slot < 6)
+                field = ElementAddr(info, ConstI4(pc, op, slot), pointerSize);
+            else if (index is null)
+                field = ElementAddr(LoadPointer(info, 6), ConstI4(pc, op, 2), pointerSize);
+            else if (method.Name == "RhGetTypeEnumValue")
+                field = ElementAddr(LoadPointer(LoadPointer(info, 6), 0), index, sizeof(ulong));
+            else
+                field = ElementAddr(LoadPointer(LoadPointer(info, 6), 1), index, pointerSize);
+
             RuntimeType resultType = method.ReturnType;
-            PushImportedValue(stack, statements, Node(GenTreeKind.LoadIndirect, pc, slot == 5 ? ILOpCode.Ldind_I4 : ILOpCode.Ldind_Ref,
+            ILOpCode load = resultType.PrimitiveKind switch
+            {
+                RuntimePrimitiveKind.Int32 => ILOpCode.Ldind_I4,
+                RuntimePrimitiveKind.UInt64 => ILOpCode.Ldind_I8,
+                _ => ILOpCode.Ldind_Ref,
+            };
+            PushImportedValue(stack, statements, Node(GenTreeKind.LoadIndirect, pc, load,
                 type: resultType, stackKind: StackKindOf(resultType), operands: One(field), runtimeType: resultType));
             return true;
         }

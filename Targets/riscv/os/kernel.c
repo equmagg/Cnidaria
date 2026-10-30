@@ -46,6 +46,8 @@ long __riscv_vfirst_m_b4(vbool4_t vs2, u64 vl);
 #define USER_ELF_BUFFER_SIZE 0x01000000ul
 #define USER_INTERP_BUFFER 0x83000000ul
 #define USER_INTERP_BUFFER_SIZE 0x00400000ul
+#define USER_PIE_BASE 0x00010000ul
+#define USER_INTERP_BASE 0x2000000000ul
 #define USER_MMAP_BASE 0x3000000000ul
 #define USER_HOST_BRIDGE_BASE 0x2F00000000ul
 #define USER_FRAMEBUFFER_BASE 0x2E00000000ul
@@ -69,6 +71,8 @@ long __riscv_vfirst_m_b4(vbool4_t vs2, u64 vl);
 // A page a fork left shared that the space may write: the first store takes a copy, or the page itself once no one else maps it
 #define PTE_SOFT_COW 0x200ul
 #define SATP_MODE_SV39 0x8000000000000000ul
+#define ELF_ET_EXEC 2u
+#define ELF_ET_DYN 3u
 #define ELF_PT_LOAD 1u
 #define ELF_PT_INTERP 3u
 #define ELF_PT_PHDR 6u
@@ -88,6 +92,9 @@ long __riscv_vfirst_m_b4(vbool4_t vs2, u64 vl);
 #define SYS_LSEEK 62ul
 #define SYS_READ 63ul
 #define SYS_WRITE 64ul
+#define SYS_READV 65ul
+#define SYS_WRITEV 66ul
+#define SYS_MSYNC 227ul
 #define SYS_READLINKAT 78ul
 #define SYS_NEWFSTATAT 79ul
 #define SYS_FSTAT 80ul
@@ -98,6 +105,10 @@ long __riscv_vfirst_m_b4(vbool4_t vs2, u64 vl);
 #define SYS_NANOSLEEP 101ul
 #define SYS_GETITIMER 102ul
 #define SYS_SETITIMER 103ul
+#define SYS_CLOCK_GETTIME 113ul
+#define SYS_CLOCK_GETRES 114ul
+#define SYS_CLOCK_NANOSLEEP 115ul
+#define SYS_GETTIMEOFDAY 169ul
 #define SYS_SCHED_YIELD 124ul
 #define SYS_RESTART_SYSCALL 128ul
 #define SYS_KILL 129ul
@@ -161,6 +172,16 @@ long __riscv_vfirst_m_b4(vbool4_t vs2, u64 vl);
 #define AT_PHNUM 5ul
 #define AT_PHDR 3ul
 #define AT_BASE 7ul
+#define AT_FLAGS 8ul
+#define AT_UID 11ul
+#define AT_EUID 12ul
+#define AT_GID 13ul
+#define AT_EGID 14ul
+#define AT_HWCAP 16ul
+#define AT_CLKTCK 17ul
+#define AT_SECURE 23ul
+#define AT_RANDOM 25ul
+#define AT_EXECFN 31ul
 #define AT_HOST_BRIDGE 0x1000ul
 #define AT_FRAMEBUFFER 0x1001ul
 #define AT_MINSIGSTKSZ 51ul
@@ -178,6 +199,7 @@ long __riscv_vfirst_m_b4(vbool4_t vs2, u64 vl);
 #define VFS_NODE_INPUT_DIR 9u
 #define VFS_NODE_EVDEV 10u
 #define VFS_NODE_DSP 11u
+#define VFS_NODE_FRAMEBUFFER 12u
 #define FAT_ATTRIBUTE_DIRECTORY 16u
 #define FAT_ATTRIBUTE_VOLUME 8u
 #define FAT_ATTRIBUTE_LONG_NAME 15u
@@ -211,9 +233,32 @@ long __riscv_vfirst_m_b4(vbool4_t vs2, u64 vl);
 #define PROT_READ 1ul
 #define PROT_WRITE 2ul
 #define PROT_EXEC 4ul
+#define MAP_SHARED 1ul
 #define MAP_PRIVATE 2ul
 #define MAP_FIXED 16ul
 #define MAP_ANONYMOUS 32ul
+#define MAP_DENYWRITE 0x800ul
+#define MAP_EXECUTABLE 0x1000ul
+#define MAP_NORESERVE 0x4000ul
+#define MAP_STACK 0x20000ul
+#define MAP_FIXED_NOREPLACE 0x100000ul
+#define VM_READONLY_FILE 0x80000000ul
+#define VM_FRAMEBUFFER 0x40000000ul
+#define MS_ASYNC 1ul
+#define MS_INVALIDATE 2ul
+#define MS_SYNC 4ul
+#define MAX_IOV 1024ul
+#define MAX_RW_COUNT 0x7ffff000ul
+#define FBIOGET_VSCREENINFO 0x4600ul
+#define FBIOPUT_VSCREENINFO 0x4601ul
+#define FBIOGET_FSCREENINFO 0x4602ul
+#define FBIOPAN_DISPLAY 0x4606ul
+#define FBIOBLANK 0x4611ul
+#define KDSETMODE 0x4b3aul
+#define KDGETMODE 0x4b3bul
+#define KD_TEXT 0u
+#define KD_GRAPHICS 1u
+
 #define TCGETS 0x5401ul
 #define TCSETS 0x5402ul
 #define TCSETSW 0x5403ul
@@ -310,6 +355,7 @@ long __riscv_vfirst_m_b4(vbool4_t vs2, u64 vl);
 #define SSTATUS_SPP 256ul
 #define SSTATUS_VS 0x600ul
 #define SSTATUS_VS_INITIAL 0x200ul
+#define SSTATUS_FS_INITIAL 0x2000ul
 #define WNOHANG 1ul
 #define WUNTRACED 2ul
 #define WCONTINUED 8ul
@@ -365,6 +411,7 @@ long __riscv_vfirst_m_b4(vbool4_t vs2, u64 vl);
 #define SEGV_MAPERR 1
 #define SEGV_ACCERR 2
 #define BUS_ADRALN 1
+#define BUS_ADRERR 2
 #define ILL_ILLOPC 1
 #define ILL_ILLTRP 4
 #define TRAP_BRKPT 1
@@ -374,6 +421,15 @@ long __riscv_vfirst_m_b4(vbool4_t vs2, u64 vl);
 #define ERESTARTNOINTR 513l
 #define ERESTARTNOHAND 514l
 #define ERESTART_RESTARTBLOCK 516l
+#define CLOCK_REALTIME 0ul
+#define CLOCK_MONOTONIC 1ul
+#define CLOCK_PROCESS_CPUTIME_ID 2ul
+#define CLOCK_THREAD_CPUTIME_ID 3ul
+#define CLOCK_MONOTONIC_RAW 4ul
+#define CLOCK_REALTIME_COARSE 5ul
+#define CLOCK_MONOTONIC_COARSE 6ul
+#define CLOCK_BOOTTIME 7ul
+#define TIMER_ABSTIME 1ul
 #define ITIMER_REAL 0ul
 #define ITIMER_VIRTUAL 1ul
 #define ITIMER_PROF 2ul
@@ -423,6 +479,7 @@ struct boot_device
     u64 framebuffer_size;
     u64 framebuffer_window;
     u64 timebase;
+    u64 hwcap;
 };
 
 struct fat32_volume
@@ -437,6 +494,16 @@ struct fat32_volume
     u32 cluster_count;
 };
 
+struct vm_region
+{
+    u64 start;
+    u64 end;
+    u64 prot;
+    u64 flags;
+    u64 offset;
+    u32 object;
+};
+
 struct elf_image
 {
     u64 entry;
@@ -446,6 +513,11 @@ struct elf_image
     u64 phent;
     u64 phnum;
     u64 brk_start;
+    u64 load_bias;
+    u64 map_start;
+    u64 map_end;
+    u32 region_count;
+    struct vm_region regions[MAX_VM_REGIONS];
     char interp[PATH_BUFFER_SIZE];
 };
 
@@ -630,6 +702,23 @@ struct vfs_node
     u32 slot_entry;
 };
 
+#define MAX_FILE_OBJECTS (MAX_PROCESSES * (MAX_OPEN_FILES + MAX_VM_REGIONS))
+
+struct file_object
+{
+    struct vfs_node node;
+    u32 refs;
+    u32 unlinked;
+    u64 pages;
+};
+
+struct file_page
+{
+    u64 next;
+    u64 offset;
+    u32 writable;
+};
+
 struct file_descriptor
 {
     u32 used;
@@ -648,14 +737,6 @@ struct path_result
     u32 leaf_length;
     u32 has_parent;
     u32 has_node;
-};
-
-struct vm_region
-{
-    u64 start;
-    u64 end;
-    u64 prot;
-    u64 flags;
 };
 
 struct signal_action
@@ -718,6 +799,7 @@ struct process
     u64 itimer_virtual_interval;
     u64 itimer_prof_value;
     u64 itimer_prof_interval;
+    u64 cpu_ticks;
     struct signal_action signal_actions[SIGNAL_COUNT];
     struct signal_entry signal_queue[SIGNAL_QUEUE_SIZE];
     struct vfs_node cwd;
@@ -783,24 +865,44 @@ static struct block_device root_block_device;
 static struct process processes[MAX_PROCESSES];
 static struct process* current_task;
 static struct file_descriptor* open_files;
+static struct file_object file_objects[MAX_FILE_OBJECTS];
+static u32 file_object_limit;
+static struct file_page* file_pages;
+static u64 free_page_count;
 static u32 current_task_slot;
 static u32 next_pid;
 static u64 scheduler_ticks;
+static u64 realtime_seconds;
+static u64 realtime_nanoseconds;
+static u64 cpu_account_start;
+static int cpu_account_running;
 static int console_ready;
 static const char init_path[] = "/init";
 static u64 sigreturn_page;
+static u32 random_state[16];
+static int random_ready;
 
 static int user_copy_to_writable(u64 root, u64 destination, const void* source, u64 count);
 static int user_copy_from_readable(u64 root, void* destination, u64 source, u64 count);
+static int user_translate_with_brk_fault(u64 root, u64 address, u64 required, u64* physical);
 static int copy_user_string(u64 source, char* destination, u32 capacity);
 static int vfs_lookup(const char* path, struct vfs_node* node);
 static int fat_read_path_to_memory(const char* path, void* destination, u32 max_size, u32* out_size);
 static int fat_read_at(struct vfs_node* node, u64 offset, void* destination, u32 count, u32* read_count);
-static int load_elf64(const u8* image, u32 image_size, u64 root, struct elf_image* loaded);
+static struct vm_region* vm_find_region(u64 address);
+static int vm_fault(u64 root, u64 address, u64 required);
+static void vm_release_regions(struct process* task);
+static u32 file_find(struct vfs_node* node);
+static int file_unlink(struct vfs_node* node);
+static int file_truncate(struct vfs_node* node);
+static int file_put(u32 object);
+static u64 available_page_count(void);
+static u64 physical_clear_end(u64 address);
+static int load_elf64(const u8* image, u32 image_size, u64 root, u64 base, const struct elf_image* occupied, struct elf_image* loaded);
 static int load_process_image(u64 root, const u8* image, u32 image_size, struct elf_image* loaded);
 static s64 capture_exec_arguments(u64 argv, u64 envp, const char* fallback, struct exec_arguments* arguments);
 static int make_kernel_arguments(const char* path, struct exec_arguments* arguments);
-static int build_user_stack(u64 root, struct elf_image* image, struct exec_arguments* arguments, u64* out_stack);
+static int build_user_stack(u64 root, struct elf_image* image, struct exec_arguments* arguments, const char* path, u64* out_stack);
 
 static u64 align_down(u64 value, u64 alignment)
 {
@@ -1255,6 +1357,13 @@ static const u8 fbcon_font[(FBCON_LAST_GLYPH - FBCON_FIRST_GLYPH + 1u) * FBCON_G
     0x00, 0x00, 0x34, 0x4C, 0x00, 0x00, 0x00, 0x00, // ~
 };
 
+static u64 framebuffer_pixels;
+static u64 framebuffer_bytes;
+static u64 framebuffer_map_size;
+static u32 framebuffer_width;
+static u32 framebuffer_height;
+static u32 framebuffer_stride;
+static u32 framebuffer_console_mode;
 static volatile u64* fbcon_registers;
 static u32* fbcon_pixels;
 static u64 fbcon_row_pixels;
@@ -1356,7 +1465,13 @@ static void fbcon_init(void)
     if (registers[0] != FBCON_MAGIC)
         return;
 
-    fbcon_pixels = (u32*)(boot_device.framebuffer_base + registers[5]);
+    framebuffer_pixels = boot_device.framebuffer_base + registers[5];
+    framebuffer_bytes = registers[6];
+    framebuffer_map_size = align_up(framebuffer_bytes, PAGE_SIZE);
+    framebuffer_width = (u32)registers[2];
+    framebuffer_height = (u32)registers[3];
+    framebuffer_stride = (u32)registers[4];
+    fbcon_pixels = (u32*)framebuffer_pixels;
     fbcon_row_pixels = registers[4] / 4ul;
     fbcon_columns = registers[2] / FBCON_GLYPH_WIDTH;
     fbcon_rows = registers[3] / FBCON_GLYPH_HEIGHT;
@@ -1864,7 +1979,7 @@ static u32 fbcon_batch;
 // Output in a batch is drawn without the cursor, which comes back and is presented once the batch ends
 static void fbcon_begin(void)
 {
-    if (fbcon_registers == (volatile u64*)0)
+    if (fbcon_registers == (volatile u64*)0 || framebuffer_console_mode == KD_GRAPHICS)
         return;
     if (fbcon_batch == 0u)
         fbcon_draw_cursor(0);
@@ -1873,7 +1988,7 @@ static void fbcon_begin(void)
 
 static void fbcon_end(void)
 {
-    if (fbcon_registers == (volatile u64*)0)
+    if (fbcon_registers == (volatile u64*)0 || framebuffer_console_mode == KD_GRAPHICS)
         return;
     fbcon_batch = fbcon_batch - 1u;
     if (fbcon_batch != 0u)
@@ -1933,7 +2048,7 @@ static void fbcon_byte(u8 byte)
 
 static void fbcon_putchar(int ch)
 {
-    if (fbcon_registers == (volatile u64*)0)
+    if (fbcon_registers == (volatile u64*)0 || framebuffer_console_mode == KD_GRAPHICS)
         return;
     fbcon_begin();
     fbcon_byte((u8)ch);
@@ -1944,7 +2059,7 @@ static void fbcon_putchar(int ch)
 static void fbcon_write(const u8* data, u64 count)
 {
     u64 index = 0ul;
-    if (fbcon_registers == (volatile u64*)0)
+    if (fbcon_registers == (volatile u64*)0 || framebuffer_console_mode == KD_GRAPHICS)
         return;
     fbcon_begin();
     while (index < count)
@@ -2173,21 +2288,40 @@ static u64 physical_reserved_limit(u64 address, u64 size)
     return address;
 }
 
-// How many spaces beyond the first map each page of RAM, which a fork raises instead of copying the page
-static u8* page_shares;
+// References beyond the first owner include file caches as well as user mappings
+static u32* page_shares;
 
 static void memory_manager_init(void)
 {
     u64 share_bytes;
+    u64 cache_bytes;
+    u64 cursor;
     free_page_cursor = align_up(KERNEL_RESERVED_END, PAGE_SIZE);
     free_page_end = align_down(ram_end(), PAGE_SIZE);
     free_page_list = 0ul;
-    share_bytes = align_up((free_page_end - RAM_BASE) >> 12, PAGE_SIZE);
-    if (free_page_cursor + share_bytes >= free_page_end || physical_reserved_limit(free_page_cursor, share_bytes) != free_page_cursor)
+    share_bytes = align_up(((free_page_end - RAM_BASE) >> 12) * sizeof(u32), PAGE_SIZE);
+    cache_bytes = align_up(((free_page_end - RAM_BASE) >> 12) * sizeof(struct file_page), PAGE_SIZE);
+    if (free_page_cursor + share_bytes + cache_bytes >= free_page_end || physical_reserved_limit(free_page_cursor, share_bytes + cache_bytes) != free_page_cursor)
         panic("no usable physical memory");
-    page_shares = (u8*)free_page_cursor;
+    page_shares = (u32*)free_page_cursor;
     free_page_cursor = free_page_cursor + share_bytes;
     mem_zero(page_shares, share_bytes);
+    file_pages = (struct file_page*)free_page_cursor;
+    free_page_cursor = free_page_cursor + cache_bytes;
+    free_page_count = 0ul;
+    cursor = free_page_cursor;
+    while (cursor < free_page_end)
+    {
+        u64 limit = physical_reserved_limit(cursor, PAGE_SIZE);
+        if (limit == cursor)
+        {
+            u64 end = physical_clear_end(cursor);
+            free_page_count = free_page_count + ((end - cursor) >> 12);
+            cursor = end;
+        }
+        else
+            cursor = limit;
+    }
 }
 
 static u64 free_page_clear_end;
@@ -2215,12 +2349,14 @@ static u64 alloc_page_raw(void)
     {
         page = free_page_list;
         free_page_list = *((u64*)page);
+        free_page_count = free_page_count - 1ul;
         return page;
     }
     if (free_page_cursor < free_page_clear_end && free_page_clear_end - free_page_cursor >= PAGE_SIZE)
     {
         page = free_page_cursor;
         free_page_cursor = free_page_cursor + PAGE_SIZE;
+        free_page_count = free_page_count - 1ul;
         return page;
     }
     for (;;)
@@ -2236,6 +2372,7 @@ static u64 alloc_page_raw(void)
         free_page_clear_end = physical_clear_end(free_page_cursor);
         page = free_page_cursor;
         free_page_cursor = free_page_cursor + PAGE_SIZE;
+        free_page_count = free_page_count - 1ul;
         return page;
     }
 }
@@ -2244,6 +2381,7 @@ static void free_page_raw(u64 page)
 {
     *((u64*)page) = free_page_list;
     free_page_list = page;
+    free_page_count = free_page_count + 1ul;
 }
 
 static u64 alloc_page(void)
@@ -2253,17 +2391,21 @@ static u64 alloc_page(void)
     return page;
 }
 
-static u8* page_share(u64 physical)
+static u32* page_share(u64 physical)
 {
     return &page_shares[(physical - RAM_BASE) >> 12];
 }
 
-// A user page goes back to the free list only with the last space that maps it
+// The last owner releases the physical page
 static void user_page_put(u64 physical)
 {
-    u8* shares = page_share(physical);
+    u32* shares;
+    // Device pages have no allocator reference count
+    if (physical - framebuffer_pixels < framebuffer_map_size)
+        return;
+    shares = page_share(physical);
     if (*shares != 0u)
-        *shares = (u8)(*shares - 1u);
+        *shares = *shares - 1u;
     else
         free_page_raw(physical);
 }
@@ -2425,6 +2567,17 @@ static int unmap_user_pages(u64 root, u64 start, u64 end)
     u64 page = start;
     while (page < end)
     {
+        u64 pte = ((u64*)root)[sv39_index(page, 2)];
+        u64 skip = 0ul;
+        if ((pte & PTE_V) == 0ul)
+            skip = GIGABYTE;
+        else if ((pte & (PTE_R | PTE_W | PTE_X)) == 0ul && (((u64*)pte_physical(pte))[sv39_index(page, 1)] & PTE_V) == 0ul)
+            skip = 0x200000ul;
+        if (skip != 0ul)
+        {
+            page = align_down(page, skip) + skip;
+            continue;
+        }
         if (!unmap_user_page(root, page))
             return 0;
         page = page + PAGE_SIZE;
@@ -2453,7 +2606,7 @@ static int user_break_cow(u64 root, u64 address)
 {
     u64* entry;
     u64 physical;
-    u8* shares;
+    u32* shares;
     if (address >= USER_VA_LIMIT)
         return 0;
     entry = user_leaf_pte(root, address);
@@ -2463,9 +2616,12 @@ static int user_break_cow(u64 root, u64 address)
     shares = page_share(physical);
     if (*shares != 0u)
     {
-        u64 copy = alloc_page_raw();
+        u64 copy;
+        if (free_page_count == 0ul)
+            return 0;
+        copy = alloc_page_raw();
         mem_copy((void*)copy, (const void*)physical, PAGE_SIZE);
-        *shares = (u8)(*shares - 1u);
+        *shares = *shares - 1u;
         physical = copy;
     }
     *entry = pte_make(physical, (*entry & (PTE_R | PTE_X | PTE_U | PTE_A | PTE_D)) | PTE_W);
@@ -2628,7 +2784,7 @@ static int user_store_u64(u64 root, u64 destination, u64 value)
 static int user_load_u8(u64 root, u64 source, u8* value)
 {
     u64 physical;
-    if (!user_translate(root, source, PTE_R, &physical))
+    if (!user_translate_with_brk_fault(root, source, PTE_R, &physical))
         return 0;
     *value = *((u8*)physical);
     return 1;
@@ -2698,7 +2854,7 @@ static int map_user_brk_fault(u64 root, u64 address)
 {
     u64 existing;
     u64 page;
-    if (address < process_brk_min || address >= process_brk)
+    if (address < process_brk_min || address >= process_brk || vm_find_region(address) != NULL)
         return 0;
     page = align_down(address, PAGE_SIZE);
     if (user_translate(root, page, 0ul, &existing))
@@ -2718,6 +2874,8 @@ static int user_translate_with_brk_fault(u64 root, u64 address, u64 required, u6
         return user_translate(root, address, required, physical);
     if (root != current_user_root_page_table || (required & PTE_X) != 0ul)
         return 0;
+    if (vm_fault(root, address, required) == 1)
+        return user_translate(root, address, required, physical);
     if (!map_user_brk_fault(root, address) && !map_user_stack_fault(root, address))
         return 0;
     return user_translate(root, address, required, physical);
@@ -2823,6 +2981,14 @@ static u64 timer_now(void)
     u64 value;
     __asm__ volatile("csrrs %[value], time, zero" : [value] "=r"(value) : : );
     return value;
+}
+
+static void process_account_time(void)
+{
+    u64 now = timer_now();
+    if (cpu_account_running && current_task != NULL && current_task->used != 0u)
+        current_task->cpu_ticks = current_task->cpu_ticks + now - cpu_account_start;
+    cpu_account_start = now;
 }
 
 static void sbi_set_timer(u64 next_time)
@@ -2948,6 +3114,8 @@ static int scheduler_can_wake(void);
 static void scheduler_switch(struct trap_frame* frame)
 {
     int next;
+    process_account_time();
+    cpu_account_running = 0;
     if (current_task != NULL)
         process_save_active(current_task, frame);
     next = scheduler_pick_next();
@@ -2964,6 +3132,8 @@ static void scheduler_switch(struct trap_frame* frame)
     if (processes[current_task_slot].time_slice == 0u)
         processes[current_task_slot].time_slice = DEFAULT_TIME_SLICE;
     process_load_active(&processes[current_task_slot], frame);
+    cpu_account_start = timer_now();
+    cpu_account_running = 1;
 }
 
 static void scheduler_yield(struct trap_frame* frame)
@@ -3054,20 +3224,24 @@ static int copy_user_page_table_level(u64 dst_root, u64 src_table, int level, u6
         }
         if (level == 0)
         {
-            // Both spaces map the page rather than each having a copy, and neither writes it until a store makes it its own
-            u8* shares;
+            // Private writable pages become copy-on-write while shared mappings retain write access
+            u32* shares;
             if ((pte & PTE_V) != 0ul && ((pte & (PTE_R | PTE_X)) == 0ul || pte_physical(pte) == sigreturn_page))
             {
                 index = index + 1u;
                 continue;
             }
-            if ((pte & PTE_W) != 0ul)
+            struct vm_region* region = vm_find_region(virtual_address);
+            if ((pte & PTE_W) != 0ul && (region == NULL || (region->flags & MAP_SHARED) == 0ul))
             {
                 pte = (pte & ~PTE_W) | PTE_SOFT_COW;
                 ((u64*)src_table)[index] = pte;
             }
-            shares = page_share(pte_physical(pte));
-            *shares = (u8)(*shares + 1u);
+            if (region == NULL || (region->flags & VM_FRAMEBUFFER) == 0ul)
+            {
+                shares = page_share(pte_physical(pte));
+                *shares = *shares + 1u;
+            }
             // Every page of a leaf table lands in the same leaf table of the copy, found once
             if (dst_leaves == NULL)
                 dst_leaves = leaf_table(dst_root, virtual_address, 0);
@@ -3197,18 +3371,28 @@ static int process_clone(struct trap_frame* frame, u64 flags, u64 child_stack)
     child->cwd = current_task->cwd;
     mem_copy(child->cwd_path, current_task->cwd_path, (u64)PATH_BUFFER_SIZE);
     mem_copy(child->files, open_files, sizeof(struct file_descriptor) * (u64)MAX_OPEN_FILES);
-    if (evdev_clients_open != 0u)
     {
         u32 index = 0u;
         while (index < MAX_OPEN_FILES)
         {
             if (child->files[index].used != 0u && child->files[index].node.type == VFS_NODE_EVDEV)
                 evdev_clients[child->files[index].object].refs = evdev_clients[child->files[index].object].refs + 1u;
+            if (child->files[index].used != 0u && child->files[index].node.type == VFS_NODE_FAT_FILE)
+                file_objects[child->files[index].object - 1u].refs = file_objects[child->files[index].object - 1u].refs + 1u;
             index = index + 1u;
         }
     }
     mem_copy(child->vm_regions, current_task->vm_regions, sizeof(struct vm_region) * (u64)current_task->vm_region_count);
     child->vm_region_count = current_task->vm_region_count;
+    {
+        u32 index;
+        for (index = 0u; index < child->vm_region_count; index = index + 1u)
+        {
+            u32 object = child->vm_regions[index].object;
+            if (object != 0u)
+                file_objects[object - 1u].refs = file_objects[object - 1u].refs + 1u;
+        }
+    }
     mem_copy(&child->frame, frame, sizeof(struct trap_frame));
     child->frame.x[10] = 0ul;
     if (child_stack != 0ul)
@@ -3243,7 +3427,7 @@ static void process_wake(struct process* process)
     process->wait_status_pointer = 0ul;
 }
 
-static void process_store_remaining(struct process* task, u64 pointer, u64 deadline);
+static int process_store_remaining(struct process* task, u64 pointer, u64 deadline);
 
 // The caller has already placed what the call returns should a signal cut the sleep short
 static void process_sleep(struct trap_frame* frame, u32 reason, u64 deadline)
@@ -3252,7 +3436,8 @@ static void process_sleep(struct trap_frame* frame, u32 reason, u64 deadline)
     {
         if (reason == SLEEP_TIMER)
         {
-            process_store_remaining(current_task, current_task->sleep_user_pointer, deadline);
+            if (!process_store_remaining(current_task, current_task->sleep_user_pointer, deadline))
+                frame->x[10] = (u64)-14l;
             current_task->restart_deadline = deadline;
             current_task->restart_user_pointer = current_task->sleep_user_pointer;
             current_task->restart_pending = 1u;
@@ -3508,9 +3693,20 @@ static int signal_fatal(struct process* task, u64 sig)
 static u64 time_to_ticks(u64 seconds, u64 fraction, u64 unit)
 {
     u64 timebase = boot_device.timebase;
-    if (seconds > 0x100000000ul)
-        seconds = 0x100000000ul;
-    return seconds * timebase + (fraction * timebase + unit - 1ul) / unit;
+    u64 ticks = (fraction * timebase + unit - 1ul) / unit;
+    if (seconds > (~0ul - ticks) / timebase)
+        return ~0ul;
+    return seconds * timebase + ticks;
+}
+
+static u64 time_add_ticks(u64 now, u64 ticks)
+{
+    return ticks > ~0ul - now ? ~0ul : now + ticks;
+}
+
+static u64 time_deadline(u64 now, u64 seconds, u64 fraction, u64 unit)
+{
+    return time_add_ticks(now, time_to_ticks(seconds, fraction, unit));
 }
 
 static void time_from_ticks(u64 ticks, u64 unit, u64* seconds, u64* fraction)
@@ -3520,14 +3716,14 @@ static void time_from_ticks(u64 ticks, u64 unit, u64* seconds, u64* fraction)
     *fraction = (ticks % timebase) * unit / timebase;
 }
 
-static void process_store_remaining(struct process* task, u64 pointer, u64 deadline)
+static int process_store_remaining(struct process* task, u64 pointer, u64 deadline)
 {
     u64 now = timer_now();
     u64 remaining[2];
     if (pointer == 0ul)
-        return;
+        return 1;
     time_from_ticks(deadline > now ? deadline - now : 0ul, 1000000000ul, &remaining[0], &remaining[1]);
-    user_copy_to_writable(task->root_page_table, pointer, remaining, 16ul);
+    return user_copy_to_writable(task->root_page_table, pointer, remaining, 16ul);
 }
 
 static void signal_store_info(u8* info, const struct signal_entry* entry)
@@ -3586,7 +3782,8 @@ static void signal_wake(struct process* task, u64 sig)
         return;
     if (task->sleep_reason == SLEEP_TIMER)
     {
-        process_store_remaining(task, task->sleep_user_pointer, task->sleep_deadline);
+        if (!process_store_remaining(task, task->sleep_user_pointer, task->sleep_deadline))
+            task->frame.x[10] = (u64)-14l;
         task->restart_deadline = task->sleep_deadline;
         task->restart_user_pointer = task->sleep_user_pointer;
         task->restart_pending = 1u;
@@ -3759,13 +3956,16 @@ static void process_exit_current(struct trap_frame* frame, u64 status, u64 sig)
     }
     process_reparent_children(pid);
     index = 0u;
-    while (evdev_clients_open != 0u && index < MAX_OPEN_FILES)
+    while (index < MAX_OPEN_FILES)
     {
         fd_release(&task->files[index]);
         task->files[index].used = 0u;
         index = index + 1u;
     }
     index = 0u;
+    vm_release_regions(task);
+    process_account_time();
+    cpu_account_running = 0;
     task->exit_status = (u32)code;
     task->exit_signal = (u32)sig;
     task->state = PROC_ZOMBIE;
@@ -4166,7 +4366,7 @@ static void sys_rt_sigtimedwait_dispatch(struct trap_frame* frame, u64 set_point
     current_task->sigwait_set = set;
     current_task->sleep_user_pointer = info_pointer;
     frame->x[10] = (u64)-EINTR;
-    process_sleep(frame, SLEEP_SIGWAIT, deadline == 0ul ? 0ul : timer_now() + deadline);
+    process_sleep(frame, SLEEP_SIGWAIT, deadline == 0ul ? 0ul : time_add_ticks(timer_now(), deadline));
 }
 
 static s64 signal_send_user(struct process* task, u64 sig, s32 code)
@@ -4439,7 +4639,7 @@ static s64 sys_setitimer_impl(u64 which, u64 new_pointer, u64 old_pointer)
     if (which == ITIMER_REAL)
     {
         current_task->itimer_real_interval = interval;
-        current_task->itimer_real_deadline = value == 0ul ? 0ul : timer_now() + value;
+        current_task->itimer_real_deadline = value == 0ul ? 0ul : time_deadline(timer_now(), values[2], values[3], 1000000ul);
     }
     else if (which == ITIMER_VIRTUAL)
     {
@@ -4452,6 +4652,70 @@ static s64 sys_setitimer_impl(u64 which, u64 new_pointer, u64 old_pointer)
         current_task->itimer_prof_value = value;
     }
     if (old_pointer != 0ul && !user_copy_to_writable(current_user_root_page_table, old_pointer, old, 32ul))
+        return -14l;
+    return 0l;
+}
+
+static int clock_read(u64 clock, u64* seconds, u64* nanoseconds)
+{
+    u64 ticks;
+    if (clock == CLOCK_PROCESS_CPUTIME_ID || clock == CLOCK_THREAD_CPUTIME_ID)
+    {
+        process_account_time();
+        ticks = current_task->cpu_ticks;
+    }
+    else if (clock == CLOCK_REALTIME || clock == CLOCK_MONOTONIC || clock == CLOCK_MONOTONIC_RAW || clock == CLOCK_BOOTTIME || clock == CLOCK_REALTIME_COARSE || clock == CLOCK_MONOTONIC_COARSE)
+    {
+        ticks = timer_now();
+        if (clock == CLOCK_REALTIME_COARSE || clock == CLOCK_MONOTONIC_COARSE)
+            ticks = ticks / TIMER_INTERVAL * TIMER_INTERVAL;
+    }
+    else
+        return 0;
+    time_from_ticks(ticks, 1000000000ul, seconds, nanoseconds);
+    if (clock == CLOCK_REALTIME || clock == CLOCK_REALTIME_COARSE)
+    {
+        *nanoseconds = *nanoseconds + realtime_nanoseconds;
+        *seconds = *seconds + realtime_seconds + *nanoseconds / 1000000000ul;
+        *nanoseconds = *nanoseconds % 1000000000ul;
+    }
+    return 1;
+}
+
+static s64 sys_clock_read(u64 clock, u64 pointer, int resolution)
+{
+    u64 value[2];
+    clock = (u64)(s64)(s32)clock;
+    if (!clock_read(clock, &value[0], &value[1]))
+        return -22l;
+    if (resolution)
+    {
+        u64 ticks = clock == CLOCK_REALTIME_COARSE || clock == CLOCK_MONOTONIC_COARSE ? TIMER_INTERVAL : 1ul;
+        value[0] = ticks / boot_device.timebase;
+        value[1] = ((ticks % boot_device.timebase) * 1000000000ul + boot_device.timebase - 1ul) / boot_device.timebase;
+        if (value[1] == 1000000000ul)
+        {
+            value[0] = value[0] + 1ul;
+            value[1] = 0ul;
+        }
+        if (pointer == 0ul)
+            return 0l;
+    }
+    return user_copy_to_writable(current_user_root_page_table, pointer, value, 16ul) ? 0l : -14l;
+}
+
+static s64 sys_gettimeofday_impl(u64 pointer, u64 timezone)
+{
+    u64 value[2];
+    u64 zone = 0ul;
+    if (pointer != 0ul)
+    {
+        clock_read(CLOCK_REALTIME, &value[0], &value[1]);
+        value[1] = value[1] / 1000ul;
+        if (!user_copy_to_writable(current_user_root_page_table, pointer, value, 16ul))
+            return -14l;
+    }
+    if (timezone != 0ul && !user_copy_to_writable(current_user_root_page_table, timezone, &zone, 8ul))
         return -14l;
     return 0l;
 }
@@ -4482,7 +4746,59 @@ static void sys_nanosleep_dispatch(struct trap_frame* frame, u64 request_pointer
         return;
     }
     current_task->restart_pending = 0u;
-    sys_sleep_until(frame, timer_now() + time_to_ticks(request[0], request[1], 1000000000ul), remaining_pointer);
+    sys_sleep_until(frame, time_deadline(timer_now(), request[0], request[1], 1000000000ul), remaining_pointer);
+}
+
+static void sys_clock_nanosleep_dispatch(struct trap_frame* frame, u64 clock, u64 flags, u64 request_pointer, u64 remaining_pointer)
+{
+    u64 request[2];
+    u64 deadline;
+    clock = (u64)(s64)(s32)clock;
+    if ((clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC && clock != CLOCK_BOOTTIME) || (flags & ~TIMER_ABSTIME) != 0ul)
+    {
+        frame->x[10] = (u64)-22l;
+        return;
+    }
+    if (!user_copy_from_readable(current_user_root_page_table, request, request_pointer, 16ul))
+    {
+        frame->x[10] = (u64)-14l;
+        return;
+    }
+    if ((s64)request[0] < 0l || request[1] >= 1000000000ul)
+    {
+        frame->x[10] = (u64)-22l;
+        return;
+    }
+    current_task->restart_pending = 0u;
+    if ((flags & TIMER_ABSTIME) == 0ul)
+    {
+        sys_sleep_until(frame, time_deadline(timer_now(), request[0], request[1], 1000000000ul), remaining_pointer);
+        return;
+    }
+    if (clock == CLOCK_REALTIME)
+    {
+        if (request[0] < realtime_seconds || (request[0] == realtime_seconds && request[1] <= realtime_nanoseconds))
+        {
+            frame->x[10] = 0ul;
+            return;
+        }
+        request[0] = request[0] - realtime_seconds;
+        if (request[1] < realtime_nanoseconds)
+        {
+            request[0] = request[0] - 1ul;
+            request[1] = request[1] + 1000000000ul;
+        }
+        request[1] = request[1] - realtime_nanoseconds;
+    }
+    deadline = time_to_ticks(request[0], request[1], 1000000000ul);
+    if (timer_now() >= deadline)
+    {
+        frame->x[10] = 0ul;
+        return;
+    }
+    current_task->sleep_user_pointer = 0ul;
+    frame->x[10] = (u64)-ERESTARTNOHAND;
+    process_sleep(frame, SLEEP_TIMER, deadline);
 }
 
 static void sys_restart_syscall_dispatch(struct trap_frame* frame)
@@ -4520,9 +4836,9 @@ static void scheduler_poll(u64 now)
             continue;
         if (task->itimer_real_deadline != 0ul && now >= task->itimer_real_deadline)
         {
-            task->itimer_real_deadline = task->itimer_real_interval == 0ul ? 0ul : task->itimer_real_deadline + task->itimer_real_interval;
+            task->itimer_real_deadline = task->itimer_real_interval == 0ul ? 0ul : time_add_ticks(task->itimer_real_deadline, task->itimer_real_interval);
             if (task->itimer_real_deadline != 0ul && task->itimer_real_deadline <= now)
-                task->itimer_real_deadline = now + task->itimer_real_interval;
+                task->itimer_real_deadline = time_add_ticks(now, task->itimer_real_interval);
             signal_send_kernel(task, SIGALRM, SI_KERNEL);
         }
         if (task->state != PROC_WAITING)
@@ -4650,7 +4966,7 @@ static s64 sys_execve_impl(struct trap_frame* frame, u64 path_pointer, u64 argv,
         free_user_address_space(new_root);
         return -8l;
     }
-    if (!build_user_stack(new_root, &image, &arguments, &stack))
+    if (!build_user_stack(new_root, &image, &arguments, path, &stack))
     {
         current_user_root_page_table = old_root;
         process_brk = old_brk;
@@ -4660,7 +4976,9 @@ static s64 sys_execve_impl(struct trap_frame* frame, u64 path_pointer, u64 argv,
         return -12l;
     }
     current_user_root_page_table = new_root;
-    current_task->vm_region_count = 0u;
+    vm_release_regions(current_task);
+    current_task->vm_region_count = image.region_count;
+    mem_copy(current_task->vm_regions, image.regions, (u64)image.region_count * sizeof(struct vm_region));
     {
         u32 index = 0u;
         while (index < (u32)SIGNAL_COUNT)
@@ -4678,11 +4996,11 @@ static s64 sys_execve_impl(struct trap_frame* frame, u64 path_pointer, u64 argv,
     current_task->altstack_flags = SS_DISABLE;
     current_task->restart_pending = 0u;
     current_task->did_exec = 1u;
+    mem_zero(frame, sizeof(struct trap_frame));
     frame->sepc = image.start_entry;
-    // A new image has touched no vector register yet, so its signal frames carry none until it does
-    frame->sstatus = (frame->sstatus & ~(SSTATUS_SPP | SSTATUS_VS)) | SSTATUS_SPIE | SSTATUS_VS_INITIAL;
+    frame->sstatus = SSTATUS_SPIE | SSTATUS_VS_INITIAL | SSTATUS_FS_INITIAL;
+    frame->vtype = 0x8000000000000000ul;
     frame->x[2] = stack;
-    frame->x[10] = 0ul;
     current_task->root_page_table = current_user_root_page_table;
     current_task->brk = process_brk;
     current_task->brk_min = process_brk_min;
@@ -4747,6 +5065,46 @@ static int fdt_node_unit_name_equals(const char* name, const char* text)
     return *base == 0 || *base == '@';
 }
 
+static u32 rotate_left32(u32 value, u32 shift)
+{
+    return (value << shift) | (value >> (32u - shift));
+}
+
+static void random_quarter(u32* x, u32 a, u32 b, u32 c, u32 d)
+{
+    x[a] = x[a] + x[b];
+    x[d] = rotate_left32(x[d] ^ x[a], 16u);
+    x[c] = x[c] + x[d];
+    x[b] = rotate_left32(x[b] ^ x[c], 12u);
+    x[a] = x[a] + x[b];
+    x[d] = rotate_left32(x[d] ^ x[a], 8u);
+    x[c] = x[c] + x[d];
+    x[b] = rotate_left32(x[b] ^ x[c], 7u);
+}
+
+// The ChaCha20 boot seed stays outside user address spaces
+static void random_block(u32* block)
+{
+    u32 i;
+    mem_copy(block, random_state, 64ul);
+    for (i = 0u; i < 10u; i = i + 1u)
+    {
+        random_quarter(block, 0u, 4u, 8u, 12u);
+        random_quarter(block, 1u, 5u, 9u, 13u);
+        random_quarter(block, 2u, 6u, 10u, 14u);
+        random_quarter(block, 3u, 7u, 11u, 15u);
+        random_quarter(block, 0u, 5u, 10u, 15u);
+        random_quarter(block, 1u, 6u, 11u, 12u);
+        random_quarter(block, 2u, 7u, 8u, 13u);
+        random_quarter(block, 3u, 4u, 9u, 14u);
+    }
+    for (i = 0u; i < 16u; i = i + 1u)
+        block[i] = block[i] + random_state[i];
+    random_state[12] = random_state[12] + 1u;
+    if (random_state[12] == 0u)
+        random_state[13] = random_state[13] + 1u;
+}
+
 static void parse_fdt(void* fdt)
 {
     const u8* base = (const u8*)fdt;
@@ -4774,6 +5132,8 @@ static void parse_fdt(void* fdt)
     boot_device.framebuffer_size = 0ul;
     boot_device.framebuffer_window = 0ul;
     boot_device.timebase = DEFAULT_TIMEBASE;
+    boot_device.hwcap = 0ul;
+    random_ready = 0;
 
     if (magic != 0xd00dfeedu)
         return;
@@ -4847,6 +5207,35 @@ static void parse_fdt(void* fdt)
                     u32 cells = be32(data);
                     if (cells <= 2u)
                         size_cells[depth] = cells;
+                }
+                else if (string_equals(current_node, "chosen") && string_equals(prop, "rng-seed") && length >= 32u)
+                {
+                    u32 i;
+                    mem_zero(random_state, sizeof(random_state));
+                    random_state[0] = 0x61707865u;
+                    random_state[1] = 0x3320646eu;
+                    random_state[2] = 0x79622d32u;
+                    random_state[3] = 0x6b206574u;
+                    for (i = 0u; i < 8u; i = i + 1u)
+                        random_state[4u + i] = le32(data + i * 4u);
+                    mem_zero((void*)data, length);
+                    random_ready = 1;
+                }
+                else if (string_equals(current_node, "chosen") && string_equals(prop, "cnidaria,unix-time") && length == 12u && be32(data + 8) < 1000000000u)
+                {
+                    realtime_seconds = be_cell(data, 2u);
+                    realtime_nanoseconds = (u64)be32(data + 8);
+                }
+                else if (string_equals(prop, "riscv,isa") && length >= 5u)
+                {
+                    u32 i = 4u;
+                    while (i < length && data[i] >= 'a' && data[i] <= 'z')
+                    {
+                        u8 letter = data[i];
+                        if (letter == 'i' || letter == 'm' || letter == 'a' || letter == 'f' || letter == 'd' || letter == 'c' || letter == 'v')
+                            boot_device.hwcap = boot_device.hwcap | (1ul << (letter - 'a'));
+                        i = i + 1u;
+                    }
                 }
                 else if (string_equals(prop, "timebase-frequency") && length >= 4u && be32(data) != 0u)
                     boot_device.timebase = (u64)be32(data);
@@ -7011,7 +7400,7 @@ static int fat_remove_node(u32 directory, struct vfs_node* node)
         if (!fat_dir_advance(&cursor))
             return 0;
     }
-    return fat_free_chain(node->first_cluster);
+    return file_unlink(node);
 }
 
 // A directory holds nothing once its own two names are taken out of the count
@@ -7130,7 +7519,7 @@ static int copy_user_string(u64 source, char* destination, u32 capacity)
         u64 chunk;
         u64 remaining = (u64)capacity - 1ul - (u64)index;
         u64 offset = 0ul;
-        if (!user_translate(current_user_root_page_table, source + (u64)index, PTE_R, &physical))
+        if (!user_translate_with_brk_fault(current_user_root_page_table, source + (u64)index, PTE_R, &physical))
             return 0;
         chunk = PAGE_SIZE - (physical & PAGE_MASK);
         if (chunk > remaining)
@@ -7235,7 +7624,7 @@ static s64 capture_exec_vector(u64 vector, struct exec_arguments* arguments, u32
             u64 physical;
             u64 available;
             u8 ch = 1u;
-            if (!user_translate(current_user_root_page_table, source + (u64)string_index, PTE_R, &physical))
+            if (!user_translate_with_brk_fault(current_user_root_page_table, source + (u64)string_index, PTE_R, &physical))
                 return -14l;
             available = PAGE_SIZE - (physical & PAGE_MASK);
             while (available != 0ul && ch != 0u)
@@ -7463,6 +7852,11 @@ static int vfs_component_lookup(struct vfs_node* directory, const char* name, u3
             vfs_device_node(out, VFS_NODE_INPUT_DIR);
             return 1;
         }
+        if (component_equals(name, length, "fb0") && framebuffer_pixels != 0ul)
+        {
+            vfs_device_node(out, VFS_NODE_FRAMEBUFFER);
+            return 1;
+        }
         if (component_equals(name, length, "dsp") && sound.base != 0ul)
         {
             vfs_device_node(out, VFS_NODE_DSP);
@@ -7603,6 +7997,12 @@ static u32 fat_read_node_to_memory(struct vfs_node* node, void* destination, u32
     u8* dst = (u8*)destination;
 
     *out_size = 0u;
+    if (file_find(node) != 0u)
+    {
+        if (file_size > max_size)
+            return 2u;
+        return fat_read_at(node, 0ul, destination, file_size, out_size) ? 0u : 3u;
+    }
     if (file_size > max_size)
         return 2u;
 
@@ -7664,7 +8064,7 @@ static int fat_read_path_to_memory(const char* path, void* destination, u32 max_
     return fat_read_node_to_memory(&node, destination, max_size, out_size) == 0u;
 }
 
-static int fat_read_at(struct vfs_node* node, u64 offset, void* destination, u32 count, u32* read_count)
+static int fat_read_disk_at(struct vfs_node* node, u64 offset, void* destination, u32 count, u32* read_count)
 {
     u32 cluster = node->first_cluster;
     u64 cluster_size = (u64)boot_volume.sectors_per_cluster * (u64)SECTOR_SIZE;
@@ -7770,6 +8170,275 @@ static int fat_read_at(struct vfs_node* node, u64 offset, void* destination, u32
     return 1;
 }
 
+static struct file_page* file_page_info(u64 physical)
+{
+    return &file_pages[(physical - RAM_BASE) >> 12];
+}
+
+static u32 file_find(struct vfs_node* node)
+{
+    u32 index;
+    if (node->type != VFS_NODE_FAT_FILE)
+        return 0u;
+    for (index = 0u; index < file_object_limit; index = index + 1u)
+    {
+        struct file_object* object = &file_objects[index];
+        if (object->refs != 0u && (&object->node == node || (object->unlinked == 0u && object->node.entry_lba == node->entry_lba && object->node.entry_offset == node->entry_offset)))
+            return index + 1u;
+    }
+    return 0u;
+}
+
+static u32 file_get(struct vfs_node* node)
+{
+    u32 object = file_find(node);
+    u32 index;
+    if (object != 0u)
+    {
+        file_objects[object - 1u].refs = file_objects[object - 1u].refs + 1u;
+        return object;
+    }
+    index = 0u;
+    while (index < file_object_limit && file_objects[index].refs != 0u)
+        index = index + 1u;
+    if (index == MAX_FILE_OBJECTS)
+        return 0u;
+    if (index == file_object_limit)
+        file_object_limit = index + 1u;
+    file_objects[index].node = *node;
+    file_objects[index].refs = 1u;
+    file_objects[index].unlinked = 0u;
+    file_objects[index].pages = 0ul;
+    return index + 1u;
+}
+
+static struct vfs_node* file_node(struct file_descriptor* file)
+{
+    return file->node.type == VFS_NODE_FAT_FILE ? &file_objects[file->object - 1u].node : &file->node;
+}
+
+static u64 file_page_find(u32 object, u64 offset)
+{
+    u64 page = file_objects[object - 1u].pages;
+    while (page != 0ul)
+    {
+        struct file_page* info = file_page_info(page);
+        if (info->offset == offset)
+            return page;
+        page = info->next;
+    }
+    return 0ul;
+}
+
+static u64 file_page_get(u32 object, u64 offset)
+{
+    struct file_object* file = &file_objects[object - 1u];
+    u64 page = file_page_find(object, offset);
+    u32 count;
+    struct file_page* info;
+    if (page != 0ul)
+        return page;
+    if (free_page_count == 0ul)
+        return 0ul;
+    page = alloc_page();
+    if (!fat_read_disk_at(&file->node, offset, (void*)page, (u32)PAGE_SIZE, &count))
+    {
+        free_page_raw(page);
+        return 0ul;
+    }
+    info = file_page_info(page);
+    info->offset = offset;
+    info->writable = 0u;
+    info->next = file->pages;
+    file->pages = page;
+    return page;
+}
+
+// Writable aliases can dirty a page again without a fault after writeback
+static int file_sync_page(struct file_object* file, u64 page)
+{
+    struct file_page* info = file_page_info(page);
+    if (info->writable != 0u && info->offset < file->node.size)
+    {
+        u32 count = (u32)((u64)file->node.size - info->offset > PAGE_SIZE ? PAGE_SIZE : (u64)file->node.size - info->offset);
+        u32 written;
+        if (!fat_write_at(&file->node, info->offset, (const u8*)page, count, &written) || written != count)
+            return 0;
+    }
+    return 1;
+}
+
+static int file_sync(u32 object, u64 offset, u64 length)
+{
+    struct file_object* file = &file_objects[object - 1u];
+    u64 page = file->pages;
+    while (page != 0ul)
+    {
+        struct file_page* info = file_page_info(page);
+        if (ranges_overlap(info->offset, PAGE_SIZE, offset, length) && !file_sync_page(file, page))
+            return 0;
+        page = info->next;
+    }
+    return 1;
+}
+
+static void file_trim_pages(struct file_object* file)
+{
+    u64* link = &file->pages;
+    while (*link != 0ul)
+    {
+        u64 page = *link;
+        struct file_page* info = file_page_info(page);
+        if (*page_share(page) == 0u && file_sync_page(file, page))
+        {
+            *link = info->next;
+            user_page_put(page);
+        }
+        else
+            link = &info->next;
+    }
+}
+
+static void file_reclaim_pages(u64 needed)
+{
+    u32 index;
+    for (index = 0u; index < file_object_limit && free_page_count < needed; index = index + 1u)
+    {
+        if (file_objects[index].refs != 0u)
+            file_trim_pages(&file_objects[index]);
+    }
+}
+
+static void file_drop_pages(struct file_object* file)
+{
+    u64 page = file->pages;
+    file->pages = 0ul;
+    while (page != 0ul)
+    {
+        u64 next = file_page_info(page)->next;
+        user_page_put(page);
+        page = next;
+    }
+}
+
+static int file_put(u32 object)
+{
+    struct file_object* file = &file_objects[object - 1u];
+    int result = 1;
+    file->refs = file->refs - 1u;
+    if (file->refs != 0u)
+    {
+        file_trim_pages(file);
+        return 1;
+    }
+    if (file->unlinked != 0u)
+        result = fat_free_chain(file->node.first_cluster);
+    else
+        result = file_sync(object, 0ul, (u64)file->node.size);
+    file_drop_pages(file);
+    while (file_object_limit != 0u && file_objects[file_object_limit - 1u].refs == 0u)
+        file_object_limit = file_object_limit - 1u;
+    return result;
+}
+
+static int file_unlink(struct vfs_node* node)
+{
+    u32 object = file_find(node);
+    if (object == 0u)
+        return fat_free_chain(node->first_cluster);
+    file_objects[object - 1u].unlinked = 1u;
+    file_objects[object - 1u].node.entry_lba = 0u;
+    return 1;
+}
+
+static int file_truncate(struct vfs_node* node)
+{
+    u32 object = file_find(node);
+    u32 index;
+    if (object != 0u)
+    {
+        for (index = 0u; index < MAX_PROCESSES; index = index + 1u)
+        {
+            struct process* task = &processes[index];
+            u32 slot;
+            if (task->used == 0u || task->root_page_table == 0ul)
+                continue;
+            for (slot = 0u; slot < task->vm_region_count; slot = slot + 1u)
+            {
+                struct vm_region* region = &task->vm_regions[slot];
+                if (region->object == object)
+                    unmap_user_pages(task->root_page_table, region->start, region->end);
+            }
+        }
+        node = &file_objects[object - 1u].node;
+        file_drop_pages(&file_objects[object - 1u]);
+    }
+    if (!fat_free_chain(node->first_cluster))
+        return 0;
+    node->first_cluster = 0u;
+    node->size = 0u;
+    return fat_write_entry(node);
+}
+
+static int fat_read_at(struct vfs_node* node, u64 offset, void* destination, u32 count, u32* read_count)
+{
+    u32 object = file_find(node);
+    u32 done = 0u;
+    if (object != 0u)
+        node = &file_objects[object - 1u].node;
+    if (object == 0u || file_objects[object - 1u].pages == 0ul)
+        return fat_read_disk_at(node, offset, destination, count, read_count);
+    *read_count = 0u;
+    while (done < count && offset + done < (u64)node->size)
+    {
+        u64 position = offset + done;
+        u64 page = file_page_find(object, align_down(position, PAGE_SIZE));
+        u32 chunk = (u32)(PAGE_SIZE - (position & PAGE_MASK));
+        if (chunk > count - done)
+            chunk = count - done;
+        if ((u64)chunk > (u64)node->size - position)
+            chunk = (u32)((u64)node->size - position);
+        if (page != 0ul)
+            mem_copy((u8*)destination + done, (const void*)(page + (position & PAGE_MASK)), chunk);
+        else
+        {
+            u32 actual;
+            if (!fat_read_disk_at(node, position, (u8*)destination + done, chunk, &actual) || actual != chunk)
+                return 0;
+        }
+        done = done + chunk;
+    }
+    *read_count = done;
+    return 1;
+}
+
+static void file_update_pages(u32 object, u64 offset, const u8* source, u32 count)
+{
+    u32 done = 0u;
+    while (done < count)
+    {
+        u64 position = offset + done;
+        u64 page = file_page_find(object, align_down(position, PAGE_SIZE));
+        u32 chunk = (u32)(PAGE_SIZE - (position & PAGE_MASK));
+        if (chunk > count - done)
+            chunk = count - done;
+        if (page != 0ul)
+            mem_copy((void*)(page + (position & PAGE_MASK)), source + done, chunk);
+        done = done + chunk;
+    }
+}
+
+static void vm_release_regions(struct process* task)
+{
+    u32 index;
+    for (index = 0u; index < task->vm_region_count; index = index + 1u)
+    {
+        if (task->vm_regions[index].object != 0u)
+            file_put(task->vm_regions[index].object);
+    }
+    task->vm_region_count = 0u;
+}
+
 static void fd_clear(u32 fd)
 {
     open_files[fd].used = 0u;
@@ -7783,10 +8452,13 @@ static void fd_clear(u32 fd)
 }
 
 // What an open created goes away with the last descriptor that refers to it
-static void fd_release(struct file_descriptor* file)
+static int fd_release(struct file_descriptor* file)
 {
     if (file->used != 0u && file->node.type == VFS_NODE_EVDEV)
         evdev_client_put(file->object);
+    if (file->used != 0u && file->node.type == VFS_NODE_FAT_FILE)
+        return file_put(file->object);
+    return 1;
 }
 
 static int fd_valid(u64 fd)
@@ -7808,12 +8480,17 @@ static int fd_alloc(void)
     return -1;
 }
 
-static void fd_install(u32 fd, struct vfs_node* node, u64 flags)
+static int fd_install(u32 fd, struct vfs_node* node, u64 flags)
 {
+    u32 object = node->type == VFS_NODE_FAT_FILE ? file_get(node) : 0u;
+    if (node->type == VFS_NODE_FAT_FILE && object == 0u)
+        return 0;
+    open_files[fd].object = object;
     open_files[fd].used = 1u;
     open_files[fd].flags = (u32)flags;
     open_files[fd].offset = 0ul;
     mem_copy(&open_files[fd].node, node, sizeof(struct vfs_node));
+    return 1;
 }
 
 static void vfs_init(void)
@@ -8245,11 +8922,9 @@ static s64 tty_job_check(u64 sig)
     return -ERESTARTSYS;
 }
 
-static s64 tty_read(u64 buffer, u64 count, u32 flags)
+static s64 tty_read_check(u64 count, u32 flags)
 {
     struct tty* tty = &console_tty;
-    u8 chunk[512];
-    u64 done = 0ul;
     s64 check = tty_job_check(SIGTTIN);
     current_task->sleep_deadline = 0ul;
     if (check != 0l)
@@ -8276,6 +8951,14 @@ static s64 tty_read(u64 buffer, u64 count, u32 flags)
             return -ERESTARTSYS;
         }
     }
+    return 0l;
+}
+
+static s64 tty_read_data(u64 buffer, u64 count)
+{
+    struct tty* tty = &console_tty;
+    u8 chunk[512];
+    u64 done = 0ul;
     while (done < count && tty->count != 0u)
     {
         u32 taken = 0u;
@@ -8308,6 +8991,12 @@ static s64 tty_read(u64 buffer, u64 count, u32 flags)
     return (s64)done;
 }
 
+static s64 tty_read(u64 buffer, u64 count, u32 flags)
+{
+    s64 check = tty_read_check(count, flags);
+    return check != 0l ? check : tty_read_data(buffer, count);
+}
+
 static s64 tty_write(u64 buffer, u64 count)
 {
     struct tty* tty = &console_tty;
@@ -8322,7 +9011,7 @@ static s64 tty_write(u64 buffer, u64 count)
     {
         u64 physical;
         u64 chunk;
-        if (!user_translate(current_user_root_page_table, buffer + done, PTE_R, &physical))
+        if (!user_translate_with_brk_fault(current_user_root_page_table, buffer + done, PTE_R, &physical))
             return done != 0ul ? (s64)done : -14l;
         chunk = PAGE_SIZE - (physical & PAGE_MASK);
         if (chunk > count - done)
@@ -8457,6 +9146,30 @@ static s64 tty_ioctl(struct file_descriptor* file, u64 request, u64 argument)
     u8 data[TTY_TERMIOS_SIZE];
     u32 value;
     s64 check;
+    if (request == KDGETMODE)
+        return user_copy_to_writable(current_user_root_page_table, argument, &framebuffer_console_mode, 4ul) ? 0l : -14l;
+    if (request == KDSETMODE)
+    {
+        if (argument != KD_TEXT && argument != KD_GRAPHICS)
+            return -22l;
+        check = tty_job_check(SIGTTOU);
+        if (check != 0l)
+            return check;
+        if (framebuffer_console_mode != (u32)argument)
+        {
+            fbcon_begin();
+            framebuffer_console_mode = (u32)argument;
+            if (framebuffer_console_mode == KD_TEXT)
+            {
+                fbcon_reset_state();
+                fbcon_batch = 1u;
+                fbcon_end();
+            }
+            else
+                fbcon_batch = 0u;
+        }
+        return 0l;
+    }
     if (request == TCGETS)
     {
         tty_store_termios(data);
@@ -8589,14 +9302,17 @@ static s64 tty_ioctl(struct file_descriptor* file, u64 request, u64 argument)
 static s64 zero_read_to_user(u64 buffer, u64 count)
 {
     u64 done = 0ul;
-    mem_zero(sector_buffer, SECTOR_SIZE);
+    u8 zeros[SECTOR_SIZE];
+    mem_zero(zeros, SECTOR_SIZE);
     while (done < count)
     {
         u64 chunk = count - done;
         if (chunk > SECTOR_SIZE)
             chunk = SECTOR_SIZE;
-        if (!user_copy_to_writable(current_user_root_page_table, buffer + done, sector_buffer, chunk))
-            return -14l;
+        if (chunk > PAGE_SIZE - ((buffer + done) & PAGE_MASK))
+            chunk = PAGE_SIZE - ((buffer + done) & PAGE_MASK);
+        if (!user_copy_to_writable(current_user_root_page_table, buffer + done, zeros, chunk))
+            return done == 0ul ? -14l : (s64)done;
         done = done + chunk;
     }
     return (s64)done;
@@ -8611,19 +9327,117 @@ static s64 fat_file_read_to_user(struct file_descriptor* file, u64 buffer, u64 c
     {
         u64 physical;
         int direct = user_translate_with_brk_fault(current_user_root_page_table, buffer + done, PTE_W, &physical);
-        u64 room = direct ? PAGE_SIZE - (physical & PAGE_MASK) : PAGE_SIZE;
+        u64 room = PAGE_SIZE - ((buffer + done) & PAGE_MASK);
+        if (file_objects[file->object - 1u].pages != 0ul)
+            direct = 0;
         u32 requested = (u32)(count - done > room ? room : count - done);
         u32 actual = 0u;
-        if (!fat_read_at(&file->node, file->offset + done, direct ? (void*)physical : (void*)file_read_buffer, requested, &actual))
+        if (!fat_read_at(file_node(file), file->offset, direct ? (void*)physical : (void*)file_read_buffer, requested, &actual))
             return done == 0ul ? -5l : (s64)done;
         if (actual == 0u)
             break;
         if (!direct && !user_copy_to_writable(current_user_root_page_table, buffer + done, file_read_buffer, (u64)actual))
-            return -14l;
+            return done == 0ul ? -14l : (s64)done;
         done = done + (u64)actual;
+        file->offset = file->offset + (u64)actual;
     }
-    file->offset = file->offset + done;
     return (s64)done;
+}
+
+static void framebuffer_present(void)
+{
+    ((volatile u64*)boot_device.framebuffer_base)[8] = 1ul;
+}
+
+static s64 framebuffer_transfer(struct file_descriptor* file, u64 buffer, u64 count, int write)
+{
+    u64 done = 0ul;
+    if (count == 0ul)
+        return 0l;
+    if (file->offset >= framebuffer_bytes)
+        return write ? (file->offset > framebuffer_bytes ? -27l : -28l) : 0l;
+    if (count > framebuffer_bytes - file->offset)
+        count = framebuffer_bytes - file->offset;
+    while (done < count)
+    {
+        u64 physical;
+        u64 chunk;
+        if (!user_translate_with_brk_fault(current_user_root_page_table, buffer + done, write ? PTE_R : PTE_W, &physical))
+            return done != 0ul ? (s64)done : -14l;
+        chunk = PAGE_SIZE - (physical & PAGE_MASK);
+        if (chunk > count - done)
+            chunk = count - done;
+        if (write)
+            mem_copy((void*)(framebuffer_pixels + file->offset), (const void*)physical, chunk);
+        else
+            mem_copy((void*)physical, (const void*)(framebuffer_pixels + file->offset), chunk);
+        file->offset = file->offset + chunk;
+        done = done + chunk;
+    }
+    if (write)
+        framebuffer_present();
+    return (s64)done;
+}
+
+static void framebuffer_store_var(u8* data)
+{
+    mem_zero(data, 160ul);
+    store_le32(data, framebuffer_width);
+    store_le32(data + 4, framebuffer_height);
+    store_le32(data + 8, framebuffer_width);
+    store_le32(data + 12, framebuffer_height);
+    store_le32(data + 24, 32u);
+    store_le32(data + 32, 16u);
+    store_le32(data + 36, 8u);
+    store_le32(data + 44, 8u);
+    store_le32(data + 48, 8u);
+    store_le32(data + 60, 8u);
+    store_le32(data + 88, 0xffffffffu);
+    store_le32(data + 92, 0xffffffffu);
+}
+
+static s64 framebuffer_ioctl(u64 request, u64 argument)
+{
+    u8 data[160];
+    if (request == FBIOGET_FSCREENINFO)
+    {
+        mem_zero(data, 80ul);
+        mem_copy(data, "Cnidaria", 8ul);
+        store_le64(data + 16, framebuffer_pixels);
+        store_le32(data + 24, (u32)framebuffer_bytes);
+        store_le32(data + 36, 2u);
+        store_le32(data + 48, framebuffer_stride);
+        return user_copy_to_writable(current_user_root_page_table, argument, data, 80ul) ? 0l : -14l;
+    }
+    if (request == FBIOGET_VSCREENINFO)
+    {
+        framebuffer_store_var(data);
+        return user_copy_to_writable(current_user_root_page_table, argument, data, 160ul) ? 0l : -14l;
+    }
+    if (request == FBIOPUT_VSCREENINFO || request == FBIOPAN_DISPLAY)
+    {
+        if (!user_copy_from_readable(current_user_root_page_table, data, argument, 160ul))
+            return -14l;
+        if (le32(data + 16) != 0u || le32(data + 20) != 0u || le32(data + 132) != 0u)
+            return -22l;
+        if (request == FBIOPUT_VSCREENINFO)
+        {
+            if (le32(data) != framebuffer_width || le32(data + 4) != framebuffer_height ||
+                le32(data + 8) != framebuffer_width || le32(data + 12) != framebuffer_height ||
+                le32(data + 24) != 32u || le32(data + 28) != 0u || le32(data + 80) != 0u ||
+                le32(data + 136) != 0u || (le32(data + 84) & 15u) > 2u)
+                return -22l;
+            framebuffer_store_var(data);
+        }
+        if (!user_copy_to_writable(current_user_root_page_table, argument, data, 160ul))
+            return -14l;
+        if (request == FBIOPAN_DISPLAY)
+            framebuffer_present();
+        return 0l;
+    }
+    if (request == FBIOBLANK)
+        return argument == 0ul ? 0l : -22l;
+    return -25l;
 }
 
 static s64 vfs_read(u64 fd_value, u64 buffer, u64 count)
@@ -8644,6 +9458,8 @@ static s64 vfs_read(u64 fd_value, u64 buffer, u64 count)
         return zero_read_to_user(buffer, count);
     if (type == VFS_NODE_FAT_FILE)
         return fat_file_read_to_user(file, buffer, count);
+    if (type == VFS_NODE_FRAMEBUFFER)
+        return framebuffer_transfer(file, buffer, count, 0);
     if (type == VFS_NODE_EVDEV)
         return evdev_read(file, buffer, count);
     if (type == VFS_NODE_DSP)
@@ -8657,19 +9473,29 @@ static s64 fat_write_from_user(struct file_descriptor* file, u64 buffer, u64 cou
 {
     u64 done = 0ul;
     if ((file->flags & O_APPEND) != 0ul)
-        file->offset = (u64)file->node.size;
+        file->offset = (u64)file_node(file)->size;
     while (done < count)
     {
         u64 physical;
         u64 chunk;
         u32 written;
-        if (!user_translate(current_user_root_page_table, buffer + done, PTE_R, &physical))
-            return -14l;
+        if (!user_translate_with_brk_fault(current_user_root_page_table, buffer + done, PTE_R, &physical))
+            return done == 0ul ? -14l : (s64)done;
         chunk = PAGE_SIZE - (physical & PAGE_MASK);
         if (chunk > count - done)
             chunk = count - done;
-        if (!fat_write_at(&file->node, file->offset, (const u8*)physical, (u32)chunk, &written))
+        if (file->offset >= 0xfffffffful)
+            return done == 0ul ? -27l : (s64)done;
+        if (chunk > 0xfffffffful - file->offset)
+            chunk = 0xfffffffful - file->offset;
+        if (file_objects[file->object - 1u].pages != 0ul)
+        {
+            mem_copy(file_read_buffer, (const void*)physical, chunk);
+            physical = (u64)file_read_buffer;
+        }
+        if (!fat_write_at(file_node(file), file->offset, (const u8*)physical, (u32)chunk, &written))
             return done != 0ul ? (s64)done : -5l;
+        file_update_pages(file->object, file->offset, (const u8*)physical, written);
         file->offset = file->offset + (u64)written;
         done = done + (u64)written;
         if (written == 0u)
@@ -8694,6 +9520,8 @@ static s64 vfs_write(u64 fd_value, u64 buffer, u64 count)
         return (s64)count;
     if (type == VFS_NODE_FAT_FILE)
         return fat_write_from_user(file, buffer, count);
+    if (type == VFS_NODE_FRAMEBUFFER)
+        return framebuffer_transfer(file, buffer, count, 1);
     if (type == VFS_NODE_DSP)
         return dsp_write(file, buffer, count);
     if (type == VFS_NODE_EVDEV)
@@ -8701,6 +9529,64 @@ static s64 vfs_write(u64 fd_value, u64 buffer, u64 count)
     if (type == VFS_NODE_ROOT_DIR || type == VFS_NODE_DEV_DIR || type == VFS_NODE_INPUT_DIR)
         return -30l;
     return -9l;
+}
+
+static s64 vfs_iov(u64 fd, u64 pointer, u64 count, int write)
+{
+    u64 vectors[MAX_IOV * 2ul];
+    u64 total = 0ul;
+    u64 done = 0ul;
+    u64 index;
+    struct file_descriptor* file;
+    if (!fd_valid(fd))
+        return -9l;
+    file = &open_files[(u32)fd];
+    if (write ? !fd_write_allowed(file) : !fd_read_allowed(file))
+        return -9l;
+    if (count > MAX_IOV)
+        return -22l;
+    if (count == 0ul)
+        return 0l;
+    if (!user_copy_from_readable(current_user_root_page_table, vectors, pointer, count * 16ul))
+        return -14l;
+    for (index = 0ul; index < count; index = index + 1ul)
+    {
+        u64 base = vectors[index * 2ul];
+        u64 length = vectors[index * 2ul + 1ul];
+        if (length > 0x7ffffffffffffffful - total)
+            return -22l;
+        if (length != 0ul && (base >= USER_VA_LIMIT || length > USER_VA_LIMIT - base))
+            return -14l;
+        total = total + length;
+    }
+    if (total > MAX_RW_COUNT)
+        total = MAX_RW_COUNT;
+    if (!write && total != 0ul && file->node.type == VFS_NODE_CONSOLE)
+    {
+        s64 check = tty_read_check(total, file->flags);
+        if (check != 0l)
+            return check;
+    }
+    for (index = 0ul; index < count && done < total; index = index + 1ul)
+    {
+        u64 length = vectors[index * 2ul + 1ul];
+        u32 lines = console_tty.lines;
+        s64 result;
+        if (length > total - done)
+            length = total - done;
+        if (length == 0ul)
+            continue;
+        if (!write && file->node.type == VFS_NODE_CONSOLE)
+            result = tty_read_data(vectors[index * 2ul], length);
+        else
+            result = write ? vfs_write(fd, vectors[index * 2ul], length) : vfs_read(fd, vectors[index * 2ul], length);
+        if (result < 0l)
+            return done == 0ul ? result : (s64)done;
+        done = done + (u64)result;
+        if ((u64)result < length || (!write && file->node.type == VFS_NODE_CONSOLE && console_tty.lines < lines))
+            break;
+    }
+    return (s64)done;
 }
 
 static s64 vfs_openat(u64 dirfd, u64 path_pointer, u64 flags, u64 mode)
@@ -8762,17 +9648,14 @@ static s64 vfs_openat(u64 dirfd, u64 path_pointer, u64 flags, u64 mode)
     // Opening for writing with a truncation gives back everything the file held
     if (node.type == VFS_NODE_FAT_FILE && (flags & O_TRUNC) != 0ul && (flags & O_ACCMODE) != O_RDONLY)
     {
-        if (!fat_free_chain(node.first_cluster))
-            return -5l;
-        node.first_cluster = 0u;
-        node.size = 0u;
-        if (!fat_write_entry(&node))
+        if (!file_truncate(&node))
             return -5l;
     }
     fd = fd_alloc();
     if (fd < 0)
         return -24l;
-    fd_install((u32)fd, &node, flags);
+    if (!fd_install((u32)fd, &node, flags))
+        return -23l;
     // A reader that opens an event node gets a queue of its own, starting from what happens next
     if (node.type == VFS_NODE_EVDEV)
     {
@@ -8963,9 +9846,9 @@ static s64 vfs_close(u64 fd)
 {
     if (!fd_valid(fd))
         return -9l;
-    fd_release(&open_files[(u32)fd]);
+    int result = fd_release(&open_files[(u32)fd]);
     fd_clear((u32)fd);
-    return 0l;
+    return result ? 0l : -5l;
 }
 
 static const char* root_dir_entry_name(u64 index)
@@ -9063,7 +9946,9 @@ static const char* dev_dir_entry_name(u64 index)
         return "zero";
     if (index == 7ul)
         return "input";
-    if (index == 8ul && sound.base != 0ul)
+    if (index == 8ul && framebuffer_pixels != 0ul)
+        return "fb0";
+    if (index == (framebuffer_pixels != 0ul ? 9ul : 8ul) && sound.base != 0ul)
         return "dsp";
     return NULL;
 }
@@ -9072,7 +9957,7 @@ static u32 dev_dir_entry_type(u64 index)
 {
     if (index == 0ul || index == 1ul || index == 7ul)
         return DT_DIR;
-    if (index >= 2ul && index <= 8ul)
+    if (index >= 2ul && index <= 9ul)
         return DT_CHR;
     return 0u;
 }
@@ -9194,18 +10079,18 @@ static s64 vfs_lseek(u64 fd_value, u64 offset, u64 whence)
     if (!fd_valid(fd_value))
         return -9l;
     file = &open_files[(u32)fd_value];
-    if (file->node.type != VFS_NODE_FAT_FILE)
+    if (file->node.type != VFS_NODE_FAT_FILE && file->node.type != VFS_NODE_FRAMEBUFFER)
         return -29l;
     if (whence == SEEK_SET)
         base = 0l;
     else if (whence == SEEK_CUR)
         base = (s64)file->offset;
     else if (whence == SEEK_END)
-        base = (s64)file->node.size;
+        base = file->node.type == VFS_NODE_FRAMEBUFFER ? (s64)framebuffer_bytes : (s64)file_node(file)->size;
     else
         return -22l;
-    requested = base + (s64)offset;
-    if (requested < 0l)
+    requested = (s64)((u64)base + offset);
+    if (requested < 0l || ((s64)offset > 0l && requested < base))
         return -22l;
     file->offset = (u64)requested;
     return requested;
@@ -9225,7 +10110,8 @@ static void stat_store_node(u8* stat_buffer, struct vfs_node* node)
     // Device numbers are Linux's: input is major 13 with event nodes from minor 64, sound is major 14 with dsp at minor 3
     store_le64(stat_buffer + 32, node->type == VFS_NODE_CONSOLE ? 1ul :
         node->type == VFS_NODE_EVDEV ? (13ul << 8) | (64ul + (u64)node->first_cluster) :
-        node->type == VFS_NODE_DSP ? (14ul << 8) | 3ul : 0ul);
+        node->type == VFS_NODE_DSP ? (14ul << 8) | 3ul :
+        node->type == VFS_NODE_FRAMEBUFFER ? 29ul << 8 : 0ul);
     store_le64(stat_buffer + 48, (u64)node->size);
     store_le32(stat_buffer + 56, SECTOR_SIZE);
     store_le64(stat_buffer + 64, blocks);
@@ -9236,7 +10122,7 @@ static s64 vfs_fstat(u64 fd_value, u64 stat_pointer)
     u8 stat_buffer[128];
     if (!fd_valid(fd_value))
         return -9l;
-    stat_store_node(stat_buffer, &open_files[(u32)fd_value].node);
+    stat_store_node(stat_buffer, file_node(&open_files[(u32)fd_value]));
     if (!user_copy_to_writable(current_user_root_page_table, stat_pointer, stat_buffer, 128ul))
         return -14l;
     return 0l;
@@ -9254,7 +10140,7 @@ static s64 vfs_newfstatat(u64 dirfd, u64 path_pointer, u64 stat_pointer, u64 fla
         {
             if (!fd_valid(dirfd))
                 return -9l;
-            stat_store_node(sector_buffer, &open_files[(u32)dirfd].node);
+            stat_store_node(sector_buffer, file_node(&open_files[(u32)dirfd]));
             if (!user_copy_to_writable(current_user_root_page_table, stat_pointer, sector_buffer, 128ul))
                 return -14l;
             return 0l;
@@ -9349,6 +10235,8 @@ static s64 sys_ioctl_impl(u64 fd_value, u64 request, u64 argument)
 {
     if (!fd_valid(fd_value))
         return -9l;
+    if (open_files[(u32)fd_value].node.type == VFS_NODE_FRAMEBUFFER)
+        return framebuffer_ioctl(request, argument);
     if (open_files[(u32)fd_value].node.type == VFS_NODE_EVDEV)
         return evdev_ioctl(&open_files[(u32)fd_value], request, argument);
     if (open_files[(u32)fd_value].node.type == VFS_NODE_DSP)
@@ -9431,7 +10319,7 @@ static int vm_range_overlaps(u64 start, u64 end)
     return 0;
 }
 
-static struct vm_region* vm_append_region(u64 start, u64 end, u64 prot, u64 flags)
+static struct vm_region* vm_append_region(u64 start, u64 end, u64 prot, u64 flags, u32 object, u64 offset)
 {
     struct vm_region* region;
     if (current_task->vm_region_count == MAX_VM_REGIONS)
@@ -9442,71 +10330,137 @@ static struct vm_region* vm_append_region(u64 start, u64 end, u64 prot, u64 flag
     region->end = end;
     region->prot = prot;
     region->flags = flags;
+    region->offset = offset;
+    region->object = object;
+    if (object != 0u)
+        file_objects[object - 1u].refs = file_objects[object - 1u].refs + 1u;
     return region;
 }
 
-static int vm_add_region(u64 start, u64 end, u64 prot, u64 flags)
+static int vm_change_regions(u64 start, u64 end, u64 prot, int remove, int apply)
 {
-    u32 index = 0u;
-    while (index < current_task->vm_region_count)
+    struct vm_region regions[MAX_VM_REGIONS];
+    u32 count = 0u;
+    u32 index;
+    for (index = 0u; index < current_task->vm_region_count; index = index + 1u)
     {
-        struct vm_region* region = &current_task->vm_regions[index];
-        if (region->end == start && region->prot == prot && region->flags == flags)
+        struct vm_region region = current_task->vm_regions[index];
+        u64 left = region.start;
+        while (left < region.end)
         {
-            region->end = end;
-            return 1;
+            u64 right = region.end;
+            int inside = left >= start && left < end;
+            if (left < start && right > start)
+                right = start;
+            else if (inside && right > end)
+                right = end;
+            if (!inside || !remove)
+            {
+                u64 protection = inside ? prot : region.prot;
+                u64 offset = region.offset + left - region.start;
+                struct vm_region* previous = count == 0u ? NULL : &regions[count - 1u];
+                if (previous != NULL && previous->end == left && previous->prot == protection && previous->flags == region.flags && previous->object == region.object &&
+                    ((region.object == 0u && (region.flags & VM_FRAMEBUFFER) == 0ul) || previous->offset + previous->end - previous->start == offset))
+                    previous->end = right;
+                else
+                {
+                    if (count == MAX_VM_REGIONS)
+                        return 0;
+                    regions[count] = region;
+                    regions[count].start = left;
+                    regions[count].end = right;
+                    regions[count].offset = offset;
+                    regions[count].prot = protection;
+                    count = count + 1u;
+                }
+            }
+            left = right;
         }
-        if (region->start == end && region->prot == prot && region->flags == flags)
-        {
-            region->start = start;
-            return 1;
-        }
-        index = index + 1u;
     }
-    return vm_append_region(start, end, prot, flags) != NULL;
+    if (!apply)
+        return (int)count + 1;
+    for (index = 0u; index < count; index = index + 1u)
+    {
+        if (regions[index].object != 0u)
+            file_objects[regions[index].object - 1u].refs = file_objects[regions[index].object - 1u].refs + 1u;
+    }
+    vm_release_regions(current_task);
+    mem_copy(current_task->vm_regions, regions, (u64)count * sizeof(struct vm_region));
+    current_task->vm_region_count = count;
+    return (int)count + 1;
 }
 
-static int vm_remove_range(u64 start, u64 end)
+static int vm_sync_range(u64 start, u64 end)
 {
-    u32 index = 0u;
-    u32 splits = 0u;
-    while (index < current_task->vm_region_count)
+    u32 index;
+    for (index = 0u; index < current_task->vm_region_count; index = index + 1u)
     {
         struct vm_region* region = &current_task->vm_regions[index];
-        if (start > region->start && end < region->end)
-            splits = splits + 1u;
-        index = index + 1u;
+        if ((region->flags & VM_FRAMEBUFFER) != 0ul && start < region->end && end > region->start)
+            framebuffer_present();
+        if (region->object != 0u && (region->flags & MAP_SHARED) != 0ul && start < region->end && end > region->start)
+        {
+            u64 left = start > region->start ? start : region->start;
+            u64 right = end < region->end ? end : region->end;
+            if (!file_sync(region->object, region->offset + left - region->start, right - left))
+                return 0;
+        }
     }
-    if (current_task->vm_region_count + splits > MAX_VM_REGIONS)
+    return 1;
+}
+
+static int vm_fault(u64 root, u64 address, u64 required)
+{
+    struct vm_region* region;
+    struct file_object* file;
+    u64 offset;
+    u64 physical;
+    u64 flags;
+    u64 page = align_down(address, PAGE_SIZE);
+    if (root != current_user_root_page_table)
         return 0;
-    index = 0u;
-    while (index < current_task->vm_region_count)
+    region = vm_find_region(address);
+    if (region == NULL || (region->object == 0u && (region->flags & VM_FRAMEBUFFER) == 0ul))
+        return 0;
+    flags = vm_pte_flags(region->prot);
+    if (flags == 0ul || (flags & required) != required)
+        return 0;
+    if ((region->flags & VM_FRAMEBUFFER) != 0ul)
     {
-        struct vm_region* region = &current_task->vm_regions[index];
-        if (start >= region->end || end <= region->start)
-        {
-            index = index + 1u;
-            continue;
-        }
-        if (start <= region->start && end >= region->end)
-        {
-            // The last region takes the freed place, and is looked at next
-            current_task->vm_region_count = current_task->vm_region_count - 1u;
-            *region = current_task->vm_regions[current_task->vm_region_count];
-            continue;
-        }
-        if (start <= region->start)
-            region->start = end;
-        else if (end >= region->end)
-            region->end = start;
-        else
-        {
-            u64 right_end = region->end;
-            region->end = start;
-            vm_append_region(end, right_end, region->prot, region->flags);
-        }
-        index = index + 1u;
+        if (user_translate(root, address, 0ul, &physical))
+            return 0;
+        file_reclaim_pages(2ul);
+        if (free_page_count < 2ul)
+            return -12;
+        physical = framebuffer_pixels + region->offset + page - region->start;
+        map_page(root, page, physical, flags | PTE_U | PTE_A | PTE_D);
+        __asm__ volatile("sfence.vma %[page], zero" : : [page] "{t0}"(page) : "memory");
+        return 1;
     }
+    file = &file_objects[region->object - 1u];
+    offset = region->offset + page - region->start;
+    if (offset >= (u64)file->node.size)
+        return -6;
+    if (user_translate(root, address, 0ul, &physical))
+        return 0;
+    file_reclaim_pages(4ul);
+    if (free_page_count < 4ul)
+        return -12;
+    physical = file_page_get(region->object, offset);
+    if (physical == 0ul)
+        return -5;
+    if ((flags & PTE_W) != 0ul)
+    {
+        if ((region->flags & MAP_SHARED) != 0ul)
+            file_page_info(physical)->writable = 1u;
+        else
+            flags = (flags & ~PTE_W) | PTE_SOFT_COW;
+    }
+    *page_share(physical) = *page_share(physical) + 1u;
+    map_page(root, page, physical, flags | PTE_U | PTE_A | PTE_D);
+    if ((required & PTE_W) != 0ul && (flags & PTE_SOFT_COW) != 0ul)
+        user_break_cow(root, address);
+    __asm__ volatile("sfence.vma %[page], zero" : : [page] "{t0}"(page) : "memory");
     return 1;
 }
 
@@ -9516,27 +10470,32 @@ static int vm_apply_protection(u64 start, u64 end, u64 prot)
     u64 pte_flags = vm_pte_flags(prot);
     while (page < end)
     {
+        struct vm_region* region = vm_find_region(page);
         u64* entry = user_leaf_pte(current_user_root_page_table, page);
+        if (entry == NULL && (pte_flags == 0ul || region->object != 0u || (region->flags & VM_FRAMEBUFFER) != 0ul))
+        {
+            u64 next = align_down(page, 0x200000ul) + 0x200000ul;
+            page = next < region->end ? next : region->end;
+            continue;
+        }
         if (pte_flags == 0ul)
         {
             if (entry != NULL && (*entry & PTE_V) != 0ul)
-            {
-                u64 physical = pte_physical(*entry);
-                *entry = pte_make_noaccess(physical);
-            }
+                *entry = pte_make_noaccess(pte_physical(*entry));
         }
         else if (entry == NULL || ((*entry & PTE_V) == 0ul && (*entry & PTE_SOFT_NOACCESS) == 0ul))
         {
-            if (!map_user_page(current_user_root_page_table, page, pte_flags))
+            if (region->object == 0u && (region->flags & VM_FRAMEBUFFER) == 0ul && !map_user_page(current_user_root_page_table, page, pte_flags))
                 return 0;
         }
         else
         {
             u64 physical = pte_physical(*entry);
             u64 flags = pte_flags;
-            // A page another space still maps cannot take W, only copy-on-write
-            if ((flags & PTE_W) != 0ul && *page_share(physical) != 0u)
+            if ((flags & PTE_W) != 0ul && (region->flags & MAP_SHARED) == 0ul && *page_share(physical) != 0u)
                 flags = (flags & ~PTE_W) | PTE_SOFT_COW;
+            if ((flags & PTE_W) != 0ul && (region->flags & MAP_SHARED) != 0ul && region->object != 0u)
+                file_page_info(physical)->writable = 1u;
             *entry = pte_make(physical, flags | PTE_U | PTE_A | PTE_D);
         }
         page = page + PAGE_SIZE;
@@ -9547,38 +10506,104 @@ static int vm_apply_protection(u64 start, u64 end, u64 prot)
 
 static s64 sys_munmap_impl(u64 address, u64 length)
 {
-    u64 start;
     u64 end;
-    if ((address & PAGE_MASK) != 0ul || length == 0ul)
+    if ((address & PAGE_MASK) != 0ul || length == 0ul || length > USER_VA_LIMIT)
         return -22l;
-    start = address;
     length = align_up(length, PAGE_SIZE);
-    end = start + length;
-    if (end < start || !user_mapping_range_valid(start, length))
+    end = address + length;
+    if (!user_mapping_range_valid(address, length))
         return -22l;
-    if (!unmap_user_pages(current_user_root_page_table, start, end))
-        return -22l;
-    if (!vm_remove_range(start, end))
+    if (!vm_change_regions(address, end, 0ul, 1, 0))
         return -12l;
+    if (!vm_sync_range(address, end))
+        return -5l;
+    if (!unmap_user_pages(current_user_root_page_table, address, end))
+        return -22l;
+    vm_change_regions(address, end, 0ul, 1, 1);
     return 0l;
 }
 
 static s64 sys_mprotect_impl(u64 address, u64 length, u64 prot)
 {
-    u64 start;
     u64 end;
-    if ((address & PAGE_MASK) != 0ul || length == 0ul || (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0ul)
+    u64 needed = 0ul;
+    u64 last_leaf = USER_VA_LIMIT;
+    u64 last_branch = USER_VA_LIMIT;
+    u64 page;
+    u32 index;
+    if ((address & PAGE_MASK) != 0ul || (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0ul)
         return -22l;
-    start = address;
+    if (length == 0ul)
+        return 0l;
+    if (length > USER_VA_LIMIT)
+        return -12l;
     length = align_up(length, PAGE_SIZE);
-    end = start + length;
-    if (end < start || !vm_range_covered(start, end))
+    end = address + length;
+    if (end < address || !vm_range_covered(address, end))
         return -12l;
-    if (!vm_apply_protection(start, end, prot))
+    for (index = 0u; index < current_task->vm_region_count; index = index + 1u)
+    {
+        struct vm_region* region = &current_task->vm_regions[index];
+        if (address < region->end && end > region->start &&
+            (((region->flags & VM_READONLY_FILE) != 0ul && (prot & PROT_WRITE) != 0ul) ||
+            ((region->flags & VM_FRAMEBUFFER) != 0ul && (prot & PROT_EXEC) != 0ul)))
+            return -13l;
+    }
+    if (!vm_change_regions(address, end, prot, 0, 0))
         return -12l;
-    if (!vm_remove_range(start, end) || !vm_add_region(start, end, prot, MAP_PRIVATE | MAP_ANONYMOUS))
+    if (prot != 0ul)
+    {
+        for (page = address; page < end; page = page + PAGE_SIZE)
+        {
+            struct vm_region* region = vm_find_region(page);
+            u64* entry;
+            if (region->object != 0u || (region->flags & VM_FRAMEBUFFER) != 0ul)
+            {
+                page = region->end - PAGE_SIZE;
+                continue;
+            }
+            entry = user_leaf_pte(current_user_root_page_table, page);
+            if (entry == NULL || (*entry & (PTE_V | PTE_SOFT_NOACCESS)) == 0ul)
+            {
+                needed = needed + 1ul;
+                if (entry == NULL && align_down(page, 0x200000ul) != last_leaf)
+                {
+                    last_leaf = align_down(page, 0x200000ul);
+                    needed = needed + 1ul;
+                    if ((((u64*)current_user_root_page_table)[sv39_index(page, 2)] & PTE_V) == 0ul && align_down(page, GIGABYTE) != last_branch)
+                    {
+                        last_branch = align_down(page, GIGABYTE);
+                        needed = needed + 1ul;
+                    }
+                }
+            }
+            if (needed > free_page_count)
+            {
+                file_reclaim_pages(needed);
+                if (needed > free_page_count)
+                    return -12l;
+            }
+        }
+    }
+    if (!vm_apply_protection(address, end, prot))
         return -12l;
+    vm_change_regions(address, end, prot, 0, 1);
     return 0l;
+}
+
+static s64 sys_msync_impl(u64 address, u64 length, u64 flags)
+{
+    u64 end;
+    if ((address & PAGE_MASK) != 0ul || (flags & ~(MS_ASYNC | MS_SYNC | MS_INVALIDATE)) != 0ul || (flags & (MS_ASYNC | MS_SYNC)) == (MS_ASYNC | MS_SYNC))
+        return -22l;
+    if (length == 0ul)
+        return 0l;
+    if (length > USER_VA_LIMIT)
+        return -12l;
+    end = address + align_up(length, PAGE_SIZE);
+    if (end < address || !vm_range_covered(address, end))
+        return -12l;
+    return vm_sync_range(address, end) ? 0l : -5l;
 }
 
 static s64 sys_mmap_impl(u64 address, u64 length, u64 prot, u64 flags, u64 fd, u64 offset)
@@ -9586,15 +10611,50 @@ static s64 sys_mmap_impl(u64 address, u64 length, u64 prot, u64 flags, u64 fd, u
     u64 start;
     u64 end;
     u64 pte_flags;
-    (void)offset;
-    if (length == 0ul || (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0ul)
+    u64 kind = flags & (MAP_PRIVATE | MAP_SHARED);
+    int regions;
+    u32 object = 0u;
+    if (length == 0ul || length > USER_VA_LIMIT || (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0ul || (offset & PAGE_MASK) != 0ul)
         return -22l;
-    if ((flags & (MAP_PRIVATE | MAP_ANONYMOUS)) != (MAP_PRIVATE | MAP_ANONYMOUS))
-        return -19l;
-    if (fd != (u64)-1l)
+    if (kind != MAP_PRIVATE && kind != MAP_SHARED)
+        return -22l;
+    if ((flags & ~(MAP_PRIVATE | MAP_SHARED | MAP_FIXED | MAP_FIXED_NOREPLACE | MAP_ANONYMOUS | MAP_DENYWRITE | MAP_EXECUTABLE | MAP_NORESERVE | MAP_STACK)) != 0ul)
         return -22l;
     length = align_up(length, PAGE_SIZE);
-    if ((flags & MAP_FIXED) != 0ul)
+    if (offset > 0x7ffffffffffffffful - length)
+        return -75l;
+    if ((flags & MAP_ANONYMOUS) == 0ul)
+    {
+        struct file_descriptor* file;
+        if (!fd_valid(fd))
+            return -9l;
+        file = &open_files[(u32)fd];
+        if (!fd_read_allowed(file) || (kind == MAP_SHARED && (prot & PROT_WRITE) != 0ul && !fd_write_allowed(file)))
+            return -13l;
+        if (file->node.type == VFS_NODE_ZERO)
+            flags = flags | MAP_ANONYMOUS;
+        else if (file->node.type == VFS_NODE_FRAMEBUFFER)
+        {
+            if (kind != MAP_SHARED || offset >= framebuffer_map_size || length > framebuffer_map_size - offset)
+                return -22l;
+            if ((prot & PROT_EXEC) != 0ul)
+                return -13l;
+            flags = flags | VM_FRAMEBUFFER;
+            if (!fd_write_allowed(file))
+                flags = flags | VM_READONLY_FILE;
+        }
+        else if (file->node.type != VFS_NODE_FAT_FILE)
+            return -19l;
+        else
+        {
+            object = file->object;
+            if (kind == MAP_SHARED && !fd_write_allowed(file))
+                flags = flags | VM_READONLY_FILE;
+        }
+    }
+    if ((flags & MAP_ANONYMOUS) != 0ul)
+        offset = 0ul;
+    if ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0ul)
     {
         if ((address & PAGE_MASK) != 0ul)
             return -22l;
@@ -9602,34 +10662,69 @@ static s64 sys_mmap_impl(u64 address, u64 length, u64 prot, u64 flags, u64 fd, u
     }
     else
     {
-        start = align_up(user_mmap_cursor, PAGE_SIZE);
-        while (vm_range_overlaps(start, start + length))
-            start = start + length;
+        start = align_down(address, PAGE_SIZE);
+        if (start == 0ul || !user_mapping_range_valid(start, length) || vm_range_overlaps(start, start + length) || ranges_overlap(start, length, process_brk_min, process_brk - process_brk_min))
+        {
+            start = align_up(user_mmap_cursor, PAGE_SIZE);
+            for (;;)
+            {
+                u64 next = start;
+                u32 index;
+                if (!user_mapping_range_valid(start, length))
+                    return -12l;
+                for (index = 0u; index < current_task->vm_region_count; index = index + 1u)
+                {
+                    struct vm_region* region = &current_task->vm_regions[index];
+                    if (start < region->end && start + length > region->start && region->end > next)
+                        next = region->end;
+                }
+                if (ranges_overlap(start, length, process_brk_min, process_brk - process_brk_min) && process_brk > next)
+                    next = align_up(process_brk, PAGE_SIZE);
+                if (next == start)
+                    break;
+                start = next;
+            }
+        }
     }
     end = start + length;
-    if (end < start || !user_mapping_range_valid(start, length))
+    if (!user_mapping_range_valid(start, length))
         return -22l;
-    if ((flags & MAP_FIXED) != 0ul)
+    if ((flags & MAP_FIXED_NOREPLACE) != 0ul && (vm_range_overlaps(start, end) || ranges_overlap(start, length, process_brk_min, process_brk - process_brk_min)))
+        return -17l;
+    regions = vm_change_regions(start, end, 0ul, 1, 0);
+    if (regions == 0 || regions > MAX_VM_REGIONS)
+        return -12l;
+    pte_flags = vm_pte_flags(prot);
+    if (object == 0u && (flags & VM_FRAMEBUFFER) == 0ul && (pte_flags != 0ul || kind == MAP_SHARED))
     {
-        if (!unmap_user_pages(current_user_root_page_table, start, end) || !vm_remove_range(start, end))
+        u64 needed = length / PAGE_SIZE + length / (PAGE_SIZE * 512ul) + 4ul;
+        file_reclaim_pages(needed);
+        if (needed > free_page_count)
             return -12l;
     }
-    else if (vm_range_overlaps(start, end))
+    if ((flags & MAP_FIXED) != 0ul)
     {
-        return -12l;
+        s64 result = sys_munmap_impl(start, length);
+        if (result != 0l)
+            return result;
     }
-    pte_flags = vm_pte_flags(prot);
-    if (pte_flags != 0ul && !map_user_range(current_user_root_page_table, start, end, pte_flags))
+    if (object == 0u && (flags & VM_FRAMEBUFFER) == 0ul && (pte_flags != 0ul || kind == MAP_SHARED))
+    {
+        if (pte_flags != 0ul)
+            map_user_range(current_user_root_page_table, start, end, pte_flags);
+        else
+        {
+            u64 page;
+            for (page = start; page < end; page = page + PAGE_SIZE)
+                map_noaccess_page(current_user_root_page_table, page, alloc_page());
+        }
+    }
+    if (vm_append_region(start, end, prot, flags & (MAP_PRIVATE | MAP_SHARED | MAP_ANONYMOUS | VM_READONLY_FILE | VM_FRAMEBUFFER), object, offset) == NULL)
     {
         unmap_user_pages(current_user_root_page_table, start, end);
         return -12l;
     }
-    if (!vm_add_region(start, end, prot, flags & (MAP_PRIVATE | MAP_ANONYMOUS)))
-    {
-        unmap_user_pages(current_user_root_page_table, start, end);
-        return -12l;
-    }
-    if ((flags & MAP_FIXED) == 0ul)
+    if ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) == 0ul)
         user_mmap_cursor = end;
     return (s64)start;
 }
@@ -9648,130 +10743,232 @@ static u64 elf_segment_flags(u32 elf_flags)
     return flags;
 }
 
-static int load_elf64(const u8* image, u32 image_size, u64 root, struct elf_image* loaded)
+static u64 available_page_count(void)
+{
+    return free_page_count;
+}
+
+static int load_elf64(const u8* image, u32 image_size, u64 root, u64 base, const struct elf_image* occupied, struct elf_image* loaded)
 {
     u64 phoff;
-    u16 phentsize;
+    u64 phsize;
+    u64 alignment = PAGE_SIZE;
+    u64 low = USER_VA_LIMIT;
+    u64 high = 0ul;
+    u64 pages = USER_STACK_SIZE / PAGE_SIZE + 4ul;
+    u64 declared_phdr = 0ul;
+    int has_phdr = 0;
+    u64 entry_physical;
+    u16 type;
     u16 phnum;
     u16 index;
-    u64 high = 0ul;
-    u64 entry_physical;
-    if (image_size < 64u)
+    if (image_size < 64u || image[0] != 0x7fu || image[1] != 'E' || image[2] != 'L' || image[3] != 'F')
         return 0;
-    if (image[0] != 0x7fu || image[1] != 'E' || image[2] != 'L' || image[3] != 'F')
+    if (image[4] != 2u || image[5] != 1u || image[6] != 1u || le16(image + 18) != 243u || le32(image + 20) != 1u)
         return 0;
-    if (image[4] != 2u || image[5] != 1u || image[6] != 1u)
-        return 0;
-    if (le16(image + 18) != 243u)
-        return 0;
-    if (le32(image + 20) != 1u)
+    type = le16(image + 16);
+    if ((type != ELF_ET_EXEC && type != ELF_ET_DYN) || le16(image + 52) != 64u || le16(image + 54) != 56u)
         return 0;
     phoff = le64(image + 32);
-    phentsize = le16(image + 54);
     phnum = le16(image + 56);
-    if (phentsize < 56u)
+    phsize = (u64)phnum * 56ul;
+    if (phnum == 0u || phsize > 65536ul || phoff > (u64)image_size || phsize > (u64)image_size - phoff)
         return 0;
-    if (phoff + (u64)phentsize * (u64)phnum > (u64)image_size)
-        return 0;
-    loaded->phdr = 0ul;
-    loaded->interp[0] = 0;
-    index = 0;
-    while (index < phnum)
+    mem_zero(loaded, sizeof(struct elf_image));
+    for (index = 0u; index < phnum; index = index + 1u)
     {
-        const u8* ph = image + phoff + (u64)index * (u64)phentsize;
-        u32 type = le32(ph + 0);
-        if (type == ELF_PT_PHDR)
-            loaded->phdr = le64(ph + 16);
-        if (type == ELF_PT_INTERP)
+        const u8* ph = image + phoff + (u64)index * 56ul;
+        u32 kind = le32(ph);
+        u64 offset = le64(ph + 8);
+        u64 vaddr = le64(ph + 16);
+        u64 filesz = le64(ph + 32);
+        u64 memsz = le64(ph + 40);
+        u64 align = le64(ph + 48);
+        if (kind == ELF_PT_PHDR)
         {
-            u64 interp_offset = le64(ph + 8);
-            u64 interp_size = le64(ph + 32);
-            u64 cursor = 0ul;
-            if (interp_size == 0ul || interp_size > (u64)PATH_BUFFER_SIZE)
+            if (has_phdr || offset != phoff || filesz < phsize || memsz < filesz)
                 return 0;
-            if (interp_offset + interp_size > (u64)image_size)
-                return 0;
-            while (cursor < interp_size)
-            {
-                loaded->interp[cursor] = (char)image[interp_offset + cursor];
-                cursor = cursor + 1ul;
-            }
-            loaded->interp[interp_size - 1ul] = 0;
+            declared_phdr = vaddr;
+            has_phdr = 1;
         }
-        if (type == ELF_PT_LOAD)
+        if (kind == ELF_PT_INTERP)
         {
-            u32 flags = le32(ph + 4);
-            u64 offset = le64(ph + 8);
-            u64 vaddr = le64(ph + 16);
-            u64 filesz = le64(ph + 32);
-            u64 memsz = le64(ph + 40);
-            u64 end = vaddr + memsz;
-            u64 mapped_start = align_down(vaddr, PAGE_SIZE);
-            u64 mapped_end = align_up(end, PAGE_SIZE);
-            if (memsz < filesz)
+            if (loaded->interp[0] != 0 || filesz < 2ul || filesz > PATH_BUFFER_SIZE || offset > image_size || filesz > image_size - offset)
                 return 0;
-            if (offset + filesz > (u64)image_size)
+            if (image[offset] == 0u || image[offset + filesz - 1ul] != 0u)
                 return 0;
-            if (end < vaddr)
-                return 0;
-            if (memsz != 0ul)
-            {
-                if (!user_mapping_range_valid(vaddr, memsz))
-                    return 0;
-                if (!map_user_range(root, mapped_start, mapped_end, elf_segment_flags(flags)))
-                    return 0;
-                if (filesz != 0ul && !user_copy_to(root, vaddr, image + offset, filesz))
-                    return 0;
-                if (end > high)
-                    high = end;
-            }
+            mem_copy(loaded->interp, image + offset, filesz);
         }
-        index = index + 1;
+        if (kind != ELF_PT_LOAD)
+            continue;
+        if (filesz > memsz || offset > image_size || filesz > image_size - offset || vaddr >= USER_VA_LIMIT || memsz > USER_VA_LIMIT - vaddr)
+            return 0;
+        if ((vaddr & PAGE_MASK) != (offset & PAGE_MASK) || (align > 1ul && ((align & (align - 1ul)) != 0ul || ((vaddr - offset) & (align - 1ul)) != 0ul)))
+            return 0;
+        if (align > USER_VA_LIMIT)
+            return 0;
+        if (align > alignment)
+            alignment = align;
+        if (memsz == 0ul)
+            continue;
+        if (vaddr < low)
+            low = align_down(vaddr, PAGE_SIZE);
+        if (vaddr + memsz > high)
+            high = align_up(vaddr + memsz, PAGE_SIZE);
+        pages = pages + (align_up(vaddr + memsz, PAGE_SIZE) - align_down(vaddr, PAGE_SIZE)) / PAGE_SIZE + 2ul;
     }
-    loaded->entry = le64(image + 24);
+    if (low >= high || pages + pages / 512ul > available_page_count())
+        return 0;
+    if (type == ELF_ET_DYN)
+    {
+        loaded->load_bias = align_up(base, alignment);
+        if (occupied != NULL && ranges_overlap(low + loaded->load_bias, high - low, occupied->map_start, occupied->map_end - occupied->map_start))
+            loaded->load_bias = align_up(occupied->map_end, alignment);
+    }
+    if (loaded->load_bias > USER_VA_LIMIT - high)
+        return 0;
+    loaded->map_start = low + loaded->load_bias;
+    loaded->map_end = high + loaded->load_bias;
+    if (occupied != NULL && ranges_overlap(loaded->map_start, high - low, occupied->map_start, occupied->map_end - occupied->map_start))
+        return 0;
+    for (index = 0u; index < phnum; index = index + 1u)
+    {
+        const u8* ph = image + phoff + (u64)index * 56ul;
+        u64 offset = le64(ph + 8);
+        u64 vaddr = le64(ph + 16) + loaded->load_bias;
+        u64 filesz = le64(ph + 32);
+        u64 memsz = le64(ph + 40);
+        u64 page;
+        u64 end;
+        u64 flags;
+        if (le32(ph) != ELF_PT_LOAD || memsz == 0ul)
+            continue;
+        page = align_down(vaddr, PAGE_SIZE);
+        end = align_up(vaddr + memsz, PAGE_SIZE);
+        if (!user_mapping_range_valid(page, end - page))
+            return 0;
+        flags = elf_segment_flags(le32(ph + 4));
+        while (page < end)
+        {
+            u64* table = leaf_table(root, page, 0);
+            u64* pte = &table[sv39_index(page, 0)];
+            if ((*pte & PTE_V) == 0ul)
+                *pte = pte_make(alloc_page(), flags | PTE_U | PTE_A | PTE_D);
+            else
+                *pte = *pte | flags;
+            page = page + PAGE_SIZE;
+        }
+        if (filesz != 0ul && !user_copy_to(root, vaddr, image + offset, filesz))
+            return 0;
+        page = vaddr + filesz;
+        while (page < vaddr + memsz)
+        {
+            u64 physical;
+            u64 size = PAGE_SIZE - (page & PAGE_MASK);
+            if (size > vaddr + memsz - page)
+                size = vaddr + memsz - page;
+            if (!user_translate(root, page, 0ul, &physical))
+                return 0;
+            mem_zero((void*)physical, size);
+            page = page + size;
+        }
+        if (phoff >= offset && phoff - offset <= filesz && phsize <= filesz - (phoff - offset))
+            loaded->phdr = vaddr + phoff - offset;
+    }
+    if (has_phdr && (declared_phdr > USER_VA_LIMIT - loaded->load_bias || loaded->phdr != declared_phdr + loaded->load_bias))
+        return 0;
+    // Segments sharing a page also share its contents and permissions
+    for (index = 0u; index < phnum; index = index + 1u)
+    {
+        const u8* ph = image + phoff + (u64)index * 56ul;
+        u64 page = align_down(le64(ph + 16) + loaded->load_bias, PAGE_SIZE);
+        u64 end = align_up(le64(ph + 16) + loaded->load_bias + le64(ph + 40), PAGE_SIZE);
+        if (le32(ph) != ELF_PT_LOAD || le64(ph + 40) == 0ul)
+            continue;
+        while (page < end)
+        {
+            struct vm_region* region;
+            u64* pte = user_leaf_pte(root, page);
+            u64 prot = ((*pte & PTE_R) != 0ul ? PROT_READ : 0ul) | ((*pte & PTE_W) != 0ul ? PROT_WRITE : 0ul) | ((*pte & PTE_X) != 0ul ? PROT_EXEC : 0ul);
+            u32 slot = 0u;
+            while (slot < loaded->region_count && !(page >= loaded->regions[slot].start && page < loaded->regions[slot].end))
+                slot = slot + 1u;
+            if (slot == loaded->region_count)
+            {
+                region = slot == 0u ? NULL : &loaded->regions[slot - 1u];
+                if (region != NULL && region->end == page && region->prot == prot)
+                    region->end = page + PAGE_SIZE;
+                else
+                {
+                    if (slot == MAX_VM_REGIONS)
+                        return 0;
+                    region = &loaded->regions[slot];
+                    region->start = page;
+                    region->end = page + PAGE_SIZE;
+                    region->prot = prot;
+                    region->flags = MAP_PRIVATE;
+                    loaded->region_count = slot + 1u;
+                }
+            }
+            page = page + PAGE_SIZE;
+        }
+    }
+    if (le64(image + 24) > USER_VA_LIMIT - loaded->load_bias)
+        return 0;
+    loaded->entry = le64(image + 24) + loaded->load_bias;
     loaded->start_entry = loaded->entry;
-    loaded->interp_base = 0ul;
-    loaded->phent = phentsize;
+    loaded->phent = 56ul;
     loaded->phnum = phnum;
-    loaded->brk_start = align_up(high, PAGE_SIZE);
-    if (loaded->entry >= USER_VA_LIMIT)
-        return 0;
-    if (!user_translate(root, loaded->entry, PTE_X, &entry_physical))
-        return 0;
-    return 1;
+    loaded->brk_start = loaded->map_end;
+    return user_translate(root, loaded->entry, PTE_X, &entry_physical) != 0ul;
 }
 
 static int load_process_image(u64 root, const u8* image, u32 image_size, struct elf_image* loaded)
 {
     struct elf_image interpreter;
     u32 interpreter_size;
-    if (!load_elf64(image, image_size, root, loaded))
+    if (!load_elf64(image, image_size, root, USER_PIE_BASE, NULL, loaded))
         return 0;
+    if (loaded->interp[0] != 0)
+    {
+        if (!fat_read_path_to_memory(loaded->interp, (void*)USER_INTERP_BUFFER, (u32)USER_INTERP_BUFFER_SIZE, &interpreter_size))
+            return 0;
+        if (!load_elf64((const u8*)USER_INTERP_BUFFER, interpreter_size, root, USER_INTERP_BASE, loaded, &interpreter))
+            return 0;
+        if (interpreter.interp[0] != 0 || loaded->phdr == 0ul || loaded->region_count + interpreter.region_count > MAX_VM_REGIONS)
+            return 0;
+        loaded->interp_base = interpreter.load_bias;
+        loaded->start_entry = interpreter.entry;
+        mem_copy(&loaded->regions[loaded->region_count], interpreter.regions, (u64)interpreter.region_count * sizeof(struct vm_region));
+        loaded->region_count = loaded->region_count + interpreter.region_count;
+    }
     process_brk = loaded->brk_start;
     process_brk_min = loaded->brk_start;
     user_mmap_cursor = USER_MMAP_BASE;
-    if (loaded->interp[0] == 0)
-        return 1;
-    if (!fat_read_path_to_memory(loaded->interp, (void*)USER_INTERP_BUFFER, (u32)USER_INTERP_BUFFER_SIZE, &interpreter_size))
-        return 0;
-    if (!load_elf64((const u8*)USER_INTERP_BUFFER, interpreter_size, root, &interpreter))
-        return 0;
-    if (interpreter.interp[0] != 0)
-        return 0;
-    loaded->interp_base = 0ul;
-    loaded->start_entry = interpreter.entry;
+    if (loaded->map_end > user_mmap_cursor)
+        user_mmap_cursor = loaded->map_end;
+    if (loaded->interp[0] != 0 && interpreter.map_end > user_mmap_cursor)
+        user_mmap_cursor = interpreter.map_end;
     return 1;
 }
 
-static int build_user_stack(u64 root, struct elf_image* image, struct exec_arguments* arguments, u64* out_stack)
+static int build_user_stack(u64 root, struct elf_image* image, struct exec_arguments* arguments, const char* path, u64* out_stack)
 {
+    u64 path_length = 0ul;
+    u64 execfn;
+    u64 random_address;
+    u32 random[16];
     u64 strings = USER_STACK_TOP - (u64)arguments->bytes_used;
     u64 sp;
-    u64 stack[MAX_EXEC_ARGS * 2u + 24u];
+    u64 stack[MAX_EXEC_ARGS * 2u + 48u];
     u32 word = 0u;
     u32 index = 0u;
     if (arguments->count == 0u)
         return 0;
+    while (path[path_length] != 0)
+        path_length = path_length + 1ul;
+    execfn = strings - path_length - 1ul;
+    random_address = align_down(execfn - 16ul, 16ul);
     stack[word] = (u64)arguments->count;
     word = word + 1u;
     while (index < arguments->count)
@@ -9809,6 +11006,39 @@ static int build_user_stack(u64 root, struct elf_image* image, struct exec_argum
     stack[word] = AT_BASE;
     stack[word + 1u] = image->interp_base;
     word = word + 2u;
+    stack[word] = AT_FLAGS;
+    stack[word + 1u] = 0ul;
+    word = word + 2u;
+    stack[word] = AT_UID;
+    stack[word + 1u] = 0ul;
+    word = word + 2u;
+    stack[word] = AT_EUID;
+    stack[word + 1u] = 0ul;
+    word = word + 2u;
+    stack[word] = AT_GID;
+    stack[word + 1u] = 0ul;
+    word = word + 2u;
+    stack[word] = AT_EGID;
+    stack[word + 1u] = 0ul;
+    word = word + 2u;
+    stack[word] = AT_SECURE;
+    stack[word + 1u] = 0ul;
+    word = word + 2u;
+    stack[word] = AT_HWCAP;
+    stack[word + 1u] = boot_device.hwcap;
+    word = word + 2u;
+    stack[word] = AT_CLKTCK;
+    stack[word + 1u] = 100ul;
+    word = word + 2u;
+    stack[word] = AT_EXECFN;
+    stack[word + 1u] = execfn;
+    word = word + 2u;
+    if (random_ready)
+    {
+        stack[word] = AT_RANDOM;
+        stack[word + 1u] = random_address;
+        word = word + 2u;
+    }
     stack[word] = AT_HOST_BRIDGE;
     stack[word + 1u] = boot_device.host_bridge_base == 0ul ? 0ul : USER_HOST_BRIDGE_BASE;
     word = word + 2u;
@@ -9821,9 +11051,18 @@ static int build_user_stack(u64 root, struct elf_image* image, struct exec_argum
     stack[word] = AT_NULL;
     stack[word + 1u] = 0ul;
     word = word + 2u;
-    sp = align_down(align_down(strings, 16ul) - (u64)word * 8ul, 16ul);
+    sp = align_down(random_address - (u64)word * 8ul, 16ul);
     if (!map_user_stack(root, sp))
         return 0;
+    if (!user_copy_to(root, execfn, path, path_length + 1ul))
+        return 0;
+    if (random_ready)
+    {
+        random_block(random);
+        if (!user_copy_to(root, random_address, random, 16ul))
+            return 0;
+        mem_zero(random, sizeof(random));
+    }
     if (!user_copy_to(root, strings, arguments->bytes, (u64)arguments->bytes_used))
         return 0;
     if (!user_copy_to(root, sp, stack, (u64)word * 8ul))
@@ -9924,7 +11163,7 @@ static void sys_ppoll_dispatch(struct trap_frame* frame, u64 fds, u64 count, u64
             frame->x[10] = (u64)-22l;
             return;
         }
-        deadline = timer_now() + time_to_ticks(timeout[0], timeout[1], 1000000000ul);
+        deadline = time_deadline(timer_now(), timeout[0], timeout[1], 1000000000ul);
     }
     if (mask_pointer != 0ul)
     {
@@ -9983,17 +11222,17 @@ static void trap_dispatch(struct trap_frame* frame)
         u64 nr = frame->x[17];
         frame->sepc = frame->sepc + 4ul;
         current_task->orig_a0 = frame->x[10];
-        if (nr == SYS_READ)
+        if (nr == SYS_READ || nr == SYS_READV)
         {
-            s64 result = vfs_read(frame->x[10], frame->x[11], frame->x[12]);
+            s64 result = nr == SYS_READ ? vfs_read(frame->x[10], frame->x[11], frame->x[12]) : vfs_iov(frame->x[10], frame->x[11], frame->x[12], 0);
             frame->x[10] = (u64)result;
             if (result == -ERESTARTSYS)
                 process_sleep(frame, fd_waits_on_device(current_task->orig_a0) ? SLEEP_DEVICE : SLEEP_CONSOLE, current_task->sleep_deadline);
             return;
         }
-        if (nr == SYS_WRITE)
+        if (nr == SYS_WRITE || nr == SYS_WRITEV)
         {
-            s64 result = vfs_write(frame->x[10], frame->x[11], frame->x[12]);
+            s64 result = nr == SYS_WRITE ? vfs_write(frame->x[10], frame->x[11], frame->x[12]) : vfs_iov(frame->x[10], frame->x[11], frame->x[12], 1);
             frame->x[10] = (u64)result;
             if (result == -ERESTARTSYS && fd_waits_on_device(current_task->orig_a0))
                 process_sleep(frame, SLEEP_DEVICE, 0ul);
@@ -10168,6 +11407,21 @@ static void trap_dispatch(struct trap_frame* frame)
             frame->x[10] = (u64)sys_setitimer_impl(frame->x[10], frame->x[11], frame->x[12]);
             return;
         }
+        if (nr == SYS_CLOCK_GETTIME || nr == SYS_CLOCK_GETRES)
+        {
+            frame->x[10] = (u64)sys_clock_read(frame->x[10], frame->x[11], nr == SYS_CLOCK_GETRES);
+            return;
+        }
+        if (nr == SYS_GETTIMEOFDAY)
+        {
+            frame->x[10] = (u64)sys_gettimeofday_impl(frame->x[10], frame->x[11]);
+            return;
+        }
+        if (nr == SYS_CLOCK_NANOSLEEP)
+        {
+            sys_clock_nanosleep_dispatch(frame, frame->x[10], frame->x[11], frame->x[12], frame->x[13]);
+            return;
+        }
         if (nr == SYS_NANOSLEEP)
         {
             sys_nanosleep_dispatch(frame, frame->x[10], frame->x[11]);
@@ -10218,6 +11472,11 @@ static void trap_dispatch(struct trap_frame* frame)
             frame->x[10] = (u64)sys_munmap_impl(frame->x[10], frame->x[11]);
             return;
         }
+        if (nr == SYS_MSYNC)
+        {
+            frame->x[10] = (u64)sys_msync_impl(frame->x[10], frame->x[11], frame->x[12]);
+            return;
+        }
         if (nr == SYS_MPROTECT)
         {
             frame->x[10] = (u64)sys_mprotect_impl(frame->x[10], frame->x[11], frame->x[12]);
@@ -10257,13 +11516,21 @@ static void trap_dispatch(struct trap_frame* frame)
         scheduler_timer_interrupt(frame);
         return;
     }
-    if ((cause == 13ul || cause == 15ul) && (frame->sstatus & SSTATUS_SPP) == 0ul)
+    if ((cause == 12ul || cause == 13ul || cause == 15ul) && (frame->sstatus & SSTATUS_SPP) == 0ul)
     {
         if (cause == 15ul && user_break_cow(current_user_root_page_table, frame->stval))
             return;
-        if (map_user_stack_fault(current_user_root_page_table, frame->stval))
+        int mapped = vm_fault(current_user_root_page_table, frame->stval, cause == 12ul ? PTE_X : cause == 15ul ? PTE_W : PTE_R);
+        if (mapped == 1)
             return;
-        if (map_user_brk_fault(current_user_root_page_table, frame->stval))
+        if (mapped < 0)
+        {
+            signal_force(current_task, SIGBUS, BUS_ADRERR, frame->stval);
+            return;
+        }
+        if (cause != 12ul && map_user_stack_fault(current_user_root_page_table, frame->stval))
+            return;
+        if (cause != 12ul && map_user_brk_fault(current_user_root_page_table, frame->stval))
             return;
     }
 
@@ -10352,15 +11619,19 @@ void kernel_main(u64 hartid, void* fdt)
         panic("invalid INIT.ELF");
     if (!make_kernel_arguments(init_path, &arguments))
         panic("init arguments setup failed");
-    if (!build_user_stack(current_user_root_page_table, &image, &arguments, &stack))
+    if (!build_user_stack(current_user_root_page_table, &image, &arguments, init_path, &stack))
         panic("user stack setup failed");
 
     current_task->root_page_table = current_user_root_page_table;
     current_task->brk = process_brk;
     current_task->brk_min = process_brk_min;
     current_task->mmap_cursor = user_mmap_cursor;
+    current_task->vm_region_count = image.region_count;
+    mem_copy(current_task->vm_regions, image.regions, (u64)image.region_count * sizeof(struct vm_region));
     activate_page_table(current_user_root_page_table);
     timer_enable();
+    cpu_account_start = timer_now();
+    cpu_account_running = 1;
     kernel_enter_user(image.start_entry, stack);
     halt();
 }
