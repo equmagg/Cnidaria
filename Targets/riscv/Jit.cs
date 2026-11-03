@@ -99,6 +99,8 @@ public sealed partial class RiscVEmulator
                     context.VectorType = _vtype;
                     context.VectorStart = _vstart;
                     context.VectorDirty = 0;
+                    context.FixedRounding = (int)_vxrm;
+                    context.FixedSaturated = 0;
                     context.ReservationAddress = _reservationAddress;
                     context.HasReservation = _hasReservation ? 1 : 0;
                     // Bounded by DevicePollInterval; no blocking or managed callbacks
@@ -112,9 +114,10 @@ public sealed partial class RiscVEmulator
                     {
                         _vtype = context.VectorType;
                         TryDecodeVectorType(_vtype, out _vsewBytes, out _vgroupBytes, out _vgroupRegisters, out _vvlmax);
-                        jit.ClearDispatch();
                     }
                     _mstatus |= context.VectorDirty;
+                    if (context.FixedSaturated != 0)
+                        _vxsat = 1;
                     _reservationAddress = context.ReservationAddress;
                     _hasReservation = context.HasReservation != 0;
                     _cycle += (ulong)executed;
@@ -277,6 +280,9 @@ public sealed partial class RiscVEmulator
         public ulong VectorType;
         public ulong VectorStart;
         public ulong VectorDirty;
+        public ulong VectorScratch;
+        public int FixedRounding;
+        public int FixedSaturated;
         public int VectorIndex;
         public ulong RamOffset;
         public ulong FramebufferStart;

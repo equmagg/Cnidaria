@@ -2440,7 +2440,7 @@ namespace Cnidaria.Cs
 
         // Native type handles are MethodTables, with the type's names and flags in an info block one pointer before
         // the MethodTable; the register VM answers these queries from its type system.
-        // The info block's last slot points to an enum's {values, names, count}.
+        // The info block's last slot points to an enum's {values, names, count}
         private bool TryImportRuntimeTypeQuery(List<StackValue> stack, List<GenTree> statements, RuntimeMethod method, int pc, ILOpCode op)
         {
             if (_rts.Target.IsRegisterBytecode)

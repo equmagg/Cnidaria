@@ -345,7 +345,6 @@ char* stpcpy(char* restrict destination, const char* restrict source)
     size_t width = __riscv_vsetvlmax_e8m8();
     size_t scanned = 0;
 
-    // One pass: the scan and the copy share it
     for (;;)
     {
         size_t taken = 0;

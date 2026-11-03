@@ -3068,7 +3068,7 @@ namespace Cnidaria.Cs
             int typeTok = MetadataToken.Make(MetadataToken.TypeDef, tdIndex + 1);
             if (declaringType.Kind == RuntimeTypeKind.Enum)
             {
-                // Sorted by the unsigned storage value, which Enum searches and formats flags by; ties keep declaration order
+                // Sorted by unsigned storage value with ties in declaration order
                 declaringType.EnumLiterals = enumLiterals.OrderBy(literal => literal.Value).ToArray();
                 declaringType.IsFlagsEnum = HasCustomAttribute(m, typeTok, "System", "FlagsAttribute");
             }

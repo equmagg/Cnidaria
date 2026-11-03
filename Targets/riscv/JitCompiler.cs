@@ -15,6 +15,10 @@ public sealed partial class RiscVEmulator
         private static readonly X86Target HostTarget = new(64, X86AbiKind.WindowsX64,
             X86IsaFlags.Sse | X86IsaFlags.Sse2 | (System.Runtime.Intrinsics.X86.Sse41.IsSupported ? X86IsaFlags.Sse41 : X86IsaFlags.None),
             TargetEndianness.Little);
+        private static readonly X86Target Avx2Target = new(64, X86AbiKind.WindowsX64,
+            X86IsaFlags.Avx | X86IsaFlags.Avx2, TargetEndianness.Little);
+        private static readonly X86Target FmaTarget = new(64, X86AbiKind.WindowsX64,
+            X86IsaFlags.Sse | X86IsaFlags.Sse2 | X86IsaFlags.Avx | X86IsaFlags.Fma, TargetEndianness.Little);
         private static readonly Dictionary<string, int> _contextOffsets = CreateContextOffsets();
         private readonly List<byte> _bytes = new();
         private readonly List<(int Offset, string Label)> _branches = new();
@@ -59,6 +63,12 @@ public sealed partial class RiscVEmulator
             compiler.Mxcsr(nameof(JitContext.SavedMxcsr), save: true);
             compiler.Mxcsr(nameof(JitContext.NativeMxcsr), save: false);
             int chainOffset = compiler._bytes.Count;
+            if (vectorSpecialized)
+            {
+                compiler.Emit(Mov, R(Rax), I(unchecked((long)machine._vtype)));
+                compiler.Emit(Cmp, Context(nameof(JitContext.VectorType)), R(Rax));
+                compiler.Branch(X86Condition.Ne, "return");
+            }
             compiler.Emit(Cmp, Context(nameof(JitContext.Remaining), 4), I(instructions.Count));
             compiler.Branch(X86Condition.B, "return");
             compiler.Emit(Add, Context(nameof(JitContext.Blocks), 4), I(1));
@@ -959,6 +969,10 @@ public sealed partial class RiscVEmulator
             int form = (int)((instruction >> 12) & 7);
             if (_machine._vsewBytes == 0 || (_machine._vtype & VectorTypeIllegal) != 0)
                 return false;
+            if (PlanElement(instruction, out _))
+                return true;
+            if (op is 0x07 or 0x27 && WholeRegisterShape(instruction, out _))
+                return true;
             if (op is 0x07 or 0x27 && form is 0 or 5 or 6 or 7)
                 return VectorMemoryShape(instruction, out _, out _, out _, out _);
             if (op != 0x57 || form == 7)
@@ -992,7 +1006,7 @@ public sealed partial class RiscVEmulator
                 };
             if (form is 2 or 6)
                 return function is >= 32 and <= 39 or 41 or 43 or 45 or 47;
-            return form is 1 or 5 && _machine._vsewBytes is 4 or 8 && function is 0 or 2 or 32 or 36;
+            return false;
         }
 
         private bool VectorMemoryShape(uint instruction, out int size, out int groups, out int fields, out int indexSize)
@@ -1015,7 +1029,8 @@ public sealed partial class RiscVEmulator
                 groups = _machine._vgroupRegisters;
                 if (!_machine.TryGetVectorMemoryShape(indexSize, out _, out int indexGroups) || !CheckVectorGroup(source, indexGroups))
                     return false;
-                if ((instruction & 127) == 7 && register < source + indexGroups && source < register + fields * groups)
+                if ((instruction & 127) == 7 && register < source + indexGroups && source < register + fields * groups
+                    && (fields != 1 || indexSize != size || register != source))
                     return false;
             }
             else if (!_machine.TryGetVectorMemoryShape(size, out _, out groups))
@@ -1033,7 +1048,8 @@ public sealed partial class RiscVEmulator
             int vd = (int)((instruction >> 7) & 31);
             int vs1 = (int)((instruction >> 15) & 31);
             int vs2 = (int)((instruction >> 20) & 31);
-            int size = _machine._vsewBytes;
+            bool planned = PlanElement(instruction, out ElementPlan plan);
+            int size = planned ? plan.Destination : _machine._vsewBytes;
             bool unmasked = ((instruction >> 25) & 1) != 0;
             if (op == 0x57 && form == 3 && function == 0x27)
             {
@@ -1049,19 +1065,57 @@ public sealed partial class RiscVEmulator
             }
             if (op == 0x57 && form == 2 && function is >= 0x18 and <= 0x1F)
                 return TranslateMaskLogic(function, vd, vs1, vs2);
-            bool maskDestination = op == 0x57 && form is 0 or 3 or 4 && function is >= 24 and <= 31;
+            if (planned && plan.Op is ElementOp.MoveToScalar or ElementOp.MoveFromScalar)
+                return TranslateScalarMove(plan, vd, vs1, vs2);
             bool memory = op is 0x07 or 0x27;
+            if (memory && WholeRegisterShape(instruction, out int wholeBytes))
+                return TranslateWholeRegister(instruction, wholeBytes);
+            bool carrying = planned && plan.Op is >= ElementOp.AddCarry and <= ElementOp.BorrowOut;
+            if (carrying)
+                unmasked = true;
+            bool maskDestination = planned
+                ? plan.Op is >= ElementOp.FloatEqual and <= ElementOp.FloatGreaterEqual
+                    or ElementOp.SetBeforeFirst or ElementOp.SetOnlyFirst or ElementOp.SetIncludingFirst or ElementOp.CarryOut or ElementOp.BorrowOut
+                : op == 0x57 && form is 0 or 3 or 4 && function is >= 24 and <= 31;
             string slow = SlowExit();
             string loop = $"vectorLoop{_count}";
             string next = $"vectorNext{_count}";
             string masked = $"vectorMasked{_count}";
             string finish = $"vectorFinish{_count}";
+            bool reduction = planned && plan.Op is >= ElementOp.ReduceSum and <= ElementOp.ReduceFloatWideSum;
+            bool scalarResult = planned && plan.Op is ElementOp.CountMask or ElementOp.FirstMask;
+            bool counting = scalarResult || planned && plan.Op == ElementOp.Compress;
+            if (planned && plan.Rounding)
+                RoundingGuard(7);
+            if (planned && plan.FixedRounding)
+            {
+                Emit(Cmp, Context(nameof(JitContext.FixedRounding), 4), I((long)_machine._vxrm));
+                Branch(X86Condition.Ne, slow);
+            }
             Emit(Mov, R(R8), Context(nameof(JitContext.VectorStart)));
             Emit(Cmp, R(R8), Context(nameof(JitContext.VectorLength)));
             Branch(X86Condition.A, slow);
             Emit(Cmp, Context(nameof(JitContext.VectorLength)), I(_machine._vvlmax));
             Branch(X86Condition.A, slow);
             Emit(Mov, R(R9), Context(nameof(JitContext.Vectors)));
+            if (planned && plan.Op >= ElementOp.Iota)
+            {
+                Emit(Test, R(R8), R(R8));
+                Branch(X86Condition.Ne, slow);
+            }
+            if (planned && plan.Op >= ElementOp.CountMask)
+                Emit(Mov, Context(nameof(JitContext.VectorScratch)), I(plan.Op == ElementOp.FirstMask ? -1 : 0));
+            else if (reduction)
+            {
+                LoadElement(Rax, M(R9, vs1 * _machine.VectorRegisterBytes, plan.Source1), plan.Source1);
+                Emit(Mov, Context(nameof(JitContext.VectorScratch)), R(Rax));
+            }
+            else if (planned && plan.Op == ElementOp.SlideUp)
+            {
+                SlideOffset(plan, vs1);
+                Emit(Cmp, R(R8), R(Rcx));
+                Emit(X86Instruction.Cmovcc(X86Condition.B, R(R8), R(Rcx)));
+            }
             if (memory && unmasked && ((instruction >> 26) & 3) == 0 && vs2 == 0 && (instruction >> 29) == 0)
             {
                 VectorMemoryShape(instruction, out int elementSize, out _, out _, out _);
@@ -1085,7 +1139,7 @@ public sealed partial class RiscVEmulator
                 Emit(Add, R(R8, 4), I(16 / elementSize));
                 Jump($"vectorMemoryPacked{_count}");
             }
-            if (!memory && unmasked && PackedVectorOperation(function, form, size) is X86InstrKind packed)
+            if (!planned && !memory && unmasked && PackedVectorOperation(function, form, size) is X86InstrKind packed)
             {
                 bool scalar = form is 3 or 4 or 6;
                 bool shift = form is 3 or 4 && function is 37 or 40 or 41;
@@ -1116,19 +1170,35 @@ public sealed partial class RiscVEmulator
                         Emit(X86Instruction.Ternary(Pshufd, R(Xmm1, 16), R(Xmm1, 16), I(size == 8 ? 0x44 : 0)));
                     }
                 }
+                bool variableShift = form == 0 && function is 37 or 40 or 41;
+                if (variableShift)
+                {
+                    Emit(Mov, R(Rax), I(size * 8 - 1));
+                    Emit(Movq, R(Xmm2, 16), R(Rax));
+                    Emit(X86Instruction.Ternary(Pshufd, R(Xmm2, 16), R(Xmm2, 16), I(size == 8 ? 0x44 : 0)));
+                }
                 Label($"vectorPacked{_count}");
                 Emit(Lea, R(Rax), M(R8, 16 / size));
                 Emit(Cmp, R(Rax), Context(nameof(JitContext.VectorLength)));
                 Branch(X86Condition.A, loop);
-                Emit(Movdqu, R(Xmm0, 16), VectorElement(vs2, size).WithSize(16));
+                if (function != 23)
+                    Emit(Movdqu, R(Xmm0, 16), VectorElement(vs2, size).WithSize(16));
                 if (!scalar)
                     Emit(Movdqu, R(Xmm1, 16), VectorElement(vs1, size).WithSize(16));
-                Emit(packed, R(Xmm0, 16), R(Xmm1, 16));
+                if (variableShift)
+                {
+                    // RVV masks each shift count; x86 saturates oversized counts
+                    Emit(Pand, R(Xmm1, 16), R(Xmm2, 16));
+                    _bytes.AddRange(X86CodeEncoder.Encode(X86Instruction.AvxTernary(packed,
+                        R(Xmm0, 16), R(Xmm0, 16), R(Xmm1, 16)), Avx2Target));
+                }
+                else
+                    Emit(packed, R(Xmm0, 16), R(Xmm1, 16));
                 Emit(Movdqu, VectorElement(vd, size).WithSize(16), R(Xmm0, 16));
                 Emit(Add, R(R8, 4), I(16 / size));
                 Jump($"vectorPacked{_count}");
             }
-            if (!memory && size == 4 && (maskDestination && unmasked || function == 23 && form == 0 && !unmasked))
+            if (!planned && !memory && size == 4 && (maskDestination && unmasked || function == 23 && form is 0 or 3 or 4 && !unmasked))
                 EmitPackedSelect(function, form, vd, vs1, vs2, maskDestination, loop);
             Label(loop);
             Emit(Cmp, R(R8), Context(nameof(JitContext.VectorLength)));
@@ -1175,41 +1245,38 @@ public sealed partial class RiscVEmulator
             }
             else
             {
-                LoadElement(Rax, VectorElement(vs2, size), size);
-                if (form is 0 or 1 or 2)
-                    LoadElement(Rcx, VectorElement(vs1, size), size);
-                else if (form == 3)
-                {
-                    int value = function is 37 or 40 or 41 ? vs1 : vs1 < 16 ? vs1 : vs1 - 32;
-                    Emit(Mov, R(Rcx), I(unchecked((long)((ulong)value & ElementMask(size * 8)))));
-                }
-                else if (form == 5)
-                {
-                    Emit(Mov, R(Rdx), Context(nameof(JitContext.Floats)));
-                    LoadElement(Rcx, M(Rdx, vs1 * 8, size), size);
-                }
+                if (planned && plan.Op >= ElementOp.CountMask)
+                    MaskElement(plan, vd, vs1, vs2);
+                else if (reduction)
+                    ReduceElement(plan, vs2);
+                else if (planned && plan.Op >= ElementOp.Gather)
+                    PermuteElement(plan, vs1, vs2);
+                else if (carrying)
+                    CarryElement(plan, vs1, vs2);
+                else if (planned && plan.Op < ElementOp.ZeroExtend)
+                    FloatElement(plan, vd, vs1, vs2);
+                else if (planned)
+                    IntegerElement(plan, vd, vs1, vs2);
                 else
                 {
-                    Load(Rcx, vs1);
-                    Truncate(Rcx, size);
-                }
-                if (form is 1 or 5)
-                {
-                    Emit(size == 8 ? Movq : Movd, R(Xmm0, 16), R(Rax, size));
-                    Emit(size == 8 ? Movq : Movd, R(Xmm1, 16), R(Rcx, size));
-                    X86InstrKind operation = function switch
+                    LoadElement(Rax, VectorElement(vs2, size), size);
+                    if (form is 0 or 2)
+                        LoadElement(Rcx, VectorElement(vs1, size), size);
+                    else if (form == 3)
                     {
-                        0 => size == 8 ? Addsd : Addss, 2 => size == 8 ? Subsd : Subss,
-                        32 => size == 8 ? Divsd : Divss, _ => size == 8 ? Mulsd : Mulss,
-                    };
-                    Emit(operation, R(Xmm0, 16), R(Xmm1, 16));
-                    Emit(size == 8 ? Movq : Movd, R(Rax, size), R(Xmm0, 16));
-                }
-                else
+                        int value = function is 37 or 40 or 41 ? vs1 : vs1 < 16 ? vs1 : vs1 - 32;
+                        Emit(Mov, R(Rcx), I(unchecked((long)((ulong)value & ElementMask(size * 8)))));
+                    }
+                    else
+                    {
+                        Load(Rcx, vs1);
+                        Truncate(Rcx, size);
+                    }
                     VectorInteger(function, form, size, vd);
+                }
                 if (maskDestination)
                     StoreVectorMask(vd);
-                else
+                else if (!reduction && !counting)
                     Emit(Mov, VectorElement(vd, size), R(Rax, size));
             }
             Jump(next);
@@ -1221,7 +1288,7 @@ public sealed partial class RiscVEmulator
                     LoadElement(Rax, VectorElement(vs2, size), size);
                     Emit(Mov, VectorElement(vd, size), R(Rax, size));
                 }
-                else if (!maskDestination && op != 0x27 && (_machine._vtype & VectorTypeMaskAgnostic) != 0)
+                else if (!maskDestination && !reduction && !counting && op != 0x27 && (_machine._vtype & VectorTypeMaskAgnostic) != 0)
                 {
                     int fields = 1;
                     int groups = _machine._vgroupRegisters;
@@ -1235,33 +1302,130 @@ public sealed partial class RiscVEmulator
             Emit(Add, R(R8, 4), I(1));
             Jump(loop);
             Label(finish);
-            if (!maskDestination && op != 0x27 && (_machine._vtype & VectorTypeTailAgnostic) != 0)
+            if (reduction)
+                ReduceFinish(plan, vd);
+            else if (scalarResult)
             {
-                int fields = 1;
-                int groups = _machine._vgroupRegisters;
-                if (memory)
-                    VectorMemoryShape(instruction, out size, out groups, out fields, out _);
-                Emit(Pcmpeqb, R(Xmm0, 16), R(Xmm0, 16));
-                Label($"vectorPackedTail{_count}");
-                Emit(Lea, R(Rax), M(R8, 16 / size));
-                Emit(Cmp, R(Rax), I(_machine._vvlmax));
-                Branch(X86Condition.A, $"vectorTail{_count}");
-                for (int field = 0; field < fields; field++)
-                    Emit(Movdqu, VectorElement(vd + field * groups, size).WithSize(16), R(Xmm0, 16));
-                Emit(Add, R(R8, 4), I(16 / size));
-                Jump($"vectorPackedTail{_count}");
-                Label($"vectorTail{_count}");
-                Emit(Cmp, R(R8, 4), I(_machine._vvlmax));
-                Branch(X86Condition.Ae, $"vectorDone{_count}");
-                for (int field = 0; field < fields; field++)
-                    Emit(Mov, VectorElement(vd + field * groups, size), I(-1));
-                Emit(Add, R(R8, 4), I(1));
-                Jump($"vectorTail{_count}");
-                Label($"vectorDone{_count}");
+                Emit(Mov, R(Rax), Context(nameof(JitContext.VectorScratch)));
+                Store(vd);
             }
             Emit(Mov, Context(nameof(JitContext.VectorStart)), I(0));
             Emit(Or, Context(nameof(JitContext.VectorDirty)), I((long)MstatusVsMask));
             return true;
+        }
+
+        private bool TranslateScalarMove(ElementPlan plan, int vd, int vs1, int vs2)
+        {
+            int size = plan.Destination;
+            bool floating = plan.Operand == ElementOperand.Float;
+            Emit(Mov, R(R9), Context(nameof(JitContext.Vectors)));
+            if (plan.Op == ElementOp.MoveToScalar)
+            {
+                LoadElement(Rax, M(R9, vs2 * _machine.VectorRegisterBytes, size), size);
+                if (floating)
+                {
+                    if (size == 4)
+                    {
+                        Emit(Mov, R(Rdx), I(-4294967296L));
+                        Emit(Or, R(Rax), R(Rdx));
+                    }
+                    Emit(Mov, R(Rdx), Context(nameof(JitContext.Floats)));
+                    Emit(Mov, M(Rdx, vd * 8), R(Rax));
+                    Emit(Or, Context(nameof(JitContext.VectorDirty)), I((long)MstatusFsMask));
+                }
+                else
+                {
+                    SignExtend(Rax, size);
+                    Store(vd);
+                }
+            }
+            else
+            {
+                string done = $"moveDone{_count}";
+                Emit(Mov, R(R8), Context(nameof(JitContext.VectorStart)));
+                Emit(Cmp, R(R8), Context(nameof(JitContext.VectorLength)));
+                Branch(X86Condition.Ae, done);
+                if (floating)
+                {
+                    Emit(Mov, R(Rax), Context(nameof(JitContext.Floats)));
+                    Emit(Mov, R(Rax), M(Rax, vs1 * 8));
+                }
+                else
+                    Load(Rax, vs1);
+                Emit(Mov, M(R9, vd * _machine.VectorRegisterBytes, size), R(Rax, size));
+                Label(done);
+            }
+            Emit(Mov, Context(nameof(JitContext.VectorStart)), I(0));
+            if (!floating || plan.Op == ElementOp.MoveFromScalar)
+                Emit(Or, Context(nameof(JitContext.VectorDirty)), I((long)MstatusVsMask));
+            return true;
+        }
+
+        private void LoadMaskBit(int register)
+        {
+            Emit(Mov, R(Rdx), R(R8));
+            Emit(Shr, R(Rdx), I(3));
+            Emit(Movzx, R(Rax, 4), X86Operand.Memory(R9, register * _machine.VectorRegisterBytes, 1, Rdx));
+            Emit(Mov, R(Rcx, 4), R(R8, 4));
+            Emit(And, R(Rcx, 4), I(7));
+            Emit(Shr, R(Rax, 4), R(Rcx, 1));
+            Emit(And, R(Rax, 4), I(1));
+        }
+
+        private void MaskElement(ElementPlan plan, int vd, int vs1, int vs2)
+        {
+            X86Operand scratch = Context(nameof(JitContext.VectorScratch));
+            string skip = $"maskSkip{_count}";
+            switch (plan.Op)
+            {
+                case ElementOp.CountMask:
+                    LoadMaskBit(vs2);
+                    Emit(Add, scratch, R(Rax));
+                    return;
+                case ElementOp.FirstMask:
+                    LoadMaskBit(vs2);
+                    Emit(Test, R(Rax, 4), R(Rax, 4));
+                    Branch(X86Condition.E, skip);
+                    Emit(Cmp, scratch, I(-1));
+                    Branch(X86Condition.Ne, skip);
+                    Emit(Mov, scratch, R(R8));
+                    Label(skip);
+                    return;
+                case ElementOp.Iota:
+                    LoadMaskBit(vs2);
+                    Emit(Mov, R(Rcx), scratch);
+                    Emit(Add, scratch, R(Rax));
+                    Emit(Mov, R(Rax), R(Rcx));
+                    return;
+                case ElementOp.Compress:
+                    {
+                        int size = plan.Destination;
+                        LoadMaskBit(vs1);
+                        Emit(Test, R(Rax, 4), R(Rax, 4));
+                        Branch(X86Condition.E, skip);
+                        Emit(Mov, R(Rcx), scratch);
+                        LoadElement(Rax, VectorElement(vs2, size), size);
+                        Emit(Mov, X86Operand.Memory(R9, vd * _machine.VectorRegisterBytes, size, Rcx, size), R(Rax, size));
+                        Emit(Add, scratch, I(1));
+                        Label(skip);
+                        return;
+                    }
+                default:
+                    LoadMaskBit(vs2);
+                    Emit(Mov, R(Rcx), scratch);
+                    Emit(Xor, R(Rcx, 4), I(1));
+                    Emit(Or, scratch, R(Rax));
+                    if (plan.Op == ElementOp.SetBeforeFirst)
+                    {
+                        Emit(Xor, R(Rax, 4), I(1));
+                        Emit(And, R(Rax, 4), R(Rcx, 4));
+                    }
+                    else if (plan.Op == ElementOp.SetOnlyFirst)
+                        Emit(And, R(Rax, 4), R(Rcx, 4));
+                    else
+                        Emit(Mov, R(Rax, 4), R(Rcx, 4));
+                    return;
+            }
         }
 
         private void EmitPackedSelect(int function, int form, int vd, int vs1, int vs2, bool compare, string scalarLoop)
@@ -1276,7 +1440,7 @@ public sealed partial class RiscVEmulator
                 Emit(Movq, R(Xmm2, 16), R(Rax));
                 Emit(Punpcklqdq, R(Xmm3, 16), R(Xmm2, 16));
             }
-            else if (form != 0)
+            if (form != 0)
             {
                 if (form == 3)
                     Emit(Mov, R(Rax), I(vs1 < 16 ? vs1 : vs1 - 32));
@@ -1339,10 +1503,11 @@ public sealed partial class RiscVEmulator
                 Emit(X86Instruction.Ternary(Pshufd, R(Xmm2, 16), R(Xmm2, 16), I(0)));
                 Emit(Pand, R(Xmm2, 16), R(Xmm3, 16));
                 Emit(Pcmpeqd, R(Xmm2, 16), R(Xmm3, 16));
-                Emit(Pand, R(Xmm1, 16), R(Xmm2, 16));
+                Emit(Movdqa, R(Xmm4, 16), R(Xmm1, 16));
+                Emit(Pand, R(Xmm4, 16), R(Xmm2, 16));
                 Emit(Pandn, R(Xmm2, 16), R(Xmm0, 16));
-                Emit(Por, R(Xmm1, 16), R(Xmm2, 16));
-                Emit(Movdqu, VectorElement(vd, 4).WithSize(16), R(Xmm1, 16));
+                Emit(Por, R(Xmm4, 16), R(Xmm2, 16));
+                Emit(Movdqu, VectorElement(vd, 4).WithSize(16), R(Xmm4, 16));
             }
             Emit(Add, R(R8, 4), I(4));
             Jump($"vectorSelect{_count}");
@@ -1356,6 +1521,18 @@ public sealed partial class RiscVEmulator
                 return function == 37 ? size switch { 2 => Pmullw, 4 => Pmulld, _ => null } : null;
             if (form is not (0 or 3 or 4))
                 return null;
+            if (form == 0 && System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+            {
+                X86InstrKind? variableShift = function switch
+                {
+                    37 => size switch { 4 => Vpsllvd, 8 => Vpsllvq, _ => null },
+                    40 => size switch { 4 => Vpsrlvd, 8 => Vpsrlvq, _ => null },
+                    41 when size == 4 => Vpsravd,
+                    _ => null,
+                };
+                if (variableShift is not null)
+                    return variableShift;
+            }
             return function switch
             {
                 0 => size switch { 1 => Paddb, 2 => Paddw, 4 => Paddd, _ => Paddq },
@@ -1365,6 +1542,7 @@ public sealed partial class RiscVEmulator
                 6 => size switch { 1 => Pmaxub, 2 => Pmaxuw, 4 => Pmaxud, _ => null },
                 7 => size switch { 1 => Pmaxsb, 2 => Pmaxsw, 4 => Pmaxsd, _ => null },
                 9 => Pand, 10 => Por, 11 => Pxor,
+                23 => Movdqa,
                 37 when form is 3 or 4 => size switch { 2 => Psllw, 4 => Pslld, 8 => Psllq, _ => null },
                 40 when form is 3 or 4 => size switch { 2 => Psrlw, 4 => Psrld, 8 => Psrlq, _ => null },
                 41 when form is 3 or 4 => size switch { 2 => Psraw, 4 => Psrad, _ => null },
@@ -1567,6 +1745,1088 @@ public sealed partial class RiscVEmulator
                     Emit(function == 37 ? Shl : function == 40 ? Shr : Sar, R(Rax), R(Rcx, 1));
                     break;
             }
+        }
+
+        private enum ElementOp : byte
+        {
+            FloatAdd, FloatSubtract, FloatReverseSubtract, FloatMultiply, FloatDivide, FloatReverseDivide,
+            FloatMinimum, FloatMaximum, FloatSign, FloatSignNegate, FloatSignXor, FloatMerge,
+            FloatEqual, FloatLessEqual, FloatLess, FloatNotEqual, FloatGreater, FloatGreaterEqual,
+            FloatMultiplyAdd, FloatSquareRoot, FloatClass,
+            FloatToUnsigned, FloatToSigned, UnsignedToFloat, SignedToFloat, FloatToFloat, FloatNarrowOdd,
+            FloatWideAdd, FloatWideSubtract, FloatWideMultiply, FloatWideMultiplyAdd,
+            ZeroExtend, SignExtend, NarrowShiftRight, NarrowShiftRightArithmetic,
+            WideAddUnsigned, WideAdd, WideSubtractUnsigned, WideSubtract,
+            WideMultiplyUnsigned, WideMultiplySignedUnsigned, WideMultiply,
+            WideMultiplyAddUnsigned, WideMultiplyAdd, WideMultiplyAddUnsignedSigned, WideMultiplyAddSignedUnsigned,
+            SaturatingAddUnsigned, SaturatingAdd, SaturatingSubtractUnsigned, SaturatingSubtract,
+            AverageAddUnsigned, AverageAdd, AverageSubtractUnsigned, AverageSubtract,
+            FractionalMultiply, ScaledShiftRight, ScaledShiftRightArithmetic, NarrowClipUnsigned, NarrowClip,
+            AddCarry, CarryOut, SubtractBorrow, BorrowOut,
+            RotateRight, RotateLeft, WideShiftLeft, ReverseBitsInBytes, ReverseBytes, ReverseBits, CountLeadingZeros, CountTrailingZeros, PopCount,
+            Gather, SlideUp, SlideDown, SlideUpOne, SlideDownOne, Index,
+            ReduceSum, ReduceAnd, ReduceOr, ReduceXor, ReduceMinimumUnsigned, ReduceMinimum, ReduceMaximumUnsigned, ReduceMaximum,
+            ReduceWideSumUnsigned, ReduceWideSum, ReduceFloatSum, ReduceFloatMinimum, ReduceFloatMaximum, ReduceFloatWideSum,
+            CountMask, FirstMask, Iota, SetBeforeFirst, SetOnlyFirst, SetIncludingFirst, Compress, MoveToScalar, MoveFromScalar,
+        }
+
+        private enum ElementOperand : byte { None, Vector, Scalar, Immediate, SignedImmediate, Float }
+
+        // Element sizes are in bytes and Function keeps funct6 for the forms that share an operation
+        private readonly record struct ElementPlan(ElementOp Op, int Destination, int Source2, int Source1, ElementOperand Operand,
+            int Function, bool Rounding, bool Truncate = false, bool FixedRounding = false, bool CarryIn = false);
+
+        private int GroupRegisters(int size)
+        {
+            long bytes = (long)_machine._vgroupBytes * size / _machine._vsewBytes;
+            return bytes > 0 && _machine.TryGetVectorGroupRegisters((int)bytes, out int registers) ? registers : 0;
+        }
+
+        private bool PlanElement(uint instruction, out ElementPlan plan)
+        {
+            plan = default;
+            int form = (int)((instruction >> 12) & 7);
+            int sew = _machine._vsewBytes;
+            if ((instruction & 127) != 0x57 || form == 7 || sew == 0 || (_machine._vtype & VectorTypeIllegal) != 0)
+                return false;
+            int function = (int)(instruction >> 26);
+            int vd = (int)((instruction >> 7) & 31);
+            int vs1 = (int)((instruction >> 15) & 31);
+            int vs2 = (int)((instruction >> 20) & 31);
+            bool unmasked = ((instruction >> 25) & 1) != 0;
+            ElementOperand operand = form switch
+            {
+                0 or 1 or 2 => ElementOperand.Vector,
+                3 => ElementOperand.Immediate,
+                5 => ElementOperand.Float,
+                _ => ElementOperand.Scalar,
+            };
+            if (form is 1 or 5)
+            {
+                if (sew is not (4 or 8))
+                    return false;
+                bool vector = form == 1;
+                ElementOp? single = function switch
+                {
+                    0x00 => ElementOp.FloatAdd,
+                    0x02 => ElementOp.FloatSubtract,
+                    0x04 => ElementOp.FloatMinimum,
+                    0x06 => ElementOp.FloatMaximum,
+                    0x08 => ElementOp.FloatSign,
+                    0x09 => ElementOp.FloatSignNegate,
+                    0x0A => ElementOp.FloatSignXor,
+                    0x20 => ElementOp.FloatDivide,
+                    0x24 => ElementOp.FloatMultiply,
+                    0x21 when !vector => ElementOp.FloatReverseDivide,
+                    0x27 when !vector => ElementOp.FloatReverseSubtract,
+                    0x17 when !vector && (!unmasked || vs2 == 0) => ElementOp.FloatMerge,
+                    0x18 => ElementOp.FloatEqual,
+                    0x19 => ElementOp.FloatLessEqual,
+                    0x1B => ElementOp.FloatLess,
+                    0x1C => ElementOp.FloatNotEqual,
+                    0x1D when !vector => ElementOp.FloatGreater,
+                    0x1F when !vector => ElementOp.FloatGreaterEqual,
+                    >= 0x28 and <= 0x2F when System.Runtime.Intrinsics.X86.Fma.IsSupported => ElementOp.FloatMultiplyAdd,
+                    _ => null,
+                };
+                if (single is ElementOp chosen)
+                {
+                    bool exact = chosen is ElementOp.FloatMinimum or ElementOp.FloatMaximum or ElementOp.FloatSign or ElementOp.FloatSignNegate
+                        or ElementOp.FloatSignXor or ElementOp.FloatMerge or (>= ElementOp.FloatEqual and <= ElementOp.FloatGreaterEqual);
+                    plan = new(chosen, sew, sew, sew, operand, function, !exact);
+                }
+                else if (vector && function is 1 or 3 or 5 or 7)
+                    plan = new(function switch { 5 => ElementOp.ReduceFloatMinimum, 7 => ElementOp.ReduceFloatMaximum, _ => ElementOp.ReduceFloatSum },
+                        sew, sew, sew, operand, function, function is 1 or 3);
+                else if (vector && function is 0x31 or 0x33 && sew == 4)
+                    plan = new(ElementOp.ReduceFloatWideSum, 8, 4, 8, operand, function, true);
+                else if (!vector && function is 0x0E or 0x0F)
+                    plan = new(function == 0x0E ? ElementOp.SlideUpOne : ElementOp.SlideDownOne, sew, sew, sew, operand, function, false);
+                else if (function == 0x10 && unmasked && (vector ? vs1 == 0 : vs2 == 0))
+                {
+                    plan = new(vector ? ElementOp.MoveToScalar : ElementOp.MoveFromScalar, sew, sew, sew, ElementOperand.Float, function, false);
+                    return vector || CheckVectorGroup(vd, 1);
+                }
+                else if (vector && function == 0x13 && vs1 is 0 or 0x10)
+                    plan = new(vs1 == 0 ? ElementOp.FloatSquareRoot : ElementOp.FloatClass, sew, sew, 0, ElementOperand.None, function, vs1 == 0);
+                else if (vector && function == 0x12 && vs1 <= 0x17 && System.Runtime.Intrinsics.X86.Sse41.IsSupported)
+                {
+                    int select = vs1 & 7;
+                    int shape = vs1 >> 3;
+                    if (shape == 0 && select is 4 or 5 || shape == 1 && select == 5 || shape != 0 && sew != 4)
+                        return false;
+                    int source = shape == 2 ? sew * 2 : sew;
+                    int destination = shape == 1 ? sew * 2 : sew;
+                    ElementOp conversion = select switch
+                    {
+                        0 or 6 => ElementOp.FloatToUnsigned,
+                        1 or 7 => ElementOp.FloatToSigned,
+                        2 => ElementOp.UnsignedToFloat,
+                        3 => ElementOp.SignedToFloat,
+                        4 => ElementOp.FloatToFloat,
+                        _ => ElementOp.FloatNarrowOdd,
+                    };
+                    plan = new(conversion, destination, source, 0, ElementOperand.None, function, select < 4 || select == 4 && shape == 2, select >= 6);
+                }
+                else if (function is 0x30 or 0x32 or 0x34 or 0x36 or 0x38 && sew == 4)
+                {
+                    ElementOp wide = function switch { 0x30 or 0x34 => ElementOp.FloatWideAdd, 0x32 or 0x36 => ElementOp.FloatWideSubtract, _ => ElementOp.FloatWideMultiply };
+                    plan = new(wide, 8, function is 0x34 or 0x36 ? 8 : 4, 4, operand, function, true);
+                }
+                else if (function >= 0x3C && sew == 4 && System.Runtime.Intrinsics.X86.Fma.IsSupported)
+                    plan = new(ElementOp.FloatWideMultiplyAdd, 8, 4, 4, operand, function, true);
+                else
+                    return false;
+            }
+            else if (form is 2 or 6)
+            {
+                if (form == 2 && function <= 7)
+                    plan = new((ElementOp)((int)ElementOp.ReduceSum + function), sew, sew, sew, operand, function, false);
+                else if (form == 6 && function is 0x0E or 0x0F)
+                    plan = new(function == 0x0E ? ElementOp.SlideUpOne : ElementOp.SlideDownOne, sew, sew, sew, operand, function, false);
+                else if (form == 2 && function == 0x14 && vs1 == 0x11 && vs2 == 0)
+                    plan = new(ElementOp.Index, sew, sew, 0, ElementOperand.None, function, false);
+                else if (function == 0x10 && unmasked && (form == 2 ? vs1 == 0 : vs2 == 0))
+                {
+                    plan = new(form == 2 ? ElementOp.MoveToScalar : ElementOp.MoveFromScalar, sew, sew, sew, ElementOperand.Scalar, function, false);
+                    return form == 2 || CheckVectorGroup(vd, 1);
+                }
+                else if (form == 2 && function == 0x10 && vs1 is 0x10 or 0x11)
+                {
+                    plan = new(vs1 == 0x10 ? ElementOp.CountMask : ElementOp.FirstMask, sew, sew, 0, ElementOperand.None, function, false);
+                    return CheckVectorGroup(vs2, 1);
+                }
+                else if (form == 2 && function == 0x14 && vs1 is 1 or 2 or 3 or 0x10)
+                {
+                    ElementOp unary = vs1 switch { 1 => ElementOp.SetBeforeFirst, 2 => ElementOp.SetOnlyFirst, 3 => ElementOp.SetIncludingFirst, _ => ElementOp.Iota };
+                    plan = new(unary, sew, sew, 0, ElementOperand.None, function, false);
+                    return CheckVectorGroup(vd, unary == ElementOp.Iota ? GroupRegisters(sew) : 1) && CheckVectorGroup(vs2, 1);
+                }
+                else if (form == 2 && function == 0x17 && unmasked)
+                {
+                    plan = new(ElementOp.Compress, sew, sew, 0, ElementOperand.None, function, false);
+                    return CheckVectorGroup(vd, GroupRegisters(sew)) && CheckVectorGroup(vs2, GroupRegisters(sew)) && CheckVectorGroup(vs1, 1);
+                }
+                else if (function is >= 0x08 and <= 0x0B)
+                    plan = new((ElementOp)((int)ElementOp.AverageAddUnsigned + function - 0x08), sew, sew, sew, operand, function, false, FixedRounding: true);
+                else if (form == 2 && function == 0x12 && vs1 is 8 or 9 or 0xA or 0xC or 0xD or 0xE
+                    && (vs1 != 0xE || System.Runtime.Intrinsics.X86.Popcnt.X64.IsSupported))
+                {
+                    ElementOp unary = vs1 switch
+                    {
+                        8 => ElementOp.ReverseBitsInBytes, 9 => ElementOp.ReverseBytes, 0xA => ElementOp.ReverseBits,
+                        0xC => ElementOp.CountLeadingZeros, 0xD => ElementOp.CountTrailingZeros, _ => ElementOp.PopCount,
+                    };
+                    plan = new(unary, sew, sew, 0, ElementOperand.None, function, false);
+                }
+                else if (form == 2 && function == 0x12 && vs1 is >= 2 and <= 7)
+                {
+                    int factor = 1 << (4 - (vs1 >> 1));
+                    if (sew < factor)
+                        return false;
+                    plan = new((vs1 & 1) != 0 ? ElementOp.SignExtend : ElementOp.ZeroExtend, sew, sew / factor, 0, ElementOperand.None, function, false);
+                }
+                else if (function >= 0x30 && sew <= 4)
+                {
+                    ElementOp? wide = function switch
+                    {
+                        0x30 or 0x34 => ElementOp.WideAddUnsigned,
+                        0x31 or 0x35 => ElementOp.WideAdd,
+                        0x32 or 0x36 => ElementOp.WideSubtractUnsigned,
+                        0x33 or 0x37 => ElementOp.WideSubtract,
+                        0x38 => ElementOp.WideMultiplyUnsigned,
+                        0x3A => ElementOp.WideMultiplySignedUnsigned,
+                        0x3B => ElementOp.WideMultiply,
+                        0x3C => ElementOp.WideMultiplyAddUnsigned,
+                        0x3D => ElementOp.WideMultiplyAdd,
+                        0x3E when form == 6 => ElementOp.WideMultiplyAddUnsignedSigned,
+                        0x3F => ElementOp.WideMultiplyAddSignedUnsigned,
+                        _ => null,
+                    };
+                    if (wide is not ElementOp chosen)
+                        return false;
+                    plan = new(chosen, sew * 2, function is >= 0x34 and <= 0x37 ? sew * 2 : sew, sew, operand, function, false);
+                }
+                else
+                    return false;
+            }
+            else if (function is 0x2C or 0x2D && sew <= 4)
+                plan = new(function == 0x2C ? ElementOp.NarrowShiftRight : ElementOp.NarrowShiftRightArithmetic, sew, sew * 2, sew, operand, function, false);
+            else if (function == 0x0C)
+                plan = new(ElementOp.Gather, sew, sew, sew, operand, function, false);
+            else if (function is 0x20 or 0x21 || function is 0x22 or 0x23 && form != 3)
+                plan = new((ElementOp)((int)ElementOp.SaturatingAddUnsigned + function - 0x20), sew, sew, sew,
+                    form == 3 ? ElementOperand.SignedImmediate : operand, function, false);
+            else if (function == 0x27 && form != 3 && sew <= 4)
+                plan = new(ElementOp.FractionalMultiply, sew, sew, sew, operand, function, false, FixedRounding: true);
+            else if (function is 0x2A or 0x2B)
+                plan = new(function == 0x2A ? ElementOp.ScaledShiftRight : ElementOp.ScaledShiftRightArithmetic, sew, sew, sew, operand, function, false, FixedRounding: true);
+            else if (function is 0x2E or 0x2F && sew <= 4)
+                plan = new(function == 0x2E ? ElementOp.NarrowClipUnsigned : ElementOp.NarrowClip, sew, sew * 2, sew, operand, function, false, FixedRounding: true);
+            else if (function is >= 0x10 and <= 0x13 && (function is 0x11 or 0x13 || !unmasked) && (function < 0x12 || form != 3))
+            {
+                ElementOp carry = function switch { 0x10 => ElementOp.AddCarry, 0x11 => ElementOp.CarryOut, 0x12 => ElementOp.SubtractBorrow, _ => ElementOp.BorrowOut };
+                plan = new(carry, sew, sew, sew, form == 3 ? ElementOperand.SignedImmediate : operand, function, false, CarryIn: !unmasked);
+                return CheckVectorGroup(vd, (function & 1) != 0 ? 1 : GroupRegisters(sew)) && CheckVectorGroup(vs2, GroupRegisters(sew))
+                    && (form != 0 || CheckVectorGroup(vs1, GroupRegisters(sew)));
+            }
+            else if (function == 0x14 || function == 0x15 && form != 3)
+                plan = new(function == 0x15 ? ElementOp.RotateLeft : ElementOp.RotateRight, sew, sew, sew, operand, function, false);
+            else if (function == 0x15 && form == 3)
+                plan = new(ElementOp.RotateRight, sew, sew, sew, operand, function, false);
+            else if (function == 0x35 && sew <= 4)
+                plan = new(ElementOp.WideShiftLeft, sew * 2, sew, sew, operand, function, false);
+            else if (function == 0x0E && form == 0)
+                plan = new(ElementOp.Gather, sew, sew, 2, operand, function, false);
+            else if (function is 0x0E or 0x0F)
+                plan = new(function == 0x0E ? ElementOp.SlideUp : ElementOp.SlideDown, sew, sew, sew, operand, function, false);
+            else if (function is 0x30 or 0x31 && form == 0 && sew <= 4)
+                plan = new(function == 0x30 ? ElementOp.ReduceWideSumUnsigned : ElementOp.ReduceWideSum, sew * 2, sew, sew * 2, operand, function, false);
+            else
+                return false;
+
+            if (plan.Op is >= ElementOp.ReduceSum and <= ElementOp.ReduceFloatWideSum)
+                return CheckVectorGroup(vd, 1) && CheckVectorGroup(vs1, 1) && CheckVectorGroup(vs2, GroupRegisters(plan.Source2));
+
+            bool maskResult = plan.Op is >= ElementOp.FloatEqual and <= ElementOp.FloatGreaterEqual;
+            return CheckVectorGroup(vd, maskResult ? 1 : GroupRegisters(plan.Destination))
+                && CheckVectorGroup(vs2, GroupRegisters(plan.Source2))
+                && (plan.Operand != ElementOperand.Vector || CheckVectorGroup(vs1, GroupRegisters(plan.Source1)));
+        }
+
+        private void SlideOffset(ElementPlan plan, int vs1)
+        {
+            if (plan.Operand == ElementOperand.Scalar)
+                Load(Rcx, vs1);
+            else
+                Emit(Mov, R(Rcx), I(vs1));
+        }
+
+        private void PermuteElement(ElementPlan plan, int vs1, int vs2)
+        {
+            int size = plan.Destination;
+            int registerBase = vs2 * _machine.VectorRegisterBytes;
+            string zero = $"permuteZero{_count}";
+            string done = $"permuteDone{_count}";
+            switch (plan.Op)
+            {
+                case ElementOp.Index:
+                    Emit(Mov, R(Rax), R(R8));
+                    return;
+                case ElementOp.Gather:
+                    if (plan.Operand == ElementOperand.Scalar)
+                        Load(Rcx, vs1);
+                    else
+                        IntegerOperand(Rcx, plan, vs1);
+                    Emit(Cmp, R(Rcx), I(_machine._vvlmax));
+                    Branch(X86Condition.Ae, zero);
+                    LoadElement(Rax, X86Operand.Memory(R9, registerBase, size, Rcx, size), size);
+                    break;
+                case ElementOp.SlideUp:
+                    SlideOffset(plan, vs1);
+                    Emit(Mov, R(Rdx), R(R8));
+                    Emit(Sub, R(Rdx), R(Rcx));
+                    LoadElement(Rax, X86Operand.Memory(R9, registerBase, size, Rdx, size), size);
+                    return;
+                case ElementOp.SlideDown:
+                    SlideOffset(plan, vs1);
+                    Emit(Mov, R(Rdx), R(R8));
+                    Emit(Add, R(Rdx), R(Rcx));
+                    Branch(X86Condition.B, zero);
+                    Emit(Cmp, R(Rdx), I(_machine._vvlmax));
+                    Branch(X86Condition.Ae, zero);
+                    LoadElement(Rax, X86Operand.Memory(R9, registerBase, size, Rdx, size), size);
+                    break;
+                case ElementOp.SlideUpOne:
+                    Emit(Test, R(R8), R(R8));
+                    Branch(X86Condition.E, zero);
+                    LoadElement(Rax, X86Operand.Memory(R9, registerBase - size, size, R8, size), size);
+                    Jump(done);
+                    Label(zero);
+                    SlideScalar(plan, vs1);
+                    Label(done);
+                    return;
+                default:
+                    Emit(Lea, R(Rax), M(R8, 1));
+                    Emit(Cmp, R(Rax), Context(nameof(JitContext.VectorLength)));
+                    Branch(X86Condition.Ae, zero);
+                    LoadElement(Rax, X86Operand.Memory(R9, registerBase + size, size, R8, size), size);
+                    Jump(done);
+                    Label(zero);
+                    SlideScalar(plan, vs1);
+                    Label(done);
+                    return;
+            }
+            Jump(done);
+            Label(zero);
+            Emit(Xor, R(Rax, 4), R(Rax, 4));
+            Label(done);
+        }
+
+        private void SlideScalar(ElementPlan plan, int vs1)
+        {
+            if (plan.Operand == ElementOperand.Float)
+            {
+                Emit(Mov, R(Rax), Context(nameof(JitContext.Floats)));
+                Emit(Mov, R(Rax), M(Rax, vs1 * 8));
+            }
+            else
+                Load(Rax, vs1);
+        }
+
+        private void ReduceElement(ElementPlan plan, int vs2)
+        {
+            int size = plan.Destination;
+            int source = plan.Source2;
+            X86Operand accumulator = Context(nameof(JitContext.VectorScratch));
+            if (plan.Op >= ElementOp.ReduceFloatSum)
+            {
+                bool wide = size == 8;
+                Emit(wide ? Movsd : Movss, R(Xmm0, 16), Context(nameof(JitContext.VectorScratch), size));
+                Emit(source == 8 ? Movsd : Movss, R(Xmm1, 16), VectorElement(vs2, source));
+                if (plan.Op == ElementOp.ReduceFloatWideSum)
+                    Emit(Cvtss2sd, R(Xmm1, 16), R(Xmm1, 16));
+                if (plan.Op is ElementOp.ReduceFloatMinimum or ElementOp.ReduceFloatMaximum)
+                    FloatMinMax(plan.Op == ElementOp.ReduceFloatMinimum ? 0 : 1, size);
+                else
+                    Emit(wide ? Addsd : Addss, R(Xmm0, 16), R(Xmm1, 16));
+                Emit(wide ? Movsd : Movss, Context(nameof(JitContext.VectorScratch), size), R(Xmm0, 16));
+                return;
+            }
+            LoadElement(Rax, VectorElement(vs2, source), source);
+            switch (plan.Op)
+            {
+                case ElementOp.ReduceSum or ElementOp.ReduceWideSumUnsigned:
+                    Emit(Add, accumulator, R(Rax));
+                    break;
+                case ElementOp.ReduceWideSum:
+                    SignExtend(Rax, source);
+                    Emit(Add, accumulator, R(Rax));
+                    break;
+                case ElementOp.ReduceAnd or ElementOp.ReduceOr or ElementOp.ReduceXor:
+                    Emit(plan.Op switch { ElementOp.ReduceAnd => And, ElementOp.ReduceOr => Or, _ => Xor }, accumulator, R(Rax));
+                    break;
+                default:
+                    bool signed = plan.Op is ElementOp.ReduceMinimum or ElementOp.ReduceMaximum;
+                    bool minimum = plan.Op is ElementOp.ReduceMinimum or ElementOp.ReduceMinimumUnsigned;
+                    Emit(Mov, R(Rcx), accumulator);
+                    if (signed)
+                    {
+                        SignExtend(Rax, size);
+                        SignExtend(Rcx, size);
+                    }
+                    Emit(Cmp, R(Rcx), R(Rax));
+                    Emit(X86Instruction.Cmovcc(minimum ? signed ? X86Condition.G : X86Condition.A : signed ? X86Condition.L : X86Condition.B, R(Rcx), R(Rax)));
+                    Emit(Mov, accumulator, R(Rcx));
+                    break;
+            }
+        }
+
+        // A reduction leaves vd alone when vl is zero and otherwise writes element zero, with the rest of vd as tail
+        private void ReduceFinish(ElementPlan plan, int vd)
+        {
+            int size = plan.Destination;
+            string done = $"reduceDone{_count}";
+            Emit(Cmp, Context(nameof(JitContext.VectorLength)), I(0));
+            Branch(X86Condition.E, done);
+            Emit(Mov, R(Rax), Context(nameof(JitContext.VectorScratch)));
+            if (plan.Op >= ElementOp.ReduceFloatSum)
+            {
+                Emit(size == 8 ? Movq : Movd, R(Xmm0, 16), R(Rax, size == 8 ? 8 : 4));
+                FloatResult(size);
+            }
+            int register = vd * _machine.VectorRegisterBytes;
+            Emit(Mov, M(R9, register, size), R(Rax, size));
+            Label(done);
+        }
+
+        // A whole register access moves bytes bytes and a mask access, reported with bytes zero, moves vl bits
+        private bool WholeRegisterShape(uint instruction, out int bytes)
+        {
+            bytes = 0;
+            int lumop = (int)((instruction >> 20) & 31);
+            int fields = (int)(instruction >> 29) + 1;
+            int width = (int)((instruction >> 12) & 7);
+            bool load = (instruction & 127) == 0x07;
+            if (((instruction >> 26) & 7) != 0 || ((instruction >> 25) & 1) == 0)
+                return false;
+            if (lumop == 8 && fields is 1 or 2 or 4 or 8 && (load ? VectorMemoryElementBytes(width) != 0 : width == 0)
+                && CheckVectorGroup((int)((instruction >> 7) & 31), fields))
+            {
+                bytes = fields * _machine.VectorRegisterBytes;
+                return true;
+            }
+            return lumop == 0x0B && fields == 1 && width == 0 && _machine._vsewBytes != 0 && (_machine._vtype & VectorTypeIllegal) == 0;
+        }
+
+        private bool TranslateWholeRegister(uint instruction, int bytes)
+        {
+            int register = (int)((instruction >> 7) & 31) * _machine.VectorRegisterBytes;
+            int rs1 = (int)((instruction >> 15) & 31);
+            bool load = (instruction & 127) == 0x07;
+            RVMemoryAccess access = load ? RVMemoryAccess.Load : RVMemoryAccess.Store;
+            string slow = SlowExit();
+            Emit(Mov, R(R9), Context(nameof(JitContext.Vectors)));
+            if (bytes != 0)
+            {
+                for (int offset = 0; offset < bytes; offset += 16)
+                {
+                    Load(Rax, rs1);
+                    Emit(Add, R(Rax), I(offset));
+                    // A TLB entry validates only one backing page
+                    Emit(Mov, R(Rdx, 4), R(Rax, 4));
+                    Emit(And, R(Rdx, 4), I(4095));
+                    Emit(Cmp, R(Rdx, 4), I(4096 - 16));
+                    Branch(X86Condition.A, slow);
+                    Memory(1, access);
+                    Emit(Movdqu, R(Xmm0, 16), load ? M(Rax, 0, 16) : M(R9, register + offset, 16));
+                    Emit(Movdqu, load ? M(R9, register + offset, 16) : M(Rax, 0, 16), R(Xmm0, 16));
+                }
+            }
+            else
+            {
+                string loop = $"maskMemory{_count}";
+                string done = $"maskMemoryDone{_count}";
+                Emit(Mov, R(R8), Context(nameof(JitContext.VectorStart)));
+                Label(loop);
+                Emit(Mov, R(Rcx), Context(nameof(JitContext.VectorLength)));
+                Emit(Add, R(Rcx), I(7));
+                Emit(Shr, R(Rcx), I(3));
+                Emit(Cmp, R(R8), R(Rcx));
+                Branch(X86Condition.Ae, done);
+                Emit(Mov, Context(nameof(JitContext.VectorStart)), R(R8));
+                Load(Rax, rs1);
+                Emit(Add, R(Rax), R(R8));
+                Memory(1, access);
+                Emit(Mov, R(R8), Context(nameof(JitContext.VectorStart)));
+                Emit(Movzx, R(Rcx, 4), load ? M(Rax, 0, 1) : X86Operand.Memory(R9, register, 1, R8));
+                Emit(Mov, load ? X86Operand.Memory(R9, register, 1, R8) : M(Rax, 0, 1), R(Rcx, 1));
+                Emit(Add, R(R8, 4), I(1));
+                Jump(loop);
+                Label(done);
+            }
+            Emit(Mov, Context(nameof(JitContext.VectorStart)), I(0));
+            Emit(Or, Context(nameof(JitContext.VectorDirty)), I((long)MstatusVsMask));
+            return true;
+        }
+
+        private void Saturated() => Emit(Mov, Context(nameof(JitContext.FixedSaturated), 4), I(1));
+
+        // The increment a right shift by cl of rax takes under the compiled vxrm, in rdx
+        private void RoundingIncrement()
+        {
+            string done = $"roundDone{_count}";
+            string one = $"roundOne{_count}";
+            Emit(Xor, R(Rdx, 4), R(Rdx, 4));
+            Emit(Test, R(Rcx, 4), R(Rcx, 4));
+            Branch(X86Condition.E, done);
+            switch (_machine._vxrm)
+            {
+                case 0:
+                    Emit(Mov, R(Rdx), R(Rax));
+                    Emit(Sub, R(Rcx, 4), I(1));
+                    Emit(Shr, R(Rdx), R(Rcx, 1));
+                    Emit(Add, R(Rcx, 4), I(1));
+                    Emit(And, R(Rdx, 4), I(1));
+                    break;
+                case 1:
+                    Emit(Sub, R(Rcx, 4), I(1));
+                    Emit(Mov, R(Rdx), R(Rax));
+                    Emit(Shr, R(Rdx), R(Rcx, 1));
+                    Emit(Test, R(Rdx, 4), I(1));
+                    Branch(X86Condition.E, $"roundZero{_count}");
+                    Emit(Mov, R(Rdx, 4), I(1));
+                    Emit(Shl, R(Rdx), R(Rcx, 1));
+                    Emit(Sub, R(Rdx), I(1));
+                    Emit(Test, R(Rdx), R(Rax));
+                    Branch(X86Condition.Ne, one);
+                    Emit(Mov, R(Rdx), R(Rax));
+                    Emit(Shr, R(Rdx), R(Rcx, 1));
+                    Emit(Shr, R(Rdx), I(1));
+                    Emit(And, R(Rdx, 4), I(1));
+                    Jump($"roundRestore{_count}");
+                    Label($"roundZero{_count}");
+                    Emit(Xor, R(Rdx, 4), R(Rdx, 4));
+                    Jump($"roundRestore{_count}");
+                    Label(one);
+                    Emit(Mov, R(Rdx, 4), I(1));
+                    Label($"roundRestore{_count}");
+                    Emit(Add, R(Rcx, 4), I(1));
+                    break;
+                case 3:
+                    Emit(Mov, R(Rdx, 4), I(1));
+                    Emit(Shl, R(Rdx), R(Rcx, 1));
+                    Emit(Sub, R(Rdx), I(1));
+                    Emit(And, R(Rdx), R(Rax));
+                    Branch(X86Condition.E, done);
+                    Emit(Mov, R(Rdx), R(Rax));
+                    Emit(Shr, R(Rdx), R(Rcx, 1));
+                    Emit(And, R(Rdx, 4), I(1));
+                    Emit(Xor, R(Rdx, 4), I(1));
+                    break;
+            }
+            Label(done);
+        }
+
+        // Clamps the signed value in rax to the element's range, flagging vxsat when it moves
+        private void SaturateSigned(int size)
+        {
+            string done = $"saturateDone{_count}";
+            string low = $"saturateLow{_count}";
+            long ceiling = size == 8 ? long.MaxValue : (1L << (size * 8 - 1)) - 1;
+            Emit(Mov, R(Rdx), I(ceiling));
+            Emit(Cmp, R(Rax), R(Rdx));
+            Branch(X86Condition.Le, low);
+            Emit(Mov, R(Rax), R(Rdx));
+            Saturated();
+            Jump(done);
+            Label(low);
+            Emit(Mov, R(Rdx), I(-ceiling - 1));
+            Emit(Cmp, R(Rax), R(Rdx));
+            Branch(X86Condition.Ge, done);
+            Emit(Mov, R(Rax), R(Rdx));
+            Saturated();
+            Label(done);
+        }
+
+        private void CarryElement(ElementPlan plan, int vs1, int vs2)
+        {
+            int size = plan.Destination;
+            X86Operand carry = Context(nameof(JitContext.VectorScratch));
+            if (plan.CarryIn)
+            {
+                LoadMaskBit(0);
+                Emit(Mov, carry, R(Rax));
+            }
+            LoadElement(Rax, VectorElement(vs2, size), size);
+            IntegerOperand(Rcx, plan, vs1);
+            bool subtract = plan.Op is ElementOp.SubtractBorrow or ElementOp.BorrowOut;
+            if (plan.Op is ElementOp.AddCarry or ElementOp.SubtractBorrow || size < 8)
+            {
+                Emit(subtract ? Sub : Add, R(Rax), R(Rcx));
+                if (plan.CarryIn)
+                    Emit(subtract ? Sub : Add, R(Rax), carry);
+                if (plan.Op == ElementOp.CarryOut)
+                {
+                    Emit(Shr, R(Rax), I(size * 8));
+                    Emit(And, R(Rax, 4), I(1));
+                }
+                else if (plan.Op == ElementOp.BorrowOut)
+                    Emit(Shr, R(Rax), I(63));
+                return;
+            }
+            if (plan.CarryIn)
+            {
+                Emit(Mov, R(Rdx), carry);
+                Emit(X86Instruction.Unary(Neg, R(Rdx)));
+                Emit(subtract ? Sbb : Adc, R(Rax), R(Rcx));
+            }
+            else
+                Emit(subtract ? Sub : Add, R(Rax), R(Rcx));
+            Emit(X86Instruction.Setcc(X86Condition.B, R(Rax, 1)));
+            Emit(Movzx, R(Rax), R(Rax, 1));
+        }
+
+        private void IntegerOperand(X86Register target, ElementPlan plan, int vs1)
+        {
+            switch (plan.Operand)
+            {
+                case ElementOperand.SignedImmediate:
+                    Emit(Mov, R(target), I(unchecked((long)((ulong)(vs1 < 16 ? vs1 : vs1 - 32) & ElementMask(plan.Source1 * 8)))));
+                    break;
+                case ElementOperand.Vector:
+                    LoadElement(target, VectorElement(vs1, plan.Source1), plan.Source1);
+                    break;
+                case ElementOperand.Scalar:
+                    Load(target, vs1);
+                    Truncate(target, plan.Source1);
+                    break;
+                case ElementOperand.Float:
+                    Emit(Mov, R(target), Context(nameof(JitContext.Floats)));
+                    LoadElement(target, M(target, vs1 * 8, plan.Source1), plan.Source1);
+                    break;
+                default:
+                    Emit(Mov, R(target), I(vs1));
+                    break;
+            }
+        }
+
+        private void FloatOperand(X86Register target, ElementPlan plan, int vs1)
+        {
+            X86InstrKind move = plan.Source1 == 8 ? Movsd : Movss;
+            if (plan.Operand == ElementOperand.Vector)
+                Emit(move, R(target, 16), VectorElement(vs1, plan.Source1));
+            else
+            {
+                Emit(Mov, R(Rdx), Context(nameof(JitContext.Floats)));
+                Emit(move, R(target, 16), M(Rdx, vs1 * 8, plan.Source1));
+            }
+        }
+
+        private void FloatElement(ElementPlan plan, int vd, int vs1, int vs2)
+        {
+            int size = plan.Destination;
+            int source = plan.Source2;
+            bool wide = size == 8;
+            switch (plan.Op)
+            {
+                case ElementOp.FloatSign or ElementOp.FloatSignNegate or ElementOp.FloatSignXor:
+                    LoadElement(Rax, VectorElement(vs2, size), size);
+                    IntegerOperand(Rcx, plan, vs1);
+                    if (plan.Op == ElementOp.FloatSignNegate)
+                        Emit(X86Instruction.Unary(Not, R(Rcx)));
+                    else if (plan.Op == ElementOp.FloatSignXor)
+                        Emit(Xor, R(Rcx), R(Rax));
+                    Emit(Shr, R(Rcx, size), I(size * 8 - 1));
+                    Emit(Shl, R(Rcx, size), I(size * 8 - 1));
+                    Emit(Shl, R(Rax, size), I(1));
+                    Emit(Shr, R(Rax, size), I(1));
+                    Emit(Or, R(Rax, size), R(Rcx, size));
+                    return;
+                case ElementOp.FloatMerge:
+                    IntegerOperand(Rax, plan, vs1);
+                    return;
+                case ElementOp.FloatClass:
+                    LoadElement(Rax, VectorElement(vs2, size), size);
+                    ClassifyFloat(size);
+                    return;
+                case ElementOp.UnsignedToFloat or ElementOp.SignedToFloat:
+                    LoadElement(Rax, VectorElement(vs2, source), source);
+                    if (plan.Op == ElementOp.SignedToFloat)
+                        SignExtend(Rax, source);
+                    else if (source == 8)
+                    {
+                        Emit(Test, R(Rax), R(Rax));
+                        Branch(X86Condition.Ns, $"convertPositive{_count}");
+                        Emit(Mov, R(Rdx), R(Rax));
+                        Emit(And, R(Rdx, 4), I(1));
+                        Emit(Shr, R(Rax), I(1));
+                        Emit(Or, R(Rax), R(Rdx));
+                        Emit(wide ? Cvtsi2sd : Cvtsi2ss, R(Xmm0, 16), R(Rax));
+                        Emit(wide ? Addsd : Addss, R(Xmm0, 16), R(Xmm0, 16));
+                        Jump($"convertDone{_count}");
+                        Label($"convertPositive{_count}");
+                    }
+                    Emit(wide ? Cvtsi2sd : Cvtsi2ss, R(Xmm0, 16), R(Rax));
+                    Label($"convertDone{_count}");
+                    FloatResult(size);
+                    return;
+            }
+
+            Emit(source == 8 ? Movsd : Movss, R(Xmm0, 16), VectorElement(vs2, source));
+            switch (plan.Op)
+            {
+                case ElementOp.FloatAdd or ElementOp.FloatSubtract or ElementOp.FloatMultiply or ElementOp.FloatDivide:
+                    FloatOperand(Xmm1, plan, vs1);
+                    Emit(plan.Op switch
+                    {
+                        ElementOp.FloatAdd => wide ? Addsd : Addss,
+                        ElementOp.FloatSubtract => wide ? Subsd : Subss,
+                        ElementOp.FloatMultiply => wide ? Mulsd : Mulss,
+                        _ => wide ? Divsd : Divss,
+                    }, R(Xmm0, 16), R(Xmm1, 16));
+                    break;
+                case ElementOp.FloatReverseSubtract or ElementOp.FloatReverseDivide:
+                    FloatOperand(Xmm1, plan, vs1);
+                    Emit(plan.Op == ElementOp.FloatReverseSubtract ? wide ? Subsd : Subss : wide ? Divsd : Divss, R(Xmm1, 16), R(Xmm0, 16));
+                    Emit(Movaps, R(Xmm0, 16), R(Xmm1, 16));
+                    break;
+                case ElementOp.FloatMinimum or ElementOp.FloatMaximum:
+                    FloatOperand(Xmm1, plan, vs1);
+                    FloatMinMax(plan.Op == ElementOp.FloatMinimum ? 0 : 1, size);
+                    break;
+                case >= ElementOp.FloatEqual and <= ElementOp.FloatGreaterEqual:
+                    FloatOperand(Xmm1, plan, vs1);
+                    bool swap = plan.Op is ElementOp.FloatGreater or ElementOp.FloatGreaterEqual;
+                    Emit(wide ? Ucomisd : Ucomiss, R(swap ? Xmm1 : Xmm0, 16), R(swap ? Xmm0 : Xmm1, 16));
+                    if (plan.Op == ElementOp.FloatNotEqual)
+                    {
+                        Emit(X86Instruction.Setcc(X86Condition.Ne, R(Rax, 1)));
+                        Emit(X86Instruction.Setcc(X86Condition.P, R(Rdx, 1)));
+                        Emit(Or, R(Rax, 1), R(Rdx, 1));
+                    }
+                    else
+                    {
+                        Emit(X86Instruction.Setcc(plan.Op switch
+                        {
+                            ElementOp.FloatEqual => X86Condition.E,
+                            ElementOp.FloatLess or ElementOp.FloatGreater => X86Condition.B,
+                            _ => X86Condition.Be,
+                        }, R(Rax, 1)));
+                        Emit(X86Instruction.Setcc(X86Condition.Np, R(Rdx, 1)));
+                        Emit(And, R(Rax, 1), R(Rdx, 1));
+                    }
+                    Emit(Movzx, R(Rax), R(Rax, 1));
+                    return;
+                case ElementOp.FloatMultiplyAdd:
+                    {
+                        bool accumulating = plan.Function >= 0x2C;
+                        FloatOperand(Xmm1, plan, vs1);
+                        Emit(wide ? Movsd : Movss, R(Xmm2, 16), VectorElement(vd, size));
+                        if (accumulating)
+                        {
+                            Emit(Movaps, R(Xmm3, 16), R(Xmm0, 16));
+                            Emit(Movaps, R(Xmm0, 16), R(Xmm1, 16));
+                            Emit(Movaps, R(Xmm1, 16), R(Xmm3, 16));
+                        }
+                        else
+                        {
+                            Emit(Movaps, R(Xmm3, 16), R(Xmm0, 16));
+                            Emit(Movaps, R(Xmm0, 16), R(Xmm1, 16));
+                            Emit(Movaps, R(Xmm1, 16), R(Xmm2, 16));
+                            Emit(Movaps, R(Xmm2, 16), R(Xmm3, 16));
+                        }
+                        FusedMultiplyAdd(plan.Function, wide);
+                        break;
+                    }
+                case ElementOp.FloatSquareRoot:
+                    Emit(wide ? Sqrtsd : Sqrtss, R(Xmm0, 16), R(Xmm0, 16));
+                    break;
+                case ElementOp.FloatToUnsigned or ElementOp.FloatToSigned:
+                    if (source == 4)
+                        Emit(Cvtss2sd, R(Xmm0, 16), R(Xmm0, 16));
+                    FloatToElement(size * 8, plan.Op == ElementOp.FloatToUnsigned, plan.Truncate);
+                    return;
+                case ElementOp.FloatToFloat:
+                    Emit(wide ? Cvtss2sd : Cvtsd2ss, R(Xmm0, 16), R(Xmm0, 16));
+                    break;
+                case ElementOp.FloatNarrowOdd:
+                    NarrowToOdd();
+                    break;
+                case ElementOp.FloatWideAdd or ElementOp.FloatWideSubtract or ElementOp.FloatWideMultiply:
+                    if (source == 4)
+                        Emit(Cvtss2sd, R(Xmm0, 16), R(Xmm0, 16));
+                    FloatOperand(Xmm1, plan, vs1);
+                    Emit(Cvtss2sd, R(Xmm1, 16), R(Xmm1, 16));
+                    Emit(plan.Op switch { ElementOp.FloatWideAdd => Addsd, ElementOp.FloatWideSubtract => Subsd, _ => Mulsd }, R(Xmm0, 16), R(Xmm1, 16));
+                    break;
+                case ElementOp.FloatWideMultiplyAdd:
+                    Emit(Cvtss2sd, R(Xmm1, 16), R(Xmm0, 16));
+                    FloatOperand(Xmm0, plan, vs1);
+                    Emit(Cvtss2sd, R(Xmm0, 16), R(Xmm0, 16));
+                    Emit(Movsd, R(Xmm2, 16), VectorElement(vd, 8));
+                    FusedMultiplyAdd(plan.Function, true);
+                    break;
+            }
+            FloatResult(size);
+        }
+
+        // Left in xmm0, right in xmm1 and addend in xmm2, with bit 0 of funct6 negating the product and bit 1 the addend
+        private void FusedMultiplyAdd(int function, bool wide)
+        {
+            Emit(Mov, R(Rax), I(wide ? long.MinValue : 0x80000000L));
+            Emit(Movq, R(Xmm3, 16), R(Rax));
+            if ((function & 1) != 0)
+            {
+                Emit(Xorps, R(Xmm0, 16), R(Xmm3, 16));
+                Emit(Xorps, R(Xmm2, 16), R(Xmm3, 16));
+            }
+            if ((function & 2) != 0)
+                Emit(Xorps, R(Xmm2, 16), R(Xmm3, 16));
+            _bytes.AddRange(X86CodeEncoder.Encode(X86Instruction.AvxTernary(wide ? Vfmadd213sd : Vfmadd213ss,
+                R(Xmm0, 16), R(Xmm1, 16), R(Xmm2, 16)), FmaTarget));
+        }
+
+        private void FloatResult(int size)
+        {
+            Emit(size == 8 ? Ucomisd : Ucomiss, R(Xmm0, 16), R(Xmm0, 16));
+            Emit(size == 8 ? Movq : Movd, R(Rax, size), R(Xmm0, 16));
+            Emit(Mov, R(Rdx), I(unchecked((long)(size == 8 ? CanonicalNaN64 : CanonicalNaN32))));
+            Emit(X86Instruction.Cmovcc(X86Condition.P, R(Rax), R(Rdx)));
+        }
+
+        // Converts the double in xmm0 to a saturated integer of the given width in rax
+        private void FloatToElement(int bits, bool unsignedResult, bool truncate)
+        {
+            string high = $"convertHigh{_count}";
+            string low = $"convertLow{_count}";
+            string small = $"convertSmall{_count}";
+            string done = $"convertDone{_count}";
+            Emit(Ucomisd, R(Xmm0, 16), R(Xmm0, 16));
+            Branch(X86Condition.P, high);
+            Emit(X86Instruction.Ternary(Roundsd, R(Xmm0, 16), R(Xmm0, 16), I(truncate ? 11 : 8)));
+            Emit(Mov, R(Rax), I(BitConverter.DoubleToInt64Bits(Math.ScaleB(1.0, unsignedResult ? bits : bits - 1))));
+            Emit(Movq, R(Xmm1, 16), R(Rax));
+            Emit(Comisd, R(Xmm0, 16), R(Xmm1, 16));
+            Branch(X86Condition.Ae, high);
+            if (unsignedResult)
+            {
+                Emit(Xorpd, R(Xmm1, 16), R(Xmm1, 16));
+                Emit(Comisd, R(Xmm0, 16), R(Xmm1, 16));
+                Branch(X86Condition.Be, low);
+            }
+            else
+            {
+                Emit(Mov, R(Rax), I(BitConverter.DoubleToInt64Bits(-Math.ScaleB(1.0, bits - 1))));
+                Emit(Movq, R(Xmm1, 16), R(Rax));
+                Emit(Comisd, R(Xmm0, 16), R(Xmm1, 16));
+                Branch(X86Condition.B, low);
+            }
+            if (unsignedResult && bits == 64)
+            {
+                Emit(Mov, R(Rax), I(BitConverter.DoubleToInt64Bits(Math.ScaleB(1.0, 63))));
+                Emit(Movq, R(Xmm1, 16), R(Rax));
+                Emit(Comisd, R(Xmm0, 16), R(Xmm1, 16));
+                Branch(X86Condition.B, small);
+                Emit(Subsd, R(Xmm0, 16), R(Xmm1, 16));
+                Emit(Cvttsd2si, R(Rax), R(Xmm0, 16));
+                Emit(Mov, R(Rdx), I(long.MinValue));
+                Emit(Xor, R(Rax), R(Rdx));
+                Jump(done);
+                Label(small);
+            }
+            Emit(Cvttsd2si, R(Rax), R(Xmm0, 16));
+            Jump(done);
+            Label(high);
+            ulong limit = bits == 64 ? ulong.MaxValue : (1UL << bits) - 1;
+            Emit(Mov, R(Rax), I(unchecked((long)(unsignedResult ? limit : limit >> 1))));
+            Jump(done);
+            Label(low);
+            Emit(Mov, R(Rax), I(unsignedResult ? 0 : unchecked((long)(1UL << (bits - 1)))));
+            Label(done);
+        }
+
+        // Narrows the double in xmm0 to a single, keeping the low bit set when the result is inexact
+        private void NarrowToOdd()
+        {
+            string done = $"narrowDone{_count}";
+            Emit(Cvtsd2ss, R(Xmm1, 16), R(Xmm0, 16));
+            Emit(Cvtss2sd, R(Xmm2, 16), R(Xmm1, 16));
+            Emit(Ucomisd, R(Xmm2, 16), R(Xmm0, 16));
+            Emit(Movaps, R(Xmm3, 16), R(Xmm0, 16));
+            Emit(Movaps, R(Xmm0, 16), R(Xmm1, 16));
+            Branch(X86Condition.P, done);
+            Branch(X86Condition.E, done);
+            Emit(Movd, R(Rax, 4), R(Xmm1, 16));
+            Emit(Test, R(Rax, 4), I(1));
+            Branch(X86Condition.Ne, done);
+            Emit(Movq, R(Rcx), R(Xmm2, 16));
+            Emit(Movq, R(Rdx), R(Xmm3, 16));
+            Emit(Shl, R(Rcx), I(1));
+            Emit(Shl, R(Rdx), I(1));
+            Emit(Cmp, R(Rcx), R(Rdx));
+            Emit(Lea, R(Rdx, 4), M(Rax, 1, 4));
+            Emit(Lea, R(Rax, 4), M(Rax, -1, 4));
+            Emit(X86Instruction.Cmovcc(X86Condition.Be, R(Rax, 4), R(Rdx, 4)));
+            Emit(Movd, R(Xmm0, 16), R(Rax, 4));
+            Label(done);
+        }
+
+        private void IntegerElement(ElementPlan plan, int vd, int vs1, int vs2)
+        {
+            int source = plan.Source2;
+            LoadElement(Rax, VectorElement(vs2, source), source);
+            switch (plan.Op)
+            {
+                case ElementOp.ZeroExtend:
+                    return;
+                case ElementOp.SignExtend:
+                    SignExtend(Rax, source);
+                    return;
+                case ElementOp.NarrowShiftRight or ElementOp.NarrowShiftRightArithmetic:
+                    IntegerOperand(Rcx, plan, vs1);
+                    Emit(And, R(Rcx, 4), I(source * 8 - 1));
+                    if (plan.Op == ElementOp.NarrowShiftRightArithmetic)
+                        SignExtend(Rax, source);
+                    Emit(plan.Op == ElementOp.NarrowShiftRight ? Shr : Sar, R(Rax), R(Rcx, 1));
+                    return;
+            }
+            if (plan.Op >= ElementOp.SaturatingAddUnsigned)
+            {
+                FixedElement(plan, vs1, source);
+                return;
+            }
+            IntegerOperand(Rcx, plan, vs1);
+            bool signedLeft = plan.Op is ElementOp.WideAdd or ElementOp.WideSubtract or ElementOp.WideMultiply or ElementOp.WideMultiplySignedUnsigned
+                or ElementOp.WideMultiplyAdd or ElementOp.WideMultiplyAddUnsignedSigned;
+            bool signedRight = plan.Op is ElementOp.WideAdd or ElementOp.WideSubtract or ElementOp.WideMultiply
+                or ElementOp.WideMultiplyAdd or ElementOp.WideMultiplyAddSignedUnsigned;
+            if (signedLeft)
+                SignExtend(Rax, source);
+            if (signedRight)
+                SignExtend(Rcx, plan.Source1);
+            switch (plan.Op)
+            {
+                case ElementOp.WideAddUnsigned or ElementOp.WideAdd:
+                    Emit(Add, R(Rax), R(Rcx));
+                    break;
+                case ElementOp.WideSubtractUnsigned or ElementOp.WideSubtract:
+                    Emit(Sub, R(Rax), R(Rcx));
+                    break;
+                case ElementOp.WideMultiplyUnsigned or ElementOp.WideMultiplySignedUnsigned or ElementOp.WideMultiply:
+                    Emit(Imul, R(Rax), R(Rcx));
+                    break;
+                default:
+                    Emit(Imul, R(Rax), R(Rcx));
+                    LoadElement(Rdx, VectorElement(vd, plan.Destination), plan.Destination);
+                    Emit(Add, R(Rax), R(Rdx));
+                    break;
+            }
+        }
+
+        private void FixedElement(ElementPlan plan, int vs1, int source)
+        {
+            int size = plan.Destination;
+            string done = $"fixedDone{_count}";
+            switch (plan.Op)
+            {
+                case ElementOp.ReverseBitsInBytes or ElementOp.ReverseBits:
+                    foreach ((int shift, long mask) in new[] { (1, 0x5555555555555555L), (2, 0x3333333333333333L), (4, 0x0F0F0F0F0F0F0F0FL) })
+                    {
+                        Emit(Mov, R(Rcx), I(mask));
+                        Emit(Mov, R(Rdx), R(Rax));
+                        Emit(Shr, R(Rdx), I(shift));
+                        Emit(And, R(Rdx), R(Rcx));
+                        Emit(And, R(Rax), R(Rcx));
+                        Emit(Shl, R(Rax), I(shift));
+                        Emit(Or, R(Rax), R(Rdx));
+                    }
+                    if (plan.Op == ElementOp.ReverseBits)
+                        goto case ElementOp.ReverseBytes;
+                    return;
+                case ElementOp.ReverseBytes:
+                    _bytes.AddRange(new byte[] { 0x48, 0x0F, 0xC8 });
+                    if (size != 8)
+                        Emit(Shr, R(Rax), I(64 - size * 8));
+                    return;
+                case ElementOp.CountLeadingZeros or ElementOp.CountTrailingZeros:
+                    Emit(Mov, R(Rdx, 4), I(size * 8));
+                    Emit(Test, R(Rax), R(Rax));
+                    Branch(X86Condition.E, done);
+                    if (plan.Op == ElementOp.CountTrailingZeros)
+                        Emit(Bsf, R(Rdx), R(Rax));
+                    else
+                    {
+                        Emit(Bsr, R(Rax), R(Rax));
+                        Emit(Mov, R(Rdx, 4), I(size * 8 - 1));
+                        Emit(Sub, R(Rdx, 4), R(Rax, 4));
+                    }
+                    Label(done);
+                    Emit(Mov, R(Rax), R(Rdx));
+                    return;
+                case ElementOp.PopCount:
+                    _bytes.AddRange(new byte[] { 0xF3, 0x48, 0x0F, 0xB8, 0xC0 });
+                    return;
+            }
+
+            IntegerOperand(Rcx, plan, vs1);
+            switch (plan.Op)
+            {
+                case ElementOp.SaturatingAddUnsigned:
+                    Emit(Add, R(Rax), R(Rcx));
+                    if (size == 8)
+                        Branch(X86Condition.Ae, done);
+                    else
+                    {
+                        Emit(Mov, R(Rdx), I((1L << (size * 8)) - 1));
+                        Emit(Cmp, R(Rax), R(Rdx));
+                        Branch(X86Condition.Be, done);
+                    }
+                    Emit(Mov, R(Rax), I(-1));
+                    Saturated();
+                    break;
+                case ElementOp.SaturatingSubtractUnsigned:
+                    Emit(Sub, R(Rax), R(Rcx));
+                    Branch(X86Condition.Ae, done);
+                    Emit(Xor, R(Rax, 4), R(Rax, 4));
+                    Saturated();
+                    break;
+                case ElementOp.SaturatingAdd or ElementOp.SaturatingSubtract:
+                    SignExtend(Rax, size);
+                    SignExtend(Rcx, size);
+                    if (size < 8)
+                    {
+                        Emit(plan.Op == ElementOp.SaturatingAdd ? Add : Sub, R(Rax), R(Rcx));
+                        SaturateSigned(size);
+                        break;
+                    }
+                    Emit(Mov, R(Rdx), R(Rax));
+                    Emit(plan.Op == ElementOp.SaturatingAdd ? Add : Sub, R(Rax), R(Rcx));
+                    Branch(X86Condition.No, done);
+                    Emit(Sar, R(Rdx), I(63));
+                    Emit(Mov, R(Rax), I(long.MaxValue));
+                    Emit(Xor, R(Rax), R(Rdx));
+                    Saturated();
+                    break;
+                case >= ElementOp.AverageAddUnsigned and <= ElementOp.AverageSubtract:
+                    {
+                        bool signed = plan.Op is ElementOp.AverageAdd or ElementOp.AverageSubtract;
+                        bool subtract = plan.Op is ElementOp.AverageSubtractUnsigned or ElementOp.AverageSubtract;
+                        X86Operand dropped = Context(nameof(JitContext.VectorScratch));
+                        if (signed)
+                        {
+                            SignExtend(Rax, size);
+                            SignExtend(Rcx, size);
+                        }
+                        Emit(Mov, R(Rdx), R(Rax));
+                        Emit(Xor, R(Rdx), R(Rcx));
+                        Emit(And, R(Rdx, 4), I(1));
+                        Emit(Mov, dropped, R(Rdx));
+                        Emit(Mov, R(Rdx), R(Rax));
+                        if (subtract)
+                            Emit(X86Instruction.Unary(Not, R(Rdx)));
+                        Emit(And, R(Rdx), R(Rcx));
+                        Emit(And, R(Rdx, 4), I(1));
+                        Emit(signed ? Sar : Shr, R(Rax), I(1));
+                        Emit(signed ? Sar : Shr, R(Rcx), I(1));
+                        Emit(subtract ? Sub : Add, R(Rax), R(Rcx));
+                        Emit(subtract ? Sub : Add, R(Rax), R(Rdx));
+                        Emit(Mov, R(Rdx), dropped);
+                        if (_machine._vxrm == 1)
+                            Emit(And, R(Rdx), R(Rax));
+                        else if (_machine._vxrm == 3)
+                        {
+                            Emit(Mov, R(Rcx), R(Rax));
+                            Emit(X86Instruction.Unary(Not, R(Rcx)));
+                            Emit(And, R(Rdx), R(Rcx));
+                        }
+                        Emit(And, R(Rdx, 4), I(1));
+                        if (_machine._vxrm != 2)
+                            Emit(Add, R(Rax), R(Rdx));
+                        break;
+                    }
+                case ElementOp.FractionalMultiply:
+                    SignExtend(Rax, size);
+                    SignExtend(Rcx, size);
+                    Emit(Imul, R(Rax), R(Rcx));
+                    Emit(Mov, R(Rcx, 4), I(size * 8 - 1));
+                    RoundingIncrement();
+                    Emit(Sar, R(Rax), R(Rcx, 1));
+                    Emit(Add, R(Rax), R(Rdx));
+                    SaturateSigned(size);
+                    break;
+                case ElementOp.ScaledShiftRight or ElementOp.ScaledShiftRightArithmetic or ElementOp.NarrowClipUnsigned or ElementOp.NarrowClip:
+                    {
+                        bool signed = plan.Op is ElementOp.ScaledShiftRightArithmetic or ElementOp.NarrowClip;
+                        Emit(And, R(Rcx, 4), I(source * 8 - 1));
+                        if (signed)
+                            SignExtend(Rax, source);
+                        RoundingIncrement();
+                        Emit(signed ? Sar : Shr, R(Rax), R(Rcx, 1));
+                        Emit(Add, R(Rax), R(Rdx));
+                        if (plan.Op == ElementOp.NarrowClip)
+                            SaturateSigned(size);
+                        else if (plan.Op == ElementOp.NarrowClipUnsigned)
+                        {
+                            Emit(Mov, R(Rdx), I((1L << (size * 8)) - 1));
+                            Emit(Cmp, R(Rax), R(Rdx));
+                            Branch(X86Condition.Be, done);
+                            Emit(Mov, R(Rax), R(Rdx));
+                            Saturated();
+                        }
+                        break;
+                    }
+                case ElementOp.RotateRight or ElementOp.RotateLeft:
+                    if (plan.Operand == ElementOperand.Immediate && plan.Function == 0x15)
+                        Emit(Or, R(Rcx, 4), I(32));
+                    Emit(plan.Op == ElementOp.RotateRight ? Ror : Rol, R(Rax, size), R(Rcx, 1));
+                    return;
+                case ElementOp.WideShiftLeft:
+                    Emit(And, R(Rcx, 4), I(size * 8 - 1));
+                    Emit(Shl, R(Rax), R(Rcx, 1));
+                    return;
+            }
+            Label(done);
         }
 
         private static bool SupportedAtomic(uint instruction)
@@ -1808,7 +3068,7 @@ public sealed partial class RiscVEmulator
             Emit(Mov, R(Rax), I(unchecked((long)type)));
             Emit(Mov, Context(nameof(JitContext.VectorType)), R(Rax));
             Emit(Mov, R(Rax), I(unchecked((long)(_pc + (ulong)size))));
-            Exit(_count + 1, chain: false);
+            Exit(_count + 1);
             return true;
         }
     }

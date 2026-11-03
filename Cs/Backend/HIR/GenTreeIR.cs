@@ -262,7 +262,7 @@ namespace Cnidaria.Cs
         /// <summary>Field access that addresses the parent struct's storage even though the parent is promoted.</summary>
         PromotionSync = 1u << 24,
         Unaligned = 1u << 25,
-        /// <summary>Store whose destination is never on the GC heap, so it needs no write barrier.</summary>
+        /// <summary>Store whose destination is never on the GC heap and needs no write barrier</summary>
         TargetNotOnHeap = 1u << 26,
         AssertionProperties = NullCheckEliminated | BoundsCheckEliminated | DivModNoByZero | DivModNoOverflow,
     }

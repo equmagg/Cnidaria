@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Linq;
 using System.Numerics;
@@ -44,7 +45,7 @@ public sealed class RiscVCodeGenerator
     private static readonly MachineRegister MaskRegister = MachineRegister.V0;
     private const int VectorRegisterCount = 32;
     private const int VectorScratchGroups = 3;
-    // The rodata fallback costs auipc, addi and a load, so a chain up to that length is never worse
+    // The rodata fallback costs an auipc and a load that may miss, so a chain up to that length still beats it
     private const int WideImmediateInstructionBudget = 4;
     private const int RoundTowardZero = 1;
 
@@ -235,7 +236,7 @@ public sealed class RiscVCodeGenerator
         private static bool SameFloatingType(QualifiedType left, QualifiedType right)
             => IsFloat32(left) == IsFloat32(right);
 
-        private static ScratchClass BinaryNeeds(LirInstruction instruction)
+        private ScratchClass BinaryNeeds(LirInstruction instruction)
         {
             var result = instruction.Result;
             if (result is null || instruction.Operands.Length != 2)
@@ -254,11 +255,12 @@ public sealed class RiscVCodeGenerator
                 return instruction.Operator is "==" or "!=" or "<" or "<=" or ">" or ">=" ? ScratchClass.None : ScratchClass.All;
             }
 
-            // Constants, scaled indices and division by a constant take at most the two spares
-            return left.Kind is LirOperandKind.Register or LirOperandKind.Immediate && right.Kind is LirOperandKind.Register or LirOperandKind.Immediate &&
-                left.Immediate is not string && right.Immediate is not string
-                ? ScratchClass.None
-                : ScratchClass.All;
+            if (left.Kind is not (LirOperandKind.Register or LirOperandKind.Immediate) || right.Kind is not (LirOperandKind.Register or LirOperandKind.Immediate) ||
+                left.Immediate is string || right.Immediate is string)
+                return ScratchClass.All;
+
+            // Constants and scaled indices take at most the two spares; a reciprocal division works in three scratch registers
+            return LirStrengthReduction.TryGetMagicDivisor(instruction, _target, out _) ? ScratchClass.General : ScratchClass.None;
         }
 
         private static bool HasComputedBase(LirAddress address)
@@ -846,12 +848,17 @@ public sealed class RiscVCodeGenerator
             return CreateExternalLabel(function.Name);
         }
 
-        if (_dataLabels.TryGetValue(symbol, out var dataLabel))
-            return dataLabel;
-        if (_dataLabelsByName.TryGetValue(symbol.Name, out dataLabel))
+        if (TryGetDefinedDataLabel(symbol, out var dataLabel))
             return dataLabel;
 
         return CreateExternalLabel(symbol.Name);
+    }
+
+    private bool TryGetDefinedDataLabel(Symbol symbol, [NotNullWhen(true)] out string? label)
+    {
+        label = null;
+        return symbol is not FunctionSymbol &&
+            (_dataLabels.TryGetValue(symbol, out label) || _dataLabelsByName.TryGetValue(symbol.Name, out label));
     }
 
     private void EmitFunction(LirFunction function)
@@ -1508,7 +1515,7 @@ public sealed class RiscVCodeGenerator
             _fallthroughBlock = null;
         }
 
-        /// <summary>Marks the narrow values whose every use is a store that keeps only their own width</summary>
+        /// <summary>Marks the narrow values whose every use is a store or a bitcast that keeps only their own width</summary>
         private void FindNarrowStoreOnlyValues()
         {
             var candidates = new HashSet<LirVirtualRegister>();
@@ -1555,9 +1562,11 @@ public sealed class RiscVCodeGenerator
             _narrowStoreOnlyValues.UnionWith(candidates);
         }
 
-        // Reports the operand a store keeps only the low bytes of, or -1 when the store reads any wider
+        // Reports the operand a store or an fmv keeps only the low bytes of, or -1 when the instruction reads any wider
         private int NarrowStoreValueOperandIndex(LirInstruction instruction)
         {
+            if (IsBitcast(instruction) && IsFloatType(instruction.Result!.Type) && UsesHardwareFloating(instruction.Result.Type))
+                return 0;
             if (instruction.Kind != LirInstructionKind.Store || instruction.Address is null ||
                 instruction.Operands.Length == 0)
             {
@@ -3675,14 +3684,10 @@ public sealed class RiscVCodeGenerator
             var wordOp = _owner._target.Is64Bit && SizeOf(instruction.Operands[0].Type) <= 4;
             var bits = wordOp ? 32 : _owner._target.RegisterSize * 8;
 
+            // dst is written last, the dividend may share its register
             var dividend = LoadOperand(leftOperand, GpScratch1);
             if (wordOp)
                 dividend = ExtendOperandToWidth(dividend, instruction.Operands[0].Type, 64, GpScratch1);
-            if (dividend != GpScratch1)
-            {
-                Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(GpScratch1), ToRegister(dividend), RVRegister.X0));
-                dividend = GpScratch1;
-            }
 
             var quotient = GpScratch2;
             LoadImmediate(GpScratch3, magic.Multiplier);
@@ -4126,8 +4131,13 @@ public sealed class RiscVCodeGenerator
             }
 
             var dst = GetWritableRegister(instruction.Result, PreferredScratch(instruction.Result.Type, GpScratch0, FpScratch0, VecScratch0));
-            var address = BuildAddress(instruction.Address, GpScratch1, GpScratch2);
-            LoadFromMemory(dst, address.BaseRegister, address.Offset, SizeOfRegisterType(instruction.Result.Type), IsCanonicallySignExtended(instruction.Result.Type));
+            var address = BuildAddress(instruction.Address, GpScratch1, GpScratch2, pcrelAccess: !IsVectorRegister(dst));
+            var size = SizeOfRegisterType(instruction.Result.Type);
+            var signed = IsCanonicallySignExtended(instruction.Result.Type);
+            if (address.PcrelSymbol is not null)
+                EmitPcrelAccess(IsFloatRegister(dst) ? FloatingLoadOpcode(size) : LoadOpcode(size, signed), dst, address, isStore: false);
+            else
+                LoadFromMemory(dst, address.BaseRegister, address.Offset, size, signed);
             NormalizeScalarRegister(dst, instruction.Result.Type);
             StoreWritableRegisterIfSpilled(instruction.Result, dst);
         }
@@ -4171,8 +4181,11 @@ public sealed class RiscVCodeGenerator
                 : TryLoadOperandForStore(instruction.Operands[0], storeType, storeSize, scratch, out var narrowed)
                     ? narrowed
                     : LoadOperandAs(instruction.Operands[0], storeType, scratch, instruction);
-            var address = BuildAddress(instruction.Address, GpScratch1, GpScratch2);
-            StoreToMemory(src, address.BaseRegister, address.Offset, storeSize);
+            var address = BuildAddress(instruction.Address, GpScratch1, GpScratch2, pcrelAccess: !IsVectorRegister(src));
+            if (address.PcrelSymbol is not null)
+                EmitPcrelAccess(IsFloatRegister(src) ? FloatingStoreOpcode(storeSize) : StoreOpcode(storeSize), src, address, isStore: true);
+            else
+                StoreToMemory(src, address.BaseRegister, address.Offset, storeSize);
         }
 
         /// <summary>Loads a value widened only as far as the store reads, since it keeps no more</summary>
@@ -6636,7 +6649,7 @@ public sealed class RiscVCodeGenerator
             AddImmediate(destination, built.BaseRegister, built.Offset, index);
         }
 
-        private AddressParts BuildAddress(LirAddress address, MachineRegister scratchBase, MachineRegister scratchIndex)
+        private AddressParts BuildAddress(LirAddress address, MachineRegister scratchBase, MachineRegister scratchIndex, bool pcrelAccess = false)
         {
             switch (address.Kind)
             {
@@ -6649,6 +6662,9 @@ public sealed class RiscVCodeGenerator
                 case LirAddressKind.Symbol:
                     if (address.Symbol is null)
                         throw new InvalidOperationException("Symbol address has no symbol.");
+                    // Only a definition here folds: the linker rewrites the addi of an imported object's pair into a table load
+                    if (pcrelAccess && _owner.TryGetDefinedDataLabel(address.Symbol, out var definedLabel))
+                        return new AddressParts(scratchBase, 0, definedLabel);
                     MaterializeSymbolAddress(_owner.GetSymbolLabel(address.Symbol), scratchBase);
                     return new AddressParts(scratchBase, 0);
                 case LirAddressKind.Indirect:
@@ -6658,10 +6674,10 @@ public sealed class RiscVCodeGenerator
                 case LirAddressKind.Element:
                     if (address.BaseAddress is null)
                         throw new InvalidOperationException("Element address has no base address.");
-                    var baseAddress = BuildAddress(address.BaseAddress, scratchBase, scratchIndex);
+                    var baseAddress = BuildAddress(address.BaseAddress, scratchBase, scratchIndex, pcrelAccess);
                     var elementScale = Math.Max(1, address.Scale);
                     if (address.Index is null)
-                        return new AddressParts(baseAddress.BaseRegister, checked(baseAddress.Offset + address.Displacement));
+                        return new AddressParts(baseAddress.BaseRegister, checked(baseAddress.Offset + address.Displacement), baseAddress.PcrelSymbol);
                     if (IsIntegerImmediate(address.Index) &&
                         TryGetConstantElementOffset(
                             address.Index,
@@ -6669,11 +6685,16 @@ public sealed class RiscVCodeGenerator
                             checked(baseAddress.Offset + address.Displacement),
                             out var constantOffset))
                     {
-                        return new AddressParts(baseAddress.BaseRegister, constantOffset);
+                        return new AddressParts(baseAddress.BaseRegister, constantOffset, baseAddress.PcrelSymbol);
                     }
 
                     var elementBase = baseAddress.BaseRegister;
-                    if (baseAddress.Offset != 0)
+                    if (baseAddress.PcrelSymbol is not null)
+                    {
+                        MaterializeSymbolAddress(baseAddress.PcrelSymbol, scratchBase, baseAddress.Offset);
+                        elementBase = scratchBase;
+                    }
+                    else if (baseAddress.Offset != 0)
                     {
                         AddImmediate(scratchBase, elementBase, baseAddress.Offset, scratchIndex);
                         elementBase = scratchBase;
@@ -6685,8 +6706,8 @@ public sealed class RiscVCodeGenerator
                 case LirAddressKind.Field:
                     if (address.BaseAddress is null)
                         throw new InvalidOperationException("Field address has no base address.");
-                    var fieldBase = BuildAddress(address.BaseAddress, scratchBase, scratchIndex);
-                    return new AddressParts(fieldBase.BaseRegister, checked(fieldBase.Offset + address.Displacement));
+                    var fieldBase = BuildAddress(address.BaseAddress, scratchBase, scratchIndex, pcrelAccess);
+                    return new AddressParts(fieldBase.BaseRegister, checked(fieldBase.Offset + address.Displacement), fieldBase.PcrelSymbol);
                 default:
                     throw new NotSupportedException($"Unsupported LIR address kind {address.Kind}.");
             }
@@ -7171,6 +7192,12 @@ public sealed class RiscVCodeGenerator
             RequireFloatingHardware(type, null);
             var size = IsFloat32(type) ? 4 : IsFloat64(type) ? 8 : throw new NotSupportedException("long double immediate requires a runtime helper.");
             var number = Convert.ToDouble(value, CultureInfo.InvariantCulture);
+            if (BitConverter.DoubleToInt64Bits(number) == 0 && (size == 4 || _owner._target.Is64Bit))
+            {
+                EmitFloatingMoveFromInteger(size == 4 ? RVInstrKind.FmvWX : RVInstrKind.FmvDX, destination, MachineRegister.X0);
+                return;
+            }
+
             if (Math.Round(number) == number && Math.Abs(number) < 2048 && BitConverter.DoubleToInt64Bits(number) != long.MinValue)
             {
                 var integer = MachineRegister.X0;
@@ -7196,8 +7223,8 @@ public sealed class RiscVCodeGenerator
                 var raw = BitConverter.GetBytes(Convert.ToDouble(value, CultureInfo.InvariantCulture));
                 _owner._rodata.EmitBytes(raw, 8);
             }
-            MaterializeSymbolAddress(label, GpScratch3);
-            LoadFromMemory(destination, GpScratch3, 0, size, signed: false);
+            EmitPcrelAccess(IsFloatRegister(destination) ? FloatingLoadOpcode(size) : LoadOpcode(size, signed: false),
+                destination, new AddressParts(GpScratch3, 0, label), isStore: false);
         }
 
         private void EmitFloatingR(RVInstrKind opcode, MachineRegister destination, MachineRegister left, MachineRegister right)
@@ -7219,15 +7246,12 @@ public sealed class RiscVCodeGenerator
         // A view conversion between a floating and an integer type of one size keeps the bits
         private bool TryEmitBitcast(LirInstruction instruction)
         {
+            if (!IsBitcast(instruction))
+                return false;
+
             var result = instruction.Result!;
             var operand = instruction.Operands[0];
             var size = SizeOf(result.Type);
-            if (instruction.Kind != LirInstructionKind.Cast || IsFloatType(result.Type) == IsFloatType(operand.Type) ||
-                size != SizeOf(operand.Type) || size is not (4 or 8) || size > _owner._target.RegisterSize)
-            {
-                return false;
-            }
-
             var floating = IsFloatType(result.Type) ? result.Type : operand.Type;
             if (!UsesHardwareFloating(floating))
             {
@@ -7252,6 +7276,16 @@ public sealed class RiscVCodeGenerator
                 StoreWritableRegisterIfSpilled(result, destination);
             }
             return true;
+        }
+
+        private bool IsBitcast(LirInstruction instruction)
+        {
+            if (instruction.Kind != LirInstructionKind.Cast || instruction.Result is null || instruction.Operands.Length == 0)
+                return false;
+            var result = instruction.Result.Type;
+            var operand = instruction.Operands[0].Type;
+            var size = SizeOf(result);
+            return IsFloatType(result) != IsFloatType(operand) && size == SizeOf(operand) && size is 4 or 8 && size <= _owner._target.RegisterSize;
         }
 
         private void EmitFloatingMoveToInteger(RVInstrKind opcode, MachineRegister destination, MachineRegister source)
@@ -7334,8 +7368,7 @@ public sealed class RiscVCodeGenerator
             var offset = _owner._rodata.Align(8);
             _owner._rodata.DefineSymbol(label, offset, 8, RVObjectSymbolBinding.Local, _owner._symbols);
             _owner._rodata.EmitInteger(value, 8, _owner._target.Endianness);
-            MaterializeSymbolAddress(label, destination);
-            LoadFromMemory(destination, destination, 0, 8, signed: false);
+            EmitPcrelAccess(LoadOpcode(8, signed: false), destination, new AddressParts(destination, 0, label), isStore: false);
             SetIntegerRepresentation(destination, representation);
         }
 
@@ -7387,16 +7420,33 @@ public sealed class RiscVCodeGenerator
             return plan.Count <= budget;
         }
 
-        private void MaterializeSymbolAddress(string symbol, MachineRegister destination)
+        private void MaterializeSymbolAddress(string symbol, MachineRegister destination, int addend = 0)
         {
             var hiOffset = _owner._text.ByteLength;
             var auipc = new RVInstruction(RVInstrKind.Auipc, ToRegister(destination), symbol: symbol, relocationKind: RVRelocationKind.AbsoluteUpper20);
             Emit(auipc);
-            _owner._text.AddRelocation(hiOffset, symbol, 0, RVObjectRelocationKind.PcrelHi20);
+            _owner._text.AddRelocation(hiOffset, symbol, addend, RVObjectRelocationKind.PcrelHi20);
             var loOffset = _owner._text.ByteLength;
             var addi = new RVInstruction(RVInstrKind.Addi, ToRegister(destination), ToRegister(destination), RVRegister.Invalid, 0, symbol, RVRelocationKind.AbsoluteLow12);
             Emit(addi);
-            _owner._text.AddRelocation(loOffset, symbol, 0, RVObjectRelocationKind.PcrelLo12I);
+            _owner._text.AddRelocation(loOffset, symbol, addend, RVObjectRelocationKind.PcrelLo12I);
+        }
+
+        // The low half resolves against the auipc right before it: every register is bound before the pair is emitted
+        private void EmitPcrelAccess(RVInstrKind opcode, MachineRegister value, AddressParts address, bool isStore)
+        {
+            var symbol = address.PcrelSymbol!;
+            var valueRegister = ToAnyRegister(value);
+            var baseRegister = ToRegister(address.BaseRegister);
+            var hiOffset = _owner._text.ByteLength;
+            Emit(new RVInstruction(RVInstrKind.Auipc, baseRegister, symbol: symbol, relocationKind: RVRelocationKind.AbsoluteUpper20));
+            _owner._text.AddRelocation(hiOffset, symbol, address.Offset, RVObjectRelocationKind.PcrelHi20);
+            var loOffset = _owner._text.ByteLength;
+            var access = isStore
+                ? RVInstruction.S(opcode, valueRegister, baseRegister, 0)
+                : RVInstruction.I(opcode, valueRegister, baseRegister, 0);
+            Emit(access.WithSymbol(symbol, RVRelocationKind.AbsoluteLow12));
+            _owner._text.AddRelocation(loOffset, symbol, address.Offset, isStore ? RVObjectRelocationKind.PcrelLo12S : RVObjectRelocationKind.PcrelLo12I);
         }
 
         private void AddImmediate(MachineRegister destination, MachineRegister source, int immediate, MachineRegister temporary = MachineRegister.Invalid)
@@ -8244,11 +8294,14 @@ public sealed class RiscVCodeGenerator
         {
             public MachineRegister BaseRegister { get; }
             public int Offset { get; }
+            // A symbol base not emitted yet, the access carries the pair with the offset as its addend
+            public string? PcrelSymbol { get; }
 
-            public AddressParts(MachineRegister baseRegister, int offset)
+            public AddressParts(MachineRegister baseRegister, int offset, string? pcrelSymbol = null)
             {
                 BaseRegister = baseRegister;
                 Offset = offset;
+                PcrelSymbol = pcrelSymbol;
             }
         }
     }

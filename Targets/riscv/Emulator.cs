@@ -1381,7 +1381,7 @@ public sealed partial class RiscVEmulator : IDisposable
                         long signedImmediate = (source1 & 16) != 0 ? source1 - 32 : source1;
 
                         if (funct3 == 4 || funct3 == 5 || funct3 == 6)
-                            scalar = floatOperation ? _f[source1] : _x[source1] & mask;
+                            scalar = floatOperation ? _f[source1] : funct6 == 12 && funct3 == 4 ? _x[source1] : _x[source1] & mask;
                         else if (funct3 == 3)
                             scalar = (ulong)(funct6 == 20 || funct6 == 21
                                     ? ((funct6 & 1) << 5) | source1
@@ -3921,26 +3921,26 @@ public sealed partial class RiscVEmulator : IDisposable
             float right = BitConverter.UInt32BitsToSingle(rightBits);
             switch (funct6)
             {
-                case 0: result = BitConverter.SingleToUInt32Bits(left + right); return true;
-                case 2: result = BitConverter.SingleToUInt32Bits(left - right); return true;
-                case 4: result = BitConverter.SingleToUInt32Bits(MathF.Min(left, right)); return true;
-                case 6: result = BitConverter.SingleToUInt32Bits(MathF.Max(left, right)); return true;
+                case 0: result = VectorFloat32(left + right); return true;
+                case 2: result = VectorFloat32(left - right); return true;
+                case 4: result = VectorFloat32(VectorMinMax(left, right, false)); return true;
+                case 6: result = VectorFloat32(VectorMinMax(left, right, true)); return true;
                 case 8: result = VectorFloatSign32(leftBits, rightBits, 0); return true;
                 case 9: result = VectorFloatSign32(leftBits, rightBits, 1); return true;
                 case 10: result = VectorFloatSign32(leftBits, rightBits, 2); return true;
-                case 32: result = BitConverter.SingleToUInt32Bits(left / right); return true;
+                case 32: result = VectorFloat32(left / right); return true;
                 case 33:
                     if (funct3 != 5) return false;
-                    result = BitConverter.SingleToUInt32Bits(right / left);
+                    result = VectorFloat32(right / left);
                     return true;
                 case 23:
                     if (funct3 != 5) return false;
                     result = rightBits;
                     return true;
-                case 36: result = BitConverter.SingleToUInt32Bits(left * right); return true;
+                case 36: result = VectorFloat32(left * right); return true;
                 case 39:
                     if (funct3 != 5) return false;
-                    result = BitConverter.SingleToUInt32Bits(right - left);
+                    result = VectorFloat32(right - left);
                     return true;
                 default: return false;
             }
@@ -3952,26 +3952,26 @@ public sealed partial class RiscVEmulator : IDisposable
             double right = BitConverter.Int64BitsToDouble((long)a);
             switch (funct6)
             {
-                case 0: result = (ulong)BitConverter.DoubleToInt64Bits(left + right); return true;
-                case 2: result = (ulong)BitConverter.DoubleToInt64Bits(left - right); return true;
-                case 4: result = (ulong)BitConverter.DoubleToInt64Bits(Math.Min(left, right)); return true;
-                case 6: result = (ulong)BitConverter.DoubleToInt64Bits(Math.Max(left, right)); return true;
+                case 0: result = VectorFloat64(left + right); return true;
+                case 2: result = VectorFloat64(left - right); return true;
+                case 4: result = VectorFloat64(VectorMinMax(left, right, false)); return true;
+                case 6: result = VectorFloat64(VectorMinMax(left, right, true)); return true;
                 case 8: result = VectorFloatSign64(b, a, 0); return true;
                 case 9: result = VectorFloatSign64(b, a, 1); return true;
                 case 10: result = VectorFloatSign64(b, a, 2); return true;
-                case 32: result = (ulong)BitConverter.DoubleToInt64Bits(left / right); return true;
+                case 32: result = VectorFloat64(left / right); return true;
                 case 33:
                     if (funct3 != 5) return false;
-                    result = (ulong)BitConverter.DoubleToInt64Bits(right / left);
+                    result = VectorFloat64(right / left);
                     return true;
                 case 23:
                     if (funct3 != 5) return false;
                     result = a;
                     return true;
-                case 36: result = (ulong)BitConverter.DoubleToInt64Bits(left * right); return true;
+                case 36: result = VectorFloat64(left * right); return true;
                 case 39:
                     if (funct3 != 5) return false;
-                    result = (ulong)BitConverter.DoubleToInt64Bits(right - left);
+                    result = VectorFloat64(right - left);
                     return true;
                 default: return false;
             }
@@ -3979,6 +3979,19 @@ public sealed partial class RiscVEmulator : IDisposable
 
         return false;
     }
+
+    private static ulong VectorFloat32(float value)
+        => float.IsNaN(value) ? CanonicalNaN32 : BitConverter.SingleToUInt32Bits(value);
+
+    private static ulong VectorFloat64(double value)
+        => double.IsNaN(value) ? CanonicalNaN64 : (ulong)BitConverter.DoubleToInt64Bits(value);
+
+    // vfmin and vfmax hand back the operand that is not NaN
+    private static float VectorMinMax(float left, float right, bool maximum)
+        => float.IsNaN(left) ? right : float.IsNaN(right) ? left : maximum ? MathF.Max(left, right) : MathF.Min(left, right);
+
+    private static double VectorMinMax(double left, double right, bool maximum)
+        => double.IsNaN(left) ? right : double.IsNaN(right) ? left : maximum ? Math.Max(left, right) : Math.Min(left, right);
 
     private static uint VectorFloatSign32(uint magnitudeSource, uint signSource, int mode)
     {
@@ -4058,9 +4071,11 @@ public sealed partial class RiscVEmulator : IDisposable
 
         if (vs2 != 0 || !CheckVectorGroup(rd, 1))
             return false;
-        if (_vl != 0)
+        if (_vstart < _vl)
+        {
             WriteVectorElement(ref vectorBytes, rd * VectorRegisterBytes, sewBytes, _x[rs1] & ElementMask(sewBytes * 8));
-        FillVectorAgnosticTail(ref vectorBytes, rd, sewBytes, 1, vlmax);
+            FillVectorAgnosticTail(ref vectorBytes, rd, sewBytes, 1, vlmax);
+        }
         _vstart = 0;
         _mstatus |= MstatusVsMask;
         return true;
@@ -4096,8 +4111,11 @@ public sealed partial class RiscVEmulator : IDisposable
             };
         }
 
-        WriteVectorElement(ref vectorBytes, vd * VectorRegisterBytes, sewBytes, accumulator);
-        FillVectorAgnosticTail(ref vectorBytes, vd, sewBytes, 1, VectorRegisterBytes / sewBytes);
+        if (_vl != 0)
+        {
+            WriteVectorElement(ref vectorBytes, vd * VectorRegisterBytes, sewBytes, accumulator);
+            FillVectorAgnosticTail(ref vectorBytes, vd, sewBytes, 1, VectorRegisterBytes / sewBytes);
+        }
         _vstart = 0;
         _mstatus |= MstatusVsMask;
         return true;
@@ -4546,7 +4564,7 @@ public sealed partial class RiscVEmulator : IDisposable
                 ulong source = (ulong)i + offset;
                 element = byOne
                     ? (i + 1 < vl ? ReadVectorElement(ref vectorBytes, vs2 * VectorRegisterBytes + (i + 1) * sewBytes, sewBytes) : inserted)
-                    : source < (ulong)vlmax ? ReadVectorElement(ref vectorBytes, vs2 * VectorRegisterBytes + (int)source * sewBytes, sewBytes) : 0;
+                    : offset < (ulong)vlmax && source < (ulong)vlmax ? ReadVectorElement(ref vectorBytes, vs2 * VectorRegisterBytes + (int)source * sewBytes, sewBytes) : 0;
             }
             else
             {
@@ -4638,9 +4656,9 @@ public sealed partial class RiscVEmulator : IDisposable
                 case 0x3D: wide = ReadVectorElement(ref vectorBytes, destinationOffset, wideBytes) + (ulong)(signedA * signedB); break;
                 case 0x3E:
                     if (funct3 != 6) return false;
-                    wide = ReadVectorElement(ref vectorBytes, destinationOffset, wideBytes) + (ulong)(signedA * (long)b);
+                    wide = ReadVectorElement(ref vectorBytes, destinationOffset, wideBytes) + (ulong)((long)a * signedB);
                     break;
-                case 0x3F: wide = ReadVectorElement(ref vectorBytes, destinationOffset, wideBytes) + (ulong)((long)a * signedB); break;
+                case 0x3F: wide = ReadVectorElement(ref vectorBytes, destinationOffset, wideBytes) + (ulong)(signedA * (long)b); break;
                 default: return false;
             }
             WriteVectorElement(ref vectorBytes, destinationOffset, wideBytes, wide & wideMask);
@@ -4675,8 +4693,11 @@ public sealed partial class RiscVEmulator : IDisposable
             accumulator = (accumulator + (funct6 == 0x30 ? element : (ulong)SignExtendElement(element, sewBits))) & wideMask;
         }
 
-        WriteVectorElement(ref vectorBytes, vd * VectorRegisterBytes, wideBytes, accumulator);
-        FillVectorAgnosticTail(ref vectorBytes, vd, wideBytes, 1, VectorRegisterBytes / wideBytes);
+        if (vl != 0)
+        {
+            WriteVectorElement(ref vectorBytes, vd * VectorRegisterBytes, wideBytes, accumulator);
+            FillVectorAgnosticTail(ref vectorBytes, vd, wideBytes, 1, VectorRegisterBytes / wideBytes);
+        }
         _vstart = 0;
         _mstatus |= MstatusVsMask;
         return true;
@@ -4765,7 +4786,7 @@ public sealed partial class RiscVEmulator : IDisposable
                 float addend = BitConverter.UInt32BitsToSingle((uint)(accumulating ? d : b));
                 if (negated) { left = -left; addend = -addend; }
                 if (subtracting) addend = -addend;
-                result = BitConverter.SingleToUInt32Bits(MathF.FusedMultiplyAdd(left, right, addend));
+                result = VectorFloat32(MathF.FusedMultiplyAdd(left, right, addend));
             }
             else
             {
@@ -4774,7 +4795,7 @@ public sealed partial class RiscVEmulator : IDisposable
                 double addend = BitConverter.Int64BitsToDouble((long)(accumulating ? d : b));
                 if (negated) { left = -left; addend = -addend; }
                 if (subtracting) addend = -addend;
-                result = (ulong)BitConverter.DoubleToInt64Bits(Math.FusedMultiplyAdd(left, right, addend));
+                result = VectorFloat64(Math.FusedMultiplyAdd(left, right, addend));
             }
             WriteVectorElement(ref vectorBytes, destinationOffset, sewBytes, result);
         }
@@ -4953,7 +4974,7 @@ public sealed partial class RiscVEmulator : IDisposable
                     _ => b * a,
                 };
             }
-            WriteVectorElement(ref vectorBytes, destinationOffset, 8, (ulong)BitConverter.DoubleToInt64Bits(result));
+            WriteVectorElement(ref vectorBytes, destinationOffset, 8, VectorFloat64(result));
         }
 
         FillVectorAgnosticTail(ref vectorBytes, vd, 8, vl, groupBytes >> 2);
@@ -4981,8 +5002,11 @@ public sealed partial class RiscVEmulator : IDisposable
             accumulator += BitConverter.UInt32BitsToSingle((uint)ReadVectorElement(ref vectorBytes, vs2 * VectorRegisterBytes + i * 4, 4));
         }
 
-        WriteVectorElement(ref vectorBytes, vd * VectorRegisterBytes, 8, (ulong)BitConverter.DoubleToInt64Bits(accumulator));
-        FillVectorAgnosticTail(ref vectorBytes, vd, 8, 1, VectorRegisterBytes / 8);
+        if (vl != 0)
+        {
+            WriteVectorElement(ref vectorBytes, vd * VectorRegisterBytes, 8, VectorFloat64(accumulator));
+            FillVectorAgnosticTail(ref vectorBytes, vd, 8, 1, VectorRegisterBytes / 8);
+        }
         _vstart = 0;
         _mstatus |= MstatusVsMask;
         return true;
@@ -5053,8 +5077,8 @@ public sealed partial class RiscVEmulator : IDisposable
             {
                 // The one rounding mode a plain cast cannot reach is the odd one the narrowing form offers
                 result = widening
-                    ? (ulong)BitConverter.DoubleToInt64Bits(BitConverter.UInt32BitsToSingle((uint)element))
-                    : BitConverter.SingleToUInt32Bits(NarrowDouble(BitConverter.Int64BitsToDouble((long)element), !widening && (select & 7) == 5));
+                    ? VectorFloat64(BitConverter.UInt32BitsToSingle((uint)element))
+                    : VectorFloat32(NarrowDouble(BitConverter.Int64BitsToDouble((long)element), !widening && (select & 7) == 5));
             }
             else if (floatSource)
             {
@@ -5143,9 +5167,9 @@ public sealed partial class RiscVEmulator : IDisposable
                 else if (select == 5)
                     result = sewBytes == 4 ? ReciprocalEstimate(element, 8, 23, rm) : ReciprocalEstimate(element, 11, 52, rm);
                 else if (sewBytes == 4)
-                    result = BitConverter.SingleToUInt32Bits(MathF.Sqrt(BitConverter.UInt32BitsToSingle((uint)element)));
+                    result = VectorFloat32(MathF.Sqrt(BitConverter.UInt32BitsToSingle((uint)element)));
                 else
-                    result = (ulong)BitConverter.DoubleToInt64Bits(Math.Sqrt(BitConverter.Int64BitsToDouble((long)element)));
+                    result = VectorFloat64(Math.Sqrt(BitConverter.Int64BitsToDouble((long)element)));
             }
             else if (select <= 1 || select >= 6)
             {
@@ -5185,16 +5209,17 @@ public sealed partial class RiscVEmulator : IDisposable
 
     private static ulong VectorIntegerToFloat(ulong element, bool signedSource, int sewBits, int rm, int sourceBits = 0)
     {
-        if (sourceBits != 0 && sourceBits < 64)
+        if (sourceBits == 0)
+            sourceBits = sewBits;
+        if (sourceBits < 64)
             element = signedSource ? (ulong)SignExtendElement(element, sourceBits) : element & ElementMask(sourceBits);
         if (sewBits == 32)
         {
-            int narrow = (int)element;
-            float nearest = signedSource ? narrow : (uint)element;
+            float nearest = signedSource ? (long)element : (float)element;
             if (rm != 0)
             {
-                double residual = (signedSource ? narrow : (double)(uint)element) - nearest;
-                nearest = RoundSingleDirected(nearest, residual, rm);
+                Int128 exact = signedSource ? (Int128)(long)element : (Int128)element;
+                nearest = RoundSingleDirected(nearest, (double)(exact - (Int128)(double)nearest), rm);
             }
             return BitConverter.SingleToUInt32Bits(nearest);
         }
@@ -5232,9 +5257,11 @@ public sealed partial class RiscVEmulator : IDisposable
 
         if (vs2 != 0)
             return false;
-        if (_vl != 0 && _vstart == 0)
+        if (_vstart < _vl)
+        {
             WriteVectorElement(ref vectorBytes, rd * VectorRegisterBytes, sewBytes, _f[rs1] & ElementMask(sewBytes * 8));
-        FillVectorAgnosticTail(ref vectorBytes, rd, sewBytes, 1, vlmax);
+            FillVectorAgnosticTail(ref vectorBytes, rd, sewBytes, 1, vlmax);
+        }
         _vstart = 0;
         _mstatus |= MstatusVsMask;
         return true;
@@ -5260,28 +5287,31 @@ public sealed partial class RiscVEmulator : IDisposable
             {
                 float left = BitConverter.UInt32BitsToSingle((uint)accumulator);
                 float right = BitConverter.UInt32BitsToSingle((uint)element);
-                accumulator = BitConverter.SingleToUInt32Bits(funct6 switch
+                accumulator = VectorFloat32(funct6 switch
                 {
                     1 or 3 => left + right,
-                    5 => MathF.Min(left, right),
-                    _ => MathF.Max(left, right),
+                    5 => VectorMinMax(left, right, false),
+                    _ => VectorMinMax(left, right, true),
                 });
             }
             else
             {
                 double left = BitConverter.Int64BitsToDouble((long)accumulator);
                 double right = BitConverter.Int64BitsToDouble((long)element);
-                accumulator = (ulong)BitConverter.DoubleToInt64Bits(funct6 switch
+                accumulator = VectorFloat64(funct6 switch
                 {
                     1 or 3 => left + right,
-                    5 => Math.Min(left, right),
-                    _ => Math.Max(left, right),
+                    5 => VectorMinMax(left, right, false),
+                    _ => VectorMinMax(left, right, true),
                 });
             }
         }
 
-        WriteVectorElement(ref vectorBytes, vd * VectorRegisterBytes, sewBytes, accumulator);
-        FillVectorAgnosticTail(ref vectorBytes, vd, sewBytes, 1, VectorRegisterBytes / sewBytes);
+        if (_vl != 0)
+        {
+            WriteVectorElement(ref vectorBytes, vd * VectorRegisterBytes, sewBytes, accumulator);
+            FillVectorAgnosticTail(ref vectorBytes, vd, sewBytes, 1, VectorRegisterBytes / sewBytes);
+        }
         _vstart = 0;
         _mstatus |= MstatusVsMask;
         return true;

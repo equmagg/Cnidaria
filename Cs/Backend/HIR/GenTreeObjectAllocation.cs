@@ -53,26 +53,36 @@ internal static class GenTreeObjectAllocator
     private static bool IsPointerKind(GenStackKind kind)
         => kind is GenStackKind.Ref or GenStackKind.ByRef or GenStackKind.NativeInt or GenStackKind.NativeUInt or GenStackKind.Ptr;
 
-    private sealed class AllocationSite
+    // A struct local is a site whose contents are what its fields reference
+    private class Site
     {
-        public AllocationSite(int index, GenTree statement, int blockId, int words)
+        public Site(int index, int words)
         {
             Index = index;
-            Statement = statement;
-            BlockId = blockId;
             Contents = new ulong[words];
         }
 
         public int Index { get; }
+        public ulong[] Contents { get; }
+        public bool Escapes { get; set; }
+    }
+
+    private sealed class AllocationSite : Site
+    {
+        public AllocationSite(int index, GenTree statement, int blockId, int words)
+            : base(index, words)
+        {
+            Statement = statement;
+            BlockId = blockId;
+        }
+
         public GenTree Statement { get; }
         public GenTree Allocation => Statement.Operands[0];
         public int BlockId { get; }
-        public ulong[] Contents { get; }
-        public bool Escapes { get; set; }
         public bool OnStack { get; set; }
     }
 
-    // Points-to sets range over allocation sites; bit 0 stands for every object this method did not allocate
+    // Points-to sets range over sites, with bit 0 for every object this method did not allocate
     private sealed class ObjectAllocator
     {
         private const int NoNode = -1;
@@ -82,7 +92,8 @@ internal static class GenTreeObjectAllocator
         private readonly RuntimeTypeSystem _typeSystem;
         private readonly ImmutableArray<GenLocalDescriptor> _locals;
         private readonly bool[] _tracked;
-        private readonly List<AllocationSite> _sites = new();
+        private readonly Site?[] _structSites;
+        private readonly List<Site> _sites = new();
         private readonly Dictionary<GenTree, AllocationSite> _siteByStatement = new();
         private readonly List<ulong[]> _pointsTo = new();
         private readonly Dictionary<GenTree, int> _valueNodes = new();
@@ -106,9 +117,18 @@ internal static class GenTreeObjectAllocator
             _typeSystem = typeSystem;
             _locals = method.AllLocalDescriptors;
             _tracked = new bool[_locals.Length];
+            _structSites = new Site?[_locals.Length];
             for (int lclNum = 0; lclNum < _locals.Length; lclNum++)
-                _tracked[lclNum] = IsPointerKind(_locals[lclNum].StackKind);
+                _tracked[lclNum] = IsPointerKind(_locals[lclNum].StackKind) || IsTrackedStruct(_locals[lclNum]);
         }
+
+        // Every use of a tracked struct local's address must be a tree the graph walks
+        private static bool IsTrackedStruct(GenLocalDescriptor local)
+            => local.Type is RuntimeType type &&
+               type.Kind == RuntimeTypeKind.Struct &&
+               type.ContainsGcPointers &&
+               !local.Pinned &&
+               !IsPointerKind(local.StackKind);
 
         public GenTreeMethod Run()
         {
@@ -135,7 +155,14 @@ internal static class GenTreeObjectAllocator
                 }
             }
 
-            _words = (allocations.Count + 64) / 64;
+            int structCount = 0;
+            for (int lclNum = 0; lclNum < _locals.Length; lclNum++)
+            {
+                if (_tracked[lclNum] && !IsPointerKind(_locals[lclNum].StackKind))
+                    structCount++;
+            }
+
+            _words = (allocations.Count + structCount + 64) / 64;
             foreach ((GenTree statement, int blockId) in allocations)
             {
                 var site = new AllocationSite(_sites.Count + 1, statement, blockId, _words);
@@ -153,6 +180,16 @@ internal static class GenTreeObjectAllocator
                 GenLocalDescriptor local = _locals[lclNum];
                 if (!_tracked[lclNum])
                     continue;
+                if (!IsPointerKind(local.StackKind))
+                {
+                    var structSite = new Site(_sites.Count + 1, _words);
+                    _sites.Add(structSite);
+                    _structSites[lclNum] = structSite;
+                    SetBit(_pointsTo[lclNum], structSite.Index);
+                    if (local.Kind == GenLocalKind.Argument)
+                        SetBit(structSite.Contents, UnknownBit);
+                    continue;
+                }
                 if (local.Kind == GenLocalKind.Argument || local.AddressExposed || local.Pinned)
                     SetBit(_pointsTo[lclNum], UnknownBit);
                 if (local.AddressExposed || local.Pinned)
@@ -184,7 +221,7 @@ internal static class GenTreeObjectAllocator
             GenTree allocation = site.Allocation;
             if (allocation.Kind is GenTreeKind.NewDelegate or GenTreeKind.Box && allocation.Operands.Length != 0)
             {
-                int stored = StoredValueNode(allocation.Operands[0]);
+                int stored = ValueNode(allocation.Operands[0]);
                 if (stored != NoNode)
                     _siteStores.Add((site, stored));
             }
@@ -195,18 +232,24 @@ internal static class GenTreeObjectAllocator
 
         private void BuildConnGraph(GenTree node)
         {
-            // A struct copied out of an object carries the object's references where nothing tracks them
-            if (node.Kind is GenTreeKind.Field or GenTreeKind.LoadIndirect or GenTreeKind.ArrayElement && MayHoldGcPointers(node))
-                _contentEscapes.Add(AddressNode(node.Operands[0]));
-
             switch (node.Kind)
             {
                 case GenTreeKind.StoreLocal:
                 case GenTreeKind.StoreTemp:
-                    if (TryGetTrackedLocal(node, out int destination))
-                        AddConnGraphEdge(destination, ValueNode(node.Operands[0]));
-                    else
+                    if (!TryGetTrackedLocal(node, out int destination))
+                    {
                         Escape(ValueNode(node.Operands[0]));
+                    }
+                    else if (_structSites[destination] is not null)
+                    {
+                        int stored = ValueNode(node.Operands[0]);
+                        if (stored != NoNode)
+                            _stores.Add((destination, stored));
+                    }
+                    else
+                    {
+                        AddConnGraphEdge(destination, ValueNode(node.Operands[0]));
+                    }
                     break;
 
                 case GenTreeKind.StoreField:
@@ -214,7 +257,7 @@ internal static class GenTreeObjectAllocator
                 case GenTreeKind.StoreArrayElement:
                     int address = AddressNode(node.Operands[0]);
                     _storeAddresses.Add((node, address));
-                    int value = StoredValueNode(node.Operands[^1]);
+                    int value = ValueNode(node.Operands[^1]);
                     if (value != NoNode)
                         _stores.Add((address, value));
                     break;
@@ -240,7 +283,7 @@ internal static class GenTreeObjectAllocator
                 case GenTreeKind.LocalAddr:
                 case GenTreeKind.TempAddr:
                 case GenTreeKind.ArgAddr:
-                    if (TryGetTrackedLocal(node, out int exposed))
+                    if (TryGetTrackedLocal(node, out int exposed) && _structSites[exposed] is null)
                     {
                         SetBit(_pointsTo[exposed], UnknownBit);
                         _escapes.Add(exposed);
@@ -279,20 +322,60 @@ internal static class GenTreeObjectAllocator
                 BuildConnGraph(node.Operands[i]);
         }
 
+        // A struct value's node points to what its fields reference
         private int ValueNode(GenTree node)
         {
-            if (!IsPointerKind(node.StackKind))
+            bool isStruct = MayHoldGcPointers(node);
+            if (!isStruct && !IsPointerKind(node.StackKind))
                 return NoNode;
             if (_valueNodes.TryGetValue(node, out int known))
                 return known;
 
+            int result = isStruct ? StructValueNode(node) : PointerValueNode(node);
+            _valueNodes[node] = result;
+            return result;
+        }
+
+        private int StructValueNode(GenTree node)
+        {
+            switch (node.Kind)
+            {
+                case GenTreeKind.Local:
+                case GenTreeKind.Temp:
+                case GenTreeKind.Arg:
+                    return TryGetTrackedLocal(node, out int lclNum) && _structSites[lclNum] is not null ? LoadNode(lclNum) : _unknownNode;
+
+                case GenTreeKind.Field when node.Operands[0].StackKind == GenStackKind.Value:
+                    return CopyNode(ValueNode(node.Operands[0]));
+
+                case GenTreeKind.Field:
+                case GenTreeKind.LoadIndirect:
+                case GenTreeKind.ArrayElement:
+                    return LoadNode(AddressNode(node.Operands[0]));
+
+                case GenTreeKind.DefaultValue:
+                    return NoNode;
+
+                default:
+                    return _unknownNode;
+            }
+        }
+
+        private int PointerValueNode(GenTree node)
+        {
             int result;
             switch (node.Kind)
             {
                 case GenTreeKind.Local:
                 case GenTreeKind.Temp:
                 case GenTreeKind.Arg:
-                    result = TryGetTrackedLocal(node, out int lclNum) ? lclNum : _unknownNode;
+                    result = TryGetTrackedLocal(node, out int lclNum) && _structSites[lclNum] is null ? lclNum : _unknownNode;
+                    break;
+
+                case GenTreeKind.LocalAddr:
+                case GenTreeKind.TempAddr:
+                case GenTreeKind.ArgAddr:
+                    result = TryGetTrackedLocal(node, out int structLocal) && _structSites[structLocal] is not null ? structLocal : _unknownNode;
                     break;
 
                 case GenTreeKind.ArrayElementAddr:
@@ -313,11 +396,14 @@ internal static class GenTreeObjectAllocator
                         AddConnGraphEdge(result, ValueNode(node.Operands[i]));
                     break;
 
+                case GenTreeKind.Field when node.Operands[0].StackKind == GenStackKind.Value:
+                    result = CopyNode(ValueNode(node.Operands[0]));
+                    break;
+
                 case GenTreeKind.Field:
                 case GenTreeKind.LoadIndirect:
                 case GenTreeKind.ArrayElement:
-                    result = NewNode();
-                    _loads.Add((result, AddressNode(node.Operands[0])));
+                    result = LoadNode(AddressNode(node.Operands[0]));
                     break;
 
                 default:
@@ -325,13 +411,25 @@ internal static class GenTreeObjectAllocator
                     break;
             }
 
-            _valueNodes[node] = result;
             return result;
         }
 
-        // A struct holds references this analysis never saw stored
-        private int StoredValueNode(GenTree node)
-            => node.Kind != GenTreeKind.DefaultValue && MayHoldGcPointers(node) ? _unknownNode : ValueNode(node);
+        private int LoadNode(int address)
+        {
+            int result = NewNode();
+            _loads.Add((result, address));
+            return result;
+        }
+
+        private int CopyNode(int source)
+        {
+            if (source == NoNode)
+                return _unknownNode;
+
+            int result = NewNode();
+            AddConnGraphEdge(result, source);
+            return result;
+        }
 
         private static bool MayHoldGcPointers(GenTree node)
             => node.StackKind == GenStackKind.Value && ((node.RuntimeType ?? node.Type) is not RuntimeType type || type.ContainsGcPointers);
@@ -419,7 +517,7 @@ internal static class GenTreeObjectAllocator
 
         private void MarkEscapingSites()
         {
-            var pending = new Stack<AllocationSite>();
+            var pending = new Stack<Site>();
             foreach (int node in _escapes)
                 MarkEscaping(_pointsTo[node], pending);
 
@@ -443,7 +541,7 @@ internal static class GenTreeObjectAllocator
                 MarkEscaping(pending.Pop().Contents, pending);
         }
 
-        private void MarkEscaping(ulong[] pointsTo, Stack<AllocationSite> pending)
+        private void MarkEscaping(ulong[] pointsTo, Stack<Site> pending)
         {
             foreach (int bit in Bits(pointsTo))
             {
@@ -459,7 +557,7 @@ internal static class GenTreeObjectAllocator
         private bool ExposeEscapedContents()
         {
             bool changed = false;
-            foreach (AllocationSite site in _sites)
+            foreach (Site site in _sites)
             {
                 if (site.Escapes)
                     changed |= SetBit(site.Contents, UnknownBit);
@@ -760,9 +858,9 @@ internal static class GenTreeObjectAllocator
         private void RewriteUses(ImmutableArray<GenTreeBlock>.Builder blocks)
         {
             var stackSites = new ulong[_words];
-            foreach (AllocationSite site in _sites)
+            foreach (Site site in _sites)
             {
-                if (site.OnStack)
+                if (site is AllocationSite allocation && allocation.OnStack)
                     SetBit(stackSites, site.Index);
             }
 
@@ -823,12 +921,12 @@ internal static class GenTreeObjectAllocator
             {
                 if (invoke.Operands[0].Kind is not (GenTreeKind.Local or GenTreeKind.Temp) ||
                     !TryGetSingleBit(_pointsTo[receiver], out int bit) ||
-                    !HasBit(stackSites, bit))
+                    !HasBit(stackSites, bit) ||
+                    _sites[bit - 1] is not AllocationSite site)
                 {
                     continue;
                 }
 
-                AllocationSite site = _sites[bit - 1];
                 GenTree creation = site.Allocation;
                 if (creation.Kind == GenTreeKind.NewDelegate &&
                     creation.Method is RuntimeMethod target &&
