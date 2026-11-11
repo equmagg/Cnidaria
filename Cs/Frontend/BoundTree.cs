@@ -148,6 +148,25 @@ namespace Cnidaria.Cs
     }
 
     /// <summary>Represents a lambda bound to a delegate invocation signature</summary>
+    internal sealed class BoundDelegateCreationExpression : BoundExpression
+    {
+        public override BoundNodeKind Kind => BoundNodeKind.DelegateCreation;
+        public MethodSymbol Method { get; }
+        public BoundExpression? TargetOpt { get; }
+        /// <summary>The receiver's type picks the method when the delegate is created</summary>
+        public bool IsVirtual { get; }
+
+        public BoundDelegateCreationExpression(ExpressionSyntax syntax, NamedTypeSymbol delegateType, MethodSymbol method, BoundExpression? targetOpt, bool isVirtual)
+            : base(syntax)
+        {
+            Type = delegateType;
+            Method = method;
+            TargetOpt = targetOpt;
+            IsVirtual = isVirtual;
+            HasErrors = targetOpt is not null && targetOpt.HasErrors;
+        }
+    }
+
     internal sealed class BoundLambdaExpression : BoundExpression
     {
         public override BoundNodeKind Kind => BoundNodeKind.Lambda;
@@ -1066,15 +1085,19 @@ namespace Cnidaria.Cs
 
         public NamedTypeSymbol ContainingType { get; }
         public NamedTypeSymbol BaseType { get; }
+        /// <summary>The captured 'this' inside a lambda, null where it is the method's own</summary>
+        public BoundExpression? InstanceOpt { get; }
 
         public BoundBaseExpression(
             ExpressionSyntax syntax,
             NamedTypeSymbol containingType,
-            NamedTypeSymbol baseType)
+            NamedTypeSymbol baseType,
+            BoundExpression? instanceOpt = null)
             : base(syntax)
         {
             ContainingType = containingType;
             BaseType = baseType;
+            InstanceOpt = instanceOpt;
             Type = baseType;
         }
     }

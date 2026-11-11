@@ -195,7 +195,7 @@ namespace Cnidaria.Cs
                 BoundLocalExpression e => e,
                 BoundParameterExpression e => e,
                 BoundThisExpression e => e,
-                BoundBaseExpression e => e,
+                BoundBaseExpression e => RewriteBaseExpression(e),
                 BoundLabelExpression e => e,
                 BoundTypeOfExpression e => e,
                 BoundSizeOfExpression e => e,
@@ -203,6 +203,7 @@ namespace Cnidaria.Cs
                 BoundMethodGroupExpression e => e,
                 BoundFunctionPointerMethodGroupExpression e => e,
                 BoundLambdaExpression e => RewriteLambdaExpression(e),
+                BoundDelegateCreationExpression e => RewriteDelegateCreationExpression(e),
                 BoundClosureCellCreationExpression e => RewriteClosureCellCreationExpression(e),
                 BoundClosureCreationExpression e => RewriteClosureCreationExpression(e),
                 BoundClosureSlotExpression e => RewriteClosureSlotExpression(e),
@@ -668,7 +669,7 @@ namespace Cnidaria.Cs
         {
             var elems = RewriteExpressions(node.Elements, out var changed);
             if (changed)
-                return new BoundArrayInitializerExpression((InitializerExpressionSyntax)node.Syntax, node.Type, elems);
+                return new BoundArrayInitializerExpression(node.Syntax, node.Type, elems);
 
             return node;
         }
@@ -810,6 +811,26 @@ namespace Cnidaria.Cs
                 return new BoundPointerElementAccessExpression(node.Syntax, node.Type, expr, idx);
 
             return node;
+        }
+
+        private BoundExpression RewriteBaseExpression(BoundBaseExpression node)
+        {
+            BoundExpression? instance = node.InstanceOpt is null ? null : RewriteExpression(node.InstanceOpt);
+            if (ReferenceEquals(instance, node.InstanceOpt))
+                return node;
+
+            return new BoundBaseExpression((ExpressionSyntax)node.Syntax, node.ContainingType, node.BaseType, instance);
+        }
+
+        private BoundExpression RewriteDelegateCreationExpression(BoundDelegateCreationExpression node)
+        {
+            if (node.TargetOpt is null)
+                return node;
+
+            BoundExpression target = RewriteExpression(node.TargetOpt);
+            return ReferenceEquals(target, node.TargetOpt)
+                ? node
+                : new BoundDelegateCreationExpression((ExpressionSyntax)node.Syntax, (NamedTypeSymbol)node.Type, node.Method, target, node.IsVirtual);
         }
 
         protected virtual BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)

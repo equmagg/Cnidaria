@@ -120,7 +120,7 @@ namespace Cnidaria.Cs
                     return true;
 
                 var method = node.Method;
-                if (method is null || method.HasInternalCall)
+                if (method is null || method.HasInternalCall || method.DllImportData?.SuppressGCTransition == true)
                     return false;
 
                 return node.TreeKind switch

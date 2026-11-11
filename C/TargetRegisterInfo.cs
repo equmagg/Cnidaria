@@ -561,7 +561,8 @@ internal static class TargetRegisterInfo
                 MachineRegister.X11,
                 MachineRegister.X12,
                 MachineRegister.X13,
-                MachineRegister.X14),
+                MachineRegister.X14,
+                MachineRegister.X10),
 
             TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64 => ImmutableArray.Create(
                 MachineRegister.X10,
@@ -854,9 +855,22 @@ internal static class TargetRegisterInfo
         return ImmutableArray<MachineRegister>.Empty;
     }
 
+    public static bool HasRotate(TargetInfo target, int bits)
+    {
+        if (bits is not (32 or 64))
+            return false;
+        if (target.IsRegisterBytecode)
+            return true;
+        return bits <= target.RegisterSize * 8 && (!target.IsRiscV || target.HasFeature(TargetArchitectureFeatures.RiscVB));
+    }
+
+    public static bool HasRotateLeft(TargetInfo target)
+        => target.Architecture is not (TargetArchitectureKind.Arm32 or TargetArchitectureKind.Arm64);
+
     public static MachineRegister FrameBaseRegister(TargetInfo target)
         => target.Architecture switch
         {
+            TargetArchitectureKind.X86_64 => MachineRegister.X10,
             TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64 => MachineRegister.X8,
             TargetArchitectureKind.Arm64 => MachineRegister.X29,
             TargetArchitectureKind.Arm32 => MachineRegister.X6,
@@ -889,8 +903,8 @@ internal static class TargetRegisterInfo
                 return false;
 
             return IsWindowsX64(target)
-                ? register is MachineRegister.X7 or MachineRegister.X8 or MachineRegister.X9 or MachineRegister.X11 or MachineRegister.X12 or MachineRegister.X13 or MachineRegister.X14
-                : register is MachineRegister.X9 or MachineRegister.X11 or MachineRegister.X12 or MachineRegister.X13 or MachineRegister.X14;
+                ? register is MachineRegister.X7 or MachineRegister.X8 or MachineRegister.X9 or MachineRegister.X10 or MachineRegister.X11 or MachineRegister.X12 or MachineRegister.X13 or MachineRegister.X14
+                : register is MachineRegister.X9 or MachineRegister.X10 or MachineRegister.X11 or MachineRegister.X12 or MachineRegister.X13 or MachineRegister.X14;
         }
 
         if (target.IsRiscV)

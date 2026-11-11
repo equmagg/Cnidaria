@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 
 namespace Cnidaria.Cs
 {
@@ -287,6 +288,7 @@ namespace Cnidaria.Cs
     ///<summary>Represents the complete source file including directives, members and end-of-file token</summary>
     public sealed class CompilationUnitSyntax : SyntaxNode
     {
+        public ImmutableArray<PragmaWarningDirective> PragmaWarnings { get; init; } = ImmutableArray<PragmaWarningDirective>.Empty;
         public SyntaxList<AttributeListSyntax> AttributeLists { get; }
         public SyntaxList<ExternAliasDirectiveSyntax> Externs { get; }
         public SyntaxList<UsingDirectiveSyntax> Usings { get; }

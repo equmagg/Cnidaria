@@ -2073,7 +2073,9 @@ internal sealed class LirFunctionBuilder
             return;
         }
 
-        if (definition is not null && !IsGimpleNameUsed(definition.Name) || _answeredDivisions.Contains(instruction))
+        // A read of a volatile object counts as a memory write here and happens even when nothing uses the value
+        if (definition is not null && !IsGimpleNameUsed(definition.Name) && (instruction.Flags & GimpleStatementFlags.WritesMemory) == 0 ||
+            _answeredDivisions.Contains(instruction))
             return;
 
         var destination = definition is null ? null : GetRegister(definition.Name);
@@ -4962,7 +4964,7 @@ internal sealed class LirFunctionBuilder
     }
 
     private static bool SameType(QualifiedType left, QualifiedType right)
-        => string.Equals(left.ToDisplayString(), right.ToDisplayString(), StringComparison.Ordinal);
+        => left.Type.ToDisplayString() == right.Type.ToDisplayString();
 
     private static bool IsVoid(QualifiedType type)
         => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Void };

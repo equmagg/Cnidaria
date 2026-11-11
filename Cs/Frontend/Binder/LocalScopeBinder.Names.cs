@@ -119,9 +119,10 @@ namespace Cnidaria.Cs
             ExpressionSyntax node,
             BindingContext context,
             DiagnosticBag diagnostics,
-            bool requireReadable = false)
+            bool requireReadable = false,
+            bool allowEvent = false)
         {
-            var target = BindAssignableValue(node, context, diagnostics);
+            BoundExpression target = BindAssignableValue(node, context, diagnostics, allowEvent);
 
             if (!requireReadable || target.HasErrors)
                 return new LValue(target, target);
@@ -142,13 +143,113 @@ namespace Cnidaria.Cs
 
             return new LValue(target, target);
         }
-        private bool TryBindSimpleValue(IdentifierNameSyntax id, out BoundExpression value)
+
+        // An event whose field is out of reach exists only as the target of += and -=, which BindAssignmentToLValue turns into accessor calls
+        private static BoundExpression BindAccessorOnlyEvent(
+            ExpressionSyntax syntax,
+            BoundExpression? receiver,
+            EventSymbol accessorOnlyEvent,
+            BindValueKind valueKind,
+            BindingContext context,
+            DiagnosticBag diagnostics,
+            TypeSymbol? constrainedTo = null)
+        {
+            if (accessorOnlyEvent.IsStatic == receiver is not null)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_MEMACC032",
+                    DiagnosticSeverity.Error,
+                    accessorOnlyEvent.IsStatic
+                        ? $"Static event '{accessorOnlyEvent.Name}' cannot be accessed with an instance reference."
+                        : $"An object reference is required for the non-static event '{accessorOnlyEvent.Name}'.",
+                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                return new BoundBadExpression(syntax);
+            }
+
+            if (valueKind == BindValueKind.LValue)
+                return new BoundMemberAccessExpression(syntax, receiver, accessorOnlyEvent, accessorOnlyEvent.Type, isLValue: false, constrainedToTypeOpt: constrainedTo);
+
+            ReportEventOutsideAssignment(syntax, accessorOnlyEvent, context, diagnostics);
+            return new BoundBadExpression(syntax);
+        }
+
+        private static void ReportEventOutsideAssignment(SyntaxNode syntax, EventSymbol accessorOnlyEvent, BindingContext context, DiagnosticBag diagnostics)
+            => diagnostics.Add(new Diagnostic(
+                "CN_EVENT004",
+                DiagnosticSeverity.Error,
+                $"The event '{accessorOnlyEvent.Name}' can only appear on the left hand side of += or -=.",
+                new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+
+        private static BoundExpression BindParameterReference(IdentifierNameSyntax syntax, ParameterSymbol parameter, BindingContext context)
+        {
+            if (parameter.ContainingSymbol is MethodSymbol method &&
+                method.ContainingSymbol is SourceNamedTypeSymbol type && type.PrimaryConstructorInfo is PrimaryConstructorInfo primary &&
+                primary.Captures.TryGetValue(parameter, out SynthesizedBackingFieldSymbol? field))
+            {
+                return new BoundMemberAccessExpression(syntax, new BoundThisExpression(syntax, type), field, field.Type,
+                    isLValue: !field.IsReadOnly || ReferenceEquals(context.ContainingSymbol, primary.Constructor));
+            }
+            return new BoundParameterExpression(syntax, parameter);
+        }
+
+        private bool TryBindPrimaryParameter(IdentifierNameSyntax syntax, SourceNamedTypeSymbol type, NamedTypeSymbol innermostType,
+            BindValueKind valueKind, BindingContext context, DiagnosticBag diagnostics, out BoundExpression expression)
+        {
+            expression = null!;
+            if (type.PrimaryConstructorInfo is not PrimaryConstructorInfo primary || type.TypeParameters.Any(p => p.Name == syntax.Identifier.ValueText))
+                return false;
+            ParameterSymbol? parameter = primary.Constructor.Parameters.FirstOrDefault(p => p.Name == syntax.Identifier.ValueText);
+            if (parameter is null)
+                return false;
+            Symbol? member = context.ContainingSymbol;
+            while (member is LambdaMethodSymbol or LocalFunctionSymbol)
+                member = member.ContainingSymbol;
+            string? error = null;
+            string code = "CS9105";
+            if (!ReferenceEquals(type, innermostType) || HasNoThis(context.ContainingSymbol) || member is not MethodSymbol method || method.IsConstructor)
+                error = $"Primary constructor parameter '{parameter.Name}' cannot be used in this context.";
+            else if (parameter.RefKind != ParameterRefKind.None || parameter.Type is ByRefTypeSymbol)
+            {
+                code = "CS9109";
+                error = "A ref, out, or in primary constructor parameter cannot be captured by an instance member.";
+            }
+            else if (parameter.Type.IsRefLikeType)
+            {
+                code = "CS9110";
+                error = "A primary constructor parameter with a ref-like type cannot be captured by an instance member.";
+            }
+            if (error is not null)
+            {
+                diagnostics.Add(new Diagnostic(code, DiagnosticSeverity.Error, error, new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                expression = new BoundBadExpression(syntax);
+                return true;
+            }
+            if (ReportThisInStructFunction(syntax, context, diagnostics))
+            {
+                expression = new BoundBadExpression(syntax);
+                return true;
+            }
+            SynthesizedBackingFieldSymbol field = primary.Capture(parameter);
+            var receiver = new BoundThisExpression(syntax, type);
+            bool writable = !field.IsReadOnly && !IsReadOnlyStructThisReceiver(receiver, context);
+            if (valueKind == BindValueKind.LValue && !writable)
+            {
+                diagnostics.Add(new Diagnostic("CS9114", DiagnosticSeverity.Error,
+                    "A captured primary constructor parameter is readonly in this context.", new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                expression = new BoundBadExpression(syntax);
+                return true;
+            }
+            expression = new BoundMemberAccessExpression(syntax, receiver, field, field.Type, isLValue: writable);
+            return true;
+        }
+
+        private bool TryBindSimpleValue(IdentifierNameSyntax id, BindingContext context, out BoundExpression value)
         {
             var name = id.Identifier.ValueText ?? "";
 
             if (TryGetLocalOrParameterFromEnclosingScopes(name, out var local, out var param))
             {
-                value = local is not null ? new BoundLocalExpression(id, local) : new BoundParameterExpression(id, param!);
+                value = local is not null ? new BoundLocalExpression(id, local) : BindParameterReference(id, param!, context);
                 return true;
             }
 
@@ -198,7 +299,7 @@ namespace Cnidaria.Cs
 
             if (!backingField.IsStatic)
             {
-                if (context.ContainingSymbol is MethodSymbol { IsStatic: true })
+                if (IsInStaticMember(context.ContainingSymbol))
                 {
                     diagnostics.Add(new Diagnostic(
                         "CN_MEMACC011",
@@ -217,6 +318,9 @@ namespace Cnidaria.Cs
                         new Location(context.SemanticModel.SyntaxTree, node.Span)));
                     return new BoundBadExpression(node);
                 }
+
+                if (ReportThisInStructFunction(node, context, diagnostics))
+                    return new BoundBadExpression(node);
 
                 receiver = new BoundThisExpression(node, containingType);
             }
@@ -308,7 +412,7 @@ namespace Cnidaria.Cs
             var name = id.Identifier.ValueText ?? "";
 
             if (TryGetLocalOrParameterFromEnclosingScopes(name, out var local, out var param))
-                return local is not null ? new BoundLocalExpression(id, local) : new BoundParameterExpression(id, param!);
+                return local is not null ? new BoundLocalExpression(id, local) : BindParameterReference(id, param!, context);
 
             if (TryBindUnqualifiedMember(id, name, BindValueKind.RValue, context, diagnostics, out var memberExpr))
                 return memberExpr;
@@ -392,13 +496,7 @@ namespace Cnidaria.Cs
                 }
             }
 
-            bool inStaticContext = context.ContainingSymbol switch
-            {
-                MethodSymbol m => m.IsStatic,
-                FieldSymbol f => f.IsStatic,
-                PropertySymbol p => p.IsStatic,
-                _ => false
-            };
+            bool inStaticContext = IsInStaticMember(context.ContainingSymbol);
 
             ImmutableArray<MethodSymbol> candidates = ImmutableArray<MethodSymbol>.Empty;
             BoundExpression? receiver = null;
@@ -464,6 +562,12 @@ namespace Cnidaria.Cs
                                 : $"No overload of '{name}' has the supplied number of type arguments.",
                             new Location(context.SemanticModel.SyntaxTree, nameSyntax.Span)));
 
+                        result = new BoundBadExpression(nameSyntax);
+                        return true;
+                    }
+
+                    if (candidates.All(m => !m.IsStatic) && ReportThisInStructFunction(nameSyntax, context, diagnostics))
+                    {
                         result = new BoundBadExpression(nameSyntax);
                         return true;
                     }
@@ -554,17 +658,14 @@ namespace Cnidaria.Cs
                     containingType = nt;
                     break;
                 }
+                if (nt is SourceNamedTypeSymbol sourceType &&
+                    TryBindPrimaryParameter(id, sourceType, innermostType, valueKind, context, diagnostics, out result))
+                    return true;
             }
             if (containingType is null)
                 return false;
 
-            bool inStaticContext = !ReferenceEquals(containingType, innermostType) || context.ContainingSymbol switch
-            {
-                MethodSymbol m => m.IsStatic,
-                FieldSymbol f => f.IsStatic,
-                PropertySymbol p => p.IsStatic,
-                _ => false
-            };
+            bool inStaticContext = !ReferenceEquals(containingType, innermostType) || IsInStaticMember(context.ContainingSymbol);
 
             var accessibleMembers = FilterAccessibleMembers(members, context);
             if (accessibleMembers.IsDefaultOrEmpty)
@@ -588,6 +689,25 @@ namespace Cnidaria.Cs
             {
                 switch (members[i])
                 {
+                    case EventSymbol accessorOnlyEvent:
+                        if (!accessorOnlyEvent.IsStatic && inStaticContext)
+                        {
+                            diagnostics.Add(new Diagnostic("CN_MEMACC031", DiagnosticSeverity.Error,
+                                $"An object reference is required for the non-static event '{accessorOnlyEvent.Name}'.",
+                                new Location(context.SemanticModel.SyntaxTree, id.Span)));
+                            result = new BoundBadExpression(id);
+                            return true;
+                        }
+
+                        result = BindAccessorOnlyEvent(
+                            id,
+                            accessorOnlyEvent.IsStatic ? null : new BoundThisExpression(id, containingType),
+                            accessorOnlyEvent,
+                            valueKind,
+                            context,
+                            diagnostics);
+                        return true;
+
                     case FieldSymbol fs:
                         if (field is not null || prop is not null)
                         {
@@ -625,6 +745,12 @@ namespace Cnidaria.Cs
                     diagnostics.Add(new Diagnostic("CN_MEMACC011", DiagnosticSeverity.Error,
                         $"An object reference is required for the non-static field '{field.Name}'.",
                         new Location(context.SemanticModel.SyntaxTree, id.Span)));
+                    result = new BoundBadExpression(id);
+                    return true;
+                }
+
+                if (!field.IsStatic && ReportThisInStructFunction(id, context, diagnostics))
+                {
                     result = new BoundBadExpression(id);
                     return true;
                 }
@@ -667,6 +793,11 @@ namespace Cnidaria.Cs
                 result = new BoundBadExpression(id);
                 return true;
             }
+            if (!prop.IsStatic && ReportThisInStructFunction(id, context, diagnostics))
+            {
+                result = new BoundBadExpression(id);
+                return true;
+            }
             BoundExpression? propReceiver = prop.IsStatic ? null : new BoundThisExpression(id, containingType);
             bool canReadProperty =
                 prop.GetMethod is not null &&
@@ -676,6 +807,11 @@ namespace Cnidaria.Cs
                 prop.SetMethod is not null &&
                 AccessibilityHelper.IsAccessible(prop.SetMethod, context) &&
                 (!prop.SetMethod.IsInitOnly || CanAssignInitOnlyProperty(propReceiver, context));
+            if (prop.GetMethod is MethodSymbol refGetter && refGetter.ReturnType is ByRefTypeSymbol && canReadProperty)
+            {
+                result = new BoundCallExpression(id, propReceiver, refGetter, ImmutableArray<BoundExpression>.Empty);
+                return true;
+            }
             if (valueKind == BindValueKind.LValue &&
                 !prop.IsStatic &&
                 IsReadOnlyStructThisReceiver(propReceiver, context))
@@ -730,7 +866,9 @@ namespace Cnidaria.Cs
             if (operand.HasErrors)
                 return operand;
 
-            if (!operand.IsLValue && !(operand is BoundConditionalExpression ce && ce.Type is ByRefTypeSymbol))
+            if (!operand.IsLValue &&
+                !(operand is BoundConditionalExpression ce && ce.Type is ByRefTypeSymbol) &&
+                !(operand is BoundSequenceExpression sequence && sequence.Value.IsLValue))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_REF000",
@@ -857,13 +995,9 @@ namespace Cnidaria.Cs
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_ADDR002",
-                    DiagnosticSeverity.Error,
-                    $"Cannot take the address of managed type '{operand.Type.Name}'.",
+                    DiagnosticSeverity.Warning,
+                    $"This takes the address of the managed type '{operand.Type.Name}'.",
                     new Location(context.SemanticModel.SyntaxTree, node.Operand.Span)));
-
-                var bad = new BoundBadExpression(node);
-                bad.SetType(context.Compilation.CreatePointerType(operand.Type));
-                return bad;
             }
 
             var ptrType = context.Compilation.CreatePointerType(operand.Type);
@@ -1057,6 +1191,12 @@ namespace Cnidaria.Cs
             return false;
         }
 
+        // An expression body of a void member is an expression statement
+        internal BoundStatement BindVoidExpressionBody(SyntaxNode node, ExpressionSyntax expression, BindingContext context, DiagnosticBag diagnostics)
+            => TryBindConditionalAccessExpressionStatement(expression, context, diagnostics, out BoundStatement statement)
+                ? statement
+                : new BoundExpressionStatement(node, BindExpression(expression, context, diagnostics));
+
         private BoundStatement BindConditionalAccessStatement(
             ConditionalAccessExpressionSyntax node,
             BindingContext context,
@@ -1066,24 +1206,44 @@ namespace Cnidaria.Cs
             if (receiver.HasErrors)
                 return new BoundExpressionStatement(node, new BoundBadExpression(node));
 
+            return BindConditionalAccessStatementCore(node, receiver, context, diagnostics);
+        }
+
+        private BoundStatement BindConditionalAccessStatementCore(
+            ConditionalAccessExpressionSyntax node,
+            BoundExpression receiver,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
             if (!TryPrepareConditionalReceiver(node, receiver, allowNullableValueTypeReceiver: true, context, diagnostics,
                     out var receiverTemp, out var receiverDecl, out var accessReceiver, out var condition))
             {
                 return new BoundExpressionStatement(node, new BoundBadExpression(node));
             }
 
-            var whenNotNull = BindConditionalWhenNotNull(node.WhenNotNull, accessReceiver, BindValueKind.RValue, context, diagnostics);
-            if (whenNotNull is BoundMethodGroupExpression)
+            BoundStatement thenStatement;
+            if (node.WhenNotNull is ConditionalAccessExpressionSyntax nested)
             {
-                diagnostics.Add(new Diagnostic(
-                    "CN_CONDACCESS_MG001",
-                    DiagnosticSeverity.Error,
-                    "Conditional access to a method group must be invoked or converted to a delegate.",
-                    new Location(context.SemanticModel.SyntaxTree, node.WhenNotNull.Span)));
-                whenNotNull = new BoundBadExpression(node.WhenNotNull);
+                BoundExpression nestedReceiver = BindConditionalWhenNotNull(nested.Expression, accessReceiver, BindValueKind.RValue, context, diagnostics);
+                thenStatement = nestedReceiver.HasErrors
+                    ? new BoundExpressionStatement(nested, new BoundBadExpression(nested))
+                    : BindConditionalAccessStatementCore(nested, nestedReceiver, context, diagnostics);
             }
+            else
+            {
+                BoundExpression whenNotNull = BindConditionalWhenNotNull(node.WhenNotNull, accessReceiver, BindValueKind.RValue, context, diagnostics);
+                if (whenNotNull is BoundMethodGroupExpression)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_CONDACCESS_MG001",
+                        DiagnosticSeverity.Error,
+                        "Conditional access to a method group must be invoked or converted to a delegate.",
+                        new Location(context.SemanticModel.SyntaxTree, node.WhenNotNull.Span)));
+                    whenNotNull = new BoundBadExpression(node.WhenNotNull);
+                }
 
-            var thenStatement = new BoundExpressionStatement(node.WhenNotNull, whenNotNull);
+                thenStatement = new BoundExpressionStatement(node.WhenNotNull, whenNotNull);
+            }
             var ifStatement = new BoundIfStatement(node, condition, thenStatement, elseOpt: null);
 
             return new BoundBlockStatement(
@@ -1717,6 +1877,7 @@ namespace Cnidaria.Cs
 
             FieldSymbol? field = null;
             PropertySymbol? prop = null;
+            EventSymbol? accessorOnlyEvent = null;
             bool hasMethod = false;
             bool hasType = false;
             for (int i = 0; i < members.Length; i++)
@@ -1725,10 +1886,14 @@ namespace Cnidaria.Cs
                 {
                     case FieldSymbol f: field ??= f; break;
                     case PropertySymbol p: prop ??= p; break;
+                    case EventSymbol e: accessorOnlyEvent ??= e; break;
                     case MethodSymbol: hasMethod = true; break;
                     case NamedTypeSymbol: hasType = true; break;
                 }
             }
+
+            if (accessorOnlyEvent is not null)
+                return BindAccessorOnlyEvent(syntax, receiver, accessorOnlyEvent, valueKind, context, diagnostics);
 
             if (field is null && prop is null)
             {
@@ -1834,6 +1999,9 @@ namespace Cnidaria.Cs
             bool canReadProperty = prop!.GetMethod is not null && AccessibilityHelper.IsAccessible(prop.GetMethod, context);
             bool canWriteProperty = prop.SetMethod is not null && AccessibilityHelper.IsAccessible(prop.SetMethod, context) &&
                 (!prop.SetMethod.IsInitOnly || CanAssignInitOnlyProperty(receiver, context));
+
+            if (!prop.IsStatic && canReadProperty && prop.GetMethod is MethodSymbol refGetter && refGetter.ReturnType is ByRefTypeSymbol)
+                return new BoundCallExpression(syntax, receiver, refGetter, ImmutableArray<BoundExpression>.Empty);
 
             if (valueKind == BindValueKind.RValue && !canReadProperty)
             {

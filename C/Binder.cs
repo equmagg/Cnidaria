@@ -1271,7 +1271,7 @@ public sealed class Binder
                     syntax,
                     syntax.OperatorToken,
                     operand,
-                    operand.Type,
+                    Unqualified(operand.Type),
                     BoundValueKind.RValue);
 
             default:
@@ -1291,7 +1291,7 @@ public sealed class Binder
             syntax,
             operand,
             syntax.OperatorToken,
-            operand.Type);
+            Unqualified(operand.Type));
     }
 
     private BoundExpression BindBinaryExpression(BinaryExpressionSyntax syntax)
@@ -1480,7 +1480,7 @@ public sealed class Binder
             left,
             syntax.OperatorToken,
             right,
-            left.Type.IsError ? ErrorType : left.Type,
+            left.Type.IsError ? ErrorType : Unqualified(left.Type),
             computation);
     }
 
@@ -1518,7 +1518,7 @@ public sealed class Binder
         var targetType = BindTypeName(syntax.TypeNameTokens, scope);
         var expression = ApplyDefaultConversions(BindExpression(syntax.Expression));
 
-        return new BoundCastExpression(syntax, expression, targetType);
+        return new BoundCastExpression(syntax, expression, Unqualified(targetType));
     }
 
     private BoundExpression BindSizeofExpression(SizeofExpressionSyntax syntax)
@@ -1617,20 +1617,26 @@ public sealed class Binder
 
     private BoundExpression BindGenericSelectionExpression(GenericSelectionExpressionSyntax syntax)
     {
+        var scope = ScopeOf(syntax) ?? _compilation.GlobalScope;
         var control = ApplyDefaultConversions(BindExpression(syntax.ControlExpression));
         var associationExpressions = ImmutableArray.CreateBuilder<BoundExpression>();
-        BoundExpression? selected = null;
+        BoundExpression? matching = null;
+        BoundExpression? fallback = null;
 
         foreach (var association in syntax.Associations)
         {
             var expression = ApplyDefaultConversions(BindExpression(association.Expression));
             associationExpressions.Add(expression);
 
-            if (selected is null && association.DefaultKeyword.HasValue)
-                selected = expression;
+            if (association.DefaultKeyword.HasValue)
+                fallback = expression;
+            else if (matching is null && SameType(control.Type, BindTypeName(association.TypeNameTokens, scope)))
+                matching = expression;
         }
 
-        selected ??= associationExpressions.Count == 0 ? null : associationExpressions[0];
+        var selected = matching ?? fallback;
+        if (selected is null && !control.Type.IsError)
+            Report($"No generic association matches the controlling type '{control.Type.ToDisplayString()}'.", SpanOf(syntax));
 
         return new BoundGenericSelectionExpression(
             syntax,
@@ -1682,7 +1688,7 @@ public sealed class Binder
         }
         else
         {
-            resultType = functionType.ReturnType;
+            resultType = Unqualified(functionType.ReturnType);
             if (functionType.HasPrototype)
                 CheckCallArguments(syntax, functionType, arguments);
             else
@@ -1961,7 +1967,7 @@ public sealed class Binder
             return new BoundConversionExpression(
                 expression.Syntax as ExpressionSyntax,
                 expression,
-                expression.Type,
+                Unqualified(expression.Type),
                 BoundValueKind.RValue,
                 BoundConversionKind.LValueToRValue);
         }
@@ -2147,7 +2153,7 @@ public sealed class Binder
     private QualifiedType IntegerPromote(QualifiedType type)
     {
         if (!IsIntegerType(type))
-            return type;
+            return Unqualified(type);
 
         if (type.Type is BuiltinType builtin)
         {
@@ -2163,7 +2169,7 @@ public sealed class Binder
             }
         }
 
-        return type;
+        return Unqualified(type);
     }
 
     private int ArithmeticRank(QualifiedType type)
@@ -2653,7 +2659,7 @@ public sealed class Binder
                     return false;
 
                 if (builtin.BuiltinKind == BuiltinTypeKind.Int &&
-                    string.Equals(function?.Name, "main", StringComparison.Ordinal))
+                    function?.Name == "main")
                 {
                     return false;
                 }

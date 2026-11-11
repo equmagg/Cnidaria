@@ -1,9 +1,15 @@
+using Internal.Runtime;
+using Microsoft.Win32.SafeHandles;
+using System.Buffers;
+using System.Collections;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
+using System.IO;
 using System.Numerics;
-using Internal.Runtime;
+using System.Reflection;
 using System.Runtime;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -11,9 +17,12 @@ using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.Wasm;
 using System.Runtime.Intrinsics.X86;
-using System.Reflection;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
+using System.Runtime.ExceptionServices;
+using System.Buffers.Binary;
+using System.Diagnostics.Tracing;
 
 namespace System
 {
@@ -872,6 +881,14 @@ namespace System
 
         public static bool PackedIndexOfIsSupported => Sse2.IsSupported;
     }
+    internal static class AppContextConfigHelper
+    {
+        internal static short GetInt16Config(string configName, string envVariable, short defaultValue, bool allowNegative = true) => defaultValue;
+
+        internal static int GetInt32Config(string configName, string envVariable, int defaultValue, bool allowNegative = true) => defaultValue;
+
+        internal static bool GetBooleanConfig(string configName, string envVariable, bool defaultValue = false) => defaultValue;
+    }
     public static class Environment
     {
         internal const bool IsDebug = false;
@@ -904,7 +921,371 @@ namespace System
         /// <value>A 32-bit signed integer containing the amount of time in milliseconds that has passed since the last time the computer was started.</value>
         public static int TickCount => (int)TickCount64;
         /// <summary>Gets the number of milliseconds elapsed since the system started.</summary>
-        public static long TickCount64 => throw new NotSupportedException();
+        /// <value>A 64-bit signed integer containing the amount of time in milliseconds that has passed since the last time the computer was started.</value>
+        public static long TickCount64 => Interop.Sys.GetLowResolutionTimestamp();
+
+        public static int CurrentManagedThreadId => ManagedThreadId.Current;
+
+        private static int s_latchedExitCode;
+
+        public static int ExitCode
+        {
+            get => s_latchedExitCode;
+            set => s_latchedExitCode = value;
+        }
+
+        [DoesNotReturn]
+        public static void Exit(int exitCode)
+        {
+            s_latchedExitCode = exitCode;
+            ShutdownCore();
+            ExitRaw();
+        }
+
+        [DoesNotReturn]
+        private static void ExitRaw() => Interop.Sys.Exit(s_latchedExitCode);
+
+        private static int s_processId;
+
+        /// <summary>Gets the unique identifier for the current process.</summary>
+        public static int ProcessId
+        {
+            get
+            {
+                int processId = s_processId;
+                if (processId == 0)
+                {
+                    s_processId = processId = GetProcessId();
+                }
+                return processId;
+            }
+        }
+
+        private static bool IsPrivilegedProcessCore() => Interop.Sys.GetEUid() == 0;
+
+        [MethodImplAttribute(MethodImplOptions.NoInlining)] // Avoid inlining PInvoke frame into the hot path
+        private static int GetProcessId() => Interop.Sys.GetPid();
+
+        private static string[] GetCommandLineArgsNative()
+        {
+            // This is only used for delegate created from native host
+
+            // Consider to use /proc/self/cmdline to get command line
+            return [];
+        }
+
+        internal static bool IsSingleProcessor => ProcessorCount == 1;
+
+        internal static int GetProcessorCount() => 1;
+
+        internal static void ShutdownCore()
+        {
+#if !TARGET_BROWSER // WASMTODO
+            AppContext.OnProcessExit();
+#endif
+        }
+
+        // Note: The CLR's Watson bucketization code looks at the caller of the FCALL method
+        // to assign blame for crashes.  Don't mess with this, such as by making it call
+        // another managed helper method, unless you consult with some CLR Watson experts.
+        [DoesNotReturn]
+        public static void FailFast(string? message) =>
+            RuntimeExceptionHelpers.FailFast(message);
+
+        [DoesNotReturn]
+        public static void FailFast(string? message, Exception? exception) =>
+            RuntimeExceptionHelpers.FailFast(message, exception);
+
+        // Used by System.Diagnostics.Debug.Assert/Fail
+        internal static void FailFast(string? message, Exception? exception, string errorSource) =>
+            RuntimeExceptionHelpers.FailFast(message, exception, errorSource: errorSource, reason: RhFailFastReason.AssertionFailure);
+
+        public enum SpecialFolderOption
+        {
+            None = 0,
+            Create = SpecialFolderOptionValues.CSIDL_FLAG_CREATE,
+            DoNotVerify = SpecialFolderOptionValues.CSIDL_FLAG_DONT_VERIFY,
+        }
+
+        // These values are specific to Windows and are known to SHGetFolderPath, however they are
+        // also the values used in the SpecialFolderOption enum.  As such, we keep them as constants
+        // with their Win32 names, but keep them here rather than in Interop.Kernel32 as they're
+        // used on all platforms.
+        private static class SpecialFolderOptionValues
+        {
+            /// <summary>
+            /// Force folder creation in SHGetFolderPath. Equivalent of KF_FLAG_CREATE (0x00008000).
+            /// </summary>
+            internal const int CSIDL_FLAG_CREATE = 0x8000;
+
+            /// <summary>
+            /// Return an unverified folder path. Equivalent of KF_FLAG_DONT_VERIFY (0x00004000).
+            /// </summary>
+            internal const int CSIDL_FLAG_DONT_VERIFY = 0x4000;
+        }
+
+        public enum SpecialFolder
+        {
+            ApplicationData = SpecialFolderValues.CSIDL_APPDATA,
+            CommonApplicationData = SpecialFolderValues.CSIDL_COMMON_APPDATA,
+            LocalApplicationData = SpecialFolderValues.CSIDL_LOCAL_APPDATA,
+            Cookies = SpecialFolderValues.CSIDL_COOKIES,
+            Desktop = SpecialFolderValues.CSIDL_DESKTOP,
+            Favorites = SpecialFolderValues.CSIDL_FAVORITES,
+            History = SpecialFolderValues.CSIDL_HISTORY,
+            InternetCache = SpecialFolderValues.CSIDL_INTERNET_CACHE,
+            Programs = SpecialFolderValues.CSIDL_PROGRAMS,
+            MyComputer = SpecialFolderValues.CSIDL_DRIVES,
+            MyMusic = SpecialFolderValues.CSIDL_MYMUSIC,
+            MyPictures = SpecialFolderValues.CSIDL_MYPICTURES,
+            MyVideos = SpecialFolderValues.CSIDL_MYVIDEO,
+            Recent = SpecialFolderValues.CSIDL_RECENT,
+            SendTo = SpecialFolderValues.CSIDL_SENDTO,
+            StartMenu = SpecialFolderValues.CSIDL_STARTMENU,
+            Startup = SpecialFolderValues.CSIDL_STARTUP,
+            System = SpecialFolderValues.CSIDL_SYSTEM,
+            Templates = SpecialFolderValues.CSIDL_TEMPLATES,
+            DesktopDirectory = SpecialFolderValues.CSIDL_DESKTOPDIRECTORY,
+            Personal = SpecialFolderValues.CSIDL_PERSONAL,
+            MyDocuments = SpecialFolderValues.CSIDL_PERSONAL,
+            ProgramFiles = SpecialFolderValues.CSIDL_PROGRAM_FILES,
+            CommonProgramFiles = SpecialFolderValues.CSIDL_PROGRAM_FILES_COMMON,
+            AdminTools = SpecialFolderValues.CSIDL_ADMINTOOLS,
+            CDBurning = SpecialFolderValues.CSIDL_CDBURN_AREA,
+            CommonAdminTools = SpecialFolderValues.CSIDL_COMMON_ADMINTOOLS,
+            CommonDocuments = SpecialFolderValues.CSIDL_COMMON_DOCUMENTS,
+            CommonMusic = SpecialFolderValues.CSIDL_COMMON_MUSIC,
+            CommonOemLinks = SpecialFolderValues.CSIDL_COMMON_OEM_LINKS,
+            CommonPictures = SpecialFolderValues.CSIDL_COMMON_PICTURES,
+            CommonStartMenu = SpecialFolderValues.CSIDL_COMMON_STARTMENU,
+            CommonPrograms = SpecialFolderValues.CSIDL_COMMON_PROGRAMS,
+            CommonStartup = SpecialFolderValues.CSIDL_COMMON_STARTUP,
+            CommonDesktopDirectory = SpecialFolderValues.CSIDL_COMMON_DESKTOPDIRECTORY,
+            CommonTemplates = SpecialFolderValues.CSIDL_COMMON_TEMPLATES,
+            CommonVideos = SpecialFolderValues.CSIDL_COMMON_VIDEO,
+            Fonts = SpecialFolderValues.CSIDL_FONTS,
+            NetworkShortcuts = SpecialFolderValues.CSIDL_NETHOOD,
+            PrinterShortcuts = SpecialFolderValues.CSIDL_PRINTHOOD,
+            UserProfile = SpecialFolderValues.CSIDL_PROFILE,
+            CommonProgramFilesX86 = SpecialFolderValues.CSIDL_PROGRAM_FILES_COMMONX86,
+            ProgramFilesX86 = SpecialFolderValues.CSIDL_PROGRAM_FILESX86,
+            Resources = SpecialFolderValues.CSIDL_RESOURCES,
+            LocalizedResources = SpecialFolderValues.CSIDL_RESOURCES_LOCALIZED,
+            SystemX86 = SpecialFolderValues.CSIDL_SYSTEMX86,
+            Windows = SpecialFolderValues.CSIDL_WINDOWS,
+        }
+
+        // These values are specific to Windows and are known to SHGetFolderPath, however they are
+        // also the values used in the SpecialFolder enum.  As such, we keep them as constants
+        // with their Win32 names, but keep them here rather than in Interop.Kernel32 as they're
+        // used on all platforms.
+        private static class SpecialFolderValues
+        {
+            internal const int CSIDL_APPDATA = 0x001a;
+            internal const int CSIDL_COMMON_APPDATA = 0x0023;
+            internal const int CSIDL_LOCAL_APPDATA = 0x001c;
+            internal const int CSIDL_COOKIES = 0x0021;
+            internal const int CSIDL_FAVORITES = 0x0006;
+            internal const int CSIDL_HISTORY = 0x0022;
+            internal const int CSIDL_INTERNET_CACHE = 0x0020;
+            internal const int CSIDL_PROGRAMS = 0x0002;
+            internal const int CSIDL_RECENT = 0x0008;
+            internal const int CSIDL_SENDTO = 0x0009;
+            internal const int CSIDL_STARTMENU = 0x000b;
+            internal const int CSIDL_STARTUP = 0x0007;
+            internal const int CSIDL_SYSTEM = 0x0025;
+            internal const int CSIDL_TEMPLATES = 0x0015;
+            internal const int CSIDL_DESKTOPDIRECTORY = 0x0010;
+            internal const int CSIDL_PERSONAL = 0x0005;
+            internal const int CSIDL_PROGRAM_FILES = 0x0026;
+            internal const int CSIDL_PROGRAM_FILES_COMMON = 0x002b;
+            internal const int CSIDL_DESKTOP = 0x0000;
+            internal const int CSIDL_DRIVES = 0x0011;
+            internal const int CSIDL_MYMUSIC = 0x000d;
+            internal const int CSIDL_MYPICTURES = 0x0027;
+
+            internal const int CSIDL_ADMINTOOLS = 0x0030; // <user name>\Start Menu\Programs\Administrative Tools
+            internal const int CSIDL_CDBURN_AREA = 0x003b; // USERPROFILE\Local Settings\Application Data\Microsoft\CD Burning
+            internal const int CSIDL_COMMON_ADMINTOOLS = 0x002f; // All Users\Start Menu\Programs\Administrative Tools
+            internal const int CSIDL_COMMON_DOCUMENTS = 0x002e; // All Users\Documents
+            internal const int CSIDL_COMMON_MUSIC = 0x0035; // All Users\My Music
+            internal const int CSIDL_COMMON_OEM_LINKS = 0x003a; // Links to All Users OEM specific apps
+            internal const int CSIDL_COMMON_PICTURES = 0x0036; // All Users\My Pictures
+            internal const int CSIDL_COMMON_STARTMENU = 0x0016; // All Users\Start Menu
+            internal const int CSIDL_COMMON_PROGRAMS = 0X0017; // All Users\Start Menu\Programs
+            internal const int CSIDL_COMMON_STARTUP = 0x0018; // All Users\Startup
+            internal const int CSIDL_COMMON_DESKTOPDIRECTORY = 0x0019; // All Users\Desktop
+            internal const int CSIDL_COMMON_TEMPLATES = 0x002d; // All Users\Templates
+            internal const int CSIDL_COMMON_VIDEO = 0x0037; // All Users\My Video
+            internal const int CSIDL_FONTS = 0x0014; // windows\fonts
+            internal const int CSIDL_MYVIDEO = 0x000e; // "My Videos" folder
+            internal const int CSIDL_NETHOOD = 0x0013; // %APPDATA%\Microsoft\Windows\Network Shortcuts
+            internal const int CSIDL_PRINTHOOD = 0x001b; // %APPDATA%\Microsoft\Windows\Printer Shortcuts
+            internal const int CSIDL_PROFILE = 0x0028; // %USERPROFILE% (%SystemDrive%\Users\%USERNAME%)
+            internal const int CSIDL_PROGRAM_FILES_COMMONX86 = 0x002c; // x86 Program Files\Common on RISC
+            internal const int CSIDL_PROGRAM_FILESX86 = 0x002a; // x86 C:\Program Files on RISC
+            internal const int CSIDL_RESOURCES = 0x0038; // %windir%\Resources
+            internal const int CSIDL_RESOURCES_LOCALIZED = 0x0039; // %windir%\resources\0409 (code page)
+            internal const int CSIDL_SYSTEMX86 = 0x0029; // %windir%\system32
+            internal const int CSIDL_WINDOWS = 0x0024; // GetWindowsDirectory()
+        }
+
+    }
+
+    internal static class PreallocatedOutOfMemoryException
+    {
+        public static OutOfMemoryException Instance { get; private set; }
+
+        // Eagerly preallocate instance of out of memory exception to avoid infinite recursion once we run out of memory
+        internal static void Initialize()
+        {
+            Instance = new OutOfMemoryException(message: null);  // Cannot call the nullary constructor as that triggers non-trivial resource manager logic.
+        }
+    }
+
+    internal static class RuntimeExceptionHelpers
+    {
+        [ThreadStatic]
+        private static bool t_allocatingOutOfMemoryException;
+
+        [DoesNotReturn]
+        internal static unsafe void FailFast(string? message = null, Exception? exception = null, string? errorSource = null,
+            RhFailFastReason reason = RhFailFastReason.EnvironmentFailFast,
+            IntPtr pExAddress = 0, IntPtr pExContext = 0)
+        {
+            const int RhFailFastCode = 7;
+            InternalCalls.RhpFallbackFailFast(RhFailFastCode);
+
+            Interop.Sys.Abort();
+        }
+    }
+
+    internal static partial class HResults
+    {
+        internal const int S_OK = unchecked((int)0x00000000);
+        internal const int S_FALSE = unchecked((int)0x1);
+        internal const int COR_E_ABANDONEDMUTEX = unchecked((int)0x8013152D);
+        internal const int COR_E_AMBIGUOUSIMPLEMENTATION = unchecked((int)0x8013106A);
+        internal const int COR_E_AMBIGUOUSMATCH = unchecked((int)0x8000211D);
+        internal const int COR_E_APPDOMAINUNLOADED = unchecked((int)0x80131014);
+        internal const int COR_E_APPLICATION = unchecked((int)0x80131600);
+        internal const int COR_E_ARGUMENT = unchecked((int)0x80070057);
+        internal const int COR_E_ARGUMENTOUTOFRANGE = unchecked((int)0x80131502);
+        internal const int COR_E_ARITHMETIC = unchecked((int)0x80070216);
+        internal const int COR_E_ARRAYTYPEMISMATCH = unchecked((int)0x80131503);
+        internal const int COR_E_BADEXEFORMAT = unchecked((int)0x800700C1);
+        internal const int COR_E_BADIMAGEFORMAT = unchecked((int)0x8007000B);
+        internal const int COR_E_CANNOTUNLOADAPPDOMAIN = unchecked((int)0x80131015);
+        internal const int COR_E_CODECONTRACTFAILED = unchecked((int)0x80131542);
+        internal const int COR_E_CONTEXTMARSHAL = unchecked((int)0x80131504);
+        internal const int COR_E_CUSTOMATTRIBUTEFORMAT = unchecked((int)0x80131605);
+        internal const int COR_E_DATAMISALIGNED = unchecked((int)0x80131541);
+        internal const int COR_E_DIRECTORYNOTFOUND = unchecked((int)0x80070003);
+        internal const int COR_E_DIVIDEBYZERO = unchecked((int)0x80020012); // DISP_E_DIVBYZERO
+        internal const int COR_E_DLLNOTFOUND = unchecked((int)0x80131524);
+        internal const int COR_E_DUPLICATEWAITOBJECT = unchecked((int)0x80131529);
+        internal const int COR_E_ENDOFSTREAM = unchecked((int)0x80070026);
+        internal const int COR_E_ENTRYPOINTNOTFOUND = unchecked((int)0x80131523);
+        internal const int COR_E_EXCEPTION = unchecked((int)0x80131500);
+        internal const int COR_E_EXECUTIONENGINE = unchecked((int)0x80131506);
+        internal const int COR_E_FAILFAST = unchecked((int)0x80131623);
+        internal const int COR_E_FIELDACCESS = unchecked((int)0x80131507);
+        internal const int COR_E_FILELOAD = unchecked((int)0x80131621);
+        internal const int COR_E_FILENOTFOUND = unchecked((int)0x80070002);
+        internal const int COR_E_FORMAT = unchecked((int)0x80131537);
+        internal const int COR_E_INDEXOUTOFRANGE = unchecked((int)0x80131508);
+        internal const int COR_E_INSUFFICIENTEXECUTIONSTACK = unchecked((int)0x80131578);
+        internal const int COR_E_INSUFFICIENTMEMORY = unchecked((int)0x8013153D);
+        internal const int COR_E_INVALIDCAST = unchecked((int)0x80004002);
+        internal const int COR_E_INVALIDCOMOBJECT = unchecked((int)0x80131527);
+        internal const int COR_E_INVALIDFILTERCRITERIA = unchecked((int)0x80131601);
+        internal const int COR_E_INVALIDOLEVARIANTTYPE = unchecked((int)0x80131531);
+        internal const int COR_E_INVALIDOPERATION = unchecked((int)0x80131509);
+        internal const int COR_E_INVALIDPROGRAM = unchecked((int)0x8013153A);
+        internal const int COR_E_IO = unchecked((int)0x80131620);
+        internal const int COR_E_KEYNOTFOUND = unchecked((int)0x80131577);
+        internal const int COR_E_MARSHALDIRECTIVE = unchecked((int)0x80131535);
+        internal const int COR_E_MEMBERACCESS = unchecked((int)0x8013151A);
+        internal const int COR_E_METHODACCESS = unchecked((int)0x80131510);
+        internal const int COR_E_MISSINGFIELD = unchecked((int)0x80131511);
+        internal const int COR_E_MISSINGMANIFESTRESOURCE = unchecked((int)0x80131532);
+        internal const int COR_E_MISSINGMEMBER = unchecked((int)0x80131512);
+        internal const int COR_E_MISSINGMETHOD = unchecked((int)0x80131513);
+        internal const int COR_E_MISSINGSATELLITEASSEMBLY = unchecked((int)0x80131536);
+        internal const int COR_E_MULTICASTNOTSUPPORTED = unchecked((int)0x80131514);
+        internal const int COR_E_NOTFINITENUMBER = unchecked((int)0x80131528);
+        internal const int COR_E_NOTSUPPORTED = unchecked((int)0x80131515);
+        internal const int COR_E_OBJECTDISPOSED = unchecked((int)0x80131622);
+        internal const int COR_E_OPERATIONCANCELED = unchecked((int)0x8013153B);
+        internal const int COR_E_OUTOFMEMORY = unchecked((int)0x8007000E);
+        internal const int COR_E_OVERFLOW = unchecked((int)0x80131516);
+        internal const int COR_E_PATHTOOLONG = unchecked((int)0x800700CE);
+        internal const int COR_E_PLATFORMNOTSUPPORTED = unchecked((int)0x80131539);
+        internal const int COR_E_RANK = unchecked((int)0x80131517);
+        internal const int COR_E_REFLECTIONTYPELOAD = unchecked((int)0x80131602);
+        internal const int COR_E_RUNTIMEWRAPPED = unchecked((int)0x8013153E);
+        internal const int COR_E_SAFEARRAYRANKMISMATCH = unchecked((int)0x80131538);
+        internal const int COR_E_SAFEARRAYTYPEMISMATCH = unchecked((int)0x80131533);
+        internal const int COR_E_SECURITY = unchecked((int)0x8013150A);
+        internal const int COR_E_SERIALIZATION = unchecked((int)0x8013150C);
+        internal const int COR_E_STACKOVERFLOW = unchecked((int)0x800703E9);
+        internal const int COR_E_SYNCHRONIZATIONLOCK = unchecked((int)0x80131518);
+        internal const int COR_E_SYSTEM = unchecked((int)0x80131501);
+        internal const int COR_E_TARGET = unchecked((int)0x80131603);
+        internal const int COR_E_TARGETINVOCATION = unchecked((int)0x80131604);
+        internal const int COR_E_TARGETPARAMCOUNT = unchecked((int)0x8002000E);
+        internal const int COR_E_THREADABORTED = unchecked((int)0x80131530);
+        internal const int COR_E_THREADINTERRUPTED = unchecked((int)0x80131519);
+        internal const int COR_E_THREADSTART = unchecked((int)0x80131525);
+        internal const int COR_E_THREADSTATE = unchecked((int)0x80131520);
+        internal const int COR_E_TIMEOUT = unchecked((int)0x80131505);
+        internal const int COR_E_TYPEACCESS = unchecked((int)0x80131543);
+        internal const int COR_E_TYPEINITIALIZATION = unchecked((int)0x80131534);
+        internal const int COR_E_TYPELOAD = unchecked((int)0x80131522);
+        internal const int COR_E_TYPEUNLOADED = unchecked((int)0x80131013);
+        internal const int COR_E_UNAUTHORIZEDACCESS = unchecked((int)0x80070005);
+        internal const int COR_E_VERIFICATION = unchecked((int)0x8013150D);
+        internal const int COR_E_WAITHANDLECANNOTBEOPENED = unchecked((int)0x8013152C);
+        internal const int CO_E_NOTINITIALIZED = unchecked((int)0x800401F0);
+        internal const int DISP_E_PARAMNOTFOUND = unchecked((int)0x80020004);
+        internal const int DISP_E_TYPEMISMATCH = unchecked((int)0x80020005);
+        internal const int DISP_E_BADVARTYPE = unchecked((int)0x80020008);
+        internal const int DISP_E_OVERFLOW = unchecked((int)0x8002000A);
+        internal const int DISP_E_DIVBYZERO = unchecked((int)0x80020012);
+        internal const int E_FILENOTFOUND = unchecked((int)0x80070002);
+        internal const int E_FAIL = unchecked((int)0x80004005);
+        internal const int E_HANDLE = unchecked((int)0x80070006);
+        internal const int E_INVALIDARG = unchecked((int)0x80070057);
+        internal const int E_NOTIMPL = unchecked((int)0x80004001);
+        internal const int E_OUTOFMEMORY = unchecked((int)0x8007000E);
+        internal const int E_POINTER = unchecked((int)0x80004003);
+        internal const int ERROR_MRM_MAP_NOT_FOUND = unchecked((int)0x80073B1F);
+        internal const int ERROR_TIMEOUT = unchecked((int)0x800705B4);
+        internal const int RO_E_CLOSED = unchecked((int)0x80000013);
+        internal const int RPC_E_CHANGED_MODE = unchecked((int)0x80010106);
+        internal const int TYPE_E_TYPEMISMATCH = unchecked((int)0x80028CA0);
+        internal const int STG_E_PATHNOTFOUND = unchecked((int)0x80030003);
+        internal const int CTL_E_PATHNOTFOUND = unchecked((int)0x800A004C);
+        internal const int CTL_E_FILENOTFOUND = unchecked((int)0x800A0035);
+        internal const int FUSION_E_INVALID_NAME = unchecked((int)0x80131047);
+        internal const int FUSION_E_REF_DEF_MISMATCH = unchecked((int)0x80131040);
+        internal const int ERROR_TOO_MANY_OPEN_FILES = unchecked((int)0x80070004);
+        internal const int ERROR_SHARING_VIOLATION = unchecked((int)0x80070020);
+        internal const int ERROR_LOCK_VIOLATION = unchecked((int)0x80070021);
+        internal const int ERROR_OPEN_FAILED = unchecked((int)0x8007006E);
+        internal const int ERROR_DISK_CORRUPT = unchecked((int)0x80070571);
+        internal const int ERROR_UNRECOGNIZED_VOLUME = unchecked((int)0x800703ED);
+        internal const int ERROR_DLL_INIT_FAILED = unchecked((int)0x8007045A);
+        internal const int MSEE_E_ASSEMBLYLOADINPROGRESS = unchecked((int)0x80131016);
+        internal const int ERROR_FILE_INVALID = unchecked((int)0x800703EE);
+    }
+
+    public static class AppContext
+    {
+        internal static void OnProcessExit()
+        {
+
+        }
     }
 
     public struct Void { }
@@ -927,9 +1308,13 @@ namespace System
         public static bool operator !=(RuntimeTypeHandle left, RuntimeTypeHandle right) => left._value != right._value;
     }
 
-    public class Object
+    public unsafe class Object
     {
+        [NonSerialized]
+        internal MethodTable* m_pEEType;
+
         public Object() { }
+        ~Object() { }
         public virtual string ToString() => GetType().ToString();
         public virtual bool Equals(object? obj)
         {
@@ -1663,7 +2048,10 @@ namespace System
             return true;
         }
     }
-    // NativeAOT's template for SZ arrays: T[] takes its vtable and generic collection interfaces from Array<T> but keeps System.Array as its base
+    //
+    // Note: the declared base type and interface list also determines what Reflection returns from TypeInfo.BaseType and TypeInfo.ImplementedInterfaces for array types.
+    //
+    [Intrinsic]
     internal class Array<T> : Array, IEnumerable<T>, ICollection<T>, IList<T>, IReadOnlyList<T>
     {
         private Array() { }
@@ -1684,8 +2072,29 @@ namespace System
 
         public T this[int index]
         {
-            get => Unsafe.As<T[]>(this)[index];
-            set => Unsafe.As<T[]>(this)[index] = value;
+            get
+            {
+                try
+                {
+                    return Unsafe.As<T[]>(this)[index];
+                }
+                catch (IndexOutOfRangeException)
+                {
+                    ThrowHelper.ThrowArgumentOutOfRange_IndexMustBeLessException();
+                    return default; // unreachable
+                }
+            }
+            set
+            {
+                try
+                {
+                    Unsafe.As<T[]>(this)[index] = value;
+                }
+                catch (IndexOutOfRangeException)
+                {
+                    ThrowHelper.ThrowArgumentOutOfRange_IndexMustBeLessException();
+                }
+            }
         }
 
         public int IndexOf(T item) => Array.IndexOf(Unsafe.As<T[]>(this), item);
@@ -1694,12 +2103,8 @@ namespace System
 
         public void CopyTo(T[] array, int arrayIndex)
         {
-            ArgumentNullException.ThrowIfNull(array);
-            T[] source = Unsafe.As<T[]>(this);
-            if ((uint)arrayIndex > (uint)array.Length || array.Length - arrayIndex < source.Length)
-                ThrowHelper.ThrowArgumentException_DestinationTooShort();
-            for (int i = 0; i < source.Length; i++)
-                array[arrayIndex + i] = source[i];
+            T[] @this = Unsafe.As<T[]>(this);
+            Array.Copy(@this, 0, array, arrayIndex, @this.Length);
         }
 
         public void Add(T item) => ThrowHelper.ThrowNotSupportedException();
@@ -1844,6 +2249,37 @@ namespace System
         public System.Collections.IEnumerator GetEnumerator() => GetArrayEnumerator();
 
         internal virtual System.Collections.IEnumerator GetArrayEnumerator() => throw new NotSupportedException();
+
+        public void CopyTo(Array array, int index) => Copy(this, 0, array, index, Length);
+
+        public static int LastIndexOf<T>(T[] array, T value, int startIndex)
+        {
+            ArgumentNullException.ThrowIfNull(array);
+            EqualityComparer<T> comparer = EqualityComparer<T>.Default;
+            for (int i = startIndex; i >= 0; i--)
+            {
+                if (comparer.Equals(array[i], value))
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
+        public static void Reverse(Array array, int index, int length) => throw new NotImplementedException();
+
+        public static void Reverse<T>(T[] array, int index, int length)
+        {
+            ArgumentNullException.ThrowIfNull(array);
+            int last = index + length - 1;
+            for (int first = index; first < last; first++, last--)
+            {
+                T swap = array[first];
+                array[first] = array[last];
+                array[last] = swap;
+            }
+        }
 
         public static T[] Empty<T>()
         {
@@ -2049,6 +2485,10 @@ namespace System
         internal object? _target; // do not rename
         internal nint _methodPtr; // do not rename
         internal nint _methodModule;
+
+        public object? Target => _target;
+
+        public MethodInfo Method => throw new PlatformNotSupportedException();
 
         [MethodImpl(MethodImplOptions.InternalCall)]
         public static Delegate? Combine(Delegate? a, Delegate? b) => null;
@@ -3980,6 +4420,15 @@ namespace System
             return m_value ? TrueLiteral : FalseLiteral;
         }
     }
+    /// <summary>
+    /// Used instead of bool? for thread-safe state because <see cref="Nullable{Boolean}"/> is not guaranteed to be read or written atomically.
+    /// </summary>
+    internal enum NullableBool : sbyte
+    {
+        Undefined = 0,
+        False = -1,
+        True = 1,
+    }
     public readonly struct Char
         : IComparable, IComparable<char>, IEquatable<char>, ISpanFormattable, IBinaryInteger<char>, IMinMaxValue<char>, IUnsignedNumber<char>,
           IUtfChar<char>
@@ -4271,6 +4720,7 @@ namespace System
         static char IUtfChar<char>.CastFrom(int value) => (char)value;
         static char IUtfChar<char>.CastFrom(uint value) => (char)value;
         static char IUtfChar<char>.CastFrom(ulong value) => (char)value;
+        static uint IUtfChar<char>.CastToUInt32(char value) => value;
 
         static bool INumberBase<char>.TryConvertFromChecked<TOther>(TOther value, out char result)
         {
@@ -4969,6 +5419,7 @@ namespace System
         static byte IUtfChar<byte>.CastFrom(int value) => (byte)value;
         static byte IUtfChar<byte>.CastFrom(uint value) => (byte)value;
         static byte IUtfChar<byte>.CastFrom(ulong value) => (byte)value;
+        static uint IUtfChar<byte>.CastToUInt32(byte value) => value;
     }
     public readonly struct Int16
         : IComparable, ISpanFormattable, IComparable<short>, IEquatable<short>, IBinaryInteger<short>, IMinMaxValue<short>, ISignedNumber<short>
@@ -8017,6 +8468,8 @@ namespace System
         {
             return System.Number.FormatDouble((double)m_value, null, null);
         }
+
+        public string ToString(IFormatProvider? provider) => ToString();
     }
 
     public readonly struct Half
@@ -8096,6 +8549,306 @@ namespace System
         }
 
         private Half(bool sign, ushort exp, ushort sig) => _value = (ushort)(((sign ? 1 : 0) << SignShift) + (exp << BiasedExponentShift) + sig);
+
+        internal byte BiasedExponent
+        {
+            get
+            {
+                ushort bits = _value;
+                return ExtractBiasedExponentFromBits(bits);
+            }
+        }
+
+        internal sbyte Exponent
+        {
+            get
+            {
+                return (sbyte)(BiasedExponent - ExponentBias);
+            }
+        }
+
+        internal ushort Significand
+        {
+            get
+            {
+                return (ushort)(TrailingSignificand | ((BiasedExponent != 0) ? (1U << BiasedExponentShift) : 0U));
+            }
+        }
+
+        internal ushort TrailingSignificand
+        {
+            get
+            {
+                ushort bits = _value;
+                return ExtractTrailingSignificandFromBits(bits);
+            }
+        }
+
+        internal static byte ExtractBiasedExponentFromBits(ushort bits)
+        {
+            return (byte)((bits >> BiasedExponentShift) & ShiftedBiasedExponentMask);
+        }
+
+        internal static ushort ExtractTrailingSignificandFromBits(ushort bits)
+        {
+            return (ushort)(bits & TrailingSignificandMask);
+        }
+
+        /// <inheritdoc cref="IComparisonOperators{TSelf, TOther, TResult}.op_LessThan(TSelf, TOther)" />
+        [Intrinsic]
+        public static bool operator <(Half left, Half right)
+        {
+            if (Avx2.IsSupported || ArmBase.Arm64.IsSupported)
+            {
+                // (float)Half lowers to a hardware conversion here, so comparing as float is cheaper.
+                return (float)left < (float)right;
+            }
+
+            if (IsNaN(left) || IsNaN(right))
+            {
+                // IEEE defines that NaN is unordered with respect to everything, including itself.
+                return false;
+            }
+
+            bool leftIsNegative = IsNegative(left);
+
+            if (leftIsNegative != IsNegative(right))
+            {
+                // When the signs of left and right differ, we know that left is less than right if it is
+                // the negative value. The exception to this is if both values are zero, in which case IEEE
+                // says they should be equal, even if the signs differ.
+                return leftIsNegative && !AreZero(left, right);
+            }
+
+            return (left._value != right._value) && ((left._value < right._value) ^ leftIsNegative);
+        }
+
+        /// <inheritdoc cref="IComparisonOperators{TSelf, TOther, TResult}.op_GreaterThan(TSelf, TOther)" />
+        [Intrinsic]
+        public static bool operator >(Half left, Half right)
+        {
+            return right < left;
+        }
+
+        /// <inheritdoc cref="IComparisonOperators{TSelf, TOther, TResult}.op_LessThanOrEqual(TSelf, TOther)" />
+        [Intrinsic]
+        public static bool operator <=(Half left, Half right)
+        {
+            if (Avx2.IsSupported || ArmBase.Arm64.IsSupported)
+            {
+                // (float)Half lowers to a hardware conversion here, so comparing as float is cheaper.
+                return (float)left <= (float)right;
+            }
+
+            if (IsNaN(left) || IsNaN(right))
+            {
+                // IEEE defines that NaN is unordered with respect to everything, including itself.
+                return false;
+            }
+
+            bool leftIsNegative = IsNegative(left);
+
+            if (leftIsNegative != IsNegative(right))
+            {
+                // When the signs of left and right differ, we know that left is less than right if it is
+                // the negative value. The exception to this is if both values are zero, in which case IEEE
+                // says they should be equal, even if the signs differ.
+                return leftIsNegative || AreZero(left, right);
+            }
+
+            return (left._value == right._value) || ((left._value < right._value) ^ leftIsNegative);
+        }
+
+        /// <inheritdoc cref="IComparisonOperators{TSelf, TOther, TResult}.op_GreaterThanOrEqual(TSelf, TOther)" />
+        [Intrinsic]
+        public static bool operator >=(Half left, Half right)
+        {
+            return right <= left;
+        }
+
+        /// <inheritdoc cref="IEqualityOperators{TSelf, TOther, TResult}.op_Equality(TSelf, TOther)" />
+        [Intrinsic]
+        public static bool operator ==(Half left, Half right)
+        {
+            if (IsNaN(left) || IsNaN(right))
+            {
+                // IEEE defines that NaN is not equal to anything, including itself.
+                return false;
+            }
+
+            // IEEE defines that positive and negative zero are equivalent.
+            return (left._value == right._value) || AreZero(left, right);
+        }
+
+        /// <inheritdoc cref="IEqualityOperators{TSelf, TOther, TResult}.op_Inequality(TSelf, TOther)" />
+        [Intrinsic]
+        public static bool operator !=(Half left, Half right)
+        {
+            return !(left == right);
+        }
+
+        /// <summary>Determines whether the specified value is finite (zero, subnormal, or normal).</summary>
+        /// <remarks>This effectively checks the value is not NaN and not infinite.</remarks>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool AreZero(Half left, Half right)
+        {
+            // IEEE defines that positive and negative zero are equal, this gives us a quick equality check
+            // for two values by or'ing the private bits together and stripping the sign. They are both zero,
+            // and therefore equivalent, if the resulting value is still zero.
+            return ((left._value | right._value) & ~SignMask) == 0;
+        }
+
+        /// <summary>Explicitly converts a half-precision floating-point value to its nearest representable <see cref="float" /> value.</summary>
+        /// <param name="value">The value to convert.</param>
+        /// <returns><paramref name="value" /> converted to its nearest representable <see cref="float" /> value.</returns>
+        [Intrinsic]
+        public static explicit operator float(Half value)
+        {
+            #region Explanation of this algorithm
+            // This algorithm converts a half-precision floating-point number to a single-precision floating-point number by rearranging the bit sequence and multiplying it as a floating-point number.
+            // However, it introduces some tricks to avoid multiplying denormalized numbers and to deal with exceptions such as infinity and NaN without using branch instructions.
+            //
+            // The bit sequence of a half-precision floating-point number is as follows
+            // seee_eeff_ffff_ffff
+            // The bit sequence of a single-precision floating-point number is as follows
+            // seee_eeee_efff_ffff_ffff_ffff_ffff_ffff
+            // In both cases, "_" is the hexadecimal separator, "s" is the sign, "e" is the exponent part, and "f" is the mantissa part.
+            // In half-precision, the exponent part is 5 bits and the mantissa part is 10 bits. In single precision, the exponent is 8 bits and the mantissa is 23 bits.
+            // Both formats use an offset binary representation for the exponent part: the exponent part for 1.0 is half of the maximum value for either precision, i.e., 127 for single-precision and 15 for half-precision.
+            // The mantissa part is normalized when the exponent part is nonzero, since in binary numbers, 1 appears as the most significant digit for any nonzero number.
+            //
+            // This conversion algorithm takes advantage of the similarity between the two formats.
+            // By isolating the sign part from the half-precision bitstring and shifting it 13 bits to the left, the boundary between the exponent and mantissa parts matches with that of single-precision.
+            // In other words,
+            //    0eeeeeffffffffff              is rearranged to
+            // 0000eeeeeffffffffff0000000000000
+            // which matches the boundary between the exponent and mantissa parts of single-precision floating-point number:
+            // seeeeeeeefffffffffffffffffffffff
+            //
+            // After rearrangement, this bit sequence is multiplied by the constant 5.192297E+33f in the floating-point number multiplication unit.
+            // However, most hardware cannot efficiently handle the multiplication of denormalized numbers.
+            // Denormalized numbers are more common in half-precision than in single-precision, so they cannot be ignored.
+            //
+            // First, if the value is a denormalized number, the constant 0x3880_0000u is added beforehand in the integer addition unit to make it behave as a normalized number.
+            // For Infinity or NaN, the constant 0x7000_0000u is added beforehand in the integer adder.
+            // These numbers are then converted to single-precision floating-point numbers as per the IEEE754 specification by the following operations.
+            // Next, regardless of whether the value is a denormalized number or not, add the constant 0x3800_0000u to this bit string in the integer addition unit. The constant is chosen to add 112 to the exponent part; 112 is 127 subtracted by 15.
+            // Then, if the value is a denormalized number, the constant 6.1035156E-05f is subtracted in the floating-point number subtraction unit.
+            // The above operation produces the same result as if the rearranged bit sequence were multiplied by the constant 5.192297E+33f.
+            // Finally, merging the isolated sign bits completes the conversion.
+            #endregion
+            // The smallest positive normal number in Half, converted to Single
+            const uint ExponentLowerBound = 0x3880_0000u;
+            // BitConverter.SingleToUInt32Bits(1.0f) - ((uint)BitConverter.HalfToUInt16Bits((Half)1.0f) << 13)
+            const uint ExponentOffset = 0x3800_0000u;
+            // Mask for sign bit in Single
+            const uint SingleSignMask = float.SignMask;
+            // Mask for exponent bits in Half
+            const uint HalfExponentMask = BiasedExponentMask;
+            // Mask for bits in Single converted from Half
+            const int HalfToSingleBitsMask = 0x0FFF_E000;
+            // Extract the internal representation of value
+            short valueInInt16Bits = BitConverter.HalfToInt16Bits(value);
+            // Extract sign bit of value
+            uint sign = (uint)(int)valueInInt16Bits & SingleSignMask;
+            // Copy sign bit to upper bits
+            uint bitValueInProcess = (uint)valueInInt16Bits;
+            // Extract exponent bits of value (BiasedExponent is not for here as it performs unnecessary shift)
+            uint offsetExponent = bitValueInProcess & HalfExponentMask;
+            // ~0u when value is subnormal, 0 otherwise
+            uint subnormalMask = offsetExponent == 0u ? ~0u : 0u;
+            // 0x3880_0000u if value is subnormal, 0 otherwise
+            uint maskedExponentLowerBound = subnormalMask & ExponentLowerBound;
+            // 0x3880_0000u if value is subnormal, 0x3800_0000u otherwise
+            uint offsetMaskedExponentLowerBound = ExponentOffset | maskedExponentLowerBound;
+            // Match the position of the boundary of exponent bits and fraction bits with IEEE 754 Binary32(Single)
+            bitValueInProcess <<= 13;
+            // Double the offsetMaskedExponentLowerBound if value is either Infinity or NaN
+            offsetMaskedExponentLowerBound <<= offsetExponent == HalfExponentMask ? 1 : 0;
+            // Extract exponent bits and fraction bits of value
+            bitValueInProcess &= HalfToSingleBitsMask;
+            // Adjust exponent to match the range of exponent
+            bitValueInProcess += offsetMaskedExponentLowerBound;
+            // If value is subnormal, remove unnecessary 1 on top of fraction bits.
+            uint absoluteValue = BitConverter.SingleToUInt32Bits(BitConverter.UInt32BitsToSingle(bitValueInProcess) - BitConverter.UInt32BitsToSingle(maskedExponentLowerBound));
+            // Merge sign bit with rest
+            return BitConverter.UInt32BitsToSingle(absoluteValue | sign);
+        }
+
+        public static bool IsFinite(Half value)
+        {
+            uint bits = value._value;
+            return (~bits & PositiveInfinityBits) != 0;
+        }
+
+        /// <summary>Determines whether the specified value is infinite.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsInfinity(Half value)
+        {
+            uint bits = value._value;
+            return (bits & ~SignMask) == PositiveInfinityBits;
+        }
+
+        /// <summary>Determines whether the specified value is NaN.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsNaN(Half value)
+        {
+            uint bits = value._value;
+            return (bits & ~SignMask) > PositiveInfinityBits;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool IsNaNOrZero(Half value)
+        {
+            uint bits = value._value;
+            return ((bits - 1) & ~SignMask) >= PositiveInfinityBits;
+        }
+
+        /// <summary>Determines whether the specified value is negative.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsNegative(Half value)
+        {
+            return (short)(value._value) < 0;
+        }
+
+        /// <summary>Determines whether the specified value is negative infinity.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsNegativeInfinity(Half value)
+        {
+            return value._value == NegativeInfinityBits;
+        }
+
+        /// <summary>Determines whether the specified value is normal (finite, but not zero or subnormal).</summary>
+        /// <remarks>This effectively checks the value is not NaN, not infinite, not subnormal, and not zero.</remarks>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsNormal(Half value)
+        {
+            uint bits = value._value;
+            return (ushort)((bits & ~SignMask) - SmallestNormalBits) < (PositiveInfinityBits - SmallestNormalBits);
+        }
+
+        /// <summary>Determines whether the specified value is positive infinity.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsPositiveInfinity(Half value)
+        {
+            return value._value == PositiveInfinityBits;
+        }
+
+        /// <summary>Determines whether the specified value is subnormal (finite, but not zero or normal).</summary>
+        /// <remarks>This effectively checks the value is not NaN, not infinite, not normal, and not zero.</remarks>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsSubnormal(Half value)
+        {
+            uint bits = value._value;
+            return (ushort)((bits & ~SignMask) - 1) < MaxTrailingSignificand;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool IsZero(Half value)
+        {
+            uint bits = value._value;
+            return (bits & ~SignMask) == 0;
+        }
     }
     public readonly struct Int128
     {
@@ -8385,6 +9138,23 @@ namespace System
     }
     internal static unsafe class Number
     {
+        internal static ReadOnlySpan<TChar> SpanTrim<TChar>(ReadOnlySpan<TChar> span) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            int start = 0;
+            while (start < span.Length && char.IsWhiteSpace((char)TChar.CastToUInt32(span[start])))
+            {
+                start++;
+            }
+
+            int end = span.Length;
+            while (end > start && char.IsWhiteSpace((char)TChar.CastToUInt32(span[end - 1])))
+            {
+                end--;
+            }
+
+            return span.Slice(start, end - start);
+        }
+
         // We need 1 additional byte, per length, for the terminating null
         internal const int DecimalNumberBufferLength = 29 + 1 + 1;  // 29 for the longest input + 1 for rounding
         internal const int DoubleNumberBufferLength = 767 + 1 + 1;  // 767 for the longest input + 1 for rounding: 4.9406564584124654E-324
@@ -10179,7 +10949,87 @@ namespace System
             }
         }
     }
+    internal static class HexConverter
+    {
+        public enum Casing : uint
+        {
+            // Output [ '0' .. '9' ] and [ 'A' .. 'F' ].
+            Upper = 0,
 
+            // Output [ '0' .. '9' ] and [ 'a' .. 'f' ].
+            // This works because values in the range [ 0x30 .. 0x39 ] ([ '0' .. '9' ])
+            // already have the 0x20 bit set, so ORing them with 0x20 is a no-op,
+            // while outputs in the range [ 0x41 .. 0x46 ] ([ 'A' .. 'F' ])
+            // don't have the 0x20 bit set, so ORing them maps to
+            // [ 0x61 .. 0x66 ] ([ 'a' .. 'f' ]), which is what we want.
+            Lower = 0x2020U,
+        }
+
+        internal static (Vector128<byte>, Vector128<byte>) AsciiToHexVector128(Vector128<byte> src, Vector128<byte> hexMap)
+        {
+            // The algorithm is simple: a single srcVec (contains the whole 16b Guid) is converted
+            // into nibbles and then, via hexMap, converted into a HEX representation via
+            // Shuffle(nibbles, srcVec). ASCII is then expanded to UTF-16 if needed.
+            Vector128<byte> shiftedSrc = Vector128.ShiftRightLogical(src.AsUInt64(), 4).AsByte();
+            Vector128<byte> lowNibbles = Vector128.UnpackLow(shiftedSrc, src);
+            Vector128<byte> highNibbles = Vector128.UnpackHigh(shiftedSrc, src);
+
+            return (Vector128.ShuffleNative(hexMap, lowNibbles & Vector128.Create((byte)0xF)),
+                    Vector128.ShuffleNative(hexMap, highNibbles & Vector128.Create((byte)0xF)));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static char ToCharUpper(int value)
+        {
+            value &= 0xF;
+            value += '0';
+
+            if (value > '9')
+            {
+                value += ('A' - ('9' + 1));
+            }
+
+            return (char)value;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static char ToCharLower(int value)
+        {
+            value &= 0xF;
+            value += '0';
+
+            if (value > '9')
+            {
+                value += ('a' - ('9' + 1));
+            }
+
+            return (char)value;
+        }
+
+        /// <summary>Converts a hex digit to its value, or 0xFF for anything else.</summary>
+        public static int FromChar(int c) => c >= CharToHexLookup.Length ? 0xFF : CharToHexLookup[c];
+
+        /// <summary>Map from an ASCII char to its hex value, e.g. arr['b'] == 11. 0xFF means it's not a hex digit.</summary>
+        public static ReadOnlySpan<byte> CharToHexLookup =>
+        [
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 15
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 31
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 47
+            0x0,  0x1,  0x2,  0x3,  0x4,  0x5,  0x6,  0x7,  0x8,  0x9,  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 63
+            0xFF, 0xA,  0xB,  0xC,  0xD,  0xE,  0xF,  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 79
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 95
+            0xFF, 0xa,  0xb,  0xc,  0xd,  0xe,  0xf,  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 111
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 127
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 143
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 159
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 175
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 191
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 207
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 223
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // 239
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF  // 255
+        ];
+    }
     // Because we have special type system support that says a boxed Nullable<T>
     // can be used where a boxed T is used, Nullable<T> can not implement any interfaces
     // at all (since T may not).
@@ -10639,6 +11489,54 @@ namespace System
         {
             return "(" + Item1?.ToString() + ", " + Item2?.ToString() + ", " + Item3?.ToString() +
                 ", " + Item4?.ToString() + ", " + Item5?.ToString() + ", " + Item6?.ToString() + ", " + Item7?.ToString() + ", " + Rest.ToString() + ")";
+        }
+    }
+
+    /// <summary>Simple alternative to <see cref="Tuple{T1, T2}"/> for use in corelib.</summary>
+    /// <remarks>Exists to avoid the unnecessary size increase that may come from Tuple's additional surface area.</remarks>
+    internal sealed class TupleSlim<T1, T2>
+    {
+        public readonly T1 Item1;
+        public readonly T2 Item2;
+
+        public TupleSlim(T1 item1, T2 item2)
+        {
+            Item1 = item1;
+            Item2 = item2;
+        }
+    }
+
+    /// <summary>Simple alternative to <see cref="Tuple{T1, T2, T3}"/> for use in corelib.</summary>
+    /// <remarks>Exists to avoid the unnecessary size increase that may come from Tuple's additional surface area.</remarks>
+    internal sealed class TupleSlim<T1, T2, T3>
+    {
+        public readonly T1 Item1;
+        public readonly T2 Item2;
+        public readonly T3 Item3;
+
+        public TupleSlim(T1 item1, T2 item2, T3 item3)
+        {
+            Item1 = item1;
+            Item2 = item2;
+            Item3 = item3;
+        }
+    }
+
+    /// <summary>Simple alternative to <see cref="Tuple{T1, T2, T3, T4}"/> for use in corelib.</summary>
+    /// <remarks>Exists to avoid the unnecessary size increase that may come from Tuple's additional surface area.</remarks>
+    internal sealed class TupleSlim<T1, T2, T3, T4>
+    {
+        public readonly T1 Item1;
+        public readonly T2 Item2;
+        public readonly T3 Item3;
+        public readonly T4 Item4;
+
+        public TupleSlim(T1 item1, T2 item2, T3 item3, T4 item4)
+        {
+            Item1 = item1;
+            Item2 = item2;
+            Item3 = item3;
+            Item4 = item4;
         }
     }
 
@@ -11321,6 +12219,1867 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         public static nuint MinValue => 0;
     }
 
+    // Represents a Globally Unique Identifier.
+    [StructLayout(LayoutKind.Sequential)]
+    [Serializable]
+    [NonVersionable] // This only applies to field layout
+    public readonly struct Guid
+        : ISpanFormattable,
+          IComparable,
+          IComparable<Guid>,
+          IEquatable<Guid>,
+          ISpanParsable<Guid>,
+          IUtf8SpanFormattable,
+          IUtf8SpanParsable<Guid>
+    {
+        // This will create a new random guid based on the https://www.ietf.org/rfc/rfc4122.txt
+        public static unsafe Guid NewGuid()
+        {
+            Guid g;
+#if !TARGET_WASI
+            // Guid.NewGuid is often used as a cheap source of random data that are sometimes used for security purposes.
+            // Windows implementation uses secure RNG to implement it. We use secure RNG for Unix too to avoid subtle security
+            // vulnerabilities in applications that depend on it. See https://github.com/dotnet/runtime/issues/42752 for details.
+            Interop.GetCryptographicallySecureRandomBytes((byte*)&g, sizeof(Guid));
+#else
+            // TODOWASI: crypto secure random bytes
+            Interop.GetRandomBytes((byte*)&g, sizeof(Guid));
+#endif
+
+            // Modify bits indicating the type of the GUID
+
+            unchecked
+            {
+                // time_hi_and_version
+                Unsafe.AsRef(in g._c) = (short)((g._c & ~VersionMask) | Version4Value);
+                // clock_seq_hi_and_reserved
+                Unsafe.AsRef(in g._d) = (byte)((g._d & ~Variant10xxMask) | Variant10xxValue);
+            }
+
+            return g;
+        }
+
+        private const byte Variant10xxMask = 0xC0;
+        private const byte Variant10xxValue = 0x80;
+
+        private const ushort VersionMask = 0xF000;
+        private const ushort Version4Value = 0x4000;
+        private const ushort Version7Value = 0x7000;
+
+        public static readonly Guid Empty;
+
+        /// <summary>Gets a <see cref="Guid" /> where all bits are set.</summary>
+        /// <remarks>This returns the value: FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF</remarks>
+        public static Guid AllBitsSet => new Guid(uint.MaxValue, ushort.MaxValue, ushort.MaxValue, byte.MaxValue, byte.MaxValue, byte.MaxValue, byte.MaxValue, byte.MaxValue, byte.MaxValue, byte.MaxValue, byte.MaxValue);
+
+        private readonly int _a;   // Do not rename (binary serialization)
+        private readonly short _b; // Do not rename (binary serialization)
+        private readonly short _c; // Do not rename (binary serialization)
+        private readonly byte _d;  // Do not rename (binary serialization)
+        private readonly byte _e;  // Do not rename (binary serialization)
+        private readonly byte _f;  // Do not rename (binary serialization)
+        private readonly byte _g;  // Do not rename (binary serialization)
+        private readonly byte _h;  // Do not rename (binary serialization)
+        private readonly byte _i;  // Do not rename (binary serialization)
+        private readonly byte _j;  // Do not rename (binary serialization)
+        private readonly byte _k;  // Do not rename (binary serialization)
+
+        // Creates a new guid from an array of bytes.
+        public Guid(byte[] b) :
+            this(new ReadOnlySpan<byte>(b ?? throw new ArgumentNullException(nameof(b))))
+        {
+        }
+
+        // Creates a new guid from a read-only span.
+        public Guid(ReadOnlySpan<byte> b)
+        {
+            if (b.Length != 16)
+            {
+                ThrowGuidArrayCtorArgumentException();
+            }
+
+            this = MemoryMarshal.Read<Guid>(b);
+
+            if (!BitConverter.IsLittleEndian)
+            {
+                _a = BinaryPrimitives.ReverseEndianness(_a);
+                _b = BinaryPrimitives.ReverseEndianness(_b);
+                _c = BinaryPrimitives.ReverseEndianness(_c);
+            }
+        }
+
+        public Guid(ReadOnlySpan<byte> b, bool bigEndian)
+        {
+            if (b.Length != 16)
+            {
+                ThrowGuidArrayCtorArgumentException();
+            }
+
+            this = MemoryMarshal.Read<Guid>(b);
+
+            if (BitConverter.IsLittleEndian == bigEndian)
+            {
+                _a = BinaryPrimitives.ReverseEndianness(_a);
+                _b = BinaryPrimitives.ReverseEndianness(_b);
+                _c = BinaryPrimitives.ReverseEndianness(_c);
+            }
+        }
+
+        [DoesNotReturn]
+        [StackTraceHidden]
+        private static void ThrowGuidArrayCtorArgumentException()
+        {
+            throw new ArgumentException(SR.Format(SR.Arg_GuidArrayCtor, "16"), "b");
+        }
+
+        [CLSCompliant(false)]
+        public Guid(uint a, ushort b, ushort c, byte d, byte e, byte f, byte g, byte h, byte i, byte j, byte k)
+        {
+            _a = (int)a;
+            _b = (short)b;
+            _c = (short)c;
+            _d = d;
+            _e = e;
+            _f = f;
+            _g = g;
+            _h = h;
+            _i = i;
+            _j = j;
+            _k = k;
+        }
+
+        // Creates a new GUID initialized to the value represented by the arguments.
+        public Guid(int a, short b, short c, byte[] d)
+        {
+            ArgumentNullException.ThrowIfNull(d);
+
+            if (d.Length != 8)
+            {
+                throw new ArgumentException(SR.Format(SR.Arg_GuidArrayCtor, "8"), nameof(d));
+            }
+
+            _a = a;
+            _b = b;
+            _c = c;
+            _d = d[0];
+            _e = d[1];
+            _f = d[2];
+            _g = d[3];
+            _h = d[4];
+            _i = d[5];
+            _j = d[6];
+            _k = d[7];
+        }
+
+        // Creates a new GUID initialized to the value represented by the
+        // arguments.  The bytes are specified like this to avoid endianness issues.
+        public Guid(int a, short b, short c, byte d, byte e, byte f, byte g, byte h, byte i, byte j, byte k)
+        {
+            _a = a;
+            _b = b;
+            _c = c;
+            _d = d;
+            _e = e;
+            _f = f;
+            _g = g;
+            _h = h;
+            _i = i;
+            _j = j;
+            _k = k;
+        }
+
+        private enum GuidParseThrowStyle : byte
+        {
+            None = 0,
+            All = 1,
+            AllButOverflow = 2
+        }
+
+        private enum ParseFailure
+        {
+            Format_ExtraJunkAtEnd,
+            Format_GuidBraceAfterLastNumber,
+            Format_GuidBrace,
+            Format_GuidComma,
+            Format_GuidDashes,
+            Format_GuidEndBrace,
+            Format_GuidHexPrefix,
+            Format_GuidInvalidChar,
+            Format_GuidInvLen,
+            Format_GuidUnrecognized,
+            Overflow_Byte,
+            Overflow_UInt32,
+        }
+
+        // This will store the result of the parsing. And it will eventually be used to construct a Guid instance.
+        // We'll eventually reinterpret_cast<> a GuidResult as a Guid, so we need to give it a sequential
+        // layout and ensure that its early fields match the layout of Guid exactly.
+        [StructLayout(LayoutKind.Explicit)]
+        private struct GuidResult
+        {
+            [FieldOffset(0)]
+            internal uint _a;
+            [FieldOffset(4)]
+            internal uint _bc;
+            [FieldOffset(4)]
+            internal ushort _b;
+            [FieldOffset(6)]
+            internal ushort _c;
+            [FieldOffset(8)]
+            internal uint _defg;
+            [FieldOffset(8)]
+            internal ushort _de;
+            [FieldOffset(8)]
+            internal byte _d;
+            [FieldOffset(10)]
+            internal ushort _fg;
+            [FieldOffset(12)]
+            internal uint _hijk;
+
+            [FieldOffset(16)]
+            private readonly GuidParseThrowStyle _throwStyle;
+
+            internal GuidResult(GuidParseThrowStyle canThrow) : this()
+            {
+                _throwStyle = canThrow;
+            }
+
+            internal readonly void SetFailure(ParseFailure failureKind)
+            {
+                if (_throwStyle == GuidParseThrowStyle.None)
+                {
+                    return;
+                }
+
+                if (failureKind == ParseFailure.Overflow_UInt32 && _throwStyle == GuidParseThrowStyle.All)
+                {
+                    throw new OverflowException(SR.Overflow_UInt32);
+                }
+
+                throw new FormatException(failureKind switch
+                {
+                    ParseFailure.Format_ExtraJunkAtEnd => SR.Format_ExtraJunkAtEnd,
+                    ParseFailure.Format_GuidBraceAfterLastNumber => SR.Format_GuidBraceAfterLastNumber,
+                    ParseFailure.Format_GuidBrace => SR.Format_GuidBrace,
+                    ParseFailure.Format_GuidComma => SR.Format_GuidComma,
+                    ParseFailure.Format_GuidDashes => SR.Format_GuidDashes,
+                    ParseFailure.Format_GuidEndBrace => SR.Format_GuidEndBrace,
+                    ParseFailure.Format_GuidHexPrefix => SR.Format_GuidHexPrefix,
+                    ParseFailure.Format_GuidInvalidChar => SR.Format_GuidInvalidChar,
+                    ParseFailure.Format_GuidInvLen => SR.Format_GuidInvLen,
+                    _ => SR.Format_GuidUnrecognized
+                });
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public readonly Guid ToGuid()
+            {
+                return Unsafe.As<GuidResult, Guid>(ref Unsafe.AsRef(in this));
+            }
+
+            public void ReverseAbcEndianness()
+            {
+                _a = BinaryPrimitives.ReverseEndianness(_a);
+                _b = BinaryPrimitives.ReverseEndianness(_b);
+                _c = BinaryPrimitives.ReverseEndianness(_c);
+            }
+        }
+
+        // Creates a new guid based on the value in the string.  The value is made up
+        // of hex digits speared by the dash ("-"). The string may begin and end with
+        // brackets ("{", "}").
+        //
+        // The string must be of the form dddddddd-dddd-dddd-dddd-dddddddddddd. where
+        // d is a hex digit. (That is 8 hex digits, followed by 4, then 4, then 4,
+        // then 12) such as: "CA761232-ED42-11CE-BACD-00AA0057B223"
+        public Guid(string g)
+        {
+            ArgumentNullException.ThrowIfNull(g);
+
+            var result = new GuidResult(GuidParseThrowStyle.All);
+            bool success = TryParseGuid(g.AsSpan(), ref result);
+            Debug.Assert(success, "GuidParseThrowStyle.All means throw on all failures");
+
+            this = result.ToGuid();
+        }
+
+        /// <summary>Gets the value of the variant field for the <see cref="Guid" />.</summary>
+        /// <remarks>
+        ///     <para>This returns all 4 bits as is, some users may only care about fewer bits of the variant field and should refer to RFC 9562 for how to interpret the result.</para>
+        ///     <para>For example, UUIDv7 may only want to consider the 2 most significant bits of the field as the least 2 significant bits are documented as "don't-care".</para>
+        /// </remarks>
+        public int Variant => _d >> 4;
+
+        /// <summary>Gets the value of the version field for the <see cref="Guid" />.</summary>
+        /// <remarks>
+        ///     <para>This corresponds to the most significant 4 bits of the 6th byte: 00000000-0000-F000-0000-000000000000.</para>
+        ///     <para>See RFC 9562 for more information on how to interpret this value.</para>
+        /// </remarks>
+        public int Version => (ushort)_c >>> 12;
+
+        /// <summary>Creates a new <see cref="Guid" /> according to RFC 9562, following the Version 7 format.</summary>
+        /// <returns>A new <see cref="Guid" /> according to RFC 9562, following the Version 7 format.</returns>
+        /// <remarks>
+        ///     <para>This uses <see cref="DateTimeOffset.UtcNow" /> to determine the Unix Epoch timestamp source.</para>
+        ///     <para>This seeds the rand_a and rand_b sub-fields with random data.</para>
+        /// </remarks>
+        /// <summary>Creates a new <see cref="Guid" /> according to RFC 9562, following the Version 7 format.</summary>
+        /// <param name="timestamp">The date time offset used to determine the Unix Epoch timestamp.</param>
+        /// <returns>A new <see cref="Guid" /> according to RFC 9562, following the Version 7 format.</returns>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="timestamp" /> represents an offset prior to <see cref="DateTimeOffset.UnixEpoch" />.</exception>
+        /// <remarks>
+        ///     <para>This seeds the rand_a and rand_b sub-fields with random data.</para>
+        /// </remarks>
+        public static Guid Parse(string input)
+        {
+            ArgumentNullException.ThrowIfNull(input);
+            return Parse((ReadOnlySpan<char>)input);
+        }
+
+        public static Guid Parse(ReadOnlySpan<char> input)
+        {
+            var result = new GuidResult(GuidParseThrowStyle.AllButOverflow);
+            bool success = TryParseGuid(input, ref result);
+            Debug.Assert(success, "GuidParseThrowStyle.AllButOverflow means throw on all failures");
+
+            return result.ToGuid();
+        }
+
+        /// <summary>
+        /// Parses the specified sequence of UTF-8 encoded bytes and returns a new <see cref="Guid"/>.
+        /// </summary>
+        /// <param name="utf8Text">A span containing the UTF-8 encoded representation of the GUID to parse.</param>
+        /// <returns>The parsed <see cref="Guid"/>.</returns>
+        public static Guid Parse(ReadOnlySpan<byte> utf8Text)
+        {
+            var result = new GuidResult(GuidParseThrowStyle.AllButOverflow);
+            bool success = TryParseGuid(utf8Text, ref result);
+            Debug.Assert(success, "GuidParseThrowStyle.AllButOverflow means throw on all failures");
+
+            return result.ToGuid();
+        }
+
+        public static bool TryParse([NotNullWhen(true)] string? input, out Guid result)
+        {
+            if (input == null)
+            {
+                result = default;
+                return false;
+            }
+
+            return TryParse((ReadOnlySpan<char>)input, out result);
+        }
+
+        public static bool TryParse(ReadOnlySpan<char> input, out Guid result)
+        {
+            var parseResult = new GuidResult(GuidParseThrowStyle.None);
+            if (TryParseGuid(input, ref parseResult))
+            {
+                result = parseResult.ToGuid();
+                return true;
+            }
+            else
+            {
+                result = default;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Tries to parse the specified sequence of UTF-8 encoded bytes as a GUID.
+        /// </summary>
+        /// <param name="utf8Text">A span containing the UTF-8 encoded representation of the GUID to parse.</param>
+        /// <param name="result">When this method returns, contains the parsed <see cref="Guid"/>, if the parse succeeded; otherwise, the default value.</param>
+        /// <returns><see langword="true"/> if the parse operation succeeded; otherwise, <see langword="false"/>.</returns>
+        public static bool TryParse(ReadOnlySpan<byte> utf8Text, out Guid result)
+        {
+            var parseResult = new GuidResult(GuidParseThrowStyle.None);
+            if (TryParseGuid(utf8Text, ref parseResult))
+            {
+                result = parseResult.ToGuid();
+                return true;
+            }
+            else
+            {
+                result = default;
+                return false;
+            }
+        }
+
+        public static Guid ParseExact(string input, [StringSyntax(StringSyntaxAttribute.GuidFormat)] string format)
+        {
+            ArgumentNullException.ThrowIfNull(input);
+            ArgumentNullException.ThrowIfNull(format);
+
+            return ParseExact((ReadOnlySpan<char>)input, (ReadOnlySpan<char>)format);
+        }
+
+        public static Guid ParseExact(ReadOnlySpan<char> input, [StringSyntax(StringSyntaxAttribute.GuidFormat)] ReadOnlySpan<char> format)
+        {
+            if (format.Length != 1)
+            {
+                // all acceptable format strings are of length 1
+                ThrowBadGuidFormatSpecification();
+            }
+
+            input = input.Trim();
+
+            var result = new GuidResult(GuidParseThrowStyle.AllButOverflow);
+            bool success = ((char)(format[0] | 0x20)) switch
+            {
+                'd' => TryParseExactD(input, ref result),
+                'n' => TryParseExactN(input, ref result),
+                'b' => TryParseExactB(input, ref result),
+                'p' => TryParseExactP(input, ref result),
+                'x' => TryParseExactX(input, ref result),
+                _ => throw new FormatException(SR.Format_InvalidGuidFormatSpecification),
+            };
+            Debug.Assert(success, "GuidParseThrowStyle.AllButOverflow means throw on all failures");
+            return result.ToGuid();
+        }
+
+        public static bool TryParseExact([NotNullWhen(true)] string? input, [NotNullWhen(true), StringSyntax(StringSyntaxAttribute.GuidFormat)] string? format, out Guid result)
+        {
+            if (input == null)
+            {
+                result = default;
+                return false;
+            }
+
+            return TryParseExact((ReadOnlySpan<char>)input, format, out result);
+        }
+
+        public static bool TryParseExact(ReadOnlySpan<char> input, [StringSyntax(StringSyntaxAttribute.GuidFormat)] ReadOnlySpan<char> format, out Guid result)
+        {
+            if (format.Length != 1 || input.Length < 32) // Minimal length we can parse ('N' format)
+            {
+                result = default;
+                return false;
+            }
+
+            input = input.Trim();
+
+            var parseResult = new GuidResult(GuidParseThrowStyle.None);
+            bool success = (format[0] | 0x20) switch
+            {
+                'd' => TryParseExactD(input, ref parseResult),
+                'n' => TryParseExactN(input, ref parseResult),
+                'b' => TryParseExactB(input, ref parseResult),
+                'p' => TryParseExactP(input, ref parseResult),
+                'x' => TryParseExactX(input, ref parseResult),
+                _ => false
+            };
+
+            if (success)
+            {
+                result = parseResult.ToGuid();
+                return true;
+            }
+            else
+            {
+                result = default;
+                return false;
+            }
+        }
+        private static bool TryParseGuid<TChar>(ReadOnlySpan<TChar> guidString, ref GuidResult result) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            guidString = Number.SpanTrim(guidString); // Remove whitespace from beginning and end
+
+            if (guidString.Length < 32) // Minimal length we can parse ('N' format)
+            {
+                result.SetFailure(ParseFailure.Format_GuidUnrecognized);
+                return false;
+            }
+
+            return TChar.CastToUInt32(guidString[0]) switch
+            {
+                '(' => TryParseExactP(guidString, ref result),
+                '{' => guidString[9] == TChar.CastFrom('-') ?
+                        TryParseExactB(guidString, ref result) :
+                        TryParseExactX(guidString, ref result),
+                _ => guidString[8] == TChar.CastFrom('-') ?
+                        TryParseExactD(guidString, ref result) :
+                        TryParseExactN(guidString, ref result),
+            };
+        }
+
+        private static bool TryParseExactB<TChar>(ReadOnlySpan<TChar> guidString, ref GuidResult result) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            // e.g. "{d85b1407-351d-4694-9392-03acc5870eb1}"
+
+            if (guidString.Length != 38 || guidString[0] != TChar.CastFrom('{') || guidString[37] != TChar.CastFrom('}'))
+            {
+                result.SetFailure(ParseFailure.Format_GuidInvLen);
+                return false;
+            }
+
+            return TryParseExactD(guidString.Slice(1, 36), ref result);
+        }
+
+        private static bool TryParseExactD<TChar>(ReadOnlySpan<TChar> guidString, ref GuidResult result) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            // e.g. "d85b1407-351d-4694-9392-03acc5870eb1"
+
+            if (guidString.Length != 36 || guidString[8] != TChar.CastFrom('-') || guidString[13] != TChar.CastFrom('-') || guidString[18] != TChar.CastFrom('-') || guidString[23] != TChar.CastFrom('-'))
+            {
+                result.SetFailure(guidString.Length != 36 ? ParseFailure.Format_GuidInvLen : ParseFailure.Format_GuidDashes);
+                return false;
+            }
+
+            Span<byte> bytes = MemoryMarshal.AsBytes(new Span<GuidResult>(ref result));
+            int invalidIfNegative = 0;
+            bytes[0] = DecodeByte(guidString[6], guidString[7], ref invalidIfNegative);
+            bytes[1] = DecodeByte(guidString[4], guidString[5], ref invalidIfNegative);
+            bytes[2] = DecodeByte(guidString[2], guidString[3], ref invalidIfNegative);
+            bytes[3] = DecodeByte(guidString[0], guidString[1], ref invalidIfNegative);
+            bytes[4] = DecodeByte(guidString[11], guidString[12], ref invalidIfNegative);
+            bytes[5] = DecodeByte(guidString[9], guidString[10], ref invalidIfNegative);
+            bytes[6] = DecodeByte(guidString[16], guidString[17], ref invalidIfNegative);
+            bytes[7] = DecodeByte(guidString[14], guidString[15], ref invalidIfNegative);
+            bytes[8] = DecodeByte(guidString[19], guidString[20], ref invalidIfNegative);
+            bytes[9] = DecodeByte(guidString[21], guidString[22], ref invalidIfNegative);
+            bytes[10] = DecodeByte(guidString[24], guidString[25], ref invalidIfNegative);
+            bytes[11] = DecodeByte(guidString[26], guidString[27], ref invalidIfNegative);
+            bytes[12] = DecodeByte(guidString[28], guidString[29], ref invalidIfNegative);
+            bytes[13] = DecodeByte(guidString[30], guidString[31], ref invalidIfNegative);
+            bytes[14] = DecodeByte(guidString[32], guidString[33], ref invalidIfNegative);
+            bytes[15] = DecodeByte(guidString[34], guidString[35], ref invalidIfNegative);
+
+            if (invalidIfNegative >= 0)
+            {
+                if (!BitConverter.IsLittleEndian)
+                {
+                    result.ReverseAbcEndianness();
+                }
+
+                return true;
+            }
+
+            // The 'D' format has some undesirable behavior leftover from its original implementation:
+            // - Components may begin with "0x" and/or "+", but the expected length of each component
+            //   needs to include those prefixes, e.g. a four digit component could be "1234" or
+            //   "0x34" or "+0x4" or "+234", but not "0x1234" nor "+1234" nor "+0x1234".
+            // - "0X" is valid instead of "0x"
+            // We continue to support these but expect them to be incredibly rare.  As such, we
+            // optimize for correctly formed strings where all the digits are valid hex, and only
+            // fall back to supporting these other forms if parsing fails.
+            if (guidString.ContainsAny(TChar.CastFrom('X'), TChar.CastFrom('x'), TChar.CastFrom('+')) && TryCompatParsing(guidString, ref result))
+            {
+                return true;
+            }
+
+            result.SetFailure(ParseFailure.Format_GuidInvalidChar);
+            return false;
+
+            static bool TryCompatParsing(ReadOnlySpan<TChar> guidString, ref GuidResult result)
+            {
+                guidString = guidString.Slice(0, 36);
+
+                if (TryParseHex(guidString.Slice(0, 8), out result._a) && // _a
+                    TryParseHex(guidString.Slice(9, 4), out uint uintTmp)) // _b
+                {
+                    result._b = (ushort)uintTmp;
+                    if (TryParseHex(guidString.Slice(14, 4), out uintTmp)) // _c
+                    {
+                        result._c = (ushort)uintTmp;
+                        if (TryParseHex(guidString.Slice(19, 4), out uintTmp)) // _d, _e
+                        {
+                            result._de = BitConverter.IsLittleEndian ? BinaryPrimitives.ReverseEndianness((ushort)uintTmp) : (ushort)uintTmp;
+                            if (TryParseHex(guidString.Slice(24, 4), out uintTmp)) // _f, _g
+                            {
+                                result._fg = BitConverter.IsLittleEndian ? BinaryPrimitives.ReverseEndianness((ushort)uintTmp) : (ushort)uintTmp;
+
+                                // Unlike the other components, this one never allowed 0x or +, so we can parse it as straight hex.
+                                if (TryParseStraightHex(guidString.Slice(28, 8), out uintTmp)) // _h, _i, _j, _k
+                                {
+                                    result._hijk = BitConverter.IsLittleEndian ? BinaryPrimitives.ReverseEndianness(uintTmp) : uintTmp;
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                return false;
+            }
+        }
+
+        private static bool TryParseStraightHex<TChar>(ReadOnlySpan<TChar> value, out uint result) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            result = 0;
+            foreach (TChar ch in value)
+            {
+                int digit = HexConverter.FromChar((int)TChar.CastToUInt32(ch));
+                if (digit == 0xFF)
+                {
+                    return false;
+                }
+                result = (result << 4) | (uint)digit;
+            }
+
+            return true;
+        }
+
+        private static bool TryParseExactN<TChar>(ReadOnlySpan<TChar> guidString, ref GuidResult result) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            // e.g. "d85b1407351d4694939203acc5870eb1"
+
+            if (guidString.Length != 32)
+            {
+                result.SetFailure(ParseFailure.Format_GuidInvLen);
+                return false;
+            }
+
+            Span<byte> bytes = MemoryMarshal.AsBytes(new Span<GuidResult>(ref result));
+            int invalidIfNegative = 0;
+            bytes[0] = DecodeByte(guidString[6], guidString[7], ref invalidIfNegative);
+            bytes[1] = DecodeByte(guidString[4], guidString[5], ref invalidIfNegative);
+            bytes[2] = DecodeByte(guidString[2], guidString[3], ref invalidIfNegative);
+            bytes[3] = DecodeByte(guidString[0], guidString[1], ref invalidIfNegative);
+            bytes[4] = DecodeByte(guidString[10], guidString[11], ref invalidIfNegative);
+            bytes[5] = DecodeByte(guidString[8], guidString[9], ref invalidIfNegative);
+            bytes[6] = DecodeByte(guidString[14], guidString[15], ref invalidIfNegative);
+            bytes[7] = DecodeByte(guidString[12], guidString[13], ref invalidIfNegative);
+            bytes[8] = DecodeByte(guidString[16], guidString[17], ref invalidIfNegative);
+            bytes[9] = DecodeByte(guidString[18], guidString[19], ref invalidIfNegative);
+            bytes[10] = DecodeByte(guidString[20], guidString[21], ref invalidIfNegative);
+            bytes[11] = DecodeByte(guidString[22], guidString[23], ref invalidIfNegative);
+            bytes[12] = DecodeByte(guidString[24], guidString[25], ref invalidIfNegative);
+            bytes[13] = DecodeByte(guidString[26], guidString[27], ref invalidIfNegative);
+            bytes[14] = DecodeByte(guidString[28], guidString[29], ref invalidIfNegative);
+            bytes[15] = DecodeByte(guidString[30], guidString[31], ref invalidIfNegative);
+
+            if (invalidIfNegative >= 0)
+            {
+                if (!BitConverter.IsLittleEndian)
+                {
+                    result.ReverseAbcEndianness();
+                }
+
+                return true;
+            }
+
+            result.SetFailure(ParseFailure.Format_GuidInvalidChar);
+            return false;
+        }
+
+        private static bool TryParseExactP<TChar>(ReadOnlySpan<TChar> guidString, ref GuidResult result) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            // e.g. "(d85b1407-351d-4694-9392-03acc5870eb1)"
+
+            if (guidString.Length != 38 || guidString[0] != TChar.CastFrom('(') || guidString[37] != TChar.CastFrom(')'))
+            {
+                result.SetFailure(ParseFailure.Format_GuidInvLen);
+                return false;
+            }
+
+            return TryParseExactD(guidString.Slice(1, 36), ref result);
+        }
+
+        private static bool TryParseExactX<TChar>(ReadOnlySpan<TChar> guidString, ref GuidResult result) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            // e.g. "{0xd85b1407,0x351d,0x4694,{0x93,0x92,0x03,0xac,0xc5,0x87,0x0e,0xb1}}"
+
+            // Compat notes due to the previous implementation's implementation details.
+            // - Each component need not be the full expected number of digits.
+            // - Each component may contain any number of leading 0s
+            // - The "short" components are parsed as 32-bits and only considered to overflow if they'd overflow 32 bits.
+            // - The "byte" components are parsed as 32-bits and are considered to overflow if they'd overflow 8 bits,
+            //   but for the Guid ctor, whether they overflow 8 bits or 32 bits results in differing exceptions.
+            // - Components may begin with "0x", "0x+", even "0x+0x".
+            // - "0X" is valid instead of "0x"
+
+            // Eat all of the whitespace.  Unlike the other forms, X allows for any amount of whitespace
+            // anywhere, not just at the beginning and end.
+            guidString = EatAllWhitespace(guidString, ref result);
+
+            // Check for leading '{'
+            if (guidString.Length == 0 || guidString[0] != TChar.CastFrom('{'))
+            {
+                result.SetFailure(ParseFailure.Format_GuidBrace);
+                return false;
+            }
+
+            // Check for '0x'
+            if (!IsHexPrefix(guidString, 1))
+            {
+                result.SetFailure(ParseFailure.Format_GuidHexPrefix);
+                return false;
+            }
+
+            // Find the end of this hex number (since it is not fixed length)
+            int numStart = 3;
+            int numLen = guidString.Slice(numStart).IndexOf(TChar.CastFrom(','));
+            if (numLen <= 0)
+            {
+                result.SetFailure(ParseFailure.Format_GuidComma);
+                return false;
+            }
+
+            bool overflow = false;
+            if (!TryParseHex(guidString.Slice(numStart, numLen), out result._a, ref overflow) || overflow)
+            {
+                result.SetFailure(overflow ? ParseFailure.Overflow_UInt32 : ParseFailure.Format_GuidInvalidChar);
+                return false;
+            }
+
+            // Check for '0x'
+            if (!IsHexPrefix(guidString, numStart + numLen + 1))
+            {
+                result.SetFailure(ParseFailure.Format_GuidHexPrefix);
+                return false;
+            }
+            // +3 to get by ',0x'
+            numStart = numStart + numLen + 3;
+            numLen = guidString.Slice(numStart).IndexOf(TChar.CastFrom(','));
+            if (numLen <= 0)
+            {
+                result.SetFailure(ParseFailure.Format_GuidComma);
+                return false;
+            }
+
+            // Read in the number
+            if (!TryParseHex(guidString.Slice(numStart, numLen), out result._b, ref overflow) || overflow)
+            {
+                result.SetFailure(overflow ? ParseFailure.Overflow_UInt32 : ParseFailure.Format_GuidInvalidChar);
+                return false;
+            }
+
+            // Check for '0x'
+            if (!IsHexPrefix(guidString, numStart + numLen + 1))
+            {
+                result.SetFailure(ParseFailure.Format_GuidHexPrefix);
+                return false;
+            }
+            // +3 to get by ',0x'
+            numStart = numStart + numLen + 3;
+            numLen = guidString.Slice(numStart).IndexOf(TChar.CastFrom(','));
+            if (numLen <= 0)
+            {
+                result.SetFailure(ParseFailure.Format_GuidComma);
+                return false;
+            }
+
+            // Read in the number
+            if (!TryParseHex(guidString.Slice(numStart, numLen), out result._c, ref overflow) || overflow)
+            {
+                result.SetFailure(overflow ? ParseFailure.Overflow_UInt32 : ParseFailure.Format_GuidInvalidChar);
+                return false;
+            }
+
+            // Check for '{'
+            if ((uint)guidString.Length <= (uint)(numStart + numLen + 1) || guidString[numStart + numLen + 1] != TChar.CastFrom('{'))
+            {
+                result.SetFailure(ParseFailure.Format_GuidBrace);
+                return false;
+            }
+
+            // Prepare for loop
+            numLen++;
+            for (int i = 0; i < 8; i++)
+            {
+                // Check for '0x'
+                if (!IsHexPrefix(guidString, numStart + numLen + 1))
+                {
+                    result.SetFailure(ParseFailure.Format_GuidHexPrefix);
+                    return false;
+                }
+
+                // +3 to get by ',0x' or '{0x' for first case
+                numStart = numStart + numLen + 3;
+
+                // Calculate number length
+                if (i < 7)  // first 7 cases
+                {
+                    numLen = guidString.Slice(numStart).IndexOf(TChar.CastFrom(','));
+                    if (numLen <= 0)
+                    {
+                        result.SetFailure(ParseFailure.Format_GuidComma);
+                        return false;
+                    }
+                }
+                else // last case ends with '}', not ','
+                {
+                    numLen = guidString.Slice(numStart).IndexOf(TChar.CastFrom('}'));
+                    if (numLen <= 0)
+                    {
+                        result.SetFailure(ParseFailure.Format_GuidBraceAfterLastNumber);
+                        return false;
+                    }
+                }
+
+                // Read in the number
+                if (!TryParseHex(guidString.Slice(numStart, numLen), out uint byteVal, ref overflow) || overflow || byteVal > byte.MaxValue)
+                {
+                    // The previous implementation had some odd inconsistencies, which are carried forward here.
+                    // The byte values in the X format are treated as integers with regards to overflow, so
+                    // a "byte" value like 0xddd in Guid's ctor results in a FormatException but 0xddddddddd results
+                    // in OverflowException.
+                    result.SetFailure(
+                        overflow ? ParseFailure.Overflow_UInt32 :
+                        byteVal > byte.MaxValue ? ParseFailure.Overflow_Byte :
+                        ParseFailure.Format_GuidInvalidChar);
+                    return false;
+                }
+                Unsafe.Add(ref result._d, i) = (byte)byteVal;
+            }
+
+            // Check for last '}'
+            if (numStart + numLen + 1 >= guidString.Length || guidString[numStart + numLen + 1] != TChar.CastFrom('}'))
+            {
+                result.SetFailure(ParseFailure.Format_GuidEndBrace);
+                return false;
+            }
+
+            // Check if we have extra characters at the end
+            if (numStart + numLen + 1 != guidString.Length - 1)
+            {
+                result.SetFailure(ParseFailure.Format_ExtraJunkAtEnd);
+                return false;
+            }
+
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static byte DecodeByte<TChar>(TChar ch1, TChar ch2, ref int invalidIfNegative) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            ReadOnlySpan<byte> lookup = HexConverter.CharToHexLookup;
+            Debug.Assert(lookup.Length == 256);
+
+            uint c1 = typeof(TChar) == typeof(byte) ? TChar.CastToUInt32(ch1) : Math.Min(TChar.CastToUInt32(ch1), 0x7F);
+            uint c2 = typeof(TChar) == typeof(byte) ? TChar.CastToUInt32(ch2) : Math.Min(TChar.CastToUInt32(ch2), 0x7F);
+            int upper = (sbyte)lookup[(int)c1];
+            int lower = (sbyte)lookup[(int)c2];
+
+            int result = (upper << 4) | lower;
+            invalidIfNegative |= result;
+            return (byte)result;
+        }
+
+        private static bool TryParseHex<TChar>(ReadOnlySpan<TChar> guidString, out ushort result, ref bool overflow) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            bool success = TryParseHex(guidString, out uint tmp, ref overflow);
+            result = (ushort)tmp;
+            return success;
+        }
+
+        private static bool TryParseHex<TChar>(ReadOnlySpan<TChar> guidString, out uint result) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            bool overflowIgnored = false;
+            return TryParseHex(guidString, out result, ref overflowIgnored);
+        }
+
+        private static bool TryParseHex<TChar>(ReadOnlySpan<TChar> guidString, out uint result, ref bool overflow) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            if (guidString.Length > 0)
+            {
+                if (guidString[0] == TChar.CastFrom('+'))
+                {
+                    guidString = guidString.Slice(1);
+                }
+
+                if (guidString.Length > 1 && guidString[0] == TChar.CastFrom('0') && (guidString[1] | TChar.CastFrom(0x20)) == TChar.CastFrom('x'))
+                {
+                    guidString = guidString.Slice(2);
+                }
+            }
+
+            // Skip past leading 0s.
+            int i = 0;
+            for (; i < guidString.Length && guidString[i] == TChar.CastFrom('0'); i++) ;
+
+            int processedDigits = 0;
+            uint tmp = 0;
+            for (; i < guidString.Length; i++)
+            {
+                int c = int.CreateTruncating(guidString[i]);
+                int numValue = HexConverter.FromChar(c);
+                if (numValue == 0xFF)
+                {
+                    if (processedDigits > 8) overflow = true;
+                    result = 0;
+                    return false;
+                }
+                tmp = (tmp * 16) + (uint)numValue;
+                processedDigits++;
+            }
+
+            if (processedDigits > 8) overflow = true;
+            result = tmp;
+            return true;
+        }
+
+        private static ReadOnlySpan<TChar> EatAllWhitespace<TChar>(ReadOnlySpan<TChar> str, scoped ref GuidResult result) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            if (typeof(TChar) == typeof(char))
+            {
+                ReadOnlySpan<char> charSpan = Unsafe.BitCast<ReadOnlySpan<TChar>, ReadOnlySpan<char>>(str);
+                // Find the first whitespace character. If there is none, just return the input.
+                int i = charSpan.IndexOfAnyWhiteSpace();
+                if (i < 0)
+                {
+                    return str;
+                }
+
+                // There was at least one whitespace. Copy over everything prior to it to a new array.
+                var chArr = new char[charSpan.Length];
+                int newLength = 0;
+                if (i > 0)
+                {
+                    newLength = i;
+                    charSpan.Slice(0, i).CopyTo(chArr);
+                }
+
+                // Loop through the remaining chars, copying over non-whitespace.
+                for (; i < charSpan.Length; i++)
+                {
+                    char c = charSpan[i];
+                    if (!char.IsWhiteSpace(c))
+                    {
+                        chArr[newLength++] = c;
+                    }
+                }
+
+                // Return the string with the whitespace removed.
+                return Unsafe.BitCast<ReadOnlySpan<char>, ReadOnlySpan<TChar>>(new ReadOnlySpan<char>(chArr, 0, newLength));
+            }
+            else
+            {
+                Debug.Assert(typeof(TChar) == typeof(byte));
+
+                ReadOnlySpan<byte> srcUtf8Span = Unsafe.BitCast<ReadOnlySpan<TChar>, ReadOnlySpan<byte>>(str);
+
+                // Find the first whitespace character.  If there is none, just return the input.
+                int i = 0;
+                while (i < srcUtf8Span.Length)
+                {
+                    if (Rune.DecodeFromUtf8(srcUtf8Span.Slice(i), out Rune current, out int bytesConsumed) != Buffers.OperationStatus.Done)
+                    {
+                        result.SetFailure(ParseFailure.Format_GuidInvalidChar);
+                        return ReadOnlySpan<TChar>.Empty;
+                    }
+
+                    if (Rune.IsWhiteSpace(current))
+                    {
+                        break;
+                    }
+
+                    i += bytesConsumed;
+                }
+
+                if (i == srcUtf8Span.Length)
+                {
+                    return str;
+                }
+
+                // There was at least one whitespace. Copy over everything prior to it to a new array.
+                Span<byte> destUtf8Span = new byte[srcUtf8Span.Length];
+                int newLength = 0;
+                if (i > 0)
+                {
+                    newLength = i;
+                    srcUtf8Span.Slice(0, i).CopyTo(destUtf8Span);
+                }
+
+                // Loop through the remaining chars, copying over non-whitespace.
+                while (i < srcUtf8Span.Length)
+                {
+                    if (Rune.DecodeFromUtf8(srcUtf8Span.Slice(i), out Rune current, out int bytesConsumed) != Buffers.OperationStatus.Done)
+                    {
+                        result.SetFailure(ParseFailure.Format_GuidInvalidChar);
+                        return ReadOnlySpan<TChar>.Empty;
+                    }
+
+                    if (!Rune.IsWhiteSpace(current))
+                    {
+                        srcUtf8Span.Slice(i, bytesConsumed).CopyTo(destUtf8Span.Slice(newLength));
+                        newLength += bytesConsumed;
+                    }
+
+                    i += bytesConsumed;
+                }
+
+                // Return the string with the whitespace removed.
+                return Unsafe.BitCast<ReadOnlySpan<byte>, ReadOnlySpan<TChar>>(destUtf8Span.Slice(0, newLength));
+            }
+        }
+
+        private static bool IsHexPrefix<TChar>(ReadOnlySpan<TChar> str, int i) where TChar : unmanaged, IUtfChar<TChar> =>
+            i + 1 < str.Length &&
+            str[i] == TChar.CastFrom('0') &&
+            (str[i + 1] | TChar.CastFrom(0x20)) == TChar.CastFrom('x');
+
+        // Returns an unsigned byte array containing the GUID.
+        public byte[] ToByteArray()
+        {
+            var g = new byte[16];
+            if (BitConverter.IsLittleEndian)
+            {
+                MemoryMarshal.Write(g, in this);
+            }
+            else
+            {
+                // slower path for BigEndian
+                Guid guid = new Guid(MemoryMarshal.AsBytes(new ReadOnlySpan<Guid>(in this)), false);
+                MemoryMarshal.Write(g, in guid);
+            }
+            return g;
+        }
+
+
+        // Returns an unsigned byte array containing the GUID.
+        public byte[] ToByteArray(bool bigEndian)
+        {
+            var g = new byte[16];
+            if (BitConverter.IsLittleEndian != bigEndian)
+            {
+                MemoryMarshal.Write(g, in this);
+            }
+            else
+            {
+                // slower path for Reverse
+                Guid guid = new Guid(MemoryMarshal.AsBytes(new ReadOnlySpan<Guid>(in this)), bigEndian);
+                MemoryMarshal.Write(g, in guid);
+            }
+            return g;
+        }
+
+        // Returns whether bytes are successfully written to given span.
+        public bool TryWriteBytes(Span<byte> destination)
+        {
+            if (destination.Length < 16)
+                return false;
+
+            if (BitConverter.IsLittleEndian)
+            {
+                MemoryMarshal.Write(destination, in this);
+            }
+            else
+            {
+                // slower path for BigEndian
+                Guid guid = new Guid(MemoryMarshal.AsBytes(new ReadOnlySpan<Guid>(in this)), false);
+                MemoryMarshal.Write(destination, in guid);
+            }
+            return true;
+        }
+
+        // Returns whether bytes are successfully written to given span.
+        public bool TryWriteBytes(Span<byte> destination, bool bigEndian, out int bytesWritten)
+        {
+            if (destination.Length < 16)
+            {
+                bytesWritten = 0;
+                return false;
+            }
+
+            if (BitConverter.IsLittleEndian != bigEndian)
+            {
+                MemoryMarshal.Write(destination, in this);
+            }
+            else
+            {
+                // slower path for Reverse
+                Guid guid = new Guid(MemoryMarshal.AsBytes(new ReadOnlySpan<Guid>(in this)), bigEndian);
+                MemoryMarshal.Write(destination, in guid);
+            }
+            bytesWritten = 16;
+            return true;
+        }
+
+        public override int GetHashCode()
+        {
+            // Simply XOR all the bits of the GUID 32 bits at a time.
+            ref int r = ref Unsafe.AsRef(in _a);
+            return r ^ Unsafe.Add(ref r, 1) ^ Unsafe.Add(ref r, 2) ^ Unsafe.Add(ref r, 3);
+        }
+
+        // Returns true if and only if the guid represented
+        //  by o is the same as this instance.
+        public override bool Equals([NotNullWhen(true)] object? o) => o is Guid g && EqualsCore(this, g);
+
+        public bool Equals(Guid g) => EqualsCore(this, g);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool EqualsCore(in Guid left, in Guid right)
+        {
+            if (Vector128.IsHardwareAccelerated)
+            {
+                return Unsafe.BitCast<Guid, Vector128<byte>>(left) == Unsafe.BitCast<Guid, Vector128<byte>>(right);
+            }
+
+            ref int rA = ref Unsafe.AsRef(in left._a);
+            ref int rB = ref Unsafe.AsRef(in right._a);
+
+            // Compare each element
+
+            return rA == rB
+                && Unsafe.Add(ref rA, 1) == Unsafe.Add(ref rB, 1)
+                && Unsafe.Add(ref rA, 2) == Unsafe.Add(ref rB, 2)
+                && Unsafe.Add(ref rA, 3) == Unsafe.Add(ref rB, 3);
+        }
+
+        private static int GetResult(uint me, uint them) => me < them ? -1 : 1;
+
+        public int CompareTo(object? value)
+        {
+            if (value == null)
+            {
+                return 1;
+            }
+            if (value is not Guid other)
+            {
+                throw new ArgumentException(SR.Arg_MustBeGuid, nameof(value));
+            }
+            return CompareTo(other);
+        }
+
+        public int CompareTo(Guid value)
+        {
+            if (value._a != _a)
+            {
+                return GetResult((uint)_a, (uint)value._a);
+            }
+
+            if (value._b != _b)
+            {
+                return GetResult((uint)_b, (uint)value._b);
+            }
+
+            if (value._c != _c)
+            {
+                return GetResult((uint)_c, (uint)value._c);
+            }
+
+            if (value._d != _d)
+            {
+                return GetResult(_d, value._d);
+            }
+
+            if (value._e != _e)
+            {
+                return GetResult(_e, value._e);
+            }
+
+            if (value._f != _f)
+            {
+                return GetResult(_f, value._f);
+            }
+
+            if (value._g != _g)
+            {
+                return GetResult(_g, value._g);
+            }
+
+            if (value._h != _h)
+            {
+                return GetResult(_h, value._h);
+            }
+
+            if (value._i != _i)
+            {
+                return GetResult(_i, value._i);
+            }
+
+            if (value._j != _j)
+            {
+                return GetResult(_j, value._j);
+            }
+
+            if (value._k != _k)
+            {
+                return GetResult(_k, value._k);
+            }
+
+            return 0;
+        }
+
+        public static bool operator ==(Guid a, Guid b) => EqualsCore(a, b);
+
+        public static bool operator !=(Guid a, Guid b) => !EqualsCore(a, b);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe int HexsToChars<TChar>(TChar* guidChars, int a, int b) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            guidChars[0] = TChar.CastFrom(HexConverter.ToCharLower(a >> 4));
+            guidChars[1] = TChar.CastFrom(HexConverter.ToCharLower(a));
+
+            guidChars[2] = TChar.CastFrom(HexConverter.ToCharLower(b >> 4));
+            guidChars[3] = TChar.CastFrom(HexConverter.ToCharLower(b));
+
+            return 4;
+        }
+
+        // Returns the guid in "registry" format.
+        public override string ToString() => ToString("d", null);
+
+        public string ToString([StringSyntax(StringSyntaxAttribute.GuidFormat)] string? format)
+        {
+            return ToString(format, null);
+        }
+
+        // IFormattable interface
+        // We currently ignore provider
+        public string ToString([StringSyntax(StringSyntaxAttribute.GuidFormat)] string? format, IFormatProvider? provider)
+        {
+            int guidSize;
+            if (string.IsNullOrEmpty(format))
+            {
+                guidSize = 36;
+            }
+            else
+            {
+                // all acceptable format strings are of length 1
+                if (format.Length != 1)
+                {
+                    ThrowBadGuidFormatSpecification();
+                }
+
+                switch (format[0] | 0x20)
+                {
+                    case 'd':
+                        guidSize = 36;
+                        break;
+
+                    case 'n':
+                        guidSize = 32;
+                        break;
+
+                    case 'b' or 'p':
+                        guidSize = 38;
+                        break;
+
+                    case 'x':
+                        guidSize = 68;
+                        break;
+
+                    default:
+                        guidSize = 0;
+                        ThrowBadGuidFormatSpecification();
+                        break;
+                }
+                ;
+            }
+
+            string guidString = string.FastAllocateString(guidSize);
+
+            bool result = TryFormatCore(new Span<char>(ref guidString.GetRawStringData(), guidString.Length), out int bytesWritten, format);
+            Debug.Assert(result && bytesWritten == guidString.Length, "Formatting guid should have succeeded.");
+
+            return guidString;
+        }
+
+        public bool TryFormat(Span<char> destination, out int charsWritten, [StringSyntax(StringSyntaxAttribute.GuidFormat)] ReadOnlySpan<char> format = default) =>
+            TryFormatCore(destination, out charsWritten, format);
+
+        bool ISpanFormattable.TryFormat(Span<char> destination, out int charsWritten, [StringSyntax(StringSyntaxAttribute.GuidFormat)] ReadOnlySpan<char> format, IFormatProvider? provider) =>
+            // Provider is ignored.
+            TryFormatCore(destination, out charsWritten, format);
+
+        public bool TryFormat(Span<byte> utf8Destination, out int bytesWritten, [StringSyntax(StringSyntaxAttribute.GuidFormat)] ReadOnlySpan<char> format = default) =>
+            TryFormatCore(utf8Destination, out bytesWritten, format);
+
+        bool IUtf8SpanFormattable.TryFormat(Span<byte> utf8Destination, out int bytesWritten, [StringSyntax(StringSyntaxAttribute.GuidFormat)] ReadOnlySpan<char> format, IFormatProvider? provider) =>
+            // Provider is ignored.
+            TryFormatCore(utf8Destination, out bytesWritten, format);
+
+        // TryFormatCore accepts an `int flags` composed of:
+        // - Lowest byte: required length
+        // - Second byte: opening brace char, or 0 if no braces
+        // - Third byte: closing brace char, or 0 if no braces
+        // - Highest bit: 1 if use dashes, else 0
+        internal const int TryFormatFlags_UseDashes = unchecked((int)0x80000000);
+        internal const int TryFormatFlags_CurlyBraces = ('}' << 16) | ('{' << 8);
+        internal const int TryFormatFlags_Parens = (')' << 16) | ('(' << 8);
+
+        private bool TryFormatCore<TChar>(Span<TChar> destination, out int charsWritten, ReadOnlySpan<char> format) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            int flags;
+
+            if (format.Length == 0)
+            {
+                flags = 36 + TryFormatFlags_UseDashes;
+            }
+            else
+            {
+                if (format.Length != 1)
+                {
+                    ThrowBadGuidFormatSpecification();
+                }
+
+                switch (format[0] | 0x20)
+                {
+                    case 'd':
+                        flags = 36 + TryFormatFlags_UseDashes;
+                        break;
+
+                    case 'p':
+                        flags = 38 + TryFormatFlags_UseDashes + TryFormatFlags_Parens;
+                        break;
+
+                    case 'b':
+                        flags = 38 + TryFormatFlags_UseDashes + TryFormatFlags_CurlyBraces;
+                        break;
+
+                    case 'n':
+                        flags = 32;
+                        break;
+
+                    case 'x':
+                        return TryFormatX(destination, out charsWritten);
+
+                    default:
+                        flags = 0;
+                        ThrowBadGuidFormatSpecification();
+                        break;
+                }
+            }
+
+            return TryFormatCore(destination, out charsWritten, flags);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)] // only used from two callers
+        internal unsafe bool TryFormatCore<TChar>(Span<TChar> destination, out int charsWritten, int flags) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            // The low byte of flags contains the required length.
+            if ((byte)flags > destination.Length)
+            {
+                charsWritten = 0;
+                return false;
+            }
+
+            charsWritten = (byte)flags;
+            flags >>= 8;
+
+            fixed (TChar* guidChars = &MemoryMarshal.GetReference(destination))
+            {
+                TChar* p = guidChars;
+
+                // The low byte of flags now contains the opening brace char (if any)
+                if ((byte)flags != 0)
+                {
+                    *p++ = TChar.CastFrom((byte)flags);
+                }
+                flags >>= 8;
+
+                if ((Ssse3.IsSupported || AdvSimd.Arm64.IsSupported || PackedSimd.IsSupported) && BitConverter.IsLittleEndian)
+                {
+                    // Vectorized implementation for D, N, P and B formats:
+                    // [{|(]dddddddd[-]dddd[-]dddd[-]dddd[-]dddddddddddd[}|)]
+                    (Vector128<byte> vecX, Vector128<byte> vecY, Vector128<byte> vecZ) = FormatGuidVector128Utf8(this, flags < 0 /* dash */);
+
+                    if (typeof(TChar) == typeof(byte))
+                    {
+                        byte* pChar = (byte*)p;
+                        if (flags < 0 /* dash */)
+                        {
+                            // We need to merge these vectors in this order:
+                            // xxxxxxxxxxxxxxxx
+                            //                     yyyyyyyyyyyyyyyy
+                            //         zzzzzzzzzzzzzzzz
+                            vecX.Store(pChar);
+                            vecY.Store(pChar + 20);
+                            vecZ.Store(pChar + 8);
+                            p += 36;
+                        }
+                        else
+                        {
+                            // xxxxxxxxxxxxxxxxyyyyyyyyyyyyyyyy
+                            vecX.Store(pChar);
+                            vecY.Store(pChar + 16);
+                            p += 32;
+                        }
+                    }
+                    else
+                    {
+                        // Expand to UTF-16
+                        (Vector128<ushort> x0, Vector128<ushort> x1) = Vector128.Widen(vecX);
+                        (Vector128<ushort> y0, Vector128<ushort> y1) = Vector128.Widen(vecY);
+                        ushort* pChar = (ushort*)p;
+                        if (flags < 0 /* dash */)
+                        {
+                            (Vector128<ushort> z0, Vector128<ushort> z1) = Vector128.Widen(vecZ);
+
+                            // We need to merge these vectors in this order:
+                            // xxxxxxxxxxxxxxxx
+                            //                     yyyyyyyyyyyyyyyy
+                            //         zzzzzzzzzzzzzzzz
+                            x0.Store(pChar);
+                            y0.Store(pChar + 20);
+                            y1.Store(pChar + 28);
+                            z0.Store(pChar + 8); // overlaps x1
+                            z1.Store(pChar + 16);
+                            p += 36;
+                        }
+                        else
+                        {
+                            // xxxxxxxxxxxxxxxxyyyyyyyyyyyyyyyy
+                            x0.Store(pChar);
+                            x1.Store(pChar + 8);
+                            y0.Store(pChar + 16);
+                            y1.Store(pChar + 24);
+                            p += 32;
+                        }
+                    }
+                }
+                else
+                {
+                    // Non-vectorized fallback for D, N, P and B formats:
+                    // [{|(]dddddddd[-]dddd[-]dddd[-]dddd[-]dddddddddddd[}|)]
+                    p += HexsToChars(p, _a >> 24, _a >> 16);
+                    p += HexsToChars(p, _a >> 8, _a);
+                    if (flags < 0 /* dash */)
+                    {
+                        *p++ = TChar.CastFrom('-');
+                    }
+                    p += HexsToChars(p, _b >> 8, _b);
+                    if (flags < 0 /* dash */)
+                    {
+                        *p++ = TChar.CastFrom('-');
+                    }
+                    p += HexsToChars(p, _c >> 8, _c);
+                    if (flags < 0 /* dash */)
+                    {
+                        *p++ = TChar.CastFrom('-');
+                    }
+                    p += HexsToChars(p, _d, _e);
+                    if (flags < 0 /* dash */)
+                    {
+                        *p++ = TChar.CastFrom('-');
+                    }
+                    p += HexsToChars(p, _f, _g);
+                    p += HexsToChars(p, _h, _i);
+                    p += HexsToChars(p, _j, _k);
+                }
+
+                // The low byte of flags now contains the closing brace char (if any)
+                if ((byte)flags != 0)
+                {
+                    *p = TChar.CastFrom((byte)flags);
+                }
+
+                Debug.Assert(p == guidChars + charsWritten - ((byte)flags != 0 ? 1 : 0));
+            }
+
+            return true;
+        }
+
+        private bool TryFormatX<TChar>(Span<TChar> dest, out int charsWritten) where TChar : unmanaged, IUtfChar<TChar>
+        {
+            if (dest.Length < 68)
+            {
+                charsWritten = 0;
+                return false;
+            }
+
+            // {0xdddddddd,0xdddd,0xdddd,{0xdd,0xdd,0xdd,0xdd,0xdd,0xdd,0xdd,0xdd}}
+            dest[0] = TChar.CastFrom('{');
+            dest[1] = TChar.CastFrom('0');
+            dest[2] = TChar.CastFrom('x');
+            dest[3] = TChar.CastFrom(HexConverter.ToCharLower(_a >> 28));
+            dest[4] = TChar.CastFrom(HexConverter.ToCharLower(_a >> 24));
+            dest[5] = TChar.CastFrom(HexConverter.ToCharLower(_a >> 20));
+            dest[6] = TChar.CastFrom(HexConverter.ToCharLower(_a >> 16));
+            dest[7] = TChar.CastFrom(HexConverter.ToCharLower(_a >> 12));
+            dest[8] = TChar.CastFrom(HexConverter.ToCharLower(_a >> 8));
+            dest[9] = TChar.CastFrom(HexConverter.ToCharLower(_a >> 4));
+            dest[10] = TChar.CastFrom(HexConverter.ToCharLower(_a));
+            dest[11] = TChar.CastFrom(',');
+            dest[12] = TChar.CastFrom('0');
+            dest[13] = TChar.CastFrom('x');
+            dest[14] = TChar.CastFrom(HexConverter.ToCharLower(_b >> 12));
+            dest[15] = TChar.CastFrom(HexConverter.ToCharLower(_b >> 8));
+            dest[16] = TChar.CastFrom(HexConverter.ToCharLower(_b >> 4));
+            dest[17] = TChar.CastFrom(HexConverter.ToCharLower(_b));
+            dest[18] = TChar.CastFrom(',');
+            dest[19] = TChar.CastFrom('0');
+            dest[20] = TChar.CastFrom('x');
+            dest[21] = TChar.CastFrom(HexConverter.ToCharLower(_c >> 12));
+            dest[22] = TChar.CastFrom(HexConverter.ToCharLower(_c >> 8));
+            dest[23] = TChar.CastFrom(HexConverter.ToCharLower(_c >> 4));
+            dest[24] = TChar.CastFrom(HexConverter.ToCharLower(_c));
+            dest[25] = TChar.CastFrom(',');
+            dest[26] = TChar.CastFrom('{');
+            WriteHex(dest, 27, _d);
+            WriteHex(dest, 32, _e);
+            WriteHex(dest, 37, _f);
+            WriteHex(dest, 42, _g);
+            WriteHex(dest, 47, _h);
+            WriteHex(dest, 52, _i);
+            WriteHex(dest, 57, _j);
+            WriteHex(dest, 62, _k, appendComma: false);
+            dest[66] = TChar.CastFrom('}');
+            dest[67] = TChar.CastFrom('}');
+            charsWritten = 68;
+            return true;
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            static void WriteHex(Span<TChar> dest, int offset, int val, bool appendComma = true)
+            {
+                dest[offset + 0] = TChar.CastFrom('0');
+                dest[offset + 1] = TChar.CastFrom('x');
+                dest[offset + 2] = TChar.CastFrom(HexConverter.ToCharLower(val >> 4));
+                dest[offset + 3] = TChar.CastFrom(HexConverter.ToCharLower(val));
+                if (appendComma)
+                {
+                    dest[offset + 4] = TChar.CastFrom(',');
+                }
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [CompExactlyDependsOn(typeof(Ssse3))]
+        [CompExactlyDependsOn(typeof(AdvSimd.Arm64))]
+        [CompExactlyDependsOn(typeof(PackedSimd))]
+        private static (Vector128<byte>, Vector128<byte>, Vector128<byte>) FormatGuidVector128Utf8(Guid value, bool useDashes)
+        {
+            Debug.Assert((Ssse3.IsSupported || AdvSimd.Arm64.IsSupported || PackedSimd.IsSupported) && BitConverter.IsLittleEndian);
+            // Vectorized implementation for D, N, P and B formats:
+            // [{|(]dddddddd[-]dddd[-]dddd[-]dddd[-]dddddddddddd[}|)]
+
+            Vector128<byte> hexMap = Vector128.Create(
+                (byte)'0', (byte)'1', (byte)'2', (byte)'3',
+                (byte)'4', (byte)'5', (byte)'6', (byte)'7',
+                (byte)'8', (byte)'9', (byte)'a', (byte)'b',
+                (byte)'c', (byte)'d', (byte)'e', (byte)'f');
+
+            Vector128<byte> srcVec = Unsafe.BitCast<Guid, Vector128<byte>>(value);
+            (Vector128<byte> hexLow, Vector128<byte> hexHigh) =
+                HexConverter.AsciiToHexVector128(srcVec, hexMap);
+
+            // because of Guid's layout (int _a, short _b, _c, <8 byte fields>)
+            // we have to shuffle some bytes for _a, _b and _c
+            hexLow = Vector128.Shuffle(hexLow.AsInt16(), Vector128.Create(3, 2, 1, 0, 5, 4, 7, 6)).AsByte();
+
+            if (useDashes)
+            {
+                // We divide 32 bytes into 3 x Vector128<byte>:
+                //
+                // ________-____-____-____-____________
+                // xxxxxxxxxxxxxxxx
+                //                     yyyyyyyyyyyyyyyy
+                //         zzzzzzzzzzzzzzzz
+                //
+                // Vector "x" - just one dash, shift all elements after it.
+                Vector128<byte> vecX = Vector128.Shuffle(hexLow,
+                    Vector128.Create(0x706050403020100, 0xD0CFF0B0A0908FF).AsByte());
+
+                // Vector "y" - same here.
+                Vector128<byte> vecY = Vector128.Shuffle(hexHigh,
+                    Vector128.Create(0x7060504FF030201, 0xF0E0D0C0B0A0908).AsByte());
+
+                // Vector "z" - we need to merge some elements of hexLow with hexHigh and add 4 dashes.
+                Vector128<byte> vecZ;
+                Vector128<byte> dashesMask = Vector128.Create(0x00002D000000002D, 0x2D000000002D0000).AsByte();
+                if (AdvSimd.Arm64.IsSupported)
+                {
+                    // Arm64 allows shuffling values using a 32-byte wide look-up table consisting of two 128-bit registers.
+                    // Each byte in the second arg represents a value between 0 to 31 that acts as an index in the look-up table.
+                    // Now we can create a "z" vector by selecting 12 values starting from the 9th element (index 0x08) and
+                    // leaving gaps for dashes. Thus, the wider look-up table allows combining two shuffles, as used in the
+                    // generic else-case, into a single instruction on Arm64.
+                    Vector128<byte> mid = AdvSimd.Arm64.VectorTableLookup((hexLow, hexHigh),
+                        Vector128.Create(0x0D0CFF0B0A0908FF, 0xFF13121110FF0F0E).AsByte());
+                    vecZ = (mid | dashesMask);
+                }
+                else
+                {
+                    Vector128<byte> mid1 = Vector128.Shuffle(hexLow,
+                        Vector128.Create(0x0D0CFF0B0A0908FF, 0xFFFFFFFFFFFF0F0E).AsByte());
+                    Vector128<byte> mid2 = Vector128.Shuffle(hexHigh,
+                        Vector128.Create(0xFFFFFFFFFFFFFFFF, 0xFF03020100FFFFFF).AsByte());
+                    vecZ = (mid1 | mid2 | dashesMask);
+                }
+
+                return (vecX, vecY, vecZ);
+            }
+
+            // N format - no dashes.
+            return (hexLow, hexHigh, default);
+        }
+
+        //
+        // IComparisonOperators
+        //
+
+        /// <inheritdoc cref="IComparisonOperators{TSelf, TOther, TResult}.op_LessThan(TSelf, TOther)" />
+        public static bool operator <(Guid left, Guid right)
+        {
+            if (left._a != right._a)
+            {
+                return (uint)left._a < (uint)right._a;
+            }
+
+            if (left._b != right._b)
+            {
+                return (uint)left._b < (uint)right._b;
+            }
+
+            if (left._c != right._c)
+            {
+                return (uint)left._c < (uint)right._c;
+            }
+
+            if (left._d != right._d)
+            {
+                return left._d < right._d;
+            }
+
+            if (left._e != right._e)
+            {
+                return left._e < right._e;
+            }
+
+            if (left._f != right._f)
+            {
+                return left._f < right._f;
+            }
+
+            if (left._g != right._g)
+            {
+                return left._g < right._g;
+            }
+
+            if (left._h != right._h)
+            {
+                return left._h < right._h;
+            }
+
+            if (left._i != right._i)
+            {
+                return left._i < right._i;
+            }
+
+            if (left._j != right._j)
+            {
+                return left._j < right._j;
+            }
+
+            if (left._k != right._k)
+            {
+                return left._k < right._k;
+            }
+
+            return false;
+        }
+
+        /// <inheritdoc cref="IComparisonOperators{TSelf, TOther, TResult}.op_LessThanOrEqual(TSelf, TOther)" />
+        public static bool operator <=(Guid left, Guid right)
+        {
+            if (left._a != right._a)
+            {
+                return (uint)left._a < (uint)right._a;
+            }
+
+            if (left._b != right._b)
+            {
+                return (uint)left._b < (uint)right._b;
+            }
+
+            if (left._c != right._c)
+            {
+                return (uint)left._c < (uint)right._c;
+            }
+
+            if (left._d != right._d)
+            {
+                return left._d < right._d;
+            }
+
+            if (left._e != right._e)
+            {
+                return left._e < right._e;
+            }
+
+            if (left._f != right._f)
+            {
+                return left._f < right._f;
+            }
+
+            if (left._g != right._g)
+            {
+                return left._g < right._g;
+            }
+
+            if (left._h != right._h)
+            {
+                return left._h < right._h;
+            }
+
+            if (left._i != right._i)
+            {
+                return left._i < right._i;
+            }
+
+            if (left._j != right._j)
+            {
+                return left._j < right._j;
+            }
+
+            if (left._k != right._k)
+            {
+                return left._k < right._k;
+            }
+
+            return true;
+        }
+
+        /// <inheritdoc cref="IComparisonOperators{TSelf, TOther, TResult}.op_GreaterThan(TSelf, TOther)" />
+        public static bool operator >(Guid left, Guid right)
+        {
+            if (left._a != right._a)
+            {
+                return (uint)left._a > (uint)right._a;
+            }
+
+            if (left._b != right._b)
+            {
+                return (uint)left._b > (uint)right._b;
+            }
+
+            if (left._c != right._c)
+            {
+                return (uint)left._c > (uint)right._c;
+            }
+
+            if (left._d != right._d)
+            {
+                return left._d > right._d;
+            }
+
+            if (left._e != right._e)
+            {
+                return left._e > right._e;
+            }
+
+            if (left._f != right._f)
+            {
+                return left._f > right._f;
+            }
+
+            if (left._g != right._g)
+            {
+                return left._g > right._g;
+            }
+
+            if (left._h != right._h)
+            {
+                return left._h > right._h;
+            }
+
+            if (left._i != right._i)
+            {
+                return left._i > right._i;
+            }
+
+            if (left._j != right._j)
+            {
+                return left._j > right._j;
+            }
+
+            if (left._k != right._k)
+            {
+                return left._k > right._k;
+            }
+
+            return false;
+        }
+
+        /// <inheritdoc cref="IComparisonOperators{TSelf, TOther, TResult}.op_GreaterThanOrEqual(TSelf, TOther)" />
+        public static bool operator >=(Guid left, Guid right)
+        {
+            if (left._a != right._a)
+            {
+                return (uint)left._a > (uint)right._a;
+            }
+
+            if (left._b != right._b)
+            {
+                return (uint)left._b > (uint)right._b;
+            }
+
+            if (left._c != right._c)
+            {
+                return (uint)left._c > (uint)right._c;
+            }
+
+            if (left._d != right._d)
+            {
+                return left._d > right._d;
+            }
+
+            if (left._e != right._e)
+            {
+                return left._e > right._e;
+            }
+
+            if (left._f != right._f)
+            {
+                return left._f > right._f;
+            }
+
+            if (left._g != right._g)
+            {
+                return left._g > right._g;
+            }
+
+            if (left._h != right._h)
+            {
+                return left._h > right._h;
+            }
+
+            if (left._i != right._i)
+            {
+                return left._i > right._i;
+            }
+
+            if (left._j != right._j)
+            {
+                return left._j > right._j;
+            }
+
+            if (left._k != right._k)
+            {
+                return left._k > right._k;
+            }
+
+            return true;
+        }
+
+        //
+        // IParsable
+        //
+
+        /// <inheritdoc cref="IParsable{TSelf}.Parse(string, IFormatProvider?)" />
+        public static Guid Parse(string s, IFormatProvider? provider) => Parse(s);
+
+        /// <inheritdoc cref="IParsable{TSelf}.TryParse(string?, IFormatProvider?, out TSelf)" />
+        public static bool TryParse([NotNullWhen(true)] string? s, IFormatProvider? provider, out Guid result) => TryParse(s, out result);
+
+        //
+        // ISpanParsable
+        //
+
+        /// <inheritdoc cref="ISpanParsable{TSelf}.Parse(ReadOnlySpan{char}, IFormatProvider?)" />
+        public static Guid Parse(ReadOnlySpan<char> s, IFormatProvider? provider) => Parse(s);
+
+        /// <inheritdoc cref="ISpanParsable{TSelf}.TryParse(ReadOnlySpan{char}, IFormatProvider?, out TSelf)" />
+        public static bool TryParse(ReadOnlySpan<char> s, IFormatProvider? provider, out Guid result) => TryParse(s, out result);
+
+        [DoesNotReturn]
+        private static void ThrowBadGuidFormatSpecification() =>
+            throw new FormatException(SR.Format_InvalidGuidFormatSpecification);
+
+        //
+        // IUtf8SpanParsable
+        //
+
+        /// <inheritdoc cref="IUtf8SpanParsable{TSelf}.Parse(ReadOnlySpan{byte}, IFormatProvider?)" />
+        public static Guid Parse(ReadOnlySpan<byte> utf8Text, IFormatProvider? provider) => Parse(utf8Text);
+
+        /// <inheritdoc cref="IUtf8SpanParsable{TSelf}.TryParse(ReadOnlySpan{byte}, IFormatProvider?, out TSelf)" />
+        public static bool TryParse(ReadOnlySpan<byte> utf8Text, IFormatProvider? provider, out Guid result) => TryParse(utf8Text, out result);
+    }
     public readonly ref struct Span<T>
     {
         internal readonly ref T _reference;
@@ -11521,6 +14280,18 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
     }
     public readonly ref struct ReadOnlySpan<T>
     {
+        /// <summary>
+        /// Casts a read-only span of <typeparamref name="TDerived"/> to a read-only span of <typeparamref name="T"/>.
+        /// </summary>
+        /// <typeparam name="TDerived">The element type of the source read-only span, which must be derived from <typeparamref name="T"/>.</typeparam>
+        /// <param name="items">The source read-only span. No copy is made.</param>
+        /// <returns>A read-only span with elements cast to the new type.</returns>
+        /// <remarks>This method uses a covariant cast, producing a read-only span that shares the same memory as the source. The relationships expressed in the type constraints ensure that the cast is a safe operation.</remarks>
+        public static ReadOnlySpan<T> CastUp<TDerived>(ReadOnlySpan<TDerived> items) where TDerived : class?, T
+        {
+            return new ReadOnlySpan<T>(ref Unsafe.As<TDerived, T>(ref MemoryMarshal.GetReference(items)), items.Length);
+        }
+
         /// <summary>A byref or a native ptr.</summary>
         internal readonly ref T _reference;
         /// <summary>The number of elements this ReadOnlySpan contains.</summary>
@@ -11784,19 +14555,762 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
             return $"System.ReadOnlySpan<{typeof(T).Name}>[{_length}]";
         }
     }
-    public readonly struct ReadOnlyMemory<T>
+    public readonly struct ArraySegment<T> : IList<T>, IReadOnlyList<T>
     {
-        internal readonly object _object;
+        public static ArraySegment<T> Empty { get; } = new ArraySegment<T>(new T[0]);
+
+        private readonly T[]? _array; // Do not rename (binary serialization)
+        private readonly int _offset; // Do not rename (binary serialization)
+        private readonly int _count; // Do not rename (binary serialization)
+
+        public ArraySegment(T[] array)
+        {
+            if (array == null)
+                ThrowHelper.ThrowArgumentNullException(ExceptionArgument.array);
+
+            _array = array;
+            _offset = 0;
+            _count = array.Length;
+        }
+
+        public ArraySegment(T[] array, int offset, int count)
+        {
+            // Validate arguments, check is minimal instructions with reduced branching for inlinable fast-path
+            // Negative values discovered though conversion to high values when converted to unsigned
+            // Failure should be rare and location determination and message is delegated to failure functions
+            if (array == null || (uint)offset > (uint)array.Length || (uint)count > (uint)(array.Length - offset))
+                ThrowHelper.ThrowArraySegmentCtorValidationFailedExceptions(array, offset, count);
+
+            _array = array;
+            _offset = offset;
+            _count = count;
+        }
+
+        public T[]? Array => _array;
+
+        public int Offset => _offset;
+
+        public int Count => _count;
+
+        public T this[int index]
+        {
+            get
+            {
+                if ((uint)index >= (uint)_count)
+                {
+                    ThrowHelper.ThrowArgumentOutOfRange_IndexMustBeLessException();
+                }
+
+                return _array![_offset + index];
+            }
+            set
+            {
+                if ((uint)index >= (uint)_count)
+                {
+                    ThrowHelper.ThrowArgumentOutOfRange_IndexMustBeLessException();
+                }
+
+                _array![_offset + index] = value;
+            }
+        }
+
+        public Enumerator GetEnumerator()
+        {
+            ThrowInvalidOperationIfDefault();
+            return new Enumerator(this);
+        }
+
+        public override int GetHashCode() =>
+            _array is null ? 0 : HashCode.Combine(_offset, _count, _array.GetHashCode());
+
+        public void CopyTo(T[] destination) => CopyTo(destination, 0);
+
+        public void CopyTo(T[] destination, int destinationIndex)
+        {
+            ThrowInvalidOperationIfDefault();
+            System.Array.Copy(_array!, _offset, destination, destinationIndex, _count);
+        }
+
+        public void CopyTo(ArraySegment<T> destination)
+        {
+            ThrowInvalidOperationIfDefault();
+            destination.ThrowInvalidOperationIfDefault();
+
+            if (_count > destination._count)
+            {
+                ThrowHelper.ThrowArgumentException_DestinationTooShort();
+            }
+
+            System.Array.Copy(_array!, _offset, destination._array!, destination._offset, _count);
+        }
+
+        public override bool Equals([NotNullWhen(true)] object? obj) =>
+            obj is ArraySegment<T> other && Equals(other);
+
+        public bool Equals(ArraySegment<T> obj) =>
+            obj._array == _array && obj._offset == _offset && obj._count == _count;
+
+        public ArraySegment<T> Slice(int index)
+        {
+            ThrowInvalidOperationIfDefault();
+
+            if ((uint)index > (uint)_count)
+            {
+                ThrowHelper.ThrowArgumentOutOfRange_IndexMustBeLessOrEqualException();
+            }
+
+            return new ArraySegment<T>(_array!, _offset + index, _count - index);
+        }
+
+        public ArraySegment<T> Slice(int index, int count)
+        {
+            ThrowInvalidOperationIfDefault();
+
+            if ((uint)index > (uint)_count || (uint)count > (uint)(_count - index))
+            {
+                ThrowHelper.ThrowArgumentOutOfRange_IndexMustBeLessOrEqualException();
+            }
+
+            return new ArraySegment<T>(_array!, _offset + index, count);
+        }
+
+        public T[] ToArray()
+        {
+            ThrowInvalidOperationIfDefault();
+
+            if (_count == 0)
+            {
+                return Empty._array!;
+            }
+
+            var array = new T[_count];
+            System.Array.Copy(_array!, _offset, array, 0, _count);
+            return array;
+        }
+
+        public static bool operator ==(ArraySegment<T> a, ArraySegment<T> b) => a.Equals(b);
+
+        public static bool operator !=(ArraySegment<T> a, ArraySegment<T> b) => !(a == b);
+
+        public static implicit operator ArraySegment<T>(T[] array) => array != null ? new ArraySegment<T>(array) : default;
+
+        #region IList<T>
+        T IList<T>.this[int index]
+        {
+            get
+            {
+                ThrowInvalidOperationIfDefault();
+                if (index < 0 || index >= _count)
+                    ThrowHelper.ThrowArgumentOutOfRange_IndexMustBeLessException();
+
+                return _array![_offset + index];
+            }
+
+            set
+            {
+                ThrowInvalidOperationIfDefault();
+                if (index < 0 || index >= _count)
+                    ThrowHelper.ThrowArgumentOutOfRange_IndexMustBeLessException();
+
+                _array![_offset + index] = value;
+            }
+        }
+
+        int IList<T>.IndexOf(T item)
+        {
+            ThrowInvalidOperationIfDefault();
+
+            int index = System.Array.IndexOf(_array!, item, _offset, _count);
+
+            return index >= 0 ? index - _offset : -1;
+        }
+
+        void IList<T>.Insert(int index, T item) => ThrowHelper.ThrowNotSupportedException();
+
+        void IList<T>.RemoveAt(int index) => ThrowHelper.ThrowNotSupportedException();
+        #endregion
+
+        #region IReadOnlyList<T>
+        T IReadOnlyList<T>.this[int index]
+        {
+            get
+            {
+                ThrowInvalidOperationIfDefault();
+                if (index < 0 || index >= _count)
+                    ThrowHelper.ThrowArgumentOutOfRange_IndexMustBeLessException();
+
+                return _array![_offset + index];
+            }
+        }
+        #endregion IReadOnlyList<T>
+
+        #region ICollection<T>
+        bool ICollection<T>.IsReadOnly =>
+            // the indexer setter does not throw an exception although IsReadOnly is true.
+            // This is to match the behavior of arrays.
+            true;
+
+        void ICollection<T>.Add(T item) => ThrowHelper.ThrowNotSupportedException();
+
+        void ICollection<T>.Clear() => ThrowHelper.ThrowNotSupportedException();
+
+        bool ICollection<T>.Contains(T item)
+        {
+            ThrowInvalidOperationIfDefault();
+
+            int index = System.Array.IndexOf(_array!, item, _offset, _count);
+
+            return index >= 0;
+        }
+
+        bool ICollection<T>.Remove(T item)
+        {
+            ThrowHelper.ThrowNotSupportedException();
+            return default;
+        }
+        #endregion
+
+        #region IEnumerable<T>
+
+        IEnumerator<T> IEnumerable<T>.GetEnumerator()
+        {
+            ThrowInvalidOperationIfDefault();
+            return
+                Count == 0 ? SZGenericArrayEnumerator<T>.Empty :
+                new Enumerator(this);
+        }
+        #endregion
+
+        #region IEnumerable
+
+        IEnumerator IEnumerable.GetEnumerator() => ((IEnumerable<T>)this).GetEnumerator();
+        #endregion
+
+        private void ThrowInvalidOperationIfDefault()
+        {
+            if (_array == null)
+            {
+                ThrowHelper.ThrowInvalidOperationException(ExceptionResource.InvalidOperation_NullArray);
+            }
+        }
+
+        public struct Enumerator : IEnumerator<T>
+        {
+            private readonly T[]? _array;
+            private readonly int _start;
+            private readonly int _end; // cache Offset + Count, since it's a little slow
+            private int _current;
+
+            internal Enumerator(ArraySegment<T> arraySegment)
+            {
+                _array = arraySegment.Array;
+                _start = arraySegment.Offset;
+                _end = arraySegment.Offset + arraySegment.Count;
+                _current = arraySegment.Offset - 1;
+            }
+
+            public bool MoveNext()
+            {
+                if (_current < _end)
+                {
+                    _current++;
+                    return _current < _end;
+                }
+                return false;
+            }
+
+            public T Current
+            {
+                get
+                {
+                    if (_current < _start)
+                        ThrowHelper.ThrowInvalidOperationException_InvalidOperation_EnumNotStarted();
+                    if (_current >= _end)
+                        ThrowHelper.ThrowInvalidOperationException_InvalidOperation_EnumEnded();
+                    return _array![_current];
+                }
+            }
+
+            object? IEnumerator.Current => Current;
+
+            void IEnumerator.Reset()
+            {
+                _current = _start - 1;
+            }
+
+            public void Dispose()
+            {
+            }
+        }
+    }
+    public readonly struct Memory<T> : IEquatable<Memory<T>>
+    {
+        // The highest order bit of _index is used to discern whether _object is a pre-pinned array.
+        // (_index < 0) => _object is a pre-pinned array, so Pin() will not allocate a new GCHandle
+        //       (else) => Pin() needs to allocate a new GCHandle to pin the object.
+        private readonly object? _object;
+        private readonly int _index;
+        private readonly int _length;
+
+        /// <summary>
+        /// Creates a new memory over the entirety of the target array.
+        /// </summary>
+        /// <param name="array">The target array.</param>
+        /// <remarks>Returns default when <paramref name="array"/> is null.</remarks>
+        /// <exception cref="ArrayTypeMismatchException">Thrown when <paramref name="array"/> is covariant and array's type is not exactly T[].</exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Memory(T[]? array)
+        {
+            if (array == null)
+            {
+                this = default;
+                return; // returns default
+            }
+            if (!typeof(T).IsValueType && array.GetType() != typeof(T[]))
+                ThrowHelper.ThrowArrayTypeMismatchException();
+
+            _object = array;
+            _index = 0;
+            _length = array.Length;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Memory(T[]? array, int start)
+        {
+            if (array == null)
+            {
+                if (start != 0)
+                    ThrowHelper.ThrowArgumentOutOfRangeException();
+                this = default;
+                return; // returns default
+            }
+            if (!typeof(T).IsValueType && array.GetType() != typeof(T[]))
+                ThrowHelper.ThrowArrayTypeMismatchException();
+            if ((uint)start > (uint)array.Length)
+                ThrowHelper.ThrowArgumentOutOfRangeException();
+
+            _object = array;
+            _index = start;
+            _length = array.Length - start;
+        }
+
+        /// <summary>
+        /// Creates a new memory over the portion of the target array beginning
+        /// at 'start' index and ending at 'end' index (exclusive).
+        /// </summary>
+        /// <param name="array">The target array.</param>
+        /// <param name="start">The index at which to begin the memory.</param>
+        /// <param name="length">The number of items in the memory.</param>
+        /// <remarks>Returns default when <paramref name="array"/> is null.</remarks>
+        /// <exception cref="ArrayTypeMismatchException">Thrown when <paramref name="array"/> is covariant and array's type is not exactly T[].</exception>
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// Thrown when the specified <paramref name="start"/> or end index is not in the range (&lt;0 or &gt;Length).
+        /// </exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Memory(T[]? array, int start, int length)
+        {
+            if (array == null)
+            {
+                if (start != 0 || length != 0)
+                    ThrowHelper.ThrowArgumentOutOfRangeException();
+                this = default;
+                return; // returns default
+            }
+            if (!typeof(T).IsValueType && array.GetType() != typeof(T[]))
+                ThrowHelper.ThrowArrayTypeMismatchException();
+#if TARGET_64BIT
+            // See comment in Span<T>.Slice for how this works.
+            if ((ulong)(uint)start + (ulong)(uint)length > (ulong)(uint)array.Length)
+                ThrowHelper.ThrowArgumentOutOfRangeException();
+#else
+            if ((uint)start > (uint)array.Length || (uint)length > (uint)(array.Length - start))
+                ThrowHelper.ThrowArgumentOutOfRangeException();
+#endif
+
+            _object = array;
+            _index = start;
+            _length = length;
+        }
+
+        /// <summary>
+        /// Creates a new memory from a memory manager that provides specific method implementations beginning
+        /// at 0 index and ending at 'end' index (exclusive).
+        /// </summary>
+        /// <param name="manager">The memory manager.</param>
+        /// <param name="length">The number of items in the memory.</param>
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// Thrown when the specified <paramref name="length"/> is negative.
+        /// </exception>
+        /// <remarks>For internal infrastructure only</remarks>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Memory(MemoryManager<T> manager, int length)
+        {
+            if (length < 0)
+                ThrowHelper.ThrowArgumentOutOfRangeException();
+
+            _object = manager;
+            _index = 0;
+            _length = length;
+        }
+
+        /// <summary>
+        /// Creates a new memory from a memory manager that provides specific method implementations beginning
+        /// at 'start' index and ending at 'end' index (exclusive).
+        /// </summary>
+        /// <param name="manager">The memory manager.</param>
+        /// <param name="start">The index at which to begin the memory.</param>
+        /// <param name="length">The number of items in the memory.</param>
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// Thrown when the specified <paramref name="start"/> or <paramref name="length"/> is negative.
+        /// </exception>
+        /// <remarks>For internal infrastructure only</remarks>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Memory(MemoryManager<T> manager, int start, int length)
+        {
+            if (length < 0 || start < 0)
+                ThrowHelper.ThrowArgumentOutOfRangeException();
+
+            _object = manager;
+            _index = start;
+            _length = length;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Memory(object? obj, int start, int length)
+        {
+            _object = obj;
+            _index = start;
+            _length = length;
+        }
+
+        /// <summary>
+        /// Defines an implicit conversion of an array to a <see cref="Memory{T}"/>
+        /// </summary>
+        public static implicit operator Memory<T>(T[]? array) => new Memory<T>(array);
+
+        /// <summary>
+        /// Defines an implicit conversion of a <see cref="ArraySegment{T}"/> to a <see cref="Memory{T}"/>
+        /// </summary>
+        public static implicit operator Memory<T>(ArraySegment<T> segment) => new Memory<T>(segment.Array, segment.Offset, segment.Count);
+
+        /// <summary>
+        /// Defines an implicit conversion of a <see cref="Memory{T}"/> to a <see cref="ReadOnlyMemory{T}"/>
+        /// </summary>
+        public static implicit operator ReadOnlyMemory<T>(Memory<T> memory) =>
+            new ReadOnlyMemory<T>(memory._object, memory._index, memory._length);
+
+        /// <summary>
+        /// Returns an empty <see cref="Memory{T}"/>
+        /// </summary>
+        public static Memory<T> Empty => default;
+
+        /// <summary>
+        /// The number of items in the memory.
+        /// </summary>
+        public int Length => _length;
+
+        /// <summary>
+        /// Returns true if Length is 0.
+        /// </summary>
+        public bool IsEmpty => _length == 0;
+
+        /// <summary>
+        /// For <see cref="Memory{Char}"/>, returns a new instance of string that represents the characters pointed to by the memory.
+        /// Otherwise, returns a <see cref="string"/> with the name of the type and the number of elements.
+        /// </summary>
+        public override string ToString()
+        {
+            if (typeof(T) == typeof(char))
+            {
+                return (_object is string str) ? str.Substring(_index, _length) : Span.ToString();
+            }
+            return $"System.Memory<{typeof(T).Name}>[{_length}]";
+        }
+
+        /// <summary>
+        /// Forms a slice out of the given memory, beginning at 'start'.
+        /// </summary>
+        /// <param name="start">The index at which to begin this slice.</param>
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// Thrown when the specified <paramref name="start"/> index is not in range (&lt;0 or &gt;Length).
+        /// </exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Memory<T> Slice(int start)
+        {
+            if ((uint)start > (uint)_length)
+            {
+                ThrowHelper.ThrowArgumentOutOfRangeException(ExceptionArgument.start);
+            }
+
+            // It is expected for _index + start to be negative if the memory is already pre-pinned.
+            return new Memory<T>(_object, _index + start, _length - start);
+        }
+
+        /// <summary>
+        /// Forms a slice out of the given memory, beginning at 'start', of given length
+        /// </summary>
+        /// <param name="start">The index at which to begin this slice.</param>
+        /// <param name="length">The desired length for the slice (exclusive).</param>
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// Thrown when the specified <paramref name="start"/> or end index is not in range (&lt;0 or &gt;Length).
+        /// </exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Memory<T> Slice(int start, int length)
+        {
+#if TARGET_64BIT
+            // See comment in Span<T>.Slice for how this works.
+            if ((ulong)(uint)start + (ulong)(uint)length > (ulong)(uint)_length)
+                ThrowHelper.ThrowArgumentOutOfRangeException();
+#else
+            if ((uint)start > (uint)_length || (uint)length > (uint)(_length - start))
+                ThrowHelper.ThrowArgumentOutOfRangeException();
+#endif
+
+            // It is expected for _index + start to be negative if the memory is already pre-pinned.
+            return new Memory<T>(_object, _index + start, length);
+        }
+
+        /// <summary>
+        /// Returns a span from the memory.
+        /// </summary>
+        public Span<T> Span
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get
+            {
+                // This property getter has special support for returning a mutable Span<char> that wraps
+                // an immutable String instance. This is obviously a dangerous feature and breaks type safety.
+                // However, we need to handle the case where a ReadOnlyMemory<char> was created from a string
+                // and then cast to a Memory<T>. Such a cast can only be done with unsafe or marshaling code,
+                // in which case that's the dangerous operation performed by the dev, and we're just following
+                // suit here to make it work as best as possible.
+
+                ref T refToReturn = ref Unsafe.NullRef<T>();
+                int lengthOfUnderlyingSpan = 0;
+
+                // Copy this field into a local so that it can't change out from under us mid-operation.
+
+                object? tmpObject = _object;
+                if (tmpObject != null)
+                {
+                    if (typeof(T) == typeof(char) && tmpObject.GetType() == typeof(string))
+                    {
+                        // Special-case string since it's the most common for ROM<char>.
+
+                        refToReturn = ref Unsafe.As<char, T>(ref ((string)tmpObject).GetRawStringData());
+                        lengthOfUnderlyingSpan = Unsafe.As<string>(tmpObject).Length;
+                    }
+                    else if (RuntimeHelpers.ObjectHasComponentSize(tmpObject))
+                    {
+                        // We know the object is not null, it's not a string, and it is variable-length. The only
+                        // remaining option is for it to be a T[] (or a U[] which is blittable to T[], like int[]
+                        // and uint[]). As a special case of this, ROM<T> allows some amount of array variance
+                        // that Memory<T> disallows. For example, an array of actual type string[] cannot be turned
+                        // into a Memory<object> or a Span<object>, but it can be turned into a ROM/ROS<object>.
+                        // We'll assume these checks succeeded because they're performed during Memory<T> construction.
+                        // It's always possible for somebody to use private reflection to bypass these checks, but
+                        // preventing type safety violations due to misuse of reflection is out of scope of this logic.
+
+
+                        refToReturn = ref MemoryMarshal.GetArrayDataReference(Unsafe.As<T[]>(tmpObject));
+                        lengthOfUnderlyingSpan = Unsafe.As<T[]>(tmpObject).Length;
+                    }
+                    else
+                    {
+                        // We know the object is not null, and it's not variable-length, so it must be a MemoryManager<T>.
+                        // Otherwise somebody used private reflection to set this field, and we're not too worried about
+                        // type safety violations at that point. Note that it can't be a MemoryManager<U>, even if U and
+                        // T are blittable (e.g., MemoryManager<int> to MemoryManager<uint>), since there exists no
+                        // constructor or other public API which would allow such a conversion.
+
+                        Span<T> memoryManagerSpan = Unsafe.As<MemoryManager<T>>(tmpObject).GetSpan();
+                        refToReturn = ref MemoryMarshal.GetReference(memoryManagerSpan);
+                        lengthOfUnderlyingSpan = memoryManagerSpan.Length;
+                    }
+
+                    // If the Memory<T> or ReadOnlyMemory<T> instance is torn, this property getter has undefined behavior.
+                    // We try to detect this condition and throw an exception, but it's possible that a torn struct might
+                    // appear to us to be valid, and we'll return an undesired span. Such a span is always guaranteed at
+                    // least to be in-bounds when compared with the original Memory<T> instance, so using the span won't
+                    // AV the process.
+
+                    // We use 'nuint' because it gives us a free early zero-extension to 64 bits when running on a 64-bit platform.
+                    nuint desiredStartIndex = (uint)_index & (uint)ReadOnlyMemory<T>.RemoveFlagsBitMask;
+
+                    int desiredLength = _length;
+
+#if TARGET_64BIT
+                    // See comment in Span<T>.Slice for how this works.
+                    if ((ulong)desiredStartIndex + (ulong)(uint)desiredLength > (ulong)(uint)lengthOfUnderlyingSpan)
+                    {
+                        ThrowHelper.ThrowArgumentOutOfRangeException();
+                    }
+#else
+                    if ((uint)desiredStartIndex > (uint)lengthOfUnderlyingSpan || (uint)desiredLength > (uint)lengthOfUnderlyingSpan - (uint)desiredStartIndex)
+                    {
+                        ThrowHelper.ThrowArgumentOutOfRangeException();
+                    }
+#endif
+
+                    refToReturn = ref Unsafe.Add(ref refToReturn, desiredStartIndex);
+                    lengthOfUnderlyingSpan = desiredLength;
+                }
+
+                return new Span<T>(ref refToReturn, lengthOfUnderlyingSpan);
+            }
+        }
+
+        /// <summary>
+        /// Copies the contents of the memory into the destination. If the source
+        /// and destination overlap, this method behaves as if the original values are in
+        /// a temporary location before the destination is overwritten.
+        /// </summary>
+        /// <param name="destination">The Memory to copy items into.</param>
+        /// <exception cref="ArgumentException">
+        /// Thrown when the destination is shorter than the source.
+        /// </exception>
+        public void CopyTo(Memory<T> destination) => Span.CopyTo(destination.Span);
+
+        /// <summary>
+        /// Copies the contents of the memory into the destination. If the source
+        /// and destination overlap, this method behaves as if the original values are in
+        /// a temporary location before the destination is overwritten.
+        /// </summary>
+        /// <returns>If the destination is shorter than the source, this method
+        /// return false and no data is written to the destination.</returns>
+        /// <param name="destination">The span to copy items into.</param>
+        public bool TryCopyTo(Memory<T> destination) => Span.TryCopyTo(destination.Span);
+
+        /// <summary>
+        /// Creates a handle for the memory.
+        /// The GC will not move the memory until the returned <see cref="MemoryHandle"/>
+        /// is disposed, enabling taking and using the memory's address.
+        /// </summary>
+        /// <exception cref="ArgumentException">
+        /// An instance with nonprimitive (non-blittable) members cannot be pinned.
+        /// </exception>
+        public unsafe MemoryHandle Pin()
+        {
+            // Just like the Span property getter, we have special support for a mutable Memory<char>
+            // that wraps an immutable String instance. This might happen if a caller creates an
+            // immutable ROM<char> wrapping a String, then uses Unsafe.As to create a mutable M<char>.
+            // This needs to work, however, so that code that uses a single Memory<char> field to store either
+            // a readable ReadOnlyMemory<char> or a writable Memory<char> can still be pinned and
+            // used for interop purposes.
+
+            // It's possible that the below logic could result in an AV if the struct
+            // is torn. This is ok since the caller is expecting to use raw pointers,
+            // and we're not required to keep this as safe as the other Span-based APIs.
+
+            object? tmpObject = _object;
+            if (tmpObject != null)
+            {
+                if (typeof(T) == typeof(char) && tmpObject is string s)
+                {
+                    // Unsafe.AsPointer is safe since the handle pins it
+                    GCHandle handle = GCHandle.Alloc(tmpObject, GCHandleType.Pinned);
+                    ref char stringData = ref Unsafe.Add(ref s.GetRawStringData(), _index);
+                    return new MemoryHandle(Unsafe.AsPointer(ref stringData), handle);
+                }
+                else if (RuntimeHelpers.ObjectHasComponentSize(tmpObject))
+                {
+                    // Array is already pre-pinned
+                    if (_index < 0)
+                    {
+                        // Unsafe.AsPointer is safe since it's pinned
+                        void* pointer = Unsafe.Add<T>(Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(Unsafe.As<T[]>(tmpObject))), _index & ReadOnlyMemory<T>.RemoveFlagsBitMask);
+                        return new MemoryHandle(pointer);
+                    }
+                    else
+                    {
+                        // Unsafe.AsPointer is safe since the handle pins it
+                        GCHandle handle = GCHandle.Alloc(tmpObject, GCHandleType.Pinned);
+                        void* pointer = Unsafe.Add<T>(Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(Unsafe.As<T[]>(tmpObject))), _index);
+                        return new MemoryHandle(pointer, handle);
+                    }
+                }
+                else
+                {
+                    return Unsafe.As<MemoryManager<T>>(tmpObject).Pin(_index);
+                }
+            }
+
+            return default;
+        }
+
+        /// <summary>
+        /// Copies the contents from the memory into a new array.  This heap
+        /// allocates, so should generally be avoided, however it is sometimes
+        /// necessary to bridge the gap with APIs written in terms of arrays.
+        /// </summary>
+        public T[] ToArray() => Span.ToArray();
+
+        /// <summary>
+        /// Determines whether the specified object is equal to the current object.
+        /// Returns true if the object is Memory or ReadOnlyMemory and if both objects point to the same array and have the same length.
+        /// </summary>
+        public override bool Equals([NotNullWhen(true)] object? obj)
+        {
+            if (obj is ReadOnlyMemory<T>)
+            {
+                return ((ReadOnlyMemory<T>)obj).Equals(this);
+            }
+            else if (obj is Memory<T> memory)
+            {
+                return Equals(memory);
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Returns true if the memory points to the same array and has the same length.  Note that
+        /// this does *not* check to see if the *contents* are equal.
+        /// </summary>
+        public bool Equals(Memory<T> other)
+        {
+            return
+                _object == other._object &&
+                _index == other._index &&
+                _length == other._length;
+        }
+
+        /// <summary>
+        /// Serves as the default hash function.
+        /// </summary>
+        public override int GetHashCode()
+        {
+            // We use RuntimeHelpers.GetHashCode instead of Object.GetHashCode because the hash
+            // code is based on object identity and referential equality, not deep equality (as common with string).
+            return (_object != null) ? HashCode.Combine(RuntimeHelpers.GetHashCode(_object), _index, _length) : 0;
+        }
+    }
+
+    public readonly struct ReadOnlyMemory<T> : IEquatable<ReadOnlyMemory<T>>
+    {
+        // The highest order bit of _index is used to discern whether _object is a pre-pinned array.
+        // (_index < 0) => _object is a pre-pinned array, so Pin() will not allocate a new GCHandle
+        //       (else) => Pin() needs to allocate a new GCHandle to pin the object.
+        internal readonly object? _object;
         internal readonly int _index;
         internal readonly int _length;
 
         internal const int RemoveFlagsBitMask = 0x7FFFFFFF;
 
-        public ReadOnlyMemory(T[] array)
+        /// <summary>
+        /// Creates a new memory over the entirety of the target array.
+        /// </summary>
+        /// <param name="array">The target array.</param>
+        /// <remarks>Returns default when <paramref name="array"/> is null.</remarks>
+        /// <exception cref="ArrayTypeMismatchException">Thrown when <paramref name="array"/> is covariant and array's type is not exactly T[].</exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public ReadOnlyMemory(T[]? array)
         {
             if (array == null)
             {
-                //this = default;
+                this = default;
                 return; // returns default
             }
 
@@ -11804,11 +15318,343 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
             _index = 0;
             _length = array.Length;
         }
-        internal ReadOnlyMemory(object obj, int start, int length)
+
+        /// <summary>
+        /// Creates a new memory over the portion of the target array beginning
+        /// at 'start' index and ending at 'end' index (exclusive).
+        /// </summary>
+        /// <param name="array">The target array.</param>
+        /// <param name="start">The index at which to begin the memory.</param>
+        /// <param name="length">The number of items in the memory.</param>
+        /// <remarks>Returns default when <paramref name="array"/> is null.</remarks>
+        /// <exception cref="ArrayTypeMismatchException">Thrown when <paramref name="array"/> is covariant and array's type is not exactly T[].</exception>
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// Thrown when the specified <paramref name="start"/> or end index is not in the range (&lt;0 or &gt;Length).
+        /// </exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public ReadOnlyMemory(T[]? array, int start, int length)
+        {
+            if (array == null)
+            {
+                if (start != 0 || length != 0)
+                    ThrowHelper.ThrowArgumentOutOfRangeException();
+                this = default;
+                return; // returns default
+            }
+#if TARGET_64BIT
+            // See comment in Span<T>.Slice for how this works.
+            if ((ulong)(uint)start + (ulong)(uint)length > (ulong)(uint)array.Length)
+                ThrowHelper.ThrowArgumentOutOfRangeException();
+#else
+            if ((uint)start > (uint)array.Length || (uint)length > (uint)(array.Length - start))
+                ThrowHelper.ThrowArgumentOutOfRangeException();
+#endif
+
+            _object = array;
+            _index = start;
+            _length = length;
+        }
+
+        /// <summary>Creates a new memory over the existing object, start, and length. No validation is performed.</summary>
+        /// <param name="obj">The target object.</param>
+        /// <param name="start">The index at which to begin the memory.</param>
+        /// <param name="length">The number of items in the memory.</param>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal ReadOnlyMemory(object? obj, int start, int length)
         {
             _object = obj;
             _index = start;
             _length = length;
+        }
+
+        /// <summary>
+        /// Defines an implicit conversion of an array to a <see cref="ReadOnlyMemory{T}"/>
+        /// </summary>
+        public static implicit operator ReadOnlyMemory<T>(T[]? array) => new ReadOnlyMemory<T>(array);
+
+        /// <summary>
+        /// Defines an implicit conversion of a <see cref="ArraySegment{T}"/> to a <see cref="ReadOnlyMemory{T}"/>
+        /// </summary>
+        public static implicit operator ReadOnlyMemory<T>(ArraySegment<T> segment) => new ReadOnlyMemory<T>(segment.Array, segment.Offset, segment.Count);
+
+        /// <summary>
+        /// Returns an empty <see cref="ReadOnlyMemory{T}"/>
+        /// </summary>
+        public static ReadOnlyMemory<T> Empty => default;
+
+        /// <summary>
+        /// The number of items in the memory.
+        /// </summary>
+        public int Length => _length;
+
+        /// <summary>
+        /// Returns true if Length is 0.
+        /// </summary>
+        public bool IsEmpty => _length == 0;
+
+        /// <summary>
+        /// For <see cref="ReadOnlyMemory{Char}"/>, returns a new instance of string that represents the characters pointed to by the memory.
+        /// Otherwise, returns a <see cref="string"/> with the name of the type and the number of elements.
+        /// </summary>
+        public override string ToString()
+        {
+            if (typeof(T) == typeof(char))
+            {
+                return (_object is string str) ? str.Substring(_index, _length) : Span.ToString();
+            }
+            return $"System.ReadOnlyMemory<{typeof(T).Name}>[{_length}]";
+        }
+
+        /// <summary>
+        /// Forms a slice out of the given memory, beginning at 'start'.
+        /// </summary>
+        /// <param name="start">The index at which to begin this slice.</param>
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// Thrown when the specified <paramref name="start"/> index is not in range (&lt;0 or &gt;Length).
+        /// </exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public ReadOnlyMemory<T> Slice(int start)
+        {
+            if ((uint)start > (uint)_length)
+            {
+                ThrowHelper.ThrowArgumentOutOfRangeException(ExceptionArgument.start);
+            }
+
+            // It is expected for _index + start to be negative if the memory is already pre-pinned.
+            return new ReadOnlyMemory<T>(_object, _index + start, _length - start);
+        }
+
+        /// <summary>
+        /// Forms a slice out of the given memory, beginning at 'start', of given length
+        /// </summary>
+        /// <param name="start">The index at which to begin this slice.</param>
+        /// <param name="length">The desired length for the slice (exclusive).</param>
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// Thrown when the specified <paramref name="start"/> or end index is not in range (&lt;0 or &gt;Length).
+        /// </exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public ReadOnlyMemory<T> Slice(int start, int length)
+        {
+#if TARGET_64BIT
+            // See comment in Span<T>.Slice for how this works.
+            if ((ulong)(uint)start + (ulong)(uint)length > (ulong)(uint)_length)
+                ThrowHelper.ThrowArgumentOutOfRangeException(ExceptionArgument.start);
+#else
+            if ((uint)start > (uint)_length || (uint)length > (uint)(_length - start))
+                ThrowHelper.ThrowArgumentOutOfRangeException(ExceptionArgument.start);
+#endif
+
+            // It is expected for _index + start to be negative if the memory is already pre-pinned.
+            return new ReadOnlyMemory<T>(_object, _index + start, length);
+        }
+
+        /// <summary>
+        /// Returns a span from the memory.
+        /// </summary>
+        public ReadOnlySpan<T> Span
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get
+            {
+                ref T refToReturn = ref Unsafe.NullRef<T>();
+                int lengthOfUnderlyingSpan = 0;
+
+                // Copy this field into a local so that it can't change out from under us mid-operation.
+
+                object? tmpObject = _object;
+                if (tmpObject != null)
+                {
+                    if (typeof(T) == typeof(char) && tmpObject.GetType() == typeof(string))
+                    {
+                        // Special-case string since it's the most common for ROM<char>.
+
+                        refToReturn = ref Unsafe.As<char, T>(ref ((string)tmpObject).GetRawStringData());
+                        lengthOfUnderlyingSpan = Unsafe.As<string>(tmpObject).Length;
+                    }
+                    else if (RuntimeHelpers.ObjectHasComponentSize(tmpObject))
+                    {
+                        // We know the object is not null, it's not a string, and it is variable-length. The only
+                        // remaining option is for it to be a T[] (or a U[] which is blittable to T[], like int[]
+                        // and uint[]). As a special case of this, ROM<T> allows some amount of array variance
+                        // that Memory<T> disallows. For example, an array of actual type string[] cannot be turned
+                        // into a Memory<object> or a Span<object>, but it can be turned into a ROM/ROS<object>.
+                        // We'll assume these checks succeeded because they're performed during Memory<T> construction.
+                        // It's always possible for somebody to use private reflection to bypass these checks, but
+                        // preventing type safety violations due to misuse of reflection is out of scope of this logic.
+
+                        refToReturn = ref MemoryMarshal.GetArrayDataReference(Unsafe.As<T[]>(tmpObject));
+                        lengthOfUnderlyingSpan = Unsafe.As<T[]>(tmpObject).Length;
+                    }
+                    else
+                    {
+                        // We know the object is not null, and it's not variable-length, so it must be a MemoryManager<T>.
+                        // Otherwise somebody used private reflection to set this field, and we're not too worried about
+                        // type safety violations at that point. Note that it can't be a MemoryManager<U>, even if U and
+                        // T are blittable (e.g., MemoryManager<int> to MemoryManager<uint>), since there exists no
+                        // constructor or other public API which would allow such a conversion.
+
+                        Span<T> memoryManagerSpan = Unsafe.As<MemoryManager<T>>(tmpObject).GetSpan();
+                        refToReturn = ref MemoryMarshal.GetReference(memoryManagerSpan);
+                        lengthOfUnderlyingSpan = memoryManagerSpan.Length;
+                    }
+
+                    // If the Memory<T> or ReadOnlyMemory<T> instance is torn, this property getter has undefined behavior.
+                    // We try to detect this condition and throw an exception, but it's possible that a torn struct might
+                    // appear to us to be valid, and we'll return an undesired span. Such a span is always guaranteed at
+                    // least to be in-bounds when compared with the original Memory<T> instance, so using the span won't
+                    // AV the process.
+
+                    // We use 'nuint' because it gives us a free early zero-extension to 64 bits when running on a 64-bit platform.
+                    nuint desiredStartIndex = (uint)_index & (uint)RemoveFlagsBitMask;
+
+                    int desiredLength = _length;
+
+#if TARGET_64BIT
+                    // See comment in Span<T>.Slice for how this works.
+                    if ((ulong)desiredStartIndex + (ulong)(uint)desiredLength > (ulong)(uint)lengthOfUnderlyingSpan)
+                    {
+                        ThrowHelper.ThrowArgumentOutOfRangeException();
+                    }
+#else
+                    if ((uint)desiredStartIndex > (uint)lengthOfUnderlyingSpan || (uint)desiredLength > (uint)lengthOfUnderlyingSpan - (uint)desiredStartIndex)
+                    {
+                        ThrowHelper.ThrowArgumentOutOfRangeException();
+                    }
+#endif
+
+                    refToReturn = ref Unsafe.Add(ref refToReturn, desiredStartIndex);
+                    lengthOfUnderlyingSpan = desiredLength;
+                }
+
+                return new ReadOnlySpan<T>(ref refToReturn, lengthOfUnderlyingSpan);
+            }
+        }
+
+        /// <summary>
+        /// Copies the contents of the read-only memory into the destination. If the source
+        /// and destination overlap, this method behaves as if the original values are in
+        /// a temporary location before the destination is overwritten.
+        /// </summary>
+        /// <param name="destination">The Memory to copy items into.</param>
+        /// <exception cref="ArgumentException">
+        /// Thrown when the destination is shorter than the source.
+        /// </exception>
+        public void CopyTo(Memory<T> destination) => Span.CopyTo(destination.Span);
+
+        /// <summary>
+        /// Copies the contents of the readonly-only memory into the destination. If the source
+        /// and destination overlap, this method behaves as if the original values are in
+        /// a temporary location before the destination is overwritten.
+        /// </summary>
+        /// <returns>If the destination is shorter than the source, this method
+        /// return false and no data is written to the destination.</returns>
+        /// <param name="destination">The span to copy items into.</param>
+        public bool TryCopyTo(Memory<T> destination) => Span.TryCopyTo(destination.Span);
+
+        /// <summary>
+        /// Creates a handle for the memory.
+        /// The GC will not move the memory until the returned <see cref="MemoryHandle"/>
+        /// is disposed, enabling taking and using the memory's address.
+        /// </summary>
+        /// <exception cref="ArgumentException">
+        /// An instance with nonprimitive (non-blittable) members cannot be pinned.
+        /// </exception>
+        public unsafe MemoryHandle Pin()
+        {
+            // It's possible that the below logic could result in an AV if the struct
+            // is torn. This is ok since the caller is expecting to use raw pointers,
+            // and we're not required to keep this as safe as the other Span-based APIs.
+
+            object? tmpObject = _object;
+            if (tmpObject != null)
+            {
+                if (typeof(T) == typeof(char) && tmpObject is string s)
+                {
+                    // Unsafe.AsPointer is safe since the handle pins it
+                    GCHandle handle = GCHandle.Alloc(tmpObject, GCHandleType.Pinned);
+                    ref char stringData = ref Unsafe.Add(ref s.GetRawStringData(), _index);
+                    return new MemoryHandle(Unsafe.AsPointer(ref stringData), handle);
+                }
+                else if (RuntimeHelpers.ObjectHasComponentSize(tmpObject))
+                {
+                    // Array is already pre-pinned
+                    if (_index < 0)
+                    {
+                        // Unsafe.AsPointer is safe since it's pinned
+                        void* pointer = Unsafe.Add<T>(Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(Unsafe.As<T[]>(tmpObject))), _index & RemoveFlagsBitMask);
+                        return new MemoryHandle(pointer);
+                    }
+                    else
+                    {
+                        // Unsafe.AsPointer is safe since the handle pins it
+                        GCHandle handle = GCHandle.Alloc(tmpObject, GCHandleType.Pinned);
+                        void* pointer = Unsafe.Add<T>(Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(Unsafe.As<T[]>(tmpObject))), _index);
+                        return new MemoryHandle(pointer, handle);
+                    }
+                }
+                else
+                {
+                    return Unsafe.As<MemoryManager<T>>(tmpObject).Pin(_index);
+                }
+            }
+
+            return default;
+        }
+
+        /// <summary>
+        /// Copies the contents from the memory into a new array.  This heap
+        /// allocates, so should generally be avoided, however it is sometimes
+        /// necessary to bridge the gap with APIs written in terms of arrays.
+        /// </summary>
+        public T[] ToArray() => Span.ToArray();
+
+        /// <summary>Determines whether the specified object is equal to the current object.</summary>
+        public override bool Equals([NotNullWhen(true)] object? obj)
+        {
+            if (obj is ReadOnlyMemory<T> readOnlyMemory)
+            {
+                return Equals(readOnlyMemory);
+            }
+            else if (obj is Memory<T> memory)
+            {
+                return Equals(memory);
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Returns true if the memory points to the same array and has the same length.  Note that
+        /// this does *not* check to see if the *contents* are equal.
+        /// </summary>
+        public bool Equals(ReadOnlyMemory<T> other)
+        {
+            return
+                _object == other._object &&
+                _index == other._index &&
+                _length == other._length;
+        }
+
+        /// <summary>Returns the hash code for this <see cref="ReadOnlyMemory{T}"/></summary>
+        public override int GetHashCode()
+        {
+            // We use RuntimeHelpers.GetHashCode instead of Object.GetHashCode because the hash
+            // code is based on object identity and referential equality, not deep equality (as common with string).
+            return (_object != null) ? HashCode.Combine(RuntimeHelpers.GetHashCode(_object), _index, _length) : 0;
+        }
+
+        /// <summary>Gets the state of the memory as individual fields.</summary>
+        /// <param name="start">The offset.</param>
+        /// <param name="length">The count.</param>
+        /// <returns>The object.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal object? GetObjectStartLength(out int start, out int length)
+        {
+            start = _index;
+            length = _length;
+            return _object;
         }
     }
 
@@ -13132,6 +16978,35 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 
     public static class MemoryExtensions
     {
+        internal static int IndexOfAnyWhiteSpace(this ReadOnlySpan<char> span)
+        {
+            for (int i = 0; i < span.Length; i++)
+            {
+                if (char.IsWhiteSpace(span[i]))
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
+        public static bool ContainsAny<T>(this ReadOnlySpan<T> span, T value0, T value1, T value2) where T : IEquatable<T>?
+        {
+            for (int i = 0; i < span.Length; i++)
+            {
+                T item = span[i];
+                if (EqualityComparer<T>.Default.Equals(item, value0) ||
+                    EqualityComparer<T>.Default.Equals(item, value1) ||
+                    EqualityComparer<T>.Default.Equals(item, value2))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         /// <summary>
         /// Searches for the first index of any of the specified values similar to calling IndexOf several times with the logical OR operator. If not found, returns -1.
         /// </summary>
@@ -13464,6 +17339,403 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
             var comparable = new SpanHelpers.ComparerComparable<T, TComparer>(
                 value, comparer);
             return BinarySearch(span, comparable);
+        }
+
+        /// <summary>
+        /// Sorts the elements in the entire <see cref="Span{T}" /> using the <see cref="IComparable{T}" /> implementation
+        /// of each element of the <see cref= "Span{T}" />
+        /// </summary>
+        /// <typeparam name="T">The type of the elements of the span.</typeparam>
+        /// <param name="span">The <see cref="Span{T}"/> to sort.</param>
+        /// <exception cref="InvalidOperationException">
+        /// One or more elements in <paramref name="span"/> do not implement the <see cref="IComparable{T}" /> interface.
+        /// </exception>
+        /// <summary>
+        /// Sorts the elements in the entire <see cref="Span{T}" /> using the specified <see cref="Comparison{T}" />.
+        /// </summary>
+        /// <typeparam name="T">The type of the elements of the span.</typeparam>
+        /// <param name="span">The <see cref="Span{T}"/> to sort.</param>
+        /// <param name="comparison">The <see cref="Comparison{T}"/> to use when comparing elements.</param>
+        /// <exception cref="ArgumentNullException"><paramref name="comparison"/> is null.</exception>
+        public static void Sort<T>(this Span<T> span, Comparison<T> comparison)
+        {
+            if (comparison == null)
+                ThrowHelper.ThrowArgumentNullException(ExceptionArgument.comparison);
+
+            if (span.Length > 1)
+            {
+                ArraySortHelper<T>.Sort(span, comparison);
+            }
+        }
+
+        /// <summary>
+        /// Returns the minimum value in the span.
+        /// </summary>
+        /// <typeparam name="T">The type of the elements in the span.</typeparam>
+        /// <param name="span">The span of values to determine the minimum value of.</param>
+        /// <returns>The minimum value in the span.</returns>
+        /// <exception cref="InvalidOperationException"><paramref name="span"/> is empty and <typeparamref name="T"/> is a non-nullable value type.</exception>
+        /// <remarks>
+        /// <para>If type <typeparamref name="T" /> implements <see cref="System.IComparable{T}" />, the <see cref="Min{T}(ReadOnlySpan{T})" /> method uses that implementation to compare values. Otherwise, if type <typeparamref name="T" /> implements <see cref="System.IComparable" />, that implementation is used to compare values.</para>
+        /// <para>If <typeparamref name="T" /> is a reference type and the span sequence is empty, this method returns <see langword="null" />.</para>
+        /// <para>Null values are ignored when determining the minimum value. If the span contains at least one non-null value, the minimum of those values is returned. If the span does not contain any non-null values, <see langword="null" /> is returned.</para>
+        /// </remarks>
+        public static T? Min<T>(this ReadOnlySpan<T> span)
+        {
+            if (typeof(T) == typeof(byte)) return MinMaxInteger<T, byte, MinCalc<byte>>(span);
+            if (typeof(T) == typeof(sbyte)) return MinMaxInteger<T, sbyte, MinCalc<sbyte>>(span);
+            if (typeof(T) == typeof(ushort)) return MinMaxInteger<T, ushort, MinCalc<ushort>>(span);
+            if (typeof(T) == typeof(short)) return MinMaxInteger<T, short, MinCalc<short>>(span);
+            if (typeof(T) == typeof(char)) return MinMaxInteger<T, ushort, MinCalc<ushort>>(span);
+            if (typeof(T) == typeof(uint)) return MinMaxInteger<T, uint, MinCalc<uint>>(span);
+            if (typeof(T) == typeof(int)) return MinMaxInteger<T, int, MinCalc<int>>(span);
+            if (typeof(T) == typeof(ulong)) return MinMaxInteger<T, ulong, MinCalc<ulong>>(span);
+            if (typeof(T) == typeof(long)) return MinMaxInteger<T, long, MinCalc<long>>(span);
+            if (typeof(T) == typeof(nuint)) return MinMaxInteger<T, nuint, MinCalc<nuint>>(span);
+            if (typeof(T) == typeof(nint)) return MinMaxInteger<T, nint, MinCalc<nint>>(span);
+
+            return MinMax<T, MinDirection>(span, Comparer<T>.Default);
+        }
+
+        /// <summary>
+        /// Returns the minimum value in the span.
+        /// </summary>
+        /// <typeparam name="T">The type of the elements in the span.</typeparam>
+        /// <param name="span">The span of values to determine the minimum value of.</param>
+        /// <param name="comparer">The <see cref="IComparer{T}"/> to compare values. If <see langword="null"/>, uses <see cref="Comparer{T}.Default"/>.</param>
+        /// <returns>The minimum value in the span.</returns>
+        /// <exception cref="InvalidOperationException"><paramref name="span"/> is empty and <typeparamref name="T"/> is a non-nullable value type.</exception>
+        /// <remarks>
+        /// <para>If <typeparamref name="T" /> is a reference type and the span sequence is empty, this method returns <see langword="null" />.</para>
+        /// <para>Null values are ignored when determining the minimum value. If the span contains at least one non-null value, the minimum of those values is returned. If the span does not contain any non-null values, <see langword="null" /> is returned.</para>
+        /// </remarks>
+        public static T? Min<T>(this ReadOnlySpan<T> span, IComparer<T>? comparer)
+        {
+            if (comparer is null || comparer == Comparer<T>.Default)
+            {
+                return Min(span);
+            }
+
+            return MinMax<T, MinDirection>(span, comparer);
+        }
+
+        /// <summary>
+        /// Returns the maximum value in the span.
+        /// </summary>
+        /// <typeparam name="T">The type of the elements in the span.</typeparam>
+        /// <param name="span">The span of values to determine the maximum value of.</param>
+        /// <returns>The maximum value in the span.</returns>
+        /// <exception cref="InvalidOperationException"><paramref name="span"/> is empty and <typeparamref name="T"/> is a non-nullable value type.</exception>
+        /// <remarks>
+        /// <para>If type <typeparamref name="T" /> implements <see cref="System.IComparable{T}" />, the <see cref="Max{T}(ReadOnlySpan{T})" /> method uses that implementation to compare values. Otherwise, if type <typeparamref name="T" /> implements <see cref="System.IComparable" />, that implementation is used to compare values.</para>
+        /// <para>If <typeparamref name="T" /> is a reference type and the span sequence is empty, this method returns <see langword="null" />.</para>
+        /// <para>Null values are ignored when determining the maximum value. If the span contains at least one non-null value, the maximum of those values is returned. If the span does not contain any non-null values, <see langword="null" /> is returned.</para>
+        /// </remarks>
+        public static T? Max<T>(this ReadOnlySpan<T> span)
+        {
+            if (typeof(T) == typeof(byte)) return MinMaxInteger<T, byte, MaxCalc<byte>>(span);
+            if (typeof(T) == typeof(sbyte)) return MinMaxInteger<T, sbyte, MaxCalc<sbyte>>(span);
+            if (typeof(T) == typeof(ushort)) return MinMaxInteger<T, ushort, MaxCalc<ushort>>(span);
+            if (typeof(T) == typeof(short)) return MinMaxInteger<T, short, MaxCalc<short>>(span);
+            if (typeof(T) == typeof(char)) return MinMaxInteger<T, ushort, MaxCalc<ushort>>(span);
+            if (typeof(T) == typeof(uint)) return MinMaxInteger<T, uint, MaxCalc<uint>>(span);
+            if (typeof(T) == typeof(int)) return MinMaxInteger<T, int, MaxCalc<int>>(span);
+            if (typeof(T) == typeof(ulong)) return MinMaxInteger<T, ulong, MaxCalc<ulong>>(span);
+            if (typeof(T) == typeof(long)) return MinMaxInteger<T, long, MaxCalc<long>>(span);
+            if (typeof(T) == typeof(nuint)) return MinMaxInteger<T, nuint, MaxCalc<nuint>>(span);
+            if (typeof(T) == typeof(nint)) return MinMaxInteger<T, nint, MaxCalc<nint>>(span);
+
+            return MinMax<T, MaxDirection>(span, Comparer<T>.Default);
+        }
+
+        /// <summary>
+        /// Returns the maximum value in the span.
+        /// </summary>
+        /// <typeparam name="T">The type of the elements in the span.</typeparam>
+        /// <param name="span">The span of values to determine the maximum value of.</param>
+        /// <param name="comparer">The <see cref="IComparer{T}"/> to compare values. If <see langword="null"/>, uses <see cref="Comparer{T}.Default"/>.</param>
+        /// <returns>The maximum value in the span.</returns>
+        /// <exception cref="InvalidOperationException"><paramref name="span"/> is empty and <typeparamref name="T"/> is a non-nullable value type.</exception>
+        /// <remarks>
+        /// <para>If <typeparamref name="T" /> is a reference type and the span sequence is empty, this method returns <see langword="null" />.</para>
+        /// <para>Null values are ignored when determining the maximum value. If the span contains at least one non-null value, the maximum of those values is returned. If the span does not contain any non-null values, <see langword="null" /> is returned.</para>
+        /// </remarks>
+        public static T? Max<T>(this ReadOnlySpan<T> span, IComparer<T>? comparer)
+        {
+            if (comparer is null || comparer == Comparer<T>.Default)
+            {
+                return Max(span);
+            }
+
+            return MinMax<T, MaxDirection>(span, comparer);
+        }
+
+        private interface IMinMaxDirection
+        {
+            static abstract bool CompareResult(int comparison);
+        }
+
+        private readonly struct MinDirection : IMinMaxDirection
+        {
+            public static bool CompareResult(int comparison) => comparison < 0;
+        }
+
+        private readonly struct MaxDirection : IMinMaxDirection
+        {
+            public static bool CompareResult(int comparison) => comparison > 0;
+        }
+
+        private static T? MinMax<T, TDirection>(this ReadOnlySpan<T> span, IComparer<T> comparer)
+            where TDirection : struct, IMinMaxDirection
+        {
+            T? value = default;
+
+            if (value is null)
+            {
+                int i;
+
+                for (i = 0; i < span.Length; i++)
+                {
+                    value = span[i];
+
+                    if (value is not null)
+                    {
+                        i++;
+                        break;
+                    }
+                }
+
+                for (; (uint)i < (uint)span.Length; i++)
+                {
+                    T next = span[i];
+                    if (next is not null && TDirection.CompareResult(comparer.Compare(next, value)))
+                    {
+                        value = next;
+                    }
+                }
+            }
+            else
+            {
+                if (span.IsEmpty)
+                {
+                    ThrowHelper.ThrowInvalidOperationException(ExceptionResource.InvalidOperation_NoElements);
+                }
+
+                value = span[0];
+
+                if (comparer == Comparer<T>.Default)
+                {
+                    for (int i = 1; i < span.Length; i++)
+                    {
+                        T next = span[i];
+                        if (TDirection.CompareResult(Comparer<T>.Default.Compare(next, value)))
+                        {
+                            value = next;
+                        }
+                    }
+                }
+                else
+                {
+                    for (int i = 1; i < span.Length; i++)
+                    {
+                        T next = span[i];
+                        if (TDirection.CompareResult(comparer.Compare(next, value)))
+                        {
+                            value = next;
+                        }
+                    }
+                }
+            }
+
+            return value;
+        }
+
+        private interface IMinMaxCalc<T> where T : struct, IBinaryInteger<T>
+        {
+            static abstract bool Compare(T left, T right);
+            static abstract Vector128<T> Compare(Vector128<T> left, Vector128<T> right);
+            static abstract Vector256<T> Compare(Vector256<T> left, Vector256<T> right);
+            static abstract Vector512<T> Compare(Vector512<T> left, Vector512<T> right);
+        }
+
+        private readonly struct MinCalc<T> : IMinMaxCalc<T> where T : struct, IBinaryInteger<T>
+        {
+            public static bool Compare(T left, T right) => left < right;
+            public static Vector128<T> Compare(Vector128<T> left, Vector128<T> right) => Vector128.Min(left, right);
+            public static Vector256<T> Compare(Vector256<T> left, Vector256<T> right) => Vector256.Min(left, right);
+            public static Vector512<T> Compare(Vector512<T> left, Vector512<T> right) => Vector512.Min(left, right);
+        }
+
+        private readonly struct MaxCalc<T> : IMinMaxCalc<T> where T : struct, IBinaryInteger<T>
+        {
+            public static bool Compare(T left, T right) => left > right;
+            public static Vector128<T> Compare(Vector128<T> left, Vector128<T> right) => Vector128.Max(left, right);
+            public static Vector256<T> Compare(Vector256<T> left, Vector256<T> right) => Vector256.Max(left, right);
+            public static Vector512<T> Compare(Vector512<T> left, Vector512<T> right) => Vector512.Max(left, right);
+        }
+
+        private static TOuter MinMaxInteger<TOuter, TInner, TMinMax>(this ReadOnlySpan<TOuter> span)
+            where TInner : struct, IBinaryInteger<TInner>
+            where TMinMax : IMinMaxCalc<TInner> =>
+            Unsafe.BitCast<TInner, TOuter>(MinMaxInteger<TInner, TMinMax>(Unsafe.BitCast<ReadOnlySpan<TOuter>, ReadOnlySpan<TInner>>(span)));
+
+        private static T MinMaxInteger<T, TMinMax>(this ReadOnlySpan<T> span)
+            where T : struct, IBinaryInteger<T>
+            where TMinMax : IMinMaxCalc<T>
+        {
+            T value;
+
+            if (span.IsEmpty)
+            {
+                ThrowHelper.ThrowInvalidOperationException(ExceptionResource.InvalidOperation_NoElements);
+            }
+
+            if (!Vector128.IsHardwareAccelerated || !Vector128<T>.IsSupported || span.Length < Vector128<T>.Count)
+            {
+                value = span[0];
+                for (int i = 1; i < span.Length; i++)
+                {
+                    if (TMinMax.Compare(span[i], value))
+                    {
+                        value = span[i];
+                    }
+                }
+                return value;
+            }
+
+            // All vectorized paths reduce to 128-bit, so we can use that as our accumulator
+            // regardless of the maximum supported vector size.
+            Vector128<T> best128;
+
+            if (!Vector256.IsHardwareAccelerated || span.Length < Vector256<T>.Count)
+            {
+                ReadOnlySpan<T> data = span;
+                Vector128<T> best = Vector128.Create(data);
+                data = data.Slice(Vector128<T>.Count);
+
+                while (data.Length > Vector128<T>.Count)
+                {
+                    best = TMinMax.Compare(best, Vector128.Create(data));
+                    data = data.Slice(Vector128<T>.Count);
+                }
+                best128 = TMinMax.Compare(best, Vector128.Create(span.Slice(span.Length - Vector128<T>.Count)));
+            }
+            else if (!Vector512.IsHardwareAccelerated || span.Length < Vector512<T>.Count)
+            {
+                ReadOnlySpan<T> data = span;
+                Vector256<T> best = Vector256.Create(data);
+                data = data.Slice(Vector256<T>.Count);
+
+                while (data.Length > Vector256<T>.Count)
+                {
+                    best = TMinMax.Compare(best, Vector256.Create(data));
+                    data = data.Slice(Vector256<T>.Count);
+                }
+                best = TMinMax.Compare(best, Vector256.Create(span.Slice(span.Length - Vector256<T>.Count)));
+
+                // Reduce to 128-bit
+                best128 = TMinMax.Compare(best.GetLower(), best.GetUpper());
+            }
+            else
+            {
+                ReadOnlySpan<T> data = span;
+                Vector512<T> best = Vector512.Create(data);
+                data = data.Slice(Vector512<T>.Count);
+
+                while (data.Length > Vector512<T>.Count)
+                {
+                    best = TMinMax.Compare(best, Vector512.Create(data));
+                    data = data.Slice(Vector512<T>.Count);
+                }
+                best = TMinMax.Compare(best, Vector512.Create(span.Slice(span.Length - Vector512<T>.Count)));
+
+                // Reduce to 128-bit
+                Vector256<T> best256 = TMinMax.Compare(best.GetLower(), best.GetUpper());
+                best128 = TMinMax.Compare(best256.GetLower(), best256.GetUpper());
+            }
+
+            // Reduce to single value
+            value = HorizontalMinMax<T, TMinMax>(best128);
+
+            return value;
+        }
+
+        /// <summary>Reduces a <see cref="Vector128{T}"/> to a single element using <typeparamref name="TMinMax"/>.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static T HorizontalMinMax<T, TMinMax>(Vector128<T> x)
+            where T : struct, IBinaryInteger<T>
+            where TMinMax : IMinMaxCalc<T>
+        {
+            // Perform log2(Vector128<T>.Count) reductions, each combining the vector with a shuffled
+            // copy of itself so that lane 0 ends up holding the min/max of all original lanes.
+            if (Vector128<T>.Count == 16)
+            {
+                x = TMinMax.Compare(x, Vector128.Shuffle(x.AsByte(),
+                    Vector128.Create((byte)8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7)).As<byte, T>());
+                x = TMinMax.Compare(x, Vector128.Shuffle(x.AsByte(),
+                    Vector128.Create((byte)4, 5, 6, 7, 0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15)).As<byte, T>());
+                x = TMinMax.Compare(x, Vector128.Shuffle(x.AsByte(),
+                    Vector128.Create((byte)2, 3, 0, 1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)).As<byte, T>());
+                x = TMinMax.Compare(x, Vector128.Shuffle(x.AsByte(),
+                    Vector128.Create((byte)1, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)).As<byte, T>());
+            }
+            else if (Vector128<T>.Count == 8)
+            {
+                x = TMinMax.Compare(x, Vector128.Shuffle(x.AsInt16(),
+                    Vector128.Create(4, 5, 6, 7, 0, 1, 2, 3)).As<short, T>());
+                x = TMinMax.Compare(x, Vector128.Shuffle(x.AsInt16(),
+                    Vector128.Create(2, 3, 0, 1, 4, 5, 6, 7)).As<short, T>());
+                x = TMinMax.Compare(x, Vector128.Shuffle(x.AsInt16(),
+                    Vector128.Create(1, 0, 2, 3, 4, 5, 6, 7)).As<short, T>());
+            }
+            else if (Vector128<T>.Count == 4)
+            {
+                x = TMinMax.Compare(x, Vector128.Shuffle(x.AsInt32(), Vector128.Create(2, 3, 0, 1)).As<int, T>());
+                x = TMinMax.Compare(x, Vector128.Shuffle(x.AsInt32(), Vector128.Create(1, 0, 3, 2)).As<int, T>());
+            }
+            else
+            {
+                Debug.Assert(Vector128<T>.Count == 2);
+                x = TMinMax.Compare(x, Vector128.Shuffle(x.AsInt64(), Vector128.Create(1, 0)).As<long, T>());
+            }
+            return x.ToScalar();
+        }
+
+        public static void Sort<T>(this Span<T> span) =>
+            Sort(span, (IComparer<T>?)null);
+
+        /// <summary>
+        /// Sorts the elements in the entire <see cref="Span{T}" /> using the <typeparamref name="TComparer" />.
+        /// </summary>
+        /// <typeparam name="T">The type of the elements of the span.</typeparam>
+        /// <typeparam name="TComparer">The type of the comparer to use to compare elements.</typeparam>
+        /// <param name="span">The <see cref="Span{T}"/> to sort.</param>
+        /// <param name="comparer">
+        /// The <see cref="IComparer{T}"/> implementation to use when comparing elements, or null to
+        /// use the <see cref="IComparable{T}"/> interface implementation of each element.
+        /// </param>
+        /// <exception cref="InvalidOperationException">
+        /// <paramref name="comparer"/> is null, and one or more elements in <paramref name="span"/> do not
+        /// implement the <see cref="IComparable{T}" /> interface.
+        /// </exception>
+        /// <exception cref="ArgumentException">
+        /// The implementation of <paramref name="comparer"/> caused an error during the sort.
+        /// </exception>
+        public static void Sort<T, TComparer>(this Span<T> span, TComparer comparer) where TComparer : IComparer<T>?
+        {
+            if (span.Length > 1)
+            {
+                if (typeof(TComparer).IsValueType)
+                {
+#pragma warning disable CS8631
+                    ArraySortHelperForTComparer<T, TComparer>.Sort(span, comparer);
+#pragma warning restore CS8631
+                }
+                else
+                {
+                    ArraySortHelper<T>.Default.Sort(span, comparer);
+                }
+            }
         }
 
         /// <summary>
@@ -14157,6 +18429,15 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
     {
         internal static bool SystemSupportsLeapSeconds => true;
         private static unsafe bool IsValidTimeWithLeapSeconds(DateTime value) => true;
+
+        public static DateTime UtcNow
+        {
+            get
+            {
+                return new DateTime(((ulong)(Interop.Sys.GetSystemTimeAsTicks() + UnixEpochTicks)) | KindUtc);
+            }
+        }
+
 
         // Number of days in a non-leap year
         private const int DaysPerYear = 365;
@@ -16207,7 +20488,7 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 
         private static void ThrowUInt64OverflowException() { throw new OverflowException(); }
     }
-    public abstract class StringComparer : IComparer
+    public abstract class StringComparer : IComparer, IEqualityComparer, IComparer<string?>, IEqualityComparer<string?>
     {
         public static StringComparer InvariantCulture => CultureAwareComparer.InvariantCaseSensitiveInstance;
 
@@ -16278,6 +20559,17 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
                 return ia.CompareTo(y);
             }
             throw new ArgumentException();
+        }
+        public new bool Equals(object? x, object? y)
+        {
+            if (x == y) return true;
+            if (x == null || y == null) return false;
+
+            if (x is string sa && y is string sb)
+            {
+                return Equals(sa, sb);
+            }
+            return x.Equals(y);
         }
         public abstract int Compare(string? x, string? y);
         public abstract bool Equals(string? x, string? y);
@@ -16532,6 +20824,9 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 
         /// <summary>Casts the specified value to this type.</summary>
         public static abstract TSelf CastFrom(ulong value);
+
+        /// <summary>Casts a value of this type to an UInt32.</summary>
+        public static abstract uint CastToUInt32(TSelf value);
     }
     public interface ITuple
     {
@@ -16542,6 +20837,10 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
     public interface IDisposable
     {
         void Dispose();
+    }
+    public interface IAsyncDisposable
+    {
+        ValueTask DisposeAsync();
     }
     public interface IComparable
     {
@@ -16952,6 +21251,14 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         public static long DoubleToInt64Bits(double value) => Unsafe.BitCast<double, long>(value);
         public static double Int64BitsToDouble(long value) => Unsafe.BitCast<long, double>(value);
 
+
+        /// <summary>
+        /// Converts the specified half-precision floating point number to a 16-bit signed integer.
+        /// </summary>
+        /// <param name="value">The number to convert.</param>
+        /// <returns>A 16-bit signed integer whose bits are identical to <paramref name="value"/>.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static short HalfToInt16Bits(Half value) => (short)value._value;
 
         public static int SingleToInt32Bits(float value) => Unsafe.BitCast<float, int>(value);
         public static float Int32BitsToSingle(int value) => Unsafe.BitCast<int, float>(value);
@@ -19804,6 +24111,18 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 
     // delegates
 
+    public delegate void AsyncCallback(IAsyncResult ar);
+
+    // This should probably technically be T? rather than T to match `IComparer<T>`.  However, the use cases are generally different,
+    // with Comparison<T> typically being used via a lambda, with the T inferred from the type of the collection being sorted,
+    // and forcing nullable warnings onto all such usage leads to many spurious warnings.
+    public delegate int Comparison<in T>(T x, T y)
+        where T : allows ref struct;
+
+    public delegate TOutput Converter<in TInput, out TOutput>(TInput input)
+        where TInput : allows ref struct
+        where TOutput : allows ref struct;
+
     public delegate bool Predicate<in T>(T obj)
         where T : allows ref struct;
 
@@ -20165,15 +24484,77 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         where T16 : allows ref struct;
 
 
+    public enum GCCollectionMode
+    {
+        Default = 0,
+        Forced = 1,
+        Optimized = 2,
+        Aggressive = 3,
+    }
+
+    [Flags]
+    internal enum InternalGCCollectionMode
+    {
+        NonBlocking = 0x00000001,
+        Blocking = 0x00000002,
+        Optimized = 0x00000004,
+        Compacting = 0x00000008,
+        Aggressive = 0x00000010,
+    }
+
     public static class GC
     {
         [MethodImpl(MethodImplOptions.NoInlining)]
         public static void KeepAlive(object? obj) { }
 
-        // Finalizers never run yet, so these only validate their argument
-        public static void SuppressFinalize(object obj) => ArgumentNullException.ThrowIfNull(obj);
+        // -1 says to GC all generations
+        public static void Collect() => RuntimeImports.RhCollect(-1, InternalGCCollectionMode.Blocking);
 
-        public static void ReRegisterForFinalize(object obj) => ArgumentNullException.ThrowIfNull(obj);
+        public static void Collect(int generation) => Collect(generation, GCCollectionMode.Default);
+
+        public static void Collect(int generation, GCCollectionMode mode) => Collect(generation, mode, true);
+
+        public static void Collect(int generation, GCCollectionMode mode, bool blocking) => Collect(generation, mode, blocking, false);
+
+        public static void Collect(int generation, GCCollectionMode mode, bool blocking, bool compacting)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(generation);
+
+            if ((mode < GCCollectionMode.Default) || (mode > GCCollectionMode.Aggressive))
+                throw new ArgumentOutOfRangeException(nameof(mode), SR.ArgumentOutOfRange_Enum);
+
+            int iInternalModes = 0;
+
+            if (mode == GCCollectionMode.Optimized)
+                iInternalModes |= (int)InternalGCCollectionMode.Optimized;
+            else if (mode == GCCollectionMode.Aggressive)
+                iInternalModes |= (int)InternalGCCollectionMode.Aggressive;
+
+            if (compacting)
+                iInternalModes |= (int)InternalGCCollectionMode.Compacting;
+
+            if (blocking)
+                iInternalModes |= (int)InternalGCCollectionMode.Blocking;
+            else if (!compacting)
+                iInternalModes |= (int)InternalGCCollectionMode.NonBlocking;
+
+            RuntimeImports.RhCollect(generation, (InternalGCCollectionMode)iInternalModes);
+        }
+
+        // Until there is a finalizer thread to wait for the caller drains the queue itself
+        public static void WaitForPendingFinalizers() => __Finalizer.DrainQueueOnCurrentThread();
+
+        public static void SuppressFinalize(object obj)
+        {
+            ArgumentNullException.ThrowIfNull(obj);
+            RuntimeImports.RhSuppressFinalize(obj);
+        }
+
+        public static void ReRegisterForFinalize(object obj)
+        {
+            ArgumentNullException.ThrowIfNull(obj);
+            RuntimeImports.RhReRegisterForFinalize(obj);
+        }
 
         private enum StartNoGCRegionStatus
         {
@@ -20445,6 +24826,8 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 
         public PlatformID Platform => _platform;
 
+        public static bool IsWasi() => false;
+
         public string ServicePack => _servicePack ?? string.Empty;
 
         public Version Version => _version;
@@ -20612,6 +24995,8 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
 
         public virtual bool IsEnum { [Intrinsic] get => throw new NotImplementedException(); }
         public virtual Type GetEnumUnderlyingType() => throw new NotImplementedException();
+        public virtual bool IsAssignableFrom([NotNullWhen(true)] Type? c) => throw new NotImplementedException();
+        public virtual Type? GetElementType() => throw new NotImplementedException();
         public virtual bool IsEquivalentTo([NotNullWhen(true)] Type? other) => this == other;
         public bool IsPrimitive
         {
@@ -20763,6 +25148,8 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
     public class Exception
     {
         private string _message;
+        private Exception? _innerException;
+        private int _HResult;
         public Exception()
         {
             _message = String.Empty;
@@ -20774,12 +25161,288 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         public Exception(String message, Exception innerException)
         {
             _message = message;
+            _innerException = innerException;
         }
         public virtual string Message => _message;
+        public Exception? InnerException => _innerException;
+        public int HResult
+        {
+            get => _HResult;
+            set => _HResult = value;
+        }
+        public virtual string? StackTrace => null;
+        public virtual Exception GetBaseException()
+        {
+            Exception? inner = InnerException;
+            Exception back = this;
+
+            while (inner is not null)
+            {
+                back = inner;
+                inner = inner.InnerException;
+            }
+
+            return back;
+        }
+
+        internal readonly struct DispatchState
+        {
+        }
+
+        internal DispatchState CaptureDispatchState() => default;
+
+        internal void RestoreDispatchState(DispatchState dispatchState)
+        {
+        }
+
+        internal void SetCurrentStackTrace()
+        {
+        }
+
+        internal void SetRemoteStackTrace(string stackTrace)
+        {
+        }
         public override string ToString()
         {
             return _message;
         }
+    }
+    /// <summary>Represents one or more errors that occur during application execution.</summary>
+    /// <remarks>
+    /// <see cref="AggregateException"/> is used to consolidate multiple failures into a single, throwable
+    /// exception object.
+    /// </remarks>
+    [Serializable]
+    public class AggregateException : Exception
+    {
+        private readonly Exception[] _innerExceptions; // Complete set of exceptions.
+        private ReadOnlyCollection<Exception>? _rocView; // separate from _innerExceptions to enable trimming if InnerExceptions isn't used
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="AggregateException"/> class.
+        /// </summary>
+        public AggregateException()
+            : this(SR.AggregateException_ctor_DefaultMessage)
+        {
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="AggregateException"/> class with
+        /// a specified error message.
+        /// </summary>
+        /// <param name="message">The error message that explains the reason for the exception.</param>
+        public AggregateException(string? message)
+            : base(message ?? SR.AggregateException_ctor_DefaultMessage)
+        {
+            _innerExceptions = [];
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="AggregateException"/> class with a specified error
+        /// message and a reference to the inner exception that is the cause of this exception.
+        /// </summary>
+        /// <param name="message">The error message that explains the reason for the exception.</param>
+        /// <param name="innerException">The exception that is the cause of the current exception.</param>
+        /// <exception cref="ArgumentNullException">The <paramref name="innerException"/> argument
+        /// is null.</exception>
+        public AggregateException(string? message, Exception innerException)
+            : base(message ?? SR.AggregateException_ctor_DefaultMessage, innerException)
+        {
+            ArgumentNullException.ThrowIfNull(innerException);
+
+            _innerExceptions = [innerException];
+        }
+
+        public ReadOnlyCollection<Exception> InnerExceptions => _rocView ?? (_rocView = new ReadOnlyCollection<Exception>(_innerExceptions));
+
+        public override string Message
+        {
+            get
+            {
+                if (_innerExceptions.Length == 0)
+                {
+                    return base.Message;
+                }
+                Span<char> initialBuffer = stackalloc char[256];
+                ValueStringBuilder valueStringBuilder = new ValueStringBuilder(initialBuffer);
+                valueStringBuilder.Append(base.Message);
+                valueStringBuilder.Append(' ');
+                for (int i = 0; i < _innerExceptions.Length; i++)
+                {
+                    valueStringBuilder.Append('(');
+                    valueStringBuilder.Append(_innerExceptions[i].Message);
+                    valueStringBuilder.Append(") ");
+                }
+                valueStringBuilder.Length--;
+                return valueStringBuilder.ToString();
+            }
+        }
+
+        internal int InnerExceptionCount => _innerExceptions.Length;
+
+        internal Exception[] InternalInnerExceptions => _innerExceptions;
+
+        public AggregateException(IEnumerable<Exception> innerExceptions)
+            : this(SR.AggregateException_ctor_DefaultMessage, innerExceptions ?? throw new ArgumentNullException(nameof(innerExceptions)))
+        {
+        }
+
+        public AggregateException(params Exception[] innerExceptions)
+            : this(SR.AggregateException_ctor_DefaultMessage, innerExceptions ?? throw new ArgumentNullException(nameof(innerExceptions)))
+        {
+        }
+
+        public AggregateException(string? message, IEnumerable<Exception> innerExceptions)
+            : this(message, new List<Exception>(innerExceptions ?? throw new ArgumentNullException(nameof(innerExceptions))).ToArray(), cloneExceptions: false)
+        {
+        }
+
+        private AggregateException(string message, Exception[] innerExceptions, bool cloneExceptions)
+            : base(message ?? SR.AggregateException_ctor_DefaultMessage, (innerExceptions.Length != 0) ? innerExceptions[0] : null)
+        {
+            _innerExceptions = (cloneExceptions ? new Exception[innerExceptions.Length] : innerExceptions);
+            for (int i = 0; i < _innerExceptions.Length; i++)
+            {
+                _innerExceptions[i] = innerExceptions[i];
+                if (innerExceptions[i] is null)
+                {
+                    throw new ArgumentException(SR.AggregateException_ctor_InnerExceptionNull);
+                }
+            }
+        }
+
+        internal AggregateException(List<ExceptionDispatchInfo> innerExceptionInfos)
+            : this(SR.AggregateException_ctor_DefaultMessage, innerExceptionInfos)
+        {
+        }
+
+        internal AggregateException(string message, List<ExceptionDispatchInfo> innerExceptionInfos)
+            : base(message, (innerExceptionInfos.Count != 0) ? innerExceptionInfos[0].SourceException : null)
+        {
+            _innerExceptions = new Exception[innerExceptionInfos.Count];
+            for (int i = 0; i < _innerExceptions.Length; i++)
+            {
+                _innerExceptions[i] = innerExceptionInfos[i].SourceException;
+            }
+        }
+
+        public override Exception GetBaseException()
+        {
+            Exception ex = this;
+            AggregateException ex2 = this;
+            while (ex2 is not null && ex2.InnerExceptions.Count == 1)
+            {
+                ex = ex.InnerException;
+                ex2 = ex as AggregateException;
+            }
+            return ex;
+        }
+
+        public void Handle(Func<Exception, bool> predicate)
+        {
+            ArgumentNullException.ThrowIfNull(predicate);
+            List<Exception> list = null;
+            for (int i = 0; i < _innerExceptions.Length; i++)
+            {
+                if (!predicate(_innerExceptions[i]))
+                {
+                    if (list is null)
+                    {
+                        list = new List<Exception>();
+                    }
+                    list.Add(_innerExceptions[i]);
+                }
+            }
+            if (list is not null)
+            {
+                throw new AggregateException(Message, list.ToArray(), cloneExceptions: false);
+            }
+        }
+
+        public AggregateException Flatten()
+        {
+            List<Exception> list = new List<Exception>();
+            List<AggregateException> list2 = new List<AggregateException> { this };
+            int num = 0;
+            while (list2.Count > num)
+            {
+                ReadOnlyCollection<Exception> innerExceptions = list2[num++].InnerExceptions;
+                for (int i = 0; i < innerExceptions.Count; i++)
+                {
+                    Exception ex = innerExceptions[i];
+                    if (ex is not null)
+                    {
+                        if (ex is AggregateException item)
+                        {
+                            list2.Add(item);
+                        }
+                        else
+                        {
+                            list.Add(ex);
+                        }
+                    }
+                }
+            }
+            return new AggregateException((GetType() == typeof(AggregateException)) ? base.Message : Message, list.ToArray(), cloneExceptions: false);
+        }
+
+        public override string ToString()
+        {
+            StringBuilder stringBuilder = new StringBuilder();
+            stringBuilder.Append(base.ToString());
+            for (int i = 0; i < _innerExceptions.Length; i++)
+            {
+                if (_innerExceptions[i] != base.InnerException)
+                {
+                    stringBuilder.Append("\r\n ---> ");
+                    stringBuilder.Append(string.Format(CultureInfo.InvariantCulture, SR.AggregateException_InnerException, i));
+                    stringBuilder.Append(_innerExceptions[i].ToString());
+                    stringBuilder.Append("<---");
+                    stringBuilder.AppendLine();
+                }
+            }
+            return stringBuilder.ToString();
+        }
+    }
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Enum | AttributeTargets.Delegate, Inherited = false)]
+    public sealed class SerializableAttribute : Attribute
+    {
+    }
+    [AttributeUsage(AttributeTargets.Class |
+                    AttributeTargets.Struct |
+                    AttributeTargets.Enum |
+                    AttributeTargets.Interface |
+                    AttributeTargets.Constructor |
+                    AttributeTargets.Method |
+                    AttributeTargets.Property |
+                    AttributeTargets.Field |
+                    AttributeTargets.Event |
+                    AttributeTargets.Delegate,
+                    Inherited = false)]
+    public sealed class ObsoleteAttribute : Attribute
+    {
+        public ObsoleteAttribute()
+        {
+        }
+
+        public ObsoleteAttribute(string? message)
+        {
+            Message = message;
+        }
+
+        public ObsoleteAttribute(string? message, bool error)
+        {
+            Message = message;
+            IsError = error;
+        }
+
+        public string? Message { get; }
+
+        public bool IsError { get; }
+
+        public string? DiagnosticId { get; set; }
+
+        public string? UrlFormat { get; set; }
     }
     public class ApplicationException : Exception
     {
@@ -20806,6 +25469,128 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         public SystemException(string message, Exception innerException)
             : base(message, innerException)
         { }
+    }
+    public class OperationCanceledException : SystemException
+    {
+        [NonSerialized]
+        private CancellationToken _cancellationToken;
+
+        public CancellationToken CancellationToken
+        {
+            get
+            {
+                return _cancellationToken;
+            }
+            private set
+            {
+                _cancellationToken = value;
+            }
+        }
+
+        public OperationCanceledException()
+            : base(SR.OperationCanceled)
+        {
+            base.HResult = -2146233029;
+        }
+
+        public OperationCanceledException(string? message)
+            : base(message ?? SR.OperationCanceled)
+        {
+            base.HResult = -2146233029;
+        }
+
+        public OperationCanceledException(string? message, Exception? innerException)
+            : base(message ?? SR.OperationCanceled, innerException)
+        {
+            base.HResult = -2146233029;
+        }
+
+        public OperationCanceledException(CancellationToken token)
+            : this()
+        {
+            CancellationToken = token;
+        }
+
+        public OperationCanceledException(string? message, CancellationToken token)
+            : this(message)
+        {
+            CancellationToken = token;
+        }
+
+        public OperationCanceledException(string? message, Exception? innerException, CancellationToken token)
+            : this(message, innerException)
+        {
+            CancellationToken = token;
+        }
+    }
+    /// <summary>The exception that is thrown when the time allotted for a process or operation has expired.</summary>
+    public class TimeoutException : SystemException
+    {
+        public TimeoutException()
+            : base(SR.Arg_TimeoutException)
+        {
+        }
+
+        public TimeoutException(string? message)
+            : base(message ?? SR.Arg_TimeoutException)
+        {
+        }
+
+        public TimeoutException(string? message, Exception? innerException)
+            : base(message ?? SR.Arg_TimeoutException, innerException)
+        {
+        }
+    }
+    public class MemberAccessException : SystemException
+    {
+        public MemberAccessException()
+            : base(SR.Arg_AccessException)
+        {
+        }
+
+        public MemberAccessException(string? message)
+            : base(message ?? SR.Arg_AccessException)
+        {
+        }
+
+        public MemberAccessException(string? message, Exception? inner)
+            : base(message ?? SR.Arg_AccessException, inner)
+        {
+        }
+    }
+    public class MissingMemberException : MemberAccessException
+    {
+        public MissingMemberException()
+            : base(SR.Arg_MissingMemberException)
+        {
+        }
+
+        public MissingMemberException(string? message)
+            : base(message ?? SR.Arg_MissingMemberException)
+        {
+        }
+
+        public MissingMemberException(string? message, Exception? inner)
+            : base(message ?? SR.Arg_MissingMemberException, inner)
+        {
+        }
+    }
+    public class MissingMethodException : MissingMemberException
+    {
+        public MissingMethodException()
+            : base(SR.Arg_MissingMethodException)
+        {
+        }
+
+        public MissingMethodException(string? message)
+            : base(message ?? SR.Arg_MissingMethodException)
+        {
+        }
+
+        public MissingMethodException(string? message, Exception? inner)
+            : base(message ?? SR.Arg_MissingMethodException, inner)
+        {
+        }
     }
     public sealed class TypeInitializationException : SystemException
     {
@@ -20951,6 +25736,14 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         }
 
         public string ObjectName => _objectName ?? string.Empty;
+
+        public static void ThrowIf([DoesNotReturnIf(true)] bool condition, object instance)
+        {
+            if (condition)
+            {
+                throw new ObjectDisposedException(instance.GetType().FullName);
+            }
+        }
     }
     public class NotImplementedException : SystemException
     {
@@ -21063,6 +25856,15 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
             : base(message)
         {
             _paramName = paramName;
+        }
+
+        public static void ThrowIfNullOrEmpty([NotNull] string? argument, [CallerArgumentExpression(nameof(argument))] string? paramName = null)
+        {
+            ArgumentNullException.ThrowIfNull(argument, paramName);
+            if (argument.Length == 0)
+            {
+                throw new ArgumentException(SR.Argument_EmptyString, paramName);
+            }
         }
     }
     public class CultureNotFoundException : ArgumentException
@@ -21379,6 +26181,29 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         public IndexOutOfRangeException(string message, Exception inner) : base(message, inner) { }
     }
 
+    public class IOException : SystemException
+    {
+        public IOException()
+            : base(SR.Arg_IOException)
+        {
+        }
+
+        public IOException(string? message)
+            : base(message)
+        {
+        }
+
+        public IOException(string? message, int hresult)
+            : base(message)
+        {
+        }
+
+        public IOException(string? message, Exception? innerException)
+            : base(message, innerException)
+        {
+        }
+    }
+
     public abstract class Attribute
     {
 
@@ -21455,37 +26280,1876 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
     {
         public NonVersionableAttribute() { }
     }
+    [AttributeUsage(AttributeTargets.Field, Inherited = false)]
+    public sealed class NonSerializedAttribute : Attribute
+    {
+        public NonSerializedAttribute()
+        {
+        }
+    }
+    internal abstract class OSPlatformAttribute : Attribute
+    {
+        private protected OSPlatformAttribute(string platformName)
+        {
+            PlatformName = platformName;
+        }
+        public string PlatformName { get; }
+    }
+    /// <summary>
+    /// Records the platform that the project targeted.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Assembly,
+                    AllowMultiple = false, Inherited = false)]
+    internal sealed class TargetPlatformAttribute : OSPlatformAttribute
+    {
+        public TargetPlatformAttribute(string platformName) : base(platformName)
+        {
+        }
+    }
+    /// <summary>
+    /// Records the operating system (and minimum version) that supports an API. Multiple attributes can be
+    /// applied to indicate support on multiple operating systems.
+    /// </summary>
+    /// <remarks>
+    /// Callers can apply a <see cref="SupportedOSPlatformAttribute " />
+    /// or use guards to prevent calls to APIs on unsupported operating systems.
+    ///
+    /// A given platform should only be specified once.
+    /// </remarks>
+    [AttributeUsage(AttributeTargets.Assembly |
+                    AttributeTargets.Class |
+                    AttributeTargets.Constructor |
+                    AttributeTargets.Enum |
+                    AttributeTargets.Event |
+                    AttributeTargets.Field |
+                    AttributeTargets.Interface |
+                    AttributeTargets.Method |
+                    AttributeTargets.Module |
+                    AttributeTargets.Property |
+                    AttributeTargets.Struct,
+                    AllowMultiple = true, Inherited = false)]
+    internal sealed class SupportedOSPlatformAttribute : OSPlatformAttribute
+    {
+        public SupportedOSPlatformAttribute(string platformName) : base(platformName)
+        {
+        }
+    }
+    /// <summary>
+    /// Marks APIs that were removed in a given operating system version.
+    /// </summary>
+    /// <remarks>
+    /// Primarily used by OS bindings to indicate APIs that are only available in
+    /// earlier versions.
+    /// </remarks>
+    [AttributeUsage(AttributeTargets.Assembly |
+                    AttributeTargets.Class |
+                    AttributeTargets.Constructor |
+                    AttributeTargets.Enum |
+                    AttributeTargets.Event |
+                    AttributeTargets.Field |
+                    AttributeTargets.Interface |
+                    AttributeTargets.Method |
+                    AttributeTargets.Module |
+                    AttributeTargets.Property |
+                    AttributeTargets.Struct,
+                    AllowMultiple = true, Inherited = false)]
+    internal sealed class UnsupportedOSPlatformAttribute : OSPlatformAttribute
+    {
+        public UnsupportedOSPlatformAttribute(string platformName) : base(platformName)
+        {
+        }
+        public UnsupportedOSPlatformAttribute(string platformName, string? message) : base(platformName)
+        {
+            Message = message;
+        }
+        public string? Message { get; }
+    }
+    /// <summary>
+    /// Marks APIs that were obsoleted in a given operating system version.
+    /// </summary>
+    /// <remarks>
+    /// Primarily used by OS bindings to indicate APIs that should not be used anymore.
+    /// </remarks>
+    [AttributeUsage(AttributeTargets.Assembly |
+                    AttributeTargets.Class |
+                    AttributeTargets.Constructor |
+                    AttributeTargets.Enum |
+                    AttributeTargets.Event |
+                    AttributeTargets.Field |
+                    AttributeTargets.Interface |
+                    AttributeTargets.Method |
+                    AttributeTargets.Module |
+                    AttributeTargets.Property |
+                    AttributeTargets.Struct,
+                    AllowMultiple = true, Inherited = false)]
+    internal sealed class ObsoletedOSPlatformAttribute : OSPlatformAttribute
+    {
+        /// <summary>
+        /// Initializes a new instance of the <see cref="ObsoletedOSPlatformAttribute"/> class with the specified platform name.
+        /// </summary>
+        /// <param name="platformName">The name of the platform where the API was obsoleted.</param>
+        public ObsoletedOSPlatformAttribute(string platformName) : base(platformName)
+        {
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="ObsoletedOSPlatformAttribute"/> class with the specified platform name and message.
+        /// </summary>
+        /// <param name="platformName">The name of the platform where the API was obsoleted.</param>
+        /// <param name="message">The message that explains the obsolescence.</param>
+        public ObsoletedOSPlatformAttribute(string platformName, string? message) : base(platformName)
+        {
+            Message = message;
+        }
+
+        /// <summary>
+        /// Gets the message that explains the obsolescence.
+        /// </summary>
+        public string? Message { get; }
+
+        /// <summary>
+        /// Gets or sets the URL that provides more information about the obsolescence.
+        /// </summary>
+        public string? Url { get; set; }
+    }
+    /// <summary>
+    /// Annotates a custom guard field, property or method with a supported platform name and optional version.
+    /// Multiple attributes can be applied to indicate guard for multiple supported platforms.
+    /// </summary>
+    /// <remarks>
+    /// Callers can apply a <see cref="SupportedOSPlatformGuardAttribute " /> to a field, property or method
+    /// and use that field, property or method in a conditional or assert statements in order to safely call platform specific APIs.
+    ///
+    /// The type of the field or property should be boolean, the method return type should be boolean in order to be used as platform guard.
+    /// </remarks>
+    [AttributeUsage(AttributeTargets.Field |
+                    AttributeTargets.Method |
+                    AttributeTargets.Property,
+                    AllowMultiple = true, Inherited = false)]
+    internal sealed class SupportedOSPlatformGuardAttribute : OSPlatformAttribute
+    {
+        public SupportedOSPlatformGuardAttribute(string platformName) : base(platformName)
+        {
+        }
+    }
+    /// <summary>
+    /// Annotates the custom guard field, property or method with an unsupported platform name and optional version.
+    /// Multiple attributes can be applied to indicate guard for multiple unsupported platforms.
+    /// </summary>
+    /// <remarks>
+    /// Callers can apply a <see cref="UnsupportedOSPlatformGuardAttribute " /> to a field, property or method
+    /// and use that  field, property or method in a conditional or assert statements as a guard to safely call APIs unsupported on those platforms.
+    ///
+    /// The type of the field or property should be boolean, the method return type should be boolean in order to be used as platform guard.
+    /// </remarks>
+    [AttributeUsage(AttributeTargets.Field |
+                    AttributeTargets.Method |
+                    AttributeTargets.Property,
+                    AllowMultiple = true, Inherited = false)]
+    internal sealed class UnsupportedOSPlatformGuardAttribute : OSPlatformAttribute
+    {
+        public UnsupportedOSPlatformGuardAttribute(string platformName) : base(platformName)
+        {
+        }
+    }
+
+    [ClassInterface(ClassInterfaceType.AutoDispatch)]
+    [ComVisible(true)]
+    public abstract class MarshalByRefObject
+    {
+        protected MarshalByRefObject()
+        {
+        }
+
+        protected MarshalByRefObject MemberwiseClone(bool cloneIdentity)
+        {
+            MarshalByRefObject mbr = (MarshalByRefObject)MemberwiseClone();
+            return mbr;
+        }
+    }
+
+    // The base class for all event classes.
+    public class EventArgs
+    {
+        public static readonly EventArgs Empty = new EventArgs();
+
+        public EventArgs()
+        {
+        }
+    }
+
+    /// <summary>
+    /// Represents the status of an asynchronous operation.
+    /// </summary>
+    public interface IAsyncResult
+    {
+        bool IsCompleted { get; }
+
+        WaitHandle AsyncWaitHandle { get; }
+
+        object? AsyncState { get; }
+
+        bool CompletedSynchronously { get; }
+    }
+
+    /// <summary>Provides an abstraction for time.</summary>
+    public abstract class TimeProvider
+    {
+        /// <summary>
+        /// Gets a <see cref="TimeProvider"/> that provides a clock based on <see cref="DateTimeOffset.UtcNow"/>,
+        /// a time zone based on <see cref="TimeZoneInfo.Local"/>, a high-performance time stamp based on <see cref="Stopwatch"/>,
+        /// and a timer based on <see cref="Timer"/>.
+        /// </summary>
+        /// <remarks>
+        /// If the <see cref="TimeZoneInfo.Local"/> changes after the object is returned, the change will be reflected in any subsequent operations that retrieve <see cref="GetLocalNow"/>.
+        /// </remarks>
+        public static TimeProvider System { get; } = new SystemTimeProvider();
+
+        /// <summary>
+        /// Initializes the <see cref="TimeProvider"/>.
+        /// </summary>
+        protected TimeProvider()
+        {
+        }
+
+        /// <summary>
+        /// Gets the frequency of <see cref="GetTimestamp"/> of high-frequency value per second.
+        /// </summary>
+        /// <remarks>
+        /// The default implementation returns <see cref="Stopwatch.Frequency"/>. For a given TimeProvider instance, the value must be idempotent and remain unchanged.
+        /// </remarks>
+        public virtual long TimestampFrequency => Stopwatch.Frequency;
+
+        /// <summary>
+        /// Gets the current high-frequency value designed to measure small time intervals with high accuracy in the timer mechanism.
+        /// </summary>
+        /// <returns>A long integer representing the high-frequency counter value of the underlying timer mechanism. </returns>
+        /// <remarks>
+        /// The default implementation returns <see cref="Stopwatch.GetTimestamp"/>.
+        /// </remarks>
+        public virtual long GetTimestamp() => Stopwatch.GetTimestamp();
+
+        /// <summary>
+        /// Gets the elapsed time between two timestamps retrieved using <see cref="GetTimestamp"/>.
+        /// </summary>
+        /// <param name="startingTimestamp">The timestamp marking the beginning of the time period.</param>
+        /// <param name="endingTimestamp">The timestamp marking the end of the time period.</param>
+        /// <returns>A <see cref="TimeSpan"/> for the elapsed time between the starting and ending timestamps.</returns>
+        public TimeSpan GetElapsedTime(long startingTimestamp, long endingTimestamp)
+        {
+            long timestampFrequency = TimestampFrequency;
+            if (timestampFrequency <= 0)
+            {
+                ThrowHelper.ThrowInvalidOperationException(ExceptionResource.InvalidOperation_TimeProviderInvalidTimestampFrequency);
+            }
+
+            return new TimeSpan((long)((endingTimestamp - startingTimestamp) * ((double)TimeSpan.TicksPerSecond / timestampFrequency)));
+        }
+
+        /// <summary>
+        /// Gets the elapsed time since the <paramref name="startingTimestamp"/> value retrieved using <see cref="GetTimestamp"/>.
+        /// </summary>
+        /// <param name="startingTimestamp">The timestamp marking the beginning of the time period.</param>
+        /// <returns>A <see cref="TimeSpan"/> for the elapsed time between the starting timestamp and the time of this call.</returns>
+        public TimeSpan GetElapsedTime(long startingTimestamp) => GetElapsedTime(startingTimestamp, GetTimestamp());
+
+        /// <summary>Creates a new <see cref="ITimer"/> instance, using <see cref="TimeSpan"/> values to measure time intervals.</summary>
+        /// <param name="callback">
+        /// A delegate representing a method to be executed when the timer fires. The method specified for callback should be reentrant,
+        /// as it may be invoked simultaneously on two threads if the timer fires again before or while a previous callback is still being handled.
+        /// </param>
+        /// <param name="state">An object to be passed to the <paramref name="callback"/>. This may be null.</param>
+        /// <param name="dueTime">The amount of time to delay before <paramref name="callback"/> is invoked. Specify <see cref="Timeout.InfiniteTimeSpan"/> to prevent the timer from starting. Specify <see cref="TimeSpan.Zero"/> to start the timer immediately.</param>
+        /// <param name="period">The time interval between invocations of <paramref name="callback"/>. Specify <see cref="Timeout.InfiniteTimeSpan"/> to disable periodic signaling.</param>
+        /// <returns>
+        /// The newly created <see cref="ITimer"/> instance.
+        /// </returns>
+        /// <exception cref="ArgumentNullException"><paramref name="callback"/> is null.</exception>
+        /// <exception cref="ArgumentOutOfRangeException">The number of milliseconds in the value of <paramref name="dueTime"/> or <paramref name="period"/> is negative and not equal to <see cref="Timeout.Infinite"/>, or is greater than <see cref="int.MaxValue">int.MaxValue</see>.</exception>
+        /// <remarks>
+        /// <para>
+        /// The delegate specified by the callback parameter is invoked once after <paramref name="dueTime"/> elapses, and thereafter each time the <paramref name="period"/> time interval elapses.
+        /// </para>
+        /// <para>
+        /// If <paramref name="dueTime"/> is zero, the callback is invoked immediately. If <paramref name="dueTime"/> is -1 milliseconds, <paramref name="callback"/> is not invoked; the timer is disabled,
+        /// but can be re-enabled by calling the <see cref="ITimer.Change"/> method.
+        /// </para>
+        /// <para>
+        /// If <paramref name="period"/> is 0 or -1 milliseconds and <paramref name="dueTime"/> is positive, <paramref name="callback"/> is invoked once; the periodic behavior of the timer is disabled,
+        /// but can be re-enabled using the <see cref="ITimer.Change"/> method.
+        /// </para>
+        /// <para>
+        /// The return <see cref="ITimer"/> instance will be implicitly rooted while the timer is still scheduled.
+        /// </para>
+        /// <para>
+        /// <see cref="CreateTimer"/> captures the <see cref="ExecutionContext"/> and stores that with the <see cref="ITimer"/> for use in invoking <paramref name="callback"/>
+        /// each time it's called. That capture can be suppressed with <see cref="ExecutionContext.SuppressFlow"/>.
+        /// </para>
+        /// </remarks>
+        public virtual ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            ArgumentNullException.ThrowIfNull(callback);
+
+            return new SystemTimeProviderTimer(dueTime, period, callback, state);
+        }
+
+        private sealed class SystemTimeProviderTimer : ITimer, IDisposable, IAsyncDisposable
+        {
+            private readonly TimerQueueTimer _timer;
+
+            public SystemTimeProviderTimer(TimeSpan dueTime, TimeSpan period, TimerCallback callback, object state)
+            {
+                _timer = new TimerQueueTimer(callback, state, dueTime, period, flowExecutionContext: true);
+            }
+
+            public bool Change(TimeSpan dueTime, TimeSpan period)
+            {
+                try
+                {
+                    return _timer.Change(dueTime, period);
+                }
+                catch (ObjectDisposedException)
+                {
+                    return false;
+                }
+            }
+
+            public void Dispose() => _timer.Dispose();
+
+            public ValueTask DisposeAsync()
+            {
+                return _timer.DisposeAsync();
+            }
+        }
+
+        /// <summary>
+        /// Used to create a <see cref="TimeProvider"/> instance returned from <see cref="System"/> and uses the default implementation
+        /// provided by <see cref="TimeProvider"/> which uses <see cref="DateTimeOffset.UtcNow"/>, <see cref="TimeZoneInfo.Local"/>, <see cref="Stopwatch"/>, and <see cref="Timer"/>.
+        /// </summary>
+        private sealed class SystemTimeProvider : TimeProvider
+        {
+            /// <summary>Initializes the instance.</summary>
+            internal SystemTimeProvider() : base()
+            {
+            }
+        }
+    }
+
     public class Random
     {
-        private int _seed;
+        private const int StackallocThreshold = 256;
+
+        /// <summary>The underlying generator implementation.</summary>
+        /// <remarks>
+        /// This is separated out so that different generators can be used based on how this Random instance is constructed.
+        /// If it's built from a seed, then we may need to ensure backwards compatibility for folks expecting consistent sequences
+        /// based on that seed.  If the instance is actually derived from Random, then we need to ensure the derived type's
+        /// overrides are called anywhere they were being called previously.  But if the instance is the base type and is constructed
+        /// with the default constructor, we have a lot of flexibility as to how to optimize the performance and quality of the generator.
+        /// </remarks>
+        private readonly ImplBase _impl;
+
+        /// <summary>Initializes a new instance of the <see cref="Random"/> class using a default seed value.</summary>
+        public Random() =>
+            // With no seed specified, if this is the base type, we can implement this however we like.
+            // If it's a derived type, for compat we respect the previous implementation, so that overrides
+            // are called as they were previously.
+            _impl = GetType() == typeof(Random) ? new XoshiroImpl() : new CompatDerivedImpl(this);
+
+        /// <summary>Initializes a new instance of the Random class, using the specified seed value.</summary>
+        /// <param name="Seed">
+        /// A number used to calculate a starting value for the pseudo-random number sequence. If a negative number
+        /// is specified, the absolute value of the number is used.
+        /// </param>
+        public Random(int Seed) =>
+            // With a custom seed, if this is the base Random class, we still need to respect the same algorithm that's been
+            // used in the past, but we can do so without having to deal with calling the right overrides in a derived type.
+            // If this is a derived type, we need to handle always using the same overrides we've done previously.
+            _impl = GetType() == typeof(Random) ? new CompatSeedImpl(Seed) : new CompatDerivedImpl(this, Seed);
+
+        /// <summary>Constructor used by <see cref="ThreadSafeRandom"/>.</summary>
+        /// <param name="isThreadSafeRandom">Must be true.</param>
+        private protected Random(bool isThreadSafeRandom)
+        {
+            _impl = null!; // base implementation isn't used at all
+        }
+
+        /// <summary>Provides a thread-safe <see cref="Random"/> instance that may be used concurrently from any thread.</summary>
         public static Random Shared { get; } = new ThreadSafeRandom();
-        public Random() { }
-        public Random(int seed) { _seed = seed; }
 
+        /// <summary>Returns a non-negative random integer.</summary>
+        /// <returns>A 32-bit signed integer that is greater than or equal to 0 and less than <see cref="int.MaxValue"/>.</returns>
+        public virtual int Next()
+        {
+            int result = _impl.Next();
+            return result;
+        }
 
-        public virtual int Next() => Next(0, 0x7fffffff);
-        public virtual int Next(int maxValue) => Next(0, maxValue);
+        /// <summary>Returns a non-negative random integer that is less than the specified maximum.</summary>
+        /// <param name="maxValue">The exclusive upper bound of the random number to be generated. <paramref name="maxValue"/> must be greater than or equal to 0.</param>
+        /// <returns>
+        /// A 32-bit signed integer that is greater than or equal to 0, and less than <paramref name="maxValue"/>; that is, the range of return values ordinarily
+        /// includes 0 but not <paramref name="maxValue"/>. However, if <paramref name="maxValue"/> equals 0, <paramref name="maxValue"/> is returned.
+        /// </returns>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxValue"/> is less than 0.</exception>
+        public virtual int Next(int maxValue)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(maxValue);
 
-        [MethodImpl(MethodImplOptions.InternalCall)]
+            int result = _impl.Next(maxValue);
+            return result;
+        }
+
+        /// <summary>Returns a random integer that is within a specified range.</summary>
+        /// <param name="minValue">The inclusive lower bound of the random number returned.</param>
+        /// <param name="maxValue">The exclusive upper bound of the random number returned. <paramref name="maxValue"/> must be greater than or equal to <paramref name="minValue"/>.</param>
+        /// <returns>
+        /// A 32-bit signed integer greater than or equal to <paramref name="minValue"/> and less than <paramref name="maxValue"/>; that is, the range of return values includes <paramref name="minValue"/>
+        /// but not <paramref name="maxValue"/>. If minValue equals <paramref name="maxValue"/>, <paramref name="minValue"/> is returned.
+        /// </returns>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="minValue"/> is greater than <paramref name="maxValue"/>.</exception>
         public virtual int Next(int minValue, int maxValue)
         {
             if (minValue > maxValue)
             {
-                throw new Exception();
+                ThrowMinMaxValueSwapped();
             }
 
-            //int result = _impl.Next(minValue, maxValue);
-            //AssertInRange(result, minValue, maxValue);
-            return -1;
+            int result = _impl.Next(minValue, maxValue);
+            return result;
+        }
+
+        /// <summary>Returns a non-negative random integer.</summary>
+        /// <returns>A 64-bit signed integer that is greater than or equal to 0 and less than <see cref="long.MaxValue"/>.</returns>
+        public virtual long NextInt64()
+        {
+            long result = _impl.NextInt64();
+            return result;
+        }
+
+        /// <summary>Returns a non-negative random integer that is less than the specified maximum.</summary>
+        /// <param name="maxValue">The exclusive upper bound of the random number to be generated. <paramref name="maxValue"/> must be greater than or equal to 0.</param>
+        /// <returns>
+        /// A 64-bit signed integer that is greater than or equal to 0, and less than <paramref name="maxValue"/>; that is, the range of return values ordinarily
+        /// includes 0 but not <paramref name="maxValue"/>. However, if <paramref name="maxValue"/> equals 0, <paramref name="maxValue"/> is returned.
+        /// </returns>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxValue"/> is less than 0.</exception>
+        public virtual long NextInt64(long maxValue)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(maxValue);
+
+            long result = _impl.NextInt64(maxValue);
+            return result;
+        }
+
+        /// <summary>Returns a random integer that is within a specified range.</summary>
+        /// <param name="minValue">The inclusive lower bound of the random number returned.</param>
+        /// <param name="maxValue">The exclusive upper bound of the random number returned. <paramref name="maxValue"/> must be greater than or equal to <paramref name="minValue"/>.</param>
+        /// <returns>
+        /// A 64-bit signed integer greater than or equal to <paramref name="minValue"/> and less than <paramref name="maxValue"/>; that is, the range of return values includes <paramref name="minValue"/>
+        /// but not <paramref name="maxValue"/>. If minValue equals <paramref name="maxValue"/>, <paramref name="minValue"/> is returned.
+        /// </returns>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="minValue"/> is greater than <paramref name="maxValue"/>.</exception>
+        public virtual long NextInt64(long minValue, long maxValue)
+        {
+            if (minValue > maxValue)
+            {
+                ThrowMinMaxValueSwapped();
+            }
+
+            long result = _impl.NextInt64(minValue, maxValue);
+            return result;
+        }
+
+        /// <summary>Returns a random floating-point number that is greater than or equal to 0.0, and less than 1.0.</summary>
+        /// <returns>A single-precision floating point number that is greater than or equal to 0.0, and less than 1.0.</returns>
+        public virtual float NextSingle()
+        {
+            float result = _impl.NextSingle();
+            return result;
+        }
+
+        /// <summary>Returns a random floating-point number that is greater than or equal to 0.0, and less than 1.0.</summary>
+        /// <returns>A double-precision floating point number that is greater than or equal to 0.0, and less than 1.0.</returns>
+        public virtual double NextDouble()
+        {
+            double result = _impl.NextDouble();
+            return result;
+        }
+
+        /// <summary>Fills the elements of a specified array of bytes with random numbers.</summary>
+        /// <param name="buffer">The array to be filled with random numbers.</param>
+        /// <exception cref="ArgumentNullException"><paramref name="buffer"/> is null.</exception>
+        public virtual void NextBytes(byte[] buffer)
+        {
+            if (buffer is null)
+            {
+                ThrowHelper.ThrowArgumentNullException(ExceptionArgument.buffer);
+            }
+
+            _impl.NextBytes(buffer);
+        }
+
+        /// <summary>Fills the elements of a specified span of bytes with random numbers.</summary>
+        /// <param name="buffer">The array to be filled with random numbers.</param>
+        public virtual void NextBytes(Span<byte> buffer) => _impl.NextBytes(buffer);
+
+        /// <summary>Returns a non-negative random integer of type <typeparamref name="T"/>.</summary>
+        /// <typeparam name="T">The type of integer to generate.</typeparam>
+        /// <returns>
+        /// A value of type <typeparamref name="T"/> in the inclusive range [0, <c>T.MaxValue</c>].
+        /// </returns>
+        /// <remarks>
+        /// Unlike <see cref="Next()"/>, which returns an <see cref="int"/> that is less than <see cref="int.MaxValue"/>,
+        /// <c>NextInteger&lt;int&gt;()</c> returns an <see cref="int"/> in the inclusive range from zero through
+        /// <see cref="int.MaxValue"/> and may return <see cref="int.MaxValue"/>.
+        /// <para><typeparamref name="T"/> must behave as if it were a two's complement value with all values in range being representable.</para>
+        /// </remarks>
+        public T NextInteger<T>() where T : IBinaryInteger<T>, IMinMaxValue<T>
+        {
+            if (T.MaxValue == T.Zero)
+            {
+                return T.Zero;
+            }
+
+            ArgumentOutOfRangeException.ThrowIfNegative(T.MaxValue);
+
+            int bitLength = T.MaxValue.GetShortestBitLength();
+            int byteCount = (bitLength + 7) >> 3;
+
+            // Compute mask for the top byte to avoid negative values for signed types
+            // and to reduce rejection rate for custom integer types.
+            int topBits = bitLength & 7;
+            byte topMask = topBits == 0 ? byte.MaxValue : (byte)((1 << topBits) - 1);
+
+            byte[]? rented = null;
+            Span<byte> bytes = byteCount <= StackallocThreshold
+                ? stackalloc byte[StackallocThreshold]
+                : rented = ArrayPool<byte>.Shared.Rent(byteCount);
+            bytes = bytes.Slice(0, byteCount);
+
+            try
+            {
+                while (true)
+                {
+                    NextBytes(bytes);
+                    bytes[^1] &= topMask;
+
+                    // Masking clears any sign bit and any bits beyond the shortest width of T.MaxValue,
+                    // but custom IBinaryInteger<T> implementations can still have unrepresentable values
+                    // within that width. Reject those rather than assuming the mask is sufficient.
+                    T value = T.ReadLittleEndian(bytes, isUnsigned: true);
+                    if (value <= T.MaxValue)
+                    {
+                        return value;
+                    }
+                }
+            }
+            finally
+            {
+                if (rented is not null)
+                {
+                    ArrayPool<byte>.Shared.Return(rented);
+                }
+            }
+        }
+
+        /// <summary>Returns a non-negative random integer that is less than the specified maximum.</summary>
+        /// <typeparam name="T">The type of integer to generate.</typeparam>
+        /// <param name="maxValue">The exclusive upper bound of the random number to be generated.
+        /// <paramref name="maxValue"/> must be greater than or equal to zero.</param>
+        /// <returns>
+        /// A value of type <typeparamref name="T"/> that is greater than or equal to zero,
+        /// and less than <paramref name="maxValue"/>; that is, the range of return values is ordinarily
+        /// [0, <paramref name="maxValue"/>). However, if <paramref name="maxValue"/> equals zero, zero is returned.
+        /// </returns>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxValue"/> is less than zero.</exception>
+        /// <remarks><typeparamref name="T"/> must behave as if it were a two's complement value with all values in range being representable.</remarks>
+        public T NextInteger<T>(T maxValue) where T : IBinaryInteger<T>
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(maxValue);
+
+            return NextBinaryIntegerInRange(maxValue);
+        }
+
+        /// <summary>Returns a random integer that is within a specified range.</summary>
+        /// <typeparam name="T">The type of integer to generate.</typeparam>
+        /// <param name="minValue">The inclusive lower bound of the random number returned.</param>
+        /// <param name="maxValue">The exclusive upper bound of the random number returned.
+        /// <paramref name="maxValue"/> must be greater than or equal to <paramref name="minValue"/>.</param>
+        /// <returns>
+        /// A value of type <typeparamref name="T"/> greater than or equal to <paramref name="minValue"/>
+        /// and less than <paramref name="maxValue"/>; that is, the range of return values is ordinarily
+        /// [<paramref name="minValue"/>, <paramref name="maxValue"/>). If <paramref name="minValue"/>
+        /// equals <paramref name="maxValue"/>, <paramref name="minValue"/> is returned.
+        /// </returns>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="minValue"/> is greater than <paramref name="maxValue"/>.</exception>
+        /// <remarks><typeparamref name="T"/> must behave as if it were a two's complement value with all values in range being representable.</remarks>
+        public T NextInteger<T>(T minValue, T maxValue) where T : IBinaryInteger<T>
+        {
+            if (minValue > maxValue)
+            {
+                ThrowMinMaxValueSwapped();
+            }
+
+            // For signed types, subtraction may overflow when the range exceeds T.MaxValue.
+            // T.IsNegative(range) detects this. Fall back to full-width generation.
+            T range = maxValue - minValue;
+            return T.IsNegative(range) ?
+                NextBinaryIntegerFullRange(minValue, maxValue) :
+                NextBinaryIntegerInRange(range) + minValue;
+        }
+
+        /// <summary>Generates a random value in [T.Zero, maxExclusive) where maxExclusive is non-negative.</summary>
+        private T NextBinaryIntegerInRange<T>(T maxExclusive) where T : IBinaryInteger<T>
+        {
+            // Fast paths for common types using existing optimized implementations.
+            // The JIT eliminates the dead branches when T is a known value type.
+            if (typeof(T) == typeof(sbyte) ||
+                typeof(T) == typeof(byte) ||
+                typeof(T) == typeof(short) ||
+                typeof(T) == typeof(ushort) ||
+                typeof(T) == typeof(char) ||
+                typeof(T) == typeof(int) ||
+                (typeof(T) == typeof(nint) && nint.Size == 4))
+            {
+                return T.CreateTruncating(Next(int.CreateTruncating(maxExclusive)));
+            }
+
+            if (typeof(T) == typeof(uint) ||
+                typeof(T) == typeof(nint) ||
+                typeof(T) == typeof(long) ||
+                (typeof(T) == typeof(nuint) && nint.Size == 4))
+            {
+                return T.CreateTruncating(NextInt64(long.CreateTruncating(maxExclusive)));
+            }
+
+            // We can't always use a fast path for these types, but if the maxExclusive value
+            // fits within a long, we can just generate a long and cast. The round-trip check
+            // ensures we don't silently truncate values for types larger than ulong.
+            if (typeof(T) == typeof(ulong) ||
+                (typeof(T) == typeof(nuint) && nint.Size == 8) ||
+                typeof(T) == typeof(Int128) ||
+                typeof(T) == typeof(UInt128))
+            {
+                ulong maxExclusiveUlong = ulong.CreateTruncating(maxExclusive);
+                if (maxExclusiveUlong <= (ulong)long.MaxValue &&
+                    T.CreateTruncating(maxExclusiveUlong) == maxExclusive)
+                {
+                    return T.CreateTruncating(NextInt64((long)maxExclusiveUlong));
+                }
+            }
+
+            // Generic fallback for large ulong, nuint, Int128, UInt128, BigInteger, etc.
+
+            if (maxExclusive == T.Zero)
+            {
+                return T.Zero;
+            }
+
+            int bitLength = maxExclusive.GetShortestBitLength();
+            int byteCount = (int)(((uint)bitLength + 7) / 8);
+
+            // Compute mask for the top byte to reduce rejection rate.
+            int topBits = bitLength & 7;
+            byte topMask = topBits == 0 ? byte.MaxValue : (byte)((1 << topBits) - 1);
+
+            byte[]? rented = null;
+            Span<byte> bytes = byteCount <= StackallocThreshold
+                ? stackalloc byte[StackallocThreshold]
+                : rented = ArrayPool<byte>.Shared.Rent(byteCount);
+            bytes = bytes.Slice(0, byteCount);
+
+            try
+            {
+                while (true)
+                {
+                    NextBytes(bytes);
+                    bytes[^1] &= topMask;
+
+                    T value = T.ReadLittleEndian(bytes, isUnsigned: true);
+                    if (value < maxExclusive)
+                    {
+                        return value;
+                    }
+                }
+            }
+            finally
+            {
+                if (rented is not null)
+                {
+                    ArrayPool<byte>.Shared.Return(rented);
+                }
+            }
+        }
+
+        /// <summary>Handles the case where the range overflows for signed types by generating full-width random values.</summary>
+        private T NextBinaryIntegerFullRange<T>(T minValue, T maxValue) where T : IBinaryInteger<T>
+        {
+            // The range exceeds what T can represent as a positive value.
+            // Generate a random value across the full range of T and check bounds.
+            // Since the range > T.MaxValue, the acceptance rate is > 50%.
+            int byteCount = Math.Max(minValue.GetByteCount(), maxValue.GetByteCount());
+
+            byte[]? rented = null;
+            Span<byte> bytes = byteCount <= StackallocThreshold
+                ? stackalloc byte[StackallocThreshold]
+                : rented = ArrayPool<byte>.Shared.Rent(byteCount);
+            bytes = bytes.Slice(0, byteCount);
+
+            try
+            {
+                while (true)
+                {
+                    NextBytes(bytes);
+
+                    T value = T.ReadLittleEndian(bytes, isUnsigned: false);
+                    if (value >= minValue && value < maxValue)
+                    {
+                        return value;
+                    }
+                }
+            }
+            finally
+            {
+                if (rented is not null)
+                {
+                    ArrayPool<byte>.Shared.Return(rented);
+                }
+            }
+        }
+
+        /// <summary>Returns a random binary floating-point number of type <typeparamref name="T"/> that is greater than or equal to 0.0, and less than 1.0.</summary>
+        /// <typeparam name="T">The type of floating-point number to generate.</typeparam>
+        /// <returns>A binary floating-point number of type <typeparamref name="T"/> in the range [0.0, 1.0).</returns>
+        public T NextBinaryFloat<T>() where T : IBinaryFloatingPointIeee754<T>
+        {
+            // Fast paths for common types using existing optimized implementations.
+            if (typeof(T) == typeof(float))
+            {
+                return T.CreateTruncating(NextSingle());
+            }
+
+            if (typeof(T) == typeof(double))
+            {
+                return T.CreateTruncating(NextDouble());
+            }
+
+            if (typeof(T) == typeof(NFloat))
+            {
+                return nint.Size == 8
+                    ? T.CreateTruncating(NextDouble())
+                    : T.CreateTruncating(NextSingle());
+            }
+
+            // For Half, BFloat16, and other low-precision types, converting from NextSingle()
+            // can round up to 1.0. Generate the value directly using the type's significand
+            // bit length to guarantee the result is in [0.0, 1.0).
+            int significandBitLength = T.Zero.GetSignificandBitLength();
+
+            // For types with significand >= 63 bits, 1L << significandBitLength would overflow.
+            // Build the random significand using chunks of up to 62 random bits. Since T has
+            // significandBitLength bits of precision, all intermediate values are exact.
+            // Note: No built-in IEEE type reaches this path (double has the largest significand
+            // at 53 bits). This handles hypothetical custom IBinaryFloatingPointIeee754<T>
+            // implementations with wider significands (e.g. Quad/Float128 with 113 bits).
+            if (significandBitLength >= 63)
+            {
+                T value = T.Zero;
+                int bitsRemaining = significandBitLength;
+                while (bitsRemaining > 0)
+                {
+                    int chunk = Math.Min(bitsRemaining, 62);
+                    long randomChunk = NextInt64(1L << chunk);
+                    value = T.ScaleB(value, chunk) + T.CreateTruncating(randomChunk);
+                    bitsRemaining -= chunk;
+                }
+
+                return T.ScaleB(value, -significandBitLength);
+            }
+
+            long randomBits = NextInt64(1L << significandBitLength);
+            return T.ScaleB(T.CreateTruncating(randomBits), -significandBitLength);
+        }
+
+        /// <summary>
+        ///   Fills the elements of a specified span with items chosen at random from the provided set of choices.
+        /// </summary>
+        /// <param name="choices">The items to use to populate the span.</param>
+        /// <param name="destination">The span to be filled with items.</param>
+        /// <typeparam name="T">The type of span.</typeparam>
+        /// <exception cref="ArgumentException"><paramref name="choices" /> is empty.</exception>
+        /// <remarks>
+        ///   The method uses <see cref="Next(int)" /> to select items randomly from <paramref name="choices" />
+        ///   by index and populate <paramref name="destination" />.
+        /// </remarks>
+        public unsafe void GetItems<T>(ReadOnlySpan<T> choices, Span<T> destination)
+        {
+            if (choices.IsEmpty)
+            {
+                throw new ArgumentException(SR.Arg_EmptySpan, nameof(choices));
+            }
+
+            // The most expensive part of this operation is the call to get random data. If the number of
+            // choices is <= 256 (which is the majority use case), we can use a single byte per element,
+            // which means we can ammortize the cost of getting random data by getting random bytes in bulk.
+            // However, we can only do that if this instance is Random.Shared or an instance created with
+            // `new Random()`. If it was created with a seed, changing which members we call and how many
+            // times may result in a visible difference in the sequence of output items. Similarly if it's
+            // a derived instance, which overrides get called and when is observable.
+            ImplBase impl = _impl;
+            if ((impl is null || impl.GetType() == typeof(XoshiroImpl)) &&
+                choices.Length <= 256)
+            {
+                // Get stack space to store random bytes. This size was chosen to balance between
+                // stack consumed and number of random calls required.
+                Span<byte> randomBytes = stackalloc byte[512];
+
+                if (BitOperations.IsPow2(choices.Length))
+                {
+                    // To avoid bias, we can't just % all bytes to get them into range; that would cause
+                    // the lower values to be more likely than the higher values. If the number of choices
+                    // is a power of 2, though, we can just mask off the extraneous bits.
+
+                    int mask = choices.Length - 1;
+
+                    while (!destination.IsEmpty)
+                    {
+                        // If this will be the last iteration, avoid over-requesting randomness.
+                        if (destination.Length < randomBytes.Length)
+                        {
+                            randomBytes = randomBytes.Slice(0, destination.Length);
+                        }
+
+                        NextBytes(randomBytes);
+
+                        for (int i = 0; i < randomBytes.Length; i++)
+                        {
+                            destination[i] = choices[randomBytes[i] & mask];
+                        }
+
+                        destination = destination.Slice(randomBytes.Length);
+                    }
+                }
+                else
+                {
+                    // As the length isn't a power of two, we can't just mask off all extraneous bits, and
+                    // instead need to do rejection sampling. However, we can mask off the irrelevant bits, which
+                    // then reduces the chances of needing to reject a value.
+
+                    int mask = (int)BitOperations.RoundUpToPowerOf2((uint)choices.Length) - 1;
+
+                    while (!destination.IsEmpty)
+                    {
+                        // Unlike in the IsPow2 case, where every byte will be used, some bytes here may
+                        // be rejected. On average, half the bytes may be rejected, so we heuristically
+                        // choose to shrink to twice the destination length.
+                        if (destination.Length * 2 < randomBytes.Length)
+                        {
+                            randomBytes = randomBytes.Slice(0, destination.Length * 2);
+                        }
+
+                        NextBytes(randomBytes);
+
+                        int i = 0;
+                        foreach (byte b in randomBytes)
+                        {
+                            if ((uint)i >= (uint)destination.Length)
+                            {
+                                break;
+                            }
+
+                            byte masked = (byte)(b & mask);
+                            if (masked < (uint)choices.Length)
+                            {
+                                destination[i++] = choices[masked];
+                            }
+                        }
+
+                        destination = destination.Slice(i);
+                    }
+                }
+            }
+            else
+            {
+                // Simple fallback: get each item individually, generating a new random Int32 for each
+                // item. This is slower than the above, but it works for all types and sizes of choices.
+                for (int i = 0; i < destination.Length; i++)
+                {
+                    destination[i] = choices[Next(choices.Length)];
+                }
+            }
+        }
+
+        /// <summary>
+        ///   Creates an array populated with items chosen at random from the provided set of choices.
+        /// </summary>
+        /// <param name="choices">The items to use to populate the array.</param>
+        /// <param name="length">The length of array to return.</param>
+        /// <typeparam name="T">The type of array.</typeparam>
+        /// <returns>An array populated with random items.</returns>
+        /// <exception cref="ArgumentException"><paramref name="choices" /> is empty.</exception>
+        /// <exception cref="ArgumentNullException"><paramref name="choices" /> is <see langword="null" />.</exception>
+        /// <exception cref="ArgumentOutOfRangeException">
+        ///   <paramref name="length" /> is not zero or a positive number.
+        /// </exception>
+        /// <remarks>
+        ///   The method uses <see cref="Next(int)" /> to select items randomly from <paramref name="choices" />
+        ///   by index. This is used to populate a newly-created array.
+        /// </remarks>
+        public T[] GetItems<T>(T[] choices, int length)
+        {
+            ArgumentNullException.ThrowIfNull(choices);
+            return GetItems(new ReadOnlySpan<T>(choices), length);
+        }
+
+        /// <summary>
+        ///   Creates an array populated with items chosen at random from the provided set of choices.
+        /// </summary>
+        /// <param name="choices">The items to use to populate the array.</param>
+        /// <param name="length">The length of array to return.</param>
+        /// <typeparam name="T">The type of array.</typeparam>
+        /// <returns>An array populated with random items.</returns>
+        /// <exception cref="ArgumentException"><paramref name="choices" /> is empty.</exception>
+        /// <exception cref="ArgumentOutOfRangeException">
+        ///   <paramref name="length" /> is not zero or a positive number.
+        /// </exception>
+        /// <remarks>
+        ///   The method uses <see cref="Next(int)" /> to select items randomly from <paramref name="choices" />
+        ///   by index. This is used to populate a newly-created array.
+        /// </remarks>
+        public T[] GetItems<T>(ReadOnlySpan<T> choices, int length)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(length);
+
+            T[] items = new T[length];
+            GetItems(choices, items.AsSpan());
+            return items;
+        }
+
+        /// <summary>
+        ///   Performs an in-place shuffle of an array.
+        /// </summary>
+        /// <param name="values">The array to shuffle.</param>
+        /// <typeparam name="T">The type of array.</typeparam>
+        /// <exception cref="ArgumentNullException"><paramref name="values" /> is <see langword="null" />.</exception>
+        /// <remarks>
+        ///   This method uses <see cref="Next(int, int)" /> to choose values for shuffling.
+        ///   This method is an O(n) operation.
+        /// </remarks>
+        public void Shuffle<T>(T[] values)
+        {
+            ArgumentNullException.ThrowIfNull(values);
+            // this can't use AsSpan due to array covariance
+            // forcing it like this is safe due to everything being in the array already
+            Shuffle(new Span<T>(ref MemoryMarshal.GetArrayDataReference(values), values.Length));
+        }
+
+        /// <summary>
+        ///   Performs an in-place shuffle of a span.
+        /// </summary>
+        /// <param name="values">The span to shuffle.</param>
+        /// <typeparam name="T">The type of span.</typeparam>
+        /// <remarks>
+        ///   This method uses <see cref="Next(int, int)" /> to choose values for shuffling.
+        ///   This method is an O(n) operation.
+        /// </remarks>
+        public void Shuffle<T>(Span<T> values)
+        {
+            for (int i = 0; i < values.Length - 1; i++)
+            {
+                int j = Next(i, values.Length);
+
+                // The i != j check is excluded intentionally.
+                // Microbenchmarks show that the mispredicted branches cost more than the redundant read/write for small value types.
+                // Since large value types are uncommon in shuffle scenarios, the trade-off favors removing the branch.
+                T temp = values[i];
+                values[i] = values[j];
+                values[j] = temp;
+            }
+        }
+
+        /// <summary>Creates a string populated with characters chosen at random from <paramref name="choices"/>.</summary>
+        /// <param name="choices">The characters to use to populate the string.</param>
+        /// <param name="length">The length of string to return.</param>
+        /// <returns>A string populated with items selected at random from <paramref name="choices"/>.</returns>
+        /// <exception cref="ArgumentException"><paramref name="choices" /> is empty.</exception>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="length" /> is not zero or a positive number.</exception>
+        /// <seealso cref="GetItems{T}(ReadOnlySpan{T}, Span{T})" />
+        public string GetString(ReadOnlySpan<char> choices, int length)
+        {
+            if (choices.IsEmpty)
+            {
+                throw new ArgumentException(SR.Arg_EmptySpan, nameof(choices));
+            }
+
+            if (length <= 0)
+            {
+                ArgumentOutOfRangeException.ThrowIfNegative(length);
+                return string.Empty;
+            }
+
+            string destination = string.FastAllocateString(length);
+            GetItems(choices, new Span<char>(ref destination.GetRawStringData(), destination.Length));
+            return destination;
+        }
+
+        /// <summary>Creates a string filled with random hexadecimal characters.</summary>
+        /// <param name="stringLength">The length of string to create.</param>
+        /// <param name="lowercase">
+        /// <see langword="true" /> if the hexadecimal characters should be lowercase; <see langword="false" /> if they should be uppercase.
+        /// The default is <see langword="false" />.
+        /// </param>
+        /// <returns>A string populated with random hexadecimal characters.</returns>
+        public string GetHexString(int stringLength, bool lowercase = false) =>
+            GetString(GetHexChoices(lowercase), stringLength);
+
+        /// <summary>Fills a buffer with random hexadecimal characters.</summary>
+        /// <param name="destination">The buffer to receive the characters.</param>
+        /// <param name="lowercase">
+        /// <see langword="true" /> if the hexadecimal characters should be lowercase; <see langword="false" /> if they should be uppercase.
+        /// The default is <see langword="false" />.
+        /// </param>
+        public void GetHexString(Span<char> destination, bool lowercase = false) =>
+            GetItems(GetHexChoices(lowercase), destination);
+
+        /// <summary>Gets all possible hex characters for the specified casing.</summary>
+        private static ReadOnlySpan<char> GetHexChoices(bool lowercase) =>
+            lowercase ? "0123456789abcdef" : "0123456789ABCDEF";
+
+        /// <summary>Returns a random floating-point number between 0.0 and 1.0.</summary>
+        /// <returns>A double-precision floating point number that is greater than or equal to 0.0, and less than 1.0.</returns>
+        protected virtual double Sample()
+        {
+            double result = _impl.Sample();
+            return result;
+        }
+
+        private static void ThrowMinMaxValueSwapped() =>
+            throw new ArgumentOutOfRangeException("minValue", SR.Format(SR.Argument_MinMaxValue, "minValue", "maxValue"));
+
+        /// <summary>Random implementation that delegates all calls to a ThreadStatic Impl instance.</summary>
+        private sealed class ThreadSafeRandom : Random
+        {
+            // We need Random.Shared to return an instance that is thread-safe, as it may be used from multiple threads.
+            // It's also possible that one thread could retrieve Shared and pass it to another thread, so Shared can't
+            // just access a ThreadStatic to return a Random instance stored there.  As such, we need the instance
+            // returned from Shared itself to be thread-safe, which can be accomplished either by locking around all
+            // accesses or by itself accessing a ThreadStatic on every access: we've chosen the latter, as it is more
+            // scalable.  With that, we have two basic approaches:
+            // 1. the instance returned can be a base Random instance constructed with an _impl that is a ThreadSafeImpl.
+            // 2. the instance returned can be a special Random-derived instance, where _impl is ignored and the derived
+            //    type overrides all methods on the base.
+            // (1) is cleaner, as (2) requires duplicating a bit more code, but (2) enables all virtual dispatch to be
+            // devirtualized and potentially inlined, so that Random.Shared.NextXx(...) ends up being faster.
+            // This implements (2).
+
+            [ThreadStatic]
+            private static XoshiroImpl? t_random;
+
+            public ThreadSafeRandom() : base(isThreadSafeRandom: true) { }
+
+            private static XoshiroImpl LocalRandom => t_random ?? Create();
+
+            [MethodImpl(MethodImplOptions.NoInlining)]
+            private static XoshiroImpl Create() => t_random = new();
+
+            public override int Next()
+            {
+                int result = LocalRandom.Next();
+                return result;
+            }
+
+            public override int Next(int maxValue)
+            {
+                ArgumentOutOfRangeException.ThrowIfNegative(maxValue);
+
+                int result = LocalRandom.Next(maxValue);
+                return result;
+            }
+
+            public override int Next(int minValue, int maxValue)
+            {
+                if (minValue > maxValue)
+                {
+                    ThrowMinMaxValueSwapped();
+                }
+
+                int result = LocalRandom.Next(minValue, maxValue);
+                return result;
+            }
+
+            public override long NextInt64()
+            {
+                long result = LocalRandom.NextInt64();
+                return result;
+            }
+
+            public override long NextInt64(long maxValue)
+            {
+                ArgumentOutOfRangeException.ThrowIfNegative(maxValue);
+
+                long result = LocalRandom.NextInt64(maxValue);
+                return result;
+            }
+
+            public override long NextInt64(long minValue, long maxValue)
+            {
+                if (minValue > maxValue)
+                {
+                    ThrowMinMaxValueSwapped();
+                }
+
+                long result = LocalRandom.NextInt64(minValue, maxValue);
+                return result;
+            }
+
+            public override float NextSingle()
+            {
+                float result = LocalRandom.NextSingle();
+                return result;
+            }
+
+            public override double NextDouble()
+            {
+                double result = LocalRandom.NextDouble();
+                return result;
+            }
+
+            public override void NextBytes(byte[] buffer)
+            {
+                if (buffer is null)
+                {
+                    ThrowHelper.ThrowArgumentNullException(ExceptionArgument.buffer);
+                }
+
+                LocalRandom.NextBytes(buffer);
+            }
+
+            public override void NextBytes(Span<byte> buffer) => LocalRandom.NextBytes(buffer);
+
+            protected override double Sample() => throw new NotSupportedException();
+        }
+
+        /// <summary>Base type for all generator implementations that plug into the base Random.</summary>
+        internal abstract class ImplBase
+        {
+            public abstract double Sample();
+
+            public abstract int Next();
+
+            public abstract int Next(int maxValue);
+
+            public abstract int Next(int minValue, int maxValue);
+
+            public abstract long NextInt64();
+
+            public abstract long NextInt64(long maxValue);
+
+            public abstract long NextInt64(long minValue, long maxValue);
+
+            public abstract float NextSingle();
+
+            public abstract double NextDouble();
+
+            public abstract void NextBytes(byte[] buffer);
+
+            public abstract void NextBytes(Span<byte> buffer);
+
+            // NextUInt32/64 algorithms based on https://arxiv.org/pdf/1805.10941.pdf and https://github.com/lemire/fastrange.
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            internal static uint NextUInt32(uint maxValue, XoshiroImpl xoshiro)
+            {
+                ulong randomProduct = (ulong)maxValue * xoshiro.NextUInt32();
+                uint lowPart = (uint)randomProduct;
+
+                if (lowPart < maxValue)
+                {
+                    uint remainder = (0u - maxValue) % maxValue;
+
+                    while (lowPart < remainder)
+                    {
+                        randomProduct = (ulong)maxValue * xoshiro.NextUInt32();
+                        lowPart = (uint)randomProduct;
+                    }
+                }
+
+                return (uint)(randomProduct >> 32);
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            internal static ulong NextUInt64(ulong maxValue, XoshiroImpl xoshiro)
+            {
+                ulong randomProduct = Math.BigMul(maxValue, xoshiro.NextUInt64(), out ulong lowPart);
+
+                if (lowPart < maxValue)
+                {
+                    ulong remainder = (0ul - maxValue) % maxValue;
+
+                    while (lowPart < remainder)
+                    {
+                        randomProduct = Math.BigMul(maxValue, xoshiro.NextUInt64(), out lowPart);
+                    }
+                }
+
+                return randomProduct;
+            }
+        }
+
+        /// <summary>
+        /// Provides an implementation of the xoshiro256** algorithm. This implementation is used
+        /// on 64-bit when no seed is specified and an instance of the base Random class is constructed.
+        /// As such, we are free to implement however we see fit, without back compat concerns around
+        /// the sequence of numbers generated or what methods call what other methods.
+        /// </summary>
+        internal sealed class XoshiroImpl : ImplBase
+        {
+            // NextUInt64 is based on the algorithm from http://prng.di.unimi.it/xoshiro256starstar.c:
+            //
+            //     Written in 2018 by David Blackman and Sebastiano Vigna (vigna@acm.org)
+            //
+            //     To the extent possible under law, the author has dedicated all copyright
+            //     and related and neighboring rights to this software to the public domain
+            //     worldwide. This software is distributed without any warranty.
+            //
+            //     See <http://creativecommons.org/publicdomain/zero/1.0/>.
+
+            private ulong _s0, _s1, _s2, _s3;
+
+            public unsafe XoshiroImpl()
+            {
+                ulong* ptr = stackalloc ulong[4];
+                do
+                {
+                    Interop.GetRandomBytes((byte*)ptr, 4 * sizeof(ulong));
+                    _s0 = ptr[0];
+                    _s1 = ptr[1];
+                    _s2 = ptr[2];
+                    _s3 = ptr[3];
+                }
+                while ((_s0 | _s1 | _s2 | _s3) == 0); // at least one value must be non-zero
+            }
+
+            /// <summary>Produces a value in the range [0, uint.MaxValue].</summary>
+            [MethodImpl(MethodImplOptions.AggressiveInlining)] // small-ish hot path used by very few call sites
+            internal uint NextUInt32() => (uint)(NextUInt64() >> 32);
+
+            /// <summary>Produces a value in the range [0, ulong.MaxValue].</summary>
+            [MethodImpl(MethodImplOptions.AggressiveInlining)] // small-ish hot path used by a handful of "next" methods
+            internal ulong NextUInt64()
+            {
+                ulong s0 = _s0, s1 = _s1, s2 = _s2, s3 = _s3;
+
+                ulong result = BitOperations.RotateLeft(s1 * 5, 7) * 9;
+                ulong t = s1 << 17;
+
+                s2 ^= s0;
+                s3 ^= s1;
+                s1 ^= s2;
+                s0 ^= s3;
+
+                s2 ^= t;
+                s3 = BitOperations.RotateLeft(s3, 45);
+
+                _s0 = s0;
+                _s1 = s1;
+                _s2 = s2;
+                _s3 = s3;
+
+                return result;
+            }
+
+            public override int Next()
+            {
+                while (true)
+                {
+                    // Get top 31 bits to get a value in the range [0, int.MaxValue], but try again
+                    // if the value is actually int.MaxValue, as the method is defined to return a value
+                    // in the range [0, int.MaxValue).
+                    ulong result = NextUInt64() >> 33;
+                    if (result != int.MaxValue)
+                    {
+                        return (int)result;
+                    }
+                }
+            }
+
+            public override int Next(int maxValue)
+            {
+                return (int)NextUInt32((uint)maxValue, this);
+            }
+
+            public override int Next(int minValue, int maxValue)
+            {
+                return (int)NextUInt32((uint)(maxValue - minValue), this) + minValue;
+            }
+
+            public override long NextInt64()
+            {
+                while (true)
+                {
+                    // Get top 63 bits to get a value in the range [0, long.MaxValue], but try again
+                    // if the value is actually long.MaxValue, as the method is defined to return a value
+                    // in the range [0, long.MaxValue).
+                    ulong result = NextUInt64() >> 1;
+                    if (result != long.MaxValue)
+                    {
+                        return (long)result;
+                    }
+                }
+            }
+
+            public override long NextInt64(long maxValue)
+            {
+                return (long)NextUInt64((ulong)maxValue, this);
+            }
+
+            public override long NextInt64(long minValue, long maxValue)
+            {
+                return (long)NextUInt64((ulong)(maxValue - minValue), this) + minValue;
+            }
+
+            public override void NextBytes(byte[] buffer) => NextBytes((Span<byte>)buffer);
+
+            public override unsafe void NextBytes(Span<byte> buffer)
+            {
+                ulong s0 = _s0, s1 = _s1, s2 = _s2, s3 = _s3;
+
+                while (buffer.Length >= sizeof(ulong))
+                {
+                    MemoryMarshal.Write(buffer, BitOperations.RotateLeft(s1 * 5, 7) * 9);
+
+                    // Update PRNG state.
+                    ulong t = s1 << 17;
+                    s2 ^= s0;
+                    s3 ^= s1;
+                    s1 ^= s2;
+                    s0 ^= s3;
+                    s2 ^= t;
+                    s3 = BitOperations.RotateLeft(s3, 45);
+
+                    buffer = buffer.Slice(sizeof(ulong));
+                }
+
+                if (!buffer.IsEmpty)
+                {
+                    ulong next = BitOperations.RotateLeft(s1 * 5, 7) * 9;
+                    byte* remainingBytes = (byte*)&next;
+                    for (int i = 0; i < buffer.Length; i++)
+                    {
+                        buffer[i] = remainingBytes[i];
+                    }
+
+                    // Update PRNG state.
+                    ulong t = s1 << 17;
+                    s2 ^= s0;
+                    s3 ^= s1;
+                    s1 ^= s2;
+                    s0 ^= s3;
+                    s2 ^= t;
+                    s3 = BitOperations.RotateLeft(s3, 45);
+                }
+
+                _s0 = s0;
+                _s1 = s1;
+                _s2 = s2;
+                _s3 = s3;
+            }
+
+            public override double NextDouble() =>
+                    // As described in http://prng.di.unimi.it/:
+                    // "A standard double (64-bit) floating-point number in IEEE floating point format has 52 bits of significand,
+                    //  plus an implicit bit at the left of the significand. Thus, the representation can actually store numbers with
+                    //  53 significant binary digits. Because of this fact, in C99 a 64-bit unsigned integer x should be converted to
+                    //  a 64-bit double using the expression
+                    //  (x >> 11) * 0x1.0p-53"
+                    (NextUInt64() >> 11) * (1.0 / (1ul << 53));
+
+            public override float NextSingle() =>
+                // Same as above, but with 24 bits instead of 53.
+                (NextUInt64() >> 40) * (1.0f / (1u << 24));
+
+            public override double Sample()
+            {
+                throw new NotSupportedException();
+            }
+        }
+
+        /// <summary>
+        /// Provides an implementation used for compatibility with cases where a derived type may
+        /// reasonably expect its overrides to be called.
+        /// </summary>
+        private sealed class CompatDerivedImpl : ImplBase
+        {
+            /// <summary>Reference to the <see cref="Random"/> containing this implementation instance.</summary>
+            /// <remarks>Used to ensure that any calls to other virtual members are performed using the Random-derived instance, if one exists.</remarks>
+            private readonly Random _parent;
+            /// <summary>Seed specified at construction time used to lazily initialize <see cref="_prng"/>.</summary>
+            private readonly int _seed;
+            /// <summary>Lazily-initialized algorithm backing this instance.</summary>
+            private CompatPrng _prng; // mutable struct; do not make this readonly
+
+            public CompatDerivedImpl(Random parent) : this(parent, Shared.Next()) { }
+
+            public CompatDerivedImpl(Random parent, int seed)
+            {
+                _parent = parent;
+                _seed = seed;
+            }
+
+            public override double Sample()
+            {
+                _prng.EnsureInitialized(_seed);
+                return _prng.Sample();
+            }
+
+            public override int Next()
+            {
+                _prng.EnsureInitialized(_seed);
+                return _prng.InternalSample();
+            }
+
+            public override int Next(int maxValue)
+            {
+                // We can use ConvertToIntegerNative here since we know the result of
+                // scaling the sample is in the range [0, int.MaxValue) and therefore
+                // the integer portion is exactly representable since it's < 2^52.
+                _prng.EnsureInitialized(_seed);
+                return double.ConvertToIntegerNative<int>(_parent.Sample() * maxValue);
+            }
+
+            public override int Next(int minValue, int maxValue)
+            {
+                // We can use ConvertToIntegerNative here since we know the result of
+                // scaling the sample is in the range [0, uint.MaxValue) and therefore
+                // the integer portion is exactly representable since it's < 2^52.
+                _prng.EnsureInitialized(_seed);
+                long range = (long)maxValue - minValue;
+                return range <= int.MaxValue ?
+                    double.ConvertToIntegerNative<int>(_parent.Sample() * range) + minValue :
+                    (int)(double.ConvertToIntegerNative<long>(_prng.GetSampleForLargeRange() * range) + minValue);
+            }
+
+            public override long NextInt64()
+            {
+                _prng.EnsureInitialized(_seed);
+                while (true)
+                {
+                    // Get top 63 bits to get a value in the range [0, long.MaxValue], but try again
+                    // if the value is actually long.MaxValue, as the method is defined to return a value
+                    // in the range [0, long.MaxValue).
+                    ulong result = NextUInt64() >> 1;
+                    if (result != long.MaxValue)
+                    {
+                        return (long)result;
+                    }
+                }
+            }
+
+            public override long NextInt64(long maxValue) => NextInt64(0, maxValue);
+
+            public override long NextInt64(long minValue, long maxValue)
+            {
+                ulong exclusiveRange = (ulong)(maxValue - minValue);
+
+                if (exclusiveRange > 1)
+                {
+                    _prng.EnsureInitialized(_seed);
+
+                    // Narrow down to the smallest range [0, 2^bits] that contains maxValue - minValue
+                    // Then repeatedly generate a value in that outer range until we get one within the inner range.
+                    int bits = BitOperations.Log2Ceiling(exclusiveRange);
+                    while (true)
+                    {
+                        ulong result = NextUInt64() >> (sizeof(long) * 8 - bits);
+                        if (result < exclusiveRange)
+                        {
+                            return (long)result + minValue;
+                        }
+                    }
+                }
+
+                return minValue;
+            }
+
+            /// <summary>Produces a value in the range [0, ulong.MaxValue].</summary>
+            private ulong NextUInt64() =>
+                 ((ulong)(uint)_parent.Next(1 << 22)) |
+                (((ulong)(uint)_parent.Next(1 << 22)) << 22) |
+                (((ulong)(uint)_parent.Next(1 << 20)) << 44);
+
+            public override double NextDouble()
+            {
+                _prng.EnsureInitialized(_seed);
+                return _parent.Sample();
+            }
+
+            public override float NextSingle()
+            {
+                _prng.EnsureInitialized(_seed);
+                while (true)
+                {
+                    float f = (float)_parent.Sample();
+                    if (f < 1.0f) // reject 1.0f, which is rare but possible due to rounding
+                    {
+                        return f;
+                    }
+                }
+            }
+
+            public override void NextBytes(byte[] buffer)
+            {
+                _prng.EnsureInitialized(_seed);
+                _prng.NextBytes(buffer);
+            }
+
+            public override void NextBytes(Span<byte> buffer)
+            {
+                _prng.EnsureInitialized(_seed);
+                for (int i = 0; i < buffer.Length; i++)
+                {
+                    buffer[i] = (byte)_parent.Next();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Provides an implementation used for compatibility with cases where a seed is specified
+        /// and thus the sequence produced historically could have been relied upon.
+        /// </summary>
+        private sealed class CompatSeedImpl : ImplBase
+        {
+            private CompatPrng _prng; // mutable struct; do not make this readonly
+
+            public CompatSeedImpl(int seed) =>
+                _prng.EnsureInitialized(seed);
+
+            public override double Sample() => _prng.Sample();
+
+            public override int Next() => _prng.InternalSample();
+
+            public override int Next(int maxValue)
+            {
+                // We can use ConvertToIntegerNative here since we know the result of
+                // scaling the sample is in the range [0, int.MaxValue) and therefore
+                // the integer portion is exactly representable since it's < 2^52.
+                return double.ConvertToIntegerNative<int>(_prng.Sample() * maxValue);
+            }
+
+            public override int Next(int minValue, int maxValue)
+            {
+                // We can use ConvertToIntegerNative here since we know the result of
+                // scaling the sample is in the range [0, uint.MaxValue) and therefore
+                // the integer portion is exactly representable since it's < 2^52.
+                long range = (long)maxValue - minValue;
+                return range <= int.MaxValue ?
+                    double.ConvertToIntegerNative<int>(_prng.Sample() * range) + minValue :
+                    (int)(double.ConvertToIntegerNative<long>(_prng.GetSampleForLargeRange() * range) + minValue);
+            }
+
+            public override long NextInt64()
+            {
+                while (true)
+                {
+                    // Get top 63 bits to get a value in the range [0, long.MaxValue], but try again
+                    // if the value is actually long.MaxValue, as the method is defined to return a value
+                    // in the range [0, long.MaxValue).
+                    ulong result = NextUInt64() >> 1;
+                    if (result != long.MaxValue)
+                    {
+                        return (long)result;
+                    }
+                }
+            }
+
+            public override long NextInt64(long maxValue) => NextInt64(0, maxValue);
+
+            public override long NextInt64(long minValue, long maxValue)
+            {
+                ulong exclusiveRange = (ulong)(maxValue - minValue);
+
+                if (exclusiveRange > 1)
+                {
+                    // Narrow down to the smallest range [0, 2^bits] that contains maxValue - minValue
+                    // Then repeatedly generate a value in that outer range until we get one within the inner range.
+                    int bits = BitOperations.Log2Ceiling(exclusiveRange);
+                    while (true)
+                    {
+                        ulong result = NextUInt64() >> (sizeof(long) * 8 - bits);
+                        if (result < exclusiveRange)
+                        {
+                            return (long)result + minValue;
+                        }
+                    }
+                }
+
+                return minValue;
+            }
+
+            /// <summary>Produces a value in the range [0, ulong.MaxValue].</summary>
+            private ulong NextUInt64() =>
+                 ((ulong)(uint)Next(1 << 22)) |
+                (((ulong)(uint)Next(1 << 22)) << 22) |
+                (((ulong)(uint)Next(1 << 20)) << 44);
+
+            public override double NextDouble() => _prng.Sample();
+
+            public override float NextSingle()
+            {
+                while (true)
+                {
+                    float f = (float)_prng.Sample();
+                    if (f < 1.0f) // reject 1.0f, which is rare but possible due to rounding
+                    {
+                        return f;
+                    }
+                }
+            }
+
+            public override void NextBytes(byte[] buffer) => _prng.NextBytes(buffer);
+
+            public override void NextBytes(Span<byte> buffer) => _prng.NextBytes(buffer);
+        }
+
+        /// <summary>
+        /// Implementation used for compatibility with previous releases. The algorithm is based on a modified version
+        /// of Knuth's subtractive random number generator algorithm.  See https://github.com/dotnet/runtime/issues/23198
+        /// for a discussion of some of the modifications / discrepancies.
+        /// </summary>
+        private struct CompatPrng
+        {
+            private int[]? _seedArray;
+            private int _inext;
+            private int _inextp;
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            [MemberNotNull(nameof(_seedArray))]
+            internal void EnsureInitialized(int seed)
+            {
+                if (_seedArray is null)
+                {
+                    Initialize(seed);
+                }
+            }
+
+            [MemberNotNull(nameof(_seedArray))]
+            private void Initialize(int seed)
+            {
+                int[] seedArray = new int[56];
+
+                int subtraction = (seed == int.MinValue) ? int.MaxValue : Math.Abs(seed);
+                int mj = 161803398 - subtraction; // magic number based on Phi (golden ratio)
+                seedArray[55] = mj;
+                int mk = 1;
+
+                int ii = 0;
+                for (int i = 1; i < 55; i++)
+                {
+                    // The range [1..55] is special (Knuth) and so we're wasting the 0'th position.
+                    if ((ii += 21) >= 55)
+                    {
+                        ii -= 55;
+                    }
+
+                    seedArray[ii] = mk;
+                    mk = mj - mk;
+                    if (mk < 0)
+                    {
+                        mk += int.MaxValue;
+                    }
+
+                    mj = seedArray[ii];
+                }
+
+                for (int k = 1; k < 5; k++)
+                {
+                    for (int i = 1; i < 56; i++)
+                    {
+                        int n = i + 30;
+                        if (n >= 55)
+                        {
+                            n -= 55;
+                        }
+
+                        seedArray[i] -= seedArray[1 + n];
+                        if (seedArray[i] < 0)
+                        {
+                            seedArray[i] += int.MaxValue;
+                        }
+                    }
+                }
+
+                _seedArray = seedArray;
+                _inext = 0;
+                _inextp = 21;
+            }
+
+            internal double Sample() =>
+                // Including the division at the end gives us significantly improved random number distribution.
+                InternalSample() * (1.0 / int.MaxValue);
+
+            internal void NextBytes(Span<byte> buffer)
+            {
+                for (int i = 0; i < buffer.Length; i++)
+                {
+                    buffer[i] = (byte)InternalSample();
+                }
+            }
+
+            // Inlining this into hot caller loops can produce branch-heavy code that is slower than the standalone method.
+            [MethodImpl(MethodImplOptions.NoInlining)]
+            internal int InternalSample()
+            {
+                int locINext = _inext;
+                if (++locINext >= 56)
+                {
+                    locINext = 1;
+                }
+
+                int locINextp = _inextp;
+                if (++locINextp >= 56)
+                {
+                    locINextp = 1;
+                }
+
+                int[] seedArray = _seedArray;
+                int retVal = seedArray[locINext] - seedArray[locINextp];
+
+                if (retVal == int.MaxValue)
+                {
+                    retVal--;
+                }
+                if (retVal < 0)
+                {
+                    retVal += int.MaxValue;
+                }
+
+                seedArray[locINext] = retVal;
+                _inext = locINext;
+                _inextp = locINextp;
+
+                return retVal;
+            }
+
+            internal double GetSampleForLargeRange()
+            {
+                // The distribution of the double returned by Sample is not good enough for a large range.
+                // If we use Sample for a range [int.MinValue..int.MaxValue), we will end up getting even numbers only.
+                int result = InternalSample();
+
+                // We can't use addition here: the distribution will be bad if we do that.
+                if (InternalSample() % 2 == 0) // decide the sign based on second sample
+                {
+                    result = -result;
+                }
+
+                double d = result;
+                d += int.MaxValue - 1; // get a number in range [0..2*int.MaxValue-1)
+                d /= 2u * int.MaxValue - 1;
+                return d;
+            }
         }
     }
-    public class ThreadSafeRandom : Random
+    
+
+    public delegate void EventHandler(object? sender, EventArgs e);
+
+    public delegate void EventHandler<in TEventArgs>(object? sender, TEventArgs e) // Removed TEventArgs constraint post-.NET 4
+        where TEventArgs : allows ref struct;
+
+    /// <summary>
+    /// Represents the method that will handle an event when the event provides data.
+    /// </summary>
+    /// <typeparam name="TSender">The type of the object raising the event.</typeparam>
+    /// <typeparam name="TEventArgs">The type of the event data generated by the event.</typeparam>
+    /// <param name="sender">The source of the event.</param>
+    /// <param name="e">An object that contains the event data.</param>
+    public delegate void EventHandler<in TSender, in TEventArgs>(TSender sender, TEventArgs e)
+        where TSender : allows ref struct
+        where TEventArgs : allows ref struct;
+
+    public delegate void ConsoleCancelEventHandler(object sender, ConsoleCancelEventArgs e);
+
+    public sealed class ConsoleCancelEventArgs : EventArgs
     {
-        public ThreadSafeRandom() { }
+        private readonly ConsoleSpecialKey _type;
+
+        internal ConsoleCancelEventArgs(ConsoleSpecialKey type)
+        {
+            _type = type;
+        }
+
+        // Whether to cancel the break event.  By setting this to true, the
+        // Control-C will not kill the process.
+        public bool Cancel
+        {
+            get; set;
+        }
+
+        public ConsoleSpecialKey SpecialKey
+        {
+            get { return _type; }
+        }
+    }
+
+    public enum ConsoleSpecialKey
+    {
+        ControlC = 0,
+        ControlBreak = 1,
+    }
+
+    // Provides Unix-based support for System.Console.
+    internal static class ConsolePal
+    {
+        // StdInReader is only used when input isn't redirected and we're working
+        // with an interactive terminal.  In that case, performance isn't critical
+        // and we can use a smaller buffer to minimize working set.
+        private const int InteractiveBufferSize = 255;
+
+        // For performance we cache Cursor{Left,Top} and Window{Width,Height}.
+        // These values must be read/written under lock (Console.Out).
+        // We also need to invalidate these values when certain signals occur.
+        // We don't want to take the lock in the signal handling thread for this.
+        // Instead, we set a flag. Before reading a cached value, a call to CheckTerminalSettingsInvalidated
+        // will invalidate the cached values if a signal has occurred.
+        private static int s_cursorVersion; // Gets incremented each time the cursor position changed.
+                                            // Used to synchronize between lock (Console.Out) blocks.
+        private static int s_cursorLeft;    // Cached CursorLeft, -1 when invalid.
+        private static int s_cursorTop;     // Cached CursorTop, invalid when s_cursorLeft == -1.
+        private static int s_windowWidth;   // Cached WindowWidth, -1 when invalid.
+        private static int s_windowHeight;  // Cached WindowHeight, invalid when s_windowWidth == -1.
+        private static byte s_invalidateCachedSettings = 1; // Tracks whether we should invalidate the cached settings.
+        private static SafeFileHandle? s_terminalHandle; // Tracks the handle used for writing to the terminal.
+
+
     }
 
     public static class Console
     {
+        // Unlike many other buffer sizes throughout .NET, which often only affect performance, this buffer size has a
+        // functional impact on interactive console apps, where the size of the buffer passed to ReadFile/Console impacts
+        // how many characters the cmd window will allow to be typed as part of a single line. It also does affect perf,
+        // in particular when input is redirected and data may be consumed from a larger source. This 4K default size is the
+        // same as is currently used by most other environments/languages tried.
+        internal const int ReadBufferSize = 4096;
+        // There's no visible functional impact to the write buffer size, and as we auto flush on every write,
+        // there's little benefit to having a large buffer.  So we use a smaller buffer size to reduce working set.
+        private const int WriteBufferSize = 256;
+
+        private static readonly object s_syncObject = new object();
+        private static TextReader? s_in;
+        private static TextWriter? s_out, s_error;
+        private static Encoding? s_inputEncoding;
+        private static Encoding? s_outputEncoding;
+        private static bool s_isOutTextWriterRedirected;
+        private static bool s_isErrorTextWriterRedirected;
+
+        private static ConsoleCancelEventHandler? s_cancelCallbacks;
+        //private static PosixSignalRegistration? s_sigIntRegistration;
+        //private static PosixSignalRegistration? s_sigQuitRegistration;
+
+
         private static ReadOnlySpan<char> _trueString => ['T', 'r', 'u', 'e', '\0'];
         private static ReadOnlySpan<char> _trueWithNewLineString => ['T', 'r', 'u', 'e', '\n', '\0'];
         private static ReadOnlySpan<char> _falseString => ['F', 'a', 'l', 's', 'e', '\0'];
@@ -21756,6 +28420,24 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
             this[2] = arg2;
         }
     }
+    //
+    // Support for tooling-friendly NotImplementedExceptions.
+    //
+    internal static class NotImplemented
+    {
+        /// <summary>
+        /// Permanent NotImplementedException with no message shown to user.
+        /// </summary>
+        internal static Exception ByDesign => new NotImplementedException();
+
+        /// <summary>
+        /// Permanent NotImplementedException with localized message shown to user.
+        /// </summary>
+        internal static Exception ByDesignWithMessage(string message)
+        {
+            return new NotImplementedException(message);
+        }
+    }
     internal static class ThrowHelper
     {
         [DoesNotReturn]
@@ -21812,6 +28494,12 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         {
             throw GetArgumentOutOfRangeException(ExceptionArgument.index,
                                                     ExceptionResource.ArgumentOutOfRange_IndexMustBeLessOrEqual);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowArgumentException_BadComparer(object? comparer)
+        {
+            throw new ArgumentException(SR.Format(SR.Arg_BogusIComparer, comparer));
         }
 
         [DoesNotReturn]
@@ -21947,6 +28635,24 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         }
 
         [DoesNotReturn]
+        internal static void ThrowInvalidOperationException_HandleIsNotInitialized()
+        {
+            throw new InvalidOperationException(SR.InvalidOperation_HandleIsNotInitialized);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowInvalidOperationException_HandleIsNotPinned()
+        {
+            throw new InvalidOperationException(SR.InvalidOperation_HandleIsNotPinned);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowArraySegmentCtorValidationFailedExceptions(Array? array, int offset, int count)
+        {
+            throw GetArraySegmentCtorValidationFailedException(array, offset, count);
+        }
+
+        [DoesNotReturn]
         internal static void ThrowInvalidOperationException_InvalidUtf8()
         {
             throw new InvalidOperationException(SR.InvalidOperation_InvalidUtf8);
@@ -21996,9 +28702,57 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         }
 
         [DoesNotReturn]
+        internal static void ThrowAggregateException(List<Exception> exceptions)
+        {
+            throw new AggregateException(exceptions);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowObjectDisposedException(ExceptionResource resource)
+        {
+            throw new ObjectDisposedException(null, GetResourceString(resource));
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowOutOfMemoryException_LockEnter_WaiterCountOverflow()
+        {
+            throw new OutOfMemoryException(SR.Lock_Enter_WaiterCountOverflow_OutOfMemoryException);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowSynchronizationLockException_LockExit()
+        {
+            throw new SynchronizationLockException(SR.Lock_Exit_SynchronizationLockException);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowUnexpectedStateForKnownCallback(object? state)
+        {
+            throw new ArgumentOutOfRangeException(nameof(state), state, SR.Argument_UnexpectedStateForKnownCallback);
+        }
+
+        [DoesNotReturn]
+        internal static void ThrowArgumentException(ExceptionResource resource, ExceptionArgument argument)
+        {
+            throw new ArgumentException(GetResourceString(resource), GetArgumentName(argument));
+        }
+
+        [DoesNotReturn]
         internal static void ThrowArgumentException(ExceptionResource resource)
         {
             throw GetArgumentException(resource);
+        }
+
+        private static Exception GetArraySegmentCtorValidationFailedException(Array? array, int offset, int count)
+        {
+            if (array == null)
+                return new ArgumentNullException(nameof(array));
+            if (offset < 0)
+                return new ArgumentOutOfRangeException(nameof(offset), SR.ArgumentOutOfRange_NeedNonNegNum);
+            if (count < 0)
+                return new ArgumentOutOfRangeException(nameof(count), SR.ArgumentOutOfRange_NeedNonNegNum);
+
+            return new ArgumentException(SR.Argument_InvalidOffLen);
         }
 
         private static ArgumentException GetArgumentException(ExceptionResource resource)
@@ -22591,6 +29345,20 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
     }
     internal static partial class SR
     {
+        internal const string AggregateException_InnerException = "(Inner Exception #{0}) ";
+        internal const string AggregateException_ctor_DefaultMessage = "One or more errors occurred.";
+        internal const string AggregateException_ctor_InnerExceptionNull = "An element of innerExceptions was null.";
+        internal const string Arg_AccessException = "Cannot access member.";
+        internal const string Arg_ArrayPlusOffTooSmall = "Destination array is not long enough to copy all the items in the collection. Check array index and length.";
+        internal const string Arg_BogusIComparer = "Unable to sort because the IComparer.Compare() method returns inconsistent results. " +
+                                                   "Either a value does not compare equal to itself, or one value repeatedly compared to another " +
+                                                   "value yields different results. IComparer: '{0}'.";
+        internal const string Arg_GuidArrayCtor = "Byte array for Guid must be exactly {0} bytes long.";
+        internal const string Arg_MissingMemberException = "Attempted to access a missing member.";
+        internal const string Arg_MissingMethodException = "Attempted to access a missing method.";
+        internal const string Arg_MustBeGuid = "Object must be of type GUID.";
+        internal const string Arg_NonZeroLowerBound = "The lower bound of target array must be zero.";
+        internal const string Arg_TimeoutException = "The operation has timed out.";
         internal const string Arg_ArgumentOutOfRangeException = "Specified argument was out of the range of valid values.";
         internal const string Arg_InvalidHexBinaryStyle = "With the AllowHexSpecifier or AllowBinarySpecifier bit set in the enum bit field, " +
                                                           "the only other valid bits that can be combined into the enum value must be AllowLeadingWhite and AllowTrailingWhite.";
@@ -22609,13 +29377,15 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         internal const string Arg_MustBeUIntPtr = "Object must be of type UIntPtr.";
         internal const string Arg_MustBeType = "Type must be a type provided by the runtime.";
         internal const string Arg_MustBeEnum = "The value passed in must be an enum base or an underlying type for an enum, such as an Int32.";
-        internal const string Arg_TypeNotSupported = "Specified type is not supported";
+        internal const string Arg_TypeNotSupported = "Specified type is not supported.";
         internal const string Arg_UnreachableException = "The program executed an instruction that was thought to be unreachable.";
         internal const string Arg_WrongType = "The value '{0}' is not of type '{1}' and cannot be used in this generic collection.";
         internal const string Arg_RankMultiDimNotSupported = "Rank is not supported for multi-dimensional arrays.";
         internal const string Arg_HTCapacityOverflow = "Hashtable's capacity overflowed and went negative. Check load factor, capacity and the current size of the table.";
         internal const string Arg_KeyNotFoundWithKey = "The given key '{0}' was not present in the dictionary.";
+        internal const string Arg_EmptySpan = "The span must not be empty.";
         internal const string Arg_MustContainEnumInfo = "Must specify valid information for parsing in the string.";
+        internal const string Arg_IOException = "I/O error occurred.";
         internal const string ArgumentNull_Generic = "Value cannot be null.";
         internal const string ArgumentOutOfRange_ActualValue = "Actual value was {0}.";
         internal const string ArgumentOutOfRange_Generic_MustBeEqual = "{0} ('{1}') must be equal to '{2}'.";
@@ -22635,6 +29405,13 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         internal const string ArgumentOutOfRange_RoundingDigits = "Rounding digits must be between 0 and 15, inclusive.";
         internal const string ArgumentOutOfRange_RoundingDigits_MathF = "Rounding digits must be between 0 and 6, inclusive.";
         internal const string ArgumentOutOfRange_SmallCapacity = "Capacity was less than the current size.";
+        internal const string ArgumentOutOfRange_Enum = "Enum value was out of legal range.";
+        internal const string Argument_InvalidFlag = "Value of flags is invalid.";
+        internal const string Argument_MustBeFalse = "Argument must be initialized to false";
+        internal const string Argument_UnexpectedStateForKnownCallback = "An unexpected state object was encountered. " +
+                                                                         "This is usually a sign of a bug in async method custom infrastructure, " +
+                                                                         "such as a custom awaiter or IValueTaskSource implementation.";
+        internal const string Argument_MinMaxValue = "The minimum value can't be greater than the maximum value.";
         internal const string Argument_AddingDuplicate = "An item with the same key has already been added.";
         internal const string Argument_DestinationTooShort = "Destination is too short.";
         internal const string Argument_InvalidCharSequenceNoIndex = "String contains invalid Unicode code points.";
@@ -22644,7 +29421,73 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         internal const string Argument_OverlapAlignmentMismatch = "Overlapping spans have mismatching alignment.";
         internal const string Argument_TypeContainsReferences = "The Type must be a primitive type or a struct containing only primitive types.";
         internal const string Argument_EnumTypeDoesNotMatch = "The argument type, '{0}', is not the same as the enum type '{1}'.";
+        internal const string Argument_EmptyString = "The value cannot be an empty string.";
+        internal const string Argument_StreamNotReadable = "Stream was not readable.";
+        internal const string Argument_InvalidOffLen = "Offset and length were out of bounds for the array or count is greater than the number of " +
+                                                       "elements from index to the end of the source collection.";
+        internal const string ArgumentException_NotIsomorphic = "Structures are not isomorphic.";
         internal const string Arithmetic_NaN = "Function does not accept floating point Not-a-Number values.";
+        internal const string CancellationTokenSource_Disposed = "The CancellationTokenSource has been disposed.";
+        internal const string CancellationToken_CreateLinkedToken_TokensIsEmpty = "No tokens were supplied.";
+        internal const string ExecutionContext_ExceptionInAsyncLocalNotification = "An exception was not handled in an AsyncLocal<T> notification callback.";
+        internal const string Format_ExtraJunkAtEnd = "Additional non-parsable characters are at the end of the string.";
+        internal const string Format_GuidBrace = "Expected {0xdddddddd, etc}.";
+        internal const string Format_GuidBraceAfterLastNumber = "Could not find a brace, or the length between the previous token and the brace was zero (i.e., '0x,'etc.).";
+        internal const string Format_GuidComma = "Could not find a comma, or the length between the previous token and the comma was zero (i.e., '0x,'etc.).";
+        internal const string Format_GuidDashes = "Dashes are in the wrong position for GUID parsing.";
+        internal const string Format_GuidEndBrace = "Could not find the ending brace.";
+        internal const string Format_GuidHexPrefix = "Expected 0x prefix.";
+        internal const string Format_GuidInvLen = "Guid should contain 32 digits with 4 dashes (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).";
+        internal const string Format_GuidInvalidChar = "Guid string should only contain hexadecimal characters.";
+        internal const string Format_GuidUnrecognized = "Unrecognized Guid format.";
+        internal const string Format_InvalidGuidFormatSpecification = "Format string can be only \"D\", \"d\", \"N\", \"n\", \"P\", \"p\", \"B\", \"b\", \"X\" or \"x\".";
+        internal const string InvalidOperation_AsyncFlowCtrlCtxMismatch = "AsyncFlowControl objects can be used to restore flow only on a Context that had its flow suppressed.";
+        internal const string InvalidOperation_CannotRestoreUnsuppressedFlow = "Cannot restore context flow when it is not suppressed.";
+        internal const string InvalidOperation_CannotUseAFCOtherThread = "AsyncFlowControl object must be used on the thread where it was created.";
+        internal const string InvalidOperation_EmptyQueue = "Queue empty.";
+        internal const string InvalidOperation_NullContext = "Cannot call Set on a null context";
+        internal const string InvalidOperation_TimerAlreadyClosed = "The Timer was already closed using an incompatible Dispose method.";
+        internal const string Lazy_CreateValue_NoParameterlessCtorForT = "The lazily-initialized type does not have a public, parameterless constructor.";
+        internal const string Lazy_StaticInit_InvalidOperation = "ValueFactory returned null.";
+        internal const string Lock_Enter_LockRecursionException = "The lock has reached the limit of recursive enters.";
+        internal const string Lock_Enter_WaiterCountOverflow_OutOfMemoryException = "The lock has reached the limit of how many threads may wait for the lock.";
+        internal const string Lock_Exit_SynchronizationLockException = "The calling thread does not hold the lock.";
+        internal const string ManualResetEventSlim_ctor_TooManyWaiters = "There are too many threads currently waiting on the event. A maximum of {0} waiting threads are supported.";
+        internal const string OperationCanceled = "The operation was canceled.";
+        internal const string Overflow_UInt32 = "Value was either too large or too small for a UInt32.";
+        internal const string SemaphoreSlim_Release_CountWrong = "The releaseCount argument must be greater than zero.";
+        internal const string SemaphoreSlim_Wait_TimeSpanTimeoutWrong = "The value needs to translate in milliseconds to -1 (signifying an infinite timeout), or be non-negative.";
+        internal const string SemaphoreSlim_Wait_TimeoutWrong = "The timeout must represent a value between -1 and Int32.MaxValue, inclusive.";
+        internal const string SemaphoreSlim_ctor_InitialCountWrong = "The initialCount argument must be non-negative and less than or equal to the maximumCount.";
+        internal const string SemaphoreSlim_ctor_MaxCountWrong = "The maximumCount argument must be a positive number. " +
+                                                                 "If a maximum is not required, use the constructor without a maxCount parameter.";
+        internal const string SpinLock_IsHeldByCurrentThread = "Thread tracking is disabled.";
+        internal const string SpinLock_TryEnter_ArgumentOutOfRange = "The timeout must be a value between -1 and Int32.MaxValue, inclusive.";
+        internal const string SpinLock_TryEnter_LockRecursionException = "The calling thread already holds the lock.";
+        internal const string SpinLock_TryReliableEnter_ArgumentException = "The tookLock argument must be set to false before calling this method.";
+        internal const string SpinWait_SpinUntil_TimeoutWrong = "The timeout must represent a value between -1 and Int32.MaxValue, inclusive.";
+        internal const string TaskCanceledException_ctor_DefaultMessage = "A task was canceled.";
+        internal const string TaskExceptionHolder_UnhandledException = "A Task's exception(s) were not observed either by Waiting on the Task or accessing its Exception property. " +
+                                                                       "As a result, the unobserved exception was rethrown by the finalizer thread.";
+        internal const string TaskExceptionHolder_UnknownExceptionType = "(Internal)Expected an Exception or an IEnumerable<Exception>";
+        internal const string TaskSchedulerException_ctor_DefaultMessage = "An exception was thrown by a TaskScheduler.";
+        internal const string TaskScheduler_ExecuteTask_WrongTaskScheduler = "ExecuteTask may not be called for a task which was previously queued to a different TaskScheduler.";
+        internal const string TaskScheduler_FromCurrentSynchronizationContext_NoCurrent = "The current SynchronizationContext may not be used as a TaskScheduler.";
+        internal const string TaskScheduler_InconsistentStateAfterTryExecuteTaskInline = "The TryExecuteTaskInline call to the underlying scheduler succeeded, " +
+                                                                                         "but the task body was not invoked.";
+        internal const string TaskT_ConfigureAwait_InvalidOptions = "Task<TResult>.ConfigureAwait does not support ConfigureAwaitOptions.SuppressThrowing. " +
+                                                                    "To suppress throwing, instead cast the Task<TResult> to its base class Task and await that with SuppressThrowing.";
+        internal const string TaskT_DebuggerNoResult = "{Not yet computed}";
+        internal const string Task_ContinueWith_ESandLR = "The specified TaskContinuationOptions combined LongRunning and ExecuteSynchronously.  " +
+                                                          "Synchronous continuations should not be long running.";
+        internal const string Task_FromAsync_LongRunning = "It is invalid to specify TaskCreationOptions.LongRunning in calls to FromAsync.";
+        internal const string Task_FromAsync_PreferFairness = "It is invalid to specify TaskCreationOptions.PreferFairness in calls to FromAsync.";
+        internal const string Task_MultiTaskContinuation_EmptyTaskList = "The tasks argument contains no tasks.";
+        internal const string Task_MultiTaskContinuation_FireOptions = "It is invalid to exclude specific continuation kinds for continuations off of multiple tasks.";
+        internal const string Task_MultiTaskContinuation_NullTask = "The tasks argument included a null value.";
+        internal const string Task_MustBeCompleted = "The provided task must have already completed.";
+        internal const string Threading_SemaphoreFullException = "Adding the specified count to the semaphore would cause it to exceed its maximum count.";
+        internal const string InvalidOperation_EmptyStack = "Stack empty.";
         internal const string CapacityMustBeGreaterThanOrEqualToCount = "Capacity must be greater than or equal to Count.";
         internal const string CapacityMustEqualCountOnMove = "Capacity must equal count on move.";
         internal const string Format_ExpectedAsciiDigit = "Expected an ASCII digit.";
@@ -22655,6 +29498,9 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         internal const string Format_UnclosedFormatItem = "Format item ends prematurely.";
         internal const string Format_UnexpectedClosingBrace = "Unexpected closing brace without a corresponding opening brace.";
         internal const string Format_InvalidEnumFormatSpecification = "Format String can be only 'G', 'g', 'X', 'x', 'F', 'f', 'D' or 'd'.";
+        internal const string InvalidOperation_CannotRegisterSecondHandler = "A handler for unhandled exceptions can only be set once.";
+        internal const string InvalidOperation_AsyncIOInProgress = "The stream is currently in use by a previous operation on the stream.";
+        internal const string InvalidOperation_TimeoutsNotSupported = "Timeouts are not supported on this stream.";
         internal const string InvalidOperationOnDefaultArray = "This operation cannot be performed on a default instance of ImmutableArray. " +
                                                                "Consider initializing the array, or checking the ImmutableArray.IsDefault property.";
         internal const string InvalidOperation_CollectionCorrupted = "A prior operation on this collection was interrupted by an exception. Collection's state is no longer trusted.";
@@ -22663,14 +29509,24 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         internal const string InvalidOperation_EnumFailedVersion = "Collection was modified; enumeration operation may not execute.";
         internal const string InvalidOperation_EnumOpCantHappen = "Enumeration has either not started or has already finished.";
         internal const string InvalidOperation_NoValue = "Nullable object must have a value.";
+        internal const string InvalidOperation_HandleIsNotInitialized = "Handle is not initialized.";
+        internal const string InvalidOperation_HandleIsNotPinned = "Handle is not pinned.";
         internal const string InvalidOperation_ConcurrentOperationsNotSupported = "Operations that change non-concurrent collections must have exclusive access. " +
                                                                                   "A concurrent update was performed on this collection and corrupted its state. " +
                                                                                   "The collection's state is no longer correct.";
         internal const string InvalidOperation_InvalidUtf8 = "Formatted string contains characters not representable as valid UTF-8.";
         internal const string InvalidOperation_ReadOnly = "Instance is read-only.";
         internal const string InvalidOperation_UnknownEnumType = "Unknown enum type.";
+        internal const string InvalidOperation_InvalidHandle = "The handle is invalid.";
+        internal const string IO_InvalidReadLength = "The read operation returned an invalid length.";
         internal const string NotSupported_Type = "Type is not supported.";
+        internal const string NotSupported_IntegerEnumOrPrimitiveTypeRequired = "Integer, enum, or primitive type required.";
+        internal const string MoreThanOneElement = "Sequence contains more than one element.";
+        internal const string MoreThanOneMatch = "Sequence contains more than one matching element.";
         internal const string ObjectDisposed_Generic = "Cannot access a disposed object.";
+        internal const string ObjectDisposed_ReaderClosed = "Cannot read from a closed TextReader.";
+        internal const string NoMatch = "No match found.";
+        internal const string NoElements = "Sequence contains no elements.";
     }
     internal static partial class SR
     {
@@ -22724,4 +29580,5 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
             return resourceFormat;
         }
     }
+
 }

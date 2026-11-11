@@ -231,7 +231,7 @@ public static class GimpleVerifier
     }
 
     private static bool SameType(QualifiedType left, QualifiedType right)
-        => string.Equals(left.Type.ToDisplayString(), right.Type.ToDisplayString(), StringComparison.Ordinal);
+        => left.Type.ToDisplayString() == right.Type.ToDisplayString();
 
     private readonly struct Context
     {

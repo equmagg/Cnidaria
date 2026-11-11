@@ -1187,7 +1187,7 @@ internal static class RiscVAssemblyWriter
             {
                 if (symbol.Binding != RVObjectSymbolBinding.External &&
                     symbol.Kind != RVObjectSymbolKind.Section &&
-                    string.Equals(symbol.SectionName, ".text", StringComparison.Ordinal))
+                    symbol.SectionName == ".text")
                 {
                     AddLabel(labelsByPc, symbol.Offset, symbol.Name);
                 }
@@ -1223,7 +1223,7 @@ internal static class RiscVAssemblyWriter
             {
                 if (symbol.Binding != RVObjectSymbolBinding.External &&
                     symbol.Kind != RVObjectSymbolKind.Section &&
-                    string.Equals(symbol.SectionName, section.Name, StringComparison.Ordinal))
+                    symbol.SectionName == section.Name)
                 {
                     AddLabel(labelsByOffset, symbol.Offset, symbol.Name);
                 }

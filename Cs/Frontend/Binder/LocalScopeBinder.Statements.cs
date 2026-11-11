@@ -11,13 +11,7 @@ namespace Cnidaria.Cs
         private BoundStatement BindUsingStatement(UsingStatementSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
             if (node.AwaitKeyword.Span.Length != 0)
-            {
-                diagnostics.Add(new Diagnostic(
-                    "CN_USING_AWAIT000",
-                    DiagnosticSeverity.Error,
-                    "await using is not supported.",
-                    new Location(context.SemanticModel.SyntaxTree, node.AwaitKeyword.Span)));
-            }
+                return BindAwaitUsingStatement(node, context, diagnostics);
 
             var scope = new LocalScopeBinder(parent: this, flags: Flags, containing: _containing);
 
@@ -108,7 +102,7 @@ namespace Cnidaria.Cs
                 hasErrors = true;
             }
 
-            var scope = new LocalScopeBinder(parent: this, flags: Flags, containing: _containing);
+            var scope = new LocalScopeBinder(parent: this, flags: Flags, containing: _containing) { _inLockBody = true };
             var body = scope.BindStatement(node.Statement, context, diagnostics);
             return new BoundLockStatement(node, expression, body, hasErrors);
         }
@@ -269,6 +263,9 @@ namespace Cnidaria.Cs
             BindingContext context,
             DiagnosticBag diagnostics)
         {
+            if (_awaitUsingScope)
+                return;
+
             if (resourceType.Kind == SymbolKind.Error)
                 return;
 
@@ -333,7 +330,7 @@ namespace Cnidaria.Cs
                         continue;
                     if (method.IsStatic)
                         continue;
-                    if (!string.Equals(method.Name, name, StringComparison.Ordinal))
+                    if (method.Name != name)
                         continue;
                     if (method.TypeParameters.Length != 0)
                         continue;
@@ -471,7 +468,9 @@ namespace Cnidaria.Cs
             if (node.Filter != null)
             {
                 var boolType = context.Compilation.GetSpecialType(SpecialType.System_Boolean);
+                scope._inCatchFilter = true;
                 var raw = scope.BindExpression(node.Filter.FilterExpression, context, diagnostics);
+                scope._inCatchFilter = false;
                 filterOpt = scope.ApplyConversion(
                     exprSyntax: node.Filter.FilterExpression,
                     expr: raw,
@@ -658,12 +657,12 @@ namespace Cnidaria.Cs
                 diagnostics: diagnostics,
                 requireImplicit: true);
 
-            var thenBinder = CreateFlowScopeBinderForTrue(condition);
-            var thenStmt = thenBinder.BindStatement(node.Statement, context, diagnostics);
+            LocalScopeBinder bodyBinder = CreateIfStatementScopeBinder(condition);
+            BoundStatement thenStmt = bodyBinder.BindStatement(node.Statement, context, diagnostics);
 
             BoundStatement? elseStmt = null;
             if (node.Else != null)
-                elseStmt = BindStatement(node.Else.Statement, context, diagnostics);
+                elseStmt = bodyBinder.BindStatement(node.Else.Statement, context, diagnostics);
 
             return new BoundIfStatement(node, condition, thenStmt, elseStmt);
         }
@@ -837,16 +836,13 @@ namespace Cnidaria.Cs
                         isFallbackLabel = cps.WhenClause is null;
                         break;
                     default:
-                        diagnostics.Add(new Diagnostic("CN_SWITCH001", DiagnosticSeverity.Error,
-                            $"Switch pattern '{cps.Pattern.Kind}' is not supported.",
-                            new Location(ctx.SemanticModel.SyntaxTree, cps.Pattern.Span)));
-                        match = new BoundBadExpression(label);
+                        match = BindIsPatternCore(label, tmpExpr, cps.Pattern, ctx, diagnostics);
                         break;
                 }
 
                 if (cps.WhenClause is null) return match;
 
-                var whenCond = BindExpression(cps.WhenClause.Condition, ctx, diagnostics);
+                BoundExpression whenCond = CreateFlowScopeBinderForTrue(match, withinExpression: true).BindExpression(cps.WhenClause.Condition, ctx, diagnostics);
                 whenCond = ApplyConversion(cps.WhenClause.Condition, whenCond, boolType, cps.WhenClause, ctx, diagnostics, requireImplicit: true);
                 if (match.HasErrors || whenCond.HasErrors) return new BoundBadExpression(label);
                 return MakeLogicalAnd(label, match, whenCond, ctx, diagnostics);
@@ -930,15 +926,12 @@ namespace Cnidaria.Cs
                     match = MakeBoolLiteral(arm, ctx, value: true);
                     break;
                 default:
-                    diagnostics.Add(new Diagnostic("CN_SWITCHEXPR001", DiagnosticSeverity.Error,
-                        $"Switch expression pattern '{arm.Pattern.Kind}' is not supported.",
-                        new Location(ctx.SemanticModel.SyntaxTree, arm.Pattern.Span)));
-                    match = new BoundBadExpression(arm);
+                    match = BindIsPatternCore(arm, tmpExpr, arm.Pattern, ctx, diagnostics);
                     break;
             }
 
             if (arm.WhenClause is null) return match;
-            var whenCond = BindExpression(arm.WhenClause.Condition, ctx, diagnostics);
+            BoundExpression whenCond = CreateFlowScopeBinderForTrue(match, withinExpression: true).BindExpression(arm.WhenClause.Condition, ctx, diagnostics);
             whenCond = ApplyConversion(arm.WhenClause.Condition, whenCond, boolType, arm.WhenClause, ctx, diagnostics, requireImplicit: true);
             if (match.HasErrors || whenCond.HasErrors) return new BoundBadExpression(arm);
             return MakeLogicalAnd(arm, match, whenCond, ctx, diagnostics);
@@ -1054,7 +1047,7 @@ namespace Cnidaria.Cs
                     _flow.RegisterLabelDefinition(sectionLabels[i]);
                     stmts.Add(new BoundLabelStatement(sec, sectionLabels[i]));
 
-                    var sectionBinder = new LocalScopeBinder(parent: switchBinder, flags: Flags, containing: _containing);
+                    var sectionBinder = new LocalScopeBinder(parent: switchBinder.CreateFlowScopeBinderForTrue(sectionConds[i]), flags: Flags, containing: _containing);
                     var secStatements = sec.Statements.ToArray();
 
                     var boundSecStmts = ImmutableArray.CreateBuilder<BoundStatement>(secStatements.Length);
@@ -1072,6 +1065,7 @@ namespace Cnidaria.Cs
             }
 
             stmts.Add(new BoundLabelStatement(node, breakLabel));
+            switchBinder.DeclareLocalFunctionDelegates(stmts, node);
             return new BoundBlockStatement(node, stmts.ToImmutable());
         }
 
@@ -1103,12 +1097,14 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(node);
             }
 
+            var conditions = ImmutableArray.CreateBuilder<BoundExpression>(armCount);
             var boundArmExprs = ImmutableArray.CreateBuilder<BoundExpression>(armCount);
             for (int i = 0; i < armCount; i++)
-                boundArmExprs.Add(BindExpression(arms[i].Expression, ctx, diagnostics));
-            var conditions = ImmutableArray.CreateBuilder<BoundExpression>(armCount);
-            for (int i = 0; i < armCount; i++)
-                conditions.Add(BindSwitchExpressionArmCondition(arms[i], tmpSyntax, tmpExpr, governing.Type, ctx, diagnostics));
+            {
+                BoundExpression condition = BindSwitchExpressionArmCondition(arms[i], tmpSyntax, tmpExpr, governing.Type, ctx, diagnostics);
+                conditions.Add(condition);
+                boundArmExprs.Add(CreateFlowScopeBinderForTrue(condition, withinExpression: true).BindExpression(arms[i].Expression, ctx, diagnostics));
+            }
 
             var unbound = new BoundUnboundSwitchExpression(node, tmp, tmpDecl, conditions.MoveToImmutable(), boundArmExprs.MoveToImmutable(),
                 new Diagnostic("CN_SWITCHEXPR004", DiagnosticSeverity.Error,

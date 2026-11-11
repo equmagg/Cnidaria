@@ -82,8 +82,52 @@ namespace System.Text
             return this;
         }
 
+        public StringBuilder Append(char[] value, int startIndex, int charCount)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(startIndex);
+            ArgumentOutOfRangeException.ThrowIfNegative(charCount);
+            if (value is null)
+            {
+                if (startIndex == 0 && charCount == 0) return this;
+                throw new ArgumentNullException(nameof(value));
+            }
+            if (charCount > value.Length - startIndex) throw new ArgumentOutOfRangeException(nameof(charCount));
+            EnsureCapacity(_length + charCount);
+            for (int i = 0; i < charCount; i++)
+                _buffer[_length + i] = value[startIndex + i];
+            _length += charCount;
+
+            return this;
+        }
+
         public StringBuilder AppendLine()
             => Append(System.Environment.NewLine);
+
+        public ChunkEnumerator GetChunks() => new ChunkEnumerator(this);
+
+        public struct ChunkEnumerator
+        {
+            private readonly StringBuilder _builder;
+            private bool _moved;
+
+            internal ChunkEnumerator(StringBuilder builder)
+            {
+                _builder = builder;
+                _moved = false;
+            }
+
+            public ChunkEnumerator GetEnumerator() => this;
+
+            public bool MoveNext()
+            {
+                if (_moved) return false;
+                _moved = true;
+
+                return true;
+            }
+
+            public ReadOnlyMemory<char> Current => new ReadOnlyMemory<char>(_builder._buffer, 0, _builder._length);
+        }
 
         private void EnsureCapacity(int desired)
         {
@@ -274,7 +318,148 @@ namespace System.Text
 
         public abstract int GetMaxCharCount(int byteCount);
 
+        public virtual ReadOnlySpan<byte> Preamble => default;
+
+        public virtual Decoder GetDecoder() => throw new PlatformNotSupportedException();
+
         public static Encoding UTF8 => UTF8Encoding.s_default;
+
+        public static Encoding Unicode => UnicodeEncoding.s_littleEndianDefault;
+
+        public static Encoding BigEndianUnicode => UnicodeEncoding.s_bigEndianDefault;
+
+        public static Encoding UTF32 => UTF32Encoding.s_default;
+    }
+    public abstract class Decoder
+    {
+        protected Decoder()
+        {
+        }
+
+        public abstract int GetCharCount(byte[] bytes, int index, int count);
+
+        public abstract int GetChars(byte[] bytes, int byteIndex, int byteCount, char[] chars, int charIndex);
+
+        public virtual int GetChars(byte[] bytes, int byteIndex, int byteCount, char[] chars, int charIndex, bool flush)
+            => GetChars(bytes, byteIndex, byteCount, chars, charIndex);
+
+        public virtual int GetChars(ReadOnlySpan<byte> bytes, Span<char> chars, bool flush)
+        {
+            byte[] byteArray = bytes.ToArray();
+            char[] charArray = new char[chars.Length];
+            int charCount = GetChars(byteArray, 0, byteArray.Length, charArray, 0, flush);
+            new ReadOnlySpan<char>(charArray, 0, charCount).CopyTo(chars);
+
+            return charCount;
+        }
+    }
+    public class UnicodeEncoding : Encoding
+    {
+        internal static readonly UnicodeEncoding s_bigEndianDefault = new UnicodeEncoding(bigEndian: true, byteOrderMark: true);
+        internal static readonly UnicodeEncoding s_littleEndianDefault = new UnicodeEncoding(bigEndian: false, byteOrderMark: true);
+
+        private readonly bool _bigEndian;
+        private readonly bool _byteOrderMark;
+
+        public UnicodeEncoding(bool bigEndian, bool byteOrderMark) : base(bigEndian ? 1201 : 1200)
+        {
+            _bigEndian = bigEndian;
+            _byteOrderMark = byteOrderMark;
+        }
+
+        private static ReadOnlySpan<byte> BigEndianPreamble => [0xFE, 0xFF];
+        private static ReadOnlySpan<byte> LittleEndianPreamble => [0xFF, 0xFE];
+
+        public override ReadOnlySpan<byte> Preamble =>
+            !_byteOrderMark ? default :
+            _bigEndian ? BigEndianPreamble : LittleEndianPreamble;
+
+        public override int GetMaxByteCount(int charCount)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(charCount);
+
+            long byteCount = (long)charCount + 1;
+
+            if (EncoderFallback.MaxCharCount > 1)
+                byteCount *= EncoderFallback.MaxCharCount;
+
+            byteCount <<= 1;
+
+            if (byteCount > 0x7fffffff)
+                throw new ArgumentOutOfRangeException(nameof(charCount), SR.ArgumentOutOfRange_GetByteCountOverflow);
+
+            return (int)byteCount;
+        }
+
+        public override int GetMaxCharCount(int byteCount)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(byteCount);
+
+            long charCount = (long)(byteCount >> 1) + (byteCount & 1) + 1;
+
+            if (DecoderFallback.MaxCharCount > 1)
+                charCount *= DecoderFallback.MaxCharCount;
+
+            if (charCount > 0x7fffffff)
+                throw new ArgumentOutOfRangeException(nameof(byteCount), SR.ArgumentOutOfRange_GetCharCountOverflow);
+
+            return (int)charCount;
+        }
+    }
+    public sealed class UTF32Encoding : Encoding
+    {
+        internal static readonly UTF32Encoding s_default = new UTF32Encoding(bigEndian: false, byteOrderMark: true);
+
+        private readonly bool _bigEndian;
+        private readonly bool _emitUTF32ByteOrderMark;
+
+        public UTF32Encoding(bool bigEndian, bool byteOrderMark) : base(bigEndian ? 12001 : 12000)
+        {
+            _bigEndian = bigEndian;
+            _emitUTF32ByteOrderMark = byteOrderMark;
+        }
+
+        private static ReadOnlySpan<byte> BigEndianPreamble => [0x00, 0x00, 0xFE, 0xFF];
+        private static ReadOnlySpan<byte> LittleEndianPreamble => [0xFF, 0xFE, 0x00, 0x00];
+
+        public override ReadOnlySpan<byte> Preamble =>
+            !_emitUTF32ByteOrderMark ? default :
+            _bigEndian ? BigEndianPreamble : LittleEndianPreamble;
+
+        public override int GetMaxByteCount(int charCount)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(charCount);
+
+            long byteCount = (long)charCount + 1;
+
+            if (EncoderFallback.MaxCharCount > 1)
+                byteCount *= EncoderFallback.MaxCharCount;
+
+            byteCount *= 4;
+
+            if (byteCount > 0x7fffffff)
+                throw new ArgumentOutOfRangeException(nameof(charCount), SR.ArgumentOutOfRange_GetByteCountOverflow);
+
+            return (int)byteCount;
+        }
+
+        public override int GetMaxCharCount(int byteCount)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(byteCount);
+
+            long charCount = (long)(byteCount / 2) + 2;
+
+            if (DecoderFallback.MaxCharCount > 2)
+            {
+                charCount *= DecoderFallback.MaxCharCount;
+                charCount /= 2;
+            }
+
+            if (charCount > 0x7fffffff)
+                throw new ArgumentOutOfRangeException(nameof(byteCount), SR.ArgumentOutOfRange_GetCharCountOverflow);
+
+            return (int)charCount;
+        }
     }
     public partial class UTF8Encoding : Encoding
     {
@@ -330,6 +515,10 @@ namespace System.Text
                 this.decoderFallback = new DecoderReplacementFallback("\xFFFD");
             }
         }
+
+        private static ReadOnlySpan<byte> Utf8Preamble => [0xEF, 0xBB, 0xBF];
+
+        public override ReadOnlySpan<byte> Preamble => _emitUTF8Identifier ? Utf8Preamble : default;
 
         public override int GetMaxByteCount(int charCount)
         {
@@ -620,6 +809,8 @@ namespace System.Text
     /// </remarks>
     public readonly struct Rune : IComparable, IComparable<Rune>, IEquatable<Rune>
     {
+        public static bool IsWhiteSpace(Rune value) => value.Value <= 0xFFFF && char.IsWhiteSpace((char)value.Value);
+
         private readonly uint _value;
 
         private Rune(uint scalarValue, bool _)
@@ -640,6 +831,21 @@ namespace System.Text
         /// Returns the Unicode scalar value as an integer.
         /// </summary>
         public int Value => (int)_value;
+
+        internal const int MaxUtf16CharsPerRune = 2;
+
+        internal ReadOnlySpan<char> AsSpan(Span<char> buffer)
+        {
+            if (_value < 0x10000)
+            {
+                buffer[0] = (char)_value;
+                return buffer.Slice(0, 1);
+            }
+
+            UnicodeUtility.GetUtf16SurrogatesFromSupplementaryPlaneScalar(_value, out buffer[0], out buffer[1]);
+
+            return buffer.Slice(0, MaxUtf16CharsPerRune);
+        }
 
         public int CompareTo(Rune other) => this.Value - other.Value; // values don't span entire 32-bit domain; won't integer overflow
 

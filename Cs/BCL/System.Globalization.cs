@@ -1574,6 +1574,12 @@ namespace System.Globalization
             //allYearMonthPatterns = cultureData.YearMonths(calendarId);
         }
     }
+    public enum DigitShapes : int
+    {
+        Context = 0x0000,
+        None = 0x0001,
+        NativeNational = 0x0002
+    }
     public sealed class NumberFormatInfo : IFormatProvider
     {
         internal static readonly string[] s_asciiDigits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];

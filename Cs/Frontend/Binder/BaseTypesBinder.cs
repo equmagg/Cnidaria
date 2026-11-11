@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Linq;
 using System.Threading;
 
 namespace Cnidaria.Cs
@@ -175,9 +176,121 @@ namespace Cnidaria.Cs
                 }
             }
 
+            foreach (NamedTypeSymbol type in desiredInterfaces.Keys)
+                ValidateInterfaceUnification(type, diagnostics);
+
             RecordBinder.DeclareMembers(compilation, diagnostics);
             BindOverrides(compilation, trees, diagnostics);
             ValidateAbstractMemberImplementations(compilation, trees, diagnostics);
+        }
+
+        /// <summary>Reports a type whose interfaces become one interface under some instantiation of its type parameters</summary>
+        private static void ValidateInterfaceUnification(NamedTypeSymbol type, DiagnosticBag diagnostics)
+        {
+            var closure = new List<NamedTypeSymbol>();
+            CollectInterfaceClosure(type, closure);
+            for (int i = 0; i < closure.Count; i++)
+            {
+                for (int j = i + 1; j < closure.Count; j++)
+                {
+                    if (!ReferenceEquals(closure[i].OriginalDefinition, closure[j].OriginalDefinition) ||
+                        !CanUnify(closure[i], closure[j], new Dictionary<TypeParameterSymbol, TypeSymbol>()))
+                    {
+                        continue;
+                    }
+
+                    diagnostics.Add(new Diagnostic(
+                        "CN_BASE_UNIFY",
+                        DiagnosticSeverity.Error,
+                        $"'{type.Name}' cannot implement both '{closure[i].Name}' and '{closure[j].Name}' because they may unify for some type parameter substitutions.",
+                        type.Locations[0]));
+                }
+            }
+        }
+
+        private static void CollectInterfaceClosure(TypeSymbol type, List<NamedTypeSymbol> closure)
+        {
+            foreach (TypeSymbol implemented in type.Interfaces)
+            {
+                if (implemented is NamedTypeSymbol named && !closure.Exists(known => LocalScopeBinder.AreSameType(known, named)))
+                {
+                    closure.Add(named);
+                    CollectInterfaceClosure(named, closure);
+                }
+            }
+        }
+
+        private static TypeSymbol FollowBindings(TypeSymbol type, Dictionary<TypeParameterSymbol, TypeSymbol> bound)
+        {
+            while (type is TypeParameterSymbol parameter && bound.TryGetValue(parameter, out TypeSymbol? value))
+                type = value;
+
+            return type;
+        }
+
+        private static bool CanUnify(TypeSymbol left, TypeSymbol right, Dictionary<TypeParameterSymbol, TypeSymbol> bound)
+        {
+            left = FollowBindings(left, bound);
+            right = FollowBindings(right, bound);
+            if (LocalScopeBinder.AreSameType(left, right))
+                return true;
+
+            if (left is not TypeParameterSymbol && right is TypeParameterSymbol)
+                (left, right) = (right, left);
+
+            switch (left, right)
+            {
+                case (TypeParameterSymbol parameter, _):
+                    if (right is PointerTypeSymbol or FunctionPointerTypeSymbol || MentionsParameter(right, parameter, bound))
+                        return false;
+
+                    bound[parameter] = right;
+                    return true;
+                case (ArrayTypeSymbol l, ArrayTypeSymbol r):
+                    return l.Rank == r.Rank && l.IsSZArray == r.IsSZArray && CanUnify(l.ElementType, r.ElementType, bound);
+                case (PointerTypeSymbol l, PointerTypeSymbol r):
+                    return CanUnify(l.PointedAtType, r.PointedAtType, bound);
+                case (TupleTypeSymbol l, TupleTypeSymbol r):
+                    return CanUnifyAll(l.ElementTypes, r.ElementTypes, bound);
+                case (NamedTypeSymbol l, NamedTypeSymbol r):
+                    return ReferenceEquals(l.OriginalDefinition, r.OriginalDefinition) && CanUnifyAll(l.TypeArguments, r.TypeArguments, bound);
+                default:
+                    return false;
+            }
+        }
+
+        private static bool CanUnifyAll(ImmutableArray<TypeSymbol> left, ImmutableArray<TypeSymbol> right, Dictionary<TypeParameterSymbol, TypeSymbol> bound)
+        {
+            if (left.Length != right.Length)
+                return false;
+
+            for (int i = 0; i < left.Length; i++)
+            {
+                if (!CanUnify(left[i], right[i], bound))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static bool MentionsParameter(TypeSymbol type, TypeParameterSymbol parameter, Dictionary<TypeParameterSymbol, TypeSymbol> bound)
+        {
+            type = FollowBindings(type, bound);
+            switch (type)
+            {
+                case TypeParameterSymbol other:
+                    return ReferenceEquals(other, parameter);
+                case ArrayTypeSymbol array:
+                    return MentionsParameter(array.ElementType, parameter, bound);
+                case PointerTypeSymbol pointer:
+                    return MentionsParameter(pointer.PointedAtType, parameter, bound);
+                case TupleTypeSymbol tuple:
+                    return tuple.ElementTypes.Any(element => MentionsParameter(element, parameter, bound));
+                case NamedTypeSymbol named:
+                    return named.TypeArguments.Any(argument => MentionsParameter(argument, parameter, bound));
+                default:
+                    return false;
+            }
         }
 
         /// <summary>Reports non-interface entries after the selected base class</summary>
@@ -244,8 +357,15 @@ namespace Cnidaria.Cs
                         BindAccessorOverride(tree, kv.Key, property.SetMethod, diagnostics);
                         continue;
                     }
-                    if (kv.Key is not MethodDeclarationSyntax md)
+                    if (kv.Value is SourceEventSymbol declaredEvent)
+                    {
+                        BindAccessorOverride(tree, kv.Key, declaredEvent.AddMethod, diagnostics);
+                        BindAccessorOverride(tree, kv.Key, declaredEvent.RemoveMethod, diagnostics);
                         continue;
+                    }
+                    if (kv.Key is not (MethodDeclarationSyntax or DestructorDeclarationSyntax))
+                        continue;
+                    SyntaxNode md = kv.Key;
                     if (kv.Value is not SourceMethodSymbol m)
                         continue;
                     if (!m.IsOverride)
@@ -338,7 +458,7 @@ namespace Cnidaria.Cs
                         LocalScopeBinder.AreSameType(overridden.ContainingSymbol as TypeSymbol, method.ContainingSymbol as TypeSymbol))
                         return true;
                 }
-                if (string.Equals(overrides[i].Name, method.Name, StringComparison.Ordinal) && SignatureEquals(overrides[i], method))
+                if (overrides[i].Name == method.Name && SignatureEquals(overrides[i], method))
                     return true;
             }
             return false;
@@ -383,7 +503,7 @@ namespace Cnidaria.Cs
                     if (mem is not MethodSymbol bm)
                         continue;
 
-                    if (!string.Equals(bm.Name, overriding.Name, StringComparison.Ordinal))
+                    if (bm.Name != overriding.Name)
                         continue;
 
                     if (!SignatureEquals(bm, overriding))

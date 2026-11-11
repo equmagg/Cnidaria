@@ -644,7 +644,7 @@ public static class StaticLinker
             var containsEntry = units[i].Lir.Functions.Any(function =>
                 function.Symbol is { } symbol &&
                 !units[i].Linkage.IsInternal(symbol) &&
-                string.Equals(symbol.Name, options.EntryFunctionName, StringComparison.Ordinal));
+                symbol.Name == options.EntryFunctionName);
             if (!containsEntry)
                 continue;
 
@@ -1264,7 +1264,7 @@ public static class StaticLinker
                 {
                     (CErrorType, CErrorType) => true,
                     (BuiltinType l, BuiltinType r) => l.BuiltinKind == r.BuiltinKind,
-                    (RVVectorType l, RVVectorType r) => string.Equals(l.BuiltinName, r.BuiltinName, StringComparison.Ordinal),
+                    (RVVectorType l, RVVectorType r) => l.BuiltinName == r.BuiltinName,
                     (PointerType l, PointerType r) => AreCompatible(l.PointeeType, r.PointeeType),
                     (ArrayType l, ArrayType r) =>
                         AreCompatible(l.ElementType, r.ElementType) &&
@@ -1272,7 +1272,7 @@ public static class StaticLinker
                     (FunctionType l, FunctionType r) => AreCompatibleFunctions(l, r),
                     (TagType l, TagType r) => AreCompatibleTags(l.Symbol, r.Symbol),
                     (EnumType l, EnumType r) => AreCompatibleEnums(l.Symbol, r.Symbol),
-                    _ => string.Equals(left.ToDisplayString(), right.ToDisplayString(), StringComparison.Ordinal),
+                    _ => left.ToDisplayString() == right.ToDisplayString(),
                 };
             }
             finally
@@ -1349,7 +1349,7 @@ public static class StaticLinker
             {
                 var leftField = left.Fields[i];
                 var rightField = right.Fields[i];
-                if (!string.Equals(leftField.Name, rightField.Name, StringComparison.Ordinal) ||
+                if (leftField.Name != rightField.Name ||
                     !AreCompatible(leftField.Type, rightField.Type))
                 {
                     return false;
@@ -1369,7 +1369,7 @@ public static class StaticLinker
             var rightAnonymous = right.StartsWith("<anonymous", StringComparison.Ordinal);
             if (leftAnonymous || rightAnonymous)
                 return leftAnonymous && rightAnonymous;
-            return string.Equals(left, right, StringComparison.Ordinal);
+            return left == right;
         }
     }
 

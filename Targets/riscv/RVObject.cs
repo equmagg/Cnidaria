@@ -327,7 +327,7 @@ public static class RiscVObjectComposer
                 if (instruction.HasSymbol)
                 {
                     string symbol = Rename(renames[i], instruction.Symbol!);
-                    if (!StringComparer.Ordinal.Equals(symbol, instruction.Symbol))
+                    if (symbol != instruction.Symbol)
                         instruction = instruction.WithSymbol(symbol, instruction.RelocationKind);
                 }
                 instructions.Add(instruction);
@@ -413,7 +413,7 @@ public static class RiscVObjectComposer
                 }
 
                 int offset;
-                if (StringComparer.Ordinal.Equals(symbol.SectionName, ".text"))
+                if (symbol.SectionName == ".text")
                 {
                     offset = checked(textBases[i] + symbol.Offset);
                 }

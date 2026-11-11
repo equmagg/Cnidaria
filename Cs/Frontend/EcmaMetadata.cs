@@ -20,6 +20,8 @@ namespace Cnidaria.Cs
         private readonly Dictionary<int, string> _strings = new();
         private readonly int[] _propertyGetters;
         private readonly int[] _propertySetters;
+        private readonly int[] _eventAdders;
+        private readonly int[] _eventRemovers;
         private readonly bool _hasModuleTypeDef;
 
         public string ModuleName { get; }
@@ -122,11 +124,21 @@ namespace Cnidaria.Cs
             IndexStrings();
             _propertyGetters = new int[rowCounts[(int)EcmaTable.Property] + 1];
             _propertySetters = new int[rowCounts[(int)EcmaTable.Property] + 1];
+            _eventAdders = new int[rowCounts[(int)EcmaTable.Event] + 1];
+            _eventRemovers = new int[rowCounts[(int)EcmaTable.Event] + 1];
             for (int rid = 1; rid <= rowCounts[(int)EcmaTable.MethodSemantics]; rid++)
             {
                 uint semantics = Read(EcmaTable.MethodSemantics, rid, 0);
                 int method = MetadataToken.Make(MetadataToken.MethodDef, (int)Read(EcmaTable.MethodSemantics, rid, 1));
                 int association = EcmaCodedIndex.Decode(EcmaCodedKind.HasSemantics, Read(EcmaTable.MethodSemantics, rid, 2));
+                if (MetadataToken.Table(association) == MetadataToken.EventDef)
+                {
+                    if ((semantics & 0x0008) != 0)
+                        _eventAdders[MetadataToken.Rid(association)] = method;
+                    if ((semantics & 0x0010) != 0)
+                        _eventRemovers[MetadataToken.Rid(association)] = method;
+                    continue;
+                }
                 if (MetadataToken.Table(association) != MetadataToken.PropertyDef)
                     continue;
                 int property = MetadataToken.Rid(association);
@@ -252,6 +264,29 @@ namespace Cnidaria.Cs
                 end++;
             return (lo, end);
         }
+        public bool TryGetFieldMarshal(int parentToken, out int nativeType)
+        {
+            uint key = EcmaCodedIndex.EncodeHasFieldMarshal(parentToken);
+            int lo = 1;
+            int hi = _layout.RowCounts[(int)EcmaTable.FieldMarshal];
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) >>> 1;
+                uint parent = Read(EcmaTable.FieldMarshal, mid, 0);
+                if (parent == key)
+                {
+                    nativeType = (int)Read(EcmaTable.FieldMarshal, mid, 1);
+                    return true;
+                }
+                if (parent < key)
+                    lo = mid + 1;
+                else
+                    hi = mid - 1;
+            }
+
+            nativeType = 0;
+            return false;
+        }
         public bool IsAttribute(int constructorToken, string @namespace, string name)
             => TryGetAttributeTypeName(constructorToken, out var ns, out var n) &&
                ns == @namespace &&
@@ -311,6 +346,7 @@ namespace Cnidaria.Cs
             MetadataTableKind.MethodSpec => EcmaTable.MethodSpec,
             MetadataTableKind.Constant => EcmaTable.Constant,
             MetadataTableKind.Property => EcmaTable.Property,
+            MetadataTableKind.Event => EcmaTable.Event,
             MetadataTableKind.CustomAttribute => EcmaTable.CustomAttribute,
             MetadataTableKind.PInvokeMap => EcmaTable.ImplMap,
             MetadataTableKind.ModuleRef => EcmaTable.ModuleRef,
@@ -413,6 +449,12 @@ namespace Cnidaria.Cs
             (int)Read(EcmaTable.Property, rid, 2),
             _propertyGetters[rid],
             _propertySetters[rid]);
+        public EventRow GetEvent(int rid) => new(
+            (ushort)Read(EcmaTable.Event, rid, 0),
+            (int)Read(EcmaTable.Event, rid, 1),
+            ReadToken(EcmaTable.Event, rid, 2, EcmaCodedKind.TypeDefOrRef),
+            _eventAdders[rid],
+            _eventRemovers[rid]);
         public CustomAttributeRow GetCustomAttribute(int rid) => new(
             ReadToken(EcmaTable.CustomAttribute, rid, 0, EcmaCodedKind.HasCustomAttribute),
             ReadToken(EcmaTable.CustomAttribute, rid, 1, EcmaCodedKind.CustomAttributeType),
@@ -445,9 +487,12 @@ namespace Cnidaria.Cs
 
             throw new InvalidOperationException("Entry point not found in module metadata.");
         }
-        /// <summary>Tries the generated top-level entry point before a compatible static Main</summary>
+        /// <summary>Tries the generated async and top-level entry points before a compatible static Main</summary>
         public bool TryFindEntryPointMethodDef(out int methodDefToken)
         {
+            if (TryFindEntryByName(this, "<Main>", out methodDefToken))
+                return true;
+
             if (TryFindEntryByName(this, "<Main>$", out methodDefToken))
                 return true;
 

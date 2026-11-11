@@ -52,11 +52,12 @@ public enum TargetArchitectureFeatures : ulong
     RiscVZcd = 1UL << 24,
     RiscVZvbb = 1UL << 25,
     RiscVSvinval = 1UL << 26,
+    RiscVZkt = 1UL << 27,
     RiscVG = RiscVM | RiscVF | RiscVD | RiscVA,
-    RVA22 = RiscVG | RiscVPrivileged | RiscVB | RiscVC,
-    RVA23 = RVA22 | RiscVV | RiscVH | RiscVZicond | RiscVZicbom | RiscVZicbop | RiscVZicboz |
-            RiscVZawrs | RiscVZfa | RiscVZfhmin | RiscVZihintpause | RiscVZihintntl |
-            RiscVZimop | RiscVZcmop | RiscVZcb | RiscVZcd | RiscVZvbb | RiscVSvinval,
+    RVA22 = RiscVG | RiscVB | RiscVC | RiscVPrivileged | RiscVZihintpause | RiscVSvinval |
+            RiscVZicbom | RiscVZicbop | RiscVZicboz | RiscVZfhmin | RiscVZkt,
+    RVA23 = RVA22 | RiscVV | RiscVH | RiscVZicond | RiscVZawrs | RiscVZfa | RiscVZihintntl |
+            RiscVZimop | RiscVZcmop | RiscVZcb | RiscVZcd | RiscVZvbb,
 
     X86Sse2 = 1UL << 32,
     X86Sse3 = 1UL << 33,

@@ -128,7 +128,7 @@ internal static class LoopInvariantCodeMotion
     {
         foreach (var block in loop.Blocks)
         {
-            if (block.Label is not null && StringComparer.Ordinal.Equals(block.Label.Name, label.Name))
+            if (block.Label is not null && block.Label.Name == label.Name)
                 return true;
         }
 
@@ -532,7 +532,7 @@ internal static class LoopInvariantCodeMotion
         {
             foreach (var pair in plans)
             {
-                if (!StringComparer.Ordinal.Equals(pair.Key.Label!.Name, target.Name))
+                if (pair.Key.Label!.Name != target.Name)
                     continue;
                 return pair.Value.TripCount == 0
                     ? pair.Value.ExitTarget
@@ -571,7 +571,7 @@ internal static class LoopInvariantCodeMotion
             {
                 if (!map.TryGetValue(target.Name, out var replacement))
                     return target;
-                if (!StringComparer.Ordinal.Equals(target.Name, plan.Loop.Header.Label!.Name))
+                if (target.Name != plan.Loop.Header.Label!.Name)
                     return replacement;
                 return last ? plan.ExitTarget : copies[copy + 1][target.Name];
             }

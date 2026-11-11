@@ -1479,6 +1479,7 @@ public static class CSharp
     }
     private const string BclPrefix = "Cnidaria.Cs.BCL.";
     public static ImmutableArray<(string Path, string Text)> GetCoreBCLSources() => ReadBclSources(
+        "Internal.cs",
         "System.cs",
         "System.Runtime.cs",
         "System.Runtime.InteropServices.cs",
@@ -1486,19 +1487,24 @@ public static class CSharp
         "System.Collections.cs",
         "System.Collections.Generic.cs",
         "System.Collections.Immutable.cs",
+        "System.Collections.ObjectModel.cs",
+        "System.Collections.Concurrent.cs",
         "System.Buffers.cs",
         "System.Threading.cs",
+        "System.Threading.Tasks.cs",
         "System.Globalization.cs",
         "System.Text.cs",
+        "System.IO.cs",
         "System.Numerics.cs",
         "System.Runtime.Intrinsics.cs",
         "System.Runtime.Intrinsics.Arm.cs",
         "System.Runtime.Intrinsics.Wasm.cs",
         "System.Runtime.Intrinsics.X86.cs",
         "System.Reflection.cs",
-        "System.Diagnostics.cs");
-    public static ImmutableArray<(string Path, string Text)> GetExtendedBCLSources() => ReadBclSources(
         "System.Linq.cs",
+        "System.Diagnostics.cs",
+        "Microsoft.Win32.SafeHandles.cs");
+    public static ImmutableArray<(string Path, string Text)> GetExtendedBCLSources() => ReadBclSources(
         "System.Drawing.cs");
     private static ImmutableArray<(string Path, string Text)> ReadBclSources(params string[] files)
     {

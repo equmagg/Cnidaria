@@ -1853,7 +1853,7 @@ public sealed class ArmCodeGenerator
                 return -1;
             for (var i = 0; i < functionType.Parameters.Length; i++)
             {
-                if (string.Equals(functionType.Parameters[i].Name, name, StringComparison.Ordinal))
+                if (functionType.Parameters[i].Name == name)
                     return i;
             }
             return -1;
@@ -2075,6 +2075,9 @@ public sealed class ArmCodeGenerator
                         Reg(ToArm(left), size),
                         Reg(ToArm(right), size)));
                     break;
+                case "rotr":
+                    Emit(ArmInstruction.Ternary(ArmInstrKind.Ror, Reg(ToArm(destination), size), Reg(ToArm(left), size), Reg(ToArm(right), size)));
+                    break;
                 case "==":
                 case "!=":
                 case "<":
@@ -2187,6 +2190,9 @@ public sealed class ArmCodeGenerator
                     EmitBinaryImmediate(shiftOpcode, destination, leftOperand, amount, size);
                     return true;
                 }
+                case "rotr":
+                    EmitBinaryImmediate(ArmInstrKind.Ror, destination, leftOperand, (int)(bits & (ulong)(operationBits - 1)), size);
+                    return true;
                 case "==":
                 case "!=":
                 case "<":
@@ -2859,6 +2865,8 @@ public sealed class ArmCodeGenerator
         {
             foreach (var preservation in preservations)
             {
+                if (!preservation.NeedsSave)
+                    continue;
                 var size = RegisterSize(preservation.Register.Type);
                 if (preservation.UsesRegister)
                 {
@@ -2873,6 +2881,8 @@ public sealed class ArmCodeGenerator
         {
             foreach (var preservation in preservations)
             {
+                if (!preservation.NeedsRestore)
+                    continue;
                 var size = RegisterSize(preservation.Register.Type);
                 if (preservation.UsesRegister)
                 {
@@ -5527,7 +5537,7 @@ public sealed class ArmCodeGenerator
                 for (var i = 0; i < symbols.Count; i++)
                 {
                     var symbol = symbols[i];
-                    if (!string.Equals(symbol.SectionName, Name, StringComparison.Ordinal))
+                    if (symbol.SectionName != Name)
                         continue;
                     var start = RemapOffset(symbol.Offset);
                     var end = RemapOffset(checked(symbol.Offset + symbol.Size));

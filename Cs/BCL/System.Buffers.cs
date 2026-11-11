@@ -1,3 +1,6 @@
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+
 namespace System.Buffers
 {
     /// <summary>
@@ -668,6 +671,153 @@ namespace System.Buffers
             Medium,
             High
         }
+    }
+
+    /// <summary>
+    /// Owner of Memory<typeparamref name="T"/> that is responsible for disposing the underlying memory appropriately.
+    /// </summary>
+    public interface IMemoryOwner<T> : IDisposable
+    {
+        /// <summary>
+        /// Returns a Memory<typeparamref name="T"/>.
+        /// </summary>
+        Memory<T> Memory { get; }
+    }
+
+    /// <summary>
+    /// Provides a mechanism for pinning and unpinning objects to prevent the GC from moving them.
+    /// </summary>
+    public interface IPinnable
+    {
+        /// <summary>
+        /// Call this method to indicate that the IPinnable object can not be moved by the garbage collector.
+        /// The address of the pinned object can be taken.
+        /// </summary>
+        /// <param name="elementIndex">The offset to the element within the memory at which the returned <see cref="MemoryHandle"/> points to.</param>
+        MemoryHandle Pin(int elementIndex);
+
+        /// <summary>
+        /// Call this method to indicate that the IPinnable object no longer needs to be pinned.
+        /// The garbage collector is free to move the object now.
+        /// </summary>
+        void Unpin();
+    }
+
+    /// <summary>
+    /// A handle for the memory.
+    /// </summary>
+    public unsafe struct MemoryHandle : IDisposable
+    {
+        private void* _pointer;
+        private GCHandle _handle;
+        private IPinnable? _pinnable;
+
+        /// <summary>
+        /// Creates a new memory handle for the memory.
+        /// </summary>
+        /// <param name="pointer">pointer to memory</param>
+        /// <param name="pinnable">reference to manually managed object, or default if there is no memory manager</param>
+        /// <param name="handle">handle used to pin array buffers</param>
+        /// <safety>Only stores the supplied pointer, GC handle, and pinnable reference into the struct's fields; it performs no dereference of the pointer.</safety>
+        [CLSCompliant(false)]
+        public MemoryHandle(void* pointer, GCHandle handle = default, IPinnable? pinnable = default)
+        {
+            _pointer = pointer;
+            _handle = handle;
+            _pinnable = pinnable;
+        }
+
+        /// <summary>
+        /// Returns the pointer to memory, where the memory is assumed to be pinned and hence the address won't change.
+        /// </summary>
+        /// <safety>Returns the stored pointer value to already-pinned memory; obtaining the address performs no dereference.</safety>
+        [CLSCompliant(false)]
+        public void* Pointer => _pointer;
+
+        /// <summary>
+        /// Frees the pinned handle and releases IPinnable.
+        /// </summary>
+        public void Dispose()
+        {
+            if (_handle.IsAllocated)
+            {
+                _handle.Free();
+            }
+
+            if (_pinnable != null)
+            {
+                _pinnable.Unpin();
+                _pinnable = null;
+            }
+
+            _pointer = null;
+        }
+    }
+
+    /// <summary>
+    /// Manager of <see cref="Memory{T}"/> that provides the implementation.
+    /// </summary>
+    public abstract class MemoryManager<T> : IMemoryOwner<T>, IPinnable
+    {
+        /// <summary>
+        /// Returns a <see cref="Memory{T}"/>.
+        /// </summary>
+        public virtual Memory<T> Memory => new Memory<T>(this, GetSpan().Length);
+
+        /// <summary>
+        /// Returns a span wrapping the underlying memory.
+        /// </summary>
+        public abstract Span<T> GetSpan();
+
+        /// <summary>
+        /// Returns a handle to the memory that has been pinned and hence its address can be taken.
+        /// </summary>
+        /// <param name="elementIndex">The offset to the element within the memory at which the returned <see cref="MemoryHandle"/> points to. (default = 0)</param>
+        public abstract MemoryHandle Pin(int elementIndex = 0);
+
+        /// <summary>
+        /// Lets the garbage collector know that the object is free to be moved now.
+        /// </summary>
+        public abstract void Unpin();
+
+        /// <summary>
+        /// Returns a <see cref="Memory{T}"/> for the current <see cref="MemoryManager{T}"/>.
+        /// </summary>
+        /// <param name="length">The element count in the memory, starting at offset 0.</param>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        protected Memory<T> CreateMemory(int length) => new Memory<T>(this, length);
+
+        /// <summary>
+        /// Returns a <see cref="Memory{T}"/> for the current <see cref="MemoryManager{T}"/>.
+        /// </summary>
+        /// <param name="start">The offset to the element which the returned memory starts at.</param>
+        /// <param name="length">The element count in the memory, starting at element offset <paramref name="start"/>.</param>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        protected Memory<T> CreateMemory(int start, int length) => new Memory<T>(this, start, length);
+
+        /// <summary>
+        /// Returns an array segment.
+        /// <remarks>Returns the default array segment if not overridden.</remarks>
+        /// </summary>
+        protected internal virtual bool TryGetArray(out ArraySegment<T> segment)
+        {
+            segment = default;
+            return false;
+        }
+
+        /// <summary>
+        /// Implements IDisposable.
+        /// </summary>
+        void IDisposable.Dispose()
+        {
+            Dispose(disposing: true);
+            GC.SuppressFinalize(this);
+        }
+
+        /// <summary>
+        /// Clean up of any leftover managed and unmanaged resources.
+        /// </summary>
+        protected abstract void Dispose(bool disposing);
     }
 }
 namespace System.Buffers.Binary

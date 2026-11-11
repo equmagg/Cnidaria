@@ -1,8 +1,13 @@
 using System;
+using System.Buffers;
 using System.Collections;
+using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Diagnostics.CodeAnalysis;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Linq;
 
 namespace System.Collections.Generic
 {
@@ -55,6 +60,26 @@ namespace System.Collections.Generic
         {
             get;
         }
+    }
+    public interface IAsyncEnumerable<out T> where T : allows ref struct
+    {
+        /// <summary>Returns an enumerator that iterates asynchronously through the collection.</summary>
+        /// <param name="cancellationToken">A <see cref="CancellationToken"/> that may be used to cancel the asynchronous iteration.</param>
+        /// <returns>An enumerator that can be used to iterate asynchronously through the collection.</returns>
+        IAsyncEnumerator<T> GetAsyncEnumerator(CancellationToken cancellationToken = default);
+    }
+    public interface IAsyncEnumerator<out T> : IAsyncDisposable where T : allows ref struct
+    {
+        /// <summary>Advances the enumerator asynchronously to the next element of the collection.</summary>
+        /// <returns>
+        /// A <see cref="ValueTask{Boolean}"/> that will complete with a result of <c>true</c> if the enumerator
+        /// was successfully advanced to the next element, or <c>false</c> if the enumerator has passed the end
+        /// of the collection.
+        /// </returns>
+        ValueTask<bool> MoveNextAsync();
+
+        /// <summary>Gets the element in the collection at the current position of the enumerator.</summary>
+        T Current { get; }
     }
     public interface IReadOnlyCollection<out T> : IEnumerable<T>
     {
@@ -652,6 +677,100 @@ namespace System.Collections.Generic
             _version++;
         }
 
+        public void AddRange(IEnumerable<T> collection)
+        {
+            if (collection is null)
+                ThrowHelper.ThrowArgumentNullException(ExceptionArgument.collection);
+
+            if (collection is ICollection<T> c)
+            {
+                int count = c.Count;
+                if (count > 0)
+                {
+                    if (_items.Length - _size < count)
+                    {
+                        Grow(checked(_size + count));
+                    }
+
+                    c.CopyTo(_items, _size);
+                    _size += count;
+                    _version++;
+                }
+            }
+            else
+            {
+                using (IEnumerator<T> en = collection.GetEnumerator())
+                {
+                    while (en.MoveNext())
+                    {
+                        Add(en.Current);
+                    }
+                }
+            }
+        }
+
+        // ToArray returns an array containing the contents of the List.
+        // This requires copying the List, which is an O(n) operation.
+        public T[] ToArray()
+        {
+            if (_size == 0)
+            {
+                return Array.Empty<T>();
+            }
+
+            T[] array = new T[_size];
+            Array.Copy(_items, array, _size);
+            return array;
+        }
+
+        // This method removes all items which matches the predicate.
+        // The complexity is O(n).
+        public int RemoveAll(Predicate<T> match)
+        {
+            if (match is null)
+            {
+                ThrowHelper.ThrowArgumentNullException(ExceptionArgument.match);
+            }
+
+            int freeIndex = 0;   // the first free slot in items array
+
+            // Find the first item which needs to be removed.
+            while (freeIndex < _size && !match(_items[freeIndex])) freeIndex++;
+            if (freeIndex >= _size) return 0;
+
+            int current = freeIndex + 1;
+            while (current < _size)
+            {
+                // Find the first item which needs to be kept.
+                while (current < _size && match(_items[current])) current++;
+
+                if (current < _size)
+                {
+                    // copy item to the free slot.
+                    _items[freeIndex++] = _items[current++];
+                }
+            }
+
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                Array.Clear(_items, freeIndex, _size - freeIndex); // Clear the elements so that the gc can reclaim the references.
+            }
+
+            int result = _size - freeIndex;
+            _size = freeIndex;
+            _version++;
+            return result;
+        }
+
+        int IList.IndexOf(object? item)
+        {
+            if (IsCompatibleObject(item))
+            {
+                return IndexOf((T)item!);
+            }
+            return -1;
+        }
+
         void IList.Insert(int index, object? item)
         {
             ThrowHelper.IfNullAndNullsAreIllegalThenThrow<T>(item, ExceptionArgument.item);
@@ -1042,6 +1161,22 @@ namespace System.Collections.Generic
             return false;
         }
     }
+    /// <summary>
+    /// An <see cref="IEqualityComparer{Object}"/> that uses reference equality
+    /// (<see cref="object.ReferenceEquals(object?, object?)"/>) instead of value equality
+    /// (<see cref="object.Equals(object?)"/>) when comparing two object instances.
+    /// </summary>
+    public sealed class ReferenceEqualityComparer : IEqualityComparer<object?>, IEqualityComparer
+    {
+        private ReferenceEqualityComparer() { }
+
+        /// <summary>Gets the singleton <see cref="ReferenceEqualityComparer"/> instance.</summary>
+        public static ReferenceEqualityComparer Instance { get; } = new ReferenceEqualityComparer();
+
+        public new bool Equals(object? x, object? y) => ReferenceEquals(x, y);
+
+        public int GetHashCode(object? obj) => RuntimeHelpers.GetHashCode(obj!);
+    }
     internal abstract class RandomizedStringEqualityComparer : EqualityComparer<string?>, IInternalStringEqualityComparer
     {
         private readonly MarvinSeed _seed;
@@ -1165,7 +1300,6 @@ namespace System.Collections.Generic
                     _seed.p0, _seed.p1);
         }
     }
-    
     public class NonRandomizedStringEqualityComparer : EqualityComparer<string?>, IInternalStringEqualityComparer
     {
         // Dictionary<...>.Comparer and similar methods need to return the original IEqualityComparer
@@ -1674,14 +1808,6 @@ namespace System.Collections.Generic
             foreach (KeyValuePair<TKey, TValue> pair in span)
             {
                 Add(pair.Key, pair.Value);
-            }
-        }
-
-        public IEqualityComparer<TKey> Comparer
-        {
-            get
-            {
-                return _comparer ?? EqualityComparer<TKey>.Default;
             }
         }
 
@@ -5253,6 +5379,1892 @@ namespace System.Collections.Generic
 
                 _index = 0;
                 _current = default!;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Represents a first-in, first-out collection of objects.
+    /// </summary>
+    /// <remarks>
+    /// Implemented as a circular buffer, so <see cref="Enqueue(T)"/> and <see cref="Dequeue"/> are typically <c>O(1)</c>.
+    /// </remarks>
+    [DebuggerDisplay("Count = {Count}")]
+    [Serializable]
+    public class Queue<T> : IEnumerable<T>,
+        ICollection,
+        IReadOnlyCollection<T>
+    {
+        private T[] _array;
+        private int _head;       // The index from which to dequeue if the queue isn't empty.
+        private int _tail;       // The index at which to enqueue if the queue isn't full.
+        private int _size;       // Number of elements.
+        private int _version;
+
+        // Creates a queue with room for capacity objects. The default initial
+        // capacity and grow factor are used.
+        public Queue()
+        {
+            _array = [];
+        }
+
+        // Creates a queue with room for capacity objects. The default grow factor
+        // is used.
+        public Queue(int capacity)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(capacity);
+            _array = new T[capacity];
+        }
+
+        // Fills a Queue with the elements of an ICollection.  Uses the enumerator
+        // to get each of the elements.
+        public Queue(IEnumerable<T> collection)
+        {
+            ArgumentNullException.ThrowIfNull(collection);
+
+            _array = EnumerableHelpers.ToArray(collection, out _size);
+            if (_size != _array.Length) _tail = _size;
+        }
+
+        public int Count => _size;
+
+        /// <summary>
+        /// Gets the total numbers of elements the internal data structure can hold without resizing.
+        /// </summary>
+        public int Capacity => _array.Length;
+
+        /// <inheritdoc cref="ICollection.IsSynchronized" />
+        bool ICollection.IsSynchronized => false;
+
+        object ICollection.SyncRoot => this;
+
+        // Removes all Objects from the queue.
+        public void Clear()
+        {
+            if (_size != 0)
+            {
+                if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                {
+                    if (_head < _tail)
+                    {
+                        Array.Clear(_array, _head, _size);
+                    }
+                    else
+                    {
+                        Array.Clear(_array, _head, _array.Length - _head);
+                        Array.Clear(_array, 0, _tail);
+                    }
+                }
+
+                _size = 0;
+            }
+
+            _head = 0;
+            _tail = 0;
+            _version++;
+        }
+
+        // CopyTo copies a collection into an Array, starting at a particular
+        // index into the array.
+        public void CopyTo(T[] array, int arrayIndex)
+        {
+            ArgumentNullException.ThrowIfNull(array);
+
+            if (arrayIndex < 0 || arrayIndex > array.Length)
+            {
+                ThrowHelper.ThrowArgumentOutOfRangeException(ExceptionArgument.arrayIndex, ExceptionResource.ArgumentOutOfRange_IndexMustBeLessOrEqual);
+            }
+
+            if (array.Length - arrayIndex < _size)
+            {
+                ThrowHelper.ThrowArgumentException(ExceptionResource.Argument_InvalidOffLen);
+            }
+
+            int numToCopy = _size;
+            if (numToCopy == 0) return;
+
+            int firstPart = Math.Min(_array.Length - _head, numToCopy);
+            Array.Copy(_array, _head, array, arrayIndex, firstPart);
+            numToCopy -= firstPart;
+            if (numToCopy > 0)
+            {
+                Array.Copy(_array, 0, array, arrayIndex + _array.Length - _head, numToCopy);
+            }
+        }
+
+        void ICollection.CopyTo(Array array, int index)
+        {
+            ArgumentNullException.ThrowIfNull(array);
+
+            if (array.Rank != 1)
+            {
+                ThrowHelper.ThrowArgumentException(ExceptionResource.Arg_RankMultiDimNotSupported, ExceptionArgument.array);
+            }
+
+            if (array.GetLowerBound(0) != 0)
+            {
+                ThrowHelper.ThrowArgumentException(ExceptionResource.Arg_NonZeroLowerBound, ExceptionArgument.array);
+            }
+
+            int arrayLen = array.Length;
+            if (index < 0 || index > arrayLen)
+            {
+                ThrowHelper.ThrowArgumentOutOfRange_IndexMustBeLessOrEqualException();
+            }
+
+            if (arrayLen - index < _size)
+            {
+                ThrowHelper.ThrowArgumentException(ExceptionResource.Argument_InvalidOffLen);
+            }
+
+            int numToCopy = _size;
+            if (numToCopy == 0) return;
+
+            try
+            {
+                int firstPart = (_array.Length - _head < numToCopy) ? _array.Length - _head : numToCopy;
+                Array.Copy(_array, _head, array, index, firstPart);
+                numToCopy -= firstPart;
+
+                if (numToCopy > 0)
+                {
+                    Array.Copy(_array, 0, array, index + _array.Length - _head, numToCopy);
+                }
+            }
+            catch (ArrayTypeMismatchException)
+            {
+                ThrowHelper.ThrowArgumentException_Argument_IncompatibleArrayType();
+            }
+        }
+
+        // Adds item to the tail of the queue.
+        public void Enqueue(T item)
+        {
+            if (_size == _array.Length)
+            {
+                Grow(_size + 1);
+            }
+
+            _array[_tail] = item;
+            MoveNext(ref _tail);
+            _size++;
+            _version++;
+        }
+
+        // GetEnumerator returns an IEnumerator over this Queue.  This
+        // Enumerator will support removing.
+        public Enumerator GetEnumerator() => new Enumerator(this);
+
+        /// <internalonly/>
+        IEnumerator<T> IEnumerable<T>.GetEnumerator() =>
+            Count == 0 ? SZGenericArrayEnumerator<T>.Empty :
+            GetEnumerator();
+
+        IEnumerator IEnumerable.GetEnumerator() => ((IEnumerable<T>)this).GetEnumerator();
+
+        // Removes the object at the head of the queue and returns it. If the queue
+        // is empty, this method throws an
+        // InvalidOperationException.
+        public T Dequeue()
+        {
+            int head = _head;
+            T[] array = _array;
+
+            if (_size == 0)
+            {
+                ThrowForEmptyQueue();
+            }
+
+            T removed = array[head];
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                array[head] = default!;
+            }
+            MoveNext(ref _head);
+            _size--;
+            _version++;
+            return removed;
+        }
+
+        public bool TryDequeue([MaybeNullWhen(false)] out T result)
+        {
+            int head = _head;
+            T[] array = _array;
+
+            if (_size == 0)
+            {
+                result = default;
+                return false;
+            }
+
+            result = array[head];
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                array[head] = default!;
+            }
+            MoveNext(ref _head);
+            _size--;
+            _version++;
+            return true;
+        }
+
+        // Returns the object at the head of the queue. The object remains in the
+        // queue. If the queue is empty, this method throws an
+        // InvalidOperationException.
+        public T Peek()
+        {
+            if (_size == 0)
+            {
+                ThrowForEmptyQueue();
+            }
+
+            return _array[_head];
+        }
+
+        public bool TryPeek([MaybeNullWhen(false)] out T result)
+        {
+            if (_size == 0)
+            {
+                result = default;
+                return false;
+            }
+
+            result = _array[_head];
+            return true;
+        }
+
+        // Returns true if the queue contains at least one object equal to item.
+        // Equality is determined using EqualityComparer<T>.Default.Equals().
+        public bool Contains(T item)
+        {
+            if (_size == 0)
+            {
+                return false;
+            }
+
+            if (_head < _tail)
+            {
+                return Array.IndexOf(_array, item, _head, _size) >= 0;
+            }
+
+            // We've wrapped around. Check both partitions, the least recently enqueued first.
+            return
+                Array.IndexOf(_array, item, _head, _array.Length - _head) >= 0 ||
+                Array.IndexOf(_array, item, 0, _tail) >= 0;
+        }
+
+        // Iterates over the objects in the queue, returning an array of the
+        // objects in the Queue, or an empty array if the queue is empty.
+        // The order of elements in the array is first in to last in, the same
+        // order produced by successive calls to Dequeue.
+        public T[] ToArray()
+        {
+            if (_size == 0)
+            {
+                return [];
+            }
+
+            T[] arr = new T[_size];
+
+            if (_head < _tail)
+            {
+                Array.Copy(_array, _head, arr, 0, _size);
+            }
+            else
+            {
+                Array.Copy(_array, _head, arr, 0, _array.Length - _head);
+                Array.Copy(_array, 0, arr, _array.Length - _head, _tail);
+            }
+
+            return arr;
+        }
+
+        // PRIVATE Grows or shrinks the buffer to hold capacity objects. Capacity
+        // must be >= _size.
+        private void SetCapacity(int capacity)
+        {
+            T[] newarray = new T[capacity];
+            if (_size > 0)
+            {
+                if (_head < _tail)
+                {
+                    Array.Copy(_array, _head, newarray, 0, _size);
+                }
+                else
+                {
+                    Array.Copy(_array, _head, newarray, 0, _array.Length - _head);
+                    Array.Copy(_array, 0, newarray, _array.Length - _head, _tail);
+                }
+            }
+
+            _array = newarray;
+            _head = 0;
+            _tail = (_size == capacity) ? 0 : _size;
+            _version++;
+        }
+
+        // Increments the index wrapping it if necessary.
+        private void MoveNext(ref int index)
+        {
+            // It is tempting to use the remainder operator here but it is actually much slower
+            // than a simple comparison and a rarely taken branch.
+            // JIT produces better code than with ternary operator ?:
+            int tmp = index + 1;
+            if (tmp == _array.Length)
+            {
+                tmp = 0;
+            }
+            index = tmp;
+        }
+
+        private void ThrowForEmptyQueue()
+        {
+            throw new InvalidOperationException(SR.InvalidOperation_EmptyQueue);
+        }
+
+        public void TrimExcess()
+        {
+            int threshold = (int)(_array.Length * 0.9);
+            if (_size < threshold)
+            {
+                SetCapacity(_size);
+            }
+        }
+
+        /// <summary>
+        /// Sets the capacity of a <see cref="Queue{T}"/> object to the specified number of entries.
+        /// </summary>
+        /// <param name="capacity">The new capacity.</param>
+        /// <exception cref="ArgumentOutOfRangeException">Passed capacity is lower than entries count.</exception>
+        public void TrimExcess(int capacity)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(capacity);
+            ArgumentOutOfRangeException.ThrowIfLessThan(capacity, _size);
+
+            if (capacity == _array.Length)
+                return;
+
+            SetCapacity(capacity);
+        }
+
+        /// <summary>
+        /// Ensures that the capacity of this Queue is at least the specified <paramref name="capacity"/>.
+        /// </summary>
+        /// <param name="capacity">The minimum capacity to ensure.</param>
+        /// <returns>The new capacity of this queue.</returns>
+        public int EnsureCapacity(int capacity)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(capacity);
+
+            if (_array.Length < capacity)
+            {
+                Grow(capacity);
+            }
+
+            return _array.Length;
+        }
+
+        private void Grow(int capacity)
+        {
+            const int GrowFactor = 2;
+            const int MinimumGrow = 4;
+
+            int newcapacity = GrowFactor * _array.Length;
+
+            // Allow the list to grow to maximum possible capacity (~2G elements) before encountering overflow.
+            // Note that this check works even when _items.Length overflowed thanks to the (uint) cast
+            if ((uint)newcapacity > Array.MaxLength) newcapacity = Array.MaxLength;
+
+            // Ensure minimum growth is respected.
+            newcapacity = Math.Max(newcapacity, _array.Length + MinimumGrow);
+
+            // If the computed capacity is still less than specified, set to the original argument.
+            // Capacities exceeding Array.MaxLength will be surfaced as OutOfMemoryException by Array.Resize.
+            if (newcapacity < capacity) newcapacity = capacity;
+
+            SetCapacity(newcapacity);
+        }
+
+        // Implements an enumerator for a Queue.  The enumerator uses the
+        // internal version number of the list to ensure that no modifications are
+        // made to the list while an enumeration is in progress.
+        public struct Enumerator : IEnumerator<T>,
+            IEnumerator
+        {
+            private readonly Queue<T> _queue;
+            private readonly int _version;
+            private int _i;
+            private T? _currentElement;
+
+            internal Enumerator(Queue<T> queue)
+            {
+                _queue = queue;
+                _version = queue._version;
+                _i = -1;
+                _currentElement = default;
+            }
+
+            public void Dispose()
+            {
+                _i = -2;
+                _currentElement = default;
+            }
+
+            public bool MoveNext()
+            {
+                if (_version != _queue._version)
+                {
+                    ThrowHelper.ThrowInvalidOperationException_InvalidOperation_EnumFailedVersion();
+                }
+
+                Queue<T> q = _queue;
+                int size = q._size;
+
+                int offset = _i + 1;
+                if ((uint)offset < (uint)size)
+                {
+                    _i = offset;
+
+                    T[] array = q._array;
+                    int index = q._head + offset;
+                    if ((uint)index < (uint)array.Length)
+                    {
+                        _currentElement = array[index];
+                    }
+                    else
+                    {
+                        // The index has wrapped around the end of the array. Shift the index and then
+                        // get the current element. It is tempting to dedup this dereferencing with that
+                        // in the if block above, but the if block above avoids a bounds check for the
+                        // accesses that are in that portion, whereas these still incur it.
+                        index -= array.Length;
+                        _currentElement = array[index];
+                    }
+
+                    return true;
+                }
+
+                _i = -2;
+                _currentElement = default;
+                return false;
+            }
+
+            public T Current => _currentElement!;
+
+            object? IEnumerator.Current => Current;
+
+            void IEnumerator.Reset()
+            {
+                if (_version != _queue._version)
+                {
+                    ThrowHelper.ThrowInvalidOperationException_InvalidOperation_EnumFailedVersion();
+                }
+
+                _i = -1;
+                _currentElement = default;
+            }
+        }
+    }
+
+    // A simple stack of objects.  Internally it is implemented as an array,
+    // so Push can be O(n).  Pop is O(1).
+    /// <summary>
+    /// Represents a last-in, first-out collection of objects.
+    /// </summary>
+    [DebuggerDisplay("Count = {Count}")]
+    [Serializable]
+    public class Stack<T> : IEnumerable<T>,
+        System.Collections.ICollection,
+        IReadOnlyCollection<T>
+    {
+        private T[] _array; // Storage for stack elements. Do not rename (binary serialization)
+        private int _size; // Number of items in the stack. Do not rename (binary serialization)
+        private int _version; // Used to keep enumerator in sync w/ collection. Do not rename (binary serialization)
+
+        private const int DefaultCapacity = 4;
+
+        public Stack()
+        {
+            _array = Array.Empty<T>();
+        }
+
+        // Create a stack with a specific initial capacity.  The initial capacity
+        // must be a non-negative number.
+        public Stack(int capacity)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(capacity);
+            _array = new T[capacity];
+        }
+
+        // Fills a Stack with the contents of a particular collection.  The items are
+        // pushed onto the stack in the same order they are read by the enumerator.
+        public Stack(IEnumerable<T> collection)
+        {
+            ArgumentNullException.ThrowIfNull(collection);
+
+            _array = EnumerableHelpers.ToArray(collection, out _size);
+        }
+
+        public int Count => _size;
+
+
+        /// <summary>
+        /// Gets the total numbers of elements the internal data structure can hold without resizing.
+        /// </summary>
+        public int Capacity => _array.Length;
+
+        /// <inheritdoc cref="ICollection.IsSynchronized" />
+        bool ICollection.IsSynchronized => false;
+
+        object ICollection.SyncRoot => this;
+
+        // Removes all Objects from the Stack.
+        public void Clear()
+        {
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                Array.Clear(_array, 0, _size); // Don't need to doc this but we clear the elements so that the gc can reclaim the references.
+            }
+            _size = 0;
+            _version++;
+        }
+
+        public bool Contains(T item)
+        {
+            // Compare items using the default equality comparer
+
+            // PERF: Internally Array.LastIndexOf calls
+            // EqualityComparer<T>.Default.LastIndexOf, which
+            // is specialized for different types. This
+            // boosts performance since instead of making a
+            // virtual method call each iteration of the loop,
+            // via EqualityComparer<T>.Default.Equals, we
+            // only make one virtual call to EqualityComparer.LastIndexOf.
+
+            return _size != 0 && Array.LastIndexOf(_array, item, _size - 1) >= 0;
+        }
+
+        // Copies the stack into an array.
+        public void CopyTo(T[] array, int arrayIndex)
+        {
+            ArgumentNullException.ThrowIfNull(array);
+
+            if (arrayIndex < 0 || arrayIndex > array.Length)
+            {
+                throw new ArgumentOutOfRangeException(nameof(arrayIndex), arrayIndex, SR.ArgumentOutOfRange_IndexMustBeLessOrEqual);
+            }
+
+            if (array.Length - arrayIndex < _size)
+            {
+                throw new ArgumentException(SR.Argument_InvalidOffLen);
+            }
+
+            int srcIndex = 0;
+            int dstIndex = arrayIndex + _size;
+            while (srcIndex < _size)
+            {
+                array[--dstIndex] = _array[srcIndex++];
+            }
+        }
+
+        void ICollection.CopyTo(Array array, int arrayIndex)
+        {
+            ArgumentNullException.ThrowIfNull(array);
+
+            if (array.Rank != 1)
+            {
+                throw new ArgumentException(SR.Arg_RankMultiDimNotSupported, nameof(array));
+            }
+
+            if (array.GetLowerBound(0) != 0)
+            {
+                throw new ArgumentException(SR.Arg_NonZeroLowerBound, nameof(array));
+            }
+
+            if (arrayIndex < 0 || arrayIndex > array.Length)
+            {
+                throw new ArgumentOutOfRangeException(nameof(arrayIndex), arrayIndex, SR.ArgumentOutOfRange_IndexMustBeLessOrEqual);
+            }
+
+            if (array.Length - arrayIndex < _size)
+            {
+                throw new ArgumentException(SR.Argument_InvalidOffLen);
+            }
+
+            try
+            {
+                Array.Copy(_array, 0, array, arrayIndex, _size);
+                Array.Reverse(array, arrayIndex, _size);
+            }
+            catch (ArrayTypeMismatchException)
+            {
+                throw new ArgumentException(SR.Argument_IncompatibleArrayType, nameof(array));
+            }
+        }
+
+        // Returns an IEnumerator for this Stack.
+        public Enumerator GetEnumerator() => new Enumerator(this);
+
+        /// <internalonly/>
+        IEnumerator<T> IEnumerable<T>.GetEnumerator() =>
+            Count == 0 ? EnumerableHelpers.GetEmptyEnumerator<T>() :
+            GetEnumerator();
+
+        IEnumerator IEnumerable.GetEnumerator() => ((IEnumerable<T>)this).GetEnumerator();
+
+        public void TrimExcess()
+        {
+            int threshold = (int)(_array.Length * 0.9);
+            if (_size < threshold)
+            {
+                Array.Resize(ref _array, _size);
+            }
+        }
+
+        /// <summary>
+        /// Sets the capacity of a <see cref="Stack{T}"/> object to a specified number of entries.
+        /// </summary>
+        /// <param name="capacity">The new capacity.</param>
+        /// <exception cref="ArgumentOutOfRangeException">Passed capacity is lower than 0 or entries count.</exception>
+        public void TrimExcess(int capacity)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(capacity);
+            ArgumentOutOfRangeException.ThrowIfLessThan(capacity, _size);
+
+            if (capacity == _array.Length)
+                return;
+
+            Array.Resize(ref _array, capacity);
+        }
+
+        // Returns the top object on the stack without removing it.  If the stack
+        // is empty, Peek throws an InvalidOperationException.
+        public T Peek()
+        {
+            int size = _size - 1;
+            T[] array = _array;
+
+            if ((uint)size >= (uint)array.Length)
+            {
+                ThrowForEmptyStack();
+            }
+
+            return array[size];
+        }
+
+        public bool TryPeek([MaybeNullWhen(false)] out T result)
+        {
+            int size = _size - 1;
+            T[] array = _array;
+
+            if ((uint)size >= (uint)array.Length)
+            {
+                result = default!;
+                return false;
+            }
+            result = array[size];
+            return true;
+        }
+
+        // Pops an item from the top of the stack.  If the stack is empty, Pop
+        // throws an InvalidOperationException.
+        public T Pop()
+        {
+            int size = _size - 1;
+            T[] array = _array;
+
+            // if (_size == 0) is equivalent to if (size == -1), and this case
+            // is covered with (uint)size, thus allowing bounds check elimination
+            // https://github.com/dotnet/coreclr/pull/9773
+            if ((uint)size >= (uint)array.Length)
+            {
+                ThrowForEmptyStack();
+            }
+
+            _version++;
+            _size = size;
+            T item = array[size];
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                array[size] = default!;     // Free memory quicker.
+            }
+            return item;
+        }
+
+        public bool TryPop([MaybeNullWhen(false)] out T result)
+        {
+            int size = _size - 1;
+            T[] array = _array;
+
+            if ((uint)size >= (uint)array.Length)
+            {
+                result = default!;
+                return false;
+            }
+
+            _version++;
+            _size = size;
+            result = array[size];
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                array[size] = default!;
+            }
+            return true;
+        }
+
+        // Pushes an item to the top of the stack.
+        public void Push(T item)
+        {
+            int size = _size;
+            T[] array = _array;
+
+            if ((uint)size < (uint)array.Length)
+            {
+                array[size] = item;
+                _version++;
+                _size = size + 1;
+            }
+            else
+            {
+                PushWithResize(item);
+            }
+        }
+
+        // Non-inline from Stack.Push to improve its code quality as uncommon path
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void PushWithResize(T item)
+        {
+            Grow(_size + 1);
+            _array[_size] = item;
+            _version++;
+            _size++;
+        }
+
+        /// <summary>
+        /// Ensures that the capacity of this Stack is at least the specified <paramref name="capacity"/>.
+        /// If the current capacity of the Stack is less than specified <paramref name="capacity"/>,
+        /// the capacity is increased by continuously twice current capacity until it is at least the specified <paramref name="capacity"/>.
+        /// </summary>
+        /// <param name="capacity">The minimum capacity to ensure.</param>
+        /// <returns>The new capacity of this stack.</returns>
+        public int EnsureCapacity(int capacity)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(capacity);
+
+            if (_array.Length < capacity)
+            {
+                Grow(capacity);
+            }
+
+            return _array.Length;
+        }
+
+        private void Grow(int capacity)
+        {
+            int newcapacity = _array.Length == 0 ? DefaultCapacity : 2 * _array.Length;
+
+            // Allow the list to grow to maximum possible capacity (~2G elements) before encountering overflow.
+            // Note that this check works even when _items.Length overflowed thanks to the (uint) cast.
+            if ((uint)newcapacity > Array.MaxLength) newcapacity = Array.MaxLength;
+
+            // If computed capacity is still less than specified, set to the original argument.
+            // Capacities exceeding Array.MaxLength will be surfaced as OutOfMemoryException by Array.Resize.
+            if (newcapacity < capacity) newcapacity = capacity;
+
+            Array.Resize(ref _array, newcapacity);
+        }
+
+        // Copies the Stack to an array, in the same order Pop would return the items.
+        public T[] ToArray()
+        {
+            if (_size == 0)
+                return Array.Empty<T>();
+
+            T[] objArray = new T[_size];
+            int i = 0;
+            while (i < _size)
+            {
+                objArray[i] = _array[_size - i - 1];
+                i++;
+            }
+            return objArray;
+        }
+
+        private void ThrowForEmptyStack()
+        {
+            throw new InvalidOperationException(SR.InvalidOperation_EmptyStack);
+        }
+
+        public struct Enumerator : IEnumerator<T>, System.Collections.IEnumerator
+        {
+            private readonly Stack<T> _stack;
+            private readonly int _version;
+            private int _index;
+            private T? _currentElement;
+
+            internal Enumerator(Stack<T> stack)
+            {
+                _stack = stack;
+                _version = stack._version;
+                _index = stack.Count;
+                _currentElement = default;
+            }
+
+            public void Dispose() => _index = -1;
+
+            public bool MoveNext()
+            {
+                if (_version != _stack._version)
+                {
+                    ThrowInvalidVersion();
+                }
+
+                T[] array = _stack._array;
+                int index = _index - 1;
+                if ((uint)index < (uint)array.Length)
+                {
+                    _currentElement = array[index];
+                    _index = index;
+                    return true;
+                }
+
+                _currentElement = default;
+                _index = -1;
+                return false;
+            }
+
+            public T Current => _currentElement!;
+
+            object? System.Collections.IEnumerator.Current => Current;
+
+            void IEnumerator.Reset()
+            {
+                if (_version != _stack._version)
+                {
+                    ThrowInvalidVersion();
+                }
+
+                _index = _stack.Count;
+                _currentElement = default;
+            }
+
+            private static void ThrowInvalidVersion() => throw new InvalidOperationException(SR.InvalidOperation_EnumFailedVersion);
+        }
+    }
+
+    /// <summary>Internal helper functions for working with enumerables.</summary>
+    internal static class EnumerableHelpers
+    {
+        /// <summary>Gets an enumerator singleton for an empty collection.</summary>
+        internal static IEnumerator<T> GetEmptyEnumerator<T>() => ((IEnumerable<T>)Array.Empty<T>()).GetEnumerator();
+
+        /// <summary>Converts an enumerable to an array using the same logic as List{T}.</summary>
+        /// <param name="source">The enumerable to convert.</param>
+        /// <param name="length">The number of items stored in the resulting array, 0-indexed.</param>
+        /// <returns>
+        /// The resulting array.  The length of the array may be greater than <paramref name="length"/>,
+        /// which is the actual number of elements in the array.
+        /// </returns>
+        internal static T[] ToArray<T>(IEnumerable<T> source, out int length)
+        {
+            if (source is ICollection<T> ic)
+            {
+                int count = ic.Count;
+                if (count != 0)
+                {
+                    // Allocate an array of the desired size, then copy the elements into it. Note that this has the same
+                    // issue regarding concurrency as other existing collections like List<T>. If the collection size
+                    // concurrently changes between the array allocation and the CopyTo, we could end up either getting an
+                    // exception from overrunning the array (if the size went up) or we could end up not filling as many
+                    // items as 'count' suggests (if the size went down).  This is only an issue for concurrent collections
+                    // that implement ICollection<T>, which as of .NET 4.6 is just ConcurrentDictionary<TKey, TValue>.
+                    T[] arr = new T[count];
+                    ic.CopyTo(arr, 0);
+                    length = count;
+                    return arr;
+                }
+            }
+            else
+            {
+                using (IEnumerator<T> en = source.GetEnumerator())
+                {
+                    if (en.MoveNext())
+                    {
+                        const int DefaultCapacity = 4;
+                        T[] arr = new T[DefaultCapacity];
+                        arr[0] = en.Current;
+                        int count = 1;
+
+                        while (en.MoveNext())
+                        {
+                            if (count == arr.Length)
+                            {
+                                // MaxLength = 2147483591, the largest array the runtime allows
+                                const int MaxLength = 0x7FFFFFC7;
+
+                                // This is the same growth logic as in List<T>:
+                                // If the array is currently empty, we make it a default size.  Otherwise, we attempt to
+                                // double the size of the array.  Doubling will overflow once the size of the array reaches
+                                // 2^30, since doubling to 2^31 is 1 larger than Int32.MaxValue.  In that case, we instead
+                                // constrain the length to be Array.MaxLength (this overflow check works because of the
+                                // cast to uint).
+                                int newLength = count << 1;
+                                if ((uint)newLength > MaxLength)
+                                {
+                                    newLength = MaxLength <= count ? count + 1 : MaxLength;
+                                }
+
+                                Array.Resize(ref arr, newLength);
+                            }
+
+                            arr[count++] = en.Current;
+                        }
+
+                        length = count;
+                        return arr;
+                    }
+                }
+            }
+
+            length = 0;
+            return Array.Empty<T>();
+        }
+    }
+
+    internal sealed class ArraySortHelper<T>
+    {
+        private static readonly ArraySortHelper<T> s_defaultArraySortHelper = new ArraySortHelper<T>();
+
+        public static ArraySortHelper<T> Default
+        {
+            get
+            {
+                return s_defaultArraySortHelper;
+            }
+        }
+
+        public void Sort(Span<T> keys, IComparer<T>? comparer)
+        {
+            // Add a try block here to detect IComparers (or their
+            // underlying IComparables, etc) that are bogus.
+            try
+            {
+                comparer ??= Comparer<T>.Default;
+                IntrospectiveSort(keys, comparer.Compare);
+            }
+            catch (IndexOutOfRangeException)
+            {
+                ThrowHelper.ThrowArgumentException_BadComparer(comparer);
+            }
+            catch (Exception e)
+            {
+                ThrowHelper.ThrowInvalidOperationException(ExceptionResource.InvalidOperation_IComparerFailed, e);
+            }
+        }
+
+        public int BinarySearch(T[] array, int index, int length, T value, IComparer<T>? comparer)
+        {
+            try
+            {
+                comparer ??= Comparer<T>.Default;
+                return InternalBinarySearch(array, index, length, value, comparer);
+            }
+            catch (Exception e)
+            {
+                ThrowHelper.ThrowInvalidOperationException(ExceptionResource.InvalidOperation_IComparerFailed, e);
+                return 0;
+            }
+        }
+
+        internal static void Sort(Span<T> keys, Comparison<T> comparer)
+        {
+            // Add a try block here to detect bogus comparisons
+            try
+            {
+                IntrospectiveSort(keys, comparer);
+            }
+            catch (IndexOutOfRangeException)
+            {
+                ThrowHelper.ThrowArgumentException_BadComparer(comparer);
+            }
+            catch (Exception e)
+            {
+                ThrowHelper.ThrowInvalidOperationException(ExceptionResource.InvalidOperation_IComparerFailed, e);
+            }
+        }
+
+        internal static int InternalBinarySearch(T[] array, int index, int length, T value, IComparer<T> comparer)
+        {
+            int lo = index;
+            int hi = index + length - 1;
+            while (lo <= hi)
+            {
+                int i = lo + ((hi - lo) >> 1);
+                int order = comparer.Compare(array[i], value);
+
+                if (order == 0) return i;
+                if (order < 0)
+                {
+                    lo = i + 1;
+                }
+                else
+                {
+                    hi = i - 1;
+                }
+            }
+
+            return ~lo;
+        }
+
+        private static void SwapIfGreater(Span<T> keys, Comparison<T> comparer, int i, int j)
+        {
+            if (comparer(keys[i], keys[j]) > 0)
+            {
+                T key = keys[i];
+                keys[i] = keys[j];
+                keys[j] = key;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void Swap(Span<T> a, int i, int j)
+        {
+            T t = a[i];
+            a[i] = a[j];
+            a[j] = t;
+        }
+
+        internal static void IntrospectiveSort(Span<T> keys, Comparison<T> comparer)
+        {
+            if (keys.Length > 1)
+            {
+                IntroSort(keys, 2 * (BitOperations.Log2((uint)keys.Length) + 1), comparer);
+            }
+        }
+
+        // IntroSort is recursive; block it from being inlined into itself as
+        // this is currenly not profitable.
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void IntroSort(Span<T> keys, int depthLimit, Comparison<T> comparer)
+        {
+            int partitionSize = keys.Length;
+            while (partitionSize > 1)
+            {
+                if (partitionSize <= Array.IntrosortSizeThreshold)
+                {
+
+                    if (partitionSize == 2)
+                    {
+                        SwapIfGreater(keys, comparer, 0, 1);
+                        return;
+                    }
+
+                    if (partitionSize == 3)
+                    {
+                        SwapIfGreater(keys, comparer, 0, 1);
+                        SwapIfGreater(keys, comparer, 0, 2);
+                        SwapIfGreater(keys, comparer, 1, 2);
+                        return;
+                    }
+
+                    InsertionSort(keys.Slice(0, partitionSize), comparer);
+                    return;
+                }
+
+                if (depthLimit == 0)
+                {
+                    HeapSort(keys.Slice(0, partitionSize), comparer);
+                    return;
+                }
+                depthLimit--;
+
+                int p = PickPivotAndPartition(keys.Slice(0, partitionSize), comparer);
+
+                // Note we've already partitioned around the pivot and do not have to move the pivot again.
+                IntroSort(keys[(p + 1)..partitionSize], depthLimit, comparer);
+                partitionSize = p;
+            }
+        }
+
+        private static int PickPivotAndPartition(Span<T> keys, Comparison<T> comparer)
+        {
+            int hi = keys.Length - 1;
+
+            // Compute median-of-three.  But also partition them, since we've done the comparison.
+            int middle = hi >> 1;
+
+            // Sort lo, mid and hi appropriately, then pick mid as the pivot.
+            SwapIfGreater(keys, comparer, 0, middle);  // swap the low with the mid point
+            SwapIfGreater(keys, comparer, 0, hi);   // swap the low with the high
+            SwapIfGreater(keys, comparer, middle, hi); // swap the middle with the high
+
+            T pivot = keys[middle];
+            Swap(keys, middle, hi - 1);
+            int left = 0, right = hi - 1;  // We already partitioned lo and hi and put the pivot in hi - 1.  And we pre-increment & decrement below.
+
+            while (left < right)
+            {
+                while (comparer(keys[++left], pivot) < 0) ;
+                while (comparer(pivot, keys[--right]) < 0) ;
+
+                if (left >= right)
+                    break;
+
+                Swap(keys, left, right);
+            }
+
+            // Put pivot in the right location.
+            if (left != hi - 1)
+            {
+                Swap(keys, left, hi - 1);
+            }
+            return left;
+        }
+
+        private static void HeapSort(Span<T> keys, Comparison<T> comparer)
+        {
+            int n = keys.Length;
+            for (int i = n >> 1; i >= 1; i--)
+            {
+                DownHeap(keys, i, n, comparer);
+            }
+
+            for (int i = n; i > 1; i--)
+            {
+                Swap(keys, 0, i - 1);
+                DownHeap(keys, 1, i - 1, comparer);
+            }
+        }
+
+        private static void DownHeap(Span<T> keys, int i, int n, Comparison<T> comparer)
+        {
+            T d = keys[i - 1];
+            while (i <= n >> 1)
+            {
+                int child = 2 * i;
+                if (child < n && comparer(keys[child - 1], keys[child]) < 0)
+                {
+                    child++;
+                }
+
+                if (!(comparer(d, keys[child - 1]) < 0))
+                    break;
+
+                keys[i - 1] = keys[child - 1];
+                i = child;
+            }
+
+            keys[i - 1] = d;
+        }
+
+        private static void InsertionSort(Span<T> keys, Comparison<T> comparer)
+        {
+            for (int i = 0; i < keys.Length - 1; i++)
+            {
+                T t = keys[i + 1];
+
+                int j = i;
+                while (j >= 0 && comparer(t, keys[j]) < 0)
+                {
+                    keys[j + 1] = keys[j];
+                    j--;
+                }
+
+                keys[j + 1] = t;
+            }
+        }
+    }
+
+    internal static class ArraySortHelper<TKey, TValue>
+    {
+        private static readonly ArraySortHelper<TKey, TValue> s_defaultArraySortHelper = new ArraySortHelper<TKey, TValue>();
+
+        public static ArraySortHelper<TKey, TValue> Default
+        {
+            get
+            {
+                return s_defaultArraySortHelper;
+            }
+        }
+    }
+
+    /// <summary>Helper methods for use in array/span sorting routines.</summary>
+    internal static class SortUtils
+    {
+        public static int MoveNansToFront<TKey, TValue>(Span<TKey> keys, Span<TValue> values) where TKey : notnull
+        {
+            int left = 0;
+
+            for (int i = 0; i < keys.Length; i++)
+            {
+                if ((typeof(TKey) == typeof(double) && double.IsNaN((double)(object)keys[i])) ||
+                    (typeof(TKey) == typeof(float) && float.IsNaN((float)(object)keys[i])) ||
+                    (typeof(TKey) == typeof(Half) && Half.IsNaN((Half)(object)keys[i])))
+                {
+                    TKey temp = keys[left];
+                    keys[left] = keys[i];
+                    keys[i] = temp;
+
+                    if ((uint)i < (uint)values.Length) // check to see if we have values
+                    {
+                        TValue tempValue = values[left];
+                        values[left] = values[i];
+                        values[i] = tempValue;
+                    }
+
+                    left++;
+                }
+            }
+
+            return left;
+        }
+    }
+
+    internal sealed class ArraySortHelperForTComparer<T, TComparer>
+        where TComparer : IComparer<T>
+    {
+        internal static void Sort(Span<T> keys, TComparer comparer)
+        {
+            // Add a try block here to detect bogus comparisons
+            try
+            {
+                IntrospectiveSort(keys, comparer);
+            }
+            catch (IndexOutOfRangeException)
+            {
+                ThrowHelper.ThrowArgumentException_BadComparer(comparer);
+            }
+            catch (Exception e)
+            {
+                ThrowHelper.ThrowInvalidOperationException(ExceptionResource.InvalidOperation_IComparerFailed, e);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void Swap(Span<T> a, int i, int j)
+        {
+            T t = a[i];
+            a[i] = a[j];
+            a[j] = t;
+        }
+
+        private static void SwapIfGreater(Span<T> keys, TComparer comparer, int i, int j)
+        {
+            if (comparer.Compare(keys[i], keys[j]) > 0)
+            {
+                T key = keys[i];
+                keys[i] = keys[j];
+                keys[j] = key;
+            }
+        }
+
+        internal static void IntrospectiveSort(Span<T> keys, TComparer comparer)
+        {
+            if (keys.Length > 1)
+            {
+                IntroSort(keys, 2 * (BitOperations.Log2((uint)keys.Length) + 1), comparer);
+            }
+        }
+
+        // IntroSort is recursive; block it from being inlined into itself as
+        // this is currenly not profitable.
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void IntroSort(Span<T> keys, int depthLimit, TComparer comparer)
+        {
+            int partitionSize = keys.Length;
+            while (partitionSize > 1)
+            {
+                if (partitionSize <= Array.IntrosortSizeThreshold)
+                {
+                    if (partitionSize == 2)
+                    {
+                        SwapIfGreater(keys, comparer, 0, 1);
+                        return;
+                    }
+
+                    if (partitionSize == 3)
+                    {
+                        SwapIfGreater(keys, comparer, 0, 1);
+                        SwapIfGreater(keys, comparer, 0, 2);
+                        SwapIfGreater(keys, comparer, 1, 2);
+                        return;
+                    }
+
+                    InsertionSort(keys.Slice(0, partitionSize), comparer);
+                    return;
+                }
+
+                if (depthLimit == 0)
+                {
+                    HeapSort(keys.Slice(0, partitionSize), comparer);
+                    return;
+                }
+                depthLimit--;
+
+                int p = PickPivotAndPartition(keys.Slice(0, partitionSize), comparer);
+
+                // Note we've already partitioned around the pivot and do not have to move the pivot again.
+                IntroSort(keys[(p + 1)..partitionSize], depthLimit, comparer);
+                partitionSize = p;
+            }
+        }
+
+        private static int PickPivotAndPartition(Span<T> keys, TComparer comparer)
+        {
+            int hi = keys.Length - 1;
+
+            // Compute median-of-three.  But also partition them, since we've done the comparison.
+            int middle = hi >> 1;
+
+            // Sort lo, mid and hi appropriately, then pick mid as the pivot.
+            SwapIfGreater(keys, comparer, 0, middle); // swap the low with the mid point
+            SwapIfGreater(keys, comparer, 0, hi); // swap the low with the high
+            SwapIfGreater(keys, comparer, middle, hi); // swap the middle with the high
+
+            T pivot = keys[middle];
+            Swap(keys, middle, hi - 1);
+            int left = 0, right = hi - 1; // We already partitioned lo and hi and put the pivot in hi - 1.  And we pre-increment & decrement below.
+
+            while (left < right)
+            {
+                while (comparer.Compare(keys[++left], pivot) < 0) ;
+                while (comparer.Compare(pivot, keys[--right]) < 0) ;
+
+                if (left >= right)
+                    break;
+
+                Swap(keys, left, right);
+            }
+
+            // Put pivot in the right location.
+            if (left != hi - 1)
+            {
+                Swap(keys, left, hi - 1);
+            }
+            return left;
+        }
+
+        private static void HeapSort(Span<T> keys, TComparer comparer)
+        {
+            int n = keys.Length;
+            for (int i = n >> 1; i >= 1; i--)
+            {
+                DownHeap(keys, i, n, comparer);
+            }
+
+            for (int i = n; i > 1; i--)
+            {
+                Swap(keys, 0, i - 1);
+                DownHeap(keys, 1, i - 1, comparer);
+            }
+        }
+
+        private static void DownHeap(Span<T> keys, int i, int n, TComparer comparer)
+        {
+            T d = keys[i - 1];
+            while (i <= n >> 1)
+            {
+                int child = 2 * i;
+                if (child < n && comparer.Compare(keys[child - 1], keys[child]) < 0)
+                {
+                    child++;
+                }
+
+                if (!(comparer.Compare(d, keys[child - 1]) < 0))
+                    break;
+
+                keys[i - 1] = keys[child - 1];
+                i = child;
+            }
+
+            keys[i - 1] = d;
+        }
+
+        private static void InsertionSort(Span<T> keys, TComparer comparer)
+        {
+            for (int i = 0; i < keys.Length - 1; i++)
+            {
+                T t = keys[i + 1];
+
+                int j = i;
+                while (j >= 0 && comparer.Compare(t, keys[j]) < 0)
+                {
+                    keys[j + 1] = keys[j];
+                    j--;
+                }
+
+                keys[j + 1] = t;
+            }
+        }
+    }
+
+
+    /// <summary>Provides a helper for efficiently building arrays and lists.</summary>
+    /// <remarks>This is implemented as an inline array of rented arrays.</remarks>
+    /// <typeparam name="T">Specifies the element type of the collection being built.</typeparam>
+    internal ref struct SegmentedArrayBuilder<T>
+    {
+        /// <summary>The size to use for the first segment that's stack allocated by the caller.</summary>
+        /// <remarks>
+        /// This value needs to be small enough that we don't need to be overly concerned about really large
+        /// value types. It's not unreasonable for a method to say it has 8 locals of a T, and that's effectively
+        /// what this is.
+        /// </remarks>
+        private const int ScratchBufferSize = 8;
+        /// <summary>Minimum size to request renting from the pool.</summary>
+        private const int MinimumRentSize = 16;
+
+        /// <summary>The array of segments.</summary>
+        /// <remarks><see cref="_segmentsCount"/> is how many of the segments are valid in <see cref="_segments"/>, not including <see cref="_firstSegment"/>.</remarks>
+        private Arrays _segments;
+        /// <summary>The scratch buffer provided by the caller.</summary>
+        /// <remarks>This is treated as the initial segment, before anything in <see cref="_segments"/>.</remarks>
+        private Span<T> _firstSegment;
+        /// <summary>The current span. This points either to <see cref="_firstSegment"/> or to <see cref="_segments"/>[<see cref="_segmentsCount"/> - 1].</summary>
+        private Span<T> _currentSegment;
+        /// <summary>The count of segments in <see cref="_segments"/> that are valid.</summary>
+        /// <remarks>All but the last are known to be fully populated.</remarks>
+        private int _segmentsCount;
+        /// <summary>The total number of elements in all but the current/last segment.</summary>
+        private int _countInFinishedSegments;
+        /// <summary>The number of elements in the current/last segment.</summary>
+        private int _countInCurrentSegment;
+
+        /// <summary>Initialize the builder.</summary>
+        /// <param name="scratchBuffer">A buffer that can be used as part of the builder.</param>
+        public SegmentedArrayBuilder(Span<T> scratchBuffer)
+        {
+            _currentSegment = _firstSegment = scratchBuffer;
+        }
+
+        /// <summary>Clean up the resources used by the builder.</summary>
+        public void Dispose()
+        {
+            int segmentsCount = _segmentsCount;
+            if (segmentsCount != 0)
+            {
+                ReturnArrays(segmentsCount);
+            }
+        }
+
+        private void ReturnArrays(int segmentsCount)
+        {
+            ReadOnlySpan<T[]> segments = _segments;
+
+            // We need to return all rented arrays to the pool, and if the arrays contain any references,
+            // we want to clear them first so that the pool doesn't artificially root contained objects.
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                // Return all but the last segment. All of these are full and need to be entirely cleared.
+                segmentsCount--;
+                foreach (T[] segment in segments.Slice(0, segmentsCount))
+                {
+                    Array.Clear(segment);
+                    ArrayPool<T>.Shared.Return(segment);
+                }
+
+                // For the last segment, we can clear only what we know was used.
+                T[] currentSegment = segments[segmentsCount];
+                Array.Clear(currentSegment, 0, _countInCurrentSegment);
+                ArrayPool<T>.Shared.Return(currentSegment);
+            }
+            else
+            {
+                // Return every rented array without clearing.
+                for (int i = 0; i < segments.Length; i++)
+                {
+                    T[] segment = segments[i];
+                    if (segment is null)
+                    {
+                        break;
+                    }
+
+                    ArrayPool<T>.Shared.Return(segment);
+                }
+            }
+        }
+
+        /// <summary>Gets the number of elements in the builder.</summary>
+        public readonly int Count => checked(_countInFinishedSegments + _countInCurrentSegment);
+
+        /// <summary>Adds an item into the builder.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Add(T item)
+        {
+            Span<T> currentSegment = _currentSegment;
+            int countInCurrentSegment = _countInCurrentSegment;
+            if ((uint)countInCurrentSegment < (uint)currentSegment.Length)
+            {
+                currentSegment[countInCurrentSegment] = item;
+                _countInCurrentSegment++;
+            }
+            else
+            {
+                AddSlow(item);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void AddSlow(T item)
+        {
+            Expand();
+            _currentSegment[0] = item;
+            _countInCurrentSegment = 1;
+        }
+
+        /// <summary>Adds a collection of items into the builder.</summary>
+        public void AddRange(IEnumerable<T> source)
+        {
+            if (source is ICollection<T> collection)
+            {
+                int collectionCount = collection.Count;
+
+                // If the source is empty, there's nothing to add.
+                if (collectionCount == 0)
+                {
+                    return;
+                }
+
+                // If the source is something from which we can get a span, e.g. a T[] or a List<T>,
+                // we can do one or two copies to handle copying everything, even if we need to split
+                // across segments.
+                if (Enumerable.TryGetSpan(source, out ReadOnlySpan<T> sourceSpan))
+                {
+                    int availableSpaceInCurrentSpan = _currentSegment.Length - _countInCurrentSegment;
+                    ReadOnlySpan<T> sourceSlice = sourceSpan.Slice(0, Math.Min(availableSpaceInCurrentSpan, sourceSpan.Length));
+                    sourceSlice.CopyTo(_currentSegment.Slice(_countInCurrentSegment));
+                    _countInCurrentSegment += sourceSlice.Length;
+                    sourceSlice = sourceSpan.Slice(sourceSlice.Length);
+
+                    if (!sourceSlice.IsEmpty)
+                    {
+                        Expand(sourceSlice.Length);
+                        sourceSlice.CopyTo(_currentSegment);
+                        _countInCurrentSegment = sourceSlice.Length;
+                    }
+
+                    return;
+                }
+
+                // Otherwise, since we have an ICollection, we'd like to use ICollection.CopyTo, but it
+                // requires targeting an array, so we can't use it if we're using a scratch buffer.
+                bool currentSegmentIsScratchBufferWithRemainingSpace = _segmentsCount == 0 && _countInCurrentSegment < _currentSegment.Length;
+                if (!currentSegmentIsScratchBufferWithRemainingSpace)
+                {
+                    // It also only works if we can copy the whole collection in one go, which
+                    // means we need enough space in the current segment to hold the whole collection
+                    // or we need to be at the end of the current segment so we can allocate a
+                    // new one without leaving any holes.
+                    int remainingSpaceInCurrentSegment = _currentSegment.Length - _countInCurrentSegment;
+
+                    // If there's no space remaining in the current segment, we can just expand
+                    // into a new segment that we ensure is large enough.
+                    if (remainingSpaceInCurrentSegment == 0)
+                    {
+                        Expand(collectionCount);
+                        collection.CopyTo(_segments[_segmentsCount - 1], 0);
+                        _countInCurrentSegment = collectionCount;
+                        return;
+                    }
+
+                    // If there's enough space remaining in the current segment, we can also just copy into it.
+                    if (collectionCount <= remainingSpaceInCurrentSegment)
+                    {
+                        collection.CopyTo(_segments[_segmentsCount - 1], _countInCurrentSegment);
+                        _countInCurrentSegment += collectionCount;
+                        return;
+                    }
+
+                    // Otherwise, we're forced to fall back to enumeration.
+                }
+            }
+
+            // Fall back to enumerating and adding each element individually.
+            AddNonICollectionRangeInlined(source);
+        }
+
+        /// <summary>Adds a collection of items into the builder.</summary>
+        /// <remarks>
+        /// The implementation assumes the caller has already ruled out the source being
+        /// and ICollection and thus doesn't bother checking to see if it is.
+        /// </remarks>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public void AddNonICollectionRange(IEnumerable<T> source) =>
+            AddNonICollectionRangeInlined(source);
+
+        /// <summary>Adds a collection of items into the builder.</summary>
+        /// <remarks>
+        /// The implementation assumes the caller has already ruled out the source being
+        /// and ICollection and thus doesn't bother checking to see if it is.
+        /// </remarks>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal void AddNonICollectionRangeInlined(IEnumerable<T> source)
+        {
+            Span<T> currentSegment = _currentSegment;
+            int countInCurrentSegment = _countInCurrentSegment;
+
+            foreach (T item in source)
+            {
+                if ((uint)countInCurrentSegment < (uint)currentSegment.Length)
+                {
+                    currentSegment[countInCurrentSegment] = item;
+                    countInCurrentSegment++;
+                }
+                else
+                {
+                    Expand();
+                    currentSegment = _currentSegment;
+                    currentSegment[0] = item;
+                    countInCurrentSegment = 1;
+                }
+            }
+
+            _countInCurrentSegment = countInCurrentSegment;
+        }
+
+        /// <summary>Creates an array containing all of the elements in the builder.</summary>
+        public readonly T[] ToArray()
+        {
+            T[] result;
+            int count = Count;
+
+            if (count != 0)
+            {
+                result = GC.AllocateUninitializedArray<T>(count);
+                ToSpanInlined(result);
+            }
+            else
+            {
+                result = [];
+            }
+
+            return result;
+        }
+
+        /// <summary>Creates a list containing all of the elements in the builder.</summary>
+        public readonly List<T> ToList()
+        {
+            List<T> result;
+            int count = Count;
+
+            if (count != 0)
+            {
+                result = new List<T>(count);
+
+                CollectionsMarshal.SetCount(result, count);
+                ToSpanInlined(CollectionsMarshal.AsSpan(result));
+            }
+            else
+            {
+                result = [];
+            }
+
+            return result;
+        }
+
+        /// <summary>Creates an array containing all of the elements in the builder.</summary>
+        /// <param name="additionalLength">The number of extra elements of room to allocate in the resulting array.</param>
+        public readonly T[] ToArray(int additionalLength)
+        {
+            T[] result;
+            int count = checked(Count + additionalLength);
+
+            if (count != 0)
+            {
+                result = GC.AllocateUninitializedArray<T>(count);
+                ToSpanInlined(result);
+            }
+            else
+            {
+                result = [];
+            }
+
+            return result;
+        }
+
+        /// <summary>Populates the destination span with all of the elements in the builder.</summary>
+        /// <param name="destination">The destination span.</param>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public readonly void ToSpan(Span<T> destination) => ToSpanInlined(destination);
+
+        /// <summary>Populates the destination span with all of the elements in the builder.</summary>
+        /// <param name="destination">The destination span.</param>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private readonly void ToSpanInlined(Span<T> destination)
+        {
+            int segmentsCount = _segmentsCount;
+            if (segmentsCount != 0)
+            {
+                // Copy the first segment
+                ReadOnlySpan<T> firstSegment = _firstSegment;
+                firstSegment.CopyTo(destination);
+                destination = destination.Slice(firstSegment.Length);
+
+                // Copy the 0..N-1 segments
+                segmentsCount--;
+                if (segmentsCount != 0)
+                {
+                    foreach (T[] arr in ((ReadOnlySpan<T[]>)_segments).Slice(0, segmentsCount))
+                    {
+                        ReadOnlySpan<T> segment = arr;
+                        segment.CopyTo(destination);
+                        destination = destination.Slice(segment.Length);
+                    }
+                }
+            }
+
+            // Copy the last segment
+            _currentSegment.Slice(0, _countInCurrentSegment).CopyTo(destination);
+        }
+
+        /// <summary>Appends a new segment onto the builder.</summary>
+        /// <param name="minimumRequired">The minimum amount of space to allocate in a new segment being appended.</param>
+        private void Expand(int minimumRequired = MinimumRentSize)
+        {
+            if (minimumRequired < MinimumRentSize)
+            {
+                minimumRequired = MinimumRentSize;
+            }
+
+            // Update our count of the number of elements in the arrays.
+            // If we know we're exceeding the maximum allowed array length, throw.
+            int currentSegmentLength = _currentSegment.Length;
+            checked { _countInFinishedSegments += currentSegmentLength; }
+            if (_countInFinishedSegments > Array.MaxLength)
+            {
+                throw new OutOfMemoryException();
+            }
+
+            // Use a typical doubling algorithm to decide the length of the next array
+            // and allocate it. We want to double the current array length, but if the
+            // minimum required is larger than that, use the minimum required. And if
+            // doubling would result in going above the max array length, only use the
+            // max array length, as List<T> does.
+            int newSegmentLength = (int)Math.Min(Math.Max(minimumRequired, currentSegmentLength * 2L), Array.MaxLength);
+            _currentSegment = _segments[_segmentsCount] = ArrayPool<T>.Shared.Rent(newSegmentLength);
+            _segmentsCount++;
+        }
+
+#pragma warning disable IDE0044 // Add readonly modifier
+#pragma warning disable IDE0051 // Remove unused private members
+        /// <summary>A struct to hold all of the T[]s that compose the full result set.</summary>
+        /// <remarks>
+        /// Starting at the minimum size of <see cref="MinimumRentSize"/>, and with a minimum of doubling
+        /// on every growth, this is large enough to hold the maximum number arrays that could result
+        /// until the total length has exceeded Array.MaxLength.
+        /// </remarks>
+        [InlineArray(27)]
+        private struct Arrays
+        {
+            private T[] _values;
+        }
+
+        /// <summary>Provides a stack-allocatable buffer for use as an argument to the builder.</summary>
+        [InlineArray(ScratchBufferSize)]
+        public struct ScratchBuffer
+        {
+            private T _item;
+        }
+#pragma warning restore IDE0051
+#pragma warning restore IDE0044
+    }
+
+    internal ref struct ValueListBuilder<T>
+    {
+        private Span<T> _span;
+        private T[]? _arrayFromPool;
+        private int _pos;
+
+        public ValueListBuilder(Span<T> scratchBuffer)
+        {
+            _span = scratchBuffer;
+        }
+
+        public ValueListBuilder(int capacity)
+        {
+            Grow(capacity);
+        }
+
+        public int Length
+        {
+            get => _pos;
+            set => _pos = value;
+        }
+
+        public ref T this[int index] => ref _span[index];
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Append(T item)
+        {
+            int pos = _pos;
+
+            Span<T> span = _span;
+            if ((uint)pos < (uint)span.Length)
+            {
+                span[pos] = item;
+                _pos = pos + 1;
+            }
+            else
+            {
+                AddWithResize(item);
+            }
+        }
+
+        // Hide uncommon path
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void AddWithResize(T item)
+        {
+            int pos = _pos;
+            Grow(1);
+            _span[pos] = item;
+            _pos = pos + 1;
+        }
+
+        public ReadOnlySpan<T> AsSpan() => _span.Slice(0, _pos);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Dispose()
+        {
+            T[]? toReturn = _arrayFromPool;
+            if (toReturn is not null)
+            {
+                _arrayFromPool = null;
+                ArrayPool<T>.Shared.Return(toReturn, RuntimeHelpers.IsReferenceOrContainsReferences<T>());
+            }
+        }
+
+        // Note that consuming implementations depend on the list only growing if it's absolutely
+        // required.  If the list is already large enough to hold the additional items be added,
+        // it must not grow. The list is used in a number of places where the reference is checked
+        // and it's expected to match the initial reference provided to the constructor if that
+        // span was sufficiently large.
+        private void Grow(int additionalCapacityRequired = 1)
+        {
+            const int ArrayMaxLength = 0x7FFFFFC7; // same as Array.MaxLength
+
+            // Double the size of the span.  If it's currently empty, default to size 4,
+            // although it'll be increased in Rent to the pool's minimum bucket size.
+            int nextCapacity = Math.Max(_span.Length != 0 ? _span.Length * 2 : 4, _span.Length + additionalCapacityRequired);
+
+            // If the computed doubled capacity exceeds the possible length of an array, then we
+            // want to downgrade to either the maximum array length if that's large enough to hold
+            // an additional item, or the current length + 1 if it's larger than the max length, in
+            // which case it'll result in an OOM when calling Rent below.  In the exceedingly rare
+            // case where _span.Length is already int.MaxValue (in which case it couldn't be a managed
+            // array), just use that same value again and let it OOM in Rent as well.
+            if ((uint)nextCapacity > ArrayMaxLength)
+            {
+                nextCapacity = Math.Max(Math.Max(_span.Length + 1, ArrayMaxLength), _span.Length);
+            }
+
+            T[] array = ArrayPool<T>.Shared.Rent(nextCapacity);
+            _span.CopyTo(array);
+
+            T[]? toReturn = _arrayFromPool;
+            _span = _arrayFromPool = array;
+            if (toReturn is not null)
+            {
+                ArrayPool<T>.Shared.Return(toReturn, RuntimeHelpers.IsReferenceOrContainsReferences<T>());
             }
         }
     }

@@ -25,11 +25,11 @@ namespace Cnidaria.Cs
             if (nt.TypeKind != TypeKind.Error)
                 return false;
 
-            return !string.Equals(nt.Name, "<unbound>", StringComparison.Ordinal);
+            return nt.Name != "<unbound>";
         }
 
         private static bool ShouldSuppressCascade(BoundExpression expr)
-            => expr.HasErrors || IsTrueErrorType(expr.Type);
+            => expr.HasErrors || (expr is not BoundUnboundCollectionExpression && IsTrueErrorType(expr.Type));
 
 
         private static BoundExpression CreateErrorConversion(ExpressionSyntax exprSyntax, BoundExpression expr, TypeSymbol targetType)
@@ -251,6 +251,10 @@ namespace Cnidaria.Cs
                 {
                     switch (members[m])
                     {
+                        case EventSymbol accessorOnlyEvent when accessorOnlyEvent.IsStatic:
+                            result = BindAccessorOnlyEvent(id, null, accessorOnlyEvent, valueKind, context, diagnostics);
+                            return true;
+
                         case FieldSymbol fs when fs.IsStatic:
                             if (field is not null || prop is not null)
                                 ambiguous = true;
@@ -308,6 +312,12 @@ namespace Cnidaria.Cs
             bool canWriteProperty =
                 prop.SetMethod is not null &&
                 AccessibilityHelper.IsAccessible(prop.SetMethod, context);
+
+            if (canReadProperty && prop.GetMethod is MethodSymbol refGetter && refGetter.ReturnType is ByRefTypeSymbol)
+            {
+                result = new BoundCallExpression(id, receiverOpt: null, refGetter, ImmutableArray<BoundExpression>.Empty);
+                return true;
+            }
 
             if (valueKind == BindValueKind.RValue && !canReadProperty)
             {
@@ -504,11 +514,11 @@ namespace Cnidaria.Cs
         private static bool CanLowerStackAllocToReadOnlySpanStaticData(BoundStackAllocArrayCreationExpression stackAlloc, NamedTypeSymbol spanLikeType)
         {
             var definition = spanLikeType.OriginalDefinition;
-            if (definition.Arity != 1 || !string.Equals(definition.Name, "ReadOnlySpan", StringComparison.Ordinal))
+            if (definition.Arity != 1 || definition.Name != "ReadOnlySpan")
                 return false;
 
             if (definition.ContainingSymbol is not NamespaceSymbol ns ||
-                !string.Equals(ns.Name, "System", StringComparison.Ordinal))
+                ns.Name != "System")
                 return false;
 
             var initializer = stackAlloc.InitializerOpt;
@@ -561,7 +571,7 @@ namespace Cnidaria.Cs
             var nss = compilation.GlobalNamespace.GetNamespaceMembers();
             for (int i = 0; i < nss.Length; i++)
             {
-                if (string.Equals(nss[i].Name, "System", StringComparison.Ordinal))
+                if (nss[i].Name == "System")
                 {
                     system = nss[i];
                     break;
@@ -587,11 +597,11 @@ namespace Cnidaria.Cs
             var def = nt.OriginalDefinition;
             if (def.Arity != 1) return false;
 
-            bool isSpan = string.Equals(def.Name, "Span", StringComparison.Ordinal);
-            bool isReadOnlySpan = string.Equals(def.Name, "ReadOnlySpan", StringComparison.Ordinal);
+            bool isSpan = def.Name == "Span";
+            bool isReadOnlySpan = def.Name == "ReadOnlySpan";
             if (!isSpan && !isReadOnlySpan) return false;
 
-            if (def.ContainingSymbol is not NamespaceSymbol ns || !string.Equals(ns.Name, "System", StringComparison.Ordinal))
+            if (def.ContainingSymbol is not NamespaceSymbol ns || ns.Name != "System")
                 return false;
 
             spanLikeType = nt;
@@ -650,7 +660,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < lf.Modifiers.Count; i++)
             {
                 var k = lf.Modifiers[i].Kind;
-                if (k != SyntaxKind.StaticKeyword && k != SyntaxKind.AsyncKeyword && k != SyntaxKind.UnsafeKeyword)
+                if (k != SyntaxKind.StaticKeyword && k != SyntaxKind.AsyncKeyword && k != SyntaxKind.UnsafeKeyword && lf.Modifiers[i].ContextualKind != SyntaxKind.AsyncKeyword)
                 {
                     diagnostics.Add(new Diagnostic("CN_LFUNC003", DiagnosticSeverity.Error,
                         $"Modifier '{lf.Modifiers[i].ValueText}' is not valid on a local function.",
@@ -659,9 +669,11 @@ namespace Cnidaria.Cs
             }
 
 
+            // 'this' is out of reach in a local function of a struct, so it needs no instance
             var isStatic =
                 HasModifier(lf.Modifiers, SyntaxKind.StaticKeyword) ||
-                (_containing is MethodSymbol containingMethod && containingMethod.IsStatic);
+                HasNoThis(_containing) ||
+                (GetEnclosingType(_containing, out _) is NamedTypeSymbol enclosingType && enclosingType.IsValueType);
             var isAsync = HasModifier(lf.Modifiers, SyntaxKind.AsyncKeyword);
             var isUnsafe = HasModifier(lf.Modifiers, SyntaxKind.UnsafeKeyword);
             var isExtern = HasModifier(lf.Modifiers, SyntaxKind.ExternKeyword);

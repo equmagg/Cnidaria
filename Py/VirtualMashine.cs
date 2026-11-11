@@ -3844,7 +3844,7 @@ namespace Cnidaria.Python
             for (var index = 0; index < localCount; index++)
             {
                 PollCancellation();
-                if (!string.Equals(GetLocalName(frame, index), "__class__", StringComparison.Ordinal))
+                if (GetLocalName(frame, index) != "__class__")
                     continue;
                 var kind = GetLocalKind(frame, index);
                 if ((kind & (LocalKind.Cell | LocalKind.Free)) == 0)
@@ -5401,7 +5401,7 @@ namespace Cnidaria.Python
                 RequireObjectType(keyword, VmObjectType.String);
                 var keywordText = GetString(keyword);
                 var value = GetTupleItem(arguments, positionalCount + index);
-                if (string.Equals(keywordText, "metaclass", StringComparison.Ordinal))
+                if (keywordText == "metaclass")
                 {
                     if (!IsObjectType(value, VmObjectType.Class))
                         Raise("TypeError", "metaclass must be a class in the safe VM");
@@ -5748,7 +5748,7 @@ namespace Cnidaria.Python
             {
                 var nameValue = GetTupleItem(keywordNames, index);
                 RequireObjectType(nameValue, VmObjectType.String);
-                if (string.Equals(GetString(nameValue), requestedName, StringComparison.Ordinal))
+                if (GetString(nameValue) == requestedName)
                 {
                     value = GetTupleItem(arguments, positionalCount + index);
                     return true;
@@ -5769,7 +5769,7 @@ namespace Cnidaria.Python
                 var allowed = false;
                 for (var allowedIndex = 0; allowedIndex < allowedNames.Length; allowedIndex++)
                 {
-                    if (string.Equals(name, allowedNames[allowedIndex], StringComparison.Ordinal))
+                    if (name == allowedNames[allowedIndex])
                     {
                         allowed = true;
                         break;
@@ -5896,7 +5896,7 @@ namespace Cnidaria.Python
                 if (positionalCount == 3)
                 {
                     var errors = GetStringArgument(GetTupleItem(arguments, 2), "bytes");
-                    if (!string.Equals(errors, "strict", StringComparison.Ordinal))
+                    if (errors != "strict")
                         Raise("LookupError", "only strict encoding errors are available in the safe VM");
                 }
                 var text = GetString(source);
@@ -6041,10 +6041,7 @@ namespace Cnidaria.Python
         {
             if (!IsObjectType(_raisedException, VmObjectType.Exception))
                 return false;
-            return string.Equals(
-                GetString(_memory.ReadValue(_memory.GetObjectPayloadAddress(_raisedException))),
-                typeName,
-                StringComparison.Ordinal);
+            return GetString(_memory.ReadValue(_memory.GetObjectPayloadAddress(_raisedException))) == typeName;
         }
 
         private bool HasAttributeValue(VmValue owner, VmValue nameValue)
@@ -10195,9 +10192,9 @@ namespace Cnidaria.Python
                         var hasClassAttribute = TryLookupClassAttribute(instanceClass, nameValue, out var classAttribute);
                         if (hasClassAttribute && IsObjectType(classAttribute, VmObjectType.Property))
                             return BindClassAttribute(classAttribute, owner, instanceClass);
-                        if (string.Equals(name, "__class__", StringComparison.Ordinal))
+                        if (name == "__class__")
                             return instanceClass;
-                        if (string.Equals(name, "__dict__", StringComparison.Ordinal))
+                        if (name == "__dict__")
                             return GetInstanceDictionary(owner);
                         if (DictionaryTryGet(GetInstanceDictionary(owner), nameValue, out var instanceAttribute))
                             return instanceAttribute;
@@ -10696,9 +10693,9 @@ namespace Cnidaria.Python
         {
             for (var current = actual; ; current = GetExceptionBaseName(current))
             {
-                if (StringComparer.Ordinal.Equals(current, expected))
+                if (current == expected)
                     return true;
-                if (StringComparer.Ordinal.Equals(current, "BaseException"))
+                if (current == "BaseException")
                     return false;
             }
         }

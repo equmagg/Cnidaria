@@ -991,7 +991,8 @@ public sealed class RiscVCodeGenerator
                 {
                     "*" => index == 0 || (value & (value - 1)) != 0 || value < 0,
                     "/" or "%" => false,
-                    "<<" or ">>" => index == 0,
+                    "<<" or ">>" or "rotr" => index == 0,
+                    "rotl" => true,
                     "-" => index == 0 || !FitsImmediate12(-value),
                     "+" or "&" or "|" or "^" or "==" or "!=" => !FitsImmediate12(value),
                     "<" or ">=" => !FitsImmediate12(index == 1 ? value : value + 1),
@@ -2083,9 +2084,9 @@ public sealed class RiscVCodeGenerator
             var result = new HashSet<MachineRegister>();
             foreach (var clobber in asmStatement.Clobbers)
             {
-                if (string.Equals(clobber, "memory", StringComparison.Ordinal) ||
-                    string.Equals(clobber, "cc", StringComparison.Ordinal) ||
-                    string.Equals(clobber, "redzone", StringComparison.Ordinal))
+                if (clobber == "memory" ||
+                    clobber == "cc" ||
+                    clobber == "redzone")
                 {
                     continue;
                 }
@@ -2698,7 +2699,7 @@ public sealed class RiscVCodeGenerator
 
             for (var i = 0; i < functionType.Parameters.Length; i++)
             {
-                if (string.Equals(functionType.Parameters[i].Name, name, StringComparison.Ordinal))
+                if (functionType.Parameters[i].Name == name)
                     return i;
             }
 
@@ -3643,6 +3644,12 @@ public sealed class RiscVCodeGenerator
                             : (wordOp ? RVInstrKind.Srliw : RVInstrKind.Srli);
                     EmitShiftImmediate(shiftOpcode, dst, LoadOperand(leftOperand, GpScratch1), shiftAmount);
                     return true;
+                case "rotr":
+                    // Only the rotated value decides the width, the count can be of any type
+                    var rotateWord = _owner._target.Is64Bit && SizeOf(leftOperand.Type) <= 4;
+                    EmitShiftImmediate(rotateWord ? RVInstrKind.Roriw : RVInstrKind.Rori, dst, LoadOperand(leftOperand, GpScratch1),
+                        GetShiftImmediate(rightOperand, rotateWord ? 32 : _owner._target.RegisterSize * 8));
+                    return true;
                 case "==":
                 case "!=":
                     if (!TryGetCanonicalImmediate12(rightOperand, out var equalityImmediate))
@@ -3842,6 +3849,12 @@ public sealed class RiscVCodeGenerator
                     Emit(RVInstruction.R(IsSignedIntegerType(instruction.Operands[0].Type)
                     ? (wordOp ? RVInstrKind.Sraw : RVInstrKind.Sra)
                     : (wordOp ? RVInstrKind.Srlw : RVInstrKind.Srl), ToRegister(dst), ToRegister(left), ToRegister(right))); return;
+                case "rotl":
+                case "rotr":
+                    var rotateWord = _owner._target.Is64Bit && SizeOf(instruction.Operands[0].Type) <= 4;
+                    Emit(RVInstruction.R(instruction.Operator == "rotl"
+                    ? (rotateWord ? RVInstrKind.Rolw : RVInstrKind.Rol)
+                    : (rotateWord ? RVInstrKind.Rorw : RVInstrKind.Ror), ToRegister(dst), ToRegister(left), ToRegister(right))); return;
                 case "==": EmitEquality(dst, left, right, equal: true); return;
                 case "!=": EmitEquality(dst, left, right, equal: false); return;
                 case "<": EmitLessThan(dst, left, right, signed); return;
@@ -4256,6 +4269,8 @@ public sealed class RiscVCodeGenerator
         {
             foreach (var preservation in preservations)
             {
+                if (!preservation.NeedsSave)
+                    continue;
                 if (preservation.UsesRegister)
                 {
                     MoveRegister(preservation.PreservationRegister, preservation.PhysicalRegister, VectorGroupOf(preservation.Register.Type));
@@ -4271,6 +4286,8 @@ public sealed class RiscVCodeGenerator
         {
             foreach (var preservation in preservations)
             {
+                if (!preservation.NeedsRestore)
+                    continue;
                 if (preservation.UsesRegister)
                 {
                     MoveRegister(preservation.PhysicalRegister, preservation.PreservationRegister, VectorGroupOf(preservation.Register.Type));
@@ -7869,6 +7886,9 @@ public sealed class RiscVCodeGenerator
                 case RVInstrKind.Sllw:
                 case RVInstrKind.Srlw:
                 case RVInstrKind.Sraw:
+                case RVInstrKind.Rolw:
+                case RVInstrKind.Rorw:
+                case RVInstrKind.Roriw:
                 case RVInstrKind.Mulw:
                 case RVInstrKind.Divw:
                 case RVInstrKind.Divuw:
@@ -8539,7 +8559,7 @@ public sealed class RiscVCodeGenerator
                 for (var i = 0; i < symbols.Count; i++)
                 {
                     var symbol = symbols[i];
-                    if (!string.Equals(symbol.SectionName, Name, StringComparison.Ordinal))
+                    if (symbol.SectionName != Name)
                         continue;
                     var start = RemapOffset(symbol.Offset);
                     var end = RemapOffset(checked(symbol.Offset + symbol.Size));

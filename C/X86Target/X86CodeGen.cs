@@ -66,19 +66,22 @@ public sealed class X86CodeGenerator
         if (_target.Architecture is not TargetArchitectureKind.I386 and not TargetArchitectureKind.X86_64)
             throw new NotSupportedException("x86 C backend requires X86 or X64 target.");
         _machineTarget = X86Target.FromTargetInfo(_target);
-        _allocationOptions = ReserveCodeGenScratchRegisters(_target, allocationOptions ?? LSRAOptions.ForTarget(_target));
         _options = options ?? X86CodeGeneratorOptions.Default;
+        _allocationOptions = ReserveCodeGenScratchRegisters(_target, allocationOptions ?? LSRAOptions.ForTarget(_target), keepFrameChain: _options.RecordUnwindInfo is not null);
         _scratchNeeds = new ScratchNeeds(_target, _options.IndirectExternalData);
     }
 
     // LSRA kills scratch registers where an instruction needs them; one per class stays out for spilled values
-    private static LSRAOptions ReserveCodeGenScratchRegisters(TargetInfo target, LSRAOptions options)
+    private static LSRAOptions ReserveCodeGenScratchRegisters(TargetInfo target, LSRAOptions options, bool keepFrameChain)
     {
         var spareGeneral = SpareGeneralRegister(target);
         var spareVector = SpareVectorRegister(target);
 
         // First-free allocation takes the earliest register, so the emitter's ones and xmm0/xmm1 go last
         var general = options.GeneralRegisters.Where(r => r != spareGeneral).ToList();
+        // The runtime's stack walk follows the frame pointers of managed frames through its own C frames
+        if (keepFrameChain)
+            general.Remove(TargetRegisterInfo.FrameBaseRegister(target));
         if (target.Architecture == TargetArchitectureKind.I386)
             general = general.OrderBy(r => ManagedGeneralRegisters(target).Contains(r)).ToList();
         var vector = options.VectorRegisters.Where(r => r != spareVector).ToList();
@@ -387,6 +390,8 @@ public sealed class X86CodeGenerator
                     return _is64Bit ? IntoRegister(left) | IntoRegister(right) : ScratchClass.General;
                 case "<<":
                 case ">>":
+                case "rotl":
+                case "rotr":
                     return IntoRegister(left);
                 case "==":
                 case "!=":
@@ -909,6 +914,8 @@ public sealed class X86CodeGenerator
             case X86InstrKind.Shl:
             case X86InstrKind.Shr:
             case X86InstrKind.Sar:
+            case X86InstrKind.Rol:
+            case X86InstrKind.Ror:
             case X86InstrKind.Imul:
             case X86InstrKind.Neg:
             case X86InstrKind.Not:
@@ -1595,9 +1602,7 @@ public sealed class X86CodeGenerator
             _blockLabels = blockLabels;
             _jumpOnlyBlocks = jumpOnlyBlocks;
             _epilogueLabel = owner.CreateLocalLabel(functionLabel + "_epilogue");
-            var savedRegisters = allocation.UsedPhysicalRegisters
-                .Where(r => TargetRegisterInfo.IsCalleeSaved(owner._target, r) && ToX86Register(r, owner._machineTarget) != X86Register.Rbp)
-                .Distinct()
+            var savedRegisters = allocation.Frame.SavedRegisterOffsets.Keys
                 .OrderBy(r => (int)r)
                 .ToList();
             _savedGeneralRegisters = savedRegisters
@@ -2265,9 +2270,9 @@ public sealed class X86CodeGenerator
             var result = new HashSet<X86Register>();
             foreach (var clobber in asmStatement.Clobbers)
             {
-                if (string.Equals(clobber, "memory", StringComparison.Ordinal) ||
-                    string.Equals(clobber, "cc", StringComparison.Ordinal) ||
-                    string.Equals(clobber, "redzone", StringComparison.Ordinal))
+                if (clobber == "memory" ||
+                    clobber == "cc" ||
+                    clobber == "redzone")
                 {
                     continue;
                 }
@@ -3016,7 +3021,7 @@ public sealed class X86CodeGenerator
             if (functionType is null)
                 return -1;
             for (var i = 0; i < functionType.Parameters.Length; i++)
-                if (string.Equals(functionType.Parameters[i].Name, name, StringComparison.Ordinal))
+                if (functionType.Parameters[i].Name == name)
                     return i;
             return -1;
         }
@@ -3973,6 +3978,12 @@ public sealed class X86CodeGenerator
                     return;
                 case ">>":
                     EmitShift(instruction, IsSignedIntegerType(left.Type) ? X86InstrKind.Sar : X86InstrKind.Shr);
+                    return;
+                case "rotl":
+                    EmitShift(instruction, X86InstrKind.Rol);
+                    return;
+                case "rotr":
+                    EmitShift(instruction, X86InstrKind.Ror);
                     return;
                 case "==":
                 case "!=":
@@ -5294,6 +5305,8 @@ public sealed class X86CodeGenerator
         {
             foreach (var preservation in preservations)
             {
+                if (!preservation.NeedsSave)
+                    continue;
                 var source = ToX86Register(preservation.PhysicalRegister, _owner._machineTarget);
                 var size = _wordSize;
                 if (preservation.UsesRegister)
@@ -5309,6 +5322,8 @@ public sealed class X86CodeGenerator
         {
             foreach (var preservation in preservations)
             {
+                if (!preservation.NeedsRestore)
+                    continue;
                 var destination = ToX86Register(preservation.PhysicalRegister, _owner._machineTarget);
                 var size = _wordSize;
                 if (preservation.UsesRegister)
@@ -6927,7 +6942,7 @@ public sealed class X86CodeGenerator
                 return false;
             if (RegisterSize(consumer.Operands[0].Type) != RegisterSize(type))
                 return false;
-            if (consumer.Operator is "/" or "%" or "<<" or ">>")
+            if (consumer.Operator is "/" or "%" or "<<" or ">>" or "rotl" or "rotr")
                 return false;
 
             var right = consumer.Operands[1];
@@ -7668,6 +7683,7 @@ public sealed class X86CodeGenerator
                 MachineRegister.X7 => X86Register.Rbx,
                 MachineRegister.X8 => X86Register.Rsi,
                 MachineRegister.X9 => X86Register.Rdi,
+                MachineRegister.X10 => X86Register.Rbp,
                 MachineRegister.X11 => X86Register.R12,
                 MachineRegister.X12 => X86Register.R13,
                 MachineRegister.X13 => X86Register.R14,
@@ -7688,6 +7704,7 @@ public sealed class X86CodeGenerator
             MachineRegister.X7 => X86Register.R10,
             MachineRegister.X8 => X86Register.R11,
             MachineRegister.X9 => X86Register.Rbx,
+            MachineRegister.X10 => X86Register.Rbp,
             MachineRegister.X11 => X86Register.R12,
             MachineRegister.X12 => X86Register.R13,
             MachineRegister.X13 => X86Register.R14,

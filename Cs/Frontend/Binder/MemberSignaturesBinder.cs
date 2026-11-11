@@ -46,6 +46,7 @@ namespace Cnidaria.Cs
         public static void BindAll(Compilation compilation, ImmutableArray<SyntaxTree> trees, DiagnosticBag diagnostics)
         {
             var pendingConstFields = new List<PendingConstField>();
+            var pendingEnums = new List<PendingEnumMembers>();
             var pendingOptionalParameters = new List<PendingOptionalParameter>();
             foreach (var tree in trees)
             {
@@ -159,6 +160,35 @@ namespace Cnidaria.Cs
                             var pt = BindParameterType(typeBinder, pars[i], ctx, diagnostics, out var isReadOnlyRef);
                             convMethod.Parameters[i].Type = pt;
                             convMethod.Parameters[i].IsReadOnlyRef = isReadOnlyRef;
+                        }
+                    }
+                    else if (kv.Value is SourceEventSymbol declaredEvent)
+                    {
+                        var ctx = new BindingContext(compilation, stubModel, declaredEvent, NullRecorder.Instance);
+                        TypeSyntax eventTypeSyntax = kv.Key is VariableDeclaratorSyntax && declaredEvent.PartialDefinition is EventFieldDeclarationSyntax partialDefinition
+                            ? partialDefinition.Declaration.Type
+                            : declaredEvent.DeclaredTypeSyntax;
+                        TypeSymbol eventType = (declaredEvent.IsUnsafe ? unsafeTypeBinder : safeTypeBinder).BindType(eventTypeSyntax, ctx, diagnostics);
+                        if (declaredEvent.Type is ErrorTypeSymbol)
+                        {
+                            declaredEvent.SetType(eventType);
+                        }
+                        else if (!LocalScopeBinder.AreSameType(declaredEvent.Type, eventType))
+                        {
+                            diagnostics.Add(new Diagnostic(
+                                "CN_EVENT012",
+                                DiagnosticSeverity.Error,
+                                $"Both declarations of partial event '{declaredEvent.Name}' must have the same type.",
+                                new Location(tree, kv.Key.Span)));
+                        }
+
+                        if (eventType is not ErrorTypeSymbol && !(eventType is NamedTypeSymbol named && named.TypeKind == TypeKind.Delegate))
+                        {
+                            diagnostics.Add(new Diagnostic(
+                                "CN_EVENT003",
+                                DiagnosticSeverity.Error,
+                                $"Event '{declaredEvent.Name}' must be of a delegate type.",
+                                new Location(tree, kv.Key.Span)));
                         }
                     }
                     else if (kv.Key is VariableDeclaratorSyntax vd && kv.Value is SourceFieldSymbol field)
@@ -293,10 +323,9 @@ namespace Cnidaria.Cs
 
                     }
                 }
-                BindEnumMembersForTree(
-                    compilation, tree, declMap, stubModel, safeTypeBinder, diagnostics);
+                CollectEnumMembersForTree(tree, declMap, stubModel, safeTypeBinder, pendingEnums);
             }
-            BindPendingConstFields(compilation, pendingConstFields, diagnostics);
+            BindPendingConstants(compilation, pendingEnums, pendingConstFields, diagnostics);
             BindPendingOptionalParameters(compilation, pendingOptionalParameters, diagnostics);
         }
 
@@ -415,39 +444,50 @@ namespace Cnidaria.Cs
                 StubModel = stubModel;
             }
         }
-        // Iterate until constant dependencies stop producing progress
-        private static void BindPendingConstFields(
+        // Enum members of one declaration bind in order, an implicit value advances from the previous one
+        private sealed class PendingEnumMembers
+        {
+            public readonly SyntaxTree Tree;
+            public readonly EnumDeclarationSyntax Declaration;
+            public readonly SourceNamedTypeSymbol EnumType;
+            public readonly ImmutableDictionary<SyntaxNode, Symbol> DeclMap;
+            public readonly SemanticModel StubModel;
+            public readonly TypeBinder TypeBinder;
+            public int NextMember;
+            public object? PreviousValue;
+            public bool HasPrevious;
+
+            public PendingEnumMembers(
+                SyntaxTree tree,
+                EnumDeclarationSyntax declaration,
+                SourceNamedTypeSymbol enumType,
+                ImmutableDictionary<SyntaxNode, Symbol> declMap,
+                SemanticModel stubModel,
+                TypeBinder typeBinder)
+            {
+                Tree = tree;
+                Declaration = declaration;
+                EnumType = enumType;
+                DeclMap = declMap;
+                StubModel = stubModel;
+                TypeBinder = typeBinder;
+            }
+        }
+
+        // Enum members and const fields can refer to each other in any order
+        private static void BindPendingConstants(
             Compilation compilation,
+            List<PendingEnumMembers> pendingEnums,
             List<PendingConstField> pendingConstFields,
             DiagnosticBag diagnostics)
         {
-            if (pendingConstFields.Count == 0)
-                return;
+            AdvancePendingConstants(compilation, pendingEnums, pendingConstFields, diagnostics);
 
-            bool madeProgress;
-            do
-            {
-                madeProgress = false;
+            for (int i = 0; i < pendingEnums.Count; i++)
+                AdvanceEnumMembers(compilation, pendingEnums[i], reportDiagnostics: true, diagnostics);
 
-                for (int i = 0; i < pendingConstFields.Count; i++)
-                {
-                    var pending = pendingConstFields[i];
-                    if (pending.Field.ConstantValueOpt.HasValue)
-                        continue;
-
-                    if (TryBindConstFieldInitializer(
-                        compilation: compilation,
-                        pending: pending,
-                        reportDiagnostics: false,
-                        diagnostics: diagnostics,
-                        constantValueOpt: out var constantValueOpt))
-                    {
-                        pending.Field.SetConstantValue(constantValueOpt);
-                        madeProgress = true;
-                    }
-                }
-            }
-            while (madeProgress);
+            // A member that only got its value above can still complete a const field
+            AdvancePendingConstants(compilation, pendingEnums, pendingConstFields, diagnostics);
 
             for (int i = 0; i < pendingConstFields.Count; i++)
             {
@@ -470,6 +510,46 @@ namespace Cnidaria.Cs
                 }
             }
         }
+
+        // Iterate until constant dependencies stop producing progress
+        private static void AdvancePendingConstants(
+            Compilation compilation,
+            List<PendingEnumMembers> pendingEnums,
+            List<PendingConstField> pendingConstFields,
+            DiagnosticBag diagnostics)
+        {
+            bool madeProgress;
+            do
+            {
+                madeProgress = false;
+
+                for (int i = 0; i < pendingEnums.Count; i++)
+                {
+                    if (AdvanceEnumMembers(compilation, pendingEnums[i], reportDiagnostics: false, diagnostics))
+                        madeProgress = true;
+                }
+
+                for (int i = 0; i < pendingConstFields.Count; i++)
+                {
+                    var pending = pendingConstFields[i];
+                    if (pending.Field.ConstantValueOpt.HasValue)
+                        continue;
+
+                    if (TryBindConstFieldInitializer(
+                        compilation: compilation,
+                        pending: pending,
+                        reportDiagnostics: false,
+                        diagnostics: diagnostics,
+                        constantValueOpt: out var constantValueOpt))
+                    {
+                        pending.Field.SetConstantValue(constantValueOpt);
+                        madeProgress = true;
+                    }
+                }
+            }
+            while (madeProgress);
+        }
+
         private static bool TryBindConstFieldInitializer(
             Compilation compilation,
             in PendingConstField pending,
@@ -567,7 +647,7 @@ namespace Cnidaria.Cs
                 containing: pending.ContainingMethod,
                 inheritFlowFromParent: false);
 
-            if (def.Value.Kind == SyntaxKind.DefaultLiteralExpression)
+            if (def.Value.Kind is SyntaxKind.DefaultLiteralExpression or SyntaxKind.DefaultExpression)
             {
                 constantValueOpt = new Optional<object>(null!);
                 return true;
@@ -813,14 +893,12 @@ namespace Cnidaria.Cs
                 enumType.SetEnumUnderlyingType(underlying);
             }
         }
-        // Implicit enum values advance from the previous successfully converted value
-        private static void BindEnumMembersForTree(
-            Compilation compilation,
+        private static void CollectEnumMembersForTree(
             SyntaxTree tree,
             ImmutableDictionary<SyntaxNode, Symbol> declMap,
             SemanticModel stubModel,
             TypeBinder safeTypeBinder,
-            DiagnosticBag diagnostics)
+            List<PendingEnumMembers> pendingEnums)
         {
             var enumDeclarations = new List<KeyValuePair<SyntaxNode, Symbol>>();
             foreach (var kv in declMap)
@@ -835,88 +913,113 @@ namespace Cnidaria.Cs
 
             foreach (var kv in enumDeclarations)
             {
-                var eds = (EnumDeclarationSyntax)kv.Key;
-                var enumType = (SourceNamedTypeSymbol)kv.Value;
-                var underlyingType = enumType.EnumUnderlyingType ?? compilation.GetSpecialType(SpecialType.System_Int32);
-                object? previousValue = null;
-                bool hasPrevious = false;
+                pendingEnums.Add(new PendingEnumMembers(
+                    tree,
+                    (EnumDeclarationSyntax)kv.Key,
+                    (SourceNamedTypeSymbol)kv.Value,
+                    declMap,
+                    stubModel,
+                    safeTypeBinder));
+            }
+        }
 
-                for (int i = 0; i < eds.Members.Count; i++)
+        // Implicit enum values advance from the previous successfully converted value
+        // Stops at a member whose value is not known yet unless this is the last pass, which reports it
+        private static bool AdvanceEnumMembers(
+            Compilation compilation,
+            PendingEnumMembers pending,
+            bool reportDiagnostics,
+            DiagnosticBag diagnostics)
+        {
+            var enumType = pending.EnumType;
+            var underlyingType = enumType.EnumUnderlyingType ?? compilation.GetSpecialType(SpecialType.System_Int32);
+            var members = pending.Declaration.Members;
+            bool advanced = false;
+
+            for (; pending.NextMember < members.Count; pending.NextMember++)
+            {
+                var em = members[pending.NextMember];
+                if (!pending.DeclMap.TryGetValue(em, out var sym) || sym is not SourceFieldSymbol field)
+                    continue;
+
+                object value;
+
+                if (em.EqualsValue is not null)
                 {
-                    var em = eds.Members[i];
-                    if (!declMap.TryGetValue(em, out var sym) || sym is not SourceFieldSymbol field)
-                        continue;
+                    var ctx = new BindingContext(compilation, pending.StubModel, field, NullRecorder.Instance);
+                    var exprBinder = new LocalScopeBinder(
+                        parent: pending.TypeBinder,
+                        flags: BinderFlags.EnumMemberInitializer,
+                        containing: field);
+                    var sink = reportDiagnostics ? diagnostics : new DiagnosticBag();
+                    var init = exprBinder.BindExpression(em.EqualsValue.Value, ctx, sink);
 
-                    object value;
-
-                    if (em.EqualsValue is not null)
+                    if (!ReferenceEquals(init.Type, enumType))
                     {
-                        var ctx = new BindingContext(compilation, stubModel, field, NullRecorder.Instance);
-                        var exprBinder = new LocalScopeBinder(
-                            parent: safeTypeBinder,
-                            flags: BinderFlags.EnumMemberInitializer,
-                            containing: field);
-                        var init = exprBinder.BindExpression(em.EqualsValue.Value, ctx, diagnostics);
+                        init = exprBinder.ApplyConversion(
+                            exprSyntax: em.EqualsValue.Value,
+                            expr: init,
+                            targetType: underlyingType,
+                            diagnosticNode: em,
+                            context: ctx,
+                            diagnostics: sink,
+                            requireImplicit: true);
+                    }
 
-                        if (!ReferenceEquals(init.Type, enumType))
+                    // The last pass binds this again, so what a silent pass found is not lost
+                    if (!reportDiagnostics && (!init.ConstantValueOpt.HasValue || !sink.IsEmpty))
+                        return advanced;
+
+                    if (!init.ConstantValueOpt.HasValue)
+                    {
+                        if (!init.HasErrors)
                         {
-                            init = exprBinder.ApplyConversion(
-                                exprSyntax: em.EqualsValue.Value,
-                                expr: init,
-                                targetType: underlyingType,
-                                diagnosticNode: em,
-                                context: ctx,
-                                diagnostics: diagnostics,
-                                requireImplicit: true);
+                            diagnostics.Add(new Diagnostic(
+                                "CN_ENUM003",
+                                DiagnosticSeverity.Error,
+                                $"Enum member '{field.Name}' must have a constant value.",
+                                new Location(pending.Tree, em.Span)));
                         }
 
-                        if (!init.ConstantValueOpt.HasValue)
-                        {
-                            if (!init.HasErrors)
-                            {
-                                diagnostics.Add(new Diagnostic(
-                                    "CN_ENUM003",
-                                    DiagnosticSeverity.Error,
-                                    $"Enum member '{field.Name}' must have a constant value.",
-                                    new Location(tree, em.Span)));
-                            }
-
-                            value = GetDefaultEnumConstantValue(underlyingType);
-                        }
-                        else
-                        {
-                            value = init.ConstantValueOpt.Value!;
-                        }
+                        value = GetDefaultEnumConstantValue(underlyingType);
                     }
                     else
                     {
-                        if (!hasPrevious)
-                        {
-                            value = GetDefaultEnumConstantValue(underlyingType);
-                        }
-                        else if (!TryIncrementEnumConstantValue(previousValue!, underlyingType, out value))
-                        {
-                            diagnostics.Add(new Diagnostic(
-                                "CN_ENUM004",
-                                DiagnosticSeverity.Error,
-                                $"Enum member '{field.Name}' value overflows underlying type '{underlyingType.Name}'.",
-                                new Location(tree, em.Span)));
-
-                            value = previousValue!;
-                        }
+                        value = init.ConstantValueOpt.Value!;
                     }
-                    field.SetConstantValue(new Optional<object>(value));
-                    hasPrevious = true;
-                    previousValue = value;
                 }
+                else
+                {
+                    if (!pending.HasPrevious)
+                    {
+                        value = GetDefaultEnumConstantValue(underlyingType);
+                    }
+                    else if (!TryIncrementEnumConstantValue(pending.PreviousValue!, underlyingType, out value))
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_ENUM004",
+                            DiagnosticSeverity.Error,
+                            $"Enum member '{field.Name}' value overflows underlying type '{underlyingType.Name}'.",
+                            new Location(pending.Tree, em.Span)));
+
+                        value = pending.PreviousValue!;
+                    }
+                }
+                field.SetConstantValue(new Optional<object>(value));
+                pending.HasPrevious = true;
+                pending.PreviousValue = value;
+                advanced = true;
             }
+
+            return advanced;
         }
+
         private static bool RequiresBackingField(PropertyDeclarationSyntax pd, SourcePropertySymbol property)
         {
             if (pd.UsesFieldKeyword)
                 return true;
 
-            if (!HasAutoAccessor(pd) || HasModifier(pd.Modifiers, SyntaxKind.AbstractKeyword))
+            if (!HasAutoAccessor(pd) || HasModifier(pd.Modifiers, SyntaxKind.AbstractKeyword) || HasModifier(pd.Modifiers, SyntaxKind.ExternKeyword))
                 return false;
 
             if (property.ContainingSymbol is NamedTypeSymbol { TypeKind: TypeKind.Interface } &&

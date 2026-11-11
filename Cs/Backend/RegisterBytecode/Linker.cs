@@ -126,7 +126,10 @@ internal static class RegisterBytecodeLinker
                 : abi.PassingKind == AbiValuePassingKind.MultiRegister ? abi.RegisterSegments.Select(s => (s.RegisterClass == RegisterClass.Float ? 1 : 0, s.Offset, s.Size)) : [];
             return AbiValue((int)abi.PassingKind, abi.Size, abi.Alignment, segments);
         }
-        string signature = Value(method.ReturnType, true) + "(" + string.Join(";", method.ParameterTypes.Select(t => Value(t, false))) + ")";
+        string result = import.ReturnsNativeBool
+            ? AbiValue((int)AbiValuePassingKind.ScalarRegister, 4, 4, [(0, 0, 4)])
+            : Value(method.ReturnType, true);
+        string signature = result + "(" + string.Join(";", method.ParameterTypes.Select(t => Value(t, false))) + ")";
         return new(method.MethodId, import.ModuleName, string.IsNullOrEmpty(import.EntryPointName) ? method.Name : import.EntryPointName, signature);
     }
 

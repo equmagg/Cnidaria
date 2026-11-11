@@ -22,8 +22,7 @@ namespace Cnidaria.Cs
             bool sameAssembly = IsSameAssembly(symbol, context.ContainingSymbol);
 
             bool protectedOk = declaringType is not null &&
-                               accessingType is not null &&
-                               IsSameOrDerived(accessingType, declaringType);
+                               IsSameOrDerivedOrNestedInOne(accessingType, declaringType);
 
             bool privateOk = declaringType is not null &&
                              accessingType is not null &&
@@ -49,6 +48,7 @@ namespace Cnidaria.Cs
                 NamedTypeSymbol nt when nt.ContainingSymbol is NamedTypeSymbol owner => owner,
                 FieldSymbol f => f.ContainingSymbol as NamedTypeSymbol,
                 PropertySymbol p => p.ContainingSymbol as NamedTypeSymbol,
+                EventSymbol e => e.ContainingSymbol as NamedTypeSymbol,
                 MethodSymbol m => m.ContainingSymbol as NamedTypeSymbol,
                 _ => null
             };
@@ -76,6 +76,18 @@ namespace Cnidaria.Cs
             for (var cur = maybeInner.ContainingSymbol; cur is not null; cur = cur.ContainingSymbol)
             {
                 if (cur is NamedTypeSymbol nt && IsSameTypeDefinition(nt, maybeOuter))
+                    return true;
+            }
+
+            return false;
+        }
+
+        // A nested type has the access of the types around it
+        private static bool IsSameOrDerivedOrNestedInOne(NamedTypeSymbol? type, NamedTypeSymbol baseType)
+        {
+            for (; type is not null; type = type.ContainingSymbol as NamedTypeSymbol)
+            {
+                if (IsSameOrDerived(type, baseType))
                     return true;
             }
 

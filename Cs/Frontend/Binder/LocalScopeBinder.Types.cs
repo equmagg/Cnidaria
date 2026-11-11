@@ -17,7 +17,7 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(node);
             }
 
-            if (method.IsStatic)
+            if (IsInStaticMember(method))
             {
                 diagnostics.Add(new Diagnostic("CN_THIS001", DiagnosticSeverity.Error,
                     "Cannot use 'this' in a static method.",
@@ -25,7 +25,7 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(node);
             }
 
-            if (method.ContainingSymbol is not NamedTypeSymbol containingType)
+            if (GetEnclosingType(method, out _) is not NamedTypeSymbol containingType)
             {
                 diagnostics.Add(new Diagnostic("CN_THIS002", DiagnosticSeverity.Error,
                     "Cannot resolve containing type for 'this'.",
@@ -33,8 +33,65 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(node);
             }
 
+            if (ReportThisInStructFunction(node, context, diagnostics))
+                return new BoundBadExpression(node);
+
             return new BoundThisExpression(node, containingType);
         }
+
+        // Lambdas and local functions see the 'this' of the member around them
+        private static bool IsInStaticMember(Symbol? symbol)
+        {
+            while (symbol is LambdaMethodSymbol or LocalFunctionSymbol)
+                symbol = symbol.ContainingSymbol;
+
+            return symbol switch
+            {
+                MethodSymbol method => method.IsStatic,
+                FieldSymbol field => field.IsStatic,
+                PropertySymbol property => property.IsStatic,
+                _ => false,
+            };
+        }
+
+        private static bool IsDeclaredStatic(Symbol symbol) => symbol switch
+        {
+            LambdaMethodSymbol lambda => lambda.IsDeclaredStatic,
+            LocalFunctionSymbol function => HasModifier(function.Declaration.Modifiers, SyntaxKind.StaticKeyword),
+            _ => false,
+        };
+
+        // A static function on the way cuts 'this' off, which StaticFunctionChecker reports if it is used anyway
+        private static bool HasNoThis(Symbol? symbol)
+        {
+            for (; symbol is LambdaMethodSymbol or LocalFunctionSymbol; symbol = symbol.ContainingSymbol)
+            {
+                if (IsDeclaredStatic(symbol))
+                    return true;
+            }
+
+            return IsInStaticMember(symbol);
+        }
+
+        private static bool ReportThisInStructFunction(SyntaxNode node, BindingContext context, DiagnosticBag diagnostics)
+        {
+            if (context.ContainingSymbol is not (LambdaMethodSymbol or LocalFunctionSymbol) ||
+                HasNoThis(context.ContainingSymbol) ||
+                GetEnclosingType(context.ContainingSymbol, out _) is not NamedTypeSymbol enclosingType ||
+                !enclosingType.IsValueType)
+            {
+                return false;
+            }
+
+            diagnostics.Add(new Diagnostic(
+                "CN_THIS003",
+                DiagnosticSeverity.Error,
+                "Anonymous methods, lambda expressions, query expressions, and local functions inside structs cannot access instance members of 'this'. " +
+                "Consider copying 'this' to a local variable outside the anonymous method, lambda expression, query expression, or local function and using the local instead.",
+                new Location(context.SemanticModel.SyntaxTree, node.Span)));
+            return true;
+        }
+
         private BoundExpression BindBase(
             BaseExpressionSyntax node,
             BindingContext context,
@@ -50,7 +107,7 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(node);
             }
 
-            if (method.IsStatic)
+            if (IsInStaticMember(method))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_BASE002",
@@ -60,7 +117,7 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(node);
             }
 
-            if (method.ContainingSymbol is not NamedTypeSymbol containingType)
+            if (GetEnclosingType(method, out _) is not NamedTypeSymbol containingType)
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_BASE003",
@@ -112,10 +169,9 @@ namespace Cnidaria.Cs
                 {
                     diagnostics.Add(new Diagnostic(
                         "CN_PTRTYPE001",
-                        DiagnosticSeverity.Error,
-                        $"Cannot take a pointer to managed type '{elem.Name}'.",
+                        DiagnosticSeverity.Warning,
+                        $"This takes the address of, gets the size of, or declares a pointer to a managed type '{elem.Name}'.",
                         new Location(context.SemanticModel.SyntaxTree, p.ElementType.Span)));
-                    return new ErrorTypeSymbol("ptr", containing: null, ImmutableArray<Location>.Empty);
                 }
 
                 return context.Compilation.CreatePointerType(elem);
@@ -138,13 +194,24 @@ namespace Cnidaria.Cs
             var statements = ImmutableArray.CreateBuilder<BoundStatement>(block.Statements.Count);
             LocalScopeBinder current = scope;
 
-            foreach (var statement in block.Statements)
+            for (int i = 0; i < block.Statements.Count; i++)
             {
+                StatementSyntax statement = block.Statements[i];
+                if (statement is LocalDeclarationStatementSyntax declaration && declaration.AwaitKeyword.Span.Length != 0)
+                {
+                    var following = ImmutableArray.CreateBuilder<StatementSyntax>(block.Statements.Count - i - 1);
+                    for (int f = i + 1; f < block.Statements.Count; f++)
+                        following.Add(block.Statements[f]);
+                    statements.Add(current.BindAwaitUsingDeclaration(declaration, following.MoveToImmutable(), context, diagnostics));
+                    break;
+                }
+
                 var bound = current.BindStatement(statement, context, diagnostics);
                 statements.Add(bound);
                 current = current.GetFlowScopeBinderForFollowingStatements(bound);
             }
 
+            scope.DeclareLocalFunctionDelegates(statements, block);
             return new BoundBlockStatement(block, statements.ToImmutable());
         }
         /// <summary>Binds an explicit or implicit base or this constructor initializer</summary>
@@ -243,11 +310,21 @@ namespace Cnidaria.Cs
             var argSyntaxes = initSyntax.ArgumentList.Arguments;
             var argsBuilder = ImmutableArray.CreateBuilder<BoundExpression>(argSyntaxes.Count);
             for (int i = 0; i < argSyntaxes.Count; i++)
-                argsBuilder.Add(BindExpression(argSyntaxes[i].Expression, context, diagnostics));
+                argsBuilder.Add(BindCallArgument(argSyntaxes[i], context, diagnostics));
             var boundArgs = argsBuilder.ToImmutable();
             var ctorCandidates = LookupConstructors(targetType)
                 .Where(c => AccessibilityHelper.IsAccessible(c, context))
                 .ToImmutableArray();
+            // A struct has an implicit parameterless constructor that zeroes it
+            if (isThisInitializer && containingType.TypeKind == TypeKind.Struct && boundArgs.IsEmpty &&
+                !ctorCandidates.Any(c => c.Parameters.IsEmpty))
+            {
+                var thisTarget = new BoundThisExpression(new ThisExpressionSyntax(initSyntax.ThisOrBaseKeyword), containingType);
+                var zero = new BoundObjectCreationExpression(initSyntax, containingType, constructorOpt: null, arguments: boundArgs);
+                var zeroThis = new BoundExpressionStatement(initSyntax, new BoundAssignmentExpression(initSyntax, thisTarget, zero));
+                context.Recorder.RecordBound(initSyntax, zeroThis);
+                return zeroThis;
+            }
             if (ctorCandidates.IsDefaultOrEmpty)
             {
                 diagnostics.Add(new Diagnostic(
@@ -414,7 +491,7 @@ namespace Cnidaria.Cs
                 return bound;
             }
             // Target-typed collection expression
-            if (exprSyntax is CollectionExpressionSyntax collectionSyntax && expr is BoundUnboundCollectionExpression unboundCollection)
+            if (expr is BoundUnboundCollectionExpression unboundCollection && unboundCollection.Syntax is CollectionExpressionSyntax collectionSyntax)
             {
                 var bound = BindCollectionExpression(collectionSyntax, targetType, unboundCollection, context, diagnostics);
                 context.Recorder.RecordBound(exprSyntax, bound);
@@ -803,7 +880,7 @@ namespace Cnidaria.Cs
         {
             foreach (var m in nullableType.GetMembers())
             {
-                if (m is PropertySymbol ps && string.Equals(ps.Name, "HasValue", StringComparison.Ordinal))
+                if (m is PropertySymbol ps && ps.Name == "HasValue")
                     return ps.GetMethod;
             }
             return null;
@@ -842,7 +919,7 @@ namespace Cnidaria.Cs
             foreach (var m in nullableType.GetMembers())
             {
                 if (m is MethodSymbol ms && !ms.IsStatic
-                    && string.Equals(ms.Name, "GetValueOrDefault", StringComparison.Ordinal)
+                    && ms.Name == "GetValueOrDefault"
                     && ms.Parameters.Length == 0
                     && ReferenceEquals(ms.ReturnType, underlying))
                 {

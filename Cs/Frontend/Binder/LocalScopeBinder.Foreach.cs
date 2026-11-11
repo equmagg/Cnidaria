@@ -69,15 +69,7 @@ namespace Cnidaria.Cs
             DiagnosticBag diagnostics)
         {
             if (node.AwaitKeyword.Span.Length != 0)
-            {
-                diagnostics.Add(new Diagnostic(
-                    "CN_FOREACH_AWAIT001",
-                    DiagnosticSeverity.Error,
-                    "await foreach is not supported.",
-                    new Location(context.SemanticModel.SyntaxTree, node.AwaitKeyword.Span)));
-
-                return new BoundBadStatement(node);
-            }
+                return BindAwaitForEach(node, context, diagnostics);
 
             var collection = BindExpression(node.Expression, context, diagnostics);
             if (collection.HasErrors)
@@ -856,7 +848,7 @@ namespace Cnidaria.Cs
             return GetWellKnownType(compilation, new[] { ns0, ns1, ns2 }, typeName, arity);
         }
 
-        private static NamedTypeSymbol? GetWellKnownType(
+        internal static NamedTypeSymbol? GetWellKnownType(
             Compilation compilation,
             string[] namespaceParts,
             string typeName,
@@ -871,7 +863,7 @@ namespace Cnidaria.Cs
 
                 for (int i = 0; i < next.Length; i++)
                 {
-                    if (string.Equals(next[i].Name, namespaceParts[p], StringComparison.Ordinal))
+                    if (next[i].Name == namespaceParts[p])
                     {
                         found = next[i];
                         break;

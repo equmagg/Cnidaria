@@ -40,7 +40,7 @@ namespace Cnidaria.Cs
             {
                 var typeParameters = definition.TypeParameters;
                 var inferences = new TypeSymbol?[typeParameters.Length];
-                InferMethodTypeArgumentsFromParameter(target, receiver, typeParameters, inferences, new bool[typeParameters.Length]);
+                InferMethodTypeArgumentsFromParameter(target, receiver, typeParameters, inferences, new InferenceBound[typeParameters.Length]);
                 var builder = ImmutableArray.CreateBuilder<TypeSymbol>(info.BlockTypeParameterCount);
                 var map = ImmutableDictionary.CreateBuilder<TypeParameterSymbol, TypeSymbol>();
                 for (int i = 0; i < info.BlockTypeParameterCount; i++)

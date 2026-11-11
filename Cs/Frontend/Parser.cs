@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Linq;
 
 namespace Cnidaria.Cs
@@ -411,7 +412,10 @@ namespace Cnidaria.Cs
                 new SyntaxList<ExternAliasDirectiveSyntax>(externs.ToArray()),
                 new SyntaxList<UsingDirectiveSyntax>(usings.ToArray()),
                 new SyntaxList<MemberDeclarationSyntax>(members.ToArray()),
-                eof);
+                eof)
+            {
+                PragmaWarnings = _tokens.PragmaWarnings.ToImmutableArray(),
+            };
         }
         private MemberDeclarationSyntax ParseCompilationUnitMember(
             ref bool seenNonGlobalMember, ref bool seenTopLevelStatement, ref bool seenFileScopedNamespace)
@@ -1249,7 +1253,7 @@ namespace Cnidaria.Cs
             }
 
             // delegate
-            if (_tokens.CurrentKind == SyntaxKind.DelegateKeyword)
+            if (_tokens.CurrentKind == SyntaxKind.DelegateKeyword && _tokens.Peek(1).Kind != SyntaxKind.AsteriskToken)
                 return ParseDelegateDeclarationAfterModifiers(attrs, modifiers);
 
             // event
@@ -1361,7 +1365,13 @@ namespace Cnidaria.Cs
                 ? explicitMemberId
                 : MatchToken(SyntaxKind.IdentifierToken);
 
-            if (_tokens.CurrentKind == SyntaxKind.OpenBraceToken || hasExplicitInterface)
+            if (hasExplicitInterface && _tokens.CurrentKind != SyntaxKind.OpenBraceToken)
+            {
+                _diagnostics.Add(new SyntaxDiagnostic(
+                    id.Span.Start,
+                    "An explicit interface implementation of an event must use event accessor syntax."));
+            }
+            else if (_tokens.CurrentKind == SyntaxKind.OpenBraceToken)
             {
                 var accessorList = ParseAccessorList();
                 return new EventDeclarationSyntax(
@@ -2546,6 +2556,10 @@ namespace Cnidaria.Cs
             }
 
             if (IsQueryExpression(mayBeVariableDeclaration: true, mayBeMemberDeclaration: false))
+                return ParseExpressionStatement();
+
+            // Otherwise 'await T();' reads as a local function declaration
+            if (IsAwaitKeyword())
                 return ParseExpressionStatement();
 
             if (TryParseLocalFunctionStatement(out var localFunc))
@@ -3770,6 +3784,19 @@ namespace Cnidaria.Cs
 
             return new[] { first, second, third };
         }
+        // 'T?[]' is a type unless a ':' makes the brackets the operand of a conditional
+        private bool IsArrayRankAfterQuestion()
+        {
+            if (_tokens.Peek(1).Kind != SyntaxKind.OpenBracketToken)
+                return false;
+
+            int index = 2;
+            while (_tokens.Peek(index).Kind == SyntaxKind.CommaToken)
+                index++;
+
+            return _tokens.Peek(index).Kind == SyntaxKind.CloseBracketToken &&
+                   _tokens.Peek(index + 1).Kind != SyntaxKind.ColonToken;
+        }
         private TypeSyntax ParseType() => ParseType(mayEndExpression: false);
         private TypeSyntax ParseTypeAtExpressionEnd() => ParseType(mayEndExpression: true);
         // After 'is' and 'as' a '?' followed by an expression belongs to a conditional
@@ -3780,7 +3807,7 @@ namespace Cnidaria.Cs
             while (true)
             {
                 if (_tokens.CurrentKind == SyntaxKind.QuestionToken &&
-                    !(mayEndExpression && CanStartExpression(_tokens.Peek(1))))
+                    !(mayEndExpression && CanStartExpression(_tokens.Peek(1)) && !IsArrayRankAfterQuestion()))
                 {
                     var q = _tokens.EatToken();
                     t = new NullableTypeSyntax(t, q);
@@ -4065,10 +4092,14 @@ namespace Cnidaria.Cs
                     if (!ScanTypeArgumentList())
                         return false;
 
-                    var k = _tokens.Current.Kind;
-                    return k == SyntaxKind.OpenParenToken ||
-                           k == SyntaxKind.DotToken ||
-                           k == SyntaxKind.ColonColonToken;
+                    // The tokens that keep a type argument list a type argument list (C# 6.2.5)
+                    return _tokens.Current.Kind is SyntaxKind.OpenParenToken or SyntaxKind.CloseParenToken or
+                        SyntaxKind.CloseBracketToken or SyntaxKind.CloseBraceToken or SyntaxKind.ColonToken or
+                        SyntaxKind.SemicolonToken or SyntaxKind.CommaToken or SyntaxKind.DotToken or
+                        SyntaxKind.QuestionToken or SyntaxKind.EqualsEqualsToken or SyntaxKind.ExclamationEqualsToken or
+                        SyntaxKind.BarToken or SyntaxKind.CaretToken or SyntaxKind.AmpersandAmpersandToken or
+                        SyntaxKind.BarBarToken or SyntaxKind.AmpersandToken or SyntaxKind.OpenBracketToken or
+                        SyntaxKind.ColonColonToken;
                 },
                 tempContext: ParseContext.Type);
         }
@@ -4656,7 +4687,7 @@ namespace Cnidaria.Cs
                     var type = ParseType();
                     var close = MatchToken(SyntaxKind.CloseParenToken);
 
-                    if (!TypeDefinitelyNotExpression(type) && !IsCastFollowerToken(_tokens.Current))
+                    if (!TypeDefinitelyNotExpression(type) && !IsCastFollowerToken(_tokens.Current) && !IsCastedCollectionExpression(type))
                     {
                         return (ExpressionSyntax)new ParenthesizedExpressionSyntax(
                             open, CreateMissingIdentifierName(close.Span.End), close);
@@ -5707,7 +5738,7 @@ namespace Cnidaria.Cs
                 return ParseParenthesizedVariableDesignation();
             var id = MatchToken(SyntaxKind.IdentifierToken);
             if (id.Kind == SyntaxKind.IdentifierToken &&
-                string.Equals(id.ValueText, "_", StringComparison.Ordinal))
+                id.ValueText == "_")
             {
                 return new DiscardDesignationSyntax(id);
             }
@@ -5832,7 +5863,7 @@ namespace Cnidaria.Cs
             }
 
             if (_tokens.Current.Kind == SyntaxKind.IdentifierToken &&
-                string.Equals(_tokens.Current.ValueText, "_", StringComparison.Ordinal))
+                _tokens.Current.ValueText == "_")
             {
                 var underscore = _tokens.EatToken();
                 return new DiscardPatternSyntax(underscore);
@@ -6154,7 +6185,7 @@ namespace Cnidaria.Cs
                 return null;
 
             var identifier = _tokens.EatToken();
-            if (string.Equals(identifier.ValueText, "_", StringComparison.Ordinal))
+            if (identifier.ValueText == "_")
                 return new DiscardDesignationSyntax(identifier);
 
             return new SingleVariableDesignationSyntax(identifier);
@@ -6671,7 +6702,7 @@ namespace Cnidaria.Cs
             var name0 = t0.ValueText;
             var className = classNameToken.ValueText;
 
-            if (!string.Equals(name0, className, StringComparison.Ordinal))
+            if (name0 != className)
                 return false;
 
             return _tokens.Peek(1).Kind == SyntaxKind.OpenParenToken;
@@ -6686,7 +6717,7 @@ namespace Cnidaria.Cs
             if (t1.Kind != SyntaxKind.IdentifierToken)
                 return false;
 
-            if (!string.Equals(t1.ValueText, typeNameToken.ValueText, StringComparison.Ordinal))
+            if (t1.ValueText != typeNameToken.ValueText)
                 return false;
 
             return _tokens.Peek(2).Kind == SyntaxKind.OpenParenToken;
@@ -6704,6 +6735,20 @@ namespace Cnidaria.Cs
             if (t is AliasQualifiedNameSyntax) return true;
 
             return false;
+        }
+        // `(A<B>)[...]` and `(A)[]` can only be casts of a collection expression
+        private bool IsCastedCollectionExpression(TypeSyntax type)
+        {
+            if (_tokens.CurrentKind != SyntaxKind.OpenBracketToken)
+                return false;
+
+            if (_tokens.Peek(1).Kind == SyntaxKind.CloseBracketToken)
+                return true;
+
+            if (type is QualifiedNameSyntax qualified)
+                return qualified.Right is GenericNameSyntax;
+
+            return type is GenericNameSyntax;
         }
         private static bool IsCastFollowerToken(SyntaxToken t)
         {

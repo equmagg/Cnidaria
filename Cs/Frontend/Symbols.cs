@@ -133,6 +133,10 @@ namespace Cnidaria.Cs
         public bool BestFitMapping { get; }
         public bool PreserveSig { get; }
         public bool ThrowOnUnmappableCharacter { get; }
+        // The native callee neither blocks nor calls back, so the GC cannot run while it does
+        public bool SuppressGCTransition { get; }
+        // [return: MarshalAs(UnmanagedType.Bool)]: the native callee returns 32 bits, any non-zero value of which is true
+        public bool ReturnsNativeBool { get; }
 
         public DllImportData(
             string moduleName,
@@ -143,7 +147,9 @@ namespace Cnidaria.Cs
             bool setLastError,
             bool bestFitMapping,
             bool preserveSig,
-            bool throwOnUnmappableCharacter)
+            bool throwOnUnmappableCharacter,
+            bool suppressGCTransition,
+            bool returnsNativeBool)
         {
             ModuleName = moduleName ?? string.Empty;
             EntryPointName = entryPointName ?? string.Empty;
@@ -154,6 +160,8 @@ namespace Cnidaria.Cs
             BestFitMapping = bestFitMapping;
             PreserveSig = preserveSig;
             ThrowOnUnmappableCharacter = throwOnUnmappableCharacter;
+            SuppressGCTransition = suppressGCTransition;
+            ReturnsNativeBool = returnsNativeBool;
         }
     }
     /// <summary>Encodes native import metadata as ECMA-335 PInvokeAttributes</summary>
@@ -185,7 +193,7 @@ namespace Cnidaria.Cs
             return (ushort)flags;
         }
 
-        public static DllImportData Decode(string moduleName, string entryPointName, ushort flags, bool preserveSig)
+        public static DllImportData Decode(string moduleName, string entryPointName, ushort flags, bool preserveSig, bool suppressGCTransition, bool returnsNativeBool)
         {
             var charSet = (flags & CharSetMask) switch
             {
@@ -204,7 +212,9 @@ namespace Cnidaria.Cs
                 (flags & SupportsLastError) != 0,
                 (flags & BestFitDisabled) == 0,
                 preserveSig,
-                (flags & ThrowOnUnmappableEnabled) != 0);
+                (flags & ThrowOnUnmappableEnabled) != 0,
+                suppressGCTransition,
+                returnsNativeBool);
         }
     }
     /// <summary>Defines serialized metadata bits shared by symbol readers and writers</summary>
@@ -213,6 +223,7 @@ namespace Cnidaria.Cs
         public const ushort NoInlining = 0x0008;
         public const ushort AggressiveInlining = 0x0100;
         public const ushort InternalCall = 0x1000;
+        public const ushort Async = 0x2000;
         public const ushort PreserveSig = 0x0080;
         public const ushort Extern = 0x0010;
     }
@@ -232,10 +243,10 @@ namespace Cnidaria.Cs
                     continue;
 
                 if (TryGetUInt16(attr, out var flags))
-                    return flags;
+                    return method.IsAsync ? (ushort)(flags | MetadataFlagBits.Async) : flags;
             }
 
-            return 0;
+            return method.IsAsync ? MetadataFlagBits.Async : (ushort)0;
         }
         public static bool HasInternalCall(MethodSymbol method)
             => (GetMethodImplFlags(method) & MetadataFlagBits.InternalCall) != 0;
@@ -253,8 +264,12 @@ namespace Cnidaria.Cs
             for (int i = 0; i < attrs.Length; i++)
             {
                 var attr = attrs[i];
-                if (!IsAttribute(attr, "System.Runtime.InteropServices", "DllImportAttribute"))
+                // LibraryImport shares the fields that matter once there is nothing to marshal
+                if (!IsAttribute(attr, "System.Runtime.InteropServices", "DllImportAttribute") &&
+                    !IsAttribute(attr, "System.Runtime.InteropServices", "LibraryImportAttribute"))
+                {
                     continue;
+                }
 
                 string moduleName = string.Empty;
                 if (!attr.ConstructorArguments.IsDefaultOrEmpty && attr.ConstructorArguments[0].Value is string module)
@@ -319,10 +334,46 @@ namespace Cnidaria.Cs
                     setLastError,
                     bestFitMapping,
                     preserveSig,
-                    throwOnUnmappableCharacter);
+                    throwOnUnmappableCharacter,
+                    HasAttribute(definition, "System.Runtime.InteropServices", "SuppressGCTransitionAttribute"),
+                    HasBoolReturnMarshalling(definition));
             }
 
             return null;
+        }
+
+        private static bool HasBoolReturnMarshalling(MethodSymbol definition)
+        {
+            foreach (AttributeData attribute in definition.GetAttributes())
+            {
+                if (attribute.Target == AttributeApplicationTarget.ReturnValue && TryGetMarshalAsType(attribute, out int unmanagedType))
+                    return unmanagedType == (int)System.Runtime.InteropServices.UnmanagedType.Bool;
+            }
+
+            return false;
+        }
+
+        internal static bool TryGetMarshalAsType(AttributeData attribute, out int unmanagedType)
+        {
+            unmanagedType = 0;
+            return IsAttribute(attribute, "System.Runtime.InteropServices", "MarshalAsAttribute") &&
+                !attribute.ConstructorArguments.IsDefaultOrEmpty &&
+                TryConvertToInt32(attribute.ConstructorArguments[0].Value, out unmanagedType);
+        }
+
+        // The attribute also covers what is nested in the member or type it is on
+        public static bool SkipsLocalsInit(MethodSymbol method)
+        {
+            for (Symbol? symbol = method; symbol is MethodSymbol or NamedTypeSymbol; symbol = symbol.ContainingSymbol)
+            {
+                foreach (AttributeData attribute in symbol.GetAttributes())
+                {
+                    if (IsAttribute(attribute, "System.Runtime.CompilerServices", "SkipLocalsInitAttribute"))
+                        return true;
+                }
+            }
+
+            return false;
         }
 
         public static bool HasIntrinsic(MethodSymbol method)
@@ -345,13 +396,13 @@ namespace Cnidaria.Cs
         internal static bool IsAttribute(AttributeData attr, string @namespace, string name)
         {
             var attrClass = attr.AttributeClass;
-            if (!string.Equals(attrClass.Name, name, StringComparison.Ordinal))
+            if (attrClass.Name != name)
                 return false;
 
             if (attrClass.ContainingSymbol is not NamespaceSymbol ns)
                 return false;
 
-            return string.Equals(GetNamespaceFullName(ns), @namespace, StringComparison.Ordinal);
+            return GetNamespaceFullName(ns) == @namespace;
         }
 
         private static string GetNamespaceFullName(NamespaceSymbol ns)
@@ -520,13 +571,13 @@ namespace Cnidaria.Cs
         public static bool IsInlineArrayAttribute(AttributeData attr)
         {
             var attrClass = attr.AttributeClass;
-            if (!string.Equals(attrClass.Name, "InlineArrayAttribute", StringComparison.Ordinal))
+            if (attrClass.Name != "InlineArrayAttribute")
                 return false;
 
             if (attrClass.ContainingSymbol is not NamespaceSymbol ns)
                 return false;
 
-            return string.Equals(GetNamespaceFullName(ns), "System.Runtime.CompilerServices", StringComparison.Ordinal);
+            return GetNamespaceFullName(ns) == "System.Runtime.CompilerServices";
         }
 
         private static string GetNamespaceFullName(NamespaceSymbol ns)
@@ -704,6 +755,14 @@ namespace Cnidaria.Cs
         ConstructorConstraint = 1 << 5,
     }
 
+    // The values of GenericParameterAttributes.VarianceMask
+    public enum VarianceKind : byte
+    {
+        None = 0,
+        Out = 1,
+        In = 2,
+    }
+
     /// <summary>Represents a type parameter declared by a type or method</summary>
     public sealed class TypeParameterSymbol : TypeSymbol
     {
@@ -712,6 +771,7 @@ namespace Cnidaria.Cs
         public override Symbol? ContainingSymbol { get; }
         public override ImmutableArray<Location> Locations { get; }
         public int Ordinal { get; }
+        public VarianceKind Variance { get; internal set; }
         public GenericConstraintsFlags GenericConstraint { get; private set; }
         private ImmutableArray<TypeSymbol> _constraintTypes;
         private List<AttributeData>? _attributes;
@@ -1145,6 +1205,196 @@ namespace Cnidaria.Cs
         public virtual bool IsExplicitInterfaceImplementation => ExplicitInterfaceImplementation is not null;
         public virtual ImmutableArray<ParameterSymbol> Parameters => ImmutableArray<ParameterSymbol>.Empty;
     }
+
+    /// <summary>The method a method group converts to, with the body lowering emits for it</summary>
+    internal sealed record MethodGroupWrapper(MethodSymbol Target, NamedTypeSymbol DelegateType, TypeSymbol? ValueReceiverType, Symbol Owner, MethodSymbol Method, BoundStatement Body);
+
+    /// <summary>Represents an event, whose only operations outside its type are the add and remove accessors</summary>
+    public abstract class EventSymbol : Symbol
+    {
+        public sealed override SymbolKind Kind => SymbolKind.Event;
+        public abstract TypeSymbol Type { get; }
+        public abstract bool IsStatic { get; }
+        public abstract MethodSymbol AddMethod { get; }
+        public abstract MethodSymbol RemoveMethod { get; }
+        /// <summary>The delegate field of a field-like event</summary>
+        public virtual FieldSymbol? BackingFieldOpt => null;
+        /// <summary>Interface member implemented explicitly by this event</summary>
+        public virtual EventSymbol? ExplicitInterfaceImplementation => null;
+        /// <summary>Declared with an interface-qualified name, so never found by member lookup</summary>
+        public virtual bool IsExplicitInterfaceImplementation => ExplicitInterfaceImplementation is not null;
+    }
+
+    /// <summary>Represents an event declared in source</summary>
+    internal sealed class SourceEventSymbol : EventSymbol
+    {
+        private readonly SourceMethodSymbol _addMethod;
+        private readonly SourceMethodSymbol _removeMethod;
+        private readonly SynthesizedBackingFieldSymbol? _backingField;
+        private readonly List<AttributeData> _attributes = new();
+        private TypeSymbol _type;
+        private EventSymbol? _explicitInterfaceImplementation;
+        private bool _isExplicitDeclaration;
+        public override string Name { get; }
+        public override Symbol? ContainingSymbol { get; }
+        public override ImmutableArray<Location> Locations { get; }
+        public override ImmutableArray<SyntaxReference> DeclaringSyntaxReferences { get; }
+        public override Accessibility DeclaredAccessibility { get; }
+        public override TypeSymbol Type => _type;
+        public override bool IsStatic { get; }
+        public override MethodSymbol AddMethod => _addMethod;
+        public override MethodSymbol RemoveMethod => _removeMethod;
+        public override FieldSymbol? BackingFieldOpt => _backingField;
+        public override EventSymbol? ExplicitInterfaceImplementation => _explicitInterfaceImplementation;
+        public override bool IsExplicitInterfaceImplementation => _isExplicitDeclaration || _explicitInterfaceImplementation is not null;
+        internal TypeSyntax DeclaredTypeSyntax { get; }
+        internal bool IsUnsafe { get; }
+        /// <summary>The declaration holding the attribute lists, shared by all events of one field-like declaration</summary>
+        internal MemberDeclarationSyntax AttributeOwner { get; }
+        /// <summary>The declaring part of a partial event, the symbol itself comes from the implementing part</summary>
+        internal EventFieldDeclarationSyntax? PartialDefinition { get; set; }
+        public SourceEventSymbol(
+            string name,
+            Symbol containing,
+            TypeSyntax declaredTypeSyntax,
+            TypeSymbol placeholderType,
+            bool isStatic,
+            bool isUnsafe,
+            Accessibility declaredAccessibility,
+            SourceMethodSymbol addMethod,
+            SourceMethodSymbol removeMethod,
+            SynthesizedBackingFieldSymbol? backingField,
+            Location location,
+            SyntaxReference declarationRef,
+            MemberDeclarationSyntax attributeOwner)
+        {
+            Name = name;
+            ContainingSymbol = containing;
+            DeclaredTypeSyntax = declaredTypeSyntax;
+            _type = placeholderType;
+            IsStatic = isStatic;
+            IsUnsafe = isUnsafe;
+            DeclaredAccessibility = declaredAccessibility;
+            _addMethod = addMethod;
+            _removeMethod = removeMethod;
+            _backingField = backingField;
+            Locations = ImmutableArray.Create(location);
+            DeclaringSyntaxReferences = ImmutableArray.Create(declarationRef);
+            AttributeOwner = attributeOwner;
+        }
+        internal void SetType(TypeSymbol type)
+        {
+            _type = type;
+            _addMethod.Parameters[0].Type = type;
+            _removeMethod.Parameters[0].Type = type;
+            _backingField?.SetType(type);
+        }
+        internal void MarkExplicitInterfaceDeclaration()
+        {
+            _isExplicitDeclaration = true;
+            _addMethod.MarkExplicitInterfaceDeclaration();
+            _removeMethod.MarkExplicitInterfaceDeclaration();
+        }
+        internal void SetExplicitInterfaceImplementation(EventSymbol interfaceEvent)
+        {
+            _explicitInterfaceImplementation = interfaceEvent;
+            _addMethod.SetExplicitInterfaceImplementation(interfaceEvent.AddMethod);
+            _removeMethod.SetExplicitInterfaceImplementation(interfaceEvent.RemoveMethod);
+        }
+        // The method target of a field-like event applies to both accessors
+        internal void AddAttribute(AttributeData attribute)
+        {
+            if (attribute.Target == AttributeApplicationTarget.Method)
+            {
+                _addMethod.AddAttribute(attribute);
+                _removeMethod.AddAttribute(attribute);
+            }
+            else
+            {
+                _attributes.Add(attribute);
+            }
+        }
+        public override ImmutableArray<AttributeData> GetAttributes() => _attributes.ToImmutableArray();
+    }
+
+    /// <summary>Projects an event through its containing type substitutions</summary>
+    internal sealed class SubstitutedEventSymbol : EventSymbol
+    {
+        private readonly EventSymbol _original;
+        private readonly TypeManager _types;
+        private readonly ImmutableDictionary<TypeParameterSymbol, TypeSymbol> _map;
+        public override string Name => _original.Name;
+        public override Symbol? ContainingSymbol { get; }
+        public override ImmutableArray<Location> Locations => _original.Locations;
+        public override ImmutableArray<SyntaxReference> DeclaringSyntaxReferences => _original.DeclaringSyntaxReferences;
+        public override Accessibility DeclaredAccessibility => _original.DeclaredAccessibility;
+        public override bool IsFromMetadata => _original.IsFromMetadata;
+        public override TypeSymbol Type { get; }
+        public override bool IsStatic => _original.IsStatic;
+        public override MethodSymbol AddMethod { get; }
+        public override MethodSymbol RemoveMethod { get; }
+        public override FieldSymbol? BackingFieldOpt { get; }
+        public override bool IsExplicitInterfaceImplementation => _original.IsExplicitInterfaceImplementation;
+        public override EventSymbol? ExplicitInterfaceImplementation
+            => _original.ExplicitInterfaceImplementation is EventSymbol implemented && implemented.ContainingSymbol is NamedTypeSymbol owner
+                ? new SubstitutedEventSymbol(implemented, (NamedTypeSymbol)TypeSubstituter.Substitute(owner, _types, _map), _types, _map)
+                : null;
+        public override ImmutableArray<AttributeData> GetAttributes() => _original.GetAttributes();
+        public SubstitutedEventSymbol(
+            EventSymbol original,
+            NamedTypeSymbol containing,
+            TypeManager types,
+            ImmutableDictionary<TypeParameterSymbol, TypeSymbol> map)
+        {
+            _original = original;
+            _types = types;
+            _map = map;
+            ContainingSymbol = containing;
+            Type = TypeSubstituter.Substitute(original.Type, types, map);
+            AddMethod = new SubstitutedMethodSymbol(original.AddMethod, containing, types, map);
+            RemoveMethod = new SubstitutedMethodSymbol(original.RemoveMethod, containing, types, map);
+            if (original.BackingFieldOpt is FieldSymbol backingField)
+                BackingFieldOpt = new SubstitutedFieldSymbol(backingField, containing, types, map);
+        }
+    }
+
+    /// <summary>Represents an event read from metadata</summary>
+    internal sealed class ExternalEventSymbol : EventSymbol
+    {
+        private readonly List<AttributeData> _attributes = new();
+        public override string Name { get; }
+        public override Symbol? ContainingSymbol { get; }
+        public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
+        public override Accessibility DeclaredAccessibility { get; }
+        public override bool IsFromMetadata => true;
+        public override TypeSymbol Type { get; }
+        public override bool IsStatic { get; }
+        public override MethodSymbol AddMethod { get; }
+        public override MethodSymbol RemoveMethod { get; }
+        public ExternalEventSymbol(
+            string name,
+            Symbol containing,
+            TypeSymbol type,
+            bool isStatic,
+            Accessibility declaredAccessibility,
+            MethodSymbol addMethod,
+            MethodSymbol removeMethod)
+        {
+            Name = name;
+            ContainingSymbol = containing;
+            Type = type;
+            IsStatic = isStatic;
+            DeclaredAccessibility = declaredAccessibility;
+            AddMethod = addMethod;
+            RemoveMethod = removeMethod;
+        }
+        private EventSymbol? _explicitInterfaceImplementation;
+        public override EventSymbol? ExplicitInterfaceImplementation => _explicitInterfaceImplementation;
+        internal void SetExplicitInterfaceImplementation(EventSymbol interfaceEvent) => _explicitInterfaceImplementation = interfaceEvent;
+        public override ImmutableArray<AttributeData> GetAttributes() => _attributes.ToImmutableArray();
+        internal void AddAttribute(AttributeData attribute) => _attributes.Add(attribute);
+    }
+
     internal enum ExtensionMemberKind : byte
     {
         Method,
@@ -1299,6 +1549,7 @@ namespace Cnidaria.Cs
         public override bool IsReadOnly { get; }
         public override Optional<object> ConstantValueOpt => Optional<object>.None;
         public override TypeSymbol Type => _type;
+        public override Accessibility DeclaredAccessibility => Accessibility.Private;
 
         public SynthesizedBackingFieldSymbol(
             string name,
@@ -1674,16 +1925,47 @@ namespace Cnidaria.Cs
 
         internal void AddAttribute(AttributeData a) => _attributes.Add(a);
     }
+    internal sealed class PrimaryConstructorInfo
+    {
+        internal SourceNamedTypeSymbol Type { get; }
+        internal SyntaxTree Tree { get; }
+        internal TypeDeclarationSyntax Syntax { get; }
+        internal SourceMethodSymbol Constructor { get; }
+        internal Dictionary<ParameterSymbol, SynthesizedBackingFieldSymbol> Captures { get; } = new();
+        internal BoundMethodBody? Body { get; set; }
+
+        internal PrimaryConstructorInfo(SourceNamedTypeSymbol type, SyntaxTree tree, TypeDeclarationSyntax syntax, SourceMethodSymbol constructor)
+        {
+            Type = type;
+            Tree = tree;
+            Syntax = syntax;
+            Constructor = constructor;
+        }
+
+        internal SynthesizedBackingFieldSymbol Capture(ParameterSymbol parameter)
+        {
+            if (!Captures.TryGetValue(parameter, out SynthesizedBackingFieldSymbol? field))
+            {
+                field = new SynthesizedBackingFieldSymbol($"<{parameter.Name}>P", Type, parameter.Type, false, Type.IsReadOnlyStruct);
+                Captures.Add(parameter, field);
+                Type.AddMember(field);
+            }
+            return field;
+        }
+    }
+
     /// <summary>Represents a named type declared in source</summary>
     internal sealed class SourceNamedTypeSymbol : NamedTypeSymbol
     {
         internal RecordTypeInfo? RecordInfo { get; set; }
+        internal PrimaryConstructorInfo? PrimaryConstructorInfo { get; set; }
+        internal MethodSymbol? PrimaryConstructor => PrimaryConstructorInfo?.Constructor ?? RecordInfo?.PrimaryConstructor;
         public override bool IsRecord => RecordInfo is not null || (IsFromMetadata && base.IsRecord);
         private bool _isSealed;
         private bool _isAbstract;
         private bool _isUnsafe;
         private readonly bool _isReadOnlyStruct;
-        private readonly bool _isRefLikeType;
+        private bool _isRefLikeType;
         private readonly int _arity;
         private readonly List<SyntaxReference> _declRefs = new();
         private readonly List<Location> _locations = new();
@@ -1710,6 +1992,7 @@ namespace Cnidaria.Cs
         public override bool IsAbstract => _isAbstract;
         internal bool IsUnsafe => _isUnsafe;
         public override bool IsRefLikeType => _isRefLikeType;
+        internal void MarkRefLike() => _isRefLikeType = true;
         public override bool IsReadOnlyStruct => _isReadOnlyStruct;
         public override int Arity => _arity;
         public override Accessibility DeclaredAccessibility { get; }
@@ -1981,8 +2264,9 @@ namespace Cnidaria.Cs
         public override Accessibility DeclaredAccessibility { get; }
         public override bool IsStatic { get; }
         public override bool IsConstructor { get; }
-        public override bool IsAsync { get; }
+        public override bool IsAsync => _isAsync;
         public override bool IsExtern { get; }
+        private bool _isAsync;
         private bool _isVirtual;
         private bool _isAbstract;
         private bool _isOverride;
@@ -2023,7 +2307,7 @@ namespace Cnidaria.Cs
             _typeParameters = typeParameters;
             IsStatic = isStatic;
             IsConstructor = isConstructor;
-            IsAsync = isAsync;
+            _isAsync = isAsync;
             IsExtern = isExtern;
             _isExtensionMethod = isExtensionMethod;
             IsUnsafe = isUnsafe;
@@ -2057,11 +2341,21 @@ namespace Cnidaria.Cs
             => (_implicitStaticInterfaceImplementations ??= new List<MethodSymbol>()).Add(interfaceMethod);
         internal void SetAssociatedProperty(SourcePropertySymbol property)
             => AssociatedProperty ??= property ?? throw new ArgumentNullException(nameof(property));
+        internal bool IsEventAccessor { get; private set; }
+        public override bool IsSpecialName => IsEventAccessor || base.IsSpecialName;
+        internal void MarkEventAccessor() => IsEventAccessor = true;
         internal void SetTypeParameters(ImmutableArray<TypeParameterSymbol> typeParameters)
         {
             if (!_typeParameters.IsDefault) throw new InvalidOperationException("TypeParameters already set.");
             _typeParameters = typeParameters;
         }
+        // The entry point of top-level statements turns async at its first await
+        internal void MarkTopLevelAsync(TypeSymbol taskType)
+        {
+            _isAsync = true;
+            SetReturnType(taskType);
+        }
+
         internal void SetReturnType(TypeSymbol type, bool returnsByRefReadonly = false)
         {
             _returnType = type;
@@ -2322,6 +2616,10 @@ namespace Cnidaria.Cs
                         b.Add(new SubstitutedPropertySymbol(ps, this, _types, SubstitutionMap));
                         break;
 
+                    case EventSymbol es:
+                        b.Add(new SubstitutedEventSymbol(es, this, _types, SubstitutionMap));
+                        break;
+
                     default:
                         b.Add(m);
                         break;
@@ -2375,10 +2673,14 @@ namespace Cnidaria.Cs
     internal sealed class SubstitutedPropertySymbol : PropertySymbol
     {
         private readonly PropertySymbol _original;
+        private readonly TypeManager _types;
+        private readonly ImmutableDictionary<TypeParameterSymbol, TypeSymbol> _map;
         private readonly TypeSymbol _type;
         private readonly MethodSymbol? _getMethod;
         private readonly MethodSymbol? _setMethod;
         private readonly ImmutableArray<ParameterSymbol> _parameters;
+        private PropertySymbol? _explicitInterfaceImplementation;
+        private bool _explicitInterfaceImplementationInitialized;
 
         public override string Name => _original.Name;
         public override Symbol? ContainingSymbol { get; }
@@ -2388,6 +2690,33 @@ namespace Cnidaria.Cs
         public override bool IsFromMetadata => _original.IsFromMetadata;
         public override TypeSymbol Type => _type;
         public override bool IsExplicitInterfaceImplementation => _original.IsExplicitInterfaceImplementation;
+        public override PropertySymbol? ExplicitInterfaceImplementation
+        {
+            get
+            {
+                if (_explicitInterfaceImplementationInitialized)
+                    return _explicitInterfaceImplementation;
+
+                _explicitInterfaceImplementationInitialized = true;
+
+                PropertySymbol? impl = _original.ExplicitInterfaceImplementation;
+                if (impl is null)
+                    return null;
+
+                if (impl.ContainingSymbol is NamedTypeSymbol owner)
+                {
+                    var substitutedOwner = (NamedTypeSymbol)TypeSubstituter.Substitute(owner, _types, _map);
+                    _explicitInterfaceImplementation =
+                        new SubstitutedPropertySymbol(impl, substitutedOwner, _types, _map);
+                }
+                else
+                {
+                    _explicitInterfaceImplementation = impl;
+                }
+
+                return _explicitInterfaceImplementation;
+            }
+        }
         public override bool IsStatic => _original.IsStatic;
         public override bool HasGet => _getMethod is not null;
         public override bool HasSet => _setMethod is not null;
@@ -2402,6 +2731,8 @@ namespace Cnidaria.Cs
             ImmutableDictionary<TypeParameterSymbol, TypeSymbol> map)
         {
             _original = original;
+            _types = types;
+            _map = map;
             ContainingSymbol = containing;
 
             _type = TypeSubstituter.Substitute(original.Type, types, map);
@@ -2677,6 +3008,7 @@ namespace Cnidaria.Cs
     internal sealed class SpecialNamedTypeSymbol : NamedTypeSymbol
     {
         private bool _isSealed;
+        internal bool IsUnsafe { get; private set; }
         public override string Name { get; }
         public override Symbol? ContainingSymbol { get; }
         public override ImmutableArray<Location> Locations => ImmutableArray<Location>.Empty;
@@ -2715,6 +3047,7 @@ namespace Cnidaria.Cs
             BaseType = baseType;
         }
         internal void MarkSealed() => _isSealed = true;
+        internal void MarkUnsafe() => IsUnsafe = true;
         internal void SetDeclaredInterfaces(ImmutableArray<TypeSymbol> interfaces) => _interfaces = interfaces;
         internal void SetDeclaredAccessibility(Accessibility accessibility) => _declaredAccessibility = accessibility;
         internal void AddMember(Symbol member)

@@ -326,7 +326,7 @@ internal static class InlineAsmConstraints
 
         for (var i = 0; i < clobbers.Length; i++)
         {
-            if (string.Equals(clobbers[i], value, StringComparison.Ordinal))
+            if (clobbers[i] == value)
                 return true;
         }
 

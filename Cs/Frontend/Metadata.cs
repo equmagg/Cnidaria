@@ -39,6 +39,7 @@ namespace Cnidaria.Cs
         public const int Constant = 0x0B000000;
         public const int CustomAttribute = 0x0C000000;
         public const int StandAloneSig = 0x11000000;
+        public const int EventDef = 0x14000000;
         public const int PropertyDef = 0x17000000;
         public const int ModuleRef = 0x1A000000;
         public const int TypeSpec = 0x1B000000;
@@ -78,6 +79,7 @@ namespace Cnidaria.Cs
         ClassLayout,
         FieldRva,
         StandAloneSig,
+        Event,
     }
 
     internal sealed class MetadataBuffer
@@ -157,8 +159,11 @@ namespace Cnidaria.Cs
         public List<ConstantRow> Constants { get; } = new();
         public List<PropertyRow> Properties { get; } = new();
         public List<PropertyMapRow> PropertyMaps { get; } = new();
+        public List<EventRow> Events { get; } = new();
+        public List<EventMapRow> EventMaps { get; } = new();
         public List<CustomAttributeRow> CustomAttributes { get; } = new();
         public List<PInvokeMapRow> PInvokeMaps { get; } = new();
+        public List<FieldMarshalRow> FieldMarshals { get; } = new();
         public List<ModuleRefRow> ModuleRefs { get; } = new();
         public List<GenericParamRow> GenericParams { get; } = new();
         public List<GenericParamConstraintRow> GenericParamConstraints { get; } = new();
@@ -349,6 +354,17 @@ namespace Cnidaria.Cs
             ImportScope = importScope;
         }
     }
+    public struct FieldMarshalRow
+    {
+        public int ParentToken;
+        public int NativeType; // #Blob
+
+        public FieldMarshalRow(int parentToken, int nativeType)
+        {
+            ParentToken = parentToken;
+            NativeType = nativeType;
+        }
+    }
     public struct FieldRow
     {
         public ushort Flags;
@@ -429,6 +445,32 @@ namespace Cnidaria.Cs
         {
             ParentTypeDefRid = parentTypeDefRid;
             PropertyList = propertyList;
+        }
+    }
+    public struct EventRow
+    {
+        public ushort Flags;
+        public int Name;        // #Strings
+        public int EventType;   // TypeDefOrRef token
+        public int AddMethod;   // MethodDef token from MethodSemantics
+        public int RemoveMethod;// MethodDef token from MethodSemantics
+        public EventRow(ushort flags, int name, int eventType, int addMethod, int removeMethod)
+        {
+            Flags = flags;
+            Name = name;
+            EventType = eventType;
+            AddMethod = addMethod;
+            RemoveMethod = removeMethod;
+        }
+    }
+    public struct EventMapRow
+    {
+        public int ParentTypeDefRid;
+        public int EventList;
+        public EventMapRow(int parentTypeDefRid, int eventList)
+        {
+            ParentTypeDefRid = parentTypeDefRid;
+            EventList = eventList;
         }
     }
     public struct MemberRefRow
@@ -695,6 +737,7 @@ namespace Cnidaria.Cs
         private const ushort ParamAttrOut = 0x0002;
         private const ushort ParamAttrOptional = 0x0010;
         private const ushort ParamAttrHasDefault = 0x1000;
+        private const ushort ParamAttrHasFieldMarshal = 0x2000;
         public MetadataImage Image { get; }
 
         private readonly Dictionary<TypeSymbol, int> _typeDefTokens
@@ -703,6 +746,8 @@ namespace Cnidaria.Cs
             = new(ReferenceEqualityComparer<FieldSymbol>.Instance);
         private readonly Dictionary<PropertySymbol, int> _propertyDefTokens
             = new(ReferenceEqualityComparer<PropertySymbol>.Instance);
+        private readonly Dictionary<EventSymbol, int> _eventDefTokens
+            = new(ReferenceEqualityComparer<EventSymbol>.Instance);
         private readonly Dictionary<MethodSymbol, int> _methodDefTokens
             = new(ReferenceEqualityComparer<MethodSymbol>.Instance);
 
@@ -715,6 +760,8 @@ namespace Cnidaria.Cs
         private readonly Dictionary<Symbol, int> _memberRefTokens
             = new(ReferenceEqualityComparer<Symbol>.Instance);
         private readonly Dictionary<(int MethodToken, int InstBlob), int> _methodSpecTokens = new();
+        // The state machine whose signatures are being written, only there the type parameters of its method encode as class parameters
+        private NamedTypeSymbol? _stateMachineScope;
 
         private readonly Func<NamedTypeSymbol, string?>? _externalAssemblyResolver;
         private readonly Dictionary<string, int> _assemblyRefTokenByName = new(StringComparer.Ordinal);
@@ -778,7 +825,11 @@ namespace Cnidaria.Cs
                 Image.TypeDefs.Add(default); // placeholder row
             }
             for (int i = 0; i < _allTypes.Length; i++)
+            {
+                _stateMachineScope = AsStateMachine(_allTypes[i]);
                 FillTypeDefAndMembers(_allTypes[i]);
+            }
+            _stateMachineScope = null;
             if (staticData is not null && staticData.Count != 0)
                 EmitStaticDataFields(staticData);
         }
@@ -864,6 +915,15 @@ namespace Cnidaria.Cs
                 hash = (hash ^ b) * 0x100000001B3ul;
             return hash.ToString("X16", System.Globalization.CultureInfo.InvariantCulture) + "_" + data.Length.ToString(System.Globalization.CultureInfo.InvariantCulture);
         }
+        public void BeginMethodBody(MethodSymbol method)
+            => _stateMachineScope = GetDeclaringType(method) is NamedTypeSymbol type ? AsStateMachine(type) : null;
+
+        private static NamedTypeSymbol? AsStateMachine(NamedTypeSymbol type)
+        {
+            NamedTypeSymbol definition = type.OriginalDefinition;
+            return !definition.TypeParameters.IsDefaultOrEmpty && definition.TypeParameters[0].ContainingSymbol is MethodSymbol ? definition : null;
+        }
+
         public void Finish()
         {
             if (_finished)
@@ -875,6 +935,7 @@ namespace Cnidaria.Cs
 
             StableSort(Image.Constants, static row => EcmaCodedIndex.EncodeHasConstant(row.ParentToken));
             StableSort(Image.CustomAttributes, static row => EcmaCodedIndex.EncodeHasCustomAttribute(row.ParentToken));
+            StableSort(Image.FieldMarshals, static row => EcmaCodedIndex.EncodeHasFieldMarshal(row.ParentToken));
         }
         private static void StableSort<T>(List<T> rows, Func<T, uint> key)
         {
@@ -896,7 +957,19 @@ namespace Cnidaria.Cs
 
             if (p.HasExplicitDefault)
                 flags |= (ushort)(ParamAttrOptional | ParamAttrHasDefault);
+            if (HasMarshalAs(p.GetAttributes()))
+                flags |= ParamAttrHasFieldMarshal;
             return flags;
+        }
+        private static bool HasMarshalAs(ImmutableArray<AttributeData> attributes)
+        {
+            foreach (AttributeData attribute in attributes)
+            {
+                if (MethodAttributeFacts.TryGetMarshalAsType(attribute, out _))
+                    return true;
+            }
+
+            return false;
         }
         private static System.Reflection.FieldAttributes MapFieldAccessibility(Accessibility a) => a switch
         {
@@ -955,7 +1028,7 @@ namespace Cnidaria.Cs
             }
 
             if (_systemObject.ContainingSymbol is NamespaceSymbol ns &&
-                string.Equals(ns.Name, "System", StringComparison.Ordinal))
+                ns.Name == "System")
             {
                 return _sysNsCache = ns;
             }
@@ -967,7 +1040,7 @@ namespace Cnidaria.Cs
             var nss = root.GetNamespaceMembers();
             for (int i = 0; i < nss.Length; i++)
             {
-                if (string.Equals(nss[i].Name, "System", StringComparison.Ordinal))
+                if (nss[i].Name == "System")
                 {
                     systemNamespace = nss[i];
                     return true;
@@ -1004,7 +1077,7 @@ namespace Cnidaria.Cs
                     return false;
                 }
             }
-            else if (string.Equals(rootOrSystem.Name, "System", StringComparison.Ordinal))
+            else if (rootOrSystem.Name == "System")
             {
                 systemNamespace = rootOrSystem;
             }
@@ -1404,6 +1477,8 @@ namespace Cnidaria.Cs
                         flags |= System.Reflection.FieldAttributes.Literal;
                     if (TryAddFieldConstant(f, fieldDefToken))
                         flags |= System.Reflection.FieldAttributes.HasDefault;
+                    if (HasMarshalAs(f.GetAttributes()))
+                        flags |= System.Reflection.FieldAttributes.HasFieldMarshal;
 
                     Image.Fields.Add(new FieldRow(flags: (ushort)flags, name: fNameIdx, signature: sigIdx));
                 }
@@ -1482,7 +1557,8 @@ namespace Cnidaria.Cs
                     var flags = System.Reflection.MethodAttributes.Private | System.Reflection.MethodAttributes.HideBySig;
                     if (m.IsStatic)
                         flags |= System.Reflection.MethodAttributes.Static;
-                    Image.Methods.Add(new MethodDefRow(0, 0, (ushort)flags, nameIndex, signature, paramList));
+                    ushort implFlags = m.IsAsync ? MetadataFlagBits.Async : (ushort)0;
+                    Image.Methods.Add(new MethodDefRow(0, implFlags, (ushort)flags, nameIndex, signature, paramList));
                 }
             }
 
@@ -1510,6 +1586,20 @@ namespace Cnidaria.Cs
             }
             if (Image.Properties.Count >= propertyListRid)
                 Image.PropertyMaps.Add(new PropertyMapRow(typeDefRid, propertyListRid));
+
+            int eventListRid = Image.Events.Count + 1;
+            for (int i = 0; i < members.Length; i++)
+            {
+                if (members[i] is EventSymbol declaredEvent &&
+                    _methodDefTokens.TryGetValue(declaredEvent.AddMethod, out int addToken) &&
+                    _methodDefTokens.TryGetValue(declaredEvent.RemoveMethod, out int removeToken))
+                {
+                    _eventDefTokens[declaredEvent] = MetadataToken.Make(MetadataToken.EventDef, Image.Events.Count + 1);
+                    Image.Events.Add(new EventRow(0, Image.Strings.Add(GetMetadataEventName(declaredEvent)), GetTypeToken(declaredEvent.Type), addToken, removeToken));
+                }
+            }
+            if (Image.Events.Count >= eventListRid)
+                Image.EventMaps.Add(new EventMapRow(typeDefRid, eventListRid));
 
             var typeFlags = (System.Reflection.TypeAttributes)MapTypeVisibility(type);
             switch (type.TypeKind)
@@ -1566,7 +1656,7 @@ namespace Cnidaria.Cs
             if (HasReturnValueAttributes(method) || GetTupleElementNames(method.ReturnType) is not null)
             {
                 _returnParamTokens[method] = MetadataToken.Make(MetadataToken.ParamDef, Image.Params.Count + 1);
-                Image.Params.Add(new ParamRow(flags: 0, sequence: 0, name: 0));
+                Image.Params.Add(new ParamRow(flags: HasMarshalAs(method.GetAttributes()) ? ParamAttrHasFieldMarshal : (ushort)0, sequence: 0, name: 0));
             }
 
             var ps = method.Parameters;
@@ -1672,6 +1762,11 @@ namespace Cnidaria.Cs
         }
         private static string GetMetadataMemberName(MethodSymbol method)
             => method.IsConstructor ? (method.IsStatic ? ".cctor" : ".ctor") : method.Name;
+
+        private static string GetMetadataEventName(EventSymbol declaredEvent)
+            => declaredEvent.ExplicitInterfaceImplementation is EventSymbol interfaceEvent && interfaceEvent.ContainingSymbol is NamedTypeSymbol interfaceType
+                ? BuildTypeMetadataQualification(interfaceType) + "." + interfaceEvent.Name
+                : declaredEvent.Name;
 
         private static string GetMetadataPropertyName(PropertySymbol property)
         {
@@ -1891,31 +1986,36 @@ namespace Cnidaria.Cs
         }
         private int GetOrAddTypeSpec(TypeSymbol type)
         {
-            if (_typeSpecTokens.TryGetValue(type, out var tok))
-                return tok;
+            // One symbol encodes differently inside a state machine, so there only the blob identifies the row
+            if (_stateMachineScope is null && _typeSpecTokens.TryGetValue(type, out int cached))
+                return cached;
 
             var w = new SigWriter();
             WriteTypeSig(w, type);
             int blobIdx = Image.Blob.Add(w.ToArray());
 
-            if (!_typeSpecTokensByBlob.TryGetValue(blobIdx, out tok))
+            if (!_typeSpecTokensByBlob.TryGetValue(blobIdx, out int tok))
             {
                 Image.TypeSpecs.Add(new TypeSpecRow(blobIdx));
                 tok = MetadataToken.Make(MetadataToken.TypeSpec, Image.TypeSpecs.Count);
                 _typeSpecTokensByBlob.Add(blobIdx, tok);
             }
-            _typeSpecTokens.Add(type, tok);
+            if (_stateMachineScope is null)
+                _typeSpecTokens.Add(type, tok);
             return tok;
         }
         private int GetOrAddMemberRef(Symbol member)
         {
-            if (_memberRefTokens.TryGetValue(member, out var tok))
-                return tok;
+            NamedTypeSymbol? scope = _stateMachineScope;
+            if (scope is null && _memberRefTokens.TryGetValue(member, out int cached))
+                return cached;
 
             if (GetDeclaringType(member) is not NamedTypeSymbol declaringType)
                 throw new NotSupportedException("MemberRef for members without declaring NamedTypeSymbol is not supported.");
 
             int classTok = GetTypeToken(declaringType);
+            // The class is named from where the reference is, the signature always in terms of the declaring type
+            _stateMachineScope = AsStateMachine(declaringType);
             int nameIdx;
             int sigIdx;
             switch (member)
@@ -1932,9 +2032,11 @@ namespace Cnidaria.Cs
                 default:
                     throw new NotSupportedException("MemberRef supports only MethodSymbol/FieldSymbol.");
             }
+            _stateMachineScope = scope;
 
-            tok = GetOrAddMemberRefRow(classTok, nameIdx, sigIdx);
-            _memberRefTokens.Add(member, tok);
+            int tok = GetOrAddMemberRefRow(classTok, nameIdx, sigIdx);
+            if (scope is null)
+                _memberRefTokens.Add(member, tok);
             return tok;
         }
         private int GetOrAddMemberRefRow(int classTok, int nameIdx, int sigIdx)
@@ -2048,6 +2150,12 @@ namespace Cnidaria.Cs
                     w.CompressedUInt(0); // numlobounds
                     return;
                 case TypeParameterSymbol tp:
+                    if (_stateMachineScope is NamedTypeSymbol stateMachine && stateMachine.TypeParameters.IndexOf(tp) is int ordinal and >= 0)
+                    {
+                        w.Byte((byte)SigElementType.VAR);
+                        w.CompressedUInt((uint)(GetTypeParametersInMetadataOrder(stateMachine).Length - stateMachine.TypeParameters.Length + ordinal));
+                        return;
+                    }
                     w.Byte((byte)(tp.ContainingSymbol is NamedTypeSymbol ? SigElementType.VAR : SigElementType.MVAR));
                     w.CompressedUInt((uint)GetMetadataTypeParameterIndex(tp));
                     return;
@@ -2205,7 +2313,7 @@ namespace Cnidaria.Cs
             owners.Sort(static (a, b) => a.Coded.CompareTo(b.Coded));
 
             var rids = new Dictionary<TypeParameterSymbol, int>(ReferenceEqualityComparer<TypeParameterSymbol>.Instance);
-            var declared = new List<(int Rid, TypeParameterSymbol Parameter)>();
+            var declared = new List<(int Rid, TypeParameterSymbol Parameter, Symbol Owner)>();
             foreach (var owner in owners)
             {
                 for (int i = 0; i < owner.Parameters.Length; i++)
@@ -2213,13 +2321,14 @@ namespace Cnidaria.Cs
                     var tp = owner.Parameters[i];
                     Image.GenericParams.Add(new GenericParamRow((ushort)i, MapGenericParamFlags(tp), owner.OwnerToken, Image.Strings.Add(tp.Name)));
                     int rid = Image.GenericParams.Count;
-                    declared.Add((rid, tp));
+                    declared.Add((rid, tp, owner.Owner));
                     if (ReferenceEquals(tp.ContainingSymbol, owner.Owner))
                         rids.TryAdd(tp, rid);
                 }
             }
-            foreach (var (rid, tp) in declared)
+            foreach ((int rid, TypeParameterSymbol tp, Symbol owner) in declared)
             {
+                _stateMachineScope = owner is NamedTypeSymbol ownerType ? AsStateMachine(ownerType) : null;
                 if ((tp.GenericConstraint & GenericConstraintsFlags.StructConstraint) != 0 &&
                     FindCoreType("System", "ValueType") is { } valueType)
                 {
@@ -2234,11 +2343,12 @@ namespace Cnidaria.Cs
                     Image.GenericParamConstraints.Add(new GenericParamConstraintRow(rid, encoded));
                 }
             }
+            _stateMachineScope = null;
             return rids;
         }
         private static ushort MapGenericParamFlags(TypeParameterSymbol tp)
         {
-            var flags = System.Reflection.GenericParameterAttributes.None;
+            var flags = (System.Reflection.GenericParameterAttributes)tp.Variance;
             var constraint = tp.GenericConstraint;
             if ((constraint & GenericConstraintsFlags.ClassConstraint) != 0)
                 flags |= System.Reflection.GenericParameterAttributes.ReferenceTypeConstraint;
@@ -2367,6 +2477,11 @@ namespace Cnidaria.Cs
                         case PropertySymbol p when _propertyDefTokens.TryGetValue(p, out var ptok):
                             EmitAttributes(ptok, p.GetAttributes());
                             EmitTupleElementNames(ptok, p.Type);
+                            break;
+
+                        case EventSymbol declaredEvent when _eventDefTokens.TryGetValue(declaredEvent, out int eventToken):
+                            EmitAttributes(eventToken, declaredEvent.GetAttributes());
+                            EmitTupleElementNames(eventToken, declaredEvent.Type);
                             break;
                     }
                 }
@@ -2537,8 +2652,91 @@ namespace Cnidaria.Cs
         }
         private void EmitAttribute(int parentToken, AttributeData attribute)
         {
+            if (MethodAttributeFacts.TryGetMarshalAsType(attribute, out int unmanagedType))
+            {
+                Image.FieldMarshals.Add(new FieldMarshalRow(parentToken, BuildMarshalDescriptor(attribute, unmanagedType)));
+                return;
+            }
+
             int ctorToken = GetMethodToken(attribute.Constructor);
             Image.CustomAttributes.Add(new CustomAttributeRow(parentToken, ctorToken, BuildCustomAttributeBlob(attribute)));
+        }
+        // The native type blob of ECMA-335 II.23.4, with the extra data each UnmanagedType takes
+        private int BuildMarshalDescriptor(AttributeData attribute, int unmanagedType)
+        {
+            const int IUnknown = 0x19, IDispatch = 0x1A, Interface = 0x1C, ByValTStr = 0x17, SafeArray = 0x1D, ByValArray = 0x1E, LPArray = 0x2A, CustomMarshaler = 0x2C;
+            const uint NoElementType = 0x50;
+
+            object? Named(string name)
+            {
+                foreach (AttributeNamedArgumentData argument in attribute.NamedArguments)
+                {
+                    if (argument.Name == name)
+                        return argument.Value.Value;
+                }
+
+                return null;
+            }
+
+            uint? NamedNumber(string name) => Named(name) is object value ? (uint)Convert.ToInt32(value) : null;
+            string TypeName(string name) => Named(name) is TypeSymbol type ? FormatSerializedTypeName(type) : "";
+
+            var w = new MetadataBuffer(16);
+            w.WriteCompressedUInt((uint)unmanagedType);
+            uint? size = NamedNumber("SizeConst");
+            switch (unmanagedType)
+            {
+                case ByValTStr:
+                    w.WriteCompressedUInt(size ?? 1);
+                    break;
+                case ByValArray:
+                    w.WriteCompressedUInt(size ?? 1);
+                    if (NamedNumber("ArraySubType") is uint fixedElement)
+                        w.WriteCompressedUInt(fixedElement);
+                    break;
+                case LPArray:
+                    w.WriteCompressedUInt(NamedNumber("ArraySubType") ?? NoElementType);
+                    if (NamedNumber("SizeParamIndex") is uint sizeParameter)
+                    {
+                        w.WriteCompressedUInt(sizeParameter);
+                        if (size is not null)
+                        {
+                            w.WriteCompressedUInt(size.Value);
+                            w.WriteByte(1);
+                        }
+                    }
+                    else if (size is not null)
+                    {
+                        // A placeholder keeps the size at its known position, the last byte says it stands for nothing
+                        w.WriteByte(0);
+                        w.WriteCompressedUInt(size.Value);
+                        w.WriteByte(0);
+                    }
+                    break;
+                case SafeArray:
+                    if (NamedNumber("SafeArraySubType") is uint safeElement)
+                    {
+                        w.WriteCompressedUInt(safeElement);
+                        string subType = TypeName("SafeArrayUserDefinedSubType");
+                        if (subType.Length != 0)
+                            CustomAttributeBlob.WriteSerString(w, subType);
+                    }
+                    break;
+                case CustomMarshaler:
+                    w.WriteUInt16(0);
+                    string marshalTypeRef = TypeName("MarshalTypeRef");
+                    CustomAttributeBlob.WriteSerString(w, marshalTypeRef.Length != 0 ? marshalTypeRef : Named("MarshalType") as string ?? "");
+                    CustomAttributeBlob.WriteSerString(w, Named("MarshalCookie") as string ?? "");
+                    break;
+                case Interface:
+                case IDispatch:
+                case IUnknown:
+                    if (NamedNumber("IidParameterIndex") is uint iidParameter)
+                        w.WriteCompressedUInt(iidParameter);
+                    break;
+            }
+
+            return Image.Blob.Add(w.Span);
         }
         private static ReadOnlySpan<byte> EmptyCustomAttributeBlob => new byte[] { 0x01, 0x00, 0x00, 0x00 };
         private int BuildCustomAttributeBlob(AttributeData attr)

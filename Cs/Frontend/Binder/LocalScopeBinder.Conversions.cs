@@ -99,10 +99,10 @@ namespace Cnidaria.Cs
                 if (m.ReturnType.SpecialType == SpecialType.System_Void)
                     continue;
 
-                bool opIsImplicit = string.Equals(m.Name, $"{OperatorPrefix}Implicit", StringComparison.Ordinal);
+                bool opIsImplicit = m.Name == $"{OperatorPrefix}Implicit";
                 bool opIsExplicit =
-                    string.Equals(m.Name, $"{OperatorPrefix}Explicit", StringComparison.Ordinal) ||
-                    string.Equals(m.Name, $"{OperatorPrefix}CheckedExplicit", StringComparison.Ordinal);
+                    m.Name == $"{OperatorPrefix}Explicit" ||
+                    m.Name == $"{OperatorPrefix}CheckedExplicit";
 
                 if (!opIsImplicit && !opIsExplicit)
                     continue;
@@ -124,7 +124,7 @@ namespace Cnidaria.Cs
                 score += overallImplicit ? 0 : 10; // Prefer implicit applicability
 
                 if (IsCheckedOverflowContext &&
-                    string.Equals(m.Name, $"{OperatorPrefix}CheckedExplicit", StringComparison.Ordinal))
+                    m.Name == $"{OperatorPrefix}CheckedExplicit")
                 {
                     score -= 1; // Prefer checked explicit operators in checked contexts
                 }
@@ -261,6 +261,11 @@ namespace Cnidaria.Cs
                     return false;
             }
         }
+        private static bool IsPointerSizedOrIntegral(TypeSymbol type)
+            => IsIntegral(type.SpecialType) ||
+               type.SpecialType == SpecialType.System_IntPtr ||
+               type.SpecialType == SpecialType.System_UIntPtr;
+
         private static bool HasImplicitFunctionPointerConversion(
             FunctionPointerTypeSymbol source,
             FunctionPointerTypeSymbol destination)
@@ -428,6 +433,10 @@ namespace Cnidaria.Cs
                     ? ConversionKind.ImplicitNumeric
                     : ConversionKind.ExplicitNumeric);
             }
+            if (target is FunctionPointerTypeSymbol && IsPointerSizedOrIntegral(expr.Type))
+                return new Conversion(ConversionKind.ExplicitNumeric);
+            if (expr.Type is FunctionPointerTypeSymbol && IsPointerSizedOrIntegral(target))
+                return new Conversion(ConversionKind.ExplicitNumeric);
             if (expr.Type is FunctionPointerTypeSymbol || target is FunctionPointerTypeSymbol)
                 return new Conversion(ConversionKind.None);
 
@@ -475,7 +484,8 @@ namespace Cnidaria.Cs
                 if (expr.Type.SpecialType is SpecialType.System_Object
                     or SpecialType.System_ValueType
                     or SpecialType.System_Enum
-                    || IsInterfaceType(expr.Type))
+                    || IsInterfaceType(expr.Type)
+                    || (expr.Type.IsReferenceType && GenericConstraintFacts.SatisfiesTypeConstraint(targetTp, expr.Type)))
                 {
                     return new Conversion(ConversionKind.Unboxing);
                 }
@@ -722,15 +732,16 @@ namespace Cnidaria.Cs
                 ? new Conversion(ConversionKind.Identity)
                 : new Conversion(ConversionKind.None);
         }
-        private static bool ImplementsInterface(TypeSymbol source, TypeSymbol destinationInterface)
+        private static bool ImplementsInterface(TypeSymbol source, TypeSymbol destinationInterface, int varianceDepth = 0)
         {
             var seen = new HashSet<TypeSymbol>(ReferenceEqualityComparer<TypeSymbol>.Instance);
-            return ImplementsInterfaceCore(source, destinationInterface, seen);
+            return ImplementsInterfaceCore(source, destinationInterface, seen, varianceDepth);
 
             static bool ImplementsInterfaceCore(
                 TypeSymbol current,
                 TypeSymbol destinationInterface,
-                HashSet<TypeSymbol> seen)
+                HashSet<TypeSymbol> seen,
+                int varianceDepth)
             {
                 if (!seen.Add(current))
                     return false;
@@ -739,19 +750,91 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < interfaces.Length; i++)
                 {
                     var iface = interfaces[i];
-                    if (ReferenceEquals(iface, destinationInterface))
+                    if (ReferenceEquals(iface, destinationInterface) || IsVarianceConvertible(iface, destinationInterface, varianceDepth))
                         return true;
 
-                    if (ImplementsInterfaceCore(iface, destinationInterface, seen))
+                    if (ImplementsInterfaceCore(iface, destinationInterface, seen, varianceDepth))
                         return true;
                 }
 
                 if (current.BaseType is TypeSymbol bt)
-                    return ImplementsInterfaceCore(bt, destinationInterface, seen);
+                    return ImplementsInterfaceCore(bt, destinationInterface, seen, varianceDepth);
 
                 return false;
             }
         }
+
+        // Deeper than real types nest, a proof this long comes from a type that expands forever and does not convert
+        private const int MaxVarianceDepth = 50;
+
+        // C# 18.2.3.3
+        internal static bool IsVarianceConvertible(TypeSymbol source, TypeSymbol destination, int depth)
+        {
+            if (source is not NamedTypeSymbol from || destination is not NamedTypeSymbol to || !AreInstancesOfVariantType(from, to) || depth == MaxVarianceDepth)
+                return false;
+
+            ImmutableArray<TypeParameterSymbol> parameters = from.TypeParameters;
+            ImmutableArray<TypeSymbol> fromArguments = from.TypeArguments;
+            ImmutableArray<TypeSymbol> toArguments = to.TypeArguments;
+            for (int i = 0; i < parameters.Length; i++)
+            {
+                if (AreSameType(fromArguments[i], toArguments[i]))
+                    continue;
+
+                bool converts = parameters[i].Variance switch
+                {
+                    VarianceKind.Out => HasImplicitReferenceConversion(fromArguments[i], toArguments[i], depth + 1),
+                    VarianceKind.In => HasImplicitReferenceConversion(toArguments[i], fromArguments[i], depth + 1),
+                    _ => false,
+                };
+                if (!converts)
+                    return false;
+            }
+
+            return true;
+        }
+
+        // C# 10.3.5
+        private static bool IsExplicitDelegateVarianceConvertible(TypeSymbol source, TypeSymbol destination)
+        {
+            if (source is not NamedTypeSymbol from || destination is not NamedTypeSymbol to || from.TypeKind != TypeKind.Delegate || !AreInstancesOfVariantType(from, to))
+                return false;
+
+            ImmutableArray<TypeParameterSymbol> parameters = from.TypeParameters;
+            ImmutableArray<TypeSymbol> fromArguments = from.TypeArguments;
+            ImmutableArray<TypeSymbol> toArguments = to.TypeArguments;
+            for (int i = 0; i < parameters.Length; i++)
+            {
+                if (AreSameType(fromArguments[i], toArguments[i]))
+                    continue;
+
+                bool converts = parameters[i].Variance switch
+                {
+                    VarianceKind.Out => HasExplicitReferenceConversion(fromArguments[i], toArguments[i]),
+                    VarianceKind.In => fromArguments[i].IsReferenceType && toArguments[i].IsReferenceType,
+                    _ => false,
+                };
+                if (!converts)
+                    return false;
+            }
+
+            return true;
+        }
+
+        // The type arguments of a containing generic type are never variant
+        private static bool AreInstancesOfVariantType(NamedTypeSymbol left, NamedTypeSymbol right)
+            => left.TypeKind is TypeKind.Interface or TypeKind.Delegate &&
+               left.Arity != 0 &&
+               ReferenceEquals(left.OriginalDefinition, right.OriginalDefinition) &&
+               (left.ContainingSymbol is not NamedTypeSymbol leftContaining ||
+                (right.ContainingSymbol is NamedTypeSymbol rightContaining && AreSameType(leftContaining, rightContaining)));
+
+        // C# 10.2.8, a single-dimensional array also converts to the generic list interfaces of what its element converts to
+        internal static bool IsArrayListInterfaceConversion(TypeSymbol source, TypeSymbol destination, int varianceDepth)
+            => source is ArrayTypeSymbol array && array.IsSZArray &&
+               destination is NamedTypeSymbol list && list.Arity == 1 && IsArrayListInterface(list) &&
+               HasImplicitReferenceConversion(array.ElementType, list.TypeArguments[0], varianceDepth);
+
         private static bool IsInterfaceType(TypeSymbol t)
             => t is NamedTypeSymbol nt && nt.TypeKind == TypeKind.Interface;
         private static bool HasImplicitBoxingConversion(TypeSymbol source, TypeSymbol destination)
@@ -805,7 +888,7 @@ namespace Cnidaria.Cs
 
             return false;
         }
-        private static bool HasImplicitReferenceConversion(TypeSymbol source, TypeSymbol destination)
+        internal static bool HasImplicitReferenceConversion(TypeSymbol source, TypeSymbol destination, int varianceDepth = 0)
         {
             if (!source.IsReferenceType || !destination.IsReferenceType)
                 return false;
@@ -815,14 +898,17 @@ namespace Cnidaria.Cs
 
             // A reference-type type parameter converts to object and to what its constraints convert to (C# 10.2.12)
             if (source is TypeParameterSymbol typeParameter)
-                return GenericConstraintFacts.SatisfiesTypeConstraint(typeParameter, destination);
+                return GenericConstraintFacts.SatisfiesTypeConstraint(typeParameter, destination, varianceDepth);
 
             // Reference conversion to a base class
             if (IsBaseTypeOf(destination, source))
                 return true;
 
             // Reference conversion to an implemented interface
-            if (IsInterfaceType(destination) && ImplementsInterface(source, destination))
+            if (IsInterfaceType(destination) && ImplementsInterface(source, destination, varianceDepth))
+                return true;
+
+            if (IsVarianceConvertible(source, destination, varianceDepth) || IsArrayListInterfaceConversion(source, destination, varianceDepth))
                 return true;
 
             // Interface reference conversion to object
@@ -838,7 +924,7 @@ namespace Cnidaria.Cs
                 if (!srcArr.ElementType.IsReferenceType || !dstArr.ElementType.IsReferenceType)
                     return false;
 
-                return HasImplicitReferenceConversion(srcArr.ElementType, dstArr.ElementType);
+                return HasImplicitReferenceConversion(srcArr.ElementType, dstArr.ElementType, varianceDepth);
             }
 
             return false;
@@ -859,6 +945,9 @@ namespace Cnidaria.Cs
             if (IsBaseTypeOf(source, destination))
                 return true;
 
+            if (IsExplicitDelegateVarianceConvertible(source, destination))
+                return true;
+
             bool srcIface = IsInterfaceType(source);
             bool dstIface = IsInterfaceType(destination);
 
@@ -877,7 +966,7 @@ namespace Cnidaria.Cs
                 if (destination is NamedTypeSymbol ntDest)
                     return !ntDest.IsSealed || ImplementsInterface(ntDest, source);
 
-                return false;
+                return destination is ArrayTypeSymbol destinationArray && destinationArray.IsSZArray && IsArrayListInterface(source);
             }
 
             // Array covariance
@@ -894,15 +983,23 @@ namespace Cnidaria.Cs
 
             return false;
         }
+
+        // The interfaces a single-dimensional array can be cast from
+        private static bool IsArrayListInterface(TypeSymbol type)
+            => type is NamedTypeSymbol named &&
+               named.OriginalDefinition.Name is "IEnumerable" or "ICollection" or "IList" or "IReadOnlyCollection" or "IReadOnlyList" &&
+               named.ContainingSymbol is NamespaceSymbol containing &&
+               containing.Name is "Generic" or "Collections";
+
         private static bool TryGetSystemNullableInfo(TypeSymbol t, out NamedTypeSymbol nullableType, out TypeSymbol underlying)
         {
             if (t is NamedTypeSymbol nt && nt.IsValueType)
             {
                 var def = nt.OriginalDefinition;
                 if (def.Arity == 1
-                    && string.Equals(def.Name, "Nullable", StringComparison.Ordinal)
+                    && def.Name == "Nullable"
                     && def.ContainingSymbol is NamespaceSymbol ns
-                    && string.Equals(ns.Name, "System", StringComparison.Ordinal))
+                    && ns.Name == "System")
                 {
                     nullableType = nt;
                     underlying = nt.TypeArguments[0];

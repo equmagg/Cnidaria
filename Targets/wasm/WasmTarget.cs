@@ -2336,7 +2336,7 @@ internal sealed class WasmInstructionBuilder
     {
         for (int depth = 0; depth < _labels.Count; depth++)
         {
-            if (StringComparer.Ordinal.Equals(_labels[_labels.Count - 1 - depth], label))
+            if (_labels[_labels.Count - 1 - depth] == label)
                 return (uint)depth;
         }
         throw new InvalidOperationException($"No open block is labelled {label}");

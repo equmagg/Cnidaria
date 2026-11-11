@@ -327,8 +327,8 @@ public readonly struct ValueNumberKey : IEquatable<ValueNumberKey>
             MemoryInputId != other.MemoryInputId ||
             BlockOrdinal != other.BlockOrdinal ||
             Discriminator != other.Discriminator ||
-            !StringComparer.Ordinal.Equals(TypeKey, other.TypeKey) ||
-            !StringComparer.Ordinal.Equals(OperatorKey, other.OperatorKey) ||
+            TypeKey != other.TypeKey ||
+            OperatorKey != other.OperatorKey ||
             OperandIds.Length != other.OperandIds.Length)
         {
             return false;
@@ -1326,14 +1326,12 @@ internal sealed class ValueNumberingBuilder
     }
 
     private bool SameType(QualifiedType left, QualifiedType right)
-        => StringComparer.Ordinal.Equals(TypeKey(left), TypeKey(right));
+        => TypeKey(left) == TypeKey(right);
 
     // const and restrict spell the same representation, so a conversion dropping them is a copy
     private bool SameRepresentation(QualifiedType left, QualifiedType right)
         => !IsVolatileOrAtomic(left) && !IsVolatileOrAtomic(right) &&
-           StringComparer.Ordinal.Equals(
-               TypeKey(new QualifiedType(GimpleTypeHelpers.Normalize(left).Type)),
-               TypeKey(new QualifiedType(GimpleTypeHelpers.Normalize(right).Type)));
+           TypeKey(new QualifiedType(GimpleTypeHelpers.Normalize(left).Type)) == TypeKey(new QualifiedType(GimpleTypeHelpers.Normalize(right).Type));
 
     private static bool IsVolatileOrAtomic(QualifiedType type)
         => (GimpleTypeHelpers.Normalize(type).Qualifiers & (TypeQualifiers.Volatile | TypeQualifiers.Atomic)) != 0;

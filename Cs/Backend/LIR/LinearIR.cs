@@ -778,7 +778,7 @@ namespace Cnidaria.Cs
                 GenTreeKind.StoreIndirect => MultiRegisterStoreGeneralScratchCount(MultiRegisterOperandValue(source, 1), needsAddressScratch: true),
                 GenTreeKind.StoreField => MultiRegisterStoreGeneralScratchCount(MultiRegisterOperandValue(source, 1), needsAddressScratch: true),
                 GenTreeKind.StoreStaticField => MultiRegisterStoreGeneralScratchCount(MultiRegisterOperandValue(source, 0), needsAddressScratch: true) +
-                    BlockCopyScratchCount(source.Operands.Length == 0 ? null : source.Operands[0].RegisterResult ?? source.Operands[0]),
+                    StaticStoreValueScratchCount(source.Operands.Length == 0 ? null : source.Operands[0].RegisterResult ?? source.Operands[0]),
 
                 GenTreeKind.Box => MultiRegisterStoreGeneralScratchCount(MultiRegisterOperandValue(source, 0), needsAddressScratch: true),
 
@@ -1156,6 +1156,19 @@ namespace Cnidaria.Cs
                 return 0;
             var abi = MachineAbi.ClassifyStorageValue(value.Type, value.StackKind, _target);
             return abi.PassingKind is AbiValuePassingKind.Stack or AbiValuePassingKind.Indirect ? 1 : 0;
+        }
+
+        // An aggregate that fits one register can still be homed on the stack
+        private int StaticStoreValueScratchCount(GenTree? value)
+        {
+            if (value is null || IsMultiRegisterValue(value))
+                return BlockCopyScratchCount(value);
+
+            RuntimeType? type = value.RuntimeType ?? value.Type;
+            bool aggregate = value.StackKind == GenStackKind.Value ||
+                (type is not null && type.IsValueType && type.PrimitiveKind == RuntimePrimitiveKind.None && type.Kind != RuntimeTypeKind.Enum);
+
+            return aggregate ? 1 : BlockCopyScratchCount(value);
         }
 
         private bool IsMultiRegisterValue(GenTree? value)

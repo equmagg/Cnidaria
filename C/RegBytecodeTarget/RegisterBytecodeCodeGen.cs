@@ -458,7 +458,7 @@ public sealed class RegisterBytecodeCodeGenerator
         => function.IntrinsicKind == RuntimeIntrinsicKind.BuiltinVaStart
            || function.IntrinsicKind == RuntimeIntrinsicKind.CStringWrite
            || function.IntrinsicKind is RuntimeIntrinsicKind.StackAllocate or RuntimeIntrinsicKind.StackSave or RuntimeIntrinsicKind.StackRestore
-           || string.Equals(function.Name, StandardHeaders.PrintfIntrinsicName, StringComparison.Ordinal);
+           || function.Name == StandardHeaders.PrintfIntrinsicName;
 
     private int ResolveEntryMethodId(string entryFunctionName)
     {
@@ -2666,7 +2666,7 @@ public sealed class RegisterBytecodeCodeGenerator
                 return false;
 
             if (function.IntrinsicKind == RuntimeIntrinsicKind.CStringWrite
-                || string.Equals(function.Name, StandardHeaders.PrintfIntrinsicName, StringComparison.Ordinal))
+                || function.Name == StandardHeaders.PrintfIntrinsicName)
             {
                 methodId = PrintfMethodId;
                 isPrintf = true;
@@ -3451,6 +3451,12 @@ public sealed class RegisterBytecodeCodeGenerator
                     : wide ? (IsUnsignedInteger(leftType) ? Op.U64Shr : Op.I64Shr) : (IsUnsignedInteger(leftType) ? Op.U32Shr : Op.I32Shr);
             }
 
+            if (text is "rotl" or "rotr")
+            {
+                var wide = Is64BitInteger(leftType);
+                return text == "rotl" ? wide ? Op.I64Rol : Op.I32Rol : wide ? Op.I64Ror : Op.I32Ror;
+            }
+
             var is64 = Is64BitInteger(leftType) || Is64BitInteger(rightType) || (Is64BitInteger(resultType) && text is not "==" and not "!=" and not "<" and not "<=" and not ">" and not ">=");
             var unsigned = IsUnsignedInteger(leftType) || IsUnsignedInteger(rightType);
 
@@ -3656,7 +3662,7 @@ public sealed class RegisterBytecodeCodeGenerator
         }
 
         private static bool SameType(QualifiedType left, QualifiedType right)
-            => string.Equals(left.ToDisplayString(), right.ToDisplayString(), StringComparison.Ordinal);
+            => left.ToDisplayString() == right.ToDisplayString();
 
         private static bool IsVoid(QualifiedType type)
             => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Void };

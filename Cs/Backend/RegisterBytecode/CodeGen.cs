@@ -2666,6 +2666,8 @@ namespace Cnidaria.Cs
                         case RuntimeIntrinsicId.InterlockedCompareExchange:
                         case RuntimeIntrinsicId.InterlockedExchangeAdd:
                         case RuntimeIntrinsicId.InterlockedExchange:
+                        case RuntimeIntrinsicId.InterlockedOr:
+                        case RuntimeIntrinsicId.InterlockedAnd:
                         case RuntimeIntrinsicId.MemoryBarrier:
                             {
                                 CallFlags intrinsicFlags = BuildCallFlags(method, Op.CallInternal) & ~CallFlags.GcSafePoint;
@@ -4893,7 +4895,7 @@ namespace Cnidaria.Cs
                 if (type.Kind == RuntimeTypeKind.Enum)
                     return true;
 
-                if (!string.Equals(type.Namespace, "System", StringComparison.Ordinal))
+                if (type.Namespace != "System")
                     return false;
 
                 return type.Name is
@@ -4908,7 +4910,7 @@ namespace Cnidaria.Cs
 
             private static CallFlags BuildCallFlags(RuntimeMethod method, Op op)
             {
-                var flags = CallFlags.GcSafePoint | CallFlags.MayThrow;
+                CallFlags flags = method.DllImportData?.SuppressGCTransition == true ? CallFlags.MayThrow : CallFlags.GcSafePoint | CallFlags.MayThrow;
                 if (method.HasInternalCall || op == Op.CallInternal)
                     flags |= CallFlags.InternalCall;
                 if (MachineAbi.RequiresHiddenReturnBuffer(method))
@@ -4939,6 +4941,8 @@ namespace Cnidaria.Cs
                 if (instruction.TreeKind == GenTreeKind.GcPoll)
                     return true;
                 if (instruction.TreeKind == GenTreeKind.Intrinsic && RuntimeIntrinsics.IsNoGcSafePoint(instruction.IntrinsicId))
+                    return false;
+                if (instruction.TreeKind == GenTreeKind.Call && instruction.Method?.DllImportData?.SuppressGCTransition == true)
                     return false;
                 if (!GenTreeLirKinds.IsRealTree(instruction))
                     return false;

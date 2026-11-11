@@ -326,7 +326,7 @@ namespace Cnidaria.Python
             var tree = new SyntaxTree(text, parser.ParseCompilationUnit());
 
             Debug.Assert(
-                string.Equals(tree.ToFullString(), text, StringComparison.Ordinal),
+                tree.ToFullString() == text,
                 "The syntax tree must retain every source character exactly once.");
 
             return tree;

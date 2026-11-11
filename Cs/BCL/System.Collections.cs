@@ -65,6 +65,8 @@ namespace System.Collections
 
         void Clear();
 
+        int IndexOf(object value);
+
         bool IsReadOnly
         { get; }
 

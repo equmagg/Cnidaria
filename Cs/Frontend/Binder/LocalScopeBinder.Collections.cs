@@ -66,6 +66,11 @@ namespace Cnidaria.Cs
             if (nt.IsRefLikeType)
                 return false;
 
+            // A collection initializer needs a type that implements IEnumerable
+            NamedTypeSymbol? enumerable = GetWellKnownType(context.Compilation, "System", "Collections", "IEnumerable", 0);
+            if (enumerable is null || !ImplementsInterface(nt, enumerable))
+                return false;
+
             bool hasSpread = false;
             for (int i = 0; i < unbound.Elements.Length; i++)
                 hasSpread |= unbound.Elements[i].Kind == BoundCollectionElementKind.Spread;
@@ -262,7 +267,7 @@ namespace Cnidaria.Cs
 
 
             var fullNs = GetNamespaceFullName(ns);
-            if (!string.Equals(fullNs, "System.Collections.Generic", StringComparison.Ordinal))
+            if (fullNs != "System.Collections.Generic")
                 return false;
 
             return type.Name switch
@@ -284,11 +289,11 @@ namespace Cnidaria.Cs
                 return false;
 
             var def = nt.OriginalDefinition;
-            if (def.Arity != 1 || !string.Equals(def.Name, "List", StringComparison.Ordinal))
+            if (def.Arity != 1 || def.Name != "List")
                 return false;
 
             if (def.ContainingSymbol is not NamespaceSymbol ns ||
-                !string.Equals(GetNamespaceFullName(ns), "System.Collections.Generic", StringComparison.Ordinal))
+                GetNamespaceFullName(ns) != "System.Collections.Generic")
             {
                 return false;
             }
@@ -314,7 +319,7 @@ namespace Cnidaria.Cs
                     var children = current.GetNamespaceMembers();
                     for (int j = 0; j < children.Length; j++)
                     {
-                        if (string.Equals(children[j].Name, parts[i], StringComparison.Ordinal))
+                        if (children[j].Name == parts[i])
                         {
                             next = children[j];
                             break;
@@ -347,7 +352,7 @@ namespace Cnidaria.Cs
             {
                 if (member is not MethodSymbol ms || !ms.IsStatic || ms.IsConstructor)
                     continue;
-                if (!string.Equals(ms.Name, "SetCount", StringComparison.Ordinal))
+                if (ms.Name != "SetCount")
                     continue;
                 if (ms.TypeParameters.Length != 1)
                     continue;
@@ -384,7 +389,7 @@ namespace Cnidaria.Cs
             {
                 if (member is not MethodSymbol ms || !ms.IsStatic || ms.IsConstructor)
                     continue;
-                if (!string.Equals(ms.Name, "AsSpan", StringComparison.Ordinal))
+                if (ms.Name != "AsSpan")
                     continue;
                 if (ms.TypeParameters.Length != 1)
                     continue;
@@ -1159,7 +1164,7 @@ namespace Cnidaria.Cs
             {
                 if (members[i] is not MethodSymbol m) continue;
                 if (!m.IsStatic || m.IsConstructor) continue;
-                if (!string.Equals(m.Name, "Copy", StringComparison.Ordinal)) continue;
+                if (m.Name != "Copy") continue;
                 if (m.Parameters.Length != 5) continue;
                 if (!ReferenceEquals(m.Parameters[0].Type, arrayType)) continue;
                 if (!ReferenceEquals(m.Parameters[1].Type, intType)) continue;

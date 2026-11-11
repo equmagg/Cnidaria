@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Globalization;
 using System.Linq;
 using System.Numerics;
@@ -21,6 +22,21 @@ namespace Cnidaria.Cs
         DisabledTextTrivia,
 
         SkippedTokensTrivia
+    }
+
+    /// <summary>An active #pragma warning directive; no ids means every warning</summary>
+    public readonly struct PragmaWarningDirective
+    {
+        public readonly int Position;
+        public readonly bool IsDisable;
+        public readonly ImmutableArray<string> Ids;
+
+        public PragmaWarningDirective(int position, bool isDisable, ImmutableArray<string> ids)
+        {
+            Position = position;
+            IsDisable = isDisable;
+            Ids = ids;
+        }
     }
 
     ///<summary>Stores a lexer or parser diagnostic at a source position</summary>
@@ -554,6 +570,7 @@ namespace Cnidaria.Cs
         private readonly HashSet<string> _preprocessorSymbols;
         private readonly List<ConditionalFrame> _conditionalStack = new();
         public List<SyntaxDiagnostic> Diagnostics { get; } = new List<SyntaxDiagnostic>();
+        public List<PragmaWarningDirective> PragmaWarnings { get; } = new List<PragmaWarningDirective>();
 
         public Lexer(string text, LexerOptions? options = null)
         {
@@ -2274,10 +2291,14 @@ namespace Cnidaria.Cs
                     // Warning directives are preserved without adding an error diagnostic
                     return;
 
+                case "pragma":
+                    if (activeBeforeDirective)
+                        ProcessPragmaDirective(argsStart, argsEnd, directiveStart);
+                    return;
+
                 case "region":
                 case "endregion":
                 case "line":
-                case "pragma":
                 case "nullable":
                 case "r":
                 case "reference":
@@ -2295,6 +2316,30 @@ namespace Cnidaria.Cs
                         Diagnostics.Add(new SyntaxDiagnostic(directiveStart, "Unknown preprocessor directive '#" + keyword + "'."));
                     return;
             }
+        }
+
+        // #pragma warning disable|restore [id[, id...]]; a bare number stands for its CS id
+        private void ProcessPragmaDirective(int argsStart, int argsEnd, int directiveStart)
+        {
+            string args = _text.Substring(argsStart, argsEnd - argsStart);
+            int comment = args.IndexOf("//", StringComparison.Ordinal);
+            if (comment >= 0)
+                args = args.Substring(0, comment);
+
+            string[] words = args.Split((char[]?)null, 3, StringSplitOptions.RemoveEmptyEntries);
+            if (words.Length < 2 || words[0] != "warning" || words[1] is not ("disable" or "restore"))
+                return;
+
+            var ids = ImmutableArray.CreateBuilder<string>();
+            if (words.Length == 3)
+            {
+                foreach (string item in words[2].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    ids.Add(int.TryParse(item, out int number) ? "CS" + number.ToString("D4") : item);
+            }
+
+            // Parser speculation can lex the same directive again
+            if (PragmaWarnings.Count == 0 || PragmaWarnings[PragmaWarnings.Count - 1].Position < directiveStart)
+                PragmaWarnings.Add(new PragmaWarningDirective(directiveStart, words[1] == "disable", ids.ToImmutable()));
         }
 
         private void ProcessIfDirective(int argsStart, int argsEnd, int directiveStart)
@@ -3772,6 +3817,7 @@ namespace Cnidaria.Cs
         private int _injectedIndex;
 
         private int _logicalPosition;
+        public IReadOnlyList<PragmaWarningDirective> PragmaWarnings => _lexer.PragmaWarnings;
         public int Position => _index;
         public SyntaxToken Current => Peek(0);
         public SyntaxKind CurrentKind => Current.Kind;

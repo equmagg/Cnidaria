@@ -745,6 +745,13 @@ internal static partial class SsaOptimizer
                 return GimpleAssignStatement.Single(assign.Lhs, GimpleNameMaterializer.MaterializeValue(folded), assign.Syntax);
             }
 
+            if (_options.EnableConstantFolding && TryFormRotate(assign, operandArray, out var rotate, out var rotateOperands))
+            {
+                Changed = true;
+                expressions = ReplaceRhsExpressions(expressions, start, assign.Operands.Length, rotateOperands);
+                return rotate;
+            }
+
             var values = ImmutableArray.CreateBuilder<GimpleValue>(operandArray.Length);
             var changed = false;
             for (var i = 0; i < operandArray.Length; i++)
@@ -1573,6 +1580,16 @@ internal static partial class SsaOptimizer
                 return true;
             }
 
+            if (code is GimpleTreeCode.LrotateExpr or GimpleTreeCode.RrotateExpr)
+            {
+                var amount = (int)(rightValue & (ulong)(leftInfo.Bits - 1));
+                if (code == GimpleTreeCode.LrotateExpr)
+                    amount = (leftInfo.Bits - amount) & (leftInfo.Bits - 1);
+                var rotated = amount == 0 ? leftValue : (leftValue >> amount | leftValue << (leftInfo.Bits - amount)) & Mask(leftInfo.Bits);
+                folded = CreateConstantExpression(CreateIntegerConstant(rotated, type, syntax));
+                return true;
+            }
+
             if (!SameType(leftConstant.Type, rightConstant.Type))
                 return false;
 
@@ -1619,6 +1636,8 @@ internal static partial class SsaOptimizer
                     case GimpleTreeCode.BitXorExpr:
                     case GimpleTreeCode.LshiftExpr:
                     case GimpleTreeCode.RshiftExpr:
+                    case GimpleTreeCode.LrotateExpr:
+                    case GimpleTreeCode.RrotateExpr:
                         folded = left;
                         return true;
                 }
@@ -1655,7 +1674,7 @@ internal static partial class SsaOptimizer
                 return true;
             }
 
-            if (IsZero(left) && SameType(left.Original.Type, type) && code is GimpleTreeCode.LshiftExpr or GimpleTreeCode.RshiftExpr)
+            if (IsZero(left) && SameType(left.Original.Type, type) && code is GimpleTreeCode.LshiftExpr or GimpleTreeCode.RshiftExpr or GimpleTreeCode.LrotateExpr or GimpleTreeCode.RrotateExpr)
             {
                 folded = left;
                 return true;
@@ -1691,6 +1710,123 @@ internal static partial class SsaOptimizer
             }
 
             return false;
+        }
+
+        // x << a | x >> b rotates when a + b is the width: constant counts, b the width minus a, or b the masked negation of a, which only | keeps right at zero
+        private bool TryFormRotate(
+            GimpleAssignStatement assign,
+            ImmutableArray<GimpleOperandInfo> operands,
+            out GimpleAssignStatement rotate,
+            out ImmutableArray<GimpleOperandInfo> rotateOperands)
+        {
+            rotate = null!;
+            rotateOperands = default;
+            if (assign.Subcode is not (GimpleTreeCode.BitIorExpr or GimpleTreeCode.BitXorExpr or GimpleTreeCode.PlusExpr) || operands.Length != 2 ||
+                !TryGetIntegerInfo(assign.Lhs.Type, out var info) || info.IsSigned || !TargetRegisterInfo.HasRotate(_target, info.Bits) ||
+                operands[0].Name is not { } first || operands[1].Name is not { } second ||
+                !TryGetDefiningAssign(first, out var firstShift) || !TryGetDefiningAssign(second, out var secondShift))
+                return false;
+
+            var (left, right) = firstShift.Subcode == GimpleTreeCode.LshiftExpr ? (firstShift, secondShift) : (secondShift, firstShift);
+            if (left.Subcode != GimpleTreeCode.LshiftExpr || right.Subcode != GimpleTreeCode.RshiftExpr ||
+                left.Operands[0] is not GimpleName value || !ReferenceEquals(value, right.Operands[0]) ||
+                !TryGetIntegerInfo(value.Type, out var valueInfo) || valueInfo.IsSigned || valueInfo.Bits != info.Bits)
+                return false;
+
+            var leftCount = left.Operands[1];
+            var rightCount = right.Operands[1];
+            GimpleTreeCode code;
+            GimpleValue count;
+            if (leftCount is GimpleConstantValue leftConstant && rightCount is GimpleConstantValue rightConstant)
+            {
+                if (!TryGetIntegerConstant(leftConstant, out var leftAmount, out _) || !TryGetIntegerConstant(rightConstant, out var rightAmount, out _) ||
+                    leftAmount == 0 || rightAmount == 0 || leftAmount + rightAmount != (ulong)info.Bits)
+                    return false;
+                (code, count) = (GimpleTreeCode.RrotateExpr, rightCount);
+            }
+            else
+            {
+                var allowMask = assign.Subcode == GimpleTreeCode.BitIorExpr;
+                if (IsRotateComplement(rightCount, leftCount, info.Bits, allowMask))
+                    (code, count) = TargetRegisterInfo.HasRotateLeft(_target)
+                        ? (GimpleTreeCode.LrotateExpr, WithoutRotateMask(leftCount, info.Bits))
+                        : (GimpleTreeCode.RrotateExpr, WithoutRotateMask(rightCount, info.Bits));
+                else if (IsRotateComplement(leftCount, rightCount, info.Bits, allowMask))
+                    (code, count) = (GimpleTreeCode.RrotateExpr, WithoutRotateMask(rightCount, info.Bits));
+                else
+                    return false;
+            }
+
+            rotate = GimpleAssignStatement.Binary(assign.Lhs, code, value, count, assign.Syntax);
+            rotateOperands = ImmutableArray.Create(
+                CreateNameExpression(value, value, GimpleOperandRole.Value),
+                count is GimpleName countName
+                    ? CreateNameExpression(countName, countName, GimpleOperandRole.Value)
+                    : CreateConstantExpression((GimpleConstantValue)count));
+            return true;
+        }
+
+        private bool IsRotateComplement(GimpleValue count, GimpleValue other, int bits, bool allowMask)
+        {
+            var source = SkipCountConversions(count);
+            var masked = TryStripRotateMask(source, bits, out var inner);
+            if (masked && !allowMask)
+                return false;
+            if (masked)
+                source = SkipCountConversions(inner);
+            if (!TryGetDefiningAssign(source, out var complement))
+                return false;
+
+            GimpleValue? amount = complement.Subcode switch
+            {
+                GimpleTreeCode.MinusExpr when IsConstantCount(complement.Operands[0], bits) || masked && IsConstantCount(complement.Operands[0], 0) => complement.Operands[1],
+                GimpleTreeCode.NegateExpr when masked => complement.Operands[0],
+                _ => null,
+            };
+            return amount is not null && ReferenceEquals(SkipCountConversions(amount), SkipCountConversions(WithoutRotateMask(other, bits)));
+        }
+
+        // A rotate reads its count modulo the width on every target
+        private GimpleValue WithoutRotateMask(GimpleValue count, int bits)
+            => TryStripRotateMask(SkipCountConversions(count), bits, out var inner) ? inner : count;
+
+        private bool TryStripRotateMask(GimpleValue count, int bits, out GimpleValue inner)
+        {
+            inner = null!;
+            if (!TryGetDefiningAssign(count, out var mask) || mask.Subcode != GimpleTreeCode.BitAndExpr)
+                return false;
+            if (IsConstantCount(mask.Operands[1], bits - 1))
+                inner = mask.Operands[0];
+            else if (IsConstantCount(mask.Operands[0], bits - 1))
+                inner = mask.Operands[1];
+            return inner is not null;
+        }
+
+        private bool IsConstantCount(GimpleValue value, int expected)
+            => value is GimpleConstantValue constant && TryGetIntegerConstant(constant, out var number, out _) && number == (ulong)expected;
+
+        // Conversions keep the low bits a shift count is read from
+        private GimpleValue SkipCountConversions(GimpleValue count)
+        {
+            while (TryGetDefiningAssign(count, out var assign) &&
+                   assign.Subcode is GimpleTreeCode.NopExpr or GimpleTreeCode.ConvertExpr or GimpleTreeCode.SsaName &&
+                   assign.Operands.Length == 1 && IsIntegerLike(assign.Operands[0].Type))
+            {
+                count = assign.Operands[0];
+            }
+
+            return count;
+        }
+
+        private bool TryGetDefiningAssign(GimpleValue value, out GimpleAssignStatement assign)
+        {
+            assign = null!;
+            if (value is not GimpleName name || !_function.TryGetDefinition(name, out var definition) ||
+                definition is not { Kind: GimpleDefinitionKind.Statement, Statement: GimpleAssignStatement statement })
+                return false;
+
+            assign = statement;
+            return true;
         }
 
         private bool TryEvaluateIntegerBinary(
@@ -2159,19 +2295,16 @@ internal static partial class SsaOptimizer
         private static bool IsIdentityConversion(GimpleTreeCode code, QualifiedType source, QualifiedType destination)
             => code is GimpleTreeCode.NopExpr or GimpleTreeCode.ConvertExpr &&
                !IsVolatileOrAtomic(source) && !IsVolatileOrAtomic(destination) &&
-               string.Equals(RepresentationKey(source), RepresentationKey(destination), StringComparison.Ordinal);
+               RepresentationKey(source) == RepresentationKey(destination);
 
         private static string RepresentationKey(QualifiedType type)
             => GimpleTypeHelpers.Normalize(type).Type.ToDisplayString();
 
         private static bool SameRepresentation(QualifiedType left, QualifiedType right)
-            => string.Equals(RepresentationKey(left), RepresentationKey(right), StringComparison.Ordinal);
+            => RepresentationKey(left) == RepresentationKey(right);
 
         private static bool SameType(QualifiedType left, QualifiedType right)
-            => string.Equals(
-                GimpleTypeHelpers.Normalize(left).ToDisplayString(),
-                GimpleTypeHelpers.Normalize(right).ToDisplayString(),
-                StringComparison.Ordinal);
+            => GimpleTypeHelpers.Normalize(left).ToDisplayString() == GimpleTypeHelpers.Normalize(right).ToDisplayString();
 
         private static bool IsVolatileOrAtomic(QualifiedType type)
             => (GimpleTypeHelpers.Normalize(type).Qualifiers & (TypeQualifiers.Volatile | TypeQualifiers.Atomic)) != 0;

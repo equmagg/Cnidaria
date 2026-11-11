@@ -38,19 +38,32 @@ namespace Cnidaria.Cs
             return null;
         }
         /// <summary>Converts bound method bodies into the reduced forms consumed by code generation</summary>
-        public static BoundMethodBody Rewrite(Compilation compilation, BoundMethodBody methodBody)
+        public static BoundMethodBody Rewrite(Compilation compilation, BoundMethodBody methodBody, DiagnosticBag diagnostics, bool closuresLowered = false)
         {
             if (compilation is null) throw new ArgumentNullException(nameof(compilation));
             if (methodBody is null) throw new ArgumentNullException(nameof(methodBody));
 
-            if (compilation.TryGetIteratorStateMachine(methodBody.Method, out var iteratorInfo))
+            BoundMethodBody closureLoweredBody = methodBody;
+            if (!closuresLowered)
             {
-                methodBody = RewriteIteratorLocalFunctions(compilation, methodBody);
+                var lambdaClosureRewriter = new LambdaClosureRewriter(compilation);
+                var lambdaClosureLoweredBody = lambdaClosureRewriter.RewriteNode(methodBody) as BoundMethodBody
+                    ?? throw new InvalidOperationException("Unexpected lambda closure conversion result.");
 
-                methodBody = IteratorLowering.RewriteOriginalIteratorMethod(compilation, methodBody, iteratorInfo);
+                var closureRewriter = new LocalFunctionClosureRewriter(compilation);
+                closureLoweredBody = closureRewriter.RewriteNode(lambdaClosureLoweredBody) as BoundMethodBody
+                    ?? throw new InvalidOperationException("Unexpected closure conversion result.");
 
-                var rewriter = new LocalRewriter(compilation, methodBody.Method);
-                var loweredBody = rewriter.RewriteNode(methodBody) as BoundMethodBody
+                // Closures are converted before the locals move to fields, so cells and lifted functions move like any local
+                new IteratorStateMachinePreparer(compilation).Prepare(closureLoweredBody);
+            }
+
+            if (compilation.TryGetIteratorStateMachine(methodBody.Method, out IteratorStateMachineInfo iteratorInfo))
+            {
+                BoundMethodBody stub = IteratorLowering.RewriteOriginalIteratorMethod(compilation, closureLoweredBody, iteratorInfo);
+
+                var rewriter = new LocalRewriter(compilation, stub.Method);
+                var loweredBody = rewriter.RewriteNode(stub) as BoundMethodBody
                     ?? throw new InvalidOperationException("Unexpected iterator method rewrite result.");
 
                 loweredBody = EnsureBlockBody(loweredBody);
@@ -61,14 +74,6 @@ namespace Cnidaria.Cs
 
                 return EnsureBlockBody(loweredBody);
             }
-
-            var lambdaClosureRewriter = new LambdaClosureRewriter(compilation);
-            var lambdaClosureLoweredBody = lambdaClosureRewriter.RewriteNode(methodBody) as BoundMethodBody
-                ?? throw new InvalidOperationException("Unexpected lambda closure conversion result.");
-
-            var closureRewriter = new LocalFunctionClosureRewriter(compilation);
-            var closureLoweredBody = closureRewriter.RewriteNode(lambdaClosureLoweredBody) as BoundMethodBody
-                ?? throw new InvalidOperationException("Unexpected closure conversion result.");
 
             closureLoweredBody = RewriteIteratorLocalFunctions(compilation, closureLoweredBody);
 
@@ -85,7 +90,7 @@ namespace Cnidaria.Cs
 
                 loweredBody = EnsureBlockBody(loweredBody);
 
-                return loweredBody;
+                return EnsureBlockBody(AsyncLowering.Rewrite(compilation, loweredBody, diagnostics));
             }
         }
 
@@ -108,30 +113,11 @@ namespace Cnidaria.Cs
                 body.Method,
                 new BoundBlockStatement(body.Body.Syntax, ImmutableArray.Create<BoundStatement>(body.Body)));
         }
-        /// <summary>Discovers iterator bodies in a syntax tree and registers their state machine symbols</summary>
-        internal static void PrepareIteratorStateMachines(Compilation compilation, SyntaxTree tree, SemanticModel model)
-        {
-            var preparer = new IteratorStateMachinePreparer(
-                compilation,
-                tree,
-                compilation.GetIteratorStateMachinesForTree(tree).Length);
-
-            if (model.GetBoundNode(tree.Root) is BoundCompilationUnit cu &&
-                cu.TopLevelMethodBodyOpt is BoundMethodBody topLevelBody)
-            {
-                preparer.Prepare(topLevelBody);
-            }
-
-            foreach (var owner in compilation.EnumerateMethodBodyOwners(tree))
-            {
-                var body = (BoundMethodBody)model.GetBoundNode(owner);
-                preparer.Prepare(body);
-            }
-        }
-
         /// <summary>Builds the synthesized method bodies for a prepared iterator state machine</summary>
         internal static ImmutableArray<BoundMethodBody> GetIteratorStateMachineBodies(Compilation compilation, IteratorStateMachineInfo info)
             => IteratorLowering.BuildBodies(compilation, info);
+        internal static bool ContainsYield(BoundStatement statement)
+            => IteratorLowering.ContainsYield(statement);
         /// <summary>Replaces iterator local functions with calls to their synthesized state machines</summary>
         private static BoundMethodBody RewriteIteratorLocalFunctions(
             Compilation compilation,
@@ -197,23 +183,26 @@ namespace Cnidaria.Cs
             protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
                 => node;
         }
-        /// <summary>Collects symbols used by an iterator but owned by an outer method</summary>
-        private sealed class IteratorExternalCaptureCollector : BoundTreeRewriter
-        {
-            private readonly MethodSymbol _owner;
-            private readonly HashSet<Symbol> _seen = new(ReferenceEqualityComparer<Symbol>.Instance);
-            private readonly ImmutableArray<Symbol>.Builder _captures = ImmutableArray.CreateBuilder<Symbol>();
 
-            private IteratorExternalCaptureCollector(MethodSymbol owner)
+        /// <summary>Finds the try statements that a yield has to resume inside of, which cannot stay protected regions</summary>
+        private sealed class IteratorYieldingTryCollector : BoundTreeRewriter
+        {
+            private readonly ImmutableArray<BoundTryStatement>.Builder _statements = ImmutableArray.CreateBuilder<BoundTryStatement>();
+
+            public static ImmutableArray<BoundTryStatement> Collect(BoundStatement body)
             {
-                _owner = owner;
+                var collector = new IteratorYieldingTryCollector();
+                collector.RewriteStatement(body);
+                return collector._statements.ToImmutable();
             }
 
-            public static ImmutableArray<Symbol> Collect(MethodSymbol owner, BoundStatement body)
+            protected override BoundStatement RewriteTryStatement(BoundTryStatement node)
             {
-                var collector = new IteratorExternalCaptureCollector(owner);
-                collector.RewriteStatement(body);
-                return collector._captures.ToImmutable();
+                // The binder allows a yield return only with no catch clause, a yield break in one can stay a plain return out of the region
+                if (node.CatchBlocks.IsEmpty && node.FinallyBlockOpt is not null && IteratorLowering.ContainsYield(node.TryBlock))
+                    _statements.Add(node);
+
+                return base.RewriteTryStatement(node);
             }
 
             protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
@@ -221,33 +210,70 @@ namespace Cnidaria.Cs
 
             protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
                 => node;
+        }
 
-            protected override BoundExpression RewriteExpressionCore(BoundExpression node)
+        private sealed class IteratorLabelCollector : BoundTreeRewriter
+        {
+            private readonly HashSet<LabelSymbol> _labels = new(ReferenceEqualityComparer<LabelSymbol>.Instance);
+
+            public static HashSet<LabelSymbol> Collect(BoundStatement body)
             {
-                switch (node)
-                {
-                    case BoundLocalExpression local when !ReferenceEquals(local.Local.ContainingSymbol, _owner):
-                        Add(local.Local);
-                        return node;
-
-                    case BoundParameterExpression parameter when !ReferenceEquals(parameter.Parameter.ContainingSymbol, _owner):
-                        Add(parameter.Parameter);
-                        return node;
-
-                    default:
-                        return base.RewriteExpressionCore(node);
-                }
+                var collector = new IteratorLabelCollector();
+                collector.RewriteStatement(body);
+                return collector._labels;
             }
 
-            private void Add(Symbol symbol)
+            protected override BoundStatement RewriteStatement(BoundStatement node)
             {
-                if (symbol is LocalSymbol { IsConst: true })
-                    return;
+                if (node is BoundLabelStatement label)
+                    _labels.Add(label.Label);
 
-                if (_seen.Add(symbol))
-                    _captures.Add(symbol);
+                return base.RewriteStatement(node);
+            }
+
+            protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
+                => node;
+
+            protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
+                => node;
+        }
+
+        /// <summary>A try statement flattened into MoveNext, with its finally block moved to a method of the state machine</summary>
+        private sealed class IteratorFinallyFrame
+        {
+            private readonly HashSet<LabelSymbol> _labels;
+
+            public IteratorFinallyFrame? Parent { get; }
+            public int FinalizeState { get; }
+            public MethodSymbol? Handler { get; }
+            public LabelSymbol Entry { get; }
+            public List<(int State, LabelSymbol Label)> Dispatch { get; } = new();
+            public List<int> States { get; } = new();
+            public List<IteratorFinallyFrame> Children { get; } = new();
+            public Dictionary<LabelSymbol, LabelSymbol> ExitProxies { get; } = new(ReferenceEqualityComparer<LabelSymbol>.Instance);
+
+            public IteratorFinallyFrame(IteratorFinallyFrame? parent, int finalizeState, MethodSymbol? handler, LabelSymbol entry, HashSet<LabelSymbol> labels)
+            {
+                Parent = parent;
+                FinalizeState = finalizeState;
+                Handler = handler;
+                Entry = entry;
+                _labels = labels;
+            }
+
+            // A jump out of a flattened try has to run its finally on the way, which the proxy after the try does
+            public LabelSymbol ProxyFor(LabelSymbol target, MethodSymbol moveNext)
+            {
+                if (Parent is null || _labels.Contains(target))
+                    return target;
+
+                if (!ExitProxies.TryGetValue(target, out LabelSymbol? proxy))
+                    ExitProxies.Add(target, proxy = LabelSymbol.CreateGenerated("<finally_exit>", moveNext));
+
+                return proxy;
             }
         }
+
         /// <summary>Detects local functions whose bodies require iterator lowering</summary>
         private sealed class IteratorLocalFunctionYieldFinder : BoundTreeRewriter
         {
@@ -270,29 +296,23 @@ namespace Cnidaria.Cs
 
                 return base.RewriteLocalFunctionStatement(node);
             }
-
-            protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
-                => node;
         }
 
         /// <summary>Creates and registers state machine metadata before ordinary lowering begins</summary>
         private sealed class IteratorStateMachinePreparer : BoundTreeRewriter
         {
             private readonly Compilation _compilation;
-            private readonly SyntaxTree _tree;
-            private int _nextOrdinal;
 
-            public IteratorStateMachinePreparer(
-                Compilation compilation,
-                SyntaxTree tree,
-                int nextOrdinal)
+            public IteratorStateMachinePreparer(Compilation compilation)
             {
                 _compilation = compilation ?? throw new ArgumentNullException(nameof(compilation));
-                _tree = tree ?? throw new ArgumentNullException(nameof(tree));
-                _nextOrdinal = nextOrdinal;
             }
+
             public void Prepare(BoundMethodBody body)
             {
+                if (!IteratorLowering.ContainsYield(body.Body) && !IteratorLocalFunctionYieldFinder.Contains(body.Body))
+                    return;
+
                 RegisterIfIterator(body);
                 RewriteStatement(body.Body);
             }
@@ -303,37 +323,23 @@ namespace Cnidaria.Cs
                 if (!IteratorLowering.ContainsYield(body.Body))
                     return;
 
-                if (_compilation.TryGetIteratorStateMachine(body.Method, out _))
-                    return;
-
-                var preLowered = IteratorLowering.PreLowerIteratorBodyPreservingYield(
-                    _compilation,
-                    body);
-
+                SyntaxTree tree = body.Method.DeclaringSyntaxReferences[0].SyntaxTree;
                 var info = IteratorLowering.Create(
                     _compilation,
-                    _tree,
+                    tree,
                     body,
-                    preLowered,
-                    _nextOrdinal++);
+                    IteratorLowering.PreLowerIteratorBodyPreservingYield(_compilation, body),
+                    _compilation.GetIteratorStateMachinesForTree(tree).Length);
 
                 _compilation.RegisterIteratorStateMachine(body.Method, info);
             }
 
             protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
             {
-                var body = new BoundMethodBody(
-                    node.Syntax,
-                    node.LocalFunction,
-                    node.Body);
-
-                RegisterIfIterator(body);
+                RegisterIfIterator(new BoundMethodBody(node.Syntax, node.LocalFunction, node.Body));
 
                 return base.RewriteLocalFunctionStatement(node);
             }
-
-            protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
-                => node;
         }
 
         /// <summary>Rewrites iterator local function declarations into state machine factories</summary>
@@ -363,13 +369,11 @@ namespace Cnidaria.Cs
                     return node;
                 }
 
-                if (!TryGetIteratorStateMachine(localFunction, out var info))
+                if (!_compilation.TryGetIteratorStateMachine(localFunction, out IteratorStateMachineInfo info))
                 {
                     throw new InvalidOperationException(
                         $"Iterator local function '{localFunction.Name}' was not prepared before metadata snapshot.");
                 }
-
-                ValidateIteratorLocalFunctionParameters(localFunction, info);
 
                 var body = new BoundMethodBody(
                     node.Syntax,
@@ -385,46 +389,6 @@ namespace Cnidaria.Cs
                     (LocalFunctionStatementSyntax)node.Syntax,
                     localFunction,
                     loweredOriginal.Body);
-            }
-            protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
-                => node;
-            private bool TryGetIteratorStateMachine(LocalFunctionSymbol localFunction, out IteratorStateMachineInfo info)
-            {
-                if (_compilation.TryGetIteratorStateMachine(localFunction, out info))
-                    return true;
-
-                if (localFunction.DeclaringSyntaxReferences.Length == 0)
-                    return false;
-
-                var tree = localFunction.DeclaringSyntaxReferences[0].SyntaxTree;
-                foreach (var candidate in _compilation.GetIteratorStateMachinesForTree(tree))
-                {
-                    if (candidate.OriginalMethod is LocalFunctionSymbol original &&
-                        ReferenceEquals(original.Declaration, localFunction.Declaration))
-                    {
-                        info = candidate;
-                        return true;
-                    }
-                }
-
-                return false;
-            }
-            private static void ValidateIteratorLocalFunctionParameters(LocalFunctionSymbol method, IteratorStateMachineInfo info)
-            {
-                var parameters = method.Parameters;
-
-                for (int i = 0; i < parameters.Length; i++)
-                {
-                    var p = parameters[i];
-                    if (p.RefKind == ParameterRefKind.None && p.Type is not ByRefTypeSymbol)
-                        continue;
-
-                    if (IteratorLowering.TryGetIteratorCaptureFieldForHiddenParameter(info, p, out _))
-                        continue;
-
-                    throw new NotSupportedException(
-                        $"Iterator local function '{method.Name}' has unsupported by-ref parameter '{p.Name}' after local-function closure lowering.");
-                }
             }
         }
         /// <summary>Identifies the interface shape returned by an iterator method</summary>
@@ -462,8 +426,8 @@ namespace Cnidaria.Cs
             public FieldSymbol? ThisField { get; }
 
             public ImmutableDictionary<ParameterSymbol, FieldSymbol> ParameterFields { get; }
-            public ImmutableDictionary<Symbol, FieldSymbol> CaptureFields { get; }
             public ImmutableDictionary<LocalSymbol, FieldSymbol> LocalFields { get; }
+            public ImmutableDictionary<BoundTryStatement, SourceMethodSymbol> FinallyMethods { get; }
 
             public IteratorStateMachineInfo(
                 SyntaxTree syntaxTree,
@@ -484,8 +448,8 @@ namespace Cnidaria.Cs
                 FieldSymbol currentField,
                 FieldSymbol? thisField,
                 ImmutableDictionary<ParameterSymbol, FieldSymbol> parameterFields,
-                ImmutableDictionary<Symbol, FieldSymbol> captureFields,
-                ImmutableDictionary<LocalSymbol, FieldSymbol> localFields)
+                ImmutableDictionary<LocalSymbol, FieldSymbol> localFields,
+                ImmutableDictionary<BoundTryStatement, SourceMethodSymbol> finallyMethods)
             {
                 SyntaxTree = syntaxTree;
                 OriginalBody = originalBody;
@@ -505,8 +469,8 @@ namespace Cnidaria.Cs
                 CurrentField = currentField;
                 ThisField = thisField;
                 ParameterFields = parameterFields ?? ImmutableDictionary<ParameterSymbol, FieldSymbol>.Empty;
-                CaptureFields = captureFields ?? ImmutableDictionary<Symbol, FieldSymbol>.Empty;
                 LocalFields = localFields ?? ImmutableDictionary<LocalSymbol, FieldSymbol>.Empty;
+                FinallyMethods = finallyMethods;
             }
         }
 
@@ -551,11 +515,12 @@ namespace Cnidaria.Cs
                     name: $"<{method.Name}>d__{ordinal}",
                     containing: containingType,
                     typeKind: TypeKind.Class,
-                    arity: 0,
+                    arity: method.TypeParameters.Length,
                     declaredAccessibility: Accessibility.Private,
                     isSealed: true);
 
-                smType.SetTypeParameters(ImmutableArray<TypeParameterSymbol>.Empty);
+                // The body moves into a class, so the type parameters it sees become parameters of that class
+                smType.SetTypeParameters(method.TypeParameters);
                 smType.SetDefaultBaseType(compilation.GetSpecialType(SpecialType.System_Object));
                 smType.AddDeclaration(tree, originalBody.Syntax);
                 containingType.AddNestedType(smType);
@@ -589,29 +554,13 @@ namespace Cnidaria.Cs
                 var stateField = AddField(tree, smType, "<>1__state", intType, originalBody.Syntax);
                 var currentField = AddField(tree, smType, "<>2__current", elementType, originalBody.Syntax);
 
-                FieldSymbol? thisField = null;
-                if (!method.IsStatic && method.ContainingSymbol is NamedTypeSymbol thisType)
-                    thisField = AddField(tree, smType, "<>4__this", thisType, originalBody.Syntax);
+                FieldSymbol? thisField = method.IsStatic ? null : AddField(tree, smType, "<>4__this", containingType, originalBody.Syntax);
 
                 var parameterFields = ImmutableDictionary.CreateBuilder<ParameterSymbol, FieldSymbol>(
                     ReferenceEqualityComparer<ParameterSymbol>.Instance);
 
                 foreach (var p in method.Parameters)
                     parameterFields[p] = AddField(tree, smType, "<>3__" + p.Name, p.Type, originalBody.Syntax);
-
-                var captureFields = ImmutableDictionary.CreateBuilder<Symbol, FieldSymbol>(ReferenceEqualityComparer<Symbol>.Instance);
-
-                var externalCaptures = IteratorExternalCaptureCollector.Collect(method, preLoweredBody.Body);
-                for (int i = 0; i < externalCaptures.Length; i++)
-                {
-                    var captured = externalCaptures[i];
-                    captureFields[captured] = AddField(
-                        tree,
-                        smType,
-                        "<>c__" + captured.Name,
-                        GetIteratorCaptureFieldType(compilation, captured),
-                        originalBody.Syntax);
-                }
 
                 var collector = new IteratorLocalCollector();
                 collector.Visit(preLoweredBody.Body);
@@ -621,6 +570,15 @@ namespace Cnidaria.Cs
 
                 foreach (var local in collector.Locals)
                     localFields[local] = AddField(tree, smType, "<>l__" + local.Name, local.Type, originalBody.Syntax);
+
+                ImmutableDictionary<BoundTryStatement, SourceMethodSymbol>.Builder finallyMethods =
+                    ImmutableDictionary.CreateBuilder<BoundTryStatement, SourceMethodSymbol>(ReferenceEqualityComparer<BoundTryStatement>.Instance);
+                foreach (BoundTryStatement statement in IteratorYieldingTryCollector.Collect(preLoweredBody.Body))
+                {
+                    SourceMethodSymbol handler = AddMethod(tree, smType, "<>m__Finally" + (finallyMethods.Count + 1), voidType, originalBody.Syntax, Accessibility.Private);
+                    handler.SetParameters(ImmutableArray<ParameterSymbol>.Empty);
+                    finallyMethods[statement] = handler;
+                }
 
                 var ctor = AddMethod(
                     tree,
@@ -741,18 +699,8 @@ namespace Cnidaria.Cs
                     currentField,
                     thisField,
                     parameterFields.ToImmutable(),
-                    captureFields.ToImmutable(),
-                    localFields.ToImmutable());
-            }
-            private static TypeSymbol GetIteratorCaptureFieldType(Compilation compilation, Symbol symbol)
-            {
-                return symbol switch
-                {
-                    LocalSymbol local => compilation.CreateByRefType(local.Type),
-                    ParameterSymbol parameter when parameter.Type is ByRefTypeSymbol => parameter.Type,
-                    ParameterSymbol parameter => compilation.CreateByRefType(parameter.Type),
-                    _ => throw new NotSupportedException($"Unsupported iterator capture symbol '{symbol.Kind}'.")
-                };
+                    localFields.ToImmutable(),
+                    finallyMethods.ToImmutable());
             }
             private static SourceNamedTypeSymbol GetContainingSourceType(MethodSymbol method)
             {
@@ -770,15 +718,17 @@ namespace Cnidaria.Cs
                 Compilation compilation,
                 IteratorStateMachineInfo info)
             {
+                var rewriter = new IteratorMoveNextRewriter(compilation, info);
+                BoundMethodBody moveNext = BuildMoveNextBody(compilation, info, rewriter);
                 return ImmutableArray.Create(
                     BuildConstructorBody(compilation, info),
-                    BuildMoveNextBody(compilation, info),
-                    BuildDisposeBody(compilation, info),
+                    moveNext,
+                    BuildDisposeBody(compilation, info, rewriter.RootFrame),
                     BuildResetBody(compilation, info),
                     BuildGenericCurrentBody(compilation, info),
                     BuildObjectCurrentBody(compilation, info),
                     BuildGenericGetEnumeratorBody(compilation, info),
-                    BuildObjectGetEnumeratorBody(compilation, info));
+                    BuildObjectGetEnumeratorBody(compilation, info)).AddRange(rewriter.FinallyBodies);
             }
 
             /// <summary>Replaces an iterator entry body with state machine allocation and initialization</summary>
@@ -809,27 +759,15 @@ namespace Cnidaria.Cs
                         syntax,
                         Field(syntax, smLocalExpr, info.ThisField),
                         new BoundThisExpression(syntax as ExpressionSyntax ?? new ThisExpressionSyntax(default),
-                        (NamedTypeSymbol)body.Method.ContainingSymbol!)));
+                        (NamedTypeSymbol)info.ThisField.Type)));
                 }
 
                 foreach (var p in body.Method.Parameters)
                 {
-                    if (info.ParameterFields.TryGetValue(p, out var f))
-                    {
-                        statements.Add(AssignStmt(
-                            syntax,
-                            Field(syntax, smLocalExpr, f),
-                            new BoundParameterExpression(syntax, p)));
-                        continue;
-                    }
-
-                    if (TryGetIteratorCaptureFieldForHiddenParameter(info, p, out var captureField))
-                    {
-                        statements.Add(AssignStmt(
-                            syntax,
-                            Field(syntax, smLocalExpr, captureField),
-                            MakeIteratorCaptureArgument(syntax, p, captureField)));
-                    }
+                    statements.Add(AssignStmt(
+                        syntax,
+                        Field(syntax, smLocalExpr, info.ParameterFields[p]),
+                        new BoundParameterExpression(syntax, p)));
                 }
 
                 statements.Add(new BoundReturnStatement(syntax, smLocalExpr));
@@ -838,41 +776,6 @@ namespace Cnidaria.Cs
                     syntax,
                     body.Method,
                     new BoundBlockStatement(syntax, statements.ToImmutable()));
-            }
-            /// <summary>Maps a hidden capture parameter to the state machine field that stores it</summary>
-            public static bool TryGetIteratorCaptureFieldForHiddenParameter(
-                IteratorStateMachineInfo info,
-                ParameterSymbol parameter,
-                out FieldSymbol field)
-            {
-                const string prefix = "<>capture";
-                field = null!;
-
-                if (!parameter.Name.StartsWith(prefix, StringComparison.Ordinal))
-                    return false;
-
-                int separator = parameter.Name.IndexOf('_', prefix.Length);
-                if (separator < 0 || separator + 1 >= parameter.Name.Length)
-                    return false;
-
-                string capturedName = parameter.Name.Substring(separator + 1);
-                foreach (var kv in info.CaptureFields)
-                {
-                    if (kv.Key.Name == capturedName)
-                    {
-                        field = kv.Value;
-                        return true;
-                    }
-                }
-
-                return false;
-            }
-            private static BoundExpression MakeIteratorCaptureArgument(SyntaxNode syntax, ParameterSymbol parameter, FieldSymbol captureField)
-            {
-                var parameterExpression = new BoundParameterExpression(syntax, parameter);
-                if (captureField.Type is ByRefTypeSymbol byRefField)
-                    return new BoundRefExpression(syntax, byRefField, parameterExpression);
-                return parameterExpression;
             }
             private static int GetInitialIteratorState(IteratorStateMachineInfo info)
             {
@@ -904,28 +807,22 @@ namespace Cnidaria.Cs
             /// <summary>Builds the resume dispatch and rewritten iterator body for MoveNext</summary>
             private static BoundMethodBody BuildMoveNextBody(
                 Compilation compilation,
-                IteratorStateMachineInfo info)
+                IteratorStateMachineInfo info,
+                IteratorMoveNextRewriter rewriter)
             {
                 var syntax = info.OriginalBody.Syntax;
-                var rewriter = new IteratorMoveNextRewriter(compilation, info);
                 var rewrittenOriginal = rewriter.RewriteIteratorBody(info.PreLoweredBody.Body);
 
                 var statements = ImmutableArray.CreateBuilder<BoundStatement>();
 
-                foreach (var resume in rewriter.ResumeLabels)
-                {
-                    statements.Add(new BoundConditionalGotoStatement(
-                        syntax,
-                        Equal(compilation, syntax, Field(syntax, This(syntax, info), info.StateField), Int(compilation, syntax, resume.State)),
-                        resume.Label,
-                        jumpIfTrue: true));
-                }
+                statements.Add(new BoundLocalDeclarationStatement(syntax, rewriter.CachedState, Field(syntax, This(syntax, info), info.StateField)));
+                rewriter.AddDispatch(statements, syntax, rewriter.RootFrame);
 
                 var finishedLabel = LabelSymbol.CreateGenerated("<iterator_finished>", info.MoveNext);
 
                 statements.Add(new BoundConditionalGotoStatement(
                     syntax,
-                    NotEqual(compilation, syntax, Field(syntax, This(syntax, info), info.StateField), Int(compilation, syntax, 0)),
+                    NotEqual(compilation, syntax, new BoundLocalExpression(syntax, rewriter.CachedState), Int(compilation, syntax, 0)),
                     finishedLabel,
                     jumpIfTrue: true));
 
@@ -945,29 +842,89 @@ namespace Cnidaria.Cs
 
                 statements.Add(new BoundReturnStatement(syntax, Bool(compilation, syntax, false)));
 
+                var body = new BoundBlockStatement(syntax, statements.ToImmutable());
+                if (rewriter.RootFrame.Children.Count == 0)
+                    return new BoundMethodBody(syntax, info.MoveNext, body);
+
+                // An exception leaving MoveNext runs the finally blocks the iterator is inside of
+                var disposeAndRethrow = new BoundBlockStatement(
+                    syntax,
+                    ImmutableArray.Create<BoundStatement>(
+                        CallOnThis(syntax, info, info.Dispose),
+                        new BoundThrowStatement(syntax, null)));
+                var catchAll = new BoundCatchBlock(
+                    new CatchClauseSyntax(default, null, null, new BlockSyntax(default, SyntaxList<StatementSyntax>.Empty, default)),
+                    compilation.GetSpecialType(SpecialType.System_Object),
+                    exceptionLocalOpt: null,
+                    filterOpt: null,
+                    disposeAndRethrow);
                 return new BoundMethodBody(
                     syntax,
                     info.MoveNext,
-                    new BoundBlockStatement(syntax, statements.ToImmutable()));
-            }
-
-            private static BoundMethodBody BuildDisposeBody(
-                Compilation compilation,
-                IteratorStateMachineInfo info)
-            {
-                var syntax = info.OriginalBody.Syntax;
-
-                return new BoundMethodBody(
-                    syntax,
-                    info.Dispose,
                     new BoundBlockStatement(
                         syntax,
                         ImmutableArray.Create<BoundStatement>(
-                            AssignStmt(
-                                syntax,
-                                Field(syntax, This(syntax, info), info.StateField),
-                                Int(compilation, syntax, -2)),
-                            new BoundReturnStatement(syntax, null))));
+                            new BoundTryStatement(LocalRewriter.CreateSyntheticTryStatementSyntax(), body, ImmutableArray.Create(catchAll), finallyBlockOpt: null))));
+            }
+
+            private static BoundStatement CallOnThis(SyntaxNode syntax, IteratorStateMachineInfo info, MethodSymbol method)
+                => new BoundExpressionStatement(
+                    syntax,
+                    new BoundCallExpression(syntax, This(syntax, info), method, ImmutableArray<BoundExpression>.Empty));
+
+            private static BoundMethodBody BuildDisposeBody(
+                Compilation compilation,
+                IteratorStateMachineInfo info,
+                IteratorFinallyFrame rootFrame)
+            {
+                var syntax = info.OriginalBody.Syntax;
+
+                ImmutableArray<BoundStatement>.Builder statements = ImmutableArray.CreateBuilder<BoundStatement>();
+                AddFinallyCalls(compilation, info, syntax, rootFrame, statements);
+                statements.Add(AssignStmt(
+                    syntax,
+                    Field(syntax, This(syntax, info), info.StateField),
+                    Int(compilation, syntax, -2)));
+                statements.Add(new BoundReturnStatement(syntax, null));
+
+                return new BoundMethodBody(syntax, info.Dispose, new BoundBlockStatement(syntax, statements.ToImmutable()));
+            }
+
+            // Each finally runs if the state is inside its try, and an exception from an inner one still runs the outer one
+            private static void AddFinallyCalls(
+                Compilation compilation,
+                IteratorStateMachineInfo info,
+                SyntaxNode syntax,
+                IteratorFinallyFrame frame,
+                ImmutableArray<BoundStatement>.Builder statements)
+            {
+                foreach (IteratorFinallyFrame child in frame.Children)
+                {
+                    LabelSymbol run = LabelSymbol.CreateGenerated("<dispose_run>", info.Dispose);
+                    LabelSymbol skip = LabelSymbol.CreateGenerated("<dispose_skip>", info.Dispose);
+                    foreach (int state in child.States)
+                    {
+                        statements.Add(new BoundConditionalGotoStatement(
+                            syntax,
+                            Equal(compilation, syntax, Field(syntax, This(syntax, info), info.StateField), Int(compilation, syntax, state)),
+                            run,
+                            jumpIfTrue: true));
+                    }
+                    statements.Add(new BoundGotoStatement(syntax, skip));
+                    statements.Add(new BoundLabelStatement(syntax, run));
+
+                    ImmutableArray<BoundStatement>.Builder inner = ImmutableArray.CreateBuilder<BoundStatement>();
+                    AddFinallyCalls(compilation, info, syntax, child, inner);
+                    BoundStatement callHandler = CallOnThis(syntax, info, child.Handler ?? throw new InvalidOperationException("Only the root frame has no finally."));
+                    statements.Add(inner.Count == 0
+                        ? callHandler
+                        : new BoundTryStatement(
+                            LocalRewriter.CreateSyntheticTryStatementSyntax(),
+                            new BoundBlockStatement(syntax, inner.ToImmutable()),
+                            ImmutableArray<BoundCatchBlock>.Empty,
+                            new BoundBlockStatement(syntax, ImmutableArray.Create(callHandler))));
+                    statements.Add(new BoundLabelStatement(syntax, skip));
+                }
             }
 
             private static BoundMethodBody BuildResetBody(
@@ -975,6 +932,9 @@ namespace Cnidaria.Cs
                 IteratorStateMachineInfo info)
             {
                 var syntax = info.OriginalBody.Syntax;
+                NamedTypeSymbol exceptionType = RequireType(compilation, "System", "NotSupportedException", 0);
+                MethodSymbol constructor = FindParameterlessInstanceConstructor(exceptionType)
+                    ?? throw new InvalidOperationException("NotSupportedException has no parameterless constructor.");
 
                 return new BoundMethodBody(
                     syntax,
@@ -982,7 +942,9 @@ namespace Cnidaria.Cs
                     new BoundBlockStatement(
                         syntax,
                         ImmutableArray.Create<BoundStatement>(
-                            new BoundReturnStatement(syntax, null))));
+                            new BoundThrowStatement(
+                                syntax,
+                                new BoundObjectCreationExpression(syntax, exceptionType, constructor, ImmutableArray<BoundExpression>.Empty)))));
             }
 
             private static BoundMethodBody BuildGenericCurrentBody(
@@ -1077,17 +1039,6 @@ namespace Cnidaria.Cs
                         Field(syntax, This(syntax, info), kv.Value)));
                 }
 
-                foreach (var kv in info.CaptureFields)
-                {
-                    statements.Add(AssignStmt(
-                        syntax,
-                        Field(syntax, smLocalExpr, kv.Value),
-                        new BoundRefExpression(
-                            syntax,
-                            (ByRefTypeSymbol)kv.Value.Type,
-                            Field(syntax, This(syntax, info), kv.Value))));
-                }
-
                 statements.Add(new BoundReturnStatement(syntax, smLocalExpr));
 
                 return new BoundMethodBody(
@@ -1102,20 +1053,47 @@ namespace Cnidaria.Cs
                 private readonly Compilation _compilation;
                 private readonly IteratorStateMachineInfo _info;
                 private int _nextState = 1;
-                private readonly ImmutableArray<(int State, LabelSymbol Label)>.Builder _resumeLabels =
-                    ImmutableArray.CreateBuilder<(int State, LabelSymbol Label)>();
+                private int _nextFinalizeState = -3;
+                private IteratorFinallyFrame _frame;
+                private bool _inFinallyBody;
 
-                public ImmutableArray<(int State, LabelSymbol Label)> ResumeLabels
-                    => _resumeLabels.ToImmutable();
+                public IteratorFinallyFrame RootFrame { get; }
+                // A flattened try is entered both by falling into it and by resuming, so a resume consumes the state it dispatched on
+                public LocalSymbol CachedState { get; }
+                public ImmutableArray<BoundMethodBody>.Builder FinallyBodies { get; } = ImmutableArray.CreateBuilder<BoundMethodBody>();
 
                 public IteratorMoveNextRewriter(Compilation compilation, IteratorStateMachineInfo info)
                 {
                     _compilation = compilation;
                     _info = info;
+                    RootFrame = new IteratorFinallyFrame(
+                        parent: null,
+                        finalizeState: -1,
+                        handler: null,
+                        LabelSymbol.CreateGenerated("<iterator_start>", info.MoveNext),
+                        new HashSet<LabelSymbol>());
+                    _frame = RootFrame;
+                    CachedState = new LocalSymbol(
+                        "$state",
+                        info.MoveNext,
+                        compilation.GetSpecialType(SpecialType.System_Int32),
+                        ImmutableArray<Location>.Empty);
                 }
 
                 public BoundStatement RewriteIteratorBody(BoundStatement statement)
                     => RewriteStatement(statement);
+
+                public void AddDispatch(ImmutableArray<BoundStatement>.Builder statements, SyntaxNode syntax, IteratorFinallyFrame frame)
+                {
+                    foreach ((int state, LabelSymbol label) in frame.Dispatch)
+                    {
+                        statements.Add(new BoundConditionalGotoStatement(
+                            syntax,
+                            Equal(_compilation, syntax, new BoundLocalExpression(syntax, CachedState), Int(_compilation, syntax, state)),
+                            label,
+                            jumpIfTrue: true));
+                    }
+                }
 
                 /// <summary>Stores the yielded value and emits a resumable return sequence</summary>
                 protected override BoundStatement RewriteYieldStatement(BoundYieldStatement node)
@@ -1129,7 +1107,12 @@ namespace Cnidaria.Cs
 
                     int state = _nextState++;
                     var resume = LabelSymbol.CreateGenerated($"<yield_resume_{state}>", _info.MoveNext);
-                    _resumeLabels.Add((state, resume));
+                    _frame.Dispatch.Add((state, resume));
+                    for (IteratorFinallyFrame frame = _frame; frame.Parent is IteratorFinallyFrame parent; frame = parent)
+                    {
+                        frame.States.Add(state);
+                        parent.Dispatch.Add((state, frame.Entry));
+                    }
 
                     return new BoundBlockStatement(
                         syntax,
@@ -1146,9 +1129,92 @@ namespace Cnidaria.Cs
                             new BoundLabelStatement(syntax, resume),
                             AssignStmt(
                                 syntax,
+                                new BoundLocalExpression(syntax, CachedState),
+                                Int(_compilation, syntax, -1)),
+                            AssignStmt(
+                                syntax,
                                 Field(syntax, This(syntax, _info), _info.StateField),
-                                Int(_compilation, syntax, -1))));
+                                Int(_compilation, syntax, _frame.FinalizeState))));
                 }
+
+                protected override BoundStatement RewriteTryStatement(BoundTryStatement node)
+                {
+                    if (!_info.FinallyMethods.TryGetValue(node, out SourceMethodSymbol? handler))
+                        return base.RewriteTryStatement(node);
+
+                    SyntaxNode syntax = node.Syntax;
+                    IteratorFinallyFrame parent = _frame;
+                    var frame = new IteratorFinallyFrame(
+                        parent,
+                        _nextFinalizeState--,
+                        handler,
+                        LabelSymbol.CreateGenerated("<finally_entry>", _info.MoveNext),
+                        IteratorLabelCollector.Collect(node.TryBlock));
+                    parent.Children.Add(frame);
+                    for (IteratorFinallyFrame current = frame; current.Parent is IteratorFinallyFrame next; current = next)
+                        current.States.Add(frame.FinalizeState);
+
+                    _frame = frame;
+                    BoundStatement tryBlock = RewriteStatement(node.TryBlock);
+                    _frame = parent;
+
+                    _inFinallyBody = true;
+                    BoundStatement finallyBody = RewriteStatement(node.FinallyBlockOpt ?? throw new InvalidOperationException("A flattened try has a finally block."));
+                    _inFinallyBody = false;
+                    FinallyBodies.Add(new BoundMethodBody(
+                        syntax,
+                        handler,
+                        new BoundBlockStatement(
+                            syntax,
+                            ImmutableArray.Create<BoundStatement>(
+                                AssignStmt(
+                                    syntax,
+                                    Field(syntax, This(syntax, _info), _info.StateField),
+                                    Int(_compilation, syntax, parent.FinalizeState)),
+                                finallyBody,
+                                new BoundReturnStatement(syntax, null)))));
+
+                    ImmutableArray<BoundStatement>.Builder statements = ImmutableArray.CreateBuilder<BoundStatement>();
+                    statements.Add(new BoundLabelStatement(syntax, frame.Entry));
+                    statements.Add(AssignStmt(
+                        syntax,
+                        Field(syntax, This(syntax, _info), _info.StateField),
+                        Int(_compilation, syntax, frame.FinalizeState)));
+                    AddDispatch(statements, syntax, frame);
+                    statements.Add(tryBlock);
+                    statements.Add(CallOnThis(syntax, _info, handler));
+                    if (frame.ExitProxies.Count != 0)
+                    {
+                        LabelSymbol dropThrough = LabelSymbol.CreateGenerated("<finally_done>", _info.MoveNext);
+                        statements.Add(new BoundGotoStatement(syntax, dropThrough));
+                        foreach ((LabelSymbol target, LabelSymbol proxy) in frame.ExitProxies)
+                        {
+                            statements.Add(new BoundLabelStatement(syntax, proxy));
+                            statements.Add(CallOnThis(syntax, _info, handler));
+                            statements.Add(new BoundGotoStatement(syntax, parent.ProxyFor(target, _info.MoveNext)));
+                        }
+                        statements.Add(new BoundLabelStatement(syntax, dropThrough));
+                    }
+
+                    return new BoundBlockStatement(syntax, statements.ToImmutable());
+                }
+
+                protected override BoundStatement RewriteStatement(BoundStatement node)
+                {
+                    if (node is BoundGotoStatement jump)
+                    {
+                        LabelSymbol target = ResolveJump(jump.TargetLabel);
+                        return ReferenceEquals(target, jump.TargetLabel) ? node : new BoundGotoStatement(jump.Syntax, target);
+                    }
+
+                    return base.RewriteStatement(node);
+                }
+
+                protected override BoundStatement RewriteConditionalGotoStatement(BoundConditionalGotoStatement node)
+                    => new BoundConditionalGotoStatement(node.Syntax, RewriteExpression(node.Condition), ResolveJump(node.TargetLabel), node.JumpIfTrue);
+
+                private LabelSymbol ResolveJump(LabelSymbol target)
+                    => _inFinallyBody ? target : _frame.ProxyFor(target, _info.MoveNext);
 
                 protected override BoundStatement RewriteReturnStatement(BoundReturnStatement node)
                     => FinishFalse(node.Syntax);
@@ -1173,16 +1239,12 @@ namespace Cnidaria.Cs
                     {
                         if (_info.LocalFields.TryGetValue(local.Local, out var localField))
                             return Field(node.Syntax, This(node.Syntax, _info), localField);
-                        if (_info.CaptureFields.TryGetValue(local.Local, out var capturedLocalField))
-                            return Field(node.Syntax, This(node.Syntax, _info), capturedLocalField);
                     }
 
                     if (node is BoundParameterExpression parameter)
                     {
                         if (_info.ParameterFields.TryGetValue(parameter.Parameter, out var parameterField))
                             return Field(node.Syntax, This(node.Syntax, _info), parameterField);
-                        if (_info.CaptureFields.TryGetValue(parameter.Parameter, out var capturedParameterField))
-                            return Field(node.Syntax, This(node.Syntax, _info), capturedParameterField);
                     }
 
                     if (node is BoundThisExpression && _info.ThisField is not null)
@@ -1190,25 +1252,73 @@ namespace Cnidaria.Cs
                         return Field(node.Syntax, This(node.Syntax, _info), _info.ThisField);
                     }
 
+                    // Still a base expression, a base call must stay non-virtual
+                    if (node is BoundBaseExpression baseExpression && _info.ThisField is not null)
+                    {
+                        return new BoundBaseExpression(
+                            (ExpressionSyntax)baseExpression.Syntax,
+                            baseExpression.ContainingType,
+                            baseExpression.BaseType,
+                            Field(node.Syntax, This(node.Syntax, _info), _info.ThisField));
+                    }
+
                     return base.RewriteExpressionCore(node);
+                }
+
+                protected override BoundExpression RewriteCallExpression(BoundCallExpression node)
+                {
+                    BoundExpression rewritten = base.RewriteCallExpression(node);
+                    if (_info.ThisField is null ||
+                        rewritten is not BoundCallExpression call ||
+                        call.ReceiverOpt is not null ||
+                        call.Method.IsStatic)
+                    {
+                        return rewritten;
+                    }
+
+                    BoundExpression receiver = Field(call.Syntax, This(call.Syntax, _info), _info.ThisField);
+                    return new BoundCallExpression(call.Syntax, receiver, call.Method, call.Arguments, call.ConstrainedToTypeOpt);
                 }
 
                 protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
                     => node;
 
+                // The body holds only its closure by now, what builds the closure runs in MoveNext
                 protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
-                    => node;
+                {
+                    if (node.TargetOpt is null)
+                        return node;
+
+                    BoundExpression target = RewriteExpression(node.TargetOpt);
+                    if (ReferenceEquals(target, node.TargetOpt))
+                        return node;
+
+                    return new BoundLambdaExpression(
+                        (ExpressionSyntax)node.Syntax,
+                        (NamedTypeSymbol)node.Type,
+                        node.Method,
+                        node.InvokeMethod,
+                        node.Body,
+                        node.IsStatic,
+                        node.IsAsync,
+                        target);
+                }
 
                 /// <summary>Marks the iterator complete and returns false</summary>
                 private BoundStatement FinishFalse(SyntaxNode syntax)
                 {
+                    // Inside a flattened try, Dispose runs its finally blocks and finishes the state
+                    BoundStatement finish = _frame.Parent is null
+                        ? AssignStmt(
+                            syntax,
+                            Field(syntax, This(syntax, _info), _info.StateField),
+                            Int(_compilation, syntax, -2))
+                        : CallOnThis(syntax, _info, _info.Dispose);
+
                     return new BoundBlockStatement(
                         syntax,
                         ImmutableArray.Create<BoundStatement>(
-                            AssignStmt(
-                                syntax,
-                                Field(syntax, This(syntax, _info), _info.StateField),
-                                Int(_compilation, syntax, -2)),
+                            finish,
                             new BoundReturnStatement(syntax, Bool(_compilation, syntax, false))));
                 }
             }
@@ -1502,7 +1612,7 @@ namespace Cnidaria.Cs
                 var nss = g.GetNamespaceMembers();
                 for (int i = 0; i < nss.Length; i++)
                 {
-                    if (string.Equals(nss[i].Name, "System", StringComparison.Ordinal))
+                    if (nss[i].Name == "System")
                         return _systemNsCache = nss[i];
                 }
 
@@ -1516,6 +1626,16 @@ namespace Cnidaria.Cs
 
             private LocalSymbol CreateRefTempLocal(TypeSymbol type)
                 => new LocalSymbol($"$temp{_tempId++}", _method, type, ImmutableArray<Location>.Empty, isByRef: true);
+
+            private BoundExpression MakeDefaultValue(SyntaxNode syntax, TypeSymbol type)
+            {
+                LocalSymbol temp = CreateTempLocal(type);
+                return new BoundSequenceExpression(
+                    syntax,
+                    ImmutableArray.Create(temp),
+                    ImmutableArray.Create<BoundStatement>(new BoundLocalDeclarationStatement(syntax, temp, initializer: null)),
+                    new BoundLocalExpression(syntax, temp));
+            }
             private NamedTypeSymbol GetValueTupleDef(int arity)
             {
                 if (_valueTupleDefCache.TryGetValue(arity, out var t))
@@ -2246,11 +2366,11 @@ namespace Cnidaria.Cs
                     return false;
 
                 var def = nt.OriginalDefinition;
-                if (def.Arity != 1 || !string.Equals(def.Name, "ReadOnlySpan", StringComparison.Ordinal))
+                if (def.Arity != 1 || def.Name != "ReadOnlySpan")
                     return false;
 
                 return def.ContainingSymbol is NamespaceSymbol ns &&
-                       string.Equals(ns.Name, "System", StringComparison.Ordinal);
+                       ns.Name == "System";
             }
             private static bool IsSupportedStaticDataElementType(TypeSymbol type)
             {
@@ -2966,7 +3086,7 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < members.Length; i++)
                 {
                     if (members[i] is PropertySymbol prop &&
-                        string.Equals(prop.Name, "Length", StringComparison.Ordinal) &&
+                        prop.Name == "Length" &&
                         prop.GetMethod is MethodSymbol getter)
                     {
                         return new BoundCallExpression(syntax, arrayExpr, getter, ImmutableArray<BoundExpression>.Empty);
@@ -2988,7 +3108,7 @@ namespace Cnidaria.Cs
                 {
                     if (members[i] is PropertySymbol prop &&
                         !prop.IsStatic &&
-                        string.Equals(prop.Name, "Length", StringComparison.Ordinal) &&
+                        prop.Name == "Length" &&
                         ReferenceEquals(prop.Type, intType) &&
                         prop.GetMethod is MethodSymbol getter)
                     {
@@ -3041,7 +3161,7 @@ namespace Cnidaria.Cs
                 {
                     if (members[i] is PropertySymbol prop &&
                         !prop.IsStatic &&
-                        string.Equals(prop.Name, "Length", StringComparison.Ordinal) &&
+                        prop.Name == "Length" &&
                         ReferenceEquals(prop.Type, intType) &&
                         prop.Parameters.Length == 0 &&
                         prop.GetMethod is MethodSymbol getter)
@@ -3099,12 +3219,12 @@ namespace Cnidaria.Cs
                 if (definition.Arity != 1)
                     return false;
 
-                if (!string.Equals(definition.Name, "Span", StringComparison.Ordinal) &&
-                    !string.Equals(definition.Name, "ReadOnlySpan", StringComparison.Ordinal))
+                if (definition.Name != "Span" &&
+                    definition.Name != "ReadOnlySpan")
                     return false;
 
                 return definition.ContainingSymbol is NamespaceSymbol ns &&
-                       string.Equals(ns.Name, "System", StringComparison.Ordinal);
+                       ns.Name == "System";
             }
 
             /// <summary>Builds the disposal finally block when the enumerator is disposable</summary>
@@ -3255,7 +3375,7 @@ namespace Cnidaria.Cs
                             continue;
                         if (method.IsStatic)
                             continue;
-                        if (!string.Equals(method.Name, name, StringComparison.Ordinal))
+                        if (method.Name != name)
                             continue;
                         if (method.TypeParameters.Length != 0)
                             continue;
@@ -3298,7 +3418,7 @@ namespace Cnidaria.Cs
 
                     for (int i = 0; i < next.Length; i++)
                     {
-                        if (string.Equals(next[i].Name, namespaceParts[p], StringComparison.Ordinal))
+                        if (next[i].Name == namespaceParts[p])
                         {
                             found = next[i];
                             break;
@@ -3318,7 +3438,7 @@ namespace Cnidaria.Cs
                 return types[0].OriginalDefinition;
             }
 
-            private static TryStatementSyntax CreateSyntheticTryStatementSyntax()
+            internal static TryStatementSyntax CreateSyntheticTryStatementSyntax()
             {
                 var emptyBlock = new BlockSyntax(default, SyntaxList<StatementSyntax>.Empty, default);
                 var finallyClause = new FinallyClauseSyntax(default, emptyBlock);
@@ -3481,7 +3601,7 @@ namespace Cnidaria.Cs
                     for (int i = 0; i < members.Length; i++)
                     {
                         if (members[i] is PropertySymbol prop &&
-                            string.Equals(prop.Name, "Length", StringComparison.Ordinal) &&
+                            prop.Name == "Length" &&
                             prop.GetMethod is MethodSymbol getter)
                         {
                             return new BoundCallExpression(syntax, arrayExpr, getter, ImmutableArray<BoundExpression>.Empty);
@@ -3561,7 +3681,7 @@ namespace Cnidaria.Cs
                     for (int i = 0; i < members.Length; i++)
                     {
                         if (members[i] is MethodSymbol method &&
-                            string.Equals(method.Name, "GetPinnableReference", StringComparison.Ordinal) &&
+                            method.Name == "GetPinnableReference" &&
                             !method.IsStatic &&
                             method.TypeParameters.Length == 0 &&
                             method.Parameters.Length == 0 &&
@@ -3726,16 +3846,19 @@ namespace Cnidaria.Cs
 
                         for (int i = 0; i < n; i++)
                         {
-                            var src = RewriteExpression(lit.Elements[i]);
+                            // A nested literal has no value type until its target element gives it one
+                            BoundExpression src = lit.Elements[i];
                             var targetType = toTuple.ElementTypes[i];
 
                             var conv = LocalScopeBinder.ClassifyConversion(src, targetType);
                             if (!conv.Exists)
                                 throw new InvalidOperationException($"No element conversion for tuple element {i}.");
 
-                            BoundExpression e = conv.Kind == ConversionKind.Identity
-                                ? src
-                                : new BoundConversionExpression(exprSyntax, targetType, src, conv, effectiveChecked);
+                            BoundExpression e = src.Type is DefaultLiteralTypeSymbol
+                                ? MakeDefaultValue(exprSyntax, targetType)
+                                : conv.Kind == ConversionKind.Identity
+                                    ? src
+                                    : new BoundConversionExpression(exprSyntax, targetType, src, conv, effectiveChecked);
 
                             // Lower nested tuple conversions before construction
                             e = RewriteExpression(e);
@@ -4202,12 +4325,12 @@ namespace Cnidaria.Cs
                     var definition = named.OriginalDefinition;
                     if (definition.Arity != 1)
                         return false;
-                    if (!string.Equals(definition.Name, "Span", StringComparison.Ordinal) &&
-                        !string.Equals(definition.Name, "ReadOnlySpan", StringComparison.Ordinal))
+                    if (definition.Name != "Span" &&
+                        definition.Name != "ReadOnlySpan")
                         return false;
 
                     return definition.ContainingSymbol is NamespaceSymbol ns &&
-                           string.Equals(ns.Name, "System", StringComparison.Ordinal);
+                           ns.Name == "System";
                 }
 
                 private static bool IsAllowedSpanMemberRead(Symbol member)
@@ -4215,15 +4338,15 @@ namespace Cnidaria.Cs
                     if (member is not PropertySymbol property || property.IsStatic)
                         return false;
 
-                    return string.Equals(property.Name, "Length", StringComparison.Ordinal) ||
-                           string.Equals(property.Name, "IsEmpty", StringComparison.Ordinal);
+                    return property.Name == "Length" ||
+                           property.Name == "IsEmpty";
                 }
 
                 private static bool IsNamespace(Symbol? symbol, params string[] names)
                 {
                     for (int i = names.Length - 1; i >= 0; i--)
                     {
-                        if (symbol is not NamespaceSymbol ns || !string.Equals(ns.Name, names[i], StringComparison.Ordinal))
+                        if (symbol is not NamespaceSymbol ns || ns.Name != names[i])
                             return false;
                         symbol = ns.ContainingSymbol;
                     }
@@ -4454,7 +4577,7 @@ namespace Cnidaria.Cs
                 var members = type.GetMembers();
                 for (int i = 0; i < members.Length; i++)
                 {
-                    if (members[i] is FieldSymbol f && string.Equals(f.Name, fieldName, StringComparison.Ordinal))
+                    if (members[i] is FieldSymbol f && f.Name == fieldName)
                         return f;
                 }
                 throw new InvalidOperationException($"Field '{fieldName}' not found in '{type.Name}'.");
@@ -4543,7 +4666,7 @@ namespace Cnidaria.Cs
                     {
                         if (members[i] is not MethodSymbol m) continue;
                         if (!m.IsStatic) continue;
-                        if (!string.Equals(m.Name, "Concat", StringComparison.Ordinal)) continue;
+                        if (m.Name != "Concat") continue;
                         if (!ReferenceEquals(m.ReturnType, stringType)) continue;
 
                         var mp = m.Parameters;
@@ -4928,7 +5051,7 @@ namespace Cnidaria.Cs
                 {
                     if (member is not MethodSymbol method || !method.IsStatic || method.IsConstructor)
                         continue;
-                    if (!string.Equals(method.Name, "Add", StringComparison.Ordinal))
+                    if (method.Name != "Add")
                         continue;
                     if (method.TypeParameters.Length != 1)
                         continue;
@@ -4975,7 +5098,7 @@ namespace Cnidaria.Cs
                         var children = current.GetNamespaceMembers();
                         for (int j = 0; j < children.Length; j++)
                         {
-                            if (string.Equals(children[j].Name, parts[i], StringComparison.Ordinal))
+                            if (children[j].Name == parts[i])
                             {
                                 next = children[j];
                                 break;
@@ -5896,9 +6019,9 @@ namespace Cnidaria.Cs
                 {
                     var def = nt.OriginalDefinition;
                     if (def.Arity == 1
-                        && string.Equals(def.Name, "Nullable", StringComparison.Ordinal)
+                        && def.Name == "Nullable"
                         && def.ContainingSymbol is NamespaceSymbol ns
-                        && string.Equals(ns.Name, "System", StringComparison.Ordinal))
+                        && ns.Name == "System")
                     {
                         nullableType = nt;
                         underlying = nt.TypeArguments[0];
@@ -5914,7 +6037,7 @@ namespace Cnidaria.Cs
             {
                 foreach (var m in nullableType.GetMembers())
                 {
-                    if (m is PropertySymbol ps && string.Equals(ps.Name, "HasValue", StringComparison.Ordinal))
+                    if (m is PropertySymbol ps && ps.Name == "HasValue")
                         return ps.GetMethod;
                 }
                 return null;

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Linq;
 
 namespace Cnidaria.Cs
 {
@@ -30,6 +31,8 @@ namespace Cnidaria.Cs
 
         private readonly Dictionary<(Symbol container, string name, int arity), NamedTypeSymbol> _typeCache = new();
         private readonly Dictionary<NamedTypeSymbol, int> _extensionBlockCounts = new();
+        private readonly Dictionary<(NamedTypeSymbol Container, string Name), (SyntaxTree Tree, EventFieldDeclarationSyntax Syntax, VariableDeclaratorSyntax Declarator)> _partialEventDefinitions = new();
+        private readonly Dictionary<(NamedTypeSymbol Container, string Name), SourceEventSymbol> _partialEventImplementations = new();
 
         private SyntaxTree? _topLevelTree;
         private SourceNamedTypeSymbol? _topLevelProgram;
@@ -55,7 +58,9 @@ namespace Cnidaria.Cs
                 DeclareCompilationUnit(tree, tree.Root, _global);
             }
             CompleteDelegateBaseTypes();
+            CompletePartialEvents();
             DeclareRecordConstructors();
+            DeclarePrimaryConstructors();
             SynthesizeDefaultConstructors();
             SynthesizeTypeInitializers();
             var immutable = _declByTree.ToImmutableDictionary(
@@ -64,6 +69,82 @@ namespace Cnidaria.Cs
 
             return new DeclarationResult(_global, immutable);
         }
+        private void DeclarePrimaryConstructors()
+        {
+            foreach (SourceNamedTypeSymbol type in _typeCache.Values.OfType<SourceNamedTypeSymbol>())
+            {
+                if (type.IsRecord)
+                    continue;
+                foreach (SyntaxReference declaration in type.DeclaringSyntaxReferences)
+                {
+                    if (declaration.Node is not (ClassDeclarationSyntax or StructDeclarationSyntax))
+                        continue;
+                    var syntax = (TypeDeclarationSyntax)declaration.Node;
+                    BaseListSyntax? bases = syntax is ClassDeclarationSyntax c ? c.BaseList : ((StructDeclarationSyntax)syntax).BaseList;
+                    if (syntax.ParameterList is not ParameterListSyntax parameters)
+                    {
+                        if (bases?.Types.Any(t => t is PrimaryConstructorBaseTypeSyntax) == true)
+                            _diagnostics.Add(new Diagnostic("CS8861", DiagnosticSeverity.Error,
+                                "A base argument list requires a primary constructor.", new Location(declaration.SyntaxTree, syntax.Span)));
+                        continue;
+                    }
+                    if (type.PrimaryConstructorInfo is not null)
+                    {
+                        _diagnostics.Add(new Diagnostic("CS8863", DiagnosticSeverity.Error,
+                            "Only a single partial type declaration may have a parameter list.", new Location(declaration.SyntaxTree, parameters.Span)));
+                        continue;
+                    }
+                    if (HasModifier(syntax.Modifiers, SyntaxKind.StaticKeyword))
+                        _diagnostics.Add(new Diagnostic("CS0710", DiagnosticSeverity.Error,
+                            "Static classes cannot have instance constructors.", new Location(declaration.SyntaxTree, parameters.Span)));
+                    if (type.IsValueType && parameters.Parameters.Count == 0)
+                        _diagnostics.Add(new Diagnostic("CS8958", DiagnosticSeverity.Error,
+                            "A struct primary constructor must have at least one parameter.", new Location(declaration.SyntaxTree, parameters.Span)));
+                    SourceMethodSymbol constructor = DeclarePrimaryConstructor(type, declaration.SyntaxTree, parameters, isRecord: false);
+                    type.PrimaryConstructorInfo = new PrimaryConstructorInfo(type, declaration.SyntaxTree, syntax, constructor);
+                }
+            }
+        }
+
+        private SourceMethodSymbol DeclarePrimaryConstructor(SourceNamedTypeSymbol type, SyntaxTree tree, ParameterListSyntax list, bool isRecord)
+        {
+            var constructor = new SourceMethodSymbol(isRecord ? ".ctor" : type.Name, type, _types.GetSpecialType(SpecialType.System_Void),
+                ImmutableArray<TypeParameterSymbol>.Empty, false, true, false,
+                ImmutableArray.Create(new Location(tree, list.Span)),
+                type.IsAbstract ? Accessibility.Protected : Accessibility.Public, isUnsafe: Binder.IsUnsafeContext(type));
+            var parameters = ImmutableArray.CreateBuilder<ParameterSymbol>(list.Parameters.Count);
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            bool seenOptional = false;
+            foreach (ParameterSyntax syntax in list.Parameters)
+            {
+                if (!names.Add(syntax.Identifier.ValueText ?? ""))
+                    _diagnostics.Add(new Diagnostic("CS0100", DiagnosticSeverity.Error,
+                        "A parameter name must be unique.", new Location(tree, syntax.Span)));
+                ParameterRefKind refKind = GetParameterRefKind(syntax);
+                if (isRecord && (refKind == ParameterRefKind.Out || refKind == ParameterRefKind.Ref && !IsReadOnlyByRefParameter(syntax)) || HasModifier(syntax.Modifiers, SyntaxKind.ThisKeyword))
+                    _diagnostics.Add(new Diagnostic("CS0631", DiagnosticSeverity.Error,
+                        isRecord ? "Record parameters cannot have 'ref', 'out', or 'this' modifiers." : "A primary constructor parameter cannot have the 'this' modifier.", new Location(tree, syntax.Span)));
+                if (IsParamsParameter(syntax) && parameters.Count + 1 != list.Parameters.Count)
+                    _diagnostics.Add(new Diagnostic("CS0231", DiagnosticSeverity.Error,
+                        "A params parameter must be the last parameter.", new Location(tree, syntax.Span)));
+                if (syntax.Default is null && seenOptional && !IsParamsParameter(syntax))
+                    _diagnostics.Add(new Diagnostic("CS1737", DiagnosticSeverity.Error,
+                        "Optional parameters must appear after all required parameters.", new Location(tree, syntax.Span)));
+                seenOptional |= syntax.Default is not null;
+                var parameter = new ParameterSymbol(syntax.Identifier.ValueText ?? "", constructor,
+                    new ErrorTypeSymbol("unbound-param", null, ImmutableArray<Location>.Empty),
+                    ImmutableArray.Create(new Location(tree, syntax.Span)),
+                    IsReadOnlyByRefParameter(syntax), GetParameterRefKind(syntax), IsScopedParameter(syntax), IsParamsParameter(syntax));
+                parameters.Add(parameter);
+                RecordDeclared(tree, syntax, parameter);
+            }
+            constructor.SetParameters(parameters.ToImmutable());
+            constructor.AddDeclaration(new SyntaxReference(tree, list));
+            type.AddMember(constructor);
+            RecordDeclared(tree, list, constructor);
+            return constructor;
+        }
+
         private void SynthesizeDefaultConstructors()
         {
             foreach (var kv in _typeCache)
@@ -94,7 +175,8 @@ namespace Cnidaria.Cs
             bool needsCctor = false;
             for (int i = 0; i < members.Length; i++)
             {
-                if (members[i] is not (SourceFieldSymbol { IsStatic: true, IsConst: false } or SourcePropertySymbol { IsStatic: true }))
+                bool isStaticEvent = members[i] is SourceEventSymbol declaredEvent && declaredEvent.IsStatic;
+                if (!isStaticEvent && members[i] is not (SourceFieldSymbol { IsStatic: true, IsConst: false } or SourcePropertySymbol { IsStatic: true }))
                     continue;
 
                 var declRefs = members[i].DeclaringSyntaxReferences;
@@ -159,7 +241,8 @@ namespace Cnidaria.Cs
             // A struct has no implicit constructor to run field initializers, so one must be declared (CS8983).
             for (int i = 0; i < members.Length; i++)
             {
-                if (members[i] is not (SourceFieldSymbol { IsStatic: false } or SourcePropertySymbol { IsStatic: false }))
+                bool isInstanceEvent = members[i] is SourceEventSymbol declaredEvent && !declaredEvent.IsStatic;
+                if (!isInstanceEvent && members[i] is not (SourceFieldSymbol { IsStatic: false } or SourcePropertySymbol { IsStatic: false }))
                     continue;
                 var declRefs = members[i].DeclaringSyntaxReferences;
                 if (!declRefs.IsDefaultOrEmpty &&
@@ -594,7 +677,11 @@ namespace Cnidaria.Cs
             if (isUnsafe && type is SourceNamedTypeSymbol unsafeSourceType)
                 unsafeSourceType.MarkUnsafe();
             if (type is SpecialNamedTypeSymbol declaredSpecial)
+            {
                 declaredSpecial.SetDeclaredAccessibility(declaredAcc);
+                if (isUnsafe)
+                    declaredSpecial.MarkUnsafe();
+            }
             if (kind == TypeKind.Class && isSealed)
             {
                 switch (type)
@@ -659,6 +746,12 @@ namespace Cnidaria.Cs
                     case FieldDeclarationSyntax fd:
                         DeclareFieldDeclaration(tree, fd, type);
                         break;
+                    case EventFieldDeclarationSyntax ef:
+                        DeclareEventFieldDeclaration(tree, ef, type);
+                        break;
+                    case EventDeclarationSyntax ed:
+                        DeclareEventDeclaration(tree, ed, type);
+                        break;
                     case PropertyDeclarationSyntax pd:
                         DeclarePropertyDeclaration(tree, pd, type);
                         break;
@@ -667,6 +760,9 @@ namespace Cnidaria.Cs
                         break;
                     case ConstructorDeclarationSyntax cd:
                         DeclareConstructorDeclaration(tree, cd, type);
+                        break;
+                    case DestructorDeclarationSyntax dd:
+                        DeclareDestructorDeclaration(tree, dd, type);
                         break;
                     case OperatorDeclarationSyntax ods:
                         DeclareOperatorDeclaration(tree, ods, type);
@@ -1482,12 +1578,34 @@ namespace Cnidaria.Cs
             RecordDeclared(tree, syntax, method);
         }
 
+        // No source generator fills in a LibraryImport method, so its partial declaration is the import itself
+        private static bool IsLibraryImportDeclaration(MethodDeclarationSyntax syntax)
+        {
+            if (!HasModifier(syntax.Modifiers, SyntaxKind.PartialKeyword) || syntax.Body is not null || syntax.ExpressionBody is not null)
+                return false;
+
+            for (int i = 0; i < syntax.AttributeLists.Count; i++)
+            {
+                AttributeListSyntax list = syntax.AttributeLists[i];
+                for (int j = 0; j < list.Attributes.Count; j++)
+                {
+                    NameSyntax name = list.Attributes[j].Name;
+                    while (name is QualifiedNameSyntax qualified)
+                        name = qualified.Right;
+                    if (name is IdentifierNameSyntax identifier && identifier.Identifier.ValueText is "LibraryImport" or "LibraryImportAttribute")
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
         private void DeclareMethodDeclaration(SyntaxTree tree, MethodDeclarationSyntax syntax, NamedTypeSymbol container)
         {
             var name = syntax.Identifier.ValueText ?? "";
             var isStatic = HasModifier(syntax.Modifiers, SyntaxKind.StaticKeyword);
             var isAsync = HasModifier(syntax.Modifiers, SyntaxKind.AsyncKeyword);
-            var isExtern = HasModifier(syntax.Modifiers, SyntaxKind.ExternKeyword);
+            bool isExtern = HasModifier(syntax.Modifiers, SyntaxKind.ExternKeyword) || IsLibraryImportDeclaration(syntax);
             var isOverride = HasModifier(syntax.Modifiers, SyntaxKind.OverrideKeyword);
             var isAbstract = HasModifier(syntax.Modifiers, SyntaxKind.AbstractKeyword);
             var isVirtualKeyword = HasModifier(syntax.Modifiers, SyntaxKind.VirtualKeyword);
@@ -1987,6 +2105,38 @@ namespace Cnidaria.Cs
             AddMemberToType(container, ctor);
             RecordDeclared(tree, syntax, ctor);
         }
+        private void DeclareDestructorDeclaration(SyntaxTree tree, DestructorDeclarationSyntax syntax, NamedTypeSymbol container)
+        {
+            if (container.TypeKind != TypeKind.Class)
+            {
+                _diagnostics.Add(new Diagnostic(
+                    "CN_DTOR001",
+                    DiagnosticSeverity.Error,
+                    "Only class types can contain destructors.",
+                    new Location(tree, syntax.Span)));
+                return;
+            }
+
+            var finalizer = new SourceMethodSymbol(
+                name: "Finalize",
+                containing: container,
+                returnType: _types.GetSpecialType(SpecialType.System_Void),
+                typeParameters: default,
+                isStatic: false,
+                isConstructor: false,
+                isAsync: false,
+                locations: ImmutableArray.Create(new Location(tree, syntax.Span)),
+                declaredAccessibility: Accessibility.Protected,
+                isUnsafe: HasModifier(syntax.Modifiers, SyntaxKind.UnsafeKeyword) || Binder.IsUnsafeContext(container),
+                isExtern: HasModifier(syntax.Modifiers, SyntaxKind.ExternKeyword));
+            finalizer.SetDispatchFlags(isVirtual: true, isAbstract: false, isOverride: container.SpecialType != SpecialType.System_Object, isSealed: false);
+            finalizer.SetTypeParameters(ImmutableArray<TypeParameterSymbol>.Empty);
+            finalizer.SetParameters(ImmutableArray<ParameterSymbol>.Empty);
+            finalizer.AddDeclaration(new SyntaxReference(tree, syntax));
+
+            AddMemberToType(container, finalizer);
+            RecordDeclared(tree, syntax, finalizer);
+        }
         // Accessor names are fixed before attributes bind, so IndexerName is read from its syntax
         private static string IndexerMetadataName(IndexerDeclarationSyntax syntax)
         {
@@ -2092,7 +2242,8 @@ namespace Cnidaria.Cs
                     isConstructor: false,
                     isAsync: false,
                     locations: ImmutableArray.Create(loc),
-                    declaredAccessibility: getAccessibility);
+                    declaredAccessibility: getAccessibility,
+                    isExtern: HasModifier(syntax.Modifiers, SyntaxKind.ExternKeyword));
 
                 getMethod.AddDeclaration(new SyntaxReference(tree, (getAccessorSyntax ?? (SyntaxNode)syntax)));
 
@@ -2115,7 +2266,8 @@ namespace Cnidaria.Cs
                     isConstructor: false,
                     isAsync: false,
                     locations: ImmutableArray.Create(loc),
-                    declaredAccessibility: setAccessibility);
+                    declaredAccessibility: setAccessibility,
+                    isExtern: HasModifier(syntax.Modifiers, SyntaxKind.ExternKeyword));
 
                 setMethod.AddDeclaration(new SyntaxReference(tree, (setAccessorSyntax ?? (SyntaxNode)syntax)));
 
@@ -2296,7 +2448,8 @@ namespace Cnidaria.Cs
                     isConstructor: false,
                     isAsync: false,
                     locations: ImmutableArray.Create(loc),
-                    declaredAccessibility: getAccessibility);
+                    declaredAccessibility: getAccessibility,
+                    isExtern: HasModifier(syntax.Modifiers, SyntaxKind.ExternKeyword));
 
                 getMethod.SetParameters(ImmutableArray<ParameterSymbol>.Empty);
                 getMethod.AddDeclaration(new SyntaxReference(tree, (getAccessorSyntax ?? syntax as SyntaxNode)));
@@ -2320,7 +2473,8 @@ namespace Cnidaria.Cs
                     isConstructor: false,
                     isAsync: false,
                     locations: ImmutableArray.Create(loc),
-                    declaredAccessibility: setAccessibility);
+                    declaredAccessibility: setAccessibility,
+                    isExtern: HasModifier(syntax.Modifiers, SyntaxKind.ExternKeyword));
 
                 // Implicit value parameter
                 var valueParam = new ParameterSymbol(
@@ -2364,6 +2518,190 @@ namespace Cnidaria.Cs
             AddMemberToType(container, prop);
             RecordDeclared(tree, syntax, prop);
         }
+
+        private void DeclareEventFieldDeclaration(SyntaxTree tree, EventFieldDeclarationSyntax syntax, NamedTypeSymbol container)
+        {
+            foreach (VariableDeclaratorSyntax declarator in syntax.Declaration.Variables)
+            {
+                string name = declarator.Identifier.ValueText ?? "";
+                if (name.Length == 0)
+                    continue;
+
+                if (declarator.Initializer is not null && (HasModifier(syntax.Modifiers, SyntaxKind.AbstractKeyword) ||
+                    (container.TypeKind == TypeKind.Interface && !HasModifier(syntax.Modifiers, SyntaxKind.StaticKeyword))))
+                {
+                    _diagnostics.Add(new Diagnostic("CN_EVENT013", DiagnosticSeverity.Error, $"Event '{name}' has no field, so it cannot have an initializer.", new Location(tree, declarator.Span)));
+                }
+
+                if (!HasModifier(syntax.Modifiers, SyntaxKind.PartialKeyword))
+                    DeclareEvent(tree, declarator, syntax, name, syntax.Modifiers, syntax.Declaration.Type, container, addSyntax: null, removeSyntax: null);
+                else if (!_partialEventDefinitions.TryAdd((container, name), (tree, syntax, declarator)))
+                    _diagnostics.Add(new Diagnostic("CN_EVENT007", DiagnosticSeverity.Error, $"A partial event '{name}' may not have multiple defining declarations.", new Location(tree, declarator.Span)));
+            }
+        }
+
+        // The implementing part holds the accessors, so it becomes the symbol and the declaring part only adds its attributes
+        private void CompletePartialEvents()
+        {
+            foreach (((NamedTypeSymbol container, string name), (SyntaxTree tree, EventFieldDeclarationSyntax syntax, VariableDeclaratorSyntax declarator)) in _partialEventDefinitions)
+            {
+                if (!_partialEventImplementations.Remove((container, name), out SourceEventSymbol? implementation))
+                {
+                    _diagnostics.Add(new Diagnostic("CN_EVENT008", DiagnosticSeverity.Error, $"Partial event '{name}' must have an implementing declaration.", new Location(tree, declarator.Span)));
+                    continue;
+                }
+
+                Accessibility declared = DecodeDeclaredAccessibility(syntax.Modifiers, GetDefaultTypeMemberAccessibility(container), allowProtected: true, allowInternal: true, diagLocation: new Location(tree, syntax.Span));
+                if (declared != implementation.DeclaredAccessibility || HasModifier(syntax.Modifiers, SyntaxKind.StaticKeyword) != implementation.IsStatic)
+                    _diagnostics.Add(new Diagnostic("CN_EVENT009", DiagnosticSeverity.Error, $"Both declarations of partial event '{name}' must have the same accessibility and static modifier.", new Location(tree, syntax.Span)));
+
+                implementation.PartialDefinition = syntax;
+                RecordDeclared(tree, declarator, implementation);
+            }
+
+            foreach (KeyValuePair<(NamedTypeSymbol Container, string Name), SourceEventSymbol> leftover in _partialEventImplementations)
+                _diagnostics.Add(new Diagnostic("CN_EVENT010", DiagnosticSeverity.Error, $"Partial event '{leftover.Key.Name}' must have a defining declaration.", leftover.Value.Locations[0]));
+        }
+
+        private void DeclareEventDeclaration(SyntaxTree tree, EventDeclarationSyntax syntax, NamedTypeSymbol container)
+        {
+            string name = syntax.Identifier.ValueText ?? "";
+            if (name.Length == 0)
+                return;
+
+            AccessorDeclarationSyntax? addSyntax = null;
+            AccessorDeclarationSyntax? removeSyntax = null;
+            bool isAbstract = HasModifier(syntax.Modifiers, SyntaxKind.AbstractKeyword);
+            bool isExtern = HasModifier(syntax.Modifiers, SyntaxKind.ExternKeyword);
+            if (isAbstract)
+                _diagnostics.Add(new Diagnostic("CN_EVENT014", DiagnosticSeverity.Error, $"An abstract event '{name}' cannot use event accessor syntax.", new Location(tree, syntax.Span)));
+
+            foreach (AccessorDeclarationSyntax accessor in syntax.AccessorList.Accessors)
+            {
+                bool hasBody = accessor.Body is not null || accessor.ExpressionBody is not null;
+                if (accessor.Modifiers.Count != 0)
+                    _diagnostics.Add(new Diagnostic("CN_EVENT015", DiagnosticSeverity.Error, "Modifiers cannot be placed on event accessor declarations.", new Location(tree, accessor.Span)));
+                if (isExtern && hasBody)
+                    _diagnostics.Add(new Diagnostic("CN_EVENT016", DiagnosticSeverity.Error, $"An accessor of event '{name}' cannot be extern and declare a body.", new Location(tree, accessor.Span)));
+                if (!isAbstract && !isExtern && !hasBody)
+                    _diagnostics.Add(new Diagnostic("CN_EVENT017", DiagnosticSeverity.Error, "An add or remove accessor must have a body.", new Location(tree, accessor.Span)));
+
+                switch (accessor.Kind)
+                {
+                    case SyntaxKind.AddAccessorDeclaration:
+                        addSyntax ??= accessor;
+                        break;
+                    case SyntaxKind.RemoveAccessorDeclaration:
+                        removeSyntax ??= accessor;
+                        break;
+                    default:
+                        _diagnostics.Add(new Diagnostic(
+                            "CN_EVENT001",
+                            DiagnosticSeverity.Error,
+                            "An add or remove accessor expected.",
+                            new Location(tree, accessor.Span)));
+                        break;
+                }
+            }
+
+            if (addSyntax is null || removeSyntax is null)
+            {
+                _diagnostics.Add(new Diagnostic(
+                    "CN_EVENT002",
+                    DiagnosticSeverity.Error,
+                    $"Event '{name}' must declare both add and remove accessors.",
+                    new Location(tree, syntax.Span)));
+                return;
+            }
+
+            SourceEventSymbol declaredEvent = DeclareEvent(tree, syntax, syntax, name, syntax.Modifiers, syntax.Type, container, addSyntax, removeSyntax);
+            if (syntax.ExplicitInterfaceSpecifier is not null)
+                declaredEvent.MarkExplicitInterfaceDeclaration();
+            if (HasModifier(syntax.Modifiers, SyntaxKind.PartialKeyword) && !_partialEventImplementations.TryAdd((container, name), declaredEvent))
+                _diagnostics.Add(new Diagnostic("CN_EVENT011", DiagnosticSeverity.Error, $"A partial event '{name}' may not have multiple implementing declarations.", new Location(tree, syntax.Span)));
+        }
+
+        private SourceEventSymbol DeclareEvent(
+            SyntaxTree tree,
+            SyntaxNode declaration,
+            MemberDeclarationSyntax attributeOwner,
+            string name,
+            SyntaxTokenList modifiers,
+            TypeSyntax typeSyntax,
+            NamedTypeSymbol container,
+            AccessorDeclarationSyntax? addSyntax,
+            AccessorDeclarationSyntax? removeSyntax)
+        {
+            bool isStatic = HasModifier(modifiers, SyntaxKind.StaticKeyword);
+            Accessibility declaredAccessibility = DecodeDeclaredAccessibility(
+                modifiers,
+                GetDefaultTypeMemberAccessibility(container),
+                allowProtected: true,
+                allowInternal: true,
+                diagLocation: new Location(tree, declaration.Span));
+            var placeholderType = new ErrorTypeSymbol("unbound-event", containing: null, ImmutableArray<Location>.Empty);
+
+            SourceMethodSymbol DeclareAccessor(string accessorName, AccessorDeclarationSyntax? accessorSyntax)
+            {
+                SyntaxNode accessorNode = accessorSyntax ?? declaration;
+                var location = new Location(tree, accessorNode.Span);
+                var accessor = new SourceMethodSymbol(
+                    name: accessorName,
+                    containing: container,
+                    returnType: _types.GetSpecialType(SpecialType.System_Void),
+                    typeParameters: ImmutableArray<TypeParameterSymbol>.Empty,
+                    isStatic: isStatic,
+                    isConstructor: false,
+                    isAsync: false,
+                    locations: ImmutableArray.Create(location),
+                    declaredAccessibility: declaredAccessibility,
+                    isExtern: HasModifier(modifiers, SyntaxKind.ExternKeyword));
+                accessor.SetParameters(ImmutableArray.Create(new ParameterSymbol(
+                    name: "value",
+                    containing: accessor,
+                    type: placeholderType,
+                    locations: ImmutableArray.Create(location))));
+                accessor.AddDeclaration(new SyntaxReference(tree, accessorNode));
+                accessor.MarkEventAccessor();
+                AddMemberToType(container, accessor);
+                if (accessorSyntax is not null)
+                    RecordDeclared(tree, accessorSyntax, accessor);
+                return accessor;
+            }
+
+            SourceMethodSymbol addMethod = DeclareAccessor($"add_{name}", addSyntax);
+            SourceMethodSymbol removeMethod = DeclareAccessor($"remove_{name}", removeSyntax);
+            SetAccessorDispatchFlags(tree, declaration, modifiers, container, isStatic, declaredAccessibility, hasExpressionBody: false,
+                addMethod, addSyntax, removeMethod, removeSyntax);
+
+            SynthesizedBackingFieldSymbol? backingField = null;
+            if (addSyntax is null &&
+                !addMethod.IsAbstract &&
+                !HasModifier(modifiers, SyntaxKind.ExternKeyword))
+            {
+                backingField = new SynthesizedBackingFieldSymbol(name, container, placeholderType, isStatic, isReadOnly: false);
+                AddMemberToType(container, backingField);
+            }
+
+            var declaredEvent = new SourceEventSymbol(
+                name,
+                container,
+                typeSyntax,
+                placeholderType,
+                isStatic,
+                HasModifier(modifiers, SyntaxKind.UnsafeKeyword) || Binder.IsUnsafeContext(container),
+                declaredAccessibility,
+                addMethod,
+                removeMethod,
+                backingField,
+                new Location(tree, declaration.Span),
+                new SyntaxReference(tree, declaration),
+                attributeOwner);
+            AddMemberToType(container, declaredEvent);
+            RecordDeclared(tree, declaration, declaredEvent);
+            return declaredEvent;
+        }
+
         private void DeclareFieldDeclaration(SyntaxTree tree, FieldDeclarationSyntax syntax, NamedTypeSymbol container)
         {
             bool isConst = HasModifier(syntax.Modifiers, SyntaxKind.ConstKeyword);
@@ -2502,6 +2840,19 @@ namespace Cnidaria.Cs
                     containing: owner,
                     ordinal: i,
                     locations: ImmutableArray.Create(new Location(tree, p.Span)));
+
+                if (p.VarianceKeyword.Kind is SyntaxKind.OutKeyword or SyntaxKind.InKeyword)
+                {
+                    tp.Variance = p.VarianceKeyword.Kind == SyntaxKind.OutKeyword ? VarianceKind.Out : VarianceKind.In;
+                    if (owner is not NamedTypeSymbol ownerType || ownerType.TypeKind is not (TypeKind.Interface or TypeKind.Delegate))
+                    {
+                        _diagnostics.Add(new Diagnostic(
+                            "CN_VARIANCE001",
+                            DiagnosticSeverity.Error,
+                            "Invalid variance modifier. Only interface and delegate type parameters can be specified as variant.",
+                            new Location(tree, p.VarianceKeyword.Span)));
+                    }
+                }
 
                 b.Add(tp);
                 RecordDeclared(tree, p, tp);

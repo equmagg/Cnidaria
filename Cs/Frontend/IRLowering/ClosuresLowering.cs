@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
@@ -15,10 +16,15 @@ namespace Cnidaria.Cs
         private readonly ArrayTypeSymbol _cellType;
         private readonly ArrayTypeSymbol _closureType;
         private readonly Dictionary<Symbol, BoundExpression> _cellByCapturedSymbol = new(ReferenceEqualityComparer<Symbol>.Instance);
+        private readonly Dictionary<Symbol, List<LocalSymbol>> _cellLocalsByCapturedSymbol = new(ReferenceEqualityComparer<Symbol>.Instance);
         private int _tempId;
+        private BoundStatement? _rootBody;
+        private Dictionary<LocalFunctionSymbol, BoundLocalFunctionStatement>? _localFunctions;
+        // What 'this' reads as in the lambda being rewritten, null where it is the method's own
+        private BoundExpression? _currentThis;
 
         /// <summary>Represents a lowered lambda method with an explicit closure parameter</summary>
-        private sealed class ClosureLambdaMethodSymbol : MethodSymbol
+        internal sealed class ClosureLambdaMethodSymbol : MethodSymbol
         {
             public override string Name { get; }
             public override Symbol? ContainingSymbol { get; }
@@ -32,6 +38,8 @@ namespace Cnidaria.Cs
             public override bool IsConstructor => false;
             public override bool IsAsync { get; }
             private readonly MethodSymbol _original;
+            // The closure slot of each cell, for calls to local functions that capture those cells
+            public Dictionary<LocalSymbol, int> CellSlots { get; } = new(ReferenceEqualityComparer<LocalSymbol>.Instance);
             public override ImmutableArray<AttributeData> GetAttributes() => _original.GetAttributes();
 
             public ClosureLambdaMethodSymbol(MethodSymbol original, ImmutableArray<TypeParameterSymbol> typeParameters)
@@ -53,19 +61,23 @@ namespace Cnidaria.Cs
         /// <summary>Collects symbols referenced by a lambda but owned by an outer method</summary>
         private sealed class LambdaCaptureCollector : BoundTreeRewriter
         {
-            private readonly MethodSymbol _lambdaMethod;
+            private readonly LambdaClosureRewriter _rewriter;
+            private readonly HashSet<Symbol> _owners = new(ReferenceEqualityComparer<Symbol>.Instance);
             private readonly HashSet<Symbol> _seen = new(ReferenceEqualityComparer<Symbol>.Instance);
             private readonly ImmutableArray<Symbol>.Builder _captures = ImmutableArray.CreateBuilder<Symbol>();
+            private bool _usesThis;
 
-            private LambdaCaptureCollector(MethodSymbol lambdaMethod)
+            private LambdaCaptureCollector(LambdaClosureRewriter rewriter, MethodSymbol lambdaMethod)
             {
-                _lambdaMethod = lambdaMethod;
+                _rewriter = rewriter;
+                _owners.Add(lambdaMethod);
             }
 
-            public static ImmutableArray<Symbol> Collect(MethodSymbol lambdaMethod, BoundStatement body)
+            public static ImmutableArray<Symbol> Collect(LambdaClosureRewriter rewriter, MethodSymbol lambdaMethod, BoundStatement body, out bool usesThis)
             {
-                var c = new LambdaCaptureCollector(lambdaMethod);
+                var c = new LambdaCaptureCollector(rewriter, lambdaMethod);
                 c.RewriteStatement(body);
+                usesThis = c._usesThis;
                 return c._captures.ToImmutable();
             }
 
@@ -73,21 +85,58 @@ namespace Cnidaria.Cs
             {
                 switch (node)
                 {
-                    case BoundLocalExpression local when !ReferenceEquals(local.Local.ContainingSymbol, _lambdaMethod):
+                    case BoundLocalExpression local when !IsOwned(local.Local):
                         Add(local.Local);
                         return node;
 
-                    case BoundParameterExpression parameter when !ReferenceEquals(parameter.Parameter.ContainingSymbol, _lambdaMethod):
+                    case BoundParameterExpression parameter when !IsOwned(parameter.Parameter):
                         Add(parameter.Parameter);
                         return node;
 
                     case BoundThisExpression:
                     case BoundBaseExpression:
-                        throw new NotSupportedException("Capturing 'this' in lambdas is not implemented by this closure lowering pass yet.");
+                        _usesThis = true;
+                        return node;
 
                     default:
                         return base.RewriteExpressionCore(node);
                 }
+            }
+
+            protected override BoundExpression RewriteCallExpression(BoundCallExpression node)
+            {
+                if (node.ReceiverOpt is null && !node.Method.IsStatic)
+                    _usesThis = true;
+
+                // What a local function declared outside captures has to reach it through this lambda
+                if (node.Method.OriginalDefinition is LocalFunctionSymbol function &&
+                    !IsOwned(function) &&
+                    _owners.Add(function) &&
+                    _rewriter.TryGetLocalFunction(function, out BoundLocalFunctionStatement? statement))
+                {
+                    RewriteStatement(statement.Body);
+                }
+
+                return base.RewriteCallExpression(node);
+            }
+
+            // The wrapper of a local function can be declared outside the lambda converting it, its parameters are still its own
+            protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
+            {
+                _owners.Add(node.Method);
+                return base.RewriteLambdaExpression(node);
+            }
+
+            // Functions nested in the lambda own their symbols too, those are not captures of the lambda
+            private bool IsOwned(Symbol symbol)
+            {
+                for (Symbol? owner = symbol.ContainingSymbol; owner is MethodSymbol; owner = owner.ContainingSymbol)
+                {
+                    if (_owners.Contains(owner))
+                        return true;
+                }
+
+                return false;
             }
 
             private void Add(Symbol symbol)
@@ -103,34 +152,86 @@ namespace Cnidaria.Cs
         /// <summary>Finds symbols owned by a method that must be stored in closure cells</summary>
         private sealed class OwnCapturedSymbolCollector : BoundTreeRewriter
         {
+            private readonly LambdaClosureRewriter _rewriter;
             private readonly MethodSymbol _owner;
             private readonly HashSet<Symbol> _seen = new(ReferenceEqualityComparer<Symbol>.Instance);
             private readonly ImmutableArray<Symbol>.Builder _symbols = ImmutableArray.CreateBuilder<Symbol>();
 
-            private OwnCapturedSymbolCollector(MethodSymbol owner)
+            private OwnCapturedSymbolCollector(LambdaClosureRewriter rewriter, MethodSymbol owner)
             {
+                _rewriter = rewriter;
                 _owner = owner;
             }
 
-            public static ImmutableArray<Symbol> Collect(MethodSymbol owner, BoundStatement body)
+            public static ImmutableArray<Symbol> Collect(LambdaClosureRewriter rewriter, MethodSymbol owner, BoundStatement body)
             {
-                var c = new OwnCapturedSymbolCollector(owner);
+                var c = new OwnCapturedSymbolCollector(rewriter, owner);
                 c.RewriteStatement(body);
                 return c._symbols.ToImmutable();
             }
 
             protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
             {
-                var captures = LambdaCaptureCollector.Collect(node.Method, node.Body);
+                AddOwned(LambdaCaptureCollector.Collect(_rewriter, node.Method, node.Body, out _));
+                return base.RewriteLambdaExpression(node);
+            }
+
+            // A byref cannot live across a suspension, so what an async or iterator local function captures goes to cells too
+            protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
+            {
+                if (node.LocalFunction.IsAsync || IRLowering.ContainsYield(node.Body))
+                    AddOwned(LambdaCaptureCollector.Collect(_rewriter, node.LocalFunction, node.Body, out _));
+                return base.RewriteLocalFunctionStatement(node);
+            }
+
+            private void AddOwned(ImmutableArray<Symbol> captures)
+            {
                 for (int i = 0; i < captures.Length; i++)
                 {
                     var s = captures[i];
                     if (ReferenceEquals(s.ContainingSymbol, _owner) && _seen.Add(s))
                         _symbols.Add(s);
                 }
-
-                return base.RewriteLambdaExpression(node);
             }
+        }
+
+        private sealed class LocalFunctionIndexer : BoundTreeRewriter
+        {
+            private readonly Dictionary<LocalFunctionSymbol, BoundLocalFunctionStatement> _localFunctions;
+
+            public LocalFunctionIndexer(Dictionary<LocalFunctionSymbol, BoundLocalFunctionStatement> localFunctions)
+            {
+                _localFunctions = localFunctions;
+            }
+
+            protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
+            {
+                _localFunctions[node.LocalFunction] = node;
+                return base.RewriteLocalFunctionStatement(node);
+            }
+        }
+
+        private bool TryGetLocalFunction(LocalFunctionSymbol function, [NotNullWhen(true)] out BoundLocalFunctionStatement? statement)
+        {
+            if (_localFunctions is null)
+            {
+                _localFunctions = new Dictionary<LocalFunctionSymbol, BoundLocalFunctionStatement>(ReferenceEqualityComparer<LocalFunctionSymbol>.Instance);
+                if (_rootBody is not null)
+                    new LocalFunctionIndexer(_localFunctions).RewriteNode(_rootBody);
+            }
+
+            return _localFunctions.TryGetValue(function, out statement);
+        }
+
+        private static NamedTypeSymbol GetThisType(MethodSymbol method)
+        {
+            for (Symbol? owner = method.ContainingSymbol; owner is not null; owner = owner.ContainingSymbol)
+            {
+                if (owner is NamedTypeSymbol type)
+                    return type;
+            }
+
+            throw new InvalidOperationException($"Lambda '{method.Name}' has no containing type.");
         }
 
         /// <summary>Preserves a captured symbol mapping while entering a nested method scope</summary>
@@ -167,6 +268,7 @@ namespace Cnidaria.Cs
 
         protected override BoundMethodBody RewriteMethodBody(BoundMethodBody node)
         {
+            _rootBody = node.Body;
             var body = RewriteMethodLike(node.Syntax, node.Method, node.Body, closureParameterOpt: null, externalCaptures: ImmutableArray<Symbol>.Empty, out _);
             if (!ReferenceEquals(body, node.Body))
                 return new BoundMethodBody(node.Syntax, node.Method, body);
@@ -177,19 +279,20 @@ namespace Cnidaria.Cs
         /// <summary>Rewrites a lambda body and materializes its closure target when captures exist</summary>
         protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
         {
-            var externalCaptures = LambdaCaptureCollector.Collect(node.Method, node.Body);
-            if (node.IsStatic && !externalCaptures.IsDefaultOrEmpty)
-                throw new NotSupportedException("Static anonymous functions cannot capture locals or parameters.");
+            ImmutableArray<Symbol> externalCaptures = LambdaCaptureCollector.Collect(this, node.Method, node.Body, out bool usesThis);
 
             ParameterSymbol? closureParameter = null;
             MethodSymbol targetMethod = node.Method;
             BoundExpression? target = node.TargetOpt is null ? null : RewriteExpression(node.TargetOpt);
-            var enclosingTypeParameters = GetEnclosingMethodTypeParameters(node.Method);
+            BoundExpression? thisInBody = null;
+            ImmutableArray<TypeParameterSymbol> enclosingTypeParameters = GetEnclosingMethodTypeParameters(node.Method);
 
-            if (!externalCaptures.IsDefaultOrEmpty || !enclosingTypeParameters.IsDefaultOrEmpty)
+            if (!externalCaptures.IsDefaultOrEmpty || usesThis || !enclosingTypeParameters.IsDefaultOrEmpty)
             {
                 var closureMethod = new ClosureLambdaMethodSymbol(node.Method, enclosingTypeParameters);
                 var parameters = ImmutableArray.CreateBuilder<ParameterSymbol>(node.Method.Parameters.Length + 1);
+                NamedTypeSymbol thisType = GetThisType(node.Method);
+                BoundExpression outerThis = _currentThis ?? new BoundThisExpression(new ThisExpressionSyntax(default), thisType);
                 if (!externalCaptures.IsDefaultOrEmpty)
                 {
                     closureParameter = new ParameterSymbol(
@@ -199,7 +302,7 @@ namespace Cnidaria.Cs
                         locations: ImmutableArray<Location>.Empty);
                     parameters.Add(closureParameter);
 
-                    var cells = ImmutableArray.CreateBuilder<BoundExpression>(externalCaptures.Length);
+                    ImmutableArray<BoundExpression>.Builder cells = ImmutableArray.CreateBuilder<BoundExpression>(externalCaptures.Length + 1);
                     for (int i = 0; i < externalCaptures.Length; i++)
                     {
                         if (!_cellByCapturedSymbol.TryGetValue(externalCaptures[i], out var cell))
@@ -208,15 +311,44 @@ namespace Cnidaria.Cs
                                 $"Cannot build closure for captured symbol '{externalCaptures[i].Name}'. The defining scope has not been closure-lowered.");
                         }
                         cells.Add(cell);
+                        if (_cellLocalsByCapturedSymbol.TryGetValue(externalCaptures[i], out List<LocalSymbol>? cellLocals))
+                        {
+                            foreach (LocalSymbol cellLocal in cellLocals)
+                                closureMethod.CellSlots[cellLocal] = i;
+                        }
+                    }
+                    // 'this' never changes, so each closure can hold its own cell for it
+                    if (usesThis)
+                    {
+                        cells.Add(new BoundClosureCellCreationExpression(node.Syntax, _cellType, thisType, outerThis));
+                        thisInBody = new BoundClosureAccessExpression(
+                            node.Syntax,
+                            thisType,
+                            new BoundClosureSlotExpression(node.Syntax, _cellType, new BoundParameterExpression(node.Syntax, closureParameter), externalCaptures.Length));
                     }
                     target = new BoundClosureCreationExpression(node.Syntax, _closureType, cells.ToImmutable());
+                }
+                else if (usesThis)
+                {
+                    // Nothing else is captured, so the delegate closes over 'this' directly
+                    var thisParameter = new ParameterSymbol(
+                        name: "<>this",
+                        containing: closureMethod,
+                        type: thisType,
+                        locations: ImmutableArray<Location>.Empty);
+                    parameters.Add(thisParameter);
+                    thisInBody = new BoundParameterExpression(node.Syntax, thisParameter);
+                    target = outerThis;
                 }
                 parameters.AddRange(node.Method.Parameters);
                 closureMethod.SetParameters(parameters.ToImmutable());
                 targetMethod = closureMethod;
             }
 
-            var body = RewriteMethodLike(node.Syntax, node.Method, node.Body, closureParameter, externalCaptures, out _);
+            BoundExpression? outerThisInBody = _currentThis;
+            _currentThis = thisInBody;
+            BoundStatement body = RewriteMethodLike(node.Syntax, node.Method, node.Body, closureParameter, externalCaptures, out _);
+            _currentThis = outerThisInBody;
 
             if (!ReferenceEquals(body, node.Body) || !ReferenceEquals(targetMethod, node.Method) || !ReferenceEquals(target, node.TargetOpt))
             {
@@ -235,6 +367,9 @@ namespace Cnidaria.Cs
         }
         protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
         {
+            // A local function has its own 'this', whoever calls it passes the one they have
+            BoundExpression? outerThis = _currentThis;
+            _currentThis = null;
             var body = RewriteMethodLike(
                 node.Syntax,
                 node.LocalFunction,
@@ -242,6 +377,7 @@ namespace Cnidaria.Cs
                 closureParameterOpt: null,
                 externalCaptures: ImmutableArray<Symbol>.Empty,
                 out var bodyChanged);
+            _currentThis = outerThis;
 
             if (bodyChanged || !ReferenceEquals(body, node.Body))
             {
@@ -308,9 +444,30 @@ namespace Cnidaria.Cs
                 case BoundParameterExpression parameter when _cellByCapturedSymbol.TryGetValue(parameter.Parameter, out var parameterCell):
                     return new BoundClosureAccessExpression(parameter.Syntax, parameter.Parameter.Type, parameterCell);
 
+                case BoundThisExpression when _currentThis is not null:
+                    return _currentThis;
+
+                // Still a base expression, a base call must stay non-virtual
+                case BoundBaseExpression baseExpression when _currentThis is not null:
+                    return new BoundBaseExpression((ExpressionSyntax)baseExpression.Syntax, baseExpression.ContainingType, baseExpression.BaseType, _currentThis);
+
                 default:
                     return base.RewriteExpressionCore(node);
             }
+        }
+
+        protected override BoundExpression RewriteCallExpression(BoundCallExpression node)
+        {
+            BoundExpression rewritten = base.RewriteCallExpression(node);
+            if (_currentThis is null ||
+                rewritten is not BoundCallExpression call ||
+                call.ReceiverOpt is not null ||
+                call.Method.IsStatic)
+            {
+                return rewritten;
+            }
+
+            return new BoundCallExpression(call.Syntax, _currentThis, call.Method, call.Arguments, call.ConstrainedToTypeOpt);
         }
 
         /// <summary>Rewrites a method-like body under the closure cells visible in that scope</summary>
@@ -335,28 +492,45 @@ namespace Cnidaria.Cs
                 _cellByCapturedSymbol[symbol] = cell;
             }
 
+            LocalSymbol NewCellLocal(Symbol symbol)
+            {
+                var cellLocal = new LocalSymbol(
+                    name: $"<>cell{_tempId++}_{symbol.Name}",
+                    containing: method,
+                    type: _cellType,
+                    locations: ImmutableArray<Location>.Empty);
+                if (!_cellLocalsByCapturedSymbol.TryGetValue(symbol, out List<LocalSymbol>? cellLocals))
+                    _cellLocalsByCapturedSymbol.Add(symbol, cellLocals = new List<LocalSymbol>());
+                cellLocals.Add(cellLocal);
+                return cellLocal;
+            }
+
             try
             {
                 if (closureParameterOpt is not null)
                 {
                     var closureExpr = new BoundParameterExpression(syntax, closureParameterOpt);
+                    // A local function here gets the cells themselves, which a lambda nested next to it can hold too
+                    var declaredFunctions = new Dictionary<LocalFunctionSymbol, BoundLocalFunctionStatement>(ReferenceEqualityComparer<LocalFunctionSymbol>.Instance);
+                    new LocalFunctionIndexer(declaredFunctions).RewriteNode(body);
                     for (int i = 0; i < externalCaptures.Length; i++)
                     {
-                        PushCell(
-                            externalCaptures[i],
-                            new BoundClosureSlotExpression(syntax, _cellType, closureExpr, i));
+                        BoundExpression cell = new BoundClosureSlotExpression(syntax, _cellType, closureExpr, i);
+                        if (declaredFunctions.Count != 0)
+                        {
+                            LocalSymbol cellLocal = NewCellLocal(externalCaptures[i]);
+                            prologue.Add(new BoundLocalDeclarationStatement(syntax, cellLocal, cell));
+                            cell = new BoundLocalExpression(syntax, cellLocal);
+                        }
+                        PushCell(externalCaptures[i], cell);
                     }
                 }
 
-                var ownCaptured = OwnCapturedSymbolCollector.Collect(method, body);
+                ImmutableArray<Symbol> ownCaptured = OwnCapturedSymbolCollector.Collect(this, method, body);
                 for (int i = 0; i < ownCaptured.Length; i++)
                 {
                     var symbol = ownCaptured[i];
-                    var cellLocal = new LocalSymbol(
-                        name: $"<>cell{_tempId++}_{symbol.Name}",
-                        containing: method,
-                        type: _cellType,
-                        locations: ImmutableArray<Location>.Empty);
+                    LocalSymbol cellLocal = NewCellLocal(symbol);
                     var cellExpr = new BoundLocalExpression(syntax, cellLocal);
                     PushCell(symbol, cellExpr);
 
@@ -434,7 +608,12 @@ namespace Cnidaria.Cs
     {
         private readonly Compilation _compilation;
         private readonly List<Dictionary<LocalFunctionSymbol, CaptureInfo>> _localFunctionScopes = new();
-        private readonly Dictionary<Symbol, ParameterSymbol> _captureParameterMap =
+        private readonly Dictionary<LocalFunctionSymbol, BoundLocalFunctionStatement> _localFunctionStatements =
+            new(ReferenceEqualityComparer<LocalFunctionSymbol>.Instance);
+        private Dictionary<Symbol, ParameterSymbol> _captureParameterMap =
+            new(ReferenceEqualityComparer<Symbol>.Instance);
+        // Inside a lambda, where the closure holds the cells that local functions it calls capture
+        private Dictionary<Symbol, BoundExpression> _closureSlots =
             new(ReferenceEqualityComparer<Symbol>.Instance);
 
         /// <summary>Describes the lowered signature and capture order of a local function</summary>
@@ -482,21 +661,30 @@ namespace Cnidaria.Cs
             private readonly MethodSymbol _owner;
             private readonly HashSet<Symbol> _seen = new(ReferenceEqualityComparer<Symbol>.Instance);
             private readonly ImmutableArray<Symbol>.Builder _captures = ImmutableArray.CreateBuilder<Symbol>();
+            private readonly List<LocalFunctionSymbol> _called = new();
 
             private CaptureCollector(MethodSymbol owner)
             {
                 _owner = owner;
             }
 
-            public static ImmutableArray<Symbol> Collect(MethodSymbol owner, BoundStatement body)
+            public static ImmutableArray<Symbol> Collect(MethodSymbol owner, BoundStatement body, out List<LocalFunctionSymbol> called)
             {
                 var collector = new CaptureCollector(owner);
                 collector.RewriteStatement(body);
+                called = collector._called;
                 return collector._captures.ToImmutable();
             }
 
             protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
                 => node;
+
+            protected override BoundExpression RewriteCallExpression(BoundCallExpression node)
+            {
+                if (node.Method.OriginalDefinition is LocalFunctionSymbol function)
+                    _called.Add(function);
+                return base.RewriteCallExpression(node);
+            }
 
             protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
             {
@@ -635,19 +823,42 @@ namespace Cnidaria.Cs
         private BoundExpression RewriteClosedLambdaExpression(BoundLambdaExpression node)
         {
             var target = node.TargetOpt is null ? null : RewriteExpression(node.TargetOpt);
-            if (!ReferenceEquals(target, node.TargetOpt))
+
+            // The hidden parameters around a lambda are out of its reach, it only has what its closure holds
+            Dictionary<Symbol, ParameterSymbol> outerParameters = _captureParameterMap;
+            Dictionary<Symbol, BoundExpression> outerSlots = _closureSlots;
+            _captureParameterMap = new Dictionary<Symbol, ParameterSymbol>(ReferenceEqualityComparer<Symbol>.Instance);
+            _closureSlots = CreateClosureSlots(node);
+            BoundStatement body = RewriteStatement(node.Body);
+            _captureParameterMap = outerParameters;
+            _closureSlots = outerSlots;
+
+            if (!ReferenceEquals(target, node.TargetOpt) || !ReferenceEquals(body, node.Body))
             {
                 return new BoundLambdaExpression(
                     (ExpressionSyntax)node.Syntax,
                     (NamedTypeSymbol)node.Type,
                     node.Method,
                     node.InvokeMethod,
-                    node.Body,
+                    body,
                     node.IsStatic,
                     node.IsAsync,
                     target);
             }
             return node;
+        }
+
+        private Dictionary<Symbol, BoundExpression> CreateClosureSlots(BoundLambdaExpression node)
+        {
+            var slots = new Dictionary<Symbol, BoundExpression>(ReferenceEqualityComparer<Symbol>.Instance);
+            if (node.Method is not LambdaClosureRewriter.ClosureLambdaMethodSymbol closureMethod || closureMethod.CellSlots.Count == 0)
+                return slots;
+
+            TypeSymbol intType = _compilation.GetSpecialType(SpecialType.System_Int32);
+            var closure = new BoundParameterExpression(node.Syntax, closureMethod.Parameters[0]);
+            foreach ((LocalSymbol cell, int slot) in closureMethod.CellSlots)
+                slots[cell] = new BoundArrayElementAccessExpression(node.Syntax, cell.Type, closure, new BoundLiteralExpression(node.Syntax, intType, slot));
+            return slots;
         }
 
         /// <summary>Appends hidden capture arguments to local function calls</summary>
@@ -670,10 +881,9 @@ namespace Cnidaria.Cs
                         var hiddenParameter = info.HiddenParameters[i];
                         var capturedValue = MakeCurrentCaptureValueExpression(node.Syntax, info.CapturedSymbols[i]);
 
-                        builder.Add(new BoundRefExpression(
-                            node.Syntax,
-                            hiddenParameter.Type,
-                            capturedValue));
+                        builder.Add(hiddenParameter.Type is ByRefTypeSymbol
+                            ? new BoundRefExpression(node.Syntax, hiddenParameter.Type, capturedValue)
+                            : capturedValue);
                     }
 
                     rewrittenArguments = builder.ToImmutable();
@@ -754,6 +964,9 @@ namespace Cnidaria.Cs
         {
             var map = new Dictionary<LocalFunctionSymbol, CaptureInfo>(ReferenceEqualityComparer<LocalFunctionSymbol>.Instance);
 
+            // A local function may call one declared later in its scope
+            RegisterLocalFunctions(statements);
+
             for (int i = 0; i < statements.Length; i++)
             {
                 if (statements[i] is BoundLocalFunctionStatement localFunction)
@@ -770,8 +983,19 @@ namespace Cnidaria.Cs
             return map;
         }
 
+        private void RegisterLocalFunctions(ImmutableArray<BoundStatement> statements)
+        {
+            for (int i = 0; i < statements.Length; i++)
+            {
+                if (statements[i] is BoundLocalFunctionStatement localFunction)
+                    _localFunctionStatements[localFunction.LocalFunction] = localFunction;
+                else if (statements[i] is BoundBlockStatement section && section.Syntax is SwitchSectionSyntax)
+                    RegisterLocalFunctions(section.Statements);
+            }
+        }
+
         /// <summary>Collects direct and transitively required captures in stable encounter order</summary>
-        private ImmutableArray<Symbol> CollectRequiredCaptures(MethodSymbol owner, BoundStatement body)
+        private ImmutableArray<Symbol> CollectRequiredCaptures(MethodSymbol owner, BoundStatement body, HashSet<MethodSymbol> visited)
         {
             var captures = ImmutableArray.CreateBuilder<Symbol>();
             var seen = new HashSet<Symbol>(ReferenceEqualityComparer<Symbol>.Instance);
@@ -782,21 +1006,32 @@ namespace Cnidaria.Cs
                     captures.Add(symbol);
             }
 
-            var directCaptures = CaptureCollector.Collect(owner, body);
+            void AddFrom(BoundLocalFunctionStatement function)
+            {
+                ImmutableArray<Symbol> functionCaptures = CollectRequiredCaptures(function.LocalFunction, function.Body, visited);
+                for (int i = 0; i < functionCaptures.Length; i++)
+                {
+                    if (!ReferenceEquals(functionCaptures[i].ContainingSymbol, owner))
+                        Add(functionCaptures[i]);
+                }
+            }
+
+            ImmutableArray<Symbol> directCaptures = CaptureCollector.Collect(owner, body, out List<LocalFunctionSymbol> called);
             for (int i = 0; i < directCaptures.Length; i++)
                 Add(directCaptures[i]);
 
-            var nestedLocalFunctions = NestedLocalFunctionCollector.Collect(body);
+            ImmutableArray<BoundLocalFunctionStatement> nestedLocalFunctions = NestedLocalFunctionCollector.Collect(body);
             for (int i = 0; i < nestedLocalFunctions.Length; i++)
             {
-                var nested = nestedLocalFunctions[i];
-                var nestedCaptures = CollectRequiredCaptures(nested.LocalFunction, nested.Body);
-                for (int j = 0; j < nestedCaptures.Length; j++)
-                {
-                    var symbol = nestedCaptures[j];
-                    if (!ReferenceEquals(symbol.ContainingSymbol, owner))
-                        Add(symbol);
-                }
+                if (visited.Add(nestedLocalFunctions[i].LocalFunction))
+                    AddFrom(nestedLocalFunctions[i]);
+            }
+
+            // A call passes the captures of the callee on, so the caller has to hold them too
+            for (int i = 0; i < called.Count; i++)
+            {
+                if (visited.Add(called[i]) && _localFunctionStatements.TryGetValue(called[i], out BoundLocalFunctionStatement? callee))
+                    AddFrom(callee);
             }
 
             return captures.ToImmutable();
@@ -806,7 +1041,8 @@ namespace Cnidaria.Cs
         private CaptureInfo CreateCaptureInfo(BoundLocalFunctionStatement statement)
         {
             var original = statement.LocalFunction;
-            var capturedSymbols = CollectRequiredCaptures(original, statement.Body);
+            var visited = new HashSet<MethodSymbol>(ReferenceEqualityComparer<MethodSymbol>.Instance) { original };
+            ImmutableArray<Symbol> capturedSymbols = CollectRequiredCaptures(original, statement.Body, visited);
             var enclosingTypeParameters = GetEnclosingMethodTypeParameters(original);
 
             if (capturedSymbols.IsDefaultOrEmpty && enclosingTypeParameters.IsDefaultOrEmpty)
@@ -836,11 +1072,12 @@ namespace Cnidaria.Cs
             var allParameters = ImmutableArray.CreateBuilder<ParameterSymbol>(original.Parameters.Length + capturedSymbols.Length);
             allParameters.AddRange(original.Parameters);
 
+            bool suspends = original.IsAsync || IRLowering.ContainsYield(statement.Body);
             var hiddenParameters = ImmutableArray.CreateBuilder<ParameterSymbol>(capturedSymbols.Length);
             for (int i = 0; i < capturedSymbols.Length; i++)
             {
                 var symbol = capturedSymbols[i];
-                var hiddenType = GetHiddenCaptureParameterType(symbol);
+                TypeSymbol hiddenType = GetHiddenCaptureParameterType(symbol, suspends);
                 var hiddenParameter = new ParameterSymbol(
                     name: $"<>capture{i}_{symbol.Name}",
                     containing: lowered,
@@ -869,9 +1106,10 @@ namespace Cnidaria.Cs
             if (!localFunction.TypeParameters.IsDefaultOrEmpty)
                 return ImmutableArray<TypeParameterSymbol>.Empty;
 
+            // The member at the end of the chain of local functions and lambdas
             Symbol? containing = localFunction.ContainingSymbol;
-            while (containing is LocalFunctionSymbol nested)
-                containing = nested.ContainingSymbol;
+            while (containing is MethodSymbol nested && nested.ContainingSymbol is MethodSymbol enclosing)
+                containing = enclosing;
 
             if (containing is not MethodSymbol method || method.TypeParameters.IsDefaultOrEmpty)
                 return ImmutableArray<TypeParameterSymbol>.Empty;
@@ -879,11 +1117,14 @@ namespace Cnidaria.Cs
             return method.TypeParameters;
         }
 
-        /// <summary>Chooses the by-ref transport type for a captured symbol</summary>
-        private TypeSymbol GetHiddenCaptureParameterType(Symbol symbol)
+        /// <summary>Chooses the transport type for a captured symbol</summary>
+        private TypeSymbol GetHiddenCaptureParameterType(Symbol symbol, bool suspends)
         {
             return symbol switch
             {
+                // All a suspending function captures is cells and closures, which never change, so a copy is the same
+                LocalSymbol local when suspends => local.Type,
+                ParameterSymbol parameter when suspends => parameter.Type,
                 LocalSymbol local => _compilation.CreateByRefType(local.Type),
                 ParameterSymbol parameter when parameter.Type is ByRefTypeSymbol => parameter.Type,
                 ParameterSymbol parameter => _compilation.CreateByRefType(parameter.Type),
@@ -896,6 +1137,9 @@ namespace Cnidaria.Cs
         {
             if (_captureParameterMap.TryGetValue(capturedSymbol, out var parameter))
                 return new BoundParameterExpression(syntax, parameter);
+
+            if (_closureSlots.TryGetValue(capturedSymbol, out BoundExpression? slot))
+                return slot;
 
             return capturedSymbol switch
             {

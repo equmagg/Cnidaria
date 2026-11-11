@@ -27,7 +27,8 @@ namespace Cnidaria.Cs
                 }
             }
 
-            var bodyFlags = Flags;
+            // A local function inside a lambda is a function of its own, it may be an iterator
+            BinderFlags bodyFlags = Flags & ~BinderFlags.InLambda;
             if (HasModifier(lf.Modifiers, SyntaxKind.UnsafeKeyword))
                 bodyFlags |= BinderFlags.UnsafeRegion;
 
@@ -60,20 +61,19 @@ namespace Cnidaria.Cs
             }
             else if (lf.ExpressionBody != null)
             {
-                var expr = bodyBinder.BindExpression(lf.ExpressionBody.Expression, bodyCtx, diagnostics);
-
-                if (sym.ReturnType.SpecialType == SpecialType.System_Void)
+                TypeSymbol bodyReturnType = GetBodyReturnType(sym, bodyCtx.Compilation);
+                if (bodyReturnType.SpecialType == SpecialType.System_Void)
                 {
                     body = new BoundBlockStatement(lf,
-                        ImmutableArray.Create<BoundStatement>(
-                            new BoundExpressionStatement(lf.ExpressionBody, expr)));
+                        ImmutableArray.Create(bodyBinder.BindVoidExpressionBody(lf.ExpressionBody, lf.ExpressionBody.Expression, bodyCtx, diagnostics)));
                 }
                 else
                 {
+                    BoundExpression expr = bodyBinder.BindExpression(lf.ExpressionBody.Expression, bodyCtx, diagnostics);
                     expr = bodyBinder.ApplyConversion(
                         exprSyntax: lf.ExpressionBody.Expression,
                         expr: expr,
-                        targetType: sym.ReturnType,
+                        targetType: bodyReturnType,
                         diagnosticNode: lf,
                         context: bodyCtx,
                         diagnostics: diagnostics,
@@ -94,6 +94,7 @@ namespace Cnidaria.Cs
 
             if (!sym.IsExtern)
                 bodyBinder.ReportControlFlowDiagnostics(bodyCtx, diagnostics, body, lf);
+            StaticFunctionChecker.Check(sym, body, context, diagnostics);
 
             return new BoundLocalFunctionStatement(lf, sym, body);
         }
@@ -104,11 +105,18 @@ namespace Cnidaria.Cs
             var isUsingDeclaration = ld.UsingKeyword.Span.Length != 0;
             if (ld.AwaitKeyword.Span.Length != 0)
             {
-                diagnostics.Add(new Diagnostic(
-                    "CN_USING_AWAIT000",
-                    DiagnosticSeverity.Error,
-                    "await using is not supported.",
-                    new Location(context.SemanticModel.SyntaxTree, ld.AwaitKeyword.Span)));
+                if (_awaitUsingScope)
+                {
+                    isUsingDeclaration = false;
+                }
+                else
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_USING_AWAIT000",
+                        DiagnosticSeverity.Error,
+                        "An 'await using' declaration must be directly inside a block.",
+                        new Location(context.SemanticModel.SyntaxTree, ld.AwaitKeyword.Span)));
+                }
             }
 
             var isConst = HasModifier(ld.Modifiers, SyntaxKind.ConstKeyword);
@@ -1203,7 +1211,7 @@ namespace Cnidaria.Cs
                 {
                     if (members[i] is not MethodSymbol m) continue;
                     if (m.IsStatic || m.IsConstructor) continue;
-                    if (!string.Equals(m.Name, "Substring", StringComparison.Ordinal)) continue;
+                    if (m.Name != "Substring") continue;
                     if (m.Parameters.Length != desiredParamCount) continue;
                     if (!ReferenceEquals(m.ReturnType, stringType)) continue;
                     if (!ReferenceEquals(m.Parameters[0].Type, int32)) continue;
@@ -1242,7 +1250,7 @@ namespace Cnidaria.Cs
                 {
                     if (members[i] is not MethodSymbol m) continue;
                     if (m.IsStatic || m.IsConstructor) continue;
-                    if (!string.Equals(m.Name, "Slice", StringComparison.Ordinal)) continue;
+                    if (m.Name != "Slice") continue;
                     if (m.Parameters.Length != desiredParamCount) continue;
                     if (!ReferenceEquals(m.Parameters[0].Type, int32)) continue;
                     if (desiredParamCount == 2 && !ReferenceEquals(m.Parameters[1].Type, int32)) continue;
@@ -1315,7 +1323,7 @@ namespace Cnidaria.Cs
                 {
                     if (arrayMembers[i] is not MethodSymbol m) continue;
                     if (!m.IsStatic || m.IsConstructor) continue;
-                    if (!string.Equals(m.Name, "Copy", StringComparison.Ordinal)) continue;
+                    if (m.Name != "Copy") continue;
                     if (m.Parameters.Length != 5) continue;
                     if (!ReferenceEquals(m.Parameters[0].Type, arrayType)) continue;
                     if (!ReferenceEquals(m.Parameters[1].Type, int32)) continue;
@@ -1561,14 +1569,16 @@ namespace Cnidaria.Cs
                 if (sizeExprSyntax is not OmittedArraySizeExpressionSyntax)
                 {
                     var sizeExpr = BindExpression(sizeExprSyntax, context, diagnostics);
-                    sizeExpr = ApplyConversion(
+                    // uint, long and ulong sizes are valid and overflow past what an array can hold
+                    bool wideSize = sizeExpr.Type.SpecialType is SpecialType.System_UInt32 or SpecialType.System_Int64 or SpecialType.System_UInt64;
+                    sizeExpr = (wideSize ? WithFlags(ApplyCheckedContext(Flags, isChecked: true)) : this).ApplyConversion(
                         exprSyntax: sizeExprSyntax,
                         expr: sizeExpr,
                         targetType: int32,
                         diagnosticNode: node,
                         context: context,
                         diagnostics: diagnostics,
-                        requireImplicit: true);
+                        requireImplicit: !wideSize);
                     dimensionSizes.Add(sizeExpr);
                     if (TryGetInt32Constant(sizeExpr, out int size) && size < 0)
                         diagnostics.Add(new Diagnostic("CN_ARRNEW006", DiagnosticSeverity.Error,
@@ -2254,8 +2264,9 @@ namespace Cnidaria.Cs
         {
             _flow.ValidateMethodExitTransfer(rs, context, diagnostics);
             var containingMethod = context.ContainingSymbol as MethodSymbol;
-            var returnType = containingMethod?.ReturnType
-                ?? context.Compilation.GetSpecialType(SpecialType.System_Void);
+            TypeSymbol returnType = containingMethod is null
+                ? context.Compilation.GetSpecialType(SpecialType.System_Void)
+                : GetBodyReturnType(containingMethod, context.Compilation);
 
             if (rs.Expression is null)
             {

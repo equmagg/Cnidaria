@@ -114,6 +114,7 @@ namespace Cnidaria.Cs
         }
         public static uint EncodeHasConstant(int token) => Encode(EcmaCodedKind.HasConstant, token);
         public static uint EncodeHasCustomAttribute(int token) => Encode(EcmaCodedKind.HasCustomAttribute, token);
+        public static uint EncodeHasFieldMarshal(int token) => Encode(EcmaCodedKind.HasFieldMarshal, token);
         public static uint EncodeTypeOrMethodDef(int token) => Encode(EcmaCodedKind.TypeOrMethodDef, token);
     }
     internal enum EcmaColumn : byte
@@ -600,18 +601,29 @@ namespace Cnidaria.Cs
         private sealed class TableRows
         {
             public readonly int[] Counts = new int[(int)EcmaTable.Count];
-            private readonly List<(ushort Semantics, int MethodRid, int PropertyRid)> _semantics = new();
+            private readonly List<(ushort Semantics, int MethodRid, int Association)> _semantics = new();
 
             public TableRows(MetadataImage image)
             {
                 for (int i = 0; i < image.Properties.Count; i++)
                 {
                     var property = image.Properties[i];
+                    int association = MetadataToken.Make(MetadataToken.PropertyDef, i + 1);
                     if (property.SetMethod != 0)
-                        _semantics.Add((0x0001, MetadataToken.Rid(property.SetMethod), i + 1));
+                        _semantics.Add((0x0001, MetadataToken.Rid(property.SetMethod), association));
                     if (property.GetMethod != 0)
-                        _semantics.Add((0x0002, MetadataToken.Rid(property.GetMethod), i + 1));
+                        _semantics.Add((0x0002, MetadataToken.Rid(property.GetMethod), association));
                 }
+
+                for (int i = 0; i < image.Events.Count; i++)
+                {
+                    int association = MetadataToken.Make(MetadataToken.EventDef, i + 1);
+                    _semantics.Add((0x0008, MetadataToken.Rid(image.Events[i].AddMethod), association));
+                    _semantics.Add((0x0010, MetadataToken.Rid(image.Events[i].RemoveMethod), association));
+                }
+
+                // The table is sorted by its coded association, which interleaves events and properties
+                _semantics.Sort(static (a, b) => EcmaCodedIndex.Encode(EcmaCodedKind.HasSemantics, a.Association).CompareTo(EcmaCodedIndex.Encode(EcmaCodedKind.HasSemantics, b.Association)));
 
                 Counts[(int)EcmaTable.Module] = 1;
                 Counts[(int)EcmaTable.TypeRef] = image.TypeRefs.Count;
@@ -623,8 +635,11 @@ namespace Cnidaria.Cs
                 Counts[(int)EcmaTable.MemberRef] = image.MemberRefs.Count;
                 Counts[(int)EcmaTable.Constant] = image.Constants.Count;
                 Counts[(int)EcmaTable.CustomAttribute] = image.CustomAttributes.Count;
+                Counts[(int)EcmaTable.FieldMarshal] = image.FieldMarshals.Count;
                 Counts[(int)EcmaTable.ClassLayout] = image.ClassLayouts.Count;
                 Counts[(int)EcmaTable.StandAloneSig] = image.StandAloneSigs.Count;
+                Counts[(int)EcmaTable.EventMap] = image.EventMaps.Count;
+                Counts[(int)EcmaTable.Event] = image.Events.Count;
                 Counts[(int)EcmaTable.PropertyMap] = image.PropertyMaps.Count;
                 Counts[(int)EcmaTable.Property] = image.Properties.Count;
                 Counts[(int)EcmaTable.MethodSemantics] = _semantics.Count;
@@ -718,6 +733,12 @@ namespace Cnidaria.Cs
                     w.Coded(EcmaCodedKind.CustomAttributeType, row.ConstructorToken);
                     w.Value(row.Value);
                 }
+                foreach (FieldMarshalRow row in image.FieldMarshals)
+                {
+                    w.Begin(EcmaTable.FieldMarshal);
+                    w.Coded(EcmaCodedKind.HasFieldMarshal, row.ParentToken);
+                    w.Value(row.NativeType);
+                }
                 foreach (var row in image.ClassLayouts)
                 {
                     w.Begin(EcmaTable.ClassLayout);
@@ -729,6 +750,19 @@ namespace Cnidaria.Cs
                 {
                     w.Begin(EcmaTable.StandAloneSig);
                     w.Value(row.Signature);
+                }
+                foreach (EventMapRow row in image.EventMaps)
+                {
+                    w.Begin(EcmaTable.EventMap);
+                    w.Value(row.ParentTypeDefRid);
+                    w.Value(row.EventList);
+                }
+                foreach (EventRow row in image.Events)
+                {
+                    w.Begin(EcmaTable.Event);
+                    w.Value(row.Flags);
+                    w.Value(row.Name);
+                    w.Coded(EcmaCodedKind.TypeDefOrRef, row.EventType);
                 }
                 foreach (var row in image.PropertyMaps)
                 {
@@ -743,12 +777,12 @@ namespace Cnidaria.Cs
                     w.Value(row.Name);
                     w.Value(row.Signature);
                 }
-                foreach (var (semantics, methodRid, propertyRid) in _semantics)
+                foreach ((ushort semantics, int methodRid, int association) in _semantics)
                 {
                     w.Begin(EcmaTable.MethodSemantics);
                     w.Value(semantics);
                     w.Value(methodRid);
-                    w.Coded(EcmaCodedKind.HasSemantics, MetadataToken.Make(MetadataToken.PropertyDef, propertyRid));
+                    w.Coded(EcmaCodedKind.HasSemantics, association);
                 }
                 foreach (var row in image.MethodImpls)
                 {

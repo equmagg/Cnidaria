@@ -72,7 +72,7 @@ namespace Cnidaria.Cs
             diagnostics.Add(new Diagnostic(
                 "CN_FLOW016",
                 DiagnosticSeverity.Error,
-                string.Equals(method.Name, "<lambda>", StringComparison.Ordinal)
+                method.Name == "<lambda>"
                     ? "Not all code paths return a value in lambda expression."
                     : $"'{method.Name}': not all code paths return a value.",
                 new Location(context.SemanticModel.SyntaxTree, GetMissingReturnDiagnosticSpan(diagnosticNode))));
@@ -84,6 +84,8 @@ namespace Cnidaria.Cs
                 return false;
 
             var returnType = method.ReturnType;
+            if (method.IsAsync && TryGetTaskResultType(returnType, out TypeSymbol? taskResult) && taskResult is null)
+                return false;
             if (returnType.SpecialType == SpecialType.System_Void)
                 return false;
 

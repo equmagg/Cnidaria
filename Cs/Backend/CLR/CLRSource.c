@@ -80,11 +80,22 @@ rh_bytes __riscv_vmv_v_x_u8m8(u8 rs1, usize vl);
 #define RH_BLOCK_OBJECT 1ul
 #define RH_BLOCK_MARK 1ul
 #define RH_BLOCK_SCANNED 2ul
+#define RH_BLOCK_FINALIZER_RUN 4ul
 #define RH_ROOT_OBJECT 0ul
 #define RH_ROOT_INTERIOR 1ul
 #define RH_ROOT_REGISTER 2ul
 #define RH_ROOT_STACK_POINTER 4ul
+#define RH_POLL_COLLECT 1u
+#define RH_POLL_FINALIZE 2u
+#define RH_HANDLE_WEAK 0ul
+#define RH_HANDLE_WEAK_TRACK_RESURRECTION 1ul
+#define RH_HANDLE_NORMAL 2ul
+#define RH_HANDLE_PINNED 3ul
+#define RH_HANDLE_DEPENDENT 6ul
+#define RH_HANDLE_FREE 7ul
+#define RH_HANDLE_CHUNK_SLOTS 128ul
 #define RH_EETYPE_KIND_MASK 0x00030000u
+#define RH_EETYPE_HAS_FINALIZER 0x00100000u
 #define RH_EETYPE_PARAMETERIZED_KIND 0x00020000u
 #define RH_EETYPE_HAS_POINTERS 0x01000000u
 #define RH_EETYPE_ELEMENT_TYPE_MASK 0x7c000000u
@@ -253,6 +264,20 @@ struct RhObject
     const RhMethodTable* type;
 };
 
+// A free slot links to the next one through secondary
+typedef struct RhHandleSlot
+{
+    void* object;
+    void* secondary;
+    usize kind;
+} RhHandleSlot;
+
+typedef struct RhHandleChunk
+{
+    struct RhHandleChunk* next;
+    RhHandleSlot slots[RH_HANDLE_CHUNK_SLOTS];
+} RhHandleChunk;
+
 static volatile usize rh_stack_base;
 static const RhSafePoint* rh_safe_points;
 static usize rh_safe_point_count;
@@ -277,6 +302,17 @@ static usize rh_interior_batch_count;
 static int rh_gc_running;
 static RhObject* rh_delegate_temporary_root;
 static RhDispatchRecord* rh_dispatches;
+static RhHandleChunk* rh_handle_chunks;
+static RhHandleSlot* rh_handle_free;
+static RhObject** rh_finalizer_queue;
+static usize rh_finalizer_queue_count;
+static usize rh_finalizer_queue_capacity;
+static RhObject** rh_finalizer_ready;
+static usize rh_finalizer_ready_head;
+static usize rh_finalizer_ready_tail;
+static usize rh_finalizer_ready_capacity;
+static usize rh_monitors_held;
+static int rh_finalizers_running;
 extern const RhCodeRegion RhpRuntimeRegions[];
 extern const usize RhpRuntimeRegionCount;
 void RhpCollect(void);
@@ -502,6 +538,7 @@ void RhpFallbackFailFast(int code);
 usize RhpCallFunclet(const void* handler, const RhUnwindContext* context, RhObject* exception);
 void RhpCallFuncletReturn(void);
 void RhpCallFuncletReturnFalse(void);
+void RhpFinalizerDrain(void);
 void RhpResume(const RhUnwindContext* context, const void* target);
 
 #if defined(__linux__) && defined(__riscv)
@@ -2066,6 +2103,7 @@ void RhpMonitorEnter(void* object)
 
     monitor->owner = thread_id;
     monitor->recursion = 1ul;
+    rh_monitors_held = rh_monitors_held + 1ul;
 }
 
 void RhpMonitorExit(void* object)
@@ -2096,6 +2134,9 @@ void RhpMonitorExit(void* object)
     monitor->owner = 0ul;
     if (rh_atomic_compare_exchange(&monitor->gate, 1ul, 0ul) != 1ul)
         RhpFallbackFailFast(154);
+    rh_monitors_held = rh_monitors_held - 1ul;
+    if (rh_monitors_held == 0ul && rh_finalizer_ready_head != rh_finalizer_ready_tail)
+        RhpGcPollRequested = RhpGcPollRequested | RH_POLL_FINALIZE;
 }
 
 static void rh_monitor_destroy_for_object(void* object)
@@ -2353,7 +2394,7 @@ static int rh_mark_object(void* object)
         return 0;
     if ((block->flags & RH_BLOCK_MARK) != 0ul)
         return 0;
-    block->flags = RH_BLOCK_MARK;
+    block->flags = block->flags | RH_BLOCK_MARK;
     block->mark_next = rh_mark_stack;
     rh_mark_stack = block;
     return 1;
@@ -2555,7 +2596,7 @@ static void rh_drain_mark_stack(void)
         usize i = 0ul;
         rh_mark_stack = block->mark_next;
         block->mark_next = (RhBlock*)0;
-        block->flags = RH_BLOCK_MARK | RH_BLOCK_SCANNED;
+        block->flags = block->flags | RH_BLOCK_SCANNED;
         if (block->kind != RH_BLOCK_OBJECT)
             RhpFallbackFailFast(139);
 
@@ -2647,7 +2688,7 @@ static void rh_sweep(void)
         if (block->kind == RH_BLOCK_OBJECT && (block->flags & RH_BLOCK_MARK) != 0ul)
         {
             block->mark_next = (RhBlock*)0;
-            block->flags = 0ul;
+            block->flags = block->flags & RH_BLOCK_FINALIZER_RUN;
             if (free_run != (RhBlock*)0)
             {
                 rh_free_list_insert(free_run);
@@ -2673,13 +2714,158 @@ static void rh_sweep(void)
     RhpGcPollRequested = 0u;
 }
 
-void RhpCollectFromContext(RhUnwindContext* context)
+static void rh_drain_marks(void)
 {
-    if (rh_gc_running != 0)
-        return;
+    do
+    {
+        rh_resolve_interior_batch();
+        rh_drain_mark_stack();
+    } while (rh_interior_batch_count != 0ul);
+}
+
+// An object outside the heap counts as marked
+static int rh_object_is_marked(void* object)
+{
+    RhBlock* block = rh_block_for_exact_object(object);
+    return block == (RhBlock*)0 || (block->flags & RH_BLOCK_MARK) != 0ul;
+}
+
+static void rh_mark_strong_handles(void)
+{
+    const RhHandleChunk* chunk = rh_handle_chunks;
+    while (chunk != (const RhHandleChunk*)0)
+    {
+        usize i = 0ul;
+        while (i < RH_HANDLE_CHUNK_SLOTS)
+        {
+            const RhHandleSlot* slot = &chunk->slots[i];
+            if (slot->kind == RH_HANDLE_NORMAL || slot->kind == RH_HANDLE_PINNED)
+                rh_mark_object(slot->object);
+            i = i + 1ul;
+        }
+        chunk = chunk->next;
+    }
+}
+
+// Marking a dependent can make another handle's primary reachable
+static void rh_scan_dependent_handles(void)
+{
+    int marked;
+    do
+    {
+        const RhHandleChunk* chunk = rh_handle_chunks;
+        marked = 0;
+        while (chunk != (const RhHandleChunk*)0)
+        {
+            usize i = 0ul;
+            while (i < RH_HANDLE_CHUNK_SLOTS)
+            {
+                const RhHandleSlot* slot = &chunk->slots[i];
+                if (slot->kind == RH_HANDLE_DEPENDENT && slot->object != (void*)0 &&
+                    rh_object_is_marked(slot->object) && rh_mark_object(slot->secondary))
+                {
+                    marked = 1;
+                }
+                i = i + 1ul;
+            }
+            chunk = chunk->next;
+        }
+        rh_drain_marks();
+    } while (marked != 0);
+}
+
+static void rh_clear_dead_handles(int after_finalization)
+{
+    RhHandleChunk* chunk = rh_handle_chunks;
+    while (chunk != (RhHandleChunk*)0)
+    {
+        usize i = 0ul;
+        while (i < RH_HANDLE_CHUNK_SLOTS)
+        {
+            RhHandleSlot* slot = &chunk->slots[i];
+            int selected = after_finalization != 0
+                ? slot->kind == RH_HANDLE_WEAK_TRACK_RESURRECTION || slot->kind == RH_HANDLE_DEPENDENT
+                : slot->kind == RH_HANDLE_WEAK;
+            if (selected && slot->object != (void*)0 && !rh_object_is_marked(slot->object))
+            {
+                slot->object = (void*)0;
+                slot->secondary = (void*)0;
+            }
+            i = i + 1ul;
+        }
+        chunk = chunk->next;
+    }
+}
+
+static RhObject** rh_grow_object_list(RhObject** list, usize count, usize* capacity)
+{
+    usize grown_capacity = *capacity == 0ul ? 256ul : *capacity * 2ul;
+    RhObject** grown = (RhObject**)RhpAllocHGlobal(grown_capacity * sizeof(RhObject*));
+    usize i = 0ul;
+    while (i < count)
+    {
+        grown[i] = list[i];
+        i = i + 1ul;
+    }
+    RhpFreeHGlobal(list);
+    *capacity = grown_capacity;
+    return grown;
+}
+
+static void rh_finalizer_queue_add(RhObject* object)
+{
+    if (rh_finalizer_queue_count == rh_finalizer_queue_capacity)
+        rh_finalizer_queue = rh_grow_object_list(rh_finalizer_queue, rh_finalizer_queue_count, &rh_finalizer_queue_capacity);
+    rh_finalizer_queue[rh_finalizer_queue_count] = object;
+    rh_finalizer_queue_count = rh_finalizer_queue_count + 1ul;
+}
+
+static void rh_mark_ready_finalizers(void)
+{
+    usize i = rh_finalizer_ready_head;
+    while (i < rh_finalizer_ready_tail)
+    {
+        rh_mark_object(rh_finalizer_ready[i]);
+        i = i + 1ul;
+    }
+}
+
+// A dead object goes to the ready list and lives on with everything it reaches until its finalizer has run
+static void rh_scan_finalizers(void)
+{
+    usize kept = 0ul;
+    usize i = 0ul;
+    while (i < rh_finalizer_queue_count)
+    {
+        RhObject* object = rh_finalizer_queue[i];
+        RhBlock* block = rh_block_for_exact_object(object);
+        i = i + 1ul;
+        if (block == (RhBlock*)0)
+            RhpFallbackFailFast(155);
+        if ((block->flags & RH_BLOCK_MARK) != 0ul)
+        {
+            rh_finalizer_queue[kept] = object;
+            kept = kept + 1ul;
+        }
+        else if ((block->flags & RH_BLOCK_FINALIZER_RUN) == 0ul)
+        {
+            if (rh_finalizer_ready_tail == rh_finalizer_ready_capacity)
+                rh_finalizer_ready = rh_grow_object_list(rh_finalizer_ready, rh_finalizer_ready_tail, &rh_finalizer_ready_capacity);
+            rh_finalizer_ready[rh_finalizer_ready_tail] = object;
+            rh_finalizer_ready_tail = rh_finalizer_ready_tail + 1ul;
+        }
+    }
+    rh_finalizer_queue_count = kept;
+    rh_mark_ready_finalizers();
+    rh_drain_marks();
+}
+
+static void rh_collect(const RhUnwindContext* context)
+{
+    RhUnwindContext frame = *context;
     rh_gc_running = 1;
     rh_mark_stack = (RhBlock*)0;
-    rh_mark_frame_roots(context);
+    rh_mark_frame_roots(&frame);
     rh_mark_static_roots();
     rh_mark_object(rh_delegate_temporary_root);
     {
@@ -2692,13 +2878,154 @@ void RhpCollectFromContext(RhUnwindContext* context)
             dispatch = dispatch->next;
         }
     }
-    do
-    {
-        rh_resolve_interior_batch();
-        rh_drain_mark_stack();
-    } while (rh_interior_batch_count != 0ul);
+    rh_mark_strong_handles();
+    rh_mark_ready_finalizers();
+    rh_drain_marks();
+    rh_scan_dependent_handles();
+    rh_clear_dead_handles(0);
+    rh_scan_finalizers();
+    rh_scan_dependent_handles();
+    rh_clear_dead_handles(1);
     rh_sweep();
+    RhpGcPollRequested = rh_finalizer_ready_head != rh_finalizer_ready_tail ? RH_POLL_FINALIZE : 0u;
     rh_gc_running = 0;
+}
+
+// With no threads yet, a managed poll outside any lock stands in for the finalizer thread
+void RhpCollectFromContext(RhUnwindContext* context)
+{
+    if (rh_gc_running != 0)
+        return;
+    if ((RhpGcPollRequested & RH_POLL_COLLECT) != 0u)
+        rh_collect(context);
+    if ((RhpGcPollRequested & RH_POLL_FINALIZE) != 0u && rh_find_safe_point(context->ip) != (const RhSafePoint*)0)
+    {
+        RhpGcPollRequested = RhpGcPollRequested & ~RH_POLL_FINALIZE;
+        if (rh_monitors_held == 0ul && rh_finalizers_running == 0)
+            (void)RhpCallFunclet((const void*)RhpFinalizerDrain, context, (RhObject*)0);
+    }
+}
+
+static void rh_collect_now(void)
+{
+    RhpGcPollRequested = RhpGcPollRequested | RH_POLL_COLLECT;
+    RhpCollect();
+}
+
+void RhCollect(int generation, int mode)
+{
+    (void)generation;
+    (void)mode;
+    rh_collect_now();
+}
+
+static RhHandleSlot* rh_handle_allocate(usize kind, void* object, void* secondary)
+{
+    RhHandleSlot* slot = rh_handle_free;
+    if (slot == (RhHandleSlot*)0)
+    {
+        RhHandleChunk* chunk = (RhHandleChunk*)RhpAllocHGlobal(sizeof(RhHandleChunk));
+        usize i = RH_HANDLE_CHUNK_SLOTS;
+        chunk->next = rh_handle_chunks;
+        rh_handle_chunks = chunk;
+        while (i != 0ul)
+        {
+            i = i - 1ul;
+            chunk->slots[i].object = (void*)0;
+            chunk->slots[i].secondary = (void*)rh_handle_free;
+            chunk->slots[i].kind = RH_HANDLE_FREE;
+            rh_handle_free = &chunk->slots[i];
+        }
+        slot = rh_handle_free;
+    }
+    rh_handle_free = (RhHandleSlot*)slot->secondary;
+    slot->object = object;
+    slot->secondary = secondary;
+    slot->kind = kind;
+    return slot;
+}
+
+void* RhpHandleAlloc(void* object, int type)
+{
+    return (void*)rh_handle_allocate((usize)type, object, (void*)0);
+}
+
+void* RhpHandleAllocDependent(void* primary, void* secondary)
+{
+    return (void*)rh_handle_allocate(RH_HANDLE_DEPENDENT, primary, secondary);
+}
+
+void RhHandleFree(void* handle)
+{
+    RhHandleSlot* slot = (RhHandleSlot*)handle;
+    slot->object = (void*)0;
+    slot->secondary = (void*)rh_handle_free;
+    slot->kind = RH_HANDLE_FREE;
+    rh_handle_free = slot;
+}
+
+void* RhHandleGet(void* handle)
+{
+    return ((RhHandleSlot*)handle)->object;
+}
+
+void RhHandleSet(void* handle, void* object)
+{
+    ((RhHandleSlot*)handle)->object = object;
+}
+
+void* RhHandleGetDependent(void* handle, void** secondary)
+{
+    RhHandleSlot* slot = (RhHandleSlot*)handle;
+    *secondary = slot->object != (void*)0 ? slot->secondary : (void*)0;
+    return slot->object;
+}
+
+void RhHandleSetDependentSecondary(void* handle, void* secondary)
+{
+    ((RhHandleSlot*)handle)->secondary = secondary;
+}
+
+void RhSuppressFinalize(RhObject* object)
+{
+    if ((object->type->flags & RH_EETYPE_HAS_FINALIZER) != 0u)
+    {
+        RhBlock* block = rh_block_for_exact_object(object);
+        block->flags = block->flags | RH_BLOCK_FINALIZER_RUN;
+    }
+}
+
+// An object suppressed while still queued only drops the suppression, one that already ran queues again
+void RhReRegisterForFinalize(RhObject* object)
+{
+    if ((object->type->flags & RH_EETYPE_HAS_FINALIZER) != 0u)
+    {
+        RhBlock* block = rh_block_for_exact_object(object);
+        if ((block->flags & RH_BLOCK_FINALIZER_RUN) != 0ul)
+            block->flags = block->flags & ~RH_BLOCK_FINALIZER_RUN;
+        else
+            rh_finalizer_queue_add(object);
+    }
+}
+
+void* RhpGetNextFinalizableObject(void)
+{
+    while (rh_finalizer_ready_head != rh_finalizer_ready_tail)
+    {
+        RhObject* object = rh_finalizer_ready[rh_finalizer_ready_head];
+        RhBlock* block = rh_block_for_exact_object(object);
+        rh_finalizer_ready_head = rh_finalizer_ready_head + 1ul;
+        if ((block->flags & RH_BLOCK_FINALIZER_RUN) == 0ul)
+        {
+            rh_finalizers_running = 1;
+            return (void*)object;
+        }
+        block->flags = block->flags & ~RH_BLOCK_FINALIZER_RUN;
+    }
+    rh_finalizer_ready_head = 0ul;
+    rh_finalizer_ready_tail = 0ul;
+    rh_finalizers_running = 0;
+    return (void*)0;
 }
 
 // A block in a larger bucket always fits; the request's own bucket is searched only a few blocks deep
@@ -2788,12 +3115,12 @@ static void* rh_allocate_object_with_zeroing(const RhMethodTable* type, usize gc
     usize maximum = (usize)-1;
 
     if (rh_allocation_debt >= RH_GC_POLL_DEBT_LIMIT)
-        RhpCollect();
+        rh_collect_now();
 
     storage = rh_try_allocate(gc_size);
     if (storage == (void*)0)
     {
-        RhpCollect();
+        rh_collect_now();
         storage = rh_try_allocate(gc_size);
         if (storage == (void*)0)
             RhpFallbackFailFast(141);
@@ -2818,7 +3145,7 @@ static void* rh_allocate_object_with_zeroing(const RhMethodTable* type, usize gc
     else
         rh_allocation_debt = rh_allocation_debt + gc_size;
     if (rh_allocation_debt >= RH_GC_POLL_DEBT_LIMIT)
-        RhpGcPollRequested = 1u;
+        RhpGcPollRequested = RhpGcPollRequested | RH_POLL_COLLECT;
     return object;
 }
 
@@ -2838,6 +3165,13 @@ void* RhpNewFast(const RhMethodTable* type)
     if (rh_total_block_size(gc_size) == 0ul)
         RhpFallbackFailFast(140);
     return rh_allocate_object(type, gc_size);
+}
+
+void* RhpNewFinalizable(const RhMethodTable* type)
+{
+    void* object = RhpNewFast(type);
+    rh_finalizer_queue_add((RhObject*)object);
+    return object;
 }
 
 void* RhpNewArray(const RhMethodTable* type, int length)
@@ -2881,6 +3215,8 @@ void* RhpMemberwiseClone(RhObject* source)
     if (gc_size < SYNC_BLOCK_SIZE + MANAGED_OBJECT_HEADER_SIZE || rh_total_block_size(gc_size) == 0ul)
         RhpFallbackFailFast(140);
     clone = rh_allocate_object(type, gc_size);
+    if ((type->flags & RH_EETYPE_HAS_FINALIZER) != 0u)
+        rh_finalizer_queue_add((RhObject*)clone);
     rh_memmove((u8*)clone + MANAGED_OBJECT_HEADER_SIZE,
         (u8*)source + MANAGED_OBJECT_HEADER_SIZE,
         gc_size - SYNC_BLOCK_SIZE - MANAGED_OBJECT_HEADER_SIZE);

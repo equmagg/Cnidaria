@@ -22,6 +22,9 @@ namespace Cnidaria.Cs
         public abstract ImmutableArray<Symbol> LookupSymbols(int position, string? name = null);
         /// <summary>Binds type syntax in the current context</summary>
         public abstract TypeSymbol BindType(TypeSyntax syntax, BindingContext context, DiagnosticBag diagnostics);
+        /// <summary>Binds the operand of typeof, the one place an unbound generic name is a type</summary>
+        internal virtual TypeSymbol BindTypeOfOperand(TypeSyntax syntax, BindingContext context, DiagnosticBag diagnostics)
+            => Parent is null ? BindType(syntax, context, diagnostics) : Parent.BindTypeOfOperand(syntax, context, diagnostics);
         // Value binding entry points
         /// <summary>Binds an expression and records diagnostics</summary>
         public abstract BoundExpression BindExpression(ExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics);
@@ -40,6 +43,9 @@ namespace Cnidaria.Cs
                 switch (cur)
                 {
                     case SourceNamedTypeSymbol type when type.IsUnsafe:
+                        return true;
+
+                    case SpecialNamedTypeSymbol special when special.IsUnsafe:
                         return true;
 
                     case SourceMethodSymbol method when method.IsUnsafe:
@@ -82,6 +88,10 @@ namespace Cnidaria.Cs
         /// <summary>Binds an attribute name with optional Attribute suffix lookup</summary>
         internal TypeSymbol BindAttributeType(NameSyntax name, BindingContext context, DiagnosticBag diagnostics)
             => BindNameType(name, context, diagnostics, allowAttributeSuffix: true, allowTypeParameterLookup: false);
+        internal override TypeSymbol BindTypeOfOperand(TypeSyntax syntax, BindingContext context, DiagnosticBag diagnostics)
+            => syntax is NameSyntax name
+                ? BindNameType(name, context, diagnostics, allowUnboundGeneric: true)
+                : BindType(syntax, context, diagnostics);
         public override BoundExpression BindExpression(ExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
             diagnostics.Add(new Diagnostic("CN_BIND_T001", DiagnosticSeverity.Error,
@@ -252,11 +262,11 @@ namespace Cnidaria.Cs
                 return false;
 
             var def = nt.OriginalDefinition;
-            if (def.Arity != 1 || !string.Equals(def.Name, "Nullable", StringComparison.Ordinal))
+            if (def.Arity != 1 || def.Name != "Nullable")
                 return false;
 
             return def.ContainingSymbol is NamespaceSymbol ns
-                && string.Equals(ns.Name, "System", StringComparison.Ordinal);
+                && ns.Name == "System";
         }
         /// <summary>Resolves System.Nullable&lt;T&gt; or reports a missing predefined type</summary>
         internal static NamedTypeSymbol GetSystemNullableDefinitionOrReport(
@@ -267,7 +277,7 @@ namespace Cnidaria.Cs
             NamespaceSymbol? systemNs = null;
             foreach (var ns in global.GetNamespaceMembers())
             {
-                if (string.Equals(ns.Name, "System", StringComparison.Ordinal))
+                if (ns.Name == "System")
                 {
                     systemNs = ns;
                     break;
@@ -396,10 +406,9 @@ namespace Cnidaria.Cs
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_PTRTYPE001",
-                    DiagnosticSeverity.Error,
-                    $"Cannot take a pointer to managed type '{elem.Name}'.",
+                    DiagnosticSeverity.Warning,
+                    $"This takes the address of, gets the size of, or declares a pointer to a managed type '{elem.Name}'.",
                     new Location(context.SemanticModel.SyntaxTree, p.ElementType.Span)));
-                return new ErrorTypeSymbol("ptr", containing: null, ImmutableArray<Location>.Empty);
             }
 
             return _compilation.CreatePointerType(elem);
@@ -632,7 +641,8 @@ namespace Cnidaria.Cs
             BindingContext context,
             DiagnosticBag diagnostics,
             bool allowAttributeSuffix = false,
-            bool allowTypeParameterLookup = true)
+            bool allowTypeParameterLookup = true,
+            bool allowUnboundGeneric = false)
         {
             var imports = GetImports(context);
             var parts = CollectParts(name);
@@ -647,6 +657,9 @@ namespace Cnidaria.Cs
                     return _compilation.GetSpecialType(SpecialType.System_UIntPtr);
             }
 
+            // Attribute lookup does not stop at a type that is no attribute, a second pass reports it if nothing else matches
+            bool skipNonAttributes = allowAttributeSuffix;
+
             List<Symbol> CollectNextWithAttributeSuffix(
                 List<Symbol> currentSet,
                 NamePart part,
@@ -655,20 +668,24 @@ namespace Cnidaria.Cs
             {
                 var nextSet = CollectNext(currentSet, part.Name, part.Arity, hasTypeArgs, boundTypeArgs, context);
 
-                // Retry attribute names with the conventional suffix
-                if (nextSet.Count == 0 &&
-                    allowAttributeSuffix &&
+                // A type named Foo that is no attribute does not hide FooAttribute
+                if (allowAttributeSuffix &&
                     !hasTypeArgs &&
                     part.Arity == 0 &&
-                    !part.Name.EndsWith("Attribute", StringComparison.Ordinal))
+                    !part.Name.EndsWith("Attribute", StringComparison.Ordinal) &&
+                    nextSet.TrueForAll(s => s is NamedTypeSymbol type && !AttributeBinder.IsAttributeType(type)))
                 {
-                    nextSet = CollectNext(
+                    List<Symbol> suffixed = CollectNext(
                         currentSet,
                         part.Name + "Attribute",
                         0,
                         hasTypeArgs: false,
                         boundTypeArgs: default,
                         context);
+                    if (suffixed.Count != 0)
+                        nextSet = suffixed;
+                    else if (skipNonAttributes && ReferenceEquals(part.Syntax, parts[parts.Count - 1].Syntax))
+                        nextSet = suffixed;
                 }
                 if (hasTypeArgs && part.TypeArgListOpt is not null)
                 {
@@ -713,21 +730,32 @@ namespace Cnidaria.Cs
                 BuildImportAndGlobalRootLayers(imports, layer1, layer2);
 
                 var first = parts[0];
-                var hasTypeArgs = first.TypeArgListOpt != null;
+                bool hasTypeArgs = first.TypeArgListOpt is not null && !(allowUnboundGeneric && IsUnboundTypeArgumentList(first.TypeArgListOpt));
                 var boundTypeArgs = hasTypeArgs
                     ? BindTypeArguments(first.TypeArgListOpt!.Arguments, context, diagnostics)
                     : default;
 
-                var next = new List<Symbol>();
-                for (int rootIndex = 0; rootIndex < layer0.Count && next.Count == 0; rootIndex++)
+                List<Symbol> LookupFirstInScopes()
                 {
-                    var root = new List<Symbol>(1) { layer0[rootIndex] };
-                    next = CollectNextWithAttributeSuffix(root, first, hasTypeArgs, boundTypeArgs);
+                    var found = new List<Symbol>();
+                    for (int rootIndex = 0; rootIndex < layer0.Count && found.Count == 0; rootIndex++)
+                    {
+                        var root = new List<Symbol>(1) { layer0[rootIndex] };
+                        found = CollectNextWithAttributeSuffix(root, first, hasTypeArgs, boundTypeArgs);
+                    }
+                    if (found.Count == 0)
+                        found = CollectNextWithAttributeSuffix(layer1, first, hasTypeArgs, boundTypeArgs);
+                    if (found.Count == 0)
+                        found = CollectNextWithAttributeSuffix(layer2, first, hasTypeArgs, boundTypeArgs);
+                    return found;
                 }
-                if (next.Count == 0)
-                    next = CollectNextWithAttributeSuffix(layer1, first, hasTypeArgs, boundTypeArgs);
-                if (next.Count == 0)
-                    next = CollectNextWithAttributeSuffix(layer2, first, hasTypeArgs, boundTypeArgs);
+
+                List<Symbol> next = LookupFirstInScopes();
+                if (next.Count == 0 && skipNonAttributes)
+                {
+                    skipNonAttributes = false;
+                    next = LookupFirstInScopes();
+                }
 
                 if (next.Count == 0)
                 {
@@ -746,12 +774,17 @@ namespace Cnidaria.Cs
             {
                 var part = parts[i];
 
-                var hasTypeArgs = part.TypeArgListOpt != null;
+                bool hasTypeArgs = part.TypeArgListOpt is not null && !(allowUnboundGeneric && IsUnboundTypeArgumentList(part.TypeArgListOpt));
                 var boundTypeArgs = hasTypeArgs
                     ? BindTypeArguments(part.TypeArgListOpt!.Arguments, context, diagnostics)
                     : default;
 
                 var next = CollectNextWithAttributeSuffix(current, part, hasTypeArgs, boundTypeArgs);
+                if (next.Count == 0 && skipNonAttributes)
+                {
+                    skipNonAttributes = false;
+                    next = CollectNextWithAttributeSuffix(current, part, hasTypeArgs, boundTypeArgs);
+                }
 
                 if (next.Count == 0)
                 {
@@ -1045,6 +1078,17 @@ namespace Cnidaria.Cs
 
             AddUnique(globalLayer, _compilation.GlobalNamespace);
         }
+        private static bool IsUnboundTypeArgumentList(TypeArgumentListSyntax list)
+        {
+            SeparatedSyntaxList<TypeSyntax> arguments = list.Arguments;
+            for (int i = 0; i < arguments.Count; i++)
+            {
+                if (arguments[i] is not OmittedTypeArgumentSyntax)
+                    return false;
+            }
+
+            return arguments.Count != 0;
+        }
         // Advance one qualified name part through namespaces and nested types
         private List<Symbol> CollectNext(
             List<Symbol> current,
@@ -1078,11 +1122,16 @@ namespace Cnidaria.Cs
                 }
                 else if (c is NamedTypeSymbol nt)
                 {
-                    foreach (var t in nt.GetTypeMembers(name, arity))
+                    // A nested type is a member of the derived types too, the nearest declaration hides the rest
+                    int countBefore = next.Count;
+                    for (NamedTypeSymbol? owner = nt; owner is not null && next.Count == countBefore; owner = owner.BaseType as NamedTypeSymbol)
                     {
-                        var inst = hasTypeArgs ? _compilation.ConstructNamedType(t, boundTypeArgs) : t;
-                        if (AccessibilityHelper.IsAccessible(inst, context))
-                            next.Add(inst);
+                        foreach (NamedTypeSymbol t in owner.GetTypeMembers(name, arity))
+                        {
+                            NamedTypeSymbol inst = hasTypeArgs ? _compilation.ConstructNamedType(t, boundTypeArgs) : t;
+                            if (AccessibilityHelper.IsAccessible(inst, context))
+                                next.Add(inst);
+                        }
                     }
                 }
             }

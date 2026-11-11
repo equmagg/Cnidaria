@@ -115,6 +115,14 @@ namespace Cnidaria.Cs
                                 BindExplicitInterfaceIndexer(compilation, tree, stubModel, binder, id, sp, diagnostics);
                                 break;
                             }
+
+                        case EventDeclarationSyntax ed
+                            when kv.Value is SourceEventSymbol se && ed.ExplicitInterfaceSpecifier is not null:
+                            {
+                                TypeBinder binder = HasModifier(ed.Modifiers, SyntaxKind.UnsafeKeyword) ? unsafeTypeBinder : safeTypeBinder;
+                                BindExplicitInterfaceEvent(compilation, tree, stubModel, binder, ed, se, diagnostics);
+                                break;
+                            }
                     }
                 }
             }
@@ -207,6 +215,17 @@ namespace Cnidaria.Cs
                                         "CN_IFACEIMPL002",
                                         DiagnosticSeverity.Error,
                                         $"'{type.Name}' does not implement interface member '{FormatInterfaceProperty(property)}'.",
+                                        new Location(tree, diagnosticSpan)));
+                                }
+                                break;
+
+                            case EventSymbol interfaceEvent when interfaceEvent.AddMethod.IsAbstract:
+                                if (!HasEventImplementation(type, interfaceEvent) && !HasInterfaceEventOverride(interfaces, interfaceEvent))
+                                {
+                                    diagnostics.Add(new Diagnostic(
+                                        "CN_IFACEIMPL003",
+                                        DiagnosticSeverity.Error,
+                                        $"'{type.Name}' does not implement interface member '{interfaceEvent.Name}'.",
                                         new Location(tree, diagnosticSpan)));
                                 }
                                 break;
@@ -326,6 +345,20 @@ namespace Cnidaria.Cs
                 method.DeclaredAccessibility == Accessibility.Private)
                 return false;
 
+            // Event accessors are validated via EventSymbol
+            if (method.ContainingSymbol is NamedTypeSymbol owner)
+            {
+                foreach (Symbol member in owner.GetMembers())
+                {
+                    if (member is EventSymbol declaredEvent &&
+                        (ReferenceEquals(declaredEvent.AddMethod.OriginalDefinition, method.OriginalDefinition) ||
+                         ReferenceEquals(declaredEvent.RemoveMethod.OriginalDefinition, method.OriginalDefinition)))
+                    {
+                        return false;
+                    }
+                }
+            }
+
             // Property accessors are validated via PropertySymbol
             if (method.Name.StartsWith("get_", StringComparison.Ordinal) ||
                 method.Name.StartsWith("set_", StringComparison.Ordinal))
@@ -349,6 +382,53 @@ namespace Cnidaria.Cs
                     }
                 }
             }
+            return false;
+        }
+
+        private static bool IsSameInterfaceEvent(EventSymbol? candidate, EventSymbol interfaceEvent)
+            => candidate is not null && candidate.Name == interfaceEvent.Name &&
+               LocalScopeBinder.AreSameType(candidate.ContainingSymbol as NamedTypeSymbol, interfaceEvent.ContainingSymbol as NamedTypeSymbol);
+
+        private static bool HasEventImplementation(NamedTypeSymbol type, EventSymbol interfaceEvent)
+        {
+            for (NamedTypeSymbol? current = type; current is not null; current = current.BaseType as NamedTypeSymbol)
+            {
+                foreach (Symbol member in current.GetMembers())
+                {
+                    if (member is not EventSymbol candidate)
+                        continue;
+
+                    if (IsSameInterfaceEvent(candidate.ExplicitInterfaceImplementation, interfaceEvent))
+                        return true;
+
+                    if (!candidate.IsExplicitInterfaceImplementation &&
+                        candidate.IsStatic == interfaceEvent.IsStatic &&
+                        candidate.DeclaredAccessibility == Accessibility.Public &&
+                        candidate.Name == interfaceEvent.Name &&
+                        LocalScopeBinder.AreSameType(candidate.Type, interfaceEvent.Type))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static bool HasInterfaceEventOverride(ImmutableArray<NamedTypeSymbol> interfaces, EventSymbol interfaceEvent)
+        {
+            foreach (NamedTypeSymbol root in interfaces)
+            {
+                foreach (NamedTypeSymbol implemented in EnumerateInterfaceClosure(root))
+                {
+                    foreach (Symbol member in implemented.GetMembers())
+                    {
+                        if (member is EventSymbol candidate && IsSameInterfaceEvent(candidate.ExplicitInterfaceImplementation, interfaceEvent))
+                            return true;
+                    }
+                }
+            }
+
             return false;
         }
 
@@ -797,6 +877,55 @@ namespace Cnidaria.Cs
 
             if (property.SetMethod is SourceMethodSymbol setImpl && match.SetMethod is MethodSymbol setIface)
                 setImpl.SetExplicitInterfaceImplementation(setIface);
+        }
+
+        private static void BindExplicitInterfaceEvent(
+            Compilation compilation,
+            SyntaxTree tree,
+            SemanticModel stubModel,
+            TypeBinder typeBinder,
+            EventDeclarationSyntax syntax,
+            SourceEventSymbol declaredEvent,
+            DiagnosticBag diagnostics)
+        {
+            if (declaredEvent.ContainingSymbol is not NamedTypeSymbol containingType ||
+                syntax.ExplicitInterfaceSpecifier is not ExplicitInterfaceSpecifierSyntax specifier)
+            {
+                return;
+            }
+
+            ValidateExplicitInterfaceMemberModifiers(tree, syntax.Modifiers, syntax, diagnostics);
+
+            NamedTypeSymbol? iface = BindExplicitInterfaceType(compilation, tree, stubModel, typeBinder, declaredEvent, specifier.Name, diagnostics);
+            if (iface is null)
+                return;
+
+            if (!ImplementsInterface(containingType, iface))
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EXPLIFACE003",
+                    DiagnosticSeverity.Error,
+                    $"Type '{containingType.Name}' does not implement interface '{iface.Name}'.",
+                    new Location(tree, specifier.Span)));
+                return;
+            }
+
+            foreach (Symbol member in iface.GetMembers())
+            {
+                if (member is EventSymbol candidate && candidate.Name == declaredEvent.Name &&
+                    candidate.IsStatic == declaredEvent.IsStatic &&
+                    LocalScopeBinder.AreSameType(candidate.Type, declaredEvent.Type))
+                {
+                    declaredEvent.SetExplicitInterfaceImplementation(candidate);
+                    return;
+                }
+            }
+
+            diagnostics.Add(new Diagnostic(
+                "CN_EXPLIFACE010",
+                DiagnosticSeverity.Error,
+                $"'{iface.Name}' does not declare event '{declaredEvent.Name}'.",
+                new Location(tree, syntax.Span)));
         }
 
         private static void BindExplicitInterfaceIndexer(

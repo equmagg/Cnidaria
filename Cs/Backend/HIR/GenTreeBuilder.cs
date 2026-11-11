@@ -47,6 +47,7 @@ namespace Cnidaria.Cs
         private readonly HashSet<int> _scannedLiveConstructedGenericTypeIds = new();
         private readonly HashSet<int> _scannedLiveConstructedGenericCctorTypeIds = new();
         private int _liveInstantiatedTypeVersion;
+        private int _finalizerScanVersion = -1;
         private int _virtualTargetScanVersion;
         public GenTreeBuilder(IReadOnlyDictionary<string, RuntimeModule> modules, RuntimeTypeSystem rts)
         {
@@ -219,6 +220,20 @@ namespace Cnidaria.Cs
             bool EnqueueConstructedGenericBodiesDiscoveredDuringImport()
             {
                 bool added = false;
+
+                // A constructed type keeps its finalizer
+                if (_finalizerScanVersion != _liveInstantiatedTypeVersion)
+                {
+                    _finalizerScanVersion = _liveInstantiatedTypeVersion;
+                    foreach (RuntimeType type in _liveInstantiatedTypes.Values)
+                    {
+                        if (_rts.GetFinalizer(type) is RuntimeMethod finalizer)
+                        {
+                            added |= Enqueue(finalizer);
+                            added |= Enqueue(_rts.GetFinalizerDrainMethod());
+                        }
+                    }
+                }
 
                 foreach (RuntimeType type in _liveInstantiatedTypes.Values)
                 {
@@ -1689,6 +1704,15 @@ namespace Cnidaria.Cs
 
                 case ILOpCode.Dup:
                     {
+                        if (frame.HasInstruction(pc + 1, ILOpCode.Ldvirtftn) && frame.HasInstruction(pc + 2, ILOpCode.Newobj))
+                        {
+                            RuntimeMethod declared = ResolveMethodIn(frame, frame.Body.Instructions[pc + 1].Token);
+                            RuntimeMethod delegateCtor = ResolveMethodIn(frame, frame.Body.Instructions[pc + 2].Token);
+                            var receiver = Pop(stack, npc, op);
+                            EmitNewDelegate(stack, statements, npc, delegateCtor.DeclaringType, _rts.GetDelegateStub(declared, frame.Module), One(receiver.Node));
+                            return 3;
+                        }
+
                         var value = Pop(stack, npc, op);
                         var temp = CreateDupTemp(value.Type, value.StackKind);
                         AppendImporterStatement(statements, stack, Node(GenTreeKind.StoreTemp, npc, op, operands: One(value.Node), int32: temp.Index));
@@ -1921,7 +1945,7 @@ namespace Cnidaria.Cs
                     return 1;
 
                 case ILOpCode.Localloc:
-                    EmitLocalloc(stack, statements, npc);
+                    EmitLocalloc(stack, statements, npc, frame.Body.InitLocals);
                     return 1;
 
                 default:
@@ -2323,7 +2347,7 @@ namespace Cnidaria.Cs
             _ => throw new GenTreeBuildException($"Not a conversion opcode: {op}."),
         };
 
-        private void EmitLocalloc(List<StackValue> stack, List<GenTree> statements, int pc)
+        private void EmitLocalloc(List<StackValue> stack, List<GenTree> statements, int pc, bool zeroInitialize)
         {
             var size = Pop(stack, pc, ILOpCode.Localloc).Node;
             GenTree count = size;
@@ -2347,14 +2371,46 @@ namespace Cnidaria.Cs
                 }
                 if (byteCount < uint.MaxValue)
                 {
-                    PushImportedValue(stack, statements, Node(GenTreeKind.StackAlloc, pc, ILOpCode.Localloc, stackKind: GenStackKind.Ptr,
-                        int32: elementSize, int64: byteCount));
+                    GenTree allocation = Node(GenTreeKind.StackAlloc, pc, ILOpCode.Localloc, stackKind: GenStackKind.Ptr,
+                        int32: elementSize, int64: byteCount);
+                    if (zeroInitialize)
+                        PushZeroedStackAllocation(stack, statements, pc, allocation, ConstI4(pc, ILOpCode.Localloc, unchecked((int)byteCount)));
+                    else
+                        PushImportedValue(stack, statements, allocation);
                     return;
                 }
             }
 
+            if (zeroInitialize)
+            {
+                count = MaterializeReusable(statements, count, pc, ILOpCode.Localloc);
+                GenTree allocation = Node(GenTreeKind.StackAlloc, pc, ILOpCode.Localloc, stackKind: GenStackKind.Ptr,
+                    operands: One(count), int32: elementSize);
+                PushZeroedStackAllocation(stack, statements, pc, allocation, Node(GenTreeKind.Binary, pc, ILOpCode.Mul, stackKind: GenStackKind.I4,
+                    operands: Two(CloneTree(count), ConstI4(pc, ILOpCode.Localloc, elementSize))));
+                return;
+            }
+
             PushImportedValue(stack, statements, Node(GenTreeKind.StackAlloc, pc, ILOpCode.Localloc, stackKind: GenStackKind.Ptr,
                 operands: One(count), int32: elementSize));
+        }
+
+        // .locals init covers what localloc returns too
+        private void PushZeroedStackAllocation(List<StackValue> stack, List<GenTree> statements, int pc, GenTree allocation, GenTree byteCount)
+        {
+            const ILOpCode Op = ILOpCode.Localloc;
+            GenTree address = MaterializeReusable(statements, allocation, pc, Op);
+            RuntimeType spanHelpers = _rts.GetRequiredNamedType("std", "System", "SpanHelpers");
+            _rts.EnsureConstructedMembers(spanHelpers);
+            RuntimeMethod memset = Array.Find(spanHelpers.Methods, static method => method.Name == "memset")
+                ?? throw new MissingMethodException("System.SpanHelpers.memset is missing from the core library.");
+            AddDirectDependency(memset);
+            GenTree length = Node(GenTreeKind.Conv, pc, ILOpCode.Conv_U, stackKind: GenStackKind.NativeInt,
+                operands: One(byteCount), convKind: NumericConvKind.NativeUInt, convFlags: NumericConvFlags.None);
+            GenTree call = Node(GenTreeKind.Call, pc, Op, stackKind: GenStackKind.Void,
+                operands: ImmutableArray.Create(CloneTree(address), ConstI4(pc, Op, 0), length), method: memset, int32: 3);
+            AppendImporterStatement(statements, stack, Node(GenTreeKind.Eval, pc, Op, operands: One(call)));
+            Push(stack, CloneTree(address));
         }
 
         // Type predicates and comparisons fold; any other typeof yields the type's canonical RuntimeType.
@@ -2409,6 +2465,9 @@ namespace Cnidaria.Cs
             "get_ElementType" => "RhGetTypeElementType",
             "get_ValueTypeSize" => "RhGetTypeValueTypeSize",
             "get_ContainsGCPointers" => "RhGetTypeContainsGCPointers",
+            "get_IsFinalizable" => "RhGetTypeIsFinalizable",
+            "get_HasComponentSize" => "RhGetTypeHasComponentSize",
+            "get_FinalizerCode" => "RhGetTypeFinalizerCode",
             "get_NullableType" => "RhGetTypeNullableType",
             "get_NullableValueOffset" => "RhGetTypeNullableValueOffset",
             _ => null,
@@ -2514,12 +2573,18 @@ namespace Cnidaria.Cs
         {
             var ldftn = frame.Body.Instructions[pc];
             var targetMethod = ResolveMethodIn(frame, ldftn.Token);
+            if (targetMethod.DllImportData?.ReturnsNativeBool == true)
+                throw Fail(npc, ILOpCode.Ldftn, $"'{targetMethod.Name}' marshals its return value at the call site, so it cannot be bound to a delegate or function pointer.");
             if (frame.HasInstruction(pc + 1, ILOpCode.Newobj))
             {
                 var ctor = ResolveMethodIn(frame, frame.Body.Instructions[pc + 1].Token);
                 if (IsDelegateType(ctor.DeclaringType) && ctor.ParameterTypes.Length == 2)
                 {
                     var target = Pop(stack, npc, ILOpCode.Newobj);
+                    // Bytecode runs a type initializer at the call site and a delegate has none
+                    if (_rts.Target.IsRegisterBytecode && targetMethod.IsStatic && RequiresTypeInitializationBeforeCall(targetMethod) && FindTypeInitializer(targetMethod.DeclaringType) is not null)
+                        targetMethod = _rts.GetDelegateStub(targetMethod, frame.Module);
+
                     EmitNewDelegate(stack, statements, npc, ctor.DeclaringType, targetMethod,
                         target.Node.Kind == GenTreeKind.ConstNull ? ImmutableArray<GenTree>.Empty : One(target.Node));
                     return 2;
@@ -3185,10 +3250,11 @@ namespace Cnidaria.Cs
                 : isRuntimeIntrinsic
                     ? GenTreeKind.Intrinsic
                     : GenTreeKind.Call;
+            bool returnsNativeBool = callKind == GenTreeKind.Call && method.DllImportData?.ReturnsNativeBool == true;
             var call = Node(callKind,
                 npc,
                 op,
-                type: returnsVoid ? null : method.ReturnType,
+                type: returnsVoid ? null : returnsNativeBool ? _rts.FindPrimitive(RuntimePrimitiveKind.Int32) : method.ReturnType,
                 stackKind: returnsVoid ? GenStackKind.Void : StackKindOf(method.ReturnType),
                 operands: args,
                 int32: total,
@@ -3197,9 +3263,18 @@ namespace Cnidaria.Cs
                 intrinsicId: runtimeIntrinsic.Id);
 
             if (returnsVoid || doesNotReturn)
+            {
                 AppendImporterStatement(statements, stack, Node(GenTreeKind.Eval, npc, op, operands: One(call)));
+            }
+            else if (returnsNativeBool)
+            {
+                PushImportedValue(stack, statements, Node(GenTreeKind.Binary, npc, ILOpCode.Cgt_Un, stackKind: GenStackKind.I4,
+                    operands: Two(MaterializeReusable(statements, call, npc, op), ConstI4(npc, op, 0))));
+            }
             else
+            {
                 PushImportedValue(stack, statements, call);
+            }
 
             terminatedBlock = doesNotReturn;
             return 1;
@@ -5773,7 +5848,7 @@ namespace Cnidaria.Cs
                     return false;
 
                 bool canDevirtualize = receiverInfo.IsExact ||
-                    objectType.IsFinal ||
+                    _rts.IsExactType(objectType) ||
                     (declaredMethod.DeclaringType.Kind != RuntimeTypeKind.Interface && candidate.IsFinal);
 
                 if (!canDevirtualize)

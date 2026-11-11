@@ -377,6 +377,8 @@ namespace Cnidaria.Cs
             public override bool IsStatic { get; }
             public override bool IsConstructor => false;
             public override bool IsAsync { get; }
+            // Every lambda is emitted static, this is the modifier in its source
+            public bool IsDeclaredStatic { get; }
             private readonly List<AttributeData> _attributes = new();
             public override ImmutableArray<AttributeData> GetAttributes() => _attributes.ToImmutableArray();
 
@@ -388,8 +390,10 @@ namespace Cnidaria.Cs
                 ImmutableArray<Location> locations,
                 bool isStatic,
                 bool isAsync,
-                bool returnsByRefReadonly = false)
+                bool returnsByRefReadonly = false,
+                bool isDeclaredStatic = false)
             {
+                IsDeclaredStatic = isDeclaredStatic;
                 Name = name;
                 ContainingSymbol = containing;
                 ReturnType = returnType;
@@ -471,8 +475,12 @@ namespace Cnidaria.Cs
         private readonly Dictionary<string, LocalSymbol> _locals = new(StringComparer.Ordinal);
         // A scope that makes pattern locals visible to one operand of an expression declares no expression variables itself.
         private bool _isExpressionFlowScope;
+        private bool _inCatchFilter;
+        private bool _inLockBody;
+        private bool _awaitUsingScope;
         private readonly Dictionary<string, ParameterSymbol> _parameters = new(StringComparer.Ordinal);
         private readonly Dictionary<string, LocalFunctionSymbol> _localFunctions = new(StringComparer.Ordinal);
+        private readonly List<(MethodSymbol Target, NamedTypeSymbol DelegateType, LocalSymbol Shared)> _localFunctionDelegates = new();
         private readonly LocalScopeBinder? _nameConflictStop;
 
         private int _tempId;
@@ -513,6 +521,7 @@ namespace Cnidaria.Cs
             _locals = template._locals;
             _parameters = template._parameters;
             _localFunctions = template._localFunctions;
+            _localFunctionDelegates = template._localFunctionDelegates;
             _nameConflictStop = template._nameConflictStop;
             _isExpressionFlowScope = template._isExpressionFlowScope;
         }
@@ -779,6 +788,14 @@ namespace Cnidaria.Cs
                     break;
                 case InvocationExpressionSyntax inv:
                     result = BindInvocation(inv, context, diagnostics);
+                    if (result is BoundCallExpression invoked && IsPropertyOrEventAccessor(invoked.Method))
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_ACCESSOR001",
+                            DiagnosticSeverity.Error,
+                            $"'{invoked.Method.Name}': cannot explicitly call operator or accessor.",
+                            new Location(context.SemanticModel.SyntaxTree, inv.Span)));
+                    }
                     break;
                 case ImplicitObjectCreationExpressionSyntax ioc:
                     result = BindUnboundImplicitObjectCreation(ioc, context, diagnostics);
@@ -806,6 +823,9 @@ namespace Cnidaria.Cs
                     break;
                 case CheckedExpressionSyntax chk:
                     result = BindCheckedExpression(chk, context, diagnostics);
+                    break;
+                case AwaitExpressionSyntax awaitExpression:
+                    result = BindAwait(awaitExpression, context, diagnostics);
                     break;
                 case TypeOfExpressionSyntax tof:
                     result = BindTypeOf(tof, context, diagnostics);

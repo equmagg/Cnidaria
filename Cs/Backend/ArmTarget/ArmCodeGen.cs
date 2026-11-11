@@ -139,6 +139,7 @@ namespace Cnidaria.Cs
                 EmitUnboxingStubs();
                 EmitVirtualDispatchFailureStub();
                 EmitCollectHelper();
+                EmitFinalizerDrainThunk();
                 RuntimeMetadataLabels metadata = EmitRuntimeMetadata();
 
                 if (_options.EmitStartup)
@@ -556,6 +557,28 @@ namespace Cnidaria.Cs
                 EmitDelegateMemoryLoad(MachineRegister.X30, ArmRegister.Sp, frameSize - pointerSize, pointerSize, signed: false);
                 EmitAdjustStack(frameSize);
                 Emit(ArmInstruction.Unary(ArmInstrKind.Ret, Reg(ArmRegister.X30, 8)));
+                AddHelperSymbol(label, start);
+            }
+
+            // The runtime calls this like a funclet
+            private void EmitFinalizerDrainThunk()
+            {
+                const string label = RuntimeGcImports.FinalizerDrainSymbol;
+                string? target = null;
+                foreach (GenTreeMethod method in _program.Methods)
+                {
+                    if (RuntimeGcImports.IsFinalizerDrain(method.RuntimeMethod))
+                        target = _methodLabels[method.RuntimeMethod.MethodId];
+                }
+
+                int start = _text.ByteLength;
+                DefineHelperLabel(label);
+                if (target is null)
+                {
+                    EmitLoadImmediate(ArmRegister.X0, 150, 8);
+                    target = ResolveExternalSymbol(ArmRuntime.FailFastSymbol);
+                }
+                EmitJump(target);
                 AddHelperSymbol(label, start);
             }
 
@@ -1014,6 +1037,7 @@ namespace Cnidaria.Cs
                 public ImmutableArray<TypeGcFieldDraft> Fields { get; }
                 public ImmutableArray<TypeGcFieldDraft> ComponentFields { get; }
                 public ImmutableArray<RuntimeType> Interfaces { get; }
+                public ImmutableArray<RuntimeType> VariantCastTargets { get; set; } = ImmutableArray<RuntimeType>.Empty;
                 public string? FieldsLabel { get; set; }
                 public string? ComponentFieldsLabel { get; set; }
                 public string? InterfacesLabel { get; set; }
@@ -1519,6 +1543,16 @@ namespace Cnidaria.Cs
                 {
                     _runtimeTypeInfoStringType = typeSystem.SystemString;
                     _ = GetTypeDescriptorLabel(_runtimeTypeInfoStringType);
+                }
+
+                if (typeSystem is not null)
+                {
+                    Dictionary<int, List<RuntimeType>> variantTargets = typeSystem.CollectVariantCastTargets(_typeDescriptors.ConvertAll(static d => d.Type).ToArray());
+                    foreach (TypeDescriptorDraft descriptor in _typeDescriptors)
+                    {
+                        if (variantTargets.TryGetValue(descriptor.Type.TypeId, out List<RuntimeType>? targets))
+                            descriptor.VariantCastTargets = targets.ToImmutableArray();
+                    }
                 }
 
                 for (int i = 0; i < _typeDescriptors.Count; i++)
@@ -2595,15 +2629,16 @@ namespace Cnidaria.Cs
                         for (int slot = 0; slot < descriptor.VTableTargets.Length; slot++)
                             EmitPointer(descriptor.VTableTargets[slot]);
                     }
-                    if (descriptor.Interfaces.Length != 0)
+                    ImmutableArray<RuntimeType> castTargets = descriptor.Interfaces.AddRange(descriptor.VariantCastTargets);
+                    if (castTargets.Length != 0)
                     {
                         descriptor.InterfacesLabel = CreateLocalLabel(descriptor.Label + "_interfaces");
                         AddDataSymbol(
                             descriptor.InterfacesLabel,
                             _rodata.Align(pointerSize),
-                            checked((descriptor.Interfaces.Length + 1) * pointerSize));
-                        for (int iface = 0; iface < descriptor.Interfaces.Length; iface++)
-                            EmitPointer(GetTypeDescriptorLabel(descriptor.Interfaces[iface]));
+                            checked((castTargets.Length + 1) * pointerSize));
+                        for (int iface = 0; iface < castTargets.Length; iface++)
+                            EmitPointer(GetTypeDescriptorLabel(castTargets[iface]));
                         EmitNative(0);
                     }
                 }
@@ -2638,7 +2673,8 @@ namespace Cnidaria.Cs
                     // RuntimeType reads names and flags through the pointer one slot before the MethodTable.
                     _rodata.Align(pointerSize);
                     EmitPointer(infoLabel);
-                    AddDataSymbol(descriptor.Label, _rodata.ByteLength, checked(16 + pointerSize * 3));
+                    RuntimeMethod? finalizer = _program.TypeSystem?.GetFinalizer(descriptor.Type);
+                    AddDataSymbol(descriptor.Label, _rodata.ByteLength, checked(16 + pointerSize * (finalizer is null ? 3 : 4)));
                     EmitUInt32(ComputeMethodTableFlags(descriptor, componentSize) | RuntimeMethodTables.ValueTypeExtendedFlags(descriptor.Type, baseSize, _target));
                     EmitUInt32(checked((uint)baseSize));
                     EmitPointer(descriptor.RelatedTypeLabel);
@@ -2647,6 +2683,8 @@ namespace Cnidaria.Cs
                     EmitUInt32(unchecked((uint)descriptor.Type.TypeId));
                     EmitPointer(descriptor.InterfacesLabel);
                     EmitPointer(descriptor.VTableLabel);
+                    if (finalizer is not null)
+                        EmitPointer(GetVirtualDispatchTargetLabel(finalizer));
                 }
 
                 for (int i = 0; i < _interfaceDispatchCells.Count; i++)
@@ -2810,7 +2848,7 @@ namespace Cnidaria.Cs
                 return Math.Max(1, elementType.SizeOf);
             }
 
-            private static uint ComputeMethodTableFlags(TypeDescriptorDraft descriptor, int componentSize)
+            private uint ComputeMethodTableFlags(TypeDescriptorDraft descriptor, int componentSize)
             {
                 const uint parameterizedKind = 0x00020000u;
                 const uint hasPointers = 0x01000000u;
@@ -2826,6 +2864,10 @@ namespace Cnidaria.Cs
                     flags |= hasPointers;
                 if (componentSize != 0)
                     flags |= hasComponentSize | checked((uint)(ushort)componentSize);
+                if (_program.TypeSystem?.HasFinalizer(descriptor.Type) == true)
+                    flags |= RuntimeMethodTables.HasFinalizerFlag;
+                if (_program.TypeSystem?.HasGenericVariance(descriptor.Type) == true)
+                    flags |= RuntimeMethodTables.GenericVarianceFlag;
                 return flags;
             }
 
@@ -4791,6 +4833,12 @@ namespace Cnidaria.Cs
                         case RuntimeIntrinsicId.InterlockedExchange:
                             EmitInterlocked(node, intrinsic.Exchange.Size, InterlockedKind.Exchange);
                             return;
+                        case RuntimeIntrinsicId.InterlockedOr:
+                            EmitInterlocked(node, intrinsic.Bitwise.Size, InterlockedKind.Or);
+                            return;
+                        case RuntimeIntrinsicId.InterlockedAnd:
+                            EmitInterlocked(node, intrinsic.Bitwise.Size, InterlockedKind.And);
+                            return;
                         case RuntimeIntrinsicId.MemoryBarrier:
                         case RuntimeIntrinsicId.VolatileWrite:
                             EmitDataMemoryBarrier();
@@ -4809,6 +4857,8 @@ namespace Cnidaria.Cs
                     CompareExchange,
                     Exchange,
                     ExchangeAdd,
+                    Or,
+                    And,
                 }
 
                 private void EmitDataMemoryBarrier()
@@ -4872,6 +4922,12 @@ namespace Cnidaria.Cs
                     {
                         _owner.Emit(ArmInstruction.Ternary(
                             ArmInstrKind.Add, Reg(Scratch1, operandSize), Reg(result, operandSize), Reg(value, operandSize)));
+                        stored = Scratch1;
+                    }
+                    else if (kind is InterlockedKind.Or or InterlockedKind.And)
+                    {
+                        _owner.Emit(ArmInstruction.Ternary(
+                            kind == InterlockedKind.Or ? ArmInstrKind.Orr : ArmInstrKind.And, Reg(Scratch1, operandSize), Reg(result, operandSize), Reg(value, operandSize)));
                         stored = Scratch1;
                     }
 
@@ -5277,15 +5333,7 @@ namespace Cnidaria.Cs
                     EmitMemoryLoad(Scratch1, right, 0, Target.PointerSize, signed: false);
                     _owner.Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(Scratch0, 8), Reg(Scratch1, 8)));
                     _owner.EmitConditionalJump(ArmCondition.Eq, typesMatch);
-                    if (remove)
-                    {
-                        _owner.EmitMove(result, left, 8);
-                        _owner.EmitJump(done);
-                    }
-                    else
-                    {
-                        EmitManagedExceptionThrow(node, "ArgumentException");
-                    }
+                    EmitManagedExceptionThrow(node, "ArgumentException");
 
                     _owner.DefineLabel(typesMatch);
                     int frameSize = AlignUp(checked(Target.PointerSize * 3), Target.CallFrameAlignment);
@@ -5729,7 +5777,8 @@ namespace Cnidaria.Cs
                     MachineRegister result = RequireResultRegister(node);
                     SafePointDraft safePoint = PrepareSafePoint(node);
                     _owner.EmitMaterializeAddress(_owner.GetTypeDescriptorLabel(objectType), ArmRegister.X0);
-                    _owner.EmitCall(_owner.ResolveExternalSymbol(ArmRuntime.NewFastSymbol));
+                    _owner.EmitCall(_owner.ResolveExternalSymbol(
+                        _owner._program.TypeSystem?.HasFinalizer(objectType) == true ? ArmRuntime.NewFinalizableSymbol : ArmRuntime.NewFastSymbol));
                     _owner.DefineLabel(safePoint.ReturnLabel);
                     _owner.EmitMove(GeneralRegister(result), ArmRegister.X0, 8);
                 }
@@ -5984,6 +6033,8 @@ namespace Cnidaria.Cs
                 }
 
                 private const int MethodTableRelatedTypeOffset = 8;
+                private const int ElementTypeFirstInteger = 0x04;
+                private const int ElementTypeLastInteger = 0x0d;
                 private const int ElementTypeClass = 0x14;
                 private const int ElementTypeInterface = 0x15;
                 private const int ElementTypeSystemArray = 0x16;
@@ -6005,6 +6056,7 @@ namespace Cnidaria.Cs
                     string targetSzArray = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_target_szarray");
                     string targetMdArray = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_target_mdarray");
                     string arrayElements = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_array_elements");
+                    string referenceElements = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_reference_elements");
                     string sourceBase = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_source_base");
                     string interfaceLoop = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_interface_loop");
 
@@ -6031,7 +6083,14 @@ namespace Cnidaria.Cs
                     _owner.EmitConditionalJump(ArmCondition.Eq, targetMdArray);
                     _owner.EmitJump(failure);
 
+                    // The instances a variant delegate converts from list it the way types list their interfaces
                     _owner.DefineLabel(targetClass);
+                    EmitMemoryLoad(temp, target, 0, 4, signed: false);
+                    _owner.Emit(ArmInstruction.Ternary(
+                        ArmInstrKind.Lsr, Reg(temp, 4), Reg(temp, 4), ArmOperand.ImmediateOperand(RuntimeMethodTables.GenericVarianceFlagBit)));
+                    _owner.Emit(ArmInstruction.Ternary(
+                        ArmInstrKind.And, Reg(temp, 4), Reg(temp, 4), ArmOperand.ImmediateOperand(1)));
+                    EmitCompareBranch(ArmInstrKind.Cbnz, temp, 4, targetInterface);
                     EmitMemoryLoad(temp, target, MethodTableRelatedTypeOffset, Target.PointerSize, signed: false);
                     EmitCompareBranch(ArmInstrKind.Cbz, temp, 8, success);
                     CompareElementType(source, ElementTypeArray, ArmCondition.Eq, failure);
@@ -6061,6 +6120,25 @@ namespace Cnidaria.Cs
                     EmitMemoryLoad(source, source, MethodTableRelatedTypeOffset, Target.PointerSize, signed: false);
                     _owner.Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(source, 8), Reg(target, 8)));
                     _owner.EmitConditionalJump(ArmCondition.Eq, success);
+                    // Integer elements of one size convert, from sbyte up the signed and unsigned element types alternate
+                    EmitMethodTableElementType(temp, target);
+                    _owner.Emit(ArmInstruction.Ternary(
+                        ArmInstrKind.Sub, Reg(temp, 4), Reg(temp, 4), ArmOperand.ImmediateOperand(ElementTypeFirstInteger)));
+                    _owner.Emit(ArmInstruction.Binary(
+                        ArmInstrKind.Cmp, Reg(temp, 4), ArmOperand.ImmediateOperand(ElementTypeLastInteger - ElementTypeFirstInteger)));
+                    _owner.EmitConditionalJump(ArmCondition.Hi, referenceElements);
+                    _owner.Emit(ArmInstruction.Ternary(
+                        ArmInstrKind.Lsr, Reg(temp, 4), Reg(temp, 4), ArmOperand.ImmediateOperand(1)));
+                    EmitMethodTableElementType(source, source);
+                    _owner.Emit(ArmInstruction.Ternary(
+                        ArmInstrKind.Sub, Reg(source, 4), Reg(source, 4), ArmOperand.ImmediateOperand(ElementTypeFirstInteger)));
+                    _owner.Emit(ArmInstruction.Ternary(
+                        ArmInstrKind.Lsr, Reg(source, 4), Reg(source, 4), ArmOperand.ImmediateOperand(1)));
+                    _owner.Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(source, 4), Reg(temp, 4)));
+                    _owner.EmitConditionalJump(ArmCondition.Eq, success);
+                    _owner.EmitJump(failure);
+
+                    _owner.DefineLabel(referenceElements);
                     EmitReferenceElementTypeGuard(target, temp, failure);
                     EmitReferenceElementTypeGuard(source, temp, failure);
                     _owner.EmitJump(loop);

@@ -221,7 +221,28 @@ namespace Cnidaria.Cs
             BindingContext context,
             DiagnosticBag diagnostics)
         {
-            var lv = BindLValue(operandSyntax, context, diagnostics, requireReadable: true);
+            LValue lv = BindLValue(operandSyntax, context, diagnostics, requireReadable: true);
+
+            // A from-end index stabilizes the receiver and index first, the operator happens inside that sequence
+            if (lv.Target is BoundSequenceExpression sequenceTarget)
+            {
+                BoundExpression inner = BindIncrementOrDecrementOfLValue(
+                    operatorSyntax, operandSyntax, new LValue(sequenceTarget.Value, sequenceTarget.Value), isIncrement, isPostfix, resultUsed, context, diagnostics);
+                return new BoundSequenceExpression(operatorSyntax, sequenceTarget.Locals, sequenceTarget.SideEffects, inner);
+            }
+
+            return BindIncrementOrDecrementOfLValue(operatorSyntax, operandSyntax, lv, isIncrement, isPostfix, resultUsed, context, diagnostics);
+        }
+        private BoundExpression BindIncrementOrDecrementOfLValue(
+            ExpressionSyntax operatorSyntax,
+            ExpressionSyntax operandSyntax,
+            LValue lv,
+            bool isIncrement,
+            bool isPostfix,
+            bool resultUsed,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
             var leftTarget = lv.Target;
 
             if (leftTarget.HasErrors || lv.Read.HasErrors)
@@ -843,6 +864,16 @@ namespace Cnidaria.Cs
             {
                 return BindStringConcatenation(bin, left, right, ctx, diagnostics);
             }
+            if (op is BoundBinaryOperatorKind.Add or BoundBinaryOperatorKind.Subtract &&
+                TryGetDelegateOperatorType(left, right, ctx) is NamedTypeSymbol delegateType)
+            {
+                BoundExpression leftDelegate = ApplyConversion(bin.Left, left, delegateType, bin, ctx, diagnostics, requireImplicit: true);
+                BoundExpression rightDelegate = ApplyConversion(bin.Right, right, delegateType, bin, ctx, diagnostics, requireImplicit: true);
+                if (leftDelegate.HasErrors || rightDelegate.HasErrors)
+                    return new BoundBadExpression(bin);
+
+                return new BoundBinaryExpression(bin, op, delegateType, leftDelegate, rightDelegate, Optional<object>.None);
+            }
             if (TryBindPointerArithmeticBinary(
                 diagnosticNode: bin,
                 leftSyntax: bin.Left,
@@ -900,6 +931,18 @@ namespace Cnidaria.Cs
                 var constValue = FoldBinaryConstant(op, promoted, left, right, isChecked);
                 return new BoundBinaryExpression(bin, op, promoted, left, right, constValue, isChecked);
             }
+        }
+
+        // C# 12.10.5 and 12.10.6: the operators of the delegate type the other operand converts to
+        private NamedTypeSymbol? TryGetDelegateOperatorType(BoundExpression left, BoundExpression right, BindingContext ctx)
+        {
+            if (left.Type is NamedTypeSymbol leftType && leftType.TypeKind == TypeKind.Delegate && ClassifyConversion(right, leftType, ctx).Kind is ConversionKind.Identity or ConversionKind.ImplicitReference or ConversionKind.NullLiteral)
+                return leftType;
+
+            if (right.Type is NamedTypeSymbol rightType && rightType.TypeKind == TypeKind.Delegate && ClassifyConversion(left, rightType, ctx).Kind is ConversionKind.Identity or ConversionKind.ImplicitReference or ConversionKind.NullLiteral)
+                return rightType;
+
+            return null;
         }
         private BoundExpression BindBitwiseBinary(
             BinaryExpressionSyntax bin,
@@ -1006,6 +1049,12 @@ namespace Cnidaria.Cs
                 SyntaxKind.NotEqualsExpression => BoundBinaryOperatorKind.NotEquals,
                 _ => throw new InvalidOperationException()
             };
+
+            // A default literal takes the type of the other operand
+            if (right.Type is DefaultLiteralTypeSymbol && left.Type is not DefaultLiteralTypeSymbol and not NullTypeSymbol)
+                right = ApplyConversion(bin.Right, right, left.Type, bin, ctx, diagnostics, requireImplicit: true);
+            else if (left.Type is DefaultLiteralTypeSymbol && right.Type is not DefaultLiteralTypeSymbol and not NullTypeSymbol)
+                left = ApplyConversion(bin.Left, left, right.Type, bin, ctx, diagnostics, requireImplicit: true);
             var lifting = op == BoundBinaryOperatorKind.Equals ? LiftedKind.Equality : LiftedKind.Inequality;
             if (TryBindLifted(bin, ImmutableArray.Create(left, right), lifting, (o, d) => BindEqualityBinary(bin, o[0], o[1], ctx, d), ctx, diagnostics, out var lifted))
                 return lifted;
@@ -1266,8 +1315,40 @@ namespace Cnidaria.Cs
                 return !rightOut.HasErrors;
             }
 
+            // An explicit reference conversion is enough, only the references are compared (C# 12.12.7)
+            TypeSymbol objectType = ctx.Compilation.GetSpecialType(SpecialType.System_Object);
+            TypeSymbol leftBase = EffectiveBaseClass(left.Type, objectType);
+            TypeSymbol rightBase = EffectiveBaseClass(right.Type, objectType);
+            if (HasExplicitReferenceConversion(leftBase, rightBase) || HasExplicitReferenceConversion(rightBase, leftBase))
+            {
+                leftOut = ApplyConversion((ExpressionSyntax)
+                    left.Syntax, left, objectType, diagnosticNode, ctx, diagnostics, requireImplicit: true);
+                rightOut = ApplyConversion((ExpressionSyntax)
+                    right.Syntax, right, objectType, diagnosticNode, ctx, diagnostics, requireImplicit: true);
+                return !leftOut.HasErrors && !rightOut.HasErrors;
+            }
+
             return false;
         }
+
+        // A type parameter converts through its class constraint, without one through object
+        private static TypeSymbol EffectiveBaseClass(TypeSymbol type, TypeSymbol objectType)
+        {
+            if (type is not TypeParameterSymbol typeParameter)
+                return type;
+
+            foreach (TypeSymbol constraint in typeParameter.ConstraintTypes)
+            {
+                if (constraint is TypeParameterSymbol)
+                    return EffectiveBaseClass(constraint, objectType);
+
+                if (!IsInterfaceType(constraint))
+                    return constraint;
+            }
+
+            return objectType;
+        }
+
         private BoundExpression BindRelationalBinary(
             BinaryExpressionSyntax bin,
             BoundExpression left,
@@ -2146,6 +2227,11 @@ namespace Cnidaria.Cs
                     builder.Add(isPattern.DeclaredLocalOpt);
                     return;
 
+                case BoundUnaryExpression not
+                    when not.OperatorKind == BoundUnaryOperatorKind.LogicalNot:
+                    CollectPatternLocalsWhenFalse(not.Operand, builder);
+                    return;
+
                 case BoundBinaryExpression bin
                     when bin.OperatorKind == BoundBinaryOperatorKind.LogicalAnd:
                     CollectPatternLocalsWhenTrue(bin.Left, builder);
@@ -2174,6 +2260,11 @@ namespace Cnidaria.Cs
                 case BoundIsPatternExpression isPattern
                     when isPattern.DeclaredLocalOpt is not null && isPattern.IsNegated:
                     builder.Add(isPattern.DeclaredLocalOpt);
+                    return;
+
+                case BoundUnaryExpression not
+                    when not.OperatorKind == BoundUnaryOperatorKind.LogicalNot:
+                    CollectPatternLocalsWhenTrue(not.Operand, builder);
                     return;
 
                 case BoundBinaryExpression bin
@@ -2232,6 +2323,21 @@ namespace Cnidaria.Cs
                 scope.ImportFlowingLocal(locals[i]);
             return scope;
         }
+        // A variable declared in an 'if' condition is in scope for the whole statement and what follows it in the block
+        private LocalScopeBinder CreateIfStatementScopeBinder(BoundExpression condition)
+        {
+            ImmutableArray<LocalSymbol> whenTrue = GetPatternLocalsWhenTrue(condition);
+            ImmutableArray<LocalSymbol> whenFalse = GetPatternLocalsWhenFalse(condition);
+            if (whenTrue.IsDefaultOrEmpty && whenFalse.IsDefaultOrEmpty)
+                return this;
+
+            var scope = new LocalScopeBinder(parent: this, flags: Flags, containing: _containing);
+            foreach (LocalSymbol local in whenTrue)
+                scope.ImportFlowingLocal(local);
+            foreach (LocalSymbol local in whenFalse)
+                scope.ImportFlowingLocal(local);
+            return scope;
+        }
         private static bool StatementDefinitelyDoesNotComplete(BoundStatement statement)
         {
             switch (statement)
@@ -2264,12 +2370,8 @@ namespace Cnidaria.Cs
         }
         private LocalScopeBinder GetFlowScopeBinderForFollowingStatements(BoundStatement statement)
         {
-            if (statement is BoundIfStatement @if &&
-                @if.ElseOpt is null &&
-                StatementDefinitelyDoesNotComplete(@if.Then))
-            {
-                return CreateFlowScopeBinderForFalse(@if.Condition);
-            }
+            if (statement is BoundIfStatement @if)
+                return CreateIfStatementScopeBinder(@if.Condition);
 
             return this;
         }

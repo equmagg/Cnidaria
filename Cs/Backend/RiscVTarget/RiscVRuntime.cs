@@ -18,6 +18,7 @@ namespace Cnidaria.Cs
         public const string CollectSymbol = "RhpCollect";
         public const string GcPollRequestedSymbol = "RhpGcPollRequested";
         public const string NewFastSymbol = "RhpNewFast";
+        public const string NewFinalizableSymbol = "RhpNewFinalizable";
         public const string NewArraySymbol = "RhpNewArray";
         public const string NewUninitializedArraySymbol = "RhpNewArrayUninitialized";
         public const string AllocHGlobalSymbol = "RhpAllocHGlobal";
@@ -272,6 +273,9 @@ namespace Cnidaria.Cs
                 return MemberwiseCloneSymbol;
             }
 
+            if (RuntimeGcImports.Symbol(method) is string gcImport)
+                return gcImport;
+
             if (IsSystemType(method.DeclaringType, "Array"))
             {
                 if (method.IsStatic &&
@@ -471,7 +475,8 @@ namespace Cnidaria.Cs
                 throw new ArgumentNullException(nameof(method));
 
             return IsAllocateNewArrayInternalCall(method) || IsMemberwiseCloneInternalCall(method) ||
-                IsFastAllocateStringInternalCall(method) || IsFastPollGcInternalCall(method) || IsNewFastInternalCall(method);
+                IsFastAllocateStringInternalCall(method) || IsFastPollGcInternalCall(method) || IsNewFastInternalCall(method) ||
+                RuntimeGcImports.IsGcSafePoint(method);
         }
 
         // Allocates a fixed-size object of the MethodTable it is passed

@@ -41,6 +41,7 @@ namespace Cnidaria.Cs
             if (!visited.Add(type))
                 return;
             ValidateDuplicateMethodSignatures(type, diagnostics);
+            ValidateDuplicateMemberNames(type, diagnostics);
             var members = type.GetMembers();
             for (int i = 0; i < members.Length; i++)
             {
@@ -78,7 +79,66 @@ namespace Cnidaria.Cs
 
                 seen.Add(method);
             }
+
+            // The accessors of a property or event take their names away from ordinary methods
+            for (int i = 0; i < members.Length; i++)
+            {
+                if (members[i] is not SourceMethodSymbol accessor ||
+                    (accessor.AssociatedProperty is null && !accessor.IsEventAccessor) ||
+                    accessor.IsExplicitInterfaceImplementation)
+                {
+                    continue;
+                }
+
+                foreach (MethodSymbol method in seen)
+                {
+                    if (method.Name == accessor.Name && HasSameMemberSignature(method, accessor))
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CS0082",
+                            DiagnosticSeverity.Error,
+                            $"Type '{type.Name}' already reserves a member called '{accessor.Name}' with the same parameter types.",
+                            method.Locations[0]));
+                    }
+                }
+            }
         }
+
+        // Only methods overload a name, the names here are the ones source can refer to
+        private static void ValidateDuplicateMemberNames(NamedTypeSymbol type, DiagnosticBag diagnostics)
+        {
+            var seen = new Dictionary<string, Symbol>(StringComparer.Ordinal);
+            foreach (Symbol member in type.GetMembers())
+            {
+                bool named = member switch
+                {
+                    SourceFieldSymbol field => field.DeclaringSyntaxReferences[0].Node is VariableDeclaratorSyntax or EnumMemberDeclarationSyntax,
+                    SourcePropertySymbol property => property.DeclaringSyntaxReferences[0].Node is PropertyDeclarationSyntax && !property.IsExplicitInterfaceImplementation,
+                    SourceEventSymbol declaredEvent => !declaredEvent.IsExplicitInterfaceImplementation,
+                    MethodSymbol method => IsSourceUserCallableMethod(method, out _),
+                    _ => false,
+                };
+                if (!named)
+                    continue;
+
+                if (seen.TryGetValue(member.Name, out Symbol? previous))
+                {
+                    if (member is not MethodSymbol || previous is not MethodSymbol)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CS0102",
+                            DiagnosticSeverity.Error,
+                            $"The type '{type.Name}' already contains a definition for '{member.Name}'.",
+                            member.Locations[0]));
+                    }
+                }
+                else
+                {
+                    seen.Add(member.Name, member);
+                }
+            }
+        }
+
         private static bool IsSourceUserCallableMethod(MethodSymbol method, out SyntaxReference declaration)
         {
             declaration = default;
@@ -100,7 +160,7 @@ namespace Cnidaria.Cs
                 return true;
             }
 
-            if (first.Node is ConstructorDeclarationSyntax)
+            if (first.Node is ConstructorDeclarationSyntax or ParameterListSyntax)
             {
                 declaration = first;
                 return true;

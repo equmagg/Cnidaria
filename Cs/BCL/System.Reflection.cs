@@ -155,6 +155,13 @@ namespace System.Reflection
         public abstract string Name { get; }
         internal virtual bool CacheEquals(object? o) { throw new NotImplementedException(); }
     }
+    public abstract class MethodBase : MemberInfo
+    {
+        public abstract Type? DeclaringType { get; }
+    }
+    public abstract class MethodInfo : MethodBase
+    {
+    }
     public abstract class EnumInfo
     {
         private protected EnumInfo(Type underlyingType, string[] names, bool isFlags)

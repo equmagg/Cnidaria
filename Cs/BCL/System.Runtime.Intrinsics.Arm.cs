@@ -18,6 +18,13 @@ namespace System.Runtime.Intrinsics.Arm
         {
             public static new bool IsSupported { [Intrinsic] get { return false; } }
             internal Arm64() { }
+
+            /// <summary>
+            ///   <para>uint8x16_t vqtbl2q_u8(uint8x16x2_t t, uint8x16_t idx)</para>
+            ///   <para>  A64: TBL Vd.16B, {Vn.16B, Vn+1.16B}, Vm.16B</para>
+            /// </summary>
+            public static Vector128<byte> VectorTableLookup((Vector128<byte>, Vector128<byte>) table, Vector128<byte> byteIndexes) { throw new PlatformNotSupportedException(); }
+
             /// <summary>
             ///   <para>float64x2_t vcvt_f64_f32 (float32x2_t a)</para>
             ///   <para>  A64: FCVTL Vd.2D, Vn.2S</para>

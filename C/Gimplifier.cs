@@ -340,7 +340,7 @@ internal sealed class Gimplifier
             var returnType = function.Symbol?.FunctionType?.ReturnType;
             if (returnType.HasValue &&
                 returnType.Value.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Int } &&
-                string.Equals(function.Symbol?.Name, "main", StringComparison.Ordinal))
+                function.Symbol?.Name == "main")
             {
                 expression = CreateZeroValue(returnType.Value, function.Syntax);
             }
@@ -929,7 +929,7 @@ internal sealed class Gimplifier
 
         foreach (var field in tag.Fields)
         {
-            if (string.Equals(field.Name, name, StringComparison.Ordinal))
+            if (field.Name == name)
             {
                 path.Add(field);
                 return true;
@@ -1425,7 +1425,11 @@ internal sealed class Gimplifier
                 break;
 
             default:
-                _ = LowerExpression(expression);
+                var value = LowerExpression(expression);
+                // A discarded read of a volatile scalar is still an access, the value of a discarded assignment is not read back
+                if (expression is BoundConversionExpression { ConversionKind: BoundConversionKind.LValueToRValue } && value is GimplePlace place &&
+                    GimpleTypes.IsVolatileOrAtomic(place.Type) && !GimpleTypes.IsAggregate(place.Type))
+                    Materialize(GimplifyReference(place));
                 break;
         }
     }
@@ -1871,7 +1875,7 @@ internal sealed class Gimplifier
 
     private GimpleValue LowerCompoundLiteralExpression(BoundCompoundLiteralExpression expression)
     {
-        var target = CreateTemporary(expression.Type, expression.Syntax);
+        var target = CreateObjectTemporary(expression.Type, expression.Syntax);
         if (expression.InitializerList is not null)
             LowerInitializer(target, expression.InitializerList);
         else
@@ -2676,12 +2680,19 @@ internal sealed class Gimplifier
         return (GimpleValue?)result ?? new GimpleConstantValue(null, signature.ReturnType, syntax);
     }
 
+    // Only the object a value was read from is volatile or atomic, the value is not
     private GimpleTemporaryValue CreateTemporary(QualifiedType type, SyntaxNode? syntax)
+        => CreateObjectTemporary(WithoutOrdering(type), syntax);
+
+    private GimpleTemporaryValue CreateObjectTemporary(QualifiedType type, SyntaxNode? syntax)
     {
         var temporary = new GimpleTemporaryValue(_temporaryOrdinal++, type, syntax);
         _temporaries.Add(temporary);
         return temporary;
     }
+
+    private static QualifiedType WithoutOrdering(QualifiedType type)
+        => GimpleTypes.IsVolatileOrAtomic(type) ? new QualifiedType(type.Type, type.Qualifiers & ~(TypeQualifiers.Volatile | TypeQualifiers.Atomic)) : type;
 
     private GimpleConstantValue CreateIntegerZero(QualifiedType type, SyntaxNode? syntax)
         => CreateIntegerConstant(0, type, syntax);
@@ -2693,7 +2704,7 @@ internal sealed class Gimplifier
     {
         var constantType = type.IsError || GimpleTypes.IsPointerLike(type)
             ? _types.Builtin(BuiltinTypeKind.Int)
-            : type;
+            : WithoutOrdering(type);
 
         return new GimpleConstantValue((int)value == value ? (int)value : value, constantType, syntax);
     }

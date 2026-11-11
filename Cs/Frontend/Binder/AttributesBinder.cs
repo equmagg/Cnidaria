@@ -181,6 +181,12 @@ namespace Cnidaria.Cs
                                 stubModel, safeTypeBinder, unsafeTypeBinder, diagnostics, applications);
                             break;
 
+                        case DestructorDeclarationSyntax dds when symbol is MethodSymbol:
+                            BindAttributeListsOnOwner(
+                                compilation, tree, dds.AttributeLists, ownerSyntax: dds, ownerSymbol: symbol,
+                                stubModel, safeTypeBinder, unsafeTypeBinder, diagnostics, applications);
+                            break;
+
                         case PropertyDeclarationSyntax pds when symbol is PropertySymbol:
                             BindAttributeListsOnOwner(
                                 compilation, tree, pds.AttributeLists, ownerSyntax: pds, ownerSymbol: symbol,
@@ -190,6 +196,15 @@ namespace Cnidaria.Cs
                         case AccessorDeclarationSyntax ads when symbol is MethodSymbol:
                             BindAttributeListsOnOwner(
                                 compilation, tree, ads.AttributeLists, ownerSyntax: ads, ownerSymbol: symbol,
+                                stubModel, safeTypeBinder, unsafeTypeBinder, diagnostics, applications);
+                            break;
+
+                        case SyntaxNode eventKey when symbol is SourceEventSymbol declaredEvent:
+                            MemberDeclarationSyntax eventOwner = eventKey is VariableDeclaratorSyntax && declaredEvent.PartialDefinition is EventFieldDeclarationSyntax partialDefinition
+                                ? partialDefinition
+                                : declaredEvent.AttributeOwner;
+                            BindAttributeListsOnOwner(
+                                compilation, tree, eventOwner.AttributeLists, ownerSyntax: eventOwner, ownerSymbol: symbol,
                                 stubModel, safeTypeBinder, unsafeTypeBinder, diagnostics, applications);
                             break;
 
@@ -307,6 +322,16 @@ namespace Cnidaria.Cs
                         typeBinder, localBinder, ctx, diagnostics,
                         out var data))
                     {
+                        if (ownerSymbol is EventSymbol && target == AttributeApplicationTarget.Method && MethodAttributeFacts.IsAttribute(data!, "System", "ObsoleteAttribute"))
+                        {
+                            diagnostics.Add(new Diagnostic(
+                                "CN_ATTR003",
+                                DiagnosticSeverity.Error,
+                                "Attribute 'Obsolete' is not valid on event accessors.",
+                                new Location(tree, attrSyntax.Span)));
+                            continue;
+                        }
+
                         AddAttribute(targetOwner, data!);
 
                         applications.Add(new BoundAttributeApplication(tree, attrSyntax, targetOwner, data!));
@@ -614,7 +639,7 @@ namespace Cnidaria.Cs
 
             var text = targetSyntax.Identifier.ValueText ?? "";
             var parsed = ParseTarget(text, defaultTarget);
-            if (parsed == AttributeApplicationTarget.Method && ownerSymbol is SourceNamedTypeSymbol { RecordInfo.PrimaryConstructor: not null })
+            if (parsed == AttributeApplicationTarget.Method && ownerSymbol is SourceNamedTypeSymbol sourceType && sourceType.PrimaryConstructor is not null)
                 parsed = AttributeApplicationTarget.Constructor;
 
             if (parsed == AttributeApplicationTarget.Unknown)
@@ -631,8 +656,8 @@ namespace Cnidaria.Cs
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_ATTR002",
-                    DiagnosticSeverity.Error,
-                    $"Attribute target '{text}' is not valid for this declaration.",
+                    DiagnosticSeverity.Warning,
+                    $"Attribute target '{text}' is not valid for this declaration, its attributes are ignored.",
                     new Location(tree, targetSyntax.Span)));
                 return AttributeApplicationTarget.Unknown;
             }
@@ -675,7 +700,7 @@ namespace Cnidaria.Cs
             switch (owner)
             {
                 case NamedTypeSymbol nt:
-                    if (target == AttributeApplicationTarget.Constructor && nt is SourceNamedTypeSymbol { RecordInfo.PrimaryConstructor: not null })
+                    if (target == AttributeApplicationTarget.Constructor && nt is SourceNamedTypeSymbol sourceType && sourceType.PrimaryConstructor is not null)
                         return true;
                     return nt.TypeKind switch
                     {
@@ -700,6 +725,11 @@ namespace Cnidaria.Cs
                 case PropertySymbol:
                     return target == AttributeApplicationTarget.Property || target == AttributeApplicationTarget.ReturnValue;
 
+                case EventSymbol declaredEvent:
+                    return target == AttributeApplicationTarget.Event ||
+                           (target == AttributeApplicationTarget.Field && declaredEvent.BackingFieldOpt is not null) ||
+                           (target == AttributeApplicationTarget.Method && declaredEvent is SourceEventSymbol sourceEvent && sourceEvent.AttributeOwner is EventFieldDeclarationSyntax);
+
                 case FieldSymbol:
                     return target == AttributeApplicationTarget.Field;
 
@@ -719,7 +749,7 @@ namespace Cnidaria.Cs
             if (owner is ParameterSymbol parameter && target is AttributeApplicationTarget.Property or AttributeApplicationTarget.Field &&
                 GetRecordParameterProperty(parameter) is SourcePropertySymbol positionalProperty)
                 owner = positionalProperty;
-            if (target == AttributeApplicationTarget.Constructor && owner is SourceNamedTypeSymbol { RecordInfo.PrimaryConstructor: MethodSymbol constructor })
+            if (target == AttributeApplicationTarget.Constructor && owner is SourceNamedTypeSymbol sourceType && sourceType.PrimaryConstructor is MethodSymbol constructor)
                 return constructor;
             if (target == AttributeApplicationTarget.Field &&
                 owner is SourcePropertySymbol property &&
@@ -727,6 +757,8 @@ namespace Cnidaria.Cs
             {
                 return backingField;
             }
+            if (target == AttributeApplicationTarget.Field && owner is EventSymbol declaredEvent)
+                return declaredEvent.BackingFieldOpt;
 
             return owner;
         }
@@ -753,6 +785,7 @@ namespace Cnidaria.Cs
                 },
                 MethodSymbol m => m.IsConstructor ? AttributeApplicationTarget.Constructor : AttributeApplicationTarget.Method,
                 PropertySymbol => AttributeApplicationTarget.Property,
+                EventSymbol => AttributeApplicationTarget.Event,
                 FieldSymbol => AttributeApplicationTarget.Field,
                 ParameterSymbol => AttributeApplicationTarget.Parameter,
                 TypeParameterSymbol => AttributeApplicationTarget.GenericParameter,
@@ -772,6 +805,7 @@ namespace Cnidaria.Cs
             {
                 MethodDeclarationSyntax md when HasModifier(md.Modifiers, SyntaxKind.UnsafeKeyword) => BinderFlags.UnsafeRegion,
                 ConstructorDeclarationSyntax cd when HasModifier(cd.Modifiers, SyntaxKind.UnsafeKeyword) => BinderFlags.UnsafeRegion,
+                DestructorDeclarationSyntax dd when HasModifier(dd.Modifiers, SyntaxKind.UnsafeKeyword) => BinderFlags.UnsafeRegion,
                 PropertyDeclarationSyntax pd when HasModifier(pd.Modifiers, SyntaxKind.UnsafeKeyword) => BinderFlags.UnsafeRegion,
                 FieldDeclarationSyntax fd when HasModifier(fd.Modifiers, SyntaxKind.UnsafeKeyword) => BinderFlags.UnsafeRegion,
                 TypeDeclarationSyntax td when HasModifier(td.Modifiers, SyntaxKind.UnsafeKeyword) => BinderFlags.UnsafeRegion,
@@ -1407,6 +1441,15 @@ namespace Cnidaria.Cs
                 return true;
             }
 
+            var typeOf = convertedExpression as BoundTypeOfExpression;
+            if (convertedExpression is BoundConversionExpression typeConversion)
+                typeOf = typeConversion.Operand as BoundTypeOfExpression;
+            if (typeOf is not null)
+            {
+                constant = new TypedConstant(typeOf.Type, typeOf.OperandType);
+                return true;
+            }
+
             if (!convertedExpression.ConstantValueOpt.HasValue)
             {
                 diagnostics.Add(new Diagnostic(
@@ -1457,7 +1500,7 @@ namespace Cnidaria.Cs
 
             return t is NamedTypeSymbol n && n.Name == "Type" && IsNamespace(n.ContainingSymbol, "System");
         }
-        private static bool IsAttributeType(NamedTypeSymbol t)
+        internal static bool IsAttributeType(NamedTypeSymbol t)
         {
             for (TypeSymbol? cur = t; cur is not null; cur = cur.BaseType)
             {
@@ -1510,6 +1553,9 @@ namespace Cnidaria.Cs
                     break;
                 case SourcePropertySymbol p:
                     p.AddAttribute(data);
+                    break;
+                case SourceEventSymbol e:
+                    e.AddAttribute(data);
                     break;
                 case SourceFieldSymbol f:
                     f.AddAttribute(data);
@@ -1645,6 +1691,39 @@ namespace Cnidaria.Cs
             if (import is null)
                 return;
 
+            if (MethodAttributeFacts.HasAttribute(method, "System.Runtime.InteropServices", "LibraryImportAttribute"))
+            {
+                if (!import.ReturnsNativeBool && !IsBlittable(method.ReturnType, allowVoid: true))
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_LIBIMPORT001",
+                        DiagnosticSeverity.Error,
+                        $"Return type '{method.ReturnType.Name}' is not blittable, and LibraryImport marshalling is not supported.",
+                        location));
+                }
+
+                foreach (ParameterSymbol parameter in method.Parameters)
+                {
+                    if (IsBlittable(parameter.Type, allowVoid: false))
+                        continue;
+
+                    diagnostics.Add(new Diagnostic(
+                        "CN_LIBIMPORT002",
+                        DiagnosticSeverity.Error,
+                        $"Parameter '{parameter.Name}' has type '{parameter.Type.Name}', which is not blittable, and LibraryImport marshalling is not supported.",
+                        location));
+                }
+            }
+
+            if (import.ReturnsNativeBool && method.ReturnType.SpecialType != SpecialType.System_Boolean)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_PINVOKE009",
+                    DiagnosticSeverity.Error,
+                    $"MarshalAs(UnmanagedType.Bool) cannot apply to return type '{method.ReturnType.Name}'.",
+                    location));
+            }
+
             if (!method.IsStatic || !method.IsExtern)
             {
                 diagnostics.Add(new Diagnostic(
@@ -1723,6 +1802,32 @@ namespace Cnidaria.Cs
             for (Symbol? containing = method.ContainingSymbol; containing is NamedTypeSymbol type; containing = type.ContainingSymbol)
             {
                 if (!type.TypeParameters.IsDefaultOrEmpty)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsBlittable(TypeSymbol type, bool allowVoid)
+        {
+            if (!IsSupportedInteropType(type, allowVoid))
+                return false;
+
+            TypeSymbol value = type is ByRefTypeSymbol byRef ? byRef.ElementType : type;
+            return !ContainsBoolOrChar(value, new HashSet<TypeSymbol>(ReferenceEqualityComparer<TypeSymbol>.Instance));
+        }
+
+        // Neither has one native form, the set stops at primitives whose only field is of their own type
+        private static bool ContainsBoolOrChar(TypeSymbol type, HashSet<TypeSymbol> visited)
+        {
+            if (type.SpecialType is SpecialType.System_Boolean or SpecialType.System_Char)
+                return true;
+            if (type is not NamedTypeSymbol structType || structType.TypeKind != TypeKind.Struct || !visited.Add(structType))
+                return false;
+
+            foreach (Symbol member in structType.GetMembers())
+            {
+                if (member is FieldSymbol field && !field.IsStatic && ContainsBoolOrChar(field.Type, visited))
                     return true;
             }
 

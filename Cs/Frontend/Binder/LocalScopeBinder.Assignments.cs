@@ -19,16 +19,23 @@ namespace Cnidaria.Cs
 
             if (node.Kind == SyntaxKind.SimpleAssignmentExpression &&
                 node.Left is IdentifierNameSyntax discardIdentifier &&
-                string.Equals(discardIdentifier.Identifier.ValueText, "_", StringComparison.Ordinal) &&
+                discardIdentifier.Identifier.ValueText == "_" &&
                 IsDiscardAssignmentTarget(discardIdentifier, context))
             {
                 return BindExpression(node.Right, context, diagnostics);
             }
 
-            var lv = BindLValue(node.Left, context, diagnostics, requireReadable: node.Kind != SyntaxKind.SimpleAssignmentExpression);
+            LValue lv = BindLValue(node.Left, context, diagnostics, requireReadable: node.Kind != SyntaxKind.SimpleAssignmentExpression, allowEvent: true);
             var leftTarget = lv.Target;
 
             var right = BindExpression(node.Right, context, diagnostics);
+
+            // A from-end index stabilizes the array and index first, the store happens inside that sequence
+            if (leftTarget is BoundSequenceExpression sequenceTarget)
+            {
+                BoundExpression store = BindAssignmentToLValue(node, new LValue(sequenceTarget.Value, sequenceTarget.Value), right, context, diagnostics);
+                return new BoundSequenceExpression(node, sequenceTarget.Locals, sequenceTarget.SideEffects, store);
+            }
 
             return BindAssignmentToLValue(node, lv, right, context, diagnostics);
         }
@@ -45,6 +52,69 @@ namespace Cnidaria.Cs
             probeDiagnostics = new DiagnosticBag();
             return !TryBindImportedStaticMember(identifier, "_", BindValueKind.LValue, probeContext, probeDiagnostics, out _);
         }
+
+        // Inside its type += and -= on a field-like event bind to the field first, which still means the event
+        private static EventSymbol? GetAssignedEvent(AssignmentExpressionSyntax node, BoundMemberAccessExpression target)
+        {
+            if (target.Member is EventSymbol accessorOnlyEvent)
+                return accessorOnlyEvent;
+
+            if (node.Kind is not (SyntaxKind.AddAssignmentExpression or SyntaxKind.SubtractAssignmentExpression) ||
+                target.Member is not FieldSymbol field ||
+                field.OriginalDefinition is not SynthesizedBackingFieldSymbol ||
+                field.ContainingSymbol is not NamedTypeSymbol owner)
+            {
+                return null;
+            }
+
+            foreach (Symbol member in owner.GetMembers())
+            {
+                if (member is EventSymbol candidate && candidate.BackingFieldOpt is FieldSymbol backingField &&
+                    ReferenceEquals(backingField.OriginalDefinition, field.OriginalDefinition))
+                {
+                    return candidate;
+                }
+            }
+
+            return null;
+        }
+
+        private BoundExpression BindEventAssignment(
+            AssignmentExpressionSyntax node,
+            BoundMemberAccessExpression target,
+            EventSymbol assignedEvent,
+            BoundExpression right,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            MethodSymbol accessor;
+            switch (node.Kind)
+            {
+                case SyntaxKind.AddAssignmentExpression:
+                    accessor = assignedEvent.AddMethod;
+                    break;
+                case SyntaxKind.SubtractAssignmentExpression:
+                    accessor = assignedEvent.RemoveMethod;
+                    break;
+                default:
+                    ReportEventOutsideAssignment(node.Left, assignedEvent, context, diagnostics);
+                    return new BoundBadExpression(node);
+            }
+
+            BoundExpression value = ApplyConversion(
+                exprSyntax: node.Right,
+                expr: right,
+                targetType: assignedEvent.Type,
+                diagnosticNode: node,
+                context: context,
+                diagnostics: diagnostics,
+                requireImplicit: true);
+            if (value.HasErrors)
+                return new BoundBadExpression(node);
+
+            return new BoundCallExpression(node, target.ReceiverOpt, accessor, ImmutableArray.Create(value), target.ConstrainedToTypeOpt);
+        }
+
         private BoundExpression BindAssignmentToLValue(
             AssignmentExpressionSyntax node,
             LValue lv,
@@ -53,6 +123,9 @@ namespace Cnidaria.Cs
             DiagnosticBag diagnostics)
         {
             var leftTarget = lv.Target;
+            if (leftTarget is BoundMemberAccessExpression eventTarget && GetAssignedEvent(node, eventTarget) is EventSymbol assignedEvent)
+                return BindEventAssignment(node, eventTarget, assignedEvent, right, context, diagnostics);
+
             bool hasErrors = leftTarget.HasErrors || right.HasErrors;
 
             // Reject writes to constant locals
@@ -1647,7 +1720,7 @@ namespace Cnidaria.Cs
                 arguments: ImmutableArray.Create(leftArg, rightArg));
         }
 
-        private static bool TryFindSystemDelegateMethod(Compilation compilation, string name, out MethodSymbol method)
+        internal static bool TryFindSystemDelegateMethod(Compilation compilation, string name, out MethodSymbol method)
         {
             method = null!;
 
@@ -1890,7 +1963,7 @@ namespace Cnidaria.Cs
             return new BoundConversionExpression(syntaxForBoundNode, targetType, expr, conv, isChecked);
         }
         // Central writable target validation for assignments and by-reference arguments
-        private BoundExpression BindAssignableValue(ExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
+        private BoundExpression BindAssignableValue(ExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics, bool allowEvent = false)
         {
             BoundExpression expr;
 
@@ -1919,7 +1992,7 @@ namespace Cnidaria.Cs
                 var name = id.Identifier.ValueText ?? "";
                 if (TryGetLocalOrParameterFromEnclosingScopes(name, out var local, out var param))
                 {
-                    expr = local is not null ? new BoundLocalExpression(id, local) : new BoundParameterExpression(id, param!);
+                    expr = local is not null ? new BoundLocalExpression(id, local) : BindParameterReference(id, param!, context);
                     expr = Record(id, expr, context);
                 }
                 else if (TryBindUnqualifiedMember(id, name, BindValueKind.LValue, context, diagnostics, out var memberExpr))
@@ -1957,6 +2030,11 @@ namespace Cnidaria.Cs
             if (expr.IsLValue || (expr is BoundConditionalExpression ce && ce.Type is ByRefTypeSymbol))
                 return expr;
 
+            if (expr is BoundSequenceExpression sequence && sequence.Value.IsLValue)
+                return expr;
+
+            if (allowEvent && expr is BoundMemberAccessExpression eventAccess && eventAccess.Member is EventSymbol)
+                return expr;
 
             diagnostics.Add(new Diagnostic("CN_ASG002", DiagnosticSeverity.Error,
                 "The left-hand side of an assignment must be a variable, property or indexer.",
@@ -1980,7 +2058,7 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(node);
             }
 
-            if (method.IsStatic)
+            if (IsInStaticMember(method))
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_THIS001",
@@ -1991,7 +2069,7 @@ namespace Cnidaria.Cs
                 return new BoundBadExpression(node);
             }
 
-            if (method.ContainingSymbol is not NamedTypeSymbol containingType)
+            if (GetEnclosingType(method, out _) is not NamedTypeSymbol containingType)
             {
                 diagnostics.Add(new Diagnostic(
                     "CN_THIS002",
@@ -2001,6 +2079,9 @@ namespace Cnidaria.Cs
 
                 return new BoundBadExpression(node);
             }
+
+            if (ReportThisInStructFunction(node, context, diagnostics))
+                return new BoundBadExpression(node);
 
             // 'this' is a variable only in struct instance members, and read-only outside constructors of readonly structs.
             if (!containingType.IsValueType || (!method.IsConstructor && containingType.IsReadOnlyStruct))
@@ -2173,7 +2254,7 @@ namespace Cnidaria.Cs
             {
                 var attrClass = attrs[i].AttributeClass;
                 if (attrClass is not null &&
-                    string.Equals(attrClass.Name, "IntrinsicAttribute", StringComparison.Ordinal))
+                    attrClass.Name == "IntrinsicAttribute")
                 {
                     return true;
                 }

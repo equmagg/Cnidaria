@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Text;
@@ -74,6 +75,7 @@ namespace Cnidaria.Cs
             layout = default;
             return false;
         }
+        internal void AddCilBody(int token, CilMethodBody body) => _cilBodies.Add(token, body);
         internal CilMethodBody? GetCilBody(int methodDefToken)
         {
             if (_cilBodies.TryGetValue(methodDefToken, out var body))
@@ -293,10 +295,26 @@ namespace Cnidaria.Cs
                     Md.GetString(Md.GetModuleRef(row.ImportScope).Name),
                     Md.GetString(row.ImportName),
                     row.MappingFlags,
-                    (method.ImplFlags & MetadataFlagBits.PreserveSig) != 0);
+                    (method.ImplFlags & MetadataFlagBits.PreserveSig) != 0,
+                    RuntimeTypeSystem.HasCustomAttribute(this, row.MethodToken, "System.Runtime.InteropServices", "SuppressGCTransitionAttribute"),
+                    HasBoolReturnMarshalling(methodRid, method.ParamList));
                 if (!PInvokesByMethodToken.TryAdd(row.MethodToken, data))
                     throw new InvalidOperationException($"Duplicate P/Invoke map for method token 0x{row.MethodToken:X8}.");
             }
+        }
+
+        private bool HasBoolReturnMarshalling(int methodRid, int paramRid)
+        {
+            // The list of a method without params starts at the row of the next method that has any
+            if (paramRid > Md.GetRowCount(MetadataTableKind.Param) ||
+                Md.GetParamOwnerMethodRid(paramRid) != methodRid ||
+                Md.GetParam(paramRid).Sequence != 0)
+            {
+                return false;
+            }
+
+            return Md.TryGetFieldMarshal(MetadataToken.Make(MetadataToken.ParamDef, paramRid), out int nativeType) &&
+                Md.GetBlob(nativeType) is [(byte)System.Runtime.InteropServices.UnmanagedType.Bool, ..];
         }
 
         public string GetSignatureKeyFromThisModule(int sigBlobIdx) => GetSigKey(sigBlobIdx);
@@ -613,7 +631,12 @@ namespace Cnidaria.Cs
 
         private readonly Dictionary<int, RuntimeType> _typeById = new();
         private readonly Dictionary<int, RuntimeMethod> _methodById = new();
+        private readonly Dictionary<int, RuntimeMethod> _delegateStubs = new();
+        // A table no metadata uses, a token of it names a runtime method by id so a generated body needs no signature to refer to one
+        private const int RuntimeMethodReferenceTable = 0x7E000000;
         private readonly Dictionary<int, (RuntimeModule Module, int Rid)> _typeDefOrigins = new();
+        // Only the variant type parameters are listed, so a miss means invariant
+        private readonly Dictionary<(int DefinitionTypeId, int Ordinal), VarianceKind> _genericVariance = new();
         private readonly Dictionary<int, List<int>> _methodImplRowsByTypeId = new();
 
         private int _nextTypeId = 1;
@@ -844,8 +867,58 @@ namespace Cnidaria.Cs
                 return false;
             }
         }
+        // A delegate holds one method to call and calls it directly, so what a call site has to do goes through this static method:
+        // dispatch on the receiver the delegate is closed over, or run the type initializer of a static target
+        internal RuntimeMethod GetDelegateStub(RuntimeMethod method, RuntimeModule module)
+        {
+            if (_delegateStubs.TryGetValue(method.MethodId, out RuntimeMethod? stub))
+                return stub;
+
+            int receiverCount = method.IsStatic ? 0 : 1;
+            var parameters = new RuntimeType[method.ParameterTypes.Length + receiverCount];
+            if (receiverCount != 0)
+                parameters[0] = method.DeclaringType;
+            method.ParameterTypes.CopyTo(parameters, receiverCount);
+            stub = new RuntimeMethod(_nextMethodId++, SystemObject, "<delegate>" + method.Name, method.ReturnType, parameters,
+                hasThis: false, isVirtual: false, isStatic: true, isNewSlot: false, isFinal: false,
+                flags: (ushort)(System.Reflection.MethodAttributes.Public | System.Reflection.MethodAttributes.Static), implFlags: 0);
+
+            ImmutableArray<CilInstruction>.Builder instructions = ImmutableArray.CreateBuilder<CilInstruction>(parameters.Length + 2);
+            for (int i = 0; i < parameters.Length; i++)
+                instructions.Add(new CilInstruction(ILOpCode.Ldarg, CilPrefix.None, i, i, 0));
+            instructions.Add(new CilInstruction(method.IsStatic ? ILOpCode.Call : ILOpCode.Callvirt, CilPrefix.None, parameters.Length, MetadataToken.Make(RuntimeMethodReferenceTable, method.MethodId), 0));
+            instructions.Add(new CilInstruction(ILOpCode.Ret, CilPrefix.None, parameters.Length + 1, 0, 0));
+
+            var body = new CilMethodBody(
+                instructions.MoveToImmutable(),
+                ImmutableArray<int>.Empty,
+                ImmutableArray<CilExceptionClause>.Empty,
+                parameters.Length,
+                initLocals: false,
+                localSignatureToken: 0);
+            short results = (short)(ReferenceEquals(method.ReturnType, FindPrimitive(RuntimePrimitiveKind.Void)) ? 0 : 1);
+            var pops = new short[parameters.Length + 2];
+            var pushes = new short[parameters.Length + 2];
+            Array.Fill(pushes, (short)1, 0, parameters.Length);
+            pops[parameters.Length] = (short)parameters.Length;
+            pushes[parameters.Length] = results;
+            pops[parameters.Length + 1] = results;
+            body.SetStackEffects(pops, pushes);
+
+            int bodyToken = MetadataToken.Make(RuntimeMethodReferenceTable, stub.MethodId);
+            module.AddCilBody(bodyToken, body);
+            stub.BodyModule = module;
+            stub.MethodDefToken = bodyToken;
+            _methodById[stub.MethodId] = stub;
+            _delegateStubs.Add(method.MethodId, stub);
+            return stub;
+        }
+
         public RuntimeMethod ResolveMethodInMethodContext(RuntimeModule module, int methodToken, RuntimeMethod? methodContext)
         {
+            if (MetadataToken.Table(methodToken) == RuntimeMethodReferenceTable)
+                return _methodById[MetadataToken.Rid(methodToken)];
+
             if (methodContext is null)
                 return ResolveMethod(module, methodToken);
 
@@ -1640,6 +1713,14 @@ namespace Cnidaria.Cs
                     _namedTypes[(m.Name, ns, name)] = rt;
                     _typeById[rt.TypeId] = rt;
                 }
+
+                for (int rid = 1; rid <= m.Md.GetRowCount(MetadataTableKind.GenericParam); rid++)
+                {
+                    GenericParamRow row = m.Md.GetGenericParam(rid);
+                    var variance = (VarianceKind)((System.Reflection.GenericParameterAttributes)row.Flags & System.Reflection.GenericParameterAttributes.VarianceMask);
+                    if (variance != VarianceKind.None && MetadataToken.Table(row.OwnerToken) == MetadataToken.TypeDef)
+                        _genericVariance[(_typeCache[(m.Name, row.OwnerToken)].TypeId, row.Number)] = variance;
+                }
             }
         }
 
@@ -1736,6 +1817,12 @@ namespace Cnidaria.Cs
                         for (int i = 0; i < t.InstanceFields.Length; i++)
                         {
                             var f = t.InstanceFields[i];
+                            // Names the header every object starts with
+                            if (t.BaseType is null && f.Name == "m_pEEType")
+                            {
+                                f.Offset = 0;
+                                continue;
+                            }
                             var (fs, fa) = GetStorageSizeAlign(f.FieldType);
                             offset = AlignUp(offset, fa);
                             f.Offset = offset;
@@ -1842,7 +1929,7 @@ namespace Cnidaria.Cs
                 t.Name switch
                 {
                     "IntPtr" or "UIntPtr" => f.Name is "_value" or "m_value",
-                    _ => string.Equals(f.Name, "m_value", StringComparison.Ordinal)
+                    _ => f.Name == "m_value"
                 };
 
             if (!validName)
@@ -2001,6 +2088,56 @@ namespace Cnidaria.Cs
 
             return method;
         }
+        private readonly Dictionary<int, RuntimeMethod?> _finalizers = new();
+
+        // Object.Finalize and its overrides take no vtable slot, MethodTable keeps the finalizer in a field of its own
+        private static bool IsFinalizerMethod(RuntimeType declaringType, RuntimeMethod method)
+            => method.IsVirtual &&
+               !method.IsStatic &&
+               method.Name == "Finalize" &&
+               method.ParameterTypes.Length == 0 &&
+               method.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Void &&
+               (declaringType.BaseType is null || !method.IsNewSlot);
+
+        internal RuntimeMethod? GetFinalizer(RuntimeType type)
+        {
+            if (type.Kind != RuntimeTypeKind.Class)
+                return null;
+            if (_finalizers.TryGetValue(type.TypeId, out RuntimeMethod? cached))
+                return cached;
+
+            RuntimeMethod? finalizer = null;
+            for (RuntimeType? current = type; current is not null && current.BaseType is not null && finalizer is null; current = current.BaseType)
+            {
+                EnsureConstructedMembers(current);
+                foreach (RuntimeMethod method in current.Methods)
+                {
+                    if (IsFinalizerMethod(current, method))
+                    {
+                        finalizer = method;
+                        break;
+                    }
+                }
+            }
+
+            _finalizers[type.TypeId] = finalizer;
+            return finalizer;
+        }
+
+        internal bool HasFinalizer(RuntimeType type) => GetFinalizer(type) is not null;
+
+        internal RuntimeMethod GetFinalizerDrainMethod()
+        {
+            RuntimeType finalizer = GetRequiredNamedType("std", "System.Runtime", "__Finalizer");
+            EnsureConstructedMembers(finalizer);
+            foreach (RuntimeMethod method in finalizer.Methods)
+            {
+                if (RuntimeGcImports.IsFinalizerDrain(method))
+                    return method;
+            }
+            throw new MissingMethodException("System.Runtime.__Finalizer.DrainQueueOnCurrentThread is missing from the core library.");
+        }
+
         internal RuntimeMethod? ResolveVirtualMethod(RuntimeMethod declaredMethod, RuntimeType objectType)
         {
             if (declaredMethod is null) throw new ArgumentNullException(nameof(declaredMethod));
@@ -2011,7 +2148,10 @@ namespace Cnidaria.Cs
                 return null;
             }
 
-            objectType = objectType.ArrayOfT ?? objectType;
+            RuntimeType receiverType = objectType;
+            if (objectType.ArrayOfT is RuntimeType arrayOfT)
+                objectType = GetArrayDispatchType(arrayOfT, declaredMethod.DeclaringType);
+
             EnsureConstructedMembers(objectType);
             EnsureVirtualTable(objectType);
 
@@ -2021,7 +2161,11 @@ namespace Cnidaria.Cs
             RuntimeMethod? target;
             if (dispatchDeclaration.DeclaringType.Kind == RuntimeTypeKind.Interface)
             {
-                target = ResolveInterfaceDispatchTarget(objectType, dispatchDeclaration);
+                bool arrayCovariance = receiverType.Kind == RuntimeTypeKind.Array;
+                target = dispatchDeclaration.DeclaringType.GenericTypeDefinition is RuntimeType interfaceDefinition &&
+                    (arrayCovariance || HasGenericVariance(dispatchDeclaration.DeclaringType))
+                    ? ResolveVariantInterfaceDispatch(objectType, dispatchDeclaration, interfaceDefinition, arrayCovariance)
+                    : ResolveInterfaceDispatchTarget(objectType, dispatchDeclaration);
             }
             else
             {
@@ -2090,13 +2234,203 @@ namespace Cnidaria.Cs
             if (targetType is null)
                 throw new ArgumentNullException(nameof(targetType));
 
-            EnsureConstructedMembers(actualType);
-            EnsureConstructedMembers(targetType);
+            return AreTypesAssignable(actualType, targetType, AssignmentVariation.BoxedSource, ImmutableStack<(RuntimeType, RuntimeType)>.Empty);
+        }
 
-            if (targetType.Kind == RuntimeTypeKind.Interface)
-                return FindInterfaceImplementationAnchor(actualType, targetType) is not null;
+        private enum AssignmentVariation : byte
+        {
+            Normal,
+            BoxedSource,
+            AllowSizeEquivalence,
+        }
 
-            return IsClassAssignableTo(actualType, targetType);
+        // A proof of variance can lead back to the instance pair it started from, proving holds those in progress
+        private bool AreTypesAssignable(RuntimeType source, RuntimeType target, AssignmentVariation variation, ImmutableStack<(RuntimeType, RuntimeType)> proving)
+        {
+            if (ReferenceEquals(source, target))
+                return true;
+
+            EnsureConstructedMembers(source);
+            EnsureConstructedMembers(target);
+
+            if (target.Kind == RuntimeTypeKind.Interface)
+            {
+                if (source.IsValueType && variation != AssignmentVariation.BoxedSource)
+                    return false;
+
+                return FindInterfaceImplementationAnchor(source, target) is not null ||
+                    FindVariantInterface(source, target, proving) is not null ||
+                    AreVariantInstances(source, target, proving);
+            }
+
+            // The only non-interface type an interface converts to is object
+            if (source.Kind == RuntimeTypeKind.Interface)
+                return ReferenceEquals(target, SystemObject);
+
+            if (target.Kind == RuntimeTypeKind.Array)
+            {
+                return source.Kind == RuntimeTypeKind.Array &&
+                    source.ArrayRank == target.ArrayRank &&
+                    source.IsSzArray == target.IsSzArray &&
+                    source.ElementType is RuntimeType sourceElement &&
+                    target.ElementType is RuntimeType targetElement &&
+                    sourceElement.Kind is not (RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.FunctionPointer) &&
+                    AreTypesAssignable(sourceElement, targetElement, AssignmentVariation.AllowSizeEquivalence, proving);
+            }
+
+            if (source.IsValueType && variation != AssignmentVariation.BoxedSource)
+                return variation == AssignmentVariation.AllowSizeEquivalence && AreSizeEquivalent(source, target);
+
+            return IsClassAssignableTo(source, target) || AreVariantInstances(source, target, proving);
+        }
+
+        private static bool AreSizeEquivalent(RuntimeType source, RuntimeType target)
+        {
+            const uint firstNonPrimitiveElementType = 0x10u;
+            uint targetElementType = NormalizedArrayElementType(target);
+            return targetElementType < firstNonPrimitiveElementType && NormalizedArrayElementType(source) == targetElementType;
+        }
+
+        // An unsigned integer shares the value of its signed counterpart, bool and char below them and the floats above stay apart
+        private static uint NormalizedArrayElementType(RuntimeType type)
+        {
+            uint elementType = RuntimeMethodTables.ElementType(type);
+            return elementType is >= 0x04u and <= 0x0du ? elementType & ~1u : elementType;
+        }
+
+        private bool AreVariantInstances(RuntimeType source, RuntimeType target, ImmutableStack<(RuntimeType, RuntimeType)> proving)
+            => target.GenericTypeDefinition is RuntimeType definition &&
+               ReferenceEquals(source.GenericTypeDefinition, definition) &&
+               AreTypeArgumentsAssignable(definition, source, target, forceCovariance: false, proving);
+
+        private bool AreTypeArgumentsAssignable(
+            RuntimeType definition,
+            RuntimeType source,
+            RuntimeType target,
+            bool forceCovariance,
+            ImmutableStack<(RuntimeType, RuntimeType)> proving)
+        {
+            if (proving.Contains((source, target)))
+                return false;
+            proving = proving.Push((source, target));
+
+            RuntimeType[] sourceArguments = source.GenericTypeArguments;
+            RuntimeType[] targetArguments = target.GenericTypeArguments;
+            for (int i = 0; i < targetArguments.Length; i++)
+            {
+                bool assignable = forceCovariance
+                    ? AreTypesAssignable(sourceArguments[i], targetArguments[i], AssignmentVariation.AllowSizeEquivalence, proving)
+                    : _genericVariance.GetValueOrDefault((definition.TypeId, i)) switch
+                    {
+                        VarianceKind.Out => AreTypesAssignable(sourceArguments[i], targetArguments[i], AssignmentVariation.Normal, proving),
+                        VarianceKind.In => AreTypesAssignable(targetArguments[i], sourceArguments[i], AssignmentVariation.Normal, proving),
+                        _ => ReferenceEquals(sourceArguments[i], targetArguments[i]),
+                    };
+                if (!assignable)
+                    return false;
+            }
+
+            return true;
+        }
+
+        // The first in hierarchy order, an array treats the generic interfaces it implements as covariant
+        private RuntimeType? FindVariantInterface(RuntimeType source, RuntimeType target, ImmutableStack<(RuntimeType, RuntimeType)> proving)
+        {
+            bool isArray = source.Kind == RuntimeTypeKind.Array;
+            if (target.GenericTypeDefinition is not RuntimeType definition || (!isArray && !HasGenericVariance(target)))
+                return null;
+
+            foreach (RuntimeType candidate in CollectImplementedInterfaces(source).Values)
+            {
+                if (ReferenceEquals(candidate.GenericTypeDefinition, definition) &&
+                    AreTypeArgumentsAssignable(definition, candidate, target, isArray, proving))
+                {
+                    return candidate;
+                }
+            }
+
+            return null;
+        }
+
+        // Sealed is not enough: a Func<object> reference can hold a Func<string>, an object[] a string[] and an int[] a uint[]
+        internal bool IsExactType(RuntimeType type)
+        {
+            while (type.Kind == RuntimeTypeKind.Array && type.ElementType is RuntimeType element)
+            {
+                if (!type.IsSzArray && type.ArrayRank == 1)
+                    return false;
+
+                type = element;
+                if (type.PrimitiveKind != RuntimePrimitiveKind.None || type.Kind == RuntimeTypeKind.Enum)
+                    return false;
+            }
+
+            if (type.Kind is RuntimeTypeKind.Pointer or RuntimeTypeKind.ByRef or RuntimeTypeKind.FunctionPointer or RuntimeTypeKind.TypeParam || HasGenericVariance(type))
+                return false;
+
+            return type.IsValueType || type.IsFinal;
+        }
+
+        internal bool HasGenericVariance(RuntimeType type)
+        {
+            if (type.GenericTypeDefinition is RuntimeType definition)
+            {
+                for (int i = 0; i < type.GenericTypeArguments.Length; i++)
+                {
+                    if (_genericVariance.ContainsKey((definition.TypeId, i)))
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        // The program is closed, so a type can list ahead of time the given interfaces and delegates it converts to only through variance
+        internal Dictionary<int, List<RuntimeType>> CollectVariantCastTargets(RuntimeType[] types)
+        {
+            var instancesByDefinition = new Dictionary<int, List<RuntimeType>>();
+            foreach (RuntimeType type in types)
+            {
+                if (type.GenericTypeDefinition is RuntimeType definition && (type.Kind == RuntimeTypeKind.Interface || HasGenericVariance(type)))
+                {
+                    if (!instancesByDefinition.TryGetValue(definition.TypeId, out List<RuntimeType>? instances))
+                        instancesByDefinition[definition.TypeId] = instances = new List<RuntimeType>();
+                    instances.Add(type);
+                }
+            }
+
+            var targetsByType = new Dictionary<int, List<RuntimeType>>();
+            foreach (RuntimeType source in types)
+            {
+                bool isArray = source.Kind == RuntimeTypeKind.Array;
+                Dictionary<int, RuntimeType> implemented = CollectImplementedInterfaces(source);
+                implemented.TryAdd(source.TypeId, source);
+                foreach (RuntimeType candidate in implemented.Values)
+                {
+                    if (candidate.GenericTypeDefinition is not RuntimeType definition ||
+                        !instancesByDefinition.TryGetValue(definition.TypeId, out List<RuntimeType>? instances) ||
+                        (!isArray && !HasGenericVariance(candidate)))
+                    {
+                        continue;
+                    }
+
+                    foreach (RuntimeType instance in instances)
+                    {
+                        if (implemented.ContainsKey(instance.TypeId) ||
+                            !AreTypeArgumentsAssignable(definition, candidate, instance, isArray, ImmutableStack<(RuntimeType, RuntimeType)>.Empty))
+                        {
+                            continue;
+                        }
+
+                        if (!targetsByType.TryGetValue(source.TypeId, out List<RuntimeType>? targets))
+                            targetsByType[source.TypeId] = targets = new List<RuntimeType>();
+                        if (!targets.Contains(instance))
+                            targets.Add(instance);
+                    }
+                }
+            }
+
+            return targetsByType;
         }
 
         private static bool IsClassAssignableTo(RuntimeType actualType, RuntimeType declaredType)
@@ -2109,7 +2443,71 @@ namespace Cnidaria.Cs
             return false;
         }
 
+        // An int[] used as IEnumerable<uint> runs Array<uint>: only arrays convert between int and uint, so what its methods return must already be of the asked type
+        private RuntimeType GetArrayDispatchType(RuntimeType arrayOfT, RuntimeType declaringType)
+        {
+            if (declaringType.Kind == RuntimeTypeKind.Interface &&
+                declaringType.GenericTypeArguments.Length == 1 &&
+                arrayOfT.GenericTypeDefinition is RuntimeType definition &&
+                AreSizeEquivalent(arrayOfT.GenericTypeArguments[0], declaringType.GenericTypeArguments[0]))
+            {
+                return GetOrCreateGenericInstanceType(definition, declaringType.GenericTypeArguments);
+            }
+
+            return arrayOfT;
+        }
+
+        // Class implementations win over default ones whatever the level, within a pass each level tries the exact interface and then
+        // the ones that convert to it before the base type does, so a derived type can take a call its base implements exactly
+        private RuntimeMethod? ResolveVariantInterfaceDispatch(RuntimeType objectType, RuntimeMethod declaredMethod, RuntimeType definition, bool arrayCovariance)
+            => ResolveVariantInterfaceLevels(objectType, declaredMethod, definition, arrayCovariance, ResolveInterfaceClassImplementation)
+                ?? ResolveVariantInterfaceLevels(objectType, declaredMethod, definition, arrayCovariance, ResolveDefaultInterfaceDispatchTarget);
+
+        private RuntimeMethod? ResolveVariantInterfaceLevels(
+            RuntimeType objectType,
+            RuntimeMethod declaredMethod,
+            RuntimeType definition,
+            bool arrayCovariance,
+            Func<RuntimeType, RuntimeMethod, RuntimeMethod?> resolve)
+        {
+            RuntimeType target = declaredMethod.DeclaringType;
+            for (RuntimeType? level = objectType; level is not null; level = level.BaseType)
+            {
+                EnsureConstructedMembers(level);
+                var interfaces = new Dictionary<int, RuntimeType>();
+                foreach (RuntimeType direct in level.Interfaces)
+                    CollectInterfaceClosure(direct, interfaces);
+
+                if (interfaces.ContainsKey(target.TypeId) && resolve(objectType, declaredMethod) is RuntimeMethod exact)
+                    return exact;
+
+                foreach (RuntimeType candidate in interfaces.Values)
+                {
+                    if (!ReferenceEquals(candidate, target) &&
+                        ReferenceEquals(candidate.GenericTypeDefinition, definition) &&
+                        AreTypeArgumentsAssignable(definition, candidate, target, arrayCovariance, ImmutableStack<(RuntimeType, RuntimeType)>.Empty) &&
+                        resolve(objectType, BindMethodToReceiver(declaredMethod, candidate)) is RuntimeMethod variant)
+                    {
+                        return variant;
+                    }
+                }
+
+                // Only the level of the array itself follows array rules
+                arrayCovariance = false;
+            }
+
+            return null;
+        }
+
         private RuntimeMethod? ResolveInterfaceDispatchTarget(RuntimeType actualType, RuntimeMethod declaredMethod)
+        {
+            if (FindInterfaceImplementationAnchor(actualType, declaredMethod.DeclaringType) is null)
+                return null;
+
+            return ResolveInterfaceClassImplementation(actualType, declaredMethod) ?? ResolveDefaultInterfaceDispatchTarget(actualType, declaredMethod);
+        }
+
+        private RuntimeMethod? ResolveInterfaceClassImplementation(RuntimeType actualType, RuntimeMethod declaredMethod)
         {
             RuntimeType? implementationAnchor = FindInterfaceImplementationAnchor(actualType, declaredMethod.DeclaringType);
             if (implementationAnchor is null)
@@ -2134,31 +2532,22 @@ namespace Cnidaria.Cs
 
             if (implementationAnchor.BaseType is not null)
             {
-                RuntimeMethod? inheritedImplementation = ResolveInterfaceDispatchTarget(
+                RuntimeMethod? inheritedImplementation = ResolveInterfaceClassImplementation(
                     implementationAnchor.BaseType,
                     declaredMethod);
                 if (inheritedImplementation is not null)
                     return ResolveInterfaceImplementationOverride(actualType, inheritedImplementation);
             }
 
-            return ResolveDefaultInterfaceDispatchTarget(actualType, declaredMethod);
+            return null;
         }
 
         private RuntimeMethod? ResolveDefaultInterfaceDispatchTarget(
             RuntimeType actualType,
             RuntimeMethod declaredMethod)
         {
-            var interfaces = new Dictionary<int, RuntimeType>();
-            for (RuntimeType? type = actualType; type is not null; type = type.BaseType)
-            {
-                EnsureConstructedMembers(type);
-                RuntimeType[] directInterfaces = type.Interfaces;
-                for (int i = 0; i < directInterfaces.Length; i++)
-                    CollectInterfaceClosure(directInterfaces[i], interfaces);
-            }
-
             var candidates = new List<KeyValuePair<RuntimeType, RuntimeMethod>>();
-            foreach (RuntimeType interfaceType in interfaces.Values)
+            foreach (RuntimeType interfaceType in CollectImplementedInterfaces(actualType).Values)
             {
                 if (!InterfaceDerivesFromOrEquals(
                     interfaceType,
@@ -2216,6 +2605,20 @@ namespace Cnidaria.Cs
             return selectedMethod;
         }
 
+        private Dictionary<int, RuntimeType> CollectImplementedInterfaces(RuntimeType type)
+        {
+            var interfaces = new Dictionary<int, RuntimeType>();
+            for (RuntimeType? current = type; current is not null; current = current.BaseType)
+            {
+                EnsureConstructedMembers(current);
+                RuntimeType[] directInterfaces = current.Interfaces;
+                for (int i = 0; i < directInterfaces.Length; i++)
+                    CollectInterfaceClosure(directInterfaces[i], interfaces);
+            }
+
+            return interfaces;
+        }
+
         private void CollectInterfaceClosure(
             RuntimeType interfaceType,
             Dictionary<int, RuntimeType> interfaces)
@@ -2259,6 +2662,13 @@ namespace Cnidaria.Cs
             foreach (KeyValuePair<int, RuntimeMethod> pair in map.OrderBy(static pair => pair.Key))
             {
                 if (!_methodById.TryGetValue(pair.Key, out RuntimeMethod? interfaceMethod))
+                    continue;
+
+                // The body implements one instance of the interface, named in terms of this type's own parameters
+                RuntimeType implemented = implementationType.GenericTypeArguments.Length == 0
+                    ? interfaceMethod.DeclaringType
+                    : SubstituteRuntimeType(interfaceMethod.DeclaringType, implementationType.GenericTypeArguments);
+                if (!SameInterfaceType(implemented, declaredMethod.DeclaringType))
                     continue;
 
                 interfaceMethod = BindMethodToReceiver(interfaceMethod, declaredMethod.DeclaringType);
@@ -3307,7 +3717,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < methods.Length; i++)
             {
                 RuntimeMethod method = methods[i];
-                if (method.IsStatic || !method.IsVirtual)
+                if (method.IsStatic || !method.IsVirtual || IsFinalizerMethod(type, method))
                     continue;
 
                 RuntimeMethod? overriddenMethod = null;
@@ -4248,6 +4658,10 @@ namespace Cnidaria.Cs
     // What a NativeAOT MethodTable records for a type, for the backends that lay one out and the VMs that answer in its place
     internal static class RuntimeMethodTables
     {
+        public const uint HasFinalizerFlag = 0x00100000u;
+        public const int GenericVarianceFlagBit = 23;
+        public const uint GenericVarianceFlag = 1u << GenericVarianceFlagBit;
+
         public static uint ElementType(RuntimeType type)
         {
             RuntimePrimitiveKind primitiveKind = type.PrimitiveKind;
@@ -4649,7 +5063,10 @@ namespace Cnidaria.Cs
         public int VTableSlot { get; internal set; } = -1;
         public RuntimeModule? BodyModule { get; internal set; }
         internal int MethodDefToken { get; set; }
-        internal CilMethodBody? CilBody => MethodDefToken == 0 ? null : BodyModule?.GetCilBody(MethodDefToken);
+        // The IL of a runtime async method would misbehave as a plain method: it returns the result, not the task
+        internal CilMethodBody? CilBody => (ImplFlags & MetadataFlagBits.Async) != 0
+            ? throw new NotSupportedException($"Runtime async method '{DeclaringType.Name}.{Name}' is not supported by the backends yet.")
+            : MethodDefToken == 0 ? null : BodyModule?.GetCilBody(MethodDefToken);
         public RuntimeMethod? GenericMethodDefinition { get; internal set; }
         internal RuntimeType[] MethodGenericArguments { get; set; } = Array.Empty<RuntimeType>();
         public int GenericArity { get; internal set; }

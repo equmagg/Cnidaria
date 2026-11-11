@@ -1787,7 +1787,7 @@ public sealed class Parser
             SyntaxKind.InlineKeyword or
             SyntaxKind.InlineExtensionKeyword or
             SyntaxKind.GotoKeyword) ||
-            string.Equals(token.Text, "__goto__", StringComparison.Ordinal);
+            token.Text == "__goto__";
     }
 
     private static bool IsStringLiteral(SyntaxKind kind)

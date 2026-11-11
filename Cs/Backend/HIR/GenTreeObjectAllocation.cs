@@ -213,12 +213,19 @@ internal static class GenTreeObjectAllocator
 
         private void BuildSiteConnGraph(AllocationSite site)
         {
-            if (TryGetTrackedLocal(site.Statement, out int lclNum))
-                SetBit(_pointsTo[lclNum], site.Index);
-            else
-                site.Escapes = true;
-
             GenTree allocation = site.Allocation;
+            if (TryGetTrackedLocal(site.Statement, out int lclNum))
+            {
+                SetBit(_pointsTo[lclNum], site.Index);
+                // The finalizer reads the object and everything it references after the method has returned
+                if (allocation.Kind == GenTreeKind.AllocObject && allocation.RuntimeType is RuntimeType objectType && _typeSystem.HasFinalizer(objectType))
+                    _escapes.Add(lclNum);
+            }
+            else
+            {
+                site.Escapes = true;
+            }
+
             if (allocation.Kind is GenTreeKind.NewDelegate or GenTreeKind.Box && allocation.Operands.Length != 0)
             {
                 int stored = ValueNode(allocation.Operands[0]);
@@ -643,7 +650,6 @@ internal static class GenTreeObjectAllocator
                         objectType.Kind != RuntimeTypeKind.Class ||
                         ReferenceEquals(objectType, _typeSystem.SystemString) ||
                         IsDelegateType(objectType) ||
-                        HasFinalizer(objectType) ||
                         objectType.InstanceSize > MaxStackAllocationSize)
                     {
                         return false;
@@ -699,20 +705,6 @@ internal static class GenTreeObjectAllocator
             {
                 if (current.Namespace == "System" && current.Name == "MulticastDelegate")
                     return true;
-            }
-
-            return false;
-        }
-
-        private static bool HasFinalizer(RuntimeType type)
-        {
-            for (RuntimeType? current = type; current is not null && current.BaseType is not null; current = current.BaseType)
-            {
-                foreach (RuntimeMethod method in current.Methods)
-                {
-                    if (method.Name == "Finalize" && method.IsVirtual && method.ParameterTypes.Length == 0)
-                        return true;
-                }
             }
 
             return false;

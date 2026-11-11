@@ -485,19 +485,19 @@ internal sealed class DeclarationCollector
     }
     private static RuntimeIntrinsicKind GetRuntimeIntrinsicKind(string name)
     {
-        if (string.Equals(name, StandardHeaders.PrintfIntrinsicName, StringComparison.Ordinal))
+        if (name == StandardHeaders.PrintfIntrinsicName)
             return RuntimeIntrinsicKind.CStringWrite;
 
-        if (string.Equals(name, StandardHeaders.MallocIntrinsicName, StringComparison.Ordinal))
+        if (name == StandardHeaders.MallocIntrinsicName)
             return RuntimeIntrinsicKind.Malloc;
 
-        if (string.Equals(name, StandardHeaders.FreeIntrinsicName, StringComparison.Ordinal))
+        if (name == StandardHeaders.FreeIntrinsicName)
             return RuntimeIntrinsicKind.Free;
 
-        if (string.Equals(name, StandardHeaders.BuiltinVaStartName, StringComparison.Ordinal))
+        if (name == StandardHeaders.BuiltinVaStartName)
             return RuntimeIntrinsicKind.BuiltinVaStart;
 
-        if (string.Equals(name, StandardHeaders.BuiltinVaArgName, StringComparison.Ordinal))
+        if (name == StandardHeaders.BuiltinVaArgName)
             return RuntimeIntrinsicKind.BuiltinVaArg;
 
         return RuntimeIntrinsicKind.None;
@@ -1566,8 +1566,8 @@ internal sealed class DeclarationTypeParser
     }
 
     private static bool IsNoInlineAttributeName(string text)
-        => string.Equals(text, "noinline", StringComparison.Ordinal) ||
-           string.Equals(text, "__noinline__", StringComparison.Ordinal);
+        => text == "noinline" ||
+           text == "__noinline__";
 
     private QualifiedType ResolveTypedefName(SyntaxToken token)
     {

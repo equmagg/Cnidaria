@@ -926,6 +926,14 @@ namespace Cnidaria.Cs
             BoundExpression constant,
             BindingContext context)
         {
+            // A nullable operand compares lifted, so null matches no constant
+            if (TryGetSystemNullableInfo(operand.Type, out _, out TypeSymbol underlying) &&
+                IsBasicConstantPatternType(underlying) &&
+                ClassifyConversion(constant, underlying, context).IsImplicit)
+            {
+                return operand.Type;
+            }
+
             if (IsBasicConstantPatternType(operand.Type))
             {
                 var constToOperand = ClassifyConversion(constant, operand.Type, context);

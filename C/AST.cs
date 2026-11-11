@@ -746,7 +746,7 @@ public sealed class AsmStatementSyntax : StatementSyntax
         => token.Kind is SyntaxKind.InlineKeyword or SyntaxKind.InlineExtensionKeyword;
 
     private static bool IsGotoQualifier(SyntaxToken token)
-        => token.Kind == SyntaxKind.GotoKeyword || string.Equals(token.Text, "__goto__", StringComparison.Ordinal);
+        => token.Kind == SyntaxKind.GotoKeyword || token.Text == "__goto__";
 }
 
 ///<summary>Decodes and concatenates adjacent string literal tokens used by assembly syntax</summary>

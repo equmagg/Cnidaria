@@ -376,7 +376,7 @@ namespace Cnidaria.Python
                         continue;
 
                     var module = Node(statement, 1);
-                    if (!string.Equals(GetDottedName(module), "__future__", StringComparison.Ordinal))
+                    if (GetDottedName(module) != "__future__")
                         continue;
 
                     var targets = Node(statement, 3);
@@ -389,7 +389,7 @@ namespace Cnidaria.Python
                             ? FirstToken(nameNode, SyntaxKind.IdentifierToken)
                             : Token(alias, 0);
                         if (importedName is { Kind: SyntaxKind.IdentifierToken } token &&
-                            string.Equals(token.Text, "annotations", StringComparison.Ordinal))
+                            token.Text == "annotations")
                             return true;
                     }
                 }
@@ -1073,7 +1073,7 @@ namespace Cnidaria.Python
                             if (name is { } token && !_current.InUnevaluatedAnnotation)
                             {
                                 AddUse(_current, token);
-                                if (string.Equals(token.Text, "super", StringComparison.Ordinal) && IsFunctionLike(_current))
+                                if (token.Text == "super" && IsFunctionLike(_current))
                                     _current.AddSyntheticUse(ClassCellName);
                             }
                             break;
@@ -1419,7 +1419,7 @@ namespace Cnidaria.Python
                             if (name is not { } token)
                                 return;
                             if (context == TargetContext.Delete &&
-                                string.Equals(token.Text, "__debug__", StringComparison.Ordinal))
+                                token.Text == "__debug__")
                             {
                                 AddDiagnostic(
                                     SymbolDiagnosticCode.DeleteDebug,
@@ -1471,7 +1471,7 @@ namespace Cnidaria.Python
                         if (Token(node, 2) is { } attribute)
                         {
                             if (context == TargetContext.Delete &&
-                                string.Equals(attribute.Text, "__debug__", StringComparison.Ordinal))
+                                attribute.Text == "__debug__")
                             {
                                 AddDiagnostic(
                                     SymbolDiagnosticCode.DeleteDebug,
@@ -1516,7 +1516,7 @@ namespace Cnidaria.Python
                     case SyntaxKind.CapturePattern:
                         {
                             var name = Token(node, 0);
-                            if (name is { } token && !string.Equals(token.Text, "_", StringComparison.Ordinal))
+                            if (name is { } token && token.Text != "_")
                                 AddDefinition(_current, token, SymbolFlags.Local, SymbolOccurrenceKind.Definition);
                             break;
                         }
@@ -1753,7 +1753,7 @@ namespace Cnidaria.Python
 
                     table.MangledNames?.Add(token.Text);
 
-                    if (string.Equals(token.Text, ClassDictionaryCellName, StringComparison.Ordinal))
+                    if (token.Text == ClassDictionaryCellName)
                     {
                         AddDiagnostic(
                             SymbolDiagnosticCode.ReservedTypeParameterName,
@@ -1924,7 +1924,7 @@ namespace Cnidaria.Python
 
             private void ValidateStoreName(SyntaxToken token)
             {
-                if (!string.Equals(token.Text, "__debug__", StringComparison.Ordinal))
+                if (token.Text != "__debug__")
                     return;
 
                 AddDiagnostic(

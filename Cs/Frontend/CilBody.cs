@@ -102,6 +102,9 @@ namespace Cnidaria.Cs
         private (short[] Pops, short[] Pushes)? _stackEffects;
 
         // Ret pops one value exactly when the method returns one, so the caller supplies that fact.
+        // A generated body refers to methods without a signature to read its effects from
+        internal void SetStackEffects(short[] pops, short[] pushes) => _stackEffects = (pops, pushes);
+
         public (short[] Pops, short[] Pushes) GetStackEffects(EcmaMetadata md, bool returnsValue)
         {
             if (_stackEffects is { } cached)

@@ -58,7 +58,8 @@ namespace Cnidaria.Cs
         private const int ObjectHeaderSize = 8;
         private const int GcFlagMark = 1 << 0;
         private const int GcFlagAllocated = 1 << 1;
-        private const int IdentityHashShift = 2;
+        private const int GcFlagFinalizerRun = 1 << 2;
+        private const int IdentityHashShift = 3;
         private uint _identityHashState = 0x9E3779B9u;
         private const int ArrayLengthOffset = ObjectHeaderSize;
         private const int ArrayDataOffset = ArrayLengthOffset + TargetArchitecture.PointerSize;
@@ -128,6 +129,33 @@ namespace Cnidaria.Cs
         private readonly List<FilterSearch> _filterSearches = new List<FilterSearch>();
         // References host code holds across an allocation; the collector marks them and rewrites them when it compacts
         private readonly List<int> _hostRoots = new List<int>();
+
+        private enum GcHandleKind
+        {
+            Weak = 0,
+            WeakTrackResurrection = 1,
+            Normal = 2,
+            Pinned = 3,
+            Dependent = 6,
+            Free = 7,
+        }
+
+        // A free slot links to the next one through Secondary
+        private struct GcHandleSlot
+        {
+            public int Object;
+            public int Secondary;
+            public GcHandleKind Kind;
+        }
+
+        private readonly List<GcHandleSlot> _gcHandles = new List<GcHandleSlot>();
+        private int _gcHandleFree = -1;
+        private readonly List<int> _finalizerQueue = new List<int>();
+        private readonly List<int> _finalizerReady = new List<int>();
+        private int _finalizerReadyHead;
+        private int? _finalizerDrainMethodIndex;
+        private bool _finalizersRunning;
+        private int _monitorsHeld;
         private int _currentExceptionThrowMethodIndex = -1;
         private int _currentExceptionThrowPc = -1;
         private CallFlags _activeCallFlags;
@@ -491,6 +519,8 @@ namespace Cnidaria.Cs
                     case Op.GcPoll:
                         ct.ThrowIfCancellationRequested();
                         MaybeCollectGarbage();
+                        if (_finalizerReadyHead != _finalizerReady.Count && _monitorsHeld == 0 && !_finalizersRunning)
+                            EnterFinalizerDrain();
                         break;
 
                     case Op.J:
@@ -1194,13 +1224,21 @@ namespace Cnidaria.Cs
                         SetGpr(ins.Rd, AllocDelegateFromDescriptor(ins.Imm, 0));
                         break;
                     case Op.NewDelegateClosed:
+                        if (GetGpr(ins.Rs1) == 0)
+                        {
+                            ThrowNullReference(executingPc);
+                            break;
+                        }
+
                         SetGpr(ins.Rd, AllocDelegateFromDescriptor(ins.Imm, GetGpr(ins.Rs1)));
                         break;
                     case Op.DelegateCombine:
-                        SetGpr(ins.Rd, ExecDelegateCombine(GetGpr(ins.Rs1), GetGpr(ins.Rs2)));
+                        if (DelegateTypesMatch(GetGpr(ins.Rs1), GetGpr(ins.Rs2), executingPc))
+                            SetGpr(ins.Rd, ExecDelegateCombine(GetGpr(ins.Rs1), GetGpr(ins.Rs2)));
                         break;
                     case Op.DelegateRemove:
-                        SetGpr(ins.Rd, ExecDelegateRemove(GetGpr(ins.Rs1), GetGpr(ins.Rs2)));
+                        if (DelegateTypesMatch(GetGpr(ins.Rs1), GetGpr(ins.Rs2), executingPc))
+                            SetGpr(ins.Rd, ExecDelegateRemove(GetGpr(ins.Rs1), GetGpr(ins.Rs2)));
                         break;
                     case Op.NewArr:
                     case Op.NewSZArray:
@@ -1698,6 +1736,15 @@ namespace Cnidaria.Cs
             return obj;
         }
 
+        private bool DelegateTypesMatch(long a, long b, int pc)
+        {
+            if (a == 0 || b == 0 || RequireDelegateLayout(a).RuntimeTypeId == RequireDelegateLayout(b).RuntimeTypeId)
+                return true;
+
+            ThrowManaged(AllocExceptionRef("System", "ArgumentException", "Delegates must be of the same type."), pc, preserveExistingThrowSite: false);
+            return false;
+        }
+
         private long ExecDelegateCombine(long a, long b)
         {
             if (a == 0)
@@ -1706,10 +1753,6 @@ namespace Cnidaria.Cs
                 return a;
 
             TypeLayoutRecord aLayout = RequireDelegateLayout(a);
-            TypeLayoutRecord bLayout = RequireDelegateLayout(b);
-            if (aLayout.RuntimeTypeId != bLayout.RuntimeTypeId)
-                throw new InvalidOperationException("Cannot combine delegates of different runtime types.");
-
             int[] left = FlattenDelegate(a);
             int[] right = FlattenDelegate(b);
             int[] merged = new int[checked(left.Length + right.Length)];
@@ -1724,10 +1767,6 @@ namespace Cnidaria.Cs
                 return source;
 
             TypeLayoutRecord sourceLayout = RequireDelegateLayout(source);
-            TypeLayoutRecord valueLayout = RequireDelegateLayout(value);
-            if (sourceLayout.RuntimeTypeId != valueLayout.RuntimeTypeId)
-                return source;
-
             int[] sourceTargets = FlattenDelegate(source);
             int[] valueTargets = FlattenDelegate(value);
             if (valueTargets.Length == 0 || sourceTargets.Length < valueTargets.Length)
@@ -2029,6 +2068,8 @@ namespace Cnidaria.Cs
                 X(MachineRegisters.StackPointer, callerSp);
                 X(MachineRegisters.FramePointer, callerFp);
                 X(MachineRegisters.ThreadPointer, TopIncomingStackArgBase());
+                // The caller of an implicit call expects every register intact
+                payloadKind = ReturnPayloadKind.None;
             }
 
             switch (payloadKind)
@@ -3327,6 +3368,42 @@ namespace Cnidaria.Cs
             return true;
         }
 
+        private bool IntrinsicInterlockedBitwise(RuntimeMethod rm, InterlockedBitwiseIntrinsic intrinsic, bool isAnd)
+        {
+            long location = ReadAbiScalarArgument(rm, 0);
+            if (location == 0)
+            {
+                ThrowNullReference(_currentSafePointPc);
+                return true;
+            }
+
+            int address = checked((int)location);
+            long value = ReadAbiScalarArgument(rm, 1);
+            long original;
+            switch (intrinsic.Size)
+            {
+                case 4:
+                    {
+                        int oldValue = ReadI32(address);
+                        WriteI32(address, isAnd ? oldValue & unchecked((int)value) : oldValue | unchecked((int)value));
+                        original = intrinsic.IsSigned ? oldValue : unchecked((uint)oldValue);
+                        break;
+                    }
+                case 8:
+                    {
+                        long oldValue = ReadI64(address);
+                        WriteI64(address, isAnd ? oldValue & value : oldValue | value);
+                        original = oldValue;
+                        break;
+                    }
+                default:
+                    throw new InvalidOperationException($"Unsupported Interlocked.Or or Interlocked.And size: {intrinsic.Size}.");
+            }
+
+            SetGpr(MachineRegisters.ReturnValue0, original);
+            return true;
+        }
+
         private bool TryInvokeIntrinsic(RuntimeMethod rm, CancellationToken ct)
         {
             if (RuntimeIntrinsics.TryResolve(rm, _rts.Target, out RuntimeIntrinsicInfo runtimeIntrinsic))
@@ -3339,6 +3416,10 @@ namespace Cnidaria.Cs
                         return IntrinsicInterlockedExchangeAdd(rm, runtimeIntrinsic.ExchangeAdd);
                     case RuntimeIntrinsicId.InterlockedExchange:
                         return IntrinsicInterlockedExchange(rm, runtimeIntrinsic.Exchange);
+                    case RuntimeIntrinsicId.InterlockedOr:
+                        return IntrinsicInterlockedBitwise(rm, runtimeIntrinsic.Bitwise, isAnd: false);
+                    case RuntimeIntrinsicId.InterlockedAnd:
+                        return IntrinsicInterlockedBitwise(rm, runtimeIntrinsic.Bitwise, isAnd: true);
                     case RuntimeIntrinsicId.MemoryBarrier:
                         // The register VM runs one instruction at a time, so a barrier has nothing to order
                         return true;
@@ -3429,6 +3510,7 @@ namespace Cnidaria.Cs
                 rm.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Void &&
                 (rm.Name == "AcquireThinLock" || rm.Name == "Release"))
             {
+                _monitorsHeld += rm.Name == "Release" ? -1 : 1;
                 return true;
             }
 
@@ -3511,19 +3593,6 @@ namespace Cnidaria.Cs
             if (rm.DeclaringType.Namespace == "System.Runtime.InteropServices" && rm.DeclaringType.Name == "MemoryMarshal")
                 return IntrinsicMemoryMarshal(rm);
 
-            if (rm.DeclaringType.Namespace == "System" && (rm.DeclaringType.Name == "Random" || rm.DeclaringType.Name == "ThreadSafeRandom") && rm.Name == "Next")
-            {
-                if (rm.ParameterTypes.Length == 0)
-                    SetReturnI4(Random.Shared.Next());
-                else if (rm.ParameterTypes.Length == 1)
-                    SetReturnI4(Random.Shared.Next((int)ReadAbiScalarArgument(rm, rm.HasThis ? 1 : 0)));
-                else if (rm.ParameterTypes.Length == 2)
-                    SetReturnI4(Random.Shared.Next((int)ReadAbiScalarArgument(rm, rm.HasThis ? 1 : 0), (int)ReadAbiScalarArgument(rm, rm.HasThis ? 2 : 1)));
-                else
-                    return false;
-                return true;
-            }
-
             if (rm.DeclaringType.Namespace == "System.Runtime" && rm.DeclaringType.Name == "RuntimeImports" &&
                 rm.Name is "RhGetArrayRank" or "RhGetArrayLength" or "RhGetArrayLowerBound")
             {
@@ -3556,6 +3625,7 @@ namespace Cnidaria.Cs
                     source = _hostRoots[^1];
                     WriteI32(clone, type.TypeId);
                     WriteI32(clone + 4, GcFlagAllocated);
+                    RegisterIfFinalizable(clone, type.TypeId);
                     _mem.AsSpan(source + ObjectHeaderSize, size - ObjectHeaderSize).CopyTo(_mem.AsSpan(clone + ObjectHeaderSize));
                     SetReturnRef(clone);
                 }
@@ -3606,8 +3676,20 @@ namespace Cnidaria.Cs
                         SetReturnI4(type.SizeOf);
                         return true;
                     case "RhGetTypeContainsGCPointers":
-                        SetReturnI4(type.ContainsGcPointers ? 1 : 0);
+                        SetReturnI4(InstanceContainsGcPointers(type) ? 1 : 0);
                         return true;
+                    case "RhGetTypeIsFinalizable":
+                        SetReturnI4(_rts.HasFinalizer(type) ? 1 : 0);
+                        return true;
+                    case "RhGetTypeHasComponentSize":
+                        SetReturnI4(type.Kind == RuntimeTypeKind.Array || IsSystemStringType(type) ? 1 : 0);
+                        return true;
+                    case "RhGetTypeFinalizerCode":
+                        {
+                            RuntimeMethod finalizer = _rts.GetFinalizer(type) ?? throw new InvalidOperationException("Type has no finalizer.");
+                            SetGpr(MachineRegisters.ReturnValue0, _image.GetMethod(finalizer.MethodId).EntryPc);
+                            return true;
+                        }
                     case "RhGetTypeNullableType":
                         SetReturnRef(type.GenericTypeArguments[0].TypeId);
                         return true;
@@ -3625,6 +3707,12 @@ namespace Cnidaria.Cs
                     _ => throw new NotSupportedException($"Unknown runtime type query {rm.Name}."),
                 };
                 SetReturnRef(text is null ? 0 : AllocStringFromManaged(text));
+                return true;
+            }
+
+            if (RuntimeGcImports.Symbol(rm) is not null)
+            {
+                InvokeGcImport(rm);
                 return true;
             }
 
@@ -4627,7 +4715,227 @@ namespace Cnidaria.Cs
             WriteI32(obj + 4, GcFlagAllocated);
             if (size > ObjectHeaderSize)
                 _mem.AsSpan(obj + ObjectHeaderSize, size - ObjectHeaderSize).Clear();
+            RegisterIfFinalizable(obj, type.RuntimeTypeId);
             return obj;
+        }
+
+        private int FinalizerDrainMethodIndex()
+        {
+            if (_finalizerDrainMethodIndex is int resolved)
+                return resolved;
+
+            int index = -1;
+            for (int i = 0; i < _image.Methods.Length; i++)
+            {
+                int methodId = _image.Methods[i].RuntimeMethodId;
+                if (methodId >= 0 && RuntimeGcImports.IsFinalizerDrain(_rts.GetMethodById(methodId)))
+                {
+                    index = i;
+                    break;
+                }
+            }
+            _finalizerDrainMethodIndex = index;
+            return index;
+        }
+
+        // The one allocation instruction also makes the choice of a native allocator helper
+        private void RegisterIfFinalizable(int obj, int typeId)
+        {
+            if (FinalizerDrainMethodIndex() >= 0 && _rts.HasFinalizer(_rts.GetTypeById(typeId)))
+                _finalizerQueue.Add(obj);
+        }
+
+        private void EnterFinalizerDrain()
+        {
+            int snapshotIndex = SaveRegisterSnapshot();
+            EnterManagedFrame(FinalizerDrainMethodIndex(), _pc, CallFlags.None);
+            SetTopRegisterSnapshotIndex(snapshotIndex);
+        }
+
+        private void InvokeGcImport(RuntimeMethod rm)
+        {
+            switch (rm.Name)
+            {
+                case "RhpHandleAlloc":
+                    SetGpr(MachineRegisters.ReturnValue0, AllocGcHandle(
+                        (GcHandleKind)(int)ReadAbiScalarArgument(rm, 1), checked((int)ReadAbiScalarArgument(rm, 0)), 0));
+                    return;
+                case "RhpHandleAllocDependent":
+                    SetGpr(MachineRegisters.ReturnValue0, AllocGcHandle(
+                        GcHandleKind.Dependent, checked((int)ReadAbiScalarArgument(rm, 0)), checked((int)ReadAbiScalarArgument(rm, 1))));
+                    return;
+                case "RhHandleFree":
+                    {
+                        int index = GcHandleIndex(ReadAbiScalarArgument(rm, 0));
+                        _gcHandles[index] = new GcHandleSlot { Secondary = _gcHandleFree, Kind = GcHandleKind.Free };
+                        _gcHandleFree = index;
+                        return;
+                    }
+                case "RhHandleGet":
+                    SetReturnRef(_gcHandles[GcHandleIndex(ReadAbiScalarArgument(rm, 0))].Object);
+                    return;
+                case "RhHandleSet":
+                    {
+                        int index = GcHandleIndex(ReadAbiScalarArgument(rm, 0));
+                        GcHandleSlot slot = _gcHandles[index];
+                        slot.Object = checked((int)ReadAbiScalarArgument(rm, 1));
+                        _gcHandles[index] = slot;
+                        return;
+                    }
+                case "RhHandleGetDependent":
+                    {
+                        GcHandleSlot slot = _gcHandles[GcHandleIndex(ReadAbiScalarArgument(rm, 0))];
+                        WriteNative(checked((int)ReadAbiScalarArgument(rm, 1)), slot.Object != 0 ? slot.Secondary : 0);
+                        SetReturnRef(slot.Object);
+                        return;
+                    }
+                case "RhHandleSetDependentSecondary":
+                    {
+                        int index = GcHandleIndex(ReadAbiScalarArgument(rm, 0));
+                        GcHandleSlot slot = _gcHandles[index];
+                        slot.Secondary = checked((int)ReadAbiScalarArgument(rm, 1));
+                        _gcHandles[index] = slot;
+                        return;
+                    }
+                case "RhSuppressFinalize":
+                    {
+                        int obj = checked((int)ReadAbiScalarArgument(rm, 0));
+                        if (_rts.HasFinalizer(GetObjectTypeFromRef(obj)))
+                            WriteI32(obj + 4, ReadI32(obj + 4) | GcFlagFinalizerRun);
+                        return;
+                    }
+                case "RhReRegisterForFinalize":
+                    {
+                        int obj = checked((int)ReadAbiScalarArgument(rm, 0));
+                        if (!_rts.HasFinalizer(GetObjectTypeFromRef(obj)))
+                            return;
+                        int flags = ReadI32(obj + 4);
+                        if ((flags & GcFlagFinalizerRun) != 0)
+                            WriteI32(obj + 4, flags & ~GcFlagFinalizerRun);
+                        else
+                            _finalizerQueue.Add(obj);
+                        return;
+                    }
+                case "RhpGetNextFinalizableObject":
+                    SetReturnRef(NextFinalizableObject());
+                    return;
+                case "RhCollect":
+                    CollectGarbage(compact: false);
+                    return;
+                case "RhpFallbackFailFast":
+                    throw new InvalidOperationException($"Fail fast with code {ReadAbiScalarArgument(rm, 0)}.");
+                default:
+                    throw new NotSupportedException($"Unknown GC import {rm.Name}.");
+            }
+        }
+
+        // The low bit stays free for the pinned flag GCHandle keeps there
+        private long AllocGcHandle(GcHandleKind kind, int obj, int secondary)
+        {
+            var slot = new GcHandleSlot { Object = obj, Secondary = secondary, Kind = kind };
+            int index = _gcHandleFree;
+            if (index >= 0)
+            {
+                _gcHandleFree = _gcHandles[index].Secondary;
+                _gcHandles[index] = slot;
+            }
+            else
+            {
+                index = _gcHandles.Count;
+                _gcHandles.Add(slot);
+            }
+            return (long)(index + 1) << 1;
+        }
+
+        private static int GcHandleIndex(long handle)
+            => checked((int)(handle >> 1) - 1);
+
+        private int NextFinalizableObject()
+        {
+            while (_finalizerReadyHead != _finalizerReady.Count)
+            {
+                int obj = _finalizerReady[_finalizerReadyHead];
+                _finalizerReadyHead++;
+                int flags = ReadI32(obj + 4);
+                if ((flags & GcFlagFinalizerRun) == 0)
+                {
+                    _finalizersRunning = true;
+                    return obj;
+                }
+                WriteI32(obj + 4, flags & ~GcFlagFinalizerRun);
+            }
+            _finalizerReady.Clear();
+            _finalizerReadyHead = 0;
+            _finalizersRunning = false;
+            return 0;
+        }
+
+        // An object outside the heap counts as marked
+        private bool IsGcMarked(int obj)
+            => !TryGetBlockFromObjectRef(obj, out _) || (ReadI32(obj + 4) & GcFlagMark) != 0;
+
+        private void DrainGcMarkStack()
+        {
+            while (_gcMarkHead != 0)
+            {
+                int obj = PopGcMarkObject();
+                RuntimeType t = _rts.GetTypeById(ReadI32(obj));
+                MarkObjectReferences(obj, t);
+            }
+        }
+
+        // Marking a dependent can make another handle's primary reachable
+        private void ScanDependentHandles()
+        {
+            bool marked;
+            do
+            {
+                marked = false;
+                for (int i = 0; i < _gcHandles.Count; i++)
+                {
+                    GcHandleSlot slot = _gcHandles[i];
+                    if (slot.Kind == GcHandleKind.Dependent && slot.Object != 0 && IsGcMarked(slot.Object) && TryMarkObject(slot.Secondary))
+                        marked = true;
+                }
+                DrainGcMarkStack();
+            }
+            while (marked);
+        }
+
+        private void ClearDeadGcHandles(bool afterFinalization)
+        {
+            for (int i = 0; i < _gcHandles.Count; i++)
+            {
+                GcHandleSlot slot = _gcHandles[i];
+                bool selected = afterFinalization
+                    ? slot.Kind is GcHandleKind.WeakTrackResurrection or GcHandleKind.Dependent
+                    : slot.Kind == GcHandleKind.Weak;
+                if (selected && slot.Object != 0 && !IsGcMarked(slot.Object))
+                {
+                    slot.Object = 0;
+                    slot.Secondary = 0;
+                    _gcHandles[i] = slot;
+                }
+            }
+        }
+
+        // A dead object goes to the ready list and lives on with everything it reaches until its finalizer has run
+        private void ScanFinalizationQueue()
+        {
+            int kept = 0;
+            for (int i = 0; i < _finalizerQueue.Count; i++)
+            {
+                int obj = _finalizerQueue[i];
+                if (IsGcMarked(obj))
+                    _finalizerQueue[kept++] = obj;
+                else if ((ReadI32(obj + 4) & GcFlagFinalizerRun) == 0)
+                    _finalizerReady.Add(obj);
+            }
+            _finalizerQueue.RemoveRange(kept, _finalizerQueue.Count - kept);
+
+            for (int i = _finalizerReadyHead; i < _finalizerReady.Count; i++)
+                TryMarkObject(_finalizerReady[i]);
+            DrainGcMarkStack();
         }
 
         private int AllocObject(RuntimeType type)
@@ -4638,6 +4946,7 @@ namespace Cnidaria.Cs
             WriteI32(obj + 4, GcFlagAllocated);
             if (size > ObjectHeaderSize)
                 _mem.AsSpan(obj + ObjectHeaderSize, size - ObjectHeaderSize).Clear();
+            RegisterIfFinalizable(obj, type.TypeId);
             return obj;
         }
 
@@ -5433,13 +5742,12 @@ namespace Cnidaria.Cs
         {
             _gcMarkHead = 0;
             MarkRoots();
-
-            while (_gcMarkHead != 0)
-            {
-                int obj = PopGcMarkObject();
-                RuntimeType t = _rts.GetTypeById(ReadI32(obj));
-                MarkObjectReferences(obj, t);
-            }
+            DrainGcMarkStack();
+            ScanDependentHandles();
+            ClearDeadGcHandles(afterFinalization: false);
+            ScanFinalizationQueue();
+            ScanDependentHandles();
+            ClearDeadGcHandles(afterFinalization: true);
         }
 
         private void SweepHeapWithoutCompaction()
@@ -5549,6 +5857,15 @@ namespace Cnidaria.Cs
                     TryMarkObject(root);
             }
 
+            foreach (GcHandleSlot slot in _gcHandles)
+            {
+                if (slot.Kind is GcHandleKind.Normal or GcHandleKind.Pinned)
+                    TryMarkObject(slot.Object);
+            }
+
+            for (int i = _finalizerReadyHead; i < _finalizerReady.Count; i++)
+                TryMarkObject(_finalizerReady[i]);
+
             MarkPendingContinuationRoots();
         }
 
@@ -5609,6 +5926,23 @@ namespace Cnidaria.Cs
                 if (_hostRoots[i] != 0)
                     _hostRoots[i] = TranslateObjectRef(_hostRoots[i]);
             }
+
+            for (int i = 0; i < _gcHandles.Count; i++)
+            {
+                GcHandleSlot slot = _gcHandles[i];
+                if (slot.Kind == GcHandleKind.Free)
+                    continue;
+                slot.Object = TranslateObjectRef(slot.Object);
+                if (slot.Kind == GcHandleKind.Dependent)
+                    slot.Secondary = TranslateObjectRef(slot.Secondary);
+                _gcHandles[i] = slot;
+            }
+
+            for (int i = 0; i < _finalizerQueue.Count; i++)
+                _finalizerQueue[i] = TranslateObjectRef(_finalizerQueue[i]);
+
+            for (int i = _finalizerReadyHead; i < _finalizerReady.Count; i++)
+                _finalizerReady[i] = TranslateObjectRef(_finalizerReady[i]);
 
             UpdatePendingContinuationRootsAfterCompaction();
         }
@@ -7486,24 +7820,29 @@ namespace Cnidaria.Cs
                 if (cur.TypeId == target.TypeId) return true;
             }
 
-            if (target.Kind == RuntimeTypeKind.Interface)
-                return _rts.IsAssignableTo(source, target);
-
-            if (source.Kind == RuntimeTypeKind.Array && target.Kind == RuntimeTypeKind.Array)
-            {
-                if (source.ArrayRank != target.ArrayRank || source.IsSzArray != target.IsSzArray)
-                    return false;
-                RuntimeType? se = source.ElementType;
-                RuntimeType? te = target.ElementType;
-                if (se == null || te == null) return false;
-                if (se.TypeId == te.TypeId) return true;
-                if (se.IsReferenceType && te.IsReferenceType) return IsAssignableTo(se, te);
-            }
-
-            return false;
+            return _rts.IsAssignableTo(source, target);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        // ContainsGcPointers of a reference type describes a reference to it, not an instance
+        private static bool InstanceContainsGcPointers(RuntimeType type)
+        {
+            if (type.Kind == RuntimeTypeKind.Array)
+                return TypeIsReferenceOrContainsReferences(type.ElementType ?? throw new InvalidOperationException("Array has no element type."));
+            if (type.IsValueType)
+                return type.ContainsGcPointers;
+
+            for (RuntimeType? cur = type; cur is not null; cur = cur.BaseType)
+            {
+                foreach (RuntimeField field in cur.InstanceFields)
+                {
+                    if (!field.IsStatic && TypeIsReferenceOrContainsReferences(field.FieldType))
+                        return true;
+                }
+            }
+            return false;
+        }
+
         private static bool TypeIsReferenceOrContainsReferences(RuntimeType type)
         {
             return type.IsReferenceType

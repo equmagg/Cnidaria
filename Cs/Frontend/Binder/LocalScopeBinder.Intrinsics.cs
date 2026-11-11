@@ -9,7 +9,7 @@ namespace Cnidaria.Cs
     {
         private BoundExpression BindTypeOf(TypeOfExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {
-            var operandType = BindType(node.Type, context, diagnostics);
+            TypeSymbol operandType = BindTypeOfOperand(node.Type, context, diagnostics);
 
             if (!DeclarationBuilder.TryFindSystemType(context.Compilation.GlobalNamespace, "Type", arity: 0, out var systemType))
             {

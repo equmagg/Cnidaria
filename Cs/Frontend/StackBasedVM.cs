@@ -844,7 +844,7 @@ namespace Cnidaria.Cs
                     }
                 }
                 catch (Exception hostEx) when (hostEx is DivideByZeroException or OverflowException or NullReferenceException or
-                    IndexOutOfRangeException or ArrayTypeMismatchException or OutOfMemoryException or ArgumentOutOfRangeException)
+                    IndexOutOfRangeException or ArrayTypeMismatchException or OutOfMemoryException or ArgumentException or InvalidCastException)
                 {
                     if (_exceptionTranslationDepth != 0)
                         throw;
@@ -2153,7 +2153,7 @@ namespace Cnidaria.Cs
             var aType = GetObjectTypeFromRef(a);
             var bType = GetObjectTypeFromRef(b);
             if (!IsSameRuntimeType(aType, bType))
-                throw new InvalidOperationException("Cannot combine delegates of different runtime types.");
+                throw new ArgumentException("Delegates must be of the same type.");
 
             var combined = new List<int>();
             AppendFlattenedDelegateTargets(combined, checked((int)a.Payload));
@@ -2161,6 +2161,18 @@ namespace Cnidaria.Cs
 
             int objAbs = AllocMulticastDelegateObject(aType, combined.ToArray());
             return new Slot(SlotKind.Ref, objAbs);
+        }
+
+        private bool SameDelegateLeaf(int left, int right)
+        {
+            if (left == right)
+                return true;
+
+            DelegateData leftData = _delegateDataByObject[left];
+            DelegateData rightData = _delegateDataByObject[right];
+            return leftData.TargetMethodId == rightData.TargetMethodId &&
+                leftData.Target.Kind == rightData.Target.Kind &&
+                leftData.Target.Payload == rightData.Target.Payload;
         }
 
         private Slot ExecDelegateRemove(Slot source, Slot value)
@@ -2174,7 +2186,7 @@ namespace Cnidaria.Cs
             var sourceType = GetObjectTypeFromRef(source);
             var valueType = GetObjectTypeFromRef(value);
             if (!IsSameRuntimeType(sourceType, valueType))
-                return source;
+                throw new ArgumentException("Delegates must be of the same type.");
 
             var sourceTargets = new List<int>();
             var valueTargets = new List<int>();
@@ -2190,7 +2202,7 @@ namespace Cnidaria.Cs
                 bool match = true;
                 for (int j = 0; j < valueTargets.Count; j++)
                 {
-                    if (sourceTargets[i + j] != valueTargets[j])
+                    if (!SameDelegateLeaf(sourceTargets[i + j], valueTargets[j]))
                     {
                         match = false;
                         break;
@@ -2265,6 +2277,14 @@ namespace Cnidaria.Cs
 
             var targetMethod = _rts.GetMethodById(delegateData.TargetMethodId);
 
+            // The type initializer returns into the pending invocation, which then starts this same target
+            if (targetMethod.IsStatic && !IsTypeInitializer(targetMethod) && TryDeferTypeInitialization(targetMethod.DeclaringType, _curPc, ct, limits))
+            {
+                context.NextIndex = targetIndex;
+                _pendingDelegateInvocations[_frameBase] = context;
+                return;
+            }
+
             bool hasClosedStaticTarget = !targetMethod.HasThis && delegateData.Target.Kind != SlotKind.Null;
             int expectedParameterCount = context.Arguments.Length + (hasClosedStaticTarget ? 1 : 0);
             if (targetMethod.ParameterTypes.Length != expectedParameterCount)
@@ -2282,7 +2302,10 @@ namespace Cnidaria.Cs
                 if (delegateData.Target.Kind == SlotKind.Null)
                     throw new InvalidOperationException("Open instance delegate invocation is not implemented.");
 
-                initialArgs[dst++] = delegateData.Target;
+                // A virtual target found through a boxed struct runs on the contents of the box
+                initialArgs[dst++] = targetMethod.DeclaringType.IsValueType && delegateData.Target.Kind == SlotKind.Ref
+                    ? new Slot(SlotKind.ByRef, GetBoxedValuePayloadAbs(checked((int)delegateData.Target.Payload)), aux: targetMethod.DeclaringType.SizeOf)
+                    : delegateData.Target;
             }
             else if (hasClosedStaticTarget)
             {
@@ -2549,35 +2572,7 @@ namespace Cnidaria.Cs
         }
 
         private bool IsAssignableTo(RuntimeType actual, RuntimeType target)
-        {
-            if (ReferenceEquals(actual, target))
-                return true;
-
-            if (target.Kind == RuntimeTypeKind.Interface && _rts.IsAssignableTo(actual, target))
-                return true;
-
-            if (actual.Kind == RuntimeTypeKind.Array &&
-                target.Kind == RuntimeTypeKind.Array)
-            {
-                if (actual.ArrayRank == target.ArrayRank &&
-                    actual.ElementType is RuntimeType actualElem &&
-                    target.ElementType is RuntimeType targetElem &&
-                    actualElem.IsReferenceType &&
-                    targetElem.IsReferenceType &&
-                    IsAssignableTo(actualElem, targetElem))
-                {
-                    return true;
-                }
-            }
-
-            for (var t = actual.BaseType; t != null; t = t.BaseType)
-            {
-                if (ReferenceEquals(t, target))
-                    return true;
-            }
-
-            return false;
-        }
+            => _rts.IsAssignableTo(actual, target);
 
         private void CheckHeapAccess(int abs, int size, bool writable)
         {
@@ -3955,7 +3950,7 @@ namespace Cnidaria.Cs
             if (hostEx is NullReferenceException)
                 return TryCreateCoreException("System", "NullReferenceException", msg, out vmEx);
 
-            if (hostEx is IndexOutOfRangeException or ArrayTypeMismatchException or OutOfMemoryException or ArgumentOutOfRangeException)
+            if (hostEx is IndexOutOfRangeException or ArrayTypeMismatchException or OutOfMemoryException or ArgumentException or InvalidCastException)
                 return TryCreateCoreException("System", hostEx.GetType().Name, msg, out vmEx);
 
             return false;
@@ -6217,6 +6212,33 @@ namespace Cnidaria.Cs
                             PushSlot(original);
                             return true;
                         }
+                    case RuntimeIntrinsicId.InterlockedOr:
+                    case RuntimeIntrinsicId.InterlockedAnd:
+                        {
+                            InterlockedBitwiseIntrinsic bitwise = runtimeIntrinsic.Bitwise;
+                            bool isAnd = runtimeIntrinsic.Id == RuntimeIntrinsicId.InterlockedAnd;
+                            if (totalArgs != 2)
+                                throw new InvalidOperationException("Interlocked.Or and Interlocked.And require exactly two arguments.");
+
+                            Slot value = PopSlot();
+                            Slot location = PopSlot();
+                            if (location.Kind == SlotKind.Null || location.Payload == 0)
+                                throw new NullReferenceException();
+                            if (location.Kind != SlotKind.ByRef)
+                                throw new InvalidOperationException($"Interlocked.Or and Interlocked.And location must be byref, got {location.Kind}.");
+
+                            int address = checked((int)location.Payload);
+                            Slot original = LoadValueAsSlot(address, 0, bitwise.ValueType);
+                            Slot updated = bitwise.Size switch
+                            {
+                                4 => new Slot(SlotKind.I4, isAnd ? original.AsI4Checked() & value.AsI4Checked() : original.AsI4Checked() | value.AsI4Checked()),
+                                8 => new Slot(SlotKind.I8, isAnd ? original.AsI8Checked() & value.AsI8Checked() : original.AsI8Checked() | value.AsI8Checked()),
+                                _ => throw new InvalidOperationException($"Unsupported Interlocked.Or or Interlocked.And size: {bitwise.Size}.")
+                            };
+                            StoreSlotAsValue(address, 0, bitwise.ValueType, updated);
+                            PushSlot(original);
+                            return true;
+                        }
                     default:
                         return false;
                 }
@@ -6683,49 +6705,6 @@ namespace Cnidaria.Cs
                     return true;
                 }
             }
-            static bool IsCoreLibRandomLike(RuntimeType t)
-            {
-                if (t.AssemblyName != "std")
-                    return false;
-
-                for (var cur = t; cur != null; cur = cur.BaseType)
-                {
-                    if (cur.AssemblyName == "std" &&
-                        cur.Namespace == "System" &&
-                        cur.Name == "Random")
-                        return true;
-                }
-                return false;
-            }
-            if (IsCoreLibRandomLike(rm.DeclaringType))
-            {
-                if (rm.HasThis &&
-                    rm.Name == "Next" &&
-                    rm.ReturnType.Namespace == "System" &&
-                    rm.ReturnType.Name == "Int32")
-                {
-                    int r;
-                    if (rm.ParameterTypes.Length == 0 && totalArgs == 1)
-                    { PopSlot(); r = System.Random.Shared.Next(); }
-                    else if (rm.ParameterTypes.Length == 1 && totalArgs == 2)
-                    {
-                        int max = PopSlot().AsI4Checked();
-                        PopSlot();
-                        r = System.Random.Shared.Next(max);
-                    }
-                    else if (rm.ParameterTypes.Length == 2 && totalArgs == 3)
-                    {
-                        int max = PopSlot().AsI4Checked();
-                        int min = PopSlot().AsI4Checked();
-                        PopSlot();
-                        r = System.Random.Shared.Next(min, max);
-                    }
-                    else return false;
-
-                    PushSlot(new Slot(SlotKind.I4, r));
-                    return true;
-                }
-            }
             if (IsSystemStringType(rm.DeclaringType) && rm.HasInternalCall)
             {
                 if (!rm.HasThis &&
@@ -6809,7 +6788,7 @@ namespace Cnidaria.Cs
 
                     return true;
                 }
-                if (p0.Name.Equals("ReadOnlySpan`1<Char>", StringComparison.Ordinal))
+                if (p0.Name == "ReadOnlySpan`1<Char>")
                 {
                     ct.ThrowIfCancellationRequested();
                     var span = PopSlot();

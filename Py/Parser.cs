@@ -1997,7 +1997,7 @@ namespace Cnidaria.Python
                 SyntaxKind.CapturePattern,
                 name);
 
-            if (string.Equals(name.Text, "_", StringComparison.Ordinal))
+            if (name.Text == "_")
             {
                 node = WithDiagnostic(
                     node,
@@ -3759,7 +3759,7 @@ namespace Cnidaria.Python
 
         private static bool IsSoftKeyword(GreenToken token, string text) =>
             token.Kind == SyntaxKind.IdentifierToken &&
-            string.Equals(token.Text, text, StringComparison.Ordinal);
+            token.Text == text;
 
         private static bool IsAssignmentTarget(
             GreenNode node,

@@ -13,11 +13,11 @@ namespace Cnidaria.Cs
                 return false;
 
             var def = nt.OriginalDefinition;
-            if (def.Arity != 1 || !string.Equals(def.Name, "Nullable", StringComparison.Ordinal))
+            if (def.Arity != 1 || def.Name != "Nullable")
                 return false;
 
             return def.ContainingSymbol is NamespaceSymbol ns
-                && string.Equals(ns.Name, "System", StringComparison.Ordinal);
+                && ns.Name == "System";
         }
         public static bool IsNonNullableValueType(TypeSymbol t)
         {
@@ -45,21 +45,21 @@ namespace Cnidaria.Cs
             return t.IsReferenceType;
         }
         /// <summary>Returns whether a type argument satisfies a substituted type constraint (identity, implicit reference, boxing, or type parameter conversion)</summary>
-        public static bool SatisfiesTypeConstraint(TypeSymbol argument, TypeSymbol constraint)
+        public static bool SatisfiesTypeConstraint(TypeSymbol argument, TypeSymbol constraint, int varianceDepth = 0)
         {
             if (LocalScopeBinder.AreSameType(argument, constraint) || constraint.SpecialType == SpecialType.System_Object)
                 return true;
 
             if (argument is TypeParameterSymbol typeParameter)
-                return IsSatisfiedByTypeParameter(typeParameter, constraint, new HashSet<TypeParameterSymbol>(ReferenceEqualityComparer<TypeParameterSymbol>.Instance));
+                return IsSatisfiedByTypeParameter(typeParameter, constraint, new HashSet<TypeParameterSymbol>(ReferenceEqualityComparer<TypeParameterSymbol>.Instance), varianceDepth);
 
             // Nullable<T> boxes to ValueType and object only; it satisfies no interface constraint
             if (IsSystemNullableValueType(argument))
                 return constraint.SpecialType == SpecialType.System_ValueType;
 
-            return ConvertsByReferenceOrBoxing(argument, constraint);
+            return ConvertsByReferenceOrBoxing(argument, constraint, varianceDepth);
         }
-        private static bool IsSatisfiedByTypeParameter(TypeParameterSymbol typeParameter, TypeSymbol constraint, HashSet<TypeParameterSymbol> visited)
+        private static bool IsSatisfiedByTypeParameter(TypeParameterSymbol typeParameter, TypeSymbol constraint, HashSet<TypeParameterSymbol> visited, int varianceDepth)
         {
             if (!visited.Add(typeParameter))
                 return false;
@@ -75,18 +75,21 @@ namespace Cnidaria.Cs
                 if (LocalScopeBinder.AreSameType(bound, constraint))
                     return true;
                 if (bound is TypeParameterSymbol other
-                    ? IsSatisfiedByTypeParameter(other, constraint, visited)
-                    : ConvertsByReferenceOrBoxing(bound, constraint))
+                    ? IsSatisfiedByTypeParameter(other, constraint, visited, varianceDepth)
+                    : ConvertsByReferenceOrBoxing(bound, constraint, varianceDepth))
                 {
                     return true;
                 }
             }
             return false;
         }
-        private static bool ConvertsByReferenceOrBoxing(TypeSymbol source, TypeSymbol target)
+        private static bool ConvertsByReferenceOrBoxing(TypeSymbol source, TypeSymbol target, int varianceDepth)
         {
             if (target is NamedTypeSymbol { TypeKind: TypeKind.Interface })
-                return ImplementsInterface(source, target, new HashSet<TypeSymbol>(ReferenceEqualityComparer<TypeSymbol>.Instance));
+            {
+                return ImplementsInterface(source, target, new HashSet<TypeSymbol>(ReferenceEqualityComparer<TypeSymbol>.Instance), varianceDepth) ||
+                    LocalScopeBinder.IsArrayListInterfaceConversion(source, target, varianceDepth);
+            }
 
             for (var current = source.BaseType; current is not null; current = current.BaseType)
             {
@@ -101,19 +104,22 @@ namespace Cnidaria.Cs
                    sourceArray.IsSZArray == targetArray.IsSZArray &&
                    sourceArray.ElementType.IsReferenceType &&
                    targetArray.ElementType.IsReferenceType &&
-                   SatisfiesTypeConstraint(sourceArray.ElementType, targetArray.ElementType);
+                   SatisfiesTypeConstraint(sourceArray.ElementType, targetArray.ElementType, varianceDepth);
         }
-        private static bool ImplementsInterface(TypeSymbol type, TypeSymbol iface, HashSet<TypeSymbol> visited)
+        private static bool ImplementsInterface(TypeSymbol type, TypeSymbol iface, HashSet<TypeSymbol> visited, int varianceDepth)
         {
             if (!visited.Add(type))
                 return false;
 
+            if (LocalScopeBinder.IsVarianceConvertible(type, iface, varianceDepth))
+                return true;
+
             foreach (var implemented in type.Interfaces)
             {
-                if (LocalScopeBinder.AreSameType(implemented, iface) || ImplementsInterface(implemented, iface, visited))
+                if (LocalScopeBinder.AreSameType(implemented, iface) || ImplementsInterface(implemented, iface, visited, varianceDepth))
                     return true;
             }
-            return type.BaseType is TypeSymbol baseType && ImplementsInterface(baseType, iface, visited);
+            return type.BaseType is TypeSymbol baseType && ImplementsInterface(baseType, iface, visited, varianceDepth);
         }
         /// <summary>Returns whether 'new T()' can construct a type argument</summary>
         public static bool HasPublicParameterlessConstructor(TypeSymbol type)
@@ -267,6 +273,8 @@ namespace Cnidaria.Cs
                             foreach (var iface in type.Interfaces)
                                 CheckTypeDeep(iface, location, types, diagnostics);
                             CheckConstraintTypes(type.TypeParameters, location, types, diagnostics);
+                            if (type is SourceNamedTypeSymbol sourceType && HasVariantParameter(sourceType))
+                                CheckVariance(sourceType, diagnostics);
                             break;
                         case MethodSymbol method:
                             CheckTypeDeep(method.ReturnType, location, types, diagnostics);
@@ -282,10 +290,127 @@ namespace Cnidaria.Cs
                             foreach (var parameter in property.Parameters)
                                 CheckTypeDeep(parameter.Type, location, types, diagnostics);
                             break;
+                        case EventSymbol declaredEvent:
+                            CheckTypeDeep(declaredEvent.Type, location, types, diagnostics);
+                            break;
                     }
                 }
             }
         }
+
+        private static bool HasVariantParameter(NamedTypeSymbol type)
+        {
+            foreach (TypeParameterSymbol parameter in type.TypeParameters)
+            {
+                if (parameter.Variance != VarianceKind.None)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static void CheckVariance(SourceNamedTypeSymbol type, DiagnosticBag diagnostics)
+        {
+            foreach (TypeSymbol baseInterface in type.Interfaces)
+                CheckTypeVariance(baseInterface, output: true, input: false, type, type, diagnostics);
+
+            foreach (Symbol member in type.GetMembers())
+            {
+                switch (member)
+                {
+                    case MethodSymbol method when type.TypeKind == TypeKind.Delegate:
+                        if (method.Name == "Invoke")
+                            CheckMethodVariance(method, type, diagnostics);
+                        break;
+                    // Static members with a body never see the variance, and accessors are checked through their property or event
+                    case MethodSymbol method when !method.IsStatic || method.IsAbstract || method.IsVirtual:
+                        if (method is not SourceMethodSymbol source || (source.AssociatedProperty is null && !source.IsEventAccessor))
+                            CheckMethodVariance(method, type, diagnostics);
+                        break;
+                    case EventSymbol declaredEvent when !declaredEvent.IsStatic:
+                        CheckTypeVariance(declaredEvent.Type, output: false, input: true, declaredEvent, type, diagnostics);
+                        break;
+                    case PropertySymbol property when !property.IsStatic:
+                        CheckSlotVariance(property.Type, output: property.HasGet, input: property.HasSet || property.Type is ByRefTypeSymbol, property, type, diagnostics);
+                        foreach (ParameterSymbol parameter in property.Parameters)
+                            CheckParameterVariance(parameter, property, type, diagnostics);
+                        break;
+                }
+            }
+        }
+
+        private static void CheckMethodVariance(MethodSymbol method, NamedTypeSymbol type, DiagnosticBag diagnostics)
+        {
+            if (method.ReturnType.SpecialType != SpecialType.System_Void)
+                CheckSlotVariance(method.ReturnType, output: true, input: method.ReturnType is ByRefTypeSymbol, method, type, diagnostics);
+
+            foreach (ParameterSymbol parameter in method.Parameters)
+                CheckParameterVariance(parameter, method, type, diagnostics);
+
+            foreach (TypeParameterSymbol typeParameter in method.TypeParameters)
+            {
+                foreach (TypeSymbol constraint in typeParameter.ConstraintTypes)
+                    CheckTypeVariance(constraint, output: false, input: true, method, type, diagnostics);
+            }
+        }
+
+        // Only a by-value parameter is purely an input, the others can be read back
+        private static void CheckParameterVariance(ParameterSymbol parameter, Symbol member, NamedTypeSymbol type, DiagnosticBag diagnostics)
+            => CheckSlotVariance(parameter.Type, output: parameter.Type is ByRefTypeSymbol, input: true, member, type, diagnostics);
+
+        private static void CheckSlotVariance(TypeSymbol slot, bool output, bool input, Symbol member, NamedTypeSymbol type, DiagnosticBag diagnostics)
+            => CheckTypeVariance(slot is ByRefTypeSymbol byRef ? byRef.ElementType : slot, output, input, member, type, diagnostics);
+
+        private static void CheckTypeVariance(TypeSymbol checkedType, bool output, bool input, Symbol member, NamedTypeSymbol type, DiagnosticBag diagnostics)
+        {
+            switch (checkedType)
+            {
+                case TypeParameterSymbol parameter:
+                    if (ReferenceEquals(parameter.ContainingSymbol, type) &&
+                        ((parameter.Variance == VarianceKind.Out && input) || (parameter.Variance == VarianceKind.In && output)))
+                    {
+                        string required = (output && input) ? "invariantly" : output ? "covariantly" : "contravariantly";
+                        string actual = parameter.Variance == VarianceKind.Out ? "covariant" : "contravariant";
+                        string where = ReferenceEquals(member, type) ? type.Name : type.Name + "." + member.Name;
+                        ImmutableArray<Location> locations = member.Locations.IsDefaultOrEmpty ? type.Locations : member.Locations;
+                        diagnostics.Add(new Diagnostic(
+                            "CN_VARIANCE002",
+                            DiagnosticSeverity.Error,
+                            $"Invalid variance: The type parameter '{parameter.Name}' must be {required} valid on '{where}'. '{parameter.Name}' is {actual}.",
+                            locations[0]));
+                    }
+                    break;
+                case ArrayTypeSymbol array:
+                    CheckTypeVariance(array.ElementType, output, input, member, type, diagnostics);
+                    break;
+                case TupleTypeSymbol tuple:
+                    foreach (TypeSymbol element in tuple.ElementTypes)
+                        CheckTypeVariance(element, output: true, input: true, member, type, diagnostics);
+                    break;
+                case NamedTypeSymbol named:
+                    if (named.ContainingSymbol is NamedTypeSymbol containing)
+                        CheckTypeVariance(containing, output, input, member, type, diagnostics);
+                    ImmutableArray<TypeParameterSymbol> declared = named.TypeParameters;
+                    ImmutableArray<TypeSymbol> arguments = named.TypeArguments;
+                    for (int i = 0; i < declared.Length; i++)
+                    {
+                        switch (declared[i].Variance)
+                        {
+                            case VarianceKind.Out:
+                                CheckTypeVariance(arguments[i], output, input, member, type, diagnostics);
+                                break;
+                            case VarianceKind.In:
+                                CheckTypeVariance(arguments[i], input, output, member, type, diagnostics);
+                                break;
+                            default:
+                                CheckTypeVariance(arguments[i], output: true, input: true, member, type, diagnostics);
+                                break;
+                        }
+                    }
+                    break;
+            }
+        }
+
         internal static void CheckConstraintTypes(ImmutableArray<TypeParameterSymbol> typeParameters, Location location, TypeManager types, DiagnosticBag diagnostics)
         {
             foreach (var typeParameter in typeParameters)
@@ -601,8 +726,8 @@ namespace Cnidaria.Cs
                     if (typeConstraint.Type is IdentifierNameSyntax id)
                     {
                         var text = id.Identifier.ValueText ?? string.Empty;
-                        if (string.Equals(text, "unmanaged", StringComparison.Ordinal) ||
-                            string.Equals(text, "notnull", StringComparison.Ordinal))
+                        if (text == "unmanaged" ||
+                            text == "notnull")
                         {
                             continue;
                         }
@@ -724,7 +849,7 @@ namespace Cnidaria.Cs
                             if (tc.Type is IdentifierNameSyntax id)
                             {
                                 var text = id.Identifier.ValueText ?? string.Empty;
-                                if (string.Equals(text, "unmanaged", StringComparison.Ordinal))
+                                if (text == "unmanaged")
                                 {
                                     if (!tp.TrySetConstraint(GenericConstraintsFlags.UnmanagedConstraint))
                                     {
@@ -736,7 +861,7 @@ namespace Cnidaria.Cs
                                     }
                                     tp.TrySetConstraint(GenericConstraintsFlags.StructConstraint);
                                 }
-                                else if (string.Equals(text, "notnull", StringComparison.Ordinal))
+                                else if (text == "notnull")
                                 {
                                     if (!tp.TrySetConstraint(GenericConstraintsFlags.NotNullConstraint))
                                     {

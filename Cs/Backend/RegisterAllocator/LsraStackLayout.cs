@@ -657,7 +657,7 @@ namespace Cnidaria.Cs
                         RuntimeMethod? method = node.Method;
                         if (method is null)
                             return true;
-                        if (method.HasInternalCall != true ||
+                        if ((method.HasInternalCall != true && method.DllImportData?.SuppressGCTransition != true) ||
                              (Target.IsRiscV && RiscVRuntime.IsGcSafePointInternalCall(method)) ||
                              (Target.IsX86 && X86Runtime.IsGcSafePointInternalCall(method)) ||
                              (Target.IsArm && ArmRuntime.IsGcSafePointInternalCall(method)))

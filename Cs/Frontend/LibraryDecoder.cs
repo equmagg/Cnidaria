@@ -168,6 +168,21 @@ namespace Cnidaria.Cs
             AddMemberToType(containingType, f);
             return f;
         }
+
+        public EventSymbol AddExternalEvent(NamedTypeSymbol containingType, string name, MethodSymbol addMethod, MethodSymbol removeMethod)
+        {
+            var declaredEvent = new ExternalEventSymbol(
+                name,
+                containingType,
+                addMethod.Parameters[0].Type,
+                addMethod.IsStatic,
+                addMethod.DeclaredAccessibility,
+                addMethod,
+                removeMethod);
+            AddMemberToType(containingType, declaredEvent);
+            return declaredEvent;
+        }
+
         public PropertySymbol AddExternalProperty(
             NamedTypeSymbol containingType,
             string name,
@@ -426,6 +441,8 @@ namespace Cnidaria.Cs
         private NamedTypeSymbol[] _typeByRid = Array.Empty<NamedTypeSymbol>();
         private readonly Dictionary<int, MethodSymbol> _methodByRid = new();
         private readonly Dictionary<int, PropertySymbol> _propertyByRid = new();
+        private readonly Dictionary<int, EventSymbol> _eventByRid = new();
+        private readonly Dictionary<int, List<int>> _eventRowsByType = new();
         private readonly Dictionary<int, ParameterSymbol> _paramByRid = new();
         private Dictionary<int, FieldSymbol> _fieldByRid = new();
         private readonly Dictionary<int, ConstantRow> _constByParent = new();
@@ -620,6 +637,7 @@ namespace Cnidaria.Cs
             AddMethodsOfType(core, typeByRid, typeRid);
             AddPropertiesFromTableOfType(core, typeByRid, typeRid);
             AddPropertiesFromAccessorsOfType(core, typeByRid[typeRid]);
+            AddEventsOfType(core, typeRid);
             ApplyMethodImplsOfType(core, typeByRid, typeRid);
 
             for (int mrid = methodStart; mrid < methodEnd; mrid++)
@@ -640,6 +658,11 @@ namespace Cnidaria.Cs
             {
                 foreach (int prid in properties)
                     ApplyCustomAttributesOf(core, typeByRid, MetadataToken.Make(MetadataToken.PropertyDef, prid));
+            }
+            if (_eventRowsByType.TryGetValue(typeRid, out List<int>? events))
+            {
+                foreach (int eventRid in events)
+                    ApplyCustomAttributesOf(core, typeByRid, MetadataToken.Make(MetadataToken.EventDef, eventRid));
             }
 
             for (int mrid = methodStart; mrid < methodEnd; mrid++)
@@ -666,6 +689,13 @@ namespace Cnidaria.Cs
                     : 0;
                 if (accessor != 0)
                     AddRow(_propertyRowsByType, _md.GetMethodOwnerTypeDefRid(MetadataToken.Rid(accessor)), rid);
+            }
+
+            for (int rid = 1; rid <= _md.GetRowCount(MetadataTableKind.Event); rid++)
+            {
+                int adder = _md.GetEvent(rid).AddMethod;
+                if (adder != 0)
+                    AddRow(_eventRowsByType, _md.GetMethodOwnerTypeDefRid(MetadataToken.Rid(adder)), rid);
             }
 
             for (int rid = 1; rid <= _md.GetRowCount(MetadataTableKind.GenericParam); rid++)
@@ -748,6 +778,7 @@ namespace Cnidaria.Cs
                 return;
 
             var flags = (System.Reflection.GenericParameterAttributes)_md.GetGenericParam(genericParamRid).Flags;
+            tp.Variance = (VarianceKind)(flags & System.Reflection.GenericParameterAttributes.VarianceMask);
             if ((flags & System.Reflection.GenericParameterAttributes.ReferenceTypeConstraint) != 0)
                 tp.TrySetConstraint(GenericConstraintsFlags.ClassConstraint);
             if ((flags & System.Reflection.GenericParameterAttributes.NotNullableValueTypeConstraint) != 0)
@@ -934,6 +965,9 @@ namespace Cnidaria.Cs
                         break;
                 }
 
+                if (FindEventOfAccessor(body) is ExternalEventSymbol bodyEvent && FindEventOfAccessor(decl) is EventSymbol declEvent)
+                    bodyEvent.SetExplicitInterfaceImplementation(declEvent);
+
                 if (FindPropertyOfAccessor(body) is PropertySymbol bodyProp && FindPropertyOfAccessor(decl) is PropertySymbol declProp)
                 {
                     switch (bodyProp)
@@ -947,6 +981,25 @@ namespace Cnidaria.Cs
                     }
                 }
             }
+        }
+
+        private static EventSymbol? FindEventOfAccessor(MethodSymbol accessor)
+        {
+            if (accessor.ContainingSymbol is NamedTypeSymbol type)
+            {
+                MethodSymbol definition = accessor.OriginalDefinition;
+                foreach (Symbol member in type.GetMembers())
+                {
+                    if (member is EventSymbol declaredEvent &&
+                        (ReferenceEquals(declaredEvent.AddMethod.OriginalDefinition, definition) ||
+                         ReferenceEquals(declaredEvent.RemoveMethod.OriginalDefinition, definition)))
+                    {
+                        return declaredEvent;
+                    }
+                }
+            }
+
+            return null;
         }
 
         private static PropertySymbol? FindPropertyOfAccessor(MethodSymbol accessor)
@@ -1221,8 +1274,12 @@ namespace Cnidaria.Cs
                 return;
 
             var data = DecodeCustomAttribute(core, typeByRid, _methodByRid, row, target);
-            if (data is not null)
-                AddImportedAttribute(owner, data);
+            if (data is null)
+                return;
+
+            AddImportedAttribute(owner, data);
+            if (owner is SourceNamedTypeSymbol type && data.AttributeClass.Name == "IsByRefLikeAttribute")
+                type.MarkRefLike();
         }
         private (Symbol? Owner, AttributeApplicationTarget Target) ResolveAttributeOwner(
             int parentToken,
@@ -1245,6 +1302,8 @@ namespace Cnidaria.Cs
                     return (methodByRid.TryGetValue(rid, out var m) ? m : null, AttributeApplicationTarget.Default);
                 case MetadataToken.PropertyDef:
                     return (propertyByRid.TryGetValue(rid, out var prop) ? prop : null, AttributeApplicationTarget.Default);
+                case MetadataToken.EventDef:
+                    return (_eventByRid.TryGetValue(rid, out EventSymbol? declaredEvent) ? declaredEvent : null, AttributeApplicationTarget.Default);
                 case MetadataToken.ParamDef:
                     if (paramByRid.TryGetValue(rid, out var p))
                         return (p, AttributeApplicationTarget.Default);
@@ -1285,6 +1344,8 @@ namespace Cnidaria.Cs
                 case ExternalMethodSymbol m: m.AddAttribute(data); break;
                 case ExternalFieldSymbol f: f.AddAttribute(data); break;
                 case ExternalPropertySymbol p: p.AddAttribute(data); break;
+                case ExternalEventSymbol e: e.AddAttribute(data); break;
+                case SourceEventSymbol e: e.AddAttribute(data); break;
 
                 case ParameterSymbol p:
                     if (MethodAttributeFacts.IsAttribute(data, "System", "ParamArrayAttribute") ||
@@ -1873,6 +1934,23 @@ namespace Cnidaria.Cs
                 default: return Optional<object>.None;
             }
         }
+        private void AddEventsOfType(CoreLibraryBuilder core, int typeRid)
+        {
+            if (!_eventRowsByType.TryGetValue(typeRid, out List<int>? rows))
+                return;
+
+            foreach (int rid in rows)
+            {
+                EventRow row = _md.GetEvent(rid);
+                if (_methodByRid.TryGetValue(MetadataToken.Rid(row.AddMethod), out MethodSymbol? addMethod) &&
+                    _methodByRid.TryGetValue(MetadataToken.Rid(row.RemoveMethod), out MethodSymbol? removeMethod) &&
+                    addMethod.ContainingSymbol is NamedTypeSymbol declaring)
+                {
+                    _eventByRid[rid] = core.AddExternalEvent(declaring, _md.GetString(row.Name), addMethod, removeMethod);
+                }
+            }
+        }
+
         private void AddPropertiesFromTableOfType(CoreLibraryBuilder core, NamedTypeSymbol[] typeByRid, int typeRid)
         {
             if (!_propertyRowsByType.TryGetValue(typeRid, out var rows))
@@ -2124,7 +2202,7 @@ namespace Cnidaria.Cs
         private static bool TryMapSpecialType(string ns, string name, out SpecialType st)
         {
             st = SpecialType.None;
-            if (!string.Equals(ns, "System", StringComparison.Ordinal))
+            if (ns != "System")
                 return false;
 
             st = name switch

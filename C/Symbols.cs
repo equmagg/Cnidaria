@@ -253,7 +253,7 @@ public sealed class TagSymbol : Symbol
     {
         foreach (var candidate in Fields)
         {
-            if (string.Equals(candidate.Name, name, StringComparison.Ordinal))
+            if (candidate.Name == name)
             {
                 field = candidate;
                 return true;

@@ -84,8 +84,8 @@ namespace Cnidaria.Cs
 
     internal static class ILEmitter
     {
-        public static byte[] Emit(BoundMethodBody body, ITokenProvider tokens, TargetInfo target)
-            => new MethodEmitter(tokens, body.Method, target).Emit(body);
+        public static byte[] Emit(BoundMethodBody body, ITokenProvider tokens, TargetInfo target, bool initLocals)
+            => new MethodEmitter(tokens, body.Method, target).Emit(body, initLocals);
 
         private enum EmitMode : byte
         {
@@ -109,25 +109,43 @@ namespace Cnidaria.Cs
             private int _returnLocal = -1;
             private bool _returnsFromRegion;
             private readonly Dictionary<TypeSymbol, int> _defaultValueTemps = new(ReferenceEqualityComparer<TypeSymbol>.Instance);
+            // An async function returns the unwrapped result, null when there is none
+            private readonly TypeSymbol? _returnType;
 
             public MethodEmitter(ITokenProvider tokens, MethodSymbol method, TargetInfo target)
             {
                 _tokens = tokens;
                 _method = method;
                 _target = target;
+                _returnType = method.IsAsync && LocalScopeBinder.TryGetTaskResultType(method.ReturnType, out TypeSymbol? taskResult) ? taskResult : method.ReturnType;
+                if (_returnType is not null && IsVoid(_returnType))
+                    _returnType = null;
                 int start = method.IsStatic ? 0 : 1;
                 var ps = method.Parameters;
                 for (int i = 0; i < ps.Length; i++)
                     _argsBySymbol[ps[i]] = start + i;
             }
 
-            public byte[] Emit(BoundMethodBody body)
+            // A local function is emitted as a member of the type that hosts its enclosing method
+            private NamedTypeSymbol? ThisType
+            {
+                get
+                {
+                    Symbol? owner = _method.ContainingSymbol;
+                    while (owner is MethodSymbol enclosing)
+                        owner = enclosing.ContainingSymbol;
+
+                    return owner as NamedTypeSymbol;
+                }
+            }
+
+            public byte[] Emit(BoundMethodBody body, bool initLocals)
             {
                 CollectLabels(body.Body, null);
                 EmitStatement(body.Body);
 
                 if (_il.IsReachable)
-                    EmitImplicitReturn(body.Method);
+                    EmitImplicitReturn();
                 if (_returnsFromRegion)
                 {
                     _il.MarkLabel(_returnLabel);
@@ -136,16 +154,16 @@ namespace Cnidaria.Cs
                     _il.Emit(ILOpCode.Ret, _returnLocal >= 0 ? 1 : 0, 0);
                 }
 
-                return _il.Bake(_tokens.GetLocalSignatureToken(_localTypes), initLocals: true);
+                return _il.Bake(_tokens.GetLocalSignatureToken(_localTypes), initLocals);
             }
-            private void EmitImplicitReturn(MethodSymbol method)
+            private void EmitImplicitReturn()
             {
-                if (IsVoid(method.ReturnType))
+                if (_returnType is null)
                 {
                     _il.Emit(ILOpCode.Ret, 0, 0);
                     return;
                 }
-                EmitDefaultValue(method.ReturnType);
+                EmitDefaultValue(_returnType);
                 _il.Emit(ILOpCode.Ret, 1, 0);
             }
             private void CollectLabels(BoundStatement s, BoundStatement? region)
@@ -185,8 +203,8 @@ namespace Cnidaria.Cs
                 {
                     _returnsFromRegion = true;
                     _returnLabel = _il.DefineLabel();
-                    if (!IsVoid(_method.ReturnType))
-                        _returnLocal = AllocateTemp(_method.ReturnType);
+                    if (_returnType is not null)
+                        _returnLocal = AllocateTemp(_returnType);
                 }
                 if (expression is not null)
                     _il.EmitLocal(ILOpCode.Stloc, _returnLocal);
@@ -461,6 +479,9 @@ namespace Cnidaria.Cs
                     case BoundParameterExpression par:
                         EmitParameter(par, mode);
                         return;
+                    case BoundBaseExpression baseExpression when baseExpression.InstanceOpt is not null:
+                        EmitExpression(baseExpression.InstanceOpt, mode);
+                        return;
                     case BoundThisExpression:
                     case BoundBaseExpression:
                         if (mode == EmitMode.Value)
@@ -506,6 +527,9 @@ namespace Cnidaria.Cs
                         return;
                     case BoundLambdaExpression lambda:
                         EmitLambda(lambda, mode);
+                        return;
+                    case BoundDelegateCreationExpression delegateCreation:
+                        EmitDelegateCreation(delegateCreation, mode);
                         return;
                     case BoundClosureCellCreationExpression closureCell:
                         EmitClosureCellCreation(closureCell, mode);
@@ -1402,6 +1426,27 @@ namespace Cnidaria.Cs
                 _il.EmitToken(ILOpCode.Ldftn, GetMethodReferenceToken(lambda.Method), 0, 1);
                 _il.EmitToken(ILOpCode.Newobj, _tokens.GetMethodToken(FindDelegateConstructor((NamedTypeSymbol)lambda.Type)), 2, 1);
             }
+            private void EmitDelegateCreation(BoundDelegateCreationExpression creation, EmitMode mode)
+            {
+                if (creation.TargetOpt is null)
+                    _il.Emit(ILOpCode.Ldnull, 0, 1);
+                else
+                    EmitExpression(creation.TargetOpt, EmitMode.Value);
+
+                if (creation.IsVirtual)
+                {
+                    _il.Emit(ILOpCode.Dup, 1, 2);
+                    _il.EmitToken(ILOpCode.Ldvirtftn, _tokens.GetMethodToken(creation.Method), 1, 1);
+                }
+                else
+                {
+                    _il.EmitToken(ILOpCode.Ldftn, _tokens.GetMethodToken(creation.Method), 0, 1);
+                }
+
+                _il.EmitToken(ILOpCode.Newobj, _tokens.GetMethodToken(FindDelegateConstructor((NamedTypeSymbol)creation.Type)), 2, 1);
+                if (mode == EmitMode.Discard)
+                    _il.Emit(ILOpCode.Pop, 1, 0);
+            }
             private int GetMethodReferenceToken(MethodSymbol method)
             {
                 var typeParameters = method.TypeParameters;
@@ -1469,7 +1514,7 @@ namespace Cnidaria.Cs
                 Symbol? s = type.ContainingSymbol;
                 for (int i = nsParts.Length - 1; i >= 0; i--)
                 {
-                    if (s is not NamespaceSymbol ns || !string.Equals(ns.Name, nsParts[i], StringComparison.Ordinal))
+                    if (s is not NamespaceSymbol ns || ns.Name != nsParts[i])
                         return false;
                     s = ns.ContainingSymbol;
                 }
@@ -1498,7 +1543,7 @@ namespace Cnidaria.Cs
                     {
                         if (_method.IsStatic)
                             throw new InvalidOperationException($"Instance call to '{method.Name}' without receiver (in static method).");
-                        var thisType = _method.ContainingSymbol as NamedTypeSymbol
+                        NamedTypeSymbol thisType = ThisType
                             ?? throw new InvalidOperationException("Cannot resolve implicit 'this' receiver type.");
                         _il.EmitArg(ILOpCode.Ldarg, 0);
                         if (thisType.IsValueType)
@@ -1644,7 +1689,7 @@ namespace Cnidaria.Cs
                     method.Parameters.Length != 0 ||
                     method.ReturnType.SpecialType != SpecialType.System_Boolean ||
                     method.ContainingSymbol is not NamedTypeSymbol containingType ||
-                    !string.Equals(containingType.Name, "Type", StringComparison.Ordinal) ||
+                    containingType.Name != "Type" ||
                     !IsInNamespace(containingType, "System"))
                 {
                     return false;
@@ -1730,7 +1775,7 @@ namespace Cnidaria.Cs
             private void EmitObjectGetTypeEquality(BoundCallExpression getTypeCall, TypeSymbol targetType, bool negate, EmitMode mode)
             {
                 TypeSymbol receiverType = getTypeCall.ReceiverOpt?.Type
-                    ?? _method.ContainingSymbol as NamedTypeSymbol
+                    ?? ThisType
                     ?? throw new InvalidOperationException("Cannot resolve implicit GetType receiver type.");
                 if (receiverType.IsValueType && !IsSystemNullableValueType(receiverType))
                 {
@@ -1782,12 +1827,12 @@ namespace Cnidaria.Cs
                 var definition = candidate.Method.OriginalDefinition;
                 if (definition.IsStatic ||
                     definition.Parameters.Length != 0 ||
-                    !string.Equals(definition.Name, "GetType", StringComparison.Ordinal) ||
+                    definition.Name != "GetType" ||
                     definition.ContainingSymbol is not NamedTypeSymbol containingType ||
-                    !string.Equals(containingType.Name, "Object", StringComparison.Ordinal) ||
+                    containingType.Name != "Object" ||
                     !IsInNamespace(containingType, "System") ||
                     definition.ReturnType is not NamedTypeSymbol returnType ||
-                    !string.Equals(returnType.Name, "Type", StringComparison.Ordinal) ||
+                    returnType.Name != "Type" ||
                     !IsInNamespace(returnType, "System"))
                 {
                     return false;
@@ -2153,9 +2198,9 @@ namespace Cnidaria.Cs
                     return false;
                 var def = nt.OriginalDefinition;
                 return def.Arity == 1 &&
-                    string.Equals(def.Name, "Nullable", StringComparison.Ordinal) &&
+                    def.Name == "Nullable" &&
                     def.ContainingSymbol is NamespaceSymbol ns &&
-                    string.Equals(ns.Name, "System", StringComparison.Ordinal);
+                    ns.Name == "System";
             }
             private void EmitAs(BoundAsExpression @as, EmitMode mode)
             {
@@ -2167,6 +2212,8 @@ namespace Cnidaria.Cs
                 EmitExpression(@as.Operand, EmitMode.Value);
                 if (@as.Operand.Type.IsValueType || @as.Operand.Type is TypeParameterSymbol)
                     _il.EmitToken(ILOpCode.Box, _tokens.GetTypeToken(@as.Operand.Type), 1, 1);
+                else if (LocalScopeBinder.HasImplicitReferenceConversion(@as.Operand.Type, @as.Type))
+                    return;
 
                 if (IsSystemNullableValueType(@as.Type))
                 {
@@ -2239,7 +2286,10 @@ namespace Cnidaria.Cs
                 EmitExpression(p.Operand, EmitMode.Value);
                 if (p.Operand.Type.IsValueType || p.Operand.Type is TypeParameterSymbol)
                     _il.EmitToken(ILOpCode.Box, _tokens.GetTypeToken(p.Operand.Type), 1, 1);
-                _il.EmitToken(ILOpCode.Isinst, _tokens.GetTypeToken(p.PatternTypeOpt!), 1, 1);
+                // Implicit reference conversions hold for every value, so only null is left to check as the language defines
+                TypeSymbol patternType = p.PatternTypeOpt ?? throw new InvalidOperationException("A type pattern has a type.");
+                if (p.Operand.Type.IsValueType || p.Operand.Type is TypeParameterSymbol || !LocalScopeBinder.HasImplicitReferenceConversion(p.Operand.Type, patternType))
+                    _il.EmitToken(ILOpCode.Isinst, _tokens.GetTypeToken(patternType), 1, 1);
                 if (mode == EmitMode.Discard)
                 {
                     _il.Emit(ILOpCode.Pop, 1, 0);
@@ -2511,6 +2561,13 @@ namespace Cnidaria.Cs
             {
                 switch (lvalue)
                 {
+                    case BoundSequenceExpression sequence:
+                        for (int i = 0; i < sequence.Locals.Length; i++)
+                            GetOrCreateLocal(sequence.Locals[i]);
+                        for (int i = 0; i < sequence.SideEffects.Length; i++)
+                            EmitStatement(sequence.SideEffects[i]);
+                        EmitLoadAddressOfLValue(sequence.Value);
+                        return;
                     case BoundLocalExpression loc:
                         {
                             int idx = GetOrCreateLocal(loc.Local);

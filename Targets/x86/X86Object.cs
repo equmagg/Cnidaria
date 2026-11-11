@@ -529,7 +529,7 @@ public static class X86ObjectComposer
                 }
 
                 int offset;
-                if (StringComparer.Ordinal.Equals(symbol.SectionName, ".text"))
+                if (symbol.SectionName == ".text")
                 {
                     offset = checked(textBases[i] + symbol.Offset);
                 }

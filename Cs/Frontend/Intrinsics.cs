@@ -8,6 +8,8 @@ namespace Cnidaria.Cs
         InterlockedCompareExchange,
         InterlockedExchangeAdd,
         InterlockedExchange,
+        InterlockedOr,
+        InterlockedAnd,
         MemoryBarrier,
         VolatileRead,
         VolatileWrite,
@@ -75,6 +77,20 @@ namespace Cnidaria.Cs
         }
     }
 
+    internal readonly struct InterlockedBitwiseIntrinsic
+    {
+        public RuntimeType ValueType { get; }
+        public int Size { get; }
+        public bool IsSigned { get; }
+
+        public InterlockedBitwiseIntrinsic(RuntimeType valueType, int size, bool isSigned)
+        {
+            ValueType = valueType;
+            Size = size;
+            IsSigned = isSigned;
+        }
+    }
+
     internal readonly struct RuntimeIntrinsicInfo
     {
         public RuntimeIntrinsicId Id { get; }
@@ -82,6 +98,7 @@ namespace Cnidaria.Cs
         public InterlockedCompareExchangeIntrinsic CompareExchange { get; }
         public InterlockedExchangeAddIntrinsic ExchangeAdd { get; }
         public InterlockedExchangeIntrinsic Exchange { get; }
+        public InterlockedBitwiseIntrinsic Bitwise { get; }
 
         public bool IsSpecialImport => (Flags & RuntimeIntrinsicFlags.SpecialImport) != 0;
         public bool IsNoInline => (Flags & RuntimeIntrinsicFlags.NoInline) != 0;
@@ -93,14 +110,52 @@ namespace Cnidaria.Cs
             RuntimeIntrinsicFlags flags,
             InterlockedCompareExchangeIntrinsic compareExchange = default,
             InterlockedExchangeAddIntrinsic exchangeAdd = default,
-            InterlockedExchangeIntrinsic exchange = default)
+            InterlockedExchangeIntrinsic exchange = default,
+            InterlockedBitwiseIntrinsic bitwise = default)
         {
             Id = id;
             Flags = flags;
             CompareExchange = compareExchange;
             ExchangeAdd = exchangeAdd;
             Exchange = exchange;
+            Bitwise = bitwise;
         }
+    }
+
+    // GC services the BCL reaches through RuntimeImports and InternalCalls, each exported under its own name
+    internal static class RuntimeGcImports
+    {
+        public const string FinalizerDrainSymbol = "RhpFinalizerDrain";
+
+        private static bool IsRuntimeImport(RuntimeMethod method)
+            => method.HasInternalCall && method.IsStatic && method.DeclaringType.Namespace == "System.Runtime" &&
+               method.DeclaringType.Name is "RuntimeImports" or "InternalCalls";
+
+        public static string? Symbol(RuntimeMethod method)
+            => IsRuntimeImport(method) && method.Name is
+                "RhpHandleAlloc" or
+                "RhpHandleAllocDependent" or
+                "RhHandleFree" or
+                "RhHandleGet" or
+                "RhHandleSet" or
+                "RhHandleGetDependent" or
+                "RhHandleSetDependentSecondary" or
+                "RhSuppressFinalize" or
+                "RhReRegisterForFinalize" or
+                "RhpGetNextFinalizableObject" or
+                "RhCollect" or
+                "RhpFallbackFailFast"
+                ? method.Name
+                : null;
+
+        public static bool IsGcSafePoint(RuntimeMethod method)
+            => IsRuntimeImport(method) && method.Name == "RhCollect";
+
+        public static bool IsFinalizerDrain(RuntimeMethod method)
+            => method.IsStatic &&
+               method.Name == "DrainQueueOnCurrentThread" &&
+               method.DeclaringType.Namespace == "System.Runtime" &&
+               method.DeclaringType.Name == "__Finalizer";
     }
 
     internal static class RuntimeIntrinsics
@@ -168,6 +223,26 @@ namespace Cnidaria.Cs
 
             if (!method.HasThis &&
                 method.IsStatic &&
+                method.ParameterTypes.Length == 2 &&
+                method.DeclaringType.Namespace == "System.Threading" &&
+                method.DeclaringType.Name == "Interlocked" &&
+                method.Name == "Or")
+            {
+                return RuntimeIntrinsicId.InterlockedOr;
+            }
+
+            if (!method.HasThis &&
+                method.IsStatic &&
+                method.ParameterTypes.Length == 2 &&
+                method.DeclaringType.Namespace == "System.Threading" &&
+                method.DeclaringType.Name == "Interlocked" &&
+                method.Name == "And")
+            {
+                return RuntimeIntrinsicId.InterlockedAnd;
+            }
+
+            if (!method.HasThis &&
+                method.IsStatic &&
                 method.ParameterTypes.Length == 0 &&
                 method.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Void &&
                 method.DeclaringType.Namespace == "System.Threading" &&
@@ -200,6 +275,8 @@ namespace Cnidaria.Cs
                 RuntimeIntrinsicId.InterlockedCompareExchange => AtomicReadModifyWriteFlags,
                 RuntimeIntrinsicId.InterlockedExchangeAdd => AtomicReadModifyWriteFlags,
                 RuntimeIntrinsicId.InterlockedExchange => AtomicReadModifyWriteFlags,
+                RuntimeIntrinsicId.InterlockedOr => AtomicReadModifyWriteFlags,
+                RuntimeIntrinsicId.InterlockedAnd => AtomicReadModifyWriteFlags,
                 RuntimeIntrinsicId.MemoryBarrier or RuntimeIntrinsicId.VolatileRead or RuntimeIntrinsicId.VolatileWrite => MemoryBarrierFlags,
                 _ => RuntimeIntrinsicFlags.None,
             };
@@ -239,6 +316,14 @@ namespace Cnidaria.Cs
                     if (TryGetInterlockedExchange(method, target.PointerSize, out var exchange))
                     {
                         intrinsic = new RuntimeIntrinsicInfo(id, AtomicReadModifyWriteFlags, exchange: exchange);
+                        return true;
+                    }
+                    break;
+                case RuntimeIntrinsicId.InterlockedOr:
+                case RuntimeIntrinsicId.InterlockedAnd:
+                    if (TryGetInterlockedBitwise(method, target, out InterlockedBitwiseIntrinsic bitwise))
+                    {
+                        intrinsic = new RuntimeIntrinsicInfo(id, AtomicReadModifyWriteFlags, bitwise: bitwise);
                         return true;
                     }
                     break;
@@ -449,6 +534,39 @@ namespace Cnidaria.Cs
             }
 
             intrinsic = new InterlockedExchangeAddIntrinsic(valueType, size);
+            return true;
+        }
+
+        // Values narrower than a word and the targets without a scratch register keep the managed compare-exchange loop
+        private static bool TryGetInterlockedBitwise(RuntimeMethod method, TargetInfo target, out InterlockedBitwiseIntrinsic intrinsic)
+        {
+            intrinsic = default;
+
+            if (target.Architecture == Cnidaria.TargetArchitectureKind.I386)
+                return false;
+
+            RuntimeType locationType = method.ParameterTypes[0];
+            if (locationType.Kind != RuntimeTypeKind.ByRef || locationType.ElementType is null)
+                return false;
+
+            RuntimeType signatureValueType = locationType.ElementType;
+            if (!SameType(signatureValueType, method.ParameterTypes[1]) || !SameType(signatureValueType, method.ReturnType))
+                return false;
+
+            if (!TryClassifyAtomicValue(signatureValueType, method, target.PointerSize, out RuntimeType valueType, out int size, out bool isReference, out bool isSigned) ||
+                isReference ||
+                size < 4)
+            {
+                return false;
+            }
+
+            if (size == 8 && target.PointerSize == 4 && target.Architecture is not
+                (Cnidaria.TargetArchitectureKind.RegisterBytecode or Cnidaria.TargetArchitectureKind.RegisterBytecode64))
+            {
+                return false;
+            }
+
+            intrinsic = new InterlockedBitwiseIntrinsic(valueType, size, isSigned);
             return true;
         }
 

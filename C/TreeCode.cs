@@ -469,6 +469,8 @@ public static class GimpleOperators
         spellings[(int)GimpleTreeCode.BitXorExpr] = "^";
         spellings[(int)GimpleTreeCode.LshiftExpr] = "<<";
         spellings[(int)GimpleTreeCode.RshiftExpr] = ">>";
+        spellings[(int)GimpleTreeCode.LrotateExpr] = "rotl";
+        spellings[(int)GimpleTreeCode.RrotateExpr] = "rotr";
         spellings[(int)GimpleTreeCode.TruthAndExpr] = "&&";
         spellings[(int)GimpleTreeCode.TruthOrExpr] = "||";
         spellings[(int)GimpleTreeCode.LtExpr] = "<";

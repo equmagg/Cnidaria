@@ -52,42 +52,9 @@ internal sealed partial class DeclarationBuilder
         {
             if (type.RecordInfo is not RecordTypeInfo record || record.Syntax.ParameterList is not ParameterListSyntax list)
                 continue;
-            var constructor = new SourceMethodSymbol(".ctor", type, _types.GetSpecialType(SpecialType.System_Void),
-                ImmutableArray<TypeParameterSymbol>.Empty, false, true, false,
-                ImmutableArray.Create(new Location(record.Tree, list.Span)),
-                type.IsAbstract ? Accessibility.Protected : Accessibility.Public);
-            var parameters = ImmutableArray.CreateBuilder<ParameterSymbol>(list.Parameters.Count);
-            var names = new HashSet<string>(StringComparer.Ordinal);
-            bool seenOptional = false;
-            foreach (var syntax in list.Parameters)
-            {
-                if (!names.Add(syntax.Identifier.ValueText ?? ""))
-                    _diagnostics.Add(new Diagnostic("CS0100", DiagnosticSeverity.Error,
-                        "A parameter name must be unique.", new Location(record.Tree, syntax.Span)));
-                var refKind = GetParameterRefKind(syntax);
-                if (refKind == ParameterRefKind.Out || refKind == ParameterRefKind.Ref && !IsReadOnlyByRefParameter(syntax) || HasModifier(syntax.Modifiers, SyntaxKind.ThisKeyword))
-                    _diagnostics.Add(new Diagnostic("CS0631", DiagnosticSeverity.Error,
-                        "Record parameters cannot have 'ref', 'out', or 'this' modifiers.", new Location(record.Tree, syntax.Span)));
-                if (IsParamsParameter(syntax) && parameters.Count + 1 != list.Parameters.Count)
-                    _diagnostics.Add(new Diagnostic("CS0231", DiagnosticSeverity.Error,
-                        "A params parameter must be the last parameter.", new Location(record.Tree, syntax.Span)));
-                if (syntax.Default is null && seenOptional && !IsParamsParameter(syntax))
-                    _diagnostics.Add(new Diagnostic("CS1737", DiagnosticSeverity.Error,
-                        "Optional parameters must appear after all required parameters.", new Location(record.Tree, syntax.Span)));
-                seenOptional |= syntax.Default is not null;
-                var parameter = new ParameterSymbol(syntax.Identifier.ValueText ?? "", constructor,
-                    new ErrorTypeSymbol("unbound-param", null, ImmutableArray<Location>.Empty),
-                    ImmutableArray.Create(new Location(record.Tree, syntax.Span)),
-                    IsReadOnlyByRefParameter(syntax), GetParameterRefKind(syntax), IsScopedParameter(syntax), IsParamsParameter(syntax));
-                parameters.Add(parameter);
-                RecordDeclared(record.Tree, syntax, parameter);
-            }
-            constructor.SetParameters(parameters.ToImmutable());
-            constructor.AddDeclaration(new SyntaxReference(record.Tree, list));
-            type.AddMember(constructor);
+            SourceMethodSymbol constructor = DeclarePrimaryConstructor(type, record.Tree, list, isRecord: true);
             record.PrimaryConstructor = constructor;
             record.Members.Add((constructor, RecordMemberKind.PrimaryConstructor, null));
-            RecordDeclared(record.Tree, list, constructor);
         }
     }
 }

@@ -106,11 +106,16 @@ public sealed class LSRAOptions
 
 internal sealed class LinearScanRegisterAllocator
 {
+    private const int MaxWeightedLoopDepth = 3;
+
     private readonly LirFunction _function;
     private readonly TargetInfo _target;
     private readonly LSRAOptions _options;
     private readonly Dictionary<LirVirtualRegister, List<LirVirtualRegister>> _copyPreferences = new();
     private readonly List<int> _callPositions = new();
+    private readonly List<int> _blockStarts = new();
+    private readonly List<int> _blockWeights = new();
+    private readonly List<int> _blockRuns = new();
     private readonly Dictionary<int, Dictionary<LirVirtualRegister, MachineRegister>> _callArgumentTargets = new();
     private readonly ClobberTable _instructionClobbers = new();
     private readonly Dictionary<int, ScratchClass> _scratchKills = new();
@@ -122,6 +127,7 @@ internal sealed class LinearScanRegisterAllocator
     private readonly Dictionary<LirVirtualRegister, List<MachineRegister>> _abiPreferences = new();
     private readonly Dictionary<LirVirtualRegister, List<LirVirtualRegister>> _phiWebs = new();
     private readonly IScratchNeeds? _scratchNeeds;
+    private ImmutableArray<MachineRegister> _generalRegisters;
 
     private LinearScanRegisterAllocator(LirFunction function, TargetInfo target, LSRAOptions? options, IScratchNeeds? scratchNeeds)
     {
@@ -138,6 +144,9 @@ internal sealed class LinearScanRegisterAllocator
     private AllocationResult Allocate()
     {
         _callPositions.Clear();
+        _blockStarts.Clear();
+        _blockWeights.Clear();
+        _blockRuns.Clear();
         _callArgumentTargets.Clear();
         _instructionClobbers.Clear();
         _scratchKills.Clear();
@@ -158,12 +167,12 @@ internal sealed class LinearScanRegisterAllocator
                 allocations[interval.Register] = VirtualRegisterAllocation.Spilled(interval.Register, interval.Register.RegisterClass);
         }
 
-        var generalRegisters = _options.GeneralRegisters;
+        _generalRegisters = _options.GeneralRegisters;
         if (HasDynamicStack(_function) && TargetRegisterInfo.FrameBaseRegister(_target) is var frameBase && frameBase != MachineRegister.Invalid)
-            generalRegisters = generalRegisters.Remove(frameBase);
-        AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, generalRegisters, allocations, _copyPreferences, _abiPreferences, _phiWebs, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
-        AllocateClasses(intervals, new[] { LirRegisterClass.Floating }, _options.FloatingRegisters, allocations, _copyPreferences, _abiPreferences, _phiWebs, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
-        AllocateClasses(intervals, new[] { LirRegisterClass.Vector }, _options.VectorRegisters, allocations, _copyPreferences, _abiPreferences, _phiWebs, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions);
+            _generalRegisters = _generalRegisters.Remove(frameBase);
+        AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, _generalRegisters, allocations, _copyPreferences, _abiPreferences, _phiWebs, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions, CheaperInMemory, SpillWeight);
+        AllocateClasses(intervals, new[] { LirRegisterClass.Floating }, _options.FloatingRegisters, allocations, _copyPreferences, _abiPreferences, _phiWebs, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions, CheaperInMemory, SpillWeight);
+        AllocateClasses(intervals, new[] { LirRegisterClass.Vector }, _options.VectorRegisters, allocations, _copyPreferences, _abiPreferences, _phiWebs, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions, CheaperInMemory, SpillWeight);
 
         var scratchOccupants = new Dictionary<MachineRegister, List<(int Start, int End, LiveInterval Interval)>>();
         var managedScratch = _scratchNeeds?.Registers(ScratchClass.All);
@@ -240,6 +249,46 @@ internal sealed class LinearScanRegisterAllocator
         return true;
     }
 
+    // A backward edge in layout order closes a loop, and an edge-split block only carries the edge of its source
+    private static void RecordBlockEdges(
+        LirBlock block,
+        int end,
+        Dictionary<LirBlock, BlockRange> placed,
+        Dictionary<LirBlock, int> loopEnds,
+        Dictionary<LirBlock, int> predecessorCounts)
+    {
+        foreach (var successor in SuccessorsOf(block))
+        {
+            predecessorCounts[successor] = predecessorCounts.GetValueOrDefault(successor) + 1;
+            if (block.IsEdgeSplit)
+                continue;
+            var target = successor.IsEdgeSplit && successor.Instructions.Length != 0 && successor.Instructions[^1].Kind == LirInstructionKind.Jump
+                ? successor.Instructions[^1].Target
+                : successor;
+            if (target is not null && (ReferenceEquals(target, block) || placed.ContainsKey(target)))
+                loopEnds[target] = end;
+        }
+    }
+
+    private int BlockWeight(LirBlock block, BlockRange range, int loopDepth, Dictionary<LirBlock, BlockRange> placed)
+    {
+        // Edge-split blocks may sit far from both ends of their edge, so their place says nothing about their loop
+        if (block.IsEdgeSplit && block.Instructions.Length != 0 && block.Instructions[^1] is { Kind: LirInstructionKind.Jump, Target: { } target } &&
+            placed.TryGetValue(target, out var targetRange) && targetRange.Start < range.Start)
+            return WeightAt(targetRange.Start);
+
+        return 1 << 3 * Math.Min(loopDepth, MaxWeightedLoopDepth);
+    }
+
+    private int BlockIndexAt(int position)
+    {
+        var index = _blockStarts.BinarySearch(position);
+        return index >= 0 ? index : ~index - 1;
+    }
+
+    private int WeightAt(int position)
+        => _blockWeights[BlockIndexAt(position)];
+
     private Dictionary<LirVirtualRegister, LiveInterval> BuildIntervals()
     {
         var intervals = new Dictionary<LirVirtualRegister, LiveInterval>();
@@ -251,6 +300,8 @@ internal sealed class LinearScanRegisterAllocator
         var blockFirstDefs = new Dictionary<LirBlock, Dictionary<LirVirtualRegister, int>>();
         var liveIn = new Dictionary<LirBlock, HashSet<LirVirtualRegister>>();
         var liveOut = new Dictionary<LirBlock, HashSet<LirVirtualRegister>>();
+        var loopEnds = new Dictionary<LirBlock, int>();
+        var predecessorCounts = new Dictionary<LirBlock, int>();
         var position = 0;
 
         foreach (var block in _function.Blocks)
@@ -319,6 +370,7 @@ internal sealed class LinearScanRegisterAllocator
                 previous = instruction;
             }
 
+            RecordBlockEdges(block, position, blockRanges, loopEnds, predecessorCounts);
             blockRanges.Add(block, new BlockRange(start, position));
             blockUses.Add(block, uses);
             blockDefs.Add(block, defs);
@@ -331,10 +383,28 @@ internal sealed class LinearScanRegisterAllocator
 
         ComputeBlockLiveness(blockUses, blockDefs, liveIn, liveOut);
 
+        var loopDepth = 0;
+        var loopClosings = new Dictionary<int, int>();
+        LirBlock? previousBlock = null;
         foreach (var block in _function.Blocks)
         {
             if (!blockRanges.TryGetValue(block, out var range))
                 continue;
+
+            if (loopClosings.Remove(range.Start, out var closedLoops))
+                loopDepth -= closedLoops;
+            if (loopEnds.TryGetValue(block, out var loopEnd))
+            {
+                loopDepth++;
+                loopClosings[loopEnd] = loopClosings.GetValueOrDefault(loopEnd) + 1;
+            }
+            _blockRuns.Add(previousBlock is not null && predecessorCounts.GetValueOrDefault(block) == 1 &&
+                previousBlock.Instructions.Length != 0 && previousBlock.Instructions[^1] is { Kind: LirInstructionKind.Jump } jump && ReferenceEquals(jump.Target, block)
+                ? _blockRuns[^1]
+                : _blockRuns.Count);
+            _blockStarts.Add(range.Start);
+            _blockWeights.Add(BlockWeight(block, range, loopDepth, blockRanges));
+            previousBlock = block;
 
             var registers = new HashSet<LirVirtualRegister>(liveIn[block]);
             registers.UnionWith(liveOut[block]);
@@ -506,7 +576,7 @@ internal sealed class LinearScanRegisterAllocator
                 clobbers.Add(TargetRegisterInfo.X86DataRegister(_target));
                 clobbers.Add(TargetRegisterInfo.X86CounterRegister(_target));
             }
-            else if (instruction.Operator is "<<" or ">>" &&
+            else if (instruction.Operator is "<<" or ">>" or "rotl" or "rotr" &&
                      instruction.Operands.Length == 2 &&
                      instruction.Operands[1].Kind != LirOperandKind.Immediate)
             {
@@ -768,9 +838,9 @@ internal sealed class LinearScanRegisterAllocator
 
         foreach (var clobber in asmStatement.Clobbers)
         {
-            if (string.Equals(clobber, "memory", StringComparison.Ordinal) ||
-                string.Equals(clobber, "cc", StringComparison.Ordinal) ||
-                string.Equals(clobber, "redzone", StringComparison.Ordinal))
+            if (clobber == "memory" ||
+                clobber == "cc" ||
+                clobber == "redzone")
             {
                 continue;
             }
@@ -1067,7 +1137,7 @@ internal sealed class LinearScanRegisterAllocator
 
             case LirInstructionKind.Binary:
                 return instruction.Operands.Length == 2 &&
-                    instruction.Operator is "+" or "-" or "*" or "&" or "|" or "^" or "<<" or ">>";
+                    instruction.Operator is "+" or "-" or "*" or "&" or "|" or "^" or "<<" or ">>" or "rotl" or "rotr";
 
             default:
                 return false;
@@ -1245,7 +1315,9 @@ internal sealed class LinearScanRegisterAllocator
         IReadOnlyDictionary<int, Dictionary<LirVirtualRegister, MachineRegister>> callArgumentTargets,
         ClobberTable instructionClobbers,
         IReadOnlyList<InlineAssemblySite> inlineAssemblySites,
-        IReadOnlyDictionary<MachineRegister, int> incomingRegisterReleasePositions)
+        IReadOnlyDictionary<MachineRegister, int> incomingRegisterReleasePositions,
+        Func<LiveInterval, bool> cheaperInMemory,
+        Func<LiveInterval, long> spillWeight)
     {
         if (physicalRegisters.IsDefaultOrEmpty)
             return;
@@ -1277,7 +1349,12 @@ internal sealed class LinearScanRegisterAllocator
             var reg = PreferredFreeRegister(interval, allowedRegisters, active, allocations, copyPreferences, abiPreferences, phiWebs, valueNumberPreferredRegisters, target, CrossesCalls(interval.Register), CrossesCalls);
             if (reg == MachineRegister.Invalid)
             {
-                SpillAtInterval(interval, active, allocations, valueNumberPreferredRegisters, allowedRegisters);
+                SpillAtInterval(interval, active, allocations, valueNumberPreferredRegisters, allowedRegisters, spillWeight);
+            }
+            else if (!interval.Register.HasFixedRegister && !TargetRegisterInfo.IsCalleeSaved(target, reg) &&
+                     CrossesCalls(interval.Register) && cheaperInMemory(interval))
+            {
+                allocations[interval.Register] = VirtualRegisterAllocation.Spilled(interval.Register, interval.Register.RegisterClass);
             }
             else
             {
@@ -1287,6 +1364,54 @@ internal sealed class LinearScanRegisterAllocator
                 InsertActive(active, interval);
             }
         }
+    }
+
+    private int MemoryCost(LiveInterval interval)
+    {
+        var cost = 0;
+        foreach (var position in interval.UsePositions)
+            cost += WeightAt(position);
+        foreach (var position in interval.DefinitionPositions)
+            cost += WeightAt(position);
+        return cost;
+    }
+
+    // What leaving a register would cost per position it stops occupying, the constant keeps the shortest values from being untouchable
+    private long SpillWeight(LiveInterval interval)
+    {
+        if (interval.SpillWeight < 0)
+        {
+            var length = 0;
+            foreach (var range in interval.Ranges)
+                length += range.End - range.Start;
+            interval.SpillWeight = MemoryCost(interval) * 1024L / (length + 16);
+        }
+
+        return interval.SpillWeight;
+    }
+
+    // In a caller-saved register a value pays a save and a restore at each call it spans, in memory an access at each reference
+    private bool CheaperInMemory(LiveInterval interval)
+    {
+        var memoryCost = MemoryCost(interval);
+        var preservationCost = 0;
+        var previous = -1;
+        foreach (var position in _callPositions)
+        {
+            if (position < interval.Start)
+                continue;
+            if (position >= interval.End)
+                break;
+            if (!interval.IsLiveAcross(position))
+                continue;
+            if (previous < 0 || !SharesCallPreservation(interval, previous, position))
+                preservationCost += 2 * WeightAt(position);
+            if (preservationCost >= memoryCost)
+                return true;
+            previous = position;
+        }
+
+        return false;
     }
 
     private static ImmutableArray<MachineRegister> AllowedRegistersForInterval(
@@ -1770,10 +1895,12 @@ internal sealed class LinearScanRegisterAllocator
         List<LiveInterval> active,
         Dictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
         Dictionary<ValueNumber, MachineRegister> valueNumberPreferredRegisters,
-        ImmutableArray<MachineRegister> allowedRegisters)
+        ImmutableArray<MachineRegister> allowedRegisters,
+        Func<LiveInterval, long> weightOf)
     {
         List<LiveInterval>? spill = null;
         var spillRegister = MachineRegister.Invalid;
+        var spillWeight = 0L;
         var spillNextUse = -1;
         var spillEnd = -1;
         foreach (var register in allowedRegisters)
@@ -1783,6 +1910,7 @@ internal sealed class LinearScanRegisterAllocator
 
             var conflicts = new List<LiveInterval>();
             var hasFixedConflict = false;
+            var weight = 0L;
             var nearestNextUse = int.MaxValue;
             var farthestEnd = -1;
             foreach (var candidate in active)
@@ -1796,6 +1924,7 @@ internal sealed class LinearScanRegisterAllocator
                 }
 
                 conflicts.Add(candidate);
+                weight += weightOf(candidate);
                 nearestNextUse = Math.Min(nearestNextUse, candidate.NextUseAtOrAfter(current.Start));
                 farthestEnd = Math.Max(farthestEnd, candidate.End);
             }
@@ -1804,12 +1933,14 @@ internal sealed class LinearScanRegisterAllocator
                 continue;
 
             if (spill is null ||
-                nearestNextUse > spillNextUse ||
-                nearestNextUse == spillNextUse && conflicts.Count < spill.Count ||
-                nearestNextUse == spillNextUse && conflicts.Count == spill.Count && farthestEnd > spillEnd)
+                weight < spillWeight ||
+                weight == spillWeight && (nearestNextUse > spillNextUse ||
+                    nearestNextUse == spillNextUse && conflicts.Count < spill.Count ||
+                    nearestNextUse == spillNextUse && conflicts.Count == spill.Count && farthestEnd > spillEnd))
             {
                 spill = conflicts;
                 spillRegister = register;
+                spillWeight = weight;
                 spillNextUse = nearestNextUse;
                 spillEnd = farthestEnd;
             }
@@ -1823,10 +1954,11 @@ internal sealed class LinearScanRegisterAllocator
             return;
         }
 
+        var currentWeight = weightOf(current);
         var currentNextUse = current.NextUseAtOrAfter(current.Start);
         if (current.Register.HasFixedRegister ||
-            spillNextUse > currentNextUse ||
-            spillNextUse == currentNextUse && spillEnd > current.End)
+            spillWeight < currentWeight ||
+            spillWeight == currentWeight && (spillNextUse > currentNextUse || spillNextUse == currentNextUse && spillEnd > current.End))
         {
             current.PhysicalRegister = spillRegister;
             allocations[current.Register] = VirtualRegisterAllocation.InRegister(current.Register, current.PhysicalRegister);
@@ -1888,6 +2020,8 @@ internal sealed class LinearScanRegisterAllocator
             return result;
         }
 
+        var previousPosition = -1;
+        ImmutableArray<CallPreservation>.Builder? previous = null;
         foreach (var position in _callPositions)
         {
             var occupied = new HashSet<MachineRegister>();
@@ -1915,6 +2049,10 @@ internal sealed class LinearScanRegisterAllocator
                 if (!intervals.TryGetValue(pair.Key, out var interval) || !interval.IsLiveAcross(position))
                     continue;
 
+                if (previous is not null && SharesCallPreservation(interval, previousPosition, position) &&
+                    TryContinuePreservation(pair.Key, previous, builder, previousPosition, position, occupied, intervals, allocations))
+                    continue;
+
                 var preservationRegister = FindCallPreservationRegister(interval, occupied);
                 if (preservationRegister != MachineRegister.Invalid)
                 {
@@ -1929,20 +2067,90 @@ internal sealed class LinearScanRegisterAllocator
                 }
             }
 
-            if (builder.Count != 0)
-                result[position] = builder.ToImmutable();
+            if (previous is { Count: not 0 })
+                result[previousPosition] = previous.ToImmutable();
+            previous = builder;
+            previousPosition = position;
         }
+
+        if (previous is { Count: not 0 })
+            result[previousPosition] = previous.ToImmutable();
 
         preservationRegisters = usedPreservationRegisters.ToImmutable();
         stackPreservedRegisters = stackPreserved.ToImmutable();
         return result;
     }
 
+    // With no reference between two calls of a straight run of blocks the value can stay where the first call left it
+    private bool SharesCallPreservation(LiveInterval interval, int first, int second)
+        => _blockRuns[BlockIndexAt(first)] == _blockRuns[BlockIndexAt(second)] && !interval.IsReferencedBetween(first, second);
+
+    private bool TryContinuePreservation(
+        LirVirtualRegister register,
+        ImmutableArray<CallPreservation>.Builder previous,
+        ImmutableArray<CallPreservation>.Builder current,
+        int previousPosition,
+        int position,
+        HashSet<MachineRegister> occupied,
+        IReadOnlyDictionary<LirVirtualRegister, LiveInterval> intervals,
+        IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations)
+    {
+        for (var i = 0; i < previous.Count; i++)
+        {
+            var preservation = previous[i];
+            if (!ReferenceEquals(preservation.Register, register))
+                continue;
+
+            if (preservation.UsesRegister)
+            {
+                if (occupied.Contains(preservation.PreservationRegister) ||
+                    !IsRegisterIdleBetween(preservation.PreservationRegister, previousPosition, position, intervals, allocations))
+                    return false;
+                occupied.Add(preservation.PreservationRegister);
+            }
+
+            previous[i] = preservation.WithoutRestore();
+            current.Add(preservation.WithoutSave());
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool IsRegisterIdleBetween(
+        MachineRegister register,
+        int first,
+        int last,
+        IReadOnlyDictionary<LirVirtualRegister, LiveInterval> intervals,
+        IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations)
+    {
+        for (var position = first + 2; position < last; position += 2)
+        {
+            if (_instructionClobbers.Clobbers(position, register))
+                return false;
+        }
+
+        foreach (var site in _inlineAssemblySites)
+        {
+            if (site.Position > first && site.Position < last && (site.TouchedRegisters.Contains(register) || site.ReservedRegisters.Contains(register)))
+                return false;
+        }
+
+        foreach (var pair in allocations)
+        {
+            if (!pair.Value.IsSpilled && pair.Value.PhysicalRegister == register &&
+                intervals.TryGetValue(pair.Key, out var interval) && interval.OverlapsSpan(first, last))
+                return false;
+        }
+
+        return true;
+    }
+
     private MachineRegister FindCallPreservationRegister(LiveInterval interval, HashSet<MachineRegister> occupied)
     {
         var registers = interval.Register.RegisterClass switch
         {
-            LirRegisterClass.General or LirRegisterClass.Address => _options.GeneralRegisters,
+            LirRegisterClass.General or LirRegisterClass.Address => _generalRegisters,
             LirRegisterClass.Floating => _options.FloatingRegisters,
             LirRegisterClass.Vector => _options.VectorRegisters,
             _ => ImmutableArray<MachineRegister>.Empty,
@@ -2719,7 +2927,10 @@ internal sealed class LinearScanRegisterAllocator
         public int End { get; set; }
         public MachineRegister PhysicalRegister { get; set; }
         public int RegisterCount { get; set; } = 1;
+        public long SpillWeight { get; set; } = -1;
         public IReadOnlyList<LiveRange> Ranges => _ranges;
+        public List<int> UsePositions => _usePositions;
+        public List<int> DefinitionPositions => _definitionPositions;
 
         /// <summary>Tests whether the assignment of this interval covers a physical register</summary>
         public bool Occupies(MachineRegister register)
@@ -2837,6 +3048,31 @@ internal sealed class LinearScanRegisterAllocator
 
         public bool HasDefinitionAtPosition(int position)
             => HasDefinitionAt(position);
+
+        /// <summary>Tests for a use after the first call up to the second one, or a definition up to the second call's result</summary>
+        public bool IsReferencedBetween(int firstCall, int secondCall)
+            => HasPositionIn(_usePositions, firstCall + 1, secondCall) || HasPositionIn(_definitionPositions, firstCall + 1, secondCall + 1);
+
+        private static bool HasPositionIn(List<int> positions, int low, int high)
+        {
+            var index = positions.BinarySearch(low);
+            if (index < 0)
+                index = ~index;
+            return index < positions.Count && positions[index] <= high;
+        }
+
+        public bool OverlapsSpan(int start, int end)
+        {
+            foreach (var range in _ranges)
+            {
+                if (range.Start > end)
+                    return false;
+                if (start < range.End)
+                    return true;
+            }
+
+            return false;
+        }
 
         private bool HasDefinitionAt(int position)
         {
@@ -3039,8 +3275,6 @@ internal sealed class AllocationResult
     public StackFrameMap Frame { get; }
     public IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> Allocations => _allocations;
 
-    public ImmutableArray<MachineRegister> UsedPhysicalRegisters { get; }
-
     public AllocationResult(
         LirFunction function,
         IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
@@ -3055,13 +3289,6 @@ internal sealed class AllocationResult
         _callPreservations = callPreservations ?? ImmutableDictionary<int, ImmutableArray<CallPreservation>>.Empty;
         _scratchKills = scratchKills ?? ImmutableDictionary<int, ScratchClass>.Empty;
         Frame = frame ?? throw new ArgumentNullException(nameof(frame));
-        UsedPhysicalRegisters = allocations.Values
-            .Where(static a => !a.IsSpilled && a.PhysicalRegister != MachineRegister.Invalid)
-            .Select(static a => a.PhysicalRegister)
-            .Concat(_callPreservations.Values.SelectMany(static p => p).Where(static p => p.UsesRegister).Select(static p => p.PreservationRegister))
-            .Distinct()
-            .OrderBy(static r => (int)r)
-            .ToImmutableArray();
     }
 
     public VirtualRegisterAllocation this[LirVirtualRegister register]
@@ -3287,18 +3514,24 @@ internal readonly struct CallPreservation
     public MachineRegister PhysicalRegister { get; }
     public MachineRegister PreservationRegister { get; }
     public int StackOffset { get; }
+    public bool NeedsSave { get; }
+    public bool NeedsRestore { get; }
     public bool UsesRegister => PreservationRegister != MachineRegister.Invalid;
 
     private CallPreservation(
         LirVirtualRegister register,
         MachineRegister physicalRegister,
         MachineRegister preservationRegister,
-        int stackOffset)
+        int stackOffset,
+        bool needsSave = true,
+        bool needsRestore = true)
     {
         Register = register ?? throw new ArgumentNullException(nameof(register));
         PhysicalRegister = physicalRegister;
         PreservationRegister = preservationRegister;
         StackOffset = stackOffset;
+        NeedsSave = needsSave;
+        NeedsRestore = needsRestore;
     }
 
     public static CallPreservation InRegister(
@@ -3311,7 +3544,13 @@ internal readonly struct CallPreservation
         => new CallPreservation(register, physicalRegister, MachineRegister.Invalid, -1);
 
     public CallPreservation WithStackOffset(int stackOffset)
-        => new CallPreservation(Register, PhysicalRegister, PreservationRegister, stackOffset);
+        => new CallPreservation(Register, PhysicalRegister, PreservationRegister, stackOffset, NeedsSave, NeedsRestore);
+
+    public CallPreservation WithoutSave()
+        => new CallPreservation(Register, PhysicalRegister, PreservationRegister, StackOffset, needsSave: false, NeedsRestore);
+
+    public CallPreservation WithoutRestore()
+        => new CallPreservation(Register, PhysicalRegister, PreservationRegister, StackOffset, NeedsSave, needsRestore: false);
 }
 
 internal sealed class VirtualRegisterAllocation

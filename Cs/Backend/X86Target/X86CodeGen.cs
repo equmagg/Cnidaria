@@ -184,6 +184,7 @@ namespace Cnidaria.Cs
                 EmitUnboxingStubs();
                 EmitVirtualDispatchFailureStub();
                 EmitCollectHelper();
+                EmitFinalizerDrainThunk();
                 RuntimeMetadataLabels metadata = EmitRuntimeMetadata();
                 string entry = _methodLabels[entryMethod.RuntimeMethod.MethodId];
                 if (_options.EmitStartup)
@@ -1241,6 +1242,31 @@ namespace Cnidaria.Cs
                 AddHelperSymbol(label, start);
             }
 
+            // The runtime calls this like a funclet
+            private void EmitFinalizerDrainThunk()
+            {
+                const string label = RuntimeGcImports.FinalizerDrainSymbol;
+                string? target = null;
+                foreach (GenTreeMethod method in _program.Methods)
+                {
+                    if (RuntimeGcImports.IsFinalizerDrain(method.RuntimeMethod))
+                        target = _methodLabels[method.RuntimeMethod.MethodId];
+                }
+
+                if (target is null || _machineTarget.Is32Bit)
+                {
+                    EmitFailFastHelper(label);
+                    return;
+                }
+
+                if (!_usedLabels.Add(label))
+                    throw new InvalidOperationException($"Duplicate x86 runtime helper symbol: {label}.");
+                int start = _text.ByteLength;
+                DefineLabel(label);
+                Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(target, 4, X86ObjectRelocationKind.Relative32)));
+                AddHelperSymbol(label, start);
+            }
+
             public string ResolveExternalObject(string label)
             {
                 if (string.IsNullOrWhiteSpace(label))
@@ -1445,6 +1471,16 @@ namespace Cnidaria.Cs
                 }
 
                 TypeDescriptorDraft[] descriptors = _typeDescriptors.Values.OrderBy(static d => d.Type.TypeId).ToArray();
+                if (typeSystem is not null)
+                {
+                    Dictionary<int, List<RuntimeType>> variantTargets = typeSystem.CollectVariantCastTargets(Array.ConvertAll(descriptors, static d => d.Type));
+                    foreach (TypeDescriptorDraft descriptor in descriptors)
+                    {
+                        if (variantTargets.TryGetValue(descriptor.Type.TypeId, out List<RuntimeType>? targets))
+                            descriptor.VariantCastTargets = targets.ToImmutableArray();
+                    }
+                }
+
                 for (int i = 0; i < descriptors.Length; i++)
                 {
                     TypeDescriptorDraft descriptor = descriptors[i];
@@ -2014,16 +2050,17 @@ namespace Cnidaria.Cs
                         }
                     }
 
-                    if (descriptor.Interfaces.Length != 0)
+                    ImmutableArray<RuntimeType> castTargets = descriptor.Interfaces.AddRange(descriptor.VariantCastTargets);
+                    if (castTargets.Length != 0)
                     {
                         descriptor.InterfacesLabel = CreateLocalLabel(descriptor.Label + "_interfaces");
                         int offset = _rodata.Align(_target.PointerSize);
                         AddDataSymbol(
                             descriptor.InterfacesLabel,
                             offset,
-                            checked((descriptor.Interfaces.Length + 1) * _target.PointerSize));
-                        for (int f = 0; f < descriptor.Interfaces.Length; f++)
-                            _rodata.EmitPointerRelocation(GetTypeDescriptorLabel(descriptor.Interfaces[f]));
+                            checked((castTargets.Length + 1) * _target.PointerSize));
+                        for (int f = 0; f < castTargets.Length; f++)
+                            _rodata.EmitPointerRelocation(GetTypeDescriptorLabel(castTargets[f]));
                         _rodata.EmitPointer(0);
                     }
 
@@ -2077,7 +2114,8 @@ namespace Cnidaria.Cs
                     else
                         _rodata.EmitPointerRelocation(infoLabel);
                     int offset = _rodata.ByteLength;
-                    AddDataSymbol(descriptor.Label, offset, checked(16 + _target.PointerSize * 3));
+                    RuntimeMethod? finalizer = _program.TypeSystem?.GetFinalizer(type);
+                    AddDataSymbol(descriptor.Label, offset, checked(16 + _target.PointerSize * (finalizer is null ? 3 : 4)));
                     _rodata.EmitUInt32(flags);
                     _rodata.EmitUInt32(checked((uint)baseSize));
                     if (descriptor.RelatedTypeLabel is null)
@@ -2095,6 +2133,8 @@ namespace Cnidaria.Cs
                         _rodata.EmitPointer(0);
                     else
                         _rodata.EmitPointerRelocation(descriptor.VTableLabel);
+                    if (finalizer is not null)
+                        _rodata.EmitPointerRelocation(GetVirtualDispatchTargetLabel(finalizer));
                 }
 
                 for (int i = 0; i < _interfaceDispatchCells.Count; i++)
@@ -2255,7 +2295,7 @@ namespace Cnidaria.Cs
                 return 0;
             }
 
-            private static uint ComputeMethodTableFlags(TypeDescriptorDraft descriptor, int componentSize)
+            private uint ComputeMethodTableFlags(TypeDescriptorDraft descriptor, int componentSize)
             {
                 const uint parameterizedKind = 0x00020000u;
                 const uint hasPointers = 0x01000000u;
@@ -2270,6 +2310,10 @@ namespace Cnidaria.Cs
                     flags |= hasPointers;
                 if (componentSize != 0)
                     flags |= hasComponentSize | checked((uint)(ushort)componentSize);
+                if (_program.TypeSystem?.HasFinalizer(type) == true)
+                    flags |= RuntimeMethodTables.HasFinalizerFlag;
+                if (_program.TypeSystem?.HasGenericVariance(type) == true)
+                    flags |= RuntimeMethodTables.GenericVarianceFlag;
                 return flags;
             }
 
@@ -2988,7 +3032,7 @@ namespace Cnidaria.Cs
                             RuntimeMethod? method = node.Method;
                             if (method is null)
                                 return true;
-                            if (method.HasInternalCall != true || X86Runtime.IsGcSafePointInternalCall(method))
+                            if ((method.HasInternalCall != true && method.DllImportData?.SuppressGCTransition != true) || X86Runtime.IsGcSafePointInternalCall(method))
                                 return true;
                         }
                     }
@@ -5055,6 +5099,8 @@ namespace Cnidaria.Cs
                 {
                     const int methodTableRelatedTypeOffset = 8;
                     int methodTableInterfaceMapOffset = checked(16 + Target.PointerSize);
+                    const int elementTypeFirstInteger = 0x04;
+                    const int elementTypeLastInteger = 0x0d;
                     const int elementTypeClass = 0x14;
                     const int elementTypeInterface = 0x15;
                     const int elementTypeSystemArray = 0x16;
@@ -5068,6 +5114,7 @@ namespace Cnidaria.Cs
                     string targetSzArray = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_target_szarray");
                     string targetMdArray = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_target_mdarray");
                     string arrayElements = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_array_elements");
+                    string referenceElements = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_reference_elements");
                     string sourceBase = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_source_base");
                     string interfaceLoop = _owner.CreateLocalLabel($"{_methodLabel}_type_assignability_interface_loop");
 
@@ -5101,7 +5148,13 @@ namespace Cnidaria.Cs
                         X86Operand.SymbolOperand(targetMdArray, 4, X86ObjectRelocationKind.Relative32)));
                     EmitJump(failure);
 
+                    // The instances a variant delegate converts from list it the way types list their interfaces
                     _owner.DefineLabel(targetClass);
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.R11, 4), Mem(X86Register.Rax, 0, 4)));
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(X86Register.R11, 4), Imm((long)RuntimeMethodTables.GenericVarianceFlag)));
+                    _owner.Emit(X86Instruction.ConditionalBranch(
+                        X86Condition.Ne,
+                        X86Operand.SymbolOperand(targetInterface, 4, X86ObjectRelocationKind.Relative32)));
                     _owner.Emit(X86Instruction.Binary(
                         X86InstrKind.Mov,
                         Reg(X86Register.R11, 8),
@@ -5165,6 +5218,24 @@ namespace Cnidaria.Cs
                     _owner.Emit(X86Instruction.ConditionalBranch(
                         X86Condition.E,
                         X86Operand.SymbolOperand(success, 4, X86ObjectRelocationKind.Relative32)));
+                    // Integer elements of one size convert, from sbyte up the signed and unsigned element types alternate
+                    EmitMethodTableElementType(X86Register.R11, X86Register.Rax);
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(X86Register.R11, 4), Imm(elementTypeFirstInteger)));
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.R11, 4), Imm(elementTypeLastInteger - elementTypeFirstInteger)));
+                    _owner.Emit(X86Instruction.ConditionalBranch(
+                        X86Condition.A,
+                        X86Operand.SymbolOperand(referenceElements, 4, X86ObjectRelocationKind.Relative32)));
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(X86Register.R11, 4), Imm(1)));
+                    EmitMethodTableElementType(X86Register.R10, X86Register.R10);
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(X86Register.R10, 4), Imm(elementTypeFirstInteger)));
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(X86Register.R10, 4), Imm(1)));
+                    _owner.Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.R10, 4), Reg(X86Register.R11, 4)));
+                    _owner.Emit(X86Instruction.ConditionalBranch(
+                        X86Condition.E,
+                        X86Operand.SymbolOperand(success, 4, X86ObjectRelocationKind.Relative32)));
+                    EmitJump(failure);
+
+                    _owner.DefineLabel(referenceElements);
                     EmitMethodTableElementType(X86Register.R11, X86Register.Rax);
                     _owner.Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(X86Register.R11, 4), Imm(elementTypeClass)));
                     _owner.Emit(X86Instruction.Binary(
@@ -5334,6 +5405,12 @@ namespace Cnidaria.Cs
                         case RuntimeIntrinsicId.InterlockedExchange:
                             EmitInterlockedExchange(node, intrinsic.Exchange);
                             return;
+                        case RuntimeIntrinsicId.InterlockedOr:
+                            EmitInterlockedBitwise(node, intrinsic.Bitwise, X86InstrKind.Or);
+                            return;
+                        case RuntimeIntrinsicId.InterlockedAnd:
+                            EmitInterlockedBitwise(node, intrinsic.Bitwise, X86InstrKind.And);
+                            return;
                         case RuntimeIntrinsicId.MemoryBarrier:
                             _owner.Emit(new X86Instruction(X86InstrKind.Mfence));
                             return;
@@ -5372,6 +5449,11 @@ namespace Cnidaria.Cs
                             _owner.EmitCall(_owner.ResolveMethodLabel(method));
                             return;
                         }
+                    }
+                    else if (method.DllImportData?.SuppressGCTransition == true)
+                    {
+                        _owner.EmitCall(_owner.ResolveMethodLabel(method));
+                        return;
                     }
 
                     SafePointDraft safePoint = PrepareSafePoint(node);
@@ -5490,6 +5572,51 @@ namespace Cnidaria.Cs
                             Reg(X86Register.Rax, 4),
                             Reg(X86Register.Rax, intrinsic.Size)));
                     }
+                }
+
+                // Only a discarded result can use the locked instruction directly
+                private void EmitInterlockedBitwise(GenTree node, InterlockedBitwiseIntrinsic intrinsic, X86InstrKind operation)
+                {
+                    if (node.Uses.Length != 2 || !node.Uses[0].IsRegister || !node.Uses[1].IsRegister)
+                        throw Unsupported(node, "Interlocked.Or and Interlocked.And require two scalar ABI register operands");
+
+                    X86Register location = ToX86Register(node.Uses[0].Register, Target);
+                    X86Register value = ToX86Register(node.Uses[1].Register, Target);
+                    if ((node.Flags & GenTreeFlags.NullCheckEliminated) == 0)
+                        EmitNullCheck(node, location, "interlocked_bitwise");
+
+                    if (node.Results.Length == 0)
+                    {
+                        _owner.Emit(X86Instruction.Raw(new byte[] { 0xF0 }));
+                        _owner.Emit(X86Instruction.Binary(
+                            operation,
+                            Mem(location, 0, intrinsic.Size),
+                            Reg(value, intrinsic.Size)));
+                        return;
+                    }
+
+                    string retry = _owner.CreateLocalLabel($"{_methodLabel}_interlocked_bitwise_retry_{node.LinearId}");
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Mov,
+                        Reg(X86Register.Rax, intrinsic.Size),
+                        Mem(location, 0, intrinsic.Size)));
+                    _owner.DefineLabel(retry);
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Mov,
+                        Reg(X86Register.R11, intrinsic.Size),
+                        Reg(X86Register.Rax, intrinsic.Size)));
+                    _owner.Emit(X86Instruction.Binary(
+                        operation,
+                        Reg(X86Register.R11, intrinsic.Size),
+                        Reg(value, intrinsic.Size)));
+                    _owner.Emit(X86Instruction.Raw(new byte[] { 0xF0 }));
+                    _owner.Emit(X86Instruction.Binary(
+                        X86InstrKind.Cmpxchg,
+                        Mem(location, 0, intrinsic.Size),
+                        Reg(X86Register.R11, intrinsic.Size)));
+                    _owner.Emit(X86Instruction.ConditionalBranch(
+                        X86Condition.Ne,
+                        X86Operand.SymbolOperand(retry, 4, X86ObjectRelocationKind.Relative32)));
                 }
 
                 private void EmitI386InterlockedCompareExchange64(GenTree node)
@@ -5733,7 +5860,8 @@ namespace Cnidaria.Cs
 
                     SafePointDraft safePoint = PrepareSafePoint(node);
                     _owner.EmitLea(RuntimeArgumentRegister(0), _owner.GetTypeDescriptorLabel(objectType));
-                    _owner.EmitCall(_owner.ResolveExternalFunction(X86Runtime.NewFastSymbol));
+                    _owner.EmitCall(_owner.ResolveExternalFunction(
+                        _owner._program.TypeSystem?.HasFinalizer(objectType) == true ? X86Runtime.NewFinalizableSymbol : X86Runtime.NewFastSymbol));
                     _owner.DefineLabel(safePoint.ReturnLabel);
                     MoveAllocationResult(node);
                 }
@@ -6436,19 +6564,7 @@ namespace Cnidaria.Cs
                     _owner.Emit(X86Instruction.ConditionalBranch(
                         X86Condition.E,
                         X86Operand.SymbolOperand(typesMatch, 4, X86ObjectRelocationKind.Relative32)));
-                    if (remove)
-                    {
-                        _owner.Emit(X86Instruction.Binary(
-                            X86InstrKind.Mov,
-                            Reg(X86Register.Rax, Target.PointerSize),
-                            Mem(X86Register.Rbp, TypeOperationScratchOffset, Target.PointerSize)));
-                        StoreDelegatePointerResult(node, X86Register.Rax);
-                        EmitJump(done);
-                    }
-                    else
-                    {
-                        EmitManagedExceptionThrow(node, "ArgumentException");
-                    }
+                    EmitManagedExceptionThrow(node, "ArgumentException");
 
                     _owner.DefineLabel(typesMatch);
                     _owner.Emit(X86Instruction.Binary(
@@ -9916,6 +10032,7 @@ namespace Cnidaria.Cs
                 public RuntimeType Type { get; }
                 public string Label { get; }
                 public ImmutableArray<RuntimeType> Interfaces { get; }
+                public ImmutableArray<RuntimeType> VariantCastTargets { get; set; } = ImmutableArray<RuntimeType>.Empty;
                 public ImmutableArray<TypeGcFieldDraft> Fields { get; set; }
                 public ImmutableArray<TypeGcFieldDraft> ComponentFields { get; set; }
                 public string? RelatedTypeLabel { get; set; }

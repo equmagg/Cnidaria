@@ -209,7 +209,45 @@ namespace Cnidaria.Cs
     public sealed class DiagnosticBag
     {
         private readonly List<Diagnostic> _items = new();
-        public void Add(Diagnostic d) => _items.Add(d);
+        public void Add(Diagnostic d)
+        {
+            if (d.Severity != DiagnosticSeverity.Warning || !IsDisabled(d))
+                _items.Add(d);
+        }
+
+        // NoWarn holds for the whole tree, otherwise the last directive before the warning that names it decides
+        private static bool IsDisabled(Diagnostic warning)
+        {
+            if (warning.Location.SyntaxTree is not SyntaxTree tree)
+                return false;
+
+            string? csharpId = CSharpWarningId(warning.Id);
+            if (csharpId is not null && tree.NoWarn.Contains(csharpId))
+                return true;
+
+            bool disabled = false;
+            foreach (PragmaWarningDirective directive in tree.Root.PragmaWarnings)
+            {
+                if (directive.Position > warning.Location.Span.Start)
+                    break;
+                if (directive.Ids.IsEmpty || directive.Ids.Contains(warning.Id) || (csharpId is not null && directive.Ids.Contains(csharpId)))
+                    disabled = directive.IsDisable;
+            }
+
+            return disabled;
+        }
+
+        private static string? CSharpWarningId(string id) => id switch
+        {
+            "CN_PTRTYPE001" or "CN_ADDR002" => "CS8500",
+            "CN_EXTERN000" => "CS0626",
+            "CN_FIELD9258" => "CS9258",
+            "CN_FNPTR_CMP001" => "CS8909",
+            "CN_FNPTR_CALL005" => "CS9191",
+            "CN_FNPTR_CALL006" => "CS9192",
+            "CN_GENCONSTR_NOTNULL" => "CS8714",
+            _ => null,
+        };
         public void AddRange(DiagnosticBag other) => _items.AddRange(other._items);
         public ImmutableArray<Diagnostic> ToImmutable() => _items.ToImmutableArray();
         public bool IsEmpty => _items.Count == 0;
@@ -220,6 +258,7 @@ namespace Cnidaria.Cs
         public CompilationUnitSyntax Root { get; }
         public string FilePath { get; }
         public string Text { get; }
+        internal ImmutableArray<string> NoWarn { get; set; } = ImmutableArray<string>.Empty;
 
         public SyntaxTree(CompilationUnitSyntax root, string filePath, string text)
         {
@@ -428,6 +467,10 @@ namespace Cnidaria.Cs
         private NamedTypeSymbol GetOrCreateNamedType(
             NamedTypeSymbol definition, NamedTypeSymbol? containingTypeOpt, ImmutableArray<TypeSymbol> typeArguments)
         {
+            // The declared container substitutes nothing, the same type must not get a second instance through it
+            if (ReferenceEquals(containingTypeOpt, definition.ContainingSymbol))
+                containingTypeOpt = null;
+
             if (containingTypeOpt is null && typeArguments.IsDefaultOrEmpty)
                 return definition;
 
@@ -843,6 +886,9 @@ namespace Cnidaria.Cs
         public static Compilation CreateCoreLibrary(ImmutableArray<SyntaxTree> trees, CompilationOptions? options, out ImmutableArray<Diagnostic> diagnostics)
         {
             options ??= new CompilationOptions();
+            // The upstream build disables this one for the whole library
+            foreach (SyntaxTree tree in trees)
+                tree.NoWarn = ImmutableArray.Create("CS8500");
             var bag = new DiagnosticBag();
             var types = new TypeManager(provider: null);
             var decl = new DeclarationBuilder(bag, types, isCoreLibrary: true);
@@ -882,6 +928,7 @@ namespace Cnidaria.Cs
         public CompilationOptions Options { get; }
         public TargetInfo Target => Options.Target;
         internal bool DeclarationsBound { get; set; }
+        internal Dictionary<MethodSymbol, List<MethodGroupWrapper>> MethodGroupWrappers { get; } = new(ReferenceEqualityComparer<MethodSymbol>.Instance);
         internal TypeManager TypeManager => _types;
         internal ImmutableDictionary<SyntaxTree, ImmutableDictionary<SyntaxNode, Symbol>> DeclaredSymbolsByTree { get; }
             = ImmutableDictionary<SyntaxTree, ImmutableDictionary<SyntaxNode, Symbol>>.Empty;
@@ -973,6 +1020,10 @@ namespace Cnidaria.Cs
                         yield return cd;
                         break;
 
+                    case DestructorDeclarationSyntax dd when dd.Body is not null || dd.ExpressionBody is not null:
+                        yield return dd;
+                        break;
+
                     case PropertyDeclarationSyntax pd when kv.Value is PropertySymbol property:
                         {
                             if (pd.ExpressionBody != null)
@@ -1002,6 +1053,16 @@ namespace Cnidaria.Cs
                                             yield return acc;
                                         break;
                                 }
+                            }
+                        }
+                        break;
+                    case EventDeclarationSyntax eds when kv.Value is EventSymbol:
+                        foreach (AccessorDeclarationSyntax accessor in eds.AccessorList.Accessors)
+                        {
+                            if ((accessor.Kind is SyntaxKind.AddAccessorDeclaration or SyntaxKind.RemoveAccessorDeclaration) &&
+                                (accessor.Body is not null || accessor.ExpressionBody is not null))
+                            {
+                                yield return accessor;
                             }
                         }
                         break;
@@ -1064,6 +1125,9 @@ namespace Cnidaria.Cs
                 var allDiagnostics = ImmutableArray.CreateBuilder<Diagnostic>();
                 foreach (var tree in compilation.SyntaxTrees)
                     allDiagnostics.AddRange(compilation.GetSemanticModel(tree).GetDiagnostics());
+                var primaryDiagnostics = new DiagnosticBag();
+                BuildPrimaryConstructorBodies(compilation, primaryDiagnostics);
+                allDiagnostics.AddRange(primaryDiagnostics.ToImmutable());
                 diagnostics = allDiagnostics.ToImmutable();
                 if (print && diagnostics.Length > 0)
                 {
@@ -1078,18 +1142,17 @@ namespace Cnidaria.Cs
 
                 var loweredBodies = new List<BoundMethodBody>();
                 var loweredMethods = new HashSet<MethodSymbol>(ReferenceEqualityComparer<MethodSymbol>.Instance);
-                void Lower(BoundMethodBody body)
+                var loweringDiagnostics = new DiagnosticBag();
+                void Lower(BoundMethodBody body, bool closuresLowered = false)
                 {
                     if (print)
                         Console.WriteLine(Cnidaria.Cs.BoundTreePrinter.Print(body));
-                    loweredBodies.Add(IRLowering.Rewrite(compilation, body));
+                    loweredBodies.Add(IRLowering.Rewrite(compilation, body, loweringDiagnostics, closuresLowered));
                     loweredMethods.Add(body.Method);
                 }
                 foreach (var tree in compilation.SyntaxTrees)
                 {
                     var model = compilation.GetSemanticModel(tree);
-                    IRLowering.PrepareIteratorStateMachines(compilation, tree, model);
-
                     if (model.GetBoundNode(tree.Root) is BoundCompilationUnit cu &&
                         cu.TopLevelMethodBodyOpt is BoundMethodBody topLevelBody)
                     {
@@ -1102,29 +1165,44 @@ namespace Cnidaria.Cs
                             body.Method.Parameters.Length == 0 &&
                             body.Method.Name == ".cctor")
                         {
-                            body = PrependTypeInitializerStatements(compilation, tree, model, body);
+                            body = PrependTypeInitializerStatements(compilation, tree, model, body, loweringDiagnostics);
                         }
                         else if (RunsInstanceFieldInitializers(body.Method, owner))
                         {
                             body = PrependInstanceInitializerStatements(compilation, tree, model, body,
-                                hasBaseInitializer: owner is ConstructorDeclarationSyntax { Initializer: not null });
+                                hasBaseInitializer: owner is ConstructorDeclarationSyntax constructorSyntax && constructorSyntax.Initializer is not null,
+                                loweringDiagnostics);
                         }
                         Lower(body);
                     }
-                    foreach (var iteratorInfo in compilation.GetIteratorStateMachinesForTree(tree))
+                    foreach (PrimaryConstructorInfo primary in GetPrimaryConstructors(compilation).Where(p => ReferenceEquals(p.Tree, tree)))
                     {
-                        foreach (var body in IRLowering.GetIteratorStateMachineBodies(compilation, iteratorInfo))
-                            Lower(body);
+                        if (primary.Body is BoundMethodBody primaryBody)
+                            Lower(primaryBody);
                     }
                     foreach (var record in RecordBinder.GetRecords(compilation).Where(r => ReferenceEquals(r.Tree, tree)))
                         foreach (var body in record.Bodies)
                             Lower(body);
+                    if (compilation.DeclaredSymbolsByTree.TryGetValue(tree, out ImmutableDictionary<SyntaxNode, Symbol>? declaredInTree))
+                    {
+                        foreach (Symbol declared in declaredInTree.Values)
+                        {
+                            if (declared is not SourceEventSymbol fieldLikeEvent || fieldLikeEvent.BackingFieldOpt is not FieldSymbol backingField)
+                                continue;
+
+                            foreach (bool isAdd in new[] { true, false })
+                            {
+                                if (BuildFieldLikeEventAccessor(compilation, fieldLikeEvent, backingField, isAdd, loweringDiagnostics) is BoundMethodBody accessorBody)
+                                    Lower(accessorBody);
+                            }
+                        }
+                    }
                     foreach (var ctor in EnumerateSynthesizedInstanceCtorsInTree(rootNs, tree))
                     {
                         if (loweredMethods.Contains(ctor))
                             continue;
                         var stmts = ImmutableArray.CreateBuilder<BoundStatement>();
-                        stmts.AddRange(BuildInstanceInitializerStatements(compilation, tree, model, ctor));
+                        stmts.AddRange(BuildInstanceInitializerStatements(compilation, tree, model, ctor, loweringDiagnostics));
                         if (IRLowering.CreateImplicitBaseConstructorCall(ctor, tree.Root) is BoundStatement baseCall)
                             stmts.Add(baseCall);
                         stmts.Add(new BoundReturnStatement(tree.Root, expression: null));
@@ -1135,8 +1213,30 @@ namespace Cnidaria.Cs
                     {
                         if (loweredMethods.Contains(cctor))
                             continue;
-                        Lower(BuildSynthesizedTypeInitializerBody(compilation, tree, model, cctor));
+                        Lower(BuildSynthesizedTypeInitializerBody(compilation, tree, model, cctor, loweringDiagnostics));
                     }
+                    foreach (IRLowering.IteratorStateMachineInfo iteratorInfo in compilation.GetIteratorStateMachinesForTree(tree))
+                    {
+                        foreach (BoundMethodBody body in IRLowering.GetIteratorStateMachineBodies(compilation, iteratorInfo))
+                            Lower(body, closuresLowered: true);
+                    }
+                }
+
+                if (BuildAsyncEntryPoint(compilation) is BoundMethodBody asyncEntryPoint)
+                    Lower(asyncEntryPoint);
+
+                // Initializers bind once per constructor, so an error in one repeats across the constructors
+                ImmutableArray<Diagnostic> loweringResults = loweringDiagnostics.ToImmutable().DistinctBy(d => d.ToString()).ToImmutableArray();
+                diagnostics = diagnostics.AddRange(loweringResults);
+                if (print)
+                {
+                    foreach (Diagnostic diagnostic in loweringResults)
+                        Console.WriteLine(diagnostic);
+                }
+                if (diagnostics.Any(d => d.Severity == DiagnosticSeverity.Error))
+                {
+                    tokens = CreateTokenProvider(null);
+                    return (tokens.Image, diagnostics, null);
                 }
 
                 var synthesized = new SynthesizedMemberCollector();
@@ -1151,7 +1251,10 @@ namespace Cnidaria.Cs
                     if (!HasMethodBody(body.Method))
                         return;
                     int rid = MetadataToken.Rid(tokenProvider.GetMethodDefinitionToken(body.Method));
-                    tokenProvider.Image.MethodBodies.Add(rid, ILEmitter.Emit(body, tokenProvider, compilation.Target));
+                    // The upstream build compiles the library under SkipLocalsInit, whose stackallocs count on it for speed
+                    bool initLocals = !includeCoreTypesInTypeDefs && !MethodAttributeFacts.SkipsLocalsInit(body.Method);
+                    tokenProvider.BeginMethodBody(body.Method);
+                    tokenProvider.Image.MethodBodies.Add(rid, ILEmitter.Emit(body, tokenProvider, compilation.Target, initLocals));
                 }
                 foreach (var body in loweredBodies)
                     EmitIL(body);
@@ -1169,6 +1272,168 @@ namespace Cnidaria.Cs
                 return (tokens.Image, diagnostics, ex);
             }
         }
+        // <Main> runs an awaitable Main to completion, the way the runtime expects to enter a program
+        private static BoundMethodBody? BuildAsyncEntryPoint(Compilation compilation)
+        {
+            if (FindAsyncMain(compilation) is not MethodSymbol main || main.ContainingSymbol is not SourceNamedTypeSymbol type)
+                return null;
+
+            NamedTypeSymbol helpers = LocalScopeBinder.GetWellKnownType(compilation, new[] { "System", "Runtime", "CompilerServices" }, "AsyncHelpers", 0)
+                ?? throw new InvalidOperationException("Required type 'System.Runtime.CompilerServices.AsyncHelpers' was not found.");
+            LocalScopeBinder.TryGetTaskResultType(main.ReturnType, out TypeSymbol? result);
+            bool returnsValue = result is not null;
+            MethodSymbol handler = helpers.GetMembers().OfType<MethodSymbol>().First(m =>
+                m.Name == "HandleAsyncEntryPoint" && (m.ReturnType.SpecialType == SpecialType.System_Int32) == returnsValue);
+
+            var wrapper = new SourceMethodSymbol(
+                name: "<Main>",
+                containing: type,
+                returnType: handler.ReturnType,
+                typeParameters: default,
+                isStatic: true,
+                isConstructor: false,
+                isAsync: false,
+                locations: main.Locations,
+                declaredAccessibility: Accessibility.Private);
+            wrapper.SetTypeParameters(ImmutableArray<TypeParameterSymbol>.Empty);
+
+            var parameters = ImmutableArray.CreateBuilder<ParameterSymbol>(main.Parameters.Length);
+            foreach (ParameterSymbol parameter in main.Parameters)
+                parameters.Add(new ParameterSymbol(parameter.Name, wrapper, parameter.Type, parameter.Locations));
+            wrapper.SetParameters(parameters.ToImmutable());
+            type.AddMember(wrapper);
+
+            CompilationUnitSyntax syntax = compilation.SyntaxTrees[0].Root;
+            var arguments = ImmutableArray.CreateBuilder<BoundExpression>(parameters.Count);
+            foreach (ParameterSymbol parameter in parameters)
+                arguments.Add(new BoundParameterExpression(syntax, parameter));
+            var call = new BoundCallExpression(syntax, receiverOpt: null, main, arguments.ToImmutable());
+            var handled = new BoundCallExpression(syntax, receiverOpt: null, handler, ImmutableArray.Create<BoundExpression>(call));
+            BoundStatement body = returnsValue
+                ? new BoundReturnStatement(syntax, handled)
+                : new BoundBlockStatement(syntax, ImmutableArray.Create<BoundStatement>(new BoundExpressionStatement(syntax, handled), new BoundReturnStatement(syntax, expression: null)));
+            return new BoundMethodBody(syntax, wrapper, body);
+        }
+
+        private static MethodSymbol? FindAsyncMain(Compilation compilation)
+        {
+            if (compilation.EntryPoint is MethodSymbol topLevel)
+                return topLevel.IsAsync ? topLevel : null;
+
+            MethodSymbol? candidate = null;
+            foreach (ImmutableDictionary<SyntaxNode, Symbol> symbols in compilation.DeclaredSymbolsByTree.Values)
+            {
+                foreach (Symbol symbol in symbols.Values)
+                {
+                    if (symbol is not MethodSymbol method || method.Name != "Main" || !method.IsStatic || !method.TypeParameters.IsDefaultOrEmpty)
+                        continue;
+                    if (method.Parameters.Length > 1 ||
+                        (method.Parameters.Length == 1 &&
+                         (method.Parameters[0].Type is not ArrayTypeSymbol arguments || !arguments.IsSZArray || arguments.ElementType.SpecialType != SpecialType.System_String)))
+                    {
+                        continue;
+                    }
+
+                    // An ordinary Main takes precedence over an awaitable one
+                    if (method.ReturnType.SpecialType is SpecialType.System_Void or SpecialType.System_Int32)
+                        return null;
+
+                    if (LocalScopeBinder.TryGetTaskResultType(method.ReturnType, out TypeSymbol? result) &&
+                        method.ReturnType is NamedTypeSymbol returnType && returnType.OriginalDefinition.Name == "Task" &&
+                        (result is null || result.SpecialType == SpecialType.System_Int32))
+                    {
+                        candidate ??= method;
+                    }
+                }
+            }
+
+            return candidate;
+        }
+
+        // Each attempt combines from the value it read and publishes only if the field still holds that value, so concurrent subscribers never lose each other
+        private static BoundMethodBody? BuildFieldLikeEventAccessor(Compilation compilation, SourceEventSymbol fieldLikeEvent, FieldSymbol field, bool isAdd, DiagnosticBag diagnostics)
+        {
+            MethodSymbol accessor = isAdd ? fieldLikeEvent.AddMethod : fieldLikeEvent.RemoveMethod;
+            MethodSymbol? compareExchangeDefinition = null;
+            NamedTypeSymbol? interlocked = LocalScopeBinder.GetWellKnownType(compilation, new[] { "System", "Threading" }, "Interlocked", 0);
+            if (interlocked is not null)
+            {
+                foreach (Symbol member in interlocked.GetMembers())
+                {
+                    if (member is MethodSymbol method && method.Name == "CompareExchange" && method.TypeParameters.Length == 1)
+                        compareExchangeDefinition = method;
+                }
+            }
+
+            if (!LocalScopeBinder.TryFindSystemDelegateMethod(compilation, isAdd ? "Combine" : "Remove", out MethodSymbol combine) || compareExchangeDefinition is null)
+            {
+                diagnostics.Add(new Diagnostic(
+                    "CN_EVENT005",
+                    DiagnosticSeverity.Error,
+                    "System.Delegate.Combine, System.Delegate.Remove and System.Threading.Interlocked.CompareExchange<T> are required for field-like events.",
+                    fieldLikeEvent.Locations[0]));
+                return null;
+            }
+
+            var syntax = new ThisExpressionSyntax(default);
+            TypeSymbol delegateType = fieldLikeEvent.Type;
+            TypeSymbol objectType = compilation.GetSpecialType(SpecialType.System_Object);
+            TypeSymbol delegateBase = combine.Parameters[0].Type;
+            var compareExchange = new ConstructedMethodSymbol(compareExchangeDefinition, ImmutableArray.Create(delegateType), compilation.TypeManager);
+            BoundExpression? receiver = field.IsStatic || fieldLikeEvent.ContainingSymbol is not NamedTypeSymbol containingType
+                ? null
+                : new BoundThisExpression(syntax, containingType);
+
+            LocalSymbol NewLocal(string name) => new LocalSymbol(name, accessor, delegateType, ImmutableArray<Location>.Empty);
+            BoundExpression Read(LocalSymbol local) => new BoundLocalExpression(syntax, local);
+            BoundExpression Convert(TypeSymbol type, BoundExpression value, ConversionKind kind)
+                => new BoundConversionExpression(syntax, type, value, new Conversion(kind), isChecked: false);
+            BoundMemberAccessExpression FieldAccess(bool isLValue)
+                => new BoundMemberAccessExpression(syntax, receiver, field, delegateType, isLValue);
+            BoundStatement Store(LocalSymbol local, BoundExpression value)
+                => new BoundExpressionStatement(syntax, new BoundAssignmentExpression(syntax, Read(local), value));
+
+            LocalSymbol current = NewLocal("current");
+            LocalSymbol read = NewLocal("read");
+            LocalSymbol updated = NewLocal("updated");
+            LabelSymbol retry = LabelSymbol.CreateGenerated("retry", accessor);
+
+            BoundExpression combined = new BoundCallExpression(
+                syntax,
+                receiverOpt: null,
+                combine,
+                ImmutableArray.Create(
+                    Convert(delegateBase, Read(read), ConversionKind.ImplicitReference),
+                    Convert(delegateBase, new BoundParameterExpression(syntax, accessor.Parameters[0]), ConversionKind.ImplicitReference)));
+            BoundExpression exchanged = new BoundCallExpression(
+                syntax,
+                receiverOpt: null,
+                compareExchange,
+                ImmutableArray.Create<BoundExpression>(
+                    new BoundRefExpression(syntax, compilation.CreateByRefType(delegateType), FieldAccess(isLValue: true)),
+                    Read(updated),
+                    Read(read)));
+            BoundExpression changed = new BoundBinaryExpression(
+                syntax,
+                BoundBinaryOperatorKind.NotEquals,
+                compilation.GetSpecialType(SpecialType.System_Boolean),
+                Convert(objectType, Read(current), ConversionKind.ImplicitReference),
+                Convert(objectType, Read(read), ConversionKind.ImplicitReference),
+                default);
+
+            var body = new BoundBlockStatement(syntax, ImmutableArray.Create<BoundStatement>(
+                new BoundLocalDeclarationStatement(syntax, current, FieldAccess(isLValue: false)),
+                new BoundLocalDeclarationStatement(syntax, read, null),
+                new BoundLocalDeclarationStatement(syntax, updated, null),
+                new BoundLabelStatement(syntax, retry),
+                Store(read, Read(current)),
+                Store(updated, Convert(delegateType, combined, ConversionKind.ExplicitReference)),
+                Store(current, exchanged),
+                new BoundConditionalGotoStatement(syntax, changed, retry, jumpIfTrue: true),
+                new BoundReturnStatement(syntax, expression: null)));
+            return new BoundMethodBody(syntax, accessor, body);
+        }
+
         private static bool HasMethodBody(MethodSymbol method)
         {
             if (method.IsAbstract || method.IsExtern || method.GetDllImportData() is not null)
@@ -1236,14 +1501,65 @@ namespace Cnidaria.Cs
             }
         }
 
+        private static IEnumerable<PrimaryConstructorInfo> GetPrimaryConstructors(Compilation compilation)
+            => compilation.DeclaredSymbolsByTree.Values.SelectMany(m => m.Values).OfType<SourceNamedTypeSymbol>()
+                .Distinct().Select(t => t.PrimaryConstructorInfo).OfType<PrimaryConstructorInfo>();
+
+        private static void BuildPrimaryConstructorBodies(Compilation compilation, DiagnosticBag diagnostics)
+        {
+            foreach (PrimaryConstructorInfo primary in GetPrimaryConstructors(compilation))
+            {
+                if (primary.Body is not null)
+                    continue;
+                SemanticModel model = compilation.GetSemanticModel(primary.Tree);
+                IBindingRecorder recorder = model is IBindingRecorder bindingRecorder ? bindingRecorder : NullRecorder.Instance;
+                ImportScopeMap imports = ImportsBuilder.BuildImportScopeMap(compilation, primary.Tree, recorder, new DiagnosticBag());
+                var typeBinder = new TypeBinder(null, BinderFlags.None, compilation, imports);
+                var binder = new LocalScopeBinder(typeBinder, BinderFlags.InMethod | BinderFlags.InConstructor, primary.Constructor);
+                var context = new BindingContext(compilation, model, primary.Constructor, recorder);
+                var statements = ImmutableArray.CreateBuilder<BoundStatement>();
+                var self = new BoundThisExpression(new ThisExpressionSyntax(default), primary.Type, isLValue: true);
+                if (primary.Type.IsValueType)
+                {
+                    var zero = new LocalSymbol("$zero", primary.Constructor, primary.Type, ImmutableArray<Location>.Empty);
+                    statements.Add(new BoundLocalDeclarationStatement(primary.Syntax, zero, null));
+                    statements.Add(new BoundExpressionStatement(primary.Syntax,
+                        new BoundAssignmentExpression(primary.Syntax, self, new BoundLocalExpression(primary.Syntax, zero))));
+                }
+                foreach (ParameterSymbol parameter in primary.Constructor.Parameters)
+                {
+                    if (primary.Captures.TryGetValue(parameter, out SynthesizedBackingFieldSymbol? field))
+                    {
+                        var target = new BoundMemberAccessExpression((ExpressionSyntax)self.Syntax, self, field, field.Type, isLValue: true);
+                        statements.Add(new BoundExpressionStatement(primary.Syntax,
+                            new BoundAssignmentExpression(primary.Syntax, target, new BoundParameterExpression(primary.Syntax, parameter))));
+                    }
+                }
+                statements.AddRange(Compilation.BuildFieldInitializerStatements(compilation, primary.Tree, model, primary.Constructor, false, diagnostics));
+                if (primary.Type.IsReferenceType)
+                {
+                    var syntax = (ClassDeclarationSyntax)primary.Syntax;
+                    PrimaryConstructorBaseTypeSyntax? baseSyntax = syntax.BaseList?.Types.OfType<PrimaryConstructorBaseTypeSyntax>().FirstOrDefault();
+                    ArgumentListSyntax arguments = baseSyntax?.ArgumentList ?? new ArgumentListSyntax(default, default, default);
+                    var token = new SyntaxToken(SyntaxKind.BaseKeyword, primary.Syntax.Span, "base", null, Array.Empty<SyntaxTrivia>(), Array.Empty<SyntaxTrivia>());
+                    var initializer = new ConstructorInitializerSyntax(SyntaxKind.BaseConstructorInitializer, default, token, arguments);
+                    if (binder.BindConstructorInitializer(initializer, context, diagnostics) is BoundStatement statement)
+                        statements.Add(statement);
+                }
+                statements.Add(new BoundReturnStatement(primary.Syntax, null));
+                primary.Body = new BoundMethodBody(primary.Syntax, primary.Constructor, new BoundBlockStatement(primary.Syntax, statements.ToImmutable()));
+            }
+        }
+
         private static BoundMethodBody BuildSynthesizedTypeInitializerBody(
             Compilation compilation,
             SyntaxTree tree,
             SemanticModel model,
-            MethodSymbol cctor)
+            MethodSymbol cctor,
+            DiagnosticBag diagnostics)
         {
             var stmts = ImmutableArray.CreateBuilder<BoundStatement>();
-            stmts.AddRange(BuildTypeInitializerStatements(compilation, tree, model, cctor));
+            stmts.AddRange(BuildTypeInitializerStatements(compilation, tree, model, cctor, diagnostics));
             stmts.Add(new BoundReturnStatement(tree.Root, expression: null));
             var block = new BoundBlockStatement(tree.Root, stmts.ToImmutable());
             return new BoundMethodBody(tree.Root, cctor, block);
@@ -1253,17 +1569,19 @@ namespace Cnidaria.Cs
             Compilation compilation,
             SyntaxTree tree,
             SemanticModel model,
-            BoundMethodBody body)
-            => PrependInitializerStatements(body, BuildTypeInitializerStatements(compilation, tree, model, body.Method));
+            BoundMethodBody body,
+            DiagnosticBag diagnostics)
+            => PrependInitializerStatements(body, BuildTypeInitializerStatements(compilation, tree, model, body.Method, diagnostics));
 
         private static BoundMethodBody PrependInstanceInitializerStatements(
             Compilation compilation,
             SyntaxTree tree,
             SemanticModel model,
             BoundMethodBody body,
-            bool hasBaseInitializer)
+            bool hasBaseInitializer,
+            DiagnosticBag diagnostics)
         {
-            var initializers = BuildInstanceInitializerStatements(compilation, tree, model, body.Method);
+            ImmutableArray<BoundStatement> initializers = BuildInstanceInitializerStatements(compilation, tree, model, body.Method, diagnostics);
             if (!hasBaseInitializer &&
                 !initializers.IsEmpty &&
                 IRLowering.CreateImplicitBaseConstructorCall(body.Method, body.Syntax) is BoundStatement baseCall)
@@ -1307,15 +1625,17 @@ namespace Cnidaria.Cs
             Compilation compilation,
             SyntaxTree tree,
             SemanticModel model,
-            MethodSymbol cctor)
-            => BuildFieldInitializerStatements(compilation, tree, model, cctor, staticFields: true);
+            MethodSymbol cctor,
+            DiagnosticBag diagnostics)
+            => BuildFieldInitializerStatements(compilation, tree, model, cctor, staticFields: true, diagnostics);
 
         private static ImmutableArray<BoundStatement> BuildInstanceInitializerStatements(
             Compilation compilation,
             SyntaxTree tree,
             SemanticModel model,
-            MethodSymbol ctor)
-            => BuildFieldInitializerStatements(compilation, tree, model, ctor, staticFields: false);
+            MethodSymbol ctor,
+            DiagnosticBag diagnostics)
+            => BuildFieldInitializerStatements(compilation, tree, model, ctor, staticFields: false, diagnostics);
 
         internal static ImmutableArray<BoundStatement> BuildFieldInitializerStatements(
             Compilation compilation,
@@ -1323,14 +1643,13 @@ namespace Cnidaria.Cs
             SemanticModel model,
             MethodSymbol initializerOwner,
             bool staticFields,
-            DiagnosticBag? diagnostics = null)
+            DiagnosticBag diagnostics)
         {
-            var bag = diagnostics ?? new DiagnosticBag();
-
             IBindingRecorder recorder =
                 model is IBindingRecorder r ? r : NullRecorder.Instance;
 
-            var importScopeMap = ImportsBuilder.BuildImportScopeMap(compilation, tree, recorder, bag);
+            // The imports were already reported when the tree was bound
+            ImportScopeMap importScopeMap = ImportsBuilder.BuildImportScopeMap(compilation, tree, recorder, new DiagnosticBag());
             var typeBinder = new TypeBinder(parent: null, flags: BinderFlags.None, compilation: compilation, importScopeMap: importScopeMap);
             var binderFlags = staticFields ? BinderFlags.InMethod : BinderFlags.InMethod | BinderFlags.InConstructor;
             var exprBinder = new LocalScopeBinder(parent: typeBinder, flags: binderFlags, containing: initializerOwner);
@@ -1352,18 +1671,22 @@ namespace Cnidaria.Cs
                     tree = initializerTree;
                     model = compilation.GetSemanticModel(tree);
                     recorder = model is IBindingRecorder initializerRecorder ? initializerRecorder : NullRecorder.Instance;
-                    importScopeMap = ImportsBuilder.BuildImportScopeMap(compilation, tree, recorder, bag);
+                    importScopeMap = ImportsBuilder.BuildImportScopeMap(compilation, tree, recorder, new DiagnosticBag());
                     typeBinder = new TypeBinder(parent: null, flags: BinderFlags.None, compilation: compilation, importScopeMap: importScopeMap);
                     exprBinder = new LocalScopeBinder(parent: typeBinder, flags: binderFlags, containing: initializerOwner);
                     ctx = new BindingContext(compilation, model, initializerOwner, recorder);
                 }
                 var rhsSyntax = initializer.Value;
-                var rhsBound = exprBinder.BindExpressionWithTargetType(
+                // The initializer binds under the constructor, which does not see the field's unsafe modifier
+                LocalScopeBinder initializerBinder = fs is SourceFieldSymbol sourceField && sourceField.IsUnsafe
+                    ? new LocalScopeBinder(parent: typeBinder, flags: binderFlags | BinderFlags.UnsafeRegion, containing: initializerOwner)
+                    : exprBinder;
+                BoundExpression rhsBound = initializerBinder.BindExpressionWithTargetType(
                     exprSyntax: rhsSyntax,
                     targetType: fs.Type,
                     diagnosticNode: initializer,
                     context: ctx,
-                    diagnostics: bag,
+                    diagnostics: diagnostics,
                     requireImplicit: true);
 
                 var lhs = new BoundMemberAccessExpression(
@@ -1402,6 +1725,14 @@ namespace Cnidaria.Cs
                     field = backingField;
                     declaration = propertyDeclaration;
                     initializer = propertyInitializer;
+                    return true;
+                case SourceEventSymbol fieldLikeEvent when fieldLikeEvent.IsStatic == staticMembers &&
+                    fieldLikeEvent.BackingFieldOpt is FieldSymbol eventField &&
+                    fieldLikeEvent.DeclaringSyntaxReferences[0].Node is VariableDeclaratorSyntax eventDeclarator &&
+                    eventDeclarator.Initializer is EqualsValueClauseSyntax eventInitializer:
+                    field = eventField;
+                    declaration = eventDeclarator;
+                    initializer = eventInitializer;
                     return true;
                 default:
                     field = null!;
@@ -1895,6 +2226,7 @@ namespace Cnidaria.Cs
                     }
                 }
                 binder.ReportControlFlowDiagnostics(ctx, bag);
+                binder.DeclareLocalFunctionDelegates(stmts, SyntaxTree.Root);
                 var bodyStmt = new BoundStatementList(SyntaxTree.Root, stmts.ToImmutable());
                 var topLevelBody = new BoundMethodBody(SyntaxTree.Root, entryPoint, bodyStmt);
 
@@ -1919,9 +2251,17 @@ namespace Cnidaria.Cs
                     {
                         BindMethodLikeBody(cd, cd.Body, cd.ExpressionBody, ctor, typeBinder, recorder, bag);
                     }
+                    else if (kv.Key is DestructorDeclarationSyntax dd && kv.Value is MethodSymbol finalizer)
+                    {
+                        BindMethodLikeBody(dd, dd.Body, dd.ExpressionBody, finalizer, typeBinder, recorder, bag);
+                    }
                     else if (kv.Key is PropertyDeclarationSyntax pd && kv.Value is PropertySymbol prop)
                     {
                         BindPropertyBodies(pd, prop, typeBinder, recorder, bag);
+                    }
+                    else if (kv.Key is EventDeclarationSyntax eds && kv.Value is EventSymbol declaredEvent)
+                    {
+                        BindEventBodies(eds, declaredEvent, typeBinder, recorder, bag);
                     }
                     else if (kv.Key is OperatorDeclarationSyntax od && kv.Value is MethodSymbol opMethod)
                     {
@@ -1948,6 +2288,32 @@ namespace Cnidaria.Cs
                     return true;
             return false;
         }
+
+        private void BindEventBodies(
+            EventDeclarationSyntax eventSyntax,
+            EventSymbol declaredEvent,
+            TypeBinder typeBinder,
+            IBindingRecorder recorder,
+            DiagnosticBag diagnostics)
+        {
+            bool isUnsafe = HasModifier(eventSyntax.Modifiers, SyntaxKind.UnsafeKeyword);
+            foreach (AccessorDeclarationSyntax accessor in eventSyntax.AccessorList.Accessors)
+            {
+                if (accessor.Kind is not (SyntaxKind.AddAccessorDeclaration or SyntaxKind.RemoveAccessorDeclaration))
+                    continue;
+
+                BindAccessorBody(
+                    ownerSyntax: accessor,
+                    isUnsafeRegion: isUnsafe,
+                    body: accessor.Body,
+                    exprBody: accessor.ExpressionBody,
+                    method: accessor.Kind == SyntaxKind.AddAccessorDeclaration ? declaredEvent.AddMethod : declaredEvent.RemoveMethod,
+                    typeBinder: typeBinder,
+                    recorder: recorder,
+                    diagnostics: diagnostics);
+            }
+        }
+
         private void BindPropertyBodies(
             PropertyDeclarationSyntax propertySyntax,
             PropertySymbol property,
@@ -2065,6 +2431,7 @@ namespace Cnidaria.Cs
             if (isUnsafeRegion)
                 flags |= BinderFlags.UnsafeRegion;
             var binder = new LocalScopeBinder(parent: typeBinder, flags: flags, containing: method);
+            LocalScopeBinder.ValidateAsyncSignature(method, ownerSyntax, ctx, diagnostics);
             BoundExpression? receiver = null;
             if (!backingField.IsStatic)
             {
@@ -2119,6 +2486,7 @@ namespace Cnidaria.Cs
                 flags |= BinderFlags.UnsafeRegion;
 
             var binder = new LocalScopeBinder(parent: typeBinder, flags: flags, containing: method);
+            LocalScopeBinder.ValidateAsyncSignature(method, ownerSyntax, ctx, diagnostics);
 
             BoundStatement boundBody;
 
@@ -2129,19 +2497,20 @@ namespace Cnidaria.Cs
             }
             else
             {
-                var expr = binder.BindExpression(exprBody!.Expression, ctx, diagnostics);
-
-                if (method.ReturnType.SpecialType == SpecialType.System_Void)
+                ExpressionSyntax bodyExpression = exprBody!.Expression;
+                TypeSymbol bodyReturnType = LocalScopeBinder.GetBodyReturnType(method, ctx.Compilation);
+                if (bodyReturnType.SpecialType == SpecialType.System_Void)
                 {
-                    boundBody = new BoundExpressionStatement(exprBody, expr);
+                    boundBody = binder.BindVoidExpressionBody(exprBody, bodyExpression, ctx, diagnostics);
                     recorder.RecordBound(exprBody, boundBody);
                 }
                 else
                 {
+                    BoundExpression expr = binder.BindExpression(bodyExpression, ctx, diagnostics);
                     expr = binder.ApplyConversion(
                         exprSyntax: exprBody.Expression,
                         expr: expr,
-                        targetType: method.ReturnType,
+                        targetType: bodyReturnType,
                         diagnosticNode: exprBody,
                         context: ctx,
                         diagnostics: diagnostics,
@@ -2239,11 +2608,18 @@ namespace Cnidaria.Cs
             if (HasUnsafeModifier(ownerSyntax))
                 flags |= BinderFlags.UnsafeRegion;
             var binder = new LocalScopeBinder(parent: typeBinder, flags: flags, containing: method);
+            LocalScopeBinder.ValidateAsyncSignature(method, ownerSyntax, ctx, diagnostics);
             BoundStatement? ctorInitializerStmt = null;
             if (ownerSyntax is ConstructorDeclarationSyntax ctorSyntax)
             {
                 ctorInitializerStmt = binder.BindConstructorInitializer(ctorSyntax, ctx, diagnostics);
                 RecordBinder.ValidateConstructor(ctorSyntax, method, ctorInitializerStmt, SyntaxTree, diagnostics);
+                if (!method.IsStatic && method.ContainingSymbol is SourceNamedTypeSymbol type && type.PrimaryConstructorInfo is not null &&
+                    ctorSyntax.Initializer?.ThisOrBaseKeyword.Kind != SyntaxKind.ThisKeyword)
+                {
+                    diagnostics.Add(new Diagnostic("CS8862", DiagnosticSeverity.Error,
+                        "A constructor in a type with a primary constructor must delegate using 'this'.", new Location(SyntaxTree, ctorSyntax.Span)));
+                }
             }
             BoundStatement boundBody;
 
@@ -2254,19 +2630,20 @@ namespace Cnidaria.Cs
             }
             else
             {
-                var expr = binder.BindExpression(exprBody!.Expression, ctx, diagnostics);
-
-                if (method.ReturnType.SpecialType == SpecialType.System_Void)
+                ExpressionSyntax bodyExpression = exprBody!.Expression;
+                TypeSymbol bodyReturnType = LocalScopeBinder.GetBodyReturnType(method, ctx.Compilation);
+                if (bodyReturnType.SpecialType == SpecialType.System_Void)
                 {
-                    boundBody = new BoundExpressionStatement(exprBody, expr);
+                    boundBody = binder.BindVoidExpressionBody(exprBody, bodyExpression, ctx, diagnostics);
                     recorder.RecordBound(exprBody, boundBody);
                 }
                 else
                 {
+                    BoundExpression expr = binder.BindExpression(bodyExpression, ctx, diagnostics);
                     expr = binder.ApplyConversion(
                         exprSyntax: exprBody.Expression,
                         expr: expr,
-                        targetType: method.ReturnType,
+                        targetType: bodyReturnType,
                         diagnosticNode: exprBody,
                         context: ctx,
                         diagnostics: diagnostics,
@@ -2279,8 +2656,31 @@ namespace Cnidaria.Cs
             }
             if (ctorInitializerStmt != null)
                 boundBody = PrependStatement(boundBody, ctorInitializerStmt);
+            if (ownerSyntax is DestructorDeclarationSyntax)
+                boundBody = ChainBaseFinalizer(boundBody, method);
             var methodBody = new BoundMethodBody(ownerSyntax, method, boundBody);
             recorder.RecordBound(ownerSyntax, methodBody);
+            static BoundStatement ChainBaseFinalizer(BoundStatement body, MethodSymbol finalizer)
+            {
+                if (finalizer.OverriddenMethod is not MethodSymbol baseFinalizer ||
+                    finalizer.ContainingSymbol is not NamedTypeSymbol containingType ||
+                    containingType.BaseType is not NamedTypeSymbol baseType ||
+                    baseFinalizer.ContainingSymbol is not NamedTypeSymbol baseOwner ||
+                    baseOwner.SpecialType == SpecialType.System_Object)
+                {
+                    return body;
+                }
+
+                var emptyBlock = new BlockSyntax(default, SyntaxList<StatementSyntax>.Empty, default);
+                var trySyntax = new TryStatementSyntax(default, emptyBlock, SyntaxList<CatchClauseSyntax>.Empty, new FinallyClauseSyntax(default, emptyBlock));
+                var receiver = new BoundBaseExpression(new BaseExpressionSyntax(default), containingType, baseType);
+                var call = new BoundCallExpression(body.Syntax, receiver, baseFinalizer, ImmutableArray<BoundExpression>.Empty);
+                var finallyBlock = new BoundBlockStatement(body.Syntax, ImmutableArray.Create<BoundStatement>(new BoundExpressionStatement(body.Syntax, call)));
+                BoundBlockStatement tryBlock = body as BoundBlockStatement ?? new BoundBlockStatement(body.Syntax, ImmutableArray.Create(body));
+                var tryStatement = new BoundTryStatement(trySyntax, tryBlock, ImmutableArray<BoundCatchBlock>.Empty, finallyBlock);
+
+                return new BoundBlockStatement(body.Syntax, ImmutableArray.Create<BoundStatement>(tryStatement));
+            }
             static BoundStatement PrependStatement(BoundStatement body, BoundStatement statement)
             {
                 if (body is BoundBlockStatement block)
@@ -2302,6 +2702,9 @@ namespace Cnidaria.Cs
                         break;
                     case ConstructorDeclarationSyntax c:
                         mods = c.Modifiers;
+                        break;
+                    case DestructorDeclarationSyntax d:
+                        mods = d.Modifiers;
                         break;
                     case OperatorDeclarationSyntax o:
                         mods = o.Modifiers;
@@ -2832,6 +3235,7 @@ namespace Cnidaria.Cs
         UnboundLambda,
         MethodGroup,
         Lambda,
+        DelegateCreation,
         ClosureCellCreation,
         ClosureCreation,
         ClosureSlot,

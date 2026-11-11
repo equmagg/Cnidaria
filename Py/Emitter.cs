@@ -843,7 +843,7 @@ namespace Cnidaria.Python
 
             foreach (var local in _symbols.LocalNames)
             {
-                if (string.Equals(local, ".0", StringComparison.Ordinal))
+                if (local == ".0")
                     continue;
                 AddOrMergeLocal(local, LocalKind.Local);
             }
@@ -1002,7 +1002,7 @@ namespace Cnidaria.Python
                         {
                             var receiver = SyntaxAccess.GetNode(target, 0);
                             if (receiver?.Kind == SyntaxKind.NameExpression &&
-                                string.Equals(GetName(receiver), "self", StringComparison.Ordinal))
+                                GetName(receiver) == "self")
                             {
                                 names.Add(SyntaxAccess.GetToken(target, 2).Text);
                             }
@@ -1889,7 +1889,7 @@ namespace Cnidaria.Python
                 }
             }
 
-            if (level == 0 && string.Equals(moduleName, "__future__", StringComparison.Ordinal))
+            if (level == 0 && moduleName == "__future__")
             {
                 // Future statements affect compiler flags and do not execute a runtime import.
                 _bytecode.Emit(PythonOpcode.Nop, sourceSpan: statement.Span);
@@ -4686,7 +4686,7 @@ namespace Cnidaria.Python
                     BitConverter.DoubleToInt64Bits(a.Real) == BitConverter.DoubleToInt64Bits(b.Real) &&
                     BitConverter.DoubleToInt64Bits(a.Imaginary) == BitConverter.DoubleToInt64Bits(b.Imaginary),
                 (StringConstant a, StringConstant b) =>
-                    string.Equals(a.Value, b.Value, StringComparison.Ordinal),
+                    a.Value == b.Value,
                 (BytesConstant a, BytesConstant b) => a.Value.AsSpan().SequenceEqual(b.Value.AsSpan()),
                 (TupleConstant a, TupleConstant b) => SequenceEquals(a.Items, b.Items),
                 (FrozenSetConstant a, FrozenSetConstant b) => SequenceEquals(a.Items, b.Items),

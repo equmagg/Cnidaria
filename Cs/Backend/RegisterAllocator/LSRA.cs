@@ -5379,6 +5379,9 @@ namespace Cnidaria.Cs
 
             private static RegisterClass RegisterClassForMove(RegisterOperand source, RegisterOperand destination)
             {
+                // A stack argument slot reads as General whatever it holds
+                if (source.RegisterClass == RegisterClass.Vector)
+                    return RegisterClass.Vector;
                 if (destination.RegisterClass is RegisterClass.General or RegisterClass.Float or RegisterClass.Vector)
                     return destination.RegisterClass;
                 if (source.RegisterClass is RegisterClass.General or RegisterClass.Float or RegisterClass.Vector)

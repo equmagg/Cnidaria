@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 
 namespace Cnidaria.Cs
@@ -94,6 +95,45 @@ namespace Cnidaria.Cs
             return false;
         }
 
+        // A void delegate takes a statement expression or no 'return x', any other delegate needs a value (C# 10.7)
+        private bool LambdaBodyFitsDelegateReturn(
+            BoundUnboundLambdaExpression lambda,
+            SyntaxNode bodySyntax,
+            MethodSymbol invoke,
+            bool isAsync,
+            BindingContext context)
+        {
+            bool targetIsVoid = invoke.ReturnType.SpecialType == SpecialType.System_Void ||
+                (isAsync && TryGetTaskResultType(invoke.ReturnType, out TypeSymbol? taskResult) && taskResult is null);
+            if (bodySyntax is ExpressionSyntax expression)
+            {
+                if (targetIsVoid)
+                {
+                    return expression is InvocationExpressionSyntax or AssignmentExpressionSyntax or ObjectCreationExpressionSyntax
+                        or ConditionalAccessExpressionSyntax or AwaitExpressionSyntax or PrefixUnaryExpressionSyntax
+                        or PostfixUnaryExpressionSyntax or ThrowExpressionSyntax;
+                }
+
+                if (expression is not InvocationExpressionSyntax and not ConditionalAccessExpressionSyntax)
+                    return true;
+            }
+
+            var parameterTypes = ImmutableArray.CreateBuilder<TypeSymbol>(invoke.Parameters.Length);
+            foreach (ParameterSymbol parameter in invoke.Parameters)
+                parameterTypes.Add(parameter.Type);
+            if (!TryProbeLambdaBody(lambda, parameterTypes.MoveToImmutable(), context, out TypeSymbol? bodyType, out bool returnsValue, out bool returnsNothing))
+                return true;
+
+            if (bodySyntax is ExpressionSyntax)
+                return bodyType?.SpecialType != SpecialType.System_Void;
+            if (targetIsVoid)
+                return !returnsValue;
+            return !returnsNothing && (returnsValue || BlockEndsInThrow((BlockSyntax)bodySyntax));
+        }
+
+        private static bool BlockEndsInThrow(BlockSyntax block)
+            => block.Statements.Count != 0 && block.Statements[block.Statements.Count - 1] is ThrowStatementSyntax or WhileStatementSyntax or ForStatementSyntax;
+
         // Speculative lambda binding suppresses diagnostics and semantic records
         private bool CanConvertLambdaToDelegate(
             BoundUnboundLambdaExpression lambda,
@@ -107,15 +147,21 @@ namespace Cnidaria.Cs
                     (ExpressionSyntax)lambda.Syntax,
                     out var parameterSyntaxes,
                     out var hasExplicitParameterList,
-                    out _,
+                    out SyntaxNode bodySyntax,
                     out var explicitReturnType,
                     out _,
-                    out _))
+                    out bool isAsync))
             {
                 return false;
             }
 
             if (hasExplicitParameterList && parameterSyntaxes.Length != invoke.Parameters.Length)
+                return false;
+
+            if (isAsync && !TryGetTaskResultType(invoke.ReturnType, out _) && invoke.ReturnType.SpecialType != SpecialType.System_Void)
+                return false;
+
+            if (!LambdaBodyFitsDelegateReturn(lambda, bodySyntax, invoke, isAsync, context))
                 return false;
 
             if (explicitReturnType is not null)
@@ -156,16 +202,49 @@ namespace Cnidaria.Cs
         private TypeSymbol? InferLambdaReturnType(BoundUnboundLambdaExpression lambda, ImmutableArray<TypeSymbol> parameterTypes, BindingContext context)
         {
             var syntax = (ExpressionSyntax)lambda.Syntax;
-            if (!TryGetAnonymousFunctionParts(syntax, out var parameterSyntaxes, out var hasExplicitParameterList, out var bodySyntax, out var explicitReturnType, out _, out var isAsync) ||
-                isAsync || (hasExplicitParameterList && parameterSyntaxes.Length != parameterTypes.Length))
+            if (!TryGetAnonymousFunctionParts(syntax, out ImmutableArray<ParameterSyntax> parameterSyntaxes, out bool hasExplicitParameterList, out _, out TypeSyntax? explicitReturnType, out _, out bool isAsync) ||
+                (hasExplicitParameterList && parameterSyntaxes.Length != parameterTypes.Length))
             {
                 return null;
             }
 
+            if (explicitReturnType is not null)
+                return IsVar(explicitReturnType) ? null : BindType(explicitReturnType, WithRecorder(context, NullBindingRecorder.Instance), new DiagnosticBag());
+
+            TryProbeLambdaBody(lambda, parameterTypes, context, out TypeSymbol? result, out _, out _);
+            if (result is null or NullTypeSymbol or DefaultLiteralTypeSymbol or ErrorTypeSymbol || result.SpecialType == SpecialType.System_Void)
+                result = null;
+            if (!isAsync)
+                return result;
+
+            // An async lambda produces a task of what its body returns
+            NamedTypeSymbol? taskDefinition = GetWellKnownType(context.Compilation, new[] { "System", "Threading", "Tasks" }, "Task", result is null ? 0 : 1);
+            if (taskDefinition is null)
+                return null;
+            return result is null ? taskDefinition : context.Compilation.ConstructNamedType(taskDefinition, ImmutableArray.Create(result));
+        }
+
+        // Binds the body with these parameter types, discarding diagnostics and records
+        private bool TryProbeLambdaBody(
+            BoundUnboundLambdaExpression lambda,
+            ImmutableArray<TypeSymbol> parameterTypes,
+            BindingContext context,
+            out TypeSymbol? bodyType,
+            out bool returnsValue,
+            out bool returnsNothing)
+        {
+            bodyType = null;
+            returnsValue = false;
+            returnsNothing = false;
+            var syntax = (ExpressionSyntax)lambda.Syntax;
+            if (!TryGetAnonymousFunctionParts(syntax, out ImmutableArray<ParameterSyntax> parameterSyntaxes, out bool hasExplicitParameterList, out SyntaxNode bodySyntax, out _, out bool isStatic, out bool isAsync) ||
+                (hasExplicitParameterList && parameterSyntaxes.Length != parameterTypes.Length))
+            {
+                return false;
+            }
+
             var diagnostics = new DiagnosticBag();
             var probeContext = WithRecorder(context, NullBindingRecorder.Instance);
-            if (explicitReturnType is not null)
-                return IsVar(explicitReturnType) ? null : BindType(explicitReturnType, probeContext, diagnostics);
 
             var lambdaMethod = new LambdaMethodSymbol(
                 name: "<lambda>",
@@ -174,8 +253,9 @@ namespace Cnidaria.Cs
                 parameters: ImmutableArray<ParameterSymbol>.Empty,
                 locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, syntax.Span)),
                 isStatic: true,
-                isAsync: false,
-                returnsByRefReadonly: false);
+                isAsync: isAsync,
+                returnsByRefReadonly: false,
+                isDeclaredStatic: isStatic);
             var parameters = ImmutableArray.CreateBuilder<ParameterSymbol>(parameterTypes.Length);
             for (int i = 0; i < parameterTypes.Length; i++)
             {
@@ -198,19 +278,24 @@ namespace Cnidaria.Cs
                 var returns = new ReturnTypeCollector();
                 returns.RewriteNode(bodyBinder.BindStatement(block, bodyContext, diagnostics));
                 result = returns.Single;
+                returnsValue = returns.ReturnsValue;
+                returnsNothing = returns.ReturnsNothing;
             }
-            return result is null or NullTypeSymbol or DefaultLiteralTypeSymbol or ErrorTypeSymbol || result.SpecialType == SpecialType.System_Void
-                ? null
-                : result;
+            bodyType = result;
+            return true;
         }
 
         private sealed class ReturnTypeCollector : BoundTreeRewriter
         {
             private bool _conflict;
             public TypeSymbol? Single { get; private set; }
+            public bool ReturnsValue { get; private set; }
+            public bool ReturnsNothing { get; private set; }
 
             protected override BoundStatement RewriteReturnStatement(BoundReturnStatement node)
             {
+                ReturnsValue |= node.Expression is not null;
+                ReturnsNothing |= node.Expression is null;
                 var value = node.Expression is BoundConversionExpression conversion ? conversion.Operand : node.Expression;
                 if (value?.Type is TypeSymbol type && !_conflict)
                 {
@@ -267,11 +352,14 @@ namespace Cnidaria.Cs
 
             if (isAsync)
             {
-                diagnostics.Add(new Diagnostic(
-                    "CN_LAMBDA002",
-                    DiagnosticSeverity.Error,
-                    "Async lambdas are not implemented.",
-                    new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                if (!TryGetTaskResultType(invoke.ReturnType, out _))
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_ASYNC001",
+                        DiagnosticSeverity.Error,
+                        "An async lambda must convert to a delegate returning Task, Task<T>, ValueTask or ValueTask<T>.",
+                        new Location(context.SemanticModel.SyntaxTree, syntax.Span)));
+                }
             }
 
             if (hasExplicitParameterList && parameterSyntaxes.Length != invoke.Parameters.Length)
@@ -328,7 +416,8 @@ namespace Cnidaria.Cs
                 locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, syntax.Span)),
                 isStatic: true,
                 isAsync: isAsync,
-                returnsByRefReadonly: invoke.ReturnsByRefReadonly);
+                returnsByRefReadonly: invoke.ReturnsByRefReadonly,
+                isDeclaredStatic: isStatic);
 
             if (syntax is LambdaExpressionSyntax lambdaSyntax)
             {
@@ -433,19 +522,22 @@ namespace Cnidaria.Cs
             }
             else if (bodySyntax is ExpressionSyntax expressionBody)
             {
-                var expression = bodyBinder.BindExpression(expressionBody, bodyContext, diagnostics);
-                if (lambdaReturnType.SpecialType == SpecialType.System_Void)
+                TypeSymbol bodyReturnType = isAsync && TryGetTaskResultType(lambdaReturnType, out TypeSymbol? taskResult)
+                    ? taskResult ?? context.Compilation.GetSpecialType(SpecialType.System_Void)
+                    : lambdaReturnType;
+                if (bodyReturnType.SpecialType == SpecialType.System_Void)
                 {
                     body = new BoundBlockStatement(
                         syntax,
-                        ImmutableArray.Create<BoundStatement>(new BoundExpressionStatement(expressionBody, expression)));
+                        ImmutableArray.Create(bodyBinder.BindVoidExpressionBody(expressionBody, expressionBody, bodyContext, diagnostics)));
                 }
                 else
                 {
+                    BoundExpression expression = bodyBinder.BindExpression(expressionBody, bodyContext, diagnostics);
                     expression = bodyBinder.ApplyConversion(
                         exprSyntax: expressionBody,
                         expr: expression,
-                        targetType: lambdaReturnType,
+                        targetType: bodyReturnType,
                         diagnosticNode: expressionBody,
                         context: bodyContext,
                         diagnostics: diagnostics,
@@ -468,6 +560,7 @@ namespace Cnidaria.Cs
             }
 
             bodyBinder.ReportControlFlowDiagnostics(bodyContext, diagnostics, body, syntax);
+            StaticFunctionChecker.Check(lambdaMethod, body, context, diagnostics);
 
             return new BoundLambdaExpression(
                 syntax,
@@ -477,6 +570,97 @@ namespace Cnidaria.Cs
                 body,
                 isStatic,
                 isAsync);
+        }
+
+        // A static function may refer to nothing around it but static local functions
+        private sealed class StaticFunctionChecker : BoundTreeRewriter
+        {
+            private readonly MethodSymbol _function;
+            private readonly BindingContext _context;
+            private readonly DiagnosticBag _diagnostics;
+
+            private StaticFunctionChecker(MethodSymbol function, BindingContext context, DiagnosticBag diagnostics)
+            {
+                _function = function;
+                _context = context;
+                _diagnostics = diagnostics;
+            }
+
+            public static void Check(MethodSymbol function, BoundStatement body, BindingContext context, DiagnosticBag diagnostics)
+            {
+                if (IsDeclaredStatic(function))
+                    new StaticFunctionChecker(function, context, diagnostics).RewriteStatement(body);
+            }
+
+            protected override BoundExpression RewriteExpressionCore(BoundExpression node)
+            {
+                switch (node)
+                {
+                    case BoundLocalExpression local:
+                        if (!local.Local.IsConst)
+                            ReportOuterSymbol(node, local.Local);
+                        return node;
+                    case BoundParameterExpression parameter:
+                        ReportOuterSymbol(node, parameter.Parameter);
+                        return node;
+                    case BoundThisExpression:
+                    case BoundBaseExpression:
+                        ReportThis(node);
+                        return node;
+                    // Left behind by errors reported already
+                    case BoundUnboundConditionalExpression:
+                    case BoundUnboundSwitchExpression:
+                        return node;
+                    default:
+                        return base.RewriteExpressionCore(node);
+                }
+            }
+
+            protected override BoundExpression RewriteCallExpression(BoundCallExpression node)
+            {
+                if (node.Method.OriginalDefinition is LocalFunctionSymbol function)
+                {
+                    if (!IsDeclaredStatic(function))
+                        ReportOuterSymbol(node, function);
+                }
+                else if (node.ReceiverOpt is null && !node.Method.IsStatic)
+                {
+                    ReportThis(node);
+                }
+
+                return base.RewriteCallExpression(node);
+            }
+
+            protected override BoundExpression RewriteLambdaExpression(BoundLambdaExpression node)
+                => IsDeclaredStatic(node.Method) ? node : base.RewriteLambdaExpression(node);
+
+            protected override BoundStatement RewriteLocalFunctionStatement(BoundLocalFunctionStatement node)
+                => IsDeclaredStatic(node.LocalFunction) ? node : base.RewriteLocalFunctionStatement(node);
+
+            private void ReportOuterSymbol(BoundExpression node, Symbol symbol)
+            {
+                for (Symbol? owner = symbol.ContainingSymbol; owner is MethodSymbol; owner = owner.ContainingSymbol)
+                {
+                    if (ReferenceEquals(owner, _function))
+                        return;
+                }
+
+                Report(node, _function is LambdaMethodSymbol
+                    ? ("CN_STATIC001", $"A static anonymous function cannot contain a reference to '{symbol.Name}'.")
+                    : ("CN_STATIC003", $"A static local function cannot contain a reference to '{symbol.Name}'."));
+            }
+
+            private void ReportThis(BoundExpression node)
+            {
+                Report(node, _function is LambdaMethodSymbol
+                    ? ("CN_STATIC002", "A static anonymous function cannot contain a reference to 'this' or 'base'.")
+                    : ("CN_STATIC004", "A static local function cannot contain a reference to 'this' or 'base'."));
+            }
+
+            private void Report(BoundExpression node, (string Id, string Message) error)
+            {
+                _diagnostics.Add(new Diagnostic(error.Id, DiagnosticSeverity.Error, error.Message, new Location(_context.SemanticModel.SyntaxTree, node.Syntax.Span)));
+            }
         }
 
         private bool CanConvertMethodGroupToDelegate(
@@ -504,9 +688,9 @@ namespace Cnidaria.Cs
             DiagnosticBag diagnostics,
             SyntaxNode diagnosticNode,
             bool reportDiagnostics,
-            out NamedTypeSymbol? delegateType,
-            out MethodSymbol? invoke,
-            out MethodSymbol? chosen)
+            [NotNullWhen(true)] out NamedTypeSymbol? delegateType,
+            [NotNullWhen(true)] out MethodSymbol? invoke,
+            [NotNullWhen(true)] out MethodSymbol? chosen)
         {
             delegateType = null;
             invoke = null;
@@ -534,45 +718,87 @@ namespace Cnidaria.Cs
                 .Where(m => m.Parameters.Length == invokeForResolution.Parameters.Length)
                 .ToImmutableArray();
 
-            if (arityCandidates.IsDefaultOrEmpty)
-            {
-                if (reportDiagnostics)
-                {
-                    diagnostics.Add(new Diagnostic(
-                        "CN_MG_CONV002",
-                        DiagnosticSeverity.Error,
-                        $"No overload of '{methodGroup.Name}' is compatible with delegate '{delegateType.Name}'.",
-                        new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
-                }
-
-                return false;
-            }
-
             var syntax = (ExpressionSyntax)methodGroup.Syntax;
             var argsBuilder = ImmutableArray.CreateBuilder<BoundExpression>(invoke.Parameters.Length);
             for (int i = 0; i < invoke.Parameters.Length; i++)
                 argsBuilder.Add(new BoundTypeOnlyExpression(syntax, invoke.Parameters[i].Type));
 
-            var overloadDiagnostics = reportDiagnostics ? diagnostics : new DiagnosticBag();
             var overloadContext = WithRecorder(context, NullBindingRecorder.Instance);
-
-            if (!TryResolveOverload(
-                candidates: arityCandidates,
-                args: argsBuilder.ToImmutable(),
-                getArgExprSyntax: _ => syntax,
-                getArgRefKindKeyword: i => MakeRefKindToken(invokeForResolution.Parameters[i], syntax.Span),
-                getArgName: null,
-                chosen: out var resolvedMethod,
-                convertedArgs: out _,
-                context: overloadContext,
-                diagnostics: overloadDiagnostics,
-                diagnosticNode: diagnosticNode))
+            var overloadDiagnostics = new DiagnosticBag();
+            MethodSymbol? resolvedMethod = null;
+            if (!arityCandidates.IsDefaultOrEmpty)
             {
-                return false;
+                TryResolveOverload(
+                    candidates: arityCandidates,
+                    args: argsBuilder.ToImmutable(),
+                    getArgExprSyntax: _ => syntax,
+                    getArgRefKindKeyword: i => MakeRefKindToken(invokeForResolution.Parameters[i], syntax.Span),
+                    getArgName: null,
+                    chosen: out resolvedMethod,
+                    convertedArgs: out _,
+                    context: overloadContext,
+                    diagnostics: overloadDiagnostics,
+                    diagnosticNode: diagnosticNode);
+            }
+
+            // Extension methods apply when no instance method does, the receiver then becomes their first argument
+            if (resolvedMethod is null && methodGroup.ReceiverOpt is BoundExpression extensionReceiver)
+            {
+                ImmutableArray<MethodSymbol> extensions = LookupExtensionMethods(methodGroup.Name, extensionReceiver, context)
+                    .Where(m => m.Parameters.Length == invokeForResolution.Parameters.Length + 1)
+                    .ToImmutableArray();
+                if (!extensions.IsDefaultOrEmpty)
+                {
+                    argsBuilder.Insert(0, new BoundTypeOnlyExpression(syntax, extensionReceiver.Type));
+                    TryResolveOverload(
+                        candidates: extensions,
+                        args: argsBuilder.ToImmutable(),
+                        getArgExprSyntax: _ => syntax,
+                        getArgRefKindKeyword: i => i == 0 ? null : MakeRefKindToken(invokeForResolution.Parameters[i - 1], syntax.Span),
+                        getArgName: null,
+                        chosen: out resolvedMethod,
+                        convertedArgs: out _,
+                        context: overloadContext,
+                        diagnostics: new DiagnosticBag(),
+                        diagnosticNode: diagnosticNode);
+                }
             }
 
             if (resolvedMethod is null)
+            {
+                if (reportDiagnostics)
+                {
+                    if (arityCandidates.IsDefaultOrEmpty)
+                    {
+                        diagnostics.Add(new Diagnostic(
+                            "CN_MG_CONV002",
+                            DiagnosticSeverity.Error,
+                            $"No overload of '{methodGroup.Name}' is compatible with delegate '{delegateType.Name}'.",
+                            new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                    }
+                    else
+                    {
+                        foreach (Diagnostic diagnostic in overloadDiagnostics.ToImmutable())
+                            diagnostics.Add(diagnostic);
+                    }
+                }
+
                 return false;
+            }
+
+            if (!AreMethodGroupParametersCompatible(resolvedMethod, invoke, syntax, context))
+            {
+                if (reportDiagnostics)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_MG_CONV005",
+                        DiagnosticSeverity.Error,
+                        $"No overload for '{resolvedMethod.Name}' matches delegate '{delegateType.Name}'.",
+                        new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                }
+
+                return false;
+            }
 
             if (!IsMethodGroupReturnCompatible(resolvedMethod, invoke, syntax, context))
             {
@@ -588,7 +814,22 @@ namespace Cnidaria.Cs
                 return false;
             }
 
-            if (!resolvedMethod.IsStatic && methodGroup.ReceiverOpt is null)
+            if (IsClosedExtensionTarget(resolvedMethod, invoke) && (resolvedMethod.Parameters[0].Type.IsValueType || resolvedMethod.Parameters[0].Type is ByRefTypeSymbol or TypeParameterSymbol))
+            {
+                if (reportDiagnostics)
+                {
+                    diagnostics.Add(new Diagnostic(
+                        "CN_MG_CONV006",
+                        DiagnosticSeverity.Error,
+                        $"Extension method '{resolvedMethod.Name}' defined on a value type cannot be used to create delegates.",
+                        new Location(context.SemanticModel.SyntaxTree, diagnosticNode.Span)));
+                }
+
+                return false;
+            }
+
+            // A local function gets its receiver from the closure the conversion creates
+            if (!resolvedMethod.IsStatic && methodGroup.ReceiverOpt is null && resolvedMethod.OriginalDefinition is not LocalFunctionSymbol)
             {
                 if (reportDiagnostics)
                 {
@@ -619,6 +860,33 @@ namespace Cnidaria.Cs
                 ParameterRefKind.In => MakeToken(SyntaxKind.InKeyword, span),
                 _ => null
             };
+        }
+
+        private static bool IsClosedExtensionTarget(MethodSymbol method, MethodSymbol invoke)
+            => method.IsStatic && method.Parameters.Length == invoke.Parameters.Length + 1;
+
+        // A delegate reaches the method with the argument bits it was given, so only conversions that keep them apply
+        private bool AreMethodGroupParametersCompatible(MethodSymbol method, MethodSymbol invoke, ExpressionSyntax syntax, BindingContext context)
+        {
+            int offset = method.Parameters.Length - invoke.Parameters.Length;
+            for (int i = 0; i < invoke.Parameters.Length; i++)
+            {
+                TypeSymbol from = invoke.Parameters[i].Type;
+                TypeSymbol to = method.Parameters[i + offset].Type;
+                if (from is ByRefTypeSymbol || to is ByRefTypeSymbol)
+                {
+                    if (!AreSameType(from, to))
+                        return false;
+
+                    continue;
+                }
+
+                ConversionKind kind = ClassifyConversion(new BoundTypeOnlyExpression(syntax, from), to, context).Kind;
+                if (kind is not (ConversionKind.Identity or ConversionKind.ImplicitReference))
+                    return false;
+            }
+
+            return true;
         }
 
         private bool IsMethodGroupReturnCompatible(
@@ -659,48 +927,217 @@ namespace Cnidaria.Cs
                     diagnostics,
                     diagnosticNode,
                     reportDiagnostics: true,
-                    out var delegateType,
-                    out var invoke,
-                    out var chosen))
+                    out NamedTypeSymbol? delegateType,
+                    out MethodSymbol? invoke,
+                    out MethodSymbol? chosen))
             {
                 var bad = new BoundBadExpression(syntax);
                 bad.SetType(targetType);
                 return bad;
             }
 
+            if (IsClosedExtensionTarget(chosen, invoke))
+                return new BoundDelegateCreationExpression(syntax, delegateType, chosen, methodGroup.ReceiverOpt, isVirtual: false);
+
+            BoundExpression? target = chosen.IsStatic ? null : methodGroup.ReceiverOpt;
+            if (!NeedsMethodGroupWrapper(chosen, target))
+            {
+                bool isVirtual = target is not null && target is not BoundBaseExpression && (chosen.IsVirtual || chosen.IsAbstract);
+                MethodSymbol method = chosen;
+                while (isVirtual && method.OverriddenMethod is MethodSymbol overridden)
+                    method = overridden;
+
+                if (target is not null && target.Type is TypeParameterSymbol)
+                    target = new BoundConversionExpression(syntax, context.Compilation.GetSpecialType(SpecialType.System_Object), target, new Conversion(ConversionKind.Boxing), isChecked: false);
+
+                return new BoundDelegateCreationExpression(syntax, delegateType, method, target, isVirtual);
+            }
+
+            TypeSymbol? valueReceiverType = null;
+            if (target is not null && target.Type.IsValueType)
+            {
+                // A private element preserves the captured struct and mutations without aliasing the source variable.
+                valueReceiverType = target.Type;
+                TypeSymbol intType = context.Compilation.GetSpecialType(SpecialType.System_Int32);
+                target = new BoundArrayCreationExpression(syntax, context.Compilation.CreateArrayType(valueReceiverType, rank: 1), valueReceiverType,
+                    new BoundLiteralExpression(syntax, intType, 1),
+                    new BoundArrayInitializerExpression(syntax, valueReceiverType, ImmutableArray.Create(target)));
+            }
+
+            MethodGroupWrapper wrapper = GetMethodGroupWrapper(chosen, delegateType, invoke, target, valueReceiverType, syntax, diagnosticNode, context, diagnostics);
+            var lambda = new BoundLambdaExpression(
+                syntax,
+                delegateType,
+                wrapper.Method,
+                invoke,
+                wrapper.Body,
+                isStatic: true,
+                isAsync: false,
+                targetOpt: target);
+            return chosen.OriginalDefinition is LocalFunctionSymbol localFunction
+                ? ShareLocalFunctionDelegate(syntax, localFunction, chosen, delegateType, lambda, context)
+                : lambda;
+        }
+
+        // A struct receiver needs a private copy to run on and these others have no body of their own for a delegate to point at
+        private static bool NeedsMethodGroupWrapper(MethodSymbol chosen, BoundExpression? target)
+            => chosen.OriginalDefinition is LocalFunctionSymbol ||
+               chosen.IsExtern ||
+               MethodAttributeFacts.HasIntrinsic(chosen) ||
+               chosen.GetDllImportData() is not null ||
+               (chosen.IsStatic && (chosen.IsAbstract || chosen.IsVirtual)) ||
+               (chosen.ContainingSymbol is NamedTypeSymbol owner && owner.TypeKind == TypeKind.Delegate) ||
+               (target is not null && target.Type is not TypeParameterSymbol && target.Type.IsValueType);
+
+        // Each conversion would build its own closure, so a capturing local function shares one delegate per activation of its scope and a handler can remove itself
+        private BoundExpression ShareLocalFunctionDelegate(
+            ExpressionSyntax syntax,
+            LocalFunctionSymbol localFunction,
+            MethodSymbol chosen,
+            NamedTypeSymbol delegateType,
+            BoundLambdaExpression lambda,
+            BindingContext context)
+        {
+            if (IsDeclaredStatic(localFunction))
+                return lambda;
+
+            LocalScopeBinder? scope = null;
+            for (Binder? binder = this; scope is null && binder is LocalScopeBinder candidate; binder = candidate.Parent)
+            {
+                if (candidate._localFunctions.TryGetValue(localFunction.Name, out LocalFunctionSymbol? found) && ReferenceEquals(found, localFunction))
+                    scope = candidate;
+            }
+
+            if (scope is null)
+                return lambda;
+
+            // A static function around the conversion cannot capture anything, then the local function does not either and has no closure to share
+            for (Symbol? symbol = context.ContainingSymbol; symbol is not null && !ReferenceEquals(symbol, scope._containing); symbol = symbol.ContainingSymbol)
+            {
+                if (IsDeclaredStatic(symbol))
+                    return lambda;
+            }
+
+            LocalSymbol? shared = null;
+            foreach ((MethodSymbol target, NamedTypeSymbol type, LocalSymbol existing) in scope._localFunctionDelegates)
+            {
+                if (ReferenceEquals(target.OriginalDefinition, localFunction) && AreSameType(type, delegateType) && HaveSameTypeArguments(target, chosen))
+                    shared = existing;
+            }
+
+            if (shared is null)
+            {
+                shared = new LocalSymbol("<delegate>", scope._containing, delegateType, ImmutableArray<Location>.Empty);
+                scope._localFunctionDelegates.Add((chosen, delegateType, shared));
+            }
+
+            var assignment = new AssignmentExpressionSyntax(SyntaxKind.CoalesceAssignmentExpression, syntax, MakeToken(SyntaxKind.QuestionQuestionEqualsToken, syntax.Span), syntax);
+            return new BoundNullCoalescingAssignmentExpression(assignment, new BoundLocalExpression(syntax, shared), lambda);
+        }
+
+        internal void DeclareLocalFunctionDelegates(ImmutableArray<BoundStatement>.Builder statements, SyntaxNode syntax)
+        {
+            int index = 0;
+            foreach ((MethodSymbol _, NamedTypeSymbol _, LocalSymbol shared) in _localFunctionDelegates)
+            {
+                var none = new BoundConversionExpression(syntax, shared.Type, new BoundLiteralExpression(syntax, NullTypeSymbol.Instance, null), new Conversion(ConversionKind.NullLiteral), isChecked: false);
+                statements.Insert(index++, new BoundLocalDeclarationStatement(syntax, shared, none));
+            }
+        }
+
+        // A wrapper belongs to the function it is converted in, its parameters and type parameters come from there
+        private MethodGroupWrapper GetMethodGroupWrapper(
+            MethodSymbol chosen,
+            NamedTypeSymbol delegateType,
+            MethodSymbol invoke,
+            BoundExpression? target,
+            TypeSymbol? valueReceiverType,
+            ExpressionSyntax syntax,
+            SyntaxNode diagnosticNode,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
+            // Every conversion of a local function shares the place it is declared in, so a static one stays equal across them
+            Symbol owner = chosen.OriginalDefinition is LocalFunctionSymbol localFunction && localFunction.ContainingSymbol is Symbol declaredIn
+                ? declaredIn
+                : context.ContainingSymbol;
+            Dictionary<MethodSymbol, List<MethodGroupWrapper>> known = context.Compilation.MethodGroupWrappers;
+            if (!known.TryGetValue(chosen.OriginalDefinition, out List<MethodGroupWrapper>? wrappers))
+            {
+                wrappers = new List<MethodGroupWrapper>();
+                known.Add(chosen.OriginalDefinition, wrappers);
+            }
+
+            foreach (MethodGroupWrapper existing in wrappers)
+            {
+                if (ReferenceEquals(existing.Owner, owner) &&
+                    AreSameType(existing.DelegateType, delegateType) &&
+                    AreSameType(existing.ValueReceiverType, valueReceiverType) &&
+                    AreSameType(existing.Target.ContainingSymbol as NamedTypeSymbol, chosen.ContainingSymbol as NamedTypeSymbol) &&
+                    HaveSameTypeArguments(existing.Target, chosen))
+                {
+                    return existing;
+                }
+            }
+
+            MethodGroupWrapper wrapper = CreateMethodGroupWrapper(chosen, delegateType, invoke, target, valueReceiverType, owner, syntax, diagnosticNode, context, diagnostics);
+            wrappers.Add(wrapper);
+            return wrapper;
+        }
+
+        private static bool HaveSameTypeArguments(MethodSymbol left, MethodSymbol right)
+        {
+            if (left.TypeArguments.Length != right.TypeArguments.Length)
+                return false;
+
+            for (int i = 0; i < left.TypeArguments.Length; i++)
+            {
+                if (!AreSameType(left.TypeArguments[i], right.TypeArguments[i]))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private MethodGroupWrapper CreateMethodGroupWrapper(
+            MethodSymbol chosen,
+            NamedTypeSymbol delegateType,
+            MethodSymbol invoke,
+            BoundExpression? target,
+            TypeSymbol? valueReceiverType,
+            Symbol owner,
+            ExpressionSyntax syntax,
+            SyntaxNode diagnosticNode,
+            BindingContext context,
+            DiagnosticBag diagnostics)
+        {
             var lambdaMethod = new LambdaMethodSymbol(
                 name: "<methodgroup>",
-                containing: context.ContainingSymbol,
-                returnType: invoke!.ReturnType,
+                containing: owner,
+                returnType: invoke.ReturnType,
                 parameters: ImmutableArray<ParameterSymbol>.Empty,
                 locations: ImmutableArray.Create(new Location(context.SemanticModel.SyntaxTree, syntax.Span)),
                 isStatic: true,
                 isAsync: false,
-                returnsByRefReadonly: invoke.ReturnsByRefReadonly);
+                returnsByRefReadonly: invoke.ReturnsByRefReadonly,
+                isDeclaredStatic: chosen.OriginalDefinition is LocalFunctionSymbol);
 
-            BoundExpression? receiver = chosen!.IsStatic ? null : methodGroup.ReceiverOpt;
-            BoundExpression? target = receiver;
-            var parameterBuilder = ImmutableArray.CreateBuilder<ParameterSymbol>(invoke.Parameters.Length + (receiver is null ? 0 : 1));
-            if (receiver is not null)
+            BoundExpression? receiver = null;
+            ImmutableArray<ParameterSymbol>.Builder parameterBuilder = ImmutableArray.CreateBuilder<ParameterSymbol>(invoke.Parameters.Length + (target is null ? 0 : 1));
+            if (target is not null)
             {
-                bool valueReceiver = receiver.Type.IsValueType || receiver.Type is TypeParameterSymbol;
-                TypeSymbol receiverType = valueReceiver
-                    ? context.Compilation.CreateArrayType(receiver.Type, rank: 1)
-                    : receiver.Type;
+                TypeSymbol receiverType = target.Type;
+                if (valueReceiverType is null && chosen.ContainingSymbol is NamedTypeSymbol declaringType)
+                    receiverType = declaringType;
+
                 var receiverParameter = new ParameterSymbol("<>receiver", lambdaMethod, receiverType, ImmutableArray<Location>.Empty);
                 parameterBuilder.Add(receiverParameter);
-                BoundExpression receiverValue = new BoundParameterExpression(syntax, receiverParameter);
-                if (valueReceiver)
+                receiver = new BoundParameterExpression(syntax, receiverParameter);
+                if (valueReceiverType is not null)
                 {
-                    // A private element preserves the captured struct and mutations without aliasing the source variable.
-                    TypeSymbol intType = context.Compilation.GetSpecialType(SpecialType.System_Int32);
-                    target = new BoundArrayCreationExpression(syntax, (ArrayTypeSymbol)receiverType, receiver.Type,
-                        new BoundLiteralExpression(syntax, intType, 1),
-                        new BoundArrayInitializerExpression(syntax, receiver.Type, ImmutableArray.Create(receiver)));
-                    receiverValue = new BoundArrayElementAccessExpression(syntax, receiver.Type, receiverValue,
-                        new BoundLiteralExpression(syntax, intType, 0));
+                    receiver = new BoundArrayElementAccessExpression(syntax, valueReceiverType, receiver,
+                        new BoundLiteralExpression(syntax, context.Compilation.GetSpecialType(SpecialType.System_Int32), 0));
                 }
-                receiver = receiverValue;
             }
             int receiverCount = parameterBuilder.Count;
             for (int i = 0; i < invoke.Parameters.Length; i++)
@@ -728,7 +1165,7 @@ namespace Cnidaria.Cs
             for (int i = 0; i < invoke.Parameters.Length; i++)
             {
                 BoundExpression arg = new BoundParameterExpression(syntax, lambdaMethod.Parameters[i + receiverCount]);
-                var targetParameter = chosen!.Parameters[i];
+                ParameterSymbol targetParameter = chosen.Parameters[i];
                 var refKind = targetParameter.RefKind;
                 if (refKind == ParameterRefKind.None && targetParameter.Type is ByRefTypeSymbol)
                     refKind = targetParameter.IsReadOnlyRef ? ParameterRefKind.In : ParameterRefKind.Ref;
@@ -773,15 +1210,7 @@ namespace Cnidaria.Cs
                     ImmutableArray.Create<BoundStatement>(new BoundReturnStatement(syntax, returnValue)));
             }
 
-            return new BoundLambdaExpression(
-                syntax,
-                delegateType!,
-                lambdaMethod,
-                invoke,
-                body,
-                isStatic: true,
-                isAsync: false,
-                targetOpt: target);
+            return new MethodGroupWrapper(chosen, delegateType, valueReceiverType, owner, lambdaMethod, body);
         }
 
         private BoundExpression BindDefaultExpression(
