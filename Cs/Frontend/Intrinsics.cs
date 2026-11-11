@@ -13,6 +13,7 @@ namespace Cnidaria.Cs
         MemoryBarrier,
         VolatileRead,
         VolatileWrite,
+        InteropSys,
     }
 
     [Flags]
@@ -186,10 +187,29 @@ namespace Cnidaria.Cs
             RuntimeIntrinsicFlags.GlobalRef |
             RuntimeIntrinsicFlags.Ordered;
 
+        private const RuntimeIntrinsicFlags SystemCallFlags =
+            RuntimeIntrinsicFlags.SpecialImport |
+            RuntimeIntrinsicFlags.NoInline |
+            RuntimeIntrinsicFlags.NoGcSafePoint |
+            RuntimeIntrinsicFlags.UsesCallAbi |
+            RuntimeIntrinsicFlags.SideEffect |
+            RuntimeIntrinsicFlags.CanThrow |
+            RuntimeIntrinsicFlags.MemoryRead |
+            RuntimeIntrinsicFlags.MemoryWrite |
+            RuntimeIntrinsicFlags.GlobalRef |
+            RuntimeIntrinsicFlags.Indirect |
+            RuntimeIntrinsicFlags.Ordered;
+
         public static RuntimeIntrinsicId GetIntrinsicId(RuntimeMethod? method)
         {
             if (method is null)
                 return RuntimeIntrinsicId.None;
+
+            if (!method.HasThis && method.IsStatic && method.DeclaringType.AssemblyName == "std" &&
+                method.DeclaringType.Namespace.Length == 0 && method.DeclaringType.Name == "Interop+Sys")
+            {
+                return RuntimeIntrinsicId.InteropSys;
+            }
 
             if (!method.HasThis &&
                 method.IsStatic &&
@@ -278,6 +298,7 @@ namespace Cnidaria.Cs
                 RuntimeIntrinsicId.InterlockedOr => AtomicReadModifyWriteFlags,
                 RuntimeIntrinsicId.InterlockedAnd => AtomicReadModifyWriteFlags,
                 RuntimeIntrinsicId.MemoryBarrier or RuntimeIntrinsicId.VolatileRead or RuntimeIntrinsicId.VolatileWrite => MemoryBarrierFlags,
+                RuntimeIntrinsicId.InteropSys => SystemCallFlags,
                 _ => RuntimeIntrinsicFlags.None,
             };
 
@@ -298,6 +319,9 @@ namespace Cnidaria.Cs
 
             switch (id)
             {
+                case RuntimeIntrinsicId.InteropSys:
+                    intrinsic = new RuntimeIntrinsicInfo(id, SystemCallFlags);
+                    return true;
                 case RuntimeIntrinsicId.InterlockedCompareExchange:
                     if (TryGetInterlockedCompareExchange(method, target.PointerSize, out var compareExchange))
                     {
@@ -338,16 +362,20 @@ namespace Cnidaria.Cs
             return false;
         }
 
-        // Every backend with a code generator expands all of these; the bodies left in the BCL recurse
         public static bool Supports(RuntimeIntrinsicId id, TargetInfo target)
-            => id != RuntimeIntrinsicId.None && target.Architecture is
-                Cnidaria.TargetArchitectureKind.RegisterBytecode or
-                Cnidaria.TargetArchitectureKind.RegisterBytecode64 or
-                Cnidaria.TargetArchitectureKind.I386 or
-                Cnidaria.TargetArchitectureKind.X86_64 or
-                Cnidaria.TargetArchitectureKind.RiscV32 or
-                Cnidaria.TargetArchitectureKind.RiscV64 or
-                Cnidaria.TargetArchitectureKind.Arm64;
+            => id switch
+            {
+                RuntimeIntrinsicId.None => false,
+                RuntimeIntrinsicId.InteropSys => target.IsRegisterBytecode,
+                _ => target.Architecture is
+                    Cnidaria.TargetArchitectureKind.RegisterBytecode or
+                    Cnidaria.TargetArchitectureKind.RegisterBytecode64 or
+                    Cnidaria.TargetArchitectureKind.I386 or
+                    Cnidaria.TargetArchitectureKind.X86_64 or
+                    Cnidaria.TargetArchitectureKind.RiscV32 or
+                    Cnidaria.TargetArchitectureKind.RiscV64 or
+                    Cnidaria.TargetArchitectureKind.Arm64,
+            };
 
         private static bool TryGetInterlockedCompareExchange(
             RuntimeMethod method,

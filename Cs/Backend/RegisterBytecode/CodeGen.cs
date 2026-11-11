@@ -31,7 +31,8 @@ namespace Cnidaria.Cs
             var imports = ImmutableArray.CreateBuilder<RegisterBytecodeImport>();
             foreach (var method in program.Methods)
                 foreach (GenTree node in method.LinearNodes)
-                    if (node.Method is RuntimeMethod foreign && foreign.IsExtern && !foreign.HasInternalCall && !methodEntryLabels.ContainsKey(foreign.MethodId))
+                    if (node.Method is RuntimeMethod foreign && foreign.IsExtern && !foreign.HasInternalCall &&
+                        !methodEntryLabels.ContainsKey(foreign.MethodId) && !RuntimeIntrinsics.TryResolve(foreign, target, out _))
                     {
                         imports.Add(RegisterBytecodeLinker.Import(foreign, target));
                         methodEntryLabels.Add(foreign.MethodId, asm.CreateLabel());
@@ -418,7 +419,7 @@ namespace Cnidaria.Cs
 
             private void EmitCallForTarget(RuntimeMethod target, CallFlags flags)
             {
-                if (target.HasInternalCall)
+                if (target.HasInternalCall || RuntimeIntrinsics.GetIntrinsicId(target) == RuntimeIntrinsicId.InteropSys)
                 {
                     _asm.Emit(InstrDesc.Call(Op.CallInternal, target.MethodId, flags | CallFlags.InternalCall));
                     return;
@@ -2668,6 +2669,7 @@ namespace Cnidaria.Cs
                         case RuntimeIntrinsicId.InterlockedExchange:
                         case RuntimeIntrinsicId.InterlockedOr:
                         case RuntimeIntrinsicId.InterlockedAnd:
+                        case RuntimeIntrinsicId.InteropSys:
                         case RuntimeIntrinsicId.MemoryBarrier:
                             {
                                 CallFlags intrinsicFlags = BuildCallFlags(method, Op.CallInternal) & ~CallFlags.GcSafePoint;

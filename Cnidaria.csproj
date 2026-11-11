@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <OutputType>Library</OutputType>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net11.0</TargetFramework>
     <ImplicitUsings>disable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -24,7 +24,7 @@
 
   <PropertyGroup>
     <PackageId>Cnidaria</PackageId>
-    <Version>3.6.3</Version>
+    <Version>3.6.4</Version>
     <Authors>equmag</Authors>
     <Description>Lightweight RCE safe compiler collection</Description>
 

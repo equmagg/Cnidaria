@@ -2,8 +2,10 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Threading;
 using System.IO;
 
@@ -3410,6 +3412,8 @@ namespace Cnidaria.Cs
             {
                 switch (runtimeIntrinsic.Id)
                 {
+                    case RuntimeIntrinsicId.InteropSys:
+                        return IntrinsicInteropSys(rm);
                     case RuntimeIntrinsicId.InterlockedCompareExchange:
                         return IntrinsicInterlockedCompareExchange(rm, runtimeIntrinsic.CompareExchange);
                     case RuntimeIntrinsicId.InterlockedExchangeAdd:
@@ -3720,6 +3724,37 @@ namespace Cnidaria.Cs
                 throw new NotSupportedException($"InternalCall is not implemented: {rm.DeclaringType.Namespace}.{rm.DeclaringType.Name}.{rm.Name}");
 
             return false;
+        }
+
+        private bool IntrinsicInteropSys(RuntimeMethod rm)
+        {
+            switch (rm.Name)
+            {
+                case "GetNonCryptographicallySecureRandomBytes":
+                case "GetCryptographicallySecureRandomBytes":
+                    {
+                        int size = checked((int)ReadAbiScalarArgument(rm, 1));
+                        if (size != 0)
+                        {
+                            int address = checked((int)ReadAbiScalarArgument(rm, 0));
+                            CheckIndirectAccess(address, size, writable: true);
+                            RandomNumberGenerator.Fill(_mem.AsSpan(address, size));
+                        }
+                        SetZeroReturnIfNonVoid(rm);
+                        return true;
+                    }
+                case "GetTimestamp":
+                    SetGpr(MachineRegisters.ReturnValue0, (long)((Int128)Stopwatch.GetTimestamp() * 1_000_000_000 / Stopwatch.Frequency));
+                    return true;
+                case "GetSystemTimeAsTicks":
+                    SetGpr(MachineRegisters.ReturnValue0, DateTime.UtcNow.Ticks - DateTime.UnixEpoch.Ticks);
+                    return true;
+                case "GetLowResolutionTimestamp":
+                    SetGpr(MachineRegisters.ReturnValue0, Environment.TickCount64);
+                    return true;
+                default:
+                    throw new NotSupportedException($"Interop.Sys intrinsic is not implemented: {rm.Name}");
+            }
         }
 
         private void SetZeroReturnIfNonVoid(RuntimeMethod rm)
