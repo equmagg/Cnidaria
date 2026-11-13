@@ -1,6 +1,8 @@
 typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;
+typedef unsigned long long u64;
+typedef signed long long i64;
 
 #if __SIZEOF_POINTER__ == 8
 typedef unsigned long long usize;
@@ -31,27 +33,58 @@ rh_bytes __riscv_vmv_v_x_u8m8(u8 rs1, usize vl);
 #if defined(__linux__) && (defined(__riscv) || defined(__aarch64__))
 #define RH_SYS_WRITE 64ul
 #define RH_SYS_EXIT 93ul
+#define RH_SYS_EXIT_GROUP 94ul
 #define RH_SYS_MUNMAP 215ul
 #define RH_SYS_MMAP 222ul
 #define RH_SYS_MPROTECT 226ul
 #define RH_SYS_GETTID 178ul
 #define RH_SYS_GETCPU 168ul
+#define RH_SYS_SCHED_YIELD 124ul
+#define RH_SYS_CLONE 220ul
+#define RH_SYS_GETPID 172ul
+#define RH_SYS_GETEUID 175ul
+#define RH_SYS_GETRANDOM 278ul
+#if __SIZEOF_POINTER__ == 8
+#define RH_SYS_FUTEX 98ul
+#define RH_SYS_CLOCK_GETTIME 113ul
+#else
+#define RH_SYS_FUTEX 422ul
+#define RH_SYS_CLOCK_GETTIME 403ul
+#endif
 #elif defined(__linux__) && defined(__x86_64__)
 #define RH_SYS_WRITE 1ul
 #define RH_SYS_EXIT 60ul
+#define RH_SYS_EXIT_GROUP 231ul
 #define RH_SYS_MUNMAP 11ul
 #define RH_SYS_MMAP 9ul
 #define RH_SYS_MPROTECT 10ul
 #define RH_SYS_GETTID 186ul
 #define RH_SYS_GETCPU 309ul
+#define RH_SYS_SCHED_YIELD 24ul
+#define RH_SYS_CLONE 56ul
+#define RH_SYS_GETPID 39ul
+#define RH_SYS_GETEUID 107ul
+#define RH_SYS_GETRANDOM 318ul
+#define RH_SYS_FUTEX 202ul
+#define RH_SYS_CLOCK_GETTIME 228ul
+#define RH_SYS_ARCH_PRCTL 158ul
 #elif defined(__linux__) && defined(__i386__)
 #define RH_SYS_WRITE 4ul
 #define RH_SYS_EXIT 1ul
+#define RH_SYS_EXIT_GROUP 252ul
 #define RH_SYS_MUNMAP 91ul
 #define RH_SYS_MMAP 90ul
 #define RH_SYS_MPROTECT 125ul
 #define RH_SYS_GETTID 224ul
 #define RH_SYS_GETCPU 318ul
+#define RH_SYS_SCHED_YIELD 158ul
+#define RH_SYS_CLONE 120ul
+#define RH_SYS_GETPID 20ul
+#define RH_SYS_GETEUID 201ul
+#define RH_SYS_GETRANDOM 355ul
+#define RH_SYS_FUTEX 422ul
+#define RH_SYS_CLOCK_GETTIME 403ul
+#define RH_SYS_SET_THREAD_AREA 243ul
 #elif defined(_WIN32)
 #define RH_WIN_MEM_COMMIT 0x00001000u
 #define RH_WIN_MEM_RESERVE 0x00002000u
@@ -87,6 +120,8 @@ rh_bytes __riscv_vmv_v_x_u8m8(u8 rs1, usize vl);
 #define RH_ROOT_STACK_POINTER 4ul
 #define RH_POLL_COLLECT 1u
 #define RH_POLL_FINALIZE 2u
+#define RH_POLL_SUSPEND 4u
+#define RH_THREAD_STACK_SIZE (1024ul * 1024ul)
 #define RH_HANDLE_WEAK 0ul
 #define RH_HANDLE_WEAK_TRACK_RESURRECTION 1ul
 #define RH_HANDLE_NORMAL 2ul
@@ -278,7 +313,6 @@ typedef struct RhHandleChunk
     RhHandleSlot slots[RH_HANDLE_CHUNK_SLOTS];
 } RhHandleChunk;
 
-static volatile usize rh_stack_base;
 static const RhSafePoint* rh_safe_points;
 static usize rh_safe_point_count;
 static const RhTypeInfo* rh_type_infos;
@@ -299,9 +333,6 @@ static RhBlock* rh_mark_stack;
 static RhBlock* rh_free_buckets[RH_FREE_BUCKET_COUNT];
 static void* rh_interior_batch[RH_INTERIOR_BATCH_SIZE];
 static usize rh_interior_batch_count;
-static int rh_gc_running;
-static RhObject* rh_delegate_temporary_root;
-static RhDispatchRecord* rh_dispatches;
 static RhHandleChunk* rh_handle_chunks;
 static RhHandleSlot* rh_handle_free;
 static RhObject** rh_finalizer_queue;
@@ -311,10 +342,15 @@ static RhObject** rh_finalizer_ready;
 static usize rh_finalizer_ready_head;
 static usize rh_finalizer_ready_tail;
 static usize rh_finalizer_ready_capacity;
-static usize rh_monitors_held;
-static int rh_finalizers_running;
+static volatile u32 rh_finalizers_running;
+static volatile u32 rh_lock_word;
+static volatile u32 rh_park_sequence;
 extern const RhCodeRegion RhpRuntimeRegions[];
 extern const usize RhpRuntimeRegionCount;
+// The offset of each root inside a thread's statics stands where a static root keeps its address
+extern const RhStaticRoot RhpThreadStaticRoots[];
+extern const usize RhpThreadStaticRootCount;
+extern const usize RhpThreadStaticSize;
 void RhpCollect(void);
 
 static const RhCodeRegion* rh_regions;
@@ -948,6 +984,190 @@ static void rh_windows_exit(u32 code)
 }
 #endif
 
+typedef struct RhThread RhThread;
+typedef struct RhClassInit RhClassInit;
+typedef void (*RhBlockingFunction)(void* argument);
+
+// Managed code finds its thread statics one pointer past the thread pointer
+struct RhThread
+{
+    RhThread* self;
+    u8* statics;
+    RhThread* next;
+    RhClassInit* waiting_initializer;
+    usize stack_base;
+    RhDispatchRecord* dispatches;
+    RhUnwindContext* context;
+    RhObject* delegate_root;
+    RhBlockingFunction blocking_function;
+    void* blocking_argument;
+    const void* entry;
+    void* parameter;
+    u8* mapping;
+    usize mapping_size;
+    usize monitors_held;
+    volatile u32 safe;
+    volatile u32 running;
+};
+
+static RhThread rh_main_thread;
+
+#if defined(_WIN32)
+u32 RhpTlsIndex;
+#endif
+
+#if defined(__linux__) && defined(__i386__)
+typedef struct RhUserDescriptor
+{
+    u32 entry_number;
+    u32 base_address;
+    u32 limit;
+    u32 flags;
+} RhUserDescriptor;
+
+static u32 rh_thread_area_entry;
+#endif
+
+static RhThread* rh_current_thread(void)
+{
+    RhThread* thread;
+#if defined(__riscv)
+    __asm__ volatile("mv %[thread], tp" : [thread] "=r"(thread) : : "memory");
+#elif defined(__linux__) && defined(__aarch64__)
+    __asm__ volatile("mrs %[thread], tpidr_el0" : [thread] "=r"(thread) : : "memory");
+#elif defined(__linux__) && defined(__x86_64__)
+    __asm__ volatile(".byte 0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00" : "={rax}"(thread) : : "memory");
+#elif defined(__linux__) && defined(__i386__)
+    __asm__ volatile(".byte 0x65, 0xa1, 0x00, 0x00, 0x00, 0x00" : "={eax}"(thread) : : "memory");
+#elif defined(_WIN32) && defined(__x86_64__)
+    usize slot = (usize)RhpTlsIndex;
+    __asm__ volatile(".byte 0x65, 0x48, 0x8b, 0x04, 0xc5, 0x80, 0x14, 0x00, 0x00" : "+{rax}"(slot) : : "memory");
+    thread = (RhThread*)slot;
+#elif defined(_WIN32) && defined(__i386__)
+    usize slot = (usize)RhpTlsIndex;
+    __asm__ volatile(".byte 0x64, 0x8b, 0x04, 0x85, 0x10, 0x0e, 0x00, 0x00" : "+{eax}"(slot) : : "memory");
+    thread = (RhThread*)slot;
+#elif defined(_WIN32) && defined(__aarch64__)
+    usize slot = (usize)RhpTlsIndex * 8ul + 0x1480ul;
+    __asm__ volatile("ldr %[thread], [x18, %[slot]]" : [thread] "=&r"(thread) : [slot] "r"(slot) : "memory");
+#endif
+    return thread;
+}
+
+static void rh_set_current_thread(RhThread* thread)
+{
+#if defined(__riscv)
+    __asm__ volatile("mv tp, %[thread]" : : [thread] "r"(thread) : "memory");
+#elif defined(__linux__) && defined(__aarch64__)
+    __asm__ volatile("msr tpidr_el0, %[thread]" : : [thread] "r"(thread) : "memory");
+#elif defined(__linux__) && defined(__x86_64__)
+    rh_syscall2(RH_SYS_ARCH_PRCTL, 0x1002ul, (usize)thread);
+#elif defined(__linux__) && defined(__i386__)
+    RhUserDescriptor descriptor;
+    descriptor.entry_number = 0xffffffffu;
+    descriptor.base_address = (u32)thread;
+    descriptor.limit = 0xfffffu;
+    descriptor.flags = 0x51u;
+    rh_syscall1(RH_SYS_SET_THREAD_AREA, (usize)&descriptor);
+    rh_thread_area_entry = descriptor.entry_number;
+    __asm__ volatile(".byte 0x8e, 0xe8" : : "{eax}"(descriptor.entry_number * 8u + 3u) : "memory");
+#elif defined(_WIN32) && defined(__x86_64__)
+    __asm__ volatile(
+        ".byte 0x65, 0x48, 0x89, 0x0c, 0xc5, 0x80, 0x14, 0x00, 0x00"
+        :
+        : "{rax}"((usize)RhpTlsIndex), "{rcx}"(thread)
+        : "memory");
+#elif defined(_WIN32) && defined(__i386__)
+    __asm__ volatile(
+        ".byte 0x64, 0x89, 0x0c, 0x85, 0x10, 0x0e, 0x00, 0x00"
+        :
+        : "{eax}"((usize)RhpTlsIndex), "{ecx}"(thread)
+        : "memory");
+#elif defined(_WIN32) && defined(__aarch64__)
+    usize slot = (usize)RhpTlsIndex * 8ul + 0x1480ul;
+    __asm__ volatile("str %[thread], [x18, %[slot]]" : : [thread] "r"(thread), [slot] "r"(slot) : "memory");
+#endif
+}
+
+#if defined(_WIN32) && defined(__x86_64__)
+#define RH_WINDOWS_IMPORT(name) \
+static usize rh_windows_##name(usize a, usize b, usize c, usize d) \
+{ \
+    usize result; \
+    __asm__ volatile( \
+        "sub rsp, 48\n" \
+        "mov qword ptr[rsp + 32], 0\n" \
+        "mov qword ptr[rsp + 40], 0\n" \
+        "call qword ptr[rip + __imp_" #name "]\n" \
+        "add rsp, 48" \
+        : "={rax}"(result), "+{rcx}"(a), "+{rdx}"(b), "+{r8}"(c), "+{r9}"(d) \
+        : \
+        : "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "cc", "memory"); \
+    return result; \
+}
+#elif defined(_WIN32) && defined(__i386__)
+#define RH_WINDOWS_IMPORT(name) \
+static usize rh_windows_##name(usize a, usize b, usize c, usize d) \
+{ \
+    usize result = a; \
+    __asm__ volatile( \
+        "push esi\n" \
+        "mov esi, esp\n" \
+        "push 0\n" \
+        "push 0\n" \
+        "push edi\n" \
+        "push edx\n" \
+        "push ecx\n" \
+        "push eax\n" \
+        "call dword ptr[__imp_" #name "]\n" \
+        "mov esp, esi\n" \
+        "pop esi" \
+        : "+{eax}"(result), "+{ecx}"(b), "+{edx}"(c) \
+        : "{edi}"(d) \
+        : "cc", "memory"); \
+    return result; \
+}
+#elif defined(_WIN32) && defined(__aarch64__)
+#define RH_WINDOWS_IMPORT(name) \
+static usize rh_windows_##name(usize a, usize b, usize c, usize d) \
+{ \
+    usize result = a; \
+    __asm__ volatile( \
+        "sub sp, sp, #16\n" \
+        "str x30, [sp]\n" \
+        "mov x4, #0\n" \
+        "mov x5, #0\n" \
+        "ldr x16, __imp_" #name "\n" \
+        "blr x16\n" \
+        "ldr x30, [sp]\n" \
+        "add sp, sp, #16" \
+        : "+{x0}"(result) \
+        : "{x1}"(b), "{x2}"(c), "{x3}"(d) \
+        : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", \
+        "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "memory"); \
+    return result; \
+}
+#endif
+
+#if defined(_WIN32)
+RH_WINDOWS_IMPORT(TlsAlloc)
+RH_WINDOWS_IMPORT(CreateThread)
+RH_WINDOWS_IMPORT(CloseHandle)
+RH_WINDOWS_IMPORT(SwitchToThread)
+RH_WINDOWS_IMPORT(WaitOnAddress)
+RH_WINDOWS_IMPORT(WakeByAddressSingle)
+RH_WINDOWS_IMPORT(WakeByAddressAll)
+RH_WINDOWS_IMPORT(QueryPerformanceCounter)
+RH_WINDOWS_IMPORT(QueryPerformanceFrequency)
+RH_WINDOWS_IMPORT(GetSystemTimeAsFileTime)
+RH_WINDOWS_IMPORT(GetCurrentProcessId)
+RH_WINDOWS_IMPORT(BCryptGenRandom)
+#endif
+
+static RhThread* rh_threads;
+static RhThread* rh_dead_threads;
+static RhThread* volatile rh_suspender;
+
 static usize rh_align_up(usize value, usize alignment)
 {
     return (value + alignment - 1ul) & ~(alignment - 1ul);
@@ -1233,6 +1453,7 @@ static void rh_eh_run_terminal_handlers(const RhCodeRegion* region, const RhUnwi
 // Filter exceptions stop at the filter frame; other unhandled exceptions fail fast before unwinding.
 static void rh_eh_dispatch(RhObject* exception, const RhUnwindContext* thrower)
 {
+    RhThread* thread = rh_current_thread();
     RhUnwindContext context = *thrower;
     const RhCodeRegion* region;
     usize depth = 0ul;
@@ -1242,8 +1463,8 @@ static void rh_eh_dispatch(RhObject* exception, const RhUnwindContext* thrower)
     RhDispatchRecord record;
     record.exception = exception;
     record.filtering = thrower;
-    record.next = rh_dispatches;
-    rh_dispatches = &record;
+    record.next = thread->dispatches;
+    thread->dispatches = &record;
 
     for (;;)
     {
@@ -1283,8 +1504,8 @@ static void rh_eh_dispatch(RhObject* exception, const RhUnwindContext* thrower)
     if (target_clause < 0)
     {
         rh_unwind_step(&context, region);
-        while (rh_dispatches != (RhDispatchRecord*)0 && (usize)rh_dispatches < context.sp)
-            rh_dispatches = rh_dispatches->next;
+        while (thread->dispatches != (RhDispatchRecord*)0 && (usize)thread->dispatches < context.sp)
+            thread->dispatches = thread->dispatches->next;
         RhpResume(&context, (const void*)RhpCallFuncletReturnFalse);
     }
 
@@ -1299,8 +1520,8 @@ static void rh_eh_dispatch(RhObject* exception, const RhUnwindContext* thrower)
         }
         continuation = (const void*)RhpCallFunclet(target->handler, &context, exception);
         // Dispatches abandoned by an exception escaping their finally live below the resumed frame
-        while (rh_dispatches != (RhDispatchRecord*)0 && (usize)rh_dispatches < context.sp)
-            rh_dispatches = rh_dispatches->next;
+        while (thread->dispatches != (RhDispatchRecord*)0 && (usize)thread->dispatches < context.sp)
+            thread->dispatches = thread->dispatches->next;
         RhpResume(&context, continuation);
     }
     RhpFallbackFailFast(150);
@@ -1677,7 +1898,7 @@ static usize rh_encode_utf8(u32 scalar, u8* buffer)
 void RhpFallbackFailFast(int code)
 {
 #if defined(__linux__)
-    rh_syscall1(RH_SYS_EXIT, (usize)code);
+    rh_syscall1(RH_SYS_EXIT_GROUP, (usize)code);
 #elif defined(_WIN32)
     rh_windows_exit((u32)code);
 #endif
@@ -2048,12 +2269,832 @@ static void rh_cpu_relax(void)
 #endif
 }
 
+static u32 rh_atomic_compare_exchange32(volatile u32* address, u32 comparand, u32 value)
+{
+#if defined(__riscv_zacas)
+    isize original = (isize)(int)comparand;
+    __asm__ volatile(
+        "amocas.w.aqrl %[original], %[value], (%[address])"
+        : [original] "+&r"(original)
+        : [address] "r"(address), [value] "r"((isize)(int)value)
+        : "memory");
+    return (u32)original;
+#elif defined(__riscv_zalrsc)
+    isize original;
+    isize status;
+    __asm__ volatile(
+        ".Lrh_cas32_retry_%=:\n"
+        "lr.w.aqrl %[original], (%[address])\n"
+        "bne %[original], %[comparand], .Lrh_cas32_done_%=\n"
+        "sc.w.aqrl %[status], %[value], (%[address])\n"
+        "bne %[status], zero, .Lrh_cas32_retry_%=\n"
+        ".Lrh_cas32_done_%=:"
+        : [original] "=&r"(original), [status] "=&r"(status)
+        : [address] "r"(address), [comparand] "r"((isize)(int)comparand), [value] "r"((isize)(int)value)
+        : "memory");
+    return (u32)original;
+#elif defined(__riscv)
+    (void)address;
+    (void)comparand;
+    (void)value;
+    RhpFallbackFailFast(154);
+    return 0u;
+#elif defined(__x86_64__) || defined(__i386__)
+    u32 original = comparand;
+    __asm__ volatile(
+        ".byte 0xf0\n"
+        "cmpxchg dword ptr[%[address]], %[value]"
+        : [original] "+&{eax}"(original)
+        : [address] "r"(address), [value] "r"(value)
+        : "cc", "memory");
+    return original;
+#elif defined(__aarch64__)
+    u32 original;
+    u32 status;
+    __asm__ volatile(
+        ".Lrh_cas32_retry_%=:\n"
+        "ldaxr %w[original], [%[address]]\n"
+        "cmp %w[original], %w[comparand]\n"
+        "b.ne .Lrh_cas32_done_%=\n"
+        "stlxr %w[status], %w[value], [%[address]]\n"
+        "cbnz %w[status], .Lrh_cas32_retry_%=\n"
+        ".Lrh_cas32_done_%=:"
+        : [original] "=&r"(original), [status] "=&r"(status)
+        : [address] "r"(address), [comparand] "r"(comparand), [value] "r"(value)
+        : "cc", "memory");
+    return original;
+#endif
+}
+
+static void rh_memory_barrier(void)
+{
+#if defined(__aarch64__)
+    __asm__ volatile("dmb ish" : : : "memory");
+#elif defined(__riscv)
+    __asm__ volatile("fence rw, rw" : : : "memory");
+#elif defined(__x86_64__)
+    __asm__ volatile(".byte 0xf0\nor dword ptr[rsp], 0" : : : "cc", "memory");
+#elif defined(__i386__)
+    __asm__ volatile(".byte 0xf0\nor dword ptr[esp], 0" : : : "cc", "memory");
+#endif
+}
+
+static u32 rh_atomic_exchange32(volatile u32* address, u32 value)
+{
+    for (;;)
+    {
+        u32 original = *address;
+        if (rh_atomic_compare_exchange32(address, original, value) == original)
+        {
+            rh_memory_barrier();
+            return original;
+        }
+    }
+}
+
+static u32 rh_atomic_add32(volatile u32* address, u32 value)
+{
+    for (;;)
+    {
+        u32 original = *address;
+        if (rh_atomic_compare_exchange32(address, original, original + value) == original)
+            return original;
+    }
+}
+
+static void rh_atomic_or32(volatile u32* address, u32 bits)
+{
+    for (;;)
+    {
+        u32 original = *address;
+        if ((original & bits) == bits || rh_atomic_compare_exchange32(address, original, original | bits) == original)
+            return;
+    }
+}
+
+static void rh_atomic_and32(volatile u32* address, u32 bits)
+{
+    for (;;)
+    {
+        u32 original = *address;
+        if ((original & ~bits) == 0u || rh_atomic_compare_exchange32(address, original, original & bits) == original)
+            return;
+    }
+}
+
+static void rh_yield(void)
+{
+#if defined(__linux__)
+    rh_syscall1(RH_SYS_SCHED_YIELD, 0ul);
+#elif defined(_WIN32)
+    rh_windows_SwitchToThread(0ul, 0ul, 0ul, 0ul);
+#endif
+}
+
+static i64 rh_monotonic_time(void)
+{
+#if defined(__linux__)
+    i64 time[2];
+    time[0] = 0;
+    time[1] = 0;
+    rh_syscall2(RH_SYS_CLOCK_GETTIME, 1ul, (usize)time);
+    return time[0] * 1000000000ll + time[1];
+#elif defined(_WIN32)
+    i64 counter = 0;
+    i64 frequency = 0;
+    rh_windows_QueryPerformanceCounter((usize)&counter, 0ul, 0ul, 0ul);
+    rh_windows_QueryPerformanceFrequency((usize)&frequency, 0ul, 0ul, 0ul);
+    if (frequency <= 0)
+        return 0;
+    return counter / frequency * 1000000000ll + counter % frequency * 1000000000ll / frequency;
+#endif
+}
+
+// Returns zero when the timeout ran out, a negative timeout waits forever
+static int rh_futex_wait(volatile u32* address, u32 expected, isize timeout_milliseconds)
+{
+#if defined(__linux__)
+    i64 time[2];
+    isize result;
+    if (timeout_milliseconds < 0l)
+    {
+        rh_syscall6(RH_SYS_FUTEX, (usize)address, 128ul, (usize)expected, 0ul, 0ul, 0ul);
+        return 1;
+    }
+    time[0] = (i64)(timeout_milliseconds / 1000l);
+    time[1] = (i64)(timeout_milliseconds % 1000l) * 1000000ll;
+    result = rh_syscall6(RH_SYS_FUTEX, (usize)address, 128ul, (usize)expected, (usize)time, 0ul, 0ul);
+    return result != -110l;
+#elif defined(_WIN32)
+    u32 compare = expected;
+    usize timeout = timeout_milliseconds < 0l ? 0xfffffffful : (usize)timeout_milliseconds;
+    return (u32)rh_windows_WaitOnAddress((usize)address, (usize)&compare, 4ul, timeout) != 0u;
+#endif
+}
+
+static void rh_futex_wake(volatile u32* address, int all)
+{
+#if defined(__linux__)
+    rh_syscall6(RH_SYS_FUTEX, (usize)address, 129ul, all != 0 ? 0x7ffffffful : 1ul, 0ul, 0ul, 0ul);
+#elif defined(_WIN32)
+    if (all != 0)
+        rh_windows_WakeByAddressAll((usize)address, 0ul, 0ul, 0ul);
+    else
+        rh_windows_WakeByAddressSingle((usize)address, 0ul, 0ul, 0ul);
+#endif
+}
+
+// Held only across a few instructions and never across a safe point, so a collection finds it free
+static void rh_lock(void)
+{
+    usize spins = 0ul;
+    while (rh_atomic_compare_exchange32(&rh_lock_word, 0u, 1u) != 0u)
+    {
+        spins = spins + 1ul;
+        if (spins < 32ul)
+            rh_cpu_relax();
+        else
+            rh_yield();
+    }
+}
+
+static void rh_unlock(void)
+{
+    rh_atomic_exchange32(&rh_lock_word, 0u);
+}
+
+// A safe thread stays out of the managed heap, a null context means it has no managed frames
+static void rh_thread_enter_safe(RhThread* thread, RhUnwindContext* context)
+{
+    thread->context = context;
+    rh_atomic_exchange32(&thread->safe, 1u);
+    if ((RhpGcPollRequested & RH_POLL_SUSPEND) != 0u)
+    {
+        rh_atomic_add32(&rh_park_sequence, 1u);
+        rh_futex_wake(&rh_park_sequence, 1);
+    }
+}
+
+static void rh_thread_leave_safe(RhThread* thread)
+{
+    for (;;)
+    {
+        u32 poll;
+        while (((poll = RhpGcPollRequested) & RH_POLL_SUSPEND) != 0u)
+            (void)rh_futex_wait(&RhpGcPollRequested, poll, -1l);
+        rh_atomic_exchange32(&thread->safe, 0u);
+        if ((RhpGcPollRequested & RH_POLL_SUSPEND) == 0u)
+            return;
+        rh_thread_enter_safe(thread, thread->context);
+    }
+}
+
+static int rh_suspend_begin(RhThread* self)
+{
+    rh_lock();
+    if (rh_suspender != (RhThread*)0)
+    {
+        rh_unlock();
+        return 0;
+    }
+    rh_suspender = self;
+    rh_atomic_or32(&RhpGcPollRequested, RH_POLL_SUSPEND);
+    rh_unlock();
+    rh_memory_barrier();
+    for (;;)
+    {
+        u32 sequence = rh_park_sequence;
+        RhThread* thread = rh_threads;
+        while (thread != (RhThread*)0 && (thread == self || thread->safe != 0u))
+            thread = thread->next;
+        if (thread == (RhThread*)0)
+            return 1;
+        (void)rh_futex_wait(&rh_park_sequence, sequence, -1l);
+    }
+}
+
+static void rh_suspend_end(void)
+{
+    rh_lock();
+    rh_atomic_and32(&RhpGcPollRequested, ~RH_POLL_SUSPEND);
+    rh_suspender = (RhThread*)0;
+    rh_unlock();
+    rh_futex_wake(&RhpGcPollRequested, 1);
+}
+
+// The callback runs with this thread's managed frames frozen and must not touch the managed heap
+static void rh_run_preemptive(RhBlockingFunction function, void* argument)
+{
+    RhThread* thread = rh_current_thread();
+    thread->blocking_function = function;
+    thread->blocking_argument = argument;
+    RhpCollect();
+}
+
+struct RhClassInit
+{
+    usize state;
+    RhThread* owner;
+    usize exception_handle;
+};
+
+static void rh_class_init_wait(void* argument)
+{
+    RhClassInit* context = (RhClassInit*)argument;
+    (void)rh_futex_wait((volatile u32*)&context->state, 2u, -1l);
+}
+
+usize RhpClassInitEnter(RhClassInit* context)
+{
+    RhThread* self = rh_current_thread();
+    for (;;)
+    {
+        RhThread* owner;
+        rh_lock();
+        if (context->state == 0ul || context->state == 3ul)
+        {
+            usize result = context->exception_handle;
+            self->waiting_initializer = (RhClassInit*)0;
+            rh_unlock();
+            return result;
+        }
+        if (context->state == 1ul)
+        {
+            context->state = 2ul;
+            context->owner = self;
+            self->waiting_initializer = (RhClassInit*)0;
+            rh_unlock();
+            return 1ul;
+        }
+        owner = context->owner;
+        while (owner != (RhThread*)0 && owner != self && owner->waiting_initializer != (RhClassInit*)0)
+            owner = owner->waiting_initializer->owner;
+        if (owner == self)
+        {
+            self->waiting_initializer = (RhClassInit*)0;
+            rh_unlock();
+            return 0ul;
+        }
+        // Publish a wait only after checking the chain, so two waiters cannot both break the same cycle
+        self->waiting_initializer = context;
+        rh_unlock();
+        rh_run_preemptive(rh_class_init_wait, context);
+    }
+}
+
+void RhpClassInitComplete(RhClassInit* context, usize exception_handle)
+{
+    rh_lock();
+    context->exception_handle = exception_handle;
+    context->owner = (RhThread*)0;
+    rh_atomic_exchange32((volatile u32*)&context->state, exception_handle == 0ul ? 0u : 3u);
+    rh_unlock();
+    rh_futex_wake((volatile u32*)&context->state, 1);
+}
+
+static void rh_thread_list_lock(void)
+{
+    for (;;)
+    {
+        rh_lock();
+        if (rh_suspender == (RhThread*)0)
+            return;
+        rh_unlock();
+        rh_yield();
+    }
+}
+
+static u8* rh_thread_statics_allocate(void)
+{
+    u8* statics;
+    if (RhpThreadStaticSize == 0ul)
+        return (u8*)0;
+    statics = (u8*)RhpAllocHGlobal(RhpThreadStaticSize);
+    rh_zero(statics, RhpThreadStaticSize);
+    return statics;
+}
+
+static void rh_thread_main(RhThread* thread)
+{
+    RhUnwindContext entry;
+    RhThread** link;
+    rh_zero(&entry, sizeof(RhUnwindContext));
+    thread->stack_base = (usize)&entry + sizeof(RhUnwindContext);
+    thread->safe = 1u;
+    rh_thread_list_lock();
+    thread->next = rh_threads;
+    rh_threads = thread;
+    rh_unlock();
+    rh_thread_leave_safe(thread);
+
+    (void)RhpCallFunclet(thread->entry, &entry, (RhObject*)thread->parameter);
+
+    rh_thread_enter_safe(thread, (RhUnwindContext*)0);
+    rh_thread_list_lock();
+    link = &rh_threads;
+    while (*link != thread)
+        link = &(*link)->next;
+    *link = thread->next;
+#if defined(__linux__)
+    thread->next = rh_dead_threads;
+    rh_dead_threads = thread;
+#endif
+    rh_unlock();
+    RhpFreeHGlobal(thread->statics);
+#if defined(__linux__)
+    rh_syscall1(RH_SYS_EXIT, 0ul);
+#elif defined(_WIN32)
+    RhpFreeHGlobal(thread);
+#endif
+}
+
+#if defined(_WIN32)
+static usize rh_thread_start(RhThread* thread)
+{
+    rh_set_current_thread(thread);
+    rh_thread_main(thread);
+    return 0ul;
+}
+#endif
+
+#if defined(__linux__)
+static void rh_reap_dead_threads(void)
+{
+    RhThread* reaped = (RhThread*)0;
+    RhThread** link;
+    rh_lock();
+    link = &rh_dead_threads;
+    while (*link != (RhThread*)0)
+    {
+        RhThread* thread = *link;
+        if (thread->running != 0u)
+        {
+            link = &thread->next;
+            continue;
+        }
+        *link = thread->next;
+        thread->next = reaped;
+        reaped = thread;
+    }
+    rh_unlock();
+    while (reaped != (RhThread*)0)
+    {
+        RhThread* next = reaped->next;
+        (void)rh_os_release(reaped->mapping, reaped->mapping_size);
+        reaped = next;
+    }
+}
+
+static isize rh_clone(RhThread* thread)
+{
+    usize flags = 0x00000100ul | 0x00000200ul | 0x00000400ul | 0x00000800ul | 0x00010000ul | 0x00040000ul | 0x00080000ul | 0x00200000ul;
+    usize* frame = (usize*)thread - 2;
+    frame[0] = (usize)rh_thread_main;
+    frame[1] = (usize)thread;
+#if defined(__riscv)
+    {
+        usize result = flags;
+        __asm__ volatile(
+            "ecall\n"
+            "bnez a0, .Lrh_clone_parent_%=\n"
+#if __SIZEOF_POINTER__ == 8
+            "ld t0, 0(sp)\n"
+            "ld a0, 8(sp)\n"
+#else
+            "lw t0, 0(sp)\n"
+            "lw a0, 4(sp)\n"
+#endif
+            "jalr ra, t0, 0\n"
+            "ebreak\n"
+            ".Lrh_clone_parent_%=:"
+            : "+{a0}"(result)
+            : [stack] "{a1}"(frame), [parent] "{a2}"(0ul), [tls] "{a3}"(thread), [child] "{a4}"(&thread->running),
+              [number] "{a7}"(RH_SYS_CLONE)
+            : "memory");
+        return (isize)result;
+    }
+#elif defined(__aarch64__)
+    {
+        usize result = flags;
+        __asm__ volatile(
+            "svc #0\n"
+            "cbnz x0, .Lrh_clone_parent_%=\n"
+            "ldr x16, [sp]\n"
+            "ldr x0, [sp, #8]\n"
+            "blr x16\n"
+            "brk #0\n"
+            ".Lrh_clone_parent_%=:"
+            : "+{x0}"(result)
+            : [stack] "{x1}"(frame), [parent] "{x2}"(0ul), [tls] "{x3}"(thread), [child] "{x4}"(&thread->running),
+              [number] "{x8}"(RH_SYS_CLONE)
+            : "memory");
+        return (isize)result;
+    }
+#elif defined(__x86_64__)
+    {
+        usize result = RH_SYS_CLONE;
+        __asm__ volatile(
+            "syscall\n"
+            "test rax, rax\n"
+            "jnz .Lrh_clone_parent_%=\n"
+            "mov rdi, qword ptr[rsp + 8]\n"
+            "call qword ptr[rsp]\n"
+            ".byte 0x0f, 0x0b\n"
+            ".Lrh_clone_parent_%=:"
+            : "+{rax}"(result)
+            : [flags] "{rdi}"(flags), [stack] "{rsi}"(frame), [parent] "{rdx}"(0ul), [child] "{r10}"(&thread->running),
+              [tls] "{r8}"(thread)
+            : "rcx", "r11", "memory");
+        return (isize)result;
+    }
+#elif defined(__i386__)
+    {
+        RhUserDescriptor descriptor;
+        usize result = flags;
+        descriptor.entry_number = rh_thread_area_entry;
+        descriptor.base_address = (u32)thread;
+        descriptor.limit = 0xfffffu;
+        descriptor.flags = 0x51u;
+        frame = (usize*)thread - 4;
+        frame[0] = (usize)rh_thread_main;
+        frame[1] = (usize)thread;
+        __asm__ volatile(
+            "push ebx\n"
+            "mov ebx, eax\n"
+            "mov eax, 120\n"
+            ".byte 0xcd, 0x80\n"
+            "test eax, eax\n"
+            "jnz .Lrh_clone_parent_%=\n"
+            "pop eax\n"
+            "call eax\n"
+            ".byte 0x0f, 0x0b\n"
+            ".Lrh_clone_parent_%=:\n"
+            "pop ebx"
+            : "+{eax}"(result)
+            : [stack] "{ecx}"(frame), [parent] "{edx}"(0ul), [tls] "{esi}"(&descriptor), [child] "{edi}"(&thread->running)
+            : "memory");
+        return (isize)result;
+    }
+#endif
+}
+#endif
+
+int SystemNative_CreateThread(usize stack_size, const void* entry, void* parameter)
+{
+    RhThread* thread;
+#if defined(__linux__)
+    usize mapping_size;
+    u8* mapping;
+    rh_reap_dead_threads();
+    if (stack_size == 0ul)
+        stack_size = RH_THREAD_STACK_SIZE;
+    mapping_size = rh_align_up(stack_size + sizeof(RhThread), RH_PAGE_SIZE);
+    mapping = (u8*)rh_os_reserve(mapping_size);
+    if (mapping == (u8*)0)
+        return 0;
+    if (!rh_os_commit(mapping, mapping_size))
+    {
+        (void)rh_os_release(mapping, mapping_size);
+        return 0;
+    }
+    thread = (RhThread*)(mapping + mapping_size - rh_align_up(sizeof(RhThread), 16ul));
+    rh_zero(thread, sizeof(RhThread));
+    thread->mapping = mapping;
+    thread->mapping_size = mapping_size;
+#elif defined(_WIN32)
+    thread = (RhThread*)RhpAllocHGlobal(sizeof(RhThread));
+    rh_zero(thread, sizeof(RhThread));
+#endif
+    thread->self = thread;
+    thread->entry = entry;
+    thread->parameter = parameter;
+    thread->statics = rh_thread_statics_allocate();
+    thread->running = 1u;
+#if defined(__linux__)
+    if (rh_clone(thread) < 0l)
+    {
+        RhpFreeHGlobal(thread->statics);
+        (void)rh_os_release(mapping, mapping_size);
+        return 0;
+    }
+#elif defined(_WIN32)
+    {
+        usize handle = rh_windows_CreateThread(0ul, stack_size, (usize)rh_thread_start, (usize)thread);
+        if (handle == 0ul)
+        {
+            RhpFreeHGlobal(thread->statics);
+            RhpFreeHGlobal(thread);
+            return 0;
+        }
+        rh_windows_CloseHandle(handle, 0ul, 0ul, 0ul);
+    }
+#endif
+    return 1;
+}
+
+typedef struct RhFutexWait
+{
+    volatile u32* address;
+    u32 expected;
+    isize timeout;
+    int result;
+} RhFutexWait;
+
+static void rh_futex_wait_blocking(void* argument)
+{
+    RhFutexWait* wait = (RhFutexWait*)argument;
+    wait->result = rh_futex_wait(wait->address, wait->expected, wait->timeout);
+}
+
+void SystemNative_LowLevelFutex_WaitOnAddress(int* address, int comparand)
+{
+    RhFutexWait wait;
+    wait.address = (volatile u32*)address;
+    wait.expected = (u32)comparand;
+    wait.timeout = -1l;
+    rh_run_preemptive(rh_futex_wait_blocking, &wait);
+}
+
+int SystemNative_LowLevelFutex_WaitOnAddressTimeout(int* address, int comparand, int timeout_milliseconds)
+{
+    RhFutexWait wait;
+    wait.address = (volatile u32*)address;
+    wait.expected = (u32)comparand;
+    wait.timeout = (isize)timeout_milliseconds;
+    wait.result = 1;
+    rh_run_preemptive(rh_futex_wait_blocking, &wait);
+    return wait.result;
+}
+
+void SystemNative_LowLevelFutex_WakeByAddressSingle(int* address)
+{
+    rh_futex_wake((volatile u32*)address, 0);
+}
+
+int RhYield(void)
+{
+    rh_yield();
+    return 1;
+}
+
+void RhSpinWait(int iterations)
+{
+    while (iterations > 0)
+    {
+        rh_cpu_relax();
+        iterations = iterations - 1;
+    }
+}
+
+// A mutex with one condition, the sequence counts signals so a waiter that saw an older one does not sleep
+typedef struct RhLowLevelMonitor
+{
+    volatile u32 state;
+    volatile u32 sequence;
+} RhLowLevelMonitor;
+
+typedef struct RhLowLevelWait
+{
+    RhLowLevelMonitor* monitor;
+    isize timeout;
+    int signaled;
+} RhLowLevelWait;
+
+static void rh_low_level_lock_blocking(void* argument)
+{
+    RhLowLevelMonitor* monitor = (RhLowLevelMonitor*)argument;
+    while (rh_atomic_exchange32(&monitor->state, 2u) != 0u)
+        (void)rh_futex_wait(&monitor->state, 2u, -1l);
+}
+
+static void rh_low_level_unlock(RhLowLevelMonitor* monitor)
+{
+    if (rh_atomic_exchange32(&monitor->state, 0u) == 2u)
+        rh_futex_wake(&monitor->state, 0);
+}
+
+static void rh_low_level_wait_blocking(void* argument)
+{
+    RhLowLevelWait* wait = (RhLowLevelWait*)argument;
+    RhLowLevelMonitor* monitor = wait->monitor;
+    u32 sequence = monitor->sequence;
+    rh_low_level_unlock(monitor);
+    wait->signaled = rh_futex_wait(&monitor->sequence, sequence, wait->timeout);
+    rh_low_level_lock_blocking(monitor);
+}
+
+void* SystemNative_LowLevelMonitor_Create(void)
+{
+    RhLowLevelMonitor* monitor = (RhLowLevelMonitor*)RhpAllocHGlobal(sizeof(RhLowLevelMonitor));
+    monitor->state = 0u;
+    monitor->sequence = 0u;
+    return monitor;
+}
+
+void SystemNative_LowLevelMonitor_Destroy(void* monitor)
+{
+    RhpFreeHGlobal(monitor);
+}
+
+void SystemNative_LowLevelMonitor_Acquire(void* monitor)
+{
+    if (rh_atomic_compare_exchange32(&((RhLowLevelMonitor*)monitor)->state, 0u, 1u) != 0u)
+        rh_run_preemptive(rh_low_level_lock_blocking, monitor);
+}
+
+void SystemNative_LowLevelMonitor_Release(void* monitor)
+{
+    rh_low_level_unlock((RhLowLevelMonitor*)monitor);
+}
+
+void SystemNative_LowLevelMonitor_Wait(void* monitor)
+{
+    RhLowLevelWait wait;
+    wait.monitor = (RhLowLevelMonitor*)monitor;
+    wait.timeout = -1l;
+    rh_run_preemptive(rh_low_level_wait_blocking, &wait);
+}
+
+int SystemNative_LowLevelMonitor_TimedWait(void* monitor, int timeout_milliseconds)
+{
+    RhLowLevelWait wait;
+    wait.monitor = (RhLowLevelMonitor*)monitor;
+    wait.timeout = (isize)timeout_milliseconds;
+    wait.signaled = 1;
+    rh_run_preemptive(rh_low_level_wait_blocking, &wait);
+    return wait.signaled;
+}
+
+void SystemNative_LowLevelMonitor_Signal_Release(void* monitor)
+{
+    RhLowLevelMonitor* target = (RhLowLevelMonitor*)monitor;
+    rh_atomic_add32(&target->sequence, 1u);
+    rh_low_level_unlock(target);
+    rh_futex_wake(&target->sequence, 0);
+}
+
+i64 SystemNative_GetTimestamp(void)
+{
+    return rh_monotonic_time();
+}
+
+i64 SystemNative_GetLowResolutionTimestamp(void)
+{
+    return rh_monotonic_time() / 1000000ll;
+}
+
+i64 SystemNative_GetSystemTimeAsTicks(void)
+{
+#if defined(__linux__)
+    i64 time[2];
+    time[0] = 0;
+    time[1] = 0;
+    rh_syscall2(RH_SYS_CLOCK_GETTIME, 0ul, (usize)time);
+    return time[0] * 10000000ll + time[1] / 100ll;
+#elif defined(_WIN32)
+    i64 time = 0;
+    rh_windows_GetSystemTimeAsFileTime((usize)&time, 0ul, 0ul, 0ul);
+    return time - 116444736000000000ll;
+#endif
+}
+
+u64 SystemNative_GetCurrentThreadId(void)
+{
+    return (u64)rh_current_thread_id();
+}
+
+int SystemNative_GetPid(void)
+{
+#if defined(__linux__)
+    return (int)rh_syscall1(RH_SYS_GETPID, 0ul);
+#elif defined(_WIN32)
+    return (int)rh_windows_GetCurrentProcessId(0ul, 0ul, 0ul, 0ul);
+#endif
+}
+
+u32 SystemNative_GetEUid(void)
+{
+#if defined(__linux__)
+    return (u32)rh_syscall1(RH_SYS_GETEUID, 0ul);
+#elif defined(_WIN32)
+    return 1u;
+#endif
+}
+
+int SystemNative_GetCryptographicallySecureRandomBytes(u8* buffer, int length)
+{
+    if (length < 0)
+        return -1;
+#if defined(__linux__)
+    while (length != 0)
+    {
+        isize count = rh_syscall3(RH_SYS_GETRANDOM, (usize)buffer, (usize)length, 0ul);
+        if (count == -4)
+            continue;
+        if (count <= 0)
+            return -1;
+        buffer += count;
+        length -= (int)count;
+    }
+    return 0;
+#elif defined(_WIN32)
+    return (int)rh_windows_BCryptGenRandom(0ul, (usize)buffer, (usize)length, 2ul) < 0 ? -1 : 0;
+#endif
+}
+
+void SystemNative_GetNonCryptographicallySecureRandomBytes(u8* buffer, int length)
+{
+    static volatile u32 sequence;
+    u32 state;
+    int i;
+    if (SystemNative_GetCryptographicallySecureRandomBytes(buffer, length) == 0)
+        return;
+    // This fallback is noncryptographic and needs no entropy device
+    state = rh_atomic_add32(&sequence, 0x9e3779b9u) ^ (u32)SystemNative_GetTimestamp() ^ (u32)rh_current_thread_id();
+    if (state == 0u)
+        state = 1u;
+    for (i = 0; i < length; i++)
+    {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        buffer[i] = (u8)state;
+    }
+}
+
+void SystemNative_Exit(int code)
+{
+    RhpFallbackFailFast(code);
+}
+
+void SystemNative_Abort(void)
+{
+    RhpFallbackFailFast(134);
+}
+
+typedef struct RhMonitorWaiter
+{
+    struct RhMonitorWaiter* next;
+    volatile u32 signaled;
+} RhMonitorWaiter;
+
+// The state is zero when free, one when held and two when held with threads asleep on it
 typedef struct RhMonitor
 {
-    volatile usize gate;
-    volatile usize owner;
-    usize recursion;
+    volatile u32 state;
+    u32 recursion;
+    RhThread* volatile owner;
+    RhMonitorWaiter* first_waiter;
+    RhMonitorWaiter* last_waiter;
 } RhMonitor;
+
+typedef struct RhMonitorWait
+{
+    RhMonitor* monitor;
+    RhMonitorWaiter* waiter;
+    isize timeout;
+    int acquired;
+} RhMonitorWait;
 
 static RhMonitor* rh_monitor_for_object(void* object)
 {
@@ -2066,9 +3107,7 @@ static RhMonitor* rh_monitor_for_object(void* object)
         return (RhMonitor*)current;
 
     candidate = (RhMonitor*)RhpAllocHGlobal(sizeof(RhMonitor));
-    candidate->gate = 0ul;
-    candidate->owner = 0ul;
-    candidate->recursion = 0ul;
+    rh_zero(candidate, sizeof(RhMonitor));
     observed = rh_atomic_compare_exchange(slot, 0ul, (usize)candidate);
     if (observed == 0ul)
         return candidate;
@@ -2077,66 +3116,202 @@ static RhMonitor* rh_monitor_for_object(void* object)
     return (RhMonitor*)observed;
 }
 
-void RhpMonitorEnter(void* object)
+static RhMonitor* rh_monitor_owned(void* object, RhThread* thread)
 {
     RhMonitor* monitor;
-    usize thread_id;
-
     if (object == (void*)0)
         RhpFallbackFailFast(154);
-
-    monitor = rh_monitor_for_object(object);
-    thread_id = rh_current_thread_id();
-    if (thread_id == 0ul)
-        RhpFallbackFailFast(154);
-
-    if (monitor->owner == thread_id)
-    {
-        if (monitor->recursion == (usize)-1)
-            RhpFallbackFailFast(154);
-        monitor->recursion = monitor->recursion + 1ul;
-        return;
-    }
-
-    while (rh_atomic_compare_exchange(&monitor->gate, 0ul, 1ul) != 0ul)
-        rh_cpu_relax();
-
-    monitor->owner = thread_id;
-    monitor->recursion = 1ul;
-    rh_monitors_held = rh_monitors_held + 1ul;
+    monitor = (RhMonitor*)(*(volatile usize*)((u8*)object - SYNC_BLOCK_SIZE));
+    if (monitor == (RhMonitor*)0 || monitor->owner != thread)
+        return (RhMonitor*)0;
+    return monitor;
 }
 
-void RhpMonitorExit(void* object)
+static i64 rh_deadline(isize timeout)
 {
-    volatile usize* slot;
-    RhMonitor* monitor;
-    usize thread_id;
+    return timeout < 0l ? 0 : rh_monotonic_time() / 1000000ll + (i64)timeout;
+}
 
+static isize rh_remaining(isize timeout, i64 deadline)
+{
+    i64 remaining;
+    if (timeout < 0l)
+        return -1l;
+    remaining = deadline - rh_monotonic_time() / 1000000ll;
+    return remaining <= 0 ? 0l : (isize)remaining;
+}
+
+static void rh_monitor_lock_blocking(void* argument)
+{
+    RhMonitorWait* wait = (RhMonitorWait*)argument;
+    RhMonitor* monitor = wait->monitor;
+    i64 deadline = rh_deadline(wait->timeout);
+    while (rh_atomic_exchange32(&monitor->state, 2u) != 0u)
+    {
+        isize remaining = rh_remaining(wait->timeout, deadline);
+        if (remaining == 0l)
+        {
+            wait->acquired = 0;
+            return;
+        }
+        (void)rh_futex_wait(&monitor->state, 2u, remaining);
+    }
+    wait->acquired = 1;
+}
+
+static void rh_monitor_unlock(RhMonitor* monitor)
+{
+    if (rh_atomic_exchange32(&monitor->state, 0u) == 2u)
+        rh_futex_wake(&monitor->state, 0);
+}
+
+static int rh_monitor_enter(void* object, isize timeout)
+{
+    RhThread* thread = rh_current_thread();
+    RhMonitor* monitor;
     if (object == (void*)0)
         RhpFallbackFailFast(154);
-
-    slot = (volatile usize*)((u8*)object - SYNC_BLOCK_SIZE);
-    monitor = (RhMonitor*)(*slot);
-    if (monitor == (RhMonitor*)0)
-        RhpFallbackFailFast(154);
-
-    thread_id = rh_current_thread_id();
-    if (thread_id == 0ul || monitor->owner != thread_id || monitor->recursion == 0ul)
-        RhpFallbackFailFast(154);
-
-    if (monitor->recursion > 1ul)
+    monitor = rh_monitor_for_object(object);
+    if (monitor->owner == thread)
     {
-        monitor->recursion = monitor->recursion - 1ul;
-        return;
+        if (monitor->recursion == 0xffffffffu)
+            RhpFallbackFailFast(154);
+        monitor->recursion = monitor->recursion + 1u;
+        return 1;
     }
+    if (rh_atomic_compare_exchange32(&monitor->state, 0u, 1u) != 0u)
+    {
+        RhMonitorWait wait;
+        if (timeout == 0l)
+            return 0;
+        wait.monitor = monitor;
+        wait.timeout = timeout;
+        wait.acquired = 0;
+        rh_run_preemptive(rh_monitor_lock_blocking, &wait);
+        if (!wait.acquired)
+            return 0;
+    }
+    monitor->owner = thread;
+    monitor->recursion = 1u;
+    thread->monitors_held = thread->monitors_held + 1ul;
+    return 1;
+}
 
-    monitor->recursion = 0ul;
-    monitor->owner = 0ul;
-    if (rh_atomic_compare_exchange(&monitor->gate, 1ul, 0ul) != 1ul)
-        RhpFallbackFailFast(154);
-    rh_monitors_held = rh_monitors_held - 1ul;
-    if (rh_monitors_held == 0ul && rh_finalizer_ready_head != rh_finalizer_ready_tail)
-        RhpGcPollRequested = RhpGcPollRequested | RH_POLL_FINALIZE;
+void RhpMonitorEnter(void* object)
+{
+    (void)rh_monitor_enter(object, -1l);
+}
+
+int RhpMonitorTryEnter(void* object, int timeout_milliseconds)
+{
+    return rh_monitor_enter(object, (isize)timeout_milliseconds);
+}
+
+int RhpMonitorIsEntered(void* object)
+{
+    return rh_monitor_owned(object, rh_current_thread()) != (RhMonitor*)0;
+}
+
+int RhpMonitorExit(void* object)
+{
+    RhThread* thread = rh_current_thread();
+    RhMonitor* monitor = rh_monitor_owned(object, thread);
+    if (monitor == (RhMonitor*)0)
+        return 0;
+    if (monitor->recursion > 1u)
+    {
+        monitor->recursion = monitor->recursion - 1u;
+        return 1;
+    }
+    monitor->recursion = 0u;
+    monitor->owner = (RhThread*)0;
+    rh_monitor_unlock(monitor);
+    thread->monitors_held = thread->monitors_held - 1ul;
+    if (thread->monitors_held == 0ul && rh_finalizer_ready_head != rh_finalizer_ready_tail)
+        rh_atomic_or32(&RhpGcPollRequested, RH_POLL_FINALIZE);
+    return 1;
+}
+
+static void rh_monitor_wait_blocking(void* argument)
+{
+    RhMonitorWait* wait = (RhMonitorWait*)argument;
+    RhMonitor* monitor = wait->monitor;
+    RhMonitorWaiter* waiter = wait->waiter;
+    i64 deadline = rh_deadline(wait->timeout);
+    rh_monitor_unlock(monitor);
+    while (waiter->signaled == 0u)
+    {
+        isize remaining = rh_remaining(wait->timeout, deadline);
+        if (remaining == 0l)
+            break;
+        (void)rh_futex_wait(&waiter->signaled, 0u, remaining);
+    }
+    while (rh_atomic_exchange32(&monitor->state, 2u) != 0u)
+        (void)rh_futex_wait(&monitor->state, 2u, -1l);
+}
+
+int RhpMonitorWait(void* object, int timeout_milliseconds)
+{
+    RhThread* thread = rh_current_thread();
+    RhMonitor* monitor = rh_monitor_owned(object, thread);
+    RhMonitorWaiter waiter;
+    RhMonitorWait wait;
+    u32 recursion;
+    if (monitor == (RhMonitor*)0)
+        return -1;
+    waiter.next = (RhMonitorWaiter*)0;
+    waiter.signaled = 0u;
+    if (monitor->last_waiter == (RhMonitorWaiter*)0)
+        monitor->first_waiter = &waiter;
+    else
+        monitor->last_waiter->next = &waiter;
+    monitor->last_waiter = &waiter;
+    recursion = monitor->recursion;
+    monitor->recursion = 0u;
+    monitor->owner = (RhThread*)0;
+    wait.monitor = monitor;
+    wait.waiter = &waiter;
+    wait.timeout = (isize)timeout_milliseconds;
+    rh_run_preemptive(rh_monitor_wait_blocking, &wait);
+    if (waiter.signaled == 0u)
+    {
+        RhMonitorWaiter* previous = (RhMonitorWaiter*)0;
+        RhMonitorWaiter* current = monitor->first_waiter;
+        while (current != &waiter)
+        {
+            previous = current;
+            current = current->next;
+        }
+        if (previous == (RhMonitorWaiter*)0)
+            monitor->first_waiter = waiter.next;
+        else
+            previous->next = waiter.next;
+        if (monitor->last_waiter == &waiter)
+            monitor->last_waiter = previous;
+    }
+    monitor->owner = thread;
+    monitor->recursion = recursion;
+    return waiter.signaled != 0u;
+}
+
+// A pulsed waiter cannot return before the pulsing thread leaves the monitor, so its record stays valid here
+int RhpMonitorPulse(void* object, int all)
+{
+    RhMonitor* monitor = rh_monitor_owned(object, rh_current_thread());
+    if (monitor == (RhMonitor*)0)
+        return 0;
+    while (monitor->first_waiter != (RhMonitorWaiter*)0)
+    {
+        RhMonitorWaiter* waiter = monitor->first_waiter;
+        monitor->first_waiter = waiter->next;
+        if (monitor->first_waiter == (RhMonitorWaiter*)0)
+            monitor->last_waiter = (RhMonitorWaiter*)0;
+        rh_atomic_exchange32(&waiter->signaled, 1u);
+        rh_futex_wake(&waiter->signaled, 0);
+        if (all == 0)
+            break;
+    }
+    return 1;
 }
 
 static void rh_monitor_destroy_for_object(void* object)
@@ -2281,7 +3456,15 @@ void RhpInitialize(
     {
         RhpFallbackFailFast(144);
     }
-    rh_stack_base = (usize)stack_base;
+#if defined(_WIN32)
+    RhpTlsIndex = (u32)rh_windows_TlsAlloc(0ul, 0ul, 0ul, 0ul);
+    if (RhpTlsIndex >= 64u)
+        RhpFallbackFailFast(144);
+#endif
+    rh_main_thread.self = &rh_main_thread;
+    rh_main_thread.stack_base = (usize)stack_base;
+    rh_set_current_thread(&rh_main_thread);
+    rh_threads = &rh_main_thread;
     rh_safe_points = safe_points;
     rh_safe_point_count = safe_point_count;
     rh_type_infos = type_infos;
@@ -2290,9 +3473,9 @@ void RhpInitialize(
     rh_static_root_count = static_root_count;
     rh_regions = regions;
     rh_region_count = region_count;
-    rh_dispatches = (RhDispatchRecord*)0;
     rh_build_type_index();
     rh_initialize_heap();
+    rh_main_thread.statics = rh_thread_statics_allocate();
 }
 
 static void rh_validate_block(u8* address, const RhBlock* block, int code)
@@ -2480,7 +3663,7 @@ static const RhSafePoint* rh_find_safe_point(const void* return_address)
     return (const RhSafePoint*)0;
 }
 
-static void rh_mark_frame_roots(RhUnwindContext* context)
+static void rh_mark_frame_roots(RhUnwindContext* context, usize stack_base)
 {
     usize depth = 0ul;
     while (depth < RH_UNWIND_DEPTH_LIMIT)
@@ -2495,12 +3678,12 @@ static void rh_mark_frame_roots(RhUnwindContext* context)
             if (region == (const RhCodeRegion*)0)
                 RhpFallbackFailFast(143);
             rh_unwind_step(context, region);
-            if (context->sp <= sp || context->sp > rh_stack_base)
+            if (context->sp <= sp || context->sp > stack_base)
                 RhpFallbackFailFast(144);
             depth = depth + 1ul;
             continue;
         }
-        if (fp == 0ul || fp > rh_stack_base)
+        if (fp == 0ul || fp > stack_base)
             RhpFallbackFailFast(143);
         if (safe_point->root_count != 0ul && safe_point->roots == (const RhRoot*)0)
             RhpFallbackFailFast(144);
@@ -2534,7 +3717,7 @@ static void rh_mark_frame_roots(RhUnwindContext* context)
         (void)rh_unwind_frame(context, safe_point->region);
         if (context->fp == 0ul)
             return;
-        if (context->fp < fp || context->fp > rh_stack_base)
+        if (context->fp < fp || context->fp > stack_base)
             RhpFallbackFailFast(142);
         depth = depth + 1ul;
     }
@@ -2542,7 +3725,7 @@ static void rh_mark_frame_roots(RhUnwindContext* context)
 }
 
 // A throw site outside any try records no roots; the frames above it are at calls
-static void rh_mark_thrower_roots(const RhUnwindContext* thrower)
+static void rh_mark_thrower_roots(const RhUnwindContext* thrower, usize stack_base)
 {
     RhUnwindContext context = *thrower;
     const RhCodeRegion* region;
@@ -2555,7 +3738,7 @@ static void rh_mark_thrower_roots(const RhUnwindContext* thrower)
         if (context.fp == 0ul)
             return;
     }
-    rh_mark_frame_roots(&context);
+    rh_mark_frame_roots(&context, stack_base);
 }
 
 static void rh_mark_field_value(void* value, usize kind)
@@ -2711,7 +3894,7 @@ static void rh_sweep(void)
     rh_heap_used = last_live_end;
     rh_decommit_unused_tail();
     rh_allocation_debt = 0ul;
-    RhpGcPollRequested = 0u;
+    rh_atomic_and32(&RhpGcPollRequested, RH_POLL_SUSPEND);
 }
 
 static void rh_drain_marks(void)
@@ -2860,24 +4043,41 @@ static void rh_scan_finalizers(void)
     rh_drain_marks();
 }
 
-static void rh_collect(const RhUnwindContext* context)
+static void rh_mark_thread_roots(RhThread* thread, const RhUnwindContext* context)
 {
-    RhUnwindContext frame = *context;
-    rh_gc_running = 1;
-    rh_mark_stack = (RhBlock*)0;
-    rh_mark_frame_roots(&frame);
-    rh_mark_static_roots();
-    rh_mark_object(rh_delegate_temporary_root);
+    const RhDispatchRecord* dispatch = thread->dispatches;
+    usize i = 0ul;
+    if (context != (const RhUnwindContext*)0)
     {
-        const RhDispatchRecord* dispatch = rh_dispatches;
-        while (dispatch != (const RhDispatchRecord*)0)
-        {
-            rh_mark_object(dispatch->exception);
-            if (dispatch->filtering != (const RhUnwindContext*)0)
-                rh_mark_thrower_roots(dispatch->filtering);
-            dispatch = dispatch->next;
-        }
+        RhUnwindContext frame = *context;
+        rh_mark_frame_roots(&frame, thread->stack_base);
     }
+    rh_mark_object(thread->delegate_root);
+    while (dispatch != (const RhDispatchRecord*)0)
+    {
+        rh_mark_object(dispatch->exception);
+        if (dispatch->filtering != (const RhUnwindContext*)0)
+            rh_mark_thrower_roots(dispatch->filtering, thread->stack_base);
+        dispatch = dispatch->next;
+    }
+    while (i < RhpThreadStaticRootCount)
+    {
+        const RhStaticRoot* root = &RhpThreadStaticRoots[i];
+        rh_mark_field_value(*(void**)(thread->statics + (usize)root->address), root->kind);
+        i = i + 1ul;
+    }
+}
+
+static void rh_collect(RhThread* self, const RhUnwindContext* context)
+{
+    RhThread* thread = rh_threads;
+    rh_mark_stack = (RhBlock*)0;
+    while (thread != (RhThread*)0)
+    {
+        rh_mark_thread_roots(thread, thread == self ? context : thread->context);
+        thread = thread->next;
+    }
+    rh_mark_static_roots();
     rh_mark_strong_handles();
     rh_mark_ready_finalizers();
     rh_drain_marks();
@@ -2887,28 +4087,54 @@ static void rh_collect(const RhUnwindContext* context)
     rh_scan_dependent_handles();
     rh_clear_dead_handles(1);
     rh_sweep();
-    RhpGcPollRequested = rh_finalizer_ready_head != rh_finalizer_ready_tail ? RH_POLL_FINALIZE : 0u;
-    rh_gc_running = 0;
+    if (rh_finalizer_ready_head != rh_finalizer_ready_tail)
+        rh_atomic_or32(&RhpGcPollRequested, RH_POLL_FINALIZE);
 }
 
-// With no threads yet, a managed poll outside any lock stands in for the finalizer thread
+// A managed poll outside any lock stands in for the finalizer thread
 void RhpCollectFromContext(RhUnwindContext* context)
 {
-    if (rh_gc_running != 0)
-        return;
-    if ((RhpGcPollRequested & RH_POLL_COLLECT) != 0u)
-        rh_collect(context);
-    if ((RhpGcPollRequested & RH_POLL_FINALIZE) != 0u && rh_find_safe_point(context->ip) != (const RhSafePoint*)0)
+    RhThread* thread = rh_current_thread();
+    if (thread->blocking_function != (RhBlockingFunction)0)
     {
-        RhpGcPollRequested = RhpGcPollRequested & ~RH_POLL_FINALIZE;
-        if (rh_monitors_held == 0ul && rh_finalizers_running == 0)
-            (void)RhpCallFunclet((const void*)RhpFinalizerDrain, context, (RhObject*)0);
+        RhBlockingFunction function = thread->blocking_function;
+        thread->blocking_function = (RhBlockingFunction)0;
+        rh_thread_enter_safe(thread, context);
+        function(thread->blocking_argument);
+        rh_thread_leave_safe(thread);
+        return;
+    }
+    if (rh_suspender == thread)
+        return;
+    for (;;)
+    {
+        u32 poll = RhpGcPollRequested;
+        if ((poll & RH_POLL_SUSPEND) != 0u)
+        {
+            rh_thread_enter_safe(thread, context);
+            rh_thread_leave_safe(thread);
+            continue;
+        }
+        if ((poll & RH_POLL_COLLECT) == 0u)
+            break;
+        if (rh_suspend_begin(thread))
+        {
+            rh_collect(thread, context);
+            rh_suspend_end();
+        }
+    }
+    if ((RhpGcPollRequested & RH_POLL_FINALIZE) != 0u && thread->monitors_held == 0ul &&
+        rh_find_safe_point(context->ip) != (const RhSafePoint*)0 &&
+        rh_atomic_compare_exchange32(&rh_finalizers_running, 0u, 1u) == 0u)
+    {
+        rh_atomic_and32(&RhpGcPollRequested, ~RH_POLL_FINALIZE);
+        (void)RhpCallFunclet((const void*)RhpFinalizerDrain, context, (RhObject*)0);
     }
 }
 
 static void rh_collect_now(void)
 {
-    RhpGcPollRequested = RhpGcPollRequested | RH_POLL_COLLECT;
+    rh_atomic_or32(&RhpGcPollRequested, RH_POLL_COLLECT);
     RhpCollect();
 }
 
@@ -2921,7 +4147,9 @@ void RhCollect(int generation, int mode)
 
 static RhHandleSlot* rh_handle_allocate(usize kind, void* object, void* secondary)
 {
-    RhHandleSlot* slot = rh_handle_free;
+    RhHandleSlot* slot;
+    rh_lock();
+    slot = rh_handle_free;
     if (slot == (RhHandleSlot*)0)
     {
         RhHandleChunk* chunk = (RhHandleChunk*)RhpAllocHGlobal(sizeof(RhHandleChunk));
@@ -2942,6 +4170,7 @@ static RhHandleSlot* rh_handle_allocate(usize kind, void* object, void* secondar
     slot->object = object;
     slot->secondary = secondary;
     slot->kind = kind;
+    rh_unlock();
     return slot;
 }
 
@@ -2958,10 +4187,12 @@ void* RhpHandleAllocDependent(void* primary, void* secondary)
 void RhHandleFree(void* handle)
 {
     RhHandleSlot* slot = (RhHandleSlot*)handle;
+    rh_lock();
     slot->object = (void*)0;
     slot->secondary = (void*)rh_handle_free;
     slot->kind = RH_HANDLE_FREE;
     rh_handle_free = slot;
+    rh_unlock();
 }
 
 void* RhHandleGet(void* handle)
@@ -2991,7 +4222,9 @@ void RhSuppressFinalize(RhObject* object)
     if ((object->type->flags & RH_EETYPE_HAS_FINALIZER) != 0u)
     {
         RhBlock* block = rh_block_for_exact_object(object);
+        rh_lock();
         block->flags = block->flags | RH_BLOCK_FINALIZER_RUN;
+        rh_unlock();
     }
 }
 
@@ -3001,15 +4234,18 @@ void RhReRegisterForFinalize(RhObject* object)
     if ((object->type->flags & RH_EETYPE_HAS_FINALIZER) != 0u)
     {
         RhBlock* block = rh_block_for_exact_object(object);
+        rh_lock();
         if ((block->flags & RH_BLOCK_FINALIZER_RUN) != 0ul)
             block->flags = block->flags & ~RH_BLOCK_FINALIZER_RUN;
         else
             rh_finalizer_queue_add(object);
+        rh_unlock();
     }
 }
 
 void* RhpGetNextFinalizableObject(void)
 {
+    rh_lock();
     while (rh_finalizer_ready_head != rh_finalizer_ready_tail)
     {
         RhObject* object = rh_finalizer_ready[rh_finalizer_ready_head];
@@ -3017,14 +4253,16 @@ void* RhpGetNextFinalizableObject(void)
         rh_finalizer_ready_head = rh_finalizer_ready_head + 1ul;
         if ((block->flags & RH_BLOCK_FINALIZER_RUN) == 0ul)
         {
-            rh_finalizers_running = 1;
+            rh_finalizers_running = 1u;
+            rh_unlock();
             return (void*)object;
         }
         block->flags = block->flags & ~RH_BLOCK_FINALIZER_RUN;
     }
     rh_finalizer_ready_head = 0ul;
     rh_finalizer_ready_tail = 0ul;
-    rh_finalizers_running = 0;
+    rh_finalizers_running = 0u;
+    rh_unlock();
     return (void*)0;
 }
 
@@ -3114,17 +4352,27 @@ static void* rh_allocate_object_with_zeroing(const RhMethodTable* type, usize gc
     void* object;
     usize maximum = (usize)-1;
 
-    if (rh_allocation_debt >= RH_GC_POLL_DEBT_LIMIT)
-        rh_collect_now();
+    if ((RhpGcPollRequested & (RH_POLL_COLLECT | RH_POLL_SUSPEND)) != 0u)
+        RhpCollect();
 
+    rh_lock();
     storage = rh_try_allocate(gc_size);
     if (storage == (void*)0)
     {
+        rh_unlock();
         rh_collect_now();
+        rh_lock();
         storage = rh_try_allocate(gc_size);
         if (storage == (void*)0)
             RhpFallbackFailFast(141);
     }
+    if (rh_allocation_debt > maximum - gc_size)
+        rh_allocation_debt = maximum;
+    else
+        rh_allocation_debt = rh_allocation_debt + gc_size;
+    if (rh_allocation_debt >= RH_GC_POLL_DEBT_LIMIT)
+        rh_atomic_or32(&RhpGcPollRequested, RH_POLL_COLLECT);
+    rh_unlock();
 
     if (zeroing_optional != 0 && (type->flags & RH_EETYPE_HAS_POINTERS) == 0u)
     {
@@ -3140,12 +4388,6 @@ static void* rh_allocate_object_with_zeroing(const RhMethodTable* type, usize gc
 
     object = (void*)((u8*)storage + SYNC_BLOCK_SIZE);
     ((RhObject*)object)->type = type;
-    if (rh_allocation_debt > maximum - gc_size)
-        rh_allocation_debt = maximum;
-    else
-        rh_allocation_debt = rh_allocation_debt + gc_size;
-    if (rh_allocation_debt >= RH_GC_POLL_DEBT_LIMIT)
-        RhpGcPollRequested = RhpGcPollRequested | RH_POLL_COLLECT;
     return object;
 }
 
@@ -3170,7 +4412,9 @@ void* RhpNewFast(const RhMethodTable* type)
 void* RhpNewFinalizable(const RhMethodTable* type)
 {
     void* object = RhpNewFast(type);
+    rh_lock();
     rh_finalizer_queue_add((RhObject*)object);
+    rh_unlock();
     return object;
 }
 
@@ -3335,7 +4579,7 @@ static void* rh_delegate_allocate_multicast(
     if (count < 2ul || count > 2147483647ul)
         RhpFallbackFailFast(152);
     result = RhpNewFast(delegate_type);
-    rh_delegate_temporary_root = (RhObject*)result;
+    rh_current_thread()->delegate_root = (RhObject*)result;
     list = RhpNewArray(array_type, (int)count);
     rh_delegate_write_slot(result, target_offset, (void*)0);
     rh_delegate_write_slot(result, method_ptr_offset, (void*)0);
@@ -3404,7 +4648,7 @@ void* RhpDelegateCombine(
             invocation_count_offset);
         index = index + 1ul;
     }
-    rh_delegate_temporary_root = (RhObject*)0;
+    rh_current_thread()->delegate_root = (RhObject*)0;
     return result;
 }
 
@@ -3498,7 +4742,7 @@ void* RhpDelegateRemove(
             destination_index = destination_index + 1ul;
         }
     }
-    rh_delegate_temporary_root = (RhObject*)0;
+    rh_current_thread()->delegate_root = (RhObject*)0;
     return result;
 }
 

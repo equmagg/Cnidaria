@@ -577,6 +577,7 @@ namespace Cnidaria.Cs
             _text = text ?? string.Empty;
             _options = options ?? new LexerOptions();
             _preprocessorSymbols = new HashSet<string>(_options.PreprocessorSymbols, StringComparer.Ordinal);
+            _preprocessorSymbols.Add("FEATURE_MULTITHREADING");
 
             if (_options.TargetPointerSize == 8)
                 _preprocessorSymbols.Add("TARGET_64BIT");

@@ -51,7 +51,11 @@ namespace Microsoft.Win32.SafeHandles
             SetHandle(existingHandle);
         }
 
-        protected override bool ReleaseHandle() => throw new PlatformNotSupportedException();
+        protected override bool ReleaseHandle()
+        {
+            System.Threading.WaitSubsystem.DeleteHandle(handle);
+            return true;
+        }
     }
 
 

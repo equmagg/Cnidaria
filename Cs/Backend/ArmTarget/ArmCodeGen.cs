@@ -91,6 +91,9 @@ namespace Cnidaria.Cs
             private readonly Dictionary<int, TypeInitializationThunkDraft> _typeInitializationThunksByTypeId = new Dictionary<int, TypeInitializationThunkDraft>();
             private readonly List<TypeInitializationThunkDraft> _typeInitializationThunks = new List<TypeInitializationThunkDraft>();
             private readonly List<StaticRootDraft> _staticRoots = new List<StaticRootDraft>();
+            private readonly Dictionary<int, int> _threadStaticOffsetByTypeId = new Dictionary<int, int>();
+            private readonly List<TypeGcFieldDraft> _threadStaticRoots = new List<TypeGcFieldDraft>();
+            private int _threadStaticSize;
             private readonly List<InterfaceDispatchCellDraft> _interfaceDispatchCells = new List<InterfaceDispatchCellDraft>();
             private readonly Dictionary<int, string> _unboxingStubLabels = new Dictionary<int, string>();
             private readonly List<UnboxingStubDraft> _unboxingStubs = new List<UnboxingStubDraft>();
@@ -401,6 +404,11 @@ namespace Cnidaria.Cs
                 GenTreeMethod? firstStaticParameterless = null;
                 foreach (var method in _program.Methods)
                 {
+                    if (method.RuntimeMethod.Name == "<Main>" && method.RuntimeMethod.IsStatic)
+                        return method;
+                }
+                foreach (var method in _program.Methods)
+                {
                     var runtimeMethod = method.RuntimeMethod;
                     if (runtimeMethod.IsStatic && runtimeMethod.ParameterTypes.Length == 0 && firstStaticParameterless is null)
                         firstStaticParameterless = method;
@@ -502,13 +510,22 @@ namespace Cnidaria.Cs
                 if (runtimeMethod.ParameterTypes.Length == 1)
                     EmitLoadImmediate(ArmRegister.X0, 0, 8);
                 EmitCall(entryMethodLabel);
+                if (_program.ThreadExitMethod is RuntimeMethod wait)
+                {
+                    EmitAdjustStack(-_target.CallFrameAlignment);
+                    EmitDelegateMemoryStore(MachineRegister.X0, ArmRegister.Sp, 0, _target.PointerSize);
+                    EmitCall(ResolveMethodLabel(wait));
+                    EmitDelegateMemoryLoad(MachineRegister.X0, ArmRegister.Sp, 0, _target.PointerSize, signed: false);
+                    EmitAdjustStack(_target.CallFrameAlignment);
+                }
+
 
                 if (IsVoid(runtimeMethod.ReturnType))
                     EmitLoadImmediate(ArmRegister.X0, 0, 8);
 
                 if (_target.OperatingSystem == OperatingSystemKind.Linux)
                 {
-                    EmitLoadImmediate(ArmRegister.X8, 93, 8);
+                    EmitLoadImmediate(ArmRegister.X8, 94, 8);
                     Emit(ArmInstruction.Unary(ArmInstrKind.Svc, ArmOperand.ImmediateOperand(0)));
                 }
                 else if (_target.OperatingSystem == OperatingSystemKind.Windows)
@@ -697,7 +714,8 @@ namespace Cnidaria.Cs
                 if (method.IsExtern)
                 {
                     string? externalLabel = _options.ExternalSymbolResolver?.Invoke(method);
-                    if (string.IsNullOrWhiteSpace(externalLabel) && _target.OperatingSystem == OperatingSystemKind.Windows && method.DllImportData is not null)
+                    if (string.IsNullOrWhiteSpace(externalLabel) && _target.OperatingSystem == OperatingSystemKind.Windows &&
+                        method.DllImportData is not null && !RuntimeGcImports.IsRuntimeLibrary(method.DllImportData))
                     {
                         PeImport import = WindowsImport(method);
                         _imports.Add(import);
@@ -2245,7 +2263,7 @@ namespace Cnidaria.Cs
                     throw new ArgumentNullException(nameof(type));
                 if (_staticStorageByTypeId.TryGetValue(type.TypeId, out StaticStorageDraft? existing))
                     return existing;
-                if (type.StaticFields.Length != 0 && type.StaticSize <= 0)
+                if (type.StaticFields.Length != 0 && type.StaticSize <= 0 && type.ThreadStaticSize <= 0)
                     throw new InvalidOperationException($"Static layout was not computed for T{type.TypeId} '{type.Namespace}.{type.Name}'.");
 
                 string label = CreateLocalLabel($"statics_{type.TypeId}");
@@ -2257,16 +2275,86 @@ namespace Cnidaria.Cs
                 var storage = new StaticStorageDraft(type, label);
                 _staticStorageByTypeId.Add(type.TypeId, storage);
 
-                var roots = ImmutableArray.CreateBuilder<TypeGcFieldDraft>();
+                ImmutableArray<TypeGcFieldDraft>.Builder roots = ImmutableArray.CreateBuilder<TypeGcFieldDraft>();
                 for (int i = 0; i < type.StaticFields.Length; i++)
-                    AppendTypedGcFields(roots, type.StaticFields[i].Offset, type.StaticFields[i].FieldType);
+                {
+                    if (!type.StaticFields[i].IsThreadStatic)
+                        AppendTypedGcFields(roots, type.StaticFields[i].Offset, type.StaticFields[i].FieldType);
+                }
                 for (int i = 0; i < roots.Count; i++)
                     _staticRoots.Add(new StaticRootDraft(label, roots[i].Offset, roots[i].Kind));
 
                 return storage;
             }
 
-            // 1 uninitialized, 2 running, 0 done: a running state seen again is the initializer recursing
+            // Every thread owns one block holding the thread statics of all types, each type at a fixed offset in it
+            private int GetThreadStaticOffset(RuntimeType type)
+            {
+                if (_threadStaticOffsetByTypeId.TryGetValue(type.TypeId, out int existing))
+                    return existing;
+
+                int offset = AlignUp(_threadStaticSize, Math.Max(1, type.ThreadStaticAlign));
+                _threadStaticSize = checked(offset + type.ThreadStaticSize);
+                _threadStaticOffsetByTypeId.Add(type.TypeId, offset);
+
+                ImmutableArray<TypeGcFieldDraft>.Builder roots = ImmutableArray.CreateBuilder<TypeGcFieldDraft>();
+                for (int i = 0; i < type.StaticFields.Length; i++)
+                {
+                    RuntimeField field = type.StaticFields[i];
+                    if (field.IsThreadStatic)
+                        AppendTypedGcFields(roots, checked(offset + field.Offset), field.FieldType);
+                }
+                _threadStaticRoots.AddRange(roots);
+                return offset;
+            }
+
+            private void EmitThreadStatics(ArmRegister destination)
+            {
+                if (_target.OperatingSystem == OperatingSystemKind.Windows)
+                {
+                    EmitMaterializeAddress(ResolveExternalObjectSymbol("RhpTlsIndex"), destination);
+                    Emit(ArmInstruction.Binary(ArmInstrKind.Ldr, Reg(destination, 4), Mem(destination, 0, 4)));
+                    Emit(ArmInstruction.Ternary(
+                        ArmInstrKind.Add,
+                        Reg(destination, 8),
+                        Reg(ArmRegister.X18, 8),
+                        ArmOperand.ShiftedRegister(destination, ArmShiftKind.Lsl, 3, 8)));
+                    Emit(ArmInstruction.Binary(ArmInstrKind.Ldr, Reg(destination, 8), Mem(destination, 0x1480, 8)));
+                }
+                else
+                {
+                    Emit(ArmInstruction.Binary(ArmInstrKind.Mrs, Reg(destination, 8), ArmOperand.SystemRegisterOperand(ArmSystemRegister.TpidrEl0)));
+                }
+                Emit(ArmInstruction.Binary(ArmInstrKind.Ldr, Reg(destination, 8), Mem(destination, _target.PointerSize, 8)));
+            }
+
+            private void EmitThreadStaticMetadata()
+            {
+                int pointerSize = _target.PointerSize;
+                AddGlobalDataSymbol("RhpThreadStaticRoots", _rodata.Align(pointerSize), Math.Max(1, _threadStaticRoots.Count) * pointerSize * 2);
+                for (int i = 0; i < _threadStaticRoots.Count; i++)
+                {
+                    EmitNative(_threadStaticRoots[i].Offset);
+                    EmitNative(ToRuntimeRootKind(_threadStaticRoots[i].Kind));
+                }
+                if (_threadStaticRoots.Count == 0)
+                {
+                    EmitNative(0);
+                    EmitNative(0);
+                }
+                AddGlobalDataSymbol("RhpThreadStaticRootCount", _rodata.ByteLength, pointerSize);
+                EmitNative(_threadStaticRoots.Count);
+                AddGlobalDataSymbol("RhpThreadStaticSize", _rodata.ByteLength, pointerSize);
+                EmitNative(AlignUp(_threadStaticSize, pointerSize));
+            }
+
+            private void AddGlobalDataSymbol(string label, int offset, int size)
+            {
+                if (!_usedLabels.Add(label))
+                    throw new InvalidOperationException($"Duplicate ARM64 runtime data symbol: {label}.");
+                _symbols.Add(new ArmObjectSymbol(label, RodataSectionName, offset, size, ArmObjectSymbolBinding.Global, ArmObjectSymbolKind.Object));
+            }
+
             public string GetTypeInitializationStateLabel(RuntimeType type)
             {
                 StaticStorageDraft storage = GetOrCreateStaticStorage(type);
@@ -2274,9 +2362,12 @@ namespace Cnidaria.Cs
                     return storage.InitializationStateLabel;
 
                 string label = CreateLocalLabel($"type_init_{type.TypeId}");
-                int offset = _data.Align(4);
-                _data.EmitBytes(BitConverter.GetBytes(1));
-                AddDataSymbol(label, DataSectionName, offset, 4);
+                int size = checked(_target.PointerSize * 3);
+                int offset = _data.Align(_target.PointerSize);
+                var context = new byte[size];
+                context[0] = 1;
+                _data.EmitBytes(context);
+                AddDataSymbol(label, DataSectionName, offset, size);
                 storage.InitializationStateLabel = label;
                 return label;
             }
@@ -2340,37 +2431,12 @@ namespace Cnidaria.Cs
                     ArmInstrKind.Str, Reg(ArmRegister.X29, 8), Mem(ArmRegister.Sp, savedFramePointerOffset, 8)));
                 EmitMove(ArmRegister.X29, ArmRegister.Sp, 8);
 
-                string doneLabel = CreateLocalLabel(thunk.Label + "_done");
-                string invalidStateLabel = CreateLocalLabel(thunk.Label + "_invalid_state");
-
-                EmitMaterializeAddress(thunk.StateLabel, ArmRegister.X16);
-                Emit(ArmInstruction.Binary(ArmInstrKind.Ldr, Reg(ArmRegister.X17, 4), Mem(ArmRegister.X16, 0, 4)));
-                EmitCompareBranch(ArmInstrKind.Cbz, ArmRegister.X17, 4, doneLabel);
-                Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ArmRegister.X17, 4), ArmOperand.ImmediateOperand(2)));
-                EmitConditionalJump(ArmCondition.Eq, doneLabel);
-                Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ArmRegister.X17, 4), ArmOperand.ImmediateOperand(1)));
-                EmitConditionalJump(ArmCondition.Ne, invalidStateLabel);
-
-                EmitLoadImmediate(ArmRegister.X17, 2, 4);
-                Emit(ArmInstruction.Binary(ArmInstrKind.Str, Reg(ArmRegister.X17, 4), Mem(ArmRegister.X16, 0, 4)));
+                EmitMaterializeAddress(thunk.StateLabel, ArmRegister.X0);
+                EmitMaterializeAddress(ResolveMethodLabel(thunk.Initializer), ArmRegister.X1);
                 string returnLabel = CreateLocalLabel(thunk.Label + "_gc_return");
-                AddSafePoint(
-                    thunk.Label,
-                    returnLabel,
-                    region,
-                    ImmutableArray<SafePointRootDraft>.Empty);
-                EmitCall(ResolveMethodLabel(thunk.Initializer));
+                AddSafePoint(thunk.Label, returnLabel, region, ImmutableArray<SafePointRootDraft>.Empty);
+                EmitCall(ResolveMethodLabel((_program.ClassConstructorRunnerMethod ?? throw new MissingMethodException("The class constructor runner is missing."))));
                 DefineLabel(returnLabel);
-                EmitMaterializeAddress(thunk.StateLabel, ArmRegister.X16);
-                Emit(ArmInstruction.Binary(ArmInstrKind.Str, Reg(ArmRegister.Xzr, 4), Mem(ArmRegister.X16, 0, 4)));
-                EmitJump(doneLabel);
-
-                DefineLabel(invalidStateLabel);
-                EmitLoadImmediate(ArmRegister.X0, 150, 8);
-                EmitCall(ResolveExternalSymbol(ArmRuntime.FailFastSymbol));
-                Emit(ArmInstruction.Unary(ArmInstrKind.Brk, ArmOperand.ImmediateOperand(1)));
-
-                DefineLabel(doneLabel);
                 EmitMove(ArmRegister.Sp, ArmRegister.X29, 8);
                 Emit(ArmInstruction.Binary(
                     ArmInstrKind.Ldr, Reg(ArmRegister.X30, 8), Mem(ArmRegister.Sp, savedReturnAddressOffset, 8)));
@@ -2813,6 +2879,7 @@ namespace Cnidaria.Cs
                     }
                 }
 
+                EmitThreadStaticMetadata();
                 _metadataSealed = true;
                 return new RuntimeMetadataLabels(
                     safePointTableLabel,
@@ -3961,12 +4028,14 @@ namespace Cnidaria.Cs
 
                     switch (node.Operator)
                     {
-                        case GenTreeOperator.Add when IsAddSubImmediate(immediate):
-                        case GenTreeOperator.Sub when IsAddSubImmediate(-immediate):
-                            _owner.Emit(ArmInstruction.Ternary(
-                                node.Operator == GenTreeOperator.Add ? ArmInstrKind.Add : ArmInstrKind.Sub,
-                                Reg(rd, size), Reg(rn, size), ArmOperand.ImmediateOperand(immediate)));
-                            return true;
+                        case GenTreeOperator.Add or GenTreeOperator.Sub when IsAddSubImmediate(immediate) || IsAddSubImmediate(-immediate):
+                            {
+                                // The encoding holds only a magnitude, so a negative immediate flips the operation
+                                bool add = (node.Operator == GenTreeOperator.Add) == (immediate >= 0);
+                                _owner.Emit(ArmInstruction.Ternary(
+                                    add ? ArmInstrKind.Add : ArmInstrKind.Sub, Reg(rd, size), Reg(rn, size), ArmOperand.ImmediateOperand(Math.Abs(immediate))));
+                                return true;
+                            }
                         case GenTreeOperator.Shl:
                         case GenTreeOperator.Shr:
                         case GenTreeOperator.ShrUn:
@@ -4599,12 +4668,22 @@ namespace Cnidaria.Cs
 
                 private void EmitReturn(GenTree node)
                 {
+                    if ((node.Flags & GenTreeFlags.AsyncSuspend) != 0)
+                    {
+                        _owner.EmitLoadImmediate(ToArm(RegisterInfo.GetIntegerReturnRegister(Target, 0)), 0, 8);
+                        _owner.EmitLoadImmediate(ToArm(RegisterInfo.GetIntegerReturnRegister(Target, 1)), 0, 8);
+                        _owner.Emit(ArmInstruction.Unary(ArmInstrKind.Ret, Reg(ArmRegister.X30, 8)));
+                        return;
+                    }
+
                     if (node.Uses.Length != 0 && MachineAbi.RequiresHiddenReturnBuffer(_method.RuntimeMethod, Target))
                     {
                         EmitHiddenReturnBufferCopy(node);
                         return;
                     }
 
+                    if (_method.RuntimeMethod.IsAsyncCall)
+                        _owner.EmitLoadImmediate(ToArm(RegisterInfo.AsyncContinuationRegister(Target)), 0, 8);
                     _owner.Emit(ArmInstruction.Unary(ArmInstrKind.Ret, Reg(ArmRegister.X30, 8)));
                 }
 
@@ -4842,6 +4921,9 @@ namespace Cnidaria.Cs
                         case RuntimeIntrinsicId.MemoryBarrier:
                         case RuntimeIntrinsicId.VolatileWrite:
                             EmitDataMemoryBarrier();
+                            return;
+                        case RuntimeIntrinsicId.AsyncCallContinuation:
+                            EmitRegisterMove(RequireResultRegister(node), RegisterInfo.AsyncContinuationRegister(Target), node.Type, GenStackKind.Ref);
                             return;
                         case RuntimeIntrinsicId.VolatileRead:
                             // dmb ishld orders the load before every later access
@@ -6500,19 +6582,15 @@ namespace Cnidaria.Cs
 
                     RuntimeType fieldType = field.FieldType;
                     GenStackKind kind = MachineAbi.StackKindForType(fieldType);
-                    string storageLabel = _owner.GetStaticStorageLabel(field.DeclaringType);
 
                     if (node.TreeKind == GenTreeKind.StaticFieldAddr)
                     {
-                        ArmRegister result = GeneralRegister(RequireResultRegister(node));
-                        _owner.EmitMaterializeAddress(storageLabel, result);
-                        _owner.EmitAddImmediate(result, result, field.Offset, Scratch0);
+                        EmitStaticFieldAddress(GeneralRegister(RequireResultRegister(node)), field, Scratch0);
                         return;
                     }
 
                     ArmRegister address = ValueAddressRegister(node, fieldType, kind);
-                    _owner.EmitMaterializeAddress(storageLabel, address);
-                    _owner.EmitAddImmediate(address, address, field.Offset, address == Scratch1 ? Scratch0 : Scratch1);
+                    EmitStaticFieldAddress(address, field, address == Scratch1 ? Scratch0 : Scratch1);
 
                     if (node.TreeKind == GenTreeKind.StaticField)
                     {
@@ -6528,6 +6606,21 @@ namespace Cnidaria.Cs
                     if (node.Uses.Length == 0)
                         throw Unsupported(node, "Static field store has no value operand");
                     EmitValueToAddress(node, node.Uses[0], fieldType, kind, address);
+                }
+
+                private void EmitStaticFieldAddress(ArmRegister destination, RuntimeField field, ArmRegister scratch)
+                {
+                    int offset = field.Offset;
+                    if (field.IsThreadStatic)
+                    {
+                        offset = checked(offset + _owner.GetThreadStaticOffset(field.DeclaringType));
+                        _owner.EmitThreadStatics(destination);
+                    }
+                    else
+                    {
+                        _owner.EmitMaterializeAddress(_owner.GetStaticStorageLabel(field.DeclaringType), destination);
+                    }
+                    _owner.EmitAddImmediate(destination, destination, offset, scratch);
                 }
 
                 private void EmitBox(GenTree node)

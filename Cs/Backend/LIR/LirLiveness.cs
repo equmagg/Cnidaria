@@ -452,7 +452,9 @@ namespace Cnidaria.Cs
                     return;
                 }
 
-                MachineRegister fixedRegister = X86FixedDefinitionRegister(method.Target, node, info.RegisterClass);
+                MachineRegister fixedRegister = node.Kind == GenTreeKind.Intrinsic && node.IntrinsicId == RuntimeIntrinsicId.AsyncCallContinuation
+                    ? RegisterInfo.AsyncContinuationRegister(method.Target)
+                    : X86FixedDefinitionRegister(method.Target, node, info.RegisterClass);
                 if (fixedRegister != MachineRegister.Invalid)
                     flags |= LinearRefPositionFlags.FixedRegister | LinearRefPositionFlags.RequiresRegister;
 
@@ -989,6 +991,13 @@ namespace Cnidaria.Cs
             var flags = GetValueRefFlags(info);
             if (IsLastUse(intervals, value, usePosition))
                 flags |= LinearRefPositionFlags.LastUse;
+
+            if ((node.Flags & GenTreeFlags.AsyncSuspend) != 0)
+            {
+                result.Add(new LinearRefPosition(node.LinearId, usePosition, 0, LinearRefPositionKind.Use, value, RegisterClass.General,
+                    RegisterInfo.AsyncContinuationRegister(target), flags | LinearRefPositionFlags.FixedRegister | LinearRefPositionFlags.RequiresRegister));
+                return;
+            }
 
             if (info.RegisterClass == RegisterClass.Vector)
             {

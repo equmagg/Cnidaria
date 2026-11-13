@@ -26,6 +26,9 @@ struct __file
     int descriptor;
     int flags;
     int ungot;
+    volatile int lock;
+    int depth;
+    void* owner;
     size_t position;
     size_t pending;
     char buffer[BUFSIZ];
@@ -33,14 +36,94 @@ struct __file
 
 // Every stream a program can hold, so opening one never asks the allocator
 static FILE __file_table[FOPEN_MAX];
-static int __file_ready;
+static volatile int __file_ready;
+
+#if defined(__linux__)
+
+void __libc_lock(volatile int* word);
+void __libc_unlock(volatile int* word);
+int __libc_trylock(volatile int* word);
+void* __libc_thread_self(void);
+
+static volatile int __file_table_lock;
+
+#define __FILE_TABLE_LOCK() __libc_lock(&__file_table_lock)
+#define __FILE_TABLE_UNLOCK() __libc_unlock(&__file_table_lock)
+
+#else
+
+#define __FILE_TABLE_LOCK() ((void)0)
+#define __FILE_TABLE_UNLOCK() ((void)0)
+
+#endif
+
+static void __file_lock(FILE* stream)
+{
+#if defined(__linux__)
+    void* self = __libc_thread_self();
+    if (stream->owner == self)
+    {
+        stream->depth = stream->depth + 1;
+        return;
+    }
+    __libc_lock(&stream->lock);
+    stream->owner = self;
+    stream->depth = 1;
+#else
+    (void)stream;
+#endif
+}
+
+static void __file_unlock(FILE* stream)
+{
+#if defined(__linux__)
+    stream->depth = stream->depth - 1;
+    if (stream->depth != 0)
+        return;
+    stream->owner = (void*)0;
+    __libc_unlock(&stream->lock);
+#else
+    (void)stream;
+#endif
+}
+
+#if defined(__linux__)
+
+void __libc_stdio_fork_lock(void)
+{
+    __FILE_TABLE_LOCK();
+}
+
+// A lock some other thread held is released in the child, which that thread never reaches
+void __libc_stdio_fork_unlock(int child)
+{
+    int index;
+    void* self = __libc_thread_self();
+    for (index = 0; child && index < FOPEN_MAX; index++)
+    {
+        if (__file_table[index].owner != self)
+        {
+            __file_table[index].lock = 0;
+            __file_table[index].owner = (void*)0;
+            __file_table[index].depth = 0;
+        }
+    }
+    __FILE_TABLE_UNLOCK();
+}
+
+#endif
 
 static void __file_prepare(void)
 {
     int index;
     if (__file_ready != 0)
         return;
-    __file_ready = 1;
+    __FILE_TABLE_LOCK();
+    if (__file_ready != 0)
+    {
+        __FILE_TABLE_UNLOCK();
+        return;
+    }
 
     for (index = 0; index < FOPEN_MAX; index++)
     {
@@ -58,6 +141,8 @@ static void __file_prepare(void)
     __file_table[1].flags = __FILE_WRITABLE | __FILE_TAKEN | __FILE_NONE;
     __file_table[2].descriptor = STDERR_FILENO;
     __file_table[2].flags = __FILE_WRITABLE | __FILE_TAKEN | __FILE_NONE;
+    __file_ready = 1;
+    __FILE_TABLE_UNLOCK();
 }
 
 FILE* __stdio_stream(int index)
@@ -69,7 +154,9 @@ FILE* __stdio_stream(int index)
 static FILE* __file_take(void)
 {
     int index;
+    FILE* stream = (FILE*)0;
     __file_prepare();
+    __FILE_TABLE_LOCK();
     for (index = 3; index < FOPEN_MAX; index++)
     {
         if ((__file_table[index].flags & __FILE_TAKEN) == 0)
@@ -78,10 +165,12 @@ static FILE* __file_take(void)
             __file_table[index].ungot = -1;
             __file_table[index].position = 0;
             __file_table[index].pending = 0;
-            return &__file_table[index];
+            stream = &__file_table[index];
+            break;
         }
     }
-    return (FILE*)0;
+    __FILE_TABLE_UNLOCK();
+    return stream;
 }
 
 static int __file_drain(FILE* stream)
@@ -295,13 +384,22 @@ int fflush(FILE* stream)
     int result = 0;
 
     if (stream != (FILE*)0)
-        return __file_drain(stream);
+    {
+        __file_lock(stream);
+        result = __file_drain(stream);
+        __file_unlock(stream);
+        return result;
+    }
 
     __file_prepare();
     for (index = 0; index < FOPEN_MAX; index++)
     {
-        if ((__file_table[index].flags & __FILE_TAKEN) != 0 && __file_drain(&__file_table[index]) != 0)
+        if ((__file_table[index].flags & __FILE_TAKEN) == 0)
+            continue;
+        __file_lock(&__file_table[index]);
+        if (__file_drain(&__file_table[index]) != 0)
             result = EOF;
+        __file_unlock(&__file_table[index]);
     }
     return result;
 }
@@ -313,23 +411,28 @@ int fclose(FILE* stream)
     if (stream == (FILE*)0)
         return EOF;
 
+    __file_lock(stream);
     result = __file_drain(stream);
     if (stream->descriptor > 2 && close(stream->descriptor) != 0)
         result = EOF;
 
-    stream->flags = 0;
     stream->descriptor = -1;
     stream->ungot = -1;
     stream->position = 0;
     stream->pending = 0;
+    __file_unlock(stream);
+    stream->flags = 0;
     return result;
 }
 
 FILE* freopen(const char* path, const char* mode, FILE* stream)
 {
+    int descriptor;
+
     if (stream == (FILE*)0)
         return (FILE*)0;
 
+    __file_lock(stream);
     __file_drain(stream);
     if (stream->descriptor > 2)
         close(stream->descriptor);
@@ -338,18 +441,14 @@ FILE* freopen(const char* path, const char* mode, FILE* stream)
     stream->pending = 0;
     stream->ungot = -1;
 
-    if (path == (const char*)0)
-        return (FILE*)0;
-
-    stream->descriptor = open(path, __file_open_flags(mode));
-    if (stream->descriptor < 0)
+    if (path != (const char*)0)
     {
-        stream->flags = 0;
-        return (FILE*)0;
+        stream->descriptor = open(path, __file_open_flags(mode));
+        stream->flags = stream->descriptor < 0 ? 0 : __file_flags_of(mode) | __FILE_TAKEN;
     }
-
-    stream->flags = __file_flags_of(mode) | __FILE_TAKEN;
-    return stream;
+    descriptor = stream->descriptor;
+    __file_unlock(stream);
+    return descriptor < 0 ? (FILE*)0 : stream;
 }
 
 int fileno(FILE* stream)
@@ -370,12 +469,14 @@ int setvbuf(FILE* stream, char* buffer, int mode, size_t size)
     if (stream == (FILE*)0)
         return EOF;
 
+    __file_lock(stream);
     __file_drain(stream);
     stream->flags = stream->flags & ~(__FILE_LINE | __FILE_NONE);
     if (mode == _IOLBF)
         stream->flags = stream->flags | __FILE_LINE;
     else if (mode == _IONBF)
         stream->flags = stream->flags | __FILE_NONE;
+    __file_unlock(stream);
     return 0;
 }
 
@@ -386,9 +487,13 @@ void setbuf(FILE* stream, char* buffer)
 
 int fputc(int value, FILE* stream)
 {
+    int result;
     if (stream == (FILE*)0)
         return EOF;
-    return __file_put(stream, value);
+    __file_lock(stream);
+    result = __file_put(stream, value);
+    __file_unlock(stream);
+    return result;
 }
 
 int putc(int value, FILE* stream)
@@ -404,25 +509,30 @@ int fputs(const char* text, FILE* stream)
         return EOF;
 
     length = strlen(text);
-    return __file_write_bytes(stream, text, length) == length ? 0 : EOF;
+    __file_lock(stream);
+    length = length - __file_write_bytes(stream, text, length);
+    __file_unlock(stream);
+    return length == 0 ? 0 : EOF;
 }
 
 int fgetc(FILE* stream)
 {
+    int value;
     if (stream == (FILE*)0)
         return EOF;
 
+    __file_lock(stream);
     if (stream->ungot >= 0)
     {
-        int value = stream->ungot;
+        value = stream->ungot;
         stream->ungot = -1;
-        return value;
     }
-
-    if (__file_fill(stream) != 0)
-        return EOF;
-
-    return (int)(unsigned char)stream->buffer[stream->position++];
+    else if (__file_fill(stream) != 0)
+        value = EOF;
+    else
+        value = (int)(unsigned char)stream->buffer[stream->position++];
+    __file_unlock(stream);
+    return value;
 }
 
 int getc(FILE* stream)
@@ -439,9 +549,11 @@ int ungetc(int value, FILE* stream)
 {
     if (stream == (FILE*)0 || value == EOF)
         return EOF;
+    __file_lock(stream);
     stream->ungot = (int)(unsigned char)value;
     stream->flags = stream->flags & ~__FILE_AT_END;
-    return stream->ungot;
+    __file_unlock(stream);
+    return (int)(unsigned char)value;
 }
 
 char* fgets(char* text, int size, FILE* stream)
@@ -451,6 +563,7 @@ char* fgets(char* text, int size, FILE* stream)
     if (text == (char*)0 || size <= 0 || stream == (FILE*)0)
         return (char*)0;
 
+    __file_lock(stream);
     while (index < size - 1)
     {
         int value = fgetc(stream);
@@ -461,6 +574,7 @@ char* fgets(char* text, int size, FILE* stream)
         if (value == '\n')
             break;
     }
+    __file_unlock(stream);
 
     if (index == 0)
         return (char*)0;
@@ -479,6 +593,7 @@ size_t fread(void* destination, size_t size, size_t count, FILE* stream)
         return 0;
 
     wanted = size * count;
+    __file_lock(stream);
     while (done < wanted)
     {
         size_t available;
@@ -504,6 +619,7 @@ size_t fread(void* destination, size_t size, size_t count, FILE* stream)
         stream->position = stream->position + step;
         done = done + step;
     }
+    __file_unlock(stream);
 
     return done / size;
 }
@@ -516,7 +632,10 @@ size_t fwrite(const void* source, size_t size, size_t count, FILE* stream)
         return 0;
 
     wanted = size * count;
-    return __file_write_bytes(stream, (const char*)source, wanted) / size;
+    __file_lock(stream);
+    wanted = __file_write_bytes(stream, (const char*)source, wanted);
+    __file_unlock(stream);
+    return wanted / size;
 }
 
 int fseek(FILE* stream, long offset, int whence)
@@ -526,6 +645,7 @@ int fseek(FILE* stream, long offset, int whence)
     if (stream == (FILE*)0)
         return -1;
 
+    __file_lock(stream);
     __file_drain(stream);
     if (whence == SEEK_CUR)
         offset = offset - (long)(stream->pending - stream->position);
@@ -536,29 +656,35 @@ int fseek(FILE* stream, long offset, int whence)
     stream->flags = stream->flags & ~__FILE_AT_END;
 
     placed = lseek(stream->descriptor, (off_t)offset, whence);
+    __file_unlock(stream);
     return placed < 0 ? -1 : 0;
 }
 
 long ftell(FILE* stream)
 {
     off_t placed;
+    long result = -1;
 
     if (stream == (FILE*)0)
         return -1;
 
+    __file_lock(stream);
     __file_drain(stream);
     placed = lseek(stream->descriptor, 0, SEEK_CUR);
-    if (placed < 0)
-        return -1;
-
-    return (long)(placed - (off_t)(stream->pending - stream->position));
+    if (placed >= 0)
+        result = (long)(placed - (off_t)(stream->pending - stream->position));
+    __file_unlock(stream);
+    return result;
 }
 
 void rewind(FILE* stream)
 {
+    if (stream == (FILE*)0)
+        return;
+    __file_lock(stream);
     fseek(stream, 0, SEEK_SET);
-    if (stream != (FILE*)0)
-        stream->flags = stream->flags & ~__FILE_FAILED;
+    stream->flags = stream->flags & ~__FILE_FAILED;
+    __file_unlock(stream);
 }
 
 int feof(FILE* stream)
@@ -573,8 +699,39 @@ int ferror(FILE* stream)
 
 void clearerr(FILE* stream)
 {
-    if (stream != (FILE*)0)
-        stream->flags = stream->flags & ~(__FILE_AT_END | __FILE_FAILED);
+    if (stream == (FILE*)0)
+        return;
+    __file_lock(stream);
+    stream->flags = stream->flags & ~(__FILE_AT_END | __FILE_FAILED);
+    __file_unlock(stream);
+}
+
+void flockfile(FILE* stream)
+{
+    __file_lock(stream);
+}
+
+void funlockfile(FILE* stream)
+{
+    __file_unlock(stream);
+}
+
+int ftrylockfile(FILE* stream)
+{
+#if defined(__linux__)
+    void* self = __libc_thread_self();
+    if (stream->owner != self)
+    {
+        if (__libc_trylock(&stream->lock) != 0)
+            return -1;
+        stream->owner = self;
+        stream->depth = 0;
+    }
+    stream->depth = stream->depth + 1;
+#else
+    (void)stream;
+#endif
+    return 0;
 }
 
 void __stdio_shutdown(void)
@@ -594,14 +751,17 @@ int rename(const char* from, const char* to)
 
 void perror(const char* text)
 {
+    const char* message = strerror(errno);
+    __file_lock(stderr);
     if (text != (const char*)0 && text[0] != 0)
     {
         fputs(text, stderr);
         fputs(": ", stderr);
     }
-    fputs(strerror(errno), stderr);
+    fputs(message, stderr);
     fputc('\n', stderr);
     fflush(stderr);
+    __file_unlock(stderr);
 }
 
 #else
@@ -635,8 +795,6 @@ typedef struct __printf_sink
     char chunk[__PRINTF_CHUNK + 1];
 } __printf_sink;
 
-static __printf_sink* __printf_out;
-
 static void __printf_flush(__printf_sink* sink)
 {
     if (sink->pending == 0)
@@ -660,7 +818,6 @@ static void __printf_open_stream(__printf_sink* sink, void* stream)
     sink->stream = stream;
     sink->outward = 1;
     sink->pending = 0;
-    __printf_out = sink;
 }
 
 static void __printf_open_buffer(__printf_sink* sink, char* buffer, size_t limit)
@@ -671,7 +828,6 @@ static void __printf_open_buffer(__printf_sink* sink, char* buffer, size_t limit
     sink->stream = (void*)0;
     sink->outward = 0;
     sink->pending = 0;
-    __printf_out = sink;
 }
 
 static int __printf_close(__printf_sink* sink)
@@ -681,14 +837,11 @@ static int __printf_close(__printf_sink* sink)
     else if (sink->buffer != (char*)0 && sink->limit != 0)
         sink->buffer[sink->produced < sink->limit - 1 ? sink->produced : sink->limit - 1] = 0;
 
-    __printf_out = (__printf_sink*)0;
     return (int)sink->produced;
 }
 
-static int __printf_putchar(int ch)
+static int __printf_putchar(__printf_sink* sink, int ch)
 {
-    __printf_sink* sink = __printf_out;
-
     if (sink->outward != 0)
     {
         sink->chunk[sink->pending] = (char)ch;
@@ -705,24 +858,24 @@ static int __printf_putchar(int ch)
     return 1;
 }
 
-static int __printf_repeat(int ch, int count)
+static int __printf_repeat(__printf_sink* sink, int ch, int count)
 {
     int written = 0;
     while (count > 0)
     {
-        __printf_putchar(ch);
+        __printf_putchar(sink, ch);
         written = written + 1;
         count = count - 1;
     }
     return written;
 }
 
-static int __printf_write(const char* text, int length)
+static int __printf_write(__printf_sink* sink, const char* text, int length)
 {
     int index = 0;
     while (index < length)
     {
-        __printf_putchar(text[index]);
+        __printf_putchar(sink, text[index]);
         index = index + 1;
     }
     return length;
@@ -738,40 +891,40 @@ static int __printf_strlen(const char* text, int precision)
     return length;
 }
 
-static int __printf_pad_write(const char* text, int length, int left, int zero, int width, char sign, const char* prefix, int prefix_len)
+static int __printf_pad_write(__printf_sink* sink, const char* text, int length, int left, int zero, int width, char sign, const char* prefix, int prefix_len)
 {
     int total = length + prefix_len;
     int written = 0;
     if (sign != 0)
         total = total + 1;
     if (!left && !zero && width > total)
-        written = written + __printf_repeat(' ', width - total);
+        written = written + __printf_repeat(sink, ' ', width - total);
     if (sign != 0)
-        written = written + __printf_putchar(sign);
+        written = written + __printf_putchar(sink, sign);
     if (prefix_len != 0)
-        written = written + __printf_write(prefix, prefix_len);
+        written = written + __printf_write(sink, prefix, prefix_len);
     if (!left && zero && width > total)
-        written = written + __printf_repeat('0', width - total);
-    written = written + __printf_write(text, length);
+        written = written + __printf_repeat(sink, '0', width - total);
+    written = written + __printf_write(sink, text, length);
     if (left && width > total)
-        written = written + __printf_repeat(' ', width - total);
+        written = written + __printf_repeat(sink, ' ', width - total);
     return written;
 }
 
-static int __printf_emit_string(const char* text, int left, int width, int precision)
+static int __printf_emit_string(__printf_sink* sink, const char* text, int left, int width, int precision)
 {
     int length;
     if (text == (const char*)0)
         text = "(null)";
     length = __printf_strlen(text, precision);
-    return __printf_pad_write(text, length, left, 0, width, 0, "", 0);
+    return __printf_pad_write(sink, text, length, left, 0, width, 0, "", 0);
 }
 
-static int __printf_emit_char(int ch, int left, int width)
+static int __printf_emit_char(__printf_sink* sink, int ch, int left, int width)
 {
     char text[1];
     text[0] = (char)ch;
-    return __printf_pad_write(text, 1, left, 0, width, 0, "", 0);
+    return __printf_pad_write(sink, text, 1, left, 0, width, 0, "", 0);
 }
 
 static char* __printf_utoa(unsigned long long value, unsigned int base, int upper, char* end, int* length)
@@ -838,7 +991,7 @@ static unsigned long long __printf_read_signed(va_list* ap, int length, int* neg
     return (unsigned long long)value;
 }
 
-static int __printf_emit_integer(unsigned long long value, int negative, int is_signed, unsigned int base, int upper, int alt, int zero, int left, int plus, int space, int width, int precision, int pointer_form)
+static int __printf_emit_integer(__printf_sink* sink, unsigned long long value, int negative, int is_signed, unsigned int base, int upper, int alt, int zero, int left, int plus, int space, int width, int precision, int pointer_form)
 {
     char buffer[65];
     char prefix[2];
@@ -888,17 +1041,17 @@ static int __printf_emit_integer(unsigned long long value, int negative, int is_
         total = total + 1;
 
     if (!left && !zero && width > total)
-        written = written + __printf_repeat(' ', width - total);
+        written = written + __printf_repeat(sink, ' ', width - total);
     if (sign != 0)
-        written = written + __printf_putchar(sign);
+        written = written + __printf_putchar(sink, sign);
     if (prefix_len != 0)
-        written = written + __printf_write(prefix, prefix_len);
+        written = written + __printf_write(sink, prefix, prefix_len);
     if (!left && zero && width > total)
-        written = written + __printf_repeat('0', width - total);
-    written = written + __printf_repeat('0', zeroes);
-    written = written + __printf_write(digits, digit_len);
+        written = written + __printf_repeat(sink, '0', width - total);
+    written = written + __printf_repeat(sink, '0', zeroes);
+    written = written + __printf_write(sink, digits, digit_len);
     if (left && width > total)
-        written = written + __printf_repeat(' ', width - total);
+        written = written + __printf_repeat(sink, ' ', width - total);
     return written;
 }
 
@@ -1096,7 +1249,7 @@ static int __printf_float_abs(double value, int spec, int precision, int alt, in
     return __printf_fixed_abs(value, precision, alt, buffer);
 }
 
-static int __printf_emit_float(double value, int spec, int upper, int alt, int zero, int left, int plus, int space, int width, int precision)
+static int __printf_emit_float(__printf_sink* sink, double value, int spec, int upper, int alt, int zero, int left, int plus, int space, int width, int precision)
 {
     char buffer[96];
     char sign = 0;
@@ -1105,8 +1258,8 @@ static int __printf_emit_float(double value, int spec, int upper, int alt, int z
     if (value != value)
     {
         if (upper)
-            return __printf_pad_write("NAN", 3, left, 0, width, 0, "", 0);
-        return __printf_pad_write("nan", 3, left, 0, width, 0, "", 0);
+            return __printf_pad_write(sink, "NAN", 3, left, 0, width, 0, "", 0);
+        return __printf_pad_write(sink, "nan", 3, left, 0, width, 0, "", 0);
     }
 
     if (value < 0.0)
@@ -1122,8 +1275,8 @@ static int __printf_emit_float(double value, int spec, int upper, int alt, int z
     if (value != 0.0 && value / 2.0 == value)
     {
         if (upper)
-            return __printf_pad_write("INF", 3, left, 0, width, sign, "", 0);
-        return __printf_pad_write("inf", 3, left, 0, width, sign, "", 0);
+            return __printf_pad_write(sink, "INF", 3, left, 0, width, sign, "", 0);
+        return __printf_pad_write(sink, "inf", 3, left, 0, width, sign, "", 0);
     }
 
     if (spec == 'a' || spec == 'A')
@@ -1137,7 +1290,7 @@ static int __printf_emit_float(double value, int spec, int upper, int alt, int z
     {
         length = __printf_float_abs(value, spec, precision, alt, upper, buffer);
     }
-    return __printf_pad_write(buffer, length, left, zero, width, sign, "", 0);
+    return __printf_pad_write(sink, buffer, length, left, zero, width, sign, "", 0);
 }
 
 static void __printf_store_count(va_list* ap, int length, int count)
@@ -1180,18 +1333,18 @@ static void __printf_store_count(va_list* ap, int length, int count)
     }
 }
 
-static int __printf_bad_format(const char* format, int start, int end)
+static int __printf_bad_format(__printf_sink* sink, const char* format, int start, int end)
 {
     int count = 0;
     while (start < end && format[start] != 0)
     {
-        count = count + __printf_putchar(format[start]);
+        count = count + __printf_putchar(sink, format[start]);
         start = start + 1;
     }
     return count;
 }
 
-static int __printf_format(const char* format, va_list* ap)
+static int __printf_format(__printf_sink* sink, const char* format, va_list* ap)
 {
     int index = 0;
     int count = 0;
@@ -1211,7 +1364,7 @@ static int __printf_format(const char* format, va_list* ap)
 
         if (format[index] != '%')
         {
-            count = count + __printf_putchar(format[index]);
+            count = count + __printf_putchar(sink, format[index]);
             index = index + 1;
             continue;
         }
@@ -1320,7 +1473,7 @@ static int __printf_format(const char* format, va_list* ap)
         spec = format[index];
         if (spec == 0)
         {
-            count = count + __printf_bad_format(format, start, index);
+            count = count + __printf_bad_format(sink, format, start, index);
             break;
         }
 
@@ -1328,16 +1481,16 @@ static int __printf_format(const char* format, va_list* ap)
             zero = 0;
 
         if (spec == '%')
-            count = count + __printf_emit_char('%', left, width);
+            count = count + __printf_emit_char(sink, '%', left, width);
         else if (spec == 'c')
-            count = count + __printf_emit_char(va_arg(*ap, int), left, width);
+            count = count + __printf_emit_char(sink, va_arg(*ap, int), left, width);
         else if (spec == 's')
-            count = count + __printf_emit_string(va_arg(*ap, char*), left, width, precision);
+            count = count + __printf_emit_string(sink, va_arg(*ap, char*), left, width, precision);
         else if (spec == 'd' || spec == 'i')
         {
             int negative = 0;
             unsigned long long value = __printf_read_signed(ap, length, &negative);
-            count = count + __printf_emit_integer(value, negative, 1, 10, 0, 0, zero, left, plus, space, width, precision, 0);
+            count = count + __printf_emit_integer(sink, value, negative, 1, 10, 0, 0, zero, left, plus, space, width, precision, 0);
         }
         else if (spec == 'u' || spec == 'o' || spec == 'x' || spec == 'X')
         {
@@ -1350,24 +1503,24 @@ static int __printf_format(const char* format, va_list* ap)
                 base = 16;
             if (spec == 'X')
                 upper = 1;
-            count = count + __printf_emit_integer(value, 0, 0, base, upper, alt, zero, left, 0, 0, width, precision, 0);
+            count = count + __printf_emit_integer(sink, value, 0, 0, base, upper, alt, zero, left, 0, 0, width, precision, 0);
         }
         else if (spec == 'p')
         {
             void* ptr = va_arg(*ap, void*);
-            count = count + __printf_emit_integer((unsigned long long)(size_t)ptr, 0, 0, 16, 0, 0, zero, left, 0, 0, width, precision, 1);
+            count = count + __printf_emit_integer(sink, (unsigned long long)(size_t)ptr, 0, 0, 16, 0, 0, zero, left, 0, 0, width, precision, 1);
         }
         else if (spec == 'f' || spec == 'F' || spec == 'e' || spec == 'E' || spec == 'g' || spec == 'G' || spec == 'a' || spec == 'A')
         {
             int upper = 0;
             if (spec == 'F' || spec == 'E' || spec == 'G' || spec == 'A')
                 upper = 1;
-            count = count + __printf_emit_float(va_arg(*ap, double), spec, upper, alt, zero, left, plus, space, width, precision);
+            count = count + __printf_emit_float(sink, va_arg(*ap, double), spec, upper, alt, zero, left, plus, space, width, precision);
         }
         else if (spec == 'n')
             __printf_store_count(ap, length, count);
         else
-            count = count + __printf_bad_format(format, start, index + 1);
+            count = count + __printf_bad_format(sink, format, start, index + 1);
 
         index = index + 1;
     }
@@ -1387,10 +1540,12 @@ int vfprintf(FILE* stream, const char* format, va_list arguments)
         return -1;
 
     va_copy(ap, arguments);
+    __file_lock(stream);
     __printf_open_stream(&sink, stream);
-    count = __printf_format(format, &ap);
+    count = __printf_format(&sink, format, &ap);
     va_end(ap);
     __printf_close(&sink);
+    __file_unlock(stream);
     return count;
 }
 
@@ -1416,6 +1571,14 @@ static void* __printf_console(void)
 #endif
 }
 
+#if defined(__CNIDARIA_FILES)
+#define __PRINTF_CONSOLE_LOCK() __file_lock(stdout)
+#define __PRINTF_CONSOLE_UNLOCK() __file_unlock(stdout)
+#else
+#define __PRINTF_CONSOLE_LOCK() ((void)0)
+#define __PRINTF_CONSOLE_UNLOCK() ((void)0)
+#endif
+
 int vprintf(const char* format, va_list arguments)
 {
     __printf_sink sink;
@@ -1423,10 +1586,12 @@ int vprintf(const char* format, va_list arguments)
     int count;
 
     va_copy(ap, arguments);
+    __PRINTF_CONSOLE_LOCK();
     __printf_open_stream(&sink, __printf_console());
-    count = __printf_format(format, &ap);
+    count = __printf_format(&sink, format, &ap);
     va_end(ap);
     __printf_close(&sink);
+    __PRINTF_CONSOLE_UNLOCK();
     return count;
 }
 
@@ -1437,10 +1602,12 @@ int printf(const char* format, ...)
     int count;
 
     va_start(ap, format);
+    __PRINTF_CONSOLE_LOCK();
     __printf_open_stream(&sink, __printf_console());
-    count = __printf_format(format, &ap);
+    count = __printf_format(&sink, format, &ap);
     va_end(ap);
     __printf_close(&sink);
+    __PRINTF_CONSOLE_UNLOCK();
     return count;
 }
 
@@ -1452,7 +1619,7 @@ int vsnprintf(char* buffer, size_t size, const char* format, va_list arguments)
 
     va_copy(ap, arguments);
     __printf_open_buffer(&sink, buffer, size);
-    count = __printf_format(format, &ap);
+    count = __printf_format(&sink, format, &ap);
     va_end(ap);
     __printf_close(&sink);
     return count;
@@ -1466,7 +1633,7 @@ int snprintf(char* buffer, size_t size, const char* format, ...)
 
     va_start(ap, format);
     __printf_open_buffer(&sink, buffer, size);
-    count = __printf_format(format, &ap);
+    count = __printf_format(&sink, format, &ap);
     va_end(ap);
     __printf_close(&sink);
     return count;
@@ -1485,7 +1652,7 @@ int sprintf(char* buffer, const char* format, ...)
 
     va_start(ap, format);
     __printf_open_buffer(&sink, buffer, (size_t)-1);
-    count = __printf_format(format, &ap);
+    count = __printf_format(&sink, format, &ap);
     va_end(ap);
     __printf_close(&sink);
     return count;
@@ -1495,9 +1662,11 @@ int putchar(int character)
 {
     __printf_sink sink;
 
+    __PRINTF_CONSOLE_LOCK();
     __printf_open_stream(&sink, __printf_console());
-    __printf_putchar((int)(unsigned char)character);
+    __printf_putchar(&sink, (int)(unsigned char)character);
     __printf_close(&sink);
+    __PRINTF_CONSOLE_UNLOCK();
     return (int)(unsigned char)character;
 }
 
@@ -1506,14 +1675,16 @@ int puts(const char* text)
     __printf_sink sink;
     int index = 0;
 
+    __PRINTF_CONSOLE_LOCK();
     __printf_open_stream(&sink, __printf_console());
     while (text[index] != 0)
     {
-        __printf_putchar((int)(unsigned char)text[index]);
+        __printf_putchar(&sink, (int)(unsigned char)text[index]);
         index = index + 1;
     }
-    __printf_putchar('\n');
+    __printf_putchar(&sink, '\n');
     __printf_close(&sink);
+    __PRINTF_CONSOLE_UNLOCK();
     return index + 1;
 }
 

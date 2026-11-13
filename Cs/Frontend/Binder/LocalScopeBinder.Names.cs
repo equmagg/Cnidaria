@@ -639,7 +639,8 @@ namespace Cnidaria.Cs
             BindValueKind valueKind,
             BindingContext context,
             DiagnosticBag diagnostics,
-            out BoundExpression result)
+            out BoundExpression result,
+            bool allowIdenticalTypeName = false)
         {
             result = null!;
 
@@ -735,6 +736,17 @@ namespace Cnidaria.Cs
             }
             if (field is null && prop is null)
                 return false;
+
+            TypeSymbol? instanceMemberType = field is FieldSymbol instanceField && !instanceField.IsStatic
+                ? GetFieldValueType(instanceField)
+                : prop is PropertySymbol instanceProperty && !instanceProperty.IsStatic ? instanceProperty.Type : null;
+            if (allowIdenticalTypeName && inStaticContext && instanceMemberType is not null)
+            {
+                BindingContext probeContext = WithRecorder(context, NullBindingRecorder.Instance);
+                if (BindNamespaceOrType(id, probeContext, new DiagnosticBag()) is TypeSymbol typeMeaning &&
+                    AreSameType(instanceMemberType, typeMeaning))
+                    return false;
+            }
 
             // Bind the selected field
             if (field is not null)

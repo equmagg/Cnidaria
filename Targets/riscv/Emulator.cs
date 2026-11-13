@@ -716,13 +716,6 @@ public sealed partial class RiscVEmulator : IDisposable
                         if (trapped)
                             break;
                         ulong address = _x[(int)((instruction >> 15) & 31)] + (ulong)ImmI(instruction);
-                        if ((address & (ulong)(size - 1)) != 0)
-                        {
-                            trapped = true;
-                            trapCause = (ulong)RVTrapCause.LoadAddressMisaligned;
-                            trapValue = address;
-                            break;
-                        }
                         if (!TryReadMemory(address, size, RVMemoryAccess.Load, out ulong value, out trapCause, out trapValue))
                         {
                             trapped = true;
@@ -752,13 +745,6 @@ public sealed partial class RiscVEmulator : IDisposable
                         if (trapped)
                             break;
                         ulong address = _x[(int)((instruction >> 15) & 31)] + (ulong)ImmS(instruction);
-                        if ((address & (ulong)(size - 1)) != 0)
-                        {
-                            trapped = true;
-                            trapCause = (ulong)RVTrapCause.StoreAddressMisaligned;
-                            trapValue = address;
-                            break;
-                        }
                         if (!TryWriteMemory(address, size, _x[(int)((instruction >> 20) & 31)], out trapCause, out trapValue))
                             trapped = true;
                         break;
@@ -1619,11 +1605,17 @@ public sealed partial class RiscVEmulator : IDisposable
                             break;
                         }
 
+                        // A reservation covers physical memory, so a store through any mapping of the word breaks it
                         if (op == 0x10000000U)
                         {
+                            if (!TryTranslate(address, RVMemoryAccess.Load, out ulong reserved, out trapCause, out trapValue))
+                            {
+                                trapped = true;
+                                break;
+                            }
                             if (rd != 0)
                                 _x[rd] = size == 4 ? SignExtend32((uint)old) : old;
-                            _reservationAddress = address;
+                            _reservationAddress = reserved;
                             _hasReservation = true;
                             break;
                         }
@@ -1631,7 +1623,12 @@ public sealed partial class RiscVEmulator : IDisposable
                         ulong result;
                         if (op == 0x18000000U)
                         {
-                            result = _hasReservation && _reservationAddress == address ? 0UL : 1UL;
+                            if (!TryTranslate(address, RVMemoryAccess.Store, out ulong target, out trapCause, out trapValue))
+                            {
+                                trapped = true;
+                                break;
+                            }
+                            result = _hasReservation && _reservationAddress == target ? 0UL : 1UL;
                             if (result == 0 && !TryWriteMemory(address, size, _x[rs2], out trapCause, out trapValue))
                             {
                                 trapped = true;
@@ -1682,13 +1679,6 @@ public sealed partial class RiscVEmulator : IDisposable
                         else if (funct3 == 0x1000U) size = 2;
                         else { trapped = true; break; }
                         ulong address = _x[(int)((instruction >> 15) & 31)] + (ulong)ImmI(instruction);
-                        if ((address & (ulong)(size - 1)) != 0)
-                        {
-                            trapped = true;
-                            trapCause = (ulong)RVTrapCause.LoadAddressMisaligned;
-                            trapValue = address;
-                            break;
-                        }
                         if (!TryReadMemory(address, size, RVMemoryAccess.Load, out ulong value, out trapCause, out trapValue))
                         {
                             trapped = true;
@@ -1716,13 +1706,6 @@ public sealed partial class RiscVEmulator : IDisposable
                         else if (funct3 == 0x1000U) size = 2;
                         else { trapped = true; break; }
                         ulong address = _x[(int)((instruction >> 15) & 31)] + (ulong)ImmS(instruction);
-                        if ((address & (ulong)(size - 1)) != 0)
-                        {
-                            trapped = true;
-                            trapCause = (ulong)RVTrapCause.StoreAddressMisaligned;
-                            trapValue = address;
-                            break;
-                        }
                         if (!TryWriteMemory(address, size, _f[(int)((instruction >> 20) & 31)], out trapCause, out trapValue))
                             trapped = true;
                         break;
@@ -2396,22 +2379,29 @@ public sealed partial class RiscVEmulator : IDisposable
         // The guest privilege is the one hstatus remembers for it
         RVPrivilegeMode guestMode = (_hstatus & (1UL << 8)) != 0 ? RVPrivilegeMode.Supervisor : RVPrivilegeMode.User;
         ulong address = _x[(int)((instruction >> 15) & 31)];
-        if ((address & (ulong)(size - 1)) != 0)
-        {
-            trapCause = store ? (ulong)RVTrapCause.StoreAddressMisaligned : (ulong)RVTrapCause.LoadAddressMisaligned;
-            trapValue = address;
-            return false;
-        }
-
         var access = store ? RVMemoryAccess.Store : RVMemoryAccess.Load;
         if (!TryTranslateGuest(address, access, guestMode, asExecute, out ulong physical, out trapCause, out trapValue))
             return false;
+        int firstLength = FirstPageLength(address, size);
+        ulong rest = 0;
+        if (firstLength < size && !TryTranslateGuest(address + (ulong)firstLength, access, guestMode, asExecute, out rest, out trapCause, out trapValue))
+            return false;
+        bool aligned = (address & (ulong)(size - 1)) == 0;
 
         if (store)
-            return TryWritePhysical(physical, size, _x[rs2], out trapCause, out trapValue);
+        {
+            return aligned
+                ? TryWritePhysical(physical, size, _x[rs2], out trapCause, out trapValue)
+                : TryWriteMisaligned(address, physical, firstLength, rest, size, _x[rs2], out trapCause, out trapValue);
+        }
 
-        if (!TryReadPhysical(physical, size, RVMemoryAccess.Load, out ulong value, out trapCause, out trapValue))
+        ulong value;
+        if (aligned
+            ? !TryReadPhysical(physical, size, RVMemoryAccess.Load, out value, out trapCause, out trapValue)
+            : !TryReadMisaligned(address, physical, firstLength, rest, size, access, out value, out trapCause, out trapValue))
+        {
             return false;
+        }
         if (rd != 0)
             _x[rd] = unsignedLoad || size == 8 ? value : (ulong)SignExtendBySize(value, size);
         return true;
@@ -2836,18 +2826,90 @@ public sealed partial class RiscVEmulator : IDisposable
         value = 0;
         if (!TryTranslate(virtualAddress, access, out ulong physicalAddress, out trapCause, out trapValue))
             return false;
-        return TryReadPhysical(physicalAddress, size, access, out value, out trapCause, out trapValue);
+        if (access == RVMemoryAccess.Execute || (virtualAddress & (ulong)(size - 1)) == 0)
+            return TryReadPhysical(physicalAddress, size, access, out value, out trapCause, out trapValue);
+        int firstLength = FirstPageLength(virtualAddress, size);
+        ulong rest = 0;
+        if (firstLength < size && !TryTranslate(virtualAddress + (ulong)firstLength, access, out rest, out trapCause, out trapValue))
+            return false;
+        return TryReadMisaligned(virtualAddress, physicalAddress, firstLength, rest, size, access, out value, out trapCause, out trapValue);
     }
 
     private bool TryWriteMemory(ulong virtualAddress, int size, ulong value, out ulong trapCause, out ulong trapValue)
     {
         if (!TryTranslate(virtualAddress, RVMemoryAccess.Store, out ulong physicalAddress, out trapCause, out trapValue))
             return false;
-        bool ok = TryWritePhysical(physicalAddress, size, value, out trapCause, out trapValue);
+        bool ok;
+        if ((virtualAddress & (ulong)(size - 1)) == 0)
+            ok = TryWritePhysical(physicalAddress, size, value, out trapCause, out trapValue);
+        else
+        {
+            int firstLength = FirstPageLength(virtualAddress, size);
+            ulong rest = 0;
+            if (firstLength < size && !TryTranslate(virtualAddress + (ulong)firstLength, RVMemoryAccess.Store, out rest, out trapCause, out trapValue))
+                return false;
+            ok = TryWriteMisaligned(virtualAddress, physicalAddress, firstLength, rest, size, value, out trapCause, out trapValue);
+        }
         if (ok && _hasReservation && physicalAddress == _reservationAddress)
             _hasReservation = false;
         return ok;
     }
+
+    private static int FirstPageLength(ulong address, int size) => (int)Math.Min((ulong)size, PageSize - (address & PageMask));
+
+    // Zicclsm: a misaligned access to main memory completes even across a page, one to a device register still traps
+    private bool TryReadMisaligned(ulong virtualAddress, ulong physicalAddress, int firstLength, ulong rest, int size, RVMemoryAccess access,
+        out ulong value, out ulong trapCause, out ulong trapValue)
+    {
+        value = 0;
+        if (!IsMainMemory(physicalAddress, firstLength) || (firstLength < size && !IsMainMemory(rest, size - firstLength)))
+        {
+            trapCause = (ulong)RVTrapCause.LoadAddressMisaligned;
+            trapValue = virtualAddress;
+            return false;
+        }
+        if (firstLength == size)
+            return TryReadPhysical(physicalAddress, size, access, out value, out trapCause, out trapValue);
+
+        trapCause = 0;
+        trapValue = 0;
+        for (int i = size - 1; i >= 0; i--)
+        {
+            ulong address = i < firstLength ? physicalAddress + (ulong)i : rest + (ulong)(i - firstLength);
+            if (!TryReadPhysical(address, 1, access, out ulong part, out trapCause, out trapValue))
+                return false;
+            value = (value << 8) | part;
+        }
+        return true;
+    }
+
+    private bool TryWriteMisaligned(ulong virtualAddress, ulong physicalAddress, int firstLength, ulong rest, int size, ulong value,
+        out ulong trapCause, out ulong trapValue)
+    {
+        if (!IsMainMemory(physicalAddress, firstLength) || (firstLength < size && !IsMainMemory(rest, size - firstLength)))
+        {
+            trapCause = (ulong)RVTrapCause.StoreAddressMisaligned;
+            trapValue = virtualAddress;
+            return false;
+        }
+        if (firstLength == size)
+            return TryWritePhysical(physicalAddress, size, value, out trapCause, out trapValue);
+
+        trapCause = 0;
+        trapValue = 0;
+        for (int i = 0; i < size; i++)
+        {
+            ulong address = i < firstLength ? physicalAddress + (ulong)i : rest + (ulong)(i - firstLength);
+            if (!TryWritePhysical(address, 1, value >> (8 * i), out trapCause, out trapValue))
+                return false;
+        }
+        return true;
+    }
+
+    private bool IsMainMemory(ulong physicalAddress, int length)
+        => (physicalAddress >= _ramBase && physicalAddress - _ramBase <= (ulong)(_ram.Length - length))
+            || (_framebufferPixels.Length != 0 && physicalAddress >= _framebufferPixelBase
+                && physicalAddress - _framebufferPixelBase <= (ulong)(_framebufferPixels.Length - length));
 
     private bool TryTranslate(ulong virtualAddress, RVMemoryAccess access, out ulong physicalAddress, out ulong trapCause, out ulong trapValue)
     {
@@ -3575,14 +3637,6 @@ public sealed partial class RiscVEmulator : IDisposable
     private bool TryVectorElementAccess(ulong address, ref byte vectorBytes, int offset, int elementBytes, bool load, int element,
         out ulong trapCause, out ulong trapValue)
     {
-        if ((address & (ulong)(elementBytes - 1)) != 0)
-        {
-            _vstart = (ulong)element;
-            trapCause = load ? (ulong)RVTrapCause.LoadAddressMisaligned : (ulong)RVTrapCause.StoreAddressMisaligned;
-            trapValue = address;
-            return false;
-        }
-
         if (load)
         {
             if (!TryReadMemory(address, elementBytes, RVMemoryAccess.Load, out ulong value, out trapCause, out trapValue))
@@ -3614,13 +3668,9 @@ public sealed partial class RiscVEmulator : IDisposable
             return true;
         }
 
+        // A misaligned element can straddle a page, and the element path stores none of it when the second page faults
         if ((baseAddress & (ulong)(elementBytes - 1)) != 0)
-        {
-            trapped = true;
-            trapCause = load ? (ulong)RVTrapCause.LoadAddressMisaligned : (ulong)RVTrapCause.StoreAddressMisaligned;
-            trapValue = baseAddress;
             return false;
-        }
 
         RVMemoryAccess access = load ? RVMemoryAccess.Load : RVMemoryAccess.Store;
         int firstLength = (int)Math.Min((ulong)byteCount, PageSize - (baseAddress & PageMask));

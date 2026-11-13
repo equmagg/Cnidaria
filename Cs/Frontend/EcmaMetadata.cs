@@ -353,6 +353,7 @@ namespace Cnidaria.Cs
             MetadataTableKind.GenericParam => EcmaTable.GenericParam,
             MetadataTableKind.GenericParamConstraint => EcmaTable.GenericParamConstraint,
             MetadataTableKind.ClassLayout => EcmaTable.ClassLayout,
+            MetadataTableKind.FieldLayout => EcmaTable.FieldLayout,
             MetadataTableKind.FieldRva => EcmaTable.FieldRva,
             MetadataTableKind.StandAloneSig => EcmaTable.StandAloneSig,
             _ => throw new ArgumentOutOfRangeException(nameof(table)),
@@ -477,6 +478,7 @@ namespace Cnidaria.Cs
             (ushort)Read(EcmaTable.ClassLayout, rid, 0),
             (int)Read(EcmaTable.ClassLayout, rid, 1),
             (int)Read(EcmaTable.ClassLayout, rid, 2));
+        public FieldLayoutRow GetFieldLayout(int rid) => new((int)Read(EcmaTable.FieldLayout, rid, 0), (int)Read(EcmaTable.FieldLayout, rid, 1));
         public FieldRvaRow GetFieldRva(int rid) => new((int)Read(EcmaTable.FieldRva, rid, 0), (int)Read(EcmaTable.FieldRva, rid, 1));
         public StandAloneSigRow GetStandAloneSig(int rid) => new((int)Read(EcmaTable.StandAloneSig, rid, 0));
         /// <summary>Finds the entry point method token</summary>

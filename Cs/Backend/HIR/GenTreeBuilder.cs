@@ -11,6 +11,9 @@ namespace Cnidaria.Cs
 {
     public sealed class GenTreeProgram
     {
+        internal RuntimeMethod? ThreadExitMethod { get; }
+        internal RuntimeMethod? ClassConstructorRunnerMethod { get; }
+
         internal ImmutableArray<GenTreeMethod> Methods { get; }
         internal IReadOnlyDictionary<int, GenTreeMethod> MethodsByRuntimeMethodId { get; }
         public RuntimeTypeSystem? TypeSystem { get; }
@@ -25,8 +28,17 @@ namespace Cnidaria.Cs
             TypeSystem = typeSystem;
             Methods = methods.IsDefault ? ImmutableArray<GenTreeMethod>.Empty : methods;
             var map = new Dictionary<int, GenTreeMethod>();
-            foreach (var m in Methods)
-                map[m.RuntimeMethod.MethodId] = m;
+            foreach (GenTreeMethod method in Methods)
+            {
+                RuntimeMethod runtimeMethod = method.RuntimeMethod;
+                map[runtimeMethod.MethodId] = method;
+                if (runtimeMethod.DeclaringType.Namespace == "System.Threading" &&
+                    runtimeMethod.DeclaringType.Name == "Thread" && runtimeMethod.Name == "WaitForForegroundThreads")
+                    ThreadExitMethod = runtimeMethod;
+                if (runtimeMethod.DeclaringType.Namespace == "System.Runtime.CompilerServices" &&
+                    runtimeMethod.DeclaringType.Name == "RuntimeHelpers" && runtimeMethod.Name == "RunClassConstructorCore")
+                    ClassConstructorRunnerMethod = runtimeMethod;
+            }
             MethodsByRuntimeMethodId = map;
         }
 
@@ -186,6 +198,15 @@ namespace Cnidaria.Cs
                     return false;
 
                 queue.Enqueue(buildMethod);
+                if (buildMethod.Name == ".cctor" && !_rts.Target.IsRegisterBytecode)
+                    Enqueue(_rts.GetClassConstructorRunnerMethod());
+                if (buildMethod.DeclaringType.Namespace == "System.Threading" && buildMethod.DeclaringType.Name == "Thread" &&
+                    buildMethod.Name == "ThreadEntryPoint")
+                {
+                    foreach (RuntimeMethod candidate in buildMethod.DeclaringType.Methods)
+                        if (candidate.Name == "WaitForForegroundThreads")
+                            Enqueue(candidate);
+                }
                 return true;
             }
 
@@ -446,6 +467,8 @@ namespace Cnidaria.Cs
         private int _inlineBudgetRemaining = InlineTotalBudget;
         private int _nextSyntheticPc;
         private int _nextDynamicBlockId;
+        private readonly List<int> _layoutPrefix = new();
+        private readonly List<int> _layoutSuffix = new();
 
         private RuntimeType[] _argTypes = Array.Empty<RuntimeType>();
         private RuntimeType[] _localTypes = Array.Empty<RuntimeType>();
@@ -498,7 +521,6 @@ namespace Cnidaria.Cs
             _rootFrame = new ImportFrame(_module, _method, _body, inlineDepth: 0, callPc: -1, _localTypes, null, null, null,
                 DefaultValueLocalsOf(_body), pc => _pcToBlockId.ContainsKey(pc), pc => noReturnRegion[pc], pc => _pcToBlockId.ContainsKey(pc + 1) ? pc + 1 : -1);
             var blocks = LinkFinallyReturns(SeparateFinallyEntries(BuildBlocks(leaders)));
-            ImmutableArray<GenTreeBlock> layout = LayOutSyntheticBlocks(blocks, leaders.Count);
 
             var handlers = ImmutableArray.CreateBuilder<ExceptionHandler>(_body.ExceptionClauses.Length);
             foreach (var clause in _body.ExceptionClauses)
@@ -511,11 +533,14 @@ namespace Cnidaria.Cs
                 }, clause.Kind == CilExceptionClauseKind.Filter ? clause.HandlerStartPc : -1));
             }
 
+            blocks = EnsureEntryHasNoPredecessors(TransformAsync(blocks, handlers));
+            ImmutableArray<GenTreeBlock> layout = LayOutSyntheticBlocks(blocks, leaders.Count);
+
             var imported = new GenTreeMethod(
                 _module,
                 _method,
                 _rts.Target,
-                handlers.MoveToImmutable(),
+                handlers.ToImmutable(),
                 _staticData.ToImmutableArray(),
                 _argTypes.ToImmutableArray(),
                 _localTypes.ToImmutableArray(),
@@ -528,6 +553,33 @@ namespace Cnidaria.Cs
             return layout.IsDefault ? imported : GenTreeCriticalEdgeSplitter.RenumberBlocks(imported, layout);
         }
 
+        // SSA and the prolog need an entry block that no branch returns to, so a loop at IL offset 0 gets an empty one in front
+        private ImmutableArray<GenTreeBlock> EnsureEntryHasNoPredecessors(ImmutableArray<GenTreeBlock> blocks)
+        {
+            if (_layoutPrefix.Count != 0)
+                return blocks;
+            bool reentered = false;
+            foreach (GenTreeBlock block in blocks)
+                reentered |= block.SuccessorBlockIds.Contains(0);
+            if (!reentered)
+                return blocks;
+
+            GenTreeBlock first = blocks[0];
+            int pc = _nextSyntheticPc++;
+            int id = _nextDynamicBlockId++;
+            if (id != blocks.Length)
+                throw new GenTreeBuildException($"Block ids of {_method.Name} are not dense at the entry block split.");
+            _pcToBlockId.Add(pc, id);
+            _layoutPrefix.Add(id);
+
+            ImmutableArray<GenTreeBlock>.Builder result = blocks.ToBuilder();
+            result[0] = new GenTreeBlock(first.Id, first.StartPc, first.EndPcExclusive, first.EntryStackDepth, first.ExitStackDepth, first.JumpKind,
+                first.Flags & ~GenTreeBlockFlags.Entry, first.Statements, first.SuccessorBlockIds, first.SuccessorPcs, first.Region);
+            result.Add(new GenTreeBlock(id, pc, pc + 1, 0, 0, GenTreeBlockJumpKind.FallThrough, GenTreeBlockFlags.Entry, ImmutableArray<GenTree>.Empty,
+                ImmutableArray.Create(first.Id), ImmutableArray.Create(first.StartPc), GenTreeEhRegion.None));
+            return result.ToImmutable();
+        }
+
         // Inlinee blocks follow their caller and leave steps the try they exit, so every EH region stays contiguous
         private ImmutableArray<GenTreeBlock> LayOutSyntheticBlocks(ImmutableArray<GenTreeBlock> blocks, int rootBlockCount)
         {
@@ -536,13 +588,19 @@ namespace Cnidaria.Cs
 
             var inlinedByHost = new List<GenTreeBlock>?[rootBlockCount];
             var stepsByHost = new List<GenTreeBlock>?[rootBlockCount];
+            var placedApart = new HashSet<int>(_layoutPrefix);
+            placedApart.UnionWith(_layoutSuffix);
             for (int i = rootBlockCount; i < blocks.Length; i++)
             {
+                if (placedApart.Contains(blocks[i].Id))
+                    continue;
                 (int host, bool step) = _syntheticBlockHosts[blocks[i].Id];
                 ((step ? stepsByHost : inlinedByHost)[host] ??= new List<GenTreeBlock>()).Add(blocks[i]);
             }
 
             var layout = ImmutableArray.CreateBuilder<GenTreeBlock>(blocks.Length);
+            foreach (int id in _layoutPrefix)
+                layout.Add(blocks[id]);
             for (int i = 0; i < rootBlockCount; i++)
             {
                 layout.Add(blocks[i]);
@@ -551,6 +609,8 @@ namespace Cnidaria.Cs
                 if (stepsByHost[i] is List<GenTreeBlock> steps)
                     layout.AddRange(steps);
             }
+            foreach (int id in _layoutSuffix)
+                layout.Add(blocks[id]);
             return layout.MoveToImmutable();
         }
 
@@ -852,6 +912,11 @@ namespace Cnidaria.Cs
                     case ILOpCode.Ret:
                         if (RegionForPc(pc) != GenTreeEhRegion.None)
                             throw new GenTreeBuildException($"ret inside a protected region or handler at pc {pc}.");
+                        if (_method.IsAsyncVersion)
+                        {
+                            EmitAsyncVersionReturn(stack, statements, pc, ins.Op);
+                            return CreateBlock(blockId, startPc, pc + 1, statements, successorPcs, stack.Count);
+                        }
                         if (IsVoid(_method.ReturnType))
                         {
                             statements.Add(Node(GenTreeKind.Return, pc, ins.Op));
@@ -1334,7 +1399,7 @@ namespace Cnidaria.Cs
                IsNoReturnCallee(_rts.ResolveMethodInMethodContext(module, ins.Token, context), ins.Op);
 
         private static bool IsNoReturnCallee(RuntimeMethod method, ILOpCode op)
-            => method.DoesNotReturn && (op == ILOpCode.Call || !method.IsVirtual || method.IsFinal);
+            => (method.DoesNotReturn && (op == ILOpCode.Call || !method.IsVirtual || method.IsFinal)) || IsAsyncSuspend(method);
 
         private static bool IsBlockTerminator(ILOpCode op)
             => op is ILOpCode.Br or ILOpCode.Leave or ILOpCode.Brtrue or ILOpCode.Brfalse or ILOpCode.Switch or
@@ -1346,12 +1411,15 @@ namespace Cnidaria.Cs
                 ? ImmutableArray<RuntimeType>.Empty
                 : _instantiatedTypes.Values.ToImmutableArray();
 
+        // The async calling convention passes the continuation to resume after the signature's arguments
         private RuntimeType[] BuildArgTypes(RuntimeMethod method)
         {
             int count = method.HasThis ? method.ParameterTypes.Length + 1 : method.ParameterTypes.Length;
-            var result = new RuntimeType[count];
+            var result = new RuntimeType[method.IsAsyncCall ? count + 1 : count];
             for (int i = 0; i < count; i++)
                 result[i] = GetArgType(method, i);
+            if (method.IsAsyncCall)
+                result[count] = _rts.ContinuationType;
             return result;
         }
 
@@ -2924,6 +2992,8 @@ namespace Cnidaria.Cs
             var method = ResolveMethodIn(frame, ins.Token);
             if (_rts.GetRuntimeExport(method) is RuntimeMethod export)
                 method = export;
+            if (TryImportAsyncHelper(stack, statements, method, npc, op, out terminatedBlock))
+                return 1;
             int total = method.ParameterTypes.Length + (method.HasThis ? 1 : 0);
             bool doesNotReturn = IsNoReturnCallee(method, op);
             bool coldCallSite = frame.IsColdCallSite(pc);
@@ -3200,6 +3270,24 @@ namespace Cnidaria.Cs
 
             if (requiresCallvirtNullCheck)
                 args = MaterializeCallVirtOperandsAndAppendNullCheck(statements, npc, op, args);
+
+            if (frame.InlineDepth == 0)
+            {
+                int consumed = 1;
+                var awaitHandling = ContinuationContextHandling.None;
+                if (_method.IsAsyncCall && !isVirtual && RuntimeTypeSystem.HasCallableAsyncVariant(method) &&
+                    TryMatchTaskAwaitPattern(frame, pc, out int matched, out awaitHandling))
+                {
+                    method = _rts.GetAsyncVariant(method);
+                    consumed += matched;
+                }
+
+                if (method.IsAsyncCall)
+                {
+                    EmitAsyncCall(stack, statements, npc, op, method, args, awaitHandling);
+                    return consumed;
+                }
+            }
 
             RuntimeIntrinsicInfo runtimeIntrinsic = default;
             bool hasRuntimeIntrinsic = !isVirtual && RuntimeIntrinsics.TryResolve(method, _rts.Target, out runtimeIntrinsic);
@@ -3571,6 +3659,9 @@ namespace Cnidaria.Cs
         {
             terminatedBlock = false;
             result = null;
+
+            if (callee.IsAsyncCall || callee.IsRuntimeAsync || callee.AsyncResumptionTarget is not null)
+                return false;
 
             var body = callee.CilBody;
             var bodyModule = callee.BodyModule;
@@ -4444,6 +4535,10 @@ namespace Cnidaria.Cs
             if (mergedKind == GenStackKind.Ref && IsObjectReferenceStackKind(leftKind) && IsObjectReferenceStackKind(rightKind))
                 return null;
 
+            // Each load through the merged byref names its own type
+            if (mergedKind == GenStackKind.ByRef && leftKind == GenStackKind.ByRef && rightKind == GenStackKind.ByRef)
+                return leftType;
+
             return null;
         }
 
@@ -4468,7 +4563,8 @@ namespace Cnidaria.Cs
             }
 
             if (leftType is not null && rightType is not null && !ReferenceEquals(leftType, rightType))
-                return !(mergedKind == GenStackKind.Ref && IsObjectReferenceStackKind(leftKind) && IsObjectReferenceStackKind(rightKind));
+                return !(mergedKind == GenStackKind.Ref && IsObjectReferenceStackKind(leftKind) && IsObjectReferenceStackKind(rightKind)) &&
+                    !(mergedKind == GenStackKind.ByRef && leftKind == GenStackKind.ByRef && rightKind == GenStackKind.ByRef);
 
             return false;
         }

@@ -141,6 +141,33 @@ static void* __heap_system_map(size_t size)
 
 #endif
 
+#if defined(__linux__)
+
+void __libc_lock(volatile int* word);
+void __libc_unlock(volatile int* word);
+
+static volatile int __stdlib_lock_word;
+
+void __stdlib_lock(void)
+{
+    __libc_lock(&__stdlib_lock_word);
+}
+
+void __stdlib_unlock(void)
+{
+    __libc_unlock(&__stdlib_lock_word);
+}
+
+#define __STDLIB_LOCK() __stdlib_lock()
+#define __STDLIB_UNLOCK() __stdlib_unlock()
+
+#else
+
+#define __STDLIB_LOCK() ((void)0)
+#define __STDLIB_UNLOCK() ((void)0)
+
+#endif
+
 #define __HEAP_IN_USE ((size_t)1)
 #define __HEAP_PREVIOUS_IN_USE ((size_t)2)
 #define __HEAP_FLAGS ((size_t)3)
@@ -348,7 +375,7 @@ static size_t __heap_request(size_t size)
     return needed;
 }
 
-void* malloc(size_t size)
+static void* __heap_allocate(size_t size)
 {
     size_t needed;
     __heap_chunk* chunk;
@@ -373,7 +400,7 @@ void* malloc(size_t size)
     return __heap_payload(chunk);
 }
 
-void free(void* pointer)
+static void __heap_free(void* pointer)
 {
     __heap_chunk* chunk;
     __heap_chunk* neighbour;
@@ -403,6 +430,24 @@ void free(void* pointer)
     __heap_release(chunk, size);
 }
 
+void* malloc(size_t size)
+{
+    void* pointer;
+    __STDLIB_LOCK();
+    pointer = __heap_allocate(size);
+    __STDLIB_UNLOCK();
+    return pointer;
+}
+
+void free(void* pointer)
+{
+    if (pointer == (void*)0)
+        return;
+    __STDLIB_LOCK();
+    __heap_free(pointer);
+    __STDLIB_UNLOCK();
+}
+
 size_t malloc_usable_size(void* pointer)
 {
     if (pointer == (void*)0)
@@ -410,7 +455,7 @@ size_t malloc_usable_size(void* pointer)
     return __heap_size(__heap_chunk_of(pointer)) - sizeof(size_t) * 2;
 }
 
-void* realloc(void* pointer, size_t size)
+static void* __heap_reallocate(void* pointer, size_t size)
 {
     __heap_chunk* chunk;
     __heap_chunk* next;
@@ -420,10 +465,10 @@ void* realloc(void* pointer, size_t size)
     void* replacement;
 
     if (pointer == (void*)0)
-        return malloc(size);
+        return __heap_allocate(size);
     if (size == 0)
     {
-        free(pointer);
+        __heap_free(pointer);
         return (void*)0;
     }
 
@@ -450,7 +495,7 @@ void* realloc(void* pointer, size_t size)
         return pointer;
     }
 
-    replacement = malloc(size);
+    replacement = __heap_allocate(size);
     if (replacement == (void*)0)
         return (void*)0;
 
@@ -459,8 +504,17 @@ void* realloc(void* pointer, size_t size)
         capacity = size;
 
     memcpy(replacement, pointer, capacity);
-    free(pointer);
+    __heap_free(pointer);
     return replacement;
+}
+
+void* realloc(void* pointer, size_t size)
+{
+    void* result;
+    __STDLIB_LOCK();
+    result = __heap_reallocate(pointer, size);
+    __STDLIB_UNLOCK();
+    return result;
 }
 
 void* calloc(size_t count, size_t size)
@@ -480,7 +534,7 @@ void* calloc(size_t count, size_t size)
     return pointer;
 }
 
-void* aligned_alloc(size_t alignment, size_t size)
+static void* __heap_aligned(size_t alignment, size_t size)
 {
     unsigned char* raw;
     unsigned char* aligned;
@@ -492,12 +546,12 @@ void* aligned_alloc(size_t alignment, size_t size)
     if (alignment == 0 || (alignment & (alignment - 1)) != 0)
         return (void*)0;
     if (alignment <= __HEAP_ALIGNMENT)
-        return malloc(size);
+        return __heap_allocate(size);
     if (size > (size_t)-1 - alignment - sizeof(__heap_chunk))
         return (void*)0;
 
     total = size + alignment + sizeof(__heap_chunk);
-    raw = (unsigned char*)malloc(total);
+    raw = (unsigned char*)__heap_allocate(total);
     if (raw == (unsigned char*)0)
         return (void*)0;
 
@@ -515,8 +569,17 @@ void* aligned_alloc(size_t alignment, size_t size)
     offset = (size_t)((unsigned char*)head - (unsigned char*)chunk);
     head->size = (__heap_size(chunk) - offset) | __HEAP_IN_USE;
     chunk->size = offset | (chunk->size & __HEAP_PREVIOUS_IN_USE) | __HEAP_IN_USE;
-    free(__heap_payload(chunk));
+    __heap_free(__heap_payload(chunk));
     return (void*)aligned;
+}
+
+void* aligned_alloc(size_t alignment, size_t size)
+{
+    void* result;
+    __STDLIB_LOCK();
+    result = __heap_aligned(alignment, size);
+    __STDLIB_UNLOCK();
+    return result;
 }
 
 
@@ -979,12 +1042,19 @@ static int __atexit_count;
 
 int atexit(void (*handler)(void))
 {
-    if (handler == (void (*)(void))0 || __atexit_count >= __ATEXIT_SLOTS)
+    int result = -1;
+    if (handler == (void (*)(void))0)
         return -1;
 
-    __atexit_handlers[__atexit_count] = handler;
-    __atexit_count = __atexit_count + 1;
-    return 0;
+    __STDLIB_LOCK();
+    if (__atexit_count < __ATEXIT_SLOTS)
+    {
+        __atexit_handlers[__atexit_count] = handler;
+        __atexit_count = __atexit_count + 1;
+        result = 0;
+    }
+    __STDLIB_UNLOCK();
+    return result;
 }
 
 #if defined(_WIN32) && defined(__x86_64__)
@@ -1085,12 +1155,22 @@ void _Exit(int status)
 
 #endif
 
+// Handlers run unlocked, as they may allocate or register more
 void exit(int status)
 {
-    while (__atexit_count > 0)
+    for (;;)
     {
-        __atexit_count = __atexit_count - 1;
-        __atexit_handlers[__atexit_count]();
+        void (*handler)(void) = (void (*)(void))0;
+        __STDLIB_LOCK();
+        if (__atexit_count > 0)
+        {
+            __atexit_count = __atexit_count - 1;
+            handler = __atexit_handlers[__atexit_count];
+        }
+        __STDLIB_UNLOCK();
+        if (handler == (void (*)(void))0)
+            break;
+        handler();
     }
 
 #if defined(__CNIDARIA_FILES)

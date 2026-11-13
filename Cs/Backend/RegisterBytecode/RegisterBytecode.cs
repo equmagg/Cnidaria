@@ -76,6 +76,7 @@ namespace Cnidaria.Cs
         PreserveException = 1 << 8,
         DivModNoByZero = 1 << 9,
         DivModNoOverflow = 1 << 10,
+        ThreadStatic = 1 << 11,
     }
 
     [Flags]
@@ -3673,7 +3674,7 @@ namespace Cnidaria.Cs
             if (inst.Op == Op.LiFieldHandle)
                 return $"fieldHandle F{inst.Imm}";
             if (inst.Op == Op.LiStaticBase)
-                return $"staticBase T{inst.Imm}";
+                return $"{(((InstructionFlags)inst.Aux & InstructionFlags.ThreadStatic) != 0 ? "threadStaticBase" : "staticBase")} T{inst.Imm}";
             if (inst.Op == Op.LiF32Bits)
                 return $"bits=0x{unchecked((uint)inst.Imm):X8}";
             if (inst.Op == Op.LiF64Bits)

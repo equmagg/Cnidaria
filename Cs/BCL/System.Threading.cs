@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Diagnostics.Tracing;
+using System.IO;
 using System.Runtime;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
@@ -28,6 +29,139 @@ namespace System.Threading
             : base(message ?? string.Empty, innerException)
         { }
     }
+    public class AbandonedMutexException : SystemException
+    {
+        private int _mutexIndex = -1;
+        private Mutex? _mutex;
+
+        public AbandonedMutexException()
+            : base(SR.Threading_AbandonedMutexException)
+        {
+            HResult = HResults.COR_E_ABANDONEDMUTEX;
+        }
+
+        public AbandonedMutexException(string? message)
+            : base(message ?? SR.Threading_AbandonedMutexException)
+        {
+            HResult = HResults.COR_E_ABANDONEDMUTEX;
+        }
+
+        public AbandonedMutexException(string? message, Exception? inner)
+            : base(message ?? SR.Threading_AbandonedMutexException, inner)
+        {
+            HResult = HResults.COR_E_ABANDONEDMUTEX;
+        }
+
+        public AbandonedMutexException(int location, WaitHandle? handle)
+            : base(SR.Threading_AbandonedMutexException)
+        {
+            HResult = HResults.COR_E_ABANDONEDMUTEX;
+            SetupException(location, handle);
+        }
+
+        public AbandonedMutexException(string? message, int location, WaitHandle? handle)
+            : base(message ?? SR.Threading_AbandonedMutexException)
+        {
+            HResult = HResults.COR_E_ABANDONEDMUTEX;
+            SetupException(location, handle);
+        }
+
+        public AbandonedMutexException(string? message, Exception? inner, int location, WaitHandle? handle)
+            : base(message ?? SR.Threading_AbandonedMutexException, inner)
+        {
+            HResult = HResults.COR_E_ABANDONEDMUTEX;
+            SetupException(location, handle);
+        }
+
+        private void SetupException(int location, WaitHandle? handle)
+        {
+            _mutexIndex = location;
+            _mutex = handle as Mutex;
+        }
+
+        public Mutex? Mutex => _mutex;
+        public int MutexIndex => _mutexIndex;
+    }
+    public class ThreadInterruptedException : SystemException
+    {
+        public ThreadInterruptedException()
+            : base(SR.Threading_ThreadInterrupted)
+        {
+            HResult = HResults.COR_E_THREADINTERRUPTED;
+        }
+
+        public ThreadInterruptedException(string? message)
+            : base(message ?? SR.Threading_ThreadInterrupted)
+        {
+            HResult = HResults.COR_E_THREADINTERRUPTED;
+        }
+
+        public ThreadInterruptedException(string? message, Exception? innerException)
+            : base(message ?? SR.Threading_ThreadInterrupted, innerException)
+        {
+            HResult = HResults.COR_E_THREADINTERRUPTED;
+        }
+    }
+    public class ThreadStateException : SystemException
+    {
+        public ThreadStateException()
+            : base(SR.Arg_ThreadStateException)
+        {
+            HResult = HResults.COR_E_THREADSTATE;
+        }
+
+        public ThreadStateException(string? message)
+            : base(message ?? SR.Arg_ThreadStateException)
+        {
+            HResult = HResults.COR_E_THREADSTATE;
+        }
+
+        public ThreadStateException(string? message, Exception? innerException)
+            : base(message ?? SR.Arg_ThreadStateException, innerException)
+        {
+            HResult = HResults.COR_E_THREADSTATE;
+        }
+    }
+    public sealed class ThreadStartException : SystemException
+    {
+        internal ThreadStartException()
+            : base(SR.Arg_ThreadStartException)
+        {
+            HResult = HResults.COR_E_THREADSTART;
+        }
+
+        internal ThreadStartException(Exception reason)
+            : base(SR.Arg_ThreadStartException, reason)
+        {
+            HResult = HResults.COR_E_THREADSTART;
+        }
+    }
+    internal enum OpenExistingResult
+    {
+        Success,
+        NameNotFound,
+        PathNotFound,
+        NameInvalid,
+        ObjectIncompatibleWithCurrentUserOnly
+    }
+
+    public class WaitHandleCannotBeOpenedException : ApplicationException
+    {
+        public WaitHandleCannotBeOpenedException() : base(SR.Threading_WaitHandleCannotBeOpenedException)
+        {
+            HResult = HResults.COR_E_WAITHANDLECANNOTBEOPENED;
+        }
+
+        public WaitHandleCannotBeOpenedException(string? message) : base(message ?? SR.Threading_WaitHandleCannotBeOpenedException)
+        {
+            HResult = HResults.COR_E_WAITHANDLECANNOTBEOPENED;
+        }
+
+        public WaitHandleCannotBeOpenedException(string? message, Exception? innerException) : base(message ?? SR.Threading_WaitHandleCannotBeOpenedException, innerException)
+        {
+            HResult = HResults.COR_E_WAITHANDLECANNOTBEOPENED;
+        }
+    }
     public sealed class Thread
     {
         /// <summary>Returns the operating system identifier for the current thread.</summary>
@@ -35,9 +169,6 @@ namespace System.Threading
 
         // Extra bits used in _threadState
         private const ThreadState ThreadPoolThread = (ThreadState)0x1000;
-#if TARGET_WINDOWS
-        private const ThreadState Interrupted = (ThreadState)0x2000;
-#endif
 
         // Bits of _threadState that are returned by the ThreadState property
         private const ThreadState PublicThreadStateMask = (ThreadState)0x1FF;
@@ -72,39 +203,70 @@ namespace System.Threading
         // Event signaling that the thread has stopped
         private ManualResetEvent _stopped;
 
-        private bool _isBackground;
-        private bool _isThreadPoolThread;
+        private WaitSubsystem.ThreadWaitInfo _waitInfo;
 
-        private readonly Delegate? _start;
+        internal WaitSubsystem.ThreadWaitInfo WaitInfo => _waitInfo;
+
+        private StartHelper? _startHelper;
+        private Exception? _startException;
 
         private Thread()
         {
             _managedThreadId = System.Threading.ManagedThreadId.GetCurrentThreadId();
+            PlatformSpecificInitialize();
         }
 
-        private Thread(Delegate start)
+        public Thread(ThreadStart start)
         {
             ArgumentNullException.ThrowIfNull(start);
-            _start = start;
+
+            InitializeStartHelper(start, maxStackSize: 0);
+
+            Initialize();
+        }
+
+        public Thread(ThreadStart start, int maxStackSize)
+        {
+            ArgumentNullException.ThrowIfNull(start);
+
+            ArgumentOutOfRangeException.ThrowIfNegative(maxStackSize);
+
+            InitializeStartHelper(start, maxStackSize);
+
+            Initialize();
+        }
+
+        public Thread(ParameterizedThreadStart start)
+        {
+            ArgumentNullException.ThrowIfNull(start);
+
+            InitializeStartHelper(start, maxStackSize: 0);
+
+            Initialize();
+        }
+
+        public Thread(ParameterizedThreadStart start, int maxStackSize)
+        {
+            ArgumentNullException.ThrowIfNull(start);
+
+            ArgumentOutOfRangeException.ThrowIfNegative(maxStackSize);
+
+            InitializeStartHelper(start, maxStackSize);
+
+            Initialize();
+        }
+
+        private void Initialize()
+        {
+            _priority = ThreadPriority.Normal;
             _managedThreadId = new ManagedThreadId();
+
+            PlatformSpecificInitialize();
         }
 
-        public Thread(ThreadStart start) : this((Delegate)start)
+        private void PlatformSpecificInitialize()
         {
-        }
-
-        public Thread(ThreadStart start, int maxStackSize) : this((Delegate)start)
-        {
-            ArgumentOutOfRangeException.ThrowIfNegative(maxStackSize);
-        }
-
-        public Thread(ParameterizedThreadStart start) : this((Delegate)start)
-        {
-        }
-
-        public Thread(ParameterizedThreadStart start, int maxStackSize) : this((Delegate)start)
-        {
-            ArgumentOutOfRangeException.ThrowIfNegative(maxStackSize);
+            _waitInfo = new WaitSubsystem.ThreadWaitInfo(this);
         }
 
         // Platform-specific initialization of foreign threads, i.e. threads not created by Thread.Start
@@ -134,11 +296,24 @@ namespace System.Threading
             }
         }
 
+        internal static Thread CurrentThreadAssumedInitialized
+        {
+            get
+            {
+                Thread? thread = t_currentThread;
+                Debug.Assert(thread != null);
+                return thread;
+            }
+        }
+
         // Slow path executed once per thread
         [MethodImpl(MethodImplOptions.NoInlining)]
         private static Thread InitializeCurrentThread()
         {
+            Debug.Assert(t_currentThread == null);
+
             var currentThread = new Thread();
+            Debug.Assert(currentThread._threadState == (int)ThreadState.Unstarted);
 
             ThreadState state = 0;
 
@@ -160,38 +335,600 @@ namespace System.Threading
             return currentThread;
         }
 
-        public int ManagedThreadId => _managedThreadId.Id;
-
-        public string? Name
+        /// <summary>
+        /// Returns true if the underlying OS thread has been created and started execution of managed code.
+        /// </summary>
+        private bool HasStarted()
         {
-            get => _name;
-            set => _name = value;
+            return !GetThreadStateBit(ThreadState.Unstarted);
+        }
+
+        public bool IsAlive
+        {
+            get
+            {
+                return ((ThreadState)_threadState & (ThreadState.Unstarted | ThreadState.Stopped | ThreadState.Aborted)) == 0;
+            }
+        }
+
+        private bool IsDead()
+        {
+            return ((ThreadState)_threadState & (ThreadState.Stopped | ThreadState.Aborted)) != 0;
         }
 
         public bool IsBackground
         {
-            get => _isBackground;
-            set => _isBackground = value;
+            get
+            {
+                if (IsDead())
+                {
+                    throw new ThreadStateException(SR.ThreadState_Dead_State);
+                }
+                return GetThreadStateBit(ThreadState.Background);
+            }
+            set
+            {
+                if (IsDead())
+                {
+                    throw new ThreadStateException(SR.ThreadState_Dead_State);
+                }
+                // we changing foreground count only for started threads
+                // on thread start we count its state in `StartThread`
+                if (value)
+                {
+                    int threadState = SetThreadStateBit(ThreadState.Background);
+                    // was foreground and has started
+                    if ((threadState & ((int)ThreadState.Background | (int)ThreadState.Unstarted | (int)ThreadState.Stopped)) == 0)
+                    {
+                        DecrementRunningForeground();
+                    }
+                }
+                else
+                {
+                    int threadState = ClearThreadStateBit(ThreadState.Background);
+                    // was background and has started
+                    if ((threadState & ((int)ThreadState.Background | (int)ThreadState.Unstarted | (int)ThreadState.Stopped)) == (int)ThreadState.Background)
+                    {
+                        IncrementRunningForeground();
+                        _mayNeedResetForThreadPool = true;
+                    }
+                }
+            }
         }
 
         public bool IsThreadPoolThread
         {
-            get => _isThreadPoolThread;
-            internal set => _isThreadPoolThread = value;
+            get
+            {
+                if (IsDead())
+                {
+                    throw new ThreadStateException(SR.ThreadState_Dead_State);
+                }
+                return GetThreadStateBit(ThreadPoolThread);
+            }
+            internal set
+            {
+                if (IsDead())
+                {
+                    throw new ThreadStateException(SR.ThreadState_Dead_State);
+                }
+                if (value)
+                {
+                    SetThreadStateBit(ThreadPoolThread);
+                }
+                else
+                {
+                    ClearThreadStateBit(ThreadPoolThread);
+                }
+            }
         }
 
-        public void Start() => StartCore();
-
-        public void Start(object? parameter) => StartCore();
-
-        public void UnsafeStart() => StartCore();
-
-        public void UnsafeStart(object? parameter) => StartCore();
-
-        private static void StartCore()
+        public int ManagedThreadId
         {
-            RuntimeFeature.ThrowIfMultithreadingIsNotSupported();
-            throw new PlatformNotSupportedException();
+            [Intrinsic]
+            get => _managedThreadId.Id;
+        }
+
+        public ExecutionContext? ExecutionContext => ExecutionContext.Capture();
+
+        public string? Name
+        {
+            get => _name;
+            set
+            {
+                lock (this)
+                {
+                    if (_name != value)
+                    {
+                        _name = value;
+                        _mayNeedResetForThreadPool = true;
+                    }
+                }
+            }
+        }
+
+        internal void SetThreadPoolWorkerThreadName()
+        {
+            Debug.Assert(ThreadState.HasFlag(ThreadState.Unstarted) || this == CurrentThread);
+            Debug.Assert(IsThreadPoolThread);
+
+            lock (this)
+            {
+                _name = ThreadPool.WorkerThreadName;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal void ResetThreadPoolThread()
+        {
+            Debug.Assert(this == CurrentThread);
+            Debug.Assert(IsThreadPoolThread);
+
+            if (_mayNeedResetForThreadPool)
+            {
+                ResetThreadPoolThreadSlow();
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void ResetThreadPoolThreadSlow()
+        {
+            Debug.Assert(this == CurrentThread);
+            Debug.Assert(IsThreadPoolThread);
+            Debug.Assert(_mayNeedResetForThreadPool);
+
+            _mayNeedResetForThreadPool = false;
+
+            if (_name != ThreadPool.WorkerThreadName)
+            {
+                SetThreadPoolWorkerThreadName();
+            }
+
+            if (!IsBackground)
+            {
+                IsBackground = true;
+            }
+
+            if (Priority != ThreadPriority.Normal)
+            {
+                Priority = ThreadPriority.Normal;
+            }
+        }
+
+        public ThreadPriority Priority
+        {
+            get
+            {
+                if (IsDead())
+                {
+                    throw new ThreadStateException(SR.ThreadState_Dead_Priority);
+                }
+                if (!HasStarted())
+                {
+                    // The thread has not been started yet; return the value assigned to the Priority property.
+                    // Race condition with setting the priority or starting the thread is OK, we may return an old value.
+                    return _priority;
+                }
+                // The priority might have been changed by external means. Obtain the actual value from the OS
+                // rather than using the value saved in _priority.
+                return GetPriorityLive();
+            }
+            set
+            {
+                if ((value < ThreadPriority.Lowest) || (ThreadPriority.Highest < value))
+                {
+                    throw new ArgumentOutOfRangeException(SR.Argument_InvalidFlag);
+                }
+                if (IsDead())
+                {
+                    throw new ThreadStateException(SR.ThreadState_Dead_Priority);
+                }
+
+                // Prevent race condition with starting this thread
+                using (_lock.EnterScope())
+                {
+                    if (HasStarted() && !SetPriorityLive(value))
+                    {
+                        throw new ThreadStateException(SR.ThreadState_SetPriorityFailed);
+                    }
+                    _priority = value;
+                }
+
+                if (value != ThreadPriority.Normal)
+                {
+                    _mayNeedResetForThreadPool = true;
+                }
+            }
+        }
+
+        public ThreadState ThreadState => ((ThreadState)_threadState & PublicThreadStateMask);
+
+        private bool GetThreadStateBit(ThreadState bit)
+        {
+            Debug.Assert((bit & ThreadState.Stopped) == 0, "ThreadState.Stopped bit may be stale; use GetThreadState instead.");
+            return (_threadState & (int)bit) != 0;
+        }
+
+        private int SetThreadStateBit(ThreadState bit)
+        {
+            return Interlocked.Or(ref _threadState, (int)bit);
+        }
+
+        private int ClearThreadStateBit(ThreadState bit)
+        {
+            return Interlocked.And(ref _threadState, ~(int)bit);
+        }
+
+        internal void SetWaitSleepJoinState()
+        {
+            Debug.Assert(this == CurrentThread);
+            Debug.Assert(!GetThreadStateBit(ThreadState.WaitSleepJoin));
+
+            SetThreadStateBit(ThreadState.WaitSleepJoin);
+        }
+
+        internal void ClearWaitSleepJoinState()
+        {
+            Debug.Assert(this == CurrentThread);
+            Debug.Assert(GetThreadStateBit(ThreadState.WaitSleepJoin));
+
+            ClearThreadStateBit(ThreadState.WaitSleepJoin);
+        }
+
+        // State associated with starting new thread
+        private sealed class StartHelper
+        {
+            internal int _maxStackSize;
+            internal Delegate _start;
+            internal object? _startArg;
+            internal ExecutionContext? _executionContext;
+
+            internal StartHelper(Delegate start)
+            {
+                _start = start;
+            }
+
+            internal static readonly ContextCallback s_threadStartContextCallback = new ContextCallback(Callback);
+
+            private static void Callback(object? state)
+            {
+                Debug.Assert(state is not null);
+                ((StartHelper)state).RunWorker();
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)] // avoid long-lived stack frame in many threads
+            internal void Run()
+            {
+                if (_executionContext is not null && !_executionContext.IsDefault)
+                {
+                    ExecutionContext.RunInternal(_executionContext, s_threadStartContextCallback, this);
+                }
+                else
+                {
+                    RunWorker();
+                }
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)] // avoid long-lived stack frame in many threads
+            private void RunWorker()
+            {
+                Delegate start = _start;
+                _start = null!;
+
+                if (start is ThreadStart threadStart)
+                {
+                    threadStart();
+                }
+                else
+                {
+                    ParameterizedThreadStart parameterizedThreadStart = (ParameterizedThreadStart)start;
+
+                    object? startArg = _startArg;
+                    _startArg = null;
+
+                    parameterizedThreadStart(startArg);
+                }
+            }
+        }
+
+        private void InitializeStartHelper(Delegate start, int maxStackSize)
+        {
+            _startHelper = new StartHelper(start) { _maxStackSize = maxStackSize };
+        }
+
+        public void Start(object? parameter) => Start(parameter, captureContext: true);
+
+        public void UnsafeStart(object? parameter) => Start(parameter, captureContext: false);
+
+        public void Start() => Start(captureContext: true);
+
+        public void UnsafeStart() => Start(captureContext: false);
+
+        private void Start(object? parameter, bool captureContext)
+        {
+            StartHelper? startHelper = _startHelper;
+
+            // In the case of a null startHelper (second call to start on same thread)
+            // StartCore method will take care of the error reporting.
+            if (startHelper is not null)
+            {
+                if (startHelper._start is ThreadStart)
+                {
+                    // We expect the thread to be setup with a ParameterizedThreadStart if this Start is called.
+                    throw new InvalidOperationException(SR.InvalidOperation_ThreadWrongThreadStart);
+                }
+
+                startHelper._startArg = parameter;
+                startHelper._executionContext = captureContext ? ExecutionContext.Capture() : null;
+            }
+
+            StartCore();
+        }
+
+        private void Start(bool captureContext)
+        {
+            StartHelper? startHelper = _startHelper;
+
+            // In the case of a null startHelper (second call to start on same thread)
+            // StartCore method will take care of the error reporting.
+            if (startHelper is not null)
+            {
+                startHelper._startArg = null;
+                startHelper._executionContext = captureContext ? ExecutionContext.Capture() : null;
+            }
+
+            StartCore();
+        }
+
+        private void StartCore()
+        {
+            using (_lock.EnterScope())
+            {
+                if (!GetThreadStateBit(ThreadState.Unstarted))
+                {
+                    throw new ThreadStateException(SR.ThreadState_AlreadyStarted);
+                }
+
+                bool waitingForThreadStart = false;
+                GCHandle threadHandle = GCHandle.Alloc(this);
+
+                try
+                {
+                    if (!CreateThread(threadHandle))
+                    {
+                        throw new OutOfMemoryException();
+                    }
+
+                    // Skip cleanup if any asynchronous exception happens while waiting for the thread start
+                    waitingForThreadStart = true;
+
+                    // Wait until the new thread either dies or reports itself as started
+                    while (GetThreadStateBit(ThreadState.Unstarted) && !JoinInternal(0))
+                    {
+                        Yield();
+                    }
+
+                    waitingForThreadStart = false;
+                }
+                finally
+                {
+                    Debug.Assert(!waitingForThreadStart, "Leaked threadHandle");
+                    if (!waitingForThreadStart)
+                    {
+                        threadHandle.Free();
+                    }
+                }
+
+                if (GetThreadStateBit(ThreadState.Unstarted))
+                {
+                    // Lift the actual exception object to the caller
+                    Exception? startException = _startException;
+                    _startException = null;
+
+                    throw new ThreadStartException(startException ?? new OutOfMemoryException());
+                }
+                Debug.Assert(_startException == null);
+            }
+        }
+
+        private unsafe bool CreateThread(GCHandle thisThreadHandle)
+        {
+            // Create the Stop event before starting the thread to make sure
+            // it is ready to be signaled at thread shutdown time.
+            // This also avoids OOM after creating the thread.
+            _stopped = new ManualResetEvent(false);
+
+            delegate*<IntPtr, void> entryPoint = &ThreadEntryPoint;
+            if (!Interop.Sys.CreateThread(_startHelper!._maxStackSize, (IntPtr)entryPoint, GCHandle.ToIntPtr(thisThreadHandle)))
+            {
+                return false;
+            }
+
+            // CoreCLR ignores OS errors while setting the priority, so do we
+            SetPriorityLive(_priority);
+
+            return true;
+        }
+
+        /// <summary>
+        /// This is an entry point for managed threads created by application
+        /// </summary>
+        private static void ThreadEntryPoint(IntPtr parameter)
+        {
+            StartThread(parameter);
+            OnThreadExit();
+        }
+
+        private static void StartThread(IntPtr parameter)
+        {
+            Thread thread = (Thread)GCHandle.FromIntPtr(parameter).Target!;
+
+            try
+            {
+                t_currentThread = thread;
+                System.Threading.ManagedThreadId.SetForCurrentThread(thread._managedThreadId);
+            }
+            catch (Exception e)
+            {
+                thread._startException = e;
+
+                // This should not block since we just created the event. Any other fix would
+                // also require signaling the event so there isn't a good fix otherwise.
+                thread._stopped!.Set();
+                return;
+            }
+
+            // Publish successful startup only after the foreground count prevents process exit.
+            while (true)
+            {
+                int state = thread._threadState;
+                bool foreground = (state & (int)ThreadState.Background) == 0;
+                if (foreground)
+                    IncrementRunningForeground();
+                if (Interlocked.CompareExchange(ref thread._threadState, state & ~(int)ThreadState.Unstarted, state) == state)
+                    break;
+                if (foreground)
+                    DecrementRunningForeground();
+            }
+
+            try
+            {
+                StartHelper? startHelper = thread._startHelper;
+                Debug.Assert(startHelper is not null);
+                thread._startHelper = null;
+
+                startHelper.Run();
+            }
+            finally
+            {
+                thread.SetThreadStateBit(ThreadState.Stopped);
+            }
+        }
+
+        private static void OnThreadExit()
+        {
+            Thread? currentThread = t_currentThread;
+            if (currentThread != null)
+            {
+                // Inform the wait subsystem that the thread is exiting. For instance, this would abandon any mutexes locked by
+                // the thread.
+                currentThread._waitInfo.OnThreadExiting();
+                StopThread(currentThread);
+                currentThread.SetJoinHandle();
+            }
+        }
+
+        private static void StopThread(Thread thread)
+        {
+            if ((thread._threadState & (int)(ThreadState.Stopped | ThreadState.Aborted)) == 0)
+            {
+                thread.SetThreadStateBit(ThreadState.Stopped);
+            }
+
+            int state = thread.ClearThreadStateBit(ThreadState.Background);
+            if ((state & (int)ThreadState.Background) == 0)
+            {
+                DecrementRunningForeground();
+            }
+        }
+
+        internal static void IncrementRunningForeground()
+        {
+            Interlocked.Increment(ref s_foregroundRunningCount);
+        }
+
+        internal static void DecrementRunningForeground()
+        {
+            if (Interlocked.Decrement(ref s_foregroundRunningCount) == 0)
+            {
+                // Interlocked.Decrement issues full memory barrier
+                // so most recent write to s_allDone should be visible here
+                s_allDone?.Set();
+            }
+        }
+
+        internal static void WaitForForegroundThreads()
+        {
+            Thread.CurrentThread.IsBackground = true;
+            // last foreground thread could be running at this point
+            if (s_foregroundRunningCount == 0)
+            {
+                return;
+            }
+            Volatile.Write(ref s_allDone, new ManualResetEvent(false));
+            // other foreground threads could have their job finished meanwhile
+            if (Volatile.Read(ref s_foregroundRunningCount) == 0)
+            {
+                return;
+            }
+            s_allDone.WaitOne();
+        }
+
+        public void Interrupt() => WaitSubsystem.Interrupt(this);
+
+        public void Join() => Join(Timeout.Infinite);
+
+        public bool Join(TimeSpan timeout) => Join(WaitHandle.ToTimeoutMilliseconds(timeout));
+
+        public bool Join(int millisecondsTimeout)
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThan(millisecondsTimeout, Timeout.Infinite);
+            if ((ThreadState & ThreadState.Unstarted) != 0)
+            {
+                throw new ThreadStateException(SR.ThreadState_NotStarted);
+            }
+            return JoinInternal(millisecondsTimeout);
+        }
+
+        private SafeWaitHandle GetJoinHandle() => _stopped.SafeWaitHandle;
+
+        private bool JoinInternal(int millisecondsTimeout)
+        {
+            // This method assumes the thread has been started
+            Debug.Assert((ThreadState & ThreadState.Unstarted) == 0 || (millisecondsTimeout == 0));
+            SafeWaitHandle waitHandle = GetJoinHandle();
+
+            // If an OS thread is terminated and its Thread object is resurrected, waitHandle may be finalized and closed
+            if (waitHandle.IsClosed)
+            {
+                return true;
+            }
+
+            // Prevent race condition with the finalizer
+            try
+            {
+                waitHandle.DangerousAddRef();
+            }
+            catch (ObjectDisposedException)
+            {
+                return true;
+            }
+
+            try
+            {
+                return WaitSubsystem.Wait(waitHandle.DangerousGetHandle(), millisecondsTimeout, interruptible: false) == WaitHandle.WaitSuccess;
+            }
+            finally
+            {
+                waitHandle.DangerousRelease();
+            }
+        }
+
+        private void SetJoinHandle()
+        {
+            SafeWaitHandle waitHandle = GetJoinHandle();
+
+            Debug.Assert(!waitHandle.IsClosed);
+            waitHandle.DangerousAddRef();
+
+            try
+            {
+                WaitSubsystem.SetEvent(waitHandle.DangerousGetHandle());
+            }
+            finally
+            {
+                waitHandle.DangerousRelease();
+            }
         }
 
         public static void Sleep(int millisecondsTimeout)
@@ -202,27 +939,15 @@ namespace System.Threading
 
         public static void Sleep(TimeSpan timeout) => Sleep(WaitHandle.ToTimeoutMilliseconds(timeout));
 
-        internal static void SleepInternal(int millisecondsTimeout)
-        {
-            RuntimeFeature.ThrowIfMultithreadingIsNotSupported();
-            throw new PlatformNotSupportedException();
-        }
+        internal static void SleepInternal(int millisecondsTimeout) => WaitSubsystem.Sleep(millisecondsTimeout);
 
-        internal static void UninterruptibleSleep0()
-        {
-        }
+        internal static void UninterruptibleSleep0() => Thread.Yield();
 
-        public static bool Yield() => false;
+        public static bool Yield() => RuntimeImports.RhYield() != 0;
 
-        public static void SpinWait(int iterations)
-        {
-        }
+        public static void SpinWait(int iterations) => RuntimeImports.RhSpinWait(iterations);
 
         internal static int OptimalMaxSpinWaitsPerSpinIteration => 1;
-
-        internal void ResetThreadPoolThread()
-        {
-        }
 
         public static void MemoryBarrier() => Interlocked.MemoryBarrier();
 
@@ -239,6 +964,112 @@ namespace System.Threading
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static extern int GetCurrentProcessorNumber();
     }
+    /// # Wait subsystem
+    ///
+    /// The following design describes the multithreaded implementation. Single-threaded
+    /// implementations retain signal and ownership state without cross-thread wait registration.
+    ///
+    /// ## Types
+    ///
+    /// <see cref="WaitSubsystem"/>
+    ///   - Static API surface for dealing with synchronization objects that support multi-wait, and to put a thread into a wait
+    ///     state, on Unix
+    ///   - Any interaction with the wait subsystem from outside should go through APIs on this class, and should not directly
+    ///     go through any of the nested classes
+    ///
+    /// <see cref="WaitableObject"/>
+    ///   - An object that supports the features of <see cref="EventWaitHandle"/>, <see cref="Semaphore"/>, and
+    ///     <see cref="Mutex"/>. The handle of each of those classes is associated with a <see cref="WaitableObject"/>.
+    ///
+    /// <see cref="ThreadWaitInfo"/>
+    ///   - Keeps information about a thread's wait and provides functionlity to put a thread into a wait state and to take it
+    ///     out of a wait state. Each thread has an instance available through <see cref="Thread.WaitInfo"/>.
+    ///
+    /// <see cref="HandleManager"/>
+    ///   - Provides functionality to allocate a handle associated with a <see cref="WaitableObject"/>, to retrieve the object
+    ///     from a handle, and to delete a handle.
+    ///
+    /// <see cref="LowLevelLock"/> and <c>LowLevelMonitor</c>
+    ///   - These are "low level" in the sense they don't depend on this wait subsystem, and any waits done are not
+    ///     interruptible
+    ///   - <see cref="LowLevelLock"/> is used for the process-wide lock <see cref="s_lock"/>
+    ///   - <c>LowLevelMonitor</c> is the main system dependency of the wait subsystem, and all waits are done through
+    ///   it. It is backed by a native implementation in System.Native that uses a minipal mutex/condition pair.
+    ///   Each thread has an instance in <c>ThreadWaitInfo._waitMonitor</c>, which is used to synchronize the
+    ///     thread's wait state and for waiting. <see cref="LowLevelLock"/> also uses an instance of
+    ///     <c>LowLevelMonitor</c> for waiting.
+    ///
+    /// ## Design goals
+    ///
+    /// Behave similarly to wait operations on Windows
+    ///   - Waiting
+    ///     - A waiter keeps an array of objects on which it is waiting (see <see cref="ThreadWaitInfo._waitedObjects"/>).
+    ///     - The waiter registers a <c>ThreadWaitInfo.WaitedListNode</c> with each <see cref="WaitableObject"/>
+    ///     - The waiter waits on its own <c>ThreadWaitInfo._waitMonitor</c> to go into a wait state
+    ///     - Upon timeout, the waiter unregisters the wait and continues
+    ///   - Sleeping
+    ///     - Sleeping is just another way of waiting, only there would not be any waited objects
+    ///   - Signaling
+    ///     - A signaler iterates over waiters and tries to release waiters based on the signal count
+    ///     - For each waiter, the signaler checks if the waiter's wait can be terminated
+    ///     - When a waiter's wait can be terminated, the signaler does everything necessary before waking the waiter, such that
+    ///       the waiter can simply continue after awakening, including unregistering the wait and assigning ownership if
+    ///       applicable
+    ///   - Interrupting
+    ///     - Interrupting is just another way of signaling a waiting thread. The interrupter unregisters the wait and wakes the
+    ///       waiter.
+    ///   - Wait release fairness
+    ///     - As mentioned above in how signaling works, waiters are released in fair order (first come, first served)
+    ///     - This is mostly done to match the behavior of synchronization objects in Windows, which are also fair
+    ///     - Events have an implicit requirement to be fair
+    ///       - For a <see cref="ManualResetEvent"/>, Set/Reset in quick succession requires that it wakes up all waiters,
+    ///         implying that the design cannot be to signal a thread to wake and have it check the state when it awakens some
+    ///         time in the future
+    ///       - For an <see cref="AutoResetEvent"/>, Set/Set in quick succession requires that it wakes up two threads, implying
+    ///         that a Set/Wait in quick succession cannot have the calling thread accept its own signal if there is a waiter
+    ///     - There is an advantage to being fair, as it guarantees that threads are only awakened when necessary. That is, a
+    ///       thread will never wake up and find that it has to go back to sleep because the wait is not satisfied (except due
+    ///       to spurious wakeups caused by external factors).
+    ///   - Synchronization
+    ///     - A process-wide lock <see cref="s_lock"/> is used to synchronize most operations and the signal state of all
+    ///       <see cref="WaitableObject"/>s in the process. Given that it is recommended to use alternative synchronization
+    ///       types (<see cref="ManualResetEventSlim"/>, <see cref="SemaphoreSlim"/>, <see cref="Monitor"/>) for single-wait
+    ///       cases, it is probably not worth optimizing for the single-wait case. It is possible with a small design change to
+    ///       bypass the lock and use interlocked operations for uncontended cases, but at the cost of making multi-waits more
+    ///       complicated and slower.
+    ///     - The wait state of a thread (<c>ThreadWaitInfo._waitSignalState</c>), among other things, is synchronized
+    ///       using the thread's <c>ThreadWaitInfo._waitMonitor</c>, so signalers and interrupters acquire the monitor's
+    ///       lock before checking the wait state of a thread and signaling the thread to wake up.
+    ///
+    /// Self-consistent in the event of any exception
+    ///   - Try/finally is used extensively, including around any operation that could fail due to out-of-memory
+    ///
+    /// Decent balance between memory usage and performance
+    ///   - <see cref="WaitableObject"/> is intended to be as small as possible while avoiding virtual calls and casts
+    ///   - As <see cref="Mutex"/> is not commonly used and requires more state, some of its state is separated into
+    ///     <see cref="WaitableObject._ownershipInfo"/>
+    ///   - When support for cross-process objects is added, the current thought is to have an <see cref="object"/> field that
+    ///     is used for both cross-process state and ownership state.
+    ///
+    /// No allocation in typical cases of any operation except where necessary
+    ///   - Since the maximum number of wait handles for a multi-wait operation is limited to
+    ///     <see cref="WaitHandle.MaxWaitHandles"/>, arrays necessary for holding information about a multi-wait, and list nodes
+    ///     necessary for registering a wait, are precreated with a low initial capacity that covers most typical cases
+    ///   - Threads track owned mutexes by linking the <see cref="WaitableObject.OwnershipInfo"/> instance into a linked list
+    ///     <c>ThreadWaitInfo.LockedMutexesHead</c>. <see cref="WaitableObject.OwnershipInfo"/> is itself a list node,
+    ///     and is created along with the mutex <see cref="WaitableObject"/>.
+    ///
+    /// Minimal p/invokes in typical uncontended cases
+    ///   - <see cref="HandleManager"/> currently uses <see cref="Runtime.InteropServices.GCHandle"/> in the interest of
+    ///     simplicity, which p/invokes and does a cast to get the <see cref="WaitableObject"/> from a handle
+    ///   - Most of the wait subsystem is written in C#, so there is no initially required p/invoke
+    ///   - <see cref="LowLevelLock"/>, used by the process-wide lock <see cref="s_lock"/>, uses interlocked operations to
+    ///     acquire and release the lock when there is no need to wait or to release a waiter. This is significantly faster than
+    ///     using <c>LowLevelMonitor</c> as a lock, which uses native synchronization through p/invoke. The lock is
+    ///     typically not held for very long, especially since allocations inside the lock will be rare.
+    ///   - Since <see cref="s_lock"/> provides mutual exclusion for the states of all <see cref="WaitableObject"/>s in the
+    ///     process, any operation that does not involve waiting or releasing a wait can occur with minimal p/invokes
+    ///
     internal static class WaitSubsystem
     {
         private static readonly LowLevelLock s_lock = new LowLevelLock();
@@ -266,6 +1097,360 @@ namespace System.Threading
             }
         }
 
+        // Some platforms have more implementations of IWaitableObject than just WaitableObject.
+        private static SafeWaitHandle NewHandle(IWaitableObject waitableObject)
+        {
+            var safeWaitHandle = new SafeWaitHandle();
+
+            IntPtr handle = IntPtr.Zero;
+            try
+            {
+                handle = HandleManager.NewHandle(waitableObject);
+            }
+            finally
+            {
+                if (handle == IntPtr.Zero)
+                {
+                    waitableObject.OnDeleteHandle();
+                }
+            }
+
+            safeWaitHandle.SetHandle(handle);
+            return safeWaitHandle;
+        }
+
+        public static SafeWaitHandle NewEvent(bool initiallySignaled, EventResetMode resetMode)
+        {
+            return NewHandle(WaitableObject.NewEvent(initiallySignaled, resetMode));
+        }
+
+        public static SafeWaitHandle NewSemaphore(int initialSignalCount, int maximumSignalCount)
+        {
+            return NewHandle(WaitableObject.NewSemaphore(initialSignalCount, maximumSignalCount));
+        }
+
+        public static SafeWaitHandle NewMutex(bool initiallyOwned)
+        {
+            WaitableObject waitableObject = WaitableObject.NewMutex();
+            SafeWaitHandle safeWaitHandle = NewHandle(waitableObject);
+            if (!initiallyOwned)
+            {
+                return safeWaitHandle;
+            }
+
+            // Acquire the mutex. A thread's <see cref="ThreadWaitInfo"/> has a reference to all <see cref="Mutex"/>es locked
+            // by the thread in the multithreaded implementation. So, acquire the lock only after all
+            // possibilities for exceptions have been exhausted.
+            ThreadWaitInfo waitInfo = Thread.CurrentThread.WaitInfo;
+            bool acquiredLock = waitableObject.Wait(waitInfo, timeoutMilliseconds: 0, interruptible: false) == 0;
+            Debug.Assert(acquiredLock);
+            return safeWaitHandle;
+        }
+
+        public static SafeWaitHandle? CreateNamedMutex(bool initiallyOwned, string name, bool isUserScope, out bool createdNew)
+        {
+            // For initially owned, newly created named mutexes, there is a potential race
+            // between adding the mutex to the named object table and initially acquiring it.
+            // To avoid the possibility of another thread retrieving the mutex via its name
+            // before we managed to acquire it, we perform both steps while holding s_lock.
+            LockHolder lockHolder = new LockHolder(s_lock);
+            try
+            {
+                if (isUserScope)
+                {
+                    name = $"User\\{name}";
+                }
+
+                WaitableObject? waitableObject = WaitableObject.CreateNamedMutex_Locked(name, out createdNew);
+                if (waitableObject == null)
+                {
+                    return null;
+                }
+                SafeWaitHandle safeWaitHandle = NewHandle(waitableObject);
+                if (!initiallyOwned || !createdNew)
+                {
+                    return safeWaitHandle;
+                }
+
+                // Acquire the mutex. A thread's <see cref="ThreadWaitInfo"/> has a reference to all <see cref="Mutex"/>es locked
+                // by the thread in the multithreaded implementation. So, acquire the lock only after all
+                // possibilities for exceptions have been exhausted.
+                ThreadWaitInfo waitInfo = Thread.CurrentThread.WaitInfo;
+                int status = waitableObject.Wait_Locked(waitInfo, timeoutMilliseconds: 0, interruptible: false, ref lockHolder);
+                Debug.Assert(status == 0);
+                return safeWaitHandle;
+            }
+            finally
+            {
+                lockHolder.Dispose();
+            }
+        }
+
+        public static OpenExistingResult OpenNamedMutex(string name, bool isUserScope, out SafeWaitHandle? result)
+        {
+            if (isUserScope)
+            {
+                name = $"User\\{name}";
+            }
+
+            OpenExistingResult status = WaitableObject.OpenNamedMutex(name, out WaitableObject? mutex);
+            result = status == OpenExistingResult.Success ? NewHandle(mutex!) : null;
+            return status;
+        }
+
+        public static void DeleteHandle(IntPtr handle)
+        {
+            HandleManager.DeleteHandle(handle);
+        }
+
+        public static void SetEvent(IntPtr handle)
+        {
+            SetEvent((WaitableObject)HandleManager.FromHandle(handle));
+        }
+
+        public static void SetEvent(WaitableObject waitableObject)
+        {
+            Debug.Assert(waitableObject != null);
+
+            LockHolder lockHolder = new LockHolder(s_lock);
+            try
+            {
+                waitableObject.SignalEvent(ref lockHolder);
+            }
+            finally
+            {
+                lockHolder.Dispose();
+            }
+        }
+
+        public static void ResetEvent(IntPtr handle)
+        {
+            ResetEvent((WaitableObject)HandleManager.FromHandle(handle));
+        }
+
+        public static void ResetEvent(WaitableObject waitableObject)
+        {
+            Debug.Assert(waitableObject != null);
+
+            LockHolder lockHolder = new LockHolder(s_lock);
+            try
+            {
+                waitableObject.UnsignalEvent(ref lockHolder);
+            }
+            finally
+            {
+                lockHolder.Dispose();
+            }
+        }
+
+        public static int ReleaseSemaphore(IntPtr handle, int count)
+        {
+            Debug.Assert(count > 0);
+            return ReleaseSemaphore((WaitableObject)HandleManager.FromHandle(handle), count);
+        }
+
+        public static int ReleaseSemaphore(WaitableObject waitableObject, int count)
+        {
+            Debug.Assert(waitableObject != null);
+            Debug.Assert(count > 0);
+
+            LockHolder lockHolder = new LockHolder(s_lock);
+            try
+            {
+                return waitableObject.SignalSemaphore(count, ref lockHolder);
+            }
+            finally
+            {
+                lockHolder.Dispose();
+            }
+        }
+
+        public static void ReleaseMutex(IntPtr handle)
+        {
+            ReleaseMutex(HandleManager.FromHandle(handle));
+        }
+
+        public static void ReleaseMutex(IWaitableObject waitableObject)
+        {
+            Debug.Assert(waitableObject != null);
+
+            LockHolder lockHolder = new LockHolder(s_lock);
+            try
+            {
+                waitableObject.Signal(1, ref lockHolder);
+            }
+            finally
+            {
+                lockHolder.Dispose();
+            }
+        }
+
+        public static int Wait(IntPtr handle, int timeoutMilliseconds, bool interruptible)
+        {
+            Debug.Assert(timeoutMilliseconds >= -1);
+            return Wait(HandleManager.FromHandle(handle), timeoutMilliseconds, interruptible);
+        }
+
+        public static int Wait(
+            IWaitableObject waitableObject,
+            int timeoutMilliseconds,
+            bool interruptible = true)
+        {
+            Debug.Assert(waitableObject != null);
+            Debug.Assert(timeoutMilliseconds >= -1);
+
+            return waitableObject.Wait(Thread.CurrentThread.WaitInfo, timeoutMilliseconds, interruptible);
+        }
+
+        public static int Wait(
+            ReadOnlySpan<IntPtr> waitHandles,
+            bool waitForAll,
+            int timeoutMilliseconds)
+        {
+            Debug.Assert(waitHandles.Length > 0);
+            Debug.Assert(waitHandles.Length <= WaitHandle.MaxWaitHandles);
+            Debug.Assert(timeoutMilliseconds >= -1);
+
+            ThreadWaitInfo waitInfo = Thread.CurrentThread.WaitInfo;
+
+
+            WaitableObject?[] waitableObjects = waitInfo.GetWaitedObjectArray(waitHandles.Length);
+            bool success = false;
+
+            try
+            {
+                for (int i = 0; i < waitHandles.Length; ++i)
+                {
+                    Debug.Assert(waitHandles[i] != IntPtr.Zero);
+                    IWaitableObject waitableObjectMaybe = HandleManager.FromHandle(waitHandles[i]);
+
+                    if (waitableObjectMaybe is not WaitableObject waitableObject)
+                    {
+                        throw new PlatformNotSupportedException(SR.PlatformNotSupported_NamedSyncObjectWaitAnyWaitAll);
+                    }
+
+                    if (waitForAll)
+                    {
+                        // Check if this is a duplicate, as wait-for-all does not support duplicates. Including the parent
+                        // loop, this becomes a brute force O(n^2) search, which is intended since the typical array length is
+                        // short enough that this would actually be faster than other alternatives. Also, the worst case is not
+                        // so bad considering that the array length is limited by <see cref="WaitHandle.MaxWaitHandles"/>.
+                        for (int j = 0; j < i; ++j)
+                        {
+                            if (waitableObject == waitableObjects[j])
+                            {
+                                throw new DuplicateWaitObjectException("waitHandles[" + i + ']');
+                            }
+                        }
+                    }
+
+                    waitableObjects[i] = waitableObject;
+                }
+                success = true;
+            }
+            finally
+            {
+                if (!success)
+                {
+                    Array.Clear(waitableObjects, 0, waitHandles.Length);
+                }
+            }
+
+            if (waitHandles.Length == 1)
+            {
+                WaitableObject waitableObject = waitableObjects[0]!;
+                Array.Clear(waitableObjects, 0, 1);
+                return
+                    waitableObject.Wait(waitInfo, timeoutMilliseconds, interruptible: true);
+            }
+
+            return
+                WaitableObject.Wait(
+                    waitableObjects,
+                    waitHandles.Length,
+                    waitForAll,
+                    waitInfo,
+                    timeoutMilliseconds,
+                    interruptible: true);
+        }
+
+        public static int SignalAndWait(
+            IntPtr handleToSignal,
+            IntPtr handleToWaitOn,
+            int timeoutMilliseconds)
+        {
+            Debug.Assert(timeoutMilliseconds >= -1);
+
+            return
+                SignalAndWait(
+                    HandleManager.FromHandle(handleToSignal),
+                    HandleManager.FromHandle(handleToWaitOn),
+                    timeoutMilliseconds);
+        }
+
+        public static int SignalAndWait(
+            IWaitableObject waitableObjectToSignal,
+            IWaitableObject waitableObjectToWaitOn,
+            int timeoutMilliseconds,
+            bool interruptible = true)
+        {
+            Debug.Assert(waitableObjectToSignal != null);
+            Debug.Assert(waitableObjectToWaitOn != null);
+            Debug.Assert(timeoutMilliseconds >= -1);
+
+            ThreadWaitInfo waitInfo = Thread.CurrentThread.WaitInfo;
+            LockHolder lockHolder = new LockHolder(s_lock);
+            try
+            {
+                // A pending interrupt does not signal the specified handle
+                if (interruptible && waitInfo.CheckAndResetPendingInterrupt)
+                {
+                    lockHolder.Dispose();
+                    throw new ThreadInterruptedException();
+                }
+
+                try
+                {
+                    waitableObjectToSignal.Signal(1, ref lockHolder);
+                }
+                catch (SemaphoreFullException ex)
+                {
+                    s_lock.VerifyIsNotLocked();
+                    throw new InvalidOperationException(SR.Threading_WaitHandleTooManyPosts, ex);
+                }
+                return waitableObjectToWaitOn.Wait_Locked(waitInfo, timeoutMilliseconds, interruptible, ref lockHolder);
+            }
+            finally
+            {
+                lockHolder.Dispose();
+            }
+        }
+
+        public static void UninterruptibleSleep0()
+        {
+            ThreadWaitInfo.UninterruptibleSleep0();
+        }
+
+        public static void Sleep(int timeoutMilliseconds, bool interruptible = true)
+        {
+            ThreadWaitInfo.Sleep(timeoutMilliseconds, interruptible);
+        }
+
+        public static void Interrupt(Thread thread)
+        {
+            Debug.Assert(thread != null);
+
+            s_lock.Acquire();
+            try
+            {
+                thread.WaitInfo.TrySignalToInterruptWaitOrRecordPendingInterrupt();
+            }
+            finally
+            {
+                s_lock.Release();
+            }
+        }
+
         public interface IWaitableObject
         {
             void OnDeleteHandle();
@@ -273,12 +1458,40 @@ namespace System.Threading
             void Signal(int count, ref LockHolder lockHolder);
         }
 
+        public static int Wait(this IWaitableObject waitable, ThreadWaitInfo waitInfo, int timeoutMilliseconds, bool interruptible)
+        {
+            Debug.Assert(waitInfo.Thread == Thread.CurrentThread);
+
+            Debug.Assert(timeoutMilliseconds >= -1);
+
+            var lockHolder = new LockHolder(s_lock);
+            try
+            {
+                if (interruptible && waitInfo.CheckAndResetPendingInterrupt)
+                {
+                    lockHolder.Dispose();
+                    throw new ThreadInterruptedException();
+                }
+
+                return waitable.Wait_Locked(waitInfo, timeoutMilliseconds, interruptible, ref lockHolder);
+            }
+            finally
+            {
+                lockHolder.Dispose();
+            }
+        }
+
         private static class HandleManager
         {
             public static IntPtr NewHandle(IWaitableObject waitableObject)
             {
+                Debug.Assert(waitableObject != null);
+
                 IntPtr handle = GCHandle.ToIntPtr(GCHandle.Alloc(waitableObject, GCHandleType.Normal));
 
+                // SafeWaitHandle treats -1 and 0 as invalid, and the handle should not be these values anyway
+                Debug.Assert(handle != IntPtr.Zero);
+                Debug.Assert(handle != new IntPtr(-1));
                 return handle;
             }
 
@@ -319,7 +1532,1752 @@ namespace System.Threading
         /// </summary>
         public sealed class ThreadWaitInfo
         {
+            private readonly Thread _thread;
 
+            /// <summary>
+            /// The monitor the thread would wait upon when the wait needs to be interruptible
+            /// </summary>
+            private LowLevelMonitor _waitMonitor;
+
+
+            /// <summary>
+            /// Thread wait state. The following members indicate the waiting state of the thread, and convery information from
+            /// a signaler to the waiter. They are synchronized with <see cref="_waitMonitor"/>.
+            /// </summary>
+            private WaitSignalState _waitSignalState;
+
+            /// <summary>
+            /// Index of the waitable object in <see cref="_waitedObjects"/>, which got signaled and satisfied the wait. -1 if
+            /// the wait has not yet been satisfied.
+            /// </summary>
+            private int _waitedObjectIndexThatSatisfiedWait;
+
+            /// <summary>
+            /// Information about the current wait, including the type of wait, the <see cref="WaitableObject"/>s involved in
+            /// the wait, etc. They are synchronized with <see cref="s_lock"/>.
+            /// </summary>
+            private bool _isWaitForAll;
+
+            /// <summary>
+            /// Number of <see cref="WaitableObject"/>s the thread is waiting upon
+            /// </summary>
+            private int _waitedCount;
+
+            /// <summary>
+            /// - <see cref="WaitableObject"/>s that are waited upon by the thread. This array is also used for temporarily
+            ///   storing <see cref="WaitableObject"/>s corresponding to <see cref="WaitHandle"/>s when the thread is not
+            ///   waiting.
+            /// - The filled count is <see cref="_waitedCount"/>
+            /// - Indexes in all arrays that use <see cref="_waitedCount"/> correspond
+            /// </summary>
+            private WaitableObject?[] _waitedObjects;
+
+            /// <summary>
+            /// - Nodes used for registering a thread's wait on each <see cref="WaitableObject"/>, in the
+            ///   <see cref="WaitableObject.WaitersHead"/> linked list
+            /// - The filled count is <see cref="_waitedCount"/>
+            /// - Indexes in all arrays that use <see cref="_waitedCount"/> correspond
+            /// </summary>
+            private WaitedListNode[] _waitedListNodes;
+
+            /// <summary>
+            /// Indicates whether the next wait should be interrupted.
+            ///
+            /// Synchronization:
+            /// - In most cases, reads and writes are synchronized with <see cref="s_lock"/>
+            /// - Sleep(nonzero) intentionally does not acquire <see cref="s_lock"/>, but it must acquire
+            ///   <see cref="_waitMonitor"/> to do the wait. To support this case, a pending interrupt is recorded while
+            ///   <see cref="s_lock"/> and <see cref="_waitMonitor"/> are locked, and the read and reset for Sleep(nonzero) are
+            ///   done while <see cref="_waitMonitor"/> is locked.
+            /// - Sleep(0) intentionally does not acquire any lock, so it uses an interlocked compare-exchange for the read and
+            ///   reset, see <see cref="CheckAndResetPendingInterrupt_NotLocked"/>
+            /// </summary>
+            private bool _isPendingInterrupt;
+
+            ////////////////////////////////////////////////////////////////
+
+            /// <summary>
+            /// Linked list of mutex <see cref="WaitableObject"/>s that are owned by the thread and need to be abandoned before
+            /// the thread exits. The linked list has only a head and no tail, which means acquired mutexes are prepended and
+            /// mutexes are abandoned in reverse order.
+            /// </summary>
+            private WaitableObject? _lockedMutexesHead;
+
+
+            public ThreadWaitInfo(Thread thread)
+            {
+                Debug.Assert(thread != null);
+
+                _thread = thread;
+                _waitMonitor.Initialize();
+                _waitSignalState = WaitSignalState.NotWaiting;
+                _waitedObjectIndexThatSatisfiedWait = -1;
+
+                // Preallocate to make waiting for single handle fault-free
+                _waitedObjects = new WaitableObject[1];
+                _waitedListNodes = new WaitedListNode[1] { new WaitedListNode(this, 0) };
+            }
+
+            ~ThreadWaitInfo()
+            {
+                _waitMonitor.Dispose();
+            }
+
+            public Thread Thread => _thread;
+
+            private bool IsWaiting
+            {
+                get
+                {
+                    _waitMonitor.VerifyIsLocked();
+                    return _waitSignalState < WaitSignalState.NotWaiting;
+                }
+            }
+
+            /// <summary>
+            /// Callers must ensure to clear the array after use. Once <see cref="RegisterWait(int, bool)"/> is called (followed
+            /// by a call to <see cref="Wait(int, bool, bool, ref LockHolder)"/>, the array will be cleared automatically.
+            /// </summary>
+            public WaitableObject?[] GetWaitedObjectArray(int requiredCapacity)
+            {
+                Debug.Assert(_thread == Thread.CurrentThread);
+                Debug.Assert(_waitedCount == 0);
+
+
+                int currentLength = _waitedObjects.Length;
+                if (currentLength < requiredCapacity)
+                    _waitedObjects = new WaitableObject[Math.Max(requiredCapacity,
+                        Math.Min(WaitHandle.MaxWaitHandles, 2 * currentLength))];
+
+                return _waitedObjects;
+            }
+
+            private WaitedListNode[] GetWaitedListNodeArray(int requiredCapacity)
+            {
+                Debug.Assert(_thread == Thread.CurrentThread);
+                Debug.Assert(_waitedCount == 0);
+
+                int currentLength = _waitedListNodes.Length;
+                if (currentLength < requiredCapacity)
+                {
+                    WaitedListNode[] newItems = new WaitedListNode[Math.Max(requiredCapacity,
+                        Math.Min(WaitHandle.MaxWaitHandles, 2 * currentLength))];
+
+                    Array.Copy(_waitedListNodes, 0, newItems, 0, currentLength);
+                    for (int i = currentLength; i < newItems.Length; i++)
+                        newItems[i] = new WaitedListNode(this, i);
+
+                    _waitedListNodes = newItems;
+                }
+
+                return _waitedListNodes;
+            }
+
+            /// <summary>
+            /// The caller is expected to populate <see cref="GetWaitedObjectArray"/> and pass in the number of objects filled
+            /// </summary>
+            public void RegisterWait(int waitedCount, bool isWaitForAll)
+            {
+                s_lock.VerifyIsLocked();
+                Debug.Assert(_thread == Thread.CurrentThread);
+
+                Debug.Assert(waitedCount > (isWaitForAll ? 1 : 0));
+                Debug.Assert(waitedCount <= _waitedObjects.Length);
+
+                Debug.Assert(_waitedCount == 0);
+
+                WaitableObject?[] waitedObjects = _waitedObjects;
+
+                bool success = false;
+                WaitedListNode[] waitedListNodes;
+                try
+                {
+                    waitedListNodes = GetWaitedListNodeArray(waitedCount);
+                    success = true;
+                }
+                finally
+                {
+                    if (!success)
+                    {
+                        // Once this function is called, the caller is effectively transferring ownership of the waited objects
+                        // to this and the wait functions. On exception, clear the array.
+                        for (int i = 0; i < waitedCount; ++i)
+                        {
+                            waitedObjects[i] = null;
+                        }
+                    }
+                }
+
+                _isWaitForAll = isWaitForAll;
+                _waitedCount = waitedCount;
+                for (int i = 0; i < waitedCount; ++i)
+                {
+                    waitedListNodes[i].RegisterWait(waitedObjects[i]!);
+                }
+            }
+
+            public void UnregisterWait()
+            {
+                s_lock.VerifyIsLocked();
+                Debug.Assert(_waitedCount > (_isWaitForAll ? 1 : 0));
+
+                for (int i = 0; i < _waitedCount; ++i)
+                {
+                    _waitedListNodes[i].UnregisterWait(_waitedObjects[i]!);
+                    _waitedObjects[i] = null;
+                }
+                _waitedCount = 0;
+            }
+
+            private int ProcessSignaledWaitState()
+            {
+                s_lock.VerifyIsNotLocked();
+                _waitMonitor.VerifyIsLocked();
+                Debug.Assert(_thread == Thread.CurrentThread);
+
+                switch (_waitSignalState)
+                {
+                    case WaitSignalState.Waiting:
+                    case WaitSignalState.Waiting_Interruptible:
+                        return WaitHandle.WaitTimeout;
+
+                    case WaitSignalState.NotWaiting_SignaledToSatisfyWait:
+                    {
+                        Debug.Assert(_waitedObjectIndexThatSatisfiedWait >= 0);
+                        int waitedObjectIndexThatSatisfiedWait = _waitedObjectIndexThatSatisfiedWait;
+                        _waitedObjectIndexThatSatisfiedWait = -1;
+                        return waitedObjectIndexThatSatisfiedWait;
+                    }
+
+                    case WaitSignalState.NotWaiting_SignaledToSatisfyWaitWithAbandonedMutex:
+                    {
+                        Debug.Assert(_waitedObjectIndexThatSatisfiedWait >= 0);
+                        int waitedObjectIndexThatSatisfiedWait = _waitedObjectIndexThatSatisfiedWait;
+                        _waitedObjectIndexThatSatisfiedWait = -1;
+                        return WaitHandle.WaitAbandoned + waitedObjectIndexThatSatisfiedWait;
+                    }
+
+                    case WaitSignalState.NotWaiting_SignaledToAbortWaitDueToMaximumMutexReacquireCount:
+                        Debug.Assert(_waitedObjectIndexThatSatisfiedWait < 0);
+                        throw new OverflowException(SR.Overflow_MutexReacquireCount);
+
+                    default:
+                        Debug.Assert(_waitSignalState == WaitSignalState.NotWaiting_SignaledToInterruptWait);
+                        Debug.Assert(_waitedObjectIndexThatSatisfiedWait < 0);
+                        throw new ThreadInterruptedException();
+                }
+            }
+
+            public int Wait(int timeoutMilliseconds, bool interruptible, bool isSleep, ref LockHolder lockHolder)
+            {
+                if (isSleep)
+                {
+                    s_lock.VerifyIsNotLocked();
+                }
+                else
+                {
+                    s_lock.VerifyIsLocked();
+                }
+                Debug.Assert(_thread == Thread.CurrentThread);
+
+                Debug.Assert(timeoutMilliseconds >= -1);
+                Debug.Assert(timeoutMilliseconds != 0); // caller should have taken care of it
+
+                _thread.SetWaitSleepJoinState();
+
+                // <see cref="_waitMonitor"/> must be acquired before <see cref="s_lock"/> is released, to ensure that there is
+                // no gap during which a waited object may be signaled to satisfy the wait but the thread may not yet be in a
+                // wait state to accept the signal
+                _waitMonitor.Acquire();
+                if (!isSleep)
+                {
+                    lockHolder.Dispose();
+                }
+
+                Debug.Assert(_waitedObjectIndexThatSatisfiedWait < 0);
+                Debug.Assert(_waitSignalState == WaitSignalState.NotWaiting);
+
+                // A signaled state may be set only when the thread is in one of the following states
+                _waitSignalState = interruptible ? WaitSignalState.Waiting_Interruptible : WaitSignalState.Waiting;
+
+                try
+                {
+                    if (isSleep && interruptible && CheckAndResetPendingInterrupt)
+                    {
+                        throw new ThreadInterruptedException();
+                    }
+
+                    if (timeoutMilliseconds < 0)
+                    {
+                        do
+                        {
+                            _waitMonitor.Wait();
+                        } while (IsWaiting);
+
+                        int waitResult = ProcessSignaledWaitState();
+                        Debug.Assert(waitResult != WaitHandle.WaitTimeout);
+                        return waitResult;
+                    }
+
+                    int elapsedMilliseconds = 0;
+                    int startTimeMilliseconds = Environment.TickCount;
+                    while (true)
+                    {
+                        bool monitorWaitResult = _waitMonitor.Wait(timeoutMilliseconds - elapsedMilliseconds);
+
+                        // It's possible for the wait to have timed out, but before the monitor could reacquire the lock, a
+                        // signaler could have acquired it and signaled to satisfy the wait or interrupt the thread. Accept the
+                        // signal and ignore the wait timeout.
+                        int waitResult = ProcessSignaledWaitState();
+                        if (waitResult != WaitHandle.WaitTimeout)
+                        {
+                            return waitResult;
+                        }
+
+                        if (monitorWaitResult)
+                        {
+                            elapsedMilliseconds = Environment.TickCount - startTimeMilliseconds;
+                            if (elapsedMilliseconds < timeoutMilliseconds)
+                            {
+                                continue;
+                            }
+                        }
+
+                        // Timeout
+                        Debug.Assert(_waitedObjectIndexThatSatisfiedWait < 0);
+                        break;
+                    }
+                }
+                finally
+                {
+                    _waitSignalState = WaitSignalState.NotWaiting;
+                    _waitMonitor.Release();
+
+                    _thread.ClearWaitSleepJoinState();
+                }
+
+                // Timeout. It's ok to read <see cref="_waitedCount"/> without acquiring <see cref="s_lock"/> here, because it
+                // is initially set by this thread, and another thread cannot unregister this thread's wait without first
+                // signaling this thread, in which case this thread wouldn't be timing out.
+                Debug.Assert(isSleep == (_waitedCount == 0));
+                if (!isSleep)
+                {
+                    s_lock.Acquire();
+                    UnregisterWait();
+                    s_lock.Release();
+                }
+                return WaitHandle.WaitTimeout;
+            }
+
+            public static void UninterruptibleSleep0()
+            {
+                s_lock.VerifyIsNotLocked();
+
+                // On Unix, a thread waits on a condition variable. The timeout time will have already elapsed at the time
+                // of the call. The documentation does not state whether the thread yields or does nothing before returning
+                // an error, and in some cases, suggests that doing nothing is acceptable. The behavior could also be
+                // different between distributions. Yield directly here.
+                Thread.Yield();
+            }
+
+            public static void Sleep(int timeoutMilliseconds, bool interruptible)
+            {
+                s_lock.VerifyIsNotLocked();
+                Debug.Assert(timeoutMilliseconds >= -1);
+
+                if (timeoutMilliseconds == 0)
+                {
+                    if (interruptible && Thread.CurrentThread.WaitInfo.CheckAndResetPendingInterrupt_NotLocked)
+                    {
+                        throw new ThreadInterruptedException();
+                    }
+
+                    UninterruptibleSleep0();
+                    return;
+                }
+
+                LockHolder dummyLockHolder = default;
+                int waitResult =
+                    Thread
+                        .CurrentThread
+                        .WaitInfo
+                        .Wait(timeoutMilliseconds, interruptible, isSleep: true, ref dummyLockHolder);
+                Debug.Assert(waitResult == WaitHandle.WaitTimeout);
+            }
+
+            public bool TrySignalToSatisfyWait(WaitedListNode registeredListNode, bool isAbandonedMutex)
+            {
+                s_lock.VerifyIsLocked();
+                Debug.Assert(_thread != Thread.CurrentThread);
+
+                Debug.Assert(registeredListNode != null);
+                Debug.Assert(registeredListNode.WaitInfo == this);
+                Debug.Assert(registeredListNode.WaitedObjectIndex >= 0);
+                Debug.Assert(registeredListNode.WaitedObjectIndex < _waitedCount);
+
+                Debug.Assert(_waitedCount > (_isWaitForAll ? 1 : 0));
+
+                int signaledWaitedObjectIndex = registeredListNode.WaitedObjectIndex;
+                bool isWaitForAll = _isWaitForAll;
+                bool wouldAnyMutexReacquireCountOverflow = false;
+                if (isWaitForAll)
+                {
+                    // Determine if all waits would be satisfied
+                    if (!WaitableObject.WouldWaitForAllBeSatisfiedOrAborted(
+                            _thread,
+                            _waitedObjects,
+                            _waitedCount,
+                            signaledWaitedObjectIndex,
+                            ref wouldAnyMutexReacquireCountOverflow,
+                            ref isAbandonedMutex))
+                    {
+                        return false;
+                    }
+                }
+
+                // The wait would be satisfied. Before making changes to satisfy the wait, acquire the monitor and verify that
+                // the thread can accept a signal.
+                _waitMonitor.Acquire();
+
+                if (!IsWaiting)
+                {
+                    _waitMonitor.Release();
+                    return false;
+                }
+
+                if (isWaitForAll && !wouldAnyMutexReacquireCountOverflow)
+                {
+                    // All waits would be satisfied, accept the signals
+                    WaitableObject.SatisfyWaitForAll(this, _waitedObjects, _waitedCount, signaledWaitedObjectIndex);
+                }
+
+                UnregisterWait();
+
+                Debug.Assert(_waitedObjectIndexThatSatisfiedWait < 0);
+                if (wouldAnyMutexReacquireCountOverflow)
+                {
+                    _waitSignalState = WaitSignalState.NotWaiting_SignaledToAbortWaitDueToMaximumMutexReacquireCount;
+                }
+                else
+                {
+                    _waitedObjectIndexThatSatisfiedWait = signaledWaitedObjectIndex;
+                    _waitSignalState =
+                        isAbandonedMutex
+                            ? WaitSignalState.NotWaiting_SignaledToSatisfyWaitWithAbandonedMutex
+                            : WaitSignalState.NotWaiting_SignaledToSatisfyWait;
+                }
+
+                _waitMonitor.Signal_Release();
+                return !wouldAnyMutexReacquireCountOverflow;
+            }
+
+            public void TrySignalToInterruptWaitOrRecordPendingInterrupt()
+            {
+                s_lock.VerifyIsLocked();
+
+                _waitMonitor.Acquire();
+
+                if (_waitSignalState != WaitSignalState.Waiting_Interruptible)
+                {
+                    RecordPendingInterrupt();
+                    _waitMonitor.Release();
+                    return;
+                }
+
+                if (_waitedCount != 0)
+                {
+                    UnregisterWait();
+                }
+
+                Debug.Assert(_waitedObjectIndexThatSatisfiedWait < 0);
+                _waitSignalState = WaitSignalState.NotWaiting_SignaledToInterruptWait;
+
+                _waitMonitor.Signal_Release();
+            }
+
+            private void RecordPendingInterrupt()
+            {
+                s_lock.VerifyIsLocked();
+                _waitMonitor.VerifyIsLocked();
+
+                _isPendingInterrupt = true;
+            }
+
+            public bool CheckAndResetPendingInterrupt
+            {
+                get
+                {
+
+                    if (!_isPendingInterrupt)
+                    {
+                        return false;
+                    }
+                    _isPendingInterrupt = false;
+                    return true;
+                }
+            }
+
+            private bool CheckAndResetPendingInterrupt_NotLocked
+            {
+                get
+                {
+                    s_lock.VerifyIsNotLocked();
+                    _waitMonitor.VerifyIsNotLocked();
+
+                    return Interlocked.CompareExchange(ref _isPendingInterrupt, false, true);
+                }
+            }
+
+            public WaitableObject? LockedMutexesHead
+            {
+                get
+                {
+                    s_lock.VerifyIsLocked();
+                    return _lockedMutexesHead;
+                }
+                set
+                {
+                    s_lock.VerifyIsLocked();
+                    _lockedMutexesHead = value;
+                }
+            }
+
+
+            public void OnThreadExiting()
+            {
+                // Abandon locked mutexes. Acquired mutexes are prepended to the linked list, so the mutexes are abandoned in
+                // last-acquired-first-abandoned order.
+
+                s_lock.Acquire();
+                try
+                {
+                    while (true)
+                    {
+                        WaitableObject? waitableObject = LockedMutexesHead;
+                        if (waitableObject == null)
+                        {
+                            break;
+                        }
+
+                        waitableObject.AbandonMutex();
+                        Debug.Assert(LockedMutexesHead != waitableObject);
+                    }
+                }
+                finally
+                {
+                    s_lock.Release();
+                }
+
+            }
+
+            public sealed class WaitedListNode
+            {
+                /// <summary>
+                /// For <see cref="WaitedListNode"/>s registered with <see cref="WaitableObject"/>s, this provides information
+                /// about the thread that is waiting and the <see cref="WaitableObject"/>s it is waiting upon
+                /// </summary>
+                private readonly ThreadWaitInfo _waitInfo;
+
+                /// <summary>
+                /// Index of the waited object corresponding to this node
+                /// </summary>
+                private readonly int _waitedObjectIndex;
+
+                /// <summary>
+                /// Link in the <see cref="WaitableObject.WaitersHead"/> linked list
+                /// </summary>
+                private WaitedListNode? _previous, _next;
+
+                public WaitedListNode(ThreadWaitInfo waitInfo, int waitedObjectIndex)
+                {
+                    Debug.Assert(waitInfo != null);
+                    Debug.Assert(waitedObjectIndex >= 0);
+                    Debug.Assert(waitedObjectIndex < WaitHandle.MaxWaitHandles);
+
+                    _waitInfo = waitInfo;
+                    _waitedObjectIndex = waitedObjectIndex;
+                }
+
+                public ThreadWaitInfo WaitInfo
+                {
+                    get
+                    {
+                        s_lock.VerifyIsLocked();
+                        return _waitInfo;
+                    }
+                }
+
+                public int WaitedObjectIndex
+                {
+                    get
+                    {
+                        s_lock.VerifyIsLocked();
+                        return _waitedObjectIndex;
+                    }
+                }
+
+                public WaitedListNode? Previous
+                {
+                    get
+                    {
+                        s_lock.VerifyIsLocked();
+                        return _previous;
+                    }
+                }
+
+                public WaitedListNode? Next
+                {
+                    get
+                    {
+                        s_lock.VerifyIsLocked();
+                        return _next;
+                    }
+                }
+
+                // Like Next, but skip nodes registered on the same thread.
+                public WaitedListNode? NextThread
+                {
+                    get
+                    {
+                        s_lock.VerifyIsLocked();
+                        WaitedListNode? ret = _next;
+                        while (ret != null && ReferenceEquals(ret._waitInfo, _waitInfo))
+                        {
+                            ret = ret._next;
+                        }
+                        return ret;
+                    }
+                }
+
+                public void RegisterWait(WaitableObject waitableObject)
+                {
+                    s_lock.VerifyIsLocked();
+                    Debug.Assert(_waitInfo.Thread == Thread.CurrentThread);
+
+                    Debug.Assert(waitableObject != null);
+
+                    Debug.Assert(_previous == null);
+                    Debug.Assert(_next == null);
+
+                    WaitedListNode? tail = waitableObject.WaitersTail;
+                    if (tail != null)
+                    {
+                        _previous = tail;
+                        tail._next = this;
+                    }
+                    else
+                    {
+                        waitableObject.WaitersHead = this;
+                    }
+                    waitableObject.WaitersTail = this;
+                }
+
+                public void UnregisterWait(WaitableObject waitableObject)
+                {
+                    s_lock.VerifyIsLocked();
+                    Debug.Assert(waitableObject != null);
+
+                    WaitedListNode? previous = _previous;
+                    WaitedListNode? next = _next;
+
+                    if (previous != null)
+                    {
+                        previous._next = next;
+                        _previous = null;
+                    }
+                    else
+                    {
+                        Debug.Assert(waitableObject.WaitersHead == this);
+                        waitableObject.WaitersHead = next;
+                    }
+
+                    if (next != null)
+                    {
+                        next._previous = previous;
+                        _next = null;
+                    }
+                    else
+                    {
+                        Debug.Assert(waitableObject.WaitersTail == this);
+                        waitableObject.WaitersTail = previous;
+                    }
+                }
+            }
+
+            private enum WaitSignalState : byte
+            {
+                Waiting,
+                Waiting_Interruptible,
+                NotWaiting,
+                NotWaiting_SignaledToSatisfyWait,
+                NotWaiting_SignaledToSatisfyWaitWithAbandonedMutex,
+                NotWaiting_SignaledToAbortWaitDueToMaximumMutexReacquireCount,
+                NotWaiting_SignaledToInterruptWait
+            }
+        }
+
+        /// <summary>
+        /// A synchronization object that can participate in <see cref="WaitSubsystem"/>'s wait operations.
+        ///
+        /// Used by the wait subsystem on Unix, so this class cannot have any dependencies on the wait subsystem.
+        /// </summary>
+        public sealed class WaitableObject : IWaitableObject
+        {
+            /// <summary>
+            /// Dictionary to look up named waitable objects.  This implementation only supports in-process
+            /// named waitable objects.  Currently only named mutexes are supported.
+            /// </summary>
+            private static Dictionary<string, WaitableObject>? s_namedObjects;
+
+            private readonly WaitableObjectType _type;
+            private int _signalCount;
+            private readonly int _maximumSignalCount;
+            private int _referenceCount;
+            private readonly string? _name;
+
+            /// <summary>
+            /// Only <see cref="Mutex"/> has a thread ownership requirement, and it's a less common type to be used, so
+            /// ownership info is separated to reduce the size. For other types, this is null.
+            /// </summary>
+            private readonly OwnershipInfo? _ownershipInfo;
+
+            private WaitableObject(
+                WaitableObjectType type,
+                int initialSignalCount,
+                int maximumSignalCount,
+                string? name,
+                OwnershipInfo? ownershipInfo)
+            {
+                Debug.Assert(initialSignalCount >= 0);
+                Debug.Assert(maximumSignalCount > 0);
+                Debug.Assert(initialSignalCount <= maximumSignalCount);
+
+                _type = type;
+                _signalCount = initialSignalCount;
+                _maximumSignalCount = maximumSignalCount;
+                _referenceCount = 1;
+                _name = name;
+                _ownershipInfo = ownershipInfo;
+            }
+
+            public static WaitableObject NewEvent(bool initiallySignaled, EventResetMode resetMode)
+            {
+                Debug.Assert((resetMode == EventResetMode.AutoReset) || (resetMode == EventResetMode.ManualReset));
+
+                return
+                    new WaitableObject(
+                        resetMode == EventResetMode.ManualReset
+                            ? WaitableObjectType.ManualResetEvent
+                            : WaitableObjectType.AutoResetEvent,
+                        initiallySignaled ? 1 : 0,
+                        1,
+                        null,
+                        null);
+            }
+
+            public static WaitableObject NewSemaphore(int initialSignalCount, int maximumSignalCount)
+            {
+                return new WaitableObject(WaitableObjectType.Semaphore, initialSignalCount, maximumSignalCount, null, null);
+            }
+
+            public static WaitableObject NewMutex()
+            {
+                return new WaitableObject(WaitableObjectType.Mutex, 1, 1, null, new OwnershipInfo());
+            }
+
+            public static WaitableObject? CreateNamedMutex_Locked(string name, out bool createdNew)
+            {
+                s_lock.VerifyIsLocked();
+
+                s_namedObjects ??= new Dictionary<string, WaitableObject>();
+
+                if (s_namedObjects.TryGetValue(name, out WaitableObject? result))
+                {
+                    createdNew = false;
+                    if (!result.IsMutex)
+                    {
+                        return null;
+                    }
+                    result._referenceCount++;
+                }
+                else
+                {
+                    createdNew = true;
+                    result = new WaitableObject(WaitableObjectType.Mutex, 1, 1, name, new OwnershipInfo());
+                    s_namedObjects.Add(name, result);
+                }
+
+                return result;
+            }
+
+            public static OpenExistingResult OpenNamedMutex(string name, out WaitableObject? result)
+            {
+                s_lock.Acquire();
+                try
+                {
+                    if (s_namedObjects == null || !s_namedObjects.TryGetValue(name, out result))
+                    {
+                        result = null;
+                        return OpenExistingResult.NameNotFound;
+                    }
+                    if (!result.IsMutex)
+                    {
+                        result = null;
+                        return OpenExistingResult.NameInvalid;
+                    }
+                    result._referenceCount++;
+                    return OpenExistingResult.Success;
+                }
+                finally
+                {
+                    s_lock.Release();
+                }
+            }
+
+            public void OnDeleteHandle()
+            {
+                s_lock.Acquire();
+                try
+                {
+                    // Multiple handles may refer to the same named object.  Make sure the object
+                    // is only abandoned once the last handle to it is deleted.  Also, remove the
+                    // object from the named objects dictionary at this point.
+                    _referenceCount--;
+                    if (_referenceCount > 0)
+                    {
+                        return;
+                    }
+                    if (_name != null)
+                    {
+                        s_namedObjects!.Remove(_name);
+                    }
+
+                    if (IsMutex && !IsSignaled)
+                    {
+                        // The multithreaded implementation tracks owned mutexes on the thread.
+                        // Abandon the mutex to remove ownership when the final handle is deleted.
+                        AbandonMutex();
+                    }
+                }
+                finally
+                {
+                    s_lock.Release();
+                }
+            }
+
+            private bool IsEvent
+            {
+                get
+                {
+                    s_lock.VerifyIsLocked();
+
+                    bool result = _type <= WaitableObjectType.AutoResetEvent;
+                    Debug.Assert(!result || _maximumSignalCount == 1);
+                    Debug.Assert(!result || _ownershipInfo == null);
+                    return result;
+                }
+            }
+
+            private bool IsManualResetEvent
+            {
+                get
+                {
+                    s_lock.VerifyIsLocked();
+
+                    bool result = _type == WaitableObjectType.ManualResetEvent;
+                    Debug.Assert(!result || _maximumSignalCount == 1);
+                    Debug.Assert(!result || _ownershipInfo == null);
+                    return result;
+                }
+            }
+
+            private bool IsAutoResetEvent
+            {
+                get
+                {
+                    s_lock.VerifyIsLocked();
+
+                    bool result = _type == WaitableObjectType.AutoResetEvent;
+                    Debug.Assert(!result || _maximumSignalCount == 1);
+                    Debug.Assert(!result || _ownershipInfo == null);
+                    return result;
+                }
+            }
+
+            private bool IsSemaphore
+            {
+                get
+                {
+                    s_lock.VerifyIsLocked();
+
+                    bool result = _type == WaitableObjectType.Semaphore;
+                    Debug.Assert(!result || _maximumSignalCount > 0);
+                    Debug.Assert(!result || _ownershipInfo == null);
+                    return result;
+                }
+            }
+
+            private bool IsMutex
+            {
+                get
+                {
+                    s_lock.VerifyIsLocked();
+
+                    bool result = _type == WaitableObjectType.Mutex;
+                    Debug.Assert(!result || _maximumSignalCount == 1);
+                    Debug.Assert(!result || _ownershipInfo != null);
+                    return result;
+                }
+            }
+
+            private bool IsAbandonedMutex
+            {
+                get
+                {
+                    s_lock.VerifyIsLocked();
+                    return IsMutex && _ownershipInfo != null && _ownershipInfo.IsAbandoned;
+                }
+            }
+
+            private bool IsSignaled
+            {
+                get
+                {
+                    s_lock.VerifyIsLocked();
+
+                    bool isSignaled = _signalCount != 0;
+                    Debug.Assert(isSignaled || !IsMutex || (_ownershipInfo != null && _ownershipInfo.Thread != null));
+                    return isSignaled;
+                }
+            }
+
+            private void AcceptSignal(ThreadWaitInfo waitInfo)
+            {
+                s_lock.VerifyIsLocked();
+                Debug.Assert(IsSignaled);
+
+                switch (_type)
+                {
+                    case WaitableObjectType.ManualResetEvent:
+                        return;
+
+                    case WaitableObjectType.AutoResetEvent:
+                    case WaitableObjectType.Semaphore:
+                        --_signalCount;
+                        return;
+
+                    default:
+                        Debug.Assert(_type == WaitableObjectType.Mutex);
+                        --_signalCount;
+
+                        Debug.Assert(_ownershipInfo!.Thread == null);
+                        _ownershipInfo.AssignOwnership(this, waitInfo);
+                        return;
+                }
+            }
+
+            /// <summary>
+            /// This function does not check for a pending thread interrupt. Callers are expected to do that soon after
+            /// acquiring <see cref="s_lock"/>.
+            /// </summary>
+            public int Wait_Locked(ThreadWaitInfo waitInfo, int timeoutMilliseconds, bool interruptible, ref LockHolder lockHolder)
+            {
+                s_lock.VerifyIsLocked();
+                Debug.Assert(waitInfo != null);
+                Debug.Assert(waitInfo.Thread == Thread.CurrentThread);
+
+                Debug.Assert(timeoutMilliseconds >= -1);
+                Debug.Assert(!interruptible || !waitInfo.CheckAndResetPendingInterrupt);
+
+                if (IsSignaled)
+                {
+                    bool isAbandoned = IsAbandonedMutex;
+                    AcceptSignal(waitInfo);
+                    return isAbandoned ? WaitHandle.WaitAbandoned : WaitHandle.WaitSuccess;
+                }
+
+                if (IsMutex && _ownershipInfo != null && _ownershipInfo.Thread == waitInfo.Thread)
+                {
+                    if (!_ownershipInfo.CanIncrementReacquireCount)
+                    {
+                        lockHolder.Dispose();
+                        throw new OverflowException(SR.Overflow_MutexReacquireCount);
+                    }
+                    _ownershipInfo.IncrementReacquireCount();
+                    return WaitHandle.WaitSuccess;
+                }
+
+                if (timeoutMilliseconds == 0)
+                {
+                    return WaitHandle.WaitTimeout;
+                }
+
+                return WaitUnsignaled(waitInfo, timeoutMilliseconds, interruptible, ref lockHolder);
+            }
+
+            public static int Wait(
+                WaitableObject?[]? waitableObjects,
+                int count,
+                bool waitForAll,
+                ThreadWaitInfo waitInfo,
+                int timeoutMilliseconds,
+                bool interruptible)
+            {
+                s_lock.VerifyIsNotLocked();
+                Debug.Assert(waitInfo != null);
+                Debug.Assert(waitInfo.Thread == Thread.CurrentThread);
+
+                Debug.Assert(waitableObjects != null);
+                Debug.Assert(waitableObjects.Length >= count);
+                Debug.Assert(count > 1);
+                Debug.Assert(timeoutMilliseconds >= -1);
+
+                var lockHolder = new LockHolder(s_lock);
+                try
+                {
+                    if (interruptible && waitInfo.CheckAndResetPendingInterrupt)
+                    {
+                        lockHolder.Dispose();
+                        throw new ThreadInterruptedException();
+                    }
+
+                    if (!waitForAll)
+                    {
+                        // Check if any is already signaled
+                        for (int i = 0; i < count; ++i)
+                        {
+                            WaitableObject waitableObject = waitableObjects[i]!;
+                            Debug.Assert(waitableObject != null);
+
+                            if (waitableObject.IsSignaled)
+                            {
+                                bool isAbandoned = waitableObject.IsAbandonedMutex;
+                                waitableObject.AcceptSignal(waitInfo);
+                                if (isAbandoned)
+                                {
+                                    return WaitHandle.WaitAbandoned + i;
+                                }
+                                return WaitHandle.WaitSuccess + i;
+                            }
+
+                            if (waitableObject.IsMutex)
+                            {
+                                OwnershipInfo ownershipInfo = waitableObject._ownershipInfo!;
+                                if (ownershipInfo.Thread == waitInfo.Thread)
+                                {
+                                    if (!ownershipInfo.CanIncrementReacquireCount)
+                                    {
+                                        lockHolder.Dispose();
+                                        throw new OverflowException(SR.Overflow_MutexReacquireCount);
+                                    }
+                                    ownershipInfo.IncrementReacquireCount();
+                                    return WaitHandle.WaitSuccess + i;
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // Check if all are already signaled
+                        bool areAllSignaled = true;
+                        bool isAnyAbandonedMutex = false;
+                        for (int i = 0; i < count; ++i)
+                        {
+                            WaitableObject waitableObject = waitableObjects[i]!;
+                            Debug.Assert(waitableObject != null);
+
+                            if (waitableObject.IsSignaled)
+                            {
+                                if (!isAnyAbandonedMutex && waitableObject.IsAbandonedMutex)
+                                {
+                                    isAnyAbandonedMutex = true;
+                                }
+                                continue;
+                            }
+
+                            if (waitableObject.IsMutex)
+                            {
+                                OwnershipInfo ownershipInfo = waitableObject._ownershipInfo!;
+                                if (ownershipInfo.Thread == waitInfo.Thread)
+                                {
+                                    if (!ownershipInfo.CanIncrementReacquireCount)
+                                    {
+                                        lockHolder.Dispose();
+                                        throw new OverflowException(SR.Overflow_MutexReacquireCount);
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            areAllSignaled = false;
+                            break;
+                        }
+
+                        if (areAllSignaled)
+                        {
+                            for (int i = 0; i < count; ++i)
+                            {
+                                WaitableObject waitableObject = waitableObjects[i]!;
+                                if (waitableObject.IsSignaled)
+                                {
+                                    waitableObject.AcceptSignal(waitInfo);
+                                    continue;
+                                }
+
+                                Debug.Assert(waitableObject.IsMutex);
+                                OwnershipInfo ownershipInfo = waitableObject._ownershipInfo!;
+                                Debug.Assert(ownershipInfo.Thread == waitInfo.Thread);
+                                ownershipInfo.IncrementReacquireCount();
+                            }
+
+                            if (isAnyAbandonedMutex)
+                            {
+                                lockHolder.Dispose();
+                                throw new AbandonedMutexException();
+                            }
+                            return WaitHandle.WaitSuccess;
+                        }
+                    }
+
+                    if (timeoutMilliseconds == 0)
+                    {
+                        return WaitHandle.WaitTimeout;
+                    }
+
+                    WaitableObject?[] waitedObjects = waitableObjects;
+                    waitableObjects = null; // The threading-specific wait takes over clearing the array.
+                    return WaitUnsignaled(waitedObjects, count, waitForAll, waitInfo, timeoutMilliseconds, interruptible, ref lockHolder);
+                }
+                finally
+                {
+                    lockHolder.Dispose();
+
+                    if (waitableObjects != null)
+                    {
+                        Array.Clear(waitableObjects, 0, count);
+                    }
+                }
+            }
+
+            public void Signal(int count, ref LockHolder lockHolder)
+            {
+                s_lock.VerifyIsLocked();
+                Debug.Assert(count > 0);
+
+                switch (_type)
+                {
+                    case WaitableObjectType.ManualResetEvent:
+                        Debug.Assert(count == 1);
+                        SignalManualResetEvent();
+                        break;
+
+                    case WaitableObjectType.AutoResetEvent:
+                        Debug.Assert(count == 1);
+                        SignalAutoResetEvent();
+                        break;
+
+                    case WaitableObjectType.Semaphore:
+                        SignalSemaphore(count, ref lockHolder);
+                        break;
+
+                    default:
+                        Debug.Assert(count == 1);
+                        SignalMutex(ref lockHolder);
+                        break;
+                }
+            }
+
+            public void SignalEvent(ref LockHolder lockHolder)
+            {
+                s_lock.VerifyIsLocked();
+
+                switch (_type)
+                {
+                    case WaitableObjectType.ManualResetEvent:
+                        SignalManualResetEvent();
+                        break;
+
+                    case WaitableObjectType.AutoResetEvent:
+                        SignalAutoResetEvent();
+                        break;
+
+                    default:
+                        lockHolder.Dispose();
+                        WaitHandle.ThrowInvalidHandleException();
+                        break;
+                }
+            }
+
+            public void UnsignalEvent(ref LockHolder lockHolder)
+            {
+                s_lock.VerifyIsLocked();
+
+                if (!IsEvent)
+                {
+                    lockHolder.Dispose();
+                    WaitHandle.ThrowInvalidHandleException();
+                }
+
+                if (IsSignaled)
+                {
+                    --_signalCount;
+                }
+            }
+
+            public void SignalMutex(ref LockHolder lockHolder)
+            {
+                s_lock.VerifyIsLocked();
+
+                if (!IsMutex)
+                {
+                    lockHolder.Dispose();
+                    WaitHandle.ThrowInvalidHandleException();
+                }
+
+                if (IsSignaled || _ownershipInfo!.Thread != Thread.CurrentThread)
+                {
+                    lockHolder.Dispose();
+                    throw new ApplicationException(SR.Arg_SynchronizationLockException);
+                }
+
+                if (!_ownershipInfo!.TryDecrementReacquireCount())
+                {
+                    SignalMutex(isAbandoned: false);
+                }
+            }
+
+            public void AbandonMutex()
+            {
+                s_lock.VerifyIsLocked();
+
+                Debug.Assert(IsMutex);
+                Debug.Assert(!IsSignaled);
+
+                // Typically, a mutex is abandoned before a thread that owns the mutex exits. However, any thread may
+                // abandon a mutex since any thread may delete a mutex handle. See <see cref="OnDeleteHandle"/>. Although
+                // Windows does not release waiters when a mutex is abandoned by deleting its handle, this implementation
+                // treats that case as abandonment as well and releases waiters, as it's a bit more robust. As the handle
+                // would be deleted shortly afterwards, it would otherwise not be possible to signal the mutex to release
+                // waiters.
+                SignalMutex(isAbandoned: true);
+            }
+
+            private sealed class OwnershipInfo
+            {
+                private int _reacquireCount;
+                private bool _isAbandoned;
+
+                public bool IsAbandoned
+                {
+                    get
+                    {
+                        s_lock.VerifyIsLocked();
+                        return _isAbandoned;
+                    }
+                }
+
+                public bool CanIncrementReacquireCount
+                {
+                    get
+                    {
+                        s_lock.VerifyIsLocked();
+
+                        Debug.Assert(Thread is not null);
+                        Debug.Assert(_reacquireCount >= 0);
+                        Debug.Assert(!_isAbandoned);
+
+                        return _reacquireCount + 1 > _reacquireCount;
+                    }
+                }
+
+                public void IncrementReacquireCount()
+                {
+                    Debug.Assert(CanIncrementReacquireCount);
+                    ++_reacquireCount;
+                }
+
+                public bool TryDecrementReacquireCount()
+                {
+                    s_lock.VerifyIsLocked();
+
+                    Debug.Assert(Thread == System.Threading.Thread.CurrentThread);
+                    Debug.Assert(_reacquireCount >= 0);
+                    Debug.Assert(!_isAbandoned);
+
+                    if (_reacquireCount == 0)
+                    {
+                        return false;
+                    }
+                    --_reacquireCount;
+                    return true;
+                }
+
+                private Thread? _thread;
+                private WaitableObject? _previous;
+                private WaitableObject? _next;
+
+                public Thread? Thread
+                {
+                    get
+                    {
+                        s_lock.VerifyIsLocked();
+                        return _thread;
+                    }
+                }
+
+                public void AssignOwnership(WaitableObject waitableObject, ThreadWaitInfo waitInfo)
+                {
+                    s_lock.VerifyIsLocked();
+
+                    Debug.Assert(waitableObject != null);
+                    Debug.Assert(waitableObject.IsMutex);
+                    Debug.Assert(waitableObject._ownershipInfo == this);
+
+                    Debug.Assert(_thread == null);
+                    Debug.Assert(_reacquireCount == 0);
+                    Debug.Assert(_previous == null);
+                    Debug.Assert(_next == null);
+
+                    _thread = waitInfo.Thread;
+                    _isAbandoned = false;
+
+                    WaitableObject? head = waitInfo.LockedMutexesHead;
+                    if (head != null)
+                    {
+                        _next = head;
+                        head._ownershipInfo!._previous = waitableObject;
+                    }
+                    waitInfo.LockedMutexesHead = waitableObject;
+                }
+
+                public void RelinquishOwnership(WaitableObject waitableObject, bool isAbandoned)
+                {
+                    s_lock.VerifyIsLocked();
+
+                    Debug.Assert(waitableObject != null);
+                    Debug.Assert(waitableObject.IsMutex);
+                    Debug.Assert(waitableObject._ownershipInfo == this);
+
+                    Debug.Assert(_thread != null);
+                    ThreadWaitInfo waitInfo = _thread.WaitInfo;
+                    Debug.Assert(isAbandoned ? _reacquireCount >= 0 : _reacquireCount == 0);
+                    Debug.Assert(!_isAbandoned);
+
+                    _thread = null;
+                    if (isAbandoned)
+                    {
+                        _reacquireCount = 0;
+                        _isAbandoned = isAbandoned;
+                    }
+
+                    WaitableObject? previous = _previous;
+                    WaitableObject? next = _next;
+
+                    if (previous != null)
+                    {
+                        previous._ownershipInfo!._next = next;
+                        _previous = null;
+                    }
+                    else
+                    {
+                        Debug.Assert(waitInfo.LockedMutexesHead == waitableObject);
+                        waitInfo.LockedMutexesHead = next;
+                    }
+
+                    if (next != null)
+                    {
+                        next._ownershipInfo!._previous = previous;
+                        _next = null;
+                    }
+                }
+            }
+
+            private enum WaitableObjectType : byte
+            {
+                ManualResetEvent,
+                AutoResetEvent,
+                Semaphore,
+                Mutex
+            }
+
+            /// <summary>
+            /// Linked list of information about waiting threads
+            /// </summary>
+            private ThreadWaitInfo.WaitedListNode? _waitersHead, _waitersTail;
+
+            private int WaitUnsignaled(ThreadWaitInfo waitInfo, int timeoutMilliseconds, bool interruptible, ref LockHolder lockHolder)
+            {
+                WaitableObject?[] waitableObjects = waitInfo.GetWaitedObjectArray(1);
+                waitableObjects[0] = this;
+                waitInfo.RegisterWait(1, isWaitForAll: false);
+                return waitInfo.Wait(timeoutMilliseconds, interruptible, isSleep: false, ref lockHolder);
+            }
+
+            private static int WaitUnsignaled(
+                WaitableObject?[] waitableObjects,
+                int count,
+                bool waitForAll,
+                ThreadWaitInfo waitInfo,
+                int timeoutMilliseconds,
+                bool interruptible,
+                ref LockHolder lockHolder)
+            {
+                Debug.Assert(waitableObjects.Length >= count);
+                waitInfo.RegisterWait(count, waitForAll);
+                return waitInfo.Wait(timeoutMilliseconds, interruptible, isSleep: false, ref lockHolder);
+            }
+            public ThreadWaitInfo.WaitedListNode? WaitersHead
+            {
+                get
+                {
+                    s_lock.VerifyIsLocked();
+                    return _waitersHead;
+                }
+                set
+                {
+                    s_lock.VerifyIsLocked();
+                    _waitersHead = value;
+                }
+            }
+
+            public ThreadWaitInfo.WaitedListNode? WaitersTail
+            {
+                get
+                {
+                    s_lock.VerifyIsLocked();
+                    return _waitersTail;
+                }
+                set
+                {
+                    s_lock.VerifyIsLocked();
+                    _waitersTail = value;
+                }
+            }
+
+            public static bool WouldWaitForAllBeSatisfiedOrAborted(
+                Thread waitingThread,
+                WaitableObject?[] waitedObjects,
+                int waitedCount,
+                int signaledWaitedObjectIndex,
+                ref bool wouldAnyMutexReacquireCountOverflow,
+                ref bool isAnyAbandonedMutex)
+            {
+                s_lock.VerifyIsLocked();
+                Debug.Assert(waitingThread != null);
+                Debug.Assert(waitingThread != Thread.CurrentThread);
+                Debug.Assert(waitedObjects != null);
+                Debug.Assert(waitedObjects.Length >= waitedCount);
+                Debug.Assert(waitedCount > 1);
+                Debug.Assert(signaledWaitedObjectIndex >= 0);
+                Debug.Assert(signaledWaitedObjectIndex <= WaitHandle.MaxWaitHandles);
+                Debug.Assert(!wouldAnyMutexReacquireCountOverflow);
+
+                for (int i = 0; i < waitedCount; ++i)
+                {
+                    Debug.Assert(waitedObjects[i] != null);
+                    if (i == signaledWaitedObjectIndex)
+                    {
+                        continue;
+                    }
+
+                    WaitableObject waitedObject = waitedObjects[i]!;
+                    if (waitedObject.IsSignaled)
+                    {
+                        if (!isAnyAbandonedMutex && waitedObject.IsAbandonedMutex)
+                        {
+                            isAnyAbandonedMutex = true;
+                        }
+                        continue;
+                    }
+
+                    if (waitedObject.IsMutex)
+                    {
+                        OwnershipInfo ownershipInfo = waitedObject._ownershipInfo!;
+                        if (ownershipInfo.Thread == waitingThread)
+                        {
+                            if (!ownershipInfo.CanIncrementReacquireCount)
+                            {
+                                // This will cause the wait to be aborted without accepting any signals
+                                wouldAnyMutexReacquireCountOverflow = true;
+                                return true;
+                            }
+                            continue;
+                        }
+                    }
+
+                    return false;
+                }
+
+                return true;
+            }
+
+            public static void SatisfyWaitForAll(
+                ThreadWaitInfo waitInfo,
+                WaitableObject?[] waitedObjects,
+                int waitedCount,
+                int signaledWaitedObjectIndex)
+            {
+                s_lock.VerifyIsLocked();
+                Debug.Assert(waitInfo != null);
+                Debug.Assert(waitInfo.Thread != Thread.CurrentThread);
+                Debug.Assert(waitedObjects != null);
+                Debug.Assert(waitedObjects.Length >= waitedCount);
+                Debug.Assert(waitedCount > 1);
+                Debug.Assert(signaledWaitedObjectIndex >= 0);
+                Debug.Assert(signaledWaitedObjectIndex <= WaitHandle.MaxWaitHandles);
+
+                for (int i = 0; i < waitedCount; ++i)
+                {
+                    Debug.Assert(waitedObjects[i] != null);
+                    if (i == signaledWaitedObjectIndex)
+                    {
+                        continue;
+                    }
+
+                    WaitableObject waitedObject = waitedObjects[i]!;
+                    if (waitedObject.IsSignaled)
+                    {
+                        waitedObject.AcceptSignal(waitInfo);
+                        continue;
+                    }
+
+                    Debug.Assert(waitedObject.IsMutex);
+                    OwnershipInfo ownershipInfo = waitedObject._ownershipInfo!;
+                    Debug.Assert(ownershipInfo.Thread == waitInfo.Thread);
+                    ownershipInfo.IncrementReacquireCount();
+                }
+            }
+
+            private void SignalManualResetEvent()
+            {
+                s_lock.VerifyIsLocked();
+                Debug.Assert(IsManualResetEvent);
+
+                if (IsSignaled)
+                {
+                    return;
+                }
+
+                for (ThreadWaitInfo.WaitedListNode? waiterNode = _waitersHead, nextWaiterNode;
+                    waiterNode != null;
+                    waiterNode = nextWaiterNode)
+                {
+                    // Signaling a waiter will unregister the waiter node, so keep the next node before trying
+                    nextWaiterNode = waiterNode.NextThread;
+
+                    waiterNode.WaitInfo.TrySignalToSatisfyWait(waiterNode, isAbandonedMutex: false);
+                }
+
+                _signalCount = 1;
+            }
+
+            private void SignalAutoResetEvent()
+            {
+                s_lock.VerifyIsLocked();
+                Debug.Assert(IsAutoResetEvent);
+
+                if (IsSignaled)
+                {
+                    return;
+                }
+
+                for (ThreadWaitInfo.WaitedListNode? waiterNode = _waitersHead, nextWaiterNode;
+                    waiterNode != null;
+                    waiterNode = nextWaiterNode)
+                {
+                    // Signaling a waiter will unregister the waiter node, but it may only abort the wait without satisfying the
+                    // wait, in which case we would try to signal another waiter. So, keep the next node before trying.
+                    nextWaiterNode = waiterNode.NextThread;
+
+                    if (waiterNode.WaitInfo.TrySignalToSatisfyWait(waiterNode, isAbandonedMutex: false))
+                    {
+                        return;
+                    }
+                }
+
+                _signalCount = 1;
+            }
+
+            public int SignalSemaphore(int count, ref LockHolder lockHolder)
+            {
+                s_lock.VerifyIsLocked();
+                Debug.Assert(count > 0);
+
+                if (!IsSemaphore)
+                {
+                    lockHolder.Dispose();
+                    WaitHandle.ThrowInvalidHandleException();
+                }
+
+                int oldSignalCount = _signalCount;
+                Debug.Assert(oldSignalCount <= _maximumSignalCount);
+                if (count > _maximumSignalCount - oldSignalCount)
+                {
+                    lockHolder.Dispose();
+                    throw new SemaphoreFullException();
+                }
+
+                if (oldSignalCount != 0)
+                {
+                    _signalCount = oldSignalCount + count;
+                    return oldSignalCount;
+                }
+
+                for (ThreadWaitInfo.WaitedListNode? waiterNode = _waitersHead, nextWaiterNode;
+                    waiterNode != null;
+                    waiterNode = nextWaiterNode)
+                {
+                    // Signaling the waiter will unregister the waiter node, so keep the next node before trying
+                    nextWaiterNode = waiterNode.NextThread;
+
+                    if (waiterNode.WaitInfo.TrySignalToSatisfyWait(waiterNode, isAbandonedMutex: false) && --count == 0)
+                    {
+                        return oldSignalCount;
+                    }
+                }
+
+                _signalCount = count;
+                return oldSignalCount;
+            }
+
+            private void SignalMutex(bool isAbandoned)
+            {
+                s_lock.VerifyIsLocked();
+
+                Debug.Assert(IsMutex);
+                Debug.Assert(!IsSignaled);
+                Debug.Assert(_ownershipInfo != null);
+
+                _ownershipInfo.RelinquishOwnership(this, isAbandoned);
+
+                for (ThreadWaitInfo.WaitedListNode? waiterNode = _waitersHead, nextWaiterNode;
+                    waiterNode != null;
+                    waiterNode = nextWaiterNode)
+                {
+                    // Signaling a waiter will unregister the waiter node, but it may only abort the wait without satisfying the
+                    // wait, in which case we would try to signal another waiter. So, keep the next node before trying.
+                    nextWaiterNode = waiterNode.NextThread;
+
+                    ThreadWaitInfo waitInfo = waiterNode.WaitInfo;
+                    if (waitInfo.TrySignalToSatisfyWait(waiterNode, isAbandoned))
+                    {
+                        _ownershipInfo.AssignOwnership(this, waitInfo);
+                        return;
+                    }
+                }
+
+                _signalCount = 1;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Wraps a non-recursive mutex and condition.
+    ///
+    /// Used by the other threading subsystems, so this type cannot have any dependencies on them.
+    /// </summary>
+    [StructLayout(LayoutKind.Auto)]
+    internal struct LowLevelMonitor
+    {
+        public void Dispose()
+        {
+            DisposeCore();
+        }
+
+        public void VerifyIsLocked()
+        {
+        }
+
+        public void VerifyIsNotLocked()
+        {
+        }
+
+        public void Acquire()
+        {
+            AcquireCore();
+        }
+
+        public void Release()
+        {
+            ReleaseCore();
+        }
+
+        public void Wait()
+        {
+            WaitCore();
+        }
+
+        public bool Wait(int timeoutMilliseconds)
+        {
+            Debug.Assert(timeoutMilliseconds >= -1);
+
+            return WaitCore(timeoutMilliseconds);
+        }
+
+        public void Signal_Release()
+        {
+            Signal_ReleaseCore();
+        }
+
+        // The following methods typical in a monitor are omitted since they are currently not necessary for the way in which
+        // this class is used:
+        //   - TryAcquire
+        //   - Signal (use Signal_Release instead)
+        //   - SignalAll
+
+        private IntPtr _nativeMonitor;
+
+        public void Initialize()
+        {
+            _nativeMonitor = Interop.Sys.LowLevelMonitor_Create();
+            if (_nativeMonitor == IntPtr.Zero)
+            {
+                throw new OutOfMemoryException();
+            }
+        }
+
+        private void DisposeCore()
+        {
+            if (_nativeMonitor == IntPtr.Zero)
+            {
+                return;
+            }
+
+            Interop.Sys.LowLevelMonitor_Destroy(_nativeMonitor);
+            _nativeMonitor = IntPtr.Zero;
+        }
+
+        private void AcquireCore()
+        {
+            Interop.Sys.LowLevelMonitor_Acquire(_nativeMonitor);
+        }
+
+        private void ReleaseCore()
+        {
+            Interop.Sys.LowLevelMonitor_Release(_nativeMonitor);
+        }
+
+        private void WaitCore()
+        {
+            Interop.Sys.LowLevelMonitor_Wait(_nativeMonitor);
+        }
+
+        private bool WaitCore(int timeoutMilliseconds)
+        {
+            Debug.Assert(timeoutMilliseconds >= -1);
+
+            if (timeoutMilliseconds < 0)
+            {
+                WaitCore();
+                return true;
+            }
+
+            return Interop.Sys.LowLevelMonitor_TimedWait(_nativeMonitor, timeoutMilliseconds);
+        }
+
+        private void Signal_ReleaseCore()
+        {
+            Interop.Sys.LowLevelMonitor_Signal_Release(_nativeMonitor);
         }
     }
     internal enum MutexTryAcquireLockResult : byte
@@ -415,7 +3373,6 @@ namespace System.Threading
         // - Do not add or rearrange fields as the EE depends on this layout.
 
         private SafeWaitHandle? _waitHandle;
-        private bool _disposed;
 
         [ThreadStatic]
         private static SafeWaitHandle?[]? t_safeWaitHandlesForRent;
@@ -440,6 +3397,33 @@ namespace System.Threading
         {
         }
 
+        [Obsolete("WaitHandle.Handle has been deprecated. Use the SafeWaitHandle property instead.")]
+        public virtual IntPtr Handle
+        {
+            get => _waitHandle == null ? InvalidHandle : _waitHandle.DangerousGetHandle();
+            set
+            {
+                if (value == InvalidHandle)
+                {
+                    // This line leaks a handle.  However, it's currently
+                    // not perfectly clear what the right behavior is here
+                    // anyways.  This preserves Everett behavior.  We should
+                    // ideally do these things:
+                    // *) Expose a settable SafeHandle property on WaitHandle.
+                    // *) Expose a settable OwnsHandle property on SafeHandle.
+                    if (_waitHandle != null)
+                    {
+                        _waitHandle.SetHandleAsInvalid();
+                        _waitHandle = null;
+                    }
+                }
+                else
+                {
+                    _waitHandle = new SafeWaitHandle(value, true);
+                }
+            }
+        }
+
         [AllowNull]
         public SafeWaitHandle SafeWaitHandle
         {
@@ -455,44 +3439,10 @@ namespace System.Threading
             return (int)timeoutMilliseconds;
         }
 
-        public virtual bool WaitOne(int millisecondsTimeout)
-        {
-            ArgumentOutOfRangeException.ThrowIfLessThan(millisecondsTimeout, -1);
-            return WaitOneNoCheck(millisecondsTimeout);
-        }
-
-        public virtual bool WaitOne(TimeSpan timeout) => WaitOneNoCheck(ToTimeoutMilliseconds(timeout));
-
-        public virtual bool WaitOne() => WaitOneNoCheck(Timeout.Infinite);
-
-        internal bool WaitOneNoCheck(int millisecondsTimeout, bool useTrivialWaits = false)
-        {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            if (TryConsumeSignal())
-            {
-                return true;
-            }
-            if (millisecondsTimeout == 0)
-            {
-                return false;
-            }
-            RuntimeFeature.ThrowIfMultithreadingIsNotSupported();
-            throw new PlatformNotSupportedException();
-        }
-
-        private protected abstract bool TryConsumeSignal();
-
-        internal static int WaitMultipleIgnoringSyncContext(nint[] waitHandles, bool waitAll, int millisecondsTimeout)
-        {
-            RuntimeFeature.ThrowIfBlockingIsNotSupported(millisecondsTimeout);
-            throw new PlatformNotSupportedException();
-        }
-
         public virtual void Close() => Dispose();
 
         protected virtual void Dispose(bool explicitDisposing)
         {
-            _disposed = true;
             _waitHandle?.Close();
         }
 
@@ -502,23 +3452,414 @@ namespace System.Threading
             GC.SuppressFinalize(this);
         }
 
+        public virtual bool WaitOne(int millisecondsTimeout)
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThan(millisecondsTimeout, -1);
+
+            return WaitOneNoCheck(millisecondsTimeout);
+        }
+
+        internal bool WaitOneNoCheck(int millisecondsTimeout, bool useTrivialWaits = false)
+        {
+            Debug.Assert(millisecondsTimeout >= -1);
+
+            // The field value is modifiable via the public <see cref="WaitHandle.SafeWaitHandle"/> property, save it locally
+            // to ensure that one instance is used in all places in this method
+            SafeWaitHandle? waitHandle = _waitHandle;
+            ObjectDisposedException.ThrowIf(waitHandle is null, this);
+
+            bool success = false;
+            try
+            {
+                waitHandle.DangerousAddRef(ref success);
+
+                int waitResult = WaitFailed;
+
+                // Check if the wait should be forwarded to a SynchronizationContext wait override. Trivial waits don't allow
+                // reentrance or interruption, and are not forwarded.
+                bool usedSyncContextWait = false;
+                if (!useTrivialWaits)
+                {
+                    SynchronizationContext? context = SynchronizationContext.Current;
+                    if (context != null && context.IsWaitNotificationRequired())
+                    {
+                        usedSyncContextWait = true;
+                        waitResult = context.Wait([waitHandle.DangerousGetHandle()], false, millisecondsTimeout);
+                    }
+                }
+
+                if (!usedSyncContextWait)
+                {
+                    waitResult = WaitOneCore(
+                        waitHandle.DangerousGetHandle(),
+                        millisecondsTimeout,
+                        useTrivialWaits);
+                }
+
+                if (waitResult == WaitAbandoned)
+                {
+                    throw new AbandonedMutexException();
+                }
+
+                return waitResult != WaitTimeout;
+            }
+            finally
+            {
+                if (success)
+                    waitHandle.DangerousRelease();
+            }
+        }
+
+        // Returns an array for storing SafeWaitHandles in WaitMultiple calls. The array
+        // is reused for subsequent calls to reduce GC pressure.
+        private static SafeWaitHandle?[] RentSafeWaitHandleArray(int capacity)
+        {
+            SafeWaitHandle?[]? safeWaitHandles = t_safeWaitHandlesForRent;
+
+            t_safeWaitHandlesForRent = null;
+
+            // t_safeWaitHandlesForRent can be null when it was not initialized yet or
+            // if a re-entrant wait is performed and the array is already rented. In
+            // that case we just allocate a new one and reuse it as necessary.
+            int currentLength = (safeWaitHandles != null) ? safeWaitHandles.Length : 0;
+            if (currentLength < capacity)
+            {
+                safeWaitHandles = new SafeWaitHandle[Math.Max(capacity,
+                    Math.Min(MaxWaitHandles, 2 * currentLength))];
+            }
+
+            return safeWaitHandles!;
+        }
+
+        private static void ReturnSafeWaitHandleArray(SafeWaitHandle?[]? safeWaitHandles)
+            => t_safeWaitHandlesForRent = safeWaitHandles;
+
+        /// <summary>
+        /// Obtains all of the corresponding safe wait handles and adds a ref to each. Since the <see cref="SafeWaitHandle"/>
+        /// property is publicly modifiable, this makes sure that we add and release refs one the same set of safe wait
+        /// handles to keep them alive during a multi-wait operation.
+        /// </summary>
+        private static void ObtainSafeWaitHandles(
+            ReadOnlySpan<WaitHandle> waitHandles,
+            Span<SafeWaitHandle?> safeWaitHandles,
+            Span<IntPtr> unsafeWaitHandles)
+        {
+            Debug.Assert(waitHandles.Length > 0);
+            Debug.Assert(waitHandles.Length <= MaxWaitHandles);
+
+            bool lastSuccess = true;
+            SafeWaitHandle? lastSafeWaitHandle = null;
+            try
+            {
+                for (int i = 0; i < waitHandles.Length; ++i)
+                {
+                    WaitHandle waitHandle = waitHandles[i] ?? throw new ArgumentNullException($"waitHandles[{i}]", SR.ArgumentNull_ArrayElement);
+                    SafeWaitHandle? safeWaitHandle = waitHandle._waitHandle;
+                    ObjectDisposedException.ThrowIf(safeWaitHandle is null, waitHandle); // throw ObjectDisposedException for backward compatibility even though it is not representative of the issue
+
+                    lastSafeWaitHandle = safeWaitHandle;
+                    lastSuccess = false;
+                    safeWaitHandle.DangerousAddRef(ref lastSuccess);
+                    safeWaitHandles[i] = safeWaitHandle;
+                    unsafeWaitHandles[i] = safeWaitHandle.DangerousGetHandle();
+                }
+            }
+            catch
+            {
+                for (int i = 0; i < waitHandles.Length; ++i)
+                {
+                    SafeWaitHandle? safeWaitHandle = safeWaitHandles[i];
+                    if (safeWaitHandle == null)
+                    {
+                        break;
+                    }
+                    safeWaitHandle.DangerousRelease();
+                    safeWaitHandles[i] = null;
+                    if (safeWaitHandle == lastSafeWaitHandle)
+                    {
+                        lastSafeWaitHandle = null;
+                        lastSuccess = true;
+                    }
+                }
+
+                if (!lastSuccess)
+                {
+                    Debug.Assert(lastSafeWaitHandle != null);
+                    lastSafeWaitHandle.DangerousRelease();
+                }
+
+                throw;
+            }
+        }
+
+        private static int WaitMultiple(WaitHandle[] waitHandles, bool waitAll, int millisecondsTimeout)
+        {
+            ArgumentNullException.ThrowIfNull(waitHandles);
+
+            return WaitMultiple(new ReadOnlySpan<WaitHandle>(waitHandles), waitAll, millisecondsTimeout);
+        }
+
+        private static unsafe int WaitMultiple(ReadOnlySpan<WaitHandle> waitHandles, bool waitAll, int millisecondsTimeout)
+        {
+            if (waitHandles.Length == 0)
+            {
+                throw new ArgumentException(SR.Argument_EmptyWaithandleArray, nameof(waitHandles));
+            }
+            if (waitHandles.Length > MaxWaitHandles)
+            {
+                throw new NotSupportedException(SR.NotSupported_MaxWaitHandles);
+            }
+            ArgumentOutOfRangeException.ThrowIfLessThan(millisecondsTimeout, -1);
+
+            SynchronizationContext? context = SynchronizationContext.Current;
+            bool useWaitContext = context != null && context.IsWaitNotificationRequired();
+            SafeWaitHandle?[]? safeWaitHandles = RentSafeWaitHandleArray(waitHandles.Length);
+
+            try
+            {
+                int waitResult;
+
+                if (useWaitContext)
+                {
+                    IntPtr[] unsafeWaitHandles = new IntPtr[waitHandles.Length];
+                    ObtainSafeWaitHandles(waitHandles, safeWaitHandles, unsafeWaitHandles);
+                    waitResult = context!.Wait(unsafeWaitHandles, waitAll, millisecondsTimeout);
+                }
+                else
+                {
+                    Span<IntPtr> unsafeWaitHandles = stackalloc IntPtr[waitHandles.Length];
+                    ObtainSafeWaitHandles(waitHandles, safeWaitHandles, unsafeWaitHandles);
+                    waitResult = WaitMultipleIgnoringSyncContext(unsafeWaitHandles, waitAll, millisecondsTimeout);
+                }
+
+                if (waitResult >= WaitAbandoned && waitResult < WaitAbandoned + waitHandles.Length)
+                {
+                    if (waitAll)
+                    {
+                        // In the case of WaitAll the OS will only provide the information that mutex was abandoned.
+                        // It won't tell us which one.  So we can't set the Index or provide access to the Mutex
+                        throw new AbandonedMutexException();
+                    }
+
+                    waitResult -= WaitAbandoned;
+                    throw new AbandonedMutexException(waitResult, waitHandles[waitResult]);
+                }
+
+                return waitResult;
+            }
+            finally
+            {
+                for (int i = 0; i < waitHandles.Length; ++i)
+                {
+                    if (safeWaitHandles[i] is SafeWaitHandle swh)
+                    {
+                        swh.DangerousRelease();
+                        safeWaitHandles[i] = null;
+                    }
+                }
+
+                ReturnSafeWaitHandleArray(safeWaitHandles);
+            }
+        }
+
+        private static unsafe int WaitAnyMultiple(ReadOnlySpan<SafeWaitHandle> safeWaitHandles, int millisecondsTimeout)
+        {
+            // - Callers are expected to manage the lifetimes of the safe wait handles such that they would not expire during
+            //   this wait
+            // - If the safe wait handle that satisfies the wait is an abandoned mutex, the wait result would reflect that and
+            //   handling of that is left up to the caller
+
+            Debug.Assert(safeWaitHandles.Length != 0);
+            Debug.Assert(safeWaitHandles.Length <= MaxWaitHandles);
+            Debug.Assert(millisecondsTimeout >= -1);
+
+            SynchronizationContext? context = SynchronizationContext.Current;
+            bool useWaitContext = context != null && context.IsWaitNotificationRequired();
+
+            int waitResult;
+            if (useWaitContext)
+            {
+                IntPtr[] unsafeWaitHandles = new IntPtr[safeWaitHandles.Length];
+                for (int i = 0; i < safeWaitHandles.Length; ++i)
+                {
+                    Debug.Assert(safeWaitHandles[i] != null);
+                    unsafeWaitHandles[i] = safeWaitHandles[i].DangerousGetHandle();
+                }
+                waitResult = context!.Wait(unsafeWaitHandles, false, millisecondsTimeout);
+            }
+            else
+            {
+                Span<IntPtr> unsafeWaitHandles = stackalloc IntPtr[safeWaitHandles.Length];
+                for (int i = 0; i < safeWaitHandles.Length; ++i)
+                {
+                    Debug.Assert(safeWaitHandles[i] != null);
+                    unsafeWaitHandles[i] = safeWaitHandles[i].DangerousGetHandle();
+                }
+                waitResult = WaitMultipleIgnoringSyncContext(unsafeWaitHandles, false, millisecondsTimeout);
+            }
+
+            return waitResult;
+        }
+
+        internal static int WaitMultipleIgnoringSyncContext(ReadOnlySpan<IntPtr> handles, bool waitAll, int millisecondsTimeout)
+        {
+            return WaitMultipleIgnoringSyncContextCore(handles, waitAll, millisecondsTimeout);
+        }
+
+        private static bool SignalAndWait(WaitHandle toSignal, WaitHandle toWaitOn, int millisecondsTimeout)
+        {
+            ArgumentNullException.ThrowIfNull(toSignal);
+            ArgumentNullException.ThrowIfNull(toWaitOn);
+
+            ArgumentOutOfRangeException.ThrowIfLessThan(millisecondsTimeout, -1);
+
+            // The field value is modifiable via the public <see cref="WaitHandle.SafeWaitHandle"/> property, save it locally
+            // to ensure that one instance is used in all places in this method
+            SafeWaitHandle? safeWaitHandleToSignal = toSignal._waitHandle;
+            SafeWaitHandle? safeWaitHandleToWaitOn = toWaitOn._waitHandle;
+            ObjectDisposedException.ThrowIf(safeWaitHandleToSignal is null, toSignal); // throw ObjectDisposedException for backward compatibility even though it is not representative of the issue
+            ObjectDisposedException.ThrowIf(safeWaitHandleToWaitOn is null, toWaitOn);
+
+            bool successSignal = false, successWait = false;
+            try
+            {
+                safeWaitHandleToSignal.DangerousAddRef(ref successSignal);
+                safeWaitHandleToWaitOn.DangerousAddRef(ref successWait);
+
+                int ret = SignalAndWaitCore(
+                    safeWaitHandleToSignal.DangerousGetHandle(),
+                    safeWaitHandleToWaitOn.DangerousGetHandle(),
+                    millisecondsTimeout);
+
+                if (ret == WaitAbandoned)
+                {
+                    throw new AbandonedMutexException();
+                }
+
+                return ret != WaitTimeout;
+            }
+            finally
+            {
+                if (successWait)
+                {
+                    safeWaitHandleToWaitOn.DangerousRelease();
+                }
+                if (successSignal)
+                {
+                    safeWaitHandleToSignal.DangerousRelease();
+                }
+            }
+        }
+
         internal static void ThrowInvalidHandleException()
         {
             var ex = new InvalidOperationException(SR.InvalidOperation_InvalidHandle);
             ex.HResult = HResults.E_HANDLE;
             throw ex;
         }
-    }
-    public partial class EventWaitHandle : WaitHandle
-    {
-        private readonly EventResetMode _mode;
-        private int _signaled;
 
+        public virtual bool WaitOne(TimeSpan timeout) => WaitOneNoCheck(ToTimeoutMilliseconds(timeout));
+        public virtual bool WaitOne() => WaitOneNoCheck(-1);
+        public virtual bool WaitOne(int millisecondsTimeout, bool exitContext) => WaitOne(millisecondsTimeout);
+        public virtual bool WaitOne(TimeSpan timeout, bool exitContext) => WaitOneNoCheck(ToTimeoutMilliseconds(timeout));
+
+        public static bool WaitAll(WaitHandle[] waitHandles, int millisecondsTimeout) =>
+            WaitMultiple(waitHandles, true, millisecondsTimeout) != WaitTimeout;
+        public static bool WaitAll(WaitHandle[] waitHandles, TimeSpan timeout) =>
+            WaitMultiple(waitHandles, true, ToTimeoutMilliseconds(timeout)) != WaitTimeout;
+        public static bool WaitAll(WaitHandle[] waitHandles) =>
+            WaitMultiple(waitHandles, true, -1) != WaitTimeout;
+        public static bool WaitAll(WaitHandle[] waitHandles, int millisecondsTimeout, bool exitContext) =>
+            WaitMultiple(waitHandles, true, millisecondsTimeout) != WaitTimeout;
+        public static bool WaitAll(WaitHandle[] waitHandles, TimeSpan timeout, bool exitContext) =>
+            WaitMultiple(waitHandles, true, ToTimeoutMilliseconds(timeout)) != WaitTimeout;
+
+        public static int WaitAny(WaitHandle[] waitHandles, int millisecondsTimeout) =>
+            WaitMultiple(waitHandles, false, millisecondsTimeout);
+        internal static int WaitAny(ReadOnlySpan<SafeWaitHandle> safeWaitHandles, int millisecondsTimeout) =>
+            WaitAnyMultiple(safeWaitHandles, millisecondsTimeout);
+        internal static int WaitAny(ReadOnlySpan<WaitHandle> waitHandles, int millisecondsTimeout) =>
+            WaitMultiple(waitHandles, false, millisecondsTimeout);
+        public static int WaitAny(WaitHandle[] waitHandles, TimeSpan timeout) =>
+            WaitMultiple(waitHandles, false, ToTimeoutMilliseconds(timeout));
+        public static int WaitAny(WaitHandle[] waitHandles) =>
+            WaitMultiple(waitHandles, false, -1);
+        public static int WaitAny(WaitHandle[] waitHandles, int millisecondsTimeout, bool exitContext) =>
+            WaitMultiple(waitHandles, false, millisecondsTimeout);
+        public static int WaitAny(WaitHandle[] waitHandles, TimeSpan timeout, bool exitContext) =>
+            WaitMultiple(waitHandles, false, ToTimeoutMilliseconds(timeout));
+
+        public static bool SignalAndWait(WaitHandle toSignal, WaitHandle toWaitOn) =>
+            SignalAndWait(toSignal, toWaitOn, -1);
+        public static bool SignalAndWait(WaitHandle toSignal, WaitHandle toWaitOn, TimeSpan timeout, bool exitContext) =>
+            SignalAndWait(toSignal, toWaitOn, ToTimeoutMilliseconds(timeout));
+        public static bool SignalAndWait(WaitHandle toSignal, WaitHandle toWaitOn, int millisecondsTimeout, bool exitContext) =>
+            SignalAndWait(toSignal, toWaitOn, millisecondsTimeout);
+
+        private static int WaitOneCore(IntPtr handle, int millisecondsTimeout, bool useTrivialWaits) =>
+            WaitSubsystem.Wait(handle, millisecondsTimeout, interruptible: !useTrivialWaits);
+
+        private static int WaitMultipleIgnoringSyncContextCore(ReadOnlySpan<IntPtr> handles, bool waitAll, int millisecondsTimeout) =>
+            WaitSubsystem.Wait(handles, waitAll, millisecondsTimeout);
+
+        private static int SignalAndWaitCore(IntPtr handleToSignal, IntPtr handleToWaitOn, int millisecondsTimeout) =>
+            WaitSubsystem.SignalAndWait(handleToSignal, handleToWaitOn, millisecondsTimeout);
+    }
+
+    public class EventWaitHandle : WaitHandle
+    {
         public EventWaitHandle(bool initialState, EventResetMode mode)
         {
-            ValidateMode(mode);
-            _mode = mode;
-            _signaled = initialState ? 1 : 0;
+            CreateEventCore(initialState, mode);
+        }
+
+        /// <summary>
+        /// Creates a named or unnamed event, or opens a named event if a event with the name already exists.
+        /// </summary>
+        /// <param name="initialState">True to initially set the event to a signaled state; false otherwise.</param>
+        /// <param name="mode">Indicates whether the event resets automatically or manually.</param>
+        /// <param name="name">
+        /// The name, if the event is to be shared with other processes; otherwise, null or an empty string.
+        /// </param>
+        /// <param name="options">
+        /// Options for the named event. Defaulted options, such as when passing 'options: default' in C#, are
+        /// 'CurrentUserOnly = true' and 'CurrentSessionOnly = true'. For more information, see 'NamedWaitHandleOptions'. The
+        /// specified options may affect the namespace for the name, and access to the underlying event object.
+        /// </param>
+        public EventWaitHandle(bool initialState, EventResetMode mode, string? name, NamedWaitHandleOptions options)
+        {
+            CreateEventCore(initialState, mode, name, new(options), out _);
+        }
+
+        public EventWaitHandle(bool initialState, EventResetMode mode, string? name)
+        {
+            CreateEventCore(initialState, mode, name, options: default, out _);
+        }
+
+        /// <summary>
+        /// Creates a named or unnamed event, or opens a named event if a event with the name already exists.
+        /// </summary>
+        /// <param name="initialState">True to initially set the event to a signaled state; false otherwise.</param>
+        /// <param name="mode">Indicates whether the event resets automatically or manually.</param>
+        /// <param name="name">
+        /// The name, if the event is to be shared with other processes; otherwise, null or an empty string.
+        /// </param>
+        /// <param name="options">
+        /// Options for the named event. Defaulted options, such as when passing 'options: default' in C#, are
+        /// 'CurrentUserOnly = true' and 'CurrentSessionOnly = true'. For more information, see 'NamedWaitHandleOptions'. The
+        /// specified options may affect the namespace for the name, and access to the underlying event object.
+        /// </param>
+        /// <param name="createdNew">
+        /// True if the event was created; false if an existing named event was opened.
+        /// </param>
+        public EventWaitHandle(bool initialState, EventResetMode mode, string? name, NamedWaitHandleOptions options, out bool createdNew)
+        {
+            CreateEventCore(initialState, mode, name, new(options), out createdNew);
+        }
+
+        public EventWaitHandle(bool initialState, EventResetMode mode, string? name, out bool createdNew)
+        {
+            CreateEventCore(initialState, mode, name, options: default, out createdNew);
         }
 
         private static void ValidateMode(EventResetMode mode)
@@ -529,28 +3870,772 @@ namespace System.Threading
             }
         }
 
+        /// <summary>
+        /// Opens an existing named event.
+        /// </summary>
+        /// <param name="name">The name of the event to be shared with other processes.</param>
+        /// <param name="options">
+        /// Options for the named event. Defaulted options, such as when passing 'options: default' in C#, are
+        /// 'CurrentUserOnly = true' and 'CurrentSessionOnly = true'. For more information, see 'NamedWaitHandleOptions'. The
+        /// specified options may affect the namespace for the name, and access to the underlying event object.
+        /// </param>
+        /// <returns>An object that represents the named event.</returns>
+        [SupportedOSPlatform("windows")]
+        public static EventWaitHandle OpenExisting(string name, NamedWaitHandleOptions options)
+        {
+            OpenExistingResult openExistingResult = OpenExistingWorker(name, new(options), out EventWaitHandle? result);
+            if (openExistingResult != OpenExistingResult.Success)
+            {
+                ThrowForOpenExistingFailure(openExistingResult, name);
+            }
+
+            Debug.Assert(result != null, "result should be non-null on success");
+            return result;
+        }
+
+        [SupportedOSPlatform("windows")]
+        public static EventWaitHandle OpenExisting(string name)
+        {
+            OpenExistingResult openExistingResult = OpenExistingWorker(name, options: default, out EventWaitHandle? result);
+            if (openExistingResult != OpenExistingResult.Success)
+            {
+                ThrowForOpenExistingFailure(openExistingResult, name);
+            }
+
+            Debug.Assert(result != null, "result should be non-null on success");
+            return result;
+        }
+
+        [DoesNotReturn]
+        private static void ThrowForOpenExistingFailure(OpenExistingResult openExistingResult, string name)
+        {
+            Debug.Assert(openExistingResult != OpenExistingResult.Success);
+
+            switch (openExistingResult)
+            {
+                case OpenExistingResult.NameNotFound:
+                    throw new WaitHandleCannotBeOpenedException();
+                case OpenExistingResult.NameInvalid:
+                    throw new WaitHandleCannotBeOpenedException(SR.Format(SR.Threading_WaitHandleCannotBeOpenedException_InvalidHandle, name));
+                case OpenExistingResult.PathNotFound:
+                    throw new DirectoryNotFoundException(SR.Format(SR.IO_PathNotFound_Path, name));
+                default:
+                    Debug.Assert(openExistingResult == OpenExistingResult.ObjectIncompatibleWithCurrentUserOnly);
+                    throw new WaitHandleCannotBeOpenedException(SR.Format(SR.NamedWaitHandles_ExistingObjectIncompatibleWithCurrentUserOnly, name));
+            }
+        }
+
+        /// <summary>
+        /// Tries to open an existing named event and returns a value indicating whether it was successful.
+        /// </summary>
+        /// <param name="name">The name of the event to be shared with other processes.</param>
+        /// <param name="options">
+        /// Options for the named event. Defaulted options, such as when passing 'options: default' in C#, are
+        /// 'CurrentUserOnly = true' and 'CurrentSessionOnly = true'. For more information, see 'NamedWaitHandleOptions'. The
+        /// specified options may affect the namespace for the name, and access to the underlying event object.
+        /// </param>
+        /// <param name="result">
+        /// An object that represents the named event if the method returns true; otherwise, null.
+        /// </param>
+        /// <returns>True if the named event was opened successfully; otherwise, false.</returns>
+        [SupportedOSPlatform("windows")]
+        public static bool TryOpenExisting(string name, NamedWaitHandleOptions options, [NotNullWhen(true)] out EventWaitHandle? result) =>
+            OpenExistingWorker(name, new(options), out result!) == OpenExistingResult.Success;
+
+        [SupportedOSPlatform("windows")]
+        public static bool TryOpenExisting(string name, [NotNullWhen(true)] out EventWaitHandle? result) =>
+            OpenExistingWorker(name, options: default, out result!) == OpenExistingResult.Success;
+
+        private void CreateEventCore(bool initialState, EventResetMode mode)
+        {
+            ValidateMode(mode);
+            SafeWaitHandle = WaitSubsystem.NewEvent(initialState, mode);
+        }
+
+        private void CreateEventCore(
+            bool initialState,
+            EventResetMode mode,
+            string? name,
+            NamedWaitHandleOptionsInternal options,
+            out bool createdNew)
+        {
+            ValidateMode(mode);
+
+            if (name != null)
+            {
+                throw new PlatformNotSupportedException(SR.PlatformNotSupported_NamedSynchronizationPrimitives);
+            }
+
+            SafeWaitHandle = WaitSubsystem.NewEvent(initialState, mode);
+            createdNew = true;
+        }
+
+        private static OpenExistingResult OpenExistingWorker(
+            string name,
+            NamedWaitHandleOptionsInternal options,
+            out EventWaitHandle? result)
+        {
+            throw new PlatformNotSupportedException(SR.PlatformNotSupported_NamedSynchronizationPrimitives);
+        }
+
         public bool Reset()
         {
-            Volatile.Write(ref _signaled, 0);
-            return true;
+            SafeWaitHandle waitHandle = ValidateHandle();
+            try
+            {
+                WaitSubsystem.ResetEvent(waitHandle.DangerousGetHandle());
+                return true;
+            }
+            finally
+            {
+                waitHandle.DangerousRelease();
+            }
         }
 
         public bool Set()
         {
-            Volatile.Write(ref _signaled, 1);
-            return true;
+            SafeWaitHandle waitHandle = ValidateHandle();
+            try
+            {
+                WaitSubsystem.SetEvent(waitHandle.DangerousGetHandle());
+                return true;
+            }
+            finally
+            {
+                waitHandle.DangerousRelease();
+            }
         }
 
-        private protected override bool TryConsumeSignal() =>
-            _mode == EventResetMode.AutoReset ? Interlocked.Exchange(ref _signaled, 0) != 0 : Volatile.Read(in _signaled) != 0;
+        internal static bool Set(SafeWaitHandle waitHandle)
+        {
+            waitHandle.DangerousAddRef();
+            try
+            {
+                WaitSubsystem.SetEvent(waitHandle.DangerousGetHandle());
+                return true;
+            }
+            finally
+            {
+                waitHandle.DangerousRelease();
+            }
+        }
+
+        private SafeWaitHandle ValidateHandle()
+        {
+            // The field value is modifiable via the public <see cref="WaitHandle.SafeWaitHandle"/> property, save it locally
+            // to ensure that one instance is used in all places in this method
+            SafeWaitHandle waitHandle = SafeWaitHandle;
+            if (waitHandle.IsInvalid)
+            {
+                ThrowInvalidHandleException();
+            }
+
+            waitHandle.DangerousAddRef();
+            return waitHandle;
+        }
     }
+
     public sealed class AutoResetEvent : EventWaitHandle
     {
         public AutoResetEvent(bool initialState) : base(initialState, EventResetMode.AutoReset) { }
     }
+
     public sealed class ManualResetEvent : EventWaitHandle
     {
         public ManualResetEvent(bool initialState) : base(initialState, EventResetMode.ManualReset) { }
+    }
+
+    /// <summary>
+    /// Synchronization primitive that can also be used for interprocess synchronization
+    /// </summary>
+    public sealed class Mutex : WaitHandle
+    {
+        /// <summary>
+        /// Creates a named or unnamed mutex, or opens a named mutex if a mutex with the name already exists.
+        /// </summary>
+        /// <param name="initiallyOwned">
+        /// True to acquire the mutex on the calling thread if it's created; otherwise, false.
+        /// </param>
+        /// <param name="name">
+        /// The name, if the mutex is to be shared with other processes; otherwise, null or an empty string.
+        /// </param>
+        /// <param name="options">
+        /// Options for the named mutex. Defaulted options, such as when passing 'options: default' in C#, are
+        /// 'CurrentUserOnly = true' and 'CurrentSessionOnly = true'. For more information, see 'NamedWaitHandleOptions'. The
+        /// specified options may affect the namespace for the name, and access to the underlying mutex object.
+        /// </param>
+        /// <param name="createdNew">
+        /// True if the mutex was created; false if an existing named mutex was opened.
+        /// </param>
+        public Mutex(bool initiallyOwned, string? name, NamedWaitHandleOptions options, out bool createdNew)
+        {
+            CreateMutexCore(initiallyOwned, name, new(options), out createdNew);
+        }
+
+        public Mutex(bool initiallyOwned, string? name, out bool createdNew)
+        {
+            CreateMutexCore(initiallyOwned, name, options: default, out createdNew);
+        }
+
+        /// <summary>
+        /// Creates a named or unnamed mutex, or opens a named mutex if a mutex with the name already exists.
+        /// </summary>
+        /// <param name="initiallyOwned">
+        /// True to acquire the mutex on the calling thread if it's created; otherwise, false.
+        /// </param>
+        /// <param name="name">
+        /// The name, if the mutex is to be shared with other processes; otherwise, null or an empty string.
+        /// </param>
+        /// <param name="options">
+        /// Options for the named mutex. Defaulted options, such as when passing 'options: default' in C#, are
+        /// 'CurrentUserOnly = true' and 'CurrentSessionOnly = true'. For more information, see 'NamedWaitHandleOptions'. The
+        /// specified options may affect the namespace for the name, and access to the underlying mutex object.
+        /// </param>
+        public Mutex(bool initiallyOwned, string? name, NamedWaitHandleOptions options)
+        {
+            CreateMutexCore(initiallyOwned, name, new(options), createdNew: out _);
+        }
+
+        public Mutex(bool initiallyOwned, string? name)
+        {
+            CreateMutexCore(initiallyOwned, name, options: default, createdNew: out _);
+        }
+
+        /// <summary>
+        /// Creates a named or unnamed mutex, or opens a named mutex if a mutex with the name already exists.
+        /// </summary>
+        /// <param name="name">
+        /// The name, if the mutex is to be shared with other processes; otherwise, null or an empty string.
+        /// </param>
+        /// <param name="options">
+        /// Options for the named mutex. Defaulted options, such as when passing 'options: default' in C#, are
+        /// 'CurrentUserOnly = true' and 'CurrentSessionOnly = true'. For more information, see 'NamedWaitHandleOptions'. The
+        /// specified options may affect the namespace for the name, and access to the underlying mutex object.
+        /// </param>
+        public Mutex(string? name, NamedWaitHandleOptions options)
+        {
+            CreateMutexCore(initiallyOwned: false, name, new(options), createdNew: out _);
+        }
+
+        public Mutex(bool initiallyOwned)
+        {
+            CreateMutexCore(initiallyOwned);
+        }
+
+        public Mutex()
+        {
+            CreateMutexCore(initiallyOwned: false);
+        }
+
+        private Mutex(SafeWaitHandle handle)
+        {
+            SafeWaitHandle = handle;
+        }
+
+        /// <summary>
+        /// Opens an existing named mutex.
+        /// </summary>
+        /// <param name="name">The name of the mutex to be shared with other processes.</param>
+        /// <param name="options">
+        /// Options for the named mutex. Defaulted options, such as when passing 'options: default' in C#, are
+        /// 'CurrentUserOnly = true' and 'CurrentSessionOnly = true'. For more information, see 'NamedWaitHandleOptions'. The
+        /// specified options may affect the namespace for the name, and access to the underlying mutex object.
+        /// </param>
+        /// <returns>An object that represents the named mutex.</returns>
+        public static Mutex OpenExisting(string name, NamedWaitHandleOptions options)
+        {
+            OpenExistingResult openExistingResult = OpenExistingWorker(name, new(options), out Mutex? result);
+            if (openExistingResult != OpenExistingResult.Success)
+            {
+                ThrowForOpenExistingFailure(openExistingResult, name);
+            }
+
+            Debug.Assert(result != null, "result should be non-null on success");
+            return result;
+        }
+
+        public static Mutex OpenExisting(string name)
+        {
+            OpenExistingResult openExistingResult = OpenExistingWorker(name, options: default, out Mutex? result);
+            if (openExistingResult != OpenExistingResult.Success)
+            {
+                ThrowForOpenExistingFailure(openExistingResult, name);
+            }
+
+            Debug.Assert(result != null, "result should be non-null on success");
+            return result;
+        }
+
+        [DoesNotReturn]
+        private static void ThrowForOpenExistingFailure(OpenExistingResult openExistingResult, string name)
+        {
+            Debug.Assert(openExistingResult != OpenExistingResult.Success);
+
+            switch (openExistingResult)
+            {
+                case OpenExistingResult.NameNotFound:
+                    throw new WaitHandleCannotBeOpenedException();
+                case OpenExistingResult.NameInvalid:
+                    throw new WaitHandleCannotBeOpenedException(SR.Format(SR.Threading_WaitHandleCannotBeOpenedException_InvalidHandle, name));
+                case OpenExistingResult.PathNotFound:
+                    throw new DirectoryNotFoundException(SR.Format(SR.IO_PathNotFound_Path, name));
+                default:
+                    Debug.Assert(openExistingResult == OpenExistingResult.ObjectIncompatibleWithCurrentUserOnly);
+                    throw new WaitHandleCannotBeOpenedException(SR.Format(SR.NamedWaitHandles_ExistingObjectIncompatibleWithCurrentUserOnly, name));
+            }
+        }
+
+        /// <summary>
+        /// Tries to open an existing named mutex and returns a value indicating whether it was successful.
+        /// </summary>
+        /// <param name="name">The name of the mutex to be shared with other processes.</param>
+        /// <param name="options">
+        /// Options for the named mutex. Defaulted options, such as when passing 'options: default' in C#, are
+        /// 'CurrentUserOnly = true' and 'CurrentSessionOnly = true'. For more information, see 'NamedWaitHandleOptions'. The
+        /// specified options may affect the namespace for the name, and access to the underlying mutex object.
+        /// </param>
+        /// <param name="result">
+        /// An object that represents the named mutex if the method returns true; otherwise, null.
+        /// </param>
+        /// <returns>True if the named mutex was opened successfully; otherwise, false.</returns>
+        public static bool TryOpenExisting(string name, NamedWaitHandleOptions options, [NotNullWhen(true)] out Mutex? result) =>
+            OpenExistingWorker(name, new(options), out result!) == OpenExistingResult.Success;
+
+        public static bool TryOpenExisting(string name, [NotNullWhen(true)] out Mutex? result) =>
+            OpenExistingWorker(name, options: default, out result!) == OpenExistingResult.Success;
+
+        [FeatureSwitchDefinition("System.Threading.Mutex.UnsafeDefaultMutexScopeGlobal")]
+        private static bool UnsafeDefaultMutexScopeGlobal { get; } =
+            AppContext.TryGetSwitch("System.Threading.Mutex.UnsafeDefaultMutexScopeGlobal", out bool enable) ? enable : false;
+
+        private void CreateMutexCore(bool initiallyOwned) => SafeWaitHandle = WaitSubsystem.NewMutex(initiallyOwned);
+
+        private void CreateMutexCore(
+            bool initiallyOwned,
+            string? name,
+            NamedWaitHandleOptionsInternal options,
+            out bool createdNew)
+        {
+            if (!string.IsNullOrEmpty(name))
+            {
+                name = BuildNameForOptions(name, options);
+
+                SafeWaitHandle? safeWaitHandle = WaitSubsystem.CreateNamedMutex(initiallyOwned, name, isUserScope: CalculateUserScope(options), out createdNew);
+                if (safeWaitHandle == null)
+                {
+                    throw new WaitHandleCannotBeOpenedException(SR.Format(SR.Threading_WaitHandleCannotBeOpenedException_InvalidHandle, name));
+                }
+                SafeWaitHandle = safeWaitHandle;
+                return;
+            }
+
+            SafeWaitHandle = WaitSubsystem.NewMutex(initiallyOwned);
+            createdNew = true;
+        }
+
+        private static OpenExistingResult OpenExistingWorker(
+            string name,
+            NamedWaitHandleOptionsInternal options,
+            out Mutex? result)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(name);
+
+            name = BuildNameForOptions(name, options);
+
+            OpenExistingResult status = WaitSubsystem.OpenNamedMutex(name, isUserScope: CalculateUserScope(options), out SafeWaitHandle? safeWaitHandle);
+            result = status == OpenExistingResult.Success ? new Mutex(safeWaitHandle!) : null;
+            return status;
+        }
+
+        private static string BuildNameForOptions(string name, NamedWaitHandleOptionsInternal options)
+        {
+            if (options.WasSpecified)
+            {
+                name = options.GetNameWithSessionPrefix(name);
+            }
+
+            if (name.StartsWith(NamedWaitHandleOptionsInternal.CurrentSessionPrefix) &&
+                name.Length > NamedWaitHandleOptionsInternal.CurrentSessionPrefix.Length)
+            {
+                name = name.Substring(NamedWaitHandleOptionsInternal.CurrentSessionPrefix.Length);
+            }
+
+            return name;
+        }
+
+        private static bool CalculateUserScope(NamedWaitHandleOptionsInternal options)
+        {
+            return options.WasSpecified ? options.CurrentUserOnly : !UnsafeDefaultMutexScopeGlobal;
+        }
+
+        public void ReleaseMutex()
+        {
+            // The field value is modifiable via the public <see cref="WaitHandle.SafeWaitHandle"/> property, save it locally
+            // to ensure that one instance is used in all places in this method
+            SafeWaitHandle waitHandle = SafeWaitHandle;
+            if (waitHandle.IsInvalid)
+            {
+                ThrowInvalidHandleException();
+            }
+
+            waitHandle.DangerousAddRef();
+            try
+            {
+                WaitSubsystem.ReleaseMutex(waitHandle.DangerousGetHandle());
+            }
+            finally
+            {
+                waitHandle.DangerousRelease();
+            }
+        }
+    }
+
+    public sealed class Semaphore : WaitHandle
+    {
+        // creates a nameless semaphore object
+        // Win32 only takes maximum count of int.MaxValue
+        public Semaphore(int initialCount, int maximumCount)
+        {
+            CreateSemaphoreCore(initialCount, maximumCount);
+        }
+
+        /// <summary>
+        /// Creates a named or unnamed semaphore, or opens a named semaphore if a semaphore with the name already exists.
+        /// </summary>
+        /// <param name="initialCount">
+        /// The initial number of requests for the semaphore that can be satisfied concurrently.
+        /// </param>
+        /// <param name="maximumCount">
+        /// The maximum number of requests for the semaphore that can be satisfied concurrently.
+        /// </param>
+        /// <param name="name">
+        /// The name, if the semaphore is to be shared with other processes; otherwise, null or an empty string.
+        /// </param>
+        /// <param name="options">
+        /// Options for the named semaphore. Defaulted options, such as when passing 'options: default' in C#, are
+        /// 'CurrentUserOnly = true' and 'CurrentSessionOnly = true'. For more information, see 'NamedWaitHandleOptions'. The
+        /// specified options may affect the namespace for the name, and access to the underlying semaphore object.
+        /// </param>
+        public Semaphore(int initialCount, int maximumCount, string? name, NamedWaitHandleOptions options)
+        {
+            CreateSemaphoreCore(initialCount, maximumCount, name, new(options), out _);
+        }
+
+        public Semaphore(int initialCount, int maximumCount, string? name)
+        {
+            CreateSemaphoreCore(initialCount, maximumCount, name, options: default, out _);
+        }
+
+        /// <summary>
+        /// Creates a named or unnamed semaphore, or opens a named semaphore if a semaphore with the name already exists.
+        /// </summary>
+        /// <param name="initialCount">
+        /// The initial number of requests for the semaphore that can be satisfied concurrently.
+        /// </param>
+        /// <param name="maximumCount">
+        /// The maximum number of requests for the semaphore that can be satisfied concurrently.
+        /// </param>
+        /// <param name="name">
+        /// The name, if the semaphore is to be shared with other processes; otherwise, null or an empty string.
+        /// </param>
+        /// <param name="options">
+        /// Options for the named semaphore. Defaulted options, such as when passing 'options: default' in C#, are
+        /// 'CurrentUserOnly = true' and 'CurrentSessionOnly = true'. For more information, see 'NamedWaitHandleOptions'. The
+        /// specified options may affect the namespace for the name, and access to the underlying semaphore object.
+        /// </param>
+        /// <param name="createdNew">
+        /// True if the semaphore was created; false if an existing named semaphore was opened.
+        /// </param>
+        public Semaphore(int initialCount, int maximumCount, string? name, NamedWaitHandleOptions options, out bool createdNew)
+        {
+            CreateSemaphoreCore(initialCount, maximumCount, name, new(options), out createdNew);
+        }
+
+        public Semaphore(int initialCount, int maximumCount, string? name, out bool createdNew)
+        {
+            CreateSemaphoreCore(initialCount, maximumCount, name, options: default, out createdNew);
+        }
+
+        private static void ValidateArguments(int initialCount, int maximumCount)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(initialCount);
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumCount);
+
+            if (initialCount > maximumCount)
+            {
+                throw new ArgumentException(SR.Argument_SemaphoreInitialMaximum);
+            }
+        }
+
+        /// <summary>
+        /// Opens an existing named semaphore.
+        /// </summary>
+        /// <param name="name">The name of the semaphore to be shared with other processes.</param>
+        /// <param name="options">
+        /// Options for the named semaphore. Defaulted options, such as when passing 'options: default' in C#, are
+        /// 'CurrentUserOnly = true' and 'CurrentSessionOnly = true'. For more information, see 'NamedWaitHandleOptions'. The
+        /// specified options may affect the namespace for the name, and access to the underlying semaphore object.
+        /// </param>
+        /// <returns>An object that represents the named semaphore.</returns>
+        [SupportedOSPlatform("windows")]
+        public static Semaphore OpenExisting(string name, NamedWaitHandleOptions options)
+        {
+            OpenExistingResult openExistingResult = OpenExistingWorker(name, new(options), out Semaphore? result);
+            if (openExistingResult != OpenExistingResult.Success)
+            {
+                ThrowForOpenExistingFailure(openExistingResult, name);
+            }
+
+            Debug.Assert(result != null, "result should be non-null on success");
+            return result;
+        }
+
+        [SupportedOSPlatform("windows")]
+        public static Semaphore OpenExisting(string name)
+        {
+            OpenExistingResult openExistingResult = OpenExistingWorker(name, options: default, out Semaphore? result);
+            if (openExistingResult != OpenExistingResult.Success)
+            {
+                ThrowForOpenExistingFailure(openExistingResult, name);
+            }
+
+            Debug.Assert(result != null, "result should be non-null on success");
+            return result;
+        }
+
+        [DoesNotReturn]
+        private static void ThrowForOpenExistingFailure(OpenExistingResult openExistingResult, string name)
+        {
+            Debug.Assert(openExistingResult != OpenExistingResult.Success);
+
+            switch (openExistingResult)
+            {
+                case OpenExistingResult.NameNotFound:
+                    throw new WaitHandleCannotBeOpenedException();
+                case OpenExistingResult.NameInvalid:
+                    throw new WaitHandleCannotBeOpenedException(SR.Format(SR.Threading_WaitHandleCannotBeOpenedException_InvalidHandle, name));
+                case OpenExistingResult.PathNotFound:
+                    throw new IOException(SR.Format(SR.IO_PathNotFound_Path, name));
+                default:
+                    Debug.Assert(openExistingResult == OpenExistingResult.ObjectIncompatibleWithCurrentUserOnly);
+                    throw new WaitHandleCannotBeOpenedException(SR.Format(SR.NamedWaitHandles_ExistingObjectIncompatibleWithCurrentUserOnly, name));
+            }
+        }
+
+        /// <summary>
+        /// Tries to open an existing named semaphore and returns a value indicating whether it was successful.
+        /// </summary>
+        /// <param name="name">The name of the semaphore to be shared with other processes.</param>
+        /// <param name="options">
+        /// Options for the named semaphore. Defaulted options, such as when passing 'options: default' in C#, are
+        /// 'CurrentUserOnly = true' and 'CurrentSessionOnly = true'. For more information, see 'NamedWaitHandleOptions'. The
+        /// specified options may affect the namespace for the name, and access to the underlying semaphore object.
+        /// </param>
+        /// <param name="result">
+        /// An object that represents the named semaphore if the method returns true; otherwise, null.
+        /// </param>
+        /// <returns>True if the named semaphore was opened successfully; otherwise, false.</returns>
+        [SupportedOSPlatform("windows")]
+        public static bool TryOpenExisting(string name, NamedWaitHandleOptions options, [NotNullWhen(true)] out Semaphore? result) =>
+            OpenExistingWorker(name, new(options), out result!) == OpenExistingResult.Success;
+
+        [SupportedOSPlatform("windows")]
+        public static bool TryOpenExisting(string name, [NotNullWhen(true)] out Semaphore? result) =>
+            OpenExistingWorker(name, options: default, out result!) == OpenExistingResult.Success;
+
+        public int Release() => ReleaseCore(1);
+
+        // increase the count on a semaphore, returns previous count
+        public int Release(int releaseCount)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(releaseCount);
+
+            return ReleaseCore(releaseCount);
+        }
+
+        private void CreateSemaphoreCore(int initialCount, int maximumCount)
+        {
+            ValidateArguments(initialCount, maximumCount);
+            SafeWaitHandle = WaitSubsystem.NewSemaphore(initialCount, maximumCount);
+        }
+
+        private void CreateSemaphoreCore(
+            int initialCount,
+            int maximumCount,
+            string? name,
+            NamedWaitHandleOptionsInternal options,
+            out bool createdNew)
+        {
+            ValidateArguments(initialCount, maximumCount);
+
+            if (name != null)
+            {
+                throw new PlatformNotSupportedException(SR.PlatformNotSupported_NamedSynchronizationPrimitives);
+            }
+
+            SafeWaitHandle = WaitSubsystem.NewSemaphore(initialCount, maximumCount);
+            createdNew = true;
+        }
+
+        private static OpenExistingResult OpenExistingWorker(
+            string name,
+            NamedWaitHandleOptionsInternal options,
+            out Semaphore? result)
+        {
+            throw new PlatformNotSupportedException(SR.PlatformNotSupported_NamedSynchronizationPrimitives);
+        }
+
+        private int ReleaseCore(int releaseCount)
+        {
+            // The field value is modifiable via the public <see cref="WaitHandle.SafeWaitHandle"/> property, save it locally
+            // to ensure that one instance is used in all places in this method
+            SafeWaitHandle waitHandle = SafeWaitHandle;
+            if (waitHandle.IsInvalid)
+            {
+                ThrowInvalidHandleException();
+            }
+
+            waitHandle.DangerousAddRef();
+            try
+            {
+                return WaitSubsystem.ReleaseSemaphore(waitHandle.DangerousGetHandle(), releaseCount);
+            }
+            finally
+            {
+                waitHandle.DangerousRelease();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Represents a set of options for named synchronization objects that are wait handles and can be shared between processes,
+    /// such as 'Mutex', 'Semaphore', and 'EventWaitHandle'.
+    /// </summary>
+    public struct NamedWaitHandleOptions
+    {
+        private bool _notCurrentUserOnly;
+        private bool _notCurrentSessionOnly;
+
+        /// <summary>
+        /// Indicates whether the named synchronization object should be limited in access to the current user.
+        /// </summary>
+        /// <remarks>
+        /// The default value is true.
+        ///
+        /// If the option is true when creating a named synchronization object, the object is limited in access to the calling
+        /// user. If the option is true when opening an existing named synchronization object, the object's access controls are
+        /// verified for the calling user.
+        ///
+        /// If the option is false when creating a named synchronization object, the object is not limited in access to a user.
+        ///
+        /// On Unix-like operating systems, each user has namespaces for the object's name that are used when the option is
+        /// true. These user-scoped namespaces are distinct from user-scoped namespaces for other users, and also distinct from
+        /// namespaces used when the option is false.
+        /// </remarks>
+        public bool CurrentUserOnly
+        {
+            get => !_notCurrentUserOnly;
+            set => _notCurrentUserOnly = !value;
+        }
+
+        /// <summary>
+        /// Indicates whether the named synchronization object is intended to be used only within the current session.
+        /// </summary>
+        /// <remarks>
+        /// The default value is true.
+        ///
+        /// Each session has namespaces for the object's name that are used when the option is true. These session-scoped
+        /// namespaces are distinct from session-scoped namespaces for other sessions, and also distinct from namespaces used
+        /// when the option is false.
+        ///
+        /// If the option is true when creating a named synchronization object, the object is limited in scope to the current
+        /// session, and can't be opened by processes running in different sessions.
+        ///
+        /// On Windows, a session is a Terminal Services session. On Unix-like operating systems, a session is typically a shell
+        /// session, where each shell gets its own session in which processes started from the shell run.
+        /// </remarks>
+        public bool CurrentSessionOnly
+        {
+            get => !_notCurrentSessionOnly;
+            set => _notCurrentSessionOnly = !value;
+        }
+    }
+
+    // This is an internal struct used by named wait handle helpers to also track whether the options were specified in APIs
+    // that were used. Using the constructor indicates WasSpecified=true, and 'default' indicates WasSpecified=false.
+    internal readonly struct NamedWaitHandleOptionsInternal
+    {
+        public const string CurrentSessionPrefix = @"Local\";
+        public const string AllSessionsPrefix = @"Global\";
+
+        private readonly NamedWaitHandleOptions _options;
+        private readonly bool _wasSpecified;
+
+        public NamedWaitHandleOptionsInternal(NamedWaitHandleOptions options)
+        {
+            _options = options;
+            _wasSpecified = true;
+        }
+
+        public bool CurrentUserOnly
+        {
+            get
+            {
+                Debug.Assert(WasSpecified);
+                return _options.CurrentUserOnly;
+            }
+        }
+
+        public bool CurrentSessionOnly
+        {
+            get
+            {
+                Debug.Assert(WasSpecified);
+                return _options.CurrentSessionOnly;
+            }
+        }
+
+        public bool WasSpecified => _wasSpecified;
+
+        public string GetNameWithSessionPrefix(string name)
+        {
+            Debug.Assert(!string.IsNullOrEmpty(name));
+            Debug.Assert(WasSpecified);
+
+            bool hasPrefix = name.Contains('\\');
+            if (!hasPrefix)
+            {
+                if (CurrentSessionOnly)
+                {
+                }
+                else
+                {
+                    name = AllSessionsPrefix + name;
+                }
+
+                return name;
+            }
+
+            // Verify that the prefix is compatible with the CurrentSessionOnly option. On Windows, when CurrentSessionOnly is
+            // false, any other prefix is permitted here, as a custom namespace can be created and used with a prefix.
+
+            bool incompatible;
+            if (CurrentSessionOnly)
+            {
+                incompatible = !name.StartsWith(CurrentSessionPrefix);
+            }
+            else
+            {
+                incompatible = !name.StartsWith(AllSessionsPrefix);
+            }
+
+            if (incompatible)
+            {
+                throw new ArgumentException(SR.Format(SR.NamedWaitHandles_IncompatibleNamePrefix, name), nameof(name));
+            }
+
+            return name;
+        }
     }
     internal sealed class Condition
     {
@@ -1805,10 +5890,48 @@ namespace System.Threading
     {
         public static long LockContentionCount => Lock.ContentionCount;
 
-        [MethodImpl(MethodImplOptions.NoInlining)]
         public static void Enter(object obj)
         {
-            ObjectHeader.AcquireThinLock(obj);
+            ArgumentNullException.ThrowIfNull(obj);
+            RuntimeImports.RhpMonitorEnter(obj);
+        }
+
+        public static bool TryEnter(object obj) => TryEnter(obj, 0);
+
+        public static void TryEnter(object obj, ref bool lockTaken)
+        {
+            if (lockTaken)
+            {
+                ThrowLockTakenException();
+            }
+            lockTaken = TryEnter(obj, 0);
+        }
+
+        public static bool TryEnter(object obj, int millisecondsTimeout)
+        {
+            ArgumentNullException.ThrowIfNull(obj);
+            ArgumentOutOfRangeException.ThrowIfLessThan(millisecondsTimeout, -1);
+            return RuntimeImports.RhpMonitorTryEnter(obj, millisecondsTimeout) != 0;
+        }
+
+        public static void TryEnter(object obj, int millisecondsTimeout, ref bool lockTaken)
+        {
+            if (lockTaken)
+            {
+                ThrowLockTakenException();
+            }
+            lockTaken = TryEnter(obj, millisecondsTimeout);
+        }
+
+        public static bool TryEnter(object obj, TimeSpan timeout) => TryEnter(obj, WaitHandle.ToTimeoutMilliseconds(timeout));
+
+        public static void TryEnter(object obj, TimeSpan timeout, ref bool lockTaken) =>
+            TryEnter(obj, WaitHandle.ToTimeoutMilliseconds(timeout), ref lockTaken);
+
+        public static bool IsEntered(object obj)
+        {
+            ArgumentNullException.ThrowIfNull(obj);
+            return RuntimeImports.RhpMonitorIsEntered(obj) != 0;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1822,50 +5945,53 @@ namespace System.Threading
             lockTaken = true;
         }
 
-        [MethodImpl(MethodImplOptions.NoInlining)]
         public static void Exit(object obj)
         {
             ArgumentNullException.ThrowIfNull(obj);
-            ObjectHeader.Release(obj);
+            if (RuntimeImports.RhpMonitorExit(obj) == 0)
+            {
+                throw new SynchronizationLockException();
+            }
         }
 
         public static bool Wait(object obj, int millisecondsTimeout)
         {
             ArgumentNullException.ThrowIfNull(obj);
-            RuntimeFeature.ThrowIfBlockingIsNotSupported(millisecondsTimeout);
-            throw new PlatformNotSupportedException();
+            ArgumentOutOfRangeException.ThrowIfLessThan(millisecondsTimeout, -1);
+            int result = RuntimeImports.RhpMonitorWait(obj, millisecondsTimeout);
+            if (result < 0)
+            {
+                throw new SynchronizationLockException();
+            }
+            return result != 0;
         }
 
         public static bool Wait(object obj) => Wait(obj, Timeout.Infinite);
 
+        public static bool Wait(object obj, TimeSpan timeout) => Wait(obj, WaitHandle.ToTimeoutMilliseconds(timeout));
+
         public static void Pulse(object obj)
         {
             ArgumentNullException.ThrowIfNull(obj);
+            if (RuntimeImports.RhpMonitorPulse(obj, 0) == 0)
+            {
+                throw new SynchronizationLockException();
+            }
         }
 
         public static void PulseAll(object obj)
         {
             ArgumentNullException.ThrowIfNull(obj);
+            if (RuntimeImports.RhpMonitorPulse(obj, 1) == 0)
+            {
+                throw new SynchronizationLockException();
+            }
         }
 
         [DoesNotReturn]
         private static void ThrowLockTakenException()
         {
             throw new ArgumentException(SR.Argument_MustBeFalse, "lockTaken");
-        }
-    }
-    internal static class ObjectHeader
-    {
-        [MethodImpl(MethodImplOptions.InternalCall)]
-        public static unsafe void AcquireThinLock(object obj)
-        {
-            if (obj is null) throw new ArgumentNullException();
-
-        }
-        [MethodImpl(MethodImplOptions.InternalCall)]
-        public static unsafe void Release(object obj)
-        {
-
         }
     }
     /// <summary>Provides atomic operations for variables that are shared by multiple threads.</summary>
@@ -7246,7 +11372,181 @@ namespace System.Threading
             }
         }
 
-        public static int ThreadCount => 0;
+        private static readonly object s_workerLock = new object();
+        private static readonly Semaphore s_workerSemaphore = new Semaphore(0, int.MaxValue);
+        private static readonly AutoResetEvent s_gateEvent = new AutoResetEvent(false);
+        private static bool s_gateStarted;
+        private static bool s_workerRequested;
+        private static bool s_workerSignaled;
+        private static int s_workerCount;
+        private static int s_processingWorkers;
+        private static int s_blockedWorkers;
+        private static int s_starvationWorkers;
+        private static int s_minWorkers = Environment.ProcessorCount;
+        private static int s_maxWorkers = short.MaxValue;
+        private static int s_minCompletionPorts = 1;
+        private static int s_maxCompletionPorts = 1000;
+        private static int s_lastProgress = Environment.TickCount;
+        [ThreadStatic]
+        private static bool t_isBlocked;
+
+        public static int ThreadCount => Volatile.Read(ref s_workerCount);
+
+        public static void GetMinThreads(out int workerThreads, out int completionPortThreads)
+        {
+            lock (s_workerLock)
+            {
+                workerThreads = s_minWorkers;
+                completionPortThreads = s_minCompletionPorts;
+            }
+        }
+
+        public static void GetMaxThreads(out int workerThreads, out int completionPortThreads)
+        {
+            lock (s_workerLock)
+            {
+                workerThreads = s_maxWorkers;
+                completionPortThreads = s_maxCompletionPorts;
+            }
+        }
+
+        public static void GetAvailableThreads(out int workerThreads, out int completionPortThreads)
+        {
+            lock (s_workerLock)
+            {
+                workerThreads = Math.Max(0, s_maxWorkers - s_processingWorkers);
+                completionPortThreads = s_maxCompletionPorts;
+            }
+        }
+
+        public static bool SetMinThreads(int workerThreads, int completionPortThreads)
+        {
+            lock (s_workerLock)
+            {
+                if (workerThreads < 0 || workerThreads > s_maxWorkers ||
+                    completionPortThreads < 0 || completionPortThreads > s_maxCompletionPorts)
+                    return false;
+                s_minWorkers = Math.Max(1, workerThreads);
+                s_minCompletionPorts = Math.Max(1, completionPortThreads);
+                RequestWorkerUnderLock();
+                return true;
+            }
+        }
+
+        public static bool SetMaxThreads(int workerThreads, int completionPortThreads)
+        {
+            lock (s_workerLock)
+            {
+                if (workerThreads <= 0 || workerThreads < s_minWorkers ||
+                    completionPortThreads <= 0 || completionPortThreads < s_minCompletionPorts)
+                    return false;
+                s_maxWorkers = Math.Min(short.MaxValue, workerThreads);
+                s_maxCompletionPorts = completionPortThreads;
+                return true;
+            }
+        }
+
+        private static void RequestWorkerUnderLock()
+        {
+            if (!s_workerRequested || s_workerSignaled)
+                return;
+            int goal = Math.Min(s_maxWorkers, s_minWorkers + s_blockedWorkers + s_starvationWorkers);
+            if (s_processingWorkers >= goal)
+                return;
+            if (s_workerCount == s_processingWorkers)
+            {
+                var worker = new Thread(WorkerThread) { IsBackground = true, IsThreadPoolThread = true };
+                worker.SetThreadPoolWorkerThreadName();
+                s_workerCount++;
+                try
+                {
+                    worker.UnsafeStart();
+                }
+                catch
+                {
+                    s_workerCount--;
+                    throw;
+                }
+            }
+            s_workerSignaled = true;
+            s_workerSemaphore.Release();
+        }
+
+        private static void WorkerThread()
+        {
+            try
+            {
+                while (true)
+                {
+                    if (!s_workerSemaphore.WaitOne(30000))
+                    {
+                        lock (s_workerLock)
+                        {
+                            if (s_workerCount > s_minWorkers && !s_workerRequested)
+                            {
+                                s_workerCount--;
+                                s_starvationWorkers = Math.Max(0, s_starvationWorkers - 1);
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                    lock (s_workerLock)
+                    {
+                        s_workerSignaled = false;
+                        s_workerRequested = false;
+                        s_processingWorkers++;
+                    }
+                    try
+                    {
+                        ThreadPoolWorkQueue.Dispatch();
+                    }
+                    finally
+                    {
+                        lock (s_workerLock)
+                        {
+                            s_processingWorkers--;
+                            RequestWorkerUnderLock();
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                ThreadPoolWorkQueueThreadLocals? locals = ThreadPoolWorkQueueThreadLocals.threadLocals;
+                if (locals is not null)
+                {
+                    ThreadPoolWorkQueue.TransferAllLocalWorkItemsToHighPriorityGlobalQueue(locals);
+                    ThreadPoolWorkQueue.WorkStealingQueueList.Remove(locals.workStealingQueue);
+                    ThreadPoolWorkQueueThreadLocals.threadLocals = null;
+                    GC.SuppressFinalize(locals);
+                }
+            }
+        }
+
+        private static void GateThread()
+        {
+            while (true)
+            {
+                s_gateEvent.WaitOne();
+                while (true)
+                {
+                    Thread.Sleep(500);
+                    lock (s_workerLock)
+                    {
+                        if (!s_workerRequested)
+                            break;
+                        // Compensate waits that do not report blocking, while bounding growth to one worker per interval
+                        if ((uint)(Environment.TickCount - s_lastProgress) >= 500u &&
+                            s_processingWorkers < s_maxWorkers)
+                        {
+                            s_starvationWorkers++;
+                            RequestWorkerUnderLock();
+                        }
+                    }
+                }
+            }
+        }
 
         public static long CompletedWorkItemCount => s_completedWorkItemCount;
 
@@ -7256,16 +11556,30 @@ namespace System.Threading
 
         internal static void NotifyWorkItemProgress()
         {
+            Volatile.Write(ref s_lastProgress, Environment.TickCount);
         }
 
         internal static bool NotifyWorkItemComplete(int currentTimeMs)
         {
             Interlocked.Increment(ref s_completedWorkItemCount);
+            NotifyWorkItemProgress();
             return true;
         }
 
         internal static void EnsureWorkerRequested()
         {
+            lock (s_workerLock)
+            {
+                s_workerRequested = true;
+                if (!s_gateStarted)
+                {
+                    var gate = new Thread(GateThread) { IsBackground = true, Name = ".NET TP Gate" };
+                    gate.UnsafeStart();
+                    s_gateStarted = true;
+                }
+                RequestWorkerUnderLock();
+                s_gateEvent.Set();
+            }
         }
 
         internal static bool EnableWorkerTracking => false;
@@ -7274,7 +11588,18 @@ namespace System.Threading
         {
         }
 
-        internal static bool NotifyThreadBlocked() => false;
+        internal static bool NotifyThreadBlocked()
+        {
+            if (!Thread.CurrentThread.IsThreadPoolThread || t_isBlocked)
+                return false;
+            lock (s_workerLock)
+            {
+                t_isBlocked = true;
+                s_blockedWorkers++;
+                RequestWorkerUnderLock();
+            }
+            return true;
+        }
 
         public static RegisteredWaitHandle RegisterWaitForSingleObject(
             WaitHandle waitObject, WaitOrTimerCallback callBack, object? state, int millisecondsTimeOutInterval, bool executeOnlyOnce)
@@ -7285,6 +11610,13 @@ namespace System.Threading
 
         internal static void NotifyThreadUnblocked()
         {
+            if (!t_isBlocked)
+                return;
+            lock (s_workerLock)
+            {
+                t_isBlocked = false;
+                s_blockedWorkers--;
+            }
         }
     }
 
@@ -9730,6 +14062,10 @@ namespace System.Threading
             _blocker.Dispose();
             GC.SuppressFinalize(this);
         }
+
+        public void VerifyIsLocked() { }
+
+        public void VerifyIsNotLocked() { }
 
         public bool TryAcquire()
         {

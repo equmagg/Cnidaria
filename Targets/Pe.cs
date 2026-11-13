@@ -58,7 +58,12 @@ internal sealed class PeImportTable
             "HeapAlloc", "HeapReAlloc", "HeapFree", "VirtualAlloc", "VirtualFree",
             "CreateFileA", "ReadFile", "CloseHandle", "SetFilePointerEx", "SetEndOfFile", "FlushFileBuffers",
             "GetFileSizeEx", "GetFileAttributesA", "DeleteFileA", "MoveFileExA", "CreateDirectoryA", "RemoveDirectoryA",
-            "GetFileType", "GetCurrentDirectoryA", "SetCurrentDirectoryA").Select(static name => new PeImport(name, "KERNEL32.dll", name)).ToImmutableArray();
+            "GetFileType", "GetCurrentDirectoryA", "SetCurrentDirectoryA",
+            "TlsAlloc", "CreateThread", "SwitchToThread", "QueryPerformanceCounter", "QueryPerformanceFrequency",
+            "GetSystemTimeAsFileTime", "GetCurrentProcessId").Select(static name => new PeImport(name, "KERNEL32.dll", name))
+        .Concat(new[] { "WaitOnAddress", "WakeByAddressSingle", "WakeByAddressAll" }.Select(static name => new PeImport(name, "KERNELBASE.dll", name)))
+        .Append(new PeImport("BCryptGenRandom", "BCRYPT.dll", "BCryptGenRandom"))
+        .ToImmutableArray();
 
     public byte[] Bytes { get; }
     public IReadOnlyDictionary<string, int> AddressOffsets { get; }

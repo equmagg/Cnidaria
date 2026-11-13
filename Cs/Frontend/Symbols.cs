@@ -361,6 +361,53 @@ namespace Cnidaria.Cs
                 TryConvertToInt32(attribute.ConstructorArguments[0].Value, out unmanagedType);
         }
 
+        internal static bool TryGetStructLayout(ImmutableArray<AttributeData> attributes, out int layoutKind, out int pack, out int size)
+        {
+            pack = 0;
+            size = 0;
+            foreach (AttributeData attribute in attributes)
+            {
+                if (!IsAttribute(attribute, "System.Runtime.InteropServices", "StructLayoutAttribute") ||
+                    attribute.ConstructorArguments.IsDefaultOrEmpty ||
+                    !TryConvertToInt32(attribute.ConstructorArguments[0].Value, out layoutKind))
+                {
+                    continue;
+                }
+
+                foreach (AttributeNamedArgumentData argument in attribute.NamedArguments)
+                {
+                    if (argument.Name == "Pack")
+                        TryConvertToInt32(argument.Value.Value, out pack);
+                    else if (argument.Name == "Size")
+                        TryConvertToInt32(argument.Value.Value, out size);
+                }
+                return true;
+            }
+
+            layoutKind = 0;
+            return false;
+        }
+
+        internal static bool TryGetFieldOffset(ImmutableArray<AttributeData> attributes, out int offset)
+        {
+            foreach (AttributeData attribute in attributes)
+            {
+                if (IsAttribute(attribute, "System.Runtime.InteropServices", "FieldOffsetAttribute") &&
+                    !attribute.ConstructorArguments.IsDefaultOrEmpty &&
+                    TryConvertToInt32(attribute.ConstructorArguments[0].Value, out offset))
+                {
+                    return true;
+                }
+            }
+
+            offset = 0;
+            return false;
+        }
+
+        internal static bool IsLayoutPseudoAttribute(AttributeData attribute)
+            => IsAttribute(attribute, "System.Runtime.InteropServices", "StructLayoutAttribute") ||
+               IsAttribute(attribute, "System.Runtime.InteropServices", "FieldOffsetAttribute");
+
         // The attribute also covers what is nested in the member or type it is on
         public static bool SkipsLocalsInit(MethodSymbol method)
         {

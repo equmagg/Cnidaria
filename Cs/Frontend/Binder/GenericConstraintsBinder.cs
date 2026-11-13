@@ -591,8 +591,7 @@ namespace Cnidaria.Cs
                     return false;
                 case ByRefTypeSymbol br:
                     return ContainsRefLike(br.ElementType);
-                case PointerTypeSymbol ptr:
-                    return ContainsRefLike(ptr.PointedAtType);
+                case PointerTypeSymbol:
                 case FunctionPointerTypeSymbol:
                     return false;
                 case ArrayTypeSymbol arr:

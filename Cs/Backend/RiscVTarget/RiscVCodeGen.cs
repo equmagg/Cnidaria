@@ -91,6 +91,9 @@ namespace Cnidaria.Cs
             private readonly Dictionary<DelegateTargetThunkKey, DelegateTargetThunkDraft> _delegateTargetThunksByKey = new Dictionary<DelegateTargetThunkKey, DelegateTargetThunkDraft>();
             private readonly List<DelegateTargetThunkDraft> _delegateTargetThunks = new List<DelegateTargetThunkDraft>();
             private readonly List<StaticRootDraft> _staticRoots = new List<StaticRootDraft>();
+            private readonly Dictionary<int, int> _threadStaticOffsetByTypeId = new Dictionary<int, int>();
+            private readonly List<TypeGcFieldDraft> _threadStaticRoots = new List<TypeGcFieldDraft>();
+            private int _threadStaticSize;
             private int _nextLocalLabel;
 
             public Generator(
@@ -439,6 +442,11 @@ namespace Cnidaria.Cs
                 GenTreeMethod? firstStaticParameterless = null;
                 foreach (var method in _program.Methods)
                 {
+                    if (method.RuntimeMethod.Name == "<Main>" && method.RuntimeMethod.IsStatic)
+                        return method;
+                }
+                foreach (var method in _program.Methods)
+                {
                     var runtimeMethod = method.RuntimeMethod;
                     if (runtimeMethod.IsStatic && runtimeMethod.ParameterTypes.Length == 0 && firstStaticParameterless is null)
                         firstStaticParameterless = method;
@@ -539,13 +547,22 @@ namespace Cnidaria.Cs
                 if (runtimeMethod.ParameterTypes.Length == 1)
                     EmitLoadImmediate(RVRegister.X10, 0);
                 EmitPcrelTransfer(entryMethodLabel, link: true);
+                if (_program.ThreadExitMethod is RuntimeMethod wait)
+                {
+                    EmitAdjustStack(-_target.CallFrameAlignment);
+                    EmitDelegateMemoryStore(MachineRegister.X10, RVRegister.X2, 0, _target.PointerSize);
+                    EmitPcrelTransfer(ResolveMethodLabel(wait), link: true);
+                    Emit(RVInstruction.I(_machineTarget.Is64Bit ? RVInstrKind.Ld : RVInstrKind.Lw, RVRegister.X10, RVRegister.X2, 0));
+                    EmitAdjustStack(_target.CallFrameAlignment);
+                }
+
 
                 if (IsVoid(runtimeMethod.ReturnType))
                     EmitLoadImmediate(RVRegister.X10, 0);
 
                 if (_target.OperatingSystem == OperatingSystemKind.Linux)
                 {
-                    EmitLoadImmediate(RVRegister.X17, 93);
+                    EmitLoadImmediate(RVRegister.X17, 94);
                     Emit(new RVInstruction(RVInstrKind.Ecall));
                     Emit(new RVInstruction(RVInstrKind.Ebreak));
                 }
@@ -2463,164 +2480,11 @@ namespace Cnidaria.Cs
 
             private void EmitTypeInitializationThunks()
             {
-                string? waitHelperLabel = null;
-                if (_target.OperatingSystem == OperatingSystemKind.Linux && _typeInitializationThunks.Count > 1)
-                {
-                    string contextTableLabel = EmitTypeInitializationContextTable();
-                    waitHelperLabel = CreateUniqueGlobalLabel("__cctor_wait");
-                    EmitTypeInitializationWaitHelper(waitHelperLabel, contextTableLabel, _typeInitializationThunks.Count);
-                }
-
                 for (int i = 0; i < _typeInitializationThunks.Count; i++)
-                    EmitTypeInitializationThunk(_typeInitializationThunks[i], waitHelperLabel);
+                    EmitTypeInitializationThunk(_typeInitializationThunks[i]);
             }
 
-            private string EmitTypeInitializationContextTable()
-            {
-                string label = CreateLocalLabel("type_init_contexts");
-                int offset = _rodata.Align(_target.PointerSize);
-                AddDataSymbol(label, offset, checked(_typeInitializationThunks.Count * _target.PointerSize));
-                for (int i = 0; i < _typeInitializationThunks.Count; i++)
-                    EmitPointer(_typeInitializationThunks[i].StateLabel);
-                return label;
-            }
-
-            private void EmitTypeInitializationWaitHelper(string label, string contextTableLabel, int contextCount)
-            {
-                int startOffset = _text.ByteLength;
-                DefineLabel(label);
-
-                string findOwnedLoopLabel = CreateLocalLabel(label + "_find_owned");
-                string findOwnedNextLabel = CreateLocalLabel(label + "_find_owned_next");
-                string ownedFoundLabel = CreateLocalLabel(label + "_owned_found");
-                string noOwnedContextLabel = CreateLocalLabel(label + "_no_owned_context");
-                string chainLoopLabel = CreateLocalLabel(label + "_chain");
-                string scanOwnerLoopLabel = CreateLocalLabel(label + "_scan_owner");
-                string scanOwnerNextLabel = CreateLocalLabel(label + "_scan_owner_next");
-                string noCycleLabel = CreateLocalLabel(label + "_no_cycle");
-                string cycleLabel = CreateLocalLabel(label + "_cycle");
-                string clearAndReturnZeroLabel = CreateLocalLabel(label + "_clear_zero");
-                string clearAndReturnOneLabel = CreateLocalLabel(label + "_clear_one");
-
-                EmitMove(RVRegister.X28, RVRegister.X10);
-                EmitMove(RVRegister.X29, RVRegister.X11);
-                EmitMove(RVRegister.X30, RVRegister.X12);
-                EmitMove(RVRegister.X31, RVRegister.X0);
-                EmitMaterializeAddress(contextTableLabel, RVRegister.X5);
-                EmitLoadImmediate(RVRegister.X6, contextCount);
-                EmitLoadImmediate(RVRegister.X14, 2);
-
-                DefineLabel(findOwnedLoopLabel);
-                Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X6, RVRegister.X0, noOwnedContextLabel));
-                Emit(RVInstruction.I(
-                    _machineTarget.Is64Bit ? RVInstrKind.Ld : RVInstrKind.Lw,
-                    RVRegister.X7,
-                    RVRegister.X5,
-                    0));
-                Emit(RVInstruction.I(RVInstrKind.Lw, RVRegister.X13, RVRegister.X7, 0));
-                Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X13, RVRegister.X14, findOwnedNextLabel));
-                Emit(RVInstruction.I(
-                    _machineTarget.Is64Bit ? RVInstrKind.Ld : RVInstrKind.Lw,
-                    RVRegister.X13,
-                    RVRegister.X7,
-                    _target.PointerSize));
-                Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X13, RVRegister.X29, ownedFoundLabel));
-
-                DefineLabel(findOwnedNextLabel);
-                Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X5, RVRegister.X5, _target.PointerSize));
-                Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X6, RVRegister.X6, -1));
-                Emit(RVInstruction.J(RVInstrKind.Jal, RVRegister.X0, findOwnedLoopLabel));
-
-                DefineLabel(noOwnedContextLabel);
-                EmitFutexWait(RVRegister.X28, 2);
-                EmitMove(RVRegister.X10, RVRegister.X0);
-                Emit(RVInstruction.I(RVInstrKind.Jalr, RVRegister.X0, RVRegister.X1, 0));
-
-                DefineLabel(ownedFoundLabel);
-                EmitMove(RVRegister.X31, RVRegister.X7);
-                Emit(RVInstruction.S(
-                    _machineTarget.Is64Bit ? RVInstrKind.Sd : RVInstrKind.Sw,
-                    RVRegister.X30,
-                    RVRegister.X31,
-                    checked(_target.PointerSize * 2)));
-                Emit(new RVInstruction(RVInstrKind.Fence, immediate: 0x33));
-                EmitLoadImmediate(RVRegister.X5, contextCount);
-                EmitMove(RVRegister.X6, RVRegister.X30);
-
-                DefineLabel(chainLoopLabel);
-                Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X6, RVRegister.X29, cycleLabel));
-                Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X5, RVRegister.X0, noCycleLabel));
-                EmitMaterializeAddress(contextTableLabel, RVRegister.X7);
-                EmitLoadImmediate(RVRegister.X13, contextCount);
-
-                DefineLabel(scanOwnerLoopLabel);
-                Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X13, RVRegister.X0, noCycleLabel));
-                Emit(RVInstruction.I(
-                    _machineTarget.Is64Bit ? RVInstrKind.Ld : RVInstrKind.Lw,
-                    RVRegister.X14,
-                    RVRegister.X7,
-                    0));
-                Emit(RVInstruction.I(RVInstrKind.Lw, RVRegister.X15, RVRegister.X14, 0));
-                EmitLoadImmediate(RVRegister.X16, 2);
-                Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X15, RVRegister.X16, scanOwnerNextLabel));
-                Emit(RVInstruction.I(
-                    _machineTarget.Is64Bit ? RVInstrKind.Ld : RVInstrKind.Lw,
-                    RVRegister.X15,
-                    RVRegister.X14,
-                    _target.PointerSize));
-                Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X15, RVRegister.X6, scanOwnerNextLabel));
-                Emit(RVInstruction.I(
-                    _machineTarget.Is64Bit ? RVInstrKind.Ld : RVInstrKind.Lw,
-                    RVRegister.X15,
-                    RVRegister.X14,
-                    checked(_target.PointerSize * 2)));
-                Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X15, RVRegister.X0, scanOwnerNextLabel));
-                EmitMove(RVRegister.X6, RVRegister.X15);
-                Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X5, RVRegister.X5, -1));
-                Emit(RVInstruction.J(RVInstrKind.Jal, RVRegister.X0, chainLoopLabel));
-
-                DefineLabel(scanOwnerNextLabel);
-                Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X7, RVRegister.X7, _target.PointerSize));
-                Emit(RVInstruction.I(RVInstrKind.Addi, RVRegister.X13, RVRegister.X13, -1));
-                Emit(RVInstruction.J(RVInstrKind.Jal, RVRegister.X0, scanOwnerLoopLabel));
-
-                DefineLabel(noCycleLabel);
-                EmitFutexWait(RVRegister.X28, 2);
-                Emit(RVInstruction.J(RVInstrKind.Jal, RVRegister.X0, clearAndReturnZeroLabel));
-
-                DefineLabel(cycleLabel);
-                Emit(RVInstruction.J(RVInstrKind.Jal, RVRegister.X0, clearAndReturnOneLabel));
-
-                DefineLabel(clearAndReturnZeroLabel);
-                Emit(RVInstruction.S(
-                    _machineTarget.Is64Bit ? RVInstrKind.Sd : RVInstrKind.Sw,
-                    RVRegister.X0,
-                    RVRegister.X31,
-                    checked(_target.PointerSize * 2)));
-                Emit(new RVInstruction(RVInstrKind.Fence, immediate: 0x33));
-                EmitMove(RVRegister.X10, RVRegister.X0);
-                Emit(RVInstruction.I(RVInstrKind.Jalr, RVRegister.X0, RVRegister.X1, 0));
-
-                DefineLabel(clearAndReturnOneLabel);
-                Emit(RVInstruction.S(
-                    _machineTarget.Is64Bit ? RVInstrKind.Sd : RVInstrKind.Sw,
-                    RVRegister.X0,
-                    RVRegister.X31,
-                    checked(_target.PointerSize * 2)));
-                Emit(new RVInstruction(RVInstrKind.Fence, immediate: 0x33));
-                EmitLoadImmediate(RVRegister.X10, 1);
-                Emit(RVInstruction.I(RVInstrKind.Jalr, RVRegister.X0, RVRegister.X1, 0));
-
-                _symbols.Add(new RVObjectSymbol(
-                    label,
-                    TextSectionName,
-                    startOffset,
-                    _text.ByteLength - startOffset,
-                    RVObjectSymbolBinding.Local,
-                    RVObjectSymbolKind.Function));
-            }
-
-            private void EmitTypeInitializationThunk(TypeInitializationThunkDraft thunk, string? waitHelperLabel)
+            private void EmitTypeInitializationThunk(TypeInitializationThunkDraft thunk)
             {
                 int startOffset = _text.ByteLength;
                 DefineLabel(thunk.Label);
@@ -2642,156 +2506,12 @@ namespace Cnidaria.Cs
                     savedFramePointerOffset));
                 EmitMove(RVRegister.X8, RVRegister.X2);
 
-                string retryLabel = CreateLocalLabel(thunk.Label + "_retry");
-                string runningLabel = CreateLocalLabel(thunk.Label + "_running");
-                string executeLabel = CreateLocalLabel(thunk.Label + "_execute");
-                string doneLabel = CreateLocalLabel(thunk.Label + "_done");
-                string failedLabel = CreateLocalLabel(thunk.Label + "_failed");
-                bool hasZacas = _machineTarget.HasZacas;
-                bool hasZalrsc = _machineTarget.HasZalrsc;
-                bool hasAtomics = hasZacas || hasZalrsc;
-
-                EmitMaterializeAddress(thunk.StateLabel, RVRegister.X28);
-                if (hasAtomics)
-                {
-                    DefineLabel(retryLabel);
-                    if (hasZacas)
-                    {
-                        EmitLoadImmediate(RVRegister.X31, 1);
-                        EmitLoadImmediate(RVRegister.X29, 2);
-                        Emit(RVInstruction.Amo(
-                            RVInstrKind.AmocasW,
-                            RVRegister.X31,
-                            RVRegister.X28,
-                            RVRegister.X29,
-                            acquire: true,
-                            release: true));
-                        Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, doneLabel));
-                        EmitLoadImmediate(RVRegister.X30, 2);
-                        Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X31, RVRegister.X30, runningLabel));
-                        EmitLoadImmediate(RVRegister.X30, 1);
-                        Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X31, RVRegister.X30, failedLabel));
-                    }
-                    else
-                    {
-                        Emit(RVInstruction.Amo(RVInstrKind.LrW, RVRegister.X31, RVRegister.X28, RVRegister.X0, acquire: true));
-                        Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, doneLabel));
-                        EmitLoadImmediate(RVRegister.X30, 2);
-                        Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X31, RVRegister.X30, runningLabel));
-                        EmitLoadImmediate(RVRegister.X30, 1);
-                        Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X31, RVRegister.X30, failedLabel));
-                        EmitLoadImmediate(RVRegister.X29, 2);
-                        Emit(RVInstruction.Amo(RVInstrKind.ScW, RVRegister.X30, RVRegister.X28, RVRegister.X29, release: true));
-                        Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X30, RVRegister.X0, retryLabel));
-                    }
-                    Emit(RVInstruction.J(RVInstrKind.Jal, RVRegister.X0, executeLabel));
-
-                    DefineLabel(runningLabel);
-                    EmitCurrentThreadId(RVRegister.X29);
-                    EmitMaterializeAddress(thunk.StateLabel, RVRegister.X28);
-                    Emit(RVInstruction.I(
-                        _machineTarget.Is64Bit ? RVInstrKind.Ld : RVInstrKind.Lw,
-                        RVRegister.X30,
-                        RVRegister.X28,
-                        _target.PointerSize));
-                    Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X30, RVRegister.X0, retryLabel));
-                    Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X30, RVRegister.X29, doneLabel));
-                    if (waitHelperLabel is not null)
-                    {
-                        EmitMove(RVRegister.X10, RVRegister.X28);
-                        EmitMove(RVRegister.X11, RVRegister.X29);
-                        EmitMove(RVRegister.X12, RVRegister.X30);
-                        EmitPcrelTransfer(waitHelperLabel, link: true);
-                        Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X10, RVRegister.X0, doneLabel));
-                    }
-                    else
-                    {
-                        EmitFutexWait(RVRegister.X28, 2);
-                    }
-                    EmitMaterializeAddress(thunk.StateLabel, RVRegister.X28);
-                    Emit(RVInstruction.J(RVInstrKind.Jal, RVRegister.X0, retryLabel));
-                }
-                else
-                {
-                    Emit(RVInstruction.I(RVInstrKind.Lw, RVRegister.X31, RVRegister.X28, 0));
-                    Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X31, RVRegister.X0, doneLabel));
-                    EmitLoadImmediate(RVRegister.X30, 2);
-                    Emit(RVInstruction.B(RVInstrKind.Beq, RVRegister.X31, RVRegister.X30, doneLabel));
-                    EmitLoadImmediate(RVRegister.X30, 1);
-                    Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X31, RVRegister.X30, failedLabel));
-                    EmitLoadImmediate(RVRegister.X30, 2);
-                    Emit(RVInstruction.S(RVInstrKind.Sw, RVRegister.X30, RVRegister.X28, 0));
-                }
-
-                DefineLabel(executeLabel);
-                EmitCurrentThreadId(RVRegister.X29);
-                EmitMaterializeAddress(thunk.StateLabel, RVRegister.X28);
-                Emit(RVInstruction.S(
-                    _machineTarget.Is64Bit ? RVInstrKind.Sd : RVInstrKind.Sw,
-                    RVRegister.X29,
-                    RVRegister.X28,
-                    _target.PointerSize));
-                Emit(RVInstruction.S(
-                    _machineTarget.Is64Bit ? RVInstrKind.Sd : RVInstrKind.Sw,
-                    RVRegister.X0,
-                    RVRegister.X28,
-                    checked(_target.PointerSize * 2)));
+                EmitMaterializeAddress(thunk.StateLabel, RVRegister.X10);
+                EmitMaterializeAddress(ResolveMethodLabel(thunk.Initializer), RVRegister.X11);
                 string returnLabel = CreateLocalLabel(thunk.Label + "_gc_return");
-                AddSafePoint(
-                    thunk.Label,
-                    returnLabel,
-                    region,
-                    ImmutableArray<SafePointRootDraft>.Empty);
-                EmitPcrelTransfer(ResolveMethodLabel(thunk.Initializer), link: true);
+                AddSafePoint(thunk.Label, returnLabel, region, ImmutableArray<SafePointRootDraft>.Empty);
+                EmitPcrelTransfer(ResolveMethodLabel((_program.ClassConstructorRunnerMethod ?? throw new MissingMethodException("The class constructor runner is missing."))), link: true);
                 DefineLabel(returnLabel);
-                EmitMaterializeAddress(thunk.StateLabel, RVRegister.X28);
-                Emit(RVInstruction.S(
-                    _machineTarget.Is64Bit ? RVInstrKind.Sd : RVInstrKind.Sw,
-                    RVRegister.X0,
-                    RVRegister.X28,
-                    checked(_target.PointerSize * 2)));
-                Emit(RVInstruction.S(
-                    _machineTarget.Is64Bit ? RVInstrKind.Sd : RVInstrKind.Sw,
-                    RVRegister.X0,
-                    RVRegister.X28,
-                    _target.PointerSize));
-                if (hasAtomics)
-                {
-                    if (_machineTarget.HasZaamo)
-                    {
-                        Emit(RVInstruction.Amo(RVInstrKind.AmoSwapW, RVRegister.X0, RVRegister.X28, RVRegister.X0, release: true));
-                    }
-                    else
-                    {
-                        string publishRetryLabel = CreateLocalLabel(thunk.Label + "_publish_retry");
-                        DefineLabel(publishRetryLabel);
-                        Emit(RVInstruction.Amo(RVInstrKind.LrW, RVRegister.X31, RVRegister.X28, RVRegister.X0));
-                        Emit(RVInstruction.Amo(RVInstrKind.ScW, RVRegister.X30, RVRegister.X28, RVRegister.X0, release: true));
-                        Emit(RVInstruction.B(RVInstrKind.Bne, RVRegister.X30, RVRegister.X0, publishRetryLabel));
-                    }
-                    EmitMaterializeAddress(thunk.StateLabel, RVRegister.X28);
-                    EmitFutexWakeAll(RVRegister.X28);
-                }
-                else
-                {
-                    Emit(new RVInstruction(RVInstrKind.Fence, immediate: 0x31));
-                    Emit(RVInstruction.S(RVInstrKind.Sw, RVRegister.X0, RVRegister.X28, 0));
-                }
-                Emit(RVInstruction.J(RVInstrKind.Jal, RVRegister.X0, doneLabel));
-
-                DefineLabel(failedLabel);
-                if (_target.OperatingSystem == OperatingSystemKind.Linux)
-                {
-                    EmitLoadImmediate(RVRegister.X10, 150);
-                    EmitPcrelTransfer(ResolveExternalSymbol(RiscVRuntime.FailFastSymbol), link: false);
-                }
-                else
-                {
-                    Emit(new RVInstruction(RVInstrKind.Ebreak));
-                    Emit(RVInstruction.J(RVInstrKind.Jal, RVRegister.X0, 0));
-                }
-
-                DefineLabel(doneLabel);
                 EmitMove(RVRegister.X2, RVRegister.X8);
                 Emit(RVInstruction.I(
                     _machineTarget.Is64Bit ? RVInstrKind.Ld : RVInstrKind.Lw,
@@ -2852,7 +2572,7 @@ namespace Cnidaria.Cs
                     throw new ArgumentNullException(nameof(type));
                 if (_staticStorageByTypeId.TryGetValue(type.TypeId, out StaticStorageDraft? existing))
                     return existing;
-                if (type.StaticFields.Length != 0 && type.StaticSize <= 0)
+                if (type.StaticFields.Length != 0 && type.StaticSize <= 0 && type.ThreadStaticSize <= 0)
                     throw new InvalidOperationException($"Static layout was not computed for T{type.TypeId} '{type.Namespace}.{type.Name}'.");
 
                 string label = CreateLocalLabel($"statics_{type.TypeId}");
@@ -2871,16 +2591,64 @@ namespace Cnidaria.Cs
                 var storage = new StaticStorageDraft(type, label);
                 _staticStorageByTypeId.Add(type.TypeId, storage);
 
-                var roots = ImmutableArray.CreateBuilder<TypeGcFieldDraft>();
+                ImmutableArray<TypeGcFieldDraft>.Builder roots = ImmutableArray.CreateBuilder<TypeGcFieldDraft>();
                 for (int i = 0; i < type.StaticFields.Length; i++)
                 {
                     RuntimeField field = type.StaticFields[i];
-                    AppendTypedGcFields(roots, field.Offset, field.FieldType);
+                    if (!field.IsThreadStatic)
+                        AppendTypedGcFields(roots, field.Offset, field.FieldType);
                 }
                 for (int i = 0; i < roots.Count; i++)
                     _staticRoots.Add(new StaticRootDraft(label, roots[i].Offset, roots[i].Kind));
 
                 return storage;
+            }
+
+            private int GetThreadStaticOffset(RuntimeType type)
+            {
+                if (_threadStaticOffsetByTypeId.TryGetValue(type.TypeId, out int existing))
+                    return existing;
+
+                int offset = AlignValueUp(_threadStaticSize, Math.Max(1, type.ThreadStaticAlign));
+                _threadStaticSize = checked(offset + type.ThreadStaticSize);
+                _threadStaticOffsetByTypeId.Add(type.TypeId, offset);
+
+                ImmutableArray<TypeGcFieldDraft>.Builder roots = ImmutableArray.CreateBuilder<TypeGcFieldDraft>();
+                for (int i = 0; i < type.StaticFields.Length; i++)
+                {
+                    RuntimeField field = type.StaticFields[i];
+                    if (field.IsThreadStatic)
+                        AppendTypedGcFields(roots, checked(offset + field.Offset), field.FieldType);
+                }
+                _threadStaticRoots.AddRange(roots);
+                return offset;
+            }
+
+            private void EmitThreadStaticMetadata()
+            {
+                int pointerSize = _target.PointerSize;
+                AddGlobalDataSymbol("RhpThreadStaticRoots", _rodata.Align(pointerSize), Math.Max(1, _threadStaticRoots.Count) * pointerSize * 2);
+                for (int i = 0; i < _threadStaticRoots.Count; i++)
+                {
+                    EmitNative(_threadStaticRoots[i].Offset);
+                    EmitNative(ToRuntimeRootKind(_threadStaticRoots[i].Kind));
+                }
+                if (_threadStaticRoots.Count == 0)
+                {
+                    EmitNative(0);
+                    EmitNative(0);
+                }
+                AddGlobalDataSymbol("RhpThreadStaticRootCount", _rodata.ByteLength, pointerSize);
+                EmitNative(_threadStaticRoots.Count);
+                AddGlobalDataSymbol("RhpThreadStaticSize", _rodata.ByteLength, pointerSize);
+                EmitNative(AlignValueUp(_threadStaticSize, pointerSize));
+            }
+
+            private void AddGlobalDataSymbol(string label, int offset, int size)
+            {
+                if (!_usedLabels.Add(label))
+                    throw new InvalidOperationException($"Duplicate RISC-V runtime data symbol: {label}.");
+                _symbols.Add(new RVObjectSymbol(label, RodataSectionName, offset, size, RVObjectSymbolBinding.Global, RVObjectSymbolKind.Object));
             }
 
             private string GetStringLiteralLabel(RuntimeType type, string text)
@@ -3494,6 +3262,7 @@ namespace Cnidaria.Cs
                     }
                 }
 
+                EmitThreadStaticMetadata();
                 return new RuntimeMetadataLabels(tableLabel, typeInfoTableLabel, staticRootTableLabel, regionTable);
             }
 
@@ -6513,12 +6282,22 @@ namespace Cnidaria.Cs
 
                 private void EmitReturn(GenTree node)
                 {
+                    if ((node.Flags & GenTreeFlags.AsyncSuspend) != 0)
+                    {
+                        _owner.EmitLoadImmediate(ToIntegerRegister(RegisterInfo.GetIntegerReturnRegister(Target, 0)), 0);
+                        _owner.EmitLoadImmediate(ToIntegerRegister(RegisterInfo.GetIntegerReturnRegister(Target, 1)), 0);
+                        _owner.Emit(RVInstruction.I(RVInstrKind.Jalr, RVRegister.X0, RVRegister.X1, 0));
+                        return;
+                    }
+
                     if (node.Uses.Length != 0 && MachineAbi.RequiresHiddenReturnBuffer(_method.RuntimeMethod, Target))
                     {
                         EmitHiddenReturnBufferCopy(node);
                         return;
                     }
 
+                    if (_method.RuntimeMethod.IsAsyncCall)
+                        _owner.EmitLoadImmediate(ToIntegerRegister(RegisterInfo.AsyncContinuationRegister(Target)), 0);
                     _owner.Emit(RVInstruction.I(RVInstrKind.Jalr, RVRegister.X0, RVRegister.X1, 0));
                 }
 
@@ -7007,6 +6786,9 @@ namespace Cnidaria.Cs
                             return;
                         case RuntimeIntrinsicId.MemoryBarrier:
                             _owner.Emit(new RVInstruction(RVInstrKind.Fence, immediate: 0x33));
+                            return;
+                        case RuntimeIntrinsicId.AsyncCallContinuation:
+                            EmitRegisterMove(RequireResultRegister(node), RegisterInfo.AsyncContinuationRegister(Target), node.Type, GenStackKind.Ref);
                             return;
                         case RuntimeIntrinsicId.VolatileRead:
                             // fence r,rw after the load
@@ -8809,27 +8591,36 @@ namespace Cnidaria.Cs
 
                     RuntimeType fieldType = field.FieldType;
                     GenStackKind kind = StackKindForType(fieldType);
-                    _owner.EmitMaterializeAddress(_owner.GetOrCreateStaticStorage(field.DeclaringType).StorageLabel, RVRegister.X28);
+                    int fieldOffset = field.Offset;
+                    if (field.IsThreadStatic)
+                    {
+                        fieldOffset = checked(fieldOffset + _owner.GetThreadStaticOffset(field.DeclaringType));
+                        _owner.EmitDelegateMemoryLoad(MachineRegister.X28, RVRegister.X4, Target.PointerSize, Target.PointerSize, signed: false);
+                    }
+                    else
+                    {
+                        _owner.EmitMaterializeAddress(_owner.GetOrCreateStaticStorage(field.DeclaringType).StorageLabel, RVRegister.X28);
+                    }
 
                     switch (node.TreeKind)
                     {
                         case GenTreeKind.StaticFieldAddr:
                             if (node.Results.Length != 1 || !node.Results[0].IsRegister)
                                 throw Unsupported(node, "Static field address requires one register result");
-                            _owner.EmitAddImmediate(ToIntegerRegister(node.Results[0].Register), RVRegister.X28, field.Offset);
+                            _owner.EmitAddImmediate(ToIntegerRegister(node.Results[0].Register), RVRegister.X28, fieldOffset);
                             return;
 
                         case GenTreeKind.StaticField:
-                            EmitValueFromAddress(node, fieldType, kind, RVRegister.X28, field.Offset);
+                            EmitValueFromAddress(node, fieldType, kind, RVRegister.X28, fieldOffset);
                             return;
 
                         case GenTreeKind.StoreStaticField:
                             if (IsContainedDefaultValue(node, 0))
                             {
                                 if (IsAggregate(fieldType, kind))
-                                    EmitZeroAddress(node, OffsetAddress(RVRegister.X28, field.Offset), StorageSize(fieldType, kind), StoreAlignment(node, fieldType));
+                                    EmitZeroAddress(node, OffsetAddress(RVRegister.X28, fieldOffset), StorageSize(fieldType, kind), StoreAlignment(node, fieldType));
                                 else
-                                    EmitStoreDefaultToAddress(MachineRegister.X28, field.Offset, fieldType, kind);
+                                    EmitStoreDefaultToAddress(MachineRegister.X28, fieldOffset, fieldType, kind);
                                 return;
                             }
 
@@ -8839,7 +8630,7 @@ namespace Cnidaria.Cs
                                 fieldType,
                                 kind,
                                 RVRegister.X28,
-                                field.Offset);
+                                fieldOffset);
                             return;
 
                         default:

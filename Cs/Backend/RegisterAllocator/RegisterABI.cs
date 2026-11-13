@@ -553,6 +553,131 @@ namespace Cnidaria.Cs
             return IsPhysicallyPromotableStruct(type, abi, target);
         }
 
+        public static AbiCallDescriptor BuildCallDescriptorFromAllocatedShape(RegisterAllocatedMethod method, GenTree node)
+        {
+            if (node.RegisterUses.Length != node.Uses.Length)
+                throw new InvalidOperationException("Call-like node must preserve one GenTree value per ABI argument operand or fragment.");
+            if (node.UseRoles.Length != node.Uses.Length)
+                throw new InvalidOperationException("Call-like node must preserve one operand role per ABI argument operand or fragment.");
+
+            ImmutableArray<GenTree>.Builder explicitArguments = ImmutableArray.CreateBuilder<GenTree>();
+            GenTree? hiddenReturnBufferValue = null;
+
+            int generalArgumentIndex = 0;
+            int floatArgumentIndex = 0;
+            int index = 0;
+            int argumentOperandCount = node.Kind == GenTreeKind.IndirectCall
+                ? node.RegisterUses.Length - 1
+                : node.RegisterUses.Length;
+            while (index < argumentOperandCount)
+            {
+                OperandRole role = node.UseRoles[index];
+                if (role == OperandRole.HiddenReturnBuffer)
+                {
+                    if (hiddenReturnBufferValue is not null)
+                        throw new InvalidOperationException("Call-like node has more than one hidden return-buffer operand.");
+                    if (node.RegisterResult is not null)
+                        throw new InvalidOperationException("Hidden return-buffer call-like node must not also expose a result value on the call node.");
+
+                    hiddenReturnBufferValue = node.RegisterUses[index];
+                    generalArgumentIndex++;
+                    index++;
+                    continue;
+                }
+
+                if (role != OperandRole.Normal)
+                    throw new InvalidOperationException("Call-like node has an unknown ABI operand role: " + role + ".");
+
+                AddCompressedExpandedCallArgument(
+                    method,
+                    node,
+                    explicitArguments,
+                    ref index,
+                    ref generalArgumentIndex,
+                    ref floatArgumentIndex);
+            }
+
+            return MachineAbi.BuildCallDescriptor(
+                explicitArguments.ToImmutable(),
+                method.GenTreeMethod.GetValueInfo,
+                hiddenReturnBufferValue ?? node.RegisterResult,
+                node.Method,
+                method.GenTreeMethod.Target);
+        }
+
+        private static void AddCompressedExpandedCallArgument(
+            RegisterAllocatedMethod method,
+            GenTree node,
+            ImmutableArray<GenTree>.Builder explicitArguments,
+            ref int index,
+            ref int generalArgumentIndex,
+            ref int floatArgumentIndex)
+        {
+            if ((uint)index >= (uint)node.RegisterUses.Length)
+                throw new ArgumentOutOfRangeException(nameof(index));
+
+            GenTree value = node.RegisterUses[index];
+            GenTreeValueInfo info = method.GenTreeMethod.GetValueInfo(value);
+            AbiValueInfo abi = MachineAbi.ClassifyValue(info.Type, info.StackKind, isReturn: false, target: method.GenTreeMethod.Target);
+            abi = MachineAbi.AdjustArgumentAbiForRegisterAvailability(
+                abi,
+                generalArgumentIndex,
+                floatArgumentIndex,
+                method.GenTreeMethod.Target);
+            int operandCount = abi.PassingKind == AbiValuePassingKind.MultiRegister
+                ? MachineAbi.GetRegisterSegments(abi, method.GenTreeMethod.Target).Length
+                : 1;
+
+            if (operandCount <= 0)
+                operandCount = 1;
+            if (index + operandCount > node.RegisterUses.Length)
+            {
+                throw new InvalidOperationException(
+                    $"Call-like node has an incomplete expanded ABI argument for {value}. " +
+                    $"Actual remaining operands: {node.RegisterUses.Length - index}, expected: {operandCount}.");
+            }
+
+            for (int i = 0; i < operandCount; i++)
+            {
+                int operandIndex = index + i;
+                if (node.UseRoles[operandIndex] != OperandRole.Normal)
+                {
+                    throw new InvalidOperationException(
+                        $"Expanded ABI argument fragment {i} for {value} has wrong role. " +
+                        $"Actual: {node.UseRoles[operandIndex]}, expected: {OperandRole.Normal}.");
+                }
+
+                if (!node.RegisterUses[operandIndex].Equals(value))
+                {
+                    throw new InvalidOperationException(
+                        $"Expanded ABI argument fragment {i} has wrong GenTree value metadata. " +
+                        $"Actual: {node.RegisterUses[operandIndex]}, expected: {value}.");
+                }
+            }
+
+            if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
+            {
+                if (abi.RegisterClass == RegisterClass.Float)
+                    floatArgumentIndex++;
+                else if (abi.RegisterClass == RegisterClass.General)
+                    generalArgumentIndex++;
+            }
+            else if (abi.PassingKind == AbiValuePassingKind.MultiRegister)
+            {
+                ImmutableArray<AbiRegisterSegment> segments = MachineAbi.GetRegisterSegments(abi, method.GenTreeMethod.Target);
+                for (int i = 0; i < segments.Length; i++)
+                {
+                    if (segments[i].RegisterClass == RegisterClass.Float)
+                        floatArgumentIndex++;
+                    else if (segments[i].RegisterClass == RegisterClass.General)
+                        generalArgumentIndex++;
+                }
+            }
+
+            explicitArguments.Add(value);
+            index += operandCount;
+        }
+
         public static ImmutableArray<AbiRegisterSegment> GetRegisterSegments(AbiValueInfo abi, TargetInfo? target = null)
         {
             if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)

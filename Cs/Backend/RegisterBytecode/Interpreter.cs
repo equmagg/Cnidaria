@@ -83,18 +83,30 @@ namespace Cnidaria.Cs
         private const int ShadowFrameCallFlagsMask = 0x0000FFFF;
         private const int ShadowFrameFilterFlag = 0x00010000;
 
-        private readonly byte[] _mem;
+        private byte[] _mem;
         private readonly int _staticEnd;
-        private readonly int _stackBase;
-        private readonly int _stackEnd;
+        private int _stackBase;
+        private int _stackEnd;
         private readonly int _heapBase;
         private readonly int _heapEnd;
         private readonly RuntimeTypeSystem _rts;
         private readonly Dictionary<string, RuntimeModule> _modules;
         private readonly TextWriter _textWriter;
         private readonly CodeImage _image;
-        private readonly long[] _x = new long[GprCount];
-        private readonly long[] _f = new long[FprCount];
+        [InlineArray(GprCount)]
+        private struct GeneralRegisters
+        {
+            private long _element0;
+        }
+
+        [InlineArray(FprCount)]
+        private struct FloatRegisters
+        {
+            private long _element0;
+        }
+
+        private GeneralRegisters _x;
+        private FloatRegisters _f;
         private int _frameStackTop;
         private int _frameStackPeakTop;
         private int _frameCount;
@@ -107,7 +119,7 @@ namespace Cnidaria.Cs
         private readonly Dictionary<string, int> _internPool = new Dictionary<string, int>(StringComparer.Ordinal);
         private readonly Dictionary<int, string> _stringLiterals = new Dictionary<int, string>();
         private readonly Dictionary<int, byte> _typeInitState = new Dictionary<int, byte>();
-        private readonly List<RegisterSnapshot?> _registerSnapshots = new List<RegisterSnapshot?>();
+        private List<RegisterSnapshot?> _registerSnapshots = new List<RegisterSnapshot?>();
         private readonly Dictionary<int, HostOverride> _hostOverrides = new Dictionary<int, HostOverride>();
         private readonly VmCallContext _hostCtx;
         private int _gcMarkHead;
@@ -127,10 +139,10 @@ namespace Cnidaria.Cs
         private int _heapPeakAbs;
         private int _staticDataRegionBytes;
         private int _currentExceptionRef;
-        private readonly List<ActiveHandler> _activeHandlers = new List<ActiveHandler>();
-        private readonly List<FilterSearch> _filterSearches = new List<FilterSearch>();
+        private List<ActiveHandler> _activeHandlers = new List<ActiveHandler>();
+        private List<FilterSearch> _filterSearches = new List<FilterSearch>();
         // References host code holds across an allocation; the collector marks them and rewrites them when it compacts
-        private readonly List<int> _hostRoots = new List<int>();
+        private List<int> _hostRoots = new List<int>();
 
         private enum GcHandleKind
         {
@@ -206,12 +218,12 @@ namespace Cnidaria.Cs
             }
         }
 
-        private readonly struct RegisterSnapshot
+        private sealed class RegisterSnapshot
         {
-            public readonly long[] General;
-            public readonly long[] Float;
+            public GeneralRegisters General;
+            public FloatRegisters Float;
 
-            public RegisterSnapshot(long[] general, long[] @float)
+            public RegisterSnapshot(GeneralRegisters general, FloatRegisters @float)
             {
                 General = general;
                 Float = @float;
@@ -288,6 +300,8 @@ namespace Cnidaria.Cs
         public void Execute(int entryPc, CancellationToken ct, ExecutionLimits limits, ReadOnlySpan<VmValue> initialArgs = default)
         {
             if (limits is null) throw new ArgumentNullException(nameof(limits));
+            ArgumentOutOfRangeException.ThrowIfLessThan(limits.MaxThreads, 1);
+            ArgumentOutOfRangeException.ThrowIfNegative(limits.MaxAdditionalMemoryBytes);
             if (!_image.MethodIndexByEntryPc.TryGetValue(entryPc, out int entryIndex))
                 throw new MissingMethodException($"Entry PC is not present in register code image: {entryPc}");
 
@@ -322,8 +336,8 @@ namespace Cnidaria.Cs
             _gcMarkHead = 0;
             _allocDebtBytes = 0;
             _gcRunning = false;
-            Array.Clear(_x, 0, _x.Length);
-            Array.Clear(_f, 0, _f.Length);
+            _x = default;
+            _f = default;
             X(MachineRegisters.StackPointer, _stackEnd);
             X(MachineRegisters.FramePointer, _stackEnd);
             X(MachineRegisters.ThreadPointer, 0);
@@ -342,7 +356,7 @@ namespace Cnidaria.Cs
                 incomingStackArgBase);
             X(MachineRegisters.ThreadPointer, incomingStackArgBase);
 
-            Run(ct, limits);
+            ExecuteThreads(ct, limits);
         }
 
         private int PrepareEntryArguments(RuntimeMethod? method, ReadOnlySpan<VmValue> initialArgs)
@@ -489,7 +503,7 @@ namespace Cnidaria.Cs
             int tokenCheckPeriod = Math.Max(1, limits.TokenCheckPeriod);
             var code = _image.Code;
 
-            while (_currentMethodIndex >= 0)
+            while (_currentMethodIndex >= 0 && !_yieldRequested)
             {
                 if (--_fuel < 0)
                     throw new OperationCanceledException("Instruction budget exceeded.");
@@ -523,6 +537,8 @@ namespace Cnidaria.Cs
                         MaybeCollectGarbage();
                         if (_finalizerReadyHead != _finalizerReady.Count && _monitorsHeld == 0 && !_finalizersRunning)
                             EnterFinalizerDrain();
+                        else
+                            YieldVmThread();
                         break;
 
                     case Op.J:
@@ -667,7 +683,9 @@ namespace Cnidaria.Cs
                         SetGpr(ins.Rd, ins.Imm);
                         break;
                     case Op.LiStaticBase:
-                        SetGpr(ins.Rd, EnsureStaticStorage(TypeLayout(ins.Imm)));
+                        SetGpr(ins.Rd, ((InstructionFlags)ins.Aux & InstructionFlags.ThreadStatic) != 0
+                            ? EnsureThreadStaticStorage(TypeLayout(ins.Imm))
+                            : EnsureStaticStorage(TypeLayout(ins.Imm)));
                         break;
 
                     case Op.I32Add: SetI32(ins.Rd, unchecked((int)GetGpr(ins.Rs1) + (int)GetGpr(ins.Rs2))); break;
@@ -1974,8 +1992,21 @@ namespace Cnidaria.Cs
             TypeLayoutRecord type = TypeLayout(typeLayoutIndex);
             if (_typeInitState.TryGetValue(type.RuntimeTypeId, out byte state))
             {
-                // 1 == running
-                // 2 == completed or known noop
+                if (state == 2)
+                    return false;
+                if (state == 1)
+                {
+                    if (!WaitForTypeInitializer(type.RuntimeTypeId))
+                        return false;
+                    _pc = returnPc;
+                    return true;
+                }
+                TypeInitialization initialization = _typeInitializations[type.RuntimeTypeId];
+                if (initialization.Failure != 0)
+                {
+                    ThrowManaged(_gcHandles[GcHandleIndex(initialization.Failure)].Object, returnPc, preserveExistingThrowSite: false);
+                    return true;
+                }
                 return false;
             }
 
@@ -1993,6 +2024,7 @@ namespace Cnidaria.Cs
                 throw new MissingMethodException($"Type initializer marker is invalid for type layout {typeLayoutIndex}.");
 
             _typeInitState[type.RuntimeTypeId] = 1;
+            _typeInitializations[type.RuntimeTypeId] = new TypeInitialization(_currentThread);
             int snapshotIndex = SaveRegisterSnapshot();
             EnterManagedFrame(cctorMethodIndex, returnPc, CallFlags.None);
             SetTopRegisterSnapshotIndex(snapshotIndex);
@@ -2041,7 +2073,7 @@ namespace Cnidaria.Cs
             if (_frameCount == 0 || retPc < 0)
             {
                 if (returnedFromCctor)
-                    _typeInitState[cctorTypeId] = 2;
+                    CompleteTypeInitializer(cctorTypeId, 0);
 
                 if (registerSnapshotIndex >= 0)
                     ReleaseRegisterSnapshot(registerSnapshotIndex);
@@ -2064,8 +2096,8 @@ namespace Cnidaria.Cs
                 if ((uint)registerSnapshotIndex >= (uint)_registerSnapshots.Count || _registerSnapshots[registerSnapshotIndex] is not RegisterSnapshot snapshot)
                     throw new InvalidOperationException("Invalid register snapshot index.");
 
-                Array.Copy(snapshot.General, _x, GprCount);
-                Array.Copy(snapshot.Float, _f, FprCount);
+                _x = snapshot.General;
+                _f = snapshot.Float;
                 _registerSnapshots[registerSnapshotIndex] = null;
                 X(MachineRegisters.StackPointer, callerSp);
                 X(MachineRegisters.FramePointer, callerFp);
@@ -2090,7 +2122,7 @@ namespace Cnidaria.Cs
                     throw new InvalidOperationException($"Invalid return payload kind: {payloadKind}");
             }
 
-            if (returnedFromCctor) _typeInitState[cctorTypeId] = 2;
+            if (returnedFromCctor) CompleteTypeInitializer(cctorTypeId, 0);
         }
         private void RestoreSavedRegistersForCurrentFrame()
         {
@@ -2130,7 +2162,7 @@ namespace Cnidaria.Cs
         }
         private int SaveRegisterSnapshot()
         {
-            var snapshot = new RegisterSnapshot((long[])_x.Clone(), (long[])_f.Clone());
+            var snapshot = new RegisterSnapshot(_x, _f);
             for (int i = 0; i < _registerSnapshots.Count; i++)
             {
                 if (_registerSnapshots[i] is null)
@@ -2319,6 +2351,12 @@ namespace Cnidaria.Cs
                     }
                 }
 
+                if (method.StaticConstructorTypeLayoutIndex >= 0)
+                {
+                    Unwind(search.ThrowPc, DispatchTarget.None);
+                    return;
+                }
+
                 int returnPc = ReadI32(frame + ShadowFrameReturnPc);
                 if (frame == _stackBase || returnPc < 0)
                 {
@@ -2384,8 +2422,8 @@ namespace Cnidaria.Cs
             PopFrame();
             if ((uint)snapshotIndex >= (uint)_registerSnapshots.Count || _registerSnapshots[snapshotIndex] is not RegisterSnapshot snapshot)
                 throw new InvalidOperationException("Invalid register snapshot index.");
-            Array.Copy(snapshot.General, _x, GprCount);
-            Array.Copy(snapshot.Float, _f, FprCount);
+            _x = snapshot.General;
+            _f = snapshot.Float;
             ReleaseRegisterSnapshot(snapshotIndex);
             X(MachineRegisters.StackPointer, callerSp);
             X(MachineRegisters.FramePointer, callerFp);
@@ -2426,9 +2464,10 @@ namespace Cnidaria.Cs
                     return;
                 }
 
+                _currentSafePointPc = throwPc;
                 int unwindingStaticConstructorTypeLayoutIndex = _image.Methods[_currentMethodIndex].StaticConstructorTypeLayoutIndex;
                 if (unwindingStaticConstructorTypeLayoutIndex >= 0)
-                    _typeInitState.Remove(TypeLayout(unwindingStaticConstructorTypeLayoutIndex).RuntimeTypeId);
+                    FailTypeInitializer(TypeLayout(unwindingStaticConstructorTypeLayoutIndex).RuntimeTypeId);
 
                 int registerSnapshotIndex = TopRegisterSnapshotIndex();
                 int retPc = TopReturnPc();
@@ -2436,7 +2475,13 @@ namespace Cnidaria.Cs
                 long callerFp = TopCallerFp();
                 PopFrame();
                 if (registerSnapshotIndex >= 0)
+                {
+                    if (_registerSnapshots[registerSnapshotIndex] is not RegisterSnapshot snapshot)
+                        throw new InvalidOperationException("Invalid register snapshot index.");
+                    _x = snapshot.General;
+                    _f = snapshot.Float;
                     ReleaseRegisterSnapshot(registerSnapshotIndex);
+                }
                 if (_frameCount == 0 || retPc < 0)
                     break;
                 int callerMethod = MethodIndexForFrame(TopFrameOffset());
@@ -2445,7 +2490,12 @@ namespace Cnidaria.Cs
                 X(MachineRegisters.StackPointer, callerSp);
                 X(MachineRegisters.FramePointer, callerFp);
                 X(MachineRegisters.ThreadPointer, TopIncomingStackArgBase());
-                throwPc = _pc - 1;
+                throwPc = unwindingStaticConstructorTypeLayoutIndex >= 0 ? _pc : _pc - 1;
+                if (unwindingStaticConstructorTypeLayoutIndex >= 0)
+                {
+                    ThrowManaged(_currentExceptionRef, throwPc, preserveExistingThrowSite: false);
+                    return;
+                }
             }
 
             string message = TryReadExceptionMessage(_currentExceptionRef);
@@ -2676,7 +2726,7 @@ namespace Cnidaria.Cs
         private RuntimeType ResolveCatchType(int catchTypeTokenOrId, int methodIndex)
         {
             int table = MetadataToken.Table(catchTypeTokenOrId);
-            if (table is MetadataToken.TypeDef or MetadataToken.TypeRef or MetadataToken.TypeSpec)
+            if (table is MetadataToken.TypeDef or MetadataToken.TypeRef or MetadataToken.TypeSpec or RuntimeTypeSystem.RuntimeTypeReferenceTable)
             {
                 RuntimeMethod method = MethodForIndex(methodIndex);
                 return _rts.ResolveTypeInMethodContext(ModuleOf(method), catchTypeTokenOrId, method);
@@ -3432,6 +3482,24 @@ namespace Cnidaria.Cs
                 }
             }
 
+            if (rm.HasInternalCall && rm.DeclaringType.Namespace == "System.Runtime.InteropServices" && rm.DeclaringType.Name == "Marshal")
+            {
+                if (rm.Name == "AllocHGlobal")
+                {
+                    SetGpr(MachineRegisters.ReturnValue0, AllocateNativeMemory(checked((int)ReadAbiScalarArgument(rm, 0))));
+                    return true;
+                }
+                if (rm.Name == "FreeHGlobal")
+                {
+                    int address = checked((int)ReadAbiScalarArgument(rm, 0));
+                    foreach (VmThreadState thread in _threads)
+                        if (address != 0 && address == thread.stackBase)
+                            throw new AccessViolationException("A thread stack is not an unmanaged allocation.");
+                    FreeNativeMemory(address);
+                    return true;
+                }
+            }
+
             if (rm.HasInternalCall && rm.IsStatic && rm.DeclaringType.Namespace == "System.Runtime" &&
                 rm.DeclaringType.Name == "InternalCalls" && rm.Name == "RhpNewFast")
             {
@@ -3488,6 +3556,7 @@ namespace Cnidaria.Cs
                 rm.ParameterTypes.Length == 0 &&
                 rm.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Void)
             {
+                YieldVmThread();
                 MaybeCollectGarbage();
                 return true;
             }
@@ -3503,18 +3572,6 @@ namespace Cnidaria.Cs
             {
                 //SetReturnI4(Thread.GetCurrentProcessorId());
                 SetReturnI4(1);
-                return true;
-            }
-
-            if (rm.DeclaringType.Namespace == "System.Threading" &&
-                rm.DeclaringType.Name == "ObjectHeader" &&
-                !rm.HasThis &&
-                rm.IsStatic &&
-                rm.ParameterTypes.Length == 1 &&
-                rm.ReturnType.PrimitiveKind == RuntimePrimitiveKind.Void &&
-                (rm.Name == "AcquireThinLock" || rm.Name == "Release"))
-            {
-                _monitorsHeld += rm.Name == "Release" ? -1 : 1;
                 return true;
             }
 
@@ -3728,6 +3785,8 @@ namespace Cnidaria.Cs
 
         private bool IntrinsicInteropSys(RuntimeMethod rm)
         {
+            if (TryThreadingInterop(rm))
+                return true;
             switch (rm.Name)
             {
                 case "GetNonCryptographicallySecureRandomBytes":
@@ -4723,7 +4782,7 @@ namespace Cnidaria.Cs
 
             if (type.StaticSize <= 0)
             {
-                if (type.StaticFields.Length != 0)
+                if (type.StaticFields.Length != 0 && type.ThreadStaticSize <= 0)
                 {
                     throw new InvalidOperationException(
                         $"Static layout was not computed for '{type.Namespace}.{type.Name}'. " +
@@ -4858,7 +4917,30 @@ namespace Cnidaria.Cs
                     CollectGarbage(compact: false);
                     return;
                 case "RhpFallbackFailFast":
-                    throw new InvalidOperationException($"Fail fast with code {ReadAbiScalarArgument(rm, 0)}.");
+                    throw new InvalidOperationException($"Fail fast with code {ReadAbiScalarArgument(rm, 0)}. " +
+                        FormatUnhandledExceptionHeader(FormatExceptionTypeName(_currentExceptionRef), TryReadExceptionMessage(_currentExceptionRef)) +
+                        Environment.NewLine + FormatManagedStackTrace(_currentExceptionThrowMethodIndex, _currentExceptionThrowPc, null));
+                case "RhpMonitorEnter":
+                case "RhpMonitorTryEnter":
+                case "RhpMonitorExit":
+                case "RhpMonitorIsEntered":
+                case "RhpMonitorPulse":
+                case "RhpMonitorWait":
+                    InvokeMonitor(rm);
+                    return;
+                case "RhYield":
+                    _yieldRequested = true;
+                    SetReturnI4(1);
+                    return;
+                case "RhSpinWait":
+                    int iterations = Math.Max(0, checked((int)ReadAbiScalarArgument(rm, 0)));
+                    _executionCancellationToken.ThrowIfCancellationRequested();
+                    if (_fuel < iterations)
+                        throw new OperationCanceledException("Instruction budget exceeded.");
+                    _fuel -= iterations;
+                    _instructionsElapsed += iterations;
+                    _yieldRequested = true;
+                    return;
                 default:
                     throw new NotSupportedException($"Unknown GC import {rm.Name}.");
             }
@@ -5783,6 +5865,7 @@ namespace Cnidaria.Cs
             ScanFinalizationQueue();
             ScanDependentHandles();
             ClearDeadGcHandles(afterFinalization: true);
+            UpdateObjectMonitors();
         }
 
         private void SweepHeapWithoutCompaction()
@@ -5858,7 +5941,7 @@ namespace Cnidaria.Cs
 
         private void MarkRoots()
         {
-            MarkFrameRoots(update: false);
+            VisitThreadRoots(update: false);
 
             foreach (var kv in _staticBaseByTypeId)
             {
@@ -5867,7 +5950,8 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < t.StaticFields.Length; i++)
                 {
                     RuntimeField f = t.StaticFields[i];
-                    MarkManagedRefCellsInTypedStorage(kv.Value + f.Offset, f.FieldType);
+                    if (!f.IsThreadStatic)
+                        MarkManagedRefCellsInTypedStorage(kv.Value + f.Offset, f.FieldType);
                 }
             }
 
@@ -5880,18 +5964,6 @@ namespace Cnidaria.Cs
             foreach (var kv in _internPool)
                 TryMarkObject(kv.Value);
 
-            if (_currentExceptionRef != 0)
-                TryMarkObject(_currentExceptionRef);
-
-            foreach (FilterSearch search in _filterSearches)
-                TryMarkObject(search.ExceptionRef);
-
-            foreach (int root in _hostRoots)
-            {
-                if (root != 0)
-                    TryMarkObject(root);
-            }
-
             foreach (GcHandleSlot slot in _gcHandles)
             {
                 if (slot.Kind is GcHandleKind.Normal or GcHandleKind.Pinned)
@@ -5901,12 +5973,12 @@ namespace Cnidaria.Cs
             for (int i = _finalizerReadyHead; i < _finalizerReady.Count; i++)
                 TryMarkObject(_finalizerReady[i]);
 
-            MarkPendingContinuationRoots();
+
         }
 
         private void UpdateRootsAfterCompaction()
         {
-            MarkFrameRoots(update: true);
+            VisitThreadRoots(update: true);
 
             foreach (var kv in _staticBaseByTypeId)
             {
@@ -5915,15 +5987,10 @@ namespace Cnidaria.Cs
                 for (int i = 0; i < t.StaticFields.Length; i++)
                 {
                     RuntimeField f = t.StaticFields[i];
-                    UpdateManagedRefCellsInTypedStorage(kv.Value + f.Offset, f.FieldType);
+                    if (!f.IsThreadStatic)
+                        UpdateManagedRefCellsInTypedStorage(kv.Value + f.Offset, f.FieldType);
                 }
             }
-
-            if (_currentExceptionRef != 0)
-                _currentExceptionRef = TranslateObjectRef(_currentExceptionRef);
-
-            foreach (FilterSearch search in _filterSearches)
-                search.ExceptionRef = TranslateObjectRef(search.ExceptionRef);
 
             if (_staticBaseByTypeId.Count != 0)
             {
@@ -5956,12 +6023,6 @@ namespace Cnidaria.Cs
                     _internPool[kv.Key] = TranslateObjectRef(kv.Value);
             }
 
-            for (int i = 0; i < _hostRoots.Count; i++)
-            {
-                if (_hostRoots[i] != 0)
-                    _hostRoots[i] = TranslateObjectRef(_hostRoots[i]);
-            }
-
             for (int i = 0; i < _gcHandles.Count; i++)
             {
                 GcHandleSlot slot = _gcHandles[i];
@@ -5973,13 +6034,15 @@ namespace Cnidaria.Cs
                 _gcHandles[i] = slot;
             }
 
+            UpdateObjectMonitors();
+
             for (int i = 0; i < _finalizerQueue.Count; i++)
                 _finalizerQueue[i] = TranslateObjectRef(_finalizerQueue[i]);
 
             for (int i = _finalizerReadyHead; i < _finalizerReady.Count; i++)
                 _finalizerReady[i] = TranslateObjectRef(_finalizerReady[i]);
 
-            UpdatePendingContinuationRootsAfterCompaction();
+
         }
 
         private void MarkFrameRoots(bool update)
@@ -6527,8 +6590,9 @@ namespace Cnidaria.Cs
             if (!TryGetBlockFromObjectRef(oldObj, out int block))
             {
                 // Objects the compiler placed in a frame never move
-                if (oldObj >= _stackBase && oldObj < _stackEnd)
-                    return oldObj;
+                foreach (VmThreadState thread in _threads)
+                    if (oldObj >= thread.stackBase && oldObj < thread.stackEnd)
+                        return oldObj;
                 throw new AccessViolationException("Dangling object reference during GC compaction.");
             }
             int target = ReadI32(block + BlockMetaOffset);
@@ -6801,13 +6865,13 @@ namespace Cnidaria.Cs
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private long GetGpr(byte register)
-            => Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_x), register);
+            => Unsafe.Add(ref _x[0], register);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void SetGpr(byte register, long value)
         {
             //if (register == (byte)MachineRegister.X0) return; trust compiler to not do that
-            Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_x), register) = value;
+            Unsafe.Add(ref _x[0], register) = value;
             if (register == (byte)MachineRegister.X2)
                 TrackStackPeak(value);
         }
@@ -6817,14 +6881,14 @@ namespace Cnidaria.Cs
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private long GetFpr(byte register)
-            => Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_f), register - (byte)MachineRegister.F0);
+            => Unsafe.Add(ref _f[0], register - (byte)MachineRegister.F0);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void SetFpr(byte register, long bits)
-            => Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_f), register - (byte)MachineRegister.F0) = bits;
+            => Unsafe.Add(ref _f[0], register - (byte)MachineRegister.F0) = bits;
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void SetFpr(MachineRegister register, long bits)
-            => Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_f), register - MachineRegister.F0) = bits;
+            => Unsafe.Add(ref _f[0], register - MachineRegister.F0) = bits;
         //  => SetFpr(RegisterVmIsa.EncodeRegister(register), bits); trust the compiler to avoid mistakes here
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private float F32(byte register)
@@ -7621,6 +7685,8 @@ namespace Cnidaria.Cs
                 if (writable) CheckWritableRange(abs, size);
                 return;
             }
+            if (CheckExternalMemoryAccess(abs, size))
+                return;
             if (abs >= _heapBase)
             {
                 CheckHeapAccess(abs, size);
@@ -8061,6 +8127,698 @@ namespace Cnidaria.Cs
         {
             offset &= 63;
             return (value >> offset) | (value << ((64 - offset) & 63));
+        }
+        private sealed class VmThreadState
+        {
+            public int Id;
+            public int WaitingInitializer = -1;
+            public int EntryMethod = -1;
+            public long Parameter;
+            public VmWaitKind WaitKind;
+            public long Deadline = long.MaxValue;
+            public int WaitAddress;
+            public VmMonitor? WaitMonitor;
+            public int WaitRecursion;
+            public bool WaitResult;
+            public readonly Dictionary<int, int> Statics = new Dictionary<int, int>();
+            public GeneralRegisters x;
+            public FloatRegisters f;
+            public int stackBase = 0;
+            public int stackEnd = 0;
+            public int frameStackTop = 0;
+            public int frameStackPeakTop = 0;
+            public int frameCount = 0;
+            public int pc = 0;
+            public int currentMethodIndex = -1;
+            public int currentSafePointPc = -1;
+            public int currentExceptionRef = 0;
+            public int currentExceptionThrowMethodIndex = -1;
+            public int currentExceptionThrowPc = -1;
+            public int monitorsHeld = 0;
+            public int stackLowWatermark = 0;
+            public CallFlags activeCallFlags = CallFlags.None;
+            public RuntimeMethod? activeCallTargetMethod = null;
+            public List<RegisterSnapshot?> registerSnapshots = new List<RegisterSnapshot?>();
+            public List<ActiveHandler> activeHandlers = new List<ActiveHandler>();
+            public List<FilterSearch> filterSearches = new List<FilterSearch>();
+            public List<int> hostRoots = new List<int>();
+        }
+
+        private readonly List<VmThreadState> _threads = new List<VmThreadState>();
+        private VmThreadState _currentThread = new VmThreadState { Id = 1 };
+        private bool _yieldRequested;
+        private int _nextThreadId = 1;
+        private long _nextThreadSwitch;
+        private int _externalMemoryEnd;
+        private readonly Dictionary<int, int> _nativeBlocks = new Dictionary<int, int>();
+        private readonly List<(int Address, int Size)> _freeNativeBlocks = new List<(int, int)>();
+        private readonly Dictionary<int, VmMonitor> _lowLevelMonitors = new Dictionary<int, VmMonitor>();
+        private int _nextMonitor;
+
+        private void SaveThread(VmThreadState thread)
+        {
+            thread.x = _x;
+            thread.f = _f;
+            thread.stackBase = _stackBase;
+            thread.stackEnd = _stackEnd;
+            thread.frameStackTop = _frameStackTop;
+            thread.frameStackPeakTop = _frameStackPeakTop;
+            thread.frameCount = _frameCount;
+            thread.pc = _pc;
+            thread.currentMethodIndex = _currentMethodIndex;
+            thread.currentSafePointPc = _currentSafePointPc;
+            thread.currentExceptionRef = _currentExceptionRef;
+            thread.currentExceptionThrowMethodIndex = _currentExceptionThrowMethodIndex;
+            thread.currentExceptionThrowPc = _currentExceptionThrowPc;
+            thread.monitorsHeld = _monitorsHeld;
+            thread.stackLowWatermark = _stackLowWatermark;
+            thread.activeCallFlags = _activeCallFlags;
+            thread.activeCallTargetMethod = _activeCallTargetMethod;
+            thread.registerSnapshots = _registerSnapshots;
+            thread.activeHandlers = _activeHandlers;
+            thread.filterSearches = _filterSearches;
+            thread.hostRoots = _hostRoots;
+        }
+
+        private void LoadThread(VmThreadState thread)
+        {
+            _currentThread = thread;
+            _x = thread.x;
+            _f = thread.f;
+            _stackBase = thread.stackBase;
+            _stackEnd = thread.stackEnd;
+            _frameStackTop = thread.frameStackTop;
+            _frameStackPeakTop = thread.frameStackPeakTop;
+            _frameCount = thread.frameCount;
+            _pc = thread.pc;
+            _currentMethodIndex = thread.currentMethodIndex;
+            _currentSafePointPc = thread.currentSafePointPc;
+            _currentExceptionRef = thread.currentExceptionRef;
+            _currentExceptionThrowMethodIndex = thread.currentExceptionThrowMethodIndex;
+            _currentExceptionThrowPc = thread.currentExceptionThrowPc;
+            _monitorsHeld = thread.monitorsHeld;
+            _stackLowWatermark = thread.stackLowWatermark;
+            _activeCallFlags = thread.activeCallFlags;
+            _activeCallTargetMethod = thread.activeCallTargetMethod;
+            _registerSnapshots = thread.registerSnapshots;
+            _activeHandlers = thread.activeHandlers;
+            _filterSearches = thread.filterSearches;
+            _hostRoots = thread.hostRoots;
+        }
+
+        private void ExecuteThreads(CancellationToken ct, ExecutionLimits limits)
+        {
+            var main = new VmThreadState { Id = 1 };
+            _threads.Clear();
+            SaveThread(main);
+            _threads.Add(main);
+            _currentThread = main;
+            _nextThreadId = 1;
+            bool waitingForForeground = false;
+            long result = 0;
+            int next = 0;
+            try
+            {
+                while (true)
+                {
+                    VmThreadState thread = SelectRunnableThread(ref next, ct);
+                    LoadThread(thread);
+                    if (thread.EntryMethod >= 0)
+                    {
+                        X(MachineRegisters.StackPointer, thread.stackEnd);
+                        X(MachineRegisters.FramePointer, thread.stackEnd);
+                        X(MachineRegisters.ReturnAddress, -1);
+                        RuntimeMethod entry = _rts.GetMethodById(_image.Methods[thread.EntryMethod].RuntimeMethodId);
+                        WriteAbiScalarArgument(entry, 0, thread.Parameter);
+                        EnterManagedFrame(thread.EntryMethod, -1, CallFlags.None);
+                        thread.EntryMethod = -1;
+                    }
+                    _yieldRequested = false;
+                    _nextThreadSwitch = _instructionsElapsed + 1024;
+                    Run(ct, limits);
+                    SaveThread(thread);
+                    if (_currentMethodIndex >= 0)
+                        continue;
+                    if (thread == main)
+                    {
+                        if (!waitingForForeground)
+                        {
+                            result = X(MachineRegisters.ReturnValue0);
+                            waitingForForeground = true;
+                            if (EnterForegroundWait())
+                            {
+                                SaveThread(main);
+                                continue;
+                            }
+                        }
+                        X(MachineRegisters.ReturnValue0, result);
+                        SaveThread(main);
+                        break;
+                    }
+                    ReleaseVmThread(thread);
+                    _threads.Remove(thread);
+                }
+            }
+            finally
+            {
+                foreach (VmThreadState thread in _threads)
+                    if (thread != main)
+                        ReleaseVmThread(thread);
+                _threads.Clear();
+                _threads.Add(main);
+                LoadThread(main);
+                _yieldRequested = false;
+            }
+        }
+
+        private bool EnterForegroundWait()
+        {
+            for (int i = 0; i < _image.Methods.Length; i++)
+            {
+                int id = _image.Methods[i].RuntimeMethodId;
+                if (id < 0)
+                    continue;
+                RuntimeMethod method = _rts.GetMethodById(id);
+                if (method.DeclaringType.Namespace == "System.Threading" && method.DeclaringType.Name == "Thread" &&
+                    method.Name == "WaitForForegroundThreads")
+                {
+                    EnterManagedFrame(i, -1, CallFlags.None);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private VmThreadState SelectRunnableThread(ref int next, CancellationToken ct)
+        {
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                long now = Environment.TickCount64;
+                long deadline = long.MaxValue;
+                foreach (VmThreadState thread in _threads)
+                {
+                    if (thread.WaitKind != VmWaitKind.None && thread.Deadline <= now)
+                    {
+                        if (thread.WaitKind == VmWaitKind.MonitorWait)
+                            ResumeMonitorWait(thread, false);
+                        else
+                        {
+                            if (thread.WaitMonitor is VmMonitor monitor)
+                                monitor.Entrants.Remove(thread);
+                            MakeRunnable(thread, false);
+                        }
+                    }
+                    deadline = Math.Min(deadline, thread.Deadline);
+                }
+                for (int i = 0; i < _threads.Count; i++)
+                {
+                    int index = next % _threads.Count;
+                    next = index + 1;
+                    if (_threads[index].WaitKind == VmWaitKind.None)
+                        return _threads[index];
+                }
+                ct.WaitHandle.WaitOne((int)Math.Min(50, Math.Max(1, deadline - now)));
+            }
+        }
+
+        private void YieldVmThread()
+        {
+            if (_threads.Count > 1 && _instructionsElapsed >= _nextThreadSwitch)
+                _yieldRequested = true;
+        }
+
+        private void ParkVmThread(VmWaitKind kind, int timeout)
+        {
+            _currentThread.WaitKind = kind;
+            _currentThread.Deadline = timeout < 0 ? long.MaxValue : Environment.TickCount64 + timeout;
+            _yieldRequested = true;
+        }
+
+        private void MakeRunnable(VmThreadState thread, bool result)
+        {
+            thread.WaitKind = VmWaitKind.None;
+            thread.Deadline = long.MaxValue;
+            thread.WaitMonitor = null;
+            thread.WaitAddress = 0;
+            thread.x[(int)MachineRegisters.ReturnValue0] = result ? 1 : 0;
+        }
+
+        private void ReleaseVmThread(VmThreadState thread)
+        {
+            foreach (int storage in thread.Statics.Values)
+                WriteI32(storage - BlockHeaderSize + BlockMetaOffset, 0);
+            thread.Statics.Clear();
+            FreeNativeMemory(thread.stackBase);
+        }
+
+        private int AllocateExternalMemory(int size)
+        {
+            ExecutionLimits limits = _executionLimits ?? throw new InvalidOperationException("The VM is not executing.");
+            long address = ((long)(_externalMemoryEnd == 0 ? _heapEnd : _externalMemoryEnd) + 15) & ~15L;
+            long end = address + size;
+            long maximum = Math.Min(Array.MaxLength, (long)_heapEnd + limits.MaxAdditionalMemoryBytes);
+            if (end > maximum)
+                throw new OperationCanceledException("Additional memory budget exceeded.");
+            if (end > _mem.Length)
+                Array.Resize(ref _mem, (int)Math.Min(maximum, Math.Max(end, (long)_mem.Length * 2)));
+            _externalMemoryEnd = (int)end;
+            return (int)address;
+        }
+
+        private int AllocateNativeMemory(int size)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(size);
+            size = Math.Max(1, size);
+            for (int i = 0; i < _freeNativeBlocks.Count; i++)
+            {
+                (int address, int available) = _freeNativeBlocks[i];
+                if (available < size)
+                    continue;
+                _freeNativeBlocks.RemoveAt(i);
+                _nativeBlocks.Add(address, available);
+                return address;
+            }
+            int result = AllocateExternalMemory(size);
+            _nativeBlocks.Add(result, size);
+            return result;
+        }
+
+        private void FreeNativeMemory(int address)
+        {
+            if (address == 0)
+                return;
+            if (!_nativeBlocks.Remove(address, out int size))
+                throw new AccessViolationException("Invalid unmanaged allocation.");
+            _freeNativeBlocks.Add((address, size));
+        }
+
+        private bool CheckExternalMemoryAccess(int address, int size)
+        {
+            if (address < _heapEnd)
+                return false;
+            foreach (VmThreadState thread in _threads)
+            {
+                if (address >= thread.stackBase && (long)address + size <= thread.stackEnd)
+                {
+                    long low = thread.x[(int)MachineRegisters.StackPointer];
+                    if (thread.frameCount != 0)
+                    {
+                        long allocaSp = ReadI64(thread.frameStackTop - ShadowFrameSize + ShadowFrameAllocaSp);
+                        if (allocaSp != 0)
+                            low = Math.Min(low, allocaSp);
+                    }
+                    if (thread == _currentThread)
+                        low = CurrentFrameStackLow();
+                    if (address < low)
+                        throw new AccessViolationException("Stack access out of active frame range.");
+                    return true;
+                }
+            }
+            foreach (KeyValuePair<int, int> block in _nativeBlocks)
+                if (address >= block.Key && (long)address + size <= (long)block.Key + block.Value)
+                    return true;
+            throw new AccessViolationException("External memory access out of range.");
+        }
+
+        private void StartVmThread(int stackSize, int entryPc, long parameter)
+        {
+            ExecutionLimits limits = _executionLimits ?? throw new InvalidOperationException("The VM is not executing.");
+            if (_threads.Count >= limits.MaxThreads)
+                throw new OperationCanceledException("Thread limit exceeded.");
+            if (!_image.MethodIndexByEntryPc.TryGetValue(entryPc, out int index))
+                throw new MissingMethodException($"Thread entry point {entryPc} is missing.");
+            int size = stackSize == 0 ? Math.Max(65536, _threads[0].stackEnd - _threads[0].stackBase) : Math.Max(65536, stackSize);
+            int stack = AllocateNativeMemory(size);
+            var state = new VmThreadState
+            {
+                Id = ++_nextThreadId,
+                EntryMethod = index,
+                Parameter = parameter,
+                stackBase = stack,
+                stackEnd = stack + size,
+                frameStackTop = stack,
+                frameStackPeakTop = stack,
+                stackLowWatermark = stack + size
+            };
+            _threads.Add(state);
+        }
+
+        private int EnsureThreadStaticStorage(TypeLayoutRecord layout)
+        {
+            if (_currentThread.Statics.TryGetValue(layout.RuntimeTypeId, out int address))
+                return address;
+            RuntimeType type = _rts.GetTypeById(layout.RuntimeTypeId);
+            address = AllocRawHeapBytes(type.ThreadStaticSize, Math.Max(8, type.ThreadStaticAlign));
+            Array.Clear(_mem, address, type.ThreadStaticSize);
+            _currentThread.Statics.Add(type.TypeId, address);
+            return address;
+        }
+
+        private void VisitThreadRoots(bool update)
+        {
+            VmThreadState current = _currentThread;
+            SaveThread(current);
+            if (_threads.Count == 0)
+                _threads.Add(current);
+            if (!update)
+                foreach (VmMonitor monitor in _objectMonitors.Values)
+                    if (monitor.Owner != 0 || monitor.Entrants.Count != 0 || monitor.Waiters.Count != 0)
+                        TryMarkObject(_gcHandles[GcHandleIndex(monitor.Handle)].Object);
+            foreach (VmThreadState thread in _threads)
+            {
+                LoadThread(thread);
+                MarkFrameRoots(update);
+                if (thread.WaitAddress != 0)
+                {
+                    if (update)
+                        thread.WaitAddress = TranslateInteriorPointer(thread.WaitAddress);
+                    else
+                        TryMarkObjectFromInteriorPointer(thread.WaitAddress);
+                }
+                foreach (KeyValuePair<int, int> storage in thread.Statics)
+                {
+                    RuntimeType type = _rts.GetTypeById(storage.Key);
+                    foreach (RuntimeField field in type.StaticFields)
+                    {
+                        if (!field.IsThreadStatic)
+                            continue;
+                        if (update)
+                            UpdateManagedRefCellsInTypedStorage(storage.Value + field.Offset, field.FieldType);
+                        else
+                            MarkManagedRefCellsInTypedStorage(storage.Value + field.Offset, field.FieldType);
+                    }
+                    if (update)
+                        thread.Statics[storage.Key] = TranslateRawBase(storage.Value);
+                }
+                if (update)
+                {
+                    _currentExceptionRef = TranslateObjectRef(_currentExceptionRef);
+                    foreach (FilterSearch search in _filterSearches)
+                        search.ExceptionRef = TranslateObjectRef(search.ExceptionRef);
+                    for (int i = 0; i < _hostRoots.Count; i++)
+                        _hostRoots[i] = TranslateObjectRef(_hostRoots[i]);
+                    UpdatePendingContinuationRootsAfterCompaction();
+                }
+                else
+                {
+                    TryMarkObject(_currentExceptionRef);
+                    foreach (FilterSearch search in _filterSearches)
+                        TryMarkObject(search.ExceptionRef);
+                    foreach (int root in _hostRoots)
+                        TryMarkObject(root);
+                    MarkPendingContinuationRoots();
+                }
+                SaveThread(thread);
+            }
+            LoadThread(current);
+        }
+
+        private enum VmWaitKind
+        {
+            None,
+            MonitorEnter,
+            MonitorWait,
+            Futex,
+            ClassInitialization
+        }
+
+        private sealed class VmMonitor
+        {
+            public int Owner;
+            public int Recursion;
+            public long Handle;
+            public readonly List<VmThreadState> Entrants = new List<VmThreadState>();
+            public readonly List<VmThreadState> Waiters = new List<VmThreadState>();
+        }
+
+        private bool EnterVmMonitor(VmMonitor monitor, int timeout)
+        {
+            if (monitor.Owner == 0 || monitor.Owner == _currentThread.Id)
+            {
+                monitor.Owner = _currentThread.Id;
+                monitor.Recursion++;
+                if (monitor.Handle != 0)
+                    _monitorsHeld++;
+                return true;
+            }
+            if (timeout == 0)
+                return false;
+            _currentThread.WaitMonitor = monitor;
+            _currentThread.WaitRecursion = 1;
+            _currentThread.WaitResult = true;
+            monitor.Entrants.Add(_currentThread);
+            ParkVmThread(VmWaitKind.MonitorEnter, timeout);
+            return false;
+        }
+
+        private void ReleaseVmMonitor(VmMonitor monitor)
+        {
+            if (monitor.Owner != _currentThread.Id)
+                throw new SynchronizationLockException();
+            if (monitor.Handle != 0)
+                _monitorsHeld--;
+            if (--monitor.Recursion != 0)
+                return;
+            monitor.Owner = 0;
+            GrantVmMonitor(monitor);
+        }
+
+        private void GrantVmMonitor(VmMonitor monitor)
+        {
+            if (monitor.Owner != 0 || monitor.Entrants.Count == 0)
+                return;
+            VmThreadState thread = monitor.Entrants[0];
+            monitor.Entrants.RemoveAt(0);
+            monitor.Owner = thread.Id;
+            monitor.Recursion = thread.WaitRecursion;
+            if (monitor.Handle != 0)
+                thread.monitorsHeld += thread.WaitRecursion;
+            MakeRunnable(thread, thread.WaitResult);
+        }
+
+        private int WaitVmMonitor(VmMonitor monitor, int timeout)
+        {
+            if (monitor.Owner != _currentThread.Id)
+                return -1;
+            if (timeout == 0)
+                return 0;
+            _currentThread.WaitMonitor = monitor;
+            _currentThread.WaitRecursion = monitor.Recursion;
+            if (monitor.Handle != 0)
+                _monitorsHeld -= monitor.Recursion;
+            monitor.Recursion = 0;
+            monitor.Owner = 0;
+            monitor.Waiters.Add(_currentThread);
+            ParkVmThread(VmWaitKind.MonitorWait, timeout);
+            GrantVmMonitor(monitor);
+            return 0;
+        }
+
+        private void ResumeMonitorWait(VmThreadState thread, bool signaled)
+        {
+            if (thread.WaitMonitor is not VmMonitor monitor)
+                throw new InvalidOperationException("A monitor waiter has no monitor.");
+            monitor.Waiters.Remove(thread);
+            thread.WaitKind = VmWaitKind.MonitorEnter;
+            thread.Deadline = long.MaxValue;
+            thread.WaitResult = signaled;
+            monitor.Entrants.Add(thread);
+            GrantVmMonitor(monitor);
+        }
+
+        private void PulseVmMonitor(VmMonitor monitor, bool all)
+        {
+            int count = all ? monitor.Waiters.Count : Math.Min(1, monitor.Waiters.Count);
+            while (count-- != 0)
+                ResumeMonitorWait(monitor.Waiters[0], true);
+        }
+
+        private bool TryThreadingInterop(RuntimeMethod method)
+        {
+            long Arg(int index) => ReadAbiScalarArgument(method, index);
+            switch (method.Name)
+            {
+                case "GetCurrentThreadId":
+                    SetGpr(MachineRegisters.ReturnValue0, _currentThread.Id);
+                    return true;
+                case "GetPid":
+                    SetReturnI4(Environment.ProcessId);
+                    return true;
+                case "GetEUid":
+                    SetReturnI4(0);
+                    return true;
+                case "CreateThread":
+                    StartVmThread(checked((int)Arg(0)), checked((int)Arg(1)), Arg(2));
+                    SetReturnI4(1);
+                    return true;
+                case "LowLevelMonitor_Create":
+                    int handle = ++_nextMonitor;
+                    _lowLevelMonitors.Add(handle, new VmMonitor());
+                    SetGpr(MachineRegisters.ReturnValue0, handle);
+                    return true;
+                case "LowLevelMonitor_Destroy":
+                    _lowLevelMonitors.Remove(checked((int)Arg(0)));
+                    return true;
+                case "LowLevelMonitor_Acquire":
+                    EnterVmMonitor(_lowLevelMonitors[checked((int)Arg(0))], -1);
+                    return true;
+                case "LowLevelMonitor_Release":
+                    ReleaseVmMonitor(_lowLevelMonitors[checked((int)Arg(0))]);
+                    return true;
+                case "LowLevelMonitor_Wait":
+                case "LowLevelMonitor_TimedWait":
+                    SetReturnI4(WaitVmMonitor(_lowLevelMonitors[checked((int)Arg(0))], method.Name == "LowLevelMonitor_Wait" ? -1 : checked((int)Arg(1))));
+                    return true;
+                case "LowLevelMonitor_Signal_Release":
+                    VmMonitor monitor = _lowLevelMonitors[checked((int)Arg(0))];
+                    PulseVmMonitor(monitor, false);
+                    ReleaseVmMonitor(monitor);
+                    return true;
+                case "LowLevelFutex_WakeByAddressSingle":
+                    foreach (VmThreadState thread in _threads)
+                        if (thread.WaitKind == VmWaitKind.Futex && thread.WaitAddress == checked((int)Arg(0)))
+                        {
+                            MakeRunnable(thread, true);
+                            break;
+                        }
+                    return true;
+                case "LowLevelFutex_WaitOnAddress":
+                case "LowLevelFutex_WaitOnAddressTimeout":
+                    int address = checked((int)Arg(0));
+                    int timeout = method.Name == "LowLevelFutex_WaitOnAddress" ? -1 : checked((int)Arg(2));
+                    if (ReadI32(address) == checked((int)Arg(1)) && timeout != 0)
+                    {
+                        _currentThread.WaitAddress = address;
+                        ParkVmThread(VmWaitKind.Futex, timeout);
+                    }
+                    SetReturnI4(ReadI32(address) != checked((int)Arg(1)) ? 1 : 0);
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private sealed class TypeInitialization
+        {
+            public readonly VmThreadState Owner;
+            public long Failure;
+
+            public TypeInitialization(VmThreadState owner) => Owner = owner;
+        }
+
+        private readonly Dictionary<int, TypeInitialization> _typeInitializations = new Dictionary<int, TypeInitialization>();
+
+        private bool WaitForTypeInitializer(int typeId)
+        {
+            VmThreadState owner = _typeInitializations[typeId].Owner;
+            while (owner != _currentThread && owner.WaitingInitializer >= 0)
+                owner = _typeInitializations[owner.WaitingInitializer].Owner;
+            if (owner == _currentThread)
+                return false;
+            _currentThread.WaitingInitializer = typeId;
+            ParkVmThread(VmWaitKind.ClassInitialization, -1);
+            return true;
+        }
+
+        private void CompleteTypeInitializer(int typeId, long failure)
+        {
+            _typeInitState[typeId] = failure == 0 ? (byte)2 : (byte)3;
+            _typeInitializations[typeId].Failure = failure;
+            foreach (VmThreadState thread in _threads)
+                if (thread.WaitingInitializer == typeId)
+                {
+                    thread.WaitingInitializer = -1;
+                    thread.WaitKind = VmWaitKind.None;
+                    thread.Deadline = long.MaxValue;
+                }
+        }
+
+        private void FailTypeInitializer(int typeId)
+        {
+            RuntimeType type = _rts.GetTypeById(typeId);
+            string name = string.IsNullOrEmpty(type.Namespace) ? type.Name : type.Namespace + "." + type.Name;
+            int failure = AllocExceptionRef("System", "TypeInitializationException", "The type initializer for '" + name + "' threw an exception.");
+            RuntimeType exceptionType = GetObjectTypeFromRef(failure);
+            for (RuntimeType? current = exceptionType; current is not null; current = current.BaseType)
+                foreach (RuntimeField field in current.InstanceFields)
+                    if (field.Name == "_innerException")
+                        WriteNative(failure + field.Offset, _currentExceptionRef);
+            _currentExceptionRef = failure;
+            foreach (RuntimeField field in exceptionType.InstanceFields)
+                if (field.Name == "_typeName")
+                {
+                    int typeName = InternString(name);
+                    WriteNative(_currentExceptionRef + field.Offset, typeName);
+                }
+            CompleteTypeInitializer(typeId, AllocGcHandle(GcHandleKind.Normal, _currentExceptionRef, 0));
+        }
+
+        private readonly Dictionary<int, VmMonitor> _objectMonitors = new Dictionary<int, VmMonitor>();
+
+        private VmMonitor ObjectMonitor(int obj)
+        {
+            if (_objectMonitors.TryGetValue(obj, out VmMonitor? monitor))
+                return monitor;
+            monitor = new VmMonitor { Handle = AllocGcHandle(GcHandleKind.Weak, obj, 0) };
+            _objectMonitors.Add(obj, monitor);
+            return monitor;
+        }
+
+        private void UpdateObjectMonitors()
+        {
+            var monitors = new List<VmMonitor>(_objectMonitors.Values);
+            _objectMonitors.Clear();
+            foreach (VmMonitor monitor in monitors)
+            {
+                int index = GcHandleIndex(monitor.Handle);
+                int obj = _gcHandles[index].Object;
+                if (obj != 0)
+                    _objectMonitors.Add(obj, monitor);
+                else
+                {
+                    _gcHandles[index] = new GcHandleSlot { Secondary = _gcHandleFree, Kind = GcHandleKind.Free };
+                    _gcHandleFree = index;
+                }
+            }
+        }
+
+        private void InvokeMonitor(RuntimeMethod method)
+        {
+            VmMonitor monitor = ObjectMonitor(checked((int)ReadAbiScalarArgument(method, 0)));
+            switch (method.Name)
+            {
+                case "RhpMonitorEnter":
+                    EnterVmMonitor(monitor, -1);
+                    return;
+                case "RhpMonitorTryEnter":
+                    SetReturnI4(EnterVmMonitor(monitor, checked((int)ReadAbiScalarArgument(method, 1))) ? 1 : 0);
+                    return;
+                case "RhpMonitorIsEntered":
+                    SetReturnI4(monitor.Owner == _currentThread.Id ? 1 : 0);
+                    return;
+                case "RhpMonitorExit":
+                    if (monitor.Owner != _currentThread.Id)
+                    {
+                        SetReturnI4(0);
+                        return;
+                    }
+                    ReleaseVmMonitor(monitor);
+                    SetReturnI4(1);
+                    return;
+                case "RhpMonitorWait":
+                    SetReturnI4(WaitVmMonitor(monitor, checked((int)ReadAbiScalarArgument(method, 1))));
+                    return;
+                case "RhpMonitorPulse":
+                    if (monitor.Owner != _currentThread.Id)
+                    {
+                        SetReturnI4(0);
+                        return;
+                    }
+                    PulseVmMonitor(monitor, ReadAbiScalarArgument(method, 1) != 0);
+                    SetReturnI4(1);
+                    return;
+            }
         }
     }
 }

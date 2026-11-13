@@ -100,39 +100,27 @@ namespace Cnidaria.Cs
             BoundUnboundLambdaExpression lambda,
             SyntaxNode bodySyntax,
             MethodSymbol invoke,
+            TypeSymbol targetType,
             bool isAsync,
             BindingContext context)
         {
             bool targetIsVoid = invoke.ReturnType.SpecialType == SpecialType.System_Void ||
                 (isAsync && TryGetTaskResultType(invoke.ReturnType, out TypeSymbol? taskResult) && taskResult is null);
-            if (bodySyntax is ExpressionSyntax expression)
+            if (targetIsVoid && bodySyntax is ExpressionSyntax expression)
             {
-                if (targetIsVoid)
-                {
-                    return expression is InvocationExpressionSyntax or AssignmentExpressionSyntax or ObjectCreationExpressionSyntax
-                        or ConditionalAccessExpressionSyntax or AwaitExpressionSyntax or PrefixUnaryExpressionSyntax
-                        or PostfixUnaryExpressionSyntax or ThrowExpressionSyntax;
-                }
-
-                if (expression is not InvocationExpressionSyntax and not ConditionalAccessExpressionSyntax)
-                    return true;
+                return expression is InvocationExpressionSyntax or AssignmentExpressionSyntax or ObjectCreationExpressionSyntax
+                    or ConditionalAccessExpressionSyntax or AwaitExpressionSyntax or PrefixUnaryExpressionSyntax
+                    or PostfixUnaryExpressionSyntax or ThrowExpressionSyntax;
             }
 
-            var parameterTypes = ImmutableArray.CreateBuilder<TypeSymbol>(invoke.Parameters.Length);
-            foreach (ParameterSymbol parameter in invoke.Parameters)
-                parameterTypes.Add(parameter.Type);
-            if (!TryProbeLambdaBody(lambda, parameterTypes.MoveToImmutable(), context, out TypeSymbol? bodyType, out bool returnsValue, out bool returnsNothing))
-                return true;
-
-            if (bodySyntax is ExpressionSyntax)
-                return bodyType?.SpecialType != SpecialType.System_Void;
-            if (targetIsVoid)
-                return !returnsValue;
-            return !returnsNothing && (returnsValue || BlockEndsInThrow((BlockSyntax)bodySyntax));
+            var diagnostics = new DiagnosticBag();
+            BindingContext probeContext = WithRecorder(context, NullBindingRecorder.Instance);
+            BindLambdaConversion(lambda, targetType, lambda.Syntax, probeContext, diagnostics);
+            foreach (Diagnostic diagnostic in diagnostics.ToImmutable())
+                if (diagnostic.Severity == DiagnosticSeverity.Error)
+                    return false;
+            return true;
         }
-
-        private static bool BlockEndsInThrow(BlockSyntax block)
-            => block.Statements.Count != 0 && block.Statements[block.Statements.Count - 1] is ThrowStatementSyntax or WhileStatementSyntax or ForStatementSyntax;
 
         // Speculative lambda binding suppresses diagnostics and semantic records
         private bool CanConvertLambdaToDelegate(
@@ -161,7 +149,7 @@ namespace Cnidaria.Cs
             if (isAsync && !TryGetTaskResultType(invoke.ReturnType, out _) && invoke.ReturnType.SpecialType != SpecialType.System_Void)
                 return false;
 
-            if (!LambdaBodyFitsDelegateReturn(lambda, bodySyntax, invoke, isAsync, context))
+            if (!LambdaBodyFitsDelegateReturn(lambda, bodySyntax, invoke, targetType, isAsync, context))
                 return false;
 
             if (explicitReturnType is not null)

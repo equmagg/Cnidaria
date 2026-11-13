@@ -404,6 +404,8 @@ int __vfscanf_internal(FILE* stream, const char* text, const char* format, va_li
     in.look = EOF;
     in.has_look = 0;
     va_copy(ap, arguments);
+    if (stream != (FILE*)0)
+        flockfile(stream);
 
     while (*format != 0)
     {
@@ -582,6 +584,8 @@ int __vfscanf_internal(FILE* stream, const char* text, const char* format, va_li
 
     va_end(ap);
     __scan_finish(&in);
+    if (stream != (FILE*)0)
+        funlockfile(stream);
     return assigned == 0 && failed_eof ? EOF : assigned;
 }
 

@@ -101,6 +101,7 @@ long __riscv_vfirst_m_b4(vbool4_t vs2, u64 vl);
 #define SYS_EXIT 93ul
 #define SYS_EXIT_GROUP 94ul
 #define SYS_SET_TID_ADDRESS 96ul
+#define SYS_FUTEX 98ul
 #define SYS_SET_ROBUST_LIST 99ul
 #define SYS_NANOSLEEP 101ul
 #define SYS_GETITIMER 102ul
@@ -323,6 +324,7 @@ long __riscv_vfirst_m_b4(vbool4_t vs2, u64 vl);
 #define TTY_ECHOKE 0x800u
 #define TTY_IEXTEN 0x8000u
 #define MAX_PROCESSES 16u
+#define MAX_THREADS 64u
 #define TRAP_FRAME_VECTOR_WORDS 256u
 #define MAX_VECTOR_REGISTER_BYTES 64u
 #define MAX_VM_REGIONS 64u
@@ -343,6 +345,9 @@ long __riscv_vfirst_m_b4(vbool4_t vs2, u64 vl);
 #define SLEEP_SIGWAIT 5u
 #define SLEEP_DEVICE 6u
 #define SLEEP_POLL 7u
+#define SLEEP_FUTEX 8u
+#define RESTART_SLEEP 1u
+#define RESTART_FUTEX 2u
 #define STOP_REPORT_STOPPED 1u
 #define STOP_REPORT_CONTINUED 2u
 #define DEFAULT_TIME_SLICE 4u
@@ -447,10 +452,26 @@ long __riscv_vfirst_m_b4(vbool4_t vs2, u64 vl);
 #define CLONE_SIGHAND 0x00000800ul
 #define CLONE_VFORK 0x00004000ul
 #define CLONE_THREAD 0x00010000ul
+#define CLONE_SYSVSEM 0x00040000ul
 #define CLONE_SETTLS 0x00080000ul
 #define CLONE_PARENT_SETTID 0x00100000ul
 #define CLONE_CHILD_CLEARTID 0x00200000ul
+#define CLONE_DETACHED 0x00400000ul
 #define CLONE_CHILD_SETTID 0x01000000ul
+#define FUTEX_WAIT 0u
+#define FUTEX_WAKE 1u
+#define FUTEX_REQUEUE 3u
+#define FUTEX_CMP_REQUEUE 4u
+#define FUTEX_WAIT_BITSET 9u
+#define FUTEX_WAKE_BITSET 10u
+#define FUTEX_PRIVATE_FLAG 128u
+#define FUTEX_CLOCK_REALTIME 256u
+#define FUTEX_BITSET_MATCH_ANY 0xffffffffu
+#define FUTEX_WAITERS 0x80000000u
+#define FUTEX_OWNER_DIED 0x40000000u
+#define FUTEX_TID_MASK 0x3fffffffu
+#define ROBUST_LIST_HEAD_SIZE 24ul
+#define ROBUST_LIST_LIMIT 2048u
 
 struct trap_frame
 {
@@ -754,7 +775,8 @@ struct signal_entry
     u32 uid;
     u64 value;
     s32 status;
-    u32 reserved;
+    // The thread a signal was sent to, or zero for one any thread of the process may take
+    u32 thread;
 };
 
 struct process
@@ -769,30 +791,14 @@ struct process
     u32 exit_signal;
     u32 child_signal;
     u32 did_exec;
-    u32 time_slice;
-    u32 vfork_parent_pid;
-    u32 sleep_reason;
-    u32 wait_options;
+    u32 thread_count;
+    u32 vfork_parent_tid;
     u32 stop_signal;
     u32 stop_report;
     u32 signal_queue_count;
-    u32 signal_restore_mask;
-    u32 altstack_flags;
-    u32 restart_pending;
     u32 ctty;
-    u32 tty_timed_out;
     u32 vm_region_count;
-    u64 signal_blocked;
     u64 signal_pending;
-    u64 signal_saved_blocked;
-    u64 orig_a0;
-    u64 sleep_deadline;
-    u64 sleep_user_pointer;
-    u64 sigwait_set;
-    u64 restart_deadline;
-    u64 restart_user_pointer;
-    u64 altstack_sp;
-    u64 altstack_size;
     u64 itimer_real_deadline;
     u64 itimer_real_interval;
     u64 itimer_virtual_value;
@@ -808,12 +814,47 @@ struct process
     u64 brk;
     u64 brk_min;
     u64 mmap_cursor;
-    u64 wait_pid;
-    u64 wait_status_pointer;
-    struct trap_frame frame;
     struct file_descriptor files[MAX_OPEN_FILES];
     struct vm_region vm_regions[MAX_VM_REGIONS];
 };
+
+struct thread
+{
+    u32 state;
+    u32 tid;
+    u32 slot;
+    u32 time_slice;
+    u32 sleep_reason;
+    u32 wait_options;
+    u32 signal_restore_mask;
+    u32 altstack_flags;
+    u32 restart_pending;
+    u32 tty_timed_out;
+    u32 futex_bitset;
+    struct process* process;
+    u64 signal_blocked;
+    u64 signal_pending;
+    u64 signal_saved_blocked;
+    u64 orig_a0;
+    u64 sleep_deadline;
+    u64 sleep_user_pointer;
+    u64 sigwait_set;
+    u64 restart_deadline;
+    u64 restart_user_pointer;
+    u64 altstack_sp;
+    u64 altstack_size;
+    u64 cpu_ticks;
+    u64 wait_pid;
+    u64 wait_status_pointer;
+    u64 futex_space;
+    u64 futex_address;
+    u64 futex_order;
+    u64 clear_child_tid;
+    u64 robust_list;
+    struct trap_frame frame;
+};
+
+_Static_assert(sizeof(struct thread) <= PAGE_SIZE, "a thread lives in one page");
 
 extern void kernel_enter_user(u64 entry, u64 stack);
 
@@ -863,14 +904,17 @@ static u64 fat_buffer_valid;
 static u64 dir_buffer_valid;
 static struct block_device root_block_device;
 static struct process processes[MAX_PROCESSES];
-static struct process* current_task;
+static struct thread* threads[MAX_THREADS];
+static struct process* current_process;
+static struct thread* current_thread;
 static struct file_descriptor* open_files;
 static struct file_object file_objects[MAX_FILE_OBJECTS];
 static u32 file_object_limit;
 static struct file_page* file_pages;
 static u64 free_page_count;
-static u32 current_task_slot;
+static u32 current_thread_slot;
 static u32 next_pid;
+static u64 futex_sequence;
 static u64 scheduler_ticks;
 static u64 realtime_seconds;
 static u64 realtime_nanoseconds;
@@ -896,6 +940,7 @@ static u32 file_find(struct vfs_node* node);
 static int file_unlink(struct vfs_node* node);
 static int file_truncate(struct vfs_node* node);
 static int file_put(u32 object);
+static void file_reclaim_pages(u64 needed);
 static u64 available_page_count(void);
 static u64 physical_clear_end(u64 address);
 static int load_elf64(const u8* image, u32 image_size, u64 root, u64 base, const struct elf_image* occupied, struct elf_image* loaded);
@@ -2986,8 +3031,8 @@ static u64 timer_now(void)
 static void process_account_time(void)
 {
     u64 now = timer_now();
-    if (cpu_account_running && current_task != NULL && current_task->used != 0u)
-        current_task->cpu_ticks = current_task->cpu_ticks + now - cpu_account_start;
+    if (cpu_account_running && current_thread != NULL)
+        current_thread->cpu_ticks = current_thread->cpu_ticks + now - cpu_account_start;
     cpu_account_start = now;
 }
 
@@ -3021,61 +3066,68 @@ static void process_clear(struct process* process)
     mem_zero(process, sizeof(struct process));
 }
 
+// The tables come zeroed with the image
 static void process_table_init(void)
 {
-    u32 index = 0u;
-    while (index < MAX_PROCESSES)
-    {
-        process_clear(&processes[index]);
-        index = index + 1u;
-    }
+    struct thread* thread = (struct thread*)alloc_page();
     next_pid = 1u;
-    current_task_slot = 0u;
-    current_task = &processes[0];
-    process_clear(current_task);
-    current_task->used = 1u;
-    current_task->state = PROC_RUNNING;
-    current_task->pid = next_pid;
-    current_task->ppid = 0u;
-    current_task->pgid = next_pid;
-    current_task->sid = next_pid;
-    current_task->time_slice = DEFAULT_TIME_SLICE;
+    current_process = &processes[0];
+    current_process->used = 1u;
+    current_process->state = PROC_RUNNABLE;
+    current_process->pid = next_pid;
+    current_process->pgid = next_pid;
+    current_process->sid = next_pid;
+    current_process->thread_count = 1u;
     // The first process stands at the root, and every later one inherits where its parent stood
-    vfs_root_node(&current_task->cwd);
-    current_task->cwd_path[0] = '/';
-    current_task->cwd_path[1] = 0;
+    vfs_root_node(&current_process->cwd);
+    current_process->cwd_path[0] = '/';
+    current_process->cwd_path[1] = 0;
+    thread->state = PROC_RUNNING;
+    thread->tid = next_pid;
+    thread->time_slice = DEFAULT_TIME_SLICE;
+    thread->process = current_process;
+    threads[0] = thread;
+    current_thread = thread;
+    current_thread_slot = 0u;
     next_pid = next_pid + 1u;
-    open_files = current_task->files;
+    open_files = current_process->files;
 }
 
-static void process_save_active(struct process* process, struct trap_frame* frame)
+static void process_save_active(struct thread* thread, struct trap_frame* frame)
 {
-    if (process == NULL || process->used == 0u)
+    struct process* process;
+    if (thread == NULL)
         return;
+    process = thread->process;
     if (frame != NULL)
-        mem_copy(&process->frame, frame, sizeof(struct trap_frame));
+        mem_copy(&thread->frame, frame, sizeof(struct trap_frame));
     process->root_page_table = current_user_root_page_table;
     process->brk = process_brk;
     process->brk_min = process_brk_min;
     process->mmap_cursor = user_mmap_cursor;
 }
 
-static void process_load_active(struct process* process, struct trap_frame* frame)
+static void process_load_active(struct thread* thread, struct trap_frame* frame)
 {
-    current_task = process;
-    current_user_root_page_table = process->root_page_table;
+    struct process* process = thread->process;
+    current_thread = thread;
+    current_process = process;
     process_brk = process->brk;
     process_brk_min = process->brk_min;
     user_mmap_cursor = process->mmap_cursor;
     open_files = process->files;
     if (frame != NULL)
-        mem_copy(frame, &process->frame, sizeof(struct trap_frame));
-    activate_page_table(process->root_page_table);
+        mem_copy(frame, &thread->frame, sizeof(struct trap_frame));
+    if (process->root_page_table != current_user_root_page_table)
+    {
+        current_user_root_page_table = process->root_page_table;
+        activate_page_table(process->root_page_table);
+    }
 }
 
 static void process_commit_active(void)
 {
-    process_save_active(current_task, NULL);
+    process_save_active(current_thread, NULL);
 }
 
 static int process_alloc_slot(void)
@@ -3090,18 +3142,56 @@ static int process_alloc_slot(void)
     return -1;
 }
 
+static int thread_alloc_slot(void)
+{
+    u32 index = 0u;
+    while (index < MAX_THREADS)
+    {
+        if (threads[index] == NULL)
+            return (int)index;
+        index = index + 1u;
+    }
+    return -1;
+}
+
+static struct thread* thread_find(u64 tid)
+{
+    u32 index = 0u;
+    while (index < MAX_THREADS)
+    {
+        struct thread* thread = threads[index];
+        index = index + 1u;
+        if (thread != NULL && (u64)thread->tid == tid)
+            return thread;
+    }
+    return NULL;
+}
+
+static struct thread* thread_next(struct process* process, struct thread* after)
+{
+    u32 index = after == NULL ? 0u : after->slot + 1u;
+    while (index < MAX_THREADS)
+    {
+        struct thread* thread = threads[index];
+        index = index + 1u;
+        if (thread != NULL && thread->process == process)
+            return thread;
+    }
+    return NULL;
+}
+
 static int scheduler_pick_next(void)
 {
     u32 count = 0u;
-    u32 index = current_task_slot + 1u;
-    if (index >= MAX_PROCESSES)
+    u32 index = current_thread_slot + 1u;
+    if (index >= MAX_THREADS)
         index = 0u;
-    while (count < MAX_PROCESSES)
+    while (count < MAX_THREADS)
     {
-        if (processes[index].used != 0u && processes[index].state == PROC_RUNNABLE)
+        if (threads[index] != NULL && threads[index]->state == PROC_RUNNABLE)
             return (int)index;
         index = index + 1u;
-        if (index >= MAX_PROCESSES)
+        if (index >= MAX_THREADS)
             index = 0u;
         count = count + 1u;
     }
@@ -3114,10 +3204,10 @@ static int scheduler_can_wake(void);
 static void scheduler_switch(struct trap_frame* frame)
 {
     int next;
+    struct thread* thread;
     process_account_time();
     cpu_account_running = 0;
-    if (current_task != NULL)
-        process_save_active(current_task, frame);
+    process_save_active(current_thread, frame);
     next = scheduler_pick_next();
     // Nothing to run is idleness while a clock or the console may still wake someone, and the end otherwise
     while (next < 0)
@@ -3127,21 +3217,22 @@ static void scheduler_switch(struct trap_frame* frame)
         scheduler_poll(timer_now());
         next = scheduler_pick_next();
     }
-    current_task_slot = (u32)next;
-    processes[current_task_slot].state = PROC_RUNNING;
-    if (processes[current_task_slot].time_slice == 0u)
-        processes[current_task_slot].time_slice = DEFAULT_TIME_SLICE;
-    process_load_active(&processes[current_task_slot], frame);
+    current_thread_slot = (u32)next;
+    thread = threads[current_thread_slot];
+    thread->state = PROC_RUNNING;
+    if (thread->time_slice == 0u)
+        thread->time_slice = DEFAULT_TIME_SLICE;
+    process_load_active(thread, frame);
     cpu_account_start = timer_now();
     cpu_account_running = 1;
 }
 
 static void scheduler_yield(struct trap_frame* frame)
 {
-    if (current_task == NULL)
+    if (current_thread == NULL)
         return;
-    if (current_task->state == PROC_RUNNING)
-        current_task->state = PROC_RUNNABLE;
+    if (current_thread->state == PROC_RUNNING)
+        current_thread->state = PROC_RUNNABLE;
     scheduler_switch(frame);
 }
 
@@ -3327,49 +3418,22 @@ static u64 copy_user_address_space(u64 source_root)
     return root;
 }
 
-static int process_clone(struct trap_frame* frame, u64 flags, u64 child_stack)
+static void process_fork_resources(struct process* child, u64 flags, u64 child_root)
 {
-    int slot;
-    struct process* child;
-    u64 child_root;
-    u64 unsupported = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID;
-    if ((flags & unsupported) != 0ul)
-        return -22;
-    if ((flags & 255ul) != 0ul && (flags & 255ul) != SIGCHLD)
-        return -22;
-    slot = process_alloc_slot();
-    if (slot < 0)
-        return -11;
-    if ((flags & CLONE_VFORK) != 0ul)
-        child_root = current_user_root_page_table;
-    else
-        child_root = copy_user_address_space(current_user_root_page_table);
-    if (child_root == 0ul)
-        return -12;
-    child = &processes[(u32)slot];
-    process_clear(child);
-    child->used = 1u;
-    child->state = PROC_RUNNABLE;
-    child->pid = next_pid;
-    child->ppid = current_task->pid;
-    child->pgid = current_task->pgid;
-    child->sid = current_task->sid;
-    child->ctty = current_task->ctty;
+    child->ppid = current_process->pid;
+    child->pgid = current_process->pgid;
+    child->sid = current_process->sid;
+    child->ctty = current_process->ctty;
     child->child_signal = (u32)(flags & 255ul);
-    child->signal_blocked = current_task->signal_blocked;
-    child->altstack_sp = current_task->altstack_sp;
-    child->altstack_size = current_task->altstack_size;
-    child->altstack_flags = current_task->altstack_flags;
-    mem_copy(child->signal_actions, current_task->signal_actions, sizeof(struct signal_action) * SIGNAL_COUNT);
+    mem_copy(child->signal_actions, current_process->signal_actions, sizeof(struct signal_action) * SIGNAL_COUNT);
     child->root_page_table = child_root;
     child->brk = process_brk;
     child->brk_min = process_brk_min;
     child->mmap_cursor = user_mmap_cursor;
-    child->time_slice = DEFAULT_TIME_SLICE;
     if ((flags & CLONE_VFORK) != 0ul)
-        child->vfork_parent_pid = current_task->pid;
-    child->cwd = current_task->cwd;
-    mem_copy(child->cwd_path, current_task->cwd_path, (u64)PATH_BUFFER_SIZE);
+        child->vfork_parent_tid = current_thread->tid;
+    child->cwd = current_process->cwd;
+    mem_copy(child->cwd_path, current_process->cwd_path, (u64)PATH_BUFFER_SIZE);
     mem_copy(child->files, open_files, sizeof(struct file_descriptor) * (u64)MAX_OPEN_FILES);
     {
         u32 index = 0u;
@@ -3382,8 +3446,8 @@ static int process_clone(struct trap_frame* frame, u64 flags, u64 child_stack)
             index = index + 1u;
         }
     }
-    mem_copy(child->vm_regions, current_task->vm_regions, sizeof(struct vm_region) * (u64)current_task->vm_region_count);
-    child->vm_region_count = current_task->vm_region_count;
+    mem_copy(child->vm_regions, current_process->vm_regions, sizeof(struct vm_region) * (u64)current_process->vm_region_count);
+    child->vm_region_count = current_process->vm_region_count;
     {
         u32 index;
         for (index = 0u; index < child->vm_region_count; index = index + 1u)
@@ -3393,12 +3457,85 @@ static int process_clone(struct trap_frame* frame, u64 flags, u64 child_stack)
                 file_objects[object - 1u].refs = file_objects[object - 1u].refs + 1u;
         }
     }
-    mem_copy(&child->frame, frame, sizeof(struct trap_frame));
-    child->frame.x[10] = 0ul;
-    if (child_stack != 0ul)
-        child->frame.x[2] = child_stack;
+}
+
+static struct thread* thread_create(u32 slot, struct process* process, const struct trap_frame* frame)
+{
+    struct thread* thread = (struct thread*)alloc_page();
+    thread->state = PROC_RUNNABLE;
+    thread->tid = next_pid;
+    thread->slot = slot;
+    thread->time_slice = DEFAULT_TIME_SLICE;
+    thread->process = process;
+    thread->signal_blocked = current_thread->signal_blocked;
+    mem_copy(&thread->frame, frame, sizeof(struct trap_frame));
+    thread->frame.x[10] = 0ul;
+    process->thread_count = process->thread_count + 1u;
+    threads[slot] = thread;
     next_pid = next_pid + 1u;
-    return (int)child->pid;
+    return thread;
+}
+
+static s64 process_clone(struct trap_frame* frame, u64 flags, u64 child_stack, u64 parent_tid, u64 tls, u64 child_tid)
+{
+    u64 shared = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND;
+    u64 known = shared | CLONE_VFORK | CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID |
+        CLONE_CHILD_CLEARTID | CLONE_DETACHED | CLONE_CHILD_SETTID | 255ul;
+    int thread_slot;
+    struct thread* thread;
+    u64 child_root = current_user_root_page_table;
+    u32 tid;
+    if ((flags & ~known) != 0ul)
+        return -22l;
+    // A thread shares all its process owns, and another process shares nothing but memory, and that only while a vfork lasts
+    if ((flags & CLONE_THREAD) != 0ul ? (flags & shared) != shared || (flags & CLONE_VFORK) != 0ul :
+        (flags & (CLONE_FS | CLONE_FILES | CLONE_SIGHAND)) != 0ul || (flags & (CLONE_VM | CLONE_VFORK)) == CLONE_VM ||
+        ((flags & 255ul) != 0ul && (flags & 255ul) != SIGCHLD))
+        return -22l;
+    thread_slot = thread_alloc_slot();
+    if (thread_slot < 0)
+        return -11l;
+    file_reclaim_pages(1ul);
+    if (free_page_count == 0ul)
+        return -12l;
+    if ((flags & CLONE_THREAD) != 0ul)
+    {
+        thread = thread_create((u32)thread_slot, current_process, frame);
+        thread->altstack_flags = SS_DISABLE;
+    }
+    else
+    {
+        int slot = process_alloc_slot();
+        struct process* child;
+        if (slot < 0)
+            return -11l;
+        if ((flags & CLONE_VM) == 0ul)
+            child_root = copy_user_address_space(current_user_root_page_table);
+        if (child_root == 0ul)
+            return -12l;
+        child = &processes[(u32)slot];
+        process_clear(child);
+        child->used = 1u;
+        child->state = PROC_RUNNABLE;
+        child->pid = next_pid;
+        thread = thread_create((u32)thread_slot, child, frame);
+        thread->altstack_sp = current_thread->altstack_sp;
+        thread->altstack_size = current_thread->altstack_size;
+        thread->altstack_flags = current_thread->altstack_flags;
+        process_fork_resources(child, flags, child_root);
+    }
+    tid = thread->tid;
+    if (child_stack != 0ul)
+        thread->frame.x[2] = child_stack;
+    if ((flags & CLONE_SETTLS) != 0ul)
+        thread->frame.x[4] = tls;
+    if ((flags & CLONE_CHILD_CLEARTID) != 0ul)
+        thread->clear_child_tid = child_tid;
+    if ((flags & CLONE_CHILD_SETTID) != 0ul)
+        user_copy_to_writable(child_root, child_tid, &tid, 4ul);
+    if ((flags & CLONE_PARENT_SETTID) != 0ul)
+        user_copy_to_writable(current_user_root_page_table, parent_tid, &tid, 4ul);
+    return (s64)tid;
 }
 
 static void process_reap(struct process* process)
@@ -3418,35 +3555,56 @@ static struct process* process_find(u64 pid)
     return NULL;
 }
 
-static void process_wake(struct process* process)
+static struct process* process_find_task(u64 id)
 {
-    process->state = PROC_RUNNABLE;
-    process->sleep_reason = SLEEP_NONE;
-    process->sleep_deadline = 0ul;
-    process->wait_pid = 0ul;
-    process->wait_status_pointer = 0ul;
+    struct process* process = process_find(id);
+    struct thread* thread;
+    if (process != NULL)
+        return process;
+    thread = thread_find(id);
+    return thread != NULL ? thread->process : NULL;
 }
 
-static int process_store_remaining(struct process* task, u64 pointer, u64 deadline);
+static void process_wake(struct thread* thread)
+{
+    thread->state = PROC_RUNNABLE;
+    thread->sleep_reason = SLEEP_NONE;
+    thread->sleep_deadline = 0ul;
+    thread->wait_pid = 0ul;
+    thread->wait_status_pointer = 0ul;
+}
+
+static u64 thread_signal_pending(struct thread* thread)
+{
+    return thread->signal_pending | thread->process->signal_pending;
+}
+
+static int process_store_remaining(struct thread* thread, u64 pointer, u64 deadline);
 
 // The caller has already placed what the call returns should a signal cut the sleep short
 static void process_sleep(struct trap_frame* frame, u32 reason, u64 deadline)
 {
-    if ((current_task->signal_pending & ~current_task->signal_blocked) != 0ul)
+    struct thread* thread = current_thread;
+    if ((thread_signal_pending(thread) & ~thread->signal_blocked) != 0ul)
     {
         if (reason == SLEEP_TIMER)
         {
-            if (!process_store_remaining(current_task, current_task->sleep_user_pointer, deadline))
+            if (!process_store_remaining(thread, thread->sleep_user_pointer, deadline))
                 frame->x[10] = (u64)-14l;
-            current_task->restart_deadline = deadline;
-            current_task->restart_user_pointer = current_task->sleep_user_pointer;
-            current_task->restart_pending = 1u;
+            thread->restart_deadline = deadline;
+            thread->restart_user_pointer = thread->sleep_user_pointer;
+            thread->restart_pending = RESTART_SLEEP;
+        }
+        else if (reason == SLEEP_FUTEX && deadline != 0ul)
+        {
+            thread->restart_deadline = deadline;
+            thread->restart_pending = RESTART_FUTEX;
         }
         return;
     }
-    current_task->sleep_reason = reason;
-    current_task->sleep_deadline = deadline;
-    current_task->state = PROC_WAITING;
+    thread->sleep_reason = reason;
+    thread->sleep_deadline = deadline;
+    thread->state = PROC_WAITING;
     scheduler_switch(frame);
 }
 
@@ -3535,7 +3693,7 @@ static void sys_wait4_dispatch(struct trap_frame* frame, u64 pid, u64 status_poi
         frame->x[10] = (u64)-22l;
         return;
     }
-    if (process_try_wait(current_task, pid, status_pointer, options, usage_pointer, &result))
+    if (process_try_wait(current_process, pid, status_pointer, options, usage_pointer, &result))
     {
         frame->x[10] = (u64)result;
         return;
@@ -3545,44 +3703,37 @@ static void sys_wait4_dispatch(struct trap_frame* frame, u64 pid, u64 status_poi
         frame->x[10] = 0ul;
         return;
     }
-    current_task->wait_pid = pid;
-    current_task->wait_status_pointer = status_pointer;
-    current_task->wait_options = (u32)options;
-    current_task->sleep_user_pointer = usage_pointer;
+    current_thread->wait_pid = pid;
+    current_thread->wait_status_pointer = status_pointer;
+    current_thread->wait_options = (u32)options;
+    current_thread->sleep_user_pointer = usage_pointer;
     frame->x[10] = (u64)-ERESTARTSYS;
     process_sleep(frame, SLEEP_CHILD, 0ul);
 }
 
 static void process_wake_vfork_parent(struct process* child)
 {
-    u32 index = 0u;
-    u32 parent_pid = child->vfork_parent_pid;
-    if (parent_pid == 0u)
-        return;
-    while (index < MAX_PROCESSES)
-    {
-        struct process* parent = &processes[index];
-        if (parent->used != 0u && parent->pid == parent_pid && parent->state == PROC_VFORK)
-        {
-            parent->state = PROC_RUNNABLE;
-            child->vfork_parent_pid = 0u;
-            return;
-        }
-        index = index + 1u;
-    }
-    child->vfork_parent_pid = 0u;
+    struct thread* parent = child->vfork_parent_tid == 0u ? NULL : thread_find((u64)child->vfork_parent_tid);
+    child->vfork_parent_tid = 0u;
+    if (parent != NULL && parent->state == PROC_VFORK)
+        parent->state = parent->process->state == PROC_STOPPED ? PROC_STOPPED : PROC_RUNNABLE;
 }
 
 static void process_notify_waiter(u32 parent_pid)
 {
     struct process* parent = process_find((u64)parent_pid);
+    struct thread* thread = NULL;
     s64 result;
-    if (parent == NULL || parent->state != PROC_WAITING || parent->sleep_reason != SLEEP_CHILD)
+    if (parent == NULL)
         return;
-    if (!process_try_wait(parent, parent->wait_pid, parent->wait_status_pointer, (u64)parent->wait_options, parent->sleep_user_pointer, &result))
-        return;
-    parent->frame.x[10] = (u64)result;
-    process_wake(parent);
+    while ((thread = thread_next(parent, thread)) != NULL)
+    {
+        if (thread->state != PROC_WAITING || thread->sleep_reason != SLEEP_CHILD ||
+            !process_try_wait(parent, thread->wait_pid, thread->wait_status_pointer, (u64)thread->wait_options, thread->sleep_user_pointer, &result))
+            continue;
+        thread->frame.x[10] = (u64)result;
+        process_wake(thread);
+    }
 }
 
 static u64 signal_bit(u64 sig)
@@ -3598,55 +3749,90 @@ static void signal_entry_init(struct signal_entry* entry, u64 sig, s32 code, u32
     entry->pid = pid;
 }
 
-static int signal_queue_push(struct process* task, const struct signal_entry* entry)
+static u64* signal_pending_set(struct process* process, u32 tid)
+{
+    struct thread* thread = tid == 0u ? NULL : thread_find((u64)tid);
+    return thread != NULL ? &thread->signal_pending : &process->signal_pending;
+}
+
+// A standard signal stays pending without its details once the queue is full, as one sent by the kernel would
+static int signal_queue_push(struct process* process, struct thread* thread, const struct signal_entry* entry)
 {
     u64 sig = (u64)entry->signo;
-    if (sig < SIGRTMIN && (task->signal_pending & signal_bit(sig)) != 0ul)
+    u64* pending = thread != NULL ? &thread->signal_pending : &process->signal_pending;
+    if (sig < SIGRTMIN && (*pending & signal_bit(sig)) != 0ul)
         return 1;
-    if (sig >= SIGRTMIN && task->signal_queue_count >= SIGNAL_RT_QUEUE_LIMIT)
+    if (sig >= SIGRTMIN && process->signal_queue_count >= SIGNAL_RT_QUEUE_LIMIT)
         return 0;
-    mem_copy(&task->signal_queue[task->signal_queue_count], entry, sizeof(struct signal_entry));
-    task->signal_queue_count = task->signal_queue_count + 1u;
-    task->signal_pending = task->signal_pending | signal_bit(sig);
+    if (process->signal_queue_count < SIGNAL_QUEUE_SIZE)
+    {
+        struct signal_entry* slot = &process->signal_queue[process->signal_queue_count];
+        mem_copy(slot, entry, sizeof(struct signal_entry));
+        slot->thread = thread != NULL ? thread->tid : 0u;
+        process->signal_queue_count = process->signal_queue_count + 1u;
+    }
+    *pending = *pending | signal_bit(sig);
     return 1;
 }
 
-static void signal_queue_remove(struct process* task, u32 index)
+static void signal_queue_remove(struct process* process, u32 index)
 {
-    u32 sig = task->signal_queue[index].signo;
+    u32 sig = process->signal_queue[index].signo;
+    u32 target = process->signal_queue[index].thread;
     u32 cursor = 0u;
-    task->signal_queue_count = task->signal_queue_count - 1u;
-    while (index < task->signal_queue_count)
+    u64* pending;
+    process->signal_queue_count = process->signal_queue_count - 1u;
+    while (index < process->signal_queue_count)
     {
-        mem_copy(&task->signal_queue[index], &task->signal_queue[index + 1u], sizeof(struct signal_entry));
+        mem_copy(&process->signal_queue[index], &process->signal_queue[index + 1u], sizeof(struct signal_entry));
         index = index + 1u;
     }
-    while (cursor < task->signal_queue_count)
+    while (cursor < process->signal_queue_count)
     {
-        if (task->signal_queue[cursor].signo == sig)
+        if (process->signal_queue[cursor].signo == sig && process->signal_queue[cursor].thread == target)
             return;
         cursor = cursor + 1u;
     }
-    task->signal_pending = task->signal_pending & ~signal_bit((u64)sig);
+    pending = signal_pending_set(process, target);
+    *pending = *pending & ~signal_bit((u64)sig);
 }
 
-static void signal_queue_flush(struct process* task, u64 mask)
+static void signal_queue_flush(struct process* process, u64 mask)
+{
+    struct thread* thread = NULL;
+    u32 index = 0u;
+    while (index < process->signal_queue_count)
+    {
+        if ((signal_bit((u64)process->signal_queue[index].signo) & mask) != 0ul)
+            signal_queue_remove(process, index);
+        else
+            index = index + 1u;
+    }
+    process->signal_pending = process->signal_pending & ~mask;
+    while ((thread = thread_next(process, thread)) != NULL)
+        thread->signal_pending = thread->signal_pending & ~mask;
+}
+
+static void signal_queue_drop_thread(struct process* process, u32 tid)
 {
     u32 index = 0u;
-    while (index < task->signal_queue_count)
+    while (index < process->signal_queue_count)
     {
-        if ((signal_bit((u64)task->signal_queue[index].signo) & mask) != 0ul)
-            signal_queue_remove(task, index);
+        if (process->signal_queue[index].thread == tid)
+            signal_queue_remove(process, index);
         else
             index = index + 1u;
     }
 }
 
 // A fault goes first so its handler sees the instruction that failed; otherwise the lowest number does
-static u64 signal_queue_take(struct process* task, u64 mask, struct signal_entry* entry)
+static u64 signal_queue_take(struct thread* thread, u64 mask, struct signal_entry* entry)
 {
-    u64 ready = task->signal_pending & mask;
+    struct process* process = thread->process;
+    u64 own = thread->signal_pending & mask;
+    u64 ready = (own | process->signal_pending) & mask;
     u64 sig = 1ul;
+    u32 target;
     u32 index = 0u;
     if (ready == 0ul)
         return 0ul;
@@ -3657,10 +3843,20 @@ static u64 signal_queue_take(struct process* task, u64 mask, struct signal_entry
         ready = ready >> 1;
         sig = sig + 1ul;
     }
-    while ((u64)task->signal_queue[index].signo != sig)
+    target = (own & signal_bit(sig)) != 0ul ? thread->tid : 0u;
+    while (index < process->signal_queue_count && ((u64)process->signal_queue[index].signo != sig || process->signal_queue[index].thread != target))
         index = index + 1u;
-    mem_copy(entry, &task->signal_queue[index], sizeof(struct signal_entry));
-    signal_queue_remove(task, index);
+    if (index == process->signal_queue_count)
+    {
+        signal_entry_init(entry, sig, SI_USER, 0u);
+        if (target != 0u)
+            thread->signal_pending = thread->signal_pending & ~signal_bit(sig);
+        else
+            process->signal_pending = process->signal_pending & ~signal_bit(sig);
+        return sig;
+    }
+    mem_copy(entry, &process->signal_queue[index], sizeof(struct signal_entry));
+    signal_queue_remove(process, index);
     return sig;
 }
 
@@ -3674,20 +3870,32 @@ static int signal_default_stops(u64 sig)
     return (SIGNAL_STOP_MASK & signal_bit(sig)) != 0ul;
 }
 
-static int signal_ignored(struct process* task, u64 sig)
+static int signal_ignored(struct process* process, struct thread* thread, u64 sig)
 {
-    u64 handler = task->signal_actions[sig - 1ul].handler;
-    if ((task->signal_blocked & signal_bit(sig)) != 0ul)
-        return 0;
-    if (task->pid == 1u && handler == SIG_DFL)
+    u64 handler = process->signal_actions[sig - 1ul].handler;
+    if (thread != NULL)
+    {
+        if ((thread->signal_blocked & signal_bit(sig)) != 0ul)
+            return 0;
+    }
+    else
+    {
+        struct thread* other = NULL;
+        while ((other = thread_next(process, other)) != NULL)
+        {
+            if ((other->signal_blocked & signal_bit(sig)) != 0ul)
+                return 0;
+        }
+    }
+    if (process->pid == 1u && handler == SIG_DFL)
         return 1;
     return handler == SIG_IGN || (handler == SIG_DFL && signal_default_ignored(sig));
 }
 
-static int signal_fatal(struct process* task, u64 sig)
+static int signal_fatal(struct thread* thread, u64 sig)
 {
-    return task->signal_actions[sig - 1ul].handler == SIG_DFL && !signal_default_ignored(sig) &&
-        !signal_default_stops(sig) && (task->signal_blocked & signal_bit(sig)) == 0ul;
+    return thread->process->signal_actions[sig - 1ul].handler == SIG_DFL && !signal_default_ignored(sig) &&
+        !signal_default_stops(sig) && (thread->signal_blocked & signal_bit(sig)) == 0ul;
 }
 
 static u64 time_to_ticks(u64 seconds, u64 fraction, u64 unit)
@@ -3716,14 +3924,14 @@ static void time_from_ticks(u64 ticks, u64 unit, u64* seconds, u64* fraction)
     *fraction = (ticks % timebase) * unit / timebase;
 }
 
-static int process_store_remaining(struct process* task, u64 pointer, u64 deadline)
+static int process_store_remaining(struct thread* thread, u64 pointer, u64 deadline)
 {
     u64 now = timer_now();
     u64 remaining[2];
     if (pointer == 0ul)
         return 1;
     time_from_ticks(deadline > now ? deadline - now : 0ul, 1000000000ul, &remaining[0], &remaining[1]);
-    return user_copy_to_writable(task->root_page_table, pointer, remaining, 16ul);
+    return user_copy_to_writable(thread->process->root_page_table, pointer, remaining, 16ul);
 }
 
 static void signal_store_info(u8* info, const struct signal_entry* entry)
@@ -3755,76 +3963,119 @@ static int signal_copy_info(u64 root, u64 pointer, const struct signal_entry* en
 
 static void signal_notify_stop(struct process* child, s32 code, u32 status);
 
-static void signal_wake(struct process* task, u64 sig)
+static void signal_interrupt(struct thread* thread)
+{
+    if (thread->sleep_reason == SLEEP_TIMER)
+    {
+        if (!process_store_remaining(thread, thread->sleep_user_pointer, thread->sleep_deadline))
+            thread->frame.x[10] = (u64)-14l;
+        thread->restart_deadline = thread->sleep_deadline;
+        thread->restart_user_pointer = thread->sleep_user_pointer;
+        thread->restart_pending = RESTART_SLEEP;
+    }
+    else if (thread->sleep_reason == SLEEP_SIGWAIT)
+        thread->frame.x[10] = (u64)-EINTR;
+    else if (thread->sleep_reason == SLEEP_POLL && thread->sleep_deadline != 0ul)
+        process_store_remaining(thread, thread->sleep_user_pointer, thread->sleep_deadline);
+    else if (thread->sleep_reason == SLEEP_FUTEX && thread->sleep_deadline != 0ul)
+    {
+        thread->restart_deadline = thread->sleep_deadline;
+        thread->restart_pending = RESTART_FUTEX;
+    }
+    process_wake(thread);
+}
+
+static void signal_wake(struct thread* thread, u64 sig)
 {
     u64 bit = signal_bit(sig);
     struct signal_entry entry;
-    if (task->state == PROC_STOPPED || task->state == PROC_VFORK)
+    if (thread->state == PROC_STOPPED || thread->state == PROC_VFORK)
     {
-        if (signal_fatal(task, sig))
+        if (signal_fatal(thread, sig))
         {
-            task->state = PROC_RUNNABLE;
-            task->stop_report = 0u;
+            thread->state = PROC_RUNNABLE;
+            if (thread->process->state == PROC_STOPPED)
+                thread->process->state = PROC_RUNNABLE;
+            thread->process->stop_report = 0u;
         }
         return;
     }
-    if (task->state != PROC_WAITING)
+    if (thread->state != PROC_WAITING)
         return;
-    if (task->sleep_reason == SLEEP_SIGWAIT && (task->sigwait_set & bit) != 0ul)
+    if (thread->sleep_reason == SLEEP_SIGWAIT && (thread->sigwait_set & bit) != 0ul)
     {
-        if (signal_queue_take(task, bit, &entry) == 0ul)
+        if (signal_queue_take(thread, bit, &entry) == 0ul)
             return;
-        task->frame.x[10] = signal_copy_info(task->root_page_table, task->sleep_user_pointer, &entry) ? sig : (u64)-14l;
-        process_wake(task);
+        thread->frame.x[10] = signal_copy_info(thread->process->root_page_table, thread->sleep_user_pointer, &entry) ? sig : (u64)-14l;
+        process_wake(thread);
         return;
     }
-    if ((task->signal_blocked & bit) != 0ul)
+    if ((thread->signal_blocked & bit) != 0ul)
         return;
-    if (task->sleep_reason == SLEEP_TIMER)
-    {
-        if (!process_store_remaining(task, task->sleep_user_pointer, task->sleep_deadline))
-            task->frame.x[10] = (u64)-14l;
-        task->restart_deadline = task->sleep_deadline;
-        task->restart_user_pointer = task->sleep_user_pointer;
-        task->restart_pending = 1u;
-    }
-    else if (task->sleep_reason == SLEEP_SIGWAIT)
-        task->frame.x[10] = (u64)-EINTR;
-    else if (task->sleep_reason == SLEEP_POLL && task->sleep_deadline != 0ul)
-        process_store_remaining(task, task->sleep_user_pointer, task->sleep_deadline);
-    process_wake(task);
+    signal_interrupt(thread);
 }
 
-static int signal_send(struct process* task, const struct signal_entry* entry)
+static struct thread* signal_pick_thread(struct process* process, u64 sig)
+{
+    struct thread* thread = NULL;
+    struct thread* chosen = NULL;
+    while ((thread = thread_next(process, thread)) != NULL)
+    {
+        if ((thread->signal_blocked & signal_bit(sig)) != 0ul &&
+            (thread->state != PROC_WAITING || thread->sleep_reason != SLEEP_SIGWAIT || (thread->sigwait_set & signal_bit(sig)) == 0ul))
+            continue;
+        if (thread->tid == process->pid)
+            return thread;
+        if (chosen == NULL)
+            chosen = thread;
+    }
+    return chosen;
+}
+
+static void process_continue(struct process* process)
+{
+    struct thread* thread = NULL;
+    process->state = PROC_RUNNABLE;
+    while ((thread = thread_next(process, thread)) != NULL)
+    {
+        if (thread->state == PROC_STOPPED)
+            thread->state = PROC_RUNNABLE;
+    }
+}
+
+static int signal_send(struct process* process, struct thread* thread, const struct signal_entry* entry)
 {
     u64 sig = (u64)entry->signo;
-    if (task->state == PROC_ZOMBIE)
+    if (process->state == PROC_ZOMBIE)
         return 1;
     if (signal_default_stops(sig))
-        signal_queue_flush(task, signal_bit(SIGCONT));
+        signal_queue_flush(process, signal_bit(SIGCONT));
     else if (sig == SIGCONT)
     {
-        signal_queue_flush(task, SIGNAL_STOP_MASK);
-        if (task->state == PROC_STOPPED)
+        signal_queue_flush(process, SIGNAL_STOP_MASK);
+        if (process->state == PROC_STOPPED)
         {
-            task->state = PROC_RUNNABLE;
-            task->stop_report = STOP_REPORT_CONTINUED;
-            signal_notify_stop(task, CLD_CONTINUED, (u32)SIGCONT);
+            process_continue(process);
+            process->stop_report = STOP_REPORT_CONTINUED;
+            signal_notify_stop(process, CLD_CONTINUED, (u32)SIGCONT);
         }
     }
-    if (signal_ignored(task, sig))
+    if (signal_ignored(process, thread, sig))
         return 1;
-    if (!signal_queue_push(task, entry))
+    if (!signal_queue_push(process, thread, entry))
         return 0;
-    signal_wake(task, sig);
+    if (thread == NULL)
+        thread = signal_pick_thread(process, sig);
+    if (thread != NULL)
+        signal_wake(thread, sig);
     return 1;
 }
 
-static void signal_send_kernel(struct process* task, u64 sig, s32 code)
+static void signal_send_kernel(struct process* process, u64 sig, s32 code)
 {
     struct signal_entry entry;
     signal_entry_init(&entry, sig, code, 0u);
-    signal_send(task, &entry);
+    signal_send(process, NULL, &entry);
 }
 
 // A waiting parent collects its answer before the signal about it can cut the wait short
@@ -3838,7 +4089,7 @@ static void signal_notify_stop(struct process* child, s32 code, u32 status)
     process_notify_waiter(parent_pid);
     parent = process_find((u64)parent_pid);
     if (parent != NULL && (parent->signal_actions[SIGCHLD - 1ul].flags & SA_NOCLDSTOP) == 0ul)
-        signal_send(parent, &entry);
+        signal_send(parent, NULL, &entry);
 }
 
 // The parent hears of a death unless it asked for its children to vanish unclaimed
@@ -3862,7 +4113,7 @@ static void process_report_exit(struct process* child)
     }
     process_notify_waiter(parent_pid);
     if (sig != 0ul)
-        signal_send(parent, &entry);
+        signal_send(parent, NULL, &entry);
 }
 
 static void process_group_signal(u32 pgid, u64 sig)
@@ -3932,9 +4183,144 @@ static void process_reparent_children(u32 parent_pid)
     }
 }
 
+static s64 futex_key(u64 address, int shared, u64* space, u64* key)
+{
+    struct vm_region* region;
+    u64 physical;
+    if ((address & 3ul) != 0ul)
+        return -22l;
+    if (!user_address_range_valid(address, 4ul))
+        return -14l;
+    region = shared ? vm_find_region(address) : NULL;
+    if (region == NULL || (region->flags & MAP_SHARED) == 0ul)
+    {
+        *space = current_user_root_page_table;
+        *key = address;
+        return 0l;
+    }
+    if (!user_translate_with_brk_fault(current_user_root_page_table, address, PTE_R, &physical))
+        return -14l;
+    *space = 0ul;
+    *key = physical;
+    return 0l;
+}
+
+static struct thread* futex_first_waiter(u64 space, u64 key, u32 bitset)
+{
+    struct thread* first = NULL;
+    u32 index = 0u;
+    while (index < MAX_THREADS)
+    {
+        struct thread* thread = threads[index];
+        index = index + 1u;
+        if (thread != NULL && thread->state == PROC_WAITING && thread->sleep_reason == SLEEP_FUTEX &&
+            thread->futex_space == space && thread->futex_address == key && (thread->futex_bitset & bitset) != 0u &&
+            (first == NULL || thread->futex_order < first->futex_order))
+            first = thread;
+    }
+    return first;
+}
+
+static s64 futex_wake(u64 space, u64 key, u32 bitset, s64 count)
+{
+    s64 woken = 0l;
+    struct thread* thread;
+    while (woken < count && (thread = futex_first_waiter(space, key, bitset)) != NULL)
+    {
+        thread->frame.x[10] = 0ul;
+        process_wake(thread);
+        woken = woken + 1l;
+    }
+    return woken;
+}
+
+static void futex_wake_shared(u64 address)
+{
+    u64 space;
+    u64 key;
+    if (futex_key(address, 1, &space, &key) == 0l)
+        futex_wake(space, key, FUTEX_BITSET_MATCH_ANY, 1l);
+}
+
+static void futex_owner_died(struct thread* thread, u64 address, int pending)
+{
+    u32 value;
+    if ((address & 3ul) != 0ul || !user_copy_from_readable(current_user_root_page_table, &value, address, 4ul))
+        return;
+    if (pending && value == 0u)
+    {
+        futex_wake_shared(address);
+        return;
+    }
+    if ((value & FUTEX_TID_MASK) != thread->tid)
+        return;
+    value = (value & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+    if (user_copy_to_writable(current_user_root_page_table, address, &value, 4ul) && (value & FUTEX_WAITERS) != 0u)
+        futex_wake_shared(address);
+}
+
+// The list head is three words: the first entry, the lock word's offset from an entry, and the entry being taken or released
+static void futex_exit_robust_list(struct thread* thread)
+{
+    u64 head[3];
+    u64 entry;
+    u32 limit = ROBUST_LIST_LIMIT;
+    if (thread->robust_list == 0ul || !user_copy_from_readable(current_user_root_page_table, head, thread->robust_list, ROBUST_LIST_HEAD_SIZE))
+        return;
+    entry = head[0] & ~1ul;
+    while (entry != thread->robust_list && limit != 0u)
+    {
+        u64 next;
+        if (!user_copy_from_readable(current_user_root_page_table, &next, entry, 8ul))
+            return;
+        if (entry != (head[2] & ~1ul))
+            futex_owner_died(thread, entry + head[1], 0);
+        entry = next & ~1ul;
+        limit = limit - 1u;
+    }
+    if ((head[2] & ~1ul) != 0ul)
+        futex_owner_died(thread, (head[2] & ~1ul) + head[1], 1);
+}
+
+static void thread_release_memory(struct thread* thread, int memory_shared)
+{
+    u32 zero = 0u;
+    futex_exit_robust_list(thread);
+    if (thread->clear_child_tid != 0ul && memory_shared && user_copy_to_writable(current_user_root_page_table, thread->clear_child_tid, &zero, 4ul))
+        futex_wake_shared(thread->clear_child_tid);
+    thread->robust_list = 0ul;
+    thread->clear_child_tid = 0ul;
+}
+
+static void thread_release(struct thread* thread)
+{
+    struct process* process = thread->process;
+    process->cpu_ticks = process->cpu_ticks + thread->cpu_ticks;
+    process->thread_count = process->thread_count - 1u;
+    signal_queue_drop_thread(process, thread->tid);
+    threads[thread->slot] = NULL;
+    if (thread == current_thread)
+        current_thread = NULL;
+    free_page_raw((u64)thread);
+}
+
+static void process_kill_other_threads(struct process* process)
+{
+    struct thread* next = thread_next(process, NULL);
+    while (next != NULL)
+    {
+        struct thread* thread = next;
+        next = thread_next(process, thread);
+        if (thread == current_thread)
+            continue;
+        futex_exit_robust_list(thread);
+        thread_release(thread);
+    }
+}
+
 static void process_exit_current(struct trap_frame* frame, u64 status, u64 sig)
 {
-    struct process* task = current_task;
+    struct process* task = current_process;
     struct process* parent = process_find((u64)task->ppid);
     u32 pid = task->pid;
     u64 code = status & 255ul;
@@ -3942,6 +4328,7 @@ static void process_exit_current(struct trap_frame* frame, u64 status, u64 sig)
     u32 groups[MAX_PROCESSES];
     u32 group_count = 0u;
     u32 index = 0u;
+    thread_release_memory(current_thread, address_space_held_by_another(root, task));
     if (task->sid == pid && task->ctty != 0u)
         tty_release_session(task->sid, 1);
     while (index < MAX_PROCESSES)
@@ -3966,6 +4353,7 @@ static void process_exit_current(struct trap_frame* frame, u64 status, u64 sig)
     vm_release_regions(task);
     process_account_time();
     cpu_account_running = 0;
+    thread_release(current_thread);
     task->exit_status = (u32)code;
     task->exit_signal = (u32)sig;
     task->state = PROC_ZOMBIE;
@@ -4000,34 +4388,68 @@ static void process_exit_current(struct trap_frame* frame, u64 status, u64 sig)
     scheduler_switch(frame);
 }
 
+static void process_exit_group(struct trap_frame* frame, u64 status, u64 sig)
+{
+    process_kill_other_threads(current_process);
+    process_exit_current(frame, status, sig);
+}
+
+static void thread_exit_current(struct trap_frame* frame, u64 status)
+{
+    struct thread* thread = current_thread;
+    struct process* process = current_process;
+    // The parent hears the status the leader left with, whichever thread goes last
+    if (process->thread_count == 1u)
+    {
+        process_exit_current(frame, thread->tid == process->pid ? status : (u64)process->exit_status, 0ul);
+        return;
+    }
+    if (thread->tid == process->pid)
+        process->exit_status = (u32)(status & 255ul);
+    thread_release_memory(thread, 1);
+    process_account_time();
+    cpu_account_running = 0;
+    thread_release(thread);
+    scheduler_switch(frame);
+}
+
 static void signal_stop_current(struct trap_frame* frame, u64 sig)
 {
-    current_task->state = PROC_STOPPED;
-    current_task->stop_signal = (u32)sig;
-    current_task->stop_report = STOP_REPORT_STOPPED;
-    signal_notify_stop(current_task, CLD_STOPPED, (u32)sig);
+    struct process* process = current_process;
+    struct thread* thread = NULL;
+    process->state = PROC_STOPPED;
+    process->stop_signal = (u32)sig;
+    process->stop_report = STOP_REPORT_STOPPED;
+    while ((thread = thread_next(process, thread)) != NULL)
+    {
+        if (thread->state == PROC_WAITING)
+            signal_interrupt(thread);
+        if (thread->state == PROC_RUNNABLE || thread->state == PROC_RUNNING)
+            thread->state = PROC_STOPPED;
+    }
+    signal_notify_stop(process, CLD_STOPPED, (u32)sig);
     scheduler_switch(frame);
 }
 
 // A fault cannot be ignored or held back, so a handler it would skip gives way to the default
-static void signal_force(struct process* task, u64 sig, s32 code, u64 address)
+static void signal_force(struct thread* thread, u64 sig, s32 code, u64 address)
 {
-    struct signal_action* action = &task->signal_actions[sig - 1ul];
+    struct signal_action* action = &thread->process->signal_actions[sig - 1ul];
     struct signal_entry entry;
-    if (action->handler == SIG_IGN || (task->signal_blocked & signal_bit(sig)) != 0ul)
+    if (action->handler == SIG_IGN || (thread->signal_blocked & signal_bit(sig)) != 0ul)
     {
         action->handler = SIG_DFL;
-        task->signal_blocked = task->signal_blocked & ~signal_bit(sig);
+        thread->signal_blocked = thread->signal_blocked & ~signal_bit(sig);
     }
     signal_entry_init(&entry, sig, code, 0u);
     entry.value = address;
-    signal_queue_push(task, &entry);
+    signal_queue_push(thread->process, thread, &entry);
 }
 
-static int signal_unhandled(struct process* task, u64 sig)
+static int signal_unhandled(struct thread* thread, u64 sig)
 {
-    u64 handler = task->signal_actions[sig - 1ul].handler;
-    return task->pid == 1u || handler == SIG_DFL || handler == SIG_IGN || (task->signal_blocked & signal_bit(sig)) != 0ul;
+    u64 handler = thread->process->signal_actions[sig - 1ul].handler;
+    return thread->process->pid == 1u || handler == SIG_DFL || handler == SIG_IGN || (thread->signal_blocked & signal_bit(sig)) != 0ul;
 }
 
 // The signal a fault carries and what it points at, so a program ends or recovers the way it would on the kernel we follow
@@ -4066,21 +4488,21 @@ static u64 signal_for_fault(struct trap_frame* frame, s32* code, u64* address)
     return SIGILL;
 }
 
-static int signal_on_stack(struct process* task, u64 sp)
+static int signal_on_stack(struct thread* task, u64 sp)
 {
     if ((task->altstack_flags & SS_AUTODISARM) != 0u)
         return 0;
     return sp > task->altstack_sp && sp - task->altstack_sp <= task->altstack_size;
 }
 
-static u32 signal_stack_flags(struct process* task, u64 sp)
+static u32 signal_stack_flags(struct thread* task, u64 sp)
 {
     if (task->altstack_size == 0ul)
         return SS_DISABLE;
     return signal_on_stack(task, sp) ? SS_ONSTACK : 0u;
 }
 
-static s64 signal_set_altstack(struct process* task, u64 sp, u64 stack, u32 flags, u64 size)
+static s64 signal_set_altstack(struct thread* task, u64 sp, u64 stack, u32 flags, u64 size)
 {
     u32 mode = flags & ~SS_AUTODISARM;
     if (task->altstack_sp == stack && task->altstack_size == size && task->altstack_flags == flags)
@@ -4102,7 +4524,7 @@ static s64 signal_set_altstack(struct process* task, u64 sp, u64 stack, u32 flag
     return 0l;
 }
 
-static int signal_setup_frame(struct trap_frame* frame, struct process* task, const struct signal_entry* entry, struct signal_action* action)
+static int signal_setup_frame(struct trap_frame* frame, struct thread* task, const struct signal_entry* entry, struct signal_action* action)
 {
     u64 buffer[(SIGFRAME_SIZE + SIGFRAME_VECTOR_STATE + 32ul * MAX_VECTOR_REGISTER_BYTES + 8ul) / 8ul];
     u8* bytes = (u8*)buffer;
@@ -4173,7 +4595,7 @@ static int signal_setup_frame(struct trap_frame* frame, struct process* task, co
 }
 
 // A call a signal cut short either resumes where it stood or reports the interruption
-static void signal_restart(struct trap_frame* frame, struct process* task, int handled, u64 flags)
+static void signal_restart(struct trap_frame* frame, struct thread* task, int handled, u64 flags)
 {
     s64 result = (s64)frame->x[10];
     if (frame->scause != 8ul)
@@ -4201,11 +4623,11 @@ static void signal_return_to_user(struct trap_frame* frame)
 {
     for (;;)
     {
-        struct process* task = current_task;
+        struct thread* task = current_thread;
         struct signal_entry entry;
         struct signal_action* action;
         u64 sig;
-        if (task == NULL || task->used == 0u || task->state != PROC_RUNNING || (frame->sstatus & SSTATUS_SPP) != 0ul)
+        if (task == NULL || task->state != PROC_RUNNING || (frame->sstatus & SSTATUS_SPP) != 0ul)
             return;
         sig = signal_queue_take(task, ~task->signal_blocked, &entry);
         if (sig == 0ul)
@@ -4218,17 +4640,17 @@ static void signal_return_to_user(struct trap_frame* frame)
             }
             return;
         }
-        action = &task->signal_actions[sig - 1ul];
+        action = &task->process->signal_actions[sig - 1ul];
         if (action->handler == SIG_IGN || (action->handler == SIG_DFL && signal_default_ignored(sig)))
             continue;
         if (action->handler == SIG_DFL)
         {
-            if (signal_default_stops(sig) && sig != SIGSTOP && process_group_orphaned(task->pgid, (struct process*)NULL))
+            if (signal_default_stops(sig) && sig != SIGSTOP && process_group_orphaned(task->process->pgid, (struct process*)NULL))
                 continue;
             if (signal_default_stops(sig))
                 signal_stop_current(frame, sig);
             else
-                process_exit_current(frame, 0ul, sig);
+                process_exit_group(frame, 0ul, sig);
             continue;
         }
         signal_restart(frame, task, 1, action->flags);
@@ -4248,7 +4670,7 @@ static s64 sys_rt_sigaction_impl(u64 sig, u64 new_pointer, u64 old_pointer, u64 
     struct signal_action* slot;
     if (size != 8ul || sig == 0ul || sig > SIGNAL_COUNT)
         return -22l;
-    slot = &current_task->signal_actions[sig - 1ul];
+    slot = &current_process->signal_actions[sig - 1ul];
     mem_copy(&old, slot, sizeof(struct signal_action));
     if (new_pointer != 0ul)
     {
@@ -4259,7 +4681,7 @@ static s64 sys_rt_sigaction_impl(u64 sig, u64 new_pointer, u64 old_pointer, u64 
         action.mask = action.mask & ~SIGNAL_UNBLOCKABLE;
         mem_copy(slot, &action, sizeof(struct signal_action));
         if (action.handler == SIG_IGN || (action.handler == SIG_DFL && signal_default_ignored(sig)))
-            signal_queue_flush(current_task, signal_bit(sig));
+            signal_queue_flush(current_process, signal_bit(sig));
     }
     if (old_pointer != 0ul && !user_copy_to_writable(current_user_root_page_table, old_pointer, &old, sizeof(struct signal_action)))
         return -14l;
@@ -4268,7 +4690,7 @@ static s64 sys_rt_sigaction_impl(u64 sig, u64 new_pointer, u64 old_pointer, u64 
 
 static s64 sys_rt_sigprocmask_impl(u64 how, u64 set_pointer, u64 old_pointer, u64 size)
 {
-    u64 old = current_task->signal_blocked;
+    u64 old = current_thread->signal_blocked;
     u64 set;
     if (size != 8ul)
         return -22l;
@@ -4282,7 +4704,7 @@ static s64 sys_rt_sigprocmask_impl(u64 how, u64 set_pointer, u64 old_pointer, u6
             set = old & ~set;
         else if (how != SIG_SETMASK)
             return -22l;
-        current_task->signal_blocked = set & ~SIGNAL_UNBLOCKABLE;
+        current_thread->signal_blocked = set & ~SIGNAL_UNBLOCKABLE;
     }
     if (old_pointer != 0ul && !user_copy_to_writable(current_user_root_page_table, old_pointer, &old, 8ul))
         return -14l;
@@ -4291,7 +4713,7 @@ static s64 sys_rt_sigprocmask_impl(u64 how, u64 set_pointer, u64 old_pointer, u6
 
 static s64 sys_rt_sigpending_impl(u64 set_pointer, u64 size)
 {
-    u64 pending = current_task->signal_pending & current_task->signal_blocked;
+    u64 pending = thread_signal_pending(current_thread) & current_thread->signal_blocked;
     if (size > 8ul)
         return -22l;
     if (!user_copy_to_writable(current_user_root_page_table, set_pointer, &pending, size))
@@ -4312,11 +4734,11 @@ static void sys_rt_sigsuspend_dispatch(struct trap_frame* frame, u64 mask_pointe
         frame->x[10] = (u64)-14l;
         return;
     }
-    current_task->signal_saved_blocked = current_task->signal_blocked;
-    current_task->signal_restore_mask = 1u;
-    current_task->signal_blocked = mask & ~SIGNAL_UNBLOCKABLE;
+    current_thread->signal_saved_blocked = current_thread->signal_blocked;
+    current_thread->signal_restore_mask = 1u;
+    current_thread->signal_blocked = mask & ~SIGNAL_UNBLOCKABLE;
     frame->x[10] = (u64)-ERESTARTNOHAND;
-    if ((current_task->signal_pending & ~current_task->signal_blocked) == 0ul)
+    if ((thread_signal_pending(current_thread) & ~current_thread->signal_blocked) == 0ul)
         process_sleep(frame, SLEEP_SIGNAL, 0ul);
 }
 
@@ -4352,7 +4774,7 @@ static void sys_rt_sigtimedwait_dispatch(struct trap_frame* frame, u64 set_point
         }
         deadline = time_to_ticks(timeout[0], timeout[1], 1000000000ul);
     }
-    sig = signal_queue_take(current_task, set, &entry);
+    sig = signal_queue_take(current_thread, set, &entry);
     if (sig != 0ul)
     {
         frame->x[10] = signal_copy_info(current_user_root_page_table, info_pointer, &entry) ? sig : (u64)-14l;
@@ -4363,19 +4785,19 @@ static void sys_rt_sigtimedwait_dispatch(struct trap_frame* frame, u64 set_point
         frame->x[10] = (u64)-EAGAIN;
         return;
     }
-    current_task->sigwait_set = set;
-    current_task->sleep_user_pointer = info_pointer;
+    current_thread->sigwait_set = set;
+    current_thread->sleep_user_pointer = info_pointer;
     frame->x[10] = (u64)-EINTR;
     process_sleep(frame, SLEEP_SIGWAIT, deadline == 0ul ? 0ul : time_add_ticks(timer_now(), deadline));
 }
 
-static s64 signal_send_user(struct process* task, u64 sig, s32 code)
+static s64 signal_send_user(struct process* task, struct thread* thread, u64 sig, s32 code)
 {
     struct signal_entry entry;
     if (sig == 0ul)
         return 0l;
-    signal_entry_init(&entry, sig, code, current_task->pid);
-    return signal_send(task, &entry) ? 0l : -EAGAIN;
+    signal_entry_init(&entry, sig, code, current_process->pid);
+    return signal_send(task, thread, &entry) ? 0l : -EAGAIN;
 }
 
 static s64 sys_rt_sigqueueinfo_impl(u64 pid, u64 sig, u64 info_pointer)
@@ -4389,9 +4811,9 @@ static s64 sys_rt_sigqueueinfo_impl(u64 pid, u64 sig, u64 info_pointer)
     if (!user_copy_from_readable(current_user_root_page_table, info, info_pointer, 128ul))
         return -14l;
     code = (s32)le32(info + 8);
-    if ((code >= 0 || code == SI_TKILL) && pid != (u64)current_task->pid)
+    if ((code >= 0 || code == SI_TKILL) && pid != (u64)current_process->pid)
         return -1l;
-    task = process_find(pid);
+    task = process_find_task(pid);
     if (task == NULL)
         return -3l;
     if (sig == 0ul)
@@ -4399,7 +4821,7 @@ static s64 sys_rt_sigqueueinfo_impl(u64 pid, u64 sig, u64 info_pointer)
     signal_entry_init(&entry, sig, code, le32(info + 16));
     entry.uid = le32(info + 20);
     entry.value = le64(info + 24);
-    return signal_send(task, &entry) ? 0l : -EAGAIN;
+    return signal_send(task, NULL, &entry) ? 0l : -EAGAIN;
 }
 
 static s64 sys_kill_impl(u64 pid_value, u64 sig)
@@ -4413,8 +4835,8 @@ static s64 sys_kill_impl(u64 pid_value, u64 sig)
         return -22l;
     if (pid > 0l)
     {
-        struct process* task = process_find((u64)pid);
-        return task == NULL ? -3l : signal_send_user(task, sig, SI_USER);
+        struct process* task = process_find_task((u64)pid);
+        return task == NULL ? -3l : signal_send_user(task, NULL, sig, SI_USER);
     }
     while (index < MAX_PROCESSES)
     {
@@ -4422,12 +4844,12 @@ static s64 sys_kill_impl(u64 pid_value, u64 sig)
         index = index + 1u;
         if (task->used == 0u)
             continue;
-        if (pid == 0l ? task->pgid != current_task->pgid :
-            pid == -1l ? task->pid <= 1u || task == current_task :
+        if (pid == 0l ? task->pgid != current_process->pgid :
+            pid == -1l ? task->pid <= 1u || task == current_process :
             (s64)task->pgid != -pid)
             continue;
         found = 1;
-        error = signal_send_user(task, sig, SI_USER);
+        error = signal_send_user(task, NULL, sig, SI_USER);
         if (error == 0l)
             delivered = 1;
     }
@@ -4438,13 +4860,13 @@ static s64 sys_kill_impl(u64 pid_value, u64 sig)
 
 static s64 sys_tgkill_impl(s64 tgid, s64 tid, u64 sig)
 {
-    struct process* task;
+    struct thread* thread;
     if (tid <= 0l || tgid == 0l || tgid < -1l || sig > SIGNAL_COUNT)
         return -22l;
-    task = process_find((u64)tid);
-    if (task == NULL || (tgid > 0l && tgid != tid))
+    thread = thread_find((u64)tid);
+    if (thread == NULL || (tgid > 0l && (s64)thread->process->pid != tgid))
         return -3l;
-    return signal_send_user(task, sig, SI_TKILL);
+    return signal_send_user(thread->process, thread, sig, SI_TKILL);
 }
 
 static s64 sys_sigaltstack_impl(struct trap_frame* frame, u64 new_pointer, u64 old_pointer)
@@ -4452,14 +4874,14 @@ static s64 sys_sigaltstack_impl(struct trap_frame* frame, u64 new_pointer, u64 o
     u64 stack[3];
     u64 old[3];
     s64 result;
-    old[0] = current_task->altstack_sp;
-    old[1] = (u64)(signal_stack_flags(current_task, frame->x[2]) | (current_task->altstack_flags & SS_AUTODISARM));
-    old[2] = current_task->altstack_size;
+    old[0] = current_thread->altstack_sp;
+    old[1] = (u64)(signal_stack_flags(current_thread, frame->x[2]) | (current_thread->altstack_flags & SS_AUTODISARM));
+    old[2] = current_thread->altstack_size;
     if (new_pointer != 0ul)
     {
         if (!user_copy_from_readable(current_user_root_page_table, stack, new_pointer, 24ul))
             return -14l;
-        result = signal_set_altstack(current_task, frame->x[2], stack[0], (u32)stack[1], stack[2]);
+        result = signal_set_altstack(current_thread, frame->x[2], stack[0], (u32)stack[1], stack[2]);
         if (result != 0l)
             return result;
     }
@@ -4480,7 +4902,7 @@ static void sys_rt_sigreturn_impl(struct trap_frame* frame)
     frame->scause = ~0ul;
     if (!user_copy_from_readable(current_user_root_page_table, bytes, base, SIGFRAME_SIZE) || le32(bytes + SIGFRAME_FP + 516ul) != 0u)
     {
-        signal_force(current_task, SIGSEGV, SI_KERNEL, 0ul);
+        signal_force(current_thread, SIGSEGV, SI_KERNEL, 0ul);
         return;
     }
     magic = le32(bytes + SIGFRAME_EXTENSION);
@@ -4490,7 +4912,7 @@ static void sys_rt_sigreturn_impl(struct trap_frame* frame)
             !user_copy_from_readable(current_user_root_page_table, state, base + SIGFRAME_SIZE, 48ul) ||
             !user_copy_from_readable(current_user_root_page_table, frame->v, state[5], vector_size - SIGFRAME_VECTOR_STATE))
         {
-            signal_force(current_task, SIGSEGV, SI_KERNEL, 0ul);
+            signal_force(current_thread, SIGSEGV, SI_KERNEL, 0ul);
             return;
         }
         frame->vstart = state[0];
@@ -4500,10 +4922,10 @@ static void sys_rt_sigreturn_impl(struct trap_frame* frame)
     }
     else if (magic != 0u)
     {
-        signal_force(current_task, SIGSEGV, SI_KERNEL, 0ul);
+        signal_force(current_thread, SIGSEGV, SI_KERNEL, 0ul);
         return;
     }
-    current_task->signal_blocked = le64(bytes + SIGFRAME_UCONTEXT + 40ul) & ~SIGNAL_UNBLOCKABLE;
+    current_thread->signal_blocked = le64(bytes + SIGFRAME_UCONTEXT + 40ul) & ~SIGNAL_UNBLOCKABLE;
     frame->sepc = le64(bytes + SIGFRAME_MCONTEXT);
     index = 1u;
     while (index < 32u)
@@ -4518,7 +4940,7 @@ static void sys_rt_sigreturn_impl(struct trap_frame* frame)
         index = index + 1u;
     }
     frame->fcsr = (u64)le32(bytes + SIGFRAME_FP + 256ul);
-    signal_set_altstack(current_task, frame->x[2], le64(bytes + SIGFRAME_UCONTEXT + 16ul),
+    signal_set_altstack(current_thread, frame->x[2], le64(bytes + SIGFRAME_UCONTEXT + 16ul),
         le32(bytes + SIGFRAME_UCONTEXT + 24ul), le64(bytes + SIGFRAME_UCONTEXT + 32ul));
 }
 
@@ -4530,7 +4952,7 @@ static s64 sys_setpgid_impl(u64 pid_value, u64 pgid_value)
     u32 index = 0u;
     int found = 0;
     if (pid == 0l)
-        pid = (s64)current_task->pid;
+        pid = (s64)current_process->pid;
     if (pgid == 0l)
         pgid = pid;
     if (pgid < 0l)
@@ -4538,14 +4960,14 @@ static s64 sys_setpgid_impl(u64 pid_value, u64 pgid_value)
     task = process_find((u64)pid);
     if (task == NULL)
         return -3l;
-    if (task->ppid == current_task->pid)
+    if (task->ppid == current_process->pid)
     {
-        if (task->sid != current_task->sid)
+        if (task->sid != current_process->sid)
             return -1l;
         if (task->did_exec != 0u)
             return -13l;
     }
-    else if (task != current_task)
+    else if (task != current_process)
         return -3l;
     if (task->sid == task->pid)
         return -1l;
@@ -4553,7 +4975,7 @@ static s64 sys_setpgid_impl(u64 pid_value, u64 pgid_value)
     {
         while (index < MAX_PROCESSES)
         {
-            if (processes[index].used != 0u && (s64)processes[index].pgid == pgid && processes[index].sid == current_task->sid)
+            if (processes[index].used != 0u && (s64)processes[index].pgid == pgid && processes[index].sid == current_process->sid)
                 found = 1;
             index = index + 1u;
         }
@@ -4567,7 +4989,7 @@ static s64 sys_setpgid_impl(u64 pid_value, u64 pgid_value)
 static s64 sys_getpgid_impl(u64 pid_value, int session)
 {
     s64 pid = (s64)(int)pid_value;
-    struct process* task = pid == 0l ? current_task : pid < 0l ? NULL : process_find((u64)pid);
+    struct process* task = pid == 0l ? current_process : pid < 0l ? NULL : process_find_task((u64)pid);
     if (task == NULL)
         return -3l;
     return (s64)(session ? task->sid : task->pgid);
@@ -4578,14 +5000,14 @@ static s64 sys_setsid_impl(void)
     u32 index = 0u;
     while (index < MAX_PROCESSES)
     {
-        if (processes[index].used != 0u && processes[index].pgid == current_task->pid)
+        if (processes[index].used != 0u && processes[index].pgid == current_process->pid)
             return -1l;
         index = index + 1u;
     }
-    current_task->sid = current_task->pid;
-    current_task->pgid = current_task->pid;
-    current_task->ctty = 0u;
-    return (s64)current_task->pid;
+    current_process->sid = current_process->pid;
+    current_process->pgid = current_process->pid;
+    current_process->ctty = 0u;
+    return (s64)current_process->pid;
 }
 
 static void itimer_read(struct process* task, u64 which, u64* values)
@@ -4614,7 +5036,7 @@ static s64 sys_getitimer_impl(u64 which, u64 pointer)
     u64 values[4];
     if (which > ITIMER_PROF)
         return -22l;
-    itimer_read(current_task, which, values);
+    itimer_read(current_process, which, values);
     if (!user_copy_to_writable(current_user_root_page_table, pointer, values, 32ul))
         return -14l;
     return 0l;
@@ -4633,23 +5055,23 @@ static s64 sys_setitimer_impl(u64 which, u64 new_pointer, u64 old_pointer)
         return -14l;
     if ((s64)values[0] < 0l || values[1] >= 1000000ul || (s64)values[2] < 0l || values[3] >= 1000000ul)
         return -22l;
-    itimer_read(current_task, which, old);
+    itimer_read(current_process, which, old);
     interval = time_to_ticks(values[0], values[1], 1000000ul);
     value = time_to_ticks(values[2], values[3], 1000000ul);
     if (which == ITIMER_REAL)
     {
-        current_task->itimer_real_interval = interval;
-        current_task->itimer_real_deadline = value == 0ul ? 0ul : time_deadline(timer_now(), values[2], values[3], 1000000ul);
+        current_process->itimer_real_interval = interval;
+        current_process->itimer_real_deadline = value == 0ul ? 0ul : time_deadline(timer_now(), values[2], values[3], 1000000ul);
     }
     else if (which == ITIMER_VIRTUAL)
     {
-        current_task->itimer_virtual_interval = interval;
-        current_task->itimer_virtual_value = value;
+        current_process->itimer_virtual_interval = interval;
+        current_process->itimer_virtual_value = value;
     }
     else
     {
-        current_task->itimer_prof_interval = interval;
-        current_task->itimer_prof_value = value;
+        current_process->itimer_prof_interval = interval;
+        current_process->itimer_prof_value = value;
     }
     if (old_pointer != 0ul && !user_copy_to_writable(current_user_root_page_table, old_pointer, old, 32ul))
         return -14l;
@@ -4659,10 +5081,18 @@ static s64 sys_setitimer_impl(u64 which, u64 new_pointer, u64 old_pointer)
 static int clock_read(u64 clock, u64* seconds, u64* nanoseconds)
 {
     u64 ticks;
-    if (clock == CLOCK_PROCESS_CPUTIME_ID || clock == CLOCK_THREAD_CPUTIME_ID)
+    if (clock == CLOCK_THREAD_CPUTIME_ID)
     {
         process_account_time();
-        ticks = current_task->cpu_ticks;
+        ticks = current_thread->cpu_ticks;
+    }
+    else if (clock == CLOCK_PROCESS_CPUTIME_ID)
+    {
+        struct thread* thread = NULL;
+        process_account_time();
+        ticks = current_process->cpu_ticks;
+        while ((thread = thread_next(current_process, thread)) != NULL)
+            ticks = ticks + thread->cpu_ticks;
     }
     else if (clock == CLOCK_REALTIME || clock == CLOCK_MONOTONIC || clock == CLOCK_MONOTONIC_RAW || clock == CLOCK_BOOTTIME || clock == CLOCK_REALTIME_COARSE || clock == CLOCK_MONOTONIC_COARSE)
     {
@@ -4727,7 +5157,7 @@ static void sys_sleep_until(struct trap_frame* frame, u64 deadline, u64 remainin
         frame->x[10] = 0ul;
         return;
     }
-    current_task->sleep_user_pointer = remaining_pointer;
+    current_thread->sleep_user_pointer = remaining_pointer;
     frame->x[10] = (u64)-ERESTART_RESTARTBLOCK;
     process_sleep(frame, SLEEP_TIMER, deadline);
 }
@@ -4745,7 +5175,7 @@ static void sys_nanosleep_dispatch(struct trap_frame* frame, u64 request_pointer
         frame->x[10] = (u64)-22l;
         return;
     }
-    current_task->restart_pending = 0u;
+    current_thread->restart_pending = 0u;
     sys_sleep_until(frame, time_deadline(timer_now(), request[0], request[1], 1000000000ul), remaining_pointer);
 }
 
@@ -4769,7 +5199,7 @@ static void sys_clock_nanosleep_dispatch(struct trap_frame* frame, u64 clock, u6
         frame->x[10] = (u64)-22l;
         return;
     }
-    current_task->restart_pending = 0u;
+    current_thread->restart_pending = 0u;
     if ((flags & TIMER_ABSTIME) == 0ul)
     {
         sys_sleep_until(frame, time_deadline(timer_now(), request[0], request[1], 1000000000ul), remaining_pointer);
@@ -4796,20 +5226,175 @@ static void sys_clock_nanosleep_dispatch(struct trap_frame* frame, u64 clock, u6
         frame->x[10] = 0ul;
         return;
     }
-    current_task->sleep_user_pointer = 0ul;
+    current_thread->sleep_user_pointer = 0ul;
     frame->x[10] = (u64)-ERESTARTNOHAND;
     process_sleep(frame, SLEEP_TIMER, deadline);
 }
 
+static u64 futex_absolute_deadline(u64 clock, const u64* request)
+{
+    u64 seconds = request[0];
+    u64 nanoseconds = request[1];
+    u64 deadline;
+    if (clock == CLOCK_REALTIME)
+    {
+        if (seconds < realtime_seconds || (seconds == realtime_seconds && nanoseconds <= realtime_nanoseconds))
+            return 1ul;
+        seconds = seconds - realtime_seconds;
+        if (nanoseconds < realtime_nanoseconds)
+        {
+            seconds = seconds - 1ul;
+            nanoseconds = nanoseconds + 1000000000ul;
+        }
+        nanoseconds = nanoseconds - realtime_nanoseconds;
+    }
+    deadline = time_to_ticks(seconds, nanoseconds, 1000000000ul);
+    return deadline == 0ul ? 1ul : deadline;
+}
+
+// The word is checked and the thread put to sleep in one step, since nothing else runs while the kernel does
+static void futex_wait(struct trap_frame* frame, u64 address, u32 value, u32 bitset, int shared, u64 deadline)
+{
+    struct thread* thread = current_thread;
+    u64 space;
+    u64 key;
+    u32 current;
+    s64 result = bitset == 0u ? -22l : futex_key(address, shared, &space, &key);
+    if (result == 0l)
+    {
+        if (!user_copy_from_readable(current_user_root_page_table, &current, address, 4ul))
+            result = -14l;
+        else if (current != value)
+            result = -EAGAIN;
+        else if (deadline != 0ul && timer_now() >= deadline)
+            result = -110l;
+    }
+    if (result != 0l)
+    {
+        frame->x[10] = (u64)result;
+        return;
+    }
+    futex_sequence = futex_sequence + 1ul;
+    thread->futex_space = space;
+    thread->futex_address = key;
+    thread->futex_bitset = bitset;
+    thread->futex_order = futex_sequence;
+    frame->x[10] = deadline != 0ul ? (u64)-ERESTART_RESTARTBLOCK : (u64)-ERESTARTSYS;
+    process_sleep(frame, SLEEP_FUTEX, deadline);
+}
+
+static void futex_wait_call(struct trap_frame* frame, u64 address, u64 op, u64 value, u64 value3, u64 deadline)
+{
+    u32 bitset = ((u32)op & 127u) == FUTEX_WAIT_BITSET ? (u32)value3 : FUTEX_BITSET_MATCH_ANY;
+    futex_wait(frame, address, (u32)value, bitset, ((u32)op & FUTEX_PRIVATE_FLAG) == 0u, deadline);
+}
+
+static s64 futex_requeue(u64 address, int shared, s64 wake_count, s64 move_count, u64 address2, int compare, u32 expected)
+{
+    u64 space;
+    u64 key;
+    u64 space2;
+    u64 key2;
+    s64 result = futex_key(address, shared, &space, &key);
+    s64 moved = 0l;
+    u64 moved_after;
+    struct thread* thread;
+    if (wake_count < 0l || move_count < 0l)
+        return -22l;
+    if (result == 0l)
+        result = futex_key(address2, shared, &space2, &key2);
+    if (result != 0l)
+        return result;
+    if (compare)
+    {
+        u32 current;
+        if (!user_copy_from_readable(current_user_root_page_table, &current, address, 4ul))
+            return -14l;
+        if (current != expected)
+            return -EAGAIN;
+    }
+    result = futex_wake(space, key, FUTEX_BITSET_MATCH_ANY, wake_count);
+    moved_after = futex_sequence;
+    while (moved < move_count && (thread = futex_first_waiter(space, key, FUTEX_BITSET_MATCH_ANY)) != NULL && thread->futex_order <= moved_after)
+    {
+        futex_sequence = futex_sequence + 1ul;
+        thread->futex_space = space2;
+        thread->futex_address = key2;
+        thread->futex_order = futex_sequence;
+        moved = moved + 1l;
+    }
+    return result + moved;
+}
+
+static void sys_futex_dispatch(struct trap_frame* frame, u64 address, u64 op, u64 value, u64 timeout, u64 address2, u64 value3)
+{
+    u32 command = (u32)op & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+    int shared = ((u32)op & FUTEX_PRIVATE_FLAG) == 0u;
+    u64 space;
+    u64 key;
+    s64 result;
+    if (((u32)op & FUTEX_CLOCK_REALTIME) != 0u && command != FUTEX_WAIT_BITSET)
+    {
+        frame->x[10] = (u64)-38l;
+        return;
+    }
+    if (command == FUTEX_WAIT || command == FUTEX_WAIT_BITSET)
+    {
+        u64 request[2];
+        u64 deadline = 0ul;
+        if (timeout != 0ul)
+        {
+            if (!user_copy_from_readable(current_user_root_page_table, request, timeout, 16ul))
+            {
+                frame->x[10] = (u64)-14l;
+                return;
+            }
+            if ((s64)request[0] < 0l || request[1] >= 1000000000ul)
+            {
+                frame->x[10] = (u64)-22l;
+                return;
+            }
+            deadline = command == FUTEX_WAIT ? time_deadline(timer_now(), request[0], request[1], 1000000000ul) :
+                futex_absolute_deadline(((u32)op & FUTEX_CLOCK_REALTIME) != 0u ? CLOCK_REALTIME : CLOCK_MONOTONIC, request);
+        }
+        current_thread->restart_pending = 0u;
+        futex_wait_call(frame, address, op, value, value3, deadline);
+        return;
+    }
+    if (command == FUTEX_WAKE || command == FUTEX_WAKE_BITSET)
+    {
+        u32 bitset = command == FUTEX_WAKE_BITSET ? (u32)value3 : FUTEX_BITSET_MATCH_ANY;
+        result = bitset == 0u ? -22l : futex_key(address, shared, &space, &key);
+        // A count below one still wakes one waiter, as on the kernel we follow
+        if (result == 0l)
+            result = futex_wake(space, key, bitset, (s32)value < 1 ? 1l : (s64)(s32)value);
+        frame->x[10] = (u64)result;
+        return;
+    }
+    if (command == FUTEX_REQUEUE || command == FUTEX_CMP_REQUEUE)
+    {
+        frame->x[10] = (u64)futex_requeue(address, shared, (s64)(s32)value, (s64)(s32)timeout, address2, command == FUTEX_CMP_REQUEUE, (u32)value3);
+        return;
+    }
+    frame->x[10] = (u64)-38l;
+}
+
 static void sys_restart_syscall_dispatch(struct trap_frame* frame)
 {
-    if (current_task->restart_pending == 0u)
+    u32 kind = current_thread->restart_pending;
+    if (kind == 0u)
     {
         frame->x[10] = (u64)-EINTR;
         return;
     }
-    current_task->restart_pending = 0u;
-    sys_sleep_until(frame, current_task->restart_deadline, current_task->restart_user_pointer);
+    current_thread->restart_pending = 0u;
+    // A futex wait goes on to the deadline it first had, its other arguments still in their registers
+    if (kind == RESTART_FUTEX)
+    {
+        futex_wait_call(frame, frame->x[10], frame->x[11], frame->x[12], frame->x[15], current_thread->restart_deadline);
+        return;
+    }
+    sys_sleep_until(frame, current_thread->restart_deadline, current_thread->restart_user_pointer);
 }
 
 static int tty_poll(void);
@@ -4830,18 +5415,24 @@ static void scheduler_poll(u64 now)
     device_activity = 0u;
     while (index < MAX_PROCESSES)
     {
-        struct process* task = &processes[index];
+        struct process* process = &processes[index];
         index = index + 1u;
-        if (task->used == 0u || task->state == PROC_ZOMBIE)
+        if (process->used == 0u || process->state == PROC_ZOMBIE)
             continue;
-        if (task->itimer_real_deadline != 0ul && now >= task->itimer_real_deadline)
+        if (process->itimer_real_deadline != 0ul && now >= process->itimer_real_deadline)
         {
-            task->itimer_real_deadline = task->itimer_real_interval == 0ul ? 0ul : time_add_ticks(task->itimer_real_deadline, task->itimer_real_interval);
-            if (task->itimer_real_deadline != 0ul && task->itimer_real_deadline <= now)
-                task->itimer_real_deadline = time_add_ticks(now, task->itimer_real_interval);
-            signal_send_kernel(task, SIGALRM, SI_KERNEL);
+            process->itimer_real_deadline = process->itimer_real_interval == 0ul ? 0ul : time_add_ticks(process->itimer_real_deadline, process->itimer_real_interval);
+            if (process->itimer_real_deadline != 0ul && process->itimer_real_deadline <= now)
+                process->itimer_real_deadline = time_add_ticks(now, process->itimer_real_interval);
+            signal_send_kernel(process, SIGALRM, SI_KERNEL);
         }
-        if (task->state != PROC_WAITING)
+    }
+    index = 0u;
+    while (index < MAX_THREADS)
+    {
+        struct thread* task = threads[index];
+        index = index + 1u;
+        if (task == NULL || task->state != PROC_WAITING)
             continue;
         if (task->sleep_reason == SLEEP_CONSOLE)
         {
@@ -4878,7 +5469,7 @@ static void scheduler_poll(u64 now)
         }
         else if (task->sleep_deadline != 0ul && now >= task->sleep_deadline)
         {
-            task->frame.x[10] = task->sleep_reason == SLEEP_TIMER ? 0ul : (u64)-EAGAIN;
+            task->frame.x[10] = task->sleep_reason == SLEEP_TIMER ? 0ul : task->sleep_reason == SLEEP_FUTEX ? (u64)-110l : (u64)-EAGAIN;
             process_wake(task);
         }
     }
@@ -4892,13 +5483,17 @@ static int scheduler_can_wake(void)
         return 1;
     while (index < MAX_PROCESSES)
     {
-        struct process* task = &processes[index];
+        struct process* process = &processes[index];
         index = index + 1u;
-        if (task->used == 0u || task->state == PROC_ZOMBIE)
-            continue;
-        if (task->itimer_real_deadline != 0ul)
+        if (process->used != 0u && process->state != PROC_ZOMBIE && process->itimer_real_deadline != 0ul)
             return 1;
-        if (task->state == PROC_WAITING && (task->sleep_deadline != 0ul || task->sleep_reason == SLEEP_CONSOLE || task->sleep_reason == SLEEP_DEVICE || task->sleep_reason == SLEEP_POLL))
+    }
+    index = 0u;
+    while (index < MAX_THREADS)
+    {
+        struct thread* task = threads[index];
+        index = index + 1u;
+        if (task != NULL && task->state == PROC_WAITING && (task->sleep_deadline != 0ul || task->sleep_reason == SLEEP_CONSOLE || task->sleep_reason == SLEEP_DEVICE || task->sleep_reason == SLEEP_POLL))
             return 1;
     }
     return 0;
@@ -4922,15 +5517,15 @@ static void scheduler_timer_interrupt(struct trap_frame* frame)
     scheduler_ticks = scheduler_ticks + 1ul;
     timer_program_next();
     scheduler_poll(timer_now());
-    if (current_task == NULL || current_task->used == 0u)
+    if (current_thread == NULL)
         return;
-    itimer_account(current_task, &current_task->itimer_virtual_value, current_task->itimer_virtual_interval, SIGVTALRM);
-    itimer_account(current_task, &current_task->itimer_prof_value, current_task->itimer_prof_interval, SIGPROF);
-    if (current_task->time_slice > 0u)
-        current_task->time_slice = current_task->time_slice - 1u;
-    if (current_task->time_slice == 0u)
+    itimer_account(current_process, &current_process->itimer_virtual_value, current_process->itimer_virtual_interval, SIGVTALRM);
+    itimer_account(current_process, &current_process->itimer_prof_value, current_process->itimer_prof_interval, SIGPROF);
+    if (current_thread->time_slice > 0u)
+        current_thread->time_slice = current_thread->time_slice - 1u;
+    if (current_thread->time_slice == 0u)
     {
-        current_task->time_slice = DEFAULT_TIME_SLICE;
+        current_thread->time_slice = DEFAULT_TIME_SLICE;
         scheduler_yield(frame);
     }
 }
@@ -4975,15 +5570,27 @@ static s64 sys_execve_impl(struct trap_frame* frame, u64 path_pointer, u64 argv,
         free_user_address_space(new_root);
         return -12l;
     }
+    process_kill_other_threads(current_process);
+    thread_release_memory(current_thread, address_space_held_by_another(old_root, current_process));
+    if (current_thread->tid != current_process->pid)
+    {
+        u32 index;
+        for (index = 0u; index < current_process->signal_queue_count; index = index + 1u)
+        {
+            if (current_process->signal_queue[index].thread == current_thread->tid)
+                current_process->signal_queue[index].thread = current_process->pid;
+        }
+        current_thread->tid = current_process->pid;
+    }
     current_user_root_page_table = new_root;
-    vm_release_regions(current_task);
-    current_task->vm_region_count = image.region_count;
-    mem_copy(current_task->vm_regions, image.regions, (u64)image.region_count * sizeof(struct vm_region));
+    vm_release_regions(current_process);
+    current_process->vm_region_count = image.region_count;
+    mem_copy(current_process->vm_regions, image.regions, (u64)image.region_count * sizeof(struct vm_region));
     {
         u32 index = 0u;
         while (index < (u32)SIGNAL_COUNT)
         {
-            struct signal_action* action = &current_task->signal_actions[index];
+            struct signal_action* action = &current_process->signal_actions[index];
             if (action->handler != SIG_IGN)
                 action->handler = SIG_DFL;
             action->flags = 0ul;
@@ -4991,23 +5598,23 @@ static s64 sys_execve_impl(struct trap_frame* frame, u64 path_pointer, u64 argv,
             index = index + 1u;
         }
     }
-    current_task->altstack_sp = 0ul;
-    current_task->altstack_size = 0ul;
-    current_task->altstack_flags = SS_DISABLE;
-    current_task->restart_pending = 0u;
-    current_task->did_exec = 1u;
+    current_thread->altstack_sp = 0ul;
+    current_thread->altstack_size = 0ul;
+    current_thread->altstack_flags = SS_DISABLE;
+    current_thread->restart_pending = 0u;
+    current_process->did_exec = 1u;
     mem_zero(frame, sizeof(struct trap_frame));
     frame->sepc = image.start_entry;
     frame->sstatus = SSTATUS_SPIE | SSTATUS_VS_INITIAL | SSTATUS_FS_INITIAL;
     frame->vtype = 0x8000000000000000ul;
     frame->x[2] = stack;
-    current_task->root_page_table = current_user_root_page_table;
-    current_task->brk = process_brk;
-    current_task->brk_min = process_brk_min;
-    current_task->mmap_cursor = user_mmap_cursor;
-    process_wake_vfork_parent(current_task);
+    current_process->root_page_table = current_user_root_page_table;
+    current_process->brk = process_brk;
+    current_process->brk_min = process_brk_min;
+    current_process->mmap_cursor = user_mmap_cursor;
+    process_wake_vfork_parent(current_process);
     activate_page_table(current_user_root_page_table);
-    if (!address_space_held_by_another(old_root, current_task))
+    if (!address_space_held_by_another(old_root, current_process))
         free_user_address_space(old_root);
     return 0l;
 }
@@ -8902,19 +9509,19 @@ static int tty_poll(void)
     return received;
 }
 
-static int signal_ignored_or_blocked(struct process* task, u64 sig)
+static int signal_ignored_or_blocked(struct thread* task, u64 sig)
 {
-    return (task->signal_blocked & signal_bit(sig)) != 0ul || task->signal_actions[sig - 1ul].handler == SIG_IGN;
+    return (task->signal_blocked & signal_bit(sig)) != 0ul || task->process->signal_actions[sig - 1ul].handler == SIG_IGN;
 }
 
 // A group outside the foreground that touches the terminal is stopped for it, or refused when nothing could resume it
 static s64 tty_job_check(u64 sig)
 {
-    struct process* task = current_task;
+    struct process* task = current_process;
     struct tty* tty = &console_tty;
     if (task->ctty == 0u || tty->session != task->sid || tty->pgrp == 0u || task->pgid == tty->pgrp)
         return 0l;
-    if (signal_ignored_or_blocked(task, sig))
+    if (signal_ignored_or_blocked(current_thread, sig))
         return sig == SIGTTIN ? -5l : 0l;
     if (process_group_orphaned(task->pgid, (struct process*)NULL))
         return -5l;
@@ -8926,7 +9533,7 @@ static s64 tty_read_check(u64 count, u32 flags)
 {
     struct tty* tty = &console_tty;
     s64 check = tty_job_check(SIGTTIN);
-    current_task->sleep_deadline = 0ul;
+    current_thread->sleep_deadline = 0ul;
     if (check != 0l)
         return check;
     tty_poll();
@@ -8940,14 +9547,14 @@ static s64 tty_read_check(u64 count, u32 flags)
     else
     {
         u64 wanted = tty->cc[TTY_VMIN] < count ? (u64)tty->cc[TTY_VMIN] : count;
-        int timed_out = current_task->tty_timed_out != 0u;
-        current_task->tty_timed_out = 0u;
+        int timed_out = current_thread->tty_timed_out != 0u;
+        current_thread->tty_timed_out = 0u;
         if ((u64)tty->count < (wanted == 0ul ? 1ul : wanted) && !timed_out && (wanted != 0ul || tty->cc[TTY_VTIME] != 0u))
         {
             if ((flags & (u32)O_NONBLOCK) != 0u)
                 return -EAGAIN;
             if (tty->cc[TTY_VTIME] != 0u && (wanted == 0ul || tty->count != 0u))
-                current_task->sleep_deadline = timer_now() + (u64)tty->cc[TTY_VTIME] * boot_device.timebase / 10ul;
+                current_thread->sleep_deadline = timer_now() + (u64)tty->cc[TTY_VTIME] * boot_device.timebase / 10ul;
             return -ERESTARTSYS;
         }
     }
@@ -9141,7 +9748,7 @@ static void tty_load_termios(const u8* data)
 static s64 tty_ioctl(struct file_descriptor* file, u64 request, u64 argument)
 {
     struct tty* tty = &console_tty;
-    struct process* task = current_task;
+    struct process* task = current_process;
     int controlling = task->ctty != 0u && tty->session == task->sid;
     u8 data[TTY_TERMIOS_SIZE];
     u32 value;
@@ -9623,14 +10230,14 @@ static s64 vfs_openat(u64 dirfd, u64 path_pointer, u64 flags, u64 mode)
     }
     if (node.type == VFS_NODE_CURRENT_TTY)
     {
-        if (current_task->ctty == 0u || console_tty.session != current_task->sid)
+        if (current_process->ctty == 0u || console_tty.session != current_process->sid)
             return -6l;
         node.type = VFS_NODE_CONSOLE;
         node.first_cluster = 1u;
     }
     // A session leader without a terminal takes the first one it opens, as a login does
     if (node.type == VFS_NODE_CONSOLE && node.first_cluster == 0u && (flags & O_NOCTTY) == 0ul)
-        tty_acquire(current_task, 0);
+        tty_acquire(current_process, 0);
     if ((node.type == VFS_NODE_ROOT_DIR || node.type == VFS_NODE_DEV_DIR || node.type == VFS_NODE_FAT_DIR ||
         node.type == VFS_NODE_INPUT_DIR) && ((flags & O_ACCMODE) != 0ul))
     {
@@ -9675,12 +10282,12 @@ static struct vfs_node vfs_fallback_directory;
 // Before there is a process to ask, a walk starts where the volume does
 static struct vfs_node* vfs_working_directory(void)
 {
-    if (current_task == (struct process*)NULL || current_task->cwd.type == VFS_NODE_NONE)
+    if (current_process == (struct process*)NULL || current_process->cwd.type == VFS_NODE_NONE)
     {
         vfs_root_node(&vfs_fallback_directory);
         return &vfs_fallback_directory;
     }
-    return &current_task->cwd;
+    return &current_process->cwd;
 }
 
 // A walk may start at a descriptor rather than the working directory, which is what the at calls are for
@@ -9780,17 +10387,17 @@ static s64 vfs_chdir(u64 path_pointer)
     if (walked.node.type != VFS_NODE_ROOT_DIR && walked.node.type != VFS_NODE_FAT_DIR &&
         walked.node.type != VFS_NODE_DEV_DIR)
         return -20l;
-    if (!path_canonical(current_task->cwd_path, path, canonical, PATH_BUFFER_SIZE))
+    if (!path_canonical(current_process->cwd_path, path, canonical, PATH_BUFFER_SIZE))
         return -36l;
-    current_task->cwd = walked.node;
+    current_process->cwd = walked.node;
     {
         u32 index = 0u;
         while (canonical[index] != 0 && index + 1u < PATH_BUFFER_SIZE)
         {
-            current_task->cwd_path[index] = canonical[index];
+            current_process->cwd_path[index] = canonical[index];
             index = index + 1u;
         }
-        current_task->cwd_path[index] = 0;
+        current_process->cwd_path[index] = 0;
     }
     return 0l;
 }
@@ -10222,7 +10829,7 @@ static s64 sys_reboot_impl(u64 magic1, u64 magic2, u64 cmd)
 
 static s64 sys_getcwd_impl(u64 user_buffer, u64 size)
 {
-    const char* cwd = current_task->cwd_path[0] != 0 ? current_task->cwd_path : "/";
+    const char* cwd = current_process->cwd_path[0] != 0 ? current_process->cwd_path : "/";
     u64 length = (u64)string_length(cwd) + 1ul;
     if (size < length)
         return -34l;
@@ -10281,9 +10888,9 @@ static u64 vm_pte_flags(u64 prot)
 static struct vm_region* vm_find_region(u64 address)
 {
     u32 index = 0u;
-    while (index < current_task->vm_region_count)
+    while (index < current_process->vm_region_count)
     {
-        struct vm_region* region = &current_task->vm_regions[index];
+        struct vm_region* region = &current_process->vm_regions[index];
         if (address >= region->start && address < region->end)
             return region;
         index = index + 1u;
@@ -10309,9 +10916,9 @@ static int vm_range_covered(u64 start, u64 end)
 static int vm_range_overlaps(u64 start, u64 end)
 {
     u32 index = 0u;
-    while (index < current_task->vm_region_count)
+    while (index < current_process->vm_region_count)
     {
-        struct vm_region* region = &current_task->vm_regions[index];
+        struct vm_region* region = &current_process->vm_regions[index];
         if (start < region->end && end > region->start)
             return 1;
         index = index + 1u;
@@ -10322,10 +10929,10 @@ static int vm_range_overlaps(u64 start, u64 end)
 static struct vm_region* vm_append_region(u64 start, u64 end, u64 prot, u64 flags, u32 object, u64 offset)
 {
     struct vm_region* region;
-    if (current_task->vm_region_count == MAX_VM_REGIONS)
+    if (current_process->vm_region_count == MAX_VM_REGIONS)
         return NULL;
-    region = &current_task->vm_regions[current_task->vm_region_count];
-    current_task->vm_region_count = current_task->vm_region_count + 1u;
+    region = &current_process->vm_regions[current_process->vm_region_count];
+    current_process->vm_region_count = current_process->vm_region_count + 1u;
     region->start = start;
     region->end = end;
     region->prot = prot;
@@ -10342,9 +10949,9 @@ static int vm_change_regions(u64 start, u64 end, u64 prot, int remove, int apply
     struct vm_region regions[MAX_VM_REGIONS];
     u32 count = 0u;
     u32 index;
-    for (index = 0u; index < current_task->vm_region_count; index = index + 1u)
+    for (index = 0u; index < current_process->vm_region_count; index = index + 1u)
     {
-        struct vm_region region = current_task->vm_regions[index];
+        struct vm_region region = current_process->vm_regions[index];
         u64 left = region.start;
         while (left < region.end)
         {
@@ -10384,18 +10991,18 @@ static int vm_change_regions(u64 start, u64 end, u64 prot, int remove, int apply
         if (regions[index].object != 0u)
             file_objects[regions[index].object - 1u].refs = file_objects[regions[index].object - 1u].refs + 1u;
     }
-    vm_release_regions(current_task);
-    mem_copy(current_task->vm_regions, regions, (u64)count * sizeof(struct vm_region));
-    current_task->vm_region_count = count;
+    vm_release_regions(current_process);
+    mem_copy(current_process->vm_regions, regions, (u64)count * sizeof(struct vm_region));
+    current_process->vm_region_count = count;
     return (int)count + 1;
 }
 
 static int vm_sync_range(u64 start, u64 end)
 {
     u32 index;
-    for (index = 0u; index < current_task->vm_region_count; index = index + 1u)
+    for (index = 0u; index < current_process->vm_region_count; index = index + 1u)
     {
-        struct vm_region* region = &current_task->vm_regions[index];
+        struct vm_region* region = &current_process->vm_regions[index];
         if ((region->flags & VM_FRAMEBUFFER) != 0ul && start < region->end && end > region->start)
             framebuffer_present();
         if (region->object != 0u && (region->flags & MAP_SHARED) != 0ul && start < region->end && end > region->start)
@@ -10541,9 +11148,9 @@ static s64 sys_mprotect_impl(u64 address, u64 length, u64 prot)
     end = address + length;
     if (end < address || !vm_range_covered(address, end))
         return -12l;
-    for (index = 0u; index < current_task->vm_region_count; index = index + 1u)
+    for (index = 0u; index < current_process->vm_region_count; index = index + 1u)
     {
-        struct vm_region* region = &current_task->vm_regions[index];
+        struct vm_region* region = &current_process->vm_regions[index];
         if (address < region->end && end > region->start &&
             (((region->flags & VM_READONLY_FILE) != 0ul && (prot & PROT_WRITE) != 0ul) ||
             ((region->flags & VM_FRAMEBUFFER) != 0ul && (prot & PROT_EXEC) != 0ul)))
@@ -10672,9 +11279,9 @@ static s64 sys_mmap_impl(u64 address, u64 length, u64 prot, u64 flags, u64 fd, u
                 u32 index;
                 if (!user_mapping_range_valid(start, length))
                     return -12l;
-                for (index = 0u; index < current_task->vm_region_count; index = index + 1u)
+                for (index = 0u; index < current_process->vm_region_count; index = index + 1u)
                 {
-                    struct vm_region* region = &current_task->vm_regions[index];
+                    struct vm_region* region = &current_process->vm_regions[index];
                     if (start < region->end && start + length > region->start && region->end > next)
                         next = region->end;
                 }
@@ -11167,9 +11774,9 @@ static void sys_ppoll_dispatch(struct trap_frame* frame, u64 fds, u64 count, u64
     }
     if (mask_pointer != 0ul)
     {
-        current_task->signal_saved_blocked = current_task->signal_blocked;
-        current_task->signal_restore_mask = 1u;
-        current_task->signal_blocked = mask & ~SIGNAL_UNBLOCKABLE;
+        current_thread->signal_saved_blocked = current_thread->signal_blocked;
+        current_thread->signal_restore_mask = 1u;
+        current_thread->signal_blocked = mask & ~SIGNAL_UNBLOCKABLE;
     }
     ready = poll_scan(entries, count);
     if (ready != 0l || (timeout_pointer != 0ul && timeout[0] == 0ul && timeout[1] == 0ul))
@@ -11178,19 +11785,19 @@ static void sys_ppoll_dispatch(struct trap_frame* frame, u64 fds, u64 count, u64
             ready = -14l;
         if (mask_pointer != 0ul)
         {
-            current_task->signal_blocked = current_task->signal_saved_blocked;
-            current_task->signal_restore_mask = 0u;
+            current_thread->signal_blocked = current_thread->signal_saved_blocked;
+            current_thread->signal_restore_mask = 0u;
         }
         frame->x[10] = (u64)ready;
         return;
     }
-    current_task->sleep_user_pointer = timeout_pointer;
+    current_thread->sleep_user_pointer = timeout_pointer;
     frame->x[10] = (u64)-ERESTARTNOHAND;
     process_sleep(frame, SLEEP_POLL, timeout_pointer != 0ul ? deadline : 0ul);
 }
 
 // A poll whose time ran out reports nothing ready, with every revents cleared
-static void poll_time_out(struct process* task)
+static void poll_time_out(struct thread* task)
 {
     u64 fds = task->orig_a0;
     u64 count = task->frame.x[11];
@@ -11200,7 +11807,7 @@ static void poll_time_out(struct process* task)
     none[1] = 0u;
     while (index < count && index < (u64)MAX_POLL_FDS)
     {
-        user_copy_to_writable(task->root_page_table, fds + index * 8ul + 6ul, none, 2ul);
+        user_copy_to_writable(task->process->root_page_table, fds + index * 8ul + 6ul, none, 2ul);
         index = index + 1ul;
     }
     process_store_remaining(task, task->sleep_user_pointer, task->sleep_deadline);
@@ -11221,20 +11828,20 @@ static void trap_dispatch(struct trap_frame* frame)
     {
         u64 nr = frame->x[17];
         frame->sepc = frame->sepc + 4ul;
-        current_task->orig_a0 = frame->x[10];
+        current_thread->orig_a0 = frame->x[10];
         if (nr == SYS_READ || nr == SYS_READV)
         {
             s64 result = nr == SYS_READ ? vfs_read(frame->x[10], frame->x[11], frame->x[12]) : vfs_iov(frame->x[10], frame->x[11], frame->x[12], 0);
             frame->x[10] = (u64)result;
             if (result == -ERESTARTSYS)
-                process_sleep(frame, fd_waits_on_device(current_task->orig_a0) ? SLEEP_DEVICE : SLEEP_CONSOLE, current_task->sleep_deadline);
+                process_sleep(frame, fd_waits_on_device(current_thread->orig_a0) ? SLEEP_DEVICE : SLEEP_CONSOLE, current_thread->sleep_deadline);
             return;
         }
         if (nr == SYS_WRITE || nr == SYS_WRITEV)
         {
             s64 result = nr == SYS_WRITE ? vfs_write(frame->x[10], frame->x[11], frame->x[12]) : vfs_iov(frame->x[10], frame->x[11], frame->x[12], 1);
             frame->x[10] = (u64)result;
-            if (result == -ERESTARTSYS && fd_waits_on_device(current_task->orig_a0))
+            if (result == -ERESTARTSYS && fd_waits_on_device(current_thread->orig_a0))
                 process_sleep(frame, SLEEP_DEVICE, 0ul);
             return;
         }
@@ -11277,7 +11884,7 @@ static void trap_dispatch(struct trap_frame* frame)
         {
             s64 result = sys_ioctl_impl(frame->x[10], frame->x[11], frame->x[12]);
             frame->x[10] = (u64)result;
-            if (result == -ERESTARTSYS && fd_waits_on_device(current_task->orig_a0))
+            if (result == -ERESTARTSYS && fd_waits_on_device(current_thread->orig_a0))
                 process_sleep(frame, SLEEP_DEVICE, 0ul);
             return;
         }
@@ -11306,14 +11913,21 @@ static void trap_dispatch(struct trap_frame* frame)
             frame->x[10] = (u64)sys_uname_impl(frame->x[10]);
             return;
         }
-        if (nr == SYS_GETPID || nr == SYS_GETTID || nr == SYS_SET_TID_ADDRESS)
+        if (nr == SYS_GETPID)
         {
-            frame->x[10] = current_task == NULL ? 1ul : (u64)current_task->pid;
+            frame->x[10] = (u64)current_process->pid;
+            return;
+        }
+        if (nr == SYS_GETTID || nr == SYS_SET_TID_ADDRESS)
+        {
+            if (nr == SYS_SET_TID_ADDRESS)
+                current_thread->clear_child_tid = frame->x[10];
+            frame->x[10] = (u64)current_thread->tid;
             return;
         }
         if (nr == SYS_GETPPID)
         {
-            frame->x[10] = current_task == NULL ? 0ul : (u64)current_task->ppid;
+            frame->x[10] = (u64)current_process->ppid;
             return;
         }
         if (nr == SYS_GETUID || nr == SYS_GETEUID || nr == SYS_GETGID || nr == SYS_GETEGID)
@@ -11321,7 +11935,23 @@ static void trap_dispatch(struct trap_frame* frame)
             frame->x[10] = 0ul;
             return;
         }
-        if (nr == SYS_SET_ROBUST_LIST || nr == SYS_PRLIMIT64)
+        if (nr == SYS_SET_ROBUST_LIST)
+        {
+            if (frame->x[11] != ROBUST_LIST_HEAD_SIZE)
+            {
+                frame->x[10] = (u64)-22l;
+                return;
+            }
+            current_thread->robust_list = frame->x[10];
+            frame->x[10] = 0ul;
+            return;
+        }
+        if (nr == SYS_FUTEX)
+        {
+            sys_futex_dispatch(frame, frame->x[10], frame->x[11], frame->x[12], frame->x[13], frame->x[14], frame->x[15]);
+            return;
+        }
+        if (nr == SYS_PRLIMIT64)
         {
             frame->x[10] = 0ul;
             return;
@@ -11441,11 +12071,11 @@ static void trap_dispatch(struct trap_frame* frame)
         if (nr == SYS_CLONE)
         {
             u64 flags = frame->x[10];
-            s64 result = (s64)process_clone(frame, flags, frame->x[11]);
+            s64 result = process_clone(frame, flags, frame->x[11], frame->x[12], frame->x[13], frame->x[14]);
             frame->x[10] = (u64)result;
             if (result > 0l && (flags & CLONE_VFORK) != 0ul)
             {
-                current_task->state = PROC_VFORK;
+                current_thread->state = PROC_VFORK;
                 scheduler_switch(frame);
             }
             return;
@@ -11503,9 +12133,14 @@ static void trap_dispatch(struct trap_frame* frame)
             frame->x[10] = (u64)sys_reboot_impl(frame->x[10], frame->x[11], frame->x[12]);
             return;
         }
-        if (nr == SYS_EXIT || nr == SYS_EXIT_GROUP)
+        if (nr == SYS_EXIT)
         {
-            process_exit_current(frame, frame->x[10], 0ul);
+            thread_exit_current(frame, frame->x[10]);
+            return;
+        }
+        if (nr == SYS_EXIT_GROUP)
+        {
+            process_exit_group(frame, frame->x[10], 0ul);
             return;
         }
         frame->x[10] = (u64)-38l;
@@ -11525,7 +12160,7 @@ static void trap_dispatch(struct trap_frame* frame)
             return;
         if (mapped < 0)
         {
-            signal_force(current_task, SIGBUS, BUS_ADRERR, frame->stval);
+            signal_force(current_thread, SIGBUS, BUS_ADRERR, frame->stval);
             return;
         }
         if (cause != 12ul && map_user_stack_fault(current_user_root_page_table, frame->stval))
@@ -11535,15 +12170,15 @@ static void trap_dispatch(struct trap_frame* frame)
     }
 
     // A fault a program took is the program's to handle or die of; only the kernel's own are fatal
-    if ((frame->sstatus & SSTATUS_SPP) == 0ul && current_task != (struct process*)NULL && current_task->used != 0u)
+    if ((frame->sstatus & SSTATUS_SPP) == 0ul && current_thread != (struct thread*)NULL)
     {
         s32 code;
         u64 address;
         u64 sig = signal_for_fault(frame, &code, &address);
-        if (signal_unhandled(current_task, sig))
+        if (signal_unhandled(current_thread, sig))
         {
             puts("kernel: process ");
-            put_dec(current_task->pid);
+            put_dec(current_process->pid);
             puts(" faulted, cause=");
             put_hex64(frame->scause);
             puts(" sepc=");
@@ -11552,7 +12187,7 @@ static void trap_dispatch(struct trap_frame* frame)
             put_hex64(frame->stval);
             puts("\n");
         }
-        signal_force(current_task, sig, code, address);
+        signal_force(current_thread, sig, code, address);
         return;
     }
 
@@ -11614,7 +12249,7 @@ void kernel_main(u64 hartid, void* fdt)
     vfs_init();
 
     current_user_root_page_table = create_user_address_space();
-    current_task->root_page_table = current_user_root_page_table;
+    current_process->root_page_table = current_user_root_page_table;
     if (!load_process_image(current_user_root_page_table, (const u8*)USER_ELF_BUFFER, init_size, &image))
         panic("invalid INIT.ELF");
     if (!make_kernel_arguments(init_path, &arguments))
@@ -11622,12 +12257,12 @@ void kernel_main(u64 hartid, void* fdt)
     if (!build_user_stack(current_user_root_page_table, &image, &arguments, init_path, &stack))
         panic("user stack setup failed");
 
-    current_task->root_page_table = current_user_root_page_table;
-    current_task->brk = process_brk;
-    current_task->brk_min = process_brk_min;
-    current_task->mmap_cursor = user_mmap_cursor;
-    current_task->vm_region_count = image.region_count;
-    mem_copy(current_task->vm_regions, image.regions, (u64)image.region_count * sizeof(struct vm_region));
+    current_process->root_page_table = current_user_root_page_table;
+    current_process->brk = process_brk;
+    current_process->brk_min = process_brk_min;
+    current_process->mmap_cursor = user_mmap_cursor;
+    current_process->vm_region_count = image.region_count;
+    mem_copy(current_process->vm_regions, image.regions, (u64)image.region_count * sizeof(struct vm_region));
     activate_page_table(current_user_root_page_table);
     timer_enable();
     cpu_account_start = timer_now();

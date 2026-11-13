@@ -668,6 +668,9 @@ namespace Cnidaria.Cs
 
             if (jumpKind is GenTreeBlockJumpKind.None or GenTreeBlockJumpKind.FallThrough)
             {
+                // A non-returning call has no explicit transfer and no normal successor
+                if (jumpKind == GenTreeBlockJumpKind.None && successors.Count == 0)
+                    return;
                 if (successors.Count != 1)
                     throw new InvalidOperationException("Malformed duplicated fall-through block.");
                 statements.Add(CreateBranch(allocator, pc, successorPcs[0], successors[0]));

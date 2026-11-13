@@ -313,16 +313,18 @@ public sealed partial class RiscVEmulator
             Label(done);
         }
 
-        private void Memory(int size, RVMemoryAccess access, bool invalidateReservation = true)
+        private void Memory(int size, RVMemoryAccess access, bool invalidateReservation = true, bool atomic = false)
         {
             string miss = $"memory{_count}_{_misses.Count}";
             _misses.Add((miss, _pc, _count, size, access));
-            if (size != 1)
+            if (atomic)
             {
+                // Zicclsm leaves atomics out, so a misaligned one traps in the interpreter
                 Emit(Test, R(Rax, 4), I(size - 1));
-                Branch(X86Condition.Ne, miss);
+                Branch(X86Condition.Ne, SlowExit());
             }
-            Emit(Mov, R(Rdx), R(Rax));
+            // The page of the last byte matches the tag only when the access stays within one page
+            Emit(Lea, R(Rdx), M(Rax, size - 1));
             Emit(And, R(Rdx), I(-4096));
             Emit(Mov, R(R8), R(Rax));
             Emit(Shr, R(R8), I(12));
@@ -2857,15 +2859,15 @@ public sealed partial class RiscVEmulator
             if (function == 5)
             {
                 Load(Rax, rs1);
-                Memory(size, RVMemoryAccess.Store, invalidateReservation: false);
+                Memory(size, RVMemoryAccess.Store, invalidateReservation: false, atomic: true);
             }
             Load(Rax, rs1);
-            Memory(size, RVMemoryAccess.Load);
+            Memory(size, RVMemoryAccess.Load, atomic: true);
             LoadElement(R9, M(Rax, 0, size), size);
             if (function == 2)
             {
-                Load(Rcx, rs1);
-                Emit(Mov, Context(nameof(JitContext.ReservationAddress)), R(Rcx));
+                PhysicalAddress();
+                Emit(Mov, Context(nameof(JitContext.ReservationAddress)), R(Rdx));
                 Emit(Mov, Context(nameof(JitContext.HasReservation), 4), I(1));
             }
             else if (function == 3)
@@ -2873,9 +2875,10 @@ public sealed partial class RiscVEmulator
                 Emit(Cmp, Context(nameof(JitContext.HasReservation), 4), I(0));
                 Branch(X86Condition.E, $"scFail{_count}");
                 Load(Rax, rs1);
-                Emit(Cmp, R(Rax), Context(nameof(JitContext.ReservationAddress)));
+                Memory(size, RVMemoryAccess.Store, invalidateReservation: false, atomic: true);
+                PhysicalAddress();
+                Emit(Cmp, R(Rdx), Context(nameof(JitContext.ReservationAddress)));
                 Branch(X86Condition.Ne, $"scFail{_count}");
-                Memory(size, RVMemoryAccess.Store, invalidateReservation: false);
                 Load(Rcx, rs2);
                 Emit(Mov, M(Rax, 0, size), R(Rcx, size));
                 Emit(Xor, R(R9, 4), R(R9, 4));
@@ -2888,7 +2891,7 @@ public sealed partial class RiscVEmulator
             else
             {
                 Load(Rax, rs1);
-                Memory(size, RVMemoryAccess.Store, invalidateReservation: false);
+                Memory(size, RVMemoryAccess.Store, invalidateReservation: false, atomic: true);
                 Load(Rcx, rs2);
                 if (function == 5)
                 {
@@ -2920,18 +2923,25 @@ public sealed partial class RiscVEmulator
             string done = $"reservation{_bytes.Count}";
             Emit(Cmp, Context(nameof(JitContext.HasReservation), 4), I(0));
             Branch(X86Condition.E, done);
-            Emit(Mov, R(Rdx), R(Rax));
-            Emit(Sub, R(Rdx), Context(nameof(JitContext.RamOffset)));
-            Emit(Cmp, R(Rax), Context(nameof(JitContext.FramebufferStart)));
-            Branch(X86Condition.B, done + "compare");
-            Emit(Cmp, R(Rax), Context(nameof(JitContext.FramebufferEnd)));
-            Branch(X86Condition.Ae, done + "compare");
-            Emit(Mov, R(Rdx), R(Rax));
-            Emit(Sub, R(Rdx), Context(nameof(JitContext.FramebufferOffset)));
-            Label(done + "compare");
+            PhysicalAddress();
             Emit(Cmp, R(Rdx), Context(nameof(JitContext.ReservationAddress)));
             Branch(X86Condition.Ne, done);
             Emit(Mov, Context(nameof(JitContext.HasReservation), 4), I(0));
+            Label(done);
+        }
+
+        // Rdx gets the guest physical address of the host pointer Memory left in Rax
+        private void PhysicalAddress()
+        {
+            string done = $"physical{_bytes.Count}";
+            Emit(Mov, R(Rdx), R(Rax));
+            Emit(Sub, R(Rdx), Context(nameof(JitContext.RamOffset)));
+            Emit(Cmp, R(Rax), Context(nameof(JitContext.FramebufferStart)));
+            Branch(X86Condition.B, done);
+            Emit(Cmp, R(Rax), Context(nameof(JitContext.FramebufferEnd)));
+            Branch(X86Condition.Ae, done);
+            Emit(Mov, R(Rdx), R(Rax));
+            Emit(Sub, R(Rdx), Context(nameof(JitContext.FramebufferOffset)));
             Label(done);
         }
 

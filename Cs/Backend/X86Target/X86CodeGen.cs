@@ -126,6 +126,9 @@ namespace Cnidaria.Cs
             private readonly Dictionary<int, TypeInitializationThunkDraft> _typeInitializationThunksByTypeId = new Dictionary<int, TypeInitializationThunkDraft>();
             private readonly List<TypeInitializationThunkDraft> _typeInitializationThunks = new List<TypeInitializationThunkDraft>();
             private readonly List<StaticRootDraft> _staticRoots = new List<StaticRootDraft>();
+            private readonly Dictionary<int, int> _threadStaticOffsetByTypeId = new Dictionary<int, int>();
+            private readonly List<TypeGcFieldDraft> _threadStaticRoots = new List<TypeGcFieldDraft>();
+            private int _threadStaticSize;
             private readonly Dictionary<int, StaticExceptionDraft> _staticExceptionsByTypeId = new Dictionary<int, StaticExceptionDraft>();
             private readonly List<StaticExceptionDraft> _staticExceptions = new List<StaticExceptionDraft>();
             private readonly Dictionary<int, EhMethodDraft> _ehMethodsByMethodId = new Dictionary<int, EhMethodDraft>();
@@ -1096,14 +1099,16 @@ namespace Cnidaria.Cs
 
                 GenTreeMethod? firstStaticParameterless = null;
                 GenTreeMethod? namedMain = null;
+                GenTreeMethod? topLevelEntry = null;
                 foreach (GenTreeMethod method in _program.Methods)
                 {
                     RuntimeMethod runtimeMethod = method.RuntimeMethod;
                     if (runtimeMethod.IsStatic && runtimeMethod.ParameterTypes.Length == 0 && firstStaticParameterless is null)
                         firstStaticParameterless = method;
 
+                    bool isAsyncEntry = runtimeMethod.Name == "<Main>";
                     bool isTopLevelEntry = runtimeMethod.Name == "<Main>$";
-                    if (!isTopLevelEntry && runtimeMethod.Name != "Main")
+                    if (!isAsyncEntry && !isTopLevelEntry && runtimeMethod.Name != "Main")
                         continue;
                     if (!runtimeMethod.IsStatic)
                         continue;
@@ -1113,15 +1118,18 @@ namespace Cnidaria.Cs
                         continue;
                     }
 
+                    // <Main> runs an awaitable entry, including one written as top-level statements, so it wins over <Main>$ and Main
+                    if (isAsyncEntry)
+                        return method;
                     // Top-level statements compile to <Main>$ and are the entry whenever one exists, so it
                     // wins over any Main the program also happens to carry
                     if (isTopLevelEntry)
-                        return method;
-
-                    namedMain ??= method;
+                        topLevelEntry ??= method;
+                    else
+                        namedMain ??= method;
                 }
 
-                return namedMain ?? firstStaticParameterless ?? _program.Methods[0];
+                return topLevelEntry ?? namedMain ?? firstStaticParameterless ?? _program.Methods[0];
             }
 
             private void EmitMethod(GenTreeMethod method)
@@ -1161,7 +1169,8 @@ namespace Cnidaria.Cs
                 if (method.IsExtern)
                 {
                     string? label = _options.ExternalSymbolResolver?.Invoke(method);
-                    if (string.IsNullOrWhiteSpace(label) && _target.OperatingSystem == OperatingSystemKind.Windows && method.DllImportData is not null)
+                    if (string.IsNullOrWhiteSpace(label) && _target.OperatingSystem == OperatingSystemKind.Windows &&
+                        method.DllImportData is not null && !RuntimeGcImports.IsRuntimeLibrary(method.DllImportData))
                     {
                         PeImport import = WindowsImport(method);
                         _imports.Add(import);
@@ -1702,50 +1711,12 @@ namespace Cnidaria.Cs
                 if (RegisterInfo.IsWindowsX64(_target))
                     Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(X86Register.Rsp, _target.PointerSize), Imm(32)));
 
-                string executeLabel = CreateLocalLabel(thunk.Label + "_execute");
-                string doneLabel = CreateLocalLabel(thunk.Label + "_done");
-                string invalidStateLabel = CreateLocalLabel(thunk.Label + "_invalid_state");
-
-                EmitLea(X86Register.R10, thunk.StateLabel);
-                Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.R11, 4), Mem(X86Register.R10, 0, 4)));
-                Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(X86Register.R11, 4), Reg(X86Register.R11, 4)));
-                Emit(X86Instruction.ConditionalBranch(
-                    X86Condition.E,
-                    X86Operand.SymbolOperand(doneLabel, 4, X86ObjectRelocationKind.Relative32)));
-                Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.R11, 4), Imm(2)));
-                Emit(X86Instruction.ConditionalBranch(
-                    X86Condition.E,
-                    X86Operand.SymbolOperand(doneLabel, 4, X86ObjectRelocationKind.Relative32)));
-                Emit(X86Instruction.Binary(X86InstrKind.Cmp, Reg(X86Register.R11, 4), Imm(1)));
-                Emit(X86Instruction.ConditionalBranch(
-                    X86Condition.E,
-                    X86Operand.SymbolOperand(executeLabel, 4, X86ObjectRelocationKind.Relative32)));
-                Emit(X86Instruction.Branch(
-                    X86InstrKind.Jmp,
-                    X86Operand.SymbolOperand(invalidStateLabel, 4, X86ObjectRelocationKind.Relative32)));
-
-                DefineLabel(executeLabel);
-                Emit(X86Instruction.Binary(X86InstrKind.Mov, Mem(X86Register.R10, 0, 4), Imm(2)));
+                EmitLea(AbiArgumentRegister(0), thunk.StateLabel);
+                EmitLea(AbiArgumentRegister(1), ResolveMethodLabel(thunk.Initializer));
                 string returnLabel = CreateLocalLabel(thunk.Label + "_gc_return");
-                AddSafePoint(
-                    thunk.Label,
-                    returnLabel,
-                    region,
-                    ImmutableArray<SafePointRootDraft>.Empty);
-                EmitCall(ResolveMethodLabel(thunk.Initializer));
+                AddSafePoint(thunk.Label, returnLabel, region, ImmutableArray<SafePointRootDraft>.Empty);
+                EmitCall(ResolveMethodLabel((_program.ClassConstructorRunnerMethod ?? throw new MissingMethodException("The class constructor runner is missing."))));
                 DefineLabel(returnLabel);
-                EmitLea(X86Register.R10, thunk.StateLabel);
-                Emit(X86Instruction.Binary(X86InstrKind.Mov, Mem(X86Register.R10, 0, 4), Imm(0)));
-                Emit(X86Instruction.Branch(
-                    X86InstrKind.Jmp,
-                    X86Operand.SymbolOperand(doneLabel, 4, X86ObjectRelocationKind.Relative32)));
-
-                DefineLabel(invalidStateLabel);
-                Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(AbiArgumentRegister(0), _target.PointerSize), Imm(150)));
-                EmitCall(ResolveExternalFunction(X86Runtime.FailFastSymbol));
-                Emit(new X86Instruction(X86InstrKind.Ud2));
-
-                DefineLabel(doneLabel);
                 if (RegisterInfo.IsWindowsX64(_target))
                     Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rsp, _target.PointerSize), Imm(32)));
                 Emit(X86Instruction.Unary(X86InstrKind.Pop, Reg(X86Register.Rbp, _target.PointerSize)));
@@ -1768,9 +1739,12 @@ namespace Cnidaria.Cs
                     return storage.InitializationStateLabel;
 
                 string label = CreateLocalLabel($"type_init_{type.TypeId}");
-                int offset = _data.Align(4);
-                _data.EmitInt32(1);
-                AddDataSymbol(label, DataSectionName, offset, 4);
+                int size = checked(_target.PointerSize * 3);
+                int offset = _data.Align(_target.PointerSize);
+                var context = new byte[size];
+                context[0] = 1;
+                _data.EmitBytes(context);
+                AddDataSymbol(label, DataSectionName, offset, size);
                 storage.InitializationStateLabel = label;
                 return label;
             }
@@ -1781,7 +1755,7 @@ namespace Cnidaria.Cs
                     throw new ArgumentNullException(nameof(type));
                 if (_staticStorageByTypeId.TryGetValue(type.TypeId, out StaticStorageDraft? existing))
                     return existing;
-                if (type.StaticFields.Length != 0 && type.StaticSize <= 0)
+                if (type.StaticFields.Length != 0 && type.StaticSize <= 0 && type.ThreadStaticSize <= 0)
                     throw new InvalidOperationException($"Static layout was not computed for T{type.TypeId} '{type.Namespace}.{type.Name}'.");
 
                 string label = CreateLocalLabel($"statics_{type.TypeId}");
@@ -1794,17 +1768,94 @@ namespace Cnidaria.Cs
                 var storage = new StaticStorageDraft(type, label);
                 _staticStorageByTypeId.Add(type.TypeId, storage);
 
-                var roots = ImmutableArray.CreateBuilder<TypeGcFieldDraft>();
+                ImmutableArray<TypeGcFieldDraft>.Builder roots = ImmutableArray.CreateBuilder<TypeGcFieldDraft>();
                 for (int i = 0; i < type.StaticFields.Length; i++)
                 {
                     RuntimeField field = type.StaticFields[i];
-                    AppendTypedGcFields(roots, field.Offset, field.FieldType);
+                    if (!field.IsThreadStatic)
+                        AppendTypedGcFields(roots, field.Offset, field.FieldType);
                 }
                 for (int i = 0; i < roots.Count; i++)
                     _staticRoots.Add(new StaticRootDraft(label, roots[i].Offset, roots[i].Kind));
 
                 return storage;
             }
+
+            private int GetThreadStaticOffset(RuntimeType type)
+            {
+                if (_threadStaticOffsetByTypeId.TryGetValue(type.TypeId, out int existing))
+                    return existing;
+
+                int offset = AlignUp(_threadStaticSize, Math.Max(1, type.ThreadStaticAlign));
+                _threadStaticSize = checked(offset + type.ThreadStaticSize);
+                _threadStaticOffsetByTypeId.Add(type.TypeId, offset);
+
+                ImmutableArray<TypeGcFieldDraft>.Builder roots = ImmutableArray.CreateBuilder<TypeGcFieldDraft>();
+                for (int i = 0; i < type.StaticFields.Length; i++)
+                {
+                    RuntimeField field = type.StaticFields[i];
+                    if (field.IsThreadStatic)
+                        AppendTypedGcFields(roots, checked(offset + field.Offset), field.FieldType);
+                }
+                _threadStaticRoots.AddRange(roots);
+                return offset;
+            }
+
+            // The thread record sits in a TEB TLS slot on Windows and at the thread pointer elsewhere, its statics one pointer in
+            private void EmitThreadStatics(X86Register destination)
+            {
+                int register = (int)destination;
+                int low = register & 7;
+                bool windows = _target.OperatingSystem == OperatingSystemKind.Windows;
+                if (windows)
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(destination, 4), SymbolMemory(ResolveExternalObject("RhpTlsIndex"), size: 4)));
+
+                var bytes = new List<byte>();
+                if (_target.Is64Bit)
+                {
+                    bytes.Add(windows ? (byte)0x65 : (byte)0x64);
+                    bytes.Add((byte)(0x48 | (register >= 8 ? (windows ? 0x06 : 0x04) : 0)));
+                    bytes.Add(0x8b);
+                    bytes.Add((byte)(0x04 | (low << 3)));
+                    bytes.Add(windows ? (byte)(0xc5 | (low << 3)) : (byte)0x25);
+                    bytes.AddRange(BitConverter.GetBytes(windows ? 0x1480 : _target.PointerSize));
+                }
+                else
+                {
+                    bytes.Add(windows ? (byte)0x64 : (byte)0x65);
+                    bytes.Add(0x8b);
+                    bytes.Add((byte)((windows ? 0x04 : 0x05) | (low << 3)));
+                    if (windows)
+                        bytes.Add((byte)(0x85 | (low << 3)));
+                    bytes.AddRange(BitConverter.GetBytes(windows ? 0xe10 : _target.PointerSize));
+                }
+                Emit(X86Instruction.Raw(bytes));
+                if (windows)
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(destination, _target.PointerSize), Mem(destination, _target.PointerSize, _target.PointerSize)));
+            }
+
+            private void EmitThreadStaticMetadata()
+            {
+                int pointerSize = _target.PointerSize;
+                AddGlobalDataSymbol("RhpThreadStaticRoots", _rodata.Align(pointerSize), Math.Max(1, _threadStaticRoots.Count) * pointerSize * 2);
+                for (int i = 0; i < _threadStaticRoots.Count; i++)
+                {
+                    _rodata.EmitPointer(_threadStaticRoots[i].Offset);
+                    _rodata.EmitPointer(ToRuntimeRootKind(_threadStaticRoots[i].Kind));
+                }
+                if (_threadStaticRoots.Count == 0)
+                {
+                    _rodata.EmitPointer(0);
+                    _rodata.EmitPointer(0);
+                }
+                AddGlobalDataSymbol("RhpThreadStaticRootCount", _rodata.ByteLength, pointerSize);
+                _rodata.EmitPointer(_threadStaticRoots.Count);
+                AddGlobalDataSymbol("RhpThreadStaticSize", _rodata.ByteLength, pointerSize);
+                _rodata.EmitPointer(AlignUp(_threadStaticSize, pointerSize));
+            }
+
+            private void AddGlobalDataSymbol(string label, int offset, int size)
+                => _symbols.Add(new X86ObjectSymbol(label, RodataSectionName, offset, size, X86ObjectSymbolBinding.Global, X86ObjectSymbolKind.Object));
 
             private void AppendObjectGcFields(ImmutableArray<TypeGcFieldDraft>.Builder fields, RuntimeType type)
             {
@@ -2273,6 +2324,7 @@ namespace Cnidaria.Cs
                     }
                 }
 
+                EmitThreadStaticMetadata();
                 return new RuntimeMetadataLabels(safePoints, typeInfoTable, staticRoots, regionTable);
             }
 
@@ -2561,6 +2613,7 @@ namespace Cnidaria.Cs
                     if (runtimeMethod.ParameterTypes.Length == 1)
                         Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rcx, 4), Reg(X86Register.Rcx, 4)));
                     EmitCall(entryMethodLabel);
+                    EmitForegroundWait();
                     if (IsVoid(runtimeMethod.ReturnType))
                         Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
 
@@ -2609,6 +2662,7 @@ namespace Cnidaria.Cs
                     if (runtimeMethod.ParameterTypes.Length == 1)
                         Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rcx, 4), Reg(X86Register.Rcx, 4)));
                     EmitCall(entryMethodLabel);
+                    EmitForegroundWait();
                     Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rsp, 8), Imm(32)));
                     if (IsVoid(runtimeMethod.ReturnType))
                         Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
@@ -2639,10 +2693,11 @@ namespace Cnidaria.Cs
                     if (runtimeMethod.ParameterTypes.Length == 1)
                         Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rdi, 4), Reg(X86Register.Rdi, 4)));
                     EmitCall(entryMethodLabel);
+                    EmitForegroundWait();
                     if (IsVoid(runtimeMethod.ReturnType))
                         Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
                     Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rdi, 4), Reg(X86Register.Rax, 4)));
-                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 4), Imm(60)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 4), Imm(231)));
                     Emit(new X86Instruction(X86InstrKind.Syscall));
                     Emit(new X86Instruction(X86InstrKind.Ud2));
                 }
@@ -2655,6 +2710,20 @@ namespace Cnidaria.Cs
                     X86ObjectSymbolBinding.Global,
                     X86ObjectSymbolKind.Function));
                 return label;
+            }
+
+            private void EmitForegroundWait()
+            {
+                RuntimeMethod? wait = _program.ThreadExitMethod;
+                if (wait is null)
+                    return;
+                int offset = RegisterInfo.IsWindowsX64(_target) ? 32 : 0;
+                int size = offset + 16;
+                Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(X86Register.Rsp, _target.PointerSize), Imm(size)));
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, Mem(X86Register.Rsp, offset, _target.PointerSize), Reg(X86Register.Rax, _target.PointerSize)));
+                EmitCall(ResolveMethodLabel(wait));
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, _target.PointerSize), Mem(X86Register.Rsp, offset, _target.PointerSize)));
+                Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rsp, _target.PointerSize), Imm(size)));
             }
 
             public void Emit(X86Instruction instruction)
@@ -3572,12 +3641,23 @@ namespace Cnidaria.Cs
 
                 private void EmitReturn(GenTree node)
                 {
+                    if ((node.Flags & GenTreeFlags.AsyncSuspend) != 0)
+                    {
+                        EmitZeroRegister(RegisterInfo.GetIntegerReturnRegister(Target, 0));
+                        if (RegisterInfo.GetIntegerReturnRegister(Target, 1) is MachineRegister second && second != MachineRegister.Invalid)
+                            EmitZeroRegister(second);
+                        _owner.Emit(X86Instruction.Ret());
+                        return;
+                    }
+
                     if (node.Uses.Length != 0 && MachineAbi.RequiresHiddenReturnBuffer(_method.RuntimeMethod, Target))
                     {
                         EmitHiddenReturnBufferCopy(node);
                         return;
                     }
 
+                    if (_method.RuntimeMethod.IsAsyncCall)
+                        EmitZeroRegister(RegisterInfo.AsyncContinuationRegister(Target));
                     _owner.Emit(X86Instruction.Ret());
                 }
 
@@ -4640,22 +4720,18 @@ namespace Cnidaria.Cs
 
                     RuntimeType fieldType = field.FieldType;
                     GenStackKind kind = MachineAbi.StackKindForType(fieldType, Target);
-                    string storage = _owner.GetStaticStorageLabel(field.DeclaringType);
                     switch (node.TreeKind)
                     {
                         case GenTreeKind.StaticFieldAddr:
                             if (node.Results.Length != 1 || !node.Results[0].IsRegister)
                                 throw Unsupported(node, "Static field address requires one register result");
-                            _owner.EmitLea(
-                                ToX86Register(node.Results[0].Register, Target),
-                                storage,
-                                field.Offset);
+                            EmitStaticFieldAddress(ToX86Register(node.Results[0].Register, Target), field);
                             return;
 
                         case GenTreeKind.StaticField:
                             {
                                 X86Register address = SelectAddressScratch(node, X86Register.Invalid);
-                                _owner.EmitLea(address, storage, field.Offset);
+                                EmitStaticFieldAddress(address, field);
                                 EmitValueFromAddress(node, fieldType, kind, address);
                                 return;
                             }
@@ -4663,7 +4739,7 @@ namespace Cnidaria.Cs
                         case GenTreeKind.StoreStaticField:
                             {
                                 X86Register address = SelectAddressScratch(node, X86Register.Invalid);
-                                _owner.EmitLea(address, storage, field.Offset);
+                                EmitStaticFieldAddress(address, field);
                                 if (IsContainedDefaultValue(node, 0))
                                 {
                                     EmitZeroAddress(node, address, StorageSize(fieldType, kind));
@@ -4681,6 +4757,20 @@ namespace Cnidaria.Cs
                         default:
                             throw Unsupported(node, "Unsupported static field operation");
                     }
+                }
+
+                private void EmitStaticFieldAddress(X86Register destination, RuntimeField field)
+                {
+                    if (!field.IsThreadStatic)
+                    {
+                        _owner.EmitLea(destination, _owner.GetStaticStorageLabel(field.DeclaringType), field.Offset);
+                        return;
+                    }
+
+                    int offset = checked(_owner.GetThreadStaticOffset(field.DeclaringType) + field.Offset);
+                    _owner.EmitThreadStatics(destination);
+                    if (offset != 0)
+                        _owner.Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(destination, Target.PointerSize), Imm(offset)));
                 }
 
                 private void EmitExplicitNullCheck(GenTree node)
@@ -5413,6 +5503,9 @@ namespace Cnidaria.Cs
                             return;
                         case RuntimeIntrinsicId.MemoryBarrier:
                             _owner.Emit(new X86Instruction(X86InstrKind.Mfence));
+                            return;
+                        case RuntimeIntrinsicId.AsyncCallContinuation:
+                            EmitRegisterMove(RequireResultRegister(node), RegisterInfo.AsyncContinuationRegister(Target), Target.PointerSize);
                             return;
                         case RuntimeIntrinsicId.VolatileRead:
                         case RuntimeIntrinsicId.VolatileWrite:

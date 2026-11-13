@@ -449,7 +449,11 @@ public static class StaticLinker
         if (trees.Count == 0)
             return;
 
-        var trimmed = Trimmer.TrimLinked(trees.ToImmutable(), unitOptions.ToImmutable(), userCount, entry, trimming);
+        // The startup's call is a root of the whole link, kept even when nothing else reaches the unit defining it
+        var linkTrimming = cLibraryStartup
+            ? new TrimmingOptions(trimming.Enabled, trimming.PreserveExternallyVisibleSymbols, libraryTrimming.RootSymbols)
+            : trimming;
+        var trimmed = Trimmer.TrimLinked(trees.ToImmutable(), unitOptions.ToImmutable(), userCount, entry, linkTrimming);
         for (var i = 0; i < slots.Count; i++)
             slots[i].Gimple = trimmed[i];
     }

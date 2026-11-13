@@ -43,6 +43,7 @@ int execv(const char* path, char* const argv[]);
 int execvp(const char* file, char* const argv[]);
 void _exit(int status);
 pid_t getpid(void);
+pid_t gettid(void);
 pid_t getppid(void);
 pid_t getpgrp(void);
 pid_t getpgid(pid_t pid);

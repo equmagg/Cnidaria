@@ -698,6 +698,8 @@ namespace Cnidaria.Cs
                     if (!TryGetLinearPosition(node, out int position))
                         continue;
 
+                    AbiCallDescriptor? call = node.HasLoweringFlag(GenTreeLinearFlags.AbiCall)
+                        ? MachineAbi.BuildCallDescriptorFromAllocatedShape(_method, node) : null;
                     int count = Math.Min(node.Uses.Length, node.RegisterUses.Length);
                     for (int u = 0; u < count; u++)
                     {
@@ -712,7 +714,17 @@ namespace Cnidaria.Cs
                         if (!_method.GenTreeMethod.ValueInfoByNode.TryGetValue(value.LinearValueKey, out var info))
                             continue;
 
-                        AddSafepointOperandRootRange(ranges, value, info, location, position);
+                        int offset = 0;
+                        int size = info.Type is RuntimeType type ? type.SizeOf : 0;
+                        if (call is not null && u < call.ArgumentSegments.Length)
+                        {
+                            AbiCallSegment segment = call.ArgumentSegments[u];
+                            if (segment.ValueAbi.PassingKind == AbiValuePassingKind.Indirect)
+                                continue;
+                            offset = segment.Offset;
+                            size = segment.Size;
+                        }
+                        AddSafepointOperandRootRange(ranges, value, info, location, position, offset, size);
                     }
                 }
             }
@@ -722,7 +734,9 @@ namespace Cnidaria.Cs
                 GenTree value,
                 GenTreeValueInfo info,
                 RegisterOperand location,
-                int position)
+                int position,
+                int fragmentOffset,
+                int fragmentSize)
             {
                 if (info.Type is not null && info.Type.IsValueType && info.Type.ContainsGcPointers)
                 {
@@ -732,7 +746,9 @@ namespace Cnidaria.Cs
                     var gcOffsets = info.Type.GcPointerOffsets;
                     for (int g = 0; g < gcOffsets.Length; g++)
                     {
-                        var structRootKind = GetStructGcRootKind(info.Type, gcOffsets[g]);
+                        if (gcOffsets[g] < fragmentOffset || gcOffsets[g] >= fragmentOffset + fragmentSize)
+                            continue;
+                        RegisterGcRootKind structRootKind = GetStructGcRootKind(info.Type, gcOffsets[g]);
                         AddLiveRangeSlices(
                             ranges,
                             new RegisterGcLiveRoot(
@@ -740,7 +756,7 @@ namespace Cnidaria.Cs
                                 structRootKind,
                                 location,
                                 info.Type,
-                                gcOffsets[g]),
+                                gcOffsets[g] - fragmentOffset),
                             position,
                             position + 1);
                     }

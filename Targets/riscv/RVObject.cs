@@ -267,23 +267,6 @@ internal static class RVObjectLinker
             image[offset + i] = (byte)(value >> ((size - 1 - i) * 8));
     }
 
-    private static void WriteUInt32(byte[] image, int offset, uint value, TargetEndianness endianness)
-    {
-        if (endianness == TargetEndianness.Little)
-        {
-            image[offset] = (byte)value;
-            image[offset + 1] = (byte)(value >> 8);
-            image[offset + 2] = (byte)(value >> 16);
-            image[offset + 3] = (byte)(value >> 24);
-            return;
-        }
-
-        image[offset] = (byte)(value >> 24);
-        image[offset + 1] = (byte)(value >> 16);
-        image[offset + 2] = (byte)(value >> 8);
-        image[offset + 3] = (byte)value;
-    }
-
     private static int AlignUp(int value, int alignment)
     {
         if (alignment <= 1)

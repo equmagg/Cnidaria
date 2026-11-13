@@ -16,6 +16,71 @@ typedef long long time_t;
 typedef int pid_t;
 typedef unsigned int useconds_t;
 
+typedef struct __pthread* pthread_t;
+typedef unsigned int pthread_key_t;
+typedef int pthread_once_t;
+typedef volatile int pthread_spinlock_t;
+
+typedef struct
+{
+    int __detach_state;
+    size_t __guard_size;
+    size_t __stack_size;
+    void* __stack;
+} pthread_attr_t;
+
+typedef struct
+{
+    volatile int __lock;
+    int __kind;
+    volatile int __owner;
+    int __count;
+} pthread_mutex_t;
+
+typedef struct
+{
+    int __kind;
+} pthread_mutexattr_t;
+
+typedef struct
+{
+    volatile int __sequence;
+    volatile int __waiters;
+    int __clock;
+    int __shared;
+} pthread_cond_t;
+
+typedef struct
+{
+    int __clock;
+    int __shared;
+} pthread_condattr_t;
+
+typedef struct
+{
+    volatile int __lock;
+    volatile int __waiters;
+    int __shared;
+} pthread_rwlock_t;
+
+typedef struct
+{
+    int __shared;
+} pthread_rwlockattr_t;
+
+typedef struct
+{
+    volatile int __sequence;
+    volatile int __count;
+    unsigned int __limit;
+    int __shared;
+} pthread_barrier_t;
+
+typedef struct
+{
+    int __shared;
+} pthread_barrierattr_t;
+
 #if defined(_WIN64) || (defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8)
 typedef long long ssize_t;
 #else

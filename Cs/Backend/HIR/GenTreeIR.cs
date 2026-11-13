@@ -264,6 +264,8 @@ namespace Cnidaria.Cs
         Unaligned = 1u << 25,
         /// <summary>Store whose destination is never on the GC heap and needs no write barrier</summary>
         TargetNotOnHeap = 1u << 26,
+        /// <summary>Return whose operand is the continuation of a suspending async method</summary>
+        AsyncSuspend = 1u << 27,
         AssertionProperties = NullCheckEliminated | BoundsCheckEliminated | DivModNoByZero | DivModNoOverflow,
     }
     internal static class GenTreeIntrinsicSemantics

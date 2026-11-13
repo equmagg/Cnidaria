@@ -14,6 +14,7 @@ namespace Cnidaria.Cs
         VolatileRead,
         VolatileWrite,
         InteropSys,
+        AsyncCallContinuation,
     }
 
     [Flags]
@@ -145,12 +146,26 @@ namespace Cnidaria.Cs
                 "RhReRegisterForFinalize" or
                 "RhpGetNextFinalizableObject" or
                 "RhCollect" or
-                "RhpFallbackFailFast"
+                "RhpFallbackFailFast" or
+                "RhpMonitorEnter" or
+                "RhpMonitorTryEnter" or
+                "RhpMonitorExit" or
+                "RhpMonitorIsEntered" or
+                "RhpMonitorWait" or
+                "RhpMonitorPulse" or
+                "RhYield" or
+                "RhSpinWait" or
+                "RhpClassInitEnter" or
+                "RhpClassInitComplete"
                 ? method.Name
                 : null;
 
         public static bool IsGcSafePoint(RuntimeMethod method)
-            => IsRuntimeImport(method) && method.Name == "RhCollect";
+            => IsRuntimeImport(method) && method.Name is "RhCollect" or "RhpMonitorEnter" or "RhpMonitorTryEnter" or "RhpMonitorWait" or "RhpClassInitEnter";
+
+        // The shims of this library are part of the runtime every native image links
+        public static bool IsRuntimeLibrary(DllImportData import)
+            => import.ModuleName == "libSystem.Native";
 
         public static bool IsFinalizerDrain(RuntimeMethod method)
             => method.IsStatic &&
@@ -187,10 +202,17 @@ namespace Cnidaria.Cs
             RuntimeIntrinsicFlags.GlobalRef |
             RuntimeIntrinsicFlags.Ordered;
 
-        private const RuntimeIntrinsicFlags SystemCallFlags =
+        // Reads the continuation register the async call just before it returned in, no instruction may come between them
+        private const RuntimeIntrinsicFlags AsyncCallContinuationFlags =
             RuntimeIntrinsicFlags.SpecialImport |
             RuntimeIntrinsicFlags.NoInline |
             RuntimeIntrinsicFlags.NoGcSafePoint |
+            RuntimeIntrinsicFlags.SideEffect |
+            RuntimeIntrinsicFlags.Ordered;
+
+        private const RuntimeIntrinsicFlags SystemCallFlags =
+            RuntimeIntrinsicFlags.SpecialImport |
+            RuntimeIntrinsicFlags.NoInline |
             RuntimeIntrinsicFlags.UsesCallAbi |
             RuntimeIntrinsicFlags.SideEffect |
             RuntimeIntrinsicFlags.CanThrow |
@@ -209,6 +231,16 @@ namespace Cnidaria.Cs
                 method.DeclaringType.Namespace.Length == 0 && method.DeclaringType.Name == "Interop+Sys")
             {
                 return RuntimeIntrinsicId.InteropSys;
+            }
+
+            if (method.IsStatic &&
+                method.ParameterTypes.Length == 0 &&
+                method.Name == "AsyncCallContinuation" &&
+                method.DeclaringType.AssemblyName == "std" &&
+                method.DeclaringType.Namespace == "System.Runtime.CompilerServices" &&
+                method.DeclaringType.Name == "AsyncHelpers")
+            {
+                return RuntimeIntrinsicId.AsyncCallContinuation;
             }
 
             if (!method.HasThis &&
@@ -299,6 +331,7 @@ namespace Cnidaria.Cs
                 RuntimeIntrinsicId.InterlockedAnd => AtomicReadModifyWriteFlags,
                 RuntimeIntrinsicId.MemoryBarrier or RuntimeIntrinsicId.VolatileRead or RuntimeIntrinsicId.VolatileWrite => MemoryBarrierFlags,
                 RuntimeIntrinsicId.InteropSys => SystemCallFlags,
+                RuntimeIntrinsicId.AsyncCallContinuation => AsyncCallContinuationFlags,
                 _ => RuntimeIntrinsicFlags.None,
             };
 
@@ -321,6 +354,9 @@ namespace Cnidaria.Cs
             {
                 case RuntimeIntrinsicId.InteropSys:
                     intrinsic = new RuntimeIntrinsicInfo(id, SystemCallFlags);
+                    return true;
+                case RuntimeIntrinsicId.AsyncCallContinuation:
+                    intrinsic = new RuntimeIntrinsicInfo(id, AsyncCallContinuationFlags);
                     return true;
                 case RuntimeIntrinsicId.InterlockedCompareExchange:
                     if (TryGetInterlockedCompareExchange(method, target.PointerSize, out var compareExchange))

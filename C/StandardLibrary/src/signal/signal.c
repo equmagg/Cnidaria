@@ -367,6 +367,11 @@ pid_t getpid(void)
     return (pid_t)__syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
 }
 
+pid_t gettid(void)
+{
+    return (pid_t)__syscall(__NR_gettid, 0, 0, 0, 0, 0, 0);
+}
+
 pid_t getppid(void)
 {
     return (pid_t)__syscall(__NR_getppid, 0, 0, 0, 0, 0, 0);

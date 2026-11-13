@@ -74,102 +74,24 @@ namespace Cnidaria.Cs
 
             return new BoundSizeOfExpression(node, intType, operandType);
         }
+        // Only a primitive, an enum or a pointer folds, the runtime lays out every struct
         private static bool TryGetCompileTimeSizeOf(TypeSymbol type, TargetInfo target, out int size)
         {
-            var visiting = new HashSet<TypeSymbol>();
-            return TryGetStorageSizeAlign(type, target, visiting, out size, out _);
-        }
-        // Recursive value type layout uses declared instance fields and target pointer size
-        private static bool TryGetStorageSizeAlign(
-            TypeSymbol type,
-            TargetInfo target,
-            HashSet<TypeSymbol> visiting,
-            out int size,
-            out int align)
-        {
             size = 0;
-            align = 1;
-
-            if (type is null || type is ErrorTypeSymbol)
+            if (type is null || type is ErrorTypeSymbol || type is TypeParameterSymbol)
                 return false;
 
             if (type.IsReferenceType || type is ArrayTypeSymbol || type is PointerTypeSymbol || type is ByRefTypeSymbol || type is FunctionPointerTypeSymbol)
             {
                 size = target.PointerSize;
-                align = target.PointerSize;
                 return true;
             }
 
-            if (type is TypeParameterSymbol)
-                return false;
-
-            if (TryGetKnownPrimitiveOrBuiltinSizeAlign(type, target.PointerSize, out size, out align))
+            if (TryGetKnownPrimitiveOrBuiltinSizeAlign(type, target.PointerSize, out size, out _))
                 return true;
 
-            if (type is NamedTypeSymbol nt)
-            {
-                if (nt.TypeKind == TypeKind.Enum)
-                {
-                    var ut = nt.EnumUnderlyingType;
-                    if (ut is null)
-                        return false;
-
-                    return TryGetStorageSizeAlign(ut, target, visiting, out size, out align);
-                }
-
-                if (nt.TypeKind == TypeKind.Struct)
-                {
-                    if (!visiting.Add(nt))
-                        return false; // Reject recursive value layouts
-
-                    try
-                    {
-                        if (InlineArrayFacts.TryGetInfo(nt, out var inlineArray))
-                        {
-                            if (!TryGetStorageSizeAlign(inlineArray.ElementType, target, visiting, out int es, out int ea))
-                                return false;
-
-                            int inlineSize = checked(es * inlineArray.Length);
-                            size = AlignUp(inlineSize, ea);
-                            if (size == 0)
-                                size = 1;
-
-                            align = ea;
-                            return true;
-                        }
-
-                        int offset = 0;
-                        int maxAlign = 1;
-
-                        var members = nt.GetMembers();
-                        for (int i = 0; i < members.Length; i++)
-                        {
-                            if (members[i] is not FieldSymbol f || f.IsStatic)
-                                continue;
-
-                            if (!TryGetStorageSizeAlign(f.Type, target, visiting, out int fs, out int fa))
-                                return false;
-
-                            offset = AlignUp(offset, fa);
-                            offset += fs;
-                            if (fa > maxAlign)
-                                maxAlign = fa;
-                        }
-
-                        size = AlignUp(offset, maxAlign);
-                        if (size == 0)
-                            size = 1; // Empty structs occupy one byte
-
-                        align = maxAlign;
-                        return true;
-                    }
-                    finally
-                    {
-                        visiting.Remove(nt);
-                    }
-                }
-            }
-            return false;
+            return type is NamedTypeSymbol named && named.TypeKind == TypeKind.Enum && named.EnumUnderlyingType is TypeSymbol underlying &&
+                TryGetCompileTimeSizeOf(underlying, target, out size);
         }
         private static bool TryGetKnownPrimitiveOrBuiltinSizeAlign(TypeSymbol type, int pointerSize, out int size, out int align)
         {
@@ -211,11 +133,6 @@ namespace Cnidaria.Cs
             }
 
             return false;
-        }
-        private static int AlignUp(int value, int align)
-        {
-            int mask = align - 1;
-            return (value + mask) & ~mask;
         }
         private BoundExpression BindThrowExpression(ThrowExpressionSyntax node, BindingContext context, DiagnosticBag diagnostics)
         {

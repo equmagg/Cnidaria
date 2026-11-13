@@ -590,6 +590,17 @@ namespace Cnidaria.Cs
             return MachineRegister.X0;
         }
 
+        // An async call returns its continuation here besides its result, null unless it suspended, and a suspension zeroes the result its caller still reports
+        public static MachineRegister AsyncContinuationRegister(TargetInfo target)
+        {
+            ValidateTarget(target);
+            if (target.IsX86)
+                return CountRegister(target);
+            if (IsArm64(target))
+                return MachineRegister.X2;
+            return target.IsRegisterBytecode ? MachineRegister.X14 : MachineRegister.X12;
+        }
+
         public static MachineRegister CountRegister(TargetInfo target)
         {
             ValidateTarget(target);

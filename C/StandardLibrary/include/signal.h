@@ -197,6 +197,8 @@ int kill(pid_t pid, int sig);
 int killpg(pid_t group, int sig);
 int sigaction(int sig, const struct sigaction* restrict action, struct sigaction* restrict old);
 int sigprocmask(int how, const sigset_t* restrict set, sigset_t* restrict old);
+int pthread_sigmask(int how, const sigset_t* restrict set, sigset_t* restrict old);
+int pthread_kill(pthread_t thread, int sig);
 int sigpending(sigset_t* set);
 int sigsuspend(const sigset_t* mask);
 int sigwait(const sigset_t* restrict set, int* restrict sig);

@@ -23,8 +23,6 @@ namespace Cnidaria.Cs
         public const string NewUninitializedArraySymbol = "RhpNewArrayUninitialized";
         public const string AllocHGlobalSymbol = "RhpAllocHGlobal";
         public const string FreeHGlobalSymbol = "RhpFreeHGlobal";
-        public const string MonitorEnterSymbol = "RhpMonitorEnter";
-        public const string MonitorExitSymbol = "RhpMonitorExit";
         public const string DelegateCombineSymbol = "RhpDelegateCombine";
         public const string DelegateRemoveSymbol = "RhpDelegateRemove";
         public const string ArrayClearSymbol = "RhpArrayClear";
@@ -392,20 +390,6 @@ namespace Cnidaria.Cs
                 method.Name is "RhGetObjectHashCode" or "RhTryGetObjectHashCode")
             {
                 return GetObjectHashCodeSymbol;
-            }
-
-            if (method.DeclaringType.Namespace == "System.Threading" &&
-                method.DeclaringType.Name == "ObjectHeader" &&
-                method.IsStatic &&
-                !method.HasThis &&
-                method.ParameterTypes.Length == 1 &&
-                IsSystemType(method.ParameterTypes[0], "Object") &&
-                IsVoid(method.ReturnType))
-            {
-                if (method.Name == "AcquireThinLock")
-                    return MonitorEnterSymbol;
-                if (method.Name == "Release")
-                    return MonitorExitSymbol;
             }
 
             if (method.DeclaringType.Namespace == "System.Runtime.InteropServices" &&

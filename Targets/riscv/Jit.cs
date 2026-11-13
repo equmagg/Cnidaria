@@ -243,7 +243,7 @@ public sealed partial class RiscVEmulator
         if (access == RVMemoryAccess.Store && read.Tag == (address & ~PageMask)
             && readOffset < (ulong)_ram.Length && jit.ProtectedPages[(int)(readOffset >> 12)])
             return false;
-        if ((_ramBase & PageMask) != 0 || (address & (ulong)(size - 1)) != 0
+        if ((_ramBase & PageMask) != 0 || (address & PageMask) > PageSize - (ulong)size
             || !TryJitTranslate(jit, address, access, out ulong physical))
             return false;
         ulong pageOffset = address & PageMask;

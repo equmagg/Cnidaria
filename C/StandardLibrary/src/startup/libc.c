@@ -1,15 +1,33 @@
+#include <errno.h>
 #include <stdlib.h>
 
 int __libc_argc;
 char** __libc_argv;
 char** environ;
 int __libc_initialized;
-int errno;
+
+#if defined(__linux__)
+
+void __pthread_main_init(void);
+
+#else
+
+static int __libc_errno;
+
+int* __errno_location(void)
+{
+    return &__libc_errno;
+}
+
+#endif
 
 void __libc_init(int argc, char** argv, char** envp)
 {
     if (__libc_initialized != 0)
         return;
+#if defined(__linux__)
+    __pthread_main_init();
+#endif
     __libc_argc = argc;
     __libc_argv = argv;
     environ = envp;

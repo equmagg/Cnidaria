@@ -140,6 +140,8 @@ supervisor_trap_vector:
     li t0, ${ZKERNEL_TRAP_DISPATCH_ADDRESS}
     jalr ra, t0, 0
 kernel_return_user:
+    # The thread returned to may not be the one whose lr is still reserved, so the reservation goes
+    sc.d zero, zero, (sp)
     ld t0, 256(sp)
     csrrw zero, sepc, t0
     ld t0, 264(sp)

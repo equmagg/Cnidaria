@@ -15,6 +15,8 @@ namespace Cnidaria.Cs
         public int MaxCallDepth { get; init; } = 128;
         public long MaxInstructions { get; init; } = 100_000_000;
         public int TokenCheckPeriod { get; init; } = 256;
+        public int MaxThreads { get; init; } = 64;
+        public int MaxAdditionalMemoryBytes { get; init; } = 16 * 1024 * 1024;
     }
     internal enum SlotKind : byte
     {
@@ -3523,6 +3525,8 @@ namespace Cnidaria.Cs
             if (++_callDepth > limits.MaxCallDepth)
                 throw new InvalidOperationException($"Max call depth exceeded calling {Describe(method)}.");
 
+            if (method.IsRuntimeAsync)
+                throw new NotSupportedException($"Runtime async method '{Describe(method)}' is not supported by the stack VM.");
             var body = method.CilBody ?? throw new MissingMethodException($"No body for target: {Describe(method)}");
             var layout = GetOrCreateMethodLayout(method);
 
@@ -6325,16 +6329,13 @@ namespace Cnidaria.Cs
                 return true;
             }
 
-            if (rm.DeclaringType.Namespace == "System.Threading" &&
-                rm.DeclaringType.Name == "ObjectHeader" &&
-                !rm.HasThis &&
-                rm.IsStatic &&
-                rm.ParameterTypes.Length == 1 &&
-                totalArgs == 1 &&
-                IsVoidReturn(rm.ReturnType) &&
-                (rm.Name == "AcquireThinLock" || rm.Name == "Release"))
+            // One thread runs here, so every monitor is free and stays owned by it
+            if (RuntimeGcImports.Symbol(rm) is string import && import.StartsWith("RhpMonitor", StringComparison.Ordinal))
             {
-                PopSlot();
+                for (int i = 0; i < totalArgs; i++)
+                    PopSlot();
+                if (!IsVoidReturn(rm.ReturnType))
+                    PushSlot(new Slot(SlotKind.I4, import == "RhpMonitorWait" ? 0 : 1));
                 return true;
             }
             if (RuntimeTypeSystem.IsHardwareAccelerationQuery(rm))

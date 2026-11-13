@@ -18,6 +18,7 @@ namespace Cnidaria.Cs
         private readonly Dictionary<int, string> _sigKeyCache = new();
         private readonly Dictionary<int, CilMethodBody?> _cilBodies = new();
         private Dictionary<int, int>? _fieldRvaByRid;
+        private Dictionary<int, int>? _fieldLayoutByRid;
         private Dictionary<int, int>? _constantRidByParent;
         private readonly Dictionary<int, int> _enclosingByNestedRid = new();
         private readonly Dictionary<int, (string ns, string name)> _fullTypeNameCache = new();
@@ -43,6 +44,21 @@ namespace Cnidaria.Cs
                 }
             }
             return _fieldRvaByRid.TryGetValue(fieldRid, out int rva) ? rva : 0;
+        }
+
+        internal int GetFieldLayoutOffset(int fieldRid)
+        {
+            if (_fieldLayoutByRid is null)
+            {
+                _fieldLayoutByRid = new Dictionary<int, int>();
+                int count = Md.GetRowCount(MetadataTableKind.FieldLayout);
+                for (int rid = 1; rid <= count; rid++)
+                {
+                    var row = Md.GetFieldLayout(rid);
+                    _fieldLayoutByRid[row.FieldRid] = row.Offset;
+                }
+            }
+            return _fieldLayoutByRid.TryGetValue(fieldRid, out int offset) ? offset : throw new TypeLoadException($"Field {fieldRid} of an explicit layout type in {Name} has no offset.");
         }
 
         internal ReadOnlySpan<byte> GetConstantValue(int parentToken)
@@ -942,6 +958,9 @@ namespace Cnidaria.Cs
                 var ms = module.Md.GetMethodSpec(rid);
 
                 var genericMethod = ResolveMethodInMethodContext(module, ms.Method, methodContext);
+                // The instantiation binds the method type parameters, never the context method's own arguments
+                if (genericMethod.GenericMethodDefinition is RuntimeMethod definition && genericMethod.MethodGenericArguments.Length != 0)
+                    genericMethod = definition;
 
                 var sig = module.Md.GetBlob(ms.Instantiation);
                 var sr = new SigReader(sig);
@@ -1027,8 +1046,8 @@ namespace Cnidaria.Cs
                 var ctxOwnerArgs = methodContext.DeclaringType.GenericTypeArguments;
                 var ctxMethodArgs = methodContext.MethodGenericArguments;
 
-                // A closed instantiation such as S<int> referenced from inside S<T> names its own members
-                if (resolved.DeclaringType.GenericTypeDefinition is null || RuntimeTypeNames.ContainsGenericParameters(resolved.DeclaringType))
+                // Only a bare definition takes the receiver's instantiation, S<int> or Task<Task<T>> inside S<T> names its own members
+                if (resolved.DeclaringType.GenericTypeDefinition is null)
                     resolved = BindMethodToReceiver(resolved, methodContext.DeclaringType);
 
                 RuntimeType substitutedOwner = SubstituteRuntimeType(resolved.DeclaringType, ctxOwnerArgs, ctxMethodArgs);
@@ -1191,11 +1210,21 @@ namespace Cnidaria.Cs
 
             int offset = 0;
             int maxAlign = 1;
+            int threadOffset = 0;
+            int threadMaxAlign = 1;
 
             for (int i = 0; i < t.StaticFields.Length; i++)
             {
                 var f = t.StaticFields[i];
                 var (fs, fa) = GetStorageSizeAlign(f.FieldType);
+                if (f.IsThreadStatic)
+                {
+                    threadOffset = AlignUp(threadOffset, fa);
+                    f.Offset = threadOffset;
+                    threadOffset += fs;
+                    if (fa > threadMaxAlign) threadMaxAlign = fa;
+                    continue;
+                }
                 offset = AlignUp(offset, fa);
                 f.Offset = offset;
                 offset += fs;
@@ -1204,6 +1233,8 @@ namespace Cnidaria.Cs
 
             t.StaticAlign = maxAlign;
             t.StaticSize = AlignUp(offset, maxAlign);
+            t.ThreadStaticAlign = threadMaxAlign;
+            t.ThreadStaticSize = AlignUp(threadOffset, threadMaxAlign);
         }
         public RuntimeMethod GetMethodById(int methodId)
         {
@@ -1704,7 +1735,8 @@ namespace Cnidaria.Cs
                         IsBeforeFieldInit = (typeAttributes & System.Reflection.TypeAttributes.BeforeFieldInit) != 0,
                         IsFinal = kind is RuntimeTypeKind.Struct or RuntimeTypeKind.Enum ||
                             (typeAttributes & System.Reflection.TypeAttributes.Sealed) != 0,
-                        IsByRefLike = HasCustomAttribute(m, tok, "System.Runtime.CompilerServices", "IsByRefLikeAttribute")
+                        IsByRefLike = HasCustomAttribute(m, tok, "System.Runtime.CompilerServices", "IsByRefLikeAttribute"),
+                        IsExplicitLayout = (typeAttributes & System.Reflection.TypeAttributes.LayoutMask) == System.Reflection.TypeAttributes.ExplicitLayout,
                     };
                     rt.Loader = this;
                     rt.MethodsPending = true;
@@ -1813,6 +1845,7 @@ namespace Cnidaria.Cs
                             : ObjectHeaderSize;
 
                         int maxAlign = Target.PointerSize;
+                        int fieldBase = offset;
 
                         for (int i = 0; i < t.InstanceFields.Length; i++)
                         {
@@ -1824,9 +1857,17 @@ namespace Cnidaria.Cs
                                 continue;
                             }
                             var (fs, fa) = GetStorageSizeAlign(f.FieldType);
-                            offset = AlignUp(offset, fa);
-                            f.Offset = offset;
-                            offset += fs;
+                            if (f.ExplicitOffset >= 0)
+                            {
+                                f.Offset = checked(fieldBase + f.ExplicitOffset);
+                                offset = Math.Max(offset, checked(f.Offset + fs));
+                            }
+                            else
+                            {
+                                offset = AlignUp(offset, fa);
+                                f.Offset = offset;
+                                offset += fs;
+                            }
                             if (fa > maxAlign) maxAlign = fa;
                         }
                         t.InstanceSize = AlignUp(offset, maxAlign);
@@ -1853,13 +1894,13 @@ namespace Cnidaria.Cs
                                 ? t.InlineArrayLength
                                 : 1;
 
-                            offset = AlignUp(offset, fa);
-                            f.Offset = offset;
+                            int fieldOffset = f.ExplicitOffset >= 0 ? f.ExplicitOffset : AlignUp(offset, fa);
+                            f.Offset = fieldOffset;
 
                             for (int elementIndex = 0; elementIndex < repeat; elementIndex++)
-                                AppendGcPointerOffsets(gcOffsets, offset + elementIndex * fs, f.FieldType);
+                                AppendGcPointerOffsets(gcOffsets, fieldOffset + elementIndex * fs, f.FieldType);
 
-                            offset += checked(fs * repeat);
+                            offset = Math.Max(offset, checked(fieldOffset + fs * repeat));
                             if (fa > maxAlign) maxAlign = fa;
                         }
 
@@ -1869,7 +1910,7 @@ namespace Cnidaria.Cs
                         t.AlignOf = maxAlign;
                         t.InstanceSize = size;
                         gcOffsets.Sort();
-                        t.GcPointerOffsets = gcOffsets.ToArray();
+                        t.GcPointerOffsets = t.IsExplicitLayout ? gcOffsets.Distinct().ToArray() : gcOffsets.ToArray();
                         t.ContainsGcPointers = t.GcPointerOffsets.Length != 0;
                         LayoutStaticFields(t);
                         return;
@@ -2125,6 +2166,16 @@ namespace Cnidaria.Cs
         }
 
         internal bool HasFinalizer(RuntimeType type) => GetFinalizer(type) is not null;
+
+        internal RuntimeMethod GetClassConstructorRunnerMethod()
+        {
+            RuntimeType helpers = GetRequiredNamedType("std", "System.Runtime.CompilerServices", "RuntimeHelpers");
+            EnsureConstructedMembers(helpers);
+            foreach (RuntimeMethod method in helpers.Methods)
+                if (method.Name == "RunClassConstructorCore")
+                    return method;
+            throw new MissingMethodException("RuntimeHelpers.RunClassConstructorCore is missing from the core library.");
+        }
 
         internal RuntimeMethod GetFinalizerDrainMethod()
         {
@@ -3002,7 +3053,7 @@ namespace Cnidaria.Cs
         }
         internal RuntimeField ResolveFieldInMethodContext(RuntimeModule contextModule, int fieldToken, RuntimeMethod? methodContext)
         {
-            if (methodContext is null)
+            if (methodContext is null || MetadataToken.Table(fieldToken) == RuntimeFieldReferenceTable)
                 return ResolveField(contextModule, fieldToken);
 
             var key = (contextModule.Name, fieldToken, methodContext.MethodId);
@@ -3130,6 +3181,9 @@ namespace Cnidaria.Cs
         {
             int table = MetadataToken.Table(fieldToken);
             int rid = MetadataToken.Rid(fieldToken);
+
+            if (table == RuntimeFieldReferenceTable)
+                return _stubFields[rid];
 
             if (table == MetadataToken.FieldDef)
             {
@@ -3458,6 +3512,9 @@ namespace Cnidaria.Cs
                 RuntimeType fieldType = ReadTypeSig(m, ref r);
 
                 var rf = new RuntimeField(_nextFieldId++, declaringType, name, fieldType, isStatic);
+                if (!isStatic && declaringType.IsExplicitLayout)
+                    rf.ExplicitOffset = m.GetFieldLayoutOffset(rid);
+                rf.IsThreadStatic = isStatic && HasCustomAttribute(m, fieldTok, "System", "ThreadStaticAttribute");
                 if ((attrs & System.Reflection.FieldAttributes.HasFieldRVA) != 0)
                 {
                     rf.RvaModule = m;
@@ -3850,6 +3907,9 @@ namespace Cnidaria.Cs
             int table = MetadataToken.Table(typeToken);
             int rid = MetadataToken.Rid(typeToken);
 
+            if (table == RuntimeTypeReferenceTable)
+                return _typeById[rid];
+
             if (table == MetadataToken.TypeDef)
                 return _typeCache[(contextModule.Name, typeToken)];
 
@@ -4229,6 +4289,7 @@ namespace Cnidaria.Cs
             t.IsBeforeFieldInit = genericDef.IsBeforeFieldInit;
             t.IsFinal = genericDef.IsFinal;
             t.IsByRefLike = genericDef.IsByRefLike;
+            t.IsExplicitLayout = genericDef.IsExplicitLayout;
 
             _constructedTypes[key] = t;
             _typeById[t.TypeId] = t;
@@ -4287,7 +4348,7 @@ namespace Cnidaria.Cs
                 {
                     var src = genericDef.InstanceFields[i];
                     var ft = SubstituteRuntimeType(src.FieldType, typeArgs);
-                    inst[i] = new RuntimeField(_nextFieldId++, t, src.Name, ft, isStatic: false);
+                    inst[i] = new RuntimeField(_nextFieldId++, t, src.Name, ft, isStatic: false) { ExplicitOffset = src.ExplicitOffset };
                     if (ReferenceEquals(src, genericDef.InlineArrayElementField))
                         t.InlineArrayElementField = inst[i];
                 }
@@ -4296,7 +4357,7 @@ namespace Cnidaria.Cs
                 {
                     var src = genericDef.StaticFields[i];
                     var ft = SubstituteRuntimeType(src.FieldType, typeArgs);
-                    stat[i] = new RuntimeField(_nextFieldId++, t, src.Name, ft, isStatic: true);
+                    stat[i] = new RuntimeField(_nextFieldId++, t, src.Name, ft, isStatic: true) { IsThreadStatic = src.IsThreadStatic };
                 }
 
                 t.InstanceFields = inst;
@@ -4364,7 +4425,7 @@ namespace Cnidaria.Cs
         }
         internal RuntimeType ResolveTypeInMethodContext(RuntimeModule contextModule, int typeToken, RuntimeMethod? methodContext)
         {
-            if (methodContext is null)
+            if (methodContext is null || MetadataToken.Table(typeToken) == RuntimeTypeReferenceTable)
                 return ResolveType(contextModule, typeToken);
 
             var key = (contextModule.Name, typeToken, methodContext.MethodId);
@@ -4409,6 +4470,8 @@ namespace Cnidaria.Cs
         {
             if (signatureToken == 0)
                 return Array.Empty<RuntimeType>();
+            if (MetadataToken.Table(signatureToken) == RuntimeLocalSignatureTable)
+                return _stubLocalSignatures[MetadataToken.Rid(signatureToken)];
             var row = contextModule.Md.GetStandAloneSig(MetadataToken.Rid(signatureToken));
             var reader = new SigReader(contextModule.Md.GetBlob(row.Signature));
             if (reader.ReadByte() != 0x07)
@@ -4622,6 +4685,466 @@ namespace Cnidaria.Cs
             }
 
             throw new NotSupportedException();
+        }
+
+        // Tables no metadata uses, so a generated body can name a type, a field or its locals without a signature
+        internal const int RuntimeTypeReferenceTable = 0x7D000000;
+        private const int RuntimeFieldReferenceTable = 0x7C000000;
+        private const int RuntimeLocalSignatureTable = 0x7B000000;
+        private const string CompilerServices = "System.Runtime.CompilerServices";
+
+        private readonly Dictionary<int, RuntimeMethod> _asyncVariants = new();
+        private readonly Dictionary<int, RuntimeMethod> _asyncResumptionStubs = new();
+        private readonly Dictionary<int, RuntimeMethod> _asyncResumeInfoAccessors = new();
+        private readonly Dictionary<string, RuntimeType> _continuationTypes = new(StringComparer.Ordinal);
+        private readonly Dictionary<int, RuntimeField> _stubFields = new();
+        private readonly List<RuntimeType[]> _stubLocalSignatures = new() { Array.Empty<RuntimeType>() };
+
+        internal static bool IsTaskOrValueTask(RuntimeType type)
+        {
+            RuntimeType definition = type.GenericTypeDefinition ?? type;
+            return definition.Namespace == "System.Threading.Tasks" &&
+                definition.Name is "Task" or "Task`1" or "ValueTask" or "ValueTask`1";
+        }
+
+        internal static bool HasCallableAsyncVariant(RuntimeMethod method)
+        {
+            if (method.IsAsyncVariant || method.AsyncResumptionTarget is not null || !IsTaskOrValueTask(method.ReturnType) ||
+                method.IsAbstract || method.IsExtern || method.HasInternalCall || method.MethodDefToken == 0 || method.BodyModule is null)
+            {
+                return false;
+            }
+
+            for (RuntimeType? t = method.DeclaringType.BaseType; t is not null; t = t.BaseType)
+            {
+                if (t.Namespace == "System" && t.Name == "MulticastDelegate")
+                    return false;
+            }
+            return true;
+        }
+
+        internal RuntimeMethod GetAsyncVariant(RuntimeMethod method)
+        {
+            if (_asyncVariants.TryGetValue(method.MethodId, out RuntimeMethod? variant))
+                return variant;
+
+            RuntimeType returnType = method.ReturnType.GenericTypeArguments.Length == 1
+                ? method.ReturnType.GenericTypeArguments[0]
+                : FindPrimitive(RuntimePrimitiveKind.Void);
+            const System.Reflection.MethodAttributes slotFlags = System.Reflection.MethodAttributes.Virtual |
+                System.Reflection.MethodAttributes.Abstract | System.Reflection.MethodAttributes.NewSlot | System.Reflection.MethodAttributes.Final;
+            variant = new RuntimeMethod(
+                _nextMethodId++,
+                method.DeclaringType,
+                method.Name,
+                returnType,
+                method.ParameterTypes,
+                method.HasThis,
+                isVirtual: false,
+                method.IsStatic,
+                isNewSlot: false,
+                isFinal: false,
+                (ushort)(method.Flags & ~(ushort)slotFlags),
+                method.ImplFlags)
+            {
+                BodyModule = method.BodyModule,
+                MethodDefToken = method.MethodDefToken,
+                GenericMethodDefinition = method.GenericMethodDefinition,
+                GenericArity = method.GenericArity,
+                MethodGenericArguments = method.MethodGenericArguments,
+                AsyncVariantTarget = method,
+            };
+            _methodById[variant.MethodId] = variant;
+            _asyncVariants.Add(method.MethodId, variant);
+            return variant;
+        }
+
+        internal RuntimeType AsyncHelpersType => FindRequired("std", CompilerServices, "AsyncHelpers");
+        internal RuntimeType ContinuationType => FindRequired("std", CompilerServices, "Continuation");
+
+        internal RuntimeMethod GetAsyncHelper(string name, int parameterCount, int genericArity = 0)
+            => FindMethod(AsyncHelpersType, name, parameterCount, genericArity);
+
+        internal RuntimeField GetContinuationField(string name)
+            => FindInstanceField(ContinuationType, name);
+
+        internal RuntimeMethod GetTransparentAwait(RuntimeType taskType)
+        {
+            RuntimeType definition = taskType.GenericTypeDefinition ?? taskType;
+            foreach (RuntimeMethod method in AsyncHelpersType.Methods)
+            {
+                if (method.Name != "TransparentAwait" || method.ParameterTypes.Length != 1 || method.GenericArity != taskType.GenericTypeArguments.Length)
+                    continue;
+                RuntimeType parameter = method.ParameterTypes[0];
+                if (!ReferenceEquals(parameter.GenericTypeDefinition ?? parameter, definition))
+                    continue;
+                return method.GenericArity == 0 ? method : GetOrCreateConstructedMethod(method, taskType.GenericTypeArguments);
+            }
+            throw new MissingMethodException($"AsyncHelpers.TransparentAwait for {taskType.Name} was not found.");
+        }
+
+        // The data slots of a continuation follow its base fields, an object slot is reported to the GC and the rest hold raw data
+        internal RuntimeType GetContinuationType(bool[] objectSlots)
+        {
+            var key = new StringBuilder("Continuation_", 16 + objectSlots.Length);
+            foreach (bool slot in objectSlots)
+                key.Append(slot ? 'o' : 'd');
+            string name = key.ToString();
+            if (_continuationTypes.TryGetValue(name, out RuntimeType? cached))
+                return cached;
+
+            RuntimeType baseType = ContinuationType;
+            EnsureLayout(baseType);
+            var type = new RuntimeType(_nextTypeId++, RuntimeTypeKind.Class, baseType.AssemblyName, baseType.Namespace, name)
+            {
+                BaseType = baseType,
+                IsFinal = true,
+                IsBeforeFieldInit = true,
+                Loader = this,
+            };
+            RuntimeType nativeInt = FindPrimitive(RuntimePrimitiveKind.NativeInt);
+            var fields = new RuntimeField[objectSlots.Length];
+            for (int i = 0; i < fields.Length; i++)
+                fields[i] = new RuntimeField(_nextFieldId++, type, "d" + i.ToString(System.Globalization.CultureInfo.InvariantCulture), objectSlots[i] ? SystemObject : nativeInt, isStatic: false);
+            type.InstanceFields = fields;
+            _typeById[type.TypeId] = type;
+            EnsureLayout(type);
+            _continuationTypes.Add(name, type);
+            return type;
+        }
+
+        internal CilMethodBody GetTaskReturningThunkBody(RuntimeMethod method)
+        {
+            if (method.GeneratedBody is CilMethodBody existing)
+                return existing;
+
+            RuntimeMethod variant = GetAsyncVariant(method);
+            RuntimeType returnType = method.ReturnType;
+            bool isValueTask = returnType.IsValueType;
+            RuntimeType? logicalType = returnType.GenericTypeArguments.Length == 1 ? returnType.GenericTypeArguments[0] : null;
+            RuntimeType helpers = AsyncHelpersType;
+            RuntimeType stackStateType = FindRequired("std", CompilerServices, "AsyncHelpers+RuntimeAsyncStackState");
+            RuntimeType awaitStateType = FindRequired("std", CompilerServices, "AsyncHelpers+RuntimeAsyncAwaitState");
+            RuntimeType exceptionType = FindRequired("std", "System", "Exception");
+            RuntimeType taskDefinition = FindRequired("std", "System.Threading.Tasks", isValueTask ? "ValueTask" : "Task");
+
+            var il = new CilStubBuilder(this);
+            int logicalLocal = logicalType is null ? -1 : il.NewLocal(logicalType);
+            int taskLocal = il.NewLocal(returnType);
+            int stackStateLocal = il.NewLocal(stackStateType);
+            int awaitStateLocal = il.NewLocal(GetByRefType(awaitStateType));
+
+            il.Emit(ILOpCode.Ldsflda, il.Token(FindStaticField(helpers, "t_runtimeAsyncAwaitState")), 0, 1);
+            il.Emit(ILOpCode.Stloc, awaitStateLocal, 1, 0);
+            il.Emit(ILOpCode.Ldloc, awaitStateLocal, 0, 1);
+            il.Emit(ILOpCode.Ldloca, stackStateLocal, 0, 1);
+            il.Emit(ILOpCode.Conv_U, 0, 1, 1);
+            il.Call(FindMethod(awaitStateType, "Push", 1));
+
+            int finallyTryStart = il.Pc;
+            il.Emit(ILOpCode.Nop, 0, 0, 0);
+            int catchTryStart = il.Pc;
+            int argumentCount = method.ParameterTypes.Length + (method.HasThis ? 1 : 0);
+            for (int i = 0; i < argumentCount; i++)
+                il.Emit(ILOpCode.Ldarg, i, 0, 1);
+            il.Call(variant);
+            if (logicalLocal >= 0)
+                il.Emit(ILOpCode.Stloc, logicalLocal, 1, 0);
+            il.Call(GetAsyncHelper("AsyncCallContinuation", 0));
+            int toFinished = il.EmitBranch(ILOpCode.Brfalse, 1);
+            int toSuspended = il.EmitBranch(ILOpCode.Leave, 0);
+            il.PatchBranch(toFinished, il.Pc);
+            if (logicalLocal >= 0)
+            {
+                il.Emit(ILOpCode.Ldloc, logicalLocal, 0, 1);
+                il.Call(GetOrCreateConstructedMethod(FindMethod(taskDefinition, "FromResult", 1, 1), new[] { logicalType! }));
+            }
+            else
+            {
+                il.Call(FindMethod(taskDefinition, "get_CompletedTask", 0));
+            }
+            il.Emit(ILOpCode.Stloc, taskLocal, 1, 0);
+            var returnLeaves = new List<int> { il.EmitBranch(ILOpCode.Leave, 0) };
+
+            int catchHandlerStart = il.Pc;
+            il.PushHandlerValue();
+            il.Call(InstantiateIfGeneric(FindMethod(helpers, isValueTask ? "ValueTaskFromException" : "TaskFromException", 1, logicalType is null ? 0 : 1), logicalType));
+            il.Emit(ILOpCode.Stloc, taskLocal, 1, 0);
+            returnLeaves.Add(il.EmitBranch(ILOpCode.Leave, 0));
+
+            int suspended = il.Pc;
+            il.PatchBranch(toSuspended, suspended);
+            il.Emit(ILOpCode.Ldloc, awaitStateLocal, 0, 1);
+            il.Call(InstantiateIfGeneric(FindMethod(helpers, isValueTask ? "CreateRuntimeAsyncValueTask" : "CreateRuntimeAsyncTask", 1, logicalType is null ? 0 : 1), logicalType));
+            il.Emit(ILOpCode.Stloc, taskLocal, 1, 0);
+            returnLeaves.Add(il.EmitBranch(ILOpCode.Leave, 0));
+
+            int finallyHandlerStart = il.Pc;
+            il.Emit(ILOpCode.Ldloc, awaitStateLocal, 0, 1);
+            il.Call(FindMethod(awaitStateType, "Pop", 0));
+            il.Emit(ILOpCode.Endfinally, 0, 0, 0);
+
+            int returnLabel = il.Pc;
+            foreach (int leave in returnLeaves)
+                il.PatchBranch(leave, returnLabel);
+            il.Emit(ILOpCode.Ldloc, taskLocal, 0, 1);
+            il.Emit(ILOpCode.Ret, 0, 1, 0);
+
+            il.AddClause(new CilExceptionClause(CilExceptionClauseKind.Catch, catchTryStart, catchHandlerStart, catchHandlerStart, suspended, il.Token(exceptionType), -1));
+            il.AddClause(new CilExceptionClause(CilExceptionClauseKind.Finally, finallyTryStart, finallyHandlerStart, finallyHandlerStart, returnLabel, 0, -1));
+            method.GeneratedBody = il.Build();
+            return method.GeneratedBody;
+        }
+
+        // The dispatcher resumes a continuation by calling this with it, and the stub stores the result it then returns to the next continuation
+        internal RuntimeMethod GetAsyncResumptionStub(RuntimeMethod target)
+        {
+            if (_asyncResumptionStubs.TryGetValue(target.MethodId, out RuntimeMethod? stub))
+                return stub;
+
+            RuntimeType byteRef = GetByRefType(FindPrimitive(RuntimePrimitiveKind.UInt8));
+            stub = CreateStubMethod("<resume>" + target.Name, ContinuationType, new[] { ContinuationType, byteRef });
+            stub.AsyncResumptionTarget = target;
+
+            var il = new CilStubBuilder(this);
+            RuntimeType voidType = FindPrimitive(RuntimePrimitiveKind.Void);
+            bool returnsVoid = ReferenceEquals(target.ReturnType, voidType);
+            int resultLocal = returnsVoid ? -1 : il.NewLocal(target.ReturnType);
+            int continuationLocal = il.NewLocal(ContinuationType);
+
+            if (target.HasThis)
+            {
+                if (target.DeclaringType.IsValueType)
+                {
+                    il.Emit(ILOpCode.Ldc_I4, 0, 0, 1);
+                    il.Emit(ILOpCode.Conv_U, 0, 1, 1);
+                }
+                else
+                {
+                    il.Emit(ILOpCode.Ldnull, 0, 0, 1);
+                }
+            }
+            il.Emit(ILOpCode.Ldarg, 0, 0, 1);
+            il.Call(FindMethod(FindRequired("std", CompilerServices, "RuntimeHelpers"), "SetNextCallAsyncContinuation", 1));
+            foreach (RuntimeType parameter in target.ParameterTypes)
+            {
+                if (parameter.Kind == RuntimeTypeKind.ByRef)
+                {
+                    il.Emit(ILOpCode.Ldc_I4, 0, 0, 1);
+                    il.Emit(ILOpCode.Conv_U, 0, 1, 1);
+                    continue;
+                }
+
+                int local = il.NewLocal(parameter);
+                il.Emit(ILOpCode.Ldloca, local, 0, 1);
+                il.Emit(ILOpCode.Initobj, il.Token(parameter), 1, 0);
+                il.Emit(ILOpCode.Ldloc, local, 0, 1);
+            }
+            il.Call(target);
+            if (!returnsVoid)
+                il.Emit(ILOpCode.Stloc, resultLocal, 1, 0);
+            il.Call(GetAsyncHelper("AsyncCallContinuation", 0));
+            il.Emit(ILOpCode.Stloc, continuationLocal, 1, 0);
+            if (!returnsVoid)
+            {
+                il.Emit(ILOpCode.Ldloc, continuationLocal, 0, 1);
+                int toDone = il.EmitBranch(ILOpCode.Brtrue, 1);
+                il.Emit(ILOpCode.Ldarg, 1, 0, 1);
+                il.Emit(ILOpCode.Ldloc, resultLocal, 0, 1);
+                il.Emit(ILOpCode.Stobj, il.Token(target.ReturnType), 2, 0);
+                il.PatchBranch(toDone, il.Pc);
+            }
+            il.Emit(ILOpCode.Ldloc, continuationLocal, 0, 1);
+            il.Emit(ILOpCode.Ret, 0, 1, 0);
+
+            AttachGeneratedBody(stub, il.Build());
+            _asyncResumptionStubs.Add(target.MethodId, stub);
+            return stub;
+        }
+
+        // The resume info a continuation points to lives in a static of its own, filled in by the first suspension
+        internal RuntimeMethod GetAsyncResumeInfoAccessor(RuntimeMethod target)
+        {
+            if (_asyncResumeInfoAccessors.TryGetValue(target.MethodId, out RuntimeMethod? accessor))
+                return accessor;
+
+            RuntimeType resumeInfoType = FindRequired("std", CompilerServices, "ResumeInfo");
+            var holder = new RuntimeType(_nextTypeId++, RuntimeTypeKind.Class, SystemObject.AssemblyName, CompilerServices,
+                "<ResumeInfo>" + target.MethodId.ToString(System.Globalization.CultureInfo.InvariantCulture))
+            {
+                BaseType = SystemObject,
+                IsFinal = true,
+                IsBeforeFieldInit = true,
+                Loader = this,
+            };
+            var info = new RuntimeField(_nextFieldId++, holder, "Info", resumeInfoType, isStatic: true);
+            holder.StaticFields = new[] { info };
+            _typeById[holder.TypeId] = holder;
+            EnsureLayout(holder);
+
+            accessor = CreateStubMethod("<resumeinfo>" + target.Name, GetPointerType(resumeInfoType), Array.Empty<RuntimeType>());
+            RuntimeField resume = FindInstanceField(resumeInfoType, "Resume");
+            var il = new CilStubBuilder(this);
+            il.Emit(ILOpCode.Ldsflda, il.Token(info), 0, 1);
+            il.Emit(ILOpCode.Ldfld, il.Token(resume), 1, 1);
+            int toDone = il.EmitBranch(ILOpCode.Brtrue, 1);
+            il.Emit(ILOpCode.Ldsflda, il.Token(info), 0, 1);
+            il.Emit(ILOpCode.Ldftn, il.Token(GetAsyncResumptionStub(target)), 0, 1);
+            il.Emit(ILOpCode.Stfld, il.Token(resume), 2, 0);
+            il.PatchBranch(toDone, il.Pc);
+            il.Emit(ILOpCode.Ldsflda, il.Token(info), 0, 1);
+            il.Emit(ILOpCode.Conv_U, 0, 1, 1);
+            il.Emit(ILOpCode.Ret, 0, 1, 0);
+
+            AttachGeneratedBody(accessor, il.Build());
+            _asyncResumeInfoAccessors.Add(target.MethodId, accessor);
+            return accessor;
+        }
+
+        private RuntimeMethod CreateStubMethod(string name, RuntimeType returnType, RuntimeType[] parameterTypes)
+        {
+            var method = new RuntimeMethod(_nextMethodId++, SystemObject, name, returnType, parameterTypes,
+                hasThis: false, isVirtual: false, isStatic: true, isNewSlot: false, isFinal: false,
+                flags: (ushort)(System.Reflection.MethodAttributes.Public | System.Reflection.MethodAttributes.Static),
+                implFlags: MetadataFlagBits.NoInlining);
+            _methodById[method.MethodId] = method;
+            return method;
+        }
+
+        private void AttachGeneratedBody(RuntimeMethod method, CilMethodBody body)
+        {
+            RuntimeModule module = _modules.TryGetValue(SystemObject.AssemblyName, out RuntimeModule? coreModule)
+                ? coreModule
+                : throw new InvalidOperationException("The core library module is not loaded.");
+            method.BodyModule = module;
+            method.GeneratedBody = body;
+        }
+
+        private RuntimeMethod InstantiateIfGeneric(RuntimeMethod method, RuntimeType? argument)
+            => argument is null ? method : GetOrCreateConstructedMethod(method, new[] { argument });
+
+        internal RuntimeMethod FindMethod(RuntimeType type, string name, int parameterCount, int genericArity = 0)
+        {
+            EnsureConstructedMembers(type);
+            foreach (RuntimeMethod method in type.Methods)
+            {
+                if (method.Name == name && method.ParameterTypes.Length == parameterCount && method.GenericArity == genericArity)
+                    return method;
+            }
+            throw new MissingMethodException($"{type.Namespace}.{type.Name}.{name} with {parameterCount} parameters was not found.");
+        }
+
+        private static RuntimeField FindStaticField(RuntimeType type, string name)
+        {
+            foreach (RuntimeField field in type.StaticFields)
+            {
+                if (field.Name == name)
+                    return field;
+            }
+            throw new MissingFieldException($"{type.Namespace}.{type.Name}.{name} was not found.");
+        }
+
+        private static RuntimeField FindInstanceField(RuntimeType type, string name)
+        {
+            for (RuntimeType? t = type; t is not null; t = t.BaseType)
+            {
+                foreach (RuntimeField field in t.InstanceFields)
+                {
+                    if (field.Name == name)
+                        return field;
+                }
+            }
+            throw new MissingFieldException($"{type.Namespace}.{type.Name}.{name} was not found.");
+        }
+
+        private sealed class CilStubBuilder
+        {
+            private readonly RuntimeTypeSystem _rts;
+            private readonly List<CilInstruction> _instructions = new();
+            private readonly List<short> _pops = new();
+            private readonly List<short> _pushes = new();
+            private readonly List<RuntimeType> _locals = new();
+            private readonly ImmutableArray<CilExceptionClause>.Builder _clauses = ImmutableArray.CreateBuilder<CilExceptionClause>();
+            private int _depth;
+            private int _maxDepth;
+
+            public CilStubBuilder(RuntimeTypeSystem rts) => _rts = rts;
+
+            public int Pc => _instructions.Count;
+
+            public int NewLocal(RuntimeType type)
+            {
+                _locals.Add(type);
+                return _locals.Count - 1;
+            }
+
+            public int Token(RuntimeType type) => MetadataToken.Make(RuntimeTypeReferenceTable, type.TypeId);
+
+            public int Token(RuntimeMethod method) => MetadataToken.Make(RuntimeMethodReferenceTable, method.MethodId);
+
+            public int Token(RuntimeField field)
+            {
+                _rts._stubFields[field.FieldId] = field;
+                return MetadataToken.Make(RuntimeFieldReferenceTable, field.FieldId);
+            }
+
+            public void Emit(ILOpCode op, long operand, int pops, int pushes)
+            {
+                _instructions.Add(new CilInstruction(op, CilPrefix.None, _instructions.Count, operand, 0));
+                _pops.Add((short)pops);
+                _pushes.Add((short)pushes);
+                _depth += pushes - pops;
+                _maxDepth = Math.Max(_maxDepth, _depth);
+                if (op is ILOpCode.Leave or ILOpCode.Endfinally or ILOpCode.Ret)
+                    _depth = 0;
+            }
+
+            public void Call(RuntimeMethod method)
+            {
+                bool returnsValue = !ReferenceEquals(method.ReturnType, _rts.FindPrimitive(RuntimePrimitiveKind.Void));
+                Emit(ILOpCode.Call, Token(method), method.ParameterTypes.Length + (method.HasThis ? 1 : 0), returnsValue ? 1 : 0);
+            }
+
+            public int EmitBranch(ILOpCode op, int pops)
+            {
+                int pc = Pc;
+                Emit(op, -1, pops, 0);
+                return pc;
+            }
+
+            public void PatchBranch(int branchPc, int targetPc)
+            {
+                CilInstruction branch = _instructions[branchPc];
+                _instructions[branchPc] = new CilInstruction(branch.Op, branch.Prefixes, branch.Offset, targetPc, branch.ConstrainedToken);
+            }
+
+            public void PushHandlerValue()
+            {
+                _depth = 1;
+                _maxDepth = Math.Max(_maxDepth, 1);
+            }
+
+            public void AddClause(CilExceptionClause clause) => _clauses.Add(clause);
+
+            public CilMethodBody Build()
+            {
+                int signature = 0;
+                if (_locals.Count != 0)
+                {
+                    _rts._stubLocalSignatures.Add(_locals.ToArray());
+                    signature = MetadataToken.Make(RuntimeLocalSignatureTable, _rts._stubLocalSignatures.Count - 1);
+                }
+
+                var body = new CilMethodBody(
+                    _instructions.ToImmutableArray(),
+                    ImmutableArray<int>.Empty,
+                    _clauses.ToImmutable(),
+                    Math.Max(1, _maxDepth),
+                    initLocals: true,
+                    signature);
+                body.SetStackEffects(_pops.ToArray(), _pushes.ToArray());
+                return body;
+            }
         }
     }
 
@@ -4919,6 +5442,7 @@ namespace Cnidaria.Cs
         public bool IsBeforeFieldInit { get; internal set; }
         public bool IsFinal { get; internal set; }
         public bool IsByRefLike { get; internal set; }
+        internal bool IsExplicitLayout { get; set; }
         internal bool IsFlagsEnum { get; set; }
         internal RuntimeEnumLiteral[] EnumLiterals { get; set; } = Array.Empty<RuntimeEnumLiteral>();
 
@@ -4945,6 +5469,8 @@ namespace Cnidaria.Cs
         public int AlignOf { get; internal set; }
         public int StaticSize { get; internal set; }
         public int StaticAlign { get; internal set; } = 1;
+        public int ThreadStaticSize { get; internal set; }
+        public int ThreadStaticAlign { get; internal set; } = 1;
         public int InstanceSize { get; internal set; }
         public bool ContainsGcPointers { get; internal set; }
         public int[] GcPointerOffsets { get; internal set; } = Array.Empty<int>();
@@ -5011,7 +5537,9 @@ namespace Cnidaria.Cs
         public string Name { get; }
         public RuntimeType FieldType { get; }
         public bool IsStatic { get; }
+        public bool IsThreadStatic { get; internal set; }
         public int Offset { get; internal set; }
+        internal int ExplicitOffset { get; set; } = -1;
         internal RuntimeModule? RvaModule { get; set; }
         internal int Rva { get; set; }
         public RuntimeField(int fieldId, RuntimeType declType, string name, RuntimeType fieldType, bool isStatic)
@@ -5063,10 +5591,20 @@ namespace Cnidaria.Cs
         public int VTableSlot { get; internal set; } = -1;
         public RuntimeModule? BodyModule { get; internal set; }
         internal int MethodDefToken { get; set; }
-        // The IL of a runtime async method would misbehave as a plain method: it returns the result, not the task
-        internal CilMethodBody? CilBody => (ImplFlags & MetadataFlagBits.Async) != 0
-            ? throw new NotSupportedException($"Runtime async method '{DeclaringType.Name}.{Name}' is not supported by the backends yet.")
-            : MethodDefToken == 0 ? null : BodyModule?.GetCilBody(MethodDefToken);
+        internal bool IsRuntimeAsync => (ImplFlags & MetadataFlagBits.Async) != 0;
+        // Set on the async calling convention entry point of the Task returning method it names
+        internal RuntimeMethod? AsyncVariantTarget { get; set; }
+        internal bool IsAsyncVariant => AsyncVariantTarget is not null;
+        internal RuntimeMethod? AsyncResumptionTarget { get; set; }
+        internal bool IsAsyncCall => IsAsyncVariant || (IsRuntimeAsync && !RuntimeTypeSystem.IsTaskOrValueTask(ReturnType));
+        internal bool RequiresSaveRestoreOfAsyncContexts => AsyncVariantTarget is RuntimeMethod target && target.IsRuntimeAsync;
+        internal bool IsAsyncVersion => AsyncVariantTarget is RuntimeMethod target && !target.IsRuntimeAsync;
+        internal CilMethodBody? GeneratedBody { get; set; }
+        // A runtime async Task returning method runs its async variant through a thunk, its own IL returns the result
+        internal CilMethodBody? CilBody => GeneratedBody ??
+            (IsRuntimeAsync && !IsAsyncVariant && RuntimeTypeSystem.IsTaskOrValueTask(ReturnType)
+                ? DeclaringType.Loader!.GetTaskReturningThunkBody(this)
+                : MethodDefToken == 0 ? null : BodyModule?.GetCilBody(MethodDefToken));
         public RuntimeMethod? GenericMethodDefinition { get; internal set; }
         internal RuntimeType[] MethodGenericArguments { get; set; } = Array.Empty<RuntimeType>();
         public int GenericArity { get; internal set; }

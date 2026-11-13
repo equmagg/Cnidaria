@@ -2301,6 +2301,18 @@ namespace Cnidaria.Cs
 
             private void EmitReturn(GenTree instruction, GenTree source)
             {
+                MachineRegister continuation = RegisterInfo.AsyncContinuationRegister(_method.Target);
+                if ((source.Flags & GenTreeFlags.AsyncSuspend) != 0)
+                {
+                    EmitRegisterMove(continuation, RequireUseRegister(instruction, 0), source.Type, GenStackKind.Ref, RegisterClass.General);
+                    _asm.LiNull(MachineRegisters.ReturnValue0);
+                    _asm.RetVoid();
+                    return;
+                }
+
+                if (_method.RuntimeMethod.IsAsyncCall)
+                    _asm.LiNull(continuation);
+
                 if (instruction.Uses.Length == 0)
                 {
                     if (source.Operands.Length != 0)
@@ -2672,13 +2684,21 @@ namespace Cnidaria.Cs
                         case RuntimeIntrinsicId.InteropSys:
                         case RuntimeIntrinsicId.MemoryBarrier:
                             {
-                                CallFlags intrinsicFlags = BuildCallFlags(method, Op.CallInternal) & ~CallFlags.GcSafePoint;
+                                CallFlags intrinsicFlags = BuildCallFlags(method, Op.CallInternal);
+                                if (intrinsic.IsNoGcSafePoint)
+                                    intrinsicFlags &= ~CallFlags.GcSafePoint;
+                                else
+                                    EmitCallGcSafePoint(instruction);
                                 _asm.Emit(InstrDesc.Call(Op.CallInternal, method.MethodId, intrinsicFlags));
                                 return;
                             }
                         case RuntimeIntrinsicId.VolatileRead:
                         case RuntimeIntrinsicId.VolatileWrite:
                             // The register VM runs one instruction at a time, so the ordering needs no instruction
+                            return;
+                        case RuntimeIntrinsicId.AsyncCallContinuation:
+                            EmitRegisterMove(RequireResultRegister(instruction), RegisterInfo.AsyncContinuationRegister(_method.Target), source.Type,
+                                GenStackKind.Ref, RegisterClass.General);
                             return;
                         default:
                             throw Unsupported(instruction, $"unsupported runtime intrinsic {intrinsic.Id}");
@@ -3077,7 +3097,7 @@ namespace Cnidaria.Cs
                 if (instruction.TreeKind == GenTreeKind.StaticFieldAddr)
                 {
                     MachineRegister result = RequireResultRegister(instruction);
-                    EmitStaticFieldAddress(result, declaringTypeLayout, fieldOffset);
+                    EmitStaticFieldAddress(result, declaringTypeLayout, fieldOffset, field.IsThreadStatic);
                     return;
                 }
 
@@ -3085,7 +3105,7 @@ namespace Cnidaria.Cs
                 {
                     ushort aux = MemoryAuxForRegisterBase(field.FieldType, StaticFieldStoreInstructionFlags(field.FieldType));
                     MachineRegister address = PickScratchRegister(instruction, RegisterClass.General, MachineRegisters.BackendScratch);
-                    EmitStaticBase(address, declaringTypeLayout);
+                    EmitStaticBase(address, declaringTypeLayout, field.IsThreadStatic);
 
                     if (TryEmitDefaultStaticFieldStore(instruction, source, field, declaringTypeLayout, address, fieldOffset, fieldSize, aux))
                         return;
@@ -3108,7 +3128,7 @@ namespace Cnidaria.Cs
                         }
 
                         MachineRegister fieldAddress = PickScratchRegister(instruction, RegisterClass.General, address);
-                        EmitStaticFieldAddress(fieldAddress, declaringTypeLayout, fieldOffset);
+                        EmitStaticFieldAddress(fieldAddress, declaringTypeLayout, fieldOffset, field.IsThreadStatic);
                         EmitMultiRegisterStoreToAddress(instruction, valueUseIndex, field.FieldType, valueKind, fieldAddress);
                         return;
                     }
@@ -3145,7 +3165,7 @@ namespace Cnidaria.Cs
                 if (instruction.Results.Length > 1)
                 {
                     MachineRegister address = PickScratchRegister(instruction, RegisterClass.General);
-                    EmitStaticFieldAddress(address, declaringTypeLayout, fieldOffset);
+                    EmitStaticFieldAddress(address, declaringTypeLayout, fieldOffset, field.IsThreadStatic);
                     EmitMultiRegisterLoadFromAddress(instruction, resultType, resultKind, address);
                     return;
                 }
@@ -3154,7 +3174,7 @@ namespace Cnidaria.Cs
                 {
                     EmitAddressOf(MachineRegisters.BackendScratch, RequireSingleResult(instruction));
                     MachineRegister address = PickScratchRegister(instruction, RegisterClass.General, MachineRegisters.BackendScratch);
-                    EmitStaticBase(address, declaringTypeLayout);
+                    EmitStaticBase(address, declaringTypeLayout, field.IsThreadStatic);
                     EmitCopyAddressToAddress(resultType, resultKind, MachineRegisters.BackendScratch, address, fieldSize, InstructionFlags.None, sourceOffset: fieldOffset);
                     return;
                 }
@@ -3162,19 +3182,19 @@ namespace Cnidaria.Cs
                 MachineRegister baseRegister = RequireSingleResult(instruction).RegisterClass == RegisterClass.General
                     ? RequireResultRegister(instruction)
                     : PickScratchRegister(instruction, RegisterClass.General);
-                EmitStaticBase(baseRegister, declaringTypeLayout);
+                EmitStaticBase(baseRegister, declaringTypeLayout, field.IsThreadStatic);
                 _asm.Emit(InstrDesc.Mem(SelectLoadOpForStorage(
                     resultType, resultKind, RequireSingleResult(instruction).RegisterClass, 0), RequireResultRegister(instruction), baseRegister, fieldOffset,
                     aux: MemoryAuxForRegisterBase(resultType)));
             }
 
-            private void EmitStaticBase(MachineRegister destination, int declaringTypeLayout)
+            private void EmitStaticBase(MachineRegister destination, int declaringTypeLayout, bool threadStatic = false)
                 => _asm.Emit(InstrDesc.Li(Op.LiStaticBase, destination, declaringTypeLayout,
-                    Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow)));
+                    Aux.Instruction(InstructionFlags.GcSafePoint | InstructionFlags.MayThrow | (threadStatic ? InstructionFlags.ThreadStatic : InstructionFlags.None))));
 
-            private void EmitStaticFieldAddress(MachineRegister destination, int declaringTypeLayout, int fieldOffset)
+            private void EmitStaticFieldAddress(MachineRegister destination, int declaringTypeLayout, int fieldOffset, bool threadStatic)
             {
-                EmitStaticBase(destination, declaringTypeLayout);
+                EmitStaticBase(destination, declaringTypeLayout, threadStatic);
                 if (fieldOffset != 0)
                     _asm.I64AddImm(destination, destination, fieldOffset);
             }
@@ -4006,7 +4026,7 @@ namespace Cnidaria.Cs
                 if (fieldType.IsValueType && !IsScalarValueType(fieldType))
                 {
                     MachineRegister fieldAddress = PickScratchRegister(instruction, RegisterClass.General, staticBase);
-                    EmitStaticFieldAddress(fieldAddress, declaringTypeLayout, fieldOffset);
+                    EmitStaticFieldAddress(fieldAddress, declaringTypeLayout, fieldOffset, field.IsThreadStatic);
                     EmitInitAggregateAddress(fieldAddress, fieldType, fieldKind, fieldSize);
                     return true;
                 }
@@ -4022,7 +4042,7 @@ namespace Cnidaria.Cs
                 if (op == Op.StObj)
                 {
                     MachineRegister fieldAddress = PickScratchRegister(instruction, RegisterClass.General, staticBase, value);
-                    EmitStaticFieldAddress(fieldAddress, declaringTypeLayout, fieldOffset);
+                    EmitStaticFieldAddress(fieldAddress, declaringTypeLayout, fieldOffset, field.IsThreadStatic);
                     EmitInitAggregateAddress(fieldAddress, fieldType, fieldKind, fieldSize);
                     return true;
                 }

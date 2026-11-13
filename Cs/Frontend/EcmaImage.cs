@@ -1,6 +1,7 @@
 using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 
 namespace Cnidaria.Cs
@@ -637,6 +638,7 @@ namespace Cnidaria.Cs
                 Counts[(int)EcmaTable.CustomAttribute] = image.CustomAttributes.Count;
                 Counts[(int)EcmaTable.FieldMarshal] = image.FieldMarshals.Count;
                 Counts[(int)EcmaTable.ClassLayout] = image.ClassLayouts.Count;
+                Counts[(int)EcmaTable.FieldLayout] = image.FieldLayouts.Count;
                 Counts[(int)EcmaTable.StandAloneSig] = image.StandAloneSigs.Count;
                 Counts[(int)EcmaTable.EventMap] = image.EventMaps.Count;
                 Counts[(int)EcmaTable.Event] = image.Events.Count;
@@ -739,12 +741,18 @@ namespace Cnidaria.Cs
                     w.Coded(EcmaCodedKind.HasFieldMarshal, row.ParentToken);
                     w.Value(row.NativeType);
                 }
-                foreach (var row in image.ClassLayouts)
+                foreach (var row in image.ClassLayouts.OrderBy(static row => row.ParentTypeDefRid))
                 {
                     w.Begin(EcmaTable.ClassLayout);
                     w.Value(row.PackingSize);
                     w.Value((uint)row.ClassSize);
                     w.Value(row.ParentTypeDefRid);
+                }
+                foreach (var row in image.FieldLayouts.OrderBy(static row => row.FieldRid))
+                {
+                    w.Begin(EcmaTable.FieldLayout);
+                    w.Value((uint)row.Offset);
+                    w.Value(row.FieldRid);
                 }
                 foreach (var row in image.StandAloneSigs)
                 {

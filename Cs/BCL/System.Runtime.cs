@@ -145,6 +145,15 @@ namespace System.Runtime
     {
         internal const string RuntimeLibrary = "*";
 
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        [RuntimeImport(RuntimeLibrary, "RhpClassInitEnter")]
+        internal static extern nint RhpClassInitEnter(nint context);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        [RuntimeImport(RuntimeLibrary, "RhpClassInitComplete")]
+        internal static extern void RhpClassInitComplete(nint context, nint exceptionHandle);
+
+
         // Moves memory from smem to dmem. Size must be a positive value.
         // This copy uses an intrinsic to be safe for copying arbitrary bits of
         // heap memory
@@ -164,6 +173,38 @@ namespace System.Runtime
         [MethodImpl(MethodImplOptions.InternalCall)]
         [RuntimeImport(RuntimeLibrary, "RhBoxAny")]
         internal static extern unsafe object RhBoxAny(ref byte pData, MethodTable* pEEType);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        [RuntimeImport(RuntimeLibrary, "RhYield")]
+        internal static extern int RhYield();
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        [RuntimeImport(RuntimeLibrary, "RhSpinWait")]
+        internal static extern void RhSpinWait(int iterations);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        [RuntimeImport(RuntimeLibrary, "RhpMonitorEnter")]
+        internal static extern void RhpMonitorEnter(object obj);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        [RuntimeImport(RuntimeLibrary, "RhpMonitorTryEnter")]
+        internal static extern int RhpMonitorTryEnter(object obj, int millisecondsTimeout);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        [RuntimeImport(RuntimeLibrary, "RhpMonitorExit")]
+        internal static extern int RhpMonitorExit(object obj);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        [RuntimeImport(RuntimeLibrary, "RhpMonitorIsEntered")]
+        internal static extern int RhpMonitorIsEntered(object obj);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        [RuntimeImport(RuntimeLibrary, "RhpMonitorWait")]
+        internal static extern int RhpMonitorWait(object obj, int millisecondsTimeout);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        [RuntimeImport(RuntimeLibrary, "RhpMonitorPulse")]
+        internal static extern int RhpMonitorPulse(object obj, int all);
 
         // Those are not standard:
 

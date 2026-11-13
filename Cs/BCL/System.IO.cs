@@ -9,6 +9,25 @@ using System.Threading;
 
 namespace System.IO
 {
+    public class DirectoryNotFoundException : IOException
+    {
+        public DirectoryNotFoundException() : base(SR.Arg_DirectoryNotFoundException)
+        {
+            HResult = HResults.COR_E_DIRECTORYNOTFOUND;
+        }
+
+        public DirectoryNotFoundException(string? message) : base(message)
+        {
+            HResult = HResults.COR_E_DIRECTORYNOTFOUND;
+        }
+
+        public DirectoryNotFoundException(string? message, Exception? innerException) : base(message, innerException)
+        {
+            HResult = HResults.COR_E_DIRECTORYNOTFOUND;
+        }
+    }
+
+
     // This abstract base class represents a reader that can read a sequential
     // stream of characters.  This is not intended for reading bytes -
     // there are methods on the Stream class to read bytes.

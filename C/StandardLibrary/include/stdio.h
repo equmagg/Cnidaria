@@ -73,6 +73,10 @@ int feof(FILE* stream);
 int ferror(FILE* stream);
 void clearerr(FILE* stream);
 
+void flockfile(FILE* stream);
+int ftrylockfile(FILE* stream);
+void funlockfile(FILE* stream);
+
 int fprintf(FILE* stream, const char* format, ...);
 int vfprintf(FILE* stream, const char* format, va_list arguments);
 

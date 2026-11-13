@@ -1,6 +1,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -18,15 +19,14 @@
 #define __NR_mprotect 10
 #define __NR_msync 26
 #define __NR_munmap 11
-#define __NR_fork 57
 #define __NR_execve 59
-#define __NR_exit 60
+#define __NR_exit_group 231
+#define __NR_sched_yield 24
 #define __NR_wait4 61
 #define __NR_uname 63
 #define __NR_getdents64 217
 #elif defined(__i386__) || defined(__arm__)
-#define __NR_exit 1
-#define __NR_fork 2
+#define __NR_sched_yield 158
 #define __NR_execve 11
 #define __NR_munmap 91
 #define __NR_wait4 114
@@ -36,23 +36,23 @@
 #define __NR_mmap2 192
 #if defined(__i386__)
 #define __NR_getdents64 220
+#define __NR_exit_group 252
 #else
 #define __NR_getdents64 217
+#define __NR_exit_group 248
 #endif
 #else
 #define __NR_getdents64 61
-#define __NR_exit 93
+#define __NR_exit_group 94
+#define __NR_sched_yield 124
 #define __NR_uname 160
 #define __NR_munmap 215
-#define __NR_clone 220
 #define __NR_execve 221
 #define __NR_mmap 222
 #define __NR_mprotect 226
 #define __NR_msync 227
 #define __NR_wait4 260
 #endif
-
-#define __CLONE_CHILD_SIGNAL 17
 
 long __syscall(long number, long a, long b, long c, long d, long e, long f);
 extern char** environ;
@@ -67,14 +67,11 @@ static long __process_result(long value)
     return value;
 }
 
+pid_t __pthread_fork(void);
+
 pid_t fork(void)
 {
-#if defined(__NR_fork)
-    return (pid_t)__process_result(__syscall(__NR_fork, 0, 0, 0, 0, 0, 0));
-#else
-    // Without a fork call of its own, a kernel forks as a clone that shares nothing and reports with SIGCHLD
-    return (pid_t)__process_result(__syscall(__NR_clone, __CLONE_CHILD_SIGNAL, 0, 0, 0, 0, 0));
-#endif
+    return __pthread_fork();
 }
 
 int execve(const char* path, char* const argv[], char* const envp[])
@@ -126,10 +123,16 @@ int execvp(const char* file, char* const argv[])
     return -1;
 }
 
+// Ends the whole process, every thread with it
 void _exit(int status)
 {
     for (;;)
-        __syscall(__NR_exit, status, 0, 0, 0, 0, 0);
+        __syscall(__NR_exit_group, status, 0, 0, 0, 0, 0);
+}
+
+int sched_yield(void)
+{
+    return (int)__process_result(__syscall(__NR_sched_yield, 0, 0, 0, 0, 0, 0));
 }
 
 pid_t waitpid(pid_t pid, int* status, int options)

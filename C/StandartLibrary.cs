@@ -40,6 +40,9 @@ public static class StandardHeaders
     internal static string SysUioH { get; } = ReadEmbeddedText("include/sys/uio.h");
     internal static string SysMmanH { get; } = ReadEmbeddedText("include/sys/mman.h");
     internal static string PollH { get; } = ReadEmbeddedText("include/poll.h");
+    internal static string PthreadH { get; } = ReadEmbeddedText("include/pthread.h");
+    internal static string SchedH { get; } = ReadEmbeddedText("include/sched.h");
+    internal static string SemaphoreH { get; } = ReadEmbeddedText("include/semaphore.h");
     internal static string SysUtsnameH { get; } = ReadEmbeddedText("include/sys/utsname.h");
     internal static string SysSoundcardH { get; } = ReadEmbeddedText("include/sys/soundcard.h");
     internal static string LinuxFbH { get; } = ReadEmbeddedText("include/linux/fb.h");
@@ -87,6 +90,9 @@ public static class StandardHeaders
             new IncludeFile("sys/mman.h", SysMmanH),
             new IncludeFile("sys/uio.h", SysUioH),
             new IncludeFile("poll.h", PollH),
+            new IncludeFile("pthread.h", PthreadH),
+            new IncludeFile("sched.h", SchedH),
+            new IncludeFile("semaphore.h", SemaphoreH),
             new IncludeFile("sys/utsname.h", SysUtsnameH),
             new IncludeFile("sys/soundcard.h", SysSoundcardH),
             new IncludeFile("linux/fb.h", LinuxFbH),
@@ -148,6 +154,7 @@ public static class StandardLibrarySources
             CreateFile("src/stdlib/stdlib.c"),
             CreateFile("src/string/string.c"),
             CreateFile("src/termios/termios.c"),
+            CreateFile("src/thread/pthread.c"),
             CreateFile("src/time/time.c"));
 
     private static SourceFile CreateFile(string path)

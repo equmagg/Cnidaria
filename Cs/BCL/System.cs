@@ -1282,6 +1282,22 @@ namespace System
 
     public static class AppContext
     {
+        private static readonly Dictionary<string, bool> s_switches = new Dictionary<string, bool>();
+
+        public static bool TryGetSwitch(string switchName, out bool isEnabled)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(switchName);
+            lock (s_switches)
+                return s_switches.TryGetValue(switchName, out isEnabled);
+        }
+
+        public static void SetSwitch(string switchName, bool isEnabled)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(switchName);
+            lock (s_switches)
+                s_switches[switchName] = isEnabled;
+        }
+
         internal static void OnProcessExit()
         {
 
@@ -26174,6 +26190,36 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
         }
     }
 
+    public class DuplicateWaitObjectException : ArgumentException
+    {
+        // Creates a new DuplicateWaitObjectException with its message
+        // string set to a default message.
+        public DuplicateWaitObjectException()
+            : base(SR.Arg_DuplicateWaitObjectException)
+        {
+            HResult = HResults.COR_E_DUPLICATEWAITOBJECT;
+        }
+
+        public DuplicateWaitObjectException(string? parameterName)
+            : base(SR.Arg_DuplicateWaitObjectException, parameterName)
+        {
+            HResult = HResults.COR_E_DUPLICATEWAITOBJECT;
+        }
+
+        public DuplicateWaitObjectException(string? parameterName, string? message)
+            : base(message ?? SR.Arg_DuplicateWaitObjectException, parameterName)
+        {
+            HResult = HResults.COR_E_DUPLICATEWAITOBJECT;
+        }
+
+        public DuplicateWaitObjectException(string? message, Exception? innerException)
+            : base(message ?? SR.Arg_DuplicateWaitObjectException, innerException)
+        {
+            HResult = HResults.COR_E_DUPLICATEWAITOBJECT;
+        }
+
+    }
+
     public class IndexOutOfRangeException : SystemException
     {
         public IndexOutOfRangeException() : base("Index was outside the bounds of the array.") { }
@@ -29345,6 +29391,32 @@ get => unchecked((nint)(unchecked((long)0x8000000000000000L)));
     }
     internal static partial class SR
     {
+        internal const string Arg_DirectoryNotFoundException = "Unable to find the specified directory.";
+        internal const string Arg_DuplicateWaitObjectException = "Duplicate objects in argument.";
+        internal const string Arg_SynchronizationLockException = "Object synchronization method was called from an unsynchronized block of code.";
+        internal const string Arg_ThreadStartException = "Thread failed to start.";
+        internal const string Arg_ThreadStateException = "Thread was in an invalid state for the operation being executed.";
+        internal const string ArgumentNull_ArrayElement = "At least one element in the specified array was null.";
+        internal const string Argument_EmptyWaithandleArray = "Waithandle array may not be empty.";
+        internal const string Argument_SemaphoreInitialMaximum = "The initial count for the semaphore must be greater than or equal to zero and less than the maximum count.";
+        internal const string IO_PathNotFound_Path = "Could not find a part of the path '{0}'.";
+        internal const string InvalidOperation_ThreadWrongThreadStart = "The thread was created with a ThreadStart delegate that does not accept a parameter.";
+        internal const string NamedWaitHandles_ExistingObjectIncompatibleWithCurrentUserOnly = "An object with the specified name '{0}' exists and can't be opened because it's not compatible with the specified option 'CurrentUserOnly = true'.";
+        internal const string NamedWaitHandles_IncompatibleNamePrefix = "The specified name '{0}' has a prefix that is not compatible with the specified option 'CurrentSessionOnly'.";
+        internal const string NotSupported_MaxWaitHandles = "The number of WaitHandles must be less than or equal to 64.";
+        internal const string Overflow_MutexReacquireCount = "The current thread attempted to reacquire a mutex that has reached its maximum acquire count.";
+        internal const string PlatformNotSupported_NamedSyncObjectWaitAnyWaitAll = "Wait operations on multiple wait handles including a named synchronization primitive are not supported on this platform.";
+        internal const string PlatformNotSupported_NamedSynchronizationPrimitives = "The named version of this synchronization primitive is not supported on this platform.";
+        internal const string ThreadState_AlreadyStarted = "Thread is running or terminated; it cannot restart.";
+        internal const string ThreadState_Dead_Priority = "Thread is dead; priority cannot be accessed.";
+        internal const string ThreadState_Dead_State = "Thread is dead; state cannot be accessed.";
+        internal const string ThreadState_NotStarted = "Thread has not been started.";
+        internal const string ThreadState_SetPriorityFailed = "Unable to set thread priority.";
+        internal const string Threading_AbandonedMutexException = "The wait completed due to an abandoned mutex.";
+        internal const string Threading_ThreadInterrupted = "Thread was interrupted from a waiting state.";
+        internal const string Threading_WaitHandleCannotBeOpenedException = "No handle of the given name exists.";
+        internal const string Threading_WaitHandleCannotBeOpenedException_InvalidHandle = "A WaitHandle with system-wide name '{0}' cannot be created. A WaitHandle of a different type might have the same name.";
+        internal const string Threading_WaitHandleTooManyPosts = "The WaitHandle cannot be signaled because it would exceed its maximum count.";
         internal const string AggregateException_InnerException = "(Inner Exception #{0}) ";
         internal const string AggregateException_ctor_DefaultMessage = "One or more errors occurred.";
         internal const string AggregateException_ctor_InnerExceptionNull = "An element of innerExceptions was null.";

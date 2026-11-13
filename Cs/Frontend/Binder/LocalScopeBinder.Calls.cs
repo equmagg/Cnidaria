@@ -1606,7 +1606,7 @@ namespace Cnidaria.Cs
                 }
                 var name = rid.Identifier.ValueText ?? "";
                 if (!string.IsNullOrEmpty(name) &&
-                    TryBindUnqualifiedMember(rid, name, BindValueKind.RValue, context, diagnostics, out var memberExpr))
+                    TryBindUnqualifiedMember(rid, name, BindValueKind.RValue, context, diagnostics, out BoundExpression memberExpr, allowIdenticalTypeName: true))
                 {
                     receiverValue = memberExpr;
                     receiverType = GetReceiverTypeForMemberLookup(memberExpr.Type, context);

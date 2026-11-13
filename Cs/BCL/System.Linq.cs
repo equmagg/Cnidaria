@@ -3882,6 +3882,84 @@ namespace System.Linq
             }
         }
 
+        public static IEnumerable<TSource> Where<TSource>(this IEnumerable<TSource> source, Func<TSource, bool> predicate)
+        {
+            if (source is null)
+            {
+                ThrowHelper.ThrowArgumentNullException(ExceptionArgument.source);
+            }
+
+            if (predicate is null)
+            {
+                ThrowHelper.ThrowArgumentNullException(ExceptionArgument.predicate);
+            }
+
+            if (source is Iterator<TSource> iterator)
+            {
+                return iterator.Where(predicate);
+            }
+
+            // Only use IList when size-optimizing (no array or List specializations).
+            if (IsSizeOptimized && source is IList<TSource> sourceList)
+            {
+                return new SizeOptIListWhereIterator<TSource>(sourceList, predicate);
+            }
+
+            if (source is TSource[] array)
+            {
+                if (array.Length == 0)
+                {
+                    return [];
+                }
+
+                return new ArrayWhereIterator<TSource>(array, predicate);
+            }
+
+            if (source is List<TSource> list)
+            {
+                return new ListWhereIterator<TSource>(list, predicate);
+            }
+
+            return new IEnumerableWhereIterator<TSource>(source, predicate);
+        }
+
+        public static IEnumerable<TSource> Where<TSource>(this IEnumerable<TSource> source, Func<TSource, int, bool> predicate)
+        {
+            if (source is null)
+            {
+                ThrowHelper.ThrowArgumentNullException(ExceptionArgument.source);
+            }
+
+            if (predicate is null)
+            {
+                ThrowHelper.ThrowArgumentNullException(ExceptionArgument.predicate);
+            }
+
+            if (IsEmptyArray(source))
+            {
+                return [];
+            }
+
+            return WhereIterator(source, predicate);
+        }
+
+        private static IEnumerable<TSource> WhereIterator<TSource>(IEnumerable<TSource> source, Func<TSource, int, bool> predicate)
+        {
+            int index = -1;
+            foreach (TSource element in source)
+            {
+                checked
+                {
+                    index++;
+                }
+
+                if (predicate(element, index))
+                {
+                    yield return element;
+                }
+            }
+        }
+
         // A comparer that chains comparisons, and pushes through the last element found to be
         // lower or higher (depending on use), so as to represent the sort of comparisons
         // done by OrderBy().ThenBy() combinations.
@@ -5627,6 +5705,700 @@ namespace System.Linq
         }
 
         /// <summary>
+        /// An iterator that filters each item of an array.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the source array.</typeparam>
+        private sealed partial class ArrayWhereIterator<TSource> : Iterator<TSource>
+        {
+            private readonly TSource[] _source;
+            private readonly Func<TSource, bool> _predicate;
+
+            public ArrayWhereIterator(TSource[] source, Func<TSource, bool> predicate)
+            {
+                _source = source;
+                _predicate = predicate;
+            }
+
+            private protected override Iterator<TSource> Clone() =>
+                new ArrayWhereIterator<TSource>(_source, _predicate);
+
+            public override bool MoveNext()
+            {
+                int index = _state - 1;
+                TSource[] source = _source;
+
+                while ((uint)index < (uint)source.Length)
+                {
+                    TSource item = source[index];
+                    index = _state++;
+                    if (_predicate(item))
+                    {
+                        _current = item;
+                        return true;
+                    }
+                }
+
+                Dispose();
+                return false;
+            }
+
+            public override IEnumerable<TResult> Select<TResult>(Func<TSource, TResult> selector) =>
+                new ArrayWhereSelectIterator<TSource, TResult>(_source, _predicate, selector);
+
+            public override IEnumerable<TSource> Where(Func<TSource, bool> predicate) =>
+                new ArrayWhereIterator<TSource>(_source, CombinePredicates(_predicate, predicate));
+
+            public override int GetCount(bool onlyIfCheap) => GetCount(onlyIfCheap, _source, _predicate);
+
+            public static int GetCount(bool onlyIfCheap, ReadOnlySpan<TSource> source, Func<TSource, bool> predicate)
+            {
+                // In case someone uses Count() to force evaluation of
+                // the selector, run it provided `onlyIfCheap` is false.
+
+                if (onlyIfCheap)
+                {
+                    return -1;
+                }
+
+                int count = 0;
+
+                foreach (TSource item in source)
+                {
+                    if (predicate(item))
+                    {
+                        checked { count++; }
+                    }
+                }
+
+                return count;
+            }
+
+            public override TSource[] ToArray() => ToArray(_source, _predicate);
+
+            public static TSource[] ToArray(ReadOnlySpan<TSource> source, Func<TSource, bool> predicate)
+            {
+                SegmentedArrayBuilder<TSource>.ScratchBuffer scratch = default;
+                SegmentedArrayBuilder<TSource> builder = new(scratch);
+
+                foreach (TSource item in source)
+                {
+                    if (predicate(item))
+                    {
+                        builder.Add(item);
+                    }
+                }
+
+                TSource[] result = builder.ToArray();
+                builder.Dispose();
+
+                return result;
+            }
+
+            public override List<TSource> ToList() => ToList(_source, _predicate);
+
+            public static List<TSource> ToList(ReadOnlySpan<TSource> source, Func<TSource, bool> predicate)
+            {
+                SegmentedArrayBuilder<TSource>.ScratchBuffer scratch = default;
+                SegmentedArrayBuilder<TSource> builder = new(scratch);
+
+                foreach (TSource item in source)
+                {
+                    if (predicate(item))
+                    {
+                        builder.Add(item);
+                    }
+                }
+
+                List<TSource> result = builder.ToList();
+                builder.Dispose();
+
+                return result;
+            }
+
+            public override TSource? TryGetFirst(out bool found)
+            {
+                Func<TSource, bool> predicate = _predicate;
+
+                foreach (TSource item in _source)
+                {
+                    if (predicate(item))
+                    {
+                        found = true;
+                        return item;
+                    }
+                }
+
+                found = false;
+                return default;
+            }
+
+            public override TSource? TryGetLast(out bool found)
+            {
+                TSource[] source = _source;
+                Func<TSource, bool> predicate = _predicate;
+
+                for (int i = source.Length - 1; i >= 0; i--)
+                {
+                    if (predicate(source[i]))
+                    {
+                        found = true;
+                        return source[i];
+                    }
+                }
+
+                found = false;
+                return default;
+            }
+
+            public override TSource? TryGetElementAt(int index, out bool found)
+            {
+                if (index >= 0)
+                {
+                    Func<TSource, bool> predicate = _predicate;
+
+                    foreach (TSource item in _source)
+                    {
+                        if (predicate(item))
+                        {
+                            if (index == 0)
+                            {
+                                found = true;
+                                return item;
+                            }
+
+                            index--;
+                        }
+                    }
+                }
+
+                found = false;
+                return default;
+            }
+
+            public override bool Contains(TSource value)
+            {
+                Func<TSource, bool> predicate = _predicate;
+
+                foreach (TSource item in _source)
+                {
+                    if (predicate(item) && EqualityComparer<TSource>.Default.Equals(item, value))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// An iterator that filters each item of a <see cref="List{TSource}"/>.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the source list.</typeparam>
+        private sealed class ListWhereIterator<TSource> : Iterator<TSource>
+        {
+            private readonly List<TSource> _source;
+            private readonly Func<TSource, bool> _predicate;
+            private List<TSource>.Enumerator _enumerator;
+
+            public ListWhereIterator(List<TSource> source, Func<TSource, bool> predicate)
+            {
+                _source = source;
+                _predicate = predicate;
+            }
+
+            private protected override Iterator<TSource> Clone() =>
+                new ListWhereIterator<TSource>(_source, _predicate);
+
+            public override bool MoveNext()
+            {
+                switch (_state)
+                {
+                    case 1:
+                        _enumerator = _source.GetEnumerator();
+                        _state = 2;
+                        goto case 2;
+                    case 2:
+                        while (_enumerator.MoveNext())
+                        {
+                            TSource item = _enumerator.Current;
+                            if (_predicate(item))
+                            {
+                                _current = item;
+                                return true;
+                            }
+                        }
+
+                        Dispose();
+                        break;
+                }
+
+                return false;
+            }
+
+            public override IEnumerable<TResult> Select<TResult>(Func<TSource, TResult> selector) =>
+                new ListWhereSelectIterator<TSource, TResult>(_source, _predicate, selector);
+
+            public override IEnumerable<TSource> Where(Func<TSource, bool> predicate) =>
+                new ListWhereIterator<TSource>(_source, CombinePredicates(_predicate, predicate));
+
+            public override int GetCount(bool onlyIfCheap) => ArrayWhereIterator<TSource>.GetCount(onlyIfCheap, CollectionsMarshal.AsSpan(_source), _predicate);
+
+            public override TSource[] ToArray() => ArrayWhereIterator<TSource>.ToArray(CollectionsMarshal.AsSpan(_source), _predicate);
+
+            public override List<TSource> ToList() => ArrayWhereIterator<TSource>.ToList(CollectionsMarshal.AsSpan(_source), _predicate);
+
+            public override TSource? TryGetFirst(out bool found)
+            {
+                Func<TSource, bool> predicate = _predicate;
+
+                foreach (TSource item in CollectionsMarshal.AsSpan(_source))
+                {
+                    if (predicate(item))
+                    {
+                        found = true;
+                        return item;
+                    }
+                }
+
+                found = false;
+                return default;
+            }
+
+            public override TSource? TryGetLast(out bool found)
+            {
+                ReadOnlySpan<TSource> source = CollectionsMarshal.AsSpan(_source);
+                Func<TSource, bool> predicate = _predicate;
+
+                for (int i = source.Length - 1; i >= 0; i--)
+                {
+                    if (predicate(source[i]))
+                    {
+                        found = true;
+                        return source[i];
+                    }
+                }
+
+                found = false;
+                return default;
+            }
+
+            public override TSource? TryGetElementAt(int index, out bool found)
+            {
+                if (index >= 0)
+                {
+                    Func<TSource, bool> predicate = _predicate;
+
+                    foreach (TSource item in CollectionsMarshal.AsSpan(_source))
+                    {
+                        if (predicate(item))
+                        {
+                            if (index == 0)
+                            {
+                                found = true;
+                                return item;
+                            }
+
+                            index--;
+                        }
+                    }
+                }
+
+                found = false;
+                return default;
+            }
+
+            public override bool Contains(TSource value)
+            {
+                Func<TSource, bool> predicate = _predicate;
+
+                foreach (TSource item in _source)
+                {
+                    if (predicate(item) && EqualityComparer<TSource>.Default.Equals(item, value))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// An iterator that filters, then maps, each item of an array.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the source array.</typeparam>
+        /// <typeparam name="TResult">The type of the mapped items.</typeparam>
+        private sealed class ArrayWhereSelectIterator<TSource, TResult> : Iterator<TResult>
+        {
+            private readonly TSource[] _source;
+            private readonly Func<TSource, bool> _predicate;
+            private readonly Func<TSource, TResult> _selector;
+
+            public ArrayWhereSelectIterator(TSource[] source, Func<TSource, bool> predicate, Func<TSource, TResult> selector)
+            {
+                _source = source;
+                _predicate = predicate;
+                _selector = selector;
+            }
+
+            private protected override Iterator<TResult> Clone() =>
+                new ArrayWhereSelectIterator<TSource, TResult>(_source, _predicate, _selector);
+
+            public override bool MoveNext()
+            {
+                int index = _state - 1;
+                TSource[] source = _source;
+
+                while ((uint)index < (uint)source.Length)
+                {
+                    TSource item = source[index];
+                    index = _state++;
+                    if (_predicate(item))
+                    {
+                        _current = _selector(item);
+                        return true;
+                    }
+                }
+
+                Dispose();
+                return false;
+            }
+
+            public override IEnumerable<TResult2> Select<TResult2>(Func<TResult, TResult2> selector) =>
+                new ArrayWhereSelectIterator<TSource, TResult2>(_source, _predicate, CombineSelectors(_selector, selector));
+
+            public override int GetCount(bool onlyIfCheap) => GetCount(onlyIfCheap, _source, _predicate, _selector);
+
+            public static int GetCount(bool onlyIfCheap, ReadOnlySpan<TSource> source, Func<TSource, bool> predicate, Func<TSource, TResult> selector)
+            {
+                // In case someone uses Count() to force evaluation of
+                // the selector, run it provided `onlyIfCheap` is false.
+
+                if (onlyIfCheap)
+                {
+                    return -1;
+                }
+
+                int count = 0;
+
+                foreach (TSource item in source)
+                {
+                    if (predicate(item))
+                    {
+                        selector(item);
+                        checked
+                        {
+                            count++;
+                        }
+                    }
+                }
+
+                return count;
+            }
+
+            public override TResult[] ToArray() => ToArray(_source, _predicate, _selector);
+
+            public static TResult[] ToArray(ReadOnlySpan<TSource> source, Func<TSource, bool> predicate, Func<TSource, TResult> selector)
+            {
+                SegmentedArrayBuilder<TResult>.ScratchBuffer scratch = default;
+                SegmentedArrayBuilder<TResult> builder = new(scratch);
+
+                foreach (TSource item in source)
+                {
+                    if (predicate(item))
+                    {
+                        builder.Add(selector(item));
+                    }
+                }
+
+                TResult[] result = builder.ToArray();
+                builder.Dispose();
+
+                return result;
+            }
+
+            public override List<TResult> ToList() => ToList(_source, _predicate, _selector);
+
+            public static List<TResult> ToList(ReadOnlySpan<TSource> source, Func<TSource, bool> predicate, Func<TSource, TResult> selector)
+            {
+                SegmentedArrayBuilder<TResult>.ScratchBuffer scratch = default;
+                SegmentedArrayBuilder<TResult> builder = new(scratch);
+
+                foreach (TSource item in source)
+                {
+                    if (predicate(item))
+                    {
+                        builder.Add(selector(item));
+                    }
+                }
+
+                List<TResult> result = builder.ToList();
+                builder.Dispose();
+
+                return result;
+            }
+
+            public override TResult? TryGetFirst(out bool found) => TryGetFirst(_source, _predicate, _selector, out found);
+
+            public static TResult? TryGetFirst(ReadOnlySpan<TSource> source, Func<TSource, bool> predicate, Func<TSource, TResult> selector, out bool found)
+            {
+                foreach (TSource item in source)
+                {
+                    if (predicate(item))
+                    {
+                        found = true;
+                        return selector(item);
+                    }
+                }
+
+                found = false;
+                return default;
+            }
+
+            public override TResult? TryGetLast(out bool found) => TryGetLast(_source, _predicate, _selector, out found);
+
+            public static TResult? TryGetLast(ReadOnlySpan<TSource> source, Func<TSource, bool> predicate, Func<TSource, TResult> selector, out bool found)
+            {
+                for (int i = source.Length - 1; i >= 0; i--)
+                {
+                    if (predicate(source[i]))
+                    {
+                        found = true;
+                        return selector(source[i]);
+                    }
+                }
+
+                found = false;
+                return default;
+            }
+
+            public override TResult? TryGetElementAt(int index, out bool found) => TryGetElementAt(_source, _predicate, _selector, index, out found);
+
+            public static TResult? TryGetElementAt(
+                ReadOnlySpan<TSource> source, Func<TSource, bool> predicate, Func<TSource, TResult> selector, int index, out bool found)
+            {
+                if (index >= 0)
+                {
+                    foreach (TSource item in source)
+                    {
+                        if (predicate(item))
+                        {
+                            if (index == 0)
+                            {
+                                found = true;
+                                return selector(item);
+                            }
+
+                            index--;
+                        }
+                    }
+                }
+
+                found = false;
+                return default;
+            }
+
+            public override bool Contains(TResult value) => Contains(_source, _predicate, _selector, value);
+
+            public static bool Contains(ReadOnlySpan<TSource> source, Func<TSource, bool> predicate, Func<TSource, TResult> selector, TResult value)
+            {
+                foreach (TSource item in source)
+                {
+                    if (predicate(item) && EqualityComparer<TResult>.Default.Equals(selector(item), value))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// An iterator that filters, then maps, each item of a <see cref="List{TSource}"/>.
+        /// </summary>
+        /// <typeparam name="TSource">The type of the source list.</typeparam>
+        /// <typeparam name="TResult">The type of the mapped items.</typeparam>
+        private sealed class ListWhereSelectIterator<TSource, TResult> : Iterator<TResult>
+        {
+            private readonly List<TSource> _source;
+            private readonly Func<TSource, bool> _predicate;
+            private readonly Func<TSource, TResult> _selector;
+            private List<TSource>.Enumerator _enumerator;
+
+            public ListWhereSelectIterator(List<TSource> source, Func<TSource, bool> predicate, Func<TSource, TResult> selector)
+            {
+                _source = source;
+                _predicate = predicate;
+                _selector = selector;
+            }
+
+            private protected override Iterator<TResult> Clone() =>
+                new ListWhereSelectIterator<TSource, TResult>(_source, _predicate, _selector);
+
+            public override bool MoveNext()
+            {
+                switch (_state)
+                {
+                    case 1:
+                        _enumerator = _source.GetEnumerator();
+                        _state = 2;
+                        goto case 2;
+                    case 2:
+                        while (_enumerator.MoveNext())
+                        {
+                            TSource item = _enumerator.Current;
+                            if (_predicate(item))
+                            {
+                                _current = _selector(item);
+                                return true;
+                            }
+                        }
+
+                        Dispose();
+                        break;
+                }
+
+                return false;
+            }
+
+            public override IEnumerable<TResult2> Select<TResult2>(Func<TResult, TResult2> selector) =>
+                new ListWhereSelectIterator<TSource, TResult2>(_source, _predicate, CombineSelectors(_selector, selector));
+
+            public override int GetCount(bool onlyIfCheap) 
+                => ArrayWhereSelectIterator<TSource, TResult>.GetCount(onlyIfCheap, CollectionsMarshal.AsSpan(_source), _predicate, _selector);
+
+            public override TResult[] ToArray() => ArrayWhereSelectIterator<TSource, TResult>.ToArray(CollectionsMarshal.AsSpan(_source), _predicate, _selector);
+
+            public override List<TResult> ToList() => ArrayWhereSelectIterator<TSource, TResult>.ToList(CollectionsMarshal.AsSpan(_source), _predicate, _selector);
+
+            public override TResult? TryGetElementAt(int index, out bool found) 
+                => ArrayWhereSelectIterator<TSource, TResult>.TryGetElementAt(CollectionsMarshal.AsSpan(_source), _predicate, _selector, index, out found);
+
+            public override TResult? TryGetFirst(out bool found) 
+                => ArrayWhereSelectIterator<TSource, TResult>.TryGetFirst(CollectionsMarshal.AsSpan(_source), _predicate, _selector, out found);
+
+            public override TResult? TryGetLast(out bool found) 
+                => ArrayWhereSelectIterator<TSource, TResult>.TryGetLast(CollectionsMarshal.AsSpan(_source), _predicate, _selector, out found);
+
+            public override bool Contains(TResult value) 
+                => ArrayWhereSelectIterator<TSource, TResult>.Contains(CollectionsMarshal.AsSpan(_source), _predicate, _selector, value);
+        }
+
+        private sealed class SizeOptIListWhereIterator<TSource> : Iterator<TSource>
+        {
+            private readonly IList<TSource> _source;
+            private readonly Func<TSource, bool> _predicate;
+            private IEnumerator<TSource>? _enumerator;
+
+            public SizeOptIListWhereIterator(IList<TSource> source, Func<TSource, bool> predicate)
+            {
+                _source = source;
+                _predicate = predicate;
+            }
+
+            private protected override Iterator<TSource> Clone() =>
+                new SizeOptIListWhereIterator<TSource>(_source, _predicate);
+
+            public override bool MoveNext()
+            {
+                switch (_state)
+                {
+                    case 1:
+                        _enumerator = _source.GetEnumerator();
+                        _state = 2;
+                        goto case 2;
+                    case 2:
+                        while (_enumerator!.MoveNext())
+                        {
+                            TSource item = _enumerator.Current;
+                            if (_predicate(item))
+                            {
+                                _current = item;
+                                return true;
+                            }
+                        }
+
+                        Dispose();
+                        break;
+                }
+
+                return false;
+            }
+
+            public override void Dispose()
+            {
+                if (_enumerator is { } e)
+                {
+                    _enumerator = null;
+                    e.Dispose();
+                }
+
+                base.Dispose();
+            }
+
+            public override IEnumerable<TSource> Where(Func<TSource, bool> predicate) =>
+                new SizeOptIListWhereIterator<TSource>(_source, Utilities.CombinePredicates(_predicate, predicate));
+
+            public override TSource[] ToArray()
+            {
+                SegmentedArrayBuilder<TSource>.ScratchBuffer scratch = default;
+                SegmentedArrayBuilder<TSource> builder = new(scratch);
+
+                foreach (TSource item in _source)
+                {
+                    if (_predicate(item))
+                    {
+                        builder.Add(item);
+                    }
+                }
+
+                TSource[] result = builder.ToArray();
+                builder.Dispose();
+
+                return result;
+            }
+
+            public override List<TSource> ToList()
+            {
+                SegmentedArrayBuilder<TSource>.ScratchBuffer scratch = default;
+                SegmentedArrayBuilder<TSource> builder = new(scratch);
+
+                foreach (TSource item in _source)
+                {
+                    if (_predicate(item))
+                    {
+                        builder.Add(item);
+                    }
+                }
+
+                List<TSource> result = builder.ToList();
+                builder.Dispose();
+
+                return result;
+            }
+
+            public override int GetCount(bool onlyIfCheap)
+            {
+                if (onlyIfCheap)
+                {
+                    return -1;
+                }
+
+                int count = 0;
+                foreach (TSource item in _source)
+                {
+                    if (_predicate(item))
+                    {
+                        checked { count++; }
+                    }
+                }
+                return count;
+            }
+        }
+
+        /// <summary>
         /// An iterator that filters, then maps, each item of an <see cref="IEnumerable{TSource}"/>.
         /// </summary>
         /// <typeparam name="TSource">The type of the source enumerable.</typeparam>
@@ -5849,6 +6621,7 @@ namespace System.Linq
                 return false;
             }
         }
+
 
         /// <summary>
         /// An iterator that yields the items of part of an <see cref="IEnumerable{TSource}"/>.

@@ -118,7 +118,7 @@ namespace Cnidaria.Cs
 
             private bool IsHiddenReturnBufferReturn(GenTree node)
             {
-                if (node.Kind != GenTreeKind.Return || node.Uses.Length == 0)
+                if (node.Kind != GenTreeKind.Return || node.Uses.Length == 0 || (node.Flags & GenTreeFlags.AsyncSuspend) != 0)
                     return false;
 
                 return MachineAbi.RequiresHiddenReturnBuffer(_method.GenTreeMethod.RuntimeMethod, Target);
@@ -547,6 +547,23 @@ namespace Cnidaria.Cs
 
                 if (hiddenReturnBufferIndex == argTypes.Length)
                     EmitIncomingHiddenReturnBufferHomeStore(blockId, nodes, argTypes.Length, ref generalArgumentIndex, ref floatArgumentIndex, ref incomingStackArgumentIndex);
+
+                // Fields excluded from SSA by EH still need their initial value from the incoming struct
+                foreach (GenLocalDescriptor field in _method.GenTreeMethod.ArgDescriptors)
+                {
+                    if (!field.IsStructField || field.SsaPromoted ||
+                        !_method.StackFrame.TryGetArgumentSlot(field.Index, out StackFrameSlot fieldHome))
+                        continue;
+                    GenLocalDescriptor parent = _method.GenTreeMethod.AllLocalDescriptors[field.ParentLclNum];
+                    if (!_method.StackFrame.TryGetArgumentSlot(parent.Index, out StackFrameSlot parentHome))
+                        throw new InvalidOperationException("A promoted argument field requires its incoming parent home.");
+                    int size = Math.Max(1, field.FieldSize);
+                    RegisterOperand source = RegisterOperand.ForFrameSlot(RegisterClass.General, StackFrameSlotKind.Argument,
+                        RegisterFrameBase.StackPointer, parentHome.Index, checked(parentHome.Offset + field.FieldOffset), size);
+                    RegisterOperand destination = RegisterOperand.ForFrameSlot(RegisterClass.General, StackFrameSlotKind.Argument,
+                        RegisterFrameBase.StackPointer, fieldHome.Index, fieldHome.Offset, size);
+                    EmitIncomingArgumentHomeBlockStore(blockId, nodes, destination, source, size);
+                }
             }
 
 
@@ -1314,6 +1331,28 @@ namespace Cnidaria.Cs
                     throw new InvalidOperationException("Register return node with operands must retain linear IR return value mapping.");
 
                 var returnValue = returnNode.RegisterUses[0];
+                if ((returnNode.Flags & GenTreeFlags.AsyncSuspend) != 0)
+                {
+                    var continuationOperand = RegisterOperand.ForRegister(RegisterInfo.AsyncContinuationRegister(Target));
+                    if (!returnNode.Uses[0].Equals(continuationOperand))
+                    {
+                        nodes.Add(GenTreeLirFactory.Move(
+                            _nextNodeId++,
+                            blockId,
+                            nodes.Count,
+                            continuationOperand,
+                            returnNode.Uses[0],
+                            destinationValue: returnValue,
+                            sourceValue: returnValue,
+                            comment: "continuation to async return register",
+                            moveFlags: MoveFlags.AbiReturn));
+                    }
+                    return returnNode.WithOperands(
+                        returnNode.Results,
+                        ImmutableArray.Create(continuationOperand),
+                        returnNode.RegisterResults,
+                        returnNode.RegisterUses);
+                }
                 var valueInfo = _method.GenTreeMethod.GetValueInfo(returnValue);
                 var abi = MachineAbi.ClassifyValue(valueInfo.Type, valueInfo.StackKind, isReturn: true, target: Target);
 

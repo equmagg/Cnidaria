@@ -77,6 +77,7 @@ namespace Cnidaria.Cs
         GenericParam,
         GenericParamConstraint,
         ClassLayout,
+        FieldLayout,
         FieldRva,
         StandAloneSig,
         Event,
@@ -168,6 +169,7 @@ namespace Cnidaria.Cs
         public List<GenericParamRow> GenericParams { get; } = new();
         public List<GenericParamConstraintRow> GenericParamConstraints { get; } = new();
         public List<ClassLayoutRow> ClassLayouts { get; } = new();
+        public List<FieldLayoutRow> FieldLayouts { get; } = new();
         public List<FieldRvaRow> FieldRvas { get; } = new();
         public List<byte[]> FieldRvaData { get; } = new();
         public List<StandAloneSigRow> StandAloneSigs { get; } = new();
@@ -554,6 +556,16 @@ namespace Cnidaria.Cs
             PackingSize = packingSize;
             ClassSize = classSize;
             ParentTypeDefRid = parentTypeDefRid;
+        }
+    }
+    public struct FieldLayoutRow
+    {
+        public int Offset;
+        public int FieldRid;
+        public FieldLayoutRow(int offset, int fieldRid)
+        {
+            Offset = offset;
+            FieldRid = fieldRid;
         }
     }
     public struct FieldRvaRow
@@ -1481,6 +1493,8 @@ namespace Cnidaria.Cs
                         flags |= System.Reflection.FieldAttributes.HasFieldMarshal;
 
                     Image.Fields.Add(new FieldRow(flags: (ushort)flags, name: fNameIdx, signature: sigIdx));
+                    if (!f.IsStatic && !f.IsConst && MethodAttributeFacts.TryGetFieldOffset(f.GetAttributes(), out int fieldOffset))
+                        Image.FieldLayouts.Add(new FieldLayoutRow(fieldOffset, fieldRid));
                 }
             }
             int methodListRid = Image.Methods.Count + 1;
@@ -1641,6 +1655,19 @@ namespace Cnidaria.Cs
             }
             if (!hasExplicitStaticConstructor && type.TypeKind != TypeKind.Interface)
                 typeFlags |= System.Reflection.TypeAttributes.BeforeFieldInit;
+
+            if (type.TypeKind is TypeKind.Struct or TypeKind.Class &&
+                MethodAttributeFacts.TryGetStructLayout(type.GetAttributes(), out int layoutKind, out int pack, out int size))
+            {
+                typeFlags = (typeFlags & ~System.Reflection.TypeAttributes.LayoutMask) | (System.Runtime.InteropServices.LayoutKind)layoutKind switch
+                {
+                    System.Runtime.InteropServices.LayoutKind.Explicit => System.Reflection.TypeAttributes.ExplicitLayout,
+                    System.Runtime.InteropServices.LayoutKind.Sequential => System.Reflection.TypeAttributes.SequentialLayout,
+                    _ => System.Reflection.TypeAttributes.AutoLayout,
+                };
+                if (pack != 0 || size != 0)
+                    Image.ClassLayouts.Add(new ClassLayoutRow((ushort)pack, size, typeDefRid));
+            }
 
             Image.TypeDefs[typeDefIndex] = new TypeDefRow(
                 flags: (int)typeFlags,
@@ -2652,6 +2679,9 @@ namespace Cnidaria.Cs
         }
         private void EmitAttribute(int parentToken, AttributeData attribute)
         {
+            if (MethodAttributeFacts.IsLayoutPseudoAttribute(attribute))
+                return;
+
             if (MethodAttributeFacts.TryGetMarshalAsType(attribute, out int unmanagedType))
             {
                 Image.FieldMarshals.Add(new FieldMarshalRow(parentToken, BuildMarshalDescriptor(attribute, unmanagedType)));

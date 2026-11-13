@@ -1,7 +1,8 @@
 #ifndef __ERRNO_H
 #define __ERRNO_H
 
-extern int errno;
+int* __errno_location(void);
+#define errno (*__errno_location())
 
 #define EPERM 1
 #define ENOENT 2
@@ -35,10 +36,14 @@ extern int errno;
 #define EPIPE 32
 #define EDOM 33
 #define ERANGE 34
+#define EDEADLK 35
 #define ENAMETOOLONG 36
 #define ENOSYS 38
 #define ENOTEMPTY 39
+#define EWOULDBLOCK EAGAIN
 #define EOVERFLOW 75
 #define EILSEQ 84
+#define ENOTSUP 95
+#define ETIMEDOUT 110
 
 #endif

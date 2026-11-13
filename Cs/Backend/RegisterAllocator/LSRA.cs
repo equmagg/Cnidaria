@@ -5488,7 +5488,9 @@ namespace Cnidaria.Cs
 
                 if (abi.PassingKind == AbiValuePassingKind.ScalarRegister)
                 {
-                    var returnOperand = RegisterOperand.ForRegister(GetReturnRegister(abi.RegisterClass));
+                    var returnOperand = RegisterOperand.ForRegister((node.Flags & GenTreeFlags.AsyncSuspend) != 0
+                        ? RegisterInfo.AsyncContinuationRegister(_method.Target)
+                        : GetReturnRegister(abi.RegisterClass));
                     if (sourceOperand.RegisterClass != abi.RegisterClass && sourceOperand.IsMemoryOperand)
                         sourceOperand = OperandAtOffset(sourceOperand, new AbiRegisterSegment(abi.RegisterClass, 0, abi.Size, abi.ContainsGcPointers));
 
@@ -6726,7 +6728,7 @@ namespace Cnidaria.Cs
                         continue;
                     }
 
-                    if (node.Kind == GenTreeKind.Return && node.RegisterUses.Length == 1)
+                    if (node.Kind == GenTreeKind.Return && node.RegisterUses.Length == 1 && (node.Flags & GenTreeFlags.AsyncSuspend) == 0)
                     {
                         var value = node.RegisterUses[0];
                         var valueInfo = method.GetValueInfo(value);
