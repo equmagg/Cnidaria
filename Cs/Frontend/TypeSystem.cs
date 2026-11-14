@@ -419,23 +419,7 @@ namespace Cnidaria.Cs
             throw new NotSupportedException($"Unsupported TypeRef scope token: 0x{scopeTok:X8}");
         }
         public static (string ns, string name) GetTypeDefFullNameByRid(RuntimeModule m, int rid)
-        {
-            var enclosingByNestedRid = new Dictionary<int, int>();
-            for (int i = 0; i < m.Md.GetRowCount(MetadataTableKind.NestedClass); i++)
-                enclosingByNestedRid[m.Md.GetNestedClass(i + 1).NestedTypeRid] = m.Md.GetNestedClass(i + 1).EnclosingTypeRid;
-
-            var td = m.Md.GetTypeDef(rid);
-            string name = m.Md.GetString(td.Name);
-            string ns = m.Md.GetString(td.Namespace);
-
-            if (enclosingByNestedRid.TryGetValue(rid, out int encRid))
-            {
-                var enc = GetTypeDefFullNameByRid(m, encRid);
-                return (enc.ns, enc.name + "+" + name);
-            }
-
-            return (ns, name);
-        }
+            => m.GetTypeDefFullNameByRid(rid);
         private static (string asm, string ns, string name) ResolveTypeSpecOwner(RuntimeModule caller, ref SigReader sr)
         {
             var et = (SigElementType)sr.ReadByte();

@@ -1514,7 +1514,7 @@ internal static partial class SsaOptimizer
         {
             var builtin = GimpleTypeHelpers.Normalize(type).Type as BuiltinType;
             single = builtin?.BuiltinKind == BuiltinTypeKind.Float;
-            return builtin?.BuiltinKind is BuiltinTypeKind.Float or BuiltinTypeKind.Double;
+            return builtin?.BuiltinKind is BuiltinTypeKind.Float or BuiltinTypeKind.Double or BuiltinTypeKind.LongDouble;
         }
 
         private bool TryFoldBinary(

@@ -121,7 +121,10 @@ internal static class InductionVariables
                 if (_analysis.Remaining <= 0)
                     break;
                 if (IsInnermost(loop) && TryGetShape(loop, out var shape) && !TryDeleteDeadLoop(shape))
+                {
                     OptimizeLoop(shape);
+                    SinkSteps(shape);
+                }
             }
 
             return _replacements.Count == 0 && _phis.Count == 0 ? _function : Rebuild();
@@ -358,6 +361,140 @@ internal static class InductionVariables
                 _replacements[shape.ExitTest!] = exit;
             Append(shape.Preheader, preheader);
             Append(shape.Latch, latch);
+        }
+
+        // A step computed before the last read of its variable keeps the old and new value apart for the rest of the iteration
+        private void SinkSteps(Shape shape)
+        {
+            GimpleBlockAnnotations header = _blocks[shape.Loop.Header];
+            GimpleBlockAnnotations latch = _blocks[shape.Latch];
+            bool exitsThroughLatch = ExitsOnlyThroughLatch(shape);
+            foreach (GimplePhi phi in header.Phis)
+            {
+                if (!_analysis.Spend())
+                    return;
+                if (BackEdgeValue(phi, shape) is not GimpleName next ||
+                    !_definitions.TryGetValue(next, out GimpleStatementAnnotations? step) ||
+                    _replacements.ContainsKey(step) ||
+                    !shape.Loop.Blocks.Contains(step.Block) ||
+                    !IsSinkableStep(step, phi.Result, shape.Loop) ||
+                    IsLastBeforeTerminator(step, latch) ||
+                    !UsesFollowLatch(next, shape, latch, ReferenceEquals(step.Block, shape.Latch) || exitsThroughLatch))
+                {
+                    continue;
+                }
+
+                MoveToLatch(shape, step);
+            }
+        }
+
+        private static GimpleValue? BackEdgeValue(GimplePhi phi, Shape shape)
+        {
+            foreach (GimplePhiOperand operand in phi.Operands)
+            {
+                if (ReferenceEquals(operand.Edge, shape.BackEdge))
+                    return operand.Value;
+            }
+
+            return null;
+        }
+
+        private bool IsSinkableStep(GimpleStatementAnnotations step, GimpleName variable, NaturalLoop loop)
+        {
+            if (step.Statement is not GimpleAssignStatement assign ||
+                step.Definitions.Length != 1 ||
+                step.MemoryInput is not null || step.MemoryOutput is not null ||
+                (step.Flags & (GimpleStatementFlags.ReadsMemory | GimpleStatementFlags.WritesMemory | GimpleStatementFlags.ContainsCall)) != 0 ||
+                assign.Subcode is not (GimpleTreeCode.PlusExpr or GimpleTreeCode.MinusExpr or GimpleTreeCode.PointerPlusExpr or GimpleTreeCode.MultExpr or
+                    GimpleTreeCode.BitAndExpr or GimpleTreeCode.BitIorExpr or GimpleTreeCode.BitXorExpr or GimpleTreeCode.LshiftExpr or
+                    GimpleTreeCode.RshiftExpr or GimpleTreeCode.NegateExpr or GimpleTreeCode.BitNotExpr or GimpleTreeCode.NopExpr or
+                    GimpleTreeCode.ConvertExpr))
+            {
+                return false;
+            }
+
+            bool readsVariable = false;
+            foreach (GimpleValue operand in assign.Operands)
+            {
+                if (operand is GimpleConstantValue)
+                    continue;
+                if (operand is not GimpleName name)
+                    return false;
+                if (ReferenceEquals(name, variable))
+                {
+                    readsVariable = true;
+                    continue;
+                }
+                if (name.Definition?.Block is ControlFlowBlock block && loop.Blocks.Contains(block))
+                    return false;
+            }
+
+            return readsVariable;
+        }
+
+        private static bool IsLastBeforeTerminator(GimpleStatementAnnotations step, GimpleBlockAnnotations latch)
+        {
+            ImmutableArray<GimpleStatementAnnotations> statements = latch.Statements;
+            int last = statements.Length != 0 && statements[^1].Statement.IsTerminator ? statements.Length - 2 : statements.Length - 1;
+            return last >= 0 && ReferenceEquals(statements[last], step);
+        }
+
+        private bool ExitsOnlyThroughLatch(Shape shape)
+        {
+            foreach (ControlFlowBlock block in shape.Loop.Blocks)
+            {
+                if (ReferenceEquals(block, shape.Latch))
+                    continue;
+                foreach (ControlFlowBlock successor in block.UniqueSuccessors)
+                {
+                    if (!shape.Loop.Blocks.Contains(successor))
+                        return false;
+                }
+            }
+
+            return true;
+        }
+
+        // The latch end dominates the back edge and the latch terminator, and every exit only when the loop is left through the latch
+        private bool UsesFollowLatch(GimpleName next, Shape shape, GimpleBlockAnnotations latch, bool outsideFollowsLatch)
+        {
+            GimpleStatement? terminator = latch.Statements.Length != 0 && latch.Statements[^1].Statement.IsTerminator
+                ? latch.Statements[^1].Statement
+                : null;
+            foreach (GimpleUse use in _function.GetImmediateUses(next))
+            {
+                if (!_analysis.Spend())
+                    return false;
+                if (use.Kind == GimpleUseKind.Phi)
+                {
+                    if (use.Edge is null || !ReferenceEquals(use.Edge.Source, shape.Latch))
+                        return false;
+                    continue;
+                }
+                if (!shape.Loop.Blocks.Contains(use.Block))
+                {
+                    if (!outsideFollowsLatch)
+                        return false;
+                    continue;
+                }
+                if (terminator is null || !ReferenceEquals(use.Statement, terminator))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private void MoveToLatch(Shape shape, GimpleStatementAnnotations step)
+        {
+            GimpleDefinition original = step.Definitions[0];
+            var definition = new GimpleDefinition(original.Name, original.Kind, shape.Latch, original.Statement, original.Target, original.Parameter);
+            _redefinitions[original] = definition;
+            var moved = new GimpleStatementAnnotations(_nextStatement++, shape.Latch, step.Statement, step.InputStatement, step.Operands,
+                SsaRewriting.CollectUses(step.Operands, shape.Latch, step.Statement), ImmutableArray.Create(definition), null, null, step.Flags);
+            var nop = new GimpleNopStatement(step.Statement.Syntax);
+            _replacements[step] = new GimpleStatementAnnotations(step.Ordinal, step.Block, nop, nop, ImmutableArray<GimpleOperandInfo>.Empty,
+                ImmutableArray<GimpleUse>.Empty, ImmutableArray<GimpleDefinition>.Empty, null, null, GimpleStatementFlags.None);
+            Append(shape.Latch, [moved]);
         }
 
         private void CollectAccesses(GimpleStatementAnnotations instruction, GimpleOperandInfo node, NaturalLoop loop,

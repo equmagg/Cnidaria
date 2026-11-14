@@ -665,7 +665,7 @@ namespace Cnidaria.Cs
                 }
             }
         }
-        internal static IEnumerable<SourceMethodSymbol> EnumerateExtensionImplementations(ImmutableDictionary<SyntaxNode, Symbol> declMap)
+        internal static IEnumerable<SourceMethodSymbol> EnumerateExtensionImplementations(IReadOnlyDictionary<SyntaxNode, Symbol> declMap)
         {
             var seen = new HashSet<SourceMethodSymbol>(ReferenceEqualityComparer<SourceMethodSymbol>.Instance);
             foreach (var symbol in declMap.Values)

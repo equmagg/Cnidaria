@@ -125,7 +125,7 @@ internal static class CAbi
     {
         if (IsFloat32(type))
             return ScalarForTarget(target, type, AbiRegisterClass.Floating, size: 4, alignment: Math.Max(1, target.AlignOf(type)));
-        if (IsFloat64(type) || IsLongDouble(type))
+        if (IsFloat64(type))
             return ScalarForTarget(target, type, AbiRegisterClass.Floating, size: Math.Min(8, Math.Max(1, target.SizeOf(type))), alignment: Math.Max(1, target.AlignOf(type)));
 
         if (IsAggregate(type))
@@ -463,11 +463,6 @@ internal static class CAbi
         if (fpClass.HasValue)
             return ScalarForTarget(target, type, fpClass.Value, size, alignment);
 
-        if (IsLongDouble(type))
-            return isReturn || TargetRegisterInfo.IsWindowsX64(target)
-                ? IndirectForTarget(target, type, size, alignment)
-                : AbiValue.Stack(type, size, alignment);
-
         if (IsAggregate(type))
             return ClassifyX86Aggregate(target, type, isReturn);
 
@@ -518,7 +513,7 @@ internal static class CAbi
             return IndirectForTarget(target, type, size, alignment);
         }
 
-        if (size <= checked(target.RegisterSize * MaxRegisterAggregateRegisters) && !ContainsLongDouble(type))
+        if (size <= checked(target.RegisterSize * MaxRegisterAggregateRegisters))
         {
             return new AbiValue(type, AbiPassingKind.MultiRegister, size, alignment, CreateSystemVSegments(target, type, size),
                 requiresAllRegisters: !isReturn, keepsRegistersWhenStacked: true);
@@ -574,25 +569,6 @@ internal static class CAbi
         }
 
         return IsFloat32(type) || IsFloat64(type);
-    }
-
-    private static bool ContainsLongDouble(QualifiedType type)
-    {
-        if (type.Type is ArrayType array)
-            return ContainsLongDouble(array.ElementType);
-
-        if (type.Type is TagType { Symbol.TagKind: not TagKind.Enum } tag && tag.Symbol.IsComplete)
-        {
-            foreach (var field in tag.Symbol.Fields)
-            {
-                if (ContainsLongDouble(field.Type))
-                    return true;
-            }
-
-            return false;
-        }
-
-        return IsLongDouble(type);
     }
 
     private static int FieldOffset(TargetInfo target, FieldSymbol field)
@@ -1164,16 +1140,13 @@ internal static class CAbi
         => (type.Type.Kind is TypeKind.Builtin or TypeKind.Enum) && !IsFloating(type) && !IsVoid(type);
 
     internal static bool IsFloating(QualifiedType type)
-        => IsFloat32(type) || IsFloat64(type) || IsLongDouble(type);
+        => IsFloat32(type) || IsFloat64(type);
 
     private static bool IsFloat32(QualifiedType type)
         => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Float };
 
     private static bool IsFloat64(QualifiedType type)
-        => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Double };
-
-    private static bool IsLongDouble(QualifiedType type)
-        => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.LongDouble };
+        => type.Type is BuiltinType builtin && builtin.BuiltinKind is BuiltinTypeKind.Double or BuiltinTypeKind.LongDouble;
 }
 
 internal readonly struct AbiPlacement

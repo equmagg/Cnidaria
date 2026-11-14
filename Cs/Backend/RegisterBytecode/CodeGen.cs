@@ -2042,8 +2042,8 @@ namespace Cnidaria.Cs
                     case NumericConvKind.U4:
                     case NumericConvKind.NativeUInt:
                         if (fromI64) op = CheckedI64ToU32Op(checkedConversion, fromUnsigned);
-                        else if (fromF32) op = checkedConversion ? Op.F32ToU32Ovf : Op.F32ToI32;
-                        else if (fromF64) op = checkedConversion ? Op.F64ToU32Ovf : Op.F64ToI32;
+                        else if (fromF32) op = checkedConversion ? Op.F32ToU32Ovf : Op.F32ToU32;
+                        else if (fromF64) op = checkedConversion ? Op.F64ToU32Ovf : Op.F64ToU32;
                         break;
                     case NumericConvKind.I8:
                         if (fromI32) op = fromUnsigned ? Op.U32ToI64 : Op.I32ToI64;
@@ -2052,8 +2052,8 @@ namespace Cnidaria.Cs
                         break;
                     case NumericConvKind.U8:
                         if (fromI32) op = fromUnsigned ? Op.U32ToI64 : Op.I32ToI64;
-                        else if (fromF32) op = checkedConversion ? Op.F32ToU64Ovf : Op.F32ToI64;
-                        else if (fromF64) op = checkedConversion ? Op.F64ToU64Ovf : Op.F64ToI64;
+                        else if (fromF32) op = checkedConversion ? Op.F32ToU64Ovf : Op.F32ToU64;
+                        else if (fromF64) op = checkedConversion ? Op.F64ToU64Ovf : Op.F64ToU64;
                         break;
                     case NumericConvKind.R4:
                         if (fromI64)

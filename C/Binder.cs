@@ -1104,7 +1104,7 @@ public sealed class Binder
             case SyntaxKind.Utf8StringLiteralToken:
                 type = new QualifiedType(_types.ArrayOf(
                     _types.Builtin(BuiltinTypeKind.Char),
-                    token.Value is string text ? System.Text.Encoding.UTF8.GetByteCount(text) + 1L : null));
+                    token.Value is string text ? NarrowStringEncoding.GetByteCount(text) + 1L : null));
                 constantValue = token.Value;
                 break;
 

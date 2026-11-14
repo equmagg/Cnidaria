@@ -866,6 +866,10 @@ namespace Cnidaria.Cs
                     case Op.F32ToU64Ovf: ConvertF64ToU64Ovf(ins.Rd, F32(ins.Rs1), executingPc); break;
                     case Op.F64ToU32Ovf: ConvertF64ToU32Ovf(ins.Rd, F64(ins.Rs1), executingPc); break;
                     case Op.F64ToU64Ovf: ConvertF64ToU64Ovf(ins.Rd, F64(ins.Rs1), executingPc); break;
+                    case Op.F32ToU32: SetI32(ins.Rd, unchecked((int)(uint)F32(ins.Rs1))); break;
+                    case Op.F32ToU64: SetGpr(ins.Rd, unchecked((long)(ulong)F32(ins.Rs1))); break;
+                    case Op.F64ToU32: SetI32(ins.Rd, unchecked((int)(uint)F64(ins.Rs1))); break;
+                    case Op.F64ToU64: SetGpr(ins.Rd, unchecked((long)(ulong)F64(ins.Rs1))); break;
                     case Op.BitcastI32F32: SetFpr(ins.Rd, (uint)(int)GetGpr(ins.Rs1)); break;
                     case Op.BitcastF32I32: SetI32(ins.Rd, unchecked((int)(uint)GetFpr(ins.Rs1))); break;
                     case Op.BitcastI64F64: SetFpr(ins.Rd, GetGpr(ins.Rs1)); break;

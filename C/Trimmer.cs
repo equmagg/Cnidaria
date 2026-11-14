@@ -403,12 +403,16 @@ internal static class Trimmer
             HashSet<Symbol> references,
             HashSet<string> names)
         {
+            TargetInfo target = _tree.SemanticModel.Compilation.Options.Target;
             if (_gimpleByFunction.TryGetValue(function, out var gimpleFunction))
             {
                 foreach (var block in EnumerateReachableBlocks(gimpleFunction))
                 {
                     foreach (var instruction in block.Statements)
+                    {
                         SymbolCollector.Collect(instruction.Statement, references, names);
+                        SoftFloat.CollectRoutines(target, instruction.Statement, names);
+                    }
                 }
 
                 return;
@@ -417,7 +421,10 @@ internal static class Trimmer
             foreach (var block in function.Blocks)
             {
                 foreach (var statement in block.Statements)
+                {
                     SymbolCollector.Collect(statement, references, names);
+                    SoftFloat.CollectRoutines(target, statement, names);
+                }
             }
         }
 

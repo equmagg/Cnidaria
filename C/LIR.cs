@@ -586,22 +586,9 @@ public static class LirSelect
     {
         if (branch.TrueTarget is not { } trueArm || branch.FalseTarget is not { } falseArm || ReferenceEquals(trueArm, falseArm))
             return false;
-        return IsCopyArm(trueArm, out var trueJoin, out var trueDestination) &&
-            IsCopyArm(falseArm, out var falseJoin, out var falseDestination) &&
-            ReferenceEquals(trueJoin, falseJoin) && ReferenceEquals(trueDestination, falseDestination);
-    }
-
-    private static bool IsCopyArm(LirBlock arm, out LirBlock? join, out LirVirtualRegister? destination)
-    {
-        join = null;
-        destination = null;
-        var instructions = arm.Instructions;
-        if (instructions.Length != 2 || instructions[0].Kind != LirInstructionKind.ParallelCopy ||
-            instructions[0].ParallelCopies.Length != 1 || instructions[1].Kind != LirInstructionKind.Jump)
-            return false;
-        join = instructions[1].Target;
-        destination = instructions[0].ParallelCopies[0].Destination;
-        return join is not null;
+        return TryReadArmCopy(trueArm, out LirParallelCopy trueCopy, out LirBlock trueJoin) &&
+            TryReadArmCopy(falseArm, out LirParallelCopy falseCopy, out LirBlock falseJoin) &&
+            ReferenceEquals(trueJoin, falseJoin) && ReferenceEquals(trueCopy.Destination, falseCopy.Destination);
     }
 
     /// <summary>Maps each head block whose branch only picks between two values for one register</summary>
@@ -657,20 +644,39 @@ public static class LirSelect
     {
         copy = default;
         join = null!;
-        if (!predecessors.TryGetValue(arm, out var count) || count != 1)
-            return false;
-        if (arm.Instructions.Length != 2)
+        return predecessors.TryGetValue(arm, out int count) && count == 1 && TryReadArmCopy(arm, out copy, out join);
+    }
+
+    private static bool TryReadArmCopy(LirBlock arm, out LirParallelCopy copy, out LirBlock join)
+    {
+        copy = default;
+        join = null!;
+        ImmutableArray<LirInstruction> instructions = arm.Instructions;
+        if (instructions.Length is not (2 or 3))
             return false;
 
-        var move = arm.Instructions[0];
+        LirInstruction move = instructions[^2];
         if (move.Kind != LirInstructionKind.ParallelCopy || move.ParallelCopies.Length != 1)
             return false;
 
-        var jump = arm.Instructions[1];
+        LirInstruction jump = instructions[^1];
         if (jump.Kind != LirInstructionKind.Jump || jump.Target is null)
             return false;
 
         copy = move.ParallelCopies[0];
+        if (instructions.Length == 3)
+        {
+            // A phi takes a constant through a name the arm defines for it alone, which SSA keeps from being read anywhere else
+            LirInstruction definition = instructions[0];
+            if (definition.Kind != LirInstructionKind.Copy || definition.Result is not { SourceName: not null } name ||
+                definition.Operands.Length != 1 || definition.Operands[0].Kind is not (LirOperandKind.Immediate or LirOperandKind.Register) ||
+                copy.Source.Kind != LirOperandKind.Register || !ReferenceEquals(copy.Source.Register, name))
+            {
+                return false;
+            }
+            copy = new LirParallelCopy(copy.Destination, definition.Operands[0]);
+        }
+
         join = jump.Target;
         return true;
     }
@@ -1292,10 +1298,12 @@ internal sealed class LirFunctionBuilder
     private readonly Dictionary<GimpleVariableKey, ComposedAggregate> _composedAggregates = new();
     private readonly Dictionary<GimpleStatement, (ComposedAggregate Aggregate, int Leaf)> _composedStores = new();
     private readonly Dictionary<GimpleStatement, ComposedAggregate> _composedZeros = new();
+    private readonly Dictionary<GimpleStatement, ComposedAggregate> _composedCopies = new();
     private readonly HashSet<GimpleVariableKey> _inPlaceArguments = new();
     private readonly Dictionary<Symbol, LirVirtualRegister> _indirectParameters = new();
     private readonly Dictionary<Symbol, ImmutableArray<LirVirtualRegister>> _parameterParts = new();
     private readonly Dictionary<GimpleStatement, (ComposedAggregate Parameter, ImmutableArray<LirVirtualRegister> Parts, int Leaf)> _parameterLeafReads = new();
+    private readonly Dictionary<string, FunctionSymbol> _softFloatRoutines = new(StringComparer.Ordinal);
 
     private readonly GimpleFunctionAnnotations _function;
     private readonly ControlFlowFunction _controlFlowFunction;
@@ -2008,6 +2016,12 @@ internal sealed class LirFunctionBuilder
             _currentInstruction = null;
             return;
         }
+        if (_composedCopies.TryGetValue(instruction.Statement, out var copied))
+        {
+            EmitComposedCopy(block, instruction, (GimpleAssignStatement)instruction.Statement, copied);
+            _currentInstruction = null;
+            return;
+        }
 
         switch (instruction.Statement)
         {
@@ -2173,6 +2187,12 @@ internal sealed class LirFunctionBuilder
 
         var result = GetResultRegister(assign.Lhs.Type, GetDefinitionValueNumber(instruction), destination);
 
+        if (assign.Subcode != GimpleTreeCode.ViewConvertExpr && SoftFloat.NeedsRoutine(_target, assign.Operands[0].Type, assign.Lhs.Type) &&
+            TryEmitSoftFloatUnary(block, instruction, assign, operand, result))
+        {
+            return LirOperand.ForRegister(result);
+        }
+
         if (GimpleOperators.IsConversion(assign.Subcode))
         {
             var kind = assign.Subcode == GimpleTreeCode.ViewConvertExpr
@@ -2220,10 +2240,149 @@ internal sealed class LirFunctionBuilder
         LirVirtualRegister result, ValueNumber? valueNumber)
     {
         var assign = (GimpleAssignStatement)instruction.Statement;
+        if (SoftFloat.Involves(_target, assign.Operands[0].Type, assign.Operands[1].Type) &&
+            TryEmitSoftFloatBinary(block, instruction, code, assign.Operands[0].Type, left, right, result, valueNumber))
+        {
+            return;
+        }
+
         Emit(block, LirInstructionKind.Binary, result, ImmutableArray.Create(left, right), address: null,
             op: GimpleOperators.Spelling(code), conversionKind: null, callSignature: null, parallelCopies: default,
             switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: assign,
             sourceValue: assign.Op1, sourceInstruction: instruction, valueNumber: valueNumber, treeCode: code);
+    }
+
+    private bool TryEmitSoftFloatBinary(LirBlock block, GimpleStatementAnnotations instruction, GimpleTreeCode code, QualifiedType operandType,
+        LirOperand left, LirOperand right, LirVirtualRegister result, ValueNumber? valueNumber)
+    {
+        if (SoftFloat.Arithmetic(_target, code, operandType) is string routine)
+        {
+            EmitSoftFloatCall(block, instruction, routine, operandType, result, valueNumber, (left, operandType), (right, operandType));
+            return true;
+        }
+
+        if (SoftFloat.Comparison(_target, code, operandType) is null)
+            return false;
+
+        LirOperand outcome = EmitSoftFloatComparison(block, instruction, code, operandType, left, right);
+        EmitSoftFloatStep(block, instruction, LirInstructionKind.Binary, code, result.Type, result, valueNumber,
+            outcome, LirOperand.ImmediateValue(0, outcome.Type));
+        return true;
+    }
+
+    private bool TryEmitSoftFloatUnary(LirBlock block, GimpleStatementAnnotations instruction, GimpleAssignStatement assign, LirOperand operand,
+        LirVirtualRegister result)
+    {
+        QualifiedType source = assign.Operands[0].Type;
+        ValueNumber? valueNumber = GetDefinitionValueNumber(instruction);
+        if (assign.Subcode == GimpleTreeCode.TruthNotExpr ||
+            GimpleOperators.IsConversion(assign.Subcode) && assign.Lhs.Type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Bool })
+        {
+            GimpleTreeCode code = assign.Subcode == GimpleTreeCode.TruthNotExpr ? GimpleTreeCode.EqExpr : GimpleTreeCode.NeExpr;
+            LirOperand outcome = EmitSoftFloatComparison(block, instruction, code, source, operand, LirOperand.ImmediateValue(0.0, source));
+            EmitSoftFloatStep(block, instruction, LirInstructionKind.Binary, code, result.Type, result, valueNumber,
+                outcome, LirOperand.ImmediateValue(0, outcome.Type));
+            return true;
+        }
+
+        if (assign.Subcode == GimpleTreeCode.NegateExpr)
+        {
+            LirOperand image = EmitSoftFloatImage(block, instruction, operand, source);
+            LirOperand flipped = EmitSoftFloatStep(block, instruction, LirInstructionKind.Binary, GimpleTreeCode.BitXorExpr, image.Type, null, null,
+                image, ImageConstant(image.Type, SignBit(image.Type)));
+            EmitSoftFloatStep(block, instruction, LirInstructionKind.Cast, GimpleTreeCode.ViewConvertExpr, source, result, valueNumber, flipped);
+            return true;
+        }
+
+        if (!GimpleOperators.IsConversion(assign.Subcode) ||
+            SoftFloat.Conversion(_target, source, assign.Lhs.Type, out QualifiedType argumentType, out QualifiedType resultType) is not string routine)
+        {
+            return false;
+        }
+
+        LirOperand argument = SameType(source, argumentType)
+            ? operand
+            : EmitSoftFloatStep(block, instruction, LirInstructionKind.Convert, GimpleTreeCode.NopExpr, argumentType, null, null, operand);
+        if (SameType(resultType, assign.Lhs.Type))
+        {
+            EmitSoftFloatCall(block, instruction, routine, resultType, result, valueNumber, (argument, argumentType));
+            return true;
+        }
+
+        LirVirtualRegister converted = EmitSoftFloatCall(block, instruction, routine, resultType, null, null, (argument, argumentType));
+        EmitSoftFloatStep(block, instruction, LirInstructionKind.Convert, GimpleTreeCode.NopExpr, assign.Lhs.Type, result, valueNumber,
+            LirOperand.ForRegister(converted));
+        return true;
+    }
+
+    private LirOperand EmitSoftFloatComparison(LirBlock block, GimpleStatementAnnotations instruction, GimpleTreeCode code, QualifiedType type,
+        LirOperand left, LirOperand right)
+    {
+        if (code is GimpleTreeCode.EqExpr or GimpleTreeCode.NeExpr && (IsFloatingZero(left) || IsFloatingZero(right)))
+        {
+            LirOperand image = EmitSoftFloatImage(block, instruction, IsFloatingZero(right) ? left : right, type);
+            return EmitSoftFloatStep(block, instruction, LirInstructionKind.Binary, GimpleTreeCode.BitAndExpr, image.Type, null, null,
+                image, ImageConstant(image.Type, SignBit(image.Type) - 1));
+        }
+
+        string routine = SoftFloat.Comparison(_target, code, type)
+            ?? throw new NotSupportedException("No software comparison exists for " + GimpleOperators.Name(code) + ".");
+        QualifiedType integer = TypeCatalog.Instance.Builtin(BuiltinTypeKind.Int);
+        return LirOperand.ForRegister(EmitSoftFloatCall(block, instruction, routine, integer, null, null, (left, type), (right, type)));
+    }
+
+    // The sign is the top bit of the image, so a negation flips it and a test against zero masks it off without a call
+    private LirOperand EmitSoftFloatImage(LirBlock block, GimpleStatementAnnotations instruction, LirOperand value, QualifiedType type)
+        => EmitSoftFloatStep(block, instruction, LirInstructionKind.Cast, GimpleTreeCode.ViewConvertExpr, UnsignedOfSize(_target.SizeOf(type)),
+            null, null, value);
+
+    private ulong SignBit(QualifiedType image)
+        => 1UL << (_target.SizeOf(image) * 8 - 1);
+
+    private LirOperand ImageConstant(QualifiedType image, ulong value)
+        => LirOperand.ImmediateValue(_target.SizeOf(image) == 8 ? value : (object)(uint)value, image);
+
+    private static bool IsFloatingZero(LirOperand operand)
+        => operand.Kind == LirOperandKind.Immediate && operand.Immediate is not (null or string) &&
+           Convert.ToDouble(operand.Immediate, CultureInfo.InvariantCulture) == 0.0;
+
+    private LirOperand EmitSoftFloatStep(LirBlock block, GimpleStatementAnnotations instruction, LirInstructionKind kind, GimpleTreeCode code,
+        QualifiedType type, LirVirtualRegister? destination, ValueNumber? valueNumber, params LirOperand[] operands)
+    {
+        LirVirtualRegister result = destination ?? NewVirtualRegister(type, sourceName: null, valueNumber: null);
+        bool binary = kind == LirInstructionKind.Binary;
+        Emit(block, kind, result, ImmutableArray.Create(operands), address: null,
+            op: binary ? GimpleOperators.Spelling(code) : GimpleOperators.Name(code), conversionKind: binary ? null : ConversionKindOf(code),
+            callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
+            sourceStatement: instruction.Statement, sourceValue: null, sourceInstruction: instruction, valueNumber: valueNumber, treeCode: code);
+        return LirOperand.ForRegister(result);
+    }
+
+    private LirVirtualRegister EmitSoftFloatCall(LirBlock block, GimpleStatementAnnotations instruction, string name, QualifiedType returnType,
+        LirVirtualRegister? destination, ValueNumber? valueNumber, params (LirOperand Value, QualifiedType Type)[] arguments)
+    {
+        if (!_softFloatRoutines.TryGetValue(name, out FunctionSymbol? routine))
+        {
+            var parameters = ImmutableArray.CreateBuilder<ParameterSymbol>(arguments.Length);
+            foreach ((LirOperand _, QualifiedType type) in arguments)
+                parameters.Add(new ParameterSymbol(string.Empty, type, declaringSyntax: null));
+            FunctionType signature = TypeCatalog.Instance.FunctionReturning(returnType, parameters.MoveToImmutable(), hasPrototype: true, isVariadic: false);
+            routine = new FunctionSymbol(name, new QualifiedType(signature), StorageClass.Extern, FunctionSpecifiers.None, isDefinition: false,
+                declaringSyntax: null);
+            _softFloatRoutines.Add(name, routine);
+        }
+
+        var operands = ImmutableArray.CreateBuilder<LirOperand>(arguments.Length + 1);
+        operands.Add(LirOperand.ForSymbol(routine, new QualifiedType(TypeCatalog.Instance.PointerTo(routine.Type))));
+        foreach ((LirOperand value, QualifiedType _) in arguments)
+            operands.Add(value);
+        LirVirtualRegister result = destination ?? NewVirtualRegister(returnType, sourceName: null, valueNumber: null);
+        Emit(block, LirInstructionKind.Call, result, operands.MoveToImmutable(), address: null, op: string.Empty, conversionKind: null,
+            callSignature: routine.FunctionType, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
+            sourceStatement: instruction.Statement, sourceValue: null, sourceInstruction: instruction, valueNumber: valueNumber,
+            treeCode: GimpleTreeCode.CallExpr);
+        _symbolBases.Clear();
+        return result;
     }
 
     // x86 divides once for an adjacent quotient and remainder; elsewhere the remainder is a - q*b
@@ -2359,10 +2518,11 @@ internal sealed class LirFunctionBuilder
         var destination = definition is not null && IsGimpleNameUsed(definition.Name)
             ? GetRegister(definition.Name)
             : null;
+        var home = hasLhsAddress ? TryGetCallResultHome(block, call) : null;
 
-        var value = EmitCall(block, instruction, call, functionIndex, destination);
+        var value = EmitCall(block, instruction, call, functionIndex, destination ?? home);
 
-        if (call.Lhs is null || value.Kind == LirOperandKind.Void || IsVoid(call.Type))
+        if (call.Lhs is null || value.Kind == LirOperandKind.Void || IsVoid(call.Type) || home is not null)
             return;
 
         if (definition is not null)
@@ -2380,6 +2540,22 @@ internal sealed class LirFunctionBuilder
             : EmitAddress(block, call.Lhs);
 
         Emit(block, LirInstructionKind.Store, null, ImmutableArray.Create(value), address, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: call, sourceValue: null, sourceInstruction: instruction, valueNumber: null);
+    }
+
+    // A local aggregate takes the result in its own slot, though a hidden buffer only when nothing else can reach that slot
+    private LirVirtualRegister? TryGetCallResultHome(LirBlock block, GimpleCallStatement call)
+    {
+        if (call.Lhs is null || !GimpleTypes.IsAggregate(call.Type) || GimpleTypes.IsVolatileOrAtomic(call.Lhs.Type) ||
+            !TryGetLocalAggregateKey(call.Lhs, out var key) || CAbi.RequiresHiddenReturnBuffer(_target, call.Type) && key.Temporary is null)
+            return null;
+
+        var address = EmitAddress(block, call.Lhs);
+        if (address.Kind != LirAddressKind.StackSlot || address.StackSlot is null)
+            return null;
+
+        var home = NewVirtualRegister(call.Type, sourceName: null, valueNumber: null);
+        home.HomeSlot = address.StackSlot;
+        return home;
     }
 
     private void TranslateCond(LirBlock block, GimpleStatementAnnotations instruction, GimpleCondStatement conditional)
@@ -2406,6 +2582,10 @@ internal sealed class LirFunctionBuilder
                 return;
             }
 
+            if (SoftFloat.IsSoftware(_target, conditional.Lhs.Type))
+                left = EmitSoftFloatComparison(block, instruction, GimpleTreeCode.NeExpr, conditional.Lhs.Type, left,
+                    LirOperand.ImmediateValue(0.0, conditional.Lhs.Type));
+
             Emit(block, LirInstructionKind.Branch, null, ImmutableArray.Create(left), address: null, op: string.Empty, conversionKind: null,
                 callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: trueTarget,
                 falseTarget: falseTarget, sourceStatement: conditional, sourceValue: conditional.Lhs, sourceInstruction: instruction,
@@ -2414,6 +2594,12 @@ internal sealed class LirFunctionBuilder
         }
 
         var right = rightExpression is null ? EmitValue(block, conditional.Rhs) : EmitValue(block, rightExpression);
+        if (SoftFloat.Involves(_target, conditional.Lhs.Type, conditional.Rhs.Type))
+        {
+            left = EmitSoftFloatComparison(block, instruction, conditional.Code, conditional.Lhs.Type, left, right);
+            right = LirOperand.ImmediateValue(0, left.Type);
+        }
+
         Emit(block, LirInstructionKind.Branch, null, ImmutableArray.Create(left, right), address: null,
             op: GimpleOperators.Spelling(conditional.Code), conversionKind: null, callSignature: null, parallelCopies: default,
             switchCases: default, target: null, trueTarget: trueTarget, falseTarget: falseTarget, sourceStatement: conditional,
@@ -2551,6 +2737,11 @@ internal sealed class LirFunctionBuilder
                                 passed.Argument = CAbi.ClassifyValue(_target, passed.Type, isReturn: false, isVariadicUnnamedArgument: false);
                         }
                         break;
+
+                    case GimpleAssignStatement { IsCopy: true, IsConstructor: false, Op1: GimpleValue source } copy when
+                        GimpleTypes.IsAggregate(copy.Lhs.Type) && !GimpleTypes.IsVolatileOrAtomic(copy.Lhs.Type):
+                        TryAddComposedCandidate(candidates, locals, source, out _);
+                        break;
                 }
             }
         }
@@ -2559,6 +2750,7 @@ internal sealed class LirFunctionBuilder
 
         var stores = new Dictionary<GimpleStatement, (GimpleVariableKey Key, int Leaf)>();
         var zeros = new Dictionary<GimpleStatement, GimpleVariableKey>();
+        var copies = new Dictionary<GimpleStatement, GimpleVariableKey>();
         var rejected = new HashSet<GimpleVariableKey>();
         var stored = new Dictionary<GimpleVariableKey, HashSet<int>>();
         var passedKeys = new HashSet<GimpleVariableKey>();
@@ -2587,6 +2779,14 @@ internal sealed class LirFunctionBuilder
                         if (!stored.TryGetValue(storeKey, out var storedLeaves))
                             stored.Add(storeKey, storedLeaves = new HashSet<int>());
                         storedLeaves.Add(leaf);
+                        continue;
+
+                    case GimpleAssignStatement { IsCopy: true, IsConstructor: false, Op1: GimpleValue source } copy when
+                        TryGetLocalAggregateKey(source, out var copyKey) && candidates.TryGetValue(copyKey, out var copied) &&
+                        GimpleTypes.IsAggregate(copy.Lhs.Type) && !GimpleTypes.IsVolatileOrAtomic(copy.Lhs.Type):
+                        RequireComposedLeaves(stored, copyKey, copied, rejected);
+                        RejectComposedReferences(copy.Lhs, candidates, rejected);
+                        copies.Add(copy, copyKey);
                         continue;
 
                     case GimpleReturnStatement { Expression: GimpleValue returned } when
@@ -2655,6 +2855,11 @@ internal sealed class LirFunctionBuilder
             if (_composedAggregates.TryGetValue(pair.Value, out var aggregate))
                 _composedZeros.Add(pair.Key, aggregate);
         }
+        foreach (var pair in copies)
+        {
+            if (_composedAggregates.TryGetValue(pair.Value, out var aggregate))
+                _composedCopies.Add(pair.Key, aggregate);
+        }
     }
 
     private static void RequireComposedLeaves(
@@ -2683,7 +2888,8 @@ internal sealed class LirFunctionBuilder
             var placement = CAbi.PlaceArgument(abi, ref cursor, _target.PointerSize);
             if (_promotedSymbols.ContainsKey(parameter) || !GimpleTypes.IsAggregate(parameter.Type) || !placement.KeepsClassification(abi))
                 continue;
-            if (abi.PassingKind == AbiPassingKind.Indirect)
+            // A stack-passed aggregate belongs to the callee, so on x86 the body reads it where the caller put it
+            if (abi.PassingKind == AbiPassingKind.Indirect || abi.PassingKind == AbiPassingKind.Stack && TargetRegisterInfo.IsX86(_target))
             {
                 _indirectParameters.Add(parameter, NewVirtualRegister(new QualifiedType(TypeCatalog.Instance.PointerTo(parameter.Type)), sourceName: null, valueNumber: null));
                 continue;
@@ -2910,7 +3116,7 @@ internal sealed class LirFunctionBuilder
                 }
                 return true;
 
-            case BuiltinType { BuiltinKind: BuiltinTypeKind.Float or BuiltinTypeKind.Double }:
+            case BuiltinType builtin when builtin.BuiltinKind is BuiltinTypeKind.Float or BuiltinTypeKind.Double or BuiltinTypeKind.LongDouble:
             case PointerType:
             case EnumType:
                 leaves.Add((offset, type));
@@ -3074,6 +3280,35 @@ internal sealed class LirFunctionBuilder
         BeginComposedBlock(aggregate);
         aggregate.Values[leaf] = value;
     }
+
+    // The copy stores the leaves where the local would have been read from, padding included in a zeroing when every leaf is zero
+    private void EmitComposedCopy(LirBlock block, GimpleStatementAnnotations instruction, GimpleAssignStatement copy, ComposedAggregate aggregate)
+    {
+        var target = TryGetExpression(instruction, 0, out var lhs) ? EmitAddress(block, lhs) : EmitAddress(block, copy.Lhs);
+        if (aggregate.Values.All(static value => value is { Kind: LirOperandKind.Immediate } immediate && IsZeroBits(immediate.Immediate)))
+        {
+            Emit(block, LirInstructionKind.ZeroMemory, null, ImmutableArray.Create(LirOperand.ImmediateValue(_target.SizeOf(aggregate.Type), TypeCatalog.Instance.Builtin(BuiltinTypeKind.Int))),
+                target, op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null,
+                falseTarget: null, sourceStatement: copy, sourceValue: null, sourceInstruction: instruction, valueNumber: null);
+            return;
+        }
+
+        for (var i = 0; i < aggregate.Leaves.Length; i++)
+        {
+            var (offset, type) = aggregate.Leaves[i];
+            Emit(block, LirInstructionKind.Store, null, ImmutableArray.Create(aggregate.Values[i]!), LirAddress.ForField(target, null, type, offset),
+                op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null,
+                trueTarget: null, falseTarget: null, sourceStatement: copy, sourceValue: null, sourceInstruction: instruction, valueNumber: null);
+        }
+    }
+
+    private static bool IsZeroBits(object? value)
+        => value switch
+        {
+            double number => BitConverter.DoubleToInt64Bits(number) == 0,
+            float number => BitConverter.SingleToInt32Bits(number) == 0,
+            _ => IsZeroObject(value),
+        };
 
     private void BeginComposedBlock(ComposedAggregate aggregate)
     {
@@ -3588,7 +3823,11 @@ internal sealed class LirFunctionBuilder
         var operands = ImmutableArray.CreateBuilder<LirOperand>(call.Arguments.Length + 1);
         operands.Add(EmitCallOperand(block, instruction, functionIndex, call.Function));
         for (var i = 0; i < call.Arguments.Length; i++)
-            operands.Add(TryEmitComposedArgument(block, call, i) ?? EmitCallOperand(block, instruction, functionIndex + 1 + i, call.Arguments[i]));
+        {
+            operands.Add(TryEmitComposedArgument(block, call, i) ??
+                TryEmitArgumentInPlace(block, instruction, call, functionIndex + 1 + i, i) ??
+                EmitCallOperand(block, instruction, functionIndex + 1 + i, call.Arguments[i]));
+        }
 
         // A destination the renamer left in memory still needs the result materialized before it is stored
         var storesToMemory = call.Lhs is not null && GetPrimaryDefinition(instruction) is null;
@@ -3605,6 +3844,20 @@ internal sealed class LirFunctionBuilder
         // and the prologue, every epilogue and the wider frame cost more than recomputing it does
         _symbolBases.Clear();
         return result is null ? LirOperand.Void : LirOperand.ForRegister(result);
+    }
+
+    // Registers and the outgoing area copy an aggregate straight from where it lies, a callee-owned copy still needs one of its own
+    private LirOperand? TryEmitArgumentInPlace(LirBlock block, GimpleStatementAnnotations instruction, GimpleCallStatement call, int operandIndex, int argumentIndex)
+    {
+        var argument = call.Arguments[argumentIndex];
+        if (!GimpleTypes.IsAggregate(argument.Type) || GimpleTypes.IsVolatileOrAtomic(argument.Type) || !IsComposableArgument(call, argumentIndex) ||
+            CAbi.ClassifyValue(_target, argument.Type, isReturn: false, isVariadicUnnamedArgument: false).PassingKind is not
+                (AbiPassingKind.Scalar or AbiPassingKind.MultiRegister or AbiPassingKind.Stack))
+        {
+            return null;
+        }
+
+        return TryEmitAggregateInPlace(block, instruction, operandIndex, argument, out var operand) ? operand : null;
     }
 
     private LirOperand EmitCallOperand(LirBlock block, GimpleStatementAnnotations instruction, int index, GimpleValue original)
@@ -5345,7 +5598,7 @@ public sealed class LirPrinter
             }
         }
 
-        return builder.ToString();
+        return NarrowStringEncoding.EscapeKeptBytes(builder.ToString());
     }
 
     private static string FormatImmediate(object? value)
@@ -5354,7 +5607,7 @@ public sealed class LirPrinter
             return "null";
 
         if (value is string text)
-            return "\"" + text.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
+            return "\"" + NarrowStringEncoding.EscapeKeptBytes(text.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal)) + "\"";
 
         if (value is char ch)
             return "'" + ch.ToString().Replace("\\", "\\\\", StringComparison.Ordinal).Replace("'", "\\'", StringComparison.Ordinal) + "'";

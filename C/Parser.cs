@@ -793,7 +793,7 @@ public sealed class Parser
             return first;
 
         var kind = first.Kind;
-        var value = new StringBuilder(first.Value as string);
+        var parts = new List<SyntaxToken> { first };
         var last = first;
         while (IsStringLiteral(Current.Kind))
         {
@@ -805,7 +805,15 @@ public sealed class Parser
                 else
                     Report(last, "Adjacent string literals have different encoding prefixes.");
             }
-            value.Append(last.Value as string);
+            parts.Add(last);
+        }
+
+        var value = new StringBuilder();
+        var wide = kind is not (SyntaxKind.StringLiteralToken or SyntaxKind.Utf8StringLiteralToken);
+        foreach (var part in parts)
+        {
+            var text = part.Value as string ?? string.Empty;
+            value.Append(wide && part.Kind == SyntaxKind.StringLiteralToken ? NarrowStringEncoding.ToWide(text) : text);
         }
 
         return new SyntaxToken(kind, first.Position, first.Text, value.ToString(), first.LeadingTrivia, last.TrailingTrivia, first.Ordinal);

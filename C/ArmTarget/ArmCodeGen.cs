@@ -534,7 +534,7 @@ public sealed class ArmCodeGenerator
         {
             if (type.Type is ArrayType)
             {
-                var bytes = Encoding.UTF8.GetBytes(text);
+                var bytes = NarrowStringEncoding.GetBytes(text);
                 var count = Math.Min(availableSize, checked(bytes.Length + 1));
                 for (var i = 0; i < count; i++)
                     section.EmitByte(i < bytes.Length ? bytes[i] : (byte)0);
@@ -659,7 +659,7 @@ public sealed class ArmCodeGenerator
             return existing;
 
         var label = CreateLocalLabel("str");
-        var bytes = Encoding.UTF8.GetBytes(text);
+        var bytes = NarrowStringEncoding.GetBytes(text);
         var offset = _strings.Align(1);
         _strings.DefineSymbol(label, offset, bytes.Length + 1, ArmObjectSymbolBinding.Local, _symbols);
         _strings.EmitBytes(bytes, bytes.Length);
@@ -875,16 +875,13 @@ public sealed class ArmCodeGenerator
         => type.Type.Kind is TypeKind.Struct or TypeKind.Union or TypeKind.Array;
 
     private static bool IsFloatType(QualifiedType type)
-        => IsFloat32(type) || IsFloat64(type) || IsLongDouble(type);
+        => IsFloat32(type) || IsFloat64(type);
 
     private static bool IsFloat32(QualifiedType type)
         => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Float };
 
     private static bool IsFloat64(QualifiedType type)
-        => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Double };
-
-    private static bool IsLongDouble(QualifiedType type)
-        => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.LongDouble };
+        => type.Type is BuiltinType builtin && builtin.BuiltinKind is BuiltinTypeKind.Double or BuiltinTypeKind.LongDouble;
 
     private sealed class FunctionEmissionContext
     {
@@ -1932,7 +1929,7 @@ public sealed class ArmCodeGenerator
             var destination = GetWritableRegister(
                 instruction.Result,
                 PreferredScratch(instruction.Result.Type, Scratch0, FpScratch0));
-            if (IsFloatType(instruction.Result.Type))
+            if (UsesFloatingRegisters(instruction.Result.Type))
                 LoadFloatingImmediate(destination, 0.0, instruction.Result.Type);
             else
                 LoadImmediate(destination, 0, RegisterSize(instruction.Result.Type));
@@ -2686,6 +2683,11 @@ public sealed class ArmCodeGenerator
         private void EmitComparisonResult(MachineRegister destination, MachineRegister left, ArmInstrKind compare, ArmOperand right, ArmCondition condition, int size)
         {
             Emit(ArmInstruction.Binary(compare, Reg(ToArm(left), size), right));
+            if (_owner._machineTarget.Is64Bit)
+            {
+                EmitConditionalOne(destination, condition, size);
+                return;
+            }
             var trueLabel = _owner.CreateLocalLabel(_functionLabel + "_cmp_true");
             var doneLabel = _owner.CreateLocalLabel(_functionLabel + "_cmp_done");
             LoadImmediate(destination, 0, size);
@@ -2707,6 +2709,11 @@ public sealed class ArmCodeGenerator
                 ArmInstrKind.Fcmp,
                 Reg(ToArmRegister(left), size),
                 Reg(ToArmRegister(right), size)));
+            if (_owner._machineTarget.Is64Bit)
+            {
+                EmitConditionalOne(destination, condition, _owner._target.RegisterSize);
+                return;
+            }
             var trueLabel = _owner.CreateLocalLabel(_functionLabel + "_fcmp_true");
             var doneLabel = _owner.CreateLocalLabel(_functionLabel + "_fcmp_done");
             LoadImmediate(destination, 0, _owner._target.RegisterSize);
@@ -2715,6 +2722,14 @@ public sealed class ArmCodeGenerator
             _owner._text.DefineLabel(trueLabel);
             LoadImmediate(destination, 1, _owner._target.RegisterSize);
             _owner._text.DefineLabel(doneLabel);
+        }
+
+        // A data-dependent branch to set a register to 1 mispredicts; csel against the zero register does not
+        private void EmitConditionalOne(MachineRegister destination, ArmCondition condition, int size)
+        {
+            LoadImmediate(destination, 1, size);
+            Emit(ArmInstruction.Ternary(ArmInstrKind.Csel, Reg(ToArm(destination), size), Reg(ToArm(destination), size),
+                Reg(ArmRegister.Xzr, size), condition));
         }
 
         // The test reads only as far as the value goes: above it the register holds nothing this may see
@@ -2727,7 +2742,7 @@ public sealed class ArmCodeGenerator
             var result = instruction.Result!;
             var operand = instruction.Operands[0];
             var size = SizeOf(result.Type);
-            if (instruction.Kind != LirInstructionKind.Cast || IsFloatType(result.Type) == IsFloatType(operand.Type) ||
+            if (instruction.Kind != LirInstructionKind.Cast || UsesFloatingRegisters(result.Type) == UsesFloatingRegisters(operand.Type) ||
                 size != SizeOf(operand.Type) || size is not (4 or 8) || size > _owner._target.RegisterSize)
             {
                 return false;
@@ -3490,11 +3505,11 @@ public sealed class ArmCodeGenerator
             RequireScalar(operand.Type, instruction);
             RequireScalar(targetType, instruction);
 
-            if (IsFloatType(targetType))
+            if (UsesFloatingRegisters(targetType))
             {
                 if (!IsVectorRegister(scratch))
                     throw Unsupported(instruction, "Floating-point conversion requires a vector scratch register.");
-                if (IsFloatType(operand.Type))
+                if (UsesFloatingRegisters(operand.Type))
                 {
                     if (RegisterSize(operand.Type) == RegisterSize(targetType))
                         return LoadOperand(operand, scratch);
@@ -3515,7 +3530,7 @@ public sealed class ArmCodeGenerator
                 return scratch;
             }
 
-            if (IsFloatType(operand.Type))
+            if (UsesFloatingRegisters(operand.Type))
             {
                 if (IsVectorRegister(scratch))
                     throw Unsupported(instruction, "Floating-to-integer conversion requires a general scratch register.");
@@ -3559,9 +3574,14 @@ public sealed class ArmCodeGenerator
                         MaterializeSymbolAddress(_owner.CreateStringLiteral(text), preferred);
                         return preferred;
                     }
-                    if (IsFloatType(operand.Type))
+                    if (UsesFloatingRegisters(operand.Type))
                     {
                         LoadFloatingImmediate(preferred, operand.Immediate, operand.Type);
+                        return preferred;
+                    }
+                    if (IsFloat32(operand.Type))
+                    {
+                        LoadImmediate(preferred, BitConverter.SingleToInt32Bits(Convert.ToSingle(operand.Immediate, CultureInfo.InvariantCulture)), 4);
                         return preferred;
                     }
                     LoadImmediate(preferred, ConvertIntegerConstant(operand.Immediate), RegisterSize(operand.Type));
@@ -3589,7 +3609,7 @@ public sealed class ArmCodeGenerator
                 case LirOperandKind.Undefined:
                 case LirOperandKind.Void:
                 case LirOperandKind.None:
-                    if (IsFloatType(operand.Type))
+                    if (UsesFloatingRegisters(operand.Type))
                         LoadFloatingImmediate(preferred, 0.0, operand.Type);
                     else
                         LoadImmediate(preferred, 0, RegisterSize(operand.Type));
@@ -4396,8 +4416,12 @@ public sealed class ArmCodeGenerator
         private bool IsSupportedFloatingScalar(QualifiedType type)
             => _owner._machineTarget.Is64Bit && (IsFloat32(type) || IsFloat64(type));
 
+        // A format computed by library routines is only bits, kept and passed like an integer of its size
+        private bool UsesFloatingRegisters(QualifiedType type)
+            => IsFloatType(type) && !SoftFloat.IsSoftware(_owner._target, type);
+
         private MachineRegister PreferredScratch(QualifiedType type, MachineRegister general, MachineRegister floating)
-            => IsFloatType(type) ? floating : general;
+            => UsesFloatingRegisters(type) ? floating : general;
 
         private int PointerScale(QualifiedType type)
         {
@@ -4414,7 +4438,7 @@ public sealed class ArmCodeGenerator
         private void RequireScalar(QualifiedType type, LirInstruction? instruction)
         {
             var supportedFloat = IsSupportedFloatingScalar(type);
-            if ((IsFloatType(type) && !supportedFloat) || IsAggregateType(type) || SizeOf(type) > _owner._target.RegisterSize)
+            if ((UsesFloatingRegisters(type) && !supportedFloat) || IsAggregateType(type) || SizeOf(type) > _owner._target.RegisterSize)
             {
                 if (instruction is null)
                     throw new NotSupportedException("The ARM backend supports integer and pointer scalars no wider than one machine register and AArch64 float/double scalars.");
@@ -4467,12 +4491,7 @@ public sealed class ArmCodeGenerator
                     return true;
                 case LirInstructionKind.Binary:
                     if (instruction.Operands.Any(operand => IsFloatType(operand.Type)))
-                    {
-                        if (!TryEmitDoubleZeroComparison(instruction))
-                            throw Unsupported(instruction, "Floating-point binary operations are not supported on ARM32.");
-                        StoreNarrowResult(instruction.Result!, Scratch0);
-                        return true;
-                    }
+                        throw Unsupported(instruction, "Floating-point binary operations are not supported on ARM32.");
                     EmitWideBinary(instruction);
                     return true;
                 case LirInstructionKind.Load when IsWideScalar(instruction.Result!.Type):
@@ -4489,18 +4508,14 @@ public sealed class ArmCodeGenerator
                     return true;
                 case LirInstructionKind.Branch when instruction.Operands.Length == 2 && IsComparisonOperator(instruction.Operator):
                     if (instruction.Operands.Any(operand => IsFloatType(operand.Type)))
-                    {
-                        if (!TryEmitDoubleZeroComparison(instruction))
-                            throw Unsupported(instruction, "Floating-point comparisons are not supported on ARM32.");
-                    }
-                    else
-                        EmitWideRelation(instruction.Operator, instruction.Operands[0], instruction.Operands[1], Scratch0, instruction);
+                        throw Unsupported(instruction, "Floating-point comparisons are not supported on ARM32.");
+                    EmitWideRelation(instruction.Operator, instruction.Operands[0], instruction.Operands[1], Scratch0, instruction);
                     EmitWideTruthBranch(instruction);
                     return true;
                 case LirInstructionKind.Branch when instruction.Operands.Length == 1:
+                    if (IsFloatType(instruction.Operands[0].Type))
+                        throw Unsupported(instruction, "Floating-point comparisons are not supported on ARM32.");
                     LoadWide(instruction.Operands[0], Scratch0, Scratch1, instruction);
-                    if (IsArm32Double(instruction.Operands[0].Type))
-                        EmitWideAluImmediate(ArmInstrKind.Lsl, Scratch1, Scratch1, 1);
                     Emit(ArmInstruction.Ternary(ArmInstrKind.Orr, Reg(ToArm(Scratch0), 4), Reg(ToArm(Scratch0), 4), Reg(ToArm(Scratch1), 4)));
                     EmitWideTruthBranch(instruction);
                     return true;
@@ -4509,29 +4524,6 @@ public sealed class ArmCodeGenerator
                 default:
                     return false;
             }
-        }
-
-        private bool TryEmitDoubleZeroComparison(LirInstruction instruction)
-        {
-            if (instruction.Operator is not "==" and not "!=" ||
-                !IsArm32Double(instruction.Operands[0].Type) || !IsArm32Double(instruction.Operands[1].Type))
-                return false;
-            var left = instruction.Operands[0];
-            var right = instruction.Operands[1];
-            LirOperand value;
-            if (left.Kind == LirOperandKind.Immediate && Convert.ToDouble(left.Immediate, CultureInfo.InvariantCulture) == 0.0)
-                value = right;
-            else if (right.Kind == LirOperandKind.Immediate && Convert.ToDouble(right.Immediate, CultureInfo.InvariantCulture) == 0.0)
-                value = left;
-            else
-                return false;
-            LoadWide(value, Scratch0, Scratch1, instruction);
-            EmitWideAluImmediate(ArmInstrKind.Lsl, Scratch1, Scratch1, 1);
-            EmitWideAlu(ArmInstrKind.Orr, Scratch0, Scratch0, Scratch1);
-            EmitBooleanFromRegister(Scratch0, Scratch0, 4);
-            if (instruction.Operator == "==")
-                EmitWideAluImmediate(ArmInstrKind.Eor, Scratch0, Scratch0, 1);
-            return true;
         }
 
         private void EmitWideTruthBranch(LirInstruction instruction)
@@ -4607,14 +4599,8 @@ public sealed class ArmCodeGenerator
         {
             var result = instruction.Result!;
             var source = instruction.Operands[0];
-            if (IsArm32Double(result.Type) && IsIntegerLike(source.Type))
-            {
-                EmitIntegerToDouble(instruction);
-                return;
-            }
-            var toBoolean = result.Type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Bool };
-            if ((IsFloatType(result.Type) || IsFloatType(source.Type)) &&
-                !(IsArm32Double(source.Type) && (IsArm32Double(result.Type) || toBoolean)))
+            if ((IsFloatType(result.Type) || IsFloatType(source.Type)) && !(IsWideScalar(result.Type) && IsWideScalar(source.Type) &&
+                (instruction.Kind == LirInstructionKind.Cast || IsArm32Double(result.Type) == IsArm32Double(source.Type))))
                 throw Unsupported(instruction, "This floating-point conversion is not supported on ARM32.");
 
             LoadWide(source, Scratch0, Scratch1, instruction);
@@ -4624,84 +4610,12 @@ public sealed class ArmCodeGenerator
                 return;
             }
 
-            if (toBoolean)
+            if (result.Type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Bool })
             {
-                if (IsArm32Double(source.Type))
-                    EmitWideAluImmediate(ArmInstrKind.Lsl, Scratch1, Scratch1, 1);
                 EmitWideAlu(ArmInstrKind.Orr, Scratch0, Scratch0, Scratch1);
                 EmitBooleanFromRegister(Scratch0, Scratch0, 4);
             }
             StoreNarrowResult(result, Scratch0);
-        }
-
-        private void EmitIntegerToDouble(LirInstruction instruction)
-        {
-            var source = instruction.Operands[0];
-            var magnitude = _owner.CreateLocalLabel(_functionLabel + "_double_magnitude");
-            var lowWord = _owner.CreateLocalLabel(_functionLabel + "_double_low_word");
-            var normalized = _owner.CreateLocalLabel(_functionLabel + "_double_normalized");
-            var round = _owner.CreateLocalLabel(_functionLabel + "_double_round");
-            var sign = _owner.CreateLocalLabel(_functionLabel + "_double_sign");
-            var done = _owner.CreateLocalLabel(_functionLabel + "_double_done");
-            LoadWide(source, Scratch0, Scratch1, instruction);
-            if (IsSignedIntegerType(source.Type))
-                EmitWideAluImmediate(ArmInstrKind.And, Scratch2, Scratch1, 0x80000000u);
-            else
-                LoadImmediate(Scratch2, 0, 4);
-            StoreToMemory(Scratch2, _wideTempOffset + WideQuotientSignOffset, 4);
-            if (IsSignedIntegerType(source.Type))
-            {
-                Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch1), 4), ArmOperand.ImmediateOperand(0)));
-                EmitConditionalJump(ArmCondition.Ge, magnitude);
-                EmitWideNegate(Scratch0, Scratch1);
-                _owner._text.DefineLabel(magnitude);
-            }
-
-            EmitWideAlu(ArmInstrKind.Orr, Scratch2, Scratch0, Scratch1);
-            Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch2), 4), ArmOperand.ImmediateOperand(0)));
-            EmitConditionalJump(ArmCondition.Eq, done);
-            Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch1), 4), ArmOperand.ImmediateOperand(0)));
-            EmitConditionalJump(ArmCondition.Eq, lowWord);
-            Emit(ArmInstruction.Binary(ArmInstrKind.Clz, Reg(ToArm(Scratch2), 4), Reg(ToArm(Scratch1), 4)));
-            EmitWideAlu(ArmInstrKind.Lsl, Scratch1, Scratch1, Scratch2);
-            LoadImmediate(Scratch3, 32, 4);
-            EmitWideAlu(ArmInstrKind.Sub, Scratch3, Scratch3, Scratch2);
-            EmitWideAlu(ArmInstrKind.Lsr, Scratch4, Scratch0, Scratch3);
-            EmitWideAlu(ArmInstrKind.Orr, Scratch1, Scratch1, Scratch4);
-            EmitWideAlu(ArmInstrKind.Lsl, Scratch0, Scratch0, Scratch2);
-            EmitJump(normalized);
-            _owner._text.DefineLabel(lowWord);
-            Emit(ArmInstruction.Binary(ArmInstrKind.Clz, Reg(ToArm(Scratch2), 4), Reg(ToArm(Scratch0), 4)));
-            EmitWideAlu(ArmInstrKind.Lsl, Scratch1, Scratch0, Scratch2);
-            LoadImmediate(Scratch0, 0, 4);
-            EmitWideAluImmediate(ArmInstrKind.Add, Scratch2, Scratch2, 32);
-            _owner._text.DefineLabel(normalized);
-
-            // The exponent starts at 1023 + 63 - shift - 1 and receives the leading significand bit
-            LoadImmediate(Scratch3, 1085, 4);
-            EmitWideAlu(ArmInstrKind.Sub, Scratch3, Scratch3, Scratch2);
-            EmitWideAluImmediate(ArmInstrKind.Lsl, Scratch3, Scratch3, 20);
-            LoadImmediate(Scratch4, 0x7ff, 4);
-            EmitWideAlu(ArmInstrKind.And, Scratch2, Scratch0, Scratch4);
-            EmitWideAluImmediate(ArmInstrKind.Lsr, Scratch0, Scratch0, 11);
-            EmitWideAluImmediate(ArmInstrKind.Lsl, Scratch4, Scratch1, 21);
-            EmitWideAlu(ArmInstrKind.Orr, Scratch0, Scratch0, Scratch4);
-            EmitWideAluImmediate(ArmInstrKind.Lsr, Scratch1, Scratch1, 11);
-            EmitWideAlu(ArmInstrKind.Add, Scratch1, Scratch1, Scratch3);
-            Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch2), 4), ArmOperand.ImmediateOperand(0x400)));
-            EmitConditionalJump(ArmCondition.Hi, round);
-            EmitConditionalJump(ArmCondition.Ne, sign);
-            EmitWideAluImmediate(ArmInstrKind.And, Scratch2, Scratch0, 1);
-            Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch2), 4), ArmOperand.ImmediateOperand(0)));
-            EmitConditionalJump(ArmCondition.Eq, sign);
-            _owner._text.DefineLabel(round);
-            EmitWideAluImmediate(ArmInstrKind.Adds, Scratch0, Scratch0, 1);
-            EmitWideAluImmediate(ArmInstrKind.Adc, Scratch1, Scratch1, 0);
-            _owner._text.DefineLabel(sign);
-            LoadFromMemory(Scratch2, _wideTempOffset + WideQuotientSignOffset, 4, false);
-            EmitWideAlu(ArmInstrKind.Orr, Scratch1, Scratch1, Scratch2);
-            _owner._text.DefineLabel(done);
-            StoreWideResult(instruction.Result!, Scratch0, Scratch1);
         }
 
         private void EmitWideNegate(MachineRegister low, MachineRegister high)
@@ -4715,29 +4629,9 @@ public sealed class ArmCodeGenerator
         private void EmitWideUnary(LirInstruction instruction)
         {
             var result = instruction.Result!;
+            if (IsFloatType(instruction.Operands[0].Type))
+                throw Unsupported(instruction, "Floating-point unary operations are not supported on ARM32.");
             LoadWide(instruction.Operands[0], Scratch0, Scratch1, instruction);
-            if (IsArm32Double(instruction.Operands[0].Type))
-            {
-                switch (instruction.Operator)
-                {
-                    case "+":
-                        break;
-                    case "-":
-                        EmitWideAluImmediate(ArmInstrKind.Eor, Scratch1, Scratch1, 0x80000000u);
-                        break;
-                    case "!":
-                        EmitWideAluImmediate(ArmInstrKind.Lsl, Scratch1, Scratch1, 1);
-                        EmitWideAlu(ArmInstrKind.Orr, Scratch0, Scratch0, Scratch1);
-                        EmitBooleanFromRegister(Scratch0, Scratch0, 4);
-                        EmitWideAluImmediate(ArmInstrKind.Eor, Scratch0, Scratch0, 1);
-                        StoreNarrowResult(result, Scratch0);
-                        return;
-                    default:
-                        throw Unsupported(instruction, $"Unsupported floating-point unary operator '{instruction.Operator}'.");
-                }
-                StoreWideResult(result, Scratch0, Scratch1);
-                return;
-            }
             switch (instruction.Operator)
             {
                 case "-":

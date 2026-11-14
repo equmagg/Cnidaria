@@ -11,6 +11,67 @@ namespace Cnidaria.C;
 
 // Diagnostics and lexical primitives
 
+/// <summary>A narrow literal keeps an escaped byte above 0x7F as a lone low surrogate from U+DC80 to U+DCFF, which decoded source never holds</summary>
+internal static class NarrowStringEncoding
+{
+    public static char EncodeByte(int value)
+    {
+        var octet = value & 0xFF;
+        return octet < 0x80 ? (char)octet : (char)(0xDC00 | octet);
+    }
+
+    public static int GetByteCount(string text)
+        => GetBytes(text).Length;
+
+    public static byte[] GetBytes(string text)
+    {
+        var bytes = new List<byte>(text.Length);
+        var runStart = 0;
+        for (var index = 0; index <= text.Length; index++)
+        {
+            if (index < text.Length && !IsKeptByte(text, index))
+                continue;
+            bytes.AddRange(System.Text.Encoding.UTF8.GetBytes(text.Substring(runStart, index - runStart)));
+            if (index < text.Length)
+                bytes.Add((byte)text[index]);
+            runStart = index + 1;
+        }
+        return bytes.ToArray();
+    }
+
+    // A narrow literal joined to a wide one reads each kept byte as the code unit of that value
+    public static string ToWide(string text)
+    {
+        var builder = new System.Text.StringBuilder(text.Length);
+        for (var index = 0; index < text.Length; index++)
+            builder.Append(IsKeptByte(text, index) ? (char)(text[index] & 0xFF) : text[index]);
+        return builder.ToString();
+    }
+
+    // No Unicode writer accepts a lone surrogate, so printed text shows each kept byte as an \x escape
+    public static string EscapeKeptBytes(string text)
+    {
+        System.Text.StringBuilder? builder = null;
+        for (int index = 0; index < text.Length; index++)
+        {
+            if (IsKeptByte(text, index))
+            {
+                builder ??= new System.Text.StringBuilder(text, 0, index, text.Length + 8);
+                builder.Append("\\x").Append(((int)text[index] & 0xFF).ToString("x2", CultureInfo.InvariantCulture));
+            }
+            else
+            {
+                builder?.Append(text[index]);
+            }
+        }
+        return builder?.ToString() ?? text;
+    }
+
+    // A low surrogate after a high one is half of a character, never a kept byte
+    private static bool IsKeptByte(string text, int index)
+        => text[index] is >= '\uDC80' and <= '\uDCFF' && (index == 0 || !char.IsHighSurrogate(text[index - 1]));
+}
+
 
 ///<summary>Stores a diagnostic and its source span</summary>
 public readonly struct SyntaxDiagnostic : IDiagnostic
@@ -2371,8 +2432,9 @@ public sealed class Lexer
         if (!terminated)
             Error(start, _position - start, $"Unterminated {(quote == '\'' ? "character" : "string")} literal.");
 
+        var narrowString = kind is SyntaxKind.StringLiteralToken or SyntaxKind.Utf8StringLiteralToken;
         var value = terminated
-            ? DecodeQuotedLiteralValue(text, prefixLength, quote, start)
+            ? DecodeQuotedLiteralValue(text, prefixLength, quote, start, narrowString)
             : text;
 
         return MakeToken(
@@ -2383,7 +2445,7 @@ public sealed class Lexer
             leadingTrivia);
     }
 
-    private object DecodeQuotedLiteralValue(string text, int prefixLength, char quote, int diagnosticStart)
+    private object DecodeQuotedLiteralValue(string text, int prefixLength, char quote, int diagnosticStart, bool narrowString)
     {
         var start = prefixLength + 1;
         var end = Math.Max(start, text.Length - 1);
@@ -2436,7 +2498,7 @@ public sealed class Lexer
                             index++;
                             digits++;
                         }
-                        builder.Append(unchecked((char)value));
+                        builder.Append(narrowString ? NarrowStringEncoding.EncodeByte(value) : unchecked((char)value));
                         break;
                     }
 
@@ -2455,7 +2517,7 @@ public sealed class Lexer
                             value = unchecked((value << 4) + (int)HexValue(text[index]));
                             index++;
                         }
-                        builder.Append(unchecked((char)value));
+                        builder.Append(narrowString ? NarrowStringEncoding.EncodeByte(value) : unchecked((char)value));
                         break;
                     }
 

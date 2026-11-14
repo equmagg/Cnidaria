@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Globalization;
 using System.Linq;
-using System.Text;
 
 namespace Cnidaria.C;
 
@@ -977,7 +976,7 @@ internal sealed class DeclarationCollector
             return false;
         }
 
-        length = checked((long)Encoding.UTF8.GetByteCount(text) + 1L);
+        length = checked((long)NarrowStringEncoding.GetByteCount(text) + 1L);
         return true;
     }
 

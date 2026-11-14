@@ -9,11 +9,11 @@ namespace Cnidaria.Cs
     internal sealed class DeclarationResult
     {
         public NamespaceSymbol GlobalNamespace { get; }
-        public ImmutableDictionary<SyntaxTree, ImmutableDictionary<SyntaxNode, Symbol>> DeclaredSymbolsByTree { get; }
+        public IReadOnlyDictionary<SyntaxTree, IReadOnlyDictionary<SyntaxNode, Symbol>> DeclaredSymbolsByTree { get; }
 
         public DeclarationResult(
             NamespaceSymbol globalNamespace,
-            ImmutableDictionary<SyntaxTree, ImmutableDictionary<SyntaxNode, Symbol>> declaredSymbolsByTree)
+            IReadOnlyDictionary<SyntaxTree, IReadOnlyDictionary<SyntaxNode, Symbol>> declaredSymbolsByTree)
         {
             GlobalNamespace = globalNamespace;
             DeclaredSymbolsByTree = declaredSymbolsByTree;
@@ -27,7 +27,7 @@ namespace Cnidaria.Cs
         private readonly TypeManager _types;
         private readonly bool _isCoreLibrary;
         private readonly SourceNamespaceSymbol _global;
-        private readonly Dictionary<SyntaxTree, Dictionary<SyntaxNode, Symbol>> _declByTree = new();
+        private readonly OrderedDictionary<SyntaxTree, OrderedDictionary<SyntaxNode, Symbol>> _declByTree = new();
 
         private readonly Dictionary<(Symbol container, string name, int arity), NamedTypeSymbol> _typeCache = new();
         private readonly Dictionary<NamedTypeSymbol, int> _extensionBlockCounts = new();
@@ -54,7 +54,7 @@ namespace Cnidaria.Cs
         {
             foreach (var tree in trees)
             {
-                _declByTree[tree] = new Dictionary<SyntaxNode, Symbol>();
+                _declByTree[tree] = new OrderedDictionary<SyntaxNode, Symbol>();
                 DeclareCompilationUnit(tree, tree.Root, _global);
             }
             CompleteDelegateBaseTypes();
@@ -63,11 +63,10 @@ namespace Cnidaria.Cs
             DeclarePrimaryConstructors();
             SynthesizeDefaultConstructors();
             SynthesizeTypeInitializers();
-            var immutable = _declByTree.ToImmutableDictionary(
-                kv => kv.Key,
-                kv => kv.Value.ToImmutableDictionary());
-
-            return new DeclarationResult(_global, immutable);
+            var declared = new OrderedDictionary<SyntaxTree, IReadOnlyDictionary<SyntaxNode, Symbol>>(_declByTree.Count);
+            foreach ((SyntaxTree tree, OrderedDictionary<SyntaxNode, Symbol> symbols) in _declByTree)
+                declared.Add(tree, symbols);
+            return new DeclarationResult(_global, declared);
         }
         private void DeclarePrimaryConstructors()
         {
@@ -1402,6 +1401,7 @@ namespace Cnidaria.Cs
             method.SetTypeParameters(DeclareExtensionTypeParameters(tree, method, block, ownTypeParameters));
             method.SetExtensionMember(info);
             method.AddDeclaration(new SyntaxReference(tree, declaration));
+            container.MarkMayContainExtensionMembers(inBlock: true);
             AddMemberToType(container, method);
             return method;
         }
@@ -1688,6 +1688,8 @@ namespace Cnidaria.Cs
 
             method.SetParameters(ps.ToImmutable());
             method.AddDeclaration(new SyntaxReference(tree, syntax));
+            if (method.IsExtensionMethod)
+                container.MarkMayContainExtensionMembers(inBlock: false);
 
             AddMemberToType(container, method);
             RecordDeclared(tree, syntax, method);

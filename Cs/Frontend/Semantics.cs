@@ -930,8 +930,7 @@ namespace Cnidaria.Cs
         internal bool DeclarationsBound { get; set; }
         internal Dictionary<MethodSymbol, List<MethodGroupWrapper>> MethodGroupWrappers { get; } = new(ReferenceEqualityComparer<MethodSymbol>.Instance);
         internal TypeManager TypeManager => _types;
-        internal ImmutableDictionary<SyntaxTree, ImmutableDictionary<SyntaxNode, Symbol>> DeclaredSymbolsByTree { get; }
-            = ImmutableDictionary<SyntaxTree, ImmutableDictionary<SyntaxNode, Symbol>>.Empty;
+        internal IReadOnlyDictionary<SyntaxTree, IReadOnlyDictionary<SyntaxNode, Symbol>> DeclaredSymbolsByTree { get; }
         private readonly Dictionary<(SyntaxTree Tree, bool IgnoreAccessibility), SemanticModel> _semanticModelCache = new();
         private readonly Dictionary<MethodSymbol, IRLowering.IteratorStateMachineInfo> _iteratorStateMachines =
             new(ReferenceEqualityComparer<MethodSymbol>.Instance);
@@ -939,7 +938,7 @@ namespace Cnidaria.Cs
             ImmutableArray<SyntaxTree> syntaxTrees,
             NamespaceSymbol sourceGlobalNamespace,
             MethodSymbol? entryPoint,
-            ImmutableDictionary<SyntaxTree, ImmutableDictionary<SyntaxNode, Symbol>> declaredSymbolsByTree,
+            IReadOnlyDictionary<SyntaxTree, IReadOnlyDictionary<SyntaxNode, Symbol>> declaredSymbolsByTree,
             TypeManager types,
             CompilationOptions? options = null)
         {
@@ -1183,7 +1182,7 @@ namespace Cnidaria.Cs
                     foreach (var record in RecordBinder.GetRecords(compilation).Where(r => ReferenceEquals(r.Tree, tree)))
                         foreach (var body in record.Bodies)
                             Lower(body);
-                    if (compilation.DeclaredSymbolsByTree.TryGetValue(tree, out ImmutableDictionary<SyntaxNode, Symbol>? declaredInTree))
+                    if (compilation.DeclaredSymbolsByTree.TryGetValue(tree, out IReadOnlyDictionary<SyntaxNode, Symbol>? declaredInTree))
                     {
                         foreach (Symbol declared in declaredInTree.Values)
                         {
@@ -1321,7 +1320,7 @@ namespace Cnidaria.Cs
                 return topLevel.IsAsync ? topLevel : null;
 
             MethodSymbol? candidate = null;
-            foreach (ImmutableDictionary<SyntaxNode, Symbol> symbols in compilation.DeclaredSymbolsByTree.Values)
+            foreach (IReadOnlyDictionary<SyntaxNode, Symbol> symbols in compilation.DeclaredSymbolsByTree.Values)
             {
                 foreach (Symbol symbol in symbols.Values)
                 {

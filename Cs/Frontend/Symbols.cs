@@ -668,6 +668,32 @@ namespace Cnidaria.Cs
         public abstract ImmutableArray<NamedTypeSymbol> GetTypeMembers();
         public ImmutableArray<NamedTypeSymbol> GetTypeMembers(string name)
             => GetTypeMembers(name, arity: -1);
+
+        private ImmutableArray<NamedTypeSymbol> _extensionContainerTypes;
+        private ImmutableArray<NamedTypeSymbol> _extensionBlockContainerTypes;
+
+        // Extension lookup runs for most calls and operators, a namespace holds few types that may declare extensions
+        internal virtual ImmutableArray<NamedTypeSymbol> GetExtensionContainerTypes(bool blocksOnly)
+        {
+            ref ImmutableArray<NamedTypeSymbol> cached = ref blocksOnly ? ref _extensionBlockContainerTypes : ref _extensionContainerTypes;
+            if (cached.IsDefault)
+            {
+                var builder = ImmutableArray.CreateBuilder<NamedTypeSymbol>();
+                foreach (NamedTypeSymbol type in GetTypeMembers())
+                {
+                    if (blocksOnly ? type.MayContainExtensionBlocks : type.MayContainExtensionMembers)
+                        builder.Add(type);
+                }
+                cached = builder.ToImmutable();
+            }
+            return cached;
+        }
+
+        private protected void InvalidateExtensionContainerTypes()
+        {
+            _extensionContainerTypes = default;
+            _extensionBlockContainerTypes = default;
+        }
     }
 
     /// <summary>Base abstraction for a resolved type</summary>
@@ -760,6 +786,9 @@ namespace Cnidaria.Cs
         public virtual bool IsRecord => TypeKind == TypeKind.Class && GetMembers().OfType<MethodSymbol>().Any(m => m.Name == "<Clone>$");
         internal virtual bool MayContainExtensionMembers => true;
         internal virtual bool MayContainExtensionBlocks => true;
+        internal virtual void MarkMayContainExtensionMembers(bool inBlock)
+        {
+        }
         internal virtual IEnumerable<NamedTypeSymbol> GetNestedTypes() => GetMembers().OfType<NamedTypeSymbol>();
         public abstract int Arity { get; }
         public virtual bool IsSealed => false;
@@ -1771,6 +1800,7 @@ namespace Cnidaria.Cs
             if (!_typesByName.TryGetValue(key, out var list))
                 _typesByName[key] = list = new List<NamedTypeSymbol>();
             list.Add(type);
+            InvalidateExtensionContainerTypes();
         }
 
         public override ImmutableArray<NamespaceSymbol> GetNamespaceMembers()
@@ -2046,9 +2076,9 @@ namespace Cnidaria.Cs
         public override bool IsFromMetadata { get; }
         private bool _mayContainExtensionMembers;
         private bool _mayContainExtensionBlocks;
-        internal override bool MayContainExtensionMembers => !IsFromMetadata || _mayContainExtensionMembers;
-        internal override bool MayContainExtensionBlocks => !IsFromMetadata || _mayContainExtensionBlocks;
-        internal void MarkMayContainExtensionMembers(bool inBlock)
+        internal override bool MayContainExtensionMembers => _mayContainExtensionMembers;
+        internal override bool MayContainExtensionBlocks => _mayContainExtensionBlocks;
+        internal override void MarkMayContainExtensionMembers(bool inBlock)
         {
             _mayContainExtensionMembers = true;
             _mayContainExtensionBlocks |= inBlock;
@@ -3020,6 +3050,7 @@ namespace Cnidaria.Cs
             if (!_types.TryGetValue(key, out var list))
                 _types[key] = list = new List<NamedTypeSymbol>();
             list.Add(type);
+            InvalidateExtensionContainerTypes();
         }
 
         public override ImmutableArray<NamespaceSymbol> GetNamespaceMembers()
@@ -3092,6 +3123,15 @@ namespace Cnidaria.Cs
             IsReferenceType = isRef;
             IsValueType = isVal;
             BaseType = baseType;
+        }
+        private bool _mayContainExtensionMembers;
+        private bool _mayContainExtensionBlocks;
+        internal override bool MayContainExtensionMembers => _mayContainExtensionMembers;
+        internal override bool MayContainExtensionBlocks => _mayContainExtensionBlocks;
+        internal override void MarkMayContainExtensionMembers(bool inBlock)
+        {
+            _mayContainExtensionMembers = true;
+            _mayContainExtensionBlocks |= inBlock;
         }
         internal void MarkSealed() => _isSealed = true;
         internal void MarkUnsafe() => IsUnsafe = true;
@@ -3189,6 +3229,16 @@ namespace Cnidaria.Cs
             var b = _b.GetTypeMembers();
             if (a.IsDefaultOrEmpty) return b;
             if (b.IsDefaultOrEmpty) return a;
+            return a.AddRange(b);
+        }
+        internal override ImmutableArray<NamedTypeSymbol> GetExtensionContainerTypes(bool blocksOnly)
+        {
+            ImmutableArray<NamedTypeSymbol> a = _a.GetExtensionContainerTypes(blocksOnly);
+            ImmutableArray<NamedTypeSymbol> b = _b.GetExtensionContainerTypes(blocksOnly);
+            if (a.IsEmpty)
+                return b;
+            if (b.IsEmpty)
+                return a;
             return a.AddRange(b);
         }
     }

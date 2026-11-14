@@ -363,7 +363,7 @@ public static class ScalarReplacement
             else
             {
                 if (type.Type.Kind is not (TypeKind.Builtin or TypeKind.Enum or TypeKind.Pointer) ||
-                    type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Void or BuiltinTypeKind.LongDouble } ||
+                    type.Type is BuiltinType builtin && builtin.BuiltinKind == BuiltinTypeKind.Void ||
                     ++leaves > _options.MaxFieldsPerAggregate) return null;
                 layout.Size = _target.SizeOf(type);
                 layout.Alignment = _target.AlignOf(type);
@@ -377,7 +377,7 @@ public static class ScalarReplacement
 
         private static bool IsViewable(QualifiedType type)
             => !IsObservable(type) && (type.Type.Kind is TypeKind.Enum or TypeKind.Pointer ||
-               type.Type is BuiltinType { BuiltinKind: not (BuiltinTypeKind.Void or BuiltinTypeKind.LongDouble or BuiltinTypeKind.Bool) });
+               type.Type is BuiltinType builtin && builtin.BuiltinKind is not (BuiltinTypeKind.Void or BuiltinTypeKind.Bool));
 
         private bool Append(Layout parent, FieldSymbol? field, Layout child)
         {

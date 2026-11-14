@@ -1031,12 +1031,13 @@ namespace Cnidaria.Cs
                         Field(syntax, This(syntax, info), info.ThisField)));
                 }
 
-                foreach (var kv in info.ParameterFields)
+                foreach (ParameterSymbol parameter in info.OriginalBody.Method.Parameters)
                 {
+                    FieldSymbol field = info.ParameterFields[parameter];
                     statements.Add(AssignStmt(
                         syntax,
-                        Field(syntax, smLocalExpr, kv.Value),
-                        Field(syntax, This(syntax, info), kv.Value)));
+                        Field(syntax, smLocalExpr, field),
+                        Field(syntax, This(syntax, info), field)));
                 }
 
                 statements.Add(new BoundReturnStatement(syntax, smLocalExpr));

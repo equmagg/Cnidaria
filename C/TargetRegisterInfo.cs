@@ -494,7 +494,7 @@ internal static class TargetRegisterInfo
         if (target is null)
             throw new ArgumentNullException(nameof(target));
 
-        if (!CAbi.IsFloating(type))
+        if (!CAbi.IsFloating(type) || SoftFloat.IsSoftware(target, type))
             return LirRegisterClass.General;
 
         if (target.IsRiscV)

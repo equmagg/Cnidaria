@@ -2100,7 +2100,7 @@ namespace Cnidaria.Cs
 
             return !replacedEvent && b.Count == members.Length ? members : b.ToImmutable();
         }
-        // Metadata types say whether they hold extension methods or C# 14 extension blocks, so lookups decode only those
+        // A type says whether it may hold extension methods or C# 14 extension blocks, so lookups decode only those
         private IEnumerable<NamedTypeSymbol> EnumerateExtensionContainerTypes(BindingContext context, bool blocksOnly = false)
         {
             var imports = GetImports(context);
@@ -2126,9 +2126,9 @@ namespace Cnidaria.Cs
 
                     case NamespaceSymbol ns:
                         {
-                            var types = ns.GetTypeMembers();
+                            var types = ns.GetExtensionContainerTypes(blocksOnly);
                             for (int j = 0; j < types.Length; j++)
-                                if (MayHold(types[j]) && seen.Add(types[j]))
+                                if (seen.Add(types[j]))
                                     yield return types[j];
                             break;
                         }
@@ -2140,9 +2140,9 @@ namespace Cnidaria.Cs
             {
                 if (s is NamespaceSymbol curNs)
                 {
-                    var types = curNs.GetTypeMembers();
+                    var types = curNs.GetExtensionContainerTypes(blocksOnly);
                     for (int j = 0; j < types.Length; j++)
-                        if (MayHold(types[j]) && seen.Add(types[j]))
+                        if (seen.Add(types[j]))
                             yield return types[j];
                     break;
                 }

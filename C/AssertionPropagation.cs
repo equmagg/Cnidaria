@@ -152,12 +152,25 @@ internal sealed class AssertionTable
         return true;
     }
 
+    // A constant is its bits read in its own type, whichever integer happens to box them
+    private bool TryGetTypedConstant(GimpleConstantValue constant, out Int128 value)
+    {
+        if (!TryGetConstant(constant, out value))
+            return false;
+        if (TryGetTypeRange(constant.Type, out var range))
+        {
+            Int128 span = range.Max - range.Min + 1;
+            value = range.Min + ((value - range.Min) % span + span) % span;
+        }
+        return true;
+    }
+
     private ValueRange? RangeAt(GimpleValue value, AssertionScope? scope, int depth)
     {
         ValueRange range;
         switch (value)
         {
-            case GimpleConstantValue constant when TryGetConstant(constant, out var number):
+            case GimpleConstantValue constant when TryGetTypedConstant(constant, out var number):
                 return new ValueRange(number, number);
             case GimpleName name when GlobalRange(name) is { } global:
                 range = global;
@@ -178,7 +191,7 @@ internal sealed class AssertionTable
 
         if (depth > 0 && value is GimpleName derived && GimpleTypes.HasUndefinedOverflow(derived.Type, _target) &&
             derived.Definition?.Statement is GimpleAssignStatement { Subcode: GimpleTreeCode.PlusExpr or GimpleTreeCode.MinusExpr, Operands: [GimpleName source, GimpleConstantValue offset] } assign &&
-            TryGetConstant(offset, out var amount) && RangeAt(source, scope, depth - 1) is { } sourceRange)
+            TryGetTypedConstant(offset, out var amount) && RangeAt(source, scope, depth - 1) is { } sourceRange)
         {
             var shift = assign.Subcode == GimpleTreeCode.PlusExpr ? amount : -amount;
             range = range.Intersect(new ValueRange(sourceRange.Min + shift, sourceRange.Max + shift));
@@ -321,7 +334,7 @@ internal sealed class AssertionTable
         if (value.Definition?.Statement is not GimpleAssignStatement { Operands.Length: 2 } assign ||
             assign.Subcode is not (GimpleTreeCode.PlusExpr or GimpleTreeCode.MinusExpr) ||
             !ReferenceEquals(assign.Operands[0], phi) || assign.Operands[1] is not GimpleConstantValue constant ||
-            !TryGetConstant(constant, out var amount))
+            !TryGetTypedConstant(constant, out var amount))
             return false;
         step = assign.Subcode == GimpleTreeCode.PlusExpr ? amount : -amount;
         return true;
@@ -330,7 +343,7 @@ internal sealed class AssertionTable
     private ValueRange? Operand(GimpleValue value)
         => value switch
         {
-            GimpleConstantValue constant when TryGetConstant(constant, out var number) => new ValueRange(number, number),
+            GimpleConstantValue constant when TryGetTypedConstant(constant, out var number) => new ValueRange(number, number),
             GimpleName name => GlobalRange(name),
             _ => null,
         };

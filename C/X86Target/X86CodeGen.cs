@@ -152,9 +152,12 @@ public sealed class X86CodeGenerator
         // A superset of IsFoldableLoad, which also wants the one use and no spill
         public bool MayFoldLoad(LirInstruction? previous, LirInstruction instruction)
             => previous is { Kind: LirInstructionKind.Load, Result: not null, Address: not null } &&
-               instruction.Kind == LirInstructionKind.Binary && instruction.Operands.Length == 2 &&
-               instruction.Operands[1].Kind == LirOperandKind.Register &&
-               ReferenceEquals(instruction.Operands[1].Register, previous.Result);
+               (instruction.Kind is LirInstructionKind.Binary or LirInstructionKind.Branch && instruction.Operands.Length == 2 &&
+                   (ReadsRegister(instruction.Operands[0], previous.Result) || ReadsRegister(instruction.Operands[1], previous.Result)) ||
+                instruction.Kind == LirInstructionKind.Branch && instruction.Operands.Length == 1 && ReadsRegister(instruction.Operands[0], previous.Result));
+
+        public static bool ReadsRegister(LirOperand operand, LirVirtualRegister register)
+            => operand.Kind == LirOperandKind.Register && ReferenceEquals(operand.Register, register);
 
         public bool ReadsRightAfterWrite(LirInstruction instruction)
         {
@@ -251,7 +254,7 @@ public sealed class X86CodeGenerator
             => operand.Kind is not (LirOperandKind.Void or LirOperandKind.None or LirOperandKind.Undefined);
 
         private bool IsUnhandled(QualifiedType type)
-            => IsLongDouble(type) || NeedsBlockCopy(_target, type) || IsWideInteger(_target, type);
+            => NeedsBlockCopy(_target, type) || IsWideInteger(_target, type);
 
         private int RegisterSize(QualifiedType type)
             => RegisterWidth(_target, type);
@@ -775,7 +778,8 @@ public sealed class X86CodeGenerator
             return;
         }
 
-        RecordZeroExtension(instruction);
+        RecordExtensions(instruction);
+        RecordFlags(instruction);
         _text.Emit(_options.PositionIndependentCode ? RelaxToRipRelative(instruction) : instruction);
     }
 
@@ -853,7 +857,8 @@ public sealed class X86CodeGenerator
     {
         if (_scratchBorrowed)
             throw new InvalidOperationException($"Label '{label}' is defined while a scratch register is borrowed.");
-        ForgetZeroExtensions();
+        ForgetExtensions();
+        ForgetFlags();
         _text.DefineLabel(label);
     }
 
@@ -862,12 +867,92 @@ public sealed class X86CodeGenerator
     /// <summary>How far up a general register is known to be zero, in bits, or zero for nothing known</summary>
     private readonly int[] _zeroExtendedBits = new int[16];
 
-    internal void ForgetZeroExtensions() => Array.Clear(_zeroExtendedBits, 0, _zeroExtendedBits.Length);
+    /// <summary>From which bit up the low 32 bits of a general register repeat their sign, or zero for nothing known</summary>
+    private readonly int[] _signExtendedBits32 = new int[16];
+
+    /// <summary>From which bit up all 64 bits of a general register repeat their sign, or zero for nothing known</summary>
+    private readonly int[] _signExtendedBits64 = new int[16];
+
+    private X86Register _flagsRegister = X86Register.Invalid;
+    private int _flagsSize;
+
+    // and, or and xor clear OF and CF as test does, the arithmetic ones leave only ZF to rely on
+    private bool _flagsFromLogical;
+
+    internal int FlagsWrites { get; private set; }
+
+    internal bool FlagsReflect(X86Register register, int size, X86Condition condition)
+        => _flagsRegister == register && _flagsSize == size && (_flagsFromLogical || condition is X86Condition.E or X86Condition.Ne);
+
+    internal void ForgetFlags()
+    {
+        _flagsRegister = X86Register.Invalid;
+        FlagsWrites++;
+    }
+
+    private void RecordFlags(X86Instruction instruction)
+    {
+        X86Operand destination = instruction.Operand0;
+        switch (instruction.Opcode)
+        {
+            case X86InstrKind.Mov:
+            case X86InstrKind.Movzx:
+            case X86InstrKind.Movsx:
+            case X86InstrKind.Movsxd:
+            case X86InstrKind.Movdqu:
+            case X86InstrKind.Lea:
+                if (destination.Kind == X86OperandKind.Register && destination.Register == _flagsRegister)
+                    _flagsRegister = X86Register.Invalid;
+                return;
+
+            case X86InstrKind.And:
+            case X86InstrKind.Or:
+            case X86InstrKind.Xor:
+            case X86InstrKind.Add:
+            case X86InstrKind.Sub:
+            case X86InstrKind.Neg:
+            case X86InstrKind.Inc:
+            case X86InstrKind.Dec:
+                FlagsWrites++;
+                if (destination.Kind == X86OperandKind.Register && IsGeneralRegister(destination.Register))
+                {
+                    _flagsRegister = destination.Register;
+                    _flagsSize = destination.Size;
+                    _flagsFromLogical = instruction.Opcode is X86InstrKind.And or X86InstrKind.Or or X86InstrKind.Xor;
+                    return;
+                }
+                break;
+
+            default:
+                FlagsWrites++;
+                break;
+        }
+
+        _flagsRegister = X86Register.Invalid;
+    }
+
+    internal void ForgetExtensions()
+    {
+        Array.Clear(_zeroExtendedBits, 0, _zeroExtendedBits.Length);
+        Array.Clear(_signExtendedBits32, 0, _signExtendedBits32.Length);
+        Array.Clear(_signExtendedBits64, 0, _signExtendedBits64.Length);
+    }
 
     internal int GetZeroExtendedBits(X86Register register)
     {
         var index = (int)register;
         return (uint)index < (uint)_zeroExtendedBits.Length ? _zeroExtendedBits[index] : 0;
+    }
+
+    /// <summary>Whether every bit of the low width bytes above bit fromBits - 1 equals that bit</summary>
+    internal bool IsSignExtended(X86Register register, int fromBits, int width)
+    {
+        var index = (int)register;
+        if ((uint)index >= (uint)_zeroExtendedBits.Length)
+            return false;
+        var sign = width == 8 ? _signExtendedBits64[index] : _signExtendedBits32[index];
+        var zero = _zeroExtendedBits[index];
+        return sign != 0 && sign <= fromBits || zero != 0 && zero < fromBits;
     }
 
     private void SetZeroExtendedBits(X86Register register, int bits)
@@ -877,12 +962,21 @@ public sealed class X86CodeGenerator
             _zeroExtendedBits[index] = bits;
     }
 
+    private void SetSignExtendedBits(X86Register register, int bits32, int bits64)
+    {
+        var index = (int)register;
+        if ((uint)index >= (uint)_signExtendedBits32.Length)
+            return;
+        _signExtendedBits32[index] = bits32;
+        _signExtendedBits64[index] = bits64;
+    }
+
     /// <summary>
     /// Follows what each emitted instruction leaves in the high bits of its destination. Only the opcodes
     /// listed here are understood to write one register and nothing else; anything else forgets everything,
     /// so an opcode with a hidden destination can never leave a stale fact behind.
     /// </summary>
-    private void RecordZeroExtension(X86Instruction instruction)
+    private void RecordExtensions(X86Instruction instruction)
     {
         switch (instruction.Opcode)
         {
@@ -896,9 +990,11 @@ public sealed class X86CodeGenerator
             // These move the stack pointer without naming it, so it is the one register they unsettle
             case X86InstrKind.Push:
                 SetZeroExtendedBits(X86Register.Rsp, 0);
+                SetSignExtendedBits(X86Register.Rsp, 0, 0);
                 return;
             case X86InstrKind.Pop:
                 SetZeroExtendedBits(X86Register.Rsp, 0);
+                SetSignExtendedBits(X86Register.Rsp, 0, 0);
                 break;
 
             case X86InstrKind.Mov:
@@ -926,14 +1022,14 @@ public sealed class X86CodeGenerator
                 break;
 
             default:
-                ForgetZeroExtensions();
+                ForgetExtensions();
                 return;
         }
 
         // The one-operand multiply spreads its product over rdx:rax without naming either
         if (instruction.Opcode == X86InstrKind.Imul && instruction.Operand1.Kind == X86OperandKind.None)
         {
-            ForgetZeroExtensions();
+            ForgetExtensions();
             return;
         }
 
@@ -942,15 +1038,53 @@ public sealed class X86CodeGenerator
             return;
         if (!IsGeneralRegister(destination.Register))
         {
-            ForgetZeroExtensions();
+            ForgetExtensions();
             return;
         }
 
+        SetSignExtensionFrom(instruction, destination);
         SetZeroExtensionFrom(instruction, destination);
     }
 
+    private void SetSignExtensionFrom(X86Instruction instruction, X86Operand destination)
+    {
+        var source = instruction.Operand1;
+        if (instruction.Opcode == X86InstrKind.Movsx && destination.Size >= 4)
+        {
+            var carried = Math.Max(1, source.Size) * 8;
+            SetSignExtendedBits(destination.Register, carried, destination.Size == 8 ? carried : 0);
+            return;
+        }
+        if (instruction.Opcode == X86InstrKind.Movsxd && destination.Size == 8)
+        {
+            SetSignExtendedBits(destination.Register, 0, 32);
+            return;
+        }
+        if (IsRegisterCopy(instruction, destination))
+        {
+            var index = (int)source.Register;
+            SetSignExtendedBits(destination.Register, _signExtendedBits32[index], destination.Size == 8 ? _signExtendedBits64[index] : 0);
+            return;
+        }
+        SetSignExtendedBits(destination.Register, 0, 0);
+    }
+
+    private static bool IsRegisterCopy(X86Instruction instruction, X86Operand destination)
+        => instruction.Opcode == X86InstrKind.Mov && destination.Size >= 4 &&
+           instruction.Operand1.Kind == X86OperandKind.Register && IsGeneralRegister(instruction.Operand1.Register) &&
+           instruction.Operand1.Size == destination.Size;
+
     private void SetZeroExtensionFrom(X86Instruction instruction, X86Operand destination)
     {
+        // A copy carries the facts of its source, and a 32-bit one clears the upper half besides
+        if (IsRegisterCopy(instruction, destination))
+        {
+            var known = GetZeroExtendedBits(instruction.Operand1.Register);
+            var cleared = _machineTarget.Is64Bit && destination.Size == 4 ? 32 : 0;
+            SetZeroExtendedBits(destination.Register, known != 0 && (cleared == 0 || known < cleared) ? known : cleared);
+            return;
+        }
+
         // movzx names the width it carried over, which is narrower than the register it cleared
         if (instruction.Opcode == X86InstrKind.Movzx && destination.Size >= 4)
         {
@@ -1283,7 +1417,7 @@ public sealed class X86CodeGenerator
         {
             if (type.Type is ArrayType)
             {
-                var bytes = Encoding.UTF8.GetBytes(text);
+                var bytes = NarrowStringEncoding.GetBytes(text);
                 var count = Math.Min(availableSize, checked(bytes.Length + 1));
                 for (var i = 0; i < count; i++)
                     section.EmitByte(i < bytes.Length ? bytes[i] : (byte)0);
@@ -1404,7 +1538,7 @@ public sealed class X86CodeGenerator
             return existing;
 
         var label = CreateLocalLabel("str");
-        var bytes = Encoding.UTF8.GetBytes(text);
+        var bytes = NarrowStringEncoding.GetBytes(text);
         var offset = _strings.Align(1);
         _strings.DefineSymbol(label, offset, bytes.Length + 1, X86ObjectSymbolBinding.Local, _symbols);
         _strings.EmitBytes(bytes, bytes.Length);
@@ -1429,7 +1563,7 @@ public sealed class X86CodeGenerator
             return CreateReadOnlyBytesLiteral($"fp64:{bits:X16}", bytes, 8, "fp64");
         }
 
-        throw new NotSupportedException("x86 backend does not support long double literals.");
+        throw new NotSupportedException("Unsupported floating-point literal type.");
     }
 
     private string CreateFloatingBitsLiteral(QualifiedType type, ulong bits)
@@ -1443,7 +1577,7 @@ public sealed class X86CodeGenerator
         if (IsFloat64(type))
             return CreateReadOnlyBytesLiteral($"fp64bits:{bits:X16}", BitConverter.GetBytes(bits), 8, "fp64bits");
 
-        throw new NotSupportedException("x86 backend does not support long double literals.");
+        throw new NotSupportedException("Unsupported floating-point literal type.");
     }
 
     private string CreateReadOnlyBytesLiteral(string key, byte[] bytes, int alignment, string prefix)
@@ -1517,6 +1651,9 @@ public sealed class X86CodeGenerator
     private static bool IsVoid(QualifiedType type)
         => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Void };
 
+    private static bool IsBoolType(QualifiedType type)
+        => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Bool };
+
     private static bool IsPointerLike(QualifiedType type)
         => type.Type.Kind is TypeKind.Pointer or TypeKind.Array or TypeKind.Function;
 
@@ -1524,16 +1661,13 @@ public sealed class X86CodeGenerator
         => type.Type.Kind is TypeKind.Struct or TypeKind.Union or TypeKind.Array;
 
     private static bool IsFloatType(QualifiedType type)
-        => IsFloat32(type) || IsFloat64(type) || IsLongDouble(type);
+        => IsFloat32(type) || IsFloat64(type);
 
     private static bool IsFloat32(QualifiedType type)
         => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Float };
 
     private static bool IsFloat64(QualifiedType type)
-        => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Double };
-
-    private static bool IsLongDouble(QualifiedType type)
-        => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.LongDouble };
+        => type.Type is BuiltinType builtin && builtin.BuiltinKind is BuiltinTypeKind.Double or BuiltinTypeKind.LongDouble;
 
     private static int StorageSize(TargetInfo target, QualifiedType type)
         => Math.Max(1, target.SizeOf(type));
@@ -1548,7 +1682,7 @@ public sealed class X86CodeGenerator
     }
 
     private static bool NeedsBlockCopy(TargetInfo target, QualifiedType type)
-        => IsAggregateType(type) || (!IsPointerLike(type) && !(IsFloatType(type) && !IsLongDouble(type)) && StorageSize(target, type) > target.PointerSize);
+        => IsAggregateType(type) || (!IsPointerLike(type) && !IsFloatType(type) && StorageSize(target, type) > target.PointerSize);
 
     private static bool IsWideInteger(TargetInfo target, QualifiedType type)
         => target.Architecture == TargetArchitectureKind.I386 && IsIntegerLike(type) && StorageSize(target, type) == 8;
@@ -1569,6 +1703,12 @@ public sealed class X86CodeGenerator
         private readonly int _stackArgumentSlotSize;
         private readonly int _sysVX64RegisterSaveAreaOffset;
         private readonly Dictionary<LirVirtualRegister, LirInstruction> _foldableLoads = new();
+        private readonly Dictionary<LirInstruction, (LirInstruction Consumer, bool ZeroFlagOnly)> _foldableMasks = new();
+        private LirInstruction? _maskConsumer;
+        private int _maskFlagsWrites;
+        private readonly Dictionary<LirInstruction, LirInstruction> _readModifyWrites = new();
+        private readonly HashSet<LirInstruction> _foldedStores = new();
+        private readonly Dictionary<LirInstruction, (bool Signed, int Width)> _loadExtensions = new();
         private readonly Dictionary<LirInstruction, LirInstruction> _divRemPartners = new();
         private readonly HashSet<LirInstruction> _fusedDivRem = new();
         private readonly Dictionary<LirVirtualRegister, X86Operand> _foldedAddresses = new();
@@ -1701,6 +1841,8 @@ public sealed class X86CodeGenerator
                     {
                         _currentInstruction = instruction;
                         EmitInstruction(instruction);
+                        if (ReferenceEquals(instruction, _maskConsumer))
+                            throw new InvalidOperationException("The flags of a folded and were not read by its consumer.");
                         if (_placeholdersIssued)
                         {
                             RestoreBorrowedScratch();
@@ -1756,7 +1898,12 @@ public sealed class X86CodeGenerator
 
             // The compare comes first and only mov and cmov follow it, so the flags survive to the move
             var condition = EmitSelectCondition(instruction);
-            if (OccupiesRegister(diamond.TrueValue, destination))
+            if (IsTruthSelect(diamond, out bool inverted))
+            {
+                Emit(X86Instruction.Setcc(inverted ? InvertCondition(condition) : condition, Reg(destination, 1)));
+                Emit(X86Instruction.Binary(X86InstrKind.Movzx, Reg(destination, 4), Reg(destination, 1)));
+            }
+            else if (OccupiesRegister(diamond.TrueValue, destination))
             {
                 Emit(X86Instruction.Cmovcc(InvertCondition(condition), Reg(destination, size),
                     Reg(LoadSelectValue(diamond.FalseValue, Scratch1, size, instruction), size)));
@@ -1774,6 +1921,16 @@ public sealed class X86CodeGenerator
                 EmitJump(diamond.Join);
             return true;
         }
+
+        private static bool IsTruthSelect(LirSelectDiamond diamond, out bool inverted)
+        {
+            inverted = IsIntegerImmediate(diamond.TrueValue, 0) && IsIntegerImmediate(diamond.FalseValue, 1);
+            return inverted || IsIntegerImmediate(diamond.TrueValue, 1) && IsIntegerImmediate(diamond.FalseValue, 0);
+        }
+
+        private static bool IsIntegerImmediate(LirOperand operand, long value)
+            => operand.Kind == LirOperandKind.Immediate && operand.Immediate is not (string or float or double or decimal) &&
+               ConvertIntegerConstant(operand.Immediate) == value;
 
         // mov rather than the usual zeroing xor, which would destroy the compare's flags
         private void MoveSelectValue(X86Register destination, LirOperand operand, int size, LirInstruction instruction)
@@ -1836,16 +1993,26 @@ public sealed class X86CodeGenerator
                 var left = branch.Operands[0];
                 var right = branch.Operands[1];
                 var size = Math.Max(RegisterSize(left.Type), RegisterSize(right.Type));
-                Emit(X86Instruction.Binary(X86InstrKind.Cmp,
-                    LoadComparisonLeft(left, branch, size),
-                    LoadOperandForIntegerOperation(right, Scratch1, branch, size)));
-                return SelectIntegerComparisonCondition(branch.Operator, IsSignedIntegerType(left.Type));
+                X86Condition condition = SelectIntegerComparisonCondition(branch.Operator, IsSignedIntegerType(left.Type));
+                EmitIntegerComparison(left, right, branch, size, condition);
+                return condition;
             }
 
-            var conditionSize = RegisterSize(branch.Operands[0].Type);
-            var conditionRegister = LoadOperand(branch.Operands[0], Scratch1, branch, conditionSize);
-            Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(conditionRegister, conditionSize), Reg(conditionRegister, conditionSize)));
+            EmitZeroComparison(branch.Operands[0], branch, RegisterSize(branch.Operands[0].Type), X86Condition.Ne);
             return X86Condition.Ne;
+        }
+
+        private void EmitIntegerComparison(LirOperand left, LirOperand right, LirInstruction instruction, int size, X86Condition condition)
+        {
+            if (IsIntegerImmediate(right, 0))
+            {
+                EmitZeroComparison(left, instruction, size, condition);
+                return;
+            }
+
+            Emit(X86Instruction.Binary(X86InstrKind.Cmp,
+                LoadComparisonLeft(left, right, instruction, size),
+                LoadOperandForIntegerOperation(right, Scratch1, instruction, size)));
         }
 
         public void EmitEpilogue()
@@ -2966,6 +3133,7 @@ public sealed class X86CodeGenerator
             try
             {
                 _owner._text.EmitAssembly(text, _owner.CreateLocalLabel(_functionLabel + "_asm"));
+                _owner.ForgetFlags();
             }
             catch (Exception ex) when (ex is FormatException or ArgumentException or InvalidOperationException)
             {
@@ -2998,7 +3166,11 @@ public sealed class X86CodeGenerator
                 {
                     if (instruction.Operands.Length == 1 && instruction.Operands[0].Immediate is int segment)
                     {
-                        LoadParameterValue(instruction.Result, CAbi.AssignParameterSegmentLocation(value, segment, ref cursor, _stackArgumentSlotSize), instruction);
+                        var location = CAbi.AssignParameterSegmentLocation(value, segment, ref cursor, _stackArgumentSlotSize);
+                        if (value.PassingKind == AbiPassingKind.Stack && location.Kind == AbiLocationKind.Stack && GimpleTypes.IsAggregate(parameter.Type))
+                            LoadIncomingAddress(instruction.Result, location);
+                        else
+                            LoadParameterValue(instruction.Result, location, instruction);
                         return;
                     }
 
@@ -3013,6 +3185,14 @@ public sealed class X86CodeGenerator
                 }
                 _ = CAbi.AssignArgumentLocation(value, ref cursor, _stackArgumentSlotSize);
             }
+        }
+
+        private void LoadIncomingAddress(LirVirtualRegister destination, AbiLocation location)
+        {
+            var writable = GetWritableRegister(destination, PreferredScratch(destination.Type));
+            Emit(X86Instruction.Binary(X86InstrKind.Lea, Reg(writable, _wordSize),
+                Mem(FrameBase, IncomingStackOffset(location.StackByteOffset(_stackArgumentSlotSize)), _wordSize)));
+            StoreWritableRegisterIfSpilled(destination, writable);
         }
 
         private int FindParameterIndex(string name)
@@ -3890,10 +4070,19 @@ public sealed class X86CodeGenerator
                 return;
             if (RequiresBlockCopyStorage(instruction.Result.Type))
                 throw Unsupported(instruction, "Wide scalar or aggregate binary emission is not supported by X86CodeGenerator.");
+            if (_foldableMasks.Remove(instruction, out (LirInstruction Consumer, bool ZeroFlagOnly) fold))
+            {
+                EmitMaskTest(instruction, fold.Consumer, fold.ZeroFlagOnly);
+                return;
+            }
 
             var left = instruction.Operands[0];
             var right = instruction.Operands[1];
             var size = RegisterSize(instruction.Result.Type);
+            if (_readModifyWrites.TryGetValue(instruction, out var store) && TryEmitReadModifyWrite(instruction, store, size))
+                return;
+            if (IsPendingFoldedLoad(left) && !IsPendingFoldedLoad(right) && IsCommutativeInteger(instruction, left, right, size))
+                (left, right) = (right, left);
             var destination = GetWritableRegister(instruction.Result, Scratch0);
 
             // Every sequence below writes the destination from the left operand before reading the
@@ -4000,6 +4189,35 @@ public sealed class X86CodeGenerator
             MoveRegister(destination, dst, size);
             StoreWritableRegisterIfSpilled(instruction.Result, destination);
         }
+
+        private bool TryEmitReadModifyWrite(LirInstruction binary, LirInstruction store, int size)
+        {
+            var loadIsLeft = IsPendingFoldedLoad(binary.Operands[0]);
+            if (!TryReadFoldedLoad(binary.Operands[loadIsLeft ? 0 : 1], size, out var memory))
+                return false;
+
+            var source = LoadOperandForRead(binary.Operands[loadIsLeft ? 1 : 0], Scratch0, binary, size);
+            if (source.Kind == X86OperandKind.Memory)
+            {
+                Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(Scratch0, size), source));
+                source = Reg(Scratch0, size);
+            }
+            var opcode = binary.Operator switch
+            {
+                "+" => X86InstrKind.Add,
+                "-" => X86InstrKind.Sub,
+                "&" => X86InstrKind.And,
+                "|" => X86InstrKind.Or,
+                _ => X86InstrKind.Xor,
+            };
+            Emit(X86Instruction.Binary(opcode, memory, source));
+            _foldedStores.Add(store);
+            return true;
+        }
+
+        private bool IsPendingFoldedLoad(LirOperand operand)
+            => operand.Kind == LirOperandKind.Register && operand.Register is not null &&
+               (_foldableLoads.ContainsKey(operand.Register) || _foldedAddresses.ContainsKey(operand.Register));
 
         private bool OccupiesRegister(LirOperand operand, X86Register register)
         {
@@ -4152,8 +4370,13 @@ public sealed class X86CodeGenerator
                 return;
             }
 
-            LoadOperandInto(right, Scratch1, instruction, size);
-            Emit(X86Instruction.Ternary(X86InstrKind.Imul, Reg(Scratch1, size), Reg(Scratch1, size), Imm(scale)));
+            if (TryGetLeaDisplacement(right, size, scale, out var displacement))
+            {
+                Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(dst, size), Imm(displacement)));
+                return;
+            }
+
+            LoadScaledIndex(right, scale, instruction, size);
             Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(dst, size), Reg(Scratch1, size)));
         }
 
@@ -4165,9 +4388,27 @@ public sealed class X86CodeGenerator
                 return;
             }
 
-            LoadOperandInto(right, Scratch1, instruction, size);
-            Emit(X86Instruction.Ternary(X86InstrKind.Imul, Reg(Scratch1, size), Reg(Scratch1, size), Imm(scale)));
+            if (TryGetLeaDisplacement(right, size, scale, out var displacement))
+            {
+                Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(dst, size), Imm(displacement)));
+                return;
+            }
+
+            LoadScaledIndex(right, scale, instruction, size);
             Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(dst, size), Reg(Scratch1, size)));
+        }
+
+        private void LoadScaledIndex(LirOperand index, int scale, LirInstruction instruction, int size)
+        {
+            X86Operand source;
+            if (HasExactRegisterWidth(index, size))
+                source = LoadOperandForRead(index, Scratch1, instruction, size);
+            else
+            {
+                LoadOperandInto(index, Scratch1, instruction, size);
+                source = Reg(Scratch1, size);
+            }
+            Emit(X86Instruction.Ternary(X86InstrKind.Imul, Reg(Scratch1, size), source, Imm(scale)));
         }
 
         // A quotient and a remainder over the same operands are one division, so the pair is emitted together
@@ -4482,8 +4723,6 @@ public sealed class X86CodeGenerator
             var left = instruction.Operands[0];
             var right = instruction.Operands[1];
             var size = Math.Max(RegisterSize(left.Type), RegisterSize(right.Type));
-            var leftOperand = LoadComparisonLeft(left, instruction, size);
-            Emit(X86Instruction.Binary(X86InstrKind.Cmp, leftOperand, LoadOperandForIntegerOperation(right, Scratch1, instruction, size)));
             var condition = instruction.Operator switch
             {
                 "==" => X86Condition.E,
@@ -4494,6 +4733,7 @@ public sealed class X86CodeGenerator
                 ">=" => IsSignedIntegerType(left.Type) ? X86Condition.Ge : X86Condition.Ae,
                 _ => X86Condition.E,
             };
+            EmitIntegerComparison(left, right, instruction, size, condition);
             var dst = GetWritableRegister(instruction.Result!, Scratch0);
             Emit(X86Instruction.Setcc(condition, Reg(dst, 1)));
             Emit(X86Instruction.Binary(X86InstrKind.Movzx, Reg(dst, 4), Reg(dst, 1)));
@@ -4504,14 +4744,11 @@ public sealed class X86CodeGenerator
         {
             var operand = instruction.Operands[0];
             var result = instruction.Result!;
-            if (IsLongDouble(operand.Type) || IsLongDouble(result.Type))
-                throw Unsupported(instruction, "x86 backend does not support long double code generation.");
-
             if (instruction.Operator == "!")
             {
                 var dst = GetWritableRegister(result, Scratch0);
                 var source = LoadFloatingOperand(operand, FpScratch0, instruction);
-                EmitFloatingRelation("==", operand.Type, source, LoadFloatingZero(FpScratch1, operand.Type), dst);
+                EmitFloatingRelation("==", operand.Type, source, Reg(LoadFloatingZero(FpScratch1, operand.Type), FloatingStorageSize(operand.Type)), dst);
                 StoreWritableRegisterIfSpilled(result, dst);
                 return;
             }
@@ -4544,9 +4781,6 @@ public sealed class X86CodeGenerator
             var left = instruction.Operands[0];
             var right = instruction.Operands[1];
             var result = instruction.Result!;
-            if (IsLongDouble(left.Type) || IsLongDouble(right.Type) || IsLongDouble(result.Type))
-                throw Unsupported(instruction, "x86 backend does not support long double code generation.");
-
             switch (instruction.Operator)
             {
                 case "+":
@@ -4557,22 +4791,27 @@ public sealed class X86CodeGenerator
                         throw Unsupported(instruction, "Floating-point arithmetic result must have a floating-point type.");
                     var operationType = SelectFloatingOperationType(left.Type, right.Type, result.Type);
                     var writable = GetWritableRegister(result, FpScratch0);
+                    var operationSize = FloatingStorageSize(operationType);
+                    if (instruction.Operator is "+" or "*" && IsPendingFoldedLoad(left) && !IsPendingFoldedLoad(right))
+                        (left, right) = (right, left);
 
                     // Same collision as the integer path: resolve the right operand before the left
                     // one overwrites the register it lives in, unless both are one value
                     var sameValue = ScratchNeeds.IsSameValue(left, right);
-                    var stagedRight = !sameValue && OccupiesRegister(right, writable)
+                    var rightMemory = default(X86Operand);
+                    var rightInMemory = !sameValue && TryReadFloatingMemory(right, operationType, instruction, out rightMemory);
+                    var stagedRight = !sameValue && !rightInMemory && OccupiesRegister(right, writable)
                         ? LoadOperandAsFloating(right, operationType, FpScratch1, instruction)
                         : X86Register.Invalid;
 
                     var leftReg = LoadOperandAsFloating(left, operationType, writable, instruction);
                     if (writable != leftReg)
                         EmitFloatingMove(writable, leftReg, operationType);
-                    var rightReg = sameValue ? writable
-                        : stagedRight != X86Register.Invalid ? stagedRight
-                        : LoadOperandAsFloatingForRead(right, operationType, FpScratch1, instruction);
+                    var rightOperand = sameValue ? Reg(writable, operationSize)
+                        : rightInMemory ? rightMemory
+                        : Reg(stagedRight != X86Register.Invalid ? stagedRight : LoadOperandAsFloatingForRead(right, operationType, FpScratch1, instruction), operationSize);
                     Emit(X86Instruction.Binary(FloatingArithmeticOpcode(instruction.Operator, operationType),
-                        Reg(writable, FloatingStorageSize(operationType)), Reg(rightReg, FloatingStorageSize(operationType))));
+                        Reg(writable, operationSize), rightOperand.WithSize(operationSize)));
                     if (!SameFloatingType(operationType, result.Type))
                         EmitFloatingPrecisionConversion(writable, writable, operationType, result.Type);
                     StoreWritableRegisterIfSpilled(result, writable);
@@ -4584,10 +4823,10 @@ public sealed class X86CodeGenerator
                 case ">":
                 case ">=":
                     var comparisonType = SelectFloatingOperationType(left.Type, right.Type, IsFloatType(result.Type) ? left.Type : result.Type);
-                    var leftCmp = LoadOperandAsFloatingForRead(left, comparisonType, FpScratch0, instruction);
-                    var rightCmp = LoadOperandAsFloatingForRead(right, comparisonType, FpScratch1, instruction);
+                    var (compared, against, relation) = OrientFloatingComparison(left, right, instruction.Operator);
+                    var (leftCmp, rightCmp) = LoadFloatingComparison(compared, against, comparisonType, instruction);
                     var dst = GetWritableRegister(result, Scratch0);
-                    EmitFloatingRelation(instruction.Operator, comparisonType, leftCmp, rightCmp, dst);
+                    EmitFloatingRelation(relation, comparisonType, leftCmp, rightCmp, dst);
                     StoreWritableRegisterIfSpilled(result, dst);
                     return;
                 default:
@@ -4599,9 +4838,6 @@ public sealed class X86CodeGenerator
         {
             var result = instruction.Result!;
             var source = instruction.Operands[0];
-            if (IsLongDouble(result.Type) || IsLongDouble(source.Type))
-                throw Unsupported(instruction, "x86 backend does not support long double code generation.");
-
             if (IsFloatType(result.Type) && IsX86WideInteger(source.Type))
             {
                 var wideDestination = GetWritableRegister(result, FpScratch0);
@@ -4783,8 +5019,6 @@ public sealed class X86CodeGenerator
         private X86Register LoadFloatingOperand(LirOperand operand, X86Register scratch, LirInstruction instruction)
         {
             var type = operand.Type;
-            if (IsLongDouble(type))
-                throw Unsupported(instruction, "x86 backend does not support long double code generation.");
             if (operand.Kind is LirOperandKind.Undefined or LirOperandKind.Void or LirOperandKind.None)
                 return LoadFloatingZero(scratch, type);
             if (operand.Kind == LirOperandKind.Immediate)
@@ -4906,9 +5140,29 @@ public sealed class X86CodeGenerator
             Emit(X86Instruction.Binary(X86InstrKind.Movzx, Reg(destination, 4), Reg(destination, 1)));
         }
 
-        private void EmitFloatingRelation(string op, QualifiedType type, X86Register left, X86Register right, X86Register destination)
+        // b > a reads the flags of an unordered compare as false where a < b would need a parity check, and memory is only on the right
+        private (LirOperand Left, LirOperand Right, string Operator) OrientFloatingComparison(LirOperand left, LirOperand right, string op)
+            => op switch
+            {
+                "<" => (right, left, ">"),
+                "<=" => (right, left, ">="),
+                "==" or "!=" when IsPendingFoldedLoad(left) && !IsPendingFoldedLoad(right) => (right, left, op),
+                _ => (left, right, op),
+            };
+
+        private (X86Register Left, X86Operand Right) LoadFloatingComparison(LirOperand left, LirOperand right, QualifiedType type, LirInstruction instruction)
         {
-            Emit(X86Instruction.Binary(FloatingCompareOpcode(type), Reg(left, FloatingStorageSize(type)), Reg(right, FloatingStorageSize(type))));
+            var size = FloatingStorageSize(type);
+            var rightInMemory = TryReadFloatingMemory(right, type, instruction, out var rightMemory);
+            var leftRegister = LoadOperandAsFloatingForRead(left, type, FpScratch0, instruction);
+            return (leftRegister, rightInMemory
+                ? rightMemory.WithSize(size)
+                : Reg(LoadOperandAsFloatingForRead(right, type, FpScratch1, instruction), size));
+        }
+
+        private void EmitFloatingRelation(string op, QualifiedType type, X86Register left, X86Operand right, X86Register destination)
+        {
+            Emit(X86Instruction.Binary(FloatingCompareOpcode(type), Reg(left, FloatingStorageSize(type)), right));
             switch (op)
             {
                 case "==":
@@ -4919,12 +5173,6 @@ public sealed class X86CodeGenerator
                     Emit(X86Instruction.Setcc(X86Condition.P, Reg(Scratch1, 1)));
                     Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(destination, 1), Reg(Scratch1, 1)));
                     Emit(X86Instruction.Binary(X86InstrKind.Movzx, Reg(destination, 4), Reg(destination, 1)));
-                    return;
-                case "<":
-                    EmitOrderedSet(X86Condition.B, destination, requireOrdered: true);
-                    return;
-                case "<=":
-                    EmitOrderedSet(X86Condition.Be, destination, requireOrdered: true);
                     return;
                 case ">":
                     EmitOrderedSet(X86Condition.A, destination, requireOrdered: false);
@@ -4987,14 +5235,16 @@ public sealed class X86CodeGenerator
 
         private void LoadFloatingImmediate(X86Register destination, object? value, QualifiedType type)
         {
-            var positiveZero = IsFloat32(type)
-                ? BitConverter.SingleToInt32Bits(Convert.ToSingle(value, CultureInfo.InvariantCulture)) == 0
-                : BitConverter.DoubleToInt64Bits(Convert.ToDouble(value, CultureInfo.InvariantCulture)) == 0;
-            if (positiveZero)
+            if (IsPositiveFloatingZero(value, type))
                 EmitFloatingZero(destination, type);
             else
                 EmitFloatingLoad(destination, LiteralOperand(_owner.CreateFloatingLiteral(type, value), type), type);
         }
+
+        private static bool IsPositiveFloatingZero(object? value, QualifiedType type)
+            => IsFloat32(type)
+                ? BitConverter.SingleToInt32Bits(Convert.ToSingle(value, CultureInfo.InvariantCulture)) == 0
+                : BitConverter.DoubleToInt64Bits(Convert.ToDouble(value, CultureInfo.InvariantCulture)) == 0;
 
         private void EmitFloatingNegate(X86Register destination, QualifiedType type)
         {
@@ -5020,7 +5270,8 @@ public sealed class X86CodeGenerator
         {
             if (destination == source)
                 return;
-            Emit(X86Instruction.Binary(FloatingMoveOpcode(type), Reg(destination, FloatingStorageSize(type)), Reg(source, FloatingStorageSize(type))));
+            // movss/movsd between registers merge into the old destination, a false dependency that chains loop iterations
+            Emit(X86Instruction.Binary(X86InstrKind.Movaps, Reg(destination, 16), Reg(source, 16)));
         }
 
         private void EmitFloatingLoad(X86Register destination, X86Operand source, QualifiedType type)
@@ -5051,7 +5302,7 @@ public sealed class X86CodeGenerator
                 return 4;
             if (IsFloat64(type))
                 return 8;
-            throw new NotSupportedException("x86 backend does not support long double code generation.");
+            throw new NotSupportedException("Unsupported floating-point type.");
         }
 
         private static X86InstrKind FloatingMoveOpcode(QualifiedType type)
@@ -5162,9 +5413,9 @@ public sealed class X86CodeGenerator
 
             if (RequiresBlockCopyStorage(instruction.Result.Type))
             {
-                var destination = MaterializeVirtualRegisterStorageAddress(instruction.Result, Scratch0);
-                var source = MaterializeAddress(instruction.Address, Scratch1, instruction, Scratch0);
-                EmitMemoryCopy(RegMem(source, 1), RegMem(destination, 1), size);
+                var destination = FrameStorage(instruction.Result);
+                var source = AggregateStorage(LirOperand.ForObjectAt(instruction.Address), Scratch1, instruction, Scratch0);
+                EmitMemoryCopy(source, destination, size);
                 return;
             }
 
@@ -5172,7 +5423,10 @@ public sealed class X86CodeGenerator
             var scalarSize = RegisterSize(instruction.Result.Type);
             if (!TryBuildAddressOperand(instruction.Address, scalarSize, Scratch1, Scratch0, instruction, out var scalarSource))
                 scalarSource = RegMem(MaterializeAddress(instruction.Address, Scratch1, instruction), scalarSize);
-            EmitLoadFromMemory(dst, scalarSource, IsSignedIntegerType(instruction.Result.Type));
+            if (_loadExtensions.TryGetValue(instruction, out var extension))
+                EmitLoadFromMemory(dst, scalarSource, extension.Signed, extension.Width);
+            else
+                EmitLoadFromMemory(dst, scalarSource, IsSignedIntegerType(instruction.Result.Type));
             StoreWritableRegisterIfSpilled(instruction.Result, dst);
         }
 
@@ -5180,6 +5434,8 @@ public sealed class X86CodeGenerator
         {
             if (instruction.Address is null || instruction.Operands.Length == 0)
                 throw Unsupported(instruction, "Store instruction expects address and value operand.");
+            if (_foldedStores.Remove(instruction))
+                return;
 
             var value = instruction.Operands[0];
             if (IsFloatType(value.Type))
@@ -5205,8 +5461,7 @@ public sealed class X86CodeGenerator
             {
                 if (RequiresBlockCopyStorage(value.Type))
                 {
-                    var blockDestination = MaterializeAddress(instruction.Address, Scratch0, instruction);
-                    EmitOperandToMemory(value, RegMem(blockDestination, size), size, instruction);
+                    EmitOperandToMemory(value, AggregateStorage(LirOperand.ForObjectAt(instruction.Address), Scratch0, instruction).WithSize(size), size, instruction);
                     return;
                 }
 
@@ -5539,8 +5794,6 @@ public sealed class X86CodeGenerator
             LirInstruction instruction,
             bool isVariadicUnnamed)
         {
-            if (IsLongDouble(operand.Type))
-                throw Unsupported(instruction, "x86 backend does not support long double code generation.");
             if (value.PassingKind == AbiPassingKind.Void)
                 return;
             if (value.PassingKind == AbiPassingKind.Unsupported)
@@ -5655,9 +5908,9 @@ public sealed class X86CodeGenerator
             {
                 if (RequiresBlockCopyStorage(operand.Type))
                 {
-                    var source = MaterializeScalarStorageAddress(operand, Scratch0, instruction);
+                    var source = AggregateStorage(operand, Scratch0, instruction);
                     EmitSegmentLoad(registerClass, ToX86Register(location.Register, _owner._machineTarget),
-                        RegMem(source, Math.Min(RegisterSize(operand.Type), size)).WithDisplacement(sourceOffset));
+                        Displaced(source, sourceOffset).WithSize(Math.Min(RegisterSize(operand.Type), size)));
                 }
                 else
                 {
@@ -5671,10 +5924,7 @@ public sealed class X86CodeGenerator
             {
                 var destination = Mem(X86Register.Rsp, location.StackByteOffset(_stackArgumentSlotSize), Math.Max(1, size));
                 if (RequiresBlockCopyStorage(operand.Type))
-                {
-                    var source = MaterializeScalarStorageAddress(operand, Scratch0, instruction);
-                    EmitMemoryCopy(RegMem(source, 1).WithDisplacement(sourceOffset), destination, size);
-                }
+                    EmitMemoryCopy(Displaced(AggregateStorage(operand, Scratch0, instruction), sourceOffset), destination, size);
                 else
                 {
                     var storeSize = Math.Min(RegisterSize(operand.Type), size);
@@ -5763,12 +6013,12 @@ public sealed class X86CodeGenerator
 
             if (value.PassingKind == AbiPassingKind.MultiRegister)
             {
-                var destinationAddress = MaterializeVirtualRegisterStorageAddress(destination, AggregateReturnAddressScratch);
+                var storage = FrameStorage(destination);
                 var loadCursor = new AbiCursor();
                 foreach (var segment in value.Segments)
                 {
                     var reg = NextReturnRegister(segment, ref loadCursor);
-                    EmitSegmentStore(segment.RegisterClass, reg, Mem(destinationAddress, segment.Offset, Math.Min(segment.Size, _wordSize)));
+                    EmitSegmentStore(segment.RegisterClass, reg, Displaced(storage, segment.Offset).WithSize(Math.Min(segment.Size, _wordSize)));
                 }
                 return;
             }
@@ -5969,9 +6219,7 @@ public sealed class X86CodeGenerator
                     EmitJump(instruction.FalseTarget);
                 return;
             }
-            var size = RegisterSize(condition.Type);
-            var reg = LoadOperand(condition, Scratch0, instruction, size);
-            Emit(X86Instruction.Binary(X86InstrKind.Test, Reg(reg, size), Reg(reg, size)));
+            EmitZeroComparison(condition, instruction, RegisterSize(condition.Type), X86Condition.Ne);
             if (trueFallsThrough && !falseFallsThrough)
             {
                 Emit(X86Instruction.ConditionalBranch(X86Condition.E, Label(instruction.FalseTarget)));
@@ -5989,16 +6237,11 @@ public sealed class X86CodeGenerator
 
             if (IsFloatType(left.Type) || IsFloatType(right.Type))
             {
-                if (IsLongDouble(left.Type) || IsLongDouble(right.Type))
-                    throw Unsupported(instruction, "x86 backend does not support long double comparison branches.");
                 var comparisonType = SelectFloatingOperationType(left.Type, right.Type, IsFloatType(left.Type) ? left.Type : right.Type);
-                var leftRegister = LoadOperandAsFloatingForRead(left, comparisonType, FpScratch0, instruction);
-                var rightRegister = LoadOperandAsFloatingForRead(right, comparisonType, FpScratch1, instruction);
-                Emit(X86Instruction.Binary(
-                    FloatingCompareOpcode(comparisonType),
-                    Reg(leftRegister, FloatingStorageSize(comparisonType)),
-                    Reg(rightRegister, FloatingStorageSize(comparisonType))));
-                EmitFloatingComparisonBranch(instruction);
+                var (compared, against, relation) = OrientFloatingComparison(left, right, instruction.Operator);
+                var (leftRegister, rightOperand) = LoadFloatingComparison(compared, against, comparisonType, instruction);
+                Emit(X86Instruction.Binary(FloatingCompareOpcode(comparisonType), Reg(leftRegister, FloatingStorageSize(comparisonType)), rightOperand));
+                EmitFloatingComparisonBranch(instruction, relation);
                 return;
             }
 
@@ -6009,9 +6252,8 @@ public sealed class X86CodeGenerator
             }
 
             var size = Math.Max(RegisterSize(left.Type), RegisterSize(right.Type));
-            var leftOperand = LoadComparisonLeft(left, instruction, size);
-            Emit(X86Instruction.Binary(X86InstrKind.Cmp, leftOperand, LoadOperandForIntegerOperation(right, Scratch1, instruction, size)));
-            var condition = SelectIntegerComparisonCondition(instruction.Operator, IsSignedIntegerType(left.Type));
+            X86Condition condition = SelectIntegerComparisonCondition(instruction.Operator, IsSignedIntegerType(left.Type));
+            EmitIntegerComparison(left, right, instruction, size, condition);
             if (PrefersInvertedBranch(instruction))
             {
                 Emit(X86Instruction.ConditionalBranch(InvertCondition(condition), Label(instruction.FalseTarget)));
@@ -6030,25 +6272,27 @@ public sealed class X86CodeGenerator
         private static X86Condition InvertCondition(X86Condition condition)
             => (X86Condition)((byte)condition ^ 1);
 
-        private void EmitFloatingComparisonBranch(LirInstruction instruction)
+        private void EmitFloatingComparisonBranch(LirInstruction instruction, string op)
         {
-            switch (instruction.Operator)
+            switch (op)
             {
                 case "==":
                     Emit(X86Instruction.ConditionalBranch(X86Condition.P, Label(instruction.FalseTarget)));
+                    if (PrefersInvertedBranch(instruction))
+                    {
+                        Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, Label(instruction.FalseTarget)));
+                        return;
+                    }
                     Emit(X86Instruction.ConditionalBranch(X86Condition.E, Label(instruction.TrueTarget)));
                     break;
                 case "!=":
                     Emit(X86Instruction.ConditionalBranch(X86Condition.P, Label(instruction.TrueTarget)));
+                    if (PrefersInvertedBranch(instruction))
+                    {
+                        Emit(X86Instruction.ConditionalBranch(X86Condition.E, Label(instruction.FalseTarget)));
+                        return;
+                    }
                     Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, Label(instruction.TrueTarget)));
-                    break;
-                case "<":
-                    Emit(X86Instruction.ConditionalBranch(X86Condition.P, Label(instruction.FalseTarget)));
-                    Emit(X86Instruction.ConditionalBranch(X86Condition.B, Label(instruction.TrueTarget)));
-                    break;
-                case "<=":
-                    Emit(X86Instruction.ConditionalBranch(X86Condition.P, Label(instruction.FalseTarget)));
-                    Emit(X86Instruction.ConditionalBranch(X86Condition.Be, Label(instruction.TrueTarget)));
                     break;
                 // An unordered result leaves CF set, so the inverted condition also selects the false target
                 case ">":
@@ -6068,7 +6312,7 @@ public sealed class X86CodeGenerator
                     Emit(X86Instruction.ConditionalBranch(X86Condition.Ae, Label(instruction.TrueTarget)));
                     break;
                 default:
-                    throw Unsupported(instruction, $"Unsupported floating-point comparison branch operator '{instruction.Operator}'.");
+                    throw Unsupported(instruction, $"Unsupported floating-point comparison branch operator '{op}'.");
             }
 
             if (!IsFallthroughTarget(instruction.FalseTarget))
@@ -6419,8 +6663,8 @@ public sealed class X86CodeGenerator
             }
             if (RequiresBlockCopyStorage(destination.Type))
             {
-                var destAddress = MaterializeVirtualRegisterStorageAddress(destination, Scratch0);
-                EmitOperandToMemory(source, RegMem(destAddress, SizeOfStorage(destination.Type)), SizeOfStorage(destination.Type), instruction);
+                EmitOperandToMemory(source, FrameStorage(destination).WithSize(SizeOfStorage(destination.Type)),
+                    SizeOfStorage(destination.Type), instruction);
                 return;
             }
 
@@ -6485,8 +6729,7 @@ public sealed class X86CodeGenerator
             if (RequiresBlockCopyStorage(source.Type))
             {
                 var held = OperandUsesRegister(destination, Scratch0) ? Scratch0 : X86Register.Invalid;
-                var address = MaterializeScalarStorageAddress(source, Scratch1, instruction, held);
-                EmitMemoryCopy(RegMem(address, 1), destination, size);
+                EmitMemoryCopy(AggregateStorage(source, Scratch1, instruction, held), destination, size);
                 return;
             }
 
@@ -6511,8 +6754,7 @@ public sealed class X86CodeGenerator
         {
             if (RequiresBlockCopyStorage(destination.Type))
             {
-                var address = MaterializeVirtualRegisterStorageAddress(destination, Scratch0);
-                EmitMemoryCopy(source, RegMem(address, 1), size);
+                EmitMemoryCopy(source, FrameStorage(destination), size);
                 return;
             }
 
@@ -6555,6 +6797,32 @@ public sealed class X86CodeGenerator
                 return MaterializeAddress(operand.Address, scratch, instruction, reservedScratch);
             throw Unsupported(instruction, "Operand has no addressable storage.");
         }
+
+        // Where an aggregate operand lies as one memory operand, taking the scratch register only when the addressing mode cannot reach it
+        private X86Operand AggregateStorage(LirOperand operand, X86Register scratch, LirInstruction instruction, X86Register reservedScratch = X86Register.Invalid)
+        {
+            if (operand.Kind == LirOperandKind.Register && operand.Register is not null)
+                return FrameStorage(operand.Register);
+            if (operand.Kind == LirOperandKind.StackSlot && operand.StackSlot is not null)
+                return Mem(FrameBase, _allocation.Frame.StackSlotOffsets[operand.StackSlot], 1);
+            if (operand.Kind == LirOperandKind.Address && operand.Address is not null &&
+                TryBuildAddressOperand(operand.Address, 1, scratch, X86Register.Invalid, instruction, out var built) && !built.IsRipRelative)
+                return built;
+            return RegMem(MaterializeScalarStorageAddress(operand, scratch, instruction, reservedScratch), 1);
+        }
+
+        private X86Operand FrameStorage(LirVirtualRegister register)
+        {
+            if (register.HomeSlot is not null)
+                return Mem(FrameBase, _allocation.Frame.StackSlotOffsets[register.HomeSlot], 1);
+            var allocation = _allocation[register];
+            if (!allocation.IsSpilled)
+                throw new NotSupportedException("Register-allocated aggregate storage is not addressable.");
+            return Mem(FrameBase, allocation.StackOffset, 1);
+        }
+
+        private static X86Operand Displaced(X86Operand memory, long offset)
+            => memory.WithDisplacement(memory.Displacement + offset);
 
         private X86Register MaterializeVirtualRegisterStorageAddress(LirVirtualRegister register, X86Register scratch)
         {
@@ -6773,8 +7041,14 @@ public sealed class X86CodeGenerator
                 Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(destination, _wordSize), X86Operand.SymbolOperand(symbol, _wordSize, X86ObjectRelocationKind.Absolute32)));
         }
 
-        private X86Operand LoadComparisonLeft(LirOperand left, LirInstruction instruction, int size)
+        private X86Operand LoadComparisonLeft(LirOperand left, LirOperand right, LirInstruction instruction, int size)
         {
+            if (IsPendingFoldedLoad(left))
+            {
+                if (IsInPlaceSource(right, size) && TryReadFoldedLoad(left, size, out var memory))
+                    return memory;
+                EmitDeferredLoad(left);
+            }
             if (left.Kind == LirOperandKind.Register &&
                 left.Register is not null &&
                 RegisterSize(left.Type) == size &&
@@ -6854,14 +7128,15 @@ public sealed class X86CodeGenerator
             var source = LoadOperandForRead(operand, destination, instruction, readSize);
             if ((source.Kind == X86OperandKind.Register || source.Kind == X86OperandKind.Memory) && source.Size < size)
             {
-                // The value may already sit in the destination with its high bits cleared, and widening
-                // a zero-extended value is what the instruction below would spend an instruction doing
-                if (source.Kind == X86OperandKind.Register &&
-                    source.Register == destination &&
-                    !IsSignedIntegerType(operand.Type) &&
-                    IsIntegerLike(operand.Type) &&
-                    IsAlreadyZeroExtended(destination, source.Size))
+                // The value may already sit in a register with its high bits as the widening would leave them
+                if (source.Kind == X86OperandKind.Register && IsIntegerLike(operand.Type) &&
+                    (IsSignedIntegerType(operand.Type)
+                        ? _owner.IsSignExtended(source.Register, source.Size * 8, size)
+                        : IsAlreadyZeroExtended(source.Register, source.Size)))
+                {
+                    MoveRegister(destination, source.Register, IsSignedIntegerType(operand.Type) && size == 8 ? 8 : 4);
                     return;
+                }
 
                 if (source.Size == 4 && size == 8)
                 {
@@ -6910,12 +7185,55 @@ public sealed class X86CodeGenerator
             {
                 for (var i = 0; i + 1 < block.Instructions.Length; i++)
                 {
+                    if (TryFindFoldableMask(block, i, uses))
+                        continue;
                     var load = block.Instructions[i];
-                    if (!IsFoldableLoad(load, block.Instructions[i + 1], uses))
+                    var consumer = block.Instructions[i + 1];
+                    if (i + 2 < block.Instructions.Length && IsReadModifyWrite(load, consumer, block.Instructions[i + 2], uses))
+                    {
+                        _foldableLoads.Add(load.Result!, load);
+                        _readModifyWrites.Add(consumer, block.Instructions[i + 2]);
+                        continue;
+                    }
+                    if (TryGetReaderExtension(load, consumer, uses, out var extension))
+                        _loadExtensions.Add(load, extension);
+                    if (!IsFoldableLoad(load, consumer, uses))
                         continue;
                     _foldableLoads.Add(load.Result!, load);
                 }
             }
+        }
+
+        // Bits above a loaded value's width are free, and a load with one re-extending reader fills them as that reader would
+        private bool TryGetReaderExtension(LirInstruction load, LirInstruction consumer, Dictionary<LirVirtualRegister, int> uses, out (bool Signed, int Width) extension)
+        {
+            extension = default;
+            if (load.Kind != LirInstructionKind.Load || load.Result is null || load.Address is null)
+                return false;
+            if (consumer.Kind is not (LirInstructionKind.Convert or LirInstructionKind.Cast) || consumer.Result is null || consumer.Operands.Length != 1 ||
+                !ScratchNeeds.ReadsRegister(consumer.Operands[0], load.Result))
+            {
+                return false;
+            }
+            if (!uses.TryGetValue(load.Result, out var count) || count != 1)
+                return false;
+
+            var loaded = load.Result.Type;
+            var read = consumer.Result.Type;
+            if (!IsIntegerLike(loaded) || !IsIntegerLike(read) || IsBoolType(loaded) || IsBoolType(read) || IsX86WideInteger(read))
+                return false;
+            var loadedSize = SizeOfStorage(loaded);
+            if (loadedSize < 4 && SizeOfStorage(read) == loadedSize && IsSignedIntegerType(loaded) != IsSignedIntegerType(read))
+            {
+                extension = (IsSignedIntegerType(read), 4);
+                return true;
+            }
+            if (_owner._machineTarget.Is64Bit && loadedSize < 8 && RegisterSize(read) == 8 && IsSignedIntegerType(loaded))
+            {
+                extension = (true, 8);
+                return true;
+            }
+            return false;
         }
 
         private bool IsFoldableLoad(LirInstruction load, LirInstruction consumer, Dictionary<LirVirtualRegister, int> uses)
@@ -6926,27 +7244,232 @@ public sealed class X86CodeGenerator
                 return false;
 
             var type = load.Result.Type;
-            if (IsFloatType(type) || RequiresBlockCopyStorage(type) || IsX86WideInteger(type))
-                return false;
-
-            // A narrower load reaches its reader through a widening move, which has nowhere to fold into
-            if (SizeOfStorage(type) != RegisterSize(type))
+            if (RequiresBlockCopyStorage(type) || IsX86WideInteger(type))
                 return false;
             if (_allocation[load.Result].IsSpilled)
                 return false;
 
-            // Only a binary operation is known to read its second operand after writing the destination
-            if (consumer.Kind != LirInstructionKind.Binary || consumer.Result is null || consumer.Operands.Length != 2)
+            if (consumer.Kind == LirInstructionKind.Branch && consumer.Operands.Length == 1)
+                return ScratchNeeds.ReadsRegister(consumer.Operands[0], load.Result) && (IsIntegerLike(type) || IsPointerLike(type));
+            if (consumer.Kind is not (LirInstructionKind.Binary or LirInstructionKind.Branch) || consumer.Operands.Length != 2)
                 return false;
-            if (IsFloatType(consumer.Result.Type) || IsFloatType(consumer.Operands[0].Type))
+            if (consumer.Kind == LirInstructionKind.Binary ? consumer.Result is null : !IsComparisonOperator(consumer.Operator))
                 return false;
-            if (RegisterSize(consumer.Operands[0].Type) != RegisterSize(type))
+
+            var loadIsLeft = ScratchNeeds.ReadsRegister(consumer.Operands[0], load.Result);
+            if (!loadIsLeft && !ScratchNeeds.ReadsRegister(consumer.Operands[1], load.Result))
                 return false;
+            var other = consumer.Operands[loadIsLeft ? 1 : 0];
+            return IsFloatType(type)
+                ? IsFoldableFloatingRead(consumer, type, other, loadIsLeft)
+                : IsFoldableIntegerRead(consumer, type, other, loadIsLeft);
+        }
+
+        private bool IsFoldableIntegerRead(LirInstruction consumer, QualifiedType type, LirOperand other, bool loadIsLeft)
+        {
+            // A narrower load reaches its reader through a widening move, which has nowhere to fold into
+            if (SizeOfStorage(type) != RegisterSize(type))
+                return false;
+            if (IsFloatType(other.Type) || consumer.Result is not null && IsFloatType(consumer.Result.Type))
+                return false;
+            var size = RegisterSize(type);
+            if (RegisterSize(other.Type) != size)
+                return false;
+            if (IsComparisonOperator(consumer.Operator))
+                return other.Kind is LirOperandKind.Register or LirOperandKind.Immediate && (!loadIsLeft || IsInPlaceSource(other, size));
             if (consumer.Operator is "/" or "%" or "<<" or ">>" or "rotl" or "rotr")
                 return false;
 
-            var right = consumer.Operands[1];
-            return right.Kind == LirOperandKind.Register && ReferenceEquals(right.Register, load.Result);
+            // The destination is written from the left operand first, so a load there has to be swapped to the right
+            return !loadIsLeft || other.Kind == LirOperandKind.Register &&
+                IsCommutativeInteger(consumer, consumer.Operands[0], consumer.Operands[1], RegisterSize(consumer.Result!.Type));
+        }
+
+        private bool IsFoldableFloatingRead(LirInstruction consumer, QualifiedType type, LirOperand other, bool loadIsLeft)
+        {
+            if (!_owner._machineTarget.Is64Bit || !IsFloat32(type) && !IsFloat64(type))
+                return false;
+            if (!IsFloatType(other.Type) || !SameFloatingType(other.Type, type))
+                return false;
+            if (IsComparisonOperator(consumer.Operator))
+                return consumer.Operator is "==" or "!=" || loadIsLeft == (consumer.Operator is "<" or "<=");
+            if (!IsFloatType(consumer.Result!.Type) || !SameFloatingType(consumer.Result.Type, type))
+                return false;
+            return consumer.Operator is "+" or "*" || !loadIsLeft && consumer.Operator is "-" or "/";
+        }
+
+        private bool IsInPlaceSource(LirOperand operand, int size)
+            => operand.Kind switch
+            {
+                LirOperandKind.Immediate => operand.Immediate is not (string or float or double or decimal) &&
+                    (size < 8 || FitsSignedInt32(ConvertIntegerConstant(operand.Immediate))),
+                LirOperandKind.Register => operand.Register is not null && HasExactRegisterWidth(operand, size) && !_allocation[operand.Register].IsSpilled,
+                _ => false,
+            };
+
+        private bool TryFindFoldableMask(LirBlock block, int index, Dictionary<LirVirtualRegister, int> uses)
+        {
+            LirInstruction mask = block.Instructions[index];
+            LirInstruction consumer = block.Instructions[index + 1];
+            if (!IsFoldableMask(mask, consumer, uses))
+                return false;
+            _foldableMasks.Add(mask, (consumer, consumer.Operands.Length == 1 || consumer.Operator is "==" or "!="));
+
+            // test takes one memory operand at most, so a load folded into the and stays only where the other side is in place
+            LirInstruction? load = index > 0 ? block.Instructions[index - 1] : null;
+            if (load is not null && IsFoldableMaskLoad(load, mask, uses))
+                _foldableLoads[load.Result!] = load;
+            else if (load?.Result is not null)
+                _foldableLoads.Remove(load.Result);
+            return true;
+        }
+
+        // The and is emitted as a test, and the comparison with zero right after it reads the flags that leaves
+        private bool IsFoldableMask(LirInstruction mask, LirInstruction consumer, Dictionary<LirVirtualRegister, int> uses)
+        {
+            if (mask.Kind != LirInstructionKind.Binary || mask.Operator != "&" || mask.Result is null || mask.Operands.Length != 2)
+                return false;
+            if (!uses.TryGetValue(mask.Result, out int count) || count != 1 || !IsTestable(mask.Result.Type))
+                return false;
+            int size = RegisterSize(mask.Result.Type);
+            LirOperand left = mask.Operands[0];
+            LirOperand right = mask.Operands[1];
+            if (!(IsInPlaceSource(right, size) && HasExactRegisterWidth(left, size)) && !(IsInPlaceSource(left, size) && HasExactRegisterWidth(right, size)))
+                return false;
+            if (consumer.Kind == LirInstructionKind.Branch && consumer.Operands.Length == 1)
+                return ScratchNeeds.ReadsRegister(consumer.Operands[0], mask.Result);
+            return consumer.Kind is LirInstructionKind.Branch or LirInstructionKind.Binary && consumer.Operands.Length == 2 &&
+                IsComparisonOperator(consumer.Operator) && ScratchNeeds.ReadsRegister(consumer.Operands[0], mask.Result) &&
+                IsIntegerImmediate(consumer.Operands[1], 0) && RegisterSize(consumer.Operands[1].Type) == size;
+        }
+
+        private bool IsTestable(QualifiedType type)
+            => (IsIntegerLike(type) || IsPointerLike(type)) && !IsX86WideInteger(type) && !RequiresBlockCopyStorage(type);
+
+        private bool IsFoldableMaskLoad(LirInstruction load, LirInstruction mask, Dictionary<LirVirtualRegister, int> uses)
+        {
+            if (load.Kind != LirInstructionKind.Load || load.Result is null || load.Address is null || _allocation[load.Result].IsSpilled)
+                return false;
+            if (!uses.TryGetValue(load.Result, out int count) || count != 1)
+                return false;
+            bool loadIsLeft = ScratchNeeds.ReadsRegister(mask.Operands[0], load.Result);
+            if (!loadIsLeft && !ScratchNeeds.ReadsRegister(mask.Operands[1], load.Result))
+                return false;
+            int size = RegisterSize(mask.Result!.Type);
+            return SizeOfStorage(load.Result.Type) == size && IsInPlaceSource(mask.Operands[loadIsLeft ? 1 : 0], size);
+        }
+
+        private void EmitMaskTest(LirInstruction mask, LirInstruction consumer, bool zeroFlagOnly)
+        {
+            int size = RegisterSize(mask.Result!.Type);
+            LirOperand tested = mask.Operands[0];
+            LirOperand source = mask.Operands[1];
+            if (!HasExactRegisterWidth(tested, size) || !IsInPlaceSource(source, size) || IsPendingFoldedLoad(source))
+                (tested, source) = (source, tested);
+            X86Operand target = LoadOperandForRead(tested, X86Register.Invalid, mask, size);
+            X86Operand operand = LoadOperandForRead(source, X86Register.Invalid, mask, size);
+            if (zeroFlagOnly && operand.Kind == X86OperandKind.Immediate && (ulong)operand.Immediate <= byte.MaxValue && size > 1 &&
+                (_owner._machineTarget.Is64Bit || target.Kind == X86OperandKind.Memory))
+            {
+                size = 1;
+            }
+            Emit(X86Instruction.Binary(X86InstrKind.Test, target.WithSize(size), operand.Kind == X86OperandKind.Register ? operand.WithSize(size) : operand));
+            _maskConsumer = consumer;
+            _maskFlagsWrites = _owner.FlagsWrites;
+        }
+
+        private void EmitZeroComparison(LirOperand value, LirInstruction instruction, int size, X86Condition condition)
+        {
+            if (ReferenceEquals(instruction, _maskConsumer))
+            {
+                if (_owner.FlagsWrites != _maskFlagsWrites)
+                    throw new InvalidOperationException("The flags of a folded and were overwritten before its consumer.");
+                _maskConsumer = null;
+                return;
+            }
+            if (IsPendingFoldedLoad(value) && TryReadFoldedLoad(value, SizeOfStorage(value.Type), out X86Operand memory))
+            {
+                Emit(X86Instruction.Binary(X86InstrKind.Cmp, memory, Imm(0)));
+                return;
+            }
+
+            X86Operand operand = value.Kind == LirOperandKind.Register && value.Register is not null && RegisterSize(value.Type) == size
+                ? GetRegisterReadOperand(value.Register, X86Register.Invalid, size)
+                : default;
+            if (operand.Kind == X86OperandKind.Memory)
+            {
+                Emit(X86Instruction.Binary(X86InstrKind.Cmp, operand, Imm(0)));
+                return;
+            }
+            if (operand.Kind != X86OperandKind.Register)
+            {
+                LoadOperandInto(value, Scratch0, instruction, size);
+                operand = Reg(Scratch0, size);
+            }
+            if (!_owner.FlagsReflect(operand.Register, size, condition))
+                Emit(X86Instruction.Binary(X86InstrKind.Test, operand, operand));
+        }
+
+        private bool IsReadModifyWrite(LirInstruction load, LirInstruction binary, LirInstruction store, Dictionary<LirVirtualRegister, int> uses)
+        {
+            if (load.Kind != LirInstructionKind.Load || load.Result is null || load.Address is null)
+                return false;
+            if (binary.Kind != LirInstructionKind.Binary || binary.Result is null || binary.Operands.Length != 2 ||
+                binary.Operator is not ("+" or "-" or "&" or "|" or "^"))
+            {
+                return false;
+            }
+            if (store.Kind != LirInstructionKind.Store || store.Address is null || store.Operands.Length != 1 ||
+                !ScratchNeeds.ReadsRegister(store.Operands[0], binary.Result))
+            {
+                return false;
+            }
+            if (!uses.TryGetValue(load.Result, out var loads) || loads != 1 || !uses.TryGetValue(binary.Result, out var results) || results != 1)
+                return false;
+
+            var type = load.Result.Type;
+            var size = RegisterSize(type);
+            if (!IsIntegerLike(type) || IsFloatType(type) || IsX86WideInteger(type) || SizeOfStorage(type) != size)
+                return false;
+            if (!IsIntegerLike(binary.Result.Type) || RegisterSize(binary.Result.Type) != size || SizeOfStorage(store.Address.ElementType) != size)
+                return false;
+
+            var loadIsLeft = ScratchNeeds.ReadsRegister(binary.Operands[0], load.Result);
+            if (!loadIsLeft && (binary.Operator == "-" || !ScratchNeeds.ReadsRegister(binary.Operands[1], load.Result)))
+                return false;
+            var other = binary.Operands[loadIsLeft ? 1 : 0];
+            return IsIntegerLike(other.Type) && IsInPlaceSource(other, size) && SameAddress(load.Address, store.Address);
+        }
+
+        private static bool SameAddress(LirAddress left, LirAddress right)
+        {
+            if (ReferenceEquals(left, right))
+                return true;
+            if (left.Kind != right.Kind || left.Scale != right.Scale || left.Displacement != right.Displacement ||
+                !ReferenceEquals(left.StackSlot, right.StackSlot) || !ReferenceEquals(left.Symbol, right.Symbol) ||
+                !ReferenceEquals(left.Field, right.Field))
+            {
+                return false;
+            }
+            if (!SameAddressOperand(left.BaseOperand, right.BaseOperand) || !SameAddressOperand(left.Index, right.Index))
+                return false;
+            if (left.BaseAddress is null || right.BaseAddress is null)
+                return left.BaseAddress is null && right.BaseAddress is null;
+            return SameAddress(left.BaseAddress, right.BaseAddress);
+        }
+
+        private static bool SameAddressOperand(LirOperand? left, LirOperand? right)
+        {
+            if (left is null || right is null)
+                return left is null && right is null;
+            return left.Kind == right.Kind && left.Kind switch
+            {
+                LirOperandKind.Register => ReferenceEquals(left.Register, right.Register),
+                LirOperandKind.Immediate => Equals(left.Immediate, right.Immediate),
+                LirOperandKind.Symbol => ReferenceEquals(left.Symbol, right.Symbol),
+                LirOperandKind.StackSlot => ReferenceEquals(left.StackSlot, right.StackSlot),
+                _ => false,
+            };
         }
 
         private static void CountInstructionUses(LirInstruction instruction, Dictionary<LirVirtualRegister, int> uses)
@@ -7001,6 +7524,35 @@ public sealed class X86CodeGenerator
             return false;
         }
 
+        private void EmitDeferredLoad(LirOperand operand)
+        {
+            if (operand.Kind != LirOperandKind.Register || operand.Register is null || !_foldableLoads.Remove(operand.Register, out var load))
+                return;
+            _foldedAddresses.Remove(operand.Register);
+            EmitLoad(load);
+        }
+
+        private bool TryReadFloatingMemory(LirOperand operand, QualifiedType type, LirInstruction instruction, out X86Operand memory)
+        {
+            memory = default;
+            if (!_owner._machineTarget.Is64Bit || !IsFloatType(operand.Type) || !SameFloatingType(operand.Type, type))
+                return false;
+            var size = FloatingStorageSize(type);
+            if (operand.Kind == LirOperandKind.Immediate)
+            {
+                if (IsPositiveFloatingZero(operand.Immediate, type))
+                    return false;
+                memory = LiteralOperand(_owner.CreateFloatingLiteral(type, operand.Immediate), type);
+                return true;
+            }
+            if (operand.Kind != LirOperandKind.Register || operand.Register is null)
+                return false;
+            if (TryReadFoldedLoad(operand, size, out memory))
+                return true;
+            memory = LoadOperandForRead(operand, X86Register.Invalid, instruction, size);
+            return memory.Kind == X86OperandKind.Memory;
+        }
+
         private bool IsSignedIntegerType(QualifiedType type)
             => GimpleTypes.IsIntegerLike(type) && GimpleTypes.IsSigned(type, _owner._target);
 
@@ -7053,14 +7605,14 @@ public sealed class X86CodeGenerator
         private void EmitLoadFromStack(X86Register destination, int offset, int size, bool signed)
             => EmitLoadFromMemory(destination, Mem(FrameBase, offset, size), signed);
 
-        private void EmitLoadFromMemory(X86Register destination, X86Operand source, bool signed)
+        private void EmitLoadFromMemory(X86Register destination, X86Operand source, bool signed, int width = 4)
         {
             var size = Math.Max(1, source.Size);
-            var registerSize = Math.Max(size, size < 4 ? 4 : size);
+            var registerSize = Math.Max(size, width);
             if (size == registerSize)
                 Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(destination, registerSize), source.WithSize(size)));
             else if (signed)
-                Emit(X86Instruction.Binary(X86InstrKind.Movsx, Reg(destination, registerSize), source.WithSize(size)));
+                Emit(X86Instruction.Binary(size == 4 ? X86InstrKind.Movsxd : X86InstrKind.Movsx, Reg(destination, registerSize), source.WithSize(size)));
             else
                 Emit(X86Instruction.Binary(X86InstrKind.Movzx, Reg(destination, registerSize), source.WithSize(size)));
         }

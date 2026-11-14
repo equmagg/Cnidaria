@@ -143,6 +143,7 @@ public static class StandardLibrarySources
             CreateFile("src/startup/libc.c"),
             CreateFile("src/process/process.c"),
             CreateFile("src/signal/signal.c"),
+            CreateFile("src/softfloat/softfloat.c"),
             CreateFile("src/stdio/stdio.c"),
             CreateFile("src/stdio/vfscanf-internal.c"),
             CreateFile("src/stdio/scanf.c"),

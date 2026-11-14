@@ -126,6 +126,8 @@ internal sealed class LinearScanRegisterAllocator
     private readonly Dictionary<string, ImmutableArray<AbiLocation>> _incomingParameterLocations = new(StringComparer.Ordinal);
     private readonly Dictionary<LirVirtualRegister, List<MachineRegister>> _abiPreferences = new();
     private readonly Dictionary<LirVirtualRegister, List<LirVirtualRegister>> _phiWebs = new();
+    private readonly Dictionary<LirVirtualRegister, LirVirtualRegister> _sameBitsSources = new();
+    private readonly Dictionary<LirVirtualRegister, LirInstruction> _definingInstructions = new();
     private readonly IScratchNeeds? _scratchNeeds;
     private ImmutableArray<MachineRegister> _generalRegisters;
 
@@ -155,6 +157,8 @@ internal sealed class LinearScanRegisterAllocator
         _incomingRegisterReleasePositions.Clear();
         _abiPreferences.Clear();
         _phiWebs.Clear();
+        _sameBitsSources.Clear();
+        _definingInstructions.Clear();
         BuildIncomingParameterRegisters();
         var intervals = BuildIntervals();
         foreach (var interval in intervals.Values)
@@ -170,11 +174,11 @@ internal sealed class LinearScanRegisterAllocator
         _generalRegisters = _options.GeneralRegisters;
         if (HasDynamicStack(_function) && TargetRegisterInfo.FrameBaseRegister(_target) is var frameBase && frameBase != MachineRegister.Invalid)
             _generalRegisters = _generalRegisters.Remove(frameBase);
-        AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, _generalRegisters, allocations, _copyPreferences, _abiPreferences, _phiWebs, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions, CheaperInMemory, SpillWeight);
-        AllocateClasses(intervals, new[] { LirRegisterClass.Floating }, _options.FloatingRegisters, allocations, _copyPreferences, _abiPreferences, _phiWebs, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions, CheaperInMemory, SpillWeight);
-        AllocateClasses(intervals, new[] { LirRegisterClass.Vector }, _options.VectorRegisters, allocations, _copyPreferences, _abiPreferences, _phiWebs, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions, CheaperInMemory, SpillWeight);
+        AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, _generalRegisters, allocations, _copyPreferences, _abiPreferences, _phiWebs, _sameBitsSources, _definingInstructions, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions, CheaperInMemory, SpillWeight);
+        AllocateClasses(intervals, new[] { LirRegisterClass.Floating }, _options.FloatingRegisters, allocations, _copyPreferences, _abiPreferences, _phiWebs, _sameBitsSources, _definingInstructions, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions, CheaperInMemory, SpillWeight);
+        AllocateClasses(intervals, new[] { LirRegisterClass.Vector }, _options.VectorRegisters, allocations, _copyPreferences, _abiPreferences, _phiWebs, _sameBitsSources, _definingInstructions, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions, CheaperInMemory, SpillWeight);
 
-        var scratchOccupants = new Dictionary<MachineRegister, List<(int Start, int End, LiveInterval Interval)>>();
+        var scratchOccupants = new Dictionary<MachineRegister, List<(int Start, int End, int Reach, LiveInterval Interval)>>();
         var managedScratch = _scratchNeeds?.Registers(ScratchClass.All);
         foreach (var interval in intervals.Values.OrderBy(static i => i.Register.Ordinal))
         {
@@ -183,11 +187,11 @@ internal sealed class LinearScanRegisterAllocator
                 if (managedScratch is not null && !assigned.IsSpilled && managedScratch.Contains(assigned.PhysicalRegister))
                 {
                     if (!scratchOccupants.TryGetValue(assigned.PhysicalRegister, out var occupants))
-                        scratchOccupants.Add(assigned.PhysicalRegister, occupants = new List<(int Start, int End, LiveInterval Interval)>());
+                        scratchOccupants.Add(assigned.PhysicalRegister, occupants = new List<(int Start, int End, int Reach, LiveInterval Interval)>());
                     foreach (var range in interval.Ranges)
-                        occupants.Add((range.Start, range.End, interval));
+                        occupants.Add((range.Start, range.End, range.End, interval));
                     if (interval.Ranges.Count == 0)
-                        occupants.Add((interval.Start, interval.Start, interval));
+                        occupants.Add((interval.Start, interval.Start, interval.Start, interval));
                 }
                 continue;
             }
@@ -203,14 +207,26 @@ internal sealed class LinearScanRegisterAllocator
             allocations[register] = allocations[register].WithCallPreservation();
 
         foreach (var occupants in scratchOccupants.Values)
+        {
             occupants.Sort(static (left, right) => left.Start.CompareTo(right.Start));
+            for (int i = 1; i < occupants.Count; i++)
+            {
+                if (occupants[i].Reach < occupants[i - 1].Reach)
+                    occupants[i] = occupants[i] with { Reach = occupants[i - 1].Reach };
+            }
+        }
         Func<MachineRegister, int, bool> isScratchFree = (register, position) => IsScratchFree(scratchOccupants, register, position);
 
         var frame = LayoutStackFrame(allocations, preservationRegisters, isScratchFree);
         foreach (var pair in allocations.ToArray())
         {
-            if (!pair.Value.NeedsStackSlot || pair.Key.HomeSlot is not null)
+            if (!pair.Value.NeedsStackSlot)
                 continue;
+            if (pair.Key.HomeSlot is not null)
+            {
+                allocations[pair.Key] = pair.Value.WithStackOffset(frame.StackSlotOffsets[pair.Key.HomeSlot]);
+                continue;
+            }
 
             if (!frame.SpillOffsets.TryGetValue(pair.Key, out var offset))
                 throw new InvalidOperationException("Missing spill slot for " + pair.Key.Name + ".");
@@ -222,9 +238,9 @@ internal sealed class LinearScanRegisterAllocator
         return new AllocationResult(_function, allocations, frame, callPreservations, _scratchKills, isScratchFree);
     }
 
-    // Values sharing a register never overlap, so their live ranges there are disjoint and end in the order they start;
+    // Only copies of one value overlap in a register, so the scan backs up while an earlier range still reaches the position
     // one value can live inside another's lifetime hole, which is why the search runs over ranges, not intervals
-    private bool IsScratchFree(Dictionary<MachineRegister, List<(int Start, int End, LiveInterval Interval)>> occupants, MachineRegister register, int position)
+    private bool IsScratchFree(Dictionary<MachineRegister, List<(int Start, int End, int Reach, LiveInterval Interval)>> occupants, MachineRegister register, int position)
     {
         if (_instructionClobbers.Clobbers(position, register))
             return false;
@@ -240,8 +256,10 @@ internal sealed class LinearScanRegisterAllocator
             else
                 high = middle - 1;
         }
-        for (var index = high; index >= 0 && ranges[index].End >= position; index--)
+        for (int index = high; index >= 0 && ranges[index].Reach >= position; index--)
         {
+            if (ranges[index].End < position)
+                continue;
             var interval = ranges[index].Interval;
             if (interval.IsLiveBefore(position) || interval.HasDefinitionAtPosition(position) || interval.HasDefinitionAtPosition(position + 1))
                 return false;
@@ -367,6 +385,8 @@ internal sealed class LinearScanRegisterAllocator
                         if (!firstDefs.ContainsKey(register))
                             firstDefs.Add(register, definitionPosition);
                     });
+                if (instruction.Result is not null && instruction.Kind != LirInstructionKind.ParallelCopy)
+                    _definingInstructions[instruction.Result] = instruction;
                 previous = instruction;
             }
 
@@ -490,9 +510,36 @@ internal sealed class LinearScanRegisterAllocator
     private int DefinitionPosition(LirInstruction instruction, int position)
         => instruction.Kind is LirInstructionKind.Copy or LirInstructionKind.ParallelCopy or LirInstructionKind.Call
                or LirInstructionKind.Convert ||
-           UpdatesFirstOperandInPlace(instruction)
+           instruction.Kind == LirInstructionKind.Load && instruction.Result is not null &&
+               TargetRegisterInfo.RegisterGroupCount(_target, instruction.Result.Type) == 1 ||
+           UpdatesFirstOperandInPlace(instruction) ||
+           IsThreeAddressArithmetic(instruction)
             ? position + 1
             : position;
+
+    // x86 writes some results through fixed registers or setcc before the last read, and a register pair is written half by half
+    private bool IsThreeAddressArithmetic(LirInstruction instruction)
+    {
+        if (instruction.Kind is not (LirInstructionKind.Unary or LirInstructionKind.Binary) ||
+            _target.IsX86 ||
+            instruction.Result is null ||
+            instruction.Result.RegisterClass is not (LirRegisterClass.General or LirRegisterClass.Address or LirRegisterClass.Floating) ||
+            TargetRegisterInfo.RegisterGroupCount(_target, instruction.Result.Type) != 1)
+        {
+            return false;
+        }
+
+        foreach (LirOperand operand in instruction.Operands)
+        {
+            if (operand.Kind == LirOperandKind.Register && operand.Register is not null &&
+                TargetRegisterInfo.RegisterGroupCount(_target, operand.Register.Type) != 1)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     private void RecordIncomingRegisterRelease(LirInstruction instruction, int position)
     {
@@ -1058,6 +1105,7 @@ internal sealed class LinearScanRegisterAllocator
         }
 
         RecordFirstOperandPreference(instruction);
+        RecordSameBitsSource(instruction);
 
         if (instruction.Kind != LirInstructionKind.ParallelCopy)
             return;
@@ -1070,6 +1118,48 @@ internal sealed class LinearScanRegisterAllocator
                 JoinPhiWeb(copy.Destination, copy.Source.Register);
             }
         }
+    }
+
+    private void RecordSameBitsSource(LirInstruction instruction)
+    {
+        if (instruction.Kind is not (LirInstructionKind.Copy or LirInstructionKind.Convert) ||
+            instruction.Result is null ||
+            instruction.Operands.Length == 0 ||
+            instruction.Operands[0].Kind != LirOperandKind.Register)
+        {
+            return;
+        }
+
+        LirVirtualRegister? source = instruction.Operands[0].Register;
+        LirVirtualRegister result = instruction.Result;
+        if (source is null || !ShouldTrack(source) || !ShouldTrack(result) ||
+            !IsGeneralLikeClass(source.RegisterClass) || !IsGeneralLikeClass(result.RegisterClass) ||
+            !HoldsSameBits(source.Type, result.Type))
+        {
+            return;
+        }
+
+        _sameBitsSources[result] = source;
+    }
+
+    // Narrower integers have a target-specific canonical extension a conversion may rewrite
+    private bool HoldsSameBits(QualifiedType source, QualifiedType destination)
+    {
+        int size = _target.SizeOf(source);
+        if (size != _target.SizeOf(destination))
+            return false;
+        bool sourcePointer = source.Type.Kind == TypeKind.Pointer;
+        bool destinationPointer = destination.Type.Kind == TypeKind.Pointer;
+        if (sourcePointer && destinationPointer)
+            return true;
+        if (!(sourcePointer || GimpleTypes.IsIntegerLike(source)) || !(destinationPointer || GimpleTypes.IsIntegerLike(destination)))
+            return false;
+
+        // The register bytecode keeps no extension invariant, it only re-extends a narrow value whose signedness changes
+        if (_target.IsRegisterBytecode)
+            return size >= 4 || source.Type.ToDisplayString() == destination.Type.ToDisplayString();
+
+        return size >= _target.RegisterSize;
     }
 
     private void JoinPhiWeb(LirVirtualRegister destination, LirVirtualRegister source)
@@ -1309,6 +1399,8 @@ internal sealed class LinearScanRegisterAllocator
         IReadOnlyDictionary<LirVirtualRegister, List<LirVirtualRegister>> copyPreferences,
         IReadOnlyDictionary<LirVirtualRegister, List<MachineRegister>> abiPreferences,
         IReadOnlyDictionary<LirVirtualRegister, List<LirVirtualRegister>> phiWebs,
+        IReadOnlyDictionary<LirVirtualRegister, LirVirtualRegister> sameBitsSources,
+        IReadOnlyDictionary<LirVirtualRegister, LirInstruction> definingInstructions,
         TargetInfo target,
         ImmutableArray<LirRegisterClass> callBoundarySplitClasses,
         IReadOnlyList<int> callPositions,
@@ -1321,6 +1413,8 @@ internal sealed class LinearScanRegisterAllocator
     {
         if (physicalRegisters.IsDefaultOrEmpty)
             return;
+
+        var sharedValueRoots = new Dictionary<LirVirtualRegister, LirVirtualRegister>();
 
         var intervals = allIntervals.Values
             .Where(i => !allocations.ContainsKey(i.Register) && registerClasses.Contains(i.Register.RegisterClass))
@@ -1346,7 +1440,17 @@ internal sealed class LinearScanRegisterAllocator
                 continue;
             }
 
-            var reg = PreferredFreeRegister(interval, allowedRegisters, active, allocations, copyPreferences, abiPreferences, phiWebs, valueNumberPreferredRegisters, target, CrossesCalls(interval.Register), CrossesCalls);
+            if (TryShareSourceRegister(interval, allowedRegisters, active, allocations, allIntervals, sameBitsSources, sharedValueRoots, phiWebs,
+                    copyPreferences, abiPreferences, target, callPositions, out LirVirtualRegister sourceRoot))
+            {
+                sharedValueRoots[interval.Register] = sourceRoot;
+                allocations[interval.Register] = VirtualRegisterAllocation.InRegister(interval.Register, interval.PhysicalRegister);
+                RememberValueNumberRegister(interval, interval.PhysicalRegister, valueNumberPreferredRegisters);
+                InsertActive(active, interval);
+                continue;
+            }
+
+            MachineRegister reg = PreferredFreeRegister(interval, allowedRegisters, active, allocations, copyPreferences, abiPreferences, phiWebs, valueNumberPreferredRegisters, definingInstructions, target, CrossesCalls(interval.Register), CrossesCalls);
             if (reg == MachineRegister.Invalid)
             {
                 SpillAtInterval(interval, active, allocations, valueNumberPreferredRegisters, allowedRegisters, spillWeight);
@@ -1364,6 +1468,120 @@ internal sealed class LinearScanRegisterAllocator
                 InsertActive(active, interval);
             }
         }
+    }
+
+    // A copy of a still-live source with the same bits can hold the source's register while neither is written again
+    private static bool TryShareSourceRegister(
+        LiveInterval interval,
+        ImmutableArray<MachineRegister> allowedRegisters,
+        List<LiveInterval> active,
+        IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
+        Dictionary<LirVirtualRegister, LiveInterval> allIntervals,
+        IReadOnlyDictionary<LirVirtualRegister, LirVirtualRegister> sameBitsSources,
+        IReadOnlyDictionary<LirVirtualRegister, LirVirtualRegister> sharedValueRoots,
+        IReadOnlyDictionary<LirVirtualRegister, List<LirVirtualRegister>> phiWebs,
+        IReadOnlyDictionary<LirVirtualRegister, List<LirVirtualRegister>> copyPreferences,
+        IReadOnlyDictionary<LirVirtualRegister, List<MachineRegister>> abiPreferences,
+        TargetInfo target,
+        IReadOnlyList<int> callPositions,
+        out LirVirtualRegister root)
+    {
+        root = interval.Register;
+        if (!sameBitsSources.TryGetValue(interval.Register, out LirVirtualRegister? source) ||
+            interval.Register.HasFixedRegister ||
+            interval.RegisterCount != 1 ||
+            interval.DefinitionPositions.Count != 1)
+        {
+            return false;
+        }
+
+        LiveInterval? sourceInterval = null;
+        foreach (LiveInterval candidate in active)
+        {
+            if (ReferenceEquals(candidate.Register, source))
+            {
+                sourceInterval = candidate;
+                break;
+            }
+        }
+
+        if (sourceInterval is null || sourceInterval.RegisterCount != 1 || sourceInterval.Register.HasFixedRegister ||
+            !sourceInterval.Overlaps(interval))
+        {
+            return false;
+        }
+
+        MachineRegister register = sourceInterval.PhysicalRegister;
+        if (phiWebs.TryGetValue(interval.Register, out List<LirVirtualRegister>? web) && !WebHoldsRegister(web, register, allocations))
+            return false;
+        if (!ContainsRegister(allowedRegisters, register) ||
+            !TargetRegisterInfo.IsCalleeSaved(target, register) && IntervalSpansPosition(interval, callPositions) ||
+            HasFreeAbiRegister(interval, interval.Register, allowedRegisters, active, abiPreferences))
+        {
+            return false;
+        }
+
+        if (copyPreferences.TryGetValue(interval.Register, out List<LirVirtualRegister>? neighbours))
+        {
+            foreach (LirVirtualRegister neighbour in neighbours)
+            {
+                if (!allocations.ContainsKey(neighbour) && HasFreeAbiRegister(interval, neighbour, allowedRegisters, active, abiPreferences))
+                    return false;
+            }
+        }
+
+        root = sharedValueRoots.TryGetValue(source, out LirVirtualRegister? sourceRoot) ? sourceRoot : source;
+        if (allIntervals.TryGetValue(root, out LiveInterval? rootInterval))
+        {
+            foreach (int definition in rootInterval.DefinitionPositions)
+            {
+                if (interval.OverlapsSpan(definition, definition))
+                    return false;
+            }
+        }
+
+        foreach (LiveInterval occupant in active)
+        {
+            if (!occupant.Occupies(register) || !occupant.Overlaps(interval) || ReferenceEquals(occupant.Register, root))
+                continue;
+            if (!sharedValueRoots.TryGetValue(occupant.Register, out LirVirtualRegister? occupantRoot) || !ReferenceEquals(occupantRoot, root))
+                return false;
+        }
+
+        interval.PhysicalRegister = register;
+        return true;
+    }
+
+    private static bool WebHoldsRegister(
+        List<LirVirtualRegister> web,
+        MachineRegister register,
+        IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations)
+    {
+        foreach (LirVirtualRegister member in web)
+        {
+            if (allocations.TryGetValue(member, out VirtualRegisterAllocation? allocation) && !allocation.IsSpilled && allocation.PhysicalRegister == register)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool HasFreeAbiRegister(
+        LiveInterval interval,
+        LirVirtualRegister register,
+        ImmutableArray<MachineRegister> allowedRegisters,
+        List<LiveInterval> active,
+        IReadOnlyDictionary<LirVirtualRegister, List<MachineRegister>> abiPreferences)
+    {
+        if (!abiPreferences.TryGetValue(register, out List<MachineRegister>? preferred))
+            return false;
+        foreach (MachineRegister candidate in preferred)
+        {
+            if (IsFreeRegister(interval, candidate, allowedRegisters, active))
+                return true;
+        }
+
+        return false;
     }
 
     private int MemoryCost(LiveInterval interval)
@@ -1698,6 +1916,7 @@ internal sealed class LinearScanRegisterAllocator
         IReadOnlyDictionary<LirVirtualRegister, List<MachineRegister>> abiPreferences,
         IReadOnlyDictionary<LirVirtualRegister, List<LirVirtualRegister>> phiWebs,
         IReadOnlyDictionary<ValueNumber, MachineRegister> valueNumberPreferredRegisters,
+        IReadOnlyDictionary<LirVirtualRegister, LirInstruction> definingInstructions,
         TargetInfo target,
         bool preferCalleeSaved,
         Func<LirVirtualRegister, bool> crossesCalls)
@@ -1825,6 +2044,18 @@ internal sealed class LinearScanRegisterAllocator
             }
         }
 
+        if (web is not null && definingInstructions.TryGetValue(interval.Register, out LirInstruction? definition))
+        {
+            foreach (MachineRegister register in physicalRegisters)
+            {
+                if (IsFreeRegister(interval, register, physicalRegisters, active) &&
+                    !HoldsOperandOfOtherWeb(definition, register, web, allocations, phiWebs))
+                {
+                    return register;
+                }
+            }
+        }
+
         return FirstFreeRegister(interval, physicalRegisters, active);
 
         MachineRegister FreeAbiRegister()
@@ -1840,6 +2071,29 @@ internal sealed class LinearScanRegisterAllocator
             }
             return MachineRegister.Invalid;
         }
+    }
+
+    // A web member in the register of another web's operand dying under it turns that loop's latch copies into a cycle
+    private static bool HoldsOperandOfOtherWeb(
+        LirInstruction definition,
+        MachineRegister register,
+        List<LirVirtualRegister> web,
+        IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
+        IReadOnlyDictionary<LirVirtualRegister, List<LirVirtualRegister>> phiWebs)
+    {
+        foreach (LirOperand operand in definition.Operands)
+        {
+            if (operand.Kind == LirOperandKind.Register && operand.Register is not null &&
+                allocations.TryGetValue(operand.Register, out VirtualRegisterAllocation? allocation) &&
+                !allocation.IsSpilled && allocation.PhysicalRegister == register &&
+                phiWebs.TryGetValue(operand.Register, out List<LirVirtualRegister>? operandWeb) &&
+                !ReferenceEquals(operandWeb, web))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static void RememberValueNumberRegister(

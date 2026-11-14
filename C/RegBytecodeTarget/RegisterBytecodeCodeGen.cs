@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Globalization;
 using System.Linq;
-using System.Text;
 using Cnidaria.Cs;
 
 namespace Cnidaria.C;
@@ -844,7 +843,7 @@ public sealed class RegisterBytecodeCodeGenerator
 
         if (value is string text && type.Type is ArrayType)
         {
-            var bytes = Encoding.UTF8.GetBytes(text);
+            var bytes = NarrowStringEncoding.GetBytes(text);
             var count = Math.Min(availableSize, checked(bytes.Length + 1));
             for (var index = 0; index < count; index++)
                 destination[destinationOffset + index] = index < bytes.Length ? bytes[index] : (byte)0;
@@ -1477,8 +1476,6 @@ public sealed class RegisterBytecodeCodeGenerator
             var op = instruction.Operator;
             if (op == "!" && IsFloatType(instruction.Operands[0].Type))
             {
-                if (IsLongDouble(instruction.Operands[0].Type))
-                    throw Unsupported(instruction, "long double logical-not is not supported by the register-bytecode backend.");
                 var fsrc = LoadOperand(instruction.Operands[0], FpScratch1);
                 EmitLiFloat(FpScratch2, 0.0, instruction.Operands[0].Type);
                 EmitRaw(IsFloat32(instruction.Operands[0].Type) ? Op.F32Eq : Op.F64Eq, dst, fsrc, FpScratch2);
@@ -1574,8 +1571,7 @@ public sealed class RegisterBytecodeCodeGenerator
 
         private QualifiedType FloatingBinaryComputationType(QualifiedType leftType, QualifiedType rightType, QualifiedType resultType)
         {
-            if (IsFloat64(leftType) || IsFloat64(rightType) || IsFloat64(resultType) ||
-                IsLongDouble(leftType) || IsLongDouble(rightType) || IsLongDouble(resultType))
+            if (IsFloat64(leftType) || IsFloat64(rightType) || IsFloat64(resultType))
                 return TypeCatalog.Instance.Builtin(BuiltinTypeKind.Double);
 
             return TypeCatalog.Instance.Builtin(BuiltinTypeKind.Float);
@@ -1904,7 +1900,10 @@ public sealed class RegisterBytecodeCodeGenerator
                 return;
             }
 
-            var src = LoadOperandAs(instruction.Operands[0], storeType, GpScratch0, FpScratch0, instruction);
+            var source = instruction.Operands[0];
+            var src = StoresLowBytes(source.Type, storeType)
+                ? LoadOperand(source, GpScratch0)
+                : LoadOperandAs(source, storeType, GpScratch0, FpScratch0, instruction);
             var parts = BuildAddress(instruction.Address, GpScratch1, GpScratch2);
             EmitMem(StoreOpForType(storeType), src, parts.BaseRegister, parts.Offset, parts.IndexRegister, parts.BaseKind, AlignmentOf(storeType), parts.ScaleLog2);
         }
@@ -2149,9 +2148,6 @@ public sealed class RegisterBytecodeCodeGenerator
 
             if (IsFloatType(type))
             {
-                if (IsLongDouble(type))
-                    throw Unsupported(instruction, "long double branch conditions are not supported by the register-bytecode backend.");
-
                 var condf = LoadOperand(instruction.Operands[0], FpScratch0);
                 EmitLiFloat(FpScratch1, 0.0, type);
 
@@ -2191,9 +2187,6 @@ public sealed class RegisterBytecodeCodeGenerator
 
             if (IsFloatType(leftType) || IsFloatType(rightType))
             {
-                if (IsLongDouble(leftType) || IsLongDouble(rightType))
-                    throw Unsupported(instruction, "long double comparison branches are not supported by the register-bytecode backend.");
-
                 var floatType = FloatingBinaryComputationType(leftType, rightType, IsFloatType(leftType) ? leftType : rightType);
                 var left = LoadOperandForFloatingBinary(instruction.Operands[0], floatType, FpScratch1, GpScratch1, instruction);
                 var right = LoadOperandForFloatingBinary(instruction.Operands[1], floatType, FpScratch2, GpScratch2, instruction);
@@ -3142,7 +3135,7 @@ public sealed class RegisterBytecodeCodeGenerator
 
         private void LoadCStringLiteral(string text, MachineRegister destination)
         {
-            var bytes = Encoding.UTF8.GetBytes($"{text ?? string.Empty}\0");
+            var bytes = NarrowStringEncoding.GetBytes($"{text ?? string.Empty}\0");
             LoadStaticBlob(bytes, destination);
         }
 
@@ -3383,9 +3376,6 @@ public sealed class RegisterBytecodeCodeGenerator
 
         private void EmitFloatConversion(MachineRegister dst, MachineRegister src, QualifiedType srcType, QualifiedType dstType, LirInstruction instruction)
         {
-            if (IsLongDouble(srcType) || IsLongDouble(dstType))
-                throw Unsupported(instruction, "long double conversions are not supported by the register-bytecode backend.");
-
             if (IsFloatType(srcType) && IsFloatType(dstType))
             {
                 if (IsFloat32(srcType) && IsFloat64(dstType))
@@ -3400,7 +3390,7 @@ public sealed class RegisterBytecodeCodeGenerator
             if (IsIntegerLike(srcType) && IsFloatType(dstType))
             {
                 if (Is64BitInteger(srcType))
-                    EmitRaw(IsFloat32(dstType) ? Op.I64ToF32 : Op.I64ToF64, dst, src);
+                    EmitRaw(IsUnsignedInteger(srcType) ? (IsFloat32(dstType) ? Op.U64ToF32 : Op.U64ToF64) : (IsFloat32(dstType) ? Op.I64ToF32 : Op.I64ToF64), dst, src);
                 else
                     EmitRaw(IsUnsignedInteger(srcType) ? (IsFloat32(dstType) ? Op.U32ToF32 : Op.U32ToF64) : (IsFloat32(dstType) ? Op.I32ToF32 : Op.I32ToF64), dst, src);
                 return;
@@ -3408,10 +3398,11 @@ public sealed class RegisterBytecodeCodeGenerator
 
             if (IsFloatType(srcType) && IsIntegerLike(dstType))
             {
+                bool unsigned = IsUnsignedInteger(dstType);
                 if (IsFloat32(srcType))
-                    EmitRaw(Is64BitInteger(dstType) ? Op.F32ToI64 : Op.F32ToI32, dst, src);
+                    EmitRaw(Is64BitInteger(dstType) ? unsigned ? Op.F32ToU64 : Op.F32ToI64 : unsigned ? Op.F32ToU32 : Op.F32ToI32, dst, src);
                 else
-                    EmitRaw(Is64BitInteger(dstType) ? Op.F64ToI64 : Op.F64ToI32, dst, src);
+                    EmitRaw(Is64BitInteger(dstType) ? unsigned ? Op.F64ToU64 : Op.F64ToI64 : unsigned ? Op.F64ToU32 : Op.F64ToI32, dst, src);
                 return;
             }
 
@@ -3420,8 +3411,6 @@ public sealed class RegisterBytecodeCodeGenerator
 
         private void EmitUnaryNeg(MachineRegister dst, MachineRegister src, QualifiedType type)
         {
-            if (IsLongDouble(type))
-                throw new NotSupportedException("long double is not supported by the register-bytecode backend.");
             if (IsFloat32(type))
                 EmitRaw(Op.F32Neg, dst, src);
             else if (IsFloat64(type))
@@ -3434,9 +3423,6 @@ public sealed class RegisterBytecodeCodeGenerator
 
         private Op SelectBinaryOp(string text, QualifiedType leftType, QualifiedType rightType, QualifiedType resultType)
         {
-            if (IsLongDouble(leftType) || IsLongDouble(rightType) || IsLongDouble(resultType))
-                throw new NotSupportedException("long double is not supported by the register-bytecode backend.");
-
             var float32 = IsFloat32(leftType) || IsFloat32(rightType) || IsFloat32(resultType);
             var float64 = IsFloat64(leftType) || IsFloat64(rightType) || IsFloat64(resultType);
             if (float32 || float64)
@@ -3664,6 +3650,13 @@ public sealed class RegisterBytecodeCodeGenerator
         private static bool SameType(QualifiedType left, QualifiedType right)
             => left.ToDisplayString() == right.ToDisplayString();
 
+        // A store keeps only the low bytes, and no integer or pointer conversion to a type no wider changes them
+        private bool StoresLowBytes(QualifiedType source, QualifiedType stored)
+            => (IsIntegerLike(source) || IsPointerLike(source)) &&
+               (IsIntegerLike(stored) || IsPointerLike(stored)) &&
+               stored.Type is not BuiltinType { BuiltinKind: BuiltinTypeKind.Bool } &&
+               SizeOf(stored) <= SizeOf(source);
+
         private static bool IsVoid(QualifiedType type)
             => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Void };
 
@@ -3683,10 +3676,7 @@ public sealed class RegisterBytecodeCodeGenerator
             => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Float };
 
         private static bool IsFloat64(QualifiedType type)
-            => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Double };
-
-        private static bool IsLongDouble(QualifiedType type)
-            => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.LongDouble };
+            => type.Type is BuiltinType builtin && builtin.BuiltinKind is BuiltinTypeKind.Double or BuiltinTypeKind.LongDouble;
 
         private bool Is64BitInteger(QualifiedType type)
         {
@@ -3704,7 +3694,7 @@ public sealed class RegisterBytecodeCodeGenerator
                 return ValueKind.Void;
             if (IsFloat32(type))
                 return ValueKind.Float32;
-            if (IsFloat64(type) || IsLongDouble(type))
+            if (IsFloat64(type))
                 return ValueKind.Float64;
             if (IsPointerLike(type))
                 return ValueKind.Pointer;

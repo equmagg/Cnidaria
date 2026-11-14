@@ -450,7 +450,7 @@ namespace Cnidaria.Cs
             public readonly SyntaxTree Tree;
             public readonly EnumDeclarationSyntax Declaration;
             public readonly SourceNamedTypeSymbol EnumType;
-            public readonly ImmutableDictionary<SyntaxNode, Symbol> DeclMap;
+            public readonly IReadOnlyDictionary<SyntaxNode, Symbol> DeclMap;
             public readonly SemanticModel StubModel;
             public readonly TypeBinder TypeBinder;
             public int NextMember;
@@ -461,7 +461,7 @@ namespace Cnidaria.Cs
                 SyntaxTree tree,
                 EnumDeclarationSyntax declaration,
                 SourceNamedTypeSymbol enumType,
-                ImmutableDictionary<SyntaxNode, Symbol> declMap,
+                IReadOnlyDictionary<SyntaxNode, Symbol> declMap,
                 SemanticModel stubModel,
                 TypeBinder typeBinder)
             {
@@ -766,7 +766,7 @@ namespace Cnidaria.Cs
         }
         private static void BindTypeConstraintTypesForTree(
             SyntaxTree tree,
-            ImmutableDictionary<SyntaxNode, Symbol> declMap,
+            IReadOnlyDictionary<SyntaxNode, Symbol> declMap,
             SemanticModelStub stubModel,
             TypeBinder safeTypeBinder,
             TypeBinder unsafeTypeBinder,
@@ -841,7 +841,7 @@ namespace Cnidaria.Cs
         private static void BindEnumUnderlyingTypesForTree(
             Compilation compilation,
             SyntaxTree tree,
-            ImmutableDictionary<SyntaxNode, Symbol> declMap,
+            IReadOnlyDictionary<SyntaxNode, Symbol> declMap,
             SemanticModel stubModel,
             TypeBinder safeTypeBinder,
             DiagnosticBag diagnostics)
@@ -895,7 +895,7 @@ namespace Cnidaria.Cs
         }
         private static void CollectEnumMembersForTree(
             SyntaxTree tree,
-            ImmutableDictionary<SyntaxNode, Symbol> declMap,
+            IReadOnlyDictionary<SyntaxNode, Symbol> declMap,
             SemanticModel stubModel,
             TypeBinder safeTypeBinder,
             List<PendingEnumMembers> pendingEnums)

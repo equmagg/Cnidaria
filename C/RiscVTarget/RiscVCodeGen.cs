@@ -781,7 +781,7 @@ public sealed class RiscVCodeGenerator
         {
             if (type.Type is ArrayType)
             {
-                var bytes = Encoding.UTF8.GetBytes(text);
+                var bytes = NarrowStringEncoding.GetBytes(text);
                 var count = Math.Min(availableSize, checked(bytes.Length + 1));
                 for (var i = 0; i < count; i++)
                     section.EmitByte(i < bytes.Length ? bytes[i] : (byte)0);
@@ -929,7 +929,7 @@ public sealed class RiscVCodeGenerator
             return existing;
 
         var label = CreateLocalLabel("str");
-        var bytes = Encoding.UTF8.GetBytes(text);
+        var bytes = NarrowStringEncoding.GetBytes(text);
         var offset = _strings.Align(1);
         _strings.DefineSymbol(label, offset, bytes.Length + 1, RVObjectSymbolBinding.Local, _symbols);
         _strings.EmitBytes(bytes, bytes.Length);
@@ -1040,16 +1040,13 @@ public sealed class RiscVCodeGenerator
         => type.Type.Kind is TypeKind.Struct or TypeKind.Union or TypeKind.Array;
 
     private static bool IsFloatType(QualifiedType type)
-        => IsFloat32(type) || IsFloat64(type) || IsLongDouble(type);
+        => IsFloat32(type) || IsFloat64(type);
 
     private static bool IsFloat32(QualifiedType type)
         => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Float };
 
     private static bool IsFloat64(QualifiedType type)
-        => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Double };
-
-    private static bool IsLongDouble(QualifiedType type)
-        => type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.LongDouble };
+        => type.Type is BuiltinType builtin && builtin.BuiltinKind is BuiltinTypeKind.Double or BuiltinTypeKind.LongDouble;
 
     private static bool IsRiscVVectorType(QualifiedType type)
         => type.Type is RVVectorType;
@@ -1646,6 +1643,19 @@ public sealed class RiscVCodeGenerator
                 var right = LoadOperand(instruction.Operands[1], GpScratch2);
                 Emit(RVInstruction.R(minMax, ToRegister(destination), ToRegister(left), ToRegister(right)));
             }
+            else if (IsTruthSelect(diamond, out bool inverted))
+            {
+                // A compare leaves exactly 0 or 1 behind, a lone operand only zero or not
+                MachineRegister condition = EmitSelectCondition(instruction);
+                destination = GetWritableRegister(diamond.Destination, GpScratch0);
+                if (instruction.Operands.Length == 2)
+                    EmitImm(inverted ? RVInstrKind.Xori : RVInstrKind.Addi, destination, condition, inverted ? 1 : 0);
+                else if (inverted)
+                    EmitImm(RVInstrKind.Sltiu, destination, condition, 1);
+                else
+                    Emit(RVInstruction.R(RVInstrKind.Sltu, ToRegister(destination), RVRegister.X0, ToRegister(condition)));
+                SetIntegerRepresentation(destination, IntegerRepresentationFact.ZeroExtended(1));
+            }
             else
             {
                 var condition = EmitSelectCondition(instruction);
@@ -1691,6 +1701,15 @@ public sealed class RiscVCodeGenerator
             opcode = minimum ? (signed ? RVInstrKind.Min : RVInstrKind.Minu) : (signed ? RVInstrKind.Max : RVInstrKind.Maxu);
             return true;
         }
+
+        private bool IsTruthSelect(LirSelectDiamond diamond, out bool inverted)
+        {
+            inverted = IsImmediateValue(diamond.TrueValue, 0) && IsImmediateValue(diamond.FalseValue, 1);
+            return inverted || IsImmediateValue(diamond.TrueValue, 1) && IsImmediateValue(diamond.FalseValue, 0);
+        }
+
+        private bool IsImmediateValue(LirOperand operand, long value)
+            => IsIntegerImmediate(operand) && CanonicalImmediate(operand) == value;
 
         private bool SameOperand(LirOperand left, LirOperand right)
             => left.Kind == LirOperandKind.Register
@@ -3231,6 +3250,14 @@ public sealed class RiscVCodeGenerator
                 return;
             }
 
+            if (operand.Kind == LirOperandKind.Immediate && !IsFloatType(operand.Type))
+            {
+                long value = ConvertIntegerConstant(operand.Immediate);
+                LoadImmediate(low, unchecked((int)value));
+                LoadImmediate(high, (int)(value >> 32));
+                return;
+            }
+
             var address = MaterializeScalarStorageAddress(operand, GpScratch3, instruction);
             LoadFromMemory(low, address, WideIntegerLowOffset(), 4, signed: false);
             LoadFromMemory(high, address, WideIntegerHighOffset(), 4, signed: false);
@@ -3269,8 +3296,6 @@ public sealed class RiscVCodeGenerator
         private void EmitFloatingUnary(LirInstruction instruction)
         {
             var operandType = instruction.Operands[0].Type;
-            if (IsLongDouble(operandType) || IsLongDouble(instruction.Result!.Type))
-                throw HelperRequired(instruction, SelectFloatingHelper(instruction.Operator, operandType), "long double operation requires a runtime helper.");
             RequireFloatingHardware(operandType, instruction);
             if (instruction.Operator == "!")
             {
@@ -3337,8 +3362,6 @@ public sealed class RiscVCodeGenerator
             var lhsType = instruction.Operands[0].Type;
             var rhsType = instruction.Operands[1].Type;
             var floatType = SelectFloatingOperationType(lhsType, rhsType, instruction.Result!.Type);
-            if (IsLongDouble(floatType))
-                throw HelperRequired(instruction, SelectFloatingHelper(instruction.Operator, floatType), "long double operation requires a runtime helper.");
             RequireFloatingHardware(floatType, instruction);
 
             var left = LoadOperandAsFloating(instruction.Operands[0], floatType, FpScratch1, instruction);
@@ -3368,8 +3391,6 @@ public sealed class RiscVCodeGenerator
 
         private QualifiedType SelectFloatingOperationType(QualifiedType left, QualifiedType right, QualifiedType result)
         {
-            if (IsLongDouble(left) || IsLongDouble(right) || IsLongDouble(result))
-                return IsLongDouble(left) ? left : IsLongDouble(right) ? right : result;
             if (IsFloat64(left) || IsFloat64(right) || IsFloat64(result))
                 return IsFloat64(left) ? left : IsFloat64(right) ? right : result;
             if (IsFloat32(left) || IsFloat32(right) || IsFloat32(result))
@@ -4006,9 +4027,6 @@ public sealed class RiscVCodeGenerator
             var srcType = instruction.Operands[0].Type;
             var dstType = instruction.Result!.Type;
 
-            if (IsLongDouble(srcType) || IsLongDouble(dstType))
-                throw HelperRequired(instruction, SelectConversionHelper(srcType, dstType), "long double conversion requires a runtime helper.");
-
             if (IsFloatType(srcType) && IsFloatType(dstType))
             {
                 var dst = GetWritableRegister(instruction.Result, FpScratch0);
@@ -4077,7 +4095,7 @@ public sealed class RiscVCodeGenerator
             else if (IsFloat64(destinationType))
                 opcode = sourceSize <= 4 ? (unsigned ? RVInstrKind.FcvtDWu : RVInstrKind.FcvtDW) : (unsigned ? RVInstrKind.FcvtDLu : RVInstrKind.FcvtDL);
             else
-                throw HelperRequired(instruction, SelectConversionHelper(sourceType, destinationType), "long double conversion requires a runtime helper.");
+                throw HelperRequired(instruction, SelectConversionHelper(sourceType, destinationType), "Unsupported floating-point conversion.");
 
             if (sourceSize > _owner._target.RegisterSize)
                 throw HelperRequired(instruction, SelectConversionHelper(sourceType, destinationType),
@@ -4096,7 +4114,7 @@ public sealed class RiscVCodeGenerator
             else if (IsFloat64(sourceType))
                 opcode = destinationSize <= 4 ? (unsigned ? RVInstrKind.FcvtWuD : RVInstrKind.FcvtWD) : (unsigned ? RVInstrKind.FcvtLuD : RVInstrKind.FcvtLD);
             else
-                throw HelperRequired(instruction, SelectConversionHelper(sourceType, destinationType), "long double conversion requires a runtime helper.");
+                throw HelperRequired(instruction, SelectConversionHelper(sourceType, destinationType), "Unsupported floating-point conversion.");
 
             if (destinationSize > _owner._target.RegisterSize)
                 throw HelperRequired(instruction, SelectConversionHelper(sourceType, destinationType),
@@ -5636,8 +5654,6 @@ public sealed class RiscVCodeGenerator
             MachineRegister cond;
             if (IsFloatType(instruction.Operands[0].Type))
             {
-                if (IsLongDouble(instruction.Operands[0].Type))
-                    throw HelperRequired(instruction, SelectFloatingHelper("!", instruction.Operands[0].Type), "long double branch condition requires a runtime helper.");
                 RequireFloatingHardware(instruction.Operands[0].Type, instruction);
                 var fcond = LoadOperand(instruction.Operands[0], FpScratch0);
                 LoadFloatingImmediate(FpScratch1, 0.0, instruction.Operands[0].Type);
@@ -5672,8 +5688,6 @@ public sealed class RiscVCodeGenerator
 
             if (IsFloatType(left.Type) || IsFloatType(right.Type))
             {
-                if (IsLongDouble(left.Type) || IsLongDouble(right.Type))
-                    throw HelperRequired(instruction, SelectFloatingHelper(instruction.Operator, IsLongDouble(left.Type) ? left.Type : right.Type), "long double comparison branch requires a runtime helper.");
                 var floatType = SelectFloatingOperationType(left.Type, right.Type, IsFloatType(left.Type) ? left.Type : right.Type);
                 RequireFloatingHardware(floatType, instruction);
                 var leftRegister = LoadOperandAsFloating(left, floatType, FpScratch1, instruction);
@@ -6587,7 +6601,7 @@ public sealed class RiscVCodeGenerator
                     return AdjustConstantBytes(BitConverter.GetBytes(Convert.ToSingle(operand.Immediate, CultureInfo.InvariantCulture)), size);
                 if (IsFloat64(operand.Type))
                     return AdjustConstantBytes(BitConverter.GetBytes(Convert.ToDouble(operand.Immediate, CultureInfo.InvariantCulture)), size);
-                throw HelperRequired(instruction, SelectScalarMoveHelper(operand.Type), "long double immediate materialization requires a runtime helper.");
+                throw HelperRequired(instruction, SelectScalarMoveHelper(operand.Type), "Unsupported floating-point immediate type.");
             }
 
             return AdjustConstantBytes(BitConverter.GetBytes(ConvertIntegerConstant(operand.Immediate)), size);
@@ -6806,9 +6820,11 @@ public sealed class RiscVCodeGenerator
             if (size <= 0 || destination == source)
                 return;
 
-            const int inlineThreshold = 16;
+            // Eight accesses inline cost about what the loop costs to set up and run
+            const int inlineThreshold = 64;
+            const int inlineAccesses = 8;
             var accessSize = BlockAccessSize(alignment);
-            if (size <= inlineThreshold && (accessSize > 1 || size <= 4))
+            if (size <= inlineThreshold && size / accessSize <= inlineAccesses && (accessSize > 1 || size <= 4))
             {
                 EmitInlineMemoryCopy(destination, source, size, accessSize);
                 return;
@@ -6820,15 +6836,19 @@ public sealed class RiscVCodeGenerator
                 var bulkSize = size - size % accessSize;
                 if (bulkSize != 0)
                 {
-                    LoadImmediate(GpScratch6, bulkSize);
+                    var unroll = bulkSize / accessSize % 2 == 0 ? 2 : 1;
+                    AddImmediate(GpScratch6, GpScratch5, bulkSize);
                     var loop = _owner.CreateLocalLabel(_functionLabel + "_memcpy_known_loop");
                     _owner._text.DefineLabel(loop);
                     LoadFromMemory(GpScratch2, GpScratch5, 0, accessSize, signed: false);
+                    if (unroll == 2)
+                        LoadFromMemory(GpScratch3, GpScratch5, accessSize, accessSize, signed: false);
                     StoreToMemory(GpScratch2, GpScratch4, 0, accessSize);
-                    AddImmediate(GpScratch5, GpScratch5, accessSize);
-                    AddImmediate(GpScratch4, GpScratch4, accessSize);
-                    AddImmediate(GpScratch6, GpScratch6, -accessSize);
-                    EmitBranch(RVInstrKind.Bne, GpScratch6, MachineRegister.X0, loop);
+                    if (unroll == 2)
+                        StoreToMemory(GpScratch3, GpScratch4, accessSize, accessSize);
+                    AddImmediate(GpScratch5, GpScratch5, accessSize * unroll);
+                    AddImmediate(GpScratch4, GpScratch4, accessSize * unroll);
+                    EmitBranch(RVInstrKind.Bne, GpScratch5, GpScratch6, loop);
                 }
 
                 var tailSize = size - bulkSize;
@@ -7207,7 +7227,7 @@ public sealed class RiscVCodeGenerator
         private void LoadFloatingImmediate(MachineRegister destination, object? value, QualifiedType type)
         {
             RequireFloatingHardware(type, null);
-            var size = IsFloat32(type) ? 4 : IsFloat64(type) ? 8 : throw new NotSupportedException("long double immediate requires a runtime helper.");
+            var size = IsFloat32(type) ? 4 : IsFloat64(type) ? 8 : throw new NotSupportedException("Unsupported floating-point immediate type.");
             var number = Convert.ToDouble(value, CultureInfo.InvariantCulture);
             if (BitConverter.DoubleToInt64Bits(number) == 0 && (size == 4 || _owner._target.Is64Bit))
             {
@@ -7272,6 +7292,12 @@ public sealed class RiscVCodeGenerator
             var floating = IsFloatType(result.Type) ? result.Type : operand.Type;
             if (!UsesHardwareFloating(floating))
             {
+                if (RequiresStackBackedScalar(result.Type))
+                {
+                    EmitStackBackedScalarCopy(result, operand, instruction);
+                    return true;
+                }
+
                 var bits = GetWritableRegister(result, GpScratch0);
                 MoveRegister(bits, LoadOperand(operand, GpScratch1));
                 StoreWritableRegisterIfSpilled(result, bits);
@@ -7302,7 +7328,8 @@ public sealed class RiscVCodeGenerator
             var result = instruction.Result.Type;
             var operand = instruction.Operands[0].Type;
             var size = SizeOf(result);
-            return IsFloatType(result) != IsFloatType(operand) && size == SizeOf(operand) && size is 4 or 8 && size <= _owner._target.RegisterSize;
+            return IsFloatType(result) != IsFloatType(operand) && size == SizeOf(operand) && size is 4 or 8 &&
+                (size <= _owner._target.RegisterSize || RequiresStackBackedScalar(result) && RequiresStackBackedScalar(operand));
         }
 
         private void EmitFloatingMoveToInteger(RVInstrKind opcode, MachineRegister destination, MachineRegister source)
@@ -8161,8 +8188,6 @@ public sealed class RiscVCodeGenerator
 
         private RiscVRuntimeHelperKind SelectConversionHelper(QualifiedType source, QualifiedType destination)
         {
-            if (IsLongDouble(source) || IsLongDouble(destination))
-                return RiscVRuntimeHelperKind.LongDoubleConvert;
             if (_owner._target.Is32Bit && ((IsIntegerLike(source) && SizeOf(source) == 8) || (IsIntegerLike(destination) && SizeOf(destination) == 8)))
                 return RiscVRuntimeHelperKind.Int64Convert;
             if (IsFloatType(source) || IsFloatType(destination))
@@ -8172,8 +8197,6 @@ public sealed class RiscVCodeGenerator
 
         private RiscVRuntimeHelperKind SelectFloatingHelper(string op, QualifiedType type)
         {
-            if (IsLongDouble(type))
-                return RiscVRuntimeHelperKind.LongDoubleArithmetic;
             if (IsFloat32(type))
                 return op switch
                 {
@@ -8196,7 +8219,7 @@ public sealed class RiscVCodeGenerator
         }
 
         private static bool SameBuiltinFloatingType(QualifiedType left, QualifiedType right)
-            => (IsFloat32(left) && IsFloat32(right)) || (IsFloat64(left) && IsFloat64(right)) || (IsLongDouble(left) && IsLongDouble(right));
+            => (IsFloat32(left) && IsFloat32(right)) || (IsFloat64(left) && IsFloat64(right));
 
         private static bool FitsSignedImmediate(long value, int bits)
         {
@@ -8306,8 +8329,6 @@ public sealed class RiscVCodeGenerator
             Float64Sub,
             Float64Mul,
             Float64Div,
-            LongDoubleArithmetic,
-            LongDoubleConvert,
         }
 
         private readonly struct AddressParts

@@ -380,6 +380,16 @@ namespace Cnidaria.Cs
 
             _liveInstantiatedTypeVersion++;
             _virtualTargetCache.Clear();
+            // ValueType.Equals and GetHashCode box the fields of a struct
+            if (type.IsValueType)
+            {
+                _rts.EnsureConstructedMembers(type);
+                foreach (RuntimeField field in type.InstanceFields)
+                {
+                    if (field.FieldType.IsValueType)
+                        MarkLiveInstantiatedType(field.FieldType);
+                }
+            }
             return true;
         }
 
@@ -5842,7 +5852,9 @@ namespace Cnidaria.Cs
                 return;
             }
 
-            MarkInstantiatedType(type);
+            // Passing a value type does not box it, only a box site makes it a runtime instance
+            if (!type.IsValueType)
+                MarkInstantiatedType(type);
 
             if (type.ElementType is not null)
                 MarkInstantiatedTypeClosure(type.ElementType);
@@ -5859,6 +5871,8 @@ namespace Cnidaria.Cs
 
             if (type.Kind is RuntimeTypeKind.Class or RuntimeTypeKind.Struct or RuntimeTypeKind.Enum or RuntimeTypeKind.Array)
                 _instantiatedTypes.TryAdd(type.TypeId, type);
+            if (IsSystemNullableRuntimeType(type))
+                MarkInstantiatedType(type.GenericTypeArguments[0]);
         }
 
         private GenTree ConstI4(int pc, ILOpCode sourceOp, int value)

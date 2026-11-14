@@ -1733,7 +1733,7 @@ namespace Cnidaria.Cs
                 int methodRid = MetadataToken.Rid(row.ParentToken);
                 if (isExtension)
                     _extensionMethodRids.Add(methodRid);
-                if (typeByRid[_md.GetMethodOwnerTypeDefRid(methodRid)] is SourceNamedTypeSymbol container)
+                if (typeByRid[_md.GetMethodOwnerTypeDefRid(methodRid)] is NamedTypeSymbol container)
                     container.MarkMayContainExtensionMembers(inBlock: !isExtension);
             }
         }

@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Globalization;
 using System.Linq;
-using System.Text;
 
 namespace Cnidaria.C;
 
@@ -620,7 +619,7 @@ internal sealed class Gimplifier
         if (!arrayType.Length.HasValue)
             return;
 
-        var bytes = Encoding.UTF8.GetBytes(text);
+        var bytes = NarrowStringEncoding.GetBytes(text);
         var count = Math.Min(arrayType.Length.Value, (long)bytes.Length + 1L);
         for (long index = 0; index < count; index++)
         {
@@ -1816,6 +1815,12 @@ internal sealed class Gimplifier
     /// <summary>Converts conditional evaluation into branches assigning one result temporary</summary>
     private GimpleValue LowerConditionalExpressionToValue(BoundExpression expression)
     {
+        if (expression is BoundBinaryExpression binary && IsLogicalOperator(binary.OperatorToken.Kind) &&
+            TryLowerLogicalWithoutBranches(binary, out GimpleValue branchless))
+        {
+            return branchless;
+        }
+
         var result = CreateTemporary(expression.Type, expression.Syntax);
         var trueLabel = CreateGeneratedLabel("cond_true");
         var falseLabel = CreateGeneratedLabel("cond_false");
@@ -1872,6 +1877,260 @@ internal sealed class Gimplifier
         StartBlock(endLabel);
         return result;
     }
+
+    // A branch on a data-dependent truth value mispredicts far more often than both operands cost to evaluate
+    private bool TryLowerLogicalWithoutBranches(BoundBinaryExpression logical, out GimpleValue value)
+    {
+        if (TryMatchRangeTest(logical, out RangeTest test))
+        {
+            (GimpleValue difference, GimpleTreeCode code, GimpleValue limit) = EmitRangeTestOperands(test, logical.Syntax);
+            value = EmitBinary(code, difference, limit, logical.Type, logical.Syntax);
+            return true;
+        }
+
+        value = null!;
+        if (!IsSpeculatableTruth(logical.Right))
+            return false;
+
+        GimpleValue left = LowerTruthValue(logical.Left, logical.Type);
+        GimpleValue right = LowerTruthValue(logical.Right, logical.Type);
+        GimpleTreeCode combine = logical.OperatorToken.Kind == SyntaxKind.AmpersandAmpersandToken ? GimpleTreeCode.BitAndExpr : GimpleTreeCode.BitIorExpr;
+        value = EmitBinary(combine, left, right, logical.Type, logical.Syntax);
+        return true;
+    }
+
+    private GimpleValue LowerTruthValue(BoundExpression operand, QualifiedType type)
+    {
+        BoundExpression expression = StripParentheses(operand);
+        if (expression is BoundBinaryExpression logical && IsLogicalOperator(logical.OperatorToken.Kind))
+            return LowerConditionalExpressionToValue(logical);
+        if (expression is BoundBinaryExpression comparison && IsComparisonOperator(comparison.OperatorToken.Kind) ||
+            expression is BoundUnaryExpression { OperatorToken.Kind: SyntaxKind.BangToken })
+            return LowerExpression(expression);
+
+        GimpleValue value = GimplifyValue(LowerExpression(expression));
+        return EmitBinary(GimpleTreeCode.NeExpr, value, CreateIntegerZero(value.Type, expression.Syntax), type, expression.Syntax);
+    }
+
+    // What the left operand already decided must not be able to fault or change state when evaluated anyway
+    private bool IsSpeculatableTruth(BoundExpression operand)
+    {
+        BoundExpression expression = StripParentheses(operand);
+        return expression switch
+        {
+            BoundBinaryExpression logical when IsLogicalOperator(logical.OperatorToken.Kind)
+                => IsSpeculatableTruth(logical.Left) && IsSpeculatableTruth(logical.Right),
+            BoundBinaryExpression comparison when IsComparisonOperator(comparison.OperatorToken.Kind)
+                => IsSpeculatableOperand(comparison.Left) && IsSpeculatableOperand(comparison.Right),
+            BoundUnaryExpression { OperatorToken.Kind: SyntaxKind.BangToken } negation => IsSpeculatableTruth(negation.Operand),
+            _ => IsSpeculatableOperand(expression),
+        };
+    }
+
+    // Names and constants only, as gcc's simple operands: anything else may fault, trap or outweigh the branch
+    private bool IsSpeculatableOperand(BoundExpression operand)
+    {
+        BoundExpression expression = StripParentheses(operand);
+        if (GimpleTypes.IsVolatileOrAtomic(expression.Type) ||
+            !GimpleTypes.IsIntegerLike(expression.Type) && expression.Type.Type.Kind is not (TypeKind.Pointer or TypeKind.Array))
+        {
+            return false;
+        }
+
+        if (IntegerConstantEvaluator.TryEvaluate(expression, _target, out _))
+            return true;
+
+        return expression switch
+        {
+            BoundNameExpression name => name.Symbol is VariableSymbol or ParameterSymbol,
+            BoundConversionExpression conversion => conversion.ConversionKind != BoundConversionKind.Error && IsSpeculatableOperand(conversion.Expression),
+            BoundCastExpression cast => IsSpeculatableOperand(cast.Expression),
+            _ => false,
+        };
+    }
+
+    private readonly record struct RangeTest(BoundExpression Subject, QualifiedType UnsignedType, long Low, ulong Width, bool Inside);
+
+    private bool TryEmitRangeTestBranch(BoundBinaryExpression logical, GimpleLabel whenTrue, GimpleLabel whenFalse)
+    {
+        if (!TryMatchRangeTest(logical, out RangeTest test))
+            return false;
+
+        (GimpleValue difference, GimpleTreeCode code, GimpleValue limit) = EmitRangeTestOperands(test, logical.Syntax);
+        Emit(new GimpleCondStatement(code, GimplifyValue(difference), limit, whenTrue, whenFalse, logical.Syntax));
+        return true;
+    }
+
+    // lo <= x <= hi is (unsigned)(x - lo) <= hi - lo, x < lo || x > hi its negation, and two adjacent equalities a range of two
+    private bool TryMatchRangeTest(BoundBinaryExpression logical, out RangeTest test)
+    {
+        test = default;
+        if (!TryReadBound(logical.Left, out BoundExpression subject, out SyntaxKind firstKind, out long firstValue) ||
+            !TryReadBound(logical.Right, out BoundExpression other, out SyntaxKind secondKind, out long secondValue) ||
+            !IsSameSideEffectFreeValue(subject, other))
+        {
+            return false;
+        }
+
+        QualifiedType type = subject.Type;
+        int size = _target.SizeOf(type);
+        if (!GimpleTypes.IsIntegerLike(type) || size is not (4 or 8) || !TryGetUnsignedType(type, size, out QualifiedType unsignedType))
+            return false;
+
+        bool signed = GimpleTypes.IsSigned(type, _target);
+        int bits = size * 8;
+        Int128 minimum = signed ? -((Int128)1 << (bits - 1)) : Int128.Zero;
+        Int128 maximum = signed ? ((Int128)1 << (bits - 1)) - 1 : ((Int128)1 << bits) - 1;
+        Int128 first = signed || bits < 64 ? (Int128)firstValue : (Int128)(ulong)firstValue;
+        Int128 second = signed || bits < 64 ? (Int128)secondValue : (Int128)(ulong)secondValue;
+        bool conjunction = logical.OperatorToken.Kind == SyntaxKind.AmpersandAmpersandToken;
+
+        Int128 low;
+        Int128 high;
+        bool inside;
+        if (firstKind is SyntaxKind.EqualsEqualsToken or SyntaxKind.BangEqualsToken)
+        {
+            bool equality = firstKind == SyntaxKind.EqualsEqualsToken;
+            if (secondKind != firstKind || equality == conjunction || Int128.Abs(first - second) != 1)
+                return false;
+            low = Int128.Min(first, second);
+            high = low + 1;
+            inside = equality;
+        }
+        else
+        {
+            if (secondKind is SyntaxKind.EqualsEqualsToken or SyntaxKind.BangEqualsToken)
+                return false;
+            (bool firstIsLow, Int128 firstBound) = RangeBound(firstKind, first, conjunction);
+            (bool secondIsLow, Int128 secondBound) = RangeBound(secondKind, second, conjunction);
+            if (firstIsLow == secondIsLow)
+                return false;
+            low = firstIsLow ? firstBound : secondBound;
+            high = firstIsLow ? secondBound : firstBound;
+            inside = conjunction;
+        }
+
+        Int128 width = high - low;
+        if (low > high || low == minimum && high == maximum || width > long.MaxValue || low > long.MaxValue || low < -long.MaxValue)
+            return false;
+
+        test = new RangeTest(subject, unsignedType, (long)low, (ulong)width, inside);
+        return true;
+    }
+
+    // Under && each comparison keeps the value inside one bound, under || each sends it past one
+    private static (bool IsLow, Int128 Bound) RangeBound(SyntaxKind kind, Int128 value, bool conjunction)
+        => kind switch
+        {
+            SyntaxKind.GreaterThanToken => (conjunction, conjunction ? value + 1 : value),
+            SyntaxKind.GreaterThanEqualsToken => (conjunction, conjunction ? value : value - 1),
+            SyntaxKind.LessThanToken => (!conjunction, conjunction ? value - 1 : value),
+            _ => (!conjunction, conjunction ? value : value + 1),
+        };
+
+    private bool TryReadBound(BoundExpression operand, out BoundExpression subject, out SyntaxKind kind, out long value)
+    {
+        subject = null!;
+        kind = default;
+        value = 0;
+        if (StripParentheses(operand) is not BoundBinaryExpression comparison || !IsComparisonOperator(comparison.OperatorToken.Kind))
+            return false;
+
+        kind = comparison.OperatorToken.Kind;
+        if (IntegerConstantEvaluator.TryEvaluate(comparison.Right, _target, out value))
+        {
+            subject = comparison.Left;
+        }
+        else if (IntegerConstantEvaluator.TryEvaluate(comparison.Left, _target, out value))
+        {
+            subject = comparison.Right;
+            kind = kind switch
+            {
+                SyntaxKind.LessThanToken => SyntaxKind.GreaterThanToken,
+                SyntaxKind.LessThanEqualsToken => SyntaxKind.GreaterThanEqualsToken,
+                SyntaxKind.GreaterThanToken => SyntaxKind.LessThanToken,
+                SyntaxKind.GreaterThanEqualsToken => SyntaxKind.LessThanEqualsToken,
+                _ => kind,
+            };
+        }
+        else
+        {
+            return false;
+        }
+
+        return !IntegerConstantEvaluator.TryEvaluate(subject, _target, out _);
+    }
+
+    private bool TryGetUnsignedType(QualifiedType type, int size, out QualifiedType unsignedType)
+    {
+        BuiltinTypeKind? kind = type.Type switch
+        {
+            BuiltinType { BuiltinKind: BuiltinTypeKind.Int or BuiltinTypeKind.UnsignedInt } => BuiltinTypeKind.UnsignedInt,
+            BuiltinType { BuiltinKind: BuiltinTypeKind.Long or BuiltinTypeKind.UnsignedLong } => BuiltinTypeKind.UnsignedLong,
+            BuiltinType { BuiltinKind: BuiltinTypeKind.LongLong or BuiltinTypeKind.UnsignedLongLong } => BuiltinTypeKind.UnsignedLongLong,
+            _ when type.Type.Kind == TypeKind.Enum => size == 4 ? BuiltinTypeKind.UnsignedInt : BuiltinTypeKind.UnsignedLongLong,
+            _ => null,
+        };
+        unsignedType = kind is { } builtin ? _types.Builtin(builtin) : default;
+        return kind is not null && _target.SizeOf(unsignedType) == size;
+    }
+
+    private (GimpleValue Difference, GimpleTreeCode Code, GimpleValue Limit) EmitRangeTestOperands(RangeTest test, SyntaxNode? syntax)
+    {
+        QualifiedType type = test.UnsignedType;
+        GimpleValue value = GimplifyValue(LowerExpression(test.Subject));
+        if (!SameRepresentation(value.Type, type))
+            value = EmitConvert(value, type, syntax);
+        if (test.Low > 0)
+            value = EmitBinary(GimpleTreeCode.MinusExpr, value, CreateUnsignedConstant((ulong)test.Low, type, syntax), type, syntax);
+        else if (test.Low < 0)
+            value = EmitBinary(GimpleTreeCode.PlusExpr, value, CreateUnsignedConstant((ulong)-test.Low, type, syntax), type, syntax);
+
+        return (value, test.Inside ? GimpleTreeCode.LeExpr : GimpleTreeCode.GtExpr, CreateUnsignedConstant(test.Width, type, syntax));
+    }
+
+    private GimpleConstantValue CreateUnsignedConstant(ulong value, QualifiedType type, SyntaxNode? syntax)
+        => new(_target.SizeOf(type) == 4 ? (object)(uint)value : value, type, syntax);
+
+    private static bool IsSameSideEffectFreeValue(BoundExpression first, BoundExpression second)
+    {
+        first = StripParentheses(first);
+        second = StripParentheses(second);
+        if (GimpleTypes.IsVolatileOrAtomic(first.Type) || GimpleTypes.IsVolatileOrAtomic(second.Type) || !SameRepresentation(first.Type, second.Type))
+            return false;
+
+        return (first, second) switch
+        {
+            (BoundNameExpression a, BoundNameExpression b) => a.Symbol is VariableSymbol or ParameterSymbol or EnumConstantSymbol && ReferenceEquals(a.Symbol, b.Symbol),
+            (BoundLiteralExpression a, BoundLiteralExpression b) => a.ConstantValue is not null && Equals(a.ConstantValue, b.ConstantValue),
+            (BoundConversionExpression a, BoundConversionExpression b) => a.ConversionKind == b.ConversionKind && a.ConversionKind != BoundConversionKind.Error &&
+                IsSameSideEffectFreeValue(a.Expression, b.Expression),
+            (BoundCastExpression a, BoundCastExpression b) => IsSameSideEffectFreeValue(a.Expression, b.Expression),
+            (BoundElementAccessExpression a, BoundElementAccessExpression b) => a.Index is not null && b.Index is not null &&
+                IsSameSideEffectFreeValue(a.Expression, b.Expression) && IsSameSideEffectFreeValue(a.Index, b.Index),
+            (BoundMemberAccessExpression a, BoundMemberAccessExpression b) => a.Field is not null && ReferenceEquals(a.Field, b.Field) &&
+                a.OperatorToken.Kind == b.OperatorToken.Kind && IsSameSideEffectFreeValue(a.Expression, b.Expression),
+            (BoundUnaryExpression a, BoundUnaryExpression b) => a.OperatorToken.Kind == b.OperatorToken.Kind &&
+                a.OperatorToken.Kind is SyntaxKind.StarToken or SyntaxKind.MinusToken or SyntaxKind.TildeToken or SyntaxKind.PlusToken or SyntaxKind.BangToken &&
+                IsSameSideEffectFreeValue(a.Operand, b.Operand),
+            (BoundBinaryExpression a, BoundBinaryExpression b) => a.OperatorToken.Kind == b.OperatorToken.Kind &&
+                a.OperatorToken.Kind is SyntaxKind.PlusToken or SyntaxKind.MinusToken or SyntaxKind.StarToken or SyntaxKind.AmpersandToken or
+                    SyntaxKind.PipeToken or SyntaxKind.HatToken or SyntaxKind.LessThanLessThanToken or SyntaxKind.GreaterThanGreaterThanToken &&
+                IsSameSideEffectFreeValue(a.Left, b.Left) && IsSameSideEffectFreeValue(a.Right, b.Right),
+            _ => false,
+        };
+    }
+
+    private static BoundExpression StripParentheses(BoundExpression expression)
+    {
+        while (expression is BoundParenthesizedExpression parenthesized)
+            expression = parenthesized.Expression;
+        return expression;
+    }
+
+    private static bool IsComparisonOperator(SyntaxKind kind)
+        => kind is SyntaxKind.EqualsEqualsToken or SyntaxKind.BangEqualsToken or SyntaxKind.LessThanToken or
+            SyntaxKind.LessThanEqualsToken or SyntaxKind.GreaterThanToken or SyntaxKind.GreaterThanEqualsToken;
 
     private GimpleValue LowerCompoundLiteralExpression(BoundCompoundLiteralExpression expression)
     {
@@ -2046,8 +2305,14 @@ internal sealed class Gimplifier
                 EmitConditional(conversion.Expression, whenTrue, whenFalse);
                 return;
 
+            case BoundUnaryExpression negation when negation.OperatorToken.Kind == SyntaxKind.BangToken:
+                EmitConditional(negation.Operand, whenFalse, whenTrue);
+                return;
+
             case BoundBinaryExpression binary when binary.OperatorToken.Kind == SyntaxKind.AmpersandAmpersandToken:
                 {
+                    if (TryEmitRangeTestBranch(binary, whenTrue, whenFalse))
+                        return;
                     var rightLabel = CreateGeneratedLabel("logical_rhs");
                     EmitConditional(binary.Left, rightLabel, whenFalse);
                     StartBlock(rightLabel);
@@ -2057,6 +2322,8 @@ internal sealed class Gimplifier
 
             case BoundBinaryExpression binary when binary.OperatorToken.Kind == SyntaxKind.PipePipeToken:
                 {
+                    if (TryEmitRangeTestBranch(binary, whenTrue, whenFalse))
+                        return;
                     var rightLabel = CreateGeneratedLabel("logical_rhs");
                     EmitConditional(binary.Left, whenTrue, rightLabel);
                     StartBlock(rightLabel);
@@ -2084,12 +2351,6 @@ internal sealed class Gimplifier
     /// <remarks>A condition that is not already a comparison is tested against zero</remarks>
     private void EmitBranch(BoundExpression condition, GimpleLabel whenTrue, GimpleLabel whenFalse)
     {
-        if (condition is BoundUnaryExpression { OperatorToken.Kind: SyntaxKind.BangToken } negation)
-        {
-            EmitBranch(negation.Operand, whenFalse, whenTrue);
-            return;
-        }
-
         if (condition is BoundBinaryExpression binary)
         {
             var comparison = GimpleOperators.FromBinaryOperator(
