@@ -72,16 +72,24 @@ internal sealed class AssertionTable
 
     public bool? Evaluate(AssertionScope? scope, GimpleValue left, GimpleTreeCode code, GimpleValue right)
     {
-        var steps = 0;
-        for (var current = scope; current is not null && steps++ < MaxScopeWalk; current = current.Parent)
-        {
-            if (Implied(current.Assertion, left, code, right) is { } truth)
-                return truth;
-        }
+        if (Implication(scope, left, code, right) is bool truth)
+            return truth;
 
         return RangeAt(left, scope, MaxRefineDepth) is { } leftRange && RangeAt(right, scope, MaxRefineDepth) is { } rightRange
             ? Compare(leftRange, code, rightRange)
             : null;
+    }
+
+    public static bool? Implication(AssertionScope? scope, GimpleValue left, GimpleTreeCode code, GimpleValue right)
+    {
+        var steps = 0;
+        for (var current = scope; current is not null && steps++ < MaxScopeWalk; current = current.Parent)
+        {
+            if (Implied(current.Assertion, left, code, right) is bool truth)
+                return truth;
+        }
+
+        return null;
     }
 
     public static bool IsTracked(QualifiedType type)

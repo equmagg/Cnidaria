@@ -678,19 +678,29 @@ internal static class InductionVariables
                 widened.Add(stride, counter);
             }
 
+            // The members start a constant number of elements apart, which their addresses carry off one base
+            QualifiedType elementType = first.Original.Type;
+            var pointerType = new QualifiedType(TypeCatalog.Instance.PointerTo(elementType));
+            long origin = first.StartOffset;
+            GimpleValue baseValue = GimpleNameMaterializer.MaterializeValue(first.Node.Children[0]);
+            if (first.StartRest is not null || origin != 0)
+            {
+                GimpleValue start = first.StartRest is null
+                    ? Constant(origin)
+                    : Materialize(Scev.Add(first.StartRest, Scev.Constant(origin, _pointerBits), false)!, shape.Preheader, preheader);
+                baseValue = EmitAddressOf(shape.Preheader, preheader, pointerType,
+                    new GimpleElementAccessExpression(baseValue, start, elementType, first.Original.Syntax));
+            }
+
             foreach (var member in group.Members)
             {
-                GimpleValue baseValue = GimpleNameMaterializer.MaterializeValue(member.Node.Children[0]);
-                if (member.StartRest is not null || member.StartOffset != 0)
-                {
-                    var start = member.StartRest is null
-                        ? Constant(member.StartOffset)
-                        : Materialize(Scev.Add(member.StartRest, Scev.Constant(member.StartOffset, _pointerBits), false)!, shape.Preheader, preheader);
-                    baseValue = EmitAddressOf(shape.Preheader, preheader, new QualifiedType(TypeCatalog.Instance.PointerTo(member.Original.Type)),
-                        new GimpleElementAccessExpression(baseValue, start, member.Original.Type, member.Original.Syntax));
-                }
-                replacements[member.Node] = SsaRewriting.Build(new GimpleElementAccessExpression(baseValue, counter, member.Original.Type, member.Original.Syntax),
-                    member.Node.Role, member.Node.ReadsMemory);
+                var element = new GimpleElementAccessExpression(baseValue, counter, elementType, member.Original.Syntax);
+                long displacement = member.StartOffset - origin;
+                GimpleValue access = displacement == 0
+                    ? element
+                    : new GimpleElementAccessExpression(new GimpleAddressOfExpression(element, pointerType, member.Original.Syntax),
+                        Constant(displacement), elementType, member.Original.Syntax);
+                replacements[member.Node] = SsaRewriting.Build(access, member.Node.Role, member.Node.ReadsMemory);
             }
         }
 
@@ -705,14 +715,19 @@ internal static class InductionVariables
                 return null;
             var variable = (GimpleName)(ivOnLeft ? test.Lhs : test.Rhs);
             var bound = ivOnLeft ? test.Rhs : test.Lhs;
-            if (evolution.IntegerBits(variable.Type) != 32 || evolution.IntegerBits(bound.Type) != 32 ||
+            var signed = GimpleTypes.IsSigned(variable.Type, _target);
+            var bits = evolution.IntegerBits(variable.Type);
+            // A full-width counter has no wider type to absorb a wrap, so it must not wrap at all
+            if (bits == 0 || evolution.IntegerBits(bound.Type) != bits || bits == 64 && !_pointerWalk ||
                 evolution.Analyze(variable) is not { Kind: ScevKind.AddRecurrence } recurrence ||
+                bits == 64 && !(signed ? recurrence.NoSignedWrap : recurrence.NoUnsignedWrap) ||
                 !recurrence.Step.TryGetConstant(out var stride) ||
-                Scev.Extend(recurrence, 64, GimpleTypes.IsSigned(variable.Type, _target)) is not { Kind: ScevKind.AddRecurrence } wide ||
+                Scev.Extend(recurrence, 64, signed) is not { Kind: ScevKind.AddRecurrence } wide ||
+                evolution.Analyze(bound) is not Scev boundValue ||
+                Scev.Extend(boundValue, 64, signed) is not Scev wideBound ||
                 !IsDeadAfterRewrite(variable, shape.ExitTest, rewritten, new HashSet<GimpleName>()))
                 return null;
 
-            var signed = GimpleTypes.IsSigned(variable.Type, _target);
             var code = ivOnLeft ? test.Code : Swap(test.Code);
             var continueCode = shape.ExitWhenTrue ? ScalarEvolution.Invert(code) : code;
 
@@ -720,8 +735,7 @@ internal static class InductionVariables
             {
                 if (!widened.TryGetValue(stride, out var counter))
                     return null;
-                var start = Materialize(wide.Start, shape.Preheader, preheader);
-                var limit = Emit(shape.Preheader, preheader, GimpleTreeCode.MinusExpr, _indexType, Extend(bound, signed, shape.Preheader, preheader), start);
+                var limit = Difference(wideBound, wide.Start, shape.Preheader, preheader);
                 var widenedTest = ivOnLeft ? test.WithOperands(test.Code, counter, limit) : test.WithOperands(test.Code, limit, counter);
                 return NewCondition(shape.ExitTest, widenedTest);
             }
@@ -743,22 +757,26 @@ internal static class InductionVariables
 
             // != stops only on the exact trip count, which a reversed range would step past
             GimpleValue distance;
-            if (wide.Start.TryGetConstant(out var first) && bound is GimpleConstantValue { Value: var last } && ScalarEvolution.TryGetInteger(last, out var limitValue))
+            if (wide.Start.TryGetConstant(out var first) && wideBound.TryGetConstant(out var last))
             {
-                var limit = signed ? (long)(int)limitValue : (long)(uint)limitValue;
-                var trips = Math.Max(0, (stride == 1 ? limit - first : first - limit) + extra);
-                distance = Constant(stride == 1 ? trips : -trips);
+                Int128 from = signed ? (Int128)first : (ulong)first;
+                Int128 to = signed ? (Int128)last : (ulong)last;
+                var trips = Int128.Max(0, (stride == 1 ? to - from : from - to) + extra);
+                if (trips > long.MaxValue)
+                    return null;
+                distance = Constant(stride == 1 ? (long)trips : -(long)trips);
             }
             else
             {
                 var forward = continueCode == GimpleTreeCode.NeExpr ||
-                    stride == 1 && wide.Start.TryGetConstant(out first) && first <= 0 && !GimpleTypes.IsSigned(bound.Type, _target) ||
+                    stride == 1 && wide.Start.TryGetConstant(out first) && first == 0 && !GimpleTypes.IsSigned(bound.Type, _target) ||
                     IsKnownForward(shape, recurrence.Start, variable.Type, bound, stride);
-                var from = Materialize(wide.Start, shape.Preheader, preheader);
-                var to = Extend(bound, signed, shape.Preheader, preheader);
+                // A full-width difference can overflow, and its sign then no longer tells an empty range
+                if (!forward && bits == 64 && !((stride == 1 ? wide.Start : wideBound).TryGetConstant(out var subtracted) && subtracted == 0))
+                    return null;
                 distance = stride == 1
-                    ? Emit(shape.Preheader, preheader, GimpleTreeCode.MinusExpr, _indexType, to, from)
-                    : Emit(shape.Preheader, preheader, GimpleTreeCode.MinusExpr, _indexType, from, to);
+                    ? Difference(wideBound, wide.Start, shape.Preheader, preheader)
+                    : Difference(wide.Start, wideBound, shape.Preheader, preheader);
                 if (extra != 0)
                     distance = Emit(shape.Preheader, preheader, GimpleTreeCode.PlusExpr, _indexType, distance, Constant(1));
                 if (!forward)
@@ -782,7 +800,9 @@ internal static class InductionVariables
             GimpleValue? first = start.Kind switch
             {
                 ScevKind.Invariant => start.Name,
-                ScevKind.Constant => new GimpleConstantValue(GimpleTypes.IsSigned(type, _target) ? (object)(int)start.Value : (uint)start.Value, type),
+                ScevKind.Constant => new GimpleConstantValue(start.Bits == 64
+                    ? GimpleTypes.IsSigned(type, _target) ? (object)start.Value : (ulong)start.Value
+                    : GimpleTypes.IsSigned(type, _target) ? (object)(int)start.Value : (uint)start.Value, type),
                 _ => null,
             };
             if (_assertions is null || first is null)
@@ -796,7 +816,7 @@ internal static class InductionVariables
             => value is GimpleName name && evolution.Analyze(name) is { Kind: ScevKind.AddRecurrence };
 
         private static bool IsInvariantOperand(GimpleValue value, ScalarEvolution evolution)
-            => value is GimpleConstantValue || value is GimpleName name && evolution.IsLoopInvariant(name);
+            => value is GimpleConstantValue || value is GimpleName name && (evolution.IsLoopInvariant(name) || evolution.Analyze(name) is { IsInvariant: true });
 
         private static GimpleTreeCode Swap(GimpleTreeCode code) => code switch
         {
@@ -841,12 +861,10 @@ internal static class InductionVariables
             return true;
         }
 
-        private GimpleValue Extend(GimpleValue value, bool signed, ControlFlowBlock block, List<GimpleStatementAnnotations> sink)
-        {
-            if (value is GimpleConstantValue constant && ScalarEvolution.TryGetInteger(constant.Value, out var number))
-                return Constant(signed ? (long)(int)number : (long)(uint)number);
-            return Emit(block, sink, GimpleTreeCode.NopExpr, _indexType, value);
-        }
+        private GimpleValue Difference(Scev minuend, Scev subtrahend, ControlFlowBlock block, List<GimpleStatementAnnotations> sink)
+            => subtrahend.TryGetConstant(out var constant)
+                ? Materialize(Scev.Add(minuend, Scev.Constant(-constant, minuend.Bits), false)!, block, sink)
+                : Emit(block, sink, GimpleTreeCode.MinusExpr, _indexType, Materialize(minuend, block, sink), Materialize(subtrahend, block, sink));
 
         private GimpleValue Materialize(Scev value, ControlFlowBlock block, List<GimpleStatementAnnotations> sink)
         {

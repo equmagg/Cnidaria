@@ -2405,6 +2405,18 @@ public sealed class RegisterBytecodeCodeGenerator
             if (TryEmitDirectParallelCopies(physicalCopies, instruction))
                 return;
 
+            if (_allocation.TrySequenceCyclicParallelCopy(instruction, physicalCopies, out ImmutableArray<(int Copy, MachineRegister From, MachineRegister To)> steps))
+            {
+                foreach ((int copy, MachineRegister from, MachineRegister to) in steps)
+                {
+                    if (from == MachineRegister.Invalid)
+                        LoadOperandInto(physicalCopies[copy].Source, to);
+                    else
+                        MoveRegister(to, from);
+                }
+                return;
+            }
+
             EmitParallelCopyThroughTemporaries(physicalCopies, instruction);
         }
 

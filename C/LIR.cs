@@ -75,6 +75,7 @@ public enum LirInstructionKind : ushort
     Binary,
     Convert,
     Cast,
+    Select,
     AddressOf,
     Load,
     Store,
@@ -545,178 +546,6 @@ public readonly struct LirSwitchCase
     {
         Value = value ?? throw new ArgumentNullException(nameof(value));
         Target = target ?? throw new ArgumentNullException(nameof(target));
-    }
-}
-
-/// <summary>A two-armed branch whose only effect is choosing one of two values for one register</summary>
-public readonly struct LirSelectDiamond
-{
-    public LirInstruction Branch { get; }
-    public LirBlock TrueArm { get; }
-    public LirBlock FalseArm { get; }
-    public LirBlock Join { get; }
-    public LirVirtualRegister Destination { get; }
-    public LirOperand TrueValue { get; }
-    public LirOperand FalseValue { get; }
-
-    internal LirSelectDiamond(
-        LirInstruction branch,
-        LirBlock trueArm,
-        LirBlock falseArm,
-        LirBlock join,
-        LirVirtualRegister destination,
-        LirOperand trueValue,
-        LirOperand falseValue)
-    {
-        Branch = branch;
-        TrueArm = trueArm;
-        FalseArm = falseArm;
-        Join = join;
-        Destination = destination;
-        TrueValue = trueValue;
-        FalseValue = falseValue;
-    }
-}
-
-/// <summary>Finds the conditional expressions a backend can turn into a conditional move</summary>
-public static class LirSelect
-{
-    /// <summary>A superset of the diamonds FindDiamonds reports, read from the branch's two arms alone</summary>
-    public static bool MayBeDiamond(LirInstruction branch)
-    {
-        if (branch.TrueTarget is not { } trueArm || branch.FalseTarget is not { } falseArm || ReferenceEquals(trueArm, falseArm))
-            return false;
-        return TryReadArmCopy(trueArm, out LirParallelCopy trueCopy, out LirBlock trueJoin) &&
-            TryReadArmCopy(falseArm, out LirParallelCopy falseCopy, out LirBlock falseJoin) &&
-            ReferenceEquals(trueJoin, falseJoin) && ReferenceEquals(trueCopy.Destination, falseCopy.Destination);
-    }
-
-    /// <summary>Maps each head block whose branch only picks between two values for one register</summary>
-    public static Dictionary<LirBlock, LirSelectDiamond> FindDiamonds(LirFunction function, TargetInfo target)
-    {
-        var result = new Dictionary<LirBlock, LirSelectDiamond>();
-        if (function is null || target is null || function.Blocks.Length < 4)
-            return result;
-
-        var predecessors = CountPredecessors(function);
-        foreach (var block in function.Blocks)
-        {
-            if (block.Instructions.Length == 0)
-                continue;
-            var branch = block.Instructions[block.Instructions.Length - 1];
-            if (branch.Kind != LirInstructionKind.Branch ||
-                branch.TrueTarget is not { } trueArm ||
-                branch.FalseTarget is not { } falseArm ||
-                ReferenceEquals(trueArm, falseArm))
-            {
-                continue;
-            }
-
-            if (!TryReadArm(trueArm, predecessors, out var trueCopy, out var join) ||
-                !TryReadArm(falseArm, predecessors, out var falseCopy, out var falseJoin) ||
-                !ReferenceEquals(join, falseJoin) ||
-                !ReferenceEquals(trueCopy.Destination, falseCopy.Destination))
-            {
-                continue;
-            }
-
-            var destination = trueCopy.Destination;
-            if (destination.RegisterClass is not (LirRegisterClass.General or LirRegisterClass.Address))
-                continue;
-            if (Math.Max(1, target.SizeOf(destination.Type)) > Math.Max(1, target.RegisterSize))
-                continue;
-            if (!IsSelectableValue(trueCopy.Source, target) || !IsSelectableValue(falseCopy.Source, target))
-                continue;
-
-            result.Add(block, new LirSelectDiamond(
-                branch, trueArm, falseArm, join, destination, trueCopy.Source, falseCopy.Source));
-        }
-
-        return result;
-    }
-
-    // An arm may do nothing but move one value into the shared register and fall into the join
-    private static bool TryReadArm(
-        LirBlock arm,
-        Dictionary<LirBlock, int> predecessors,
-        out LirParallelCopy copy,
-        out LirBlock join)
-    {
-        copy = default;
-        join = null!;
-        return predecessors.TryGetValue(arm, out int count) && count == 1 && TryReadArmCopy(arm, out copy, out join);
-    }
-
-    private static bool TryReadArmCopy(LirBlock arm, out LirParallelCopy copy, out LirBlock join)
-    {
-        copy = default;
-        join = null!;
-        ImmutableArray<LirInstruction> instructions = arm.Instructions;
-        if (instructions.Length is not (2 or 3))
-            return false;
-
-        LirInstruction move = instructions[^2];
-        if (move.Kind != LirInstructionKind.ParallelCopy || move.ParallelCopies.Length != 1)
-            return false;
-
-        LirInstruction jump = instructions[^1];
-        if (jump.Kind != LirInstructionKind.Jump || jump.Target is null)
-            return false;
-
-        copy = move.ParallelCopies[0];
-        if (instructions.Length == 3)
-        {
-            // A phi takes a constant through a name the arm defines for it alone, which SSA keeps from being read anywhere else
-            LirInstruction definition = instructions[0];
-            if (definition.Kind != LirInstructionKind.Copy || definition.Result is not { SourceName: not null } name ||
-                definition.Operands.Length != 1 || definition.Operands[0].Kind is not (LirOperandKind.Immediate or LirOperandKind.Register) ||
-                copy.Source.Kind != LirOperandKind.Register || !ReferenceEquals(copy.Source.Register, name))
-            {
-                return false;
-            }
-            copy = new LirParallelCopy(copy.Destination, definition.Operands[0]);
-        }
-
-        join = jump.Target;
-        return true;
-    }
-
-    private static bool IsSelectableValue(LirOperand operand, TargetInfo target)
-    {
-        if (operand.Kind == LirOperandKind.Register && operand.Register is not null)
-        {
-            return operand.Register.RegisterClass is LirRegisterClass.General or LirRegisterClass.Address &&
-                Math.Max(1, target.SizeOf(operand.Register.Type)) <= Math.Max(1, target.RegisterSize);
-        }
-
-        return operand.Kind == LirOperandKind.Immediate && operand.Immediate is not string;
-    }
-
-    private static Dictionary<LirBlock, int> CountPredecessors(LirFunction function)
-    {
-        var counts = new Dictionary<LirBlock, int>(function.Blocks.Length);
-        foreach (var block in function.Blocks)
-            counts[block] = 0;
-
-        foreach (var block in function.Blocks)
-        {
-            foreach (var instruction in block.Instructions)
-            {
-                Count(counts, instruction.Target);
-                Count(counts, instruction.TrueTarget);
-                Count(counts, instruction.FalseTarget);
-                foreach (var switchCase in instruction.SwitchCases)
-                    Count(counts, switchCase.Target);
-            }
-        }
-
-        return counts;
-    }
-
-    private static void Count(Dictionary<LirBlock, int> counts, LirBlock? block)
-    {
-        if (block is not null && counts.TryGetValue(block, out var count))
-            counts[block] = count + 1;
     }
 }
 
@@ -1276,15 +1105,180 @@ public sealed class LirProblem
     public override string ToString() => Message;
 }
 
+/// <summary>Names the libgcc routines for the floating formats a target computes in software, softfloat.c defines them under the same conditions</summary>
+internal static class SoftFloat
+{
+    public static bool IsSoftware(TargetInfo target, QualifiedType type)
+    {
+        if (!GimpleTypes.IsFloating(type))
+            return false;
+
+        return target.Architecture switch
+        {
+            TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64 => target.SizeOf(type) > RiscVHardwareSize(target),
+            TargetArchitectureKind.Arm32 => true,
+            _ => false,
+        };
+    }
+
+    public static bool Involves(TargetInfo target, QualifiedType first, QualifiedType second)
+        => IsSoftware(target, first) || IsSoftware(target, second);
+
+    public static bool NeedsRoutine(TargetInfo target, QualifiedType operand, QualifiedType result)
+        => Involves(target, operand, result) || ConvertsWideInteger(target, operand, result) || ConvertsWideInteger(target, result, operand);
+
+    public static string? Arithmetic(TargetInfo target, GimpleTreeCode code, QualifiedType type)
+    {
+        string? operation = code switch
+        {
+            GimpleTreeCode.PlusExpr => "add",
+            GimpleTreeCode.MinusExpr => "sub",
+            GimpleTreeCode.MultExpr => "mul",
+            GimpleTreeCode.RdivExpr => "div",
+            _ => null,
+        };
+        return operation is null ? null : "__" + operation + Suffix(target, type) + "3";
+    }
+
+    public static string? Comparison(TargetInfo target, GimpleTreeCode code, QualifiedType type)
+    {
+        string? relation = code switch
+        {
+            GimpleTreeCode.EqExpr => "eq",
+            GimpleTreeCode.NeExpr => "ne",
+            GimpleTreeCode.LtExpr => "lt",
+            GimpleTreeCode.LeExpr => "le",
+            GimpleTreeCode.GtExpr => "gt",
+            GimpleTreeCode.GeExpr => "ge",
+            _ => null,
+        };
+        return relation is null ? null : "__" + relation + Suffix(target, type) + "2";
+    }
+
+    public static string? Conversion(TargetInfo target, QualifiedType source, QualifiedType destination,
+        out QualifiedType argument, out QualifiedType result)
+    {
+        argument = source;
+        result = destination;
+        bool floatingSource = GimpleTypes.IsFloating(source);
+        bool floatingDestination = GimpleTypes.IsFloating(destination);
+        if (floatingSource && floatingDestination)
+        {
+            int sourceSize = target.SizeOf(source);
+            int destinationSize = target.SizeOf(destination);
+            if (sourceSize == destinationSize)
+                return null;
+            return sourceSize < destinationSize ? "__extendsfdf2" : "__truncdfsf2";
+        }
+
+        if (floatingDestination && GimpleTypes.IsIntegerLike(source))
+        {
+            bool wide = target.SizeOf(source) > 4;
+            bool unsigned = !GimpleTypes.IsSigned(source, target);
+            argument = Integer(wide, unsigned);
+            return "__float" + (unsigned ? "un" : string.Empty) + (wide ? "di" : "si") + Suffix(target, destination);
+        }
+
+        if (floatingSource && GimpleTypes.IsIntegerLike(destination))
+        {
+            bool wide = target.SizeOf(destination) > 4;
+            bool unsigned = !GimpleTypes.IsSigned(destination, target);
+            result = Integer(wide, unsigned);
+            return "__fix" + (unsigned ? "uns" : string.Empty) + Suffix(target, source) + (wide ? "di" : "si");
+        }
+
+        return null;
+    }
+
+    // Optimization may still change the operation or the integer type, so a format in use keeps all of its routines
+    public static void CollectRoutines(TargetInfo target, GimpleStatement statement, HashSet<string> names)
+    {
+        switch (statement)
+        {
+            case GimpleAssignStatement assign when assign.RhsClass is GimpleRhsClass.Unary or GimpleRhsClass.Binary:
+                AddFormat(target, assign.Lhs.Type, names);
+                foreach (GimpleValue operand in assign.Operands)
+                    AddFormat(target, operand.Type, names);
+                if (assign.RhsClass == GimpleRhsClass.Unary)
+                {
+                    AddWideConversions(target, assign.Operands[0].Type, assign.Lhs.Type, names);
+                    AddWideConversions(target, assign.Lhs.Type, assign.Operands[0].Type, names);
+                }
+                break;
+
+            case GimpleCondStatement conditional:
+                AddFormat(target, conditional.Lhs.Type, names);
+                AddFormat(target, conditional.Rhs.Type, names);
+                break;
+        }
+    }
+
+    private static void AddFormat(TargetInfo target, QualifiedType type, HashSet<string> names)
+    {
+        if (!IsSoftware(target, type))
+            return;
+
+        string suffix = Suffix(target, type);
+        foreach (string operation in new[] { "add", "sub", "mul", "div" })
+            names.Add("__" + operation + suffix + "3");
+        foreach (string relation in new[] { "eq", "ne", "lt", "le", "gt", "ge" })
+            names.Add("__" + relation + suffix + "2");
+        foreach (string integer in new[] { "si", "unsi", "di", "undi" })
+            names.Add("__float" + integer + suffix);
+        foreach (string integer in new[] { "si", "di" })
+        {
+            names.Add("__fix" + suffix + integer);
+            names.Add("__fixuns" + suffix + integer);
+        }
+        names.Add("__extendsfdf2");
+        names.Add("__truncdfsf2");
+    }
+
+    private static void AddWideConversions(TargetInfo target, QualifiedType integer, QualifiedType floating, HashSet<string> names)
+    {
+        if (!ConvertsWideInteger(target, integer, floating))
+            return;
+
+        string suffix = Suffix(target, floating);
+        names.Add("__floatdi" + suffix);
+        names.Add("__floatundi" + suffix);
+        names.Add("__fix" + suffix + "di");
+        names.Add("__fixuns" + suffix + "di");
+    }
+
+    private static bool ConvertsWideInteger(TargetInfo target, QualifiedType integer, QualifiedType floating)
+        => target.IsRiscV && GimpleTypes.IsFloating(floating) && GimpleTypes.IsIntegerLike(integer) && target.SizeOf(integer) > target.RegisterSize;
+
+    private static QualifiedType Integer(bool wide, bool unsigned)
+        => TypeCatalog.Instance.Builtin(wide
+            ? unsigned ? BuiltinTypeKind.UnsignedLongLong : BuiltinTypeKind.LongLong
+            : unsigned ? BuiltinTypeKind.UnsignedInt : BuiltinTypeKind.Int);
+
+    private static string Suffix(TargetInfo target, QualifiedType type)
+        => target.SizeOf(type) == 4 ? "sf" : "df";
+
+    private static int RiscVHardwareSize(TargetInfo target)
+        => target.HasFeature(TargetArchitectureFeatures.RiscVD) ? 8
+            : target.HasFeature(TargetArchitectureFeatures.RiscVF) ? 4
+            : 0;
+}
+
 internal sealed class LirFunctionBuilder
 {
     private const int MaxRotatedLoopHeaderInstructions = 8;
-    private const int MaxThreadedJumpHops = 4;
     private const int MaxLoopValues = 4;
     private const int MaxHoistingLoopAnalysisWork = 100_000;
     private const int MaxSharedSymbolBases = 4;
     private const int MaxComposedLeaves = 16;
+    // Both arms then run about four cheap statements, near the issue cost of the branch a well-predicted select replaces
+    private const int MaxSpeculatedArmStatements = 2;
+    // Two values cover the compare-exchange of a pair, while each further select is another compare and move
+    private const int MaxSelectsPerJoin = 2;
 
+    private readonly Dictionary<ControlFlowBlock, SelectPlan?> _selectPlans = new();
+    private readonly HashSet<ControlFlowBlock> _absorbedSelectArms = new();
+    private readonly HashSet<GimplePhi> _selectedPhis = new();
+    private readonly Dictionary<GimpleStatementAnnotations, SelectPlan> _selectProducers = new();
     private readonly Dictionary<LirVirtualRegister, LirVirtualRegister> _widenedIndices = new();
     private readonly Dictionary<Symbol, (LirVirtualRegister Register, ControlFlowBlock Block)> _symbolBases = new();
     private readonly HashSet<Symbol> _sharedSymbols = new();
@@ -1332,6 +1326,7 @@ internal sealed class LirFunctionBuilder
     private GimpleStatementAnnotations? _currentInstruction;
     private LirBlock? _currentBlock;
     private ControlFlowBlock? _currentGimpleBlock;
+    private bool _selectPlansSealed;
 
     private LirFunctionBuilder(GimpleFunctionAnnotations function, LirOptions options, TargetInfo target)
     {
@@ -1463,6 +1458,8 @@ internal sealed class LirFunctionBuilder
                     stack.Push(successorBlock);
             }
         }
+
+        _selectPlansSealed = true;
     }
 
     private IEnumerable<ControlFlowBlock> EnumerateOptimizedSuccessors(GimpleBlockAnnotations block)
@@ -1472,10 +1469,15 @@ internal sealed class LirFunctionBuilder
         {
             case GimpleGotoStatement gotoStatement:
                 if (_controlFlowFunction.TryGetBlock(gotoStatement.Target, out var gotoTarget) && gotoTarget is not null)
-                    yield return ThreadJump(block.ControlFlowBlock, gotoTarget);
+                    yield return gotoTarget;
                 yield break;
 
             case GimpleCondStatement conditional:
+                if (GetSelectPlan(block.ControlFlowBlock) is SelectPlan plan)
+                {
+                    yield return plan.Join;
+                    yield break;
+                }
                 if (_controlFlowFunction.TryGetBlock(conditional.WhenTrue, out var trueTarget) && trueTarget is not null)
                     yield return trueTarget;
                 if (_controlFlowFunction.TryGetBlock(conditional.WhenFalse, out var falseTarget) && falseTarget is not null && !ReferenceEquals(falseTarget, trueTarget))
@@ -1505,35 +1507,6 @@ internal sealed class LirFunctionBuilder
         }
     }
 
-    // A join that only branches on phis feeding nothing else is skipped when this edge's input decides the branch
-    private ControlFlowBlock ThreadJump(ControlFlowBlock source, ControlFlowBlock target)
-    {
-        if (!_gimpleBlocksByControlFlowBlock.TryGetValue(target, out var join))
-            return target;
-
-        var current = join;
-        for (var hops = 0; hops < MaxThreadedJumpHops; hops++)
-        {
-            // Past the join a block reached another way, such as a loop header, would read the bypassed phi again
-            if (hops != 0 && current.ControlFlowBlock.UniquePredecessors.Length != 1 || !TryGetSoleStatement(current, out var terminator))
-                return target;
-
-            if (terminator.Statement is GimpleGotoStatement next)
-            {
-                if (!_controlFlowFunction.TryGetBlock(next.Target, out var nextBlock) || nextBlock is null ||
-                    !_gimpleBlocksByControlFlowBlock.TryGetValue(nextBlock, out current))
-                    return target;
-                continue;
-            }
-
-            return terminator.Statement is GimpleCondStatement condition && TryDecideJoinBranch(source, join, terminator, condition, out var decided)
-                ? decided
-                : target;
-        }
-
-        return target;
-    }
-
     private static bool TryGetSoleStatement(GimpleBlockAnnotations block, out GimpleStatementAnnotations terminator)
     {
         terminator = null!;
@@ -1549,55 +1522,404 @@ internal sealed class LirFunctionBuilder
         return true;
     }
 
-    private bool TryDecideJoinBranch(
-        ControlFlowBlock source,
-        GimpleBlockAnnotations join,
-        GimpleStatementAnnotations branch,
-        GimpleCondStatement condition,
-        out ControlFlowBlock decided)
+    // A branch whose arms only compute the join's phis, from statements cheap and safe enough to run ahead of it
+    private sealed class SelectPlan
     {
-        decided = null!;
-        if (condition.Code is not (GimpleTreeCode.EqExpr or GimpleTreeCode.NeExpr) ||
-            !TryGetExpression(branch, 0, out var left) || left.Name is not GimpleName tested)
-            return false;
-        var rightValue = condition.Rhs is GimpleConstantValue constant ? constant.Value : null;
-        if (rightValue is null && (!TryGetExpression(branch, 1, out var right) || !_function.ValueNumbering.TryGetConstantValue(right, out rightValue)) ||
-            !ScalarEvolution.TryGetInteger(rightValue, out var rightNumber))
-            return false;
-
-        GimpleName? input = null;
-        foreach (var phi in join.Phis)
+        public SelectPlan(
+            GimpleBlockAnnotations head,
+            ImmutableArray<GimpleStatementAnnotations> speculated,
+            ControlFlowBlock join,
+            ImmutableArray<GimplePhi> phis,
+            ControlFlowBlock trueSide,
+            ControlFlowBlock falseSide,
+            SelectPlan? nested)
         {
-            foreach (var use in _function.GetImmediateUses(phi.Result))
-            {
-                if (use.Kind == GimpleUseKind.Phi || !ReferenceEquals(use.Statement, condition))
-                    return false;
-            }
+            Head = head;
+            Speculated = speculated;
+            Join = join;
+            Phis = phis;
+            TrueSide = trueSide;
+            FalseSide = falseSide;
+            Nested = nested;
+        }
 
+        public GimpleBlockAnnotations Head { get; }
+        public GimpleStatementAnnotations Condition => Head.Statements[^1];
+        public ImmutableArray<GimpleStatementAnnotations> Speculated { get; }
+        public ControlFlowBlock Join { get; }
+        public ImmutableArray<GimplePhi> Phis { get; }
+
+        public ControlFlowBlock TrueSide { get; }
+        public ControlFlowBlock FalseSide { get; }
+
+        public SelectPlan? Nested { get; }
+
+        public bool SpeculatesEarly { get; set; }
+    }
+
+    private SelectPlan? GetSelectPlan(ControlFlowBlock head)
+    {
+        if (_selectPlans.TryGetValue(head, out SelectPlan? plan))
+            return plan;
+        if (_selectPlansSealed || !_gimpleBlocksByControlFlowBlock.TryGetValue(head, out GimpleBlockAnnotations? block))
+            return null;
+
+        plan = PlanSelect(block, allowNested: true);
+        _selectPlans.Add(head, plan);
+        return plan;
+    }
+
+    private SelectPlan? PlanSelect(GimpleBlockAnnotations head, bool allowNested)
+    {
+        if (!TargetRegisterInfo.HasConditionalSelect(_target) || head.Statements.Length == 0 ||
+            head.Statements[^1].Statement is not GimpleCondStatement condition || !IsSelectableCondition(condition) ||
+            !_controlFlowFunction.TryGetBlock(condition.WhenTrue, out ControlFlowBlock? whenTrue) || whenTrue is null ||
+            !_controlFlowFunction.TryGetBlock(condition.WhenFalse, out ControlFlowBlock? whenFalse) || whenFalse is null ||
+            ReferenceEquals(whenTrue, whenFalse) || MayThreadPast(head, condition))
+            return null;
+
+        ControlFlowBlock source = head.ControlFlowBlock;
+        var trueStatements = new List<GimpleStatementAnnotations>();
+        var falseStatements = new List<GimpleStatementAnnotations>();
+        ControlFlowBlock? trueJoin = ReadSelectArm(source, whenTrue, trueStatements);
+        ControlFlowBlock? falseJoin = ReadSelectArm(source, whenFalse, falseStatements);
+        SelectPlan? plan = null;
+        SelectPlan? inner = null;
+        if (trueJoin is not null && ReferenceEquals(trueJoin, falseJoin))
+            plan = CreateSelectPlan(head, [.. trueStatements, .. falseStatements], trueJoin, whenTrue, whenFalse, null);
+        else if (ReferenceEquals(trueJoin, whenFalse))
+            plan = CreateSelectPlan(head, [.. trueStatements], whenFalse, whenTrue, source, null);
+        else if (ReferenceEquals(falseJoin, whenTrue))
+            plan = CreateSelectPlan(head, [.. falseStatements], whenTrue, source, whenFalse, null);
+        else if (allowNested)
+        {
+            ImmutableArray<GimpleStatementAnnotations> falseArm = falseJoin is null ? [] : [.. falseStatements];
+            ImmutableArray<GimpleStatementAnnotations> trueArm = trueJoin is null ? [] : [.. trueStatements];
+            if (TryReadNestedSelectArm(source, whenTrue, falseJoin ?? whenFalse, CountComputing(falseArm), out inner))
+                plan = CreateSelectPlan(head, falseArm, falseJoin ?? whenFalse, inner.Join, falseJoin is null ? source : whenFalse, inner);
+            else if (TryReadNestedSelectArm(source, whenFalse, trueJoin ?? whenTrue, CountComputing(trueArm), out inner))
+                plan = CreateSelectPlan(head, trueArm, trueJoin ?? whenTrue, trueJoin is null ? source : whenTrue, inner.Join, inner);
+        }
+
+        if (plan is null)
+            return null;
+
+        _selectedPhis.UnionWith(plan.Phis);
+        if (!ReferenceEquals(plan.TrueSide, source))
+            _absorbedSelectArms.Add(plan.TrueSide);
+        if (!ReferenceEquals(plan.FalseSide, source))
+            _absorbedSelectArms.Add(plan.FalseSide);
+        if (inner is not null)
+            _absorbedSelectArms.Add(inner.Head.ControlFlowBlock);
+        else if (FindTestedValueProducer(head, condition, plan.Speculated) is GimpleStatementAnnotations producer)
+        {
+            _selectProducers.Add(producer, plan);
+            plan.SpeculatesEarly = true;
+        }
+
+        return plan;
+    }
+
+    // Jump threading may send an edge past this test straight into an arm, which a select would leave without a block
+    private bool MayThreadPast(GimpleBlockAnnotations head, GimpleCondStatement condition)
+    {
+        if (condition.Code is not (GimpleTreeCode.EqExpr or GimpleTreeCode.NeExpr) || !TryGetSoleStatement(head, out _) ||
+            !TryGetExpression(head.Statements[^1], 0, out GimpleOperandInfo left) || left.Name is not GimpleName tested)
+            return false;
+
+        foreach (GimplePhi phi in head.Phis)
+        {
             if (!ReferenceEquals(phi.Result, tested))
                 continue;
-            foreach (var operand in phi.Operands)
+            foreach (GimplePhiOperand operand in phi.Operands)
             {
-                if (ReferenceEquals(operand.Predecessor, source))
-                    input = operand.Value;
+                if (_function.ValueNumbering.TryGetConstantValue(operand.Value, out _))
+                    return true;
             }
         }
 
-        if (input is null || !_function.ValueNumbering.TryGetConstantValue(input, out var inputValue) ||
-            !ScalarEvolution.TryGetInteger(inputValue, out var inputNumber))
+        return false;
+    }
+
+    private SelectPlan? CreateSelectPlan(GimpleBlockAnnotations head, ImmutableArray<GimpleStatementAnnotations> speculated, ControlFlowBlock join,
+        ControlFlowBlock trueSide, ControlFlowBlock falseSide, SelectPlan? nested)
+    {
+        ImmutableArray<ControlFlowBlock> predecessors = join.UniquePredecessors;
+        if (predecessors.Length != 2 || !predecessors.Contains(trueSide) || !predecessors.Contains(falseSide) ||
+            !_gimpleBlocksByControlFlowBlock.TryGetValue(join, out GimpleBlockAnnotations? block))
+            return null;
+
+        ImmutableArray<GimplePhi>.Builder phis = ImmutableArray.CreateBuilder<GimplePhi>();
+        foreach (GimplePhi phi in block.Phis)
+        {
+            if (phi.Variable.Kind == GimpleVariableKind.Memory)
+                continue;
+            if (phis.Count == MaxSelectsPerJoin || !IsSelectableScalar(phi.Result.Type) ||
+                FindPhiInput(phi, trueSide) is not GimpleName whenTrue || whenTrue.IsUndefined ||
+                FindPhiInput(phi, falseSide) is not GimpleName whenFalse || whenFalse.IsUndefined)
+                return null;
+            phis.Add(phi);
+        }
+
+        return phis.Count == 0 ? null : new SelectPlan(head, speculated, join, phis.ToImmutable(), trueSide, falseSide, nested);
+    }
+
+    private ControlFlowBlock? ReadSelectArm(ControlFlowBlock head, ControlFlowBlock arm, List<GimpleStatementAnnotations> speculated)
+    {
+        if (!HasOnlyPredecessor(arm, head) || !_gimpleBlocksByControlFlowBlock.TryGetValue(arm, out GimpleBlockAnnotations? block) ||
+            HasValuePhis(block) || block.Statements.Length == 0 || block.Statements[^1].Statement is not GimpleGotoStatement jump ||
+            !_controlFlowFunction.TryGetBlock(jump.Target, out ControlFlowBlock? target) || target is null)
+            return null;
+
+        var computing = 0;
+        for (var i = 0; i < block.Statements.Length - 1; i++)
+        {
+            GimpleStatementAnnotations statement = block.Statements[i];
+            if (statement.Statement is GimpleNopStatement or GimpleDeclarationStatement)
+                continue;
+            if (!IsSpeculatable(statement) || IsComputing(statement) && ++computing > MaxSpeculatedArmStatements)
+                return null;
+            speculated.Add(statement);
+        }
+
+        return target;
+    }
+
+    private bool TryReadNestedSelectArm(ControlFlowBlock head, ControlFlowBlock arm, ControlFlowBlock join, int otherComputing,
+        [NotNullWhen(true)] out SelectPlan? inner)
+    {
+        inner = null;
+        if (!HasOnlyPredecessor(arm, head) || !_gimpleBlocksByControlFlowBlock.TryGetValue(arm, out GimpleBlockAnnotations? block) || HasValuePhis(block))
             return false;
 
-        var bits = Math.Min(64, Math.Max(1, _target.SizeOf(tested.Type)) * 8);
-        var mask = bits == 64 ? ulong.MaxValue : (1UL << bits) - 1;
-        var equal = ((ulong)(inputNumber ^ rightNumber) & mask) == 0;
-        var label = equal == (condition.Code == GimpleTreeCode.EqExpr) ? condition.WhenTrue : condition.WhenFalse;
-        if (!_controlFlowFunction.TryGetBlock(label, out var side) || side is null ||
-            !_gimpleBlocksByControlFlowBlock.TryGetValue(side, out var sideBlock) || sideBlock.Phis.Length != 0)
+        var computing = otherComputing;
+        for (var i = 0; i < block.Statements.Length - 1; i++)
+        {
+            GimpleStatementAnnotations statement = block.Statements[i];
+            if (statement.Statement is GimpleNopStatement)
+                continue;
+            if (!IsSpeculatable(statement))
+                return false;
+            if (IsComputing(statement))
+                computing++;
+        }
+
+        if (!_selectPlans.TryGetValue(arm, out SelectPlan? plan))
+        {
+            plan = PlanSelect(block, allowNested: false);
+            if (plan is not null)
+                _selectPlans.Add(arm, plan);
+        }
+        if (plan is null || computing + CountComputing(plan.Speculated) > 2 * MaxSpeculatedArmStatements ||
+            !_gimpleBlocksByControlFlowBlock.TryGetValue(plan.Join, out GimpleBlockAnnotations? passing) ||
+            !TryGetSoleStatement(passing, out GimpleStatementAnnotations terminator) || terminator.Statement is not GimpleGotoStatement jump ||
+            !_controlFlowFunction.TryGetBlock(jump.Target, out ControlFlowBlock? target) || !ReferenceEquals(target, join))
             return false;
 
-        decided = side;
+        inner = plan;
         return true;
     }
+
+    private static GimpleStatementAnnotations? FindTestedValueProducer(GimpleBlockAnnotations head, GimpleCondStatement condition,
+        ImmutableArray<GimpleStatementAnnotations> speculated)
+    {
+        int index = head.Statements.Length - 2;
+        while (index >= 0 && head.Statements[index].Statement is GimpleNopStatement)
+            index--;
+        if (speculated.Length == 0 || index < 0 || condition.Lhs is not GimpleName tested ||
+            head.Statements[index].Statement is not GimpleAssignStatement || (head.Statements[index].Flags & GimpleStatementFlags.ContainsCall) != 0 ||
+            head.Statements[index].Definitions.Length != 1 || !ReferenceEquals(head.Statements[index].Definitions[0].Name, tested))
+            return null;
+
+        foreach (GimpleStatementAnnotations statement in speculated)
+        {
+            foreach (GimpleOperandInfo operand in statement.Operands)
+            {
+                if (ReferenceEquals(operand.Name, tested))
+                    return null;
+            }
+        }
+
+        return head.Statements[index];
+    }
+
+    private void EmitSelectRegion(LirBlock block, SelectPlan plan)
+    {
+        if (plan.Nested is SelectPlan nested)
+        {
+            for (var i = 0; i < nested.Head.Statements.Length - 1; i++)
+                TranslateInstruction(block, nested.Head.Statements[i]);
+            EmitSelectRegion(block, nested);
+        }
+        if (!plan.SpeculatesEarly)
+        {
+            foreach (GimpleStatementAnnotations statement in plan.Speculated)
+                TranslateInstruction(block, statement);
+        }
+
+        GimpleStatementAnnotations instruction = plan.Condition;
+        var conditional = (GimpleCondStatement)instruction.Statement;
+        _currentInstruction = instruction;
+        LirOperand left = FindClampedValue(plan) is GimpleName clamped ? EmitValue(block, clamped)
+            : TryGetExpression(instruction, 0, out GimpleOperandInfo leftExpression) ? EmitValue(block, leftExpression) : EmitValue(block, conditional.Lhs);
+        LirOperand right = TryGetExpression(instruction, 1, out GimpleOperandInfo rightExpression) ? EmitValue(block, rightExpression) : EmitValue(block, conditional.Rhs);
+        foreach (GimplePhi phi in plan.Phis)
+        {
+            if (!IsGimpleNameUsed(phi.Result))
+                continue;
+            _function.ValueNumbering.TryGetValueNumber(phi.Result, out ValueNumber? valueNumber);
+            ImmutableArray<LirOperand> operands = ImmutableArray.Create(left, right,
+                SelectInput(block, RequirePhiInput(phi, plan.TrueSide)), SelectInput(block, RequirePhiInput(phi, plan.FalseSide)));
+            Emit(block, LirInstructionKind.Select, GetRegister(phi.Result), operands, address: null, op: GimpleOperators.Spelling(conditional.Code),
+                conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null,
+                falseTarget: null, sourceStatement: conditional, sourceValue: conditional.Lhs, sourceInstruction: instruction,
+                valueNumber: valueNumber, treeCode: conditional.Code);
+        }
+    }
+
+    private LirOperand SelectInput(LirBlock block, GimpleName input)
+        => TryGetSelectConstant(input, out object? value) ? LirOperand.ImmediateValue(value, input.Type) : EmitValue(block, input);
+
+    private bool TryGetSelectConstant(GimpleName input, [NotNullWhen(true)] out object? value)
+        => _function.ValueNumbering.TryGetConstantValue(input, out value) && value is not null && ScalarEvolution.TryGetInteger(value, out _);
+
+    // The outer test of a clamp chooses the same on the inner select's result, and a select taking its bound above the input is a min
+    private GimpleName? FindClampedValue(SelectPlan outer)
+    {
+        if (outer.Nested is not SelectPlan inner || outer.Phis.Length != 1 || inner.Phis.Length != 1 ||
+            outer.Condition.Statement is not GimpleCondStatement outerTest || inner.Condition.Statement is not GimpleCondStatement innerTest ||
+            outerTest.Lhs is not GimpleName input || !ReferenceEquals(innerTest.Lhs, input) ||
+            !TryGetBound(outerTest, out long outerBound) || !TryGetBound(innerTest, out long innerBound))
+            return null;
+
+        GimplePhi clamped = inner.Phis[0];
+        GimplePhi result = outer.Phis[0];
+        bool innerBoundOnTrue;
+        if (ReferenceEquals(FindPhiInput(clamped, inner.FalseSide), input) && IsConstantInput(FindPhiInput(clamped, inner.TrueSide), innerBound, input.Type))
+            innerBoundOnTrue = true;
+        else if (ReferenceEquals(FindPhiInput(clamped, inner.TrueSide), input) && IsConstantInput(FindPhiInput(clamped, inner.FalseSide), innerBound, input.Type))
+            innerBoundOnTrue = false;
+        else
+            return null;
+
+        bool outerBoundOnTrue = !ReferenceEquals(outer.TrueSide, inner.Join);
+        if (!IsConstantInput(FindPhiInput(result, outerBoundOnTrue ? outer.TrueSide : outer.FalseSide), outerBound, input.Type) ||
+            !ReferenceEquals(FindPhiInput(result, inner.Join), clamped.Result))
+            return null;
+
+        bool innerMinimum = (innerTest.Code is GimpleTreeCode.GtExpr or GimpleTreeCode.GeExpr) == innerBoundOnTrue;
+        bool outerMinimum = (outerTest.Code is GimpleTreeCode.GtExpr or GimpleTreeCode.GeExpr) == outerBoundOnTrue;
+        if (innerMinimum == outerMinimum)
+            return null;
+
+        int bits = Math.Min(64, Math.Max(1, _target.SizeOf(input.Type)) * 8);
+        int order = GimpleTypes.IsSigned(input.Type, _target)
+            ? SignExtend(outerBound, bits).CompareTo(SignExtend(innerBound, bits))
+            : ZeroExtend(outerBound, bits).CompareTo(ZeroExtend(innerBound, bits));
+        return (innerMinimum ? order <= 0 : order >= 0) ? clamped.Result : null;
+    }
+
+    private static long SignExtend(long value, int bits)
+        => bits == 64 ? value : value << (64 - bits) >> (64 - bits);
+
+    private static ulong ZeroExtend(long value, int bits)
+        => bits == 64 ? (ulong)value : (ulong)value & ((1UL << bits) - 1);
+
+    private static bool TryGetBound(GimpleCondStatement test, out long bound)
+    {
+        bound = 0;
+        return test.Code is GimpleTreeCode.LtExpr or GimpleTreeCode.LeExpr or GimpleTreeCode.GtExpr or GimpleTreeCode.GeExpr &&
+            test.Rhs is GimpleConstantValue constant && ScalarEvolution.TryGetInteger(constant.Value, out bound);
+    }
+
+    private bool IsConstantInput(GimpleName? input, long expected, QualifiedType type)
+    {
+        if (input is null || !_function.ValueNumbering.TryGetConstantValue(input, out object? value) || !ScalarEvolution.TryGetInteger(value, out long actual))
+            return false;
+
+        int bits = Math.Min(64, Math.Max(1, _target.SizeOf(type)) * 8);
+        return ZeroExtend(actual ^ expected, bits) == 0;
+    }
+
+    private static GimpleName? FindPhiInput(GimplePhi phi, ControlFlowBlock predecessor)
+    {
+        foreach (GimplePhiOperand operand in phi.Operands)
+        {
+            if (ReferenceEquals(operand.Predecessor, predecessor))
+                return operand.Value;
+        }
+
+        return null;
+    }
+
+    private static GimpleName RequirePhiInput(GimplePhi phi, ControlFlowBlock predecessor)
+        => FindPhiInput(phi, predecessor) ?? throw new InvalidOperationException("A selected phi lost the input of one of its sides.");
+
+    private static bool HasOnlyPredecessor(ControlFlowBlock block, ControlFlowBlock predecessor)
+        => block.UniquePredecessors.Length == 1 && ReferenceEquals(block.UniquePredecessors[0], predecessor);
+
+    private static bool HasValuePhis(GimpleBlockAnnotations block)
+    {
+        foreach (GimplePhi phi in block.Phis)
+        {
+            if (phi.Variable.Kind != GimpleVariableKind.Memory)
+                return true;
+        }
+
+        return false;
+    }
+
+    private bool IsSelectableCondition(GimpleCondStatement condition)
+        => condition.Lhs is GimpleName && IsSelectableScalar(condition.Lhs.Type) && IsSelectableScalar(condition.Rhs.Type);
+
+    private bool IsSelectableScalar(QualifiedType type)
+        => (GimpleTypes.IsIntegerLike(type) || type.Type.Kind == TypeKind.Pointer) && !GimpleTypes.IsVolatileOrAtomic(type) &&
+           _target.SizeOf(type) <= _target.RegisterSize;
+
+    private static bool IsComputing(GimpleStatementAnnotations instruction)
+        => instruction.Statement is GimpleAssignStatement assign && assign.RhsClass is GimpleRhsClass.Unary or GimpleRhsClass.Binary;
+
+    private static int CountComputing(ImmutableArray<GimpleStatementAnnotations> statements)
+    {
+        var count = 0;
+        foreach (GimpleStatementAnnotations statement in statements)
+        {
+            if (IsComputing(statement))
+                count++;
+        }
+
+        return count;
+    }
+
+    private bool IsSpeculatable(GimpleStatementAnnotations instruction)
+    {
+        if (instruction.Statement is not GimpleAssignStatement assign || assign.IsConstructor || instruction.Flags != GimpleStatementFlags.None ||
+            instruction.MemoryOutput is not null || instruction.Definitions.Length != 1 || assign.Lhs is not GimpleName result ||
+            !IsSelectableScalar(result.Type) || result.Variable.Symbol is VariableSymbol variable && variable.ExplicitRegisterName is not null)
+            return false;
+        if (assign.RhsClass is GimpleRhsClass.Unary or GimpleRhsClass.Binary ? !IsSpeculatableCode(assign.Subcode) : assign.RhsClass != GimpleRhsClass.Single)
+            return false;
+
+        foreach (GimpleOperandInfo operand in instruction.Operands)
+        {
+            if (operand.Children.Length != 0 || operand.IsAddress || operand.ReadsMemory || operand.WritesMemory || operand.ContainsCall)
+                return false;
+            if (operand.Name is null
+                ? operand.Original is not GimpleConstantValue || !IsSelectableScalar(operand.Original.Type)
+                : operand.Name.IsUndefined || !IsSelectableScalar(operand.Name.Type))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsSpeculatableCode(GimpleTreeCode code)
+        => code is GimpleTreeCode.NegateExpr or GimpleTreeCode.BitNotExpr or GimpleTreeCode.NopExpr or GimpleTreeCode.ConvertExpr or
+            GimpleTreeCode.PlusExpr or GimpleTreeCode.MinusExpr or GimpleTreeCode.MultExpr or GimpleTreeCode.PointerPlusExpr or
+            GimpleTreeCode.BitAndExpr or GimpleTreeCode.BitIorExpr or GimpleTreeCode.BitXorExpr or GimpleTreeCode.LshiftExpr or
+            GimpleTreeCode.RshiftExpr or GimpleTreeCode.LrotateExpr or GimpleTreeCode.RrotateExpr or GimpleTreeCode.MinExpr or
+            GimpleTreeCode.MaxExpr or GimpleTreeCode.LtExpr or GimpleTreeCode.LeExpr or GimpleTreeCode.GtExpr or GimpleTreeCode.GeExpr or
+            GimpleTreeCode.EqExpr or GimpleTreeCode.NeExpr;
 
     private void CreateVirtualRegistersForGimpleNames()
     {
@@ -1622,15 +1944,17 @@ internal sealed class LirFunctionBuilder
     {
         foreach (var block in _function.Blocks)
         {
-            if (_reachableControlFlowBlocks.Count != 0 && !_reachableControlFlowBlocks.Contains(block.ControlFlowBlock))
+            if (_reachableControlFlowBlocks.Count != 0 && !_reachableControlFlowBlocks.Contains(block.ControlFlowBlock) &&
+                !_absorbedSelectArms.Contains(block.ControlFlowBlock))
                 continue;
 
             foreach (var phi in block.Phis)
             {
+                bool selected = _selectedPhis.Contains(phi);
                 foreach (var operand in phi.Operands)
                 {
                     if (!operand.Value.IsUndefined && operand.Value.Variable.Kind != GimpleVariableKind.Memory &&
-                        StillReaches(operand.Predecessor, phi.Block))
+                        StillReaches(operand.Predecessor, phi.Block) && !(selected && TryGetSelectConstant(operand.Value, out _)))
                         RecordGimpleUse(operand.Value);
                 }
             }
@@ -1660,6 +1984,8 @@ internal sealed class LirFunctionBuilder
     {
         foreach (var controlFlowBlock in _controlFlowFunction.RealBlocks)
         {
+            if (_absorbedSelectArms.Contains(controlFlowBlock))
+                continue;
             if (!_options.PreserveUnreachableBlocks)
             {
                 if (!controlFlowBlock.IsReachable)
@@ -1698,7 +2024,7 @@ internal sealed class LirFunctionBuilder
 
             foreach (var phi in block.Phis)
             {
-                if (phi.Result.Variable.Kind == GimpleVariableKind.Memory || !IsGimpleNameUsed(phi.Result))
+                if (phi.Result.Variable.Kind == GimpleVariableKind.Memory || !IsGimpleNameUsed(phi.Result) || _selectedPhis.Contains(phi))
                     continue;
 
                 if (!_blocksByControlFlowBlock.ContainsKey(phi.Block))
@@ -2001,6 +2327,11 @@ internal sealed class LirFunctionBuilder
 
     private void TranslateInstruction(LirBlock block, GimpleStatementAnnotations instruction)
     {
+        if (_selectProducers.TryGetValue(instruction, out SelectPlan? early))
+        {
+            foreach (GimpleStatementAnnotations statement in early.Speculated)
+                TranslateInstruction(block, statement);
+        }
         _currentInstruction = instruction;
         if (_composedStores.TryGetValue(instruction.Statement, out var composed))
         {
@@ -2040,13 +2371,21 @@ internal sealed class LirFunctionBuilder
 
             case GimpleGotoStatement gotoStatement:
                 if (_controlFlowFunction.TryGetBlock(gotoStatement.Target, out var gotoTarget) && gotoTarget is not null)
-                    EmitJumpToControlFlowTarget(block, instruction.Block, ThreadJump(instruction.Block, gotoTarget), gotoStatement, instruction);
+                    EmitJumpToControlFlowTarget(block, instruction.Block, gotoTarget, gotoStatement, instruction);
                 else
                     EmitJump(block, instruction.Block, gotoStatement.Target, gotoStatement);
                 break;
 
             case GimpleCondStatement conditional:
-                TranslateCond(block, instruction, conditional);
+                if (GetSelectPlan(instruction.Block) is SelectPlan plan)
+                {
+                    EmitSelectRegion(block, plan);
+                    EmitJumpToControlFlowTarget(block, instruction.Block, plan.Join, conditional, instruction);
+                }
+                else
+                {
+                    TranslateCond(block, instruction, conditional);
+                }
                 break;
 
             case GimpleSwitchStatement switchStatement:
@@ -4053,7 +4392,14 @@ internal sealed class LirFunctionBuilder
     {
         var baseExpression = GetChild(expression, 0);
         LirAddress baseAddress;
-        if (elementAccess.Expression.Type.Type is PointerType)
+        if (baseExpression is null ? elementAccess.Expression is GimpleAddressOfExpression : baseExpression.Original is GimpleAddressOfExpression && baseExpression.Children.Length == 1)
+        {
+            // Indexing the address of a place addresses past that place, with nothing to compute into a register
+            baseAddress = baseExpression is null
+                ? EmitAddress(block, ((GimpleAddressOfExpression)elementAccess.Expression).Target)
+                : EmitAddress(block, baseExpression.Children[0]);
+        }
+        else if (elementAccess.Expression.Type.Type is PointerType)
         {
             var pointer = EmitPointerElementBaseValue(block, elementAccess.Expression, baseExpression);
             baseAddress = LirAddress.Indirect(pointer, elementAccess.Type);
@@ -4944,7 +5290,7 @@ internal sealed class LirFunctionBuilder
         ValueNumber? valueNumber,
         GimpleTreeCode treeCode = GimpleTreeCode.None)
     {
-        if (kind is LirInstructionKind.Binary or LirInstructionKind.Branch or LirInstructionKind.Store && _hoistingLoops.Count != 0)
+        if (kind is LirInstructionKind.Binary or LirInstructionKind.Branch or LirInstructionKind.Store or LirInstructionKind.Select && _hoistingLoops.Count != 0)
             operands = HoistLoopConstants(kind, op, operands);
 
         var instruction = new LirInstruction(
@@ -5412,6 +5758,11 @@ public sealed class LirPrinter
 
             case LirInstructionKind.Binary:
                 line += FormatResult(instruction) + " = " + FormatOperand(instruction.Operands[0]) + " " + instruction.Operator + " " + FormatOperand(instruction.Operands[1]);
+                break;
+
+            case LirInstructionKind.Select:
+                line += FormatResult(instruction) + " = select " + FormatOperand(instruction.Operands[0]) + " " + instruction.Operator + " " +
+                    FormatOperand(instruction.Operands[1]) + " ? " + FormatOperand(instruction.Operands[2]) + " : " + FormatOperand(instruction.Operands[3]);
                 break;
 
             case LirInstructionKind.Convert:

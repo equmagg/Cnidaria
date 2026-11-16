@@ -1263,7 +1263,7 @@ public static class RiscVUserland
             Cnidaria.C.StandardLibrarySources.CreateFiles(),
             ImmutableArray<string>.Empty,
             StandardLibrarySoName,
-            Cnidaria.C.TargetInfo.RVA32Linux);
+            Cnidaria.C.TargetInfo.RVA32Zacas);
         var image = RiscVElfWriter.WriteSharedObject(
             program,
             StandardLibrarySoName,
@@ -1328,7 +1328,7 @@ public static class RiscVUserland
     private static string ReadUserSource(string fileName)
     {
         var asm = typeof(RiscVUserland).Assembly;
-        string resourceName = "Cnidaria.Targets.riscv.os." + fileName;
+        string resourceName = $"Cnidaria.Targets.riscv.os.{fileName}";
         using var stream = asm.GetManifestResourceStream(resourceName);
         if (stream is null)
             throw new FileNotFoundException($"User source not found: {fileName}");
@@ -1338,7 +1338,7 @@ public static class RiscVUserland
 
     private static RiscVProgram CompileProgram(string source, string filePath)
     {
-        var options = new Cnidaria.C.CompilationOptions(Cnidaria.C.TargetInfo.RV64GLinux);
+        var options = new Cnidaria.C.CompilationOptions(Cnidaria.C.TargetInfo.RVA32Zacas);
         var compilation = Cnidaria.C.Compilation.CreateFromSource(
             source,
             filePath: filePath,
@@ -1426,11 +1426,7 @@ public static class RiscVKernel
 
     private static RiscVProgram CompileKernel(string source)
     {
-        var options = new Cnidaria.C.CompilationOptions(Cnidaria.C.TargetInfo.RiscV64.WithFeatures(
-            TargetArchitectureFeatures.RiscVG |
-            TargetArchitectureFeatures.RiscVPrivileged |
-            TargetArchitectureFeatures.RiscVV |
-            TargetArchitectureFeatures.RiscVB));
+        var options = new Cnidaria.C.CompilationOptions(Cnidaria.C.TargetInfo.RVA32Zacas);
         var compilation = Cnidaria.C.Compilation.CreateFromSource(
             source,
             filePath: "riscv/os/kernel.c",

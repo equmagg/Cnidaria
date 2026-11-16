@@ -47,8 +47,9 @@ internal static partial class SsaOptimizer
         }
 
         var hoisted = LoopInvariantCodeMotion.Optimize(current, target, options, valueNumberingOptions);
-        if (!ReferenceEquals(hoisted, current))
-            current = new Pass(hoisted, target, options, valueNumberingOptions).Run();
+        GimpleFunctionAnnotations branched = RedundantBranchOptimization.Optimize(hoisted, target, options, valueNumberingOptions);
+        if (!ReferenceEquals(branched, current))
+            current = new Pass(branched, target, options, valueNumberingOptions).Run();
 
         var asserted = AssertionPropagation.Optimize(current, target, options, valueNumberingOptions, out var assertions);
         var induced = InductionVariables.Optimize(asserted, target, options, valueNumberingOptions, assertions);
@@ -743,6 +744,13 @@ internal static partial class SsaOptimizer
                 Changed = true;
                 expressions = ReplaceRhsExpressions(expressions, start, assign.Operands.Length, ImmutableArray.Create(folded));
                 return GimpleAssignStatement.Single(assign.Lhs, GimpleNameMaterializer.MaterializeValue(folded), assign.Syntax);
+            }
+
+            if (_options.EnableConstantFolding && TryReassociateConstants(assign, operandArray, out GimpleAssignStatement reassociated, out ImmutableArray<GimpleOperandInfo> reassociatedOperands))
+            {
+                Changed = true;
+                expressions = ReplaceRhsExpressions(expressions, start, assign.Operands.Length, reassociatedOperands);
+                return reassociated;
             }
 
             if (_options.EnableConstantFolding && TryFormRotate(assign, operandArray, out var rotate, out var rotateOperands))
@@ -1707,6 +1715,87 @@ internal static partial class SsaOptimizer
                 case GimpleTreeCode.NeExpr:
                     folded = CreateConstantExpression(CreateIntegerConstant(0UL, type, syntax));
                     return true;
+            }
+
+            return false;
+        }
+
+        // (x + c1) + c2 is x + (c1 + c2) when the first sum feeds nothing else, and unless the type wraps the exact sum has to fit
+        private bool TryReassociateConstants(
+            GimpleAssignStatement assign,
+            ImmutableArray<GimpleOperandInfo> operands,
+            out GimpleAssignStatement reassociated,
+            out ImmutableArray<GimpleOperandInfo> reassociatedOperands)
+        {
+            reassociated = null!;
+            reassociatedOperands = default;
+            if (assign.Subcode is not (GimpleTreeCode.PlusExpr or GimpleTreeCode.MinusExpr or GimpleTreeCode.PointerPlusExpr) ||
+                operands.Length != 2 || operands[0].Name is not GimpleName inner ||
+                !TryGetConstant(operands[1], out GimpleConstantValue outerConstant) ||
+                !IsSoleUseThroughCopies(assign.Operands[0], inner) ||
+                !TryGetDefiningAssign(inner, out GimpleAssignStatement innerAssign) || innerAssign.Operands.Length != 2 ||
+                innerAssign.Operands[0] is not GimpleName value || innerAssign.Operands[1] is not GimpleConstantValue innerConstant ||
+                !SameType(value.Type, assign.Lhs.Type) ||
+                !SameType(inner.Type, assign.Lhs.Type) ||
+                !TryGetIntegerConstant(innerConstant, out ulong innerValue, out IntegerInfo innerInfo) ||
+                !TryGetIntegerConstant(outerConstant, out ulong outerValue, out IntegerInfo outerInfo))
+            {
+                return false;
+            }
+
+            bool pointer = assign.Subcode == GimpleTreeCode.PointerPlusExpr;
+            if (pointer ? innerAssign.Subcode != GimpleTreeCode.PointerPlusExpr
+                    : innerAssign.Subcode is not (GimpleTreeCode.PlusExpr or GimpleTreeCode.MinusExpr) ||
+                      !SameType(innerConstant.Type, outerConstant.Type) || !SameType(outerConstant.Type, assign.Lhs.Type))
+            {
+                return false;
+            }
+
+            Int128 exact = ExactInteger(innerValue, innerInfo, innerAssign.Subcode == GimpleTreeCode.MinusExpr) +
+                ExactInteger(outerValue, outerInfo, assign.Subcode == GimpleTreeCode.MinusExpr);
+            QualifiedType type = outerConstant.Type;
+            IntegerInfo info = outerInfo;
+            // A pointer offset is extended from its own type, any offset type holding the exact sum serves
+            if (pointer && !FitsInteger(exact, outerInfo) && FitsInteger(exact, innerInfo))
+                (type, info) = (innerConstant.Type, innerInfo);
+            else if ((pointer || info.IsSigned) && !FitsInteger(exact, info))
+                return false;
+
+            ulong sum = (ulong)(exact & Mask(info.Bits));
+            GimpleTreeCode code = pointer ? GimpleTreeCode.PointerPlusExpr : GimpleTreeCode.PlusExpr;
+            ulong topBit = 1UL << (info.Bits - 1);
+            if (!pointer && (sum & topBit) != 0 && sum != topBit)
+            {
+                code = GimpleTreeCode.MinusExpr;
+                sum = (0 - sum) & Mask(info.Bits);
+            }
+
+            GimpleConstantValue constant = CreateIntegerConstant(sum, type, assign.Syntax);
+            reassociated = GimpleAssignStatement.Binary(assign.Lhs, code, value, constant, assign.Syntax);
+            reassociatedOperands = ImmutableArray.Create(CreateNameExpression(value, value, GimpleOperandRole.Value), CreateConstantExpression(constant));
+            return true;
+        }
+
+        private static Int128 ExactInteger(ulong value, IntegerInfo info, bool negated)
+        {
+            Int128 exact = info.IsSigned ? ToSigned(value, info.Bits) : value & Mask(info.Bits);
+            return negated ? -exact : exact;
+        }
+
+        private static bool FitsInteger(Int128 value, IntegerInfo info)
+            => info.IsSigned
+                ? value >= MinSigned(info.Bits) && value <= MaxSigned(info.Bits)
+                : value >= 0 && value <= Mask(info.Bits);
+
+        private bool IsSoleUseThroughCopies(GimpleValue operand, GimpleName name)
+        {
+            while (operand is GimpleName current && _useCounts.TryGetValue(current, out int uses) && uses == 1)
+            {
+                if (ReferenceEquals(current, name))
+                    return true;
+                if (!TryGetDefiningAssign(current, out GimpleAssignStatement copy) || copy.RhsClass != GimpleRhsClass.Single || copy.Operands.Length != 1)
+                    return false;
+                operand = copy.Operands[0];
             }
 
             return false;

@@ -274,6 +274,23 @@ internal static class InlineAsmConstraints
     public static bool HasExplicitRegister(string constraint)
         => ExplicitRegisterName(constraint) is not null;
 
+    public static string? X86RegisterLetterName(string constraint)
+    {
+        foreach (char ch in OperandConstraint(constraint))
+        {
+            switch (ch)
+            {
+                case 'a': return "rax";
+                case 'b': return "rbx";
+                case 'c': return "rcx";
+                case 'd': return "rdx";
+                case 'S': return "rsi";
+                case 'D': return "rdi";
+            }
+        }
+        return null;
+    }
+
     public static bool AllowsMemory(string constraint)
         => OperandConstraint(constraint).IndexOf('m') >= 0;
 
@@ -312,6 +329,72 @@ internal static class InlineAsmConstraints
             return InlineAsmOperandStorage.Immediate;
         return InlineAsmOperandStorage.Register;
     }
+
+    public static bool FormatsThroughScratch(GimpleAsmStatement statement)
+    {
+        foreach (GimpleAsmOperand output in statement.Outputs)
+        {
+            if (output.Target is not null && PreferredStorage(output.Constraint, output.Target.Type) != InlineAsmOperandStorage.Register)
+                return true;
+        }
+
+        foreach (GimpleAsmOperand input in statement.Inputs)
+        {
+            if (input.Value is not null && PreferredStorage(input.Constraint, input.Value.Type) != InlineAsmOperandStorage.Register)
+                return true;
+        }
+
+        return false;
+    }
+
+    // A linking jump or a named return-address register means the asm may leave through a call, which needs ra saved and the stack aligned
+    public static bool MayCall(GimpleAsmStatement statement, TargetInfo target)
+    {
+        foreach (string clobber in statement.Clobbers)
+        {
+            if (IsReturnAddressRegister(clobber, target))
+                return true;
+        }
+
+        foreach (string piece in statement.Text.Split('\n', ';'))
+        {
+            string line = piece.Trim();
+            string mnemonic = NextWord(ref line);
+            while (mnemonic.EndsWith(':'))
+                mnemonic = NextWord(ref line);
+
+            mnemonic = mnemonic.ToLowerInvariant();
+            if (mnemonic is "call" or "tail" or "bl" or "blr" or "blx" ||
+                mnemonic is "jal" or "jalr" && line.Split(',')[0].Trim().ToLowerInvariant() is not ("zero" or "x0"))
+                return true;
+
+            foreach (string word in line.Split(' ', '\t', ',', '(', ')', '[', ']', '!', '{', '}', '#'))
+            {
+                if (word.Length != 0 && word[0] != '%' && IsReturnAddressRegister(word, target))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static string NextWord(ref string line)
+    {
+        int end = 0;
+        while (end < line.Length && !char.IsWhiteSpace(line[end]))
+            end++;
+        string word = line.Substring(0, end);
+        line = line.Substring(end).TrimStart();
+        return word;
+    }
+
+    private static bool IsReturnAddressRegister(string name, TargetInfo target)
+        => name.Trim().TrimStart('%').ToLowerInvariant() switch
+        {
+            "ra" or "x1" => target.IsRiscV,
+            "x30" or "w30" or "lr" or "r14" => target.IsArm,
+            _ => false,
+        };
 
     public static bool HasMemoryClobber(ImmutableArray<string> clobbers)
         => ContainsClobber(clobbers, "memory");

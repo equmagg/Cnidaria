@@ -867,6 +867,9 @@ internal static class TargetRegisterInfo
     public static bool HasRotateLeft(TargetInfo target)
         => target.Architecture is not (TargetArchitectureKind.Arm32 or TargetArchitectureKind.Arm64);
 
+    public static bool HasConditionalSelect(TargetInfo target)
+        => target.IsX86 || target.IsRiscV && target.HasFeature(TargetArchitectureFeatures.RiscVZicond);
+
     public static MachineRegister FrameBaseRegister(TargetInfo target)
         => target.Architecture switch
         {

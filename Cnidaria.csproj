@@ -24,7 +24,7 @@
 
   <PropertyGroup>
     <PackageId>Cnidaria</PackageId>
-    <Version>3.6.6</Version>
+    <Version>3.6.7</Version>
     <Authors>equmag</Authors>
     <Description>Lightweight RCE safe compiler collection</Description>
 

@@ -414,7 +414,7 @@ static void* __win_std_handle(unsigned long long which)
         "add rsp, 32"
         : "={rax}"(result)
         : [which] "{rcx}"(which)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 }
 
@@ -469,7 +469,7 @@ static void* __win_create_file(
         : "={rax}"(result)
         : [path] "{rcx}"(path), [access] "{rdx}"(access), [share] "{r8}"(share), [security] "{r9}"((void*)0),
           [disposition] "r"(disposition), [attributes] "r"(attributes)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 }
 
@@ -483,7 +483,7 @@ static int __win_read_file(void* handle, void* buffer, unsigned long long count,
         "add rsp, 48"
         : "={rax}"(result)
         : [handle] "{rcx}"(handle), [buffer] "{rdx}"(buffer), [count] "{r8}"(count), [done] "{r9}"(done)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 }
 
@@ -497,7 +497,7 @@ static int __win_write_file(void* handle, const void* buffer, unsigned long long
         "add rsp, 48"
         : "={rax}"(result)
         : [handle] "{rcx}"(handle), [buffer] "{rdx}"(buffer), [count] "{r8}"(count), [done] "{r9}"(done)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 }
 
@@ -510,7 +510,7 @@ static int __win_close_handle(void* handle)
         "add rsp, 32"
         : "={rax}"(result)
         : [handle] "{rcx}"(handle)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 }
 
@@ -523,7 +523,7 @@ static int __win_seek(void* handle, long long distance, long long* position, uns
         "add rsp, 32"
         : "={rax}"(result)
         : [handle] "{rcx}"(handle), [distance] "{rdx}"(distance), [position] "{r8}"(position), [method] "{r9}"(method)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 }
 
@@ -536,7 +536,7 @@ static int __win_set_end(void* handle)
         "add rsp, 32"
         : "={rax}"(result)
         : [handle] "{rcx}"(handle)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 }
 
@@ -549,7 +549,7 @@ static int __win_flush(void* handle)
         "add rsp, 32"
         : "={rax}"(result)
         : [handle] "{rcx}"(handle)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 }
 
@@ -562,7 +562,7 @@ static int __win_file_size(void* handle, long long* size)
         "add rsp, 32"
         : "={rax}"(result)
         : [handle] "{rcx}"(handle), [size] "{rdx}"(size)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 }
 
@@ -575,7 +575,7 @@ static unsigned int __win_file_type(void* handle)
         "add rsp, 32"
         : "={rax}"(result)
         : [handle] "{rcx}"(handle)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 }
 
@@ -588,7 +588,7 @@ static unsigned int __win_attributes(const char* path)
         "add rsp, 32"
         : "={rax}"(result)
         : [path] "{rcx}"(path)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 }
 
@@ -601,7 +601,7 @@ static int __win_delete(const char* path)
         "add rsp, 32"
         : "={rax}"(result)
         : [path] "{rcx}"(path)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 }
 
@@ -614,7 +614,7 @@ static int __win_move(const char* from, const char* to, unsigned long long flags
         "add rsp, 32"
         : "={rax}"(result)
         : [from] "{rcx}"(from), [to] "{rdx}"(to), [flags] "{r8}"(flags)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 }
 
@@ -627,7 +627,7 @@ static int __win_make_directory(const char* path)
         "add rsp, 32"
         : "={rax}"(result)
         : [path] "{rcx}"(path), [security] "{rdx}"((void*)0)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 }
 
@@ -640,7 +640,7 @@ static int __win_remove_directory(const char* path)
         "add rsp, 32"
         : "={rax}"(result)
         : [path] "{rcx}"(path)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 }
 
@@ -653,7 +653,7 @@ static unsigned int __win_current_directory(unsigned long long size, char* buffe
         "add rsp, 32"
         : "={rax}"(result)
         : [size] "{rcx}"(size), [buffer] "{rdx}"(buffer)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 }
 
@@ -666,7 +666,7 @@ static int __win_set_current_directory(const char* path)
         "add rsp, 32"
         : "={rax}"(result)
         : [path] "{rcx}"(path)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 }
 

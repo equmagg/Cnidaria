@@ -138,8 +138,12 @@ public sealed class ControlFlowFunction
         if (function is null)
             throw new ArgumentNullException(nameof(function));
 
-        return new Builder(function).Build();
+        return new Builder(function, function.Blocks).Build();
     }
+
+    // The blocks keep the function's labels and order, only their terminators may differ
+    internal ControlFlowFunction Rebuild(ImmutableArray<GimpleBasicBlock> blocks)
+        => new Builder(Function, blocks).Build();
 
     /// <summary>Gets the first block associated with a label</summary>
     /// <remarks>Duplicate labels keep the first block as the jump target</remarks>
@@ -157,6 +161,7 @@ public sealed class ControlFlowFunction
     private sealed class Builder
     {
         private readonly GimpleFunctionDefinition _function;
+        private readonly ImmutableArray<GimpleBasicBlock> _basicBlocks;
         private readonly List<ControlFlowBlock> _blocks = new();
         private readonly List<ControlFlowBlock> _realBlocks = new();
         private readonly List<ControlFlowEdge> _edges = new();
@@ -167,9 +172,10 @@ public sealed class ControlFlowFunction
 
         private ControlFlowBlock? _exit;
 
-        public Builder(GimpleFunctionDefinition function)
+        public Builder(GimpleFunctionDefinition function, ImmutableArray<GimpleBasicBlock> basicBlocks)
         {
             _function = function;
+            _basicBlocks = basicBlocks;
         }
 
         /// <summary>Runs all graph construction phases</summary>
@@ -201,9 +207,9 @@ public sealed class ControlFlowFunction
         // Create one graph block per lowered block and append a synthetic exit
         private void CreateBlocks()
         {
-            for (var i = 0; i < _function.Blocks.Length; i++)
+            for (var i = 0; i < _basicBlocks.Length; i++)
             {
-                var block = new ControlFlowBlock(i, _function.Blocks[i], isExit: false);
+                var block = new ControlFlowBlock(i, _basicBlocks[i], isExit: false);
                 _blocks.Add(block);
                 _realBlocks.Add(block);
                 _predecessors.Add(block, new List<ControlFlowEdge>());
@@ -224,7 +230,7 @@ public sealed class ControlFlowFunction
                 }
             }
 
-            _exit = new ControlFlowBlock(_function.Blocks.Length, gimpleBlock: null, isExit: true);
+            _exit = new ControlFlowBlock(_basicBlocks.Length, gimpleBlock: null, isExit: true);
             _blocks.Add(_exit);
             _predecessors.Add(_exit, new List<ControlFlowEdge>());
             _successors.Add(_exit, new List<ControlFlowEdge>());

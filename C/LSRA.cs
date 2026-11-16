@@ -129,21 +129,34 @@ internal sealed class LinearScanRegisterAllocator
     private readonly Dictionary<LirVirtualRegister, LirVirtualRegister> _sameBitsSources = new();
     private readonly Dictionary<LirVirtualRegister, LirInstruction> _definingInstructions = new();
     private readonly IScratchNeeds? _scratchNeeds;
+    private readonly Dictionary<MachineRegister, List<LiveInterval>> _registerOccupants = new();
+    private readonly Dictionary<LirInstruction, ParallelCopyCycleRegisters> _parallelCopyCycleRegisters = new();
+    private readonly HashSet<LirInstruction> _conservativeAsmSites;
+    private bool _hasRegisterGroups;
     private ImmutableArray<MachineRegister> _generalRegisters;
 
-    private LinearScanRegisterAllocator(LirFunction function, TargetInfo target, LSRAOptions? options, IScratchNeeds? scratchNeeds)
+    private LinearScanRegisterAllocator(LirFunction function, TargetInfo target, LSRAOptions? options, IScratchNeeds? scratchNeeds, HashSet<LirInstruction> conservativeAsmSites)
     {
         _function = function ?? throw new ArgumentNullException(nameof(function));
         _target = target ?? TargetInfo.Default;
         _options = options ?? LSRAOptions.ForTarget(_target);
         _scratchNeeds = scratchNeeds;
+        _conservativeAsmSites = conservativeAsmSites;
     }
 
     public static AllocationResult Allocate(LirFunction function, TargetInfo? target = null, LSRAOptions? options = null,
         IScratchNeeds? scratchNeeds = null)
-         => new LinearScanRegisterAllocator(function, target ?? TargetInfo.Default, options, scratchNeeds).Allocate();
+    {
+        var conservativeAsmSites = new HashSet<LirInstruction>();
+        while (true)
+        {
+            AllocationResult? result = new LinearScanRegisterAllocator(function, target ?? TargetInfo.Default, options, scratchNeeds, conservativeAsmSites).Allocate();
+            if (result is not null)
+                return result;
+        }
+    }
 
-    private AllocationResult Allocate()
+    private AllocationResult? Allocate()
     {
         _callPositions.Clear();
         _blockStarts.Clear();
@@ -159,6 +172,9 @@ internal sealed class LinearScanRegisterAllocator
         _phiWebs.Clear();
         _sameBitsSources.Clear();
         _definingInstructions.Clear();
+        _generalRegisters = _options.GeneralRegisters;
+        if (HasDynamicStack(_function) && TargetRegisterInfo.FrameBaseRegister(_target) is var frameBase && frameBase != MachineRegister.Invalid)
+            _generalRegisters = _generalRegisters.Remove(frameBase);
         BuildIncomingParameterRegisters();
         var intervals = BuildIntervals();
         foreach (var interval in intervals.Values)
@@ -171,9 +187,6 @@ internal sealed class LinearScanRegisterAllocator
                 allocations[interval.Register] = VirtualRegisterAllocation.Spilled(interval.Register, interval.Register.RegisterClass);
         }
 
-        _generalRegisters = _options.GeneralRegisters;
-        if (HasDynamicStack(_function) && TargetRegisterInfo.FrameBaseRegister(_target) is var frameBase && frameBase != MachineRegister.Invalid)
-            _generalRegisters = _generalRegisters.Remove(frameBase);
         AllocateClasses(intervals, new[] { LirRegisterClass.General, LirRegisterClass.Address }, _generalRegisters, allocations, _copyPreferences, _abiPreferences, _phiWebs, _sameBitsSources, _definingInstructions, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions, CheaperInMemory, SpillWeight);
         AllocateClasses(intervals, new[] { LirRegisterClass.Floating }, _options.FloatingRegisters, allocations, _copyPreferences, _abiPreferences, _phiWebs, _sameBitsSources, _definingInstructions, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions, CheaperInMemory, SpillWeight);
         AllocateClasses(intervals, new[] { LirRegisterClass.Vector }, _options.VectorRegisters, allocations, _copyPreferences, _abiPreferences, _phiWebs, _sameBitsSources, _definingInstructions, _target, _options.CallBoundarySplitClasses, _callPositions, _callArgumentTargets, _instructionClobbers, _inlineAssemblySites, _incomingRegisterReleasePositions, CheaperInMemory, SpillWeight);
@@ -184,6 +197,13 @@ internal sealed class LinearScanRegisterAllocator
         {
             if (allocations.TryGetValue(interval.Register, out var assigned))
             {
+                if (!assigned.IsSpilled && assigned.PhysicalRegister != MachineRegister.Invalid)
+                {
+                    if (!_registerOccupants.TryGetValue(assigned.PhysicalRegister, out List<LiveInterval>? held))
+                        _registerOccupants.Add(assigned.PhysicalRegister, held = new List<LiveInterval>());
+                    held.Add(interval);
+                    _hasRegisterGroups |= interval.RegisterCount > 1;
+                }
                 if (managedScratch is not null && !assigned.IsSpilled && managedScratch.Contains(assigned.PhysicalRegister))
                 {
                     if (!scratchOccupants.TryGetValue(assigned.PhysicalRegister, out var occupants))
@@ -201,6 +221,9 @@ internal sealed class LinearScanRegisterAllocator
 
             allocations.Add(interval.Register, VirtualRegisterAllocation.Spilled(interval.Register, interval.Register.RegisterClass));
         }
+
+        if (!AssignInlineAssemblyRegisters(allocations))
+            return null;
 
         var callPreservations = BuildCallPreservations(intervals, allocations, out var preservationRegisters, out var stackPreservedRegisters);
         foreach (var register in stackPreservedRegisters)
@@ -235,7 +258,11 @@ internal sealed class LinearScanRegisterAllocator
         }
 
         callPreservations = BindCallPreservationStackOffsets(callPreservations, allocations);
-        return new AllocationResult(_function, allocations, frame, callPreservations, _scratchKills, isScratchFree);
+        Dictionary<LirInstruction, InlineAssemblyRegisters>? inlineAssemblyRegisters = null;
+        foreach (InlineAssemblySite site in _inlineAssemblySites)
+            (inlineAssemblyRegisters ??= new Dictionary<LirInstruction, InlineAssemblyRegisters>()).Add(site.Instruction, site.Registers);
+
+        return new AllocationResult(_function, allocations, frame, callPreservations, _scratchKills, isScratchFree, _parallelCopyCycleRegisters, inlineAssemblyRegisters);
     }
 
     // Only copies of one value overlap in a register, so the scan backs up while an earlier range still reaches the position
@@ -387,6 +414,18 @@ internal sealed class LinearScanRegisterAllocator
                     });
                 if (instruction.Result is not null && instruction.Kind != LirInstructionKind.ParallelCopy)
                     _definingInstructions[instruction.Result] = instruction;
+
+                // An output nothing reads is written all the same, so it must not share a register with another output
+                if (instruction.Kind == LirInstructionKind.InlineAssembly)
+                {
+                    foreach (LirParallelCopy copy in instruction.ParallelCopies)
+                    {
+                        if (!ShouldTrack(copy.Destination))
+                            continue;
+                        Touch(intervals, copy.Destination, pos + 1, isUse: true);
+                        lastUses[copy.Destination] = pos + 1;
+                    }
+                }
                 previous = instruction;
             }
 
@@ -509,7 +548,7 @@ internal sealed class LinearScanRegisterAllocator
     // sound for every operator below: each reads its sources before it writes the destination
     private int DefinitionPosition(LirInstruction instruction, int position)
         => instruction.Kind is LirInstructionKind.Copy or LirInstructionKind.ParallelCopy or LirInstructionKind.Call
-               or LirInstructionKind.Convert ||
+               or LirInstructionKind.Convert or LirInstructionKind.Select ||
            instruction.Kind == LirInstructionKind.Load && instruction.Result is not null &&
                TargetRegisterInfo.RegisterGroupCount(_target, instruction.Result.Type) == 1 ||
            UpdatesFirstOperandInPlace(instruction) ||
@@ -650,11 +689,11 @@ internal sealed class LinearScanRegisterAllocator
 
     private bool NeedsX86BlockCopyScratch(LirInstruction instruction)
     {
-        if (instruction.Kind is LirInstructionKind.ZeroMemory or LirInstructionKind.InlineAssembly or
-            LirInstructionKind.VaStart or LirInstructionKind.VaArg)
-        {
+        if (instruction.Kind is LirInstructionKind.ZeroMemory or LirInstructionKind.VaStart or LirInstructionKind.VaArg)
             return true;
-        }
+        if (instruction.Kind == LirInstructionKind.InlineAssembly &&
+            instruction.SourceStatement is GimpleAsmStatement asmStatement && InlineAsmConstraints.FormatsThroughScratch(asmStatement))
+            return true;
 
         if (instruction.Result is not null && IsX86BlockCopyStorage(instruction.Result.Type))
             return true;
@@ -813,70 +852,81 @@ internal sealed class LinearScanRegisterAllocator
 
     private InlineAssemblySite CreateInlineAssemblySite(LirInstruction instruction, int position)
     {
-        var reserved = ImmutableHashSet.CreateBuilder<MachineRegister>();
-        var touched = ImmutableHashSet.CreateBuilder<MachineRegister>();
-        var inputTargets = ImmutableDictionary.CreateBuilder<LirVirtualRegister, MachineRegister>();
-        var outputTargets = ImmutableDictionary.CreateBuilder<LirVirtualRegister, MachineRegister>();
+        var site = new InlineAssemblySite(instruction, position);
         if (instruction.SourceStatement is not GimpleAsmStatement asmStatement)
-            return new InlineAssemblySite(position, reserved.ToImmutable(), touched.ToImmutable(), inputTargets.ToImmutable(), outputTargets.ToImmutable());
+            return site;
 
+        ImmutableHashSet<MachineRegister>.Builder reserved = ImmutableHashSet.CreateBuilder<MachineRegister>();
+        ImmutableHashSet<MachineRegister>.Builder touched = ImmutableHashSet.CreateBuilder<MachineRegister>();
+        ImmutableHashSet<MachineRegister>.Builder? classes = _conservativeAsmSites.Contains(instruction) ? ImmutableHashSet.CreateBuilder<MachineRegister>() : null;
         ReserveInlineAssemblyTemplateRegisters(asmStatement.Text, reserved, touched);
 
         var copyIndex = 0;
         var operandIndex = 0;
-        foreach (var output in asmStatement.Outputs)
+        for (var index = 0; index < asmStatement.Outputs.Length; index++)
         {
+            GimpleAsmOperand output = asmStatement.Outputs[index];
             if (output.Target is null)
                 continue;
 
-            var storage = InlineAsmConstraints.PreferredStorage(output.Constraint, output.Target.Type);
-            if (storage != InlineAsmOperandStorage.Register)
-            {
-                if (storage == InlineAsmOperandStorage.Memory)
-                    operandIndex++;
-                continue;
-            }
-
-            ReserveInlineAssemblyOperand(reserved, touched, output.Constraint, output.Target.Type);
-            if (copyIndex < instruction.ParallelCopies.Length)
-            {
-                var destination = instruction.ParallelCopies[copyIndex].Destination;
-                var explicitRegister = InlineAsmConstraints.ExplicitRegisterName(output.Constraint);
-                var registerClass = CAbi.PreferredLirRegisterClass(_target, output.Target.Type);
-                if (explicitRegister is not null &&
-                    TargetRegisterInfo.TryParseExplicitRegister(_target, explicitRegister, registerClass, out var fixedRegister))
-                {
-                    outputTargets[destination] = fixedRegister;
-                    AddAbiPreference(destination, fixedRegister);
-                }
-            }
-            copyIndex++;
-        }
-
-        foreach (var input in asmStatement.Inputs)
-        {
-            if (input.Value is null)
+            if (InlineAsmConstraints.PreferredStorage(output.Constraint, output.Target.Type) == InlineAsmOperandStorage.Memory)
             {
                 operandIndex++;
                 continue;
             }
 
-            var storage = InlineAsmConstraints.PreferredStorage(input.Constraint, input.Value.Type);
-            if (storage == InlineAsmOperandStorage.Register && InlineAsmConstraints.MatchingOperand(input.Constraint) is null)
+            if (copyIndex < instruction.ParallelCopies.Length)
             {
-                ReserveInlineAssemblyOperand(reserved, touched, input.Constraint, input.Value.Type);
-                if (operandIndex < instruction.Operands.Length &&
-                    instruction.Operands[operandIndex].Kind == LirOperandKind.Register &&
-                    instruction.Operands[operandIndex].Register is { } source)
+                LirVirtualRegister destination = instruction.ParallelCopies[copyIndex].Destination;
+                switch (FixedInlineAssemblyRegister(output.Constraint, output.Target.Type, out MachineRegister fixedRegister))
                 {
-                    var explicitRegister = InlineAsmConstraints.ExplicitRegisterName(input.Constraint);
-                    var registerClass = CAbi.PreferredLirRegisterClass(_target, input.Value.Type);
-                    if (explicitRegister is not null &&
-                        TargetRegisterInfo.TryParseExplicitRegister(_target, explicitRegister, registerClass, out var fixedRegister))
-                    {
-                        inputTargets[source] = fixedRegister;
-                        AddAbiPreference(source, fixedRegister);
-                    }
+                    case true:
+                        AddInlineAssemblyRegister(reserved, touched, fixedRegister);
+                        site.OutputTargets[destination] = fixedRegister;
+                        AddAbiPreference(destination, fixedRegister);
+                        break;
+                    case false:
+                        reserved.UnionWith(ClassRegisters(CAbi.PreferredLirRegisterClass(_target, output.Target.Type)));
+                        break;
+                    default:
+                        site.GenericOutputs.Add((index, destination));
+                        site.GenericRegisters.Add(destination);
+                        classes?.UnionWith(ClassRegisters(destination.RegisterClass));
+                        break;
+                }
+            }
+            copyIndex++;
+        }
+
+        for (var index = 0; index < asmStatement.Inputs.Length; index++)
+        {
+            GimpleAsmOperand input = asmStatement.Inputs[index];
+            if (input.Value is not null &&
+                InlineAsmConstraints.PreferredStorage(input.Constraint, input.Value.Type) == InlineAsmOperandStorage.Register &&
+                InlineAsmConstraints.MatchingOperand(input.Constraint) is null &&
+                operandIndex < instruction.Operands.Length)
+            {
+                LirOperand value = instruction.Operands[operandIndex];
+                LirVirtualRegister? source = value.Kind == LirOperandKind.Register ? value.Register : null;
+                switch (FixedInlineAssemblyRegister(input.Constraint, input.Value.Type, out MachineRegister fixedRegister))
+                {
+                    case true:
+                        AddInlineAssemblyRegister(reserved, touched, fixedRegister);
+                        if (source is not null)
+                        {
+                            site.InputTargets[source] = fixedRegister;
+                            AddAbiPreference(source, fixedRegister);
+                        }
+                        break;
+                    case false:
+                        reserved.UnionWith(ClassRegisters(CAbi.PreferredLirRegisterClass(_target, input.Value.Type)));
+                        break;
+                    default:
+                        site.GenericInputs.Add((index, value));
+                        if (source is not null)
+                            site.GenericRegisters.Add(source);
+                        classes?.UnionWith(ClassRegisters(source?.RegisterClass ?? CAbi.PreferredLirRegisterClass(_target, input.Value.Type)));
+                        break;
                 }
             }
 
@@ -896,8 +946,33 @@ internal sealed class LinearScanRegisterAllocator
                 AddInlineAssemblyRegister(reserved, touched, register);
         }
 
-        return new InlineAssemblySite(position, reserved.ToImmutable(), touched.ToImmutable(), inputTargets.ToImmutable(), outputTargets.ToImmutable());
+        site.ReservedRegisters = reserved.ToImmutable();
+        site.TouchedRegisters = touched.ToImmutable();
+        if (classes is not null)
+            site.ConservativeRegisters = classes.ToImmutable();
+        return site;
     }
+
+    // True names a register, false a register constraint the allocator cannot read, null an operand any register of its class can take
+    private bool? FixedInlineAssemblyRegister(string constraint, QualifiedType type, out MachineRegister register)
+    {
+        register = MachineRegister.Invalid;
+        string? name = InlineAsmConstraints.ExplicitRegisterName(constraint);
+        if (name is null && _target.IsX86 && !CAbi.IsFloating(type))
+            name = InlineAsmConstraints.X86RegisterLetterName(constraint);
+        if (name is null)
+            return null;
+        return TargetRegisterInfo.TryParseExplicitRegister(_target, name, CAbi.PreferredLirRegisterClass(_target, type), out register);
+    }
+
+    private ImmutableArray<MachineRegister> ClassRegisters(LirRegisterClass registerClass)
+        => registerClass switch
+        {
+            LirRegisterClass.General or LirRegisterClass.Address => _generalRegisters,
+            LirRegisterClass.Floating => _options.FloatingRegisters,
+            LirRegisterClass.Vector => _options.VectorRegisters,
+            _ => ImmutableArray<MachineRegister>.Empty,
+        };
 
     private void ReserveInlineAssemblyTemplateRegisters(
         string text,
@@ -926,31 +1001,6 @@ internal sealed class LinearScanRegisterAllocator
                 AddInlineAssemblyRegister(reserved, touched, register);
             start = -1;
         }
-    }
-
-    private void ReserveInlineAssemblyOperand(
-        ImmutableHashSet<MachineRegister>.Builder reserved,
-        ImmutableHashSet<MachineRegister>.Builder touched,
-        string constraint,
-        QualifiedType type)
-    {
-        var explicitRegister = InlineAsmConstraints.ExplicitRegisterName(constraint);
-        var registerClass = CAbi.PreferredLirRegisterClass(_target, type);
-        if (explicitRegister is not null &&
-            TargetRegisterInfo.TryParseExplicitRegister(_target, explicitRegister, registerClass, out var fixedRegister))
-        {
-            AddInlineAssemblyRegister(reserved, touched, fixedRegister);
-            return;
-        }
-
-        var registers = registerClass switch
-        {
-            LirRegisterClass.General or LirRegisterClass.Address => _options.GeneralRegisters,
-            LirRegisterClass.Floating => _options.FloatingRegisters,
-            LirRegisterClass.Vector => _options.VectorRegisters,
-            _ => ImmutableArray<MachineRegister>.Empty,
-        };
-        reserved.UnionWith(registers);
     }
 
     private void AddInlineAssemblyRegister(
@@ -1106,6 +1156,20 @@ internal sealed class LinearScanRegisterAllocator
 
         RecordFirstOperandPreference(instruction);
         RecordSameBitsSource(instruction);
+
+        // A select is a phi resolved in place, and either of its values in the result's register spares a move
+        if (instruction.Kind == LirInstructionKind.Select && instruction.Result is not null)
+        {
+            for (var i = 2; i < instruction.Operands.Length; i++)
+            {
+                if (instruction.Operands[i].Register is LirVirtualRegister value)
+                {
+                    AddCopyPreference(instruction.Result, value);
+                    JoinPhiWeb(instruction.Result, value);
+                }
+            }
+            return;
+        }
 
         if (instruction.Kind != LirInstructionKind.ParallelCopy)
             return;
@@ -1683,22 +1747,30 @@ internal sealed class LinearScanRegisterAllocator
             var reserved = false;
             foreach (var site in inlineAssemblySites)
             {
-                var conflictsWithSite = IntervalSpansPosition(interval, site.Position) ||
-                    (target.IsRiscV && interval.IsLiveBefore(site.Position));
-                if (!conflictsWithSite || !site.ReservedRegisters.Contains(register))
+                bool named = site.ReservedRegisters.Contains(register);
+                if (!named && !site.ConservativeRegisters.Contains(register))
+                    continue;
+                bool liveBefore = interval.IsLiveBefore(site.Position);
+                bool defined = interval.HasDefinitionAtPosition(site.Position);
+                if (!liveBefore && !defined)
                     continue;
 
-                var ownFixedInput = target.IsRiscV &&
-                    interval.IsLiveBefore(site.Position) &&
-                    !interval.IsLiveAcross(site.Position) &&
-                    site.InputTargets.TryGetValue(interval.Register, out var inputTarget) &&
-                    inputTarget == register;
-                var ownFixedOutput = target.IsRiscV &&
-                    interval.HasDefinitionAtPosition(site.Position) &&
-                    site.OutputTargets.TryGetValue(interval.Register, out var outputTarget) &&
-                    outputTarget == register;
-                if (ownFixedInput || ownFixedOutput)
+                if (named)
+                {
+                    bool ownFixedInput = liveBefore &&
+                        !interval.IsLiveAcross(site.Position) &&
+                        site.InputTargets.TryGetValue(interval.Register, out MachineRegister inputTarget) &&
+                        inputTarget == register;
+                    bool ownFixedOutput = defined &&
+                        site.OutputTargets.TryGetValue(interval.Register, out MachineRegister outputTarget) &&
+                        outputTarget == register;
+                    if (ownFixedInput || ownFixedOutput)
+                        continue;
+                }
+                else if (site.GenericRegisters.Contains(interval.Register))
+                {
                     continue;
+                }
 
                 reserved = true;
                 break;
@@ -2778,9 +2850,6 @@ internal sealed class LinearScanRegisterAllocator
             var instructionPosition = position;
             position += 2;
 
-            if (instruction.Kind == LirInstructionKind.InlineAssembly)
-                maxSize = Math.Max(maxSize, ComputeInlineAssemblyTempSize(instruction));
-
             if (instruction.Kind != LirInstructionKind.ParallelCopy)
             {
                 mayBorrow = mayBorrow || _scratchNeeds is not null && MayBorrowScratch(instruction, instructionPosition, allocations, isScratchFree, int.MaxValue, stackAccessScratch);
@@ -2800,6 +2869,11 @@ internal sealed class LinearScanRegisterAllocator
             var copies = physicalCopies.ToImmutable();
             if (!HasBlockCopyParallelCopy(copies) && CanOrderParallelCopies(copies, allocations, spillOffsets))
                 continue;
+            if (!HasBlockCopyParallelCopy(copies) && TryChooseCycleRegisters(copies, instructionPosition, allocations, out ParallelCopyCycleRegisters cycleRegisters))
+            {
+                _parallelCopyCycleRegisters.Add(instruction, cycleRegisters);
+                continue;
+            }
 
             // Through the frame temporaries the copies read into one general scratch register and write out of another
             mayBorrow = mayBorrow || _scratchNeeds is not null && MayBorrowScratch(instruction, instructionPosition, allocations, isScratchFree, 2, 0);
@@ -2811,6 +2885,199 @@ internal sealed class LinearScanRegisterAllocator
         }
 
         return maxSize;
+    }
+
+    // Register moves that form a cycle go round through a register nothing holds at the copy, found after allocation
+    private bool TryChooseCycleRegisters(
+        ImmutableArray<LirParallelCopy> copies,
+        int position,
+        IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations,
+        out ParallelCopyCycleRegisters cycleRegisters)
+    {
+        cycleRegisters = default;
+        if (_hasRegisterGroups)
+            return false;
+
+        var destinations = new MachineRegister[copies.Length];
+        var sources = new MachineRegister[copies.Length];
+        var floating = new Dictionary<MachineRegister, bool>();
+        for (var i = 0; i < copies.Length; i++)
+        {
+            LirParallelCopy copy = copies[i];
+            LirRegisterClass registerClass = copy.Destination.RegisterClass;
+            if (registerClass is not (LirRegisterClass.General or LirRegisterClass.Address or LirRegisterClass.Floating) ||
+                !TryGetDestinationPhysicalRegister(copy.Destination, allocations, out destinations[i]))
+                return false;
+
+            bool isFloating = registerClass == LirRegisterClass.Floating;
+            if (copy.Source.Kind == LirOperandKind.Immediate)
+            {
+                if (isFloating || copy.Source.Immediate is null or string or float or double or decimal)
+                    return false;
+                sources[i] = MachineRegister.Invalid;
+            }
+            else if (copy.Source.Register is not LirVirtualRegister source || !TryGetOperandPhysicalRegister(copy.Source, allocations, out sources[i]) ||
+                     (source.RegisterClass == LirRegisterClass.Floating) != isFloating || _target.SizeOf(source.Type) != _target.SizeOf(copy.Destination.Type))
+            {
+                return false;
+            }
+
+            floating[destinations[i]] = isFloating;
+            if (sources[i] != MachineRegister.Invalid)
+                floating[sources[i]] = isFloating;
+        }
+
+        bool generalCycle = false;
+        bool floatingCycle = false;
+        RegisterMoveSequencer.Order(destinations, sources, blocked =>
+        {
+            if (floating[blocked])
+                floatingCycle = true;
+            else
+                generalCycle = true;
+            return MachineRegister.Invalid;
+        });
+
+        MachineRegister general = MachineRegister.Invalid;
+        MachineRegister floatingRegister = MachineRegister.Invalid;
+        if (generalCycle && !TryFindFreeRegister(_generalRegisters, floating, position, out general) ||
+            floatingCycle && !TryFindFreeRegister(_options.FloatingRegisters, floating, position, out floatingRegister))
+            return false;
+
+        cycleRegisters = new ParallelCopyCycleRegisters(general, floatingRegister);
+        return generalCycle || floatingCycle;
+    }
+
+    private bool AssignInlineAssemblyRegisters(IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations)
+    {
+        var assigned = true;
+        foreach (InlineAssemblySite site in _inlineAssemblySites)
+        {
+            if (site.Instruction.SourceStatement is not GimpleAsmStatement asmStatement)
+                continue;
+
+            Dictionary<MachineRegister, bool> taken = site.ReservedRegisters.ToDictionary(static register => register, static _ => false);
+            var inputOwners = new Dictionary<MachineRegister, LirVirtualRegister>();
+            ImmutableHashSet<MachineRegister>.Builder fresh = ImmutableHashSet.CreateBuilder<MachineRegister>();
+            var outputs = new MachineRegister[asmStatement.Outputs.Length];
+            var inputs = new MachineRegister[asmStatement.Inputs.Length];
+            Array.Fill(outputs, MachineRegister.Invalid);
+            Array.Fill(inputs, MachineRegister.Invalid);
+            var satisfied = true;
+            foreach ((int index, LirVirtualRegister destination) in site.GenericOutputs)
+            {
+                string constraint = asmStatement.Outputs[index].Constraint;
+                MachineRegister register = OwnInlineAssemblyRegister(destination, constraint, allocations);
+                if (register == MachineRegister.Invalid || taken.ContainsKey(register))
+                    register = FreeInlineAssemblyRegister(site.Position, destination.Type, destination.RegisterClass, constraint, taken, fresh);
+                outputs[index] = register;
+                satisfied &= register != MachineRegister.Invalid && taken.TryAdd(register, false);
+            }
+
+            foreach ((int index, LirOperand value) in site.GenericInputs)
+            {
+                string constraint = asmStatement.Inputs[index].Constraint;
+                LirVirtualRegister? source = value.Kind == LirOperandKind.Register ? value.Register : null;
+                MachineRegister register = source is null ? MachineRegister.Invalid : OwnInlineAssemblyRegister(source, constraint, allocations);
+                if (register != MachineRegister.Invalid && inputOwners.TryGetValue(register, out LirVirtualRegister? owner) && ReferenceEquals(owner, source))
+                {
+                    inputs[index] = register;
+                    continue;
+                }
+
+                if (register == MachineRegister.Invalid || taken.ContainsKey(register))
+                    register = FreeInlineAssemblyRegister(site.Position, value.Type, source?.RegisterClass ?? CAbi.PreferredLirRegisterClass(_target, value.Type), constraint, taken, fresh);
+                else
+                    inputOwners.Add(register, source!);
+                inputs[index] = register;
+                satisfied &= register != MachineRegister.Invalid && taken.TryAdd(register, false);
+            }
+
+            if (!satisfied)
+            {
+                if (!_conservativeAsmSites.Add(site.Instruction))
+                    throw new InvalidOperationException($"Inline assembly at LIR position {site.Position} of '{_function.Symbol?.Name}' has more operands than free registers.");
+                assigned = false;
+                continue;
+            }
+
+            site.Registers = new InlineAssemblyRegisters(outputs.ToImmutableArray(), inputs.ToImmutableArray());
+            if (fresh.Count != 0)
+                site.TouchedRegisters = site.TouchedRegisters.Union(fresh);
+        }
+
+        return assigned;
+    }
+
+    private MachineRegister OwnInlineAssemblyRegister(LirVirtualRegister register, string constraint, IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> allocations)
+        => allocations.TryGetValue(register, out VirtualRegisterAllocation? allocation) && !allocation.IsSpilled && allocation.PhysicalRegister != MachineRegister.Invalid &&
+           FitsInlineAssemblyConstraint(constraint, allocation.PhysicalRegister)
+            ? allocation.PhysicalRegister
+            : MachineRegister.Invalid;
+
+    private MachineRegister FreeInlineAssemblyRegister(
+        int position,
+        QualifiedType type,
+        LirRegisterClass registerClass,
+        string constraint,
+        Dictionary<MachineRegister, bool> taken,
+        ImmutableHashSet<MachineRegister>.Builder fresh)
+    {
+        if (TargetRegisterInfo.RegisterGroupCount(_target, type) != 1)
+            return MachineRegister.Invalid;
+        // The emitter binds its scratch registers by what the allocation leaves free, which knows nothing of these
+        ImmutableHashSet<MachineRegister>? scratch = _scratchNeeds?.Registers(ScratchClass.All);
+        ImmutableArray<MachineRegister> candidates = ClassRegisters(registerClass)
+            .Where(register => FitsInlineAssemblyConstraint(constraint, register) && (scratch is null || !scratch.Contains(register)))
+            .ToImmutableArray();
+        if (!TryFindFreeRegister(candidates, taken, position, out MachineRegister register) &&
+            !TryFindFreeRegister(candidates, taken, position, out register, unusedCalleeSaved: true))
+            return MachineRegister.Invalid;
+        fresh.Add(register);
+        return register;
+    }
+
+    // i386 'q' asks for a register with a byte form, which only eax, ecx, edx and ebx have
+    private bool FitsInlineAssemblyConstraint(string constraint, MachineRegister register)
+        => _target.Architecture != TargetArchitectureKind.I386 ||
+           !InlineAsmConstraints.OperandConstraint(constraint).Contains('q') ||
+           register is MachineRegister.X0 or MachineRegister.X1 or MachineRegister.X2 or MachineRegister.X3;
+
+    // A callee-saved register the function never uses would need saving first
+    private bool TryFindFreeRegister(ImmutableArray<MachineRegister> candidates, Dictionary<MachineRegister, bool> copied, int position, out MachineRegister register, bool unusedCalleeSaved = false)
+    {
+        foreach (MachineRegister candidate in candidates)
+        {
+            if (copied.ContainsKey(candidate) || _instructionClobbers.Clobbers(position, candidate) ||
+                _incomingRegisterReleasePositions.TryGetValue(candidate, out int release) && release >= position)
+                continue;
+
+            var used = false;
+            var held = false;
+            // A group of up to eight vector registers is listed under its first one
+            for (var first = (int)candidate; !held && first >= (_hasRegisterGroups ? (int)candidate - 7 : (int)candidate); first--)
+            {
+                if (!_registerOccupants.TryGetValue((MachineRegister)first, out List<LiveInterval>? occupants))
+                    continue;
+                foreach (LiveInterval interval in occupants)
+                {
+                    if (!interval.Occupies(candidate))
+                        continue;
+                    used = true;
+                    held = interval.IsLiveBefore(position) || interval.HasDefinitionAtPosition(position) || interval.HasDefinitionAtPosition(position + 1);
+                    if (held)
+                        break;
+                }
+            }
+
+            if (held || !used && !unusedCalleeSaved && TargetRegisterInfo.IsCalleeSaved(_target, candidate))
+                continue;
+            register = candidate;
+            return true;
+        }
+
+        register = MachineRegister.Invalid;
+        return false;
     }
 
     // The emitter borrows only past the spares and every free home of a class, a spilled value needing at most one
@@ -2884,43 +3151,6 @@ internal sealed class LinearScanRegisterAllocator
             return free;
         }
     }
-
-    private int ComputeInlineAssemblyTempSize(LirInstruction instruction)
-    {
-        if (instruction.SourceStatement is not GimpleAsmStatement asmStatement)
-            return 0;
-
-        var registerOperandCount = 0;
-        var maxSize = 0;
-        foreach (var output in asmStatement.Outputs)
-        {
-            if (output.Target is null ||
-                InlineAsmConstraints.PreferredStorage(output.Constraint, output.Target.Type) != InlineAsmOperandStorage.Register)
-            {
-                continue;
-            }
-
-            registerOperandCount++;
-            maxSize = Math.Max(maxSize, InlineAssemblyTempSlotSize(output.Target.Type));
-        }
-
-        foreach (var input in asmStatement.Inputs)
-        {
-            if (input.Value is null ||
-                InlineAsmConstraints.PreferredStorage(input.Constraint, input.Value.Type) != InlineAsmOperandStorage.Register)
-            {
-                continue;
-            }
-
-            registerOperandCount++;
-            maxSize = Math.Max(maxSize, InlineAssemblyTempSlotSize(input.Value.Type));
-        }
-
-        return registerOperandCount > 1 ? maxSize : 0;
-    }
-
-    private int InlineAssemblyTempSlotSize(QualifiedType type)
-        => AlignUp(Math.Max(_options.SpillSlotSize, SizeOfStorage(type)), _options.SpillSlotAlignment);
 
     private static bool RequiresPhysicalParallelCopy(
         LirParallelCopy copy,
@@ -3135,26 +3365,24 @@ internal sealed class LinearScanRegisterAllocator
         return checked((value + mask) & ~mask);
     }
 
-    private readonly struct InlineAssemblySite
+    private sealed class InlineAssemblySite
     {
+        public LirInstruction Instruction { get; }
         public int Position { get; }
-        public ImmutableHashSet<MachineRegister> ReservedRegisters { get; }
-        public ImmutableHashSet<MachineRegister> TouchedRegisters { get; }
-        public ImmutableDictionary<LirVirtualRegister, MachineRegister> InputTargets { get; }
-        public ImmutableDictionary<LirVirtualRegister, MachineRegister> OutputTargets { get; }
+        public ImmutableHashSet<MachineRegister> ReservedRegisters { get; set; } = ImmutableHashSet<MachineRegister>.Empty;
+        public ImmutableHashSet<MachineRegister> ConservativeRegisters { get; set; } = ImmutableHashSet<MachineRegister>.Empty;
+        public ImmutableHashSet<MachineRegister> TouchedRegisters { get; set; } = ImmutableHashSet<MachineRegister>.Empty;
+        public Dictionary<LirVirtualRegister, MachineRegister> InputTargets { get; } = new();
+        public Dictionary<LirVirtualRegister, MachineRegister> OutputTargets { get; } = new();
+        public List<(int Index, LirVirtualRegister Destination)> GenericOutputs { get; } = new();
+        public List<(int Index, LirOperand Value)> GenericInputs { get; } = new();
+        public HashSet<LirVirtualRegister> GenericRegisters { get; } = new();
+        public InlineAssemblyRegisters Registers { get; set; } = new(ImmutableArray<MachineRegister>.Empty, ImmutableArray<MachineRegister>.Empty);
 
-        public InlineAssemblySite(
-            int position,
-            ImmutableHashSet<MachineRegister> reservedRegisters,
-            ImmutableHashSet<MachineRegister> touchedRegisters,
-            ImmutableDictionary<LirVirtualRegister, MachineRegister> inputTargets,
-            ImmutableDictionary<LirVirtualRegister, MachineRegister> outputTargets)
+        public InlineAssemblySite(LirInstruction instruction, int position)
         {
+            Instruction = instruction;
             Position = position;
-            ReservedRegisters = reservedRegisters ?? ImmutableHashSet<MachineRegister>.Empty;
-            TouchedRegisters = touchedRegisters ?? ImmutableHashSet<MachineRegister>.Empty;
-            InputTargets = inputTargets ?? ImmutableDictionary<LirVirtualRegister, MachineRegister>.Empty;
-            OutputTargets = outputTargets ?? ImmutableDictionary<LirVirtualRegister, MachineRegister>.Empty;
         }
     }
 
@@ -3518,12 +3746,18 @@ internal static class ParallelCopySequencer
 
 }
 
+internal readonly record struct ParallelCopyCycleRegisters(MachineRegister General, MachineRegister Floating);
+
+internal readonly record struct InlineAssemblyRegisters(ImmutableArray<MachineRegister> Outputs, ImmutableArray<MachineRegister> Inputs);
+
 internal sealed class AllocationResult
 {
     private readonly IReadOnlyDictionary<LirVirtualRegister, VirtualRegisterAllocation> _allocations;
     private readonly IReadOnlyDictionary<int, ImmutableArray<CallPreservation>> _callPreservations;
     private readonly IReadOnlyDictionary<int, ScratchClass> _scratchKills;
     private readonly Func<MachineRegister, int, bool>? _isScratchFree;
+    private readonly IReadOnlyDictionary<LirInstruction, ParallelCopyCycleRegisters> _parallelCopyCycleRegisters;
+    private readonly IReadOnlyDictionary<LirInstruction, InlineAssemblyRegisters>? _inlineAssemblyRegisters;
 
     public LirFunction Function { get; }
     public StackFrameMap Frame { get; }
@@ -3535,9 +3769,13 @@ internal sealed class AllocationResult
         StackFrameMap frame,
         IReadOnlyDictionary<int, ImmutableArray<CallPreservation>>? callPreservations = null,
         IReadOnlyDictionary<int, ScratchClass>? scratchKills = null,
-        Func<MachineRegister, int, bool>? isScratchFree = null)
+        Func<MachineRegister, int, bool>? isScratchFree = null,
+        IReadOnlyDictionary<LirInstruction, ParallelCopyCycleRegisters>? parallelCopyCycleRegisters = null,
+        IReadOnlyDictionary<LirInstruction, InlineAssemblyRegisters>? inlineAssemblyRegisters = null)
     {
         _isScratchFree = isScratchFree;
+        _parallelCopyCycleRegisters = parallelCopyCycleRegisters ?? new Dictionary<LirInstruction, ParallelCopyCycleRegisters>();
+        _inlineAssemblyRegisters = inlineAssemblyRegisters;
         Function = function ?? throw new ArgumentNullException(nameof(function));
         _allocations = allocations ?? throw new ArgumentNullException(nameof(allocations));
         _callPreservations = callPreservations ?? ImmutableDictionary<int, ImmutableArray<CallPreservation>>.Empty;
@@ -3552,6 +3790,11 @@ internal sealed class AllocationResult
 
     public ScratchClass GetScratchKills(int position)
         => _scratchKills.TryGetValue(position, out var kills) ? kills : ScratchClass.None;
+
+    public InlineAssemblyRegisters GetInlineAssemblyRegisters(LirInstruction instruction)
+        => _inlineAssemblyRegisters is not null && _inlineAssemblyRegisters.TryGetValue(instruction, out InlineAssemblyRegisters registers)
+            ? registers
+            : throw new KeyNotFoundException("No inline assembly operand registers for the instruction.");
 
     public bool IsScratchFree(MachineRegister register, int position)
         => _isScratchFree?.Invoke(register, position) ?? false;
@@ -3673,6 +3916,37 @@ internal sealed class AllocationResult
         }
 
         target = jumpTarget;
+        return true;
+    }
+
+    // Each step names the copy it moves, or for a cycle break the copy reading the saved register, and an invalid source is the copy's immediate
+    public bool TrySequenceCyclicParallelCopy(LirInstruction instruction, IReadOnlyList<LirParallelCopy> copies, out ImmutableArray<(int Copy, MachineRegister From, MachineRegister To)> steps)
+    {
+        steps = ImmutableArray<(int Copy, MachineRegister From, MachineRegister To)>.Empty;
+        if (!_parallelCopyCycleRegisters.TryGetValue(instruction, out ParallelCopyCycleRegisters cycleRegisters))
+            return false;
+
+        var destinations = new MachineRegister[copies.Count];
+        var sources = new MachineRegister[copies.Count];
+        var floating = new Dictionary<MachineRegister, bool>();
+        for (var i = 0; i < copies.Count; i++)
+        {
+            if (!TryGetPhysicalRegister(copies[i].Destination, out destinations[i]))
+                throw new InvalidOperationException("A cyclic parallel copy writes a register the allocator did not assign.");
+            sources[i] = copies[i].Source.Kind == LirOperandKind.Immediate ? MachineRegister.Invalid
+                : TryGetPhysicalRegister(copies[i].Source, out MachineRegister source) ? source
+                : throw new InvalidOperationException("A cyclic parallel copy reads a value outside a register.");
+            floating[destinations[i]] = copies[i].Destination.RegisterClass == LirRegisterClass.Floating;
+        }
+
+        var builder = ImmutableArray.CreateBuilder<(int Copy, MachineRegister From, MachineRegister To)>();
+        foreach ((int move, MachineRegister from, MachineRegister to) in RegisterMoveSequencer.Order(destinations, sources,
+            blocked => floating[blocked] ? cycleRegisters.Floating : cycleRegisters.General))
+        {
+            builder.Add((move >= 0 ? move : Array.IndexOf(sources, from), from, to));
+        }
+
+        steps = builder.ToImmutable();
         return true;
     }
 

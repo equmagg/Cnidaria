@@ -2119,7 +2119,7 @@ int RhpGetCurrentProcessorNumber(void)
         "add rsp, 32"
         : "={rax}"(result)
         :
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return (int)(u32)result;
 #elif defined(_WIN32) && defined(__i386__)
     usize result;
@@ -2146,7 +2146,7 @@ static usize rh_current_thread_id(void)
         "add rsp, 32"
         : "={rax}"(result)
         :
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 #elif defined(_WIN32) && defined(__i386__)
     usize result;

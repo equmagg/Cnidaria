@@ -241,10 +241,15 @@ public sealed class X86CodeGenerator
                         : needs | AddressNeeds(instruction.Address) | StoredValueNeeds(operands[0]);
                 case LirInstructionKind.Branch:
                     return needs | BranchNeeds(instruction);
+                case LirInstructionKind.Select:
+                    return result is null || operands.Length != 4 ? ScratchClass.All : needs | ComparisonNeeds(operands[0], operands[1]) | ScratchClass.General;
                 case LirInstructionKind.Return:
                     return needs | ReturnNeeds(instruction);
                 case LirInstructionKind.Switch:
                     return needs | ScratchClass.General;
+                case LirInstructionKind.InlineAssembly when instruction.SourceStatement is GimpleAsmStatement asmStatement &&
+                                                            !InlineAsmConstraints.FormatsThroughScratch(asmStatement):
+                    return needs;
                 default:
                     return ScratchClass.All;
             }
@@ -529,8 +534,6 @@ public sealed class X86CodeGenerator
 
         private ScratchClass BranchNeeds(LirInstruction instruction)
         {
-            if (LirSelect.MayBeDiamond(instruction))
-                return ScratchClass.General;
             var operands = instruction.Operands;
             if (operands.Length == 2 && instruction.Operator is "==" or "!=" or "<" or "<=" or ">" or ">=")
             {
@@ -901,6 +904,8 @@ public sealed class X86CodeGenerator
             case X86InstrKind.Movsxd:
             case X86InstrKind.Movdqu:
             case X86InstrKind.Lea:
+            case X86InstrKind.Cmovcc:
+            case X86InstrKind.Setcc:
                 if (destination.Kind == X86OperandKind.Register && destination.Register == _flagsRegister)
                     _flagsRegister = X86Register.Invalid;
                 return;
@@ -1706,6 +1711,9 @@ public sealed class X86CodeGenerator
         private readonly Dictionary<LirInstruction, (LirInstruction Consumer, bool ZeroFlagOnly)> _foldableMasks = new();
         private LirInstruction? _maskConsumer;
         private int _maskFlagsWrites;
+        private LirInstruction? _flagsSelect;
+        private int _flagsSelectWrites;
+        private X86Condition _flagsSelectCondition;
         private readonly Dictionary<LirInstruction, LirInstruction> _readModifyWrites = new();
         private readonly HashSet<LirInstruction> _foldedStores = new();
         private readonly Dictionary<LirInstruction, (bool Signed, int Width)> _loadExtensions = new();
@@ -1722,9 +1730,6 @@ public sealed class X86CodeGenerator
         private bool _placeholdersIssued;
         private LirBlock? _fallthroughBlock;
         private LirBlock? _currentBlock;
-        private int _currentBlockIndex;
-        private readonly Dictionary<LirBlock, LirSelectDiamond> _selectDiamonds = new();
-        private readonly HashSet<LirBlock> _foldedSelectArms = new();
         private bool _useCallPreservationSources;
 
         public FunctionEmissionContext(
@@ -1808,7 +1813,6 @@ public sealed class X86CodeGenerator
         public void EmitBlocks()
         {
             FindFoldableLoads();
-            FindSelectDiamonds();
             FindDivRemPairs();
             _currentInstructionPosition = 0;
             for (var blockIndex = 0; blockIndex < _function.Blocks.Length; blockIndex++)
@@ -1822,13 +1826,8 @@ public sealed class X86CodeGenerator
 
                 _fallthroughBlock = NextEmittedBlock(blockIndex);
                 _currentBlock = block;
-                _currentBlockIndex = blockIndex;
                 DefineBlockLabel(block);
-                if (_foldedSelectArms.Contains(block))
-                {
-                    _currentInstructionPosition += block.Instructions.Length * 2;
-                    continue;
-                }
+                _flagsSelect = null;
 
                 foreach (var instruction in block.Instructions)
                 {
@@ -1858,74 +1857,63 @@ public sealed class X86CodeGenerator
             _fallthroughBlock = null;
         }
 
-        // A conditional expression reaches the backend as a diamond; cmov collapses it without a branch
-        private void FindSelectDiamonds()
+        private void EmitSelect(LirInstruction instruction)
         {
-            foreach (var pair in LirSelect.FindDiamonds(_function, _owner._target))
+            LirVirtualRegister result = instruction.Result ?? throw Unsupported(instruction, "Select has no result.");
+            LirOperand whenTrue = instruction.Operands[2];
+            LirOperand whenFalse = instruction.Operands[3];
+            int size = Math.Max(4, RegisterSize(result.Type));
+            X86Register destination = GetWritableRegister(result, Scratch0);
+
+            // The compare comes first and only mov and cmov follow it, so the flags survive to the move and to the next select of the join
+            X86Condition condition;
+            if (_flagsSelect is not null && _owner.FlagsWrites == _flagsSelectWrites && IsSameSelectTest(_flagsSelect, instruction))
             {
-                if (!IsSelectableCondition(pair.Value.Branch))
-                    continue;
-                _selectDiamonds.Add(pair.Key, pair.Value);
-                _foldedSelectArms.Add(pair.Value.TrueArm);
-                _foldedSelectArms.Add(pair.Value.FalseArm);
+                condition = _flagsSelectCondition;
             }
-        }
-
-        private bool IsSelectableCondition(LirInstruction branch)
-        {
-            if (branch.Operands.Length == 2 && IsComparisonOperator(branch.Operator))
+            else
             {
-                return !IsFloatType(branch.Operands[0].Type) &&
-                    !IsFloatType(branch.Operands[1].Type) &&
-                    !IsX86WideInteger(branch.Operands[0].Type);
+                condition = EmitSelectCondition(instruction);
+                _flagsSelect = instruction;
+                _flagsSelectWrites = _owner.FlagsWrites;
+                _flagsSelectCondition = condition;
             }
-
-            return branch.Operands.Length == 1 &&
-                !IsFloatType(branch.Operands[0].Type) &&
-                !IsX86WideInteger(branch.Operands[0].Type);
-        }
-
-        private bool TryEmitSelect(LirInstruction instruction)
-        {
-            if (!_selectDiamonds.TryGetValue(_currentBlock!, out var diamond) ||
-                !ReferenceEquals(diamond.Branch, instruction))
-            {
-                return false;
-            }
-
-            var size = Math.Max(4, RegisterSize(diamond.Destination.Type));
-            var destination = GetWritableRegister(diamond.Destination, Scratch0);
-
-            // The compare comes first and only mov and cmov follow it, so the flags survive to the move
-            var condition = EmitSelectCondition(instruction);
-            if (IsTruthSelect(diamond, out bool inverted))
+            if (IsTruthSelect(whenTrue, whenFalse, out bool inverted))
             {
                 Emit(X86Instruction.Setcc(inverted ? InvertCondition(condition) : condition, Reg(destination, 1)));
                 Emit(X86Instruction.Binary(X86InstrKind.Movzx, Reg(destination, 4), Reg(destination, 1)));
             }
-            else if (OccupiesRegister(diamond.TrueValue, destination))
+            else if (OccupiesRegister(whenTrue, destination))
             {
                 Emit(X86Instruction.Cmovcc(InvertCondition(condition), Reg(destination, size),
-                    Reg(LoadSelectValue(diamond.FalseValue, Scratch1, size, instruction), size)));
+                    Reg(LoadSelectValue(whenFalse, Scratch1, size, instruction), size)));
             }
             else
             {
-                if (!OccupiesRegister(diamond.FalseValue, destination))
-                    MoveSelectValue(destination, diamond.FalseValue, size, instruction);
+                if (!OccupiesRegister(whenFalse, destination))
+                    MoveSelectValue(destination, whenFalse, size, instruction);
                 Emit(X86Instruction.Cmovcc(condition, Reg(destination, size),
-                    Reg(LoadSelectValue(diamond.TrueValue, Scratch1, size, instruction), size)));
+                    Reg(LoadSelectValue(whenTrue, Scratch1, size, instruction), size)));
             }
 
-            StoreWritableRegisterIfSpilled(diamond.Destination, destination);
-            if (!FallsThroughToJoin(diamond.Join))
-                EmitJump(diamond.Join);
-            return true;
+            StoreWritableRegisterIfSpilled(result, destination);
         }
 
-        private static bool IsTruthSelect(LirSelectDiamond diamond, out bool inverted)
+        private static bool IsSameSelectTest(LirInstruction first, LirInstruction second)
+            => first.Operator == second.Operator && IsSameSelectOperand(first.Operands[0], second.Operands[0]) &&
+               IsSameSelectOperand(first.Operands[1], second.Operands[1]);
+
+        private static bool IsSameSelectOperand(LirOperand first, LirOperand second)
+            => first.Kind == LirOperandKind.Register
+                ? second.Kind == LirOperandKind.Register && ReferenceEquals(first.Register, second.Register)
+                : first.Kind == LirOperandKind.Immediate && second.Kind == LirOperandKind.Immediate &&
+                  first.Immediate is not (string or float or double or decimal) && second.Immediate is not (string or float or double or decimal) &&
+                  ConvertIntegerConstant(first.Immediate) == ConvertIntegerConstant(second.Immediate);
+
+        private static bool IsTruthSelect(LirOperand whenTrue, LirOperand whenFalse, out bool inverted)
         {
-            inverted = IsIntegerImmediate(diamond.TrueValue, 0) && IsIntegerImmediate(diamond.FalseValue, 1);
-            return inverted || IsIntegerImmediate(diamond.TrueValue, 1) && IsIntegerImmediate(diamond.FalseValue, 0);
+            inverted = IsIntegerImmediate(whenTrue, 0) && IsIntegerImmediate(whenFalse, 1);
+            return inverted || IsIntegerImmediate(whenTrue, 1) && IsIntegerImmediate(whenFalse, 0);
         }
 
         private static bool IsIntegerImmediate(LirOperand operand, long value)
@@ -1955,22 +1943,6 @@ public sealed class X86CodeGenerator
             return LoadOperand(operand, scratch, instruction, size);
         }
 
-        // The folded arms emit nothing, so the join is still reached by falling off the end of this block
-        private bool FallsThroughToJoin(LirBlock join)
-        {
-            join = JumpTarget(join);
-            for (var index = _currentBlockIndex + 1; index < _function.Blocks.Length; index++)
-            {
-                var block = _function.Blocks[index];
-                if (ReferenceEquals(block, join))
-                    return true;
-                if (!_foldedSelectArms.Contains(block) && !_jumpOnlyBlocks.ContainsKey(block))
-                    return false;
-            }
-
-            return false;
-        }
-
         private LirBlock? NextEmittedBlock(int blockIndex)
         {
             for (var index = blockIndex + 1; index < _function.Blocks.Length; index++)
@@ -1986,20 +1958,14 @@ public sealed class X86CodeGenerator
             => _jumpOnlyBlocks.TryGetValue(block, out var target) ? target : block;
 
         // Leaves the flags the conditional move reads and reports the condition that selects the true value
-        private X86Condition EmitSelectCondition(LirInstruction branch)
+        private X86Condition EmitSelectCondition(LirInstruction select)
         {
-            if (branch.Operands.Length == 2 && IsComparisonOperator(branch.Operator))
-            {
-                var left = branch.Operands[0];
-                var right = branch.Operands[1];
-                var size = Math.Max(RegisterSize(left.Type), RegisterSize(right.Type));
-                X86Condition condition = SelectIntegerComparisonCondition(branch.Operator, IsSignedIntegerType(left.Type));
-                EmitIntegerComparison(left, right, branch, size, condition);
-                return condition;
-            }
-
-            EmitZeroComparison(branch.Operands[0], branch, RegisterSize(branch.Operands[0].Type), X86Condition.Ne);
-            return X86Condition.Ne;
+            LirOperand left = select.Operands[0];
+            LirOperand right = select.Operands[1];
+            int size = Math.Max(RegisterSize(left.Type), RegisterSize(right.Type));
+            X86Condition condition = SelectIntegerComparisonCondition(select.Operator, IsSignedIntegerType(left.Type) || IsSignedIntegerType(right.Type));
+            EmitIntegerComparison(left, right, select, size, condition);
+            return condition;
         }
 
         private void EmitIntegerComparison(LirOperand left, LirOperand right, LirInstruction instruction, int size, X86Condition condition)
@@ -2076,7 +2042,9 @@ public sealed class X86CodeGenerator
             {
                 foreach (var instruction in block.Instructions)
                 {
-                    if (instruction.Kind is LirInstructionKind.Call or LirInstructionKind.InlineAssembly)
+                    if (instruction.Kind == LirInstructionKind.Call ||
+                        instruction.Kind == LirInstructionKind.InlineAssembly &&
+                        (instruction.SourceStatement is not GimpleAsmStatement asmStatement || InlineAsmConstraints.MayCall(asmStatement, _owner._target)))
                         return false;
                 }
             }
@@ -2265,6 +2233,9 @@ public sealed class X86CodeGenerator
                 case LirInstructionKind.Branch:
                     EmitBranch(instruction);
                     break;
+                case LirInstructionKind.Select:
+                    EmitSelect(instruction);
+                    break;
                 case LirInstructionKind.Switch:
                     EmitSwitch(instruction);
                     break;
@@ -2296,11 +2267,13 @@ public sealed class X86CodeGenerator
             var namedLabels = new Dictionary<string, int>(StringComparer.Ordinal);
             var outputBindings = new List<X86AsmRegisterBinding>();
             var inputBindings = new List<X86AsmRegisterBinding>();
+            InlineAssemblyRegisters assigned = _allocation.GetInlineAssemblyRegisters(instruction);
             var operandIndex = 0;
             var copyIndex = 0;
 
-            foreach (var output in asmStatement.Outputs)
+            for (var index = 0; index < asmStatement.Outputs.Length; index++)
             {
+                GimpleAsmOperand output = asmStatement.Outputs[index];
                 InlineAsmFormattedOperand formatted;
                 var storage = output.Target is null
                     ? InlineAsmOperandStorage.Register
@@ -2317,7 +2290,7 @@ public sealed class X86CodeGenerator
                     if (copyIndex >= instruction.ParallelCopies.Length)
                         throw Unsupported(instruction, "Inline assembly output register is missing from LIR.");
                     var destination = instruction.ParallelCopies[copyIndex++].Destination;
-                    var binding = new X86AsmRegisterBinding(output, destination, null);
+                    var binding = new X86AsmRegisterBinding(output, destination, null, AssignedX86AsmRegister(assigned.Outputs, index));
                     outputBindings.Add(binding);
                     formatted = new InlineAsmFormattedOperand(
                         output.Name,
@@ -2327,8 +2300,9 @@ public sealed class X86CodeGenerator
                 AddAsmOperand(operands, namedOperands, formatted);
             }
 
-            foreach (var input in asmStatement.Inputs)
+            for (var index = 0; index < asmStatement.Inputs.Length; index++)
             {
+                GimpleAsmOperand input = asmStatement.Inputs[index];
                 if (operandIndex >= instruction.Operands.Length)
                     throw Unsupported(instruction, "Inline assembly input operand is missing from LIR.");
 
@@ -2345,7 +2319,7 @@ public sealed class X86CodeGenerator
                 }
                 else
                 {
-                    var binding = new X86AsmRegisterBinding(input, null, value);
+                    var binding = new X86AsmRegisterBinding(input, null, value, AssignedX86AsmRegister(assigned.Inputs, index));
                     inputBindings.Add(binding);
                     formatted = new InlineAsmFormattedOperand(
                         input.Name,
@@ -2370,7 +2344,7 @@ public sealed class X86CodeGenerator
             var clobbers = GetX86AsmClobbers(asmStatement, instruction);
             ResolveX86AsmMatchingOperands(outputBindings, inputBindings, instruction);
             AllocateX86AsmRegisters(outputBindings, inputBindings, clobbers, instruction);
-            EmitX86AsmInputMoves(outputBindings, inputBindings, clobbers, instruction);
+            EmitX86AsmInputMoves(outputBindings, inputBindings, instruction);
 
             var expanded = InlineAsmTemplateExpander.Expand(
                 asmStatement.Text,
@@ -2381,7 +2355,7 @@ public sealed class X86CodeGenerator
                 _owner.CreateLocalLabel(_functionLabel + "_asm_id"));
             EmitInlineAssemblyText(instruction, expanded);
 
-            EmitX86AsmOutputMoves(outputBindings, clobbers, instruction);
+            EmitX86AsmOutputMoves(outputBindings);
 
             if (asmStatement.IsGoto && instruction.Target is not null)
                 EmitJump(instruction.Target);
@@ -2470,15 +2444,8 @@ public sealed class X86CodeGenerator
 
             foreach (var output in outputs)
             {
-                if (output.Register != X86Register.Invalid)
-                    continue;
-
-                var candidates = GetX86AsmRegisterCandidates(output.Operand.Constraint, output.Type, instruction);
-                var preferred = TryGetAllocatedX86Register(output.Output!, out var allocated) ? allocated : X86Register.Invalid;
-                var selected = SelectX86AsmRegister(candidates, preferred, clobbers, usedOutputs, null);
-                if (selected == X86Register.Invalid)
-                    throw Unsupported(instruction, $"Cannot satisfy inline assembly output constraint '{output.Operand.Constraint}'.");
-                AssignX86AsmOutputRegister(output, selected, usedOutputs, clobbers, instruction);
+                if (output.Register == X86Register.Invalid)
+                    AssignX86AsmOutputRegister(output, RequireAssignedX86AsmRegister(output, instruction), usedOutputs, clobbers, instruction);
             }
 
             var earlyClobbers = new HashSet<X86Register>();
@@ -2508,18 +2475,23 @@ public sealed class X86CodeGenerator
 
             foreach (var input in inputs)
             {
-                if (input.Register != X86Register.Invalid)
-                    continue;
-
-                var candidates = GetX86AsmRegisterCandidates(input.Operand.Constraint, input.Type, instruction);
-                var preferred = input.Input is not null && TryGetAllocatedX86Register(input.Input, out var allocated)
-                    ? allocated
-                    : X86Register.Invalid;
-                var selected = SelectX86AsmRegister(candidates, preferred, clobbers, earlyClobbers, usedInputs.Keys);
-                if (selected == X86Register.Invalid)
-                    throw Unsupported(instruction, $"Cannot satisfy inline assembly input constraint '{input.Operand.Constraint}'.");
-                AssignX86AsmInputRegister(input, selected, usedInputs, earlyClobbers, instruction);
+                if (input.Register == X86Register.Invalid)
+                    AssignX86AsmInputRegister(input, RequireAssignedX86AsmRegister(input, instruction), usedInputs, earlyClobbers, instruction);
             }
+        }
+
+        private X86Register AssignedX86AsmRegister(ImmutableArray<MachineRegister> registers, int index)
+            => index < registers.Length && registers[index] != MachineRegister.Invalid
+                ? ToX86Register(registers[index], _owner._machineTarget)
+                : X86Register.Invalid;
+
+        private X86Register RequireAssignedX86AsmRegister(X86AsmRegisterBinding binding, LirInstruction instruction)
+        {
+            if (InlineAsmConstraints.HasExplicitRegister(binding.Operand.Constraint))
+                throw Unsupported(instruction, $"Invalid or unsupported x86 explicit register constraint '{binding.Operand.Constraint}'.");
+            if (binding.Assigned == X86Register.Invalid)
+                throw Unsupported(instruction, $"Cannot satisfy inline assembly constraint '{binding.Operand.Constraint}'.");
+            return binding.Assigned;
         }
 
         private void AssignX86AsmOutputRegister(
@@ -2584,54 +2556,6 @@ public sealed class X86CodeGenerator
             return ReferenceEquals(leftValue, rightValue);
         }
 
-        private ImmutableArray<X86Register> GetX86AsmRegisterCandidates(string constraint, QualifiedType type, LirInstruction instruction)
-        {
-            var fixedRegister = TryGetX86ConstraintRegister(constraint, type);
-            if (fixedRegister.HasValue)
-                return ImmutableArray.Create(fixedRegister.Value);
-            if (InlineAsmConstraints.HasExplicitRegister(constraint))
-                throw Unsupported(instruction, $"Invalid or unsupported x86 explicit register constraint '{constraint}'.");
-
-            var source = IsFloatType(type)
-                ? _owner._allocationOptions.VectorRegisters
-                : _owner._allocationOptions.GeneralRegisters;
-            var builder = ImmutableArray.CreateBuilder<X86Register>();
-            foreach (var machineRegister in source)
-            {
-                var register = ToX86Register(machineRegister, _owner._machineTarget);
-                if (!IsUsableX86ExplicitRegister(register))
-                    continue;
-                if (_owner._machineTarget.Is32Bit && InlineAsmConstraints.OperandConstraint(constraint).IndexOf('q') >= 0 && X86Registers.Index(register) >= 4)
-                    continue;
-                if (!builder.Contains(register))
-                    builder.Add(register);
-            }
-            return builder.ToImmutable();
-        }
-
-        private static X86Register SelectX86AsmRegister(
-            ImmutableArray<X86Register> candidates,
-            X86Register preferred,
-            HashSet<X86Register> excluded0,
-            HashSet<X86Register> excluded1,
-            IEnumerable<X86Register>? excluded2)
-        {
-            var excluded = excluded2 is null ? null : new HashSet<X86Register>(excluded2);
-            if (preferred != X86Register.Invalid && candidates.Contains(preferred) &&
-                !excluded0.Contains(preferred) && !excluded1.Contains(preferred) && (excluded is null || !excluded.Contains(preferred)))
-            {
-                return preferred;
-            }
-
-            foreach (var candidate in candidates)
-            {
-                if (excluded0.Contains(candidate) || excluded1.Contains(candidate) || (excluded is not null && excluded.Contains(candidate)))
-                    continue;
-                return candidate;
-            }
-            return X86Register.Invalid;
-        }
-
         private bool TryGetAllocatedX86Register(LirVirtualRegister register, out X86Register physicalRegister)
         {
             var allocation = _allocation[register];
@@ -2655,7 +2579,6 @@ public sealed class X86CodeGenerator
         private void EmitX86AsmInputMoves(
             IReadOnlyList<X86AsmRegisterBinding> outputs,
             IReadOnlyList<X86AsmRegisterBinding> inputs,
-            HashSet<X86Register> clobbers,
             LirInstruction instruction)
         {
             var moves = new List<X86AsmInputMove>();
@@ -2669,7 +2592,7 @@ public sealed class X86CodeGenerator
                 if (input.Input is not null)
                     AddX86AsmInputMove(moves, input.Register, input.Input, input.Type, instruction);
             }
-            EmitX86AsmParallelInputMoves(moves, clobbers, instruction);
+            EmitX86AsmParallelInputMoves(moves, instruction);
         }
 
         private void AddX86AsmInputMove(
@@ -2697,7 +2620,6 @@ public sealed class X86CodeGenerator
 
         private void EmitX86AsmParallelInputMoves(
             List<X86AsmInputMove> moves,
-            HashSet<X86Register> clobbers,
             LirInstruction instruction)
         {
             foreach (var move in moves)
@@ -2738,55 +2660,17 @@ public sealed class X86CodeGenerator
                     emitted = true;
                     break;
                 }
-                if (emitted)
-                    continue;
-
-                var cycleMove = moves.FirstOrDefault(static move => move.HasRegisterSource);
-                if (cycleMove is null)
-                    throw Unsupported(instruction, "Cannot resolve inline assembly input operands.");
-                BreakX86AsmInputCycle(moves, cycleMove.SourceRegister, cycleMove.Type, clobbers, instruction);
+                if (!emitted)
+                    throw InlineAssemblyMoveCycle();
             }
         }
 
-        private void BreakX86AsmInputCycle(
-            List<X86AsmInputMove> moves,
-            X86Register source,
-            QualifiedType type,
-            HashSet<X86Register> clobbers,
-            LirInstruction instruction)
-        {
-            var scratch = FindX86AsmCycleScratch(moves.Select(static move => move.Destination), moves.Where(static move => move.HasRegisterSource).Select(static move => move.SourceRegister), IsFloatType(type), clobbers);
-            if (scratch != X86Register.Invalid)
-            {
-                MoveX86AsmRegister(scratch, source, type);
-                foreach (var move in moves)
-                {
-                    if (move.HasRegisterSource && move.SourceRegister == source)
-                        move.SourceRegister = scratch;
-                }
-                return;
-            }
-
-            var size = X86AsmTempSlotSize(type);
-            RequireX86AsmTempSize(size, instruction);
-            StoreX86AsmRegisterToTemp(source, type);
-            foreach (var move in moves)
-            {
-                if (move.HasRegisterSource && move.SourceRegister == source)
-                {
-                    move.SourceRegister = X86Register.Invalid;
-                    move.UsesTemp = true;
-                }
-            }
-        }
+        // The allocator keeps a named register from every other value at the site, and a register it hands out holds nothing there
+        private Exception InlineAssemblyMoveCycle()
+            => new InvalidOperationException($"Inline assembly operand moves in '{_functionLabel}' form a cycle at LIR position {_currentInstructionPosition}.");
 
         private void EmitX86AsmInputMove(X86AsmInputMove move, LirInstruction instruction)
         {
-            if (move.UsesTemp)
-            {
-                LoadX86AsmTempInto(move.Destination, move.Type);
-                return;
-            }
             if (move.HasRegisterSource)
             {
                 MoveX86AsmRegister(move.Destination, move.SourceRegister, move.Type);
@@ -2797,10 +2681,7 @@ public sealed class X86CodeGenerator
             LoadX86AsmOperandInto(move.SourceOperand, move.Destination, instruction);
         }
 
-        private void EmitX86AsmOutputMoves(
-            IReadOnlyList<X86AsmRegisterBinding> outputs,
-            HashSet<X86Register> clobbers,
-            LirInstruction instruction)
+        private void EmitX86AsmOutputMoves(IReadOnlyList<X86AsmRegisterBinding> outputs)
         {
             var moves = new List<X86AsmRegisterMove>();
             foreach (var output in outputs)
@@ -2821,13 +2702,10 @@ public sealed class X86CodeGenerator
                 if (destination != output.Register)
                     moves.Add(new X86AsmRegisterMove(destination, output.Register, output.Type));
             }
-            EmitX86AsmParallelRegisterMoves(moves, clobbers, instruction);
+            EmitX86AsmParallelRegisterMoves(moves);
         }
 
-        private void EmitX86AsmParallelRegisterMoves(
-            List<X86AsmRegisterMove> moves,
-            HashSet<X86Register> clobbers,
-            LirInstruction instruction)
+        private void EmitX86AsmParallelRegisterMoves(List<X86AsmRegisterMove> moves)
         {
             while (moves.Count != 0)
             {
@@ -2842,57 +2720,9 @@ public sealed class X86CodeGenerator
                     emitted = true;
                     break;
                 }
-                if (emitted)
-                    continue;
-
-                var source = moves[0].Source;
-                var type = moves[0].Type;
-                var scratch = FindX86AsmCycleScratch(moves.Select(static move => move.Destination), moves.Select(static move => move.Source), IsFloatType(type), clobbers);
-                if (scratch != X86Register.Invalid)
-                {
-                    MoveX86AsmRegister(scratch, source, type);
-                    for (var i = 0; i < moves.Count; i++)
-                    {
-                        if (moves[i].Source == source)
-                            moves[i] = moves[i].WithSource(scratch);
-                    }
-                    continue;
-                }
-
-                var size = X86AsmTempSlotSize(type);
-                RequireX86AsmTempSize(size, instruction);
-                StoreX86AsmRegisterToTemp(source, type);
-                var tempConsumers = new List<X86AsmRegisterMove>();
-                for (var i = moves.Count - 1; i >= 0; i--)
-                {
-                    if (moves[i].Source != source)
-                        continue;
-                    tempConsumers.Add(moves[i]);
-                    moves.RemoveAt(i);
-                }
-                EmitX86AsmParallelRegisterMoves(moves, clobbers, instruction);
-                foreach (var move in tempConsumers)
-                    LoadX86AsmTempInto(move.Destination, move.Type);
+                if (!emitted)
+                    throw InlineAssemblyMoveCycle();
             }
-        }
-
-        private X86Register FindX86AsmCycleScratch(
-            IEnumerable<X86Register> destinations,
-            IEnumerable<X86Register> sources,
-            bool floating,
-            HashSet<X86Register> clobbers)
-        {
-            var used = new HashSet<X86Register>(destinations);
-            used.UnionWith(sources);
-            foreach (var clobber in clobbers)
-            {
-                if (used.Contains(clobber))
-                    continue;
-                if (floating != X86Registers.IsVector(clobber))
-                    continue;
-                return clobber;
-            }
-            return X86Register.Invalid;
         }
 
         private void MoveX86AsmRegister(X86Register destination, X86Register source, QualifiedType type)
@@ -2903,38 +2733,6 @@ public sealed class X86CodeGenerator
                 EmitFloatingMove(destination, source, type);
             else
                 MoveRegister(destination, source, RegisterSize(type));
-        }
-
-        private void StoreX86AsmRegisterToTemp(X86Register source, QualifiedType type)
-        {
-            var destination = Mem(FrameBase, _allocation.Frame.ParallelCopyTempOffset, RegisterSize(type));
-            if (IsFloatType(type))
-                EmitFloatingStore(destination.WithSize(FloatingStorageSize(type)), source, type);
-            else
-                Emit(X86Instruction.Binary(X86InstrKind.Mov, destination, Reg(source, RegisterSize(type))));
-        }
-
-        private void LoadX86AsmTempInto(X86Register destination, QualifiedType type)
-        {
-            var source = Mem(FrameBase, _allocation.Frame.ParallelCopyTempOffset, RegisterSize(type));
-            if (IsFloatType(type))
-                EmitFloatingLoad(destination, source.WithSize(FloatingStorageSize(type)), type);
-            else
-                EmitLoadFromMemory(destination, source, IsSignedIntegerType(type));
-        }
-
-        private int X86AsmTempSlotSize(QualifiedType type)
-        {
-            var size = Math.Max(RegisterSize(type), SizeOfStorage(type));
-            return AlignUp(
-                Math.Max(_owner._allocationOptions.SpillSlotSize, size),
-                _owner._allocationOptions.SpillSlotAlignment);
-        }
-
-        private void RequireX86AsmTempSize(int required, LirInstruction instruction)
-        {
-            if (_allocation.Frame.ParallelCopyTempSize < required)
-                throw Unsupported(instruction, "Inline assembly parallel-copy spill slot is too small.");
         }
 
         private void LoadX86AsmOperandInto(LirOperand operand, X86Register destination, LirInstruction instruction)
@@ -3026,23 +2824,10 @@ public sealed class X86CodeGenerator
                 return null;
             }
 
-            if (IsFloatType(type))
+            if (IsFloatType(type) || InlineAsmConstraints.X86RegisterLetterName(constraint) is not string letter ||
+                !TryParseX86ExplicitRegisterName(letter, out X86Register lettered))
                 return null;
-
-            var text = InlineAsmConstraints.OperandConstraint(constraint);
-            foreach (var ch in text)
-            {
-                switch (ch)
-                {
-                    case 'a': return X86Register.Rax;
-                    case 'b': return X86Register.Rbx;
-                    case 'c': return X86Register.Rcx;
-                    case 'd': return X86Register.Rdx;
-                    case 'S': return X86Register.Rsi;
-                    case 'D': return X86Register.Rdi;
-                }
-            }
-            return null;
+            return lettered;
         }
 
         private bool TryParseX86ExplicitRegisterConstraint(string text, QualifiedType type, out X86Register register)
@@ -3357,6 +3142,22 @@ public sealed class X86CodeGenerator
             {
                 foreach (var copy in ordered)
                     EmitValueCopy(copy.Destination, copy.Source, instruction);
+                return;
+            }
+
+            if (_allocation.TrySequenceCyclicParallelCopy(instruction, copies, out ImmutableArray<(int Copy, MachineRegister From, MachineRegister To)> steps))
+            {
+                foreach ((int copy, MachineRegister from, MachineRegister to) in steps)
+                {
+                    X86Register destination = ToX86Register(to, _owner._machineTarget);
+                    QualifiedType type = copies[copy].Destination.Type;
+                    if (from == MachineRegister.Invalid)
+                        LoadOperandInto(copies[copy].Source, destination, instruction, RegisterSize(type));
+                    else if (IsXmmRegister(destination))
+                        EmitFloatingMove(destination, ToX86Register(from, _owner._machineTarget), type);
+                    else
+                        MoveRegister(destination, ToX86Register(from, _owner._machineTarget), RegisterSize(type));
+                }
                 return;
             }
 
@@ -5718,13 +5519,15 @@ public sealed class X86CodeGenerator
             public QualifiedType Type => Output?.Type ?? Input!.Type;
             public X86AsmRegisterBinding? MatchingOutput { get; set; }
             public X86Register Register { get; set; }
+            public X86Register Assigned { get; }
 
-            public X86AsmRegisterBinding(GimpleAsmOperand operand, LirVirtualRegister? output, LirOperand? input)
+            public X86AsmRegisterBinding(GimpleAsmOperand operand, LirVirtualRegister? output, LirOperand? input, X86Register assigned)
             {
                 Operand = operand ?? throw new ArgumentNullException(nameof(operand));
                 Output = output;
                 Input = input;
                 Register = X86Register.Invalid;
+                Assigned = assigned;
             }
         }
 
@@ -5734,7 +5537,6 @@ public sealed class X86CodeGenerator
             public LirOperand? SourceOperand { get; set; }
             public X86Register SourceRegister { get; set; }
             public QualifiedType Type { get; }
-            public bool UsesTemp { get; set; }
             public bool HasRegisterSource => SourceRegister != X86Register.Invalid;
 
             public X86AsmInputMove(X86Register destination, LirOperand sourceOperand, QualifiedType type)
@@ -5758,9 +5560,6 @@ public sealed class X86CodeGenerator
                 Source = source;
                 Type = type;
             }
-
-            public X86AsmRegisterMove WithSource(X86Register source)
-                => new X86AsmRegisterMove(Destination, source, Type);
         }
 
         private readonly struct PendingCallArgumentSegment
@@ -6173,9 +5972,6 @@ public sealed class X86CodeGenerator
 
         private void EmitBranch(LirInstruction instruction)
         {
-            if (TryEmitSelect(instruction))
-                return;
-
             if (instruction.Operands.Length == 2 && IsComparisonOperator(instruction.Operator))
             {
                 EmitComparisonBranch(instruction);
@@ -7338,7 +7134,8 @@ public sealed class X86CodeGenerator
                 return false;
             if (consumer.Kind == LirInstructionKind.Branch && consumer.Operands.Length == 1)
                 return ScratchNeeds.ReadsRegister(consumer.Operands[0], mask.Result);
-            return consumer.Kind is LirInstructionKind.Branch or LirInstructionKind.Binary && consumer.Operands.Length == 2 &&
+            return (consumer.Kind is LirInstructionKind.Branch or LirInstructionKind.Binary && consumer.Operands.Length == 2 ||
+                    consumer.Kind == LirInstructionKind.Select && consumer.Operands.Length == 4) &&
                 IsComparisonOperator(consumer.Operator) && ScratchNeeds.ReadsRegister(consumer.Operands[0], mask.Result) &&
                 IsIntegerImmediate(consumer.Operands[1], 0) && RegisterSize(consumer.Operands[1].Type) == size;
         }
@@ -8144,12 +7941,6 @@ public sealed class X86CodeGenerator
             {
                 Add(copy.Destination);
                 AddOperand(copy.Source);
-            }
-            if (_currentBlock is not null && _selectDiamonds.TryGetValue(_currentBlock, out var diamond) && ReferenceEquals(diamond.Branch, instruction))
-            {
-                Add(diamond.Destination);
-                AddOperand(diamond.TrueValue);
-                AddOperand(diamond.FalseValue);
             }
         }
 

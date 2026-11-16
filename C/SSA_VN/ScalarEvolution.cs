@@ -89,8 +89,11 @@ internal sealed class Scev
         if (left.Kind == ScevKind.Constant)
             (left, right) = (right, left);
         if (right.TryGetConstant(out b) && left.Kind == ScevKind.Add && left.Right!.TryGetConstant(out var inner))
-            return Add(left.Left!, Constant(inner + b, left.Bits), noSignedWrap);
-        return new Scev(ScevKind.Add, left.Bits, 0, null, left, right);
+        {
+            long sum = inner + b;
+            return Add(left.Left!, Constant(sum, left.Bits), noSignedWrap && left.NoSignedWrap && sum == Wrap(sum, left.Bits));
+        }
+        return new Scev(ScevKind.Add, left.Bits, 0, null, left, right, noSignedWrap: noSignedWrap);
     }
 
     public static Scev? Multiply(Scev left, Scev right, bool noSignedWrap)
@@ -151,6 +154,10 @@ internal sealed class Scev
             case ScevKind.Extend when value.SignExtend == signExtend:
                 return Extend(value.Left!, bits, signExtend);
 
+            // A sum that cannot overflow its narrow type widens term by term, which keeps its constant apart
+            case ScevKind.Add when signExtend && value.NoSignedWrap && value.Right!.TryGetConstant(out var addend):
+                return Extend(value.Left!, bits, true) is Scev widened ? Add(widened, Constant(addend, bits), true) : null;
+
             default:
                 return value.IsInvariant ? new Scev(ScevKind.Extend, bits, 0, null, value, null, signExtend) : null;
         }
@@ -200,7 +207,7 @@ internal sealed class ScalarEvolution
     private readonly TargetInfo _target;
     private readonly IReadOnlyDictionary<GimpleName, GimpleStatementAnnotations> _definitions;
     private readonly Dictionary<GimpleName, Scev?> _cache = new();
-    private readonly HashSet<GimpleName> _pending = new();
+    private HashSet<GimpleName> _pending = new();
     private GimpleCondStatement? _exitTest;
     private bool _exitWhenTrue;
     private bool _unsignedStep;
@@ -352,10 +359,16 @@ internal sealed class ScalarEvolution
         // Descriptions made against the placeholder are provisional and must not outlive it
         var placeholder = Scev.Invariant(name, bits);
         var saved = new Dictionary<GimpleName, Scev?>(_cache);
+        // The placeholder closes every cycle through the phi, so a name whose description led here is described again inside
+        var pending = _pending;
+        var outerUnsignedStep = _unsignedStep;
+        _pending = new HashSet<GimpleName>();
         _cache[name] = placeholder;
         _unsignedStep = false;
         var advanced = Analyze(next);
         var unsignedStep = _unsignedStep;
+        _pending = pending;
+        _unsignedStep = outerUnsignedStep;
         _cache.Clear();
         foreach (var pair in saved)
             _cache[pair.Key] = pair.Value;

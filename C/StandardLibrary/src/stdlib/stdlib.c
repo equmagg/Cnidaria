@@ -23,7 +23,7 @@ static void* __heap_system_map(size_t size)
         "add rsp, 32"
         : "={rax}"(result)
         : [address] "{rcx}"((void*)0), [size] "{rdx}"(size), [type] "{r8}"(12288), [protection] "{r9}"(4)
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory");
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory");
     return result;
 }
 
@@ -42,7 +42,7 @@ static void* __heap_system_map(size_t size)
         "call dword ptr[__imp_VirtualAlloc]"
         : "={eax}"(result)
         : [size] "r"(size)
-        : "ecx", "edx", "memory");
+        : "ecx", "edx", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "memory");
     return result;
 }
 

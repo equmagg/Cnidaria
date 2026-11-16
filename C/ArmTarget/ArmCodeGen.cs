@@ -958,7 +958,8 @@ public sealed class ArmCodeGenerator
             _labels = labels ?? throw new ArgumentNullException(nameof(labels));
             _jumpOnlyBlocks = jumpOnlyBlocks;
             var instructions = function.Blocks.SelectMany(static b => b.Instructions).ToArray();
-            _hasCalls = instructions.Any(static i => i.Kind is LirInstructionKind.Call or LirInstructionKind.InlineAssembly);
+            _hasCalls = instructions.Any(i => i.Kind == LirInstructionKind.Call ||
+                i.Kind == LirInstructionKind.InlineAssembly && (i.SourceStatement is not GimpleAsmStatement asmStatement || InlineAsmConstraints.MayCall(asmStatement, owner._target)));
             _lrSaveOffset = _hasCalls ? AlignUp(_allocation.Frame.FrameSize, _owner._target.PointerAlignment) : -1;
             var frameSize = _allocation.Frame.FrameSize;
             if (_hasCalls)
@@ -968,20 +969,32 @@ public sealed class ArmCodeGenerator
             if (!_owner._machineTarget.Is64Bit)
                 frameSize = checked(_scratchSaveOffset + 16);
 
-            var maximumCallStagingSlots = instructions
-                .Where(static i => i.Kind == LirInstructionKind.Call)
-                .Select(static i => i.Operands.Length)
-                .DefaultIfEmpty(0)
-                .Max();
-            var maximumParallelCopies = instructions
-                .Where(static i => i.Kind == LirInstructionKind.ParallelCopy)
-                .Select(static i => i.ParallelCopies.Length)
-                .DefaultIfEmpty(0)
-                .Max();
+            var callStagingSlots = 0;
+            foreach (LirInstruction instruction in instructions)
+            {
+                if (instruction.Kind != LirInstructionKind.Call || instruction.Operands.Length == 0)
+                    continue;
+                int slots = PlaceCallArguments(instruction, 1).NeedsStaging ? instruction.Operands.Length - 1 : 0;
+                // ARM32 parks an indirect target in the slot after the arguments
+                if (!_owner._machineTarget.Is64Bit && !(instruction.Operands[0].Kind == LirOperandKind.Symbol && instruction.Operands[0].Symbol is FunctionSymbol))
+                    slots = instruction.Operands.Length;
+                callStagingSlots = Math.Max(callStagingSlots, slots);
+            }
+            var memoryCopySlots = 0;
+            foreach (LirInstruction instruction in instructions)
+            {
+                if (instruction.Kind != LirInstructionKind.ParallelCopy)
+                    continue;
+                LirParallelCopy[] copies = instruction.ParallelCopies
+                    .Where(copy => allocation.RequiresPhysicalParallelCopy(copy) && !IsWideScalar(copy.Destination.Type))
+                    .ToArray();
+                if (copies.Length > 1 && !allocation.TryOrderParallelCopies(copies, out _) && !allocation.TrySequenceCyclicParallelCopy(instruction, copies, out _))
+                    memoryCopySlots = Math.Max(memoryCopySlots, copies.Length);
+            }
             var temporarySlotSize = AlignUp(_owner._target.RegisterSize, _owner._allocationOptions.SpillSlotAlignment);
             var backendTempSize = Math.Max(
-                checked(maximumCallStagingSlots * _owner._allocationOptions.StackArgumentSlotSize),
-                checked(maximumParallelCopies * temporarySlotSize));
+                checked(callStagingSlots * _owner._allocationOptions.StackArgumentSlotSize),
+                checked(memoryCopySlots * temporarySlotSize));
             _backendTempOffset = AlignUp(frameSize, _owner._target.PointerAlignment);
             frameSize = checked(_backendTempOffset + backendTempSize);
 
@@ -1043,10 +1056,7 @@ public sealed class ArmCodeGenerator
             }
             SaveIncomingHiddenReturnBuffer();
             SaveIncomingVarArgs();
-            foreach (var pair in _allocation.Frame.SavedRegisterOffsets.OrderBy(static p => p.Value))
-                StoreRegister(pair.Key, pair.Value, RegisterSaveSize(pair.Key));
-            if (_hasCalls)
-                StoreArmRegister(_owner._machineTarget.Is64Bit ? ArmRegister.X30 : ArmRegister.Lr, _lrSaveOffset, _owner._target.PointerSize);
+            TransferSavedRegisters(store: true);
             if (!_owner._machineTarget.Is64Bit)
             {
                 StoreRegister(Scratch0, _scratchSaveOffset, 4);
@@ -1316,11 +1326,13 @@ public sealed class ArmCodeGenerator
             var labels = new List<string>();
             var namedLabels = new Dictionary<string, int>(StringComparer.Ordinal);
             var outputFinalizers = new List<Action>();
+            InlineAssemblyRegisters assigned = _allocation.GetInlineAssemblyRegisters(instruction);
             var operandIndex = 0;
             var copyIndex = 0;
 
-            foreach (var output in asmStatement.Outputs)
+            for (var index = 0; index < asmStatement.Outputs.Length; index++)
             {
+                GimpleAsmOperand output = asmStatement.Outputs[index];
                 InlineAsmFormattedOperand formatted;
                 var storage = output.Target is null
                     ? InlineAsmOperandStorage.Register
@@ -1337,19 +1349,19 @@ public sealed class ArmCodeGenerator
                     if (copyIndex >= instruction.ParallelCopies.Length)
                         throw Unsupported(instruction, "Inline assembly output register is missing from LIR.");
                     var destination = instruction.ParallelCopies[copyIndex++].Destination;
-                    formatted = CreateArmAsmOutputOperand(output, destination, instruction, outputFinalizers);
+                    formatted = CreateArmAsmOutputOperand(output, destination, AssignedArmAsmRegister(assigned.Outputs, index), instruction, outputFinalizers);
                 }
 
                 AddAsmOperand(operands, namedOperands, formatted);
             }
 
-            foreach (var input in asmStatement.Inputs)
+            for (var index = 0; index < asmStatement.Inputs.Length; index++)
             {
                 if (operandIndex >= instruction.Operands.Length)
                     throw Unsupported(instruction, "Inline assembly input operand is missing from LIR.");
 
                 var operand = instruction.Operands[operandIndex++];
-                var formatted = CreateArmAsmInputOperand(input, operand, instruction);
+                InlineAsmFormattedOperand formatted = CreateArmAsmInputOperand(asmStatement.Inputs[index], operand, AssignedArmAsmRegister(assigned.Inputs, index), instruction);
                 AddAsmOperand(operands, namedOperands, formatted);
             }
 
@@ -1394,9 +1406,13 @@ public sealed class ArmCodeGenerator
             operands.Add(operand);
         }
 
+        private static MachineRegister AssignedArmAsmRegister(ImmutableArray<MachineRegister> registers, int index)
+            => index < registers.Length ? registers[index] : MachineRegister.Invalid;
+
         private InlineAsmFormattedOperand CreateArmAsmOutputOperand(
             GimpleAsmOperand operand,
             LirVirtualRegister destination,
+            MachineRegister register,
             LirInstruction instruction,
             List<Action> finalizers)
         {
@@ -1412,26 +1428,27 @@ public sealed class ArmCodeGenerator
                     modifier => FormatArmAsmRegister(fixedRegister.Value, destination.Type, modifier));
             }
 
-            if (InlineAsmConstraints.HasExplicitRegister(operand.Constraint))
-                throw Unsupported(instruction, $"Invalid or unsupported explicit register constraint '{operand.Constraint}'.");
-
-            var register = GetWritableRegister(
-                destination,
-                PreferredScratch(destination.Type, Scratch0, FpScratch0));
-            finalizers.Add(() =>
-            {
-                if (!IsFloatType(destination.Type))
-                    NormalizeIntegerRegister(register, destination.Type);
-                StoreWritableRegisterIfSpilled(destination, register);
-            });
+            RequireAssignedArmAsmRegister(operand, register, instruction);
+            if (operand.IsReadWrite)
+                LoadOperandIntoAs(LirOperand.ForRegister(destination), register, destination.Type, instruction);
+            finalizers.Add(() => StoreArmAsmOutput(destination, register));
             return new InlineAsmFormattedOperand(
                 operand.Name,
                 modifier => FormatArmAsmRegister(register, destination.Type, modifier));
         }
 
+        private void RequireAssignedArmAsmRegister(GimpleAsmOperand operand, MachineRegister register, LirInstruction instruction)
+        {
+            if (InlineAsmConstraints.HasExplicitRegister(operand.Constraint))
+                throw Unsupported(instruction, $"Invalid or unsupported explicit register constraint '{operand.Constraint}'.");
+            if (register == MachineRegister.Invalid)
+                throw Unsupported(instruction, $"Cannot satisfy inline assembly constraint '{operand.Constraint}'.");
+        }
+
         private InlineAsmFormattedOperand CreateArmAsmInputOperand(
             GimpleAsmOperand operand,
             LirOperand value,
+            MachineRegister register,
             LirInstruction instruction)
         {
             RequireScalar(value.Type, instruction);
@@ -1450,12 +1467,8 @@ public sealed class ArmCodeGenerator
                     modifier => FormatArmAsmRegister(fixedRegister.Value, value.Type, modifier));
             }
 
-            if (InlineAsmConstraints.HasExplicitRegister(operand.Constraint))
-                throw Unsupported(instruction, $"Invalid or unsupported explicit register constraint '{operand.Constraint}'.");
-
-            var register = LoadOperand(
-                value,
-                PreferredScratch(value.Type, Scratch1, FpScratch1));
+            RequireAssignedArmAsmRegister(operand, register, instruction);
+            LoadOperandIntoAs(value, register, value.Type, instruction);
             return new InlineAsmFormattedOperand(
                 operand.Name,
                 modifier => FormatArmAsmRegister(register, value.Type, modifier));
@@ -2842,9 +2855,10 @@ public sealed class ArmCodeGenerator
             try
             {
                 var callee = instruction.Operands[0];
+                CallArguments arguments = PlaceCallArguments(instruction, 1);
                 if (TryResolveWindowsImportCall(callee, out var importLabel))
                 {
-                    MarshalCallArguments(instruction, 1);
+                    MarshalCallArguments(instruction, arguments);
                     _owner.AddExternalSymbol(importLabel, ArmObjectSymbolKind.Object);
                     MaterializeSymbolAddress(importLabel, Scratch0);
                     LoadFromMemory(Scratch0, Scratch0, 0, _owner._target.PointerSize, false);
@@ -2852,17 +2866,33 @@ public sealed class ArmCodeGenerator
                 }
                 else if (TryResolveDirectCallLabel(callee, out var label))
                 {
-                    MarshalCallArguments(instruction, 1);
+                    MarshalCallArguments(instruction, arguments);
                     EmitDirectCall(label);
                 }
                 else
                 {
-                    var calleeSlot = checked(_backendTempOffset + (instruction.Operands.Length - 1) * _owner._allocationOptions.StackArgumentSlotSize);
-                    var target = LoadOperand(callee, Scratch0);
-                    StoreToMemory(target, calleeSlot, _owner._target.PointerSize);
-                    MarshalCallArguments(instruction, 1);
-                    LoadFromMemory(Scratch0, calleeSlot, _owner._target.PointerSize, false);
-                    Emit(ArmInstruction.Unary(_owner._machineTarget.Is64Bit ? ArmInstrKind.Blr : ArmInstrKind.Blx, Reg(ToArm(Scratch0), _owner._target.PointerSize)));
+                    MachineRegister target;
+                    if (TryGetCallOperandRegister(callee, out MachineRegister calleeRegister) && !arguments.Writes(calleeRegister))
+                    {
+                        MarshalCallArguments(instruction, arguments);
+                        target = calleeRegister;
+                    }
+                    else if (_owner._machineTarget.Is64Bit)
+                    {
+                        // Nothing between here and the branch uses x16, the first intra-procedure-call scratch
+                        target = MachineRegister.X16;
+                        MoveRegister(target, LoadOperand(callee, target), _owner._target.PointerSize);
+                        MarshalCallArguments(instruction, arguments);
+                    }
+                    else
+                    {
+                        int calleeSlot = checked(_backendTempOffset + (instruction.Operands.Length - 1) * _owner._allocationOptions.StackArgumentSlotSize);
+                        StoreToMemory(LoadOperand(callee, Scratch0), calleeSlot, _owner._target.PointerSize);
+                        MarshalCallArguments(instruction, arguments);
+                        target = Scratch0;
+                        LoadFromMemory(target, calleeSlot, _owner._target.PointerSize, false);
+                    }
+                    Emit(ArmInstruction.Unary(_owner._machineTarget.Is64Bit ? ArmInstrKind.Blr : ArmInstrKind.Blx, Reg(ToArm(target), _owner._target.PointerSize)));
                 }
 
                 ClearCallerClobberedIntegerRepresentationFacts();
@@ -2910,14 +2940,133 @@ public sealed class ArmCodeGenerator
             }
         }
 
-        private void MarshalCallArguments(LirInstruction instruction, int startOperand)
+        private void MarshalCallArguments(LirInstruction instruction, CallArguments arguments)
+        {
+            if (arguments.NeedsStaging)
+                StageCallArguments(instruction, arguments);
+            else
+                MoveCallArguments(arguments.Scalars);
+
+            // The buffer register is a scratch the arguments above were still using, so it is filled last
+            if (arguments.HiddenReturnBuffer is AbiLocation buffer)
+            {
+                MachineRegister address = MaterializeVirtualRegisterStorageAddress(instruction.Result!, Scratch0);
+                if (buffer.Kind == AbiLocationKind.Register)
+                    MoveRegister(buffer.Register, address, _owner._target.PointerSize);
+                else if (buffer.Kind == AbiLocationKind.Stack)
+                    StoreToMemory(address, StackPointer, _allocation.Frame.OutgoingArgumentAreaOffset + buffer.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), _owner._target.PointerSize);
+                else
+                    throw Unsupported(instruction, "Invalid hidden return buffer ABI location.");
+            }
+        }
+
+        // A value may sit in the register another argument goes to, so the arguments move into theirs as one parallel move
+        private void MoveCallArguments(List<CallArgument> scalars)
+        {
+            var moved = new List<CallArgument>();
+            var destinations = new List<MachineRegister>();
+            var sources = new List<MachineRegister>();
+            foreach (CallArgument argument in scalars)
+            {
+                if (argument.Location.Kind == AbiLocationKind.Register)
+                {
+                    moved.Add(argument);
+                    destinations.Add(argument.Location.Register);
+                    sources.Add(TryGetCallOperandRegister(argument.Operand, out MachineRegister register) ? register : MachineRegister.Invalid);
+                    continue;
+                }
+
+                MachineRegister source = LoadOperand(argument.Operand, PreferredScratch(argument.Operand.Type, Scratch0, FpScratch0));
+                StoreToMemory(source, StackPointer, OutgoingArgumentOffset(argument.Location), Math.Min(argument.ValueSize, argument.RegisterSize));
+            }
+
+            foreach ((int move, MachineRegister from, MachineRegister to) in RegisterMoveSequencer.Order(destinations, sources, register => IsVectorRegister(register) ? FpScratch0 : Scratch0))
+            {
+                if (from != MachineRegister.Invalid)
+                {
+                    MoveRegister(to, from, move >= 0 ? moved[move].RegisterSize : IsVectorRegister(from) ? 8 : _owner._target.RegisterSize);
+                    continue;
+                }
+
+                LirOperand operand = moved[move].Operand;
+                MachineRegister value = LoadOperand(operand, IsVectorRegister(to) == UsesFloatingRegisters(operand.Type) ? to : PreferredScratch(operand.Type, Scratch0, FpScratch0));
+                MoveRegister(to, value, moved[move].RegisterSize);
+            }
+        }
+
+        // Every argument is read into the frame before any lands where it travels, since an aggregate or an address may read a register another argument fills
+        private void StageCallArguments(LirInstruction instruction, CallArguments arguments)
+        {
+            int stagingBase = _backendTempOffset;
+            for (var i = 0; i < arguments.Scalars.Count; i++)
+            {
+                CallArgument argument = arguments.Scalars[i];
+                int stagingOffset = stagingBase + i * _owner._allocationOptions.StackArgumentSlotSize;
+                if (TryStoreZeroToStack(argument.Operand, argument.Operand.Type, stagingOffset, argument.RegisterSize))
+                    continue;
+                MachineRegister source = LoadOperand(argument.Operand, PreferredScratch(argument.Operand.Type, Scratch0, FpScratch0));
+                StoreToMemory(source, stagingOffset, argument.RegisterSize);
+            }
+
+            foreach ((LirOperand operand, AbiPlacement placement) in arguments.InMemory)
+                EmitMemoryCallArgument(instruction, operand, placement);
+
+            for (var i = 0; i < arguments.Scalars.Count; i++)
+            {
+                CallArgument argument = arguments.Scalars[i];
+                MachineRegister staged = PreferredScratch(argument.Operand.Type, Scratch0, FpScratch0);
+                LoadFromMemory(staged, stagingBase + i * _owner._allocationOptions.StackArgumentSlotSize, argument.RegisterSize, false);
+                if (argument.Location.Kind == AbiLocationKind.Register)
+                    MoveRegister(argument.Location.Register, staged, argument.RegisterSize);
+                else
+                    StoreToMemory(staged, StackPointer, OutgoingArgumentOffset(argument.Location), Math.Min(argument.ValueSize, argument.RegisterSize));
+            }
+        }
+
+        private int OutgoingArgumentOffset(AbiLocation location)
+            => _allocation.Frame.OutgoingArgumentAreaOffset + location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize);
+
+        private bool TryGetCallOperandRegister(LirOperand operand, out MachineRegister register)
+        {
+            register = MachineRegister.Invalid;
+            if (operand.Kind != LirOperandKind.Register || operand.Register is null || _allocation[operand.Register].IsSpilled)
+                return false;
+            if (_useCallPreservationSources &&
+                _allocation.TryGetCallPreservation(_currentInstructionPosition, operand.Register, out CallPreservation preservation))
+            {
+                if (!preservation.UsesRegister)
+                    return false;
+                register = preservation.PreservationRegister;
+                return true;
+            }
+
+            register = _allocation[operand.Register].PhysicalRegister;
+            return true;
+        }
+
+        private readonly record struct CallArgument(LirOperand Operand, AbiLocation Location, int ValueSize, int RegisterSize);
+
+        private sealed class CallArguments
+        {
+            public List<CallArgument> Scalars { get; } = new();
+            public List<(LirOperand Operand, AbiPlacement Placement)> InMemory { get; } = new();
+            public AbiLocation? HiddenReturnBuffer { get; init; }
+            public bool NeedsStaging => InMemory.Count != 0 || Scalars.Exists(static argument => argument.Operand.Kind == LirOperandKind.Address);
+
+            public bool Writes(MachineRegister register)
+                => HiddenReturnBuffer is AbiLocation buffer && buffer.Kind == AbiLocationKind.Register && buffer.Register == register ||
+                   Scalars.Exists(argument => argument.Location.Kind == AbiLocationKind.Register && argument.Location.Register == register) ||
+                   InMemory.Exists(argument => argument.Placement.Locations.Any(location => location.Kind == AbiLocationKind.Register && location.Register == register));
+        }
+
+        private CallArguments PlaceCallArguments(LirInstruction instruction, int startOperand)
         {
             var cursor = new AbiCursor();
             AbiLocation? hiddenReturnBuffer = null;
             if (instruction.Result is not null && CAbi.RequiresHiddenReturnBuffer(_owner._target, instruction.Result.Type))
                 hiddenReturnBuffer = CAbi.AssignHiddenReturnBufferLocation(_owner._target, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
 
-            var locations = new List<(LirOperand Operand, AbiLocation Location, int ValueSize, int RegisterSize)>();
+            var arguments = new CallArguments { HiddenReturnBuffer = hiddenReturnBuffer };
             for (var i = startOperand; i < instruction.Operands.Length; i++)
             {
                 var operand = instruction.Operands[i];
@@ -2939,66 +3088,38 @@ public sealed class ArmCodeGenerator
                     for (var segment = 0; segment < value.Segments.Length; segment++)
                     {
                         var part = operand.Parts[segment];
-                        locations.Add((part, placement.Locations[segment], RegisterSize(part.Type), RegisterSize(part.Type)));
+                        arguments.Scalars.Add(new CallArgument(part, RequireArgumentLocation(placement.Locations[segment], instruction), RegisterSize(part.Type), RegisterSize(part.Type)));
                     }
                     continue;
                 }
-                if (EmitAggregateCallArgument(instruction, operand, placement))
+                if (IsMemoryCallArgument(operand, placement))
+                {
+                    arguments.InMemory.Add((operand, placement));
                     continue;
+                }
 
                 value = placement.Value;
                 RequireScalar(operand.Type, instruction);
                 if (value.PassingKind != AbiPassingKind.Scalar || value.Segments.Length != 1 ||
                     value.Segments[0].RegisterClass is not (AbiRegisterClass.General or AbiRegisterClass.Vector))
                     throw Unsupported(instruction, "Unsupported scalar ARM call argument class.");
-                locations.Add((operand, placement.Locations[0], Math.Max(1, value.Size), RegisterSize(operand.Type)));
+                arguments.Scalars.Add(new CallArgument(operand, RequireArgumentLocation(placement.Locations[0], instruction), Math.Max(1, value.Size), RegisterSize(operand.Type)));
             }
 
-            var stagingBase = _backendTempOffset;
-
-            for (var i = 0; i < locations.Count; i++)
-            {
-                var stagingOffset = stagingBase + i * _owner._allocationOptions.StackArgumentSlotSize;
-                if (TryStoreZeroToStack(locations[i].Operand, locations[i].Operand.Type, stagingOffset, locations[i].RegisterSize))
-                    continue;
-                var source = LoadOperand(
-                    locations[i].Operand,
-                    PreferredScratch(locations[i].Operand.Type, Scratch0, FpScratch0));
-                StoreToMemory(source, stagingOffset, locations[i].RegisterSize);
-            }
-
-            for (var i = 0; i < locations.Count; i++)
-            {
-                var item = locations[i];
-                var staged = PreferredScratch(item.Operand.Type, Scratch0, FpScratch0);
-                LoadFromMemory(staged, stagingBase + i * _owner._allocationOptions.StackArgumentSlotSize, item.RegisterSize, false);
-                if (item.Location.Kind == AbiLocationKind.Register)
-                    MoveRegister(item.Location.Register, staged, item.RegisterSize);
-                else if (item.Location.Kind == AbiLocationKind.Stack)
-                    StoreToMemory(
-                        staged,
-                        StackPointer,
-                        _allocation.Frame.OutgoingArgumentAreaOffset + item.Location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize),
-                        Math.Min(item.ValueSize, item.RegisterSize));
-                else
-                    throw Unsupported(instruction, "Invalid call argument ABI location.");
-            }
-
-            // The buffer register is a scratch the arguments above were still using, so it is filled last
-            if (hiddenReturnBuffer is { } buffer)
-            {
-                var address = MaterializeVirtualRegisterStorageAddress(instruction.Result!, Scratch0);
-                if (buffer.Kind == AbiLocationKind.Register)
-                    MoveRegister(buffer.Register, address, _owner._target.PointerSize);
-                else if (buffer.Kind == AbiLocationKind.Stack)
-                    StoreToMemory(address, StackPointer, _allocation.Frame.OutgoingArgumentAreaOffset + buffer.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), _owner._target.PointerSize);
-                else
-                    throw Unsupported(instruction, "Invalid hidden return buffer ABI location.");
-            }
+            return arguments;
         }
 
-        /// <summary>Places an argument the ABI does not carry in one register, reporting whether it did</summary>
-        private bool EmitAggregateCallArgument(LirInstruction instruction, LirOperand operand, AbiPlacement placement)
+        private AbiLocation RequireArgumentLocation(AbiLocation location, LirInstruction instruction)
+            => location.Kind is AbiLocationKind.Register or AbiLocationKind.Stack
+                ? location
+                : throw Unsupported(instruction, "Invalid call argument ABI location.");
+
+        private bool IsMemoryCallArgument(LirOperand operand, AbiPlacement placement)
+            => placement.Value.PassingKind is AbiPassingKind.Indirect or AbiPassingKind.MultiRegister ||
+               IsArm32Double(operand.Type) && placement.Value.PassingKind == AbiPassingKind.Scalar ||
+               placement.Value.PassingKind == AbiPassingKind.Stack && IsAggregateType(operand.Type);
+
+        private void EmitMemoryCallArgument(LirInstruction instruction, LirOperand operand, AbiPlacement placement)
         {
             var value = placement.Value;
             if (value.PassingKind == AbiPassingKind.Indirect)
@@ -3011,7 +3132,7 @@ public sealed class ArmCodeGenerator
                     StoreToMemory(source, StackPointer, _allocation.Frame.OutgoingArgumentAreaOffset + location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize), _owner._target.PointerSize);
                 else
                     throw Unsupported(instruction, "Invalid indirect call argument ABI location.");
-                return true;
+                return;
             }
 
             if (value.PassingKind == AbiPassingKind.MultiRegister || IsArm32Double(operand.Type) && value.PassingKind == AbiPassingKind.Scalar)
@@ -3043,19 +3164,12 @@ public sealed class ArmCodeGenerator
                         throw Unsupported(instruction, "Invalid aggregate call argument segment location.");
                     }
                 }
-                return true;
+                return;
             }
 
-            if (value.PassingKind == AbiPassingKind.Stack && IsAggregateType(operand.Type))
-            {
-                var source = MaterializeOperandStorageAddress(operand, Scratch1, instruction);
-                var location = placement.Locations[0];
-                AddImmediate(Scratch0, StackPointer, _allocation.Frame.OutgoingArgumentAreaOffset + location.StackByteOffset(_owner._allocationOptions.StackArgumentSlotSize));
-                CopyMemory(Scratch0, source, value.Size);
-                return true;
-            }
-
-            return false;
+            MachineRegister stackSource = MaterializeOperandStorageAddress(operand, Scratch1, instruction);
+            AddImmediate(Scratch0, StackPointer, OutgoingArgumentOffset(placement.Locations[0]));
+            CopyMemory(Scratch0, stackSource, value.Size);
         }
 
         private void EmitCallResult(LirInstruction instruction)
@@ -3162,6 +3276,19 @@ public sealed class ArmCodeGenerator
                 return;
             }
             var integerCondition = LoadOperand(instruction.Operands[0], Scratch0);
+            if (_owner._machineTarget.Is64Bit)
+            {
+                int conditionSize = RegisterSize(instruction.Operands[0].Type);
+                if (trueFallsThrough && !falseFallsThrough)
+                {
+                    EmitZeroTestJump(integerCondition, conditionSize, nonZero: false, LabelOf(instruction.FalseTarget));
+                    return;
+                }
+                EmitZeroTestJump(integerCondition, conditionSize, nonZero: true, LabelOf(instruction.TrueTarget));
+                if (!falseFallsThrough)
+                    EmitJump(LabelOf(instruction.FalseTarget));
+                return;
+            }
             Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(integerCondition), RegisterSize(instruction.Operands[0].Type)), ArmOperand.ImmediateOperand(0)));
             if (trueFallsThrough && !falseFallsThrough)
             {
@@ -3204,31 +3331,45 @@ public sealed class ArmCodeGenerator
                 var op = instruction.Operator;
                 // The condition follows whichever operand ends up on the left of the compare
                 var conditionType = left.Type;
-                if (_owner._machineTarget.Is64Bit && IsIntegerImmediate(right) &&
-                    TryGetCompareImmediate(GetIntegerImmediateBits(right, size * 8), size * 8, out var compareOpcode, out var compareValue))
+                LirOperand? zeroTested = !_owner._machineTarget.Is64Bit || op is not ("==" or "!=") ? null
+                    : IsZeroImmediate(right, size) ? left
+                    : IsZeroImmediate(left, size) ? right
+                    : null;
+                if (zeroTested is not null)
                 {
-                    Emit(ArmInstruction.Binary(compareOpcode, Reg(ToArm(LoadOperandAtWidth(left, Scratch1, size)), size), ArmOperand.ImmediateOperand(compareValue)));
-                }
-                else if (_owner._machineTarget.Is64Bit && IsIntegerImmediate(left) && !IsIntegerImmediate(right) &&
-                    TrySwapComparison(op) is { } swappedOperator &&
-                    TryGetCompareImmediate(GetIntegerImmediateBits(left, size * 8), size * 8, out var swappedOpcode, out var swappedValue))
-                {
-                    op = swappedOperator;
-                    conditionType = right.Type;
-                    Emit(ArmInstruction.Binary(swappedOpcode, Reg(ToArm(LoadOperandAtWidth(right, Scratch1, size)), size), ArmOperand.ImmediateOperand(swappedValue)));
+                    EmitZeroTestJump(LoadOperandAtWidth(zeroTested, Scratch1, size), size, nonZero: op == "!=" != inverted, branchTarget);
                 }
                 else
                 {
-                    var leftRegister = LoadOperandAtWidth(left, Scratch1, size);
-                    var rightRegister = LoadOperandAtWidth(right, Scratch2, size);
-                    Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(leftRegister), size), Reg(ToArm(rightRegister), size)));
+                    if (_owner._machineTarget.Is64Bit && IsIntegerImmediate(right) &&
+                        TryGetCompareImmediate(GetIntegerImmediateBits(right, size * 8), size * 8, out ArmInstrKind compareOpcode, out long compareValue))
+                    {
+                        Emit(ArmInstruction.Binary(compareOpcode, Reg(ToArm(LoadOperandAtWidth(left, Scratch1, size)), size), ArmOperand.ImmediateOperand(compareValue)));
+                    }
+                    else if (_owner._machineTarget.Is64Bit && IsIntegerImmediate(left) && !IsIntegerImmediate(right) &&
+                        TrySwapComparison(op) is string swappedOperator &&
+                        TryGetCompareImmediate(GetIntegerImmediateBits(left, size * 8), size * 8, out ArmInstrKind swappedOpcode, out long swappedValue))
+                    {
+                        op = swappedOperator;
+                        conditionType = right.Type;
+                        Emit(ArmInstruction.Binary(swappedOpcode, Reg(ToArm(LoadOperandAtWidth(right, Scratch1, size)), size), ArmOperand.ImmediateOperand(swappedValue)));
+                    }
+                    else
+                    {
+                        MachineRegister leftRegister = LoadOperandAtWidth(left, Scratch1, size);
+                        MachineRegister rightRegister = LoadOperandAtWidth(right, Scratch2, size);
+                        Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(leftRegister), size), Reg(ToArm(rightRegister), size)));
+                    }
+                    EmitConditionalJump(MaybeInvert(SelectCondition(op, IsSignedIntegerType(conditionType)), inverted), branchTarget);
                 }
-                EmitConditionalJump(MaybeInvert(SelectCondition(op, IsSignedIntegerType(conditionType)), inverted), branchTarget);
             }
 
             if (!inverted && !IsFallthroughTarget(instruction.FalseTarget))
                 EmitJump(LabelOf(instruction.FalseTarget));
         }
+
+        private bool IsZeroImmediate(LirOperand operand, int size)
+            => IsIntegerImmediate(operand) && GetIntegerImmediateBits(operand, size * 8) == 0;
 
         /// <summary>Reports whether the true target falls through, so branching on the negated condition removes the jump</summary>
         private bool PrefersInvertedBranch(LirInstruction instruction)
@@ -3425,16 +3566,46 @@ public sealed class ArmCodeGenerator
                 LoadRegister(Scratch1, _scratchSaveOffset + 4, 4);
                 LoadRegister(Scratch0, _scratchSaveOffset, 4);
             }
-            if (_hasCalls)
-                LoadArmRegister(_owner._machineTarget.Is64Bit ? ArmRegister.X30 : ArmRegister.Lr, _lrSaveOffset, _owner._target.PointerSize);
-            foreach (var pair in _allocation.Frame.SavedRegisterOffsets.OrderByDescending(static p => p.Value))
-                LoadRegister(pair.Key, pair.Value, RegisterSaveSize(pair.Key));
+            TransferSavedRegisters(store: false);
             if (_allocation.Frame.HasDynamicStack)
             {
                 EmitMemoryLoad(ToArmRegister(TargetRegisterInfo.FrameBaseRegister(_owner._target)), StackPointerArm,
                     _allocation.Frame.FrameBaseSaveOffset, _owner._target.PointerSize, false);
             }
             AdjustStack(_totalFrameSize);
+        }
+
+        private void TransferSavedRegisters(bool store)
+        {
+            List<(ArmRegister Register, int Offset, int Size)> saves = _allocation.Frame.SavedRegisterOffsets
+                .Select(pair => (Register: ToArmRegister(pair.Key), Offset: pair.Value, Size: RegisterSaveSize(pair.Key)))
+                .ToList();
+            if (_hasCalls)
+                saves.Add((_owner._machineTarget.Is64Bit ? ArmRegister.X30 : ArmRegister.Lr, _lrSaveOffset, _owner._target.PointerSize));
+            saves.Sort(static (left, right) => left.Offset.CompareTo(right.Offset));
+
+            for (var i = 0; i < saves.Count; i++)
+            {
+                (ArmRegister register, int offset, int size) = saves[i];
+                if (_owner._machineTarget.Is64Bit && i + 1 < saves.Count && size is 8 or 16 &&
+                    saves[i + 1].Size == size && saves[i + 1].Offset == offset + size &&
+                    ArmRegisters.IsVector(saves[i + 1].Register) == ArmRegisters.IsVector(register) &&
+                    offset % size == 0 && offset / size is >= -64 and <= 63)
+                {
+                    Emit(ArmInstruction.Ternary(
+                        store ? ArmInstrKind.Stp : ArmInstrKind.Ldp,
+                        Reg(register, size),
+                        Reg(saves[i + 1].Register, size),
+                        ArmOperand.Memory(FrameBaseArm, offset, size)));
+                    i++;
+                    continue;
+                }
+
+                if (store)
+                    StoreArmRegister(register, offset, size);
+                else
+                    LoadArmRegister(register, offset, size);
+            }
         }
 
         private void EmitParallelCopy(LirInstruction instruction)
@@ -3460,6 +3631,18 @@ public sealed class ArmCodeGenerator
             {
                 foreach (var copy in ordered)
                     EmitDirectParallelCopy(copy, instruction);
+                return;
+            }
+
+            if (_allocation.TrySequenceCyclicParallelCopy(instruction, copies, out ImmutableArray<(int Copy, MachineRegister From, MachineRegister To)> steps))
+            {
+                foreach ((int copy, MachineRegister from, MachineRegister to) in steps)
+                {
+                    if (from == MachineRegister.Invalid)
+                        LoadOperandIntoAs(copies[copy].Source, to, copies[copy].Destination.Type, instruction);
+                    else
+                        MoveRegister(to, from, RegisterSize(copies[copy].Destination.Type));
+                }
                 return;
             }
 
@@ -4360,6 +4543,16 @@ public sealed class ArmCodeGenerator
                 label,
                 0,
                 _owner._machineTarget.Is64Bit ? ArmObjectRelocationKind.AArch64Branch26 : ArmObjectRelocationKind.ArmBranch24);
+        }
+
+        private void EmitZeroTestJump(MachineRegister register, int size, bool nonZero, string label)
+        {
+            int offset = _owner._text.ByteLength;
+            Emit(new ArmInstruction(
+                nonZero ? ArmInstrKind.Cbnz : ArmInstrKind.Cbz,
+                Reg(ToArm(register), size),
+                ArmOperand.SymbolOperand(label, ArmRelocationKind.CompareBranch)));
+            _owner._text.AddRelocation(offset, label, 0, ArmObjectRelocationKind.AArch64CompareBranch19);
         }
 
         private void EmitConditionalJump(ArmCondition condition, string label)

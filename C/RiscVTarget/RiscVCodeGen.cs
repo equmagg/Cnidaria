@@ -172,6 +172,8 @@ public sealed class RiscVCodeGenerator
 
             switch (instruction.Kind)
             {
+                case LirInstructionKind.Select:
+                    return ScratchClass.All;
                 case LirInstructionKind.Nop:
                 case LirInstructionKind.Jump:
                 case LirInstructionKind.Unreachable:
@@ -213,6 +215,9 @@ public sealed class RiscVCodeGenerator
                 case LirInstructionKind.Call:
                     // Scalar arguments move one at a time through at most the two spares; vector intrinsics configure in t4
                     return IsRiscVVectorIntrinsicCall(instruction) ? ScratchClass.All : ScratchClass.None;
+                case LirInstructionKind.InlineAssembly when instruction.SourceStatement is GimpleAsmStatement asmStatement &&
+                                                            !InlineAsmConstraints.FormatsThroughScratch(asmStatement):
+                    return ScratchClass.None;
                 default:
                     return ScratchClass.All;
             }
@@ -281,7 +286,9 @@ public sealed class RiscVCodeGenerator
                 LirAddressKind.Element when address.BaseAddress is not null =>
                     address.Index is null || address.Index.Kind == LirOperandKind.Immediate
                         ? AddressNeeds(address.BaseAddress)
-                        : _hasB && address.BaseAddress.Kind != LirAddressKind.Element ? AddressNeeds(address.BaseAddress) : ScratchClass.General,
+                        : _hasB && address.BaseAddress.Kind != LirAddressKind.Element && address.Scale is 1 or 2 or 4 or 8
+                            ? AddressNeeds(address.BaseAddress)
+                            : ScratchClass.General,
                 _ => ScratchClass.All,
             };
 
@@ -299,8 +306,6 @@ public sealed class RiscVCodeGenerator
 
         private static ScratchClass BranchNeeds(LirInstruction branch)
         {
-            if (LirSelect.MayBeDiamond(branch))
-                return ScratchClass.All;
             var operands = branch.Operands;
             if (operands.Length == 2 && branch.Operator is "==" or "!=" or "<" or "<=" or ">" or ">=")
             {
@@ -986,6 +991,15 @@ public sealed class RiscVCodeGenerator
                 return index == 0;
             case LirInstructionKind.Branch:
                 return operands.Length == 2;
+            case LirInstructionKind.Select:
+                // The values go through registers, and a bound the select also takes as a value shares that register
+                if (index >= 2 || index == 0 || IsSameConstant(constant, operands[2]) || IsSameConstant(constant, operands[3]))
+                    return true;
+                return op switch
+                {
+                    "==" or "!=" or "<" or ">=" => !FitsImmediate12(value),
+                    _ => !FitsImmediate12(value + 1),
+                };
             case LirInstructionKind.Binary:
                 return op switch
                 {
@@ -1005,6 +1019,9 @@ public sealed class RiscVCodeGenerator
 
         static bool FitsImmediate12(long value)
             => value is >= -2048 and <= 2047;
+
+        static bool IsSameConstant(LirOperand constant, LirOperand other)
+            => other.Kind == LirOperandKind.Immediate && Equals(constant.Immediate, other.Immediate) && ReferenceEquals(constant.Type.Type, other.Type.Type);
     }
 
     private static long ConvertIntegerConstant(object? value)
@@ -1132,11 +1149,8 @@ public sealed class RiscVCodeGenerator
         private readonly string _functionLabel;
         private readonly IReadOnlyDictionary<LirBlock, string> _labels;
         private readonly IReadOnlyDictionary<LirBlock, LirBlock> _jumpOnlyBlocks;
-        private readonly Dictionary<LirBlock, LirSelectDiamond> _selectDiamonds = new();
-        private readonly HashSet<LirBlock> _foldedSelectArms = new();
         private readonly HashSet<LirVirtualRegister> _narrowStoreOnlyValues = new();
         private LirBlock? _currentBlock;
-        private int _currentBlockIndex;
         private readonly bool _hasCalls;
         private readonly int _raSaveOffset;
         private readonly int _riscVVarArgsSaveAreaOffset;
@@ -1426,8 +1440,8 @@ public sealed class RiscVCodeGenerator
             _functionLabel = functionLabel ?? string.Empty;
             _labels = labels ?? throw new ArgumentNullException(nameof(labels));
             _jumpOnlyBlocks = jumpOnlyBlocks;
-            _hasCalls = function.Blocks.SelectMany(static b => b.Instructions).Any(static i =>
-                i.Kind == LirInstructionKind.InlineAssembly ||
+            _hasCalls = function.Blocks.SelectMany(static b => b.Instructions).Any(i =>
+                i.Kind == LirInstructionKind.InlineAssembly && (i.SourceStatement is not GimpleAsmStatement asmStatement || InlineAsmConstraints.MayCall(asmStatement, owner._target)) ||
                 i.Kind == LirInstructionKind.Call && !IsRiscVVectorIntrinsicCall(i));
             _raSaveOffset = _hasCalls ? AlignUp(_allocation.Frame.FrameSize, _owner._target.PointerAlignment) : -1;
             _riscVVarArgsSaveAreaSize = ComputeRiscVVarArgsSaveAreaSize();
@@ -1472,7 +1486,6 @@ public sealed class RiscVCodeGenerator
 
         public void EmitBlocks()
         {
-            FindSelectDiamonds();
             FindNarrowStoreOnlyValues();
             _currentInstructionPosition = 0;
             for (var blockIndex = 0; blockIndex < _function.Blocks.Length; blockIndex++)
@@ -1487,14 +1500,7 @@ public sealed class RiscVCodeGenerator
                 _fallthroughBlock = NextEmittedBlock(blockIndex);
                 ClearIntegerRepresentationFacts();
                 _currentBlock = block;
-                _currentBlockIndex = blockIndex;
                 _owner._text.DefineLabel(LabelOf(block));
-                if (_foldedSelectArms.Contains(block))
-                {
-                    _currentInstructionPosition += block.Instructions.Length * 2;
-                    continue;
-                }
-
                 foreach (var instruction in block.Instructions)
                 {
                     _currentInstruction = instruction;
@@ -1599,58 +1605,27 @@ public sealed class RiscVCodeGenerator
         }
 
         // Zicond turns a conditional expression into two masked moves and an or, with no branch at all
-        private void FindSelectDiamonds()
+        private void EmitSelect(LirInstruction instruction)
         {
-            if (!_owner._machineTarget.HasZicond)
-                return;
-
-            foreach (var pair in LirSelect.FindDiamonds(_function, _owner._target))
-            {
-                if (!IsSelectableCondition(pair.Value.Branch))
-                    continue;
-                _selectDiamonds.Add(pair.Key, pair.Value);
-                _foldedSelectArms.Add(pair.Value.TrueArm);
-                _foldedSelectArms.Add(pair.Value.FalseArm);
-            }
-        }
-
-        private bool IsSelectableCondition(LirInstruction branch)
-        {
-            foreach (var operand in branch.Operands)
-            {
-                if (IsFloatType(operand.Type) || IsRv32WideInteger(operand.Type) || RequiresStackBackedScalar(operand.Type))
-                    return false;
-            }
-
-            return branch.Operands.Length == 1 ||
-                (branch.Operands.Length == 2 && IsComparisonOperator(branch.Operator));
-        }
-
-        private bool TryEmitSelect(LirInstruction instruction)
-        {
-            if (_currentBlock is null ||
-                !_selectDiamonds.TryGetValue(_currentBlock, out var diamond) ||
-                !ReferenceEquals(diamond.Branch, instruction))
-            {
-                return false;
-            }
-
+            LirVirtualRegister result = instruction.Result ?? throw Unsupported(instruction, "Select has no result.");
+            LirOperand whenTrue = instruction.Operands[2];
+            LirOperand whenFalse = instruction.Operands[3];
             MachineRegister destination;
-            if (TryGetMinMaxOpcode(instruction, diamond, out var minMax))
+            if (TryGetMinMaxOpcode(instruction, out RVInstrKind minMax))
             {
-                destination = GetWritableRegister(diamond.Destination, GpScratch0);
-                var left = LoadOperand(instruction.Operands[0], GpScratch1);
-                var right = LoadOperand(instruction.Operands[1], GpScratch2);
+                destination = GetWritableRegister(result, GpScratch0);
+                MachineRegister left = LoadIntegerSourceOperand(instruction.Operands[0], GpScratch1);
+                MachineRegister right = LoadIntegerSourceOperand(instruction.Operands[1], GpScratch2);
                 Emit(RVInstruction.R(minMax, ToRegister(destination), ToRegister(left), ToRegister(right)));
             }
-            else if (IsTruthSelect(diamond, out bool inverted))
+            else if (IsTruthSelect(whenTrue, whenFalse, out bool truthInverted))
             {
-                // A compare leaves exactly 0 or 1 behind, a lone operand only zero or not
-                MachineRegister condition = EmitSelectCondition(instruction);
-                destination = GetWritableRegister(diamond.Destination, GpScratch0);
-                if (instruction.Operands.Length == 2)
-                    EmitImm(inverted ? RVInstrKind.Xori : RVInstrKind.Addi, destination, condition, inverted ? 1 : 0);
-                else if (inverted)
+                MachineRegister condition = EmitSelectCondition(instruction, out bool inverted, out bool boolean);
+                destination = GetWritableRegister(result, GpScratch0);
+                bool flip = inverted != truthInverted;
+                if (boolean)
+                    EmitImm(flip ? RVInstrKind.Xori : RVInstrKind.Addi, destination, condition, flip ? 1 : 0);
+                else if (flip)
                     EmitImm(RVInstrKind.Sltiu, destination, condition, 1);
                 else
                     Emit(RVInstruction.R(RVInstrKind.Sltu, ToRegister(destination), RVRegister.X0, ToRegister(condition)));
@@ -1658,54 +1633,72 @@ public sealed class RiscVCodeGenerator
             }
             else
             {
-                var condition = EmitSelectCondition(instruction);
-                destination = GetWritableRegister(diamond.Destination, GpScratch0);
+                MachineRegister condition = EmitSelectCondition(instruction, out bool inverted, out _);
+                destination = GetWritableRegister(result, GpScratch0);
 
-                var trueValue = LoadOperand(diamond.TrueValue, GpScratch1);
-                Emit(RVInstruction.R(RVInstrKind.CzeroEqz, ToRegister(GpScratch1), ToRegister(trueValue), ToRegister(condition)));
-                var falseValue = LoadOperand(diamond.FalseValue, GpScratch2);
-                Emit(RVInstruction.R(RVInstrKind.CzeroNez, ToRegister(GpScratch2), ToRegister(falseValue), ToRegister(condition)));
-                Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(destination), ToRegister(GpScratch1), ToRegister(GpScratch2)));
-                SetIntegerRepresentation(destination, IntegerRepresentationFact.Unknown);
+                LirOperand whenSet = inverted ? whenFalse : whenTrue;
+                LirOperand whenClear = inverted ? whenTrue : whenFalse;
+                IntegerRepresentationFact required = CanonicalIntegerRepresentation(result.Type);
+                bool canonical;
+                if (IsZeroIntegerImmediate(whenClear))
+                {
+                    MachineRegister value = LoadOperand(whenSet, GpScratch1);
+                    canonical = IntegerRepresentationSatisfies(KnownIntegerRepresentation(value, whenSet.Type), required);
+                    Emit(RVInstruction.R(RVInstrKind.CzeroEqz, ToRegister(destination), ToRegister(value), ToRegister(condition)));
+                }
+                else if (IsZeroIntegerImmediate(whenSet))
+                {
+                    MachineRegister value = LoadOperand(whenClear, GpScratch2);
+                    canonical = IntegerRepresentationSatisfies(KnownIntegerRepresentation(value, whenClear.Type), required);
+                    Emit(RVInstruction.R(RVInstrKind.CzeroNez, ToRegister(destination), ToRegister(value), ToRegister(condition)));
+                }
+                else
+                {
+                    MachineRegister setValue = LoadOperand(whenSet, GpScratch1);
+                    canonical = IntegerRepresentationSatisfies(KnownIntegerRepresentation(setValue, whenSet.Type), required);
+                    Emit(RVInstruction.R(RVInstrKind.CzeroEqz, ToRegister(GpScratch1), ToRegister(setValue), ToRegister(condition)));
+                    MachineRegister clearValue = LoadOperand(whenClear, GpScratch2);
+                    canonical &= IntegerRepresentationSatisfies(KnownIntegerRepresentation(clearValue, whenClear.Type), required);
+                    Emit(RVInstruction.R(RVInstrKind.CzeroNez, ToRegister(GpScratch2), ToRegister(clearValue), ToRegister(condition)));
+                    Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(destination), ToRegister(GpScratch1), ToRegister(GpScratch2)));
+                }
+                SetIntegerRepresentation(destination, canonical ? required : IntegerRepresentationFact.Unknown);
             }
 
-            NormalizeIntegerRegister(destination, diamond.Destination.Type);
-            StoreWritableRegisterIfSpilled(diamond.Destination, destination);
-            if (!FallsThroughToJoin(diamond.Join))
-                EmitJump(LabelOf(diamond.Join));
-            return true;
+            NormalizeIntegerRegister(destination, result.Type);
+            StoreWritableRegisterIfSpilled(result, destination);
         }
 
-        private bool TryGetMinMaxOpcode(LirInstruction branch, LirSelectDiamond diamond, out RVInstrKind opcode)
+        private bool TryGetMinMaxOpcode(LirInstruction select, out RVInstrKind opcode)
         {
             opcode = default;
-            if (!_owner._machineTarget.HasB || branch.Operands.Length != 2 || branch.Operator is not ("<" or "<=" or ">" or ">="))
+            if (!_owner._machineTarget.HasB || select.Operator is not ("<" or "<=" or ">" or ">="))
                 return false;
 
-            var left = branch.Operands[0];
-            var right = branch.Operands[1];
+            LirOperand left = select.Operands[0];
+            LirOperand right = select.Operands[1];
             if ((!IsIntegerLike(left.Type) && !IsPointerLike(left.Type)) || SizeOf(left.Type) > _owner._target.RegisterSize ||
                 (!IsIntegerLike(right.Type) && !IsPointerLike(right.Type)) || SizeOf(right.Type) > _owner._target.RegisterSize)
                 return false;
 
             bool takesLeft;
-            if (SameOperand(diamond.TrueValue, left) && SameOperand(diamond.FalseValue, right))
+            if (SameOperand(select.Operands[2], left) && SameOperand(select.Operands[3], right))
                 takesLeft = true;
-            else if (SameOperand(diamond.TrueValue, right) && SameOperand(diamond.FalseValue, left))
+            else if (SameOperand(select.Operands[2], right) && SameOperand(select.Operands[3], left))
                 takesLeft = false;
             else
                 return false;
 
-            var minimum = (branch.Operator is "<" or "<=") == takesLeft;
-            var signed = IsSignedIntegerType(left.Type) || IsSignedIntegerType(right.Type);
+            bool minimum = (select.Operator is "<" or "<=") == takesLeft;
+            bool signed = IsSignedIntegerType(left.Type) || IsSignedIntegerType(right.Type);
             opcode = minimum ? (signed ? RVInstrKind.Min : RVInstrKind.Minu) : (signed ? RVInstrKind.Max : RVInstrKind.Maxu);
             return true;
         }
 
-        private bool IsTruthSelect(LirSelectDiamond diamond, out bool inverted)
+        private bool IsTruthSelect(LirOperand whenTrue, LirOperand whenFalse, out bool inverted)
         {
-            inverted = IsImmediateValue(diamond.TrueValue, 0) && IsImmediateValue(diamond.FalseValue, 1);
-            return inverted || IsImmediateValue(diamond.TrueValue, 1) && IsImmediateValue(diamond.FalseValue, 0);
+            inverted = IsImmediateValue(whenTrue, 0) && IsImmediateValue(whenFalse, 1);
+            return inverted || IsImmediateValue(whenTrue, 1) && IsImmediateValue(whenFalse, 0);
         }
 
         private bool IsImmediateValue(LirOperand operand, long value)
@@ -1716,42 +1709,53 @@ public sealed class RiscVCodeGenerator
                 ? right.Kind == LirOperandKind.Register && ReferenceEquals(left.Register, right.Register)
                 : IsIntegerImmediate(left) && IsIntegerImmediate(right) && CanonicalImmediate(left) == CanonicalImmediate(right);
 
-        // czero reads the whole register, so the condition only has to be zero or non-zero
-        private MachineRegister EmitSelectCondition(LirInstruction branch)
+        // czero reads the whole register, so the condition only has to be zero or non-zero, and it may come inverted
+        private MachineRegister EmitSelectCondition(LirInstruction branch, out bool inverted, out bool boolean)
         {
-            if (branch.Operands.Length == 1)
-                return LoadIntegerSourceOperand(branch.Operands[0], GpScratch3);
-
-            var left = LoadOperand(branch.Operands[0], GpScratch1);
-            var right = LoadOperand(branch.Operands[1], GpScratch2);
-            var signed = IsSignedIntegerType(branch.Operands[0].Type) || IsSignedIntegerType(branch.Operands[1].Type);
-            switch (branch.Operator)
+            inverted = false;
+            boolean = false;
+            LirOperand leftOperand = branch.Operands[0];
+            LirOperand rightOperand = branch.Operands[1];
+            bool signed = IsSignedIntegerType(leftOperand.Type) || IsSignedIntegerType(rightOperand.Type);
+            if (branch.Operator is "==" or "!=")
             {
-                case "==": EmitEquality(GpScratch3, left, right, equal: true); break;
-                case "!=": EmitEquality(GpScratch3, left, right, equal: false); break;
-                case "<": EmitLessThan(GpScratch3, left, right, signed); break;
-                case ">": EmitLessThan(GpScratch3, right, left, signed); break;
-                case "<=": EmitLessThan(GpScratch3, right, left, signed); EmitImm(RVInstrKind.Xori, GpScratch3, GpScratch3, 1); break;
-                default: EmitLessThan(GpScratch3, left, right, signed); EmitImm(RVInstrKind.Xori, GpScratch3, GpScratch3, 1); break;
+                inverted = branch.Operator == "==";
+                if (IsZeroIntegerImmediate(rightOperand))
+                    return LoadIntegerSourceOperand(leftOperand, GpScratch3);
+                MachineRegister difference = LoadIntegerSourceOperand(leftOperand, GpScratch1);
+                if (IsIntegerImmediate(rightOperand) && TryGetCanonicalImmediate12(rightOperand, out int equality))
+                    EmitImm(RVInstrKind.Xori, GpScratch3, difference, equality);
+                else
+                    Emit(RVInstruction.R(RVInstrKind.Xor, ToRegister(GpScratch3), ToRegister(difference), ToRegister(LoadIntegerSourceOperand(rightOperand, GpScratch2))));
+                return GpScratch3;
+            }
+
+            boolean = true;
+            MachineRegister left = LoadIntegerSourceOperand(leftOperand, GpScratch1);
+            RVInstrKind lessThan = signed ? RVInstrKind.Slti : RVInstrKind.Sltiu;
+            if (branch.Operator is "<" or ">=")
+            {
+                inverted = branch.Operator == ">=";
+                if (IsIntegerImmediate(rightOperand) && TryGetCanonicalImmediate12(rightOperand, out int bound))
+                    EmitImm(lessThan, GpScratch3, left, bound);
+                else
+                    EmitLessThan(GpScratch3, left, LoadIntegerSourceOperand(rightOperand, GpScratch2), signed);
+                return GpScratch3;
+            }
+
+            inverted = branch.Operator == "<=";
+            if (IsIntegerImmediate(rightOperand) && TryGetCanonicalImmediate12(rightOperand, out int limit) &&
+                TryGetComparisonSuccessorImmediate(limit, signed, out int successor))
+            {
+                EmitImm(lessThan, GpScratch3, left, successor);
+                inverted = !inverted;
+            }
+            else
+            {
+                EmitLessThan(GpScratch3, LoadIntegerSourceOperand(rightOperand, GpScratch2), left, signed);
             }
 
             return GpScratch3;
-        }
-
-        // The folded arms emit nothing, so the join is still reached by falling off the end of this block
-        private bool FallsThroughToJoin(LirBlock join)
-        {
-            join = JumpTarget(join);
-            for (var index = _currentBlockIndex + 1; index < _function.Blocks.Length; index++)
-            {
-                var block = _function.Blocks[index];
-                if (ReferenceEquals(block, join))
-                    return true;
-                if (!_foldedSelectArms.Contains(block) && !_jumpOnlyBlocks.ContainsKey(block))
-                    return false;
-            }
-
-            return false;
         }
 
         private LirBlock? NextEmittedBlock(int blockIndex)
@@ -1925,6 +1929,9 @@ public sealed class RiscVCodeGenerator
                 case LirInstructionKind.Branch:
                     EmitBranch(instruction);
                     break;
+                case LirInstructionKind.Select:
+                    EmitSelect(instruction);
+                    break;
                 case LirInstructionKind.Switch:
                     EmitSwitch(instruction);
                     break;
@@ -1956,11 +1963,13 @@ public sealed class RiscVCodeGenerator
             var namedLabels = new Dictionary<string, int>(StringComparer.Ordinal);
             var outputBindings = new List<RiscVAsmRegisterBinding>();
             var inputBindings = new List<RiscVAsmRegisterBinding>();
+            InlineAssemblyRegisters assigned = _allocation.GetInlineAssemblyRegisters(instruction);
             var operandIndex = 0;
             var copyIndex = 0;
 
-            foreach (var output in asmStatement.Outputs)
+            for (var index = 0; index < asmStatement.Outputs.Length; index++)
             {
+                GimpleAsmOperand output = asmStatement.Outputs[index];
                 InlineAsmFormattedOperand formatted;
                 var storage = output.Target is null
                     ? InlineAsmOperandStorage.Register
@@ -1977,7 +1986,7 @@ public sealed class RiscVCodeGenerator
                     if (copyIndex >= instruction.ParallelCopies.Length)
                         throw Unsupported(instruction, "Inline assembly output register is missing from LIR.");
                     var destination = instruction.ParallelCopies[copyIndex++].Destination;
-                    var binding = new RiscVAsmRegisterBinding(output, destination, null);
+                    var binding = new RiscVAsmRegisterBinding(output, destination, null, AssignedRiscVAsmRegister(assigned.Outputs, index));
                     outputBindings.Add(binding);
                     formatted = new InlineAsmFormattedOperand(
                         output.Name,
@@ -1987,8 +1996,9 @@ public sealed class RiscVCodeGenerator
                 AddAsmOperand(operands, namedOperands, formatted);
             }
 
-            foreach (var input in asmStatement.Inputs)
+            for (var index = 0; index < asmStatement.Inputs.Length; index++)
             {
+                GimpleAsmOperand input = asmStatement.Inputs[index];
                 if (operandIndex >= instruction.Operands.Length)
                     throw Unsupported(instruction, "Inline assembly input operand is missing from LIR.");
 
@@ -2005,7 +2015,7 @@ public sealed class RiscVCodeGenerator
                 }
                 else
                 {
-                    var binding = new RiscVAsmRegisterBinding(input, null, value);
+                    var binding = new RiscVAsmRegisterBinding(input, null, value, AssignedRiscVAsmRegister(assigned.Inputs, index));
                     inputBindings.Add(binding);
                     formatted = new InlineAsmFormattedOperand(
                         input.Name,
@@ -2043,7 +2053,7 @@ public sealed class RiscVCodeGenerator
                 _owner.CreateLocalLabel(_functionLabel + "_asm_id"));
             EmitInlineAssemblyText(instruction, expanded);
 
-            EmitRiscVAsmOutputMoves(outputBindings, instruction);
+            EmitRiscVAsmOutputMoves(outputBindings);
 
             if (asmStatement.IsGoto && instruction.Target is not null && !IsFallthroughTarget(instruction.Target))
                 EmitJump(LabelOf(instruction.Target));
@@ -2208,12 +2218,8 @@ public sealed class RiscVCodeGenerator
 
             foreach (var output in outputs)
             {
-                if (output.Register != MachineRegister.Invalid)
-                    continue;
-                var selected = SelectRiscVAsmRegister(output.Type, used, unavailable);
-                if (selected == MachineRegister.Invalid)
-                    throw Unsupported(instruction, $"Cannot satisfy RISC-V inline assembly output constraint '{output.Operand.Constraint}'.");
-                AssignRiscVAsmRegister(output, selected, used, unavailable, instruction, "output");
+                if (output.Register == MachineRegister.Invalid)
+                    AssignRiscVAsmRegister(output, RequireAssignedRiscVAsmRegister(output, instruction), used, unavailable, instruction, "output");
             }
 
             foreach (var input in inputs)
@@ -2227,11 +2233,24 @@ public sealed class RiscVCodeGenerator
             {
                 if (input.Register != MachineRegister.Invalid)
                     continue;
-                var selected = SelectRiscVAsmRegister(input.Type, used, unavailable);
-                if (selected == MachineRegister.Invalid)
-                    throw Unsupported(instruction, $"Cannot satisfy RISC-V inline assembly input constraint '{input.Operand.Constraint}'.");
-                AssignRiscVAsmRegister(input, selected, used, unavailable, instruction, "input");
+                MachineRegister register = RequireAssignedRiscVAsmRegister(input, instruction);
+                if (inputs.Any(other => other.MatchingOutput is null && other.Register == register && SameRiscVAsmInputValue(other.Input, input.Input!)))
+                    input.Register = register;
+                else
+                    AssignRiscVAsmRegister(input, register, used, unavailable, instruction, "input");
             }
+        }
+
+        private static MachineRegister AssignedRiscVAsmRegister(ImmutableArray<MachineRegister> registers, int index)
+            => index < registers.Length ? registers[index] : MachineRegister.Invalid;
+
+        private MachineRegister RequireAssignedRiscVAsmRegister(RiscVAsmRegisterBinding binding, LirInstruction instruction)
+        {
+            if (InlineAsmConstraints.HasExplicitRegister(binding.Operand.Constraint))
+                throw Unsupported(instruction, $"Invalid or unsupported RISC-V explicit register constraint '{binding.Operand.Constraint}'.");
+            if (binding.Assigned == MachineRegister.Invalid)
+                throw Unsupported(instruction, $"Cannot satisfy RISC-V inline assembly constraint '{binding.Operand.Constraint}'.");
+            return binding.Assigned;
         }
 
         private void AssignRiscVAsmRegister(
@@ -2247,39 +2266,6 @@ public sealed class RiscVCodeGenerator
             if (!used.Add(register))
                 throw Unsupported(instruction, $"RISC-V inline assembly operands require incompatible values in {RVRegisters.Format(ToAnyRegister(register))}.");
             binding.Register = register;
-        }
-
-        private MachineRegister SelectRiscVAsmRegister(
-            QualifiedType type,
-            HashSet<MachineRegister> used,
-            HashSet<MachineRegister> unavailable)
-        {
-            foreach (var register in RiscVAsmRegisterCandidates(type))
-            {
-                if (!used.Contains(register) && !unavailable.Contains(register))
-                    return register;
-            }
-            return MachineRegister.Invalid;
-        }
-
-        private IEnumerable<MachineRegister> RiscVAsmRegisterCandidates(QualifiedType type)
-        {
-            var allocated = RiscVAsmRegisterClass(type) switch
-            {
-                LirRegisterClass.Floating => _allocationOptions.FloatingRegisters,
-                LirRegisterClass.Vector => _allocationOptions.VectorRegisters,
-                _ => _allocationOptions.GeneralRegisters,
-            };
-
-            // Generic asm operands are deliberately kept out of the code generator's t0/t1/etc.
-            // scratch registers: formatting memory operands and materializing large stack offsets
-            // may use those scratches before the asm executes. The LSRA reserves the requested
-            // register class at an asm site, so caller-saved allocatable registers are free here.
-            foreach (var register in allocated)
-            {
-                if (!TargetRegisterInfo.IsCalleeSaved(_owner._target, register))
-                    yield return register;
-            }
         }
 
         private LirRegisterClass RiscVAsmRegisterClass(QualifiedType type)
@@ -2369,41 +2355,16 @@ public sealed class RiscVCodeGenerator
                     emitted = true;
                     break;
                 }
-                if (emitted)
-                    continue;
-
-                var cycleMove = moves.FirstOrDefault(static move => move.HasRegisterSource);
-                if (cycleMove is null)
-                    throw Unsupported(instruction, "Cannot resolve RISC-V inline assembly input operands.");
-                SpillRiscVAsmInputCycle(moves, cycleMove.SourceRegister, cycleMove.Type, instruction);
+                if (!emitted)
+                    throw InlineAssemblyMoveCycle();
             }
         }
 
-        private void SpillRiscVAsmInputCycle(
-            List<RiscVAsmInputMove> moves,
-            MachineRegister source,
-            QualifiedType type,
-            LirInstruction instruction)
-        {
-            RequireRiscVAsmTemp(type, instruction);
-            StoreToMemory(source, FrameBase, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(type));
-            foreach (var move in moves)
-            {
-                if (!move.HasRegisterSource || move.SourceRegister != source)
-                    continue;
-                move.SourceRegister = MachineRegister.Invalid;
-                move.UsesTemp = true;
-            }
-        }
+        private Exception InlineAssemblyMoveCycle()
+            => new InvalidOperationException($"Inline assembly operand moves in '{_functionLabel}' form a cycle at LIR position {_currentInstructionPosition}.");
 
         private void EmitRiscVAsmInputMove(RiscVAsmInputMove move, LirInstruction instruction)
         {
-            if (move.UsesTemp)
-            {
-                LoadFromMemory(move.Destination, FrameBase, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(move.Type), IsCanonicallySignExtended(move.Type));
-                NormalizeScalarRegister(move.Destination, move.Type);
-                return;
-            }
             if (move.HasRegisterSource)
             {
                 MoveRegister(move.Destination, move.SourceRegister, VectorGroupOf(move.Type));
@@ -2414,7 +2375,7 @@ public sealed class RiscVCodeGenerator
             LoadOperandIntoAs(move.SourceOperand, move.Destination, move.Type, instruction);
         }
 
-        private void EmitRiscVAsmOutputMoves(IReadOnlyList<RiscVAsmRegisterBinding> outputs, LirInstruction instruction)
+        private void EmitRiscVAsmOutputMoves(IReadOnlyList<RiscVAsmRegisterBinding> outputs)
         {
             var moves = new List<RiscVAsmRegisterMove>();
             foreach (var output in outputs)
@@ -2432,10 +2393,10 @@ public sealed class RiscVCodeGenerator
                     moves.Add(new RiscVAsmRegisterMove(destination, output.Register, output.Type));
             }
 
-            EmitRiscVAsmParallelRegisterMoves(moves, instruction);
+            EmitRiscVAsmParallelRegisterMoves(moves);
         }
 
-        private void EmitRiscVAsmParallelRegisterMoves(List<RiscVAsmRegisterMove> moves, LirInstruction instruction)
+        private void EmitRiscVAsmParallelRegisterMoves(List<RiscVAsmRegisterMove> moves)
         {
             while (moves.Count != 0)
             {
@@ -2450,37 +2411,9 @@ public sealed class RiscVCodeGenerator
                     emitted = true;
                     break;
                 }
-                if (emitted)
-                    continue;
-
-                var source = moves[0].Source;
-                var type = moves[0].Type;
-                RequireRiscVAsmTemp(type, instruction);
-                StoreToMemory(source, FrameBase, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(type));
-                var tempConsumers = new List<RiscVAsmRegisterMove>();
-                for (var i = moves.Count - 1; i >= 0; i--)
-                {
-                    if (moves[i].Source != source)
-                        continue;
-                    tempConsumers.Add(moves[i]);
-                    moves.RemoveAt(i);
-                }
-                EmitRiscVAsmParallelRegisterMoves(moves, instruction);
-                foreach (var move in tempConsumers)
-                {
-                    LoadFromMemory(move.Destination, FrameBase, _allocation.Frame.ParallelCopyTempOffset, SizeOfRegisterType(move.Type), IsCanonicallySignExtended(move.Type));
-                    NormalizeScalarRegister(move.Destination, move.Type);
-                }
+                if (!emitted)
+                    throw InlineAssemblyMoveCycle();
             }
-        }
-
-        private void RequireRiscVAsmTemp(QualifiedType type, LirInstruction instruction)
-        {
-            var required = AlignUp(
-                Math.Max(_allocationOptions.SpillSlotSize, SizeOfRegisterType(type)),
-                _allocationOptions.SpillSlotAlignment);
-            if (_allocation.Frame.ParallelCopyTempSize < required)
-                throw Unsupported(instruction, "RISC-V inline assembly parallel-copy spill slot is too small.");
         }
 
         private MachineRegister? TryGetRiscVConstraintRegister(string constraint, QualifiedType type)
@@ -2528,13 +2461,15 @@ public sealed class RiscVCodeGenerator
             public QualifiedType Type => Output?.Type ?? Input!.Type;
             public RiscVAsmRegisterBinding? MatchingOutput { get; set; }
             public MachineRegister Register { get; set; }
+            public MachineRegister Assigned { get; }
 
-            public RiscVAsmRegisterBinding(GimpleAsmOperand operand, LirVirtualRegister? output, LirOperand? input)
+            public RiscVAsmRegisterBinding(GimpleAsmOperand operand, LirVirtualRegister? output, LirOperand? input, MachineRegister assigned)
             {
                 Operand = operand ?? throw new ArgumentNullException(nameof(operand));
                 Output = output;
                 Input = input;
                 Register = MachineRegister.Invalid;
+                Assigned = assigned;
             }
         }
 
@@ -2544,7 +2479,6 @@ public sealed class RiscVCodeGenerator
             public LirOperand? SourceOperand { get; set; }
             public MachineRegister SourceRegister { get; set; }
             public QualifiedType Type { get; }
-            public bool UsesTemp { get; set; }
             public bool HasRegisterSource => SourceRegister != MachineRegister.Invalid;
 
             public RiscVAsmInputMove(MachineRegister destination, LirOperand sourceOperand, QualifiedType type)
@@ -5638,9 +5572,6 @@ public sealed class RiscVCodeGenerator
 
         private void EmitBranch(LirInstruction instruction)
         {
-            if (TryEmitSelect(instruction))
-                return;
-
             if (instruction.Operands.Length == 2 && IsComparisonOperator(instruction.Operator))
             {
                 EmitComparisonBranch(instruction);
@@ -6128,6 +6059,18 @@ public sealed class RiscVCodeGenerator
             {
                 foreach (var copy in ordered)
                     EmitDirectParallelCopy(copy, instruction);
+                return;
+            }
+
+            if (_allocation.TrySequenceCyclicParallelCopy(instruction, copies, out ImmutableArray<(int Copy, MachineRegister From, MachineRegister To)> steps))
+            {
+                foreach ((int copy, MachineRegister from, MachineRegister to) in steps)
+                {
+                    if (from == MachineRegister.Invalid)
+                        LoadOperandIntoAs(copies[copy].Source, to, copies[copy].Destination.Type, instruction);
+                    else
+                        MoveRegister(to, from);
+                }
                 return;
             }
 
@@ -7987,6 +7930,10 @@ public sealed class RiscVCodeGenerator
                             fact = CommonSignExtension(source, right);
                         break;
                     }
+                case RVInstrKind.CzeroEqz:
+                case RVInstrKind.CzeroNez:
+                    fact = source;
+                    break;
                 case RVInstrKind.AddUw when instruction.Rs2 == RVRegister.X0:
                     fact = IntegerRepresentationFact.ZeroExtended(32);
                     break;
