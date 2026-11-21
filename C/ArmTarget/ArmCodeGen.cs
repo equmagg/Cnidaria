@@ -620,7 +620,9 @@ public sealed class ArmCodeGenerator
         _text.DefineLabel(label);
         context.EmitPrologue();
         context.EmitBlocks();
-        context.EmitTrap();
+        context.EmitSharedEpilogue();
+        if (!_text.EndsWithoutFallthrough)
+            context.EmitTrap();
         var size = _text.ByteLength - startOffset;
         var binding = _fileScopeLinkage.IsInternal(function.Symbol) ? ArmObjectSymbolBinding.Local : ArmObjectSymbolBinding.Global;
         _symbols.Add(new ArmObjectSymbol(label, TextSectionName, startOffset, size, binding, ArmObjectSymbolKind.Function));
@@ -914,6 +916,8 @@ public sealed class ArmCodeGenerator
         private readonly int _varArgsVrSaveAreaOffset;
         private readonly int _varArgsVrSaveAreaSize;
         private readonly int _totalFrameSize;
+        private readonly string _epilogueLabel;
+        private bool _epilogueReferenced;
         private readonly IntegerRepresentationFact[] _integerRepresentationFacts = new IntegerRepresentationFact[32];
         private int _currentInstructionPosition;
         private LirBlock? _fallthroughBlock;
@@ -1029,6 +1033,7 @@ public sealed class ArmCodeGenerator
                     ? -1
                     : checked(_totalFrameSize - _varArgsGpSaveAreaSize);
             }
+            _epilogueLabel = owner.CreateLocalLabel(functionLabel + "_epilogue");
         }
 
         private void RecordUnwindInfo()
@@ -1306,7 +1311,6 @@ public sealed class ArmCodeGenerator
                     EmitReturnBuffer(instruction);
                     break;
                 case LirInstructionKind.Unreachable:
-                    EmitTrap();
                     break;
                 default:
                     throw Unsupported(instruction, "Unsupported LIR instruction kind.");
@@ -1770,6 +1774,12 @@ public sealed class ArmCodeGenerator
             {
                 var partType = instruction.Result.Type;
                 var partLocation = CAbi.AssignParameterSegmentLocation(value, segmentIndex, ref cursor, _owner._allocationOptions.StackArgumentSlotSize);
+                if (IsVfpSlot(partLocation))
+                {
+                    StoreVfpSlot(partLocation.Register, partLocation.RegisterByteOffset, instruction.Result);
+                    return;
+                }
+
                 var part = GetWritableRegister(instruction.Result, PreferredScratch(partType, Scratch0, FpScratch0));
                 if (partLocation.Kind == AbiLocationKind.Register)
                     MoveRegister(part, partLocation.Register, RegisterSize(partType));
@@ -1817,7 +1827,8 @@ public sealed class ArmCodeGenerator
                         throw Unsupported(instruction, "Invalid aggregate parameter segment location.");
                     }
 
-                    StoreToMemory(source, home, segment.Offset, RawStorageSize(segment.Size));
+                    StoreToMemory(source, home, segment.Offset, RawStorageSize(segment.Size),
+                        segmentLocation.Kind == AbiLocationKind.Register ? segmentLocation.RegisterByteOffset : 0);
                 }
                 return;
             }
@@ -1832,11 +1843,16 @@ public sealed class ArmCodeGenerator
             }
 
             RequireScalar(instruction.Result.Type, instruction);
-            if (value.PassingKind != AbiPassingKind.Scalar || value.Segments.Length != 1 ||
-                value.Segments[0].RegisterClass is not (AbiRegisterClass.General or AbiRegisterClass.Vector))
+            if (value.PassingKind != AbiPassingKind.Scalar || value.Segments.Length != 1 || !IsScalarAbiClass(value.Segments[0].RegisterClass))
                 throw Unsupported(instruction, "Unsupported scalar ARM parameter class.");
 
             var location = placement.Locations[0];
+            if (IsVfpSlot(location))
+            {
+                StoreVfpSlot(location.Register, location.RegisterByteOffset, instruction.Result);
+                return;
+            }
+
             var destination = GetWritableRegister(
                 instruction.Result,
                 PreferredScratch(type, Scratch0, FpScratch0));
@@ -2167,18 +2183,9 @@ public sealed class ArmCodeGenerator
                     EmitBinaryImmediate(subtract ? ArmInstrKind.Sub : ArmInstrKind.Add, destination, leftOperand, addend, size);
                     return true;
                 }
-                case "*":
-                {
-                    // No multiply form takes an immediate, so only a power of two reaches one instruction
-                    if (!LirStrengthReduction.TryGetPowerOfTwoFactor(instruction, _owner._target, out var factorShift))
-                        return false;
-                    EmitBinaryImmediate(ArmInstrKind.Lsl, destination, leftOperand, factorShift, size);
-                    return true;
-                }
                 case "/":
                 case "%":
-                    return TryEmitDivideByPowerOfTwo(instruction, destination, leftOperand, size) ||
-                        TryEmitDivideByMagic(instruction, destination, leftOperand, size);
+                    return TryEmitDivideByMagic(instruction, destination, leftOperand, size);
                 case "&":
                 case "|":
                 case "^":
@@ -2298,51 +2305,6 @@ public sealed class ArmCodeGenerator
             }
 
             MoveRegister(destination, quotient, size);
-            return true;
-        }
-
-        private bool TryEmitDivideByPowerOfTwo(LirInstruction instruction, MachineRegister destination, LirOperand leftOperand, int size)
-        {
-            if (!LirStrengthReduction.TryGetPowerOfTwoDivisor(instruction, _owner._target, out var shift, out var negated))
-                return false;
-
-            var bits = size * 8;
-            var wantRemainder = instruction.Operator == "%";
-            var dividend = LoadOperandAtWidth(leftOperand, Scratch1, size);
-            InvalidateIntegerRepresentation(destination);
-
-            if (!IsSignedIntegerType(instruction.Operands[0].Type))
-            {
-                Emit(ArmInstruction.Ternary(
-                    wantRemainder ? ArmInstrKind.And : ArmInstrKind.Lsr,
-                    Reg(ToArm(destination), size),
-                    Reg(ToArm(dividend), size),
-                    ArmOperand.ImmediateOperand(wantRemainder ? (1L << shift) - 1 : shift)));
-                return true;
-            }
-
-            // The bias is 2^k - 1 for a negative dividend and zero otherwise, so the shift truncates toward zero
-            if (shift == 1)
-            {
-                Emit(ArmInstruction.Ternary(ArmInstrKind.Lsr, Reg(ToArm(Scratch2), size), Reg(ToArm(dividend), size), ArmOperand.ImmediateOperand(bits - 1)));
-            }
-            else
-            {
-                Emit(ArmInstruction.Ternary(ArmInstrKind.Asr, Reg(ToArm(Scratch2), size), Reg(ToArm(dividend), size), ArmOperand.ImmediateOperand(bits - 1)));
-                Emit(ArmInstruction.Ternary(ArmInstrKind.Lsr, Reg(ToArm(Scratch2), size), Reg(ToArm(Scratch2), size), ArmOperand.ImmediateOperand(bits - shift)));
-            }
-
-            Emit(ArmInstruction.Ternary(ArmInstrKind.Add, Reg(ToArm(Scratch2), size), Reg(ToArm(dividend), size), Reg(ToArm(Scratch2), size)));
-            if (wantRemainder)
-            {
-                Emit(ArmInstruction.Ternary(ArmInstrKind.And, Reg(ToArm(Scratch2), size), Reg(ToArm(Scratch2), size), ArmOperand.ImmediateOperand(-(1L << shift))));
-                Emit(ArmInstruction.Ternary(ArmInstrKind.Sub, Reg(ToArm(destination), size), Reg(ToArm(dividend), size), Reg(ToArm(Scratch2), size)));
-                return true;
-            }
-
-            Emit(ArmInstruction.Ternary(ArmInstrKind.Asr, Reg(ToArm(destination), size), Reg(ToArm(Scratch2), size), ArmOperand.ImmediateOperand(shift)));
-            if (negated)
-                Emit(ArmInstruction.Ternary(ArmInstrKind.Sub, Reg(ToArm(destination), size), Reg(ArmRegister.Xzr, size), Reg(ToArm(destination), size)));
             return true;
         }
 
@@ -2701,14 +2663,8 @@ public sealed class ArmCodeGenerator
                 EmitConditionalOne(destination, condition, size);
                 return;
             }
-            var trueLabel = _owner.CreateLocalLabel(_functionLabel + "_cmp_true");
-            var doneLabel = _owner.CreateLocalLabel(_functionLabel + "_cmp_done");
             LoadImmediate(destination, 0, size);
-            EmitConditionalJump(condition, trueLabel);
-            EmitJump(doneLabel);
-            _owner._text.DefineLabel(trueLabel);
-            LoadImmediate(destination, 1, size);
-            _owner._text.DefineLabel(doneLabel);
+            Emit(ArmInstruction.Binary(ArmInstrKind.Mov, Reg(ToArm(destination), size), ArmOperand.ImmediateOperand(1), condition));
         }
 
         private void EmitFloatingComparisonResult(
@@ -2942,6 +2898,8 @@ public sealed class ArmCodeGenerator
 
         private void MarshalCallArguments(LirInstruction instruction, CallArguments arguments)
         {
+            foreach (CallArgument argument in arguments.VfpSlots)
+                LoadVfpSlot(argument.Location.Register, argument.Location.RegisterByteOffset, argument.Operand, instruction);
             if (arguments.NeedsStaging)
                 StageCallArguments(instruction, arguments);
             else
@@ -3049,6 +3007,7 @@ public sealed class ArmCodeGenerator
         private sealed class CallArguments
         {
             public List<CallArgument> Scalars { get; } = new();
+            public List<CallArgument> VfpSlots { get; } = new();
             public List<(LirOperand Operand, AbiPlacement Placement)> InMemory { get; } = new();
             public AbiLocation? HiddenReturnBuffer { get; init; }
             public bool NeedsStaging => InMemory.Count != 0 || Scalars.Exists(static argument => argument.Operand.Kind == LirOperandKind.Address);
@@ -3088,7 +3047,8 @@ public sealed class ArmCodeGenerator
                     for (var segment = 0; segment < value.Segments.Length; segment++)
                     {
                         var part = operand.Parts[segment];
-                        arguments.Scalars.Add(new CallArgument(part, RequireArgumentLocation(placement.Locations[segment], instruction), RegisterSize(part.Type), RegisterSize(part.Type)));
+                        var partLocation = RequireArgumentLocation(placement.Locations[segment], instruction);
+                        (IsVfpSlot(partLocation) ? arguments.VfpSlots : arguments.Scalars).Add(new CallArgument(part, partLocation, RegisterSize(part.Type), RegisterSize(part.Type)));
                     }
                     continue;
                 }
@@ -3100,14 +3060,21 @@ public sealed class ArmCodeGenerator
 
                 value = placement.Value;
                 RequireScalar(operand.Type, instruction);
-                if (value.PassingKind != AbiPassingKind.Scalar || value.Segments.Length != 1 ||
-                    value.Segments[0].RegisterClass is not (AbiRegisterClass.General or AbiRegisterClass.Vector))
+                if (value.PassingKind != AbiPassingKind.Scalar || value.Segments.Length != 1 || !IsScalarAbiClass(value.Segments[0].RegisterClass))
                     throw Unsupported(instruction, "Unsupported scalar ARM call argument class.");
-                arguments.Scalars.Add(new CallArgument(operand, RequireArgumentLocation(placement.Locations[0], instruction), Math.Max(1, value.Size), RegisterSize(operand.Type)));
+                var location = RequireArgumentLocation(placement.Locations[0], instruction);
+                (IsVfpSlot(location) ? arguments.VfpSlots : arguments.Scalars).Add(new CallArgument(operand, location, Math.Max(1, value.Size), RegisterSize(operand.Type)));
             }
 
             return arguments;
         }
+
+        private bool IsScalarAbiClass(AbiRegisterClass registerClass)
+            => registerClass is AbiRegisterClass.General or AbiRegisterClass.Vector ||
+               registerClass == AbiRegisterClass.Floating && !_owner._machineTarget.Is64Bit;
+
+        private bool IsVfpSlot(AbiLocation location)
+            => location.Kind == AbiLocationKind.Register && IsArm32VfpRegister(location.Register);
 
         private AbiLocation RequireArgumentLocation(AbiLocation location, LirInstruction instruction)
             => location.Kind is AbiLocationKind.Register or AbiLocationKind.Stack
@@ -3145,7 +3112,7 @@ public sealed class ArmCodeGenerator
                     var width = RawStorageSize(segment.Size);
                     if (location.Kind == AbiLocationKind.Register)
                     {
-                        LoadFromMemory(location.Register, source, segment.Offset, width, false);
+                        LoadFromMemory(location.Register, source, segment.Offset, width, false, location.RegisterByteOffset);
                     }
                     else if (location.Kind == AbiLocationKind.Stack)
                     {
@@ -3187,16 +3154,21 @@ public sealed class ArmCodeGenerator
                 for (var i = 0; i < aggregate.Segments.Length; i++)
                 {
                     var segment = aggregate.Segments[i];
-                    StoreToMemory(CAbi.SegmentReturnRegister(aggregate, i), home, segment.Offset, RawStorageSize(segment.Size));
+                    StoreToMemory(CAbi.SegmentReturnRegister(aggregate, i), home, segment.Offset, RawStorageSize(segment.Size),
+                        CAbi.SegmentReturnRegisterByteOffset(aggregate, i));
                 }
                 return;
             }
 
             RequireScalar(instruction.Result.Type, instruction);
             var value = CAbi.ClassifyValue(_owner._target, instruction.Result.Type, true, false);
-            if (value.PassingKind != AbiPassingKind.Scalar || value.Segments.Length != 1 ||
-                value.Segments[0].RegisterClass is not (AbiRegisterClass.General or AbiRegisterClass.Vector))
+            if (value.PassingKind != AbiPassingKind.Scalar || value.Segments.Length != 1 || !IsScalarAbiClass(value.Segments[0].RegisterClass))
                 throw Unsupported(instruction, "Unsupported scalar ARM call result class.");
+            if (IsArm32VfpRegister(CAbi.ReturnRegister(value.Segments[0], 0)))
+            {
+                StoreVfpSlot(CAbi.ReturnRegister(value.Segments[0], 0), CAbi.ReturnRegisterByteOffset(value.Segments[0], 0), instruction.Result);
+                return;
+            }
             var destination = GetWritableRegister(
                 instruction.Result,
                 PreferredScratch(instruction.Result.Type, Scratch0, FpScratch0));
@@ -3489,10 +3461,7 @@ public sealed class ArmCodeGenerator
                     var source = MaterializeOperandStorageAddress(operand, Scratch1, instruction);
                     LoadFromMemory(Scratch0, _allocation.Frame.HiddenReturnBufferOffset, _owner._target.PointerSize, false);
                     CopyMemory(Scratch0, source, value.Size);
-                    EmitEpilogue();
-                    Emit(ArmInstruction.Unary(
-                        _owner._machineTarget.Is64Bit ? ArmInstrKind.Ret : ArmInstrKind.Bx,
-                        Reg(_owner._machineTarget.Is64Bit ? ArmRegister.X30 : ArmRegister.Lr, _owner._target.PointerSize)));
+                    LeaveFunction();
                     return;
                 }
 
@@ -3502,41 +3471,46 @@ public sealed class ArmCodeGenerator
                     for (var i = 0; i < value.Segments.Length; i++)
                     {
                         var segment = value.Segments[i];
-                        LoadFromMemory(CAbi.SegmentReturnRegister(value, i), source, segment.Offset, RawStorageSize(segment.Size), false);
+                        LoadFromMemory(CAbi.SegmentReturnRegister(value, i), source, segment.Offset, RawStorageSize(segment.Size), false,
+                            CAbi.SegmentReturnRegisterByteOffset(value, i));
                     }
 
-                    EmitEpilogue();
-                    Emit(ArmInstruction.Unary(
-                        _owner._machineTarget.Is64Bit ? ArmInstrKind.Ret : ArmInstrKind.Bx,
-                        Reg(_owner._machineTarget.Is64Bit ? ArmRegister.X30 : ArmRegister.Lr, _owner._target.PointerSize)));
+                    LeaveFunction();
                     return;
                 }
 
                 RequireScalar(operand.Type, instruction);
-                if (value.PassingKind != AbiPassingKind.Scalar || value.Segments.Length != 1 ||
-                    value.Segments[0].RegisterClass is not (AbiRegisterClass.General or AbiRegisterClass.Vector))
+                if (value.PassingKind != AbiPassingKind.Scalar || value.Segments.Length != 1 || !IsScalarAbiClass(value.Segments[0].RegisterClass))
                     throw Unsupported(instruction, "Unsupported scalar ARM return class.");
-                LoadOperandIntoAs(operand, CAbi.ReturnRegister(value.Segments[0], 0), returnType, instruction);
+                if (IsArm32VfpRegister(CAbi.ReturnRegister(value.Segments[0], 0)))
+                    LoadVfpSlot(CAbi.ReturnRegister(value.Segments[0], 0), CAbi.ReturnRegisterByteOffset(value.Segments[0], 0), operand, instruction);
+                else
+                    LoadOperandIntoAs(operand, CAbi.ReturnRegister(value.Segments[0], 0), returnType, instruction);
             }
 
-            EmitEpilogue();
-            Emit(ArmInstruction.Unary(
-                _owner._machineTarget.Is64Bit ? ArmInstrKind.Ret : ArmInstrKind.Bx,
-                Reg(_owner._machineTarget.Is64Bit ? ArmRegister.X30 : ArmRegister.Lr,
-                _owner._target.PointerSize)));
+            LeaveFunction();
         }
 
         private void MoveReturnSegments(LirInstruction instruction)
         {
             var functionType = _function.Symbol!.FunctionType!;
             var value = CAbi.ClassifyValue(_owner._target, functionType.ReturnType, true, false, functionType.IsVariadic);
-            var parts = instruction.Operands[0].Parts;
-            var destinations = new MachineRegister[parts.Length];
-            var sources = new MachineRegister[parts.Length];
-            for (var i = 0; i < destinations.Length; i++)
+            var parts = new List<LirOperand>();
+            var destinations = new List<MachineRegister>();
+            var sources = new List<MachineRegister>();
+            for (var i = 0; i < instruction.Operands[0].Parts.Length; i++)
             {
-                destinations[i] = CAbi.SegmentReturnRegister(value, i);
-                sources[i] = _allocation.TryGetPhysicalRegister(parts[i], out var register) ? register : MachineRegister.Invalid;
+                var part = instruction.Operands[0].Parts[i];
+                var destination = CAbi.SegmentReturnRegister(value, i);
+                if (IsArm32VfpRegister(destination))
+                {
+                    LoadVfpSlot(destination, CAbi.SegmentReturnRegisterByteOffset(value, i), part, instruction);
+                    continue;
+                }
+
+                parts.Add(part);
+                destinations.Add(destination);
+                sources.Add(_allocation.TryGetPhysicalRegister(part, out var register) ? register : MachineRegister.Invalid);
             }
 
             foreach (var (move, from, to) in RegisterMoveSequencer.Order(destinations, sources, register => IsVectorRegister(register) ? FpScratch0 : Scratch0))
@@ -3554,6 +3528,35 @@ public sealed class ArmCodeGenerator
             LoadFromMemory(destination, _allocation.Frame.HiddenReturnBufferOffset, _owner._target.PointerSize, false);
             StoreWritableRegisterIfSpilled(instruction.Result!, destination);
         }
+
+        private void LeaveFunction()
+        {
+            if (_fallthroughBlock is not null && _totalFrameSize == 0)
+            {
+                EmitReturnInstruction();
+                return;
+            }
+
+            _epilogueReferenced = true;
+            if (_fallthroughBlock is not null)
+                EmitJump(_epilogueLabel);
+        }
+
+        public void EmitSharedEpilogue()
+        {
+            if (!_epilogueReferenced)
+                return;
+
+            ClearIntegerRepresentationFacts();
+            _owner._text.DefineLabel(_epilogueLabel);
+            EmitEpilogue();
+            EmitReturnInstruction();
+        }
+
+        private void EmitReturnInstruction()
+            => Emit(ArmInstruction.Unary(
+                _owner._machineTarget.Is64Bit ? ArmInstrKind.Ret : ArmInstrKind.Bx,
+                Reg(_owner._machineTarget.Is64Bit ? ArmRegister.X30 : ArmRegister.Lr, _owner._target.PointerSize)));
 
         private void EmitEpilogue()
         {
@@ -3828,17 +3831,19 @@ public sealed class ArmCodeGenerator
 
         private MachineRegister MaterializeVirtualRegisterStorageAddress(LirVirtualRegister register, MachineRegister destination)
         {
+            AddImmediate(destination, FrameBase, VirtualRegisterHomeOffset(register));
+            return destination;
+        }
+
+        private int VirtualRegisterHomeOffset(LirVirtualRegister register)
+        {
             if (register.HomeSlot is { } home)
-            {
-                AddImmediate(destination, FrameBase, _allocation.Frame.StackSlotOffsets[home]);
-                return destination;
-            }
+                return _allocation.Frame.StackSlotOffsets[home];
 
             var allocation = _allocation[register];
             if (!allocation.IsSpilled)
                 throw new NotSupportedException($"Virtual register {register.Name} must be stack-backed.");
-            AddImmediate(destination, FrameBase, allocation.StackOffset);
-            return destination;
+            return allocation.StackOffset;
         }
 
         private MachineRegister MaterializeOperandStorageAddress(LirOperand operand, MachineRegister destination, LirInstruction instruction)
@@ -4304,9 +4309,9 @@ public sealed class ArmCodeGenerator
                 SetIntegerRepresentation(destination, RepresentationForLoad(size, signed));
         }
 
-        private void LoadFromMemory(MachineRegister destination, MachineRegister baseRegister, int offset, int size, bool signed)
+        private void LoadFromMemory(MachineRegister destination, MachineRegister baseRegister, int offset, int size, bool signed, int registerByteOffset = 0)
         {
-            EmitMemoryLoad(ToArmRegister(destination), ToArmRegister(baseRegister), offset, size, signed);
+            EmitMemoryLoad(ToArmDataRegister(destination, size, registerByteOffset), ToArmRegister(baseRegister), offset, size, signed);
             if (!IsVectorRegister(destination))
                 SetIntegerRepresentation(destination, RepresentationForLoad(size, signed));
         }
@@ -4314,15 +4319,55 @@ public sealed class ArmCodeGenerator
         private void StoreToMemory(MachineRegister source, int offset, int size)
             => EmitMemoryStore(ToArmRegister(source), FrameBaseArm, offset, size);
 
-        private void StoreToMemory(MachineRegister source, MachineRegister baseRegister, int offset, int size)
-            => EmitMemoryStore(ToArmRegister(source), ToArmRegister(baseRegister), offset, size);
+        private void StoreToMemory(MachineRegister source, MachineRegister baseRegister, int offset, int size, int registerByteOffset = 0)
+            => EmitMemoryStore(ToArmDataRegister(source, size, registerByteOffset), ToArmRegister(baseRegister), offset, size);
+
+        private ArmRegister ToArmDataRegister(MachineRegister register, int size, int registerByteOffset)
+            => IsArm32VfpRegister(register) ? ToArm32Vfp(register, size, registerByteOffset) : ToArmRegister(register);
+
+        private bool IsArm32VfpRegister(MachineRegister register)
+            => !_owner._machineTarget.Is64Bit && register >= MachineRegister.F0 && register <= MachineRegister.F31;
+
+        // A floating register names a d register, and a single occupies one of its halves
+        private static ArmRegister ToArm32Vfp(MachineRegister register, int size, int registerByteOffset)
+        {
+            var index = (int)register - (int)MachineRegister.F0;
+            return (ArmRegister)((int)ArmRegister.V0 + (size == 8 ? index : index * 2 + registerByteOffset / 4));
+        }
+
+        // Floating values live in core registers and stack pairs, a hard-float call passes them in VFP registers
+        private void LoadVfpSlot(MachineRegister slot, int registerByteOffset, LirOperand operand, LirInstruction instruction)
+        {
+            if (IsArm32Double(operand.Type))
+            {
+                LoadFromMemory(slot, MaterializeOperandStorageAddress(operand, Scratch0, instruction), 0, 8, false);
+                return;
+            }
+
+            var source = LoadOperand(operand, Scratch0);
+            Emit(ArmInstruction.Binary(ArmInstrKind.Fmov, Reg(ToArm32Vfp(slot, 4, registerByteOffset), 4), Reg(ToArm(source), 4)));
+        }
+
+        private void StoreVfpSlot(MachineRegister slot, int registerByteOffset, LirVirtualRegister result)
+        {
+            if (IsArm32Double(result.Type))
+            {
+                StoreToMemory(slot, MaterializeVirtualRegisterStorageAddress(result, Scratch0), 0, 8);
+                return;
+            }
+
+            var destination = GetWritableRegister(result, Scratch0);
+            Emit(ArmInstruction.Binary(ArmInstrKind.Fmov, Reg(ToArm(destination), 4), Reg(ToArm32Vfp(slot, 4, registerByteOffset), 4)));
+            InvalidateIntegerRepresentation(destination);
+            StoreWritableRegisterIfSpilled(result, destination);
+        }
 
         private void EmitMemoryLoad(ArmRegister destination, ArmRegister baseRegister, int offset, int size, bool signed)
         {
             var vector = ArmRegisters.IsVector(destination);
             var extend = signed && !vector;
             var target = Reg(destination, vector ? size : RegisterOperandSize(size, extend));
-            if (CanEncodeMemoryOffset(offset, size, extend))
+            if (vector && !_owner._machineTarget.Is64Bit ? CanEncodeVfpOffset(offset) : CanEncodeMemoryOffset(offset, size, extend))
             {
                 Emit(ArmInstruction.Binary(LoadOpcode(size, extend), target, Mem(baseRegister, offset, size)));
                 return;
@@ -4335,15 +4380,16 @@ public sealed class ArmCodeGenerator
 
         private void EmitMemoryStore(ArmRegister source, ArmRegister baseRegister, int offset, int size)
         {
-            if (CanEncodeMemoryOffset(offset, size))
+            ArmOperand data = Reg(source, size is 1 or 2 ? 4 : size);
+            if (ArmRegisters.IsVector(source) && !_owner._machineTarget.Is64Bit ? CanEncodeVfpOffset(offset) : CanEncodeMemoryOffset(offset, size))
             {
-                Emit(ArmInstruction.Binary(StoreOpcode(size), Reg(source, size), Mem(baseRegister, offset, size)));
+                Emit(ArmInstruction.Binary(StoreOpcode(size), data, Mem(baseRegister, offset, size)));
                 return;
             }
 
             var addressScratch = SelectAddressScratch(baseRegister, source);
             AddImmediate(addressScratch, FromArm(baseRegister), offset);
-            Emit(ArmInstruction.Binary(StoreOpcode(size), Reg(source, size), Mem(ToArm(addressScratch), 0, size)));
+            Emit(ArmInstruction.Binary(StoreOpcode(size), data, Mem(ToArm(addressScratch), 0, size)));
         }
 
         private MachineRegister SelectAddressScratch(ArmRegister firstAvoid, ArmRegister secondAvoid)
@@ -4357,6 +4403,9 @@ public sealed class ArmCodeGenerator
             }
             throw new InvalidOperationException("No ARM address scratch register is available.");
         }
+
+        private static bool CanEncodeVfpOffset(int offset)
+            => offset % 4 == 0 && offset >= -1020 && offset <= 1020;
 
         private bool CanEncodeMemoryOffset(int offset, int size, bool signed = false)
         {
@@ -4760,6 +4809,14 @@ public sealed class ArmCodeGenerator
                 return;
             }
 
+            if (operand.Kind == LirOperandKind.Register && operand.Register is not null)
+            {
+                var home = VirtualRegisterHomeOffset(operand.Register);
+                LoadFromMemory(low, FrameBase, home, 4, false);
+                LoadFromMemory(high, FrameBase, home + 4, 4, false);
+                return;
+            }
+
             var address = MaterializeOperandStorageAddress(operand, Scratch4, instruction);
             LoadFromMemory(low, address, 0, 4, false);
             LoadFromMemory(high, address, 4, 4, false);
@@ -4767,9 +4824,9 @@ public sealed class ArmCodeGenerator
 
         private void StoreWideResult(LirVirtualRegister result, MachineRegister low, MachineRegister high)
         {
-            var address = MaterializeVirtualRegisterStorageAddress(result, Scratch4);
-            StoreToMemory(low, address, 0, 4);
-            StoreToMemory(high, address, 4, 4);
+            var home = VirtualRegisterHomeOffset(result);
+            StoreToMemory(low, FrameBase, home, 4);
+            StoreToMemory(high, FrameBase, home + 4, 4);
         }
 
         private void StoreNarrowResult(LirVirtualRegister result, MachineRegister value)
@@ -4931,6 +4988,17 @@ public sealed class ArmCodeGenerator
         private void EmitWideShift(LirInstruction instruction)
         {
             var result = instruction.Result!;
+            if (instruction.Operands[1].Kind == LirOperandKind.Immediate && instruction.Operands[1].Immediate is not string)
+            {
+                LoadWide(instruction.Operands[0], Scratch0, Scratch1, instruction);
+                EmitWideShiftByConstant(instruction, (int)(ConvertIntegerConstant(instruction.Operands[1].Immediate) & 63));
+                if (IsWideInteger(result.Type))
+                    StoreWideResult(result, Scratch0, Scratch1);
+                else
+                    StoreNarrowResult(result, Scratch0);
+                return;
+            }
+
             LoadWide(instruction.Operands[1], Scratch2, Scratch3, instruction);
             LoadWide(instruction.Operands[0], Scratch0, Scratch1, instruction);
             EmitWideAluImmediate(ArmInstrKind.And, Scratch2, Scratch2, 63);
@@ -4979,6 +5047,50 @@ public sealed class ArmCodeGenerator
                 StoreNarrowResult(result, Scratch0);
         }
 
+        private void EmitWideShiftByConstant(LirInstruction instruction, int count)
+        {
+            var arithmetic = instruction.Operator != "<<" && IsSignedIntegerType(instruction.Operands[0].Type);
+            if (count == 0)
+                return;
+            if (instruction.Operator == "<<")
+            {
+                if (count >= 32)
+                {
+                    if (count == 32)
+                        MoveRegister(Scratch1, Scratch0, 4);
+                    else
+                        EmitWideAluImmediate(ArmInstrKind.Lsl, Scratch1, Scratch0, count - 32);
+                    LoadImmediate(Scratch0, 0, 4);
+                    return;
+                }
+
+                EmitWideAluImmediate(ArmInstrKind.Lsr, Scratch4, Scratch0, 32 - count);
+                EmitWideAluImmediate(ArmInstrKind.Lsl, Scratch1, Scratch1, count);
+                EmitWideAlu(ArmInstrKind.Orr, Scratch1, Scratch1, Scratch4);
+                EmitWideAluImmediate(ArmInstrKind.Lsl, Scratch0, Scratch0, count);
+                return;
+            }
+
+            var highShift = arithmetic ? ArmInstrKind.Asr : ArmInstrKind.Lsr;
+            if (count >= 32)
+            {
+                if (count == 32)
+                    MoveRegister(Scratch0, Scratch1, 4);
+                else
+                    EmitWideAluImmediate(highShift, Scratch0, Scratch1, count - 32);
+                if (arithmetic)
+                    EmitWideAluImmediate(ArmInstrKind.Asr, Scratch1, Scratch1, 31);
+                else
+                    LoadImmediate(Scratch1, 0, 4);
+                return;
+            }
+
+            EmitWideAluImmediate(ArmInstrKind.Lsl, Scratch4, Scratch1, 32 - count);
+            EmitWideAluImmediate(ArmInstrKind.Lsr, Scratch0, Scratch0, count);
+            EmitWideAlu(ArmInstrKind.Orr, Scratch0, Scratch0, Scratch4);
+            EmitWideAluImmediate(highShift, Scratch1, Scratch1, count);
+        }
+
         private void EmitWideRelation(string op, LirOperand left, LirOperand right, MachineRegister destination, LirInstruction instruction)
         {
             var signed = IsSignedIntegerType(IsWideInteger(left.Type) ? left.Type : right.Type);
@@ -5024,6 +5136,19 @@ public sealed class ArmCodeGenerator
                 EmitWideNegateIfNegative(Scratch2, Scratch3, "divisor");
             }
 
+            var wideOperands = _owner.CreateLocalLabel(_functionLabel + "_i64_div_wide");
+            var signs = _owner.CreateLocalLabel(_functionLabel + "_i64_div_signs");
+            EmitWideAlu(ArmInstrKind.Orr, Scratch4, Scratch1, Scratch3);
+            Emit(ArmInstruction.Binary(ArmInstrKind.Cmp, Reg(ToArm(Scratch4), 4), ArmOperand.ImmediateOperand(0)));
+            EmitConditionalJump(ArmCondition.Ne, wideOperands);
+            Emit(ArmInstruction.Ternary(ArmInstrKind.Udiv, Reg(ToArm(Scratch4), 4), Reg(ToArm(Scratch0), 4), Reg(ToArm(Scratch2), 4)));
+            if (wantRemainder)
+                Emit(ArmInstruction.Quaternary(ArmInstrKind.Mls, Reg(ToArm(Scratch0), 4), Reg(ToArm(Scratch4), 4), Reg(ToArm(Scratch2), 4), Reg(ToArm(Scratch0), 4)));
+            else
+                MoveRegister(Scratch0, Scratch4, 4);
+            EmitJump(signs);
+
+            _owner._text.DefineLabel(wideOperands);
             StoreToMemory(Scratch2, baseOffset + WideDivisorOffset, 4);
             StoreToMemory(Scratch3, baseOffset + WideDivisorOffset + 4, 4);
             LoadImmediate(Scratch4, 64, 4);
@@ -5059,6 +5184,7 @@ public sealed class ArmCodeGenerator
                 MoveRegister(Scratch0, Scratch2, 4);
                 MoveRegister(Scratch1, Scratch3, 4);
             }
+            _owner._text.DefineLabel(signs);
             if (signed)
             {
                 LoadFromMemory(Scratch4, baseOffset + (wantRemainder ? WideRemainderSignOffset : WideQuotientSignOffset), 4, false);
@@ -5417,6 +5543,7 @@ public sealed class ArmCodeGenerator
         private readonly Dictionary<string, int> _labels = new Dictionary<string, int>(StringComparer.Ordinal);
         private readonly List<ArmObjectRelocation> _relocations = new List<ArmObjectRelocation>();
         private readonly HashSet<string> _referenced = new HashSet<string>(StringComparer.Ordinal);
+        private int _lastLabelOffset = -1;
 
         public string Name { get; }
         public int ByteLength => checked(_instructions.Count * 4);
@@ -5429,7 +5556,22 @@ public sealed class ArmCodeGenerator
         public void DefineLabel(string label)
         {
             if (!_labels.ContainsKey(label))
+            {
                 _labels.Add(label, ByteLength);
+                _lastLabelOffset = ByteLength;
+            }
+        }
+
+        public bool EndsWithoutFallthrough
+        {
+            get
+            {
+                if (_instructions.Count == 0 || _lastLabelOffset == ByteLength)
+                    return false;
+                ArmInstruction last = _instructions[^1];
+                return last.Condition == ArmCondition.Al &&
+                    last.Opcode is ArmInstrKind.B or ArmInstrKind.Br or ArmInstrKind.Ret or ArmInstrKind.Bx or ArmInstrKind.Brk or ArmInstrKind.Bkpt;
+            }
         }
 
         public void Emit(ArmInstruction instruction)

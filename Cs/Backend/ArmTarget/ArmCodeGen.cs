@@ -20,7 +20,7 @@ namespace Cnidaria.Cs
         public Func<RuntimeMethod, string>? ExternalSymbolResolver { get; set; }
     }
 
-    internal static class ArmCodeGenerator
+    internal static partial class ArmCodeGenerator
     {
         private const string TextSectionName = ".text";
         private const string RodataSectionName = ".rodata";
@@ -64,7 +64,7 @@ namespace Cnidaria.Cs
             throw new ArgumentOutOfRangeException(nameof(register), $"Register {MachineRegisters.Format(register)} has no ARM64 encoding.");
         }
 
-        private sealed class Generator
+        private sealed partial class Generator
         {
             private readonly GenTreeProgram _program;
             private readonly TargetInfo _target;
@@ -972,6 +972,9 @@ namespace Cnidaria.Cs
 
             public static ArmOperand Reg(ArmRegister register, int size)
                 => ArmOperand.RegisterOperand(register, size);
+
+            public static ArmOperand Vec(ArmRegister register, int elementSize, int vectorSize)
+                => ArmOperand.Vector(register, elementSize, vectorSize);
 
             public static ArmOperand Mem(ArmRegister baseRegister, long displacement, int size)
                 => ArmOperand.Memory(baseRegister, displacement, size);
@@ -2973,7 +2976,7 @@ namespace Cnidaria.Cs
             private static int ToRuntimeRootKind(RegisterGcRootKind kind)
                 => kind == RegisterGcRootKind.ObjectReference ? 0 : 1;
 
-            private sealed class MethodEmitter
+            private sealed partial class MethodEmitter
             {
                 private readonly Generator _owner;
                 private readonly GenTreeMethod _method;
@@ -3367,6 +3370,9 @@ namespace Cnidaria.Cs
                             return;
                         case GenTreeKind.Intrinsic:
                             EmitIntrinsic(node);
+                            return;
+                        case GenTreeKind.HWIntrinsic:
+                            EmitHWIntrinsic(node);
                             return;
                         case GenTreeKind.Call:
                             EmitCall(node);
@@ -4428,7 +4434,7 @@ namespace Cnidaria.Cs
                                         Reg(ToArm(source), StorageSize(sourceType, sourceKind))));
                                     return;
                                 }
-                                EmitIntegerNarrowing(node, GeneralRegister(destination), GeneralRegister(source));
+                                EmitIntegerNarrowing(node, GeneralRegister(destination), GeneralRegister(source), sourceType, sourceKind);
                                 return;
                             }
                         case NumericConvKind.Bool:
@@ -4543,7 +4549,7 @@ namespace Cnidaria.Cs
                     EndThrowTarget(node, "OverflowException", overflow, inlineThrow);
                 }
 
-                private void EmitIntegerNarrowing(GenTree node, ArmRegister destination, ArmRegister source)
+                private void EmitIntegerNarrowing(GenTree node, ArmRegister destination, ArmRegister source, RuntimeType? sourceType, GenStackKind sourceKind)
                 {
                     switch (node.ConvKind)
                     {
@@ -4566,7 +4572,10 @@ namespace Cnidaria.Cs
                             EmitBitfieldMove(sign: false, destination, source, 32);
                             return;
                         default:
-                            _owner.EmitMove(destination, source, 8);
+                            if (sourceKind is GenStackKind.I8 or GenStackKind.NativeInt or GenStackKind.NativeUInt || sourceType?.SizeOf == 8)
+                                _owner.EmitMove(destination, source, 8);
+                            else
+                                EmitBitfieldMove(sign: (node.ConvFlags & NumericConvFlags.SourceUnsigned) == 0, destination, source, 32);
                             return;
                     }
                 }
@@ -5529,15 +5538,21 @@ namespace Cnidaria.Cs
                     out int saveAreaSize)
                 {
                     ulong live = node.SafePointLiveRegisters;
-                    ImmutableArray<MachineRegister> registers = RegisterInfo.CallerSavedScalarRegisters(Target);
+                    var registers = new List<MachineRegister>(RegisterInfo.CallerSavedScalarRegisters(Target));
+                    UInt128 upperClobbered = RegisterInfo.CallClobberedVectorUpperMask(Target);
+                    foreach (MachineRegister register in RegisterInfo.AllocatableFloatingRegisters(Target))
+                    {
+                        if ((upperClobbered & RegisterInfo.MaskOf(register)) != 0)
+                            registers.Add(register);
+                    }
                     int offset = checked(RegisterInfo.MinimumOutgoingArgumentSlots(Target) * Target.PointerSize);
                     var locations = new List<(MachineRegister Register, int Offset, int Size)>();
-                    for (int i = 0; i < registers.Length; i++)
+                    for (int i = 0; i < registers.Count; i++)
                     {
                         MachineRegister register = registers[i];
                         if (RegisterInfo.IsReserved(Target, register) || (live & MachineRegisters.MaskOf(register)) == 0)
                             continue;
-                        int size = RegisterInfo.RegisterSaveSize(Target, register);
+                        int size = RegisterInfo.LiveRegisterSaveSize(Target, register);
                         offset = AlignUp(offset, RegisterInfo.RegisterSaveAlignment(Target, register));
                         locations.Add((register, offset, size));
                         offset = checked(offset + size);
@@ -6295,13 +6310,20 @@ namespace Cnidaria.Cs
                     int size = StorageSize(type, kind, result);
                     if (result.IsRegister)
                     {
-                        if (size is not (1 or 2 or 4 or 8))
+                        if (size is not (1 or 2 or 4 or 8) && !(size is 12 or 16 && result.RegisterClass == RegisterClass.Float))
                             throw Unsupported(node, $"Unsupported element load size {size}");
                         EmitMemoryLoad(ToArm(result.Register), address, 0, size, IsSigned(type, kind));
                         return;
                     }
                     if (!result.IsFrameSlot)
                         throw Unsupported(node, "Load result is not addressable");
+
+                    if (IsVectorValue(type, kind))
+                    {
+                        EmitMemoryLoad(ArmRegister.V31, address, 0, size, signed: false);
+                        EmitStore(result, MachineRegister.F31, type, kind);
+                        return;
+                    }
 
                     // A scalar is read before its address register is needed again, so it can be relayed
                     // through the other scratch register
@@ -6351,13 +6373,20 @@ namespace Cnidaria.Cs
                     int size = StorageSize(type, kind, value);
                     if (value.IsRegister)
                     {
-                        if (size is not (1 or 2 or 4 or 8))
+                        if (size is not (1 or 2 or 4 or 8) && !(size is 12 or 16 && value.RegisterClass == RegisterClass.Float))
                             throw Unsupported(node, $"Unsupported element store size {size}");
                         EmitMemoryStore(ToArm(value.Register), address, 0, size);
                         return;
                     }
                     if (!value.IsFrameSlot)
                         throw Unsupported(node, "Array-element store value is not addressable");
+
+                    if (IsVectorValue(type, kind))
+                    {
+                        EmitLoad(MachineRegister.F31, value, type, kind);
+                        EmitMemoryStore(ArmRegister.V31, address, 0, size);
+                        return;
+                    }
 
                     if (size is 1 or 2 or 4 or 8)
                     {
@@ -7023,8 +7052,9 @@ namespace Cnidaria.Cs
                     {
                         if (destination != source)
                         {
-                            _owner.Emit(ArmInstruction.Binary(
-                                ArmInstrKind.Fmov, Reg(ToArm(destination), size), Reg(ToArm(source), size)));
+                            _owner.Emit(size > 8
+                                ? ArmInstruction.Binary(ArmInstrKind.Mov, Vec(ToArm(destination), 1, 16), Vec(ToArm(source), 1, 16))
+                                : ArmInstruction.Binary(ArmInstrKind.Fmov, Reg(ToArm(destination), size), Reg(ToArm(source), size)));
                         }
                         return;
                     }
@@ -7138,6 +7168,14 @@ namespace Cnidaria.Cs
                         EmitOddSizedLoad(destination, baseRegister, offset, size);
                         return;
                     }
+                    if (size == 12 && ArmRegisters.IsVector(destination))
+                    {
+                        EmitMemoryLoad(destination, baseRegister, offset, 8, signed: false);
+                        ArmRegister lane = baseRegister == ArmRegister.X17 ? ArmRegister.X16 : ArmRegister.X17;
+                        _owner.EmitAddImmediate(lane, baseRegister, checked(offset + 8), lane);
+                        _owner.Emit(ArmInstruction.Binary(ArmInstrKind.Ld1, ArmOperand.VectorElement(destination, 4, 2), Mem(lane, 0, 4)));
+                        return;
+                    }
 
                     if (!CanEncodeMemoryOffset(offset, size))
                     {
@@ -7228,6 +7266,14 @@ namespace Cnidaria.Cs
                         EmitOddSizedStore(source, baseRegister, offset, size);
                         return;
                     }
+                    if (size == 12 && ArmRegisters.IsVector(source))
+                    {
+                        EmitMemoryStore(source, baseRegister, offset, 8);
+                        ArmRegister lane = baseRegister == ArmRegister.X17 ? ArmRegister.X16 : ArmRegister.X17;
+                        _owner.EmitAddImmediate(lane, baseRegister, checked(offset + 8), lane);
+                        _owner.Emit(ArmInstruction.Binary(ArmInstrKind.St1, ArmOperand.VectorElement(source, 4, 2), Mem(lane, 0, 4)));
+                        return;
+                    }
 
                     if (!CanEncodeMemoryOffset(offset, size))
                     {
@@ -7242,6 +7288,7 @@ namespace Cnidaria.Cs
                         1 => ArmInstrKind.Strb,
                         2 => ArmInstrKind.Strh,
                         4 or 8 => ArmInstrKind.Str,
+                        16 when ArmRegisters.IsVector(source) => ArmInstrKind.Str,
                         _ => throw new NotImplementedException($"Unsupported ARM64 store size {size}."),
                     };
 
@@ -7356,9 +7403,13 @@ namespace Cnidaria.Cs
                     {
                         GenStackKind.R4 or GenStackKind.I4 => 4,
                         GenStackKind.R8 or GenStackKind.I8 => 8,
+                        _ when SimdTypes.IsSimdKind(kind) => SimdTypes.SizeOf(kind),
                         _ => Target.PointerSize,
                     };
                 }
+
+                private bool IsVectorValue(RuntimeType? type, GenStackKind kind)
+                    => SimdTypes.IsSimdKind(kind) || SimdTypes.IsSimdType(type, Target);
 
                 private int OperationSize(RuntimeType? type, GenStackKind kind)
                     => IsI4(type, kind) ? 4 : 8;

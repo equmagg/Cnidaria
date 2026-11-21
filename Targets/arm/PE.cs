@@ -62,7 +62,7 @@ internal static class ArmPortableExecutableWriter
         var references = obj.Symbols.Where(static symbol => symbol.Binding == ArmObjectSymbolBinding.External).Select(static symbol => symbol.Name).ToHashSet(StringComparer.Ordinal);
         foreach (var instruction in obj.Text.Instructions)
         {
-            foreach (var operand in new[] { instruction.Operand0, instruction.Operand1, instruction.Operand2, instruction.Operand3 })
+            foreach (var operand in new[] { instruction.Operand0, instruction.Operand1, instruction.Operand2, instruction.Operand3, instruction.Operand4 })
             {
                 if (operand.Symbol is string name)
                     references.Add(name);

@@ -136,7 +136,7 @@ namespace Cnidaria.Cs
 
         static X86Intrinsics() => Build();
 
-        public static bool IsX86(GenTree node) => node.Int32 >= FirstId;
+        public static bool IsX86(GenTree node) => node.Int32 >= FirstId && node.Int32 < ArmIntrinsics.FirstId;
 
         public static X86IntrinsicInfo Info(GenTree node) => Rows[node.Int32 - FirstId];
 

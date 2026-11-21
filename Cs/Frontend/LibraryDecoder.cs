@@ -1668,7 +1668,7 @@ namespace Cnidaria.Cs
         {
             _tupleElementNames ??= CollectTupleElementNames();
             if (!_tupleElementNames.TryGetValue(parentToken, out var names))
-                return type;
+                names = Array.Empty<string?>();
             int index = 0;
             return Apply(type, ref index);
 

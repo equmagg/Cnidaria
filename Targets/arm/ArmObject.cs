@@ -402,7 +402,8 @@ public static class ArmObjectComposer
             .WithOperand0(RewriteOperand(instruction.Operand0, renames))
             .WithOperand1(RewriteOperand(instruction.Operand1, renames))
             .WithOperand2(RewriteOperand(instruction.Operand2, renames))
-            .WithOperand3(RewriteOperand(instruction.Operand3, renames));
+            .WithOperand3(RewriteOperand(instruction.Operand3, renames))
+            .WithOperand4(RewriteOperand(instruction.Operand4, renames));
 
     private static ArmOperand RewriteOperand(ArmOperand operand, IReadOnlyDictionary<string, string> renames)
         => operand.Symbol is null ? operand : operand.WithSymbol(Rename(renames, operand.Symbol), operand.RelocationKind, operand.Addend);

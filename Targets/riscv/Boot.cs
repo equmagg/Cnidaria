@@ -1441,7 +1441,11 @@ public static class RiscVKernel
         var semanticModel = compilation.GetSemanticModel(compilation.SyntaxTrees[0]);
         var gimple = Cnidaria.C.GimplePipeline.Run(semanticModel);
         var lir = Cnidaria.C.LirModule.Lower(gimple);
-        return Cnidaria.C.RiscVCodeGenerator.Generate(lir);
+        return Cnidaria.C.RiscVCodeGenerator.Generate(lir, options: new Cnidaria.C.RiscVCodeGeneratorOptions
+        {
+            EmitStartup = false,
+            EntryFunctionName = "kernel_main",
+        });
     }
 
     private static ulong ResolveRequiredSymbol(RVLinkedImage image, string name)

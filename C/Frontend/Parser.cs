@@ -162,7 +162,7 @@ public sealed class Parser
         if (allowFunctionDefinition && Current.Kind == SyntaxKind.OpenBraceToken)
         {
             DeclareDeclaratorName(firstDeclarator, isTypedefName: false);
-            var body = ParseCompoundStatement();
+            CompoundStatementSyntax body = ParseCompoundStatement(firstDeclarator);
             return new FunctionDefinitionSyntax(specifiers, firstDeclarator, body);
         }
 
@@ -199,9 +199,14 @@ public sealed class Parser
     private ImmutableArray<SyntaxToken> ParseDeclarationSpecifiers()
     {
         var specifiers = RentTokenList();
+        var sawTypeSpecifier = false;
 
         while (IsDeclarationSpecifierStart(Current.Kind))
         {
+            if (Current.Kind == SyntaxKind.TypedefNameToken && sawTypeSpecifier)
+                break;
+            sawTypeSpecifier |= DeclarationTypeParser.IsTypeSpecifier(Current.Kind);
+
             if (Current.Kind is SyntaxKind.StructKeyword or SyntaxKind.UnionKeyword or SyntaxKind.EnumKeyword)
             {
                 ParseTagSpecifier(specifiers);
@@ -466,9 +471,11 @@ public sealed class Parser
 
     // Statements
 
-    private CompoundStatementSyntax ParseCompoundStatement()
+    private CompoundStatementSyntax ParseCompoundStatement(DeclaratorSyntax? function = null)
     {
         _typeNames.BeginScope();
+        if (function is not null)
+            DeclareParameterNames(function);
 
         var openBrace = MatchToken(SyntaxKind.OpenBraceToken);
         var members = ImmutableArray.CreateBuilder<SyntaxNode>();
@@ -1510,6 +1517,52 @@ public sealed class Parser
     }
 
     // Typedef classification is updated as soon as each declarator is complete
+    // A parameter named like a typedef hides it in the function body
+    private void DeclareParameterNames(DeclaratorSyntax function)
+    {
+        ImmutableArray<SyntaxToken> tokens = function.Tokens;
+        int open = 0;
+        if (function.Identifier is SyntaxToken name)
+        {
+            while (open < tokens.Length && tokens[open].Position != name.Position)
+                open++;
+        }
+        while (open < tokens.Length && tokens[open].Kind != SyntaxKind.OpenParenToken)
+            open++;
+
+        var depth = 0;
+        var start = open + 1;
+        for (var i = open; i < tokens.Length; i++)
+        {
+            SyntaxKind kind = tokens[i].Kind;
+            if (kind is SyntaxKind.OpenParenToken or SyntaxKind.OpenBracketToken or SyntaxKind.OpenBraceToken)
+            {
+                depth++;
+                continue;
+            }
+            if (depth == 1 && kind == SyntaxKind.CommaToken || depth == 1 && kind == SyntaxKind.CloseParenToken)
+            {
+                DeclareParameterName(tokens[start..i]);
+                start = i + 1;
+            }
+            if (kind is SyntaxKind.CloseParenToken or SyntaxKind.CloseBracketToken or SyntaxKind.CloseBraceToken && --depth == 0)
+                return;
+        }
+    }
+
+    private void DeclareParameterName(ImmutableArray<SyntaxToken> parameter)
+    {
+        StructUnionFieldParser.ReadSpecifierTokens(parameter, out int declaratorStart);
+        for (var i = declaratorStart; i < parameter.Length; i++)
+        {
+            if (parameter[i].Kind is SyntaxKind.IdentifierToken or SyntaxKind.TypedefNameToken)
+            {
+                _typeNames.DeclareOrdinaryIdentifier(parameter[i].Text);
+                return;
+            }
+        }
+    }
+
     private void DeclareDeclaratorName(DeclaratorSyntax declarator, bool isTypedefName)
     {
         var identifier = declarator.Identifier;

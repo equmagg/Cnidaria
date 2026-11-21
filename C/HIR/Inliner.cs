@@ -62,6 +62,8 @@ public sealed class InliningOptions
 
 public static class Inliner
 {
+    private const int CallNodeSize = 6;
+
     public static GimpleTree Inline(GimpleTree tree, InliningOptions? options = null)
     {
         if (tree is null)
@@ -116,6 +118,7 @@ public static class Inliner
                 entriesBySymbol[entry.Function.Symbol] = entry;
         }
 
+        var analyses = new FunctionAnalyses(definitions);
         var siteOrdinal = 0;
 
         foreach (var symbol in callGraph.CalleeFirstOrder)
@@ -126,6 +129,7 @@ public static class Inliner
             var rewritten = InlineIntoFunction(
                 entry.Function,
                 definitions,
+                analyses,
                 callCounts,
                 callGraph.RecursiveFunctions,
                 options,
@@ -134,6 +138,7 @@ public static class Inliner
             members[entry.MemberIndex] = rewritten;
             UpdateDefinitionMappings(definitions, symbol, rewritten);
             entry.Function = rewritten;
+            analyses.Complete(symbol, rewritten);
         }
 
         foreach (var entry in functions)
@@ -144,6 +149,7 @@ public static class Inliner
             var rewritten = InlineIntoFunction(
                 entry.Function,
                 definitions,
+                analyses,
                 callCounts,
                 callGraph.RecursiveFunctions,
                 options,
@@ -175,15 +181,18 @@ public static class Inliner
     private static GimpleFunctionDefinition InlineIntoFunction(
         GimpleFunctionDefinition caller,
         Dictionary<FunctionSymbol, GimpleFunctionDefinition> definitions,
+        FunctionAnalyses analyses,
         Dictionary<FunctionSymbol, int> callCounts,
         HashSet<FunctionSymbol> recursiveFunctions,
         InliningOptions options,
         ref int siteOrdinal)
     {
         var current = caller;
-        var initialAnalysis = Analyze(current);
+        var initialAnalysis = analyses.Get(current);
         if (initialAnalysis.HasControlFlowProblems)
             return current;
+        if (initialAnalysis.MarksNoReturn)
+            current = MarkNoReturnCalls(current, analyses, ref siteOrdinal);
 
         var initialSize = initialAnalysis.EstimatedSize;
         var growth = 0;
@@ -191,12 +200,9 @@ public static class Inliner
 
         while (inlinedSites < options.MaxInlineSitesPerFunction)
         {
-            var callerAnalysis = Analyze(current);
-            if (callerAnalysis.HasControlFlowProblems)
-                break;
-
             InlineSite? selectedSite = null;
             GimpleFunctionDefinition? selectedCallee = null;
+            var selectedGrowth = int.MaxValue;
 
             foreach (var site in EnumerateInlineSites(current))
             {
@@ -204,11 +210,17 @@ public static class Inliner
                     continue;
                 if (!definitions.TryGetValue(calleeSymbol, out var callee))
                     continue;
+
+                var analysis = analyses.Get(callee);
+                var siteGrowth = analysis.EstimatedSize - CallNodeSize;
+                if (siteGrowth >= selectedGrowth)
+                    continue;
                 if (!CanInline(
                     current,
-                    callerAnalysis,
                     site,
                     callee,
+                    analysis,
+                    siteGrowth,
                     callCounts,
                     recursiveFunctions,
                     options,
@@ -220,15 +232,14 @@ public static class Inliner
 
                 selectedSite = site;
                 selectedCallee = callee;
-                break;
+                selectedGrowth = siteGrowth;
             }
 
             if (selectedSite is null || selectedCallee is null)
                 break;
 
-            var calleeSize = Analyze(selectedCallee).EstimatedSize;
             current = InlineCallSite(current, selectedCallee, selectedSite.Value, siteOrdinal++);
-            growth += Math.Max(0, calleeSize - 1);
+            growth += selectedGrowth;
             inlinedSites++;
         }
 
@@ -237,9 +248,10 @@ public static class Inliner
 
     private static bool CanInline(
         GimpleFunctionDefinition caller,
-        FunctionAnalysis callerAnalysis,
         InlineSite site,
         GimpleFunctionDefinition callee,
+        FunctionAnalysis analysis,
+        int siteGrowth,
         Dictionary<FunctionSymbol, int> callCounts,
         HashSet<FunctionSymbol> recursiveFunctions,
         InliningOptions options,
@@ -255,7 +267,7 @@ public static class Inliner
             return false;
         if (recursiveFunctions.Contains(calleeSymbol))
             return false;
-        if ((calleeSymbol.FunctionSpecifiers & FunctionSpecifiers.NoReturn) != 0)
+        if ((calleeSymbol.FunctionSpecifiers & FunctionSpecifiers.NoReturn) != 0 || !analysis.CanReturn)
             return false;
         if ((calleeSymbol.FunctionSpecifiers & FunctionSpecifiers.NoInline) != 0)
             return false;
@@ -272,19 +284,16 @@ public static class Inliner
             return false;
         }
 
-        var analysis = Analyze(callee);
         if (analysis.HasControlFlowProblems || analysis.HasAsmGoto)
             return false;
         if (analysis.ReachableBlocks == 0 || analysis.ReachableBlocks > options.MaxCalleeBlocks)
             return false;
 
-        var projectedGrowth = Math.Max(0, analysis.EstimatedSize - 1);
-        if (currentGrowth + projectedGrowth > options.MaxCallerGrowth)
+        if (siteGrowth > 0 &&
+            currentGrowth + siteGrowth > Math.Max(options.MaxCallerSize - initialCallerSize, options.MaxCallerGrowth))
+        {
             return false;
-        if (callerAnalysis.EstimatedSize + projectedGrowth > options.MaxCallerSize)
-            return false;
-        if (initialCallerSize + currentGrowth + projectedGrowth > options.MaxCallerSize)
-            return false;
+        }
 
         var threshold = (calleeSymbol.FunctionSpecifiers & FunctionSpecifiers.Inline) != 0
             ? options.InlineKeywordThreshold
@@ -436,13 +445,16 @@ public static class Inliner
         }
     }
 
-    private static FunctionAnalysis Analyze(GimpleFunctionDefinition function)
+    private static FunctionAnalysis Analyze(GimpleFunctionDefinition function, FunctionAnalyses analyses)
     {
         var cfg = ControlFlowFunction.Build(function);
         var estimatedSize = 0;
         var inlineCost = 0;
         var reachableBlocks = 0;
         var hasAsmGoto = false;
+        var marksNoReturn = false;
+        var callsNoReturn = new bool[cfg.Blocks.Length];
+        var locals = new HashSet<Symbol>();
 
         foreach (var block in cfg.RealBlocks)
         {
@@ -455,11 +467,23 @@ public static class Inliner
 
             foreach (var statement in block.Statements)
             {
-                var cost = StatementCost(statement);
+                if (statement is GimpleDeclarationStatement declaration && declaration.Symbol is VariableSymbol variable &&
+                    variable.ExplicitRegisterName is null &&
+                    variable.StorageClass is not (StorageClass.Static or StorageClass.Extern or StorageClass.ThreadLocal))
+                {
+                    locals.Add(variable);
+                }
+
+                NodeCost cost = StatementCost(statement, locals);
                 estimatedSize += cost.Size;
                 inlineCost += cost.Cost;
                 if (statement is GimpleAsmStatement { IsGoto: true })
                     hasAsmGoto = true;
+                if (statement is GimpleCallStatement call && analyses.IsNoReturnCall(call))
+                {
+                    callsNoReturn[block.Ordinal] = true;
+                    marksNoReturn |= !call.IsNoReturn;
+                }
             }
 
             foreach (var successor in block.UniqueSuccessors)
@@ -474,16 +498,74 @@ public static class Inliner
             inlineCost,
             reachableBlocks,
             hasAsmGoto,
-            cfg.Problems.Length != 0);
+            cfg.Problems.Length != 0,
+            ReachesExit(cfg, callsNoReturn),
+            marksNoReturn);
     }
 
-    private static NodeCost StatementCost(GimpleStatement statement)
+    private static GimpleFunctionDefinition MarkNoReturnCalls(GimpleFunctionDefinition function, FunctionAnalyses analyses, ref int siteOrdinal)
+    {
+        var blocks = ImmutableArray.CreateBuilder<GimpleBasicBlock>(function.Blocks.Length);
+        foreach (GimpleBasicBlock block in function.Blocks)
+        {
+            ImmutableArray<GimpleStatement> statements = block.Statements;
+            GimpleLabel label = block.Label;
+            int start = 0;
+            for (var i = 0; i < statements.Length; i++)
+            {
+                if (statements[i] is not GimpleCallStatement call || call.IsNoReturn || !analyses.IsNoReturnCall(call))
+                    continue;
+                var marked = new GimpleCallStatement(call.Lhs, call.Function, call.Arguments, call.FunctionType, call.Type, call.Syntax,
+                    call.IsTailCall, isNoReturn: true);
+                blocks.Add(new GimpleBasicBlock(label, ImmutableArray.Create(statements, start, i - start).Add(marked)));
+                label = new GimpleLabel("inline_" + siteOrdinal++.ToString(CultureInfo.InvariantCulture) + "_unreachable", syntax: call.Syntax);
+                start = i + 1;
+            }
+
+            if (start == 0)
+                blocks.Add(block);
+            else if (start < statements.Length)
+                blocks.Add(new GimpleBasicBlock(label, ImmutableArray.Create(statements, start, statements.Length - start)));
+        }
+
+        return new GimpleFunctionDefinition(function.Syntax, function.Symbol, function.Temporaries, blocks.ToImmutable(), function.EntryLabel);
+    }
+
+    private static bool ReachesExit(ControlFlowFunction cfg, bool[] callsNoReturn)
+    {
+        var visited = new bool[cfg.Blocks.Length];
+        var pending = new Stack<ControlFlowBlock>();
+        visited[cfg.Entry.Ordinal] = true;
+        pending.Push(cfg.Entry);
+
+        while (pending.Count != 0)
+        {
+            var block = pending.Pop();
+            if (block.IsExit)
+                return true;
+            if (callsNoReturn[block.Ordinal])
+                continue;
+
+            foreach (var successor in block.UniqueSuccessors)
+            {
+                if (!visited[successor.Ordinal])
+                {
+                    visited[successor.Ordinal] = true;
+                    pending.Push(successor);
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static NodeCost StatementCost(GimpleStatement statement, HashSet<Symbol> locals)
     {
         return statement switch
         {
             GimpleDeclarationStatement => new NodeCost(0, 0),
             GimpleNopStatement => new NodeCost(0, 0),
-            GimpleAssignStatement assign => AssignCost(assign),
+            GimpleAssignStatement assign => AssignCost(assign, locals),
             GimpleCallStatement call => CallCost(call),
             GimpleGotoStatement => new NodeCost(0, 0),
             GimpleCondStatement conditional => ValueCost(conditional.Lhs) + ValueCost(conditional.Rhs) + new NodeCost(1, 2),
@@ -494,8 +576,11 @@ public static class Inliner
         };
     }
 
-    private static NodeCost AssignCost(GimpleAssignStatement assign)
+    private static NodeCost AssignCost(GimpleAssignStatement assign, HashSet<Symbol> locals)
     {
+        if (IsRegisterMove(assign, locals))
+            return new NodeCost(0, 0);
+
         var cost = ValueCost(assign.Lhs) + new NodeCost(1, assign.IsConstructor ? 2 : 1);
         foreach (var operand in assign.Operands)
             cost += ValueCost(operand);
@@ -503,9 +588,27 @@ public static class Inliner
         return cost;
     }
 
+    private static bool IsRegisterMove(GimpleAssignStatement assign, HashSet<Symbol> locals)
+    {
+        if (assign.Op1 is not GimpleValue source || !IsRegister(assign.Lhs, locals) ||
+            source is not GimpleConstantValue && !IsRegister(source, locals))
+            return false;
+
+        return assign.RhsClass == GimpleRhsClass.Single ||
+               assign.Subcode is GimpleTreeCode.NopExpr or GimpleTreeCode.ConvertExpr && IsIntegral(source.Type) && IsIntegral(assign.Lhs.Type);
+    }
+
+    private static bool IsRegister(GimpleValue value, HashSet<Symbol> locals)
+        => value.Type.Type.Kind is TypeKind.Builtin or TypeKind.Enum or TypeKind.Pointer && !GimpleTypes.IsVoid(value.Type) &&
+           !GimpleTypes.IsVolatileOrAtomic(value.Type) &&
+           (value is GimpleTemporaryValue || value is GimpleSymbolValue symbol && (symbol.Symbol is ParameterSymbol || locals.Contains(symbol.Symbol)));
+
+    private static bool IsIntegral(QualifiedType type)
+        => GimpleTypes.IsIntegerLike(type) || type.Type.Kind == TypeKind.Pointer;
+
     private static NodeCost CallCost(GimpleCallStatement call)
     {
-        var cost = ValueCost(call.Function) + new NodeCost(6, 12);
+        var cost = ValueCost(call.Function) + new NodeCost(CallNodeSize, 12);
         if (call.Lhs is not null)
             cost += ValueCost(call.Lhs);
 
@@ -1111,6 +1214,45 @@ public static class Inliner
         }
     }
 
+    private sealed class FunctionAnalyses
+    {
+        private readonly Dictionary<FunctionSymbol, GimpleFunctionDefinition> _definitions;
+        private readonly Dictionary<GimpleFunctionDefinition, FunctionAnalysis> _analyses = new();
+        private readonly HashSet<FunctionSymbol> _noReturn = new();
+
+        public FunctionAnalyses(Dictionary<FunctionSymbol, GimpleFunctionDefinition> definitions)
+            => _definitions = definitions;
+
+        public FunctionAnalysis Get(GimpleFunctionDefinition function)
+        {
+            if (!_analyses.TryGetValue(function, out var analysis))
+            {
+                analysis = Analyze(function, this);
+                _analyses.Add(function, analysis);
+            }
+
+            return analysis;
+        }
+
+        public void Complete(FunctionSymbol symbol, GimpleFunctionDefinition function)
+        {
+            if (!Get(function).CanReturn)
+                _noReturn.Add(symbol);
+        }
+
+        public bool IsNoReturnCall(GimpleCallStatement call)
+        {
+            if (!TryResolveDirectCallee(call.Function, out var symbol))
+                return false;
+            if ((symbol.FunctionSpecifiers & FunctionSpecifiers.NoReturn) != 0)
+                return true;
+
+            return _definitions.TryGetValue(symbol, out var definition) &&
+                   definition.Symbol is not null &&
+                   _noReturn.Contains(definition.Symbol);
+        }
+    }
+
     private readonly struct FunctionAnalysis
     {
         public int EstimatedSize { get; }
@@ -1118,19 +1260,25 @@ public static class Inliner
         public int ReachableBlocks { get; }
         public bool HasAsmGoto { get; }
         public bool HasControlFlowProblems { get; }
+        public bool CanReturn { get; }
+        public bool MarksNoReturn { get; }
 
         public FunctionAnalysis(
             int estimatedSize,
             int inlineCost,
             int reachableBlocks,
             bool hasAsmGoto,
-            bool hasControlFlowProblems)
+            bool hasControlFlowProblems,
+            bool canReturn,
+            bool marksNoReturn)
         {
             EstimatedSize = estimatedSize;
             InlineCost = inlineCost;
             ReachableBlocks = reachableBlocks;
             HasAsmGoto = hasAsmGoto;
             HasControlFlowProblems = hasControlFlowProblems;
+            CanReturn = canReturn;
+            MarksNoReturn = marksNoReturn;
         }
     }
 

@@ -2073,6 +2073,7 @@ namespace Cnidaria.Cs
     internal sealed class Assembler
     {
         private readonly List<InstrDesc> _code = new List<InstrDesc>();
+        private int _lastBoundPc = -1;
         private readonly List<MethodDraft> _methods = new List<MethodDraft>();
         private readonly List<EhRegionRecord> _eh = new List<EhRegionRecord>();
         private readonly List<GcSafePointRecord> _gcSafePoints = new List<GcSafePointRecord>();
@@ -2116,7 +2117,12 @@ namespace Cnidaria.Cs
             if (_labelPc[label.Id] >= 0)
                 throw new InvalidOperationException($"Label is already bound: {label}");
             _labelPc[label.Id] = Pc;
+            _lastBoundPc = Pc;
         }
+
+        public bool EndsWithoutFallthrough
+            => _code.Count != 0 && _lastBoundPc != _code.Count &&
+               _code[^1].Op is Op.J or Op.RetVoid or Op.RetI or Op.RetF or Op.RetRef or Op.RetValue or Op.Trap;
 
         public void BeginMethod(int runtimeMethodId, int staticConstructorTypeLayoutIndex = -1, StackFrameLayout? frame = null, ushort flags = 0)
         {

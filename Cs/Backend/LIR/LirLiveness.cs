@@ -33,7 +33,7 @@ namespace Cnidaria.Cs
             var result = ImmutableArray.CreateBuilder<LinearRefPosition>();
             UInt128 callKill = RegisterInfo.MaskOf(RegisterInfo.CallerSavedScalarRegisters(target)) |
                 RegisterInfo.MaskOf(RegisterInfo.AllocatableVectorRegisters(target));
-            if (HasWideVectorValues(method))
+            if (HasWideVectorValues(method, RegisterInfo.CalleeSavedVectorBytes(target)))
                 callKill |= RegisterInfo.CallClobberedVectorUpperMask(target);
 
             for (int i = 0; i < method.LinearNodes.Length; i++)
@@ -129,13 +129,13 @@ namespace Cnidaria.Cs
             return result.ToImmutable();
         }
 
-        private static bool HasWideVectorValues(GenTreeMethod method)
+        private static bool HasWideVectorValues(GenTreeMethod method, int preservedBytes)
         {
             if (method.Values.IsDefault)
                 return false;
             foreach (GenTreeValueInfo info in method.Values)
             {
-                if (SimdTypes.SizeOf(info.StackKind) > 16)
+                if (SimdTypes.SizeOf(info.StackKind) > preservedBytes)
                     return true;
             }
             return false;
@@ -413,7 +413,9 @@ namespace Cnidaria.Cs
                 if (fixedRegister != MachineRegister.Invalid)
                     flags |= LinearRefPositionFlags.FixedRegister | LinearRefPositionFlags.RequiresRegister;
 
-                UInt128 registerMask = X86UseRegisterMask(method.Target, node, operandIndex, info.RegisterClass);
+                UInt128 registerMask = method.Target.IsArm
+                    ? ArmUseRegisterMask(node, operandIndex)
+                    : X86UseRegisterMask(method.Target, node, operandIndex, info.RegisterClass);
                 result.Add(new LinearRefPosition(
                     node.LinearId,
                     usePosition,
@@ -514,6 +516,20 @@ namespace Cnidaria.Cs
                 return RegisterInfo.AccumulatorRegister(target);
 
             return MachineRegister.Invalid;
+        }
+
+        // A 16-bit element selected by index comes from v0-v15, the only registers its 4-bit field names
+        private static UInt128 ArmUseRegisterMask(GenTree node, int operandIndex)
+        {
+            if (node.Kind != GenTreeKind.HWIntrinsic || !ArmIntrinsics.IsArm(node) || !ArmIntrinsics.IsIndexedElementOperand(node, operandIndex))
+                return 0;
+            RuntimeType? type = node.Operands[operandIndex].Type;
+            if (type is null || type.GenericTypeArguments.Length != 1 || type.GenericTypeArguments[0].PrimitiveKind is not (RuntimePrimitiveKind.Int16 or RuntimePrimitiveKind.UInt16))
+                return 0;
+            UInt128 mask = 0;
+            for (int i = 0; i < 16; i++)
+                mask |= RegisterInfo.MaskOf((MachineRegister)((int)MachineRegister.F0 + i));
+            return mask;
         }
 
         private static UInt128 X86UseRegisterMask(
@@ -1658,7 +1674,8 @@ namespace Cnidaria.Cs
 
         private static bool UseRequiresDelayedFree(GenTree node, int operandIndex, TargetInfo target)
             => node.LinearMemoryAccess.HasAddressOperand(operandIndex) ||
-               node.Kind == GenTreeKind.HWIntrinsic && target.IsX86 && GenTreeLinearLoweringClassifier.X86HWIntrinsicDelaysFree(node, operandIndex);
+               node.Kind == GenTreeKind.HWIntrinsic && target.IsX86 && GenTreeLinearLoweringClassifier.X86HWIntrinsicDelaysFree(node, operandIndex) ||
+               node.Kind == GenTreeKind.HWIntrinsic && target.IsArm && GenTreeLinearLoweringClassifier.ArmHWIntrinsicDelaysFree(node, operandIndex);
 
         private static void RecordUse(
             Dictionary<GenTree, SortedSet<int>> allUsePositions,

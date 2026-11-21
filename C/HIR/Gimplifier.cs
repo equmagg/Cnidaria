@@ -32,6 +32,7 @@ internal sealed class Gimplifier
 
     private readonly Dictionary<VariableArrayType, GimpleValue> _lengths = new(ReferenceEqualityComparer.Instance);
     private readonly Dictionary<Symbol, GimpleValue> _variableArrays = new(ReferenceEqualityComparer.Instance);
+    private readonly HashSet<Symbol> _localVariables = new(ReferenceEqualityComparer.Instance);
     private readonly List<StackRegion> _stackRegions = new();
     private readonly Dictionary<LabelSymbol, ImmutableArray<BoundDeclaration>> _labelRegions = new();
     private readonly Dictionary<GimpleLabel, int> _jumpTargetRegionDepths = new();
@@ -370,6 +371,7 @@ internal sealed class Gimplifier
         _temporaryOrdinal = 0;
         _lengths.Clear();
         _variableArrays.Clear();
+        _localVariables.Clear();
         _stackRegions.Clear();
         _labelRegions.Clear();
         _jumpTargetRegionDepths.Clear();
@@ -563,6 +565,8 @@ internal sealed class Gimplifier
                 }
             }
 
+            if (declarator.Symbol is VariableSymbol local)
+                _localVariables.Add(local);
             Emit(new GimpleDeclarationStatement(
                 LowerVariableDeclaration(declarator, declaration.StorageClass, includeInitializer: false)));
 
@@ -599,8 +603,12 @@ internal sealed class Gimplifier
                 break;
 
             case BoundExpressionInitializer expressionInitializer:
-                EmitStore(target, LowerRValue(expressionInitializer.Expression), expressionInitializer.Syntax);
-                break;
+                {
+                    GimpleValue value = LowerRValue(expressionInitializer.Expression);
+                    if (!TryRetarget(target, value))
+                        EmitStore(target, value, expressionInitializer.Syntax);
+                    break;
+                }
 
             case BoundInitializerList initializerList:
                 LowerInitializerList(target, initializerList, zeroed);
@@ -1435,6 +1443,12 @@ internal sealed class Gimplifier
 
     private GimpleValue LowerExpression(BoundExpression expression)
     {
+        if (expression is BoundUnaryExpression or BoundBinaryExpression or BoundConditionalExpression or BoundConversionExpression or BoundCastExpression &&
+            GimpleTypes.IsIntegerLike(expression.Type) && IntegerConstantEvaluator.TryEvaluate(expression, _target, out long value))
+        {
+            return CreateIntegerConstant(value, expression.Type, expression.Syntax);
+        }
+
         switch (expression)
         {
             case BoundLiteralExpression literal:
@@ -1582,12 +1596,7 @@ internal sealed class Gimplifier
         if (operand is not GimplePlace place)
             return EmitConvert(operand, type, syntax);
 
-        var target = CreateTemporary(type, syntax);
-        Emit(GimpleAssignStatement.Single(
-            target,
-            new GimpleAddressOfExpression(GimplifyReference(place), type, syntax),
-            syntax));
-        return target;
+        return AddressOf(place, type, syntax);
     }
 
     /// <summary>Emits the conversion that produces a value of the destination type</summary>
@@ -1609,17 +1618,7 @@ internal sealed class Gimplifier
                 return EmitConvert(LowerVariableArrayAddress(expression.Operand), expression.Type, expression.Syntax);
 
             case SyntaxKind.AmpersandToken:
-                {
-                    var target = CreateTemporary(expression.Type, expression.Syntax);
-                    Emit(GimpleAssignStatement.Single(
-                        target,
-                        new GimpleAddressOfExpression(
-                            GimplifyReference(LowerPlace(expression.Operand)),
-                            expression.Type,
-                            expression.Syntax),
-                        expression.Syntax));
-                    return target;
-                }
+                return AddressOf(LowerPlace(expression.Operand), expression.Type, expression.Syntax);
 
             case SyntaxKind.StarToken:
                 return new GimpleIndirectExpression(
@@ -1679,7 +1678,7 @@ internal sealed class Gimplifier
             ? CreateIntegerConstant(-1, one.Type, syntax)
             : one;
 
-        if (GimpleOperandRules.IsRegisterOperand(place))
+        if (IsRegister(place))
         {
             var previous = returnUpdatedValue ? null : Materialize(place);
             Emit(GimpleAssignStatement.Binary(place, code, place, step, syntax));
@@ -1764,8 +1763,10 @@ internal sealed class Gimplifier
         if (expression.OperatorToken.Kind == SyntaxKind.EqualsToken)
         {
             var assigned = LowerRValue(expression.Right);
+            if (TryRetarget(target, assigned))
+                return target;
             EmitStore(target, assigned, expression.Syntax);
-            return GimpleOperandRules.IsRegisterOperand(assigned) ? assigned : target;
+            return IsRegister(assigned) ? assigned : target;
         }
 
         var operand = LowerExpression(expression.Right);
@@ -1777,7 +1778,7 @@ internal sealed class Gimplifier
             var computed = EmitBinary(operation, widened, GimplifyValue(operand), computation, expression.Syntax);
             var narrowed = EmitConvert(computed, target.Type, expression.Syntax);
             EmitStore(target, narrowed, expression.Syntax);
-            return GimpleOperandRules.IsRegisterOperand(target) ? target : narrowed;
+            return IsRegister(target) ? target : narrowed;
         }
 
         var code = GimpleOperators.FromBinaryOperator(
@@ -1800,7 +1801,7 @@ internal sealed class Gimplifier
             return stepped;
         }
 
-        if (GimpleOperandRules.IsRegisterOperand(target))
+        if (IsRegister(target))
         {
             Emit(GimpleAssignStatement.Binary(target, code, target, GimplifyValue(operand), expression.Syntax));
             return target;
@@ -2391,6 +2392,19 @@ internal sealed class Gimplifier
         return target;
     }
 
+    // A register takes the computation of a temporary made for it, so no copy is left between the variable and its own phis
+    private bool TryRetarget(GimplePlace target, GimpleValue value)
+    {
+        if (value is not GimpleTemporaryValue temporary || target is not GimpleSymbolValue || !IsRegister(target) ||
+            !SameRepresentation(temporary.Type, target.Type) || _currentBlock is null || _currentBlock.Statements.Count == 0 ||
+            _currentBlock.Statements[^1] is not GimpleAssignStatement assign || !ReferenceEquals(assign.Lhs, temporary))
+        {
+            return false;
+        }
+        _currentBlock.Statements[^1] = new GimpleAssignStatement(target, assign.Subcode, assign.Operands, assign.Syntax);
+        return true;
+    }
+
     /// <summary>Emits the store that gives a place its value</summary>
     private void EmitStore(GimplePlace target, GimpleValue value, SyntaxNode? syntax)
     {
@@ -2400,10 +2414,13 @@ internal sealed class Gimplifier
             return;
         }
 
-        Emit(GimpleAssignStatement.Single(
-            GimplifyReference(target),
-            GimplifyStoredValue(value),
-            syntax));
+        GimplePlace place = GimplifyReference(target);
+        // A register is loaded in the one statement, only a store to memory needs the value in a register first
+        GimpleValue stored = value is GimplePlace source && IsRegister(place) && !IsRegister(source) && !GimpleTypes.IsAggregate(source.Type) &&
+                             !TryGetBitFieldAccess(source, out _, out _) && SameRepresentation(source.Type, place.Type)
+            ? GimplifyReference(source)
+            : GimplifyStoredValue(value);
+        Emit(GimpleAssignStatement.Single(place, stored, syntax));
     }
 
     private bool TryGetBitFieldAccess(GimpleValue value, out GimpleMemberAccessExpression member, out FieldPlacement placement)
@@ -2527,13 +2544,31 @@ internal sealed class Gimplifier
     /// <summary>Reduces an operand to a register or an invariant a computation may consume</summary>
     private GimpleValue GimplifyValue(GimpleValue value)
     {
-        if (GimpleOperandRules.IsRegisterOperand(value))
+        if (IsRegister(value))
             return value;
 
         if (value is GimplePlace place)
             return Materialize(GimplifyReference(place));
 
         return Materialize(value);
+    }
+
+    // A global, a static, a volatile object and a local whose address is taken live in memory, and an operation reads them into a temporary
+    private bool IsRegister(GimpleValue value)
+    {
+        if (!GimpleOperandRules.IsRegisterOperand(value))
+            return false;
+        if (value is not GimpleSymbolValue symbol || GimpleTypes.IsAggregate(symbol.Type))
+            return true;
+        if (GimpleTypes.IsVolatileOrAtomic(symbol.Type))
+            return false;
+        return symbol.Symbol switch
+        {
+            ParameterSymbol parameter => !parameter.IsAddressTaken,
+            VariableSymbol variable => _localVariables.Contains(variable) && !variable.IsAddressTaken &&
+                variable.StorageClass is not (StorageClass.Extern or StorageClass.Static or StorageClass.ThreadLocal),
+            _ => true,
+        };
     }
 
     /// <summary>Reduces a call argument to an operand the call statement may carry</summary>
@@ -2573,6 +2608,9 @@ internal sealed class Gimplifier
 
             case GimpleElementAccessExpression element:
                 {
+                    if (ScaledElementAddress(element) is GimpleValue address)
+                        return new GimpleIndirectExpression(address, element.Type, element.Syntax);
+
                     var target = GimplifyReferenceBase(element.Expression);
                     var index = element.Index is null ? null : GimplifyValue(element.Index);
                     return ReferenceEquals(target, element.Expression) && ReferenceEquals(index, element.Index)
@@ -2602,9 +2640,75 @@ internal sealed class Gimplifier
         }
     }
 
+    // An element size no addressing mode scales by leaves a multiply, which the optimizer sees only as statements of its own
+    private GimpleValue? ScaledElementAddress(GimpleElementAccessExpression element)
+    {
+        if (element.Index is null or GimpleConstantValue || ArrayType.IsVariablyModified(element.Type))
+            return null;
+        int size = _target.SizeOf(element.Type);
+        if (size <= 1 || TargetRegisterInfo.ScalesIndex(_target, size))
+            return null;
+
+        GimpleValue start;
+        if (element.Expression.Type.Type is PointerType)
+            start = GimplifyValue(element.Expression);
+        else if (element.Expression is GimplePlace array && !ReachesThroughUnion(array))
+            start = AddressOf(array, new QualifiedType(_types.PointerTo(array.Type)), element.Syntax);
+        else
+            return null;
+
+        SyntaxNode? syntax = element.Syntax;
+        QualifiedType difference = PointerDifferenceType();
+        GimpleValue index = EmitConvert(GimplifyValue(element.Index), difference, syntax);
+        GimpleValue offset = EmitBinary(GimpleTreeCode.MultExpr, index, CreateIntegerConstant(size, difference, syntax), difference, syntax);
+        GimpleValue bytes = EmitBinary(GimpleTreeCode.PointerPlusExpr, EmitConvert(start, BytePointerType(), syntax), offset, BytePointerType(), syntax);
+        return EmitConvert(bytes, new QualifiedType(_types.PointerTo(element.Type)), syntax);
+    }
+
+    // A union member read through an indirection would lose the union that lets it alias every type
+    private static bool ReachesThroughUnion(GimpleValue place)
+    {
+        GimpleValue current = place;
+        while (true)
+        {
+            if (current is GimpleMemberAccessExpression member)
+            {
+                QualifiedType container = member.ThroughPointer && member.Expression.Type.Type is PointerType pointer
+                    ? pointer.PointeeType
+                    : member.Expression.Type;
+                if (container.Type.Kind == TypeKind.Union)
+                    return true;
+                if (member.ThroughPointer)
+                    return false;
+                current = member.Expression;
+            }
+            else if (current is GimpleElementAccessExpression element && element.Expression.Type.Type is ArrayType)
+            {
+                current = element.Expression;
+            }
+            else
+            {
+                return false;
+            }
+        }
+    }
+
+    private GimpleValue AddressOf(GimplePlace place, QualifiedType type, SyntaxNode? syntax)
+    {
+        GimplePlace reference = GimplifyReference(place);
+        if (reference is GimpleIndirectExpression indirect)
+            return EmitConvert(indirect.Address, type, syntax);
+
+        GimpleTemporaryValue target = CreateTemporary(type, syntax);
+        Emit(GimpleAssignStatement.Single(target, new GimpleAddressOfExpression(reference, type, syntax), syntax));
+        return target;
+    }
+
     /// <summary>Reduces the base of a reference tree, which may stay a nested reference</summary>
     private GimpleValue GimplifyReferenceBase(GimpleValue value)
     {
+        if (value is GimpleSymbolValue && value.Type.Type is PointerType)
+            return GimplifyValue(value);
         if (value is GimpleSymbolValue or GimpleTemporaryValue)
             return value;
 
@@ -2825,7 +2929,7 @@ internal sealed class Gimplifier
         var elements = EmitBinary(GimpleTreeCode.PointerDiffExpr, EmitConvert(left, elementPointer, syntax), EmitConvert(right, elementPointer, syntax),
             PointerDifferenceType(), syntax);
         var stride = EmitConvert(ElementCount(pointee, syntax), PointerDifferenceType(), syntax);
-        return EmitConvert(EmitBinary(GimpleTreeCode.TruncDivExpr, elements, stride, PointerDifferenceType(), syntax), type, syntax);
+        return EmitConvert(EmitBinary(GimpleTreeCode.ExactDivExpr, elements, stride, PointerDifferenceType(), syntax), type, syntax);
     }
 
     private GimpleValue LowerVariableSizeof(BoundSizeofExpression expression, QualifiedType operandType)
@@ -3072,6 +3176,25 @@ internal sealed class Gimplifier
 
                 case BoundLabelStatement labelStatement:
                     Visit(labelStatement.Statement);
+                    break;
+
+                // A case label may sit anywhere in the switch body, inside an if or a loop as well
+                case BoundIfStatement ifStatement:
+                    Visit(ifStatement.ThenStatement);
+                    if (ifStatement.ElseStatement is not null)
+                        Visit(ifStatement.ElseStatement);
+                    break;
+
+                case BoundWhileStatement whileStatement:
+                    Visit(whileStatement.Statement);
+                    break;
+
+                case BoundDoStatement doStatement:
+                    Visit(doStatement.Statement);
+                    break;
+
+                case BoundForStatement forStatement:
+                    Visit(forStatement.Statement);
                     break;
 
                 case BoundSwitchStatement:

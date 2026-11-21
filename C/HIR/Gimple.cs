@@ -737,6 +737,7 @@ public sealed class GimpleAssignStatement : GimpleStatement
 public sealed class GimpleCallStatement : GimpleStatement
 {
     public override GimpleNodeKind Kind => GimpleNodeKind.CallStatement;
+    public override bool IsTerminator => IsNoReturn;
 
     /// <summary>Gets the destination of the call result or null when the result is discarded</summary>
     public GimplePlace? Lhs { get; }

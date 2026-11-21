@@ -61,6 +61,8 @@ public sealed class RiscVCodeGenerator
     private readonly Dictionary<Symbol, string> _dataLabels = new Dictionary<Symbol, string>();
     private readonly Dictionary<string, string> _dataLabelsByName = new Dictionary<string, string>(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _stringLabels = new Dictionary<string, string>(StringComparer.Ordinal);
+    private readonly Dictionary<long, string> _wideImmediateLabels = new Dictionary<long, string>();
+    private readonly Dictionary<(int Size, ulong Bits), string> _floatingLiteralLabels = new Dictionary<(int Size, ulong Bits), string>();
     private readonly HashSet<string> _usedLabels = new HashSet<string>(StringComparer.Ordinal);
     private readonly List<RVObjectSymbol> _symbols = new List<RVObjectSymbol>();
     private readonly DataSectionBuilder _rodata = new DataSectionBuilder(RodataSectionName, RVObjectSectionKind.Rodata);
@@ -894,6 +896,7 @@ public sealed class RiscVCodeGenerator
         _text.DefineLabel(label);
         context.EmitPrologue();
         context.EmitBlocks();
+        context.EmitSharedEpilogue();
         if (!_text.EndsWithoutFallthrough)
             context.EmitTrap();
         var size = _text.ByteLength - startOffset;
@@ -1008,7 +1011,8 @@ public sealed class RiscVCodeGenerator
                     "<<" or ">>" or "rotr" => index == 0,
                     "rotl" => true,
                     "-" => index == 0 || !FitsImmediate12(-value),
-                    "+" or "&" or "|" or "^" or "==" or "!=" => !FitsImmediate12(value),
+                    "&" => !FitsImmediate12(value) && !TryGetBitRun(unchecked((ulong)value), Math.Min(target.SizeOf(constant.Type), target.RegisterSize) * 8, out _, out _),
+                    "+" or "|" or "^" or "==" or "!=" => !FitsImmediate12(value),
                     "<" or ">=" => !FitsImmediate12(index == 1 ? value : value + 1),
                     "<=" or ">" => !FitsImmediate12(index == 1 ? value + 1 : value),
                     _ => false,
@@ -1022,6 +1026,17 @@ public sealed class RiscVCodeGenerator
 
         static bool IsSameConstant(LirOperand constant, LirOperand other)
             => other.Kind == LirOperandKind.Immediate && Equals(constant.Immediate, other.Immediate) && ReferenceEquals(constant.Type.Type, other.Type.Type);
+    }
+
+    // A mask of only the low or only the high bits is a shift pair, so it never needs a register
+    private static bool TryGetBitRun(ulong mask, int bits, out int shift, out bool keepsLow)
+    {
+        ulong full = bits >= 64 ? ulong.MaxValue : (1UL << bits) - 1;
+        mask &= full;
+        ulong cleared = ~mask & full;
+        keepsLow = (mask & (mask + 1)) == 0;
+        shift = System.Numerics.BitOperations.TrailingZeroCount(keepsLow ? ~mask : mask);
+        return mask != 0 && mask != full && (keepsLow || (cleared & (cleared + 1)) == 0);
     }
 
     private static long ConvertIntegerConstant(object? value)
@@ -1156,6 +1171,9 @@ public sealed class RiscVCodeGenerator
         private readonly int _riscVVarArgsSaveAreaOffset;
         private readonly int _riscVVarArgsSaveAreaSize;
         private readonly int _totalFrameSize;
+        private readonly int _firstStackStep;
+        private readonly string _epilogueLabel;
+        private bool _epilogueReferenced;
         private readonly IntegerRepresentationFact[] _integerRepresentationFacts = new IntegerRepresentationFact[32];
         private RVRegister _vectorConfigLength = RVRegister.Invalid;
         private RVRegister _vectorConfigResult = RVRegister.Invalid;
@@ -1450,6 +1468,26 @@ public sealed class RiscVCodeGenerator
                 baseFrameSize = Math.Max(baseFrameSize, checked(_raSaveOffset + _owner._target.PointerSize));
             _totalFrameSize = AlignUp(checked(baseFrameSize + _riscVVarArgsSaveAreaSize), _allocation.Frame.FrameAlignment);
             _riscVVarArgsSaveAreaOffset = _riscVVarArgsSaveAreaSize == 0 ? -1 : checked(_totalFrameSize - _riscVVarArgsSaveAreaSize);
+            _firstStackStep = ComputeFirstStackStep();
+            _epilogueLabel = owner.CreateLocalLabel(functionLabel + "_epilogue");
+        }
+
+        private int ComputeFirstStackStep()
+        {
+            var lowest = _hasCalls ? _raSaveOffset : int.MaxValue;
+            var highest = _raSaveOffset;
+            foreach (var offset in _allocation.Frame.SavedRegisterOffsets.Values)
+            {
+                lowest = Math.Min(lowest, offset);
+                highest = Math.Max(highest, offset);
+            }
+
+            if (highest < 0 || FitsSignedImmediate(highest, 12))
+                return _totalFrameSize;
+
+            var secondStep = lowest - lowest % _allocation.Frame.FrameAlignment;
+            var firstStep = _totalFrameSize - secondStep;
+            return FitsSignedImmediate(-firstStep, 12) ? firstStep : _totalFrameSize;
         }
 
         private MachineRegister FrameBase => _allocation.Frame.HasDynamicStack ? FramePointer : Sp;
@@ -1470,17 +1508,19 @@ public sealed class RiscVCodeGenerator
         public void EmitPrologue()
         {
             RecordUnwindInfo();
-            AdjustStack(-_totalFrameSize);
+            var secondStep = _totalFrameSize - _firstStackStep;
+            AdjustStack(-_firstStackStep);
+            foreach (var pair in _allocation.Frame.SavedRegisterOffsets.OrderBy(static p => p.Value))
+                StoreRegister(pair.Key, Sp, pair.Value - secondStep, RegisterSaveSize(pair.Key));
+            if (_hasCalls)
+                StoreRegister(Ra, Sp, _raSaveOffset - secondStep, _owner._target.PointerSize);
+            AdjustStack(-secondStep);
             if (_allocation.Frame.HasDynamicStack)
             {
                 StoreRegister(FramePointer, Sp, _allocation.Frame.FrameBaseSaveOffset, _owner._target.PointerSize);
                 MoveRegister(FramePointer, Sp);
             }
             SaveIncomingVarArgsPointer();
-            foreach (var pair in _allocation.Frame.SavedRegisterOffsets.OrderBy(static p => p.Value))
-                StoreRegister(pair.Key, Sp, pair.Value, RegisterSaveSize(pair.Key));
-            if (_hasCalls)
-                StoreRegister(Ra, Sp, _raSaveOffset, _owner._target.PointerSize);
             SaveIncomingHiddenReturnBuffer();
         }
 
@@ -1942,7 +1982,6 @@ public sealed class RiscVCodeGenerator
                     EmitReturnBuffer(instruction);
                     break;
                 case LirInstructionKind.Unreachable:
-                    EmitTrap();
                     break;
                 default:
                     throw Unsupported(instruction, $"Unsupported LIR instruction kind: {instruction.Kind}.");
@@ -2865,6 +2904,13 @@ public sealed class RiscVCodeGenerator
         private void EmitWideIntegerShift(LirInstruction instruction)
         {
             LoadWideIntegerOperand(instruction.Operands[0], GpScratch0, GpScratch1, instruction);
+            if (instruction.Operands[1].Kind == LirOperandKind.Immediate && instruction.Operands[1].Immediate is not string)
+            {
+                EmitWideIntegerShiftByConstant(instruction, (int)(ConvertIntegerConstant(instruction.Operands[1].Immediate) & 63));
+                StoreWideIntegerResult(instruction.Result!, GpScratch0, GpScratch1);
+                return;
+            }
+
             LoadWideIntegerLowWord(instruction.Operands[1], GpScratch2, instruction);
             EmitImm(RVInstrKind.Andi, GpScratch2, GpScratch2, 63);
 
@@ -2917,41 +2963,54 @@ public sealed class RiscVCodeGenerator
             StoreWideIntegerResult(instruction.Result!, GpScratch0, GpScratch1);
         }
 
+        private void EmitWideIntegerShiftByConstant(LirInstruction instruction, int count)
+        {
+            var arithmetic = instruction.Operator != "<<" && IsSignedIntegerType(instruction.Operands[0].Type);
+            if (count == 0)
+                return;
+            if (instruction.Operator == "<<")
+            {
+                if (count >= 32)
+                {
+                    EmitShiftImmediate(RVInstrKind.Slli, GpScratch1, GpScratch0, count - 32);
+                    MoveRegister(GpScratch0, MachineRegister.X0);
+                    return;
+                }
+
+                EmitShiftImmediate(RVInstrKind.Srli, GpScratch2, GpScratch0, 32 - count);
+                EmitShiftImmediate(RVInstrKind.Slli, GpScratch1, GpScratch1, count);
+                Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(GpScratch1), ToRegister(GpScratch1), ToRegister(GpScratch2)));
+                EmitShiftImmediate(RVInstrKind.Slli, GpScratch0, GpScratch0, count);
+                return;
+            }
+
+            var highShift = arithmetic ? RVInstrKind.Srai : RVInstrKind.Srli;
+            if (count >= 32)
+            {
+                EmitShiftImmediate(highShift, GpScratch0, GpScratch1, count - 32);
+                if (arithmetic)
+                    EmitShiftImmediate(RVInstrKind.Srai, GpScratch1, GpScratch1, 31);
+                else
+                    MoveRegister(GpScratch1, MachineRegister.X0);
+                return;
+            }
+
+            EmitShiftImmediate(RVInstrKind.Slli, GpScratch2, GpScratch1, 32 - count);
+            EmitShiftImmediate(RVInstrKind.Srli, GpScratch0, GpScratch0, count);
+            Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(GpScratch0), ToRegister(GpScratch0), ToRegister(GpScratch2)));
+            EmitShiftImmediate(highShift, GpScratch1, GpScratch1, count);
+        }
+
         private void EmitWideIntegerMultiply(LirInstruction instruction)
         {
             LoadWideIntegerOperand(instruction.Operands[0], GpScratch0, GpScratch1, instruction);
             LoadWideIntegerOperand(instruction.Operands[1], GpScratch2, GpScratch3, instruction);
-            MoveRegister(GpScratch4, MachineRegister.X0);
-            MoveRegister(GpScratch5, MachineRegister.X0);
-
-            var loop = _owner.CreateLocalLabel(_functionLabel + "_i64_mul_loop");
-            var skipAdd = _owner.CreateLocalLabel(_functionLabel + "_i64_mul_skip");
-            var done = _owner.CreateLocalLabel(_functionLabel + "_i64_mul_done");
-            Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(GpScratch6), ToRegister(GpScratch2), ToRegister(GpScratch3)));
-            EmitBranch(RVInstrKind.Beq, GpScratch6, MachineRegister.X0, done);
-
-            _owner._text.DefineLabel(loop);
-            EmitImm(RVInstrKind.Andi, GpScratch6, GpScratch2, 1);
-            EmitBranch(RVInstrKind.Beq, GpScratch6, MachineRegister.X0, skipAdd);
-            Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(GpScratch6), ToRegister(GpScratch4), ToRegister(GpScratch0)));
-            Emit(RVInstruction.R(RVInstrKind.Sltu, ToRegister(GpScratch4), ToRegister(GpScratch6), ToRegister(GpScratch4)));
-            Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(GpScratch5), ToRegister(GpScratch5), ToRegister(GpScratch1)));
-            Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(GpScratch5), ToRegister(GpScratch5), ToRegister(GpScratch4)));
-            MoveRegister(GpScratch4, GpScratch6);
-
-            _owner._text.DefineLabel(skipAdd);
-            EmitShiftImmediate(RVInstrKind.Srli, GpScratch6, GpScratch0, 31);
-            EmitShiftImmediate(RVInstrKind.Slli, GpScratch0, GpScratch0, 1);
-            EmitShiftImmediate(RVInstrKind.Slli, GpScratch1, GpScratch1, 1);
-            Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(GpScratch1), ToRegister(GpScratch1), ToRegister(GpScratch6)));
-            EmitShiftImmediate(RVInstrKind.Slli, GpScratch6, GpScratch3, 31);
-            EmitShiftImmediate(RVInstrKind.Srli, GpScratch2, GpScratch2, 1);
-            Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(GpScratch2), ToRegister(GpScratch2), ToRegister(GpScratch6)));
-            EmitShiftImmediate(RVInstrKind.Srli, GpScratch3, GpScratch3, 1);
-            Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(GpScratch6), ToRegister(GpScratch2), ToRegister(GpScratch3)));
-            EmitBranch(RVInstrKind.Bne, GpScratch6, MachineRegister.X0, loop);
-
-            _owner._text.DefineLabel(done);
+            Emit(RVInstruction.R(RVInstrKind.Mulhu, ToRegister(GpScratch5), ToRegister(GpScratch0), ToRegister(GpScratch2)));
+            Emit(RVInstruction.R(RVInstrKind.Mul, ToRegister(GpScratch6), ToRegister(GpScratch0), ToRegister(GpScratch3)));
+            Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(GpScratch5), ToRegister(GpScratch5), ToRegister(GpScratch6)));
+            Emit(RVInstruction.R(RVInstrKind.Mul, ToRegister(GpScratch6), ToRegister(GpScratch1), ToRegister(GpScratch2)));
+            Emit(RVInstruction.R(RVInstrKind.Add, ToRegister(GpScratch5), ToRegister(GpScratch5), ToRegister(GpScratch6)));
+            Emit(RVInstruction.R(RVInstrKind.Mul, ToRegister(GpScratch4), ToRegister(GpScratch0), ToRegister(GpScratch2)));
             StoreWideIntegerResult(instruction.Result!, GpScratch4, GpScratch5);
         }
 
@@ -3002,6 +3061,19 @@ public sealed class RiscVCodeGenerator
                 MoveRegister(GpScratch10, MachineRegister.X0);
             }
 
+            var wideOperands = _owner.CreateLocalLabel(_functionLabel + "_i64_div_wide");
+            var signs = _owner.CreateLocalLabel(_functionLabel + "_i64_div_signs");
+            Emit(RVInstruction.R(RVInstrKind.Or, ToRegister(GpScratch7), ToRegister(GpScratch1), ToRegister(GpScratch3)));
+            EmitBranch(RVInstrKind.Bne, GpScratch7, MachineRegister.X0, wideOperands);
+            if (wantRemainder)
+                Emit(RVInstruction.R(RVInstrKind.Remu, ToRegister(GpScratch4), ToRegister(GpScratch0), ToRegister(GpScratch2)));
+            else
+                Emit(RVInstruction.R(RVInstrKind.Divu, ToRegister(GpScratch0), ToRegister(GpScratch0), ToRegister(GpScratch2)));
+            MoveRegister(GpScratch1, MachineRegister.X0);
+            MoveRegister(GpScratch5, MachineRegister.X0);
+            EmitJump(signs);
+
+            _owner._text.DefineLabel(wideOperands);
             MoveRegister(GpScratch4, MachineRegister.X0);
             MoveRegister(GpScratch5, MachineRegister.X0);
             LoadImmediate(GpScratch6, 64);
@@ -3033,6 +3105,7 @@ public sealed class RiscVCodeGenerator
             EmitImm(RVInstrKind.Addi, GpScratch6, GpScratch6, -1);
             EmitBranch(RVInstrKind.Bne, GpScratch6, MachineRegister.X0, loop);
 
+            _owner._text.DefineLabel(signs);
             EmitBranch(RVInstrKind.Beq, GpScratch9, MachineRegister.X0, quotientSignReady);
             Emit(RVInstruction.R(RVInstrKind.Sltu, ToRegister(GpScratch7), RVRegister.X0, ToRegister(GpScratch0)));
             Emit(RVInstruction.R(RVInstrKind.Sub, ToRegister(GpScratch0), RVRegister.X0, ToRegister(GpScratch0)));
@@ -3192,6 +3265,14 @@ public sealed class RiscVCodeGenerator
                 return;
             }
 
+            if (operand.Kind == LirOperandKind.Register && operand.Register is not null && RequiresStackBackedScalar(operand.Type))
+            {
+                var home = VirtualRegisterHomeOffset(operand.Register);
+                LoadFromMemory(low, FrameBase, home + WideIntegerLowOffset(), 4, signed: false);
+                LoadFromMemory(high, FrameBase, home + WideIntegerHighOffset(), 4, signed: false);
+                return;
+            }
+
             var address = MaterializeScalarStorageAddress(operand, GpScratch3, instruction);
             LoadFromMemory(low, address, WideIntegerLowOffset(), 4, signed: false);
             LoadFromMemory(high, address, WideIntegerHighOffset(), 4, signed: false);
@@ -3207,15 +3288,21 @@ public sealed class RiscVCodeGenerator
                 return;
             }
 
+            if (operand.Kind == LirOperandKind.Register && operand.Register is not null && RequiresStackBackedScalar(operand.Type))
+            {
+                LoadFromMemory(destination, FrameBase, VirtualRegisterHomeOffset(operand.Register) + WideIntegerLowOffset(), 4, signed: false);
+                return;
+            }
+
             var address = MaterializeScalarStorageAddress(operand, GpScratch3, instruction);
             LoadFromMemory(destination, address, WideIntegerLowOffset(), 4, signed: false);
         }
 
         private void StoreWideIntegerResult(LirVirtualRegister destination, MachineRegister low, MachineRegister high)
         {
-            var address = MaterializeVirtualRegisterStorageAddress(destination, GpScratch3);
-            StoreToMemory(low, address, WideIntegerLowOffset(), 4);
-            StoreToMemory(high, address, WideIntegerHighOffset(), 4);
+            var home = VirtualRegisterHomeOffset(destination);
+            StoreToMemory(low, FrameBase, home + WideIntegerLowOffset(), 4);
+            StoreToMemory(high, FrameBase, home + WideIntegerHighOffset(), 4);
         }
 
         private int WideIntegerLowOffset()
@@ -3530,8 +3617,6 @@ public sealed class RiscVCodeGenerator
             var rightOperand = instruction.Operands[1];
             var op = instruction.Operator;
 
-            if (op is "*" or "/" or "%" && TryEmitPowerOfTwoArithmetic(instruction, dst, leftOperand))
-                return true;
             if (op is "/" or "%" && TryEmitMagicDivide(instruction, dst, leftOperand))
                 return true;
 
@@ -3581,7 +3666,7 @@ public sealed class RiscVCodeGenerator
                 case "|":
                 case "^":
                     if (!TryGetSignedImmediate12(rightOperand, operationBits, out var bitwiseImmediate))
-                        return false;
+                        return op == "&" && TryEmitBitMask(dst, leftOperand, GetIntegerImmediateBits(rightOperand, operationBits), wordOp, operationBits);
                     var bitwiseOpcode = op == "&" ? RVInstrKind.Andi : op == "|" ? RVInstrKind.Ori : RVInstrKind.Xori;
                     EmitImm(bitwiseOpcode, dst, LoadOperand(leftOperand, GpScratch1), bitwiseImmediate);
                     return true;
@@ -3701,55 +3786,15 @@ public sealed class RiscVCodeGenerator
             return true;
         }
 
-        private bool TryEmitPowerOfTwoArithmetic(LirInstruction instruction, MachineRegister dst, LirOperand leftOperand)
+        private bool TryEmitBitMask(MachineRegister dst, LirOperand leftOperand, ulong mask, bool wordOp, int bits)
         {
-            var wordOp = _owner._target.Is64Bit && SizeOf(instruction.Operands[0].Type) <= 4;
-            var bits = wordOp ? 32 : _owner._target.RegisterSize * 8;
-
-            if (instruction.Operator == "*")
-            {
-                if (!LirStrengthReduction.TryGetPowerOfTwoFactor(instruction, _owner._target, out var factorShift))
-                    return false;
-                EmitShiftImmediate(wordOp ? RVInstrKind.Slliw : RVInstrKind.Slli, dst, LoadOperand(leftOperand, GpScratch1), factorShift);
-                return true;
-            }
-
-            if (!LirStrengthReduction.TryGetPowerOfTwoDivisor(instruction, _owner._target, out var shift, out var negated))
+            if (!TryGetBitRun(mask, bits, out int shift, out bool keepsLow))
                 return false;
 
-            var wantRemainder = instruction.Operator == "%";
-            var dividend = LoadOperand(leftOperand, GpScratch1);
-            if (!IsSignedIntegerType(instruction.Operands[0].Type))
-            {
-                if (!wantRemainder)
-                    EmitShiftImmediate(wordOp ? RVInstrKind.Srliw : RVInstrKind.Srli, dst, dividend, shift);
-                else
-                    EmitKeepLowBits(dst, dividend, shift, wordOp, bits);
-                return true;
-            }
-
-            // The bias is 2^k - 1 for a negative dividend and zero otherwise, so the shift truncates toward zero
-            if (shift == 1)
-            {
-                EmitShiftImmediate(wordOp ? RVInstrKind.Srliw : RVInstrKind.Srli, GpScratch2, dividend, bits - 1);
-            }
+            if (keepsLow)
+                EmitKeepLowBits(dst, LoadOperand(leftOperand, GpScratch1), shift, wordOp, bits);
             else
-            {
-                EmitShiftImmediate(wordOp ? RVInstrKind.Sraiw : RVInstrKind.Srai, GpScratch2, dividend, bits - 1);
-                EmitShiftImmediate(wordOp ? RVInstrKind.Srliw : RVInstrKind.Srli, GpScratch2, GpScratch2, bits - shift);
-            }
-
-            Emit(RVInstruction.R(wordOp ? RVInstrKind.Addw : RVInstrKind.Add, ToRegister(GpScratch2), ToRegister(dividend), ToRegister(GpScratch2)));
-            if (wantRemainder)
-            {
-                EmitClearLowBits(GpScratch2, GpScratch2, shift, wordOp, bits);
-                Emit(RVInstruction.R(wordOp ? RVInstrKind.Subw : RVInstrKind.Sub, ToRegister(dst), ToRegister(dividend), ToRegister(GpScratch2)));
-                return true;
-            }
-
-            EmitShiftImmediate(wordOp ? RVInstrKind.Sraiw : RVInstrKind.Srai, dst, GpScratch2, shift);
-            if (negated)
-                Emit(RVInstruction.R(wordOp ? RVInstrKind.Subw : RVInstrKind.Sub, ToRegister(dst), RVRegister.X0, ToRegister(dst)));
+                EmitClearLowBits(dst, LoadOperand(leftOperand, GpScratch1), shift, wordOp, bits);
             return true;
         }
 
@@ -5923,14 +5968,12 @@ public sealed class RiscVCodeGenerator
             if (instruction.Operands.Length == 1 && instruction.Operands[0].Kind == LirOperandKind.Segments)
             {
                 MoveReturnSegments(instruction);
-                EmitEpilogue();
-                EmitReturnInstruction();
+                LeaveFunction();
                 return;
             }
             if (instruction.Operator.Length != 0 || instruction.Operands.Length == 0 || IsVoid(instruction.Operands[0].Type))
             {
-                EmitEpilogue();
-                EmitReturnInstruction();
+                LeaveFunction();
                 return;
             }
 
@@ -5943,8 +5986,7 @@ public sealed class RiscVCodeGenerator
                 {
                     MaterializeIncomingHiddenReturnBufferAddress(GpScratch1);
                     CopyMemory(GpScratch1, GpScratch0, value.Size, BlockAlignment(operand.Type));
-                    EmitEpilogue();
-                    EmitReturnInstruction();
+                    LeaveFunction();
                     return;
                 }
 
@@ -5954,8 +5996,7 @@ public sealed class RiscVCodeGenerator
                     LoadRawBitsFromMemory(CAbi.SegmentReturnRegister(value, i), GpScratch0, segment.Offset, segment.Size, BlockAlignment(operand.Type));
                 }
 
-                EmitEpilogue();
-                EmitReturnInstruction();
+                LeaveFunction();
                 return;
             }
 
@@ -5966,8 +6007,7 @@ public sealed class RiscVCodeGenerator
                 var sourceAddress = MaterializeScalarStorageAddress(operand, GpScratch0, instruction);
                 MaterializeIncomingHiddenReturnBufferAddress(GpScratch1);
                 CopyMemory(GpScratch1, sourceAddress, returnAbi.Size, BlockAlignment(returnType));
-                EmitEpilogue();
-                EmitReturnInstruction();
+                LeaveFunction();
                 return;
             }
 
@@ -5979,14 +6019,12 @@ public sealed class RiscVCodeGenerator
                     var segment = returnAbi.Segments[i];
                     LoadRawBitsFromMemory(CAbi.SegmentReturnRegister(returnAbi, i), sourceAddress, segment.Offset, segment.Size, BlockAlignment(returnType));
                 }
-                EmitEpilogue();
-                EmitReturnInstruction();
+                LeaveFunction();
                 return;
             }
             var returnRegister = returnAbi.Segments.Length != 0 && returnAbi.Segments[0].RegisterClass == AbiRegisterClass.Floating ? MachineRegister.F10 : MachineRegister.X10;
             LoadOperandIntoAs(operand, returnRegister, returnType, instruction);
-            EmitEpilogue();
-            EmitReturnInstruction();
+            LeaveFunction();
         }
 
         private void MoveReturnSegments(LirInstruction instruction)
@@ -6017,17 +6055,39 @@ public sealed class RiscVCodeGenerator
             StoreWritableRegisterIfSpilled(instruction.Result!, destination);
         }
 
-        private void EmitEpilogue()
+        private void LeaveFunction()
         {
+            if (_fallthroughBlock is not null && _totalFrameSize == 0)
+            {
+                EmitReturnInstruction();
+                return;
+            }
+
+            _epilogueReferenced = true;
+            if (_fallthroughBlock is not null)
+                EmitJump(_epilogueLabel);
+        }
+
+        public void EmitSharedEpilogue()
+        {
+            if (!_epilogueReferenced)
+                return;
+
+            ClearIntegerRepresentationFacts();
+            _owner._text.DefineLabel(_epilogueLabel);
+            var secondStep = _totalFrameSize - _firstStackStep;
             if (_allocation.Frame.HasDynamicStack)
+            {
                 MoveRegister(Sp, FramePointer);
-            if (_hasCalls)
-                LoadFromMemory(Ra, Sp, _raSaveOffset, _owner._target.PointerSize, signed: false);
-            foreach (var pair in _allocation.Frame.SavedRegisterOffsets.OrderByDescending(static p => p.Value))
-                LoadFromMemory(pair.Key, Sp, pair.Value, RegisterSaveSize(pair.Key), signed: false);
-            if (_allocation.Frame.HasDynamicStack)
                 LoadFromMemory(FramePointer, Sp, _allocation.Frame.FrameBaseSaveOffset, _owner._target.PointerSize, signed: false);
-            AdjustStack(_totalFrameSize);
+            }
+            AdjustStack(secondStep);
+            if (_hasCalls)
+                LoadFromMemory(Ra, Sp, _raSaveOffset - secondStep, _owner._target.PointerSize, signed: false);
+            foreach (var pair in _allocation.Frame.SavedRegisterOffsets.OrderByDescending(static p => p.Value))
+                LoadFromMemory(pair.Key, Sp, pair.Value - secondStep, RegisterSaveSize(pair.Key), signed: false);
+            AdjustStack(_firstStackStep);
+            EmitReturnInstruction();
         }
 
         private void EmitParallelCopy(LirInstruction instruction)
@@ -6406,17 +6466,19 @@ public sealed class RiscVCodeGenerator
 
         private MachineRegister MaterializeVirtualRegisterStorageAddress(LirVirtualRegister register, MachineRegister destination)
         {
+            AddImmediate(destination, FrameBase, VirtualRegisterHomeOffset(register));
+            return destination;
+        }
+
+        private int VirtualRegisterHomeOffset(LirVirtualRegister register)
+        {
             if (register.HomeSlot is { } home)
-            {
-                AddImmediate(destination, FrameBase, _allocation.Frame.StackSlotOffsets[home]);
-                return destination;
-            }
+                return _allocation.Frame.StackSlotOffsets[home];
 
             var alloc = _allocation[register];
             if (!alloc.IsSpilled)
                 throw new NotSupportedException($"Virtual register {register.Name} must be stack-backed.");
-            AddImmediate(destination, FrameBase, alloc.StackOffset);
-            return destination;
+            return alloc.StackOffset;
         }
 
         private void MaterializeOperandStorageAddress(LirOperand operand, MachineRegister destination, LirInstruction instruction)
@@ -7190,18 +7252,17 @@ public sealed class RiscVCodeGenerator
                 return;
             }
 
-            var label = _owner.CreateLocalLabel(size == 4 ? "f32" : "f64");
-            var offset = _owner._rodata.Align(size);
-            _owner._rodata.DefineSymbol(label, offset, size, RVObjectSymbolBinding.Local, _owner._symbols);
-            if (size == 4)
+            byte[] raw = size == 4
+                ? BitConverter.GetBytes(Convert.ToSingle(value, CultureInfo.InvariantCulture))
+                : BitConverter.GetBytes(Convert.ToDouble(value, CultureInfo.InvariantCulture));
+            var key = (size, size == 4 ? BitConverter.ToUInt32(raw, 0) : BitConverter.ToUInt64(raw, 0));
+            if (!_owner._floatingLiteralLabels.TryGetValue(key, out string? label))
             {
-                var raw = BitConverter.GetBytes(Convert.ToSingle(value, CultureInfo.InvariantCulture));
-                _owner._rodata.EmitBytes(raw, 4);
-            }
-            else
-            {
-                var raw = BitConverter.GetBytes(Convert.ToDouble(value, CultureInfo.InvariantCulture));
-                _owner._rodata.EmitBytes(raw, 8);
+                label = _owner.CreateLocalLabel(size == 4 ? "f32" : "f64");
+                var offset = _owner._rodata.Align(size);
+                _owner._rodata.DefineSymbol(label, offset, size, RVObjectSymbolBinding.Local, _owner._symbols);
+                _owner._rodata.EmitBytes(raw, size);
+                _owner._floatingLiteralLabels.Add(key, label);
             }
             EmitPcrelAccess(IsFloatRegister(destination) ? FloatingLoadOpcode(size) : LoadOpcode(size, signed: false),
                 destination, new AddressParts(GpScratch3, 0, label), isStore: false);
@@ -7351,10 +7412,14 @@ public sealed class RiscVCodeGenerator
                 return;
             }
 
-            var label = _owner.CreateLocalLabel("i64");
-            var offset = _owner._rodata.Align(8);
-            _owner._rodata.DefineSymbol(label, offset, 8, RVObjectSymbolBinding.Local, _owner._symbols);
-            _owner._rodata.EmitInteger(value, 8, _owner._target.Endianness);
+            if (!_owner._wideImmediateLabels.TryGetValue(value, out string? label))
+            {
+                label = _owner.CreateLocalLabel("i64");
+                var offset = _owner._rodata.Align(8);
+                _owner._rodata.DefineSymbol(label, offset, 8, RVObjectSymbolBinding.Local, _owner._symbols);
+                _owner._rodata.EmitInteger(value, 8, _owner._target.Endianness);
+                _owner._wideImmediateLabels.Add(value, label);
+            }
             EmitPcrelAccess(LoadOpcode(8, signed: false), destination, new AddressParts(destination, 0, label), isStore: false);
             SetIntegerRepresentation(destination, representation);
         }

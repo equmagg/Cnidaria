@@ -78,6 +78,12 @@ public enum TargetArchitectureFeatures : ulong
     X86Vpclmulqdq = 1UL << 48,
     X86Gfni = 1UL << 49,
     X86Serialize = 1UL << 50,
+    ArmAes = 1UL << 51,
+    ArmCrc32 = 1UL << 52,
+    ArmDp = 1UL << 53,
+    ArmRdm = 1UL << 54,
+    ArmSha1 = 1UL << 55,
+    ArmSha256 = 1UL << 62,
     // POPCNT comes with SSE4.2 and BMI1, BMI2 and FMA with AVX2, as in the x86-64 levels
     X86V2 = X86Sse2 | X86Sse3 | X86Ssse3 | X86Sse41 | X86Sse42,
     X86V3 = X86V2 | X86Avx | X86Avx2 | X86Lzcnt,
@@ -87,6 +93,8 @@ public enum TargetArchitectureFeatures : ulong
     ArmVfpD32 = 1UL << 57,
     ArmNeon = 1UL << 58,
     ArmHardFloat = 1UL << 59,
+    ArmSve = 1UL << 60,
+    ArmSve2 = 1UL << 61,
 }
 
 public interface IProgram

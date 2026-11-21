@@ -210,11 +210,14 @@ internal sealed class ScalarEvolution
     private HashSet<GimpleName> _pending = new();
     private GimpleCondStatement? _exitTest;
     private bool _exitWhenTrue;
+    private readonly GimpleName? _guardedPhi;
     private bool _unsignedStep;
 
     public ScalarEvolution(NaturalLoop loop, ControlFlowBlock preheader, ControlFlowBlock latch, TargetInfo target,
-        IReadOnlyDictionary<GimpleName, GimpleStatementAnnotations> definitions, GimpleCondStatement? exitTest, bool exitWhenTrue)
+        IReadOnlyDictionary<GimpleName, GimpleStatementAnnotations> definitions, GimpleCondStatement? exitTest, bool exitWhenTrue,
+        GimpleName? guardedPhi = null)
     {
+        _guardedPhi = guardedPhi;
         _loop = loop;
         _preheader = preheader;
         _latch = latch;
@@ -303,7 +306,7 @@ internal sealed class ScalarEvolution
                         _unsignedStep = true;
                     return assign.Subcode switch
                     {
-                        GimpleTreeCode.PlusExpr => Scev.Add(left, right, noSignedWrap),
+                        GimpleTreeCode.PlusExpr => Successor(assign, Scev.Add(left, right, noSignedWrap)),
                         GimpleTreeCode.MinusExpr => Scev.Negate(right, noSignedWrap) is { } negated ? Scev.Add(left, negated, noSignedWrap) : null,
                         _ => Scev.Multiply(left, right, noSignedWrap),
                     };
@@ -421,9 +424,19 @@ internal sealed class ScalarEvolution
         }
     }
 
+    // The guarded counter stays below its bound everywhere in the loop, so one past it still fits its type
+    private Scev? Successor(GimpleAssignStatement assign, Scev? sum)
+        => sum is not null && sum.Kind == ScevKind.AddRecurrence && !sum.NoUnsignedWrap && _guardedPhi is not null &&
+           ReferenceEquals(assign.Operands[0], _guardedPhi) && assign.Operands[1] is GimpleConstantValue constant &&
+           TryGetInteger(constant.Value, out long addend) && addend == 1
+            ? Scev.AddRecurrence(sum.Start, sum.Step, sum.NoSignedWrap, true)
+            : sum;
+
     // i < n with a unit step stops at n, before i can wrap
     private bool IsBoundedAbove(GimpleName phi)
     {
+        if (ReferenceEquals(phi, _guardedPhi))
+            return true;
         if (_exitTest is null)
             return false;
         var code = _exitWhenTrue ? Invert(_exitTest.Code) : _exitTest.Code;

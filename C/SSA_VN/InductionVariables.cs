@@ -11,14 +11,14 @@ internal static class InductionVariables
     private const int MaxIndexedGroups = 2;
 
     public static GimpleFunctionAnnotations Optimize(GimpleFunctionAnnotations function, TargetInfo target,
-        SsaOptimizationOptions options, ValueNumberingOptions valueNumberingOptions, AssertionTable? assertions = null)
+        SsaOptimizationOptions options, ValueNumberingOptions valueNumberingOptions, ValueRangeTable? ranges = null)
     {
         if (!options.EnableInductionVariables || options.MaxLoopAnalysisWork <= 0 || function.Problems.Length != 0)
             return function;
         var analysis = new NaturalLoopAnalysis(function.ControlFlowFunction, options.MaxLoopAnalysisWork);
         if (analysis.Remaining <= 0 || analysis.Loops.Count == 0)
             return function;
-        return new Rewriter(function, target, valueNumberingOptions, analysis, assertions).Run();
+        return new Rewriter(function, target, valueNumberingOptions, analysis, ranges).Run();
     }
 
     private sealed class Shape
@@ -30,6 +30,7 @@ internal static class InductionVariables
         public ControlFlowEdge BackEdge = null!;
         public GimpleStatementAnnotations? ExitTest;
         public bool ExitWhenTrue;
+        public bool ExitAtLatch;
     }
 
     private sealed class Access
@@ -49,6 +50,7 @@ internal static class InductionVariables
         public Access First => Members[0];
         public GimpleName? Start;
         public GimpleName? Pointer;
+        public GimpleName? Next;
     }
 
     private sealed class Rewriter
@@ -57,7 +59,7 @@ internal static class InductionVariables
         private readonly TargetInfo _target;
         private readonly ValueNumberingOptions _valueNumberingOptions;
         private readonly NaturalLoopAnalysis _analysis;
-        private readonly AssertionTable? _assertions;
+        private readonly ValueRangeTable? _ranges;
         private readonly bool _pointerWalk;
         private readonly int _pointerBits;
         private readonly QualifiedType _indexType;
@@ -77,10 +79,10 @@ internal static class InductionVariables
         private int _nextPhi;
 
         public Rewriter(GimpleFunctionAnnotations function, TargetInfo target, ValueNumberingOptions valueNumberingOptions,
-            NaturalLoopAnalysis analysis, AssertionTable? assertions)
+            NaturalLoopAnalysis analysis, ValueRangeTable? ranges)
         {
             _function = function;
-            _assertions = assertions;
+            _ranges = ranges;
             _target = target;
             _valueNumberingOptions = valueNumberingOptions;
             _analysis = analysis;
@@ -190,7 +192,58 @@ internal static class InductionVariables
                     shape.ExitWhenTrue = !trueInside;
                 }
             }
+
+            // An inverted loop tests at its latch, between the back edge and the exit
+            if (shape.ExitTest is null && _blocks.TryGetValue(shape.Latch, out GimpleBlockAnnotations? latch) && latch.Statements.Length != 0 &&
+                latch.Statements[^1].Statement is GimpleCondStatement bottom)
+            {
+                bool trueToHeader = Targets(bottom.WhenTrue, loop.Header);
+                if (trueToHeader != Targets(bottom.WhenFalse, loop.Header) && !TargetsLoop(trueToHeader ? bottom.WhenFalse : bottom.WhenTrue, loop))
+                {
+                    shape.ExitTest = latch.Statements[^1];
+                    shape.ExitWhenTrue = !trueToHeader;
+                    shape.ExitAtLatch = true;
+                }
+            }
             return true;
+        }
+
+        private (GimpleName Phi, GimpleValue Start)? EntryOf(Shape shape, GimpleValue counter)
+        {
+            foreach (GimplePhi phi in _blocks[shape.Loop.Header].Phis)
+            {
+                if (!ReferenceEquals(phi.Result, counter) && !ReferenceEquals(BackEdgeValue(phi, shape), counter))
+                    continue;
+                foreach (GimplePhiOperand operand in phi.Operands)
+                {
+                    if (ReferenceEquals(operand.Edge, shape.EntryEdge))
+                        return (phi.Result, operand.Value);
+                }
+            }
+            return null;
+        }
+
+        // A latch test sees a counter only after the body ran, so it bounds the counter only from an entry already inside the range
+        private bool EntersRange(Shape shape, GimpleValue counter, GimpleTreeCode continueCode, GimpleValue bound)
+            => _ranges is not null && EntryOf(shape, counter) is (GimpleName, GimpleValue) entry &&
+               _ranges.Proves(shape.Preheader, entry.Start, continueCode, bound);
+
+        // A counter that starts below the bound and goes around only while its next value is still below it never reaches the bound
+        private GimpleName? GuardedPhi(Shape shape)
+        {
+            if (!shape.ExitAtLatch || shape.ExitTest?.Statement is not GimpleCondStatement test)
+                return null;
+            GimpleTreeCode continueCode = shape.ExitWhenTrue ? ScalarEvolution.Invert(test.Code) : test.Code;
+            GimpleValue counter = continueCode == GimpleTreeCode.GtExpr ? test.Rhs : test.Lhs;
+            GimpleValue bound = continueCode == GimpleTreeCode.GtExpr ? test.Lhs : test.Rhs;
+            if (continueCode is not (GimpleTreeCode.LtExpr or GimpleTreeCode.GtExpr) ||
+                bound is GimpleName name && name.Definition?.Block is ControlFlowBlock block && shape.Loop.Blocks.Contains(block) ||
+                EntryOf(shape, counter) is not (GimpleName phi, GimpleValue) || ReferenceEquals(phi, counter) ||
+                !EntersRange(shape, counter, GimpleTreeCode.LtExpr, bound))
+            {
+                return null;
+            }
+            return phi;
         }
 
         private GimpleStatement? Terminator(ControlFlowBlock block)
@@ -243,7 +296,7 @@ internal static class InductionVariables
                 }
             }
 
-            var evolution = new ScalarEvolution(shape.Loop, shape.Preheader, shape.Latch, _target, _definitions, test, shape.ExitWhenTrue);
+            var evolution = new ScalarEvolution(shape.Loop, shape.Preheader, shape.Latch, _target, _definitions, test, shape.ExitWhenTrue, GuardedPhi(shape));
             var ivOnLeft = IsRecurrence(test.Lhs, evolution) && IsInvariantOperand(test.Rhs, evolution);
             if (!ivOnLeft && !(IsRecurrence(test.Rhs, evolution) && IsInvariantOperand(test.Lhs, evolution)))
                 return false;
@@ -300,7 +353,7 @@ internal static class InductionVariables
         private void OptimizeLoop(Shape shape)
         {
             var test = shape.ExitTest?.Statement as GimpleCondStatement;
-            var evolution = new ScalarEvolution(shape.Loop, shape.Preheader, shape.Latch, _target, _definitions, test, shape.ExitWhenTrue);
+            var evolution = new ScalarEvolution(shape.Loop, shape.Preheader, shape.Latch, _target, _definitions, test, shape.ExitWhenTrue, GuardedPhi(shape));
             var accesses = new List<Access>();
             foreach (var block in shape.Loop.Blocks)
             {
@@ -331,7 +384,7 @@ internal static class InductionVariables
             var preheader = new List<GimpleStatementAnnotations>();
             var latch = new List<GimpleStatementAnnotations>();
             var reduced = new List<Group>();
-            var widened = new Dictionary<long, GimpleName>();
+            var widened = new Dictionary<long, (GimpleName Counter, GimpleName Next)>();
             foreach (var group in groups.OrderByDescending(static group => group.Members.Count))
             {
                 if (_pointerWalk ? reduced.Count < MaxPointerWalkGroups : !IsIndexable(group) && reduced.Count < MaxIndexedGroups)
@@ -650,6 +703,7 @@ internal static class InductionVariables
             }
             group.Start = start;
             group.Pointer = current;
+            group.Next = next;
 
             foreach (var member in group.Members)
             {
@@ -663,19 +717,24 @@ internal static class InductionVariables
 
         private void Widen(Shape shape, Group group, List<GimpleStatementAnnotations> preheader,
             List<GimpleStatementAnnotations> latch, Dictionary<GimpleOperandInfo, GimpleOperandInfo> replacements,
-            Dictionary<long, GimpleName> widened)
+            Dictionary<long, (GimpleName Counter, GimpleName Next)> widened)
         {
             var first = group.First;
             if (!first.NarrowIndex || !first.Index.Step.TryGetConstant(out var stride))
                 return;
-            if (!widened.TryGetValue(stride, out var counter))
+            GimpleName counter;
+            if (widened.TryGetValue(stride, out (GimpleName Counter, GimpleName Next) existing))
+            {
+                counter = existing.Counter;
+            }
+            else
             {
                 var variable = NewVariable(_indexType);
                 counter = NewName(variable);
                 var next = NewName(variable);
                 AddPhi(shape, variable, counter, Emit(shape.Preheader, preheader, GimpleTreeCode.IntegerCst, _indexType, Constant(0)), next);
                 latch.Add(NewAssign(shape.Latch, next, GimpleTreeCode.PlusExpr, counter, Constant(stride)));
-                widened.Add(stride, counter);
+                widened.Add(stride, (counter, next));
             }
 
             // The members start a constant number of elements apart, which their addresses carry off one base
@@ -705,7 +764,7 @@ internal static class InductionVariables
         }
 
         private GimpleStatementAnnotations? RewriteExitTest(Shape shape, ScalarEvolution evolution, List<Group> reduced,
-            Dictionary<long, GimpleName> widened, List<GimpleStatementAnnotations> preheader,
+            Dictionary<long, (GimpleName Counter, GimpleName Next)> widened, List<GimpleStatementAnnotations> preheader,
             Dictionary<GimpleStatementAnnotations, GimpleStatementAnnotations> rewritten)
         {
             if (shape.ExitTest?.Statement is not GimpleCondStatement test || _pointerBits != 64)
@@ -733,15 +792,22 @@ internal static class InductionVariables
 
             if (!_pointerWalk)
             {
-                if (!widened.TryGetValue(stride, out var counter))
+                if (!widened.TryGetValue(stride, out (GimpleName Counter, GimpleName Next) widenedCounter))
                     return null;
-                var limit = Difference(wideBound, wide.Start, shape.Preheader, preheader);
+                GimpleValue limit = Difference(wideBound, wide.Start, shape.Preheader, preheader);
+                GimpleName counter = widenedCounter.Counter;
+                // The latch compares the counter that has already stepped
+                if (shape.ExitAtLatch)
+                {
+                    counter = widenedCounter.Next;
+                    limit = Emit(shape.Preheader, preheader, GimpleTreeCode.PlusExpr, _indexType, limit, Constant(stride));
+                }
                 var widenedTest = ivOnLeft ? test.WithOperands(test.Code, counter, limit) : test.WithOperands(test.Code, limit, counter);
                 return NewCondition(shape.ExitTest, widenedTest);
             }
 
             var group = reduced.FirstOrDefault(candidate => candidate.First.Index.Step.TryGetConstant(out var step) && step == stride);
-            if (group?.Start is null || group.Pointer is null || stride is not (1 or -1))
+            if (group?.Start is null || group.Pointer is null || group.Next is null || stride is not (1 or -1))
                 return null;
             var extra = continueCode switch
             {
@@ -754,6 +820,13 @@ internal static class InductionVariables
             };
             if (extra < 0)
                 return null;
+            // A test at the latch sees the range only after one trip, so it may not start empty, where the pointer would run past the end
+            GimpleTreeCode entryCode = continueCode == GimpleTreeCode.NeExpr ? stride == 1 ? GimpleTreeCode.LtExpr : GimpleTreeCode.GtExpr : continueCode;
+            if (shape.ExitAtLatch && !EntersRange(shape, variable, entryCode, bound))
+                return null;
+            // The latch compares the pointer that has already stepped, one element past the one the counter belongs to
+            if (shape.ExitAtLatch)
+                extra++;
 
             // != stops only on the exact trip count, which a reversed range would step past
             GimpleValue distance;
@@ -765,6 +838,15 @@ internal static class InductionVariables
                 if (trips > long.MaxValue)
                     return null;
                 distance = Constant(stride == 1 ? (long)trips : -(long)trips);
+            }
+            else if (shape.ExitAtLatch)
+            {
+                distance = stride == 1
+                    ? Difference(wideBound, wide.Start, shape.Preheader, preheader)
+                    : Difference(wide.Start, wideBound, shape.Preheader, preheader);
+                distance = Emit(shape.Preheader, preheader, GimpleTreeCode.PlusExpr, _indexType, distance, Constant(extra));
+                if (stride == -1)
+                    distance = Emit(shape.Preheader, preheader, GimpleTreeCode.NegateExpr, _indexType, distance);
             }
             else
             {
@@ -792,7 +874,8 @@ internal static class InductionVariables
             var end = Emit(shape.Preheader, preheader, GimpleTreeCode.PointerPlusExpr, group.Start.Type, group.Start, distance);
             var inside = shape.ExitWhenTrue ? test.WhenFalse : test.WhenTrue;
             var outside = shape.ExitWhenTrue ? test.WhenTrue : test.WhenFalse;
-            return NewCondition(shape.ExitTest, new GimpleCondStatement(GimpleTreeCode.NeExpr, group.Pointer, end, inside, outside, test.Syntax));
+            GimpleName pointer = shape.ExitAtLatch ? group.Next : group.Pointer;
+            return NewCondition(shape.ExitTest, new GimpleCondStatement(GimpleTreeCode.NeExpr, pointer, end, inside, outside, test.Syntax));
         }
 
         private bool IsKnownForward(Shape shape, Scev start, QualifiedType type, GimpleValue bound, long stride)
@@ -805,11 +888,11 @@ internal static class InductionVariables
                     : GimpleTypes.IsSigned(type, _target) ? (object)(int)start.Value : (uint)start.Value, type),
                 _ => null,
             };
-            if (_assertions is null || first is null)
+            if (_ranges is null || first is null)
                 return false;
             return stride == 1
-                ? _assertions.Proves(shape.Preheader, bound, GimpleTreeCode.GeExpr, first)
-                : _assertions.Proves(shape.Preheader, first, GimpleTreeCode.GeExpr, bound);
+                ? _ranges.Proves(shape.Preheader, bound, GimpleTreeCode.GeExpr, first)
+                : _ranges.Proves(shape.Preheader, first, GimpleTreeCode.GeExpr, bound);
         }
 
         private static bool IsRecurrence(GimpleValue value, ScalarEvolution evolution)

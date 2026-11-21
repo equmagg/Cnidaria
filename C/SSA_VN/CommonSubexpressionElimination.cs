@@ -76,7 +76,7 @@ internal static partial class SsaOptimizer
                     return;
 
                 available.TryGetValue(number.Id, out var previous);
-                if (previous is not null && SameType(previous.Type, name.Type))
+                if (previous is not null && IsInterchangeable(previous.Type, name.Type))
                     return;
                 undo.Add((number.Id, previous));
                 available[number.Id] = name;
@@ -87,12 +87,12 @@ internal static partial class SsaOptimizer
                 replacement = null!;
                 if (!IsCseScalar(type) || IsVolatileOrAtomic(type))
                     return false;
-                if (number.HasConstantValue && SameType(number.Type, type))
+                if (number.HasConstantValue && IsInterchangeable(number.Type, type))
                 {
                     replacement = CreateConstantExpression(new GimpleConstantValue(number.ConstantValue, type));
                     return true;
                 }
-                if (!available.TryGetValue(number.Id, out var name) || !SameType(name.Type, type))
+                if (!available.TryGetValue(number.Id, out GimpleName? name) || !IsInterchangeable(name.Type, type))
                     return false;
                 replacement = CreateNameExpression(name, name, GimpleOperandRole.Value);
                 return true;

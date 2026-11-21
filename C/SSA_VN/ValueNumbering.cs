@@ -132,12 +132,29 @@ public enum ValueNumberFlags : byte
     Unique = 8,
 }
 
+/// <summary>Places a memory access as an object or address root, an offset into it, a size and the type classes it reads through</summary>
+internal readonly record struct MemoryAccess(int Root, long Offset, int Size, ulong AliasClasses)
+{
+    public static bool Disjoint(MemoryAccess left, MemoryAccess right)
+    {
+        if ((left.AliasClasses & right.AliasClasses) == 0)
+            return true;
+        if (left.Root != right.Root)
+            return left.Root < 0 && right.Root < 0;
+        return left.Offset <= right.Offset
+            ? (ulong)right.Offset - (ulong)left.Offset >= (ulong)left.Size
+            : (ulong)left.Offset - (ulong)right.Offset >= (ulong)right.Size;
+    }
+}
+
 public sealed class GimpleValueNumbering
 {
     private readonly Dictionary<GimpleName, ValueNumber> _nameNumbers;
     private readonly Dictionary<GimpleOperandInfo, ValueNumber> _expressionNumbers;
     private readonly Dictionary<GimpleDefinition, ValueNumber> _definitionNumbers;
     private readonly Dictionary<GimplePhi, ValueNumber> _phiNumbers;
+    private readonly Dictionary<GimpleOperandInfo, MemoryAccess> _readAccesses;
+    private readonly Dictionary<GimpleName, MemoryAccess> _storeAccesses;
 
     public GimpleFunctionAnnotations Function { get; }
     public ImmutableArray<ValueNumber> ValueNumbers { get; }
@@ -148,8 +165,12 @@ public sealed class GimpleValueNumbering
         Dictionary<GimpleName, ValueNumber> nameNumbers,
         Dictionary<GimpleOperandInfo, ValueNumber> expressionNumbers,
         Dictionary<GimpleDefinition, ValueNumber> definitionNumbers,
-        Dictionary<GimplePhi, ValueNumber> phiNumbers)
+        Dictionary<GimplePhi, ValueNumber> phiNumbers,
+        Dictionary<GimpleOperandInfo, MemoryAccess>? readAccesses = null,
+        Dictionary<GimpleName, MemoryAccess>? storeAccesses = null)
     {
+        _readAccesses = readAccesses ?? new Dictionary<GimpleOperandInfo, MemoryAccess>();
+        _storeAccesses = storeAccesses ?? new Dictionary<GimpleName, MemoryAccess>();
         Function = function ?? throw new ArgumentNullException(nameof(function));
         ValueNumbers = valueNumbers.IsDefault ? ImmutableArray<ValueNumber>.Empty : valueNumbers;
         _nameNumbers = nameNumbers is null
@@ -168,6 +189,11 @@ public sealed class GimpleValueNumbering
 
     internal static GimpleValueNumbering Build(GimpleFunctionAnnotations function, ValueNumberingOptions? options = null)
         => new ValueNumberingBuilder(function, options ?? ValueNumberingOptions.Default).Build();
+
+    /// <summary>Reports whether the store that produced a memory state may write what a read takes, or whether either is unplaced</summary>
+    internal bool MayOverlap(GimpleName storedMemory, GimpleOperandInfo read)
+        => !_storeAccesses.TryGetValue(storedMemory, out MemoryAccess store) || !_readAccesses.TryGetValue(read, out MemoryAccess load) ||
+           !MemoryAccess.Disjoint(store, load);
 
     public bool TryGetValueNumber(GimpleName name, out ValueNumber? valueNumber)
     {
@@ -389,7 +415,12 @@ internal sealed class ValueNumberingBuilder
     private int _uniqueOrdinal;
 
     private readonly record struct MemoryAddress(int Root, long Offset);
-    private readonly record struct MemoryLocation(MemoryAddress Address, int Size, string Type);
+    private const ulong AnyAliasClass = ulong.MaxValue;
+    private readonly Dictionary<TagSymbol, ulong> _tagAliasClasses = new(ReferenceEqualityComparer.Instance);
+    private readonly record struct MemoryLocation(MemoryAddress Address, int Size, string Type, ulong AliasClasses)
+    {
+        public MemoryAccess Access => new(Address.Root, Address.Offset, Size, AliasClasses);
+    }
     private readonly record struct MemoryStore(ValueNumber Input, MemoryLocation Location, ValueNumber? Value);
 
     private readonly Dictionary<object, int> _objectRoots = new(ReferenceEqualityComparer.Instance);
@@ -398,6 +429,8 @@ internal sealed class ValueNumberingBuilder
     private readonly Dictionary<int, GimplePhi> _memoryPhis = new();
     private readonly Dictionary<(int Memory, MemoryLocation Location), ValueNumber> _memoryReads = new();
     private readonly Dictionary<FieldSymbol, long> _fieldOffsets = new();
+    private readonly Dictionary<GimpleOperandInfo, MemoryAccess> _readAccesses = new();
+    private readonly Dictionary<GimpleName, MemoryAccess> _storeAccesses = new();
 
     public ValueNumberingBuilder(GimpleFunctionAnnotations function, ValueNumberingOptions options)
     {
@@ -432,7 +465,9 @@ internal sealed class ValueNumberingBuilder
             _nameNumbers,
             _expressionNumbers,
             _definitionNumbers,
-            _phiNumbers);
+            _phiNumbers,
+            _readAccesses,
+            _storeAccesses);
     }
 
     private void NumberInitialDefinitions()
@@ -879,6 +914,7 @@ internal sealed class ValueNumberingBuilder
 
         var budget = _options.MemorySearchBudget;
         number = SelectMemory(memoryInput, location, expression.Original.Type, ref budget);
+        _readAccesses[expression] = location.Access;
         return true;
     }
 
@@ -930,13 +966,7 @@ internal sealed class ValueNumberingBuilder
     }
 
     private static bool Disjoint(MemoryLocation left, MemoryLocation right)
-    {
-        if (left.Address.Root != right.Address.Root)
-            return left.Address.Root < 0 && right.Address.Root < 0;
-        return left.Address.Offset <= right.Address.Offset
-            ? (ulong)right.Address.Offset - (ulong)left.Address.Offset >= (ulong)left.Size
-            : (ulong)left.Address.Offset - (ulong)right.Address.Offset >= (ulong)right.Size;
-    }
+        => MemoryAccess.Disjoint(left.Access, right.Access);
 
     private void RecordMemoryDefinition(GimpleStatementAnnotations instruction, ValueNumber? memoryInput,
         ImmutableArray<ValueNumber> expressionNumbers)
@@ -970,6 +1000,7 @@ internal sealed class ValueNumberingBuilder
             }
         }
         _memoryStores[GetNameNumber(instruction.MemoryOutput).Id] = new MemoryStore(memoryInput, location, value);
+        _storeAccesses[instruction.MemoryOutput] = location.Access;
     }
 
     private bool TryGetLocation(GimpleOperandInfo expression, ValueNumber? memory, out MemoryLocation location)
@@ -980,7 +1011,7 @@ internal sealed class ValueNumberingBuilder
             var size = _function.Target.SizeOf(expression.Original.Type);
             if (size <= 0 || !TryGetPlaceAddress(expression, memory, out var address))
                 return false;
-            location = new MemoryLocation(address, size, TypeKey(expression.Original.Type));
+            location = new MemoryLocation(address, size, TypeKey(expression.Original.Type), AliasClasses(expression.Original));
             return true;
         }
         catch (OverflowException)
@@ -1092,6 +1123,78 @@ internal sealed class ValueNumberingBuilder
 
     private long FieldOffset(FieldSymbol field)
         => _function.Target.GetFieldPlacement(field).ByteOffset;
+
+    // C11 6.5p7 lets an object be read only through its own type up to signedness, an aggregate holding it or a character type,
+    // and a union member reads any of them
+    private ulong AliasClasses(GimpleValue place)
+    {
+        GimpleValue current = place;
+        while (true)
+        {
+            if (current is GimpleMemberAccessExpression member)
+            {
+                QualifiedType container = member.ThroughPointer && member.Expression.Type.Type is PointerType pointer
+                    ? pointer.PointeeType
+                    : member.Expression.Type;
+                if (container.Type.Kind == TypeKind.Union)
+                    return AnyAliasClass;
+                if (member.ThroughPointer)
+                    break;
+                current = member.Expression;
+            }
+            else if (current is GimpleElementAccessExpression element && element.Expression.Type.Type is ArrayType)
+            {
+                current = element.Expression;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        return TypeAliasClasses(place.Type);
+    }
+
+    private ulong TypeAliasClasses(QualifiedType type)
+    {
+        switch (type.Type)
+        {
+            case BuiltinType builtin:
+                return builtin.BuiltinKind switch
+                {
+                    BuiltinTypeKind.Void or BuiltinTypeKind.Char or BuiltinTypeKind.SignedChar or BuiltinTypeKind.UnsignedChar => AnyAliasClass,
+                    BuiltinTypeKind.Bool => 1UL,
+                    BuiltinTypeKind.Float or BuiltinTypeKind.Double or BuiltinTypeKind.LongDouble => SizeAliasClass(type, floating: true),
+                    _ => SizeAliasClass(type, floating: false),
+                };
+            case PointerType:
+                return 1UL << 40;
+            case ArrayType array:
+                return TypeAliasClasses(array.ElementType);
+            case TagType tag when tag.Kind == TypeKind.Enum:
+                return SizeAliasClass(type, floating: false);
+            case TagType tag when tag.Symbol.IsComplete:
+                {
+                    if (_tagAliasClasses.TryGetValue(tag.Symbol, out ulong cached))
+                        return cached;
+                    _tagAliasClasses[tag.Symbol] = AnyAliasClass;
+                    ulong classes = 0;
+                    foreach (FieldSymbol field in tag.Symbol.Fields)
+                        classes |= TypeAliasClasses(field.Type);
+                    _tagAliasClasses[tag.Symbol] = classes;
+                    return classes;
+                }
+            default:
+                return AnyAliasClass;
+        }
+    }
+
+    // Integers of one size share a class whatever their signedness, and floating types of one size share another
+    private ulong SizeAliasClass(QualifiedType type, bool floating)
+    {
+        int size = _function.Target.SizeOf(type);
+        return size is > 0 and <= 16 ? 1UL << ((floating ? 17 : 1) + size) : AnyAliasClass;
+    }
 
     private static bool IsMemoryScalar(QualifiedType type)
         => type.Type.Kind is TypeKind.Builtin or TypeKind.Enum or TypeKind.Pointer;
@@ -1568,7 +1671,9 @@ internal sealed class ValueNumberingBuilder
                 "," + string.Join(",", function.Parameters.Select(parameter => TypeKey(parameter.Type))) + ")",
             _ => type.Type.ToDisplayString(),
         };
-        key = type.Qualifiers == TypeQualifiers.None ? identity : type.Qualifiers + ":" + identity;
+        // const and restrict change neither a value nor an access through a pointer to it, at any depth
+        TypeQualifiers qualifiers = type.Qualifiers & ~(TypeQualifiers.Const | TypeQualifiers.Restrict);
+        key = qualifiers == TypeQualifiers.None ? identity : qualifiers + ":" + identity;
         _typeKeys.Add(type, key);
         return key;
     }

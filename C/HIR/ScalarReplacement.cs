@@ -808,7 +808,7 @@ public static class ScalarReplacement
                 GimpleReturnStatement ret => new GimpleReturnStatement(ret.Function, ret.Expression is null ? null : Map(ret.Expression), ret.Syntax),
                 _ => statement,
             });
-            if (accesses is not null)
+            if (accesses is not null && !statement.IsTerminator)
                 foreach (var write in accesses.Writes) Synchronize(write, output, writeBack: false);
         }
 

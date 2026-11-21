@@ -1194,6 +1194,13 @@ public sealed class Binder
                 // C11 6.5.3.2: a bit-field has no address of its own, it shares one with its neighbours
                 if (operand is BoundMemberAccessExpression { Field.IsBitField: true })
                     Report("Cannot take the address of a bit-field.", SpanOf(syntax.Operand));
+                else if (!IsAddressable(operand))
+                    Report("The operand of unary '&' must be an lvalue or a function designator.", SpanOf(syntax.Operand));
+                else if (StripLValueTransparency(operand) is BoundNameExpression name && name.Symbol is VariableSymbol variable &&
+                         variable.StorageClass == StorageClass.Register)
+                    Report($"Cannot take the address of register variable '{variable.Name}'.", SpanOf(syntax.Operand));
+                else if (StripLValueTransparency(operand) is BoundNameExpression named && named.Symbol is TypedSymbol typed)
+                    typed.MarkAddressTaken();
 
                 return new BoundUnaryExpression(
                     syntax,
@@ -1977,7 +1984,7 @@ public sealed class Binder
 
     private QualifiedType BindTypeName(ImmutableArray<SyntaxToken> tokens, Scope scope)
     {
-        var type = TypeNameParser.Parse(tokens, scope, _types) ?? ErrorType;
+        QualifiedType type = TypeNameParser.Parse(tokens, scope, _types, new DeclarationContext(_compilation.Options.Target, _diagnostics)) ?? ErrorType;
         BindVariableLengths(type);
         return type;
     }
@@ -2241,8 +2248,18 @@ public sealed class Binder
         }
     }
 
+    private static bool IsAddressable(BoundExpression expression)
+    {
+        expression = StripLValueTransparency(expression);
+        return expression.ValueKind == BoundValueKind.Function || IsLValueExpression(expression) ||
+               expression is BoundLiteralExpression && expression.Type.Type is ArrayType;
+    }
+
     private static bool IsLValueExpression(BoundExpression expression)
     {
+        // A member of a structure is an lvalue only when the structure is one
+        if (expression is BoundMemberAccessExpression member && member.OperatorToken.Kind == SyntaxKind.DotToken)
+            return IsLValueExpression(StripLValueTransparency(member.Expression));
         if (expression.ValueKind == BoundValueKind.LValue)
             return true;
 

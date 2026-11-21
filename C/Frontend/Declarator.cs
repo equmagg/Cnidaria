@@ -226,14 +226,16 @@ internal static class TypeNameParser
         out ImmutableArray<SyntaxToken> declaratorTokens)
     {
         var index = 0;
+        var sawTypeSpecifier = false;
 
         while (index < tokens.Length)
         {
             var token = tokens[index];
-
-            if (!IsTypeNameSpecifierToken(token.Kind) && !IsTypedefNameToken(token, scope))
+            bool namesType = token.Kind == SyntaxKind.TypedefNameToken || IsTypedefNameToken(token, scope);
+            if (!IsTypeNameSpecifierToken(token.Kind) && !namesType || sawTypeSpecifier && namesType)
                 break;
 
+            sawTypeSpecifier |= DeclarationTypeParser.IsTypeSpecifier(token.Kind) || namesType;
             index++;
 
             if (token.Kind is SyntaxKind.StructKeyword or SyntaxKind.UnionKeyword or SyntaxKind.EnumKeyword)
@@ -1346,18 +1348,9 @@ internal sealed class DeclarationTypeParser
         var storageClass = StorageClass.None;
         var qualifiers = TypeQualifiers.None;
         var functionSpecifiers = FunctionSpecifiers.None;
-
-        var sawVoid = false;
-        var sawBool = false;
-        var sawChar = false;
-        var sawShort = false;
-        var longCount = 0;
-        var sawSigned = false;
-        var sawUnsigned = false;
-        var sawInt = false;
-        var sawFloat = false;
-        var sawDouble = false;
+        var specified = new TypeSpecifierSet();
         QualifiedType? namedBaseType = null;
+        var tagNamePending = false;
         // Tokens inside a tag body belong to field declarations
         var braceDepth = 0;
 
@@ -1368,6 +1361,7 @@ internal sealed class DeclarationTypeParser
             if (token.Kind is SyntaxKind.OpenBraceToken or SyntaxKind.OpenBraceDigraphToken)
             {
                 braceDepth++;
+                tagNamePending = false;
                 continue;
             }
 
@@ -1384,6 +1378,12 @@ internal sealed class DeclarationTypeParser
             if (token.Kind is SyntaxKind.AttributeKeyword or SyntaxKind.DeclspecKeyword)
             {
                 functionSpecifiers |= ReadAttributeSpecifiers(_tokens, ref i);
+                continue;
+            }
+
+            if (tagNamePending && token.Kind is SyntaxKind.IdentifierToken or SyntaxKind.TypedefNameToken)
+            {
+                tagNamePending = false;
                 continue;
             }
 
@@ -1432,6 +1432,38 @@ internal sealed class DeclarationTypeParser
                 case SyntaxKind.AtomicKeyword:
                 case SyntaxKind.UnderscoreAtomicKeyword:
                     qualifiers |= TypeQualifiers.Atomic;
+                    if (i + 1 < _tokens.Length && _tokens[i + 1].Kind == SyntaxKind.OpenParenToken)
+                    {
+                        AddTypeSpecifier(ref specified, i);
+                        int close = ClosingParenthesis(i + 1);
+                        namedBaseType ??= TypeNameParser.Parse(_tokens[(i + 2)..close], _scope, _types, _context) ?? new QualifiedType(CErrorType.Instance);
+                        i = close;
+                    }
+                    break;
+
+                case SyntaxKind.AlignasKeyword:
+                case SyntaxKind.UnderscoreAlignasKeyword:
+                    if (i + 1 < _tokens.Length && _tokens[i + 1].Kind == SyntaxKind.OpenParenToken)
+                        i = ClosingParenthesis(i + 1);
+                    break;
+
+                case SyntaxKind.TypeofKeyword:
+                case SyntaxKind.TypeofUnqualKeyword:
+                case SyntaxKind.TypeofExtensionKeyword:
+                    AddTypeSpecifier(ref specified, i);
+                    namedBaseType ??= ResolveTypeof(ref i);
+                    break;
+
+                case SyntaxKind.UnderscoreComplexKeyword:
+                case SyntaxKind.UnderscoreImaginaryKeyword:
+                case SyntaxKind.UnderscoreBitIntKeyword:
+                case SyntaxKind.UnderscoreDecimal32Keyword:
+                case SyntaxKind.UnderscoreDecimal64Keyword:
+                case SyntaxKind.UnderscoreDecimal128Keyword:
+                    Report($"'{token.Text}' is not supported.", i);
+                    namedBaseType ??= new QualifiedType(CErrorType.Instance);
+                    if (i + 1 < _tokens.Length && _tokens[i + 1].Kind == SyntaxKind.OpenParenToken)
+                        i = ClosingParenthesis(i + 1);
                     break;
 
                 case SyntaxKind.InlineKeyword:
@@ -1444,56 +1476,30 @@ internal sealed class DeclarationTypeParser
                     break;
 
                 case SyntaxKind.VoidKeyword:
-                    sawVoid = true;
-                    break;
-
                 case SyntaxKind.BoolKeyword:
                 case SyntaxKind.UnderscoreBoolKeyword:
-                    sawBool = true;
-                    break;
-
                 case SyntaxKind.CharKeyword:
-                    sawChar = true;
-                    break;
-
                 case SyntaxKind.ShortKeyword:
-                    sawShort = true;
-                    break;
-
-                case SyntaxKind.LongKeyword:
-                    longCount++;
-                    break;
-
-                case SyntaxKind.SignedKeyword:
-                    sawSigned = true;
-                    break;
-
-                case SyntaxKind.UnsignedKeyword:
-                    sawUnsigned = true;
-                    break;
-
                 case SyntaxKind.IntKeyword:
-                    sawInt = true;
-                    break;
-
+                case SyntaxKind.LongKeyword:
+                case SyntaxKind.SignedKeyword:
+                case SyntaxKind.UnsignedKeyword:
                 case SyntaxKind.FloatKeyword:
-                    sawFloat = true;
-                    break;
-
                 case SyntaxKind.DoubleKeyword:
-                    sawDouble = true;
+                    AddTypeSpecifier(ref specified, i);
                     break;
 
                 case SyntaxKind.TypedefNameToken:
-                    if (namedBaseType is null)
-                        namedBaseType = ResolveTypedefName(token);
+                    AddTypeSpecifier(ref specified, i);
+                    namedBaseType ??= ResolveTypedefName(token);
                     break;
 
                 case SyntaxKind.StructKeyword:
                 case SyntaxKind.UnionKeyword:
                 case SyntaxKind.EnumKeyword:
-                    if (namedBaseType is null)
-                        namedBaseType = ResolveTagType(token.Kind, i);
+                    AddTypeSpecifier(ref specified, i);
+                    namedBaseType ??= ResolveTagType(token.Kind, i);
+                    tagNamePending = true;
                     break;
             }
         }
@@ -1508,23 +1514,63 @@ internal sealed class DeclarationTypeParser
                 functionSpecifiers);
         }
 
-        var builtinKind = SelectBuiltinType(
-            sawVoid,
-            sawBool,
-            sawChar,
-            sawShort,
-            longCount,
-            sawSigned,
-            sawUnsigned,
-            sawInt,
-            sawFloat,
-            sawDouble);
-
         return new DeclarationSpecifiers(
-            _types.Builtin(builtinKind, qualifiers),
+            _types.Builtin(specified.BuiltinKind, qualifiers),
             storageClass,
             qualifiers,
             functionSpecifiers);
+    }
+
+    /// <summary>Reports whether a token is a type specifier, after which a typedef name is the declared identifier instead</summary>
+    public static bool IsTypeSpecifier(SyntaxKind kind)
+        => kind is SyntaxKind.VoidKeyword or SyntaxKind.BoolKeyword or SyntaxKind.UnderscoreBoolKeyword or SyntaxKind.CharKeyword
+            or SyntaxKind.ShortKeyword or SyntaxKind.IntKeyword or SyntaxKind.LongKeyword or SyntaxKind.SignedKeyword
+            or SyntaxKind.UnsignedKeyword or SyntaxKind.FloatKeyword or SyntaxKind.DoubleKeyword or SyntaxKind.UnderscoreComplexKeyword
+            or SyntaxKind.UnderscoreImaginaryKeyword or SyntaxKind.UnderscoreBitIntKeyword or SyntaxKind.UnderscoreDecimal32Keyword
+            or SyntaxKind.UnderscoreDecimal64Keyword or SyntaxKind.UnderscoreDecimal128Keyword or SyntaxKind.StructKeyword
+            or SyntaxKind.UnionKeyword or SyntaxKind.EnumKeyword or SyntaxKind.TypeofKeyword or SyntaxKind.TypeofUnqualKeyword
+            or SyntaxKind.TypeofExtensionKeyword or SyntaxKind.TypedefNameToken;
+
+    private void AddTypeSpecifier(ref TypeSpecifierSet specified, int index)
+    {
+        if (!specified.TryAdd(_tokens[index].Kind))
+            Report($"'{_tokens[index].Text}' cannot be combined with the type specifiers before it.", index);
+    }
+
+    private QualifiedType ResolveTypeof(ref int index)
+    {
+        SyntaxToken keyword = _tokens[index];
+        if (index + 1 >= _tokens.Length || _tokens[index + 1].Kind != SyntaxKind.OpenParenToken)
+        {
+            Report($"'{keyword.Text}' requires a parenthesized operand.", index);
+            return new QualifiedType(CErrorType.Instance);
+        }
+
+        int close = ClosingParenthesis(index + 1);
+        ImmutableArray<SyntaxToken> operand = _tokens[(index + 2)..close];
+        int start = index;
+        index = close;
+        if (operand.Length == 0 || !TypeNameParser.StartsTypeName(operand[0], _scope))
+        {
+            Report($"'{keyword.Text}' of an expression is not supported.", start);
+            return new QualifiedType(CErrorType.Instance);
+        }
+
+        QualifiedType type = TypeNameParser.Parse(operand, _scope, _types, _context) ?? new QualifiedType(CErrorType.Instance);
+        return keyword.Kind == SyntaxKind.TypeofUnqualKeyword ? new QualifiedType(type.Type) : type;
+    }
+
+    private int ClosingParenthesis(int open)
+    {
+        var depth = 0;
+        for (var i = open; i < _tokens.Length; i++)
+        {
+            if (_tokens[i].Kind == SyntaxKind.OpenParenToken)
+                depth++;
+            else if (_tokens[i].Kind == SyntaxKind.CloseParenToken && --depth == 0)
+                return i;
+        }
+        return _tokens.Length;
     }
 
     /// <summary>Consumes one attribute specifier and reports the function specifiers its names carry</summary>
@@ -1620,8 +1666,13 @@ internal sealed class DeclarationTypeParser
         return new QualifiedType(new TagType(existing));
     }
 
+    // A declaration is parsed again wherever its type is needed, and one mistake is one diagnostic
     private void Report(string message, int tokenIndex)
-        => _context?.Diagnostics.Add(SemanticDiagnostic.Error(message, _tokens[tokenIndex].Span));
+    {
+        TextSpan span = _tokens[tokenIndex].Span;
+        if (_context is not null && !_context.Diagnostics.Exists(diagnostic => diagnostic.Position == span && diagnostic.Message == message))
+            _context.Diagnostics.Add(SemanticDiagnostic.Error(message, span));
+    }
 
     private string? FindTagName(int keywordIndex)
     {
@@ -1683,52 +1734,101 @@ internal sealed class DeclarationTypeParser
         return false;
     }
 
-    private static BuiltinTypeKind SelectBuiltinType(
-        bool sawVoid,
-        bool sawBool,
-        bool sawChar,
-        bool sawShort,
-        int longCount,
-        bool sawSigned,
-        bool sawUnsigned,
-        bool sawInt,
-        bool sawFloat,
-        bool sawDouble)
+    private struct TypeSpecifierSet
     {
-        if (sawVoid)
-            return BuiltinTypeKind.Void;
+        private bool _void;
+        private bool _bool;
+        private bool _char;
+        private bool _short;
+        private bool _int;
+        private bool _float;
+        private bool _double;
+        private bool _signed;
+        private bool _unsigned;
+        private bool _named;
+        private int _long;
 
-        if (sawBool)
-            return BuiltinTypeKind.Bool;
+        private readonly bool Any => _void || _bool || _char || _short || _int || _float || _double || _signed || _unsigned || _named || _long != 0;
 
-        if (sawChar)
+        /// <summary>Adds a type specifier, or reports that no type in C11 6.7.2 spells it together with the ones already seen</summary>
+        public bool TryAdd(SyntaxKind kind)
         {
-            if (sawUnsigned)
-                return BuiltinTypeKind.UnsignedChar;
-            if (sawSigned)
-                return BuiltinTypeKind.SignedChar;
-            return BuiltinTypeKind.Char;
+            bool conflicts = kind switch
+            {
+                SyntaxKind.CharKeyword => _void || _bool || _char || _short || _int || _float || _double || _named || _long != 0,
+                SyntaxKind.ShortKeyword => _void || _bool || _char || _short || _float || _double || _named || _long != 0,
+                SyntaxKind.IntKeyword => _void || _bool || _char || _int || _float || _double || _named,
+                SyntaxKind.LongKeyword => _void || _bool || _char || _short || _float || _named || _long == 2 || _double && _long == 1,
+                SyntaxKind.DoubleKeyword => _void || _bool || _char || _short || _int || _float || _double || _signed || _unsigned || _named || _long > 1,
+                SyntaxKind.SignedKeyword or SyntaxKind.UnsignedKeyword => _void || _bool || _float || _double || _signed || _unsigned || _named,
+                _ => Any,
+            };
+            if (conflicts)
+                return false;
+
+            switch (kind)
+            {
+                case SyntaxKind.VoidKeyword:
+                    _void = true;
+                    break;
+                case SyntaxKind.BoolKeyword:
+                case SyntaxKind.UnderscoreBoolKeyword:
+                    _bool = true;
+                    break;
+                case SyntaxKind.CharKeyword:
+                    _char = true;
+                    break;
+                case SyntaxKind.ShortKeyword:
+                    _short = true;
+                    break;
+                case SyntaxKind.IntKeyword:
+                    _int = true;
+                    break;
+                case SyntaxKind.LongKeyword:
+                    _long++;
+                    break;
+                case SyntaxKind.FloatKeyword:
+                    _float = true;
+                    break;
+                case SyntaxKind.DoubleKeyword:
+                    _double = true;
+                    break;
+                case SyntaxKind.SignedKeyword:
+                    _signed = true;
+                    break;
+                case SyntaxKind.UnsignedKeyword:
+                    _unsigned = true;
+                    break;
+                default:
+                    _named = true;
+                    break;
+            }
+            return true;
         }
 
-        if (sawFloat)
-            return BuiltinTypeKind.Float;
-
-        if (sawDouble)
-            return longCount > 0 ? BuiltinTypeKind.LongDouble : BuiltinTypeKind.Double;
-
-        if (sawShort)
-            return sawUnsigned ? BuiltinTypeKind.UnsignedShort : BuiltinTypeKind.Short;
-
-        if (longCount >= 2)
-            return sawUnsigned ? BuiltinTypeKind.UnsignedLongLong : BuiltinTypeKind.LongLong;
-
-        if (longCount == 1)
-            return sawUnsigned ? BuiltinTypeKind.UnsignedLong : BuiltinTypeKind.Long;
-
-        if (sawUnsigned)
-            return BuiltinTypeKind.UnsignedInt;
-
-        return BuiltinTypeKind.Int;
+        public readonly BuiltinTypeKind BuiltinKind
+        {
+            get
+            {
+                if (_void)
+                    return BuiltinTypeKind.Void;
+                if (_bool)
+                    return BuiltinTypeKind.Bool;
+                if (_char)
+                    return _unsigned ? BuiltinTypeKind.UnsignedChar : _signed ? BuiltinTypeKind.SignedChar : BuiltinTypeKind.Char;
+                if (_float)
+                    return BuiltinTypeKind.Float;
+                if (_double)
+                    return _long > 0 ? BuiltinTypeKind.LongDouble : BuiltinTypeKind.Double;
+                if (_short)
+                    return _unsigned ? BuiltinTypeKind.UnsignedShort : BuiltinTypeKind.Short;
+                if (_long >= 2)
+                    return _unsigned ? BuiltinTypeKind.UnsignedLongLong : BuiltinTypeKind.LongLong;
+                if (_long == 1)
+                    return _unsigned ? BuiltinTypeKind.UnsignedLong : BuiltinTypeKind.Long;
+                return _unsigned ? BuiltinTypeKind.UnsignedInt : BuiltinTypeKind.Int;
+            }
+        }
     }
 }
 /// <summary>Builds field symbols from a structure or union body</summary>
@@ -1884,15 +1984,19 @@ internal static class StructUnionFieldParser
             declaringSyntax: null));
     }
 
-    private static ImmutableArray<SyntaxToken> ReadSpecifierTokens(
+    internal static ImmutableArray<SyntaxToken> ReadSpecifierTokens(
         ImmutableArray<SyntaxToken> tokens,
         out int nextIndex)
     {
         var index = 0;
+        var sawTypeSpecifier = false;
 
         while (index < tokens.Length && IsDeclarationSpecifierStart(tokens[index].Kind))
         {
             var token = tokens[index];
+            if (token.Kind == SyntaxKind.TypedefNameToken && sawTypeSpecifier)
+                break;
+            sawTypeSpecifier |= DeclarationTypeParser.IsTypeSpecifier(token.Kind);
             index++;
 
             if (token.Kind is SyntaxKind.StructKeyword or SyntaxKind.UnionKeyword or SyntaxKind.EnumKeyword)
@@ -2733,7 +2837,7 @@ internal sealed class DeclaratorParser
             if (parameterTokens.Length == 0 || parameterTokens.Any(static t => t.Kind == SyntaxKind.EllipsisToken))
                 continue;
 
-            var specifierTokens = ReadParameterSpecifierTokens(parameterTokens, out var declaratorStart);
+            ImmutableArray<SyntaxToken> specifierTokens = StructUnionFieldParser.ReadSpecifierTokens(parameterTokens, out int declaratorStart);
             if (specifierTokens.Length == 0)
                 continue;
 
@@ -2744,7 +2848,9 @@ internal sealed class DeclaratorParser
                 continue;
             }
 
-            var specifiers = DeclarationTypeParser.ParseSpecifiers(specifierTokens, prototypeScope, _types);
+            DeclarationSpecifiers specifiers = DeclarationTypeParser.ParseSpecifiers(specifierTokens, prototypeScope, _types, _context);
+            if (specifiers.StorageClass is not (StorageClass.None or StorageClass.Register))
+                _context?.Diagnostics.Add(SemanticDiagnostic.Error("A parameter takes no storage class but 'register'.", specifierTokens[0].Span));
             var declaratorTokens = parameterTokens[declaratorStart..];
             var identifier = FindDeclaratorIdentifier(declaratorTokens);
             var parameterDeclarator = new DeclaratorSyntax(declaratorTokens, identifier);
@@ -2772,34 +2878,6 @@ internal sealed class DeclaratorParser
             return new QualifiedType(_types.PointerTo(type), type.Qualifiers);
 
         return type;
-    }
-
-    private static ImmutableArray<SyntaxToken> ReadParameterSpecifierTokens(
-        ImmutableArray<SyntaxToken> tokens,
-        out int nextIndex)
-    {
-        var index = 0;
-
-        while (index < tokens.Length && IsDeclarationSpecifierToken(tokens[index].Kind))
-        {
-            var token = tokens[index];
-            index++;
-
-            if (token.Kind is SyntaxKind.StructKeyword or SyntaxKind.UnionKeyword or SyntaxKind.EnumKeyword)
-            {
-                if (index < tokens.Length &&
-                    tokens[index].Kind is SyntaxKind.IdentifierToken or SyntaxKind.TypedefNameToken)
-                {
-                    index++;
-                }
-
-                if (index < tokens.Length && tokens[index].Kind == SyntaxKind.OpenBraceToken)
-                    SkipBalancedTokenSequence(tokens, ref index, SyntaxKind.OpenBraceToken, SyntaxKind.CloseBraceToken);
-            }
-        }
-
-        nextIndex = index;
-        return tokens[..index];
     }
 
     private static ImmutableArray<ImmutableArray<SyntaxToken>> SplitTopLevel(

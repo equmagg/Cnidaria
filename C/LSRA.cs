@@ -653,9 +653,7 @@ internal sealed class LinearScanRegisterAllocator
             instruction.Result is not null &&
             instruction.Result.RegisterClass is LirRegisterClass.General or LirRegisterClass.Address)
         {
-            // A power of two divisor is reduced to shifts, which need none of the fixed registers
-            if (instruction.Operator is "/" or "%" &&
-                !LirStrengthReduction.TryGetPowerOfTwoDivisor(instruction, _target, out _, out _))
+            if (instruction.Operator is "/" or "%")
             {
                 // div and idiv read and write rax:rdx, and the emitted sequence parks the divisor in rcx
                 clobbers.Add(TargetRegisterInfo.X86AccumulatorRegister(_target));
@@ -1450,7 +1448,7 @@ internal sealed class LinearScanRegisterAllocator
             return false;
         if (register.Type.Type.Kind is TypeKind.Pointer or TypeKind.Array or TypeKind.Function)
             return false;
-        if (CAbi.UsesHardwareFloatingRegister(_target, register.Type, isVariadicUnnamedArgument: false))
+        if (LivesInFloatingRegister(register.Type))
             return false;
         return Math.Max(1, _target.SizeOf(register.Type)) > Math.Max(1, _target.RegisterSize);
     }
@@ -2768,7 +2766,7 @@ internal sealed class LinearScanRegisterAllocator
     {
         if (type.Type.Kind is TypeKind.Pointer or TypeKind.Array or TypeKind.Function or TypeKind.Struct or TypeKind.Union or TypeKind.Vector)
             return false;
-        if (CAbi.IsFloating(type) && CAbi.UsesHardwareFloatingRegister(_target, type, isVariadicUnnamedArgument: false))
+        if (LivesInFloatingRegister(type))
             return false;
         return SizeOfStorage(type) > Math.Max(1, _target.RegisterSize);
     }
@@ -2798,11 +2796,15 @@ internal sealed class LinearScanRegisterAllocator
         return false;
     }
 
+    private bool LivesInFloatingRegister(QualifiedType type)
+        => CAbi.IsFloating(type) &&
+           TargetRegisterInfo.PreferredFloatingPointRegisterClass(_target, type, isVariadicUnnamedArgument: false) != LirRegisterClass.General;
+
     private bool RequiresStackBackedScalarStorage(QualifiedType type)
     {
         if (CAbi.IsAggregate(type) || type.Type.Kind is TypeKind.Pointer or TypeKind.Array or TypeKind.Function or TypeKind.Vector)
             return false;
-        if (CAbi.UsesHardwareFloatingRegister(_target, type, isVariadicUnnamedArgument: false))
+        if (LivesInFloatingRegister(type))
             return false;
         return SizeOfStorage(type) > Math.Max(1, _target.RegisterSize);
     }

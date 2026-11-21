@@ -198,300 +198,158 @@ internal static class ArmAssemblyParser
         bool setFlags,
         int precision)
     {
-        switch (opcode)
+        var parsed = new List<ArmOperand>(5);
+        for (int i = 0; i < operands.Count; i++)
         {
-            case ArmInstrKind.Nop:
-            case ArmInstrKind.Yield:
-            case ArmInstrKind.Wfe:
-            case ArmInstrKind.Wfi:
-            case ArmInstrKind.Sev:
-            case ArmInstrKind.Sevl:
-                RequireCount(operands, 0, mnemonic);
-                return new ArmInstruction(opcode, condition: condition);
-
-            case ArmInstrKind.Ret:
-                if (operands.Count == 0)
-                    return new ArmInstruction(opcode, condition: condition);
-                RequireCount(operands, 1, mnemonic);
-                return ArmInstruction.Unary(opcode, ParseRegister(operands[0], target, precision), condition);
-
-            case ArmInstrKind.B:
-            case ArmInstrKind.Bl:
-                RequireCount(operands, 1, mnemonic);
-                return new ArmInstruction(opcode, ParseBranchTarget(operands[0], opcode, condition), condition: condition);
-
-            case ArmInstrKind.Bx:
-            case ArmInstrKind.Blx:
-            case ArmInstrKind.Br:
-            case ArmInstrKind.Blr:
-                RequireCount(operands, 1, mnemonic);
-                return ArmInstruction.Unary(opcode, ParseRegister(operands[0], target, precision), condition);
-
-            case ArmInstrKind.Cbz:
-            case ArmInstrKind.Cbnz:
-                RequireCount(operands, 2, mnemonic);
-                return new ArmInstruction(opcode, ParseRegister(operands[0], target, precision), ParseBranchTarget(operands[1], opcode, condition));
-
-            case ArmInstrKind.Tbz:
-            case ArmInstrKind.Tbnz:
-                RequireCount(operands, 3, mnemonic);
-                return new ArmInstruction(opcode, ParseRegister(operands[0], target, precision), ParseImmediate(operands[1]), ParseBranchTarget(operands[2], opcode, condition));
-
-            case ArmInstrKind.Adr:
-            case ArmInstrKind.Adrp:
-                RequireCount(operands, 2, mnemonic);
-                return ArmInstruction.Binary(opcode, ParseRegister(operands[0], target, precision), ParseAddressTarget(operands[1], opcode));
-
-            case ArmInstrKind.Mov:
-            case ArmInstrKind.Mvn:
-                if (operands.Count is < 2 or > 3)
-                    throw new FormatException(mnemonic + " expects two operands and an optional shift.");
-                return new ArmInstruction(opcode, ParseRegister(operands[0], target, precision), ParseDataOperandWithSuffix(operands, 1, target, precision), condition: condition, setFlags: setFlags);
-
-            case ArmInstrKind.Movw:
-            case ArmInstrKind.Movt:
-                RequireCount(operands, 2, mnemonic);
-                return ArmInstruction.Binary(opcode, ParseRegister(operands[0], target, precision), ParseImmediate(operands[1]), condition);
-
-            case ArmInstrKind.Movz:
-            case ArmInstrKind.Movn:
-            case ArmInstrKind.Movk:
-                if (operands.Count is < 2 or > 3)
-                    throw new FormatException(mnemonic + " expects two or three operands.");
-                return new ArmInstruction(opcode, ParseRegister(operands[0], target, precision), ParseImmediate(operands[1]),
-                    operands.Count == 3 ? ParseShiftAmountOperand(operands[2]) : ArmOperand.ImmediateOperand(0), condition: condition);
-
-            case ArmInstrKind.Cmp:
-            case ArmInstrKind.Cmn:
-            case ArmInstrKind.Tst:
-            case ArmInstrKind.Teq:
-            case ArmInstrKind.Fcmp:
-                if (operands.Count is < 2 or > 3)
-                    throw new FormatException(mnemonic + " expects two operands and an optional shift.");
-                return ArmInstruction.Binary(opcode, ParseRegister(operands[0], target, precision), ParseDataOperandWithSuffix(operands, 1, target, precision), condition);
-
-            case ArmInstrKind.Add:
-            case ArmInstrKind.Adds:
-            case ArmInstrKind.Adc:
-            case ArmInstrKind.Adcs:
-            case ArmInstrKind.Sub:
-            case ArmInstrKind.Subs:
-            case ArmInstrKind.Sbc:
-            case ArmInstrKind.Sbcs:
-            case ArmInstrKind.Rsb:
-            case ArmInstrKind.And:
-            case ArmInstrKind.Ands:
-            case ArmInstrKind.Orr:
-            case ArmInstrKind.Eor:
-            case ArmInstrKind.Bic:
-            case ArmInstrKind.Bics:
-            case ArmInstrKind.Fadd:
-            case ArmInstrKind.Fsub:
-            case ArmInstrKind.Fmul:
-            case ArmInstrKind.Fdiv:
-                if (operands.Count is < 3 or > 4)
-                    throw new FormatException(mnemonic + " expects three operands and an optional shift.");
-                return new ArmInstruction(opcode,
-                    ParseRegister(operands[0], target, precision),
-                    ParseRegister(operands[1], target, precision),
-                    ParseDataOperandWithSuffix(operands, 2, target, precision),
-                    condition: condition,
-                    setFlags: setFlags);
-
-            case ArmInstrKind.Lsl:
-            case ArmInstrKind.Lsr:
-            case ArmInstrKind.Asr:
-            case ArmInstrKind.Ror:
-                RequireCount(operands, 3, mnemonic);
-                return ArmInstruction.Ternary(opcode, ParseRegister(operands[0], target, precision), ParseRegister(operands[1], target, precision), ParseDataOperand(operands[2], target, precision), condition).WithSetFlags(setFlags);
-
-            case ArmInstrKind.Mul:
-            case ArmInstrKind.Umulh:
-            case ArmInstrKind.Smulh:
-            case ArmInstrKind.Udiv:
-            case ArmInstrKind.Sdiv:
-                RequireCount(operands, 3, mnemonic);
-                return ArmInstruction.Ternary(opcode, ParseRegister(operands[0], target, precision), ParseRegister(operands[1], target, precision), ParseRegister(operands[2], target, precision), condition).WithSetFlags(setFlags);
-
-            case ArmInstrKind.Csel:
-                RequireCount(operands, 4, mnemonic);
-                if (!ArmConditions.TryParse(operands[3], out var selectCondition))
-                    throw new FormatException("Invalid csel condition.");
-                return ArmInstruction.Ternary(opcode, ParseRegister(operands[0], target, precision), ParseRegister(operands[1], target, precision), ParseRegister(operands[2], target, precision), selectCondition);
-
-            case ArmInstrKind.Mla:
-            case ArmInstrKind.Mls:
-            case ArmInstrKind.Madd:
-            case ArmInstrKind.Msub:
-                RequireCount(operands, 4, mnemonic);
-                return ArmInstruction.Quaternary(opcode,
-                    ParseRegister(operands[0], target, precision),
-                    ParseRegister(operands[1], target, precision),
-                    ParseRegister(operands[2], target, precision),
-                    ParseRegister(operands[3], target, precision),
-                    condition).WithSetFlags(setFlags);
-
-            case ArmInstrKind.Umull:
-            case ArmInstrKind.Smull:
-                RequireCount(operands, 4, mnemonic);
-                return ArmInstruction.Quaternary(opcode,
-                    ParseRegister(operands[0], target, precision),
-                    ParseRegister(operands[1], target, precision),
-                    ParseRegister(operands[2], target, precision),
-                    ParseRegister(operands[3], target, precision),
-                    condition).WithSetFlags(setFlags);
-
-            case ArmInstrKind.Clz:
-            case ArmInstrKind.Rev:
-            case ArmInstrKind.Rev16:
-            case ArmInstrKind.Revsh:
-            case ArmInstrKind.Rbit:
-            case ArmInstrKind.Sxtb:
-            case ArmInstrKind.Sxth:
-            case ArmInstrKind.Sxtw:
-            case ArmInstrKind.Uxtb:
-            case ArmInstrKind.Uxth:
-            case ArmInstrKind.Fmov:
-            case ArmInstrKind.Fsqrt:
-            case ArmInstrKind.Fabs:
-            case ArmInstrKind.Fneg:
-            case ArmInstrKind.Scvtf:
-            case ArmInstrKind.Ucvtf:
-            case ArmInstrKind.Fcvtzs:
-            case ArmInstrKind.Fcvtzu:
-            case ArmInstrKind.Fcvt:
-                RequireCount(operands, 2, mnemonic);
-                return ArmInstruction.Binary(opcode, ParseRegister(operands[0], target, precision), ParseRegister(operands[1], target, precision), condition);
-
-            case ArmInstrKind.Ldr:
-            case ArmInstrKind.Str:
-            case ArmInstrKind.Ldrb:
-            case ArmInstrKind.Strb:
-            case ArmInstrKind.Ldrh:
-            case ArmInstrKind.Strh:
-            case ArmInstrKind.Ldrsb:
-            case ArmInstrKind.Ldrsh:
-            case ArmInstrKind.Ldrsw:
-            case ArmInstrKind.Ldur:
-            case ArmInstrKind.Stur:
-                if (operands.Count is < 2 or > 3)
-                    throw new FormatException(mnemonic + " expects two operands and an optional post-index.");
-                var data = ParseRegister(operands[0], target, precision);
-                var address = ParseMemoryOrLiteral(operands[1], target, data.Size, opcode);
-                if (operands.Count == 3)
-                {
-                    if (address.Kind != ArmOperandKind.Memory || address.AddressingMode != ArmAddressingMode.Offset || address.Immediate != 0)
-                        throw new FormatException("Post-index addressing requires a base-only memory operand.");
-                    var post = ParseImmediate(operands[2]).Immediate;
-                    address = ArmOperand.Memory(address.BaseRegister, post, address.Size, ArmAddressingMode.PostIndex);
-                }
-                return ArmInstruction.Binary(opcode, data, address, condition);
-
-            case ArmInstrKind.Ldaxr:
-            case ArmInstrKind.Ldaxrb:
-            case ArmInstrKind.Ldaxrh:
-                RequireCount(operands, 2, mnemonic);
-                return ArmInstruction.Binary(
-                    opcode,
-                    ParseRegister(operands[0], target, precision),
-                    ParseMemoryOrLiteral(operands[1], target, 0, opcode),
-                    condition);
-
-            case ArmInstrKind.Stlxr:
-            case ArmInstrKind.Stlxrb:
-            case ArmInstrKind.Stlxrh:
-                RequireCount(operands, 3, mnemonic);
-                return ArmInstruction.Ternary(
-                    opcode,
-                    ParseRegister(operands[0], target, precision),
-                    ParseRegister(operands[1], target, precision),
-                    ParseMemoryOrLiteral(operands[2], target, 0, opcode),
-                    condition);
-
-            case ArmInstrKind.Ldp:
-            case ArmInstrKind.Stp:
-                if (operands.Count is < 3 or > 4)
-                    throw new FormatException(mnemonic + " expects three operands and an optional post-index.");
-                var first = ParseRegister(operands[0], target, precision);
-                var second = ParseRegister(operands[1], target, precision);
-                var pairAddress = ParseMemoryOrLiteral(operands[2], target, first.Size, opcode);
-                if (operands.Count == 4)
-                {
-                    if (pairAddress.Kind != ArmOperandKind.Memory || pairAddress.AddressingMode != ArmAddressingMode.Offset || pairAddress.Immediate != 0)
-                        throw new FormatException("Post-index addressing requires a base-only memory operand.");
-                    pairAddress = ArmOperand.Memory(pairAddress.BaseRegister, ParseImmediate(operands[3]).Immediate, pairAddress.Size, ArmAddressingMode.PostIndex);
-                }
-                return ArmInstruction.Ternary(opcode, first, second, pairAddress, condition);
-
-            case ArmInstrKind.Push:
-            case ArmInstrKind.Pop:
-                RequireCount(operands, 1, mnemonic);
-                return ArmInstruction.Unary(opcode, ParseRegisterList(operands[0], target), condition);
-
-            case ArmInstrKind.Ldm:
-            case ArmInstrKind.Stm:
-                RequireCount(operands, 2, mnemonic);
-                var baseText = operands[0].Trim();
-                var writeback = baseText.EndsWith("!", StringComparison.Ordinal);
-                if (writeback)
-                    baseText = baseText.Substring(0, baseText.Length - 1).TrimEnd();
-                var mode = mnemonic switch
-                {
-                    "ldmia" or "ldmfd" or "stmia" => 1,
-                    "ldmdb" or "stmdb" or "stmfd" => 2,
-                    "ldmib" or "stmib" => 3,
-                    "ldmda" or "stmda" => 4,
-                    _ => 1,
-                };
-                return new ArmInstruction(opcode, ParseRegister(baseText, target, precision), ParseRegisterList(operands[1], target), ArmOperand.ImmediateOperand(mode), condition: condition, setFlags: writeback);
-
-            case ArmInstrKind.Svc:
-            case ArmInstrKind.Brk:
-            case ArmInstrKind.Bkpt:
-                RequireCount(operands, 1, mnemonic);
-                return ArmInstruction.Unary(opcode, ParseImmediate(operands[0]), condition);
-
-            case ArmInstrKind.Mrs:
-                RequireCount(operands, 2, mnemonic);
-                return ArmInstruction.Binary(opcode, ParseRegister(operands[0], target, precision), ParseSystemRegister(operands[1]), condition);
-
-            case ArmInstrKind.Msr:
-                RequireCount(operands, 2, mnemonic);
-                return ArmInstruction.Binary(opcode, ParseSystemRegister(operands[0]), ParseRegister(operands[1], target, precision), condition);
-
-            case ArmInstrKind.Dmb:
-            case ArmInstrKind.Dsb:
-            case ArmInstrKind.Isb:
-                if (operands.Count == 0)
-                    return new ArmInstruction(opcode);
-                RequireCount(operands, 1, mnemonic);
-                return ArmInstruction.Unary(opcode, ParseBarrierOption(operands[0]));
-
-            default:
-                throw new NotSupportedException("Assembler support is missing for " + opcode + ".");
+            string text = operands[i].Trim();
+            if (opcode == ArmInstrKind.Csel && i == 3)
+            {
+                if (!ArmConditions.TryParse(text, out condition))
+                    throw new FormatException("Invalid CSEL condition");
+                continue;
+            }
+            int space = FirstWhitespace(text);
+            string head = (space < 0 ? text : text.Substring(0, space)).ToLowerInvariant();
+            if (TryParseShift(head, out _) || TryParseExtend(head, out _))
+            {
+                if (parsed.Count == 0)
+                    throw new FormatException("A shift requires a preceding operand");
+                if (opcode is ArmInstrKind.Movz or ArmInstrKind.Movn or ArmInstrKind.Movk)
+                    parsed.Add(ParseShiftAmountOperand(text));
+                else if (parsed[^1].Kind == ArmOperandKind.Immediate && head == "lsl" && space >= 0)
+                    parsed[^1] = ArmOperand.ShiftedImmediate(parsed[^1].Immediate, checked((int)ParseInteger(text.Substring(space + 1))));
+                else
+                    parsed[^1] = ParseRegisterSuffix(parsed[^1], text);
+                continue;
+            }
+            if (parsed.Count != 0 && parsed[^1].Kind == ArmOperandKind.Memory && TryParseInteger(text, out long post))
+            {
+                ArmOperand memory = parsed[^1];
+                if (memory.AddressingMode != ArmAddressingMode.Offset || memory.Immediate != 0 || memory.IndexRegister != ArmRegister.Invalid)
+                    throw new FormatException("Post-index addressing requires a base-only memory operand");
+                parsed[^1] = ArmOperand.Memory(memory.BaseRegister, post, memory.Size, ArmAddressingMode.PostIndex);
+                continue;
+            }
+            if (opcode is ArmInstrKind.Ldm or ArmInstrKind.Stm && i == 0 && text.EndsWith('!'))
+            {
+                setFlags = true;
+                text = text.Substring(0, text.Length - 1).TrimEnd();
+            }
+            ArmOperand operand;
+            if (opcode is ArmInstrKind.Dmb or ArmInstrKind.Dsb or ArmInstrKind.Isb)
+                operand = ParseBarrierOption(text);
+            else if (opcode == ArmInstrKind.Mrs && i == 1 || opcode == ArmInstrKind.Msr && i == 0)
+                operand = ParseSystemRegister(text);
+            else if (opcode is ArmInstrKind.B or ArmInstrKind.Bl || opcode is ArmInstrKind.Cbz or ArmInstrKind.Cbnz && i == 1 || opcode is ArmInstrKind.Tbz or ArmInstrKind.Tbnz && i == 2)
+                operand = ParseBranchTarget(text, opcode, condition);
+            else if (opcode is ArmInstrKind.Adr or ArmInstrKind.Adrp && i == 1 && !text.StartsWith('['))
+                operand = ParseAddressTarget(text, opcode);
+            else if (opcode is ArmInstrKind.Ldr or ArmInstrKind.Ldrsw && i == 1)
+                operand = ParseMemoryOrLiteral(text, target, parsed[0].Size);
+            else
+                operand = ParseOperand(text, target, precision);
+            parsed.Add(operand);
         }
+        if (opcode is ArmInstrKind.Ldm or ArmInstrKind.Stm)
+        {
+            int mode = mnemonic switch
+            {
+                "ldmdb" or "stmdb" or "stmfd" => 2,
+                "ldmib" or "stmib" => 3,
+                "ldmda" or "stmda" => 4,
+                _ => 1,
+            };
+            parsed.Add(ArmOperand.ImmediateOperand(mode));
+        }
+        if (parsed.Count > 5)
+            throw new FormatException("Too many ARM operands");
+        var instruction = new ArmInstruction(opcode,
+            parsed.Count > 0 ? parsed[0] : default, parsed.Count > 1 ? parsed[1] : default,
+            parsed.Count > 2 ? parsed[2] : default, parsed.Count > 3 ? parsed[3] : default,
+            condition, setFlags, operand4: parsed.Count > 4 ? parsed[4] : default);
+        if (ArmInstructionForms.ForOpcode(opcode).Count == 0)
+            throw new NotSupportedException("Assembler support is missing for " + opcode);
+        return instruction;
     }
 
-    private static ArmOperand ParseDataOperandWithSuffix(IReadOnlyList<string> operands, int index, ArmTarget target, int size)
+    private static ArmOperand ParseOperand(string text, ArmTarget target, int precision)
     {
-        var operand = ParseDataOperand(operands[index], target, size);
-        if (index + 1 >= operands.Count)
-            return operand;
-        var suffix = operands[index + 1].Trim();
-        if (operand.Kind != ArmOperandKind.Register)
-            throw new FormatException("A shift or extension suffix requires a register operand.");
-        return ParseRegisterSuffix(operand, suffix);
-    }
-
-    private static ArmOperand ParseDataOperand(string text, ArmTarget target, int size)
-    {
-        text = text.Trim();
-        if (text.StartsWith("#", StringComparison.Ordinal) || IsInteger(text))
-            return ParseImmediate(text);
-        if (ArmRegisters.TryParse(text, target, out var register, out var parsedSize))
-            return ArmOperand.RegisterOperand(register, size > 0 ? size : parsedSize);
+        if (text.StartsWith('['))
+            return ParseMemory(text, target, 0);
+        if (text.StartsWith('{'))
+        {
+            if (!text.EndsWith('}'))
+                throw new FormatException("Unterminated register list");
+            string inner = text.Substring(1, text.Length - 2).Trim();
+            if (!inner.StartsWith("z", StringComparison.OrdinalIgnoreCase))
+                return ParseRegisterList(text, target);
+            List<string> names = SplitOperands(inner);
+            int dash = inner.IndexOf('-');
+            if (dash >= 0)
+                names = new List<string> { inner.Substring(0, dash).Trim(), inner.Substring(dash + 1).Trim() };
+            ArmOperand first = ParseRegister(names[0], target, 0);
+            if (!ArmRegisters.IsScalableVector(first.Register))
+                throw new FormatException("Expected a Z register list");
+            int count = names.Count;
+            for (int i = 1; i < names.Count; i++)
+            {
+                ArmOperand next = ParseRegister(names[i], target, 0);
+                if (!ArmRegisters.IsScalableVector(next.Register) || next.Size != first.Size)
+                    throw new FormatException("Mismatched vector list elements");
+                int distance = (ArmRegisters.Index(next.Register) - ArmRegisters.Index(first.Register)) & 31;
+                if (dash >= 0)
+                    count = distance + 1;
+                else if (distance != i)
+                    throw new FormatException("Vector list registers must be consecutive");
+            }
+            if (count is < 1 or > 4)
+                throw new FormatException("Vector register lists contain one to four registers");
+            return ArmOperand.VectorList(first.Register, first.Size, count);
+        }
+        int slash = text.IndexOf('/');
+        if (slash >= 0)
+        {
+            ArmOperand predicate = ParseRegister(text.Substring(0, slash), target, 0);
+            ArmPredication mode = text.Substring(slash + 1).ToLowerInvariant() switch
+            {
+                "m" => ArmPredication.Merging,
+                "z" => ArmPredication.Zeroing,
+                _ => throw new FormatException("Invalid predicate qualifier"),
+            };
+            if (!ArmRegisters.IsPredicate(predicate.Register) || predicate.Size != 0)
+                throw new FormatException("A governing predicate must be an unsuffixed P register");
+            return ArmOperand.Predicate(predicate.Register, mode);
+        }
+        int bracket = text.IndexOf('[');
+        if (bracket > 0 && text.EndsWith(']'))
+        {
+            ArmOperand register = ParseRegister(text.Substring(0, bracket), target, 0);
+            return ArmOperand.VectorElement(register.Register, register.Size, checked((int)ParseInteger(text.Substring(bracket + 1, text.Length - bracket - 2))));
+        }
+        if (ArmRegisters.TryParse(text, target, out ArmRegister reg, out int size))
+            return ArmOperand.RegisterOperand(reg, precision > 0 ? precision : size);
+        if (text.StartsWith("mul ", StringComparison.OrdinalIgnoreCase))
+            return ArmOperand.Multiplier(checked((int)ParseInteger(text.Substring(4))));
+        if (TryParseInteger(text, out long immediate))
+            return ArmOperand.ImmediateOperand(immediate);
+        if (Enum.TryParse(text, true, out ArmPredicatePattern pattern) && Enum.IsDefined(pattern))
+            return ArmOperand.Pattern(pattern);
+        if (text.StartsWith('#') && double.TryParse(text.AsSpan(1), NumberStyles.Float, CultureInfo.InvariantCulture, out double floating))
+            return ArmOperand.FloatingImmediateOperand(floating);
+        string lower = text.ToLowerInvariant();
+        int prefetch = Array.IndexOf(PrefetchNames, lower);
+        if (prefetch >= 0 && PrefetchNames[prefetch].Length != 0)
+            return ArmOperand.PrefetchOperation(prefetch);
+        if (text.StartsWith('#'))
+            throw new FormatException("Invalid ARM immediate: " + text);
         return ParseSymbol(text, ArmRelocationKind.None);
     }
+
+    internal static readonly string[] PrefetchNames =
+    {
+        "pldl1keep", "pldl1strm", "pldl2keep", "pldl2strm", "pldl3keep", "pldl3strm", "", "",
+        "pstl1keep", "pstl1strm", "pstl2keep", "pstl2strm", "pstl3keep", "pstl3strm", "", "",
+    };
 
     private static ArmOperand ParseRegisterSuffix(ArmOperand register, string suffix)
     {
@@ -511,7 +369,7 @@ internal static class ArmAssemblyParser
         throw new FormatException("Invalid ARM shift or extension: " + suffix);
     }
 
-    private static ArmOperand ParseMemoryOrLiteral(string text, ArmTarget target, int size, ArmInstrKind opcode)
+    private static ArmOperand ParseMemoryOrLiteral(string text, ArmTarget target, int size)
     {
         text = text.Trim();
         if (!text.StartsWith("[", StringComparison.Ordinal))
@@ -534,15 +392,25 @@ internal static class ArmAssemblyParser
         var parts = SplitOperands(inner);
         if (parts.Count == 0 || parts.Count > 3)
             throw new FormatException("Invalid ARM memory operand: " + text);
-        var baseOperand = ParseRegister(parts[0], target, target.Is64Bit ? 8 : 4);
+        ArmOperand baseOperand = ParseRegister(parts[0], target, 0);
+        if (target.Is64Bit && !ArmRegisters.IsScalableVector(baseOperand.Register) && baseOperand.Size != 8)
+            throw new FormatException("AArch64 memory bases must be X registers or SP");
         if (parts.Count == 1)
-            return ArmOperand.Memory(baseOperand.Register, 0, size, preIndex ? ArmAddressingMode.PreIndex : ArmAddressingMode.Offset);
+            return ArmOperand.Memory(baseOperand.Register, 0, ArmRegisters.IsScalableVector(baseOperand.Register) ? baseOperand.Size : size,
+                preIndex ? ArmAddressingMode.PreIndex : ArmAddressingMode.Offset);
         if (parts[1].TrimStart().StartsWith("#", StringComparison.Ordinal) || IsInteger(parts[1]))
         {
             var displacement = ParseImmediate(parts[1]).Immediate;
-            return ArmOperand.Memory(baseOperand.Register, displacement, size, preIndex ? ArmAddressingMode.PreIndex : ArmAddressingMode.Offset);
+            ArmAddressingMode mode = preIndex ? ArmAddressingMode.PreIndex : ArmAddressingMode.Offset;
+            if (parts.Count == 3)
+            {
+                if (preIndex || !parts[2].Equals("mul vl", StringComparison.OrdinalIgnoreCase))
+                    throw new FormatException("Invalid memory offset suffix");
+                mode = ArmAddressingMode.MulVl;
+            }
+            return ArmOperand.Memory(baseOperand.Register, displacement, ArmRegisters.IsScalableVector(baseOperand.Register) ? baseOperand.Size : size, mode);
         }
-        var index = ParseRegister(parts[1], target, target.Is64Bit ? 8 : 4);
+        ArmOperand index = ParseRegister(parts[1], target, 0);
         var shift = ArmShiftKind.None;
         var shiftAmount = 0;
         var extend = ArmExtendKind.None;
@@ -553,7 +421,8 @@ internal static class ArmAssemblyParser
             shiftAmount = suffix.ShiftAmount;
             extend = suffix.Extend;
         }
-        return ArmOperand.Memory(baseOperand.Register, 0, size, preIndex ? ArmAddressingMode.PreIndex : ArmAddressingMode.Offset, index.Register, shift, shiftAmount, extend);
+        return ArmOperand.Memory(baseOperand.Register, 0, ArmRegisters.IsScalableVector(baseOperand.Register) ? baseOperand.Size : size,
+            preIndex ? ArmAddressingMode.PreIndex : ArmAddressingMode.Offset, index.Register, shift, shiftAmount, extend, index.Size);
     }
 
     private static ArmOperand ParseBranchTarget(string text, ArmInstrKind opcode, ArmCondition condition)
@@ -758,6 +627,13 @@ internal static class ArmAssemblyParser
 
         var destinationType = parts[1].ToLowerInvariant();
         var sourceType = parts[2].ToLowerInvariant();
+        if (destinationType is "f32" or "f64" && sourceType is "f32" or "f64" && destinationType != sourceType)
+        {
+            opcode = ArmInstrKind.Fcvt;
+            destinationSize = destinationType == "f64" ? 8 : 4;
+            sourceSize = sourceType == "f64" ? 8 : 4;
+            return true;
+        }
         if (destinationType is "f32" or "f64" && sourceType is "s32" or "u32")
         {
             opcode = sourceType == "s32" ? ArmInstrKind.Scvtf : ArmInstrKind.Ucvtf;
@@ -1010,6 +886,7 @@ internal static class ArmAssemblyWriter
         if (instruction.Opcode is not ArmInstrKind.Ldm and not ArmInstrKind.Stm)
             AddOperand(operands, instruction.Operand2, instruction, target, options);
         AddOperand(operands, instruction.Operand3, instruction, target, options);
+        AddOperand(operands, instruction.Operand4, instruction, target, options);
         if (instruction.Opcode == ArmInstrKind.Csel)
             operands.Add(ArmConditions.Format(instruction.Condition));
 
@@ -1035,6 +912,11 @@ internal static class ArmAssemblyWriter
         if (target.Is32Bit && instruction.Opcode is (ArmInstrKind.Ldr or ArmInstrKind.Str) && ArmRegisters.IsVector(instruction.Operand0.Register))
         {
             mnemonic = instruction.Opcode == ArmInstrKind.Ldr ? "vldr" : "vstr";
+        }
+        else if (target.Is32Bit && instruction.Opcode == ArmInstrKind.Fmov &&
+                 (ArmRegisters.IsAArch32General(instruction.Operand0.Register) || ArmRegisters.IsAArch32General(instruction.Operand1.Register)))
+        {
+            mnemonic = "vmov";
         }
         else if (target.Is32Bit && instruction.Opcode is (ArmInstrKind.Fmov or ArmInstrKind.Fadd or ArmInstrKind.Fsub or ArmInstrKind.Fmul or ArmInstrKind.Fdiv or ArmInstrKind.Fsqrt or ArmInstrKind.Fabs or ArmInstrKind.Fneg or ArmInstrKind.Fcmp))
         {
@@ -1109,9 +991,22 @@ internal static class ArmAssemblyWriter
     {
         return operand.Kind switch
         {
-            ArmOperandKind.Register => ArmRegisters.Format(operand.Register, operand.Size, target),
+            ArmOperandKind.Register => ArmRegisters.Format(operand.Register, operand.Size, target) + (operand.Predication switch
+            {
+                ArmPredication.Merging => "/m",
+                ArmPredication.Zeroing => "/z",
+                _ => string.Empty,
+            }),
+            ArmOperandKind.VectorElement => ArmRegisters.Format(operand.Register, operand.Size, target) + "[" + operand.ElementIndex.ToString(CultureInfo.InvariantCulture) + "]",
+            ArmOperandKind.VectorList => "{ " + string.Join(", ", Enumerable.Range(0, operand.RegisterCount).Select(i =>
+                ArmRegisters.Format((ArmRegister)((int)ArmRegister.Z0 + ((ArmRegisters.Index(operand.Register) + i) & 31)), operand.Size, target))) + " }",
+            ArmOperandKind.Pattern => Enum.IsDefined((ArmPredicatePattern)operand.Immediate) ? ((ArmPredicatePattern)operand.Immediate).ToString().ToLowerInvariant() : "#" + FormatInteger(operand.Immediate, options),
+            ArmOperandKind.Multiplier => "mul #" + FormatInteger(operand.Immediate, options),
+            ArmOperandKind.FloatingImmediate => "#" + operand.FloatingImmediate.ToString("0.0################", CultureInfo.InvariantCulture),
+            ArmOperandKind.PrefetchOperation => (ulong)operand.Immediate < 16 && ArmAssemblyParser.PrefetchNames[(int)operand.Immediate].Length != 0
+                ? ArmAssemblyParser.PrefetchNames[(int)operand.Immediate] : "#" + FormatInteger(operand.Immediate, options),
             ArmOperandKind.Immediate when instruction.Opcode is ArmInstrKind.Dmb or ArmInstrKind.Dsb or ArmInstrKind.Isb => FormatBarrierOption(operand.Immediate, options),
-            ArmOperandKind.Immediate => "#" + FormatInteger(operand.Immediate, options),
+            ArmOperandKind.Immediate => "#" + FormatInteger(operand.Immediate, options) + (operand.ShiftAmount != 0 ? ", lsl #" + operand.ShiftAmount.ToString(CultureInfo.InvariantCulture) : string.Empty),
             ArmOperandKind.Symbol => FormatSymbol(operand, options),
             ArmOperandKind.ShiftedRegister => FormatShiftedRegister(operand, target, options),
             ArmOperandKind.ExtendedRegister => FormatExtendedRegister(operand, target, options),
@@ -1145,12 +1040,12 @@ internal static class ArmAssemblyWriter
         if (operand.AddressingMode == ArmAddressingMode.Literal)
             return FormatInteger(operand.Immediate, options);
         var sb = new StringBuilder();
-        sb.Append('[').Append(ArmRegisters.Format(operand.BaseRegister, target.Is64Bit ? 8 : 4, target));
+        sb.Append('[').Append(ArmRegisters.Format(operand.BaseRegister, ArmRegisters.IsScalableVector(operand.BaseRegister) ? operand.Size : target.Is64Bit ? 8 : 4, target));
         if (operand.AddressingMode != ArmAddressingMode.PostIndex)
         {
             if (operand.IndexRegister != ArmRegister.Invalid)
             {
-                var indexSize = target.Is64Bit && operand.Extend is not ArmExtendKind.Uxtw and not ArmExtendKind.Sxtw ? 8 : 4;
+                int indexSize = operand.IndexSize != 0 ? operand.IndexSize : target.Is64Bit && operand.Extend is not ArmExtendKind.Uxtw and not ArmExtendKind.Sxtw ? 8 : 4;
                 sb.Append(", ").Append(ArmRegisters.Format(operand.IndexRegister, indexSize, target));
                 if (operand.Extend != ArmExtendKind.None)
                 {
@@ -1164,9 +1059,11 @@ internal static class ArmAssemblyWriter
                     sb.Append(" #").Append(FormatInteger(operand.ShiftAmount, options));
                 }
             }
-            else if (operand.Immediate != 0)
+            else if (operand.Immediate != 0 || operand.AddressingMode == ArmAddressingMode.MulVl)
             {
                 sb.Append(", #").Append(FormatInteger(operand.Immediate, options));
+                if (operand.AddressingMode == ArmAddressingMode.MulVl)
+                    sb.Append(", mul vl");
             }
         }
         sb.Append(']');

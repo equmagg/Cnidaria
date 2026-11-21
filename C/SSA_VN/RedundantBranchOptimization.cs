@@ -35,7 +35,7 @@ internal static class RedundantBranchOptimization
     {
         private readonly GimpleFunctionAnnotations _function;
         private readonly ValueNumberingOptions _valueNumberingOptions;
-        private readonly AssertionTable _constants;
+        private readonly ValueRangeTable _constants;
         private readonly Dictionary<ControlFlowBlock, GimpleBlockAnnotations> _blocks = new();
         private readonly Dictionary<ControlFlowBlock, GimpleStatementAnnotations> _terminators = new();
         private readonly Dictionary<GimplePhi, Dictionary<ControlFlowBlock, GimpleName>> _addedInputs = new();
@@ -46,7 +46,7 @@ internal static class RedundantBranchOptimization
         {
             _function = function;
             _valueNumberingOptions = valueNumberingOptions;
-            _constants = new AssertionTable(target, new Dictionary<GimpleName, GimpleStatementAnnotations>());
+            _constants = new ValueRangeTable(target, assertions: null);
             foreach (GimpleBlockAnnotations block in function.Blocks)
                 _blocks[block.ControlFlowBlock] = block;
         }
@@ -239,12 +239,18 @@ internal static class RedundantBranchOptimization
                 return false;
             for (var i = 0; i < block.Statements.Length - 1; i++)
             {
-                if (block.Statements[i].Statement is not GimpleNopStatement)
+                if (block.Statements[i].Statement is not GimpleNopStatement && !DeclaresRegister(block.Statements[i].Statement))
                     return false;
             }
 
             return true;
         }
+
+        // A variable kept in registers takes no code to declare, while a stack slot is laid out from its declaration
+        private static bool DeclaresRegister(GimpleStatement statement)
+            => statement is GimpleDeclarationStatement declaration && declaration.Symbol is VariableSymbol variable && !variable.IsAddressTaken &&
+               declaration.StorageClass is StorageClass.None or StorageClass.Auto or StorageClass.Register &&
+               !GimpleTypes.IsAggregate(variable.Type) && !GimpleTypes.IsVolatileOrAtomic(variable.Type);
 
         private static bool IsLoopHeader(ControlFlowBlock block)
         {

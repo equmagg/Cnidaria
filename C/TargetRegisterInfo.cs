@@ -24,6 +24,32 @@ internal static class TargetRegisterInfo
         => target.Architecture is TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64
             or TargetArchitectureKind.Arm32 or TargetArchitectureKind.Arm64;
 
+    /// <summary>Reports whether an addressing mode multiplies an index by this element size on its own</summary>
+    public static bool ScalesIndex(TargetInfo target, int scale)
+    {
+        if (scale == 1)
+            return true;
+        if (scale <= 0 || (scale & (scale - 1)) != 0)
+            return false;
+        if (IsX86(target))
+            return scale <= 8;
+        if (target.IsRiscV)
+            return scale <= 8 && target.HasFeature(TargetArchitectureFeatures.RiscVB);
+        return true;
+    }
+
+    /// <summary>Splits a displacement a memory operand cannot carry into a part added to the base ahead and the part it keeps</summary>
+    public static bool TrySplitDisplacement(TargetInfo target, long displacement, out long high, out int low)
+    {
+        high = 0;
+        low = 0;
+        if (!target.IsRiscV || displacement is >= -2048 and <= 2047)
+            return false;
+        high = (displacement + 0x800) & ~0xFFFL;
+        low = (int)(displacement - high);
+        return true;
+    }
+
     // A target whose loops reload constants and addresses into registers every iteration gains from loading them once ahead
     public static bool HoistsLoopValues(TargetInfo target)
         => target.Architecture is TargetArchitectureKind.RiscV32 or TargetArchitectureKind.RiscV64;

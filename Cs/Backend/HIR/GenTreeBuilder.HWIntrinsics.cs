@@ -1,3 +1,4 @@
+using Cnidaria.Arm;
 using Cnidaria.X86;
 using System;
 using System.Collections.Generic;
@@ -27,7 +28,7 @@ namespace Cnidaria.Cs
         }
 
         private bool IsHardwareAcceleratedVectorApi(RuntimeType type)
-            => (type.Namespace != "System.Numerics" || SimdTypes.NumericsSize(type) != 0 || _rts.Target.IsRiscV) &&
+            => (type.Namespace != "System.Numerics" || SimdTypes.NumericsSize(type) != 0 || SimdTypes.HasFixedNumericsVector(_rts.Target)) &&
                SimdTypes.TargetSupports(_rts.Target, VectorApiSize(type));
 
         private bool TryImportVectorElementTypeIsSupported(List<StackValue> stack, RuntimeMethod method, int pc, ILOpCode op)
@@ -63,8 +64,11 @@ namespace Cnidaria.Cs
         private bool TryImportHWIntrinsic(ImportFrame frame, List<StackValue> stack, List<GenTree> statements, RuntimeMethod method, int pc, ILOpCode op)
         {
             bool x86 = method.DeclaringType.Namespace == X86Intrinsics.Namespace;
-            if (!x86 && !SimdTypes.TargetSupports(_rts.Target, VectorApiSize(method.DeclaringType)))
+            bool arm = method.DeclaringType.Namespace == ArmIntrinsics.Namespace;
+            if (!x86 && !arm && !SimdTypes.TargetSupports(_rts.Target, VectorApiSize(method.DeclaringType)))
                 return false;
+            if (arm && HasValueTupleSignature(method))
+                return TryImportArmTupleIntrinsic(frame, stack, statements, method, pc, op);
 
             int argCount = method.ParameterTypes.Length + (method.HasThis ? 1 : 0);
             if (stack.Count < argCount)
@@ -74,7 +78,9 @@ namespace Cnidaria.Cs
             for (int i = stack.Count - argCount; i < stack.Count; i++)
                 args.Add(stack[i].Node);
 
-            GenTree? result = x86 ? BuildX86Intrinsic(method, args.MoveToImmutable(), pc) : BuildHWIntrinsic(method, args.MoveToImmutable(), pc);
+            GenTree? result = x86 ? BuildX86Intrinsic(method, args.MoveToImmutable(), pc)
+                : arm ? BuildArmIntrinsic(method, args.MoveToImmutable(), pc)
+                : BuildHWIntrinsic(method, args.MoveToImmutable(), pc);
             if (result is null)
                 return false;
 
@@ -144,6 +150,203 @@ namespace Cnidaria.Cs
             node.Flags |= X86Intrinsics.EffectFlags(node);
             return node;
         }
+
+        private GenTree? BuildArmIntrinsic(RuntimeMethod method, ImmutableArray<GenTree> args, int pc)
+        {
+            TargetInfo target = _rts.Target;
+            bool supported = ArmIntrinsics.TryGetIsa(method.DeclaringType, out ArmIsa isa, out bool arm64) && ArmIntrinsics.IsSupported(target, isa);
+            RuntimeType[] ps = method.ParameterTypes;
+            if (method.Name == "get_IsSupported" && ps.Length == 0)
+                return ConstI4(pc, ILOpCode.Ldc_I4, supported ? 1 : 0);
+            if (!supported || method.HasThis || !ArmIntrinsics.TryLookup(isa, arm64, method.Name, out int id))
+                return null;
+
+            ArmIntrinsicInfo info = ArmIntrinsics.Info(id);
+            if (info.Has(ArmIntrinsicFlags.NoCodeGen) || IsValueTuple(method.ReturnType))
+                return null;
+            foreach (RuntimeType type in ps)
+            {
+                if (IsValueTuple(type))
+                    return null;
+            }
+            if (info.Category == ArmIntrinsicCategory.Helper && method.Name is not ("LoadVector64" or "LoadVector128"))
+                return null;
+
+            int simdSize = 8;
+            foreach (RuntimeType type in ps)
+                simdSize = Math.Max(simdSize, VectorApiSize(type));
+            simdSize = Math.Max(simdSize, VectorApiSize(method.ReturnType));
+
+            RuntimeType? source = info.Has(ArmIntrinsicFlags.BaseFromFirstArg) ? ps[0]
+                : info.Has(ArmIntrinsicFlags.BaseFromSecondArg) ? ps[1]
+                : SimdTypes.IsSimdType(method.ReturnType, target) ? method.ReturnType
+                : ps.Length != 0 ? ps[0] : method.ReturnType;
+            RuntimePrimitiveKind baseKind = X86ElementKind(source, target);
+            if (info.Category is not (ArmIntrinsicCategory.Helper or ArmIntrinsicCategory.Special) && method.Name != "Store" &&
+                info.Instruction(baseKind) == ArmInstrKind.Invalid)
+            {
+                return null;
+            }
+
+            int addressMask = 0;
+            for (int i = 0; i < ps.Length; i++)
+            {
+                if (ps[i].Kind == RuntimeTypeKind.Pointer)
+                    addressMask |= 1 << i;
+            }
+
+            bool variable = false;
+            ReadOnlySpan<int> immediates = ArmIntrinsics.ImmediateOperands(info, args.Length);
+            var bounds = new (int Minimum, int Maximum)[immediates.Length];
+            for (int slot = 0; slot < immediates.Length; slot++)
+            {
+                int index = immediates[slot];
+                if (args[index] is GenTree conversion && conversion.Kind == GenTreeKind.Conv && conversion.Operands[0].Kind == GenTreeKind.ConstI4 &&
+                    conversion.ConvKind == NumericConvKind.U1 && (conversion.ConvFlags & NumericConvFlags.Checked) == 0)
+                {
+                    args = args.SetItem(index, ConstI4(pc, ILOpCode.Ldc_I4, (byte)conversion.Operands[0].Int32));
+                }
+                (int minimum, int maximum) = ArmIntrinsics.ImmediateRange(info, ps, method.ReturnType, index, target);
+                bounds[slot] = (minimum, maximum);
+                variable |= args[index].Kind != GenTreeKind.ConstI4 || args[index].Int32 < minimum || args[index].Int32 > maximum;
+            }
+
+            GenStackKind stackKind = StackKindOf(method.ReturnType);
+            GenTree node = Node(GenTreeKind.HWIntrinsic, pc, GenTreeOperator.None, type: stackKind == GenStackKind.Void ? null : method.ReturnType,
+                stackKind: stackKind, operands: args, int32: id, int64: ArmIntrinsics.Encode(baseKind, simdSize, addressMask, variable, bounds));
+            node.Flags |= ArmIntrinsics.EffectFlags(node);
+            return node;
+        }
+
+        private static bool HasValueTupleSignature(RuntimeMethod method)
+        {
+            if (IsValueTuple(method.ReturnType))
+                return true;
+            foreach (RuntimeType type in method.ParameterTypes)
+            {
+                if (IsValueTuple(type))
+                    return true;
+            }
+            return false;
+        }
+
+        private bool TryImportArmTupleIntrinsic(ImportFrame frame, List<StackValue> stack, List<GenTree> statements, RuntimeMethod method, int pc, ILOpCode op)
+        {
+            TargetInfo target = _rts.Target;
+            RuntimeType[] ps = method.ParameterTypes;
+            if (method.HasThis || stack.Count < ps.Length ||
+                !ArmIntrinsics.TryGetIsa(method.DeclaringType, out ArmIsa isa, out bool arm64) || !ArmIntrinsics.IsSupported(target, isa))
+            {
+                return false;
+            }
+            RuntimeType? tupleParameter = null;
+            foreach (RuntimeType type in ps)
+            {
+                if (IsValueTuple(type))
+                    tupleParameter = type;
+            }
+            RuntimeType? tupleResult = IsValueTuple(method.ReturnType) ? method.ReturnType : null;
+            RuntimeType tuple = tupleResult ?? tupleParameter!;
+            RuntimeField[] elements = tuple.InstanceFields;
+            if (elements.Length is < 2 or > 4)
+                return false;
+            foreach (RuntimeField element in elements)
+            {
+                if (!SimdTypes.IsSimdType(element.FieldType, target))
+                    return false;
+            }
+            string name = method.Name == "LoadAndInsertScalar"
+                ? $"LoadAndInsertScalar{(SimdTypes.SizeOf(SimdTypes.KindOf(elements[0].FieldType, target)) == 8 ? "Vector64" : "Vector128")}x{elements.Length}"
+                : method.Name;
+            if (!ArmIntrinsics.TryLookup(isa, arm64, name, out int id))
+                return false;
+            ArmIntrinsicInfo info = ArmIntrinsics.Info(id);
+
+            SpillEvaluationStackForImportBarrier(statements, stack, pc, op);
+            var operands = new List<Func<GenTree>>();
+            var operandTypes = new List<RuntimeType>();
+            for (int i = 0; i < ps.Length; i++)
+            {
+                GenTree arg = stack[stack.Count - ps.Length + i].Node;
+                GenTemp temp = CreateImporterSpillTemp(ps[i], StackKindOf(ps[i]));
+                statements.Add(Node(GenTreeKind.StoreTemp, pc, op, operands: One(arg), int32: temp.Index));
+                if (!IsValueTuple(ps[i]))
+                {
+                    operands.Add(() => TempLoad(pc, op, temp).Node);
+                    operandTypes.Add(ps[i]);
+                    continue;
+                }
+                foreach (RuntimeField element in elements)
+                {
+                    operands.Add(() => Node(GenTreeKind.Field, pc, ILOpCode.Ldfld, type: element.FieldType, stackKind: StackKindOf(element.FieldType),
+                        operands: One(TempAddress(pc, op, temp).Node), field: element));
+                    operandTypes.Add(element.FieldType);
+                }
+            }
+            PopMany(stack, ps.Length, pc, op);
+
+            RuntimeType? elementResult = tupleResult is not null ? elements[0].FieldType : null;
+            RuntimeType? resultType = elementResult ?? (IsVoid(method.ReturnType) ? null : method.ReturnType);
+            RuntimeType? source = info.Has(ArmIntrinsicFlags.BaseFromFirstArg) ? operandTypes[0]
+                : info.Has(ArmIntrinsicFlags.BaseFromSecondArg) ? operandTypes[1]
+                : resultType is not null && SimdTypes.IsSimdType(resultType, target) ? resultType
+                : operandTypes[^1];
+            RuntimePrimitiveKind baseKind = X86ElementKind(source, target);
+            int simdSize = 8;
+            foreach (RuntimeType type in operandTypes)
+                simdSize = Math.Max(simdSize, VectorApiSize(type));
+            if (resultType is not null)
+                simdSize = Math.Max(simdSize, VectorApiSize(resultType));
+            int addressMask = 0;
+            for (int i = 0; i < operandTypes.Count; i++)
+            {
+                if (operandTypes[i].Kind == RuntimeTypeKind.Pointer)
+                    addressMask |= 1 << i;
+            }
+            ReadOnlySpan<int> immediates = ArmIntrinsics.ImmediateOperands(info, operandTypes.Count);
+            var bounds = new (int Minimum, int Maximum)[immediates.Length];
+            for (int slot = 0; slot < immediates.Length; slot++)
+                bounds[slot] = ArmIntrinsics.ImmediateRange(info, operandTypes, resultType, immediates[slot], target);
+
+            GenTree Build(int element)
+            {
+                ImmutableArray<GenTree>.Builder args = ImmutableArray.CreateBuilder<GenTree>(operands.Count);
+                foreach (Func<GenTree> operand in operands)
+                    args.Add(operand());
+                GenStackKind stackKind = resultType is null ? GenStackKind.Void : StackKindOf(resultType);
+                long encoded = ArmIntrinsics.EncodeTuple(ArmIntrinsics.Encode(baseKind, simdSize, addressMask, variableImmediate: true, bounds), elements.Length, element);
+                GenTree node = Node(GenTreeKind.HWIntrinsic, pc, GenTreeOperator.None, type: resultType, stackKind: stackKind,
+                    operands: args.MoveToImmutable(), int32: id, int64: encoded);
+                node.Flags |= ArmIntrinsics.EffectFlags(node);
+                return node;
+            }
+
+            if (tupleResult is null)
+            {
+                GenTree node = Build(0);
+                if (node.StackKind == GenStackKind.Void)
+                    AppendImporterStatement(statements, stack, Node(GenTreeKind.Eval, pc, op, operands: One(node)));
+                else
+                    PushImportedValue(stack, statements, node);
+                return true;
+            }
+
+            for (int element = 0; element < elements.Length; element++)
+                PushImportedValue(stack, statements, Build(element));
+            _rts.EnsureConstructedMembers(tupleResult);
+            foreach (RuntimeMethod ctor in tupleResult.Methods)
+            {
+                if (!ctor.IsStatic && ctor.ParameterTypes.Length == elements.Length && ctor.Name == ".ctor")
+                {
+                    EmitNewObject(frame, stack, statements, pc, op, token: 0, ctor, coldCallSite: false);
+                    return true;
+                }
+            }
+            throw Fail(pc, op, "ValueTuple has no element constructor.");
+        }
+
+        private static bool IsValueTuple(RuntimeType type)
+            => type.Namespace == "System" && (type.GenericTypeDefinition?.Name ?? type.Name).StartsWith("ValueTuple`", StringComparison.Ordinal);
 
         private static bool IsX86IntrinsicEnum(RuntimeType type, string name)
             => type.Namespace == X86Intrinsics.Namespace && type.Name == name;
@@ -266,11 +469,9 @@ namespace Cnidaria.Cs
                     return VectorBinary(HWIntrinsicId.CompareLessThan);
                 case "LessThanOrEqual":
                     return VectorBinary(HWIntrinsicId.CompareLessThanOrEqual);
-                case "Min" when !HWIntrinsics.IsFloating(baseKind):
-                case "MinNative" when !HWIntrinsics.IsFloating(baseKind):
+                case "Min" or "MinNative" when !HWIntrinsics.IsFloating(baseKind) || target.Architecture == TargetArchitectureKind.Arm64:
                     return VectorBinary(HWIntrinsicId.Min);
-                case "Max" when !HWIntrinsics.IsFloating(baseKind):
-                case "MaxNative" when !HWIntrinsics.IsFloating(baseKind):
+                case "Max" or "MaxNative" when !HWIntrinsics.IsFloating(baseKind) || target.Architecture == TargetArchitectureKind.Arm64:
                     return VectorBinary(HWIntrinsicId.Max);
                 case "op_Multiply" or "Multiply":
                     return ScaledBinary(HWIntrinsicId.Multiply, allowScalarLeft: true);

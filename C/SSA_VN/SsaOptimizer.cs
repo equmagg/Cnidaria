@@ -30,7 +30,8 @@ internal static partial class SsaOptimizer
             !options.EnableCommonSubexpressionElimination &&
             !options.EnableLoopInvariantCodeMotion &&
             !options.EnableInductionVariables &&
-            !options.EnableAssertionPropagation)
+            !options.EnableAssertionPropagation &&
+            !options.EnableRangeAnalysis)
         {
             return function;
         }
@@ -51,8 +52,9 @@ internal static partial class SsaOptimizer
         if (!ReferenceEquals(branched, current))
             current = new Pass(branched, target, options, valueNumberingOptions).Run();
 
-        var asserted = AssertionPropagation.Optimize(current, target, options, valueNumberingOptions, out var assertions);
-        var induced = InductionVariables.Optimize(asserted, target, options, valueNumberingOptions, assertions);
+        GimpleFunctionAnnotations asserted = AssertionPropagation.Optimize(current, options, valueNumberingOptions, out AssertionTable? assertions);
+        GimpleFunctionAnnotations ranged = RangeAnalysis.Optimize(asserted, target, options, valueNumberingOptions, assertions, out ValueRangeTable? ranges);
+        GimpleFunctionAnnotations induced = InductionVariables.Optimize(ranged, target, options, valueNumberingOptions, ranges);
         return ReferenceEquals(induced, current)
             ? current
             : new Pass(induced, target, options, valueNumberingOptions).Run();
@@ -693,7 +695,7 @@ internal static partial class SsaOptimizer
                     return MaterializeCall(call, instruction, expressions);
 
                 case GimpleCondStatement conditional:
-                    return MaterializeCond(conditional, expressions);
+                    return MaterializeCond(conditional, ref expressions);
 
                 case GimpleSwitchStatement switchStatement:
                     if (expressions.Length >= 1 && TryMaterializeValue(expressions[0], out var switchValue))
@@ -733,6 +735,7 @@ internal static partial class SsaOptimizer
             var start = GetRhsOperandStart(instruction);
             if (assign.Operands.Length == 0 || start + assign.Operands.Length > expressions.Length)
                 return assign;
+            GimplePlace lhs = start == 1 ? MaterializeStoreTarget(assign.Lhs, expressions[0]) : assign.Lhs;
 
             var operands = ImmutableArray.CreateBuilder<GimpleOperandInfo>(assign.Operands.Length);
             for (var i = 0; i < assign.Operands.Length; i++)
@@ -743,7 +746,7 @@ internal static partial class SsaOptimizer
             {
                 Changed = true;
                 expressions = ReplaceRhsExpressions(expressions, start, assign.Operands.Length, ImmutableArray.Create(folded));
-                return GimpleAssignStatement.Single(assign.Lhs, GimpleNameMaterializer.MaterializeValue(folded), assign.Syntax);
+                return GimpleAssignStatement.Single(lhs, GimpleNameMaterializer.MaterializeValue(folded), assign.Syntax);
             }
 
             if (_options.EnableConstantFolding && TryReassociateConstants(assign, operandArray, out GimpleAssignStatement reassociated, out ImmutableArray<GimpleOperandInfo> reassociatedOperands))
@@ -761,7 +764,7 @@ internal static partial class SsaOptimizer
             }
 
             var values = ImmutableArray.CreateBuilder<GimpleValue>(operandArray.Length);
-            var changed = false;
+            bool changed = !ReferenceEquals(lhs, assign.Lhs);
             for (var i = 0; i < operandArray.Length; i++)
             {
                 var value = GimpleNameMaterializer.MaterializeValue(operandArray[i]);
@@ -780,7 +783,69 @@ internal static partial class SsaOptimizer
                 changed = true;
             }
 
-            return changed ? assign.WithOperands(assign.Lhs, values.ToImmutable()) : assign;
+            return changed ? assign.WithOperands(lhs, values.ToImmutable()) : assign;
+        }
+
+        // A copy propagated into the place a store writes reaches only its operand, so the statement is rebuilt where the names part
+        private static GimplePlace MaterializeStoreTarget(GimplePlace target, GimpleOperandInfo expression)
+        {
+            var current = new List<GimpleName>();
+            CollectNames(expression, current);
+            var written = new List<GimpleName>();
+            CollectNames(target, written);
+            return current.SequenceEqual(written) ? target : GimpleNameMaterializer.MaterializeValue(expression) as GimplePlace ?? target;
+        }
+
+        private static void CollectNames(GimpleOperandInfo expression, List<GimpleName> names)
+        {
+            if (expression.Name is not null && expression.IsAddress)
+            {
+                CollectNames(expression.Original, names);
+                return;
+            }
+            if (expression.Name is not null)
+            {
+                names.Add(expression.Name);
+                return;
+            }
+            foreach (GimpleOperandInfo child in expression.Children)
+                CollectNames(child, names);
+        }
+
+        private static void CollectNames(GimpleValue? value, List<GimpleName> names)
+        {
+            switch (value)
+            {
+                case GimpleName name:
+                    names.Add(name);
+                    break;
+                case GimpleMemberAccessExpression member:
+                    CollectNames(member.Expression, names);
+                    break;
+                case GimpleElementAccessExpression element:
+                    CollectNames(element.Expression, names);
+                    CollectNames(element.Index, names);
+                    break;
+                case GimpleIndirectExpression indirect:
+                    CollectNames(indirect.Address, names);
+                    break;
+                case GimpleAddressOfExpression address:
+                    CollectNames(address.Target, names);
+                    break;
+                case GimpleUnaryExpression unary:
+                    CollectNames(unary.Operand, names);
+                    break;
+                case GimpleBinaryExpression binary:
+                    CollectNames(binary.Left, names);
+                    CollectNames(binary.Right, names);
+                    break;
+                case GimpleConversionExpression conversion:
+                    CollectNames(conversion.Operand, names);
+                    break;
+                case GimpleCastExpression cast:
+                    CollectNames(cast.Operand, names);
+                    break;
+            }
         }
 
         /// <summary>
@@ -821,7 +886,7 @@ internal static partial class SsaOptimizer
         }
 
         /// <summary>Rebuilds a branch, resolving it to a jump when the comparison is decided</summary>
-        private GimpleStatement MaterializeCond(GimpleCondStatement conditional, ImmutableArray<GimpleOperandInfo> expressions)
+        private GimpleStatement MaterializeCond(GimpleCondStatement conditional, ref ImmutableArray<GimpleOperandInfo> expressions)
         {
             if (_options.EnableBranchFolding && ReferenceEquals(conditional.WhenTrue, conditional.WhenFalse))
                 return new GimpleGotoStatement(conditional.WhenTrue, conditional.Syntax);
@@ -841,6 +906,15 @@ internal static partial class SsaOptimizer
 
             var left = GimpleNameMaterializer.MaterializeValue(expressions[0]);
             var right = GimpleNameMaterializer.MaterializeValue(expressions[1]);
+            // A constant is compared from the right, where every target encodes it as an immediate
+            if (left is GimpleConstantValue && right is not GimpleConstantValue &&
+                conditional.Code is GimpleTreeCode.LtExpr or GimpleTreeCode.LeExpr or GimpleTreeCode.GtExpr or GimpleTreeCode.GeExpr or
+                    GimpleTreeCode.EqExpr or GimpleTreeCode.NeExpr)
+            {
+                expressions = expressions.SetItem(0, expressions[1]).SetItem(1, expressions[0]);
+                Changed = true;
+                return conditional.WithOperands(AssertionTable.Swap(conditional.Code), right, left);
+            }
             return ReferenceEquals(left, conditional.Lhs) && ReferenceEquals(right, conditional.Rhs)
                 ? conditional
                 : conditional.WithOperands(conditional.Code, left, right);
@@ -2382,9 +2456,10 @@ internal static partial class SsaOptimizer
 
         // A conversion between two spellings of one representation only moves the value
         private static bool IsIdentityConversion(GimpleTreeCode code, QualifiedType source, QualifiedType destination)
-            => code is GimpleTreeCode.NopExpr or GimpleTreeCode.ConvertExpr &&
-               !IsVolatileOrAtomic(source) && !IsVolatileOrAtomic(destination) &&
-               RepresentationKey(source) == RepresentationKey(destination);
+            => code is GimpleTreeCode.NopExpr or GimpleTreeCode.ConvertExpr && IsInterchangeable(source, destination);
+
+        private static bool IsInterchangeable(QualifiedType left, QualifiedType right)
+            => !IsVolatileOrAtomic(left) && !IsVolatileOrAtomic(right) && SameRepresentation(left, right);
 
         private static string RepresentationKey(QualifiedType type)
             => GimpleTypeHelpers.Normalize(type).Type.ToDisplayString();

@@ -392,9 +392,7 @@ public sealed class X86CodeGenerator
                 }
                 case "/":
                 case "%":
-                    if (LirStrengthReduction.TryGetPowerOfTwoDivisor(instruction, _target, out _, out _))
-                        return IntoRegister(left) | (IsSigned(left.Type) ? ScratchClass.General : ScratchClass.None);
-                    // Every other divide works in eax, ecx and edx, which on x64 are not scratch registers
+                    // A divide works in eax, ecx and edx, which on x64 are not scratch registers
                     return _is64Bit ? IntoRegister(left) | IntoRegister(right) : ScratchClass.General;
                 case "<<":
                 case ">>":
@@ -2246,7 +2244,7 @@ public sealed class X86CodeGenerator
                     EmitReturnBuffer(instruction);
                     break;
                 case LirInstructionKind.Unreachable:
-                    Emit(new X86Instruction(X86InstrKind.Ud2));
+                    // The epilogue always follows the blocks, so the return address of a call that cannot return stays inside the function
                     break;
                 default:
                     throw Unsupported(instruction, $"Unsupported LIR instruction kind for x86 codegen: {instruction.Kind}.");
@@ -3411,6 +3409,14 @@ public sealed class X86CodeGenerator
 
         private void EmitWideIntegerShift(LirInstruction instruction)
         {
+            if (instruction.Operands[1].Kind == LirOperandKind.Immediate && instruction.Operands[1].Immediate is not string)
+            {
+                LoadWideIntegerOperand(instruction.Operands[0], X86Register.Rax, X86Register.Rdx, instruction);
+                EmitWideIntegerShiftByConstant(instruction, (int)(ConvertIntegerConstant(instruction.Operands[1].Immediate) & 63));
+                StoreWideIntegerResult(instruction.Result!, X86Register.Rax, X86Register.Rdx);
+                return;
+            }
+
             StoreWideIntegerOperandToTemp(instruction.Operands[0], 0, instruction);
             LoadWideIntegerLowWord(instruction.Operands[1], X86Register.Rcx, instruction);
             Emit(X86Instruction.Binary(X86InstrKind.And, Reg(X86Register.Rcx, 4), Imm(63)));
@@ -3493,45 +3499,64 @@ public sealed class X86CodeGenerator
             _owner.DefineLabel(done);
         }
 
+        private void EmitWideIntegerShiftByConstant(LirInstruction instruction, int count)
+        {
+            var arithmetic = instruction.Operator != "<<" && IsSignedIntegerType(instruction.Operands[0].Type);
+            if (count == 0)
+                return;
+            if (instruction.Operator == "<<")
+            {
+                if (count >= 32)
+                {
+                    MoveRegister(X86Register.Rdx, X86Register.Rax, 4);
+                    if (count > 32)
+                        Emit(X86Instruction.Binary(X86InstrKind.Shl, Reg(X86Register.Rdx, 4), Imm(count - 32)));
+                    Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
+                    return;
+                }
+
+                MoveRegister(X86Register.Rcx, X86Register.Rax, 4);
+                Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(X86Register.Rcx, 4), Imm(32 - count)));
+                Emit(X86Instruction.Binary(X86InstrKind.Shl, Reg(X86Register.Rdx, 4), Imm(count)));
+                Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rdx, 4), Reg(X86Register.Rcx, 4)));
+                Emit(X86Instruction.Binary(X86InstrKind.Shl, Reg(X86Register.Rax, 4), Imm(count)));
+                return;
+            }
+
+            var highShift = arithmetic ? X86InstrKind.Sar : X86InstrKind.Shr;
+            if (count >= 32)
+            {
+                MoveRegister(X86Register.Rax, X86Register.Rdx, 4);
+                if (count > 32)
+                    Emit(X86Instruction.Binary(highShift, Reg(X86Register.Rax, 4), Imm(count - 32)));
+                if (arithmetic)
+                    Emit(X86Instruction.Binary(X86InstrKind.Sar, Reg(X86Register.Rdx, 4), Imm(31)));
+                else
+                    Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rdx, 4), Reg(X86Register.Rdx, 4)));
+                return;
+            }
+
+            MoveRegister(X86Register.Rcx, X86Register.Rdx, 4);
+            Emit(X86Instruction.Binary(X86InstrKind.Shl, Reg(X86Register.Rcx, 4), Imm(32 - count)));
+            Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(X86Register.Rax, 4), Imm(count)));
+            Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rax, 4), Reg(X86Register.Rcx, 4)));
+            Emit(X86Instruction.Binary(highShift, Reg(X86Register.Rdx, 4), Imm(count)));
+        }
+
         private void EmitWideIntegerMultiply(LirInstruction instruction)
         {
             StoreWideIntegerOperandToTemp(instruction.Operands[0], 0, instruction);
             StoreWideIntegerOperandToTemp(instruction.Operands[1], 1, instruction);
-            ZeroWideIntegerResult(instruction.Result!);
-
-            var loop = _owner.CreateLocalLabel(_functionLabel + "_i64_mul_loop");
-            var skipAdd = _owner.CreateLocalLabel(_functionLabel + "_i64_mul_skip");
-            var done = _owner.CreateLocalLabel(_functionLabel + "_i64_mul_done");
-            Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 4), WideTempMemory(1, 0)));
-            Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rax, 4), WideTempMemory(1, 4)));
-            Emit(X86Instruction.ConditionalBranch(X86Condition.E, X86Operand.SymbolOperand(done, 4, X86ObjectRelocationKind.Relative32)));
-
-            _owner.DefineLabel(loop);
-            Emit(X86Instruction.Binary(X86InstrKind.Test, WideTempMemory(1, 0), Imm(1)));
-            Emit(X86Instruction.ConditionalBranch(X86Condition.E, X86Operand.SymbolOperand(skipAdd, 4, X86ObjectRelocationKind.Relative32)));
-            LoadWideIntegerResult(instruction.Result!, X86Register.Rax, X86Register.Rdx);
-            Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rax, 4), WideTempMemory(0, 0)));
-            Emit(X86Instruction.Binary(X86InstrKind.Adc, Reg(X86Register.Rdx, 4), WideTempMemory(0, 4)));
+            Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 4), WideTempMemory(0, 0)));
+            Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rcx, 4), WideTempMemory(1, 0)));
+            Emit(X86Instruction.Unary(X86InstrKind.Mul, Reg(X86Register.Rcx, 4)));
+            Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rcx, 4), WideTempMemory(0, 0)));
+            Emit(X86Instruction.Binary(X86InstrKind.Imul, Reg(X86Register.Rcx, 4), WideTempMemory(1, 4)));
+            Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rdx, 4), Reg(X86Register.Rcx, 4)));
+            Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rcx, 4), WideTempMemory(0, 4)));
+            Emit(X86Instruction.Binary(X86InstrKind.Imul, Reg(X86Register.Rcx, 4), WideTempMemory(1, 0)));
+            Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rdx, 4), Reg(X86Register.Rcx, 4)));
             StoreWideIntegerResult(instruction.Result!, X86Register.Rax, X86Register.Rdx);
-
-            _owner.DefineLabel(skipAdd);
-            LoadWideIntegerTemp(0, X86Register.Rax, X86Register.Rdx);
-            Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(X86Register.Rax, 4), Reg(X86Register.Rax, 4)));
-            Emit(X86Instruction.Binary(X86InstrKind.Adc, Reg(X86Register.Rdx, 4), Reg(X86Register.Rdx, 4)));
-            StoreWideIntegerTemp(0, X86Register.Rax, X86Register.Rdx);
-
-            LoadWideIntegerTemp(1, X86Register.Rax, X86Register.Rdx);
-            MoveRegister(X86Register.Rcx, X86Register.Rdx, 4);
-            Emit(X86Instruction.Binary(X86InstrKind.And, Reg(X86Register.Rcx, 4), Imm(1)));
-            Emit(X86Instruction.Binary(X86InstrKind.Shl, Reg(X86Register.Rcx, 4), Imm(31)));
-            Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(X86Register.Rax, 4), Imm(1)));
-            Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rax, 4), Reg(X86Register.Rcx, 4)));
-            Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(X86Register.Rdx, 4), Imm(1)));
-            StoreWideIntegerTemp(1, X86Register.Rax, X86Register.Rdx);
-            MoveRegister(X86Register.Rcx, X86Register.Rax, 4);
-            Emit(X86Instruction.Binary(X86InstrKind.Or, Reg(X86Register.Rcx, 4), Reg(X86Register.Rdx, 4)));
-            Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, X86Operand.SymbolOperand(loop, 4, X86ObjectRelocationKind.Relative32)));
-            _owner.DefineLabel(done);
         }
 
         private void EmitWideIntegerDivide(LirInstruction instruction, bool wantRemainder)
@@ -3568,6 +3593,23 @@ public sealed class X86CodeGenerator
                 EmitAbsoluteWideIntegerTemp(1);
             }
 
+            // A divisor that fits a word takes two divs of edx:eax, the high quotient word first
+            var wideDivisor = _owner.CreateLocalLabel(_functionLabel + "_i64_div_wide");
+            var divided = _owner.CreateLocalLabel(_functionLabel + "_i64_div_divided");
+            Emit(X86Instruction.Binary(X86InstrKind.Cmp, WideTempMemory(1, 4), Imm(0)));
+            Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, X86Operand.SymbolOperand(wideDivisor, 4, X86ObjectRelocationKind.Relative32)));
+            Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rcx, 4), WideTempMemory(1, 0)));
+            Emit(X86Instruction.Binary(X86InstrKind.Xor, Reg(X86Register.Rdx, 4), Reg(X86Register.Rdx, 4)));
+            Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 4), WideTempMemory(0, 4)));
+            Emit(X86Instruction.Unary(X86InstrKind.Div, Reg(X86Register.Rcx, 4)));
+            Emit(X86Instruction.Binary(X86InstrKind.Mov, WideTempMemory(0, 4), Reg(X86Register.Rax, 4)));
+            Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rax, 4), WideTempMemory(0, 0)));
+            Emit(X86Instruction.Unary(X86InstrKind.Div, Reg(X86Register.Rcx, 4)));
+            Emit(X86Instruction.Binary(X86InstrKind.Mov, WideTempMemory(0, 0), Reg(X86Register.Rax, 4)));
+            Emit(X86Instruction.Binary(X86InstrKind.Mov, WideTempMemory(2, 0), Reg(X86Register.Rdx, 4)));
+            Emit(X86Instruction.Branch(X86InstrKind.Jmp, X86Operand.SymbolOperand(divided, 4, X86ObjectRelocationKind.Relative32)));
+
+            _owner.DefineLabel(wideDivisor);
             Emit(X86Instruction.Binary(X86InstrKind.Mov, Reg(X86Register.Rcx, 4), Imm(64)));
             _owner.DefineLabel(loop);
             LoadWideIntegerTemp(0, X86Register.Rax, X86Register.Rdx);
@@ -3595,6 +3637,7 @@ public sealed class X86CodeGenerator
             Emit(X86Instruction.Unary(X86InstrKind.Dec, Reg(X86Register.Rcx, 4)));
             Emit(X86Instruction.ConditionalBranch(X86Condition.Ne, X86Operand.SymbolOperand(loop, 4, X86ObjectRelocationKind.Relative32)));
 
+            _owner.DefineLabel(divided);
             if (wantRemainder)
             {
                 LoadWideIntegerTemp(2, X86Register.Rax, X86Register.Rdx);
@@ -3931,7 +3974,8 @@ public sealed class X86CodeGenerator
                         EmitExactDivide(dst, PointerScale(left.Type), size);
                     break;
                 case "&":
-                    EmitCommutativeBinary(X86InstrKind.And, left, right, dst, instruction, size);
+                    if (!TryEmitWideBitMask(left, right, dst, instruction, size))
+                        EmitCommutativeBinary(X86InstrKind.And, left, right, dst, instruction, size);
                     break;
                 case "|":
                     EmitCommutativeBinary(X86InstrKind.Or, left, right, dst, instruction, size);
@@ -3940,12 +3984,14 @@ public sealed class X86CodeGenerator
                     EmitCommutativeBinary(X86InstrKind.Xor, left, right, dst, instruction, size);
                     break;
                 case "*":
-                    LoadOperandInto(left, dst, instruction, size);
-                    if (LirStrengthReduction.TryGetPowerOfTwoFactor(instruction, _owner._target, out var factorShift))
+                    if (left.Kind != LirOperandKind.Immediate && right.Kind == LirOperandKind.Immediate && right.Immediate is not string &&
+                        FitsSignedInt32(ConvertIntegerConstant(right.Immediate)))
                     {
-                        Emit(X86Instruction.Binary(X86InstrKind.Shl, Reg(dst, size), Imm(factorShift)));
+                        Emit(X86Instruction.Ternary(X86InstrKind.Imul, Reg(dst, size), LoadOperandForIntegerOperation(left, dst, instruction, size),
+                            Imm(ConvertIntegerConstant(right.Immediate))));
                         break;
                     }
+                    LoadOperandInto(left, dst, instruction, size);
                     var multiplier = LoadOperandForRead(right, Scratch1, instruction, size);
                     if (multiplier.Kind == X86OperandKind.Immediate && FitsSignedInt32(multiplier.Immediate))
                         Emit(X86Instruction.Ternary(X86InstrKind.Imul, Reg(dst, size), Reg(dst, size), multiplier));
@@ -4054,10 +4100,23 @@ public sealed class X86CodeGenerator
         /// <summary>Emits the operation as an address computation, which needs no move ahead of it</summary>
         private bool TryEmitLeaBinary(LirInstruction instruction, LirOperand left, LirOperand right, X86Register destination, int size)
         {
-            if (size is not (4 or 8) || instruction.Operator is not ("+" or "-" or "*"))
+            if (size is not (4 or 8) || instruction.Operator is not ("+" or "-" or "*" or "<<"))
                 return false;
             if (!TryGetLeaRegister(left, size, out var baseRegister) || baseRegister == destination)
                 return false;
+
+            if (instruction.Operator == "<<")
+            {
+                if (right.Kind != LirOperandKind.Immediate || right.Immediate is string)
+                    return false;
+                return ConvertIntegerConstant(right.Immediate) switch
+                {
+                    1 => EmitLea(destination, baseRegister, baseRegister, 1, 0, size),
+                    2 => EmitLea(destination, X86Register.Invalid, baseRegister, 4, 0, size),
+                    3 => EmitLea(destination, X86Register.Invalid, baseRegister, 8, 0, size),
+                    _ => false,
+                };
+            }
 
             if (instruction.Operator == "*")
             {
@@ -4065,11 +4124,8 @@ public sealed class X86CodeGenerator
                     return false;
                 return factor switch
                 {
-                    2 => EmitLea(destination, baseRegister, baseRegister, 1, 0, size),
                     3 => EmitLea(destination, baseRegister, baseRegister, 2, 0, size),
-                    4 => EmitLea(destination, X86Register.Invalid, baseRegister, 4, 0, size),
                     5 => EmitLea(destination, baseRegister, baseRegister, 4, 0, size),
-                    8 => EmitLea(destination, X86Register.Invalid, baseRegister, 8, 0, size),
                     9 => EmitLea(destination, baseRegister, baseRegister, 8, 0, size),
                     _ => false,
                 };
@@ -4226,9 +4282,6 @@ public sealed class X86CodeGenerator
                     var second = instructions[i + 1];
                     if (!LirStrengthReduction.IsDivideRemainderPair(first, second))
                         continue;
-                    // A power of two is a shift for each, which is already cheaper than sharing a division
-                    if (LirStrengthReduction.TryGetPowerOfTwoDivisor(first, _owner._target, out _, out _))
-                        continue;
                     if (IsX86WideInteger(first.Result!.Type) || IsX86WideInteger(second.Result!.Type))
                         continue;
                     _divRemPartners.Add(first, second);
@@ -4241,8 +4294,6 @@ public sealed class X86CodeGenerator
         private void EmitDivide(LirInstruction instruction, bool signed, bool wantRemainder)
         {
             _divRemPartners.TryGetValue(instruction, out var partner);
-            if (TryEmitDivideByPowerOfTwo(instruction, signed, wantRemainder))
-                return;
             if (TryEmitDivideByMagic(instruction, signed, wantRemainder, partner))
                 return;
 
@@ -4421,56 +4472,22 @@ public sealed class X86CodeGenerator
             MoveRegister(destination, X86Register.Rdx, size);
         }
 
-        private bool TryEmitDivideByPowerOfTwo(LirInstruction instruction, bool signed, bool wantRemainder)
+        private bool TryEmitWideBitMask(LirOperand left, LirOperand right, X86Register dst, LirInstruction instruction, int size)
         {
-            if (!LirStrengthReduction.TryGetPowerOfTwoDivisor(instruction, _owner._target, out var shift, out var negated))
+            if (size != 8 || left.Kind == LirOperandKind.Immediate || right.Kind != LirOperandKind.Immediate || right.Immediate is string)
                 return false;
 
-            var size = RegisterSize(instruction.Operands[0].Type);
-            var bits = size * 8;
-            var dst = GetWritableRegister(instruction.Result!, Scratch0);
-            LoadOperandInto(instruction.Operands[0], dst, instruction, size);
+            ulong mask = unchecked((ulong)ConvertIntegerConstant(right.Immediate));
+            ulong negated = 0UL - mask;
+            if (FitsSignedInt32(unchecked((long)mask)) || (mask & (mask + 1)) != 0 && (negated & (negated - 1)) != 0)
+                return false;
 
-            if (!signed)
-            {
-                if (wantRemainder)
-                    EmitKeepLowBits(dst, shift, size);
-                else
-                    Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(dst, size), Imm(shift)));
-            }
+            LoadOperandInto(left, dst, instruction, size);
+            if ((mask & (mask + 1)) == 0)
+                EmitKeepLowBits(dst, System.Numerics.BitOperations.TrailingZeroCount(~mask), size);
             else
-            {
-                EmitSignedDivisionBias(dst, shift, bits, size);
-                if (wantRemainder)
-                {
-                    Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(Scratch1, size), Reg(dst, size)));
-                    EmitClearLowBits(Scratch1, shift, size);
-                    Emit(X86Instruction.Binary(X86InstrKind.Sub, Reg(dst, size), Reg(Scratch1, size)));
-                }
-                else
-                {
-                    Emit(X86Instruction.Binary(X86InstrKind.Add, Reg(dst, size), Reg(Scratch1, size)));
-                    Emit(X86Instruction.Binary(X86InstrKind.Sar, Reg(dst, size), Imm(shift)));
-                    if (negated)
-                        Emit(X86Instruction.Unary(X86InstrKind.Neg, Reg(dst, size)));
-                }
-            }
-
-            StoreWritableRegisterIfSpilled(instruction.Result!, dst);
+                EmitClearLowBits(dst, System.Numerics.BitOperations.TrailingZeroCount(mask), size);
             return true;
-        }
-
-        // Leaves 2^shift - 1 in the scratch for a negative dividend and zero otherwise, so the shift truncates toward zero
-        private void EmitSignedDivisionBias(X86Register dividend, int shift, int bits, int size)
-        {
-            MoveRegister(Scratch1, dividend, size);
-            if (shift == 1)
-            {
-                Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(Scratch1, size), Imm(bits - 1)));
-                return;
-            }
-            Emit(X86Instruction.Binary(X86InstrKind.Sar, Reg(Scratch1, size), Imm(bits - 1)));
-            Emit(X86Instruction.Binary(X86InstrKind.Shr, Reg(Scratch1, size), Imm(bits - shift)));
         }
 
         private void EmitKeepLowBits(X86Register register, int shift, int size)

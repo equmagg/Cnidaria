@@ -1,11 +1,17 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Diagnostics.CodeAnalysis;
 
 namespace Cnidaria.C;
 
 internal static class LoopInvariantCodeMotion
 {
+    // Inversion pays for duplicating a short test only in a loop small enough for the test to matter
+    private const int MaxInvertedTestNodes = 24;
+    private const int MaxInvertedLoopNodes = 100;
+    private const int MaxComparedDefinitions = 8;
+
     private static bool Enabled(SsaOptimizationOptions options)
         => options.EnableLoopInvariantCodeMotion && options.MaxLoopHoistsPerLoop > 0 && options.MaxLoopAnalysisWork > 0;
 
@@ -635,6 +641,9 @@ internal static class LoopInvariantCodeMotion
             var unrolled = Unroll(current, options.MaxLoopAnalysisWork, graph.SemanticModel.Compilation.Options.Target);
             if (!ReferenceEquals(unrolled, current.Function))
                 current = ControlFlowFunction.Build(unrolled);
+            GimpleFunctionDefinition inverted = InvertLoops(current, options.MaxLoopAnalysisWork);
+            if (!ReferenceEquals(inverted, current.Function))
+                current = ControlFlowFunction.Build(inverted);
             var rewritten = CreatePreheaders(current, options.MaxLoopAnalysisWork);
             functions.Add(ReferenceEquals(rewritten, current.Function) ? current : ControlFlowFunction.Build(rewritten));
             replacements.Add(flow.Function, rewritten);
@@ -658,6 +667,260 @@ internal static class LoopInvariantCodeMotion
         return graph.WithTrimmedMembers(
             new GimpleTree(tree.SemanticModel, members.ToImmutable(), tree.Diagnostics, tree.HasInliningApplied),
             functions.ToImmutable());
+    }
+
+    // A loop tested on entry runs that test once more ahead of it, so its body becomes a header run on every iteration
+    private static GimpleFunctionDefinition InvertLoops(ControlFlowFunction flow, int budget)
+    {
+        var analysis = new NaturalLoopAnalysis(flow, budget);
+        if (analysis.Remaining <= 0 || flow.Problems.Length != 0)
+            return flow.Function;
+        var guards = new Dictionary<GimpleLabel, (NaturalLoop Loop, GimpleLabel Label)>();
+        // The guard goes where the layout reaches it without a jump, ahead of the body when nothing falls into either
+        var placements = new Dictionary<GimpleLabel, ControlFlowBlock>();
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        var definitions = new Dictionary<GimpleTemporaryValue, GimpleAssignStatement?>();
+        foreach (ControlFlowBlock block in flow.RealBlocks)
+        {
+            names.Add(block.Label!.Name);
+            foreach (GimpleStatement statement in block.Statements)
+            {
+                GimplePlace? defined = statement switch
+                {
+                    GimpleAssignStatement assign => assign.Lhs,
+                    GimpleCallStatement call => call.Lhs,
+                    _ => null,
+                };
+                if (defined is GimpleTemporaryValue temporary)
+                    definitions[temporary] = definitions.ContainsKey(temporary) ? null : statement as GimpleAssignStatement;
+            }
+        }
+        foreach (NaturalLoop loop in analysis.Loops)
+        {
+            if (!CanInvert(flow, loop, definitions, out ControlFlowBlock? placement) || placements.ContainsKey(placement.Label!))
+                continue;
+            string name = loop.Header.Label!.Name + "_guard";
+            while (!names.Add(name))
+                name += "_";
+            guards.Add(loop.Header.Label, (loop, new GimpleLabel(name)));
+            placements.Add(placement.Label!, loop.Header);
+        }
+        if (guards.Count == 0)
+            return flow.Function;
+
+        var blocks = ImmutableArray.CreateBuilder<GimpleBasicBlock>();
+        foreach (ControlFlowBlock block in flow.RealBlocks)
+        {
+            if (placements.TryGetValue(block.Label!, out ControlFlowBlock? header))
+            {
+                (NaturalLoop Loop, GimpleLabel Label) guard = guards[header.Label!];
+                blocks.Add(new GimpleBasicBlock(guard.Label, RedirectStatements(header.Statements, target => Redirect(target, header, guard.Loop))));
+            }
+            ImmutableArray<GimpleStatement> statements = block.Statements;
+            if (statements.Length != 0 && statements[^1].IsTerminator)
+                statements = statements.SetItem(statements.Length - 1, CloneStatement(statements[^1], target => Redirect(target, block, null)));
+            blocks.Add(new GimpleBasicBlock(block.Label!, statements));
+        }
+        GimpleFunctionDefinition function = flow.Function;
+        return new GimpleFunctionDefinition(function.Syntax, function.Symbol, function.Temporaries,
+            blocks.ToImmutable(), function.EntryLabel, function.HasScalarReplacementApplied);
+
+        // An entry from outside a loop reaches its guard, and its own blocks still reach the header
+        GimpleLabel Redirect(GimpleLabel target, ControlFlowBlock position, NaturalLoop? own)
+            => guards.TryGetValue(target, out (NaturalLoop Loop, GimpleLabel Label) destination) && !ReferenceEquals(destination.Loop, own) &&
+               !destination.Loop.Blocks.Contains(position)
+                ? destination.Label
+                : target;
+    }
+
+    private static bool CanInvert(ControlFlowFunction flow, NaturalLoop loop, Dictionary<GimpleTemporaryValue, GimpleAssignStatement?> definitions,
+        [NotNullWhen(true)] out ControlFlowBlock? placement)
+    {
+        placement = null;
+        ControlFlowBlock header = loop.Header;
+        ImmutableArray<GimpleStatement> statements = header.Statements;
+        if (ReferenceEquals(header, flow.Entry) || statements.Length == 0 || statements[^1] is not GimpleCondStatement test ||
+            !flow.TryGetBlock(test.WhenTrue, out ControlFlowBlock? whenTrue) || !flow.TryGetBlock(test.WhenFalse, out ControlFlowBlock? whenFalse) ||
+            whenTrue is null || whenFalse is null || loop.Blocks.Contains(whenTrue) == loop.Blocks.Contains(whenFalse) ||
+            ReferenceEquals(loop.Blocks.Contains(whenTrue) ? whenTrue : whenFalse, header))
+        {
+            return false;
+        }
+        int testNodes = 0;
+        foreach (GimpleStatement statement in statements)
+        {
+            if (statement is not (GimpleAssignStatement or GimpleCondStatement))
+                return false;
+            testNodes += CountNodes(statement);
+        }
+        if (testNodes > MaxInvertedTestNodes)
+            return false;
+
+        var tested = new List<GimpleValue>();
+        foreach (GimpleStatement statement in statements)
+            CollectReads(statement, tested);
+        // A block reading what the test read would have to read it again once the test stops dominating it
+        if (ReadsAny(loop.Blocks.Contains(whenTrue) ? whenFalse : whenTrue, tested, definitions))
+            return false;
+
+        int loopNodes = 0;
+        foreach (ControlFlowBlock block in loop.Blocks)
+        {
+            if (!ReferenceEquals(block, header) && ReadsAny(block, tested, definitions))
+                return false;
+            // A latch that already tests and leaves makes the loop bottom tested
+            if (!ReferenceEquals(block, header) && block.Terminator is GimpleCondStatement exit && block.UniqueSuccessors.Contains(header) &&
+                (!flow.TryGetBlock(exit.WhenTrue, out ControlFlowBlock? first) || first is null || !loop.Blocks.Contains(first) ||
+                 !flow.TryGetBlock(exit.WhenFalse, out ControlFlowBlock? second) || second is null || !loop.Blocks.Contains(second)))
+            {
+                return false;
+            }
+            foreach (GimpleStatement statement in block.Statements)
+                loopNodes += CountNodes(statement);
+            if (loopNodes > MaxInvertedLoopNodes)
+                return false;
+        }
+
+        ControlFlowBlock body = loop.Blocks.Contains(whenTrue) ? whenTrue : whenFalse;
+        ControlFlowBlock? beforeHeader = LayoutPredecessor(flow, header);
+        ControlFlowBlock? beforeBody = LayoutPredecessor(flow, body);
+        if (beforeHeader is not null && beforeHeader.Terminator is null)
+        {
+            // A block of the loop that falls into the header would fall into the guard instead
+            if (loop.Blocks.Contains(beforeHeader))
+                return false;
+            placement = header;
+            return true;
+        }
+        placement = beforeBody is null || beforeBody.Terminator is not null ? body : header;
+        return true;
+    }
+
+    private static void CollectReads(GimpleStatement statement, List<GimpleValue> reads)
+    {
+        switch (statement)
+        {
+            case GimpleAssignStatement assign:
+                foreach (GimpleValue operand in assign.Operands)
+                    CollectReads(operand, reads);
+                break;
+            case GimpleCondStatement branch:
+                CollectReads(branch.Lhs, reads);
+                CollectReads(branch.Rhs, reads);
+                break;
+        }
+    }
+
+    private static void CollectReads(GimpleValue value, List<GimpleValue> reads)
+    {
+        if (value is GimpleIndirectExpression or GimpleMemberAccessExpression or GimpleElementAccessExpression)
+            reads.Add(value);
+    }
+
+    private static bool ReadsAny(ControlFlowBlock block, List<GimpleValue> places, Dictionary<GimpleTemporaryValue, GimpleAssignStatement?> definitions)
+    {
+        if (places.Count == 0)
+            return false;
+        var reads = new List<GimpleValue>();
+        foreach (GimpleStatement statement in block.Statements)
+            CollectReads(statement, reads);
+        foreach (GimpleValue read in reads)
+        {
+            foreach (GimpleValue place in places)
+            {
+                if (SameValue(read, place, definitions, MaxComparedDefinitions))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    // Temporaries made for the same expression compare by what they were computed from
+    private static bool SameValue(GimpleValue left, GimpleValue right, Dictionary<GimpleTemporaryValue, GimpleAssignStatement?> definitions, int depth)
+        => (left, right) switch
+        {
+            (GimpleSymbolValue a, GimpleSymbolValue b) => ReferenceEquals(a.Symbol, b.Symbol),
+            (GimpleTemporaryValue a, GimpleTemporaryValue b) => ReferenceEquals(a, b) ||
+                depth > 0 && definitions.GetValueOrDefault(a) is GimpleAssignStatement first &&
+                definitions.GetValueOrDefault(b) is GimpleAssignStatement second && SameComputation(first, second, definitions, depth - 1),
+            (GimpleConstantValue a, GimpleConstantValue b) => Equals(a.Value, b.Value),
+            (GimpleIndirectExpression a, GimpleIndirectExpression b) => SameValue(a.Address, b.Address, definitions, depth),
+            (GimpleMemberAccessExpression a, GimpleMemberAccessExpression b) =>
+                ReferenceEquals(a.Field, b.Field) && a.ThroughPointer == b.ThroughPointer && SameValue(a.Expression, b.Expression, definitions, depth),
+            (GimpleElementAccessExpression a, GimpleElementAccessExpression b) =>
+                SameValue(a.Expression, b.Expression, definitions, depth) &&
+                (a.Index is null ? b.Index is null : b.Index is not null && SameValue(a.Index, b.Index, definitions, depth)),
+            _ => false,
+        };
+
+    private static bool SameComputation(GimpleAssignStatement left, GimpleAssignStatement right,
+        Dictionary<GimpleTemporaryValue, GimpleAssignStatement?> definitions, int depth)
+    {
+        if (left.Subcode != right.Subcode || left.Operands.Length != right.Operands.Length ||
+            GimpleTypeHelpers.Normalize(left.Lhs.Type).Type.ToDisplayString() != GimpleTypeHelpers.Normalize(right.Lhs.Type).Type.ToDisplayString())
+        {
+            return false;
+        }
+        for (var i = 0; i < left.Operands.Length; i++)
+        {
+            if (!SameValue(left.Operands[i], right.Operands[i], definitions, depth))
+                return false;
+        }
+        return true;
+    }
+
+    private static int CountNodes(GimpleStatement statement)
+    {
+        int nodes = 1;
+        switch (statement)
+        {
+            case GimpleAssignStatement assign:
+                nodes += CountNodes(assign.Lhs);
+                foreach (GimpleValue operand in assign.Operands)
+                    nodes += CountNodes(operand);
+                break;
+            case GimpleCondStatement branch:
+                nodes += CountNodes(branch.Lhs) + CountNodes(branch.Rhs);
+                break;
+            case GimpleCallStatement call:
+                nodes += (call.Lhs is null ? 0 : CountNodes(call.Lhs)) + CountNodes(call.Function);
+                foreach (GimpleValue argument in call.Arguments)
+                    nodes += CountNodes(argument);
+                break;
+            case GimpleReturnStatement @return when @return.Expression is not null:
+                nodes += CountNodes(@return.Expression);
+                break;
+            case GimpleSwitchStatement dispatch:
+                nodes += CountNodes(dispatch.Expression);
+                break;
+        }
+        return nodes;
+    }
+
+    private static int CountNodes(GimpleValue value)
+        => value switch
+        {
+            GimpleMemberAccessExpression member => 1 + CountNodes(member.Expression),
+            GimpleElementAccessExpression element => 1 + CountNodes(element.Expression) + (element.Index is null ? 0 : CountNodes(element.Index)),
+            GimpleIndirectExpression indirect => 1 + CountNodes(indirect.Address),
+            GimpleAddressOfExpression address => 1 + CountNodes(address.Target),
+            GimpleUnaryExpression unary => 1 + CountNodes(unary.Operand),
+            GimpleBinaryExpression binary => 1 + CountNodes(binary.Left) + CountNodes(binary.Right),
+            GimpleConversionExpression conversion => 1 + CountNodes(conversion.Operand),
+            GimpleCastExpression cast => 1 + CountNodes(cast.Operand),
+            _ => 1,
+        };
+
+    private static ControlFlowBlock? LayoutPredecessor(ControlFlowFunction flow, ControlFlowBlock target)
+    {
+        ControlFlowBlock? previous = null;
+        foreach (ControlFlowBlock block in flow.RealBlocks)
+        {
+            if (ReferenceEquals(block, target))
+                return previous;
+            previous = block;
+        }
+        return null;
     }
 
     private static GimpleFunctionDefinition CreatePreheaders(ControlFlowFunction flow, int budget)
@@ -745,6 +1008,10 @@ internal static class LoopInvariantCodeMotion
         private readonly Dictionary<GimpleName, ControlFlowBlock?> _locations = new();
         private readonly Dictionary<GimpleName, GimpleStatementAnnotations> _instructions = new();
         private readonly Dictionary<GimpleStatement, ControlFlowBlock> _instructionBlocks = new();
+        private readonly Dictionary<GimpleStatementAnnotations, GimpleName> _entryMemory = new();
+        private readonly List<GimpleStatementAnnotations> _loopStores = new();
+        private GimpleName? _loopEntryMemory;
+        private bool _loopCalls;
         private bool _changed;
 
         public Hoister(GimpleFunctionAnnotations function, TargetInfo target, SsaOptimizationOptions options,
@@ -785,6 +1052,8 @@ internal static class LoopInvariantCodeMotion
         {
             bool writesMemory = false;
             bool containsCall = false;
+            _loopStores.Clear();
+            _loopEntryMemory = EntryMemory(loop);
             var live = new HashSet<GimpleName>();
             var useCounts = new Dictionary<GimpleName, int>();
             foreach (var block in loop.Blocks)
@@ -814,6 +1083,8 @@ internal static class LoopInvariantCodeMotion
                         return;
                     writesMemory |= (instruction.Flags & GimpleStatementFlags.WritesMemory) != 0;
                     containsCall |= (instruction.Flags & GimpleStatementFlags.ContainsCall) != 0;
+                    if ((instruction.Flags & GimpleStatementFlags.WritesMemory) != 0)
+                        _loopStores.Add(instruction);
                     foreach (var use in instruction.Uses)
                     {
                         if (!_analysis.Spend())
@@ -826,6 +1097,7 @@ internal static class LoopInvariantCodeMotion
                 }
             }
 
+            _loopCalls = containsCall;
             int hoists = 0;
             int livePressure = RegisterPressure(live);
             int temporaryPressure = EstimateTemporaryPressure(loop, live);
@@ -859,6 +1131,8 @@ internal static class LoopInvariantCodeMotion
                                 int insertion = destination.Count > 0 && destination[^1].Statement.IsTerminator
                                     ? destination.Count - 1 : destination.Count;
                                 destination.Insert(insertion, candidate);
+                                if (candidate.MemoryInput is GimpleName input && DefinedInLoop(input, loop) && _loopEntryMemory is not null)
+                                    _entryMemory[candidate] = _loopEntryMemory;
                                 _locations[candidate.Definitions[0].Name] = loop.Preheader;
                                 _instructionBlocks[candidate.Statement] = loop.Preheader!;
                                 moved.Add(candidate);
@@ -891,6 +1165,73 @@ internal static class LoopInvariantCodeMotion
                 }
             }
         }
+
+        private GimpleName? EntryMemory(NaturalLoop loop)
+        {
+            if (loop.Preheader is null || !_function.TryGetBlock(loop.Header, out GimpleBlockAnnotations? header) || header is null)
+                return null;
+            foreach (GimplePhi phi in header.Phis)
+            {
+                if (!ReferenceEquals(phi.Variable, _function.MemoryVariable))
+                    continue;
+                foreach (GimplePhiOperand operand in phi.Operands)
+                {
+                    if (ReferenceEquals(operand.Predecessor, loop.Preheader))
+                        return operand.Value;
+                }
+            }
+            return null;
+        }
+
+        private bool DefinedInLoop(GimpleName name, NaturalLoop loop)
+            => _locations.TryGetValue(name, out ControlFlowBlock? block) && block is not null && loop.Blocks.Contains(block);
+
+        // A load keeps its value through the loop when no call runs in it and no store in it writes what the load reads
+        private bool SurvivesLoop(GimpleStatementAnnotations load)
+        {
+            if (_loopCalls || _loopEntryMemory is null || load.MemoryInput is null)
+                return false;
+            foreach (GimpleStatementAnnotations store in _loopStores)
+            {
+                if (store.MemoryOutput is not GimpleName output)
+                    return false;
+                foreach (GimpleOperandInfo operand in load.Operands)
+                {
+                    if (!ReadsApart(operand, output))
+                        return false;
+                }
+            }
+            return true;
+        }
+
+        private bool ReadsApart(GimpleOperandInfo node, GimpleName storedMemory)
+        {
+            if (!node.ReadsMemory)
+                return true;
+            if (node.Original is GimplePlace && !node.IsAddress)
+                return !_function.ValueNumbering.MayOverlap(storedMemory, node);
+            foreach (GimpleOperandInfo child in node.Children)
+            {
+                if (!ReadsApart(child, storedMemory))
+                    return false;
+            }
+            return true;
+        }
+
+        private static bool ReadsOnlyDeclaredObjects(GimpleStatementAnnotations instruction)
+        {
+            foreach (GimpleOperandInfo operand in instruction.Operands)
+            {
+                if (operand.ReadsMemory && !CannotTrap(operand))
+                    return false;
+            }
+            return true;
+        }
+
+        // A declared object read directly, or a member of one, is always there to read
+        private static bool CannotTrap(GimpleOperandInfo node)
+            => node.Original is GimpleSymbolValue ||
+               node.Original is GimpleMemberAccessExpression member && !member.ThroughPointer && node.Children.Length == 1 && CannotTrap(node.Children[0]);
 
         private static void CountUse(GimpleName name, Dictionary<GimpleName, int> counts)
         {
@@ -1006,7 +1347,7 @@ internal static class LoopInvariantCodeMotion
                     !Classify(instruction, out bool speculative, out int instructionCost) ||
                     depth != 0 && !speculative ||
                     (instruction.Flags & GimpleStatementFlags.ReadsMemory) != 0 &&
-                        (writesMemory || instruction.MemoryInput is null))
+                        (instruction.MemoryInput is null || writesMemory && !SurvivesLoop(instruction)))
                     return false;
                 var name = instruction.Definitions[0].Name;
                 if (planned.Contains(name))
@@ -1015,6 +1356,8 @@ internal static class LoopInvariantCodeMotion
                     return false;
                 foreach (var use in instruction.Uses)
                 {
+                    if (use.Kind == GimpleUseKind.Memory)
+                        continue;
                     if (!_analysis.Spend() || use.Name.IsUndefined || !_locations.TryGetValue(use.Name, out var definition))
                         return false;
                     if (definition is null || _analysis.Dominates(definition, loop.Preheader!))
@@ -1070,10 +1413,14 @@ internal static class LoopInvariantCodeMotion
             if (_analysis.Remaining <= 0)
                 return false;
             int growth = RegisterPressure(carried) - RegisterPressure(released);
-            if (cost < MinimumHoistCost)
-                return (root.Flags & GimpleStatementFlags.ReadsMemory) != 0 && growth <= 0;
-            return growth <= 0 || !containsCall &&
-                livePressure + temporaryPressure + growth <= Math.Max(1, _registers - 2);
+            if (cost == 0)
+                return false;
+            if (growth <= 0)
+                return true;
+            // A cheap value earns a register only while the loop leaves registers free, a load or an expensive one may take one of the last
+            bool reads = plan.Exists(static instruction => (instruction.Flags & GimpleStatementFlags.ReadsMemory) != 0);
+            int reserve = cost < MinimumHoistCost && !reads ? _registers / 2 : 2;
+            return !containsCall && livePressure + temporaryPressure + growth <= Math.Max(1, _registers - reserve);
         }
 
         private bool UsedBeyondLoop(GimpleName name, NaturalLoop loop)
@@ -1108,7 +1455,7 @@ internal static class LoopInvariantCodeMotion
                     return false;
             }
             bool load = (instruction.Flags & GimpleStatementFlags.ReadsMemory) != 0;
-            speculative &= !load;
+            speculative &= !load || ReadsOnlyDeclaredObjects(instruction);
             cost = load ? 1 : assign.Subcode switch
             {
                 GimpleTreeCode.TruncDivExpr or GimpleTreeCode.TruncModExpr or GimpleTreeCode.ExactDivExpr => 12,
@@ -1130,9 +1477,9 @@ internal static class LoopInvariantCodeMotion
                 if (!ClassifyCode(GimpleOperators.CodeOf(operand.Original), out bool safe))
                     return false;
                 if (!operand.IsAddress)
-                    speculative &= safe;
+                    speculative &= safe || CannotTrap(operand);
             }
-            speculative &= !operand.ReadsMemory;
+            speculative &= !operand.ReadsMemory || CannotTrap(operand);
             foreach (var child in operand.Children)
             {
                 if (!ClassifyOperand(child, ref speculative))
@@ -1229,13 +1576,14 @@ internal static class LoopInvariantCodeMotion
                         var moved = new GimpleDefinition(definition.Name, definition.Kind, block.ControlFlowBlock,
                             definition.Statement, definition.Target, definition.Parameter);
                         replacements[definition.Name] = moved;
+                        GimpleName? memory = _entryMemory.TryGetValue(instruction, out GimpleName? entry) ? entry : instruction.MemoryInput;
                         var movedUses = ImmutableArray.CreateBuilder<GimpleUse>(instruction.Uses.Length);
                         foreach (var use in instruction.Uses)
-                            movedUses.Add(new GimpleUse(use.Name, use.Kind, block.ControlFlowBlock,
-                                use.Statement, use.Value, use.Edge));
+                            movedUses.Add(new GimpleUse(use.Kind == GimpleUseKind.Memory && memory is not null ? memory : use.Name, use.Kind,
+                                block.ControlFlowBlock, use.Statement, use.Value, use.Edge));
                         rewritten = new GimpleStatementAnnotations(instruction.Ordinal, block.ControlFlowBlock,
                             instruction.Statement, instruction.InputStatement, instruction.Operands, movedUses.ToImmutable(),
-                            ImmutableArray.Create(moved), instruction.MemoryInput, instruction.MemoryOutput, instruction.Flags);
+                            ImmutableArray.Create(moved), memory, instruction.MemoryOutput, instruction.Flags);
                     }
                     statements.Add(rewritten);
                     uses.AddRange(rewritten.Uses);

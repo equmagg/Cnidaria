@@ -111,6 +111,19 @@ namespace Cnidaria.Cs
             if (!SimdTypes.TargetSupports(target, simdSize))
                 return false;
 
+            if (target.Architecture == TargetArchitectureKind.Arm64)
+            {
+                bool floatingKind = IsFloating(baseKind);
+                return id switch
+                {
+                    HWIntrinsicId.Divide or HWIntrinsicId.Sqrt or HWIntrinsicId.Floor or HWIntrinsicId.Ceiling => floatingKind,
+                    HWIntrinsicId.Multiply => floatingKind || ElementSize(baseKind) != 8,
+                    HWIntrinsicId.AddSaturate or HWIntrinsicId.SubtractSaturate or
+                    HWIntrinsicId.ShiftLeft or HWIntrinsicId.ShiftRightArithmetic or HWIntrinsicId.ShiftRightLogical => !floatingKind,
+                    _ => true,
+                };
+            }
+
             if (target.IsRiscV)
             {
                 return id switch
@@ -146,6 +159,9 @@ namespace Cnidaria.Cs
 
         public static bool IsContainableOperand(GenTree node, int operandIndex, GenTree operand)
         {
+            if (ArmIntrinsics.IsArm(node))
+                return ArmIntrinsics.IsImmediateOperand(node, operandIndex) && ArmIntrinsics.IsConstantImmediate(node, operandIndex);
+
             if (X86Intrinsics.IsX86(node))
             {
                 return operand.Kind == GenTreeKind.ConstI4 &&
@@ -182,15 +198,17 @@ namespace Cnidaria.Cs
         }
 
         public static bool TouchesMemory(GenTree node)
-            => X86Intrinsics.IsX86(node) && X86Intrinsics.TouchesMemory(node);
+            => X86Intrinsics.IsX86(node) ? X86Intrinsics.TouchesMemory(node) : ArmIntrinsics.IsArm(node) && ArmIntrinsics.TouchesMemory(node);
 
         public static GenTreeFlags EffectFlags(GenTree node)
-            => X86Intrinsics.IsX86(node) ? X86Intrinsics.EffectFlags(node) : GenTreeFlags.None;
+            => X86Intrinsics.IsX86(node) ? X86Intrinsics.EffectFlags(node)
+                : ArmIntrinsics.IsArm(node) ? ArmIntrinsics.EffectFlags(node) : GenTreeFlags.None;
 
         public static long ValueNumberKey(int id, long info) => ((long)id << 32) | info;
 
         public static string Format(GenTree node)
-            => X86Intrinsics.IsX86(node) ? X86Intrinsics.Format(node) : $"{Id(node)}<{BaseKind(node)}x{SimdSize(node)}>";
+            => X86Intrinsics.IsX86(node) ? X86Intrinsics.Format(node)
+                : ArmIntrinsics.IsArm(node) ? ArmIntrinsics.Format(node) : $"{Id(node)}<{BaseKind(node)}x{SimdSize(node)}>";
     }
     internal static class SimdTypes
     {
@@ -222,6 +240,7 @@ namespace Cnidaria.Cs
         public static bool TargetSupports(TargetInfo? target, int size)
             => target is not null && (target.Architecture == TargetArchitectureKind.RiscV64 &&
                 HWIntrinsics.HasFeature(target, TargetArchitectureFeatures.RiscVV) && size is 8 or 12 or 16 or 32 or 64 ||
+                target.Architecture == TargetArchitectureKind.Arm64 && size is 8 or 12 or 16 ||
                 target.Architecture == TargetArchitectureKind.X86_64 && size switch
             {
                 8 or 12 or 16 => true,
@@ -242,12 +261,15 @@ namespace Cnidaria.Cs
                 return KindForSize(numericsSize);
             if (type.GenericTypeArguments.Length != 1)
                 return GenStackKind.Unknown;
-            int size = target.IsRiscV && type.GenericTypeDefinition is RuntimeType definition &&
+            int size = HasFixedNumericsVector(target) && type.GenericTypeDefinition is RuntimeType definition &&
                 definition.Namespace == "System.Numerics" && definition.Name == "Vector`1" ? 16 : DefinitionSize(type);
             if (size == 0 || !TargetSupports(target, size) || !IsSupportedElement(type.GenericTypeArguments[0]))
                 return GenStackKind.Unknown;
             return KindForSize(size);
         }
+
+        public static bool HasFixedNumericsVector(TargetInfo target)
+            => target.IsRiscV || target.Architecture == TargetArchitectureKind.Arm64;
 
         public static bool IsSimdType(RuntimeType? type, TargetInfo? target)
             => KindOf(type, target) != GenStackKind.Unknown;

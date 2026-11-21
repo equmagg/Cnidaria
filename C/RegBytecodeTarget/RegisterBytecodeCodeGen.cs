@@ -940,7 +940,8 @@ public sealed class RegisterBytecodeCodeGenerator
         _assembler.BeginMethod(methodId, GetMethodEntryLabel(methodId), -1, ToStackFrameLayout(allocation.Frame));
         context.EmitPrologue();
         context.EmitBlocks();
-        context.EmitImplicitFallthroughTrap();
+        if (!_assembler.EndsWithoutFallthrough)
+            context.EmitImplicitFallthroughTrap();
         _assembler.EndMethod();
     }
 
@@ -1325,7 +1326,6 @@ public sealed class RegisterBytecodeCodeGenerator
                     break;
 
                 case LirInstructionKind.Unreachable:
-                    _asm.Trap(1);
                     break;
 
                 default:
@@ -1535,13 +1535,6 @@ public sealed class RegisterBytecodeCodeGenerator
             var usesFloatingOperands = IsFloatType(leftType) || IsFloatType(rightType) || IsFloatType(resultType);
             var dst = GetWritableRegister(instruction.Result, GpScratch0, FpScratch0);
             var op = SelectBinaryOp(instruction.Operator, leftType, rightType, resultType);
-            if (!usesFloatingOperands && TryEmitPowerOfTwoImmediate(instruction, dst))
-            {
-                NormalizeNarrowResult(dst, instruction);
-                StoreWritableRegisterIfSpilled(instruction.Result, dst);
-                return;
-            }
-
             if (!usesFloatingOperands && TryEmitBinaryImmediate(instruction, dst, op))
             {
                 NormalizeNarrowResult(dst, instruction);
@@ -1600,36 +1593,6 @@ public sealed class RegisterBytecodeCodeGenerator
             var integerSource = LoadOperand(operand, generalScratch);
             EmitFloatConversion(floatScratch, integerSource, operand.Type, floatType, instruction);
             return floatScratch;
-        }
-
-        // One dispatch either way, so only a reduction that stays a single instruction pays off here
-        private bool TryEmitPowerOfTwoImmediate(LirInstruction instruction, MachineRegister destination)
-        {
-            var is64 = Is64BitInteger(instruction.Operands[0].Type) || Is64BitInteger(instruction.Operands[1].Type);
-            Op immediateOp;
-            long immediate;
-
-            if (LirStrengthReduction.TryGetPowerOfTwoFactor(instruction, _owner._target, out var factorShift))
-            {
-                immediateOp = is64 ? Op.I64ShlImm : Op.I32ShlImm;
-                immediate = factorShift;
-            }
-            else if (IsUnsignedInteger(instruction.Operands[0].Type) &&
-                LirStrengthReduction.TryGetPowerOfTwoDivisor(instruction, _owner._target, out var shift, out _))
-            {
-                var wantRemainder = instruction.Operator == "%";
-                immediateOp = wantRemainder
-                    ? (is64 ? Op.I64AndImm : Op.I32AndImm)
-                    : (is64 ? Op.U64ShrImm : Op.U32ShrImm);
-                immediate = wantRemainder ? (1L << shift) - 1 : shift;
-            }
-            else
-            {
-                return false;
-            }
-
-            EmitI64Imm(immediateOp, destination, LoadOperand(instruction.Operands[0], GpScratch1), immediate);
-            return true;
         }
 
         private bool TryEmitBinaryImmediate(LirInstruction instruction, MachineRegister destination, Op binaryOp)

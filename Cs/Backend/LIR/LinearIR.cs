@@ -622,6 +622,7 @@ namespace Cnidaria.Cs
         private static bool ThrowsWithoutReturningCall(GenTree source)
             => source.Kind switch
             {
+                GenTreeKind.HWIntrinsic => source.CanThrow,
                 GenTreeKind.Field or GenTreeKind.FieldAddr or GenTreeKind.StoreField or
                 GenTreeKind.StaticField or GenTreeKind.StaticFieldAddr or GenTreeKind.StoreStaticField or
                 GenTreeKind.LoadIndirect or GenTreeKind.StoreIndirect or GenTreeKind.NullCheck or
@@ -676,6 +677,12 @@ namespace Cnidaria.Cs
 
             if (source.Kind == GenTreeKind.Conv && (source.ConvFlags & NumericConvFlags.Checked) != 0)
                 return true;
+
+            if (source.Kind == GenTreeKind.HWIntrinsic && target.IsArm && ArmIntrinsics.IsArm(source) && ArmIntrinsics.HasVariableImmediate(source) &&
+                !ArmIntrinsics.UsesRegisterShift(source))
+            {
+                return true;
+            }
 
             if (source.Kind is
                 GenTreeKind.Field or GenTreeKind.FieldAddr or GenTreeKind.StoreField or
@@ -857,6 +864,43 @@ namespace Cnidaria.Cs
                     return false;
             }
         }
+
+        // A temp that must differ from the result is requested twice
+        internal static int ArmHWIntrinsicFloatTemps(GenTree node)
+        {
+            if (ArmIntrinsics.IsArm(node))
+                return ArmIntrinsics.UsesRegisterShift(node) ? 2 : 0;
+
+            RuntimePrimitiveKind kind = HWIntrinsics.BaseKind(node);
+            bool floating = HWIntrinsics.IsFloating(kind);
+            switch (HWIntrinsics.Id(node))
+            {
+                case HWIntrinsicId.Min:
+                case HWIntrinsicId.Max:
+                    return !floating && HWIntrinsics.ElementSize(kind) == 8 ? 2 : 0;
+                case HWIntrinsicId.ShiftLeft:
+                case HWIntrinsicId.ShiftRightArithmetic:
+                case HWIntrinsicId.ShiftRightLogical:
+                    return node.Operands[1].Kind == GenTreeKind.ConstI4 ? 0 : 2;
+                case HWIntrinsicId.EqualsAll:
+                case HWIntrinsicId.EqualsAny:
+                    return 1;
+                case HWIntrinsicId.ExtractMostSignificantBits:
+                    return 2;
+                case HWIntrinsicId.Sum:
+                    return floating ? HWIntrinsics.SimdSize(node) == 12 ? 2 : 0 : 1;
+                default:
+                    return 0;
+            }
+        }
+
+        internal static bool ArmHWIntrinsicDelaysFree(GenTree node, int operandIndex)
+            => ArmIntrinsics.IsArm(node) ? operandIndex != 0 && ArmIntrinsics.IsReadModifyWrite(node) : HWIntrinsics.Id(node) switch
+            {
+                HWIntrinsicId.CreateElements => operandIndex != 0 && HWIntrinsics.IsFloating(HWIntrinsics.BaseKind(node)),
+                HWIntrinsicId.WithElement => operandIndex == 2 && HWIntrinsics.IsFloating(HWIntrinsics.BaseKind(node)),
+                _ => false,
+            };
 
         internal static byte RiscVHWIntrinsicVectorTemps(GenTree node)
             => HWIntrinsics.Id(node) switch
@@ -1079,6 +1123,7 @@ namespace Cnidaria.Cs
             int count = source.Kind switch
             {
                 GenTreeKind.HWIntrinsic when _target.IsX86 => X86HWIntrinsicFloatTemps(source, _target),
+                GenTreeKind.HWIntrinsic when _target.IsArm => ArmHWIntrinsicFloatTemps(source),
                 GenTreeKind.ArrayElement => MultiRegisterLoadFloatScratchCount(result),
                 GenTreeKind.UnboxAny => MultiRegisterLoadFloatScratchCount(result),
                 GenTreeKind.Field => MultiRegisterLoadFloatScratchCount(result),

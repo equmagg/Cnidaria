@@ -951,25 +951,12 @@ static int build_user_stack(u64 root, struct elf_image* image, struct exec_argum
 
 static u64 align_down(u64 value, u64 alignment)
 {
-    __asm__ volatile(
-        "addi %[alignment], %[alignment], -1\n"
-        "andn %[value], %[value], %[alignment]"
-        : [value] "+{a0}"(value), [alignment] "+{a1}"(alignment)
-        :
-        : );
-    return value;
+    return value & ~(alignment - 1ul);
 }
 
 static u64 align_up(u64 value, u64 alignment)
 {
-    __asm__ volatile(
-        "addi %[alignment], %[alignment], -1\n"
-        "add %[value], %[value], %[alignment]\n"
-        "andn %[value], %[value], %[alignment]"
-        : [value] "+{a0}"(value), [alignment] "+{a1}"(alignment)
-        :
-        : );
-    return value;
+    return (value + alignment - 1ul) & ~(alignment - 1ul);
 }
 
 static void fence_rw(void)
@@ -979,21 +966,12 @@ static void fence_rw(void)
 
 static u8 mmio_read8(u64 address)
 {
-    __asm__ volatile(
-        "lbu %[address], 0(%[address])"
-        : [address] "+{a0}"(address)
-        :
-        : "memory");
-    return (u8)address;
+    return *(volatile const u8*)address;
 }
 
 static void mmio_write8(u64 address, u8 value)
 {
-    __asm__ volatile(
-        "sb %[value], 0(%[address])"
-        :
-    : [address] "{a0}"(address), [value] "{a1}"((u64)value)
-        : "memory");
+    *(volatile u8*)address = value;
 }
 
 static void sbi_putchar(int ch)
@@ -1017,79 +995,36 @@ static void fbcon_end(void);
 
 static int uart_can_read(void)
 {
-    u64 value = boot_device.uart_base;
-    __asm__ volatile(
-        "lbu a1, 5(%[value])\n"
-        "andi %[value], a1, 1"
-        : [value] "+{a0}"(value)
-        :
-        : "memory");
-    return (int)value;
+    return mmio_read8(boot_device.uart_base + 5ul) & 1;
 }
 
 static int uart_try_read(void)
 {
-    u64 value = boot_device.uart_base;
-    __asm__ volatile(
-        "lbu a1, 5(%[value])\n"
-        "andi a1, a1, 1\n"
-        "beq a1, zero, .Luart_try_read_empty_%=\n"
-        "lbu %[value], 0(%[value])\n"
-        "jal zero, .Luart_try_read_done_%=\n"
-        ".Luart_try_read_empty_%=:\n"
-        "addi %[value], zero, -1\n"
-        ".Luart_try_read_done_%=:"
-        : [value] "+{a0}"(value)
-        :
-        : "memory");
-    return (int)value;
+    u64 base = boot_device.uart_base;
+    if ((mmio_read8(base + 5ul) & 1u) == 0u)
+        return -1;
+    return mmio_read8(base);
 }
 
 static void uart_putchar(int ch)
 {
     u64 base = boot_device.uart_base;
-    u64 value = (u64)(u8)ch;
-    __asm__ volatile(
-        ".Luart_putchar_wait_%=:\n"
-        "lbu a2, 5(%[base])\n"
-        "andi a2, a2, 32\n"
-        "beq a2, zero, .Luart_putchar_wait_%=\n"
-        "sb %[value], 0(%[base])"
-        :
-    : [base] "{a0}"(base), [value] "{a1}"(value)
-        : "memory");
+    while ((mmio_read8(base + 5ul) & 32u) == 0u)
+    {
+    }
+    mmio_write8(base, (u8)ch);
 }
 
 // What a program writes reaches the screen as well; what the kernel says stays on the serial line
 static void uart_write_buffer(const u8* data, u64 count)
 {
-    u64 base = boot_device.uart_base;
     fbcon_write(data, count);
-    __asm__ volatile(
-        "beq %[count], zero, .Luart_write_done_%=\n"
-        ".Luart_write_next_%=:\n"
-        "lbu a3, 0(%[data])\n"
-        "addi %[data], %[data], 1\n"
-        "addi %[count], %[count], -1\n"
-        "addi a4, zero, 10\n"
-        "bne a3, a4, .Luart_write_char_%=\n"
-        ".Luart_write_cr_wait_%=:\n"
-        "lbu a4, 5(%[base])\n"
-        "andi a4, a4, 32\n"
-        "beq a4, zero, .Luart_write_cr_wait_%=\n"
-        "addi a4, zero, 13\n"
-        "sb a4, 0(%[base])\n"
-        ".Luart_write_char_%=:\n"
-        ".Luart_write_char_wait_%=:\n"
-        "lbu a4, 5(%[base])\n"
-        "andi a4, a4, 32\n"
-        "beq a4, zero, .Luart_write_char_wait_%=\n"
-        "sb a3, 0(%[base])\n"
-        "bne %[count], zero, .Luart_write_next_%=\n"
-        ".Luart_write_done_%=:"
-        :
-    : [data] "{a0}"(data), [count] "{a1}"(count), [base] "{a2}"(base)
-        : "memory");
+    for (u64 i = 0; i < count; i++)
+    {
+        if (data[i] == 10u)
+            uart_putchar(13);
+        uart_putchar(data[i]);
+    }
 }
 
 static void console_putchar_raw(int ch)
@@ -2119,137 +2054,40 @@ static void fbcon_write(const u8* data, u64 count)
 
 static u16 le16(const u8* p)
 {
-    u64 value = (u64)p;
-    __asm__ volatile(
-        "lbu a1, 0(%[value])\n"
-        "lbu a2, 1(%[value])\n"
-        "slli a2, a2, 8\n"
-        "or %[value], a1, a2"
-        : [value] "+{a0}"(value)
-        :
-        : "memory");
-    return (u16)value;
+    return (u16)((u32)p[0] | (u32)p[1] << 8);
 }
 
 static u32 le32(const u8* p)
 {
-    u64 value = (u64)p;
-    __asm__ volatile(
-        "lbu a1, 0(%[value])\n"
-        "lbu a2, 1(%[value])\n"
-        "lbu a3, 2(%[value])\n"
-        "lbu a4, 3(%[value])\n"
-        "slli a2, a2, 8\n"
-        "slli a3, a3, 16\n"
-        "slli a4, a4, 24\n"
-        "or a1, a1, a2\n"
-        "or a3, a3, a4\n"
-        "or %[value], a1, a3"
-        : [value] "+{a0}"(value)
-        :
-        : "memory");
-    return (u32)value;
+    return (u32)p[0] | (u32)p[1] << 8 | (u32)p[2] << 16 | (u32)p[3] << 24;
 }
 
 static u64 le64(const u8* p)
 {
-    u64 value = (u64)p;
-    __asm__ volatile(
-        "lbu a1, 0(%[value])\n"
-        "lbu a2, 1(%[value])\n"
-        "lbu a3, 2(%[value])\n"
-        "lbu a4, 3(%[value])\n"
-        "lbu a5, 4(%[value])\n"
-        "lbu a6, 5(%[value])\n"
-        "lbu t0, 6(%[value])\n"
-        "lbu t1, 7(%[value])\n"
-        "slli a2, a2, 8\n"
-        "slli a3, a3, 16\n"
-        "slli a4, a4, 24\n"
-        "slli a5, a5, 32\n"
-        "slli a6, a6, 40\n"
-        "slli t0, t0, 48\n"
-        "slli t1, t1, 56\n"
-        "or a1, a1, a2\n"
-        "or a3, a3, a4\n"
-        "or a5, a5, a6\n"
-        "or t0, t0, t1\n"
-        "or a1, a1, a3\n"
-        "or a5, a5, t0\n"
-        "or %[value], a1, a5"
-        : [value] "+{a0}"(value)
-        :
-        : "memory");
-    return value;
+    return (u64)le32(p) | (u64)le32(p + 4) << 32;
 }
 
 static u32 be32(const u8* p)
 {
-    u64 value = (u64)p;
-    __asm__ volatile(
-        "lbu a1, 0(%[value])\n"
-        "lbu a2, 1(%[value])\n"
-        "lbu a3, 2(%[value])\n"
-        "lbu a4, 3(%[value])\n"
-        "slli a1, a1, 24\n"
-        "slli a2, a2, 16\n"
-        "slli a3, a3, 8\n"
-        "or a1, a1, a2\n"
-        "or a3, a3, a4\n"
-        "or %[value], a1, a3"
-        : [value] "+{a0}"(value)
-        :
-        : "memory");
-    return (u32)value;
+    return (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | (u32)p[3];
 }
 
 static void store_le16(u8* p, u16 value)
 {
-    __asm__ volatile(
-        "sb %[value], 0(%[p])\n"
-        "srli %[value], %[value], 8\n"
-        "sb %[value], 1(%[p])"
-        :
-    : [p] "{a0}"(p), [value] "{a1}"((u64)value)
-        : "memory");
+    p[0] = (u8)value;
+    p[1] = (u8)(value >> 8);
 }
 
 static void store_le32(u8* p, u32 value)
 {
-    __asm__ volatile(
-        "sb %[value], 0(%[p])\n"
-        "srli %[value], %[value], 8\n"
-        "sb %[value], 1(%[p])\n"
-        "srli %[value], %[value], 8\n"
-        "sb %[value], 2(%[p])\n"
-        "srli %[value], %[value], 8\n"
-        "sb %[value], 3(%[p])"
-        :
-    : [p] "{a0}"(p), [value] "{a1}"((u64)value)
-        : "memory");
+    store_le16(p, (u16)value);
+    store_le16(p + 2, (u16)(value >> 16));
 }
 
 static void store_le64(u8* p, u64 value)
 {
-    __asm__ volatile(
-        "sb %[value], 0(%[p])\n"
-        "srli %[value], %[value], 8\n"
-        "sb %[value], 1(%[p])\n"
-        "srli %[value], %[value], 8\n"
-        "sb %[value], 2(%[p])\n"
-        "srli %[value], %[value], 8\n"
-        "sb %[value], 3(%[p])\n"
-        "srli %[value], %[value], 8\n"
-        "sb %[value], 4(%[p])\n"
-        "srli %[value], %[value], 8\n"
-        "sb %[value], 5(%[p])\n"
-        "srli %[value], %[value], 8\n"
-        "sb %[value], 6(%[p])\n"
-        "srli %[value], %[value], 8\n"
-        "sb %[value], 7(%[p])"
-        :
-    : [p] "{a0}"(p), [value] "{a1}"(value)
-        : "memory");
+    store_le32(p, (u32)value);
+    store_le32(p + 4, (u32)(value >> 32));
 }
 
 static u64 be_cell(const u8* p, u32 cells)
@@ -2266,33 +2104,17 @@ static u64 be_cell(const u8* p, u32 cells)
 
 static u32 mmio_read32(u64 base, u32 offset)
 {
-    u64 address = base + (u64)offset;
-    __asm__ volatile(
-        "lwu %[address], 0(%[address])"
-        : [address] "+{a0}"(address)
-        :
-        : "memory");
-    return (u32)address;
+    return *(volatile const u32*)(base + (u64)offset);
 }
 
 static void mmio_write32(u64 base, u32 offset, u32 value)
 {
-    u64 address = base + (u64)offset;
-    __asm__ volatile(
-        "sw %[value], 0(%[address])"
-        :
-    : [address] "{a0}"(address), [value] "{a1}"((u64)value)
-        : "memory");
+    *(volatile u32*)(base + (u64)offset) = value;
 }
 
 static u64 mmio_read64(u64 address)
 {
-    __asm__ volatile(
-        "ld %[address], 0(%[address])"
-        : [address] "+{a0}"(address)
-        :
-        : "memory");
-    return address;
+    return *(volatile const u64*)address;
 }
 
 static u64 ram_end(void)
@@ -2457,15 +2279,7 @@ static void user_page_put(u64 physical)
 
 static u64 pte_make(u64 physical, u64 flags)
 {
-    __asm__ volatile(
-        "srli %[physical], %[physical], 12\n"
-        "slli %[physical], %[physical], 10\n"
-        "or %[physical], %[physical], %[flags]\n"
-        "ori %[physical], %[physical], 1"
-        : [physical] "+{a0}"(physical)
-        : [flags] "{a1}"(flags)
-        : );
-    return physical;
+    return physical >> 12 << 10 | flags | PTE_V;
 }
 
 static u64 pte_make_noaccess(u64 physical)
@@ -2475,28 +2289,12 @@ static u64 pte_make_noaccess(u64 physical)
 
 static u64 pte_physical(u64 pte)
 {
-    __asm__ volatile(
-        "srli %[pte], %[pte], 10\n"
-        "slli %[pte], %[pte], 12"
-        : [pte] "+{a0}"(pte)
-        :
-        : );
-    return pte;
+    return pte >> 10 << 12;
 }
 
 static u32 sv39_index(u64 virtual_address, int level)
 {
-    u64 shift = (u64)level;
-    __asm__ volatile(
-        "slli a2, %[shift], 3\n"
-        "add %[shift], %[shift], a2\n"
-        "addi %[shift], %[shift], 12\n"
-        "srl %[address], %[address], %[shift]\n"
-        "andi %[address], %[address], 511"
-        : [address] "+{a0}"(virtual_address), [shift] "+{a1}"(shift)
-        :
-        : );
-    return (u32)virtual_address;
+    return (u32)(virtual_address >> (12 + 9 * level) & 511ul);
 }
 
 static u64* leaf_table(u64 root, u64 virtual_address, int leaf_level)
@@ -2730,74 +2528,26 @@ static int user_mapping_range_valid(u64 address, u64 size)
 
 static u64 user_translate(u64 root, u64 virtual_address, u64 required, u64* physical)
 {
-    __asm__ volatile(
-        "srli t0, a1, 38\n"
-        "bne t0, zero, .Luser_translate_fail_%=\n"
-        "srli t0, a1, 30\n"
-        "andi t0, t0, 511\n"
-        "sh3add t0, t0, a0\n"
-        "ld t0, 0(t0)\n"
-        "andi t1, t0, 1\n"
-        "beq t1, zero, .Luser_translate_fail_%=\n"
-        "andi t1, t0, 6\n"
-        "addi t2, zero, 4\n"
-        "beq t1, t2, .Luser_translate_fail_%=\n"
-        "andi t1, t0, 10\n"
-        "bne t1, zero, .Luser_translate_leaf2_%=\n"
-        "srli a0, t0, 10\n"
-        "slli a0, a0, 12\n"
-        "srli t0, a1, 21\n"
-        "andi t0, t0, 511\n"
-        "sh3add t0, t0, a0\n"
-        "ld t0, 0(t0)\n"
-        "andi t1, t0, 1\n"
-        "beq t1, zero, .Luser_translate_fail_%=\n"
-        "andi t1, t0, 6\n"
-        "beq t1, t2, .Luser_translate_fail_%=\n"
-        "andi t1, t0, 10\n"
-        "bne t1, zero, .Luser_translate_leaf1_%=\n"
-        "srli a0, t0, 10\n"
-        "slli a0, a0, 12\n"
-        "srli t0, a1, 12\n"
-        "andi t0, t0, 511\n"
-        "sh3add t0, t0, a0\n"
-        "ld t0, 0(t0)\n"
-        "andi t1, t0, 1\n"
-        "beq t1, zero, .Luser_translate_fail_%=\n"
-        "andi t1, t0, 6\n"
-        "beq t1, t2, .Luser_translate_fail_%=\n"
-        "andi t1, t0, 10\n"
-        "beq t1, zero, .Luser_translate_fail_%=\n"
-        "addi t4, zero, 12\n"
-        "jal zero, .Luser_translate_leaf_%=\n"
-        ".Luser_translate_leaf1_%=:\n"
-        "addi t4, zero, 21\n"
-        "jal zero, .Luser_translate_leaf_%=\n"
-        ".Luser_translate_leaf2_%=:\n"
-        "addi t4, zero, 30\n"
-        ".Luser_translate_leaf_%=:\n"
-        "andi t1, t0, 16\n"
-        "beq t1, zero, .Luser_translate_fail_%=\n"
-        "andn t1, a2, t0\n"
-        "bne t1, zero, .Luser_translate_fail_%=\n"
-        "addi t1, t4, -2\n"
-        "srl t0, t0, t1\n"
-        "sll t0, t0, t4\n"
-        "addi t1, zero, 64\n"
-        "sub t1, t1, t4\n"
-        "sll t3, a1, t1\n"
-        "srl t3, t3, t1\n"
-        "or t0, t0, t3\n"
-        "sd t0, 0(a3)\n"
-        "addi a0, zero, 1\n"
-        "jal zero, .Luser_translate_done_%=\n"
-        ".Luser_translate_fail_%=:\n"
-        "addi a0, zero, 0\n"
-        ".Luser_translate_done_%=:"
-        : [root] "+{a0}"(root)
-        : [virtual_address] "{a1}"(virtual_address), [required] "{a2}"(required), [physical] "{a3}"(physical)
-        : "memory");
-    return root;
+    if (virtual_address >> 38 != 0ul)
+        return 0;
+    u64 table = root;
+    for (int level = 2; level >= 0; level--)
+    {
+        u64 pte = ((const u64*)table)[sv39_index(virtual_address, level)];
+        if ((pte & PTE_V) == 0ul || (pte & (PTE_R | PTE_W)) == PTE_W)
+            return 0;
+        if ((pte & (PTE_R | PTE_X)) == 0ul)
+        {
+            table = pte_physical(pte);
+            continue;
+        }
+        u64 shift = 12ul + 9ul * (u64)level;
+        if ((pte & PTE_U) == 0ul || (required & ~pte) != 0ul)
+            return 0;
+        *physical = pte >> (shift - 2ul) << shift | (virtual_address & ((1ul << shift) - 1ul));
+        return 1;
+    }
+    return 0;
 }
 
 static int user_copy_to(u64 root, u64 destination, const void* source, u64 count)
@@ -5990,20 +5740,14 @@ static int virtio_blk_transfer(u64 sector, void* buffer, u32 bytes, u32 type)
     virtio_avail_index = index;
     virtq_avail[1] = (u16)index;
 
-    __asm__ volatile(
-        "fence rw, rw\n"
-        "sw zero, 80(a0)\n"
-        "addi t0, zero, 255\n"
-        ".Lvirtio_blk_wait_%=:\n"
-        "lbu t1, 0(a1)\n"
-        "beq t1, t0, .Lvirtio_blk_wait_%=\n"
-        "lwu t1, 96(a0)\n"
-        "sw t1, 100(a0)\n"
-        "lbu a0, 0(a1)"
-        : [base] "+{a0}"(base)
-        : [status] "{a1}"(&virtio_request.status)
-        : "memory");
-    return base == 0ul;
+    fence_rw();
+    mmio_write32(base, 0x050u, 0u);
+    volatile const u8* status = &virtio_request.status;
+    while (*status == 255u)
+    {
+    }
+    mmio_write32(base, 0x064u, mmio_read32(base, 0x060u));
+    return *status == 0u;
 }
 
 static int virtio_blk_read(u64 sector, void* buffer, u32 bytes)

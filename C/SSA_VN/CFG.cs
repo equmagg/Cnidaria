@@ -274,6 +274,9 @@ public sealed class ControlFlowFunction
                         AddEdge(block, _exit!, ControlFlowEdgeKind.Return, @return, switchValue: null);
                         break;
 
+                    case GimpleCallStatement call when call.IsNoReturn:
+                        break;
+
                     case GimpleAsmStatement asm when asm.IsGoto:
                         foreach (var label in asm.GotoLabels)
                             AddLabelEdge(block, label, ControlFlowEdgeKind.Goto, asm, switchValue: null);

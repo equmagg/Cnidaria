@@ -997,6 +997,12 @@ internal static class CAbi
 
     // Each register class draws its return registers in order, whatever the segments of other classes take
     public static MachineRegister SegmentReturnRegister(AbiValue value, int index)
+        => ReturnRegister(value.Segments[index], SegmentReturnOrdinal(value, index));
+
+    public static int SegmentReturnRegisterByteOffset(AbiValue value, int index)
+        => ReturnRegisterByteOffset(value.Segments[index], SegmentReturnOrdinal(value, index));
+
+    private static int SegmentReturnOrdinal(AbiValue value, int index)
     {
         var ordinal = 0;
         for (var i = 0; i < index; i++)
@@ -1004,7 +1010,7 @@ internal static class CAbi
             if (value.Segments[i].RegisterClass == value.Segments[index].RegisterClass)
                 ordinal++;
         }
-        return ReturnRegister(value.Segments[index], ordinal);
+        return ordinal;
     }
 
     public static bool RequiresHiddenReturnBuffer(TargetInfo target, QualifiedType returnType)

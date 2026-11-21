@@ -57,9 +57,15 @@ internal static class ArmCodeEncoder
             throw new ArgumentNullException(nameof(target));
         if (instruction.Opcode == ArmInstrKind.Raw)
             return instruction.RawWord;
-        return target.Is64Bit
-            ? EncodeAArch64(instruction, pc, symbols)
-            : EncodeAArch32(instruction, pc, symbols);
+        foreach (ArmInstructionForm form in ArmInstructionForms.ForOpcode(instruction.Opcode))
+        {
+            if (form.XLen != target.XLen || !TryEncodeForm(form, instruction, pc, symbols, out uint word))
+                continue;
+            if (!target.Has(form.Isa))
+                throw new NotSupportedException($"{instruction.Opcode} requires {form.Isa}");
+            return word;
+        }
+        throw new ArgumentException($"No {target.XLen}-bit ARM encoding matches {instruction.Opcode} and its operands", nameof(instruction));
     }
 
     public static void WriteWord(byte[] destination, int offset, uint word, TargetEndianness endianness)
@@ -85,1339 +91,417 @@ internal static class ArmCodeEncoder
         }
     }
 
-    private static uint EncodeAArch64(ArmInstruction instruction, ulong pc, IReadOnlyDictionary<string, ulong>? symbols)
+    private static bool TryEncodeForm(ArmInstructionForm form, ArmInstruction instruction, ulong pc,
+        IReadOnlyDictionary<string, ulong>? symbols, out uint word)
     {
-        switch (instruction.Opcode)
+        word = form.Word;
+        if (form.ConditionShift < 0 && instruction.Condition != ArmCondition.Al ||
+            form.ConditionalOnly && instruction.Condition == ArmCondition.Al)
+            return false;
+        if ((uint)instruction.Condition > 15)
+            return false;
+        if (form.ConditionShift >= 0)
+            word |= (uint)instruction.Condition << form.ConditionShift;
+        if (instruction.SetFlags)
+            word |= form.FlagMask;
+        for (int i = 0; i < 5; i++)
         {
-            case ArmInstrKind.Nop: return 0xD503201Fu;
-            case ArmInstrKind.Yield: return 0xD503203Fu;
-            case ArmInstrKind.Wfe: return 0xD503205Fu;
-            case ArmInstrKind.Wfi: return 0xD503207Fu;
-            case ArmInstrKind.Sev: return 0xD503209Fu;
-            case ArmInstrKind.Sevl: return 0xD50320BFu;
-            case ArmInstrKind.Ret: return 0xD65F0000u | ((uint)A64Register(instruction.Operand0.Kind == ArmOperandKind.None ? ArmRegister.X30 : instruction.Operand0.Register) << 5);
-            case ArmInstrKind.Br: return 0xD61F0000u | ((uint)A64Register(instruction.Operand0.Register) << 5);
-            case ArmInstrKind.Blr: return 0xD63F0000u | ((uint)A64Register(instruction.Operand0.Register) << 5);
-            case ArmInstrKind.B:
-            case ArmInstrKind.Bl:
-                return EncodeA64Branch(instruction, pc, symbols);
-            case ArmInstrKind.Cbz:
-            case ArmInstrKind.Cbnz:
-                return EncodeA64CompareBranch(instruction, pc, symbols);
-            case ArmInstrKind.Tbz:
-            case ArmInstrKind.Tbnz:
-                return EncodeA64TestBranch(instruction, pc, symbols);
-            case ArmInstrKind.Adr:
-            case ArmInstrKind.Adrp:
-                return EncodeA64Adr(instruction, pc, symbols);
-            case ArmInstrKind.Add:
-            case ArmInstrKind.Adds:
-            case ArmInstrKind.Sub:
-            case ArmInstrKind.Subs:
-            case ArmInstrKind.Cmp:
-            case ArmInstrKind.Cmn:
-                return EncodeA64AddSub(instruction);
-            case ArmInstrKind.Adc:
-            case ArmInstrKind.Adcs:
-            case ArmInstrKind.Sbc:
-            case ArmInstrKind.Sbcs:
-                return EncodeA64AddSubCarry(instruction);
-            case ArmInstrKind.And:
-            case ArmInstrKind.Ands:
-            case ArmInstrKind.Orr:
-            case ArmInstrKind.Eor:
-            case ArmInstrKind.Bic:
-            case ArmInstrKind.Bics:
-            case ArmInstrKind.Tst:
-                return EncodeA64Logical(instruction);
-            case ArmInstrKind.Mov:
-                return EncodeA64Mov(instruction);
-            case ArmInstrKind.Mvn:
-                return EncodeA64Mvn(instruction);
-            case ArmInstrKind.Movz:
-            case ArmInstrKind.Movn:
-            case ArmInstrKind.Movk:
-                return EncodeA64MoveWide(instruction);
-            case ArmInstrKind.Lsl:
-            case ArmInstrKind.Lsr:
-            case ArmInstrKind.Asr:
-            case ArmInstrKind.Ror:
-                return EncodeA64Shift(instruction);
-            case ArmInstrKind.Mul:
-            case ArmInstrKind.Madd:
-            case ArmInstrKind.Msub:
-                return EncodeA64Multiply(instruction);
-            case ArmInstrKind.Umulh:
-            case ArmInstrKind.Smulh:
-                return EncodeA64MultiplyHigh(instruction);
-            case ArmInstrKind.Udiv:
-            case ArmInstrKind.Sdiv:
-                return EncodeA64Divide(instruction);
-            case ArmInstrKind.Csel:
-                return EncodeA64ConditionalSelect(instruction);
-            case ArmInstrKind.Clz:
-            case ArmInstrKind.Rbit:
-            case ArmInstrKind.Rev:
-            case ArmInstrKind.Rev16:
-                return EncodeA64OneSource(instruction);
-            case ArmInstrKind.Sxtb:
-            case ArmInstrKind.Sxth:
-            case ArmInstrKind.Sxtw:
-            case ArmInstrKind.Uxtb:
-            case ArmInstrKind.Uxth:
-                return EncodeA64Extend(instruction);
-            case ArmInstrKind.Ldr:
-            case ArmInstrKind.Str:
-            case ArmInstrKind.Ldrb:
-            case ArmInstrKind.Strb:
-            case ArmInstrKind.Ldrh:
-            case ArmInstrKind.Strh:
-            case ArmInstrKind.Ldrsb:
-            case ArmInstrKind.Ldrsh:
-            case ArmInstrKind.Ldrsw:
-            case ArmInstrKind.Ldur:
-            case ArmInstrKind.Stur:
-                return EncodeA64LoadStore(instruction, pc, symbols);
-            case ArmInstrKind.Ldp:
-            case ArmInstrKind.Stp:
-                return EncodeA64LoadStorePair(instruction);
-            case ArmInstrKind.Ldaxr:
-            case ArmInstrKind.Ldaxrb:
-            case ArmInstrKind.Ldaxrh:
-            case ArmInstrKind.Stlxr:
-            case ArmInstrKind.Stlxrb:
-            case ArmInstrKind.Stlxrh:
-                return EncodeA64Exclusive(instruction);
-            case ArmInstrKind.Svc:
-                return 0xD4000001u | ((uint)RequireUnsigned(instruction.Operand0.Immediate, 16, "AArch64 SVC immediate") << 5);
-            case ArmInstrKind.Brk:
-            case ArmInstrKind.Bkpt:
-                return 0xD4200000u | ((uint)RequireUnsigned(instruction.Operand0.Immediate, 16, "AArch64 BRK immediate") << 5);
-            case ArmInstrKind.Mrs:
-            case ArmInstrKind.Msr:
-                return EncodeA64SystemRegister(instruction);
-            case ArmInstrKind.Dmb:
-            case ArmInstrKind.Dsb:
-            case ArmInstrKind.Isb:
-                return EncodeA64Barrier(instruction);
-            case ArmInstrKind.Fmov:
-            case ArmInstrKind.Fadd:
-            case ArmInstrKind.Fsub:
-            case ArmInstrKind.Fmul:
-            case ArmInstrKind.Fdiv:
-            case ArmInstrKind.Fsqrt:
-            case ArmInstrKind.Fabs:
-            case ArmInstrKind.Fneg:
-            case ArmInstrKind.Fcmp:
-            case ArmInstrKind.Scvtf:
-            case ArmInstrKind.Ucvtf:
-            case ArmInstrKind.Fcvtzs:
-            case ArmInstrKind.Fcvtzu:
-            case ArmInstrKind.Fcvt:
-                return EncodeA64Floating(instruction);
+            ArmOperand operand = instruction.GetOperand(i);
+            if (i >= form.Operands.Length)
+            {
+                if (operand.Kind != ArmOperandKind.None)
+                    return false;
+                continue;
+            }
+            ArmOperandSpec spec = form.Operands[i];
+            if (operand.Kind == ArmOperandKind.None && spec.Optional)
+                operand = spec.Default;
+            if (spec.Tie >= 0 && operand.Register != instruction.GetOperand(spec.Tie).Register)
+                return false;
+            if (!TryEncodeOperand(spec, operand, form.XLen, pc, symbols, out uint bits))
+                return false;
+            word |= bits;
+        }
+        return true;
+    }
+
+    private static bool TryEncodeOperand(ArmOperandSpec spec, ArmOperand operand, int xlen, ulong pc,
+        IReadOnlyDictionary<string, ulong>? symbols, out uint bits)
+    {
+        bits = 0;
+        long value;
+        uint encoded;
+        switch (spec.Encoding)
+        {
+            case ArmOperandEncoding.Register:
+            case ArmOperandEncoding.VectorList:
+            case ArmOperandEncoding.VectorElement:
+                if (spec.Encoding == ArmOperandEncoding.VectorList)
+                {
+                    if (operand.Kind != ArmOperandKind.VectorList && !(spec.Count == 1 && operand.Kind == ArmOperandKind.Register) ||
+                        operand.Kind == ArmOperandKind.VectorList && operand.RegisterCount != spec.Count ||
+                        (spec.IndexMask != 0) != (operand.Kind == ArmOperandKind.VectorList && operand.ElementIndex >= 0))
+                        return false;
+                }
+                else if (operand.Kind != (spec.Encoding == ArmOperandEncoding.VectorElement ? ArmOperandKind.VectorElement : ArmOperandKind.Register))
+                    return false;
+                if (!TryRegister(spec, operand, xlen, out encoded))
+                    return false;
+                bits = Deposit(encoded, spec.Mask);
+                if (spec.Encoding == ArmOperandEncoding.VectorElement)
+                {
+                    if (!TryImmediate(spec, operand.ElementIndex, out uint index))
+                        return false;
+                    // AdvSIMD by-element indices store their high bit H below L and M
+                    int indexBits = System.Numerics.BitOperations.PopCount(spec.ExtraMask);
+                    if (spec.IndexRotate && indexBits > 1)
+                        index = ((index << 1) | (index >> (indexBits - 1))) & ((1u << indexBits) - 1);
+                    bits |= Deposit(index, spec.ExtraMask);
+                }
+                else
+                    bits |= Deposit(encoded, spec.ExtraMask) | Deposit(encoded, spec.BaseMask);
+                if (spec.Encoding == ArmOperandEncoding.VectorList && spec.IndexMask != 0)
+                {
+                    if (!TryImmediate(spec, operand.ElementIndex, out uint lane))
+                        return false;
+                    bits |= Deposit(lane, spec.IndexMask);
+                }
+                return true;
+
+            case ArmOperandEncoding.Immediate:
+            case ArmOperandEncoding.Pattern:
+            case ArmOperandEncoding.Multiplier:
+            case ArmOperandEncoding.PrefetchOperation:
+                ArmOperandKind kind = spec.Encoding switch
+                {
+                    ArmOperandEncoding.Pattern => ArmOperandKind.Pattern,
+                    ArmOperandEncoding.Multiplier => ArmOperandKind.Multiplier,
+                    ArmOperandEncoding.PrefetchOperation => ArmOperandKind.PrefetchOperation,
+                    _ => ArmOperandKind.Immediate,
+                };
+                if (operand.Kind != kind && !(kind is ArmOperandKind.Pattern or ArmOperandKind.PrefetchOperation && operand.Kind == ArmOperandKind.Immediate))
+                    return false;
+                if (operand.ShiftAmount != spec.Shift || operand.Shift is not ArmShiftKind.None and not ArmShiftKind.Lsl ||
+                    !TryImmediate(spec, operand.Immediate, out encoded))
+                    return false;
+                bits = Deposit(encoded, spec.Mask) | Deposit(encoded, spec.ExtraMask);
+                return true;
+
+            case ArmOperandEncoding.FloatingConstant:
+            case ArmOperandEncoding.FloatingImmediate:
+                if (operand.Kind != ArmOperandKind.FloatingImmediate && operand.Kind != ArmOperandKind.Immediate)
+                    return false;
+                double floating = operand.Kind == ArmOperandKind.FloatingImmediate ? operand.FloatingImmediate : operand.Immediate;
+                if (spec.Encoding == ArmOperandEncoding.FloatingConstant)
+                    return BitConverter.DoubleToInt64Bits(floating) == spec.Minimum;
+                if (!TryFloatingImmediate(floating, out encoded))
+                    return false;
+                bits = Deposit(encoded, spec.Mask);
+                return true;
+
+            case ArmOperandEncoding.LogicalImmediate:
+                if (operand.Kind != ArmOperandKind.Immediate || operand.ShiftAmount != 0)
+                    return false;
+                if (!FitsElement(operand.Immediate, spec.Size * 8))
+                    return false;
+                ulong logical = unchecked((ulong)operand.Immediate);
+                if (spec.Invert)
+                    logical = ~logical;
+                if (!TryEncodeLogicalImmediate(logical, spec.Size * 8, out uint n, out uint immr, out uint imms))
+                    return false;
+                bits = Deposit((n << 12) | (immr << 6) | imms, spec.Mask);
+                return true;
+
+            case ArmOperandEncoding.MoveWideImmediate:
+                if (operand.Kind != ArmOperandKind.Immediate || operand.ShiftAmount != 0 ||
+                    !TryEncodeMoveWide(unchecked((ulong)operand.Immediate), spec.Size * 8, spec.Invert, out ushort wide, out int shift))
+                    return false;
+                bits = ((uint)wide << 5) | ((uint)(shift / 16) << 21);
+                return true;
+
+            case ArmOperandEncoding.AddImmediate:
+                if (operand.Kind != ArmOperandKind.Immediate)
+                    return false;
+                value = operand.Immediate;
+                if (spec.Size is > 0 and < 8)
+                {
+                    int significantBits = spec.Size * 8 - operand.ShiftAmount;
+                    if (significantBits <= 0 || significantBits > 64)
+                        return false;
+                    if (!FitsElement(value, significantBits))
+                        return false;
+                    value = (value << (64 - significantBits)) >> (64 - significantBits);
+                }
+                if (operand.ShiftAmount != 0)
+                {
+                    if (operand.Shift != ArmShiftKind.Lsl || operand.ShiftAmount != spec.Shift || value < spec.Minimum || value > spec.Maximum)
+                        return false;
+                    bits = spec.ExtraMask;
+                }
+                else if (value < spec.Minimum || value > spec.Maximum)
+                {
+                    long unit = 1L << spec.Shift;
+                    if (spec.Shift == 0 || value % unit != 0 || value / unit < spec.Minimum || value / unit > spec.Maximum)
+                        return false;
+                    value /= unit;
+                    bits = spec.ExtraMask;
+                }
+                bits |= Deposit(unchecked((uint)value), spec.Mask);
+                return true;
+
+            case ArmOperandEncoding.ShiftLeftImmediate:
+            case ArmOperandEncoding.ShiftRightImmediate:
+                if (operand.Kind != ArmOperandKind.Immediate || operand.ShiftAmount != 0 || !TryImmediate(spec, operand.Immediate, out _))
+                    return false;
+                int amount = (int)operand.Immediate;
+                int width = spec.Size * 8;
+                if (spec.Encoding == ArmOperandEncoding.ShiftLeftImmediate)
+                    bits = Deposit((uint)((width - amount) & (width - 1)), spec.Mask) | Deposit((uint)(width - 1 - amount), spec.ExtraMask);
+                else
+                    bits = Deposit((uint)amount, spec.Mask);
+                return true;
+
+            case ArmOperandEncoding.ShiftedRegister:
+                if (operand.Kind is not ArmOperandKind.Register and not ArmOperandKind.ShiftedRegister ||
+                    !TryRegister(spec, operand, xlen, out encoded) || operand.ShiftAmount < 0 || operand.ShiftAmount >= spec.Size * 8 ||
+                    operand.Shift is ArmShiftKind.Rrx || operand.Shift == ArmShiftKind.Ror && spec.Maximum == 2)
+                    return false;
+                bits = Deposit(encoded, spec.Mask) | ((uint)operand.ShiftAmount << 10) | (EncodeA64ShiftKind(operand.Shift) << 22);
+                return true;
+
+            case ArmOperandEncoding.ExtendedRegister:
+                if (operand.Kind != ArmOperandKind.ExtendedRegister || !ArmRegisters.IsAArch64General(operand.Register) && operand.Register != ArmRegister.Xzr ||
+                    operand.ShiftAmount < 0 || operand.ShiftAmount > 4 || operand.Extend == ArmExtendKind.None)
+                    return false;
+                int sourceSize = operand.Extend is ArmExtendKind.Uxtx or ArmExtendKind.Sxtx ? 8 : 4;
+                if (operand.Size != 0 && operand.Size != sourceSize || spec.Size == 4 && sourceSize == 8)
+                    return false;
+                bits = ((uint)ArmRegisters.Index(operand.Register) << 16) | (EncodeA64Extend(operand.Extend) << 13) | ((uint)operand.ShiftAmount << 10);
+                return true;
+
+            case ArmOperandEncoding.A32Shifter:
+                if (operand.Kind == ArmOperandKind.Immediate)
+                {
+                    if (operand.Immediate < int.MinValue || operand.Immediate > uint.MaxValue || !TryEncodeA32Immediate(unchecked((uint)operand.Immediate), out encoded))
+                        return false;
+                    bits = encoded | (1u << 25);
+                    return true;
+                }
+                if (operand.Kind is not ArmOperandKind.Register and not ArmOperandKind.ShiftedRegister || !TryRegister(spec, operand, xlen, out encoded))
+                    return false;
+                if (!TryA32Shift(operand.Shift, operand.ShiftAmount, out uint shifted))
+                    return false;
+                bits = encoded | shifted;
+                return true;
+
+            case ArmOperandEncoding.Memory:
+            case ArmOperandEncoding.RegisterMemory:
+            case ArmOperandEncoding.A32Memory:
+            case ArmOperandEncoding.A32HalfMemory:
+            case ArmOperandEncoding.A32VfpMemory:
+                return TryEncodeMemory(spec, operand, xlen, out bits);
+
+            case ArmOperandEncoding.Relative:
+            case ArmOperandEncoding.Address:
+            case ArmOperandEncoding.PageAddress:
+                if (operand.Kind is not ArmOperandKind.Immediate and not ArmOperandKind.Symbol &&
+                    !(operand.Kind == ArmOperandKind.Memory && operand.AddressingMode == ArmAddressingMode.Literal))
+                    return false;
+                value = ResolveDisplacement(operand, pc, symbols);
+                if (spec.Encoding == ArmOperandEncoding.PageAddress && operand.HasSymbol)
+                    value = checked((long)(ResolveAddress(operand, symbols) & ~4095UL) - (long)(pc & ~4095UL));
+                if (!TryImmediate(spec, value, out encoded))
+                    return false;
+                bits = spec.Encoding == ArmOperandEncoding.Relative ? Deposit(encoded, spec.Mask)
+                    : ((encoded & 3) << 29) | ((encoded & 0x1FFFFC) << 3);
+                return true;
+
+            case ArmOperandEncoding.RegisterList:
+                if (operand.Kind != ArmOperandKind.RegisterList || operand.RegisterMask == 0 || (operand.RegisterMask & 0xFFFF0000u) != 0)
+                    return false;
+                bits = operand.RegisterMask;
+                return true;
+
+            case ArmOperandEncoding.SystemRegister:
+                if (operand.Kind != ArmOperandKind.SystemRegister)
+                    return false;
+                if (xlen == 32)
+                {
+                    if (operand.SystemRegister is not ArmSystemRegister.Cpsr and not ArmSystemRegister.Spsr)
+                        return false;
+                    bits = operand.SystemRegister == ArmSystemRegister.Spsr ? 1u << 22 : 0;
+                }
+                else
+                    bits = EncodeSystemRegister(operand.SystemRegister);
+                return true;
+
             default:
-                throw new NotSupportedException($"Unsupported AArch64 instruction: {instruction.Opcode}");
+                throw new InvalidOperationException("Unknown ARM operand encoding");
         }
     }
 
-    private static uint EncodeA64Branch(ArmInstruction instruction, ulong pc, IReadOnlyDictionary<string, ulong>? symbols)
+    private static bool TryRegister(ArmOperandSpec spec, ArmOperand operand, int xlen, out uint value)
     {
-        var displacement = ResolveDisplacement(instruction.Operand0, pc, symbols);
-        RequireAligned(displacement, 4, "AArch64 branch displacement");
-        var immediate = RequireSigned(displacement >> 2, 26, "AArch64 branch displacement");
-        if (instruction.Condition != ArmCondition.Al && instruction.Opcode == ArmInstrKind.B)
+        value = 0;
+        bool valid = spec.Class switch
         {
-            var condImmediate = RequireSigned(displacement >> 2, 19, "AArch64 conditional branch displacement");
-            return 0x54000000u | ((uint)condImmediate & 0x7FFFFu) << 5 | (uint)instruction.Condition;
+            ArmRegisterClass.General32 => ArmRegisters.IsAArch32General(operand.Register) || operand.Register == ArmRegister.Sp,
+            ArmRegisterClass.General64 => ArmRegisters.IsAArch64General(operand.Register) || (spec.AllowSp ? operand.Register == ArmRegister.Sp : operand.Register == ArmRegister.Xzr),
+            ArmRegisterClass.Vector => ArmRegisters.IsVector(operand.Register),
+            ArmRegisterClass.ScalableVector => ArmRegisters.IsScalableVector(operand.Register),
+            ArmRegisterClass.Predicate => ArmRegisters.IsPredicate(operand.Register),
+            _ => false,
+        };
+        if (!valid || operand.Predication != spec.Predication || operand.VectorSize != spec.VectorSize)
+            return false;
+        int size = operand.Size;
+        if (size == 0 && spec.Class is ArmRegisterClass.General32 or ArmRegisterClass.General64 or ArmRegisterClass.Vector)
+            size = xlen / 8;
+        if (size != spec.Size)
+            return false;
+        value = operand.Register == ArmRegister.Sp && xlen == 32 ? 13u : (uint)ArmRegisters.Index(operand.Register);
+        if (value >= spec.RegisterLimit)
+            return false;
+        if (xlen == 32 && spec.Class == ArmRegisterClass.Vector && spec.Size == 4)
+            value = (value >> 1) | ((value & 1) << 4);
+        if (spec.RegisterRotation != 0)
+            value = ((value << spec.RegisterRotation) | (value >> (5 - spec.RegisterRotation))) & 31;
+        return true;
+    }
+
+    private static bool TryEncodeMemory(ArmOperandSpec spec, ArmOperand operand, int xlen, out uint bits)
+    {
+        bits = 0;
+        if (operand.Kind != ArmOperandKind.Memory || operand.AddressingMode != spec.Mode)
+            return false;
+        bool a32 = xlen == 32;
+        if (spec.BaseVectorSize != 0
+            ? !ArmRegisters.IsScalableVector(operand.BaseRegister) || operand.Size != spec.BaseVectorSize
+            : a32 ? !ArmRegisters.IsAArch32General(operand.BaseRegister) && operand.BaseRegister != ArmRegister.Sp
+            : !ArmRegisters.IsAArch64General(operand.BaseRegister) && operand.BaseRegister != ArmRegister.Sp)
+            return false;
+        uint rn = operand.BaseRegister == ArmRegister.Sp && a32 ? 13u : (uint)ArmRegisters.Index(operand.BaseRegister);
+        bits = Deposit(rn, spec.BaseMask);
+        if (spec.Encoding == ArmOperandEncoding.RegisterMemory)
+        {
+            bool validIndex = spec.Class == ArmRegisterClass.ScalableVector
+                ? ArmRegisters.IsScalableVector(operand.IndexRegister)
+                : ArmRegisters.IsAArch64General(operand.IndexRegister) || operand.IndexRegister == ArmRegister.Xzr;
+            if (operand.Immediate != 0 || !validIndex || ArmRegisters.Index(operand.IndexRegister) >= spec.RegisterLimit ||
+                operand.Shift is not ArmShiftKind.None and not ArmShiftKind.Lsl ||
+                operand.Extend != spec.Extend || operand.ShiftAmount != spec.Shift ||
+                operand.IndexSize != 0 && operand.IndexSize != spec.IndexSize)
+                return false;
+            bits |= Deposit((uint)ArmRegisters.Index(operand.IndexRegister), spec.IndexMask);
+            return true;
         }
-        return (instruction.Opcode == ArmInstrKind.Bl ? 0x94000000u : 0x14000000u) | ((uint)immediate & 0x03FFFFFFu);
-    }
-
-    private static uint EncodeA64CompareBranch(ArmInstruction instruction, ulong pc, IReadOnlyDictionary<string, ulong>? symbols)
-    {
-        var register = instruction.Operand0;
-        var displacement = ResolveDisplacement(instruction.Operand1, pc, symbols);
-        RequireAligned(displacement, 4, "AArch64 compare branch displacement");
-        var immediate = RequireSigned(displacement >> 2, 19, "AArch64 compare branch displacement");
-        var sf = RegisterSize(register, 8) == 8 ? 1u : 0u;
-        return 0x34000000u | (sf << 31) | (instruction.Opcode == ArmInstrKind.Cbnz ? 1u << 24 : 0) | (((uint)immediate & 0x7FFFFu) << 5) | (uint)A64Register(register.Register);
-    }
-
-    private static uint EncodeA64TestBranch(ArmInstruction instruction, ulong pc, IReadOnlyDictionary<string, ulong>? symbols)
-    {
-        var register = instruction.Operand0;
-        var bit = RequireUnsigned(instruction.Operand1.Immediate, 6, "AArch64 test bit");
-        var displacement = ResolveDisplacement(instruction.Operand2, pc, symbols);
-        RequireAligned(displacement, 4, "AArch64 test branch displacement");
-        var immediate = RequireSigned(displacement >> 2, 14, "AArch64 test branch displacement");
-        var size = RegisterSize(register, 8);
-        if (size == 4 && bit >= 32)
-            throw new ArgumentOutOfRangeException(nameof(instruction), "A W-register test bit must be below 32.");
-        return 0x36000000u |
-            (instruction.Opcode == ArmInstrKind.Tbnz ? 1u << 24 : 0) |
-            ((uint)bit >> 5 << 31) |
-            (((uint)bit & 31u) << 19) |
-            (((uint)immediate & 0x3FFFu) << 5) |
-            (uint)A64Register(register.Register);
-    }
-
-    private static uint EncodeA64Adr(ArmInstruction instruction, ulong pc, IReadOnlyDictionary<string, ulong>? symbols)
-    {
-        var destination = instruction.Operand0;
-        var operand = instruction.Operand1;
-        long displacement;
-        if (instruction.Opcode == ArmInstrKind.Adrp)
+        if (spec.Encoding == ArmOperandEncoding.Memory)
         {
-            if (operand.HasSymbol)
-            {
-                var target = ResolveAddress(operand, symbols);
-                var targetPage = (long)(target & ~0xFFFUL);
-                var pcPage = (long)(pc & ~0xFFFUL);
-                displacement = (targetPage - pcPage) >> 12;
-            }
-            else
-            {
-                RequireAligned(operand.Immediate, 4096, "AArch64 ADRP displacement");
-                displacement = operand.Immediate >> 12;
-            }
+            if (operand.IndexRegister != ArmRegister.Invalid || operand.ShiftAmount != 0 || operand.Extend != ArmExtendKind.None ||
+                !TryImmediate(spec, operand.Immediate, out uint offset))
+                return false;
+            bits |= Deposit(offset, spec.Mask);
+            return true;
+        }
+        if (operand.Extend != ArmExtendKind.None || operand.Immediate == long.MinValue)
+            return false;
+        if (operand.Immediate >= 0)
+            bits |= 1u << 23;
+        if (spec.Encoding == ArmOperandEncoding.A32VfpMemory)
+        {
+            if (operand.IndexRegister != ArmRegister.Invalid || !TryImmediate(spec, Math.Abs(operand.Immediate), out uint offset))
+                return false;
+            bits |= offset;
+            return true;
+        }
+        if (operand.IndexRegister != ArmRegister.Invalid)
+        {
+            if (!ArmRegisters.IsAArch32General(operand.IndexRegister) || operand.Immediate != 0)
+                return false;
+            bits |= (uint)ArmRegisters.Index(operand.IndexRegister);
+            if (spec.Encoding == ArmOperandEncoding.A32HalfMemory)
+                return operand.ShiftAmount == 0 && operand.Shift == ArmShiftKind.None;
+            if (!TryA32Shift(operand.Shift, operand.ShiftAmount, out uint shifted))
+                return false;
+            bits |= shifted | (1u << 25);
         }
         else
         {
-            displacement = ResolveDisplacement(operand, pc, symbols);
+            if (!TryImmediate(spec, Math.Abs(operand.Immediate), out uint offset))
+                return false;
+            bits |= Deposit(offset, spec.Mask);
+            if (spec.Encoding == ArmOperandEncoding.A32HalfMemory)
+                bits |= 1u << 22;
         }
-        var immediate = RequireSigned(displacement, 21, "AArch64 ADR displacement");
-        var immlo = (uint)immediate & 3u;
-        var immhi = ((uint)immediate >> 2) & 0x7FFFFu;
-        return (instruction.Opcode == ArmInstrKind.Adrp ? 0x90000000u : 0x10000000u) | (immlo << 29) | (immhi << 5) | (uint)A64Register(destination.Register);
+        return true;
     }
 
-    private static uint EncodeA64AddSub(ArmInstruction instruction)
+    private static bool TryImmediate(ArmOperandSpec spec, long value, out uint encoded)
     {
-        var opcode = instruction.Opcode;
-        var compare = opcode is ArmInstrKind.Cmp or ArmInstrKind.Cmn;
-        var destination = compare
-            ? ArmOperand.RegisterOperand(ArmRegister.Xzr, RegisterSize(instruction.Operand0, 8))
-            : instruction.Operand0;
-        var source = compare ? instruction.Operand0 : instruction.Operand1;
-        var operand = compare ? instruction.Operand1 : instruction.Operand2;
-        var size = RegisterSize(destination, RegisterSize(source, 8));
-        var sf = size == 8 ? 1u : 0u;
-        var isSub = opcode is ArmInstrKind.Sub or ArmInstrKind.Subs or ArmInstrKind.Cmp;
-        var setFlags = opcode is ArmInstrKind.Adds or ArmInstrKind.Subs or ArmInstrKind.Cmp or ArmInstrKind.Cmn || instruction.SetFlags;
-        var rd = A64Register(destination.Register);
-        var rn = A64Register(source.Register);
+        encoded = 0;
+        if (value < spec.Minimum || value > spec.Maximum || value % spec.Scale != 0)
+            return false;
+        encoded = unchecked((uint)(value / spec.Scale + spec.Bias));
+        return true;
+    }
 
-        if (operand.Kind == ArmOperandKind.Immediate)
+    private static bool FitsElement(long value, int width)
+    {
+        if (width == 64)
+            return true;
+        long mask = (1L << width) - 1;
+        return value >= -mask && value <= mask;
+    }
+
+    private static uint Deposit(uint value, uint mask)
+    {
+        if (mask == 0)
+            return 0;
+        int shift = System.Numerics.BitOperations.TrailingZeroCount(mask);
+        uint field = mask >> shift;
+        if ((field & (field + 1)) == 0)
+            return (value << shift) & mask;
+        uint result = 0;
+        while (mask != 0)
         {
-            var immediate = operand.Immediate;
-            uint shift;
-            if (immediate >= 0 && immediate <= 4095)
-                shift = 0;
-            else if (immediate >= 0 && (immediate & 0xFFF) == 0 && (immediate >> 12) <= 4095)
-            {
-                shift = 1;
-                immediate >>= 12;
-            }
-            else
-                throw new ArgumentOutOfRangeException(nameof(instruction), "AArch64 add/sub immediate is not encodable.");
-            return 0x11000000u | (sf << 31) | (isSub ? 1u << 30 : 0) | (setFlags ? 1u << 29 : 0) | (shift << 22) | ((uint)immediate << 10) | ((uint)rn << 5) | (uint)rd;
+            uint bit = mask & unchecked(0u - mask);
+            if ((value & 1) != 0)
+                result |= bit;
+            value >>= 1;
+            mask &= mask - 1;
         }
-
-        if (operand.Kind == ArmOperandKind.ExtendedRegister)
-        {
-            var option = EncodeA64Extend(operand.Extend);
-            if (operand.ShiftAmount > 4)
-                throw new ArgumentOutOfRangeException(nameof(instruction), "AArch64 extended register shift must be in 0..4.");
-            return 0x0B200000u | (sf << 31) | (isSub ? 1u << 30 : 0) | (setFlags ? 1u << 29 : 0) |
-                ((uint)A64Register(operand.Register) << 16) | (option << 13) | ((uint)operand.ShiftAmount << 10) | ((uint)rn << 5) | (uint)rd;
-        }
-
-        var shifted = AsShiftedRegister(operand);
-        if (shifted.Shift == ArmShiftKind.Rrx)
-            throw new NotSupportedException("AArch64 add/sub does not support RRX.");
-        var shiftKind = EncodeA64ShiftKind(shifted.Shift);
-        var maximum = size * 8 - 1;
-        if (shifted.ShiftAmount > maximum)
-            throw new ArgumentOutOfRangeException(nameof(instruction), "AArch64 register shift is out of range.");
-        return 0x0B000000u | (sf << 31) | (isSub ? 1u << 30 : 0) | (setFlags ? 1u << 29 : 0) |
-            (shiftKind << 22) | ((uint)A64Register(shifted.Register) << 16) | ((uint)shifted.ShiftAmount << 10) | ((uint)rn << 5) | (uint)rd;
-    }
-
-    private static uint EncodeA64AddSubCarry(ArmInstruction instruction)
-    {
-        var size = RegisterSize(instruction.Operand0, 8);
-        var sf = size == 8 ? 1u : 0u;
-        var sub = instruction.Opcode is ArmInstrKind.Sbc or ArmInstrKind.Sbcs;
-        var flags = instruction.Opcode is ArmInstrKind.Adcs or ArmInstrKind.Sbcs || instruction.SetFlags;
-        return 0x1A000000u | (sf << 31) | (sub ? 1u << 30 : 0) | (flags ? 1u << 29 : 0) |
-            ((uint)A64Register(instruction.Operand2.Register) << 16) |
-            ((uint)A64Register(instruction.Operand1.Register) << 5) |
-            (uint)A64Register(instruction.Operand0.Register);
-    }
-
-    private static uint EncodeA64Logical(ArmInstruction instruction)
-    {
-        var test = instruction.Opcode == ArmInstrKind.Tst;
-        var destination = test
-            ? ArmOperand.RegisterOperand(ArmRegister.Xzr, RegisterSize(instruction.Operand0, 8))
-            : instruction.Operand0;
-        var source = test ? instruction.Operand0 : instruction.Operand1;
-        var operand = test ? instruction.Operand1 : instruction.Operand2;
-        var size = RegisterSize(destination, RegisterSize(source, 8));
-        var sf = size == 8 ? 1u : 0u;
-        var opc = instruction.Opcode switch
-        {
-            ArmInstrKind.And => 0u,
-            ArmInstrKind.Bic => 0u,
-            ArmInstrKind.Orr => 1u,
-            ArmInstrKind.Eor => 2u,
-            ArmInstrKind.Ands => 3u,
-            ArmInstrKind.Bics => 3u,
-            ArmInstrKind.Tst => 3u,
-            _ => throw new ArgumentOutOfRangeException(nameof(instruction)),
-        };
-        var inverted = instruction.Opcode is ArmInstrKind.Bic or ArmInstrKind.Bics;
-        var rd = A64Register(destination.Register);
-        var rn = A64Register(source.Register);
-
-        if (operand.Kind == ArmOperandKind.Immediate)
-        {
-            if (inverted)
-                throw new NotSupportedException("AArch64 BIC immediate has no direct encoding.");
-            if (!TryEncodeLogicalImmediate(unchecked((ulong)operand.Immediate), size * 8, out var n, out var immr, out var imms))
-                throw new ArgumentOutOfRangeException(nameof(instruction), "AArch64 logical immediate is not encodable.");
-            return 0x12000000u | (sf << 31) | (opc << 29) | (n << 22) | (immr << 16) | (imms << 10) | ((uint)rn << 5) | (uint)rd;
-        }
-
-        var shifted = AsShiftedRegister(operand);
-        var shiftKind = EncodeA64ShiftKind(shifted.Shift);
-        if (shifted.ShiftAmount >= size * 8)
-            throw new ArgumentOutOfRangeException(nameof(instruction), "AArch64 logical shift is out of range.");
-        return 0x0A000000u | (sf << 31) | (opc << 29) | (shiftKind << 22) | (inverted ? 1u << 21 : 0) |
-            ((uint)A64Register(shifted.Register) << 16) | ((uint)shifted.ShiftAmount << 10) | ((uint)rn << 5) | (uint)rd;
-    }
-
-    private static uint EncodeA64Mov(ArmInstruction instruction)
-    {
-        var destination = instruction.Operand0;
-        var source = instruction.Operand1;
-        var size = RegisterSize(destination, RegisterSize(source, 8));
-        if (source.Kind == ArmOperandKind.Immediate)
-        {
-            var value = size == 4 ? unchecked((uint)source.Immediate) : unchecked((ulong)source.Immediate);
-            if (TryEncodeMoveWide(value, size * 8, false, out var immediate, out var shift))
-                return EncodeA64MoveWide(new ArmInstruction(ArmInstrKind.Movz, destination, ArmOperand.ImmediateOperand(immediate), ArmOperand.ImmediateOperand(shift)));
-            if (TryEncodeMoveWide(value, size * 8, true, out immediate, out shift))
-                return EncodeA64MoveWide(new ArmInstruction(ArmInstrKind.Movn, destination, ArmOperand.ImmediateOperand(immediate), ArmOperand.ImmediateOperand(shift)));
-            if (TryEncodeLogicalImmediate(value, size * 8, out var n, out var immr, out var imms))
-            {
-                var sf = size == 8 ? 1u : 0u;
-                return 0x12000000u | (sf << 31) | (1u << 29) | (n << 22) | (immr << 16) | (imms << 10) | (31u << 5) | (uint)A64Register(destination.Register);
-            }
-            throw new ArgumentOutOfRangeException(nameof(instruction), "AArch64 MOV immediate requires more than one instruction.");
-        }
-
-        var shifted = AsShiftedRegister(source);
-        if (shifted.Shift != ArmShiftKind.None || shifted.ShiftAmount != 0)
-            return EncodeA64Logical(new ArmInstruction(ArmInstrKind.Orr, destination, ArmOperand.RegisterOperand(ArmRegister.Xzr, size), shifted));
-        var baseWord = size == 8 ? 0xAA0003E0u : 0x2A0003E0u;
-        return baseWord | ((uint)A64Register(source.Register) << 16) | (uint)A64Register(destination.Register);
-    }
-
-    private static uint EncodeA64Mvn(ArmInstruction instruction)
-    {
-        var size = RegisterSize(instruction.Operand0, RegisterSize(instruction.Operand1, 8));
-        var source = AsShiftedRegister(instruction.Operand1);
-        var sf = size == 8 ? 1u : 0u;
-        return 0x0A2003E0u | (sf << 31) | (1u << 29) | (EncodeA64ShiftKind(source.Shift) << 22) |
-            ((uint)A64Register(source.Register) << 16) | ((uint)source.ShiftAmount << 10) | (uint)A64Register(instruction.Operand0.Register);
-    }
-
-    private static uint EncodeA64MoveWide(ArmInstruction instruction)
-    {
-        var destination = instruction.Operand0;
-        var size = RegisterSize(destination, 8);
-        var shift = instruction.Operand2.Kind == ArmOperandKind.None ? 0 : checked((int)instruction.Operand2.Immediate);
-        if (shift < 0 || (shift & 15) != 0 || shift >= size * 8)
-            throw new ArgumentOutOfRangeException(nameof(instruction), "AArch64 move-wide shift is invalid.");
-        var immediate = RequireUnsigned(instruction.Operand1.Immediate, 16, "AArch64 move-wide immediate");
-        var opc = instruction.Opcode switch
-        {
-            ArmInstrKind.Movn => 0u,
-            ArmInstrKind.Movz => 2u,
-            ArmInstrKind.Movk => 3u,
-            _ => throw new ArgumentOutOfRangeException(nameof(instruction)),
-        };
-        var sf = size == 8 ? 1u : 0u;
-        return 0x12800000u | (sf << 31) | (opc << 29) | ((uint)(shift / 16) << 21) | ((uint)immediate << 5) | (uint)A64Register(destination.Register);
-    }
-
-    private static uint EncodeA64Shift(ArmInstruction instruction)
-    {
-        var destination = instruction.Operand0;
-        var source = instruction.Operand1;
-        var amount = instruction.Operand2;
-        var size = RegisterSize(destination, RegisterSize(source, 8));
-        var sf = size == 8 ? 1u : 0u;
-        var width = size * 8;
-        if (amount.Kind == ArmOperandKind.Register)
-        {
-            var baseWord = instruction.Opcode switch
-            {
-                ArmInstrKind.Lsl => 0x1AC02000u,
-                ArmInstrKind.Lsr => 0x1AC02400u,
-                ArmInstrKind.Asr => 0x1AC02800u,
-                ArmInstrKind.Ror => 0x1AC02C00u,
-                _ => throw new ArgumentOutOfRangeException(nameof(instruction)),
-            };
-            return baseWord | (sf << 31) | ((uint)A64Register(amount.Register) << 16) | ((uint)A64Register(source.Register) << 5) | (uint)A64Register(destination.Register);
-        }
-
-        var shift = checked((int)amount.Immediate);
-        if (shift < 0 || shift >= width)
-            throw new ArgumentOutOfRangeException(nameof(instruction), "AArch64 shift amount is out of range.");
-        if (instruction.Opcode == ArmInstrKind.Ror)
-        {
-            return 0x13800000u | (sf << 31) | (sf << 22) | ((uint)A64Register(source.Register) << 16) |
-                ((uint)shift << 10) | ((uint)A64Register(source.Register) << 5) | (uint)A64Register(destination.Register);
-        }
-        var signed = instruction.Opcode == ArmInstrKind.Asr;
-        var immr = instruction.Opcode == ArmInstrKind.Lsl ? (width - shift) & (width - 1) : shift;
-        var imms = instruction.Opcode == ArmInstrKind.Lsl ? width - 1 - shift : width - 1;
-        return (signed ? 0x13000000u : 0x53000000u) | (sf << 31) | (sf << 22) |
-            ((uint)immr << 16) | ((uint)imms << 10) | ((uint)A64Register(source.Register) << 5) | (uint)A64Register(destination.Register);
-    }
-
-    private static uint EncodeA64Multiply(ArmInstruction instruction)
-    {
-        var size = RegisterSize(instruction.Operand0, 8);
-        var sf = size == 8 ? 1u : 0u;
-        var addend = instruction.Opcode == ArmInstrKind.Mul ? 31 : A64Register(instruction.Operand3.Register);
-        var subtract = instruction.Opcode == ArmInstrKind.Msub;
-        return 0x1B000000u | (sf << 31) | ((uint)A64Register(instruction.Operand2.Register) << 16) |
-            (subtract ? 1u << 15 : 0) | ((uint)addend << 10) | ((uint)A64Register(instruction.Operand1.Register) << 5) | (uint)A64Register(instruction.Operand0.Register);
-    }
-
-    // smulh/umulh take the top half of a 64 by 64 product, which is what a checked multiply compares
-    private static uint EncodeA64MultiplyHigh(ArmInstruction instruction)
-    {
-        var baseWord = instruction.Opcode == ArmInstrKind.Smulh ? 0x9B407C00u : 0x9BC07C00u;
-        return baseWord | ((uint)A64Register(instruction.Operand2.Register) << 16) |
-            ((uint)A64Register(instruction.Operand1.Register) << 5) | (uint)A64Register(instruction.Operand0.Register);
-    }
-
-    private static uint EncodeA64Divide(ArmInstruction instruction)
-    {
-        var size = RegisterSize(instruction.Operand0, 8);
-        var sf = size == 8 ? 1u : 0u;
-        var baseWord = instruction.Opcode == ArmInstrKind.Sdiv ? 0x1AC00C00u : 0x1AC00800u;
-        return baseWord | (sf << 31) | ((uint)A64Register(instruction.Operand2.Register) << 16) |
-            ((uint)A64Register(instruction.Operand1.Register) << 5) | (uint)A64Register(instruction.Operand0.Register);
-    }
-
-    private static uint EncodeA64ConditionalSelect(ArmInstruction instruction)
-    {
-        var sf = RegisterSize(instruction.Operand0, 8) == 8 ? 1u : 0u;
-        return 0x1A800000u | (sf << 31) | ((uint)A64Register(instruction.Operand2.Register) << 16) | ((uint)instruction.Condition << 12) |
-            ((uint)A64Register(instruction.Operand1.Register) << 5) | (uint)A64Register(instruction.Operand0.Register);
-    }
-
-    private static uint EncodeA64OneSource(ArmInstruction instruction)
-    {
-        var size = RegisterSize(instruction.Operand0, RegisterSize(instruction.Operand1, 8));
-        var sf = size == 8 ? 1u : 0u;
-        var op = instruction.Opcode switch
-        {
-            ArmInstrKind.Rbit => 0u,
-            ArmInstrKind.Rev16 => 1u,
-            ArmInstrKind.Rev => size == 8 ? 3u : 2u,
-            ArmInstrKind.Clz => 4u,
-            _ => throw new ArgumentOutOfRangeException(nameof(instruction)),
-        };
-        return 0x5AC00000u | (sf << 31) | (op << 10) | ((uint)A64Register(instruction.Operand1.Register) << 5) | (uint)A64Register(instruction.Operand0.Register);
-    }
-
-    // The extend mnemonics are bitfield moves that take the low bits of the source and fill the rest
-    private static uint EncodeA64Extend(ArmInstruction instruction)
-    {
-        var signed = instruction.Opcode is ArmInstrKind.Sxtb or ArmInstrKind.Sxth or ArmInstrKind.Sxtw;
-        var sourceBits = instruction.Opcode switch
-        {
-            ArmInstrKind.Sxtb or ArmInstrKind.Uxtb => 8,
-            ArmInstrKind.Sxth or ArmInstrKind.Uxth => 16,
-            ArmInstrKind.Sxtw => 32,
-            _ => throw new ArgumentOutOfRangeException(nameof(instruction)),
-        };
-        var size = RegisterSize(instruction.Operand0, signed ? 8 : 4);
-        if (sourceBits >= size * 8)
-            throw new ArgumentOutOfRangeException(nameof(instruction), "AArch64 extend does not widen the value.");
-
-        var sf = size == 8 ? 1u : 0u;
-        return (signed ? 0x13000000u : 0x53000000u) | (sf << 31) | (sf << 22) |
-            ((uint)(sourceBits - 1) << 10) | ((uint)A64Register(instruction.Operand1.Register) << 5) | (uint)A64Register(instruction.Operand0.Register);
-    }
-
-    private static uint EncodeA64LoadStore(ArmInstruction instruction, ulong pc, IReadOnlyDictionary<string, ulong>? symbols)
-    {
-        var target = instruction.Operand0;
-        var address = instruction.Operand1;
-        var load = instruction.Opcode is ArmInstrKind.Ldr or ArmInstrKind.Ldrb or ArmInstrKind.Ldrh or ArmInstrKind.Ldrsb or ArmInstrKind.Ldrsh or ArmInstrKind.Ldrsw or ArmInstrKind.Ldur;
-        var explicitUnscaled = instruction.Opcode is ArmInstrKind.Ldur or ArmInstrKind.Stur;
-
-        if (address.Kind == ArmOperandKind.Symbol || address.AddressingMode == ArmAddressingMode.Literal)
-        {
-            if (!load)
-                throw new NotSupportedException("AArch64 literal stores are not supported.");
-            var displacement = address.Kind == ArmOperandKind.Symbol
-                ? ResolveDisplacement(address, pc, symbols)
-                : address.Immediate;
-            RequireAligned(displacement, 4, "AArch64 literal load displacement");
-            var immediate = RequireSigned(displacement >> 2, 19, "AArch64 literal load displacement");
-            uint baseWord;
-            if (ArmRegisters.IsVector(target.Register))
-                baseWord = target.Size == 8 ? 0x5C000000u : target.Size == 16 ? 0x9C000000u : 0x1C000000u;
-            else if (instruction.Opcode == ArmInstrKind.Ldrsw)
-                baseWord = 0x98000000u;
-            else
-                baseWord = RegisterSize(target, 8) == 8 ? 0x58000000u : 0x18000000u;
-            return baseWord | (((uint)immediate & 0x7FFFFu) << 5) | (uint)A64Register(target.Register);
-        }
-
-        if (address.Kind != ArmOperandKind.Memory)
-            throw new ArgumentException("AArch64 load/store requires a memory operand.", nameof(instruction));
-        if (address.IndexRegister != ArmRegister.Invalid)
-            return EncodeA64RegisterOffsetLoadStore(instruction, target, address, load);
-
-        var dataSize = GetLoadStoreSize(instruction, target);
-        var vector = ArmRegisters.IsVector(target.Register);
-        var rt = A64Register(target.Register);
-        var rn = A64Register(address.BaseRegister);
-        var displacementValue = address.Immediate;
-        var unscaled = explicitUnscaled || address.AddressingMode != ArmAddressingMode.Offset || displacementValue < 0 || displacementValue % dataSize != 0 || displacementValue / dataSize > 4095;
-        var sizeCode = dataSize switch
-        {
-            1 => 0u,
-            2 => 1u,
-            4 => 2u,
-            8 => 3u,
-            16 => 0u,
-            _ => throw new ArgumentOutOfRangeException(nameof(instruction)),
-        };
-        uint opc;
-        if (instruction.Opcode == ArmInstrKind.Ldrsw)
-            opc = 2;
-        else if (instruction.Opcode is ArmInstrKind.Ldrsb or ArmInstrKind.Ldrsh)
-            opc = RegisterSize(target, 8) == 8 ? 2u : 3u;
-        else
-            opc = load ? 1u : 0u;
-
-        if (!unscaled)
-        {
-            var imm12 = RequireUnsigned(displacementValue / dataSize, 12, "AArch64 load/store offset");
-            var word = 0x39000000u | (sizeCode << 30) | (vector ? 1u << 26 : 0) | (opc << 22) |
-                ((uint)imm12 << 10) | ((uint)rn << 5) | (uint)rt;
-            if (dataSize == 16)
-                word |= 1u << 23;
-            return word;
-        }
-
-        var imm9 = RequireSigned(displacementValue, 9, "AArch64 unscaled load/store offset");
-        var mode = address.AddressingMode switch
-        {
-            ArmAddressingMode.Offset => 0u,
-            ArmAddressingMode.PostIndex => 1u,
-            ArmAddressingMode.PreIndex => 3u,
-            _ => throw new ArgumentOutOfRangeException(nameof(instruction)),
-        };
-        var result = 0x38000000u | (sizeCode << 30) | (vector ? 1u << 26 : 0) | (opc << 22) |
-            (((uint)imm9 & 0x1FFu) << 12) | (mode << 10) | ((uint)rn << 5) | (uint)rt;
-        if (dataSize == 16)
-            result |= 1u << 23;
         return result;
     }
 
-    private static uint EncodeA64RegisterOffsetLoadStore(ArmInstruction instruction, ArmOperand target, ArmOperand address, bool load)
+    private static bool TryA32Shift(ArmShiftKind shift, int amount, out uint bits)
     {
-        var dataSize = GetLoadStoreSize(instruction, target);
-        var vector = ArmRegisters.IsVector(target.Register);
-        var sizeCode = dataSize switch
+        bits = 0;
+        if (shift == ArmShiftKind.None)
+            return amount == 0;
+        if (shift == ArmShiftKind.Rrx)
         {
-            1 => 0u,
-            2 => 1u,
-            4 => 2u,
-            8 => 3u,
-            16 => 0u,
-            _ => throw new ArgumentOutOfRangeException(nameof(instruction)),
-        };
-        uint opc;
-        if (instruction.Opcode == ArmInstrKind.Ldrsw)
-            opc = 2;
-        else if (instruction.Opcode is ArmInstrKind.Ldrsb or ArmInstrKind.Ldrsh)
-            opc = RegisterSize(target, 8) == 8 ? 2u : 3u;
-        else
-            opc = load ? 1u : 0u;
-        var option = address.Extend switch
-        {
-            ArmExtendKind.Uxtw => 2u,
-            ArmExtendKind.Sxtw => 6u,
-            ArmExtendKind.Sxtx => 7u,
-            ArmExtendKind.None or ArmExtendKind.Uxtx => 3u,
-            _ => throw new NotSupportedException("Unsupported AArch64 load/store register extension."),
-        };
-        var scaled = address.ShiftAmount != 0;
-        var expectedShift = Log2(dataSize);
-        if (scaled && address.ShiftAmount != expectedShift)
-            throw new ArgumentOutOfRangeException(nameof(instruction), "AArch64 load/store register shift must match the access size.");
-        var result = 0x38200800u | (sizeCode << 30) | (vector ? 1u << 26 : 0) | (opc << 22) |
-            ((uint)A64Register(address.IndexRegister) << 16) | (option << 13) | (scaled ? 1u << 12 : 0) |
-            ((uint)A64Register(address.BaseRegister) << 5) | (uint)A64Register(target.Register);
-        if (dataSize == 16)
-            result |= 1u << 23;
-        return result;
-    }
-
-    // ldaxr Xt, [Xn] and stlxr Ws, Xt, [Xn]: the status register of a store is always 32 bit
-    private static uint EncodeA64Exclusive(ArmInstruction instruction)
-    {
-        bool load = instruction.Opcode is ArmInstrKind.Ldaxr or ArmInstrKind.Ldaxrb or ArmInstrKind.Ldaxrh;
-        ArmOperand data = load ? instruction.Operand0 : instruction.Operand1;
-        ArmOperand address = load ? instruction.Operand1 : instruction.Operand2;
-        if (address.Kind != ArmOperandKind.Memory || address.BaseRegister == ArmRegister.Invalid)
-            throw new ArgumentException("AArch64 exclusive access requires a base-only memory operand.", nameof(instruction));
-        if (address.Immediate != 0 || address.IndexRegister != ArmRegister.Invalid)
-            throw new ArgumentException("AArch64 exclusive access does not take an offset.", nameof(instruction));
-
-        uint size = instruction.Opcode is ArmInstrKind.Ldaxrb or ArmInstrKind.Stlxrb
-            ? 0u
-            : instruction.Opcode is ArmInstrKind.Ldaxrh or ArmInstrKind.Stlxrh
-                ? 1u
-                : RegisterSize(data, 8) == 8 ? 3u : 2u;
-        uint status = load ? 31u : (uint)A64Register(instruction.Operand0.Register);
-        return 0x08000000u | (size << 30) | (load ? 1u << 22 : 0) | (status << 16) | (1u << 15) |
-            (31u << 10) | ((uint)A64Register(address.BaseRegister) << 5) | (uint)A64Register(data.Register);
-    }
-
-    private static uint EncodeA64LoadStorePair(ArmInstruction instruction)
-    {
-        var first = instruction.Operand0;
-        var second = instruction.Operand1;
-        var address = instruction.Operand2;
-        if (address.Kind != ArmOperandKind.Memory)
-            throw new ArgumentException("AArch64 LDP/STP requires a memory operand.", nameof(instruction));
-        var size = RegisterSize(first, RegisterSize(second, 8));
-        var vector = ArmRegisters.IsVector(first.Register);
-        var scale = vector ? size : size;
-        if (scale is not 4 and not 8 and not 16)
-            throw new NotSupportedException("Unsupported AArch64 pair access size.");
-        if (address.Immediate % scale != 0)
-            throw new ArgumentOutOfRangeException(nameof(instruction), "AArch64 pair offset is not aligned to the element size.");
-        var immediate = RequireSigned(address.Immediate / scale, 7, "AArch64 pair offset");
-        var load = instruction.Opcode == ArmInstrKind.Ldp;
-        uint mode = address.AddressingMode switch
-        {
-            ArmAddressingMode.PostIndex => 1u,
-            ArmAddressingMode.Offset => 2u,
-            ArmAddressingMode.PreIndex => 3u,
-            _ => throw new ArgumentOutOfRangeException(nameof(instruction)),
-        };
-        uint opc;
-        if (vector)
-            opc = size == 4 ? 0u : size == 8 ? 1u : 2u;
-        else
-            opc = size == 8 ? 2u : 0u;
-        return 0x28000000u | (opc << 30) | (vector ? 1u << 26 : 0) | (mode << 23) | (load ? 1u << 22 : 0) |
-            (((uint)immediate & 0x7Fu) << 15) | ((uint)A64Register(second.Register) << 10) |
-            ((uint)A64Register(address.BaseRegister) << 5) | (uint)A64Register(first.Register);
-    }
-
-    private static uint EncodeA64SystemRegister(ArmInstruction instruction)
-    {
-        var read = instruction.Opcode == ArmInstrKind.Mrs;
-        var registerOperand = read ? instruction.Operand0 : instruction.Operand1;
-        var systemOperand = read ? instruction.Operand1 : instruction.Operand0;
-        var encoding = EncodeSystemRegister(systemOperand.SystemRegister);
-        return (read ? 0xD5300000u : 0xD5100000u) | encoding | (uint)A64Register(registerOperand.Register);
-    }
-
-    private static uint EncodeA64Barrier(ArmInstruction instruction)
-    {
-        var option = instruction.Operand0.Kind == ArmOperandKind.None ? 15 : checked((int)instruction.Operand0.Immediate);
-        if ((uint)option > 15)
-            throw new ArgumentOutOfRangeException(nameof(instruction), "AArch64 barrier option must be in 0..15.");
-        return instruction.Opcode switch
-        {
-            ArmInstrKind.Dsb => 0xD503309Fu | ((uint)option << 8),
-            ArmInstrKind.Dmb => 0xD50330BFu | ((uint)option << 8),
-            ArmInstrKind.Isb => 0xD50330DFu | ((uint)option << 8),
-            _ => throw new ArgumentOutOfRangeException(nameof(instruction)),
-        };
-    }
-
-    private static uint EncodeA64Floating(ArmInstruction instruction)
-    {
-        var destination = instruction.Operand0;
-        var size = RegisterSize(destination, instruction.Opcode == ArmInstrKind.Fcmp ? RegisterSize(instruction.Operand0, 8) : 8);
-        if (instruction.Opcode is ArmInstrKind.Scvtf or ArmInstrKind.Ucvtf)
-        {
-            var integer = instruction.Operand1;
-            var sf = RegisterSize(integer, 8) == 8 ? 1u : 0u;
-            var type = size == 8 ? 1u : 0u;
-            var baseWord = instruction.Opcode == ArmInstrKind.Scvtf ? 0x1E220000u : 0x1E230000u;
-            return baseWord | (sf << 31) | (type << 22) | ((uint)A64Register(integer.Register) << 5) | (uint)A64Register(destination.Register);
+            bits = 3u << 5;
+            return amount is 0 or 1;
         }
-        if (instruction.Opcode == ArmInstrKind.Fcvt)
-        {
-            var source = instruction.Operand1;
-            var sourceType = RegisterSize(source, 8) == 8 ? 1u : 0u;
-            var destinationType = RegisterSize(destination, 8) == 8 ? 1u : 0u;
-            return 0x1E224000u | (sourceType << 22) | (destinationType << 15) |
-                ((uint)A64Register(source.Register) << 5) | (uint)A64Register(destination.Register);
-        }
-        if (instruction.Opcode is ArmInstrKind.Fcvtzs or ArmInstrKind.Fcvtzu)
-        {
-            var integer = destination;
-            var floating = instruction.Operand1;
-            var sf = RegisterSize(integer, 8) == 8 ? 1u : 0u;
-            var type = RegisterSize(floating, 8) == 8 ? 1u : 0u;
-            var baseWord = instruction.Opcode == ArmInstrKind.Fcvtzs ? 0x1E380000u : 0x1E390000u;
-            return baseWord | (sf << 31) | (type << 22) | ((uint)A64Register(floating.Register) << 5) | (uint)A64Register(integer.Register);
-        }
+        if (amount < 0 || amount > 32 || shift is ArmShiftKind.Lsl or ArmShiftKind.Ror && amount == 32)
+            return false;
+        bits = ((uint)(amount & 31) << 7) | (EncodeA32ShiftKind(shift) << 5);
+        return true;
+    }
 
-        var typeBit = size == 8 ? 1u << 22 : 0;
-        if (instruction.Opcode == ArmInstrKind.Fmov)
+    private static bool TryFloatingImmediate(double value, out uint encoded)
+    {
+        for (uint i = 0; i < 256; i++)
         {
-            if (ArmRegisters.IsVector(destination.Register) && ArmRegisters.IsVector(instruction.Operand1.Register))
-                return 0x1E204000u | typeBit | ((uint)A64Register(instruction.Operand1.Register) << 5) | (uint)A64Register(destination.Register);
-            var integer = ArmRegisters.IsVector(destination.Register) ? instruction.Operand1 : destination;
-            var floating = ArmRegisters.IsVector(destination.Register) ? destination : instruction.Operand1;
-            var sf = RegisterSize(integer, 8) == 8 ? 1u : 0u;
-            var toFloat = ArmRegisters.IsVector(destination.Register);
-            return 0x1E260000u | (sf << 31) | typeBit | (toFloat ? 1u << 16 : 0) |
-                ((uint)A64Register(integer.Register) << (toFloat ? 5 : 0)) |
-                ((uint)A64Register(floating.Register) << (toFloat ? 0 : 5));
-        }
-        if (instruction.Opcode is ArmInstrKind.Fsqrt or ArmInstrKind.Fabs or ArmInstrKind.Fneg)
-        {
-            var baseWord = instruction.Opcode switch
+            ulong bits = ((ulong)(i & 0x80) << 56) | ((ulong)((i & 0x40) == 0 ? 0x400 : 0x3FC) << 52) | ((ulong)(i & 0x3F) << 48);
+            if (BitConverter.Int64BitsToDouble(unchecked((long)bits)) == value)
             {
-                ArmInstrKind.Fsqrt => 0x1E21C000u,
-                ArmInstrKind.Fabs => 0x1E20C000u,
-                ArmInstrKind.Fneg => 0x1E214000u,
-                _ => 0u,
-            };
-            return baseWord | typeBit | ((uint)A64Register(instruction.Operand1.Register) << 5) | (uint)A64Register(destination.Register);
-        }
-        if (instruction.Opcode == ArmInstrKind.Fcmp)
-        {
-            return 0x1E202000u | typeBit | ((uint)A64Register(instruction.Operand1.Register) << 16) | ((uint)A64Register(destination.Register) << 5);
-        }
-        var binaryBase = instruction.Opcode switch
-        {
-            ArmInstrKind.Fmul => 0x1E200800u,
-            ArmInstrKind.Fdiv => 0x1E201800u,
-            ArmInstrKind.Fadd => 0x1E202800u,
-            ArmInstrKind.Fsub => 0x1E203800u,
-            _ => throw new NotSupportedException($"Unsupported AArch64 floating instruction: {instruction.Opcode}"),
-        };
-        return binaryBase | typeBit | ((uint)A64Register(instruction.Operand2.Register) << 16) |
-            ((uint)A64Register(instruction.Operand1.Register) << 5) | (uint)A64Register(destination.Register);
-    }
-
-    private static uint EncodeAArch32(ArmInstruction instruction, ulong pc, IReadOnlyDictionary<string, ulong>? symbols)
-    {
-        var condition = (uint)instruction.Condition << 28;
-        switch (instruction.Opcode)
-        {
-            case ArmInstrKind.Nop: return condition | 0x0320F000u;
-            case ArmInstrKind.Yield: return condition | 0x0320F001u;
-            case ArmInstrKind.Wfe: return condition | 0x0320F002u;
-            case ArmInstrKind.Wfi: return condition | 0x0320F003u;
-            case ArmInstrKind.Sev: return condition | 0x0320F004u;
-            case ArmInstrKind.Sevl: return condition | 0x0320F005u;
-            case ArmInstrKind.B:
-            case ArmInstrKind.Bl:
-                return EncodeA32Branch(instruction, pc, symbols);
-            case ArmInstrKind.Ret:
-                return condition | 0x012FFF10u | (uint)A32Register(instruction.Operand0.Kind == ArmOperandKind.None ? ArmRegister.Lr : instruction.Operand0.Register);
-            case ArmInstrKind.Bx:
-                return condition | 0x012FFF10u | (uint)A32Register(instruction.Operand0.Register);
-            case ArmInstrKind.Blx:
-                return condition | 0x012FFF30u | (uint)A32Register(instruction.Operand0.Register);
-            case ArmInstrKind.Movw:
-            case ArmInstrKind.Movt:
-                return EncodeA32MoveWide(instruction);
-            case ArmInstrKind.Mov:
-            case ArmInstrKind.Mvn:
-            case ArmInstrKind.Add:
-            case ArmInstrKind.Adds:
-            case ArmInstrKind.Adc:
-            case ArmInstrKind.Adcs:
-            case ArmInstrKind.Sub:
-            case ArmInstrKind.Subs:
-            case ArmInstrKind.Sbc:
-            case ArmInstrKind.Sbcs:
-            case ArmInstrKind.Rsb:
-            case ArmInstrKind.And:
-            case ArmInstrKind.Ands:
-            case ArmInstrKind.Orr:
-            case ArmInstrKind.Eor:
-            case ArmInstrKind.Bic:
-            case ArmInstrKind.Bics:
-            case ArmInstrKind.Tst:
-            case ArmInstrKind.Teq:
-            case ArmInstrKind.Cmp:
-            case ArmInstrKind.Cmn:
-                return EncodeA32DataProcessing(instruction);
-            case ArmInstrKind.Lsl:
-            case ArmInstrKind.Lsr:
-            case ArmInstrKind.Asr:
-            case ArmInstrKind.Ror:
-                return EncodeA32Shift(instruction);
-            case ArmInstrKind.Mul:
-            case ArmInstrKind.Mla:
-            case ArmInstrKind.Mls:
-            case ArmInstrKind.Umull:
-            case ArmInstrKind.Smull:
-                return EncodeA32Multiply(instruction);
-            case ArmInstrKind.Udiv:
-            case ArmInstrKind.Sdiv:
-                return EncodeA32Divide(instruction);
-            case ArmInstrKind.Clz:
-            case ArmInstrKind.Rev:
-            case ArmInstrKind.Rev16:
-            case ArmInstrKind.Revsh:
-            case ArmInstrKind.Rbit:
-                return EncodeA32OneSource(instruction);
-            case ArmInstrKind.Ldr:
-            case ArmInstrKind.Str:
-            case ArmInstrKind.Ldrb:
-            case ArmInstrKind.Strb:
-            case ArmInstrKind.Ldrh:
-            case ArmInstrKind.Strh:
-            case ArmInstrKind.Ldrsb:
-            case ArmInstrKind.Ldrsh:
-                return EncodeA32LoadStore(instruction);
-            case ArmInstrKind.Ldm:
-            case ArmInstrKind.Stm:
-            case ArmInstrKind.Push:
-            case ArmInstrKind.Pop:
-                return EncodeA32Multiple(instruction);
-            case ArmInstrKind.Svc:
-                return condition | 0x0F000000u | (uint)RequireUnsigned(instruction.Operand0.Immediate, 24, "ARM SVC immediate");
-            case ArmInstrKind.Bkpt:
-            case ArmInstrKind.Brk:
-                return EncodeA32Bkpt(instruction);
-            case ArmInstrKind.Mrs:
-            case ArmInstrKind.Msr:
-                return EncodeA32SystemRegister(instruction);
-            case ArmInstrKind.Dmb:
-            case ArmInstrKind.Dsb:
-            case ArmInstrKind.Isb:
-                return EncodeA32Barrier(instruction);
-            case ArmInstrKind.Fmov:
-            case ArmInstrKind.Fadd:
-            case ArmInstrKind.Fsub:
-            case ArmInstrKind.Fmul:
-            case ArmInstrKind.Fdiv:
-            case ArmInstrKind.Fsqrt:
-            case ArmInstrKind.Fabs:
-            case ArmInstrKind.Fneg:
-            case ArmInstrKind.Fcmp:
-            case ArmInstrKind.Scvtf:
-            case ArmInstrKind.Ucvtf:
-            case ArmInstrKind.Fcvtzs:
-            case ArmInstrKind.Fcvtzu:
-            case ArmInstrKind.Fcvt:
-                return EncodeA32Floating(instruction);
-            default:
-                throw new NotSupportedException($"Unsupported AArch32 instruction: {instruction.Opcode}");
-        }
-    }
-
-    private static uint EncodeA32Branch(ArmInstruction instruction, ulong pc, IReadOnlyDictionary<string, ulong>? symbols)
-    {
-        var displacement = ResolveDisplacement(instruction.Operand0, pc, symbols) - 8;
-        RequireAligned(displacement, 4, "ARM branch displacement");
-        var immediate = RequireSigned(displacement >> 2, 24, "ARM branch displacement");
-        return ((uint)instruction.Condition << 28) | (instruction.Opcode == ArmInstrKind.Bl ? 0x0B000000u : 0x0A000000u) | ((uint)immediate & 0x00FFFFFFu);
-    }
-
-    private static uint EncodeA32MoveWide(ArmInstruction instruction)
-    {
-        var immediate = RequireUnsigned(instruction.Operand1.Immediate, 16, "ARM move-wide immediate");
-        return ((uint)instruction.Condition << 28) | (instruction.Opcode == ArmInstrKind.Movt ? 0x03400000u : 0x03000000u) |
-            (((uint)immediate & 0xF000u) << 4) | ((uint)A32Register(instruction.Operand0.Register) << 12) | ((uint)immediate & 0xFFFu);
-    }
-
-    private static uint EncodeA32DataProcessing(ArmInstruction instruction)
-    {
-        var opcode = instruction.Opcode;
-        var test = opcode is ArmInstrKind.Tst or ArmInstrKind.Teq or ArmInstrKind.Cmp or ArmInstrKind.Cmn;
-        var unary = opcode is ArmInstrKind.Mov or ArmInstrKind.Mvn;
-        ArmOperand rd;
-        ArmOperand rn;
-        ArmOperand operand2;
-        if (test)
-        {
-            rd = ArmOperand.RegisterOperand(ArmRegister.R0, 4);
-            rn = instruction.Operand0;
-            operand2 = instruction.Operand1;
-        }
-        else if (unary)
-        {
-            rd = instruction.Operand0;
-            rn = ArmOperand.RegisterOperand(ArmRegister.R0, 4);
-            operand2 = instruction.Operand1;
-        }
-        else
-        {
-            rd = instruction.Operand0;
-            rn = instruction.Operand1;
-            operand2 = instruction.Operand2;
-        }
-        var op = opcode switch
-        {
-            ArmInstrKind.And or ArmInstrKind.Ands => 0u,
-            ArmInstrKind.Eor => 1u,
-            ArmInstrKind.Sub or ArmInstrKind.Subs => 2u,
-            ArmInstrKind.Rsb => 3u,
-            ArmInstrKind.Add or ArmInstrKind.Adds => 4u,
-            ArmInstrKind.Adc or ArmInstrKind.Adcs => 5u,
-            ArmInstrKind.Sbc or ArmInstrKind.Sbcs => 6u,
-            ArmInstrKind.Tst => 8u,
-            ArmInstrKind.Teq => 9u,
-            ArmInstrKind.Cmp => 10u,
-            ArmInstrKind.Cmn => 11u,
-            ArmInstrKind.Orr => 12u,
-            ArmInstrKind.Mov => 13u,
-            ArmInstrKind.Bic or ArmInstrKind.Bics => 14u,
-            ArmInstrKind.Mvn => 15u,
-            _ => throw new ArgumentOutOfRangeException(nameof(instruction)),
-        };
-        var setFlags = test || instruction.SetFlags || opcode is ArmInstrKind.Adds or ArmInstrKind.Adcs or ArmInstrKind.Subs or ArmInstrKind.Sbcs or ArmInstrKind.Ands or ArmInstrKind.Bics;
-        var condition = (uint)instruction.Condition << 28;
-        uint encodedOperand;
-        uint immediateBit;
-        if (operand2.Kind == ArmOperandKind.Immediate)
-        {
-            if (!TryEncodeA32Immediate(unchecked((uint)operand2.Immediate), out encodedOperand))
-                throw new ArgumentOutOfRangeException(nameof(instruction), "ARM data-processing immediate is not encodable.");
-            immediateBit = 1u << 25;
-        }
-        else
-        {
-            encodedOperand = EncodeA32ShiftedRegister(AsShiftedRegister(operand2));
-            immediateBit = 0;
-        }
-        return condition | immediateBit | (op << 21) | (setFlags ? 1u << 20 : 0) |
-            ((uint)A32Register(rn.Register) << 16) | ((uint)A32Register(rd.Register) << 12) | encodedOperand;
-    }
-
-    private static uint EncodeA32Shift(ArmInstruction instruction)
-    {
-        var shift = instruction.Opcode switch
-        {
-            ArmInstrKind.Lsl => ArmShiftKind.Lsl,
-            ArmInstrKind.Lsr => ArmShiftKind.Lsr,
-            ArmInstrKind.Asr => ArmShiftKind.Asr,
-            ArmInstrKind.Ror => ArmShiftKind.Ror,
-            _ => throw new ArgumentOutOfRangeException(nameof(instruction)),
-        };
-        var shifted = instruction.Operand2.Kind == ArmOperandKind.Register
-            ? new ArmOperand()
-            : ArmOperand.ShiftedRegister(instruction.Operand1.Register, shift, checked((int)instruction.Operand2.Immediate), 4);
-        if (instruction.Operand2.Kind == ArmOperandKind.Register)
-        {
-            var type = EncodeA32ShiftKind(shift);
-            var word = ((uint)instruction.Condition << 28) | 0x01A00010u |
-                ((uint)A32Register(instruction.Operand0.Register) << 12) |
-                ((uint)A32Register(instruction.Operand2.Register) << 8) |
-                (type << 5) |
-                (uint)A32Register(instruction.Operand1.Register);
-            if (instruction.SetFlags)
-                word |= 1u << 20;
-            return word;
-        }
-        return EncodeA32DataProcessing(new ArmInstruction(ArmInstrKind.Mov, instruction.Operand0, shifted, condition: instruction.Condition, setFlags: instruction.SetFlags));
-    }
-
-    private static uint EncodeA32Multiply(ArmInstruction instruction)
-    {
-        var condition = (uint)instruction.Condition << 28;
-        if (instruction.Opcode is ArmInstrKind.Umull or ArmInstrKind.Smull)
-        {
-            var signed = instruction.Opcode == ArmInstrKind.Smull;
-            return condition | 0x00800090u | (signed ? 1u << 22 : 0) | (instruction.SetFlags ? 1u << 20 : 0) |
-                ((uint)A32Register(instruction.Operand1.Register) << 16) |
-                ((uint)A32Register(instruction.Operand0.Register) << 12) |
-                ((uint)A32Register(instruction.Operand3.Register) << 8) |
-                (uint)A32Register(instruction.Operand2.Register);
-        }
-        if (instruction.Opcode == ArmInstrKind.Mls)
-        {
-            return condition | 0x00600090u |
-                ((uint)A32Register(instruction.Operand0.Register) << 16) |
-                ((uint)A32Register(instruction.Operand3.Register) << 12) |
-                ((uint)A32Register(instruction.Operand2.Register) << 8) |
-                (uint)A32Register(instruction.Operand1.Register);
-        }
-        var accumulate = instruction.Opcode == ArmInstrKind.Mla;
-        var addend = accumulate ? A32Register(instruction.Operand3.Register) : 0;
-        return condition | (accumulate ? 1u << 21 : 0) | (instruction.SetFlags ? 1u << 20 : 0) |
-            ((uint)A32Register(instruction.Operand0.Register) << 16) |
-            ((uint)addend << 12) |
-            ((uint)A32Register(instruction.Operand2.Register) << 8) |
-            0x90u |
-            (uint)A32Register(instruction.Operand1.Register);
-    }
-
-    private static uint EncodeA32Divide(ArmInstruction instruction)
-    {
-        var signed = instruction.Opcode == ArmInstrKind.Sdiv;
-        return ((uint)instruction.Condition << 28) | (signed ? 0x0710F010u : 0x0730F010u) |
-            ((uint)A32Register(instruction.Operand0.Register) << 16) |
-            ((uint)A32Register(instruction.Operand2.Register) << 8) |
-            (uint)A32Register(instruction.Operand1.Register);
-    }
-
-    private static uint EncodeA32OneSource(ArmInstruction instruction)
-    {
-        var condition = (uint)instruction.Condition << 28;
-        var rd = (uint)A32Register(instruction.Operand0.Register) << 12;
-        var rm = (uint)A32Register(instruction.Operand1.Register);
-        return instruction.Opcode switch
-        {
-            ArmInstrKind.Clz => condition | 0x016F0F10u | rd | rm,
-            ArmInstrKind.Rev => condition | 0x06BF0F30u | rd | rm,
-            ArmInstrKind.Rev16 => condition | 0x06BF0FB0u | rd | rm,
-            ArmInstrKind.Revsh => condition | 0x06FF0FB0u | rd | rm,
-            ArmInstrKind.Rbit => condition | 0x06FF0F30u | rd | rm,
-            _ => throw new ArgumentOutOfRangeException(nameof(instruction)),
-        };
-    }
-
-    private static uint EncodeA32LoadStore(ArmInstruction instruction)
-    {
-        var target = instruction.Operand0;
-        var address = instruction.Operand1;
-        if (address.Kind != ArmOperandKind.Memory)
-            throw new ArgumentException("ARM load/store requires a memory operand.", nameof(instruction));
-        var load = instruction.Opcode is ArmInstrKind.Ldr or ArmInstrKind.Ldrb or ArmInstrKind.Ldrh or ArmInstrKind.Ldrsb or ArmInstrKind.Ldrsh;
-        if (ArmRegisters.IsVector(target.Register))
-        {
-            if (instruction.Opcode is not ArmInstrKind.Ldr and not ArmInstrKind.Str)
-                throw new NotSupportedException("AArch32 VFP memory operands only support VLDR and VSTR.");
-            if (address.IndexRegister != ArmRegister.Invalid || address.AddressingMode != ArmAddressingMode.Offset)
-                throw new NotSupportedException("AArch32 VLDR and VSTR require immediate offset addressing.");
-            if ((address.Immediate & 3) != 0 || address.Immediate < -1020 || address.Immediate > 1020)
-                throw new ArgumentOutOfRangeException(nameof(instruction), "AArch32 VFP load/store offset is out of range or unaligned.");
-            var size = RegisterSize(target, 4);
-            if (size is not 4 and not 8)
-                throw new ArgumentOutOfRangeException(nameof(instruction), "AArch32 VFP load/store register size must be 4 or 8 bytes.");
-            var word = ((uint)instruction.Condition << 28) | (load ? 0x0D100A00u : 0x0D000A00u);
-            if (address.Immediate >= 0)
-                word |= 1u << 23;
-            word |= (uint)A32Register(address.BaseRegister) << 16;
-            word |= (uint)(Math.Abs(address.Immediate) >> 2);
-            word = InsertA32Vd(word, target.Register, size);
-            if (size == 8)
-                word |= 1u << 8;
-            return word;
-        }
-        var byteAccess = instruction.Opcode is ArmInstrKind.Ldrb or ArmInstrKind.Strb;
-        var halfword = instruction.Opcode is ArmInstrKind.Ldrh or ArmInstrKind.Strh or ArmInstrKind.Ldrsh;
-        var signedByte = instruction.Opcode == ArmInstrKind.Ldrsb;
-        var signedHalf = instruction.Opcode == ArmInstrKind.Ldrsh;
-        var pre = address.AddressingMode != ArmAddressingMode.PostIndex;
-        var writeback = address.AddressingMode is ArmAddressingMode.PreIndex or ArmAddressingMode.PostIndex;
-        var add = address.Immediate >= 0;
-        var offset = Math.Abs(address.Immediate);
-        var condition = (uint)instruction.Condition << 28;
-        if (halfword || signedByte || signedHalf)
-        {
-            uint encodedOffset;
-            uint immediateBit;
-            if (address.IndexRegister != ArmRegister.Invalid)
-            {
-                encodedOffset = (uint)A32Register(address.IndexRegister);
-                immediateBit = 0;
+                encoded = i;
+                return true;
             }
-            else
-            {
-                if (offset > 255)
-                    throw new ArgumentOutOfRangeException(nameof(instruction), "ARM halfword/signed load offset is out of range.");
-                encodedOffset = ((uint)offset & 0xF0u) << 4 | ((uint)offset & 0xFu);
-                immediateBit = 1u << 22;
-            }
-            var operation = signedByte ? 2u : signedHalf ? 3u : 1u;
-            return condition | (pre ? 1u << 24 : 0) | (add ? 1u << 23 : 0) | immediateBit |
-                (writeback && pre ? 1u << 21 : 0) | (load ? 1u << 20 : 0) |
-                ((uint)A32Register(address.BaseRegister) << 16) | ((uint)A32Register(target.Register) << 12) |
-                0x90u | (operation << 5) | encodedOffset;
         }
-
-        uint offsetEncoding;
-        uint registerOffset;
-        if (address.IndexRegister != ArmRegister.Invalid)
-        {
-            var shifted = ArmOperand.ShiftedRegister(address.IndexRegister, address.Shift, address.ShiftAmount, 4);
-            offsetEncoding = EncodeA32ShiftedRegister(shifted);
-            registerOffset = 1u << 25;
-        }
-        else
-        {
-            if (offset > 4095)
-                throw new ArgumentOutOfRangeException(nameof(instruction), "ARM load/store offset is out of range.");
-            offsetEncoding = (uint)offset;
-            registerOffset = 0;
-        }
-        return condition | 0x04000000u | registerOffset | (pre ? 1u << 24 : 0) | (add ? 1u << 23 : 0) |
-            (byteAccess ? 1u << 22 : 0) | (writeback && pre ? 1u << 21 : 0) | (load ? 1u << 20 : 0) |
-            ((uint)A32Register(address.BaseRegister) << 16) | ((uint)A32Register(target.Register) << 12) | offsetEncoding;
-    }
-
-    private static uint EncodeA32Multiple(ArmInstruction instruction)
-    {
-        if (instruction.Opcode == ArmInstrKind.Push)
-            return ((uint)instruction.Condition << 28) | 0x092D0000u | instruction.Operand0.RegisterMask;
-        if (instruction.Opcode == ArmInstrKind.Pop)
-            return ((uint)instruction.Condition << 28) | 0x08BD0000u | instruction.Operand0.RegisterMask;
-
-        var baseRegister = instruction.Operand0;
-        var registers = instruction.Operand1;
-        var mode = instruction.Operand2.Kind == ArmOperandKind.Immediate ? checked((int)instruction.Operand2.Immediate) : 1;
-        var p = mode is 2 or 3;
-        var u = mode is 1 or 3;
-        var load = instruction.Opcode == ArmInstrKind.Ldm;
-        return ((uint)instruction.Condition << 28) | 0x08000000u | (p ? 1u << 24 : 0) | (u ? 1u << 23 : 0) |
-            (instruction.SetFlags ? 1u << 21 : 0) | (load ? 1u << 20 : 0) |
-            ((uint)A32Register(baseRegister.Register) << 16) | registers.RegisterMask;
-    }
-
-    private static uint EncodeA32Bkpt(ArmInstruction instruction)
-    {
-        var immediate = RequireUnsigned(instruction.Operand0.Immediate, 16, "ARM BKPT immediate");
-        return ((uint)instruction.Condition << 28) | 0x01200070u | (((uint)immediate & 0xFFF0u) << 4) | ((uint)immediate & 0xFu);
-    }
-
-    private static uint EncodeA32SystemRegister(ArmInstruction instruction)
-    {
-        var condition = (uint)instruction.Condition << 28;
-        if (instruction.Opcode == ArmInstrKind.Mrs)
-        {
-            var system = instruction.Operand1.SystemRegister;
-            var baseWord = system switch
-            {
-                ArmSystemRegister.Cpsr => 0x010F0000u,
-                ArmSystemRegister.Spsr => 0x014F0000u,
-                _ => throw new NotSupportedException("AArch32 MRS only supports CPSR and SPSR."),
-            };
-            return condition | baseWord | ((uint)A32Register(instruction.Operand0.Register) << 12);
-        }
-
-        var target = instruction.Operand0.SystemRegister;
-        var msrBase = target switch
-        {
-            ArmSystemRegister.Cpsr => 0x012FF000u,
-            ArmSystemRegister.Spsr => 0x016FF000u,
-            _ => throw new NotSupportedException("AArch32 MSR only supports CPSR and SPSR."),
-        };
-        return condition | msrBase | (uint)A32Register(instruction.Operand1.Register);
-    }
-
-    private static uint EncodeA32Barrier(ArmInstruction instruction)
-    {
-        var option = instruction.Operand0.Kind == ArmOperandKind.None ? 15 : checked((int)instruction.Operand0.Immediate);
-        if ((uint)option > 15)
-            throw new ArgumentOutOfRangeException(nameof(instruction), "AArch32 barrier option must be in 0..15.");
-        var baseWord = instruction.Opcode switch
-        {
-            ArmInstrKind.Dsb => 0xF57FF040u,
-            ArmInstrKind.Dmb => 0xF57FF050u,
-            ArmInstrKind.Isb => 0xF57FF060u,
-            _ => throw new ArgumentOutOfRangeException(nameof(instruction)),
-        };
-        return baseWord | (uint)option;
-    }
-
-    private static uint EncodeA32Floating(ArmInstruction instruction)
-    {
-        var condition = (uint)instruction.Condition << 28;
-        var destination = instruction.Operand0;
-        var size = RegisterSize(destination, 4);
-        if (instruction.Opcode == ArmInstrKind.Fmov)
-        {
-            if (!ArmRegisters.IsVector(instruction.Operand1.Register))
-                throw new NotSupportedException("AArch32 FMOV integer transfers are not implemented.");
-            return EncodeA32VfpUnary(condition, 0x0EB00A40u, destination, instruction.Operand1, size);
-        }
-        if (instruction.Opcode is ArmInstrKind.Fsqrt or ArmInstrKind.Fabs or ArmInstrKind.Fneg)
-        {
-            var baseWord = instruction.Opcode switch
-            {
-                ArmInstrKind.Fsqrt => 0x0EB10AC0u,
-                ArmInstrKind.Fabs => 0x0EB00AC0u,
-                ArmInstrKind.Fneg => 0x0EB10A40u,
-                _ => 0u,
-            };
-            return EncodeA32VfpUnary(condition, baseWord, destination, instruction.Operand1, size);
-        }
-        if (instruction.Opcode == ArmInstrKind.Fcmp)
-        {
-            var word = condition | 0x0EB40A40u;
-            word = InsertA32Vd(word, destination.Register, size);
-            word = InsertA32Vm(word, instruction.Operand1.Register, size);
-            if (size == 8)
-                word |= 1u << 8;
-            return word;
-        }
-        if (instruction.Opcode is ArmInstrKind.Scvtf or ArmInstrKind.Ucvtf or ArmInstrKind.Fcvtzs or ArmInstrKind.Fcvtzu)
-            return EncodeA32VfpConvert(instruction, condition);
-        if (instruction.Opcode == ArmInstrKind.Fcvt)
-        {
-            // The size bit names the source precision, and each register is numbered in its own
-            var source = instruction.Operand1;
-            var sourceSize = RegisterSize(source, 4);
-            var word = condition | 0x0EB70AC0u;
-            if (sourceSize == 8)
-                word |= 1u << 8;
-            word = InsertA32Vd(word, destination.Register, RegisterSize(destination, 4));
-            word = InsertA32Vm(word, source.Register, sourceSize);
-            return word;
-        }
-
-        var binaryBase = instruction.Opcode switch
-        {
-            ArmInstrKind.Fmul => 0x0E200A00u,
-            ArmInstrKind.Fadd => 0x0E300A00u,
-            ArmInstrKind.Fsub => 0x0E300A40u,
-            ArmInstrKind.Fdiv => 0x0E800A00u,
-            _ => throw new NotSupportedException($"Unsupported AArch32 floating instruction: {instruction.Opcode}"),
-        };
-        var result = condition | binaryBase;
-        result = InsertA32Vd(result, destination.Register, size);
-        result = InsertA32Vn(result, instruction.Operand1.Register, size);
-        result = InsertA32Vm(result, instruction.Operand2.Register, size);
-        if (size == 8)
-            result |= 1u << 8;
-        return result;
-    }
-
-    private static uint EncodeA32VfpUnary(uint condition, uint baseWord, ArmOperand destination, ArmOperand source, int size)
-    {
-        var result = condition | baseWord;
-        result = InsertA32Vd(result, destination.Register, size);
-        result = InsertA32Vm(result, source.Register, size);
-        if (size == 8)
-            result |= 1u << 8;
-        return result;
-    }
-
-    private static uint EncodeA32VfpConvert(ArmInstruction instruction, uint condition)
-    {
-        var destination = instruction.Operand0;
-        var source = instruction.Operand1;
-        var toFloat = instruction.Opcode is ArmInstrKind.Scvtf or ArmInstrKind.Ucvtf;
-        var unsigned = instruction.Opcode is ArmInstrKind.Ucvtf or ArmInstrKind.Fcvtzu;
-        var floatSize = toFloat ? RegisterSize(destination, 4) : RegisterSize(source, 4);
-        uint result;
-        if (toFloat)
-        {
-            result = condition | (unsigned ? 0x0EB80A40u : 0x0EB80AC0u);
-            result = InsertA32Vd(result, destination.Register, floatSize);
-            result = InsertA32Vm(result, source.Register, 4);
-        }
-        else
-        {
-            result = condition | (unsigned ? 0x0EBC0AC0u : 0x0EBD0AC0u);
-            result = InsertA32Vd(result, destination.Register, 4);
-            result = InsertA32Vm(result, source.Register, floatSize);
-        }
-        if (floatSize == 8)
-            result |= 1u << 8;
-        return result;
-    }
-
-    private static uint InsertA32Vd(uint word, ArmRegister register, int size)
-    {
-        var index = ArmRegisters.Index(register);
-        if (size == 4)
-            return word | ((uint)(index >> 1) << 12) | ((uint)(index & 1) << 22);
-        return word | ((uint)(index & 15) << 12) | ((uint)(index >> 4) << 22);
-    }
-
-    private static uint InsertA32Vn(uint word, ArmRegister register, int size)
-    {
-        var index = ArmRegisters.Index(register);
-        if (size == 4)
-            return word | ((uint)(index >> 1) << 16) | ((uint)(index & 1) << 7);
-        return word | ((uint)(index & 15) << 16) | ((uint)(index >> 4) << 7);
-    }
-
-    private static uint InsertA32Vm(uint word, ArmRegister register, int size)
-    {
-        var index = ArmRegisters.Index(register);
-        if (size == 4)
-            return word | ((uint)(index >> 1)) | ((uint)(index & 1) << 5);
-        return word | (uint)(index & 15) | ((uint)(index >> 4) << 5);
-    }
-
-    private static uint EncodeA32ShiftedRegister(ArmOperand operand)
-    {
-        var result = (uint)A32Register(operand.Register);
-        if (operand.Shift == ArmShiftKind.None)
-            return result;
-        if (operand.Shift == ArmShiftKind.Rrx)
-            return result | (3u << 5);
-        if (operand.ShiftAmount < 0 || operand.ShiftAmount > 32)
-            throw new ArgumentOutOfRangeException(nameof(operand), "ARM shift amount is out of range.");
-        var amount = operand.ShiftAmount;
-        if ((operand.Shift is ArmShiftKind.Lsr or ArmShiftKind.Asr) && amount == 32)
-            amount = 0;
-        if (operand.Shift == ArmShiftKind.Lsl && amount == 32)
-            throw new ArgumentOutOfRangeException(nameof(operand), "ARM LSL immediate must be below 32.");
-        return result | ((uint)amount << 7) | (EncodeA32ShiftKind(operand.Shift) << 5);
-    }
-
-    private static ArmOperand AsShiftedRegister(ArmOperand operand)
-    {
-        if (operand.Kind == ArmOperandKind.Register)
-            return ArmOperand.ShiftedRegister(operand.Register, ArmShiftKind.None, 0, operand.Size);
-        if (operand.Kind == ArmOperandKind.ShiftedRegister)
-            return operand;
-        throw new ArgumentException("Expected a register operand.", nameof(operand));
-    }
-
-    private static int GetLoadStoreSize(ArmInstruction instruction, ArmOperand target)
-    {
-        return instruction.Opcode switch
-        {
-            ArmInstrKind.Ldrb or ArmInstrKind.Strb or ArmInstrKind.Ldrsb => 1,
-            ArmInstrKind.Ldrh or ArmInstrKind.Strh or ArmInstrKind.Ldrsh => 2,
-            ArmInstrKind.Ldrsw => 4,
-            _ => RegisterSize(target, 8),
-        };
-    }
-
-    private static int RegisterSize(ArmOperand operand, int defaultSize)
-        => operand.Size > 0 ? operand.Size : defaultSize;
-
-    private static int A64Register(ArmRegister register)
-    {
-        if (register == ArmRegister.Sp || register == ArmRegister.Xzr)
-            return 31;
-        if (ArmRegisters.IsAArch64General(register) || ArmRegisters.IsVector(register))
-            return ArmRegisters.Index(register);
-        throw new ArgumentOutOfRangeException(nameof(register), "Expected an AArch64 register.");
-    }
-
-    private static int A32Register(ArmRegister register)
-    {
-        if (register == ArmRegister.Sp)
-            return 13;
-        if (ArmRegisters.IsAArch32General(register))
-            return ArmRegisters.Index(register);
-        throw new ArgumentOutOfRangeException(nameof(register), "Expected an AArch32 register.");
+        encoded = 0;
+        return false;
     }
 
     private static uint EncodeA64ShiftKind(ArmShiftKind shift)
@@ -1491,29 +575,6 @@ internal static class ArmCodeEncoder
         return checked((ulong)checked((long)address + operand.Addend));
     }
 
-    private static long RequireSigned(long value, int bits, string name)
-    {
-        var minimum = -(1L << (bits - 1));
-        var maximum = (1L << (bits - 1)) - 1;
-        if (value < minimum || value > maximum)
-            throw new OverflowException(name + " is out of range.");
-        return value;
-    }
-
-    private static long RequireUnsigned(long value, int bits, string name)
-    {
-        var maximum = bits == 63 ? long.MaxValue : (1L << bits) - 1;
-        if (value < 0 || value > maximum)
-            throw new OverflowException(name + " is out of range.");
-        return value;
-    }
-
-    private static void RequireAligned(long value, int alignment, string name)
-    {
-        if (value % alignment != 0)
-            throw new ArgumentException(name + " is not aligned.");
-    }
-
     private static bool TryEncodeA32Immediate(uint value, out uint encoded)
     {
         for (var rotate = 0; rotate < 16; rotate++)
@@ -1554,7 +615,7 @@ internal static class ArmCodeEncoder
 
     private static bool TryEncodeLogicalImmediate(ulong value, int width, out uint n, out uint immr, out uint imms)
     {
-        var widthMask = width == 64 ? ulong.MaxValue : uint.MaxValue;
+        var widthMask = width == 64 ? ulong.MaxValue : (1UL << width) - 1;
         value &= widthMask;
         if (value == 0 || value == widthMask)
         {
@@ -2209,6 +1270,14 @@ internal static class ArmCodeDecoder
             return DecodeA32HalfwordLoadStore(word, condition);
         if ((word & 0x0C000000u) == 0x04000000u)
             return DecodeA32LoadStore(word, condition);
+        if ((word & 0x0FE00F7Fu) == 0x0E000A10u)
+        {
+            var single = DecodeA32Vn(word, 4);
+            var core = A32Gpr((word >> 12) & 15);
+            return (word & (1u << 20)) != 0
+                ? ArmInstruction.Binary(ArmInstrKind.Fmov, core, single, condition)
+                : ArmInstruction.Binary(ArmInstrKind.Fmov, single, core, condition);
+        }
         if ((word & 0x0F000E10u) == 0x0E000A00u)
         {
             var floating = DecodeA32Floating(word, condition);

@@ -552,51 +552,31 @@ public readonly struct LirSwitchCase
 /// <summary>Divisors and multipliers that an integer operation can be reduced to shifts for</summary>
 public static class LirStrengthReduction
 {
-    /// <summary>Reports a divisor of 2^k or -2^k, with the shift and whether the quotient has to be negated</summary>
-    public static bool TryGetPowerOfTwoDivisor(LirInstruction instruction, TargetInfo target, out int shift, out bool negated)
+    /// <summary>Reports a constant of 2^k, or of -2^k in a signed type, at the width of a four or eight byte integer type</summary>
+    public static bool TryGetPowerOfTwo(LirOperand constant, QualifiedType type, TargetInfo target, out int shift, out bool negative)
     {
         shift = 0;
-        negated = false;
-        if (instruction is null || target is null)
-            return false;
-        if (instruction.Operator is not "/" and not "%")
-            return false;
-        if (!TryGetOperationShape(instruction, target, out var bits, out var isSigned))
-            return false;
-        if (!TryGetIntegerConstant(instruction.Operands[1], bits, isSigned, out var divisor))
+        negative = false;
+        if (type.Type.Kind is not (TypeKind.Builtin or TypeKind.Enum) || IsFloating(type) || target.SizeOf(type) is not (4 or 8))
             return false;
 
-        var magnitude = unchecked((ulong)divisor);
-        if (isSigned && divisor < 0)
+        int bits = target.SizeOf(type) * 8;
+        bool isSigned = IsSignedInteger(type);
+        if (!TryGetIntegerConstant(constant, bits, isSigned, out long value))
+            return false;
+
+        ulong magnitude = MaskBits(unchecked((ulong)value), bits);
+        if (isSigned && value < 0)
         {
             magnitude = MaskBits(unchecked(0UL - magnitude), bits);
-            // The remainder keeps the sign of the dividend, so only the quotient cares about the divisor's
-            negated = instruction.Operator == "/";
+            negative = true;
         }
 
         if (magnitude == 0 || (magnitude & (magnitude - 1)) != 0)
             return false;
         shift = CountTrailingZeros(magnitude);
-        // A divisor of one is an identity the folder already handles
-        return shift >= 1 && shift < bits;
-    }
-
-    /// <summary>Reports a multiplier of 2^k, which a shift computes in less latency than a multiply</summary>
-    public static bool TryGetPowerOfTwoFactor(LirInstruction instruction, TargetInfo target, out int shift)
-    {
-        shift = 0;
-        if (instruction is null || target is null || instruction.Operator != "*")
-            return false;
-        if (!TryGetOperationShape(instruction, target, out var bits, out var isSigned))
-            return false;
-        if (!TryGetIntegerConstant(instruction.Operands[1], bits, isSigned, out var factor))
-            return false;
-
-        var magnitude = unchecked((ulong)factor);
-        if (magnitude == 0 || (magnitude & (magnitude - 1)) != 0)
-            return false;
-        shift = CountTrailingZeros(magnitude);
-        return shift >= 1 && shift < bits;
+        // A divisor or factor of one is an identity the folder already handles
+        return shift >= 1;
     }
 
     /// <summary>Reports a constant multiplier of any value, normalized to the operation's width</summary>
@@ -1280,9 +1260,11 @@ internal sealed class LirFunctionBuilder
     private readonly HashSet<GimplePhi> _selectedPhis = new();
     private readonly Dictionary<GimpleStatementAnnotations, SelectPlan> _selectProducers = new();
     private readonly Dictionary<LirVirtualRegister, LirVirtualRegister> _widenedIndices = new();
+    private readonly Dictionary<(LirVirtualRegister Base, long High), (LirVirtualRegister Register, ControlFlowBlock Block)> _displacedBases = new();
     private readonly Dictionary<Symbol, (LirVirtualRegister Register, ControlFlowBlock Block)> _symbolBases = new();
     private readonly HashSet<Symbol> _sharedSymbols = new();
     private readonly Dictionary<ControlFlowBlock, NaturalLoop?> _hoistingLoops = new();
+    private readonly Dictionary<ControlFlowBlock, int> _loopDepths = new();
     private readonly Dictionary<(NaturalLoop Loop, CType Type, object Value), LirVirtualRegister> _loopConstants = new();
     private readonly Dictionary<NaturalLoop, int> _loopValueCounts = new();
     private readonly HashSet<LirBlock> _preheadersWithValues = new();
@@ -1303,6 +1285,9 @@ internal sealed class LirFunctionBuilder
     private readonly ControlFlowFunction _controlFlowFunction;
     private readonly LirOptions _options;
     private readonly TargetInfo _target;
+    private readonly bool _splitsWideIntegers;
+    private readonly Dictionary<LirVirtualRegister, (LirVirtualRegister Low, LirVirtualRegister High)> _wordPairs = new();
+    private readonly Dictionary<LirVirtualRegister, LirStackSlot> _wordPairSlots = new();
     private readonly List<LirVirtualRegister> _registers = new();
     private readonly List<LirStackSlot> _stackSlots = new();
     private readonly List<LirBlock> _blocks = new();
@@ -1334,6 +1319,7 @@ internal sealed class LirFunctionBuilder
         _controlFlowFunction = function.ControlFlowFunction;
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _target = target;
+        _splitsWideIntegers = target.Architecture is TargetArchitectureKind.I386 or TargetArchitectureKind.Arm32 or TargetArchitectureKind.RiscV32;
     }
 
     public static LoweredLirFunction Lower(GimpleFunctionAnnotations function, LirOptions options, TargetInfo? target)
@@ -1367,7 +1353,7 @@ internal sealed class LirFunctionBuilder
         var function = new LirFunction(
             _function,
             entry,
-            _registers.ToImmutableArray(),
+            _wordPairs.Count == 0 ? _registers.ToImmutableArray() : _registers.Where(register => !_wordPairs.ContainsKey(register)).ToImmutableArray(),
             _stackSlots.ToImmutableArray(),
             _blocks.ToImmutableArray(),
             _problems.ToImmutableArray());
@@ -2119,6 +2105,7 @@ internal sealed class LirFunctionBuilder
         FindDivisionPairs();
         IndexHoistingLoops();
         _symbolBases.Clear();
+        _displacedBases.Clear();
         foreach (var gimpleBlock in _function.Blocks)
         {
             if (!_blocksByControlFlowBlock.TryGetValue(gimpleBlock.ControlFlowBlock, out var block))
@@ -2584,11 +2571,80 @@ internal sealed class LirFunctionBuilder
         {
             return;
         }
+        if (TryEmitPowerOfTwoArithmetic(block, instruction, code, assign.Operands[0].Type, left, right, result, valueNumber))
+            return;
 
         Emit(block, LirInstructionKind.Binary, result, ImmutableArray.Create(left, right), address: null,
             op: GimpleOperators.Spelling(code), conversionKind: null, callSignature: null, parallelCopies: default,
             switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: assign,
             sourceValue: assign.Op1, sourceInstruction: instruction, valueNumber: valueNumber, treeCode: code);
+    }
+
+    // A power-of-two factor or divisor becomes shifts, with a bias that rounds a negative dividend toward zero
+    private bool TryEmitPowerOfTwoArithmetic(LirBlock block, GimpleStatementAnnotations instruction, GimpleTreeCode code, QualifiedType type,
+        LirOperand left, LirOperand right, LirVirtualRegister result, ValueNumber? valueNumber)
+    {
+        if (code == GimpleTreeCode.MultExpr && left.Kind == LirOperandKind.Immediate && right.Kind != LirOperandKind.Immediate)
+            (left, right) = (right, left);
+        if (code is not (GimpleTreeCode.MultExpr or GimpleTreeCode.TruncDivExpr or GimpleTreeCode.TruncModExpr or GimpleTreeCode.ExactDivExpr) ||
+            !GimpleTypes.IsIntegerLike(type) || !LirStrengthReduction.TryGetPowerOfTwo(right, type, _target, out int shift, out bool negative))
+        {
+            return false;
+        }
+
+        var countType = new QualifiedType(TypeCatalog.Instance.Int);
+        LirOperand shiftCount = LirOperand.ImmediateValue(shift, countType);
+        bool remainder = code == GimpleTreeCode.TruncModExpr;
+        bool exact = code == GimpleTreeCode.ExactDivExpr;
+        if (code == GimpleTreeCode.MultExpr || !GimpleTypes.IsSigned(type, _target) || exact && !negative)
+        {
+            if (code == GimpleTreeCode.MultExpr && negative)
+                return false;
+            GimpleTreeCode reduced = code == GimpleTreeCode.MultExpr ? GimpleTreeCode.LshiftExpr : remainder ? GimpleTreeCode.BitAndExpr : GimpleTreeCode.RshiftExpr;
+            LirOperand operand = remainder ? LirOperand.ImmediateValue(unchecked((long)((1UL << shift) - 1)), type) : shiftCount;
+            EmitSoftFloatStep(block, instruction, LirInstructionKind.Binary, reduced, type, result, valueNumber, left, operand);
+            return true;
+        }
+
+        // A signed quotient or remainder takes one bytecode dispatch as a division and four as shifts
+        if (_target.IsRegisterBytecode)
+            return false;
+
+        LirOperand biased = exact ? left : EmitSignedDivisionBias(block, instruction, type, left, shift);
+        if (remainder)
+        {
+            LirOperand truncated = EmitSoftFloatStep(block, instruction, LirInstructionKind.Binary, GimpleTreeCode.BitAndExpr, type, null, null,
+                biased, LirOperand.ImmediateValue(unchecked(-(1L << shift)), type));
+            EmitSoftFloatStep(block, instruction, LirInstructionKind.Binary, GimpleTreeCode.MinusExpr, type, result, valueNumber, left, truncated);
+            return true;
+        }
+
+        if (!negative)
+        {
+            EmitSoftFloatStep(block, instruction, LirInstructionKind.Binary, GimpleTreeCode.RshiftExpr, type, result, valueNumber, biased, shiftCount);
+            return true;
+        }
+
+        LirOperand quotient = EmitSoftFloatStep(block, instruction, LirInstructionKind.Binary, GimpleTreeCode.RshiftExpr, type, null, null, biased, shiftCount);
+        EmitSoftFloatStep(block, instruction, LirInstructionKind.Binary, GimpleTreeCode.MinusExpr, type, result, valueNumber,
+            LirOperand.ImmediateValue(0L, type), quotient);
+        return true;
+    }
+
+    private LirOperand EmitSignedDivisionBias(LirBlock block, GimpleStatementAnnotations instruction, QualifiedType type, LirOperand dividend, int shift)
+    {
+        var countType = new QualifiedType(TypeCatalog.Instance.Int);
+        int bits = _target.SizeOf(type) * 8;
+        QualifiedType unsignedType = UnsignedOfSize(bits / 8);
+        LirOperand signBits = shift == 1
+            ? dividend
+            : EmitSoftFloatStep(block, instruction, LirInstructionKind.Binary, GimpleTreeCode.RshiftExpr, type, null, null,
+                dividend, LirOperand.ImmediateValue(bits - 1, countType));
+        LirOperand unsignedSign = EmitSoftFloatStep(block, instruction, LirInstructionKind.Convert, GimpleTreeCode.NopExpr, unsignedType, null, null, signBits);
+        LirOperand unsignedBias = EmitSoftFloatStep(block, instruction, LirInstructionKind.Binary, GimpleTreeCode.RshiftExpr, unsignedType, null, null,
+            unsignedSign, LirOperand.ImmediateValue(bits - shift, countType));
+        LirOperand bias = EmitSoftFloatStep(block, instruction, LirInstructionKind.Convert, GimpleTreeCode.NopExpr, type, null, null, unsignedBias);
+        return EmitSoftFloatStep(block, instruction, LirInstructionKind.Binary, GimpleTreeCode.PlusExpr, type, null, null, dividend, bias);
     }
 
     private bool TryEmitSoftFloatBinary(LirBlock block, GimpleStatementAnnotations instruction, GimpleTreeCode code, QualifiedType operandType,
@@ -2721,6 +2777,7 @@ internal sealed class LirFunctionBuilder
             sourceStatement: instruction.Statement, sourceValue: null, sourceInstruction: instruction, valueNumber: valueNumber,
             treeCode: GimpleTreeCode.CallExpr);
         _symbolBases.Clear();
+        _displacedBases.Clear();
         return result;
     }
 
@@ -4182,6 +4239,7 @@ internal sealed class LirFunctionBuilder
         // Reaching past the call would make the allocator carry the address in a callee-saved register,
         // and the prologue, every epilogue and the wider frame cost more than recomputing it does
         _symbolBases.Clear();
+        _displacedBases.Clear();
         return result is null ? LirOperand.Void : LirOperand.ForRegister(result);
     }
 
@@ -4428,7 +4486,55 @@ internal sealed class LirFunctionBuilder
         var scale = _target.SizeOf(elementAccess.Type);
         if (AddressIndexKey(indexExpression?.Name) is { } indexKey && _sharedAddressKeys.Contains(indexKey))
             index = WidenAddressIndex(block, index);
-        return LirAddress.Element(baseAddress, index, elementAccess.Type, scale);
+        return ShareDisplacedBase(block, LirAddress.Element(baseAddress, index, elementAccess.Type, scale));
+    }
+
+    // A displacement past what a memory operand carries is added to the base ahead of the access, once for the accesses near it
+    private LirAddress ShareDisplacedBase(LirBlock block, LirAddress address)
+    {
+        if (_currentGimpleBlock is null || !TryGetRegisterDisplacement(address, out LirAddress root, out LirVirtualRegister? baseRegister, out long displacement) ||
+            baseRegister.ValueNumber is not ValueNumber baseNumber || !TargetRegisterInfo.TrySplitDisplacement(_target, displacement, out long high, out int low))
+        {
+            return address;
+        }
+
+        if (!_displacedBases.TryGetValue((baseRegister, high), out (LirVirtualRegister Register, ControlFlowBlock Block) cached) || !cached.Block.Dominates(_currentGimpleBlock))
+        {
+            if (!_sharedAddressKeys.Contains((baseNumber.Id, high)))
+                return address;
+            var byteType = new QualifiedType(TypeCatalog.Instance.Char);
+            LirVirtualRegister result = NewVirtualRegister(new QualifiedType(TypeCatalog.Instance.PointerTo(byteType)), sourceName: null, valueNumber: null);
+            Emit(block, LirInstructionKind.AddressOf, result, ImmutableArray<LirOperand>.Empty, LirAddress.ForField(root, null, byteType, checked((int)high)),
+                op: string.Empty, conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null,
+                falseTarget: null, sourceStatement: null, sourceValue: null, sourceInstruction: null, valueNumber: null);
+            cached = (result, _currentGimpleBlock);
+            _displacedBases[(baseRegister, high)] = cached;
+        }
+
+        return LirAddress.ForField(LirAddress.Indirect(LirOperand.ForRegister(cached.Register), root.ElementType), address.Field, address.ElementType, low);
+    }
+
+    private static bool TryGetRegisterDisplacement(LirAddress address, out LirAddress root, [NotNullWhen(true)] out LirVirtualRegister? register, out long displacement)
+    {
+        displacement = 0;
+        root = address;
+        register = null;
+        while (root.BaseAddress is LirAddress inner)
+        {
+            if (root.Kind == LirAddressKind.Field)
+                displacement += root.Displacement;
+            else if (root.Kind == LirAddressKind.Element && root.Index is LirOperand index && index.Kind == LirOperandKind.Immediate &&
+                     index.Immediate is not null and not string && ScalarEvolution.TryGetInteger(index.Immediate, out long element))
+                displacement += element * root.Scale;
+            else if (root.Kind != LirAddressKind.Element || root.Index is not null)
+                return false;
+            root = inner;
+        }
+
+        if (root.Kind != LirAddressKind.Indirect || root.BaseOperand is not LirOperand operand || operand.Kind != LirOperandKind.Register)
+            return false;
+        register = operand.Register;
+        return register is not null;
     }
     // Widening here instead of in the emitter gives the value a register and shares it across a block
     private LirOperand? WidenAddressIndex(LirBlock block, LirOperand? index)
@@ -4553,13 +4659,30 @@ internal sealed class LirFunctionBuilder
         _sharedAddressKeys.Clear();
         var counts = new Dictionary<object, int>();
         foreach (var instruction in gimpleBlock.Statements)
+        {
             CountStatementAddressKeys(instruction.Statement, counts);
+            foreach (GimpleOperandInfo operand in instruction.Operands)
+                CountDisplacedKeys(operand, counts);
+        }
 
         foreach (var pair in counts)
         {
             if (pair.Value > 1)
                 _sharedAddressKeys.Add(pair.Key);
         }
+    }
+
+    // The operands, not the statement, hold the names the address is emitted from
+    private void CountDisplacedKeys(GimpleOperandInfo operand, Dictionary<object, int> counts)
+    {
+        if (operand.Original is GimpleMemberAccessExpression or GimpleElementAccessExpression && TryGetDisplacedKey(operand, out object? key))
+        {
+            counts.TryGetValue(key, out int count);
+            counts[key] = count + 1;
+            return;
+        }
+        foreach (GimpleOperandInfo child in operand.Children)
+            CountDisplacedKeys(child, counts);
     }
 
     private static void CountStatementAddressKeys(GimpleStatement statement, Dictionary<object, int> counts)
@@ -4637,6 +4760,56 @@ internal sealed class LirFunctionBuilder
     private static object? AddressIndexKey(GimpleName? index)
         => index is null ? null : (index.Variable, index.Version);
 
+    // The same walk as the address emission, keyed by the value number the emitted base register carries
+    private bool TryGetDisplacedKey(GimpleOperandInfo place, [NotNullWhen(true)] out object? key)
+    {
+        key = null;
+        long displacement = 0;
+        GimpleOperandInfo current = place;
+        GimpleName? pointer = null;
+        while (pointer is null)
+        {
+            if (current.Children.Length == 0)
+                return false;
+            GimpleOperandInfo inner = current.Children[0];
+            switch (current.Original)
+            {
+                case GimpleMemberAccessExpression member:
+                    displacement += GetFieldOffset(member.Field);
+                    if (!member.ThroughPointer)
+                        current = inner;
+                    else if (inner.Name is GimpleName memberBase)
+                        pointer = memberBase;
+                    else
+                        return false;
+                    break;
+                case GimpleElementAccessExpression element when element.Index is GimpleConstantValue constant &&
+                                                                 ScalarEvolution.TryGetInteger(constant.Value, out long index):
+                    displacement += index * _target.SizeOf(element.Type);
+                    if (element.Expression.Type.Type is not PointerType)
+                        current = inner;
+                    else if (inner.Name is GimpleName elementBase)
+                        pointer = elementBase;
+                    else
+                        return false;
+                    break;
+                case GimpleIndirectExpression when inner.Name is GimpleName address:
+                    pointer = address;
+                    break;
+                default:
+                    return false;
+            }
+        }
+
+        if (!_function.ValueNumbering.TryGetValueNumber(pointer, out ValueNumber? number) || number is null ||
+            !TargetRegisterInfo.TrySplitDisplacement(_target, displacement, out long high, out _))
+        {
+            return false;
+        }
+        key = (number.Id, high);
+        return true;
+    }
+
     private bool TryGetPointerSizedIntegerType(QualifiedType source, int pointerSize, out QualifiedType type)
     {
         var unsigned = !GimpleTypes.IsSigned(source, _target);
@@ -4656,14 +4829,7 @@ internal sealed class LirFunctionBuilder
     }
 
     private LirOperand EmitPointerElementBaseValue(LirBlock block, GimpleValue originalBase, GimpleOperandInfo? rewrittenBase)
-    {
-        if (rewrittenBase?.Name is not null)
-            return GetOperand(rewrittenBase.Name);
-
-        return rewrittenBase is null
-            ? EmitValue(block, originalBase)
-            : EmitValue(block, originalBase, rewrittenBase);
-    }
+        => rewrittenBase is null ? EmitValue(block, originalBase) : EmitValue(block, rewrittenBase);
     private LirAddress EmitMemberAddress(LirBlock block, GimpleMemberAccessExpression memberAccess, GimpleOperandInfo? expression)
     {
         var baseExpression = GetChild(expression, 0);
@@ -4686,7 +4852,7 @@ internal sealed class LirFunctionBuilder
             baseAddress = LirAddress.Indirect(baseExpression is null ? EmitValue(block, memberAccess.Expression) : EmitValue(block, baseExpression), memberAccess.Expression.Type);
         }
 
-        return LirAddress.ForField(baseAddress, memberAccess.Field, memberAccess.Type, GetFieldOffset(memberAccess.Field));
+        return ShareDisplacedBase(block, LirAddress.ForField(baseAddress, memberAccess.Field, memberAccess.Type, GetFieldOffset(memberAccess.Field)));
     }
 
     private LirAddress EmitPromotedAddress(LirBlock block, GimpleOperandInfo expression)
@@ -4719,6 +4885,14 @@ internal sealed class LirFunctionBuilder
     {
         if (HasTerminator(block))
             return;
+
+        if (source.Terminator is GimpleCallStatement call && call.IsNoReturn)
+        {
+            Emit(block, LirInstructionKind.Unreachable, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null,
+                parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null, sourceStatement: call, sourceValue: null,
+                sourceInstruction: null, valueNumber: null);
+            return;
+        }
 
         if (source.Successors.Length == 0)
         {
@@ -4969,6 +5143,13 @@ internal sealed class LirFunctionBuilder
             }
         }
 
+        _loopDepths.Clear();
+        foreach (NaturalLoop loop in new NaturalLoopAnalysis(_controlFlowFunction, MaxHoistingLoopAnalysisWork).Loops)
+        {
+            foreach (ControlFlowBlock member in loop.Blocks)
+                _loopDepths[member] = _loopDepths.TryGetValue(member, out int depth) ? depth + 1 : 1;
+        }
+
         var placed = new HashSet<LirBlock>();
         var layout = new List<LirBlock>(original.Length);
         var entry = _blocksByControlFlowBlock.TryGetValue(_controlFlowFunction.Entry, out var entryBlock)
@@ -4987,14 +5168,13 @@ internal sealed class LirFunctionBuilder
                 current = next;
             }
 
-            LirBlock? fallback = null;
+            LirBlock? fallback = RotatedHeaderExit(current, placed);
             foreach (var block in original)
             {
-                if (!placed.Contains(block))
-                {
-                    fallback = block;
+                if (fallback is not null)
                     break;
-                }
+                if (!placed.Contains(block))
+                    fallback = block;
             }
 
             if (fallback is null)
@@ -5124,6 +5304,19 @@ internal sealed class LirFunctionBuilder
     private static LirInstruction? LayoutTerminator(LirBlock block)
         => block.Instructions.Length == 0 ? null : block.Instructions[^1];
 
+    // A latch jumping back to its test gets the test moved behind it, where the test falls into the way out of the loop
+    private static LirBlock? RotatedHeaderExit(LirBlock latch, HashSet<LirBlock> placed)
+    {
+        if (LayoutTerminator(latch) is not LirInstruction jump || jump.Kind != LirInstructionKind.Jump || jump.Target is not LirBlock header ||
+            !placed.Contains(header) || header.Instructions.Length > MaxRotatedLoopHeaderInstructions ||
+            LayoutTerminator(header) is not LirInstruction branch || branch.Kind != LirInstructionKind.Branch ||
+            branch.TrueTarget is null || branch.FalseTarget is null || placed.Contains(branch.TrueTarget) == placed.Contains(branch.FalseTarget))
+        {
+            return null;
+        }
+        return placed.Contains(branch.TrueTarget) ? branch.FalseTarget : branch.TrueTarget;
+    }
+
     private LirBlock? SelectLayoutSuccessor(
         LirBlock block,
         HashSet<LirBlock> placed,
@@ -5177,7 +5370,7 @@ internal sealed class LirFunctionBuilder
         return firstScore >= secondScore ? first : second;
     }
 
-    private static int LayoutScore(
+    private int LayoutScore(
         LirBlock source,
         LirBlock? target,
         HashSet<LirBlock> placed,
@@ -5203,7 +5396,22 @@ internal sealed class LirFunctionBuilder
                 score -= 40;
         }
 
+        // Leaving a loop is the unlikely way out of a branch, so the edge that stays in it falls through
+        if (LoopDepth(target) < LoopDepth(source))
+            score -= 1000;
         return score;
+    }
+
+    private int LoopDepth(LirBlock block)
+    {
+        if (block.SourceBlock is ControlFlowBlock source)
+            return _loopDepths.TryGetValue(source, out int depth) ? depth : 0;
+        if (block.IsEdgeSplit && block.Instructions.Length != 0 && block.Instructions[^1].Target is LirBlock destination &&
+            destination.SourceBlock is ControlFlowBlock target)
+        {
+            return _loopDepths.TryGetValue(target, out int depth) ? depth : 0;
+        }
+        return 0;
     }
 
     private bool CanFollowLayoutEdge(
@@ -5270,7 +5478,7 @@ internal sealed class LirFunctionBuilder
         }
     }
 
-    private LirInstruction Emit(
+    private void Emit(
         LirBlock block,
         LirInstructionKind kind,
         LirVirtualRegister? result,
@@ -5293,25 +5501,34 @@ internal sealed class LirFunctionBuilder
         if (kind is LirInstructionKind.Binary or LirInstructionKind.Branch or LirInstructionKind.Store or LirInstructionKind.Select && _hoistingLoops.Count != 0)
             operands = HoistLoopConstants(kind, op, operands);
 
+        var pending = new PendingInstruction(kind, result, operands, address, op, conversionKind, callSignature, parallelCopies, switchCases,
+            target, trueTarget, falseTarget, sourceStatement, sourceValue, sourceInstruction, valueNumber, treeCode);
+        if (_splitsWideIntegers && TryEmitWordPairs(block, pending))
+            return;
+        EmitInstruction(block, pending);
+    }
+
+    private void EmitInstruction(LirBlock block, PendingInstruction pending)
+    {
         var instruction = new LirInstruction(
             _nextInstructionOrdinal++,
-            kind,
-            result,
-            operands,
-            address,
-            op,
-            conversionKind,
-            callSignature,
-            parallelCopies,
-            switchCases,
-            target,
-            trueTarget,
-            falseTarget,
-            sourceStatement,
-            sourceValue,
-            sourceInstruction,
-            valueNumber,
-            treeCode);
+            pending.Kind,
+            pending.Result,
+            pending.Operands,
+            pending.Address,
+            pending.Op,
+            pending.ConversionKind,
+            pending.CallSignature,
+            pending.ParallelCopies,
+            pending.SwitchCases,
+            pending.Target,
+            pending.TrueTarget,
+            pending.FalseTarget,
+            pending.SourceStatement,
+            pending.SourceValue,
+            pending.SourceInstruction,
+            pending.ValueNumber,
+            pending.TreeCode);
 
         if (!_instructions.TryGetValue(block, out var list))
         {
@@ -5320,7 +5537,842 @@ internal sealed class LirFunctionBuilder
         }
 
         list.Add(instruction);
-        return instruction;
+    }
+
+    private readonly record struct PendingInstruction(
+        LirInstructionKind Kind,
+        LirVirtualRegister? Result,
+        ImmutableArray<LirOperand> Operands,
+        LirAddress? Address,
+        string? Op,
+        GimpleConversionKind? ConversionKind,
+        FunctionType? CallSignature,
+        ImmutableArray<LirParallelCopy> ParallelCopies,
+        ImmutableArray<LirSwitchCase> SwitchCases,
+        LirBlock? Target,
+        LirBlock? TrueTarget,
+        LirBlock? FalseTarget,
+        GimpleStatement? SourceStatement,
+        GimpleValue? SourceValue,
+        GimpleStatementAnnotations? SourceInstruction,
+        ValueNumber? ValueNumber,
+        GimpleTreeCode TreeCode);
+
+    private static QualifiedType LowWord => TypeCatalog.Instance.Builtin(BuiltinTypeKind.UnsignedInt);
+
+    private static QualifiedType SignedWord => new QualifiedType(TypeCatalog.Instance.Int);
+
+    private QualifiedType HighWord(QualifiedType type)
+        => GimpleTypes.IsSigned(type, _target) ? SignedWord : LowWord;
+
+    private bool IsWordPair(QualifiedType type)
+        => GimpleTypes.IsIntegerLike(type) && _target.SizeOf(type) == 8;
+
+    private bool IsWordPairRegister(LirOperand operand)
+        => operand.Kind == LirOperandKind.Register && operand.Register is not null && IsWordPair(operand.Register.Type);
+
+    private bool IsWordPairValue(LirOperand operand)
+        => operand.Kind is LirOperandKind.Register or LirOperandKind.Immediate or LirOperandKind.Undefined &&
+           operand.Immediate is not string && IsWordPair(operand.Type) && (operand.Kind != LirOperandKind.Register || operand.Register is not null);
+
+    private bool TouchesWordPair(LirOperand operand)
+        => operand.Kind switch
+        {
+            LirOperandKind.Register or LirOperandKind.Immediate or LirOperandKind.Undefined => IsWordPairValue(operand),
+            LirOperandKind.Segments => operand.Parts.Any(TouchesWordPair),
+            LirOperandKind.Address => operand.Address is not null && AddressTouchesWordPair(operand.Address),
+            _ => false,
+        };
+
+    private bool AddressTouchesWordPair(LirAddress address)
+        => address.BaseOperand is not null && IsWordPairRegister(address.BaseOperand) ||
+           address.Index is not null && IsWordPairRegister(address.Index) ||
+           address.BaseAddress is not null && AddressTouchesWordPair(address.BaseAddress);
+
+    private bool InvolvesWordPair(PendingInstruction pending)
+    {
+        if (pending.Result is not null && IsWordPair(pending.Result.Type))
+            return true;
+        if (pending.Address is not null && AddressTouchesWordPair(pending.Address))
+            return true;
+        if (!pending.Operands.IsDefault && pending.Operands.Any(TouchesWordPair))
+            return true;
+        return !pending.ParallelCopies.IsDefault &&
+               pending.ParallelCopies.Any(copy => IsWordPair(copy.Destination.Type) || TouchesWordPair(copy.Source));
+    }
+
+    private (LirVirtualRegister Low, LirVirtualRegister High) WordPairOf(LirVirtualRegister register)
+    {
+        if (!_wordPairs.TryGetValue(register, out var pair))
+        {
+            pair = (NewVirtualRegister(LowWord, sourceName: null, valueNumber: null), NewVirtualRegister(HighWord(register.Type), sourceName: null, valueNumber: null));
+            _wordPairs.Add(register, pair);
+        }
+
+        return pair;
+    }
+
+    private (LirOperand Low, LirOperand High) SplitWords(LirOperand operand)
+    {
+        QualifiedType high = HighWord(operand.Type);
+        switch (operand.Kind)
+        {
+            case LirOperandKind.Register:
+                var (lowRegister, highRegister) = WordPairOf(operand.Register!);
+                return (LirOperand.ForRegister(lowRegister), LirOperand.ForRegister(highRegister));
+            case LirOperandKind.Immediate:
+                TryGetImmediateBits(operand.Immediate, operand.Type, out var bits);
+                ulong highBits = bits >> 32;
+                return (LirOperand.ImmediateValue((long)(uint)bits, LowWord),
+                    LirOperand.ImmediateValue(GimpleTypes.IsSigned(operand.Type, _target) ? (long)(int)(uint)highBits : (long)(uint)highBits, high));
+            default:
+                return (LirOperand.Undefined(operand.UndefinedName, LowWord), LirOperand.Undefined(operand.UndefinedName, high));
+        }
+    }
+
+    private LirStackSlot WordPairSlot(LirVirtualRegister register)
+    {
+        if (!_wordPairSlots.TryGetValue(register, out var slot))
+        {
+            slot = GetOrCreateAnonymousStackSlot(register.Type, "wide" + register.Name);
+            _wordPairSlots.Add(register, slot);
+        }
+
+        return slot;
+    }
+
+    private void EmitWordStep(LirBlock block, PendingInstruction pending, LirInstructionKind kind, LirVirtualRegister? result, ImmutableArray<LirOperand> operands,
+        LirAddress? address, string op, GimpleConversionKind? conversionKind, GimpleTreeCode treeCode)
+        => Emit(block, kind, result, operands, address, op, conversionKind, callSignature: null, parallelCopies: default, switchCases: default,
+            target: null, trueTarget: null, falseTarget: null, pending.SourceStatement, pending.SourceValue, pending.SourceInstruction, valueNumber: null, treeCode);
+
+    private LirOperand WordBinary(LirBlock block, PendingInstruction pending, GimpleTreeCode code, QualifiedType type, LirOperand left, LirOperand right,
+        LirVirtualRegister? into = null)
+    {
+        if (left.Kind == LirOperandKind.Immediate && right.Kind != LirOperandKind.Immediate)
+        {
+            GimpleTreeCode mirrored = code switch
+            {
+                GimpleTreeCode.LtExpr => GimpleTreeCode.GtExpr,
+                GimpleTreeCode.GtExpr => GimpleTreeCode.LtExpr,
+                GimpleTreeCode.LeExpr => GimpleTreeCode.GeExpr,
+                GimpleTreeCode.GeExpr => GimpleTreeCode.LeExpr,
+                _ => GimpleOperators.IsCommutative(code) ? code : GimpleTreeCode.None,
+            };
+            if (mirrored == GimpleTreeCode.None)
+                left = InRegister(block, left, left.Type);
+            else
+                (code, left, right) = (mirrored, right, left);
+        }
+
+        LirVirtualRegister result = into ?? NewVirtualRegister(type, sourceName: null, valueNumber: null);
+        EmitWordStep(block, pending, LirInstructionKind.Binary, result, ImmutableArray.Create(left, right), address: null, GimpleOperators.Spelling(code),
+            conversionKind: null, code);
+        return LirOperand.ForRegister(result);
+    }
+
+    private LirOperand WordShift(LirBlock block, PendingInstruction pending, GimpleTreeCode code, QualifiedType type, LirOperand value, int count,
+        LirVirtualRegister? into = null)
+        => WordBinary(block, pending, code, type, value, LirOperand.ImmediateValue(count, SignedWord), into);
+
+    private LirOperand WordUnary(LirBlock block, PendingInstruction pending, GimpleTreeCode code, QualifiedType type, LirOperand operand,
+        LirVirtualRegister? into = null)
+    {
+        LirVirtualRegister result = into ?? NewVirtualRegister(type, sourceName: null, valueNumber: null);
+        EmitWordStep(block, pending, LirInstructionKind.Unary, result, ImmutableArray.Create(operand), address: null, GimpleOperators.Spelling(code),
+            conversionKind: null, code);
+        return LirOperand.ForRegister(result);
+    }
+
+    // A conversion between words of one size keeps the bits and becomes a copy
+    private LirOperand WordConvert(LirBlock block, PendingInstruction pending, QualifiedType type, LirOperand operand, LirVirtualRegister? into = null)
+    {
+        if (operand.Kind == LirOperandKind.Immediate && _target.SizeOf(operand.Type) == _target.SizeOf(type) && TryGetImmediateBits(operand.Immediate, operand.Type, out var bits))
+            operand = LirOperand.ImmediateValue(GimpleTypes.IsSigned(type, _target) ? (long)(int)(uint)bits : (long)(uint)bits, type);
+        else if (operand.Kind == LirOperandKind.Undefined)
+            operand = LirOperand.Undefined(operand.UndefinedName, type);
+        if (SameType(operand.Type, type) && into is null)
+            return operand;
+
+        LirVirtualRegister result = into ?? NewVirtualRegister(type, sourceName: null, valueNumber: null);
+        if (SameType(operand.Type, type) || operand.Kind != LirOperandKind.Register && _target.SizeOf(operand.Type) == _target.SizeOf(type))
+        {
+            EmitWordStep(block, pending, LirInstructionKind.Copy, result, ImmutableArray.Create(operand), address: null, string.Empty, conversionKind: null,
+                GimpleTreeCode.None);
+            return LirOperand.ForRegister(result);
+        }
+
+        EmitWordStep(block, pending, LirInstructionKind.Convert, result, ImmutableArray.Create(operand), address: null,
+            GimpleOperators.Name(GimpleTreeCode.NopExpr), ConversionKindOf(GimpleTreeCode.NopExpr), GimpleTreeCode.NopExpr);
+        return LirOperand.ForRegister(result);
+    }
+
+    private void WordLoad(LirBlock block, PendingInstruction pending, LirVirtualRegister into, LirAddress address, int offset)
+        => EmitWordStep(block, pending, LirInstructionKind.Load, into, ImmutableArray<LirOperand>.Empty,
+            LirAddress.ForField(address, null, into.Type, offset), string.Empty, conversionKind: null, GimpleTreeCode.None);
+
+    private void WordStore(LirBlock block, PendingInstruction pending, LirOperand value, LirAddress address, int offset)
+        => EmitWordStep(block, pending, LirInstructionKind.Store, null, ImmutableArray.Create(value),
+            LirAddress.ForField(address, null, value.Type, offset), string.Empty, conversionKind: null, GimpleTreeCode.None);
+
+    private bool TryEmitWordPairs(LirBlock block, PendingInstruction pending)
+    {
+        if (!InvolvesWordPair(pending))
+            return false;
+        // An address wraps at 32 bits and takes only the low word of a 64-bit index
+        if (pending.Address is not null && AddressTouchesWordPair(pending.Address))
+            pending = pending with { Address = LowWordAddress(pending.Address) };
+        if (!pending.Operands.IsDefault && pending.Operands.Any(static operand => operand.Kind == LirOperandKind.Address))
+        {
+            pending = pending with
+            {
+                Operands = pending.Operands.Select(operand => operand.Kind == LirOperandKind.Address && operand.Address is not null
+                    ? LirOperand.ForAddress(LowWordAddress(operand.Address))
+                    : operand).ToImmutableArray(),
+            };
+        }
+        if (!InvolvesWordPair(pending))
+        {
+            EmitInstruction(block, pending);
+            return true;
+        }
+        if (!TryEmitWordInstructions(block, pending))
+            EmitThroughWideHomes(block, pending);
+        return true;
+    }
+
+    private bool TryEmitWordInstructions(LirBlock block, PendingInstruction pending)
+    {
+        LirVirtualRegister? result = pending.Result;
+        ImmutableArray<LirOperand> operands = pending.Operands.IsDefault ? ImmutableArray<LirOperand>.Empty : pending.Operands;
+        if (pending.Address is not null && AddressTouchesWordPair(pending.Address))
+            return false;
+
+        switch (pending.Kind)
+        {
+            case LirInstructionKind.Copy or LirInstructionKind.Constant when result is not null && IsWordPair(result.Type) && operands.Length == 1 &&
+                IsWordPairValue(operands[0]):
+            {
+                var (low, high) = WordPairOf(result);
+                var (sourceLow, sourceHigh) = SplitWords(operands[0]);
+                WordConvert(block, pending, low.Type, sourceLow, low);
+                WordConvert(block, pending, high.Type, sourceHigh, high);
+                return true;
+            }
+
+            case LirInstructionKind.Zero when result is not null && IsWordPair(result.Type):
+            {
+                var (low, high) = WordPairOf(result);
+                EmitWordStep(block, pending, LirInstructionKind.Zero, low, ImmutableArray<LirOperand>.Empty, address: null, string.Empty, conversionKind: null, GimpleTreeCode.None);
+                EmitWordStep(block, pending, LirInstructionKind.Zero, high, ImmutableArray<LirOperand>.Empty, address: null, string.Empty, conversionKind: null, GimpleTreeCode.None);
+                return true;
+            }
+
+            case LirInstructionKind.Parameter when result is not null && IsWordPair(result.Type) && operands.Length == 0:
+            {
+                FunctionType? functionType = _function.Symbol?.FunctionType;
+                AbiValue abi = CAbi.ClassifyValue(_target, result.Type, isReturn: false, isVariadicUnnamedArgument: false, functionType?.IsVariadic == true);
+                if (abi.PassingKind != AbiPassingKind.MultiRegister || abi.Segments.Length != 2)
+                    return false;
+                var (low, high) = WordPairOf(result);
+                EmitWordStep(block, pending, LirInstructionKind.Parameter, low, ImmutableArray.Create(LirOperand.ImmediateValue(0, SignedWord)), address: null,
+                    pending.Op ?? string.Empty, conversionKind: null, GimpleTreeCode.None);
+                EmitWordStep(block, pending, LirInstructionKind.Parameter, high, ImmutableArray.Create(LirOperand.ImmediateValue(1, SignedWord)), address: null,
+                    pending.Op ?? string.Empty, conversionKind: null, GimpleTreeCode.None);
+                return true;
+            }
+
+            case LirInstructionKind.Unary when result is not null && operands.Length == 1 && IsWordPairValue(operands[0]):
+                return TryEmitWordUnary(block, pending, result, operands[0]);
+
+            case LirInstructionKind.Binary when result is not null && operands.Length == 2:
+                return TryEmitWordBinary(block, pending, result, operands[0], operands[1]);
+
+            case LirInstructionKind.Convert or LirInstructionKind.Cast when result is not null && operands.Length == 1:
+                return TryEmitWordConversion(block, pending, result, operands[0]);
+
+            case LirInstructionKind.Load when result is not null && IsWordPair(result.Type) && operands.Length == 0 && pending.Address is not null:
+            {
+                var (low, high) = WordPairOf(result);
+                WordLoad(block, pending, low, pending.Address, 0);
+                WordLoad(block, pending, high, pending.Address, 4);
+                return true;
+            }
+
+            case LirInstructionKind.Store when operands.Length == 1 && IsWordPairValue(operands[0]) && pending.Address is not null:
+            {
+                var (low, high) = SplitWords(operands[0]);
+                WordStore(block, pending, low, pending.Address, 0);
+                WordStore(block, pending, high, pending.Address, 4);
+                return true;
+            }
+
+            case LirInstructionKind.Call when operands.Length != 0:
+                return TryEmitWordCall(block, pending, operands);
+
+            case LirInstructionKind.Return when operands.Length == 1 && string.IsNullOrEmpty(pending.Op) && IsWordPairValue(operands[0]):
+            {
+                FunctionType? functionType = _function.Symbol?.FunctionType;
+                AbiValue abi = CAbi.ClassifyValue(_target, functionType?.ReturnType ?? operands[0].Type, isReturn: true, isVariadicUnnamedArgument: false,
+                    functionType?.IsVariadic == true);
+                if (abi.PassingKind != AbiPassingKind.MultiRegister || abi.Segments.Length != 2)
+                    return false;
+                Emit(block, LirInstructionKind.Return, null, ImmutableArray.Create(WordSegments(block, operands[0])), address: null, op: string.Empty,
+                    conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
+                    pending.SourceStatement, pending.SourceValue, pending.SourceInstruction, valueNumber: null);
+                return true;
+            }
+
+            case LirInstructionKind.ParallelCopy when !pending.ParallelCopies.IsDefault &&
+                pending.ParallelCopies.All(copy => !IsWordPair(copy.Destination.Type) || IsWordPairValue(copy.Source)):
+            {
+                ImmutableArray<LirParallelCopy>.Builder copies = ImmutableArray.CreateBuilder<LirParallelCopy>(pending.ParallelCopies.Length * 2);
+                foreach (LirParallelCopy copy in pending.ParallelCopies)
+                {
+                    if (!IsWordPair(copy.Destination.Type))
+                    {
+                        copies.Add(copy);
+                        continue;
+                    }
+
+                    var (low, high) = WordPairOf(copy.Destination);
+                    var (sourceLow, sourceHigh) = SplitWords(copy.Source);
+                    copies.Add(new LirParallelCopy(low, sourceLow));
+                    copies.Add(new LirParallelCopy(high, SameType(sourceHigh.Type, high.Type) ? sourceHigh : WordConvert(block, pending, high.Type, sourceHigh)));
+                }
+                EmitInstruction(block, pending with { ParallelCopies = copies.ToImmutable() });
+                return true;
+            }
+
+            case LirInstructionKind.Select when operands.Length == 4:
+                return TryEmitWordSelect(block, pending, result, operands);
+
+            case LirInstructionKind.Branch when operands.Length is 1 or 2:
+                return TryEmitWordBranch(block, pending, operands);
+
+            case LirInstructionKind.Switch when operands.Length == 1 && IsWordPairValue(operands[0]) && !pending.SwitchCases.IsDefault &&
+                pending.Target is not null && pending.SwitchCases.All(switchCase => switchCase.Value.Kind == LirOperandKind.Immediate):
+                EmitWordSwitch(block, pending, operands[0]);
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    private LirOperand WordSegments(LirBlock block, LirOperand value)
+    {
+        var (low, high) = SplitWords(value);
+        return LirOperand.ForSegments(value.Type, ImmutableArray.Create(InRegister(block, low, low.Type), InRegister(block, high, high.Type)));
+    }
+
+    private bool TryEmitWordUnary(LirBlock block, PendingInstruction pending, LirVirtualRegister result, LirOperand operand)
+    {
+        var (low, high) = SplitWords(operand);
+        if (pending.Op == "!" && !IsWordPair(result.Type))
+        {
+            LirOperand either = WordBinary(block, pending, GimpleTreeCode.BitIorExpr, LowWord, low, WordConvert(block, pending, LowWord, high));
+            WordBinary(block, pending, GimpleTreeCode.EqExpr, result.Type, either, LirOperand.ImmediateValue(0L, LowWord), result);
+            return true;
+        }
+        if (!IsWordPair(result.Type))
+            return false;
+
+        var (resultLow, resultHigh) = WordPairOf(result);
+        switch (pending.Op)
+        {
+            case "~":
+                WordUnary(block, pending, GimpleTreeCode.BitNotExpr, LowWord, low, resultLow);
+                WordConvert(block, pending, resultHigh.Type, WordUnary(block, pending, GimpleTreeCode.BitNotExpr, high.Type, high), resultHigh);
+                return true;
+            case "-":
+            {
+                // The high word borrows exactly when the low word is not zero
+                LirOperand borrow = WordBinary(block, pending, GimpleTreeCode.NeExpr, resultHigh.Type, low, LirOperand.ImmediateValue(0L, LowWord));
+                LirOperand negatedHigh = WordUnary(block, pending, GimpleTreeCode.NegateExpr, resultHigh.Type, WordConvert(block, pending, resultHigh.Type, high));
+                WordBinary(block, pending, GimpleTreeCode.MinusExpr, resultHigh.Type, negatedHigh, borrow, resultHigh);
+                WordUnary(block, pending, GimpleTreeCode.NegateExpr, LowWord, low, resultLow);
+                return true;
+            }
+            case "+":
+                WordConvert(block, pending, LowWord, low, resultLow);
+                WordConvert(block, pending, resultHigh.Type, high, resultHigh);
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private bool TryEmitWordBinary(LirBlock block, PendingInstruction pending, LirVirtualRegister result, LirOperand left, LirOperand right)
+    {
+        string? op = pending.Op;
+        if (op is "==" or "!=" or "<" or "<=" or ">" or ">=")
+        {
+            if (IsWordPair(result.Type) || !IsWordPairValue(left) || !IsWordPairValue(right))
+                return false;
+            EmitWordComparison(block, pending, ComparisonCode(op), left, right, result);
+            return true;
+        }
+        if (!IsWordPair(result.Type) || !IsWordPairValue(left))
+            return false;
+
+        if (op is "<<" or ">>")
+        {
+            if (right.Kind != LirOperandKind.Immediate || right.Immediate is string || !TryGetImmediateBits(right.Immediate, right.Type, out var count))
+                return false;
+            EmitWordShift(block, pending, op == "<<", left, (int)(count & 63), result);
+            return true;
+        }
+        if (op is not ("+" or "-" or "&" or "|" or "^") || !IsWordPairValue(right))
+            return false;
+
+        var (leftLow, leftHigh) = SplitWords(left);
+        var (rightLow, rightHigh) = SplitWords(right);
+        var (resultLow, resultHigh) = WordPairOf(result);
+        QualifiedType highType = resultHigh.Type;
+        leftHigh = WordConvert(block, pending, highType, leftHigh);
+        rightHigh = WordConvert(block, pending, highType, rightHigh);
+        switch (op)
+        {
+            case "+":
+            {
+                // The low sum wraps below an addend exactly when it carries
+                LirOperand sum = WordBinary(block, pending, GimpleTreeCode.PlusExpr, LowWord, leftLow, rightLow);
+                LirOperand carry = WordBinary(block, pending, GimpleTreeCode.LtExpr, highType, sum, rightLow);
+                LirOperand high = WordBinary(block, pending, GimpleTreeCode.PlusExpr, highType, leftHigh, rightHigh);
+                WordBinary(block, pending, GimpleTreeCode.PlusExpr, highType, high, carry, resultHigh);
+                WordConvert(block, pending, LowWord, sum, resultLow);
+                return true;
+            }
+            case "-":
+            {
+                LirOperand borrow = WordBinary(block, pending, GimpleTreeCode.LtExpr, highType, leftLow, rightLow);
+                LirOperand difference = WordBinary(block, pending, GimpleTreeCode.MinusExpr, LowWord, leftLow, rightLow);
+                LirOperand high = WordBinary(block, pending, GimpleTreeCode.MinusExpr, highType, leftHigh, rightHigh);
+                WordBinary(block, pending, GimpleTreeCode.MinusExpr, highType, high, borrow, resultHigh);
+                WordConvert(block, pending, LowWord, difference, resultLow);
+                return true;
+            }
+            default:
+            {
+                GimpleTreeCode code = op == "&" ? GimpleTreeCode.BitAndExpr : op == "|" ? GimpleTreeCode.BitIorExpr : GimpleTreeCode.BitXorExpr;
+                LirOperand low = WordBinary(block, pending, code, LowWord, leftLow, rightLow);
+                WordBinary(block, pending, code, highType, leftHigh, rightHigh, resultHigh);
+                WordConvert(block, pending, LowWord, low, resultLow);
+                return true;
+            }
+        }
+    }
+
+    private static GimpleTreeCode ComparisonCode(string op)
+        => op switch
+        {
+            "==" => GimpleTreeCode.EqExpr,
+            "!=" => GimpleTreeCode.NeExpr,
+            "<" => GimpleTreeCode.LtExpr,
+            "<=" => GimpleTreeCode.LeExpr,
+            ">" => GimpleTreeCode.GtExpr,
+            _ => GimpleTreeCode.GeExpr,
+        };
+
+    // The high words decide unless they are equal, then the low words decide unsigned
+    private LirOperand EmitWordComparison(LirBlock block, PendingInstruction pending, GimpleTreeCode code, LirOperand left, LirOperand right,
+        LirVirtualRegister? into = null)
+    {
+        var (leftLow, leftHigh) = SplitWords(left);
+        var (rightLow, rightHigh) = SplitWords(right);
+        QualifiedType highType = HighWord(left.Type);
+        leftHigh = WordConvert(block, pending, highType, leftHigh);
+        rightHigh = WordConvert(block, pending, highType, rightHigh);
+        QualifiedType resultType = into?.Type ?? SignedWord;
+        if (code is GimpleTreeCode.EqExpr or GimpleTreeCode.NeExpr)
+        {
+            LirOperand lowDifference = WordBinary(block, pending, GimpleTreeCode.BitXorExpr, LowWord, leftLow, rightLow);
+            LirOperand highDifference = WordConvert(block, pending, LowWord, WordBinary(block, pending, GimpleTreeCode.BitXorExpr, highType, leftHigh, rightHigh));
+            LirOperand difference = WordBinary(block, pending, GimpleTreeCode.BitIorExpr, LowWord, lowDifference, highDifference);
+            return WordBinary(block, pending, code, resultType, difference, LirOperand.ImmediateValue(0L, LowWord), into);
+        }
+
+        GimpleTreeCode strict = code is GimpleTreeCode.LtExpr or GimpleTreeCode.LeExpr ? GimpleTreeCode.LtExpr : GimpleTreeCode.GtExpr;
+        LirOperand highDecides = WordBinary(block, pending, strict, SignedWord, leftHigh, rightHigh);
+        LirOperand highEqual = WordBinary(block, pending, GimpleTreeCode.EqExpr, SignedWord, leftHigh, rightHigh);
+        LirOperand lowDecides = WordBinary(block, pending, code, SignedWord, leftLow, rightLow);
+        LirOperand tie = WordBinary(block, pending, GimpleTreeCode.BitAndExpr, SignedWord, highEqual, lowDecides);
+        return WordBinary(block, pending, GimpleTreeCode.BitIorExpr, resultType, highDecides, tie, into);
+    }
+
+    private void EmitWordShift(LirBlock block, PendingInstruction pending, bool left, LirOperand value, int count, LirVirtualRegister result)
+    {
+        var (low, high) = SplitWords(value);
+        var (resultLow, resultHigh) = WordPairOf(result);
+        QualifiedType highType = resultHigh.Type;
+        bool arithmetic = !left && GimpleTypes.IsSigned(value.Type, _target);
+        if (count == 0)
+        {
+            WordConvert(block, pending, highType, high, resultHigh);
+            WordConvert(block, pending, LowWord, low, resultLow);
+            return;
+        }
+
+        if (left)
+        {
+            if (count >= 32)
+            {
+                LirOperand moved = count == 32 ? low : WordShift(block, pending, GimpleTreeCode.LshiftExpr, LowWord, low, count - 32);
+                WordConvert(block, pending, highType, moved, resultHigh);
+                WordConvert(block, pending, LowWord, LirOperand.ImmediateValue(0L, LowWord), resultLow);
+                return;
+            }
+
+            LirOperand carried = WordShift(block, pending, GimpleTreeCode.RshiftExpr, LowWord, low, 32 - count);
+            LirOperand shiftedHigh = WordShift(block, pending, GimpleTreeCode.LshiftExpr, LowWord, WordConvert(block, pending, LowWord, high), count);
+            WordConvert(block, pending, highType, WordBinary(block, pending, GimpleTreeCode.BitIorExpr, LowWord, shiftedHigh, carried), resultHigh);
+            WordShift(block, pending, GimpleTreeCode.LshiftExpr, LowWord, low, count, resultLow);
+            return;
+        }
+
+        LirOperand signedHigh = WordConvert(block, pending, arithmetic ? SignedWord : LowWord, high);
+        if (count >= 32)
+        {
+            LirOperand moved = count == 32 ? signedHigh : WordShift(block, pending, GimpleTreeCode.RshiftExpr, signedHigh.Type, signedHigh, count - 32);
+            LirOperand fill = arithmetic
+                ? WordShift(block, pending, GimpleTreeCode.RshiftExpr, SignedWord, signedHigh, 31)
+                : LirOperand.ImmediateValue(0L, LowWord);
+            WordConvert(block, pending, LowWord, moved, resultLow);
+            WordConvert(block, pending, highType, fill, resultHigh);
+            return;
+        }
+
+        LirOperand borrowed = WordShift(block, pending, GimpleTreeCode.LshiftExpr, LowWord, WordConvert(block, pending, LowWord, high), 32 - count);
+        LirOperand shiftedLow = WordShift(block, pending, GimpleTreeCode.RshiftExpr, LowWord, low, count);
+        LirOperand newLow = WordBinary(block, pending, GimpleTreeCode.BitIorExpr, LowWord, shiftedLow, borrowed);
+        WordConvert(block, pending, highType, WordShift(block, pending, GimpleTreeCode.RshiftExpr, signedHigh.Type, signedHigh, count), resultHigh);
+        WordConvert(block, pending, LowWord, newLow, resultLow);
+    }
+
+    private bool TryEmitWordConversion(LirBlock block, PendingInstruction pending, LirVirtualRegister result, LirOperand operand)
+    {
+        if (pending.Kind == LirInstructionKind.Cast && TryEmitWordReinterpretation(block, pending, result, operand))
+            return true;
+        if (GimpleTypes.IsFloating(result.Type) || GimpleTypes.IsFloating(operand.Type) ||
+            !GimpleTypes.IsIntegerLike(result.Type) && !GimpleTypes.IsPointerLike(result.Type) ||
+            !GimpleTypes.IsIntegerLike(operand.Type) && !GimpleTypes.IsPointerLike(operand.Type))
+        {
+            return false;
+        }
+
+        if (IsWordPair(result.Type))
+        {
+            var (resultLow, resultHigh) = WordPairOf(result);
+            if (IsWordPair(operand.Type))
+            {
+                if (!IsWordPairValue(operand))
+                    return false;
+                var (low, high) = SplitWords(operand);
+                WordConvert(block, pending, resultHigh.Type, high, resultHigh);
+                WordConvert(block, pending, LowWord, low, resultLow);
+                return true;
+            }
+            if (TouchesWordPair(operand) || _target.SizeOf(operand.Type) > 4)
+                return false;
+
+            bool signed = GimpleTypes.IsSigned(operand.Type, _target) && !GimpleTypes.IsPointerLike(operand.Type);
+            LirOperand word = WordConvert(block, pending, signed ? SignedWord : LowWord, operand);
+            if (signed)
+                WordConvert(block, pending, resultHigh.Type, WordShift(block, pending, GimpleTreeCode.RshiftExpr, SignedWord, word, 31), resultHigh);
+            else
+                WordConvert(block, pending, resultHigh.Type, LirOperand.ImmediateValue(0L, resultHigh.Type), resultHigh);
+            WordConvert(block, pending, LowWord, word, resultLow);
+            return true;
+        }
+
+        if (!IsWordPairValue(operand))
+            return false;
+        var (operandLow, operandHigh) = SplitWords(operand);
+        if (result.Type.Type is BuiltinType { BuiltinKind: BuiltinTypeKind.Bool })
+        {
+            LirOperand either = WordBinary(block, pending, GimpleTreeCode.BitIorExpr, LowWord, operandLow, WordConvert(block, pending, LowWord, operandHigh));
+            WordBinary(block, pending, GimpleTreeCode.NeExpr, result.Type, either, LirOperand.ImmediateValue(0L, LowWord), result);
+            return true;
+        }
+
+        EmitWordStep(block, pending, LirInstructionKind.Convert, result, ImmutableArray.Create(operandLow), address: null,
+            GimpleOperators.Name(GimpleTreeCode.NopExpr), ConversionKindOf(GimpleTreeCode.NopExpr), GimpleTreeCode.NopExpr);
+        return true;
+    }
+
+    // A double and a word pair trade their bits through the pair's stack slot
+    private bool TryEmitWordReinterpretation(LirBlock block, PendingInstruction pending, LirVirtualRegister result, LirOperand operand)
+    {
+        if (GimpleTypes.IsFloating(result.Type) && _target.SizeOf(result.Type) == 8 && IsWordPairValue(operand))
+        {
+            LirAddress slot = LirAddress.ForStackSlot(operand.Kind == LirOperandKind.Register
+                ? WordPairSlot(operand.Register!)
+                : GetOrCreateAnonymousStackSlot(operand.Type, "wide"));
+            var (low, high) = SplitWords(operand);
+            WordStore(block, pending, low, slot, 0);
+            WordStore(block, pending, high, slot, 4);
+            EmitWordStep(block, pending, LirInstructionKind.Load, result, ImmutableArray<LirOperand>.Empty, LirAddress.ForField(slot, null, result.Type, 0),
+                string.Empty, conversionKind: null, GimpleTreeCode.None);
+            return true;
+        }
+
+        if (GimpleTypes.IsFloating(operand.Type) && _target.SizeOf(operand.Type) == 8 && IsWordPair(result.Type) && !TouchesWordPair(operand))
+        {
+            LirAddress slot = LirAddress.ForStackSlot(WordPairSlot(result));
+            var (low, high) = WordPairOf(result);
+            EmitWordStep(block, pending, LirInstructionKind.Store, null, ImmutableArray.Create(operand), LirAddress.ForField(slot, null, operand.Type, 0),
+                string.Empty, conversionKind: null, GimpleTreeCode.None);
+            WordLoad(block, pending, low, slot, 0);
+            WordLoad(block, pending, high, slot, 4);
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool TryEmitWordCall(LirBlock block, PendingInstruction pending, ImmutableArray<LirOperand> operands)
+    {
+        if (TouchesWordPair(operands[0]))
+            return false;
+        for (var i = 1; i < operands.Length; i++)
+        {
+            if (operands[i].Kind != LirOperandKind.Register && operands[i].Kind != LirOperandKind.Immediate &&
+                operands[i].Kind != LirOperandKind.Undefined && TouchesWordPair(operands[i]))
+            {
+                return false;
+            }
+        }
+
+        FunctionType? signature = pending.CallSignature;
+        var cursor = new AbiCursor();
+        if (pending.Result is not null && CAbi.RequiresHiddenReturnBuffer(_target, pending.Result.Type))
+            _ = CAbi.AssignHiddenReturnBufferLocation(_target, ref cursor, _target.PointerSize);
+        ImmutableArray<LirOperand>.Builder arguments = ImmutableArray.CreateBuilder<LirOperand>(operands.Length);
+        arguments.Add(operands[0]);
+        for (var i = 1; i < operands.Length; i++)
+        {
+            LirOperand operand = operands[i];
+            bool isVariadicUnnamed = signature is not null && signature.IsVariadic && i - 1 >= signature.Parameters.Length;
+            AbiValue abi = CAbi.ClassifyValue(_target, operand.Type, isReturn: false, isVariadicUnnamed, signature?.IsVariadic == true);
+            AbiPlacement placement = CAbi.PlaceArgument(abi, ref cursor, _target.PointerSize);
+            if (!IsWordPairValue(operand))
+                arguments.Add(operand);
+            else if (abi.PassingKind == AbiPassingKind.MultiRegister && abi.Segments.Length == 2 && placement.KeepsClassification(abi))
+                arguments.Add(WordSegments(block, operand));
+            else
+                arguments.Add(MaterializeWide(block, pending, operand));
+        }
+
+        EmitWithWideResult(block, pending with { Operands = arguments.ToImmutable() });
+        return true;
+    }
+
+    private bool TryEmitWordSelect(LirBlock block, PendingInstruction pending, LirVirtualRegister? result, ImmutableArray<LirOperand> operands)
+    {
+        if (result is null)
+            return false;
+        bool wideCondition = IsWordPairValue(operands[0]) && IsWordPairValue(operands[1]);
+        if (!wideCondition && (TouchesWordPair(operands[0]) || TouchesWordPair(operands[1])))
+            return false;
+        if (IsWordPair(result.Type) ? !IsWordPairValue(operands[2]) || !IsWordPairValue(operands[3]) : TouchesWordPair(operands[2]) || TouchesWordPair(operands[3]))
+            return false;
+
+        LirOperand conditionLeft = operands[0];
+        LirOperand conditionRight = operands[1];
+        string? op = pending.Op;
+        GimpleTreeCode treeCode = pending.TreeCode;
+        if (wideCondition)
+        {
+            conditionLeft = EmitWordComparison(block, pending, ComparisonCode(pending.Op ?? string.Empty), operands[0], operands[1]);
+            conditionRight = LirOperand.ImmediateValue(0L, SignedWord);
+            op = "!=";
+            treeCode = GimpleTreeCode.NeExpr;
+        }
+
+        if (!IsWordPair(result.Type))
+        {
+            EmitInstruction(block, pending with { Operands = ImmutableArray.Create(conditionLeft, conditionRight, operands[2], operands[3]), Op = op, TreeCode = treeCode });
+            return true;
+        }
+
+        var (trueLow, trueHigh) = SplitWords(operands[2]);
+        var (falseLow, falseHigh) = SplitWords(operands[3]);
+        var (resultLow, resultHigh) = WordPairOf(result);
+        Emit(block, LirInstructionKind.Select, resultLow, ImmutableArray.Create(conditionLeft, conditionRight, trueLow, falseLow), address: null, op,
+            conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
+            pending.SourceStatement, pending.SourceValue, pending.SourceInstruction, valueNumber: null, treeCode);
+        Emit(block, LirInstructionKind.Select, resultHigh, ImmutableArray.Create(conditionLeft, conditionRight,
+                WordConvert(block, pending, resultHigh.Type, trueHigh), WordConvert(block, pending, resultHigh.Type, falseHigh)), address: null, op,
+            conversionKind: null, callSignature: null, parallelCopies: default, switchCases: default, target: null, trueTarget: null, falseTarget: null,
+            pending.SourceStatement, pending.SourceValue, pending.SourceInstruction, valueNumber: null, treeCode);
+        return true;
+    }
+
+    // The high word picks among the cases that share it, then a word switch picks among their low words
+    private void EmitWordSwitch(LirBlock block, PendingInstruction pending, LirOperand value)
+    {
+        var (low, high) = SplitWords(value);
+        LirOperand highWord = WordConvert(block, pending, LowWord, high);
+        List<IGrouping<uint, LirSwitchCase>> groups = pending.SwitchCases
+            .GroupBy(switchCase => TryGetImmediateBits(switchCase.Value.Immediate, switchCase.Value.Type, out var bits) ? (uint)(bits >> 32) : 0u)
+            .ToList();
+        LirBlock test = block;
+        for (var i = 0; i < groups.Count; i++)
+        {
+            LirBlock cases = NewBlock(block.Name + "_wide_cases", block.SourceBlock, isEdgeSplit: false);
+            LirBlock next = i + 1 < groups.Count ? NewBlock(block.Name + "_wide_test", block.SourceBlock, isEdgeSplit: false) : pending.Target!;
+            LirOperand match = WordBinary(test, pending, GimpleTreeCode.EqExpr, SignedWord, highWord, LirOperand.ImmediateValue((long)groups[i].Key, LowWord));
+            Emit(test, LirInstructionKind.Branch, null, ImmutableArray.Create(match), address: null, op: string.Empty, conversionKind: null, callSignature: null,
+                parallelCopies: default, switchCases: default, target: null, trueTarget: cases, falseTarget: next, pending.SourceStatement, pending.SourceValue,
+                pending.SourceInstruction, valueNumber: null, GimpleTreeCode.NeExpr);
+            ImmutableArray<LirSwitchCase> lowCases = groups[i]
+                .Select(switchCase =>
+                {
+                    TryGetImmediateBits(switchCase.Value.Immediate, switchCase.Value.Type, out var bits);
+                    return new LirSwitchCase(LirOperand.ImmediateValue((long)(uint)bits, LowWord), switchCase.Target);
+                })
+                .ToImmutableArray();
+            Emit(cases, LirInstructionKind.Switch, null, ImmutableArray.Create(low), address: null, op: string.Empty, conversionKind: null, callSignature: null,
+                parallelCopies: default, lowCases, pending.Target, trueTarget: null, falseTarget: null, pending.SourceStatement, pending.SourceValue,
+                pending.SourceInstruction, valueNumber: null);
+            test = next;
+        }
+        if (groups.Count == 0)
+        {
+            Emit(block, LirInstructionKind.Jump, null, ImmutableArray<LirOperand>.Empty, address: null, op: string.Empty, conversionKind: null, callSignature: null,
+                parallelCopies: default, switchCases: default, pending.Target, trueTarget: null, falseTarget: null, pending.SourceStatement, pending.SourceValue,
+                pending.SourceInstruction, valueNumber: null);
+        }
+    }
+
+    private LirAddress LowWordAddress(LirAddress address)
+    {
+        if (!AddressTouchesWordPair(address))
+            return address;
+        return address.Kind switch
+        {
+            LirAddressKind.Indirect => LirAddress.Indirect(LowWordOf(address.BaseOperand!), address.ElementType),
+            LirAddressKind.Element => LirAddress.Element(LowWordAddress(address.BaseAddress!), address.Index is null ? null : LowWordOf(address.Index),
+                address.ElementType, address.Scale),
+            LirAddressKind.Field => LirAddress.ForField(LowWordAddress(address.BaseAddress!), address.Field, address.ElementType, address.Displacement),
+            _ => address,
+        };
+    }
+
+    private LirOperand LowWordOf(LirOperand operand)
+        => IsWordPairRegister(operand) ? LirOperand.ForRegister(WordPairOf(operand.Register!).Low) : operand;
+
+    private bool TryEmitWordBranch(LirBlock block, PendingInstruction pending, ImmutableArray<LirOperand> operands)
+    {
+        LirOperand truth;
+        if (operands.Length == 1)
+        {
+            if (!IsWordPairValue(operands[0]))
+                return false;
+            var (low, high) = SplitWords(operands[0]);
+            truth = WordBinary(block, pending, GimpleTreeCode.BitIorExpr, LowWord, low, WordConvert(block, pending, LowWord, high));
+        }
+        else
+        {
+            if (!IsWordPairValue(operands[0]) || !IsWordPairValue(operands[1]))
+                return false;
+            truth = EmitWordComparison(block, pending, ComparisonCode(pending.Op ?? string.Empty), operands[0], operands[1]);
+        }
+
+        EmitInstruction(block, pending with { Operands = ImmutableArray.Create(truth), Op = string.Empty, TreeCode = GimpleTreeCode.NeExpr });
+        return true;
+    }
+
+    // What has no word form yet reads a 64-bit value back from memory and leaves its result there for the words to load
+    private void EmitThroughWideHomes(LirBlock block, PendingInstruction pending)
+    {
+        ImmutableArray<LirOperand> operands = pending.Operands.IsDefault ? pending.Operands : pending.Operands.Select(operand => MaterializeWide(block, pending, operand)).ToImmutableArray();
+        LirAddress? address = pending.Address is null ? null : MaterializeWideAddress(block, pending, pending.Address);
+        ImmutableArray<LirParallelCopy> copies = pending.ParallelCopies;
+        List<(LirVirtualRegister Wide, LirVirtualRegister Home)> splitCopies = new();
+        if (!copies.IsDefault)
+        {
+            ImmutableArray<LirParallelCopy>.Builder rewritten = ImmutableArray.CreateBuilder<LirParallelCopy>(copies.Length);
+            foreach (LirParallelCopy copy in copies)
+            {
+                LirVirtualRegister destination = copy.Destination;
+                if (IsWordPair(destination.Type))
+                {
+                    LirVirtualRegister home = WideHome(destination);
+                    splitCopies.Add((destination, home));
+                    destination = home;
+                }
+                rewritten.Add(new LirParallelCopy(destination, MaterializeWide(block, pending, copy.Source)));
+            }
+            copies = rewritten.ToImmutable();
+        }
+
+        EmitWithWideResult(block, pending with { Operands = operands, Address = address, ParallelCopies = copies });
+        foreach (var (wide, home) in splitCopies)
+            LoadWordPair(block, pending, wide, home);
+    }
+
+    private void EmitWithWideResult(LirBlock block, PendingInstruction pending)
+    {
+        LirVirtualRegister? result = pending.Result;
+        if (result is null || !IsWordPair(result.Type))
+        {
+            EmitInstruction(block, pending);
+            return;
+        }
+
+        LirVirtualRegister home = WideHome(result);
+        EmitInstruction(block, pending with { Result = home });
+        LoadWordPair(block, pending, result, home);
+    }
+
+    private LirVirtualRegister WideHome(LirVirtualRegister register)
+    {
+        LirVirtualRegister home = NewVirtualRegister(register.Type, sourceName: null, valueNumber: null);
+        home.HomeSlot = WordPairSlot(register);
+        return home;
+    }
+
+    private void LoadWordPair(LirBlock block, PendingInstruction pending, LirVirtualRegister wide, LirVirtualRegister home)
+    {
+        var (low, high) = WordPairOf(wide);
+        LirAddress slot = LirAddress.ForStackSlot(home.HomeSlot!);
+        WordLoad(block, pending, low, slot, 0);
+        WordLoad(block, pending, high, slot, 4);
+    }
+
+    private LirOperand MaterializeWide(LirBlock block, PendingInstruction pending, LirOperand operand)
+    {
+        if (operand.Kind == LirOperandKind.Segments && operand.Parts.Any(IsWordPairRegister))
+            return LirOperand.ForSegments(operand.Type, operand.Parts.Select(part => MaterializeWide(block, pending, part)).ToImmutableArray());
+        if (operand.Kind == LirOperandKind.Address && operand.Address is not null && AddressTouchesWordPair(operand.Address))
+            return LirOperand.ForAddress(MaterializeWideAddress(block, pending, operand.Address));
+        if (!IsWordPairRegister(operand))
+            return operand;
+
+        var (low, high) = WordPairOf(operand.Register!);
+        LirStackSlot slot = WordPairSlot(operand.Register!);
+        LirAddress address = LirAddress.ForStackSlot(slot);
+        WordStore(block, pending, LirOperand.ForRegister(low), address, 0);
+        WordStore(block, pending, LirOperand.ForRegister(high), address, 4);
+        LirVirtualRegister wide = NewVirtualRegister(operand.Type, sourceName: null, valueNumber: null);
+        wide.HomeSlot = slot;
+        return LirOperand.ForRegister(wide);
+    }
+
+    private LirAddress MaterializeWideAddress(LirBlock block, PendingInstruction pending, LirAddress address)
+    {
+        if (!AddressTouchesWordPair(address))
+            return address;
+        return address.Kind switch
+        {
+            LirAddressKind.Indirect => LirAddress.Indirect(MaterializeWide(block, pending, address.BaseOperand!), address.ElementType),
+            LirAddressKind.Element => LirAddress.Element(MaterializeWideAddress(block, pending, address.BaseAddress!),
+                address.Index is null ? null : MaterializeWide(block, pending, address.Index), address.ElementType, address.Scale),
+            LirAddressKind.Field => LirAddress.ForField(MaterializeWideAddress(block, pending, address.BaseAddress!), address.Field, address.ElementType, address.Displacement),
+            _ => address,
+        };
     }
 
     private void EmitNop(LirBlock block, GimpleStatement statement)

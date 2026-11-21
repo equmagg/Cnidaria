@@ -420,14 +420,18 @@ namespace Cnidaria.Cs
 
         // A live vector value can be as wide as the target's vectors, beyond what the callee-saved slots keep
         public static int LiveRegisterSaveSize(TargetInfo target, MachineRegister register)
-            => target.IsX86 && MachineRegisters.GetClass(register) == RegisterClass.Float
+            => (target.IsX86 || IsArm64(target) && SimdTypes.TargetSupports(target, 16)) && MachineRegisters.GetClass(register) == RegisterClass.Float
                 ? SimdTypes.MaxSize(target)
                 : RegisterSaveSize(target, register);
 
-        // Callee-saved xmm registers keep only their low 128 bits across a call
+        public static int CalleeSavedVectorBytes(TargetInfo target)
+            => target.IsX86 ? 16 : IsArm64(target) ? 8 : 0;
+
+        // Callee-saved xmm registers keep only their low 128 bits across a call, ARM64 v8-v15 only their low 64
         public static UInt128 CallClobberedVectorUpperMask(TargetInfo target)
         {
-            if (!target.IsX86 || SimdTypes.MaxSize(target) <= 16)
+            int preserved = CalleeSavedVectorBytes(target);
+            if (preserved == 0 || SimdTypes.MaxSize(target) <= preserved || IsArm64(target) && !SimdTypes.TargetSupports(target, 16))
                 return 0;
             UInt128 mask = 0;
             foreach (MachineRegister register in AllocatableFloatingRegisters(target))

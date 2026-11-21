@@ -314,6 +314,8 @@ public enum ArmIsaFlags : ulong
     VfpD32 = 1UL << 1,
     Neon = 1UL << 2,
     HardFloat = 1UL << 3,
+    Sve = 1UL << 4,
+    Sve2 = 1UL << 5,
 }
 
 public enum ArmAbiKind : byte
@@ -376,6 +378,24 @@ public enum ArmAddressingMode : byte
     PreIndex,
     PostIndex,
     Literal,
+    MulVl,
+}
+
+public enum ArmPredication : byte
+{
+    None,
+    Merging,
+    Zeroing,
+}
+
+public enum ArmPredicatePattern : byte
+{
+    Pow2 = 0,
+    Vl1, Vl2, Vl3, Vl4, Vl5, Vl6, Vl7, Vl8,
+    Vl16, Vl32, Vl64, Vl128, Vl256,
+    Mul4 = 29,
+    Mul3 = 30,
+    All = 31,
 }
 
 public enum ArmOperandKind : byte
@@ -389,6 +409,12 @@ public enum ArmOperandKind : byte
     RegisterList,
     Symbol,
     SystemRegister,
+    VectorElement,
+    VectorList,
+    Pattern,
+    Multiplier,
+    FloatingImmediate,
+    PrefetchOperation,
 }
 
 public enum ArmInstrKind : ushort
@@ -471,6 +497,13 @@ public enum ArmInstrKind : ushort
     Ldrsw,
     Ldur,
     Stur,
+    Ldurb,
+    Sturb,
+    Ldurh,
+    Sturh,
+    Ldursb,
+    Ldursh,
+    Ldursw,
     Ldp,
     Stp,
     Ldaxr,
@@ -511,6 +544,590 @@ public enum ArmInstrKind : ushort
     Fcvtzu,
     Fcvt,
     Csel,
+    Abs,
+    Addpl,
+    Addvl,
+    Andv,
+    Cls,
+    Cnot,
+    Cnt,
+    Cntb,
+    Cntd,
+    Cnth,
+    Cntp,
+    Cntw,
+    Decb,
+    Decd,
+    Dech,
+    Decw,
+    Dup,
+    Dupm,
+    Eon,
+    Eors,
+    Eorv,
+    Fabd,
+    Faddv,
+    Famax,
+    Famin,
+    Fdivr,
+    Fmad,
+    Fmax,
+    Fmaxnm,
+    Fmaxnmv,
+    Fmaxv,
+    Fmin,
+    Fminnm,
+    Fminnmv,
+    Fminv,
+    Fmla,
+    Fmls,
+    Fmsb,
+    Fmulx,
+    Fnmad,
+    Fnmla,
+    Fnmls,
+    Fnmsb,
+    Frecpe,
+    Frecps,
+    Frecpx,
+    Frinta,
+    Frinti,
+    Frintm,
+    Frintn,
+    Frintp,
+    Frintx,
+    Frintz,
+    Frsqrte,
+    Frsqrts,
+    Fscale,
+    Fsubr,
+    Incb,
+    Incd,
+    Inch,
+    Incw,
+    Mad,
+    Msb,
+    Nand,
+    Nands,
+    Neg,
+    Nor,
+    Nors,
+    Not,
+    Orn,
+    Orns,
+    Orrs,
+    Orv,
+    Pfalse,
+    Ptest,
+    Ptrue,
+    Ptrues,
+    Rdvl,
+    Sabd,
+    Saddv,
+    Sdivr,
+    Smax,
+    Smaxv,
+    Smin,
+    Sminv,
+    Sqadd,
+    Sqsub,
+    Subr,
+    Trn1,
+    Trn2,
+    Uabd,
+    Uaddv,
+    Udivr,
+    Umax,
+    Umaxv,
+    Umin,
+    Uminv,
+    Uqadd,
+    Uqsub,
+    Uxtw,
+    Uzp1,
+    Uzp2,
+    Whilege,
+    Whilegt,
+    Whilehi,
+    Whilehs,
+    Whilele,
+    Whilelo,
+    Whilels,
+    Whilelt,
+    Zip1,
+    Zip2,
+    Addp,
+    Cadd,
+    Eorbt,
+    Eortb,
+    Faddp,
+    Fcvtlt,
+    Fcvtnt,
+    Fcvtx,
+    Fcvtxnt,
+    Flogb,
+    Fmaxnmp,
+    Fmaxp,
+    Fminnmp,
+    Fminp,
+    Ld1b,
+    Ld1d,
+    Ld1h,
+    Ld1sb,
+    Ld1sh,
+    Ld1sw,
+    Ld1w,
+    Ldff1b,
+    Ldff1d,
+    Ldff1h,
+    Ldff1sb,
+    Ldff1sh,
+    Ldff1sw,
+    Ldff1w,
+    Ldnf1b,
+    Ldnf1d,
+    Ldnf1h,
+    Ldnf1sb,
+    Ldnf1sh,
+    Ldnf1sw,
+    Ldnf1w,
+    Pmul,
+    Pmullb,
+    Pmullt,
+    Saba,
+    Sabalb,
+    Sabalt,
+    Sabdlb,
+    Sabdlt,
+    Saddlb,
+    Saddlbt,
+    Saddlt,
+    Saddwb,
+    Saddwt,
+    Shadd,
+    Shsub,
+    Shsubr,
+    Smaxp,
+    Sminp,
+    Smlalb,
+    Smlalt,
+    Smlslb,
+    Smlslt,
+    Smullb,
+    Smullt,
+    Sqabs,
+    Sqcadd,
+    Sqdmlalb,
+    Sqdmlalbt,
+    Sqdmlalt,
+    Sqdmlslb,
+    Sqdmlslbt,
+    Sqdmlslt,
+    Sqdmulh,
+    Sqdmullb,
+    Sqdmullt,
+    Sqneg,
+    Sqrdmlah,
+    Sqrdmlsh,
+    Sqrdmulh,
+    Sqrshl,
+    Sqrshlr,
+    Sqshl,
+    Sqshlr,
+    Sqsubr,
+    Srhadd,
+    Srshl,
+    Srshlr,
+    Ssublb,
+    Ssublbt,
+    Ssublt,
+    Ssubltb,
+    Ssubwb,
+    Ssubwt,
+    St1b,
+    St1d,
+    St1h,
+    St1w,
+    Suqadd,
+    Uaba,
+    Uabalb,
+    Uabalt,
+    Uabdlb,
+    Uabdlt,
+    Uaddlb,
+    Uaddlt,
+    Uaddwb,
+    Uaddwt,
+    Uhadd,
+    Uhsub,
+    Uhsubr,
+    Umaxp,
+    Uminp,
+    Umlalb,
+    Umlalt,
+    Umlslb,
+    Umlslt,
+    Umullb,
+    Umullt,
+    Uqrshl,
+    Uqrshlr,
+    Uqshl,
+    Uqshlr,
+    Uqsubr,
+    Urecpe,
+    Urhadd,
+    Urshl,
+    Urshlr,
+    Ursqrte,
+    Usqadd,
+    Usublb,
+    Usublt,
+    Usubwb,
+    Usubwt,
+    Asrd,
+    Asrr,
+    Brka,
+    Brkas,
+    Brkb,
+    Brkbs,
+    Brkn,
+    Brkns,
+    Brkpa,
+    Brkpas,
+    Brkpb,
+    Brkpbs,
+    Cmpeq,
+    Cmpge,
+    Cmpgt,
+    Cmphi,
+    Cmphs,
+    Cmple,
+    Cmplo,
+    Cmpls,
+    Cmplt,
+    Cmpne,
+    Cpy,
+    Decp,
+    Ext,
+    Facge,
+    Facgt,
+    Facle,
+    Faclt,
+    Fcmeq,
+    Fcmge,
+    Fcmgt,
+    Fcmle,
+    Fcmlt,
+    Fcmne,
+    Fcmuo,
+    Fcpy,
+    Fdup,
+    Incp,
+    Insr,
+    Lslr,
+    Lsrr,
+    Movprfx,
+    Pfirst,
+    Pnext,
+    Punpkhi,
+    Punpklo,
+    Rdffr,
+    Rdffrs,
+    Sel,
+    Setffr,
+    Sqdecb,
+    Sqdecd,
+    Sqdech,
+    Sqdecp,
+    Sqdecw,
+    Sqincb,
+    Sqincd,
+    Sqinch,
+    Sqincp,
+    Sqincw,
+    Sqshlu,
+    Srshr,
+    Tbl,
+    Tbx,
+    Uqdecb,
+    Uqdecd,
+    Uqdech,
+    Uqdecp,
+    Uqdecw,
+    Uqincb,
+    Uqincd,
+    Uqinch,
+    Uqincp,
+    Uqincw,
+    Urshr,
+    Wrffr,
+    Ld1rb,
+    Ld1rd,
+    Ld1rh,
+    Ld1rqb,
+    Ld1rqd,
+    Ld1rqh,
+    Ld1rqw,
+    Ld1rsb,
+    Ld1rsh,
+    Ld1rsw,
+    Ld1rw,
+    Ld2b,
+    Ld2d,
+    Ld2h,
+    Ld2w,
+    Ld3b,
+    Ld3d,
+    Ld3h,
+    Ld3w,
+    Ld4b,
+    Ld4d,
+    Ld4h,
+    Ld4w,
+    Ldnt1b,
+    Ldnt1d,
+    Ldnt1h,
+    Ldnt1w,
+    Prfb,
+    Prfd,
+    Prfh,
+    Prfw,
+    St2b,
+    St2d,
+    St2h,
+    St2w,
+    St3b,
+    St3d,
+    St3h,
+    St3w,
+    St4b,
+    St4d,
+    St4h,
+    St4w,
+    Stnt1b,
+    Stnt1d,
+    Stnt1h,
+    Stnt1w,
+    Addhnb,
+    Addhnt,
+    Bcax,
+    Bsl,
+    Bsl1n,
+    Bsl2n,
+    Clasta,
+    Clastb,
+    Compact,
+    Ctermeq,
+    Ctermne,
+    Eor3,
+    Fadda,
+    Fcadd,
+    Fcmla,
+    Fexpa,
+    Ftmad,
+    Ftsmul,
+    Ftssel,
+    Histcnt,
+    Histseg,
+    Index,
+    Lasta,
+    Lastb,
+    Match,
+    Nbsl,
+    Nmatch,
+    Raddhnb,
+    Raddhnt,
+    Revb,
+    Revh,
+    Revw,
+    Rshrnb,
+    Rshrnt,
+    Rsubhnb,
+    Rsubhnt,
+    Sdot,
+    Shrnb,
+    Shrnt,
+    Sli,
+    Splice,
+    Sqrshrnb,
+    Sqrshrnt,
+    Sqrshrunb,
+    Sqrshrunt,
+    Sqshrnb,
+    Sqshrnt,
+    Sqshrunb,
+    Sqshrunt,
+    Sqxtnb,
+    Sqxtnt,
+    Sqxtunb,
+    Sqxtunt,
+    Sri,
+    Srsra,
+    Sshllb,
+    Sshllt,
+    Ssra,
+    Subhnb,
+    Subhnt,
+    Sunpkhi,
+    Sunpklo,
+    Udot,
+    Uqrshrnb,
+    Uqrshrnt,
+    Uqshrnb,
+    Uqshrnt,
+    Uqxtnb,
+    Uqxtnt,
+    Ursra,
+    Ushllb,
+    Ushllt,
+    Usra,
+    Uunpkhi,
+    Uunpklo,
+    Whilerw,
+    Whilewr,
+    Xar,
+    Adclb,
+    Adclt,
+    Cdot,
+    Cmla,
+    Fmlalb,
+    Fmlalt,
+    Fmlslb,
+    Fmlslt,
+    Ldnt1sb,
+    Ldnt1sh,
+    Ldnt1sw,
+    Movs,
+    Nots,
+    Sadalp,
+    Sbclb,
+    Sbclt,
+    Sqrdcmlah,
+    Uadalp,
+    Bit,
+    Bif,
+    Cmeq,
+    Cmgt,
+    Cmge,
+    Cmhi,
+    Cmhs,
+    Cmtst,
+    Cmle,
+    Cmlt,
+    Sshl,
+    Ushl,
+    Rev32,
+    Rev64,
+    Saddlp,
+    Uaddlp,
+    Xtn,
+    Sqxtn,
+    Uqxtn,
+    Sqxtun,
+    Fcvtl,
+    Fcvtn,
+    Fcvtxn,
+    Fcvtns,
+    Fcvtnu,
+    Fcvtms,
+    Fcvtmu,
+    Fcvtas,
+    Fcvtau,
+    Fcvtps,
+    Fcvtpu,
+    Addv,
+    Saddlv,
+    Uaddlv,
+    Ins,
+    Umov,
+    Smov,
+    Movi,
+    Mvni,
+    Sshr,
+    Ushr,
+    Shl,
+    Shrn,
+    Rshrn,
+    Sqshrn,
+    Sqrshrn,
+    Uqshrn,
+    Uqrshrn,
+    Sqshrun,
+    Sqrshrun,
+    Sshll,
+    Ushll,
+    Saddl,
+    Uaddl,
+    Ssubl,
+    Usubl,
+    Saddw,
+    Uaddw,
+    Ssubw,
+    Usubw,
+    Addhn,
+    Raddhn,
+    Subhn,
+    Rsubhn,
+    Sabal,
+    Uabal,
+    Sabdl,
+    Uabdl,
+    Smlal,
+    Umlal,
+    Smlsl,
+    Umlsl,
+    Sqdmull,
+    Sqdmlal,
+    Sqdmlsl,
+    Pmull,
+    Ld1,
+    Ld2,
+    Ld3,
+    Ld4,
+    Ld1r,
+    Ld2r,
+    Ld3r,
+    Ld4r,
+    St1,
+    St2,
+    St3,
+    St4,
+    Ldnp,
+    Stnp,
+    Aese,
+    Aesd,
+    Aesmc,
+    Aesimc,
+    Sha1c,
+    Sha1p,
+    Sha1m,
+    Sha1h,
+    Sha1su0,
+    Sha1su1,
+    Sha256h,
+    Sha256h2,
+    Sha256su0,
+    Sha256su1,
+    Crc32b,
+    Crc32h,
+    Crc32w,
+    Crc32x,
+    Crc32cb,
+    Crc32ch,
+    Crc32cw,
+    Crc32cx,
+    Rax1,
+    Sm4e,
+    Sm4ekey,
+    Fmadd,
+    Fmsub,
+    Fnmadd,
+    Fnmsub,
+    Fnmul,
+    Smaddl,
+    Umaddl,
+    Smsubl,
+    Umsubl,
 }
 
 public enum ArmRegister : byte
@@ -599,6 +1216,55 @@ public enum ArmRegister : byte
     V29 = 93,
     V30 = 94,
     V31 = 95,
+    Z0 = 96,
+    Z1 = 97,
+    Z2 = 98,
+    Z3 = 99,
+    Z4 = 100,
+    Z5 = 101,
+    Z6 = 102,
+    Z7 = 103,
+    Z8 = 104,
+    Z9 = 105,
+    Z10 = 106,
+    Z11 = 107,
+    Z12 = 108,
+    Z13 = 109,
+    Z14 = 110,
+    Z15 = 111,
+    Z16 = 112,
+    Z17 = 113,
+    Z18 = 114,
+    Z19 = 115,
+    Z20 = 116,
+    Z21 = 117,
+    Z22 = 118,
+    Z23 = 119,
+    Z24 = 120,
+    Z25 = 121,
+    Z26 = 122,
+    Z27 = 123,
+    Z28 = 124,
+    Z29 = 125,
+    Z30 = 126,
+    Z31 = 127,
+    P0 = 128,
+    P1 = 129,
+    P2 = 130,
+    P3 = 131,
+    P4 = 132,
+    P5 = 133,
+    P6 = 134,
+    P7 = 135,
+    P8 = 136,
+    P9 = 137,
+    P10 = 138,
+    P11 = 139,
+    P12 = 140,
+    P13 = 141,
+    P14 = 142,
+    P15 = 143,
+    Ffr = 144,
     Invalid = 255,
 }
 
@@ -627,6 +1293,12 @@ public readonly struct ArmOperand
     public ArmRegister BaseRegister { get; }
     public ArmRegister IndexRegister { get; }
     public int Size { get; }
+    public ArmPredication Predication { get; }
+    public int ElementIndex { get; }
+    public int RegisterCount { get; }
+    public int IndexSize { get; }
+    public int VectorSize { get; }
+    public double FloatingImmediate => BitConverter.Int64BitsToDouble(Immediate);
     public long Immediate { get; }
     public ArmShiftKind Shift { get; }
     public int ShiftAmount { get; }
@@ -654,7 +1326,12 @@ public readonly struct ArmOperand
         string? symbol,
         long addend,
         ArmRelocationKind relocationKind,
-        ArmSystemRegister systemRegister)
+        ArmSystemRegister systemRegister,
+        ArmPredication predication = ArmPredication.None,
+        int elementIndex = -1,
+        int registerCount = 0,
+        int indexSize = 0,
+        int vectorSize = 0)
     {
         Kind = kind;
         Register = register;
@@ -663,7 +1340,8 @@ public readonly struct ArmOperand
         Size = Math.Max(0, size);
         Immediate = immediate;
         Shift = shift;
-        ShiftAmount = Math.Max(0, shiftAmount);
+        ArgumentOutOfRangeException.ThrowIfNegative(shiftAmount);
+        ShiftAmount = shiftAmount;
         Extend = extend;
         AddressingMode = addressingMode;
         RegisterMask = registerMask;
@@ -671,6 +1349,11 @@ public readonly struct ArmOperand
         Addend = addend;
         RelocationKind = relocationKind;
         SystemRegister = systemRegister;
+        Predication = predication;
+        ElementIndex = elementIndex;
+        RegisterCount = registerCount;
+        IndexSize = indexSize;
+        VectorSize = vectorSize;
     }
 
     public static ArmOperand None => default;
@@ -699,9 +1382,10 @@ public readonly struct ArmOperand
         ArmRegister indexRegister = ArmRegister.Invalid,
         ArmShiftKind shift = ArmShiftKind.None,
         int shiftAmount = 0,
-        ArmExtendKind extend = ArmExtendKind.None)
+        ArmExtendKind extend = ArmExtendKind.None,
+        int indexSize = 0)
         => new ArmOperand(ArmOperandKind.Memory, ArmRegister.Invalid, baseRegister, indexRegister, size, displacement, shift, shiftAmount, extend, addressingMode,
-            0, null, 0, ArmRelocationKind.None, ArmSystemRegister.Invalid);
+            0, null, 0, ArmRelocationKind.None, ArmSystemRegister.Invalid, indexSize: indexSize);
 
     public static ArmOperand Literal(long displacement, int size = 0)
         => new ArmOperand(ArmOperandKind.Memory, ArmRegister.Invalid, ArmRegister.Pc, ArmRegister.Invalid, size, displacement, ArmShiftKind.None,
@@ -719,17 +1403,72 @@ public readonly struct ArmOperand
         => new ArmOperand(ArmOperandKind.SystemRegister, ArmRegister.Invalid, ArmRegister.Invalid, ArmRegister.Invalid, 0, 0, ArmShiftKind.None,
             0, ArmExtendKind.None, ArmAddressingMode.Offset, 0, null, 0, ArmRelocationKind.None, register);
 
+    public static ArmOperand Predicate(ArmRegister register, ArmPredication predication, int elementSize = 0)
+        => new ArmOperand(ArmOperandKind.Register, register, ArmRegister.Invalid, ArmRegister.Invalid, elementSize, 0,
+            ArmShiftKind.None, 0, ArmExtendKind.None, ArmAddressingMode.Offset, 0, null, 0, ArmRelocationKind.None,
+            ArmSystemRegister.Invalid, predication);
+
+    public static ArmOperand VectorElement(ArmRegister register, int elementSize, int index)
+        => new ArmOperand(ArmOperandKind.VectorElement, register, ArmRegister.Invalid, ArmRegister.Invalid, elementSize, 0,
+            ArmShiftKind.None, 0, ArmExtendKind.None, ArmAddressingMode.Offset, 0, null, 0, ArmRelocationKind.None,
+            ArmSystemRegister.Invalid, elementIndex: index);
+
+    public static ArmOperand VectorList(ArmRegister firstRegister, int elementSize, int count = 1)
+        => new ArmOperand(ArmOperandKind.VectorList, firstRegister, ArmRegister.Invalid, ArmRegister.Invalid, elementSize, 0,
+            ArmShiftKind.None, 0, ArmExtendKind.None, ArmAddressingMode.Offset, 0, null, 0, ArmRelocationKind.None,
+            ArmSystemRegister.Invalid, registerCount: count);
+
+    public static ArmOperand Vector(ArmRegister register, int elementSize, int vectorSize)
+        => new ArmOperand(ArmOperandKind.Register, register, ArmRegister.Invalid, ArmRegister.Invalid, elementSize, 0,
+            ArmShiftKind.None, 0, ArmExtendKind.None, ArmAddressingMode.Offset, 0, null, 0, ArmRelocationKind.None,
+            ArmSystemRegister.Invalid, vectorSize: vectorSize);
+
+    public static ArmOperand VectorList(ArmRegister firstRegister, int elementSize, int count, int vectorSize)
+        => new ArmOperand(ArmOperandKind.VectorList, firstRegister, ArmRegister.Invalid, ArmRegister.Invalid, elementSize, 0,
+            ArmShiftKind.None, 0, ArmExtendKind.None, ArmAddressingMode.Offset, 0, null, 0, ArmRelocationKind.None,
+            ArmSystemRegister.Invalid, registerCount: count, vectorSize: vectorSize);
+
+    public static ArmOperand VectorListLane(ArmRegister firstRegister, int elementSize, int count, int index)
+        => new ArmOperand(ArmOperandKind.VectorList, firstRegister, ArmRegister.Invalid, ArmRegister.Invalid, elementSize, 0,
+            ArmShiftKind.None, 0, ArmExtendKind.None, ArmAddressingMode.Offset, 0, null, 0, ArmRelocationKind.None,
+            ArmSystemRegister.Invalid, elementIndex: index, registerCount: count);
+
+    public static ArmOperand Pattern(ArmPredicatePattern pattern)
+        => ImmediateOperand((int)pattern).WithKind(ArmOperandKind.Pattern);
+
+    public static ArmOperand Multiplier(int multiplier)
+        => ImmediateOperand(multiplier).WithKind(ArmOperandKind.Multiplier);
+
+    public static ArmOperand FloatingImmediateOperand(double value)
+        => ImmediateOperand(BitConverter.DoubleToInt64Bits(value)).WithKind(ArmOperandKind.FloatingImmediate);
+
+    public static ArmOperand PrefetchOperation(int operation)
+        => ImmediateOperand(operation).WithKind(ArmOperandKind.PrefetchOperation);
+
+    public static ArmOperand ShiftedImmediate(long value, int amount)
+        => new ArmOperand(ArmOperandKind.Immediate, ArmRegister.Invalid, ArmRegister.Invalid, ArmRegister.Invalid, 0, value,
+            ArmShiftKind.Lsl, amount, ArmExtendKind.None, ArmAddressingMode.Offset, 0, null, 0, ArmRelocationKind.None,
+            ArmSystemRegister.Invalid);
+
+    private ArmOperand WithKind(ArmOperandKind kind)
+        => new ArmOperand(kind, Register, BaseRegister, IndexRegister, Size, Immediate, Shift, ShiftAmount,
+            Extend, AddressingMode, RegisterMask, Symbol, Addend, RelocationKind, SystemRegister,
+            Predication, ElementIndex, RegisterCount, IndexSize, VectorSize);
+
     public ArmOperand WithImmediate(long immediate)
         => new ArmOperand(Kind, Register, BaseRegister, IndexRegister, Size, immediate, Shift, ShiftAmount,
-            Extend, AddressingMode, RegisterMask, Symbol, Addend, RelocationKind, SystemRegister);
+            Extend, AddressingMode, RegisterMask, Symbol, Addend, RelocationKind, SystemRegister,
+            Predication, ElementIndex, RegisterCount, IndexSize, VectorSize);
 
     public ArmOperand WithSize(int size)
         => new ArmOperand(Kind, Register, BaseRegister, IndexRegister, size, Immediate, Shift, ShiftAmount,
-            Extend, AddressingMode, RegisterMask, Symbol, Addend, RelocationKind, SystemRegister);
+            Extend, AddressingMode, RegisterMask, Symbol, Addend, RelocationKind, SystemRegister,
+            Predication, ElementIndex, RegisterCount, IndexSize, VectorSize);
 
     public ArmOperand WithSymbol(string symbol, ArmRelocationKind relocationKind, long addend = 0)
         => new ArmOperand(Kind, Register, BaseRegister, IndexRegister, Size, Immediate, Shift, ShiftAmount,
-            Extend, AddressingMode, RegisterMask, symbol, addend, relocationKind, SystemRegister);
+            Extend, AddressingMode, RegisterMask, symbol, addend, relocationKind, SystemRegister,
+            Predication, ElementIndex, RegisterCount, IndexSize, VectorSize);
 }
 
 public readonly struct ArmInstruction
@@ -739,10 +1478,11 @@ public readonly struct ArmInstruction
     public ArmOperand Operand1 { get; }
     public ArmOperand Operand2 { get; }
     public ArmOperand Operand3 { get; }
+    public ArmOperand Operand4 { get; }
     public ArmCondition Condition { get; }
     public bool SetFlags { get; }
     public uint RawWord { get; }
-    public bool HasSymbol => Operand0.HasSymbol || Operand1.HasSymbol || Operand2.HasSymbol || Operand3.HasSymbol;
+    public bool HasSymbol => Operand0.HasSymbol || Operand1.HasSymbol || Operand2.HasSymbol || Operand3.HasSymbol || Operand4.HasSymbol;
 
     public ArmInstruction(
         ArmInstrKind opcode,
@@ -752,35 +1492,51 @@ public readonly struct ArmInstruction
         ArmOperand operand3 = default,
         ArmCondition condition = ArmCondition.Al,
         bool setFlags = false,
-        uint rawWord = 0)
+        uint rawWord = 0,
+        ArmOperand operand4 = default)
     {
         Opcode = opcode;
         Operand0 = operand0;
         Operand1 = operand1;
         Operand2 = operand2;
         Operand3 = operand3;
+        Operand4 = operand4;
         Condition = condition;
         SetFlags = setFlags;
         RawWord = rawWord;
     }
 
     public ArmInstruction WithOperand0(ArmOperand operand)
-        => new ArmInstruction(Opcode, operand, Operand1, Operand2, Operand3, Condition, SetFlags, RawWord);
+        => new ArmInstruction(Opcode, operand, Operand1, Operand2, Operand3, Condition, SetFlags, RawWord, Operand4);
 
     public ArmInstruction WithOperand1(ArmOperand operand)
-        => new ArmInstruction(Opcode, Operand0, operand, Operand2, Operand3, Condition, SetFlags, RawWord);
+        => new ArmInstruction(Opcode, Operand0, operand, Operand2, Operand3, Condition, SetFlags, RawWord, Operand4);
 
     public ArmInstruction WithOperand2(ArmOperand operand)
-        => new ArmInstruction(Opcode, Operand0, Operand1, operand, Operand3, Condition, SetFlags, RawWord);
+        => new ArmInstruction(Opcode, Operand0, Operand1, operand, Operand3, Condition, SetFlags, RawWord, Operand4);
 
     public ArmInstruction WithOperand3(ArmOperand operand)
-        => new ArmInstruction(Opcode, Operand0, Operand1, Operand2, operand, Condition, SetFlags, RawWord);
+        => new ArmInstruction(Opcode, Operand0, Operand1, Operand2, operand, Condition, SetFlags, RawWord, Operand4);
+
+    public ArmInstruction WithOperand4(ArmOperand operand)
+        => new ArmInstruction(Opcode, Operand0, Operand1, Operand2, Operand3, Condition, SetFlags, RawWord, operand);
+
+    public ArmOperand GetOperand(int index)
+        => index switch
+        {
+            0 => Operand0,
+            1 => Operand1,
+            2 => Operand2,
+            3 => Operand3,
+            4 => Operand4,
+            _ => throw new ArgumentOutOfRangeException(nameof(index)),
+        };
 
     public ArmInstruction WithCondition(ArmCondition condition)
-        => new ArmInstruction(Opcode, Operand0, Operand1, Operand2, Operand3, condition, SetFlags, RawWord);
+        => new ArmInstruction(Opcode, Operand0, Operand1, Operand2, Operand3, condition, SetFlags, RawWord, Operand4);
 
     public ArmInstruction WithSetFlags(bool setFlags)
-        => new ArmInstruction(Opcode, Operand0, Operand1, Operand2, Operand3, Condition, setFlags, RawWord);
+        => new ArmInstruction(Opcode, Operand0, Operand1, Operand2, Operand3, Condition, setFlags, RawWord, Operand4);
 
     public static ArmInstruction Raw(uint word)
         => new ArmInstruction(ArmInstrKind.Raw, rawWord: word);
@@ -856,6 +1612,11 @@ public sealed class ArmTarget
         if ((features & TargetArchitectureFeatures.ArmHardFloat) != 0)
             isa |= ArmIsaFlags.Vfp | ArmIsaFlags.HardFloat;
 
+        if ((features & TargetArchitectureFeatures.ArmSve) != 0)
+            isa |= ArmIsaFlags.Sve;
+        if ((features & TargetArchitectureFeatures.ArmSve2) != 0)
+            isa |= ArmIsaFlags.Sve | ArmIsaFlags.Sve2;
+
         if (architecture == TargetArchitectureKind.Arm32)
         {
             var abi = operatingSystem == OperatingSystemKind.Windows
@@ -883,6 +1644,8 @@ public sealed class ArmTarget
     public bool HasVfp => Has(ArmIsaFlags.Vfp);
     public bool HasVfpD32 => Has(ArmIsaFlags.VfpD32);
     public bool HasNeon => Has(ArmIsaFlags.Neon);
+    public bool HasSve => Has(ArmIsaFlags.Sve);
+    public bool HasSve2 => Has(ArmIsaFlags.Sve2);
     public bool UsesHardFloat => Has(ArmIsaFlags.HardFloat) || Abi == ArmAbiKind.AapcsVfp;
 
     public ArmTarget(
@@ -898,6 +1661,11 @@ public sealed class ArmTarget
             throw new ArgumentException("AArch64 ABI requires a 64-bit target", nameof(abi));
         if (xlen == 64 && abi is (ArmAbiKind.Aapcs or ArmAbiKind.AapcsVfp or ArmAbiKind.WindowsArm))
             throw new ArgumentException("AArch32 ABI requires a 32-bit target", nameof(abi));
+
+        if (xlen == 32 && (isa & (ArmIsaFlags.Sve | ArmIsaFlags.Sve2)) != 0)
+            throw new ArgumentException("SVE requires an AArch64 target", nameof(isa));
+        if ((isa & ArmIsaFlags.Sve2) != 0)
+            isa |= ArmIsaFlags.Sve;
 
         XLen = xlen;
         Abi = abi;
@@ -926,6 +1694,10 @@ public sealed class ArmTarget
             name += "+neon";
         else if (HasVfp)
             name += "+vfp";
+        if (HasSve2)
+            name += "+sve2";
+        else if (HasSve)
+            name += "+sve";
         return name;
     }
 }
@@ -961,6 +1733,12 @@ internal static class ArmRegisters
     public static bool IsVector(ArmRegister register)
         => register >= ArmRegister.V0 && register <= ArmRegister.V31;
 
+    public static bool IsScalableVector(ArmRegister register)
+        => register >= ArmRegister.Z0 && register <= ArmRegister.Z31;
+
+    public static bool IsPredicate(ArmRegister register)
+        => register >= ArmRegister.P0 && register <= ArmRegister.P15;
+
     public static int Index(ArmRegister register)
     {
         if (IsAArch32General(register))
@@ -973,6 +1751,10 @@ internal static class ArmRegisters
             return 31;
         if (IsVector(register))
             return (int)register - (int)ArmRegister.V0;
+        if (IsScalableVector(register))
+            return (int)register - (int)ArmRegister.Z0;
+        if (IsPredicate(register))
+            return (int)register - (int)ArmRegister.P0;
         throw new ArgumentOutOfRangeException(nameof(register));
     }
 
@@ -994,6 +1776,13 @@ internal static class ArmRegisters
             };
         }
 
+        if (IsScalableVector(register) || IsPredicate(register))
+        {
+            string suffix = size switch { 0 => "", 1 => ".b", 2 => ".h", 4 => ".s", 8 => ".d", 16 => ".q", _ => throw new ArgumentOutOfRangeException(nameof(size)) };
+            return (IsScalableVector(register) ? "z" : "p") + Index(register).ToString(CultureInfo.InvariantCulture) + suffix;
+        }
+        if (register == ArmRegister.Ffr)
+            return "ffr";
         if (register == ArmRegister.Sp)
             return size == 4 ? "wsp" : "sp";
         if (register == ArmRegister.Xzr)
@@ -1013,6 +1802,25 @@ internal static class ArmRegisters
             return false;
 
         var value = text.Trim().ToLowerInvariant();
+        if (value.StartsWith("pn", StringComparison.Ordinal))
+            value = "p" + value.Substring(2);
+        if (target.Is64Bit && value.Length >= 2 && value[0] is 'z' or 'p')
+        {
+            int dot = value.IndexOf('.');
+            string number = dot < 0 ? value.Substring(1) : value.Substring(1, dot - 1);
+            if (!int.TryParse(number, NumberStyles.None, CultureInfo.InvariantCulture, out int index) || index > (value[0] == 'z' ? 31 : 15))
+                return false;
+            size = dot < 0 ? 0 : value.Substring(dot) switch { ".b" => 1, ".h" => 2, ".s" => 4, ".d" => 8, ".q" => 16, _ => -1 };
+            if (size < 0)
+                return false;
+            register = (ArmRegister)((int)(value[0] == 'z' ? ArmRegister.Z0 : ArmRegister.P0) + index);
+            return true;
+        }
+        if (target.Is64Bit && value == "ffr")
+        {
+            register = ArmRegister.Ffr;
+            return true;
+        }
         if (target.Is32Bit)
         {
             if (value == "sp")
@@ -1080,6 +1888,12 @@ internal static class ArmRegisters
             }
         }
 
+        if (target.Is64Bit && (TryParseIndexed(value, 'b', 31, out int narrow) || TryParseIndexed(value, 'h', 31, out narrow)))
+        {
+            register = (ArmRegister)((int)ArmRegister.V0 + narrow);
+            size = value[0] == 'b' ? 1 : 2;
+            return true;
+        }
         if (TryParseIndexed(value, 's', 31, out var s))
         {
             register = (ArmRegister)((int)ArmRegister.V0 + s);
@@ -1112,6 +1926,8 @@ internal static class ArmRegisters
     {
         var prefix = size switch
         {
+            1 => "b",
+            2 => "h",
             4 => "s",
             8 => "d",
             16 => "q",

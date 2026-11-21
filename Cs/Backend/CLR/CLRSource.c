@@ -2244,14 +2244,14 @@ static usize rh_atomic_compare_exchange(volatile usize* address, usize comparand
     return original;
 #elif defined(__aarch64__)
     usize original;
-    usize status;
+    u32 status;
     __asm__ volatile(
         ".Lrh_cas_retry_%=:\n"
         "ldaxr %[original], [%[address]]\n"
         "cmp %[original], %[comparand]\n"
         "b.ne .Lrh_cas_done_%=\n"
-        "stlxr %[status], %[value], [%[address]]\n"
-        "cbnz %[status], .Lrh_cas_retry_%=\n"
+        "stlxr %w[status], %[value], [%[address]]\n"
+        "cbnz %w[status], .Lrh_cas_retry_%=\n"
         ".Lrh_cas_done_%=:"
         : [original] "=&r"(original), [status] "=&r"(status)
         : [address] "r"(address), [comparand] "r"(comparand), [value] "r"(value)

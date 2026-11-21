@@ -47,12 +47,16 @@ public abstract class TypedSymbol : Symbol
     public QualifiedType Type { get; }
     /// <summary>Syntax that introduced the symbol or null for synthesized symbols</summary>
     public SyntaxNode? DeclaringSyntax { get; }
+    /// <summary>Gets whether the program takes the object's address, which keeps it in memory</summary>
+    public bool IsAddressTaken { get; private set; }
 
     protected TypedSymbol(QualifiedType type, SyntaxNode? declaringSyntax)
     {
         Type = type;
         DeclaringSyntax = declaringSyntax;
     }
+
+    internal void MarkAddressTaken() => IsAddressTaken = true;
 }
 
 /// <summary>Sentinel used when symbol resolution fails</summary>
